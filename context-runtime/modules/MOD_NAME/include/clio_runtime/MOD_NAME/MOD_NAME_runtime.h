@@ -77,7 +77,10 @@ public:
 private:
   // Container-specific state
   clio::run::u32 create_count_ = 0;
-  clio::run::u32 custom_count_ = 0;
+  // issue #785: atomic — several workers run Custom concurrently, so the plain
+  // counter was a data race (TSan). Only a test-module tally, but it drowned
+  // the report and made real races harder to spot.
+  std::atomic<clio::run::u32> custom_count_{0};
 
   // Client for making calls to this ChiMod
   Client client_;

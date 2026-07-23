@@ -43,15 +43,33 @@ namespace clio::run {
  * CoRwLock - Reentrant cooperative read-write lock for coroutine-based
  * task execution. Allows write->write and write->read reentrancy
  * from the same logical execution context (parent/subtask chain).
+ *
+ * SOUNDNESS: holder_ and the depth counters are plain fields; they may be
+ * touched without the underlying lock ONLY by the OS thread that currently
+ * owns the write lock. Every legitimate reentrant acquire runs on that
+ * thread (same-stack nesting, or a same-worker subtask of the holding
+ * parent — LockOwnerId embeds the worker id), so the fast path is gated on
+ * holder_tid_, an atomic OS-thread id: another thread can never store OUR
+ * tid, and our own release of it is visible to us in program order, so
+ * (holder_tid_ == this thread) <=> this thread genuinely holds the write
+ * lock right now. The previous version compared holder_ alone — an
+ * unsynchronized read that could observe a STALE value equal to the
+ * caller's own identity from an EARLIER hold, granting lock-free access
+ * while another thread held the write lock. Under the #807 stress test
+ * that let ToFullPtr read alloc_map_ mid-rehash (spurious misses of
+ * registered allocators -> NULL-source memcpy in the RAM bdev), and the
+ * same false grant on the write side double-entered critical sections and
+ * corrupted the underlying RwLock — wedging every worker.
  */
 class CoRwLock {
  public:
   ctp::RwLock lock_;
   LockOwnerId holder_;
+  ctp::ipc::atomic<u64> holder_tid_;
   u32 write_depth_;
   u32 read_depth_;
 
-  CoRwLock() : write_depth_(0), read_depth_(0) {}
+  CoRwLock() : holder_tid_(0), write_depth_(0), read_depth_(0) {}
 
   /** Deleted copy constructor (matches ctp::RwLock) */
   CoRwLock(const CoRwLock &other) = delete;
@@ -59,9 +77,11 @@ class CoRwLock {
   CoRwLock(CoRwLock &&other) noexcept
       : lock_(std::move(other.lock_)),
         holder_(other.holder_),
+        holder_tid_(other.holder_tid_.load()),
         write_depth_(other.write_depth_),
         read_depth_(other.read_depth_) {
     other.holder_.Clear();
+    other.holder_tid_.store(0);
     other.write_depth_ = 0;
     other.read_depth_ = 0;
   }
@@ -70,18 +90,28 @@ class CoRwLock {
     if (this != &other) {
       lock_ = std::move(other.lock_);
       holder_ = other.holder_;
+      holder_tid_.store(other.holder_tid_.load());
       write_depth_ = other.write_depth_;
       read_depth_ = other.read_depth_;
       other.holder_.Clear();
+      other.holder_tid_.store(0);
       other.write_depth_ = 0;
       other.read_depth_ = 0;
     }
     return *this;
   }
 
+  /** True iff the calling OS thread currently owns the write lock. Only
+   *  then may holder_ / the depth counters be touched without lock_. */
+  bool HeldByThisThread() const {
+    u64 self = GetCoLockThreadId();
+    return self != 0 &&
+           holder_tid_.load(std::memory_order_acquire) == self;
+  }
+
   void ReadLock() {
-    LockOwnerId cur = GetCurrentLockOwnerId();
-    if (cur == holder_) {
+    // Write->read reentrancy for the holding thread's logical context.
+    if (HeldByThisThread() && GetCurrentLockOwnerId() == holder_) {
       ++read_depth_;
       return;
     }
@@ -89,8 +119,8 @@ class CoRwLock {
   }
 
   void ReadUnlock() {
-    LockOwnerId cur = GetCurrentLockOwnerId();
-    if (cur == holder_ && read_depth_ > 0) {
+    if (HeldByThisThread() && read_depth_ > 0 &&
+        GetCurrentLockOwnerId() == holder_) {
       --read_depth_;
       return;
     }
@@ -98,13 +128,13 @@ class CoRwLock {
   }
 
   void WriteLock() {
-    LockOwnerId cur = GetCurrentLockOwnerId();
-    if (cur == holder_) {
+    if (HeldByThisThread() && GetCurrentLockOwnerId() == holder_) {
       ++write_depth_;
       return;
     }
     lock_.WriteLock(0);
-    holder_ = cur;
+    holder_ = GetCurrentLockOwnerId();
+    holder_tid_.store(GetCoLockThreadId(), std::memory_order_release);
     write_depth_ = 1;
   }
 
@@ -112,6 +142,7 @@ class CoRwLock {
     --write_depth_;
     if (write_depth_ == 0 && read_depth_ == 0) {
       holder_.Clear();
+      holder_tid_.store(0, std::memory_order_release);
       lock_.WriteUnlock();
     }
   }

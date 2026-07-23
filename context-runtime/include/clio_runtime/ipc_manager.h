@@ -37,6 +37,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -302,12 +304,61 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /**
+   * Returns the runtime-wide metadata allocator (issue #783), or nullptr if
+   * the metadata segment is not attached. Callers MUST null-check: the segment
+   * is optional, and a client that failed to attach it simply falls back to
+   * the RPC path rather than failing.
+   */
+  CLIO_TASK_ALLOC_T *GetMetadataAllocator() { return metadata_allocator_; }
+
+  /** True if the metadata segment is available for shared-memory caching. */
+  bool HasMetadataSegment() const { return metadata_allocator_ != nullptr; }
+
+  /**
+   * Directory of well-known roots in the metadata segment (issue #783), or
+   * nullptr when unavailable. Resolved in THIS process from the offset the
+   * server published, so it is valid for clients too.
+   */
+  MetadataDirectory *GetMetadataDirectory() {
+    if (metadata_allocator_ == nullptr || metadata_dir_off_ == 0) {
+      return nullptr;
+    }
+    auto *dir = reinterpret_cast<MetadataDirectory *>(
+        reinterpret_cast<char *>(metadata_allocator_) + metadata_dir_off_);
+    if (dir->version_ != MetadataDirectory::kVersion) {
+      return nullptr;  // unknown layout -> decline rather than guess
+    }
+    return dir;
+  }
+
+  /** Offset of the metadata directory; 0 when unavailable. Sent to clients in
+   *  the ClientConnect handshake. */
+  u64 GetMetadataDirOffset() const { return metadata_dir_off_; }
+
+  /** Client-side: record the directory offset learned from ClientConnect. */
+  void SetMetadataDirOffset(u64 off) { metadata_dir_off_ = off; }
+
+  /**
+   * PID of the runtime this process talks to (its own pid when this IS the
+   * runtime). Clients use it to reconstruct per-pool SHM segment names, e.g.
+   * a RAM bdev's data segment (issue #783), without those names having to be
+   * published anywhere.
+   */
+  int GetRuntimePid() const {
+    return runtime_pid_ != 0 ? runtime_pid_
+                             : static_cast<int>(ctp::SystemInfo::GetPid());
+  }
+
   /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
-   *  pid.2 queue). Reported to clients via ClientConnect so they attach the
-   *  right allocators instead of assuming (1,0)/(2,0). */
+   *  pid.2 queue, pid.3 metadata). Reported to clients via ClientConnect so
+   *  they attach the right allocators instead of assuming (1,0)/(2,0). */
   ctp::ipc::AllocatorId GetMainAllocatorId() const { return main_allocator_id_; }
   ctp::ipc::AllocatorId GetQueueAllocatorId() const {
     return queue_allocator_id_;
+  }
+  ctp::ipc::AllocatorId GetMetadataAllocatorId() const {
+    return metadata_allocator_id_;
   }
 
   /**
@@ -879,6 +930,15 @@ class IpcManager {
    */
   void RecvShmClientThread();
 
+  /** issue #807: drain + demux available SHM responses off the client out-ring,
+   *  under a try-lock so exactly one thread consumes at a time. Called BOTH by a
+   *  waiter spinning in RecvOut (inline fast path) and by RecvShmClientThread
+   *  (fallback when waiters are parked). Returns true if it drained anything;
+   *  false if another thread holds the drain lock (caller just polls its own
+   *  completion) or the ring was empty. Sets IsComplete + stashes the archive
+   *  for every response it demuxes, so one draining waiter serves all waiters. */
+  bool DrainShmResponses();
+
   /**
    * Runtime-side thread that drains the single inbound SHM ring
    * (shm_in_server_) in SHM mode, deserializing each client task and pushing it
@@ -887,7 +947,20 @@ class IpcManager {
    * scheduler needs to know the ring exists: this thread IS the ring's single
    * consumer.
    */
-  void RecvShmServerThread();
+
+  // issue #807: WORKER-DRIVEN inbound shard draining. Instead of dedicated drain
+  // threads (which oversubscribe cores on a small box — the whole reason the
+  // first cut regressed), the EXISTING workers drain the shard rings in their
+  // poll loop. Worker w owns shard w (shards are capped at the worker count), so
+  // each ring still has exactly one consumer, satisfying MPSC. The worker's own
+  // signalfd EventManager IS the ring's consumer wake target (consumer_tid_ =
+  // worker tid), so a client send SIGUSR1s the owning worker exactly as a lane
+  // push does.
+  void RegisterShardConsumer(u32 worker_id);    // publish worker tid on its ring
+  void UnregisterShardConsumer(u32 worker_id);  // withdraw at worker exit
+  bool ShardEmpty(u32 worker_id) const;         // park-recheck
+  void SetShardParked(u32 worker_id, bool parked);  // park protocol
+  // Worker w drains + executes its own shard inline — see Worker::DrainMyShard.
 
   /**
    * Start RecvShmServerThread. Called once from the admin ChiMod's Create,
@@ -959,6 +1032,23 @@ class IpcManager {
     // Release the lock before continuing
     allocator_map_lock_.ReadUnlock();
     if (result.ptr_ != nullptr) return result;
+
+    // Issue #807: a multithreaded client can hand the runtime a ShmPtr into a
+    // freshly created segment BEFORE the creating thread's RegisterMemory
+    // admin round-trip lands — segment creation exposes the allocator to the
+    // client's sibling threads immediately, and the SHM data plane is much
+    // faster than the TCP control plane the registration rides on. Attach the
+    // segment on demand and retry, instead of handing back a null resolution
+    // (which a bdev write would memcpy from).
+    if (TryLazyRegisterClientSegment(shm_ptr.alloc_id_)) {
+      allocator_map_lock_.ReadLock();
+      auto retry_it = alloc_map_.find(alloc_key);
+      if (retry_it != alloc_map_.end()) {
+        result = ctp::ipc::FullPtr<T>(retry_it->second, shm_ptr);
+      }
+      allocator_map_lock_.ReadUnlock();
+      if (result.ptr_ != nullptr) return result;
+    }
 
     // Case 4: Check GPU client backends (kPinnedHost / kManagedUvm /
     // kDeviceMem). The IpcGpu2Cpu producer convention stashes the raw
@@ -1180,6 +1270,17 @@ class IpcManager {
   bool RegisterMemory(const ctp::ipc::AllocatorId &alloc_id);
 
   /**
+   * Runtime-side fallback for ToFullPtr: attach a client segment whose
+   * RegisterMemory control-plane round-trip has not landed yet (issue #807 —
+   * the SHM data plane outruns the TCP admin path, so a sibling client
+   * thread's first use of a fresh segment can reach a worker before the
+   * creating thread's registration does). No-op on clients / null ids.
+   * @return true if the segment is now registered (attached here or already
+   *         present), false otherwise
+   */
+  bool TryLazyRegisterClientSegment(const ctp::ipc::AllocatorId &alloc_id);
+
+  /**
    * Get the current process's shared memory info for registration
    * @param index Index of the shared memory segment (0 to shm_count_-1)
    * @return ClientShmInfo for the specified segment
@@ -1367,6 +1468,24 @@ class IpcManager {
   // Queue allocator pointer — ArenaAllocator for all TaskQueue structures
   CLIO_QUEUE_ALLOC_T *queue_allocator_ = nullptr;
 
+  // issue #783: runtime-wide metadata segment. Large (default 8 GB), sparse,
+  // never pre-faulted. Owned by the runtime; the CTE shared-memory metadata
+  // cache is its first consumer. Clients attach it read-write but by
+  // convention write only lock words -- metadata itself is runtime-owned.
+  ctp::ipc::PosixShmMmap metadata_backend_;
+
+  // Allocator ID for metadata segment
+  ctp::ipc::AllocatorId metadata_allocator_id_;
+
+  // Metadata allocator. BuddyAllocator (same as main) because the CTE cache
+  // does variable-size allocation with frees, which an ArenaAllocator cannot
+  // service.
+  CLIO_TASK_ALLOC_T *metadata_allocator_ = nullptr;
+
+  // Offset of the MetadataDirectory within metadata_allocator_. Set by the
+  // server when it builds the segment, and by clients from ClientConnect.
+  u64 metadata_dir_off_ = 0;
+
   // Number of workers for which queues are allocated
   u32 num_workers_ = 0;
 
@@ -1375,6 +1494,11 @@ class IpcManager {
 
   // PID of the runtime process (for tgkill)
   pid_t runtime_pid_ = 0;
+
+  // issue #807: number of parallel inbound SHM rings. On the runtime this is
+  // GetShmInShards(); on a client it is learned from ClientConnect and selects
+  // which shard (clio-<pid>-shm-in-<k>) a request is sent to.
+  u32 shm_in_shards_ = 1;
 
   // Monotonic counter, set from epoch nanos at init
   std::atomic<u64> server_generation_{0};
@@ -1408,15 +1532,56 @@ class IpcManager {
   //   (RecvShmClientThread), which demuxes by net_key and wakes waiters. This
   //   mirrors the ZMQ model (one recv path, event-woken waiters) instead of
   //   clients load-balancing across per-worker rings.
-  ctp::lbm::ShmMpscTransport shm_in_server_;
+  // issue #807: S parallel inbound rings (clio-<pid>-shm-in-<k>), each with its
+  // own drain thread, replacing the single shm_in_server_. unique_ptr because
+  // ShmMpscTransport owns SHM handles and is not movable into a vector. Index k
+  // is the shard the producing client selected. shm_in_server_ok_ is true once
+  // ALL shards initialised.
+  std::vector<std::unique_ptr<ctp::lbm::ShmMpscTransport>> shm_in_servers_;
   bool shm_in_server_ok_ = false;
   ctp::lbm::ShmMpscTransport shm_out_server_;
   bool shm_out_server_ok_ = false;
+  // issue #807: serialises out-ring consumption. The out-ring is single-consumer
+  // (recv_conns_ reassembly state is shared, not thread-local), so a waiter that
+  // drains inline (RecvOut spin) and the fallback RecvShmClientThread must never
+  // Recv concurrently — whoever holds this try-lock is the sole consumer.
+  std::mutex shm_out_drain_mutex_;
+
+  // issue #807 D2: nonblocking, ordered, PER-DESTINATION response send.
+  //
+  // The old SHM SendOut ran INLINE on the executing worker: it serialized the
+  // result and did a blocking MPSC transfer into the client's out-ring, so a
+  // full client ring stalled task processing — the exact thing the transport
+  // was meant to avoid. Now a worker ENQUEUES an owning future here (nonblocking)
+  // and returns; a dedicated background sender thread drains each destination's
+  // queue in order and does the serialize + transfer, mirroring the ZMQ path's
+  // EnqueueSendOut. One queue per destination ring keeps per-client response
+  // ordering while letting different clients' responses proceed independently.
+  struct ShmSendQueue {
+    std::mutex mtx;
+    std::deque<clio::run::Future<Task>> pending;
+  };
+  std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
+      shm_send_queues_;
+  std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
+  std::atomic<bool> shm_send_running_{false};  // #807: SHM-mode gate for flush
 
  public:
   /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
    *  nullptr if the named server cannot be attached. #642 */
   ctp::lbm::ShmMpscTransport *GetOrCreateShmConn(const std::string &name);
+
+  /** issue #807: enqueue an owning response future onto the per-destination SHM
+   *  send queue named `dest` and wake the sender thread. Nonblocking; never runs
+   *  serialization or a ring transfer on the caller (worker) thread. */
+  void EnqueueShmSend(const std::string &dest, clio::run::Future<Task> &&future);
+
+  /** issue #807: drain up to `budget` deferred responses across the
+   *  per-destination queues (serialize + MPSC transfer). Called from the
+   *  WORKERS' poll loop — no dedicated sender thread. Returns the count sent. */
+  u32 DrainShmSends(ctp::lbm::Transport *transport, u32 budget);
+  void StartShmServerSendThread();  // #807: no-op (workers drain)
+  void StopShmServerSendThread();   // #807: shutdown flush
 
  private:
 #endif
@@ -1489,7 +1654,7 @@ class IpcManager {
   // inbound ring) and pushes tasks onto worker lanes, mirroring the ZMQ path's
   // ClientRecvThread. Owning the drain here — rather than on a designated
   // worker — is what keeps the schedulers and Worker free of transport state.
-  std::thread shm_in_recv_thread_;
+  std::vector<std::thread> shm_in_recv_threads_;  // #807: one per shard
   std::atomic<bool> shm_in_recv_running_{false};
 
   // Background heartbeat thread for server liveness detection

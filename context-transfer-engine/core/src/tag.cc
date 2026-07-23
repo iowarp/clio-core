@@ -185,6 +185,19 @@ void Tag::GetBlob(const std::string &blob_name, char *data, size_t data_size, si
     throw std::invalid_argument("data buffer must be pre-allocated by caller");
   }
 
+  // issue #783 fast path: for a node-local RAM-resident blob, copy the bytes
+  // straight out of shared memory -- no IPC, no staging buffer, no allocation.
+  // Any failure (not cached, not direct-readable, placement moved mid-copy)
+  // falls through to the RPC path below, so this can only ever be faster or
+  // equivalent, never wrong.
+  {
+    auto *cte_client = CLIO_CTE_CLIENT;
+    if (cte_client->HasShmCache() &&
+        cte_client->TryReadBlobShm(tag_id_, blob_name, data, data_size, off)) {
+      return;
+    }
+  }
+
   // Allocate shared memory for the data
   auto *ipc_manager = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm_fullptr = ipc_manager->AllocateBuffer(data_size);
@@ -239,6 +252,18 @@ float Tag::GetBlobScore(const std::string &blob_name) {
 
 clio::run::u64 Tag::GetBlobSize(const std::string &blob_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
+
+  // issue #783 fast path: answer from the shared-memory metadata cache with
+  // ZERO IPC when the blob is cached. A miss (or an inconsistent read) simply
+  // falls through to the RPC below -- the cache is never treated as
+  // authoritative, and "not cached" must never be reported as "size 0".
+  if (cte_client->HasShmCache()) {
+    ShmBlobRecord rec;
+    if (cte_client->TryGetBlobRecordShm(tag_id_, blob_name, &rec)) {
+      return rec.total_size_;
+    }
+  }
+
   auto task = cte_client->AsyncGetBlobSize(tag_id_, blob_name);
   task.Wait();
 

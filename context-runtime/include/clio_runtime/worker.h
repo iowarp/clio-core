@@ -79,6 +79,8 @@ struct WorkerStats {
   u32 num_retry_tasks_;      /**< Number of tasks in retry queue */
   u32 suspend_period_us_;    /**< Time in microseconds before the worker would suspend */
   u32 idle_iterations_;      /**< Number of consecutive idle iterations */
+  // issue #785: atomic — Stop() is called from another thread while Run() polls
+  // it. TSan flagged the plain bool.
   bool is_running_;          /**< Whether the worker is currently running */
   bool is_active_;           /**< Whether the worker's lane is currently active (processing tasks) */
   u32 worker_id_;            /**< Worker identifier */
@@ -171,13 +173,107 @@ class Worker {
   u32 GetId() const;
 
   /** OS thread id of this worker (valid once Run() has started). #642 */
-  u32 GetTid() const { return tid_; }
+  u32 GetTid() const { return tid_.load(std::memory_order_acquire); }
 
   /**
    * Get the event queue for this worker
    * @return Pointer to this worker's event queue
    */
-  auto *GetEventQueue() { return event_queue_; }
+  auto *GetEventQueue() {
+    return event_queue_.load(std::memory_order_acquire);
+  }
+
+  /** Event-queue element type (completion futures for parked parents). */
+  using EventQueue =
+      ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>,
+                                 ctp::ipc::MallocAllocator>;
+
+  /**
+   * issue #785: take ownership of a stalled worker's event queue.
+   *
+   * The insight that makes this cheap: a parked task holds a raw pointer to the
+   * queue OBJECT (stamped into its RunContext at ProcessNewTask). Transferring
+   * the object — rather than draining its contents — therefore redirects both
+   * the events already queued AND every event a still-running subtask will push
+   * later. No per-task re-pointing and no producer-side handshake is needed,
+   * because nothing about the tasks changes.
+   *
+   * Safe because the donor is stalled inside ExecTask and so is provably not in
+   * ProcessEventQueue. Called on the monitor thread.
+   */
+  void AdoptEventQueue(EventQueue *q) {
+    if (q == nullptr) {
+      return;
+    }
+    // APPEND, never replace. An earlier version stored over event_queue_, which
+    // silently orphaned whatever this worker already owned — a recycled
+    // replacement can hold events for tasks that still point at its original
+    // queue, and those tasks would then never wake. That is task LOSS, not just
+    // a leak. A worker therefore drains its own queue plus every queue it has
+    // adopted.
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    adopted_event_queues_.push_back(q);
+  }
+
+  /**
+   * issue #785: hand off this worker's event queue and install a fresh empty
+   * one, so the donor still has somewhere to put completions for subtasks its
+   * own in-flight task spawns after it recovers.
+   * @return the queue that was released.
+   */
+  EventQueue *ReplaceEventQueue();
+
+  /**
+   * issue #785: hand every queue this worker has ADOPTED to \a dst.
+   *
+   * Rescues cascade — a replacement adopts a donor's queue, then wedges and is
+   * rescued in turn. Without this its adopted queues stay with it and nobody
+   * drains them, so the parked tasks pointing at those queues are stranded
+   * permanently: exactly the failure the adoption was meant to prevent, just
+   * one level deeper. Only the worker's OWN queue moves via ReplaceEventQueue;
+   * this moves the inherited ones.
+   *
+   * Preserves the one-consumer-per-queue invariant: entries are MOVED, never
+   * copied.
+   */
+  void TransferAdoptedEventQueuesTo(Worker *dst) {
+    if (dst == nullptr || dst == this) {
+      return;
+    }
+    // std::lock, matching MigrateParkedTo. Only the monitor thread calls this
+    // today, so a fixed this->dst order would work — but leaving two different
+    // lock orders in the same class is a landmine for whoever adds the second
+    // caller.
+    std::lock(park_mtx_, dst->park_mtx_);
+    std::lock_guard<std::mutex> lk_src(park_mtx_, std::adopt_lock);
+    std::lock_guard<std::mutex> lk_dst(dst->park_mtx_, std::adopt_lock);
+    for (EventQueue *q : adopted_event_queues_) {
+      dst->adopted_event_queues_.push_back(q);
+    }
+    adopted_event_queues_.clear();
+  }
+
+  /**
+   * issue #785: move this worker's PARKED state (blocked / periodic / retry
+   * queues) to \a dst. Completes the rescue: the lane covers tasks not yet
+   * started and the event queue covers tasks parked on a co_await, but a task
+   * that yielded with a timer, or is waiting to be re-routed, sits in a plain
+   * worker-private std::queue that no other thread can reach.
+   *
+   * Periodic tasks matter most here. ProcessPeriodicQueue re-routes each task
+   * through RouteTask every period, so a non-pinned periodic task self-heals
+   * its placement as soon as ANYONE scans it — moving the queue to a live
+   * worker is the whole fix. A wedged worker never scans, so its periodic
+   * tasks simply stop running.
+   *
+   * Both workers' park locks are taken with std::lock to avoid deadlock, and
+   * the lock is never held across ExecTask (see park_mtx_), so a wedged donor
+   * can never block the monitor thread here.
+   *
+   * @param dst worker to receive the parked tasks.
+   * @return number of tasks moved.
+   */
+  size_t MigrateParkedTo(Worker *dst);
 
   /**
    * Check if worker is running
@@ -187,8 +283,27 @@ class Worker {
 
   // --- issue #781: measured-load + stall-detection accessors ---
 
+  /** issue #785: tasks completed by this worker. Read by the monitor thread's
+   *  progress watchdog; relaxed because it only needs to observe CHANGE. */
+  u64 TasksProcessed() const {
+    return num_tasks_processed_.load(std::memory_order_relaxed);
+  }
+
+  /** issue #785: completions of NON-PERIODIC tasks only.
+   *
+   *  The progress watchdog must use this rather than TasksProcessed(). Periodic
+   *  tasks — the network and client-IPC pollers — complete and reschedule
+   *  continuously whether or not the runtime is making real progress, so a
+   *  counter that includes them never stops advancing and the watchdog can
+   *  never fire. Measured: with every worker occupied by a 14 s blocking task
+   *  and nothing else able to run, the all-tasks counter kept climbing and no
+   *  alarm was raised. Polling is not progress. */
+  u64 RealTasksProcessed() const {
+    return num_nonperiodic_processed_.load(std::memory_order_relaxed);
+  }
+
   /** Estimated queued CPU time (us), bumped/decremented around ExecTask. */
-  float Load() const { return load_; }
+  float Load() const { return load_.load(std::memory_order_relaxed); }
 
   /** True while a task is actively executing on this worker. */
   bool IsExecuting() const {
@@ -209,7 +324,7 @@ class Worker {
   double RealtimeLoad(double now_us) const {
     long long start = last_exec_start_us_.load(std::memory_order_relaxed);
     double elapsed = (start != 0) ? (now_us - static_cast<double>(start)) : 0.0;
-    return static_cast<double>(load_) +
+    return static_cast<double>(load_.load(std::memory_order_relaxed)) +
            static_cast<double>(queued_load_us_.load(std::memory_order_relaxed)) +
            elapsed;
   }
@@ -332,6 +447,32 @@ class Worker {
   TaskLane *GetLane() const;
 
   /**
+   * issue #785: take over \a lane from a stalled worker (D5 lane transfer).
+   *
+   * Lanes are allocated 1:1 with num_threads at startup with no spare, so an
+   * elastic worker cannot be given a fresh lane — the rescue moves the wedged
+   * worker's lane instead, which is a swap rather than an allocation. It also
+   * avoids draining a single-consumer MPSC ring from a foreign thread, which is
+   * the "steal-safe pop" problem #781 left open.
+   *
+   * Safe because the donor worker is, by definition of stalled, inside ExecTask
+   * and provably not popping. Republishes the lane's tid so AwakenWorker's
+   * tgkill reaches THIS thread.
+   *
+   * Called on the monitor thread.
+   * @param lane The lane to adopt (may be null to release without adopting).
+   */
+  void AdoptLane(TaskLane *lane);
+
+  /**
+   * issue #785: give up this worker's lane without taking another. Used on the
+   * stalled donor: it keeps running (we cannot interrupt it) but owns nothing,
+   * so nothing new is stranded behind it.
+   * @return The lane that was released (null if it had none).
+   */
+  TaskLane *ReleaseLane();
+
+  /**
    * Set GPU lanes for this worker to process
    * @param lanes Vector of TaskLane pointers for GPU queues
    */
@@ -420,6 +561,17 @@ class Worker {
    */
   bool ProcessNewTask(TaskLane *lane);
 
+  /** issue #807: bind a resolved Future to this worker, route it, and execute it
+   *  INLINE if it maps here (else RouteTask enqueues it to the right worker).
+   *  Shared by the lane path (ProcessNewTask) and the inline SHM-ingest path
+   *  (DrainMyShard). `lane` is where the task's RunContext should point for
+   *  subtask wakeups (the popped lane, or this worker's own lane on ingest). */
+  void RouteAndExec(Future<Task> &future, TaskLane *lane);
+
+  /** issue #807: drain this worker's inbound SHM shard, executing each request
+   *  INLINE (no lane round-trip, no per-request wakeup). Returns count handled. */
+  u32 DrainMyShard();
+
   /**
    * Get the time remaining before the next periodic task should resume
    * Scans all periodic queues to find the task with the shortest remaining time
@@ -447,10 +599,20 @@ class Worker {
   // / task->ResumeCoroutine.
 
   u32 worker_id_;
-  u32 tid_ = 0;  /**< OS thread id, set in Run() (#642) */
-  bool is_running_;
+  // issue #785: atomic. Run() publishes it on the worker thread; AdoptLane
+  // reads it on the monitor thread to republish lane ownership. TSan flagged
+  // the plain u32.
+  std::atomic<u32> tid_{0};  /**< OS thread id, set in Run() (#642) */
+  // issue #785: atomic — Stop() is called from another thread while Run()
+  // polls it. TSan flagged the plain bool.
+  std::atomic<bool> is_running_;
   bool is_initialized_;
-  float load_;          // Estimated total CPU time (us) of active tasks
+  // issue #785: atomic. Written only by the owning worker (ExecTask/EndTask)
+  // but read by the monitor thread via RealtimeLoad() on every LoadBalance
+  // tick, which TSan flags as a race on a plain float. Only load/store is used
+  // — never fetch_add — because atomic<float> RMW is not portable (the #781
+  // atomic<double> fetch_add broke MSVC-STL and icx).
+  std::atomic<float> load_;  // Estimated total CPU time (us) of active tasks
   // issue #781: wall-clock timestamp stamped at the top of ExecTask and cleared
   // when the task returns/yields. While executing, (now() - last_exec_start_) is
   // the current task's elapsed time; the monitor thread uses this to detect a
@@ -471,8 +633,12 @@ class Worker {
   // RunContext lives inside this Task; it is never held as a bare pointer.
   clio::run::shared_ptr<Task> current_task_;
 
-  // Single lane assigned to this worker (one lane per worker)
-  TaskLane *assigned_lane_;
+  // Single lane assigned to this worker (one lane per worker).
+  // issue #785: atomic because the monitor thread reassigns it during a stall
+  // rescue (AdoptLane/ReleaseLane) while this worker is running. Run() re-reads
+  // it every iteration so a wedged worker picks up the change the moment it
+  // finally returns from the bad task.
+  std::atomic<TaskLane *> assigned_lane_;
 
   // GPU lanes assigned to this worker (one lane per GPU, empty when no GPU)
   std::vector<GpuTaskLane *> gpu_lanes_;
@@ -485,6 +651,15 @@ class Worker {
   // - Queue[2]: Tasks blocked <= 8 times (checked every % 8 iterations)
   // - Queue[3]: Tasks blocked > 8 times (checked every % 16 iterations)
   // Using std::queue for O(1) enqueue/dequeue operations
+  // issue #785: guards blocked_queues_, periodic_queues_ and retry_queue_ —
+  // plain std::queues that, before this, only the owning thread ever touched.
+  // The monitor thread takes it to migrate parked work off a stalled worker.
+  //
+  // INVARIANT: never held across ExecTask. Callers pop under the lock, RELEASE,
+  // then execute. That is what guarantees a worker wedged inside a task holds
+  // nothing the monitor thread needs.
+  mutable std::mutex park_mtx_;
+
   static constexpr u32 NUM_BLOCKED_QUEUES = 4;
   static constexpr u32 BLOCKED_QUEUE_SIZE = 1024;
   std::queue<clio::run::shared_ptr<Task>> blocked_queues_[NUM_BLOCKED_QUEUES];
@@ -505,7 +680,13 @@ class Worker {
   // 2x that headroom keeps the WAIT_FOR_SPACE Emplace from ever blocking on a
   // single parent's fan-out (which otherwise self-deadlocks the worker, #620).
   static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
-  ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
+  // issue #785: atomic because the monitor thread reassigns it during a stall
+  // rescue. ProcessEventQueue re-reads it each drain.
+  std::atomic<EventQueue *> event_queue_;
+
+  // issue #785: queues inherited from rescued workers. Drained alongside
+  // event_queue_ so no parked task is ever orphaned. Guarded by park_mtx_.
+  std::vector<EventQueue *> adopted_event_queues_;
 
   // Boost fiber stacks are pooled by the process-wide BoostStackPool() (a
   // per-thread SlabAllocator over BoostStackAllocator), reused by AllocateStack
@@ -527,13 +708,20 @@ class Worker {
   ctp::Timepoint spawn_time_;  // Time when worker was spawned
 
   // Task completion counter (incremented in EndTask)
-  u64 num_tasks_processed_;  // Total tasks completed by this worker
+  // issue #785: atomic — the monitor thread's progress watchdog reads it.
+  std::atomic<u64> num_tasks_processed_;  // Total tasks completed by this worker
+  // issue #785: non-periodic completions only — see RealTasksProcessed().
+  std::atomic<u64> num_nonperiodic_processed_{0};
 
   // Iteration counter for periodic blocked queue checks
   u64 iteration_count_;  // Number of iterations completed
 
   // Sleep management for idle workers
-  u64 idle_iterations_;   // Number of consecutive iterations with no work
+  // issue #785: atomic. GetWorkerStats() is now called from the monitor thread
+  // on every watchdog tick, so this plain counter became a live cross-thread
+  // race (TSan). Relaxed: it is a diagnostic, only its approximate value
+  // matters.
+  std::atomic<u64> idle_iterations_;  // consecutive iterations with no work
   u32 current_sleep_us_;  // Current sleep duration in microseconds
   u64 sleep_count_;  // Number of times sleep was called in current idle period
   ctp::Timepoint idle_start_;  // Time when worker became idle

@@ -128,10 +128,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // otherwise). Same rationale and same lifetime as the threads above: by this
   // point the pool manager, task queue and scheduler it pushes into all exist.
   CLIO_IPC->StartShmServerRecvThread();
+  // issue #807: dedicated background thread that owns SHM response send, so no
+  // worker ever serializes or blocks on a full client ring. Same lifetime.
+  CLIO_IPC->StartShmServerSendThread();
   // Stop recv threads before the main transport is freed.
   CLIO_IPC->RegisterTransportShutdownHook([]() {
     CLIO_IPC->GetRun2Run()->StopRecvThreads();
     CLIO_IPC->StopShmServerRecvThread();
+    CLIO_IPC->StopShmServerSendThread();
   });
 
   // Spawn periodic WreapDeadIpcs task with 1 second period
@@ -587,10 +591,14 @@ clio::run::TaskResume Runtime::ClientConnect(clio::run::shared_ptr<ClientConnect
   task->server_generation_ = CLIO_IPC->GetServerGeneration();
   task->server_pid_ = static_cast<int32_t>(getpid());
   task->worker_queues_off_ = CLIO_IPC->GetWorkerQueuesOffset();
+  // issue #807: tell the client how many inbound SHM rings to shard across.
+  task->shm_in_shards_ = CLIO_CONFIG_MANAGER->GetShmInShards();
   // Report this runtime's pid-based allocator ids so the client attaches the
   // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
   task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
+  // issue #783: tell the client where the metadata-segment directory lives.
+  task->metadata_dir_off_ = CLIO_IPC->GetMetadataDirOffset();
 
   // #642: publish worker OS thread ids so SHM clients can address each worker's
   // "clio-<server_pid>-<worker_tid>" MPSC receive server.

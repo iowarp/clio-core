@@ -176,6 +176,13 @@ class WorkOrchestrator {
   Worker *SpawnAdditionalWorker();
 
   /**
+   * issue #785: find an already-spawned replacement that is idle (no lane, not
+   * executing) so a rescue can reuse it instead of spawning another thread.
+   * Prefer this over SpawnAdditionalWorker(). Monitor thread only.
+   */
+  Worker *FindIdleElasticWorker();
+
+  /**
    * Retire an idle elastic worker spawned by SpawnAdditionalWorker (issue #781):
    * park it, join its thread, and drop it from the pool — the hysteresis that
    * returns the runtime to the minimum thread count after a burst clears.
@@ -217,11 +224,30 @@ class WorkOrchestrator {
   bool is_initialized_ = false;
   bool workers_running_ = false;
 
+  // issue #785: headroom reserved in workers_/all_workers_/worker_threads_ at
+  // Init() for elastic workers spawned later by SpawnAdditionalWorker(). The
+  // reserve is what makes append safe without a lock: push_back cannot
+  // reallocate while readers on other threads hold Worker* or index the vector,
+  // so growth is a pure append and existing entries never move. Reaching this
+  // cap is a hard stop rather than a reallocation.
+  static constexpr u32 kElasticHeadroom = 64;
+
   // Worker ownership container (owns all worker unique_ptrs)
   std::vector<std::unique_ptr<Worker>> workers_;
 
   // All workers for easy access (raw pointers to owned workers)
   std::vector<Worker*> all_workers_;
+
+  // issue #785: number of entries in all_workers_ that are fully constructed
+  // and safe for another thread to read. Published with release ordering AFTER
+  // the worker is in both vectors; readers (GetWorker/GetWorkerCount, and thus
+  // ClientConnect's worker-tid publication) acquire it. all_workers_.size() is
+  // NOT safe to read concurrently with a spawn.
+  std::atomic<size_t> num_workers_published_{0};
+
+  // issue #785: workers created at Init. Anything at or beyond this index is an
+  // elastic replacement and is eligible for reuse.
+  size_t baseline_worker_count_ = 0;
 
   // Active lanes pointer to IPC Manager worker queues
   void* active_lanes_;

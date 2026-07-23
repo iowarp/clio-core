@@ -11,34 +11,38 @@
 
 namespace clio::run {
 
-bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
-  // Drain the runtime's SINGLE inbound ring (shm_in_server_, DONTWAIT) and
-  // enqueue any received external-client task onto the normal dispatch path.
-  // The only caller is IpcManager::RecvShmServerThread, a dedicated non-worker
-  // thread — that satisfies the ring's single-consumer contract on its own and
-  // keeps every byte of task/future deserialization off the workers.
-  if (!ipc->shm_in_server_ok_) {
-    return false;
+Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
+  // Drain ONE task off inbound shard ring `shard` (DONTWAIT) and return it as a
+  // resolved Future for the CALLING WORKER to route + execute INLINE. issue #807:
+  // the ingesting worker executes the request itself (when it maps here) instead
+  // of pushing to a lane and SIGUSR1-waking a worker — that lane round-trip and
+  // per-request signal syscall were the bulk of the added latency vs the
+  // original inline design. Returns an empty Future (get()==nullptr) when the
+  // ring is empty. Each shard has exactly one consumer (worker `shard`), so the
+  // MPSC contract holds.
+  if (!ipc->shm_in_server_ok_ || shard >= ipc->shm_in_servers_.size() ||
+      ipc->shm_in_servers_[shard] == nullptr) {
+    return Future<Task>();
   }
   LoadTaskArchive archive;
   ctp::lbm::ClientInfo info =
-      ipc->shm_in_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      ipc->shm_in_servers_[shard]->Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
   if (info.rc != 0) {
-    return false;
+    return Future<Task>();
   }
   const auto &tis = archive.GetTaskInfos();
   if (tis.empty()) {
-    return false;
+    return Future<Task>();
   }
   const auto &ti = tis[0];
   auto container = CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_).get();
   if (container == nullptr) {
-    return false;
+    return Future<Task>();
   }
   clio::run::shared_ptr<clio::run::Task> tp =
       container->AllocLoadTask(ti.method_id_, archive);
   if (tp.IsNull()) {
-    return false;
+    return Future<Task>();
   }
   tp->SetFlags(TASK_EXTERNAL_CLIENT);
   // The Future owns the FutureShm via shared_ptr; pushing it onto the lane
@@ -65,15 +69,8 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  // issue #781: ClientMapTask removed. Like the ZMQ client recv thread
-  // (IpcCpu2CpuZmq::RecvIn), this SHM recv path deposits on the shared ingress
-  // lane (0); the runtime maps the task to a worker via RuntimeMapTask. Always
-  // signal: see ipc_cpu2cpu_impl.h for the enqueue/sleep race this closes.
-  LaneId lane_id = 0;
-  auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
-  lane_ref.Push(f);
-  ipc->AwakenWorker(&lane_ref);
-  return true;
+  // Return the resolved future; the calling worker routes + executes it inline.
+  return f;
 }
 
 clio::run::shared_ptr<clio::run::Task> IpcCpu2Cpu::RecvIn(
@@ -90,6 +87,37 @@ clio::run::shared_ptr<clio::run::Task> IpcCpu2Cpu::RecvIn(
 }
 
 void IpcCpu2Cpu::SendOut(
+    IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
+    ctp::lbm::Transport *send_transport) {
+  // issue #807: two paths.
+  //
+  // Default (fast): serialize + transfer INLINE on the worker, right here. The
+  // client's dedicated recv thread always drains its out-ring, so this Send only
+  // ever blocks transiently under back-pressure, never deadlocks (that is what
+  // the #768 refactor's client recv thread guarantees). Measured ~3x faster than
+  // the deferred path on latency-bound workloads, because there is no thread
+  // handoff on the critical path.
+  //
+  // Opt-in (CLIO_SHM_ASYNC_SEND): enqueue an OWNING future onto the destination's
+  // per-client send queue and return nonblocking; the background sender thread
+  // does the transfer. This never stalls a worker on a full client ring, which
+  // matters under sustained overload — at a latency cost that is pure overhead
+  // when the ring is not full. The owning copy is mandatory (same non-owning
+  // self-handle hazard as IpcCpu2CpuZmq::EnqueueSendOut): RunFuture's task_ptr
+  // may be a non-owning self-handle, so we take an owning copy to keep the task
+  // alive until the sender drains it.
+  if (!CLIO_CONFIG_MANAGER->GetShmAsyncSend()) {
+    SendOutTransfer(ipc, task_ptr, send_transport);
+    return;
+  }
+  clio::run::Future<Task> owning = task_ptr->RunFuture();
+  owning.GetTaskPtr() = task_ptr;
+  std::string dest =
+      "clio-" + std::to_string(task_ptr->WaiterPid()) + "-shm-out";
+  ipc->EnqueueShmSend(dest, std::move(owning));
+}
+
+void IpcCpu2Cpu::SendOutTransfer(
     IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
     ctp::lbm::Transport *send_transport) {
   clio::run::ContainerHold container =

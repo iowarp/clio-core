@@ -45,7 +45,23 @@ float FrecencyDataOrganizer::ComputeScore(const OrganizerBlobStat &stat,
   // steady-clock ns; guard against a stamp taken after `now` was sampled.
   Timestamp last_access = std::max(stat.last_read_, stat.last_modified_);
   double age_sec = 0.0;
-  if (now > last_access) {
+  if (last_access == 0) {
+    // No access has been recorded yet — the blob was observed between its
+    // insertion into the metadata map and the write of its timestamps.
+    //
+    // Zero is a sentinel, NOT a point in time. Computing `now - 0` here
+    // would yield the full value of the steady_clock counter, whose epoch
+    // is machine boot, so a blob written seconds ago would score as though
+    // it were as old as the machine's uptime — demoting brand-new data to
+    // the slow tier, and making the outcome depend on how long the host had
+    // been running. That is issue #792; it flaked cte_data_organizer_all
+    // whenever CI runners had been up longer than ~17 minutes.
+    //
+    // Treat it as just-accessed: a blob with no recorded access is new, not
+    // ancient. Collection also skips these (see CollectOrganizerBlobStats),
+    // so this is a second line of defence for any other caller.
+    age_sec = 0.0;
+  } else if (now > last_access) {
     age_sec = static_cast<double>(now - last_access) / 1e9;
   }
 

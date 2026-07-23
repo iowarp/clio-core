@@ -19,6 +19,12 @@ set(WAIT_FUNCTIONALITY_TEST_SOURCES
   test_wait_functionality.cc
 )
 
+# issue #785: stalled-worker migration / task-drop tests
+set(STALL_MIGRATION_TEST_TARGET clio_run_stall_migration_tests)
+set(STALL_MIGRATION_TEST_SOURCES
+  test_stall_migration.cc
+)
+
 # Streaming test executable
 set(STREAMING_TEST_TARGET clio_run_streaming_tests)
 set(STREAMING_TEST_SOURCES
@@ -112,6 +118,34 @@ set_target_properties(${WAIT_FUNCTIONALITY_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${WAIT_FUNCTIONALITY_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create stall-migration test executable (issue #785)
+add_executable(${STALL_MIGRATION_TEST_TARGET} ${STALL_MIGRATION_TEST_SOURCES})
+
+target_include_directories(${STALL_MIGRATION_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+  ${CLIO_RUN_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks and client
+)
+
+target_link_libraries(${STALL_MIGRATION_TEST_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${STALL_MIGRATION_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${STALL_MIGRATION_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

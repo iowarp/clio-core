@@ -120,6 +120,17 @@ struct CreateParams {
   // gpu_metadata_cache.h header for the eventual extension).
   clio::run::u64 gpu_cache_ptr_ = 0;
 
+  // OUT: byte offset of the CTE shared-memory metadata cache root within the
+  // runtime's metadata allocator (issue #783). 0 means caching is disabled --
+  // no metadata segment, or the cache could not be built -- and the client
+  // must simply use the RPC path.
+  //
+  // UNLIKE gpu_cache_ptr_ above, this is genuinely cross-process valid: it is
+  // an OFFSET into a segment both processes map, not a raw address. That is
+  // the whole reason the cache can be read by another process at all; a
+  // pointer here would resolve to garbage in the client.
+  clio::run::u64 shm_cache_root_off_ = 0;
+
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_cte_core";
 
@@ -129,13 +140,15 @@ struct CreateParams {
   // Copy constructor (required for task creation)
   CreateParams(const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_) {}
+        gpu_cache_ptr_(other.gpu_cache_ptr_),
+        shm_cache_root_off_(other.shm_cache_root_off_) {}
 
   // Constructor with pool_id and CreateParams (required for admin
   // task creation)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_) {
+        gpu_cache_ptr_(other.gpu_cache_ptr_),
+        shm_cache_root_off_(other.shm_cache_root_off_) {
     // pool_id is used by the admin task framework, but we don't need to store
     // it
     (void)pool_id;  // Suppress unused parameter warning
@@ -162,7 +175,8 @@ struct CreateParams {
        config_.organizer_.name_,
        config_.organizer_.organizer_tasks_,
        config_.organizer_.period_ms_,
-       gpu_cache_ptr_);
+       gpu_cache_ptr_,
+       shm_cache_root_off_);
   }
 
   /**

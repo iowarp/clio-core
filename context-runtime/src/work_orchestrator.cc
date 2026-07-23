@@ -95,6 +95,14 @@ bool WorkOrchestrator::Init() {
          total_workers, num_task_workers);
   }
 
+  // issue #785: reserve elastic headroom BEFORE creating any worker. Every
+  // later SpawnAdditionalWorker() is then a pure append that cannot reallocate,
+  // so Worker* held by other threads stay valid and no lock is needed on the
+  // read path.
+  workers_.reserve(total_workers + kElasticHeadroom);
+  all_workers_.reserve(total_workers + kElasticHeadroom);
+  worker_threads_.reserve(total_workers + kElasticHeadroom);
+
   // Create all workers
   // The scheduler will partition them into groups via DivideWorkers()
   for (u32 i = 0; i < total_workers; ++i) {
@@ -102,6 +110,8 @@ bool WorkOrchestrator::Init() {
       return false;
     }
   }
+  num_workers_published_.store(all_workers_.size(), std::memory_order_release);
+  baseline_worker_count_ = all_workers_.size();  // #785: elastic growth starts here
 
   // Mark as initialized so GetWorker() works during DivideWorkers
   is_initialized_ = true;
@@ -215,7 +225,10 @@ void WorkOrchestrator::StopWorkers() {
 }
 
 Worker *WorkOrchestrator::GetWorker(u32 worker_id) const {
-  if (!is_initialized_ || worker_id >= all_workers_.size()) {
+  // issue #785: bound by the PUBLISHED count, not all_workers_.size(), so a
+  // concurrent SpawnAdditionalWorker() can never expose a half-built worker.
+  if (!is_initialized_ ||
+      worker_id >= num_workers_published_.load(std::memory_order_acquire)) {
     return nullptr;
   }
 
@@ -223,7 +236,9 @@ Worker *WorkOrchestrator::GetWorker(u32 worker_id) const {
 }
 
 size_t WorkOrchestrator::GetWorkerCount() const {
-  return is_initialized_ ? all_workers_.size() : 0;
+  return is_initialized_
+             ? num_workers_published_.load(std::memory_order_acquire)
+             : 0;
 }
 
 bool WorkOrchestrator::IsInitialized() const { return is_initialized_; }
@@ -430,14 +445,136 @@ void WorkOrchestrator::MonitorLoop() {
 }
 
 Worker *WorkOrchestrator::SpawnAdditionalWorker() {
-  // TODO(#781): create a Worker + lane, register in all_workers_/worker_threads_,
-  // and thread_model_->Spawn its Run() — the dynamic-growth path the fixed-pool
-  // Init does not provide today. Returns nullptr until wired.
+  // issue #785. Called from Scheduler::LoadBalance() on the monitor thread when
+  // a worker is wedged inside a non-yielding task.
+  //
+  // The new worker starts with NO lane. Lanes are allocated 1:1 with
+  // num_threads when the TaskQueue is constructed (ipc_manager.cc:1021) and
+  // there is no spare, so an elastic worker cannot be given one. It does not
+  // need one: the rescue path TRANSFERS the stalled worker's lane to it
+  // (Worker::AdoptLane), which is a swap rather than an allocation. Until then
+  // it runs its loop harmlessly — Worker::Run() and SuspendMe() both guard on a
+  // null assigned_lane_.
+  if (!is_initialized_) {
+    return nullptr;
+  }
+  if (all_workers_.size() >= all_workers_.capacity()) {
+    HLOG(kWarning,
+         "[#785] elastic worker cap reached ({} workers); refusing to spawn. "
+         "Growing past the reserve would reallocate all_workers_ under readers "
+         "on other threads.",
+         all_workers_.capacity());
+    return nullptr;
+  }
+
+  // issue #785: BOUND THE POOL BY CONCURRENT, NOT CUMULATIVE, STALLS.
+  //
+  // #781 chose an unbounded elastic pool. That is sound as long as replacements
+  // are REUSED, because the pool then tracks how many workers are wedged at
+  // once, which is self-limiting. Spawning a fresh thread per rescue instead
+  // makes it track the TOTAL number of stalls over the process lifetime, which
+  // grows without bound on a long-running daemon. Callers must try
+  // FindIdleElasticWorker() first.
+  //
+  // The ceiling is baseline + one thread per core: a replacement only buys
+  // parallelism if there is a core to run it on, and a non-yielding task never
+  // deschedules itself, so threads past that point take cycles from the tasks
+  // we are trying to unblock rather than adding throughput.
+  // Must match ConfigManager::GetElasticLaneHeadroom exactly: lanes are
+  // reserved for worker ids baseline..baseline+headroom, so spawning past the
+  // headroom would create a worker with no lane — routable-to by id but with
+  // nothing consuming it, which silently swallows tasks.
+  ConfigManager *cfg = CLIO_CONFIG_MANAGER;
+  size_t elastic_budget =
+      cfg ? static_cast<size_t>(cfg->GetElasticLaneHeadroom()) : 8;
+  if (all_workers_.size() >= baseline_worker_count_ + elastic_budget) {
+    HLOG(kWarning,
+         "[#785] NOT spawning: {} workers >= baseline {} + {} cores. The pool "
+         "is CPU-bound; another thread would only take cycles from running "
+         "tasks. Backlog on the stalled worker stays queued.",
+         all_workers_.size(), baseline_worker_count_, elastic_budget);
+    return nullptr;
+  }
+
+  u32 worker_id = static_cast<u32>(all_workers_.size());
+  auto worker = std::make_unique<Worker>(worker_id);
+  if (!worker->Init()) {
+    HLOG(kError, "[#785] elastic worker {} failed to Init", worker_id);
+    return nullptr;
+  }
+
+  Worker *worker_ptr = worker.get();
+
+  // issue #785: hand it the lane reserved for this worker id. Lanes are indexed
+  // by worker id because RouteTask resolves GetLane(dest_worker_id, 0), so
+  // without this a replacement can never be routed to and cannot receive
+  // redistributed work — which is exactly what small tasks stuck behind heavy
+  // ones need.
+  IpcManager *ipc = CLIO_IPC;
+  TaskQueue *queues = ipc ? ipc->GetTaskQueue() : nullptr;
+  if (queues != nullptr && worker_id < queues->GetNumLanes()) {
+    TaskLane *lane = &queues->GetLane(worker_id, 0);
+    lane->SetAssignedWorkerId(worker_id);
+    worker_ptr->SetLane(lane);
+  } else {
+    HLOG(kWarning,
+         "[#785] elastic worker {} has no reserved lane (lanes={}); it can "
+         "drain adopted state but cannot be routed to",
+         worker_id, queues ? queues->GetNumLanes() : 0);
+  }
+
+  workers_.push_back(std::move(worker));
+  all_workers_.push_back(worker_ptr);
+
+  // Spawn the thread BEFORE publishing: a reader that can see the worker must
+  // be able to assume it is running. Worker::Run() is self-initialising (it
+  // creates its own IpcManagerTls, registers its signal event and publishes its
+  // tid), so a late-spawned worker needs no extra setup here.
+  try {
+    ctp::thread::Thread thread = CTP_THREAD_MODEL->Spawn(
+        thread_group_, [worker_ptr](int tid) { worker_ptr->Run(); },
+        static_cast<int>(worker_id));
+    worker_threads_.emplace_back(std::move(thread));
+  } catch (const std::exception &e) {
+    HLOG(kError, "[#785] elastic worker {} thread spawn failed: {}", worker_id,
+         e.what());
+    return nullptr;
+  }
+
+  num_workers_published_.fetch_add(1, std::memory_order_release);
+  HLOG(kWarning, "[#785] spawned elastic worker {} (pool now {} workers)",
+       worker_id, num_workers_published_.load(std::memory_order_relaxed));
+  return worker_ptr;
+}
+
+Worker *WorkOrchestrator::FindIdleElasticWorker() {
+  // issue #785: a replacement that finished its rescued work sits idle with no
+  // lane. Reusing it keeps the pool proportional to how many workers are wedged
+  // AT ONCE rather than how many have ever been wedged.
+  for (size_t i = baseline_worker_count_; i < all_workers_.size(); ++i) {
+    Worker *w = all_workers_[i];
+    // Idle == not currently running a task.
+    if (w != nullptr && !w->IsExecuting()) {
+      return w;
+    }
+  }
   return nullptr;
 }
 
 void WorkOrchestrator::RetireWorker(Worker *worker) {
-  // TODO(#781): park + join an idle elastic worker and drop it from the pool.
+  // issue #785: deliberately still a no-op, and not merely unimplemented.
+  //
+  // Runtime::ClientConnect publishes worker OS tids to every connecting client
+  // (#642) so SHM clients can address "clio-<pid>-<tid>" mailboxes directly.
+  // That list is a snapshot taken at connect time. Retiring a worker whose tid
+  // has been published would leave clients addressing a dead mailbox, and tasks
+  // sent there are never consumed — a task-loss bug strictly worse than the
+  // thread it would reclaim. Retirement is an optimisation; correctness is not
+  // negotiable for it.
+  //
+  // Reclaiming threads safely needs one of: a generation bump plus client
+  // re-fetch, or the replacement worker continuing to drain the retired
+  // worker's mailbox. Neither is in scope for this issue.
   (void)worker;
 }
 

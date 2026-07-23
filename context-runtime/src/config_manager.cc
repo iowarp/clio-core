@@ -38,6 +38,7 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/ipc_manager.h"
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 
@@ -45,6 +46,83 @@
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::ConfigManager, g_config_manager);
 
 namespace clio::run {
+
+namespace {
+
+/**
+ * Parse a shared-memory segment size from YAML.
+ *
+ * Accepts either a bare byte count (`metadata_segment_size: 1073741824`) or a
+ * size string with a unit suffix (`metadata_segment_size: "1g"`), matching how
+ * the CTE spells storage capacities. A value of 0 means "use the built-in
+ * default" — the same sentinel LoadDefault() installs.
+ *
+ * Returns false and leaves `out` untouched when the value cannot be parsed, so
+ * the caller keeps its default. Deliberately does NOT delegate an unknown
+ * suffix to ctp::ConfigParse::ParseSize, which calls exit(1) on one: a typo in
+ * a config file should not take the runtime down, and the recognised suffixes
+ * are checked here first.
+ */
+bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+                          size_t &out) {
+  std::string text;
+  try {
+    text = node.as<std::string>();
+  } catch (const std::exception &) {
+    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
+    return false;
+  }
+  if (text.empty()) {
+    HLOG(kError, "Config: {} is empty; ignoring", key);
+    return false;
+  }
+
+  // Locate the unit suffix (first character that is not part of the number).
+  size_t i = 0;
+  if (text[i] == '+' || text[i] == '-') ++i;
+  size_t digits_begin = i;
+  while (i < text.size() && ((text[i] >= '0' && text[i] <= '9') ||
+                             text[i] == '.')) {
+    ++i;
+  }
+  if (i == digits_begin) {
+    HLOG(kError, "Config: {} = '{}' has no numeric part; ignoring", key, text);
+    return false;
+  }
+  if (text[0] == '-') {
+    HLOG(kError, "Config: {} = '{}' is negative; ignoring", key, text);
+    return false;
+  }
+
+  std::string suffix;
+  for (size_t j = i; j < text.size(); ++j) {
+    if (!std::isspace(static_cast<unsigned char>(text[j]))) {
+      suffix += static_cast<char>(std::tolower(
+          static_cast<unsigned char>(text[j])));
+    }
+  }
+  // Bare number, or a unit ParseSize understands (it keys off the first
+  // character, so "gb"/"gigabytes" resolve the same as "g").
+  const bool suffix_ok =
+      suffix.empty() || suffix[0] == 'b' || suffix[0] == 'k' ||
+      suffix[0] == 'm' || suffix[0] == 'g' || suffix[0] == 't' ||
+      suffix[0] == 'p';
+  if (!suffix_ok) {
+    HLOG(kError, "Config: {} = '{}' has an unrecognised unit '{}'; ignoring "
+         "(expected one of b, k, m, g, t, p)", key, text, suffix);
+    return false;
+  }
+
+  // "b"/"bytes" is a bare byte count; ParseSize treats an unrecognised
+  // leading 'b' as a fatal unit, so strip it and let the empty-suffix path
+  // handle it.
+  const std::string for_parse =
+      (!suffix.empty() && suffix[0] == 'b') ? text.substr(0, i) : text;
+  out = static_cast<size_t>(ctp::ConfigParse::ParseSize(for_parse));
+  return true;
+}
+
+}  // namespace
 
 // Constructor and destructor removed - handled by CTP singleton pattern
 
@@ -106,6 +184,34 @@ void ConfigManager::ApplyEnvOverrides() {
     unsigned long n = std::strtoul(env, &end, 10);
     if (end != env && n >= 1) {
       num_threads_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #807: number of parallel inbound SHM rings (each with its own drain
+  // thread). CLIO_SHM_IN_SHARDS overrides. Default 4 spreads the MPSC tail
+  // contention and the deserialize+route work across cores without oversubscribing
+  // a small box; 1 restores the single-ring behaviour.
+  if (const char *env = clio::run::env::GetCompat("SHM_IN_SHARDS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      shm_in_shards_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #807: CLIO_SHM_ASYNC_SEND=1 defers SHM response send to a background
+  // thread. Off by default (see GetShmAsyncSend — 3x latency regression on
+  // latency-bound workloads).
+  if (const char *env = clio::run::env::GetCompat("SHM_ASYNC_SEND")) {
+    shm_async_send_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T');
+  }
+
+  // issue #807/#784: CLIO_SHM_CLIENT_SPIN_US — waiter spin-before-park budget.
+  if (const char *env = clio::run::env::GetCompat("SHM_CLIENT_SPIN_US")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env) {
+      shm_client_spin_us_ = static_cast<u32>(n);
     }
   }
 }
@@ -211,6 +317,9 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
   case kQueueSegment:
     segment_name = queue_segment_name_;
     break;
+  case kMetadataSegment:
+    segment_name = metadata_segment_name_;
+    break;
   default:
     return "";
   }
@@ -250,6 +359,8 @@ void ConfigManager::LoadDefault() {
   // Set default shared memory segment names with environment variables
   main_segment_name_ = "chi_main_segment_${USER}";
   client_data_segment_name_ = "chi_client_data_segment_${USER}";
+  metadata_segment_name_ = "chi_metadata_segment_${USER}";
+  metadata_segment_size_ = 0;  // 0 means auto-calculate
 
   // Set default hostfile path (empty means no networking/distributed mode)
   hostfile_path_ = "";
@@ -306,6 +417,22 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Task load prediction model learning rate
     if (runtime["learning_rate"]) {
       learning_rate_ = runtime["learning_rate"].as<float>();
+    }
+
+    // Size of the runtime-wide metadata segment (issue #783), which backs the
+    // CTE's shared-memory tag/blob maps. Accepts a byte count or a size string
+    // ("8g", "512MB"); 0 restores the built-in default.
+    //
+    // This needs to be tunable because the 8 GB default is more than some
+    // hosts can back. On Windows CI, CreateFileMapping cannot reserve it and
+    // the runtime falls back to the no-cache path, silently disabling the
+    // feature — with no way to ask for a smaller segment instead.
+    if (runtime["metadata_segment_size"]) {
+      size_t parsed = 0;
+      if (ParseSegmentSizeNode(runtime["metadata_segment_size"],
+                               "metadata_segment_size", parsed)) {
+        metadata_segment_size_ = parsed;
+      }
     }
 
     // Note: stack_size parameter removed (was never used)
@@ -459,13 +586,32 @@ size_t ConfigManager::CalculateMainSegmentSize() const {
   return ctp::Unit<size_t>::Gigabytes(1);
 }
 
+size_t ConfigManager::CalculateMetadataSegmentSize() const {
+  // If metadata_segment_size is explicitly set (non-zero), use it
+  if (metadata_segment_size_ > 0) {
+    return metadata_segment_size_;
+  }
+
+  // Default 8 GB. This is an address-space reservation, not an allocation: the
+  // segment is never pre-faulted, so only pages the runtime actually writes
+  // consume RAM. Sized generously because the CTE metadata cache (issue #783)
+  // holds one entry per live tag and blob, and growing the segment later would
+  // invalidate every client's mapping.
+  return ctp::Unit<size_t>::Gigabytes(8);
+}
+
 size_t ConfigManager::CalculateQueueSegmentSize() const {
   // Queue segment holds TaskQueue and NetQueue ring buffers (ArenaAllocator)
   constexpr size_t BASE_OVERHEAD = 4 * 1024 * 1024;  // 4MB for allocator metadata
   constexpr u32 NUM_PRIORITIES = 2;                   // normal + resumed
 
-  // Calculate total workers: num_threads + 1 network worker
-  u32 total_workers = num_threads_ + 1;
+  // issue #785: size for the elastic replacements too. Lanes are indexed by
+  // worker id (RouteTask resolves GetLane(dest_worker_id, 0)), so a worker
+  // spawned later has no lane at all unless one was reserved up front — and a
+  // worker with no lane can neither be routed to nor receive redistributed
+  // work, which is the constraint that made head-of-line blocking
+  // unrecoverable under saturation.
+  u32 total_workers = num_threads_ + 1 + GetElasticLaneHeadroom();
 
   // Calculate worker task queues size: TaskQueue with total_workers lanes
   size_t worker_queues_size = TaskQueue::CalculateSize(

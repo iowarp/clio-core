@@ -633,6 +633,26 @@ using DestroyTask = DestroyPoolTask;
  * Polls net_queue_ for tasks and sends them to remote nodes
  * This is a periodic task similar to RecvTask
  */
+// issue #785 / D8: scheduling affinity groups for the network periodics.
+//
+// Tasks in a TaskGroup are pinned to the same worker once routed
+// (Container::task_group_map_). The grouping follows SOCKET OWNERSHIP, not
+// verb, because "ZeroMQ sockets are not safe to share across threads, so each
+// socket has exactly one owner thread" (see DefaultScheduler::RuntimeMapTask).
+//
+// Group ids are Container-scoped, so these only need to be unique within the
+// admin pool. Named rather than bare literals: kSend and kRecv previously BOTH
+// used TaskGroup(0), and since RuntimeMapTask consults the group map BEFORE the
+// periodic role table and the insert is first-writer-wins, whichever routed
+// first bound the group and the other simply followed it — silently defeating
+// the deliberate send/recv split (keeping outbound DEALER sends off the recv
+// worker so inbound SWIM probes still get polled). Separate groups restore it.
+static constexpr int64_t kGroupNetPeerSend = 0;  ///< kSend: peer DEALER pool
+static constexpr int64_t kGroupNetPeerRecv = 1;  ///< kRecv: peer ROUTER (9413)
+static constexpr int64_t kGroupNetClient = 2;    ///< kClientRecv + kClientSend
+                                                 ///< share the client ROUTER,
+                                                 ///< so they MUST co-locate.
+
 struct SendTask : public clio::run::Task {
   // Network transfer parameters
   IN clio::run::u32 transfer_flags_;  ///< Flags controlling transfer behavior
@@ -657,7 +677,7 @@ struct SendTask : public clio::run::Task {
     method_ = Method::kSend;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    task_group_ = clio::run::TaskGroup(0);  // Network tasks in affinity group 0
+    task_group_ = clio::run::TaskGroup(kGroupNetPeerSend);
   }
 
   /**
@@ -726,7 +746,7 @@ struct RecvTask : public clio::run::Task {
     method_ = Method::kRecv;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    task_group_ = clio::run::TaskGroup(0);  // Network tasks in affinity group 0
+    task_group_ = clio::run::TaskGroup(kGroupNetPeerRecv);
   }
 
   /**
@@ -786,6 +806,9 @@ struct ClientConnectTask : public clio::run::Task {
 
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within queue allocator
+  // issue #807: number of parallel inbound SHM rings the runtime is draining.
+  // The client shards its requests across clio-<pid>-shm-in-<k> for k in [0,S).
+  OUT clio::run::u32 shm_in_shards_;
 
   // #642: worker OS thread ids so an SHM client can address each worker's
   // "clio-<server_pid>-<worker_tid>" MPSC receive server.
@@ -798,6 +821,11 @@ struct ClientConnectTask : public clio::run::Task {
   // rather than assuming (1,0)/(2,0).
   OUT ctp::ipc::AllocatorId main_alloc_id_;
   OUT ctp::ipc::AllocatorId queue_alloc_id_;
+  // issue #783: offset of the MetadataDirectory inside the metadata segment,
+  // or 0 when the runtime has no metadata segment. Sent here rather than on a
+  // per-module Create path so discovery does not depend on which client
+  // happened to create a pool first.
+  OUT clio::run::u64 metadata_dir_off_;
 
   // GPU queue info (populated by server if GPUs are present)
   OUT clio::run::u32 num_gpus_;  ///< Number of GPU devices
@@ -816,6 +844,7 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        shm_in_shards_(1),
         num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -837,6 +866,7 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        shm_in_shards_(1),
         num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -863,7 +893,8 @@ struct ClientConnectTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(response_, server_generation_, server_pid_, worker_queues_off_,
-       main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_);
+       main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_,
+       metadata_dir_off_, shm_in_shards_);
     ar(num_worker_tids_);
     for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
       ar(worker_tids_[i]);
@@ -889,6 +920,7 @@ struct ClientConnectTask : public clio::run::Task {
     worker_queues_off_ = other->worker_queues_off_;
     main_alloc_id_ = other->main_alloc_id_;
     queue_alloc_id_ = other->queue_alloc_id_;
+    metadata_dir_off_ = other->metadata_dir_off_;
     num_gpus_ = other->num_gpus_;
     gpu_queue_depth_ = other->gpu_queue_depth_;
     memcpy(cpu2gpu_queue_off_, other->cpu2gpu_queue_off_,
@@ -932,6 +964,12 @@ struct ClientRecvTask : public clio::run::Task {
     method_ = Method::kClientRecv;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    // issue #785 / D8: kClientRecv and kClientSend drive the SAME
+    // client-facing ROUTER socket, so they must never run on two workers
+    // at once. Today they co-locate only because the periodic role table
+    // sends both to net_recv_worker_; stating it as a group makes the
+    // constraint explicit and survives that table being removed.
+    task_group_ = clio::run::TaskGroup(kGroupNetClient);
   }
 
   template <typename Archive>
@@ -977,6 +1015,12 @@ struct ClientSendTask : public clio::run::Task {
     method_ = Method::kClientSend;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    // issue #785 / D8: kClientRecv and kClientSend drive the SAME
+    // client-facing ROUTER socket, so they must never run on two workers
+    // at once. Today they co-locate only because the periodic role table
+    // sends both to net_recv_worker_; stating it as a group makes the
+    // constraint explicit and survives that table being removed.
+    task_group_ = clio::run::TaskGroup(kGroupNetClient);
   }
 
   template <typename Archive>

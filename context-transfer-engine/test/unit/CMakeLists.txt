@@ -1120,6 +1120,29 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # GPU metadata cache unit tests — pure POD header, CPU-testable
 # ------------------------------------------------------------------------------
+add_executable(test_cte_shm_metadata_cache
+    test_cte_shm_metadata_cache.cc
+)
+
+target_link_libraries(test_cte_shm_metadata_cache
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_shm_metadata_cache_all
+    COMMAND test_cte_shm_metadata_cache)
+
+set_tests_properties(
+    cte_shm_metadata_cache_all
+    PROPERTIES TIMEOUT 120
+)
+
 add_executable(test_cte_gpu_metadata_cache
     test_cte_gpu_metadata_cache.cc
 )

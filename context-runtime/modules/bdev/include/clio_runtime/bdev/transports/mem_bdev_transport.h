@@ -8,8 +8,12 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
-#include <mutex>
+// Must follow the runtime headers above: posix_shm_mmap.h needs the memory
+// backend base types they pull in.
+#include <clio_ctp/memory/backend/posix_shm_mmap.h>
 #include <limits>
+#include <mutex>
+#include <string>
 
 namespace clio::run::bdev {
 
@@ -44,6 +48,73 @@ class MemBdevTransport : public BdevTransport {
   bool force_sync_gpu_{false};
 
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
+
+ public:
+  /**
+   * Header at the start of a RAM bdev's shared-memory segment (issue #783).
+   *
+   * Lets a client sanity-check a segment it attached by NAME before trusting
+   * any offset in it. POD, fixed layout, no pointers.
+   */
+  struct ShmRamHeader {
+    static constexpr clio::run::u32 kVersion = 1;
+    clio::run::u32 version_;
+    clio::run::u32 ready_;      /**< 0 until the mapping is usable */
+    clio::run::u64 capacity_;   /**< bytes of addressable device space */
+    clio::run::u64 data_off_;   /**< offset from header start to byte 0 */
+    clio::run::u64 reserved_[5];
+  };
+
+  /**
+   * Deterministic segment name for a node-local RAM bdev.
+   *
+   * Derived purely from (runtime pid, pool id) so a client can construct it
+   * from information it already has -- the server pid from ClientConnect and
+   * the target pool id carried in each cached block descriptor. That removes
+   * any need to publish a name or a page table separately.
+   */
+  static std::string ShmSegmentName(clio::run::u32 server_pid,
+                                    const clio::run::PoolId &pool_id) {
+    return "clio_rambdev_" + std::to_string(server_pid) + "_" +
+           std::to_string(pool_id.major_) + "_" +
+           std::to_string(pool_id.minor_);
+  }
+
+ private:
+  // issue #783: when this is a node-local kRam device, its bytes live in a
+  // dedicated shared-memory segment so client processes can read blob payloads
+  // directly instead of paying a round-trip.
+  //
+  // The whole capacity is mapped as ONE contiguous sparse region rather than a
+  // page table: these segments are memfd-backed, so an untouched reservation
+  // costs nothing, and a flat mapping means a reader resolves a block offset
+  // with an addition instead of chasing an index. kRamPageSize is retained
+  // only to keep the existing paged call sites unchanged.
+  /** Create the shared-memory backing for a node-local RAM device. */
+  void InitShmBacking(const clio::run::PoolId &pool_id);
+
+  /**
+   * True if this page's START lies inside the shared mapping.
+   *
+   * Deliberately NOT "the whole 1 GiB page fits": a device smaller than one
+   * page has a partial page 0, and requiring the full page rejected it --
+   * which silently pushed every RAM bdev back to the private heap and broke
+   * direct payload reads. Callers clamp their access within the device
+   * capacity, and the mapping is sized to cover it (see kBackendHeaderSlack).
+   */
+  bool ShmPageInBounds(size_t page_idx) const {
+    if (kRamPageSize != 0 && page_idx > shm_usable_ / kRamPageSize) {
+      return false;  // guards the multiply below from overflowing
+    }
+    return page_idx * kRamPageSize < shm_usable_;
+  }
+
+  ctp::ipc::PosixShmMmap shm_backend_;
+  size_t shm_usable_ = 0;  /**< bytes of device space actually mapped */
+  char *shm_base_ = nullptr;       /**< byte 0 of device space, or nullptr */
+  ShmRamHeader *shm_header_ = nullptr;
+  bool shm_backed_ = false;
+  std::string shm_name_;
 
   // A lazily-allocated RAM page. A kPinned pool allocates page-locked host
   // memory through GpuApi (cudaMallocHost / hipHostMalloc / sycl::malloc_host)

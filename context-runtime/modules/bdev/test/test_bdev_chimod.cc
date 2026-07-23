@@ -431,6 +431,108 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
   }
 }
 
+/**
+ * Regression for #798: alloc/free accounting must be alignment-symmetric.
+ *
+ * StandardBlockAllocator charged the caller's raw request on allocate but
+ * credited AlignSize(request) on free, so every first allocation of a
+ * non-4096-multiple block drifted allocated_bytes_ down by
+ * (AlignSize(size) - size). GetRemainingSize() — surfaced to the CTE as
+ * TargetInfo::remaining_space_ — then reported steadily more free space
+ * than the target actually had, letting DPE over-commit it. The `std::min`
+ * clamp in FreeBlocks hid the drift by absorbing it instead of underflowing.
+ *
+ * This deliberately uses an UNALIGNED size. Both existing bdev leak-stress
+ * tests use 1 MiB blobs, which are already 4096-aligned, so for them
+ * AlignSize(size) - size == 0 and they cannot observe this class of bug.
+ */
+TEST_CASE("bdev_unaligned_alloc_free_accounting", "[bdev][allocate][align]") {
+  BdevChimodFixture fixture;
+
+  SECTION("Setup") {
+    REQUIRE(g_initialized);
+    REQUIRE(fixture.createTestFile(kDefaultFileSize));
+  }
+
+  SECTION("Unaligned alloc/free cycles leave remaining_size unchanged") {
+    clio::run::PoolId custom_pool_id(110, 0);
+    clio::run::bdev::Client client(custom_pool_id);
+
+    bool success = BdevChimodFixture::CreateBdevAsync(
+        client, clio::run::PoolQuery::Dynamic(), fixture.getTestFile(),
+        custom_pool_id, clio::run::bdev::BdevType::kFile);
+    REQUIRE(success);
+
+    auto pool_query = clio::run::PoolQuery::DirectHash(0);
+
+    // 5000 is deliberately not a multiple of 4096: AlignSize(5000) == 8192,
+    // so a broken allocator drifts 3192 bytes for every fresh block.
+    const clio::run::u64 kUnalignedSize = 5000;
+    const int kBatch = 32;
+
+    // A residual batch must stay allocated across the measurement, for two
+    // reasons that both otherwise hide the bug:
+    //
+    //   1. Freed blocks return to the free list, and the reuse path in
+    //      AllocateBlocks is alignment-symmetric. A simple
+    //      alloc/free/alloc/free loop therefore takes the heap path only
+    //      once and never accumulates drift.
+    //   2. FreeBlocks clamps with `dec = std::min(cur, freed_bytes)`, so
+    //      once everything is released allocated_bytes_ floors at 0 and the
+    //      drift is absorbed rather than observable.
+    //
+    // Holding kBatch blocks keeps allocated_bytes_ positive, so the
+    // over-credit from the second batch eats into a non-zero balance and
+    // becomes visible as inflated free space.
+    std::vector<clio::run::bdev::Block> held;
+    for (int i = 0; i < kBatch; ++i) {
+      auto alloc = client.AsyncAllocateBlocks(pool_query, kUnalignedSize);
+      alloc.Wait();
+      REQUIRE(alloc->return_code_ == 0);
+      REQUIRE(alloc->blocks_.size() > 0);
+      held.insert(held.end(), alloc->blocks_.begin(), alloc->blocks_.end());
+    }
+
+    clio::run::u64 remaining_before = 0;
+    BdevChimodFixture::GetStatsAsync(client, remaining_before);
+
+    // Balanced batch: allocate kBatch fresh blocks (these take the heap
+    // path, since the free list is empty) and release them all again.
+    std::vector<clio::run::bdev::Block> churn;
+    for (int i = 0; i < kBatch; ++i) {
+      auto alloc = client.AsyncAllocateBlocks(pool_query, kUnalignedSize);
+      alloc.Wait();
+      REQUIRE(alloc->return_code_ == 0);
+      REQUIRE(alloc->blocks_.size() > 0);
+      churn.insert(churn.end(), alloc->blocks_.begin(), alloc->blocks_.end());
+    }
+    {
+      auto freed = client.AsyncFreeBlocks(pool_query, churn);
+      freed.Wait();
+      REQUIRE(freed->return_code_ == 0);
+    }
+
+    clio::run::u64 remaining_after = 0;
+    BdevChimodFixture::GetStatsAsync(client, remaining_after);
+
+    // Release the residual batch so the test leaves no allocation behind.
+    {
+      auto freed = client.AsyncFreeBlocks(pool_query, held);
+      freed.Wait();
+      REQUIRE(freed->return_code_ == 0);
+    }
+
+    HLOG(kInfo, "unaligned alloc/free accounting: before={} after={}",
+         remaining_before, remaining_after);
+
+    // Balanced alloc/free must be a no-op for the accounting in EITHER
+    // direction. Drifting upward is as wrong as leaking: it over-reports
+    // free space, so the target can be over-committed while still claiming
+    // capacity. Hence exact equality rather than a one-sided bound.
+    REQUIRE(remaining_after == remaining_before);
+  }
+}
+
 TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
   BdevChimodFixture fixture;
 

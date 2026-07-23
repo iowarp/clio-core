@@ -69,12 +69,16 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
     ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
   }
 
-  // Send the task to the runtime's single inbound ring. Clients no longer
-  // load-balance across per-worker rings (worker_tids_); the net_recv worker
-  // drains this one ring and fans tasks out to worker lanes, mirroring the ZMQ
-  // ROUTER model. The runtime pid (learned via ClientConnect) keys the name.
+  // issue #807: shard across the runtime's S inbound rings. Key by this client
+  // thread's tid so a given thread always targets the same ring — preserves
+  // per-thread request order and keeps the ring's producer set stable (locality).
+  // Each shard ring has its own dedicated drain thread on the runtime, so this
+  // spreads both the MPSC-tail contention and the deserialize+route work.
+  u32 shards = ipc->shm_in_shards_ >= 1 ? ipc->shm_in_shards_ : 1;
+  u32 shard = static_cast<u32>(ctp::SystemInfo::GetTid()) % shards;
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(
-      "clio-" + std::to_string(ipc->runtime_pid_) + "-shm-in");
+      "clio-" + std::to_string(ipc->runtime_pid_) + "-shm-in-" +
+      std::to_string(shard));
   if (conn == nullptr) {
     HLOG(kError, "IpcCpu2Cpu::SendIn: inbound SHM ring unavailable");
     task_ptr->SetComplete();  // unblock the waiter on the error path
@@ -120,6 +124,31 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   ctp::Timepoint start;
   start.Now();
+
+  // issue #807/#784: spin-poll for the response before parking. On SHM the
+  // round-trip is microseconds; a brief spin catches the completion (set by
+  // RecvShmClientThread when it demuxes our archive) without the park/wake +
+  // signal syscall that otherwise dominates low-latency round-trips. Bounded by
+  // config so a slow/absent response still falls through to the parked Wait.
+  const double spin_us =
+      static_cast<double>(CLIO_CONFIG_MANAGER->GetShmClientSpinUs());
+  if (spin_us > 0.0 && !task_ptr->IsComplete()) {
+    ctp::Timepoint spin_now;
+    do {
+      // issue #807: DRAIN INLINE while spinning instead of waiting for the
+      // dedicated RecvShmClientThread to demux our response and signal us. The
+      // try-lock inside makes us the sole consumer when we win it (no concurrent
+      // Recv with the fallback thread); if another drainer holds it we just poll
+      // our own completion below. Draining here also demuxes other waiters'
+      // responses, so one active waiter serves the whole process — and it cuts
+      // the entire RecvShmClientThread wake+demux hop off the response path,
+      // which the split-timing showed dominates the round-trip.
+      ipc->DrainShmResponses();
+      if (task_ptr->IsComplete()) break;
+      spin_now.Now();
+    } while (start.GetUsecFromStart(spin_now) < spin_us);
+  }
+
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
     if (max_sec > 0) {

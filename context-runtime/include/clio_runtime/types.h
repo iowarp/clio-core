@@ -391,6 +391,25 @@ inline CTP_CROSS_FUN LockOwnerId GetCurrentLockOwnerId() {
 }
 #endif
 
+/**
+ * The calling OS thread's id, cached in TLS, for the CoMutex/CoRwLock
+ * reentrancy fast paths. Every legitimate reentrant acquire happens on the
+ * OS thread that already owns the lock (same-stack nesting, or a same-worker
+ * subtask of the holding parent), so gating the fast path on this id is what
+ * makes the unsynchronized holder_/depth accesses sound — see CoRwLock.
+ * Returns 0 under a device pass (device code never takes these locks);
+ * callers treat 0 as "no fast path".
+ */
+#if !CTP_IS_DEVICE_PASS
+inline u64 GetCoLockThreadId() {
+  static thread_local const u64 kTid =
+      static_cast<u64>(ctp::SystemInfo::GetTid());
+  return kTid;
+}
+#else
+inline CTP_CROSS_FUN u64 GetCoLockThreadId() { return 0; }
+#endif
+
 using MethodId = u32;
 
 // Worker and Lane identifiers
@@ -596,7 +615,83 @@ CTP_GPU_FUN ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu();
 enum MemorySegment {
   kMainSegment = 0,
   kClientDataSegment = 1,
-  kQueueSegment = 2
+  kQueueSegment = 2,
+  // issue #783: runtime-wide metadata segment. Large (default 8 GB) and
+  // sparsely populated -- it is never pre-faulted, so only touched pages cost
+  // RAM. Owned by the runtime as a whole (not by any one ChiMod); the CTE
+  // shared-memory metadata cache is its first consumer. Clients map it
+  // read-write, but by convention only ever write lock words.
+  kMetadataSegment = 3
+};
+
+/**
+ * Directory of well-known roots inside the metadata segment (issue #783).
+ *
+ * WHY THIS EXISTS: the CTE cache root offset was originally handed to clients
+ * on the CreateTask OUT path, which only works for the process that actually
+ * causes the pool to be created. Any later client -- and in practice EVERY
+ * client, because compose creates the CTE pool at startup -- calls
+ * GetOrCreatePool, hits the existing pool, never runs the ChiMod's Create, and
+ * so receives a zero offset. A discovery path must not depend on being the
+ * first caller.
+ *
+ * The directory is allocated once by IpcManager as the FIRST object in the
+ * metadata segment, and its offset is handed to every client in the
+ * ClientConnect handshake alongside the allocator ids. Modules publish their
+ * roots here by offset (never by pointer -- clients map the segment at a
+ * different base address).
+ *
+ * POD and fixed-layout: no virtuals, no pointers.
+ */
+struct MetadataDirectory {
+  static constexpr u32 kVersion = 1;
+
+  /** Max distinct module caches registrable. CTE alone can have many pools. */
+  static constexpr u32 kMaxEntries = 32;
+
+  /**
+   * One registered cache root, keyed by the owning pool.
+   *
+   * Keying by pool is REQUIRED, not cosmetic: CTE is a multi-pool module, and
+   * an earlier single-slot version let each new pool's Create overwrite the
+   * slot. Clients then attached whichever pool created its cache last and
+   * silently read a different pool's metadata -- every lookup missed.
+   */
+  struct Entry {
+    u64 pool_id_;   /**< PoolId::ToU64(); 0 = empty slot */
+    u64 root_off_;  /**< offset of the module's cache root */
+  };
+
+  u32 version_;
+  u32 num_entries_;
+  Entry entries_[kMaxEntries];
+
+  /** Register (or update) a pool's cache root. Returns false if full. */
+  bool RegisterRoot(u64 pool_id, u64 root_off) {
+    for (u32 i = 0; i < num_entries_ && i < kMaxEntries; ++i) {
+      if (entries_[i].pool_id_ == pool_id) {
+        entries_[i].root_off_ = root_off;  // re-created pool: update in place
+        return true;
+      }
+    }
+    if (num_entries_ >= kMaxEntries) {
+      return false;
+    }
+    entries_[num_entries_].pool_id_ = pool_id;
+    entries_[num_entries_].root_off_ = root_off;
+    ++num_entries_;
+    return true;
+  }
+
+  /** Look up a pool's cache root, or 0 if that pool is not caching. */
+  u64 FindRoot(u64 pool_id) const {
+    for (u32 i = 0; i < num_entries_ && i < kMaxEntries; ++i) {
+      if (entries_[i].pool_id_ == pool_id) {
+        return entries_[i].root_off_;
+      }
+    }
+    return 0;
+  }
 };
 
 // Input/Output parameter macros

@@ -65,7 +65,25 @@ class DefaultScheduler : public Scheduler {
   void DivideWorkers(WorkOrchestrator *work_orch) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task,
                      ContainerHold container) override;
-  void LoadBalance() override;         // issue #781 — safety net, every 500ms
+  void LoadBalance() override;
+
+  /**
+   * issue #785: the progress watchdog's decision, as a pure function so it can
+   * be unit-tested without constructing a real deadlock.
+   *
+   * A live deadlock test would wedge the runtime permanently — the tasks never
+   * complete, teardown never finishes, and CI hangs rather than fails. Testing
+   * the predicate directly gets the coverage without that risk.
+   *
+   * @param outstanding queued + blocked + retry tasks across all workers.
+   * @param live workers currently inside ExecTask.
+   * @param live_stalled how many of those are past the stall threshold.
+   * @param[out] window_sec how long to wait before believing it (the
+   *   "everything blocked" shape is ambiguous and needs far longer).
+   * @return true if this shape means no progress is possible.
+   */
+  static bool IsWedgedShape(u64 outstanding, u32 live, u32 live_stalled,
+                            double *window_sec);         // issue #781 — safety net, every 500ms
   bool StealWork(Worker *thief) override;  // issue #781 — work-conserving steal
   void RecordCompletion(u32 method, double cpu_us, double wall_us) override;
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
@@ -103,6 +121,24 @@ class DefaultScheduler : public Scheduler {
   std::array<std::atomic<u64>, kNumPerfBins> perf_pdf_{};  ///< #781 telemetry
   std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
+  std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers
+  /** #785: replacement workers spawned by rescues. Only ever touched by
+   *  LoadBalance on the monitor thread, so it needs no lock. Kept separate from
+   *  io_workers_ (which the mapper scans) so a rescuer is not immediately handed
+   *  fresh work, but still checked for stalls so cascades are rescued. */
+  std::vector<Worker *> elastic_workers_;
+
+  /** #785 progress watchdog. Monitor-thread only, so plain members. */
+  static constexpr double kNoProgressAlarmSec = 10.0;   ///< nothing executing
+  static constexpr double kAllBlockedAlarmSec = 60.0;   ///< all blocked (ambiguous)
+  u64 last_progress_count_ = 0;
+  double last_progress_us_ = 0.0;
+  bool progress_alarm_raised_ = false;
+
+  /** #785: least-loaded live worker with a lane, excluding two given workers.
+   *  Used to re-place a stalled worker's queued backlog. Monitor thread only. */
+  Worker *PickLeastLoadedLive(double now_us, Worker *avoid_a,
+                              Worker *avoid_b) const;
 
   Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
   std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O

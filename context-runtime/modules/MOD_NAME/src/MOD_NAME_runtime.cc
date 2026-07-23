@@ -40,6 +40,7 @@
 #include "../include/clio_runtime/MOD_NAME/MOD_NAME_runtime.h"
 
 #include <chrono>
+#include <thread>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 
 namespace clio::run::MOD_NAME {
@@ -75,11 +76,33 @@ clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr<CustomTask> &task) {
 
   custom_count_++;
 
+  // issue #785: dependency chain. Self-send a child and co_await it BEFORE
+  // spinning, so this task parks on a subtask for as long as the child spins.
+  // A parent parked this way is the category the lane rescue does NOT cover:
+  // it sits in no queue at all, and its wakeup is routed to the event queue of
+  // whichever worker it first ran on. Wedge that worker while the parent is
+  // parked and the completion has nowhere to land.
+  if (task->chain_depth_ > 0) {
+    auto subtask = client_.AsyncCustom(task->pool_query_, "chain", 0,
+                                       task->spin_us_, task->chain_depth_ - 1);
+    CLIO_CO_AWAIT(subtask);
+  }
+
   // issue #781 scheduler-variety benchmark: busy-spin for the requested compute
   // time. This is a NON-YIELDING spin on purpose — it models the mislabeled /
   // long-running task class the anti-deadlock scheduler must tolerate, and lets
   // the benchmark sweep 1us..1s to measure quick-task p99 / starvation.
-  if (task->spin_us_ > 0) {
+  // issue #785: blocking-syscall stall. sleep_for deschedules the thread, so
+  // unlike the spin above the worker consumes no CPU — but from the runtime's
+  // side it is the same failure: ExecTask does not return and the worker is
+  // gone. Uses the same non-yielding shape a real blocking read() would.
+  if (task->block_us_ > 0 && task->chain_depth_ == 0) {
+    std::this_thread::sleep_for(std::chrono::microseconds(task->block_us_));
+  }
+
+  // A chaining parent does not spin itself — its cost is the time spent parked
+  // awaiting the child. Only the leaf (chain_depth_ == 0) burns CPU.
+  if (task->spin_us_ > 0 && task->chain_depth_ == 0) {
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::microseconds(task->spin_us_);
     while (std::chrono::steady_clock::now() < deadline) {

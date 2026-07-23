@@ -47,6 +47,7 @@
 #include <clio_cte/core/dpe/dpe.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/data_organizer/data_organizer.h>
+#include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
 #include <clio_ctp/search/regex_search_engine.h>
@@ -343,6 +344,21 @@ private:
   // tag_map_lock_ (created in GetOrAssignTagId, removed in DelTag, moved in
   // RenameTag, rebuilt after WAL/metadata restore).
   ctp::search::RegexSearchEngine<TagId> tag_search_;
+
+  // issue #783: shared-memory mirror of the tag/blob metadata, for zero-IPC
+  // client reads. DERIVED STATE ONLY -- the maps above stay authoritative.
+  // Every mirror call is best-effort and silently no-ops when the metadata
+  // segment is unavailable, so a metadata write is never rejected because the
+  // cache could not be updated.
+  ShmMetadataCache shm_cache_;
+
+  /** Project a BlobInfo into its cacheable form. Returns false when the blob
+   *  cannot be represented (too many blocks), in which case it is not
+   *  cached and clients keep using the RPC path for it. */
+  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
+
+  /** Mirror one blob into the SHM cache. No-op when caching is off. */
+  void MirrorBlobToShm(const std::string &composite_key, const BlobInfo &info);
 
   // Atomic counters for thread-safe ID generation
   std::atomic<clio::run::u32>

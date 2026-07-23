@@ -73,10 +73,13 @@ namespace ctp::search {
  * Thread-safety: internally synchronized with a shared_mutex — mutators
  * (Insert/Delete/Rename/Clear) take it exclusively, queries (Search/Contains/
  * Find/Size/Empty) take it shared. Search returns a SNAPSHOT of the matching
- * keys (SearchResult::keys()), so callers can iterate keys() safely without
- * external locking. NOTE: the value-yielding SearchResult iterator fetches
- * values live via Find() and is NOT safe against concurrent deletes — use
- * keys() under concurrency.
+ * (key, value) pairs, so a SearchResult — keys() and the value-yielding
+ * iterator alike — is stable under concurrent mutation. A key deleted between
+ * the candidate scan and the value snapshot is simply absent from the result
+ * (the documented "live subset" semantics). The previous design fetched
+ * values lazily via Find() at iteration time; a concurrent Delete then made
+ * the iterator dereference Find()'s nullptr — a NULL TagId read that crashed
+ * the runtime under the #807 CFS stress (readdir's TagQuery racing unlink).
  */
 template <typename ValueT>
 class RegexSearchEngine {
@@ -211,8 +214,9 @@ class RegexSearchEngine {
         return *this;
       }
       reference operator*() const {
-        const std::string &k = r_->keys_[i_];
-        return reference(k, *r_->eng_->Find(k));
+        // Both halves come from the result's own snapshot — no live engine
+        // access, so iteration is safe against concurrent mutation.
+        return reference(r_->keys_[i_], r_->values_[i_]);
       }
 
      private:
@@ -229,10 +233,10 @@ class RegexSearchEngine {
 
    private:
     friend class RegexSearchEngine;
-    SearchResult(std::vector<std::string> keys, const RegexSearchEngine *eng)
-        : keys_(std::move(keys)), eng_(eng) {}
-    std::vector<std::string> keys_;
-    const RegexSearchEngine *eng_;
+    SearchResult(std::vector<std::string> keys, std::vector<ValueT> values)
+        : keys_(std::move(keys)), values_(std::move(values)) {}
+    std::vector<std::string> keys_;   // sorted; aligned with values_
+    std::vector<ValueT> values_;      // snapshot taken under the shared lock
   };
 
   /**
@@ -270,7 +274,8 @@ class RegexSearchEngine {
           auto it = index_.find(t);
           if (it == index_.end()) {
             // Some required trigram indexes no key => no match possible.
-            return SearchResult(std::vector<std::string>(), this);
+            return SearchResult(std::vector<std::string>(),
+                                std::vector<ValueT>());
           }
           if (smallest == nullptr || it->second.size() < smallest->size()) {
             smallest = &it->second;
@@ -296,7 +301,26 @@ class RegexSearchEngine {
     }
 
     std::sort(matches.begin(), matches.end());
-    return SearchResult(std::move(matches), this);
+
+    // Snapshot the values under a brief re-acquired shared lock, AFTER the
+    // (deliberately unlocked, see above) regex pass and the sort, so keys_
+    // and values_ stay aligned. A key deleted since the candidate scan is
+    // dropped from the result here — the "live subset" semantics — instead
+    // of surfacing as a null value at iteration time.
+    std::vector<std::string> keys;
+    std::vector<ValueT> values;
+    keys.reserve(matches.size());
+    values.reserve(matches.size());
+    {
+      std::shared_lock<std::shared_mutex> lk(mtx_);
+      for (auto &k : matches) {
+        auto it = entries_.find(k);
+        if (it == entries_.end()) continue;  // concurrently deleted
+        values.push_back(it->second);
+        keys.push_back(std::move(k));
+      }
+    }
+    return SearchResult(std::move(keys), std::move(values));
   }
 
  private:

@@ -156,9 +156,20 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
     block_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
   }
   if (heap_.Allocate(aligned_total_size, block_type, block)) {
+    // block.size_ stays the caller's requested size — that is what the
+    // caller reads and writes, and what it hands back to FreeBlocks.
     block.size_ = total_size;
     blocks.push_back(block);
-    allocated_bytes_.fetch_add(block.size_, std::memory_order_relaxed);
+    // Charge the ALIGNED size, not the raw request. The heap advanced by
+    // aligned_total_size, and FreeBlocks credits AlignSize(block.size_),
+    // which is the same aligned value. Charging total_size here made every
+    // first allocation of a non-4096-multiple block credit more on free
+    // than it charged, so allocated_bytes_ drifted downward by
+    // (AlignSize(size) - size) per block and GetRemainingSize() reported
+    // progressively more free space than the target actually had. The
+    // `std::min` clamp in FreeBlocks hid it by silently absorbing the
+    // difference rather than underflowing. See #798.
+    allocated_bytes_.fetch_add(aligned_total_size, std::memory_order_relaxed);
     return true;
   }
 

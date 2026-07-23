@@ -118,12 +118,11 @@ bool Worker::Init() {
     task_queue_depth = 1024;  // fallback if config is unset
   }
   u32 event_queue_depth = EVENT_QUEUE_DEPTH_MULTIPLIER * task_queue_depth;
-  event_queue_ =
-      CTP_MALLOC
-          ->template NewObj<ctp::ipc::mpsc_ring_buffer<
-              Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
-              CTP_MALLOC, event_queue_depth)
-          .ptr_;
+  event_queue_.store(CTP_MALLOC
+                         ->template NewObj<EventQueue>(CTP_MALLOC,
+                                                       event_queue_depth)
+                         .ptr_,
+                     std::memory_order_release);
 
   // Boost fiber stacks now come from the process-wide, per-thread-cached
   // BoostStackPool() (see AllocateStack/FreeStack); no per-worker pool needed.
@@ -152,18 +151,21 @@ WorkerStats Worker::GetWorkerStats() const {
   // Basic worker info
   stats.worker_id_ = worker_id_;
   stats.is_running_ = is_running_;
-  stats.idle_iterations_ = idle_iterations_;
+  stats.idle_iterations_ = idle_iterations_.load(std::memory_order_relaxed);
 
   // Calculate number of queued tasks (tasks waiting in the assigned lane)
   stats.num_queued_tasks_ = 0;
   stats.is_active_ = false;
-  if (assigned_lane_) {
-    stats.num_queued_tasks_ = assigned_lane_->Size();
-    stats.is_active_ = assigned_lane_->IsActive();
+  TaskLane *stats_lane = assigned_lane_.load(std::memory_order_acquire);
+  if (stats_lane) {
+    stats.num_queued_tasks_ = stats_lane->Size();
+    stats.is_active_ = stats_lane->IsActive();
   }
 
   // Count blocked tasks across all blocked queues
   stats.num_blocked_tasks_ = 0;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     stats.num_blocked_tasks_ += blocked_queues_[i].size();
   }
@@ -176,14 +178,16 @@ WorkerStats Worker::GetWorkerStats() const {
 
   // Count retry tasks
   stats.num_retry_tasks_ = retry_queue_.size();
+  }
 
   // Get suspend period (time until next periodic task or 0 if none)
   double suspend_period = GetSuspendPeriod();
   stats.suspend_period_us_ =
       (suspend_period < 0) ? 0 : static_cast<u32>(suspend_period);
 
-  stats.num_tasks_processed_ = num_tasks_processed_;
-  stats.load_ = load_;
+  stats.num_tasks_processed_ =
+      num_tasks_processed_.load(std::memory_order_relaxed);
+  stats.load_ = load_.load(std::memory_order_relaxed);
 
   return stats;
 }
@@ -200,6 +204,8 @@ void Worker::Finalize() {
   // Note: Context cache cleanup removed - RunContext is now embedded in Task
 
   // Clean up all blocked queues
+  {
+  std::lock_guard<std::mutex> lk(park_mtx_);  // #785: monitor may splice these
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     while (!blocked_queues_[i].empty()) {
       // Each entry is an owning shared_ptr<Task>; popping drops the worker's
@@ -221,12 +227,14 @@ void Worker::Finalize() {
     retry_queue_.pop();
   }
 
+  }  // release park_mtx_
+
   // Boost fiber stacks are owned by the process-wide BoostStackPool() (a
   // per-thread SlabAllocator cache); cached stacks live for the process and are
   // reclaimed at exit — no per-worker drain here.
 
   // Clear assigned lane reference (don't delete - it's in shared memory)
-  assigned_lane_ = nullptr;
+  assigned_lane_.store(nullptr, std::memory_order_release);
 
   is_initialized_ = false;
 }
@@ -253,25 +261,42 @@ void Worker::Run() {
   // (issue #520). On Windows the same order matters for liveness: Signal()
   // on a tid without a registered event is a lost wakeup.
   int tid = ctp::SystemInfo::GetTid();
-  tid_ = static_cast<u32>(tid);  // publish for ClientConnect worker-tid list (#642)
+  tid_.store(static_cast<u32>(tid), std::memory_order_release);  // #642
   event_manager_.AddSignalEvent(nullptr);
-  if (assigned_lane_) {
-    assigned_lane_->SetTid(tid);
+  if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+    lane->SetTid(tid);
   }
+  // issue #807: become the consumer of this worker's inbound SHM shard ring, so
+  // a producing client's SignalConsumerIfParked SIGUSR1s THIS worker (its tid is
+  // now published on the ring). Must run after AddSignalEvent, which blocks
+  // SIGUSR1 on this thread — otherwise the wake would kill the process.
+  CLIO_IPC->RegisterShardConsumer(worker_id_);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
-    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
-    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
-    // touch serialized task bytes and need no knowledge of the transport.
+    // issue #807: drain THIS worker's inbound SHM shard ring (worker w owns
+    // shard w) and execute each request INLINE — no lane round-trip, no
+    // per-request wakeup. A no-op for workers that own no shard / non-SHM.
+    if (DrainMyShard() > 0) {
+      did_work_ = true;
+    }
+    // issue #807: also drain any DEFERRED SHM responses (opt-in async send path)
+    // onto the client rings, using this worker's own send transport. A cheap
+    // no-op on the inline-default path (queues stay empty). Bounded so it can't
+    // starve this worker's own task processing.
+    if (CLIO_IPC->DrainShmSends(shm_send_transport_.get(), 16) > 0) {
+      did_work_ = true;
+    }
 
     // Process tasks from assigned lane
-    if (assigned_lane_) {
-      u32 count = ProcessNewTasks(assigned_lane_);
+    // issue #785: re-read every iteration. The monitor thread may have moved
+    // this lane to a replacement worker while we were wedged in a task, so a
+    // cached pointer would keep us consuming a lane we no longer own.
+    if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+      u32 count = ProcessNewTasks(lane);
       if (count > 0) did_work_ = true;
     }
     u32 gpu_count = ProcessNewTasksGpu();
@@ -302,12 +327,16 @@ void Worker::Run() {
 
     if (did_work_) {
       // Work was done - reset idle counters
-      idle_iterations_ = 0;
+      idle_iterations_.store(0, std::memory_order_relaxed);
       current_sleep_us_ = 0;
       sleep_count_ = 0;
       did_work_ = false;
     }
   }
+
+  // issue #807: stop being the shard ring's consumer before this thread's tid
+  // can be recycled by an unrelated thread that does not block SIGUSR1.
+  CLIO_IPC->UnregisterShardConsumer(worker_id_);
 
   // EventManager destructor handles signalfd and epoll cleanup
 }
@@ -315,14 +344,93 @@ void Worker::Run() {
 void Worker::Stop() { is_running_ = false; }
 
 void Worker::SetLane(TaskLane *lane) {
-  assigned_lane_ = lane;
+  assigned_lane_.store(lane, std::memory_order_release);
   // Mark lane as active when assigned to worker
-  if (assigned_lane_) {
-    assigned_lane_->SetActive(true);
+  if (lane) {
+    lane->SetActive(true);
   }
 }
 
-TaskLane *Worker::GetLane() const { return assigned_lane_; }
+TaskLane *Worker::GetLane() const {
+  return assigned_lane_.load(std::memory_order_acquire);
+}
+
+void Worker::AdoptLane(TaskLane *lane) {
+  if (lane != nullptr) {
+    // Republish ownership BEFORE the lane becomes visible to our Run loop, so a
+    // producer that signals between these two stores still targets this thread.
+    lane->SetAssignedWorkerId(worker_id_);
+    u32 my_tid = tid_.load(std::memory_order_acquire);
+    if (my_tid != 0) {
+      lane->SetTid(static_cast<int>(my_tid));
+    }
+    lane->SetActive(true);
+  }
+  assigned_lane_.store(lane, std::memory_order_release);
+  HLOG(kWarning, "[#785] worker {} adopted lane {}", worker_id_,
+       static_cast<const void *>(lane));
+}
+
+Worker::EventQueue *Worker::ReplaceEventQueue() {
+  u32 depth = CLIO_CONFIG_MANAGER->GetQueueDepth();
+  if (depth == 0) {
+    depth = 1024;
+  }
+  EventQueue *fresh =
+      CTP_MALLOC
+          ->template NewObj<EventQueue>(CTP_MALLOC,
+                                        EVENT_QUEUE_DEPTH_MULTIPLIER * depth)
+          .ptr_;
+  return event_queue_.exchange(fresh, std::memory_order_acq_rel);
+}
+
+size_t Worker::MigrateParkedTo(Worker *dst) {
+  if (dst == nullptr || dst == this) {
+    return 0;
+  }
+  // std::lock takes both without a fixed order, so two concurrent migrations
+  // involving the same pair cannot deadlock. Neither lock is ever held across
+  // ExecTask, so a wedged donor cannot block us here.
+  std::lock(park_mtx_, dst->park_mtx_);
+  std::lock_guard<std::mutex> lk_src(park_mtx_, std::adopt_lock);
+  std::lock_guard<std::mutex> lk_dst(dst->park_mtx_, std::adopt_lock);
+
+  size_t moved = 0;
+  for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
+    while (!blocked_queues_[i].empty()) {
+      dst->blocked_queues_[i].push(blocked_queues_[i].front());
+      blocked_queues_[i].pop();
+      ++moved;
+    }
+  }
+  for (u32 i = 0; i < NUM_PERIODIC_QUEUES; ++i) {
+    while (!periodic_queues_[i].empty()) {
+      clio::run::shared_ptr<Task> t = periodic_queues_[i].front();
+      periodic_queues_[i].pop();
+      // Reset the block timestamp. A periodic task stranded behind a wedged
+      // worker has elapsed >> its period, so every migrated task would fire on
+      // the destination's very first scan — a thundering herd proportional to
+      // how long the stall lasted. Restarting the clock costs at most one
+      // period of delay and keeps the cadence sane.
+      if (!t.IsNull()) {
+        t->BlockStart().Now();
+      }
+      dst->periodic_queues_[i].push(t);
+      ++moved;
+    }
+  }
+  while (!retry_queue_.empty()) {
+    dst->retry_queue_.push(retry_queue_.front());
+    retry_queue_.pop();
+    ++moved;
+  }
+  return moved;
+}
+
+TaskLane *Worker::ReleaseLane() {
+  TaskLane *old = assigned_lane_.exchange(nullptr, std::memory_order_acq_rel);
+  return old;
+}
 
 void Worker::SetGpuLanes(const std::vector<GpuTaskLane *> &lanes) {
   gpu_lanes_ = lanes;
@@ -421,6 +529,16 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
+  // Bind + route + execute (shared with the inline SHM-ingest path).
+  RouteAndExec(future, lane);
+  return true;
+}
+
+void Worker::RouteAndExec(Future<Task> &future, TaskLane *lane) {
+  clio::run::shared_ptr<Task> task_full_ptr = future.GetTaskPtr();
+  if (task_full_ptr.IsNull()) {
+    return;
+  }
   // The RunContext (with its container resolved) was allocated by the ipc
   // receive/send site that introduced this task (Task::BeginRunContext). Bind it
   // to THIS worker/lane and record the future so subtask-completion events and
@@ -428,7 +546,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   // re-enqueued across workers by RouteLocal.
   task_full_ptr->SetRunWorkerId(worker_id_);
   task_full_ptr->Lane() = lane;
-  task_full_ptr->SetEventQueue(event_queue_);
+  task_full_ptr->SetEventQueue(event_queue_.load(std::memory_order_acquire));
   task_full_ptr->RunFuture() = future;
 
   // Route task using consolidated routing function
@@ -441,8 +559,35 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     ExecTask(task_full_ptr, is_started);
 #endif
   }
+}
 
-  return true;
+u32 Worker::DrainMyShard() {
+#if CTP_IS_HOST
+  // issue #807: pop requests off this worker's inbound SHM shard and execute
+  // each INLINE — bind, route, and (when it maps here, the common case for a
+  // quick local task) run it right here, then the response is sent inline. No
+  // lane push, no per-request AwakenWorker SIGUSR1: those were the bulk of the
+  // latency gap vs the original inline design. A task that maps elsewhere is
+  // enqueued by RouteTask as usual.
+  constexpr u32 kShardDrainBudget = 16;
+  TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
+  u32 n = 0;
+  while (n < kShardDrainBudget) {
+    Future<Task> f = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+    if (f.get() == nullptr) {
+      break;  // shard empty
+    }
+    // Bind + route + execute. RuntimeMapTask decides whether this ingesting
+    // worker keeps the task (inline, the quick-local common case) or routes it
+    // to another worker (heavy tasks), so all placement policy stays in the
+    // scheduler.
+    RouteAndExec(f, my_lane);
+    ++n;
+  }
+  return n;
+#else
+  return 0;
+#endif
 }
 
 double Worker::GetSuspendPeriod() const {
@@ -450,6 +595,11 @@ double Worker::GetSuspendPeriod() const {
   // We must wake up for the fastest periodic task to avoid starving it
   double min_yield_time_us = 0;
   bool found_task = false;
+
+  // issue #785: the periodic queues are no longer worker-private — the monitor
+  // thread splices them during a rescue — so this scan must hold park_mtx_.
+  // TSan caught it racing MigrateParkedTo on the deque's internal iterators.
+  std::lock_guard<std::mutex> lk(park_mtx_);
 
   // Check all periodic queues (0-3)
   for (u32 queue_idx = 0; queue_idx < NUM_PERIODIC_QUEUES; ++queue_idx) {
@@ -486,10 +636,10 @@ void Worker::SuspendMe() {
   }
 
   // No work was done in this iteration - increment idle counter
-  idle_iterations_++;
+  idle_iterations_.fetch_add(1, std::memory_order_relaxed);
 
   // Set idle start time on first idle iteration
-  if (idle_iterations_ == 1) {
+  if (idle_iterations_.load(std::memory_order_relaxed) == 1) {
     idle_start_.Now();
   }
 
@@ -514,7 +664,10 @@ void Worker::SuspendMe() {
     // FUSE thread that must submit it), livelocking the whole pipeline. That
     // is why the embedded-FUSE xfstests (generic/006/007/011/013/089/100/113/
     // 127/286/363/438/471) pass on a 16-core box but hang in CI. Yielding lets
-    // the runnable thread get scheduled so forward progress resumes.
+    // the runnable thread get scheduled so forward progress resumes. (issue
+    // #807: measured a bare tight-spin here at only ~1us over the yield on a
+    // spare-core box — sched_yield is already ~free when a core is idle — so it
+    // is not worth risking the oversubscription livelock the yield prevents.)
     CTP_THREAD_MODEL->Yield();
     return;
   } else {
@@ -536,14 +689,29 @@ void Worker::SuspendMe() {
     // (4n 256m, multi-tier bdev) where active_=true at the producer's
     // load suppressed the signal while the worker was already past its
     // post-store recheck and committed to epoll_pwait2.
-    if (assigned_lane_) {
-      bool work_pending = !assigned_lane_->Empty();
-      if (!work_pending && event_queue_) {
-        work_pending = !event_queue_->Empty();
+    if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+      bool work_pending = !lane->Empty();
+      EventQueue *eq_chk = event_queue_.load(std::memory_order_acquire);
+      if (!work_pending) {
+        std::lock_guard<std::mutex> lk(park_mtx_);
+        for (EventQueue *aq : adopted_event_queues_) {
+          if (aq && !aq->Empty()) {
+            work_pending = true;
+            break;
+          }
+        }
+      }
+      if (!work_pending && eq_chk) {
+        work_pending = !eq_chk->Empty();
       }
       if (work_pending) {
         return;
       }
+    }
+    // issue #807: last-chance check of this worker's inbound SHM shard, so a
+    // request that arrived before we park is not missed.
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      return;
     }
 
     // Calculate timeout from periodic tasks, then cap it by max_sleep so a
@@ -563,8 +731,27 @@ void Worker::SuspendMe() {
                          : std::min(static_cast<int>(suspend_period_us),
                                     static_cast<int>(max_sleep));
 
+    // issue #807: park protocol for the inbound SHM shard. The ORDER is
+    // load-bearing and must match the transport's documented rendezvous:
+    // publish "parked" BEFORE the final empty re-check, so it interlocks with a
+    // producer that does "reserve slot (tail++) THEN check consumer_parked_".
+    // The store(parked) and the load(tail, via ShardEmpty) form a Dekker
+    // StoreLoad pair — if a request landed after our earlier fast-path check, we
+    // now either observe its slot here (and skip the park) or it observes us
+    // parked (and signals). Doing the re-check BEFORE setting parked (as an
+    // earlier cut did) loses the wakeup: the producer pushes in the gap, sees
+    // parked==0, skips the signal, and we park anyway — bounded only by the
+    // 50ms max_sleep re-poll, which under the ARM weak-memory model fires
+    // constantly and crawled cr_cli_cfs_parallel_stress into its timeout (x86
+    // TSO mostly hid it).
+    CLIO_IPC->SetShardParked(worker_id_, true);
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      CLIO_IPC->SetShardParked(worker_id_, false);
+      return;  // a request arrived during/before the park setup — go drain it
+    }
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
+    CLIO_IPC->SetShardParked(worker_id_, false);
 
     if (nfds == 0) {
       sleep_count_++;
@@ -685,7 +872,9 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // The task is now EXECUTING: count its predicted cost in load_ (whether the
     // value came from the map or from here), and release the queued reservation
     // so it is not double-counted. EndTask subtracts the same PredictedLoad.
-    load_ += task_ptr->PredictedLoad();
+    load_.store(load_.load(std::memory_order_relaxed) +
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     if (reserved != 0.0f) {
       ReleaseReservation(reserved);
       task_ptr->SetSchedReservedUs(0);
@@ -757,10 +946,16 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   }
 
   // Track completed tasks
-  ++num_tasks_processed_;
+  num_tasks_processed_.fetch_add(1, std::memory_order_relaxed);
+  if (!task_ptr->IsPeriodic()) {
+    // #785: real work, as opposed to a poller re-arming itself.
+    num_nonperiodic_processed_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Subtract predicted load from worker
-  load_ -= task_ptr->PredictedLoad();
+  load_.store(load_.load(std::memory_order_relaxed) -
+                  task_ptr->PredictedLoad(),
+              std::memory_order_relaxed);
 
   // issue #781: defensively release any still-held queued reservation for tasks
   // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a
@@ -903,20 +1098,31 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
                                  u32 queue_idx) {
   (void)queue_idx;  // Unused parameter, kept for API consistency
 
-  // Process only first 8 tasks in the queue
-  size_t queue_size = queue.size();
+  // Process only first 8 tasks in the queue.
+  // issue #785: size() reads the deque's internal iterators, which the monitor
+  // thread mutates in MigrateParkedTo — TSan flagged this even though the pops
+  // below are already guarded. It is only a batch hint, so a snapshot is fine.
+  size_t queue_size;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    queue_size = queue.size();
+  }
   size_t check_limit = std::min(queue_size, size_t(8));
 
   for (size_t i = 0; i < check_limit; i++) {
-    if (queue.empty()) {
-      break;
+    // issue #785: pop under park_mtx_, then RELEASE before ExecTask. Holding it
+    // across execution would let a wedged worker block the monitor thread.
+    clio::run::shared_ptr<Task> task;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      if (queue.empty()) {
+        break;
+      }
+      // The queue OWNS the task (shared_ptr), which keeps both the task and its
+      // RunContext (owned by the task) alive while blocked.
+      task = queue.front();
+      queue.pop();
     }
-
-    // The queue OWNS the task (shared_ptr), which keeps both the task and its
-    // RunContext (owned by the task) alive while blocked. The task's execution
-    // state is reached through its accessors.
-    clio::run::shared_ptr<Task> task = queue.front();
-    queue.pop();
 
     if (task.IsNull()) {
       continue;
@@ -958,7 +1164,11 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
 
   // Check up to 8 tasks from the queue
   size_t check_limit = 8;
-  size_t queue_size = queue.size();
+  size_t queue_size;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785: see ProcessBlockedQueue
+    queue_size = queue.size();
+  }
   size_t actual_limit = std::min(queue_size, check_limit);
 
   // Capture SINGLE timestamp for ALL tasks processed in this batch
@@ -969,12 +1179,17 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
 
   // Get current time for all checks
   for (size_t i = 0; i < actual_limit; i++) {
-    if (queue.empty()) {
-      break;
+    // issue #785: same rule as ProcessBlockedQueue — pop under the lock,
+    // execute outside it.
+    clio::run::shared_ptr<Task> task;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      if (queue.empty()) {
+        break;
+      }
+      task = queue.front();
+      queue.pop();
     }
-
-    clio::run::shared_ptr<Task> task = queue.front();
-    queue.pop();
 
     if (task.IsNull()) {
       continue;
@@ -1009,6 +1224,7 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
       }
     } else {
       // Time threshold not reached yet - re-add to same queue
+      std::lock_guard<std::mutex> lk(park_mtx_);
       queue.push(task);
     }
   }
@@ -1021,7 +1237,21 @@ void Worker::ProcessEventQueue() {
   // the parent coroutine. This avoids stale RunContext* pointers since
   // FUTURE_COMPLETE is never set before the event is consumed.
   Future<Task, CLIO_QUEUE_ALLOC_T> future;
-  while (event_queue_->Pop(future)) {
+  // issue #785: drain this worker's own queue AND every queue inherited from a
+  // rescued worker. Snapshot the list under park_mtx_ and release before
+  // popping, since ExecTask runs below.
+  std::vector<EventQueue *> queues;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    EventQueue *own = event_queue_.load(std::memory_order_acquire);
+    if (own != nullptr) {
+      queues.push_back(own);
+    }
+    queues.insert(queues.end(), adopted_event_queues_.begin(),
+                  adopted_event_queues_.end());
+  }
+  for (EventQueue *eq : queues) {
+  while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
     // Mark the subtask's future as complete
@@ -1068,6 +1298,7 @@ void Worker::ProcessEventQueue() {
 
     // Execute the task
     ExecTask(parent, true);
+  }
   }
 }
 
@@ -1171,6 +1402,7 @@ void Worker::AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
 
     // Add to the appropriate blocked queue. Store the task (owning shared_ptr)
     // so the task + its RunContext stay alive while blocked.
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
     blocked_queues_[queue_idx].push(task);
   } else {
     // Time-based periodic task - add to periodic queue
@@ -1201,19 +1433,32 @@ void Worker::AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
     }
 
     // Add to the appropriate periodic queue (store the owning task handle).
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
     periodic_queues_[queue_idx].push(task);
   }
 }
 
 void Worker::AddToRetryQueue(const clio::run::shared_ptr<Task> &task) {
+  std::lock_guard<std::mutex> lk(park_mtx_);  // #785
   retry_queue_.push(task);
 }
 
 void Worker::ProcessRetryQueue() {
-  size_t count = retry_queue_.size();
+  size_t count;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    count = retry_queue_.size();
+  }
   for (size_t i = 0; i < count; ++i) {
-    clio::run::shared_ptr<Task> task_ptr = retry_queue_.front();
-    retry_queue_.pop();
+    clio::run::shared_ptr<Task> task_ptr;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);  // #785
+      if (retry_queue_.empty()) {
+        break;
+      }
+      task_ptr = retry_queue_.front();
+      retry_queue_.pop();
+    }
 
     if (task_ptr.IsNull()) {
       continue;  // Skip invalid entries
@@ -1243,11 +1488,27 @@ void Worker::ReschedulePeriodicTask(clio::run::shared_ptr<Task> &task_ptr) {
   task_ptr->SetPredictedWallUs(0);
   task_ptr->PredictedStat() = TaskStat();
 
-  // Get the lane from the run context
+  // Get the lane from the run context.
   TaskLane *lane = task_ptr->Lane();
   if (!lane) {
-    // No lane information, cannot reschedule
-    return;
+    // issue #785: this used to return silently, DROPPING the periodic task —
+    // it would simply stop running with no diagnostic anywhere. Fall back to
+    // this worker's current lane so the task survives, and say so loudly if
+    // even that is unavailable. A periodic task that vanishes is how a runtime
+    // quietly stops polling.
+    lane = assigned_lane_.load(std::memory_order_acquire);
+    if (!lane) {
+      HLOG(kError,
+           "[#785] DROPPING periodic task (pool={} method={}): its RunContext "
+           "has no lane and this worker has none either",
+           task_ptr->pool_id_, task_ptr->method_);
+      return;
+    }
+    task_ptr->Lane() = lane;
+    HLOG(kWarning,
+         "[#785] periodic task (pool={} method={}) had no lane; recovered onto "
+         "worker {}'s lane",
+         task_ptr->pool_id_, task_ptr->method_, worker_id_);
   }
 
   // Unset started when rescheduling periodic task

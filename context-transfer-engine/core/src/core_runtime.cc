@@ -296,6 +296,83 @@ void Runtime::FixupAfterCopy(clio::run::u32 method,
   }
 }
 
+// ===========================================================================
+// issue #783: projection of the authoritative BlobInfo into its shared-memory
+// cache record. Deliberately lossy -- the cache stores only what a client
+// needs to answer a read, in a form that is POD and bounded.
+// ===========================================================================
+bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
+  if (out == nullptr) {
+    return false;
+  }
+  *out = ShmBlobRecord();
+  out->total_size_ = info.total_size_cache_;
+  out->last_modified_ = info.last_modified_;
+  out->last_read_ = info.last_read_;
+  out->score_ = info.score_;
+
+  size_t n = info.blocks_.size();
+  if (n > kMaxInlineBlocks) {
+    // Too many blocks to represent. Cache the metadata but mark it truncated
+    // so no client ever tries a payload read from a partial block list.
+    out->flags_ |= kShmBlobTruncated;
+    n = kMaxInlineBlocks;
+  }
+  out->num_blocks_ = static_cast<clio::run::u32>(n);
+
+  // A payload may only be read directly out of shared memory when EVERY block
+  // is node-local and RAM-backed. This starts true and is cleared by the first
+  // block that fails to qualify -- the default must be "refuse", so an
+  // unknown target can never be mistaken for a readable one.
+  bool all_direct = (n > 0) && ((out->flags_ & kShmBlobTruncated) == 0);
+
+  for (size_t i = 0; i < n; ++i) {
+    const BlobBlock &b = info.blocks_[i];
+    ShmBlockDesc &d = out->blocks_[i];
+    // Only the POD identity of the target is copied. The bdev::Client in
+    // BlobBlock carries a vtable pointer and must never enter shared memory.
+    d.target_pool_ = b.bdev_client_.pool_id_;
+    d.target_offset_ = b.target_offset_;
+    d.size_ = b.size_;
+    d.bdev_type_ = 0;
+    d.node_id_ = 0;
+
+    TargetInfo *tinfo = registered_targets_.find(d.target_pool_);
+    if (tinfo == nullptr) {
+      // Unknown target: record nothing and refuse direct reads.
+      all_direct = false;
+      continue;
+    }
+    d.bdev_type_ = static_cast<clio::run::u32>(tinfo->bdev_type_);
+    const bool is_ram = (tinfo->bdev_type_ == clio::run::bdev::BdevType::kRam);
+    const bool is_local = tinfo->target_query_.IsLocalMode();
+    if (!is_ram || !is_local) {
+      // kPinned/kHbm are excluded deliberately: their pages come from GPU
+      // allocators and are not SHM-backed, so their offsets are meaningless
+      // to a client. Remote targets are excluded because the bytes are not on
+      // this node at all.
+      all_direct = false;
+    }
+  }
+
+  if (all_direct) {
+    out->flags_ |= kShmBlobDirectReadable;
+  }
+  return true;
+}
+
+void Runtime::MirrorBlobToShm(const std::string &composite_key,
+                              const BlobInfo &info) {
+  if (!shm_cache_.IsEnabled()) {
+    return;
+  }
+  ShmBlobRecord rec;
+  if (!BuildShmBlobRecord(info, &rec)) {
+    return;
+  }
+  shm_cache_.PutBlob(composite_key, rec);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Initialize unordered_map_ll instances with appropriately sized bucket
@@ -355,6 +432,52 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // Build the DPE once from config so ExtendBlob does not pay a heap alloc
   // (and the per-call vtable construction) on every PutBlob.
+  // issue #783: bring up the shared-memory metadata mirror. Sized once and
+  // permanently -- the SHM maps never rehash (a rehash would free a table out
+  // from under untracked cross-process readers), so a full table degrades to
+  // the RPC path rather than growing. Failure here is NOT an error: it just
+  // means clients keep using RPC.
+  {
+    // Capacity is PERMANENT: the SHM maps never rehash (a rehash would free a
+    // table out from under untracked cross-process readers), so this is the
+    // one chance to size them. Entries beyond capacity are simply not cached
+    // and those blobs keep using the RPC path.
+    //
+    // COST IS RESIDENT, NOT SPARSE. Every slot is constructed at creation, so
+    // capacity is paid in RAM immediately: ~376 B per blob slot and ~80 B per
+    // tag slot. The defaults below are ~100 MB of blob table. Raise them for
+    // large deployments -- 1M blobs wants ~2M slots (~0.79 GB) since the load
+    // factor caps useful occupancy at 7/8.
+    size_t tag_capacity = 64 * 1024;
+    size_t blob_capacity = 256 * 1024;
+    if (const char *env = clio::run::env::GetCompat("CTE_SHM_TAG_CAPACITY")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && v > 0) {
+        tag_capacity = static_cast<size_t>(v);
+      }
+    }
+    if (const char *env = clio::run::env::GetCompat("CTE_SHM_BLOB_CAPACITY")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && v > 0) {
+        blob_capacity = static_cast<size_t>(v);
+      }
+    }
+    const size_t kShmTagCapacity = tag_capacity;
+    const size_t kShmBlobCapacity = blob_capacity;
+    if (shm_cache_.Create(kShmTagCapacity, kShmBlobCapacity, pool_id_)) {
+      HLOG(kInfo,
+           "CTE: shared-memory metadata cache enabled (tags={}, blobs={}, "
+           "root_off={})",
+           kShmTagCapacity, kShmBlobCapacity, shm_cache_.RootOffset());
+    } else {
+      HLOG(kInfo,
+           "CTE: shared-memory metadata cache disabled (no metadata segment) "
+           "-- clients will use the RPC path");
+    }
+  }
+
   dpe_ = DpeFactory::CreateDpe(config_.dpe_.dpe_type_);
 
   // Store storage configuration in runtime
@@ -558,6 +681,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   out_params.gpu_cache_ptr_ =
       GpuCacheCreate() ? reinterpret_cast<clio::run::u64>(gpu_cache_)
                        : static_cast<clio::run::u64>(0);
+  // issue #783: hand the client the offset of the SHM metadata cache root.
+  // An OFFSET, not a pointer -- the client maps the same segment at a
+  // different base address, so only a segment-relative value survives the
+  // trip. 0 means caching is off and the client stays on the RPC path.
+  out_params.shm_cache_root_off_ =
+      shm_cache_.IsEnabled()
+          ? static_cast<clio::run::u64>(shm_cache_.RootOffset())
+          : static_cast<clio::run::u64>(0);
   clio::run::Task::Serialize(CLIO_PRIV_ALLOC, task->chimod_params_, out_params);
 
   CLIO_CO_RETURN;
@@ -1557,6 +1688,17 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     LogTelemetry(CteOp::kPutBlob, offset, size, tag_id, now,
                  blob_info_ptr->last_read_);
     GpuCacheOnPutBlob(tag_id, blob_name, *blob_info_ptr);
+    // issue #783: mirror into the SHM cache HERE, at the successful end of the
+    // put -- not when the BlobInfo is first inserted into the map. At insert
+    // time the blob is still empty (blocks and total_size_cache_ are filled in
+    // later by ExtendBlob), so mirroring there published size 0 and a client
+    // reading its own write got the wrong answer. Caught by the
+    // write-then-read test.
+    {
+      std::string shm_key = std::to_string(tag_id.major_) + "." +
+                            std::to_string(tag_id.minor_) + "." + blob_name;
+      MirrorBlobToShm(shm_key, *blob_info_ptr);
+    }
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
@@ -2005,6 +2147,14 @@ void Runtime::CollectOrganizerBlobStats(clio::run::u32 replica_id,
         // organizer replica. The key hash partitions the blob space
         // disjointly across the `organizer_tasks` periodic replicas.
         if (blob_info.blocks_.empty()) return;
+        // Skip blobs whose access timestamps have not been written yet. A
+        // BlobInfo is constructed with last_modified_/last_read_ zeroed and
+        // stamped shortly after (PutBlobImpl), so a periodic organizer round
+        // can observe one in between. Scoring it would treat the zero as a
+        // real timestamp and derive an age from the steady_clock epoch — see
+        // the sentinel note in FrecencyDataOrganizer::ComputeScore (#792).
+        // Skipping costs nothing: the next round rescores it correctly.
+        if (blob_info.last_modified_ == 0 && blob_info.last_read_ == 0) return;
         if (num_replicas > 1 && (hasher(key) % num_replicas) != replica_id) {
           return;
         }
@@ -2104,6 +2254,9 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
                                  std::to_string(tag_id.minor_) + "." +
                                  blob_name;
       tag_blob_name_to_info_.erase(compound_key);
+      // Mirror the erase too. A stale cache entry for a deleted blob is worse
+      // than a miss: a client would read metadata for something gone.
+      shm_cache_.EraseBlob(compound_key);
     }
 
     // Step 6: Log telemetry for DelBlob operation
@@ -2714,6 +2867,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
           }, ctp::priv::ForEachLock::kShared);
       for (const auto &key : keys_to_erase) {
         tag_blob_name_to_info_.erase(key);
+        shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
       }
     }
 
@@ -3052,6 +3206,18 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   // Store mappings
   tag_name_to_id_.insert_or_assign(tag_name, tag_id);
   tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
+
+  // issue #783: mirror into the SHM cache, after the authoritative insert so
+  // the cache can only lag, never lead.
+  if (shm_cache_.IsEnabled()) {
+    shm_cache_.PutTagId(tag_name, tag_id);
+    ShmTagRecord trec;
+    trec.total_size_ = tag_info.total_size_;
+    trec.last_modified_ = tag_info.last_modified_;
+    trec.last_read_ = tag_info.last_read_;
+    trec.last_changed_ = tag_info.last_changed_;
+    shm_cache_.PutTagInfo(tag_id, trec);
+  }
 
   // Index the new tag's ABSOLUTE name for regex TagQuery (#598). The parent
   // chain is already created (GetOrCreateTagChain builds parents first), so
@@ -3592,6 +3758,7 @@ void Runtime::RestoreMetadataFromLog() {
       }
 
       tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
+      MirrorBlobToShm(composite_key, blob_info);
       blobs_restored++;
 
     } else {
@@ -3658,6 +3825,7 @@ void Runtime::ReplayTransactionLogs() {
             });
         for (const auto &key : keys_to_erase) {
           tag_blob_name_to_info_.erase(key);
+          shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
         }
         tag_id_to_info_.erase(tag_id);
         tags_replayed++;
@@ -3686,6 +3854,7 @@ void Runtime::ReplayTransactionLogs() {
         blob_info.blob_name_ = txn.blob_name_;
         blob_info.score_ = txn.score_;
         tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
+        MirrorBlobToShm(composite_key, blob_info);
         blobs_replayed++;
 
       } else if (type == TxnType::kExtendBlob) {
@@ -3883,6 +4052,12 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   {
     tag_blob_name_to_info_.insert_or_assign(composite_key, new_blob_info);
   }  // Release lock immediately after insertion
+  // issue #783: mirror into the SHM cache. Best-effort and AFTER the
+  // authoritative insert, so the cache can only ever lag, never lead.
+  // NOTE: deliberately NOT mirrored here. The blob has no blocks and no size
+  // yet; publishing it now would let a client read a zero-sized record for a
+  // blob that is mid-write. The mirror happens at the end of PutBlobImpl,
+  // once the content is actually there.
 
   // WAL: log blob creation
   if (!blob_txn_logs_.empty()) {

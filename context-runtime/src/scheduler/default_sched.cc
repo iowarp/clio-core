@@ -32,6 +32,8 @@
  */
 
 // Copyright 2024 IOWarp contributors
+#include <algorithm>
+
 #include "clio_runtime/scheduler/default_sched.h"
 
 #include <chrono>
@@ -226,6 +228,35 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
     selected = scheduler_worker_;
   }
 
+  // issue #807: PREFER INLINE EXECUTION on the calling worker for a quick task.
+  // When a worker ingests a request off its SHM shard (or routes any cheap
+  // task) and is not itself backlogged, run it right here instead of handing it
+  // to another worker via a lane + AwakenWorker SIGUSR1. That cross-worker hop
+  // is the bulk of the per-request latency vs the original inline design; for a
+  // sub-100us task it dominates the actual work. Heavy tasks (high predicted
+  // cost) and a backlogged caller fall through to least-loaded routing, so the
+  // ingesting worker is never blocked from draining its shard by a big task.
+  // The client sharding provides the cross-worker load balancing.
+  if (selected == nullptr && worker != nullptr && task_ptr != nullptr &&
+      container != nullptr && !kFunnel) {
+    constexpr double kInlineCostThresholdUs = 100.0;   // "quick"
+    constexpr double kInlineCallerLoadUs = 250.0;      // caller not backlogged
+    double now_us = NowUs();
+    clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
+    double predicted = container->InferCpuTime(task_ptr->method_, stat);
+    if (predicted <= kInlineCostThresholdUs &&
+        worker->RealtimeLoad(now_us) <= kInlineCallerLoadUs) {
+      // Account the predicted cost on the caller so a burst of quick ingests
+      // doesn't all decide "I'm idle" simultaneously and pile onto one worker.
+      if (predicted > 0.0) {
+        task_ptr->SetPredictedLoad(static_cast<float>(predicted));
+        task_ptr->SetSchedReservedUs(static_cast<float>(predicted));
+        worker->ReserveLoad(predicted);
+      }
+      return worker->GetId();  // ExecHere -> RouteAndExec runs it inline
+    }
+  }
+
   if (selected == nullptr) {
     // Build the compute candidate pool. Prefer the dedicated I/O workers so the
     // scheduler worker (lane 0) stays a pure INGRESS DISPATCHER — a heavy task
@@ -287,6 +318,12 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
     auto it = container->task_group_map_.find(group_id);
     if (it == container->task_group_map_.end() || it->second == nullptr) {
       container->task_group_map_[group_id] = selected;
+      // issue #785: bindings are created once and never revisited, and the
+      // group lookup runs BEFORE every other routing rule — so a wrong or stale
+      // binding silently overrides load, role and health checks for the life of
+      // the process. Log each one so the placement is at least observable.
+      HLOG(kInfo, "[#785] task group {} bound to worker {} (method={})",
+           group_id, selected->GetId(), task_ptr->method_);
     }
   }
 
@@ -328,6 +365,51 @@ Worker *DefaultScheduler::PickAltWorker(u32 avoid_id) const {
 //   2. update perf_pdf_ from recently-completed exec times (telemetry);
 //   3. retire elastic workers idle > kRetireCooldownSec (hysteresis);
 //   4. emit sched.threads.* metrics; WARN when live threads are abnormal.
+Worker *DefaultScheduler::PickLeastLoadedLive(double now_us, Worker *avoid_a,
+                                              Worker *avoid_b) const {
+  // issue #785: least measured-load worker that is alive, has a lane, and is
+  // not itself stalled. Used when redistributing a stalled worker's backlog.
+  Worker *best = nullptr;
+  double best_load = 0.0;
+  auto consider = [&](Worker *w) {
+    if (w == nullptr || w == avoid_a || w == avoid_b) return;
+    if (w->GetLane() == nullptr) return;
+    if (w->IsStalled(now_us, kStallThresholdSec)) return;
+    double l = w->RealtimeLoad(now_us);
+    if (best == nullptr || l < best_load) {
+      best = w;
+      best_load = l;
+    }
+  };
+  consider(scheduler_worker_);
+  for (Worker *w : io_workers_) consider(w);
+  for (Worker *w : elastic_workers_) consider(w);
+  return best;
+}
+
+bool DefaultScheduler::IsWedgedShape(u64 outstanding, u32 live,
+                                     u32 live_stalled, double *window_sec) {
+  // No work outstanding is not a deadlock, it is an idle runtime.
+  if (outstanding == 0) {
+    return false;
+  }
+  // (a) Nothing executing at all: unambiguous — no thread can make progress.
+  if (live == 0) {
+    if (window_sec) *window_sec = kNoProgressAlarmSec;
+    return true;
+  }
+  // (b) Everything executing is stalled: the lock-cycle shape. CoMutex::Lock()
+  // blocks the worker rather than parking the task, so a deadlocked worker is
+  // still "executing". Ambiguous against a slow syscall, hence the much longer
+  // window.
+  if (live_stalled == live) {
+    if (window_sec) *window_sec = kAllBlockedAlarmSec;
+    return true;
+  }
+  // Something is running and not stalled: progress is possible.
+  return false;
+}
+
 void DefaultScheduler::LoadBalance() {
   // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
   // This pass implements the OBSERVABILITY half of the safety net: detect a
@@ -354,25 +436,281 @@ void DefaultScheduler::LoadBalance() {
          perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
          perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
          stalls_detected_.load());
+    HLOG(kWarning, "[#785] lane rescues performed: {}",
+         rescues_performed_.load());
   }
 
-  auto check = [&](Worker *w) -> bool {
+  // migratable == may we move this worker's lane/event queue elsewhere?
+  //   NO for net_send/net_recv: they own ZMQ sockets, and "ZeroMQ sockets are
+  //   not safe to share across threads, so each socket has exactly one owner
+  //   thread" (see the routing comment above). Moving their lane would run the
+  //   periodic poller — and thus the socket — on a different thread.
+  //   NO for the GPU worker: it is bound to its GPU lanes.
+  // Non-migratable workers are still detected and warned about; they are simply
+  // not rescued.
+  auto check = [&](Worker *w, bool migratable) -> bool {
     if (w == nullptr || !w->IsExecuting()) return false;
     if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
          "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
-         "threshold_s={}) — routing new work around it; backlog awaits rescue",
+         "threshold_s={})",
          w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
          kStallThresholdSec);
+
+    // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
+    // provably not popping its lane, so its queued backlog is stranded behind a
+    // task that may never return. Move the lane to a fresh worker rather than
+    // draining a single-consumer MPSC ring from this thread (the "steal-safe
+    // pop" problem #781 left open) — a transfer needs no new lane, which
+    // matters because lanes are allocated 1:1 with num_threads and there is no
+    // spare.
+    //
+    // Rescue ONCE per stalled worker: a worker with no lane has nothing left to
+    // strand, and re-firing every 500ms would spawn a thread per tick for the
+    // whole life of the bad task.
+    if (!migratable) {
+      HLOG(kWarning,
+           "[#785] worker {} is NOT migratable (owns a ZMQ socket or GPU "
+           "lanes); cannot rescue it — see D7",
+           w->GetId());
+      return true;
+    }
+    if (work_orch_ == nullptr || w->GetLane() == nullptr) {
+      return true;
+    }
+    // STEP 1 — drain and redistribute the backlog. This needs NO replacement
+    // worker, which is the whole point: when the pool is capped and every
+    // replacement is itself wedged, spawning is impossible but re-placing the
+    // queued tasks on healthy workers is still both possible and exactly what
+    // the small tasks stuck behind heavy ones need. Splitting this from the
+    // handover is what makes head-of-line blocking recoverable under
+    // saturation rather than only when a spare thread happens to be available.
+    //
+    // Release first: the donor re-reads assigned_lane_ every Run() iteration,
+    // so after this it never pops again and the monitor is the lane's only
+    // consumer. That is what makes draining it safe.
+    TaskLane *lane = w->ReleaseLane();
+    size_t redistributed = 0;
+    if (lane != nullptr) {
+      Future<Task> queued;
+      while (lane->Pop(queued)) {
+        Worker *target = PickLeastLoadedLive(now_us, w, nullptr);
+        // A target whose lane is (nearly) full is unusable HERE even though it
+        // would be fine for a worker thread: TaskLane::Push uses
+        // WAIT_FOR_SPACE, so it busy-spins until space appears. On a worker
+        // that is back-pressure; on THIS thread it would freeze the monitor
+        // loop — no more stall detection, no more rescues, no watchdog. The
+        // machinery meant to prevent deadlock would itself deadlock. Leave the
+        // remaining tasks in the donor's lane instead; they are handed back to
+        // it below and retried on the next tick.
+        if (target != nullptr && target->GetLane() != nullptr) {
+          TaskLane *tl = target->GetLane();
+          size_t depth = tl->GetDepth();
+          if (depth > 0 && tl->Size() + 2 >= depth) {
+            target = nullptr;  // treat as "nowhere healthy to put it"
+          }
+        }
+        if (target == nullptr || target->GetLane() == nullptr) {
+          // Safe to push back: we just popped from this very lane, so it has
+          // room and cannot spin.
+          if (!lane->Push(queued)) {
+            HLOG(kError, "[#785] lost a task re-queuing during rescue");
+          }
+          break;  // nowhere healthy to put it; leave the rest in place
+        }
+        // Move the #781 cost reservation with the task, or the donor's
+        // queued_load_ never drains and the target under-reports its load.
+        Task *tp = queued.get();
+        if (tp != nullptr) {
+          float resv = tp->SchedReservedUs();
+          if (resv != 0.0f) {
+            w->ReleaseReservation(resv);
+            target->ReserveLoad(resv);
+          }
+        }
+        if (!target->GetLane()->Push(queued)) {
+          HLOG(kError, "[#785] failed to re-place task during rescue");
+          break;
+        }
+        CLIO_IPC->AwakenWorker(target->GetLane());
+        ++redistributed;
+      }
+    }
+
+    // Give the lane straight back. Transferring ownership to the replacement
+    // was a mistake: after a few rescues the original workers had permanently
+    // lost their lanes to elastic ones, so the set of "healthy workers that own
+    // a lane" could be EMPTY even with most of the pool idle — and then there
+    // was nowhere to redistribute to, which is precisely when it matters.
+    //
+    // Keeping worker<->lane fixed avoids that entirely. The donor is still
+    // wedged so it will not drain the lane, but every LoadBalance tick
+    // redistributes whatever has accumulated, bounding the delay by the monitor
+    // period rather than by the bad task's runtime. It also removes a whole
+    // class of ownership bugs: no orphaned lanes, and RouteTask's
+    // resolve-lane-by-worker-id stays consistent.
+    w->AdoptLane(lane);
+
+    // A replacement is still wanted for the state that needs a LIVE THREAD to
+    // make progress: tasks parked on a co_await are reachable only through the
+    // event queue, and the blocked/periodic/retry queues need someone to scan
+    // them. Neither can be fixed by re-placing work on another lane.
+    Worker *rescuer = work_orch_->FindIdleElasticWorker();
+    if (rescuer == nullptr) {
+      rescuer = work_orch_->SpawnAdditionalWorker();
+    }
+    if (rescuer == nullptr) {
+      HLOG(kWarning,
+           "[#785] worker {} stalled, no replacement available; redistributed "
+           "{} queued task(s). Parked tasks stay put until one frees up.",
+           w->GetId(), redistributed);
+      return true;
+    }
+
+    // Transfer the event queue by handing the OBJECT to the rescuer to drain —
+    // a parked task's RunContext still points at this exact queue, so both the
+    // events already in it and every event a still-running subtask pushes later
+    // follow automatically, with no per-task re-pointing.
+    // Hand over the queue OBJECT and give the donor a FRESH one, so there is
+    // exactly ONE consumer per queue.
+    //
+    // An earlier version passed w->GetEventQueue() while leaving the donor
+    // holding the same pointer. Both then drained it: the rescuer via its
+    // adopted list, and the donor via ProcessEventQueue the moment it
+    // un-wedged. That is two consumers on a SINGLE-consumer MPSC ring — memory
+    // corruption, and timing-sensitive enough to be invisible on this Linux box
+    // while segfaulting cr_all_safe_bdev_tests on all three Windows configs.
+    // Parked tasks still point at the old object, which the rescuer now solely
+    // owns, so wakeups still land correctly.
+    rescuer->AdoptEventQueue(w->ReplaceEventQueue());
+    // ...and anything this worker had itself inherited from an earlier rescue.
+    // Rescues cascade, so without this a replacement that wedges strands every
+    // queue it was holding for someone else.
+    w->TransferAdoptedEventQueuesTo(rescuer);
+    size_t parked_moved = w->MigrateParkedTo(rescuer);
+
+    if (std::find(elastic_workers_.begin(), elastic_workers_.end(), rescuer) ==
+        elastic_workers_.end()) {
+      elastic_workers_.push_back(rescuer);
+    }
+    rescues_performed_.fetch_add(1, std::memory_order_relaxed);
+    HLOG(kWarning,
+         "[#785] RESCUE: stalled worker {} -> worker {} ({} parked task(s) "
+         "moved, {} queued task(s) redistributed, rescues={})",
+         w->GetId(), rescuer->GetId(), parked_moved, redistributed,
+         rescues_performed_.load(std::memory_order_relaxed));
     return true;
   };
 
+  // ---- Progress watchdog (issue #785) ----------------------------------
+  // Everything else in this function handles a worker wedged by a task that
+  // will eventually return. It is powerless against the classes where the WORK
+  // ITSELF cannot proceed — a true dependency cycle (A awaits B, B awaits A), a
+  // lock cycle, a lost wakeup — because there is no healthy worker to move the
+  // work to. This will not fix those, but it refuses to let them be SILENT,
+  // which is the difference between "the cluster hung" and a diagnosable
+  // defect.
+  //
+  // The signature it keys on is deliberately narrow: tasks are outstanding,
+  // NOT ONE WORKER IS EXECUTING, and nothing has completed for the alarm
+  // window. Everything parked with nothing running is a deadlock. Contrast a
+  // merely slow runtime, where workers ARE executing — that is what the stall
+  // detector below is for, and conflating the two would make this cry wolf on
+  // every long task.
+  //
+  // Two things it must NOT depend on, both learned the hard way:
+  //   - Container::GetWorkRemaining(): most ChiMods do not implement it
+  //     (MOD_NAME returns a hardcoded 0), so it reads "no work" during a real
+  //     stall and the alarm never arms.
+  //   - Worker::TasksProcessed(): periodic pollers complete and re-arm
+  //     continuously, so an all-tasks counter never stops advancing. Polling is
+  //     not progress; use RealTasksProcessed().
+  // work_orch_ is null when LoadBalance is driven directly by a unit test
+  // rather than by the WorkOrchestrator's monitor thread. The stall check below
+  // already guards this; the watchdog must too, or the no-op path segfaults
+  // (caught by clio_run_autogen_coverage_tests' "LoadBalance noop" section).
+  if (work_orch_ != nullptr) {
+    u64 processed = 0;
+    u64 outstanding = 0;
+    u32 live = 0;       // workers executing something
+    u32 live_stalled = 0;  // ...of which are stuck past the stall threshold
+    for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+      Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+      if (w == nullptr) continue;
+      processed += w->RealTasksProcessed();
+      if (w->IsExecuting()) {
+        ++live;
+        if (w->IsStalled(now_us, kStallThresholdSec)) ++live_stalled;
+      }
+      WorkerStats st = w->GetWorkerStats();
+      outstanding += st.num_queued_tasks_ + st.num_blocked_tasks_ +
+                     st.num_retry_tasks_;
+    }
+    // Two shapes mean "no progress is possible", and BOTH must be covered:
+    //
+    //  (a) nothing is executing at all — everything is parked waiting on
+    //      something that is not coming (dependency cycle, lost wakeup).
+    //
+    //  (b) everything that IS executing is stalled — the lock-cycle case.
+    //      CoMutex::Lock() calls ctp::Mutex::Lock(), a BLOCKING mutex rather
+    //      than a coroutine-aware park, so two tasks deadlocked on an A/B-B/A
+    //      lock order sit *inside* ExecTask with IsExecuting() true. Keying
+    //      only on (a) would have missed the commonest real deadlock entirely,
+    //      while this alarm claimed to cover it.
+    // The two shapes are NOT equally diagnostic, so they get different
+    // windows:
+    //   (a) nothing executing at all is unambiguous — no thread can make
+    //       progress, period. Alarm after the short window.
+    //   (b) everything executing is blocked is AMBIGUOUS: a worker deadlocked
+    //       on a lock is indistinguishable from one inside a slow syscall that
+    //       will return. Alarming on that quickly would fire on every long
+    //       blocking task, and an alarm operators learn to ignore is worse than
+    //       none. So it needs a much longer window, after which deadlock is far
+    //       likelier than slowness.
+    double window_sec = kNoProgressAlarmSec;
+    const bool wedged_shape =
+        IsWedgedShape(outstanding, live, live_stalled, &window_sec);
+    if (!wedged_shape || processed != last_progress_count_) {
+      last_progress_count_ = processed;
+      last_progress_us_ = now_us;
+      progress_alarm_raised_ = false;
+    } else if (!progress_alarm_raised_ &&
+               (now_us - last_progress_us_) > window_sec * 1e6) {
+      progress_alarm_raised_ = true;  // once per stall, not once per tick
+      HLOG(kError,
+           "[#785] DEADLOCK SUSPECTED: {} task(s) outstanding, {} worker(s) "
+           "executing ({} of them stalled), and no non-periodic task completed "
+           "in {}s. Migration cannot resolve this shape — either everything is "
+           "parked waiting on something that is not coming (dependency cycle, "
+           "lost wakeup), or every running worker is blocked (lock cycle). "
+           "Worker state:",
+           outstanding, live, live_stalled, window_sec);
+      for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+        Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+        if (w == nullptr) continue;
+        WorkerStats st = w->GetWorkerStats();
+        HLOG(kError,
+             "[#785]   worker {}: done={} queued={} blocked={} periodic={} "
+             "retry={}",
+             w->GetId(), st.num_tasks_processed_, st.num_queued_tasks_,
+             st.num_blocked_tasks_, st.num_periodic_tasks_,
+             st.num_retry_tasks_);
+      }
+    }
+  }
+
   u32 stalled = 0;
-  if (check(scheduler_worker_)) ++stalled;
-  for (Worker *w : io_workers_) if (check(w)) ++stalled;
-  if (check(net_send_worker_)) ++stalled;
-  if (check(net_recv_worker_)) ++stalled;
+  if (check(scheduler_worker_, /*migratable=*/true)) ++stalled;
+  for (Worker *w : io_workers_) if (check(w, /*migratable=*/true)) ++stalled;
+  // Elastic workers spawned by earlier rescues. Iterated by index because
+  // check() may append to elastic_workers_ (a cascading rescue), which would
+  // invalidate an iterator mid-loop.
+  for (size_t i = 0; i < elastic_workers_.size(); ++i) {
+    if (check(elastic_workers_[i], /*migratable=*/true)) ++stalled;
+  }
+  if (check(net_send_worker_, /*migratable=*/false)) ++stalled;
+  if (check(net_recv_worker_, /*migratable=*/false)) ++stalled;
 
   // Observability for the unbounded-pool design (#781): if EVERY general-purpose
   // worker is stalled, no routing target can make progress — this is exactly the

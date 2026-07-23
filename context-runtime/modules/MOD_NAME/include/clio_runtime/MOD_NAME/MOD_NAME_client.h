@@ -104,13 +104,16 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<CustomTask> AsyncCustom(const clio::run::PoolQuery& pool_query,
                                        const std::string& input_data,
                                        clio::run::u32 operation_id,
-                                       clio::run::u32 spin_us = 0) {
+                                       clio::run::u32 spin_us = 0,
+                                       clio::run::u32 chain_depth = 0,
+                                       clio::run::u32 block_us = 0,
+                                       int64_t group_id = -1) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // issue #781: spin_us drives the scheduler-variety benchmark's compute mix.
     auto task = ipc_manager->NewTask<CustomTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, input_data,
-        operation_id, spin_us);
+        operation_id, spin_us, chain_depth, block_us, group_id);
 
     return ipc_manager->Send(task);
   }

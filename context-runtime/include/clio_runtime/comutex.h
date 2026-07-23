@@ -43,37 +43,56 @@ namespace clio::run {
  * CoMutex - Reentrant cooperative mutex for coroutine-based task execution.
  * When a parent task holds the lock and spawns a subtask on the same worker,
  * the subtask can reacquire the lock without deadlocking.
+ *
+ * SOUNDNESS: the reentrancy fast path is gated on holder_tid_, an atomic
+ * OS-thread id — every legitimate reentrant acquire runs on the OS thread
+ * that already owns the lock (same-stack nesting, or a same-worker subtask
+ * of the holding parent), and only that gate makes the unsynchronized
+ * holder_/depth_ accesses sound. Comparing holder_ alone (the previous
+ * version) is a data race: a thread could observe a STALE holder_ equal to
+ * its own identity from an EARLIER hold and enter the critical section
+ * while another thread held the mutex. See CoRwLock for the full analysis
+ * (#807 stress-test corruption).
  */
 class CoMutex {
  public:
   ctp::Mutex lock_;
   LockOwnerId holder_;
+  ctp::ipc::atomic<u64> holder_tid_;
   u32 depth_;
 
-  CoMutex() : depth_(0) {}
+  CoMutex() : holder_tid_(0), depth_(0) {}
 
   /** Copy constructor reinitializes to unlocked (needed for std::vector) */
-  CoMutex(const CoMutex &other) : depth_(0) { (void)other; }
+  CoMutex(const CoMutex &other) : holder_tid_(0), depth_(0) { (void)other; }
+
+  /** True iff the calling OS thread currently owns the mutex. Only then may
+   *  holder_ / depth_ be touched without lock_. */
+  bool HeldByThisThread() const {
+    u64 self = GetCoLockThreadId();
+    return self != 0 &&
+           holder_tid_.load(std::memory_order_acquire) == self;
+  }
 
   void Lock() {
-    LockOwnerId cur = GetCurrentLockOwnerId();
-    if (cur == holder_) {
+    if (HeldByThisThread() && GetCurrentLockOwnerId() == holder_) {
       ++depth_;
       return;
     }
     lock_.Lock(0);
-    holder_ = cur;
+    holder_ = GetCurrentLockOwnerId();
+    holder_tid_.store(GetCoLockThreadId(), std::memory_order_release);
     depth_ = 1;
   }
 
   bool TryLock() {
-    LockOwnerId cur = GetCurrentLockOwnerId();
-    if (cur == holder_) {
+    if (HeldByThisThread() && GetCurrentLockOwnerId() == holder_) {
       ++depth_;
       return true;
     }
     if (!lock_.TryLock(0)) return false;
-    holder_ = cur;
+    holder_ = GetCurrentLockOwnerId();
+    holder_tid_.store(GetCoLockThreadId(), std::memory_order_release);
     depth_ = 1;
     return true;
   }
@@ -82,6 +101,7 @@ class CoMutex {
     --depth_;
     if (depth_ == 0) {
       holder_.Clear();
+      holder_tid_.store(0, std::memory_order_release);
       lock_.Unlock();
     }
   }
