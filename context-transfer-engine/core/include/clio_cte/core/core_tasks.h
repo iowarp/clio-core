@@ -1025,7 +1025,20 @@ struct Context {
   bool emulate_;                    // IN: skip real I/O, model the time
   clio::run::u64 emulated_time_ns_;  // OUT: modeled duration of the skipped I/O
 
-#if CTP_ENABLE_COMPRESS
+  // NOTE: these fields are part of the FIXED ABI of Context and must NOT be
+  // compiled conditionally. They used to sit behind #if CTP_ENABLE_COMPRESS,
+  // which made sizeof(Context) (and every task embedding it, e.g. PutBlobTask)
+  // differ between TUs built with and without the flag. clio_cte_core_client
+  // builds WITHOUT it, the runtime modules build WITH it, and the dynamic
+  // linker binds every module's inline Client::AsyncPutBlob/NewTask<...> to
+  // the FIRST DSO exporting it (the client lib) — so tasks were allocated with
+  // the small layout while handlers wrote the large one: a 96-byte heap
+  // overflow that corrupted the next chunk (observed as EndTask's
+  // ExecContainer turning into a stray compression-ratio double, issue: the
+  // compressed-weights segfault), plus gpu_page_idx_ read at the wrong offset
+  // (the "_pi0" double-suffix). Plain PODs cost nothing when compression is
+  // disabled — only the compression BEHAVIOR may be conditional, never the
+  // layout or the serialize format.
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1049,16 +1062,13 @@ struct Context {
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
   double actual_psnr_db_;  // Actual PSNR for lossy compression (0 if lossless)
-#endif
 
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
         min_persistence_level_(0),
         preallocate_(0),
         emulate_(false),
-        emulated_time_ns_(0)
-#if CTP_ENABLE_COMPRESS
-        ,
+        emulated_time_ns_(0),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1074,22 +1084,20 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0)
-#endif
-  {
+        actual_psnr_db_(0.0) {
   }
 
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
              emulate_, emulated_time_ns_);
-#if CTP_ENABLE_COMPRESS
+    // Unconditional: the wire format must not depend on CTP_ENABLE_COMPRESS
+    // (see the layout note above the members).
     ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
              psnr_chance_, max_performance_, consumer_node_, data_type_,
              trace_, trace_key_, trace_node_, actual_original_size_,
              actual_compressed_size_, actual_compression_ratio_,
              actual_compress_time_ms_, actual_psnr_db_);
-#endif
   }
 
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
