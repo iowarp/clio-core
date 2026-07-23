@@ -1235,18 +1235,63 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       name += "_pi" + std::to_string(task->gpu_page_idx_);
 
     size_t hsz = sizeof(CompressionHeader);
-    auto tmp = CLIO_IPC->AllocateBuffer(expected_size + hsz + 1024);
-    if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
-    ctp::ipc::ShmPtr<> tmpp = tmp.shm_.template Cast<void>();
+    const size_t fetch_size = expected_size + hsz + 1024;
+    auto out = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    const bool dev_out = ctp::IsDevicePointer(out.ptr_);
+
+    // Fetch buffer for the compressed bytes. On the device-output fault path
+    // allocate it in DEVICE memory: with an HBM bdev the core's read is then
+    // D2D, and a GPU codec (nvcomp) decompresses device->device — the page
+    // never touches host RAM. Falls back to a host SHM buffer when no GPU (or
+    // VRAM) is available; every consumer below is pointer-type aware.
+    char *dev_tmp = nullptr;
+    ctp::ipc::FullPtr<char> tmp;
+#if CTP_ENABLE_GPU
+    if (dev_out) {
+      dev_tmp = ctp::GpuApi::Malloc<char>(fetch_size);
+    }
+#endif
+    if (dev_tmp == nullptr) {
+      tmp = CLIO_IPC->AllocateBuffer(fetch_size);
+      if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
+    }
+    auto free_tmp = [&]() {
+#if CTP_ENABLE_GPU
+      if (dev_tmp != nullptr) { ctp::GpuApi::Free(dev_tmp); dev_tmp = nullptr; return; }
+#endif
+      CLIO_IPC->FreeBuffer(tmp);
+    };
+    ctp::ipc::ShmPtr<> tmpp;
+    if (dev_tmp != nullptr) {
+      tmpp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();  // raw device pointer
+      tmpp.off_ = reinterpret_cast<clio::run::u64>(dev_tmp);
+    } else {
+      tmpp = tmp.shm_.template Cast<void>();
+    }
     auto gt = core_client_->AsyncGetBlob(task->tag_id_, name, task->offset_,
-        expected_size + hsz + 1024, task->flags_, tmpp,
+        fetch_size, task->flags_, tmpp,
         ForwardQuery(task->tag_id_, name));
     CLIO_CO_AWAIT(gt);
-    if (gt->return_code_ != 0) { CLIO_IPC->FreeBuffer(tmp);
+    if (gt->return_code_ != 0) { free_tmp();
       task->return_code_ = 10 + gt->return_code_; CLIO_CO_RETURN; }
 
-    auto* header = reinterpret_cast<CompressionHeader*>(tmp.ptr_);
-    auto out = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    // The header must be readable on the host; for a device fetch buffer pull
+    // just the 32-byte header across.
+    char *fetch_base = dev_tmp != nullptr ? dev_tmp : tmp.ptr_;
+    CompressionHeader header_host;
+#if CTP_ENABLE_GPU
+    if (dev_tmp != nullptr) {
+      void *hstream = ctp::GpuApi::CreateStream();
+      ctp::GpuApi::MemcpyAsync(reinterpret_cast<char*>(&header_host), dev_tmp,
+                               hsz, hstream);
+      ctp::GpuApi::Synchronize(hstream);
+      ctp::GpuApi::DestroyStream(hstream);
+    } else
+#endif
+    {
+      std::memcpy(&header_host, fetch_base, hsz);
+    }
+    auto* header = &header_host;
     HLOG(kInfo, "[DecompressGetBlob] name={} off={} req={} get_rc={} valid={}",
          name, task->offset_, expected_size, gt->return_code_,
          header->IsValid());
@@ -1279,8 +1324,8 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       if (header->compress_preset_ == 1) preset = ctp::CompressionPreset::FAST;
       else if (header->compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
       auto dec = ctp::CompressionFactory::GetPreset(lib, preset);
-      if (!dec) { CLIO_IPC->FreeBuffer(tmp); task->return_code_ = 3; CLIO_CO_RETURN; }
-      char* cdata = tmp.ptr_ + hsz;
+      if (!dec) { free_tmp(); task->return_code_ = 3; CLIO_CO_RETURN; }
+      char* cdata = fetch_base + hsz;
       // Use the EXACT compressed size recorded at Put time. cuSZp is self-
       // delimiting and tolerates an over-estimate, but zstd/lz4 require the
       // precise frame length or ZSTD_decompress fails ("Src size incorrect")
@@ -1292,23 +1337,44 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
                          : expected_size;
       size_t dsize = header->original_size_;
       // On the on-device fault path task->blob_data_ is an HBM slot, so out.ptr_
-      // is a DEVICE pointer. A host codec (zstd/lz4) decompresses on the CPU and
-      // cannot write there directly -- doing so segfaults. Decompress into a host
-      // staging buffer and device-aware-copy it across. Host destinations keep
-      // the original zero-copy path (no extra allocation or memcpy).
+      // is a DEVICE pointer. A GPU codec (nvcomp*/cusz) writes device output
+      // zero-copy — hand it the slot directly so the decompress runs entirely
+      // on the GPU (with an HBM bdev the compressed input is device memory too:
+      // no byte of the page ever crosses PCIe). A HOST codec (zstd/lz4)
+      // decompresses on the CPU and cannot write device memory — stage through
+      // a host buffer and device-aware-copy it across. Host destinations keep
+      // the original zero-copy path.
+      const bool gpu_codec = lib.rfind("nvcomp", 0) == 0 || lib == "cusz" ||
+                             lib == "cuszp" || lib == "zfp-sycl";
+      // A host codec cannot read a device fetch buffer: pull the compressed
+      // frame D2H first. (Only happens when blobs written with a host codec
+      // are read back on the device fault path — mixed-codec stores.)
+      std::vector<char> chost;
+      if (dev_tmp != nullptr && !gpu_codec) {
+        chost.resize(csize);
+#if CTP_ENABLE_GPU
+        void *cstream = ctp::GpuApi::CreateStream();
+        ctp::GpuApi::MemcpyAsync(chost.data(), cdata, csize, cstream);
+        ctp::GpuApi::Synchronize(cstream);
+        ctp::GpuApi::DestroyStream(cstream);
+#endif
+        cdata = chost.data();
+      }
       bool ok;
-      if (ctp::IsDevicePointer(out.ptr_)) {
+      if (ctp::IsDevicePointer(out.ptr_) && gpu_codec) {
+        ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      } else if (ctp::IsDevicePointer(out.ptr_)) {
         std::vector<char> staging(dsize);
         ok = dec->Decompress(staging.data(), dsize, cdata, csize);
         if (ok) write_out(out.ptr_, staging.data(), dsize);
       } else {
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
       }
-      CLIO_IPC->FreeBuffer(tmp);
+      free_tmp();
       task->return_code_ = ok ? 0 : 5;
     } else {  // stored uncompressed -> copy through (out may be an HBM slot)
-      write_out(out.ptr_, tmp.ptr_, expected_size);
-      CLIO_IPC->FreeBuffer(tmp);
+      write_out(out.ptr_, fetch_base, expected_size);
+      free_tmp();
       task->return_code_ = 0;
     }
   } catch (const std::exception& e) {

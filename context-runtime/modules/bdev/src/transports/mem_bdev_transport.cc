@@ -138,6 +138,12 @@ void MemBdevTransport::FreeRamPage(RamPage &page) {
     page.pinned = false;
     return;
   }
+  if (page.device) {
+    ctp::GpuApi::Free(page.data);
+    page.data = nullptr;
+    page.device = false;
+    return;
+  }
 #endif
   delete[] page.data;
   page.data = nullptr;
@@ -187,6 +193,19 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
       }
       // MallocHost returns nullptr on a host with no usable GPU backend; fall
       // through to the pageable path below so kPinned still functions there.
+    } else if (bdev_type_ == BdevType::kHbm) {
+      // A true HBM tier: pages live in GPU device memory. Reads and writes go
+      // through device-aware copies (see the memcpy sites below), so data
+      // buffered here — e.g. nvcomp-compressed model pages — never has to
+      // round-trip through host RAM to reach a device consumer.
+      page.data = ctp::GpuApi::Malloc<char>(kRamPageSize);
+      if (page.data != nullptr) {
+        page.device = true;
+      }
+      // Malloc returns nullptr with no usable GPU (or VRAM exhaustion); fall
+      // through to the pageable host path so the tier degrades instead of
+      // failing (correctness first — the consumer copies are device-aware
+      // in both directions).
     }
 #endif
     if (page.data == nullptr) {
@@ -211,6 +230,16 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
   clio::run::u64 total_bytes_written = 0;
   clio::run::u64 data_offset = 0;
 
+  // kHbm pages are device memory: chunks are enqueued on one fresh stream and
+  // synchronized once at the end (mirrors LaunchWriteBlocksGpu; a fresh stream
+  // in the current context keeps coroutine thread-migration safe).
+  void *hbm_stream = nullptr;
+#if CTP_ENABLE_GPU
+  if (bdev_type_ == BdevType::kHbm) {
+    hbm_stream = ctp::GpuApi::CreateStream();
+  }
+#endif
+
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
 
@@ -222,6 +251,12 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
         block.offset_ + block_write_size > ram_capacity_) {
       task->return_code_ = 1;
       task->bytes_written_ = total_bytes_written;
+#if CTP_ENABLE_GPU
+      if (hbm_stream != nullptr) {
+        ctp::GpuApi::Synchronize(hbm_stream);
+        ctp::GpuApi::DestroyStream(hbm_stream);
+      }
+#endif
       return;
     }
 
@@ -232,7 +267,14 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
       clio::run::u64 intra = cur_off % kRamPageSize;
       clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
-      memcpy(page + intra, data + data_offset, chunk);
+#if CTP_ENABLE_GPU
+      if (hbm_stream != nullptr) {
+        ctp::GpuApi::MemcpyAsync(page + intra, data + data_offset, chunk, hbm_stream);
+      } else
+#endif
+      {
+        memcpy(page + intra, data + data_offset, chunk);
+      }
       cur_off += chunk;
       data_offset += chunk;
       left -= chunk;
@@ -241,6 +283,12 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
     total_bytes_written += block_write_size;
   }
 
+#if CTP_ENABLE_GPU
+  if (hbm_stream != nullptr) {
+    ctp::GpuApi::Synchronize(hbm_stream);
+    ctp::GpuApi::DestroyStream(hbm_stream);
+  }
+#endif
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
 }
@@ -339,6 +387,17 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
   clio::run::u64 total_bytes_read = 0;
   clio::run::u64 data_offset = 0;
 
+  // kHbm pages are device memory: device-aware chunk copies on one fresh
+  // stream, synchronized once (see WriteBlocksCpu). MemcpyAsync infers the
+  // direction, so a device destination (`data` = an HBM cache slot or a device
+  // scratch buffer) never bounces through the host.
+  void *hbm_stream = nullptr;
+#if CTP_ENABLE_GPU
+  if (bdev_type_ == BdevType::kHbm) {
+    hbm_stream = ctp::GpuApi::CreateStream();
+  }
+#endif
+
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
 
@@ -350,6 +409,12 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
         block.offset_ + block_read_size > ram_capacity_) {
       task->return_code_ = 1;
       task->bytes_read_ = total_bytes_read;
+#if CTP_ENABLE_GPU
+      if (hbm_stream != nullptr) {
+        ctp::GpuApi::Synchronize(hbm_stream);
+        ctp::GpuApi::DestroyStream(hbm_stream);
+      }
+#endif
       return;
     }
 
@@ -362,10 +427,24 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
       char* page = GetRamPage(page_idx);
       char *dst = data + data_offset;
       if (page) {
-        memcpy(dst, page + intra, chunk);
+#if CTP_ENABLE_GPU
+        if (hbm_stream != nullptr) {
+          ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, hbm_stream);
+        } else
+#endif
+        {
+          memcpy(dst, page + intra, chunk);
+        }
       } else {
         // Never-written region reads back as zeros.
-        memset(dst, 0, chunk);
+#if CTP_ENABLE_GPU
+        if (hbm_stream != nullptr) {
+          ctp::GpuApi::MemsetAsync(dst, 0, chunk, hbm_stream);
+        } else
+#endif
+        {
+          memset(dst, 0, chunk);
+        }
       }
       cur_off += chunk;
       data_offset += chunk;
@@ -375,6 +454,12 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
     total_bytes_read += block_read_size;
   }
 
+#if CTP_ENABLE_GPU
+  if (hbm_stream != nullptr) {
+    ctp::GpuApi::Synchronize(hbm_stream);
+    ctp::GpuApi::DestroyStream(hbm_stream);
+  }
+#endif
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;
 }
