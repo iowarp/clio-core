@@ -93,3 +93,26 @@ decompress (host) with GEMV (device) via a second stream + pinned staging.
 greedy temp-0 32-token generation must stay byte-identical to stock. Perf A/B
 with `llama-bench -r 3` (warm). VRAM audit via `nvidia-smi` before/after Phase
 D — llama's weight slabs must be gone.
+
+## Outcome (2026-07-23)
+
+All phases landed on the llama fork branch `clio-vector-integration`:
+A `b4d623d45` (80%-of-free-VRAM auto cache), B `026c0d49d` (batched GEMM-lite —
+prefill served), C `0a617acc3` (paged get_rows), D `a7e2e75c5` (CLIO_Paged
+no-alloc buffer type; llama loads nothing), E `51c66f91b` (double-buffered
+windowed streaming + speculative prefetch).
+
+Verified: weight VRAM = vector cache alone (CLIO_Paged 1201.81 MiB at zero
+device bytes; CUDA0 residue 0.27 MiB of F32 norms); generation byte-identical
+to stock in resident (676/676 matmuls + 4/4 get_rows) and oversubscribed
+(5577/5577 + 33/33) modes, compressed store throughout.
+
+Phase E finding: at 1.5x oversubscription decode is decompress-volume-bound
+(per-token working set > cache; ~5ms compute vs ~500ms zstd decompress), so
+overlap yields parity (330s vs 314s single-window), not a win. Future levers,
+in value order: (1) hot-page pinning — the embedding + output head re-decompress
+262 pages every token and the two-run window machinery already supports a
+pinned run; (2) GPU-side decompression; (3) fusing the CUDA-graph disable to
+per-segment rather than whole-graph. The Phase D fusion-gate lesson: ANY new
+ggml-cuda fast path that reads src0->data directly must refuse CLIO_Paged
+tensors — the abort-trap sentinels catch violations at the faulting op.
