@@ -1120,6 +1120,23 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # CUDA: allow constexpr __host__ functions in __host__ __device__ contexts
     if(CLIO_CORE_ENABLE_CUDA)
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+
+        # Enable CUDA at the TOP-LEVEL scope, before any component subdirectory.
+        # Previously CUDA was enabled lazily inside the first subdirectory that
+        # called add_cuda_library (ClioCoreCommon), which populates the CUDA
+        # compiler feature table only in that scope. That was fine until
+        # CLIO_CORE_ENABLE_LLAMA_SERVER + GGML_CUDA pulled external/llama.cpp in:
+        # ggml's own CUDA enablement re-runs compiler determination and leaves the
+        # feature table blank for sibling IOWarp CUDA targets defined earlier
+        # (e.g. context-assimilation-engine/core via add_cuda_library), so the
+        # GENERATE step aborts with
+        #   "No known features for CUDA compiler "" version ."
+        # Enabling CUDA here, at the root, makes the feature/version state a
+        # property of the top-level project inherited consistently by every
+        # component, so a nested project()'s CUDA determination can no longer
+        # strand a sibling. (A CUDA build without llama.cpp worked before only
+        # because nothing reset the lazily-enabled state.) No-op when CUDA is off.
+        enable_language(CUDA)
     endif()
 
     # AddressSanitizer + LeakSanitizer configuration
@@ -1579,6 +1596,8 @@ if(CLIO_CORE_ENABLE_LLAMA)
         # CUDA platform variables (_CMAKE_CUDA_WHOLE_FLAG etc.).  Re-enabling CUDA
         # at the top level forces CMake to re-run CMakeCUDAInformation.cmake and
         # restore all required device-link variables before generating build rules.
+        # (The CUDA feature/version table itself is now established at the root —
+        # see enable_language(CUDA) far above — so sibling targets survive this.)
         if(CLIO_CORE_ENABLE_CUDA)
             enable_language(CUDA)
         endif()

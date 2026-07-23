@@ -124,8 +124,18 @@ class Vector {
    *
    * Legacy/single-tier only (host_pages_per_block == 0): the HBM tier holds the
    * whole logical extent, so materializing every slot materializes the vector.
+   *
+   * @param num_model_pages  Number of pages the stored object actually occupies.
+   *   Only these pages have a backing blob; the remaining HBM slots are unused.
+   *   Pass 0 (default) to fault every slot -- correct only when the object fills
+   *   the cache exactly. When the object is SMALLER than the cache (gpu_ppb),
+   *   passing 0 makes GetBlob fail on the first page past the object (e.g.
+   *   "<tag>_b0_pi<num_model_pages>" does not exist), which aborts the whole
+   *   pre-fault and forces the slow on-device-fault path. A model-weights tag is
+   *   almost always smaller than the 4096-slot cache, so callers should pass the
+   *   real page count.
    */
-  void FaultAllSync();
+  void FaultAllSync(clio::run::u64 num_model_pages = 0);
 
   /**
    * Windowed host-driven prefetch (the #700 SequentialTransaction primitive).
@@ -1401,7 +1411,7 @@ inline void Vector<T>::FlushAllSync() {
 }
 
 template <typename T>
-inline void Vector<T>::FaultAllSync() {
+inline void Vector<T>::FaultAllSync(clio::run::u64 num_model_pages) {
 #if !CTP_IS_DEVICE_PASS
   if (impl_->host_ppb_cached != 0) {
     throw std::runtime_error(
@@ -1422,6 +1432,13 @@ inline void Vector<T>::FaultAllSync() {
   for (clio::run::u32 b = 0; b < nblocks; ++b) {
     for (clio::run::u32 s = 0; s < gpu_ppb; ++s) {
       clio::run::u64 gp = static_cast<clio::run::u64>(b) * gpu_ppb + s;
+      // Only the first num_model_pages global pages have a backing blob; the
+      // rest of the cache is unused. Faulting past the object would GetBlob a
+      // page that was never stored (rc != 0) and abort the whole pre-fault.
+      // num_model_pages == 0 means "the object fills the cache" -> fault all.
+      if (num_model_pages != 0 && gp >= num_model_pages) {
+        continue;
+      }
       char *hbm = static_cast<char *>(impl_->pages_base) + gp * page_size;
       // Matches the eviction name: writer stores "<tag>_b<block>" and the
       // (de)compressor appends "_pi<gpu_page_idx>" where gpu_page_idx is the

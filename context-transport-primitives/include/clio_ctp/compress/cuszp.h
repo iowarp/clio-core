@@ -66,7 +66,14 @@ inline CUcontext CompressorContext() {
     cuInit(0);
     CUdevice dev;
     if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return;
+    // CUDA 13 remapped cuCtxCreate -> cuCtxCreate_v4, which takes a
+    // CUctxCreateParams* as its 2nd argument (the old 3-arg v2 form fails to
+    // compile with "too few arguments"). Pass nullptr for the default params.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+    if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS) { ctx = nullptr; return; }
+#else
     if (cuCtxCreate(&ctx, 0, dev) != CUDA_SUCCESS) { ctx = nullptr; return; }
+#endif
     CUcontext popped;
     cuCtxPopCurrent(&popped);  // cuCtxCreate left it current; restore the caller's
   });
