@@ -264,6 +264,15 @@ class ShmMetadataCache {
    */
   bool Create(size_t tag_capacity, size_t blob_capacity,
               const clio::run::PoolId &owner_pool) {
+#if !CTP_IS_HOST
+    // Device pass: CLIO_IPC resolves to the GPU IpcManager, which has no
+    // metadata segment. This body is host-only (nvcc member-checks the whole
+    // TU in the device pass when a CUDA file includes core_client.h — e.g.
+    // ggml's clio-vector.cu); the cache is never created from device code.
+    (void)tag_capacity; (void)blob_capacity; (void)owner_pool;
+    return false;
+  }
+#else
     auto *ipc = CLIO_IPC;
     if (ipc == nullptr) {
       return false;
@@ -310,6 +319,7 @@ class ShmMetadataCache {
       return false;
     }
   }
+#endif  // CTP_IS_HOST
 
   bool IsEnabled() const { return root_ != nullptr && alloc_ != nullptr; }
 
