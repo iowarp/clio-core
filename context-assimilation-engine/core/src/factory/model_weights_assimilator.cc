@@ -10,8 +10,10 @@
 #include <clio_cae/core/factory/model_weights_assimilator.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <vector>
 
 // Include clio_cte headers after any clio_cae namespace to avoid Method
@@ -143,6 +145,28 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
     CLIO_IPC->FreeBuffer(mtask->blob_data_.template Cast<char>());
   }
 
+  // Optional: route the PAGE PutBlobs through a storage pool (the
+  // cte_compressor entrypoint) so the weight pages are stored COMPRESSED, while
+  // the tag + manifest above stay on the CTE core (cte_client_). The compressor
+  // is a data-path-only forwarder — it has no tag ops — so tag creation must NOT
+  // be routed through it (mirrors how gpu_vector::Vector always creates the tag
+  // on kCtePoolId and only routes page traffic to its storage_pool_id).
+  // CLIO_MW_STORAGE_POOL=<major> selects it; unset keeps pages on the core.
+  clio::cte::core::Client *page_client = cte_client_.get();
+  std::unique_ptr<clio::cte::core::Client> storage_client;
+  if (const char *sp = std::getenv("CLIO_MW_STORAGE_POOL")) {
+    unsigned long m = std::strtoul(sp, nullptr, 10);
+    if (m != 0) {
+      storage_client = std::make_unique<clio::cte::core::Client>(
+          clio::run::PoolId(static_cast<clio::run::u32>(m), 0));
+      page_client = storage_client.get();
+      HLOG(kInfo,
+           "ModelWeightsAssimilator: routing page PutBlobs through storage "
+           "pool {} (compressed store); tag+manifest stay on the core",
+           m);
+    }
+  }
+
   // ----- Open and stream the weight file into page blobs -----
   std::ifstream file(src_path, std::ios::binary);
   if (!file.is_open()) {
@@ -184,7 +208,7 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
     //   <tag>_b<block>_pi<page>
     std::string blob_name = tag_name + "_b" + std::to_string(block) + "_pi" +
                             std::to_string(p);
-    auto task = cte_client_->AsyncPutBlob(tag_id, blob_name, 0, page_size,
+    auto task = page_client->AsyncPutBlob(tag_id, blob_name, 0, page_size,
                                           buf.shm_.template Cast<void>(), 1.0f,
                                           clio::cte::core::Context(), 0);
     active_tasks.push_back(task);
