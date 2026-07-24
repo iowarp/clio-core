@@ -1477,8 +1477,15 @@ template <typename T>
 inline void Vector<T>::PrefetchWindowSync(clio::run::u64 first_page) {
 #if !CTP_IS_DEVICE_PASS
   // Load the whole cache (gpu_pages_per_block) starting at first_page into
-  // slots [0, gpu_pages_per_block). Serial per-page prefetch (batched showed no
-  // benefit on a single GPU -- see PrefetchPagesSync).
+  // slots [0, gpu_pages_per_block).
+  //
+  // SERIAL, deliberately. Batching this call is NOT safe: it is the whole-cache
+  // rebind, so `count` is the entire slot count (hundreds to thousands), and
+  // batched mode issues every GetBlob before waiting on any. Measured 2026-07-24:
+  // flipping this to batched=true HANGS a 2x-oversubscribed 0.5B run that works
+  // serially -- that many simultaneously outstanding tasks wedges the runtime.
+  // Any fix for the demand-path cost has to bound concurrency (chunked batches),
+  // not simply flip this flag.
   PrefetchPagesSync(first_page, impl_->gpu_ppb_cached, /*slot_base=*/0,
                     /*batched=*/false);
 #endif

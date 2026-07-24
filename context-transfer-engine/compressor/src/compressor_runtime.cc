@@ -55,6 +55,34 @@
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
 #include "clio_ctp/util/gpu_api.h"
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
+#include "clio_ctp/compress/cuszp.h"
+#endif
+
+namespace {
+// cuSZp's presets only reach an absolute error bound of 1e-4 (BEST). To sweep
+// tighter bounds (e.g. 1e-6 / 1e-9) set CLIO_CUSZP_EB=<float>; it overrides the
+// preset's bound at COMPRESS time only. Decompress needs no override — the
+// cuSZp wrapper records the bound used in each blob's prefix and reconstructs
+// from that. No-op unless the codec is cuSZp and the env var is set.
+inline void ApplyCuszpErrorBoundOverride(ctp::Compressor *c,
+                                         const std::string &lib) {
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
+  if (lib != "cuszp") return;
+  const char *e = std::getenv("CLIO_CUSZP_EB");
+  if (e == nullptr) return;
+  if (auto *cz = dynamic_cast<ctp::Cuszp *>(c)) {
+    float eb = std::strtof(e, nullptr);
+    if (eb > 0.0f) {
+      cz->SetErrorBound(eb);
+      HLOG(kInfo, "[cuszp] absolute error bound overridden to {}", eb);
+    }
+  }
+#else
+  (void)c; (void)lib;
+#endif
+}
+}  // namespace
 
 namespace clio::cte::compressor {
 
@@ -868,6 +896,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       task->return_code_ = 3;  // Compressor creation failed
       CLIO_CO_RETURN;
     }
+    ApplyCuszpErrorBoundOverride(compressor.get(), library_name);
 
     auto compress_start = std::chrono::high_resolution_clock::now();
 
@@ -1174,6 +1203,7 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
     else if (context.compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
     auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
     if (!compressor) { task->return_code_ = 3; CLIO_CO_RETURN; }
+    ApplyCuszpErrorBoundOverride(compressor.get(), lib);
 
     std::vector<char> cbuf(input_size + (input_size / 20) + 1024);
     size_t csize = cbuf.size();
