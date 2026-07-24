@@ -173,6 +173,22 @@ class Vector {
   void PrefetchPagesSync(clio::run::u64 first_page, clio::run::u32 count,
                          clio::run::u32 slot_base, bool batched = false);
 
+  /**
+   * Re-score `count` page blobs [first_page, first_page+count) so the CTE data
+   * organizer moves them between storage tiers: score 1.0 stages a page into
+   * the fastest tier (HBM in a tiered compose) BEFORE the window loader needs
+   * it, score 0.9 drains a finished page back to the DRAM tier. This is the
+   * backing-store half of deterministic schedule prefetch — the schedule knows
+   * exactly which pages are needed soon and which are done until next token.
+   *
+   * Reorganize is a metadata/placement op owned by the CTE CORE, and the
+   * compressor entrypoint does not forward it, so this always targets
+   * kCtePoolId regardless of the page-traffic storage pool. Blocking (waits
+   * every future); call it from a background thread, never the compute path.
+   */
+  void ReorganizePagesSync(clio::run::u64 first_page, clio::run::u32 count,
+                           float score);
+
   /** Cache-thread-only: drains the per-block host_prefetch_q, issues
    *  AsyncGetBlob via the CPU-side CTE client for each directive,
    *  waits for completion, then launches a tiny kernel to clear
@@ -1566,6 +1582,32 @@ inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
   detail::MarkPagesResidentKernel<<<1, threads, 0, mark_stream>>>(
       view_.base, first_page, count, slot_base);
   cudaStreamSynchronize(mark_stream);
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::ReorganizePagesSync(clio::run::u64 first_page,
+                                           clio::run::u32 count, float score) {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->nblocks_cached != 1 || count == 0) {
+    return;  // single-block only, same constraint as the prefetch paths
+  }
+  // Reorganize is handled by the CTE core (the tag owner); the compressor
+  // entrypoint has no handler for it, so target kCtePoolId directly even when
+  // page traffic routes through a storage pool.
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  std::vector<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> futs;
+  futs.reserve(count);
+  for (clio::run::u32 i = 0; i < count; ++i) {
+    std::string name =
+        impl_->tag_name + "_b0_pi" + std::to_string(first_page + i);
+    futs.push_back(core.AsyncReorganizeBlob(view_.base.tag_id, name, score,
+                                            clio::run::PoolQuery::Local()));
+  }
+  for (auto &f : futs) {
+    f.Wait();  // rc!=0 (e.g. blob still mid-write) is fine — placement is a
+               // hint; the next token's pass simply retries the same score.
+  }
 #endif
 }
 
