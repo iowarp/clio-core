@@ -1,0 +1,368 @@
+# =============================================================================
+# Issue #526 — Reproducible Jarvis pipeline: SINGLE-NODE regression sweep (v3).
+# CONTAINERIZED (Apptainer) deployment, submitted via jarvis's native
+# scheduler block:   jarvis ppl submit <abs path>/single_node.yaml
+# =============================================================================
+#
+# One pipeline test that benchmarks FOUR storage stacks back-to-back over a
+# shared (I/O size x thread count) grid and records every run into ONE
+# results.csv, so a daily Ares run can be diffed against yesterday to catch
+# performance regressions.
+#
+#   Experiments (issue #526, v3 = issue-literal drivers):
+#     1. NFS + ior           -> ior against the cluster's NFS home
+#     2. CTE + libfuse + ior -> ior against the CTE FUSE mount (POSIX->FUSE->CTE)
+#     3. redis + redis-bench -> builtin.redis-benchmark (SET/GET) vs local redis
+#     4. juicefs + ior       -> ior against the JuiceFS FUSE mount (redis meta +
+#                               local-file object backend)
+#
+#   Grid (issue #526):
+#     * I/O size:     4 KB, 64 KB, 128 KB, 1024 KB   -> 4k, 64k, 128k, 1m
+#     * thread count: 1, 2, 4, 8, 16, 32             -> 4 x 6 = 24 combinations
+#   "threads" = MPI ranks (nprocs/ppn) for the ior drivers; = redis-benchmark
+#   --threads AND -c clients, zipped equal (N connections driven by N threads).
+#
+# EXECUTION MODEL (scheduler Mode A):
+#   The top-level `scheduler:` block below + `jarvis ppl submit` generate and
+#   submit ONE sbatch job (<pipeline shared_dir>/submit.slurm) that wraps the
+#   WHOLE 24-combo grid: pre_cmds run, the hostfile is generated from
+#   $SLURM_JOB_NODELIST, then `jarvis ppl run yaml <this file>` runs every
+#   combo IN-PROCESS inside that single allocation.
+#   PREREQUISITE: jarvis-cd @ regression-pipelines (v3): the Mode A in-process
+#   fix, the `container_fakeroot` pipeline flag, `run_timeout`, builtin.ior's
+#   shared-instance container path (+ stonewall), builtin.redis-benchmark v3
+#   (--csv stats, clients key), builtin.juicefs, and
+#   jarvis_cd.util.container_utils (which the clio_* packages here import).
+#   HOSTFILE: `scheduler.hostfile` tells submit.slurm where to write the
+#   allocation's hosts; the IDENTICAL `hostfile:` under `config:` makes every
+#   iteration read that same file. Keep the two values literally identical.
+#
+# CONTAINER MODEL:
+#   base_deploy_mode: container + container_engine: apptainer => jarvis starts
+#   ONE long-running `apptainer instance` (with sshd inside) and runs the WHOLE
+#   pipeline inside it via `apptainer exec instance://...`. All services and
+#   drivers share that instance, so the JuiceFS and CTE FUSE mounts are visible
+#   to ior in the SAME mount namespace. FUSE needs CAP_SYS_ADMIN, which an
+#   UNPRIVILEGED (non-setuid, conda-forge) apptainer can only supply via
+#   --fakeroot (container_fakeroot below); plain --add-caps SYS_ADMIN is a
+#   NO-OP rootless. Apptainer applies no seccomp/apparmor, so io_uring_setup
+#   (CTE bdev) is not blocked.
+#   FAKEROOT + SLURM GID: rootless --fakeroot validates the GID map against the
+#   user's PERSONAL group, but Slurm starts jobs under the PROJECT primary GID.
+#   The first pre_cmd below re-execs the job script under `sg $USER` (guarded:
+#   no-op when the primary group is already $USER, e.g. off-Slurm).
+#
+# INSTALLATION: baked into a prebuilt SIF built from jarvis-cd's
+# docker/regression.Dockerfile (docker build -> `apptainer build <sif>
+# docker-daemon://...`; the Dockerfile's final RUN is the install-cleanliness
+# gate). The v3 image carries iowarp@dev +fuse, spack ior@3.3.0 + openmpi,
+# redis, juicefs, jarvis-cd, and this repo (fetched at CLIO_REF). Rebuild
+# daily so #526 tracks the latest IOWarp. The SIF-presence pre_cmd below
+# aborts the job early when the image was never staged; build it with
+# jarvis-cd's docker/build_regression_image.sh.
+#
+# PATHS: shared-FS experiment targets (nfs_ior out + the JuiceFS object store)
+# live under ${HOME}/526_scratch, bound INTO the instance via container_binds
+# at instance start — inside the --fakeroot instance $HOME ITSELF is the
+# overlay, so an unbound $HOME path hits ephemeral node-local storage, not NFS.
+# The FUSE mountpoints + JuiceFS cache + chimaera memfd/IPC live on NODE-LOCAL
+# /tmp via tmp_bind_root. The runner writes results.csv on the HOST at
+# `output:` below.
+#
+# Output:
+#   ${HOME}/single_node_results/results.csv   (24 rows; per-driver columns:
+#   <ior pkg>.write_max_mibs/.read_max_mibs/... + .runtime for the ior drivers;
+#   redis_bench.set_rps/.get_rps/.set_p50_ms/.get_p50_ms/.set_p99_ms/
+#   .get_p99_ms + .runtime, raw CSV in the pipeline shared_dir.)
+#
+# ENV OVERRIDES (read by the pre_cmds at job runtime): CONDA_SH (path to
+# conda.sh), CONDA_ENV (conda env with jarvis + apptainer, default iowarp),
+# SPACK_SETUP (optional spack setup-env.sh providing apptainer), CLIO_REPO
+# (this repo's checkout, default ~/clio-core-fork). Export them before
+# `jarvis ppl submit` — pre_cmds are baked verbatim into submit.slurm, so the
+# expansion happens when the JOB runs.
+#
+# SMOKE FIRST: run single_node_smoke.yaml (same pkgs/container/pre_cmds, 2
+# combos, ~15 min) after ANY container rebuild before committing to this
+# 24-combo sweep.
+#
+# SIZING: peak ior data = 32 ranks x 64 MiB block = 2 GiB per phase — 12x
+# headroom in the 24 GiB CTE RAM tier. stonewall (ior -D) caps each ior phase
+# at 120 s, so a pathological small-xfer FUSE combo gets clipped instead of
+# eating the whole run_timeout.
+
+scheduler:
+  name: slurm
+  job_name: single_node_526
+  nodes: 1
+  ntasks_per_node: 1
+  # cpus_per_task must stay large: Ares Slurm uses proctrack/cgroup with
+  # ConstrainCores, and a 1-core cgroup starves clio_run's dedicated workers
+  # alongside FUSE + ior ranks.
+  cpus_per_task: 32
+  partition: debug
+  time: "12:00:00"
+  # Absolute paths so slurm's own stdout/stderr are easy to find (a relative
+  # path lands in the sbatch CWD). Written by slurm on the HOST, outside any
+  # container, so $HOME is the real host home (not the fakeroot overlay).
+  output: ${HOME}/single_node-%j.out
+  error: ${HOME}/single_node-%j.err
+  # Known bad fakeroot nodes (surveyed): uncomment to steer clear. Unknown
+  # scheduler keys pass through as --<key>=<value> sbatch directives.
+  # exclude: "ares-comp-15,ares-comp-17"
+  # Where submit.slurm writes the allocation's hosts. MUST stay literally
+  # identical to config.hostfile below (both are env-expanded at different
+  # times; $HOME is NFS-shared so they resolve to the same file).
+  hostfile: "${HOME}/.jarvis-526/single_node_hostfile.txt"
+  pre_cmds:
+    # 1) fakeroot GID fix: Slurm hands the job the project primary GID;
+    #    rootless --fakeroot validates the GID map against group == $USER.
+    #    Guarded self-re-exec of this job script under the personal group.
+    - 'if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi'
+    # 2) HOST-ENV BLOCK (the one place the host launcher toolchain is brought
+    #    up — swap here for spack when the conda->spack host migration lands).
+    - '. "${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}" && conda activate "${CONDA_ENV:-iowarp}"'
+    - 'command -v apptainer >/dev/null 2>&1 || { [ -n "${SPACK_SETUP:-}" ] && . "$SPACK_SETUP" && spack load apptainer; } || true'
+    - 'command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not on PATH" >&2; exit 1; }'
+    # 3) SIF gate: fail fast if the v3 regression image was never staged.
+    #    pre_cmds are verbatim shell, so resolve jarvis's shared_dir here.
+    - 'JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)'
+    - 'SIF="$JSD/containers/iowarp-regression-526-v3.sif"; [ -n "$JSD" ] && [ -f "$SIF" ] || { echo "ERROR: SIF missing: $SIF — build via jarvis-cd docker/build_regression_image.sh" >&2; exit 1; }'
+    # 4) stale-state cleanup: ghost daemons/instances from a crashed prior
+    #    run wedge this one (port 9413, /dev/shm segments, leftover per-run
+    #    /tmp). pkill patterns are BRACKETED so they never match this
+    #    script's own argv.
+    - 'timeout 30 apptainer instance stop --all >/dev/null 2>&1 || true'
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'find /tmp -maxdepth 1 \( -name "single_node_run*" -o -name "single_node" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true'
+    - 'rm -rf /tmp/iowarp_chi* 2>/dev/null || true'
+    # 5) experiment dirs + repo registration + clean-slate results (the
+    #    sweep runner resumes over an existing results.csv and would skip
+    #    previously-failed rows)
+    - 'mkdir -p "$HOME/526_scratch/single_node/nfs" "$HOME/526_scratch/single_node/jfs_data" "$HOME/single_node_results"'
+    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
+    - 'rm -f "$HOME/single_node_results/results.csv"'
+  post_cmds:
+    - 'RES="$HOME/single_node_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 24"; [ "$n" -ge 24 ] && echo "ALL 24 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
+
+config:
+  name: single_node
+
+  # Every iteration reads the allocation's hosts from the file submit.slurm
+  # wrote (see scheduler.hostfile above — keep the two literally identical).
+  hostfile: "${HOME}/.jarvis-526/single_node_hostfile.txt"
+
+  # ---- Containerized deployment (Ares dev jarvis — APPTAINER) -----------
+  base_deploy_mode: container
+  container_engine: apptainer
+  # Pre-staged SIF, referenced by BASENAME (NOT a path): jarvis resolves it to
+  #   <jarvis shared_dir>/containers/iowarp-regression-526-v3.sif
+  # Because container_uri is UNSET, jarvis trusts this SIF and performs NO
+  # pull/build. The -v3 basename is deliberate: a stale v2 SIF (which lacks
+  # ior) can never be silently reused. NOTE: container_image is NOT
+  # env-expanded by jarvis, so it must stay a bare basename.
+  container_image: "iowarp-regression-526-v3"
+  # FUSE-in-apptainer recipe: the CTE + JuiceFS FUSE mounts need CAP_SYS_ADMIN
+  # *effective* inside the container. With a non-setuid apptainer, --fakeroot
+  # is required (verified in v2: without it, fusermount fails to open
+  # /dev/fuse). With fakeroot, container_caps and a /dev/fuse bind are
+  # unnecessary (v2 went 24/24 green with neither; confirmed with jarvis v3).
+  container_fakeroot: true
+  # Redirect in-container /tmp to NODE-LOCAL disk. Default jarvis backs
+  # apptainer /tmp with an NFS overlay, which breaks chimaera's IPC unix
+  # sockets and would put the JuiceFS cache on NFS. tmp_bind_root makes jarvis
+  # bind <root>/single_node/tmp -> /tmp from local disk instead.
+  tmp_bind_root: "/tmp"
+  # container_binds: bind a dedicated shared-FS scratch INTO the instance.
+  # v2's objection was about per-package `apptainer exec instance://` --bind
+  # (which did NOT materialize on Ares); container_binds are applied at
+  # `apptainer instance start` instead — the SAME mechanism as tmp_bind_root —
+  # so they DO take effect. Required because inside the --fakeroot instance
+  # $HOME is the overlay, not a host bind, so nfs_ior's out + juicefs's
+  # data_dir would otherwise land on the ephemeral node-local overlay instead
+  # of real NFS. The bind maps the exact host path through, bypassing the
+  # overlay; it is on shared NFS and identical on every node. jarvis does NOT
+  # create bind sources (instance start --bind fails on a missing source), so
+  # the pre_cmd mkdir above creates ${HOME}/526_scratch/... first.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
+
+  env:
+    # In-container memfd dir for chimaera (container /tmp is private + writable).
+    CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
+
+  pkgs:
+    # ---- Services (started in order; stopped in reverse) -----------------
+    # Redis: metadata engine for JuiceFS (DB 1) AND server for redis-benchmark
+    # (DB 0). One server covers both; no persistence keeps it a fair in-memory
+    # peer of the CTE RAM tier. (builtin.redis — #526 hardening lives upstream
+    # in jarvis-cd @ regression-pipelines.)
+    - pkg_type: builtin.redis
+      pkg_name: redis
+      port: 6379
+      sleep: 4
+
+    # clio_run runtime daemon (shm IPC for single-node). swim_enabled: false
+    # carried from the validated host-mode ior yaml — avoids mid-IOR SWIM
+    # "node confirmed dead" cascades.
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+      swim_enabled: false
+
+    # CTE pool, single RAM tier. 24 GiB = 12x the 2 GiB peak ior write set
+    # (32 ranks x 64 MiB block). pool_name stays at its default
+    # clio_cte_core == the C++ kCtePoolName constant — required so the FUSE
+    # client's AsyncCreate composes against the same pool (see the pool_name
+    # menu text for the cross-node race this avoids).
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "24GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # CTE libfuse mount (in-container): the "+ libfuse" path the ior driver
+    # below writes through (POSIX -> FUSE -> CTE).
+    - pkg_type: jarvis_clio_core.clio_cte_libfuse
+      pkg_name: cte_fuse
+      # FUSE mountpoint on NODE-LOCAL /tmp (writable via tmp_bind_root), NOT
+      # /mnt: the image's /mnt is read-only SquashFS.
+      mountpoint: /tmp/cte_mnt
+      log_level: "info"
+      extra_fuse_args: "-f"
+      sleep: 2
+
+    # JuiceFS: format (storage=file) + FUSE mount. Object store on the bound
+    # shared-FS scratch (real NFS, bypasses the overlay); mount + cache on
+    # in-container node-local /tmp (a distributed-FS cache stays node-local).
+    - pkg_type: builtin.juicefs
+      pkg_name: juicefs
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: file
+      data_dir: ${HOME}/526_scratch/single_node/jfs_data
+      mountpoint: /tmp/jfs_mnt
+      cache_dir: /tmp/juicefs_cache
+      name: jfsbench
+      format_fresh: true
+      mount_wait: 20
+
+    # ---- Benchmark drivers (Applications; run sequentially) --------------
+    # builtin.ior (v3 container path). Shared keys: api posix, write+read,
+    # fpp (file-per-process — REQUIRED through per-node FUSE mounts), fixed
+    # block 64m per rank (data-bounded runtime; the xfer sweep below is the
+    # I/O-size axis), stonewall 120 (ior -D: phase runtime cap). log: is left
+    # UNSET on purpose — builtin.ior then defaults it to each package's own
+    # shared_dir/ior.log, which is host-bound and auto-distinct per package.
+    # An explicit ${HOME}/..._results/*.log silently lost every stat: inside
+    # the --fakeroot instance $HOME is the overlay (not a host bind) and the
+    # log parent dir does not exist there, so ior's `tee <log>` failed and the
+    # host-side stat parser found nothing.
+    # 1) NFS: ior against real NFS via the bound 526_scratch (an unbound $HOME
+    #    path would hit the fakeroot overlay, not NFS — see container_binds).
+    - pkg_type: builtin.ior
+      pkg_name: nfs_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "4k"
+      block: "64m"
+      nprocs: 1
+      ppn: 1
+      stonewall: 120
+      out: ${HOME}/526_scratch/single_node/nfs/ior_nfs.bin
+
+    # 2) CTE + libfuse: ior through the CTE FUSE mount.
+    - pkg_type: builtin.ior
+      pkg_name: cte_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "4k"
+      block: "64m"
+      nprocs: 1
+      ppn: 1
+      stonewall: 120
+      out: /tmp/cte_mnt/ior_cte.bin
+
+    # 3) redis: builtin.redis-benchmark (SET/GET -> -t set,get; --csv stats).
+    #    The "threads" axis drives clients (-c) AND nthreads (--threads),
+    #    zipped equal: a row means N connections driven by N I/O threads.
+    #    count (-n) is zipped with req_size so total data stays ~1 GiB
+    #    (count = 1 GiB / req_size), keeping the working set axis-independent.
+    - pkg_type: builtin.redis-benchmark
+      pkg_name: redis_bench
+      port: 6379
+      write: true
+      read: true
+      req_size: 4096
+      count: 262144
+      clients: 1
+      nthreads: 1
+
+    # 4) juicefs: ior through the JuiceFS FUSE mount.
+    - pkg_type: builtin.ior
+      pkg_name: jfs_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "4k"
+      block: "64m"
+      nprocs: 1
+      ppn: 1
+      stonewall: 120
+      out: /tmp/jfs_mnt/ior_jfs.bin
+
+vars:
+  # I/O size, applied to all four drivers at once (zipped, length 4). 1m = the
+  # issue's 1024 KB point. redis req_size is in BYTES; count is the matching
+  # ~1 GiB request budget (1 GiB / req_size), so 4k<->262144, 64k<->16384,
+  # 128k<->8192, 1m<->1024 stay paired.
+  nfs_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
+  cte_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
+  jfs_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
+  redis_bench.req_size: [4096,  65536,  131072, 1048576]
+  redis_bench.count:    [262144, 16384, 8192,   1024]
+
+  # Thread count, applied to all four drivers at once (zipped, length 6).
+  # ior: nprocs AND ppn (single node => equal). redis-benchmark: clients (-c)
+  # AND nthreads (--threads), zipped equal per the jarvis contract.
+  nfs_ior.nprocs:      [1, 2, 4, 8, 16, 32]
+  nfs_ior.ppn:         [1, 2, 4, 8, 16, 32]
+  cte_ior.nprocs:      [1, 2, 4, 8, 16, 32]
+  cte_ior.ppn:         [1, 2, 4, 8, 16, 32]
+  jfs_ior.nprocs:      [1, 2, 4, 8, 16, 32]
+  jfs_ior.ppn:         [1, 2, 4, 8, 16, 32]
+  redis_bench.clients: [1, 2, 4, 8, 16, 32]
+  redis_bench.nthreads: [1, 2, 4, 8, 16, 32]
+
+loop:
+  # Outer group: I/O size (+ redis request budget), 4 values.
+  - [nfs_ior.xfer, cte_ior.xfer, jfs_ior.xfer,
+     redis_bench.req_size, redis_bench.count]
+  # Inner group: thread count, 6 values  =>  4 x 6 = 24 combinations.
+  - [nfs_ior.nprocs, nfs_ior.ppn, cte_ior.nprocs, cte_ior.ppn,
+     jfs_ior.nprocs, jfs_ior.ppn, redis_bench.clients, redis_bench.nthreads]
+
+# Per-combination wall-clock backstop (jarvis-cd @ regression-pipelines;
+# older jarvis silently ignores this key). With stonewall capping each ior
+# phase at 120 s, a healthy combo stays well under 1200; expiry records the
+# row failed and the sweep continues — one wedged package can no longer lose
+# the other 23 rows of the shared allocation.
+run_timeout: 1200
+
+repeat: 1                       # bump to 3 for variance (~3x wall-clock)
+output: "${HOME}/single_node_results"

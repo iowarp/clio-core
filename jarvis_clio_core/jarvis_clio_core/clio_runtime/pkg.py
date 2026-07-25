@@ -7,6 +7,7 @@ and container deployment modes via deploy_mode configuration.
 from jarvis_cd.core.pkg import Service
 from jarvis_cd.shell import Exec, PsshExecInfo
 from jarvis_cd.shell.process import Kill, GdbServer
+from jarvis_cd.util.container_utils import container_kwargs
 from jarvis_cd.util import SizeType
 from jarvis_cd.util.logger import Color
 import os
@@ -318,6 +319,34 @@ class ClioRuntime(Service):
 
         self.log("Starting IOWarp runtime")
 
+        # Self-heal BEFORE launching a fresh runtime: kill any stale chimaera
+        # left alive by a prior combo, THEN reclaim its chi_* shm. Both are
+        # host-side (unwrapped) on purpose — apptainer shares the host /dev/shm
+        # and PID space, and the stale process we're hunting has, by definition,
+        # ESCAPED the prior combo's instance:// PID namespace, so the wrapped
+        # `Kill('chimaera')` in the previous stop() could not reach it.
+        #
+        # Why this matters (observed on single_node job 21563, combo 18): the
+        # sweep is sequential in ONE allocation, so combo N+1's runtime start
+        # inherits whatever combo N's teardown left behind. Every teardown logs
+        # `ERROR ... Server dead` — the runtime dies hard, not gracefully — so a
+        # wedged/re-parented chimaera CAN survive. If it does and we only rm the
+        # shm, the fresh runtime comes up alongside the survivor with an
+        # inconsistent pool registry; a client task then routes to the null pool
+        # (`worker.cc ... Container not found for pool_id=PoolId(0,0)`) and, with
+        # no IPC failover, HANGS forever (combo 18 stalled ~8 h to the wall
+        # clock). Killing first makes the old "no live chimaera here" assumption
+        # actually true. Idempotent: in the healthy case nothing matches, so this
+        # is a no-op that leaves startup state unchanged. The `[c]himaera` /
+        # `[c]lio_run` bracket keeps pkill from matching its own argv; `|| true`
+        # keeps a no-match (exit 1) from looking like a failure. Without the shm
+        # reclaim a single mid-startup death also snowballs into a /dev/shm
+        # ENOSPC cascade for every subsequent combo.
+        Exec("pkill -9 -f '[c]himaera' || true; "
+             "pkill -9 -f '[c]lio_run' || true; "
+             'rm -f /dev/shm/chi_*',
+             PsshExecInfo(hostfile=self.hostfile)).run()
+
         cmd = 'clio_run runtime start'
         # Jarvis runs default to a fresh session; a persistent deployment
         # (ephemeral=false) recomposes saved pools + replays the WAL instead.
@@ -328,10 +357,9 @@ class ClioRuntime(Service):
             env=self.env,
             hostfile=self.hostfile,
             exec_async=True,
-            container=self._container_engine,
-            container_image=self.deploy_image_name(),
             private_dir=self.private_dir,
             bind_mounts=self.container_mounts,
+            **container_kwargs(self),
         )
         if self.config.get('do_dbg', False):
             GdbServer(cmd, self.config['dbg_port'], exec_info).run()
@@ -372,10 +400,27 @@ class ClioRuntime(Service):
 
         self.log("Stopping IOWarp runtime")
 
-        Exec('clio_run runtime stop',
-             PsshExecInfo(env=self.env, hostfile=self.hostfile)).run()
+        # #526: BOUND the graceful stop, and run it INSIDE the instance
+        # (container_kwargs) — symmetric with start(). The earlier
+        # intermittent "shm_attach shm_open failed" during stop was the
+        # host-side stop client trying to attach shm owned by the
+        # in-instance runtime; wrapping puts the stop client in the same
+        # namespace. `timeout` still caps a wedged stop; Kill below is what
+        # actually frees the runtime. `-k 10` SIGKILLs if clio_run ignores
+        # the SIGTERM. Harmless on bare-metal (engine 'none' -> no wrap).
+        Exec('timeout -k 10 45 clio_run runtime stop',
+             PsshExecInfo(env=self.env, hostfile=self.hostfile,
+                          **container_kwargs(self))).run()
+        # Backstop force-kill under BOTH daemon names: 'chimaera' (pre-rebrand
+        # CLIO, e.g. the current 526 SIF) and 'clio_run' (post Chimaera->Clio
+        # rebrand). Kill of a name with no matches is benign, so the union is
+        # safe whichever CLIO vintage is deployed.
+        Kill('chimaera',
+             PsshExecInfo(env=self.env, hostfile=self.hostfile,
+                          **container_kwargs(self))).run()
         Kill('clio_run',
-             PsshExecInfo(env=self.env, hostfile=self.hostfile)).run()
+             PsshExecInfo(env=self.env, hostfile=self.hostfile,
+                          **container_kwargs(self))).run()
 
         port = self.config['port']
         host = self.hostfile.hosts[0] if self.hostfile.hosts else '127.0.0.1'
@@ -395,8 +440,15 @@ class ClioRuntime(Service):
 
     def kill(self):
         self.log("Forcibly killing IOWarp runtime")
+        # Both daemon names — pre-rebrand ('chimaera') and post ('clio_run');
+        # see stop() for rationale.
+        Kill('chimaera', PsshExecInfo(
+            hostfile=self.hostfile,
+            **container_kwargs(self)
+        )).run()
         Kill('clio_run', PsshExecInfo(
-            hostfile=self.hostfile
+            hostfile=self.hostfile,
+            **container_kwargs(self)
         )).run()
 
     def clean(self):
@@ -409,6 +461,16 @@ class ClioRuntime(Service):
         if os.path.exists(log_file):
             os.remove(log_file)
 
+        # HOST-SIDE (deliberately NOT wrapped): clean() runs *after* stop() has
+        # already torn the apptainer instance down, so a wrapped `apptainer exec
+        # instance://…` here would target a dead instance and silently no-op —
+        # leaking the runtime's shm across every sweep combo until /dev/shm
+        # (a 48 GiB tmpfs on Ares) fills and later combos die with ENOSPC
+        # ([Errno 28]). Apptainer shares the host /dev/shm by default (no
+        # --contain), so chimaera's shm_open segments physically live on the
+        # host /dev/shm; a bare host-side rm reaches the exact same files and
+        # reclaims them regardless of instance state. On distributed runs the
+        # hostfile fans this out host-side to every node's local /dev/shm.
         Exec('rm -f /dev/shm/chi_*', PsshExecInfo(
             hostfile=self.hostfile
         )).run()

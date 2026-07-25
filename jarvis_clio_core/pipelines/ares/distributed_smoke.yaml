@@ -1,0 +1,224 @@
+# =============================================================================
+# Issue #526 — DISTRIBUTED SMOKE pipeline (v3). The go/no-go gate.
+#   jarvis ppl submit <abs path>/distributed_smoke.yaml
+# =============================================================================
+#
+# Validation scaffolding, NOT a throwaway: same packages, container recipe,
+# fabric tuning, and pre_cmds as distributed.yaml — only the allocation (2
+# nodes), grid ({1,2} client nodes), block size, and time limit shrink.
+#
+# THIS FILE PROVES THE TWO v3 HEADLINE RISKS at 2-node cost, BEFORE any
+# 4-node reservation:
+#   1. MPI-IN-CONTAINER: in-instance mpiexec spawning ranks on the OTHER
+#      node's instance via ssh -p 2222 (the num_nodes=2 row is the proof —
+#      its cte_ior aggregate should be ~2x the num_nodes=1 row).
+#   2. MULTI-NODE LIBFUSE: per-node CTE FUSE mounts against per-node pools
+#      (pool_query local, default pool_name = kCtePoolName) without the
+#      cross-node AsyncCreate race.
+#
+# Red-run levers: set log_level debug on runtime/cte_core; read the per-host
+# fuse logs in the pipeline shared_dir; probe the cross-node hop manually
+# (apptainer exec instance://<run> ssh -p 2222 <peer> hostname); drop
+# num_nodes vars to [1] to isolate MPI spawn from FUSE; use the fakeroot
+# preflight's --exclude hint for bad nodes.
+#
+# See distributed.yaml for full documentation — everything here mirrors it
+# with `distributed_smoke` names.
+
+scheduler:
+  name: slurm
+  job_name: distributed_smoke_526
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 32
+  partition: debug
+  time: "01:00:00"
+  # Absolute (host-side slurm log; relative would land in the sbatch CWD).
+  output: ${HOME}/distributed_smoke-%j.out
+  error: ${HOME}/distributed_smoke-%j.err
+  # exclude: "ares-comp-15,ares-comp-17"
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-526/distributed_smoke_hostfile.txt"
+  pre_cmds:
+    # 1) fakeroot GID fix on the head node (see single_node.yaml).
+    - 'if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi'
+    # 2) HOST-ENV BLOCK (swap here for spack when the host migration lands).
+    - '. "${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}" && conda activate "${CONDA_ENV:-iowarp}"'
+    - 'command -v apptainer >/dev/null 2>&1 || { [ -n "${SPACK_SETUP:-}" ] && . "$SPACK_SETUP" && spack load apptainer; } || true'
+    - 'command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not on PATH" >&2; exit 1; }'
+    # 3) SIF gate ($SIF is reused by the preflight below — one bash process)
+    - 'JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)'
+    - 'SIF="$JSD/containers/iowarp-regression-526-v3.sif"; [ -n "$JSD" ] && [ -f "$SIF" ] || { echo "ERROR: SIF missing: $SIF — build via jarvis-cd docker/build_regression_image.sh" >&2; exit 1; }'
+    # 4) per-node stale-state reap (both nodes; bracketed pkills).
+    - |-
+      srun --kill-on-bad-exit=0 --ntasks-per-node=1 bash -c '
+        command -v apptainer >/dev/null 2>&1 || { echo "WARNING: $(hostname): apptainer not on PATH"; exit 0; }
+        timeout 30 apptainer instance stop --all >/dev/null 2>&1 || true
+        pkill -9 -f "[c]himaera" 2>/dev/null || true
+        pkill -9 -f "[c]lio_run" 2>/dev/null || true
+        { command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true
+        rm -f /dev/shm/chi_* 2>/dev/null || true
+        find /tmp -maxdepth 1 \( -name "distributed_smoke_run*" -o -name "distributed_smoke" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true
+        rm -rf /tmp/iowarp_chi* 2>/dev/null || true
+        echo "prep done: $(hostname)"
+      ' || echo "WARNING: per-node prep rc=$? — continuing"
+    # 5) fakeroot preflight (throwaway --fakeroot instance per node).
+    - |-
+      BAD=""
+      for h in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
+        if env -u LD_LIBRARY_PATH ssh -n -o BatchMode=yes "$h" \
+            "apptainer instance start --fakeroot $SIF pf_$$ >/dev/null 2>&1 && apptainer instance stop pf_$$ >/dev/null 2>&1"; then
+          echo "fakeroot OK: $h"
+        else
+          echo "fakeroot FAILED: $h"
+          BAD="${BAD:+$BAD,}$h"
+        fi
+      done
+      if [ -n "$BAD" ]; then
+        echo "ERROR: fakeroot preflight failed on: $BAD" >&2
+        echo "Resubmit excluding them: set exclude: \"$BAD\" in the scheduler block, or: sbatch --exclude=$BAD <pipeline shared_dir>/submit.slurm" >&2
+        exit 1
+      fi
+    # 6) experiment dirs + repo registration + clean-slate results
+    - 'mkdir -p "$HOME/526_scratch/distributed_smoke/nfs" "$HOME/526_scratch/distributed_smoke/jfs_data" "$HOME/cte_libfuse_526_smoke" "$HOME/distributed_smoke_results"'
+    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
+    - 'rm -f "$HOME/distributed_smoke_results/results.csv"'
+  post_cmds:
+    - 'RES="$HOME/distributed_smoke_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"; [ "$n" -ge 2 ] && echo "ALL 2 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
+
+config:
+  name: distributed_smoke
+
+  hostfile: "${HOME}/.jarvis-526/distributed_smoke_hostfile.txt"
+
+  # Host-level Pssh hop + mpiexec plm_rsh_agent (see distributed.yaml). The
+  # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are REQUIRED for the
+  # in-instance ssh -p 2222 prted spawn — without them the num_nodes>=2 rows die
+  # with "Host key verification failed" / "PRTE has lost communication".
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+  # Fabric tuning prefix (identical to distributed.yaml; must start "mpiexec ").
+  mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include eno1 --prtemca prte_if_include eno1 --prtemca prte_tmpdir_base /tmp/iowarp_prte_tmp'
+
+  # ---- Containerized deployment — identical recipe to distributed.yaml ----
+  base_deploy_mode: container
+  container_engine: apptainer
+  container_image: "iowarp-regression-526-v3"
+  container_fakeroot: true
+  tmp_bind_root: "/tmp"
+  container_overlay_root: "/tmp"
+  # Shared-FS scratch bound at instance start on both nodes (see
+  # distributed.yaml): real-NFS nfs_ior baseline + a genuinely shared JuiceFS
+  # object store under meta_use_head.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
+  env:
+    CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
+
+  pkgs:
+    # ---- Services (identical configs to distributed.yaml) ----------------
+    - pkg_type: builtin.redis
+      pkg_name: redis
+      port: 6379
+      single_instance: true
+      sleep: 4
+
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+      swim_enabled: false
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_clio_core.clio_cte_libfuse
+      pkg_name: cte_fuse
+      mountpoint: ${HOME}/cte_libfuse_526_smoke
+      log_level: "info"
+      extra_fuse_args: "-f"
+      sleep: 2
+
+    - pkg_type: builtin.juicefs
+      pkg_name: juicefs
+      meta_use_head: true
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: file
+      data_dir: ${HOME}/526_scratch/distributed_smoke/jfs_data
+      mountpoint: /tmp/jfs_mnt
+      cache_dir: /tmp/juicefs_cache
+      name: jfsbench
+      format_fresh: true
+      mount_wait: 20
+
+    # ---- Benchmark drivers (block shrunk 256m -> 64m, ppn 4 -> 2) --------
+    - pkg_type: builtin.ior
+      pkg_name: nfs_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "1m"
+      block: "64m"
+      ppn: 2
+      nprocs: 2
+      num_nodes: 1
+      stonewall: 120
+      out: ${HOME}/526_scratch/distributed_smoke/nfs/ior_nfs.bin
+
+    - pkg_type: builtin.ior
+      pkg_name: cte_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "1m"
+      block: "64m"
+      ppn: 2
+      nprocs: 2
+      num_nodes: 1
+      stonewall: 120
+      out: ${HOME}/cte_libfuse_526_smoke/ior_cte.bin
+
+    - pkg_type: builtin.ior
+      pkg_name: jfs_ior
+      api: posix
+      write: true
+      read: true
+      fpp: true
+      xfer: "1m"
+      block: "64m"
+      ppn: 2
+      nprocs: 2
+      num_nodes: 1
+      stonewall: 120
+      out: /tmp/jfs_mnt/ior_jfs.bin
+
+# {1,2}-client-node sweep: row 1 = all-local MPI (isolates the container
+# stack), row 2 = the cross-node spawn proof.
+vars:
+  nfs_ior.num_nodes: [1, 2]
+  cte_ior.num_nodes: [1, 2]
+  jfs_ior.num_nodes: [1, 2]
+  nfs_ior.nprocs:    [2, 4]
+  cte_ior.nprocs:    [2, 4]
+  jfs_ior.nprocs:    [2, 4]
+
+loop:
+  - [nfs_ior.num_nodes, cte_ior.num_nodes, jfs_ior.num_nodes,
+     nfs_ior.nprocs, cte_ior.nprocs, jfs_ior.nprocs]
+
+run_timeout: 1200
+
+repeat: 1
+output: "${HOME}/distributed_smoke_results"
