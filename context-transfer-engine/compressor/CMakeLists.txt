@@ -49,10 +49,16 @@ endif()
 # cuszp.h runs cuSZp in a dedicated CUDA context (driver API: cuCtxCreate/cuInit/
 # cuCtxPushCurrent). Link the CUDA driver library so the dlopen'd module .so
 # resolves those symbols at load time (else the ChiMod fails to load).
-if(TARGET CUDA::cuda_driver)
-    target_link_libraries(clio_cte_compressor_runtime PRIVATE CUDA::cuda_driver)
-else()
-    target_link_libraries(clio_cte_compressor_runtime PRIVATE cuda)
+# ONLY when the cuSZp code is actually compiled in: gating on
+# CLIO_CTP_ENABLE_CUSZP mirrors the CTP_ENABLE_CUSZP compile guard in cuszp.h.
+# An unconditional -lcuda fallback breaks every CPU-only build (no libcuda
+# exists there) — that was CI failure "Build Core Containers" on this branch.
+if(CLIO_CTP_ENABLE_CUSZP)
+    if(TARGET CUDA::cuda_driver)
+        target_link_libraries(clio_cte_compressor_runtime PRIVATE CUDA::cuda_driver)
+    else()
+        target_link_libraries(clio_cte_compressor_runtime PRIVATE cuda)
+    endif()
 endif()
 
 add_clio_module_client(
