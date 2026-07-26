@@ -104,7 +104,16 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   SaveTaskArchive archive(MsgType::kSerializeIn,
                            ipc->shm_send_transport_.get());
   archive << (*task_ptr);
-  conn->Send(archive);
+  int send_rc = conn->Send(archive);
+  if (send_rc != 0) {
+    // A submit that never reached the daemon must FAIL the future, not hang
+    // it (issue #774: every silent drop on this path turns into a client
+    // parked forever in Future::Wait).
+    HLOG(kError, "IpcCpu2Cpu::SendIn: MPSC send failed rc={} for task {}",
+         send_rc, task_ptr->task_id_);
+    task_ptr->SetReturnCode(static_cast<clio::run::u32>(-send_rc));
+    task_ptr->SetComplete();
+  }
   return future;
 #endif  // CTP_IS_HOST
 }

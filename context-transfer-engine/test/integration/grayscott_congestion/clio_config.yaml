@@ -1,0 +1,52 @@
+---
+# Gray-Scott congestion-collapse repro config (issue #774).
+#
+# Two-node cluster, CTE core pool only (one container per node, neighborhood 2)
+# so HashBlobToContainer scatters ~50% of blobs cross-node over the ZMQ mesh.
+#
+# runtime.num_threads is deliberately 4 to match the Delta pipeline
+# (gray-scott-warn.yaml: num_threads: 4) where 2 of the 4 workers were observed
+# pegged at 88% during the collapse.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
+
+networking:
+  port: 8080
+  neighborhood_size: 2
+  hostfile: /workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
+
+logging:
+  level: info
+  file: /tmp/clio.log
+
+runtime:
+  num_threads: 4          # Delta parity — the constrained worker pool
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
+
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: /mnt/hdd1
+        bdev_type: file
+        capacity_limit: 6GB
+        score: 0.5
+    dpe:
+      dpe_type: max_bw
+    targets:
+      neighborhood: 2
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    performance:
+      target_stat_interval_ms: 5000
+      blob_cache_size_mb: 1024
+      max_concurrent_operations: 64
+      score_threshold: 0.7
+      score_difference_threshold: 0.05

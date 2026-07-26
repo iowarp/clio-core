@@ -390,7 +390,14 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
-  u32 task_progress_interval_ms_ = 0;        // #628: 0 = periodic validity check disabled
+  // #628 task-progress probe (0 = disabled). ON by default (issue #774): this
+  // probe is the ONLY recovery for a cross-node task whose response was lost
+  // (e.g. the SendOut retry queue timing out under sustained back-pressure) —
+  // with it disabled, the origin task leaks in send_map_ and the client's
+  // Future::Wait() hangs forever. 5s keeps the scan cheap (throttled, probes
+  // only replicas outstanding beyond the interval) while bounding how long a
+  // lost response can park a client.
+  u32 task_progress_interval_ms_ = 5000;
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
 
   // Task load prediction model

@@ -1,62 +1,84 @@
-# CTE multi-node coherency test (Docker, 4 nodes)
+# CTE Memory-Coherency Integration Test (4-node Docker)
 
-Verifies **memory coherency** of the distributed CTE blob store across a 4-node
-cluster for three workloads, with **every node acting as a client** — coherency
-only means something when *different nodes touch the same blobs*.
+Runs `test_cte_coherency` (unit source: `test/unit/test_cte_coherency.cc`) as a
+**client on all four nodes** of a Docker Compose cluster — different nodes
+touching the same blobs, which is what coherency actually means. Blobs
+hash-route by `(tag_id, blob_name)`, so a blob written on one node generally
+lives on another and must read back identically cross-node.
 
-| workload | what it asserts |
-|----------|-----------------|
-| **write-only** | 4 nodes write 8 disjoint blobs each, concurrently; every node then reads back **all 32** → no lost or cross-clobbered writes |
-| **read-only** | node 0 writes 16 blobs; all 4 nodes read the **same** blobs → identical content, no stale or torn reads on non-writer nodes |
-| **append-only** | all 4 nodes write disjoint slices into **one shared blob** at increasing offsets; every node verifies all slices → concurrent partial writes assemble instead of clobbering |
+Three coherency cases (12 assertions across 4 nodes): **write-only** (concurrent
+disjoint writes globally visible), **read-only** (all nodes read one dataset
+identically), **append-only** (concurrent disjoint slices assemble into one
+blob).
 
-Blobs hash-route by `(tag_id, blob_name)` across the pool's containers, so a blob
-written on one node generally *lives* on another — that cross-node round trip is
-what is being tested.
+## Differs from `test/integration/distributed`
+
+| | distributed | coherency (this suite) |
+|---|---|---|
+| test client | node1 only | **all 4 nodes** |
+| binary | `test_core_functionality` | `test_cte_coherency` |
+| cross-node barriers | n/a | shared Docker volume `coh_rundir` at `CTE_RUNDIR` |
+| subnet | 172.28.0.0/24 | **172.31.0.0/24** |
+
+## Per-node sequence (`node_entrypoint.sh`)
+
+1. start `clio_run` daemon (background)
+2. wait for the daemon's **ChiMod scan** to finish — gate on
+   `Loaded ChiMod: clio_cte_core`, not merely `Main server started` (the scan
+   that registers `clio_bdev`/`clio_cte_core` runs *after* the server-started
+   marker; gating too early lets cross-node pool creation begin before peers
+   have loaded `clio_bdev`)
+3. **READY barrier** — no further step until all 4 daemons are up and scanned
+4. rank 0 creates pool 512.0 via `clio_run compose start` (idempotent), then a
+   **COMPOSED barrier** — see "Pool creation" below
+5. run `test_cte_coherency` as a client (`CLIO_WITH_RUNTIME=0`, `CTE_RANK`=node-1)
+6. **TESTDONE barrier** — a node must not tear down its daemon while peers may
+   still be reading blobs that hash-route to it
+7. stop the daemon; exit with the test's return code
+
+## Pool creation (why the explicit `compose start`)
+
+`test_cte_coherency` *assumes* the CTE core pool (512.0) already exists (it only
+does `GetOrCreateTag`/`PutBlob`/`GetBlob`), unlike `test_core_functionality`
+which creates the pool in its own body. Relying on the daemon-startup compose is
+racy in a cold 4-node cluster: a node can receive cross-node
+`GetOrCreatePool(clio_bdev)` broadcasts *before* its own ChiMod scan has loaded
+`clio_bdev`, so the pool silently fails to form. Rank 0 therefore composes the
+pool explicitly *after* the READY barrier guarantees every peer has loaded
+`clio_bdev`; the COMPOSED barrier makes all ranks wait for the pool before they
+connect. Idempotent — returns the existing pool for a single-node run.
+
+## Guards (why this can't fake a pass)
+
+- **Shared volume wiped every run** (`docker compose down -v`): stale
+  `READY`/`TESTDONE`/`bar_*` files would let a node skip a barrier and fake a pass.
+- **Vacuous run ≠ pass**: the binary exits 0 if a filter matches no cases (prints
+  `Passed: 0`). `run_tests.sh` asserts `Total tests: 3 / Passed: 3 / Failed: 0`
+  **per node**, not merely exit 0.
+- **All four aggregated**: any node failing fails the suite (a single
+  `--abort-on-container-exit` code is not enough).
+- **Done barrier, not just ready**: peers keep serving until every client finishes.
 
 ## Run
 
 ```bash
-cmake --build build --target clio_run test_cte_coherency   # binaries first
-context-transfer-engine/test/integration/coherency/run_tests.sh
+# Prerequisite (Linux binaries, e.g. inside the deps container):
+cmake --build build --target clio_run test_cte_coherency
+
+# Then:
+ctest -R cte_coherency_integration_docker      # via CTest (needs CLIO_CORE_ENABLE_DOCKER_CI=ON)
+./run_tests.sh                                 # or directly
+./run_tests.sh --keep                          # keep containers for debugging
+./run_tests.sh --cleanup-only                  # wipe a previous run
 ```
 
-or through ctest:
+`HOST_WORKSPACE=/abs/path` overrides the workspace bind-mount (devcontainers /
+out-of-tree builds). `IOWARP_DOCKER_IMAGE` overrides the image (auto-detected:
+`deps-nvidia` if `clio_run` links libcudart, else `deps-cpu`).
 
-```bash
-ctest -R cte_coherency_integration_docker
-```
+## Note on measuring where data landed
 
-Requires docker + docker compose. Useful knobs:
-
-| variable | meaning |
-|----------|---------|
-| `HOST_WORKSPACE` | repo path mounted at `/workspace` (auto-detected) |
-| `IOWARP_DOCKER_IMAGE` | image to run (default `iowarp/deps-cpu:latest`) |
-| `KEEP_UP=1` | leave containers up afterwards for inspection |
-
-## How it works
-
-Each container starts a `clio_run` daemon, waits at a **ready barrier** until all
-4 daemons are up, runs `test_cte_coherency` as a client, then waits at a **done
-barrier** before shutting its daemon down — a node must not disappear while a
-peer is still reading blobs that hash-routed to it. Barriers are files on the
-shared `coh-rundir` volume (`CTE_RUNDIR`), which `run_tests.sh` deletes between
-runs so stale barriers cannot make a run appear to pass.
-
-The runner aggregates **all four** nodes: it fails if any node exits non-zero
-**or** reports fewer than 3 passing coherency cases, so a run where nothing
-executed is a failure rather than a silent green.
-
-## Relationship to `distributed_slurm/`
-
-`test/integration/distributed_slurm/` runs the same `test_cte_coherency` binary
-on a real cluster via Slurm + Apptainer (and additionally covers the GPU
-compressed-vector cases, which need real GPUs). That harness is portable only to
-Slurm sites. **This suite is the portable one** — it exercises the same coherency
-logic anywhere Docker runs, including a laptop.
-
-## Related
-
-`../distributed/` runs the stock CTE distributed test with a client on **one**
-node only; this suite differs by making every node a client.
+If you ever extend this to check placement: the file bdev pre-allocates **sparse**
+backing files, so apparent size (`du --apparent-size`, `find -printf '%s'`) reads
+identically on every node whether or not data landed there. Count **allocated
+blocks** instead (`find -printf '%b'`, 512-byte units).

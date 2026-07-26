@@ -52,6 +52,14 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   auto fs = f.GetFutureShm();
   fs->origin_ = ClientOrigin::kClientShm;
   fs->client_pid_ = ti.task_id_.pid_;
+  // Preserve the CLIENT's response-matching key (issue #774 / #768). The
+  // runtime repurposes task_id_.net_key_ for its own bookkeeping when the task
+  // is forwarded cross-node (IpcManagerRun2Run::SendIn overwrites it with the
+  // daemon-side send_map key), so a forwarded task's response would otherwise
+  // reach the client bearing the DAEMON's key — the client's net_key demux
+  // then stashes it forever and Future::Wait() never returns. Mirror of the
+  // ZMQ path's save (ipc_cpu2cpu_zmq.cc RecvIn) / restore (SendOut).
+  fs->client_net_key_ = ti.task_id_.net_key_;
   // The SHM client blocks on its own MPSC server clio-<pid>-<tid>; SendOut routes
   // the result back there using the waiter (the OS pid/tid stamped by SendIn,
   // carried in task_id_). net_key (task_id_.net_key_) is already on the task.
@@ -91,6 +99,13 @@ void IpcCpu2Cpu::SendOut(
                      std::to_string(task_ptr->WaiterTid());
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(name);
   if (conn != nullptr) {
+    // Restore the CLIENT's response-matching key before serializing: a
+    // cross-node round trip leaves task_id_.net_key_ holding run2run's
+    // send_map key (see RecvIn above); the client demuxes responses by ITS
+    // key, so echo back what it sent. Mirror of ipc_cpu2cpu_zmq.cc SendOut.
+    if (!future_shm.IsNull() && future_shm->client_net_key_ != 0) {
+      task_ptr->task_id_.net_key_ = future_shm->client_net_key_;
+    }
     SaveTaskArchive archive(MsgType::kSerializeOut, send_transport);
     // SaveTask takes a non-const shared_ptr&; copy the (const) handle.
     clio::run::shared_ptr<clio::run::Task> save_handle = task_ptr;

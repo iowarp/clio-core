@@ -8,10 +8,11 @@ add_subdirectory(restart)
 if(CLIO_CORE_ENABLE_DOCKER_CI)
     message(STATUS "CTE integration tests enabled (Docker CI)")
     add_subdirectory(distributed)
-    add_subdirectory(coherency)  # write/read/append coherency, every node a client
+    add_subdirectory(coherency)  # 4-node CTE memory-coherency (client on every node)
     add_subdirectory(cfs_distributed)  # #685: cross-node CFS namespace test
     add_subdirectory(mpi_producer_consumer)  # #714: cross-node blob data (MPI)
     add_subdirectory(client_crash)  # #722: client dies mid-PutBlob (runtime robustness)
+    add_subdirectory(grayscott_congestion)  # #774: L=512 congestion-collapse repro
     add_subdirectory(jarvis_deploy)
 
     # FUSE integration test requires Docker with FUSE support

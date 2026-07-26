@@ -1,35 +1,36 @@
 ---
-# CTE multi-node COHERENCY test - 4-node cluster (Docker).
-#
-# Same shape as test/integration/distributed/clio_config.yaml, but every node
-# runs the test as a CLIENT (coherency needs different nodes touching the same
-# blobs), and each node owns one file-backed storage target so we can see where
-# blob data actually lands.
+# WRP configuration for the 4-node CTE memory-coherency integration test.
+# Mirrors test/integration/distributed/clio_config.yaml (same cte_core pool
+# 512.0 across 4 nodes); only the hostfile path differs (points at this dir).
+# test_cte_coherency connects to pool 512.0 as a client on every node.
 
+# Memory segment configuration
 memory:
   main_segment_size: auto
   client_data_segment_size: 2GB
   runtime_data_segment_size: 2GB
 
+# Network configuration
 networking:
   port: 8080
   neighborhood_size: 32
   hostfile: /workspace/context-transfer-engine/test/integration/coherency/hostfile
 
+# Logging configuration
 logging:
   level: info
   file: /tmp/clio.log
 
+# Runtime configuration
 runtime:
-  num_threads: 8
+  num_threads: 16
   queue_depth: 1024
   local_sched: "default"
   heartbeat_interval: 1000
 
+# Compose section - declarative pool creation.
+# CTE Core ChiMod, pool 512.0 (clio_cte/core/constants.h), name "cte_main".
 compose:
-  # CTE core (pool 512.0). Blobs hash-route by (tag_id, blob_name) across the
-  # containers of this pool, so a blob written on one node generally lives on
-  # another -- which is what makes the coherency assertions meaningful.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
@@ -37,8 +38,20 @@ compose:
     storage:
       - path: /mnt/hdd1
         bdev_type: file
-        capacity_limit: 4GB
-        score: 1.0
+        capacity_limit: 10GB
+        score: 0.25
+      - path: /mnt/hdd2
+        bdev_type: file
+        capacity_limit: 10GB
+        score: 0.25
+      - path: /mnt/hdd3
+        bdev_type: file
+        capacity_limit: 10GB
+        score: 0.25
+      - path: /mnt/hdd4
+        bdev_type: file
+        capacity_limit: 10GB
+        score: 0.25
     dpe:
       dpe_type: max_bw
     targets:
@@ -47,7 +60,7 @@ compose:
       poll_period_ms: 5000
     performance:
       target_stat_interval_ms: 5000
-      blob_cache_size_mb: 1024
+      blob_cache_size_mb: 16384
       max_concurrent_operations: 64
       score_threshold: 0.7
       score_difference_threshold: 0.05

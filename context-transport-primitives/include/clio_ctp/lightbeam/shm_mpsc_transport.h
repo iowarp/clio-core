@@ -61,6 +61,7 @@ static constexpr size_t kShmMpscMaxXfers = 256;
 // connection skipping on the consumer side).
 struct ShmXferHeader {
   ctp::u64 conn_id_;     // Producing connection's id
+  ctp::u64 producer_pid_;  // OS pid of the producing process (liveness check)
   ctp::u32 xfer_off_;    // Absolute ring byte offset of this chunk's slot
   ctp::u32 xfer_size_;   // Number of bytes in this chunk
   ctp::u32 rem_off_;     // Offset of this chunk within the producer's message
@@ -68,7 +69,8 @@ struct ShmXferHeader {
   ctp::ipc::atomic<bool> ready_;  // Producer sets after memcpy; consumer clears
 
   CTP_CROSS_FUN ShmXferHeader()
-      : conn_id_(0), xfer_off_(0), xfer_size_(0), rem_off_(0), rem_size_(0) {
+      : conn_id_(0), producer_pid_(0), xfer_off_(0), xfer_size_(0), rem_off_(0),
+        rem_size_(0) {
     ready_.store(false);
   }
 };
@@ -265,6 +267,13 @@ class ShmMpscTransport {
       //    (which also means its ring slot has been drained and is free).
       ctp::u64 xfer_id = hdr_->xfer_id_tail_.fetch_add(1);
       if (!WaitSlotFree(xfer_id)) return -EPIPE;
+      // Stamp ownership the moment the slot is ours, BEFORE the payload copy:
+      // if this thread is descheduled mid-publish, the consumer's
+      // WaitChunkReady can verify we are alive and keep waiting instead of
+      // abandoning the chunk (issue #774 — a skipped live chunk permanently
+      // orphans this connection's message reassembly).
+      hdr_->xfers_[xfer_id % kShmMpscMaxXfers].producer_pid_ =
+          static_cast<ctp::u64>(ctp::SystemInfo::GetPid());
       // 2. Chunk size (each chunk fits wholly inside one kShmMpscChunkSize slot,
       //    so no ring wraparound is possible within a chunk).
       ctp::u32 xfer_size = static_cast<ctp::u32>(
@@ -502,7 +511,22 @@ class ShmMpscTransport {
       ctp::Timepoint now;
       now.Now();
       if (start.GetUsecFromStart(now) >= kShmMpscDeadXferUs) {
-        return false;
+        // Abandon the chunk ONLY if the producing process is actually gone.
+        // A live producer may be descheduled arbitrarily long on a loaded
+        // host; skipping its chunk loses the message and poisons this conn's
+        // reassembly state forever (issue #774: single-victim client hangs).
+        // producer_pid_ is stamped right after the slot is claimed; 0 means
+        // the claim itself has not landed yet — treat as alive and re-arm
+        // (the stamping window is nanoseconds; a dead pre-stamp producer is
+        // caught on the next expiry via the previous occupant's dead pid).
+        ctp::u64 pid = slot.producer_pid_;
+#ifndef _WIN32
+        if (pid != 0 &&
+            !ctp::SystemInfo::IsProcessAlive(static_cast<int>(pid))) {
+          return false;
+        }
+#endif
+        start.Now();  // producer alive (or unstamped): keep waiting
       }
       CTP_THREAD_MODEL->Yield();
     }

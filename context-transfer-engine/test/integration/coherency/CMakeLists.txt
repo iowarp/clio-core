@@ -1,10 +1,9 @@
-# CMakeLists.txt for the CTE multi-node coherency integration test.
-#
-# Docker-based: spins up a 4-container cluster and runs test_cte_coherency on
-# every node (write-only / read-only / append-only). Portable counterpart to
-# test/integration/distributed_slurm, which requires Slurm + Apptainer.
+# CMakeLists.txt for the CTE 4-node memory-coherency integration test.
 cmake_minimum_required(VERSION 3.10)
 
+# Docker + docker-compose 4-node cluster: every node runs test_cte_coherency
+# as a client against its local daemon. Prerequisite binaries (built before
+# ctest runs): clio_run, test_cte_coherency.
 set(COHERENCY_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_test(
@@ -15,7 +14,7 @@ add_test(
 
 set_tests_properties(cte_coherency_integration_docker PROPERTIES
     LABELS "integration;docker;distributed;coherency"
-    TIMEOUT 600
+    TIMEOUT 900  # 15 min: 4-container bring-up + barriers + teardown
 )
 
 message(STATUS "CTE coherency integration test configured")
