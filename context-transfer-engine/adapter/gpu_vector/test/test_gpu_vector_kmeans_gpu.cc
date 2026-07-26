@@ -41,6 +41,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/singletons.h>
+#include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
@@ -95,24 +96,41 @@ void EnsureInit() {
   const char *port_env = std::getenv("CLIO_PORT");
   int port = port_env ? std::atoi(port_env) : 10590;
   std::string cfg = "/tmp/gpu_vec_kmeans_" + std::to_string(port) + ".yaml";
+  // Two storage tiers so the compressed footprint can be measured split across
+  // HBM and DRAM at scale: tier 0 = HBM (score 1.0, filled first) -> pool 512.1;
+  // tier 1 = DRAM overflow (score 0.5) -> pool 513.1. Sizes are env-tunable so a
+  // large run can force a real spill; the small default keeps everything in HBM.
+  const char *hbm_env = std::getenv("CLIO_KM_HBM_MIB");
+  const char *dram_env = std::getenv("CLIO_KM_DRAM_MIB");
+  int hbm_mib = hbm_env ? std::atoi(hbm_env) : 8192;
+  int dram_mib = dram_env ? std::atoi(dram_env) : 16384;
   {
     std::ofstream f(cfg);
     f << "networking:\n  port: " << port << "\n\n"
       << "runtime:\n  num_threads: 8\n  queue_depth: 65536\n\n"
       << "compose:\n"
       << "  - mod_name: clio_bdev\n"
-      << "    pool_name: \"ram::chi_default_bdev\"\n"
+      << "    pool_name: \"hbm::chi_default_bdev\"\n"
       << "    pool_query: local\n    pool_id: \"301.0\"\n"
-      << "    bdev_type: ram\n    capacity: \"2048MB\"\n\n"
+      << "    bdev_type: hbm\n    capacity: \"128MB\"\n\n"
       << "  - mod_name: clio_cte_compressor\n"
       << "    pool_name: cte_compressor\n    pool_query: local\n"
       << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n\n"
       << "  - mod_name: clio_cte_core\n"
       << "    pool_name: cte_core\n    pool_query: local\n    pool_id: \"512.0\"\n"
-      << "    storage:\n      - path: \"ram::cte_ram_tier1\"\n"
-      << "        bdev_type: \"ram\"\n        capacity_limit: \"2048MB\"\n"
-      << "        score: 1.0\n"
-      << "    dpe:\n      dpe_type: \"max_bw\"\n";
+      << "    storage:\n"
+      << "      - path: \"hbm::cte_hbm_tier\"\n"
+      << "        bdev_type: \"hbm\"\n        capacity_limit: \""
+      << hbm_mib << "MB\"\n        score: 1.0\n";
+    // CLIO_KM_DRAM_MIB=0 -> single HBM tier (no DRAM overflow), so a dataset
+    // whose compressed footprint fits in HBM is stored ENTIRELY in HBM. Else add
+    // the DRAM overflow tier for the spill case.
+    if (dram_mib > 0) {
+      f << "      - path: \"ram::cte_dram_tier\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \""
+        << dram_mib << "MB\"\n        score: 0.5\n";
+    }
+    f << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
   std::fprintf(stderr, "[KM] compose=%s\n", cfg.c_str());
@@ -164,8 +182,10 @@ __global__ void KmGatherKernel(clio::run::IpcManagerGpuInfo info,
  * so this is free to use a full grid.
  */
 __global__ void KmAssignKernel(const float *scratch, clio::run::u64 npts,
-                               const float *centroids, float *sums, int *counts,
-                               float *inertia) {
+                               const float *centroids, double *sums, int *counts,
+                               double *inertia) {
+  // Accumulate in DOUBLE: at 100M+ points a float32 sum saturates (loses any
+  // value once it exceeds 2^24), which corrupts both centroids and inertia.
   for (clio::run::u64 p = blockIdx.x * (clio::run::u64)blockDim.x + threadIdx.x;
        p < npts; p += (clio::run::u64)gridDim.x * blockDim.x) {
     const float *pt = &scratch[p * kDims];
@@ -179,9 +199,10 @@ __global__ void KmAssignKernel(const float *scratch, clio::run::u64 npts,
       }
       if (d2 < best_d2) { best_d2 = d2; best = c; }
     }
-    for (int d = 0; d < kDims; ++d) atomicAdd(&sums[best * kDims + d], pt[d]);
+    for (int d = 0; d < kDims; ++d)
+      atomicAdd(&sums[best * kDims + d], (double)pt[d]);
     atomicAdd(&counts[best], 1);
-    atomicAdd(inertia, best_d2);
+    atomicAdd(inertia, (double)best_d2);
   }
 }
 
@@ -194,9 +215,15 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
   auto *ipc = CLIO_CPU_IPC;
 
   const clio::run::u32 window = 4;                       // pages per window
-  const clio::run::u64 page_size = 256ULL * 1024;        // cuSZp-correct size
+  // Page size / count tunable so the same test runs at 16 MiB (default) or many
+  // GiB (CLIO_KM_PAGE_KIB, CLIO_KM_PAGES). Larger pages also store faster (fewer
+  // serial PutBlobs) and compress a touch better.
+  const char *pk_env = std::getenv("CLIO_KM_PAGE_KIB");
+  const clio::run::u64 page_size =
+      (pk_env ? (clio::run::u64)std::atoi(pk_env) : 256ULL) * 1024;  // >=256 KiB
   const clio::run::u64 epp = page_size / sizeof(float);
-  const clio::run::u32 K = 64;                           // pages -> 16 MiB
+  const char *kp_env = std::getenv("CLIO_KM_PAGES");
+  const clio::run::u32 K = kp_env ? (clio::run::u32)std::atoi(kp_env) : 64;
   const clio::run::u64 total_elems = (clio::run::u64)K * epp;
   const clio::run::u64 npoints = total_elems / kDims;
   const int iters = std::getenv("CLIO_KM_ITERS")
@@ -225,6 +252,18 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
   ctx.dynamic_compress_ = 1;
   ctx.compress_preset_ = 2;   // BALANCED -> abs error bound 1e-3
 
+  // Measure the compressed footprint (memory-expansion metric): the store tier
+  // is split across the HBM tier (512.1) and the DRAM overflow tier (513.1).
+  // Compare each tier's used bytes before/after storing the point set.
+  const bool have_dram = !std::getenv("CLIO_KM_DRAM_MIB") ||
+                         std::atoi(std::getenv("CLIO_KM_DRAM_MIB")) > 0;
+  clio::run::bdev::Client hbm_bdev(clio::run::PoolId(512, 1));
+  auto h0 = hbm_bdev.AsyncGetStats(); h0.Wait();
+  clio::run::u64 hbm_rem0 = h0->remaining_size_, dram_rem0 = 0;
+  clio::run::bdev::Client dram_bdev(clio::run::PoolId(513, 1));
+  if (have_dram) { auto r0 = dram_bdev.AsyncGetStats(); r0.Wait();
+                   dram_rem0 = r0->remaining_size_; }
+
   float *pagebuf = nullptr;
   REQUIRE(cudaMalloc(&pagebuf, page_size) == cudaSuccess);
   for (clio::run::u32 p = 0; p < K; ++p) {
@@ -240,8 +279,26 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
     REQUIRE(pf->GetReturnCode() == 0);
   }
   cudaFree(pagebuf);
-  std::fprintf(stderr, "[KM] stored %u compressed pages (%lluMiB logical)\n", K,
-               (unsigned long long)(total_elems * sizeof(float) >> 20));
+
+  auto h1 = hbm_bdev.AsyncGetStats(); h1.Wait();
+  clio::run::u64 hbm_used =
+      (hbm_rem0 >= h1->remaining_size_) ? hbm_rem0 - h1->remaining_size_ : 0;
+  clio::run::u64 dram_used = 0;
+  if (have_dram) { auto r1 = dram_bdev.AsyncGetStats(); r1.Wait();
+                   dram_used = (dram_rem0 >= r1->remaining_size_)
+                                   ? dram_rem0 - r1->remaining_size_ : 0; }
+  clio::run::u64 stored_bytes = hbm_used + dram_used;
+  const clio::run::u64 logical_bytes = total_elems * sizeof(float);
+  double ratio = stored_bytes ? (double)logical_bytes / (double)stored_bytes : 0.0;
+  std::fprintf(stderr,
+      "[KM] MEMORY: logical=%lluMiB (uncompressed) -> compressed=%lluMiB "
+      "(%.2fx, clustered ML data)  split: HBM=%lluMiB + DRAM=%lluMiB\n",
+      (unsigned long long)(logical_bytes >> 20),
+      (unsigned long long)(stored_bytes >> 20), ratio,
+      (unsigned long long)(hbm_used >> 20), (unsigned long long)(dram_used >> 20));
+  std::fprintf(stderr, "[KM] stored %u compressed pages (%lluMiB logical, %lluKiB pages)\n",
+               K, (unsigned long long)(logical_bytes >> 20),
+               (unsigned long long)(page_size >> 10));
 
   // ---- K-means iterations, each a full streaming sweep via prefetch ----
   gv::Vector<float> vec(tag, /*nblocks=*/1, /*gpu_id=*/0,
@@ -252,12 +309,13 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
                         /*allow_cold_miss_fault=*/false,
                         /*storage_pool_id=*/StoragePool());
 
-  float *d_centroids = nullptr, *d_sums = nullptr, *d_inertia = nullptr;
+  float *d_centroids = nullptr;
+  double *d_sums = nullptr, *d_inertia = nullptr;
   int *d_counts = nullptr;
   REQUIRE(cudaMalloc(&d_centroids, kClusters * kDims * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_sums, kClusters * kDims * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_sums, kClusters * kDims * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&d_counts, kClusters * sizeof(int)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_inertia, sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_inertia, sizeof(double)) == cudaSuccess);
   // Contiguous staging for one prefetch window (window pages worth of floats).
   const clio::run::u64 win_elems = (clio::run::u64)window * epp;
   float *d_scratch = nullptr;
@@ -269,16 +327,16 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
     for (int d = 0; d < kDims; ++d)
       h_centroids[c * kDims + d] = PointCoord((clio::run::u64)c, d);
 
-  std::vector<float> h_sums(kClusters * kDims);
+  std::vector<double> h_sums(kClusters * kDims);
   std::vector<int> h_counts(kClusters);
   double prev_inertia = 0.0;
 
   for (int it = 0; it < iters; ++it) {
     cudaMemcpy(d_centroids, h_centroids.data(),
                h_centroids.size() * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_sums, 0, kClusters * kDims * sizeof(float));
+    cudaMemset(d_sums, 0, kClusters * kDims * sizeof(double));
     cudaMemset(d_counts, 0, kClusters * sizeof(int));
-    cudaMemset(d_inertia, 0, sizeof(float));
+    cudaMemset(d_inertia, 0, sizeof(double));
 
     // Stream the whole dataset: window W+1 decompresses while W is consumed.
     gv::SequentialTransaction<float> sweep(vec, /*first_page=*/0, /*npages=*/K);
@@ -296,19 +354,19 @@ TEST_CASE("gpu_vector: k-means over a compressed dataset larger than the HBM "
     });
     ctp::GpuApi::Synchronize();
 
-    cudaMemcpy(h_sums.data(), d_sums, h_sums.size() * sizeof(float),
+    cudaMemcpy(h_sums.data(), d_sums, h_sums.size() * sizeof(double),
                cudaMemcpyDeviceToHost);
     cudaMemcpy(h_counts.data(), d_counts, h_counts.size() * sizeof(int),
                cudaMemcpyDeviceToHost);
-    float inertia = 0.0f;
-    cudaMemcpy(&inertia, d_inertia, sizeof(float), cudaMemcpyDeviceToHost);
+    double inertia = 0.0;
+    cudaMemcpy(&inertia, d_inertia, sizeof(double), cudaMemcpyDeviceToHost);
 
     clio::run::u64 assigned = 0;
     for (int c = 0; c < kClusters; ++c) {
       assigned += (clio::run::u64)h_counts[c];
       if (h_counts[c] > 0)
         for (int d = 0; d < kDims; ++d)
-          h_centroids[c * kDims + d] = h_sums[c * kDims + d] / (float)h_counts[c];
+          h_centroids[c * kDims + d] = (float)(h_sums[c * kDims + d] / (double)h_counts[c]);
     }
     std::fprintf(stderr, "[KM] iter %d: assigned=%llu inertia=%.4f\n", it,
                  (unsigned long long)assigned, (double)inertia);
