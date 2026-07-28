@@ -3829,8 +3829,28 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
+      if (!worker) {
+        // Routed from a NON-worker thread (the runtime main thread during
+        // ServerInit/compose, via IpcCpu2Self::SendIn). This used to be a
+        // silent DROP: the transient Dne/Retry (e.g. the admin pool's static
+        // container not yet resolvable while compose submits GetOrCreatePool)
+        // lost the task forever, the submitter waited on a future nobody
+        // completes, and the runtime wedged at startup with provably idle
+        // workers — the CI unit-gate 300 s timeouts on cte_tag_construction /
+        // cte_query_* et al. Park it on a published worker's retry queue
+        // instead; every worker polls its retry queue each loop iteration and
+        // sleeps at most max_sleep, so the re-route needs no explicit wake.
+        worker = CLIO_WORK_ORCHESTRATOR->GetWorker(0);
+      }
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
+      } else {
+        // No worker published yet (pre-SpawnWorkerThreads). Nothing can ever
+        // retry this task; make the loss loud instead of a silent hang.
+        HLOG(kFatal,
+             "RouteTask: dropping unroutable task (pool={} method={}) — no "
+             "worker exists to retry it",
+             task_ptr->pool_id_, task_ptr->method_);
       }
     }
     return result;
