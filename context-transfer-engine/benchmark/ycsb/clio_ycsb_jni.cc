@@ -21,7 +21,10 @@
 #include <jni.h>
 #include <signal.h>
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -34,6 +37,27 @@ namespace {
 clio::cte::core::Tag *g_tag = nullptr;
 std::once_flag g_init_once;
 int g_init_rc = -100;  // set by the once-body; <0 means init failed
+
+// ---- async write window (issue #862 follow-up) ----------------------------
+// Writes were fully synchronous: one blocking PutBlob round trip per update,
+// which caps update-heavy workloads (A/F) at the depth-1 rate. This window
+// pipelines puts through the private-memory AsyncPutBlob (issue #830): in
+// client mode the private bytes are STAGED (copied) into a task-owned SHM
+// buffer during the submit call itself, so the JNI array can be released
+// immediately and the task frees its own staging on completion. The window is
+// shared by all YCSB client threads (mutex-guarded deque); when it exceeds
+// CLIO_YCSB_WINDOW (default 64, 0 = synchronous), the submitting thread reaps
+// the oldest future OUTSIDE the lock. Completion errors are sticky
+// (g_async_err) and surfaced on the next put and at drain.
+//
+// Semantics note: a read may observe the pre-put value of a key whose put is
+// still in flight (YCSB does not verify read values in the core workloads);
+// load/run phases are separate processes and cleanup() drains, so no put
+// escapes its phase.
+std::mutex g_win_mtx;
+std::deque<clio::run::Future<clio::cte::core::PutBlobTask>> g_inflight;
+std::atomic<int> g_async_err{0};
+size_t g_window = 64;
 
 void InitOnce() {
   // The Clio SHM transport wakes waiters with tgkill(SIGUSR1); clio-aware
@@ -74,7 +98,29 @@ void InitOnce() {
     return;
   }
   g_tag = new clio::cte::core::Tag("ycsb");
+  if (const char *w = std::getenv("CLIO_YCSB_WINDOW")) {
+    g_window = static_cast<size_t>(std::strtoul(w, nullptr, 10));
+  }
   g_init_rc = 0;
+}
+
+// Reap futures until at most `keep` remain. Waits happen outside the lock so
+// submitting threads only contend on deque ops, not on put completion.
+void ReapDownTo(size_t keep) {
+  while (true) {
+    clio::run::Future<clio::cte::core::PutBlobTask> fut;
+    {
+      std::lock_guard<std::mutex> lk(g_win_mtx);
+      if (g_inflight.size() <= keep) return;
+      fut = std::move(g_inflight.front());
+      g_inflight.pop_front();
+    }
+    fut.Wait();
+    auto *t = fut.get();
+    if (t == nullptr || t->GetReturnCode() != 0) {
+      g_async_err.fetch_add(1);
+    }
+  }
 }
 
 }  // namespace
@@ -111,6 +157,47 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePut(
   env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
   env->ReleaseStringUTFChars(key, key_chars);
   return rc;
+}
+
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
+    JNIEnv *env, jclass, jstring key, jbyteArray value) {
+  if (g_tag == nullptr) return -1;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return -2;
+  jsize len = env->GetArrayLength(value);
+  jbyte *bytes = env->GetByteArrayElements(value, nullptr);
+  if (bytes == nullptr) {
+    env->ReleaseStringUTFChars(key, key_chars);
+    return -3;
+  }
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto fut = cte_client->AsyncPutBlob(
+      g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len),
+      reinterpret_cast<const char *>(bytes));
+  // Client mode staged (copied) the bytes during the call; the array can go.
+  env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
+  if (fut.IsNull()) return -11;  // degenerate request or staging alloc failed
+
+  if (g_window == 0) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
+    fut.Wait();
+    auto *t = fut.get();
+    return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_win_mtx);
+    g_inflight.push_back(std::move(fut));
+  }
+  ReapDownTo(g_window);
+  return g_async_err.load() != 0 ? -12 : 0;
+}
+
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeDrain(JNIEnv *,
+                                                                jclass) {
+  ReapDownTo(0);
+  return g_async_err.load();
 }
 
 JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(

@@ -41,6 +41,8 @@ public class ClioClient extends DB {
 
   private static native int nativeInit();
   private static native int nativePut(String key, byte[] value);
+  private static native int nativePutAsync(String key, byte[] value);
+  private static native int nativeDrain();
   private static native byte[] nativeGet(String key);
 
   static {
@@ -53,6 +55,16 @@ public class ClioClient extends DB {
     if (rc != 0) {
       throw new DBException("Clio native init failed rc=" + rc
           + " (is the clio_run daemon running?)");
+    }
+  }
+
+  @Override
+  public void cleanup() throws DBException {
+    // Drain the async write window (shared across threads; idempotent) so no
+    // put escapes this phase and completion errors fail the phase loudly.
+    int errs = nativeDrain();
+    if (errs != 0) {
+      throw new DBException("Clio async writes failed: " + errs);
     }
   }
 
@@ -109,7 +121,7 @@ public class ClioClient extends DB {
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
     try {
-      int rc = nativePut(blobName(table, key), serialize(values));
+      int rc = nativePutAsync(blobName(table, key), serialize(values));
       return rc == 0 ? Status.OK : Status.ERROR;
     } catch (IOException e) {
       return Status.ERROR;
