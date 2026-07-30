@@ -55,10 +55,21 @@ int g_init_rc = -100;  // set by the once-body; <0 means init failed
 // still in flight (YCSB does not verify read values in the core workloads);
 // load/run phases are separate processes and cleanup() drains, so no put
 // escapes its phase.
+// In CLIENT mode the private AsyncPutBlob STAGES (copies) the bytes into a
+// task-owned SHM buffer during the submit call, so the source can be released
+// immediately. In RUNTIME (co-located, CLIO_WITH_RUNTIME=1) mode there is no
+// staging — the bdev write reads DIRECTLY from the caller's buffer until the
+// task completes — so the window must own a copy of the bytes and free it at
+// reap. g_runtime_mode selects the ownership scheme.
+struct InflightPut {
+  clio::run::Future<clio::cte::core::PutBlobTask> fut_;
+  char *owned_buf_;  // runtime mode only; nullptr in client mode
+};
 std::mutex g_win_mtx;
-std::deque<clio::run::Future<clio::cte::core::PutBlobTask>> g_inflight;
+std::deque<InflightPut> g_inflight;
 std::atomic<int> g_async_err{0};
 size_t g_window = 64;
+bool g_runtime_mode = false;
 
 // ---- scan key index (workloads D/E) ---------------------------------------
 // CTE has no ordered key scan, so the binding maintains its own sorted index
@@ -110,6 +121,7 @@ void InitOnce() {
     return;
   }
   g_tag = new clio::cte::core::Tag("ycsb");
+  g_runtime_mode = CLIO_RUNTIME_MANAGER->IsRuntime();
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     for (auto &name : g_tag->GetContainedBlobs()) {
@@ -126,18 +138,19 @@ void InitOnce() {
 // submitting threads only contend on deque ops, not on put completion.
 void ReapDownTo(size_t keep) {
   while (true) {
-    clio::run::Future<clio::cte::core::PutBlobTask> fut;
+    InflightPut entry;
     {
       std::lock_guard<std::mutex> lk(g_win_mtx);
       if (g_inflight.size() <= keep) return;
-      fut = std::move(g_inflight.front());
+      entry = std::move(g_inflight.front());
       g_inflight.pop_front();
     }
-    fut.Wait();
-    auto *t = fut.get();
+    entry.fut_.Wait();
+    auto *t = entry.fut_.get();
     if (t == nullptr || t->GetReturnCode() != 0) {
       g_async_err.fetch_add(1);
     }
+    std::free(entry.owned_buf_);  // no-op in client mode (nullptr)
   }
 }
 
@@ -194,12 +207,29 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
   env->ReleaseStringUTFChars(key, key_chars);
 
   auto *cte_client = CLIO_CTE_CLIENT;
+  const char *src = reinterpret_cast<const char *>(bytes);
+  char *owned = nullptr;
+  if (g_runtime_mode) {
+    // Co-located: the put reads the source buffer until completion — the JNI
+    // array cannot be released while the task is in flight, so the window
+    // owns a heap copy instead (freed at reap).
+    owned = static_cast<char *>(std::malloc(static_cast<size_t>(len)));
+    if (owned == nullptr) {
+      env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
+      return -13;
+    }
+    std::memcpy(owned, src, static_cast<size_t>(len));
+    src = owned;
+  }
   auto fut = cte_client->AsyncPutBlob(
-      g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len),
-      reinterpret_cast<const char *>(bytes));
-  // Client mode staged (copied) the bytes during the call; the array can go.
+      g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  // Client mode staged (copied) the bytes during the call; runtime mode uses
+  // the owned copy above — either way the array can go now.
   env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
-  if (fut.IsNull()) return -11;  // degenerate request or staging alloc failed
+  if (fut.IsNull()) {
+    std::free(owned);
+    return -11;  // degenerate request or staging alloc failed
+  }
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     g_keys.insert(key_str);
@@ -208,11 +238,12 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
   if (g_window == 0) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
     fut.Wait();
     auto *t = fut.get();
+    std::free(owned);
     return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
   }
   {
     std::lock_guard<std::mutex> lk(g_win_mtx);
-    g_inflight.push_back(std::move(fut));
+    g_inflight.push_back(InflightPut{std::move(fut), owned});
   }
   ReapDownTo(g_window);
   return g_async_err.load() != 0 ? -12 : 0;
