@@ -26,6 +26,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,17 @@ std::mutex g_win_mtx;
 std::deque<clio::run::Future<clio::cte::core::PutBlobTask>> g_inflight;
 std::atomic<int> g_async_err{0};
 size_t g_window = 64;
+
+// ---- scan key index (workloads D/E) ---------------------------------------
+// CTE has no ordered key scan, so the binding maintains its own sorted index
+// of blob names — the same approach the stock YCSB Redis binding takes (it
+// keeps a zset index for exactly this reason). Seeded from
+// Tag::GetContainedBlobs() at init (run phases start in a fresh process
+// against a loaded store) and updated on every put; scan = lower_bound +
+// walk. Guarded by its own mutex; scans copy the keys out under the lock and
+// fetch values outside it.
+std::mutex g_keys_mtx;
+std::set<std::string> g_keys;
 
 void InitOnce() {
   // The Clio SHM transport wakes waiters with tgkill(SIGUSR1); clio-aware
@@ -98,6 +110,12 @@ void InitOnce() {
     return;
   }
   g_tag = new clio::cte::core::Tag("ycsb");
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    for (auto &name : g_tag->GetContainedBlobs()) {
+      g_keys.insert(name);
+    }
+  }
   if (const char *w = std::getenv("CLIO_YCSB_WINDOW")) {
     g_window = static_cast<size_t>(std::strtoul(w, nullptr, 10));
   }
@@ -148,6 +166,8 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePut(
   try {
     g_tag->PutBlob(key_chars, reinterpret_cast<const char *>(bytes),
                    static_cast<size_t>(len));
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_chars);
   } catch (const std::exception &) {
     // Tag::PutBlob throws on a failed put (e.g. daemon死/capacity); an
     // exception escaping a JNI boundary terminates the JVM, so convert to a
@@ -180,6 +200,10 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
   // Client mode staged (copied) the bytes during the call; the array can go.
   env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
   if (fut.IsNull()) return -11;  // degenerate request or staging alloc failed
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_str);
+  }
 
   if (g_window == 0) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
     fut.Wait();
@@ -198,6 +222,36 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeDrain(JNIEnv *,
                                                                 jclass) {
   ReapDownTo(0);
   return g_async_err.load();
+}
+
+JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
+    JNIEnv *env, jclass, jstring start, jint count) {
+  if (g_tag == nullptr || count <= 0) return nullptr;
+  const char *start_chars = env->GetStringUTFChars(start, nullptr);
+  if (start_chars == nullptr) return nullptr;
+  std::string start_str(start_chars);
+  env->ReleaseStringUTFChars(start, start_chars);
+
+  std::vector<std::string> keys;
+  keys.reserve(static_cast<size_t>(count));
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    for (auto it = g_keys.lower_bound(start_str);
+         it != g_keys.end() && keys.size() < static_cast<size_t>(count);
+         ++it) {
+      keys.push_back(*it);
+    }
+  }
+  jclass str_cls = env->FindClass("java/lang/String");
+  jobjectArray out =
+      env->NewObjectArray(static_cast<jsize>(keys.size()), str_cls, nullptr);
+  if (out == nullptr) return nullptr;
+  for (jsize i = 0; i < static_cast<jsize>(keys.size()); ++i) {
+    jstring js = env->NewStringUTF(keys[static_cast<size_t>(i)].c_str());
+    env->SetObjectArrayElement(out, i, js);
+    env->DeleteLocalRef(js);
+  }
+  return out;
 }
 
 JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(

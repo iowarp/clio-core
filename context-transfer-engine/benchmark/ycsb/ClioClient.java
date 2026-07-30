@@ -33,9 +33,10 @@ import java.util.Vector;
  * (libclio_ycsb_jni.so) is a thin JNI shim over the CTE SHM client; the Clio
  * runtime daemon must be running before the workload starts.
  *
- * scan() and delete() return NOT_IMPLEMENTED: the CTE client exposes no
- * ordered scan or blob destroy today, which confines runs to the core
- * workloads A, B, C and F (none of which scan or delete).
+ * scan() walks a binding-maintained sorted key index (seeded from the tag's
+ * blob list at init, updated on puts — the stock Redis binding keeps a zset
+ * index for the same reason), enabling workloads D and E. delete() remains
+ * NOT_IMPLEMENTED (no core workload deletes).
  */
 public class ClioClient extends DB {
 
@@ -44,6 +45,7 @@ public class ClioClient extends DB {
   private static native int nativePutAsync(String key, byte[] value);
   private static native int nativeDrain();
   private static native byte[] nativeGet(String key);
+  private static native String[] nativeScanKeys(String startKey, int count);
 
   static {
     System.loadLibrary("clio_ycsb_jni");
@@ -154,6 +156,25 @@ public class ClioClient extends DB {
   @Override
   public Status scan(String table, String startkey, int recordcount,
       Set<String> fields, Vector<HashMap<String, ByteIterator>> result) {
-    return Status.NOT_IMPLEMENTED;
+    // Ordered scan over the binding-maintained key index (the stock Redis
+    // binding does the same with a zset index); values fetched per key.
+    String[] keys = nativeScanKeys(blobName(table, startkey), recordcount);
+    if (keys == null) {
+      return Status.ERROR;
+    }
+    for (String k : keys) {
+      byte[] data = nativeGet(k);
+      if (data == null) {
+        continue;  // deleted/in-flight between index walk and fetch
+      }
+      HashMap<String, ByteIterator> row = new HashMap<>();
+      try {
+        deserialize(data, fields, row);
+      } catch (IOException e) {
+        return Status.ERROR;
+      }
+      result.add(row);
+    }
+    return Status.OK;
   }
 }
