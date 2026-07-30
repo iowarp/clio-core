@@ -80,7 +80,34 @@ Per-component lossless ratio (each component paged through the same zstd path):
   and the BEST sweep reports the (float) feature ratio only. Float feature pages are
   not affected (best store = 5.9 s for 82 MiB).
 
-## Step 3 (Option B, stretch): Vector<T> + zstd streaming — _pending_
+## Step 3 (Option B, stretch): Vector<T> + zstd streaming — WORKS (bit-exact PASS)
+
+Added CPU-codec D2H/H2D **staging** to the compressor (`compressor_runtime.cc`) so a
+CPU codec (zstd) works on a **device** `blob_data_` in the gpu_vector streaming path,
+without touching the GPU-codec (cuSZp) path:
+- `CompressPutBlobImpl`: if (CPU codec `wire<=10` AND device ptr) `cudaMemcpy` D2H
+  before `Compress`.
+- `DecompressGetBlobImpl`: for a CPU codec, query the **exact** stored size
+  (`GetBlobSize`) so zstd is not fed the cuSZp-style over-read; if the output is a
+  device slot, decompress into a host buffer then H2D-stage. The H2D copy runs on a
+  dedicated **non-blocking** stream — a default-stream copy deadlocks behind the
+  on-device fault kernel that spin-waits on the very slot the copy must fill.
+- Gated on `(CpuCodecWire && PtrIsDevice)` via `cudaPointerGetAttributes`, so cuSZp
+  is byte-for-byte unchanged.
+
+**Regression (observed):**
+- `test_gpu_vector_compress` with `CLIO_CTE_COMPRESS_LIB=cuszp` → PASS (unchanged).
+- `test_gpu_vector_compress` with `CLIO_CTE_COMPRESS_LIB=zstd` → PASS — zstd now
+  round-trips through the real `gv::Vector` **on-device fault** streaming path
+  (previously segfaulted / deadlocked).
+
+**GNN streaming variant** (`test/test_gpu_vector_gnn_stream_gpu.cc`, target
+`test_gpu_vector_gnn_stream`, port 10596): the same GraphSAGE forward, but features
+are sourced through `gv::Vector<float>` + `SequentialTransaction` (zstd, staged),
+swept into the full feature buffer, then forwarded. **Observed PASS** on ogbn-arxiv:
+- feature memcmp = 0, logit memcmp = 0, max_abs_diff = 0.0 (bit-exact)
+- store 169.7 MB/s; stream 238.2 MB/s with only a **window=4 pages (1 MiB) resident**
+  vs the 82 MiB dataset — the capacity/streaming decoupling, now with lossless zstd.
 
 ## Step 4 (scale): ogbn-products capacity headline — _pending_
 
