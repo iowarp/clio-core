@@ -231,6 +231,59 @@ class Client : public clio::run::ContainerClient {
     return true;
   }
 
+  /**
+   * Zero-copy VIEW of a blob's payload in the shared RAM-bdev segment
+   * (issues #859/#862). Returns a pointer INTO the mapped segment for a
+   * single-extent, direct-readable blob, plus the placement generation the
+   * caller must re-validate with CheckBlobGenShm AFTER consuming the bytes
+   * (same optimistic discipline as TryReadBlobShm, with the consume replacing
+   * the copy). Refuses multi-extent, truncated, transformed (#818), or
+   * non-RAM blobs -- the caller falls back to a copying read.
+   *
+   * LIFETIME/SAFETY: the pointer is valid only while the blob's placement is
+   * unchanged; a failed CheckBlobGenShm means the bytes consumed may be torn
+   * and the operation must be retried via a copying path. An in-place
+   * overwrite (same placement) does NOT bump the generation -- concurrent
+   * same-blob overwrite vs view is torn-content-visible, exactly as it is
+   * for the copying fast path.
+   */
+  bool TryGetBlobViewShm(const TagId &tag_id, const std::string &blob_name,
+                         const char **ptr, clio::run::u64 *size,
+                         clio::run::u64 *gen) {
+    if (shm_root_ == nullptr || ptr == nullptr || size == nullptr ||
+        gen == nullptr) {
+      return false;
+    }
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      return false;
+    }
+    if (!rec.IsDirectReadable() || rec.num_blocks_ != 1 ||
+        (rec.flags_ & kShmBlobTruncated) != 0) {
+      return false;
+    }
+    char *base = MapRamBdev(rec.blocks_[0].target_pool_);
+    if (base == nullptr) {
+      return false;
+    }
+    *ptr = base + rec.blocks_[0].target_offset_;
+    *size = rec.total_size_;
+    *gen = rec.placement_gen_;
+    return true;
+  }
+
+  /** Re-validate a view taken with TryGetBlobViewShm: true iff the blob's
+   *  placement generation is unchanged (bytes consumed from the view were
+   *  stable). */
+  bool CheckBlobGenShm(const TagId &tag_id, const std::string &blob_name,
+                       clio::run::u64 gen) {
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      return false;
+    }
+    return rec.placement_gen_ == gen;
+  }
+
   /** Zero-IPC tag-name lookup. */
   bool TryGetTagIdShm(const std::string &tag_name, TagId *out) const {
     if (shm_root_ == nullptr || out == nullptr) {
