@@ -200,7 +200,8 @@ TEST_CASE("gpu_vector: GraphSAGE over a zstd Vector<float> stream is bit-identic
   std::int64_t N = 0, E = 0; int F = 0, C = 0;
   { std::ifstream mf(data_dir + "/meta.txt"); REQUIRE((bool)mf); mf >> N >> F >> E >> C; }
   REQUIRE(N > 0); REQUIRE(F > 0); REQUIRE(C > 0);
-  const int H = kHidden;
+  const int H = std::getenv("CLIO_GNN_HIDDEN") ? std::atoi(std::getenv("CLIO_GNN_HIDDEN"))
+                                               : kHidden;
 
   std::vector<char> feat_bytes;
   REQUIRE(ReadFile(data_dir + "/features.f32", feat_bytes));

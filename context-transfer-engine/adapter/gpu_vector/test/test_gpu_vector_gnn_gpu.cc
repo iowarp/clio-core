@@ -238,7 +238,8 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
     mf >> N >> F >> E >> C;
   }
   REQUIRE(N > 0); REQUIRE(F > 0); REQUIRE(C > 0);
-  const int H = kHidden;
+  const int H = std::getenv("CLIO_GNN_HIDDEN") ? std::atoi(std::getenv("CLIO_GNN_HIDDEN"))
+                                               : kHidden;
   std::fprintf(stderr, "[GNN] N=%lld F=%d E=%lld C=%d H=%d\n",
                (long long)N, F, (long long)E, (long long)C, H);
 
