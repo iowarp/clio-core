@@ -55,7 +55,52 @@
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
 
+#if CTP_ENABLE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 namespace clio::cte::compressor {
+
+// ---------------------------------------------------------------------------
+// CPU-codec-on-device-blob staging (issue #GNN, Option B).
+//
+// cuSZp (wire >= 11) is GPU-aware and compresses a device `blob_data_` in place.
+// The CPU codecs (wire <= 10: zstd/lz4/zlib/...) run on the HOST and SEGFAULT on
+// a device pointer. When the gpu_vector's device streaming path routes a device
+// blob through a CPU codec, we D2H-stage the input before Compress and H2D-stage
+// the output after Decompress. Gated on (CPU codec AND device pointer) so the
+// cuSZp path stays byte-for-byte unchanged.
+// ---------------------------------------------------------------------------
+static inline bool CpuCodecWire(int wire_id) {
+  return wire_id >= 0 && wire_id <= 10;  // brotli..zstd in the wire registry
+}
+static inline bool PtrIsDevice(const void* p) {
+#if CTP_ENABLE_CUDA
+  if (p == nullptr) return false;
+  cudaPointerAttributes attr;
+  cudaError_t e = cudaPointerGetAttributes(&attr, p);
+  if (e != cudaSuccess) { cudaGetLastError(); return false; }  // clear sticky err
+  return attr.type == cudaMemoryTypeDevice;
+#else
+  (void)p;
+  return false;
+#endif
+}
+#if CTP_ENABLE_CUDA
+// A dedicated NON-BLOCKING stream for staging copies. The on-device page-fault
+// path has a kernel SPIN-WAITING on the device slot this copy must fill; a
+// default-stream copy would serialize behind that kernel (the kernel waits for
+// the copy, the copy waits for the kernel -> deadlock). A non-blocking stream
+// lets the copy engine run concurrently with the spinning kernel.
+static cudaStream_t StagingStream() {
+  static cudaStream_t s = [] {
+    cudaStream_t st = nullptr;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    return st;
+  }();
+  return s;
+}
+#endif
 
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
@@ -1164,7 +1209,28 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
     std::vector<char> cbuf(input_size + (input_size / 20) + 1024);
     size_t csize = cbuf.size();
     auto in = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-    bool ok = compressor->Compress(cbuf.data(), csize, in.ptr_, input_size);
+    // Option B: a CPU codec on a device blob -> D2H-stage the input so the
+    // host-side compressor never dereferences a device pointer. cuSZp (GPU) is
+    // untouched (CpuCodecWire false), so its path is byte-for-byte unchanged.
+    char* comp_src = in.ptr_;
+    std::vector<char> dev_stage_in;
+    if (CpuCodecWire(context.compress_lib_) && PtrIsDevice(in.ptr_)) {
+#if CTP_ENABLE_CUDA
+      dev_stage_in.resize(input_size);
+      cudaError_t ce = cudaMemcpy(dev_stage_in.data(), in.ptr_, input_size,
+                                  cudaMemcpyDeviceToHost);
+      if (ce != cudaSuccess) {
+        cudaGetLastError();
+        HLOG(kError, "[CompressPutBlob] D2H stage failed: {}",
+             cudaGetErrorString(ce));
+        task->return_code_ = 7; CLIO_CO_RETURN;
+      }
+      comp_src = dev_stage_in.data();
+      HLOG(kInfo, "[CompressPutBlob] D2H-staged device blob for CPU codec "
+           "wire={} ({} B)", context.compress_lib_, input_size);
+#endif
+    }
+    bool ok = compressor->Compress(cbuf.data(), csize, comp_src, input_size);
     size_t hsz = sizeof(CompressionHeader);
     size_t total = csize + hsz;
 
@@ -1245,11 +1311,57 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       char* cdata = tmp.ptr_ + hsz;
       size_t csize = expected_size;  // over-estimate; cuSZp reads its own length
       size_t dsize = header->original_size_;
-      bool ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      const bool cpu_codec = CpuCodecWire(header->compress_lib_);
+      // Option B: a CPU codec cannot tolerate the cuSZp-style over-read of
+      // `csize` -- it would feed the codec trailing bytes and fail (e.g. zstd
+      // errors on a second, garbage "frame"). Query the EXACT stored blob size
+      // so the compressed length is precise. cuSZp keeps the over-estimate.
+      if (cpu_codec) {
+        auto szt = core_client_->AsyncGetBlobSize(
+            task->tag_id_, name, ForwardQuery(task->tag_id_, name));
+        CLIO_CO_AWAIT(szt);
+        if (szt->return_code_ == 0 && (size_t)szt->size_ >= hsz) {
+          csize = (size_t)szt->size_ - hsz;
+        }
+      }
+      // Option B: a CPU codec on a device output -> decompress into a host
+      // buffer then H2D-stage into the caller's device slot.
+      bool ok;
+      if (cpu_codec && PtrIsDevice(out.ptr_)) {
+#if CTP_ENABLE_CUDA
+        std::vector<char> host_out(dsize);
+        ok = dec->Decompress(host_out.data(), dsize, cdata, csize);
+        if (ok) {
+          cudaStream_t st = StagingStream();
+          cudaError_t ce = cudaMemcpyAsync(out.ptr_, host_out.data(), dsize,
+                                           cudaMemcpyHostToDevice, st);
+          if (ce == cudaSuccess) ce = cudaStreamSynchronize(st);
+          if (ce != cudaSuccess) {
+            cudaGetLastError();
+            HLOG(kError, "[DecompressGetBlob] H2D stage failed: {}",
+                 cudaGetErrorString(ce));
+            ok = false;
+          }
+        }
+        HLOG(kInfo, "[DecompressGetBlob] CPU-codec H2D-staged decompress "
+             "wire={} ({} B) ok={}", header->compress_lib_, dsize, ok);
+#else
+        ok = false;
+#endif
+      } else {
+        ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      }
       CLIO_IPC->FreeBuffer(tmp);
       task->return_code_ = ok ? 0 : 5;
-    } else {  // stored uncompressed -> copy through
-      std::memcpy(out.ptr_, tmp.ptr_, expected_size);
+    } else {  // stored uncompressed -> copy through (device-safe)
+#if CTP_ENABLE_CUDA
+      if (PtrIsDevice(out.ptr_)) {
+        cudaMemcpy(out.ptr_, tmp.ptr_, expected_size, cudaMemcpyHostToDevice);
+      } else
+#endif
+      {
+        std::memcpy(out.ptr_, tmp.ptr_, expected_size);
+      }
       CLIO_IPC->FreeBuffer(tmp);
       task->return_code_ = 0;
     }
