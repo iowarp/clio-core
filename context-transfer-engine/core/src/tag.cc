@@ -271,9 +271,18 @@ clio::run::u64 Tag::GetBlobSize(const std::string &blob_name) {
   // ZERO IPC when the blob is cached. A miss (or an inconsistent read) simply
   // falls through to the RPC below -- the cache is never treated as
   // authoritative, and "not cached" must never be reported as "size 0".
+  //
+  // A cached record with total_size_ == 0 is ALSO untrustworthy (issue #862):
+  // a freshly created blob's record can be visible in the mirror before the
+  // completing put's size is republished, and callers cannot tell "empty
+  // blob" from "absent" from a zero return. Confirm zero via the RPC below --
+  // genuinely empty blobs are degenerate and rare, so the extra round trip is
+  // irrelevant; the stale zero showed up as read-after-write NOT_FOUNDs on
+  // freshly inserted keys (YCSB workload D).
   if (cte_client->HasShmCache()) {
     ShmBlobRecord rec;
-    if (cte_client->TryGetBlobRecordShm(tag_id_, blob_name, &rec)) {
+    if (cte_client->TryGetBlobRecordShm(tag_id_, blob_name, &rec) &&
+        rec.total_size_ != 0) {
       return rec.total_size_;
     }
   }

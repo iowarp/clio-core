@@ -852,6 +852,22 @@ struct BlobInfo {
   // here — it would deadlock the single worker the instant the holder suspends
   // at a co_await. 0 == unlocked; otherwise a non-zero per-task owner token.
   clio::run::u64 write_owner_;
+  // Reader-pin word (issue #753, reader half). GetBlob deliberately reads with
+  // no lock held: it snapshots blocks_ and then co_awaits bdev reads, so a
+  // concurrent ReorganizeBlob/DelBlob/Truncate that takes the write token
+  // AFTER the snapshot could free the snapshot's extents mid-read -- the
+  // reader would return reused bytes with rc=0. This word closes that hole
+  // without serializing readers against PutBlob (which modifies data in place
+  // but never frees extents): readers hold a PIN for the duration of
+  // snapshot+read, and only the extent-FREEING mutators drain pins to zero
+  // (under the write token) before freeing.
+  //
+  // Layout: bit 63 = drain flag (an extent-freeing mutator is waiting/active);
+  // bits 0..62 = pin count. Readers must NEVER wait while pinned (they back
+  // off and retry un-pinned), which makes the protocol deadlock-free: the
+  // drainer waits only on pin holders, and pin holders only wait on bdev I/O.
+  // Same atomic_ref discipline as write_owner_ above.
+  clio::run::u64 read_state_;
   // Maintained mirror of sum(blocks_[i].size_). GetTotalSize() returns this in
   // O(1) instead of an O(blocks) sum; every blocks_ mutation MUST keep it in
   // sync (ExtendBlob updates it incrementally; cold paths call
@@ -910,6 +926,7 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
+        read_state_(0),
         total_size_cache_(0),
         placement_gen_(0) {
     prealloc_lock_.Init();
@@ -928,6 +945,7 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
+        read_state_(0),
         total_size_cache_(0),
         placement_gen_(0) {
     prealloc_lock_.Init();
@@ -947,6 +965,7 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
+        read_state_(0),
         total_size_cache_(0),
         placement_gen_(0) {
     prealloc_lock_.Init();
@@ -966,6 +985,7 @@ struct BlobInfo {
         trace_key_(other.trace_key_),
         preallocated_size_(other.preallocated_size_),
         write_owner_(0),  // a fresh copy is unlocked; never inherit lock state
+        read_state_(0),  // ...and has no readers pinned
         total_size_cache_(other.total_size_cache_),
         placement_gen_(other.placement_gen_) {
     prealloc_lock_.Init();
@@ -1081,6 +1101,64 @@ struct BlobInfo {
   bool IsWriteLocked() {
     return ctp::ipc::atomic_ref<clio::run::u64>(write_owner_).load() != 0;
   }
+
+  // ---- reader pins (issue #753, reader half; see read_state_) --------------
+
+  static constexpr clio::run::u64 kReadDrainBit = 1ULL << 63;
+
+  /**
+   * Try to pin this blob's extents for a read. On success the caller may
+   * snapshot blocks_ and read the referenced extents; no extent-freeing
+   * mutator will free them until UnpinRead. Fails (returns false) while such
+   * a mutator is draining -- the caller must back off WITHOUT holding a pin
+   * (co_await yield) and retry; waiting while pinned would deadlock the
+   * drainer. Pairs with UnpinRead (use BlobReadPinGuard).
+   */
+  bool TryPinRead() {
+    ctp::ipc::atomic_ref<clio::run::u64> ref(read_state_);
+    // Cheap pre-check so retries during a drain do not touch the counter and
+    // livelock the drainer's pins==0 poll with transient +1/-1 flickers.
+    if (ref.load() & kReadDrainBit) return false;
+    clio::run::u64 prev = ref.fetch_add(1);
+    if ((prev & kReadDrainBit) == 0) return true;
+    ref.fetch_sub(1);  // lost the race with a drainer: back off un-pinned
+    return false;
+  }
+
+  /** Drop a pin taken by TryPinRead. Synchronous; safe in RAII destructors. */
+  void UnpinRead() {
+    ctp::ipc::atomic_ref<clio::run::u64>(read_state_).fetch_sub(1);
+  }
+
+  /**
+   * Begin draining readers. Caller MUST already hold the per-blob write token
+   * (so at most one drainer exists, and no new layout-mutation races it).
+   * After this, new readers back off and existing pins can only decrease;
+   * poll HasReadPins() to zero (co_await yield) before freeing any extent.
+   * Pairs with EndDrainReaders (use BlobReaderDrainGuard).
+   */
+  void BeginDrainReaders() {
+    // atomic_ref has no fetch_or; CAS-set the bit (single drainer per blob is
+    // guaranteed by the write token, so this only races reader fetch_add/sub).
+    ctp::ipc::atomic_ref<clio::run::u64> ref(read_state_);
+    clio::run::u64 cur = ref.load();
+    while (!ref.compare_exchange_weak(cur, cur | kReadDrainBit)) {
+    }
+  }
+
+  /** True while any reader still holds a pin. */
+  bool HasReadPins() {
+    return (ctp::ipc::atomic_ref<clio::run::u64>(read_state_).load() &
+            ~kReadDrainBit) != 0;
+  }
+
+  /** End the drain, re-admitting readers. Synchronous; RAII-safe. */
+  void EndDrainReaders() {
+    ctp::ipc::atomic_ref<clio::run::u64> ref(read_state_);
+    clio::run::u64 cur = ref.load();
+    while (!ref.compare_exchange_weak(cur, cur & ~kReadDrainBit)) {
+    }
+  }
 #endif  // CTP_IS_HOST
 };
 
@@ -1103,6 +1181,39 @@ struct BlobWriteLockGuard {
   }
   BlobWriteLockGuard(const BlobWriteLockGuard &) = delete;
   BlobWriteLockGuard &operator=(const BlobWriteLockGuard &) = delete;
+};
+
+/**
+ * RAII release guard for a reader pin (issue #753). Acquisition is done by the
+ * caller (TryPinRead needs a `co_await yield()` back-off loop, which cannot
+ * live in a constructor); this guard only guarantees UnpinRead on EVERY scope
+ * exit -- a leaked pin would wedge the next Reorganize/DelBlob/Truncate of the
+ * blob forever in its drain loop.
+ */
+struct BlobReadPinGuard {
+  BlobInfo *blob_;
+  explicit BlobReadPinGuard(BlobInfo *blob) : blob_(blob) {}
+  ~BlobReadPinGuard() {
+    if (blob_ != nullptr) blob_->UnpinRead();
+  }
+  BlobReadPinGuard(const BlobReadPinGuard &) = delete;
+  BlobReadPinGuard &operator=(const BlobReadPinGuard &) = delete;
+};
+
+/**
+ * RAII end guard for a reader drain (issue #753). BeginDrainReaders/the
+ * pins==0 poll are done by the caller (the poll co_awaits); this guard only
+ * guarantees EndDrainReaders on EVERY scope exit -- a leaked drain bit would
+ * lock every future reader of the blob out of the pin fast path forever.
+ */
+struct BlobReaderDrainGuard {
+  BlobInfo *blob_;
+  explicit BlobReaderDrainGuard(BlobInfo *blob) : blob_(blob) {}
+  ~BlobReaderDrainGuard() {
+    if (blob_ != nullptr) blob_->EndDrainReaders();
+  }
+  BlobReaderDrainGuard(const BlobReaderDrainGuard &) = delete;
+  BlobReaderDrainGuard &operator=(const BlobReaderDrainGuard &) = delete;
 };
 #endif  // CTP_IS_HOST
 

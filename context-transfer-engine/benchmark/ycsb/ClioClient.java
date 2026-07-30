@@ -33,18 +33,124 @@ import java.util.Vector;
  * (libclio_ycsb_jni.so) is a thin JNI shim over the CTE SHM client; the Clio
  * runtime daemon must be running before the workload starts.
  *
- * scan() and delete() return NOT_IMPLEMENTED: the CTE client exposes no
- * ordered scan or blob destroy today, which confines runs to the core
- * workloads A, B, C and F (none of which scan or delete).
+ * scan() walks a binding-maintained sorted key index (seeded from the tag's
+ * blob list at init, updated on puts — the stock Redis binding keeps a zset
+ * index for the same reason), enabling workloads D and E. delete() remains
+ * NOT_IMPLEMENTED (no core workload deletes).
  */
 public class ClioClient extends DB {
 
   private static native int nativeInit();
   private static native int nativePut(String key, byte[] value);
+  private static native int nativePutAsync(String key, byte[] value);
+  private static native int nativeDrain();
   private static native byte[] nativeGet(String key);
+  private static native String[] nativeScanKeys(String startKey, int count);
+  private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len);
+  private static native int nativeGetDirect(String key, java.nio.ByteBuffer buf);
+  private static native java.nio.ByteBuffer nativeGetView(String key, long[] genOut);
+  private static native boolean nativeValidateGen(String key, long gen);
 
   static {
     System.loadLibrary("clio_ycsb_jni");
+  }
+
+  // ---- copy-reduction plumbing (items 1-3) --------------------------------
+  // Writes: a per-thread ring of direct ByteBuffers, sized comfortably above
+  // the shim's async window (default 64) so a slot's put is guaranteed reaped
+  // (the window is a global FIFO) before its buffer is reused. Serialization
+  // writes ONCE into the direct buffer; the native put uses its address as
+  // the source (runtime mode reads it directly; client mode stages at
+  // submit). Reads: one per-thread direct buffer for copying reads, and a
+  // zero-copy view path over the blob's RAM extent, gen-validated after the
+  // row is built (fall back to the copying read on mismatch).
+  private static final int RING_SIZE = 96;
+  private static final int BUF_CAP = 64 * 1024;
+
+  private static final class WriteRing {
+    final java.nio.ByteBuffer[] bufs = new java.nio.ByteBuffer[RING_SIZE];
+    int next;
+    java.nio.ByteBuffer take() {
+      java.nio.ByteBuffer b = bufs[next];
+      if (b == null) {
+        b = java.nio.ByteBuffer.allocateDirect(BUF_CAP);
+        bufs[next] = b;
+      }
+      next = (next + 1) % RING_SIZE;
+      b.clear();
+      return b;
+    }
+  }
+  private static final ThreadLocal<WriteRing> WRITE_RING =
+      ThreadLocal.withInitial(WriteRing::new);
+  private static final ThreadLocal<java.nio.ByteBuffer> READ_BUF =
+      ThreadLocal.withInitial(() -> java.nio.ByteBuffer.allocateDirect(1024 * 1024));
+  private static final ThreadLocal<long[]> GEN_OUT =
+      ThreadLocal.withInitial(() -> new long[1]);
+
+  /** Zero-copy ByteIterator over a slice of a (shared) ByteBuffer; absolute
+   *  reads so many iterators can share one buffer without position races. */
+  private static final class BBByteIterator extends ByteIterator {
+    private final java.nio.ByteBuffer bb;
+    private int pos;
+    private final int end;
+    BBByteIterator(java.nio.ByteBuffer bb, int start, int len) {
+      this.bb = bb;
+      this.pos = start;
+      this.end = start + len;
+    }
+    @Override public boolean hasNext() { return pos < end; }
+    @Override public byte nextByte() { return bb.get(pos++); }
+    @Override public long bytesLeft() { return end - pos; }
+  }
+
+  /** Serialize the field map ONCE into the direct buffer, in exactly the
+   *  DataOutputStream format deserialize() expects (writeUTF == u16 length +
+   *  modified-UTF8; YCSB field names are ASCII, where the encodings agree). */
+  private static int serializeInto(java.nio.ByteBuffer bb,
+      Map<String, ByteIterator> values) throws IOException {
+    try {
+      bb.putInt(values.size());
+      for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+        byte[] name = e.getKey().getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        bb.putShort((short) name.length);
+        bb.put(name);
+        byte[] v = e.getValue().toArray();
+        bb.putInt(v.length);
+        bb.put(v);
+      }
+      return bb.position();
+    } catch (java.nio.BufferOverflowException e) {
+      throw new IOException("record exceeds direct buffer capacity", e);
+    }
+  }
+
+  /** Deserialize from a ByteBuffer with zero-copy field views (BBByteIterator
+   *  slices). The views are valid only until the backing buffer is reused —
+   *  callers must fully consume the row within the current operation. */
+  private static void deserializeBB(java.nio.ByteBuffer bb, int limit,
+      Set<String> fields, Map<String, ByteIterator> result) throws IOException {
+    try {
+      java.nio.ByteBuffer d = bb.duplicate();
+      d.position(0).limit(limit);
+      int count = d.getInt();
+      byte[] nameBuf = new byte[256];
+      for (int i = 0; i < count; i++) {
+        int nlen = d.getShort() & 0xFFFF;
+        if (nlen > nameBuf.length) nameBuf = new byte[nlen];
+        d.get(nameBuf, 0, nlen);
+        String name = new String(nameBuf, 0, nlen,
+            java.nio.charset.StandardCharsets.US_ASCII);
+        int vlen = d.getInt();
+        int vstart = d.position();
+        if (fields == null || fields.contains(name)) {
+          result.put(name, new BBByteIterator(bb, vstart, vlen));
+        }
+        d.position(vstart + vlen);
+      }
+    } catch (RuntimeException e) {
+      throw new IOException("malformed record", e);
+    }
   }
 
   @Override
@@ -53,6 +159,16 @@ public class ClioClient extends DB {
     if (rc != 0) {
       throw new DBException("Clio native init failed rc=" + rc
           + " (is the clio_run daemon running?)");
+    }
+  }
+
+  @Override
+  public void cleanup() throws DBException {
+    // Drain the async write window (shared across threads; idempotent) so no
+    // put escapes this phase and completion errors fail the phase loudly.
+    int errs = nativeDrain();
+    if (errs != 0) {
+      throw new DBException("Clio async writes failed: " + errs);
     }
   }
 
@@ -93,12 +209,35 @@ public class ClioClient extends DB {
   @Override
   public Status read(String table, String key, Set<String> fields,
       Map<String, ByteIterator> result) {
-    byte[] data = nativeGet(blobName(table, key));
-    if (data == null) {
+    String name = blobName(table, key);
+    // Item 3: zero-copy view over the blob's RAM extent, validated by
+    // placement generation AFTER the row is built (torn/moved -> retry via
+    // the copying path). The field views point into the store; YCSB consumes
+    // them within this operation.
+    long[] gen = GEN_OUT.get();
+    java.nio.ByteBuffer view = nativeGetView(name, gen);
+    if (view != null) {
+      try {
+        deserializeBB(view, view.capacity(), fields, result);
+        if (nativeValidateGen(name, gen[0])) {
+          return Status.OK;
+        }
+        result.clear();  // placement moved mid-read: fall through and copy
+      } catch (IOException e) {
+        result.clear();
+      }
+    }
+    // Item 2: one-copy read into the per-thread direct buffer.
+    java.nio.ByteBuffer buf = READ_BUF.get();
+    int n = nativeGetDirect(name, buf);
+    if (n == 0) {
       return Status.NOT_FOUND;
     }
+    if (n < 0) {
+      return Status.ERROR;
+    }
     try {
-      deserialize(data, fields, result);
+      deserializeBB(buf, n, fields, result);
     } catch (IOException e) {
       return Status.ERROR;
     }
@@ -109,7 +248,9 @@ public class ClioClient extends DB {
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
     try {
-      int rc = nativePut(blobName(table, key), serialize(values));
+      java.nio.ByteBuffer wb = WRITE_RING.get().take();
+      int len = serializeInto(wb, values);
+      int rc = nativePutDirect(blobName(table, key), wb, len);
       return rc == 0 ? Status.OK : Status.ERROR;
     } catch (IOException e) {
       return Status.ERROR;
@@ -121,7 +262,8 @@ public class ClioClient extends DB {
       Map<String, ByteIterator> values) {
     // Read-modify-write so partial-field updates (workloads A/B/F) preserve
     // the untouched fields, matching what the redis/rocksdb bindings do.
-    byte[] existing = nativeGet(blobName(table, key));
+    byte[] existing = nativeGet(blobName(table, key));  // scan/RMW keep the
+    // byte[] path: the merged row must stay valid across the serialize.
     Map<String, ByteIterator> merged = new HashMap<>();
     if (existing != null) {
       try {
@@ -142,6 +284,25 @@ public class ClioClient extends DB {
   @Override
   public Status scan(String table, String startkey, int recordcount,
       Set<String> fields, Vector<HashMap<String, ByteIterator>> result) {
-    return Status.NOT_IMPLEMENTED;
+    // Ordered scan over the binding-maintained key index (the stock Redis
+    // binding does the same with a zset index); values fetched per key.
+    String[] keys = nativeScanKeys(blobName(table, startkey), recordcount);
+    if (keys == null) {
+      return Status.ERROR;
+    }
+    for (String k : keys) {
+      byte[] data = nativeGet(k);
+      if (data == null) {
+        continue;  // deleted/in-flight between index walk and fetch
+      }
+      HashMap<String, ByteIterator> row = new HashMap<>();
+      try {
+        deserialize(data, fields, row);
+      } catch (IOException e) {
+        return Status.ERROR;
+      }
+      result.add(row);
+    }
+    return Status.OK;
   }
 }

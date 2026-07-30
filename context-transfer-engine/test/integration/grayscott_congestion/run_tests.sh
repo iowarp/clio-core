@@ -63,10 +63,21 @@ run_phase() {
     PHASE_RC2=$(timeout "$hard_to" docker wait gs-congest-node2 2>/dev/null || echo 124)
 
     say "--- node1 output lines ---"
-    docker logs gs-congest-node1 2>&1 | grep -aE "gs-congest|OUTPUT|RESULT|STALL" | tail -12
+    # The containers' own lines are prefixed "gs-nodeN:", not "gs-congest"
+    # (the container NAME) — the old pattern matched nothing they print, so
+    # every CI failure showed empty output and exit codes with no cause.
+    docker logs gs-congest-node1 2>&1 | grep -aE "gs-node|gs-congest|OUTPUT|RESULT|STALL" | tail -12
     say "--- node2 output lines ---"
-    docker logs gs-congest-node2 2>&1 | grep -aE "gs-congest|OUTPUT|RESULT|STALL" | tail -12
+    docker logs gs-congest-node2 2>&1 | grep -aE "gs-node|gs-congest|OUTPUT|RESULT|STALL" | tail -12
     echo "phase '$label': node1 exit=$PHASE_RC1 node2 exit=$PHASE_RC2"
+    # On failure, dump the raw tails: a loader error or bad path (exit 127)
+    # never matches the curated patterns above and is otherwise invisible.
+    if [ "$PHASE_RC1" != "0" ] || [ "$PHASE_RC2" != "0" ]; then
+        say "--- node1 raw log tail (failure) ---"
+        docker logs gs-congest-node1 2>&1 | tail -40
+        say "--- node2 raw log tail (failure) ---"
+        docker logs gs-congest-node2 2>&1 | tail -40
+    fi
     docker compose down -v >/dev/null 2>&1 || true
 }
 

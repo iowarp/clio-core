@@ -117,6 +117,7 @@ jobs:
       # `if: !cancelled()` so every suite reports a result even if an earlier one
       # failed.
       - name: ManyToOne collective tests (inside deps-cpu)
+        timeout-minutes: 25
         if: ${{ !cancelled() }}
         run: |
           docker run --rm \
@@ -142,6 +143,7 @@ jobs:
 
       # ---- AllToOne: count-based barrier on a real 4-node cluster.
       - name: AllToOne barrier test (4-node cluster)
+        timeout-minutes: 20
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -150,36 +152,42 @@ jobs:
       # ---- Distributed: run-to-run network + node-failure suites. Each exports
       # HOST_UID/HOST_GID so container processes match host file ownership.
       - name: Runtime distributed test (4-node, shm/tcp/ipc)
+        timeout-minutes: 20
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/distributed/run_tests.sh all
 
       - name: Runtime expand/induction test (node join)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/expand/run_tests.sh all
 
       - name: Runtime migrate test (container migration)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/migrate/run_tests.sh all
 
       - name: Runtime reconnect failover test (node death + client failover)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/reconnect/run_tests.sh all
 
       - name: Runtime leader-election test (leader death + re-election)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/leader_elect/run_tests.sh all
 
       - name: Runtime recovery test (container recovery after node death)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -190,6 +198,7 @@ jobs:
       # CTE blob op currently resolves to the client node's local container;
       # the rest of the CTE distributed suite is a hard check.
       - name: CTE distributed test (4-node, shm/tcp/ipc)
+        timeout-minutes: 25
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -201,6 +210,7 @@ jobs:
       # re-queue the undeliverable response, and stay responsive to a follow-up
       # client.
       - name: CTE client-crash test (daemon + separate-container client, #722)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -211,6 +221,7 @@ jobs:
       # on node 2. Fails hard if the CFS namespace is node-local (the pre-#685
       # PoolQuery::Local() routing); the run script keys on the reader's result.
       - name: CTE filesystem cross-node test (2-node, issue #685)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -225,12 +236,14 @@ jobs:
       # because cross-node blob assertions were disabled (#503) and every other
       # distributed test used TCP clients or the CFS adapter. Hard gate.
       - name: CTE cross-node SHM client gate (2-node, issue #774)
+        timeout-minutes: 15
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-transfer-engine/test/integration/grayscott_congestion/run_tests.sh tiny
 
       - name: CTE FUSE test (mount + POSIX I/O)
+        timeout-minutes: 20
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"

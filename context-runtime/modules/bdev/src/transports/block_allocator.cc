@@ -13,6 +13,9 @@ namespace clio::run::bdev {
 // will be moved here from bdev_runtime.cc
 
 const size_t kBlockSizes[] = {
+    512,      // 512B
+    1024,     // 1KB
+    2048,     // 2KB
     4096,     // 4KB
     16384,    // 16KB
     32768,    // 32KB
@@ -20,6 +23,9 @@ const size_t kBlockSizes[] = {
     131072,   // 128KB
     1048576   // 1MB
 };
+static_assert(sizeof(kBlockSizes) / sizeof(kBlockSizes[0]) ==
+                  static_cast<size_t>(BlockSizeCategory::kMaxCategories),
+              "kBlockSizes must match BlockSizeCategory");
 
 WorkerBlockMap::WorkerBlockMap() {
   blocks_.resize(static_cast<size_t>(BlockSizeCategory::kMaxCategories));

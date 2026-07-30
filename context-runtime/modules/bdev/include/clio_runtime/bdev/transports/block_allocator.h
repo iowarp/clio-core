@@ -19,14 +19,22 @@
 
 namespace clio::run::bdev {
 
+// Free-list bucket sizes. MUST match kBlockSizes[] in block_allocator.cc.
+// Sub-4KB buckets (issue #862): a ~1KB blob no longer pins a whole 4KB block
+// on byte-addressable tiers — the RAM bdev allocates at 512B granularity (see
+// mem_bdev_transport.cc); device-aligned tiers (file O_DIRECT) keep a 4KB
+// alignment quantum, so their requests still round up past the small buckets.
 enum class BlockSizeCategory : clio::run::u32 {
-  k256B = 0,
+  k512B = 0,
   k1KB = 1,
-  k4KB = 2,
-  k64KB = 3,
-  k128KB = 4,
-  k1MB = 5,
-  kMaxCategories = 6
+  k2KB = 2,
+  k4KB = 3,
+  k16KB = 4,
+  k32KB = 5,
+  k64KB = 6,
+  k128KB = 7,
+  k1MB = 8,
+  kMaxCategories = 9
 };
 
 extern const size_t kBlockSizes[];

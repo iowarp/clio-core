@@ -21,9 +21,15 @@
 #include <jni.h>
 #include <signal.h>
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <limits>
 #include <mutex>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
@@ -34,6 +40,65 @@ namespace {
 clio::cte::core::Tag *g_tag = nullptr;
 std::once_flag g_init_once;
 int g_init_rc = -100;  // set by the once-body; <0 means init failed
+
+// ---- async write window (issue #862 follow-up) ----------------------------
+// Writes were fully synchronous: one blocking PutBlob round trip per update,
+// which caps update-heavy workloads (A/F) at the depth-1 rate. This window
+// pipelines puts through the private-memory AsyncPutBlob (issue #830): in
+// client mode the private bytes are STAGED (copied) into a task-owned SHM
+// buffer during the submit call itself, so the JNI array can be released
+// immediately and the task frees its own staging on completion. The window is
+// shared by all YCSB client threads (mutex-guarded deque); when it exceeds
+// CLIO_YCSB_WINDOW (default 64, 0 = synchronous), the submitting thread reaps
+// the oldest future OUTSIDE the lock. Completion errors are sticky
+// (g_async_err) and surfaced on the next put and at drain.
+//
+// Semantics note: a read may observe the pre-put value of a key whose put is
+// still in flight (YCSB does not verify read values in the core workloads);
+// load/run phases are separate processes and cleanup() drains, so no put
+// escapes its phase.
+// In CLIENT mode the private AsyncPutBlob STAGES (copies) the bytes into a
+// task-owned SHM buffer during the submit call, so the source can be released
+// immediately. In RUNTIME (co-located, CLIO_WITH_RUNTIME=1) mode there is no
+// staging — the bdev write reads DIRECTLY from the caller's buffer until the
+// task completes — so the window must own a copy of the bytes and free it at
+// reap. g_runtime_mode selects the ownership scheme.
+// Deferred-put pipeline now lives in the CTE client (AsyncPutBlobDefer /
+// AsyncGetBlobDefer / AwaitPutsUntilSpace, issue #862) — the shim only picks
+// the flow-control policy:
+//   CLIO_YCSB_WINDOW unset -> capacity mode: async until shared memory is
+//        genuinely exhausted (AsyncPutBlobDefer awaits oldest puts on staging
+//        exhaustion); ring-slot safety caps in-flight payload at
+//        (RING_SIZE - 8) slots' worth so a direct-buffer slot is never
+//        rewritten while a prior put may still read it (Java rotates 96).
+//   CLIO_YCSB_WINDOW=0   -> synchronous (drain after every put)
+//   CLIO_YCSB_WINDOW=N   -> classic depth-N window (N puts' worth of bytes)
+//   CLIO_YCSB_WINDOW_BYTES -> explicit in-flight payload cap (overrides)
+size_t g_window = 0;
+bool g_sync_mode = false;
+bool g_depth_mode = false;
+size_t g_window_bytes = 0;  // 0 = not set
+bool g_runtime_mode = false;
+constexpr size_t kJavaWriteRingSlots = 96;  // must match ClioClient.RING_SIZE
+
+// In-flight byte budget for one more put of `len` bytes under the active
+// policy (SIZE_MAX = unbounded, capacity mode governs via staging).
+size_t PutBudget(size_t len) {
+  if (g_window_bytes != 0) return g_window_bytes;
+  if (g_depth_mode) return g_window * len;
+  return (kJavaWriteRingSlots - 8) * len;  // ring-reuse safety in capacity mode
+}
+
+// ---- scan key index (workloads D/E) ---------------------------------------
+// CTE has no ordered key scan, so the binding maintains its own sorted index
+// of blob names — the same approach the stock YCSB Redis binding takes (it
+// keeps a zset index for exactly this reason). Seeded from
+// Tag::GetContainedBlobs() at init (run phases start in a fresh process
+// against a loaded store) and updated on every put; scan = lower_bound +
+// walk. Guarded by its own mutex; scans copy the keys out under the lock and
+// fetch values outside it.
+std::mutex g_keys_mtx;
+std::set<std::string> g_keys;
 
 void InitOnce() {
   // The Clio SHM transport wakes waiters with tgkill(SIGUSR1); clio-aware
@@ -74,6 +139,21 @@ void InitOnce() {
     return;
   }
   g_tag = new clio::cte::core::Tag("ycsb");
+  g_runtime_mode = CLIO_RUNTIME_MANAGER->IsRuntime();
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    for (auto &name : g_tag->GetContainedBlobs()) {
+      g_keys.insert(name);
+    }
+  }
+  if (const char *w = std::getenv("CLIO_YCSB_WINDOW")) {
+    g_window = static_cast<size_t>(std::strtoul(w, nullptr, 10));
+    g_sync_mode = (g_window == 0);
+    g_depth_mode = (g_window > 0);
+  }
+  if (const char *b = std::getenv("CLIO_YCSB_WINDOW_BYTES")) {
+    g_window_bytes = static_cast<size_t>(std::strtoull(b, nullptr, 10));
+  }
   g_init_rc = 0;
 }
 
@@ -102,6 +182,8 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePut(
   try {
     g_tag->PutBlob(key_chars, reinterpret_cast<const char *>(bytes),
                    static_cast<size_t>(len));
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_chars);
   } catch (const std::exception &) {
     // Tag::PutBlob throws on a failed put (e.g. daemon死/capacity); an
     // exception escaping a JNI boundary terminates the JVM, so convert to a
@@ -113,6 +195,196 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePut(
   return rc;
 }
 
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
+    JNIEnv *env, jclass, jstring key, jbyteArray value) {
+  if (g_tag == nullptr) return -1;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return -2;
+  jsize len = env->GetArrayLength(value);
+  jbyte *bytes = env->GetByteArrayElements(value, nullptr);
+  if (bytes == nullptr) {
+    env->ReleaseStringUTFChars(key, key_chars);
+    return -3;
+  }
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  const char *src = reinterpret_cast<const char *>(bytes);
+  int rc;
+  if (g_runtime_mode) {
+    // Co-located byte[] path (cold; direct-buffer ring is the hot path): the
+    // put reads the source until completion and the JNI array must be
+    // released on return, so run it synchronously.
+    auto fut = cte_client->AsyncPutBlob(
+        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+    if (fut.IsNull()) {
+      rc = -11;
+    } else {
+      fut.Wait();
+      auto *t = fut.get();
+      rc = (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
+    }
+  } else {
+    // Client mode stages (copies) during the call — defer freely.
+    clio::cte::core::Client::AwaitPutsUntilSpace(
+        PutBudget(static_cast<size_t>(len)));
+    rc = cte_client->AsyncPutBlobDefer(
+        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+    if (rc == 0 && g_sync_mode) {
+      clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    }
+  }
+  env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
+  if (rc != 0) return rc;
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_str);
+  }
+  return clio::cte::core::Client::DeferErrorCount() != 0 ? -12 : 0;
+}
+
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeDrain(JNIEnv *,
+                                                                jclass) {
+  clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  return static_cast<jint>(clio::cte::core::Client::DeferErrorCount());
+}
+
+JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
+    JNIEnv *env, jclass, jstring start, jint count) {
+  if (g_tag == nullptr || count <= 0) return nullptr;
+  const char *start_chars = env->GetStringUTFChars(start, nullptr);
+  if (start_chars == nullptr) return nullptr;
+  std::string start_str(start_chars);
+  env->ReleaseStringUTFChars(start, start_chars);
+
+  std::vector<std::string> keys;
+  keys.reserve(static_cast<size_t>(count));
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    for (auto it = g_keys.lower_bound(start_str);
+         it != g_keys.end() && keys.size() < static_cast<size_t>(count);
+         ++it) {
+      keys.push_back(*it);
+    }
+  }
+  jclass str_cls = env->FindClass("java/lang/String");
+  jobjectArray out =
+      env->NewObjectArray(static_cast<jsize>(keys.size()), str_cls, nullptr);
+  if (out == nullptr) return nullptr;
+  for (jsize i = 0; i < static_cast<jsize>(keys.size()); ++i) {
+    jstring js = env->NewStringUTF(keys[static_cast<size_t>(i)].c_str());
+    env->SetObjectArrayElement(out, i, js);
+    env->DeleteLocalRef(js);
+  }
+  return out;
+}
+
+// Direct-ByteBuffer put (copy-reduction item 1): the source is a Java
+// direct buffer whose native memory is stable — the Java side rotates a
+// per-thread ring larger than the async window, and the window's global FIFO
+// reap guarantees a slot is complete before its buffer is reused. No JNI
+// array copy, no owned-buffer copy: runtime mode reads the buffer directly;
+// client mode stages at submit as before.
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
+    JNIEnv *env, jclass, jstring key, jobject buf, jint len) {
+  if (g_tag == nullptr || len <= 0) return -1;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return -2;
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+  char *src = static_cast<char *>(env->GetDirectBufferAddress(buf));
+  if (src == nullptr) return -3;
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  // Ring-slot safety: bound in-flight payload below the Java ring's capacity
+  // so a slot is never rewritten while a prior put may still read it (FIFO
+  // await order guarantees anything older than the newest kRing-8 puts has
+  // completed). Sync/depth modes tighten the same budget.
+  clio::cte::core::Client::AwaitPutsUntilSpace(
+      PutBudget(static_cast<size_t>(len)));
+  int rc = cte_client->AsyncPutBlobDefer(
+      g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  if (rc != 0) return rc == -1 ? -1 : -11;
+  if (g_sync_mode) {
+    clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_str);
+  }
+  return clio::cte::core::Client::DeferErrorCount() != 0 ? -12 : 0;
+}
+
+// Direct-ByteBuffer read (item 2): copy the payload once, store -> the Java
+// direct buffer, skipping the byte[] allocation + SetByteArrayRegion copy.
+// Returns payload size, 0 = absent, -1 = error, -2 = buffer too small.
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeGetDirect(
+    JNIEnv *env, jclass, jstring key, jobject buf) {
+  if (g_tag == nullptr) return -1;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return -1;
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+  char *dst = static_cast<char *>(env->GetDirectBufferAddress(buf));
+  jlong cap = env->GetDirectBufferCapacity(buf);
+  if (dst == nullptr) return -1;
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+  try {
+    clio::run::u64 size = g_tag->GetBlobSize(key_str);
+    if (size == 0) return 0;
+    if (static_cast<jlong>(size) > cap) return -2;
+    g_tag->GetBlob(key_str, dst, size, 0);
+    return static_cast<jint>(size);
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+// Zero-copy read view (item 3, issues #859/#862): wrap the blob's RAM-bdev
+// extent as a direct ByteBuffer — NO copy. gen_out[0] receives the placement
+// generation; the caller MUST re-validate with nativeValidateGen after
+// consuming and fall back to a copying read on mismatch.
+JNIEXPORT jobject JNICALL Java_site_ycsb_db_ClioClient_nativeGetView(
+    JNIEnv *env, jclass, jstring key, jlongArray gen_out) {
+  if (g_tag == nullptr) return nullptr;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return nullptr;
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+  const char *ptr = nullptr;
+  clio::run::u64 size = 0, gen = 0;
+  if (!cte_client->TryGetBlobViewShm(g_tag->GetTagId(), key_str, &ptr, &size,
+                                     &gen)) {
+    return nullptr;  // not viewable -> caller uses the copying path
+  }
+  jlong g = static_cast<jlong>(gen);
+  env->SetLongArrayRegion(gen_out, 0, 1, &g);
+  return env->NewDirectByteBuffer(const_cast<char *>(ptr),
+                                  static_cast<jlong>(size));
+}
+
+JNIEXPORT jboolean JNICALL Java_site_ycsb_db_ClioClient_nativeValidateGen(
+    JNIEnv *env, jclass, jstring key, jlong gen) {
+  if (g_tag == nullptr) return JNI_FALSE;
+  const char *key_chars = env->GetStringUTFChars(key, nullptr);
+  if (key_chars == nullptr) return JNI_FALSE;
+  std::string key_str(key_chars);
+  env->ReleaseStringUTFChars(key, key_chars);
+  auto *cte_client = CLIO_CTE_CLIENT;
+  return cte_client->CheckBlobGenShm(g_tag->GetTagId(), key_str,
+                                     static_cast<clio::run::u64>(gen))
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
 JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(
     JNIEnv *env, jclass, jstring key) {
   if (g_tag == nullptr) return nullptr;
@@ -121,6 +393,9 @@ JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(
   std::string key_str(key_chars);
   env->ReleaseStringUTFChars(key, key_chars);
 
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
   clio::run::u64 size = 0;
   std::vector<char> buf;
   try {

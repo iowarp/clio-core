@@ -238,6 +238,31 @@ class SystemInfo {
 
   CTP_DLL static void UnmapMemory(void *ptr, size_t size);
 
+  /**
+   * Bulk-fault the pages of [addr, addr+size) for WRITING, so a subsequent
+   * memcpy into the range takes no per-4KB page-fault round trips (measured
+   * ~7.6us/fault under WSL2 — first-touch faulting turned 10.6 GB/s of RAM
+   * bdev placement into 0.5 GB/s).
+   *
+   * ADVISORY: correctness never depends on this call — untouched pages
+   * demand-fault exactly as before, so any failure path may simply return.
+   * Platform behavior:
+   *  - Linux:   madvise(MADV_POPULATE_WRITE) (kernel >= 5.14), which
+   *             populates in-kernel at a fraction of the per-#PF cost;
+   *             older kernels fall back to the write-touch loop.
+   *  - Windows: PrefetchVirtualMemory to bring the range resident in bulk.
+   *  - macOS:   write-touch loop (no populate API); still batches the
+   *             faults at a controlled point instead of inside the copy.
+   * The fallback write-touch loop performs a volatile read-modify-write of
+   * one byte per page, preserving existing contents.
+   *
+   * @param addr Start of the range (any alignment; internally page-aligned).
+   * @param size Bytes to populate.
+   * @return True if a bulk populate mechanism (or the touch loop) ran;
+   *         false only for a null/empty range.
+   */
+  CTP_DLL static bool BulkFault(void *addr, size_t size);
+
   CTP_DLL static void *AlignedAlloc(size_t alignment, size_t size);
 
   /** Free memory returned by AlignedAlloc. POSIX accepts plain free()

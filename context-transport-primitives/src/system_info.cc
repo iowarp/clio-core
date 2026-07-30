@@ -37,6 +37,8 @@
 #include <clio_ctp/util/env_compat.h>
 #include "clio_ctp/introspect/system_info.h"
 
+#include <atomic>
+#include <cerrno>
 #include <climits>
 #ifdef __linux__
 #include <linux/limits.h>  // PATH_MAX on some Linux toolchains
@@ -755,6 +757,63 @@ void SystemInfo::UnmapMemory(void *ptr, size_t size) {
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   VirtualFree(ptr, size, MEM_RELEASE);
 #endif
+}
+
+// Some build toolchains (older glibc headers) predate the kernel constant;
+// the kernel rejects it with EINVAL when unsupported, which the fallback
+// below handles, so defining it locally is safe.
+#if defined(__linux__) && !defined(MADV_POPULATE_WRITE)
+#define MADV_POPULATE_WRITE 23
+#endif
+
+bool SystemInfo::BulkFault(void *addr, size_t size) {
+  if (addr == nullptr || size == 0) {
+    return false;
+  }
+  // Page-align the range: madvise requires an aligned start, and the touch
+  // loop wants to land exactly once per page.
+  const size_t page = static_cast<size_t>(GetPageSize());
+  uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t end = begin + size;
+  begin &= ~(static_cast<uintptr_t>(page) - 1);
+
+#if defined(__linux__)
+  // Cache the kernel's answer: one EINVAL/ENOSYS (pre-5.14) is permanent,
+  // so later calls skip straight to the touch loop.
+  static std::atomic<bool> populate_supported{true};
+  if (populate_supported.load(std::memory_order_relaxed)) {
+    if (madvise(reinterpret_cast<void *>(begin), end - begin,
+                MADV_POPULATE_WRITE) == 0) {
+      return true;
+    }
+    if (errno == EINVAL || errno == ENOSYS) {
+      populate_supported.store(false, std::memory_order_relaxed);
+    }
+    // Any other errno (e.g. ENOMEM under pressure): fall through and touch —
+    // partial population is fine, the remainder demand-faults.
+  }
+#elif defined(_WIN32)
+  // PrefetchVirtualMemory materializes the whole range into the working set
+  // in one call. Pages arrive resident; the later write's dirty-bit
+  // transition is a cheap soft fault, not a demand-zero fault.
+  WIN32_MEMORY_RANGE_ENTRY range;
+  range.VirtualAddress = reinterpret_cast<PVOID>(begin);
+  range.NumberOfBytes = static_cast<SIZE_T>(end - begin);
+  if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+    return true;
+  }
+  // Fall through to the touch loop (e.g. pre-Win8, or an unmapped subrange).
+#endif
+
+  // Universal fallback (and the macOS primary path): write-touch one byte
+  // per page. A volatile read-modify-write faults the page for writing while
+  // preserving its contents. Same per-page cost as demand faulting, but paid
+  // here, at a controlled point, instead of scattered through a bulk memcpy.
+  volatile char *p = reinterpret_cast<volatile char *>(begin);
+  for (uintptr_t off = 0; off < end - begin; off += page) {
+    p[off] = p[off];
+  }
+  return true;
 }
 
 void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {

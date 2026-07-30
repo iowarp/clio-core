@@ -40,9 +40,13 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
+#include <atomic>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace clio::cte::core {
@@ -229,6 +233,67 @@ class Client : public clio::run::ContainerClient {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Zero-copy VIEW of a blob's payload in the shared RAM-bdev segment
+   * (issues #859/#862). Returns a pointer INTO the mapped segment for a
+   * single-extent, direct-readable blob, plus the placement generation the
+   * caller must re-validate with CheckBlobGenShm AFTER consuming the bytes
+   * (same optimistic discipline as TryReadBlobShm, with the consume replacing
+   * the copy). Refuses multi-extent, truncated, transformed (#818), or
+   * non-RAM blobs -- the caller falls back to a copying read.
+   *
+   * LIFETIME/SAFETY: the pointer is valid only while the blob's placement is
+   * unchanged; a failed CheckBlobGenShm means the bytes consumed may be torn
+   * and the operation must be retried via a copying path. An in-place
+   * overwrite (same placement) does NOT bump the generation -- concurrent
+   * same-blob overwrite vs view is torn-content-visible, exactly as it is
+   * for the copying fast path.
+   */
+  bool TryGetBlobViewShm(const TagId &tag_id, const std::string &blob_name,
+                         const char **ptr, clio::run::u64 *size,
+                         clio::run::u64 *gen) {
+    if (shm_root_ == nullptr || ptr == nullptr || size == nullptr ||
+        gen == nullptr) {
+      return false;
+    }
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      return false;
+    }
+    if (!rec.IsDirectReadable() || rec.num_blocks_ != 1 ||
+        (rec.flags_ & kShmBlobTruncated) != 0) {
+      return false;
+    }
+    // A zero-size record is untrustworthy, not "empty" (issue #862): a fresh
+    // blob's record can be mirrored before its completing put republishes the
+    // size, and a size-0 view reads as an absent/empty value to callers.
+    // Refuse the view so the caller falls back to the authoritative RPC path
+    // (same rule as Tag::GetBlobSize).
+    if (rec.total_size_ == 0) {
+      return false;
+    }
+    char *base = MapRamBdev(rec.blocks_[0].target_pool_);
+    if (base == nullptr) {
+      return false;
+    }
+    *ptr = base + rec.blocks_[0].target_offset_;
+    *size = rec.total_size_;
+    *gen = rec.placement_gen_;
+    return true;
+  }
+
+  /** Re-validate a view taken with TryGetBlobViewShm: true iff the blob's
+   *  placement generation is unchanged (bytes consumed from the view were
+   *  stable). */
+  bool CheckBlobGenShm(const TagId &tag_id, const std::string &blob_name,
+                       clio::run::u64 gen) {
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      return false;
+    }
+    return rec.placement_gen_ == gen;
   }
 
   /** Zero-IPC tag-name lookup. */
@@ -649,7 +714,7 @@ class Client : public clio::run::ContainerClient {
       return clio::run::Future<PutBlobTask>();
     }
 
-    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    if (CLIO_RUNTIME_MANAGER->IsRuntime() && !NoPrivPutEnv()) {
       // Co-located daemon: read directly from the private buffer. The null
       // AllocatorId marks the offset as an absolute process address, so the
       // bdev write pulls the source bytes straight out of `priv_data`.
@@ -665,7 +730,8 @@ class Client : public clio::run::ContainerClient {
       return ipc_manager->Send(task);
     }
 
-    // Client: stage through an SHM buffer, copying the private bytes in ONCE.
+    // Client (or CLIO_CTE_NO_PRIV_PUT): stage through an SHM buffer, copying
+    // the private bytes in ONCE.
     ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
     if (staging.IsNull()) {
       return clio::run::Future<PutBlobTask>();
@@ -679,6 +745,15 @@ class Client : public clio::run::ContainerClient {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located (CLIO_CTE_NO_PRIV_PUT staging): client and daemon share this
+      // ONE task object — nothing is serialized, so the flag never "ships", and
+      // setting it after Send would race the worker's task_flags_ reads. Set it
+      // BEFORE Send; the single ~PutBlobTask frees the staging buffer exactly
+      // once, after the future completes.
+      t->SetFlags(TASK_DATA_OWNER);
+      return ipc_manager->Send(task);
+    }
     auto fut = ipc_manager->Send(task);
     // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
     // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
@@ -688,6 +763,202 @@ class Client : public clio::run::ContainerClient {
     // when the Future (task) is destroyed, after the write has completed.
     t->SetFlags(TASK_DATA_OWNER);
     return fut;
+  }
+
+  // ==== Deferred-put pipeline (issue #862) ==================================
+  //
+  // Promoted from the YCSB binding: a process-wide registry of in-flight
+  // deferred puts giving callers (a) unbounded async writes with flow control
+  // tied to REAL shared-memory capacity rather than a fixed depth, and (b)
+  // read-after-write consistency without waiting on unrelated writes at read
+  // time unless needed.
+  //
+  //  - AsyncPutBlobDefer: submit a private-memory put and register its future
+  //    in the registry (FIFO + per-key table). If client-mode SHM staging is
+  //    exhausted (AsyncPutBlob returns an empty future), the oldest deferred
+  //    puts are awaited one at a time — each releasing its staging buffer —
+  //    until the submit succeeds.
+  //  - AsyncGetBlobDefer: await any pending put(s) for the SAME blob first
+  //    (Wait on their futures), then read — so a get after an acked put never
+  //    misses or returns pre-put bytes.
+  //  - AwaitPutsUntilSpace: await oldest deferred puts until at most
+  //    `max_inflight_bytes` of payload remain in flight (0 = drain).
+  //
+  // The registry is process-wide (Client instances may be copied; a static
+  // registry keeps the API on the client without breaking copyability).
+  // Completion failures are counted, not thrown: poll DeferErrorCount().
+  struct DeferredPut {
+    clio::run::Future<PutBlobTask> fut_;
+    std::string key_;
+    clio::run::u64 size_;
+  };
+  struct DeferRegistry {
+    std::mutex mtx_;
+    std::deque<DeferredPut> fifo_;
+    std::unordered_map<std::string, clio::run::u32> per_key_;
+    clio::run::u64 inflight_bytes_ = 0;
+    // Lock-free emptiness signal: readers on the hot path check this before
+    // touching mtx_ — a pure-read phase pays one relaxed load per get, not a
+    // contended mutex (18% of workload C's throughput at 1M reads/s).
+    std::atomic<clio::run::u64> pending_count_{0};
+    std::atomic<clio::run::u64> errors_{0};
+    static DeferRegistry &Get() {
+      static DeferRegistry r;
+      return r;
+    }
+  };
+
+  static std::string DeferKey(const TagId &tag_id, const std::string &name) {
+    std::string k;
+    k.reserve(sizeof(tag_id) + name.size());
+    k.append(reinterpret_cast<const char *>(&tag_id), sizeof(tag_id));
+    k.append(name);
+    return k;
+  }
+
+  /** Await the single oldest deferred put. @return false if none was
+   *  available to claim (the fifo may be empty while other threads are still
+   *  mid-Wait on claimed entries — per_key_/pending_count_/inflight_bytes_
+   *  stay accounted until THEIR waits finish).
+   *
+   *  Ordering matters (read-after-write): the per-key/pending/bytes
+   *  bookkeeping is released only AFTER Wait() returns. Releasing it at pop
+   *  time opened a race where a reader's AwaitPendingPuts saw "not pending"
+   *  while the reaping thread was still waiting on that key's put — the read
+   *  then missed the not-yet-published blob (the residual YCSB-D NOT_FOUNDs
+   *  that survived the first RAW implementation). */
+  static bool DeferAwaitOldest() {
+    DeferRegistry &reg = DeferRegistry::Get();
+    DeferredPut entry;
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      if (reg.fifo_.empty()) {
+        return false;
+      }
+      entry = std::move(reg.fifo_.front());
+      reg.fifo_.pop_front();
+    }
+    entry.fut_.Wait();
+    auto *t = entry.fut_.get();
+    if (t == nullptr || t->GetReturnCode() != 0) {
+      reg.errors_.fetch_add(1);
+    }
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.pending_count_.fetch_sub(1, std::memory_order_relaxed);
+      reg.inflight_bytes_ -= entry.size_;
+      auto it = reg.per_key_.find(entry.key_);
+      if (it != reg.per_key_.end() && --(it->second) == 0) {
+        reg.per_key_.erase(it);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Deferred private-memory put: submit AND register; the registry owns the
+   * future. In client mode the bytes are STAGED (copied) during this call, so
+   * `priv_data` may be reused immediately on return. In runtime (co-located)
+   * mode the write reads `priv_data` until the put completes — the caller must
+   * keep it stable until the put is awaited (AwaitPutsUntilSpace / a
+   * same-blob AsyncGetBlobDefer / drain).
+   *
+   * @return 0 submitted; -1 degenerate request (size 0 / null source); -2
+   *         shared memory exhausted with nothing left to await.
+   */
+  int AsyncPutBlobDefer(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, const char *priv_data, float score = -1.0f,
+      const Context &context = Context(), clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    if (size == 0 || priv_data == nullptr) {
+      return -1;
+    }
+    auto fut = AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
+                            context, flags, pool_query);
+    // Empty future with a non-degenerate request = client-mode staging
+    // exhaustion: shared memory is full of in-flight puts. Await the oldest
+    // (freeing their staging) until the submit succeeds.
+    while (fut.IsNull()) {
+      if (!DeferAwaitOldest()) {
+        return -2;
+      }
+      fut = AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
+                         context, flags, pool_query);
+    }
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::string key = DeferKey(tag_id, blob_name);
+    std::lock_guard<std::mutex> lk(reg.mtx_);
+    reg.fifo_.push_back(DeferredPut{std::move(fut), key, size});
+    reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+    reg.inflight_bytes_ += size;
+    reg.per_key_[std::move(key)]++;
+    return 0;
+  }
+
+  /** Await every deferred put targeting (tag_id, blob_name). FIFO order, so
+   *  older unrelated puts ahead of them are completed too (harmless). */
+  static void AwaitPendingPuts(const TagId &tag_id,
+                               const std::string &blob_name) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return;  // nothing deferred anywhere -> no key can be pending
+    }
+    std::string key = DeferKey(tag_id, blob_name);
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk(reg.mtx_);
+        if (reg.per_key_.find(key) == reg.per_key_.end()) {
+          return;
+        }
+      }
+      if (!DeferAwaitOldest()) {
+        // Nothing claimable, but the key is still accounted: another thread
+        // is mid-Wait on its put. Spin-yield until that wait retires it.
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  /**
+   * Read-after-write-consistent private-memory get: if a deferred put for this
+   * blob is still in flight, Wait for it (them) FIRST, then read — the read
+   * takes the same SHM fast path / RPC fallback as AsyncGetBlob.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlobDefer(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, char *priv_data, clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    AwaitPendingPuts(tag_id, blob_name);
+    return AsyncGetBlob(tag_id, blob_name, offset, size, flags, priv_data,
+                        pool_query, context);
+  }
+
+  /**
+   * Await oldest deferred puts until at most `max_inflight_bytes` of payload
+   * remain in flight. 0 = full drain. @return in-flight bytes on return.
+   */
+  static clio::run::u64 AwaitPutsUntilSpace(clio::run::u64 max_inflight_bytes) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk(reg.mtx_);
+        if (reg.inflight_bytes_ <= max_inflight_bytes) {
+          return reg.inflight_bytes_;
+        }
+      }
+      if (!DeferAwaitOldest()) {
+        // In-flight bytes are retired only when their Wait completes; if
+        // other threads hold the remaining claims, yield until they finish.
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  /** Deferred puts that completed with a nonzero return code (sticky). */
+  static clio::run::u64 DeferErrorCount() {
+    return DeferRegistry::Get().errors_.load();
   }
 
   /**
@@ -733,6 +1004,20 @@ class Client : public clio::run::ContainerClient {
   static bool ForceNetEnv() {
     static const bool v = [] {
       const char *e = std::getenv("CLIO_FORCE_NET");
+      return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return v;
+  }
+
+  /** True when CLIO_CTE_NO_PRIV_PUT is set: the private-memory AsyncPutBlob
+   * stands down its runtime-mode zero-copy branch (null-allocator ShmPtr over
+   * the caller's buffer) and every put goes through the plain staged path —
+   * allocate SHM, copy once, send — exactly like a pure client. Benchmarking
+   * knob (issue #862): isolates what the #830 zero-copy path buys co-located
+   * writers. Read once. */
+  static bool NoPrivPutEnv() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CTE_NO_PRIV_PUT");
       return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
     }();
     return v;

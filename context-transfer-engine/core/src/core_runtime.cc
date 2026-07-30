@@ -2017,6 +2017,21 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Use the pre-provided data pointer from the task
     ctp::ipc::ShmPtr<> blob_data_ptr = task->blob_data_;
 
+    // Pin the blob's extents for the duration of snapshot+read (issue #753,
+    // reader half). The snapshot below protects against the blocks_ VECTOR
+    // reallocating, but not against an extent-freeing mutator (ReorganizeBlob/
+    // DelBlob/Truncate) taking the write token after the snapshot and FREEING
+    // the extents it references mid-ReadData — this read would then return
+    // reused bytes with rc=0. The pin makes those mutators drain us first.
+    // PutBlob never drains (it modifies data in place but frees nothing), so
+    // read/write concurrency on a blob is unchanged. The back-off loop must
+    // never wait while pinned — TryPinRead fails instead of blocking, and we
+    // retry un-pinned, so the drainer can always make progress.
+    while (!blob_info_ptr->TryPinRead()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    BlobReadPinGuard read_pin_guard(blob_info_ptr.get());
+
     // Snapshot the block layout BEFORE the read I/O. ReadData co_awaits a bdev
     // read per block; a concurrent PutBlob/Truncate (holding the per-blob write
     // token) may ExtendBlob/ResizeBlob and push_back into the SAME blocks_
@@ -2218,6 +2233,20 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     // concurrent GetBlob can never see "blob not found" mid-move (issue #753).
     // Readers that would race the emptied layout instead wait on the write
     // token (see the torn-layout guard in GetBlobImpl).
+    // issue #753 (reader half): drain in-flight GetBlob readers before the
+    // ClearBlob below frees the old extents. Readers snapshot blocks_ and then
+    // read with NO lock held (see GetBlobImpl), so without this drain the free
+    // could reclaim extents a reader's snapshot still references mid-ReadData
+    // — that reader would return reused bytes with rc=0. Pinned readers only
+    // finish (they never wait while pinned), new readers back off until the
+    // guard clears the drain bit at scope exit, and the write token above
+    // guarantees at most one drainer.
+    blob_info.BeginDrainReaders();
+    BlobReaderDrainGuard reader_drain_guard(&blob_info);
+    while (blob_info.HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
     bool cleared = false;
     CLIO_CO_AWAIT(ClearBlob(blob_info, current_score, 0, blob_size, cleared));
     if (!cleared) {
@@ -2514,6 +2543,17 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     // Step 2: Get blob size before deletion for tag size accounting
     clio::run::u64 blob_size = blob_info_ptr->GetTotalSize();
 
+    // issue #753 (reader half): drain in-flight GetBlob readers before freeing
+    // the blocks. A reader's snapshot may still reference these extents
+    // mid-ReadData; freeing them under it would let the read return reused
+    // bytes with rc=0. The #820 Evict path routes through this handler, so
+    // capacity eviction drains readers too.
+    blob_info_ptr->BeginDrainReaders();
+    BlobReaderDrainGuard reader_drain_guard(blob_info_ptr.get());
+    while (blob_info_ptr->HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
     // Step 2.5: Free all blocks back to their targets before removing blob
     clio::run::u32 free_result = 0;
     CLIO_CO_AWAIT(FreeAllBlobBlocks(*blob_info_ptr, free_result));
@@ -2731,7 +2771,9 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     clio::run::u64 old_size = blob_info_ptr->GetTotalSize();
     float blob_score = blob_info_ptr->score_;
 
-    // Shared resize helper (also used by PutBlob's replace path).
+    // Shared resize helper (also used by PutBlob's replace path). The shrink
+    // path drains in-flight readers itself before freeing dropped extents
+    // (issue #753, reader half) — see ResizeBlob.
     clio::run::u32 resize_result = 0;
     CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, new_size, blob_score,
                         resize_result, 0));
@@ -3957,6 +3999,29 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
       continue;
     }
 
+    // issue #753: the read below iterates blob_info_ptr->blocks_ DIRECTLY and
+    // Step 2 frees extents, so both need the same protection every other
+    // mutator has. Take the per-blob write token (stops concurrent Put/
+    // Reorganize/Del from mutating blocks_ under our read — the same dangling-
+    // vector hazard #680 fixed in GetBlob) and drain pinned readers before the
+    // volatile blocks are freed. flush_guards_open brackets the protected
+    // region: it MUST be closed before Step 3's AsyncPutBlob, which acquires
+    // the same token as a subtask and would deadlock against us. Manual
+    // begin/end rather than RAII because the region ends mid-scope; the
+    // `continue` error paths below each close it explicitly.
+    clio::run::u64 flush_tok =
+        reinterpret_cast<clio::run::u64>(clio::run::GetCurrentTask().get());
+    if (flush_tok == 0) {
+      flush_tok = reinterpret_cast<clio::run::u64>(&total_size);
+    }
+    while (!blob_info_ptr->TryLockWrite(flush_tok)) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    blob_info_ptr->BeginDrainReaders();
+    while (blob_info_ptr->HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
     ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
     clio::run::u32 read_error = 0;
     CLIO_CO_AWAIT(ReadData(blob_info_ptr->blocks_, shm_ptr, total_size, 0,
@@ -3964,6 +4029,8 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     if (read_error != 0) {
       HLOG(kError, "FlushData: Failed to read blob data for {}",
            entry.blob_name);
+      blob_info_ptr->EndDrainReaders();
+      blob_info_ptr->UnlockWrite(flush_tok);
       ipc_manager->FreeBuffer(buffer);
       continue;
     }
@@ -4031,6 +4098,12 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     // Republish immediately: the volatile blocks were just freed, so a mirror
     // still naming them points clients at reusable storage.
     MirrorBlobToShm(entry.composite_key, *blob_info_ptr);
+
+    // End the #753 protected region BEFORE the re-put below — AsyncPutBlob
+    // acquires this blob's write token as a subtask and would deadlock if we
+    // still held it.
+    blob_info_ptr->EndDrainReaders();
+    blob_info_ptr->UnlockWrite(flush_tok);
 
     // Step 3: Re-put data using AsyncPutBlob with persistence context
     Context flush_ctx;
@@ -4987,6 +5060,19 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   // Shrink: keep the blocks covering [0, new_size); free the rest. The block
   // straddling new_size is trimmed logically (its physical tail stays
   // allocated within that block and is reclaimed when the block is freed).
+  //
+  // issue #753 (reader half): the dropped extents are about to go back to the
+  // bdev free pool, but an in-flight GetBlob's snapshot may still reference
+  // them mid-ReadData (readers hold no lock during I/O). Drain pinned readers
+  // first. This is the chokepoint shared by BOTH shrink callers (Truncate and
+  // PutBlob's replace path), each of which holds the per-blob write token —
+  // which is what guarantees at most one drainer per blob.
+  blob_info.BeginDrainReaders();
+  BlobReaderDrainGuard reader_drain_guard(&blob_info);
+  while (blob_info.HasReadPins()) {
+    CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+  }
+
   std::vector<BlobBlock> keep;
   std::vector<BlobBlock> drop;
   clio::run::u64 block_start = 0;
@@ -6081,7 +6167,18 @@ clio::run::TaskResume Runtime::SemanticSearch(
     }
     ctp::ipc::ShmPtr<> shm(buf.shm_);
     clio::run::u32 read_rc = 0;
-    CLIO_CO_AWAIT(ReadData(info->blocks_, shm, total, 0, read_rc));
+    {
+      // issue #753 (reader half): pin + snapshot, same discipline as
+      // GetBlobImpl — the pin keeps extent-freeing mutators from reclaiming
+      // the extents mid-read, the snapshot keeps a concurrent Put's blocks_
+      // push_back from dangling the vector we iterate.
+      while (!info->TryPinRead()) {
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      BlobReadPinGuard read_pin_guard(info.get());
+      clio::run::priv::vector<BlobBlock> blocks_snapshot(info->blocks_);
+      CLIO_CO_AWAIT(ReadData(blocks_snapshot, shm, total, 0, read_rc));
+    }
     if (read_rc != 0) {
       HLOG(kWarning,
            "SemanticSearch: ReadData failed for blob '{}' (rc={}); "

@@ -149,3 +149,6 @@ claude-log.json
 .clio_firewall_allowed
 context-runtime/test/integration/collective_restart/docker-compose.override.yml
 build-tsan/
+
+# Local-only compose overrides (per-box mounts/debug shims) must never be committed
+docker-compose.override.yml
