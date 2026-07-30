@@ -162,20 +162,10 @@ ssize_t CfsIo::DoRead(clio::run::u64 handle, const std::string &path,
     return fast;
   }
   // issue #872: the runtime cannot see this client's Defer registry, so a
-  // task-path read must not race in-flight deferred puts for these pages.
-  // With the record we await exactly the overlapped pages; without it (no
-  // tag known) fall back to a full drain — rare, since a file that was ever
-  // deferred-written has a fast-pathable record.
-  {
-    auto *cfs_cl = CLIO_CFS_CLIENT;
-    clio::cte::filesystem::ShmFileRecord rrec;
-    if (cfs_cl != nullptr && cfs_cl->TryGetFileRecordShm(path, &rrec) &&
-        rrec.IsFastPathable()) {
-      AwaitDeferPages(rrec.tag_id_, off, count);
-    } else {
-      clio::cte::core::Client::AwaitPutsUntilSpace(0);
-    }
-  }
+  // task-path read must not race in-flight deferred puts. This fallback is
+  // the rare path (the SHM fast path answers the common case), so one full
+  // registry drain — free when nothing is pending — beats page bookkeeping.
+  clio::cte::core::Client::AwaitPutsUntilSpace(0);
   auto *ipc = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(count);
   if (shm.IsNull()) {
@@ -253,30 +243,26 @@ bool CfsIo::DeferWritesEnabled() {
   return v;
 }
 
-void CfsIo::AwaitDeferPages(const clio::cte::core::TagId &tag,
-                            clio::run::u64 off, clio::run::u64 size) {
-  clio::run::u64 cur = off;
-  const clio::run::u64 end = off + size;
-  while (cur < end) {
-    clio::cte::core::Client::AwaitPendingPuts(
-        tag, clio::cte::filesystem::PageName(cur));
-    cur += clio::cte::filesystem::kFsPageSize -
-           (cur % clio::cte::filesystem::kFsPageSize);
+void CfsIo::LatchDeferErrors(PathWrites *pw) {
+  // Defer-put failures are process-global counters, not attributable to one
+  // entry; sample the delta and latch EIO like a failed WriteTask would.
+  static std::atomic<clio::run::u64> seen_errs{0};
+  clio::run::u64 errs = clio::cte::core::Client::DeferErrorCount();
+  clio::run::u64 prev = seen_errs.exchange(errs);
+  if (errs != prev && pw->sticky == 0) {
+    pw->sticky = EIO;
   }
 }
 
 void CfsIo::RetireEntry(PathWrites *pw, PendingWrite &p) {
   if (p.deferred) {
-    // Payload first (the registry waits and error-counts the puts), then the
-    // metadata advance. Defer-put failures are process-global counters, not
-    // attributable to one entry; sample the delta and latch EIO like a failed
-    // WriteTask would.
-    static std::atomic<clio::run::u64> seen_errs{0};
-    AwaitDeferPages(p.tag, p.off, p.size);
+    // Only the metadata advance: the payload's staging lives in the Defer
+    // registry, which bounds itself, so REAPING an entry never has to block
+    // on the puts — payload durability is a property of the DRAIN points
+    // (fsync/close/truncate/overlap), where DrainWindow performs one
+    // registry-level AwaitPutsUntilSpace(0) after the entries retire.
     p.meta_fut.Wait();
-    clio::run::u64 errs = clio::cte::core::Client::DeferErrorCount();
-    clio::run::u64 prev = seen_errs.exchange(errs);
-    if ((errs != prev || p.meta_fut->GetReturnCode() != 0) && pw->sticky == 0) {
+    if (p.meta_fut->GetReturnCode() != 0 && pw->sticky == 0) {
       pw->sticky = EIO;
     }
     return;
@@ -417,12 +403,26 @@ ctp::ipc::FullPtr<char> CfsIo::AllocateStaging(const std::string &path,
 }
 
 void CfsIo::DrainWindow(PathWrites *pw) {
-  std::lock_guard<std::mutex> g(pw->mu);
-  for (auto &p : pw->q) {
-    RetireEntry(pw, p);
+  bool any_deferred = false;
+  {
+    std::lock_guard<std::mutex> g(pw->mu);
+    for (auto &p : pw->q) {
+      any_deferred |= p.deferred;
+      RetireEntry(pw, p);
+    }
+    pw->q.clear();
+    pw->bytes = 0;
   }
-  pw->q.clear();
-  pw->bytes = 0;
+  // A drain means "the payload is durable", so the deferred puts must be
+  // waited out too. One registry-level drain — deliberately wider than this
+  // file (it waits every in-flight deferred put) — replaces per-page awaits:
+  // strictly safe, and the drain points (fsync/close/truncate/overlap) are
+  // exactly where a full flush is the expected cost.
+  if (any_deferred) {
+    clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    std::lock_guard<std::mutex> g(pw->mu);
+    LatchDeferErrors(pw);
+  }
 }
 
 int CfsIo::DrainPath(const std::string &path) {
@@ -492,13 +492,9 @@ void CfsIo::DrainIfOverlap(const std::string &path, clio::run::u64 off,
     // ordered, and waiting on a later write while an earlier one is still
     // outstanding would leave the file in a state no single read reflects.
     // The sticky error is deliberately NOT consumed here -- a read must not
-    // swallow the report owed to the next write/fsync/close.
-    std::lock_guard<std::mutex> g(pw->mu);
-    for (auto &p : pw->q) {
-      RetireEntry(pw.get(), p);
-    }
-    pw->q.clear();
-    pw->bytes = 0;
+    // swallow the report owed to the next write/fsync/close. DrainWindow also
+    // performs the registry-level payload drain deferred entries require.
+    DrainWindow(pw.get());
   }
 }
 
@@ -559,7 +555,6 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
         p.off = off;
         p.size = count;
         p.deferred = true;
-        p.tag = rec.tag_id_;
         {
           std::lock_guard<std::mutex> g(pw->mu);
           pw->q.push_back(std::move(p));

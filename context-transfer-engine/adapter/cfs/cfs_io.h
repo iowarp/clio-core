@@ -101,7 +101,6 @@ struct PendingWrite {
   clio::run::u64 off = 0;
   clio::run::u64 size = 0;
   bool deferred = false;
-  clio::cte::core::TagId tag;    ///< deferred: file tag for per-page await
 };
 
 /**
@@ -274,11 +273,12 @@ class CfsIo {
   /** issue #872: route write payloads through AsyncPutBlobDefer (client-side
    *  page loop, no WriteTask on the data path). CLIO_CFS_DEFER=0 disables. */
   static bool DeferWritesEnabled();
-  /** Await the Defer-registry puts covering [off, off+size) of `tag`. */
-  static void AwaitDeferPages(const clio::cte::core::TagId &tag,
-                              clio::run::u64 off, clio::run::u64 size);
+  /** Sample the Defer registry's global error counter; latch EIO on `pw` if
+   *  it advanced. Caller holds pw->mu. */
+  static void LatchDeferErrors(PathWrites *pw);
   /** Wait out one window entry (either kind), latching failures on `pw`.
-   *  Caller holds pw->mu. */
+   *  Deferred entries wait only their metadata task here — payload puts are
+   *  drained registry-wide by DrainWindow. Caller holds pw->mu. */
   static void RetireEntry(PathWrites *pw, PendingWrite &p);
 
   /** Window bounds, read once from the environment. */
