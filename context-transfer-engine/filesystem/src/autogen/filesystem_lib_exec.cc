@@ -42,7 +42,8 @@ namespace clio::cte::filesystem {
   X(kGetxattr, GetxattrTask, Getxattr)   \
   X(kListxattr, ListxattrTask, Listxattr)   \
   X(kRemovexattr, RemovexattrTask, Removexattr)   \
-  X(kChown, ChownTask, Chown)
+  X(kChown, ChownTask, Chown)             \
+  X(kAdvanceSize, AdvanceSizeTask, AdvanceSize)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

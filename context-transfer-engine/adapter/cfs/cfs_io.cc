@@ -101,6 +101,12 @@ ssize_t CfsIo::TryReadShm(const std::string &path, clio::run::u64 off,
     clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
     clio::run::u64 to_read =
         std::min(clio::cte::filesystem::kFsPageSize - page_off, want - done);
+    // issue #872: a deferred write to this page may still be in flight; the
+    // registry await is one relaxed load when nothing is pending. (The
+    // pre-existing mirror-republish lag documented in DoRead applies here
+    // exactly as it does to drained WriteTask writes.)
+    clio::cte::core::Client::AwaitPendingPuts(
+        rec.tag_id_, clio::cte::filesystem::PageName(cur));
     if (!cte->TryReadBlobShm(rec.tag_id_, clio::cte::filesystem::PageName(cur),
                              dst + done, static_cast<size_t>(to_read),
                              static_cast<size_t>(page_off))) {
@@ -155,6 +161,21 @@ ssize_t CfsIo::DoRead(clio::run::u64 handle, const std::string &path,
   if (fast >= 0) {
     return fast;
   }
+  // issue #872: the runtime cannot see this client's Defer registry, so a
+  // task-path read must not race in-flight deferred puts for these pages.
+  // With the record we await exactly the overlapped pages; without it (no
+  // tag known) fall back to a full drain — rare, since a file that was ever
+  // deferred-written has a fast-pathable record.
+  {
+    auto *cfs_cl = CLIO_CFS_CLIENT;
+    clio::cte::filesystem::ShmFileRecord rrec;
+    if (cfs_cl != nullptr && cfs_cl->TryGetFileRecordShm(path, &rrec) &&
+        rrec.IsFastPathable()) {
+      AwaitDeferPages(rrec.tag_id_, off, count);
+    } else {
+      clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    }
+  }
   auto *ipc = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(count);
   if (shm.IsNull()) {
@@ -207,6 +228,64 @@ bool CfsIo::AsyncWritesEnabled() {
     return true;
   }();
   return v;
+}
+
+bool CfsIo::DeferWritesEnabled() {
+  // issue #872: route the write PAYLOAD through the CTE Defer registry
+  // (AsyncPutBlobDefer pages the caller's buffer client-side, staging the
+  // bytes into SHM during write(2)); only the logical-size advance still
+  // crosses to the chimod, as a metadata-only AdvanceSizeTask. Requires the
+  // #817 SHM record for the file (tag id) — files without a fast-pathable
+  // record fall back to the WriteTask path transparently.
+  //
+  // Consistency: in-process readers are covered exactly (the read paths await
+  // the registry's per-page pending puts). Cross-process readers can
+  // transiently observe the advanced size before the page bytes land — the
+  // AdvanceSizeTask cannot know when the client's puts complete. The
+  // single-daemon deployment (one FUSE/interceptor process per node) is
+  // unaffected; multi-writer-multi-reader setups should set CLIO_CFS_DEFER=0.
+  static const bool v = [] {
+    if (const char *e = std::getenv("CLIO_CFS_DEFER")) {
+      return !(std::string(e) == "0" || std::string(e) == "false");
+    }
+    return true;
+  }();
+  return v;
+}
+
+void CfsIo::AwaitDeferPages(const clio::cte::core::TagId &tag,
+                            clio::run::u64 off, clio::run::u64 size) {
+  clio::run::u64 cur = off;
+  const clio::run::u64 end = off + size;
+  while (cur < end) {
+    clio::cte::core::Client::AwaitPendingPuts(
+        tag, clio::cte::filesystem::PageName(cur));
+    cur += clio::cte::filesystem::kFsPageSize -
+           (cur % clio::cte::filesystem::kFsPageSize);
+  }
+}
+
+void CfsIo::RetireEntry(PathWrites *pw, PendingWrite &p) {
+  if (p.deferred) {
+    // Payload first (the registry waits and error-counts the puts), then the
+    // metadata advance. Defer-put failures are process-global counters, not
+    // attributable to one entry; sample the delta and latch EIO like a failed
+    // WriteTask would.
+    static std::atomic<clio::run::u64> seen_errs{0};
+    AwaitDeferPages(p.tag, p.off, p.size);
+    p.meta_fut.Wait();
+    clio::run::u64 errs = clio::cte::core::Client::DeferErrorCount();
+    clio::run::u64 prev = seen_errs.exchange(errs);
+    if ((errs != prev || p.meta_fut->GetReturnCode() != 0) && pw->sticky == 0) {
+      pw->sticky = EIO;
+    }
+    return;
+  }
+  p.fut.Wait();
+  if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+    pw->sticky = EIO;
+  }
+  CLIO_IPC->FreeBuffer(p.buf);
 }
 
 // The window is a BACK-PRESSURE bound, not an error condition: a writer that
@@ -268,30 +347,28 @@ void CfsIo::ReapAndBound(PathWrites *pw) {
   // Retire anything already finished. Front to back: the queue is in
   // submission order, and a completed write behind an outstanding one still
   // has to keep its slot so `bytes` and the drain order stay coherent.
+  // (Deferred entries look at the metadata future; their payload puts are
+  // awaited inside RetireEntry, which may block briefly if a put straggles.)
   size_t done = 0;
-  while (done < pw->q.size() && pw->q[done].fut.IsComplete()) {
+  while (done < pw->q.size() &&
+         (pw->q[done].deferred ? pw->q[done].meta_fut.IsComplete()
+                               : pw->q[done].fut.IsComplete())) {
     PendingWrite &p = pw->q[done];
-    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
-      pw->sticky = EIO;
-    }
-    ipc->FreeBuffer(p.buf);
+    RetireEntry(pw, p);
     pw->bytes -= p.size;
     ++done;
   }
   if (done > 0) {
     pw->q.erase(pw->q.begin(), pw->q.begin() + static_cast<long>(done));
   }
+  (void)ipc;
 
   // Still over the window: block on the oldest until we are under it. This is
   // the back-pressure -- without it a writer outruns the runtime and the
   // staging buffers grow without bound.
   while (pw->bytes > MaxInflightBytes() || pw->q.size() > MaxInflightWrites()) {
     PendingWrite &p = pw->q.front();
-    p.fut.Wait();
-    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
-      pw->sticky = EIO;
-    }
-    ipc->FreeBuffer(p.buf);
+    RetireEntry(pw, p);
     pw->bytes -= p.size;
     pw->q.erase(pw->q.begin());
   }
@@ -340,14 +417,9 @@ ctp::ipc::FullPtr<char> CfsIo::AllocateStaging(const std::string &path,
 }
 
 void CfsIo::DrainWindow(PathWrites *pw) {
-  auto *ipc = CLIO_IPC;
   std::lock_guard<std::mutex> g(pw->mu);
   for (auto &p : pw->q) {
-    p.fut.Wait();
-    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
-      pw->sticky = EIO;
-    }
-    ipc->FreeBuffer(p.buf);
+    RetireEntry(pw, p);
   }
   pw->q.clear();
   pw->bytes = 0;
@@ -421,14 +493,9 @@ void CfsIo::DrainIfOverlap(const std::string &path, clio::run::u64 off,
     // outstanding would leave the file in a state no single read reflects.
     // The sticky error is deliberately NOT consumed here -- a read must not
     // swallow the report owed to the next write/fsync/close.
-    auto *ipc = CLIO_IPC;
     std::lock_guard<std::mutex> g(pw->mu);
     for (auto &p : pw->q) {
-      p.fut.Wait();
-      if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
-        pw->sticky = EIO;
-      }
-      ipc->FreeBuffer(p.buf);
+      RetireEntry(pw.get(), p);
     }
     pw->q.clear();
     pw->bytes = 0;
@@ -441,6 +508,72 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
   if (count == 0) {
     return 0;
   }
+
+  // issue #872: deferred data path. When the file's SHM record gives us the
+  // tag, page the caller's buffer straight into AsyncPutBlobDefer — the
+  // registry stages the bytes during this call (the buffer is reusable on
+  // return), backpressures against real SHM capacity, and gives the read
+  // paths per-page read-after-write consistency. Only the logical-size
+  // advance still crosses to the chimod, as a metadata-only task parked in
+  // the same per-path window so every drain/ordering rule stays intact.
+  if (!sync && AsyncWritesEnabled() && DeferWritesEnabled()) {
+    auto *cfs_cl = CLIO_CFS_CLIENT;
+    auto *cte = CLIO_CTE_CLIENT;
+    clio::cte::filesystem::ShmFileRecord rec;
+    if (cfs_cl != nullptr && cte != nullptr &&
+        (cfs_cl->HasShmCache() || cfs_cl->AttachShmCache()) &&
+        cfs_cl->TryGetFileRecordShm(path, &rec) && rec.IsFastPathable()) {
+      const char *src = static_cast<const char *>(buf);
+      clio::run::u64 done = 0;
+      clio::run::u64 cur = off;
+      bool ok = true;
+      while (done < count) {
+        clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
+        clio::run::u64 to_write = std::min(
+            clio::cte::filesystem::kFsPageSize - page_off, count - done);
+        static constexpr clio::run::u64 kFsPreallocBytes = 64ull * 1024;
+        int rc = cte->AsyncPutBlobDefer(
+            rec.tag_id_, clio::cte::filesystem::PageName(cur), page_off,
+            to_write, src + done, /*score*/ -1.0f,
+            clio::cte::core::Context::Preallocate(kFsPreallocBytes),
+            /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
+        if (rc != 0) {
+          ok = false;
+          break;
+        }
+        done += to_write;
+        cur += to_write;
+      }
+      if (ok) {
+        // Same rationale as TryReadShm's announce: an engaged and a
+        // silently-fallen-back defer path are otherwise indistinguishable.
+        static std::once_flag announced;
+        std::call_once(announced, [] {
+          HLOG(kInfo,
+               "clio-fs: deferred write path active (payload via "
+               "AsyncPutBlobDefer, issue #872)");
+        });
+        auto pw = PendingFor(path, /*create=*/true);
+        PendingWrite p;
+        p.meta_fut = CLIO_CFS_CLIENT->AsyncAdvanceSize(handle, off + count);
+        p.off = off;
+        p.size = count;
+        p.deferred = true;
+        p.tag = rec.tag_id_;
+        {
+          std::lock_guard<std::mutex> g(pw->mu);
+          pw->q.push_back(std::move(p));
+          pw->bytes += count;
+        }
+        ReapAndBound(pw.get());
+        return static_cast<ssize_t>(count);
+      }
+      // A mid-buffer Defer failure (staging exhausted with nothing left to
+      // await) falls through to the WriteTask path, whose full-range write
+      // makes the partial pages moot (same bytes, rewritten).
+    }
+  }
+
   auto *ipc = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm = AllocateStaging(path, count);
   if (shm.IsNull()) {

@@ -1567,6 +1567,43 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::AdvanceSize(
+    clio::run::shared_ptr<AdvanceSizeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Metadata half of the client-side deferred write path (issue #872): the
+  // page payloads travel via AsyncPutBlobDefer directly from the client, so
+  // this performs only what Runtime::Write's tail did — grow the logical size
+  // and republish the SHM mirror. max() semantics (CAS loop) so out-of-order
+  // arrival of two advances can never shrink; Truncate owns shrinking.
+  //
+  // Ordering caveat (documented in cfs_io.cc): this task does not know when
+  // the client's deferred puts complete, so a cross-process reader can
+  // transiently observe the grown size before the page bytes are readable.
+  // In-process readers are covered by the Defer registry's per-blob await.
+  CLIO_FS_LOOKUP(fi, task->handle_);
+  if (!fi) {
+    task->return_code_ = EBADF;
+    CLIO_CO_RETURN;
+  }
+  clio::run::u64 end = task->end_off_;
+  clio::run::u64 old = fi->size_.load();
+  while (end > old && !fi->size_.compare_exchange_weak(old, end)) {
+  }
+  // A write re-establishes natural mtime/ctime, matching Runtime::Write.
+  if (fi->set_atime_ || fi->set_mtime_ || fi->set_ctime_) {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    fi->set_atime_ = 0; fi->set_mtime_ = 0; fi->set_ctime_ = 0;
+  }
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    MirrorFile(fi->path_, *fi);
+  }
+  task->new_size_ = fi->size_.load();
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = StripTrailingSlash(task->path_.str());

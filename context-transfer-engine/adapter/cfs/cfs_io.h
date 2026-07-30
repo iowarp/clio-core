@@ -89,10 +89,19 @@ static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
  * cannot be freed until the runtime has read it.
  */
 struct PendingWrite {
+  // Exactly one of the two futures is set. Legacy entries carry a WriteTask
+  // (data + size advance in one runtime round trip) plus its staging buffer.
+  // Deferred entries (issue #872) moved the payload through the CTE Defer
+  // registry (AsyncPutBlobDefer staged the bytes during write(2)); the entry
+  // holds only the metadata-advance future plus the tag/range needed to await
+  // the payload puts when the window retires it.
   clio::run::Future<clio::cte::filesystem::WriteTask> fut;
-  ctp::ipc::FullPtr<char> buf;
+  clio::run::Future<clio::cte::filesystem::AdvanceSizeTask> meta_fut;
+  ctp::ipc::FullPtr<char> buf;   ///< legacy staging; null for deferred entries
   clio::run::u64 off = 0;
   clio::run::u64 size = 0;
+  bool deferred = false;
+  clio::cte::core::TagId tag;    ///< deferred: file tag for per-page await
 };
 
 /**
@@ -262,6 +271,15 @@ class CfsIo {
   /** Whether write(2) may return before the runtime has the bytes. ON by
    *  default -- see the definition for the measurement that decided it. */
   static bool AsyncWritesEnabled();
+  /** issue #872: route write payloads through AsyncPutBlobDefer (client-side
+   *  page loop, no WriteTask on the data path). CLIO_CFS_DEFER=0 disables. */
+  static bool DeferWritesEnabled();
+  /** Await the Defer-registry puts covering [off, off+size) of `tag`. */
+  static void AwaitDeferPages(const clio::cte::core::TagId &tag,
+                              clio::run::u64 off, clio::run::u64 size);
+  /** Wait out one window entry (either kind), latching failures on `pw`.
+   *  Caller holds pw->mu. */
+  static void RetireEntry(PathWrites *pw, PendingWrite &p);
 
   /** Window bounds, read once from the environment. */
   static clio::run::u64 MaxInflightBytes();
