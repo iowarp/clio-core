@@ -420,10 +420,15 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
   REQUIRE(feat_cmp == 0);
 
   // ---- compressed-path forward ----
+  // Warmup again: a long CPU-bound level-19 store idles the GPU, which then
+  // downclocks (DVFS); the first post-store launch pays the ramp-up. Discard
+  // one pass so the timed compressed forward reflects the same steady state as
+  // the baseline (the computation is provably identical — see the bit-exact
+  // check below).
+  { std::vector<float> warm; forward(warm); }
   std::vector<float> logits_comp;
   double fwd_comp_ms = forward(logits_comp) * 1e3;
-  std::fprintf(stderr, "[GNN] compressed forward done (%.2f ms); per-component...\n",
-               fwd_comp_ms);
+  std::fprintf(stderr, "[GNN] compressed forward done (%.2f ms)\n", fwd_comp_ms);
 
   // ---- lossless proof #2: logits bit-identical ----
   REQUIRE(logits_comp.size() == logits_base.size());
@@ -469,20 +474,32 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
   };
   auto comp_t0 = NowSec();
   (void)comp_t0;
-  std::fprintf(stderr, "[GNN] storing per-component blobs (paged)...\n");
   std::int64_t indptr_bytes = (N + 1) * (std::int64_t)sizeof(std::int64_t);
   std::int64_t indices_bytes = csrE * (std::int64_t)sizeof(std::int64_t);
-  std::int64_t s_indptr = store_one("comp_indptr", h_indptr, indptr_bytes);
-  std::fprintf(stderr, "[GNN]   indptr stored (%.2fs elapsed)\n", NowSec() - comp_t0);
-  std::int64_t s_indices = store_one("comp_indices", h_indices, indices_bytes);
-  std::fprintf(stderr, "[GNN]   indices stored (%.2fs elapsed)\n", NowSec() - comp_t0);
+  std::int64_t s_indptr = -1, s_indices = -1, s_labels = -1, label_sz = 0;
   std::vector<char> label_bytes;
-  std::int64_t s_labels = -1, label_sz = 0;
-  if (ReadFile(data_dir + "/labels.i64", label_bytes)) {
-    label_sz = (std::int64_t)label_bytes.size();
-    s_labels = store_one("comp_labels", label_bytes.data(), label_sz);
+  // The per-component breakdown is opt-out (CLIO_GNN_COMPONENTS=0) because zstd
+  // BEST (level 19) optimal-parse is a pathological worst case on the sorted
+  // int64 CSR indices: even in 256 KiB chunks the ~18 MiB indices array takes
+  // several minutes, while the (float) feature matrix — the headline — stores
+  // fine. So for the BEST sweep we measure the feature ratio and skip components.
+  const char *comp_env = std::getenv("CLIO_GNN_COMPONENTS");
+  bool do_components = !comp_env || comp_env[0] != '0';
+  if (do_components) {
+    std::fprintf(stderr, "[GNN] storing per-component blobs (paged)...\n");
+    s_indptr = store_one("comp_indptr", h_indptr, indptr_bytes);
+    std::fprintf(stderr, "[GNN]   indptr stored (%.2fs elapsed)\n", NowSec() - comp_t0);
+    s_indices = store_one("comp_indices", h_indices, indices_bytes);
+    std::fprintf(stderr, "[GNN]   indices stored (%.2fs elapsed)\n", NowSec() - comp_t0);
+    if (ReadFile(data_dir + "/labels.i64", label_bytes)) {
+      label_sz = (std::int64_t)label_bytes.size();
+      s_labels = store_one("comp_labels", label_bytes.data(), label_sz);
+    }
+    std::fprintf(stderr, "[GNN]   labels stored (%.2fs elapsed)\n", NowSec() - comp_t0);
+  } else {
+    std::fprintf(stderr, "[GNN] per-component breakdown skipped "
+                         "(CLIO_GNN_COMPONENTS=0)\n");
   }
-  std::fprintf(stderr, "[GNN]   labels stored (%.2fs elapsed)\n", NowSec() - comp_t0);
 
   auto rr = [](std::int64_t logical, std::int64_t stored) {
     return stored > 0 ? (double)logical / (double)stored : 0.0;
@@ -495,24 +512,28 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
       "\n================= GNN LOSSLESS-ZSTD RESULTS =================\n"
       "  dataset      : ogbn-arxiv  N=%lld F=%d E=%lld C=%d\n"
       "  codec        : %s  preset=%s  (LOSSLESS)\n"
-      "  features     : logical=%.2f MiB  stored=%.2f MiB  ratio=%.3fx\n"
-      "    per-component (single-blob):\n"
-      "      features : %.2f MiB -> %.2f MiB  (%.3fx)\n"
-      "      indptr   : %.2f MiB -> %.2f MiB  (%.3fx)\n"
-      "      indices  : %.2f MiB -> %.2f MiB  (%.3fx)\n"
-      "      labels   : %.2f MiB -> %.2f MiB  (%.3fx)\n"
+      "  features     : logical=%.2f MiB  stored=%.2f MiB  ratio=%.3fx\n",
+      (long long)N, F, (long long)E, (long long)C,
+      lib_env ? lib_env : "(pin-unset)", preset_env ? preset_env : "balanced",
+      logical_bytes / 1048576.0, stored_bytes / 1048576.0, ratio);
+  if (do_components) {
+    std::fprintf(stderr,
+        "    per-component lossless ratio (paged):\n"
+        "      indptr   : %.2f MiB -> %.2f MiB  (%.3fx)\n"
+        "      indices  : %.2f MiB -> %.2f MiB  (%.3fx)\n"
+        "      labels   : %.2f MiB -> %.2f MiB  (%.3fx)\n",
+        indptr_bytes / 1048576.0, s_indptr / 1048576.0, rr(indptr_bytes, s_indptr),
+        indices_bytes / 1048576.0, s_indices / 1048576.0, rr(indices_bytes, s_indices),
+        label_sz / 1048576.0, s_labels / 1048576.0, rr(label_sz, s_labels));
+  } else {
+    std::fprintf(stderr, "    per-component : skipped (CLIO_GNN_COMPONENTS=0)\n");
+  }
+  std::fprintf(stderr,
       "  throughput   : compress=%.1f MB/s (%.3fs)  decompress=%.1f MB/s (%.3fs)\n"
       "  forward (ms) : baseline=%.2f  compressed=%.2f\n"
       "  bit-exact    : feature memcmp=%d  logit memcmp=%d  max_abs_diff=%.1f\n"
       "  RESULT       : %s\n"
       "============================================================\n",
-      (long long)N, F, (long long)E, (long long)C,
-      lib_env ? lib_env : "(pin-unset)", preset_env ? preset_env : "balanced",
-      logical_bytes / 1048576.0, stored_bytes / 1048576.0, ratio,
-      logical_bytes / 1048576.0, stored_bytes / 1048576.0, ratio,
-      indptr_bytes / 1048576.0, s_indptr / 1048576.0, rr(indptr_bytes, s_indptr),
-      indices_bytes / 1048576.0, s_indices / 1048576.0, rr(indices_bytes, s_indices),
-      label_sz / 1048576.0, s_labels / 1048576.0, rr(label_sz, s_labels),
       comp_mbs, store_dt, decomp_mbs, read_dt,
       fwd_base_ms, fwd_comp_ms,
       feat_cmp, logit_cmp, max_abs,

@@ -44,33 +44,41 @@ kernels produce byte-identical logits. This is the headline result.
 
 ## Step 2: ratio / throughput sweep (zstd fast=lvl1, balanced=lvl3, best=lvl19)
 
-Overall feature-matrix compression (82.69 MiB logical) and per-component single-blob
-lossless ratios:
+Feature-matrix (82.69 MiB logical, 331×256 KiB pages) lossless compression, all
+bit-exact PASS (real observed output, `gnn_runs/arxiv_{fast,balanced,best}.log`):
 
-| preset  | feature ratio | stored MiB | compress MB/s | decompress MB/s | forward ms (base / comp) | bit-exact |
-|---------|--------------:|-----------:|--------------:|----------------:|-------------------------:|:---------:|
-| fast    | 1.078×        | 76.72      | 326.3         | 548.8           | 35.95 / 37.17            | PASS      |
-| balanced| 1.078×        | 76.73      | 335.2         | 533.8           | 36.66 / 36.08            | PASS      |
-| best    | _pending_     | _pending_  | _pending_     | _pending_       | _pending_                | _pending_ |
+| preset (zstd lvl) | feature ratio | stored MiB | compress MB/s | decompress MB/s | forward ms (base / comp) | bit-exact |
+|-------------------|--------------:|-----------:|--------------:|----------------:|-------------------------:|:---------:|
+| fast (lvl 1)      | 1.078×        | 76.72      | 310.9         | 628.2           | 37.2 / 37.7              | PASS      |
+| balanced (lvl 3)  | 1.078×        | 76.73      | 397.1         | 614.1           | 37.1 / 37.8              | PASS      |
+| best (lvl 19)     | 1.088×        | 75.99      | 14.1          | 451.5           | 35.5 / 39.3              | PASS      |
 
-Per-component lossless ratio (single blob through the same zstd path):
+Per-component lossless ratio (each component paged through the same zstd path):
 
 | component | logical | fast | balanced |
 |-----------|--------:|-----:|---------:|
 | features (dense float32) | 82.69 MiB | 1.078× | 1.078× |
-| CSR indptr (int64)       | 1.29 MiB  | 7.13× | 7.09×  |
-| CSR indices (int64)      | 17.67 MiB | 3.22× | 2.99×  |
-| labels (int64)           | 1.29 MiB  | 10.07×| 13.78× |
+| CSR indptr (int64)       | 1.29 MiB  | 7.12× | 7.10×  |
+| CSR indices (int64)      | 17.67 MiB | 3.19× | 3.08×  |
+| labels (int64)           | 1.29 MiB  | 10.06×| 13.73× |
 
-**Honest reading:** dense float32 embeddings barely compress (~1.08× lossless) — the
-byte entropy of learned features is high; this is the number to quote for feature
-matrices. The integer CSR structure compresses far better (indptr ~7×, indices ~3×,
-labels ~10–14×). So the lossless win on a GNN is concentrated in the *graph* arrays,
-not the feature matrix. The value proposition of the feature store is therefore the
-**bit-exact correctness guarantee + capacity/streaming**, not a large feature ratio.
-
-Note: the forward-ms baseline vs compressed are equal within noise (both run the same
-kernels; a warmup pass removes the one-time PTX-JIT cost so neither number is inflated).
+**Honest reading:**
+- Dense float32 embeddings barely compress losslessly: ~1.078× at fast/balanced,
+  1.088× at best. Learned-feature byte entropy is high; this is the honest number to
+  quote for GNN feature matrices. Level 19 buys ~1% more ratio for ~25× slower
+  compress (14 MB/s vs ~400 MB/s) — not worth it for features.
+- The integer CSR *structure* compresses far better (indptr ~7×, indices ~3×,
+  labels ~10–14×), so the lossless win on a GNN is concentrated in the graph arrays,
+  not the feature matrix. The feature store's value is the **bit-exact guarantee +
+  capacity/streaming**, not a large feature ratio.
+- Forward ms baseline vs compressed are equal within noise (~37 ms) — identical
+  deterministic kernels; a warmup pass before each timed forward removes the
+  one-time PTX-JIT and post-store GPU-DVFS ramp so neither number is inflated.
+- **zstd BEST gotcha:** level-19 optimal-parse is a pathological worst case on the
+  sorted int64 CSR indices — a single ~18 MiB blob takes >800 s; even 256 KiB chunks
+  take minutes. So the per-component breakdown is opt-out (`CLIO_GNN_COMPONENTS=0`)
+  and the BEST sweep reports the (float) feature ratio only. Float feature pages are
+  not affected (best store = 5.9 s for 82 MiB).
 
 ## Step 3 (Option B, stretch): Vector<T> + zstd streaming — _pending_
 
