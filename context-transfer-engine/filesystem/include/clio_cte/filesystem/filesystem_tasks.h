@@ -625,6 +625,34 @@ struct StatSizeTask : public clio::run::Task {
   }
 };
 
+/**
+ * AdvanceSize: metadata-only logical-size grow (issue #872). The client-side
+ * deferred write path (AsyncPutBlobDefer) moves page payloads without a
+ * WriteTask, so this carries ONLY the size advance the Write handler used to
+ * perform: size_ = max(size_, end_off_), then republish the SHM mirror.
+ * Never shrinks (concurrent larger writes win); Truncate owns shrinking.
+ */
+struct AdvanceSizeTask : public clio::run::Task {
+  IN clio::run::u64 handle_;
+  IN clio::run::u64 end_off_;
+  OUT clio::run::u64 new_size_;
+  AdvanceSizeTask() : clio::run::Task(), handle_(0), end_off_(0), new_size_(0) {}
+  explicit AdvanceSizeTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u64 handle, clio::run::u64 end_off)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
+        handle_(handle), end_off_(end_off), new_size_(0) {}
+  void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask>& o) {
+    handle_ = o->handle_; end_off_ = o->end_off_; new_size_ = o->new_size_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(handle_, end_off_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(new_size_);
+  }
+};
+
 // ===========================================================================
 // Deferred-append pipeline
 //

@@ -142,6 +142,17 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /** Metadata-only logical-size grow — the companion of the client-side
+   *  deferred write path (issue #872). */
+  clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(clio::run::u64 handle,
+                                                      clio::run::u64 end_off) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AdvanceSizeTask>(
+        clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local(), handle,
+        end_off);
+    return ipc->Send(task);
+  }
+
   clio::run::Future<GetattrTask> AsyncGetattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetattrTask>(clio::run::CreateTaskId(), pool_id_,

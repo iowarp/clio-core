@@ -56,6 +56,7 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Removexattr(clio::run::shared_ptr<RemovexattrTask> &task);
   clio::run::TaskResume Utimens(clio::run::shared_ptr<UtimensTask> &task);
   clio::run::TaskResume Chown(clio::run::shared_ptr<ChownTask> &task);
+  clio::run::TaskResume AdvanceSize(clio::run::shared_ptr<AdvanceSizeTask> &task);
   clio::run::TaskResume Readdir(clio::run::shared_ptr<ReaddirTask> &task);
   clio::run::TaskResume StatSize(clio::run::shared_ptr<StatSizeTask> &task);
   // ---- deferred-append pipeline ----
