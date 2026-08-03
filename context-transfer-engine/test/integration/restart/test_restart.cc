@@ -35,32 +35,98 @@
  * Restart Integration Test
  *
  * Two-mode test program controlled by argv[1]:
- *   --put-blobs    Phase 1: create tag, put 10 blobs, flush metadata+data
- *   --verify-blobs Phase 2: call RestartContainers, verify pool recreation
- *                           and attempt blob recovery (informational)
+ *   --put-blobs    Phase 1: create tag, put searchable blobs, flush
+ *                  metadata+data, and verify keyword search
+ *   --verify-blobs Phase 2: call RestartContainers, require blob recovery,
+ *                  and verify the rebuilt keyword index returns the same
+ *                  ranked results
  *
  * Designed to be orchestrated by test_restart.sh which starts/stops
  * the runtime between phases.
  */
 
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_tasks.h>
+#include <clio_ctp/util/logging.h>
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/clio_runtime.h>
+
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
-
-#include <clio_ctp/util/logging.h>
-#include <clio_runtime/clio_runtime.h>
-#include <clio_runtime/admin/admin_client.h>
-#include <clio_cte/core/core_client.h>
-#include <clio_cte/core/core_tasks.h>
+#include <vector>
 
 static constexpr int kNumBlobs = 10;
 static constexpr clio::run::u64 kBlobSize = 4096;
 static const char* kTagName = "restart_test_tag";
+static const char* kSearchTerm = "restartsearchtoken";
 
 /**
- * Phase 1: Put blobs and flush
+ * Fill a fixed-size blob with a controlled keyword frequency.
+ *
+ * All blobs have the same token count, while later blob numbers contain more
+ * copies of the search term. BM25 must therefore rank higher-numbered blobs
+ * first, giving the restart test a deterministic expected order.
+ *
+ * @param buffer Destination buffer.
+ * @param blob_number Zero-based blob number controlling keyword frequency.
+ */
+void FillSearchableBlob(char* buffer, int blob_number) {
+  std::string payload;
+  for (int i = 0; i <= blob_number; ++i) {
+    payload += std::string(kSearchTerm) + " ";
+  }
+  for (int i = blob_number + 1; i < kNumBlobs; ++i) {
+    payload += "backgroundword ";
+  }
+  memset(buffer, ' ', kBlobSize);
+  memcpy(buffer, payload.data(), payload.size());
+}
+
+/**
+ * Require the deterministic keyword-search result produced by PutBlobs.
+ *
+ * @param cte_client Client connected to the CTE pool.
+ * @param phase Human-readable phase name used in diagnostics.
+ * @return Zero when all blobs are returned in expected BM25 order.
+ */
+int VerifyKeywordSearch(clio::cte::core::Client& cte_client,
+                        const char* phase) {
+  auto search_task = cte_client.AsyncSemanticSearch(
+      kTagName, "restart_blob_.*", kSearchTerm, kNumBlobs,
+      clio::run::PoolQuery::Broadcast());
+  search_task.Wait();
+  if (search_task->GetReturnCode() != 0) {
+    HLOG(kError, "{}: SemanticSearch failed, rc={}", phase,
+         search_task->GetReturnCode());
+    return 1;
+  }
+  if (search_task->results_.size() != kNumBlobs) {
+    HLOG(kError, "{}: SemanticSearch returned {} results, expected {}", phase,
+         search_task->results_.size(), kNumBlobs);
+    return 1;
+  }
+  for (int i = 0; i < kNumBlobs; ++i) {
+    const std::string expected_name =
+        "restart_blob_" + std::to_string(kNumBlobs - i - 1);
+    if (search_task->results_[i].blob_name_ != expected_name) {
+      HLOG(kError, "{}: SemanticSearch result {} was '{}', expected '{}'",
+           phase, i, search_task->results_[i].blob_name_, expected_name);
+      return 1;
+    }
+  }
+  HLOG(kInfo, "{}: SemanticSearch returned all {} blobs in expected order",
+       phase, kNumBlobs);
+  return 0;
+}
+
+/**
+ * Store searchable blobs, verify the live index, and flush durable state.
+ *
+ * @return Zero on success.
  */
 int PutBlobs() {
   // Connect to external runtime as client
@@ -78,7 +144,7 @@ int PutBlobs() {
   clio::cte::core::TagId tag_id = tag_task->tag_id_;
   HLOG(kInfo, "Phase 1: Created tag '{}'", kTagName);
 
-  // Put kNumBlobs blobs with distinct data patterns
+  // Put blobs with deterministic, distinct BM25 term frequencies.
   for (int i = 0; i < kNumBlobs; ++i) {
     std::string blob_name = "restart_blob_" + std::to_string(i);
 
@@ -89,44 +155,52 @@ int PutBlobs() {
       return 1;
     }
 
-    // Fill with pattern: each blob gets a different base character
-    char pattern = static_cast<char>('A' + i);
-    memset(buf.ptr_, pattern, kBlobSize);
+    FillSearchableBlob(buf.ptr_, i);
 
     // Convert to ShmPtr for API
     ctp::ipc::ShmPtr<> shm_ptr = buf.shm_.template Cast<void>();
 
     // Put blob
-    auto put_task = cte_client.AsyncPutBlob(
-        tag_id, blob_name, 0, kBlobSize, shm_ptr);
+    auto put_task =
+        cte_client.AsyncPutBlob(tag_id, blob_name, 0, kBlobSize, shm_ptr);
     put_task.Wait();
 
     if (put_task->GetReturnCode() != 0) {
       HLOG(kError, "Phase 1: PutBlob failed for blob {} rc={}", i,
            put_task->GetReturnCode());
+      CLIO_IPC->FreeBuffer(buf);
       return 1;
     }
-    HLOG(kInfo, "Phase 1: Put blob '{}' pattern='{}'", blob_name, pattern);
+    CLIO_IPC->FreeBuffer(buf);
+    HLOG(kInfo, "Phase 1: Put searchable blob '{}'", blob_name);
   }
 
   // Flush metadata (one-shot)
   HLOG(kInfo, "Phase 1: Flushing metadata...");
-  auto flush_meta = cte_client.AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+  auto flush_meta =
+      cte_client.AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
   flush_meta.Wait();
   HLOG(kInfo, "Phase 1: Metadata flush complete");
 
-  // Flush data (one-shot, persistence level 0 for RAM target)
+  // Flush data to the long-term file target.
   HLOG(kInfo, "Phase 1: Flushing data...");
-  auto flush_data = cte_client.AsyncFlushData(clio::run::PoolQuery::Local(), 0, 0);
+  auto flush_data =
+      cte_client.AsyncFlushData(clio::run::PoolQuery::Local(), 2, 0);
   flush_data.Wait();
   HLOG(kInfo, "Phase 1: Data flush complete");
+
+  if (VerifyKeywordSearch(cte_client, "Phase 1") != 0) {
+    return 1;
+  }
 
   HLOG(kSuccess, "Phase 1: SUCCESS - {} blobs stored and flushed", kNumBlobs);
   return 0;
 }
 
 /**
- * Phase 2: RestartContainers then verify pool recreation
+ * Restart containers and require both blob and keyword-index recovery.
+ *
+ * @return Zero on success.
  */
 int VerifyBlobs() {
   // Connect to external runtime as client
@@ -138,22 +212,32 @@ int VerifyBlobs() {
   // Call RestartContainers via admin client
   HLOG(kInfo, "Phase 2: Calling RestartContainers...");
   clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
-  auto restart_task = admin_client.AsyncRestartContainers(clio::run::PoolQuery::Local());
+  const auto restart_begin = std::chrono::steady_clock::now();
+  auto restart_task =
+      admin_client.AsyncRestartContainers(clio::run::PoolQuery::Local());
   restart_task.Wait();
+  const double restart_rebuild_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - restart_begin)
+          .count();
+  HLOG(kInfo, "[RESTART_TEST] restart_rebuild_ms={}", restart_rebuild_ms);
 
   clio::run::u32 rc = restart_task->GetReturnCode();
   clio::run::u32 restarted = restart_task->containers_restarted_;
-  HLOG(kInfo, "Phase 2: RestartContainers complete, rc={}, containers_restarted={}",
+  HLOG(kInfo,
+       "Phase 2: RestartContainers complete, rc={}, containers_restarted={}",
        rc, restarted);
 
   // Verify RestartContainers succeeded
   if (rc != 0) {
-    HLOG(kError, "Phase 2: FAILED - RestartContainers returned error rc={}", rc);
+    HLOG(kError, "Phase 2: FAILED - RestartContainers returned error rc={}",
+         rc);
     return 1;
   }
   if (restarted == 0) {
-    HLOG(kError, "Phase 2: FAILED - No containers were restarted "
-                  "(restart config missing or unreadable)");
+    HLOG(kError,
+         "Phase 2: FAILED - No containers were restarted "
+         "(restart config missing or unreadable)");
     return 1;
   }
 
@@ -164,7 +248,8 @@ int VerifyBlobs() {
   auto tag_task = cte_client.AsyncGetOrCreateTag(kTagName);
   tag_task.Wait();
   if (tag_task->GetReturnCode() != 0) {
-    HLOG(kError, "Phase 2: FAILED - Could not create tag on restarted pool, rc={}",
+    HLOG(kError,
+         "Phase 2: FAILED - Could not create tag on restarted pool, rc={}",
          tag_task->GetReturnCode());
     return 1;
   }
@@ -172,59 +257,56 @@ int VerifyBlobs() {
   HLOG(kInfo, "Phase 2: Tag '{}' accessible on restarted pool", kTagName);
 
   // Verify targets were re-registered by listing them
-  auto targets_task = cte_client.AsyncListTargets(clio::run::PoolQuery::Local());
+  auto targets_task =
+      cte_client.AsyncListTargets(clio::run::PoolQuery::Local());
   targets_task.Wait();
   HLOG(kInfo, "Phase 2: ListTargets rc={}", targets_task->GetReturnCode());
 
-  // Attempt blob recovery (informational - data persistence is WIP)
+  // Blob bytes are authoritative for rebuilding the in-memory keyword index.
   int recovered = 0;
-  int failed = 0;
   for (int i = 0; i < kNumBlobs; ++i) {
     std::string blob_name = "restart_blob_" + std::to_string(i);
-    char expected_pattern = static_cast<char>('A' + i);
 
     ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer(kBlobSize);
     if (buf.IsNull()) {
-      ++failed;
-      continue;
+      HLOG(kError, "Phase 2: Failed to allocate buffer for '{}'", blob_name);
+      return 1;
     }
     memset(buf.ptr_, 0, kBlobSize);
     ctp::ipc::ShmPtr<> shm_ptr = buf.shm_.template Cast<void>();
 
-    auto get_task = cte_client.AsyncGetBlob(
-        tag_id, blob_name, 0, kBlobSize, 0, shm_ptr);
+    auto get_task =
+        cte_client.AsyncGetBlob(tag_id, blob_name, 0, kBlobSize, 0, shm_ptr);
     get_task.Wait();
 
     if (get_task->GetReturnCode() != 0) {
-      ++failed;
-      continue;
+      HLOG(kError, "Phase 2: Failed to recover '{}', rc={}", blob_name,
+           get_task->GetReturnCode());
+      CLIO_IPC->FreeBuffer(buf);
+      return 1;
     }
 
-    // Verify data pattern
-    bool data_ok = true;
-    for (clio::run::u64 j = 0; j < kBlobSize; ++j) {
-      if (buf.ptr_[j] != expected_pattern) {
-        data_ok = false;
-        break;
-      }
+    std::vector<char> expected(kBlobSize);
+    FillSearchableBlob(expected.data(), i);
+    if (memcmp(buf.ptr_, expected.data(), kBlobSize) != 0) {
+      HLOG(kError, "Phase 2: Recovered bytes differ for '{}'", blob_name);
+      CLIO_IPC->FreeBuffer(buf);
+      return 1;
     }
-
-    if (data_ok) {
-      ++recovered;
-      HLOG(kInfo, "Phase 2: Blob '{}' data recovered OK", blob_name);
-    } else {
-      ++failed;
-    }
+    CLIO_IPC->FreeBuffer(buf);
+    ++recovered;
   }
 
-  HLOG(kInfo, "Phase 2: Blob recovery: {}/{} recovered, {}/{} pending implementation",
-       recovered, kNumBlobs, failed, kNumBlobs);
+  HLOG(kInfo, "Phase 2: Blob recovery: {}/{} recovered", recovered, kNumBlobs);
 
-  // The test passes if RestartContainers worked and the pool is functional.
-  // Full blob data recovery requires completing FlushData and metadata
-  // recovery implementation.
-  HLOG(kSuccess, "Phase 2: SUCCESS - Pool restart verified ({} containers restarted)",
-       restarted);
+  if (VerifyKeywordSearch(cte_client, "Phase 2") != 0) {
+    return 1;
+  }
+
+  HLOG(kSuccess,
+       "Phase 2: SUCCESS - {} blobs and keyword index recovered after "
+       "restarting {} container(s)",
+       recovered, restarted);
   return 0;
 }
 

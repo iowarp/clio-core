@@ -32,14 +32,14 @@ cleanup() {
     sleep 1
     rm -f /dev/shm/clio_*
     rm -rf "$CONF_DIR"
-    rm -rf /tmp/cte_restart_ram
+    rm -rf /tmp/cte_restart_data
 }
 trap cleanup EXIT
 
 # Clean slate
 rm -f /dev/shm/clio_*
 rm -rf "$CONF_DIR"
-rm -rf /tmp/cte_restart_ram
+rm -rf /tmp/cte_restart_data
 
 # === Phase 1: Start runtime, compose, put blobs, flush ===
 echo ""

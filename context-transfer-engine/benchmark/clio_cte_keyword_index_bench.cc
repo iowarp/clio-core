@@ -57,6 +57,9 @@ struct Args {
   std::size_t blobs_ = 1000;
   std::size_t matches_ = 10;
   std::size_t query_iters_ = 20;
+  std::size_t payload_bytes_ = 128;
+  std::size_t vocabulary_ = 100;
+  std::size_t max_rss_mib_ = 0;
   bool valid_ = true;
 };
 
@@ -102,14 +105,24 @@ Args ParseArgs(int argc, char **argv) {
       args.matches_ = ParseSize(value, "--matches", args.valid_);
     } else if (flag == "--query-iters") {
       args.query_iters_ = ParseSize(value, "--query-iters", args.valid_);
+    } else if (flag == "--payload-bytes") {
+      args.payload_bytes_ =
+          ParseSize(value, "--payload-bytes", args.valid_);
+    } else if (flag == "--vocabulary") {
+      args.vocabulary_ = ParseSize(value, "--vocabulary", args.valid_);
+    } else if (flag == "--max-rss-mib") {
+      args.max_rss_mib_ = ParseSize(value, "--max-rss-mib", args.valid_);
     } else {
       std::cerr << "Unknown flag: " << flag << '\n';
       args.valid_ = false;
     }
   }
+  constexpr std::size_t kTargetKeywordBytes = 13;
   if (args.blobs_ == 0 || args.query_iters_ == 0 ||
+      args.payload_bytes_ < kTargetKeywordBytes || args.vocabulary_ == 0 ||
       args.matches_ > args.blobs_) {
-    std::cerr << "Require blobs > 0, query-iters > 0, and matches <= blobs\n";
+    std::cerr << "Require blobs, query-iters, and vocabulary > 0, "
+                 "payload-bytes >= 13, and matches <= blobs\n";
     args.valid_ = false;
   }
   return args;
@@ -163,18 +176,40 @@ double ToMilliseconds(Clock::duration duration) {
 }
 
 /**
- * Build a deterministic payload with one unique term and an optional target.
+ * Build a deterministic fixed-size payload and an optional target term.
  *
  * @param index Blob sequence number.
  * @param matches Whether this blob should match the target keyword.
+ * @param payload_bytes Desired payload size in bytes.
+ * @param vocabulary Number of distinct non-target terms.
  * @return Blob text to index.
  */
-std::string MakePayload(std::size_t index, bool matches) {
-  std::string payload = "document" + std::to_string(index);
+std::string MakePayload(std::size_t index, bool matches,
+                        std::size_t payload_bytes, std::size_t vocabulary) {
+  const std::string filler = " term" + std::to_string(index % vocabulary);
+  std::string payload;
+  payload.reserve(payload_bytes);
   if (matches) {
-    payload += " targetkeyword";
+    payload = "targetkeyword";
+  }
+  while (payload.size() < payload_bytes) {
+    payload.append(filler, 0,
+                   std::min(filler.size(), payload_bytes - payload.size()));
   }
   return payload;
+}
+
+/**
+ * Determine whether the configured resident-memory ceiling was exceeded.
+ *
+ * @param args Benchmark configuration.
+ * @param resident_bytes Current process resident memory in bytes.
+ * @return True when a nonzero ceiling was exceeded.
+ */
+bool ExceedsMemoryLimit(const Args &args, std::size_t resident_bytes) {
+  constexpr std::size_t kBytesPerMebibyte = 1024 * 1024;
+  return args.max_rss_mib_ > 0 &&
+         resident_bytes > args.max_rss_mib_ * kBytesPerMebibyte;
 }
 
 }  // namespace
@@ -195,10 +230,20 @@ int main(int argc, char **argv) {
   const std::size_t rss_before = CurrentResidentBytes();
   clio::cte::core::KeywordIndex index;
   const auto build_start = Clock::now();
-  for (std::size_t blob = 0; blob < args.blobs_; ++blob) {
-    const std::string payload = MakePayload(blob, blob < args.matches_);
-    index.Update(1, 0, "blob_" + std::to_string(blob), payload.data(),
+  std::size_t indexed_blobs = 0;
+  bool memory_limit_hit = false;
+  for (; indexed_blobs < args.blobs_; ++indexed_blobs) {
+    const std::string payload =
+        MakePayload(indexed_blobs, indexed_blobs < args.matches_,
+                    args.payload_bytes_, args.vocabulary_);
+    index.Update(1, 0, "blob_" + std::to_string(indexed_blobs), payload.data(),
                  payload.size());
+    if ((indexed_blobs + 1) % 10000 == 0 &&
+        ExceedsMemoryLimit(args, CurrentResidentBytes())) {
+      memory_limit_hit = true;
+      ++indexed_blobs;
+      break;
+    }
   }
   const double build_ms = ToMilliseconds(Clock::now() - build_start);
   const std::size_t rss_after = CurrentResidentBytes();
@@ -221,13 +266,23 @@ int main(int argc, char **argv) {
   const std::size_t rss_delta =
       rss_after >= rss_before ? rss_after - rss_before : 0;
   std::cout << "[KEYWORD_INDEX_BENCH]"
-            << " blobs=" << args.blobs_ << " matches=" << args.matches_
+            << " requested_blobs=" << args.blobs_
+            << " indexed_blobs=" << indexed_blobs
+            << " matches=" << args.matches_
             << " candidates=" << candidates << " build_ms=" << build_ms
             << " query_avg_ms=" << query_total_ms / args.query_iters_
             << " query_min_ms=" << query_min_ms
             << " query_max_ms=" << query_max_ms
             << " rss_before_mib=" << ToMebibytes(rss_before)
             << " rss_after_mib=" << ToMebibytes(rss_after)
-            << " rss_delta_mib=" << ToMebibytes(rss_delta) << '\n';
-  return candidates == args.matches_ ? 0 : 2;
+            << " rss_delta_mib=" << ToMebibytes(rss_delta)
+            << " payload_bytes=" << args.payload_bytes_
+            << " vocabulary=" << args.vocabulary_
+            << " memory_limit_hit=" << memory_limit_hit << '\n';
+  const std::size_t expected_matches =
+      std::min(args.matches_, indexed_blobs);
+  if (memory_limit_hit) {
+    return 3;
+  }
+  return candidates == expected_matches ? 0 : 2;
 }

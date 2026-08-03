@@ -11,9 +11,10 @@ compose:
     pool_id: "512.0"
     restart: true
     storage:
-      - path: /tmp/cte_restart_ram
-        bdev_type: ram
+      - path: /tmp/cte_restart_data
+        bdev_type: file
         capacity_limit: 100MB
+        persistence_level: long_term
     performance:
       metadata_log_path: /tmp/clio_run_restart_test/metadata.log
       transaction_log_capacity: 32MB

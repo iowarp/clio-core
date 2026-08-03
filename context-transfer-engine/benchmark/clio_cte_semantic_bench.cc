@@ -53,7 +53,8 @@
  *   --size  BYTES     size of each blob in bytes  (default 4096)
  *   --results K       number of results to return (default 10; 0 = all)
  *   --keyword W       keyword stored in / searched for (default "needle")
- *   --query-iters N   repeat the search N times for a stable latency (default 5)
+ *   --match-every N   put keyword in every Nth blob (default 1)
+ *   --query-iters N   warm searches after the cold search (default 5)
  *
  * Example:
  *   clio_cte_semantic_bench --blobs 5000 --size 8192 --results 20 --query-iters 10
@@ -89,6 +90,7 @@ struct Args {
   long size = 4096;
   unsigned results = 10;
   std::string keyword = "needle";
+  long match_every = 1;
   int query_iters = 5;
   bool ok = true;
 };
@@ -120,23 +122,37 @@ Args ParseArgs(int argc, char **argv) {
     } else if (flag == "--query-iters") {
       const char *v = next("--query-iters");
       if (v) a.query_iters = std::atoi(v);
+    } else if (flag == "--match-every") {
+      const char *v = next("--match-every");
+      if (v) a.match_every = std::atol(v);
     } else {
       HLOG(kError, "Unknown flag: {}", flag);
       a.ok = false;
     }
   }
-  if (a.blobs <= 0 || a.size <= 0) {
-    HLOG(kError, "--blobs and --size must be > 0");
+  if (a.blobs <= 0 || a.size <= 0 || a.match_every <= 0 ||
+      a.keyword.empty() ||
+      static_cast<std::size_t>(a.size) < a.keyword.size()) {
+    HLOG(kError,
+         "--blobs, --size, and --match-every must be > 0; keyword must "
+         "be nonempty and fit in the blob");
     a.ok = false;
   }
   if (a.query_iters <= 0) a.query_iters = 1;
   return a;
 }
 
-/** Fill `buf` (size bytes) with "<keyword> " repeated so the blob tokenizes
- *  into `keyword` terms that BM25 will match. */
-void FillWithKeyword(char *buf, size_t size, const std::string &keyword) {
-  std::string token = keyword + " ";
+/**
+ * Fill a blob with either the query keyword or nonmatching background text.
+ *
+ * @param buf Destination buffer.
+ * @param size Destination size in bytes.
+ * @param keyword Query keyword used for matching blobs.
+ * @param matches Whether the payload should contain the keyword.
+ */
+void FillPayload(char *buf, size_t size, const std::string &keyword,
+                 bool matches) {
+  const std::string token = matches ? keyword + " " : "background ";
   for (size_t off = 0; off < size;) {
     size_t n = std::min(token.size(), size - off);
     std::memcpy(buf + off, token.data(), n);
@@ -182,8 +198,6 @@ int main(int argc, char **argv) {
     HLOG(kError, "AllocateBuffer({}) failed", a.size);
     return 1;
   }
-  FillWithKeyword(reinterpret_cast<char *>(put_shm.ptr_),
-                  static_cast<size_t>(a.size), a.keyword);
   ctp::ipc::ShmPtr<> put_ptr = put_shm.shm_.template Cast<void>();
 
   HLOG(kInfo, "Writing {} blobs x {} bytes under tag '{}' (keyword='{}')...",
@@ -191,6 +205,9 @@ int main(int argc, char **argv) {
   auto put_t0 = steady_clock::now();
   bool put_err = false;
   for (long k = 0; k < a.blobs; ++k) {
+    FillPayload(reinterpret_cast<char *>(put_shm.ptr_),
+                static_cast<size_t>(a.size), a.keyword,
+                k % a.match_every == 0);
     std::string blob_name = "blob_" + std::to_string(k);
     auto t = cte->AsyncPutBlob(tag_id, blob_name.c_str(), 0,
                                static_cast<clio::run::u64>(a.size), put_ptr, 1.0f,
@@ -205,12 +222,25 @@ int main(int argc, char **argv) {
   double put_s = duration<double>(steady_clock::now() - put_t0).count();
   CLIO_IPC->FreeBuffer(put_shm);
   if (put_err) return 1;
-  HLOG(kInfo, "Ingest: {} blobs in {}s ({} blobs/s)", a.blobs, F(put_s, 3),
+  HLOG(kInfo, "Ingest: {} blobs in {} ms ({} blobs/s)", a.blobs,
+       F(put_s * 1000.0, 3),
        F(a.blobs / (put_s > 0 ? put_s : 1), 0));
 
-  // --- 2. Broadcast semantic search, repeated for a stable latency -----
-  HLOG(kInfo, "SemanticSearch keyword='{}' k={} (broadcast), {} iters...",
+  // The first query includes deferred indexing of every dirty PutBlob.
+  HLOG(kInfo, "SemanticSearch keyword='{}' k={} (broadcast), 1 cold + {} warm...",
        a.keyword, a.results, a.query_iters);
+  auto cold_t0 = steady_clock::now();
+  auto cold_search = cte->AsyncSemanticSearch(
+      tag_name, ".*", a.keyword, a.results, clio::run::PoolQuery::Broadcast());
+  cold_search.Wait();
+  const double cold_ms =
+      duration<double, std::milli>(steady_clock::now() - cold_t0).count();
+  if (cold_search->return_code_.load() != 0) {
+    HLOG(kError, "Cold SemanticSearch rc={}",
+         cold_search->return_code_.load());
+    return 1;
+  }
+
   double q_sum = 0.0, q_min = 1e30, q_max = 0.0;
   size_t last_count = 0;
   std::vector<clio::cte::core::SemanticSearchResult> last_results;
@@ -219,7 +249,8 @@ int main(int argc, char **argv) {
     auto search = cte->AsyncSemanticSearch(
         tag_name, ".*", a.keyword, a.results, clio::run::PoolQuery::Broadcast());
     search.Wait();
-    double q_s = duration<double>(steady_clock::now() - q_t0).count();
+    double q_s =
+        duration<double, std::milli>(steady_clock::now() - q_t0).count();
     if (search->return_code_.load() != 0) {
       HLOG(kError, "SemanticSearch rc={}", search->return_code_.load());
       return 1;
@@ -230,9 +261,7 @@ int main(int argc, char **argv) {
     last_count = search->results_.size();
     last_results.assign(search->results_.begin(), search->results_.end());
   }
-  double q_avg_us = (q_sum / a.query_iters) * 1e6;
-  double q_min_us = q_min * 1e6;
-  double q_max_us = q_max * 1e6;
+  double q_avg_ms = q_sum / a.query_iters;
 
   // Show a few top hits from the last query.
   size_t show = std::min<size_t>(last_results.size(), 5);
@@ -246,15 +275,17 @@ int main(int argc, char **argv) {
   // machine-parseable record consumed by jarvis _get_stat.
   HLOG(kInfo,
        "Retrieval: top-{} query over {} blobs -> {} results; "
-       "latency avg={} us, min={} us, max={} us ({} iters)",
-       a.results, a.blobs, last_count, F(q_avg_us, 1), F(q_min_us, 1),
-       F(q_max_us, 1), a.query_iters);
+       "cold={} ms; warm avg={} ms, min={} ms, max={} ms ({} iters)",
+       a.results, a.blobs, last_count, F(cold_ms, 3), F(q_avg_ms, 3),
+       F(q_min, 3), F(q_max, 3), a.query_iters);
   HLOG(kInfo,
-       "[SEM_BENCH] query_avg_us={} query_min_us={} query_max_us={} "
+       "[SEM_BENCH] cold_query_ms={} warm_query_avg_ms={} "
+       "warm_query_min_ms={} warm_query_max_ms={} "
        "results={} k={} blobs={} blob_size={} query_iters={} "
-       "ingest_s={} ingest_blobs_per_s={}",
-       F(q_avg_us, 1), F(q_min_us, 1), F(q_max_us, 1), last_count, a.results,
-       a.blobs, a.size, a.query_iters, F(put_s, 3),
+       "match_every={} ingest_ms={} ingest_blobs_per_s={}",
+       F(cold_ms, 3), F(q_avg_ms, 3), F(q_min, 3), F(q_max, 3), last_count,
+       a.results, a.blobs, a.size, a.query_iters, a.match_every,
+       F(put_s * 1000.0, 3),
        F(a.blobs / (put_s > 0 ? put_s : 1), 0));
   return 0;
 }
