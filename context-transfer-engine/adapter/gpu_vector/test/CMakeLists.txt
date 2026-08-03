@@ -355,6 +355,36 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 
+    # GNN capacity comparison: GraphSAGE aggregation+readout over a feature matrix
+    # larger than HBM -- traditional in-core (OOMs) vs Eternia zstd-compressed +
+    # tiered streaming (bounded window). Build-only (needs data + size env).
+    add_cuda_executable(test_gpu_vector_gnn_capacity FALSE
+        test_gpu_vector_gnn_capacity_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_gnn_capacity PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
     # Distributed compressed GPU vector: compress in HBM on one GPU node, store
     # compressed pages across a multi-node cte_core, read back + decompress.
     # Runs as a client under test/integration/distributed_slurm/run_slurm_gpu.
