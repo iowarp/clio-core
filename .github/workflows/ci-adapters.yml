@@ -215,7 +215,14 @@ jobs:
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
       # to a hard gate once this step is observed green. See #903.
+      # timeout + continue-on-error: the first probe HUNG for 50+ minutes
+      # (fuse daemon stuck in an uninterruptible mount, the script's cleanup
+      # wait blocked behind it) — `|| echo` inside the script only survives
+      # failures, not hangs, so the non-blocking contract needs both a step
+      # bound and continue-on-error to hold.
       - name: FUSE mount smoke (FSKit backend, non-blocking probe)
+        timeout-minutes: 10
+        continue-on-error: true
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
