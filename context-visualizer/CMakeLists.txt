@@ -41,6 +41,11 @@ execute_process(
 if(NOT _VIS_SITE_RC EQUAL 0 OR _VIS_SITE_REL STREQUAL "")
     set(_VIS_SITE_REL "lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
 endif()
+# os.path.relpath uses the host separator, so on Windows this arrives as
+# e.g. "Lib\site-packages". Raw backslashes reach cmake_install.cmake as
+# string escapes and break `cpack` with "Invalid character escape '\p'"
+# (first hit by the Windows ZIP/NSIS package build, #899).
+file(TO_CMAKE_PATH "${_VIS_SITE_REL}" _VIS_SITE_REL)
 
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/context_visualizer/

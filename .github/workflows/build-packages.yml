@@ -477,6 +477,11 @@ jobs:
     - name: Install WinFsp (FUSE adapter SDK)
       run: choco install winfsp -y --no-progress
 
+    # makensis is NOT on the runner image (first run failed with "Cannot
+    # find NSIS compiler makensis"); the choco shim lands on PATH.
+    - name: Install NSIS (installer compiler)
+      run: choco install nsis -y --no-progress
+
     - name: Configure with CMake
       run: |
         # Cache + replication pins: same rationale as build-deb (#899).

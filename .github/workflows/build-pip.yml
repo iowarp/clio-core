@@ -400,6 +400,12 @@ jobs:
             done
 
             echo "=== FUSE adapter entry point (Linux standard feature) ==="
+            # STRICT presence check first: the console script exits 1 with
+            # a friendly error when the binary is absent, which the
+            # signal-level heuristic below would let pass — that masked a
+            # wheel built without the adapter (root-vs-installers/pip
+            # pyproject mixup, #899).
+            python -c "import iowarp_core, glob, os, sys; b = iowarp_core.get_bin_dir(); sys.exit(0 if glob.glob(os.path.join(b, \"clio_cte_fuse*\")) else \"clio_cte_fuse missing from wheel bin dir: \" + b)"
             # The wheel ships clio_cte_fuse but deliberately not
             # libfuse3.so.3 (a system dep, see #899). Install the distro
             # fuse3 runtime like an end user would, then apply the same
