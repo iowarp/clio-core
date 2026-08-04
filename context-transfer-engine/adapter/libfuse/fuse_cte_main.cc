@@ -73,6 +73,22 @@
 // instead of having libfuse mount its own. Plain read/writev syscalls
 // suffice; splice is optional.
 #ifndef __APPLE__
+#if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)
+// Headers older than 3.14 (e.g. the manylinux/AlmaLinux 9 wheel builders'
+// fuse3 3.10, #899) don't declare struct fuse_custom_io. Its layout is
+// ABI-fixed upstream and the consuming function is resolved via dlsym at
+// runtime anyway (see main below), so a local mirror keeps this
+// apptainer-fd path compiling against old headers; it still only
+// activates when a 3.14+ libfuse runtime provides the symbol.
+struct fuse_custom_io {
+  ssize_t (*writev)(int fd, struct iovec *iov, int count, void *userdata);
+  ssize_t (*read)(int fd, void *buf, size_t buf_len, void *userdata);
+  ssize_t (*splice_receive)(int fdin, off_t *offin, int fdout, off_t *offout,
+                            size_t len, unsigned int flags, void *userdata);
+  ssize_t (*splice_send)(int fdin, off_t *offin, int fdout, off_t *offout,
+                         size_t len, unsigned int flags, void *userdata);
+};
+#endif  // FUSE_VERSION < 3.14
 static ssize_t cte_custom_writev(int fd, struct iovec *iov, int count,
                                  void * /*userdata*/) {
   return writev(fd, iov, count);
