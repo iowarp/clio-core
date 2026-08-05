@@ -201,8 +201,12 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetQueueDepth() const { return queue_depth_; }
 
   /**
-   * Calculate main segment size based on queue_depth and num_threads
-   * @return Calculated size in bytes, or explicit size if main_segment_size_ > 0
+   * Size of the main task-data segment (issue #727).
+   * @return The explicit size when main_segment_size_ > 0 (yaml
+   *         `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE), else the
+   *         auto default: the machine's RAM capacity (1 GiB if introspection
+   *         fails). The reservation is sparse; creation-time clamps in
+   *         ipc_manager.cc bound what the segment actually gets. Never 0.
    */
   size_t CalculateMainSegmentSize() const;
 
@@ -397,15 +401,19 @@ class ConfigManager : public ctp::BaseConfig {
    */
   void ParseYAML(YAML::Node& yaml_conf) override;
 
+ public:
   /**
    * Apply environment-variable overrides (CLIO_PORT, CLIO_SERVER_ADDR, etc.).
    * Must run after every (re)load: LoadFromFile resets to defaults via
    * LoadDefault, so a config reload (e.g. parsing a compose file into this
    * manager) would otherwise silently drop the env-configured port — which on
-   * the force-net path retargets every forward at the wrong port.
+   * the force-net path retargets every forward at the wrong port. Public so
+   * external reloaders (and tests) can restore env semantics after a bare
+   * LoadYaml.
    */
   void ApplyEnvOverrides();
 
+ private:
   bool is_initialized_ = false;
   std::string config_file_path_;
 
@@ -423,13 +431,21 @@ class ConfigManager : public ctp::BaseConfig {
   u32 shm_client_spin_us_ = 50;  // issue #807/#784: waiter spin before park
   u32 queue_depth_ = 1024;
 
-  size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);
+  // issue #727: 0 = auto (the machine's RAM capacity — a sparse reservation;
+  // see CalculateMainSegmentSize() and the creation-time clamps in
+  // ipc_manager.cc). Settable via yaml `runtime: main_segment_size` or
+  // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
+  // just matches it.
+  size_t main_segment_size_ = 0;
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
-  // shm_open + ftruncate + mmap is lazily populated, so the 8 GB reservation
-  // costs only the pages actually touched. NOTE: on a host whose /dev/shm is
-  // smaller than the live set, touching past the tmpfs limit raises SIGBUS,
-  // not ENOMEM. See CalculateMetadataSegmentSize().
+  // shm_open + ftruncate + mmap is lazily populated, so the reservation
+  // (default: the machine's RAM capacity, so metadata scales with the host)
+  // costs only the pages actually touched. Creation-time safety clamps live in
+  // ipc_manager.cc (half the cgroup-aware budget on Linux; 1 GB file cap
+  // elsewhere). NOTE: on a host whose /dev/shm is smaller than the live set,
+  // touching past the tmpfs limit raises SIGBUS, not ENOMEM. See
+  // CalculateMetadataSegmentSize().
   // 0 means "auto-calculate" — CalculateMetadataSegmentSize() supplies the
   // default. Initialising this to a non-zero size would make the explicit
   // override branch there permanently true and the documented sentinel a lie;

@@ -14,6 +14,7 @@ cmake_minimum_required(VERSION 3.20)
 #------------------------------------------------------------------------------
 
 add_subdirectory(kvcache)
+add_subdirectory(lmcache)
 
 # weights/ links against 'ggml' (from external/llama.cpp) and uses CUDA separable
 # compilation.  Only add it when llama.cpp is also being built to keep ggml target

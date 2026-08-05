@@ -87,14 +87,6 @@ public:
   ~Runtime() override;
 
   /**
-   * Fix up POD task members (clio::run::priv::string SSO data_ pointers,
-   * etc.) after a GPU2CPU D2H POD memcpy. Dispatched by the GPU pop
-   * path on the worker before Run.
-   */
-  void FixupAfterCopy(clio::run::u32 method,
-                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
-
-  /**
    * Create the container (Method::kCreate)
    * This method both creates and initializes the container
    * Returns TaskResume for coroutine-based async operations
@@ -158,12 +150,78 @@ public:
   template <typename TaskT>
   clio::run::TaskResume ReorganizeBlobImpl(clio::run::shared_ptr<TaskT> &task);
 
+  /**
+   * Write one replica's bytes for a Put task (issue #886). Called from
+   * PutBlobImpl UNDER the blob's write token, for Context::replica_ > 0
+   * (replica-targeted put) and for each replica of a kAllReplicas
+   * write-through. Lends the replica's block layout to the primary
+   * extend/write machinery via a staging BlobInfo (the ReorganizeBlob
+   * pattern), then publishes the layout back and logs a kExtendReplica WAL
+   * record. error_code uses PutBlob's return-code space (10+x alloc,
+   * 20+x write).
+   *
+   * Score resolution: requested_score >= 0 sets the REPLICA's score (the
+   * primary's is untouched); -1 keeps the replica's own score, falling back
+   * to fallback_score for a replica this write creates. The write-through
+   * loop always passes -1 — an explicit put score is for the primary, not a
+   * blanket rescore of every copy. Context::replica_flags_ is OR'd in first,
+   * and REPLICA_PERSISTENT tightens the placement's min persistence level.
+   */
+  template <typename TaskT>
+  clio::run::TaskResume WriteReplicaData(clio::run::shared_ptr<TaskT> &task,
+                                         BlobInfo &blob_info,
+                                         const std::string &blob_name,
+                                         TagId tag_id, int replica_idx,
+                                         clio::run::u64 offset,
+                                         clio::run::u64 size,
+                                         float requested_score,
+                                         float fallback_score,
+                                         clio::run::u32 &error_code);
+
+  /**
+   * Migrate one REPLICA's blocks to the tier its new score selects (issue
+   * #886) — the replica half of ReorganizeBlobInternal, sharing its
+   * read→free→re-place→publish shape and rc space. REPLICA_FIXED makes this
+   * a no-op (rc 0); REPLICA_PERSISTENT keeps the re-place off volatile
+   * tiers. The primary's blocks, score and mirror are untouched.
+   */
+  clio::run::TaskResume ReorganizeReplicaInternal(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  int replica_idx,
+                                                  float new_score,
+                                                  clio::run::u32 &rc);
+
+  /** True when any of the replica's blocks sit on a target the health
+   *  predictor marks failing (the REPLICA_FIXED evacuation override). */
+  bool ReplicaBlocksOnFailingTarget(const Replica &rep);
+
+  /**
+   * Free a REPLICA_CACHE replica's blocks under capacity pressure (issue
+   * #886 cache chimod): write token + reader drain, blocks freed via the
+   * staging/FreeAllBlobBlocks path, empty layout published + WAL'd. The
+   * slot's metadata (flags, min_score) survives so the next cache write
+   * refills it. freed_bytes reports the physical footprint returned.
+   */
+  clio::run::TaskResume ReclaimCacheReplica(const TagId &tag_id,
+                                            const std::string &blob_name,
+                                            clio::run::u64 &freed_bytes,
+                                            clio::run::u32 &rc);
+
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   /** Get blob (Method::kGetBlob) - reads data from existing blob. */
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+  /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
+   *  (Method::kEvict). Broadcast; each shard reports its share. */
+  clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
+  clio::run::TaskResume MultiPutBlob(
+      clio::run::shared_ptr<MultiPutBlobTask> &task);
+  /** Record that a node holds a cached/replicated copy of a blob
+   *  (Method::kRegisterReplicaContainer, issue #886 coherence). */
+  clio::run::TaskResume RegisterReplicaContainer(
+      clio::run::shared_ptr<RegisterReplicaContainerTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue
@@ -287,6 +345,22 @@ public:
    * traffic instead of going to dedicated I/O workers.
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
+
+  /**
+   * Worker-local batching policy (issue #820).
+   *
+   * PutBlob/GetBlob tasks aimed at the SAME blob are parked together and then
+   * collapsed into one vectored task per blob. This is the whole point of the
+   * feature: the filesystem stores each 1 MiB page as one blob, so a sequential
+   * 4 KiB workload sends 256 tasks at one page-blob and every one of them has to
+   * take that blob's #680 write token across its entire body. Merged, they cost
+   * one token acquire and one bdev pass.
+   */
+  bool BuildBatch(clio::run::u32 method,
+                  const clio::run::shared_ptr<clio::run::Task> &task,
+                  clio::run::BatchGroups &groups) override;
+  void SmashBatch(clio::run::BatchGroups &groups,
+                  clio::run::BatchSink &sink) override;
 
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
@@ -568,8 +642,9 @@ private:
    * @param success Output parameter: true if allocation succeeded, false otherwise
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume AllocateFromTarget(TargetInfo &target_info, clio::run::u64 size,
-                                     clio::run::u64 &allocated_offset, bool &success);
+  clio::run::TaskResume AllocateFromTarget(
+      TargetInfo &target_info, clio::run::u64 size,
+      std::vector<clio::run::bdev::Block> &out_blocks, bool &success);
 
   /**
    * Free all blocks from a blob back to their respective targets
@@ -622,7 +697,8 @@ private:
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 preallocate = 0);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via
@@ -780,14 +856,9 @@ private:
    */
   clio::run::TaskResume BlobQuery(clio::run::shared_ptr<BlobQueryTask> &task);
 
-  /**
-   * BM25 keyword search over blob contents (Method::kSemanticSearch).
-   * Filters by tag+blob regex like BlobQuery, then tokenizes each
-   * candidate blob's bytes and scores them against query_text_ using
-   * Okapi BM25 with corpus stats computed over the matched working
-   * set. Returns top-k results sorted by descending score.
-   */
-  clio::run::TaskResume SemanticSearch(clio::run::shared_ptr<SemanticSearchTask> &task);
+  // SemanticSearch (Method::kSemanticSearch) moved to the indexer chimod
+  // (issue #905) — the task struct and client API stay here (interposers
+  // speak the core's vocabulary), but the core no longer executes it.
 
   /**
    * Timestamp-window search over blob metadata (Method::kTemporalSearch).

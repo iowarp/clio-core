@@ -19,14 +19,22 @@
 
 namespace clio::run::bdev {
 
+// Free-list bucket sizes. MUST match kBlockSizes[] in block_allocator.cc.
+// Sub-4KB buckets (issue #862): a ~1KB blob no longer pins a whole 4KB block
+// on byte-addressable tiers — the RAM bdev allocates at 512B granularity (see
+// mem_bdev_transport.cc); device-aligned tiers (file O_DIRECT) keep a 4KB
+// alignment quantum, so their requests still round up past the small buckets.
 enum class BlockSizeCategory : clio::run::u32 {
-  k256B = 0,
+  k512B = 0,
   k1KB = 1,
-  k4KB = 2,
-  k64KB = 3,
-  k128KB = 4,
-  k1MB = 5,
-  kMaxCategories = 6
+  k2KB = 2,
+  k4KB = 3,
+  k16KB = 4,
+  k32KB = 5,
+  k64KB = 6,
+  k128KB = 7,
+  k1MB = 8,
+  kMaxCategories = 9
 };
 
 extern const size_t kBlockSizes[];
@@ -39,6 +47,12 @@ class WorkerBlockMap {
   WorkerBlockMap();
 
   bool AllocateBlock(int block_type, Block& block, size_t min_size = 0);
+  /** Pull ANY freed block whose size_ is <= max_bytes (largest first), for
+   *  fragmentation reuse (issue #820). Unlike AllocateBlock, which finds a
+   *  block >= a size in one category, this scans every bucket for a block that
+   *  FITS what is left -- a freed 8 KiB block bucketed under 16 KiB is exactly
+   *  the case the >= match could never reach. */
+  bool AllocateAnyUpTo(size_t max_bytes, Block& block);
   void FreeBlock(Block block);
 
  private:
@@ -54,6 +68,9 @@ class GlobalBlockMap {
 
   void Init(size_t num_workers);
   bool AllocateBlock(int worker, size_t io_size, Block& block);
+  /** @copydoc WorkerBlockMap::AllocateAnyUpTo -- searches this worker's map
+   *  first, then steals from the others. */
+  bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
   bool FreeBlock(int worker, Block& block);
 
   /** Map an I/O size to its block-size category, or -1 if larger than all. */

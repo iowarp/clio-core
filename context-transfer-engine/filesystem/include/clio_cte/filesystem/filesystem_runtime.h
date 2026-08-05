@@ -15,6 +15,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/filesystem/filesystem_client.h>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
 
@@ -131,6 +132,39 @@ class Runtime : public clio::run::Container {
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
   std::atomic<clio::run::u64> next_handle_{1};
+
+  // ---- issue #817: shared-memory attribute mirror ----
+  // Lets a client resolve path -> {tag id, logical size} itself and then read
+  // the file's page blobs straight out of the RAM bdev segment, with no round
+  // trip at all. Pure cache: every mirror call is best-effort and happens
+  // AFTER the authoritative update, so the mirror can only ever lag.
+  ShmFsCache shm_fs_cache_;
+
+  /**
+   * Publish a path's current attributes.
+   *
+   * @param path absolute path (the map key, and the CTE tag name).
+   * @param fi the authoritative entry, already updated.
+   * @param extra_flags refusal flags to OR in (e.g. kShmFilePendingAppend).
+   *
+   * Caller may hold meta_mu_ or not: the mirror is independent of it, and the
+   * SHM map has its own per-slot seqlock.
+   */
+  void MirrorFile(const std::string &path, const FileInfo &fi,
+                  clio::run::u32 extra_flags = 0);
+
+  /** Drop a path from the mirror (unlink/rename/rmdir). */
+  void MirrorErase(const std::string &path) {
+    shm_fs_cache_.ErasePath(path);
+  }
+
+  /**
+   * Re-publish a path with refusal flags set, so in-flight clients stop
+   * fast-pathing it. Used where the authoritative state is about to change in
+   * a way that invalidates cached pages (truncate, rename) but the path lives
+   * on. Erasing would work too; this keeps the tag binding for the next op.
+   */
+  void MirrorRefuse(const std::string &path);
 
   // ---- deferred-append pipeline state ----
   // Per-node logical append counter (orders appends sharing a UTC tick).

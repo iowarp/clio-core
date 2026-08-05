@@ -53,8 +53,19 @@ hid_t H5FD_clio_init();
 /* Select the CLIO VFD and attach its tiering policy.
  *   cache_enabled: populate the CTE cache tier (false = native-only, which
  *                  avoids the current write-amplification of the populate-only
- *                  cache). */
+ *                  cache, and does not require a running CLIO runtime).
+ *
+ * The same tier can be switched off without touching source by setting
+ * CLIO_VFD_CACHE=0 (also "off"/"false"/"no") in the environment -- the shape
+ * VFD_VOL_TECHNICAL_GOALS.md §1.4 asks for, and the only shape available to an
+ * application loaded via HDF5_DRIVER=clio_vfd. The env var is an opt-OUT only:
+ * it can force the cache off, but never on over an explicit
+ * H5Pset_fapl_clio(fapl, false). */
 herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled);
+/* Read back the tiering policy from a FAPL that selects this driver. Reports
+ * the default when no driver-info block was attached, so it always describes
+ * what an open through this FAPL would actually do. */
+herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/);
 
 H5PL_type_t H5PLget_plugin_type(void);
 const void* H5PLget_plugin_info(void);

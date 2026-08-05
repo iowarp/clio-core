@@ -56,7 +56,22 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodReorganizeBlob = 45;
 // Periodic internal data-organizer driver (issue #738)
 GLOBAL_CROSS_CONST clio::run::u32 kDynamicReorganize = 46;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 47;
+// Score-driven capacity eviction: free the lowest-score blobs off a tier
+// (targets with score >= min) until a byte budget is reclaimed.
+GLOBAL_CROSS_CONST clio::run::u32 kEvict = 47;
+
+// Batched multi-blob put (issue #862): one task carrying up to ~64 puts to
+// DIFFERENT blobs, executed as nested PutBlob calls — amortizes per-task
+// scheduling/completion and staging allocation across the batch.
+GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
+
+// Register a node as holding a cached/replicated copy of one blob (issue
+// #886 distributed coherence). The blob's OWNER container records the node
+// in BlobInfo::replica_nodes_; the next primary write invalidates every
+// registered node's copy (write-invalidate) before completing.
+GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 50;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -97,6 +112,9 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[44] = "PodGetBlob";
     v[45] = "PodReorganizeBlob";
     v[46] = "DynamicReorganize";
+    v[47] = "Evict";
+    v[48] = "MultiPutBlob";
+    v[49] = "RegisterReplicaContainer";
     return v;
   }();
   return names;

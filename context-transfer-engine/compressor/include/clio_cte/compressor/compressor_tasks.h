@@ -88,8 +88,13 @@ struct CompressorConfig {
 
   template <class Archive>
   void serialize(Archive &ar) {
+    // next_pool_id_ MUST round-trip: it is the interposition-chain target
+    // (issue #886) — omitting it silently rewired a programmatically
+    // created compressor pool straight to the default core, bypassing any
+    // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, trace_folder_path_, tracking_enabled_);
+       dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
+       tracking_enabled_);
   }
 
   /**
@@ -137,7 +142,13 @@ struct DestroyTask : public clio::run::Task {
                        const clio::run::PoolQuery &pool_query)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DestroyTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     // No additional fields to copy beyond clio::run::Task
   }
 
@@ -261,7 +272,13 @@ struct DynamicScheduleTask : public clio::run::Task {
         context_(context), flags_(flags), core_pool_id_(core_pool_id),
         tier_score_(0.0f) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DynamicScheduleTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<DynamicScheduleTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     offset_ = other->offset_;
@@ -334,7 +351,13 @@ struct CompressTask : public clio::run::Task {
         context_(context), flags_(flags), core_pool_id_(core_pool_id),
         tier_score_(0.0f) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<CompressTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<CompressTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     offset_ = other->offset_;
@@ -404,7 +427,13 @@ struct DecompressTask : public clio::run::Task {
         core_pool_id_(core_pool_id),
         output_size_(0), decompress_time_ms_(0.0) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DecompressTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<DecompressTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     offset_ = other->offset_;
@@ -474,7 +503,13 @@ struct PollNodeLoadTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kPollNodeLoad),
         sample_() {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PollNodeLoadTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<PollNodeLoadTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     sample_ = other->sample_;
   }
 
@@ -503,7 +538,13 @@ struct PollConsumersTask : public clio::run::Task {
                              const clio::run::PoolQuery &pool_query)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kPollConsumers) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PollConsumersTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<PollConsumersTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     (void)other;
   }
 

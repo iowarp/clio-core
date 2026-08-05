@@ -32,8 +32,9 @@ namespace ctp::priv {
  * members of its own, so it is **bitwise-relocatable**: no heap, no SSO, no
  * self-referential pointer, and an identical layout on host and device. A raw
  * memcpy/cudaMemcpy of a struct embedding a fixed_string is correct with ZERO
- * post-copy fixup — which is exactly why GPU tasks can carry it without the
- * priv::string FixupSsoPointer dance. The copy/move/dtor are defaulted so the
+ * post-copy fixup — which is exactly why GPU tasks can carry it while a
+ * priv::string (whose SSO caches a self-pointer) cannot cross a bytewise
+ * copy. The copy/move/dtor are defaulted so the
  * type remains trivially copyable (the converting constructors below do not
  * affect that).
  *

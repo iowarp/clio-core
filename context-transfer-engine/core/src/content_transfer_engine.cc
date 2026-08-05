@@ -35,6 +35,8 @@
 #include <clio_cte/core/content_transfer_engine.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 // Define global pointer variable in source file (outside namespace)
@@ -68,6 +70,46 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Initialize CTE core client
   auto *cte_client = CLIO_CTE_CLIENT;
 
+  // CLIO_CTE_POOL=major.minor (issue #886): bind this process's CTE client
+  // singleton to an INTERPOSING pool — e.g. the replication chimod at 561.0,
+  // which speaks the core task interface and forwards every method it does
+  // not override. Pure configuration: no caller changes, no create (the
+  // interposer is composed, and creating it needs its own params anyway).
+  // Deliberately ONLY here, never in Client::Init/ctor — runtime-internal
+  // module clients construct Client(next_pool_id) to reach the core, and
+  // redirecting those would make an interposer forward to itself.
+  {
+    const char *pool_env = std::getenv("CLIO_CTE_POOL");
+    if (pool_env != nullptr && *pool_env != '\0') {
+      unsigned major = 0, minor = 0;
+      if (std::sscanf(pool_env, "%u.%u", &major, &minor) == 2) {
+        cte_client->Init(clio::run::PoolId(major, minor));
+        // Zero-IPC reads through an interposer: the interposer pool
+        // publishes no mirror of its own, so fall back to the CANONICAL
+        // core pool's mirror — the pool every shipped interposer sits over.
+        // Correct because interposed writes update the primary
+        // synchronously and drops re-mirror empty (see AttachShmCacheOf).
+        if (cte_client->AttachShmCache()) {
+          HLOG(kInfo, "CTE ClientInit: SHM fast path via pool {}.{}'s mirror",
+               major, minor);
+        } else if (cte_client->AttachShmCacheOf(clio::cte::core::kCtePoolId)) {
+          HLOG(kInfo,
+               "CTE ClientInit: SHM fast path via the core pool's mirror");
+        } else {
+          HLOG(kDebug,
+               "CTE ClientInit: SHM metadata cache unavailable; using RPC");
+        }
+        HLOG(kInfo, "CTE ClientInit: CLIO_CTE_POOL bound client to pool {}.{}",
+             major, minor);
+        is_initialized_ = true;
+        is_initializing_ = false;
+        return true;
+      }
+      HLOG(kError, "CTE ClientInit: ignoring malformed CLIO_CTE_POOL '{}'",
+           pool_env);
+    }
+  }
+
   // Create CreateParams without config - configuration is now provided via clio compose
   CreateParams params;
 
@@ -90,7 +132,24 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Update client pool_id_ with the actual pool ID from the task
   cte_client->pool_id_ = create_task->new_pool_id_;
 
-  // Delete the create task
+  // Attach the shared-memory metadata cache (issue #783, wired up in #817).
+  // Until this call existed the cache was only ever attached by its own unit
+  // tests, so `Tag::GetBlob`'s zero-IPC fast path was dead in every real
+  // process. Must run AFTER pool_id_ is set: directory lookup is keyed by pool,
+  // and a shared slot would attach whichever CTE pool cached last.
+  //
+  // The DIRECTORY overload, not the CreateTask one: the task carries a non-zero
+  // root offset only for the process that actually caused pool creation, and
+  // under `clio compose` the pool already exists by the time any real client
+  // runs. (Reading the task's params here would also drag the config parser
+  // into the client library, which does not link it.)
+  //
+  // Failure is not an error -- a TCP client, a remote node, or a runtime built
+  // without the cache all legitimately report false, and every caller of the
+  // fast path falls back to RPC.
+  if (!cte_client->AttachShmCache()) {
+    HLOG(kDebug, "CTE ClientInit: SHM metadata cache unavailable; using RPC");
+  }
 
   // Mark as successfully initialized
   is_initialized_ = true;

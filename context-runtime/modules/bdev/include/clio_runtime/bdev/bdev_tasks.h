@@ -94,7 +94,8 @@ enum class BdevType : clio::run::u32 {
 struct Block {
   clio::run::u64 offset_;      // Offset within file
   clio::run::u64 size_;        // Size of block
-  clio::run::u32 block_type_;  // Block size category (0=4KB, 1=64KB, 2=256KB, 3=1MB)
+  clio::run::u32 block_type_;  // Block size category (BlockSizeCategory:
+                               // 512B..1MB; see block_allocator.h)
 
   CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
   CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
@@ -164,6 +165,21 @@ struct CreateParams {
   // disabled (no file created), preserving pre-WAL behavior.
   std::string alloc_log_path_;
 
+  // #858: file-backed devices grow the backing file lazily in units of this
+  // many bytes instead of truncating the full capacity at compose (on NTFS a
+  // plain SetEndOfFile claims the clusters eagerly, so the old full-capacity
+  // truncate reserved the whole tier up front). Ignored by RAM/GPU
+  // transports. YAML key: growth_unit (size string, e.g. "1GB").
+  clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;  // 1 GiB default
+
+  // Incremental population unit for the RAM bdev's sparse SHM mapping: when
+  // an allocation crosses the populated watermark, the next this-many bytes
+  // are bulk-faulted (SystemInfo::BulkFault) so data memcpys stop paying one
+  // demand fault per 4KB. 0 disables population (pure lazy faulting).
+  // Committed memory stays bounded by the allocation high-water mark plus
+  // one unit. YAML key: populate_unit (size string).
+  clio::run::u64 populate_unit_ = clio::run::u64(64) << 20;  // 64 MiB default
+
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_bdev";
 
@@ -206,12 +222,14 @@ struct CreateParams {
   // Constructor with optional performance metrics (as last parameter)
   CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
                clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
-               const std::string &alloc_log_path = "")
+               const std::string &alloc_log_path = "",
+               clio::run::u64 growth_unit = clio::run::u64(1) << 30)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment),
-        alloc_log_path_(alloc_log_path) {
+        alloc_log_path_(alloc_log_path),
+        growth_unit_(growth_unit) {
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
@@ -241,7 +259,7 @@ struct CreateParams {
   template <class Archive>
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
-       persistence_level_, alloc_log_path_);
+       persistence_level_, alloc_log_path_, growth_unit_, populate_unit_);
   }
 
   /**
@@ -286,6 +304,18 @@ struct CreateParams {
     // Load alignment (optional)
     if (config["alignment"]) {
       alignment_ = config["alignment"].as<clio::run::u32>();
+    }
+
+    // Load lazy-growth unit for file-backed devices (optional, default 1GB)
+    if (config["growth_unit"]) {
+      std::string growth_str = config["growth_unit"].as<std::string>();
+      growth_unit_ = ctp::ConfigParse::ParseSize(growth_str);
+    }
+
+    // Load RAM-bdev incremental population unit (optional, default 64MB)
+    if (config["populate_unit"]) {
+      std::string populate_str = config["populate_unit"].as<std::string>();
+      populate_unit_ = ctp::ConfigParse::ParseSize(populate_str);
     }
 
     // Load performance metrics (optional)
@@ -352,11 +382,6 @@ struct AllocateBlocksTask : public clio::run::Task {
                               const clio::run::PoolId &pool_id,
                               const clio::run::PoolQuery &pool_query, clio::run::u64 size)
       : clio::run::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CLIO_PRIV_ALLOC) {
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** Serialize IN and INOUT parameters */
@@ -445,11 +470,6 @@ struct FreeBlocksTask : public clio::run::Task {
     // No additional output parameters
   }
 
-  /** Fix up SVO pointer after POD copy (e.g., CPU→GPU memcpy) */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
-  }
-
   /**
    * Copy from another FreeBlocksTask (assumes this task is already constructed)
    * @param other Pointer to the source task to copy from
@@ -522,11 +542,6 @@ struct WriteTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(bytes_written_, io_error_);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** AggregateOut */
@@ -607,11 +622,6 @@ struct ReadTask : public clio::run::Task {
     ar(length_, bytes_read_, io_error_);
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** AggregateOut */

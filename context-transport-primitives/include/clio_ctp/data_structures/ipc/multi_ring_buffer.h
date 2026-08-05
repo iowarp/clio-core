@@ -258,6 +258,20 @@ using multi_mpsc_ring_buffer =
                       (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
                        RING_BUFFER_WAIT_FOR_SPACE)>;
 
+/**
+ * Typedef for multi-lane extensible mutex-guarded queues (issue #822).
+ *
+ * Each lane is an ext_spsc_queue: push/pop fully serialized by the lane's
+ * embedded ctp::Mutex, and a full lane GROWS (doubles) instead of
+ * busy-spinning. See the ext_spsc_queue typedef in ring_buffer.h for the
+ * full rationale (producer==consumer WAIT_FOR_SPACE deadlock).
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using multi_ext_spsc_queue =
+    multi_ring_buffer<T, AllocT,
+                      (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_DYNAMIC_SIZE |
+                       RING_BUFFER_LOCK_PUSH | RING_BUFFER_LOCK_POP)>;
+
 }  // namespace ctp::ipc
 
 #endif  // CTP_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_

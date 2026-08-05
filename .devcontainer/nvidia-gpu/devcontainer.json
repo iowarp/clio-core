@@ -1,73 +1,71 @@
 {
-    "name": "IOWarp Core (NVIDIA GPU)",
-    "build": {
-        "dockerfile": "Dockerfile",
-        "context": "../..",
-        "args": {
-            "HOST_UID": "${localEnv:HOST_UID:1000}",
-            "HOST_GID": "${localEnv:HOST_GID:1000}"
-        },
-        "options": [
-            "--tag=iowarp/clio-core-devcontainer:latest"
-        ]
+  "name": "IOWarp Core (NVIDIA GPU)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "../..",
+    "args": {
+      "HOST_UID": "${localEnv:HOST_UID:1000}",
+      "HOST_GID": "${localEnv:HOST_GID:1000}",
     },
-    "workspaceFolder": "/workspace",
-    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-    "containerEnv": {
-        "HOME": "/home/iowarp",
-        "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
-        "CUDA_HOME": "/usr/local/cuda-12.6",
-        "LD_LIBRARY_PATH": "/usr/local/lib:/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:/usr/lib/x86_64-linux-gnu",
-        "NVIDIA_VISIBLE_DEVICES": "all",
-        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
-        "ASAN_OPTIONS": "protect_shadow_gap=0"
+    "options": ["--tag=iowarp/clio-core-devcontainer:latest"],
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "containerEnv": {
+    "HOME": "/home/iowarp",
+    "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
+    "CUDA_HOME": "/usr/local/cuda-12.9",
+    "LD_LIBRARY_PATH": "/usr/local/lib:/usr/local/cuda-12.9/lib64:/usr/local/cuda-12.9/lib64/stubs:/usr/lib/x86_64-linux-gnu",
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+    "ASAN_OPTIONS": "protect_shadow_gap=0",
+  },
+  "mounts": [
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/tmp/host-claude,type=bind,readonly",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.codex,target=/tmp/host-codex,type=bind,readonly",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+  ],
+  "runArgs": ["--privileged", "--gpus=all"],
+  "updateRemoteUserUID": true,
+  "initializeCommand": "sh -c 'mkdir -p ~/.ssh ~/.claude ~/.codex && touch ~/.claude.json' || powershell -Command \"$ErrorActionPreference = 'SilentlyContinue'; New-Item -Path ~\\.ssh, ~\\.claude -ItemType Directory -Force | Out-Null; New-Item -Path ~\\.claude.json -ItemType File -Force | Out-Null\"",
+  // NOTE: If container fails to start with GPU error, run on host:
+  //   sudo apt-get install -y nvidia-container-toolkit
+  //   sudo nvidia-ctk runtime configure --runtime=docker
+  //   sudo systemctl restart docker
+  // Then rebuild the devcontainer.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "KylinIdeTeam.cppdebug",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-vscode.cmake-tools",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy",
+        "nvidia.nsight-vscode-edition",
+        "openai.chatgpt",
+        "openai.codex",
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "python.defaultInterpreterPath": "/home/iowarp/venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.venvPath": "/home/iowarp",
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": false,
+        "python.linting.flake8Enabled": true,
+      },
     },
-    "mounts": [
-        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
-        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/tmp/host-claude,type=bind,readonly",
-        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
-        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
-    ],
-    "runArgs": [
-        "--privileged",
-        "--gpus=all"
-    ],
-    "updateRemoteUserUID": true,
-    "initializeCommand": "sh -c 'mkdir -p ~/.ssh ~/.claude && touch ~/.claude.json' || powershell -Command \"$ErrorActionPreference = 'SilentlyContinue'; New-Item -Path ~\\.ssh, ~\\.claude -ItemType Directory -Force | Out-Null; New-Item -Path ~\\.claude.json -ItemType File -Force | Out-Null\"",
-    // NOTE: If container fails to start with GPU error, run on host:
-    //   sudo apt-get install -y nvidia-container-toolkit
-    //   sudo nvidia-ctk runtime configure --runtime=docker
-    //   sudo systemctl restart docker
-    // Then rebuild the devcontainer.
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "anthropic.claude-code",
-                "ms-vscode.cpptools",
-                "ms-vscode.cmake-tools",
-                "twxs.cmake",
-                "KylinIdeTeam.cppdebug",
-                "llvm-vs-code-extensions.vscode-clangd",
-                "ms-vscode.cmake-tools",
-                "ms-azuretools.vscode-docker",
-                "ms-python.python",
-                "ms-python.vscode-pylance",
-                "ms-python.debugpy",
-                "nvidia.nsight-vscode-edition"
-            ],
-            "settings": {
-                "cmake.configureOnOpen": false,
-                "python.defaultInterpreterPath": "/home/iowarp/venv/bin/python",
-                "python.terminal.activateEnvironment": true,
-                "python.venvPath": "/home/iowarp",
-                "python.formatting.provider": "black",
-                "python.linting.enabled": true,
-                "python.linting.pylintEnabled": false,
-                "python.linting.flake8Enabled": true
-            }
-        }
-    },
-    "postCreateCommand": ".devcontainer/post-create.sh",
-    "postStartCommand": ".devcontainer/post-start.sh",
-    "remoteUser": "iowarp"
+  },
+  "postCreateCommand": ".devcontainer/post-create.sh",
+  "postStartCommand": ".devcontainer/post-start.sh",
+  "remoteUser": "iowarp",
 }

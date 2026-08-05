@@ -468,25 +468,95 @@ def _compile_c(binp, srcp):
     return comp
 
 
+# Probes that did not COMPILE, kept apart from probes that compiled and failed.
+# A build error means the connector's behaviour was never measured, which is a
+# different fact with a different owner and a different fix than "the connector
+# is incompatible". Both are fatal; only one of them is a statement about the
+# VOL. Populated by _build_probe, reported separately by driver().
+BUILD_ERRORS = {}
+
+# Every C probe the suite compiles, name -> source. Built up front by
+# _build_probe_set so a build error is reported before any case runs, rather
+# than surfacing mid-run as a single mysterious case failure.
+C_PROBES = {
+    "c_iteration":         "vol_c_iteration_test.c",
+    "c_safeflush":         "vol_c_safeflush_test.c",
+    "c_selection":         "vol_c_selection_test.c",
+    "c_cache_identity":    "vol_c_cache_identity_test.c",
+    "c_error_propagation": "vol_c_error_propagation_test.c",
+    "c_passthrough_ops":   "vol_c_passthrough_ops_test.c",
+    "c_isaccessible":      "vol_c_isaccessible_test.c",
+}
+
+
+def _build_probe(name, binp, srcp):
+    """Compile one C probe. True on success; on failure records the reason in
+    BUILD_ERRORS and prints the compiler's FULL diagnostics.
+
+    Full, not truncated: a tail slice is the wrong end of a compiler error.
+    Compilers put the message first and the caret art last, so keeping the last
+    N characters reliably discards the sentence naming the problem and keeps
+    `~~~~~~~` -- which is exactly how an HDF5 API-arity mismatch reached CI
+    looking like an unexplained incompatibility."""
+    comp = _compile_c(binp, srcp)
+    if comp is not None and comp.returncode == 0:
+        return True
+    if comp is None:
+        BUILD_ERRORS[name] = "no C compiler (h5cc/gcc) found"
+        print(f"  {name:<20} BUILD-ERROR  no C compiler (h5cc/gcc) found")
+        return False
+    err = comp.stderr.strip() or comp.stdout.strip() or "(no compiler output)"
+    # One-line summary for the end-of-run block: the first line that actually
+    # says "error", not merely the first line -- compilers open with context
+    # ("In function 'main':") and with warnings that precede the real cause.
+    lines = err.splitlines()
+    BUILD_ERRORS[name] = next((l.strip() for l in lines if "error:" in l),
+                              lines[0].strip() if lines else "compile failed")
+    print(f"  {name:<20} BUILD-ERROR  did not compile; full output follows")
+    for line in err.splitlines():
+        print(f"      | {line}")
+    return False
+
+
+def _build_probe_set():
+    """Build every C probe before any case runs. Fails loudly and completely:
+    all build errors are reported in one pass, not one per run."""
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(TMP, exist_ok=True)
+    for name, src in C_PROBES.items():
+        _build_probe(name, os.path.join(TMP, name),
+                     os.path.join(src_dir, src))
+    if BUILD_ERRORS:
+        print(f"  {len(BUILD_ERRORS)} of {len(C_PROBES)} C probes did not build; "
+              "their coverage is UNMEASURED (not 'passing', not 'incompatible')")
+    else:
+        print(f"  all {len(C_PROBES)} C probes built")
+
+
 def _run_c_tests():
     """Compile + run the isolated C tests through the VOL. Returns
     {name: {"pass": bool}}; each C program exits 0 on pass. These cover ops h5py
     cannot exercise well via a non-native VOL: modern-API iteration
-    (c_iteration), Safe-mode H5Fflush durability (c_safeflush), and
-    selection-aware read caching + partial-write invalidation (c_selection)."""
+    (c_iteration), Safe-mode H5Fflush durability (c_safeflush),
+    selection-aware read caching + partial-write invalidation (c_selection), and
+    the cache-identity regressions (c_cache_identity): mem/file datatype
+    mismatch, a cache surviving H5F_ACC_TRUNC of its file, and H5Dflush as a
+    barrier. Each of those three returned wrong data with a success status.
+    c_isaccessible covers the filename-scoped file_specific ops HDF5 invokes
+    with a NULL object; h5py never calls H5Fis_accessible, so no h5py case
+    reaches that callback."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
-    tests = {"c_iteration": "vol_c_iteration_test.c",
-             "c_safeflush": "vol_c_safeflush_test.c",
-             "c_selection": "vol_c_selection_test.c"}
     out = {}
-    for name, src in tests.items():
+    for name, src in C_PROBES.items():
         binp = os.path.join(TMP, name)
         srcp = os.path.join(src_dir, src)
-        comp = _compile_c(binp, srcp)
-        if comp is None or comp.returncode != 0:
-            detail = (comp.stderr.strip()[-120:] if comp is not None
-                      else "no C compiler (h5cc/gcc) found")
-            print(f"  {name:<20} COMPILE-FAIL  {detail}")
+        # Already built (and already reported) by _build_probe_set; retry here
+        # only for a standalone caller that skipped that step.
+        if name in BUILD_ERRORS:
+            print(f"  {name:<20} BUILD-ERROR  not run: {BUILD_ERRORS[name]}")
+            out[name] = {"pass": False}
+            continue
+        if not os.path.exists(binp) and not _build_probe(name, binp, srcp):
             out[name] = {"pass": False}
             continue
         r = subprocess.run([binp], capture_output=True, text=True,
@@ -511,11 +581,8 @@ def _run_trace_check():
     src_dir = os.path.dirname(os.path.abspath(__file__))
     binp = os.path.join(TMP, "c_selection")  # reuse the c_selection binary
     srcp = os.path.join(src_dir, "vol_c_selection_test.c")
-    if not os.path.exists(binp):
-        comp = _compile_c(binp, srcp)
-        if comp is None or comp.returncode != 0:
-            print(f"  {'telemetry':<20} COMPILE-FAIL")
-            return {"telemetry": {"pass": False}}
+    if not os.path.exists(binp) and not _build_probe("telemetry", binp, srcp):
+        return {"telemetry": {"pass": False}}
     tdir = os.path.join(TMP, "trace")
     os.makedirs(tdir, exist_ok=True)
     for f in glob.glob(tdir + "/*"):
@@ -567,6 +634,11 @@ def stop_runtime():
 def driver(args):
     assert restart_runtime(), "clio_run did not become ready"
     os.makedirs(TMP, exist_ok=True)
+    # Build every C probe first. A probe that does not compile is a broken
+    # harness, and finding that out now -- with all of them reported together --
+    # beats discovering it as one opaque case failure two minutes into the run.
+    print("-- building C probes --")
+    _build_probe_set()
     results, n_fail = {}, 0
     for case in CASES:
         fn = os.path.join(TMP, case + "_native.h5")
@@ -610,17 +682,32 @@ def driver(args):
     failed = {c for c, p in results.items() if not all(p.values())}
     unexpected = sorted(failed - expect_fail)      # honest failures (or regressions)
     fixed = sorted(expect_fail - failed)           # known gap now passes
+    # A probe that never compiled says nothing about the VOL. Report it as its
+    # own category so the summary does not assert an incompatibility it did not
+    # measure. Still fatal -- unmeasured is not the same as passing either.
+    unbuilt = sorted(set(BUILD_ERRORS) & failed)
+    measured_fail = sorted(failed - set(BUILD_ERRORS))
     print(f"\n{total - len(failed)}/{total} cases fully pass. wrote {args.out}")
+    if unbuilt:
+        print(f"BUILD-ERROR — NOT MEASURED, the probe did not compile: {unbuilt}")
+        for name in unbuilt:
+            print(f"    {name}: {BUILD_ERRORS[name]}")
+        print("    This is a harness/toolchain failure, not a VOL compatibility "
+              "result. Fix the build, then re-run to learn what these cases say.")
     if expect_fail:
         # regression-gate mode: only unexpected failures are fatal
         print(f"expected gaps still failing: {sorted(failed & expect_fail)}")
         if fixed:
             print(f"NOTE: previously-failing cases now PASS (drop from --expect-fail): {fixed}")
-        if unexpected:
-            print(f"REGRESSION — these should pass but FAILED: {unexpected}")
-    elif failed:
+        # A probe that did not build is already reported above as UNMEASURED;
+        # calling it a regression would name the wrong problem. It still counts
+        # toward the exit status.
+        regressions = [c for c in unexpected if c not in BUILD_ERRORS]
+        if regressions:
+            print(f"REGRESSION — these should pass but FAILED: {regressions}")
+    elif measured_fail:
         # honest mode (default): every failure is reported and fatal
-        print(f"FAILING — VOL not yet compatible for: {sorted(failed)}")
+        print(f"FAILING — VOL not yet compatible for: {measured_fail}")
     return 1 if unexpected else 0
 
 

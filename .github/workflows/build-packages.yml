@@ -82,12 +82,17 @@ jobs:
         # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
         # pure-Python context visualizer ships as a standard feature via
         # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # Cache + replication chimods already default ON (#886); pin them
+        # explicitly so a future default flip cannot silently drop them
+        # from published packages (#899).
         cmake -B build-deb \
           -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
           -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+          -DCLIO_CTE_ENABLE_CACHE=ON \
+          -DCLIO_CTE_ENABLE_REPLICATION=ON \
           -G Ninja
 
     - name: Build with CMake
@@ -146,6 +151,7 @@ jobs:
         # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
         # pure-Python context visualizer ships as a standard feature via
         # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # Cache + replication pins: same rationale as build-deb (#899).
         cmake -B build-rpm \
           -DCLIO_CORE_ENABLE_RPM_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
@@ -153,6 +159,8 @@ jobs:
           -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+          -DCLIO_CTE_ENABLE_CACHE=ON \
+          -DCLIO_CTE_ENABLE_REPLICATION=ON \
           -G Ninja
 
     - name: Build with CMake
@@ -210,11 +218,14 @@ jobs:
 
     - name: Configure with CMake
       run: |
+        # Cache + replication pins: same rationale as build-deb (#899).
         cmake -B build-appimage \
           -DCLIO_CORE_ENABLE_APPIMAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+          -DCLIO_CTE_ENABLE_CACHE=ON \
+          -DCLIO_CTE_ENABLE_REPLICATION=ON \
           -G Ninja
 
     - name: Build with CMake
@@ -291,10 +302,25 @@ jobs:
           exit 1
         fi
         python3 -c "import context_visualizer; print('context_visualizer import OK')"
+        echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
+        # The .deb now declares libfuse3-dev + fuse3, so the apt install
+        # above must have pulled libfuse3.so.3 — a load failure here means
+        # the dependency declaration regressed.
+        rc=0; clio_cte_fuse --help || rc=$?
+        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
+          echo "FAIL: clio_cte_fuse --help died with exit code $rc"
+          exit 1
+        fi
+        echo "=== cache + replication chimods present (#899) ==="
+        for mod in clio_cte_cache clio_cte_replication; do
+          dpkg -L iowarp-core | grep -q "$mod" || { echo "FAIL: $mod libs missing from package"; exit 1; }
+        done
         echo "=== dpkg -L iowarp-core (file manifest) ==="
         dpkg -L iowarp-core | head -40
         echo "=== ldd $(command -v clio_run) ==="
         ldd "$(command -v clio_run)" | grep -E "not found" && exit 1 || echo "All shared libraries resolve."
+        echo "=== ldd $(command -v clio_cte_fuse) ==="
+        ldd "$(command -v clio_cte_fuse)" | grep -E "not found" && exit 1 || echo "All shared libraries resolve."
 
   test-rpm:
     name: Test RPM install (${{ matrix.arch }})
@@ -339,10 +365,25 @@ jobs:
           exit 1
         fi
         python3 -c "import context_visualizer; print('context_visualizer import OK')"
+        echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
+        # The .rpm now requires fuse3-devel + fuse3, so dnf must have
+        # pulled libfuse3.so.3 — a load failure here means the dependency
+        # declaration regressed.
+        rc=0; clio_cte_fuse --help || rc=$?
+        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
+          echo "FAIL: clio_cte_fuse --help died with exit code $rc"
+          exit 1
+        fi
+        echo "=== cache + replication chimods present (#899) ==="
+        for mod in clio_cte_cache clio_cte_replication; do
+          rpm -ql iowarp-core | grep -q "$mod" || { echo "FAIL: $mod libs missing from package"; exit 1; }
+        done
         echo "=== rpm -ql iowarp-core (file manifest) ==="
         rpm -ql iowarp-core | head -40
         echo "=== ldd $(command -v clio_run) ==="
         ldd "$(command -v clio_run)" | grep -E "not found" && exit 1 || echo "All shared libraries resolve."
+        echo "=== ldd $(command -v clio_cte_fuse) ==="
+        ldd "$(command -v clio_cte_fuse)" | grep -E "not found" && exit 1 || echo "All shared libraries resolve."
 
   test-appimage:
     name: Test AppImage (${{ matrix.arch }})
@@ -384,6 +425,146 @@ jobs:
           exit 1
         fi
         echo "AppImage launches and prints usage."
+        echo "=== Inspect payload: fuse adapter + chimods (#899) ==="
+        # --appimage-extract works without FUSE; inspect and smoke-test the
+        # extracted tree directly.
+        "$APPIMG" --appimage-extract >/dev/null
+        test -x squashfs-root/usr/bin/clio_cte_fuse || { echo "FAIL: clio_cte_fuse missing from AppImage"; exit 1; }
+        ls squashfs-root/usr/lib/libfuse3.so.3* >/dev/null 2>&1 || { echo "FAIL: libfuse3.so.3 not bundled"; exit 1; }
+        for mod in clio_cte_cache clio_cte_replication; do
+          ls squashfs-root/usr/lib/ | grep -q "$mod" || { echo "FAIL: $mod libs missing from AppImage"; exit 1; }
+        done
+        # Run the bundled adapter against the bundled libs — proves the
+        # AppImage is self-contained even where the host lacks libfuse3.
+        rc=0; LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" squashfs-root/usr/bin/clio_cte_fuse --help || rc=$?
+        if [ "$rc" -ge 128 ]; then
+          echo "FAIL: bundled clio_cte_fuse --help died with exit code $rc"
+          exit 1
+        fi
+        echo "FUSE adapter present with bundled libfuse3."
+
+  #-----------------------------------------------------------------------
+  # Build native Windows package (ZIP + NSIS installer .exe)
+  #
+  # Windows users without Python get clio_run.exe & friends via a plain
+  # ZIP plus an NSIS installer (#899). Deps come from vcpkg exactly like
+  # the Windows wheel job in build-pip.yml; WinFsp provides the FUSE3-
+  # compatible SDK for clio_cte_fuse.exe. NSIS (makensis) is preinstalled
+  # on the windows-latest runner image.
+  #-----------------------------------------------------------------------
+  build-windows:
+    name: Build Windows package (x86_64)
+    runs-on: windows-latest
+    needs: [check-version]
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Bootstrap vcpkg
+      run: |
+        cd $env:VCPKG_INSTALLATION_ROOT
+        git pull
+        .\bootstrap-vcpkg.bat
+
+    - name: Install vcpkg dependencies
+      run: |
+        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
+
+    - name: Install WinFsp (FUSE adapter SDK)
+      run: choco install winfsp -y --no-progress
+
+    - name: Configure with CMake
+      run: |
+        # Cache + replication pins: same rationale as build-deb (#899).
+        cmake -B build-win `
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DVCPKG_TARGET_TRIPLET=x64-windows `
+          -DCLIO_CORE_ENABLE_WINDOWS_PACKAGE=ON `
+          -DCLIO_CORE_ENABLE_TESTS=OFF `
+          -DCLIO_CORE_ENABLE_PYTHON=OFF `
+          -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON `
+          -DCLIO_CTE_ENABLE_CACHE=ON `
+          -DCLIO_CTE_ENABLE_REPLICATION=ON
+
+    - name: Build with CMake
+      run: cmake --build build-win --config Release --parallel 4
+
+    - name: Create ZIP + NSIS packages
+      run: |
+        cd build-win
+        cpack -G ZIP -C Release
+        cpack -G NSIS -C Release
+
+    - name: Upload Windows package artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-package-x86_64
+        path: |
+          build-win/iowarp-core-*.zip
+          build-win/iowarp-core-*.exe
+
+  #-----------------------------------------------------------------------
+  # Install-and-smoke-test the Windows ZIP on a clean runner, mirroring
+  # test-deb / test-rpm. The NSIS .exe is asserted to exist but tested via
+  # the ZIP payload (identical file set; silent NSIS install would need UI
+  # automation for the PATH checkbox).
+  #-----------------------------------------------------------------------
+  test-windows:
+    name: Test Windows package (x86_64)
+    needs: [build-windows]
+    runs-on: windows-latest
+    if: always() && needs.build-windows.result == 'success'
+    steps:
+    - name: Download Windows package
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-package-x86_64
+        path: pkg/
+
+    - name: Install WinFsp (FUSE adapter runtime)
+      run: choco install winfsp -y --no-progress
+
+    - name: Extract ZIP + smoke test
+      shell: pwsh
+      run: |
+        $zip = (Get-ChildItem pkg/iowarp-core-*.zip | Select-Object -First 1).FullName
+        Write-Host "Extracting $zip"
+        Expand-Archive $zip -DestinationPath extracted
+        # The archive wraps everything in one iowarp-core-<ver>-win64/ root.
+        $root = (Get-ChildItem extracted -Directory | Select-Object -First 1).FullName
+        $bin = Join-Path $root "bin"
+
+        Write-Host "=== clio_run.exe --help ==="
+        & "$bin\clio_run.exe" --help
+        # Same heuristic as build-pip.yml: negative exit codes are load-time
+        # crashes (missing DLL = 0xC0000135); small positive codes are the
+        # arg parser printing usage.
+        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
+          throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL)"
+        }
+
+        Write-Host "=== clio_cte_fuse.exe (FUSE adapter, #899) ==="
+        if (-not (Test-Path "$bin\clio_cte_fuse.exe")) { throw "clio_cte_fuse.exe missing from package" }
+        $env:PATH = "${env:ProgramFiles(x86)}\WinFsp\bin;$env:PATH"
+        & "$bin\clio_cte_fuse.exe" --help
+        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
+          throw "clio_cte_fuse --help died with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "=== cache + replication chimod DLLs present (#899) ==="
+        foreach ($mod in @('clio_cte_cache', 'clio_cte_replication')) {
+          if (-not (Get-ChildItem -Recurse $root -Filter "*$mod*")) { throw "$mod DLLs missing from package" }
+        }
+
+        Write-Host "=== NSIS installer artifact exists ==="
+        if (-not (Get-ChildItem pkg/iowarp-core-*.exe)) { throw "NSIS installer .exe missing" }
+
+        Write-Host "All Windows package tests passed."
+        exit 0
 
   #-----------------------------------------------------------------------
   # Publish all artifacts to GitHub Release on tag
@@ -396,7 +577,7 @@ jobs:
   #-----------------------------------------------------------------------
   publish-release:
     name: Publish to GitHub Release
-    needs: [build-deb, build-rpm, build-appimage, test-deb, test-rpm, test-appimage]
+    needs: [build-deb, build-rpm, build-appimage, build-windows, test-deb, test-rpm, test-appimage, test-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -420,6 +601,13 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         pattern: appimage-*
+        path: packages/
+        merge-multiple: true
+
+    - name: Download Windows packages
+      uses: actions/download-artifact@v4
+      with:
+        pattern: windows-package-*
         path: packages/
         merge-multiple: true
 

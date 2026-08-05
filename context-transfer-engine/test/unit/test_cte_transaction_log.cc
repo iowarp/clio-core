@@ -137,6 +137,74 @@ TEST_CASE("TransactionLog - ExtendBlob roundtrip with blocks", "[cte][txnlog]") 
   TxnRemove(path);
 }
 
+TEST_CASE("TransactionLog - ExtendReplica roundtrip", "[cte][txnlog]") {
+  // issue #886: the record that persists a replica's block layout between the
+  // replica write that produced it and the next metadata flush. A separate
+  // appended type (not a replica index folded into kExtendBlob) so old replay
+  // chains skip it instead of misparsing the record.
+  std::string path = TxnTempFile("txn_extend_replica");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnExtendReplica txn;
+  txn.tag_major_ = 5;
+  txn.tag_minor_ = 6;
+  txn.blob_name_ = "replicated";
+  txn.replica_ = 2;
+  txn.replica_name_ = "replicated#2";
+  txn.score_ = 0.25f;
+  txn.flags_ = 3;  // REPLICA_FIXED | REPLICA_PERSISTENT
+  txn.transform_flags_ = 2;  // this copy holds transformed bytes (#886)
+  txn.min_score_ = 0.4f;     // organizer rescore floor
+  TxnExtendBlobBlock blk0;
+  blk0.bdev_major_ = 512;
+  blk0.bdev_minor_ = 1;
+  blk0.target_query_ = clio::run::PoolQuery::Local();
+  blk0.target_offset_ = 4096;
+  blk0.size_ = 1024;
+  TxnExtendBlobBlock blk1;
+  blk1.bdev_major_ = 513;
+  blk1.bdev_minor_ = 2;
+  blk1.target_query_ = clio::run::PoolQuery::Local();
+  blk1.target_offset_ = 8192;
+  blk1.size_ = 2048;
+  txn.new_blocks_.push_back(blk0);
+  txn.new_blocks_.push_back(blk1);
+  log.Log(TxnType::kExtendReplica, txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 1);
+  REQUIRE(entries[0].first == TxnType::kExtendReplica);
+  TxnExtendReplica out =
+      TransactionLog::DeserializeExtendReplica(entries[0].second);
+  REQUIRE(out.tag_major_ == 5);
+  REQUIRE(out.tag_minor_ == 6);
+  REQUIRE(out.blob_name_ == "replicated");
+  REQUIRE(out.replica_ == 2);
+  REQUIRE(out.replica_name_ == "replicated#2");
+  REQUIRE(out.score_ == 0.25f);
+  REQUIRE(out.flags_ == 3);
+  REQUIRE(out.transform_flags_ == 2);
+  REQUIRE(out.min_score_ == 0.4f);
+  REQUIRE(out.new_blocks_.size() == 2);
+  REQUIRE(out.new_blocks_[0].bdev_major_ == 512);
+  REQUIRE(out.new_blocks_[0].bdev_minor_ == 1);
+  REQUIRE(out.new_blocks_[0].target_offset_ == 4096);
+  REQUIRE(out.new_blocks_[0].size_ == 1024);
+  REQUIRE(out.new_blocks_[1].bdev_major_ == 513);
+  REQUIRE(out.new_blocks_[1].bdev_minor_ == 2);
+  REQUIRE(out.new_blocks_[1].target_offset_ == 8192);
+  REQUIRE(out.new_blocks_[1].size_ == 2048);
+  REQUIRE(std::memcmp(&out.new_blocks_[0].target_query_,
+                      &blk0.target_query_, sizeof(clio::run::PoolQuery)) == 0);
+
+  log.Close();
+  TxnRemove(path);
+}
+
 TEST_CASE("TransactionLog - ClearBlob DelBlob roundtrip", "[cte][txnlog]") {
   std::string path = TxnTempFile("txn_clear_del");
   TxnRemove(path);
@@ -172,6 +240,38 @@ TEST_CASE("TransactionLog - ClearBlob DelBlob roundtrip", "[cte][txnlog]") {
   REQUIRE(del_out.tag_major_ == 13);
   REQUIRE(del_out.tag_minor_ == 14);
   REQUIRE(del_out.blob_name_ == "to_delete");
+
+  log.Close();
+  TxnRemove(path);
+}
+
+TEST_CASE("TransactionLog - SetBlobTransform roundtrip", "[cte][txnlog]") {
+  // issue #818: the record that persists a blob's transform mark between the
+  // put that set it and the next metadata flush.
+  std::string path = TxnTempFile("txn_set_transform");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnSetBlobTransform txn;
+  txn.tag_major_ = 21;
+  txn.tag_minor_ = 22;
+  txn.blob_name_ = "compressed_blob";
+  txn.transform_flags_ = 0x3;  // kBlobTransformed | kBlobTransformCompressed
+  log.Log(TxnType::kSetBlobTransform, txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 1);
+  REQUIRE(entries[0].first == TxnType::kSetBlobTransform);
+
+  TxnSetBlobTransform out =
+      TransactionLog::DeserializeSetBlobTransform(entries[0].second);
+  REQUIRE(out.tag_major_ == 21);
+  REQUIRE(out.tag_minor_ == 22);
+  REQUIRE(out.blob_name_ == "compressed_blob");
+  REQUIRE(out.transform_flags_ == 0x3);
 
   log.Close();
   TxnRemove(path);

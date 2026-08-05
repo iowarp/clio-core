@@ -6,11 +6,22 @@
  */
 
 /**
- * Clio HDF5 VOL Connector
+ * Clio HDF5 VOL Connector — pass-through, native-authoritative.
  *
- * Intercepts H5Dwrite/H5Dread and maps them to CTE AsyncPutBlob/AsyncGetBlob.
- * Large writes are split into configurable-size chunks and submitted
- * asynchronously. All other HDF5 operations pass through to the native VOL.
+ * EVERY operation is delegated to the native VOL, which owns the file: the
+ * on-disk HDF5 image is written synchronously and is the source of truth, so
+ * standard tools read it live and CLIO can be removed without losing data.
+ * On top of that, whole-dataset H5Dwrite/H5Dread transfers of flat datatypes
+ * are additionally MIRRORED into the CTE tier as chunked blobs, and hyperslab /
+ * point reads can be served from that mirror (serve-only; a miss falls back to
+ * native). The cache is an accelerator, never an authority: any doubt about
+ * whether it matches the file resolves by invalidating it and re-reading native.
+ *
+ * If the CLIO runtime is unreachable, or CLIO_VOL_CACHE=0 is set, the connector
+ * degrades to a pure pass-through and remains correct.
+ *
+ * See README.md for configuration and translation/VOL_AUDIT.md for the current
+ * gap list.
  */
 
 #include "clio_vol.h"
@@ -42,6 +53,13 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
 
+/* The connector's capability set. Defined once because it is reported from two
+   places (the class literal and introspect_get_cap_flags) that must agree. */
+#define CLIO_VOL_CAP_FLAGS                                                 \
+  (H5VL_CAP_FLAG_FILE_BASIC | H5VL_CAP_FLAG_DATASET_BASIC |                \
+   H5VL_CAP_FLAG_GROUP_BASIC | H5VL_CAP_FLAG_ATTR_BASIC |                  \
+   H5VL_CAP_FLAG_LINK_BASIC | H5VL_CAP_FLAG_OBJECT_BASIC)
+
 /* ========================================================================
  * Internal state structures
  * ======================================================================== */
@@ -54,10 +72,18 @@ struct clio_dataset_t;  /* fwd */
    inherited from the containing file/group at create-time. The
    dataset_t branch reads it to find the CTE tag for AsyncPutBlob /
    AsyncGetBlob. */
+/* Which wrapper struct a void* actually points at. clio_dataset_t and
+   clio_file_t are NOT derived from clio_obj_t -- they CONTAIN one as their first
+   member -- so a `delete (clio_obj_t *)p` on a dataset is undefined behaviour
+   and leaks its std::string/vectors. Every wrapper records its kind here so the
+   generic paths (notably clio_unwrap_object) can destroy the right type. */
+enum class clio_kind_t : int { kObj = 0, kFile, kDataset };
+
 struct clio_obj_t {
   void           *under_object;
   hid_t           under_vol_id;
   clio_file_t  *parent_file;
+  clio_kind_t     kind = clio_kind_t::kObj;
 };
 
 struct clio_file_t {
@@ -65,6 +91,12 @@ struct clio_file_t {
   clio::cte::core::TagId tag_id;
   std::string file_name;
   size_t chunk_size;
+  /* False when the CTE tier is bypassed entirely for this file: either the user
+     disabled it (CLIO_VOL_CACHE=0) or the CLIO runtime was unreachable at open.
+     The connector then behaves as a pure pass-through to the native VOL, which
+     is always a correct (if unaccelerated) mode -- the native file is
+     authoritative regardless. */
+  bool cache_enabled = true;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
      successful flush/close (the native file is already written synchronously and
@@ -80,6 +112,15 @@ struct clio_dataset_t {
   clio_obj_t obj;
   clio_file_t *file;
   std::string dataset_path;
+  /* The dataset's FILE datatype, resolved lazily on first cache-eligible
+     transfer. The blob cache is a flat byte image sized by the transfer's
+     datatype, so it is only coherent when the caller's memory type is the same
+     size as what HDF5 actually stores. Without this check, writing
+     H5T_NATIVE_INT into an H5T_STD_I64LE dataset caches 4n bytes and a later
+     read with H5T_NATIVE_LONG asks for 8n, hits, and reassembles garbage. */
+  hid_t file_type = H5I_INVALID_HID;
+  size_t file_type_size = 0;
+  int file_type_probed = 0;
   /* When false the CTE cache is bypassed and every transfer goes to the native
      VOL. Set for datasets whose stable path is unknown (opened via the generic
      object-open / wrap paths), so we never key a blob by an empty/ambiguous
@@ -107,10 +148,12 @@ static clio_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
   auto *dset = new clio_dataset_t;
   dset->obj.under_object = under;
   dset->obj.under_vol_id = under_vol_id;
+  dset->obj.kind = clio_kind_t::kDataset;
   dset->file = parent_file;
   dset->obj.parent_file = parent_file;
   dset->dataset_path = path ? path : "";
-  dset->cacheable = (parent_file != nullptr) && path && path[0] != '\0';
+  dset->cacheable = (parent_file != nullptr) && parent_file->cache_enabled &&
+                    path && path[0] != '\0';
   /* Register with the file so Safe-mode flush/close can drain this dataset's
      pending puts. Only cacheable datasets accumulate CTE puts. */
   if (dset->cacheable) {
@@ -121,13 +164,24 @@ static clio_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
 }
 
 /* Block until every async CTE put for this dataset has completed, then release
-   the shared-memory buffers. Shared by dataset_close and Safe-mode flush/close. */
-static void drain_dataset_puts(clio_dataset_t *dset) {
+   the shared-memory buffers. Shared by dataset_close and Safe-mode flush/close.
+
+   Returns false if ANY put reported a failure. Waiting is not the same as
+   succeeding: a put that landed with a non-zero return code left the cache
+   holding less than it believes it does, so the caller invalidates the
+   dataset's cache rather than leave a partially-staged image that a later read
+   would treat as a hit. The native file is authoritative and unaffected. */
+static bool drain_dataset_puts(clio_dataset_t *dset) {
+  bool ok = true;
   for (auto &future : dset->pending_puts) {
     future.Wait();
+    if (future->GetReturnCode() != 0) {
+      ok = false;
+    }
   }
   dset->pending_puts.clear();
   dset->pending_buffers.clear();
+  return ok;
 }
 
 /* VOL object-wrap context. HDF5 uses this during link/object iteration
@@ -160,10 +214,68 @@ static clio::cte::core::Client *get_cte_client() {
      LD_PRELOAD constructor to do it (the POSIX adapter inits in
      Filesystem::Filesystem -> CLIO_CTE_CLIENT_INIT()); without this the CTE
      client singleton is unbound and the first AsyncGetOrCreateTag segfaults.
-     Config comes from CLIO_SERVER_CONF, same as the runtime. */
+     Config comes from CLIO_SERVER_CONF, same as the runtime.
+
+     Returns nullptr when the runtime is unreachable. Callers MUST check: the
+     attach result was previously discarded, so an absent runtime faulted inside
+     H5Fcreate. There is always a correct fallback -- pass everything through to
+     the native VOL -- because the native file is authoritative and the CTE tier
+     is a performance layer, not a correctness one. */
   static std::once_flag once;
-  std::call_once(once, []() { clio::cte::core::CLIO_CTE_CLIENT_INIT(); });
-  return CLIO_CTE_CLIENT;
+  static bool attached = false;
+  std::call_once(once, []() {
+    attached = clio::cte::core::CLIO_CTE_CLIENT_INIT();
+    if (!attached) {
+      fprintf(stderr,
+              "[clio-vol] CLIO runtime unavailable; running as a pure "
+              "pass-through to the native VOL (cache disabled)\n");
+    }
+  });
+  return attached ? CLIO_CTE_CLIENT : nullptr;
+}
+
+/* Is the CTE cache path usable for this file at all? One check for the two
+   independent reasons it may not be: the user turned it off, or the runtime is
+   not there. */
+static bool clio_cache_usable(clio_file_t *file) {
+  return file && file->cache_enabled && get_cte_client() != nullptr;
+}
+
+/* Read the CLIO_VOL_CACHE opt-out. Default on; "0"/"off"/"false"/"no" disable
+   the CTE tier and make the connector a pure pass-through. Without this there
+   was NO configuration in which the connector could be loaded and not require a
+   CLIO runtime, which is what Safe mode's environment-robustness clause needs. */
+static bool clio_cache_env_enabled() {
+  const char *v = std::getenv("CLIO_VOL_CACHE");
+  if (!v || !*v) return true;
+  return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 ||
+           std::strcmp(v, "false") == 0 || std::strcmp(v, "no") == 0);
+}
+
+/* Drop this dataset's cached image so later reads miss and re-stage from the
+   authoritative native file. Used whenever the cache may no longer mirror the
+   file: a partial write, or a put that failed to land. Deleting chunk_0 (the
+   hit-test key) is sufficient -- a miss re-stages every chunk -- but the delete
+   itself must be CHECKED, because a failed invalidation leaves the cache
+   claiming to hold pre-write data. On failure the dataset is marked
+   uncacheable for the rest of the session, which is the fail-closed choice. */
+static void clio_invalidate_dataset(clio_dataset_t *dset) {
+  if (!dset || !dset->file || !dset->cacheable) return;
+  auto *cte_client = get_cte_client();
+  if (!cte_client) {
+    dset->cacheable = false;
+    return;
+  }
+  auto del = cte_client->AsyncDelBlob(dset->file->tag_id,
+                                      dset->dataset_path + "/chunk_0");
+  del.Wait();
+  if (del->GetReturnCode() != 0) {
+    fprintf(stderr,
+            "[clio-vol] cache invalidation failed for %s; bypassing the cache "
+            "for this dataset (native file is authoritative)\n",
+            dset->dataset_path.c_str());
+    dset->cacheable = false;
+  }
 }
 
 /* ========================================================================
@@ -242,12 +354,40 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
   return o;
 }
 
+/* Destroy a wrapper through its ACTUAL type. clio_dataset_t contains (does not
+   inherit) a clio_obj_t, so deleting one as a clio_obj_t* is undefined
+   behaviour and leaks its std::string, its two vectors, and the SHM buffers
+   they own. The kind tag exists to make this dispatch possible. */
+static void clio_destroy_wrapper(clio_obj_t *o) {
+  if (!o) return;
+  switch (o->kind) {
+    case clio_kind_t::kDataset: {
+      auto *dset = reinterpret_cast<clio_dataset_t *>(o);
+      if (dset->file && dset->cacheable) {
+        std::lock_guard<std::mutex> lk(dset->file->ds_mtx);
+        dset->file->open_datasets.erase(dset);
+      }
+      if (dset->file_type >= 0) H5Tclose(dset->file_type);
+      delete dset;
+      break;
+    }
+    case clio_kind_t::kFile:
+      delete reinterpret_cast<clio_file_t *>(o);
+      break;
+    case clio_kind_t::kObj:
+    default:
+      delete o;
+      break;
+  }
+}
+
 static void *clio_unwrap_object(void *obj) {
   auto *o = static_cast<clio_obj_t *>(obj);
   /* Symmetric with clio_wrap_object()'s H5VLwrap_object(): peel the native
      wrapper back off before discarding our wrapper. */
   void *under = H5VLunwrap_object(o->under_object, o->under_vol_id);
-  if (under) delete o;
+  /* Free the wrapper either way -- returning NULL previously leaked it. */
+  clio_destroy_wrapper(o);
   return under;
 }
 
@@ -270,33 +410,70 @@ static herr_t clio_free_wrap_ctx(void *_wrap_ctx) {
  * File callbacks
  * ======================================================================== */
 
-static void *clio_file_create(const char *name, unsigned flags,
-                                hid_t fcpl_id, hid_t fapl_id,
-                                hid_t dxpl_id, void **req) {
-  /* Get underlying VOL info */
-  hid_t under_vol_id = H5VL_NATIVE;
-  void *under_vol_info = nullptr;
-
-  /* Check if user provided Clio VOL info.
-   * HDF5 2.x split H5Pget_vol() into H5Pget_vol_id() + H5Pget_vol_info();
-     we only care about the info blob here. */
+/* Resolve the CTE chunk size for a file: connector info, then CLIO_VOL_CHUNK_SIZE,
+   then the built-in default. Shared so create and open cannot disagree -- open
+   previously never read the info struct at all, so a chunk_size set through
+   H5Pset_vol was silently honoured on create and ignored on open. */
+static size_t clio_resolve_chunk_size(hid_t fapl_id) {
+  size_t chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
   clio_vol_info_t *vol_info = nullptr;
   H5Pget_vol_info(fapl_id, reinterpret_cast<void **>(&vol_info));
-  size_t chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
-  if (vol_info) {
-    under_vol_id = vol_info->under_vol_id;
-    under_vol_info = vol_info->under_vol_info;
-    if (vol_info->chunk_size > 0) {
-      chunk_size = vol_info->chunk_size;
-    }
+  if (vol_info && vol_info->chunk_size > 0) {
+    chunk_size = vol_info->chunk_size;
   }
-
-  /* Check environment variable for chunk size */
   const char *env_chunk = std::getenv("CLIO_VOL_CHUNK_SIZE");
   if (env_chunk) {
     chunk_size = std::strtoul(env_chunk, nullptr, 10);
     if (chunk_size == 0) chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
   }
+  return chunk_size;
+}
+
+/* Build the connector's file wrapper around an already-opened native file, and
+   bind its CTE tag if the cache is usable. `truncated` means the native file was
+   just emptied (H5F_ACC_TRUNC), so any tag left over from a PREVIOUS file of the
+   same name describes data that no longer exists and must be dropped -- the tag
+   is keyed on the filename, which a truncate does not change. Without this,
+   creating a file over an old one and then reading a dataset the new file never
+   wrote would hit the old file's cached blobs. */
+static clio_file_t *clio_make_file(void *under_file, const char *name,
+                                     size_t chunk_size, bool truncated) {
+  auto *file = new clio_file_t;
+  file->obj.under_object = under_file;
+  file->obj.under_vol_id = H5VL_NATIVE;
+  file->obj.parent_file = file;          /* self-pointer */
+  file->obj.kind = clio_kind_t::kFile;
+  file->file_name = name;
+  file->chunk_size = chunk_size;
+  file->cache_enabled = clio_cache_env_enabled();
+  file->trace = clio::trace::open_file(name);
+
+  auto *cte_client = file->cache_enabled ? get_cte_client() : nullptr;
+  if (!cte_client) {
+    /* Pure pass-through: no tag, no cache. Correct, just unaccelerated. */
+    file->cache_enabled = false;
+    return file;
+  }
+
+  const std::string tag_name = std::string("hdf5:") + name;
+  if (truncated) {
+    auto del = cte_client->AsyncDelTag(tag_name);
+    del.Wait();  /* absent tag is a harmless no-op */
+  }
+  auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
+  tag_task.Wait();
+  if (tag_task->GetReturnCode() != 0) {
+    file->cache_enabled = false;
+    return file;
+  }
+  file->tag_id = tag_task->tag_id_;
+  return file;
+}
+
+static void *clio_file_create(const char *name, unsigned flags,
+                                hid_t fcpl_id, hid_t fapl_id,
+                                hid_t dxpl_id, void **req) {
+  size_t chunk_size = clio_resolve_chunk_size(fapl_id);
 
   /* Create file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -306,32 +483,14 @@ static void *clio_file_create(const char *name, unsigned flags,
   H5Pclose(native_fapl);
   if (!under_file) return nullptr;
 
-  /* Create CTE tag for this file */
-  auto *cte_client = get_cte_client();
-  auto tag_task = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + name);
-  tag_task.Wait();
-
-  /* Create file state */
-  auto *file = new clio_file_t;
-  file->obj.under_object = under_file;
-  file->obj.under_vol_id = H5VL_NATIVE;
-  file->obj.parent_file = file;          /* self-pointer */
-  file->tag_id = tag_task->tag_id_;
-  file->file_name = name;
-  file->chunk_size = chunk_size;
-  file->trace = clio::trace::open_file(name);
-
-  return file;
+  /* H5Fcreate always yields an empty file (TRUNC replaces an existing one,
+     EXCL/CREAT means there was none), so any pre-existing tag is stale. */
+  return clio_make_file(under_file, name, chunk_size, /*truncated*/ true);
 }
 
 static void *clio_file_open(const char *name, unsigned flags,
                               hid_t fapl_id, hid_t dxpl_id, void **req) {
-  size_t chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
-  const char *env_chunk = std::getenv("CLIO_VOL_CHUNK_SIZE");
-  if (env_chunk) {
-    chunk_size = std::strtoul(env_chunk, nullptr, 10);
-    if (chunk_size == 0) chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
-  }
+  size_t chunk_size = clio_resolve_chunk_size(fapl_id);
 
   /* Open file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -340,21 +499,7 @@ static void *clio_file_open(const char *name, unsigned flags,
   H5Pclose(native_fapl);
   if (!under_file) return nullptr;
 
-  /* Get or create CTE tag */
-  auto *cte_client = get_cte_client();
-  auto tag_task = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + name);
-  tag_task.Wait();
-
-  auto *file = new clio_file_t;
-  file->obj.under_object = under_file;
-  file->obj.under_vol_id = H5VL_NATIVE;
-  file->obj.parent_file = file;          /* self-pointer */
-  file->tag_id = tag_task->tag_id_;
-  file->file_name = name;
-  file->chunk_size = chunk_size;
-  file->trace = clio::trace::open_file(name);
-
-  return file;
+  return clio_make_file(under_file, name, chunk_size, /*truncated*/ false);
 }
 
 static herr_t clio_file_get(void *obj, H5VL_file_get_args_t *args,
@@ -367,15 +512,61 @@ static herr_t clio_file_get(void *obj, H5VL_file_get_args_t *args,
 static herr_t clio_file_specific(void *obj,
                                    H5VL_file_specific_args_t *args,
                                    hid_t dxpl_id, void **req) {
+  /* OBJECT-LESS OPERATIONS COME FIRST -- they are called with obj == NULL.
+     H5VL_FILE_IS_ACCESSIBLE and H5VL_FILE_DELETE act on a FILENAME, not on an
+     open file, so there is no object to unwrap and the cast below would be a
+     NULL dereference.
+
+     This is not a theoretical path. HDF5 walks it whenever an H5Fopen has to
+     work out WHICH connector can open a file: H5VL__file_open_find_connector_cb
+     iterates every plugin on HDF5_PLUGIN_PATH and asks each one
+     IS_ACCESSIBLE. So merely having this .so sitting in the plugin directory
+     was enough to turn a plain `H5Fopen` of a missing (or non-HDF5) file into a
+     SEGFAULT -- with the clio connector not selected, not requested, and
+     nothing in the application referring to it. Selecting it explicitly hid the
+     bug, because that path opens directly and never probes.
+
+     Delegation mirrors clio_file_open/create: copy the caller's FAPL, point it
+     at the native connector, and hand the operation to native with a NULL
+     object. args->args.*.fapl_id must be swapped too -- it is the FAPL native
+     will re-read, and leaving it pointing at a clio-VOL FAPL sends HDF5 straight
+     back into this connector (infinite recursion instead of an answer). */
+  if (args && (args->op_type == H5VL_FILE_IS_ACCESSIBLE ||
+               args->op_type == H5VL_FILE_DELETE)) {
+    hid_t *fapl_slot = (args->op_type == H5VL_FILE_IS_ACCESSIBLE)
+                           ? &args->args.is_accessible.fapl_id
+                           : &args->args.del.fapl_id;
+    hid_t saved_fapl = *fapl_slot;
+    hid_t native_fapl = H5Pcopy(saved_fapl);
+    if (native_fapl < 0) return -1;
+    H5Pset_vol(native_fapl, H5VL_NATIVE, nullptr);
+    *fapl_slot = native_fapl;
+    herr_t ret = H5VLfile_specific(nullptr, H5VL_NATIVE, args, dxpl_id, req);
+    *fapl_slot = saved_fapl; /* the caller owns theirs; give it back intact */
+    H5Pclose(native_fapl);
+    return ret;
+  }
+
   auto *file = static_cast<clio_file_t *>(obj);
+  if (!file) return -1; /* every remaining op requires an open file */
   /* Safe mode: on H5Fflush, drain every open cacheable dataset's pending CTE
-     puts BEFORE delegating the flush to native. This makes the flush a real
-     durability barrier for the cache path (fail-closed: we only return once all
-     async puts have landed), with the native file remaining authoritative. */
+     puts BEFORE delegating the flush to native, so no async write outlives a
+     successful flush. A put that failed invalidates that dataset's cache rather
+     than leaving a half-staged image a later read would treat as a hit. The
+     native file is written synchronously and stays authoritative throughout. */
   if (args && args->op_type == H5VL_FILE_FLUSH) {
-    std::lock_guard<std::mutex> lk(file->ds_mtx);
-    for (auto *dset : file->open_datasets) {
-      drain_dataset_puts(dset);
+    /* Snapshot under the lock, drain outside it: draining blocks on every
+       in-flight put, and holding ds_mtx across that serialises flush against
+       every concurrent dataset open/close. */
+    std::vector<clio_dataset_t *> to_drain;
+    {
+      std::lock_guard<std::mutex> lk(file->ds_mtx);
+      to_drain.assign(file->open_datasets.begin(), file->open_datasets.end());
+    }
+    for (auto *dset : to_drain) {
+      if (!drain_dataset_puts(dset)) {
+        clio_invalidate_dataset(dset);
+      }
     }
   }
   return H5VLfile_specific(file->obj.under_object, file->obj.under_vol_id,
@@ -401,9 +592,15 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
      close degree) so no async CTE put outlives the file. Datasets closed the
      normal way have already drained and unregistered themselves. */
   {
-    std::lock_guard<std::mutex> lk(file->ds_mtx);
-    for (auto *dset : file->open_datasets) {
-      drain_dataset_puts(dset);
+    std::vector<clio_dataset_t *> to_drain;
+    {
+      std::lock_guard<std::mutex> lk(file->ds_mtx);
+      to_drain.assign(file->open_datasets.begin(), file->open_datasets.end());
+    }
+    for (auto *dset : to_drain) {
+      if (!drain_dataset_puts(dset)) {
+        clio_invalidate_dataset(dset);
+      }
     }
   }
   herr_t ret = H5VLfile_close(file->obj.under_object, file->obj.under_vol_id,
@@ -588,6 +785,46 @@ static bool clio_read_is_whole(hid_t mem_space_id, hid_t file_space_id) {
          clio_space_is_natural_full(file_space_id);
 }
 
+/**
+ * True when the transfer's MEMORY datatype has the same element size as what
+ * HDF5 stores on disk for this dataset.
+ *
+ * The blob cache is a flat byte image whose length is derived from the
+ * transfer's datatype size (nelem * H5Tget_size(mem_type)). That is only a
+ * coherent key when the memory image and the file image agree on element size;
+ * otherwise the SAME dataset has different cached lengths depending on which
+ * type the caller happened to use, and a hit computed with one size reassembles
+ * blobs written with another. Concretely, without this check:
+ *
+ *   H5Dwrite(d, H5T_NATIVE_INT,  ...)   on an H5T_STD_I64LE dataset -> caches 4n
+ *   H5Dread (d, H5T_NATIVE_LONG, ...)   asks for 8n, hit-tests chunk_0 (present),
+ *                                       and reassembles 8n bytes from 4n -> the
+ *                                       tail is short/zero-filled garbage,
+ *                                       returned with a success status.
+ *
+ * HDF5 converts between memory and file types freely, so this is a legal and
+ * unremarkable thing for an application to do. The dataset's file type is
+ * fetched once and cached on the wrapper.
+ */
+static bool clio_type_matches_file(clio_dataset_t *dataset, hid_t mem_type_id,
+                                     hid_t dxpl_id) {
+  if (mem_type_id < 0) return false;
+  if (!dataset->file_type_probed) {
+    dataset->file_type_probed = 1;
+    H5VL_dataset_get_args_t ga;
+    ga.op_type = H5VL_DATASET_GET_TYPE;
+    ga.args.get_type.type_id = H5I_INVALID_HID;
+    if (H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
+                        &ga, dxpl_id, nullptr) >= 0 &&
+        ga.args.get_type.type_id >= 0) {
+      dataset->file_type = ga.args.get_type.type_id;
+      dataset->file_type_size = H5Tget_size(dataset->file_type);
+    }
+  }
+  if (dataset->file_type_size == 0) return false;  /* unknown -> don't cache */
+  return H5Tget_size(mem_type_id) == dataset->file_type_size;
+}
+
 static void *clio_dataset_create(void *obj,
                                    const H5VL_loc_params_t *loc_params,
                                    const char *name, hid_t lcpl_id,
@@ -756,9 +993,8 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
                                    hid_t file_space_id[],
                                    hid_t dxpl_id, const void *buf[],
                                    void **req) {
-  auto *cte_client = get_cte_client();
-
   const bool tracing = clio::trace::enabled();
+  herr_t ret_value = 0;
   for (size_t d = 0; d < count; ++d) {
     auto *dataset = static_cast<clio_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
@@ -768,22 +1004,26 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        CTE chunk cache. For no-file-reference, partial (hyperslab), or
        collective writes, persist to the native VOL only — caching a partial
        write under a whole-dataset key would poison a later whole read. */
-    if (!dataset->file || !dataset->cacheable ||
+    if (!clio_cache_usable(dataset->file) || !dataset->cacheable ||
         !clio_is_whole_read(mem_space_id[d], file_space_id[d]) ||
         !clio_type_is_cacheable(mem_type_id[d]) ||
+        !clio_type_matches_file(dataset, mem_type_id[d], dxpl_id) ||
         clio_is_collective(dxpl_id)) {
-      H5VLdataset_write(1, &dataset->obj.under_object,
+      /* The native VOL is the authoritative store: its status IS this call's
+         status. Discarding it (as this did) reported success for writes that
+         never reached the file -- ENOSPC, filter failure, a bad selection. */
+      herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                          dataset->obj.under_vol_id,
                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
                          dxpl_id, &buf[d], req);
+      if (rc < 0) ret_value = rc;
       /* This write did NOT refresh the whole linear image, so any cached image
          is now stale. Invalidate it (drop the chunk_0 hit-test key) so later
          whole/selection reads miss and re-stage fresh data from native. Without
-         this, a partial write followed by a cached read returns pre-write data. */
-      if (dataset->file && dataset->cacheable) {
-        auto del = cte_client->AsyncDelBlob(
-            dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
-        del.Wait();
+         this, a partial write followed by a cached read returns pre-write data.
+         Only meaningful if the write actually landed. */
+      if (rc >= 0) {
+        clio_invalidate_dataset(dataset);
       }
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kWrite, mem_type_id[d],
@@ -792,9 +1032,13 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
                             clio_since_us(t0));
       continue;
     }
+    auto *cte_client = get_cte_client();
 
-    /* Compute total data size from memory dataspace */
+    /* Compute total data size from memory dataspace. When we had to ask the
+       native dataset for its space we own that hid_t and must close it -- the
+       previous code leaked one per whole-dataset write. */
     hid_t space = mem_space_id[d];
+    hid_t owned_space = H5I_INVALID_HID;
     if (space == H5S_ALL) {
       /* Get dataspace from the native dataset */
       H5VL_dataset_get_args_t get_args;
@@ -803,8 +1047,10 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
                        &get_args, dxpl_id, nullptr);
       space = get_args.args.get_space.space_id;
+      owned_space = space;
     }
-    hssize_t nelem = H5Sget_simple_extent_npoints(space);
+    hssize_t nelem = (space >= 0) ? H5Sget_simple_extent_npoints(space) : -1;
+    if (owned_space >= 0) H5Sclose(owned_space);
     if (nelem <= 0) continue;
 
     size_t type_size = H5Tget_size(mem_type_id[d]);
@@ -834,18 +1080,27 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       dataset->pending_buffers.push_back(std::move(buffer));
     }
 
-    /* Also write to native VOL for metadata consistency */
-    H5VLdataset_write(1, &dataset->obj.under_object,
+    /* Write to the native VOL -- the authoritative store. Its status is this
+       call's status; if it failed, the bytes we just staged into CTE describe
+       data the file does not contain, so drop them. */
+    herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                        dataset->obj.under_vol_id,
                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
                        dxpl_id, &buf[d], req);
+    if (rc < 0) {
+      ret_value = rc;
+      drain_dataset_puts(dataset);
+      clio_invalidate_dataset(dataset);
+    }
     if (tracing)
       clio_trace_access(dataset, clio::trace::Op::kWrite, mem_type_id[d],
                           mem_space_id[d], file_space_id[d], dxpl_id,
-                          clio::trace::Served::kCache, clio_since_us(t0));
+                          rc < 0 ? clio::trace::Served::kUncacheable
+                                 : clio::trace::Served::kCache,
+                          clio_since_us(t0));
   }
 
-  return 0;
+  return ret_value;
 }
 
 /* True when the dataset's linear chunk cache is populated (a fully-staged cache
@@ -935,6 +1190,22 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     if (total_nelem <= 0 || type_size == 0) break;
     size_t total_size = static_cast<size_t>(total_nelem) * type_size;
 
+    /* INTERIM GUARD. Serving a selection currently materialises the WHOLE
+       dataset and gathers out of it, so a 1 KiB hyperslab against a 100 GiB
+       dataset would allocate 100 GiB -- an OOM, and strictly worse than simply
+       letting native do the read. Until the fetch is narrowed to the chunks the
+       selection actually touches (Q2.3), refuse to serve above a ceiling and
+       fall back to native. Tunable via CLIO_VOL_MAX_SERVE_BYTES; default 1 GiB. */
+    static const size_t kMaxServeBytes = []() -> size_t {
+      const char *v = std::getenv("CLIO_VOL_MAX_SERVE_BYTES");
+      if (v && *v) {
+        size_t n = std::strtoull(v, nullptr, 10);
+        if (n > 0) return n;
+      }
+      return (size_t)1 << 30;
+    }();
+    if (total_size > kMaxServeBytes) break;
+
     std::vector<char> full(total_size);
     if (!clio_read_cached_image(dataset, total_size, full.data())) break;
 
@@ -984,24 +1255,32 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                   hid_t file_space_id[],
                                   hid_t dxpl_id, void *buf[],
                                   void **req) {
-  auto *cte_client = get_cte_client();
   const bool tracing = clio::trace::enabled();
+  herr_t ret_value = 0;
 
   for (size_t d = 0; d < count; ++d) {
     auto *dataset = static_cast<clio_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
     auto t0 = std::chrono::steady_clock::now();
 
-    /* Native passthrough when there is no file reference, the type is not flat,
-       or the read is collective. The native VOL always produces correct data. */
-    bool cacheable_flat = dataset->file && dataset->cacheable &&
+    /* Native passthrough when the cache is unusable, there is no file
+       reference, the type is not flat, the memory type disagrees in size with
+       the stored type, or the read is collective. The native VOL always
+       produces correct data. */
+    bool cacheable_flat = clio_cache_usable(dataset->file) &&
+                          dataset->cacheable &&
                           clio_type_is_read_cacheable(mem_type_id[d]) &&
+                          clio_type_matches_file(dataset, mem_type_id[d],
+                                                 dxpl_id) &&
                           !clio_is_collective(dxpl_id);
     if (!cacheable_flat) {
-      H5VLdataset_read(1, &dataset->obj.under_object,
+      /* Propagate the native status: a failed read previously returned success
+         with the user's buffer untouched. */
+      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                         dataset->obj.under_vol_id,
                         &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
                         dxpl_id, &buf[d], req);
+      if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
                             mem_space_id[d], file_space_id[d], dxpl_id,
@@ -1009,6 +1288,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                             clio_since_us(t0));
       continue;
     }
+    auto *cte_client = get_cte_client();
 
     /* Partial (non-full-extent) selection → serve from the CTE tier when the
        linear cache is already populated (serve-only). On a miss, fall back to
@@ -1019,10 +1299,11 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                            mem_space_id[d], file_space_id[d],
                                            dxpl_id, buf[d]);
       if (!served) {
-        H5VLdataset_read(1, &dataset->obj.under_object,
+        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                           dataset->obj.under_vol_id,
                           &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
                           dxpl_id, &buf[d], req);
+        if (rc < 0) ret_value = rc;
       }
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -1044,10 +1325,11 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     if (space >= 0) H5Sclose(space);
     if (nelem <= 0) {
       /* Can't size it — fall back to native for safety. */
-      H5VLdataset_read(1, &dataset->obj.under_object,
+      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                         dataset->obj.under_vol_id,
                         &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
                         dxpl_id, &buf[d], req);
+      if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
                             mem_space_id[d], file_space_id[d], dxpl_id,
@@ -1077,11 +1359,16 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                    &mem_type_id[d], &mem_space_id[d],
                                    &file_space_id[d], dxpl_id, &buf[d], req);
       if (rc < 0) return rc;
-      for (size_t i = 0; i < num_chunks; ++i) {
+      /* Stage into the tier. Best-effort, but a PARTIAL stage must not be left
+         behind: chunk_0 present is the hit test, so a run that stages chunk_0
+         and then fails would make the next read a "hit" on an incomplete image.
+         Track it and invalidate rather than leave that trap. */
+      bool staged_ok = true;
+      for (size_t i = 0; i < num_chunks && staged_ok; ++i) {
         size_t offset = i * chunk_size;
         size_t this_size = std::min(chunk_size, total_size - offset);
         auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-        if (buffer.IsNull()) break;            /* caching is best-effort */
+        if (buffer.IsNull()) { staged_ok = false; break; }
         std::memcpy(buffer.ptr_, dst + offset, this_size);
         ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
         std::string blob_name = dataset->dataset_path + "/chunk_" +
@@ -1090,10 +1377,23 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
             dataset->file->tag_id, blob_name, offset, this_size, blob_data,
             -1.0f, clio::cte::core::Context(), 0);
         fut.Wait();
+        if (fut->GetReturnCode() != 0) staged_ok = false;
+      }
+      if (!staged_ok) {
+        clio_invalidate_dataset(dataset);
       }
     } else {
-      /* HIT — serve the whole image from the CTE tier. */
-      if (!clio_read_cached_image(dataset, total_size, dst)) return -1;
+      /* HIT — serve the whole image from the CTE tier. If reassembly fails we
+         have no data to return, so fall back to native rather than handing back
+         a partially-filled buffer with a success status. */
+      if (!clio_read_cached_image(dataset, total_size, dst)) {
+        clio_invalidate_dataset(dataset);
+        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
+                          dataset->obj.under_vol_id,
+                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
+                          dxpl_id, &buf[d], req);
+        if (rc < 0) ret_value = rc;
+      }
     }
     if (tracing)
       clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -1103,7 +1403,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                           clio_since_us(t0));
   }
 
-  return 0;
+  return ret_value;
 }
 
 static herr_t clio_dataset_get(void *obj, H5VL_dataset_get_args_t *args,
@@ -1117,6 +1417,25 @@ static herr_t clio_dataset_specific(void *obj,
                                       H5VL_dataset_specific_args_t *args,
                                       hid_t dxpl_id, void **req) {
   auto *dset = static_cast<clio_dataset_t *>(obj);
+  /* Safe mode: H5Dflush is a durability barrier at DATASET granularity, and the
+     spec names it alongside H5Fflush -- so drain this dataset's pending CTE puts
+     before delegating, exactly as file_specific does for the whole file. This
+     was previously a bare pass-through, so H5Dflush returned with async puts
+     still in flight.
+
+     H5Dset_extent changes the dataset's element count, which is what the linear
+     blob image is sized by, so the cached image no longer describes the dataset:
+     invalidate rather than serve a stale-length image. */
+  if (args) {
+    if (args->op_type == H5VL_DATASET_FLUSH) {
+      if (!drain_dataset_puts(dset)) {
+        clio_invalidate_dataset(dset);
+      }
+    } else if (args->op_type == H5VL_DATASET_SET_EXTENT) {
+      drain_dataset_puts(dset);
+      clio_invalidate_dataset(dset);
+    }
+  }
   return H5VLdataset_specific(dset->obj.under_object, dset->obj.under_vol_id,
                                args, dxpl_id, req);
 }
@@ -1131,9 +1450,13 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
     dset->file->open_datasets.erase(dset);
   }
 
-  /* Flush all pending async writes */
-  drain_dataset_puts(dset);
+  /* Flush all pending async writes; a failed put leaves a partial image, so
+     invalidate rather than let the next open treat it as a hit. */
+  if (!drain_dataset_puts(dset)) {
+    clio_invalidate_dataset(dset);
+  }
 
+  if (dset->file_type >= 0) H5Tclose(dset->file_type);
   herr_t ret = H5VLdataset_close(dset->obj.under_object,
                                   dset->obj.under_vol_id, dxpl_id, req);
   delete dset;
@@ -1294,6 +1617,23 @@ static herr_t clio_link_create(H5VL_link_create_args_t *args,
   return H5VLlink_create(args, o ? o->under_object : nullptr, loc_params,
                           o ? o->under_vol_id : H5VL_NATIVE,
                           lcpl_id, lapl_id, dxpl_id, req);
+}
+
+/* H5Lmove / H5Lrename. Left null, these failed outright through the connector —
+   a pass-through must forward every op it does not itself implement. */
+static herr_t clio_link_move(void *src_obj,
+                               const H5VL_loc_params_t *loc_params1,
+                               void *dst_obj,
+                               const H5VL_loc_params_t *loc_params2,
+                               hid_t lcpl_id, hid_t lapl_id,
+                               hid_t dxpl_id, void **req) {
+  auto *s = static_cast<clio_obj_t *>(src_obj);
+  auto *d = static_cast<clio_obj_t *>(dst_obj);
+  /* Either endpoint may be null (a move can name one side purely by path). */
+  hid_t vol_id = s ? s->under_vol_id : (d ? d->under_vol_id : H5VL_NATIVE);
+  return H5VLlink_move(s ? s->under_object : nullptr, loc_params1,
+                        d ? d->under_object : nullptr, loc_params2,
+                        vol_id, lcpl_id, lapl_id, dxpl_id, req);
 }
 
 static herr_t clio_link_copy(void *src_obj,
@@ -1460,9 +1800,10 @@ static herr_t clio_introspect_get_conn_cls(void *obj,
 static herr_t clio_introspect_get_cap_flags(const void *info,
                                               uint64_t *cap_flags) {
   (void)info;
-  *cap_flags = H5VL_CAP_FLAG_FILE_BASIC | H5VL_CAP_FLAG_DATASET_BASIC |
-               H5VL_CAP_FLAG_GROUP_BASIC | H5VL_CAP_FLAG_ATTR_BASIC |
-               H5VL_CAP_FLAG_LINK_BASIC | H5VL_CAP_FLAG_OBJECT_BASIC;
+  /* Same constant the class advertises. These previously disagreed -- the class
+     literal omitted LINK_BASIC and OBJECT_BASIC that this callback reported --
+     so what the connector claimed depended on which one HDF5 asked. */
+  *cap_flags = CLIO_VOL_CAP_FLAGS;
   return 0;
 }
 
@@ -1513,6 +1854,109 @@ static herr_t clio_blob_optional(void *obj, void *blob_id,
   return H5VLblob_optional(o->under_object, o->under_vol_id, blob_id, args);
 }
 
+/* ------------------------------------------------------------------------
+ * Optional-op passthrough. Every subclass's `optional` callback carries the
+ * connector-specific ops HDF5 (and other pass-through connectors) dispatch
+ * through the VOL — for datasets that includes direct chunk I/O
+ * (H5Dread_chunk / H5Dwrite_chunk / H5Dchunk_iter). Left null, those calls fail
+ * through this connector even though the native VOL beneath supports them. The
+ * file subclass already forwarded (it must, for H5VL_NATIVE_FILE_POST_OPEN);
+ * these complete the set. Mirrors H5VLpassthru.
+ * ------------------------------------------------------------------------ */
+static herr_t clio_attr_optional(void *obj, H5VL_optional_args_t *args,
+                                   hid_t dxpl_id, void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLattr_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
+}
+
+static herr_t clio_dataset_optional(void *obj, H5VL_optional_args_t *args,
+                                      hid_t dxpl_id, void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLdataset_optional(o->under_object, o->under_vol_id, args, dxpl_id,
+                               req);
+}
+
+static herr_t clio_datatype_optional(void *obj, H5VL_optional_args_t *args,
+                                       hid_t dxpl_id, void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLdatatype_optional(o->under_object, o->under_vol_id, args, dxpl_id,
+                                req);
+}
+
+static herr_t clio_group_optional(void *obj, H5VL_optional_args_t *args,
+                                    hid_t dxpl_id, void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLgroup_optional(o->under_object, o->under_vol_id, args, dxpl_id,
+                             req);
+}
+
+static herr_t clio_link_optional(void *obj,
+                                   const H5VL_loc_params_t *loc_params,
+                                   H5VL_optional_args_t *args, hid_t dxpl_id,
+                                   void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLlink_optional(o->under_object, loc_params, o->under_vol_id, args,
+                            dxpl_id, req);
+}
+
+static herr_t clio_object_optional(void *obj,
+                                     const H5VL_loc_params_t *loc_params,
+                                     H5VL_optional_args_t *args, hid_t dxpl_id,
+                                     void **req) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLobject_optional(o->under_object, loc_params, o->under_vol_id, args,
+                              dxpl_id, req);
+}
+
+/* ------------------------------------------------------------------------
+ * Object tokens — passthrough. Tokens are the VOL-agnostic identity of an
+ * object; H5Oget_info-driven code compares and serialises them via these. Left
+ * null, H5Otoken_cmp/to_str/from_str fail through the connector.
+ * ------------------------------------------------------------------------ */
+static herr_t clio_token_cmp(void *obj, const H5O_token_t *token1,
+                               const H5O_token_t *token2, int *cmp_value) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLtoken_cmp(o->under_object, o->under_vol_id, token1, token2,
+                        cmp_value);
+}
+
+static herr_t clio_token_to_str(void *obj, H5I_type_t obj_type,
+                                  const H5O_token_t *token, char **token_str) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLtoken_to_str(o->under_object, obj_type, o->under_vol_id, token,
+                           token_str);
+}
+
+static herr_t clio_token_from_str(void *obj, H5I_type_t obj_type,
+                                    const char *token_str, H5O_token_t *token) {
+  auto *o = static_cast<clio_obj_t *>(obj);
+  return H5VLtoken_from_str(o->under_object, obj_type, o->under_vol_id,
+                             token_str, token);
+}
+
+/* Connector-info comparison. HDF5 uses this to decide whether two FAPLs select
+   the same connector configuration; without it, infos that differ are treated
+   as equal. Compares the fields that actually change behaviour. */
+static herr_t clio_info_cmp(int *cmp_value, const void *_info1,
+                              const void *_info2) {
+  const auto *i1 = static_cast<const clio_vol_info_t *>(_info1);
+  const auto *i2 = static_cast<const clio_vol_info_t *>(_info2);
+  if (!i1 || !i2) {
+    *cmp_value = (i1 == i2) ? 0 : (i1 ? 1 : -1);
+    return 0;
+  }
+  if (i1->under_vol_id != i2->under_vol_id) {
+    *cmp_value = (i1->under_vol_id < i2->under_vol_id) ? -1 : 1;
+    return 0;
+  }
+  if (i1->chunk_size != i2->chunk_size) {
+    *cmp_value = (i1->chunk_size < i2->chunk_size) ? -1 : 1;
+    return 0;
+  }
+  *cmp_value = 0;
+  return 0;
+}
+
 /* ========================================================================
  * VOL connector class definition
  * ======================================================================== */
@@ -1522,15 +1966,14 @@ const H5VL_class_t H5VL_clio_cls = {
     /* value        */ CLIO_VOL_CONNECTOR_VALUE,
     /* name         */ CLIO_VOL_CONNECTOR_NAME,
     /* conn_version */ CLIO_VOL_CONNECTOR_VERSION,
-    /* cap_flags    */ H5VL_CAP_FLAG_FILE_BASIC | H5VL_CAP_FLAG_DATASET_BASIC |
-                       H5VL_CAP_FLAG_GROUP_BASIC | H5VL_CAP_FLAG_ATTR_BASIC,
+    /* cap_flags    */ CLIO_VOL_CAP_FLAGS,
     /* initialize   */ nullptr,
     /* terminate    */ nullptr,
 
     /* info_cls */ {
         /* size    */ sizeof(clio_vol_info_t),
         /* copy    */ clio_info_copy,
-        /* cmp     */ nullptr,
+        /* cmp     */ clio_info_cmp,
         /* free    */ clio_info_free,
         /* to_str  */ nullptr,
         /* from_str*/ nullptr,
@@ -1551,7 +1994,7 @@ const H5VL_class_t H5VL_clio_cls = {
         /* write    */ clio_attr_write,
         /* get      */ clio_attr_get,
         /* specific */ clio_attr_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_attr_optional,
         /* close    */ clio_attr_close,
     },
 
@@ -1562,7 +2005,7 @@ const H5VL_class_t H5VL_clio_cls = {
         /* write    */ clio_dataset_write,
         /* get      */ clio_dataset_get,
         /* specific */ clio_dataset_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_dataset_optional,
         /* close    */ clio_dataset_close,
     },
 
@@ -1571,7 +2014,7 @@ const H5VL_class_t H5VL_clio_cls = {
         /* open     */ clio_datatype_open,
         /* get      */ clio_datatype_get,
         /* specific */ clio_datatype_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_datatype_optional,
         /* close    */ clio_datatype_close,
     },
 
@@ -1589,17 +2032,17 @@ const H5VL_class_t H5VL_clio_cls = {
         /* open     */ clio_group_open,
         /* get      */ clio_group_get,
         /* specific */ clio_group_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_group_optional,
         /* close    */ clio_group_close,
     },
 
     /* link_cls */ {
         /* create   */ clio_link_create,
         /* copy     */ clio_link_copy,
-        /* move     */ nullptr,
+        /* move     */ clio_link_move,
         /* get      */ clio_link_get,
         /* specific */ clio_link_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_link_optional,
     },
 
     /* object_cls */ {
@@ -1607,7 +2050,7 @@ const H5VL_class_t H5VL_clio_cls = {
         /* copy     */ clio_object_copy,
         /* get      */ clio_object_get,
         /* specific */ clio_object_specific,
-        /* optional */ nullptr,
+        /* optional */ clio_object_optional,
         /* (no close — objects are closed by their specific type class) */
     },
 
@@ -1626,7 +2069,7 @@ const H5VL_class_t H5VL_clio_cls = {
     },
 
     /* token_cls */ {
-        nullptr, nullptr,
+        clio_token_cmp, clio_token_to_str, clio_token_from_str,
     },
 
     /* optional */ nullptr,

@@ -1,0 +1,40 @@
+---
+# Indexer restart test (issue #905): CTE core on a FILE-backed tier (bytes
+# survive the reboot) + the indexer chimod above it. Both restart: true so
+# re-composing after a daemon restart takes the Restart() path — the core
+# replays its metadata WAL, then the indexer rebuilds its term index from
+# the restored storage (BlobQuery + GetBlob against next_pool_id).
+runtime:
+  num_threads: 4
+  queue_depth: 256
+  conf_dir: /tmp/clio_indexer_restart_test
+
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_indexer_restart
+    pool_query: local
+    pool_id: "512.0"
+    restart: true
+    storage:
+      - path: /tmp/clio_indexer_restart_test/file_dev
+        bdev_type: file
+        capacity_limit: 100MB
+        # Without this the target defaults to "volatile" and the restart
+        # restore drops every block placed on it — the rebuild would then
+        # (correctly) find nothing to index.
+        persistence_level: "temporary"
+    performance:
+      metadata_log_path: /tmp/clio_indexer_restart_test/metadata.log
+      transaction_log_capacity: 32MB
+      flush_metadata_period_ms: 0
+      flush_data_period_ms: 0
+
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    restart: true
+    next_pool_id: "512.0"
+    # Module WAL (issue #905): phase 2 verifies searches served from the
+    # RESTORED index — no rescan of storage happens on restart.
+    index_log_path: /tmp/clio_indexer_restart_test/indexer_index.log

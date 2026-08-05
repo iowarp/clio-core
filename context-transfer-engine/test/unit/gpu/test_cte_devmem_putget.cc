@@ -21,8 +21,8 @@
  *   1. Kernel mutates the device-side POD (writes pattern to blob_data,
  *      then calls Send) and waits on the device-side gpu::FutureShm.
  *   2. CPU GPU worker pops the task, D2H-copies the POD into a host
- *      scratch slot, calls Container::FixupAfterCopy to relocate the
- *      clio::run::priv::string SSO data_ pointer, runs the chimod handler,
+ *      scratch slot and runs the chimod handler directly — the Pod*Blob
+ *      tasks are bitwise-relocatable, so no post-copy fixup step exists —
  *      then H2D-copies the (mutated) POD back to the original device
  *      address and flips FUTURE_COMPLETE on the device fshm via
  *      cudaMemcpy.
@@ -30,7 +30,7 @@
  *      device memory, and proceeds to GetBlob.
  *
  * The two-task round-trip gives us end-to-end coverage of:
- *   - Device→host POD copy + SSO fixup on the inbound path.
+ *   - Device→host POD copy consumed with zero fixup on the inbound path.
  *   - DeviceAwareMemcpy on the bdev side reading kDeviceMem blob_data.
  *   - Host→device POD writeback so the kernel sees output fields.
  *   - cudaMemcpy of the FUTURE_COMPLETE flag word as the device-fshm

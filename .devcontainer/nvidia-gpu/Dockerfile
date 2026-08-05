@@ -245,8 +245,29 @@ RUN if id ubuntu >/dev/null 2>&1; then \
 USER iowarp
 WORKDIR /workspace
 
+ARG LMCACHE_REF=v0.5.1
+ARG LMCACHE_SRC=/opt/lmcache
+
+USER root
+RUN mkdir -p /opt && chown -R iowarp:iowarp /opt
+
+USER iowarp
+RUN git clone --depth 1 --branch ${LMCACHE_REF} https://github.com/LMCache/LMCache.git ${LMCACHE_SRC}
+ENV TORCH_CUDA_ARCH_LIST="8.0;9.0;12.0+PTX"
+RUN /bin/bash -lc "source /home/iowarp/venv/bin/activate && \
+    pip install --no-cache-dir uv && \
+    cd ${LMCACHE_SRC} && \
+    uv pip install -r requirements/build.txt && \
+    uv pip install vllm --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match && \
+    LMCACHE_CUDA_MAJOR=12 uv pip install -e . --no-build-isolation"
+
+ENV PYTHONPATH=/workspace:/opt/lmcache
+
 # Install Claude Code for AI-assisted development
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Install OpenAI Codex for AI-assisted development
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/bin/bash"]

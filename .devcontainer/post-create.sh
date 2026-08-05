@@ -38,3 +38,10 @@ sudo service ssh start
 
 # Activate Python virtual environment
 echo "Python venv available at ${HOME_DIR}/venv (auto-activated in new shells)"
+
+# Provision YCSB + comparison stores into external/ (issue #862).
+# Best-effort: benchmark tooling must not block container creation.
+if [ -x /workspace/docker/provision-ycsb.sh ]; then
+    /workspace/docker/provision-ycsb.sh /workspace || \
+        echo "WARN: YCSB provisioning incomplete (re-run docker/provision-ycsb.sh)"
+fi

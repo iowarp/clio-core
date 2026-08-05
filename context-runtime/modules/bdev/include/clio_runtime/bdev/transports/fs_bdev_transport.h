@@ -10,6 +10,9 @@
 #include <clio_runtime/bdev/transports/block_allocator.h>
 #include <clio_ctp/io/async_io_factory.h>
 
+#include <atomic>
+#include <mutex>
+
 namespace clio::run::bdev {
 
 /**
@@ -47,9 +50,23 @@ class FsBdevTransport : public BdevTransport {
   std::string file_path_;
   clio::run::u32 io_depth_;
 
+  // #858: lazy backing-file growth. The file is truncated to at most one
+  // growth unit at Init and extended in growth-unit steps as allocations
+  // cross the backed frontier — never the full capacity up front (on NTFS
+  // SetEndOfFile claims clusters eagerly, so the old full-capacity truncate
+  // physically reserved the whole tier at compose).
+  clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;
+  std::atomic<clio::run::u64> file_backed_bytes_{0};
+  std::mutex grow_mu_;
+
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();
   WorkerIOContext* GetWorkerIOContext(size_t worker_id);
+
+  /** Extend the backing file so [0, end_offset) is inside it (growth-unit
+   *  granularity, capped at capacity). Returns false if the extension fails
+   *  (e.g. the disk is genuinely full). */
+  bool EnsureFileBacked(clio::run::u64 end_offset);
 };
 
 } // namespace clio::run::bdev

@@ -88,6 +88,12 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+# Queue-depth flurry test executable (issue #822)
+set(QUEUE_DEPTH_FLURRY_TEST_TARGET clio_run_queue_depth_flurry_tests)
+set(QUEUE_DEPTH_FLURRY_TEST_SOURCES
+  test_queue_depth_flurry.cc
+)
+
 
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
@@ -487,6 +493,39 @@ set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Queue-depth flurry test (issue #822): SHM client + RuntimeServer, POSIX-only
+# like the other daemon-spawning tests.
+add_executable(${QUEUE_DEPTH_FLURRY_TEST_TARGET} ${QUEUE_DEPTH_FLURRY_TEST_SOURCES})
+
+target_include_directories(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${QUEUE_DEPTH_FLURRY_TEST_TARGET}
+  clio_run_cxx               # Main CLIO Runtime library
+  clio_bdev_client        # Bdev module client
+  clio_admin_client       # Admin module client
+  ctp::cxx                  # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${QUEUE_DEPTH_FLURRY_TEST_TARGET} clio_run)
+target_compile_definitions(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+set_target_properties(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 endif()
@@ -944,6 +983,20 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 300
   )
   endif()  # NOT WIN32 (ipc_transport_modes tests)
+
+  # Queue-depth flurry test (issue #822): tiny queue_depth + task flurry must
+  # not hang (the TIMEOUT is the hang detector).
+  if(NOT WIN32)
+  add_test(
+    NAME cr_queue_depth_flurry
+    COMMAND ${QUEUE_DEPTH_FLURRY_TEST_TARGET} "QueueDepthFlurry - depth 16 survives a 4096-task flurry"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_queue_depth_flurry PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 300
+  )
+  endif()
 
   # Client Retry Tests (POSIX fork-based — Linux/macOS only)
   # NOTE: Each test case must run in its own process because CLIO_INIT has

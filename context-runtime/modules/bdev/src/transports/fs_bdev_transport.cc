@@ -78,26 +78,62 @@ bool FsBdevTransport::Init(const CreateParams& params,
     return false;
   }
 
-  clio::run::u64 file_size = 0;
   off_t current_size = setup_io->GetFileSize();
   if (current_size < 0) {
     HLOG(kError, "Failed to get file size for: {}", file_path_);
     setup_io->Close();
     return false;
   }
-  file_size = static_cast<clio::run::u64>(current_size);
+  clio::run::u64 existing = static_cast<clio::run::u64>(current_size);
 
-  if (params.total_size_ > 0 && params.total_size_ < file_size) {
+  // Device capacity (what the allocator hands out): the configured size when
+  // one is given, else the existing file's size, else a 1GB default.
+  //
+  // #858 semantic change: a configured capacity is no longer clamped to a
+  // smaller existing file. With lazy growth, "backing file smaller than
+  // capacity" is the NORMAL state after any restart (the file only ever grew
+  // as far as allocations reached), so the old min(existing, configured)
+  // clamp would silently shrink the device to its previously-touched prefix
+  // on every restart. The existing file is instead treated as the
+  // already-backed prefix, and growth resumes from there.
+  clio::run::u64 file_size;
+  if (params.total_size_ > 0) {
     file_size = params.total_size_;
+  } else if (existing > 0) {
+    file_size = existing;
+  } else {
+    file_size = 1ULL << 30;
   }
 
-  if (file_size == 0) {
-    file_size = (params.total_size_ > 0) ? params.total_size_ : (1ULL << 30);
-    if (!setup_io->Truncate(static_cast<size_t>(file_size))) {
+  // #858: growth granularity for the lazy backing-file extension
+  // (EnsureFileBacked). 0 disables stepping — each allocation extends the
+  // file exactly as far as it needs.
+  growth_unit_ = params.growth_unit_;
+
+  if (existing == 0) {
+    // Fresh (empty) backing file: truncate only the FIRST growth unit into
+    // existence. The rest of the file materializes in EnsureFileBacked as
+    // allocations cross the backed frontier. This keeps a 500GB
+    // capacity_limit from claiming 500GB at compose time on filesystems that
+    // allocate eagerly on a size set (NTFS SetEndOfFile; any FS without
+    // sparse files) and gives ENOSPC a chance to surface at allocation time
+    // instead of mid-write.
+    clio::run::u64 initial = file_size;
+    if (growth_unit_ > 0 && growth_unit_ < initial) {
+      initial = growth_unit_;
+    }
+    if (!setup_io->Truncate(static_cast<size_t>(initial))) {
       HLOG(kError, "Failed to truncate file");
       setup_io->Close();
       return false;
     }
+    file_backed_bytes_.store(initial, std::memory_order_relaxed);
+  } else {
+    // Existing file: its current extent is the already-backed prefix (capped
+    // at the device capacity — a larger file than the device just has spare
+    // tail the allocator will never address).
+    file_backed_bytes_.store(existing < file_size ? existing : file_size,
+                             std::memory_order_relaxed);
   }
 
   setup_io->Close();
@@ -118,7 +154,68 @@ void FsBdevTransport::Destroy() {
 }
 
 bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
-  return allocator_.AllocateBlocks(size, worker_id, blocks);
+  if (!allocator_.AllocateBlocks(size, worker_id, blocks)) {
+    return false;
+  }
+  // #858: back every returned block with real file before the caller can
+  // touch it. Reads of allocated-but-unwritten blocks must land inside the
+  // file (and return zeros) exactly as they did when the whole capacity was
+  // truncated up front — a block past EOF would short-read instead.
+  clio::run::u64 end = 0;
+  for (const Block &b : blocks) {
+    clio::run::u64 e = b.offset_ + b.size_;
+    if (e > end) end = e;
+  }
+  if (!EnsureFileBacked(end)) {
+    // The disk cannot actually provide the space the allocator promised.
+    // Fail the allocation cleanly (the caller sees the same "no space"
+    // result as an exhausted allocator) instead of handing out blocks whose
+    // writes would EIO later.
+    allocator_.FreeBlocks(worker_id, blocks);
+    blocks.clear();
+    return false;
+  }
+  return true;
+}
+
+bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
+  // Fast path: recycled or low blocks are already inside the backed prefix.
+  if (end_offset <= file_backed_bytes_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(grow_mu_);
+  clio::run::u64 backed = file_backed_bytes_.load(std::memory_order_relaxed);
+  if (end_offset <= backed) {
+    return true;  // another thread grew past us while we waited
+  }
+  // Grow in growth-unit steps (capped at capacity) so a bump-allocation
+  // stream costs one truncate per unit, not one per allocation.
+  clio::run::u64 target = end_offset;
+  if (growth_unit_ > 0) {
+    target = ((end_offset + growth_unit_ - 1) / growth_unit_) * growth_unit_;
+  }
+  clio::run::u64 capacity = allocator_.GetCapacity();
+  if (capacity > 0 && target > capacity) {
+    target = capacity;
+  }
+  auto io = OpenBackingFile(io_depth_, file_path_);
+  if (!io) {
+    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
+    return false;
+  }
+  bool ok = io->Truncate(static_cast<size_t>(target));
+  io->Close();
+  if (!ok) {
+    HLOG(kError,
+         "EnsureFileBacked: failed to grow {} from {} to {} bytes — treating "
+         "as out of space",
+         file_path_, backed, target);
+    return false;
+  }
+  HLOG(kDebug, "EnsureFileBacked: grew {} from {} to {} bytes", file_path_,
+       backed, target);
+  file_backed_bytes_.store(target, std::memory_order_release);
+  return true;
 }
 
 void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {

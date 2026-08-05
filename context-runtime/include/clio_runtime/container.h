@@ -42,6 +42,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "clio_runtime/batch_groups.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/corwlock.h"
 #include "clio_runtime/pool_query.h"
@@ -238,6 +239,33 @@ class Container {
   }
 
   /**
+   * OPT-IN inline (same-thread) execution for pure in-memory methods.
+   *
+   * A caller that is ALREADY on a worker thread and holds an in-process
+   * container may invoke this instead of submitting a task, skipping the
+   * whole enqueue -> other worker -> event-queue-completion round trip
+   * (~20us). Only a method that is synchronous (no I/O, no co_await, no
+   * suspension) and safe to run on ANY worker thread may be wired up here;
+   * everything else must keep returning false so the caller falls back to
+   * the normal task path. First user: bdev kAllocateBlocks, a pure block-
+   * allocator call that was costing a full task round trip per fresh-blob
+   * PutBlob (the dominant small-write cost: 4 KiB Put d64 39k -> 91k IOPS
+   * when allocation is skipped entirely).
+   *
+   * @param method  The module's method id being requested inline.
+   * @param in      Method-specific input (documented at the override).
+   * @param out     Method-specific output (documented at the override).
+   * @return true if the method was executed inline (out is valid);
+   *         false if unsupported here — caller must submit the task instead.
+   */
+  virtual bool InlineOp(u32 method, void *in, void *out) {
+    (void)method;
+    (void)in;
+    (void)out;
+    return false;
+  }
+
+  /**
    * Predict CPU time: a * (compute + 1).
    * @param method_id Method being executed
    * @param stat Task statistics from GetTaskStats()
@@ -350,26 +378,6 @@ class Container {
    */
   virtual TaskResume Run(u32 method,
                          clio::run::shared_ptr<Task> task_ptr) = 0;
-
-  /**
-   * Fix up POD bytewise-copied tasks (clio::run::priv::string SSO data_
-   * pointers, etc.) before dispatching Run. Called by the GPU2CPU pop
-   * path when the kernel's task was in kDeviceMem and the worker had
-   * to D2H-copy the POD bytes into a host scratch buffer — at that
-   * point any embedded `data_` pointers still reference the original
-   * device buffer offsets and must be re-pointed at the scratch copy.
-   *
-   * Default no-op for chimods whose tasks are already trivially
-   * relocatable (no SSO strings, no SVO vectors). Each chimod that
-   * has SSO/SVO members should override and dispatch per method to
-   * the per-task `FixupAfterCopy()`.
-   */
-  virtual void FixupAfterCopy(u32 method,
-                              clio::run::shared_ptr<Task> &task_ptr) {
-    (void)method;
-    (void)task_ptr;
-  }
-
 
   /**
    * Get remaining work count for this container - PURE VIRTUAL
@@ -574,6 +582,47 @@ class Container {
     (void)method;
     (void)agg_task;
     (void)member_task;
+  }
+
+  // ---- issue #820: worker-local task batching ----------------------------
+  //
+  // A worker may collect a bounded run of ready tasks and give a container the
+  // chance to COALESCE them before any of them executes: N independent tasks
+  // become a minimal set of merged tasks, each completing the parents it
+  // subsumed. This is not the ManyToOne collective in BatchManager (which
+  // reduces N inputs to 1 and broadcasts one result back); here the output is
+  // a *subset* of tasks and each carries a different parent set.
+  //
+  // Both hooks default to "not batchable" / "nothing to do", so a container
+  // that does not opt in behaves exactly as before.
+
+  /**
+   * Offer `task` to this container's batching policy.
+   *
+   * Return true to take ownership: the task has been parked in `groups` under
+   * whatever key the container chose, and the worker will NOT execute it now.
+   * Return false to decline, and the worker runs it as-is.
+   *
+   * @param method   the task's method id
+   * @param task     the candidate (already routed ExecHere, so it is local)
+   * @param groups   the worker's per-key parking area, reused across phases
+   */
+  virtual bool BuildBatch(u32 method, const clio::run::shared_ptr<Task> &task,
+                          BatchGroups &groups) {
+    (void)method;
+    (void)task;
+    (void)groups;
+    return false;
+  }
+
+  /**
+   * Collapse everything parked in `groups` into merged tasks and hand each to
+   * `sink`, naming the parent tasks it completes. Called once per phase after
+   * all BuildBatch offers. The container must leave `groups` empty.
+   */
+  virtual void SmashBatch(BatchGroups &groups, BatchSink &sink) {
+    (void)groups;
+    (void)sink;
   }
 
   // NOTE: There is no DelTask virtual. Tasks are clio::run::shared_ptr handles

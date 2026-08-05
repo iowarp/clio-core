@@ -127,6 +127,17 @@ bool Runtime::LoadPerfStatsFile(const std::string &path, PerfMetrics &metrics,
 
 void Runtime::LoadPerfStats() {
   perf_stats_path_ = MakePerfStatsPath(pool_name_);
+  // Memory-class bdevs NEVER restore persisted perf stats. Their real
+  // performance is stable and high, so a persisted profile can only carry
+  // risk: one measurement taken through a contended/wedged window (observed:
+  // a RAM tier persisted at 0.098 MB/s write) is restored forever after and
+  // silently INVERTS tiering — max_bw then places every blob, cache copies
+  // included, on disk. Disk-class devices keep the warm start; their
+  // measured profiles vary for real reasons.
+  if (bdev_type_ == BdevType::kRam || bdev_type_ == BdevType::kHbm ||
+      bdev_type_ == BdevType::kPinned) {
+    return;
+  }
   PerfMetrics m;
   float wall_read = 0.0f;
   float wall_write = 0.0f;
@@ -244,6 +255,30 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+bool Runtime::InlineOp(clio::run::u32 method, void *in, void *out) {
+  // See the header comment: kAllocateBlocks only, pure in-memory, safe from
+  // any worker thread. Everything else falls back to the task path.
+  if (method != Method::kAllocateBlocks || in == nullptr || out == nullptr) {
+    return false;
+  }
+  auto *blocks = static_cast<std::vector<Block> *>(out);
+  if (bdev_type_ == BdevType::kNoop) {
+    return true;  // matches the handler: rc=0, no blocks
+  }
+  const clio::run::u64 size = *static_cast<clio::run::u64 *>(in);
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  const int worker_id = (worker != nullptr) ? static_cast<int>(worker->GetId()) : 0;
+  std::vector<Block> local_blocks;
+  if (!transport_->AllocateBlocks(static_cast<size_t>(size), worker_id,
+                                  local_blocks)) {
+    return false;  // ENOSPC etc. — task-path fallback owns error reporting
+  }
+  for (const auto &b : local_blocks) {
+    blocks->push_back(b);
+  }
+  return true;
 }
 
 clio::run::TaskResume Runtime::AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task) {

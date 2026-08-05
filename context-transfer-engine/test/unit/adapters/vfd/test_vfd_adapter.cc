@@ -254,6 +254,15 @@ herr_t FindClioErr(unsigned n, const H5E_error2_t *err, void *data) {
 }  // namespace
 
 int main() {
+  // Cap a single kernel I/O call at 4 KiB for the whole suite. The driver
+  // splits any larger transfer into bounded passes and resumes; in production
+  // that threshold is 1 GiB and only enormous transfers reach it, which would
+  // make the multi-pass path effectively untestable. Lowering it here means
+  // every section exercises splitting and resuming, while the constant stream
+  // of sub-4 KiB metadata I/O still covers the single-pass case. Must be set
+  // before the driver's first use -- it is read once.
+  setenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
+
   if (!InitRuntime()) {
     std::fprintf(stderr, "[vfd-suite] FAIL: runtime/CTE init\n");
     return 1;
@@ -785,6 +794,258 @@ int main() {
     H5Pclose(rfapl);
     H5Pclose(wfapl);
     std::printf("[vfd-suite] ok 15: no-pending-dirty-state barrier (flush finalizes the image)\n");
+  }
+
+  // === 16. cmp() compares file IDENTITY, not the filename string ==========
+  // HDF5 uses the driver's cmp() to decide whether an already-open file IS the
+  // same file. Comparing names made every spelling of one path look like a
+  // different file, so the library could open it twice with two independent
+  // metadata caches -- corruption, not a performance bug. H5Fget_fileno exposes
+  // the shared file struct HDF5 settled on, so equal filenos == cmp() matched.
+  // Three spellings that must all resolve to one file: with the clio:: marker,
+  // without it, and via a redundant path component.
+  {
+    const char *kClioId = "clio::/tmp/clio_cte_vfd_ident.h5";
+    const char *kNativeId = "/tmp/clio_cte_vfd_ident.h5";
+    const char *kDotted = "/tmp/../tmp/clio_cte_vfd_ident.h5";
+    std::remove(kNativeId);
+    hid_t fapl_id_ = H5Pcopy(fapl);
+    CHECK(fapl_id_ >= 0 &&
+              H5Pset_file_locking(fapl_id_, /*use*/ false, /*ignore*/ true) >= 0,
+          "16: fapl (locking off so the same file can be opened twice)");
+
+    hid_t c = H5Fcreate(kClioId, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id_);
+    CHECK(c >= 0 && WriteDset(c, "d", H5T_NATIVE_INT32, MakeI32(kSmall)) &&
+              H5Fclose(c) >= 0,
+          "16: seed the file");
+
+    hid_t a = H5Fopen(kClioId, H5F_ACC_RDONLY, fapl_id_);
+    hid_t b = H5Fopen(kNativeId, H5F_ACC_RDONLY, fapl_id_);
+    hid_t e = H5Fopen(kDotted, H5F_ACC_RDONLY, fapl_id_);
+    CHECK(a >= 0 && b >= 0 && e >= 0, "16: open the same file three ways");
+
+    unsigned long fa_no = 0, fb_no = 0, fe_no = 0;
+    CHECK(H5Fget_fileno(a, &fa_no) >= 0 && H5Fget_fileno(b, &fb_no) >= 0 &&
+              H5Fget_fileno(e, &fe_no) >= 0,
+          "16: H5Fget_fileno on all three");
+    CHECK(fa_no == fb_no,
+          "16: clio::-marked and bare paths are ONE file (cmp by dev/ino)");
+    CHECK(fa_no == fe_no,
+          "16: redundant path components resolve to the same file");
+
+    // Two genuinely different files must still compare different.
+    const char *kOther = "clio::/tmp/clio_cte_vfd_ident_other.h5";
+    std::remove("/tmp/clio_cte_vfd_ident_other.h5");
+    hid_t o = H5Fcreate(kOther, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id_);
+    CHECK(o >= 0 && WriteDset(o, "d", H5T_NATIVE_INT32, MakeI32(kSmall)) &&
+              H5Fclose(o) >= 0,
+          "16: seed a second file");
+    hid_t o2 = H5Fopen(kOther, H5F_ACC_RDONLY, fapl_id_);
+    unsigned long fo_no = 0;
+    CHECK(o2 >= 0 && H5Fget_fileno(o2, &fo_no) >= 0, "16: fileno of file 2");
+    CHECK(fo_no != fa_no, "16: distinct files still compare distinct");
+
+    CHECK(H5Fclose(a) >= 0 && H5Fclose(b) >= 0 && H5Fclose(e) >= 0 &&
+              H5Fclose(o2) >= 0,
+          "16: close all");
+    H5Pclose(fapl_id_);
+    std::printf("[vfd-suite] ok 16: cmp() by device+inode, not filename\n");
+  }
+
+  // === 17. H5Pget_fapl_clio round-trips the policy ========================
+  {
+    hid_t p = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(p >= 0, "17: H5Pcreate");
+    hbool_t got = 1;
+    CHECK(H5Pset_fapl_clio(p, /*cache_enabled*/ 0) >= 0, "17: set cache off");
+    CHECK(H5Pget_fapl_clio(p, &got) >= 0 && got == 0, "17: get reports off");
+    CHECK(H5Pset_fapl_clio(p, /*cache_enabled*/ 1) >= 0, "17: set cache on");
+    CHECK(H5Pget_fapl_clio(p, &got) >= 0 && got == 1, "17: get reports on");
+
+    // Driver selected with no driver-info block: the getter must report the
+    // default the open would actually use, not fail.
+    hid_t q = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(q >= 0 && H5Pset_driver(q, H5FD_clio_init(), nullptr) >= 0,
+          "17: H5Pset_driver with NULL info");
+    got = 0;
+    CHECK(H5Pget_fapl_clio(q, &got) >= 0 && got == 1,
+          "17: default policy reported when no driver-info block is set");
+
+    // Negative: a FAPL that does not select this driver, and a NULL out-param.
+    H5E_auto2_t of = nullptr;
+    void *od = nullptr;
+    H5Eget_auto2(H5E_DEFAULT, &of, &od);
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+    hid_t plain = H5Pcreate(H5P_FILE_ACCESS);
+    herr_t bad_drv = H5Pget_fapl_clio(plain, &got);
+    herr_t bad_out = H5Pget_fapl_clio(p, nullptr);
+    H5Eset_auto2(H5E_DEFAULT, of, od);
+    CHECK(bad_drv < 0, "17: rejects a FAPL not using the CLIO VFD");
+    CHECK(bad_out < 0, "17: rejects a NULL out parameter");
+
+    H5Pclose(plain);
+    H5Pclose(q);
+    H5Pclose(p);
+    std::printf("[vfd-suite] ok 17: H5Pget_fapl_clio round-trip\n");
+  }
+
+  // === 18. Transfers larger than one kernel I/O call ======================
+  // A single pread/pwrite is capped by the kernel (~2 GiB on Linux) and can
+  // also be cut short by a signal, so the driver splits every transfer into
+  // bounded passes and resumes. A short result must be treated as "continue
+  // from here", NOT as end-of-file -- treating it as EOF zero-fills the
+  // remainder and hands back zeros in place of real data. Exercised at a small
+  // threshold (CLIO_VFD_MAX_IO_BYTES, set by the parent process below) so the
+  // multi-pass path runs on kilobytes instead of needing gigabytes; the split
+  // and resume logic is identical at any threshold.
+  //
+  // The value must survive intact across many passes, including a final pass
+  // shorter than the cap and a dataset that is an exact multiple of it.
+  {
+    const char *kClioMp = "clio::/tmp/clio_cte_vfd_multipass.h5";
+    std::remove("/tmp/clio_cte_vfd_multipass.h5");
+    // 64 KiB of doubles against a 4 KiB cap => 16+ passes per transfer.
+    const hsize_t kN = 8192;
+    std::vector<double> w = MakeF64(kN);
+
+    hid_t f = H5Fcreate(kClioMp, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    CHECK(f >= 0, "18: create");
+    CHECK(WriteDset(f, "multipass", H5T_NATIVE_DOUBLE, w), "18: write");
+    // An exact multiple of the cap: the loop must terminate cleanly with no
+    // trailing zero-length pass.
+    std::vector<int32_t> aligned = MakeI32(1024);  // 4096 B == the cap
+    CHECK(WriteDset(f, "aligned", H5T_NATIVE_INT32, aligned),
+          "18: write an exact multiple of the transfer cap");
+    CHECK(H5Fclose(f) >= 0, "18: close");
+
+    hid_t f2 = H5Fopen(kClioMp, H5F_ACC_RDONLY, fapl);
+    CHECK(f2 >= 0, "18: reopen");
+    CHECK(ReadDsetEq(f2, "multipass", H5T_NATIVE_DOUBLE, w),
+          "18: multi-pass transfer round-trips byte-clean (no zero-filled tail)");
+    CHECK(ReadDsetEq(f2, "aligned", H5T_NATIVE_INT32, aligned),
+          "18: cap-aligned transfer round-trips byte-clean");
+    CHECK(H5Fclose(f2) >= 0, "18: close");
+
+    // Read it back with NO VFD to prove the bytes really are on disk, rather
+    // than a matching pair of bugs in the write and read paths.
+    hid_t fn = H5Fopen("/tmp/clio_cte_vfd_multipass.h5", H5F_ACC_RDONLY,
+                       H5P_DEFAULT);
+    CHECK(fn >= 0, "18: reopen natively");
+    CHECK(ReadDsetEq(fn, "multipass", H5T_NATIVE_DOUBLE, w),
+          "18: native reader sees the same bytes");
+    CHECK(H5Fclose(fn) >= 0, "18: close native");
+    std::printf("[vfd-suite] ok 18: transfers split across multiple I/O passes\n");
+  }
+
+  // === 19. Closing a file with objects still open ========================
+  // The driver's default close degree decides what H5Fclose does when datasets
+  // are still open: close the file immediately and invalidate them, or defer
+  // until the last one closes. Applications observe the difference, so it must
+  // match what they would get natively. Compare against sec2 rather than
+  // asserting one particular behavior.
+  {
+    const char *kClioCd = "clio::/tmp/clio_cte_vfd_closedeg.h5";
+    const char *kSec2Cd = "/tmp/clio_cte_vfd_closedeg_sec2.h5";
+    std::remove("/tmp/clio_cte_vfd_closedeg.h5");
+    std::remove(kSec2Cd);
+
+    auto close_with_open_dataset = [&](const char *path, hid_t fa) -> int {
+      hid_t f = H5Fcreate(path, H5F_ACC_TRUNC, H5P_DEFAULT, fa);
+      if (f < 0) return -99;
+      hsize_t dims[1] = {16};
+      hid_t sp = H5Screate_simple(1, dims, nullptr);
+      hid_t d = H5Dcreate2(f, "d", H5T_NATIVE_INT32, sp, H5P_DEFAULT,
+                           H5P_DEFAULT, H5P_DEFAULT);
+      if (d < 0) return -99;
+      // Close the FILE while the dataset is still open, then ask whether the
+      // dataset id is still usable. That answer is the close degree.
+      herr_t fc = H5Fclose(f);
+      H5E_auto2_t af = nullptr;
+      void *ad = nullptr;
+      H5Eget_auto2(H5E_DEFAULT, &af, &ad);
+      H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+      hid_t still = H5Dget_space(d);
+      H5Eset_auto2(H5E_DEFAULT, af, ad);
+      int alive = (still >= 0) ? 1 : 0;
+      if (still >= 0) H5Sclose(still);
+      // Only close the dataset if it survived; under the other degree the file
+      // close already took it, and closing a dead id just logs a spurious error.
+      if (alive) H5Dclose(d);
+      H5Sclose(sp);
+      return (fc < 0) ? -1 : alive;
+    };
+
+    int clio_behavior = close_with_open_dataset(kClioCd, fapl);
+    int sec2_behavior = close_with_open_dataset(kSec2Cd, H5P_DEFAULT);
+    CHECK(clio_behavior != -99 && sec2_behavior != -99,
+          "19: both close-degree probes ran");
+    CHECK(clio_behavior == sec2_behavior,
+          "19: closing with an open dataset behaves the same as sec2");
+    std::printf("[vfd-suite] ok 19: close-with-open-objects matches sec2 "
+                "(objects %s)\n",
+                clio_behavior == 1 ? "stay usable" : "are invalidated");
+  }
+
+  // === 20. Rejecting unusable file names =================================
+  // An empty name -- directly, or one that is empty once the clio:: marker is
+  // stripped -- has no authoritative file behind it. It must be refused with a
+  // real error, not dereferenced.
+  {
+    H5E_auto2_t of = nullptr;
+    void *od = nullptr;
+    H5Eget_auto2(H5E_DEFAULT, &of, &od);
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+    hid_t empty = H5Fcreate("", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    hid_t marker_only = H5Fcreate("clio::", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    H5Eset_auto2(H5E_DEFAULT, of, od);
+    CHECK(empty < 0, "20: an empty file name is refused");
+    CHECK(marker_only < 0, "20: a name that is empty once stripped is refused");
+    if (empty >= 0) H5Fclose(empty);
+    if (marker_only >= 0) H5Fclose(marker_only);
+    std::printf("[vfd-suite] ok 20: unusable file names are refused\n");
+  }
+
+  // === 21. A file already locked by another opener =======================
+  // Section 8 proves the driver TAKES the lock. This is the other direction:
+  // when someone else already holds it, the open must fail closed AND say why.
+  // Lock contention is the failure a user is most likely to hit and least able
+  // to diagnose from a bare error code.
+  {
+    const char *kClioBusy = "clio::/tmp/clio_cte_vfd_busy.h5";
+    const char *kNativeBusy = "/tmp/clio_cte_vfd_busy.h5";
+    std::remove(kNativeBusy);
+    hid_t fapl_lk = H5Pcopy(fapl);
+    CHECK(fapl_lk >= 0 &&
+              H5Pset_file_locking(fapl_lk, /*use*/ true, /*ignore*/ false) >= 0,
+          "21: force file locking on");
+    hid_t seed = H5Fcreate(kClioBusy, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_lk);
+    CHECK(seed >= 0 && WriteDset(seed, "d", H5T_NATIVE_INT32, MakeI32(kSmall)) &&
+              H5Fclose(seed) >= 0,
+          "21: seed the file");
+
+    // An unrelated process-level lock holder.
+    int holder = ::open(kNativeBusy, O_RDWR);
+    CHECK(holder >= 0 && ::flock(holder, LOCK_EX | LOCK_NB) == 0,
+          "21: take an exclusive lock outside HDF5");
+
+    H5E_auto2_t of = nullptr;
+    void *od = nullptr;
+    H5Eget_auto2(H5E_DEFAULT, &of, &od);
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+    H5Eclear2(H5E_DEFAULT);
+    hid_t blocked = H5Fopen(kClioBusy, H5F_ACC_RDWR, fapl_lk);
+    bool found_clio_err = false;
+    H5Ewalk2(H5E_DEFAULT, H5E_WALK_UPWARD, FindClioErr, &found_clio_err);
+    H5Eset_auto2(H5E_DEFAULT, of, od);
+
+    CHECK(blocked < 0, "21: opening a file locked by another holder fails");
+    CHECK(found_clio_err,
+          "21: the driver explains WHY the locked open failed");
+    ::flock(holder, LOCK_UN);
+    ::close(holder);
+    H5Pclose(fapl_lk);
+    std::printf("[vfd-suite] ok 21: a file locked elsewhere fails with a "
+                "diagnosable error\n");
   }
 
   H5Pclose(fapl);

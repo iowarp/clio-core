@@ -408,6 +408,28 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
   clio::run::Future<clio::run::Task> queued_future;
   bool did_send = false;
 
+  // TEMP NET TRACE (issue #892): measure the ACTUAL tick rate of this
+  // periodic — the drain's byte budget × tick rate caps cross-node BW.
+  {
+    static bool trace_on = std::getenv("CLIO_NET_TRACE") != nullptr;
+    if (trace_on) {
+      static std::atomic<uint64_t> ticks{0};
+      static std::atomic<int64_t> window_start_ns{0};
+      uint64_t t = ++ticks;
+      if (t % 512 == 1) {
+        int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        int64_t prev = window_start_ns.exchange(now);
+        if (prev != 0) {
+          double secs = (now - prev) / 1e9;
+          HLOG(kInfo, "[NETTRACE sendpoll] 512 ticks in {}s = {}/s",
+               secs, 512.0 / secs);
+        }
+      }
+    }
+  }
+
   // Per-tick maintenance: retries and dead-node fanout.
   CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
   CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
@@ -2004,6 +2026,22 @@ clio::run::TaskResume Runtime::RecoverContainers(
 
     // Only dest node creates the container
     if (static_cast<clio::run::u64>(ra.dest_node_id_) != self_node_id) continue;
+
+    // Idempotence guard (issue #856): a Broadcast task executes once per
+    // LOCAL container of the pool, and after a prior recovery a survivor
+    // hosts more than one admin container — so this handler runs multiple
+    // times with the same assignment list. Re-creating and re-registering an
+    // already-recovered container constructs a second module instance and
+    // drops the first mid-use (the free(): invalid pointer aborts that kill
+    // the new leader during leader-election). Skip assignments that are
+    // already satisfied locally.
+    if (pool_manager->GetContainer(ra.pool_id_, ra.container_id_)) {
+      HLOG(kInfo,
+           "Recovery: container {} for pool {} already present locally; "
+           "skipping duplicate recovery",
+           ra.container_id_, ra.pool_name_);
+      continue;
+    }
 
     HLOG(kInfo, "Recovery: Creating container {} for pool {} ({})",
          ra.container_id_, ra.pool_name_, ra.chimod_name_);

@@ -676,16 +676,6 @@ class vector {
 
  public:
   /**
-   * Re-seat data_.ptr_ to this object's inline SVO buffer after a memcpy.
-   * Call after cudaMemcpy/memcpy when the vector was using SVO (size <= SVO_SIZE).
-   * Preserves size_ and the data already in svo_[].
-   */
-  CTP_INLINE_CROSS_FUN
-  void FixupSvoPtr() {
-    data_.ptr_ = svo_data();
-  }
-
-  /**
    * Default constructor (no allocator).
    * Creates an empty vector with SVO buffer available.
    */

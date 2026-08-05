@@ -41,6 +41,28 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
+  /**
+   * Inline execution (Container::InlineOp) for kAllocateBlocks ONLY.
+   *
+   * The AllocateBlocks handler is a pure in-memory allocator call
+   * (StandardBlockAllocator: per-worker-id free-list shards + atomic heap
+   * bump) with no I/O and no co_await, and it already runs on whatever
+   * worker the router picks — so calling it directly from another module's
+   * worker (with THAT worker's id) is the same concurrency pattern the task
+   * path exercises today. Skipping the task round trip removes the dominant
+   * per-op cost of fresh-blob small writes.
+   *
+   *   method: Method::kAllocateBlocks
+   *   in:     clio::run::u64*                     (bytes to allocate)
+   *   out:    std::vector<clio::run::bdev::Block>* (blocks; appended)
+   *
+   * Returns false for every other method, and ALSO on allocation failure
+   * (ENOSPC) — the caller then falls back to the task path, which fails the
+   * same way but keeps a single error-reporting surface. kNoop bdevs report
+   * success with no blocks, matching the task handler.
+   */
+  bool InlineOp(clio::run::u32 method, void *in, void *out) override;
+
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
   clio::run::TaskResume AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task);
   clio::run::TaskResume FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> &task);

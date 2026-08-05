@@ -1,0 +1,20 @@
+# Cache ChiMod (issue #886 cache/replication split) — the TOP of the clio-fs
+# interposition chain. Keeps a node-local UNTRANSFORMED copy of each blob in
+# the CTE core's REPLICA_CACHE slot (serving the SHM zero-IPC fast path and
+# raw task reads) while pushing the authoritative bytes down `next` (usually
+# the compressor -> replication -> core) with a write-back sweep. Speaks the
+# core's task interface: point a clio::cte::core::Client at this pool.
+module_name: cache
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core data verbs (MUST equal the core's ids)
+kPutBlob: 15
+kGetBlob: 16
+kGetBlobSize: 23
+kMultiPutBlob: 48
+

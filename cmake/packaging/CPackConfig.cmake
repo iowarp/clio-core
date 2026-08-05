@@ -74,6 +74,15 @@ if(CLIO_CORE_ENABLE_DEB_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
         set(CPACK_DEBIAN_PACKAGE_DEPENDS
             "${CPACK_DEBIAN_PACKAGE_DEPENDS}, python3, python3-flask, python3-yaml, python3-msgpack")
     endif()
+    # The FUSE adapter binary (clio_cte_fuse) links libfuse3.so.3 and
+    # mounting needs the setuid fusermount3 helper from the fuse3 package.
+    # Without these the shipped binary dies at exec with a dynamic-linker
+    # error on any host that never installed fuse (#899). libfuse3-dev is
+    # the -dev-name convention used for every other dep above.
+    if(CLIO_CTE_ENABLE_FUSE_ADAPTER)
+        set(CPACK_DEBIAN_PACKAGE_DEPENDS
+            "${CPACK_DEBIAN_PACKAGE_DEPENDS}, libfuse3-dev, fuse3")
+    endif()
 
     # Use Debian-standard filename: <pkg>_<ver>-<rel>_<arch>.deb. Without this,
     # CPack defaults to "iowarp-core-<ver>-Linux.deb" with no arch suffix, so
@@ -110,6 +119,13 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
         set(CPACK_RPM_PACKAGE_REQUIRES
             "${CPACK_RPM_PACKAGE_REQUIRES}, python3, python3-flask, python3-pyyaml, python3-msgpack")
     endif()
+    # FUSE runtime deps for clio_cte_fuse — same rationale as the DEB
+    # branch above (#899): fuse3-devel pulls libfuse3.so.3, fuse3 provides
+    # fusermount3 for actually mounting.
+    if(CLIO_CTE_ENABLE_FUSE_ADAPTER)
+        set(CPACK_RPM_PACKAGE_REQUIRES
+            "${CPACK_RPM_PACKAGE_REQUIRES}, fuse3-devel, fuse3")
+    endif()
     # Disable auto-generated Requires on internal libraries. With AUTOREQ
     # default-on, rpmbuild scans every installed .so and adds a
     # Requires: lib<x>.so()(64bit) for each one — including our OWN
@@ -144,6 +160,37 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 
     message(STATUS "CPack: RPM generator enabled")
+endif()
+
+# Windows Package Configuration (ZIP archive + NSIS installer .exe)
+if(CLIO_CORE_ENABLE_WINDOWS_PACKAGE)
+    list(APPEND CPACK_GENERATOR "ZIP" "NSIS")
+    set(CPACK_GENERATORS_ENABLED ON)
+
+    # Same component filter as DEB/RPM: package the default (Unspecified)
+    # component only, in one artifact. Without the *_COMPONENT_INSTALL
+    # switches CPack falls back to monolithic mode and drags wheel-only
+    # pip_package files (iowarp_core.pth, ...) into the archive/installer.
+    set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+    set(CPACK_NSIS_COMPONENT_INSTALL ON)
+
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "iowarp-core")
+    set(CPACK_NSIS_PACKAGE_NAME "IOWarp Core ${PROJECT_VERSION}")
+    set(CPACK_NSIS_DISPLAY_NAME "IOWarp Core")
+    # Offer the "add bin/ to PATH" checkbox so `clio_run` works from any
+    # terminal after install.
+    set(CPACK_NSIS_MODIFY_PATH ON)
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+
+    # Arch-suffixed filenames, matching the DEB/RPM rationale above.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_win_arch "win64")
+    else()
+        set(_win_arch "win32")
+    endif()
+    set(CPACK_PACKAGE_FILE_NAME "iowarp-core-${PROJECT_VERSION}-${_win_arch}")
+
+    message(STATUS "CPack: ZIP + NSIS generators enabled (${_win_arch})")
 endif()
 
 # Legacy TGZ support (from CLIO_CORE_ENABLE_CPACK)

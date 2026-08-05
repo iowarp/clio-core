@@ -25,6 +25,7 @@
 #include "../runtime_server.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -53,15 +54,39 @@ TEST_CASE("DaemonDetachedSpawn - transport initializes without a console (#721)"
   constexpr unsigned kPort = 10615;
   const std::string log_path =
       (fs::temp_directory_path() / "clio_detached_spawn.log").string();
-  ::remove(log_path.c_str());
   test::SetEnvVar("CLIO_TEST_SERVER_LOG", log_path);
   test::SetEnvVar("CTP_LOG_LEVEL", "info");
-  test::SetEnvVar("CLIO_PORT", std::to_string(kPort));
 
   // Spawn the daemon with NO controlling console (the #721 failure mode).
+  //
+  // Issue #848 (most frequent cluster member): on the Windows runners the
+  // daemon sometimes dies ~200ms into startup — its captured log ends
+  // abruptly mid-init with no error, the signature of colliding with a
+  // lingering prior daemon's port / named shared-memory segments rather
+  // than anything #721-related. Retry the spawn on a FRESH port (fresh
+  // port-keyed segment names) before declaring failure; the #721 assertion
+  // below is unaffected by which attempt produced the daemon.
   test::RuntimeServer server;
-  REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true, /*detached=*/true));
-  REQUIRE(server.WaitForReady());
+  bool ready = false;
+  unsigned port = kPort;
+  for (int attempt = 0; attempt < 3 && !ready; ++attempt, port += 7) {
+    ::remove(log_path.c_str());
+    test::SetEnvVar("CLIO_PORT", std::to_string(port));
+    if (!server.Start(port, "127.0.0.1", /*ephemeral=*/true,
+                      /*detached=*/true)) {
+      continue;
+    }
+    ready = server.WaitForReady();
+    if (!ready) {
+      std::printf(
+          "[detached-spawn] attempt %d on port %u: daemon not ready "
+          "(IsRunning=%d); daemon log follows:\n----\n%s\n----\n",
+          attempt, port, static_cast<int>(server.IsRunning()),
+          ReadWholeFile(log_path).c_str());
+      server.Stop();
+    }
+  }
+  REQUIRE(ready);
 
   // Connect a TCP client: its DEALER must reach the daemon's ROUTER (the socket
   // that WSAStartup failure left dead). Bound the wait so a dead transport fails

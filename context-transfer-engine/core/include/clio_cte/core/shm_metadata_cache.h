@@ -37,6 +37,7 @@
 #include <clio_ctp/data_structures/ipc/string.h>
 #include <clio_ctp/data_structures/ipc/unordered_map.h>
 
+#include "clio_cte/core/blob_transform.h"
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/types.h"
 
@@ -49,13 +50,23 @@ using ShmCacheString = ctp::ipc::string<ShmCacheAlloc>;
 /**
  * Maximum blocks stored inline in a cached blob record.
  *
- * Deliberately small and FIXED. The fast path exists for SMALL blobs (design
- * §5.3: for a 1 GB blob a 72 us round-trip is already noise), and a small blob
- * has few blocks. Capping the block list keeps the record a plain POD with no
- * nested allocation and no second pointer chase for a lock-free reader; a blob
- * with more blocks than this simply is not cacheable and takes the RPC path.
+ * FIXED, because capping the block list keeps the record a plain POD with no
+ * nested allocation and no second pointer chase for a lock-free reader.
+ *
+ * SIZED AGAINST THE ALLOCATOR, NOT AGAINST "small blobs" (issue #817). The
+ * CTE caps every physical block at kMaxBlockChunk = 64 KB (core_runtime.cc,
+ * ExtendBlob) so that freed extents can be reused under fragmentation, which
+ * means block count scales with blob SIZE: a 1 MiB blob is 16 blocks, not one.
+ * At the original value of 8 every blob above 512 KB was marked truncated and
+ * refused -- including every clio-fs page, since kFsPageSize is exactly 1 MiB.
+ * 16 covers a full page.
+ *
+ * The cost is resident: each block descriptor is 32 B, so this is +256 B per
+ * cached blob (the table is preallocated, see ShmMetadataCacheRoot). Raising it
+ * further to chase larger blobs is the wrong trade -- the round-trip it saves
+ * is already noise next to the memcpy at that size.
  */
-static constexpr clio::run::u32 kMaxInlineBlocks = 8;
+static constexpr clio::run::u32 kMaxInlineBlocks = 16;
 
 /**
  * One block of a cached blob.
@@ -80,9 +91,14 @@ enum ShmBlobFlags : clio::run::u32 {
   /** Every block is node-local AND RAM-backed, so the payload is directly
    *  readable from shared memory. Without this the client must use RPC. */
   kShmBlobDirectReadable = 1u << 0,
-  /** The blob had more blocks than kMaxInlineBlocks, so blocks_ is truncated
-   *  and MUST NOT be used for a payload read. */
+  /** The blob had more blocks than kMaxInlineBlocks, so blocks_ describes only
+   *  a PREFIX of it. Reads bounded by CoveredBytes() are still served; reads
+   *  past the prefix must fall back to RPC. */
   kShmBlobTruncated = 1u << 1,
+  /** The stored bytes are transformed (compressed/encrypted/...), so copying
+   *  them out verbatim would hand the caller codec bytes. Mirrors
+   *  BlobInfo::IsTransformed(); see transform_flags_ below. */
+  kShmBlobTransformed = 1u << 2,
 };
 
 /**
@@ -109,8 +125,37 @@ struct ShmBlobRecord {
   float score_;
   clio::run::u32 flags_;
   clio::run::u32 num_blocks_;
-  clio::run::u32 reserved_;
+  /**
+   * Verbatim mirror of BlobInfo::transform_flags_ (issue #818) -- the
+   * authoritative "these are not the caller's bytes" word, carried so a client
+   * can tell WHY the fast path was refused and, later, undo the transform
+   * itself. Occupies the slot formerly named `reserved_`, so the record's size
+   * and layout are unchanged.
+   *
+   * Note total_size_ is the STORED size. For a transformed blob that is the
+   * post-transform byte count, which is not the blob's logical length -- one
+   * more reason a transformed record must never serve a direct read.
+   */
+  clio::run::u32 transform_flags_;
   ShmBlockDesc blocks_[kMaxInlineBlocks];
+
+  /**
+   * Serving-replica extension (issue #886 cache/replication split). When the
+   * PRIMARY is refused (transformed, absent, or not direct-readable), a
+   * client may serve the read from an UNTRANSFORMED node-local RAM-backed
+   * replica instead — in practice the REPLICA_CACHE copy the cache chimod
+   * maintains while the authoritative bytes live compressed further down
+   * the chain. rep_direct_ follows the same default-refuse discipline as
+   * kShmBlobDirectReadable: it is set only when EVERY published replica
+   * block qualifies, and replicas whose layouts exceed the inline array are
+   * not published at all (no truncated-prefix mode for replicas).
+   * placement_gen_ covers replica layout changes too — replica writers and
+   * the cache-reclaim path bump it before republishing.
+   */
+  clio::run::u32 rep_direct_;      // 1 = replica descriptor serves reads
+  clio::run::u32 rep_num_blocks_;
+  clio::run::u64 rep_total_size_;  // the replica copy's logical size
+  ShmBlockDesc rep_blocks_[kMaxInlineBlocks];
 
   ShmBlobRecord()
       : total_size_(0),
@@ -120,12 +165,64 @@ struct ShmBlobRecord {
         score_(0.0f),
         flags_(0),
         num_blocks_(0),
-        reserved_(0) {}
+        transform_flags_(0),
+        rep_direct_(0),
+        rep_num_blocks_(0),
+        rep_total_size_(0) {}
 
-  /** True if the payload may be read directly out of shared memory. */
+  /** Bytes readable from the published replica descriptor. */
+  clio::run::u64 RepCoveredBytes() const {
+    clio::run::u64 n = 0;
+    for (clio::run::u32 i = 0; i < rep_num_blocks_ && i < kMaxInlineBlocks;
+         ++i) {
+      n += rep_blocks_[i].size_;
+    }
+    return n;
+  }
+
+  /** True when the replica descriptor may serve direct reads. */
+  bool HasServableReplica() const {
+    return rep_direct_ != 0 && rep_num_blocks_ > 0;
+  }
+
+  /** True if this blob's stored bytes have been rewritten by some transform. */
+  bool IsTransformed() const {
+    return transform_flags_ != 0 || (flags_ & kShmBlobTransformed) != 0;
+  }
+
+  /**
+   * True if the payload may be read directly out of shared memory.
+   *
+   * A TRUNCATED record still qualifies (issue #817). The cached blocks are the
+   * blob's first blocks in logical order, so they describe a known prefix
+   * exactly; refusing the whole blob threw away complete information about the
+   * part it did have. Callers must bound the read by CoveredBytes(), not by
+   * total_size_ -- that is what keeps a truncated record safe.
+   *
+   * A TRANSFORMED record never qualifies (issue #818): its stored bytes are a
+   * codec's output, so copying them out would succeed and return the wrong
+   * thing. The transform check is deliberately redundant with the runtime
+   * clearing kShmBlobDirectReadable when it builds the record: this is the
+   * "default must be refuse" discipline the cache is built on, so a future
+   * writer that forgets to clear the flag still cannot cause a client to hand
+   * codec bytes back as data.
+   */
   bool IsDirectReadable() const {
-    return (flags_ & kShmBlobDirectReadable) != 0 &&
-           (flags_ & kShmBlobTruncated) == 0 && num_blocks_ > 0;
+    return (flags_ & kShmBlobDirectReadable) != 0 && !IsTransformed() &&
+           num_blocks_ > 0;
+  }
+
+  /**
+   * Logical bytes described by the cached blocks: the length of the prefix of
+   * this blob that can be read from shared memory. Equals total_size_ unless
+   * the record is truncated.
+   */
+  clio::run::u64 CoveredBytes() const {
+    clio::run::u64 n = 0;
+    for (clio::run::u32 i = 0; i < num_blocks_ && i < kMaxInlineBlocks; ++i) {
+      n += blocks_[i].size_;
+    }
+    return n;
   }
 };
 
@@ -168,7 +265,10 @@ using ShmBlobInfoMap =
 struct ShmMetadataCacheRoot {
   /** Layout version. A client that does not recognize it must not attach --
    *  the cache is derived state, so refusing is always safe. */
-  static constexpr clio::run::u32 kLayoutVersion = 1;
+  // v2 (issue #817): kMaxInlineBlocks 8 -> 16, and a truncated record is now
+  // readable up to CoveredBytes(). Both change the record layout/semantics, so
+  // a v1 client must refuse rather than misread it.
+  static constexpr clio::run::u32 kLayoutVersion = 3;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
@@ -265,13 +365,17 @@ class ShmMetadataCache {
   bool Create(size_t tag_capacity, size_t blob_capacity,
               const clio::run::PoolId &owner_pool) {
 #if !CTP_IS_HOST
-    // Device pass: CLIO_IPC resolves to the GPU IpcManager, which has no
-    // metadata segment. This body is host-only (nvcc member-checks the whole
-    // TU in the device pass when a CUDA file includes core_client.h — e.g.
-    // ggml's clio-vector.cu); the cache is never created from device code.
-    (void)tag_capacity; (void)blob_capacity; (void)owner_pool;
+    // The metadata cache lives in the runtime's host-side segment and is
+    // constructed by the runtime. GetMetadataAllocator()/GetMetadataDirectory()
+    // are host-only IpcManager members, absent in the device (nvcc) pass — so
+    // this body does not compile there. Device code never owns or builds the
+    // cache; report "caching off", which callers already treat as a valid,
+    // non-error state (see the docstring above). Without this guard the whole
+    // header failed the CUDA build (GPU Tests workflow).
+    (void)tag_capacity;
+    (void)blob_capacity;
+    (void)owner_pool;
     return false;
-  }
 #else
     auto *ipc = CLIO_IPC;
     if (ipc == nullptr) {
@@ -318,8 +422,8 @@ class ShmMetadataCache {
       alloc_ = nullptr;
       return false;
     }
-  }
 #endif  // CTP_IS_HOST
+  }
 
   bool IsEnabled() const { return root_ != nullptr && alloc_ != nullptr; }
 

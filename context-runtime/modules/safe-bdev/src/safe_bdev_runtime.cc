@@ -766,6 +766,10 @@ clio::run::TaskResume Runtime::AllocateBlocks(
     CLIO_CO_RETURN;
   }
 
+  // Guards data_alloc_/rr_cursor_/alloc_log_ against the other workers that can
+  // be executing this container concurrently. No co_await below, so a plain
+  // mutex is safe here.
+  std::lock_guard<std::mutex> alloc_g(alloc_mu_);
   const size_t nmembers = data_members_.size();
   clio::run::u64 remaining = size;
   while (remaining > 0) {
@@ -821,6 +825,9 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
   // Decode each block to (member d, slot s) and release the slot on that member.
   // The slot leaves the stripe -> if the stripe still has members, mark it dirty
   // so BuildParity re-derives the narrower parity; if it is now empty, forget it.
+  // Same allocator lock as AllocateBlocks (see alloc_mu_); StripeMembers and
+  // ForgetSlotIfEmpty read data_alloc_ under it and must not re-acquire it.
+  std::lock_guard<std::mutex> alloc_g(alloc_mu_);
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const clio::run::bdev::Block &b = task->blocks_[i];
     clio::run::u32 d = 0;
@@ -1043,9 +1050,13 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
   // Full aggregate capacity: every active data member contributes its own
   // remaining slots (bump headroom + reusable frees). No stranding.
   clio::run::u64 remaining = 0;
-  for (size_t d = 0; d < data_alloc_.size(); ++d) {
-    if (data_members_[d].state_ == ec::EcState::kActive) {
-      remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
+  {
+    // data_alloc_ is mutated by concurrent AllocateBlocks/FreeBlocks.
+    std::lock_guard<std::mutex> alloc_g(alloc_mu_);
+    for (size_t d = 0; d < data_alloc_.size(); ++d) {
+      if (data_members_[d].state_ == ec::EcState::kActive) {
+        remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
+      }
     }
   }
   task->remaining_size_ = remaining;

@@ -54,12 +54,36 @@ cp '@APPIMAGE_STAGING_DIR@/clio_run.png' \
 # final AppImage assembly to appimagetool below so we control the output
 # filename (iowarp-core-<ver>-<arch>.AppImage to match our release naming).
 echo "Bundling runtime libs into AppDir..."
+# clio_cte_fuse (the FUSE adapter, staged when CLIO_CTE_ENABLE_FUSE_ADAPTER
+# is ON) has NEEDED entries clio_run doesn't — most importantly
+# libfuse3.so.3 — so linuxdeploy must walk it too or the shipped adapter
+# only works on hosts that already installed libfuse3 (#899).
+EXTRA_EXEC_ARGS=""
+if [ -x '@APPIMAGE_STAGING_DIR@/usr/bin/clio_cte_fuse' ]; then
+    EXTRA_EXEC_ARGS="--executable @APPIMAGE_STAGING_DIR@/usr/bin/clio_cte_fuse"
+fi
 "./$LINUXDEPLOY" \
     --appdir '@APPIMAGE_STAGING_DIR@' \
     --executable '@APPIMAGE_STAGING_DIR@/usr/bin/clio_run' \
+    $EXTRA_EXEC_ARGS \
     --desktop-file '@APPIMAGE_STAGING_DIR@/clio_run.desktop' \
     --icon-file '@APPIMAGE_STAGING_DIR@/clio_run.png' \
     || { echo "linuxdeploy failed"; exit 1; }
+
+# linuxdeploy consults the AppImage excludelist, which skips libfuse.so.2
+# (the AppImage *runtime's* own dependency) and on some versions also
+# libfuse3. Our clio_cte_fuse needs libfuse3.so.3 at exec time regardless,
+# so copy it in explicitly if linuxdeploy declined to.
+if [ -x '@APPIMAGE_STAGING_DIR@/usr/bin/clio_cte_fuse' ] && \
+   ! ls '@APPIMAGE_STAGING_DIR@'/usr/lib/libfuse3.so.3* >/dev/null 2>&1; then
+    FUSE3_LIB=$(ldconfig -p | awk '/libfuse3\.so\.3 /{print $NF; exit}')
+    if [ -n "$FUSE3_LIB" ]; then
+        echo "Bundling $FUSE3_LIB (skipped by linuxdeploy excludelist)..."
+        cp -L "$FUSE3_LIB" '@APPIMAGE_STAGING_DIR@/usr/lib/'
+    else
+        echo "WARNING: libfuse3.so.3 not found on build host; clio_cte_fuse will need system libfuse3" >&2
+    fi
+fi
 
 # ---- appimagetool ----
 # Resolve to an absolute or ./-prefixed path so we don't have to rely on

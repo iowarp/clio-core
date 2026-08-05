@@ -86,31 +86,31 @@ if(CLIO_CORE_ENABLE_CUDA)
   )
   add_test(NAME test_thread_alloc_gpu COMMAND test_thread_alloc_gpu)
 
-  # RoundRobinAllocator CDP test. This is CDP1-only — it launches child kernels
-  # and calls cudaDeviceSynchronize() from device code, and forces CDP1 via
-  # CUDA_FORCE_CDP1_IF_SUPPORTED. CUDA 13 removed CDP1 entirely (CCCL hard-errors
-  # on CUDA_FORCE_CDP1_IF_SUPPORTED, and device-side cudaDeviceSynchronize is
-  # gone), so only build it on CUDA < 13. A CUDA 13+ build would need a CDP2
-  # rewrite (CDP2 has no device-side synchronize).
+  # RoundRobinAllocator CDP test. The test source picks its CDP flavor from the
+  # toolkit: CDP2 (fire-and-forget children joined by a tail launch) when the
+  # headers expose cudaStreamFireAndForget, else the CDP1 device-side
+  # cudaDeviceSynchronize. So do NOT define CUDA_FORCE_CDP1_IF_SUPPORTED on
+  # CUDA >= 12 — it both hides the CDP2 stream macros and fails to bring back
+  # device-side cudaDeviceSynchronize, which CUDA 12 does not declare at all for
+  # sm_90+ (see issue #828). On CUDA < 12 only CDP1 exists; silence its
+  # 11.6-onwards deprecation warning.
   find_package(CUDAToolkit QUIET)
-  if(CUDAToolkit_VERSION VERSION_LESS 13)
-    add_cuda_executable(test_round_robin_alloc_gpu TRUE test_round_robin_alloc_gpu.cc
-      INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS}
-      DEFS CUDA_FORCE_CDP1_IF_SUPPORTED __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
-    target_link_libraries(test_round_robin_alloc_gpu
-      ctp::cuda_cxx
-      Catch2::Catch2WithMain
-    )
-    target_compile_options(test_round_robin_alloc_gpu PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -rdc=true>)
-    add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
-    set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
-      TIMEOUT 60 LABELS "gpu;allocator")
-  else()
-    message(STATUS
-      "Skipping test_round_robin_alloc_gpu: CDP1 was removed in CUDA >= 13 "
-      "(needs a CDP2 rewrite — no device-side cudaDeviceSynchronize)")
+  set(CLIO_RR_CDP_DEFS "")
+  if(CUDAToolkit_VERSION VERSION_LESS 12)
+    set(CLIO_RR_CDP_DEFS __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
   endif()
+  add_cuda_executable(test_round_robin_alloc_gpu TRUE test_round_robin_alloc_gpu.cc
+    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS}
+    DEFS ${CLIO_RR_CDP_DEFS})
+  target_link_libraries(test_round_robin_alloc_gpu
+    ctp::cuda_cxx
+    Catch2::Catch2WithMain
+  )
+  target_compile_options(test_round_robin_alloc_gpu PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -rdc=true>)
+  add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
+  set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
+    TIMEOUT 60 LABELS "gpu;allocator")
 
   add_subdirectory(runtime)
 

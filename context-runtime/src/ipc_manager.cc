@@ -42,10 +42,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -754,7 +756,7 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
-void IpcManager::AwakenWorker(TaskLane *lane) {
+void IpcManager::AwakenWorker(TaskLane *lane, bool force) {
   if (!lane) {
     // No lane to target — wake every worker so a task parked with no resolvable
     // owning lane is still re-checked (lost-wakeup safety net).
@@ -763,23 +765,24 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
     return;
   }
 
-  // ALWAYS send SIGUSR1, never skip on active_=true. Past attempts to
-  // gate this on the park-flag tripped a lost-wakeup race at scale (4n
-  // 256m FPP) where the producer observed active_=true, skipped the
-  // signal, and the worker then stored active_=false and entered
-  // epoll_pwait2 before noticing the just-pushed task. The
-  // post-store-recheck handshake in Worker::SuspendMe is supposed to
-  // catch this but doesn't fire reliably under heavy multi-tier
-  // scheduling pressure. Skipping the tgkill saved a syscall; the
-  // observed cost was hangs that never recovered. The extra signal is
-  // absorbed harmlessly by signalfd — at worst the worker wakes one
-  // extra time and re-checks its (empty) queue. Worth it.
-
+  // Signal ONLY a PARKED worker. The caller has already pushed to `lane` (or to
+  // the event queue whose owner runs on this lane); the seq_cst fence here plus
+  // Worker::SuspendMe's seq_cst SetActive(false)+fence form a Dekker StoreLoad,
+  // so a running worker that we skip is GUARANTEED to observe the just-pushed
+  // task in its post-park re-check and not park. That closes the lost-wakeup the
+  // earlier gated attempt hit; and even a hypothetical residual miss self-heals
+  // within the worker's max_sleep cap (<=50ms) rather than hanging forever (that
+  // cap did not exist when the earlier attempt was reverted). On small requests
+  // this removes the per-op tgkill that made SHM lose to Redis's pipelined TCP.
   int tid = lane->GetTid();
   if (tid > 0) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!force && lane->IsActive()) {
+      return;  // worker is polling; it will drain this task without a wake
+    }
     int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
 
-    // Send SIGUSR1 to the worker thread in the runtime process
+    // Send SIGUSR1 to the (parked) worker thread in the runtime process
     int result = ctp::lbm::EventManager::Signal(runtime_pid, tid);
     if (result != 0) {
       HLOG(kError,
@@ -837,43 +840,6 @@ ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
 }
 
 /**
- * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
- * unreadable (cgroup v2 first, then v1).
- *
- * Needed because SystemInfo::GetRamCapacity() reports the HOST's physical
- * memory even inside a container -- sizing a shared-memory reservation off
- * that number over-commits badly in CI images and constrained deployments.
- */
-static size_t ReadCgroupMemoryLimit() {
-#ifdef __linux__
-  const char *paths[] = {"/sys/fs/cgroup/memory.max",
-                         "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
-  for (const char *path : paths) {
-    std::ifstream f(path);
-    if (!f.is_open()) {
-      continue;
-    }
-    std::string v;
-    if (!(f >> v)) {
-      continue;
-    }
-    if (v == "max") {
-      return 0;  // explicitly unlimited
-    }
-    try {
-      unsigned long long n = std::stoull(v);
-      // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
-      if (n > 0 && n < (1ULL << 62)) {
-        return static_cast<size_t>(n);
-      }
-    } catch (...) {
-    }
-  }
-#endif
-  return 0;
-}
-
-/**
  * Keep a large shared mapping out of core dumps (Linux MADV_DONTDUMP).
  *
  * The runtime shuts down via std::abort() (admin_runtime.cc), so every clean
@@ -920,8 +886,47 @@ bool IpcManager::ServerInitShm() {
     std::string main_segment_name =
         config->GetSharedMemorySegmentName(kMainSegment);
 
-    // Use calculated or explicit main_segment_size
+    // Main segment size (issue #727): yaml `runtime: main_segment_size` /
+    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the auto default
+    // CalculateMainSegmentSize() resolves — the machine's RAM capacity,
+    // mirroring the metadata segment. On Linux the segment is a sparse memfd,
+    // so the exposure is not the reservation but the LIVE SET in
+    // memory-limited containers — and on Windows the whole size is commit
+    // charge up front.
+    //
+    // Both the auto default and explicit values pass the same half-budget
+    // guard the metadata segment uses — beyond that the live set can only end
+    // in SIGBUS/OOM, so clamp instead of booting a time bomb. The RAM-sized
+    // auto default trips it by design (RAM > budget/2 always), landing the
+    // segment at half the cgroup-aware budget.
     size_t main_segment_size = config->CalculateMainSegmentSize();
+    {
+      const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+      if (budget > 0 && main_segment_size > budget / 2) {
+        HLOG(kWarning,
+             "Main segment: requested {} bytes exceeds half the memory "
+             "budget ({} bytes); clamping to {} bytes",
+             main_segment_size, budget, budget / 2);
+        main_segment_size = budget / 2;
+      }
+
+      // OFF LINUX THE SEGMENT IS NOT SPARSE MEMORY (issues #727/#817):
+      // macOS/BSD back it with a regular file (no memfd) and Windows charges
+      // the whole reservation as commit up front — a RAM-sized request there
+      // is a real cost, exactly what #727 complained about. Keep the
+      // historical 1 GiB cap on those platforms; explicit configuration can
+      // still go smaller.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMainCap = 1024ULL * 1024 * 1024;  // 1 GiB
+      if (main_segment_size > kNonLinuxMainCap) {
+        HLOG(kInfo,
+             "Main segment: not sparse memory on this platform; "
+             "clamping {} bytes to {} bytes",
+             main_segment_size, kNonLinuxMainCap);
+        main_segment_size = kNonLinuxMainCap;
+      }
+#endif
+    }
 
     HLOG(kInfo, "Initializing main shared memory segment: {} bytes ({} MB)",
          main_segment_size, main_segment_size / (1024 * 1024));
@@ -959,8 +964,8 @@ bool IpcManager::ServerInitShm() {
     // issue #783: runtime-wide metadata segment (pid.3). Backs the CTE
     // shared-memory metadata cache. Deliberately NON-FATAL: if it cannot be
     // created the runtime still starts and every client simply falls back to
-    // the RPC path. That matters because the reservation is huge (8 GB by
-    // default) and a host with a small /dev/shm can legitimately refuse it --
+    // the RPC path. That matters because the reservation is huge (the host's
+    // RAM capacity by default) and a constrained host can legitimately refuse it --
     // losing an optimization is acceptable, failing to boot is not.
     metadata_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 3);
     std::string metadata_segment_name =
@@ -994,19 +999,41 @@ bool IpcManager::ServerInitShm() {
     // RAM keeps the default a no-op on real nodes while protecting small
     // dev boxes and constrained containers.
     {
-      size_t budget = ctp::SystemInfo::GetRamCapacity();
-      size_t cgroup_limit = ReadCgroupMemoryLimit();
-      if (cgroup_limit > 0 && (budget == 0 || cgroup_limit < budget)) {
-        budget = cgroup_limit;
-      }
+      size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && metadata_segment_size > budget / 2) {
         size_t clamped = budget / 2;
         HLOG(kWarning,
              "Metadata segment: requested {} bytes exceeds half the memory "
-             "budget ({} bytes; cgroup_limit={}); clamping to {} bytes",
-             metadata_segment_size, budget, cgroup_limit, clamped);
+             "budget ({} bytes); clamping to {} bytes",
+             metadata_segment_size, budget, clamped);
         metadata_segment_size = clamped;
       }
+
+      // OFF LINUX THE SEGMENT IS A FILE, NOT MEMORY (issue #817).
+      // SystemInfo::CreateNewSharedMemory uses memfd_create only on Linux;
+      // macOS/BSD fall back to a regular file under /tmp/clio_$USER (POSIX
+      // shm_open names cap at 31 chars and have no filesystem path, which
+      // breaks the readiness probes). Everything above -- "the reservation is
+      // nearly free because it is sparse and never pre-faulted" -- is a
+      // statement about memfd and RAM, and it is simply not true of a file:
+      // the ftruncate/mmap goes against the DISK, and a multi-GB request on a
+      // CI runner fails outright.
+      //
+      // That is why macOS has no metadata segment at all today, and therefore
+      // no SHM metadata cache (#783) and no clio-fs fast path (#817) -- both
+      // silently degrade to RPC. Ask for something a filesystem will actually
+      // give us there. Still generous: at 560 B per cached blob this holds
+      // ~1.9M entries.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMetadataCap = 1024ULL * 1024 * 1024;  // 1 GB
+      if (metadata_segment_size > kNonLinuxMetadataCap) {
+        HLOG(kInfo,
+             "Metadata segment: file-backed on this platform (no memfd); "
+             "clamping {} bytes to {} bytes",
+             metadata_segment_size, kNonLinuxMetadataCap);
+        metadata_segment_size = kNonLinuxMetadataCap;
+      }
+#endif
     }
 
     HLOG(kInfo,
@@ -2239,9 +2266,16 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 }
 
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
-                                                    int port) {
-  // Create key for the pool map
+                                                    int port,
+                                                    const char *lane) {
+  // Create key for the pool map. The lane suffix gives distinct traffic
+  // classes (bulk task payloads vs small responses) their own connection
+  // and thus their own socket mutex + ZMQ pipe (issue #892).
   std::string key = addr + ":" + std::to_string(port);
+  if (lane != nullptr && *lane != '\0') {
+    key += "#";
+    key += lane;
+  }
 
   // Lock the pool for thread-safe access
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
@@ -2350,7 +2384,10 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
         break;
     }
     if (wake_lane) {
-      AwakenWorker(wake_lane);
+      // force=true: this push went to a net_queue_ priority lane, which is NOT
+      // in the net worker's SuspendMe re-check set — the parked-skip handshake
+      // is unpaired here, so the signal must be unconditional (see AwakenWorker).
+      AwakenWorker(wake_lane, /*force=*/true);
     }
     HLOG(kDebug,
          "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
@@ -3340,6 +3377,14 @@ bool IpcManager::DrainShmResponses() {
     return false;
   }
   bool any = false;
+  // The waiter that drains a response inline (RecvOut spin path) is THIS thread;
+  // it will observe IsComplete on its next spin and needs no wake. Signalling it
+  // is a wasted SYS_tgkill per response — and on a single pipelining thread that
+  // is one syscall PER OP that never amortizes with depth (the whole reason CTE
+  // pipelining lagged Redis, whose 64 replies cost ~1 read). Skip the self-wake;
+  // still signal OTHER (possibly parked) waiters whose responses we demux.
+  const int my_pid = static_cast<int>(ctp::SystemInfo::GetPid());
+  const int my_tid = static_cast<int>(ctp::SystemInfo::GetTid());
   while (true) {
     // Cheap check before allocating: a spinning waiter calls this every
     // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
@@ -3377,7 +3422,9 @@ bool IpcManager::DrainShmResponses() {
     std::atomic_thread_fence(std::memory_order_release);
     task->SetNewData();
     task->SetComplete();
-    if (task->WaiterPid() != 0) {
+    if (task->WaiterPid() != 0 &&
+        !(static_cast<int>(task->WaiterPid()) == my_pid &&
+          static_cast<int>(task->WaiterTid()) == my_tid)) {
       ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
                                      static_cast<int>(task->WaiterTid()));
     }
@@ -3811,6 +3858,75 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
            worker ? (int)worker->GetId() : -1);
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
+      } else {
+        // issue #822/#841: no worker context — this is a non-worker thread
+        // (ServerInit's main thread, an embedded client). There is no retry
+        // queue here, so the old code DROPPED the task on Retry/Dne and its
+        // future was never completed: a task.Wait() caller then polls
+        // FUTURE_COMPLETE forever. Concretely: the restart-log replay's
+        // AsyncCompose can route before the just-created admin container's
+        // registration (finished by a worker task) is visible, hit Dne, and
+        // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
+        // open reliably. Retry inline first: the window is transient and
+        // normally closes within a few milliseconds.
+        //
+        // EXCEPT for periodic tasks. The admin container's Create spawns its
+        // periodic service tasks (kSend/kClientSend pumps, kHeartbeatProbe,
+        // kSystemMonitor) on THIS thread, and the container is only
+        // registered after Create returns — so for those, no amount of
+        // waiting here can succeed: the retry blocks the exact thread whose
+        // progress it awaits. Observed as 5 s x N stalls at every runtime
+        // init (unit-amd64 +19 min; the icx windows gate's rotating per-test
+        // timeouts, a retry storm filling the whole 300 s window). Fail them
+        // immediately instead — the same harmless outcome as the historical
+        // silent drop, but loud and with a completed future.
+        //
+        // The budget is a wall-clock DEADLINE, not an iteration count (issue
+        // #849): sleep_for(1ms) rounds up to the platform timer granularity —
+        // ~15.6ms on Windows — so a 5000-iteration loop actually burned ~75s
+        // per unroutable task there, and ServerInit's handful of exhausted
+        // retries alone exceeded a 300s ctest window.
+        constexpr auto kInlineRetryBudget = std::chrono::seconds(5);
+        // Admin-pool tasks get a longer leash (issue #883): the admin
+        // container is GUARANTEED to register (ServerInit creates it), but on
+        // loaded CI runners (Windows icx Debug, 2 vCPU) its worker-side
+        // registration has been observed to outlast 5 s, terminally failing
+        // embedded ClientInit -- and the whole test -- for a wedge that
+        // clears moments later (3 distinct tests on 2026-07-31, all rerun
+        // green). Waiting longer here cannot reintroduce the #849
+        // recovery-test time burn: those exhausted retries target non-admin
+        // pools and keep the 5 s deadline.
+        const auto inline_retry_budget = (task_ptr->pool_id_ == kAdminPoolId)
+                                             ? std::chrono::seconds(30)
+                                             : kInlineRetryBudget;
+        const auto deadline =
+            std::chrono::steady_clock::now() + inline_retry_budget;
+        while (!task_ptr->IsPeriodic() &&
+               (result == RouteResult::Retry || result == RouteResult::Dne) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          result = RouteLocal(future, force_enqueue);
+        }
+        if (result == RouteResult::Retry || result == RouteResult::Dne) {
+          // Inline retry exhausted: this is no longer the ms-scale transient
+          // window but a task that cannot resolve in this phase. FAIL the
+          // future so the waiter unblocks loudly. (An earlier revision parked
+          // the task on worker 0's retry queue here instead, to avoid the
+          // deadline — but a task that is still unroutable after 5 s of
+          // retries just churns the retry queue forever, and re-queuing it
+          // through the RunFuture's non-owning task handle dangled the queue
+          // entry once the popping iteration's owning reference died: the icx
+          // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
+          // correct end state.)
+          HLOG(kError,
+               "RouteTask: inline retry exhausted ({} ms) on non-worker "
+               "thread; failing task pool={} method={}",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   inline_retry_budget).count(),
+               task_ptr->pool_id_, task_ptr->method_);
+          task_ptr->SetReturnCode(static_cast<u32>(-1));
+          task_ptr->SetComplete();
+        }
       }
     }
     return result;
@@ -3946,7 +4062,13 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   ContainerHold exec_container = exec_dc.get();
 
   if (!exec_container) {
-    HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
+    // kDebug, not kError: this is the routine transient-miss result that the
+    // retry paths (worker retry queue, the non-worker inline retry loop) poll
+    // against — at kError a single exhausted 5s inline retry emits ~5000
+    // lines, and a green coverage run logs ~19k of these (issue #849). The
+    // callers in RouteTask log the kError summary on first failure and on
+    // retry exhaustion.
+    HLOG(kDebug, "RouteLocal: Container not found for pool={} container_id={} method={}",
          task_ptr->pool_id_, container_id, task_ptr->method_);
     return RouteResult::Dne;
   }

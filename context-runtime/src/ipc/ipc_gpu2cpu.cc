@@ -169,13 +169,9 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     return true;
   }
 
-  // Fix up SSO/SVO `data_` pointers in the host-resident task copy if we
-  // D2H-copied it. The chimod's container override dispatches by method id to
-  // the per-task FixupAfterCopy(). Skip when the task never moved (kPinnedHost /
-  // kManagedUvm path).
-  if (task_on_device) {
-    container->FixupAfterCopy(method_id, future.GetTaskPtr());
-  }
+  // No post-copy fixup: tasks that cross this boundary must be bitwise
+  // relocatable (fully-POD, e.g. the Pod*Blob tasks) — the D2H copy above is
+  // already a correct host-side task.
 
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.

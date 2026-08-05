@@ -379,7 +379,14 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
       if (device.score_ >= 0.0f) {
         emitter << YAML::Key << "score" << YAML::Value << device.score_;
       }
-      
+
+      // Emit persistence_level only when it differs from the default, so
+      // pre-existing emitted configs stay byte-identical.
+      if (device.persistence_level_ != "volatile") {
+        emitter << YAML::Key << "persistence_level" << YAML::Value
+                << device.persistence_level_;
+      }
+
       emitter << YAML::EndMap;
     }
     emitter << YAML::EndSeq;
@@ -553,6 +560,23 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
     }
 
     // Parse score (optional)
+    // Parse persistence_level (optional; defaults to "volatile"). Without
+    // this key the field was NEVER populated from YAML, so every composed
+    // tier counted as volatile — min_persistence_level filters and
+    // REPLICA_PERSISTENT (issue #886) could not be satisfied from a config.
+    if (device_node["persistence_level"]) {
+      std::string level = device_node["persistence_level"].as<std::string>();
+      if (level != "volatile" && level != "temporary" &&
+          level != "long_term") {
+        HLOG(kError,
+             "Config error: Storage device persistence_level '{}' must be "
+             "'volatile', 'temporary', or 'long_term' for device {}",
+             level, device_config.path_);
+        return false;
+      }
+      device_config.persistence_level_ = level;
+    }
+
     if (device_node["score"]) {
       device_config.score_ = device_node["score"].as<float>();
 

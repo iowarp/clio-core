@@ -53,6 +53,14 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
   }
   fs_client->pool_id_ = create_task->new_pool_id_;
 
+  // issue #817: attach the filesystem attribute cache. Must run AFTER pool_id_
+  // is set -- the directory is keyed by pool. Failure is not an error: it just
+  // means every path lookup keeps going through the runtime.
+  if (!fs_client->AttachShmCache()) {
+    HLOG(kDebug,
+         "CFS ClientInit: SHM attribute cache unavailable; using RPC");
+  }
+
   s_initialized = true;
   return true;
 }

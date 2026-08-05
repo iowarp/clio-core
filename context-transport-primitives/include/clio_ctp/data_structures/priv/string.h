@@ -607,17 +607,6 @@ class basic_string {
   }
 
   /**
-   * Fix up the data_ pointer after a bulk memcpy.
-   * After memcpy, data_ still points to the source object's buffer.
-   * This repoints it to this object's own SSO buffer.
-   * Only valid when UsingSso() is true.
-   */
-  CTP_INLINE_CROSS_FUN
-  void FixupSsoPointer() {
-    data_ = storage_.buffer_;
-  }
-
-  /**
    * Initialize this string by copying SSO data from another string.
    * No allocator needed — copies the inline buffer directly.
    * Only valid when the source is using SSO (size <= SSOSize).

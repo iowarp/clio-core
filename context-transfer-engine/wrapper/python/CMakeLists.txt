@@ -179,4 +179,20 @@ if(BUILD_TESTING)
         ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
+
+    # Async client APIs: Client.Async*() -> Future (wait/done/result), including
+    # overlapped in-flight submission of many put/get ops.
+    add_test(
+        NAME python_async_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_async.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_async_test
+        PROPERTIES
+        LABELS "python;bindings;async"
+        TIMEOUT 120
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        DEPENDS clio_cte_core_ext
+    )
 endif()

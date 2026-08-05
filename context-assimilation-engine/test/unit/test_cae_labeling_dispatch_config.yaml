@@ -21,12 +21,14 @@ compose:
     bdev_type: ram
     capacity: "256MB"
 
-  # CAE core at the entrypoint (512.0), labeling enabled.
+  # CAE core at the entrypoint (512.0), labeling enabled. Forwards to the
+  # indexer (564.0), which owns SemanticSearch (issue #905) over the CTE
+  # core at 513.0.
   - mod_name: clio_cae_core
     pool_name: cae_label
     pool_query: local
     pool_id: "512.0"
-    next_pool_id: "513.0"
+    next_pool_id: "564.0"
     label_endpoint: "http://127.0.0.1:1"
     label_prompts:
       summarize: "Summarize this document:"
@@ -56,3 +58,11 @@ compose:
         score: 1.0
     dpe:
       dpe_type: "max_bw"
+
+  # Indexer chimod (issue #905): owns SemanticSearch; the CAE forward
+  # terminates here instead of the core.
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "513.0"

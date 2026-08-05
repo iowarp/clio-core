@@ -88,8 +88,13 @@ jobs:
         CIBW_BUILD: ${{ matrix.cibw_build }}
         CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.cibw_image }}
+        # fuse3-devel: Linux wheels build the FUSE adapter by default
+        # (#899, see the platform override in installers/pip/pyproject.toml).
+        # Only the headers/import stub are needed at build time; the wheel
+        # does not bundle libfuse3.so.3 — end users get it from their
+        # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf &&
+          yum install -y curl patchelf fuse3-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -134,6 +139,13 @@ jobs:
       run: |
         C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
 
+    # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
+    # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
+    # package installs to %ProgramFiles(x86)%\WinFsp, which is the CMake
+    # default search path.
+    - name: Install WinFsp (FUSE adapter SDK)
+      run: choco install winfsp -y --no-progress
+
     - name: Install cibuildwheel
       run: pip install cibuildwheel
 
@@ -154,8 +166,12 @@ jobs:
         # --ignore-existing tells delvewheel to treat DLLs already in the
         # wheel as satisfied, so it can traverse the dep graph without
         # trying to locate them externally.
+        # --exclude winfsp-x64.dll: clio_cte_fuse.exe links the WinFsp
+        # system DLL, which ships with the user's WinFsp install (a signed
+        # driver package) and must never be vendored into the wheel.
         CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
-          delvewheel repair -w {dest_dir} -v --ignore-existing {wheel}
+          delvewheel repair -w {dest_dir} -v --ignore-existing
+          --exclude winfsp-x64.dll {wheel}
       run: cibuildwheel --output-dir installers/pip/wheelhouse
 
     - name: Upload Windows wheels
@@ -383,9 +399,37 @@ jobs:
               unset rc
             done
 
+            echo "=== FUSE adapter entry point (Linux standard feature) ==="
+            # The wheel ships clio_cte_fuse but deliberately not
+            # libfuse3.so.3 (a system dep, see #899). Install the distro
+            # fuse3 runtime like an end user would, then apply the same
+            # signal-level heuristic as the benchmarks above.
+            if command -v apt-get &>/dev/null; then
+              apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
+            elif command -v dnf &>/dev/null; then
+              dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
+            fi
+            clio_cte_fuse --help || rc=$?
+            rc=${rc:-0}
+            if [ "$rc" -ge 128 ]; then
+              echo "FAIL: clio_cte_fuse --help died with signal (exit $rc)"
+              exit 1
+            fi
+            unset rc
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+            echo "=== Cache + replication chimods present ==="
+            # Both chimods ship by default (#886/#899); a missing lib means
+            # the pip_package component lost them.
+            for mod in cache replication; do
+              if ! ls "$LIB_DIR"/libclio_cte_${mod}_* >/dev/null 2>&1; then
+                echo "FAIL: libclio_cte_${mod}_* missing from wheel lib dir"
+                exit 1
+              fi
+            done
             MISSING=0
             for so in "$LIB_DIR"/*.so "$LIB_DIR"/*.so.*; do
               [ -f "$so" ] || continue
@@ -533,6 +577,12 @@ jobs:
         name: wheels-win_amd64
         path: wheels/
 
+    # WinFsp runtime for the fuse adapter smoke test (#899) — end users
+    # install this from winfsp.dev. The DLL lives under
+    # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
+    - name: Install WinFsp (FUSE adapter runtime)
+      run: choco install winfsp -y --no-progress
+
     - name: Test wheel in clean venv
       shell: pwsh
       run: |
@@ -583,6 +633,26 @@ jobs:
             throw "$bench --help died with exit code $LASTEXITCODE"
           }
         }
+
+        Write-Host "=== FUSE adapter (WinFsp standard feature, #899) ==="
+        # The exe must ship in the wheel; delvewheel excludes winfsp-x64.dll
+        # (system DLL), so put the WinFsp bin dir on PATH like an installed
+        # WinFsp app launcher would before exercising the binary.
+        $binDir = python -c "import iowarp_core; print(iowarp_core.get_bin_dir())"
+        if (-not (Test-Path "$binDir\clio_cte_fuse.exe")) {
+          throw "clio_cte_fuse.exe missing from wheel bin dir ($binDir)"
+        }
+        $env:PATH = "${env:ProgramFiles(x86)}\WinFsp\bin;$env:PATH"
+        clio_cte_fuse --help
+        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
+          throw "clio_cte_fuse --help died with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "=== Cache + replication chimods present (#899) ==="
+        # DLLs are RUNTIME artifacts on Windows, so they land in bin/ (import
+        # .lib archives go to lib/) — search both.
+        python -c "import iowarp_core, glob, os, sys; dirs = [iowarp_core.get_lib_dir(), iowarp_core.get_bin_dir()]; missing = [m for m in ('cache', 'replication') if not any(glob.glob(os.path.join(d, f'*clio_cte_{m}_*')) for d in dirs)]; sys.exit(f'missing chimods: {missing}' if missing else 0)"
+        if ($LASTEXITCODE -ne 0) { throw "cache/replication chimod DLLs missing from wheel" }
 
         Write-Host "=== All Windows tests passed ==="
         # The bench --help calls above leave $LASTEXITCODE = 1 (they print

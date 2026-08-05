@@ -1,0 +1,23 @@
+# LOCAL-ONLY debug overlay: containers run ONLY the runtime; the test is
+# exec'd manually for fast iteration.
+services:
+  coh-node1:
+    command: >
+      "
+        /workspace/build/bin/clio_run runtime start
+      "
+  coh-node2:
+    command: >
+      "
+        /workspace/build/bin/clio_run runtime start
+      "
+  coh-node3:
+    command: >
+      "
+        /workspace/build/bin/clio_run runtime start
+      "
+  coh-node4:
+    command: >
+      "
+        /workspace/build/bin/clio_run runtime start
+      "

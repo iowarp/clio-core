@@ -89,10 +89,15 @@ jobs:
                 -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
                 -DCLIO_CTP_LOG_LEVEL=1
-              # Targeted build: just the VFD test target pulls in the driver +
-              # the runtime libs it depends on (add_dependencies), not the whole
+              # Targeted build: the VFD test targets pull in the driver + the
+              # runtime libs they depend on (add_dependencies), not the whole
               # adapter/test matrix.
-              cmake --build build-vfd --target clio_cte_vfd_unit_tests -j"$(nproc)"
+              #
+              # Both test binaries must be named here. ctest below selects by
+              # name (-R vfd), so any target left out is still selected and then
+              # reported as "Not Run" 
+              cmake --build build-vfd -j"$(nproc)" \
+                --target clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests
               # ABI gate: the VFD MUST link the same libhdf5 the tools use.
               echo "== VFD libhdf5 linkage =="
               ldd build-vfd/bin/libclio_vfd.so | grep -i hdf5

@@ -703,14 +703,6 @@ class Task {
   void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
     (void)member_task;
   }
-
-  /**
-   * Fix up internal pointers after a cudaMemcpy/memcpy (POD copy path).
-   * Override in tasks that contain priv::vector or other pointer-bearing
-   * fields to re-seat inline (SVO) pointers to the new host address.
-   * Default is a no-op for pure POD tasks.
-   */
-  CTP_CROSS_FUN void FixupAfterCopy() {}
 };
 
 }  // namespace clio::run
@@ -762,19 +754,22 @@ struct TaskQueueHeader {
 };
 
 // Type alias for individual lanes with per-lane headers (moved outside
-// TaskQueue class) Worker queues store Future<Task> objects directly
+// TaskQueue class) Worker queues store Future<Task> objects directly.
+// issue #822: lanes are ext_spsc_queue (mutex-serialized, growable) instead
+// of WAIT_FOR_SPACE MPSC rings — a push onto a full lane grows the lane
+// rather than busy-spinning, so a worker enqueuing onto the lane it drains
+// (producer==consumer) can no longer deadlock when queue_depth is small.
 using TaskLane =
-    ctp::ipc::multi_mpsc_ring_buffer<Future<Task>,
-                                 CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
+    ctp::ipc::multi_ext_spsc_queue<Future<Task>,
+                                   CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
 
 /**
- * Simple wrapper around ctp::ipc::multi_mpsc_ring_buffer
- *
- * This wrapper adds custom enqueue and dequeue functions while maintaining
- * compatibility with existing code that expects the multi_mpsc_ring_buffer
- * interface.
+ * Multi-lane worker task queue (one growable mutex-guarded ring per
+ * lane/priority); see the TaskLane comment above for the issue #822
+ * rationale.
  */
-typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
+typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
+    TaskQueue;
 
 }  // namespace clio::run
 

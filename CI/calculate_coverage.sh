@@ -210,6 +210,12 @@ if [ "$DO_BUILD" = true ]; then
     # CLIO_CTE_ENABLE_COMPRESS=ON default leaked through and broke the
     # pkg_check_modules(liblz4 REQUIRED) call when lz4 wasn't in the
     # conda env.
+    # Info log level, not the debug preset's Debug (issue #845): Debug compiles
+    # every DEBUG HLOG into the hot path — one format+write syscall per task
+    # pop — which makes tests slow-not-stuck on the 2-vCPU coverage runners
+    # (cte_bdev_fragmentation alone emitted ~3.8M lines inside its 300 s ctest
+    # window). Same lever as e93def6d for the adapters gate; costs coverage of
+    # HLOG(kDebug) lines only.
     cmake --preset=debug \
         -DCLIO_CORE_ENABLE_COVERAGE=ON \
         -DCLIO_CORE_ENABLE_CONDA=ON \
@@ -217,6 +223,7 @@ if [ "$DO_BUILD" = true ]; then
         -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
         -DCLIO_CTE_ENABLE_COMPRESS=OFF \
         -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+        -DCLIO_CTP_LOG_LEVEL=1 \
         ${PHASE_CMAKE_ARGS}
 
     print_info "Building project..."
@@ -282,7 +289,7 @@ if [ "$DO_CTEST" = true ]; then
                 [ "${keep_it}" = 0 ] && _excludes="${_excludes}    \".*/${rel}/.*\"\n"
             done < <(
                 { find "${REPO_ROOT}" -mindepth 1 -maxdepth 1 -type d \
-                       \( -name 'context-*' -o -name 'prediction_server' \);
+                       -name 'context-*';
                   find "${REPO_ROOT}/context-transfer-engine" -mindepth 1 -maxdepth 1 \
                        -type d 2>/dev/null; } | sort -u
             )

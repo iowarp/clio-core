@@ -359,8 +359,17 @@ inline int run_all_tests(const std::string& filter = "") {
 // g_test_finalize / static dtors / atexit handlers run, sidestepping the
 // libzmq signaler abort. On POSIX it's a no-op and the rest of main()
 // executes normally.
+#ifdef _WIN32
+#define SIMPLE_TEST_SETENV(k, v) _putenv_s((k), (v))
+#else
+#define SIMPLE_TEST_SETENV(k, v) setenv((k), (v), 1)
+#endif
+
 #define SIMPLE_TEST_MAIN() \
 int main(int argc, char* argv[]) { \
+    /* Unit tests assert queue/scheduling semantics; mark the process so \
+       CLIO_RUN_INLINE (run_inline.h) keeps the normal task path. */ \
+    SIMPLE_TEST_SETENV("CLIO_UNIT_TEST", "1"); \
     std::string filter = ""; \
     if (argc > 1) { \
         filter = argv[1]; \

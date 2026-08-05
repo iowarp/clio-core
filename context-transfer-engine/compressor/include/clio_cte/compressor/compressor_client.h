@@ -86,6 +86,20 @@ class Client : public clio::cte::core::Client {
     return ipc_manager->Send(task);
   }
 
+  /** Create with explicit config — the interposition-chaining form (set
+   *  params.next_pool_id_ to the pool this compressor forwards to, e.g. the
+   *  replication interposer for a compressor→replication→core stack). */
+  clio::run::Future<CreateTask> AsyncCreateCompressor(
+      const clio::run::PoolQuery &pool_query, const std::string &pool_name,
+      const clio::run::PoolId &custom_pool_id,
+      const CompressorConfig &params) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<CreateTask>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, pool_query,
+        "clio_cte_compressor", pool_name, custom_pool_id, this, params);
+    return ipc_manager->Send(task);
+  }
+
   // ------------------------------------------------------------------
   // Overridden data-path methods: route through compressor
   // ------------------------------------------------------------------

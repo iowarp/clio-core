@@ -1,0 +1,12 @@
+# LOCAL-ONLY overlay: mimic the CI runner's CPU budget (4 vCPUs shared by
+# 4 runtime containers + 4 test clients) to reproduce timing-dependent
+# failures that never fire on an unconstrained host.
+services:
+  coh-node1:
+    cpus: 0.5
+  coh-node2:
+    cpus: 0.5
+  coh-node3:
+    cpus: 0.5
+  coh-node4:
+    cpus: 0.5

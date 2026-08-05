@@ -9,6 +9,7 @@
 #define CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
 
 #include <unordered_map>
 
@@ -157,6 +158,19 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
       if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
         return false;
       }
+    }
+    // Server-death escape (issue #851): unlike the ZMQ twin of this loop, the
+    // SHM wait used to have NO liveness check — a task in flight over SHM when
+    // the runtime died (reconnect test: AsyncStopRuntime, then submit) left
+    // the client parked here forever, since a dead server can never set
+    // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
+    // to the ZMQ RecvOut, whose kClientShm-origin head implements the
+    // reconnect/failover + resend path.
+    if (!ipc->server_alive_.load(std::memory_order_acquire) &&
+        !ipc->reconnecting_.load()) {
+      HLOG(kWarning,
+           "Recv(SHM): server died mid-wait; handing off to reconnect path");
+      return IpcCpu2CpuZmq::RecvOut(ipc, future, max_sec);
     }
   }
 

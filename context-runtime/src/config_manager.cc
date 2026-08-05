@@ -38,6 +38,8 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/ipc_manager.h"
+#include <clio_ctp/introspect/system_info.h>
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -63,15 +65,8 @@ namespace {
  * a config file should not take the runtime down, and the recognised suffixes
  * are checked here first.
  */
-bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+bool ParseSegmentSizeText(const std::string &text, const char *key,
                           size_t &out) {
-  std::string text;
-  try {
-    text = node.as<std::string>();
-  } catch (const std::exception &) {
-    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
-    return false;
-  }
   if (text.empty()) {
     HLOG(kError, "Config: {} is empty; ignoring", key);
     return false;
@@ -120,6 +115,19 @@ bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
       (!suffix.empty() && suffix[0] == 'b') ? text.substr(0, i) : text;
   out = static_cast<size_t>(ctp::ConfigParse::ParseSize(for_parse));
   return true;
+}
+
+/** YAML wrapper over ParseSegmentSizeText — same semantics for config keys. */
+bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+                          size_t &out) {
+  std::string text;
+  try {
+    text = node.as<std::string>();
+  } catch (const std::exception &) {
+    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
+    return false;
+  }
+  return ParseSegmentSizeText(text, key, out);
 }
 
 }  // namespace
@@ -212,6 +220,17 @@ void ConfigManager::ApplyEnvOverrides() {
     unsigned long n = std::strtoul(env, &end, 10);
     if (end != env) {
       shm_client_spin_us_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #727: CLIO_MAIN_SEGMENT_SIZE bounds the main task-data segment
+  // (byte count or size string, e.g. "512m"). Last word after any config
+  // file, so a deployment can cap the daemon's footprint without editing
+  // yaml; 0 restores the auto default.
+  if (const char *env = clio::run::env::GetCompat("MAIN_SEGMENT_SIZE")) {
+    size_t parsed = 0;
+    if (ParseSegmentSizeText(env, "CLIO_MAIN_SEGMENT_SIZE", parsed)) {
+      main_segment_size_ = parsed;
     }
   }
 }
@@ -435,6 +454,21 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       }
     }
 
+    // Size of the main task-data segment (issue #727): FutureShm + task
+    // payload allocations (BuddyAllocator). Accepts a byte count or a size
+    // string ("512m", "1g"); 0 restores the auto default. Tunable because
+    // this segment dominates the daemon's commit charge on Windows and the
+    // shmem live-set exposure in memory-limited containers regardless of
+    // actual data volume — the previous flat 1 GiB could be several times
+    // an embedded deployment's whole budget.
+    if (runtime["main_segment_size"]) {
+      size_t parsed = 0;
+      if (ParseSegmentSizeNode(runtime["main_segment_size"],
+                               "main_segment_size", parsed)) {
+        main_segment_size_ = parsed;
+      }
+    }
+
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
   }
@@ -576,14 +610,31 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
 }
 
 size_t ConfigManager::CalculateMainSegmentSize() const {
-  // If main_segment_size is explicitly set (non-zero), use it
+  // Explicit (yaml main_segment_size / CLIO_MAIN_SEGMENT_SIZE) wins verbatim.
   if (main_segment_size_ > 0) {
     return main_segment_size_;
   }
 
-  // Main segment holds task data (FutureShm, BuddyAllocator metadata) — no queues
-  // Use 1 GB default for task/data allocations
-  return ctp::Unit<size_t>::Gigabytes(1);
+  // 0 = auto: the machine's RAM capacity, mirroring the metadata segment. The
+  // main segment holds task data (FutureShm, BuddyAllocator metadata) and is
+  // an address-space RESERVATION, not an allocation — on Linux it is a sparse
+  // memfd that is never pre-faulted, so only pages actually written consume
+  // memory, and growing the segment later would invalidate every client's
+  // mapping. Reserve big up front so task-data capacity scales with the host
+  // instead of hitting the old flat 1 GiB ceiling (issue #727). Safety is
+  // enforced downstream at creation time (ipc_manager.cc): clamped to half
+  // the cgroup-aware process memory budget, and capped at 1 GiB off Linux,
+  // where the segment is a real file (macOS/BSD) or up-front commit charge
+  // (Windows) rather than sparse memory.
+  //
+  // Resolved here rather than at the creation site so that no reader of this
+  // value — GetMemorySegmentSize(kMainSegment) included — ever sees a bare
+  // 0 sentinel.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(1);  // introspection failed; old default
+  }
+  return ram;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {
@@ -592,12 +643,21 @@ size_t ConfigManager::CalculateMetadataSegmentSize() const {
     return metadata_segment_size_;
   }
 
-  // Default 8 GB. This is an address-space reservation, not an allocation: the
-  // segment is never pre-faulted, so only pages the runtime actually writes
-  // consume RAM. Sized generously because the CTE metadata cache (issue #783)
-  // holds one entry per live tag and blob, and growing the segment later would
-  // invalidate every client's mapping.
-  return ctp::Unit<size_t>::Gigabytes(8);
+  // Default: the machine's RAM capacity. This is an address-space RESERVATION,
+  // not an allocation: the segment is sparse and never pre-faulted, so only
+  // pages the runtime actually writes consume memory. Sizing the reservation
+  // like RAM means metadata capacity scales with the machine instead of hitting
+  // an arbitrary fixed ceiling (the old 8 GB default), and growing the segment
+  // later is impossible without invalidating every client's mapping — so
+  // reserve big up front. Safety is enforced downstream at creation time
+  // (ipc_manager.cc): on Linux the request is clamped to half the
+  // cgroup-aware process memory budget (containers!), and on non-Linux — where
+  // the segment is a real file, not memfd — it is capped at 1 GB.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(8);  // introspection failed; old default
+  }
+  return ram;
 }
 
 size_t ConfigManager::CalculateQueueSegmentSize() const {
@@ -613,11 +673,25 @@ size_t ConfigManager::CalculateQueueSegmentSize() const {
   // unrecoverable under saturation.
   u32 total_workers = num_threads_ + 1 + GetElasticLaneHeadroom();
 
+  // issue #822: worker lanes are growable (ext_spsc_queue) — queue_depth_ is
+  // only their INITIAL capacity. Budget arena space for growth: doubling from
+  // queue_depth_ up to GROWTH_CAP consumes < 2*GROWTH_CAP entries per ring
+  // total, because the arena is a bump allocator that never reuses the freed
+  // smaller generations. This is an address-space reservation, not RAM — the
+  // memfd segment only faults pages that are actually written — so we can be
+  // generous. A lane that outgrows GROWTH_CAP fails its allocation LOUDLY
+  // (allocator throw) instead of silently wedging, which is the intended
+  // trade: by then ~128Ki tasks are backed up on one worker and the system
+  // is already sick.
+  constexpr size_t GROWTH_CAP = 128 * 1024;  // entries per ring
+  const size_t depth_budget =
+      2 * std::max<size_t>(queue_depth_, GROWTH_CAP);
+
   // Calculate worker task queues size: TaskQueue with total_workers lanes
   size_t worker_queues_size = TaskQueue::CalculateSize(
       total_workers,      // num_lanes
       NUM_PRIORITIES,     // num_priorities
-      queue_depth_);      // depth per queue
+      depth_budget);      // growth budget per queue (initial depth is queue_depth_)
 
   // Calculate network queue size: NetQueue with 1 lane, 4 priorities
   size_t net_queue_size = NetQueue::CalculateSize(

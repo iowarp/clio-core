@@ -1,101 +1,139 @@
-# HDF5 Clio VFD
+# CLIO HDF5 VFD (`H5FDclio`)
 
-## 1. Description
-The HDF5 Clio VFD is a [Virtual File
-Driver](https://portal.hdfgroup.org/display/HDF5/Virtual+File+Drivers) (VFD) for
-HDF5 that can be used to interface with the Clio API. The driver is built as a
-plugin library that is external to HDF5.
+A [Virtual File Driver](https://portal.hdfgroup.org/display/HDF5/Virtual+File+Drivers)
+that writes every byte through to an **authoritative on-disk native HDF5 file**,
+while optionally populating a CLIO CTE cache tier alongside it.
 
-## 2. Dependencies
-The Clio VFD requires [HDF5](https://github.com/HDFGroup/hdf5) >= `1.13.0`,
-which is the version that first introduced dynamically loadable VFDs.
+The native file is the source of truth. Standard tools (`h5dump`, `h5ls`,
+`h5repack`, `h5diff`) read it live, with or without CLIO running, because the
+driver adds no superblock driver-info message — the artifact is a plain native
+HDF5 file. Reads are served from it; writes are committed to it synchronously
+before the call returns. The CTE tier is **populate-only** today: writes push
+into it, reads never come from it. Turning it into a read-serving tier is scoped
+in `translation/VFD_2.1_READ_CACHE_SCOPING.md` and is not implemented.
 
-## 3. Usage
-To use the HDF5 Clio VFD in an HDF5 application, the driver can either be
-linked with the application during compilation, or it can be dynamically loaded
-via an environment variable. It is more convenient to load the VFD as a dynamic
-plugin because it does not require code changes or recompilation.
+Files: `H5FDclio.cc`, `H5FDclio.h`. Driver name: **`clio_vfd`**. Driver value: `3200`.
 
-### Method 1: Dynamically loaded by environment variable (recommended)
+## Requirements
 
-As of HDF5 `1.13.0` each file in an HDF5 app opened or created with the default
-file access property list (FAPL) will use the VFD specified in the `HDF5_DRIVER`
-environment variable rather than the default "sec2" (POSIX) driver. To use the
-Clio VFD, simply set
+HDF5 **>= 1.14** — the driver uses the multi-version `H5FD_class_t` API
+(`H5FD_CLASS_VERSION`, `read_vector`/`write_vector`). Point the build at a
+suitable install with `-DHDF5_ROOT=<prefix>` or `CMAKE_PREFIX_PATH`.
 
-```sh
-HDF5_DRIVER=clio
-```
-
-Now we must tell the HDF5 library where to find the Clio VFD. That is done
-with the following environment variable:
+**HDF5 linkage matters.** A dynamically loaded driver is ABI-coupled to the
+`libhdf5` of the application that loads it. Confirm with:
 
 ```sh
-HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix>/lib/clio_vfd
+ldd <build>/bin/libclio_vfd.so | grep -i hdf5
 ```
 
-The Clio VFD has two configuration options.
-1. persistence - if `true`, the HDF5 application will produce the same output
-   files with the Clio VFD as it would without it. If `false`, the files are
-   buffered in Clio during the application run, but are not persisted when the
-   application terminates. Thus, no files are produced.
-2. page size - The Clio VFD works by mapping HDF5 files into its internal data
-   structures. This happens in pages. The `page size` configuration option
-   allows the user to specify the size, in bytes, of these pages. If your app
-   does lots 2 MiB writes, then it's a good idea to set the page size to 2
-   MiB. A smaller page size, 1 KiB for example, would convert each 2 MiB write
-   into 2048 1 KiB writes. However, be aware that using pages that are too large
-   can slow down metadata operations, which are usually less than 2 KiB. To
-   combat the tradeoff between small metadata pages and large raw data pages,
-   the Clio VFD can be stacked underneath the [split VFD](https://docs.hdfgroup.org/hdf5/develop/group___f_a_p_l.html#ga502f1ad38f5143cf281df8282fef26ed).
-
-
-These two configuration options are passed as a space-delimited string through
-an environment variable:
+## Building
 
 ```sh
-# Example of configuring the Clio VFD with `persistent_mode=true` and
-# `page_size=64KiB`
-HDF5_DRIVER_CONFIG="true 65536"
+cmake -S <repo> -B <build> -DCLIO_CTE_ENABLE_VFD=ON
+cmake --build <build> --target clio_vfd -j
+# -> <build>/bin/libclio_vfd.so   (installs to <prefix>/lib)
 ```
 
-Finally we need to provide a configuration file for Clio itself, and
-`LD_PRELOAD` the Clio VFD so we can intercept HDF5 and MPI calls for proper
-initialization and finalization:
+## Using it
+
+### Method 1 — linked into the application
+
+Include `H5FDclio.h`, link `libclio_vfd.so`, and select the driver on a FAPL:
+
+```c
+herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled);
+herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/);
+```
+
+`cache_enabled` is the only configuration option:
+
+- `true` — populate the CTE cache tier on write. Requires a reachable CLIO
+  runtime; if none is found the file opens native-only and a warning is logged.
+- `false` — native-only. No CTE traffic, no write amplification, and **no CLIO
+  runtime required**. In this mode the driver is a complete, correct HDF5 driver
+  on its own.
+
+```c
+hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+H5Pset_fapl_clio(fapl, /*cache_enabled*/ 1);
+hid_t f = H5Fcreate("/tmp/data.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+```
+
+### Method 2 — loaded by environment variable (no source changes)
 
 ```sh
-CLIO_CONF=<path_to>/clio.yaml
-LD_PRELOAD=<HRUN_INSTALL_prefix>/clio_vfd/libclio_vfd.so
+export HDF5_PLUGIN_PATH=<build>/bin
+export HDF5_DRIVER=clio_vfd
+./my_hdf5_app
 ```
 
-Heres is a full example of running an HDF5 app with the Clio VFD:
+**Known gap:** the driver does not yet parse `HDF5_DRIVER_CONFIG`, so
+`cache_enabled` cannot be set on this path (it uses the default, cache on).
+This path is also not yet covered by the test suite. Both are tracked as Q2.1
+work in `translation/VFD_AUDIT.md` (F13).
+
+## File naming
+
+The driver accepts either a plain path (`/tmp/data.h5`) or a `clio::`-marked one
+(`clio::/tmp/data.h5`). The marker is stripped to locate the authoritative native
+file, so both forms write the same on-disk file; the full name is used as the CTE
+cache key. Plain paths are the normal case — the marker exists for callers that
+also address the file through other CLIO adapters.
+
+## Configuration reference
+
+| Knob | Where | Default | Effect |
+|---|---|---|---|
+| `cache_enabled` | `H5Pset_fapl_clio` | on | Populate the CTE tier on write |
+| `HDF5_DRIVER=clio_vfd` | env | — | Select the driver without source changes |
+| `HDF5_PLUGIN_PATH` | env | — | Where HDF5 looks for the `.so` |
+| `CLIO_VFD_DEBUG` | env | off | Print every read/write addr+size to stderr |
+| `CLIO_VFD_MAX_IO_BYTES` | env | 1 GiB | Largest single `pread`/`pwrite`; larger transfers are split and resumed. Lower it to exercise the multi-pass path in tests |
+| `CLIO_CLIENT_RETRY_TIMEOUT` | env | 60s | How long the runtime attach retries before giving up. `0` fails immediately — worth setting when you expect no runtime |
+
+## Runtime availability
+
+The driver attaches to the CLIO runtime **once per process**, on the first open
+that wants the cache, and remembers the result. Three cases:
+
+- **`cache_enabled=false`** — no attach is attempted at all. The driver is a
+  complete HDF5 driver on its own.
+- **Runtime absent** — the attach fails and the file opens native-only, with a
+  warning. Everything still works; nothing is cached. Note the attach costs
+  `CLIO_CLIENT_RETRY_TIMEOUT` seconds before it gives up, paid once per process.
+- **Runtime *misconfigured*** — e.g. `CLIO_SERVER_CONF` pointing at a file that
+  cannot be parsed. This is **fatal inside the runtime client**: the process
+  aborts before the driver can decide anything. The driver can survive a
+  missing runtime; it cannot survive a broken configuration.
+
+A runtime that starts *after* the first open is not picked up for the lifetime
+of the process — files stay native-only, which is correct but unaccelerated.
+
+## Durability
+
+- `H5Fflush` / `H5Dflush` → `fsync` on the authoritative file. Fail-closed: a
+  flush that did not reach disk returns an error rather than reporting success.
+- `H5Fclose` → `fsync` then `close`, both checked. After a successful close the
+  on-disk file is a complete native HDF5 image and CLIO holds nothing needed to
+  read it.
+- Any driver failure either falls through to the native path or returns a real
+  HDF5 error with a populated error stack. It never reports success for data that
+  was not committed.
+
+## Testing
 
 ```sh
-HDF5_DRIVER=clio                                                    \
-  HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix/lib/clio_vfd              \
-  HDF5_DRIVER_CONFIG="true 65536"                                     \
-  CLIO_CONF=<path_to>/clio.yaml                                   \
-  ./my_hdf5_app
+ctest --test-dir <build> -R vfd --output-on-failure
 ```
 
-### Method 2: Linked into application
+`clio_cte_vfd_unit_tests` covers the rich round-trip, reopen+append, a
+differential against `sec2` as oracle, partial hyperslab overwrite, two files
+open at once, flush/`get_handle`, `flock` exclusion, fail-closed error reporting,
+on-disk size parity with `sec2`, SWMR, the driver FAPL, vectored I/O, `H5Fdelete`
+of both stores, and the no-pending-dirty-state flush barrier.
+CI: `.github/workflows/ci-vfd.yml`.
 
-To link the Clio VFD into an HDF5 application, the application should include
-the `H5FDclio.h` header and should link the installed VFD library,
-`libclio_vfd.so`, into the application. Once this has been done, Clio
-VFD access can be set up by calling `H5Pset_fapl_clio()` on a FAPL within the
-HDF5 application. In this case, the `persistence` and `page_size` configuration
-options are pass directly to this function:
-
-```C
-herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t persistence, size_t page_size)
-```
-
-The resulting `fapl_id` should then be passed to each file open or creation for
-which you wish to use the Clio VFD.
-
-## 4. More Information
-* [Clio VFD performance results](https://github.com/HDFGroup/clio/wiki/HDF5-Clio-VFD)
-
-* [Clio VFD with hdf5-iotest](https://github.com/HDFGroup/clio/tree/master/benchmarks/ClioVFD)
-* [HDF5 VFD Plugins RFC](https://github.com/HDFGroup/hdf5doc/blob/master/RFCs/HDF5_Library/VFL_DriverPlugins/RFC__A_Plugin_Interface_for_HDF5_Virtual_File_Drivers.pdf)
+For the current gap list — including what this suite does **not** cover
+(multi-process, crash consistency, >2 GiB transfers, the env-var path) — see
+`translation/VFD_AUDIT.md`.

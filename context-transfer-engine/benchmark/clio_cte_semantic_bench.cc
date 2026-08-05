@@ -162,6 +162,10 @@ int main(int argc, char **argv) {
     }
   } finalize_guard;
   std::this_thread::sleep_for(milliseconds(500));
+  // SemanticSearch lives in the indexer chimod (issue #905), composed at
+  // 564.0 in the default chain — and puts must flow through it to be
+  // indexed. Default the client binding there; CLIO_CTE_POOL still wins.
+  setenv("CLIO_CTE_POOL", "564.0", /*overwrite=*/0);
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     HLOG(kError, "Failed to initialize CTE client");
     return 1;

@@ -35,7 +35,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME ctp_drive_prediction_e2e
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_prediction_e2e.sh
                 $<TARGET_FILE:test_drive_prediction_e2e_exec>
-                ${CMAKE_SOURCE_DIR}/prediction_server)
+                ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/hw_failure_monitor)
     set_tests_properties(ctp_drive_prediction_e2e PROPERTIES
         LABELS "prediction_e2e"
         SKIP_RETURN_CODE 77

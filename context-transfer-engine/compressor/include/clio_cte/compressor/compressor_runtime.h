@@ -50,6 +50,7 @@
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_interposer.h>
 
 #ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
 #include <clio_cte/compressor/models/dense_nn_predictor.h>
@@ -81,7 +82,7 @@ struct CompressionStats {
  * CTE Compressor Runtime Container
  * Implements compression scheduling and execution
  */
-class Runtime : public clio::run::Container {
+class Runtime : public clio::cte::core::CoreInterposer {
 public:
   using CreateParams = CompressorConfig; // Required for CLIO_TASK_CC (defined in compressor_tasks.h)
 
@@ -93,6 +94,27 @@ private:
   Client client_;
 
   // Core client for target monitoring
+  /**
+   * Compress src[0..size) per ctx into a fresh SHM buffer laid out as
+   * CompressionHeader + codec bytes. Returns true and sets stored/
+   * stored_size on success (and ORs the transform bits + stats into ctx);
+   * returns false when compression failed or was not beneficial — the
+   * caller must then store the RAW bytes with ctx.compress_lib_ cleared.
+   */
+  bool CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
+                       clio::run::u64 size, ctp::ipc::FullPtr<char> *stored,
+                       clio::run::u64 *stored_size);
+
+  /**
+   * Decompress a stored CompressionHeader+codec buffer into dst (capacity
+   * dst_cap). Sets *out_size to the original size. Returns 0, or a nonzero
+   * rc (3 = decompressor creation failed, 5 = decompress failed,
+   * 6 = header invalid / dst too small).
+   */
+  int DecompressStored(const char *stored, clio::run::u64 stored_size,
+                       char *dst, clio::run::u64 dst_cap,
+                       clio::run::u64 *out_size);
+
   std::unique_ptr<clio::cte::core::Client> core_client_;
 
   /**
@@ -176,6 +198,24 @@ private:
    */
   clio::run::TaskResume PollConsumers(clio::run::shared_ptr<PollConsumersTask> &task);
 
+  // ---- Interposed core data verbs (issue #886 interposition) ----
+  // The compressor speaks the CTE core's task interface: a default put with
+  // Context::compress_lib_ set is compressed transparently before landing on
+  // the next pool; reads of transformed blobs are decompressed — including
+  // PARTIAL and VECTORED reads (fetch stored, decompress once, slice into
+  // each requested region), which the raw core cannot serve for compressed
+  // data. GetBlobSize reports the LOGICAL (original) size. MultiPutBlob is
+  // forwarded verbatim (batch records carry no per-record Context, so
+  // compression is not requestable on that path).
+  clio::run::TaskResume PutBlob(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+  clio::run::TaskResume GetBlob(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+  clio::run::TaskResume GetBlobSize(
+      clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
+  clio::run::TaskResume MultiPutBlob(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
@@ -203,6 +243,8 @@ private:
                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
   clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
                                                clio::run::DefaultLoadArchive &archive) override;
+  void AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
+                   const clio::run::shared_ptr<clio::run::Task> &member_task) override;
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 

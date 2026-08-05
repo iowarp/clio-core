@@ -130,7 +130,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       NAME cr_bdev_prediction_integration
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_bdev_prediction_integration.sh
               $<TARGET_FILE:${BDEV_TEST_TARGET}>
-              ${CMAKE_SOURCE_DIR}/prediction_server
+              ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/hw_failure_monitor
     )
     set_tests_properties(cr_bdev_prediction_integration PROPERTIES
       TIMEOUT 300

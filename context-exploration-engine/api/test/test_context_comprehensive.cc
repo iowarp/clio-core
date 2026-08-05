@@ -51,6 +51,7 @@
 #include <clio_cae/core/constants.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
 #include <clio_cte/core/core_client.h>
+#include <clio_cte/indexer/indexer_client.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <clio_runtime/clio_runtime.h>
 #include <fstream>
@@ -122,12 +123,35 @@ public:
           clio::run::PoolId(512, 10));          // explicit bdev pool id
       reg_task.Wait();
 
-      // Initialize CAE client
-      CLIO_CAE_CLIENT_INIT();
+      // Create the indexer pool over the core (issue #905): it owns
+      // SemanticSearch, so the BM25 query tests need it in the chain.
+      {
+        clio::cte::indexer::Client indexer_client;
+        clio::cte::indexer::IndexerConfig indexer_params;
+        indexer_params.next_pool_id_ = clio::cte::core::kCtePoolId;
+        auto idx_create = indexer_client.AsyncCreateIndexer(
+            clio::run::PoolQuery::Local(),
+            clio::cte::indexer::kIndexerPoolName,
+            clio::cte::indexer::kIndexerPoolId,
+            indexer_params);
+        idx_create.Wait();
+        if (idx_create->GetReturnCode() != 0) {
+          throw std::runtime_error("Indexer pool creation failed");
+        }
+      }
+      // Bind the CTE client singleton to the indexer so every put/search
+      // in these tests flows through it (the interposer forwards the rest).
+      cte_client->Init(clio::cte::indexer::kIndexerPoolId);
 
-      // Create CAE pool
+      // Create CAE pool BEFORE CLIO_CAE_CLIENT_INIT: the init helper
+      // creates the pool with DEFAULT params (next = the core), and a
+      // second create by id just returns the existing pool — so whoever
+      // creates first decides the chain. CAE's internal CTE writes
+      // (ParseOmni assimilation, labeling) must flow through the indexer
+      // to be searchable.
       clio::cae::core::Client cae_client;
       clio::cae::core::CreateParams cae_params;
+      cae_params.next_pool_id_ = clio::cte::indexer::kIndexerPoolId;
       auto cae_create = cae_client.AsyncCreate(
           clio::run::PoolQuery::Local(),
           "test_cae_pool",
@@ -138,6 +162,9 @@ public:
       if (cae_create->GetReturnCode() != 0) {
         throw std::runtime_error("CAE pool creation failed");
       }
+
+      // Initialize CAE client (binds the singleton; finds the pool above).
+      CLIO_CAE_CLIENT_INIT();
 
       INFO("CEE infrastructure initialized");
       g_initialized = true;

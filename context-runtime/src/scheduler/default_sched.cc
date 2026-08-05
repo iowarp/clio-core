@@ -635,6 +635,7 @@ void DefaultScheduler::LoadBalance() {
     u64 outstanding = 0;
     u32 live = 0;       // workers executing something
     u32 live_stalled = 0;  // ...of which are stuck past the stall threshold
+    u64 ob_queued = 0, ob_blocked = 0, ob_retry = 0, ob_periodic = 0;
     for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
       Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
       if (w == nullptr) continue;
@@ -644,6 +645,10 @@ void DefaultScheduler::LoadBalance() {
         if (w->IsStalled(now_us, kStallThresholdSec)) ++live_stalled;
       }
       WorkerStats st = w->GetWorkerStats();
+      ob_queued += st.num_queued_tasks_;
+      ob_blocked += st.num_blocked_tasks_;
+      ob_retry += st.num_retry_tasks_;
+      ob_periodic += st.num_periodic_tasks_;
       outstanding += st.num_queued_tasks_ + st.num_blocked_tasks_ +
                      st.num_retry_tasks_;
     }
@@ -696,6 +701,64 @@ void DefaultScheduler::LoadBalance() {
              w->GetId(), st.num_tasks_processed_, st.num_queued_tasks_,
              st.num_blocked_tasks_, st.num_periodic_tasks_,
              st.num_retry_tasks_);
+      }
+    }
+
+    // [HANGWATCH] Pure no-forward-progress watchdog (diagnostic). The wedged-
+    // shape alarm above only fires when live==0 or EVERY live worker is stalled-
+    // in-one-task; it misses the busy-spin / lost-completion class (workers look
+    // "live" and are not counted as stalled) that is exactly the embedded-FUSE
+    // 2-CPU hang (generic/020). This fires purely on "no real task completed for
+    // a while while work is outstanding" and dumps race-safe per-worker state
+    // (stats snapshot + atomic reads only; no GetCurrentTask() shared_ptr race)
+    // so a CI hang is diagnosable from the log. Runs on the monitor thread,
+    // which the spinning workers cannot fully starve.
+    {
+      static u64 wd_last_processed = ~0ull;
+      static double wd_last_us = 0.0;
+      static bool wd_alarmed = false;
+      // Heartbeat every ~2s while work is outstanding: a CI hang log then shows
+      // whether `processed` is advancing (watchdog resets, never alarms) or truly
+      // frozen (should alarm). This is the signal that tells us WHY the 12s dump
+      // did or did not fire.
+      static u64 hb_tick = 0;
+      if (outstanding > 0 && (++hb_tick % 4 == 0)) {
+        HLOG(kError,
+             "[HANGWATCH-HB] processed={} outstanding={} (queued={} blocked={} "
+             "retry={} periodic={}) live={} live_stalled={}",
+             processed, outstanding, ob_queued, ob_blocked, ob_retry,
+             ob_periodic, live, live_stalled);
+      }
+      if (wd_last_processed == ~0ull) {
+        wd_last_processed = processed;
+        wd_last_us = now_us;
+      }
+      if (processed != wd_last_processed || outstanding == 0) {
+        wd_last_processed = processed;
+        wd_last_us = now_us;
+        wd_alarmed = false;
+      } else if (!wd_alarmed && outstanding > 0 &&
+                 (now_us - wd_last_us) > 12.0 * 1e6) {
+        wd_alarmed = true;
+        HLOG(kError,
+             "[HANGWATCH] no task completed in 12s: outstanding={} processed={} "
+             "live={} live_stalled={}. Per-worker:",
+             outstanding, processed, live, live_stalled);
+        for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+          Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+          if (w == nullptr) continue;
+          TaskLane *ln = w->GetLane();
+          WorkerStats st = w->GetWorkerStats();
+          HLOG(kError,
+               "[HANGWATCH]  w{} exec={} stalled={} lane_size={} queued={} "
+               "blocked={} periodic={} retry={} done={}",
+               w->GetId(), w->IsExecuting(),
+               w->IsStalled(now_us, kStallThresholdSec),
+               ln ? static_cast<long>(ln->Size()) : -1L,
+               st.num_queued_tasks_, st.num_blocked_tasks_,
+               st.num_periodic_tasks_, st.num_retry_tasks_,
+               st.num_tasks_processed_);
+        }
       }
     }
   }

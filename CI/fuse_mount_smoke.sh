@@ -26,7 +26,14 @@ case "$(uname -s)" in
   *)      IS_MAC=0 ;;
 esac
 
-MOUNT_POINT="$(mktemp -d 2>/dev/null || mktemp -d -t cte_fuse)"
+# CLIO_SMOKE_MOUNT_POINT: override the mountpoint. macFUSE's FSKit backend
+# (the only backend loadable on CI runners, where the kext cannot be
+# user-approved) only supports mountpoints under /Volumes, so the macOS CI
+# job pre-creates one and passes it here (#903).
+MOUNT_POINT="${CLIO_SMOKE_MOUNT_POINT:-$(mktemp -d 2>/dev/null || mktemp -d -t cte_fuse)}"
+mkdir -p "$MOUNT_POINT" 2>/dev/null || true
+# CLIO_SMOKE_FUSE_OPTS: extra options for the fuse daemon, e.g.
+# "-o backend=fskit" on macOS CI. Intentionally word-split below.
 RUNTIME_PID=""
 FUSE_PID=""
 
@@ -117,7 +124,8 @@ clio_run compose "$CFG_DIR/cte_compose.yaml"
 
 # --- Mount ------------------------------------------------------------------
 info "mounting clio_cte_fuse at $MOUNT_POINT"
-CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM clio_cte_fuse "$MOUNT_POINT" -f &
+# shellcheck disable=SC2086  # CLIO_SMOKE_FUSE_OPTS is deliberately word-split
+CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM clio_cte_fuse "$MOUNT_POINT" -f ${CLIO_SMOKE_FUSE_OPTS:-} &
 FUSE_PID=$!
 for _ in $(seq 1 20); do
   is_mounted && break

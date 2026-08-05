@@ -1,0 +1,33 @@
+# Content Transfer Engine (CTE) Configuration File
+runtime:
+    num_threads: 6
+    queue_depth: 65536
+# RAM-only storage configuration for benchmark testing
+compose:
+  # Compose parameters
+  - mod_name: clio_cte_core
+    pool_name: clio_cte
+    pool_query: local
+    pool_id: 512.0
+
+    # Target management settings
+    targets:
+      neighborhood: 1  # Single-node configuration
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000  # Period to rescan targets for statistics (capacity, bandwidth, etc.)
+
+    # Storage block device configuration
+    # RAM-only configuration for benchmark testing
+    storage:
+      # Primary RAM storage
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "16GB"
+        score: 0.0           # Manual score override (0.0-1.0) - highest tier
+
+    # Data Placement Engine configuration
+    dpe:
+      dpe_type: "max_bw"  # Options: "random", "round_robin", "max_bw"
+
+    # Note: This configuration uses only RAM-based storage for maximum performance
+    # benchmarking. All data is stored in memory with no persistent storage.

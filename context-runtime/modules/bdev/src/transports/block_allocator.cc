@@ -13,6 +13,9 @@ namespace clio::run::bdev {
 // will be moved here from bdev_runtime.cc
 
 const size_t kBlockSizes[] = {
+    512,      // 512B
+    1024,     // 1KB
+    2048,     // 2KB
     4096,     // 4KB
     16384,    // 16KB
     32768,    // 32KB
@@ -20,6 +23,9 @@ const size_t kBlockSizes[] = {
     131072,   // 128KB
     1048576   // 1MB
 };
+static_assert(sizeof(kBlockSizes) / sizeof(kBlockSizes[0]) ==
+                  static_cast<size_t>(BlockSizeCategory::kMaxCategories),
+              "kBlockSizes must match BlockSizeCategory");
 
 WorkerBlockMap::WorkerBlockMap() {
   blocks_.resize(static_cast<size_t>(BlockSizeCategory::kMaxCategories));
@@ -38,6 +44,29 @@ bool WorkerBlockMap::AllocateBlock(int block_type, Block &block, size_t min_size
       block = *it;
       list.erase(it);
       return true;
+    }
+  }
+  return false;
+}
+
+bool WorkerBlockMap::AllocateAnyUpTo(size_t max_bytes, Block &block) {
+  // Largest category first so a big request drains few large freed extents
+  // rather than many tiny ones. Match on the block's PHYSICAL FOOTPRINT (its
+  // 4 KiB-aligned size, which is what it actually occupies), not its logical
+  // size_ -- taking a block whose footprint exceeds the remainder would occupy
+  // more space than is charged for it. Alignment is 4 KiB everywhere in this
+  // allocator (the block-size categories and the heap slab are all 4 KiB
+  // multiples), so it is safe to compute here without the allocator's field.
+  for (int bt = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1; bt >= 0;
+       --bt) {
+    auto &list = blocks_[bt];
+    for (auto it = list.begin(); it != list.end(); ++it) {
+      clio::run::u64 footprint = ((it->size_ + 4095) / 4096) * 4096;
+      if (it->size_ > 0 && footprint <= max_bytes) {
+        block = *it;
+        list.erase(it);
+        return true;
+      }
     }
   }
   return false;
@@ -91,6 +120,26 @@ bool GlobalBlockMap::AllocateBlock(int worker, size_t io_size, Block &block) {
   return false;
 }
 
+bool GlobalBlockMap::AllocateAnyUpTo(int worker, size_t max_bytes,
+                                     Block &block) {
+  if (worker_maps_.empty()) return false;
+  size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
+  {
+    clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
+    if (worker_maps_[worker_idx].AllocateAnyUpTo(max_bytes, block)) {
+      return true;
+    }
+  }
+  for (size_t i = 1; i < worker_maps_.size(); ++i) {
+    size_t other = (worker_idx + i) % worker_maps_.size();
+    clio::run::ScopedCoMutex lock(worker_locks_[other]);
+    if (worker_maps_[other].AllocateAnyUpTo(max_bytes, block)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
   if (worker_maps_.empty()) return false;
   size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
@@ -139,6 +188,7 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
     return true;
   }
 
+  // 1. Reuse a single free extent that already fits (the common case).
   Block block;
   if (global_block_map_.AllocateBlock(worker_id, total_size, block)) {
     blocks.push_back(block);
@@ -146,33 +196,62 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
     return true;
   }
 
+  // 2. Take one contiguous block from the heap. This is tried BEFORE
+  //    fragmenting so that a request the heap can satisfy stays a SINGLE
+  //    block -- fragmenting a request the heap could serve cleanly only
+  //    scatters it for no benefit (and broke callers that assume one
+  //    allocation is one block, e.g. bdev_file_vs_ram_comparison).
   clio::run::u64 aligned_total_size = AlignSize(total_size);
-  // Classify the fresh allocation by its size category so callers (and the
-  // free list it returns to) see the correct block_type_. Previously this
-  // hardcoded the largest category, so e.g. a 4KB allocation came back tagged
-  // as 1MB (block_type_ != 0).
-  int block_type = GlobalBlockMap::FindBlockType(aligned_total_size);
-  if (block_type == -1) {
-    block_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
+  int whole_type = GlobalBlockMap::FindBlockType(aligned_total_size);
+  if (whole_type == -1) {
+    whole_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
   }
-  if (heap_.Allocate(aligned_total_size, block_type, block)) {
-    // block.size_ stays the caller's requested size — that is what the
-    // caller reads and writes, and what it hands back to FreeBlocks.
-    block.size_ = total_size;
+  if (heap_.Allocate(aligned_total_size, whole_type, block)) {
+    block.size_ = total_size;  // logical size the caller reads/writes
     blocks.push_back(block);
-    // Charge the ALIGNED size, not the raw request. The heap advanced by
-    // aligned_total_size, and FreeBlocks credits AlignSize(block.size_),
-    // which is the same aligned value. Charging total_size here made every
-    // first allocation of a non-4096-multiple block credit more on free
-    // than it charged, so allocated_bytes_ drifted downward by
-    // (AlignSize(size) - size) per block and GetRemainingSize() reported
-    // progressively more free space than the target actually had. The
-    // `std::min` clamp in FreeBlocks hid it by silently absorbing the
-    // difference rather than underflowing. See #798.
+    // Charge the ALIGNED size (the heap advanced by it, and FreeBlocks credits
+    // AlignSize(size_) -- keeping the two in step; see #798).
     allocated_bytes_.fetch_add(aligned_total_size, std::memory_order_relaxed);
     return true;
   }
 
+  // 3. LAST RESORT: the heap cannot give a contiguous block (the tier is at or
+  //    near capacity). ASSEMBLE the request from several smaller freed extents
+  //    (issue #820). Without this, the free list is bucketed by size category
+  //    -- a 1 MiB ask never sees freed 64 KiB blocks -- so a large ask can
+  //    never reuse a fragmented pool and the bump-only heap climbs to capacity
+  //    -> write EIO (xfstests 074/521/522). This is the allocator's job, not
+  //    the CTE's (which used to cap every block at 64 KiB to dodge it); the
+  //    blocks_ vector carries multi-block extents transparently.
+  //
+  //    Accounting is in PHYSICAL footprint bytes (AlignSize(size_)): each
+  //    reused block is reported at its footprint and covers that many bytes, so
+  //    a big ask consumes one slab per slab of need, not one slab per (possibly
+  //    sub-slab) freed logical size. The caller distributes the logical request
+  //    across these physical blocks.
+  clio::run::u64 remaining_phys = aligned_total_size;
+  Block fb;
+  while (remaining_phys > 0 &&
+         global_block_map_.AllocateAnyUpTo(worker_id, remaining_phys, fb)) {
+    clio::run::u64 fp = AlignSize(fb.size_);       // true footprint
+    if (fp > remaining_phys) fp = remaining_phys;  // last partial block
+    fb.size_ = fp;                                 // report the footprint
+    blocks.push_back(fb);
+    allocated_bytes_.fetch_add(fp, std::memory_order_relaxed);
+    remaining_phys -= fp;
+  }
+  if (remaining_phys == 0) {
+    return true;  // satisfied entirely from reused space
+  }
+
+  // Freed extents did not cover it and the heap is full: genuinely out of
+  // space. Roll everything back so the caller sees all-or-nothing (it frees
+  // `blocks` only on a true return).
+  for (auto &b : blocks) {
+    global_block_map_.FreeBlock(worker_id, b);
+    allocated_bytes_.fetch_sub(AlignSize(b.size_), std::memory_order_relaxed);
+  }
+  blocks.clear();
   return false;
 }
 

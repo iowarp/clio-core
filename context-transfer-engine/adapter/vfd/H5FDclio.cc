@@ -74,6 +74,16 @@ static hid_t H5FDclio_err_minor_g = H5I_INVALID_HID;
 unsigned long H5FDclio_read_vector_calls_g = 0;
 unsigned long H5FDclio_write_vector_calls_g = 0;
 
+/* Observability: CTE cache-tier operations that FAILED. The cache is populate-
+ * only today, so a failure is survivable (the authoritative native file already
+ * has the bytes) -- but it must not be invisible: once the read tier lands, a
+ * dropped Pwrite is a range the cache believes it holds and does not, which is
+ * exactly the stale-data hazard VFD_2.1_READ_CACHE_SCOPING.md is written to
+ * contain. Counted and logged here so residency work has a signal to build on.
+ * Exported (not static) so tests can assert on them. */
+unsigned long H5FDclio_cache_write_failures_g = 0;
+unsigned long H5FDclio_cache_truncate_failures_g = 0;
+
 /* Push a driver error onto HDF5's default error stack. Callbacks still return
  * FAIL/NULL to signal the failure to the library; this records a diagnosable
  * reason (incl. errno) that composes with HDF5's own stack and is surfaced by
@@ -101,6 +111,84 @@ unsigned long H5FDclio_write_vector_calls_g = 0;
 #define SUCCEED 0
 #define FAIL (-1)
 
+/* Largest byte count handed to a single pread/pwrite. Linux caps a single
+ * transfer at 0x7ffff000 and returns a SHORT count above it, so an unlooped
+ * call would silently transfer less than asked. sec2 chunks for the same
+ * reason (H5_POSIX_MAX_IO_BYTES); 1 GiB is comfortably under every platform
+ * limit and keeps the loop count trivial for realistic HDF5 requests.
+ *
+ * CLIO_VFD_MAX_IO_BYTES overrides it. This exists so the multi-pass path can be
+ * exercised with ordinary kilobyte-sized transfers instead of requiring a
+ * multi-gigabyte one: the splitting/resume logic is identical at any threshold,
+ * and a test that needs 2 GiB of disk and memory to run is a test that does not
+ * get run. Read once, on first use. */
+static size_t H5FD__clio_max_io_bytes(void) {
+  static const size_t limit = []() -> size_t {
+    const char *v = getenv("CLIO_VFD_MAX_IO_BYTES");
+    if (v && *v) {
+      unsigned long long n = strtoull(v, nullptr, 10);
+      if (n > 0) {
+        return (size_t)n;
+      }
+    }
+    return (size_t)1 << 30;
+  }();
+  return limit;
+}
+
+/* Attach to the CLIO runtime, at most once per process, and remember the
+ * answer.
+ *
+ * Attaching to an absent runtime is not cheap: the client retries for
+ * CLIO_CLIENT_RETRY_TIMEOUT seconds (60 by default) before giving up. Asking
+ * again on every H5Fopen would make a down runtime cost that timeout per file
+ * rather than once per process -- a workload opening a hundred files would
+ * appear to hang. Cache it.
+ *
+ * Consequence, accepted deliberately: a runtime that starts AFTER the first
+ * open is not picked up for the life of the process. Files stay native-only,
+ * which is correct, just unaccelerated. */
+static bool H5FD__clio_cache_available(void) {
+  static const bool available = clio::cte::core::CLIO_CTE_CLIENT_INIT();
+  return available;
+}
+
+/* Read the CLIO_VFD_CACHE opt-out. Default on; "0"/"off"/"false"/"no" disable
+ * the CTE tier and make the driver pure write-through to the native file.
+ *
+ * Deliberately identical in name-shape and accepted values to the VOL's
+ * CLIO_VOL_CACHE, because the two connectors should not need different muscle
+ * memory to switch off the same thing.
+ *
+ * Why an env var when H5Pset_fapl_clio(fapl, false) already exists: the FAPL
+ * property requires editing and recompiling the application, and the entire
+ * deployment story for this driver is HDF5_DRIVER=clio_vfd with NO source
+ * edits. A switch reachable only from source is not reachable at all for the
+ * workloads this driver targets. §1.4 of VFD_VOL_TECHNICAL_GOALS.md asks for
+ * exactly this shape -- "one env var and one FAPL property, either of which is
+ * sufficient" -- and only the FAPL half existed.
+ *
+ * Precedence: the env var is an opt-OUT only. It can force the cache off, but
+ * it never forces it on over an explicit H5Pset_fapl_clio(fapl, false). "Either
+ * is sufficient" means either is sufficient to DISABLE, which is the
+ * fail-closed direction; a caller that asked for native-only in code must not
+ * have the cache switched back on underneath by an environment it did not set.
+ */
+static bool H5FD__clio_cache_env_enabled(void) {
+  const char *v = getenv("CLIO_VFD_CACHE");
+  if (!v || !*v) return true;
+  return !(strcmp(v, "0") == 0 || strcmp(v, "off") == 0 ||
+           strcmp(v, "false") == 0 || strcmp(v, "no") == 0);
+}
+
+/* True when addr/size cannot be expressed as a POSIX file region: an undefined
+ * address, an address past the driver's advertised maxaddr, or a length that
+ * wraps when added to the address. sec2 performs the equivalent checks; without
+ * them the casts below silently produce a nonsense off_t. */
+#define H5FD_CLIO_REGION_INVALID(addr, size)                               \
+  (HADDR_UNDEF == (addr) || (addr) > MAXADDR ||                            \
+   (haddr_t)(size) > (haddr_t)(MAXADDR - (addr)))
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -127,6 +215,14 @@ typedef struct H5FD_clio_t {
   char *filename_;    /* the name of the file (NULL if empty)  */
   unsigned flags;     /* the flags passed from H5Fcreate/H5Fopen */
   H5FD_clio_fapl_t fa; /* driver-specific FAPL config for this file */
+  /* Filesystem identity of the authoritative native file, captured at open.
+   * This -- NOT the filename -- is what cmp() compares: HDF5 uses cmp() to
+   * decide whether an already-open file IS the same file, and two spellings of
+   * one path (relative vs absolute, symlink vs target, with vs without the
+   * clio:: marker) must compare equal or the library opens the same file twice
+   * with two independent metadata caches, which corrupts it. sec2 parity. */
+  dev_t st_dev;       /* device id of the authoritative native file */
+  ino_t st_ino;       /* inode number of the authoritative native file */
 } H5FD_clio_t;
 
 /* Prototypes */
@@ -166,7 +262,12 @@ static const H5FD_class_t H5FD_clio_g = {
     H5FD_CLIO_VALUE,   /* value                */
     H5FD_CLIO_NAME,    /* name                 */
     MAXADDR,              /* maxaddr              */
-    H5F_CLOSE_STRONG,     /* fc_degree            */
+    /* sec2 parity: the driver's DEFAULT file-close degree. Under STRONG (the
+     * previous value) H5Fclose tears the file down even with objects still
+     * open, invalidating their ids; under WEAK the close defers until the last
+     * object closes. Applications observe the difference, so differing from
+     * sec2 here is a silent native-compatibility deviation. */
+    H5F_CLOSE_WEAK,       /* fc_degree            */
     H5FD__clio_term,    /* terminate            */
     NULL,                 /* sb_size              */
     NULL,                 /* sb_encode            */
@@ -283,14 +384,52 @@ static herr_t H5FD__clio_term(void) {
  */
 static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
                                  hid_t fapl_id, haddr_t maxaddr) {
-  (void)maxaddr;
-  clio::cte::core::CLIO_CTE_CLIENT_INIT();
+  // Argument validation, sec2 parity. Without these a NULL name dereferences in
+  // StripClioPrefix below, and an out-of-range maxaddr is accepted despite the
+  // class advertising MAXADDR.
+  if (!name || !*name) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("invalid file name (NULL or empty)");
+    return nullptr;
+  }
+  if (0 == maxaddr || HADDR_UNDEF == maxaddr) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("invalid maxaddr");
+    return nullptr;
+  }
+  if (maxaddr > MAXADDR) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("maxaddr exceeds the driver's addressable range");
+    return nullptr;
+  }
 
   // Driver-specific FAPL config: use the caller's policy if a driver-info block
   // was set (H5Pset_fapl_clio), else the default (cache on).
   const H5FD_clio_fapl_t *fa_in =
       (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
   H5FD_clio_fapl_t fa = fa_in ? *fa_in : H5FD_clio_fapl_default_g;
+
+  /* Environment opt-out, applied before the runtime probe below so that
+     CLIO_VFD_CACHE=0 also skips the attach attempt entirely (and therefore its
+     retry timeout) rather than attaching and then not using it. */
+  if (fa.cache_enabled && !H5FD__clio_cache_env_enabled()) {
+    fa.cache_enabled = 0;
+  }
+
+  // Attach to the CLIO runtime ONLY when this file actually wants the cache
+  // tier. Model A keeps the native file authoritative, so the native-only
+  // configuration (H5Pset_fapl_clio(fapl, false)) is a complete, correct driver
+  // on its own and must not require CLIO to be running -- previously this ran
+  // unconditionally and with its result discarded, so a down/absent runtime
+  // broke even the native-only path. If attach fails we degrade to native-only
+  // for this file rather than failing the open: the authoritative store is
+  // unaffected, and the cache is a performance tier, not a correctness one.
+  if (fa.cache_enabled && !H5FD__clio_cache_available()) {
+    HLOG(kWarning,
+         "CLIO runtime unavailable; opening {} native-only (cache disabled)",
+         name);
+    fa.cache_enabled = 0;
+  }
 
   /* Build the open flags */
   int o_flags = (H5F_ACC_RDWR & flags) ? O_RDWR : O_RDONLY;
@@ -345,19 +484,42 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     return nullptr;
   }
 
+  // Identity + size from ONE fstat of the authoritative file. cmp() depends on
+  // dev/ino, so a failed fstat is fail-closed: without identity the library
+  // could not tell this file apart from another and might open it twice.
+  struct stat st;
+  if (fstat(posix_fd, &st) < 0) {
+    H5FD_CLIO_ERROR("fstat() of authoritative native file failed");
+    close(posix_fd);
+    if (fd >= 0) {
+      CLIO_CTE_CFS->Close(fd);
+    }
+    free(file);
+    return nullptr;
+  }
+
   /* Pack file */
-  if (name && *name) {
-    file->filename_ = strdup(name);
+  file->filename_ = strdup(name);
+  if (!file->filename_) {
+    errno = ENOMEM;
+    H5FD_CLIO_ERROR("strdup() of file name failed");
+    close(posix_fd);
+    if (fd >= 0) {
+      CLIO_CTE_CFS->Close(fd);
+    }
+    free(file);
+    return nullptr;
   }
   file->fd = fd;
   file->posix_fd = posix_fd;
   file->flags = flags;
   file->fa = fa;
+  file->st_dev = st.st_dev;
+  file->st_ino = st.st_ino;
 
   // EOF is the authoritative on-disk size (durable across reopen/append), not a
   // session-local counter or the cache's logical size.
-  struct stat st;
-  file->eof = (fstat(posix_fd, &st) == 0) ? (haddr_t)st.st_size : 0;
+  file->eof = (haddr_t)st.st_size;
 
   return (H5FD_t *)file;
 } /* end H5FD__clio_open() */
@@ -384,7 +546,13 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
       H5FD_CLIO_ERROR("fsync() on close failed");
       ret_value = FAIL; /* fail-closed: a close that did not persist fails */
     }
-    close(file->posix_fd);
+    // close() itself can fail (EIO, and notably deferred write errors on NFS).
+    // A close that reports an error has not necessarily persisted, so it is
+    // fail-closed too -- the whole point of the barrier.
+    if (close(file->posix_fd) < 0) {
+      H5FD_CLIO_ERROR("close() of authoritative native file failed");
+      ret_value = FAIL;
+    }
   }
   // Release the CTE cache handle, if this session had one.
   if (file->fd >= 0) {
@@ -413,11 +581,17 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
 static int H5FD__clio_cmp(const H5FD_t *_f1, const H5FD_t *_f2) {
   const H5FD_clio_t *f1 = (const H5FD_clio_t *)_f1;
   const H5FD_clio_t *f2 = (const H5FD_clio_t *)_f2;
-  // filename_ is only set for a non-empty name; guard against NULL so an
-  // empty-name file cannot crash strcmp.
-  const char *n1 = f1->filename_ ? f1->filename_ : "";
-  const char *n2 = f2->filename_ ? f2->filename_ : "";
-  return strcmp(n1, n2);
+  // Compare filesystem IDENTITY (device + inode), not the filename string.
+  // HDF5 uses this to decide whether an already-open file is the same file;
+  // comparing names made "/tmp/f.h5", "./f.h5", "clio::/tmp/f.h5" and a symlink
+  // to any of them look like four different files, so the library could open
+  // one file several times with independent metadata caches and corrupt it.
+  // sec2 compares dev/ino for exactly this reason.
+  if (f1->st_dev < f2->st_dev) return -1;
+  if (f1->st_dev > f2->st_dev) return 1;
+  if (f1->st_ino < f2->st_ino) return -1;
+  if (f1->st_ino > f2->st_ino) return 1;
+  return 0;
 } /* end H5FD__clio_cmp() */
 
 /*-------------------------------------------------------------------------
@@ -536,32 +710,98 @@ static haddr_t H5FD__clio_get_eof(const H5FD_t *_file, H5FD_mem_t type) {
  */
 static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
                                  void *buf) {
-  ssize_t got = pread(file->posix_fd, buf, size, static_cast<off_t>(addr));
-  if (getenv("CLIO_VFD_DEBUG"))
-    fprintf(stderr, "[vfd] READ  addr=%llu size=%llu got=%lld\n",
-            (unsigned long long)addr, (unsigned long long)size, (long long)got);
-  if (got < 0) {
-    H5FD_CLIO_ERROR("pread() of authoritative native file failed");
+  if (H5FD_CLIO_REGION_INVALID(addr, size)) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("read region is undefined or out of range");
     return FAIL;
   }
-  if (static_cast<size_t>(got) < size) {
-    memset(static_cast<char *>(buf) + got, 0, size - static_cast<size_t>(got));
+  char *dst = static_cast<char *>(buf);
+  size_t remaining = size;
+  off_t off = static_cast<off_t>(addr);
+
+  // Loop rather than issue one pread. A short return is NOT proof of EOF: the
+  // kernel caps a single transfer (0x7ffff000 on Linux) and a signal can cut
+  // one short via EINTR. The previous single-shot version zero-filled whatever
+  // it did not get, so a >2 GiB read -- or any interrupted one -- silently
+  // handed back zeros in place of real data WITH a success status. Only a
+  // pread returning exactly 0 is true EOF; HDF5 treats the file as a flat byte
+  // array, so the tail past EOF is legitimately zero-filled.
+  while (remaining > 0) {
+    const size_t cap = H5FD__clio_max_io_bytes();
+    size_t want = (remaining > cap) ? cap : remaining;
+    ssize_t got = pread(file->posix_fd, dst, want, off);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue; /* interrupted before transferring anything: retry */
+      }
+      H5FD_CLIO_ERROR("pread() of authoritative native file failed");
+      return FAIL;
+    }
+    if (got == 0) {
+      memset(dst, 0, remaining); /* genuine EOF: zero-fill the remainder */
+      break;
+    }
+    dst += got;
+    off += got;
+    remaining -= static_cast<size_t>(got);
   }
+  if (getenv("CLIO_VFD_DEBUG"))
+    fprintf(stderr, "[vfd] READ  addr=%llu size=%llu\n",
+            (unsigned long long)addr, (unsigned long long)size);
   return SUCCEED;
 }
 
 static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
                                   const void *buf) {
-  ssize_t put = pwrite(file->posix_fd, buf, size, static_cast<off_t>(addr));
-  if (getenv("CLIO_VFD_DEBUG"))
-    fprintf(stderr, "[vfd] WRITE addr=%llu size=%llu put=%lld\n",
-            (unsigned long long)addr, (unsigned long long)size, (long long)put);
-  if (put < 0 || static_cast<size_t>(put) < size) {
-    H5FD_CLIO_ERROR("pwrite() to authoritative native file failed/short");
+  if (H5FD_CLIO_REGION_INVALID(addr, size)) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("write region is undefined or out of range");
     return FAIL;
   }
+  const char *src = static_cast<const char *>(buf);
+  size_t remaining = size;
+  off_t off = static_cast<off_t>(addr);
+
+  // Same loop as the read path: chunk to stay under the kernel's per-call cap
+  // and retry on EINTR. A short pwrite is a partial transfer to be continued,
+  // not a failure -- unlooped, a >2 GiB write failed outright.
+  while (remaining > 0) {
+    const size_t cap = H5FD__clio_max_io_bytes();
+    size_t want = (remaining > cap) ? cap : remaining;
+    ssize_t put = pwrite(file->posix_fd, src, want, off);
+    if (put < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      H5FD_CLIO_ERROR("pwrite() to authoritative native file failed");
+      return FAIL;
+    }
+    if (put == 0) {
+      // No progress and no error: cannot complete the write. Fail closed
+      // rather than spin.
+      H5FD_CLIO_ERROR("pwrite() to authoritative native file made no progress");
+      return FAIL;
+    }
+    src += put;
+    off += put;
+    remaining -= static_cast<size_t>(put);
+  }
+  if (getenv("CLIO_VFD_DEBUG"))
+    fprintf(stderr, "[vfd] WRITE addr=%llu size=%llu\n",
+            (unsigned long long)addr, (unsigned long long)size);
+
+  // Populate the cache tier. Best-effort by design (the authoritative write
+  // already succeeded), but NOT silent: a dropped populate is a range the tier
+  // does not hold, which the future read tier must not mistake for resident
+  // data. Count it and log once per failure so residency work has a signal.
   if (file->fd >= 0) {
-    CLIO_CTE_CFS->Pwrite(file->fd, buf, size, static_cast<off_t>(addr));
+    if (CLIO_CTE_CFS->Pwrite(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
+      H5FDclio_cache_write_failures_g++;
+      HLOG(kWarning,
+           "CTE cache populate failed at addr={} size={} (native file is "
+           "unaffected and remains authoritative)",
+           (unsigned long long)addr, (unsigned long long)size);
+    }
   }
   if ((haddr_t)(addr + size) > file->eof) {
     file->eof = (haddr_t)(addr + size);
@@ -752,9 +992,16 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
       return FAIL;
     }
     // Keep the CTE cache's logical size in step (best-effort; populate-only
-    // tier, see the write callback).
+    // tier, see the write callback). Counted on failure for the same reason:
+    // a tier that did not shrink still holds bytes past the new EOF.
     if (file->fd >= 0) {
-      CLIO_CTE_CFS->FtruncateFd(file->fd, (off_t)file->eoa);
+      if (CLIO_CTE_CFS->FtruncateFd(file->fd, (off_t)file->eoa) < 0) {
+        H5FDclio_cache_truncate_failures_g++;
+        HLOG(kWarning,
+             "CTE cache truncate to {} failed (native file is unaffected and "
+             "remains authoritative)",
+             (unsigned long long)file->eoa);
+      }
     }
     file->eof = file->eoa;
   }
@@ -783,6 +1030,10 @@ static herr_t H5FD__clio_lock(H5FD_t *_file, bool rw) {
     if (errno == ENOSYS) {
       return SUCCEED; /* locking unsupported here: not an error (sec2 parity) */
     }
+    // Push a diagnosable error like every other failure path. Lock contention
+    // (EWOULDBLOCK: another process holds the file) is exactly the failure a
+    // user needs named, and it was the one case the driver stayed silent on.
+    H5FD_CLIO_ERROR("flock() of authoritative native file failed");
     return FAIL;
   }
   return SUCCEED;
@@ -797,6 +1048,7 @@ static herr_t H5FD__clio_unlock(H5FD_t *_file) {
     if (errno == ENOSYS) {
       return SUCCEED;
     }
+    H5FD_CLIO_ERROR("flock(LOCK_UN) of authoritative native file failed");
     return FAIL;
   }
   return SUCCEED;
@@ -859,6 +1111,43 @@ herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled) {
 }
 
 /*-------------------------------------------------------------------------
+ * Function:    H5Pget_fapl_clio
+ *
+ * Purpose:     Read back the driver-specific tiering policy from a FAPL that
+ *              selects this driver. The symmetric counterpart to
+ *              H5Pset_fapl_clio -- HDF5 convention pairs every H5Pset_fapl_*
+ *              with a getter, and without one a caller cannot inspect (or
+ *              round-trip) the config it set.
+ *
+ * Return:      SUCCEED/FAIL
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/) {
+  if (H5Pisa_class(fapl_id, H5P_FILE_ACCESS) <= 0) {
+    H5FD_CLIO_ERROR("H5Pget_fapl_clio: not a file access property list");
+    return FAIL;
+  }
+  if (!cache_enabled) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("H5Pget_fapl_clio: NULL out parameter");
+    return FAIL;
+  }
+  if (H5Pget_driver(fapl_id) != H5FD_clio_init()) {
+    H5FD_CLIO_ERROR("H5Pget_fapl_clio: FAPL does not select the CLIO VFD");
+    return FAIL;
+  }
+  // No driver-info block means the file would open with the default policy
+  // (H5Pset_driver(fapl, driver, NULL)); report that same default so the getter
+  // always describes what an open would actually do.
+  const H5FD_clio_fapl_t *fa =
+      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
+  *cache_enabled =
+      fa ? fa->cache_enabled : H5FD_clio_fapl_default_g.cache_enabled;
+  return SUCCEED;
+}
+
+/*-------------------------------------------------------------------------
  * Function:    H5FD__clio_del
  *
  * Purpose:     Delete the file NAME (H5Fdelete). Removes BOTH stores so neither
@@ -874,12 +1163,21 @@ herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled) {
  */
 static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
   (void)fapl;
-  clio::cte::core::CLIO_CTE_CLIENT_INIT();
+  if (!name || !*name) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("H5Fdelete: invalid file name (NULL or empty)");
+    return FAIL;
+  }
 
   // Drop the CTE cache tag first so it can never be orphaned behind a deleted
   // native file. Best-effort: keyed by the same full name open() used, and
-  // absence (cache off / never populated) is a harmless no-op.
-  CLIO_CTE_CFS->RemovePath(name);
+  // absence (cache off / never populated) is a harmless no-op. If the runtime
+  // is not reachable there is no cache entry to orphan, so deleting the native
+  // file alone is still correct -- the delete must not fail just because CLIO
+  // is down (same reasoning as open()).
+  if (H5FD__clio_cache_available()) {
+    CLIO_CTE_CFS->RemovePath(name);
+  }
 
   // Remove the authoritative native file at the stripped path. Fail-closed on
   // error (sec2 parity) so a failed delete is reported, not masked.

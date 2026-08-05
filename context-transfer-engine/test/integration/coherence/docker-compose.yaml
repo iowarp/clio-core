@@ -1,0 +1,108 @@
+# 4-node cache-coherence cluster (issue #886 distributed coherence).
+#
+# Unlike the sibling distributed suite (tests on node 1 only), EVERY node
+# runs the coherence binary — the scenarios are collective (each rank puts,
+# every rank reads). A node's container exits with its test binary's code;
+# run_tests.sh requires 0 from all four.
+
+x-coh-node: &coh-node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+  tmpfs:
+    - /mnt:mode=1777
+    - /tmp/clio_home:mode=1777
+  mem_limit: 8g
+  working_dir: /workspace
+  entrypoint: [ "/bin/bash", "-c" ]
+
+x-coh-env: &coh-env
+  CLIO_SERVER_CONF: /workspace/context-transfer-engine/test/integration/coherence/clio_config.yaml
+  CONTAINER_HOSTFILE: /workspace/context-transfer-engine/test/integration/coherence/hostfile
+  CTE_NUM_NODES: "4"
+  CLIO_WITH_RUNTIME: "0"
+  # The test client binds the chain top (the runtime ignores this env; its
+  # module-internal clients bind pools explicitly).
+  CLIO_CTE_POOL: "563.0"
+  # Hermetic per-container state: no restart-log replay, no persisted bdev
+  # perf profiles leaking between runs.
+  HOME: /tmp/clio_home
+  PATH: /workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+  LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+
+x-coh-cmd: &coh-cmd >
+  "
+    echo \"Node $$NODE_ID: starting runtime\" &&
+    /workspace/build/bin/clio_run runtime start &
+    RUNTIME_PID=$$! &&
+    sleep 5 &&
+    echo \"Node $$NODE_ID: running coherence suite\" &&
+    /workspace/build/bin/test_cache_coherence 2>&1;
+    TEST_EXIT_CODE=$$?;
+    echo \"Node $$NODE_ID: suite exit $$TEST_EXIT_CODE\";
+    kill $$RUNTIME_PID 2>/dev/null;
+    exit $$TEST_EXIT_CODE
+  "
+
+services:
+  coh-node1:
+    <<: *coh-node
+    container_name: coh-node1
+    hostname: coh-node1
+    networks:
+      coh-cluster:
+        ipv4_address: 172.30.0.10
+    environment:
+      <<: *coh-env
+      NODE_ID: "1"
+      NODE_IP: 172.30.0.10
+    command: *coh-cmd
+
+  coh-node2:
+    <<: *coh-node
+    container_name: coh-node2
+    hostname: coh-node2
+    networks:
+      coh-cluster:
+        ipv4_address: 172.30.0.11
+    environment:
+      <<: *coh-env
+      NODE_ID: "2"
+      NODE_IP: 172.30.0.11
+    command: *coh-cmd
+
+  coh-node3:
+    <<: *coh-node
+    container_name: coh-node3
+    hostname: coh-node3
+    networks:
+      coh-cluster:
+        ipv4_address: 172.30.0.12
+    environment:
+      <<: *coh-env
+      NODE_ID: "3"
+      NODE_IP: 172.30.0.12
+    command: *coh-cmd
+
+  coh-node4:
+    <<: *coh-node
+    container_name: coh-node4
+    hostname: coh-node4
+    networks:
+      coh-cluster:
+        ipv4_address: 172.30.0.13
+    environment:
+      <<: *coh-env
+      NODE_ID: "4"
+      NODE_IP: 172.30.0.13
+    command: *coh-cmd
+
+networks:
+  coh-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

@@ -48,6 +48,9 @@
 #ifndef _WIN32
 #include <sys/statvfs.h>          // struct statvfs (statfs op)
 #include <unistd.h>               // read, getuid, getgid
+#ifdef __APPLE__
+#include <sys/mount.h>            // struct statfs (macFUSE's statfs callback type)
+#endif
 #endif  // _WIN32
 // The mount / process-entry glue (fuse_main, the apptainer --fusemount custom-io
 // path, and the fuse_lowlevel/dlsym/mount/uio machinery it needs) now lives in
@@ -69,7 +72,20 @@ using cte_stat_t = struct stat;
 using cte_off_t = off_t;
 using cte_mode_t = mode_t;
 using cte_timespec_t = struct timespec;
+#ifdef __APPLE__
+// macFUSE's statfs callback reports through Darwin's struct statfs, not
+// statvfs (the two share f_bsize/f_blocks/f_bfree/f_bavail/f_files/f_ffree;
+// f_frsize/f_favail/f_namemax exist only on statvfs — see cte_fuse_statfs).
+using cte_statvfs_t = struct statfs;
+// Darwin spells the nanosecond stat members st_*timespec. Macro-alias the
+// Linux spellings AFTER all system headers so member accesses in the
+// callbacks (and in the test TU that #includes this file) resolve.
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+#else
 using cte_statvfs_t = struct statvfs;
+#endif
 #endif
 
 using namespace clio::cae::fuse;
@@ -429,7 +445,15 @@ static int cte_fuse_readdir(const char *path, void *buf,
     cte_stat_t st;
     memset(&st, 0, sizeof(st));
     st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
+#ifdef __APPLE__
+    // macFUSE's fill-dir callback consumes a fuse_darwin_attr, not a
+    // struct stat — translate (same mapping getattr uses).
+    struct fuse_darwin_attr attr;
+    CopyStatToDarwinAttr(st, &attr);
+    filler(buf, name.c_str(), &attr, 0, static_cast<fuse_fill_dir_flags>(0));
+#else
     filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+#endif
   }
   return 0;
 }
@@ -787,6 +811,30 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
   return static_cast<int>(len);
 }
 
+#ifdef __APPLE__
+// macFUSE's xattr callbacks carry an extra `position` argument (resource-fork
+// offset for the com.apple.ResourceFork attribute). We store xattrs whole, so
+// only position 0 is meaningful; reject sub-range access like most non-HFS
+// FUSE filesystems do.
+static int cte_fuse_setxattr_darwin(const char *path, const char *name,
+                                    const char *value, size_t size, int flags,
+                                    uint32_t position) {
+  if (position != 0) {
+    return -EINVAL;
+  }
+  return cte_fuse_setxattr(path, name, value, size, flags);
+}
+
+static int cte_fuse_getxattr_darwin(const char *path, const char *name,
+                                    char *value, size_t size,
+                                    uint32_t position) {
+  if (position != 0) {
+    return -EINVAL;
+  }
+  return cte_fuse_getxattr(path, name, value, size);
+}
+#endif  // __APPLE__
+
 static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
   // Return the NUL-separated, NUL-terminated list of xattr names. size==0 is a
   // length query.
@@ -819,6 +867,9 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)  // from <linux/fs.h>; guarded to avoid header clash
+#endif
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)  // ditto; referenced by the unsupported-flag test
 #endif
 
 static int cte_fuse_rename(const char *from, const char *to,
@@ -877,7 +928,6 @@ static int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   fsblkcnt_t free_blocks = remaining_bytes / kBlockSize;
 
   stbuf->f_bsize = kBlockSize;
-  stbuf->f_frsize = kBlockSize;
   stbuf->f_blocks = total_blocks;
   // Report real remaining space as both free and available (no reservation
   // distinction), so df shows used = total - remaining.
@@ -885,8 +935,15 @@ static int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   stbuf->f_bavail = free_blocks;
   stbuf->f_files = static_cast<fsfilcnt_t>(1) << 20;
   stbuf->f_ffree = static_cast<fsfilcnt_t>(1) << 20;
+#ifdef __APPLE__
+  // Darwin struct statfs has no f_frsize/f_favail/f_namemax; f_iosize is its
+  // optimal-transfer-size analogue.
+  stbuf->f_iosize = kBlockSize;
+#else
+  stbuf->f_frsize = kBlockSize;
   stbuf->f_favail = static_cast<fsfilcnt_t>(1) << 20;
   stbuf->f_namemax = 255;
+#endif
   return 0;
 }
 
@@ -912,8 +969,13 @@ const struct fuse_operations cte_fuse_ops = {
     .flush = cte_fuse_flush,
     .release = cte_fuse_release,
     .fsync = cte_fuse_fsync,
+#ifdef __APPLE__
+    .setxattr = cte_fuse_setxattr_darwin,
+    .getxattr = cte_fuse_getxattr_darwin,
+#else
     .setxattr = cte_fuse_setxattr,
     .getxattr = cte_fuse_getxattr,
+#endif
     .listxattr = cte_fuse_listxattr,
     .removexattr = cte_fuse_removexattr,
     .readdir = cte_fuse_readdir,

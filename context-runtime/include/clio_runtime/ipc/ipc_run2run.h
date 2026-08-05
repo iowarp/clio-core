@@ -288,9 +288,23 @@ class IpcManagerRun2Run {
   /**
    * Finalize an origin task once all its replicas have been aggregated:
    * delete replica tasks, remove from send_map_, and call EndTask.
+   * Exactly-once: internally claims the origin via ClaimOrigin() and returns
+   * without side effects if another completion path already claimed it.
    */
   void RecvOutCompleteOriginTask(size_t net_key,
                                   clio::run::shared_ptr<clio::run::Task> origin_task);
+
+  /**
+   * Atomically claim the right to complete an origin (issue #856). Erases the
+   * origin from send_map_ (and progress_map_) under send_map_mutex_ and
+   * returns true iff this caller performed the erase. Every path that can
+   * complete an origin — replica-count completion, the #628 Gone verdict, the
+   * dead-node timeout scan — must claim first, so an origin is EndTask'd
+   * exactly once. A double EndTask writes completion state into a task whose
+   * RunContext the first completion already freed (heap corruption that
+   * crashed the leader-election recovery leader).
+   */
+  bool ClaimOrigin(size_t net_key);
 
   // ---------------------------------------------------------------------------
   // Retry helpers

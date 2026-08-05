@@ -253,3 +253,14 @@ leak:clio_run::admin::Runtime::SendIn
 # substring-match virtual function names in its suppression engine.
 # ---------------------------------------------------------------------------
 leak:clio_run/container.h
+
+# ---------------------------------------------------------------------------
+# lightbeam SHM transport: ClientInfo / receive-buffer allocations in Recv
+# ctp::lbm::ShmMpscTransport::Recv() allocates a small ClientInfo + receive
+# buffer for the inbound message (shm_mpsc_transport_test.cc exercises this
+# directly). The test reads recv_meta.recv[0].data but does not free the
+# transport-owned receive buffer — the same test-infrastructure receive-side
+# pattern already suppressed for the ZMQ transport (RecvBulks above). Bounded
+# (~50 bytes), does not grow with message count; reclaimed by the OS at exit.
+# ---------------------------------------------------------------------------
+leak:ctp::lbm::ShmMpscTransport::Recv

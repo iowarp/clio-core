@@ -238,6 +238,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
   config_ = task->GetParams();
+  interposer_next_pool_ = config_.next_pool_id_;  // base forwarding target
 
   // Initialize the core client using next_pool_id from compose
   if (!config_.next_pool_id_.IsNull()) {
@@ -952,6 +953,13 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
                   compressed_size);
 
+      // Tell the runtime these bytes are no longer the caller's bytes, so it
+      // can mark the blob authoritatively (issue #818). This is the ONLY place
+      // that knows it for certain -- compress_lib_ is set on the not-beneficial
+      // path below too, where the stored bytes are raw.
+      context.transform_flags_ |= clio::cte::core::kBlobTransformed |
+                                  clio::cte::core::kBlobTransformCompressed;
+
       // Call PutBlob with header + compressed data
       ctp::ipc::ShmPtr<> compressed_shm_ptr =
           compressed_shm.shm_.template Cast<void>();
@@ -984,13 +992,20 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // Compression failed or didn't reduce size - store original data
       HLOG(kDebug, "Compression not beneficial, storing original data");
 
+      // Mark uncompressed BEFORE the put, not after. The bytes below are the
+      // caller's original bytes, so the blob must not be recorded as carrying
+      // the codec we merely attempted -- this used to be zeroed only after
+      // PutBlob had already copied compress_lib_ onto the BlobInfo, which is
+      // half of why compress_lib_ cannot be trusted as a transform signal
+      // (issue #818). transform_flags_ is deliberately left unset here.
+      context.compress_lib_ = 0;
+
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
           ForwardQuery(task->tag_id_, task->blob_name_.str()));
       CLIO_CO_AWAIT(put_task);
 
-      context.compress_lib_ = 0;  // Mark as uncompressed
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
     }
@@ -1595,7 +1610,7 @@ clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumers
 
   for (std::size_t i = 0; i < futures.size(); ++i) {
     auto& fut = futures[i];
-    fut.Wait();
+    CLIO_CO_AWAIT(fut);
     if (fut->GetReturnCode() == 0) {
       const NodeLoadSample& s = fut->sample_;
       HLOG(kDebug,
@@ -1637,6 +1652,348 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodGetBlobTask>& task) {
   CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
   CLIO_CO_RETURN;
+}
+
+// ============================================================================
+// Interposed core data verbs (issue #886): the compressor as a transparent
+// interposer over the CTE core's task interface. Machinery (forwarding,
+// batching, region iteration) comes from CoreInterposer + blob_batch.h —
+// shared with the replication chimod; only the transform policy lives here.
+// ============================================================================
+
+bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
+                              clio::run::u64 size,
+                              ctp::ipc::FullPtr<char> *stored,
+                              clio::run::u64 *stored_size) {
+  std::string library_name =
+      ctp::CompressionFactory::NameForWireId(ctx.compress_lib_);
+  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+  if (ctx.compress_preset_ == 1) {
+    preset = ctp::CompressionPreset::FAST;
+  } else if (ctx.compress_preset_ == 3) {
+    preset = ctp::CompressionPreset::BEST;
+  }
+  auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
+  if (!compressor) {
+    return false;
+  }
+  auto t0 = std::chrono::high_resolution_clock::now();
+  std::vector<char> compressed(size + (size / 20) + 1024);
+  size_t compressed_size = compressed.size();
+  if (!compressor->Compress(compressed.data(), compressed_size,
+                            const_cast<char *>(src), size)) {
+    return false;
+  }
+  size_t header_size = sizeof(CompressionHeader);
+  size_t total = compressed_size + header_size;
+  if (total >= size) {
+    return false;  // not beneficial — caller stores raw
+  }
+  auto shm = CLIO_IPC->AllocateBuffer(total);
+  if (shm.IsNull()) {
+    return false;
+  }
+  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size);
+  std::memcpy(shm.ptr_, &header, header_size);
+  std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::high_resolution_clock::now() - t0)
+                  .count();
+  ctx.actual_original_size_ = size;
+  ctx.actual_compressed_size_ = total;
+  ctx.actual_compression_ratio_ =
+      static_cast<double>(size) / static_cast<double>(total);
+  ctx.actual_compress_time_ms_ = ms;
+  // The one place that KNOWS the stored bytes are no longer the caller's
+  // bytes (issue #818 authoritative transform bit).
+  ctx.transform_flags_ |= clio::cte::core::kBlobTransformed |
+                          clio::cte::core::kBlobTransformCompressed;
+  *stored = shm;
+  *stored_size = total;
+  return true;
+}
+
+int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
+                              char *dst, clio::run::u64 dst_cap,
+                              clio::run::u64 *out_size) {
+  if (stored_size < sizeof(CompressionHeader)) {
+    return 6;
+  }
+  const auto *header = reinterpret_cast<const CompressionHeader *>(stored);
+  if (!header->IsValid() || header->original_size_ > dst_cap) {
+    return 6;
+  }
+  std::string library_name = ctp::CompressionFactory::NameForWireId(
+      static_cast<int>(header->compress_lib_));
+  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+  if (header->compress_preset_ == 1) {
+    preset = ctp::CompressionPreset::FAST;
+  } else if (header->compress_preset_ == 3) {
+    preset = ctp::CompressionPreset::BEST;
+  }
+  auto decompressor = ctp::CompressionFactory::GetPreset(library_name, preset);
+  if (!decompressor) {
+    return 3;
+  }
+  size_t decompressed = header->original_size_;
+  if (!decompressor->Decompress(dst, decompressed,
+                                const_cast<char *>(stored) +
+                                    sizeof(CompressionHeader),
+                                stored_size - sizeof(CompressionHeader))) {
+    return 5;
+  }
+  *out_size = decompressed;
+  return 0;
+}
+
+clio::run::TaskResume Runtime::PutBlob(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::cte::core::Context &ctx = task->context_;
+    // Compression is defined for WHOLE-BLOB writes only: a partial or
+    // vectored write cannot patch a compressed stream, so those (and
+    // replica-addressed or emulated puts) forward with the codec request
+    // cleared — raw bytes, never a recorded codec (issue #818 rule).
+    const bool whole_blob = task->segments_.empty() && task->offset_ == 0;
+    if (ctx.replica_ != 0 || ctx.compress_lib_ <= 0 || ctx.emulate_ ||
+        !whole_blob) {
+      if (ctx.compress_lib_ > 0 && !whole_blob) {
+        ctx.compress_lib_ = 0;
+      }
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                             task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    auto src_full =
+        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    ctp::ipc::FullPtr<char> stored;
+    clio::run::u64 stored_size = 0;
+    if (src_full.ptr_ != nullptr &&
+        CompressIntoShm(ctx, src_full.ptr_, task->size_, &stored,
+                        &stored_size)) {
+      if (!core_client_) {
+        core_client_ =
+            std::make_unique<clio::cte::core::Client>(CorePoolId());
+      }
+      // Re-issuing under an explicit NAME means the fresh task carries the
+      // default gpu_page_idx_, so the core's own "_pi<idx>" suffixing
+      // (core_runtime.cc) never runs. Compose it here or every page of a
+      // gpu_vector blob would land on the base name and overwrite the last.
+      std::string name = task->blob_name_.str();
+      if (task->gpu_page_idx_ !=
+          clio::cte::core::PutBlobTask::kNoPageIdx) {
+        name += "_pi" + std::to_string(task->gpu_page_idx_);
+      }
+      auto put = core_client_->AsyncPutBlob(
+          task->tag_id_, name, 0, stored_size,
+          stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
+          ForwardQuery(task->tag_id_, name));
+      CLIO_CO_AWAIT(put);
+      CLIO_IPC->FreeBuffer(stored);
+      task->context_ = put->context_;
+      task->return_code_ = put->GetReturnCode();
+    } else {
+      // Failed or not beneficial: store the caller's raw bytes and make
+      // sure the blob is never recorded as carrying the attempted codec.
+      ctx.compress_lib_ = 0;
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                             task.template Cast<clio::run::Task>()));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::GetBlob(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Serve the read as-is first: the untransformed case (and every replica-
+  // addressed read) costs nothing extra, and the core reports the blob's
+  // authoritative transform state OUT through the context either way.
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
+                         task.template Cast<clio::run::Task>()));
+  if (task->GetReturnCode() != 0 || task->context_.replica_ != 0 ||
+      !(task->context_.transform_flags_ &
+        clio::cte::core::kBlobTransformCompressed)) {
+    CLIO_CO_RETURN;
+  }
+  {
+    // The forwarded read handed back CODEC bytes. Fetch the whole stored
+    // blob, decompress ONCE, then slice every requested region out of the
+    // original — which is what makes partial and VECTORED reads of
+    // compressed blobs work through this interposer at all.
+    if (!core_client_) {
+      core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+    }
+    clio::run::u64 stored_size = 0;
+    {
+      auto sz = core_client_->AsyncGetBlobSize(task->tag_id_,
+                                               task->blob_name_.str());
+      CLIO_CO_AWAIT(sz);
+      if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
+        task->return_code_ = 10 + sz->GetReturnCode();
+        CLIO_CO_RETURN;
+      }
+      stored_size = sz->size_;
+    }
+    auto stored = CLIO_IPC->AllocateBuffer(stored_size);
+    if (stored.IsNull()) {
+      task->return_code_ = 2;
+      CLIO_CO_RETURN;
+    }
+    {
+      auto get = core_client_->AsyncGetBlob(
+          task->tag_id_, task->blob_name_.str(), 0, stored_size,
+          /*flags=*/0, stored.shm_.template Cast<void>(),
+          clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(get);
+      if (get->GetReturnCode() != 0) {
+        CLIO_IPC->FreeBuffer(stored);
+        task->return_code_ = 10 + get->GetReturnCode();
+        CLIO_CO_RETURN;
+      }
+    }
+    const auto *header =
+        reinterpret_cast<const CompressionHeader *>(stored.ptr_);
+    clio::run::u64 original_size =
+        stored_size >= sizeof(CompressionHeader) ? header->original_size_ : 0;
+    auto scratch = CLIO_IPC->AllocateBuffer(original_size);
+    if (scratch.IsNull()) {
+      CLIO_IPC->FreeBuffer(stored);
+      task->return_code_ = 2;
+      CLIO_CO_RETURN;
+    }
+    clio::run::u64 out_size = 0;
+    int rc = DecompressStored(stored.ptr_, stored_size, scratch.ptr_,
+                              original_size, &out_size);
+    CLIO_IPC->FreeBuffer(stored);
+    if (rc != 0) {
+      CLIO_IPC->FreeBuffer(scratch);
+      task->return_code_ = rc;
+      CLIO_CO_RETURN;
+    }
+    // Copy each requested region out of the original bytes (shared
+    // scalar-vs-vectored iteration, blob_batch.h). Regions beyond the
+    // original size keep the core's short-read semantics (left untouched).
+    bool region_ok = true;
+    clio::cte::core::ForEachBlobRegion(
+        *task, [&](const clio::cte::core::BlobRegion &r) {
+          if (r.blob_off_ >= out_size) {
+            return true;  // wholly past EOF: short read
+          }
+          clio::run::u64 n = r.size_;
+          if (r.blob_off_ + n > out_size) {
+            n = out_size - r.blob_off_;
+          }
+          auto dst =
+              CLIO_IPC->ToFullPtr<char>(r.data_.template Cast<char>());
+          if (dst.ptr_ == nullptr) {
+            region_ok = false;
+            return false;
+          }
+          std::memcpy(dst.ptr_, scratch.ptr_ + r.blob_off_, n);
+          return true;
+        });
+    CLIO_IPC->FreeBuffer(scratch);
+    // The caller now holds ORIGINAL bytes: clear the transform report so
+    // nothing downstream tries to undo the codec again.
+    task->context_.transform_flags_ &=
+        ~(clio::cte::core::kBlobTransformed |
+          clio::cte::core::kBlobTransformCompressed);
+    task->return_code_ = region_ok ? 0 : 3;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::GetBlobSize(
+    clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlobSize,
+                         task.template Cast<clio::run::Task>()));
+  // A transformed blob's stored size is header+codec bytes; size-then-read
+  // callers need the LOGICAL size. Probe the header with a tiny ranged get —
+  // its OUT context carries the authoritative transform bit, so a raw blob
+  // that merely looks like a header can never be misreported.
+  if (task->GetReturnCode() == 0 && task->replica_ == 0 &&
+      task->size_ >= sizeof(CompressionHeader)) {
+    if (!core_client_) {
+      core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+    }
+    auto hdr_buf = CLIO_IPC->AllocateBuffer(sizeof(CompressionHeader));
+    if (!hdr_buf.IsNull()) {
+      auto get = core_client_->AsyncGetBlob(
+          task->tag_id_, task->blob_name_.str(), 0, sizeof(CompressionHeader),
+          /*flags=*/0, hdr_buf.shm_.template Cast<void>(),
+          clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(get);
+      if (get->GetReturnCode() == 0 &&
+          (get->context_.transform_flags_ &
+           clio::cte::core::kBlobTransformCompressed)) {
+        const auto *header =
+            reinterpret_cast<const CompressionHeader *>(hdr_buf.ptr_);
+        if (header->IsValid()) {
+          task->size_ = header->original_size_;
+        }
+      }
+      CLIO_IPC->FreeBuffer(hdr_buf);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MultiPutBlob(
+    clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Batches carry a batch-wide Context (issue #886 follow-up) and get
+  // SCALAR-EQUIVALENT semantics. No codec requested (or replica-addressed /
+  // emulated): forward the batch intact — the chain below executes every
+  // record with this context, records stay raw, amortization preserved.
+  if (task->context_.replica_ != 0 || task->context_.compress_lib_ <= 0 ||
+      task->context_.emulate_) {
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
+  // Codec requested: records transform INDIVIDUALLY (some compress, some
+  // stay raw — not-beneficial or offset writes), so one shared batch cannot
+  // describe the results. Decompose through OUR scalar handler, which
+  // applies the exact scalar rules per record.
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    clio::cte::core::MultiPutBatchView batch;
+    if (!clio::cte::core::MultiPutBatchView::Attach(*task, &batch)) {
+      task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
+      CLIO_CO_RETURN;
+    }
+    for (size_t bi = 0; bi < batch.size(); ++bi) {
+      const auto &d = batch.descs_[bi];
+      if (!batch.RecordValid(bi)) {
+        if (task->first_rc_ == 0) task->first_rc_ = 2;
+        continue;
+      }
+      auto sub = ipc_manager->NewTask<clio::cte::core::PutBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
+          d.size_, batch.RecordSlice(bi), /*score=*/-1.0f, task->context_,
+          /*flags=*/0);
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(PutBlob(sub));
+      int rc = sub->GetReturnCode();
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (task->first_rc_ == 0) {
+        task->first_rc_ = rc;
+      }
+    }
+  }
+  task->SetReturnCode(task->first_rc_ == 0 ? 0 : task->first_rc_);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 }  // namespace clio::cte::compressor

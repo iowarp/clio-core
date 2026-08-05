@@ -3,7 +3,7 @@ name: GPU Tests (CUDA)
 on:
   push:
     branches: [main, dev]
-    paths:
+    paths: &gpu_paths
       - 'context-runtime/**'
       - 'context-transfer-engine/**'
       - 'context-transport-primitives/**'
@@ -11,7 +11,24 @@ on:
       - 'CMakePresets.json'
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
+  # Also run on PRs touching the same paths. Previously this workflow fired
+  # ONLY on push to main/dev, so a change that broke the CUDA device compile
+  # was invisible in PR review and only surfaced after merge, on dev — which
+  # is exactly how the shm_metadata_cache.h device-pass break (#812, from
+  # #788) landed. Running the same compile-only build on PRs catches these
+  # before merge. Same path filter, so PRs that don't touch buildable source
+  # still skip it.
+  pull_request:
+    branches: [main, dev]
+    paths: *gpu_paths
   workflow_dispatch:
+
+# One in-flight run per ref; a new push to a PR branch cancels the previous
+# GPU build rather than piling them up (the CUDA toolchain install + conda
+# build is ~15 min).
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-cuda-conda:
@@ -45,6 +62,10 @@ jobs:
       uses: conda-incubator/setup-miniconda@v3
       with:
         auto-update-conda: false
+        # Pin a py312-base Miniconda: the runner's bundled conda moved its
+        # base to Python 3.14 (2026-07-30), which crashes conda-build
+        # (execute_download_actions IndexError). See CI/ci-deps.sh.
+        miniconda-version: 'py312_26.5.3-2'
         python-version: '3.12'
         activate-environment: iowarp
 

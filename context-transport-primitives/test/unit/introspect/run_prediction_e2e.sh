@@ -5,7 +5,7 @@
 # waits for it to become healthy, then runs the C++ checker against it via
 # CLIO_PREDICT_URL. Cleans up the server on exit.
 #
-# Usage: run_prediction_e2e.sh <checker_exe> <prediction_server_dir>
+# Usage: run_prediction_e2e.sh <checker_exe> <hw_failure_monitor_dir>
 # Env overrides: PREDICT_PYTHON (python interpreter), PREDICT_PORT.
 #
 # Exit codes: 0 pass, 1 fail, 77 SKIP (prerequisites absent — registered as the
@@ -15,7 +15,7 @@ set -u
 SKIP=77
 
 CHECKER="${1:?checker exe path required}"
-SERVER_DIR="${2:?prediction_server dir required}"
+SERVER_DIR="${2:?hw_failure_monitor dir required}"
 PY="${PREDICT_PYTHON:-python3}"
 PORT="${PREDICT_PORT:-18080}"
 

@@ -7,6 +7,7 @@
 
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
 
@@ -21,6 +22,68 @@ class Client : public clio::cte::core::Client {
  public:
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
+
+#if CTP_IS_HOST
+  // =========================================================================
+  // issue #817: shared-memory attribute cache (client side).
+  //
+  // Same contract as the CTE core's cache: strictly an OPTIMIZATION, every
+  // accessor reports failure rather than guessing, and `false` means "ask the
+  // runtime", never "the file does not exist".
+  // =========================================================================
+
+  /** Attach this filesystem pool's cache root via the segment directory. */
+  bool AttachShmCache() {
+    shm_fs_root_ = nullptr;
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    auto *alloc = ipc->GetMetadataAllocator();
+    auto *dir = ipc->GetMetadataDirectory();
+    if (alloc == nullptr || dir == nullptr) {
+      // No metadata segment (e.g. TCP client, remote node).
+      HLOG(kDebug, "[#817] AttachShmCache: no metadata segment (alloc={}, dir={})",
+           static_cast<const void *>(alloc), static_cast<const void *>(dir));
+      return false;
+    }
+    clio::run::u64 root_off = dir->FindRoot(pool_id_.ToU64());
+    if (root_off == 0) {
+      // Either this pool is not caching, or its chimod has not registered its
+      // root YET -- a client that raced pool creation must be able to attach
+      // later, which is why callers retry rather than latching a failure.
+      HLOG(kDebug, "[#817] AttachShmCache: no root for fs pool {} ({} entries)",
+           pool_id_.ToString(), dir->num_entries_);
+      return false;
+    }
+    auto *root = reinterpret_cast<ShmFsCacheRoot *>(
+        reinterpret_cast<char *>(alloc) + root_off);
+    // Refuse anything unrecognized: the cache is derived state, so declining
+    // is always safe, while guessing at a layout is not.
+    if (root->ready_ != 1 ||
+        root->version_ != ShmFsCacheRoot::kLayoutVersion) {
+      return false;
+    }
+    shm_fs_root_ = root;
+    return true;
+  }
+
+  bool HasShmCache() const { return shm_fs_root_ != nullptr; }
+
+  /**
+   * Zero-IPC path lookup.
+   *
+   * @return true if a consistent record was read. false means "not cached /
+   *         could not read consistently" -- fall back to the RPC path.
+   */
+  bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
+    if (shm_fs_root_ == nullptr || out == nullptr) {
+      return false;
+    }
+    return shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
+                                                   out);
+  }
+#endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
   /** Create/initialize the filesystem container over a CTE core pool. */
@@ -274,6 +337,14 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 #endif  // CTP_IS_HOST
+
+#if CTP_IS_HOST
+ private:
+  // Resolved address of the filesystem cache root in THIS process, or nullptr
+  // when caching is unavailable. Not owned: the runtime owns the segment and
+  // may drop the cache at any time, which is why every read is validated.
+  ShmFsCacheRoot *shm_fs_root_ = nullptr;
+#endif
 };
 
 // Process-wide filesystem client singleton (reuses the clio_cte export macro).

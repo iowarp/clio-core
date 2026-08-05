@@ -96,6 +96,27 @@ using gid_t = fuse_gid_t;
 #define S_IFLNK 0120000
 #endif
 
+// Type-predicate macros (MSVC's sys/stat.h ships the S_IF* constants but not
+// the POSIX S_IS* predicates the callbacks/tests use).
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#ifndef S_ISLNK
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
+#endif
+
+// utimensat sentinel nsec values (POSIX; absent from MSVC and the WinFsp
+// fuse headers — cte_fuse_utimens implements their semantics itself).
+#ifndef UTIME_NOW
+#define UTIME_NOW ((1l << 30) - 1l)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1l << 30) - 2l)
+#endif
+
 // --- Owner identity --------------------------------------------------------
 // Windows has no POSIX uid/gid; WinFsp fabricates a mapping per request.
 // getattr only uses these to populate st_uid/st_gid for display, so report

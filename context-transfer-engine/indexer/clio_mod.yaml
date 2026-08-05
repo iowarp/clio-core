@@ -1,0 +1,27 @@
+# Indexer ChiMod (issue #905) — owns the SemanticSearch reverse index that
+# used to live in the CTE core. An INTERPOSER in the standard chain: speaks
+# the core's task interface, maintains a per-container forward index (term
+# frequencies per doc) by intercepting the mutating data verbs, serves
+# kSemanticSearch from that index (no per-query blob reads), and forwards
+# every other core method to `next` verbatim. On restart the index is
+# REBUILT from the storage below (BlobQuery + GetBlob against next).
+module_name: indexer
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core verbs (MUST equal the core's ids)
+kPutBlob: 15
+kDelBlob: 18
+kDelTag: 19
+kSemanticSearch: 35
+kTruncateBlob: 37
+kRenameTag: 38
+kMultiPutBlob: 48
+
+# Module verbs (>= 100, above the core id space)
+kIndexSweep: 100   # periodic asynchronous index drain
+kReindexScan: 101  # explicit on-demand backfill of existing data

@@ -106,6 +106,17 @@ def generate_test_config() -> str:
                 ],
                 "dpe": {"dpe_type": "max_bw"},
             },
+            # Indexer chimod (issue #905): owns the SemanticSearch index.
+            # Puts flow through it (CLIO_CTE_POOL below binds the client
+            # here) so the index is maintained inline; the core no longer
+            # implements Method::kSemanticSearch.
+            {
+                "mod_name": "clio_cte_indexer",
+                "pool_name": "clio_cte_indexer",
+                "pool_query": "local",
+                "pool_id": "564.0",
+                "next_pool_id": "512.0",
+            },
         ],
     }
     cfg_path = os.path.join(tmp, "clio_semsearch_conf.yaml")
@@ -263,6 +274,12 @@ def run_test(cte) -> int:
 
 
 def main() -> int:
+    # Bind the CTE client singleton to the indexer pool (issue #905): the
+    # sanctioned interposer redirect, so PutBlob maintains the index and
+    # SemanticSearch is served from it — the core alone rejects Method 35.
+    # 564.0 exists in both the generated test compose and the default chain
+    # (external-runtime mode).
+    os.environ.setdefault("CLIO_CTE_POOL", "564.0")
     if should_initialize_runtime():
         try:
             import clio_cte_core_ext as cte

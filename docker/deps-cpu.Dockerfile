@@ -54,12 +54,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # System libraries and services
+# openjdk: YCSB (issue #862) needs java to run the harness + DynamoDB Local,
+# and the JDK's javac/jni.h to build the Clio binding (headless: no AWT).
 RUN apt-get update && apt-get install -y \
     libelf-dev \
     libaio-dev \
     liburing-dev \
     redis-server \
     redis-tools \
+    openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # MPI

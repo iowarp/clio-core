@@ -117,11 +117,32 @@ compose:
     # Each entry creates a block device for CTE to buffer data onto.
     # score: 0.0 = slowest/cheapest, 1.0 = fastest/most expensive
     #        -1.0 = automatic scoring
+    # persistence_level: "volatile" (default), "temporary", or "long_term".
+    #        Placement filters (Context::min_persistence_level_) and replica
+    #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
+    #        tier left at "volatile" can never satisfy a persistence request.
     storage:
       - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
         bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
         capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
         score: 1.0                       # DRAM = highest-performance tier
+
+      # Persistent disk tier: where the replication chimod (below) keeps the
+      # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
+      # capacity_limit is a cap, not an upfront allocation.
+      - path: "${HOME}/.clio/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        score: 0.2
+        persistence_level: "temporary"
+
+    # Metadata durability ---------------------------------------------------
+    # Write-ahead log + periodic snapshots for tag/blob metadata. Required
+    # for data to survive a runtime reboot: without it the disk tier's bytes
+    # persist but nothing remembers which blob they belong to.
+    performance:
+      metadata_log_path: "${HOME}/.clio/cte_metadata_log"
+      transaction_log_capacity: "32MB"
 
     # Data Placement Engine ------------------------------------------------
     dpe:
@@ -145,17 +166,102 @@ compose:
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
 
+  # === The interposition chain (issue #886) ==============================
+  # The chimods below all speak the CTE core's own Put/Get task interface
+  # and stack via next_pool_id, separating RELIABILITY (replication) from
+  # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
+  #
+  #   cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->]
+  #     replication(561.0) -> core(512.0)
+  #
+  # Point any clio::cte::core::Client (or the filesystem chimod below) at
+  # the TOP pool and the whole chain is transparent: a put writes through
+  # the chain (compressed, then replicated, then stored — the AUTHORITATIVE
+  # copy lands before the ack) and updates the raw node-local cache copy
+  # with it; a read serves from the raw cache copy — which also keeps the
+  # zero-IPC SHM fast path live even for compressed blobs — and falls
+  # through the chain on a miss (fetching from the blob's owner node and
+  # re-populating the local copy, coherently: the owner's next write
+  # invalidates it). Order in this file matters: each entry must come AFTER
+  # the entry its next_pool_id names.
+
+  # === Replication (persistent copies, issue #886) ===
+  # Reliability layer: every default put writes through to a fixed set of
+  # persistent replicas on the disk tier above (REPLICA_FIXED |
+  # REPLICA_PERSISTENT: the organizer never migrates them and never places
+  # them on volatile storage — they only move if a device is evacuated).
+  # Reads serve the primary when present and transparently re-cache from a
+  # disk replica when the organizer (or a reboot) dropped it; every other
+  # core op is forwarded to next_pool_id untouched.
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"               # CTE core pool — see entry above
+    num_replicas: 1                     # persistent copies per put
+    cache_score: 1.0                    # DRAM re-cache placement score
+    replica_score: 0.2                  # disk copies' score = drop threshold
+
+  # === Compression (optional, issue #886) ===
+  # Encoding layer: transparently compresses on the way down and
+  # decompresses on the way out. Requires a build with
+  # CLIO_CTE_ENABLE_COMPRESS=ON; uncomment this entry AND re-point the
+  # indexer entry below at 562.0 to enable it.
+  # - mod_name: clio_cte_compressor
+  #   pool_name: clio_cte_compressor
+  #   pool_query: local
+  #   pool_id: "562.0"
+  #   next_pool_id: "561.0"             # replication pool — see entry above
+
+  # === Indexer (SemanticSearch index, issue #905) ===
+  # Search layer: owns the term index that serves Method::kSemanticSearch
+  # (the CTE core no longer implements it). Mutating data verbs are
+  # intercepted — a put's only cost is an O(1) coalesced dirty-key enqueue;
+  # the periodic sweep tokenizes asynchronously and a search drains first
+  # (read-your-writes) — and forwarded down unchanged; everything else
+  # passes through. Sits ABOVE the compressor so its read-backs see logical
+  # (uncompressed) bytes. The module persists its own snapshot + WAL: a
+  # restart restores the index and never rescans storage; pre-existing data
+  # enters via a tag's first-insertion backfill or the kReindexScan verb.
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "561.0"               # replication (562.0 with compressor)
+    index_log_path: "${HOME}/.clio/cte_indexer_index"
+    # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
+    # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
+    # tag_re: ".*"                      # index scope: only matching tags...
+    # blob_re: ".*"                     # ...and blob names are tokenized
+
+  # === Cache (node-local raw copies, issue #886) ===
+  # Locality layer and the TOP of the chain, with ASYNCHRONOUS WRITE-THROUGH
+  # semantics: a put lands below (authoritative) before the ack — the layers
+  # underneath keep their own async machinery — and the raw local copy in
+  # the core's REPLICA_CACHE slot is updated with it. Reads serve the raw
+  # copy — including via the zero-IPC SHM fast path, which a compressed
+  # primary alone would refuse — and min_score is the floor below which the
+  # organizer will not rescore a cache copy (only genuine tier pressure
+  # evicts one).
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "564.0"               # indexer — see entry above
+    min_score: 0.5                      # cache copies' score floor
+
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
-  # kCfsPoolId) over the CTE core at next_pool_id (512.0): paths map to CTE tags
-  # and offsets to 1 MiB page-blobs. Composing it here means a filesystem pool
-  # exists out of the box; the adapters create-or-bind it idempotently, so this
-  # is safe whether or not an adapter is also used. Must come AFTER the CTE core
-  # entry above — its Create resolves tags on the CTE pool (512.0). Remove it if
-  # you do not need the filesystem layer.
+  # kCfsPoolId) over the interposition chain at next_pool_id: paths map to CTE
+  # tags and offsets to 1 MiB page-blobs, and every page ride the full chain
+  # (cache -> [compressor ->] replication -> core). Composing it here means a
+  # filesystem pool exists out of the box; the adapters create-or-bind it
+  # idempotently, so this is safe whether or not an adapter is also used. Must
+  # come AFTER the chain entries above. Remove it if you do not need the
+  # filesystem layer; point next_pool_id at 512.0 to bypass the chain.
   - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "512.0"               # CTE core pool — see entry above
+    next_pool_id: "563.0"               # chain top (cache) — see entries above

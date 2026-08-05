@@ -499,6 +499,16 @@ struct AddressHash {
   BIT_OPT(clio::run::u32, 8)  ///< ManyToOne: this is the synthetic aggregate task the
                         ///< neighborhood leader runs for a batch. On completion,
                         ///< its OUT is broadcast to the batched original tasks.
+#define TASK_BATCH_MERGED \
+  BIT_OPT(clio::run::u32, 10)  ///< issue #820: synthetic task a container's
+                        ///< SmashBatch produced by coalescing several ready
+                        ///< tasks. On completion the worker completes the
+                        ///< PARENTS it subsumed. Distinct from
+                        ///< TASK_BATCH_AGGREGATE: that one is the ManyToOne
+                        ///< collective (N inputs reduced to 1, one OUT
+                        ///< broadcast back to all); this is a merge, where the
+                        ///< output is a subset of tasks and each completes a
+                        ///< different parent set.
 #define TASK_EXTERNAL_CLIENT \
   BIT_OPT(clio::run::u32, 9)  ///< Task ingressed from an external user client (set in
                         ///< the IpcCpu2Cpu / IpcCpu2CpuZmq client-receive paths,

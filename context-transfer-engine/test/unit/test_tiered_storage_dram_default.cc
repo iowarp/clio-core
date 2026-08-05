@@ -72,8 +72,42 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
+
+/**
+ * Render a reorganize return-code histogram for the INFO line.
+ *
+ * ReorganizeBlobInternal distinguishes several failure modes, and which one
+ * fires identifies the cause — but this test used to discard the code and
+ * report only "93/96", which says nothing about why (issue #794):
+ *
+ *   1 = error during reorganization
+ *   3 = blob not found      -> mid-move window, see issue #753
+ *   5 = buffer allocation failed
+ *   6 = get blob failed
+ *   7 = put blob failed     -> placement against stale capacity data; the DPE
+ *                              filters targets on TargetInfo::remaining_space_,
+ *                              which is only refreshed every
+ *                              stat_targets_period_ms_ (default 5000 ms)
+ *
+ * With this, the next CI failure names its own cause and needs no extra round
+ * trip. Returns "" when there were no failures, so passing runs stay quiet.
+ */
+static std::string FormatRcHistogram(const std::map<clio::run::u32, int> &rcs) {
+  if (rcs.empty()) {
+    return std::string();
+  }
+  std::ostringstream out;
+  out << " failures:";
+  for (const auto &kv : rcs) {
+    out << " rc" << kv.first << "=" << kv.second;
+  }
+  return out.str();
+}
 
 #include "simple_test.h"
 
@@ -294,26 +328,40 @@ TEST_CASE("DramDefault - Reorganize down to file then up to 0g RAM",
 
   // Down to slow (bounded 64MB file) tier.
   int down_ok = 0;
+  std::map<clio::run::u32, int> down_rc;
   for (int i = 0; i < kNumBlobs; ++i) {
     std::string blob_name = "blob_" + std::to_string(i);
     auto t = cte_client->AsyncReorganizeBlob(tag_id, blob_name,
                                              kSlowTierScore);
     t.Wait();
-    if (t->GetReturnCode() == 0) down_ok++;
+    clio::run::u32 rc = t->GetReturnCode();
+    if (rc == 0) {
+      down_ok++;
+    } else {
+      down_rc[rc]++;
+    }
   }
-  INFO("Reorganize down (-> file): " << down_ok << "/" << kNumBlobs);
+  INFO("Reorganize down (-> file): " << down_ok << "/" << kNumBlobs
+       << FormatRcHistogram(down_rc));
   REQUIRE(down_ok == kNumBlobs);
 
   // Back up to the "0g" (80% DRAM) fast tier.
   int up_ok = 0;
+  std::map<clio::run::u32, int> up_rc;
   for (int i = 0; i < kNumBlobs; ++i) {
     std::string blob_name = "blob_" + std::to_string(i);
     auto t = cte_client->AsyncReorganizeBlob(tag_id, blob_name,
                                              kFastTierScore);
     t.Wait();
-    if (t->GetReturnCode() == 0) up_ok++;
+    clio::run::u32 rc = t->GetReturnCode();
+    if (rc == 0) {
+      up_ok++;
+    } else {
+      up_rc[rc]++;
+    }
   }
-  INFO("Reorganize up (-> 0g RAM): " << up_ok << "/" << kNumBlobs);
+  INFO("Reorganize up (-> 0g RAM): " << up_ok << "/" << kNumBlobs
+       << FormatRcHistogram(up_rc));
   REQUIRE(up_ok == kNumBlobs);
 }
 

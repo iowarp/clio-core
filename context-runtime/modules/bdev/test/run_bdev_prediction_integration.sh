@@ -6,7 +6,7 @@
 # live bdev's Monitor("stats") -> device-health collection -> live inference and
 # asserts the prediction round-trips back through the bdev payload.
 #
-# Usage: run_bdev_prediction_integration.sh <bdev_test_exe> <prediction_server_dir>
+# Usage: run_bdev_prediction_integration.sh <bdev_test_exe> <hw_failure_monitor_dir>
 # Env overrides: PREDICT_PYTHON, PREDICT_PORT.
 #
 # Exit codes: 0 pass, 1 fail, 77 SKIP (prerequisites absent — the ctest
@@ -16,7 +16,7 @@ set -u
 SKIP=77
 
 BDEV_EXE="${1:?bdev test exe path required}"
-SERVER_DIR="${2:?prediction_server dir required}"
+SERVER_DIR="${2:?hw_failure_monitor dir required}"
 PY="${PREDICT_PYTHON:-python3}"
 PORT="${PREDICT_PORT:-18082}"
 

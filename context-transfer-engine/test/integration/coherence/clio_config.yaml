@@ -1,0 +1,71 @@
+---
+# 4-node cache-coherence cluster config (issue #886 distributed coherence).
+# Full default chain on every node: cache(563) -> replication(561) ->
+# core(512). Clients bind the chain top via CLIO_CTE_POOL=563.0.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
+
+networking:
+  port: 8080
+  neighborhood_size: 32
+  hostfile: /workspace/context-transfer-engine/test/integration/coherence/hostfile
+
+logging:
+  level: info
+  file: /tmp/clio.log
+
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
+
+# This suite validates COHERENCE, not failure detection (the leader-election
+# cluster test owns SWIM coverage). On CI-class CPU budgets (4 runtimes + 4
+# spinning clients on ~4 vCPUs) probe responses starve for >30s and SWIM
+# false-positives a healthy node dead — recovery then reshuffles containers
+# and every blob-barrier cascades to timeout (issue #894's second failure
+# shape). A genuinely dead node still fails the suite via barrier timeouts.
+swim:
+  enabled: false
+
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::coherence_dram"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0
+      - path: "/tmp/coherence_disk.dat"
+        bdev_type: "file"
+        capacity_limit: "2GB"
+        score: 0.2
+        persistence_level: "temporary"
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+    num_replicas: 1
+    cache_score: 1.0
+    replica_score: 0.2
+
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "561.0"
+    min_score: 0.5

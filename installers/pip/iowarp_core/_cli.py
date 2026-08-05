@@ -105,9 +105,29 @@ def cte_bench_main():
 def cte_fuse_main():
     """Entry point for the ``clio_cte_fuse`` console script.
 
-    Requires libfuse3 to be installed on the system (e.g. ``apt install fuse3``).
-    If libfuse3 is absent the binary will exit with a dynamic-linker error.
+    Linux: requires libfuse3 from the system (e.g. ``apt install fuse3``).
+    If libfuse3 is absent the binary exits with a dynamic-linker error.
+    Windows: requires WinFsp (https://winfsp.dev); its bin dir is added to
+    PATH below so ``winfsp-x64.dll`` resolves without a system-wide PATH
+    edit. macOS wheels do not ship this binary (no FUSE3 API on macOS).
     """
+    if sys.platform == "win32":
+        winfsp_bin = os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "WinFsp",
+            "bin",
+        )
+        if os.path.isdir(winfsp_bin):
+            os.environ["PATH"] = (
+                winfsp_bin + os.pathsep + os.environ.get("PATH", "")
+            )
+        else:
+            print(
+                "Error: WinFsp not found (looked in %s). Install it from "
+                "https://winfsp.dev to use the FUSE adapter." % winfsp_bin,
+                file=sys.stderr,
+            )
+            sys.exit(1)
     _exec_iowarp_bin("clio_cte_fuse")
 
 

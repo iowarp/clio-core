@@ -97,7 +97,34 @@ struct BenchmarkConfig {
       ""; // Lane mapping policy override (empty = use config)
   std::string output_dir =
       "/tmp/clio_benchmark"; // Output directory for benchmark files
+  // Attach to an already-composed block-device pool instead of creating a
+  // private bdev. safe_bdev reuses bdev's data-plane task types and method
+  // ids (10..14), so the bdev client drives either module unchanged -- only
+  // the target pool differs. Empty => create a private bdev (default).
+  bool attach_pool = false;
+  clio::run::PoolId attach_pool_id;
 };
+
+/**
+ * Parse a "major.minor" pool id (the same form compose files use, e.g.
+ * "7000.0"). Returns false on malformed input.
+ */
+bool ParsePoolId(const std::string &str, clio::run::PoolId &pool_id) {
+  size_t dot = str.find('.');
+  if (dot == std::string::npos || dot == 0 || dot + 1 >= str.size()) {
+    return false;
+  }
+  try {
+    clio::run::u32 major = static_cast<clio::run::u32>(
+        std::stoul(str.substr(0, dot)));
+    clio::run::u32 minor = static_cast<clio::run::u32>(
+        std::stoul(str.substr(dot + 1)));
+    pool_id = clio::run::PoolId(major, minor);
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Parse test case from string
@@ -146,6 +173,12 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
       config.lane_policy = argv[++i];
     } else if (arg == "--output-dir" && i + 1 < argc) {
       config.output_dir = argv[++i];
+    } else if (arg == "--pool-id" && i + 1 < argc) {
+      if (!ParsePoolId(argv[++i], config.attach_pool_id)) {
+        HLOG(kError, "ERROR: --pool-id expects <major>.<minor> (e.g. 7000.0)");
+        return false;
+      }
+      config.attach_pool = true;
     } else if (arg == "--verbose" || arg == "-v") {
       config.verbose = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -158,6 +191,8 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
       HIPRINT("  --io-size <size>        I/O size per operation with suffix: k, m, g (default: 4k)");
       HIPRINT("  --lane-policy <P>       Lane policy: map_by_pid_tid, round_robin, random (default: from config)");
       HIPRINT("  --output-dir <dir>      Output directory for benchmark files (default: /tmp/clio_benchmark)");
+      HIPRINT("  --pool-id <major.minor> Attach to an existing block-device pool (e.g. a composed");
+      HIPRINT("                          safe_bdev) instead of creating a private bdev. bdev-only tests.");
       HIPRINT("  --verbose, -v           Verbose output");
       HIPRINT("  --help, -h              Show this help");
       HIPRINT("");
@@ -569,7 +604,9 @@ int main(int argc, char **argv) {
   }
   HIPRINT("Threads: {}", config.num_threads);
   HIPRINT("Duration: {} seconds", config.duration_seconds);
-  if (config.test_case != TestCase::kLatency) {
+  // max_file_size only sizes a bdev this run creates; when attaching to an
+  // existing pool the capacity is whatever that pool was composed with.
+  if (config.test_case != TestCase::kLatency && !config.attach_pool) {
     HIPRINT("Max file size: {} bytes", config.max_file_size);
   }
 
@@ -599,6 +636,24 @@ int main(int argc, char **argv) {
            create_task->GetReturnCode());
       BENCH_EXIT(1);
     }
+  } else if (config.attach_pool) {
+    // Attach to a pool that already exists in the runtime (composed via
+    // `clio_run compose start`). This is how the bdev tests are pointed at a
+    // safe_bdev: it serves the same AllocateBlocks/Write/FreeBlocks methods
+    // (ids 10..12) over its member bdevs, so no client-side change is needed
+    // beyond targeting its pool id.
+    test_pool_id = config.attach_pool_id;
+    clio::run::bdev::Client probe(test_pool_id);
+    auto stats_task = probe.AsyncGetStats(clio::run::PoolQuery::Local());
+    stats_task.Wait();
+    if (stats_task->GetReturnCode() != 0) {
+      HLOG(kError,
+           "ERROR: pool {} is not reachable as a block device (return code: "
+           "{}). Is it composed?",
+           test_pool_id, stats_task->GetReturnCode());
+      BENCH_EXIT(1);
+    }
+    HIPRINT("Attached to existing pool: {}", test_pool_id);
   } else {
     // Create BDev container for I/O and allocation tests
     test_pool_id = clio::run::PoolId(7000, 0);

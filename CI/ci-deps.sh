@@ -64,9 +64,19 @@ echo ""
 echo -e "${BLUE}Preset: ${YELLOW}$PRESET${NC}"
 echo ""
 
+# Pinned Miniconda release with a Python 3.12 base. conda-build crashes on a
+# Python >= 3.14 interpreter (execute_download_actions IndexError, same bug as
+# the PYVER note above), and "Miniconda3-latest" now ships a 3.14 base — so
+# fresh installs must pin, and a detected system conda must be checked.
+MINICONDA_RELEASE="py312_26.5.3-2"
+# Anaconda stopped shipping macOS-Intel installers after this release
+# (Miniconda3-py312_26.5.3-2-MacOSX-x86_64.sh is a 404), so mac-Intel pins
+# the last release that has one.
+MINICONDA_RELEASE_MACOS_INTEL="py312_25.7.0-2"
+
 # Function to install Miniconda
 install_miniconda() {
-    echo -e "${YELLOW}Conda not detected. Installing Miniconda...${NC}"
+    echo -e "${YELLOW}Installing pinned Miniconda ($MINICONDA_RELEASE)...${NC}"
     echo ""
 
     # Default Miniconda installation directory
@@ -77,9 +87,9 @@ install_miniconda() {
         PLATFORM="Linux"
         ARCH=$(uname -m)
         if [[ "$ARCH" == "x86_64" ]]; then
-            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE-Linux-x86_64.sh"
         elif [[ "$ARCH" == "aarch64" ]]; then
-            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"
+            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE-Linux-aarch64.sh"
         else
             echo -e "${RED}Error: Unsupported Linux architecture: $ARCH${NC}"
             exit 1
@@ -88,9 +98,9 @@ install_miniconda() {
         PLATFORM="macOS"
         ARCH=$(uname -m)
         if [[ "$ARCH" == "x86_64" ]]; then
-            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
+            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE_MACOS_INTEL-MacOSX-x86_64.sh"
         elif [[ "$ARCH" == "arm64" ]]; then
-            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh"
+            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE-MacOSX-arm64.sh"
         else
             echo -e "${RED}Error: Unsupported macOS architecture: $ARCH${NC}"
             exit 1
@@ -104,14 +114,20 @@ install_miniconda() {
     echo -e "${BLUE}Installation directory: $MINICONDA_DIR${NC}"
     echo ""
 
-    # Download Miniconda installer
+    # Download Miniconda installer. -f: fail on HTTP errors instead of saving
+    # an HTML error page that bash then chokes on (`syntax error near
+    # unexpected token 'newline'`).
     INSTALLER_SCRIPT="/tmp/miniconda_installer.sh"
     echo -e "${BLUE}Downloading Miniconda installer...${NC}"
-    curl -L -o "$INSTALLER_SCRIPT" "$INSTALLER_URL"
+    if ! curl -fL -o "$INSTALLER_SCRIPT" "$INSTALLER_URL"; then
+        echo -e "${RED}Error: failed to download $INSTALLER_URL${NC}"
+        exit 1
+    fi
 
-    # Install Miniconda
+    # Install Miniconda (-u: proceed even if the directory already exists,
+    # e.g. when replacing an unusable py3.14-base install)
     echo -e "${BLUE}Installing Miniconda...${NC}"
-    bash "$INSTALLER_SCRIPT" -b -p "$MINICONDA_DIR"
+    bash "$INSTALLER_SCRIPT" -b -u -p "$MINICONDA_DIR"
     rm "$INSTALLER_SCRIPT"
 
     # Initialize conda for bash
@@ -124,6 +140,16 @@ install_miniconda() {
     echo ""
     echo -e "${GREEN}Miniconda installed successfully!${NC}"
     echo ""
+}
+
+# conda-build runs in the BASE environment, and is broken on a Python >= 3.14
+# base regardless of the recipe's target-python pin. Returns success when the
+# detected conda's base interpreter is usable.
+conda_base_usable() {
+    local base
+    base="$(conda info --base 2>/dev/null)" || return 1
+    [ -x "$base/bin/python" ] || return 1
+    "$base/bin/python" -c 'import sys; sys.exit(0 if sys.version_info < (3, 14) else 1)'
 }
 
 # Function to ensure conda is available
@@ -144,24 +170,48 @@ ensure_conda() {
     else
         echo -e "${GREEN}Conda detected: $(conda --version)${NC}"
     fi
+    # A detected conda with a py3.14 base (e.g. the GitHub runner image's
+    # preinstalled /usr/share/miniconda since 2026-07-30) crashes conda-build;
+    # replace it with the pinned py312 Miniconda and use that instead.
+    if command -v conda &> /dev/null && ! conda_base_usable; then
+        echo -e "${YELLOW}Detected conda has a Python >= 3.14 base, which breaks conda-build.${NC}"
+        install_miniconda
+    fi
     echo ""
 }
 
 # Ensure conda is available
 ensure_conda
 
-# Accept Conda Terms of Service for Anaconda channels
-echo -e "${BLUE}Accepting Conda Terms of Service...${NC}"
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
-echo -e "${GREEN}Conda ToS accepted${NC}"
-echo ""
-
-# Configure conda channels (add conda-forge if not already present)
-echo -e "${BLUE}Configuring conda channels...${NC}"
+# Configure conda to use conda-forge ONLY, and never the Anaconda `defaults`
+# channels (pkgs/main, pkgs/r).
+#
+# Those channels sit behind repo.anaconda.com, which now returns HTTP 403
+# Forbidden for CI/commercial use unless the org has an Anaconda license:
+#
+#   CondaHTTPError: HTTP 403 Forbidden for url
+#     <https://repo.anaconda.com/pkgs/main/noarch/repodata.json>
+#   - The channel requires authentication.
+#
+# Previously this script did `conda tos accept ...` for pkgs/main and pkgs/r
+# and then `conda config --add channels conda-forge`, which only PREPENDED
+# conda-forge while leaving `defaults` in the channel list. conda still
+# fetched pkgs/main repodata and intermittently 403'd — a flake that fails the
+# dependency-install step before any build begins, and the create-retry loop
+# below could not help because every retry hit the same forbidden channel.
+# Accepting a ToS also does nothing when the runner IP is refused outright.
+#
+# `--remove-key channels` clears whatever the base install seeded (which
+# includes defaults), then we add only conda-forge and pin strict priority so
+# conda never falls back to defaults for a package conda-forge lacks.
+echo -e "${BLUE}Configuring conda channels (conda-forge only, no defaults)...${NC}"
+conda config --remove-key channels 2>/dev/null || true
 conda config --add channels conda-forge 2>/dev/null || true
-conda config --set channel_priority flexible 2>/dev/null || true
-echo -e "${GREEN}Conda channels configured${NC}"
+conda config --set channel_priority strict 2>/dev/null || true
+# Belt and braces: some conda versions still consult the implicit `defaults`
+# unless it is explicitly disabled.
+conda config --set default_channels "[]" 2>/dev/null || true
+echo -e "${GREEN}Conda channels configured (conda-forge only)${NC}"
 echo ""
 
 # Create and activate environment if not already in one
@@ -176,7 +226,7 @@ if [ -z "$CONDA_PREFIX" ]; then
         # Retry up to 3 times: conda-forge CDN occasionally returns 403/502.
         _created=0
         for _attempt in 1 2 3; do
-            if conda create -n "$ENV_NAME" -y "python=$PYVER"; then
+            if conda create -n "$ENV_NAME" -y -c conda-forge --override-channels "python=$PYVER"; then
                 _created=1
                 break
             fi

@@ -40,6 +40,19 @@ using MonitorTask = clio::run::admin::MonitorTask;
 GLOBAL_CROSS_CONST clio::run::u64 kFsPageSize = 1024 * 1024;
 
 /**
+ * Page-blob name for a byte offset (stringified page index).
+ *
+ * Lives in the shared header, not in the runtime's .cc, because since issue
+ * #817 a CLIENT resolves page blobs itself on the fast path. Two copies of
+ * this rule would let the reader and the writer disagree about which blob a
+ * byte range lives in -- the same reasoning that keeps MakeShmBlobKey single
+ * sourced in the CTE core.
+ */
+inline std::string PageName(clio::run::u64 off) {
+  return std::to_string(off / kFsPageSize);
+}
+
+/**
  * Well-known default pool id/name for the filesystem chimod, used by the
  * interceptor adapters (libfuse, POSIX, ...) to create-or-bind a single
  * shared filesystem pool over the default CTE core pool — exactly the way

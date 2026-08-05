@@ -94,6 +94,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
             -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
+            -DVCPKG_APPLOCAL_DEPS=OFF `
             -DCMAKE_BUILD_TYPE=Debug `
             -DSITE="${{ matrix.os }}" `
             -DBUILDNAME="msvc/${{ matrix.arch }}/d" `
@@ -175,7 +176,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Run tests
-        run: ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
+        # VCPKG_APPLOCAL_DEPS=OFF above (see #848: the z-applocal DLL copy
+        # intermittently dies with ERROR_SHARING_VIOLATION) means dependency
+        # DLLs were never copied next to the exes -- resolve them from the
+        # vcpkg tree instead.
+        run: |
+          $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\debug\bin;${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\bin;$env:PATH"
+          ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
       - name: Submit results to CDash
         if: always()
         continue-on-error: true
@@ -323,6 +330,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows ^
             -DVCPKG_MANIFEST_DIR="%GITHUB_WORKSPACE%\installers\vcpkg" ^
             -DVCPKG_OVERLAY_PORTS="%GITHUB_WORKSPACE%\installers\vcpkg\overlay-ports" ^
+            -DVCPKG_APPLOCAL_DEPS=OFF ^
             -DCMAKE_BUILD_TYPE=Debug ^
             -DSITE=${{ matrix.os }} ^
             -DBUILDNAME=ninja/icx-2025.3 ^
@@ -363,6 +371,8 @@ jobs:
         run: |
           @echo on
           call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat"
+          rem VCPKG_APPLOCAL_DEPS=OFF (#848): DLLs resolve from the vcpkg tree
+          set "PATH=%GITHUB_WORKSPACE%\build\vcpkg_installed\x64-windows\debug\bin;%GITHUB_WORKSPACE%\build\vcpkg_installed\x64-windows\bin;%PATH%"
           cd build
           ctest -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
       - name: Submit results to CDash
@@ -468,6 +478,7 @@ jobs:
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
             -DVCPKG_MANIFEST_FEATURES="boost-coroutines" `
             -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
+            -DVCPKG_APPLOCAL_DEPS=OFF `
             -DCMAKE_BUILD_TYPE=Release `
             -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON `
             -DCLIO_CORE_ENABLE_RUNTIME=ON `
@@ -504,4 +515,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Run tests
-        run: ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama
+        # VCPKG_APPLOCAL_DEPS=OFF (#848): DLLs resolve from the vcpkg tree
+        run: |
+          $env:PATH = "${{ github.workspace }}\build-boost\vcpkg_installed\${{ matrix.triplet }}\bin;${{ github.workspace }}\build-boost\vcpkg_installed\${{ matrix.triplet }}\debug\bin;$env:PATH"
+          ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama

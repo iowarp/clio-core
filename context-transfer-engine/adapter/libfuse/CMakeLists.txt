@@ -43,6 +43,16 @@ endif()
 
 message(STATUS "Found FUSE3: ${FUSE3_VERSION}")
 
+# Export the discovery results for the fuse test dir (processed after this
+# one). test_fuse_ops previously re-probed with pkg-config, which silently
+# skipped the suite on Windows (WinFsp has no .pc file) and macOS setups
+# where only these hand-found paths exist (#903).
+set(CLIO_FUSE3_FOUND TRUE CACHE INTERNAL "FUSE3 backend located (adapter/libfuse)")
+set(CLIO_FUSE3_INCLUDEDIR "${FUSE3_INCLUDEDIR}" CACHE INTERNAL "")
+set(CLIO_FUSE3_INCLUDE_DIRS "${FUSE3_INCLUDE_DIRS}" CACHE INTERNAL "")
+set(CLIO_FUSE3_LIBRARY_DIRS "${FUSE3_LIBRARY_DIRS}" CACHE INTERNAL "")
+set(CLIO_FUSE3_LIBRARIES "${FUSE3_LIBRARIES}" CACHE INTERNAL "")
+
 add_executable(clio_cte_fuse
     fuse_cte.cc       # FUSE operation callbacks (unit-tested, coverage-tracked)
     fuse_cte_main.cc) # process entry / mount glue (coverage-excluded)
@@ -67,4 +77,10 @@ target_link_libraries(clio_cte_fuse
     ctp::cxx)
 
 install(TARGETS clio_cte_fuse
+    RUNTIME DESTINATION bin)
+# Also ship in the pip wheel: scikit-build-core installs only COMPONENT
+# pip_package, so without this second rule the wheel's clio_cte_fuse
+# console script points at a binary that is not there (#899).
+install(TARGETS clio_cte_fuse
+    COMPONENT pip_package
     RUNTIME DESTINATION bin)

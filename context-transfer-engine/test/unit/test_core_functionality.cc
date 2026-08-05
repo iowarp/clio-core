@@ -378,8 +378,11 @@ class CTECoreFunctionalTestFixture {
   /**
    * Async helper: Get or create tag
    */
-  clio::cte::core::TagId GetOrCreateTagAsync(const std::string& tag_name) {
-    auto task = core_client_->AsyncGetOrCreateTag(tag_name);
+  clio::cte::core::TagId GetOrCreateTagAsync(
+      const std::string& tag_name,
+      const clio::run::PoolQuery& pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto task = core_client_->AsyncGetOrCreateTag(
+        tag_name, clio::cte::core::TagId::GetNull(), pool_query);
     task.Wait();
     clio::cte::core::TagId tag_id = task->tag_id_;
     return tag_id;
@@ -2502,6 +2505,19 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
  *   - a miss must be reported as "not cached", never as "blob does not exist";
  *   - cached metadata must AGREE with the authoritative RPC answer.
  */
+/** The SHM-cache fast paths are node-local BY DESIGN: a blob's cached
+ * metadata/payload live in the SHM segment of the node that owns its
+ * container, and the cache exists to accelerate access to LOCAL data — on
+ * every deployment size, multi-node included. These tests therefore pin
+ * every tag and blob task to the LOCAL container (PoolQuery::Local()): the
+ * puts land on this node's target, the records publish into this node's
+ * SHM, and the assertions hold identically on single-node and multi-node
+ * suites (#879). A REMOTE blob is simply a clean cache miss served by RPC;
+ * that fallback is what the distributed suites cover. */
+static clio::run::PoolQuery ShmCacheLocalQuery() {
+  return clio::run::PoolQuery::Local();
+}
+
 TEST_CASE("CTE SHM cache write-then-read",
           "[cte][core][shm_cache][functional]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
@@ -2530,7 +2546,7 @@ TEST_CASE("CTE SHM cache write-then-read",
   }
 
   const std::string tag_name = "shm_rw_tag";
-  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync(tag_name);
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync(tag_name, ShmCacheLocalQuery());
   REQUIRE(!tag_id.IsNull());
 
   SECTION("A miss is reported as not-cached, never as absent") {
@@ -2559,7 +2575,7 @@ TEST_CASE("CTE SHM cache write-then-read",
 
     auto put_task = fixture->core_client_->AsyncPutBlob(
         tag_id, blob_name, 0, blob_size, blob_data_ptr, 0.5f,
-        clio::cte::core::Context(), 0);
+        clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
     REQUIRE(put_task->return_code_ == 0);
@@ -2573,7 +2589,7 @@ TEST_CASE("CTE SHM cache write-then-read",
 
     // The cached answer must AGREE with the authoritative RPC answer. A cache
     // that is fast but disagrees is worse than no cache at all.
-    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
 
@@ -2596,7 +2612,7 @@ TEST_CASE("CTE SHM cache write-then-read",
       REQUIRE(fixture->CopyToSharedMemory(fp, data));
       auto t = fixture->core_client_->AsyncPutBlob(
           tag_id, blob_name, 0, sz, fp.shm_.template Cast<void>(), 0.5f,
-          clio::cte::core::Context(), 0);
+          clio::cte::core::Context(), 0, ShmCacheLocalQuery());
       REQUIRE(!t.IsNull());
       REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
       REQUIRE(t->return_code_ == 0);
@@ -2608,7 +2624,7 @@ TEST_CASE("CTE SHM cache write-then-read",
     clio::cte::core::ShmBlobRecord rec;
     REQUIRE(fixture->core_client_->TryGetBlobRecordShm(tag_id, blob_name,
                                                        &rec));
-    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
   }
@@ -2649,7 +2665,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
     return;
   }
 
-  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync("shm_bench_tag");
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync("shm_bench_tag", ShmCacheLocalQuery());
   REQUIRE(!tag_id.IsNull());
 
   // Populate a working set.
@@ -2665,7 +2681,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
     REQUIRE(fixture->CopyToSharedMemory(fp, data));
     auto t = fixture->core_client_->AsyncPutBlob(
         tag_id, bn, 0, kBlobSize, fp.shm_.template Cast<void>(), 0.5f,
-        clio::cte::core::Context(), 0);
+        clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     REQUIRE(!t.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
     REQUIRE(t->return_code_ == 0);
@@ -2700,8 +2716,8 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
   clio::run::u64 rpc_checksum = 0;
   auto rpc_t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < kRpcIters; ++i) {
-    auto t = fixture->core_client_->AsyncGetBlobSize(tag_id,
-                                                     names[i % kBlobs]);
+    auto t = fixture->core_client_->AsyncGetBlobSize(
+        tag_id, names[i % kBlobs], ShmCacheLocalQuery());
     t.Wait();
     rpc_checksum += t->size_;
   }
@@ -2735,6 +2751,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * authoritative RPC read. A fast path that returns the wrong bytes is far
  * worse than no fast path, so correctness is asserted before speed.
  */
+
 TEST_CASE("CTE SHM cache direct payload read",
           "[cte][core][shm_cache][payload][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
@@ -2773,7 +2790,9 @@ TEST_CASE("CTE SHM cache direct payload read",
 
   clio::cte::core::TagId tag_id;
   {
-    auto t = client.AsyncGetOrCreateTag("shm_payload_tag");
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_payload_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
     t.Wait();
     tag_id = t->tag_id_;
   }
@@ -2788,7 +2807,7 @@ TEST_CASE("CTE SHM cache direct payload read",
   REQUIRE(fixture->CopyToSharedMemory(fp, test_data));
   auto put = client.AsyncPutBlob(
       tag_id, blob_name, 0, blob_size, fp.shm_.template Cast<void>(), 0.9f,
-      clio::cte::core::Context(), 0);
+      clio::cte::core::Context(), 0, ShmCacheLocalQuery());
   REQUIRE(!put.IsNull());
   REQUIRE(fixture->WaitForTaskCompletion(put, 10000));
   REQUIRE(put->return_code_ == 0);
@@ -2824,7 +2843,7 @@ TEST_CASE("CTE SHM cache direct payload read",
     REQUIRE(!rd.IsNull());
     auto get = client.AsyncGetBlob(
         tag_id, blob_name.c_str(), 0, blob_size, 0,
-        rd.shm_.template Cast<void>());
+        rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     REQUIRE(!get.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(get, 10000));
     REQUIRE(get->return_code_ == 0);
@@ -2868,7 +2887,7 @@ TEST_CASE("CTE SHM cache direct payload read",
     for (int i = 0; i < kRpcIters; ++i) {
       auto g = client.AsyncGetBlob(
           tag_id, blob_name.c_str(), 0, blob_size, 0,
-          rd.shm_.template Cast<void>());
+          rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
       g.Wait();
     }
     auto rpc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2878,10 +2897,181 @@ TEST_CASE("CTE SHM cache direct payload read",
     double shm_us = static_cast<double>(shm_ns) / 1000.0 / kIters;
     double rpc_us = static_cast<double>(rpc_ns) / 1000.0 / kRpcIters;
     HLOG(kWarning,
-         "[#783 BENCH] PAYLOAD read {} bytes: SHM {} us/op vs RPC {} us/op -- "
-         "speedup {}x",
-         blob_size, shm_us, rpc_us, (rpc_us > 0 ? rpc_us / shm_us : 0.0));
-    REQUIRE(shm_us < rpc_us / 5.0);
+         "[#783 BENCH] PAYLOAD read {} bytes: raw TryReadBlobShm {} us/op vs "
+         "AsyncGetBlob {} us/op",
+         blob_size, shm_us, rpc_us);
+    // AsyncGetBlob now embeds this SHM fast path natively (TryShmGet), so the
+    // old ">=5x faster than the RPC" comparison is void — both loops serve
+    // from shared memory. Assert the inverse guard instead: the DEFAULT get
+    // stays within a small constant factor of the raw cache read (task
+    // synthesis is a few us at most). If someone unwires the fast path,
+    // AsyncGetBlob falls back to a full RPC (~50-150us) and this trips.
+    //
+    // EXCEPT under CLIO_FORCE_NET: there the fast path deliberately stands
+    // down (the force_net suites exist to exercise the network path), so
+    // AsyncGetBlob is a genuine net RPC and the ORIGINAL direction holds —
+    // the raw cache read must beat it handily.
+    const char *fn = std::getenv("CLIO_FORCE_NET");
+    const bool force_net = fn != nullptr && fn[0] != '\0' &&
+                           !(fn[0] == '0' && fn[1] == '\0');
+    if (force_net) {
+      REQUIRE(shm_us < rpc_us / 5.0);
+    } else {
+      REQUIRE(rpc_us < shm_us * 25.0 + 25.0);
+    }
+  }
+}
+
+/**
+ * issue #818: a transformed blob must never be served from the direct-read
+ * fast path.
+ *
+ * The producer of the bytes declares the transform through
+ * Context::transform_flags_. This test drives that field directly rather than
+ * going through the compressor chimod, for two reasons: the chimod is only
+ * built when CLIO_CTE_ENABLE_COMPRESS is ON (it defaults OFF), and the property
+ * under test is precisely that the guard does NOT depend on compression being
+ * compiled in. A compressed blob is one instance of the rule; the rule is the
+ * bit.
+ */
+TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
+          "[cte][core][shm_cache][transform][noleak]") {
+  auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+  clio::cte::core::CreateParams params;
+
+  // ISOLATED pool whose ONLY target is kRam, exactly as the payload test does.
+  // This is load-bearing, not boilerplate: on the shared fixture pool the DPE
+  // places blobs on a file target, which is not direct-readable for reasons
+  // that have nothing to do with transforms -- so every "the fast path
+  // refuses" assertion below would pass for the wrong reason and the test
+  // would prove nothing.
+  clio::run::PoolId xform_pool(7802, 0);
+  clio::cte::core::Client client(xform_pool);
+  {
+    auto t = client.AsyncCreate(pool_query, "cte_shm_transform_pool",
+                                xform_pool, params);
+    t.Wait();
+    client.AttachShmCache(*t);
+  }
+  {
+    auto t = client.AsyncRegisterTarget(
+        "ram_transform_target", clio::run::bdev::BdevType::kRam,
+        64ULL * 1024 * 1024, clio::run::PoolQuery::Local(),
+        clio::run::PoolId(672, 0));
+    t.Wait();
+    REQUIRE(t->GetReturnCode() == 0);
+  }
+
+  if (!client.HasShmCache()) {
+    HLOG(kWarning,
+         "[#818] SHM metadata cache unavailable -- transform-guard assertions "
+         "SKIPPED (this test proves nothing on this host)");
+    return;
+  }
+
+  clio::cte::core::TagId tag_id;
+  {
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_transform_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
+    t.Wait();
+    tag_id = t->tag_id_;
+  }
+  REQUIRE(!tag_id.IsNull());
+
+  const clio::run::u64 blob_size = 4096;
+  auto test_data = fixture->CreateTestData(blob_size, 'X');
+
+  // Put the SAME bytes twice: once declared raw, once declared transformed.
+  // The only difference between the two blobs is the bit, so any difference in
+  // how the cache treats them is attributable to it and nothing else.
+  auto put_blob = [&](const std::string &name, clio::run::u32 transform) {
+    auto fp = CLIO_IPC->AllocateBuffer(blob_size);
+    REQUIRE(!fp.IsNull());
+    REQUIRE(fixture->CopyToSharedMemory(fp, test_data));
+    clio::cte::core::Context ctx;
+    ctx.transform_flags_ = transform;
+    auto put = client.AsyncPutBlob(tag_id, name, 0, blob_size,
+                                   fp.shm_.template Cast<void>(), 0.9f, ctx, 0, ShmCacheLocalQuery());
+    REQUIRE(!put.IsNull());
+    REQUIRE(fixture->WaitForTaskCompletion(put, 10000));
+    REQUIRE(put->return_code_ == 0);
+    CLIO_IPC->FreeBuffer(fp);
+  };
+
+  put_blob("raw_blob", clio::cte::core::kBlobTransformNone);
+  put_blob("transformed_blob", clio::cte::core::kBlobTransformed |
+                                   clio::cte::core::kBlobTransformCompressed);
+
+  clio::cte::core::ShmBlobRecord raw_rec, xform_rec;
+  REQUIRE(client.TryGetBlobRecordShm(tag_id, "raw_blob", &raw_rec));
+  REQUIRE(client.TryGetBlobRecordShm(tag_id, "transformed_blob", &xform_rec));
+
+  // CONTROL. Without this the refusal assertions below are vacuous: they would
+  // also hold if nothing here were direct-readable in the first place. The raw
+  // blob proves the fast path IS available for these bytes on this tier, so
+  // the transformed blob's refusal is attributable to the bit alone.
+  if (!raw_rec.IsDirectReadable()) {
+    HLOG(kWarning,
+         "[#818] raw control blob is not direct-readable -- refusal "
+         "assertions would be vacuous, SKIPPING");
+    return;
+  }
+  {
+    std::vector<char> control(blob_size, 0);
+    REQUIRE(client.TryReadBlobShm(tag_id, "raw_blob", control.data(),
+                                  blob_size));
+    REQUIRE(std::memcmp(control.data(), test_data.data(), blob_size) == 0);
+  }
+
+  SECTION("The transform state reaches the cache record") {
+    REQUIRE_FALSE(raw_rec.IsTransformed());
+    REQUIRE(xform_rec.IsTransformed());
+    REQUIRE((xform_rec.transform_flags_ &
+             clio::cte::core::kBlobTransformCompressed) != 0);
+  }
+
+  SECTION("A transformed record is never direct-readable") {
+    REQUIRE_FALSE(xform_rec.IsDirectReadable());
+    // ...and the runtime cleared the flag rather than relying solely on the
+    // client-side check, so an older client refuses too.
+    REQUIRE((xform_rec.flags_ &
+             clio::cte::core::kShmBlobDirectReadable) == 0);
+  }
+
+  SECTION("The payload fast path refuses") {
+    std::vector<char> got(blob_size, 0);
+    REQUIRE_FALSE(client.TryReadBlobShm(tag_id, "transformed_blob", got.data(),
+                                        blob_size));
+  }
+
+  SECTION("Refusing costs correctness nothing: RPC still returns the bytes") {
+    // The guard must degrade to the slow path, never to an error or to
+    // "no such blob".
+    auto rd = CLIO_IPC->AllocateBuffer(blob_size);
+    REQUIRE(!rd.IsNull());
+    auto g = client.AsyncGetBlob(tag_id, "transformed_blob", 0, blob_size, 0,
+                                 rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
+    g.Wait();
+    REQUIRE(g->return_code_ == 0);
+    REQUIRE(std::memcmp(test_data.data(), rd.ptr_, blob_size) == 0);
+    // The get also REPORTS the transform state back through its context
+    // (OUT), so a caller can detect it received stored-form bytes.
+    REQUIRE((g->context_.transform_flags_ &
+             clio::cte::core::kBlobTransformed) != 0);
+    CLIO_IPC->FreeBuffer(rd);
+  }
+
+  SECTION("The bit is sticky across an overwrite with undeclared bytes") {
+    // A later put that does not declare a transform must not clear the mark:
+    // the blob may now be a mix of codec output and raw bytes, and the only
+    // safe reading of that is still "transformed".
+    put_blob("transformed_blob", clio::cte::core::kBlobTransformNone);
+    clio::cte::core::ShmBlobRecord after;
+    REQUIRE(client.TryGetBlobRecordShm(tag_id, "transformed_blob", &after));
+    REQUIRE(after.IsTransformed());
+    REQUIRE_FALSE(after.IsDirectReadable());
   }
 }
 
@@ -2926,7 +3116,9 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
 
   clio::cte::core::TagId tag_id;
   {
-    auto t = client.AsyncGetOrCreateTag("shm_wtr_tag");
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_wtr_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
     t.Wait();
     tag_id = t->tag_id_;
   }
@@ -2945,7 +3137,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   auto do_write = [&]() {
     auto t = client.AsyncPutBlob(tag_id, blob_name, 0, kSize,
                                  wbuf.shm_.template Cast<void>(), 0.9f,
-                                 clio::cte::core::Context(), 0);
+                                 clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     t.Wait();
     return t->return_code_;
   };
@@ -2991,7 +3183,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   auto b0 = std::chrono::steady_clock::now();
   for (int i = 0; i < kIters; ++i) {
     REQUIRE(do_write() == 0);
-    auto g = client.AsyncGetBlobSize(tag_id, blob_name);
+    auto g = client.AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     g.Wait();
     sink += g->size_;
   }
@@ -3017,7 +3209,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   for (int i = 0; i < kIters; ++i) {
     REQUIRE(do_write() == 0);
     auto g = client.AsyncGetBlob(tag_id, blob_name.c_str(), 0, kSize, 0,
-                                 rd.shm_.template Cast<void>());
+                                 rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     g.Wait();
   }
   double cycle_rpc_data_us =
@@ -3043,11 +3235,34 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
        write_us, write_us_last, cycle_shm_meta_us, cycle_rpc_meta_us,
        cycle_shm_data_us, cycle_rpc_data_us, kIters, kSize, sink);
 
-  // The cycle can never beat the write floor, and the SHM variants must not be
-  // slower than the RPC ones. Loose bounds: this is a measurement, not a gate.
+  // Structural sanity: a write+read cycle includes a write, so it cannot take
+  // less than half the write-alone floor. This catches a broken/near-zero
+  // measurement, and holds regardless of runner load.
   REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.5);
-  REQUIRE(cycle_shm_meta_us < cycle_rpc_meta_us);
-  REQUIRE(cycle_shm_data_us < cycle_rpc_data_us);
+
+  // SHM is EXPECTED to beat RPC — that is the point of the cache — but this is
+  // a wall-clock comparison of two timing samples, so on a loaded CI runner
+  // the faster path occasionally samples slower and the strict inequality
+  // inverts. This used to be REQUIRE(shm < rpc), which flaked
+  // (cte_functional_all, retry-masked on dev boost/docker). The comment above
+  // it already declared the intent — "a measurement, not a gate" — so the hard
+  // assertion was the bug. Report the comparison and warn if the expectation
+  // is not met, but do not fail the test on sample noise. A genuine
+  // performance regression shows up as a persistent warning across runs, not a
+  // single-sample flake; gate it in a dedicated perf job with repetition and
+  // statistics if it needs gating at all.
+  if (!(cycle_shm_meta_us < cycle_rpc_meta_us)) {
+    HLOG(kWarning,
+         "[#783 WTR] metadata SHM cycle ({} us) did not beat RPC ({} us) this "
+         "run — expected SHM faster; treating as sample noise, not a failure",
+         cycle_shm_meta_us, cycle_rpc_meta_us);
+  }
+  if (!(cycle_shm_data_us < cycle_rpc_data_us)) {
+    HLOG(kWarning,
+         "[#783 WTR] payload SHM cycle ({} us) did not beat RPC ({} us) this "
+         "run — expected SHM faster; treating as sample noise, not a failure",
+         cycle_shm_data_us, cycle_rpc_data_us);
+  }
 }
 
 // Main function using simple_test.h framework

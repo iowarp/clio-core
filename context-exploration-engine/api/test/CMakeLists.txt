@@ -12,10 +12,12 @@ function(add_cee_api_unit_test TEST_NAME TEST_SOURCE)
   # Create test executable
   add_executable(${TEST_NAME} ${TEST_SOURCE})
 
-  # Link common dependencies
+  # Link common dependencies (indexer client: the SemanticSearch pool the
+  # BM25 tests compose over the core, issue #905)
   target_link_libraries(${TEST_NAME}
     PRIVATE
       clio_cee_api
+      clio_cte_indexer_client
   )
 
   # Install test binary
@@ -52,6 +54,7 @@ add_executable(test_context_comprehensive test_context_comprehensive.cc)
 target_link_libraries(test_context_comprehensive
   PRIVATE
     clio_cee_api
+    clio_cte_indexer_client
 )
 install(TARGETS test_context_comprehensive DESTINATION bin/tests)
 

@@ -50,6 +50,36 @@
 
 namespace clio::run {
 
+// TEMP NET TRACE (issue #892 diagnosis): per-stage nanosecond totals for the
+// cross-node task path, dumped every 32 ops when CLIO_NET_TRACE=1.
+namespace nettrace {
+static std::atomic<uint64_t> sendin_ser_ns{0}, sendin_tx_ns{0},
+    sendin_bytes{0}, sendin_n{0};
+static std::atomic<uint64_t> sendout_ser_ns{0}, sendout_tx_ns{0},
+    sendout_n{0};
+static std::atomic<uint64_t> recv_ns{0}, recvin_ns{0}, recvout_ns{0},
+    recv_n{0};
+inline bool On() {
+  static bool on = std::getenv("CLIO_NET_TRACE") != nullptr;
+  return on;
+}
+inline uint64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+inline void Dump(const char *tag, uint64_t n) {
+  if (n % 32 != 0) return;
+  HLOG(kInfo,
+       "[NETTRACE {}] n={} sendin(ser={}us tx={}us bytes={}MB) "
+       "sendout(ser={}us tx={}us n={}) recv(recv={}us in={}us out={}us n={})",
+       tag, n, sendin_ser_ns.load() / 1000, sendin_tx_ns.load() / 1000,
+       sendin_bytes.load() >> 20, sendout_ser_ns.load() / 1000,
+       sendout_tx_ns.load() / 1000, sendout_n.load(), recv_ns.load() / 1000,
+       recvin_ns.load() / 1000, recvout_ns.load() / 1000, recv_n.load());
+}
+}  // namespace nettrace
+
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -132,10 +162,19 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   // for SendOut (see RecvInHandleOne), keyed in the connection cache by
   // return-host + this port.
   archive.client_port_ = static_cast<int>(config_manager->GetPort());
+  const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(task_copy->method_, archive, task_copy);
+  const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
+  if (nettrace::On()) {
+    const uint64_t nt2 = nettrace::NowNs();
+    nettrace::sendin_ser_ns += nt1 - nt0;
+    nettrace::sendin_tx_ns += nt2 - nt1;
+    for (const auto &b : archive.send) nettrace::sendin_bytes += b.size;
+    nettrace::Dump("sendin", ++nettrace::sendin_n);
+  }
 
   if (rc != 0) {
     HLOG(kWarning, "[SendIn] Task {} Lightbeam Send rc={} — re-queueing",
@@ -222,7 +261,19 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
         HLOG(kWarning,
              "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
              origin_task->task_id_, target_node_id);
-        origin_task->CompletedReplicas()++;
+        // Issue #856: if this skip is the LAST replica to be accounted (every
+        // other replica already responded), nobody else will ever observe
+        // completed == size — the origin would never complete and its awaiting
+        // client/fiber parks forever (the 15-minute leader-election step
+        // timeout). Check for completion here like every other counting path.
+        // Reaching size mid-loop is only possible when every replica has
+        // already contributed, so no later iteration touches Subtasks() after
+        // RecvOutCompleteOriginTask clears it.
+        clio::run::u32 completed =
+            origin_task->CompletedReplicas().fetch_add(1) + 1;
+        if (completed == origin_task->Subtasks().size()) {
+          RecvOutCompleteOriginTask(send_map_key, origin_task);
+        }
         continue;
       }
       HLOG(kWarning,
@@ -275,7 +326,12 @@ int IpcManagerRun2Run::SendOutTransmit(
     }
   }
   if (lbm_transport == nullptr) {
-    lbm_transport = ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+    // Responses ride a DEDICATED connection (lane "resp"), never the bulk
+    // SendIn DEALER: a metadata-only ack queuing behind a 1 MiB task frame
+    // on the shared socket mutex was measured at ~1.2 ms per response —
+    // the dominant term in cross-node round-trip latency (issue #892).
+    lbm_transport =
+        ipc_manager->GetOrCreateClient(target_host->ip_address, port, "resp");
   }
 
   if (lbm_transport == nullptr) {
@@ -289,10 +345,17 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeOut, lbm_transport);
+  const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
+  const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
+  if (nettrace::On()) {
+    nettrace::sendout_ser_ns += nt1 - nt0;
+    nettrace::sendout_tx_ns += nettrace::NowNs() - nt1;
+    ++nettrace::sendout_n;
+  }
 
   if (rc != 0) {
     HLOG(kWarning, "[SendOut] Task {} Lightbeam Send rc={} — re-queueing",
@@ -606,10 +669,29 @@ int IpcManagerRun2Run::RecvOutAggregate(
   return 0;
 }
 
+bool IpcManagerRun2Run::ClaimOrigin(size_t net_key) {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  bool present = (send_map_.find(net_key) != nullptr);
+  if (present) {
+    send_map_.erase(net_key);
+  }
+  progress_map_.erase(net_key);  // #628: drop task-progress tracking
+  return present;
+}
+
 void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     size_t net_key,
     clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
+
+  // Exactly-once (issue #856): completion is legal only for the path that
+  // erases the origin from send_map_. If the dead-node timeout scan (or any
+  // other completer) got here first, this origin is already finalized —
+  // touching it again would EndTask a task whose first completion freed its
+  // RunContext.
+  if (!ClaimOrigin(net_key)) {
+    return;
+  }
 
   clio::run::DynamicContainer container =
       CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
@@ -623,12 +705,6 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   // Clearing the vector drops the last shared_ptr owner of each replica subtask,
   // freeing them via RAII (replaces the former per-subtask DelTask).
   origin_task->Subtasks().clear();
-
-  {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    send_map_.erase(net_key);
-    progress_map_.erase(net_key);  // #628: drop task-progress tracking
-  }
 
   auto *worker = CLIO_CUR_WORKER;
   if (worker == nullptr) {
@@ -996,29 +1072,13 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
          "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
          origin_task->task_id_);
     origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
-    // Fix B (#628): this runs on the net worker's periodic tick, where
-    // CLIO_CUR_WORKER can be null. Fall back to the net-recv worker rather than
-    // dereferencing null (mirrors RecvOutCompleteOriginTask).
-    auto *worker = CLIO_CUR_WORKER;
-    if (worker == nullptr) {
-      auto *scheduler = CLIO_IPC->GetScheduler();
-      worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
-    }
-    if (worker != nullptr) {
-      worker->EndTask(origin_task, true);
-    } else {
-      HLOG(kError,
-           "[ScanSendMapTimeouts] No worker available to complete task {}",
-           origin_task->task_id_);
-    }
-  }
-
-  if (!to_complete.empty()) {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    for (auto &entry : to_complete) {
-      send_map_.erase(entry.first);
-      progress_map_.erase(entry.first);  // #628: drop task-progress tracking
-    }
+    // Exactly-once (issue #856): funnel through RecvOutCompleteOriginTask,
+    // whose ClaimOrigin() erases the send_map_ entry BEFORE completing. The
+    // old order (EndTask first, erase in a second pass) left a window where a
+    // late replica response found the origin still in send_map_, aggregated
+    // into the completed task, and completed it a second time — the double
+    // EndTask heap corruption behind the leader-election crashes.
+    RecvOutCompleteOriginTask(entry.first, origin_task);
   }
 }
 
@@ -1027,6 +1087,12 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
 // =============================================================================
 
 void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
+  // Origins whose flushed retry was the last unaccounted replica; completed
+  // OUTSIDE retry_queues_mutex_ (EndTask is heavyweight and must not run
+  // under the retry lock).
+  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>>
+      to_complete;
+  {
   std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
 
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
@@ -1044,7 +1110,13 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
       }
     }
     if (!origin.IsNull()) {
-      origin->CompletedReplicas()++;
+      // Issue #856: same last-replica rule as the SendIn dead-skip — if this
+      // flush accounts the final replica, the origin must complete here or it
+      // never will.
+      clio::run::u32 completed = origin->CompletedReplicas().fetch_add(1) + 1;
+      if (completed == origin->Subtasks().size()) {
+        to_complete.emplace_back(net_key, origin);
+      }
     }
     HLOG(kInfo,
          "[FlushStale] Discarding SendIn retry for restarted node {}",
@@ -1061,6 +1133,11 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
          "[FlushStale] Discarding SendOut retry for restarted node {}",
          node_id);
     it = send_out_retry_.erase(it);
+  }
+  }  // release retry_queues_mutex_ before completing origins
+
+  for (auto &entry : to_complete) {
+    RecvOutCompleteOriginTask(entry.first, entry.second);
   }
 }
 
@@ -1107,6 +1184,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
       bool drained_any = false;
       while (!recv_shutdown_.load(std::memory_order_acquire)) {
         clio::run::LoadTaskArchive archive;
+        const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
         auto info = lbm_transport->Recv(archive);
         int rc = info.rc;
         if (rc != 0) {
@@ -1118,14 +1196,24 @@ void IpcManagerRun2Run::StartRecvThreads() {
           }
           break;
         }
+        const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+        if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
           case clio::run::MsgType::kSerializeIn:
             RecvIn(archive, lbm_transport);
+            if (nettrace::On()) {
+              nettrace::recvin_ns += nettrace::NowNs() - nt1;
+              nettrace::Dump("recv", ++nettrace::recv_n);
+            }
             break;
           case clio::run::MsgType::kSerializeOut:
             RecvOut(archive, lbm_transport);
+            if (nettrace::On()) {
+              nettrace::recvout_ns += nettrace::NowNs() - nt1;
+              nettrace::Dump("recv", ++nettrace::recv_n);
+            }
             break;
           case clio::run::MsgType::kHeartbeat:
             break;

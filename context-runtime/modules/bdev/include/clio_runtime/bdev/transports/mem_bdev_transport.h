@@ -11,6 +11,7 @@
 // Must follow the runtime headers above: posix_shm_mmap.h needs the memory
 // backend base types they pull in.
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -115,6 +116,20 @@ class MemBdevTransport : public BdevTransport {
   ShmRamHeader *shm_header_ = nullptr;
   bool shm_backed_ = false;
   std::string shm_name_;
+
+  // Incremental population of the sparse SHM mapping (SystemInfo::BulkFault).
+  // First-touch demand faulting made cold placement ~20x slower than warm on
+  // WSL2 (one #PF per 4KB of memcpy), so when an allocation crosses this
+  // watermark the NEXT populate-unit of pages is bulk-faulted in. The
+  // watermark advances by CAS — no lock — because population is ADVISORY: a
+  // thread that observes an advanced watermark before the winner's BulkFault
+  // finishes just demand-faults those pages exactly as before. Committed
+  // memory stays <= round_up(allocation high-water mark, unit): capacity that
+  // is never allocated is never touched.
+  clio::run::u64 populate_unit_ = 64ULL << 20;
+  std::atomic<clio::run::u64> populated_bytes_{0};
+  /** Bulk-fault [populated_bytes_, round_up(end, unit)) if end crosses it. */
+  void EnsurePopulated(clio::run::u64 end);
 
   // A lazily-allocated RAM page. A kPinned pool allocates page-locked host
   // memory through GpuApi (cudaMallocHost / hipHostMalloc / sycl::malloc_host)

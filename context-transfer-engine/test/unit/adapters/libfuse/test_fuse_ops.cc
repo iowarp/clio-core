@@ -54,7 +54,10 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 
-#include <unistd.h>  // _exit
+#include <cstdlib>   // _exit (declared in <unistd.h> on POSIX, <stdlib.h> on MSVC)
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +72,14 @@
 // here) — it needs a real mount + apptainer fd injection and is exercised by
 // the mount smoke test, not this unit test.
 #include "adapter/libfuse/fuse_cte.cc"  // NOLINT(build/include)
+
+#ifdef __APPLE__
+// macFUSE's public getattr callback fills a fuse_darwin_attr; these tests
+// assert struct-stat fields, so point them at the shared struct-stat
+// implementation both wrappers delegate to (the Darwin translation itself
+// is covered by the readdir filler path and the mount smoke).
+#define cte_fuse_getattr cte_fuse_getattr_stat
+#endif
 
 #include "simple_test.h"
 
@@ -132,11 +143,20 @@ static struct fuse_file_info MakeFi() {
   return fi;
 }
 
-// readdir collector: matches fuse_fill_dir_t.
+// readdir collector: matches the platform's fill-dir callback type
+// (fuse_fill_dir_t on Linux, WinFsp's fuse_fill_dir_t on Windows — both
+// spelled via the adapter's cte_* aliases — and macFUSE's
+// fuse_darwin_fill_dir_t, whose attr parameter is fuse_darwin_attr).
 static std::vector<std::string> *g_fill_names = nullptr;
+#ifdef __APPLE__
 static int CollectFiller(void *buf, const char *name,
-                         const struct stat *stbuf, off_t off,
+                         const struct fuse_darwin_attr *stbuf, cte_off_t off,
                          enum fuse_fill_dir_flags flags) {
+#else
+static int CollectFiller(void *buf, const char *name,
+                         const cte_stat_t *stbuf, cte_off_t off,
+                         enum fuse_fill_dir_flags flags) {
+#endif
   (void)buf;
   (void)stbuf;
   (void)off;
@@ -171,7 +191,7 @@ TEST_CASE("FUSE ops - init is idempotent", "[fuse][ops]") {
 
 TEST_CASE("FUSE ops - getattr root and missing", "[fuse][ops]") {
   Fx();
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr("/", &st, nullptr) == 0);
   REQUIRE(S_ISDIR(st.st_mode));
   REQUIRE(st.st_ino == 1);
@@ -208,10 +228,10 @@ TEST_CASE("FUSE ops - file create write read release", "[fuse][ops]") {
   REQUIRE(cte_fuse_read(path, buf.data(), 0, 0, &fi) == 0);
 
   // getattr on the regular file reports size + reg mode.
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
   REQUIRE(S_ISREG(st.st_mode));
-  REQUIRE(st.st_size == static_cast<off_t>(payload.size()));
+  REQUIRE(st.st_size == static_cast<cte_off_t>(payload.size()));
   REQUIRE(st.st_blocks > 0);
 
   REQUIRE(cte_fuse_release(path, &fi) == 0);
@@ -228,7 +248,7 @@ TEST_CASE("FUSE ops - file create write read release", "[fuse][ops]") {
   fi3.flags = O_TRUNC | O_WRONLY;
   REQUIRE(cte_fuse_open(path, &fi3) == 0);
   REQUIRE(cte_fuse_release(path, &fi3) == 0);
-  struct stat st_trunc;
+  cte_stat_t st_trunc;
   REQUIRE(cte_fuse_getattr(path, &st_trunc, nullptr) == 0);
   REQUIRE(st_trunc.st_size == 0);
 
@@ -277,7 +297,7 @@ TEST_CASE("FUSE ops - mkdir readdir rmdir", "[fuse][ops]") {
   REQUIRE(std::find(names.begin(), names.end(), "b.txt") != names.end());
 
   // getattr on the directory reports dir mode.
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr("/ops_dir", &st, nullptr) == 0);
   REQUIRE(S_ISDIR(st.st_mode));
 
@@ -299,7 +319,7 @@ TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
   REQUIRE(cte_fuse_release(path, &fi) == 0);
 
   REQUIRE(cte_fuse_chmod(path, 0755, nullptr) == 0);
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(path, &st, nullptr) == 0);
   REQUIRE((st.st_mode & 0777) == 0755);
 
@@ -311,8 +331,9 @@ TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
   REQUIRE(st.st_uid == 4242);
   REQUIRE(st.st_gid == 4343);
 
-  // utimens: explicit times.
-  struct timespec tv[2];
+  // utimens: explicit times (cte_timespec_t: plain timespec on POSIX,
+  // WinFsp's fuse_timespec on Windows).
+  cte_timespec_t tv[2];
   tv[0].tv_sec = 111111;
   tv[0].tv_nsec = 222;
   tv[1].tv_sec = 333333;
@@ -337,7 +358,7 @@ TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
   tv[1].tv_sec = -5;
   tv[1].tv_nsec = 500000000;
   REQUIRE(cte_fuse_utimens(path, tv, nullptr) == 0);
-  struct stat st_pre;
+  cte_stat_t st_pre;
   REQUIRE(cte_fuse_getattr(path, &st_pre, nullptr) == 0);
   REQUIRE(st_pre.st_mtim.tv_sec == -5);
   REQUIRE(st_pre.st_mtim.tv_nsec == 500000000);
@@ -370,7 +391,7 @@ TEST_CASE("FUSE ops - symlink readlink", "[fuse][ops]") {
   REQUIRE(cte_fuse_readlink(link, buf, 0) == -EINVAL);
 
   // getattr on the symlink reports S_IFLNK.
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(link, &st, nullptr) == 0);
   REQUIRE(S_ISLNK(st.st_mode));
 
@@ -411,7 +432,7 @@ TEST_CASE("FUSE ops - truncate", "[fuse][ops]") {
   REQUIRE(cte_fuse_release(path, &fi) == 0);
 
   REQUIRE(cte_fuse_truncate(path, 100, nullptr) == 0);
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(path, &st, nullptr) == 0);
   REQUIRE(st.st_size == 100);
 
@@ -439,7 +460,7 @@ TEST_CASE("FUSE ops - fallocate modes", "[fuse][ops]") {
 
   // mode 0: grow EOF to offset+length.
   REQUIRE(cte_fuse_fallocate(path, 0, 0, 4096, &fi) == 0);
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
   REQUIRE(st.st_size == 4096);
 
@@ -556,7 +577,7 @@ TEST_CASE("FUSE ops - rename", "[fuse][ops]") {
 
   // Plain rename a -> b.
   REQUIRE(cte_fuse_rename(a, b, 0) == 0);
-  struct stat st;
+  cte_stat_t st;
   REQUIRE(cte_fuse_getattr(b, &st, nullptr) == 0);
   REQUIRE(cte_fuse_getattr(a, &st, nullptr) == -ENOENT);
 
@@ -581,10 +602,13 @@ TEST_CASE("FUSE ops - rename", "[fuse][ops]") {
 
 TEST_CASE("FUSE ops - statfs", "[fuse][ops]") {
   Fx();
-  struct statvfs sv;
+  cte_statvfs_t sv;
   REQUIRE(cte_fuse_statfs("/", &sv) == 0);
   REQUIRE(sv.f_bsize == 4096);
+#ifndef __APPLE__
+  // Darwin's struct statfs (macFUSE's reporting type) has no f_namemax.
   REQUIRE(sv.f_namemax == 255);
+#endif
 }
 
 // gcov flush entry point, present only in coverage builds (the build wires

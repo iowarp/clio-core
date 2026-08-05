@@ -68,12 +68,19 @@ class SingletonBase {
   }
 
   static ctp::SpinLock &GetSpinLock() {
-    static char spinlock_data_[sizeof(ctp::SpinLock)] = {0};
+    // alignas: SpinLock holds ipc::atomic<u64> members needing 8-byte
+    // alignment. A bare char[] is only 1-byte aligned, so on aarch64 the
+    // atomic load/fetch_add instructions (LDADD/LDAXR) fault with SIGBUS when
+    // this storage lands off an 8-byte boundary (as it does inside the python
+    // extension .so). x86 tolerates the misalignment; ARM does not.
+    alignas(ctp::SpinLock) static char spinlock_data_[sizeof(ctp::SpinLock)] = {0};
     return *(ctp::SpinLock *)spinlock_data_;
   }
 
   static T *GetData() {
-    static char data_[sizeof(T)] = {0};
+    // alignas(T): a bare char[] is 1-byte aligned; if T contains atomics
+    // (e.g. SystemInfo) an unaligned atomic access SIGBUSes on aarch64.
+    alignas(T) static char data_[sizeof(T)] = {0};
     return (T *)data_;
   }
 
@@ -115,13 +122,20 @@ class CrossSingletonBase {
 
   CTP_INLINE_CROSS_FUN
   static ctp::SpinLock &GetSpinLock() {
-    static char spinlock_data_[sizeof(ctp::SpinLock)] = {0};
+    // alignas: SpinLock holds ipc::atomic<u64> members needing 8-byte
+    // alignment. A bare char[] is only 1-byte aligned, so on aarch64 the
+    // atomic load/fetch_add instructions (LDADD/LDAXR) fault with SIGBUS when
+    // this storage lands off an 8-byte boundary (as it does inside the python
+    // extension .so). x86 tolerates the misalignment; ARM does not.
+    alignas(ctp::SpinLock) static char spinlock_data_[sizeof(ctp::SpinLock)] = {0};
     return *(ctp::SpinLock *)spinlock_data_;
   }
 
   CTP_INLINE_CROSS_FUN
   static T *GetData() {
-    static char data_[sizeof(T)] = {0};
+    // alignas(T): a bare char[] is 1-byte aligned; if T contains atomics
+    // (e.g. SystemInfo) an unaligned atomic access SIGBUSes on aarch64.
+    alignas(T) static char data_[sizeof(T)] = {0};
     return (T *)data_;
   }
 

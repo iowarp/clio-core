@@ -88,12 +88,23 @@ class CTEBenchmark {
     if (a_.test_case == "Put") return RunGeneric(Mode::kPut);
     if (a_.test_case == "Get") return RunGeneric(Mode::kGet);
     if (a_.test_case == "PutGet") return RunGeneric(Mode::kPutGet);
-    HLOG(kError, "Unknown test case: {} (Put|Get|PutGet)", a_.test_case);
+    if (a_.test_case == "PutDefer") return RunGeneric(Mode::kPutDefer);
+    if (a_.test_case == "GetDefer") return RunGeneric(Mode::kGetDefer);
+    if (a_.test_case == "PutGetDefer") return RunGeneric(Mode::kPutGetDefer);
+    HLOG(kError,
+         "Unknown test case: {} "
+         "(Put|Get|PutGet|PutDefer|GetDefer|PutGetDefer)",
+         a_.test_case);
     return false;
   }
 
  private:
-  enum class Mode { kPut, kGet, kPutGet };
+  enum class Mode { kPut, kGet, kPutGet, kPutDefer, kGetDefer, kPutGetDefer };
+
+  static bool IsDeferMode(Mode m) {
+    return m == Mode::kPutDefer || m == Mode::kGetDefer ||
+           m == Mode::kPutGetDefer;
+  }
 
   void PrintInfo() {
     HLOG(kInfo, "=== CTE Core Benchmark ===");
@@ -130,9 +141,16 @@ class CTEBenchmark {
               std::vector<long long> &times, std::vector<clio_bench::u64> &ops) {
     auto *cte = CLIO_CTE_CLIENT;
     auto put_shm = CLIO_IPC->AllocateBuffer(a_.io_size);
-    auto get_shm = CLIO_IPC->AllocateBuffer(a_.io_size);
+    // One destination REGION PER IN-FLIGHT GET. With a single shared buffer
+    // the Get loop had to Wait() each op before issuing the next (concurrent
+    // reads would race on the destination), which silently serialized Gets and
+    // made --depth a no-op for reads: Get d64 measured ~= Get d1 while the
+    // properly-pipelined Puts scaled 5x. Per-slot regions let Gets batch
+    // exactly like Puts.
+    const size_t get_slots = a_.depth > 0 ? static_cast<size_t>(a_.depth) : 1;
+    auto get_shm = CLIO_IPC->AllocateBuffer(a_.io_size * get_slots);
     std::memset(put_shm.ptr_, static_cast<int>(tid & 0xFF), a_.io_size);
-    std::memset(get_shm.ptr_, 0, a_.io_size);  // pre-fault dest pages
+    std::memset(get_shm.ptr_, 0, a_.io_size * get_slots);  // pre-fault dest pages
     ctp::ipc::ShmPtr<> put_ptr = put_shm.shm_.template Cast<void>();
     ctp::ipc::ShmPtr<> get_ptr = get_shm.shm_.template Cast<void>();
 
@@ -189,10 +207,19 @@ class CTEBenchmark {
         }
       }
       if (mode == Mode::kGet || mode == Mode::kPutGet) {
+        // Pipeline exactly like the Put arm: submit `batch` async Gets (each
+        // into its OWN destination slot), then drain. This is what makes
+        // --depth meaningful for reads.
+        std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> gts;
+        gts.reserve(batch);
         for (long j = 0; j < batch; ++j) {
-          auto t = cte->AsyncGetBlob(
+          ctp::ipc::ShmPtr<> slot =
+              get_ptr + static_cast<size_t>(j) * a_.io_size;
+          gts.push_back(cte->AsyncGetBlob(
               tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
-              a_.io_size, 0, get_ptr, pq);
+              a_.io_size, 0, slot, pq));
+        }
+        for (auto &t : gts) {
           t.Wait();
           if (t->return_code_.load() != 0) {
             HLOG(kError, "[t{}] GetBlob rc={}", tid, t->return_code_.load());
@@ -210,8 +237,119 @@ class CTEBenchmark {
     CLIO_IPC->FreeBuffer(get_shm);
   }
 
+  /**
+   * Defer-API worker (issue #905 bench coverage of the #862/#878 registry):
+   * PutDefer streams AsyncPutBlobDefer from a PRIVATE buffer — the call owns
+   * a copy, so one buffer serves every op — with `--depth * io-size` as the
+   * registry pacing wall (making --depth the in-flight window, symmetric
+   * with the futures window of the plain modes). The timed region INCLUDES
+   * the final AwaitPutsUntilSpace(0) drain: deferred acks are early by
+   * design, and throughput that excludes the drain would count unfinished
+   * work. GetDefer issues AsyncGetBlobDefer into per-slot private buffers,
+   * batched exactly like the plain Get arm; each future's Wait() must run
+   * (client-mode private gets copy staged bytes in PostWait). PutGetDefer
+   * alternates put/get on the same key per op, so gets exercise the
+   * read-your-writes TryServe path against in-flight puts.
+   * Completion failures are counted, not thrown: the DeferErrorCount()
+   * delta across the run flags them.
+   */
+  void WorkerDefer(Mode mode, size_t tid, std::atomic<bool> &err,
+                   std::vector<long long> &times,
+                   std::vector<clio_bench::u64> &ops) {
+    auto *cte = CLIO_CTE_CLIENT;
+    std::vector<char> put_buf(a_.io_size, static_cast<char>(tid & 0xFF));
+    const size_t get_slots = a_.depth > 0 ? static_cast<size_t>(a_.depth) : 1;
+    std::vector<char> get_buf(a_.io_size * get_slots, 0);
+
+    std::string tag_name = "tag_n" + node_id_ + "_t" + std::to_string(tid);
+    auto tag_task = cte->AsyncGetOrCreateTag(tag_name);
+    tag_task.Wait();
+    clio::cte::core::TagId tag_id = tag_task->tag_id_;
+    auto blob_name = [&](long k) {
+      return "blob_t" + std::to_string(tid) + "_" + std::to_string(k);
+    };
+    const clio::run::PoolQuery pq = MakeQuery();
+    const clio::run::u64 inflight_wall =
+        static_cast<clio::run::u64>(a_.depth) * a_.io_size;
+    const clio_bench::u64 err_before = clio::cte::core::Client::DeferErrorCount();
+
+    // GetDefer needs the keyspace populated first (untimed, drained).
+    if (mode == Mode::kGetDefer) {
+      for (long k = 0; k < KeyspaceSize(); ++k) {
+        if (cte->AsyncPutBlobDefer(tag_id, blob_name(k), 0, a_.io_size,
+                                   put_buf.data(), 0.8f,
+                                   clio::cte::core::Context(), 0, pq,
+                                   inflight_wall) != 0) {
+          err.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+      clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    }
+
+    const bool timed = a_.time_limit_s > 0.0;
+    const long target = timed ? std::numeric_limits<long>::max() : a_.io_count;
+    clio_bench::u64 done = 0;
+    auto start = steady_clock::now();
+
+    for (long i = 0; i < target; i += a_.depth) {
+      if (err.load(std::memory_order_relaxed)) break;
+      if (timed && TimeUp(start, a_.time_limit_s)) break;
+      long batch = timed ? a_.depth : std::min<long>(a_.depth, target - i);
+
+      if (mode == Mode::kPutDefer || mode == Mode::kPutGetDefer) {
+        for (long j = 0; j < batch; ++j) {
+          int rc = cte->AsyncPutBlobDefer(
+              tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
+              a_.io_size, put_buf.data(), 0.8f, clio::cte::core::Context(), 0,
+              pq, inflight_wall);
+          if (rc != 0) {
+            HLOG(kError, "[t{}] AsyncPutBlobDefer rc={}", tid, rc);
+            err.store(true, std::memory_order_relaxed);
+            break;
+          }
+        }
+      }
+      if (mode == Mode::kGetDefer || mode == Mode::kPutGetDefer) {
+        std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> gts;
+        gts.reserve(batch);
+        for (long j = 0; j < batch; ++j) {
+          char *slot = get_buf.data() + static_cast<size_t>(j) * a_.io_size;
+          gts.push_back(cte->AsyncGetBlobDefer(
+              tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
+              a_.io_size, slot, 0, pq));
+        }
+        for (auto &t : gts) {
+          if (t.IsNull()) continue;
+          t.Wait();
+          if (t->return_code_.load() != 0) {
+            HLOG(kError, "[t{}] GetBlobDefer rc={}", tid,
+                 t->return_code_.load());
+            err.store(true, std::memory_order_relaxed);
+          }
+        }
+      }
+      done += static_cast<clio_bench::u64>(batch);
+    }
+
+    // Drain INSIDE the timed region — deferred acks are early by design;
+    // undrained throughput would count work the runtime hasn't done yet.
+    if (mode == Mode::kPutDefer || mode == Mode::kPutGetDefer) {
+      clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    }
+    times[tid] =
+        duration_cast<microseconds>(steady_clock::now() - start).count();
+    ops[tid] = done;
+
+    if (clio::cte::core::Client::DeferErrorCount() != err_before) {
+      HLOG(kError, "[t{}] deferred put completion failures: {}", tid,
+           clio::cte::core::Client::DeferErrorCount() - err_before);
+      err.store(true, std::memory_order_relaxed);
+    }
+  }
+
   bool RunGeneric(Mode mode) {
-    if (mode == Mode::kGet) {
+    if (mode == Mode::kGet || mode == Mode::kGetDefer) {
       HLOG(kInfo, "Populating {} keys/thread for Get...", KeyspaceSize());
     }
     std::vector<std::thread> threads;
@@ -219,8 +357,13 @@ class CTEBenchmark {
     std::vector<clio_bench::u64> ops(a_.threads);
     std::atomic<bool> err{false};
     for (size_t i = 0; i < a_.threads; ++i) {
-      threads.emplace_back(&CTEBenchmark::Worker, this, mode, i,
-                           std::ref(err), std::ref(times), std::ref(ops));
+      if (IsDeferMode(mode)) {
+        threads.emplace_back(&CTEBenchmark::WorkerDefer, this, mode, i,
+                             std::ref(err), std::ref(times), std::ref(ops));
+      } else {
+        threads.emplace_back(&CTEBenchmark::Worker, this, mode, i,
+                             std::ref(err), std::ref(times), std::ref(ops));
+      }
     }
     for (auto &t : threads) t.join();
     clio_bench::PrintResults(a_.test_case, a_, times, ops);
