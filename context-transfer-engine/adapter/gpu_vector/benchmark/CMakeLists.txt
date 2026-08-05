@@ -109,6 +109,11 @@ if(CLIO_CORE_ENABLE_CUDA)
     # End-to-end: assimilate weights via CAE -> map tag with vector -> verify.
     # The CAE assimilation call lives in a plain-C++ static lib because the CAE
     # task headers do not compile under nvcc; the CUDA exe links it.
+    #
+    # Gated on the CAE client target actually existing: CLIO_CORE_ENABLE_CAE is
+    # OFF in the CUDA/LLM presets, and declaring these targets unconditionally
+    # made the link fail with `cannot find -lclio_cae_core_client`.
+    if(TARGET clio_cae_core_client)
     add_library(clio_mw_assimilate_helper STATIC clio_mw_assimilate.cc)
     target_include_directories(clio_mw_assimilate_helper PRIVATE
         ${CMAKE_SOURCE_DIR}/context-runtime/include
@@ -145,6 +150,11 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_model_weights_roundtrip RUNTIME DESTINATION bin)
+    else()
+        message(STATUS "CAE disabled - skipping clio_model_weights_roundtrip "
+                       "(needs clio_cae_core_client for weight assimilation)")
+    endif()
+
     # Gray-Scott async-compressed PutBlob bench (production-vector-shaped):
     # ships each per-block snapshot to storage via a CLIO compressed PutBlob.
     # Needs the compressor chimod, so only built when compression is enabled.

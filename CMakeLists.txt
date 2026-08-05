@@ -555,8 +555,36 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         HINTS ${CLIO_ZFP_SYCL_ROOT}/include
         NO_DEFAULT_PATH)
     if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
-        message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
-        set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+        # zfp and nvcomp cannot coexist in one translation unit: nvcomp/ans.h
+        # declares an UNSCOPED, global enum `nvcompANSDataType_t { uint8,
+        # float16 }` while zfp's types.h declares a global `typedef
+        # std::uint8_t uint8`. compress_factory.h pulls in both nvcomp.h and
+        # sycl_zfp.h, and ctp::compress propagates their include dirs to every
+        # consumer, so with both enabled EVERY compression-consuming TU fails
+        # with `"uint8" has already been declared in the current scope`.
+        # Neither order helps — each is a redeclaration of the other.
+        #
+        # They also target different hardware (zfp-sycl is the Intel-XPU
+        # compressor; nvcomp is NVIDIA-only), so on a CUDA build nvcomp wins.
+        # Set CLIO_CTP_FORCE_ZFP_SYCL=ON to invert the preference; enabling
+        # both is not buildable until sycl_zfp.h stops including <zfp.h> in a
+        # public header (PIMPL would fix it properly).
+        option(CLIO_CTP_FORCE_ZFP_SYCL
+            "Prefer zfp-sycl over nvcomp when both are present (they conflict)" OFF)
+        if(CLIO_CTP_ENABLE_NVCOMP AND NOT CLIO_CTP_FORCE_ZFP_SYCL)
+            message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY}, but nvcomp is "
+                           "enabled and their headers both define a global `uint8` "
+                           "- zfp-sycl disabled (set CLIO_CTP_FORCE_ZFP_SYCL=ON to "
+                           "prefer zfp-sycl and disable nvcomp instead)")
+        else()
+            if(CLIO_CTP_ENABLE_NVCOMP)
+                message(STATUS "CLIO_CTP_FORCE_ZFP_SYCL=ON - disabling nvcomp so "
+                               "zfp-sycl can be used (conflicting global `uint8`)")
+                set(CLIO_CTP_ENABLE_NVCOMP OFF)
+            endif()
+            message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
+            set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+        endif()
     else()
         message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
     endif()

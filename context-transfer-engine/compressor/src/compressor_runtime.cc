@@ -1693,7 +1693,14 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   if (shm.IsNull()) {
     return false;
   }
-  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size);
+  // Record the EXACT compressed payload size. Omitting it (the 4th arg
+  // defaults to 0) makes every interposer-written blob look "legacy" to
+  // DecompressGetBlobImpl, which then falls back to the over-allocated fetch
+  // size as the frame length — precisely the trailing-garbage case that
+  // compressed_size_ was added to fix, so zstd/lz4 reads fail. The two older
+  // compress paths (Compress, CompressPutBlobImpl) already pass it.
+  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size,
+                           compressed_size);
   std::memcpy(shm.ptr_, &header, header_size);
   std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
@@ -1751,6 +1758,25 @@ clio::run::TaskResume Runtime::PutBlob(
   CLIO_TASK_BODY_BEGIN
   {
     clio::cte::core::Context &ctx = task->context_;
+    // Operator pin: CLIO_CTE_COMPRESS_LIB must govern EVERY compression path,
+    // including this interposed one. Runtime::Compress applies the same pin,
+    // but the interposer never routes through Compress/DynamicSchedule — it
+    // calls CompressIntoShm directly — so without this the pin silently did
+    // not reach interposed puts. That mattered: clients that own no codec
+    // policy (the gpu_vector builds its page tasks with a default Context, so
+    // compress_lib_ == 0) fell through the gate below and stored every page
+    // RAW while still reporting success, which is exactly the "silently
+    // passed data through" failure the compressed gpu_vector tests exist to
+    // catch. Applied before the gate so partial/vectored/replica writes still
+    // clear the codec and store raw.
+    {
+      int pin_preset = 2;
+      int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) {
+        ctx.compress_lib_ = pin_wire;
+        ctx.compress_preset_ = pin_preset;
+      }
+    }
     // Compression is defined for WHOLE-BLOB writes only: a partial or
     // vectored write cannot patch a compressed stream, so those (and
     // replica-addressed or emulated puts) forward with the codec request

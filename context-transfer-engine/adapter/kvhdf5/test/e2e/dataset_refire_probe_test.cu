@@ -53,14 +53,19 @@
 #endif
 #include "cte_env.h"
 
-using kvhdf5::byte_t;
+// NOTE: deliberately NOT named `byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which context-runtime
+// headers include) declares `typedef uint8_t byte_t;` at GLOBAL scope. Since
+// kvhdf5::byte_t is cuda::std::byte, a global `using kvhdf5::byte_t;` here is a
+// conflicting redeclaration and every one of these TUs fails to compile.
+using kv_byte_t = kvhdf5::byte_t;  // raw blob-payload bytes
 
 namespace {
 
 // chunk byte i for a given seed -> (seed ^ i) & 0xFF. Distinct seed per iteration
 // so a stale buffer/blob MISMATCHES rather than silently coinciding.
-constexpr byte_t RefirePattern(unsigned seed, uint64_t i) {
-    return static_cast<byte_t>((seed ^ static_cast<unsigned>(i)) & 0xFFu);
+constexpr kv_byte_t RefirePattern(unsigned seed, uint64_t i) {
+    return static_cast<kv_byte_t>((seed ^ static_cast<unsigned>(i)) & 0xFFu);
 }
 
 }  // namespace
@@ -70,10 +75,10 @@ constexpr byte_t RefirePattern(unsigned seed, uint64_t i) {
 __global__ void RefireFillWriteKernel(kvhdf5::GpuDatasetHandle h, unsigned seed) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    byte_t* dst = h.Data(0);
+    kv_byte_t* dst = h.Data(0);
     uint64_t n = h.Size(0);
     for (uint64_t i = threadIdx.x; i < n; i += blockDim.x)
-        dst[i] = static_cast<byte_t>((seed ^ static_cast<unsigned>(i)) & 0xFFu);
+        dst[i] = static_cast<kv_byte_t>((seed ^ static_cast<unsigned>(i)) & 0xFFu);
     __threadfence_system();
     __syncthreads();
     h.Write(0);
@@ -91,7 +96,7 @@ clio::cte::core::TagId MakeTag(const char* name) {
     return t->tag_id_;
 }
 
-std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
+std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
                                  uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -101,7 +106,7 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& 
                                            clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }

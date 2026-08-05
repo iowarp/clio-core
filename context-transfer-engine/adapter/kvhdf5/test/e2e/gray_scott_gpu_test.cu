@@ -41,7 +41,12 @@
 #endif
 #include "cte_env.h"
 
-using kvhdf5::byte_t;  // raw blob-payload bytes (codebase convention)
+// NOTE: deliberately NOT named `byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which context-runtime
+// headers include) declares `typedef uint8_t byte_t;` at GLOBAL scope. Since
+// kvhdf5::byte_t is cuda::std::byte, a global `using kvhdf5::byte_t;` here is a
+// conflicting redeclaration and every one of these TUs fails to compile.
+using kv_byte_t = kvhdf5::byte_t;  // raw blob-payload bytes
 
 namespace {
 
@@ -87,8 +92,8 @@ __global__ void GsStepKernel(const float *u, const float *v, float *un,
 __global__ void GsSnapKernel(kvhdf5::GpuDatasetHandle h, const float *src) {
   CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
   (void)g_ipc_manager;
-  const byte_t *s = reinterpret_cast<const byte_t *>(src);
-  byte_t *dst = h.Data();
+  const kv_byte_t *s = reinterpret_cast<const kv_byte_t *>(src);
+  kv_byte_t *dst = h.Data();
   for (uint64_t i = threadIdx.x; i < h.Size(); i += blockDim.x) dst[i] = s[i];
   __threadfence_system();
   __syncthreads();
@@ -178,14 +183,14 @@ TEST_CASE("GPU Gray-Scott end-to-end snapshots via dataset handle",
   REQUIRE(snaps.size() == static_cast<size_t>(kSteps / kSnap));
 
   // ---- Read each snapshot back via GetBlob and verify. ----
-  std::vector<byte_t> zeros(kBytes);
+  std::vector<kv_byte_t> zeros(kBytes);
   for (size_t s = 0; s < snaps.size(); ++s) {
-    byte_t *buf = snaps[s].DeviceData();
+    kv_byte_t *buf = snaps[s].DeviceData();
     ctp::GpuApi::Memcpy(buf, zeros.data(), kBytes);  // clobber so readback is real
     GsReadKernel<<<1, 32>>>(snaps[s].Handle());
     ctp::GpuApi::Synchronize();
 
-    std::vector<byte_t> back(kBytes);
+    std::vector<kv_byte_t> back(kBytes);
     ctp::GpuApi::Memcpy(back.data(), buf, kBytes);
     if (std::memcmp(back.data(), expected[s].data(), kBytes) != 0)
       std::fprintf(stderr, "[verify] snapshot %zu mismatch\n", s);

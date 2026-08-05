@@ -36,6 +36,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_ctp/util/singleton.h>
+#include <clio_ctp/util/gpu_api.h>  // ctp::IsDevicePointer (host-copy guards)
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/blob_batch.h>
@@ -220,6 +221,15 @@ class Client : public clio::run::ContainerClient {
   bool TryReadBlobShm(const TagId &tag_id, const std::string &blob_name,
                       char *out, size_t size, size_t offset = 0) {
     if (shm_root_ == nullptr || out == nullptr || size == 0) {
+      return false;
+    }
+    // `out` may be DEVICE memory: the gpu_vector faults pages directly into an
+    // HBM slot, so AsyncGetBlob is routinely handed a device destination. This
+    // fast path copies with a plain host std::memcpy below, which segfaults on
+    // such a pointer — the crash behind the gpu_vector oversubscribe/prefetch
+    // failures and the llama.cpp weight-streaming SIGSEGV. Fall back to RPC,
+    // whose bdev transports are device-aware.
+    if (ctp::IsDevicePointer(out)) {
       return false;
     }
     ShmBlobRecord rec;
