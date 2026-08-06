@@ -1989,7 +1989,15 @@ clio::run::TaskResume Runtime::GetBlob(
             region_ok = false;
             return false;
           }
-          std::memcpy(dst.ptr_, scratch.ptr_ + r.blob_off_, n);
+          // The vector's fault path hands a DEVICE destination (its HBM
+          // slot); a plain memcpy segfaults on it. This was the compressed
+          // resident-warmup crash: FaultAllSync -> GetBlob -> here with a
+          // device region pointer.
+          if (ctp::IsDevicePointer(dst.ptr_)) {
+            ctp::DeviceAwareMemcpy(dst.ptr_, scratch.ptr_ + r.blob_off_, n);
+          } else {
+            std::memcpy(dst.ptr_, scratch.ptr_ + r.blob_off_, n);
+          }
           return true;
         });
     CLIO_IPC->FreeBuffer(scratch);
