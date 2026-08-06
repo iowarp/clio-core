@@ -395,6 +395,113 @@ TEST_CASE("gpu_vector: grid far wider than nblocks faults safely",
 }
 
 
+/** The vector-owned out-of-core tiers, exercised as VECTOR CONTRACT rather
+ *  than indirectly through the llama integration: the DRAM mirror is built
+ *  through the CTE and byte-exact; PinnedSpan admits permanent spans on
+ *  first touch and slab spans on second touch (two-touch); StageTransient
+ *  hands out ring slices and CopySpan fills them -- all on the vector's own
+ *  copy stream. */
+TEST_CASE("gpu_vector: host mirror + span tiers are vector contract",
+          "[gpu_vector][mirror][tiers]") {
+  EnsureRuntime();
+  const std::string tag = "gvm_tiers";
+  constexpr clio::run::u64 kPages = 8;
+  constexpr clio::run::u64 kTotal = kPages * kPageSizeBytes;
+  gv::Vector<uint8_t> vec(tag, /*nblocks=*/1, /*gpu_id=*/0,
+                          /*gpu_pages_per_block=*/2,
+                          /*host_pages_per_block=*/0, kPageSizeBytes,
+                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*manager_threads_per_block=*/32,
+                          /*allow_cold_miss_fault=*/true,
+                          /*storage_pool_id=*/clio::run::PoolId(0, 0),
+                          /*family_pages=*/0,
+                          /*host_namer=*/nullptr,
+                          /*flat_layout=*/true);
+  // Seed the FLAT blob "w" through the CTE in 4 MiB offset chunks.
+  {
+    auto *cte = CLIO_CTE_CLIENT;
+    constexpr clio::run::u64 kChunk = 4ull << 20;
+    for (clio::run::u64 off = 0; off < kTotal; off += kChunk) {
+      auto buf = CLIO_CPU_IPC->AllocateBuffer(kChunk);
+      auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
+      for (clio::run::u64 j = 0; j < kChunk; ++j) {
+        bytes[j] = PatternAt(off + j);
+      }
+      auto task = cte->AsyncPutBlob(vec.TagId(), "w", off, kChunk,
+                                    buf.shm_.template Cast<void>(), 1.0f,
+                                    clio::cte::core::Context(), 0);
+      task.Wait();
+      REQUIRE(task->return_code_ == 0);
+    }
+  }
+  // DRAM mirror: built through CTE GetBlob, byte-exact against the seed.
+  REQUIRE(vec.BuildHostMirror(kTotal));
+  const uint8_t *mirror = vec.HostMirror();
+  REQUIRE(mirror != nullptr);
+  REQUIRE(vec.MirrorBytes() == kTotal);
+  {
+    clio::run::u64 bad = 0;
+    for (clio::run::u64 j = 0; j < kTotal; ++j) {
+      if (mirror[j] != PatternAt(j)) ++bad;
+    }
+    printf("  [mirror] %llu bytes, %llu mismatches (0 expected)\n",
+           (unsigned long long) kTotal, (unsigned long long) bad);
+    REQUIRE(bad == 0);
+  }
+  REQUIRE(vec.ReserveSpanCaches(/*ring_bytes=*/64ull << 20,
+                                /*vram_reserve=*/1ull << 30,
+                                /*slab_cap_max=*/256ull << 20));
+  auto drain = [&]() {
+    cudaStreamSynchronize((cudaStream_t) vec.CopyStream());
+  };
+  auto check_span = [&](const uint8_t *dev, clio::run::u64 off,
+                        clio::run::u64 len) {
+    std::vector<uint8_t> host(len);
+    drain();
+    REQUIRE(cudaMemcpy(host.data(), dev, len,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    clio::run::u64 bad = 0;
+    for (clio::run::u64 j = 0; j < len; ++j) {
+      if (host[j] != PatternAt(off + j)) ++bad;
+    }
+    REQUIRE(bad == 0);
+  };
+  const clio::run::u64 kSpan = 1ull << 20;
+  // Two-touch slab admission: first touch declines, second admits, third hits
+  // the SAME pointer.
+  bool copied = false;
+  REQUIRE(vec.PinnedSpan(0, kSpan, /*permanent=*/false, &copied) == nullptr);
+  const uint8_t *sp = vec.PinnedSpan(0, kSpan, false, &copied);
+  REQUIRE(sp != nullptr);
+  REQUIRE(copied);
+  check_span(sp, 0, kSpan);
+  REQUIRE(vec.PinnedSpan(0, kSpan, false, &copied) == sp);
+  REQUIRE(!copied);
+  // Permanent admission: first touch admits.
+  const uint8_t *pp = vec.PinnedSpan(3 * kSpan, kSpan, /*permanent=*/true,
+                                     &copied);
+  REQUIRE(pp != nullptr);
+  REQUIRE(copied);
+  check_span(pp, 3 * kSpan, kSpan);
+  // Transient ring: slices come back non-null across a wrap and CopySpan
+  // fills them from the mirror.
+  for (int i = 0; i < 80; ++i) {   // 80 x 1 MiB through a 64 MiB ring: wraps
+    uint8_t *tr = vec.StageTransient(kSpan, /*main_stream=*/nullptr);
+    REQUIRE(tr != nullptr);
+    REQUIRE(vec.CopySpan(tr, 5 * kSpan, kSpan));
+    if (i == 0 || i == 79) check_span(tr, 5 * kSpan, kSpan);
+  }
+  clio::run::u64 hits = 0, misses = 0, slab_used = 0, stat_b = 0;
+  vec.SpanStats(&hits, &misses, &slab_used, &stat_b);
+  printf("  [tiers] hits=%llu misses=%llu slab=%llu static=%llu\n",
+         (unsigned long long) hits, (unsigned long long) misses,
+         (unsigned long long) slab_used, (unsigned long long) stat_b);
+  REQUIRE(hits == 1);
+  REQUIRE(misses == 3);            // decline, admit, permanent-admit
+  REQUIRE(slab_used >= kSpan);
+  REQUIRE(stat_b == kSpan);
+}
+
 SIMPLE_TEST_MAIN()
 
 #endif  // !CTP_IS_DEVICE_PASS
