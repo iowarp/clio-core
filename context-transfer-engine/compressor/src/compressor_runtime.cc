@@ -1216,7 +1216,8 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
     // Per-page name: what the core PutBlob handler composes from gpu_page_idx_.
     std::string name = CompressorBlobName(*task);
     if (task->gpu_family_idx_ != PutT::kNoFamilyIdx) {
-      name += "_b" + std::to_string(task->gpu_family_idx_);
+      name += (name.empty() ? "b" : "_b") +
+              std::to_string(task->gpu_family_idx_);
     }
     if (task->gpu_page_idx_ != PutT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
@@ -1329,8 +1330,14 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
 
     std::string name = CompressorBlobName(*task);
+    // Same bare-stem rule as the core: page blobs carry no tag prefix (the
+    // tag travels as tag_id_), so an EMPTY stem composes "b<f>_pi<p>" with no
+    // leading underscore. Composing "_b..." here made every device fault look
+    // up a name the store never wrote -- pages came back rc=1 and the kernel
+    // computed on zeros (the '<unused32>' garbage on the compressed OOC path).
+    const bool bare_name = name.empty();
     if (task->gpu_family_idx_ != GetT::kNoFamilyIdx) {
-      name += "_b" + std::to_string(task->gpu_family_idx_);
+      name += (bare_name ? "b" : "_b") + std::to_string(task->gpu_family_idx_);
     }
     if (task->gpu_page_idx_ != GetT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
