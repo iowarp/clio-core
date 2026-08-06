@@ -41,6 +41,7 @@
 #include <memory>
 #include <string>
 #include "compress.h"
+#include "quant.h"
 #include "lossless_modes.h"
 #include "snappy.h"
 #include "blosc.h"
@@ -55,6 +56,9 @@
 
 #if CTP_ENABLE_ZFP_SYCL
 #include "sycl_zfp.h"
+#endif
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
 #endif
 
 #if CTP_ENABLE_CUSZ
@@ -200,6 +204,19 @@ class CompressionFactory {
   }
 
   /**
+   * Reverse of NameForWireId: resolve a canonical compressor name to its wire
+   * ID (compress_lib_). Returns -1 if the name is unknown, so callers can tell
+   * "not found" apart from wire ID 0.
+   *
+   * @param name Canonical lowercase library name (e.g. "nvcomp-lz4")
+   * @return Wire ID, or -1 if unknown
+   */
+  static int WireIdForName(const std::string& name) {
+    const CompressorInfo* info = FindByName(name);
+    return info ? info->wire_id : -1;
+  }
+
+  /**
    * Get string name for preset.
    *
    * @param preset Compression preset
@@ -244,6 +261,18 @@ class CompressionFactory {
 
   // Construction helpers for single-mode and backend-guarded compressors.
   // (Multi-mode lossless compressors use CreateLossless<T> directly.)
+  static std::unique_ptr<Compressor> MakeQuantQ4K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ4_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ5K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ5_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ6K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ6_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ8_0(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ8_0);
+  }
   static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
     return std::make_unique<Snappy>();
   }
@@ -391,6 +420,7 @@ class CompressionFactory {
 #endif
   }
 
+
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
    * constexpr std::array -> constant-initialized static data: no heap allocation
@@ -422,6 +452,15 @@ class CompressionFactory {
         CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
         CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
+        // Block-quantized (GGUF k-quant) decode transform. Not a compressor:
+        // the data arrives already quantized, so this never quantizes and
+        // never loses precision -- it stores the compact blocks and expands
+        // them on the way out, which is what lets the kHbm tier hold ~8x more
+        // model per byte than the F32 form.
+        CompressorInfo{"quant-q4k",       21, 23, true,  &MakeQuantQ4K},
+        CompressorInfo{"quant-q5k",       22, 24, true,  &MakeQuantQ5K},
+        CompressorInfo{"quant-q6k",       23, 25, true,  &MakeQuantQ6K},
+        CompressorInfo{"quant-q8_0",      24, 26, true,  &MakeQuantQ8_0},
     };
     return kRegistry;
   }

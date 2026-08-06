@@ -55,6 +55,20 @@ struct VectorStats {
   unsigned long long phase4_prefetches;   /**< prefetch slot claims succeeded */
   unsigned long long phase4_skip_cached;  /**< already cached when popped */
   unsigned long long phase4_skip_nofree;  /**< no DRAM slot acquirable */
+  /** GetBlob completions the DEVICE saw with a non-zero return code.
+   *  DrainGet waited on the future and discarded the code, so a failing
+   *  fault left a zero-filled page and no diagnostic anywhere. */
+  unsigned long long fault_get_fail;
+  unsigned long long fault_get_ok;
+  /** Total GPU clock ticks spent inside DrainGet waiting for a fault, and the
+   *  number of waits. Divide to get per-fault latency: scheduling changes
+   *  cannot help if the round trip itself dominates. */
+  unsigned long long fault_wait_ticks;
+  unsigned long long fault_wait_count;
+  /** Last non-zero GetBlob return code the device saw, plus the page it was
+   *  fetching. Counting failures was not enough to name the error. */
+  unsigned long long fault_get_last_rc;
+  unsigned long long fault_get_last_page;
   unsigned long long resolve_spin_iters;  /**< nanosleep spins while waiting
                                             *  for the manager to populate
                                             *  a page (cold-miss fault off) */
@@ -87,6 +101,15 @@ struct DeviceViewBase {
   /** Tag the kernel writes blobs against. Set once at Vector ctor. */
   clio::cte::core::TagId tag_id;
   clio::run::u32 nblocks;
+  /** 1 = model stored as ONE flat blob "w"; pages addressed by OFFSET
+   *  (gp * page_size_bytes) instead of per-page blob names. Makes k-page
+   *  batch faults expressible with the existing Pod task. */
+  clio::run::u32 flat_layout;
+  /** Pinned-host mirror of the whole flat blob (UVA device-readable), or
+   *  nullptr. The Vector's DRAM tier for out-of-core flat models: reads
+   *  that miss every device tier stream from here over PCIe. Built by
+   *  Vector::BuildHostMirror(), which fills it THROUGH the CTE. */
+  const unsigned char *host_mirror;
   clio::run::u32 gpu_pages_per_block;   /**< HBM cache slots per block. */
   clio::run::u32 host_pages_per_block;  /**< DRAM cache slots per block. 0 ⇒ legacy. */
   clio::run::u64 page_size_bytes;
@@ -99,7 +122,23 @@ struct DeviceViewBase {
   bool allow_cold_miss_fault;
   /** Optional pinned-host counters block; nullptr means disabled. */
   VectorStats *stats;
+  /**
+   * DEFAULT page->blob-family policy: family(pg) = pg / fam_ppb, matching the
+   * CAE ModelWeightsAssimilator's sharding (pages_per_block =
+   * ceil(num_pages/nblocks)). 0 means "everything in family 0" (the naming
+   * every self-consistent single-family writer uses). The composed name is
+   * "<tag>_b<family>_pi<page>" — the family travels in the task's
+   * gpu_family_idx_ so per-slot task names stay family-invariant. User
+   * kernels may override per-fault via the FamFn lambda on dev::vector.
+   */
+  clio::run::u64 fam_ppb;
 };
+
+/** Default family policy: derived from the view's fam_ppb (see above). */
+CTP_INLINE_CROSS_FUN clio::run::u32 FamilyOf(const DeviceViewBase &v,
+                                             clio::run::u64 pg) {
+  return v.fam_ppb ? static_cast<clio::run::u32>(pg / v.fam_ppb) : 0u;
+}
 
 /** Total slots per block across both tiers. */
 CTP_INLINE_CROSS_FUN clio::run::u32 TotalPagesPerBlock(const DeviceViewBase &v) {

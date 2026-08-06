@@ -1558,8 +1558,24 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // routed this put through a per-(block, page) sub-blob — keeps cache
     // pages from colliding on a shared blob name. Sentinel kNoPageIdx
     // means "no suffix", which is the path non-GPU clients take.
-    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
-      blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    // The per-page "_pi<idx>" suffix is exclusively a gpu_vector device concept,
+    // carried only by PodPutBlobTask (set from FlushPage/FaultPage kernels). The
+    // regular PutBlobTask has no way to set gpu_page_idx_ through the public API,
+    // so it must never grow a suffix here — and MUST NOT, because a regular put
+    // forwarded through the compressor chimod can arrive with a stale
+    // gpu_page_idx_ of 0 (the server->server LocalSerialize path does not
+    // reliably round-trip this field for PutBlobTask). Appending "_pi0" in that
+    // case stored the blob under "<name>_pi0" while the matching GetBlob looked
+    // up "<name>", silently losing every compressed page. Gate the suffix on the
+    // Pod task type so only genuine device page I/O is affected.
+    if constexpr (std::is_same_v<TaskT, PodPutBlobTask>) {
+      if (task->gpu_family_idx_ != TaskT::kNoFamilyIdx) {
+        blob_name += (blob_name.empty() ? "b" : "_b") +
+                     std::to_string(task->gpu_family_idx_);
+      }
+      if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
+        blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
+      }
     }
     clio::run::u64 offset = task->offset_;
     clio::run::u64 size = task->size_;
@@ -2322,8 +2338,19 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
     std::string blob_name = task->blob_name_.str();
-    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
-      blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    // Symmetric with PutBlobImpl: only the device Pod task type carries a real
+    // per-page index. A regular GetBlobTask (including every compressor-forwarded
+    // read) must look up the blob name verbatim, never appending "_pi<idx>".
+    if constexpr (std::is_same_v<TaskT, PodGetBlobTask>) {
+      // An EMPTY stem means the page name stands alone ("b<fam>_pi<page>");
+      // a non-empty stem keeps the legacy "<stem>_b<fam>_pi<page>" form.
+      const bool bare = blob_name.empty();
+      if (task->gpu_family_idx_ != TaskT::kNoFamilyIdx) {
+        blob_name += (bare ? "b" : "_b") + std::to_string(task->gpu_family_idx_);
+      }
+      if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
+        blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
+      }
     }
     clio::run::u64 offset = task->offset_;
     clio::run::u64 size = task->size_;

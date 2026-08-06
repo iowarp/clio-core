@@ -140,6 +140,7 @@ class MemBdevTransport : public BdevTransport {
   struct RamPage {
     char* data = nullptr;
     bool pinned = false;
+    bool device = false;  // kHbm: `data` is GPU device memory (GpuApi::Malloc)
   };
 
   mutable std::mutex ram_pages_mu_;

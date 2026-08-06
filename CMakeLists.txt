@@ -555,8 +555,36 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         HINTS ${CLIO_ZFP_SYCL_ROOT}/include
         NO_DEFAULT_PATH)
     if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
-        message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
-        set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+        # zfp and nvcomp cannot coexist in one translation unit: nvcomp/ans.h
+        # declares an UNSCOPED, global enum `nvcompANSDataType_t { uint8,
+        # float16 }` while zfp's types.h declares a global `typedef
+        # std::uint8_t uint8`. compress_factory.h pulls in both nvcomp.h and
+        # sycl_zfp.h, and ctp::compress propagates their include dirs to every
+        # consumer, so with both enabled EVERY compression-consuming TU fails
+        # with `"uint8" has already been declared in the current scope`.
+        # Neither order helps — each is a redeclaration of the other.
+        #
+        # They also target different hardware (zfp-sycl is the Intel-XPU
+        # compressor; nvcomp is NVIDIA-only), so on a CUDA build nvcomp wins.
+        # Set CLIO_CTP_FORCE_ZFP_SYCL=ON to invert the preference; enabling
+        # both is not buildable until sycl_zfp.h stops including <zfp.h> in a
+        # public header (PIMPL would fix it properly).
+        option(CLIO_CTP_FORCE_ZFP_SYCL
+            "Prefer zfp-sycl over nvcomp when both are present (they conflict)" OFF)
+        if(CLIO_CTP_ENABLE_NVCOMP AND NOT CLIO_CTP_FORCE_ZFP_SYCL)
+            message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY}, but nvcomp is "
+                           "enabled and their headers both define a global `uint8` "
+                           "- zfp-sycl disabled (set CLIO_CTP_FORCE_ZFP_SYCL=ON to "
+                           "prefer zfp-sycl and disable nvcomp instead)")
+        else()
+            if(CLIO_CTP_ENABLE_NVCOMP)
+                message(STATUS "CLIO_CTP_FORCE_ZFP_SYCL=ON - disabling nvcomp so "
+                               "zfp-sycl can be used (conflicting global `uint8`)")
+                set(CLIO_CTP_ENABLE_NVCOMP OFF)
+            endif()
+            message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
+            set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+        endif()
     else()
         message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
     endif()
@@ -630,8 +658,13 @@ if(CLIO_CTE_ENABLE_COMPRESS)
             set(CLIO_CTP_ENABLE_CUSZP ON)
             message(STATUS "found cuSZp via CMake config (GPU lossy compression)")
         else()
-            find_path(cuszp_INCLUDE_DIR cuSZp.h)
-            find_library(cuszp_LIBRARY NAMES cuSZp)
+            # CLIO_CUSZP_ROOT points at a cuSZp prefix find_package cannot see
+            # (e.g. a container-local build); searched before the default paths.
+            set(CLIO_CUSZP_ROOT "" CACHE PATH
+                "Install prefix of cuSZp (headers in include/, lib in lib/ or lib64/)")
+            find_path(cuszp_INCLUDE_DIR cuSZp.h HINTS ${CLIO_CUSZP_ROOT}/include)
+            find_library(cuszp_LIBRARY NAMES cuSZp
+                HINTS ${CLIO_CUSZP_ROOT}/lib ${CLIO_CUSZP_ROOT}/lib64)
             if(cuszp_INCLUDE_DIR AND cuszp_LIBRARY)
                 set(cuszp_LIBRARIES ${cuszp_LIBRARY})
                 set(cuszp_INCLUDE_DIRS ${cuszp_INCLUDE_DIR})
@@ -1125,6 +1158,23 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # CUDA: allow constexpr __host__ functions in __host__ __device__ contexts
     if(CLIO_CORE_ENABLE_CUDA)
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+
+        # Enable CUDA at the TOP-LEVEL scope, before any component subdirectory.
+        # Previously CUDA was enabled lazily inside the first subdirectory that
+        # called add_cuda_library (ClioCoreCommon), which populates the CUDA
+        # compiler feature table only in that scope. That was fine until
+        # CLIO_CORE_ENABLE_LLAMA_SERVER + GGML_CUDA pulled external/llama.cpp in:
+        # ggml's own CUDA enablement re-runs compiler determination and leaves the
+        # feature table blank for sibling IOWarp CUDA targets defined earlier
+        # (e.g. context-assimilation-engine/core via add_cuda_library), so the
+        # GENERATE step aborts with
+        #   "No known features for CUDA compiler "" version ."
+        # Enabling CUDA here, at the root, makes the feature/version state a
+        # property of the top-level project inherited consistently by every
+        # component, so a nested project()'s CUDA determination can no longer
+        # strand a sibling. (A CUDA build without llama.cpp worked before only
+        # because nothing reset the lazily-enabled state.) No-op when CUDA is off.
+        enable_language(CUDA)
     endif()
 
     # AddressSanitizer + LeakSanitizer configuration
@@ -1594,6 +1644,8 @@ if(CLIO_CORE_ENABLE_LLAMA)
         # CUDA platform variables (_CMAKE_CUDA_WHOLE_FLAG etc.).  Re-enabling CUDA
         # at the top level forces CMake to re-run CMakeCUDAInformation.cmake and
         # restore all required device-link variables before generating build rules.
+        # (The CUDA feature/version table itself is now established at the root —
+        # see enable_language(CUDA) far above — so sibling targets survive this.)
         if(CLIO_CORE_ENABLE_CUDA)
             enable_language(CUDA)
         endif()

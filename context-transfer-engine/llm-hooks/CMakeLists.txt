@@ -21,10 +21,16 @@ add_subdirectory(lmcache)
 # available for the device-link step; otherwise the CMake generate step aborts with
 # "_CMAKE_CUDA_RDC_FLAG not set" because the unresolved 'ggml' target breaks CUDA
 # property propagation.
-if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_LLAMA_SERVER)
+# The GpuVMM weight-offload backend (ggml_iowarp_backend.cc) is stale against
+# current llama.cpp's ggml-backend-impl.h vtables and is superseded by the
+# gpu_vector read_range integration (GGML_CLIO_VECTOR in ggml-cuda). Off by
+# default so it doesn't break the llama build; opt in with
+# -DCLIO_CORE_ENABLE_LLM_WEIGHTS_GPUVMM=ON once its vtables are updated.
+option(CLIO_CORE_ENABLE_LLM_WEIGHTS_GPUVMM "Build the legacy GpuVMM weight-offload backend" OFF)
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_LLAMA_SERVER AND CLIO_CORE_ENABLE_LLM_WEIGHTS_GPUVMM)
     add_subdirectory(weights)
 else()
-    message(STATUS "llm-hooks/weights: skipped (requires CUDA + CLIO_CORE_ENABLE_LLAMA_SERVER=ON)")
+    message(STATUS "llm-hooks/weights: skipped (legacy GpuVMM backend disabled)")
 endif()
 
 # NOTE: Patching of server-context and llama targets with IOWARP_LLM_KVCACHE

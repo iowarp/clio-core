@@ -73,6 +73,13 @@ struct CompressorConfig {
    */
   bool tracking_enabled_ = true;
 
+  /** Codec pinned from the COMPOSE FILE (canonical name, e.g. "zstd",
+   *  "nvcomp-lz4", "cuszp"). Empty = no compose pin; the runtime then falls
+   *  back to the CLIO_CTE_COMPRESS_LIB env pin, then the dynamic predictor. */
+  std::string compress_lib_;
+  /** Preset for the compose-pinned codec: 1=FAST, 2=BALANCED, 3=BEST. */
+  int compress_preset_ = 2;
+
   CompressorConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
   CompressorConfig(const clio::run::PoolId &pool_id, const CompressorConfig &other)
@@ -82,7 +89,9 @@ struct CompressorConfig {
         dnn_model_weights_path_(other.dnn_model_weights_path_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
-        tracking_enabled_(other.tracking_enabled_) {
+        tracking_enabled_(other.tracking_enabled_),
+        compress_lib_(other.compress_lib_),
+        compress_preset_(other.compress_preset_) {
     (void)pool_id;
   }
 
@@ -94,7 +103,7 @@ struct CompressorConfig {
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
        dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
-       tracking_enabled_);
+       tracking_enabled_, compress_lib_, compress_preset_);
   }
 
   /**
@@ -118,6 +127,12 @@ struct CompressorConfig {
         }
         if (node["tracking_enabled"]) {
           tracking_enabled_ = node["tracking_enabled"].as<bool>();
+        }
+        if (node["compress_lib"]) {
+          compress_lib_ = node["compress_lib"].as<std::string>();
+        }
+        if (node["compress_preset"]) {
+          compress_preset_ = node["compress_preset"].as<int>();
         }
       } catch (...) {
         // Config parsing is best-effort
