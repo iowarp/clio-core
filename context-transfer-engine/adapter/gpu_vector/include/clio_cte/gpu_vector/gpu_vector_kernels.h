@@ -266,9 +266,14 @@ CTP_GPU_FUN void DrainPut(Page *page) {
 }
 
 /** Wait on any in-flight get for this page, then clear the slot. */
-CTP_GPU_FUN void DrainGet(Page *page) {
+CTP_GPU_FUN void DrainGet(Page *page, DeviceViewBase *vb = nullptr) {
   if (!page->active_get.IsNull()) {
     page->active_get.Wait();
+    if (vb != nullptr && vb->stats != nullptr) {
+      const int rc = (int) page->active_get->return_code_.load();
+      atomicAdd_system(rc == 0 ? &vb->stats->fault_get_ok
+                               : &vb->stats->fault_get_fail, 1ULL);
+    }
     page->active_get = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPageGetInFlight);
   }
@@ -316,7 +321,7 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
   for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
     if (b->pages[s].page_idx < 0) {
       DrainPut(&b->pages[s]);
-      DrainGet(&b->pages[s]);
+      DrainGet(&b->pages[s], (DeviceViewBase *) &v.base);
       return s;
     }
   }
@@ -330,7 +335,7 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
     }
   }
   DrainPut(&b->pages[lru]);
-  DrainGet(&b->pages[lru]);
+  DrainGet(&b->pages[lru], (DeviceViewBase *) &v.base);
   return lru;
 }
 
@@ -558,6 +563,14 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
       if (!is_write) {
         FaultPage(ipc, v, block_idx, p, slot, target_page,
                   fam_fn(v.base, target_page));
+        // WAIT for the fetch. This is the "synchronous" fault path but it
+        // returned the page with the GetBlob still in flight: the caller's
+        // TryAcquireBusy tests kPageBusy, not kPageGetInFlight, so it
+        // acquired immediately and read a page the fetch had not filled yet.
+        // Small models won the race and looked correct; a 17 GB model lost
+        // it on every span, yielding all-zero weights with no error anywhere
+        // (77 faults issued, 0 completions ever observed).
+        DrainGet(p, (DeviceViewBase *) &v.base);
       }
       hit = p;
       last = hit;

@@ -55,6 +55,11 @@ struct VectorStats {
   unsigned long long phase4_prefetches;   /**< prefetch slot claims succeeded */
   unsigned long long phase4_skip_cached;  /**< already cached when popped */
   unsigned long long phase4_skip_nofree;  /**< no DRAM slot acquirable */
+  /** GetBlob completions the DEVICE saw with a non-zero return code.
+   *  DrainGet waited on the future and discarded the code, so a failing
+   *  fault left a zero-filled page and no diagnostic anywhere. */
+  unsigned long long fault_get_fail;
+  unsigned long long fault_get_ok;
   unsigned long long resolve_spin_iters;  /**< nanosleep spins while waiting
                                             *  for the manager to populate
                                             *  a page (cold-miss fault off) */
