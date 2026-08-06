@@ -229,11 +229,30 @@ class Vector {
   // policy and the copy stream, and publishes the mirror in its device
   // view. Callers only orchestrate WHICH spans a launch needs.
 
-  /** Build the pinned-host DRAM tier for a FLAT-layout vector: allocate
-   *  total_bytes pinned and fill through CTE GetBlob on the flat blob.
-   *  Publishes DeviceViewBase::host_mirror. Returns false (and leaves the
-   *  vector fully functional on its fault path) on any failure. */
-  bool BuildHostMirror(clio::run::u64 total_bytes);
+  /** Build the pinned-host DRAM tier under a byte budget. Full coverage
+   *  (budget >= total): the arena is the flat decompressed image, filled
+   *  through the CTE up front and published in DeviceViewBase::host_mirror
+   *  for direct kernel reads. Partial coverage (ANY model size): the arena
+   *  is a page-granular cache with clock eviction, filled on demand through
+   *  the CTE, served ONLY through CopySpan/PinnedSpan -- kernels never see
+   *  a raw pointer they could dereference out of coverage. Returns false
+   *  (fault path remains fully functional) on any failure. */
+  bool BuildHostTier(clio::run::u64 total_bytes, clio::run::u64 budget_bytes);
+  /** Full-coverage convenience wrapper. */
+  bool BuildHostMirror(clio::run::u64 total_bytes) {
+    return BuildHostTier(total_bytes, total_bytes);
+  }
+  /** Partial-mode page residency (see BuildHostTier). */
+  unsigned char *EnsureHostPage(clio::run::u64 gp);
+
+  /** True iff the host tier exists at all (full OR partial coverage). */
+  bool HostTier() const {
+#if !CTP_IS_DEVICE_PASS
+    return impl_ && impl_->host_arena != nullptr;
+#else
+    return false;
+#endif
+  }
   const unsigned char *HostMirror() const {
 #if !CTP_IS_DEVICE_PASS
     return impl_ ? impl_->host_mirror : nullptr;
@@ -1064,9 +1083,21 @@ struct Vector<T>::Impl {
   bool persistent_kernel_running = false;
   std::string tag_name;
   // ---- Vector-owned out-of-core tiers (see BuildHostMirror et al.) ----
-  /** Pinned-host DRAM tier: the whole flat blob, UVA device-readable. */
+  /** Pinned-host DRAM tier. FULL coverage (arena holds every model page in
+   *  order): host_mirror == host_arena and spans are raw pointer math.
+   *  PARTIAL coverage (model larger than the host budget): host_mirror
+   *  stays null, the arena is a page-granular cache with clock eviction,
+   *  and spans are served through EnsureHostPage/CopySpan only -- which is
+   *  what makes the tier correct for a model of ANY size. */
   unsigned char *host_mirror = nullptr;
-  clio::run::u64 mirror_bytes = 0;
+  clio::run::u64 mirror_bytes = 0;   /**< logical model bytes (both modes). */
+  unsigned char *host_arena = nullptr;
+  clio::run::u64 host_slots = 0;     /**< pinned pages in the arena. */
+  std::vector<long long> host_page_slot;       /**< model page -> slot|-1. */
+  std::vector<long long> host_slot_page;       /**< slot -> model page|-1. */
+  std::vector<uint8_t> host_slot_ref;          /**< clock reference bits. */
+  clio::run::u64 host_clock = 0;
+  clio::run::u64 host_tier_hits = 0, host_tier_fills = 0;
   /** Pinned-span HBM cache slab (bump-allocated, two-touch admission). */
   unsigned char *span_slab = nullptr;
   clio::run::u64 slab_cap = 0, slab_used = 0;
@@ -1438,44 +1469,143 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
 }
 
 template <typename T>
-inline bool Vector<T>::BuildHostMirror(clio::run::u64 total_bytes) {
+inline bool Vector<T>::BuildHostTier(clio::run::u64 total_bytes,
+                                     clio::run::u64 budget_bytes) {
 #if !CTP_IS_DEVICE_PASS
-  if (!impl_ || !view_.base.flat_layout || total_bytes == 0) return false;
-  if (impl_->host_mirror != nullptr) return true;
-  unsigned char *mirror = nullptr;
-  if (cudaMallocHost(&mirror, total_bytes) != cudaSuccess) {
+  if (!impl_ || total_bytes == 0) return false;
+  if (impl_->host_arena != nullptr) return true;
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  const clio::run::u64 n_pages = (total_bytes + page - 1) / page;
+  clio::run::u64 slots = budget_bytes / page;
+  if (slots > n_pages) slots = n_pages;
+  if (slots == 0) return false;
+  unsigned char *arena = nullptr;
+  while (cudaMallocHost(&arena, slots * page) != cudaSuccess) {
     cudaGetLastError();
-    return false;
+    arena = nullptr;
+    slots >>= 1;                      // degrade gracefully under RAM pressure
+    if (slots < 64) return false;
   }
-  // Fill THROUGH the CTE: GetBlob on the flat blob, 64 MiB per hop. The
-  // CTE remains the sole source of truth for the bytes; the mirror is a
-  // tier, not a second loading pipeline.
-  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
-  const clio::run::u64 kChunk = 64ull << 20;
-  auto buf = CLIO_IPC->AllocateBuffer(kChunk);
-  bool ok = buf.ptr_ != nullptr;
-  for (clio::run::u64 off = 0; ok && off < total_bytes; off += kChunk) {
-    const clio::run::u64 n = std::min<clio::run::u64>(total_bytes - off,
-                                                      kChunk);
-    auto gt = cte.AsyncGetBlob(view_.base.tag_id, "w", off, n, 0,
+  impl_->host_arena = arena;
+  impl_->host_slots = slots;
+  impl_->mirror_bytes = total_bytes;
+  if (slots == n_pages) {
+    // FULL coverage: prefill through the CTE and publish the flat image.
+    bool ok = true;
+    if (view_.base.flat_layout) {
+      clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+      const clio::run::u64 kChunk = 64ull << 20;
+      auto buf = CLIO_IPC->AllocateBuffer(kChunk);
+      ok = buf.ptr_ != nullptr;
+      for (clio::run::u64 off = 0; ok && off < total_bytes; off += kChunk) {
+        const clio::run::u64 n =
+            std::min<clio::run::u64>(total_bytes - off, kChunk);
+        auto gt = cte.AsyncGetBlob(view_.base.tag_id, "w", off, n, 0,
+                                   buf.shm_.template Cast<void>(),
+                                   clio::run::PoolQuery::Local());
+        gt.Wait();
+        if (gt->GetReturnCode() != 0) { ok = false; break; }
+        std::memcpy(arena + off, buf.ptr_, n);
+      }
+      if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
+    } else {
+      clio::cte::core::Client cte(impl_->cte_pool_id);
+      auto buf = CLIO_IPC->AllocateBuffer(page);
+      ok = buf.ptr_ != nullptr;
+      for (clio::run::u64 gp = 0; ok && gp < n_pages; ++gp) {
+        const std::string name = PageBlobName(gp);
+        auto gt = cte.AsyncGetBlob(view_.base.tag_id, name.c_str(), 0, page,
+                                   0, buf.shm_.template Cast<void>(),
+                                   clio::run::PoolQuery::Local());
+        gt.Wait();
+        if (gt->GetReturnCode() != 0) { ok = false; break; }
+        std::memcpy(arena + gp * page, buf.ptr_,
+                    std::min<clio::run::u64>(total_bytes - gp * page, page));
+      }
+      if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
+    }
+    if (!ok) {
+      cudaFreeHost(arena);
+      impl_->host_arena = nullptr;
+      impl_->host_slots = 0;
+      return false;
+    }
+    impl_->host_mirror = arena;
+    view_.base.host_mirror = arena;
+    return true;
+  }
+  // PARTIAL coverage: page-granular cache, filled on demand. host_mirror
+  // stays null so no kernel ever sees a raw arena pointer.
+  impl_->host_page_slot.assign(n_pages, -1);
+  impl_->host_slot_page.assign(slots, -1);
+  impl_->host_slot_ref.assign(slots, 0);
+  return true;
+#else
+  (void) total_bytes; (void) budget_bytes;
+  return false;
+#endif
+}
+
+// Make model page gp resident in the host tier and return its pinned bytes.
+// Partial mode only. Clock eviction; the copy stream is synced before a
+// recycled slot is overwritten so no queued H2D still reads it.
+template <typename T>
+inline unsigned char *Vector<T>::EnsureHostPage(clio::run::u64 gp) {
+#if !CTP_IS_DEVICE_PASS
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  long long sl = impl_->host_page_slot[gp];
+  if (sl >= 0) {
+    impl_->host_slot_ref[sl] = 1;
+    impl_->host_tier_hits++;
+    return impl_->host_arena + (clio::run::u64) sl * page;
+  }
+  // Clock: find a victim slot.
+  for (;;) {
+    sl = (long long) (impl_->host_clock++ % impl_->host_slots);
+    if (impl_->host_slot_ref[sl] == 0) break;
+    impl_->host_slot_ref[sl] = 0;
+  }
+  if (impl_->copy_stream != nullptr) {
+    cudaStreamSynchronize(impl_->copy_stream);
+  }
+  const long long old_gp = impl_->host_slot_page[sl];
+  if (old_gp >= 0) impl_->host_page_slot[old_gp] = -1;
+  unsigned char *dst = impl_->host_arena + (clio::run::u64) sl * page;
+  clio::cte::core::Client cte(view_.base.flat_layout
+                                  ? clio::cte::core::kCtePoolId
+                                  : impl_->cte_pool_id);
+  auto buf = CLIO_IPC->AllocateBuffer(page);
+  if (buf.ptr_ == nullptr) return nullptr;
+  bool ok = false;
+  if (view_.base.flat_layout) {
+    auto gt = cte.AsyncGetBlob(view_.base.tag_id, "w", gp * page, page, 0,
                                buf.shm_.template Cast<void>(),
                                clio::run::PoolQuery::Local());
     gt.Wait();
-    if (gt->GetReturnCode() != 0) { ok = false; break; }
-    std::memcpy(mirror + off, buf.ptr_, n);
+    ok = gt->GetReturnCode() == 0;
+  } else {
+    const std::string name = PageBlobName(gp);
+    auto gt = cte.AsyncGetBlob(view_.base.tag_id, name.c_str(), 0, page, 0,
+                               buf.shm_.template Cast<void>(),
+                               clio::run::PoolQuery::Local());
+    gt.Wait();
+    ok = gt->GetReturnCode() == 0;
   }
-  if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
-  if (!ok) {
-    cudaFreeHost(mirror);
-    return false;
+  if (ok) {
+    std::memcpy(dst, buf.ptr_,
+                std::min<clio::run::u64>(impl_->mirror_bytes - gp * page,
+                                         page));
   }
-  impl_->host_mirror = mirror;
-  impl_->mirror_bytes = total_bytes;
-  view_.base.host_mirror = mirror;
-  return true;
+  CLIO_IPC->FreeBuffer(buf);
+  if (!ok) return nullptr;
+  impl_->host_page_slot[gp] = sl;
+  impl_->host_slot_page[sl] = (long long) gp;
+  impl_->host_slot_ref[sl] = 1;
+  impl_->host_tier_fills++;
+  return dst;
 #else
-  (void) total_bytes;
-  return false;
+  (void) gp;
+  return nullptr;
 #endif
 }
 
@@ -1540,7 +1670,7 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
                                                   bool *copied) {
 #if !CTP_IS_DEVICE_PASS
   if (copied) *copied = false;
-  if (!impl_ || impl_->host_mirror == nullptr) return nullptr;
+  if (!impl_ || impl_->host_arena == nullptr) return nullptr;
   if (off >= impl_->mirror_bytes) return nullptr;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
   auto it = impl_->span_cache.find(off);
@@ -1566,8 +1696,10 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
     dst = impl_->span_slab + impl_->slab_used;
     impl_->slab_used += (len + 255ull) & ~255ull;
   }
-  cudaMemcpyAsync(dst, impl_->host_mirror + off, len,
-                  cudaMemcpyHostToDevice, impl_->copy_stream);
+  if (!CopySpan(dst, off, len)) {
+    // dst stays allocated but unmapped; do not cache a bad span.
+    return nullptr;
+  }
   impl_->span_cache.emplace(off, dst);
   if (copied) *copied = true;
   return dst;
@@ -1581,12 +1713,33 @@ template <typename T>
 inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
                                 clio::run::u64 len) {
 #if !CTP_IS_DEVICE_PASS
-  if (!impl_ || impl_->host_mirror == nullptr || dst == nullptr) return false;
+  if (!impl_ || impl_->host_arena == nullptr || dst == nullptr) return false;
   if (off >= impl_->mirror_bytes) return false;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
-  return cudaMemcpyAsync(dst, impl_->host_mirror + off, len,
-                         cudaMemcpyHostToDevice,
-                         impl_->copy_stream) == cudaSuccess;
+  if (impl_->host_mirror != nullptr) {   // full coverage: one flat copy
+    return cudaMemcpyAsync(dst, impl_->host_mirror + off, len,
+                           cudaMemcpyHostToDevice,
+                           impl_->copy_stream) == cudaSuccess;
+  }
+  // Partial coverage: gather per page through the host cache. Misses fill
+  // through the CTE (decompressing exactly once for compressed tags).
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  clio::run::u64 cur = off;
+  while (cur < off + len) {
+    const clio::run::u64 gp   = cur / page;
+    const clio::run::u64 poff = cur - gp * page;
+    const clio::run::u64 seg  =
+        std::min<clio::run::u64>(page - poff, off + len - cur);
+    unsigned char *hp = EnsureHostPage(gp);
+    if (hp == nullptr) return false;
+    if (cudaMemcpyAsync(dst + (cur - off), hp + poff, seg,
+                        cudaMemcpyHostToDevice,
+                        impl_->copy_stream) != cudaSuccess) {
+      return false;
+    }
+    cur += seg;
+  }
+  return true;
 #else
   (void) dst; (void) off; (void) len;
   return false;
@@ -1674,7 +1827,7 @@ inline Vector<T>::~Vector() {
   }
   if (impl_->span_slab) cudaFree(impl_->span_slab);
   if (impl_->stage_ring) cudaFree(impl_->stage_ring);
-  if (impl_->host_mirror) cudaFreeHost(impl_->host_mirror);
+  if (impl_->host_arena) cudaFreeHost(impl_->host_arena);
 #endif  // !CTP_IS_DEVICE_PASS
 }
 
