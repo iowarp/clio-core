@@ -41,6 +41,7 @@
 #include <memory>
 #include <string>
 #include "compress.h"
+#include "quant.h"
 #include "lossless_modes.h"
 #include "snappy.h"
 #include "blosc.h"
@@ -58,7 +59,6 @@
 #endif
 #if CTP_ENABLE_CUSZP
 #include "cuszp.h"
-#include "quant.h"
 #endif
 
 #if CTP_ENABLE_CUSZ
@@ -71,7 +71,6 @@
 
 #if CTP_ENABLE_CUSZP
 #include "cuszp.h"
-#include "quant.h"
 #endif
 
 namespace ctp {
