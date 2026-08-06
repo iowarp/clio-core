@@ -1,0 +1,484 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ * BSD 3-Clause License. See LICENSE file.
+ */
+
+/**
+ * GNN TRAINING over a compressed / streamed feature matrix (Eternia).
+ *
+ * Model: SIGN-style 1-hop GraphSAGE -- the node features are mean-aggregated over
+ * each node's 1-hop neighbourhood once (gnn_agg.py -> agg_features.f32), then a
+ * trainable 2-layer MLP classifier (F -> H -> C) is learned by FULL-BATCH gradient
+ * descent with softmax cross-entropy over the labelled nodes. The aggregated
+ * feature matrix A (N x F) is the large object; Eternia stores it losslessly
+ * (zstd) and streams it a window at a time each epoch.
+ *
+ * Why full-batch: the gradient is a SUM over all nodes, so it can be accumulated
+ * WHILE streaming A window-by-window -- resident memory stays O(window + weights),
+ * independent of N. One weight update per epoch. Because the per-window grad kernel
+ * uses one thread per weight (summing its window's nodes in order) and windows are
+ * issued in order on one stream, accumulation is deterministic -> given lossless
+ * (bit-identical) features, the streamed-Eternia run and an in-core resident run
+ * produce BIT-IDENTICAL weights, loss and accuracy every epoch.
+ *
+ * Two methods, same training:
+ *   - IN-CORE: A resident in HBM (peak GPU = whole A). OOMs once A > HBM.
+ *   - ETERNIA: A stored zstd-compressed, streamed through a bounded window
+ *     (peak GPU = window). Runs at any A size.
+ * Real A (ogbn-arxiv/products aggregated), tiled to reach a requested size.
+ *
+ * Env: CLIO_GNN_DATA, CLIO_GNN_TRAIN_NODES (tiled node count; 0=native),
+ *      CLIO_GNN_EPOCHS (default 30), CLIO_GNN_LR (default 0.5),
+ *      CLIO_GNN_HIDDEN (default 64), CLIO_GNN_PAGE_ROWS, CLIO_GNN_WINDOW,
+ *      CLIO_GNN_HBM_MIB / CLIO_GNN_DRAM_MIB, CLIO_GNN_CSV.
+ */
+
+#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
+
+#include "simple_test.h"
+
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/singletons.h>
+#include <clio_runtime/bdev/bdev_client.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_tasks.h>
+#include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_cte/gpu_vector/transaction.h>
+
+#include <clio_ctp/util/gpu_api.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std::chrono_literals;
+
+namespace {
+
+bool g_initialized = false;
+inline clio::run::PoolId StoragePool() { return clio::run::PoolId(600, 0); }
+
+constexpr int kMaxH = 256;
+constexpr int kMaxC = 64;
+
+double NowSec() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void EnsureInit() {
+#if !CTP_IS_DEVICE_PASS
+  if (g_initialized) return;
+  const char *port_env = std::getenv("CLIO_PORT");
+  int port = port_env ? std::atoi(port_env) : 10602;
+  std::string cfg = "/tmp/gpu_vec_gnn_train_" + std::to_string(port) + ".yaml";
+  int hbm_mib = std::getenv("CLIO_GNN_HBM_MIB") ? std::atoi(std::getenv("CLIO_GNN_HBM_MIB")) : 2048;
+  int dram_mib = std::getenv("CLIO_GNN_DRAM_MIB") ? std::atoi(std::getenv("CLIO_GNN_DRAM_MIB")) : 20480;
+  {
+    std::ofstream f(cfg);
+    f << "networking:\n  port: " << port << "\n\n"
+      << "runtime:\n  num_threads: 8\n  queue_depth: 65536\n\n"
+      << "compose:\n"
+      << "  - mod_name: clio_bdev\n    pool_name: \"hbm::chi_default_bdev\"\n"
+      << "    pool_query: local\n    pool_id: \"301.0\"\n    bdev_type: hbm\n    capacity: \"128MB\"\n\n"
+      << "  - mod_name: clio_cte_compressor\n    pool_name: cte_compressor\n    pool_query: local\n"
+      << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n\n"
+      << "  - mod_name: clio_cte_core\n    pool_name: cte_core\n    pool_query: local\n    pool_id: \"512.0\"\n"
+      << "    storage:\n"
+      << "      - path: \"hbm::cte_hbm_tier\"\n        bdev_type: \"hbm\"\n        capacity_limit: \""
+      << hbm_mib << "MB\"\n        score: 1.0\n"
+      << "      - path: \"ram::cte_dram_tier\"\n        bdev_type: \"ram\"\n        capacity_limit: \""
+      << dram_mib << "MB\"\n        score: 0.5\n"
+      << "    dpe:\n      dpe_type: \"max_bw\"\n";
+  }
+  setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+  std::this_thread::sleep_for(1s);
+  g_initialized = true;
+#endif
+}
+
+void ReadMeta(const std::string &dir, clio::run::u64 &N, int &F, clio::run::u64 &E, int &C) {
+  std::ifstream f(dir + "/meta.txt"); REQUIRE(f.good());
+  long long n, e; int ff, cc; f >> n >> ff >> e >> cc;
+  N = (clio::run::u64)n; F = ff; E = (clio::run::u64)e; C = cc;
+}
+
+}  // namespace
+
+namespace gv = clio::cte::gpu_vector;
+namespace dev = cte::gpu::dev;
+
+__global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
+                               gv::DeviceView<float> view, clio::run::u64 lo,
+                               clio::run::u64 hi, float *scratch) {
+  CLIO_GPU_INIT(info, nullptr);
+  dev::vector<float> v(view, g_ipc_manager_ptr);
+  v.read_range(lo, hi, [scratch, lo](clio::run::u64 i, float val) { scratch[i - lo] = val; });
+  (void)g_ipc_manager;
+}
+
+/** Forward + backward for the window's nodes (one thread per node). Writes per-node
+ *  h1, dz1, dz2 to window buffers; accumulates loss/correct/count. */
+__global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u64 node_lo,
+                                const long long *labels, int F, int H, int C,
+                                const float *W1, const float *b1, const float *W2,
+                                const float *b2, float *h1_out, float *dz1_out,
+                                float *dz2_out, double *loss_buf, int *correct, int *count) {
+  clio::run::u64 n = blockIdx.x * (clio::run::u64)blockDim.x + threadIdx.x;
+  if (n >= nn) return;
+  long long y = labels[node_lo + n];
+  loss_buf[n] = 0.0;
+  for (int c = 0; c < C; ++c) dz2_out[n * C + c] = 0.0f;
+  for (int h = 0; h < H; ++h) { h1_out[n * H + h] = 0.0f; dz1_out[n * H + h] = 0.0f; }
+  if (y < 0) return;
+  const float *a = A + n * (clio::run::u64)F;
+  float z1[kMaxH], h1[kMaxH];
+  for (int h = 0; h < H; ++h) {
+    float s = b1[h];
+    for (int f = 0; f < F; ++f) s += W1[h * F + f] * a[f];
+    z1[h] = s; h1[h] = s > 0.f ? s : 0.f;
+  }
+  float z2[kMaxC], maxz = -1e30f;
+  for (int c = 0; c < C; ++c) {
+    float s = b2[c];
+    for (int h = 0; h < H; ++h) s += W2[c * H + h] * h1[h];
+    z2[c] = s; if (s > maxz) maxz = s;
+  }
+  float sum = 0.f;
+  for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
+  int pred = 0; float pmax = -1.f; float p[kMaxC];
+  for (int c = 0; c < C; ++c) { p[c] = z2[c] / sum; if (p[c] > pmax) { pmax = p[c]; pred = c; } }
+  loss_buf[n] = -log((double)fmaxf(p[y], 1e-30f));
+  if (pred == (int)y) atomicAdd(correct, 1);
+  atomicAdd(count, 1);
+  float dz2[kMaxC];
+  for (int c = 0; c < C; ++c) { dz2[c] = p[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = dz2[c]; }
+  for (int h = 0; h < H; ++h) {
+    float s = 0.f;
+    for (int c = 0; c < C; ++c) s += W2[c * H + h] * dz2[c];
+    dz1_out[n * H + h] = (z1[h] > 0.f) ? s : 0.f;
+    h1_out[n * H + h] = h1[h];
+  }
+}
+
+/** Grad accumulation (one thread per weight element; sums the window's nodes in
+ *  order and += into the global double grad -- deterministic across windows because
+ *  the launches serialize on one stream). */
+__global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn,
+                             int F, int H, double *dW1, double *db1) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= H * F) return;
+  int h = idx / F, f = idx % F;
+  double s = 0.0;
+  for (clio::run::u64 n = 0; n < nn; ++n) s += (double)dz1[n * H + h] * (double)A[n * F + f];
+  dW1[idx] += s;
+  if (f == 0) { double sb = 0.0; for (clio::run::u64 n = 0; n < nn; ++n) sb += (double)dz1[n * H + h]; db1[h] += sb; }
+}
+__global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
+                             int H, int C, double *dW2, double *db2) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= C * H) return;
+  int c = idx / H, h = idx % H;
+  double s = 0.0;
+  for (clio::run::u64 n = 0; n < nn; ++n) s += (double)dz2[n * C + c] * (double)h1[n * H + h];
+  dW2[idx] += s;
+  if (h == 0) { double sb = 0.0; for (clio::run::u64 n = 0; n < nn; ++n) sb += (double)dz2[n * C + c]; db2[c] += sb; }
+}
+/** Deterministic loss reduction: one thread sums the window's per-node losses in
+ *  order and adds to the global loss (windows serialize on the stream -> the total
+ *  is order-deterministic -> bit-identical across the in-core and streamed runs). */
+__global__ void LossReduceKernel(const double *loss_buf, clio::run::u64 nn, double *d_loss) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  double s = 0.0;
+  for (clio::run::u64 n = 0; n < nn; ++n) s += loss_buf[n];
+  d_loss[0] += s;
+}
+
+#if !CTP_IS_DEVICE_PASS
+
+TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
+          "matches an in-core baseline (bit-exact) and runs beyond HBM",
+          "[gpu_vector][compress][gnn][train][bench]") {
+  EnsureInit();
+  auto *ipc = CLIO_CPU_IPC;
+
+  const std::string dir = std::getenv("CLIO_GNN_DATA") ? std::getenv("CLIO_GNN_DATA")
+                                                       : "/workspace/data/ogb/arxiv";
+  clio::run::u64 N0 = 0, E0 = 0; int F = 128, C = 40;
+  ReadMeta(dir, N0, F, E0, C);
+  REQUIRE(C <= kMaxC);
+  const int H = std::getenv("CLIO_GNN_HIDDEN") ? std::atoi(std::getenv("CLIO_GNN_HIDDEN")) : 64;
+  REQUIRE(H <= kMaxH);
+  const int epochs = std::getenv("CLIO_GNN_EPOCHS") ? std::atoi(std::getenv("CLIO_GNN_EPOCHS")) : 30;
+  const float lr = std::getenv("CLIO_GNN_LR") ? (float)std::atof(std::getenv("CLIO_GNN_LR")) : 0.5f;
+  const clio::run::u32 window = std::getenv("CLIO_GNN_WINDOW") ? (clio::run::u32)std::atoi(std::getenv("CLIO_GNN_WINDOW")) : 4;
+  const clio::run::u64 page_rows = std::getenv("CLIO_GNN_PAGE_ROWS") ? (clio::run::u64)std::atoi(std::getenv("CLIO_GNN_PAGE_ROWS")) : 512;
+  const clio::run::u64 page_size = page_rows * (clio::run::u64)F * sizeof(float);
+  const clio::run::u64 epp = page_size / sizeof(float);
+  REQUIRE(epp % (clio::run::u64)F == 0);
+  clio::run::u64 want = std::getenv("CLIO_GNN_TRAIN_NODES") ? (clio::run::u64)std::atoll(std::getenv("CLIO_GNN_TRAIN_NODES")) : 0;
+  if (want == 0) want = N0;
+  clio::run::u64 K = (want + page_rows - 1) / page_rows; K = (K / window) * window; if (K == 0) K = window;
+  const clio::run::u64 N = K * page_rows;
+  const clio::run::u64 total_elems = N * (clio::run::u64)F;
+  const clio::run::u64 dataset_bytes = total_elems * sizeof(float);
+
+  size_t gfree = 0, gtot = 0; cudaMemGetInfo(&gfree, &gtot);
+  std::fprintf(stderr,
+      "\n============== GNN TRAINING (Eternia) ==============\n"
+      "[TRAIN] A=%lluMiB (%llu nodes x %d-d agg, real tiled)  F=%d H=%d C=%d  "
+      "epochs=%d lr=%.3f  GPU free=%zuMiB  window=%u pages (peak %lluMiB)\n",
+      (unsigned long long)(dataset_bytes >> 20), (unsigned long long)N, F, F, H, C,
+      epochs, lr, gfree >> 20, window, (unsigned long long)(2ull * window * page_size >> 20));
+
+  // ---- Load aggregated features + labels (host), tiled ----
+  std::vector<float> A0(N0 * (clio::run::u64)F);
+  { std::ifstream f(dir + "/agg_features.f32", std::ios::binary); REQUIRE(f.good());
+    f.read((char *)A0.data(), (std::streamsize)(A0.size() * sizeof(float))); REQUIRE((bool)f); }
+  std::vector<long long> lab0(N0);
+  { std::ifstream f(dir + "/labels.i64", std::ios::binary); REQUIRE(f.good());
+    f.read((char *)lab0.data(), (std::streamsize)(N0 * sizeof(long long))); REQUIRE((bool)f); }
+  const clio::run::u64 file_elems = N0 * (clio::run::u64)F;
+
+  // Resident tiled labels.
+  long long *d_lab = nullptr; REQUIRE(cudaMalloc(&d_lab, N * sizeof(long long)) == cudaSuccess);
+  { std::vector<long long> tile(std::min<clio::run::u64>(N, 1u << 22));
+    for (clio::run::u64 off = 0; off < N; off += tile.size()) {
+      clio::run::u64 n = std::min<clio::run::u64>(tile.size(), N - off);
+      for (clio::run::u64 i = 0; i < n; ++i) tile[i] = lab0[(off + i) % N0];
+      cudaMemcpy(d_lab + off, tile.data(), n * sizeof(long long), cudaMemcpyHostToDevice);
+    } }
+
+  // ---- Shared init weights (seeded; identical for both runs) ----
+  std::mt19937 rng(1234); std::normal_distribution<float> nd(0.f, 0.1f);
+  std::vector<float> W1_0(H * F), b1_0(H, 0.f), W2_0(C * H), b2_0(C, 0.f);
+  for (auto &w : W1_0) w = nd(rng); for (auto &w : W2_0) w = nd(rng);
+
+  // Device weights + grads + window buffers.
+  const clio::run::u64 max_nn = (clio::run::u64)window * page_rows;
+  float *dW1, *db1, *dW2, *db2; double *gW1, *gb1, *gW2, *gb2;
+  float *h1_buf, *dz1_buf, *dz2_buf, *d_scratch;
+  REQUIRE(cudaMalloc(&dW1, H * F * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&db1, H * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&dW2, C * H * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&db2, C * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gW1, H * F * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gb1, H * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gW2, C * H * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gb2, C * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&h1_buf, max_nn * H * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&dz1_buf, max_nn * H * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&dz2_buf, max_nn * C * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_scratch, max_nn * F * sizeof(float)) == cudaSuccess);
+  double *loss_buf; REQUIRE(cudaMalloc(&loss_buf, max_nn * sizeof(double)) == cudaSuccess);
+  double *d_loss; int *d_correct, *d_count;
+  REQUIRE(cudaMalloc(&d_loss, sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_correct, sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_count, sizeof(int)) == cudaSuccess);
+
+  clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
+
+  // One epoch over a window provider. get_win(win_idx, first_node, nn) fills
+  // d_scratch (nn*F). Returns final (loss,acc). Deterministic accumulation.
+  auto run_epoch = [&](std::function<void(clio::run::u64, clio::run::u64, clio::run::u64)> gather,
+                       double &out_loss, double &out_acc, clio::run::u64 &out_count) {
+    cudaMemset(gW1, 0, H * F * sizeof(double)); cudaMemset(gb1, 0, H * sizeof(double));
+    cudaMemset(gW2, 0, C * H * sizeof(double)); cudaMemset(gb2, 0, C * sizeof(double));
+    cudaMemset(d_loss, 0, sizeof(double)); cudaMemset(d_correct, 0, sizeof(int));
+    cudaMemset(d_count, 0, sizeof(int));
+    for (clio::run::u64 w = 0; w < K; w += window) {
+      clio::run::u64 first = w * page_rows;
+      clio::run::u64 nn = (clio::run::u64)window * page_rows;
+      gather(w, first, nn);   // fills d_scratch with nn*F floats
+      int tpb = 128;
+      TrainNodeKernel<<<(int)((nn + tpb - 1) / tpb), tpb>>>(
+          d_scratch, nn, first, d_lab, F, H, C, dW1, db1, dW2, db2,
+          h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count);
+      LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
+      GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
+      GradW2Kernel<<<(C * H + tpb - 1) / tpb, tpb>>>(h1_buf, dz2_buf, nn, H, C, gW2, gb2);
+    }
+    ctp::GpuApi::Synchronize();
+    // SGD update on host (weights are small).
+    std::vector<double> hW1(H * F), hb1(H), hW2(C * H), hb2(C); double hloss; int hcorr, hcnt;
+    cudaMemcpy(hW1.data(), gW1, H * F * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hb1.data(), gb1, H * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hW2.data(), gW2, C * H * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hb2.data(), gb2, C * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&hloss, d_loss, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&hcorr, d_correct, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&hcnt, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+    std::vector<float> W1(H * F), b1(H), W2(C * H), b2(C);
+    cudaMemcpy(W1.data(), dW1, H * F * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b1.data(), db1, H * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(W2.data(), dW2, C * H * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b2.data(), db2, C * sizeof(float), cudaMemcpyDeviceToHost);
+    float inv = 1.0f / (float)std::max<int>(1, hcnt);
+    for (int i = 0; i < H * F; ++i) W1[i] -= lr * (float)(hW1[i] * inv);
+    for (int i = 0; i < H; ++i) b1[i] -= lr * (float)(hb1[i] * inv);
+    for (int i = 0; i < C * H; ++i) W2[i] -= lr * (float)(hW2[i] * inv);
+    for (int i = 0; i < C; ++i) b2[i] -= lr * (float)(hb2[i] * inv);
+    cudaMemcpy(dW1, W1.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(db1, b1.data(), H * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dW2, W2.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(db2, b2.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+    out_loss = hloss / std::max<int>(1, hcnt); out_acc = (double)hcorr / std::max<int>(1, hcnt);
+    out_count = (clio::run::u64)hcnt;
+  };
+
+  auto reset_weights = [&]() {
+    cudaMemcpy(dW1, W1_0.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(db1, b1_0.data(), H * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dW2, W2_0.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(db2, b2_0.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+  };
+
+  // =========================== IN-CORE baseline ===========================
+  std::vector<double> base_loss(epochs), base_acc(epochs);
+  std::string base_status = "OOM"; double base_time = -1.0;
+  {
+    size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
+    float *d_all = nullptr; cudaError_t al = cudaErrorMemoryAllocation;
+    if (dataset_bytes + (size_t(384) << 20) < fb) al = cudaMalloc(&d_all, dataset_bytes);
+    if (al != cudaSuccess) {
+      cudaGetLastError();
+      std::fprintf(stderr, "[TRAIN] IN-CORE: *** OOM *** cannot place %lluMiB A resident.\n",
+                   (unsigned long long)(dataset_bytes >> 20));
+    } else {
+      for (clio::run::u64 off = 0; off < total_elems; off += file_elems) {
+        clio::run::u64 n = std::min(file_elems, total_elems - off);
+        cudaMemcpy(d_all + off, A0.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+      }
+      reset_weights();
+      double t0 = NowSec();
+      for (int e = 0; e < epochs; ++e) {
+        clio::run::u64 cnt;
+        run_epoch([&](clio::run::u64, clio::run::u64 first, clio::run::u64 nn) {
+          cudaMemcpy(d_scratch, d_all + first * F, nn * F * sizeof(float), cudaMemcpyDeviceToDevice);
+        }, base_loss[e], base_acc[e], cnt);
+      }
+      base_time = NowSec() - t0; base_status = "OK";
+      cudaFree(d_all);
+      std::fprintf(stderr, "[TRAIN] IN-CORE: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f (%.2fs)\n",
+                   base_loss[0], base_acc[0], epochs - 1, base_loss[epochs - 1], base_acc[epochs - 1], base_time);
+    }
+  }
+
+  // =========================== ETERNIA (streamed) ===========================
+  const char *tag = "gnn_train";
+  clio::cte::core::Client core; core.Init(clio::cte::core::kCtePoolId);
+  auto tagf = core.AsyncGetOrCreateTag(tag); tagf.Wait(); REQUIRE(tagf->GetReturnCode() == 0);
+  auto tag_id = tagf->tag_id_;
+  clio::cte::core::Client comp; comp.Init(StoragePool());
+  clio::cte::core::Context ctx; ctx.dynamic_compress_ = 1; ctx.compress_preset_ = 2;
+  clio::run::bdev::Client hbm_bdev(clio::run::PoolId(512, 1)), dram_bdev(clio::run::PoolId(513, 1));
+  auto h0 = hbm_bdev.AsyncGetStats(); h0.Wait(); auto r0 = dram_bdev.AsyncGetStats(); r0.Wait();
+  clio::run::u64 hbm0 = h0->remaining_size_, dram0 = r0->remaining_size_;
+
+  std::vector<float> pagebuf(epp);
+  double store_t0 = NowSec();
+  for (clio::run::u64 p = 0; p < K; ++p) {
+    // Tile A into this page (host buffer; zstd is CPU-side).
+    clio::run::u64 start = p * epp;
+    for (clio::run::u64 i = 0; i < epp; ++i) pagebuf[i] = A0[(start + i) % file_elems];
+    ctp::ipc::ShmPtr<> dp; dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    dp.off_ = reinterpret_cast<clio::run::u64>(pagebuf.data());
+    std::string name = std::string(tag) + "_b0_pi" + std::to_string(p);
+    auto pf = comp.AsyncPutBlob(tag_id, name, 0ull, page_size, dp, 0.5f, ctx, 0, clio::run::PoolQuery::Local());
+    pf.Wait(); REQUIRE(pf->GetReturnCode() == 0);
+  }
+  double store_dt = NowSec() - store_t0;
+  auto h1s = hbm_bdev.AsyncGetStats(); h1s.Wait(); auto r1s = dram_bdev.AsyncGetStats(); r1s.Wait();
+  clio::run::u64 hbm_used = hbm0 >= h1s->remaining_size_ ? hbm0 - h1s->remaining_size_ : 0;
+  clio::run::u64 dram_used = dram0 >= r1s->remaining_size_ ? dram0 - r1s->remaining_size_ : 0;
+  clio::run::u64 stored = hbm_used + dram_used;
+  double ratio = stored ? (double)dataset_bytes / (double)stored : 0.0;
+  std::fprintf(stderr, "[TRAIN] ETERNIA: stored A %lluMiB -> %lluMiB zstd (%.3fx) in %.2fs\n",
+               (unsigned long long)(dataset_bytes >> 20), (unsigned long long)(stored >> 20), ratio, store_dt);
+
+  gv::Vector<float> vec(tag, 1, 0, 2 * window, 0, page_size, 20000, gv::CacheMode::kLegacy,
+                        32, false, StoragePool());
+  std::vector<double> et_loss(epochs), et_acc(epochs);
+  reset_weights();
+  double et_t0 = NowSec();
+  for (int e = 0; e < epochs; ++e) {
+    clio::run::u64 cnt;
+    // Stream A windows through the vector each epoch: prefetch (decompress) each
+    // window into HBM slots, gather its ELEMENTS [first*F, (first+nn)*F) into
+    // d_scratch, then run the same train kernels as the in-core path.
+    run_epoch([&](clio::run::u64 wi, clio::run::u64 first, clio::run::u64 nn) {
+      vec.PrefetchPagesSync(wi, window, 0);
+      GnnGatherKernel<<<1, 32>>>(gpu_info, vec.Device(), first * (clio::run::u64)F,
+                                 (first + nn) * (clio::run::u64)F, d_scratch);
+      ctp::GpuApi::Synchronize();
+    }, et_loss[e], et_acc[e], cnt);
+  }
+  double et_time = NowSec() - et_t0;
+  const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
+  std::fprintf(stderr,
+      "[TRAIN] ETERNIA: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f (%.2fs)  "
+      "peak GPU window=%lluMiB\n", et_loss[0], et_acc[0], epochs - 1,
+      et_loss[epochs - 1], et_acc[epochs - 1], et_time, (unsigned long long)(peak_win >> 20));
+
+  // ---- Compare curves (bit-exact where in-core ran) ----
+  std::string exact = "n/a(OOM)";
+  if (base_status == "OK") {
+    double maxdl = 0, maxda = 0;
+    for (int e = 0; e < epochs; ++e) {
+      maxdl = std::max(maxdl, std::fabs(base_loss[e] - et_loss[e]));
+      maxda = std::max(maxda, std::fabs(base_acc[e] - et_acc[e]));
+    }
+    exact = (maxdl == 0.0 && maxda == 0.0) ? "BIT-EXACT" : "CLOSE";
+    std::fprintf(stderr, "[TRAIN] VERIFY vs in-core: max|dloss|=%.3e max|dacc|=%.3e -> %s\n",
+                 maxdl, maxda, exact.c_str());
+    std::fprintf(stderr, "[TRAIN] per-epoch (in-core || eternia):\n");
+    for (int e = 0; e < epochs; ++e)
+      std::fprintf(stderr, "   e%02d  loss %.6f acc %.4f  ||  loss %.6f acc %.4f\n",
+                   e, base_loss[e], base_acc[e], et_loss[e], et_acc[e]);
+    REQUIRE(exact == "BIT-EXACT");
+  } else {
+    std::fprintf(stderr, "[TRAIN] in-core OOM'd -> Eternia is the ONLY method that TRAINED this "
+                 "%lluMiB feature matrix. Final acc=%.4f\n",
+                 (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1]);
+    REQUIRE(et_acc[epochs - 1] > et_acc[0]);  // training made progress
+  }
+  std::fprintf(stderr, "====================================================\n");
+
+  const char *csv = std::getenv("CLIO_GNN_CSV");
+  if (csv) {
+    std::ifstream probe(csv); bool empty = !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
+    probe.close(); std::ofstream out(csv, std::ios::app);
+    if (out) { if (empty) out << "A_mib,nodes,H,epochs,base_status,base_final_acc,eternia_final_acc,"
+                                 "stored_mib,ratio,peak_gpu_mib,bit_exact\n";
+      out << (dataset_bytes >> 20) << "," << N << "," << H << "," << epochs << "," << base_status << ","
+          << (base_status == "OK" ? base_acc[epochs - 1] : -1.0) << "," << et_acc[epochs - 1] << ","
+          << (stored >> 20) << "," << ratio << "," << (peak_win >> 20) << "," << exact << "\n"; }
+  }
+
+  cudaFree(d_lab); cudaFree(dW1); cudaFree(db1); cudaFree(dW2); cudaFree(db2);
+  cudaFree(gW1); cudaFree(gb1); cudaFree(gW2); cudaFree(gb2);
+  cudaFree(h1_buf); cudaFree(dz1_buf); cudaFree(dz2_buf); cudaFree(d_scratch);
+  cudaFree(loss_buf); cudaFree(d_loss); cudaFree(d_correct); cudaFree(d_count);
+}
+
+SIMPLE_TEST_MAIN()
+
+#endif  // !CTP_IS_DEVICE_PASS
+
+#else
+int main() { return 0; }
+#endif
