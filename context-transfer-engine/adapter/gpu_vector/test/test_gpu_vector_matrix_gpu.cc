@@ -167,7 +167,10 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
     // (fam_ppb >= num_pages) and family == page index (fam_ppb == 1). If the
     // device looks up either, it will find data -- which isolates whether the
     // failure is blob NAMING or the put itself.
-    const std::string blob = tag + "_b" + std::to_string(p / fam_pages) +
+    // Page blobs carry NO tag prefix: tag_id already scopes the lookup, and a
+    // short name is what keeps PodGetBlobTask::blob_name_ inside its SSO
+    // buffer (a long tag was silently truncated, so every device fault missed).
+    const std::string blob = "b" + std::to_string(p / fam_pages) +
                              "_pi" + std::to_string(p);
     auto task = cte->AsyncPutBlob(tag_id, blob, 0, kPageSizeBytes,
                                   buf.shm_.template Cast<void>(), 1.0f,
@@ -183,7 +186,7 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
     auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
     auto *got = reinterpret_cast<uint8_t *>(buf.ptr_);
     std::memset(got, 0, 256);
-    const std::string blob = tag + "_b0_pi0";  // page 0 is family 0 either way
+    const std::string blob = "b0_pi0";  // page 0 is family 0 either way
     auto g = cte->AsyncGetBlob(tag_id, blob.c_str(), 0, kPageSizeBytes, 0,
                                buf.shm_.template Cast<void>());
     g.Wait();
