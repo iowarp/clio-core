@@ -268,7 +268,13 @@ CTP_GPU_FUN void DrainPut(Page *page) {
 /** Wait on any in-flight get for this page, then clear the slot. */
 CTP_GPU_FUN void DrainGet(Page *page, DeviceViewBase *vb = nullptr) {
   if (!page->active_get.IsNull()) {
+    const long long t0 = clock64();
     page->active_get.Wait();
+    if (vb != nullptr && vb->stats != nullptr) {
+      atomicAdd_system(&vb->stats->fault_wait_ticks,
+                       (unsigned long long)(clock64() - t0));
+      atomicAdd_system(&vb->stats->fault_wait_count, 1ULL);
+    }
     if (vb != nullptr && vb->stats != nullptr) {
       const int rc = (int) page->active_get->return_code_.load();
       atomicAdd_system(rc == 0 ? &vb->stats->fault_get_ok

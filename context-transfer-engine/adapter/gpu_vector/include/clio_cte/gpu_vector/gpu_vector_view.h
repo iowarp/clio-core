@@ -60,6 +60,11 @@ struct VectorStats {
    *  fault left a zero-filled page and no diagnostic anywhere. */
   unsigned long long fault_get_fail;
   unsigned long long fault_get_ok;
+  /** Total GPU clock ticks spent inside DrainGet waiting for a fault, and the
+   *  number of waits. Divide to get per-fault latency: scheduling changes
+   *  cannot help if the round trip itself dominates. */
+  unsigned long long fault_wait_ticks;
+  unsigned long long fault_wait_count;
   /** Last non-zero GetBlob return code the device saw, plus the page it was
    *  fetching. Counting failures was not enough to name the error. */
   unsigned long long fault_get_last_rc;
