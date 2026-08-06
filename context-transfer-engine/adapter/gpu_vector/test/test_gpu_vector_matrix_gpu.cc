@@ -297,6 +297,27 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
   cudaFree(c);
 }
 
+/*
+ * ROOT CAUSE of the two red cases below (same defect, both configurations).
+ *
+ * gpu_vector_kernels.h: FaultPage() mutates GetGetTask(base, block_idx, slot)
+ * -- a task struct shared per (cache block, slot) -- clearing flags, minting a
+ * fresh task_id, and setting gpu_page_idx_ before Send(). read_range() calls
+ * Resolve() (which faults) BEFORE TryAcquireBusy(p), so that mutation is
+ * performed with no lock held.
+ *
+ * BlockIdx() wraps blockIdx.x % nblocks, so a grid wider than nblocks maps
+ * many CUDA blocks onto one cache block. Two of them faulting concurrently
+ * write the same task struct; one overwrites the other's page index and task
+ * id, and the runtime reports
+ *     ReadData: bytes_read=0, expected=2097152, status=FAILED
+ *
+ * This is why the out-of-core compute grid is currently capped at nblocks,
+ * which is the whole reason qwen3-coder decodes at 0.08 tok/s. Fixing it means
+ * claiming the slot (or the page) atomically BEFORE FaultPage touches the
+ * task, not after.
+ */
+
 /** Chunk size deliberately NOT a divisor of a 176-byte record (Q5_K block):
  *  24576 % 176 != 0, so every chunk after the first starts mid-record. */
 TEST_CASE("gpu_vector: staging chunks that do not divide the record size",
