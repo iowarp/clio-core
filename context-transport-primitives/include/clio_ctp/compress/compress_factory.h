@@ -58,6 +58,7 @@
 #endif
 #if CTP_ENABLE_CUSZP
 #include "cuszp.h"
+#include "quant.h"
 #endif
 
 #if CTP_ENABLE_CUSZ
@@ -70,6 +71,7 @@
 
 #if CTP_ENABLE_CUSZP
 #include "cuszp.h"
+#include "quant.h"
 #endif
 
 namespace ctp {
@@ -260,6 +262,18 @@ class CompressionFactory {
 
   // Construction helpers for single-mode and backend-guarded compressors.
   // (Multi-mode lossless compressors use CreateLossless<T> directly.)
+  static std::unique_ptr<Compressor> MakeQuantQ4K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ4_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ5K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ5_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ6K(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ6_K);
+  }
+  static std::unique_ptr<Compressor> MakeQuantQ8_0(CompressionPreset) {
+    return std::make_unique<QuantCodec>(QuantCodec::Type::kQ8_0);
+  }
   static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
     return std::make_unique<Snappy>();
   }
@@ -439,6 +453,15 @@ class CompressionFactory {
         CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
         CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
+        // Block-quantized (GGUF k-quant) decode transform. Not a compressor:
+        // the data arrives already quantized, so this never quantizes and
+        // never loses precision -- it stores the compact blocks and expands
+        // them on the way out, which is what lets the kHbm tier hold ~8x more
+        // model per byte than the F32 form.
+        CompressorInfo{"quant-q4k",       21, 23, true,  &MakeQuantQ4K},
+        CompressorInfo{"quant-q5k",       22, 24, true,  &MakeQuantQ5K},
+        CompressorInfo{"quant-q6k",       23, 25, true,  &MakeQuantQ6K},
+        CompressorInfo{"quant-q8_0",      24, 26, true,  &MakeQuantQ8_0},
     };
     return kRegistry;
   }
