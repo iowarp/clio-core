@@ -297,15 +297,6 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
   cudaFree(c);
 }
 
-/** 64 CUDA blocks over 2 cache blocks. Index wrapping keeps this in bounds,
- *  but many CUDA blocks concurrently faulting through one page table is a
- *  race; this is the illegal-memory-access configuration. */
-TEST_CASE("gpu_vector: grid far wider than nblocks faults safely",
-          "[gpu_vector][oom][race]") {
-  RunSpanCase("gvm_widegrid", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/64,
-              0, kTotalBytes, /*chunk=*/8192);
-}
-
 /** Chunk size deliberately NOT a divisor of a 176-byte record (Q5_K block):
  *  24576 % 176 != 0, so every chunk after the first starts mid-record. */
 TEST_CASE("gpu_vector: staging chunks that do not divide the record size",
@@ -320,6 +311,16 @@ TEST_CASE("gpu_vector: cross-page spans at unaligned offsets",
   RunSpanCase("gvm_crosspage", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/4,
               kPageSizeBytes - 1000, 5 * kPageSizeBytes + 333, /*chunk=*/4096);
 }
+
+/** 64 CUDA blocks over 2 cache blocks. Index wrapping keeps this in bounds,
+ *  but many CUDA blocks concurrently faulting through one page table is a
+ *  race; this is the illegal-memory-access configuration. */
+TEST_CASE("gpu_vector: grid far wider than nblocks faults safely",
+          "[gpu_vector][oom][race]") {
+  RunSpanCase("gvm_widegrid", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/64,
+              0, kTotalBytes, /*chunk=*/8192);
+}
+
 
 SIMPLE_TEST_MAIN()
 
