@@ -35,19 +35,21 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
 
     # On-device faulting under oversubscription, UNCOMPRESSED: cache == 1/2 the
-    # logical extent, reads served purely by the cold-miss fault path.
-# TODO: test_gpu_vector_matrix does not compile yet. CLIO_CPU_IPC fixed the
-# AllocateBuffer resolution, but Client::AsyncPutBlob and
-# GetGpuIpcManager()->GetGpuInfo still resolve to device-visible
-# overloads in this TU while the identical calls compile in
-# test_gpu_vector_llama_geom_gpu.cc. Registration stays disabled so the
-# build is green; the difference between the two TUs is the next step.
+# DISABLED: test_gpu_vector_matrix does not compile yet.
+#   Fixed so far: CLIO_CPU_IPC (not CLIO_IPC) for AllocateBuffer, and the
+#   missing modules/bdev/include that llama_geom has.
+#   Still failing: Client::AsyncPutBlob and GetGpuIpcManager()->GetGpuInfo
+#   resolve to device-visible overloads here but not in llama_geom, whose
+#   INCLUDE_DIRS and LINK_LIBS are now identical. Next thing to try is
+#   guarding the host-only helpers with #ifndef __CUDA_ARCH__, since the
+#   symptom is the device pass parsing host-only members.
 #    add_cuda_executable(test_gpu_vector_matrix FALSE
 #        test_gpu_vector_matrix_gpu.cc
 #        INCLUDE_DIRS
 #            ${CMAKE_SOURCE_DIR}/context-runtime/include
 #            ${CMAKE_SOURCE_DIR}/context-runtime/test
 #            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+#            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
 #            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
 #            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
 #        LINK_LIBS
