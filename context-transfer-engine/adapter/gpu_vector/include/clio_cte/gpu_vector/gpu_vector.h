@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <functional>
+#include <unordered_map>
 #include <thread>
 
 #if CTP_IS_GPU_COMPILER
@@ -220,6 +221,89 @@ class Vector {
   DeviceView<T> Device() const { return view_; }
 
   const clio::cte::core::TagId &TagId() const { return view_.base.tag_id; }
+
+  // ---- Vector-owned out-of-core tiers ------------------------------------
+  // The DRAM mirror, the pinned-span HBM cache, and the transient stage
+  // ring are tiers OF THE VECTOR: it allocates them, fills them through the
+  // CTE (which stays the source of truth for bytes), owns the admission
+  // policy and the copy stream, and publishes the mirror in its device
+  // view. Callers only orchestrate WHICH spans a launch needs.
+
+  /** Build the pinned-host DRAM tier for a FLAT-layout vector: allocate
+   *  total_bytes pinned and fill through CTE GetBlob on the flat blob.
+   *  Publishes DeviceViewBase::host_mirror. Returns false (and leaves the
+   *  vector fully functional on its fault path) on any failure. */
+  bool BuildHostMirror(clio::run::u64 total_bytes);
+  const unsigned char *HostMirror() const {
+#if !CTP_IS_DEVICE_PASS
+    return impl_ ? impl_->host_mirror : nullptr;
+#else
+    return nullptr;
+#endif
+  }
+  clio::run::u64 MirrorBytes() const {
+#if !CTP_IS_DEVICE_PASS
+    return impl_ ? impl_->mirror_bytes : 0;
+#else
+    return 0;
+#endif
+  }
+
+  /** Size the VRAM span tiers: a transient ring of ring_bytes and a
+   *  pinned-span slab of min(slab_cap_max, free - vram_reserve). Creates
+   *  the copy stream + event pool. Halves each request until it fits. */
+  bool ReserveSpanCaches(clio::run::u64 ring_bytes,
+                         clio::run::u64 vram_reserve,
+                         clio::run::u64 slab_cap_max);
+
+  /** Stream every span copy runs on; wait launches on RecordCopyEvent(). */
+  void *CopyStream() const {
+#if !CTP_IS_DEVICE_PASS
+    return impl_ ? (void *) impl_->copy_stream : nullptr;
+#else
+    return nullptr;
+#endif
+  }
+  /** Record a pooled event on the copy stream and return it. */
+  void *RecordCopyEvent();
+
+  /** Look up / admit the span [off, off+len) of the mirror in the pinned
+   *  cache. permanent=true admits on first touch with an exact allocation
+   *  (static tensors); otherwise two-touch admission into the slab. On a
+   *  miss that admits, the H2D copy is issued on CopyStream() and *copied
+   *  is set. Returns nullptr when not admitted (caller stages transient
+   *  or reads the mirror). */
+  const unsigned char *PinnedSpan(clio::run::u64 off, clio::run::u64 len,
+                                  bool permanent, bool *copied);
+
+  /** Bump-allocate len bytes of the transient ring. On wrap, fences the
+   *  copy stream on main_stream progress so no in-flight consumer still
+   *  reads the region being reused. */
+  unsigned char *StageTransient(clio::run::u64 len, void *main_stream);
+
+  /** Issue the H2D copy of mirror span [off,off+len) into dst on the copy
+   *  stream. dst is normally a StageTransient() slice. */
+  bool CopySpan(unsigned char *dst, clio::run::u64 off, clio::run::u64 len);
+
+  clio::run::u64 RingCap() const {
+#if !CTP_IS_DEVICE_PASS
+    return impl_ ? impl_->ring_cap : 0;
+#else
+    return 0;
+#endif
+  }
+
+  /** Span-tier counters (pinned hits/misses, slab/static bytes). */
+  void SpanStats(clio::run::u64 *hits, clio::run::u64 *misses,
+                 clio::run::u64 *slab_used,
+                 clio::run::u64 *static_bytes) const {
+#if !CTP_IS_DEVICE_PASS
+    if (hits) *hits = impl_ ? impl_->span_hits : 0;
+    if (misses) *misses = impl_ ? impl_->span_misses : 0;
+    if (slab_used) *slab_used = impl_ ? impl_->slab_used : 0;
+    if (static_bytes) *static_bytes = impl_ ? impl_->static_bytes : 0;
+#endif
+  }
 
   /** Read a coherent snapshot of the pinned-host counters. Caller
    *  should cudaDeviceSync first so the device's atomicAdd writes
@@ -979,6 +1063,27 @@ struct Vector<T>::Impl {
    *  and there is work that needs handling. */
   bool persistent_kernel_running = false;
   std::string tag_name;
+  // ---- Vector-owned out-of-core tiers (see BuildHostMirror et al.) ----
+  /** Pinned-host DRAM tier: the whole flat blob, UVA device-readable. */
+  unsigned char *host_mirror = nullptr;
+  clio::run::u64 mirror_bytes = 0;
+  /** Pinned-span HBM cache slab (bump-allocated, two-touch admission). */
+  unsigned char *span_slab = nullptr;
+  clio::run::u64 slab_cap = 0, slab_used = 0;
+  /** Transient stage ring for spans read exactly once. */
+  unsigned char *stage_ring = nullptr;
+  clio::run::u64 ring_cap = 0, ring_head = 0;
+  /** Copy stream all span DMA runs on, + reusable event pool. */
+  cudaStream_t copy_stream = nullptr;
+  cudaEvent_t copy_events[256] = {};
+  clio::run::u32 copy_ev_idx = 0;
+  /** Span cache: flat offset -> device pointer (slab or permanent). */
+  std::unordered_map<clio::run::u64, unsigned char *> span_cache;
+  std::unordered_map<clio::run::u64, clio::run::u32> span_seen;
+  clio::run::u64 span_hits = 0, span_misses = 0;
+  /** Permanent (first-touch) admissions get exact cudaMallocs under
+   *  their own budget -- static model tensors, reused every token. */
+  clio::run::u64 static_bytes = 0, static_cap = 3ull << 30;
   /** Page->family policy (see Vector ctor). 0 => single family b0. */
   clio::run::u64 fam_ppb = 0;
   /** Optional full-name override for host-side page name composition. */
@@ -1333,6 +1438,186 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
 }
 
 template <typename T>
+inline bool Vector<T>::BuildHostMirror(clio::run::u64 total_bytes) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || !view_.base.flat_layout || total_bytes == 0) return false;
+  if (impl_->host_mirror != nullptr) return true;
+  unsigned char *mirror = nullptr;
+  if (cudaMallocHost(&mirror, total_bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  // Fill THROUGH the CTE: GetBlob on the flat blob, 64 MiB per hop. The
+  // CTE remains the sole source of truth for the bytes; the mirror is a
+  // tier, not a second loading pipeline.
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+  const clio::run::u64 kChunk = 64ull << 20;
+  auto buf = CLIO_IPC->AllocateBuffer(kChunk);
+  bool ok = buf.ptr_ != nullptr;
+  for (clio::run::u64 off = 0; ok && off < total_bytes; off += kChunk) {
+    const clio::run::u64 n = std::min<clio::run::u64>(total_bytes - off,
+                                                      kChunk);
+    auto gt = cte.AsyncGetBlob(view_.base.tag_id, "w", off, n, 0,
+                               buf.shm_.template Cast<void>(),
+                               clio::run::PoolQuery::Local());
+    gt.Wait();
+    if (gt->GetReturnCode() != 0) { ok = false; break; }
+    std::memcpy(mirror + off, buf.ptr_, n);
+  }
+  if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
+  if (!ok) {
+    cudaFreeHost(mirror);
+    return false;
+  }
+  impl_->host_mirror = mirror;
+  impl_->mirror_bytes = total_bytes;
+  view_.base.host_mirror = mirror;
+  return true;
+#else
+  (void) total_bytes;
+  return false;
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::ReserveSpanCaches(clio::run::u64 ring_bytes,
+                                         clio::run::u64 vram_reserve,
+                                         clio::run::u64 slab_cap_max) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_) return false;
+  for (clio::run::u64 want = ring_bytes; want >= (64ull << 20);
+       want >>= 1) {
+    if (cudaMalloc(&impl_->stage_ring, want) == cudaSuccess) {
+      impl_->ring_cap = want;
+      break;
+    }
+    impl_->stage_ring = nullptr;
+    cudaGetLastError();
+  }
+  size_t mfree = 0, mtot = 0;
+  cudaMemGetInfo(&mfree, &mtot);
+  clio::run::u64 slab_max =
+      (mfree > vram_reserve) ? (clio::run::u64) mfree - vram_reserve : 0;
+  if (slab_max > slab_cap_max) slab_max = slab_cap_max;
+  for (clio::run::u64 want = slab_max; want >= (256ull << 20);
+       want >>= 1) {
+    if (cudaMalloc(&impl_->span_slab, want) == cudaSuccess) {
+      impl_->slab_cap = want;
+      break;
+    }
+    impl_->span_slab = nullptr;
+    cudaGetLastError();
+  }
+  if (impl_->copy_stream == nullptr) {
+    cudaStreamCreateWithFlags(&impl_->copy_stream, cudaStreamNonBlocking);
+    for (auto &ev : impl_->copy_events) {
+      cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    }
+  }
+  return impl_->stage_ring != nullptr;
+#else
+  (void) ring_bytes; (void) vram_reserve; (void) slab_cap_max;
+  return false;
+#endif
+}
+
+template <typename T>
+inline void *Vector<T>::RecordCopyEvent() {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || impl_->copy_stream == nullptr) return nullptr;
+  cudaEvent_t ev = impl_->copy_events[impl_->copy_ev_idx++ % 256];
+  cudaEventRecord(ev, impl_->copy_stream);
+  return (void *) ev;
+#else
+  return nullptr;
+#endif
+}
+
+template <typename T>
+inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
+                                                  clio::run::u64 len,
+                                                  bool permanent,
+                                                  bool *copied) {
+#if !CTP_IS_DEVICE_PASS
+  if (copied) *copied = false;
+  if (!impl_ || impl_->host_mirror == nullptr) return nullptr;
+  if (off >= impl_->mirror_bytes) return nullptr;
+  if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
+  auto it = impl_->span_cache.find(off);
+  if (it != impl_->span_cache.end()) {
+    impl_->span_hits++;
+    return it->second;
+  }
+  impl_->span_misses++;
+  unsigned char *dst = nullptr;
+  if (permanent) {
+    if (impl_->static_bytes + len > impl_->static_cap) return nullptr;
+    if (cudaMalloc(&dst, len) != cudaSuccess) {
+      cudaGetLastError();
+      return nullptr;
+    }
+    impl_->static_bytes += len;
+  } else {
+    if (impl_->span_slab == nullptr ||
+        impl_->slab_used + len > impl_->slab_cap ||
+        ++impl_->span_seen[off] < 2) {
+      return nullptr;
+    }
+    dst = impl_->span_slab + impl_->slab_used;
+    impl_->slab_used += (len + 255ull) & ~255ull;
+  }
+  cudaMemcpyAsync(dst, impl_->host_mirror + off, len,
+                  cudaMemcpyHostToDevice, impl_->copy_stream);
+  impl_->span_cache.emplace(off, dst);
+  if (copied) *copied = true;
+  return dst;
+#else
+  (void) off; (void) len; (void) permanent; (void) copied;
+  return nullptr;
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
+                                clio::run::u64 len) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || impl_->host_mirror == nullptr || dst == nullptr) return false;
+  if (off >= impl_->mirror_bytes) return false;
+  if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
+  return cudaMemcpyAsync(dst, impl_->host_mirror + off, len,
+                         cudaMemcpyHostToDevice,
+                         impl_->copy_stream) == cudaSuccess;
+#else
+  (void) dst; (void) off; (void) len;
+  return false;
+#endif
+}
+
+template <typename T>
+inline unsigned char *Vector<T>::StageTransient(clio::run::u64 len,
+                                                void *main_stream) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || impl_->stage_ring == nullptr || len > impl_->ring_cap) {
+    return nullptr;
+  }
+  if (impl_->ring_head + len > impl_->ring_cap) {
+    impl_->ring_head = 0;
+    // Ring wrap with copies on the copy stream: fence it on the consumer
+    // stream's progress so no in-flight reader still uses the region.
+    cudaEvent_t wev = impl_->copy_events[impl_->copy_ev_idx++ % 256];
+    cudaEventRecord(wev, (cudaStream_t) main_stream);
+    cudaStreamWaitEvent(impl_->copy_stream, wev, 0);
+  }
+  unsigned char *out = impl_->stage_ring + impl_->ring_head;
+  impl_->ring_head += (len + 255ull) & ~255ull;
+  return out;
+#else
+  (void) len; (void) main_stream;
+  return nullptr;
+#endif
+}
+
+template <typename T>
 inline Vector<T>::~Vector() {
 #if !CTP_IS_DEVICE_PASS
   if (!impl_) return;
@@ -1372,6 +1657,24 @@ inline Vector<T>::~Vector() {
     ctp::GpuApi::FreeHost(impl_->kernel_stop_flag);
   if (impl_->stats)
     cudaFreeHost(impl_->stats);
+  if (impl_->copy_stream) {
+    cudaStreamSynchronize(impl_->copy_stream);
+    for (auto &ev : impl_->copy_events) {
+      if (ev) cudaEventDestroy(ev);
+    }
+    cudaStreamDestroy(impl_->copy_stream);
+  }
+  for (auto &kv : impl_->span_cache) {
+    // Slab entries are freed with the slab; permanent spans are exact
+    // allocations outside it.
+    if (impl_->span_slab == nullptr || kv.second < impl_->span_slab ||
+        kv.second >= impl_->span_slab + impl_->slab_cap) {
+      cudaFree(kv.second);
+    }
+  }
+  if (impl_->span_slab) cudaFree(impl_->span_slab);
+  if (impl_->stage_ring) cudaFree(impl_->stage_ring);
+  if (impl_->host_mirror) cudaFreeHost(impl_->host_mirror);
 #endif  // !CTP_IS_DEVICE_PASS
 }
 

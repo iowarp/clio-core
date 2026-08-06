@@ -105,6 +105,11 @@ struct DeviceViewBase {
    *  (gp * page_size_bytes) instead of per-page blob names. Makes k-page
    *  batch faults expressible with the existing Pod task. */
   clio::run::u32 flat_layout;
+  /** Pinned-host mirror of the whole flat blob (UVA device-readable), or
+   *  nullptr. The Vector's DRAM tier for out-of-core flat models: reads
+   *  that miss every device tier stream from here over PCIe. Built by
+   *  Vector::BuildHostMirror(), which fills it THROUGH the CTE. */
+  const unsigned char *host_mirror;
   clio::run::u32 gpu_pages_per_block;   /**< HBM cache slots per block. */
   clio::run::u32 host_pages_per_block;  /**< DRAM cache slots per block. 0 ⇒ legacy. */
   clio::run::u64 page_size_bytes;

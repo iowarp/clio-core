@@ -143,7 +143,8 @@ clio::run::u64 ElemsPerPage() { return kPageSizeBytes / sizeof(clio::run::u32); 
 
 /**
  * Populate `tag` the way the CAE assimilator does: host-side PutBlob of
- * fully-composed "<tag>_b0_pi<page>" pages. This is the ONLY way to get real
+ * bare-stem "b0_pi<page>" pages (tag travels as tag_id_ only -- prefixed
+ * names overflowed chi::string SSO). This is the ONLY way to get real
  * blobs into the store right now, because Vector::FlushAllSync() is a no-op
  * (see the defect notes in this file's header) and the cache-manager thread
  * does not drain dirty pages in kLegacy single-tier mode. It is also exactly
@@ -168,7 +169,7 @@ void PopulateViaPutBlob(const std::string &tag, clio::run::u32 logical_pages) {
     for (clio::run::u64 j = 0; j < epp; ++j) {
       vals[j] = static_cast<clio::run::u32>((p * epp + j) * 2u);
     }
-    std::string blob_name = tag + "_b0_pi" + std::to_string(p);
+    std::string blob_name = "b0_pi" + std::to_string(p);
     auto task = cte->AsyncPutBlob(tag_id, blob_name, 0, kPageSizeBytes,
                                   buf.shm_.template Cast<void>(), 1.0f,
                                   clio::cte::core::Context(), 0);
