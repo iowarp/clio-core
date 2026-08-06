@@ -322,13 +322,16 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
     }
     FlushPage(ipc, v, block_idx, p, s);
   }
-  // Free slot?
+  // Free slot? CLAIM before draining. DrainGet WAITS on the victim's future,
+  // so two CUDA blocks sharing this cache block could otherwise both drain the
+  // SAME in-flight fault and one would consume the other's completion. The
+  // slot is returned with kPageBusy held; Resolve releases it after faulting.
   for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
-    if (b->pages[s].page_idx < 0) {
-      DrainPut(&b->pages[s]);
-      DrainGet(&b->pages[s], (DeviceViewBase *) &v.base);
-      return s;
-    }
+    if (b->pages[s].page_idx >= 0) continue;
+    if (!detail::TryAcquireBusy(&b->pages[s])) continue;
+    DrainPut(&b->pages[s]);
+    DrainGet(&b->pages[s], (DeviceViewBase *) &v.base);
+    return s;
   }
   // LRU within range, SKIPPING slots another CUDA block is already binding or
   // fetching. BlockIdx() wraps blockIdx.x % nblocks, so several CUDA blocks
@@ -343,7 +346,14 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
       lru = s;
     }
   }
-  if (lru == tier_hi) lru = tier_lo;   // every slot busy: caller retries
+  if (lru == tier_hi) lru = tier_lo;   // everything busy: fall back
+  // Same rule: claim before draining. A failed claim means another block is
+  // already binding this slot, so scan for one we can actually take.
+  if (!detail::TryAcquireBusy(&b->pages[lru])) {
+    for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
+      if (detail::TryAcquireBusy(&b->pages[s])) { lru = s; break; }
+    }
+  }
   DrainPut(&b->pages[lru]);
   DrainGet(&b->pages[lru], (DeviceViewBase *) &v.base);
   return lru;
@@ -567,14 +577,11 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
       // deadlocks: with many CUDA blocks per cache block the spinners occupy
       // the SMs and starve the holder. Here a failed claim just picks a
       // DIFFERENT victim next round, so every block makes progress.
-      clio::run::u32 slot = 0;
-      Page *p = nullptr;
-      for (int attempt = 0; attempt < 64; ++attempt) {
-        slot = EvictSlot(ipc, v, block_idx);
-        Page *cand = &b->pages[slot];
-        if (detail::TryAcquireBusy(cand)) { p = cand; break; }
-      }
-      if (p == nullptr) { p = &b->pages[slot]; }   // give up: last resort
+      // EvictSlot returns the victim with kPageBusy ALREADY held, claimed
+      // BEFORE it drained the slot's outstanding futures. Claiming afterwards
+      // (what this did) was too late -- the drain had already raced.
+      clio::run::u32 slot = EvictSlot(ipc, v, block_idx);
+      Page *p = &b->pages[slot];
       p->page_idx = target_page;
       p->lru_clock = clock64();
       p->modify_min = -1;
