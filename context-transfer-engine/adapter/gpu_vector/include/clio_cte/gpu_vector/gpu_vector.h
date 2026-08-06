@@ -254,6 +254,22 @@ class Vector {
 #endif
   }
 
+  /** Fetch [off, off+len) of the model image STRAIGHT INTO DEVICE MEMORY
+   *  through the CTE: per-page GetBlobs (16 in flight) routed via the
+   *  storage pool, so a COMPRESSED tag's pages decompress on the GPU --
+   *  kHBM-resident pages never cross PCIe at all (D2D + nvcomp), ram-tier
+   *  pages cross compressed. Blocking: data is resident on return. */
+  bool FetchSpanDevice(unsigned char *dst_dev, clio::run::u64 off,
+                       clio::run::u64 len);
+
+  /** Logical model bytes for span clamping when no DRAM tier is built
+   *  (compressed mode fetches device-direct instead). */
+  void SetLogicalBytes(clio::run::u64 n) {
+#if !CTP_IS_DEVICE_PASS
+    if (impl_ && impl_->mirror_bytes == 0) impl_->mirror_bytes = n;
+#endif
+  }
+
   /** Partial-mode page residency (see BuildHostTier). */
   unsigned char *EnsureHostPage(clio::run::u64 gp);
 
@@ -1722,8 +1738,8 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
                                                   bool *copied) {
 #if !CTP_IS_DEVICE_PASS
   if (copied) *copied = false;
-  if (!impl_ || impl_->host_arena == nullptr) return nullptr;
-  if (off >= impl_->mirror_bytes) return nullptr;
+  if (!impl_) return nullptr;
+  if (impl_->mirror_bytes != 0 && off >= impl_->mirror_bytes) return nullptr;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
   auto it = impl_->span_cache.find(off);
   if (it != impl_->span_cache.end()) {
@@ -1765,7 +1781,13 @@ template <typename T>
 inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
                                 clio::run::u64 len) {
 #if !CTP_IS_DEVICE_PASS
-  if (!impl_ || impl_->host_arena == nullptr || dst == nullptr) return false;
+  if (!impl_ || dst == nullptr) return false;
+  if (impl_->host_arena == nullptr) {
+    // No DRAM tier (compressed mode): fetch device-direct through the CTE.
+    // kHBM-resident pages decompress VRAM->VRAM; nothing uncompressed
+    // crosses PCIe.
+    return FetchSpanDevice(dst, off, len);
+  }
   if (off >= impl_->mirror_bytes) return false;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
   if (impl_->host_mirror != nullptr) {   // full coverage: one flat copy
@@ -1794,6 +1816,50 @@ inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
   return true;
 #else
   (void) dst; (void) off; (void) len;
+  return false;
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
+                                       clio::run::u64 off,
+                                       clio::run::u64 len) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || dst_dev == nullptr) return false;
+  if (impl_->mirror_bytes != 0) {
+    if (off >= impl_->mirror_bytes) return false;
+    if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
+  }
+  clio::cte::core::Client cte(impl_->cte_pool_id);
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> infl;
+  bool ok = true;
+  clio::run::u64 cur = off;
+  while (ok && cur < off + len) {
+    const clio::run::u64 gp   = cur / page;
+    const clio::run::u64 poff = cur - gp * page;
+    const clio::run::u64 seg  =
+        std::min<clio::run::u64>(page - poff, off + len - cur);
+    const std::string name =
+        view_.base.flat_layout ? std::string("w") : PageBlobName(gp);
+    const clio::run::u64 boff = view_.base.flat_layout ? cur : poff;
+    infl.push_back(cte.AsyncGetBlob(
+        view_.base.tag_id, name, boff, seg, 0,
+        (char *) dst_dev + (cur - off), clio::run::PoolQuery::Local()));
+    cur += seg;
+    if (infl.size() >= 16) {
+      infl.front().Wait();
+      if (infl.front()->GetReturnCode() != 0) ok = false;
+      infl.erase(infl.begin());
+    }
+  }
+  for (auto &f : infl) {
+    f.Wait();
+    if (f->GetReturnCode() != 0) ok = false;
+  }
+  return ok;
+#else
+  (void) dst_dev; (void) off; (void) len;
   return false;
 #endif
 }
