@@ -126,6 +126,11 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
     auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
     const clio::run::u64 base = static_cast<clio::run::u64>(p) * kPageSizeBytes;
     for (clio::run::u64 j = 0; j < kPageSizeBytes; ++j) bytes[j] = PatternAt(base + j);
+    if (p == 0) {
+      printf("  [seed-src] ptr=%p bytes[0..3]=%02x %02x %02x %02x (want %02x %02x %02x %02x)\n",
+             (void *) bytes, bytes[0], bytes[1], bytes[2], bytes[3],
+             PatternAt(0), PatternAt(1), PatternAt(2), PatternAt(3));
+    }
     const std::string blob = tag + "_b" + std::to_string(p / fam_pages) +
                              "_pi" + std::to_string(p);
     auto task = cte->AsyncPutBlob(tag_id, blob, 0, kPageSizeBytes,
@@ -166,14 +171,15 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
   // obtain the TagId -- llama_geom does the same. A reader constructed first
   // snapshots page metadata and never sees blobs written afterwards.
   {
+    // EXACTLY llama_geom's seeding vector: no storage_pool_id, no
+    // family_pages. Passing PoolId(0, 0) here routed the put at a pool the
+    // seeding path does not have, and the writes silently did nothing.
     gv::Vector<uint8_t> seeder(tag, /*nblocks=*/1, /*gpu_id=*/0,
                                /*gpu_pages_per_block=*/1,
                                /*host_pages_per_block=*/0, kPageSizeBytes,
-                               /*cache_period_us=*/200, gv::CacheMode::kAsync,
+                               /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
                                /*manager_threads_per_block=*/32,
-                               /*allow_cold_miss_fault=*/true,
-                               /*storage_pool_id=*/clio::run::PoolId(0, 0),
-                               /*family_pages=*/kLogicalPages);
+                               /*allow_cold_miss_fault=*/true);
     SeedTag(tag, seeder.TagId(), kLogicalPages);
   }
   gv::Vector<uint8_t> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
