@@ -266,6 +266,7 @@ CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
   page->active_get = ipc->Send(fp);
 }
 
+
 /** Wait on any in-flight put for this page, then clear the slot. */
 CTP_GPU_FUN void DrainPut(Page *page) {
   if (!page->active_put.IsNull()) {
@@ -274,6 +275,7 @@ CTP_GPU_FUN void DrainPut(Page *page) {
     detail::AtomicClearBitsU32(&page->flags, kPagePutInFlight);
   }
 }
+
 
 /** Wait on any in-flight get for this page, then clear the slot. */
 CTP_GPU_FUN void DrainGet(Page *page, DeviceViewBase *vb = nullptr) {
@@ -297,6 +299,90 @@ CTP_GPU_FUN void DrainGet(Page *page, DeviceViewBase *vb = nullptr) {
     }
     page->active_get = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPageGetInFlight);
+  }
+}
+
+/** Claim k CONSECUTIVE slots (kPageBusy held on each), or return false.
+ *  Consecutive slots are contiguous device memory within a block, which is
+ *  what lets k pages arrive with ONE flat-offset read. */
+template <typename T>
+CTP_GPU_FUN bool EvictRun(::clio::run::gpu::IpcManager *ipc,
+                          const DeviceView<T> &v, clio::run::u32 block_idx,
+                          clio::run::u32 k, clio::run::u32 *out_s0) {
+  Block *b = GetBlock(v.base, block_idx);
+  const clio::run::u32 total = v.base.gpu_pages_per_block;
+  if (k == 0 || k > total) return false;
+  for (clio::run::u32 s0 = 0; s0 + k <= total; ++s0) {
+    clio::run::u32 got = 0;
+    for (; got < k; ++got) {
+      Page *p = &b->pages[s0 + got];
+      if (p->flags & (kPageBusy | kPageGetInFlight)) break;
+      if (!detail::TryAcquireBusy(p)) break;
+      // claimed; drain any residue so the slot is quiescent
+      DrainPut(p);
+      DrainGet(p, (DeviceViewBase *) &v.base);
+    }
+    if (got == k) { *out_s0 = s0; return true; }
+    for (clio::run::u32 r = 0; r < got; ++r)
+      detail::ReleaseBusy(&b->pages[s0 + r]);
+  }
+  return false;
+}
+
+/** Issue ONE flat-offset read covering pages [p0, p0+k) into the k claimed
+ *  consecutive slots starting at s0. Uses the HEAD slot's Pod task; all k
+ *  pages share its future and are marked with modify_max = head slot so the
+ *  completion SWEEP (BatchSweep) can clear the whole run at once. Waiting
+ *  happens at first ACCESS, not here. */
+template <typename T>
+CTP_GPU_FUN void FaultRun(::clio::run::gpu::IpcManager *ipc,
+                          const DeviceView<T> &v, clio::run::u32 block_idx,
+                          clio::run::u32 s0, int32_t p0, clio::run::u32 k) {
+  Block *b = GetBlock(v.base, block_idx);
+  auto *task = GetGetTask(v.base, block_idx, s0);
+  task->task_flags_.Clear();
+  task->return_code_.store(0);
+  task->task_id_ = clio::run::CreateTaskId();
+  task->offset_  = static_cast<clio::run::u64>(p0) * v.base.page_size_bytes;
+  task->size_    = static_cast<clio::run::u64>(k) * v.base.page_size_bytes;
+  task->gpu_page_idx_   = clio::cte::core::PodGetBlobTask::kNoPageIdx;
+  task->gpu_family_idx_ = clio::cte::core::PodGetBlobTask::kNoFamilyIdx;
+  task->blob_data_ =
+      detail::MakeBlobShmPtr(b->pages[s0].device_ptr, v.base.pages_alloc_id);
+  ctp::ipc::FullPtr<clio::cte::core::PodGetBlobTask> fp;
+  fp.shm_.alloc_id_ = v.base.get_pool_alloc_id;
+  fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
+  fp.ptr_ = task;
+  auto fut = ipc->Send(fp);
+  for (clio::run::u32 i = 0; i < k; ++i) {
+    Page *p = &b->pages[s0 + i];
+    p->page_idx   = p0 + static_cast<int32_t>(i);
+    p->lru_clock  = clock64();
+    p->modify_min = -1;
+    p->modify_max = static_cast<int32_t>(s0);   // batch membership marker
+    p->active_get = fut;
+    detail::AtomicOrU32(&p->flags, kPageGetInFlight);
+    detail::ReleaseBusy(p);
+  }
+}
+
+/** After a batch member's completion has been OBSERVED (its shared future
+ *  waited), clear the in-flight flag and stale future copies on EVERY member
+ *  of that batch. Without this, the head slot's task could be reinitialised
+ *  for a later fault while unaccessed members still poll its old memory --
+ *  a spin that never ends. modify_max carries the head slot. */
+CTP_GPU_FUN void BatchSweep(const DeviceViewBase &vb, clio::run::u32 block_idx,
+                            Page *observed) {
+  const int32_t head = observed->modify_max;
+  if (head < 0) return;
+  Block *b = GetBlock(vb, block_idx);
+  const clio::run::u32 total = vb.gpu_pages_per_block;
+  for (clio::run::u32 s = 0; s < total; ++s) {
+    Page *p = &b->pages[s];
+    if (p->modify_max != head) continue;
+    p->modify_max = -1;
+    detail::AtomicClearBitsU32(&p->flags, kPageGetInFlight);
+    p->active_get = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
   }
 }
 
@@ -675,7 +761,12 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
   }
 
   // Wait on outstanding fault before returning the byte (read path).
-  if (!is_write) DrainGet(hit);
+  if (!is_write) {
+    DrainGet(hit);
+    // A batch member's completion clears the WHOLE run (stale-future guard).
+    if (v.base.flat_layout && hit->modify_max >= 0)
+      BatchSweep(v.base, block_idx, hit);
+  }
 
   // LRU bookkeeping: cheap monotonic block-local counter would be ideal,
   // but lru_clock is read by the manager rescore phase. For now leave
