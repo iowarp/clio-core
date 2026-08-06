@@ -254,8 +254,14 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
 // Cases
 // ---------------------------------------------------------------------------
 
-/** Cache holds 4 of 24 pages: 6x oversubscribed, so nearly every span faults.
- *  This is the qwen3-coder configuration that produced garbage tokens. */
+/** 6x oversubscribed, so nearly every span faults -- the qwen3-coder shape.
+ *
+ *  NOTE grid == nblocks here, so BlockIdx() (blockIdx.x % nblocks) never
+ *  wraps and each CUDA block owns its cache block outright. This case PASSES.
+ *  The two cases that fail both run grid > nblocks. Taken together that
+ *  isolates the defect to concurrent access to ONE cache block by several
+ *  CUDA blocks -- not to oversubscription, eviction, chunk alignment, or
+ *  page geometry, all of which this passing case also exercises. */
 TEST_CASE("gpu_vector: oversubscribed sequential read is byte-exact",
           "[gpu_vector][oom]") {
   RunSpanCase("gvm_oversub", /*nblocks=*/4, /*pages_per_block=*/1, /*grid=*/4,
