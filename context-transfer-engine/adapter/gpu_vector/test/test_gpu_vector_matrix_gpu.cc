@@ -35,6 +35,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -131,6 +132,25 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
                                   buf.shm_.template Cast<void>(), 1.0f,
                                   clio::cte::core::Context(), 0);
     task.Wait();
+  }
+
+  // Prove the fixture actually wrote data BEFORE any kernel runs. The matrix
+  // previously reported ~100% mismatches with an exact 1/256 match rate --
+  // i.e. reads returning all zeros -- which looked like a paging defect but
+  // was indistinguishable from the seeding silently doing nothing.
+  {
+    auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
+    auto *got = reinterpret_cast<uint8_t *>(buf.ptr_);
+    std::memset(got, 0, 256);
+    const std::string blob = tag + "_b0_pi0";
+    auto g = cte->AsyncGetBlob(tag_id, blob.c_str(), 0, kPageSizeBytes, 0,
+                               buf.shm_.template Cast<void>());
+    g.Wait();
+    clio::run::u64 bad = 0;
+    for (clio::run::u64 j = 0; j < 4096; ++j) if (got[j] != PatternAt(j)) ++bad;
+    printf("  [seed-check] '%s' first 4 KiB: %llu mismatches (0 expected)\n",
+           blob.c_str(), (unsigned long long) bad);
+    REQUIRE(bad == 0);
   }
 }
 
