@@ -100,6 +100,11 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
   const size_t kDefaultPage = 2ULL * 1024 * 1024;  // 2 MiB
   size_t page_size = ParseFormatParam(ctx.format, "page", kDefaultPage);
   size_t nblocks = ParseFormatParam(ctx.format, "nblocks", 1);
+  // flat=1: store the model as ONE blob ("w"), pages addressed by OFFSET.
+  // This is what makes multi-page batch faults possible with the EXISTING
+  // Pod task (offset_/size_ fields, no per-page name lookup) -- k contiguous
+  // pages become one read of k*page_size at offset p*page_size.
+  const bool flat = ParseFormatParam(ctx.format, "flat", 0) != 0;
   if (page_size == 0) page_size = kDefaultPage;
   if (nblocks == 0) nblocks = 1;
 
@@ -224,9 +229,11 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
     // the handler. A 44-char tag was SILENTLY truncated to 31, so every device
     // fault missed with rc=1 and the weights stayed zero with no error
     // anywhere. Dropping the prefix removes the whole failure class.
-    std::string blob_name = "b" + std::to_string(block) + "_pi" +
-                            std::to_string(p);
-    auto task = page_client->AsyncPutBlob(tag_id, blob_name, 0, page_size,
+    std::string blob_name = flat ? std::string("w")
+                                 : "b" + std::to_string(block) + "_pi" +
+                                   std::to_string(p);
+    const size_t put_off = flat ? p * page_size : 0;
+    auto task = page_client->AsyncPutBlob(tag_id, blob_name, put_off, page_size,
                                           buf.shm_.template Cast<void>(), 1.0f,
                                           clio::cte::core::Context(), 0);
     active_tasks.push_back(task);
