@@ -330,15 +330,20 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
       return s;
     }
   }
-  // LRU within range.
-  clio::run::u32 lru = tier_lo;
-  clio::run::u64 lru_clock = b->pages[tier_lo].lru_clock;
-  for (clio::run::u32 s = tier_lo + 1; s < tier_hi; ++s) {
-    if (b->pages[s].lru_clock < lru_clock) {
+  // LRU within range, SKIPPING slots another CUDA block is already binding or
+  // fetching. BlockIdx() wraps blockIdx.x % nblocks, so several CUDA blocks
+  // share this cache block; handing two of them the same victim let both write
+  // the same per-(block, slot) task struct.
+  clio::run::u32 lru = tier_hi;
+  clio::run::u64 lru_clock = 0;
+  for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
+    if (b->pages[s].flags & (kPageBusy | kPageGetInFlight)) continue;
+    if (lru == tier_hi || b->pages[s].lru_clock < lru_clock) {
       lru_clock = b->pages[s].lru_clock;
       lru = s;
     }
   }
+  if (lru == tier_hi) lru = tier_lo;   // every slot busy: caller retries
   DrainPut(&b->pages[lru]);
   DrainGet(&b->pages[lru], (DeviceViewBase *) &v.base);
   return lru;
@@ -558,13 +563,23 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
       if (v.base.stats && !is_write) {
         atomicAdd_system(&v.base.stats->resolve_fault_get, 1ULL);
       }
-      clio::run::u32 slot = EvictSlot(ipc, v, block_idx);
-      Page *p = &b->pages[slot];
+      // CLAIM-OR-RETRY, not a spinlock. A GPU spinlock across blocks
+      // deadlocks: with many CUDA blocks per cache block the spinners occupy
+      // the SMs and starve the holder. Here a failed claim just picks a
+      // DIFFERENT victim next round, so every block makes progress.
+      clio::run::u32 slot = 0;
+      Page *p = nullptr;
+      for (int attempt = 0; attempt < 64; ++attempt) {
+        slot = EvictSlot(ipc, v, block_idx);
+        Page *cand = &b->pages[slot];
+        if (detail::TryAcquireBusy(cand)) { p = cand; break; }
+      }
+      if (p == nullptr) { p = &b->pages[slot]; }   // give up: last resort
       p->page_idx = target_page;
       p->lru_clock = clock64();
       p->modify_min = -1;
       p->modify_max = -1;
-      p->flags = 0;
+      p->flags = kPageBusy;   // hold the claim across bind + fault
       if (!is_write) {
         FaultPage(ipc, v, block_idx, p, slot, target_page,
                   fam_fn(v.base, target_page));
@@ -577,6 +592,7 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
         // (77 faults issued, 0 completions ever observed).
         DrainGet(p, (DeviceViewBase *) &v.base);
       }
+      detail::ReleaseBusy(p);
       hit = p;
       last = hit;
       detail::RescorePush(&b->rescore_q,
