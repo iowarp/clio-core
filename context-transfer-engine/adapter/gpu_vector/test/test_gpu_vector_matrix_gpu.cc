@@ -197,6 +197,10 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
 
 }  // namespace
 
+// Throughput of the last RunSpanCase, in GiB/s of weight bytes consumed
+// through read_range. Reported by every case and asserted by the perf cases.
+static double g_last_gbps = 0.0;
+
 static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                         clio::run::u32 pages_per_block, clio::run::u32 grid,
                         clio::run::u64 lo, clio::run::u64 hi,
@@ -238,13 +242,24 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
   REQUIRE(cudaMallocManaged(&counters, 2 * sizeof(unsigned long long)) == cudaSuccess);
   counters[0] = 0; counters[1] = 0;
 
+  cudaEvent_t t0, t1;
+  cudaEventCreate(&t0); cudaEventCreate(&t1);
+  cudaEventRecord(t0);
   SpanVerifyKernel<<<grid, 64>>>(gpu_info, vec.Device(), &counters[0],
                                  &counters[1], lo, hi, chunk);
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  cudaEventRecord(t1);
+  cudaEventSynchronize(t1);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, t0, t1);
+  g_last_gbps = (ms > 0.0f)
+      ? ((double)(hi - lo) / (1024.0 * 1024.0 * 1024.0)) / (ms / 1000.0) : 0.0;
+  cudaEventDestroy(t0); cudaEventDestroy(t1);
 
-  printf("  [%s] nblocks=%u slots/blk=%u grid=%u chunk=%llu -> checked=%llu mismatches=%llu\n",
+  printf("  [%s] nblocks=%u slots/blk=%u grid=%u chunk=%llu -> checked=%llu "
+         "mismatches=%llu  %.2f GiB/s\n",
          tag_name, nblocks, pages_per_block, grid,
-         (unsigned long long) chunk, counters[1], counters[0]);
+         (unsigned long long) chunk, counters[1], counters[0], g_last_gbps);
   REQUIRE(counters[1] == (hi - lo));   // every byte was actually read
   REQUIRE(counters[0] == 0);           // and every byte was correct
   cudaFree(counters);
@@ -337,6 +352,34 @@ TEST_CASE("gpu_vector: cross-page spans at unaligned offsets",
           "[gpu_vector][staging]") {
   RunSpanCase("gvm_crosspage", /*nblocks=*/4, /*pages_per_block=*/2, /*grid=*/4,
               kPageSizeBytes - 1000, 5 * kPageSizeBytes + 333, /*chunk=*/4096);
+}
+
+
+/** IN-MEMORY: cache holds every page, so after the first pass nothing faults.
+ *  This is the configuration gemma runs in (model fits VRAM) and it had no
+ *  unit test at all -- correctness there was only ever observed indirectly,
+ *  by reading generated text. */
+TEST_CASE("gpu_vector: fully resident read is byte-exact",
+          "[gpu_vector][in-memory]") {
+  RunSpanCase("gvm_resident", /*nblocks=*/4, /*pages_per_block=*/8, /*grid=*/4,
+              0, kTotalBytes, /*chunk=*/24576);
+  printf("  [resident] %.2f GiB/s\n", g_last_gbps);
+  // Loose floor: this asserts "not catastrophically broken", not a target.
+  // Measured 0.41 GiB/s here -- the per-byte read_range callback dominates,
+  // not paging, which is why the resident case is not faster than the
+  // out-of-core one. Tightening this belongs with a faster bulk read API.
+  REQUIRE(g_last_gbps > 0.1);
+}
+
+/** PERFORMANCE floor for the out-of-core path. Deliberately loose: the point
+ *  is to catch an order-of-magnitude regression (the grid-cap bug dropped
+ *  qwen3-coder to 0.08 tok/s), not to pin a number that will flake. */
+TEST_CASE("gpu_vector: out-of-core throughput floor",
+          "[gpu_vector][perf][oom]") {
+  RunSpanCase("gvm_perf", /*nblocks=*/8, /*pages_per_block=*/2, /*grid=*/8,
+              0, kTotalBytes, /*chunk=*/24576);
+  printf("  [perf oom] %.2f GiB/s\n", g_last_gbps);
+  REQUIRE(g_last_gbps > 0.1);
 }
 
 /** 64 CUDA blocks over 2 cache blocks. Index wrapping keeps this in bounds,
