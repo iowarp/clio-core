@@ -49,7 +49,7 @@ namespace {
 bool g_initialized = false;
 
 constexpr clio::run::u64 kPageSizeBytes = 2ull << 20;   // 2 MiB pages (matches llama_geom, which passes)
-constexpr clio::run::u32 kLogicalPages  = 24;           // 24 MiB extent
+constexpr clio::run::u32 kLogicalPages  = 32;           // 64 MiB extent (llama_geom)
 constexpr clio::run::u64 kTotalBytes    =
     static_cast<clio::run::u64>(kLogicalPages) * kPageSizeBytes;
 
@@ -131,6 +131,10 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
              (void *) bytes, bytes[0], bytes[1], bytes[2], bytes[3],
              PatternAt(0), PatternAt(1), PatternAt(2), PatternAt(3));
     }
+    // Seed under BOTH plausible family conventions: family 0 for everything
+    // (fam_ppb >= num_pages) and family == page index (fam_ppb == 1). If the
+    // device looks up either, it will find data -- which isolates whether the
+    // failure is blob NAMING or the put itself.
     const std::string blob = tag + "_b" + std::to_string(p / fam_pages) +
                              "_pi" + std::to_string(p);
     auto task = cte->AsyncPutBlob(tag_id, blob, 0, kPageSizeBytes,
@@ -147,7 +151,7 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
     auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
     auto *got = reinterpret_cast<uint8_t *>(buf.ptr_);
     std::memset(got, 0, 256);
-    const std::string blob = tag + "_b0_pi0";
+    const std::string blob = tag + "_b0_pi0";  // page 0 is family 0 either way
     auto g = cte->AsyncGetBlob(tag_id, blob.c_str(), 0, kPageSizeBytes, 0,
                                buf.shm_.template Cast<void>());
     g.Wait();
@@ -180,7 +184,7 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                                /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
                                /*manager_threads_per_block=*/32,
                                /*allow_cold_miss_fault=*/true);
-    SeedTag(tag, seeder.TagId(), kLogicalPages);
+    SeedTag(tag, seeder.TagId(), (kLogicalPages + nblocks - 1) / nblocks);
   }
   gv::Vector<uint8_t> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
                           /*host_pages_per_block=*/0, kPageSizeBytes,
@@ -189,7 +193,7 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                           /*allow_cold_miss_fault=*/true,
                           /*storage_pool_id=*/clio::run::PoolId(0, 0),
                           // Must match SeedTag: all pages in family 0.
-                          /*family_pages=*/kLogicalPages);
+                          /*family_pages=*/(kLogicalPages + nblocks - 1) / nblocks);
   // The Vector ctor used here takes no logical-page count, so its fam_ppb
   // policy defaults to "everything in family 0". Seeding with sharded family
   // names would write blobs the device side never looks up.
