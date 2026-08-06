@@ -864,6 +864,60 @@ class vector {
   }
 
   /**
+   * BULK read of a contiguous span into `dst`, using 16-byte accesses.
+   *
+   * The callback form above moves ONE ELEMENT per lane per iteration, and the
+   * vector is instantiated with T = uint8_t, so it moves one BYTE per lane:
+   * 32 B per warp-iteration, 768 iterations for a 24 KiB span, each a
+   * dependent global->shared round trip. Measured at ~68 MB/s per block, which
+   * made staging 15x the cost of the dequant it feeds. The per-byte
+   * `consume(index, value)` signature is what forces that granularity, so the
+   * fix is a separate entry point rather than a change to it.
+   *
+   * Falls back to bytes when either side is not 16-byte aligned.
+   */
+  CTP_GPU_FUN void read_range_to(clio::run::u64 lo, clio::run::u64 hi,
+                                 uint8_t *dst) {
+    if (lo >= hi) return;
+    const clio::run::u64 lo0 = lo;
+    clio::run::u32 lane = threadIdx.x & 31;
+    clio::run::u64 cap = view_.page_capacity_t;
+    while (lo < hi) {
+      if (lane == 0) {
+        (void)::clio::cte::gpu_vector::Resolve(
+            ipc_, view_, last_page_array_, lo, /*is_write=*/false, fam_fn_);
+        ::clio::cte::gpu_vector::Page *p0 = last_page_array_[0];
+        while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(p0)) {}
+      }
+      __syncwarp();
+      ::clio::cte::gpu_vector::Page *p = last_page_array_[0];
+      const uint8_t *page_base = static_cast<const uint8_t *>(p->device_ptr);
+      clio::run::u64 page_start_i =
+          static_cast<clio::run::u64>(p->page_idx) * cap;
+      clio::run::u64 page_end_i = page_start_i + cap;
+      clio::run::u64 stop = (hi < page_end_i) ? hi : page_end_i;
+      const uint8_t *src = page_base + (lo - page_start_i);
+      uint8_t *d = dst + (lo - lo0);
+      clio::run::u64 n = stop - lo;
+      const bool wide = ((reinterpret_cast<uintptr_t>(src) & 15u) == 0) &&
+                        ((reinterpret_cast<uintptr_t>(d) & 15u) == 0);
+      if (wide) {
+        const clio::run::u64 n16 = n >> 4;
+        const uint4 *s4 = reinterpret_cast<const uint4 *>(src);
+        uint4 *d4 = reinterpret_cast<uint4 *>(d);
+        for (clio::run::u64 j = lane; j < n16; j += 32) d4[j] = s4[j];
+        for (clio::run::u64 j = (n16 << 4) + lane; j < n; j += 32) d[j] = src[j];
+      } else {
+        for (clio::run::u64 j = lane; j < n; j += 32) d[j] = src[j];
+      }
+      __syncwarp();
+      if (lane == 0) ::clio::cte::gpu_vector::detail::ReleaseBusy(p);
+      __syncwarp();
+      lo = stop;
+    }
+  }
+
+  /**
    * Stride-1 read fast path — warp-cooperative twin of write_range.
    * consume is called from each lane as `void consume(clio::run::u64 i, T v)`.
    */
