@@ -111,8 +111,40 @@ void EnsureRuntime() {
   if (g_initialized) return;
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
-  CLIO_CTE_CLIENT->Init(clio::cte::core::kCtePoolId);
-  std::this_thread::sleep_for(200ms);
+  auto *cte_client = CLIO_CTE_CLIENT;
+  REQUIRE(cte_client != nullptr);
+  cte_client->Init(clio::cte::core::kCtePoolId);
+
+  // The CTE pool and a backing bdev must BOTH exist before any PutBlob. This
+  // fixture previously did neither: the puts returned nominally fine while
+  // storing nothing, so every read came back zeros -- which looked exactly
+  // like a paging defect and was invariant to blob naming, page geometry,
+  // family policy, pool id and seed ordering, because none of those was on
+  // the failing path.
+  clio::cte::core::CreateParams params;
+  auto create_task = cte_client->AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
+      clio::cte::core::kCtePoolId, params);
+  create_task.Wait();
+  REQUIRE(create_task->GetReturnCode() == 0);
+  std::this_thread::sleep_for(50ms);
+
+  const clio::run::u64 kRamCapacity = 1ULL << 30;
+  clio::run::PoolId bdev_pool_id(972, 0);
+  clio::run::bdev::Client bdev_client(bdev_pool_id);
+  auto bdev_create = bdev_client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), std::string("gpu_vector_matrix_ram"),
+      bdev_pool_id, clio::run::bdev::BdevType::kRam, kRamCapacity);
+  bdev_create.Wait();
+  REQUIRE(bdev_create->GetReturnCode() == 0);
+  std::this_thread::sleep_for(50ms);
+  auto reg_task = cte_client->AsyncRegisterTarget(
+      "gpu_vector_matrix_ram", clio::run::bdev::BdevType::kRam,
+      kRamCapacity, clio::run::PoolQuery::Local(), bdev_pool_id);
+  reg_task.Wait();
+  REQUIRE(reg_task->GetReturnCode() == 0);
+  std::this_thread::sleep_for(50ms);
+
   g_initialized = true;
 }
 
