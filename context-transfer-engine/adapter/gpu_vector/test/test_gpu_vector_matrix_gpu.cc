@@ -48,7 +48,7 @@ namespace {
 
 bool g_initialized = false;
 
-constexpr clio::run::u64 kPageSizeBytes = 1ull << 20;   // 1 MiB pages
+constexpr clio::run::u64 kPageSizeBytes = 2ull << 20;   // 2 MiB pages (matches llama_geom, which passes)
 constexpr clio::run::u32 kLogicalPages  = 24;           // 24 MiB extent
 constexpr clio::run::u64 kTotalBytes    =
     static_cast<clio::run::u64>(kLogicalPages) * kPageSizeBytes;
