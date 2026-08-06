@@ -59,34 +59,6 @@ CTP_CROSS_FUN inline uint8_t PatternAt(clio::run::u64 byte_idx) {
   return static_cast<uint8_t>((pg * 131u + byte_idx * 7u) & 0xFFu);
 }
 
-void EnsureRuntime() {
-  if (g_initialized) return;
-  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
-  REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
-  CLIO_CTE_CLIENT->Init(clio::cte::core::kCtePoolId);
-  std::this_thread::sleep_for(200ms);
-  g_initialized = true;
-}
-
-/** Seed every page of `tag` with PatternAt, using the family naming the
- *  device-side vector derives from its fam_ppb policy. */
-void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
-             clio::run::u32 fam_pages) {
-  clio::cte::core::Client *cte = CLIO_CTE_CLIENT;
-  for (clio::run::u32 p = 0; p < kLogicalPages; ++p) {
-    auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
-    auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
-    const clio::run::u64 base = static_cast<clio::run::u64>(p) * kPageSizeBytes;
-    for (clio::run::u64 j = 0; j < kPageSizeBytes; ++j) bytes[j] = PatternAt(base + j);
-    const std::string blob = tag + "_b" + std::to_string(p / fam_pages) +
-                             "_pi" + std::to_string(p);
-    auto task = cte->AsyncPutBlob(tag_id, blob, 0, kPageSizeBytes,
-                                  buf.shm_.template Cast<void>(), 1.0f,
-                                  clio::cte::core::Context(), 0);
-    task.Wait();
-  }
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -125,6 +97,44 @@ __global__ void SpanVerifyKernel(clio::run::IpcManagerGpuInfo info,
 }
 
 // ---------------------------------------------------------------------------
+
+// Host-only from here down. nvcc compiles this TU twice; in the DEVICE pass
+// CLIO_IPC expands to the GPU manager and host-only members such as
+// gpu::IpcManager::GetGpuInfo and Client::AsyncPutBlob are not declared, so
+// host helpers must be excluded from that pass entirely.
+#if !CTP_IS_DEVICE_PASS
+
+namespace {
+
+void EnsureRuntime() {
+  if (g_initialized) return;
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+  REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
+  CLIO_CTE_CLIENT->Init(clio::cte::core::kCtePoolId);
+  std::this_thread::sleep_for(200ms);
+  g_initialized = true;
+}
+
+/** Seed every page of `tag` with PatternAt, using the family naming the
+ *  device-side vector derives from its fam_ppb policy. */
+void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
+             clio::run::u32 fam_pages) {
+  clio::cte::core::Client *cte = CLIO_CTE_CLIENT;
+  for (clio::run::u32 p = 0; p < kLogicalPages; ++p) {
+    auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
+    auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
+    const clio::run::u64 base = static_cast<clio::run::u64>(p) * kPageSizeBytes;
+    for (clio::run::u64 j = 0; j < kPageSizeBytes; ++j) bytes[j] = PatternAt(base + j);
+    const std::string blob = tag + "_b" + std::to_string(p / fam_pages) +
+                             "_pi" + std::to_string(p);
+    auto task = cte->AsyncPutBlob(tag_id, blob, 0, kPageSizeBytes,
+                                  buf.shm_.template Cast<void>(), 1.0f,
+                                  clio::cte::core::Context(), 0);
+    task.Wait();
+  }
+}
+
+}  // namespace
 
 static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                         clio::run::u32 pages_per_block, clio::run::u32 grid,
@@ -229,6 +239,8 @@ TEST_CASE("gpu_vector: cross-page spans at unaligned offsets",
 }
 
 SIMPLE_TEST_MAIN()
+
+#endif  // !CTP_IS_DEVICE_PASS
 
 #else
 int main() { return 0; }
