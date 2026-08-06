@@ -60,6 +60,10 @@ struct VectorStats {
    *  fault left a zero-filled page and no diagnostic anywhere. */
   unsigned long long fault_get_fail;
   unsigned long long fault_get_ok;
+  /** Last non-zero GetBlob return code the device saw, plus the page it was
+   *  fetching. Counting failures was not enough to name the error. */
+  unsigned long long fault_get_last_rc;
+  unsigned long long fault_get_last_page;
   unsigned long long resolve_spin_iters;  /**< nanosleep spins while waiting
                                             *  for the manager to populate
                                             *  a page (cold-miss fault off) */

@@ -273,6 +273,11 @@ CTP_GPU_FUN void DrainGet(Page *page, DeviceViewBase *vb = nullptr) {
       const int rc = (int) page->active_get->return_code_.load();
       atomicAdd_system(rc == 0 ? &vb->stats->fault_get_ok
                                : &vb->stats->fault_get_fail, 1ULL);
+      if (rc != 0) {
+        vb->stats->fault_get_last_rc = (unsigned long long)(long long) rc;
+        vb->stats->fault_get_last_page =
+            (unsigned long long)(long long) page->page_idx;
+      }
     }
     page->active_get = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPageGetInFlight);
