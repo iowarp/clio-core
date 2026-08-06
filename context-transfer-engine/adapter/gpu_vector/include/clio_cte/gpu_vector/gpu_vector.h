@@ -29,6 +29,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <functional>
 #include <thread>
 
 #if CTP_IS_GPU_COMPILER
@@ -97,8 +98,20 @@ class Vector {
          CacheMode mode = CacheMode::kLegacy,
          clio::run::u32 manager_threads_per_block = 32,
          bool allow_cold_miss_fault = false,
-         clio::run::PoolId storage_pool_id = clio::run::PoolId(0, 0));
+         clio::run::PoolId storage_pool_id = clio::run::PoolId(0, 0),
+         clio::run::u64 family_pages = 0,
+         std::function<std::string(clio::run::u64)> host_namer = nullptr);
   ~Vector();
+
+  /**
+   * Blob name for global page `gp` under the vector's family policy —
+   * the ONE host-side place page names are composed. Default:
+   * "<tag>_b<gp / family_pages>_pi<gp>" (family 0 when family_pages == 0),
+   * which matches both the CAE ModelWeightsAssimilator's sharding and the
+   * runtime-side composition driven by gpu_family_idx_. `host_namer`
+   * overrides the whole string for exotic layouts.
+   */
+  std::string PageBlobName(clio::run::u64 gp) const;
 
   Vector(const Vector &) = delete;
   Vector &operator=(const Vector &) = delete;
@@ -962,6 +975,10 @@ struct Vector<T>::Impl {
    *  and there is work that needs handling. */
   bool persistent_kernel_running = false;
   std::string tag_name;
+  /** Page->family policy (see Vector ctor). 0 => single family b0. */
+  clio::run::u64 fam_ppb = 0;
+  /** Optional full-name override for host-side page name composition. */
+  std::function<std::string(clio::run::u64)> host_namer;
   clio::run::PoolId cte_pool_id = clio::run::PoolId(0, 0);
   std::thread cache_thread;
   std::atomic<bool> cache_thread_run{false};
@@ -980,7 +997,9 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
                           CacheMode mode,
                           clio::run::u32 manager_threads_per_block,
                           bool allow_cold_miss_fault,
-                          clio::run::PoolId storage_pool_id) {
+                          clio::run::PoolId storage_pool_id,
+                          clio::run::u64 family_pages,
+                          std::function<std::string(clio::run::u64)> host_namer) {
 #if !CTP_IS_DEVICE_PASS
   // Body gated for the host pass only.
   if (nblocks == 0 || gpu_pages_per_block == 0 || page_size_bytes == 0) {
@@ -1139,6 +1158,8 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   // routed to the compressor, which fetches + decompresses. The CTE tag is
   // always created on kCtePoolId above, so the tag_id is valid at the core the
   // compressor forwards to regardless of where page traffic is routed.
+  impl_->fam_ppb = family_pages;
+  impl_->host_namer = std::move(host_namer);
   impl_->cte_pool_id = storage_pool_id.IsNull()
                            ? clio::cte::core::kCtePoolId
                            : storage_pool_id;
@@ -1161,6 +1182,7 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   view_.base.host_pages_per_block = host_pages_per_block;
   view_.base.page_size_bytes = page_size_bytes;
   view_.base.allow_cold_miss_fault = allow_cold_miss_fault;
+  view_.base.fam_ppb = family_pages;
   // Pinned-host instrumentation counters. Mapped so the device can
   // atomicAdd_system into them and the host can read them directly
   // (no cudaMemcpy round-trip). cudaHostAllocMapped + UVA means the
@@ -1189,7 +1211,13 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
           static_cast<clio::run::u64>(b) * total_ppb + s;
       char *put_addr = impl_->put_base + slot_idx * put_stride;
       char *get_addr = impl_->get_base + slot_idx * get_stride;
-      std::string blob_name = tag_name + "_b" + std::to_string(b);
+      // BARE tag: the family is not baked into the slot name any more. The
+      // device fault/flush paths stamp gpu_family_idx_ from the vector's
+      // family policy (or the user's FamFn lambda) and the runtime composes
+      // "<tag>_b<family>_pi<page>". A per-block family here once made a
+      // multi-block vector fault blobs that were never written — the GetBlob
+      // parked forever and the faulting warp deadlocked spinning on it.
+      std::string blob_name = tag_name;
       auto put_task = new (put_addr) clio::cte::core::PodPutBlobTask(
           clio::run::CreateTaskId(), impl_->cte_pool_id,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
@@ -1381,8 +1409,7 @@ inline void Vector<T>::DrainHostPrefetchQueue(void *cuda_stream) {
         device_ptr = impl_->host_pages_base +
             (static_cast<clio::run::u64>(b) * host_ppb + host_slot) * psz;
       }
-      std::string blob_name = impl_->tag_name + "_b" + std::to_string(b) +
-                               "_pi" + std::to_string(p->page_idx);
+      std::string blob_name = PageBlobName(p->page_idx);
       ctp::ipc::ShmPtr<> blob_data;
       blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
       blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
@@ -1459,8 +1486,7 @@ inline void Vector<T>::FaultAllSync(clio::run::u64 num_model_pages) {
       // Matches the eviction name: writer stores "<tag>_b<block>" and the
       // (de)compressor appends "_pi<gpu_page_idx>" where gpu_page_idx is the
       // global page index. Legacy slot (b,s) holds global page b*gpu_ppb+s.
-      std::string name = impl_->tag_name + "_b" + std::to_string(b) + "_pi" +
-                         std::to_string(gp);
+      std::string name = PageBlobName(gp);
       // Zero-copy blob_data: null alloc id + off_ = the slot's HBM device
       // address, so the (de)compressor writes decompressed bytes straight into
       // HBM. (Host-side equivalent of detail::MakeBlobShmPtr, which is
@@ -1508,6 +1534,20 @@ inline void Vector<T>::PrefetchWindowSync(clio::run::u64 first_page) {
 }
 
 template <typename T>
+inline std::string Vector<T>::PageBlobName(clio::run::u64 gp) const {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->host_namer) {
+    return impl_->host_namer(gp);
+  }
+  const clio::run::u64 fam = impl_->fam_ppb ? gp / impl_->fam_ppb : 0;
+  return impl_->tag_name + "_b" + std::to_string(fam) + "_pi" +
+         std::to_string(gp);
+#else
+  (void)gp; return {};
+#endif
+}
+
+template <typename T>
 inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
                                          clio::run::u32 count,
                                          clio::run::u32 slot_base,
@@ -1523,7 +1563,7 @@ inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
     clio::run::u64 gp = first_page + i;
     char *hbm =
         static_cast<char *>(impl_->pages_base) + (slot_base + i) * page_size;
-    std::string name = impl_->tag_name + "_b0_pi" + std::to_string(gp);
+    std::string name = PageBlobName(gp);
     ctp::ipc::ShmPtr<> blob_data;
     blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
     blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
@@ -1536,7 +1576,7 @@ inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
     if (gf->GetReturnCode() != 0) {
       throw std::runtime_error(
           "gpu_vector: PrefetchPagesSync GetBlob failed for '" +
-          impl_->tag_name + "_b0_pi" + std::to_string(first_page + i) +
+          PageBlobName(first_page + i) +
           "' rc=" + std::to_string(gf->GetReturnCode()));
     }
   };
@@ -1600,7 +1640,7 @@ inline void Vector<T>::ReorganizePagesSync(clio::run::u64 first_page,
   futs.reserve(count);
   for (clio::run::u32 i = 0; i < count; ++i) {
     std::string name =
-        impl_->tag_name + "_b0_pi" + std::to_string(first_page + i);
+        PageBlobName(first_page + i);
     futs.push_back(core.AsyncReorganizeBlob(view_.base.tag_id, name, score,
                                             clio::run::PoolQuery::Local()));
   }

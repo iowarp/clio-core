@@ -154,8 +154,18 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
   // CLIO_MW_STORAGE_POOL=<major> selects it; unset keeps pages on the core.
   clio::cte::core::Client *page_client = cte_client_.get();
   std::unique_ptr<clio::cte::core::Client> storage_client;
-  if (const char *sp = std::getenv("CLIO_MW_STORAGE_POOL")) {
-    unsigned long m = std::strtoul(sp, nullptr, 10);
+  // `pool=<major>` in the omni format string selects the storage pool in code
+  // (e.g. "modelweights;page=2097152;nblocks=8;pool=600" routes pages through
+  // the compressor pool the compose file created). The env var remains as a
+  // fallback for operator experiments only.
+  size_t pool_param = ParseFormatParam(ctx.format, "pool", 0);
+  {
+    unsigned long m = pool_param;
+    if (m == 0) {
+      if (const char *sp = std::getenv("CLIO_MW_STORAGE_POOL")) {
+        m = std::strtoul(sp, nullptr, 10);
+      }
+    }
     if (m != 0) {
       storage_client = std::make_unique<clio::cte::core::Client>(
           clio::run::PoolId(static_cast<clio::run::u32>(m), 0));

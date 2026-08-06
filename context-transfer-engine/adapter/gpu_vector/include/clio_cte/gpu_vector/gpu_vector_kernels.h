@@ -162,6 +162,7 @@ CTP_GPU_FUN void FlushPageBase(::clio::run::gpu::IpcManager *ipc,
   task->offset_ = 0;
   task->size_ = v.page_size_bytes;
   task->gpu_page_idx_ = static_cast<clio::run::u32>(page->page_idx);
+  task->gpu_family_idx_ = FamilyOf(v, page->page_idx);
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.pages_alloc_id : v.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
@@ -211,6 +212,7 @@ CTP_GPU_FUN void FlushPage(::clio::run::gpu::IpcManager *ipc,
   task->offset_ = mn_b;            // offset within the per-page blob
   task->size_ = mx_b - mn_b;
   task->gpu_page_idx_ = static_cast<clio::run::u32>(page->page_idx);
+  task->gpu_family_idx_ = FamilyOf(v.base, page->page_idx);
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(
@@ -224,12 +226,16 @@ CTP_GPU_FUN void FlushPage(::clio::run::gpu::IpcManager *ipc,
   page->active_put = ipc->Send(fp);
 }
 
+/** "Compute the family from the view's fam_ppb policy" sentinel. */
+static constexpr clio::run::u32 kFamAuto = ~static_cast<clio::run::u32>(0);
+
 /** Submit a GetBlob to fault `target_page_idx` into `page->device_ptr`. */
 template <typename T>
 CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
                             const DeviceView<T> &v, clio::run::u32 block_idx,
                             Page *page, clio::run::u32 slot,
-                            int32_t target_page_idx) {
+                            int32_t target_page_idx,
+                            clio::run::u32 fam = kFamAuto) {
   auto *task = GetGetTask(v.base, block_idx, slot);
   // Reset lifecycle flags + mint a fresh task_id for slot reuse.
   task->task_flags_.Clear();
@@ -238,6 +244,8 @@ CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
   task->offset_ = 0;
   task->size_ = v.base.page_size_bytes;
   task->gpu_page_idx_ = static_cast<clio::run::u32>(target_page_idx);
+  task->gpu_family_idx_ =
+      (fam == kFamAuto) ? FamilyOf(v.base, target_page_idx) : fam;
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
@@ -486,9 +494,18 @@ CTP_GPU_FUN Page *WarpCoopEvictHbmToDram(
  *  fallback evicts in the HBM tier (the hottest target) and faults
  *  from CTE. In kAsync mode the caller also pushes a high-score hint
  *  into the rescore queue so neighboring pages get pulled in next tick. */
-template <typename T>
+/** Default FamFn for Resolve/dev::vector: the view's fam_ppb policy. */
+struct ViewFamily {
+  CTP_GPU_FUN clio::run::u32 operator()(const DeviceViewBase &v,
+                                        clio::run::u64 pg) const {
+    return FamilyOf(v, pg);
+  }
+};
+
+template <typename T, typename FamFn = ViewFamily>
 CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
-                        Page **last_page_array, clio::run::u64 i, bool is_write) {
+                        Page **last_page_array, clio::run::u64 i, bool is_write,
+                        FamFn fam_fn = FamFn{}) {
   clio::run::u32 block_idx = blockIdx.x;
   Block *b = GetBlock(v.base, block_idx);
   int32_t target_page = static_cast<int32_t>(i / v.page_capacity_t);
@@ -535,7 +552,10 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
       p->modify_min = -1;
       p->modify_max = -1;
       p->flags = 0;
-      if (!is_write) FaultPage(ipc, v, block_idx, p, slot, target_page);
+      if (!is_write) {
+        FaultPage(ipc, v, block_idx, p, slot, target_page,
+                  fam_fn(v.base, target_page));
+      }
       hit = p;
       last = hit;
       detail::RescorePush(&b->rescore_q,
@@ -612,7 +632,8 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
 
 namespace cte::gpu::dev {
 
-template <typename T>
+template <typename T,
+          typename FamFn = ::clio::cte::gpu_vector::ViewFamily>
 class vector;
 
 /**
@@ -636,7 +657,7 @@ class vector;
  * balanced. ElementRef / operator[] is intentionally NOT exposed — the
  * bulk APIs are the only race-free hot path under kAsync mode.
  */
-template <typename T>
+template <typename T, typename FamFn>
 class vector {
  public:
   using DeviceView = ::clio::cte::gpu_vector::DeviceView<T>;
@@ -649,7 +670,26 @@ class vector {
    */
   CTP_GPU_FUN vector(const DeviceView &view,
                       ::clio::run::gpu::IpcManager *ipc) noexcept
-      : view_(view), ipc_(ipc) {
+      : view_(view), ipc_(ipc), fam_fn_() {
+    __shared__ ::clio::cte::gpu_vector::Page *last_page_storage[32];
+    last_page_array_ = last_page_storage;
+    if (threadIdx.x < 32) last_page_array_[threadIdx.x] = nullptr;
+    __syncthreads();
+  }
+
+  /**
+   * Same, with an explicit page->blob-family mapping. `fam_fn` is any
+   * callable `(const DeviceViewBase &, u64 global_page) -> u32 family`
+   * (a __device__-compatible lambda works); it is consulted on every
+   * cold-miss fault this handle fires, so the composed blob name
+   * "<tag>_b<family>_pi<page>" can follow whatever sharding the writer
+   * used. The default (ViewFamily) applies the view's fam_ppb policy —
+   * which the host Vector sets to the CAE assimilator's sharding.
+   */
+  CTP_GPU_FUN vector(const DeviceView &view,
+                      ::clio::run::gpu::IpcManager *ipc,
+                      FamFn fam_fn) noexcept
+      : view_(view), ipc_(ipc), fam_fn_(fam_fn) {
     __shared__ ::clio::cte::gpu_vector::Page *last_page_storage[32];
     last_page_array_ = last_page_storage;
     if (threadIdx.x < 32) last_page_array_[threadIdx.x] = nullptr;
@@ -790,7 +830,7 @@ class vector {
               &bx->rescore_q, hint, 0.1f);
         }
         (void)::clio::cte::gpu_vector::Resolve(
-            ipc_, view_, last_page_array_, lo, /*is_write=*/false);
+            ipc_, view_, last_page_array_, lo, /*is_write=*/false, fam_fn_);
         ::clio::cte::gpu_vector::Page *p = last_page_array_[0];
         while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(p)) {}
       }
@@ -852,7 +892,7 @@ class vector {
         clio::run::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
         rescore(k, clipped_la, lookbehind, b->rescore_q);
         (void)::clio::cte::gpu_vector::Resolve(
-            ipc_, view_, last_page_array_, idx, /*is_write=*/true);
+            ipc_, view_, last_page_array_, idx, /*is_write=*/true, fam_fn_);
         held = last_page_array_[0];
         while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(held)) {}
         held_page = pg;
@@ -892,7 +932,7 @@ class vector {
         clio::run::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
         rescore(k, clipped_la, lookbehind, b->rescore_q);
         (void)::clio::cte::gpu_vector::Resolve(
-            ipc_, view_, last_page_array_, idx, /*is_write=*/false);
+            ipc_, view_, last_page_array_, idx, /*is_write=*/false, fam_fn_);
         held = last_page_array_[0];
         while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(held)) {}
         held_page = pg;
@@ -918,6 +958,8 @@ class vector {
   DeviceView view_;
   ::clio::run::gpu::IpcManager *ipc_;
   ::clio::cte::gpu_vector::Page **last_page_array_;
+  /** Page -> blob-family mapping consulted on every fault (see ctor). */
+  FamFn fam_fn_;
 };
 
 }  // namespace cte::gpu::dev

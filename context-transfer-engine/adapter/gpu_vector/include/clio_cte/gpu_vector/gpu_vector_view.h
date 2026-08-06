@@ -99,7 +99,23 @@ struct DeviceViewBase {
   bool allow_cold_miss_fault;
   /** Optional pinned-host counters block; nullptr means disabled. */
   VectorStats *stats;
+  /**
+   * DEFAULT page->blob-family policy: family(pg) = pg / fam_ppb, matching the
+   * CAE ModelWeightsAssimilator's sharding (pages_per_block =
+   * ceil(num_pages/nblocks)). 0 means "everything in family 0" (the naming
+   * every self-consistent single-family writer uses). The composed name is
+   * "<tag>_b<family>_pi<page>" — the family travels in the task's
+   * gpu_family_idx_ so per-slot task names stay family-invariant. User
+   * kernels may override per-fault via the FamFn lambda on dev::vector.
+   */
+  clio::run::u64 fam_ppb;
 };
+
+/** Default family policy: derived from the view's fam_ppb (see above). */
+CTP_INLINE_CROSS_FUN clio::run::u32 FamilyOf(const DeviceViewBase &v,
+                                             clio::run::u64 pg) {
+  return v.fam_ppb ? static_cast<clio::run::u32>(pg / v.fam_ppb) : 0u;
+}
 
 /** Total slots per block across both tiers. */
 CTP_INLINE_CROSS_FUN clio::run::u32 TotalPagesPerBlock(const DeviceViewBase &v) {

@@ -1875,6 +1875,14 @@ struct PutBlobTask : public clio::run::Task {
    */
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  /** Blob-FAMILY index. When set, the runtime composes the page blob name as
+   *  blob_name_ + "_b<family>" + "_pi<page>", so the family is a POLICY the
+   *  writer/reader agree on (e.g. the CAE ModelWeightsAssimilator shards
+   *  families as page / ceil(num_pages/nblocks)) instead of a string baked
+   *  into per-slot task names. Sentinel kNoFamilyIdx keeps the legacy
+   *  composition where blob_name_ already contains the family. */
+  static constexpr clio::run::u32 kNoFamilyIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_family_idx_;
 
   // Submit-side timestamp (steady_clock nanoseconds), stamped by the
   // CTE client just before Send so the receiving daemon can compute
@@ -1899,6 +1907,7 @@ struct PutBlobTask : public clio::run::Task {
         context_(),
         flags_(0),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         submit_ts_ns_(0) {}
 
   // Emplace constructor
@@ -1921,6 +1930,7 @@ struct PutBlobTask : public clio::run::Task {
         context_(context),
         flags_(flags),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         submit_ts_ns_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -1949,6 +1959,7 @@ struct PutBlobTask : public clio::run::Task {
         context_(context),
         flags_(flags),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         submit_ts_ns_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -1993,7 +2004,7 @@ struct PutBlobTask : public clio::run::Task {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, blob_data_,
-       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_, segments_);
+       score_, context_, flags_, gpu_page_idx_, gpu_family_idx_, submit_ts_ns_, segments_);
     ar.PopPod();
     // Emulated puts (issue #747) never write the payload, so don't ship it
     // over the wire either — the whole point is to not pay for the I/O.
@@ -2039,6 +2050,7 @@ struct PutBlobTask : public clio::run::Task {
     context_ = other->context_;
     flags_ = other->flags_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    gpu_family_idx_ = other->gpu_family_idx_;
     submit_ts_ns_ = other->submit_ts_ns_;
   }
 
@@ -2082,6 +2094,14 @@ struct GetBlobTask : public clio::run::Task {
    */
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  /** Blob-FAMILY index. When set, the runtime composes the page blob name as
+   *  blob_name_ + "_b<family>" + "_pi<page>", so the family is a POLICY the
+   *  writer/reader agree on (e.g. the CAE ModelWeightsAssimilator shards
+   *  families as page / ceil(num_pages/nblocks)) instead of a string baked
+   *  into per-slot task names. Sentinel kNoFamilyIdx keeps the legacy
+   *  composition where blob_name_ already contains the family. */
+  static constexpr clio::run::u32 kNoFamilyIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_family_idx_;
   INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
   /**
@@ -2132,6 +2152,7 @@ struct GetBlobTask : public clio::run::Task {
         flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         context_() {}
 
   // Emplace constructor
@@ -2152,6 +2173,7 @@ struct GetBlobTask : public clio::run::Task {
         flags_(flags),
         blob_data_(blob_data),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -2235,6 +2257,7 @@ struct GetBlobTask : public clio::run::Task {
         flags_(flags),
         blob_data_(blob_data),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -2252,7 +2275,7 @@ struct GetBlobTask : public clio::run::Task {
     Task::SerializeIn(ar);
     ar(segments_);
     ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_,
-       gpu_page_idx_, context_);
+       gpu_page_idx_, gpu_family_idx_, context_);
     ar.PopPod();
     // Emulated gets (issue #747) return no data, so the caller's buffer
     // does not need to be exposed for the response.
@@ -2290,6 +2313,7 @@ struct GetBlobTask : public clio::run::Task {
     blob_data_ = other->blob_data_;
     segments_ = other->segments_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    gpu_family_idx_ = other->gpu_family_idx_;
     context_ = other->context_;
   }
 
@@ -2611,6 +2635,14 @@ struct PodPutBlobTask : public clio::run::Task {
   IN clio::run::u32 flags_;
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  /** Blob-FAMILY index. When set, the runtime composes the page blob name as
+   *  blob_name_ + "_b<family>" + "_pi<page>", so the family is a POLICY the
+   *  writer/reader agree on (e.g. the CAE ModelWeightsAssimilator shards
+   *  families as page / ceil(num_pages/nblocks)) instead of a string baked
+   *  into per-slot task names. Sentinel kNoFamilyIdx keeps the legacy
+   *  composition where blob_name_ already contains the family. */
+  static constexpr clio::run::u32 kNoFamilyIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_family_idx_;
   IN clio::run::u64 submit_ts_ns_;
 
   // SHM constructor
@@ -2625,6 +2657,7 @@ struct PodPutBlobTask : public clio::run::Task {
         context_(),
         flags_(0),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         submit_ts_ns_(0) {}
 
   // GPU-compatible emplace constructor (const char* blob name, no allocator)
@@ -2644,6 +2677,7 @@ struct PodPutBlobTask : public clio::run::Task {
         context_(context),
         flags_(flags),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         submit_ts_ns_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -2682,7 +2716,7 @@ struct PodPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_,
-       flags_, gpu_page_idx_, submit_ts_ns_);
+       flags_, gpu_page_idx_, gpu_family_idx_, submit_ts_ns_);
     // Emulated puts never write the payload — skip the wire transfer too
     // (issue #747; see PutBlobTask::SerializeIn).
     if (!context_.emulate_) {
@@ -2709,6 +2743,7 @@ struct PodPutBlobTask : public clio::run::Task {
     context_ = other->context_;
     flags_ = other->flags_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    gpu_family_idx_ = other->gpu_family_idx_;
     submit_ts_ns_ = other->submit_ts_ns_;
   }
 
@@ -2733,6 +2768,14 @@ struct PodGetBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<> blob_data_;
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  /** Blob-FAMILY index. When set, the runtime composes the page blob name as
+   *  blob_name_ + "_b<family>" + "_pi<page>", so the family is a POLICY the
+   *  writer/reader agree on (e.g. the CAE ModelWeightsAssimilator shards
+   *  families as page / ceil(num_pages/nblocks)) instead of a string baked
+   *  into per-slot task names. Sentinel kNoFamilyIdx keeps the legacy
+   *  composition where blob_name_ already contains the family. */
+  static constexpr clio::run::u32 kNoFamilyIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_family_idx_;
   INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
   // SHM constructor
@@ -2745,6 +2788,7 @@ struct PodGetBlobTask : public clio::run::Task {
         flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         context_() {}
 
   // GPU-compatible emplace constructor (const char* blob name, no allocator)
@@ -2762,6 +2806,7 @@ struct PodGetBlobTask : public clio::run::Task {
         flags_(flags),
         blob_data_(blob_data),
         gpu_page_idx_(kNoPageIdx),
+        gpu_family_idx_(kNoFamilyIdx),
         context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -2799,7 +2844,7 @@ struct PodGetBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_,
+    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_, gpu_family_idx_,
        context_);
     // Emulated gets return no data — no buffer expose needed (issue #747).
     if (!context_.emulate_) {
@@ -2827,6 +2872,7 @@ struct PodGetBlobTask : public clio::run::Task {
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    gpu_family_idx_ = other->gpu_family_idx_;
     context_ = other->context_;
   }
 

@@ -697,6 +697,20 @@ static void WriteTraceLog(const std::string& trace_folder,
   }
 }
 
+
+// Codec pin resolution: the COMPOSE FILE's compress_lib wins; the
+// CLIO_CTE_COMPRESS_LIB env remains as an operator override-of-last-resort.
+static int PinWireFor(const CompressorConfig &cfg, int *out_preset) {
+  if (!cfg.compress_lib_.empty()) {
+    int w = ctp::CompressionFactory::WireIdForName(cfg.compress_lib_);
+    if (w >= 0) {
+      *out_preset = cfg.compress_preset_;
+      return w;
+    }
+  }
+  return CompressorPinWireId(out_preset);
+}
+
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -730,7 +744,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // deterministic under a pin (and avoids paying for stat estimation).
     {
       int pin_preset = 2;
-      int pin_wire = CompressorPinWireId(&pin_preset);
+      int pin_wire = PinWireFor(config_, &pin_preset);
       if (pin_wire >= 0) {
         context.compress_lib_ = pin_wire;
         context.compress_preset_ = pin_preset;
@@ -833,7 +847,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // it governs every compression path (static, dynamic, explicit).
     {
       int pin_preset = 2;
-      int pin_wire = CompressorPinWireId(&pin_preset);
+      int pin_wire = PinWireFor(config_, &pin_preset);
       if (pin_wire >= 0) {
         context.compress_lib_ = pin_wire;
         context.compress_preset_ = pin_preset;
@@ -1192,7 +1206,7 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
     if (task->blob_data_.IsNull() || input_size == 0) {
       task->return_code_ = 1; CLIO_CO_RETURN;
     }
-    { int pin_preset = 2; int pin_wire = CompressorPinWireId(&pin_preset);
+    { int pin_preset = 2; int pin_wire = PinWireFor(config_, &pin_preset);
       if (pin_wire >= 0) { context.compress_lib_ = pin_wire;
                            context.compress_preset_ = pin_preset; } }
     if (!core_client_ && !config_.next_pool_id_.IsNull())
@@ -1201,6 +1215,9 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
 
     // Per-page name: what the core PutBlob handler composes from gpu_page_idx_.
     std::string name = CompressorBlobName(*task);
+    if (task->gpu_family_idx_ != PutT::kNoFamilyIdx) {
+      name += "_b" + std::to_string(task->gpu_family_idx_);
+    }
     if (task->gpu_page_idx_ != PutT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
 
@@ -1276,6 +1293,9 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
 
     std::string name = CompressorBlobName(*task);
+    if (task->gpu_family_idx_ != GetT::kNoFamilyIdx) {
+      name += "_b" + std::to_string(task->gpu_family_idx_);
+    }
     if (task->gpu_page_idx_ != GetT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
 
@@ -1292,7 +1312,20 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     char *dev_tmp = nullptr;
     ctp::ipc::FullPtr<char> tmp;
 #if CTP_ENABLE_GPU
-    if (dev_out) {
+    // Device fetch buffers ONLY for GPU codecs. Two reasons:
+    //  - for a host codec (zstd/lz4) the compressed frame is pulled D2H for
+    //    the CPU decompressor anyway, so a device fetch buys nothing;
+    //  - the per-fault GpuApi::Malloc here deadlocked the paged-inference
+    //    fault path: under VRAM pressure cudaMalloc implicitly synchronizes
+    //    the context, which can never complete while the faulting kernel is
+    //    spin-waiting on THIS task. Host fetch + fresh-stream device write is
+    //    the same pattern the uncompressed mem-bdev read path uses, which
+    //    services spinning kernels correctly today.
+    const bool pinned_gpu_codec =
+        config_.compress_lib_.rfind("nvcomp", 0) == 0 ||
+        config_.compress_lib_ == "cusz" || config_.compress_lib_ == "cuszp" ||
+        config_.compress_lib_ == "zfp-sycl";
+    if (dev_out && pinned_gpu_codec) {
       dev_tmp = ctp::GpuApi::Malloc<char>(fetch_size);
     }
 #endif
@@ -1412,7 +1445,8 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
         std::vector<char> staging(dsize);
         ok = dec->Decompress(staging.data(), dsize, cdata, csize);
         if (ok) write_out(out.ptr_, staging.data(), dsize);
-      } else {
+        // DEBUG(first few): prove the bytes actually landed at out.ptr_.
+        } else {
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
       }
       free_tmp();
@@ -1648,6 +1682,7 @@ clio::run::TaskResume Runtime::DecompressGetBlob(
   CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
   CLIO_CO_RETURN;
 }
+// (debug wrapper counter lives in DecompressGetBlobImpl entry)
 clio::run::TaskResume Runtime::DecompressPodGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodGetBlobTask>& task) {
   CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
@@ -1771,7 +1806,7 @@ clio::run::TaskResume Runtime::PutBlob(
     // clear the codec and store raw.
     {
       int pin_preset = 2;
-      int pin_wire = CompressorPinWireId(&pin_preset);
+      int pin_wire = PinWireFor(config_, &pin_preset);
       if (pin_wire >= 0) {
         ctx.compress_lib_ = pin_wire;
         ctx.compress_preset_ = pin_preset;

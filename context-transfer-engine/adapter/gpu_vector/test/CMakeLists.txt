@@ -68,6 +68,40 @@ if(CLIO_CORE_ENABLE_CUDA)
         LABELS "gpu;cuda;cte;gpu_vector;fault;oversubscribe"
     )
 
+    # MULTI-BLOCK cold faulting against a CAE-sharded external tag — the
+    # llama.cpp weight-streaming configuration in miniature (the coverage gap
+    # behind the family-mismatch deadlock: every other multi-block test writes
+    # through the vector, every external-writer test is nblocks=1).
+    add_cuda_executable(test_gpu_vector_llama_geom FALSE
+        test_gpu_vector_llama_geom_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_llama_geom PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_llama_geom_cuda COMMAND test_gpu_vector_llama_geom
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_llama_geom_cuda PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10660"
+    )
+
     # Model tensors mapped as gpu_vectors, across every ggml tensor format
     # (F32/F16/BF16 + Q4_0/Q8_0/Q4_K/Q5_K/Q6_K block-quantized). Uncompressed;
     # cache is far smaller than each tensor so every page demand-faults.
