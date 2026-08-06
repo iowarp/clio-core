@@ -506,7 +506,10 @@ template <typename T, typename FamFn = ViewFamily>
 CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
                         Page **last_page_array, clio::run::u64 i, bool is_write,
                         FamFn fam_fn = FamFn{}) {
-  clio::run::u32 block_idx = blockIdx.x;
+  // Wrap: the compute grid is sized by the caller and is routinely wider than
+  // the cache's block count, so an unwrapped index runs off the block array.
+  const clio::run::u32 nblk = v.base.nblocks ? v.base.nblocks : 1u;
+  clio::run::u32 block_idx = blockIdx.x % nblk;
   Block *b = GetBlock(v.base, block_idx);
   int32_t target_page = static_cast<int32_t>(i / v.page_capacity_t);
   clio::run::u64 off_t = i - static_cast<clio::run::u64>(target_page) * v.page_capacity_t;
@@ -659,6 +662,21 @@ class vector;
  */
 template <typename T, typename FamFn>
 class vector {
+
+  /** Index of the cache block this CUDA block uses.
+   *
+   * The kernel grid is chosen by the CALLER for its arithmetic and is routinely
+   * wider than the vector's block count -- a GEMV wants hundreds of blocks
+   * while the cache may have one. Every internal use of blockIdx.x indexes the
+   * per-block array, so an unwrapped index runs off the end (observed as a
+   * segfault the moment the grid exceeded nblocks). Wrapping makes a wide grid
+   * safe: CUDA blocks share cache sets instead of overrunning, and when the
+   * resident window already covers a span no cache block is touched at all.
+   */
+  __device__ clio::run::u32 BlockIdx() const {
+    const clio::run::u32 n = view_.base.nblocks ? view_.base.nblocks : 1u;
+    return blockIdx.x % n;
+  }
  public:
   using DeviceView = ::clio::cte::gpu_vector::DeviceView<T>;
 
@@ -723,7 +741,7 @@ class vector {
           hit = last;
         } else {
           ::clio::cte::gpu_vector::Block *bx =
-              ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
+              ::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx());
           clio::run::u32 total =
               ::clio::cte::gpu_vector::TotalPagesPerBlock(view_.base);
           for (clio::run::u32 s = 0; s < total; ++s) {
@@ -753,7 +771,7 @@ class vector {
       // 2. Cold miss → warp-coop evict HBM→DRAM, bind target_page in HBM.
       if (p == nullptr) {
         p = ::clio::cte::gpu_vector::WarpCoopEvictHbmToDram(
-            ipc_, view_, blockIdx.x, target_page, lane);
+            ipc_, view_, BlockIdx(), target_page, lane);
         if (lane == 0) {
           ::clio::cte::gpu_vector::detail::LaneLastPage(last_page_array_) = p;
           last_page_array_[0] = p;
@@ -772,7 +790,7 @@ class vector {
         if (p->modify_min < 0) {
           p->modify_min = static_cast<int32_t>(page_off_lo);
           ::clio::cte::gpu_vector::detail::AtomicIncU32(
-              &::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x)
+              &::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx())
                    ->num_modified);
         } else if (static_cast<int32_t>(page_off_lo) < p->modify_min) {
           p->modify_min = static_cast<int32_t>(page_off_lo);
@@ -815,7 +833,7 @@ class vector {
       if (lane == 0) {
         clio::run::u32 cur_page = static_cast<clio::run::u32>(lo / cap);
         ::clio::cte::gpu_vector::Block *bx =
-            ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
+            ::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx());
         for (int la = 1; la <= kLookahead; ++la) {
           clio::run::u32 hint = cur_page + static_cast<clio::run::u32>(la);
           if (hint > last_page) break;
@@ -878,7 +896,7 @@ class vector {
     // here — that would deadlock against the early-returned lanes).
     if (lane != 0) return;
     ::clio::cte::gpu_vector::Block *b =
-        ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
+        ::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx());
     clio::run::u64 cap = view_.page_capacity_t;
     ::clio::cte::gpu_vector::Page *held = nullptr;
     int32_t held_page = -1;
@@ -918,7 +936,7 @@ class vector {
     clio::run::u32 lane = threadIdx.x & 31;
     if (lane != 0) return;
     ::clio::cte::gpu_vector::Block *b =
-        ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
+        ::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx());
     clio::run::u64 cap = view_.page_capacity_t;
     ::clio::cte::gpu_vector::Page *held = nullptr;
     int32_t held_page = -1;
@@ -949,7 +967,7 @@ class vector {
   CTP_GPU_FUN void FlushAll() {
     if ((threadIdx.x & 31) != 0) return;
     if (threadIdx.x != 0) return;
-    ::clio::cte::gpu_vector::FlushAllInBlock(ipc_, view_, blockIdx.x);
+    ::clio::cte::gpu_vector::FlushAllInBlock(ipc_, view_, BlockIdx());
   }
 
   CTP_GPU_FUN const DeviceView &view() const { return view_; }
