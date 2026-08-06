@@ -564,7 +564,12 @@ CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
     for (clio::run::u32 s = 0; s < total; ++s) {
       Page *p = &b->pages[s];
       if (p->page_idx != target_page) continue;
-      if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
+      if (p->flags & kPageBusy) continue;      // being re-bound: not ours yet
+      // kPageGetInFlight is NOT a reason to skip. The page IS the one we want,
+      // it is simply still arriving, and the DrainGet at the end of Resolve
+      // waits for exactly that. Skipping it here forced a re-fault of a page
+      // already on the wire, which is what made bulk faulting impossible:
+      // every miss had to be issued AND awaited before the next could start.
       hit = p;
       last = hit;
       break;
