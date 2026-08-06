@@ -35,14 +35,17 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
 
     # On-device faulting under oversubscription, UNCOMPRESSED: cache == 1/2 the
-# DISABLED: test_gpu_vector_matrix does not compile yet.
-#   Fixed so far: CLIO_CPU_IPC (not CLIO_IPC) for AllocateBuffer, and the
-#   missing modules/bdev/include that llama_geom has.
-#   Still failing: Client::AsyncPutBlob and GetGpuIpcManager()->GetGpuInfo
-#   resolve to device-visible overloads here but not in llama_geom, whose
-#   INCLUDE_DIRS and LINK_LIBS are now identical. Next thing to try is
-#   guarding the host-only helpers with #ifndef __CUDA_ARCH__, since the
-#   symptom is the device pass parsing host-only members.
+# DISABLED: test_gpu_vector_matrix does not compile.
+# Ruled out so far, by direct comparison against test_gpu_vector_llama_geom
+# (which was FORCE-rebuilt to confirm it genuinely compiles today):
+#   - INCLUDE_DIRS / LINK_LIBS: now identical
+#   - include list: identical except <cstring>
+#   - call sites: made textually identical (explicit types, CLIO_CPU_IPC,
+#     clio::cte::core::Client*, clio::run::IpcManagerGpuInfo)
+# Still: Client::AsyncPutBlob and GetGpuIpcManager()->GetGpuInfo do not
+# resolve here. Next: preprocess both TUs (nvcc -E) and diff, rather than
+# comparing sources by eye -- the divergence is evidently in what the
+# preprocessor produces, not in what the files say.
 #    add_cuda_executable(test_gpu_vector_matrix FALSE
 #        test_gpu_vector_matrix_gpu.cc
 #        INCLUDE_DIRS

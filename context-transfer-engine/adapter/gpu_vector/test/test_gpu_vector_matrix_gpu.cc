@@ -98,7 +98,7 @@ void EnsureRuntime() {
  *  device-side vector derives from its fam_ppb policy. */
 void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
              clio::run::u32 fam_pages) {
-  auto *cte = CLIO_CTE_CLIENT;
+  clio::cte::core::Client *cte = CLIO_CTE_CLIENT;
   for (clio::run::u32 p = 0; p < kLogicalPages; ++p) {
     auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
     auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
@@ -172,9 +172,9 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
   const clio::run::u32 fam_pages = (kLogicalPages + nblocks - 1) / nblocks;
   SeedTag(tag, vec.TagId(), fam_pages);
 
-  auto *gm = CLIO_CPU_IPC->GetGpuIpcManager();
-  REQUIRE(gm != nullptr);
-  auto gpu_info = gm->GetGpuInfo(0);
+  auto *gpu_ipc_mgr = CLIO_CPU_IPC->GetGpuIpcManager();
+  REQUIRE(gpu_ipc_mgr != nullptr);
+  clio::run::IpcManagerGpuInfo gpu_info = gpu_ipc_mgr->GetGpuInfo(0);
 
   unsigned long long *counters = nullptr;
   REQUIRE(cudaMallocManaged(&counters, 2 * sizeof(unsigned long long)) == cudaSuccess);
@@ -214,8 +214,8 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
   const std::string tag = "gvm_stale";
   auto vec = MakeVec(tag, /*nblocks=*/1, /*pages_per_block=*/4);
   SeedTag(tag, vec.TagId(), kLogicalPages);
-  auto *gm = CLIO_CPU_IPC->GetGpuIpcManager();
-  auto gpu_info = gm->GetGpuInfo(0);
+  auto *gpu_ipc_mgr = CLIO_CPU_IPC->GetGpuIpcManager();
+  clio::run::IpcManagerGpuInfo gpu_info = gpu_ipc_mgr->GetGpuInfo(0);
   unsigned long long *c = nullptr;
   REQUIRE(cudaMallocManaged(&c, 2 * sizeof(unsigned long long)) == cudaSuccess);
 
