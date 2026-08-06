@@ -142,13 +142,31 @@ static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                         clio::run::u64 chunk) {
   EnsureRuntime();
   const std::string tag = tag_name;
+  // Seed BEFORE constructing the reader, using a throwaway vector purely to
+  // obtain the TagId -- llama_geom does the same. A reader constructed first
+  // snapshots page metadata and never sees blobs written afterwards.
+  {
+    gv::Vector<uint8_t> seeder(tag, /*nblocks=*/1, /*gpu_id=*/0,
+                               /*gpu_pages_per_block=*/1,
+                               /*host_pages_per_block=*/0, kPageSizeBytes,
+                               /*cache_period_us=*/200, gv::CacheMode::kAsync,
+                               /*manager_threads_per_block=*/32,
+                               /*allow_cold_miss_fault=*/true,
+                               /*storage_pool_id=*/clio::run::PoolId(0, 0),
+                               /*family_pages=*/kLogicalPages);
+    SeedTag(tag, seeder.TagId(), kLogicalPages);
+  }
   gv::Vector<uint8_t> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
                           /*host_pages_per_block=*/0, kPageSizeBytes,
-                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*cache_period_us=*/200, gv::CacheMode::kAsync,
                           /*manager_threads_per_block=*/32,
-                          /*allow_cold_miss_fault=*/true);
-  const clio::run::u32 fam_pages = (kLogicalPages + nblocks - 1) / nblocks;
-  SeedTag(tag, vec.TagId(), fam_pages);
+                          /*allow_cold_miss_fault=*/true,
+                          /*storage_pool_id=*/clio::run::PoolId(0, 0),
+                          // Must match SeedTag: all pages in family 0.
+                          /*family_pages=*/kLogicalPages);
+  // The Vector ctor used here takes no logical-page count, so its fam_ppb
+  // policy defaults to "everything in family 0". Seeding with sharded family
+  // names would write blobs the device side never looks up.
 
   auto *gpu_ipc_mgr = CLIO_CPU_IPC->GetGpuIpcManager();
   REQUIRE(gpu_ipc_mgr != nullptr);
@@ -192,9 +210,12 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
   const std::string tag = "gvm_stale";
   gv::Vector<uint8_t> vec(tag, /*nblocks=*/1, /*gpu_id=*/0, /*gpu_pages_per_block=*/4,
                           /*host_pages_per_block=*/0, kPageSizeBytes,
-                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*cache_period_us=*/200, gv::CacheMode::kAsync,
                           /*manager_threads_per_block=*/32,
-                          /*allow_cold_miss_fault=*/true);
+                          /*allow_cold_miss_fault=*/true,
+                          /*storage_pool_id=*/clio::run::PoolId(0, 0),
+                          // Must match SeedTag: all pages in family 0.
+                          /*family_pages=*/kLogicalPages);
   SeedTag(tag, vec.TagId(), kLogicalPages);
   auto *gpu_ipc_mgr = CLIO_CPU_IPC->GetGpuIpcManager();
   clio::run::IpcManagerGpuInfo gpu_info = gpu_ipc_mgr->GetGpuInfo(0);
