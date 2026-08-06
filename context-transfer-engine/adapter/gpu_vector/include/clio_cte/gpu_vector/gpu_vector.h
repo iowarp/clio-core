@@ -242,6 +242,18 @@ class Vector {
   bool BuildHostMirror(clio::run::u64 total_bytes) {
     return BuildHostTier(total_bytes, total_bytes);
   }
+  /** Stop and join the cache-manager thread. Idempotent. A process whose
+   *  Vector is a leaked global MUST call this before exit (atexit works):
+   *  otherwise the thread races CUDA teardown and its next
+   *  CacheManagerKernel launch segfaults inside cudart. */
+  void StopManager() {
+#if !CTP_IS_DEVICE_PASS
+    if (!impl_) return;
+    impl_->cache_thread_run.store(false, std::memory_order_release);
+    if (impl_->cache_thread.joinable()) impl_->cache_thread.join();
+#endif
+  }
+
   /** Partial-mode page residency (see BuildHostTier). */
   unsigned char *EnsureHostPage(clio::run::u64 gp);
 
@@ -1509,20 +1521,60 @@ inline bool Vector<T>::BuildHostTier(clio::run::u64 total_bytes,
       }
       if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
     } else {
+      // Paged (e.g. COMPRESSED) fill: K gets in flight so dispatch and
+      // decompression pipeline instead of serializing per page.
       clio::cte::core::Client cte(impl_->cte_pool_id);
-      auto buf = CLIO_IPC->AllocateBuffer(page);
-      ok = buf.ptr_ != nullptr;
-      for (clio::run::u64 gp = 0; ok && gp < n_pages; ++gp) {
-        const std::string name = PageBlobName(gp);
-        auto gt = cte.AsyncGetBlob(view_.base.tag_id, name.c_str(), 0, page,
-                                   0, buf.shm_.template Cast<void>(),
-                                   clio::run::PoolQuery::Local());
-        gt.Wait();
-        if (gt->GetReturnCode() != 0) { ok = false; break; }
-        std::memcpy(arena + gp * page, buf.ptr_,
-                    std::min<clio::run::u64>(total_bytes - gp * page, page));
+      constexpr clio::run::u64 kInflight = 16;
+      struct Slot {
+        decltype(CLIO_IPC->AllocateBuffer(0)) buf;
+        decltype(cte.AsyncGetBlob(view_.base.tag_id, "", 0, 0, 0,
+                                  buf.shm_.template Cast<void>(),
+                                  clio::run::PoolQuery::Local())) fut;
+        clio::run::u64 gp = 0;
+        bool busy = false;
+      };
+      std::vector<Slot> ring(kInflight);
+      for (auto &sl2 : ring) {
+        sl2.buf = CLIO_IPC->AllocateBuffer(page);
+        if (sl2.buf.ptr_ == nullptr) ok = false;
       }
-      if (buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(buf);
+      clio::run::u64 next = 0, done = 0;
+      while (ok && done < n_pages) {
+        for (auto &sl2 : ring) {
+          if (!ok) break;
+          if (sl2.busy) {
+            sl2.fut.Wait();
+            if (sl2.fut->GetReturnCode() != 0) { ok = false; break; }
+            std::memcpy(arena + sl2.gp * page, sl2.buf.ptr_,
+                        std::min<clio::run::u64>(
+                            total_bytes - sl2.gp * page, page));
+            sl2.busy = false;
+            ++done;
+          }
+          if (next < n_pages) {
+            const std::string name = PageBlobName(next);
+            sl2.fut = cte.AsyncGetBlob(view_.base.tag_id, name.c_str(), 0,
+                                       page, 0,
+                                       sl2.buf.shm_.template Cast<void>(),
+                                       clio::run::PoolQuery::Local());
+            sl2.gp = next++;
+            sl2.busy = true;
+          }
+        }
+      }
+      for (auto &sl2 : ring) {
+        if (sl2.busy) {
+          sl2.fut.Wait();
+          if (ok && sl2.fut->GetReturnCode() == 0) {
+            std::memcpy(arena + sl2.gp * page, sl2.buf.ptr_,
+                        std::min<clio::run::u64>(
+                            total_bytes - sl2.gp * page, page));
+            ++done;
+          }
+          sl2.busy = false;
+        }
+        if (sl2.buf.ptr_ != nullptr) CLIO_IPC->FreeBuffer(sl2.buf);
+      }
     }
     if (!ok) {
       cudaFreeHost(arena);
