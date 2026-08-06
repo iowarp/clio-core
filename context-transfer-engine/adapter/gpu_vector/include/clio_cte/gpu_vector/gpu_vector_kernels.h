@@ -241,11 +241,21 @@ CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
   task->task_flags_.Clear();
   task->return_code_.store(0);
   task->task_id_ = clio::run::CreateTaskId();
-  task->offset_ = 0;
   task->size_ = v.base.page_size_bytes;
-  task->gpu_page_idx_ = static_cast<clio::run::u32>(target_page_idx);
-  task->gpu_family_idx_ =
-      (fam == kFamAuto) ? FamilyOf(v.base, target_page_idx) : fam;
+  if (v.base.flat_layout) {
+    // Flat store: one blob "w", page addressed by OFFSET. Sentinels keep the
+    // runtime from appending any _b/_pi suffix to the slot's stem.
+    task->offset_ = static_cast<clio::run::u64>(target_page_idx) *
+                    v.base.page_size_bytes;
+    task->gpu_page_idx_   = clio::cte::core::PodGetBlobTask::kNoPageIdx;
+    task->gpu_family_idx_ = clio::cte::core::PodGetBlobTask::kNoFamilyIdx;
+    (void) fam;
+  } else {
+    task->offset_ = 0;
+    task->gpu_page_idx_ = static_cast<clio::run::u32>(target_page_idx);
+    task->gpu_family_idx_ =
+        (fam == kFamAuto) ? FamilyOf(v.base, target_page_idx) : fam;
+  }
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);

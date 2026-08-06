@@ -100,7 +100,8 @@ class Vector {
          bool allow_cold_miss_fault = false,
          clio::run::PoolId storage_pool_id = clio::run::PoolId(0, 0),
          clio::run::u64 family_pages = 0,
-         std::function<std::string(clio::run::u64)> host_namer = nullptr);
+         std::function<std::string(clio::run::u64)> host_namer = nullptr,
+         bool flat_layout = false);
   ~Vector();
 
   /**
@@ -112,6 +113,9 @@ class Vector {
    * overrides the whole string for exotic layouts.
    */
   std::string PageBlobName(clio::run::u64 gp) const;
+  /** 0 for the per-page-blob layout; gp * page_size for the flat layout. */
+  clio::run::u64 PageBlobOffset(clio::run::u64 gp) const;
+  bool FlatLayout() const;
 
   Vector(const Vector &) = delete;
   Vector &operator=(const Vector &) = delete;
@@ -979,6 +983,7 @@ struct Vector<T>::Impl {
   clio::run::u64 fam_ppb = 0;
   /** Optional full-name override for host-side page name composition. */
   std::function<std::string(clio::run::u64)> host_namer;
+  bool flat_layout = false;   /**< model stored as one flat blob "w". */
   clio::run::PoolId cte_pool_id = clio::run::PoolId(0, 0);
   std::thread cache_thread;
   std::atomic<bool> cache_thread_run{false};
@@ -999,7 +1004,8 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
                           bool allow_cold_miss_fault,
                           clio::run::PoolId storage_pool_id,
                           clio::run::u64 family_pages,
-                          std::function<std::string(clio::run::u64)> host_namer) {
+                          std::function<std::string(clio::run::u64)> host_namer,
+                          bool flat_layout) {
 #if !CTP_IS_DEVICE_PASS
   // Body gated for the host pass only.
   if (nblocks == 0 || gpu_pages_per_block == 0 || page_size_bytes == 0) {
@@ -1183,6 +1189,8 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   view_.base.page_size_bytes = page_size_bytes;
   view_.base.allow_cold_miss_fault = allow_cold_miss_fault;
   view_.base.fam_ppb = family_pages;
+  impl_->flat_layout = flat_layout;
+  view_.base.flat_layout = flat_layout ? 1u : 0u;
   // Pinned-host instrumentation counters. Mapped so the device can
   // atomicAdd_system into them and the host can read them directly
   // (no cudaMemcpy round-trip). cudaHostAllocMapped + UVA means the
@@ -1220,7 +1228,7 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
       // Empty stem: the handler composes "b<fam>_pi<page>" from the task's
       // gpu_family_idx_/gpu_page_idx_. Sending the tag here is redundant with
       // tag_id_ and overflowed the small-string buffer for long model names.
-      std::string blob_name;
+      std::string blob_name = flat_layout ? "w" : "";
       auto put_task = new (put_addr) clio::cte::core::PodPutBlobTask(
           clio::run::CreateTaskId(), impl_->cte_pool_id,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
@@ -1422,7 +1430,7 @@ inline void Vector<T>::DrainHostPrefetchQueue(void *cuda_stream) {
       }
       impl_->async_inflight.fetch_add(1, std::memory_order_acq_rel);
       futs.push_back(cte_client.AsyncPodGetBlob(view_.base.tag_id, blob_name,
-                                                 /*offset=*/0, psz,
+                                                 PageBlobOffset(p->page_idx), psz,
                                                  /*flags=*/0, blob_data,
                                                  clio::run::PoolQuery::ToLocalCpu()));
       impl_->clear_block_arr[n_to_clear] = b;
@@ -1497,7 +1505,7 @@ inline void Vector<T>::FaultAllSync(clio::run::u64 num_model_pages) {
       ctp::ipc::ShmPtr<> blob_data;
       blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
       blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
-      auto gf = client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0,
+      auto gf = client.AsyncGetBlob(view_.base.tag_id, name, PageBlobOffset(gp),
                                     page_size, /*flags=*/0, blob_data,
                                     clio::run::PoolQuery::Local());
       gf.Wait();
@@ -1544,10 +1552,29 @@ inline std::string Vector<T>::PageBlobName(clio::run::u64 gp) const {
   }
   // No tag prefix: tag_id already scopes the lookup, and keeping the name
   // short is what keeps PodGetBlobTask::blob_name_ inside its SSO buffer.
+  if (impl_->flat_layout) return "w";   // flat: one blob, offset-addressed
   const clio::run::u64 fam = impl_->fam_ppb ? gp / impl_->fam_ppb : 0;
   return "b" + std::to_string(fam) + "_pi" + std::to_string(gp);
 #else
   (void)gp; return {};
+#endif
+}
+
+template <typename T>
+inline clio::run::u64 Vector<T>::PageBlobOffset(clio::run::u64 gp) const {
+#if !CTP_IS_DEVICE_PASS
+  return impl_->flat_layout ? gp * view_.base.page_size_bytes : 0;
+#else
+  (void)gp; return 0;
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::FlatLayout() const {
+#if !CTP_IS_DEVICE_PASS
+  return impl_->flat_layout;
+#else
+  return false;
 #endif
 }
 
@@ -1571,7 +1598,7 @@ inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
     ctp::ipc::ShmPtr<> blob_data;
     blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
     blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
-    return client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0, page_size,
+    return client.AsyncGetBlob(view_.base.tag_id, name, PageBlobOffset(gp), page_size,
                                /*flags=*/0, blob_data,
                                clio::run::PoolQuery::Local());
   };

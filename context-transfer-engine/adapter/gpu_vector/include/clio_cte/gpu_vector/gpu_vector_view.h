@@ -101,6 +101,10 @@ struct DeviceViewBase {
   /** Tag the kernel writes blobs against. Set once at Vector ctor. */
   clio::cte::core::TagId tag_id;
   clio::run::u32 nblocks;
+  /** 1 = model stored as ONE flat blob "w"; pages addressed by OFFSET
+   *  (gp * page_size_bytes) instead of per-page blob names. Makes k-page
+   *  batch faults expressible with the existing Pod task. */
+  clio::run::u32 flat_layout;
   clio::run::u32 gpu_pages_per_block;   /**< HBM cache slots per block. */
   clio::run::u32 host_pages_per_block;  /**< DRAM cache slots per block. 0 ⇒ legacy. */
   clio::run::u64 page_size_bytes;
