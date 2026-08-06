@@ -352,13 +352,22 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
       lru = s;
     }
   }
-  if (lru == tier_hi) lru = tier_lo;   // everything busy: fall back
-  // Same rule: claim before draining. A failed claim means another block is
-  // already binding this slot, so scan for one we can actually take.
-  if (!detail::TryAcquireBusy(&b->pages[lru])) {
+  // Claim SOME victim -- NEVER return a slot we do not own. The old fallback
+  // could give up after one scan and return an unowned slot, racing an
+  // in-flight fetch's completion (bind + task reuse against a Send still on
+  // the wire: the qwen MoE illegal-memory-access). An IN-FLIGHT slot is a
+  // legitimate victim here: claiming it and DrainGet-ing below waits out its
+  // fetch before reuse, which also reclaims prefetched pages that were never
+  // accessed and would otherwise hold their slots forever.
+  for (;;) {
+    if (lru != tier_hi && detail::TryAcquireBusy(&b->pages[lru])) break;
+    lru = tier_hi;
     for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
-      if (detail::TryAcquireBusy(&b->pages[s])) { lru = s; break; }
+      Page *p = &b->pages[s];
+      if (p->flags & kPageBusy) continue;      // owned by someone else
+      if (detail::TryAcquireBusy(p)) { lru = s; break; }
     }
+    if (lru != tier_hi) break;
   }
   DrainPut(&b->pages[lru]);
   DrainGet(&b->pages[lru], (DeviceViewBase *) &v.base);
@@ -891,6 +900,45 @@ class vector {
           ipc_, view_, last_page_array_, lo, /*is_write=*/false, fam_fn_);
       ::clio::cte::gpu_vector::Page *p0 = last_page_array_[0];
       while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(p0)) {}
+      // ISSUE-AHEAD (async prefetch): start the next pages' fetches, wait
+      // only at first access (hit-in-waiting + DrainGet provide the wait).
+      {
+        ::clio::cte::gpu_vector::Block *bx =
+            ::clio::cte::gpu_vector::GetBlock(view_.base, BlockIdx());
+        const clio::run::u32 total =
+            ::clio::cte::gpu_vector::TotalPagesPerBlock(view_.base);
+        for (clio::run::u64 la = 1; la <= 4; ++la) {
+          const clio::run::u64 np = pg + la;
+          if (view_.base.fam_ppb != 0 && np >= view_.base.fam_ppb) break;
+          bool have = false;
+          clio::run::u32 nfl = 0;
+          for (clio::run::u32 s2 = 0; s2 < total; ++s2) {
+            if (bx->pages[s2].flags &
+                ::clio::cte::gpu_vector::kPageGetInFlight) ++nfl;
+            if (bx->pages[s2].page_idx == static_cast<int32_t>(np)) {
+              have = true;
+            }
+          }
+          if (have) continue;
+          // Cap outstanding prefetches: a prefetched page's in-flight flag is
+          // only cleared at ACCESS, so uncapped issue leaks slots until the
+          // block runs out of them entirely.
+          if (nfl >= 8) break;
+          const clio::run::u32 sl =
+              ::clio::cte::gpu_vector::EvictSlot(ipc_, view_, BlockIdx());
+          ::clio::cte::gpu_vector::Page *p2 = &bx->pages[sl];
+          p2->page_idx   = static_cast<int32_t>(np);
+          p2->lru_clock  = clock64();
+          p2->modify_min = -1;
+          p2->modify_max = -1;
+          ::clio::cte::gpu_vector::FaultPage(ipc_, view_, BlockIdx(), p2, sl,
+                                             static_cast<int32_t>(np),
+                                             fam_fn_(view_.base, np));
+          ::clio::cte::gpu_vector::detail::AtomicOrU32(
+              &p2->flags, ::clio::cte::gpu_vector::kPageGetInFlight);
+          ::clio::cte::gpu_vector::detail::ReleaseBusy(p2);
+        }
+      }
     }
     __syncwarp();
     ::clio::cte::gpu_vector::Page *p = last_page_array_[0];
