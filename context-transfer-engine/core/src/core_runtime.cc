@@ -1570,7 +1570,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Pod task type so only genuine device page I/O is affected.
     if constexpr (std::is_same_v<TaskT, PodPutBlobTask>) {
       if (task->gpu_family_idx_ != TaskT::kNoFamilyIdx) {
-        blob_name += "_b" + std::to_string(task->gpu_family_idx_);
+        blob_name += (blob_name.empty() ? "b" : "_b") +
+                     std::to_string(task->gpu_family_idx_);
       }
       if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
         blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
@@ -2341,8 +2342,11 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // per-page index. A regular GetBlobTask (including every compressor-forwarded
     // read) must look up the blob name verbatim, never appending "_pi<idx>".
     if constexpr (std::is_same_v<TaskT, PodGetBlobTask>) {
+      // An EMPTY stem means the page name stands alone ("b<fam>_pi<page>");
+      // a non-empty stem keeps the legacy "<stem>_b<fam>_pi<page>" form.
+      const bool bare = blob_name.empty();
       if (task->gpu_family_idx_ != TaskT::kNoFamilyIdx) {
-        blob_name += "_b" + std::to_string(task->gpu_family_idx_);
+        blob_name += (bare ? "b" : "_b") + std::to_string(task->gpu_family_idx_);
       }
       if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
         blob_name += "_pi" + std::to_string(task->gpu_page_idx_);

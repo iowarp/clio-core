@@ -1217,7 +1217,10 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
       // "<tag>_b<family>_pi<page>". A per-block family here once made a
       // multi-block vector fault blobs that were never written — the GetBlob
       // parked forever and the faulting warp deadlocked spinning on it.
-      std::string blob_name = tag_name;
+      // Empty stem: the handler composes "b<fam>_pi<page>" from the task's
+      // gpu_family_idx_/gpu_page_idx_. Sending the tag here is redundant with
+      // tag_id_ and overflowed the small-string buffer for long model names.
+      std::string blob_name;
       auto put_task = new (put_addr) clio::cte::core::PodPutBlobTask(
           clio::run::CreateTaskId(), impl_->cte_pool_id,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
@@ -1539,9 +1542,10 @@ inline std::string Vector<T>::PageBlobName(clio::run::u64 gp) const {
   if (impl_->host_namer) {
     return impl_->host_namer(gp);
   }
+  // No tag prefix: tag_id already scopes the lookup, and keeping the name
+  // short is what keeps PodGetBlobTask::blob_name_ inside its SSO buffer.
   const clio::run::u64 fam = impl_->fam_ppb ? gp / impl_->fam_ppb : 0;
-  return impl_->tag_name + "_b" + std::to_string(fam) + "_pi" +
-         std::to_string(gp);
+  return "b" + std::to_string(fam) + "_pi" + std::to_string(gp);
 #else
   (void)gp; return {};
 #endif

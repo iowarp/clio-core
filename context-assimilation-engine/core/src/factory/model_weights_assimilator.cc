@@ -214,9 +214,17 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
       CLIO_CO_RETURN;
     }
 
-    // Fully-composed name the vector's GetBlob will request:
-    //   <tag>_b<block>_pi<page>
-    std::string blob_name = tag_name + "_b" + std::to_string(block) + "_pi" +
+    // Name the vector's GetBlob will request: "b<block>_pi<page>".
+    //
+    // The tag is deliberately NOT part of this. Lookups are already scoped by
+    // tag_id -- HashBlobToContainer(tag_id, blob_name) keys on both -- so
+    // prefixing the semantic tag transported it twice. It also had to survive
+    // inside PodGetBlobTask::blob_name_, a priv::string that must stay in its
+    // small-string buffer because a Pod task cannot carry a heap allocation to
+    // the handler. A 44-char tag was SILENTLY truncated to 31, so every device
+    // fault missed with rc=1 and the weights stayed zero with no error
+    // anywhere. Dropping the prefix removes the whole failure class.
+    std::string blob_name = "b" + std::to_string(block) + "_pi" +
                             std::to_string(p);
     auto task = page_client->AsyncPutBlob(tag_id, blob_name, 0, page_size,
                                           buf.shm_.template Cast<void>(), 1.0f,
