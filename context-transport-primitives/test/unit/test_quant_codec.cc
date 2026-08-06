@@ -33,6 +33,33 @@
 #include "clio_ctp/compress/quant.h"
 #include <cstdio>
 #include <cmath>
+// ggml's dequantize_row_q6_K, transcribed from ggml-quants.c
+static void ref_q6k(const uint8_t *blk, float *y) {
+  const uint8_t *ql = blk;
+  const uint8_t *qh = blk + 128;
+  const int8_t  *sc = (const int8_t *)(blk + 128 + 64);
+  uint16_t dh; memcpy(&dh, blk + 128 + 64 + 16, 2);
+  // half -> float
+  uint32_t s=(uint32_t)(dh&0x8000)<<16, e=(dh>>10)&0x1F, m=dh&0x3FF, u;
+  if (e==0) u = m? 0 : s; else if (e==31) u = s|0x7F800000|(m<<13);
+  else u = s | ((e-15+127)<<23) | (m<<13);
+  float d; memcpy(&d,&u,4);
+  for (int n = 0; n < 256; n += 128) {
+    for (int l = 0; l < 32; ++l) {
+      int is = l/16;
+      const int8_t q1 = (int8_t)((ql[l+ 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+      const int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+      const int8_t q3 = (int8_t)((ql[l+ 0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+      const int8_t q4 = (int8_t)((ql[l+32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+      y[l+ 0] = d * sc[is+0] * q1;
+      y[l+32] = d * sc[is+2] * q2;
+      y[l+64] = d * sc[is+4] * q3;
+      y[l+96] = d * sc[is+6] * q4;
+    }
+    ql += 64; qh += 32; sc += 8; y += 128;
+  }
+}
+
 int fails = 0;
 void chk(const char* n, float got, float want) {
   if (std::fabs(got - want) > 1e-4f) { printf("FAIL %s got %f want %f\n", n, got, want); ++fails; }
@@ -74,6 +101,20 @@ int main() {
   Q::DecodeBlock(Q::Type::kQ4_K, k, ser);
   for (int l = 0; l < 32; ++l) Q::DecodeBlock(Q::Type::kQ4_K, k, par, l, 32);
   for (int i = 0; i < 256; ++i) chk("q4k lane==serial", par[i], ser[i]);
+
+  // Q6_K against ggml's own dequantize_row_q6_K, not a reimplementation of
+  // it. Geometry alone is not enough: Q5_K was present, had correct block
+  // size, and silently returned wrong VALUES -- which showed up only as
+  // garbage model output much later.
+  {
+    uint8_t b6[210];
+    for (int i = 0; i < 210; ++i) b6[i] = (uint8_t)(i * 37 + 11);
+    uint16_t d1 = 0x3C00; memcpy(b6 + 208, &d1, 2);
+    float mine[256], ref[256];
+    Q::DecodeBlock(Q::Type::kQ6_K, b6, mine);
+    ref_q6k(b6, ref);
+    for (int i = 0; i < 256; ++i) chk("q6_K vs ggml", mine[i], ref[i]);
+  }
 
   printf(fails ? "FAILURES: %d\n" : "ALL PASS\n", fails);
   return fails != 0;
