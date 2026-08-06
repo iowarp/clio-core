@@ -93,6 +93,23 @@ private:
   // Client for this ChiMod
   Client client_;
 
+  /**
+   * Pre-allocated DEVICE fetch buffers for the GPU-codec fault path. A fault
+   * needs the compressed page in device memory so nvcomp/cusz decompress
+   * device->device into the vector's HBM slot; allocating that buffer with a
+   * per-fault cudaMalloc deadlocks under VRAM pressure (implicit context
+   * sync vs the spin-waiting faulting kernel). Grow-once ring, mutex+cv
+   * guarded, capped at kDevFetchPoolCap buffers.
+   */
+  static constexpr int kDevFetchPoolCap = 8;
+  std::mutex dev_fetch_mtx_;
+  std::condition_variable dev_fetch_cv_;
+  std::vector<char *> dev_fetch_free_;
+  int dev_fetch_alloced_ = 0;
+  clio::run::u64 dev_fetch_size_ = 0;
+  char *AcquireDevFetch(clio::run::u64 size);
+  void ReleaseDevFetch(char *buf);
+
   // Core client for target monitoring
   /**
    * Compress src[0..size) per ctx into a fresh SHM buffer laid out as

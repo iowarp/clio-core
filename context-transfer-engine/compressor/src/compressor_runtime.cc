@@ -1282,6 +1282,42 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
 // fault. Fetches the (compressed) blob from core under the "_pi" name and
 // decompresses into the caller's HBM buffer. Mirrors Decompress(); the
 // compressed size is over-estimated (cuSZp's stream is self-delimiting).
+char *Runtime::AcquireDevFetch(clio::run::u64 size) {
+  std::unique_lock<std::mutex> lk(dev_fetch_mtx_);
+  for (;;) {
+    if (!dev_fetch_free_.empty() && dev_fetch_size_ >= size) {
+      char *b = dev_fetch_free_.back();
+      dev_fetch_free_.pop_back();
+      return b;
+    }
+    if (dev_fetch_alloced_ < kDevFetchPoolCap || dev_fetch_size_ < size) {
+      // (Re)allocate outside the fault hot loop: this runs at most
+      // kDevFetchPoolCap times per size class, typically once at warmup —
+      // NOT per fault, which is what deadlocked.
+      if (dev_fetch_size_ < size) {
+        for (char *b : dev_fetch_free_) ctp::GpuApi::Free(b);
+        dev_fetch_free_.clear();
+        dev_fetch_alloced_ = 0;
+        dev_fetch_size_ = size;
+      }
+      char *b = ctp::GpuApi::Malloc<char>(dev_fetch_size_);
+      if (b != nullptr) {
+        ++dev_fetch_alloced_;
+        return b;
+      }
+    }
+    dev_fetch_cv_.wait(lk);
+  }
+}
+
+void Runtime::ReleaseDevFetch(char *buf) {
+  {
+    std::lock_guard<std::mutex> lk(dev_fetch_mtx_);
+    dev_fetch_free_.push_back(buf);
+  }
+  dev_fetch_cv_.notify_one();
+}
+
 template <typename GetT>
 clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     clio::run::shared_ptr<GetT>& task) {
@@ -1326,7 +1362,7 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
         config_.compress_lib_ == "cusz" || config_.compress_lib_ == "cuszp" ||
         config_.compress_lib_ == "zfp-sycl";
     if (dev_out && pinned_gpu_codec) {
-      dev_tmp = ctp::GpuApi::Malloc<char>(fetch_size);
+      dev_tmp = AcquireDevFetch(fetch_size);
     }
 #endif
     if (dev_tmp == nullptr) {
@@ -1335,7 +1371,7 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     }
     auto free_tmp = [&]() {
 #if CTP_ENABLE_GPU
-      if (dev_tmp != nullptr) { ctp::GpuApi::Free(dev_tmp); dev_tmp = nullptr; return; }
+      if (dev_tmp != nullptr) { ReleaseDevFetch(dev_tmp); dev_tmp = nullptr; return; }
 #endif
       CLIO_IPC->FreeBuffer(tmp);
     };
