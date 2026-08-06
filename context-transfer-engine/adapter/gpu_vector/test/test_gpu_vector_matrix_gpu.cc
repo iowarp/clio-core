@@ -152,23 +152,17 @@ __global__ void SpanVerifyKernel(clio::run::IpcManagerGpuInfo info,
 
 // ---------------------------------------------------------------------------
 
-/** Build a vector over the seeded tag with an explicitly chosen cache size. */
-static gv::Vector<uint8_t> MakeVec(const std::string &tag, clio::run::u32 nblocks,
-                                   clio::run::u32 pages_per_block) {
-  return gv::Vector<uint8_t>(tag, nblocks, /*gpu_id=*/0, pages_per_block,
-                             /*host_pages_per_block=*/0, kPageSizeBytes,
-                             /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
-                             /*manager_threads_per_block=*/32,
-                             /*allow_cold_miss_fault=*/true);
-}
-
 static void RunSpanCase(const char *tag_name, clio::run::u32 nblocks,
                         clio::run::u32 pages_per_block, clio::run::u32 grid,
                         clio::run::u64 lo, clio::run::u64 hi,
                         clio::run::u64 chunk) {
   EnsureRuntime();
   const std::string tag = tag_name;
-  auto vec = MakeVec(tag, nblocks, pages_per_block);
+  gv::Vector<uint8_t> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
+                          /*host_pages_per_block=*/0, kPageSizeBytes,
+                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*manager_threads_per_block=*/32,
+                          /*allow_cold_miss_fault=*/true);
   const clio::run::u32 fam_pages = (kLogicalPages + nblocks - 1) / nblocks;
   SeedTag(tag, vec.TagId(), fam_pages);
 
@@ -212,7 +206,11 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
           "[gpu_vector][oom]") {
   EnsureRuntime();
   const std::string tag = "gvm_stale";
-  auto vec = MakeVec(tag, /*nblocks=*/1, /*pages_per_block=*/4);
+  gv::Vector<uint8_t> vec(tag, /*nblocks=*/1, /*gpu_id=*/0, /*gpu_pages_per_block=*/4,
+                          /*host_pages_per_block=*/0, kPageSizeBytes,
+                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*manager_threads_per_block=*/32,
+                          /*allow_cold_miss_fault=*/true);
   SeedTag(tag, vec.TagId(), kLogicalPages);
   auto *gpu_ipc_mgr = CLIO_CPU_IPC->GetGpuIpcManager();
   clio::run::IpcManagerGpuInfo gpu_info = gpu_ipc_mgr->GetGpuInfo(0);

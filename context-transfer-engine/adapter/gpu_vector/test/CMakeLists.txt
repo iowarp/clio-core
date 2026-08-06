@@ -36,16 +36,7 @@ if(CLIO_CORE_ENABLE_CUDA)
 
     # On-device faulting under oversubscription, UNCOMPRESSED: cache == 1/2 the
 
-# DISABLED: test_gpu_vector_matrix does not compile.
-# PROVEN identical to test_gpu_vector_llama_geom (which does compile):
-#   - compile command: identical but for filenames
-#   - includes_CUDA.rsp: byte-identical
-#   - #include list: identical except <cstring>
-#   - call sites: textually identical
-# So the defect is in the SOURCE, not the build. Client::AsyncPutBlob and
-# GetGpuIpcManager()->GetGpuInfo do not resolve. NOTE: an earlier claim that
-# this source compiles under llama_geom's flags was WRONG -- the eval never
-# ran and an empty grep was read as success. Verify by exit code, not grep.
+# DISABLED: test_gpu_vector_matrix does not compile. See git log.
 #    add_cuda_executable(test_gpu_vector_matrix FALSE
 #        test_gpu_vector_matrix_gpu.cc
 #        INCLUDE_DIRS
