@@ -88,8 +88,8 @@ class NvComp : public Compressor {
 
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    cudaStream_t stream = CachedStream();
+    if (stream == nullptr) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -107,7 +107,7 @@ class NvComp : public Compressor {
         d_in = ToDeviceInput(input, input_size, stream, &free_in);
         if (!d_in) break;
 
-        std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
+        nvcomp::nvcompManagerBase *mgr = CachedManager(stream);
         if (!mgr) break;
         nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
 
@@ -147,14 +147,13 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
     return ok;
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    cudaStream_t stream = CachedStream();
+    if (stream == nullptr) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -171,9 +170,10 @@ class NvComp : public Compressor {
         d_in = ToDeviceInput(input, input_size, stream, &free_in);
         if (!d_in) break;
 
-        // create_manager parses the NVCOMP_NATIVE header and syncs the stream.
-        std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
-            nvcomp::create_manager(d_in, stream);
+        // Typed managers decompress their own NVCOMP_NATIVE bitstreams;
+        // create_manager (header parse + device scratch + stream sync PER
+        // CALL) is unnecessary for bytes this codec wrote itself.
+        nvcomp::nvcompManagerBase *mgr = CachedManager(stream);
         if (!mgr) break;
         nvcomp::DecompressionConfig cfg = mgr->configure_decompression(d_in);
         if (cfg.decomp_data_size > output_size) break;  // caller buffer too small
@@ -204,7 +204,6 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
     return ok;
   }
 
@@ -251,6 +250,36 @@ class NvComp : public Compressor {
     }
     *owned = true;
     return d;
+  }
+
+  /**
+   * Per-thread cached stream + typed manager. Building an nvcomp Manager
+   * allocates device scratch (cudaMalloc) and create_manager additionally
+   * parses the header AND syncs the stream -- measured ~3 ms of setup per
+   * 1 MiB page, which serialized the whole decompress pipeline on the
+   * allocator. Each runtime worker gets one stream and one manager per
+   * algorithm, reused forever; typed managers decompress their own
+   * NVCOMP_NATIVE bitstreams, so create_manager is unnecessary.
+   */
+  cudaStream_t CachedStream() {
+    static thread_local cudaStream_t s_stream = nullptr;
+    if (s_stream == nullptr) {
+      if (cudaStreamCreate(&s_stream) != cudaSuccess) s_stream = nullptr;
+    }
+    return s_stream;
+  }
+  nvcomp::nvcompManagerBase *CachedManager(cudaStream_t stream) {
+    static thread_local std::shared_ptr<nvcomp::nvcompManagerBase>
+        s_mgr[6] = {};
+    const int idx = (int) algo_;
+    if (!s_mgr[idx]) {
+      try {
+        s_mgr[idx] = MakeManager(stream);
+      } catch (...) {
+        return nullptr;
+      }
+    }
+    return s_mgr[idx].get();
   }
 
   /** Construct the nvcomp manager for the configured algorithm. */

@@ -254,6 +254,35 @@ class Vector {
 #endif
   }
 
+  /** In-flight device fetches: issue many spans with FetchSpanDeviceAsync /
+   *  PinnedSpan(..., &list), then WaitFetches ONCE for the whole batch --
+   *  the server decompresses the pages CONCURRENTLY across its workers.
+   *  Per-span blocking waits serialized the pipeline (measured
+   *  dispatch-bound at ~1.3-3 ms/page). */
+  using FetchList =
+      std::vector<clio::run::Future<clio::cte::core::GetBlobTask>>;
+
+  /** Issue the page-gets for [off, off+len) -> dst_dev WITHOUT waiting;
+   *  futures are appended to fl. */
+  bool FetchSpanDeviceAsync(unsigned char *dst_dev, clio::run::u64 off,
+                            clio::run::u64 len, FetchList *fl);
+
+  /** Wait every fetch in fl; true iff all succeeded. Clears fl. */
+  bool WaitFetches(FetchList &fl) {
+#if !CTP_IS_DEVICE_PASS
+    bool ok = true;
+    for (auto &f : fl) {
+      f.Wait();
+      if (f->GetReturnCode() != 0) ok = false;
+    }
+    fl.clear();
+    return ok;
+#else
+    (void) fl;
+    return false;
+#endif
+  }
+
   /** Fetch [off, off+len) of the model image STRAIGHT INTO DEVICE MEMORY
    *  through the CTE: per-page GetBlobs (16 in flight) routed via the
    *  storage pool, so a COMPRESSED tag's pages decompress on the GPU --
@@ -321,7 +350,8 @@ class Vector {
    *  is set. Returns nullptr when not admitted (caller stages transient
    *  or reads the mirror). */
   const unsigned char *PinnedSpan(clio::run::u64 off, clio::run::u64 len,
-                                  bool permanent, bool *copied);
+                                  bool permanent, bool *copied,
+                                  FetchList *fl = nullptr);
 
   /** Bump-allocate len bytes of the transient ring. On wrap, fences the
    *  copy stream on main_stream progress so no in-flight consumer still
@@ -330,7 +360,8 @@ class Vector {
 
   /** Issue the H2D copy of mirror span [off,off+len) into dst on the copy
    *  stream. dst is normally a StageTransient() slice. */
-  bool CopySpan(unsigned char *dst, clio::run::u64 off, clio::run::u64 len);
+  bool CopySpan(unsigned char *dst, clio::run::u64 off, clio::run::u64 len,
+                FetchList *fl = nullptr);
 
   clio::run::u64 RingCap() const {
 #if !CTP_IS_DEVICE_PASS
@@ -1735,7 +1766,8 @@ template <typename T>
 inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
                                                   clio::run::u64 len,
                                                   bool permanent,
-                                                  bool *copied) {
+                                                  bool *copied,
+                                                  FetchList *fl) {
 #if !CTP_IS_DEVICE_PASS
   if (copied) *copied = false;
   if (!impl_) return nullptr;
@@ -1764,7 +1796,7 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
     dst = impl_->span_slab + impl_->slab_used;
     impl_->slab_used += (len + 255ull) & ~255ull;
   }
-  if (!CopySpan(dst, off, len)) {
+  if (!CopySpan(dst, off, len, fl)) {
     // dst stays allocated but unmapped; do not cache a bad span.
     return nullptr;
   }
@@ -1779,13 +1811,14 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
 
 template <typename T>
 inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
-                                clio::run::u64 len) {
+                                clio::run::u64 len, FetchList *fl) {
 #if !CTP_IS_DEVICE_PASS
   if (!impl_ || dst == nullptr) return false;
   if (impl_->host_arena == nullptr) {
     // No DRAM tier (compressed mode): fetch device-direct through the CTE.
     // kHBM-resident pages decompress VRAM->VRAM; nothing uncompressed
-    // crosses PCIe.
+    // crosses PCIe. With fl, the caller batches waits across MANY spans.
+    if (fl != nullptr) return FetchSpanDeviceAsync(dst, off, len, fl);
     return FetchSpanDevice(dst, off, len);
   }
   if (off >= impl_->mirror_bytes) return false;
@@ -1821,21 +1854,20 @@ inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
 }
 
 template <typename T>
-inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
-                                       clio::run::u64 off,
-                                       clio::run::u64 len) {
+inline bool Vector<T>::FetchSpanDeviceAsync(unsigned char *dst_dev,
+                                            clio::run::u64 off,
+                                            clio::run::u64 len,
+                                            FetchList *fl) {
 #if !CTP_IS_DEVICE_PASS
-  if (!impl_ || dst_dev == nullptr) return false;
+  if (!impl_ || dst_dev == nullptr || fl == nullptr) return false;
   if (impl_->mirror_bytes != 0) {
     if (off >= impl_->mirror_bytes) return false;
     if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
   }
   clio::cte::core::Client cte(impl_->cte_pool_id);
   const clio::run::u64 page = view_.base.page_size_bytes;
-  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> infl;
-  bool ok = true;
   clio::run::u64 cur = off;
-  while (ok && cur < off + len) {
+  while (cur < off + len) {
     const clio::run::u64 gp   = cur / page;
     const clio::run::u64 poff = cur - gp * page;
     const clio::run::u64 seg  =
@@ -1843,21 +1875,26 @@ inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
     const std::string name =
         view_.base.flat_layout ? std::string("w") : PageBlobName(gp);
     const clio::run::u64 boff = view_.base.flat_layout ? cur : poff;
-    infl.push_back(cte.AsyncGetBlob(
+    fl->push_back(cte.AsyncGetBlob(
         view_.base.tag_id, name, boff, seg, 0,
         (char *) dst_dev + (cur - off), clio::run::PoolQuery::Local()));
     cur += seg;
-    if (infl.size() >= 16) {
-      infl.front().Wait();
-      if (infl.front()->GetReturnCode() != 0) ok = false;
-      infl.erase(infl.begin());
-    }
   }
-  for (auto &f : infl) {
-    f.Wait();
-    if (f->GetReturnCode() != 0) ok = false;
-  }
-  return ok;
+  return true;
+#else
+  (void) dst_dev; (void) off; (void) len; (void) fl;
+  return false;
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
+                                       clio::run::u64 off,
+                                       clio::run::u64 len) {
+#if !CTP_IS_DEVICE_PASS
+  FetchList fl;
+  if (!FetchSpanDeviceAsync(dst_dev, off, len, &fl)) return false;
+  return WaitFetches(fl);
 #else
   (void) dst_dev; (void) off; (void) len;
   return false;

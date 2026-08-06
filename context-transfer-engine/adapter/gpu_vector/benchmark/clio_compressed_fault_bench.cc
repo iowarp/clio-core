@@ -53,7 +53,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-constexpr uint64_t kPage = 1ull << 20;   // vector/storage page: 1 MiB
+uint64_t kPage = 1ull << 20;   // vector/storage page (--page-mb)
 
 #if !CTP_IS_DEVICE_PASS
 
@@ -146,6 +146,8 @@ int main(int argc, char **argv) {
       c.layers = val("layers");
     } else if (a == "--experts") {
       c.experts = val("experts");
+    } else if (a == "--page-mb") {
+      kPage = val("page") << 20;
     }
   }
   // Case presets: dataset vs. tier-cap regimes (see header comment).
@@ -281,8 +283,14 @@ int main(int argc, char **argv) {
   uint64_t x = c.seed ^ 0xD1B54A32D192ED03ull;
   uint64_t expected = 0, fetched = 0, fails = 0;
   const uint64_t t_run0 = NowMs();
+  gv::Vector<uint8_t>::FetchList fl;
+  std::vector<std::pair<uint8_t *, uint64_t>> batch;   // (dst, slice)
   for (uint64_t tok = 0; tok < c.tokens; ++tok) {
     for (uint64_t l = 0; l < c.layers; ++l) {
+      // ASYNC BULK PREFETCH: issue every selected slice's page-gets first,
+      // wait ONCE for the layer -- the server decompresses the whole batch
+      // concurrently. Per-slice blocking waits measured dispatch-bound.
+      batch.clear();
       for (uint64_t s = 0; s < c.k_sel; ++s) {
         x ^= x << 13;
         x ^= x >> 7;
@@ -291,15 +299,20 @@ int main(int argc, char **argv) {
         const uint64_t r =
             std::lower_bound(cum.begin(), cum.end(), u) - cum.begin();
         const uint64_t sl = rank[std::min(r, slices - 1)];
-        const uint64_t off = sl * c.slice_bytes;
         uint8_t *dst = vec.StageTransient(c.slice_bytes, nullptr);
-        if (dst == nullptr || !vec.FetchSpanDevice(dst, off, c.slice_bytes)) {
+        if (dst == nullptr ||
+            !vec.FetchSpanDeviceAsync(dst, sl * c.slice_bytes, c.slice_bytes,
+                                      &fl)) {
           ++fails;
           continue;
         }
-        ConsumeKernel<<<256, 256>>>(dst, c.slice_bytes, d_sum);
+        batch.emplace_back(dst, sl);
+      }
+      if (!vec.WaitFetches(fl)) ++fails;
+      for (auto &pr : batch) {
+        ConsumeKernel<<<256, 256>>>(pr.first, c.slice_bytes, d_sum);
         for (uint64_t p = 0; p < pages_per_slice; ++p) {
-          expected += SliceSum(kPage, sl * pages_per_slice + p,
+          expected += SliceSum(kPage, pr.second * pages_per_slice + p,
                                c.fill_const_frac);
         }
         fetched += c.slice_bytes;
