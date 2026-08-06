@@ -248,8 +248,10 @@ void EnsureInit() {
 
 /**
  * Seed the tag EXACTLY the way the CAE ModelWeightsAssimilator does: external
- * PutBlob of "<tag>_b<page/kFamPages>_pi<page>" — sharded families, written by
- * a component that knows nothing about the reader's cache layout.
+ * PutBlob of "b<page/kFamPages>_pi<page>" — bare-stem names (the tag travels
+ * as tag_id_ only; a tag-prefixed name overflowed chi::string's SSO and
+ * truncated) — sharded families, written by a component that knows nothing
+ * about the reader's cache layout.
  */
 void PopulateCaeSharded(const std::string &tag) {
   gv::Vector<uint8_t> vec(tag, /*nblocks=*/1, /*gpu_id=*/0,
@@ -267,7 +269,7 @@ void PopulateCaeSharded(const std::string &tag) {
     for (clio::run::u64 j = 0; j < kPageSizeBytes; ++j) {
       bytes[j] = PatternAt(base + j);
     }
-    std::string blob_name = tag + "_b" + std::to_string(p / kFamPages) +
+    std::string blob_name = "b" + std::to_string(p / kFamPages) +
                             "_pi" + std::to_string(p);
     auto task = cte->AsyncPutBlob(tag_id, blob_name, 0, kPageSizeBytes,
                                   buf.shm_.template Cast<void>(), 1.0f,
