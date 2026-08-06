@@ -7,43 +7,17 @@
  */
 
 /**
- * MULTI-BLOCK on-device faulting against an EXTERNALLY-written, FAMILY-SHARDED
- * tag — the llama.cpp weight-streaming configuration in miniature.
- *
- * Every other test in this directory runs read_range from a single CUDA block
- * (the oversubscribe kernel literally early-returns `blockIdx.x != 0`), and
- * every multi-block test writes its data through the vector itself, which is
- * naming-scheme-agnostic by construction. The combination that shipped broken
- * was therefore never covered:
- *
- *     nblocks == 8, uint8_t elements, 2 MiB pages,
- *     pages written EXTERNALLY under the CAE assimilator's sharded families
- *         (family = page / ceil(num_pages/nblocks)),
- *     kAsync cache manager, allow_cold_miss_fault,
- *     cache << extent, every CUDA block cold-faulting pages OUTSIDE the
- *     family stripe its index would suggest,
- *     consume staging into __shared__ (the paged-dequant kernel's shape).
- *
- * What this covers that nothing else did:
- *   - the gpu_family_idx_ / FamilyOf policy: fault names must match the
- *     assimilator's sharding for ANY (faulting block, page) pair;
- *   - the FamFn lambda input to dev::vector;
- *   - concurrent fault traffic from 8 blocks at once;
- *   - byte-typed pages (all prior fault tests used u32/float).
-
-/**
  * gpu_vector paging matrix.
  *
  * Every case here is a defect that actually shipped and was found by running a
- * multi-GB model instead of a test. The point of the file is that none of them
- * should have needed a 30B model to find:
+ * multi-GB model instead of a test. None of them should have needed a 30B
+ * model to find:
  *
- *   OversubscribedSequential  cache << extent, every byte via read_range
- *   StaleWindowAfterEviction  prefaulted window must not outlive its slots
- *   GridWiderThanNblocks      N CUDA blocks sharing one cache block, faulting
- *   UnalignedChunkedStaging   stage size NOT a multiple of the record size
- *   CrossPageUnalignedSpans   spans straddling page boundaries at odd offsets
- *   RandomOrderThrash         non-sequential access defeating the prefetcher
+ *   oversubscribed sequential  cache << extent, every byte via read_range
+ *   stale prefaulted window    window must not outlive the slots it describes
+ *   grid wider than nblocks    many CUDA blocks sharing one cache block
+ *   unaligned staging chunks   chunk size not dividing the record size
+ *   cross-page unaligned spans spans straddling pages at odd offsets
  */
 
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
