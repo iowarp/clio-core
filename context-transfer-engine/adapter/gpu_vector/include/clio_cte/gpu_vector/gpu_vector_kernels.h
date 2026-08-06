@@ -864,6 +864,54 @@ class vector {
   }
 
   /**
+   * Pointer to a span lying entirely within ONE page, or nullptr.
+   *
+   * Staging exists only because read_range hands bytes back through a
+   * per-value callback and never exposes where they live; the bytes are
+   * already in device memory and that copy measured 15x the compute it
+   * feeds. This returns the location instead, with the page pinned.
+   *
+   * WARP-COLLECTIVE: every lane of one warp must enter (lane 0 resolves and
+   * acquires, all lanes read the broadcast slot). On success the page is
+   * PINNED (kPageBusy) and the caller must release_span() after reading.
+   * Returns nullptr -- pinning nothing -- when the span straddles a page
+   * boundary, or when the slot was rebound between resolve and acquire; the
+   * caller stages that (rare) span instead.
+   */
+  CTP_GPU_FUN const uint8_t *span_ptr(clio::run::u64 lo, clio::run::u64 hi,
+                                      ::clio::cte::gpu_vector::Page **held) {
+    *held = nullptr;
+    if (lo >= hi) return nullptr;
+    const clio::run::u64 cap = view_.page_capacity_t;
+    const clio::run::u64 pg = lo / cap;
+    if (pg != ((hi - 1) / cap)) return nullptr;   // straddles: caller stages
+    const clio::run::u32 lane = threadIdx.x & 31;
+    if (lane == 0) {
+      (void)::clio::cte::gpu_vector::Resolve(
+          ipc_, view_, last_page_array_, lo, /*is_write=*/false, fam_fn_);
+      ::clio::cte::gpu_vector::Page *p0 = last_page_array_[0];
+      while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(p0)) {}
+    }
+    __syncwarp();
+    ::clio::cte::gpu_vector::Page *p = last_page_array_[0];
+    // Validate under the pin: the slot can be rebound between resolve and
+    // acquire. A stale slot must not be dereferenced.
+    if (p == nullptr || p->device_ptr == nullptr ||
+        static_cast<clio::run::u64>(p->page_idx) != pg) {
+      __syncwarp();
+      if (lane == 0 && p != nullptr)
+        ::clio::cte::gpu_vector::detail::ReleaseBusy(p);
+      return nullptr;
+    }
+    *held = p;
+    return static_cast<const uint8_t *>(p->device_ptr) + (lo - pg * cap);
+  }
+
+  CTP_GPU_FUN void release_span(::clio::cte::gpu_vector::Page *held) {
+    if (held) ::clio::cte::gpu_vector::detail::ReleaseBusy(held);
+  }
+
+  /**
    * BULK read of a contiguous span into `dst`, using 16-byte accesses.
    *
    * The callback form above moves ONE ELEMENT per lane per iteration, and the
