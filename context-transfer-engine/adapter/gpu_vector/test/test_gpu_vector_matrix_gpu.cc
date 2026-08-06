@@ -390,7 +390,7 @@ TEST_CASE("gpu_vector: out-of-core throughput floor",
  *  race; this is the illegal-memory-access configuration. */
 TEST_CASE("gpu_vector: grid far wider than nblocks faults safely",
           "[gpu_vector][oom][race]") {
-  RunSpanCase("gvm_widegrid", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/64,
+  RunSpanCase("gvm_widegrid", /*nblocks=*/8, /*pages_per_block=*/8, /*grid=*/64,
               0, kTotalBytes, /*chunk=*/8192);
 }
 
