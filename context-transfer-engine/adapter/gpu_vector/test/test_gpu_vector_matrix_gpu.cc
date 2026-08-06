@@ -100,7 +100,7 @@ void SeedTag(const std::string &tag, const clio::cte::core::TagId &tag_id,
              clio::run::u32 fam_pages) {
   auto *cte = CLIO_CTE_CLIENT;
   for (clio::run::u32 p = 0; p < kLogicalPages; ++p) {
-    auto buf = CLIO_IPC->AllocateBuffer(kPageSizeBytes);
+    auto buf = CLIO_CPU_IPC->AllocateBuffer(kPageSizeBytes);
     auto *bytes = reinterpret_cast<uint8_t *>(buf.ptr_);
     const clio::run::u64 base = static_cast<clio::run::u64>(p) * kPageSizeBytes;
     for (clio::run::u64 j = 0; j < kPageSizeBytes; ++j) bytes[j] = PatternAt(base + j);

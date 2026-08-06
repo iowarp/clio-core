@@ -36,10 +36,12 @@ if(CLIO_CORE_ENABLE_CUDA)
 
     # On-device faulting under oversubscription, UNCOMPRESSED: cache == 1/2 the
     # logical extent, reads served purely by the cold-miss fault path.
-# TODO: test_gpu_vector_matrix does not compile yet -- the host-side
-# seeding helpers resolve CLIO_IPC/CLIO_CPU_IPC to the GPU IpcManager in
-# this TU. Registration is disabled so it cannot break the build; the
-# test source is committed so the work is not lost.
+# TODO: test_gpu_vector_matrix does not compile yet. CLIO_CPU_IPC fixed the
+# AllocateBuffer resolution, but Client::AsyncPutBlob and
+# GetGpuIpcManager()->GetGpuInfo still resolve to device-visible
+# overloads in this TU while the identical calls compile in
+# test_gpu_vector_llama_geom_gpu.cc. Registration stays disabled so the
+# build is green; the difference between the two TUs is the next step.
 #    add_cuda_executable(test_gpu_vector_matrix FALSE
 #        test_gpu_vector_matrix_gpu.cc
 #        INCLUDE_DIRS
