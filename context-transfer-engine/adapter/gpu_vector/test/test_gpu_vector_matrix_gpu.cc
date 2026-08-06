@@ -328,14 +328,14 @@ TEST_CASE("gpu_vector: prefaulted window does not outlive its slots",
  *  24576 % 176 != 0, so every chunk after the first starts mid-record. */
 TEST_CASE("gpu_vector: staging chunks that do not divide the record size",
           "[gpu_vector][staging]") {
-  RunSpanCase("gvm_unaligned", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/8,
+  RunSpanCase("gvm_unaligned", /*nblocks=*/8, /*pages_per_block=*/2, /*grid=*/8,
               0, kTotalBytes, /*chunk=*/176 * 139 + 17);
 }
 
 /** Spans that start and end at odd offsets and straddle page boundaries. */
 TEST_CASE("gpu_vector: cross-page spans at unaligned offsets",
           "[gpu_vector][staging]") {
-  RunSpanCase("gvm_crosspage", /*nblocks=*/2, /*pages_per_block=*/2, /*grid=*/4,
+  RunSpanCase("gvm_crosspage", /*nblocks=*/4, /*pages_per_block=*/2, /*grid=*/4,
               kPageSizeBytes - 1000, 5 * kPageSizeBytes + 333, /*chunk=*/4096);
 }
 
