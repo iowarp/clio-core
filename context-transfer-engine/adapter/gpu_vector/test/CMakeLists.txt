@@ -35,17 +35,17 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
 
     # On-device faulting under oversubscription, UNCOMPRESSED: cache == 1/2 the
+
 # DISABLED: test_gpu_vector_matrix does not compile.
-# Ruled out so far, by direct comparison against test_gpu_vector_llama_geom
-# (which was FORCE-rebuilt to confirm it genuinely compiles today):
-#   - INCLUDE_DIRS / LINK_LIBS: now identical
-#   - include list: identical except <cstring>
-#   - call sites: made textually identical (explicit types, CLIO_CPU_IPC,
-#     clio::cte::core::Client*, clio::run::IpcManagerGpuInfo)
-# Still: Client::AsyncPutBlob and GetGpuIpcManager()->GetGpuInfo do not
-# resolve here. Next: preprocess both TUs (nvcc -E) and diff, rather than
-# comparing sources by eye -- the divergence is evidently in what the
-# preprocessor produces, not in what the files say.
+# PROVEN identical to test_gpu_vector_llama_geom (which does compile):
+#   - compile command: identical but for filenames
+#   - includes_CUDA.rsp: byte-identical
+#   - #include list: identical except <cstring>
+#   - call sites: textually identical
+# So the defect is in the SOURCE, not the build. Client::AsyncPutBlob and
+# GetGpuIpcManager()->GetGpuInfo do not resolve. NOTE: an earlier claim that
+# this source compiles under llama_geom's flags was WRONG -- the eval never
+# ran and an empty grep was read as success. Verify by exit code, not grep.
 #    add_cuda_executable(test_gpu_vector_matrix FALSE
 #        test_gpu_vector_matrix_gpu.cc
 #        INCLUDE_DIRS
@@ -143,6 +143,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_tests_properties(cte_gpu_vector_llama_geom_cuda PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10660"
     )
+
 
     # Model tensors mapped as gpu_vectors, across every ggml tensor format
     # (F32/F16/BF16 + Q4_0/Q8_0/Q4_K/Q5_K/Q6_K block-quantized). Uncompressed;
