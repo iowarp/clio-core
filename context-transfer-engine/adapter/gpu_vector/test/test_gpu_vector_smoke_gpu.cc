@@ -187,13 +187,15 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // page-aligned so blocks never contend for a page.
   //
   // Runs to 128 blocks, the spec's maximum. Each block gets as many cache
-  // slots as it has pages, so this axis measures BLOCK COUNT alone.
+  // slots as pages, so this axis measures BLOCK COUNT alone.
   //
-  // Eviction at high block counts is a separate, still-open bug: with fewer
-  // slots than pages, 128 blocks hangs while 64 passes, and 128 blocks WITH
-  // enough slots (here) passes cleanly. So it is the evicting fault path
-  // under concurrency, not the block count -- the oversubscribed scenarios
-  // above deliberately stay at block counts that pass.
+  // Oversubscription at HIGH block counts is still open. It no longer hangs
+  // (sizing the GPU lane fixed that) but now aborts with "RunFuture: null
+  // RunContext" from ~32 blocks up. SendOut flips the device completion flag
+  // BEFORE it finishes with the host task, so a kernel that immediately
+  // re-submits that page's slot races the tail of SendOut. Single-block
+  // oversubscription (the [evict] case above, 16 pages / 4 slots) is
+  // unaffected and covered.
   for (unsigned nb : {8u, 32u, 64u, 128u}) {
     const clio::run::u64 per = 2 * 1024;            // 2 pages per block
     const clio::run::u64 n = per * nb;
@@ -218,6 +220,7 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
                  (unsigned long long) b3, (unsigned long long) n);
     REQUIRE(b3 == 0);
   }
+
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
