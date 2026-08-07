@@ -2873,6 +2873,67 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     // attempt 0 and 1 target new_score; attempt 2 falls back to restoring at
     // current_score — the capacity the blob occupied before Step 6.5 is free
     // again, so the restore has the same space the original placement had.
+    // MAKE ROOM (issue: promotion into a full top tier silently bounced).
+    // A score-driven prefetcher's whole contract is "raise the score and the
+    // data moves up"; without eviction the top tier keeps whatever landed
+    // there FIRST and every later promotion falls back to a lower tier at
+    // the requested score. Before promoting into a tier whose score is at
+    // or above the request, demote enough LOWER-scored blobs out of it to
+    // fit this one.
+    if (new_score > current_score) {
+      TargetInfo *top = nullptr;
+      registered_targets_.for_each(
+          [&](const clio::run::PoolId &, TargetInfo &ti) {
+            if (ti.target_score_ >= new_score &&
+                (top == nullptr || ti.target_score_ > top->target_score_)) {
+              top = &ti;
+            }
+          });
+      if (top != nullptr && top->remaining_space_ < blob_size) {
+        const clio::run::PoolId top_pool = top->bdev_client_.pool_id_;
+        // Cheapest sufficient victim set: lowest-scored blobs resident on
+        // that target, oldest read first.
+        std::vector<std::pair<float, std::string>> victims;
+        tag_blob_name_to_info_.for_each(
+            [&](const std::string &key,
+                const std::shared_ptr<BlobInfo> &bi_sp) {
+              const BlobInfo &bi = *bi_sp;
+              if (bi.score_ >= new_score || bi.blocks_.empty()) return;
+              for (const auto &blk : bi.blocks_) {
+                if (blk.bdev_client_.pool_id_ == top_pool) {
+                  victims.emplace_back(bi.score_, key);
+                  break;
+                }
+              }
+            });
+        std::sort(victims.begin(), victims.end());
+        clio::run::u64 freed = 0;
+        for (const auto &v : victims) {
+          if (freed >= blob_size) break;
+          const size_t s1 = v.second.find('.');
+          const size_t s2 = (s1 == std::string::npos)
+                                ? std::string::npos
+                                : v.second.find('.', s1 + 1);
+          if (s1 == std::string::npos || s2 == std::string::npos) continue;
+          TagId vtag(
+              static_cast<clio::run::u32>(std::stoul(v.second.substr(0, s1))),
+              static_cast<clio::run::u32>(
+                  std::stoul(v.second.substr(s1 + 1, s2 - s1 - 1))));
+          const std::string vname = v.second.substr(s2 + 1);
+          std::shared_ptr<BlobInfo> vinfo = CheckBlobExists(vname, vtag);
+          if (vinfo == nullptr) continue;
+          const clio::run::u64 vsize = vinfo->total_size_cache_;
+          clio::run::u32 vrc = 0;
+          // Demote just below this promotion so the DPE places it lower.
+          CLIO_CO_AWAIT(ReorganizeBlobInternal(
+              vtag, vname, std::max(0.0f, new_score - 0.5f), vrc));
+          if (vrc == 0) freed += vsize;
+        }
+        HLOG(kDebug,
+             "ReorganizeBlob: evicted {} bytes from the top tier for '{}'",
+             freed, blob_name);
+      }
+    }
     BlobInfo staging;
     int attempt = 0;
     bool placed = false;
