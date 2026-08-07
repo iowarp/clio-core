@@ -64,6 +64,7 @@ struct Cfg {
   bool compressed = true;
   uint64_t layers = 12, experts = 32, slice_bytes = 4ull << 20;
   uint64_t hbm_mb = 2048;
+  uint64_t slab_mb = 512;    // decompressed span cache (--slab-mb)
   uint64_t tokens = 64, k_sel = 4;
   double fill_const_frac = 0.5;   // fraction of each 64B chunk that repeats
   uint64_t seed = 12345;
@@ -148,6 +149,8 @@ int main(int argc, char **argv) {
       c.layers = val("layers");
     } else if (a == "--experts") {
       c.experts = val("experts");
+    } else if (a == "--slab-mb") {
+      c.slab_mb = val("slab");
     } else if (a == "--page-mb") {
       kPage = val("page") << 20;
     } else if (a == "--no-prefetch") {
@@ -290,11 +293,17 @@ int main(int argc, char **argv) {
   size_t vfree1 = 0;
   cudaMemGetInfo(&vfree1, &vtot);
 
-  // ---- device staging ring + reduce scratch ----
+  // ---- device staging ring + DECOMPRESSED span cache + reduce scratch ----
+  // The slab holds slices in their FINAL form, so a hit skips the fetch AND
+  // (for a compressed tag) the decompress. Disabling it measured the pure
+  // fault path, which understated compression: every read of a hot slice
+  // re-decompressed it. Both modes get the same slab, so the comparison
+  // stays honest -- it just no longer forbids the caching a real caller
+  // (llama) does.
   if (!vec.ReserveSpanCaches(/*ring_bytes=*/256ull << 20,
                              /*vram_reserve=*/1ull << 30,
-                             /*slab_cap_max=*/1)) {   // no pinned slab:
-    std::fprintf(stderr, "ReserveSpanCaches failed\n");  // pure fault path
+                             /*slab_cap_max=*/c.slab_mb << 20)) {
+    std::fprintf(stderr, "ReserveSpanCaches failed\n");
     return 1;
   }
   unsigned long long *d_sum = nullptr;
@@ -497,6 +506,9 @@ int main(int argc, char **argv) {
     }
     const uint64_t tp1 = NowMs();
     if (!vec.WaitFetches(fl)) ++fails;
+    // Slab admissions fill on the vector's copy stream; make them visible
+    // before the consuming kernels run.
+    cudaStreamSynchronize((cudaStream_t) vec.CopyStream());
     t_task += NowMs() - tp1;
     const uint64_t tp2 = NowMs();
     for (auto &pr : batch) {
