@@ -1,0 +1,83 @@
+/* Copyright 2024 IOWarp - BSD 3-Clause License */
+/**
+ * One cached page of a gpu_vector, and the per-block page table.
+ *
+ * A page is the unit of everything: it is one CTE blob ("p<N>"), one
+ * PodGetBlobTask on fault, one PodPutBlobTask on flush, and one
+ * PodReorganizeBlobTask on rescore. Each page owns its three task slots
+ * outright rather than sharing a pool, so a fault, a flush and a rescore on
+ * the same page never contend for a slot and the code never has to reason
+ * about slot reuse.
+ *
+ * Pages are grouped per CUDA block. Block b owns pages[b * pages_per_block
+ * .. +pages_per_block), so two blocks never touch the same entry and the
+ * page table needs no locking at all.
+ */
+#ifndef CLIO_CTE_GPU_VECTOR_PAGE_H_
+#define CLIO_CTE_GPU_VECTOR_PAGE_H_
+
+#include <clio_runtime/gpu/future.h>
+#include <clio_runtime/types.h>
+#include <clio_cte/core/core_tasks.h>
+
+namespace clio::cte::gpu_vector {
+
+/** page_num of an empty slot. */
+constexpr clio::run::u64 kNoPage = ~static_cast<clio::run::u64>(0);
+
+/**
+ * A task is SELF-CONTAINED: its completion state lives in the task itself
+ * (the separate FutureShm was removed when Future was simplified), so a
+ * page's task slots are just the tasks. Each page owns its own three, which
+ * is why a fault, a flush and a rescore on one page never contend.
+ */
+using PutSlot = clio::cte::core::PodPutBlobTask;
+using GetSlot = clio::cte::core::PodGetBlobTask;
+using RescoreSlot = clio::cte::core::PodReorganizeBlobTask;
+
+/** One resident page. */
+struct Page {
+  /** Which page of the vector this slot holds; kNoPage when free. */
+  clio::run::u64 page_num;
+  /** This page's bytes, in the device page backend. */
+  void *data;
+  /** Set by RescorePage; EvictPages takes the lowest. */
+  float score;
+  /** clock64() at last access; breaks score ties (LRU). */
+  clio::run::u64 last_access;
+  /** 1 when the page has been written since it was faulted or flushed. */
+  clio::run::u32 dirty;
+  /** 1 while a put issued by BeginFlush is still outstanding. */
+  clio::run::u32 flushing;
+
+  /** This page's own task slots, in the registered device backend. */
+  PutSlot *put;
+  GetSlot *get;
+  RescoreSlot *rescore;
+
+  /** Outstanding put, waited on by WaitFlush. */
+  clio::run::gpu::Future<clio::cte::core::PodPutBlobTask> put_fut;
+};
+
+/** Compose a page's blob name: "p<page_num>". Device-callable, no CRT. */
+CTP_INLINE_CROSS_FUN void PageBlobName(clio::run::u64 page_num, char *out) {
+  char digits[24];
+  int n = 0;
+  if (page_num == 0) {
+    digits[n++] = '0';
+  }
+  while (page_num > 0) {
+    digits[n++] = static_cast<char>('0' + (page_num % 10));
+    page_num /= 10;
+  }
+  int w = 0;
+  out[w++] = 'p';
+  while (n > 0) {
+    out[w++] = digits[--n];
+  }
+  out[w] = '\0';
+}
+
+}  // namespace clio::cte::gpu_vector
+
+#endif  // CLIO_CTE_GPU_VECTOR_PAGE_H_
