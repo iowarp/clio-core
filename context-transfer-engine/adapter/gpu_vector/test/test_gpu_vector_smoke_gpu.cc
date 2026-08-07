@@ -32,7 +32,7 @@ namespace gv = clio::cte::gpu_vector;
 
 namespace {
 constexpr clio::run::u64 kPageBytes = 4096;
-constexpr clio::run::u64 kElems = 1024;          // ONE page (see note)
+constexpr clio::run::u64 kElems = 4096;          // 4 pages
 }  // namespace
 
 /** Fill every element with a known function of its index. */

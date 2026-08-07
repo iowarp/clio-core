@@ -68,10 +68,26 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     return true;
   }
 
-  // Per-thread scratch for the host-resident task copy. Sized to fit any
-  // reasonable POD task (PutBlobTask is ~480 bytes today).
+  // Per-thread scratch RING for host-resident task copies.
+  //
+  // One buffer per thread is not enough: the copy is wrapped NON-OWNING and
+  // handed to a COROUTINE, which parks at its first await (a PutBlob waiting
+  // on bdev I/O, say). The worker then services the next GPU task and, with a
+  // single buffer, overwrites the task the parked coroutine is still using.
+  // Concurrent device-submitted tasks therefore corrupted each other, while
+  // one-at-a-time traffic worked -- a gpu_vector kernel that flushed two
+  // pages at once hung, and the same two pages flushed sequentially passed.
+  //
+  // A ring of slots gives each in-flight task its own copy. The depth bounds
+  // how many GPU tasks one worker may have parked at once; 256 is far above
+  // any real in-flight count and costs 1 MiB of per-worker scratch.
   static constexpr size_t kTaskScratchBytes = 4096;
-  alignas(64) thread_local char task_scratch[kTaskScratchBytes];
+  static constexpr size_t kTaskScratchSlots = 256;
+  alignas(64) thread_local char task_scratch_ring[kTaskScratchSlots]
+                                                [kTaskScratchBytes];
+  thread_local size_t task_scratch_next = 0;
+  char *task_scratch = task_scratch_ring[task_scratch_next];
+  task_scratch_next = (task_scratch_next + 1) % kTaskScratchSlots;
   if (task_pod_size > kTaskScratchBytes) {
     HLOG(kError,
          "IpcGpu2Cpu::RecvIn: worker {} task_pod_size {} exceeds scratch "
