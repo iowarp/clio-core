@@ -56,6 +56,11 @@ inline uint8_t *GatherScratch(size_t bytes) {
   static thread_local uint8_t *buf = nullptr;
   static thread_local size_t cap = 0;
   if (bytes > cap) {
+    if (std::getenv("CLIO_TRACE_ALLOC") != nullptr) {
+      fprintf(stderr, "[cuda-alloc] GatherScratch grow %zu -> %zu\n", cap,
+              bytes);
+      fflush(stderr);
+    }
     if (buf) cudaFree(buf);
     if (cudaMalloc(&buf, bytes) != cudaSuccess) {
       buf = nullptr;

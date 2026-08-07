@@ -47,6 +47,9 @@ class MemBdevTransport : public BdevTransport {
   // stream. Lets one binary A/B the worker-block-vs-yield change over an
   // identical device workload. Off in all normal operation.
   bool force_sync_gpu_{false};
+  /** Set once Init() has prefaulted the tier; a later page allocation is a
+   *  deadlock risk against a resident GPU consumer kernel. */
+  bool prefault_done_{false};
 
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
 

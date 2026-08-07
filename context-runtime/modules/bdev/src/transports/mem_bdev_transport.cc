@@ -105,8 +105,18 @@ bool MemBdevTransport::Init(const CreateParams& params,
     const size_t npages =
         (size_t) ((ram_capacity_ + kRamPageSize - 1) / kRamPageSize);
     for (size_t i = 0; i < npages; ++i) {
-      GetRamPage(i);   // allocates; falls back to host RAM on VRAM exhaustion
+      // EnsureRamPage, not GetRamPage: the latter is a non-allocating lookup
+      // and would leave every page to be allocated on the fault path.
+      EnsureRamPage(i);   // falls back to host RAM on VRAM exhaustion
     }
+  }
+  prefault_done_ = true;
+  if (std::getenv("CLIO_TRACE_ALLOC") != nullptr) {
+    fprintf(stderr,
+            "[cuda-alloc] Init type=%d cap=%llu pagesz=%llu prefaulted=%d\n",
+            (int) bdev_type_, (unsigned long long) ram_capacity_,
+            (unsigned long long) kRamPageSize, (int) ram_pages_.size());
+    fflush(stderr);
   }
 #endif
 
@@ -347,6 +357,14 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
   }
   RamPage &page = ram_pages_[page_idx];
   if (page.data == nullptr) {
+    // Any allocation reaching here after Init() is a deadlock risk against a
+    // resident GPU consumer kernel (see the prefault in Init). Make it loud
+    // under CLIO_TRACE_ALLOC rather than silently hanging.
+    if (prefault_done_ && std::getenv("CLIO_TRACE_ALLOC") != nullptr) {
+      fprintf(stderr, "[cuda-alloc] LATE GetRamPage page=%zu type=%d\n",
+              page_idx, (int) bdev_type_);
+      fflush(stderr);
+    }
 #if CTP_ENABLE_GPU
     if (bdev_type_ == BdevType::kPinned) {
       // Page-locked host memory keeps cudaMemcpyAsync/hipMemcpyAsync truly
