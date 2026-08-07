@@ -160,6 +160,7 @@ class DeviceVector {
     t->replica_ = 0;
     // Fire and forget: a hint that arrives late is still useful, and
     // waiting here would serialise the kernel behind placement.
+    ClearRunCtx(t);
     (void) ipc_->Send(SlotPtr(slot->rescore));
   }
 
@@ -224,6 +225,27 @@ class DeviceVector {
     return p;
   }
 
+  /**
+   * Clear a task's RunContext handle before RE-submitting the slot.
+   *
+   * A task slot is reused every time its page is re-faulted or re-flushed.
+   * The first execution leaves run_ctx_ pointing at a RunContext that is
+   * already marked STARTED, and SendOut copies that pointer back into the
+   * device task. Resubmitting as-is makes the worker take the RESUME path,
+   * find no coroutine handle, and drop the task -- the kernel then waits
+   * forever on a completion that cannot come. Handing the task over with no
+   * RunContext makes RecvIn's BeginRunContext allocate a fresh one, which is
+   * what a first submission gets.
+   *
+   * It is three pointers of POD on both sides (see Task::run_ctx_), so
+   * clearing the bytes is the device-side equivalent of ResetRunCtx().
+   */
+  template <typename TaskT>
+  CTP_GPU_FUN void ClearRunCtx(TaskT *t) const {
+    char *raw = reinterpret_cast<char *>(&t->run_ctx_);
+    for (unsigned i = 0; i < sizeof(t->run_ctx_); ++i) raw[i] = 0;
+  }
+
   /** Issue this page's PodPutBlobTask for the whole page. */
   CTP_GPU_FUN void SubmitPut(Page *p) {
     if (p->flushing) return;             // one outstanding put per page
@@ -243,6 +265,7 @@ class DeviceVector {
     t->blob_data_ = RawPtr(p->data);
     t->score_ = p->score;
     t->flags_ = 0;
+    ClearRunCtx(t);
     p->put_fut = ipc_->Send(SlotPtr(p->put));
     // Clean as of THIS put: the bytes it carries are what the page held
     // when it was submitted. A later write dirties it again for the next.
@@ -273,6 +296,7 @@ class DeviceVector {
     t->size_ = page_bytes_;
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
+    ClearRunCtx(t);
     auto fut = ipc_->Send(SlotPtr(p->get));
     fut.Wait();                           // page faults are synchronous
   }

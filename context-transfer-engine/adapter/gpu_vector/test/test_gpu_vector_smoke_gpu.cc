@@ -75,6 +75,11 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
 
   // 4 pages of capacity for a 4-page vector: everything fits, so no
   // eviction should be needed.
+  gv::Vector<clio::run::u32> probe("gv_probe", {0}, kPageBytes,
+                                   /*nblocks=*/1, /*pages_per_block=*/2,
+                                   kElems);
+  std::fprintf(stderr, "[probe] second vector constructed OK\n");
+
   gv::Vector<clio::run::u32> vec("gv_smoke", {0}, kPageBytes,
                                  /*nblocks=*/1, /*pages_per_block=*/4, kElems);
 
@@ -95,6 +100,38 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   std::fprintf(stderr, "[smoke] mismatches=%llu / %llu\n",
                (unsigned long long) bad, (unsigned long long) kElems);
   REQUIRE(bad == 0);
+
+  // ---- oversubscribed: 16 pages through 4 slots ------------------------
+  //
+  // Every page past the fourth forces EvictPages, and every victim is
+  // DIRTY, so its bytes must be written back before the slot is reused.
+  // Reading the whole thing back therefore exercises eviction write-back
+  // and slot reuse, not just the cache.
+  //
+  // Same runtime deliberately: CLIO_INIT is once per PROCESS, and a second
+  // TEST_CASE that re-inits simply hangs.
+  {
+    const clio::run::u64 n = 16 * 1024;
+    gv::Vector<clio::run::u32> big("gv_evict", {0}, kPageBytes,
+                                   /*nblocks=*/1, /*pages_per_block=*/4, n);
+
+    FillKernel<<<1, 32>>>(gpu_info, big.GetDevice(0), n);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    unsigned long long *d2 = nullptr;
+    REQUIRE(cudaMalloc(&d2, sizeof(unsigned long long)) == cudaSuccess);
+    REQUIRE(cudaMemset(d2, 0, sizeof(unsigned long long)) == cudaSuccess);
+    CheckKernel<<<1, 32>>>(gpu_info, big.GetDevice(0), n, d2);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    unsigned long long b2 = 1;
+    REQUIRE(cudaMemcpy(&b2, d2, sizeof(b2), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    cudaFree(d2);
+    std::fprintf(stderr, "[evict] mismatches=%llu / %llu\n",
+                 (unsigned long long) b2, (unsigned long long) n);
+    REQUIRE(b2 == 0);
+  }
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
