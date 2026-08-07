@@ -149,6 +149,10 @@ struct DeviceViewBase {
    */
   const clio::run::u64 *dev_page_addr;
   clio::run::u64 dev_page_count;   /**< entries in dev_page_addr. */
+  /** STORED bytes of page gp at dev_page_addr[gp]. Equal to
+   *  page_size_bytes for a page stored raw; smaller for one stored as a
+   *  compressed frame, which the block decodes in-kernel. */
+  const clio::run::u64 *dev_page_bytes;
 };
 
 /** Default family policy: derived from the view's fam_ppb (see above). */

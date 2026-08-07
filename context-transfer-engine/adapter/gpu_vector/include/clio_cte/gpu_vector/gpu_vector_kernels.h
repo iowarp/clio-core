@@ -527,6 +527,136 @@ CTP_GPU_FUN clio::run::u32 EvictSlot(::clio::run::gpu::IpcManager *ipc,
   return EvictSlotInRange(ipc, v, block_idx, 0, v.base.gpu_pages_per_block);
 }
 
+/** Wire constants of the stored form, mirrored for the device decoder.
+ *  Host definitions: CompressionHeader in compressor_runtime.cc and
+ *  ctp::raw_lz4::Table in clio_ctp/compress/nvcomp.h. */
+constexpr clio::run::u32 kCteHdrMagic = 0x43544543u;   // 'CTEC'
+constexpr clio::run::u32 kRawLz4Magic = 0x43344252u;   // 'RB4C'
+constexpr clio::run::u32 kCteHdrBytes = 32u;           // sizeof(CompressionHeader)
+constexpr clio::run::u32 kRawLz4Chunk = 64u * 1024u;
+constexpr clio::run::u32 kRawLz4MaxChunks = 64u;
+
+/**
+ * Decompress ONE LZ4 block, serially, by a single thread.
+ *
+ * Standard LZ4 block format, which is what nvcomp's batched LZ4 emits: a
+ * token byte (literal length in the high nibble, match length in the low
+ * nibble, each escaping through 255-chains), the literals, a 2-byte
+ * little-endian back-offset, then the match. The final sequence stops after
+ * its literals with no match, which is why the offset read is guarded.
+ *
+ * Match copy is byte-at-a-time on purpose: LZ4 matches routinely overlap
+ * the output cursor (offset < length) to encode runs, so a wider copy would
+ * read bytes it has not written yet. Returns bytes produced, or 0 on any
+ * malformed input -- callers treat 0 as "fall back to the task path"
+ * rather than trusting a partial page.
+ */
+CTP_GPU_FUN clio::run::u32 Lz4DecodeBlock(const unsigned char *src,
+                                          clio::run::u32 src_len,
+                                          unsigned char *dst,
+                                          clio::run::u32 dst_cap) {
+  clio::run::u32 ip = 0, op = 0;
+  while (ip < src_len) {
+    const clio::run::u32 token = src[ip++];
+    clio::run::u32 ll = token >> 4;
+    if (ll == 15) {
+      clio::run::u32 b;
+      do {
+        if (ip >= src_len) return 0;
+        b = src[ip++];
+        ll += b;
+      } while (b == 255);
+    }
+    if (ip + ll > src_len || op + ll > dst_cap) return 0;
+    for (clio::run::u32 i = 0; i < ll; ++i) dst[op + i] = src[ip + i];
+    ip += ll;
+    op += ll;
+    if (ip >= src_len) break;            // last sequence: literals only
+    if (ip + 2 > src_len) return 0;
+    const clio::run::u32 offset =
+        (clio::run::u32) src[ip] | ((clio::run::u32) src[ip + 1] << 8);
+    ip += 2;
+    if (offset == 0 || offset > op) return 0;
+    clio::run::u32 ml = token & 15u;
+    if (ml == 15) {
+      clio::run::u32 b;
+      do {
+        if (ip >= src_len) return 0;
+        b = src[ip++];
+        ml += b;
+      } while (b == 255);
+    }
+    ml += 4;                              // minmatch
+    if (op + ml > dst_cap) return 0;
+    clio::run::u32 mp = op - offset;
+    for (clio::run::u32 i = 0; i < ml; ++i) dst[op + i] = dst[mp + i];
+    op += ml;
+  }
+  return op;
+}
+
+/**
+ * Block-collective decompress of a stored frame that is already in VRAM.
+ *
+ * One thread per 64 KiB chunk; chunks are independent, so this is pure
+ * parallelism with no cooperation. Returns true if every chunk decoded and
+ * the total matches `out_bytes`. Must be called uniformly by the block.
+ */
+CTP_GPU_FUN bool BlockDecompressFrame(const unsigned char *frame,
+                                      clio::run::u64 frame_bytes,
+                                      unsigned char *dst,
+                                      clio::run::u64 out_bytes,
+                                      clio::run::u32 *ok_count) {
+  if (frame_bytes < kCteHdrBytes + 8) return false;
+  // CompressionHeader: magic first, then lib/preset, original, compressed.
+  const clio::run::u32 hdr_magic = *(const clio::run::u32 *) frame;
+  if (hdr_magic != kCteHdrMagic) return false;
+  const clio::run::u64 orig =
+      *(const clio::run::u64 *) (frame + 16);   // original_size_
+  if (orig != out_bytes) return false;
+
+  const unsigned char *tbl = frame + kCteHdrBytes;
+  if (*(const clio::run::u32 *) tbl != kRawLz4Magic) {
+    // No chunk table: the host lz4 codec stores ONE raw LZ4 block covering
+    // the whole page, immediately after the header. LZ4 block decoding is
+    // inherently serial (each match refers back into the bytes just
+    // produced), so this cannot be split across threads -- one thread
+    // decodes and the rest wait. Slower than the chunked form, but it keeps
+    // the fault on the device, which is the property that matters.
+    if (threadIdx.x == 0) {
+      const clio::run::u32 got =
+          Lz4DecodeBlock(tbl, (clio::run::u32) (frame_bytes - kCteHdrBytes),
+                         dst, (clio::run::u32) out_bytes);
+      if (got == (clio::run::u32) out_bytes) *ok_count = 1u;
+    }
+    __syncthreads();
+    return *ok_count == 1u;
+  }
+  const clio::run::u32 nchunks = *(const clio::run::u32 *) (tbl + 4);
+  if (nchunks == 0 || nchunks > kRawLz4MaxChunks) return false;
+  const clio::run::u32 *comp_bytes = (const clio::run::u32 *) (tbl + 8);
+  const clio::run::u32 tbl_bytes = 8u + kRawLz4MaxChunks * 4u;
+  const unsigned char *payload = tbl + tbl_bytes;
+
+  for (clio::run::u32 c = threadIdx.x; c < nchunks; c += blockDim.x) {
+    // Offset of chunk c is the sum of the preceding compressed sizes. The
+    // table is tiny (<=64 entries) so recomputing per thread is cheaper
+    // than a prefix scan through shared memory.
+    clio::run::u64 off = 0;
+    for (clio::run::u32 i = 0; i < c; ++i) off += comp_bytes[i];
+    const clio::run::u64 dst_off = (clio::run::u64) c * kRawLz4Chunk;
+    clio::run::u32 want = kRawLz4Chunk;
+    if (dst_off + want > out_bytes) {
+      want = (clio::run::u32) (out_bytes - dst_off);
+    }
+    const clio::run::u32 got =
+        Lz4DecodeBlock(payload + off, comp_bytes[c], dst + dst_off, want);
+    if (got == want) atomicAdd(ok_count, 1u);
+  }
+  __syncthreads();
+  return *ok_count == nchunks;
+}
+
 /** Device address of page `gp` inside the kHbm tier, or 0 if not resident
  *  there / no directory was published. */
 CTP_INLINE_GPU_FUN clio::run::u64 DevPageAddr(const DeviceViewBase &v,
@@ -534,6 +664,15 @@ CTP_INLINE_GPU_FUN clio::run::u64 DevPageAddr(const DeviceViewBase &v,
   if (v.dev_page_addr == nullptr || gp < 0) return 0;
   if ((clio::run::u64) gp >= v.dev_page_count) return 0;
   return v.dev_page_addr[gp];
+}
+
+/** STORED bytes of page `gp` (page_size when stored raw, less when the page
+ *  is a compressed frame). 0 when unknown. */
+CTP_INLINE_GPU_FUN clio::run::u64 DevPageBytes(const DeviceViewBase &v,
+                                               int32_t gp) {
+  if (v.dev_page_bytes == nullptr || gp < 0) return 0;
+  if ((clio::run::u64) gp >= v.dev_page_count) return 0;
+  return v.dev_page_bytes[gp];
 }
 
 /** Block-collective copy of `bytes` from device memory to device memory.
@@ -640,26 +779,51 @@ CTP_GPU_FUN Page *BlockFaultPage(::clio::run::gpu::IpcManager *ipc,
   // the decision is uniform across the block with nothing broadcast.
   const clio::run::u64 src_addr = DevPageAddr(v.base, target_page);
   if (src_addr != 0) {
+    const clio::run::u64 stored = DevPageBytes(v.base, target_page);
     Page *dst = BlockClaimSlot(ipc, v, block_idx, target_page);
     if (dst != nullptr) {
-      // Only the claimer copies; a slot that was already resident comes back
-      // with kPageBusy clear and needs no copy at all.
+      // Only the claimer fills; a slot that was already resident comes back
+      // with kPageBusy clear and needs no work at all.
       if (dst->flags & kPageBusy) {
-        BlockCopyPage(dst->device_ptr, (const void *) src_addr,
-                      v.base.page_size_bytes);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          if (v.base.stats) {
-            atomicAdd_system(&v.base.stats->resolve_fault_get, 1ULL);
-            atomicAdd_system(&v.base.stats->fault_get_ok, 1ULL);
-          }
-          detail::ReleaseBusy(dst);
+        bool ok = true;
+        if (stored == v.base.page_size_bytes) {
+          BlockCopyPage(dst->device_ptr, (const void *) src_addr,
+                        v.base.page_size_bytes);
+          __syncthreads();
+        } else {
+          // Stored compressed: decode the frame in-kernel, one thread per
+          // 64 KiB chunk. Still no task and no host round trip.
+          __shared__ clio::run::u32 ok_chunks;
+          if (threadIdx.x == 0) ok_chunks = 0;
+          __syncthreads();
+          ok = BlockDecompressFrame((const unsigned char *) src_addr, stored,
+                                    (unsigned char *) dst->device_ptr,
+                                    v.base.page_size_bytes, &ok_chunks);
+          __syncthreads();
         }
-        __syncthreads();
+        if (!ok) {
+          // Malformed or unexpected frame: surrender the slot and let the
+          // task path fetch it. Never publish a half-decoded page.
+          if (threadIdx.x == 0) {
+            dst->page_idx = -1;
+            detail::ReleaseBusy(dst);
+          }
+          __syncthreads();
+          dst = nullptr;
+        } else {
+          if (threadIdx.x == 0) {
+            if (v.base.stats) {
+              atomicAdd_system(&v.base.stats->resolve_fault_get, 1ULL);
+              atomicAdd_system(&v.base.stats->fault_get_ok, 1ULL);
+            }
+            detail::ReleaseBusy(dst);
+          }
+          __syncthreads();
+        }
       }
-      return dst;
+      if (dst != nullptr) return dst;
     }
-    // Could not claim a slot; fall through to the task path.
+    // Could not claim a slot, or the frame did not decode: use the task path.
   }
 
   // One thread mutates the page table for the entire block.

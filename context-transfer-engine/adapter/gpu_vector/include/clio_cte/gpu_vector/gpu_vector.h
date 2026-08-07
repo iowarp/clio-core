@@ -1567,6 +1567,7 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   // Not built until BuildDevicePageTable() runs; 0/nullptr means "every
   // fault goes through the task path", i.e. exactly the old behaviour.
   view_.base.dev_page_addr = nullptr;
+  view_.base.dev_page_bytes = nullptr;
   view_.base.dev_page_count = 0;
   view_.page_capacity_t = page_size_bytes / sizeof(T);
   impl_->nblocks_cached = nblocks;
@@ -2105,6 +2106,7 @@ inline clio::run::u64 Vector<T>::BuildDevicePageTable(
     clio::run::u64 num_pages) {
 #if !CTP_IS_DEVICE_PASS
   view_.base.dev_page_addr = nullptr;
+  view_.base.dev_page_bytes = nullptr;
   view_.base.dev_page_count = 0;
   if (!impl_ || num_pages == 0) return 0;
   const clio::run::u64 page = view_.base.page_size_bytes;
@@ -2112,6 +2114,7 @@ inline clio::run::u64 Vector<T>::BuildDevicePageTable(
   clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
   cte.AttachShmCache();
   std::vector<clio::run::u64> tbl(num_pages, 0ull);
+  std::vector<clio::run::u64> sz(num_pages, 0ull);
   clio::run::u64 n_res = 0;
   for (clio::run::u64 gp = 0; gp < num_pages; ++gp) {
     clio::cte::core::ShmBlobRecord rec;
@@ -2128,31 +2131,56 @@ inline clio::run::u64 Vector<T>::BuildDevicePageTable(
         (clio::run::u32) clio::run::bdev::BdevType::kHbm) {
       continue;
     }
-    if (blk.size_ < page || rec.total_size_ < page) continue;
+    // total_size_ is the STORED size: == page when the page was written
+    // raw, smaller when the compressor stored a frame. Both are servable
+    // in-kernel -- the block decodes the frame itself -- so the only thing
+    // that disqualifies a page here is not being wholly resident.
+    const clio::run::u64 stored = rec.total_size_;
+    if (stored == 0 || stored > page) continue;
+    if (blk.size_ < stored) continue;
     auto *t = clio::run::bdev::MemBdevTransport::LookupHbm(blk.target_pool_);
     if (t == nullptr) continue;
-    char *src = t->ResolveHbmSpan(blk.target_offset_, page);
+    char *src = t->ResolveHbmSpan(blk.target_offset_, stored);
     if (src == nullptr) continue;
     tbl[gp] = (clio::run::u64) src;
+    sz[gp] = stored;
+    if (n_res == 0 && stored != page &&
+        std::getenv("CLIO_TRACE_ALLOC") != nullptr) {
+      // First compressed page: report the stored form so a decoder
+      // mismatch is visible instead of silently falling back.
+      unsigned char probe[48] = {0};
+      cudaMemcpy(probe, src, sizeof(probe), cudaMemcpyDeviceToHost);
+      std::fprintf(stderr,
+                   "[dev-page] gp=%llu stored=%llu hdr_magic=%08x lib=%u "
+                   "orig=%llu tbl_magic=%08x\n",
+                   (unsigned long long) gp, (unsigned long long) stored,
+                   *(const unsigned *) probe, *(const unsigned *) (probe + 4),
+                   (unsigned long long) *(const clio::run::u64 *) (probe + 16),
+                   *(const unsigned *) (probe + 32));
+    }
     ++n_res;
   }
   if (n_res == 0) return 0;
 
+  // One allocation holding both arrays back to back: [addr][stored].
+  const size_t n_bytes = num_pages * sizeof(clio::run::u64);
   if (impl_->dev_page_tbl == nullptr) {
     void *d = nullptr;
-    if (cudaMalloc(&d, num_pages * sizeof(clio::run::u64)) != cudaSuccess) {
+    if (cudaMalloc(&d, 2 * n_bytes) != cudaSuccess) {
       cudaGetLastError();
       return 0;
     }
     impl_->dev_page_tbl = static_cast<clio::run::u64 *>(d);
   }
-  if (cudaMemcpy(impl_->dev_page_tbl, tbl.data(),
-                 num_pages * sizeof(clio::run::u64),
+  if (cudaMemcpy(impl_->dev_page_tbl, tbl.data(), n_bytes,
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(impl_->dev_page_tbl + num_pages, sz.data(), n_bytes,
                  cudaMemcpyHostToDevice) != cudaSuccess) {
     cudaGetLastError();
     return 0;
   }
   view_.base.dev_page_addr = impl_->dev_page_tbl;
+  view_.base.dev_page_bytes = impl_->dev_page_tbl + num_pages;
   view_.base.dev_page_count = num_pages;
   return n_res;
 #else
