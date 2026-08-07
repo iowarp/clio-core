@@ -195,6 +195,10 @@ __global__ void ConsumeKernel(const uint8_t *src, uint64_t bytes,
 #if !CTP_IS_DEVICE_PASS
 int main(int argc, char **argv) {
   Cfg c;
+  // An explicit --hbm-mb must survive the case presets below, or a tier
+  // sweep silently measures the preset instead.
+  bool hbm_explicit = false;
+  bool layers_explicit = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto val = [&](const char *) { return std::stoull(argv[++i]); };
@@ -204,10 +208,12 @@ int main(int argc, char **argv) {
       c.compressed = false;
     } else if (a == "--hbm-mb") {
       c.hbm_mb = val("hbm");
+      hbm_explicit = true;
     } else if (a == "--tokens") {
       c.tokens = val("tokens");
     } else if (a == "--layers") {
       c.layers = val("layers");
+      layers_explicit = true;
     } else if (a == "--experts") {
       c.experts = val("experts");
     } else if (a == "--in-kernel") {
@@ -222,14 +228,14 @@ int main(int argc, char **argv) {
   }
   // Case presets: dataset vs. tier-cap regimes (see header comment).
   if (c.mode_case == 'a') {
-    c.layers = 12;
-    c.hbm_mb = 2048;                      // 1.5 GiB fits raw AND compressed
+    if (!layers_explicit) c.layers = 12;
+    if (!hbm_explicit) c.hbm_mb = 2048;                      // 1.5 GiB fits raw AND compressed
   } else if (c.mode_case == 'b') {
-    c.layers = 12;
-    c.hbm_mb = 900;                       // raw spills, compressed fits
+    if (!layers_explicit) c.layers = 12;
+    if (!hbm_explicit) c.hbm_mb = 900;                       // raw spills, compressed fits
   } else if (c.mode_case == 'c') {
-    c.layers = 24;
-    c.hbm_mb = 700;                       // even compressed spills
+    if (!layers_explicit) c.layers = 24;
+    if (!hbm_explicit) c.hbm_mb = 700;                       // even compressed spills
   }
   // MODE 2 page sizing: read_range keeps its resolved page in ONE
   // __shared__ slot per block, so warps that are on DIFFERENT pages stomp
@@ -516,10 +522,19 @@ int main(int argc, char **argv) {
     // Wide blocks are safe because the page is sized to the slice: every
     // warp in the block is inside the same page for the whole read_range,
     // so they all resolve the identical Page* into the shared slot.
-    ConsumeKernelVec<<<nblocks_grid, 256>>>(gpu_info, vec.Device(), d_access,
-                                            access.size(), c.slice_bytes,
-                                            d_sum);
-    const cudaError_t kerr = cudaDeviceSynchronize();
+    // Launch on a NON-BLOCKING stream, never the legacy default stream.
+    // Servicing a fault from the DEVICE tier does GPU work on streams the
+    // runtime created with default flags, which implicitly synchronize
+    // with the legacy stream -- so a kernel spin-waiting THERE can never
+    // be satisfied by the very copy it waits for. Measured exactly: with
+    // an hbm tier of 64MB (faults come from host) the run completes; at
+    // 700MB (faults come from device) it hangs, same data.
+    cudaStream_t kstream = nullptr;
+    cudaStreamCreateWithFlags(&kstream, cudaStreamNonBlocking);
+    ConsumeKernelVec<<<nblocks_grid, 256, 0, kstream>>>(
+        gpu_info, vec.Device(), d_access, access.size(), c.slice_bytes,
+        d_sum);
+    const cudaError_t kerr = cudaStreamSynchronize(kstream);
     const uint64_t k_ms = NowMs() - t_k0;
     if (kerr != cudaSuccess) {
       std::fprintf(stderr, "CFB: in-kernel run failed: %s\n",
