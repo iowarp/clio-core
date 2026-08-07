@@ -234,6 +234,35 @@ struct CompressionHeader {
 
   bool IsValid() const { return magic_ == kMagic; }
 };
+/**
+ * Minimum SAVINGS a page must show before it is stored compressed.
+ *
+ * Storing a page that barely compresses is a pure loss: every later read
+ * pays a decompress, the device tier holds a frame the same size the raw
+ * bytes would have been, and the metadata carries a transform for nothing.
+ * Already-quantized model weights are the case that forced this -- measured
+ * lz4 ratios of 0.952 (gemma Q4_K) and 0.973 (qwen Q4_K), i.e. ~4% saved
+ * for 100% of the decompress cost.
+ *
+ * Default 20%: keep the compressed form only when it is at most 80% of the
+ * original. CLIO_CTE_MIN_COMPRESS_SAVINGS (percent) overrides.
+ */
+inline double MinCompressSavings() {
+  static const double v = [] {
+    if (const char *e = std::getenv("CLIO_CTE_MIN_COMPRESS_SAVINGS")) {
+      const double pct = std::strtod(e, nullptr);
+      if (pct >= 0.0 && pct <= 100.0) return pct / 100.0;
+    }
+    return 0.20;
+  }();
+  return v;
+}
+/** True when `stored` bytes are worth keeping in place of `original`. */
+inline bool CompressionWorthIt(size_t stored, size_t original) {
+  if (original == 0) return false;
+  return (double) stored <= (double) original * (1.0 - MinCompressSavings());
+}
+
 static_assert(sizeof(CompressionHeader) == 32,
               "CompressionHeader must be 32 bytes (added compressed_size_)");
 
@@ -941,7 +970,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     size_t header_size = sizeof(CompressionHeader);
     size_t total_stored_size = compressed_size + header_size;
 
-    if (success && total_stored_size < input_size) {
+    if (success && CompressionWorthIt(total_stored_size, input_size)) {
       // Compression succeeded and reduced size (including header overhead)
       compressed_buffer.resize(compressed_size);
 
@@ -1250,7 +1279,7 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
 
     HLOG(kInfo, "[CompressPutBlob] name={} off={} in={} csize={} ok={}",
          name, task->offset_, input_size, csize, ok);
-    if (ok && total < input_size) {
+    if (ok && CompressionWorthIt(total, input_size)) {
       context.actual_original_size_ = input_size;
       context.actual_compressed_size_ = total;
       context.actual_compression_ratio_ = (double)input_size / (double)total;
@@ -1930,8 +1959,10 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   }
   size_t header_size = sizeof(CompressionHeader);
   size_t total = compressed_size + header_size;
-  if (total >= size) {
-    return false;  // not beneficial — caller stores raw
+  if (!CompressionWorthIt(total, size)) {
+    // Not worth it: below the savings floor the caller stores RAW, so no
+    // read ever pays a decompress for a few percent of space.
+    return false;
   }
   auto shm = CLIO_IPC->AllocateBuffer(total);
   if (shm.IsNull()) {
