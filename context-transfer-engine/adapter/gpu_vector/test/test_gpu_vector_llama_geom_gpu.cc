@@ -163,9 +163,11 @@ __global__ void SamePageReadKernel(clio::run::IpcManagerGpuInfo info,
   (void)g_ipc_manager;
 }
 
-/** The llama perf-kernel structure: 256 threads, warp 0 drives read_range
- *  into __shared__ staging, all 8 warps consume. Reproduces (or clears) the
- *  hang seen only at blockDim>32 in the llama process. */
+/** The llama perf-kernel structure at blockDim=256. read_range is now
+ *  BLOCK-collective (a fault is serviced by the whole block), so every
+ *  thread calls it; the old warp-0-only form is a barrier divergence and
+ *  traps. Staging into shared memory is unchanged.
+ */
 __global__ void Warp0Read256Kernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceView<uint8_t> view,
                                    unsigned long long *mismatches,
@@ -190,7 +192,7 @@ __global__ void Warp0Read256Kernel(clio::run::IpcManagerGpuInfo info,
   for (clio::run::u64 lo = lo0; lo < hi0; lo += kStageBytes) {
     clio::run::u64 hi = lo + kStageBytes;
     if (hi > hi0) hi = hi0;
-    if (warp == 0) {
+    {
       v.read_range(lo, hi, [stage, lo] (clio::run::u64 i, uint8_t val) {
         stage[i - lo] = val;
       });

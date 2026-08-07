@@ -4,6 +4,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <atomic>
 #include <limits>
 #include <shared_mutex>
 #include <unordered_map>
@@ -691,6 +692,15 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
     CLIO_CO_RETURN;
   }
 
+  {
+    static std::atomic<unsigned long long> n_in{0}, n_out{0};
+    const unsigned long long k = ++n_in;
+    if (k <= 4 || (k & 1023) == 0) {
+      std::fprintf(stderr, "[bdev-dev-read] enter n=%llu len=%llu done=%llu\n",
+                   k, (unsigned long long) task->length_,
+                   (unsigned long long) n_out.load());
+    }
+  }
   // Device destination: enqueue async copies and complete them.
   //
   // SMALL reads synchronize INLINE: the copy itself is ~0.1 ms/MiB of D2D
@@ -703,7 +713,16 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   // per task cost ~0.3 ms on top).
   clio::run::u64 bytes_read = 0;
   int rc;
-  if (force_sync_gpu_ || task->length_ <= (8ull << 20)) {
+  // CLIO_BDEV_NO_INLINE_SYNC=1 forces the yield-poll path for every size.
+  // The inline path BLOCKS a runtime worker for the duration of the copy,
+  // which is cheap when reads are short and the worker pool is idle -- and
+  // is exactly what a kernel spin-waiting on that read cannot tolerate if
+  // it starves the pool. Knob exists so that can be tested, not argued.
+  static const bool no_inline = [] {
+    const char *e = std::getenv("CLIO_BDEV_NO_INLINE_SYNC");
+    return e != nullptr && *e == '1';
+  }();
+  if (!no_inline && (force_sync_gpu_ || task->length_ <= (8ull << 20))) {
     static thread_local void *t_stream = nullptr;
     if (t_stream == nullptr) t_stream = ctp::GpuApi::CreateStream();
     rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, t_stream, bytes_read);
@@ -717,6 +736,13 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
     ctp::GpuApi::DestroyStream(stream);
   }
 
+  {
+    static std::atomic<unsigned long long> n_done{0};
+    const unsigned long long k = ++n_done;
+    if (k <= 4 || (k & 1023) == 0) {
+      std::fprintf(stderr, "[bdev-dev-read] done n=%llu rc=%d\n", k, rc);
+    }
+  }
   task->return_code_ = rc;
   task->bytes_read_ = bytes_read;
   CLIO_CO_RETURN;

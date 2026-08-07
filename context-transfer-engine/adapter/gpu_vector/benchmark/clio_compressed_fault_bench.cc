@@ -144,36 +144,25 @@ __global__ void ConsumeKernelVec(clio::run::IpcManagerGpuInfo info,
   // through the vector into shared memory, the whole block consumes it.
   // The page is sized to the access granularity, so warp 0 never leaves
   // one page during a slice and its faults are one page each.
-  constexpr uint32_t kChunk = 16384;
-  __shared__ uint8_t stage[kChunk];
+  // BLOCK-COLLECTIVE read: every thread of the block walks the same range,
+  // hits its own per-lane page pointer in the common case, and the whole
+  // block faults together when any thread lacks the page. No staging
+  // buffer, no __shared__ page slot, no one-warp restriction.
   __shared__ unsigned long long block_sum;
   const uint32_t tid = threadIdx.x;
-  const uint32_t warp = tid >> 5;
   if (tid == 0) block_sum = 0;
   __syncthreads();
 
-  // ONE launch for the WHOLE workload: each CUDA block owns one vector
-  // cache block and walks its stride of the access stream, faulting pages
-  // in from inside the kernel as it goes.
   for (uint64_t i = blockIdx.x; i < n_access; i += gridDim.x) {
     const uint64_t base = access[i] * slice_bytes;
-    for (uint64_t off = 0; off < slice_bytes; off += kChunk) {
-      const uint64_t lo = base + off;
-      const uint64_t hi = lo + kChunk;
-      if (warp == 0) {
-        W.read_range(lo, hi, [&](uint64_t idx, uint8_t v) {
-          stage[idx - lo] = v;
-        });
-      }
-      __syncthreads();
-      unsigned long long local = 0;
-      for (uint32_t j = tid; j < kChunk; j += blockDim.x) local += stage[j];
-      for (int o = 16; o > 0; o >>= 1) {
-        local += __shfl_xor_sync(0xffffffff, local, o);
-      }
-      if ((tid & 31u) == 0) atomicAdd(&block_sum, local);
-      __syncthreads();
+    unsigned long long local = 0;
+    W.read_range(base, base + slice_bytes,
+                 [&local](uint64_t, uint8_t v) { local += v; });
+    for (int o = 16; o > 0; o >>= 1) {
+      local += __shfl_xor_sync(0xffffffff, local, o);
     }
+    if ((tid & 31u) == 0) atomicAdd(&block_sum, local);
+    __syncthreads();
   }
   if (tid == 0) atomicAdd(out, block_sum);
 }

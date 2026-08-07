@@ -87,12 +87,14 @@ __global__ void SpanVerifyKernel(clio::run::IpcManagerGpuInfo info,
   if (b1 > hi) b1 = hi;
   for (clio::run::u64 c = b0; c < b1; c += chunk) {
     const clio::run::u64 ce = (c + chunk < b1) ? (c + chunk) : b1;
-    if (threadIdx.x < 32) {
-      W.read_range(c, ce, [mismatches, checked](clio::run::u64 i, uint8_t v) {
-        atomicAdd(checked, 1ULL);
-        if (v != PatternAt(i)) atomicAdd(mismatches, 1ULL);
-      });
-    }
+    // read_range is BLOCK-collective: every thread of the block must call
+    // it (a fault is serviced by the whole block, and the barrier inside
+    // deadlocks if some threads skip it). The old warp-0-only guard here
+    // encoded the previous warp-collective contract.
+    W.read_range(c, ce, [mismatches, checked](clio::run::u64 i, uint8_t v) {
+      atomicAdd(checked, 1ULL);
+      if (v != PatternAt(i)) atomicAdd(mismatches, 1ULL);
+    });
     __syncthreads();
   }
 }
