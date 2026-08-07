@@ -29,6 +29,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <unordered_map>
@@ -297,6 +298,7 @@ class Vector {
         }
       }
       impl_->in_direct_flush = false;
+      LfuAdmit(want);
     }
     for (auto &f : fl) {
       f.Wait();
@@ -369,6 +371,41 @@ class Vector {
   /** True when this page's cached record already shows a top-tier score,
    *  i.e. a promotion has landed and the zero-task read path can serve it. */
   bool PageIsPromoted(clio::run::u64 gp);
+
+  /** Count this batch's reads and, periodically, promote the hottest
+   *  not-yet-promoted pages into the top tier by SCORE. Bounded work: a
+   *  fixed number of promotions per round, only when a page is measurably
+   *  hot, and never a data copy. */
+  void LfuAdmit(const std::vector<PendingPage> &batch) {
+#if !CTP_IS_DEVICE_PASS
+    if (!impl_ || view_.base.flat_layout) return;
+    for (const auto &p : batch) ++impl_->page_hits[p.gp];
+    if ((++impl_->lfu_rounds % 64) != 0) return;
+    // Hottest pages first; skip ones already promoted.
+    std::vector<std::pair<clio::run::u32, clio::run::u64>> hot;
+    hot.reserve(impl_->page_hits.size());
+    for (const auto &kv : impl_->page_hits) {
+      if (kv.second < 2) continue;
+      if (impl_->page_promoted.count(kv.first)) continue;
+      hot.emplace_back(kv.second, kv.first);
+    }
+    if (hot.empty()) return;
+    std::partial_sort(
+        hot.begin(),
+        hot.begin() + std::min<size_t>(hot.size(), 32), hot.end(),
+        [](const auto &a, const auto &b) { return a.first > b.first; });
+    const size_t n = std::min<size_t>(hot.size(), 32);
+    for (size_t k = 0; k < n; ++k) {
+      PromoteSpan(hot[k].second * view_.base.page_size_bytes,
+                  view_.base.page_size_bytes, 1.0f);
+      impl_->page_promoted[hot[k].second] = 1;
+    }
+    // Decay so the window follows a moving hot set instead of freezing.
+    for (auto &kv : impl_->page_hits) kv.second = (kv.second + 1) / 2;
+#else
+    (void) batch;
+#endif
+  }
 
   /** Partial-mode page residency (see BuildHostTier). */
   unsigned char *EnsureHostPage(clio::run::u64 gp);
@@ -1264,6 +1301,15 @@ struct Vector<T>::Impl {
                      std::vector<PendingPage> *)> direct_batch;
   std::vector<PendingPage> pending_direct;
   bool in_direct_flush = false;
+  /** LFU tier admission: how often each page is actually read, and which
+   *  pages we have already promoted. The device tier otherwise holds
+   *  whatever assimilation happened to place there -- a RANDOM slice of
+   *  the model, so its hit rate is just its capacity fraction. Promoting
+   *  by measured hotness (a score-set, never a Get) makes it hold the hot
+   *  slice instead. */
+  std::unordered_map<clio::run::u64, clio::run::u32> page_hits;
+  std::unordered_map<clio::run::u64, char> page_promoted;
+  clio::run::u64 lfu_rounds = 0;
   clio::run::u64 direct_hits = 0, direct_misses = 0;
   /** Permanent (first-touch) admissions get exact cudaMallocs under
    *  their own budget -- static model tensors, reused every token. */
