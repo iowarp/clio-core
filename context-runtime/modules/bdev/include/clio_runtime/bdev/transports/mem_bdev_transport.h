@@ -74,6 +74,21 @@ class MemBdevTransport : public BdevTransport {
    * the target pool id carried in each cached block descriptor. That removes
    * any need to publish a name or a page table separately.
    */
+  // ---- In-process HBM directory (zero-task device reads) -----------------
+  // A kHbm bdev's pages are DEVICE memory in THIS process. Registering the
+  // transport by pool id lets a co-located reader (the gpu_vector's direct
+  // fetch path) resolve a cached block descriptor straight to a device
+  // pointer -- no task, no copy -- the device analog of the kRam shm
+  // fast path below. Guarded by placement_gen on the reader side.
+  static void RegisterHbm(const clio::run::PoolId &pool_id,
+                          MemBdevTransport *t);
+  static void UnregisterHbm(const clio::run::PoolId &pool_id);
+  static MemBdevTransport *LookupHbm(const clio::run::PoolId &pool_id);
+
+  /** Device pointer for [offset, offset+size) iff it lies within one
+   *  allocated page of this device; nullptr otherwise. */
+  char *ResolveHbmSpan(clio::run::u64 offset, clio::run::u64 size);
+
   static std::string ShmSegmentName(clio::run::u32 server_pid,
                                     const clio::run::PoolId &pool_id) {
     return "clio_rambdev_" + std::to_string(server_pid) + "_" +

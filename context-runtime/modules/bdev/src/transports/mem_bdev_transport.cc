@@ -3,6 +3,8 @@
  * All rights reserved.
  */
 
+#include <shared_mutex>
+#include <unordered_map>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -14,6 +16,46 @@
 #include <cstdlib>
 
 namespace clio::run::bdev {
+
+// ---- In-process HBM directory ----------------------------------------------
+namespace {
+std::shared_mutex &HbmDirMutex() {
+  static std::shared_mutex m;
+  return m;
+}
+std::unordered_map<clio::run::u64, MemBdevTransport *> &HbmDir() {
+  static std::unordered_map<clio::run::u64, MemBdevTransport *> d;
+  return d;
+}
+}  // namespace
+
+void MemBdevTransport::RegisterHbm(const clio::run::PoolId &pool_id,
+                                   MemBdevTransport *t) {
+  std::unique_lock<std::shared_mutex> lk(HbmDirMutex());
+  HbmDir()[pool_id.ToU64()] = t;
+}
+void MemBdevTransport::UnregisterHbm(const clio::run::PoolId &pool_id) {
+  std::unique_lock<std::shared_mutex> lk(HbmDirMutex());
+  HbmDir().erase(pool_id.ToU64());
+}
+MemBdevTransport *MemBdevTransport::LookupHbm(
+    const clio::run::PoolId &pool_id) {
+  std::shared_lock<std::shared_mutex> lk(HbmDirMutex());
+  auto it = HbmDir().find(pool_id.ToU64());
+  return it == HbmDir().end() ? nullptr : it->second;
+}
+
+char *MemBdevTransport::ResolveHbmSpan(clio::run::u64 offset,
+                                       clio::run::u64 size) {
+  if (bdev_type_ != BdevType::kHbm) return nullptr;
+  const size_t page_idx = static_cast<size_t>(offset / kRamPageSize);
+  const clio::run::u64 intra = offset % kRamPageSize;
+  if (intra + size > kRamPageSize) return nullptr;   // straddles pages
+  char *page = GetRamPage(page_idx);
+  if (page == nullptr) return nullptr;
+  return page + intra;
+}
+
 
 bool MemBdevTransport::Init(const CreateParams& params,
                             const std::string& /*pool_name*/, Runtime* runtime) {
@@ -626,20 +668,31 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
     CLIO_CO_RETURN;
   }
 
-  // Device destination: enqueue async copies on a per-task stream and yield
-  // while they run.
-  void *stream = ctp::GpuApi::CreateStream();
+  // Device destination: enqueue async copies and complete them.
+  //
+  // SMALL reads synchronize INLINE: the copy itself is ~0.1 ms/MiB of D2D
+  // or H2D, while observing completion through the yield-poll loop costs
+  // scheduler-latency rounds -- measured ~3.3 ms per 1 MiB fetch on the
+  // compressed fault path, the dominant term of its entire budget. Blocking
+  // the worker for the copy is strictly cheaper below a few MiB. No
+  // CLIO_CO_AWAIT sits between stream use and sync, so the coroutine stays
+  // on one thread and a per-thread CACHED stream is safe (create/destroy
+  // per task cost ~0.3 ms on top).
   clio::run::u64 bytes_read = 0;
-  int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
-  if (force_sync_gpu_) {
-    // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+  int rc;
+  if (force_sync_gpu_ || task->length_ <= (8ull << 20)) {
+    static thread_local void *t_stream = nullptr;
+    if (t_stream == nullptr) t_stream = ctp::GpuApi::CreateStream();
+    rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, t_stream, bytes_read);
+    ctp::GpuApi::Synchronize(t_stream);
   } else {
+    void *stream = ctp::GpuApi::CreateStream();
+    rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
+    ctp::GpuApi::DestroyStream(stream);
   }
-  ctp::GpuApi::DestroyStream(stream);
 
   task->return_code_ = rc;
   task->bytes_read_ = bytes_read;

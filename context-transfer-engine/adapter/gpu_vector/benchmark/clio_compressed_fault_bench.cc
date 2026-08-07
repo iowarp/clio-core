@@ -34,6 +34,7 @@
 #include <clio_runtime/singletons.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_cte/gpu_vector/gpu_vector_hbm_direct.h>
 
 #include <cuda_runtime.h>
 
@@ -262,9 +263,14 @@ int main(int argc, char **argv) {
         FillSlice(host.data(), kPage, gp, c.fill_const_frac);
         auto buf = CLIO_CPU_IPC->AllocateBuffer(kPage);
         std::memcpy(buf.ptr_, host.data(), kPage);
+        // Seed COLD (0.3): placement follows the score protocol -- only the
+        // prefetcher's promotions (0.95) move pages into the hbm tier, so
+        // the tier's contents track the schedule instead of freezing
+        // whatever fit first. (Seeding at 1.0 also made promotion a
+        // sub-threshold no-op: 1.0 -> 0.95 moves nothing.)
         auto t = put_client.AsyncPutBlob(
             vec.TagId(), vec.PageBlobName(gp), 0, kPage,
-            buf.shm_.template Cast<void>(), 1.0f, clio::cte::core::Context(),
+            buf.shm_.template Cast<void>(), 0.3f, clio::cte::core::Context(),
             0);
         t.Wait();
         CLIO_CPU_IPC->FreeBuffer(buf);
@@ -319,20 +325,47 @@ int main(int argc, char **argv) {
   // then decompresses from device memory. Slices leaving the window are
   // demoted (0.30) so the tier's capacity follows the schedule. Promotions
   // are fire-and-forget with a bounded drain.
+  // Exact next-occurrence of every access position (backward scan): the
+  // prefetcher promotes a slice only when it RECURS soon enough to repay
+  // the migration -- one-shot tail slices go through the batched task path
+  // instead of churning the tier.
+  std::vector<uint64_t> next_occ(access.size(), UINT64_MAX);
+  {
+    std::vector<uint64_t> last(slices, UINT64_MAX);
+    for (uint64_t i2 = access.size(); i2-- > 0;) {
+      next_occ[i2] = last[access[i2]];
+      last[access[i2]] = i2;
+    }
+  }
+  const uint64_t kRecurHorizon = access.size();   // recurs at all
   clio::cte::core::Client core_cli(clio::cte::core::kCtePoolId);
-  const uint64_t kLookahead = c.k_sel * 4;   // ~4 layers of lead
+  if (!core_cli.AttachShmCache()) {
+    std::fprintf(stderr, "CFB: shm metadata cache not attachable; "
+                         "zero-task path disabled\n");
+  }
+  gv::DirectStats dstats;
+  const uint64_t kLookahead = c.k_sel * 10;  // ~10 layers of migration lead
   std::vector<int8_t> promoted(slices, 0);
+  // True LRU: entries are (slice, epoch); a pop is valid only when the
+  // epoch matches the slice's latest touch, so re-promotion refreshes
+  // recency instead of leaving the hottest slice first in line.
+  std::deque<std::pair<uint64_t, uint64_t>> promo_lru;
+  std::vector<uint64_t> promo_epoch(slices, 0);
+  uint64_t promoted_bytes = 0;
   std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> reorgs;
+  static uint64_t reorg_ok = 0, reorg_fail = 0;
+  auto drain_one = [&]() {
+    reorgs.front().Wait();
+    if (reorgs.front()->return_code_ == 0) ++reorg_ok; else ++reorg_fail;
+    reorgs.pop_front();
+  };
   auto set_score = [&](uint64_t sl, float score) {
     for (uint64_t pp = 0; pp < pages_per_slice; ++pp) {
       reorgs.push_back(core_cli.AsyncReorganizeBlob(
           vec.TagId(), vec.PageBlobName(sl * pages_per_slice + pp), score,
           clio::run::PoolQuery::Local()));
     }
-    while (reorgs.size() > 256) {
-      reorgs.front().Wait();
-      reorgs.pop_front();
-    }
+    while (reorgs.size() > 256) drain_one();
   };
   gv::Vector<uint8_t>::FetchList fl;
   std::vector<std::pair<uint8_t *, uint64_t>> batch;   // (dst, slice)
@@ -344,37 +377,77 @@ int main(int argc, char **argv) {
          prefetch_on && j < std::min<uint64_t>(i + kLookahead,
                                                access.size()); ++j) {
       const uint64_t sl = access[j];
-      if (!promoted[sl]) {
-        promoted[sl] = 1;
-        set_score(sl, 0.95f);
+      if (next_occ[j] == UINT64_MAX || next_occ[j] > j + kRecurHorizon) {
+        continue;   // one-shot in this horizon: not worth a migration
       }
+      if (promoted[sl]) {
+        promo_lru.emplace_back(sl, ++promo_epoch[sl]);   // refresh recency
+      } else {
+        promoted[sl] = 1;
+        promo_lru.emplace_back(sl, ++promo_epoch[sl]);
+        promoted_bytes += (uint64_t) (c.slice_bytes * 0.75);
+        // 1.0, not 0.95: MaxBwDpe treats targets with score > blob score
+        // as FALLBACK, so anything below the hbm tier's 1.0 puts hbm in
+        // the fallback group and the blob lands in ram.
+        set_score(sl, 1.0f);
+      }
+
     }
-    if (prefetch_on && i >= c.k_sel) {
-      for (uint64_t j = i - c.k_sel; j < i; ++j) {
-        const uint64_t sl = access[j];
-        if (!promoted[sl]) continue;
+    // CAPACITY-PRESSURE demotion only: hot slices stay hbm-resident across
+    // recurrences (window-exit demotion re-migrated every slice every
+    // cycle -- 42k reorganizes saturating the workers for a working set
+    // that mostly fits). Evict LRU promoted slices only when the promoted
+    // footprint nears the tier cap.
+    if (prefetch_on) {
+      const uint64_t est_slice = (uint64_t) (c.slice_bytes * 0.75);
+      const uint64_t budget = (c.hbm_mb << 20) * 85 / 100;
+      uint64_t scanned = 0;
+      while (promoted_bytes + est_slice * c.k_sel > budget &&
+             !promo_lru.empty() && scanned < promo_lru.size() + 8) {
+        auto [victim, epoch] = promo_lru.front();
+        promo_lru.pop_front();
+        ++scanned;
+        if (!promoted[victim] || promo_epoch[victim] != epoch) {
+          continue;   // stale entry: slice was refreshed or already evicted
+        }
         bool ahead = false;
         for (uint64_t j2 = i;
              j2 < std::min<uint64_t>(i + kLookahead, access.size()); ++j2) {
-          if (access[j2] == sl) { ahead = true; break; }
+          if (access[j2] == victim) { ahead = true; break; }
         }
-        if (!ahead) {
-          promoted[sl] = 0;
-          set_score(sl, 0.30f);
+        if (ahead) {
+          promo_lru.emplace_back(victim, epoch);   // still needed
+          continue;
         }
+        promoted[victim] = 0;
+        promoted_bytes -= est_slice;
+        set_score(victim, 0.30f);
       }
     }
     batch.clear();
+    // ZERO-TASK first: promoted, hbm-resident frames resolve straight to
+    // device pointers and decompress client-side in ONE batch; only the
+    // leftovers pay the task path.
+    std::vector<gv::DirectWant> want;
+    std::vector<gv::DirectWant> leftover;
     for (uint64_t s = 0; s < c.k_sel && i + s < access.size(); ++s) {
       const uint64_t sl = access[i + s];
       uint8_t *dst = vec.StageTransient(c.slice_bytes, nullptr);
-      if (dst == nullptr ||
-          !vec.FetchSpanDeviceAsync(dst, sl * c.slice_bytes, c.slice_bytes,
-                                    &fl)) {
+      if (dst == nullptr) {
         ++fails;
         continue;
       }
+      for (uint64_t pp = 0; pp < pages_per_slice; ++pp) {
+        want.push_back(gv::DirectWant{sl * pages_per_slice + pp,
+                                      dst + pp * kPage, kPage});
+      }
       batch.emplace_back(dst, sl);
+    }
+    gv::HbmDirectFetchBatch(vec, core_cli, want, &leftover, &dstats);
+    for (const auto &lw : leftover) {
+      if (!vec.FetchSpanDeviceAsync(lw.dst, lw.gp * kPage, lw.len, &fl)) {
+        ++fails;
+      }
     }
     if (!vec.WaitFetches(fl)) ++fails;
     for (auto &pr : batch) {
@@ -386,7 +459,10 @@ int main(int argc, char **argv) {
       fetched += c.slice_bytes;
     }
   }
-  for (auto &rg : reorgs) rg.Wait();
+  while (!reorgs.empty()) drain_one();
+  std::printf("CFB reorg: %llu ok, %llu failed\n",
+              (unsigned long long) reorg_ok,
+              (unsigned long long) reorg_fail);
   cudaDeviceSynchronize();
   const uint64_t run_ms = NowMs() - t_run0;
   unsigned long long got = 0;
@@ -406,6 +482,15 @@ int main(int argc, char **argv) {
       run_ms / 1000.0, c.tokens * 1000.0 / (double) run_ms,
       (double) fetched / (1ull << 30) / (run_ms / 1000.0),
       got == expected ? "OK" : "MISMATCH", (unsigned long long) fails);
+  std::printf("CFB direct: %llu hits %llu misses | no_rec=%llu cold=%llu "
+              "trunc=%llu unresolv=%llu moved=%llu\n",
+              (unsigned long long) dstats.hits,
+              (unsigned long long) dstats.misses,
+              (unsigned long long) dstats.no_rec,
+              (unsigned long long) dstats.cold,
+              (unsigned long long) dstats.trunc,
+              (unsigned long long) dstats.unresolv,
+              (unsigned long long) dstats.moved);
   if (got != expected) {
     std::printf("CFB expected=%llu got=%llu\n", (unsigned long long) expected,
                 (unsigned long long) got);

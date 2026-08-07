@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "clio_ctp/util/timer.h"
+#include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 
 namespace clio::run::bdev {
 
@@ -242,6 +243,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kError, "Failed to initialize bdev transport");
     task->return_code_ = 2;
     CLIO_CO_RETURN;
+  }
+  if (bdev_type_ == BdevType::kHbm) {
+    // Publish this device's in-process page table for zero-task reads
+    // (gpu_vector direct fetch; see MemBdevTransport::LookupHbm).
+    MemBdevTransport::RegisterHbm(
+        pool_id_, static_cast<MemBdevTransport *>(transport_.get()));
   }
 
   perf_metrics_ = params.perf_metrics_;

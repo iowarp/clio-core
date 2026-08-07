@@ -100,8 +100,20 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
     }
   }
 
-  // Sort low_score targets by performance (already correct order for placement)
-  std::sort(low_score_targets.begin(), low_score_targets.end(), perf_comparator);
+  // Sort low_score targets by TIER first (highest target_score_ <= blob
+  // score, i.e. the closest tier), then by performance within a tier.
+  // Sorting purely by perf let a low tier with better measured latency
+  // (host ram memcpy) beat the tier the score asked for (hbm through the
+  // CUDA path) -- which made score-driven promotion into the hbm tier
+  // unreachable: a blob at 1.0 still landed in ram. The score ladder is
+  // the operator's intent; perf only breaks ties within a tier.
+  std::sort(low_score_targets.begin(), low_score_targets.end(),
+            [&perf_comparator](const TargetInfo &a, const TargetInfo &b) {
+              if (a.target_score_ != b.target_score_) {
+                return a.target_score_ > b.target_score_;
+              }
+              return perf_comparator(a, b);
+            });
 
   // Sort high_score targets by performance in REVERSE order
   // (when falling back to higher tiers, prefer lower-performing ones first)
