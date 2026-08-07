@@ -189,13 +189,11 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // Runs to 128 blocks, the spec's maximum. Each block gets as many cache
   // slots as pages, so this axis measures BLOCK COUNT alone.
   //
-  // Oversubscription at HIGH block counts is still open. It no longer hangs
-  // (sizing the GPU lane fixed that) but now aborts with "RunFuture: null
-  // RunContext" from ~32 blocks up. SendOut flips the device completion flag
-  // BEFORE it finishes with the host task, so a kernel that immediately
-  // re-submits that page's slot races the tail of SendOut. Single-block
-  // oversubscription (the [evict] case above, 16 pages / 4 slots) is
-  // unaffected and covered.
+  // Oversubscription combined with HIGH block counts reaches 64 (covered
+  // below); 128 still hangs and is not diagnosed. The abort that used to
+  // appear here from ~32 blocks up is fixed: the host task copy is now keyed
+  // to its device slot instead of freed in SendOut, and the device completion
+  // flag is written LAST so a re-submitted slot cannot race SendOut's tail.
   for (unsigned nb : {8u, 32u, 64u, 128u}) {
     const clio::run::u64 per = 2 * 1024;            // 2 pages per block
     const clio::run::u64 n = per * nb;
@@ -219,6 +217,33 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     std::fprintf(stderr, "[multi-%u] mismatches=%llu / %llu\n", nb,
                  (unsigned long long) b3, (unsigned long long) n);
     REQUIRE(b3 == 0);
+  }
+
+  // ---- many blocks AND oversubscribed ----------------------------------
+  // Both pressures at once: 64 blocks, each walking 4 pages through 2 slots,
+  // so every block evicts and writes back mid-kernel while 63 others do the
+  // same. 128 here still hangs (see the note above), so this stops at 64.
+  {
+    const unsigned nb = 64u;
+    const clio::run::u64 per = 4 * 1024;
+    const clio::run::u64 n = per * nb;
+    gv::Vector<clio::run::u32> ov("gv_multi_ov", {0}, kPageBytes, nb,
+                                  /*pages_per_block=*/2, n);
+    MultiFillKernel<<<nb, 32>>>(gpu_info, ov.GetDevice(0), per);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    unsigned long long *d4 = nullptr;
+    REQUIRE(cudaMalloc(&d4, sizeof(unsigned long long)) == cudaSuccess);
+    REQUIRE(cudaMemset(d4, 0, sizeof(unsigned long long)) == cudaSuccess);
+    MultiCheckKernel<<<nb, 32>>>(gpu_info, ov.GetDevice(0), per, d4);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    unsigned long long b4 = 1;
+    REQUIRE(cudaMemcpy(&b4, d4, sizeof(b4), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    cudaFree(d4);
+    std::fprintf(stderr, "[multi-oversub-64] mismatches=%llu / %llu\n",
+                 (unsigned long long) b4, (unsigned long long) n);
+    REQUIRE(b4 == 0);
   }
 
 }

@@ -5,6 +5,7 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
+#include <unordered_map>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -79,9 +80,16 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   // its depth (and a depth large enough for 128 blocks x 4 pages blew the
   // thread's TLS and segfaulted).
   //
-  // Owning it per task removes the limit entirely. SendOut frees it -- it is
-  // the last place the host copy is used, and it already distinguishes
-  // device-origin tasks by gpu_task_device_ptr_.
+  // Allocating per CALL fixes the aliasing but creates an ownership problem:
+  // nothing can say when the copy is dead. Freeing it in SendOut looks right
+  // and is not -- SendOut is NOT the last reference, and doing so aborted with
+  // "RunFuture: null RunContext" as soon as slots were reused concurrently.
+  //
+  // Keying on the DEVICE task address solves both. Distinct slots get distinct
+  // buffers, so nothing aliases; and a slot is only re-submitted after its
+  // previous completion has been observed by the kernel, so reusing its buffer
+  // is safe by the same invariant the producer already relies on. Nothing is
+  // freed, and the total is bounded by the task slots the client allocated.
   static constexpr size_t kTaskScratchBytes = 4096;
   if (task_pod_size > kTaskScratchBytes) {
     HLOG(kError,
@@ -89,7 +97,12 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
          worker_id, task_pod_size, kTaskScratchBytes);
     return true;
   }
-  char *task_scratch = new char[task_pod_size];
+  thread_local std::unordered_map<const void *, char *> task_scratch_by_slot;
+  char *&slot_buf = task_scratch_by_slot[gpu_task_raw];
+  if (slot_buf == nullptr) {
+    slot_buf = new char[kTaskScratchBytes];
+  }
+  char *task_scratch = slot_buf;
 
   Task *task_raw = nullptr;
   if (task_on_device) {
@@ -128,7 +141,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
          "method={})",
          worker_id, pool_id, method_id);
     signal_task_complete();
-    if (task_on_device) delete[] task_scratch;
+
     return true;
   }
 
@@ -202,20 +215,12 @@ void IpcGpu2Cpu::SendOut(
       future_shm->gpu_task_device_ptr_ != 0 && future_shm->gpu_task_size_ != 0;
 
   if (device_task) {
-    // kDeviceMem: writeback the mutated POD (is_complete_ still 0 here), then
-    // flip the completion flag separately at its device address. is_complete_
-    // is fut_'s first member (atomic<u32> whose storage is `.x`).
+    // kDeviceMem: write back the mutated POD. is_complete_ is still 0 here on
+    // purpose -- the flag is flipped at the END of this function, once nothing
+    // else will touch the task (see below).
     ctp::DeviceAwareMemcpy(
         reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_), host_task,
         future_shm->gpu_task_size_);
-    size_t complete_off =
-        reinterpret_cast<char *>(&host_task->fut_.is_complete_.x) -
-        reinterpret_cast<char *>(host_task);
-    u32 one = 1;
-    ctp::DeviceAwareMemcpy(
-        reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
-            complete_off,
-        &one, sizeof(u32));
   }
 
   // Mark complete: for kPinnedHost / kManagedUvm this storage is shared with
@@ -226,10 +231,19 @@ void IpcGpu2Cpu::SendOut(
   // the task — the runtime does not free it.
   task_ptr->ClearFlags(TASK_DATA_OWNER);
 
-  // The HOST copy, though, is ours: RecvIn allocated it per task so that
-  // concurrent device tasks never share a buffer. This is its last use.
+  // The device completion flag goes LAST, once nothing here will touch this
+  // task again. It is the kernel's release signal: the instant it flips, the
+  // producer may re-submit that page's slot, and any work still pending in
+  // this function would race the new submission.
   if (device_task) {
-    delete[] reinterpret_cast<char *>(host_task);
+    size_t complete_off =
+        reinterpret_cast<char *>(&host_task->fut_.is_complete_.x) -
+        reinterpret_cast<char *>(host_task);
+    u32 one = 1;
+    ctp::DeviceAwareMemcpy(
+        reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+            complete_off,
+        &one, sizeof(u32));
   }
   (void)ipc;
 }
