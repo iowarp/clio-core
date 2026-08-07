@@ -156,6 +156,10 @@ class MemBdevTransport : public BdevTransport {
     char* data = nullptr;
     bool pinned = false;
     bool device = false;  // kHbm: `data` is GPU device memory (GpuApi::Malloc)
+    /** Bytes actually allocated. The tail page of a device whose capacity is
+     *  not a multiple of kRamPageSize is SHORT -- allocating a full page for
+     *  it exhausted VRAM on small tiers. 0 means "the full page". */
+    size_t bytes = 0;
   };
 
   mutable std::mutex ram_pages_mu_;

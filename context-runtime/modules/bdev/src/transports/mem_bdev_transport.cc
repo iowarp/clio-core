@@ -3,6 +3,8 @@
  * All rights reserved.
  */
 
+#include <cuda_runtime.h>
+#include <limits>
 #include <shared_mutex>
 #include <unordered_map>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
@@ -331,9 +333,30 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
       // through device-aware copies (see the memcpy sites below), so data
       // buffered here — e.g. nvcomp-compressed model pages — never has to
       // round-trip through host RAM to reach a device consumer.
-      page.data = ctp::GpuApi::Malloc<char>(kRamPageSize);
-      if (page.data != nullptr) {
-        page.device = true;
+      //
+      // Allocate only what this DEVICE actually spans: kRamPageSize is 1 GiB,
+      // so a tier configured at (say) 1.7 GB otherwise tried to cudaMalloc a
+      // full 1 GiB for its tail page and OOM'd against the application's own
+      // VRAM. Clamp the last page to the capacity, and use a hard-failure-free
+      // cudaMalloc so exhaustion degrades to the host path instead of
+      // aborting the process.
+      size_t want = kRamPageSize;
+      if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max()) {
+        const clio::run::u64 base = (clio::run::u64) page_idx * kRamPageSize;
+        want = (base >= ram_capacity_)
+                   ? 0
+                   : (size_t) std::min<clio::run::u64>(
+                         kRamPageSize, ram_capacity_ - base);
+      }
+      if (want > 0) {
+        void *dp = nullptr;
+        if (cudaMalloc(&dp, want) == cudaSuccess) {
+          page.data = static_cast<char *>(dp);
+          page.device = true;
+          page.bytes = want;
+        } else {
+          cudaGetLastError();   // clear; fall through to the host path
+        }
       }
       // Malloc returns nullptr with no usable GPU (or VRAM exhaustion); fall
       // through to the pageable host path so the tier degrades instead of
@@ -369,7 +392,11 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
   void *hbm_stream = nullptr;
 #if CTP_ENABLE_GPU
   if (bdev_type_ == BdevType::kHbm) {
-    hbm_stream = ctp::GpuApi::CreateStream();
+    // Cached per-thread stream: a fresh stream PER WRITE exhausted device
+    // memory when the tier itself was large (CUDA Error 2 in CreateStream).
+    static thread_local void *s_w_stream = nullptr;
+    if (s_w_stream == nullptr) s_w_stream = ctp::GpuApi::CreateStream();
+    hbm_stream = s_w_stream;
   }
 #endif
 
@@ -387,7 +414,6 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
 #if CTP_ENABLE_GPU
       if (hbm_stream != nullptr) {
         ctp::GpuApi::Synchronize(hbm_stream);
-        ctp::GpuApi::DestroyStream(hbm_stream);
       }
 #endif
       return;
@@ -419,7 +445,6 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
 #if CTP_ENABLE_GPU
   if (hbm_stream != nullptr) {
     ctp::GpuApi::Synchronize(hbm_stream);
-    ctp::GpuApi::DestroyStream(hbm_stream);
   }
 #endif
   task->return_code_ = 0;
@@ -545,7 +570,6 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
 #if CTP_ENABLE_GPU
       if (hbm_stream != nullptr) {
         ctp::GpuApi::Synchronize(hbm_stream);
-        ctp::GpuApi::DestroyStream(hbm_stream);
       }
 #endif
       return;
@@ -590,7 +614,6 @@ void MemBdevTransport::ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task,
 #if CTP_ENABLE_GPU
   if (hbm_stream != nullptr) {
     ctp::GpuApi::Synchronize(hbm_stream);
-    ctp::GpuApi::DestroyStream(hbm_stream);
   }
 #endif
   task->return_code_ = 0;

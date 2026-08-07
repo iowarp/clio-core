@@ -32,6 +32,7 @@
  */
 
 // Copyright 2024 IOWarp contributors
+#include <cuda_runtime.h>
 #include <atomic>
 #include <chrono>
 #include <clio_cte/compressor/compressor_runtime.h>
@@ -1287,12 +1288,21 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
 // compressed size is over-estimated (cuSZp's stream is self-delimiting).
 char *Runtime::AcquireDevFetch(clio::run::u64 size) {
   std::unique_lock<std::mutex> lk(dev_fetch_mtx_);
+  // Cap the pool by BYTES, not just count: 32 buffers sized for an 8 MiB
+  // request is 256 MiB of device memory, which OOM'd the allocator once the
+  // hbm tier itself was large. Above the cap, callers fall back to a host
+  // fetch buffer (correct, just slower).
+  constexpr clio::run::u64 kDevFetchByteCap = 192ull << 20;
   if (!dev_fetch_free_.empty() && dev_fetch_size_ >= size) {
     char *b = dev_fetch_free_.back();
     dev_fetch_free_.pop_back();
     return b;
   }
-  if (dev_fetch_alloced_ < kDevFetchPoolCap || dev_fetch_size_ < size) {
+  const bool byte_room =
+      (clio::run::u64) (dev_fetch_alloced_ + 1) * std::max(dev_fetch_size_, size) <=
+      kDevFetchByteCap;
+  if (byte_room && (dev_fetch_alloced_ < kDevFetchPoolCap ||
+                    dev_fetch_size_ < size)) {
     // (Re)allocate outside the fault hot loop: this runs at most
     // kDevFetchPoolCap times per size class, typically once at warmup —
     // NOT per fault, which is what deadlocked.
@@ -1302,7 +1312,14 @@ char *Runtime::AcquireDevFetch(clio::run::u64 size) {
       dev_fetch_alloced_ = 0;
       dev_fetch_size_ = size;
     }
-    char *b = ctp::GpuApi::Malloc<char>(dev_fetch_size_);
+    // Soft allocation: GpuApi::Malloc FATALs the process on exhaustion,
+    // and this pool is an optimization -- a failure must degrade to the
+    // host fetch buffer, not abort. (Observed: gemma + a device tier ->
+    // CUDA Error 2 aborting inference.)
+    void *dp = nullptr;
+    char *b = (cudaMalloc(&dp, dev_fetch_size_) == cudaSuccess)
+                  ? static_cast<char *>(dp)
+                  : (cudaGetLastError(), nullptr);
     if (b != nullptr) {
       ++dev_fetch_alloced_;
       return b;
@@ -1492,10 +1509,14 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
         // (MemBdevTransport::LaunchReadBlocksGpu): a fresh stream in the current
         // context, copy, synchronize -- no co_await between, so this coroutine
         // stays on one thread and the stream/context stay consistent.
-        void *stream = ctp::GpuApi::CreateStream();
-        ctp::GpuApi::MemcpyAsync(dst, src, n, stream);
-        ctp::GpuApi::Synchronize(stream);
-        ctp::GpuApi::DestroyStream(stream);
+        // Cached per-thread stream: creating one PER CALL exhausted device
+        // memory under a small tier (CUDA Error 2 in CreateStream) and cost
+        // ~0.3 ms each. No co_await between use and sync, so the coroutine
+        // cannot migrate threads mid-copy.
+        static thread_local void *s_wr_stream = nullptr;
+        if (s_wr_stream == nullptr) s_wr_stream = ctp::GpuApi::CreateStream();
+        ctp::GpuApi::MemcpyAsync(dst, src, n, s_wr_stream);
+        ctp::GpuApi::Synchronize(s_wr_stream);
       } else {
         std::memcpy(dst, src, n);
       }
@@ -1535,10 +1556,10 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       if (dev_tmp != nullptr && !gpu_codec) {
         chost.resize(csize);
 #if CTP_ENABLE_GPU
-        void *cstream = ctp::GpuApi::CreateStream();
-        ctp::GpuApi::MemcpyAsync(chost.data(), cdata, csize, cstream);
-        ctp::GpuApi::Synchronize(cstream);
-        ctp::GpuApi::DestroyStream(cstream);
+        static thread_local void *s_c_stream = nullptr;
+        if (s_c_stream == nullptr) s_c_stream = ctp::GpuApi::CreateStream();
+        ctp::GpuApi::MemcpyAsync(chost.data(), cdata, csize, s_c_stream);
+        ctp::GpuApi::Synchronize(s_c_stream);
 #endif
         cdata = chost.data();
       }
