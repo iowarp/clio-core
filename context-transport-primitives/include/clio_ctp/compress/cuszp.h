@@ -36,8 +36,11 @@
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
 
+#include <cuda.h>  // driver API: dedicated CUDA context for the compressor
 #include <cuda_runtime.h>
 #include <cuSZp.h>
+#include <mutex>
+#include <vector>
 
 #include <cstdint>
 #include <cstring>
@@ -45,6 +48,113 @@
 #include "compress.h"
 
 namespace ctp {
+namespace cuszp_detail {
+
+// A dedicated CUDA context for all compressor GPU work. Running cuSZp in a
+// SEPARATE context (not the app's primary context) is what makes the on-device
+// page fault non-deadlocking: A100 compute preemption lets the decompress kernel
+// in this context run while the app's fault kernel spin-waits in the primary
+// context (verified -- streams within one context do NOT preempt; a separate
+// context does). Cross-context UVA lets the decompress write straight into the
+// vector's HBM page (allocated in the primary context). Created once, lazily, on
+// the first compress (page eviction, GPU idle). A context may be current on many
+// threads at once (CUDA 4.0+), so all compressor workers share it.
+inline CUcontext CompressorContext() {
+  static CUcontext ctx = nullptr;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    cuInit(0);
+    CUdevice dev;
+    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return;
+    // CUDA 13 remapped cuCtxCreate -> cuCtxCreate_v4, which takes a
+    // CUctxCreateParams* as its 2nd argument (the old 3-arg v2 form fails to
+    // compile with "too few arguments"). Pass nullptr for the default params.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+    if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS) { ctx = nullptr; return; }
+#else
+    if (cuCtxCreate(&ctx, 0, dev) != CUDA_SUCCESS) { ctx = nullptr; return; }
+#endif
+    CUcontext popped;
+    cuCtxPopCurrent(&popped);  // cuCtxCreate left it current; restore the caller's
+  });
+  return ctx;
+}
+
+// RAII: make the compressor context current for the enclosing scope, restore the
+// previous (app) context on exit -- so the rest of the runtime is unaffected.
+struct ContextScope {
+  bool active = false;
+  ContextScope() {
+    CUcontext c = CompressorContext();
+    if (c && cuCtxPushCurrent(c) == CUDA_SUCCESS) active = true;
+  }
+  ~ContextScope() {
+    if (active) { CUcontext popped; cuCtxPopCurrent(&popped); }
+  }
+};
+
+// Process-global pinned-host staging pool + pre-warmed stream-ordered mempool.
+//
+// The compressed GPU-vector fault path decompresses while a caller kernel
+// spin-waits ON-DEVICE for that decompress. To not deadlock, the decompress
+// must issue ZERO device-synchronizing CUDA calls. Two would otherwise remain:
+//   (1) the first cudaMallocAsync (lazy mempool creation) device-syncs, and
+//   (2) staging the compressed bytes host->device from PAGEABLE memory makes
+//       cudaMemcpyAsync behave synchronously (a device sync).
+// This pool fixes both: its constructor warms the mempool and preallocates
+// pinned staging buffers, and it is constructed lazily on the FIRST compress --
+// which always happens during page eviction (GPU idle), strictly before any
+// read fault can occur (a page must be written before it can be faulted back).
+// Pageable inputs are then bounced through a pinned buffer so the H2D is a true
+// async copy.
+struct PinnedPool {
+  std::mutex m;
+  std::vector<uint8_t *> free_;
+  std::vector<uint8_t *> all_;
+  size_t buf_ = 0;
+
+  PinnedPool() {
+    cudaFree(0);  // ensure a context exists
+    // Warm the default stream-ordered mempool so later cudaMallocAsync calls
+    // (during an on-device fault) are pure stream ops, not a syncing pool init.
+    void *w = nullptr;
+    if (cudaMallocAsync(&w, size_t(8) << 20, 0) == cudaSuccess) {
+      cudaFreeAsync(w, 0);
+      cudaStreamSynchronize(0);
+    }
+    buf_ = size_t(8) << 20;  // 8 MiB covers typical gpu_vector page sizes
+    for (int i = 0; i < 16; ++i) {
+      uint8_t *p = nullptr;
+      if (cudaMallocHost((void **)&p, buf_) == cudaSuccess) {
+        all_.push_back(p);
+        free_.push_back(p);
+      }
+    }
+  }
+
+  uint8_t *Acquire(size_t need) {
+    if (need > buf_) return nullptr;
+    std::lock_guard<std::mutex> g(m);
+    if (free_.empty()) return nullptr;
+    uint8_t *p = free_.back();
+    free_.pop_back();
+    return p;
+  }
+  void Release(uint8_t *p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> g(m);
+    free_.push_back(p);
+  }
+};
+
+inline PinnedPool &Pool() {
+  static PinnedPool pool;  // thread-safe lazy init; first touch = first compress
+  return pool;
+}
+
+}  // namespace cuszp_detail
+
+
 
 /**
  * cuSZp GPU error-bounded LOSSY compressor for floating-point data -- the
@@ -107,6 +217,11 @@ class Cuszp : public Compressor {
     }
     const size_t n = input_size / sizeof(float);
 
+    // Dedicated CUDA context: A100 compute preemption lets this run while an app
+    // kernel spin-waits in the primary context (cross-context UVA reaches HBM).
+    cuszp_detail::ContextScope _cctx;
+    (void)cuszp_detail::Pool();  // warm pinned pool + mempool on first compress
+
     cudaStream_t stream = nullptr;
     if (cudaStreamCreate(&stream) != cudaSuccess) {
       return false;
@@ -122,7 +237,7 @@ class Cuszp : public Compressor {
 
       // cuSZp writes into a caller-provided device buffer; size it for the
       // worst case (no larger than the original data).
-      if (cudaMalloc(&d_cmp, input_size) != cudaSuccess) break;
+      if (cudaMallocAsync(&d_cmp, input_size, stream) != cudaSuccess) break;
 
       size_t cmp_size = 0;
       uint3 dims = {0, 0, 0};  // ignored for 1D
@@ -177,8 +292,8 @@ class Cuszp : public Compressor {
       ok = true;
     } while (false);
 
-    if (d_cmp != nullptr) cudaFree(d_cmp);
-    if (free_in) cudaFree(d_in);
+    if (d_cmp != nullptr) cudaFreeAsync(d_cmp, stream);
+    if (free_in) cudaFreeAsync(d_in, stream);
     cudaStreamDestroy(stream);
     return ok;
   }
@@ -188,6 +303,9 @@ class Cuszp : public Compressor {
     if (output == nullptr || input == nullptr || input_size < sizeof(Prefix)) {
       return false;
     }
+
+    cuszp_detail::ContextScope _cctx;
+    (void)cuszp_detail::Pool();
 
     cudaStream_t stream = nullptr;
     if (cudaStreamCreate(&stream) != cudaSuccess) {
@@ -201,8 +319,9 @@ class Cuszp : public Compressor {
     do {
       Prefix prefix;
       if (IsDeviceAccessible(input)) {
-        if (cudaMemcpy(&prefix, input, sizeof(Prefix),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (cudaMemcpyAsync(&prefix, input, sizeof(Prefix),
+                            cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
           break;
         }
       } else {
@@ -223,7 +342,7 @@ class Cuszp : public Compressor {
       if (out_is_device) {
         d_out = static_cast<float *>(output);
       } else {
-        if (cudaMalloc(&d_out, n * sizeof(float)) != cudaSuccess) break;
+        if (cudaMallocAsync(&d_out, n * sizeof(float), stream) != cudaSuccess) break;
         free_out = true;
       }
 
@@ -232,7 +351,7 @@ class Cuszp : public Compressor {
       if (IsDeviceAccessible(input)) {
         d_stream = stream_src;
       } else {
-        if (cudaMalloc(&d_stream, avail) != cudaSuccess) break;
+        if (cudaMallocAsync(&d_stream, avail, stream) != cudaSuccess) break;
         free_stream = true;
         if (cudaMemcpyAsync(d_stream, stream_src, avail,
                             cudaMemcpyHostToDevice, stream) != cudaSuccess) {
@@ -248,8 +367,9 @@ class Cuszp : public Compressor {
                      cudaGetLastError() == cudaSuccess;
       if (decoded) {
         if (!out_is_device) {
-          decoded = cudaMemcpy(output, d_out, n * sizeof(float),
-                               cudaMemcpyDeviceToHost) == cudaSuccess;
+          decoded = cudaMemcpyAsync(output, d_out, n * sizeof(float),
+                                    cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess;
         }
         if (decoded) {
           output_size = n * sizeof(float);
@@ -258,8 +378,8 @@ class Cuszp : public Compressor {
       }
     } while (false);
 
-    if (free_stream) cudaFree(d_stream);
-    if (free_out) cudaFree(d_out);
+    if (free_stream) cudaFreeAsync(d_stream, stream);
+    if (free_out) cudaFreeAsync(d_out, stream);
     cudaStreamDestroy(stream);
     return ok;
   }
@@ -306,12 +426,12 @@ class Cuszp : public Compressor {
       return input;
     }
     void *d = nullptr;
-    if (cudaMalloc(&d, size) != cudaSuccess) {
+    if (cudaMallocAsync(&d, size, stream) != cudaSuccess) {
       return nullptr;
     }
     if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
         cudaSuccess) {
-      cudaFree(d);
+      cudaFreeAsync(d, stream);
       return nullptr;
     }
     *owned = true;

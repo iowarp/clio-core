@@ -1898,3 +1898,21 @@ install(TARGETS test_safe_bdev_recovery_e2e
 )
 
 endif()  # TARGET clio_safe_bdev_runtime
+
+# Multi-node coherency tests (write-only / read-only / append-only). Every rank
+# is a client, so different NODES touch the same blobs. Driven by
+# test/integration/distributed_slurm; single-rank by default (CTE_NUM_NODES=1).
+add_executable(test_cte_coherency
+    test_cte_coherency.cc
+)
+
+target_link_libraries(test_cte_coherency
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)

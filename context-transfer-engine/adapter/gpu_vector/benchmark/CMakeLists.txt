@@ -56,6 +56,161 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS clio_cte_gpu_vector_bench RUNTIME DESTINATION bin)
 
+    # Weight-application transaction demo: y = W*x streamed through the vector
+    # (the CTE analogue of llama.cpp mul_mat_vec). See gpu_vector_matvec.h.
+    add_cuda_executable(clio_weight_matvec_bench FALSE
+        clio_weight_matvec_bench.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_weight_matvec_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_weight_matvec_bench RUNTIME DESTINATION bin)
+
+    # F16 transaction-driven weight GEMV (half weights streamed via read_range).
+    # See gpu_vector_gemv.h.
+    add_cuda_executable(clio_weight_gemv_bench FALSE
+        clio_weight_gemv_bench.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_weight_gemv_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_weight_gemv_bench RUNTIME DESTINATION bin)
+
+    # End-to-end: assimilate weights via CAE -> map tag with vector -> verify.
+    # The CAE assimilation call lives in a plain-C++ static lib because the CAE
+    # task headers do not compile under nvcc; the CUDA exe links it.
+    #
+    # Gated on the CAE client target actually existing: CLIO_CORE_ENABLE_CAE is
+    # OFF in the CUDA/LLM presets, and declaring these targets unconditionally
+    # made the link fail with `cannot find -lclio_cae_core_client`.
+    if(TARGET clio_cae_core_client)
+    add_library(clio_mw_assimilate_helper STATIC clio_mw_assimilate.cc)
+    target_include_directories(clio_mw_assimilate_helper PRIVATE
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-assimilation-engine/core/include
+    )
+    target_link_libraries(clio_mw_assimilate_helper PUBLIC
+        clio_run_cxx
+        clio_cte_core_client
+        clio_cae_core_client
+    )
+
+    add_cuda_executable(clio_model_weights_roundtrip FALSE
+        clio_model_weights_roundtrip.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_mw_assimilate_helper
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_model_weights_roundtrip PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_model_weights_roundtrip RUNTIME DESTINATION bin)
+    else()
+        message(STATUS "CAE disabled - skipping clio_model_weights_roundtrip "
+                       "(needs clio_cae_core_client for weight assimilation)")
+    endif()
+
+    # Gray-Scott async-compressed PutBlob bench (production-vector-shaped):
+    # ships each per-block snapshot to storage via a CLIO compressed PutBlob.
+    # Needs the compressor chimod, so only built when compression is enabled.
+    if(CLIO_CTE_ENABLE_COMPRESS)
+        add_cuda_executable(clio_gs_putblob_compress_bench FALSE
+            clio_gs_putblob_compress_bench.cc
+            INCLUDE_DIRS
+                ${CMAKE_SOURCE_DIR}/context-runtime/include
+                ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            LINK_LIBS
+                clio_run_cxx
+                clio_run_cxx_gpu
+                clio_admin_client
+                clio_bdev_client
+                clio_cte_core_client
+                clio_cte_core_runtime
+                clio_cte_compressor_client
+                clio_cte_compressor_runtime
+                ctp::cuda_cxx
+                ${CMAKE_THREAD_LIBS_INIT}
+        )
+        set_target_properties(clio_gs_putblob_compress_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+        install(TARGETS clio_gs_putblob_compress_bench RUNTIME DESTINATION bin)
+
+        # Gray-Scott checkpoint comparison: traditional (D2H + PFS file) vs
+        # compressed GPU vector (compress in HBM, on-GPU).
+        add_cuda_executable(clio_gs_checkpoint_bench FALSE
+            clio_gs_checkpoint_bench.cu
+            INCLUDE_DIRS
+                ${CMAKE_SOURCE_DIR}/context-runtime/include
+                ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+                ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            LINK_LIBS
+                clio_run_cxx
+                clio_run_cxx_gpu
+                clio_admin_client
+                clio_bdev_client
+                clio_cte_core_client
+                clio_cte_core_runtime
+                clio_cte_compressor_client
+                clio_cte_compressor_runtime
+                ctp::cuda_cxx
+                ${CMAKE_THREAD_LIBS_INIT}
+        )
+        set_target_properties(clio_gs_checkpoint_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+        install(TARGETS clio_gs_checkpoint_bench RUNTIME DESTINATION bin)
+    endif()
+
     # Traditional out-of-memory baseline: synchronous D2H + synchronous PutBlob.
     add_cuda_executable(clio_traditional_oom_bench FALSE
         clio_traditional_oom_bench.cc
@@ -148,6 +303,70 @@ if(CLIO_CORE_ENABLE_ROCM)
         ${CMAKE_THREAD_LIBS_INIT}
     )
     install(TARGETS clio_cte_gpu_vector_bench RUNTIME DESTINATION bin)
+
+    # Weight-application transaction demo (ROCm).
+    add_rocm_gpu_executable(clio_weight_matvec_bench FALSE
+        clio_weight_matvec_bench.cc
+    )
+    target_compile_options(clio_weight_matvec_bench PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    )
+    set_target_properties(clio_weight_matvec_bench PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    target_include_directories(clio_weight_matvec_bench PUBLIC
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+    )
+    target_link_libraries(clio_weight_matvec_bench PUBLIC
+        clio_run_cxx
+        clio_run_cxx_gpu
+        clio_admin_client
+        clio_bdev_client
+        clio_cte_core_client
+        clio_cte_core_runtime
+        clio::cte::gpu_vector
+        ctp::rocm_cxx
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+    install(TARGETS clio_weight_matvec_bench RUNTIME DESTINATION bin)
+
+    # F16 transaction-driven weight GEMV (ROCm).
+    add_rocm_gpu_executable(clio_weight_gemv_bench FALSE
+        clio_weight_gemv_bench.cc
+    )
+    target_compile_options(clio_weight_gemv_bench PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    )
+    set_target_properties(clio_weight_gemv_bench PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    target_include_directories(clio_weight_gemv_bench PUBLIC
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+    )
+    target_link_libraries(clio_weight_gemv_bench PUBLIC
+        clio_run_cxx
+        clio_run_cxx_gpu
+        clio_admin_client
+        clio_bdev_client
+        clio_cte_core_client
+        clio_cte_core_runtime
+        clio::cte::gpu_vector
+        ctp::rocm_cxx
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+    install(TARGETS clio_weight_gemv_bench RUNTIME DESTINATION bin)
 
     # Traditional out-of-memory baseline (ROCm).
     add_rocm_gpu_executable(clio_traditional_oom_bench FALSE

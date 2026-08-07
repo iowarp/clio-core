@@ -9,6 +9,11 @@ set(KVCACHE_SOURCES
 
 add_library(clio_llm_kvcache SHARED ${KVCACHE_SOURCES})
 
+# On Windows a SHARED lib with no dllexport'd symbols produces no import .lib,
+# so anything linking it (llama, patched with IOWARP_LLM_KVCACHE) fails with
+# LNK1181. Auto-export all symbols so the import lib is generated.
+set_target_properties(clio_llm_kvcache PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+
 target_include_directories(clio_llm_kvcache
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
