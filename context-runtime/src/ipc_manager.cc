@@ -483,7 +483,17 @@ bool IpcManager::ServerInit() {
   // (Device-aware memcpy is now ctp::DeviceAwareMemcpy in gpu_api.h.)
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
@@ -498,7 +508,17 @@ bool IpcManager::ServerInit() {
   // on both.
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {

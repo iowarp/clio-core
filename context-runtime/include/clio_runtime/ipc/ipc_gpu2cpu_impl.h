@@ -64,7 +64,22 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
 
   CTP_DEVICE_FENCE_SYSTEM();
   auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
-  qlane.Push(task_future);
+  // Push RETURNS FALSE when the lane is full, and dropping the task there is
+  // unrecoverable: the caller is about to wait on a completion flag that
+  // nothing will ever set, so the kernel hangs forever. Every producer block
+  // shares this one lane, so a burst of faults fills it easily -- measured
+  // with a demand-paged vector, 128 blocks x 1 page passed while 128 x 2
+  // hung, and 64 x 4 (the same task count) passed, which is the signature of
+  // a burst overrunning the lane rather than a total-work limit.
+  //
+  // Spin until it lands. The consumer is a CPU worker that is actively
+  // draining, so this is a brief stall; it is also strictly what the caller
+  // already assumes by waiting on the result.
+  while (!qlane.Push(task_future)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __nanosleep(64);
+#endif
+  }
   return future;
 }
 #endif  // CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER

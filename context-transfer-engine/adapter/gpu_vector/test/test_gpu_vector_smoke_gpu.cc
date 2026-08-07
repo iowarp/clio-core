@@ -186,14 +186,16 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // Each block drives its own slice through its own page table. Slices are
   // page-aligned so blocks never contend for a page.
   //
-  // KNOWN CEILING: 64 blocks is the highest that passes RELIABLY. 96 passes
-  // in isolation but hangs intermittently (it was the flake that failed the
-  // combined ctest run roughly one time in three), and 128 hangs outright.
-  // Not diagnosed. Ruled out: the gpu2cpu queue (its depth is the runtime
-  // queue_depth, 1024, not the unused gpu_queue_depth_=16) and the host-copy
-  // allocation (per-task since ee53b56f). Do not raise this past 64.
-  for (unsigned nb : {8u, 32u, 64u}) {
-    const clio::run::u64 per = 4 * 1024;            // 4 pages per block
+  // Runs to 128 blocks, the spec's maximum. Each block gets as many cache
+  // slots as it has pages, so this axis measures BLOCK COUNT alone.
+  //
+  // Eviction at high block counts is a separate, still-open bug: with fewer
+  // slots than pages, 128 blocks hangs while 64 passes, and 128 blocks WITH
+  // enough slots (here) passes cleanly. So it is the evicting fault path
+  // under concurrency, not the block count -- the oversubscribed scenarios
+  // above deliberately stay at block counts that pass.
+  for (unsigned nb : {8u, 32u, 64u, 128u}) {
+    const clio::run::u64 per = 2 * 1024;            // 2 pages per block
     const clio::run::u64 n = per * nb;
     gv::Vector<clio::run::u32> mv("gv_multi" + std::to_string(nb), {0},
                                   kPageBytes, /*nblocks=*/nb,
