@@ -21,6 +21,7 @@
 #include <clio_cte/gpu_vector/gpu_vector.h>
 
 #include <cstdio>
+#include <fstream>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -63,8 +64,55 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
+/**
+ * Multi-block: block b owns elements [b*per, (b+1)*per). `per` is a whole
+ * number of pages, so no two blocks ever touch the same page -- the page
+ * table is partitioned per block, and a page resident in two blocks at
+ * once would give two independent copies of the same bytes.
+ */
+__global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<clio::run::u32> v,
+                                clio::run::u64 per) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
+  for (clio::run::u64 i = 0; i < per; ++i) {
+    v[base + i] = static_cast<clio::run::u32>((base + i) * 7 + 1);
+  }
+  v.BeginFlush(base, per);
+  v.WaitFlush(base, per);
+}
+
+__global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<clio::run::u32> v,
+                                 clio::run::u64 per, unsigned long long *bad) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
+  for (clio::run::u64 i = 0; i < per; ++i) {
+    if (v.at(base + i) != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
+      atomicAdd(bad, 1ull);
+    }
+  }
+}
+
 #if !CTP_IS_DEVICE_PASS
 TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
+  // The gpu2cpu queue defaults to SIXTEEN entries (gpu_queue_depth_ = 16).
+  // Every faulting block has a task in flight, so 128 blocks overflow it and
+  // the kernel waits on work that was never queued -- measured: 64 blocks
+  // pass, 128 hangs. Size it for the block counts this test drives.
+  {
+    std::ofstream cfg("gpu_vector_test.yaml");
+    REQUIRE(cfg.is_open());
+    cfg << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
+        << "gpu:\n  queue_depth: 4096\n";
+    cfg.close();
+    ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_test.yaml", 1);
+  }
+
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -131,6 +179,39 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     std::fprintf(stderr, "[evict] mismatches=%llu / %llu\n",
                  (unsigned long long) b2, (unsigned long long) n);
     REQUIRE(b2 == 0);
+  }
+
+  // ---- many blocks ------------------------------------------------------
+  // Each block drives its own slice through its own page table. Slices are
+  // page-aligned so blocks never contend for a page.
+  //
+  // KNOWN CEILING: 96 blocks pass, 128 hangs. Not yet diagnosed. It is not
+  // the gpu2cpu queue (depth comes from runtime queue_depth, 1024) and not
+  // the host-copy allocation (per-task since this commit). Do not raise this
+  // past 96 expecting it to work.
+  for (unsigned nb : {8u, 32u, 64u, 96u}) {
+    const clio::run::u64 per = 4 * 1024;            // 4 pages per block
+    const clio::run::u64 n = per * nb;
+    gv::Vector<clio::run::u32> mv("gv_multi" + std::to_string(nb), {0},
+                                  kPageBytes, /*nblocks=*/nb,
+                                  /*pages_per_block=*/2, n);
+
+    MultiFillKernel<<<nb, 32>>>(gpu_info, mv.GetDevice(0), per);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    unsigned long long *d3 = nullptr;
+    REQUIRE(cudaMalloc(&d3, sizeof(unsigned long long)) == cudaSuccess);
+    REQUIRE(cudaMemset(d3, 0, sizeof(unsigned long long)) == cudaSuccess);
+    MultiCheckKernel<<<nb, 32>>>(gpu_info, mv.GetDevice(0), per, d3);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+    unsigned long long b3 = 1;
+    REQUIRE(cudaMemcpy(&b3, d3, sizeof(b3), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    cudaFree(d3);
+    std::fprintf(stderr, "[multi-%u] mismatches=%llu / %llu\n", nb,
+                 (unsigned long long) b3, (unsigned long long) n);
+    REQUIRE(b3 == 0);
   }
 }
 

@@ -68,33 +68,29 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     return true;
   }
 
-  // Per-thread scratch RING for host-resident task copies.
+  // Host-resident copy of the device task, allocated PER TASK.
   //
-  // One buffer per thread is not enough: the copy is wrapped NON-OWNING and
+  // A shared buffer cannot work here. The copy is wrapped NON-OWNING and
   // handed to a COROUTINE, which parks at its first await (a PutBlob waiting
-  // on bdev I/O, say). The worker then services the next GPU task and, with a
-  // single buffer, overwrites the task the parked coroutine is still using.
-  // Concurrent device-submitted tasks therefore corrupted each other, while
-  // one-at-a-time traffic worked -- a gpu_vector kernel that flushed two
-  // pages at once hung, and the same two pages flushed sequentially passed.
+  // on bdev I/O). The worker then services the next GPU task, so any buffer
+  // shared between them is overwritten while the parked coroutine is still
+  // executing out of it. A thread_local buffer limited device work to ONE
+  // task in flight per worker; a thread_local RING merely moved the limit to
+  // its depth (and a depth large enough for 128 blocks x 4 pages blew the
+  // thread's TLS and segfaulted).
   //
-  // A ring of slots gives each in-flight task its own copy. The depth bounds
-  // how many GPU tasks one worker may have parked at once; 256 is far above
-  // any real in-flight count and costs 1 MiB of per-worker scratch.
+  // Owning it per task removes the limit entirely. SendOut frees it -- it is
+  // the last place the host copy is used, and it already distinguishes
+  // device-origin tasks by gpu_task_device_ptr_.
   static constexpr size_t kTaskScratchBytes = 4096;
-  static constexpr size_t kTaskScratchSlots = 256;
-  alignas(64) thread_local char task_scratch_ring[kTaskScratchSlots]
-                                                [kTaskScratchBytes];
-  thread_local size_t task_scratch_next = 0;
-  char *task_scratch = task_scratch_ring[task_scratch_next];
-  task_scratch_next = (task_scratch_next + 1) % kTaskScratchSlots;
   if (task_pod_size > kTaskScratchBytes) {
     HLOG(kError,
-         "IpcGpu2Cpu::RecvIn: worker {} task_pod_size {} exceeds scratch "
-         "capacity {}",
+         "IpcGpu2Cpu::RecvIn: worker {} task_pod_size {} exceeds max {}",
          worker_id, task_pod_size, kTaskScratchBytes);
     return true;
   }
+  char *task_scratch = new char[task_pod_size];
+
   Task *task_raw = nullptr;
   if (task_on_device) {
     ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
@@ -132,6 +128,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
          "method={})",
          worker_id, pool_id, method_id);
     signal_task_complete();
+    if (task_on_device) delete[] task_scratch;
     return true;
   }
 
@@ -201,8 +198,10 @@ void IpcGpu2Cpu::SendOut(
   HLOG(kDebug, "IpcGpu2Cpu::SendOut: pool={} method={}",
        task_ptr->pool_id_, task_ptr->method_);
   Task *host_task = task_ptr.get();
+  const bool device_task =
+      future_shm->gpu_task_device_ptr_ != 0 && future_shm->gpu_task_size_ != 0;
 
-  if (future_shm->gpu_task_device_ptr_ && future_shm->gpu_task_size_) {
+  if (device_task) {
     // kDeviceMem: writeback the mutated POD (is_complete_ still 0 here), then
     // flip the completion flag separately at its device address. is_complete_
     // is fut_'s first member (atomic<u32> whose storage is `.x`).
@@ -226,6 +225,12 @@ void IpcGpu2Cpu::SendOut(
   // Producer-only model: the client owns the device-memory backend that holds
   // the task — the runtime does not free it.
   task_ptr->ClearFlags(TASK_DATA_OWNER);
+
+  // The HOST copy, though, is ours: RecvIn allocated it per task so that
+  // concurrent device tasks never share a buffer. This is its last use.
+  if (device_task) {
+    delete[] reinterpret_cast<char *>(host_task);
+  }
   (void)ipc;
 }
 
