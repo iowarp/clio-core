@@ -65,6 +65,7 @@ struct Cfg {
   uint64_t layers = 12, experts = 32, slice_bytes = 4ull << 20;
   uint64_t hbm_mb = 2048;
   uint64_t slab_mb = 512;    // decompressed span cache (--slab-mb)
+  bool in_kernel = false;    // read through the vector's device API
   uint64_t tokens = 64, k_sel = 4;
   double fill_const_frac = 0.5;   // fraction of each 64B chunk that repeats
   uint64_t seed = 12345;
@@ -117,6 +118,66 @@ uint64_t SliceSum(uint64_t bytes, uint64_t slice_id, double frac) {
 
 }  // namespace
 
+/**
+ * IN-KERNEL vector read (--in-kernel): the kernel reads the slice THROUGH
+ * the vector's device API, faulting pages on demand from inside the kernel,
+ * with NO host staging at all. This is the mode where the kernel indexes a
+ * logical array larger than device memory; the default mode below has the
+ * host stage a slice and hands the kernel a plain pointer, which never
+ * exercises the device-side path.
+ */
+__global__ void ConsumeKernelVec(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceView<uint8_t> view,
+                                 const uint64_t *access, uint64_t n_access,
+                                 uint64_t slice_bytes,
+                                 unsigned long long *out) {
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  auto fam = [] (const gv::DeviceViewBase &b, uint64_t pg) {
+    return gv::FamilyOf(b, pg);
+  };
+  cte::gpu::dev::vector<uint8_t, decltype(fam)> W(view, g_ipc_manager_ptr,
+                                                  fam);
+  // read_range is WARP-collective and keeps its resolved page in ONE
+  // __shared__ slot per block, so exactly one warp may drive it; a second
+  // warp on a different page overwrites that slot mid-read (illegal
+  // access). The block-wide pattern is therefore: warp 0 pulls a chunk
+  // through the vector into shared memory, the whole block consumes it.
+  // The page is sized to the access granularity, so warp 0 never leaves
+  // one page during a slice and its faults are one page each.
+  constexpr uint32_t kChunk = 16384;
+  __shared__ uint8_t stage[kChunk];
+  __shared__ unsigned long long block_sum;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t warp = tid >> 5;
+  if (tid == 0) block_sum = 0;
+  __syncthreads();
+
+  // ONE launch for the WHOLE workload: each CUDA block owns one vector
+  // cache block and walks its stride of the access stream, faulting pages
+  // in from inside the kernel as it goes.
+  for (uint64_t i = blockIdx.x; i < n_access; i += gridDim.x) {
+    const uint64_t base = access[i] * slice_bytes;
+    for (uint64_t off = 0; off < slice_bytes; off += kChunk) {
+      const uint64_t lo = base + off;
+      const uint64_t hi = lo + kChunk;
+      if (warp == 0) {
+        W.read_range(lo, hi, [&](uint64_t idx, uint8_t v) {
+          stage[idx - lo] = v;
+        });
+      }
+      __syncthreads();
+      unsigned long long local = 0;
+      for (uint32_t j = tid; j < kChunk; j += blockDim.x) local += stage[j];
+      for (int o = 16; o > 0; o >>= 1) {
+        local += __shfl_xor_sync(0xffffffff, local, o);
+      }
+      if ((tid & 31u) == 0) atomicAdd(&block_sum, local);
+      __syncthreads();
+    }
+  }
+  if (tid == 0) atomicAdd(out, block_sum);
+}
+
 /** The dequant-read stand-in: block-strided byte reduce into a u64. */
 __global__ void ConsumeKernel(const uint8_t *src, uint64_t bytes,
                               unsigned long long *out) {
@@ -149,6 +210,8 @@ int main(int argc, char **argv) {
       c.layers = val("layers");
     } else if (a == "--experts") {
       c.experts = val("experts");
+    } else if (a == "--in-kernel") {
+      c.in_kernel = true;
     } else if (a == "--slab-mb") {
       c.slab_mb = val("slab");
     } else if (a == "--page-mb") {
@@ -168,14 +231,27 @@ int main(int argc, char **argv) {
     c.layers = 24;
     c.hbm_mb = 700;                       // even compressed spills
   }
+  // MODE 2 page sizing: read_range keeps its resolved page in ONE
+  // __shared__ slot per block, so warps that are on DIFFERENT pages stomp
+  // each other's pointer (illegal access). Sizing the page to the access
+  // granularity means every warp in a block is inside the SAME page for
+  // the whole call -- they all resolve the identical Page*, so the shared
+  // slot is written with one value and the block can run wide.
   const bool prefetch_on = !(c.k_sel >> 63);
   c.k_sel &= ~(1ull << 63);
+  if (c.in_kernel) kPage = c.slice_bytes;   // one page == one slice
   const uint64_t slices = c.layers * c.experts;
   const uint64_t data_bytes = slices * c.slice_bytes;
   const uint64_t pages_per_slice = c.slice_bytes / kPage;
   const uint64_t num_pages = data_bytes / kPage;
 
-  // ---- compose: compressor 600 (nvcomp-lz4) -> core 512 [hbm + ram] ----
+  // ---- compose: compressor 600 -> core 512 [hbm + ram] ----
+  // MODE 2 pins a HOST codec. In-kernel faulting parks the user kernel on
+  // the SMs spin-waiting for its page, and a GPU codec must LAUNCH a
+  // decompress kernel to satisfy that page -- which cannot schedule behind
+  // the spinning kernel. Deadlock, reproduced here as a hang. A host codec
+  // decompresses on the CPU, so the fault completes without needing the
+  // GPU. (Mode 1 never spins on the device, so it keeps nvcomp.)
   {
     std::string cfg_path =
         "/tmp/clio_cfb_compose_" + std::to_string((long) ::getpid()) + ".yaml";
@@ -186,7 +262,9 @@ int main(int argc, char **argv) {
         << "  - mod_name: clio_cte_compressor\n"
         << "    pool_name: cte_compressor\n    pool_query: local\n"
         << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n"
-        << "    compress_lib: \"nvcomp-lz4\"\n    compress_preset: 2\n\n"
+        << "    compress_lib: \""
+        << (c.in_kernel ? "lz4" : "nvcomp-lz4")
+        << "\"\n    compress_preset: 2\n\n"
         << "  - mod_name: clio_cte_core\n"
         << "    pool_name: cte_core\n    pool_query: local\n"
         << "    pool_id: \"512.0\"\n"
@@ -246,10 +324,24 @@ int main(int argc, char **argv) {
   // ---- seed pages through the storage pool (hot slices first) ----
   const clio::run::PoolId storage_pool =
       c.compressed ? clio::run::PoolId(600, 0) : clio::run::PoolId(0, 0);
-  gv::Vector<uint8_t> vec("cfb_data", /*nblocks=*/1, /*gpu_id=*/0,
-                          /*gpu_pages_per_block=*/8,
+  // MODE 2 needs a vector configured for ON-DEVICE faulting:
+  //  - kAsync: only that mode does the CacheManagerKernel warmup launch,
+  //    without which the cache thread's first cross-thread launch races a
+  //    spin-waiting read_range.
+  //  - several cache blocks: read_range indexes the page table by blockIdx,
+  //    so the grid is capped at nblocks -- one block would serialize the
+  //    whole workload onto one SM.
+  //  - a real per-block cache, since every span faults through it.
+  const clio::run::u32 nblk = c.in_kernel ? 8u : 1u;
+  const clio::run::u32 ppb =
+      c.in_kernel ? (clio::run::u32) ((c.hbm_mb << 20) / kPage / nblk / 2)
+                  : 8u;
+  gv::Vector<uint8_t> vec("cfb_data", nblk, /*gpu_id=*/0,
+                          /*gpu_pages_per_block=*/ppb < 8 ? 8 : ppb,
                           /*host_pages_per_block=*/0, kPage,
-                          /*cache_period_us=*/1000000, gv::CacheMode::kLegacy,
+                          /*cache_period_us=*/c.in_kernel ? 200 : 1000000,
+                          c.in_kernel ? gv::CacheMode::kAsync
+                                      : gv::CacheMode::kLegacy,
                           /*manager_threads_per_block=*/32,
                           /*allow_cold_miss_fault=*/true, storage_pool,
                           /*family_pages=*/num_pages);
@@ -383,6 +475,79 @@ int main(int argc, char **argv) {
     }
     while (reorgs.size() > 256) drain_one();
   };
+  // In-kernel mode needs the GPU IPC handle and a grid capped at the
+  // vector's cache-block count (read_range indexes the page table by
+  // blockIdx, so a wider grid would have several CUDA blocks racing one
+  // cache block).
+  auto *gpu_ipc = CLIO_CPU_IPC->GetGpuIpcManager();
+  clio::run::IpcManagerGpuInfo gpu_info{};
+  if (gpu_ipc != nullptr) {
+    gpu_info = gpu_ipc->GetGpuInfo(0);
+  } else if (c.in_kernel) {
+    // A default-constructed handle would be dereferenced by the kernel's
+    // fault path -- fail loudly rather than as an illegal access.
+    std::fprintf(stderr, "CFB: no GPU IPC manager; --in-kernel needs one\n");
+    return 1;
+  }
+  std::fprintf(stderr, "CFB: gpu_ipc=%p nblk=%u ppb=%u pages=%llu\n",
+               (void *) gpu_ipc, nblk, (unsigned) (ppb < 8 ? 8 : ppb),
+               (unsigned long long) num_pages);
+  const unsigned nblocks_grid = nblk;   // one CUDA block per cache block
+  if (c.in_kernel) {
+    // MODE 2: exactly ONE kernel invocation for the entire workload, with
+    // the device vector as its input. Everything the host does here is
+    // setup; no staging, no per-slice launches, no host round trips.
+    uint64_t *d_access = nullptr;
+    if (cudaMalloc(&d_access, access.size() * sizeof(uint64_t)) !=
+            cudaSuccess ||
+        cudaMemcpy(d_access, access.data(),
+                   access.size() * sizeof(uint64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      std::fprintf(stderr, "CFB: access upload failed\n");
+      return 1;
+    }
+    for (uint64_t idx : access) {
+      for (uint64_t p = 0; p < pages_per_slice; ++p) {
+        expected += page_sum[idx * pages_per_slice + p];
+      }
+      fetched += c.slice_bytes;
+    }
+    const uint64_t t_k0 = NowMs();
+    // Wide blocks are safe because the page is sized to the slice: every
+    // warp in the block is inside the same page for the whole read_range,
+    // so they all resolve the identical Page* into the shared slot.
+    ConsumeKernelVec<<<nblocks_grid, 256>>>(gpu_info, vec.Device(), d_access,
+                                            access.size(), c.slice_bytes,
+                                            d_sum);
+    const cudaError_t kerr = cudaDeviceSynchronize();
+    const uint64_t k_ms = NowMs() - t_k0;
+    if (kerr != cudaSuccess) {
+      std::fprintf(stderr, "CFB: in-kernel run failed: %s\n",
+                   cudaGetErrorString(kerr));
+      return 1;
+    }
+    cudaFree(d_access);
+    unsigned long long got_k = 0;
+    cudaMemcpy(&got_k, d_sum, sizeof(got_k), cudaMemcpyDeviceToHost);
+    std::printf(
+        "CFB[in-kernel] case=%c mode=%s data=%.2fGiB hbm_cap=%lluMB | "
+        "seed=%.1fs dev_used=%.2fGiB | launches=1 fetched=%.2fGiB "
+        "run=%.2fs GB/s=%.2f | checksum=%s\n",
+        c.mode_case, c.compressed ? "compressed" : "uncompressed",
+        (double) data_bytes / (1ull << 30), (unsigned long long) c.hbm_mb,
+        seed_ms / 1000.0,
+        (double) ((int64_t) vfree0 - (int64_t) vfree1) / (1ull << 30),
+        (double) fetched / (1ull << 30), k_ms / 1000.0,
+        (double) fetched / (1ull << 30) / (k_ms / 1000.0),
+        got_k == expected ? "OK" : "MISMATCH");
+    if (got_k != expected) {
+      std::printf("CFB expected=%llu got=%llu\n",
+                  (unsigned long long) expected,
+                  (unsigned long long) got_k);
+    }
+    vec.StopManager();
+    return got_k == expected ? 0 : 2;
+  }
   gv::Vector<uint8_t>::FetchList fl;
   std::vector<std::pair<uint8_t *, uint64_t>> batch;   // (dst, slice)
   const uint64_t t_run0b = NowMs();
