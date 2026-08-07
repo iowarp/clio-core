@@ -300,6 +300,12 @@ class Vector {
 #endif
   }
 
+  /** MEASURED stored/original ratio, sampled from the first `n_sample`
+   *  page blobs after assimilation. 0 when unknown (no pages, or the
+   *  sizes are unavailable). Callers use this to size tiers by what the
+   *  data ACTUALLY compresses to instead of a per-model guess. */
+  double MeasuredRatio(clio::run::u64 n_sample = 24);
+
   /** Raise the scores of the pages spanning [off, off+len) so the CTE's
    *  organizer migrates them INTO the top tier (kHbm) before use. This is
    *  the prefetch primitive: a metadata op, never a data copy. Promotions
@@ -1926,6 +1932,41 @@ inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
 #else
   (void) dst_dev; (void) off; (void) len;
   return false;
+#endif
+}
+
+template <typename T>
+inline double Vector<T>::MeasuredRatio(clio::run::u64 n_sample) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_ || view_.base.flat_layout) return 0.0;
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  const clio::run::u64 pages = impl_->mirror_bytes / page;
+  if (pages == 0) return 0.0;
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+  cte.AttachShmCache();
+  // Sample evenly across the model: a prefix would over-weight whatever
+  // the first tensors happen to compress to.
+  const clio::run::u64 n = std::min<clio::run::u64>(n_sample, pages);
+  const clio::run::u64 stride = pages / n;
+  clio::run::u64 stored = 0, seen = 0;
+  for (clio::run::u64 k = 0; k < n; ++k) {
+    // The SHM record's total_size_ is the STORED byte count (for a
+    // transformed blob, post-transform); GetBlobSize reports the LOGICAL
+    // size, which for a compressed blob is the original and would measure
+    // every model as incompressible (observed: ratio 0.96).
+    clio::cte::core::ShmBlobRecord rec;
+    if (cte.TryGetBlobRecordShm(view_.base.tag_id, PageBlobName(k * stride),
+                                &rec) &&
+        rec.total_size_ > 0) {
+      stored += rec.total_size_;
+      ++seen;
+    }
+  }
+  if (seen == 0) return 0.0;
+  return (double) stored / (double) (seen * page);
+#else
+  (void) n_sample;
+  return 0.0;
 #endif
 }
 
