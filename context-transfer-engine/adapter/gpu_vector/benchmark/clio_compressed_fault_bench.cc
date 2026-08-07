@@ -66,6 +66,7 @@ struct Cfg {
   uint64_t hbm_mb = 2048;
   uint64_t slab_mb = 512;    // decompressed span cache (--slab-mb)
   bool in_kernel = false;    // read through the vector's device API
+  uint64_t blocks = 8;       // cache blocks == CUDA grid width (--blocks)
   uint64_t tokens = 64, k_sel = 4;
   double fill_const_frac = 0.5;   // fraction of each 64B chunk that repeats
   uint64_t seed = 12345;
@@ -205,6 +206,8 @@ int main(int argc, char **argv) {
       layers_explicit = true;
     } else if (a == "--experts") {
       c.experts = val("experts");
+    } else if (a == "--blocks") {
+      c.blocks = val("blocks");
     } else if (a == "--in-kernel") {
       c.in_kernel = true;
     } else if (a == "--slab-mb") {
@@ -327,12 +330,22 @@ int main(int argc, char **argv) {
   //    so the grid is capped at nblocks -- one block would serialize the
   //    whole workload onto one SM.
   //  - a real per-block cache, since every span faults through it.
-  const clio::run::u32 nblk = c.in_kernel ? 8u : 1u;
-  const clio::run::u32 ppb =
-      c.in_kernel ? (clio::run::u32) ((c.hbm_mb << 20) / kPage / nblk / 2)
-                  : 8u;
+  // GRID WIDTH == cache-block count. read_range indexes the page table by
+  // BlockIdx() (blockIdx.x % nblocks), so N CUDA blocks over N cache
+  // blocks gives each its own page table; a wider grid makes several CUDA
+  // blocks share one, which is legal but contended.
+  const clio::run::u32 nblk = c.in_kernel ? (clio::run::u32) c.blocks : 1u;
+  // Pages per cache block from a FIXED total cache, divided by the block
+  // count -- not a per-block floor. With a floor the cache grew with the
+  // grid (256 blocks x 8 pages x 4 MiB = 8 GiB) and simply ran the device
+  // out of memory, which looked like a scaling limit and was not one.
+  const clio::run::u64 cache_pages = (c.hbm_mb << 20) / kPage / 2;
+  clio::run::u32 ppb = c.in_kernel
+      ? (clio::run::u32) (cache_pages / (nblk ? nblk : 1))
+      : 8u;
+  if (ppb < 2) ppb = 2;
   gv::Vector<uint8_t> vec("cfb_data", nblk, /*gpu_id=*/0,
-                          /*gpu_pages_per_block=*/ppb < 8 ? 8 : ppb,
+                          /*gpu_pages_per_block=*/ppb,
                           /*host_pages_per_block=*/0, kPage,
                           /*cache_period_us=*/c.in_kernel ? 200 : 1000000,
                           c.in_kernel ? gv::CacheMode::kAsync
@@ -484,8 +497,10 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "CFB: no GPU IPC manager; --in-kernel needs one\n");
     return 1;
   }
-  std::fprintf(stderr, "CFB: gpu_ipc=%p nblk=%u ppb=%u pages=%llu\n",
-               (void *) gpu_ipc, nblk, (unsigned) (ppb < 8 ? 8 : ppb),
+  std::fprintf(stderr,
+               "CFB: nblk=%u ppb=%u cache=%.0fMiB pages=%llu\n",
+               nblk, (unsigned) ppb,
+               (double) nblk * ppb * kPage / (1024.0 * 1024.0),
                (unsigned long long) num_pages);
   const unsigned nblocks_grid = nblk;   // one CUDA block per cache block
   if (c.in_kernel) {
