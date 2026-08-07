@@ -874,3 +874,33 @@ set_tests_properties(cae_pagify PROPERTIES
   TIMEOUT 60
   LABELS "coverage;cae;pagemap;pagify"
 )
+
+#------------------------------------------------------------------------------
+# pagify through the CAE's CTE interceptor (end to end)
+#------------------------------------------------------------------------------
+add_executable(test_cae_pagify
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_pagify.cc
+)
+
+target_include_directories(test_cae_pagify
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_pagify
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_cae_pagify DESTINATION bin)
+
+add_test(NAME cae_pagify_interpose COMMAND test_cae_pagify)
+set_tests_properties(cae_pagify_interpose PROPERTIES
+  TIMEOUT 120
+  LABELS "coverage;cae;pagify;interpose"
+)
