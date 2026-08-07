@@ -81,6 +81,30 @@ bool MemBdevTransport::Init(const CreateParams& params,
                                                             : params.alignment_;
   allocator_.Init(num_workers, ram_capacity_, align);
 
+#if CTP_ENABLE_GPU
+  // Allocate every device page NOW, before any consumer kernel can be
+  // resident on the GPU.
+  //
+  // cudaMalloc is a device-synchronizing call: it cannot return while a
+  // kernel is executing. A demand-paged GPU consumer (gpu_vector) spins
+  // in-kernel waiting for a fault to be serviced, and servicing that fault
+  // is what would reach the lazy cudaMalloc below -- a circular wait that
+  // hangs the process. It is worse than one stuck worker, because the
+  // allocation happens under ram_pages_mu_, so every other worker piles up
+  // behind it and the runtime stops draining its queue entirely.
+  //
+  // Faulting the pages in here costs nothing extra (the tier is sized to be
+  // filled) and makes the read/write paths allocation-free by construction.
+  if (bdev_type_ == BdevType::kHbm &&
+      ram_capacity_ != std::numeric_limits<clio::run::u64>::max()) {
+    const size_t npages =
+        (size_t) ((ram_capacity_ + kRamPageSize - 1) / kRamPageSize);
+    for (size_t i = 0; i < npages; ++i) {
+      GetRamPage(i);   // allocates; falls back to host RAM on VRAM exhaustion
+    }
+  }
+#endif
+
   // issue #783: back a plain RAM device with shared memory so client processes
   // can read blob payloads directly.
   //

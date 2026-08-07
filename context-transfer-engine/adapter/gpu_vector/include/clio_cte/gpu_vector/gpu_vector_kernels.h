@@ -425,6 +425,10 @@ CTP_GPU_FUN void FlushAllInBlock(::clio::run::gpu::IpcManager *ipc,
   }
 }
 
+/** Returned by EvictSlot* when no slot could be claimed; the caller must
+ *  re-check the cache and retry rather than treat it as a slot index. */
+constexpr clio::run::u32 kNoSlot = 0xFFFFFFFFu;
+
 /**
  * Pick a victim slot (free first, else LRU) within a single tier.
  * Drains any in-flight ops on it before returning so the caller can
@@ -477,16 +481,37 @@ CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
   // legitimate victim here: claiming it and DrainGet-ing below waits out its
   // fetch before reuse, which also reclaims prefetched pages that were never
   // accessed and would otherwise hold their slots forever.
-  for (;;) {
-    if (lru != tier_hi && detail::TryAcquireBusy(&b->pages[lru])) break;
+  // BOUNDED. This loop used to spin forever when EVERY slot carried
+  // kPageBusy, which is reachable whenever a block has few slots: the
+  // async cache manager can hold them for its prefetch, and it only
+  // clears them from a kernel that may not be scheduled while this one is
+  // spinning. That is a hard hang, and it is what made the in-kernel
+  // benchmark fail non-deterministically above 16 blocks (2 slots per
+  // block: 32 blocks passed twice, then hung).
+  //
+  // Give the holders a bounded window to finish, then report failure so
+  // the CALLER can re-check the cache and retry -- the page it wants may
+  // well have arrived in the meantime. A wrong answer is not on the table
+  // either way; the choice is between progress and a wedge.
+  constexpr int kClaimRounds = 4096;
+  bool claimed = false;
+  for (int round = 0; round < kClaimRounds; ++round) {
+    if (lru != tier_hi && detail::TryAcquireBusy(&b->pages[lru])) {
+      claimed = true;
+      break;
+    }
     lru = tier_hi;
     for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
       Page *p = &b->pages[s];
       if (p->flags & kPageBusy) continue;      // owned by someone else
-      if (detail::TryAcquireBusy(p)) { lru = s; break; }
+      if (detail::TryAcquireBusy(p)) { lru = s; claimed = true; break; }
     }
-    if (lru != tier_hi) break;
+    if (claimed) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __nanosleep(64);
+#endif
   }
+  if (!claimed) return kNoSlot;
   DrainPut(&b->pages[lru]);
   DrainGet(&b->pages[lru], (DeviceViewBase *) &v.base);
   if (b->pages[lru].modify_max >= 0)
@@ -524,6 +549,11 @@ CTP_GPU_FUN Page *BlockFaultPage(::clio::run::gpu::IpcManager *ipc,
   const clio::run::u32 total = TotalPagesPerBlock(v.base);
   // One thread mutates the page table for the entire block.
   if (threadIdx.x == 0) {
+    // Retry across the whole resolve: a failed claim means every slot was
+    // held, and the page we want may arrive (or a slot free up) while we
+    // wait. Re-checking the cache each round is what turns a wedge into
+    // progress.
+    for (int attempt = 0; attempt < 64; ++attempt) {
     Page *hit = nullptr;
     for (clio::run::u32 s = 0; s < total; ++s) {
       Page *p = &b->pages[s];
@@ -534,6 +564,12 @@ CTP_GPU_FUN Page *BlockFaultPage(::clio::run::gpu::IpcManager *ipc,
     }
     if (hit == nullptr) {
       const clio::run::u32 slot = EvictSlot(ipc, v, block_idx);
+      if (slot == kNoSlot) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(256);
+#endif
+        continue;                       // re-check, then try again
+      }
       Page *p = &b->pages[slot];
       p->page_idx = target_page;
       if (v.base.stats) {
@@ -547,6 +583,8 @@ CTP_GPU_FUN Page *BlockFaultPage(::clio::run::gpu::IpcManager *ipc,
       detail::ReleaseBusy(p);
     } else {
       DrainGet(hit, const_cast<DeviceViewBase *>(&v.base));
+    }
+    break;                              // page is resident
     }
   }
   __syncthreads();
