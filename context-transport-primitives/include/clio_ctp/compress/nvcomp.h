@@ -42,6 +42,8 @@
 #include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
+#include <nvcomp/lz4.h>
+#include <lz4.h>
 #include <nvcomp/snappy.hpp>
 #include <nvcomp/zstd.hpp>
 
@@ -82,6 +84,232 @@ enum class NvCompAlgo {
  * The compressed bitstream uses NVCOMP_NATIVE (self-describing) format, so
  * Decompress reconstructs the manager directly from the compressed bytes.
  */
+/**
+ * Raw batched-LZ4 frame codec (nvcomp LOW-LEVEL API).
+ *
+ * The Manager API costs a device-scratch cudaMalloc per manager and hides a
+ * stream sync inside configure_decompression PER FRAME -- which caps any
+ * batched decompress at one-frame-at-a-time speed (~1 GB/s measured). The
+ * low-level nvcompBatchedLZ4* API decompresses EVERY chunk of EVERY frame in
+ * a batch with one launch.
+ *
+ * Frame layout (written after the caller's own headers):
+ *   RawLz4Table  { magic, nchunks, chunk payload sizes }   (host-readable)
+ *   packed compressed chunk payloads
+ * Chunks are 64 KiB of uncompressed data (last one short). The table is
+ * fixed-size so a caller holding only the first ~300 bytes of a frame on the
+ * host can drive a fully device-side batched decompress.
+ */
+namespace raw_lz4 {
+
+constexpr uint32_t kMagic = 0x43344252u;   // 'RB4C'
+constexpr size_t kChunk = 64 * 1024;
+constexpr size_t kMaxChunks = 64;          // frames up to 4 MiB
+
+struct Table {
+  uint32_t magic;
+  uint32_t nchunks;
+  uint32_t comp_bytes[kMaxChunks];
+};
+
+/** Growable per-thread device scratch (never freed; sized to high water). */
+inline void *DevScratch(size_t bytes) {
+  static thread_local void *buf = nullptr;
+  static thread_local size_t cap = 0;
+  if (bytes > cap) {
+    if (buf) cudaFree(buf);
+    if (cudaMalloc(&buf, bytes) != cudaSuccess) {
+      buf = nullptr;
+      cap = 0;
+      return nullptr;
+    }
+    cap = bytes;
+  }
+  return buf;
+}
+inline cudaStream_t RawStream() {
+  static thread_local cudaStream_t s = nullptr;
+  if (s == nullptr && cudaStreamCreate(&s) != cudaSuccess) s = nullptr;
+  return s;
+}
+
+/** Compress `in_size` HOST bytes into `out` (host): Table + packed chunks.
+ *  Returns compressed frame size (Table included), or 0 on failure. */
+inline size_t CompressFrame(const void *in, size_t in_size, void *out,
+                            size_t out_cap) {
+  if (in_size == 0 || in_size > kChunk * kMaxChunks) return 0;
+  cudaStream_t stream = RawStream();
+  if (!stream) return 0;
+  const size_t n = (in_size + kChunk - 1) / kChunk;
+  size_t max_out = 0;
+  nvcompBatchedLZ4CompressGetMaxOutputChunkSize(kChunk,
+                                                nvcompBatchedLZ4DefaultOpts,
+                                                &max_out);
+  size_t temp = 0;
+  nvcompBatchedLZ4CompressGetTempSize(n, kChunk, nvcompBatchedLZ4DefaultOpts,
+                                      &temp);
+  // Scratch layout: [in n*kChunk][out n*max_out][temp]
+  //                 [in_ptrs n][in_sizes n][out_ptrs n][out_sizes n]
+  const size_t arr = n * (sizeof(void *) * 2 + sizeof(size_t) * 2);
+  uint8_t *d = (uint8_t *) DevScratch(n * kChunk + n * max_out + temp + arr +
+                                      256);
+  if (!d) return 0;
+  uint8_t *d_in = d;
+  uint8_t *d_out = d_in + n * kChunk;
+  uint8_t *d_temp = d_out + n * max_out;
+  uint8_t *d_arr = d_temp + temp;
+  if (cudaMemcpyAsync(d_in, in, in_size, cudaMemcpyHostToDevice, stream) !=
+      cudaSuccess) {
+    return 0;
+  }
+  std::vector<const void *> h_inp(n);
+  std::vector<size_t> h_ins(n);
+  std::vector<void *> h_outp(n);
+  for (size_t c = 0; c < n; ++c) {
+    h_inp[c] = d_in + c * kChunk;
+    h_ins[c] = (c + 1 < n) ? kChunk : (in_size - c * kChunk);
+    h_outp[c] = d_out + c * max_out;
+  }
+  auto *d_inp = (const void **) d_arr;
+  auto *d_ins = (size_t *) (d_arr + n * sizeof(void *));
+  auto *d_outp = (void **) (d_arr + n * (sizeof(void *) + sizeof(size_t)));
+  auto *d_outs =
+      (size_t *) (d_arr + n * (sizeof(void *) * 2 + sizeof(size_t)));
+  cudaMemcpyAsync(d_inp, h_inp.data(), n * sizeof(void *),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_ins, h_ins.data(), n * sizeof(size_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_outp, h_outp.data(), n * sizeof(void *),
+                  cudaMemcpyHostToDevice, stream);
+  if (nvcompBatchedLZ4CompressAsync(d_inp, d_ins, kChunk, n, d_temp, temp,
+                                    d_outp, d_outs,
+                                    nvcompBatchedLZ4DefaultOpts,
+                                    stream) != nvcompSuccess) {
+    return 0;
+  }
+  std::vector<size_t> h_outs(n);
+  cudaMemcpyAsync(h_outs.data(), d_outs, n * sizeof(size_t),
+                  cudaMemcpyDeviceToHost, stream);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+  Table tbl{};
+  tbl.magic = kMagic;
+  tbl.nchunks = (uint32_t) n;
+  size_t total = sizeof(Table);
+  for (size_t c = 0; c < n; ++c) {
+    tbl.comp_bytes[c] = (uint32_t) h_outs[c];
+    total += h_outs[c];
+  }
+  if (total > out_cap) return 0;
+  std::memcpy(out, &tbl, sizeof(Table));
+  uint8_t *w = (uint8_t *) out + sizeof(Table);
+  for (size_t c = 0; c < n; ++c) {
+    if (cudaMemcpyAsync(w, h_outp[c], h_outs[c], cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
+      return 0;
+    }
+    w += h_outs[c];
+  }
+  if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+  return total;
+}
+
+/** One frame of a device-side batched decompress. `frame_dev` points at the
+ *  Table INSIDE device memory; `table` is the same bytes host-side (the
+ *  caller already pulled its headers). */
+struct FrameRef {
+  const uint8_t *frame_dev;
+  const Table *table;
+  uint8_t *out_dev;
+  size_t out_size;
+};
+
+/** Decompress every chunk of every frame with ONE nvcomp launch on `stream`.
+ *  No sync: the caller owns completion. Returns false on setup failure. */
+inline bool DecompressBatch(const FrameRef *frames, size_t nf,
+                            cudaStream_t stream) {
+  if (nf == 0) return true;
+  size_t chunks = 0;
+  for (size_t f = 0; f < nf; ++f) chunks += frames[f].table->nchunks;
+  if (chunks == 0) return true;
+  size_t temp = 0;
+  nvcompBatchedLZ4DecompressGetTempSize(chunks, kChunk, &temp);
+  const size_t arr =
+      chunks * (sizeof(void *) * 2 + sizeof(size_t) * 3) +
+      chunks * sizeof(nvcompStatus_t);
+  uint8_t *d = (uint8_t *) DevScratch(temp + arr + 256);
+  if (!d) return false;
+  uint8_t *d_temp = d;
+  uint8_t *d_arr = d + temp;
+  std::vector<const void *> h_cptr(chunks);
+  std::vector<size_t> h_csz(chunks), h_usz(chunks);
+  std::vector<void *> h_uptr(chunks);
+  size_t k = 0;
+  for (size_t f = 0; f < nf; ++f) {
+    const Table *t = frames[f].table;
+    const uint8_t *payload = frames[f].frame_dev + sizeof(Table);
+    size_t out_off = 0;
+    for (uint32_t c = 0; c < t->nchunks; ++c, ++k) {
+      h_cptr[k] = payload;
+      h_csz[k] = t->comp_bytes[c];
+      const size_t usz = (c + 1 < t->nchunks)
+                             ? kChunk
+                             : (frames[f].out_size - out_off);
+      h_usz[k] = usz;
+      h_uptr[k] = frames[f].out_dev + out_off;
+      payload += t->comp_bytes[c];
+      out_off += usz;
+    }
+  }
+  auto *d_cptr = (const void **) d_arr;
+  auto *d_csz = (size_t *) (d_arr + chunks * sizeof(void *));
+  auto *d_usz = (size_t *) (d_arr + chunks * (sizeof(void *) + sizeof(size_t)));
+  auto *d_act =
+      (size_t *) (d_arr + chunks * (sizeof(void *) + 2 * sizeof(size_t)));
+  auto *d_uptr =
+      (void **) (d_arr + chunks * (sizeof(void *) + 3 * sizeof(size_t)));
+  auto *d_status = (nvcompStatus_t *) (d_arr + chunks * (2 * sizeof(void *) +
+                                                         3 * sizeof(size_t)));
+  cudaMemcpyAsync(d_cptr, h_cptr.data(), chunks * sizeof(void *),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_csz, h_csz.data(), chunks * sizeof(size_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_usz, h_usz.data(), chunks * sizeof(size_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_uptr, h_uptr.data(), chunks * sizeof(void *),
+                  cudaMemcpyHostToDevice, stream);
+  return nvcompBatchedLZ4DecompressAsync(d_cptr, d_csz, d_usz, d_act, chunks,
+                                         d_temp, temp, d_uptr, d_status,
+                                         stream) == nvcompSuccess;
+}
+
+/** HOST-side decode of a raw frame (table + payload on the host): nvcomp's
+ *  batched-LZ4 chunks are standard LZ4 blocks, so plain LZ4_decompress_safe
+ *  handles them. Keeps host consumers (DRAM-tier fills, host GetBlobs)
+ *  working on frames written by the GPU compressor. */
+inline bool DecompressFrameHost(const void *frame, size_t frame_size,
+                                void *out, size_t out_size) {
+  const auto *t = reinterpret_cast<const Table *>(frame);
+  if (frame_size < sizeof(Table) || t->magic != kMagic ||
+      t->nchunks == 0 || t->nchunks > kMaxChunks) {
+    return false;
+  }
+  const char *payload = reinterpret_cast<const char *>(frame) + sizeof(Table);
+  size_t out_off = 0;
+  for (uint32_t c = 0; c < t->nchunks; ++c) {
+    const size_t usz =
+        (c + 1 < t->nchunks) ? kChunk : (out_size - out_off);
+    const int got = LZ4_decompress_safe(
+        payload, reinterpret_cast<char *>(out) + out_off,
+        (int) t->comp_bytes[c], (int) usz);
+    if (got < 0 || (size_t) got != usz) return false;
+    payload += t->comp_bytes[c];
+    out_off += usz;
+  }
+  return out_off == out_size;
+}
+
+}  // namespace raw_lz4
+
 class NvComp : public Compressor {
  public:
   explicit NvComp(NvCompAlgo algo = NvCompAlgo::LZ4) : algo_(algo) {}

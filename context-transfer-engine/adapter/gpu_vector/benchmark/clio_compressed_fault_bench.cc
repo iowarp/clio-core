@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <numeric>
 #include <string>
@@ -148,6 +149,8 @@ int main(int argc, char **argv) {
       c.experts = val("experts");
     } else if (a == "--page-mb") {
       kPage = val("page") << 20;
+    } else if (a == "--no-prefetch") {
+      c.k_sel |= (1ull << 63);   // flag bit, masked below
     }
   }
   // Case presets: dataset vs. tier-cap regimes (see header comment).
@@ -161,6 +164,8 @@ int main(int argc, char **argv) {
     c.layers = 24;
     c.hbm_mb = 700;                       // even compressed spills
   }
+  const bool prefetch_on = !(c.k_sel >> 63);
+  c.k_sel &= ~(1ull << 63);
   const uint64_t slices = c.layers * c.experts;
   const uint64_t data_bytes = slices * c.slice_bytes;
   const uint64_t pages_per_slice = c.slice_bytes / kPage;
@@ -191,6 +196,10 @@ int main(int argc, char **argv) {
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CTP_LOG_LEVEL", "error", 0);
+    // Lane batching (issue #820): lets the compressor's BuildBatch/SmashBatch
+    // collapse a burst of page-gets into ONE merged task with a single
+    // batched nvcomp decompress.
+    ctp::SystemInfo::Setenv("CLIO_BATCH_LANE", "1", 0);
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", cfg_path.c_str(), 1);
   }
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer)) {
@@ -208,20 +217,24 @@ int main(int argc, char **argv) {
   // ---- access-frequency ranking (zipf-ish) shared by seeding order and
   // the access stream: rank r has weight 1/(1+r). Case c seeds HOT slices
   // first so the score-1.0 hbm tier holds the best pages.
-  std::vector<uint64_t> rank(slices);
+  // LAYER-LOCAL experts (the llama shape): layer l selects only among its
+  // own E slices, zipf-skewed within the layer. This is the locality the
+  // score-driven prefetcher exploits: the hbm tier is a rolling window over
+  // the upcoming layers' hot slices.
+  std::vector<uint64_t> rank(c.experts);
   std::iota(rank.begin(), rank.end(), 0);
   {
     uint64_t x = c.seed;
-    for (uint64_t i = slices - 1; i > 0; --i) {
+    for (uint64_t i = c.experts - 1; i > 0; --i) {
       x ^= x << 13;
       x ^= x >> 7;
       x ^= x << 17;
       std::swap(rank[i], rank[x % (i + 1)]);
     }
   }
-  std::vector<double> cum(slices);
+  std::vector<double> cum(c.experts);
   double acc = 0;
-  for (uint64_t r = 0; r < slices; ++r) {
+  for (uint64_t r = 0; r < c.experts; ++r) {
     acc += 1.0 / (double) (1 + r);
     cum[r] = acc;
   }
@@ -243,8 +256,7 @@ int main(int argc, char **argv) {
                                            ? clio::run::PoolId(600, 0)
                                            : clio::cte::core::kCtePoolId);
     std::vector<uint8_t> host(kPage);
-    for (uint64_t r = 0; r < slices; ++r) {   // rank order == hot first
-      const uint64_t sl = rank[r];
+    for (uint64_t sl = 0; sl < slices; ++sl) {   // layer-major order
       for (uint64_t p = 0; p < pages_per_slice; ++p) {
         const uint64_t gp = sl * pages_per_slice + p;
         FillSlice(host.data(), kPage, gp, c.fill_const_frac);
@@ -283,42 +295,98 @@ int main(int argc, char **argv) {
   uint64_t x = c.seed ^ 0xD1B54A32D192ED03ull;
   uint64_t expected = 0, fetched = 0, fails = 0;
   const uint64_t t_run0 = NowMs();
-  gv::Vector<uint8_t>::FetchList fl;
-  std::vector<std::pair<uint8_t *, uint64_t>> batch;   // (dst, slice)
-  for (uint64_t tok = 0; tok < c.tokens; ++tok) {
+  // The access stream is deterministic: materialize it up front so the
+  // prefetcher's look-ahead window is 100% ACCURATE.
+  std::vector<uint64_t> access;
+  access.reserve(c.tokens * c.layers * c.k_sel);
+  for (uint64_t tok2 = 0; tok2 < c.tokens; ++tok2) {
     for (uint64_t l = 0; l < c.layers; ++l) {
-      // ASYNC BULK PREFETCH: issue every selected slice's page-gets first,
-      // wait ONCE for the layer -- the server decompresses the whole batch
-      // concurrently. Per-slice blocking waits measured dispatch-bound.
-      batch.clear();
-      for (uint64_t s = 0; s < c.k_sel; ++s) {
+      for (uint64_t k = 0; k < c.k_sel; ++k) {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         const double u = (double) (x >> 11) / 9007199254740992.0 * acc;
         const uint64_t r =
             std::lower_bound(cum.begin(), cum.end(), u) - cum.begin();
-        const uint64_t sl = rank[std::min(r, slices - 1)];
-        uint8_t *dst = vec.StageTransient(c.slice_bytes, nullptr);
-        if (dst == nullptr ||
-            !vec.FetchSpanDeviceAsync(dst, sl * c.slice_bytes, c.slice_bytes,
-                                      &fl)) {
-          ++fails;
-          continue;
-        }
-        batch.emplace_back(dst, sl);
-      }
-      if (!vec.WaitFetches(fl)) ++fails;
-      for (auto &pr : batch) {
-        ConsumeKernel<<<256, 256>>>(pr.first, c.slice_bytes, d_sum);
-        for (uint64_t p = 0; p < pages_per_slice; ++p) {
-          expected += SliceSum(kPage, pr.second * pages_per_slice + p,
-                               c.fill_const_frac);
-        }
-        fetched += c.slice_bytes;
+        access.push_back(l * c.experts +
+                         rank[std::min(r, c.experts - 1)]);
       }
     }
   }
+  // SCORE-DRIVEN PREFETCH: for slices we will need soon, RAISE their pages'
+  // scores (0.95) so the CTE's organizer migrates them INTO the hbm tier
+  // ahead of use -- a metadata op, NOT a data copy; the Get at access time
+  // then decompresses from device memory. Slices leaving the window are
+  // demoted (0.30) so the tier's capacity follows the schedule. Promotions
+  // are fire-and-forget with a bounded drain.
+  clio::cte::core::Client core_cli(clio::cte::core::kCtePoolId);
+  const uint64_t kLookahead = c.k_sel * 4;   // ~4 layers of lead
+  std::vector<int8_t> promoted(slices, 0);
+  std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> reorgs;
+  auto set_score = [&](uint64_t sl, float score) {
+    for (uint64_t pp = 0; pp < pages_per_slice; ++pp) {
+      reorgs.push_back(core_cli.AsyncReorganizeBlob(
+          vec.TagId(), vec.PageBlobName(sl * pages_per_slice + pp), score,
+          clio::run::PoolQuery::Local()));
+    }
+    while (reorgs.size() > 256) {
+      reorgs.front().Wait();
+      reorgs.pop_front();
+    }
+  };
+  gv::Vector<uint8_t>::FetchList fl;
+  std::vector<std::pair<uint8_t *, uint64_t>> batch;   // (dst, slice)
+  const uint64_t t_run0b = NowMs();
+  (void) t_run0b;
+  for (uint64_t i = 0; i < access.size(); i += c.k_sel) {
+    // Window maintenance: promote [i, i+K), demote what fell out.
+    for (uint64_t j = i + c.k_sel;
+         prefetch_on && j < std::min<uint64_t>(i + kLookahead,
+                                               access.size()); ++j) {
+      const uint64_t sl = access[j];
+      if (!promoted[sl]) {
+        promoted[sl] = 1;
+        set_score(sl, 0.95f);
+      }
+    }
+    if (prefetch_on && i >= c.k_sel) {
+      for (uint64_t j = i - c.k_sel; j < i; ++j) {
+        const uint64_t sl = access[j];
+        if (!promoted[sl]) continue;
+        bool ahead = false;
+        for (uint64_t j2 = i;
+             j2 < std::min<uint64_t>(i + kLookahead, access.size()); ++j2) {
+          if (access[j2] == sl) { ahead = true; break; }
+        }
+        if (!ahead) {
+          promoted[sl] = 0;
+          set_score(sl, 0.30f);
+        }
+      }
+    }
+    batch.clear();
+    for (uint64_t s = 0; s < c.k_sel && i + s < access.size(); ++s) {
+      const uint64_t sl = access[i + s];
+      uint8_t *dst = vec.StageTransient(c.slice_bytes, nullptr);
+      if (dst == nullptr ||
+          !vec.FetchSpanDeviceAsync(dst, sl * c.slice_bytes, c.slice_bytes,
+                                    &fl)) {
+        ++fails;
+        continue;
+      }
+      batch.emplace_back(dst, sl);
+    }
+    if (!vec.WaitFetches(fl)) ++fails;
+    for (auto &pr : batch) {
+      ConsumeKernel<<<256, 256>>>(pr.first, c.slice_bytes, d_sum);
+      for (uint64_t p = 0; p < pages_per_slice; ++p) {
+        expected += SliceSum(kPage, pr.second * pages_per_slice + p,
+                             c.fill_const_frac);
+      }
+      fetched += c.slice_bytes;
+    }
+  }
+  for (auto &rg : reorgs) rg.Wait();
   cudaDeviceSynchronize();
   const uint64_t run_ms = NowMs() - t_run0;
   unsigned long long got = 0;

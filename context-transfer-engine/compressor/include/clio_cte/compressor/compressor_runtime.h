@@ -151,6 +151,25 @@ private:
   char *AcquireDevFetch(clio::run::u64 size);
   void ReleaseDevFetch(char *buf);
 
+  // ---- issue #820 batching: N whole-frame GetBlobs -> ONE merged task ----
+  // BuildBatch parks device-destination whole-frame reads per tag;
+  // SmashBatch emits a merged task and records its member list here; the
+  // GetBlob handler recognizes the merged task by registry lookup and runs
+  // BatchedGetBlobImpl: concurrent core fetches + ONE batched nvcomp
+  // decompress spanning every frame.
+  std::mutex batch_reg_mtx_;
+  std::unordered_map<const clio::run::Task *,
+                     std::vector<clio::run::shared_ptr<clio::run::Task>>>
+      batch_reg_;
+  bool BuildBatch(clio::run::u32 method,
+                  const clio::run::shared_ptr<clio::run::Task> &task,
+                  clio::run::BatchGroups &groups) override;
+  void SmashBatch(clio::run::BatchGroups &groups,
+                  clio::run::BatchSink &sink) override;
+  clio::run::TaskResume BatchedGetBlobImpl(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
+      std::vector<clio::run::shared_ptr<clio::run::Task>> members);
+
   // Core client for target monitoring
   /**
    * Compress src[0..size) per ctx into a fresh SHM buffer laid out as

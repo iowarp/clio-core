@@ -1421,21 +1421,59 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     // The header must be readable on the host; for a device fetch buffer pull
     // just the 32-byte header across.
     char *fetch_base = dev_tmp != nullptr ? dev_tmp : tmp.ptr_;
-    CompressionHeader header_host;
+    // Header + (possible) raw-LZ4 chunk table in ONE small pull: the table
+    // is host-readable metadata that lets the decompress run fully batched
+    // on the device.
+    struct HdrAndTable {
+      CompressionHeader hdr;
+      ctp::raw_lz4::Table tbl;
+    } ht_host;
 #if CTP_ENABLE_GPU
     if (dev_tmp != nullptr) {
       // Cached per-thread stream: create/sync/destroy per task cost ~0.3 ms.
       static thread_local void *s_hdr_stream = nullptr;
       if (s_hdr_stream == nullptr) s_hdr_stream = ctp::GpuApi::CreateStream();
-      ctp::GpuApi::MemcpyAsync(reinterpret_cast<char*>(&header_host), dev_tmp,
-                               hsz, s_hdr_stream);
+      ctp::GpuApi::MemcpyAsync(reinterpret_cast<char*>(&ht_host), dev_tmp,
+                               sizeof(HdrAndTable), s_hdr_stream);
       ctp::GpuApi::Synchronize(s_hdr_stream);
     } else
 #endif
     {
-      std::memcpy(&header_host, fetch_base, hsz);
+      std::memcpy(&ht_host, fetch_base, sizeof(HdrAndTable));
     }
+    CompressionHeader &header_host = ht_host.hdr;
     auto* header = &header_host;
+    // PARTIAL reads fetch expected_size+slack, but the COMPRESSED frame can
+    // be larger than the requested slice -- decompressing a truncated frame
+    // produced garbage tails. Refetch the exact stored size when short.
+    if (header->IsValid() && header->compressed_size_ != 0) {
+      const size_t needed = hsz + (size_t) header->compressed_size_;
+      if (needed > fetch_size) {
+        free_tmp();
+        const size_t fetch2 = needed + 256;
+#if CTP_ENABLE_GPU
+        if (dev_out && pinned_gpu_codec) dev_tmp = AcquireDevFetch(fetch2);
+#endif
+        if (dev_tmp == nullptr) {
+          tmp = CLIO_CPU_IPC->AllocateBuffer(fetch2);
+          if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
+        }
+        ctp::ipc::ShmPtr<> tmpp2;
+        if (dev_tmp != nullptr) {
+          tmpp2.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+          tmpp2.off_ = reinterpret_cast<clio::run::u64>(dev_tmp);
+        } else {
+          tmpp2 = tmp.shm_.template Cast<void>();
+        }
+        auto gt2 = core_client_->AsyncGetBlob(task->tag_id_, name,
+            task->offset_, fetch2, task->flags_, tmpp2,
+            ForwardQuery(task->tag_id_, name));
+        CLIO_CO_AWAIT(gt2);
+        if (gt2->return_code_ != 0) { free_tmp();
+          task->return_code_ = 10 + gt2->return_code_; CLIO_CO_RETURN; }
+        fetch_base = dev_tmp != nullptr ? dev_tmp : tmp.ptr_;
+      }
+    }
     HLOG(kInfo, "[DecompressGetBlob] name={} off={} req={} get_rc={} valid={}",
          name, task->offset_, expected_size, gt->return_code_,
          header->IsValid());
@@ -1508,13 +1546,73 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       s_hdr_us += now_us() - t_hdr0;
       const unsigned long long t_dec0 = now_us();
       if (ctp::IsDevicePointer(out.ptr_) && gpu_codec) {
+#if CTP_ENABLE_GPU
+        if (lib == "nvcomp-lz4" &&
+            ht_host.tbl.magic == ctp::raw_lz4::kMagic &&
+            dev_tmp == nullptr) {
+          // Raw frame fetched into a HOST buffer: decode on the CPU (the
+          // chunks are standard LZ4 blocks), then push to the device dst.
+          std::vector<char> staging(dsize);
+          ok = ctp::raw_lz4::DecompressFrameHost(cdata, csize + sizeof(ctp::raw_lz4::Table),
+                                                 staging.data(), dsize);
+          if (ok) {
+            write_out(out.ptr_, staging.data() + task->offset_,
+                      std::min<size_t>(expected_size, dsize));
+          }
+        } else if (lib == "nvcomp-lz4" &&
+            ht_host.tbl.magic == ctp::raw_lz4::kMagic &&
+            dev_tmp != nullptr) {
+          // RAW frame: one low-level batched decompress of all its chunks,
+          // straight from the device fetch buffer into the destination.
+          // PARTIAL reads (caller wants < the frame's original size, e.g.
+          // an unaligned span head/tail) decompress into a bounce buffer
+          // and slice -- writing dsize into a smaller dst was an illegal
+          // memory access.
+          uint8_t *bounce = nullptr;
+          uint8_t *target = reinterpret_cast<uint8_t *>(out.ptr_);
+          if (dsize > expected_size) {
+            bounce = reinterpret_cast<uint8_t *>(AcquireDevFetch(dsize));
+            target = bounce;
+          }
+          cudaStream_t rs = ctp::raw_lz4::RawStream();
+          if (target == nullptr || rs == nullptr) {
+            ok = false;
+          } else {
+            ctp::raw_lz4::FrameRef fr{
+                reinterpret_cast<const uint8_t *>(cdata), &ht_host.tbl,
+                target, dsize};
+            ok = ctp::raw_lz4::DecompressBatch(&fr, 1, rs);
+            if (ok && bounce != nullptr) {
+              ok = cudaMemcpyAsync(out.ptr_, bounce + task->offset_,
+                                   std::min<size_t>(expected_size, dsize),
+                                   cudaMemcpyDeviceToDevice,
+                                   rs) == cudaSuccess;
+            }
+            ok = ok && cudaStreamSynchronize(rs) == cudaSuccess;
+          }
+          if (bounce != nullptr) ReleaseDevFetch((char *) bounce);
+        } else
+#endif
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
       } else if (ctp::IsDevicePointer(out.ptr_)) {
         std::vector<char> staging(dsize);
+#if CTP_ENABLE_GPU
+        if (ht_host.tbl.magic == ctp::raw_lz4::kMagic) {
+          ok = ctp::raw_lz4::DecompressFrameHost(
+              cdata, csize + sizeof(ctp::raw_lz4::Table), staging.data(),
+              dsize);
+        } else
+#endif
         ok = dec->Decompress(staging.data(), dsize, cdata, csize);
         if (ok) write_out(out.ptr_, staging.data(), dsize);
         // DEBUG(first few): prove the bytes actually landed at out.ptr_.
         } else {
+#if CTP_ENABLE_GPU
+        if (ht_host.tbl.magic == ctp::raw_lz4::kMagic) {
+          ok = ctp::raw_lz4::DecompressFrameHost(
+              cdata, csize + sizeof(ctp::raw_lz4::Table), out.ptr_, dsize);
+        } else
+#endif
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
       }
       s_dec_us += now_us() - t_dec0;
@@ -1790,8 +1888,21 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
     return false;
   }
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::vector<char> compressed(size + (size / 20) + 1024);
+  std::vector<char> compressed(size + (size / 20) + 1024 +
+                               sizeof(ctp::raw_lz4::Table));
   size_t compressed_size = compressed.size();
+#if CTP_ENABLE_GPU
+  if (library_name == "nvcomp-lz4" &&
+      size <= ctp::raw_lz4::kChunk * ctp::raw_lz4::kMaxChunks) {
+    // RAW batched-LZ4 frame: decompressible chunk-parallel and BATCHABLE
+    // across frames with one nvcomp launch (the Manager format hides a
+    // stream sync per frame in configure_decompression).
+    compressed_size = ctp::raw_lz4::CompressFrame(src, size,
+                                                  compressed.data(),
+                                                  compressed.size());
+    if (compressed_size == 0) return false;
+  } else
+#endif
   if (!compressor->Compress(compressed.data(), compressed_size,
                             const_cast<char *>(src), size)) {
     return false;
@@ -1855,6 +1966,22 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
     return 3;
   }
   size_t decompressed = header->original_size_;
+#if CTP_ENABLE_GPU
+  {
+    const auto *rt = reinterpret_cast<const ctp::raw_lz4::Table *>(
+        stored + sizeof(CompressionHeader));
+    if (stored_size >= sizeof(CompressionHeader) + sizeof(ctp::raw_lz4::Table)
+        && rt->magic == ctp::raw_lz4::kMagic) {
+      if (!ctp::raw_lz4::DecompressFrameHost(
+              stored + sizeof(CompressionHeader),
+              stored_size - sizeof(CompressionHeader), dst, decompressed)) {
+        return 5;
+      }
+      *out_size = decompressed;
+      return 0;
+    }
+  }
+#endif
   if (!decompressor->Decompress(dst, decompressed,
                                 const_cast<char *>(stored) +
                                     sizeof(CompressionHeader),
@@ -1943,8 +2070,276 @@ clio::run::TaskResume Runtime::PutBlob(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::BuildBatch(clio::run::u32 method,
+                         const clio::run::shared_ptr<clio::run::Task> &task,
+                         clio::run::BatchGroups &groups) {
+  if (method != clio::cte::core::Method::kGetBlob) return false;
+  auto *t = reinterpret_cast<clio::cte::core::GetBlobTask *>(task.get());
+  // Only the shape BatchedGetBlobImpl handles: whole-frame, non-replica,
+  // plain positioned reads. Declining is always safe.
+  if (t->offset_ != 0 || t->context_.replica_ != 0 || t->size_ == 0 ||
+      t->blob_data_.IsNull() || !t->segments_.empty()) {
+    return false;
+  }
+  clio::run::BatchKey key{task->pool_id_,
+                          clio::cte::core::Method::kGetBlob,
+                          std::hash<clio::run::u64>()(
+                              ((clio::run::u64) t->tag_id_.major_ << 32) ^
+                              t->tag_id_.minor_)};
+  clio::run::BatchMember member;
+  member.task = task;
+  groups[key].push_back(member);
+  return true;
+}
+
+void Runtime::SmashBatch(clio::run::BatchGroups &groups,
+                         clio::run::BatchSink &sink) {
+  for (auto it = groups.begin(); it != groups.end();) {
+    const clio::run::BatchKey key = it->first;
+    if (key.method != clio::cte::core::Method::kGetBlob) {
+      ++it;
+      continue;
+    }
+    std::vector<clio::run::BatchMember> members = std::move(it->second);
+    it = groups.erase(it);
+    if (members.empty()) continue;
+    if (members.size() == 1) {
+      sink.Passthrough(members[0].task);
+      continue;
+    }
+    clio::run::shared_ptr<clio::run::Task> merged = NewCopyTask(
+        clio::cte::core::Method::kGetBlob, members[0].task, /*deep=*/true);
+    if (merged.IsNull()) {
+      for (auto &m : members) sink.Passthrough(m.task);
+      continue;
+    }
+    std::vector<clio::run::shared_ptr<clio::run::Task>> parents;
+    parents.reserve(members.size());
+    for (auto &m : members) parents.push_back(m.task);
+    {
+      std::lock_guard<std::mutex> lk(batch_reg_mtx_);
+      batch_reg_[merged.get()] = parents;
+    }
+    sink.Emit(merged, std::move(parents));
+  }
+}
+
+clio::run::TaskResume Runtime::BatchedGetBlobImpl(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
+    std::vector<clio::run::shared_ptr<clio::run::Task>> members) {
+  static std::atomic<unsigned long long> b_n{0}, b_members{0}, b_fetch_us{0},
+      b_dec_us{0};
+  auto b_now = [] {
+    return (unsigned long long)
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  const unsigned long long b_t0 = b_now();
+  // Per-member state.
+  const size_t n = members.size();
+  std::vector<char *> bufs(n, nullptr);
+  std::vector<ctp::ipc::FullPtr<char>> host_bufs(n);
+  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> gets;
+  gets.reserve(n);
+  size_t hsz = sizeof(CompressionHeader);
+  int rc_all = 0;
+  // 1) Issue every core fetch CONCURRENTLY into pooled device buffers.
+  for (size_t m = 0; m < n; ++m) {
+    auto *mt = reinterpret_cast<clio::cte::core::GetBlobTask *>(
+        members[m].get());
+    const size_t fetch_size = mt->size_ + hsz + 1024;
+    bufs[m] = AcquireDevFetch(fetch_size);
+    ctp::ipc::ShmPtr<> tmpp;
+    if (bufs[m] != nullptr) {
+      tmpp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+      tmpp.off_ = reinterpret_cast<clio::run::u64>(bufs[m]);
+    } else {
+      host_bufs[m] = CLIO_IPC->AllocateBuffer(fetch_size);
+      if (host_bufs[m].IsNull()) { rc_all = 2; break; }
+      tmpp = host_bufs[m].shm_.template Cast<void>();
+    }
+    std::string name = CompressorBlobName(*mt);
+    const bool bare_name = name.empty();
+    if (mt->gpu_family_idx_ != clio::cte::core::GetBlobTask::kNoFamilyIdx) {
+      name += (bare_name ? "b" : "_b") +
+              std::to_string(mt->gpu_family_idx_);
+    }
+    if (mt->gpu_page_idx_ != clio::cte::core::GetBlobTask::kNoPageIdx) {
+      name += "_pi" + std::to_string(mt->gpu_page_idx_);
+    }
+    gets.push_back(core_client_->AsyncGetBlob(
+        mt->tag_id_, name, mt->offset_, fetch_size, mt->flags_, tmpp,
+        ForwardQuery(mt->tag_id_, name)));
+  }
+  for (auto &g : gets) {
+    CLIO_CO_AWAIT(g);
+    if (g->return_code_ != 0 && rc_all == 0) rc_all = 10 + g->return_code_;
+  }
+  const unsigned long long b_t1 = b_now();
+  // 2) Pull [header + raw table] for every frame -- small copies, one sync.
+  struct HdrTbl {
+    CompressionHeader hdr;
+    ctp::raw_lz4::Table tbl;
+  };
+  std::vector<HdrTbl> ht(n);
+#if CTP_ENABLE_GPU
+  {
+    static thread_local void *s_stream = nullptr;
+    if (s_stream == nullptr) s_stream = ctp::GpuApi::CreateStream();
+    for (size_t m = 0; m < n && rc_all == 0; ++m) {
+      char *base = bufs[m] != nullptr ? bufs[m] : host_bufs[m].ptr_;
+      if (bufs[m] != nullptr) {
+        ctp::GpuApi::MemcpyAsync(reinterpret_cast<char *>(&ht[m]), base,
+                                 sizeof(HdrTbl), s_stream);
+      } else {
+        std::memcpy(&ht[m], base, sizeof(HdrTbl));
+      }
+    }
+    ctp::GpuApi::Synchronize(s_stream);
+  }
+#endif
+  // 2b) Refetch any member whose COMPRESSED frame is larger than its first
+  // fetch (partial reads: the slice is smaller than the frame). Concurrent,
+  // like the first wave.
+#if CTP_ENABLE_GPU
+  if (rc_all == 0) {
+    std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> refetch;
+    std::vector<size_t> refetch_m;
+    for (size_t m = 0; m < n; ++m) {
+      auto *mt = reinterpret_cast<clio::cte::core::GetBlobTask *>(
+          members[m].get());
+      const size_t fetched = mt->size_ + hsz + 1024;
+      if (!(bufs[m] != nullptr && ht[m].hdr.IsValid() &&
+            ht[m].hdr.compressed_size_ != 0)) {
+        continue;
+      }
+      const size_t needed = hsz + (size_t) ht[m].hdr.compressed_size_;
+      if (needed <= fetched) continue;
+      ReleaseDevFetch(bufs[m]);
+      bufs[m] = AcquireDevFetch(needed + 256);
+      if (bufs[m] == nullptr) { rc_all = 2; break; }
+      ctp::ipc::ShmPtr<> tmpp;
+      tmpp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+      tmpp.off_ = reinterpret_cast<clio::run::u64>(bufs[m]);
+      std::string name = CompressorBlobName(*mt);
+      const bool bare_name = name.empty();
+      if (mt->gpu_family_idx_ != clio::cte::core::GetBlobTask::kNoFamilyIdx) {
+        name += (bare_name ? "b" : "_b") +
+                std::to_string(mt->gpu_family_idx_);
+      }
+      if (mt->gpu_page_idx_ != clio::cte::core::GetBlobTask::kNoPageIdx) {
+        name += "_pi" + std::to_string(mt->gpu_page_idx_);
+      }
+      refetch.push_back(core_client_->AsyncGetBlob(
+          mt->tag_id_, name, mt->offset_, needed + 256, mt->flags_, tmpp,
+          ForwardQuery(mt->tag_id_, name)));
+      refetch_m.push_back(m);
+    }
+    for (auto &g : refetch) {
+      CLIO_CO_AWAIT(g);
+      if (g->return_code_ != 0 && rc_all == 0) rc_all = 10 + g->return_code_;
+    }
+  }
+#endif
+  // 3) ONE batched decompress across every raw frame; everything else falls
+  // back to the single-task path semantics.
+#if CTP_ENABLE_GPU
+  if (rc_all == 0) {
+    std::vector<ctp::raw_lz4::FrameRef> frames;
+    frames.reserve(n);
+    std::vector<size_t> frame_member;
+    // Partial reads (span heads/tails): decompress the full frame into a
+    // bounce buffer and slice afterwards; the dst is smaller than the frame.
+    struct Fixup { char *bounce; char *dst; size_t bytes; };
+    std::vector<Fixup> fixups;
+    for (size_t m = 0; m < n; ++m) {
+      auto *mt = reinterpret_cast<clio::cte::core::GetBlobTask *>(
+          members[m].get());
+      auto out = CLIO_IPC->ToFullPtr<char>(
+          mt->blob_data_.template Cast<char>());
+      if (bufs[m] != nullptr && ht[m].hdr.IsValid() &&
+          ht[m].tbl.magic == ctp::raw_lz4::kMagic &&
+          ctp::IsDevicePointer(out.ptr_)) {
+        uint8_t *target = reinterpret_cast<uint8_t *>(out.ptr_);
+        const size_t dsize = (size_t) ht[m].hdr.original_size_;
+        if (dsize > mt->size_) {
+          char *bounce = AcquireDevFetch(dsize);
+          if (bounce == nullptr) { rc_all = 2; break; }
+          fixups.push_back(Fixup{bounce, out.ptr_, (size_t) mt->size_});
+          target = reinterpret_cast<uint8_t *>(bounce);
+        }
+        frames.push_back(ctp::raw_lz4::FrameRef{
+            reinterpret_cast<const uint8_t *>(bufs[m]) + hsz, &ht[m].tbl,
+            target, dsize});
+        frame_member.push_back(m);
+      } else {
+        // Non-raw / host-buffer member: serve it with the proven
+        // single-task path so mixed batches stay correct.
+        auto single = members[m];
+        auto st = single.template Cast<clio::cte::core::GetBlobTask>();
+        // Release our fetch buffer first; the single path refetches.
+        if (bufs[m] != nullptr) { ReleaseDevFetch(bufs[m]); bufs[m] = nullptr; }
+        if (!host_bufs[m].IsNull()) {
+          CLIO_IPC->FreeBuffer(host_bufs[m]);
+          host_bufs[m] = ctp::ipc::FullPtr<char>();
+        }
+        CLIO_CO_AWAIT(DecompressGetBlobImpl(st));
+        if (st->return_code_ != 0 && rc_all == 0) {
+          rc_all = st->return_code_;
+        }
+      }
+    }
+    if (!frames.empty() && rc_all == 0) {
+      cudaStream_t rs = ctp::raw_lz4::RawStream();
+      bool ok = rs != nullptr &&
+                ctp::raw_lz4::DecompressBatch(frames.data(), frames.size(),
+                                              rs);
+      for (auto &f : fixups) {
+        ok = ok && cudaMemcpyAsync(f.dst, f.bounce, f.bytes,
+                                   cudaMemcpyDeviceToDevice,
+                                   rs) == cudaSuccess;
+      }
+      if (!ok || cudaStreamSynchronize(rs) != cudaSuccess) rc_all = 5;
+    }
+    for (auto &f : fixups) ReleaseDevFetch(f.bounce);
+  }
+#endif
+  for (size_t m = 0; m < n; ++m) {
+    if (bufs[m] != nullptr) ReleaseDevFetch(bufs[m]);
+    if (!host_bufs[m].IsNull()) CLIO_IPC->FreeBuffer(host_bufs[m]);
+  }
+  b_fetch_us += b_t1 - b_t0;
+  b_dec_us += b_now() - b_t1;
+  b_members += n;
+  const unsigned long long bn = ++b_n;
+  if ((bn & 255) == 0) {
+    std::fprintf(stderr,
+                 "[cfb-batch] batches=%llu avg_members=%.1f fetch=%.2fms "
+                 "dec=%.2fms (avg per batch)\n",
+                 bn, (double) b_members / bn, b_fetch_us / 1000.0 / bn,
+                 b_dec_us / 1000.0 / bn);
+  }
+  task->return_code_ = rc_all;
+  CLIO_CO_RETURN;
+}
+
 clio::run::TaskResume Runtime::GetBlob(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
+  {
+    std::vector<clio::run::shared_ptr<clio::run::Task>> members;
+    {
+      std::lock_guard<std::mutex> lk(batch_reg_mtx_);
+      auto it = batch_reg_.find(task.get());
+      if (it != batch_reg_.end()) {
+        members = std::move(it->second);
+        batch_reg_.erase(it);
+      }
+    }
+    if (!members.empty()) {
+      CLIO_CO_AWAIT(BatchedGetBlobImpl(task, std::move(members)));
+      CLIO_CO_RETURN;
+    }
+  }
   if (task->offset_ == 0 && task->context_.replica_ == 0) {
     // Whole-frame read: take the pod-fault decompress path directly -- a
     // SINGLE core read of the compressed frame (D2D from an hbm:: tier into

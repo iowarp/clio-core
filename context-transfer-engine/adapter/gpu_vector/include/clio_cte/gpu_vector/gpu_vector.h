@@ -1866,6 +1866,13 @@ inline bool Vector<T>::FetchSpanDeviceAsync(unsigned char *dst_dev,
   }
   clio::cte::core::Client cte(impl_->cte_pool_id);
   const clio::run::u64 page = view_.base.page_size_bytes;
+  // Route every fetch of this TAG to ONE lane: per-blob hashing scattered
+  // same-tag gets across workers, so the compressor's SmashBatch only ever
+  // saw ~1/n of an issue burst (avg batch 3.3 of 16). Converging them is
+  // what lets one batched nvcomp decompress span the whole burst.
+  const clio::run::PoolQuery pq = clio::run::PoolQuery::DirectHash(
+      (clio::run::u32) (((clio::run::u64) view_.base.tag_id.major_ << 8) ^
+                        view_.base.tag_id.minor_));
   clio::run::u64 cur = off;
   while (cur < off + len) {
     const clio::run::u64 gp   = cur / page;
@@ -1877,7 +1884,7 @@ inline bool Vector<T>::FetchSpanDeviceAsync(unsigned char *dst_dev,
     const clio::run::u64 boff = view_.base.flat_layout ? cur : poff;
     fl->push_back(cte.AsyncGetBlob(
         view_.base.tag_id, name, boff, seg, 0,
-        (char *) dst_dev + (cur - off), clio::run::PoolQuery::Local()));
+        (char *) dst_dev + (cur - off), pq));
     cur += seg;
   }
   return true;
