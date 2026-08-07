@@ -287,8 +287,12 @@ class Vector {
       // model computed on stale staging memory (garbage output at speed).
       impl_->in_direct_flush = true;
       for (const auto &lp : leftover) {
-        if (!FetchSpanDeviceAsync(lp.dst, lp.gp * view_.base.page_size_bytes,
-                                  lp.len, &fl)) {
+        const clio::run::u64 loff = lp.gp * view_.base.page_size_bytes;
+        // With a DRAM tier present the fallback is a host copy, not a
+        // task: same PCIe bytes, no decompress, no round trip.
+        if (impl_->host_arena != nullptr) {
+          if (!CopySpan(lp.dst, loff, lp.len, nullptr)) ok = false;
+        } else if (!FetchSpanDeviceAsync(lp.dst, loff, lp.len, &fl)) {
           ok = false;
         }
       }
@@ -1910,6 +1914,21 @@ inline bool Vector<T>::CopySpan(unsigned char *dst, clio::run::u64 off,
     // crosses PCIe. With fl, the caller batches waits across MANY spans.
     if (fl != nullptr) return FetchSpanDeviceAsync(dst, off, len, fl);
     return FetchSpanDevice(dst, off, len);
+  }
+  // BOTH tiers present: offer whole pages to the zero-task resolver first
+  // (device-resident pages cost no PCIe at all), and serve the rest from
+  // the DRAM tier below. The resolver is installed device_only in this
+  // configuration, so it refuses ram pages rather than pulling compressed
+  // frames the DRAM tier already holds decompressed.
+  if (impl_->direct_batch && !impl_->in_direct_flush && fl != nullptr) {
+    const clio::run::u64 page2 = view_.base.page_size_bytes;
+    if ((off % page2) == 0 && (len % page2) == 0) {
+      for (clio::run::u64 k = 0; k < len / page2; ++k) {
+        impl_->pending_direct.push_back(
+            PendingPage{off / page2 + k, dst + k * page2, page2});
+      }
+      return true;
+    }
   }
   if (off >= impl_->mirror_bytes) return false;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;

@@ -77,7 +77,8 @@ template <typename VecT>
 inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
                                 const std::vector<DirectWant> &want,
                                 std::vector<DirectWant> *leftover,
-                                DirectStats *stats = nullptr) {
+                                DirectStats *stats = nullptr,
+                                bool device_only = false) {
   using clio::run::bdev::MemBdevTransport;
   struct Pending {
     const DirectWant *w;
@@ -125,6 +126,14 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
         // still no task, just a PCIe copy of COMPRESSED bytes instead of a
         // D2D copy. This is what makes a miss cheap when the model is far
         // larger than the device tier.
+        //
+        // device_only: the caller has a DECOMPRESSED DRAM tier, which
+        // serves the same bytes over the same PCIe with no decompress at
+        // all -- so refuse ram pages and let it use that instead.
+        if (device_only) {
+          resolvable = false;
+          break;
+        }
         from_ram = true;
         continue;
       }
@@ -317,19 +326,21 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
  * vector. Safe to call once at init; a null install is a no-op.
  */
 template <typename VecT>
-inline void InstallDirectReads(VecT &vec, DirectStats *stats) {
+inline void InstallDirectReads(VecT &vec, DirectStats *stats,
+                               bool device_only = false) {
   auto cli = std::make_shared<clio::cte::core::Client>(
       clio::cte::core::kCtePoolId);
   cli->AttachShmCache();
   VecT *vp = &vec;
   using PP = typename VecT::PendingPage;
-  vec.SetDirectBatchFn([vp, cli, stats](const std::vector<PP> &want,
-                                        std::vector<PP> *leftover) {
+  const bool dev_only = device_only;
+  vec.SetDirectBatchFn([vp, cli, stats, dev_only](const std::vector<PP> &want,
+                                                  std::vector<PP> *leftover) {
     std::vector<DirectWant> w;
     w.reserve(want.size());
     for (const auto &p : want) w.push_back(DirectWant{p.gp, p.dst, p.len});
     std::vector<DirectWant> lo;
-    HbmDirectFetchBatch(*vp, *cli, w, &lo, stats);
+    HbmDirectFetchBatch(*vp, *cli, w, &lo, stats, dev_only);
     for (const auto &l : lo) leftover->push_back(PP{l.gp, l.dst, l.len});
   });
 }
