@@ -2371,7 +2371,15 @@ clio::run::TaskResume Runtime::GetBlob(
     // hops and multiple full-page copies PER READ (measured ~2.6 ms/MiB,
     // the entire fetch ceiling of the compressed fault path).
     CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
-    CLIO_CO_RETURN;
+    // The fast path over-fetches (it cannot know the stored size a
+    // priori), which a RAW blob shorter than the fetch window rejects --
+    // the uncompressed-passthrough case in test_compressor_interpose. Any
+    // failure falls through to the interposer path, which sizes its read
+    // from the blob's actual size.
+    if (task->GetReturnCode() == 0) {
+      CLIO_CO_RETURN;
+    }
+    task->return_code_ = 0;
   }
   CLIO_TASK_BODY_BEGIN
   // Serve the read as-is first: the untransformed case (and every replica-
