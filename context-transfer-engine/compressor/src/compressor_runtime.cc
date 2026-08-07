@@ -235,6 +235,97 @@ struct CompressionHeader {
   bool IsValid() const { return magic_ == kMagic; }
 };
 /**
+ * CHUNKED payload layout for host codecs: a table of per-chunk compressed
+ * sizes followed by the packed chunks, each of which decompresses
+ * independently to kChunk bytes.
+ *
+ * This exists so a GPU consumer can decode a stored page IN-KERNEL and in
+ * parallel. LZ4 block decoding is inherently serial -- a match copies from
+ * the bytes just produced -- so a page stored as ONE block can only be
+ * decoded by one thread. Measured: the single-block form decodes at
+ * 1.3 GB/s on the in-kernel fault path against 12 GB/s for uncompressed
+ * pages, with 255 of 256 threads idle. Cutting the page into independent
+ * chunks is what makes that decode parallel.
+ *
+ * Byte-identical to ctp::raw_lz4::Table (the nvcomp path's format) on
+ * purpose: one device-side decoder then reads both.
+ */
+namespace chunked {
+// DISTINCT from ctp::raw_lz4's 'RB4C'. The layouts are identical and both
+// hold standard LZ4 blocks, but several readers detect an nvcomp RAW frame
+// by that magic alone; reusing it made host-compressed payloads decode with
+// the GPU decoder and hand back garbage (caught by cte_compressor_interpose
+// and compressor_transparent_getblob). A separate magic keeps the two
+// producers apart while a device decoder can still accept both.
+constexpr uint32_t kMagic = 0x43344248u;   // 'HB4C'
+constexpr size_t kChunk = 64 * 1024;
+constexpr size_t kMaxChunks = 64;          // payloads up to 4 MiB
+
+struct Table {
+  uint32_t magic;
+  uint32_t nchunks;
+  uint32_t comp_bytes[kMaxChunks];
+};
+
+/** Compress `in_size` bytes into `out` as Table + packed chunks. Returns
+ *  the total payload size, or 0 if the input does not fit the chunked form
+ *  (caller then stores the single-block form). */
+inline size_t CompressChunked(ctp::Compressor *c, const char *in,
+                              size_t in_size, char *out, size_t out_cap) {
+  if (c == nullptr || in_size == 0 || in_size > kChunk * kMaxChunks) return 0;
+  if (out_cap < sizeof(Table)) return 0;
+  const size_t n = (in_size + kChunk - 1) / kChunk;
+  Table *t = reinterpret_cast<Table *>(out);
+  t->magic = kMagic;
+  t->nchunks = static_cast<uint32_t>(n);
+  std::memset(t->comp_bytes, 0, sizeof(t->comp_bytes));
+  size_t off = sizeof(Table);
+  for (size_t i = 0; i < n; ++i) {
+    const size_t this_in = std::min(kChunk, in_size - i * kChunk);
+    if (off >= out_cap) return 0;
+    size_t got = out_cap - off;
+    if (!c->Compress(out + off, got,
+                     const_cast<char *>(in + i * kChunk), this_in) ||
+        got == 0) {
+      return 0;
+    }
+    t->comp_bytes[i] = static_cast<uint32_t>(got);
+    off += got;
+  }
+  return off;
+}
+
+/** Decompress a payload written either chunked (Table magic present) or as
+ *  a single block. Keeps every existing reader working against both. */
+inline bool DecompressAny(ctp::Compressor *c, void *dst, size_t &dsize,
+                          const void *src, size_t ssize) {
+  if (c == nullptr) return false;
+  if (ssize >= sizeof(Table) &&
+      reinterpret_cast<const Table *>(src)->magic == kMagic) {
+    const Table *t = reinterpret_cast<const Table *>(src);
+    const uint32_t n = t->nchunks;
+    if (n == 0 || n > kMaxChunks) return false;
+    const char *payload = static_cast<const char *>(src) + sizeof(Table);
+    size_t in_off = 0, out_off = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (out_off >= dsize) return false;
+      size_t got = std::min(kChunk, dsize - out_off);
+      if (!c->Decompress(static_cast<char *>(dst) + out_off, got,
+                         const_cast<char *>(payload + in_off),
+                         t->comp_bytes[i])) {
+        return false;
+      }
+      in_off += t->comp_bytes[i];
+      out_off += got;
+    }
+    dsize = out_off;
+    return true;
+  }
+  return c->Decompress(dst, dsize, const_cast<void *>(src), ssize);
+}
+}  // namespace chunked
+
+/**
  * Minimum SAVINGS a page must show before it is stored compressed.
  *
  * Storing a page that barely compresses is a pure loss: every later read
@@ -957,8 +1048,22 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     auto input_fullptr =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     char* input_ptr = input_fullptr.ptr_;
-    bool success = compressor->Compress(compressed_buffer.data(),
-                                        compressed_size, input_ptr, input_size);
+    // Prefer the CHUNKED payload: it is what lets a GPU consumer decode the
+    // page in-kernel with one thread per chunk instead of one thread for
+    // the whole page. Falls back to a single block when the input does not
+    // fit the chunked form, and readers detect which by the table magic.
+    bool success = false;
+    size_t chunked_size = chunked::CompressChunked(
+        compressor.get(), input_ptr, input_size, compressed_buffer.data(),
+        compressed_buffer.size());
+    if (chunked_size != 0) {
+      compressed_size = chunked_size;
+      success = true;
+    } else {
+      compressed_size = compressed_buffer.size();
+      success = compressor->Compress(compressed_buffer.data(), compressed_size,
+                                     input_ptr, input_size);
+    }
 
     auto compress_end = std::chrono::high_resolution_clock::now();
     double compress_time =
@@ -1169,7 +1274,8 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       size_t decompressed_size = original_size;
       bool success =
-          decompressor->Decompress(output_fullptr.ptr_, decompressed_size,
+          chunked::DecompressAny(decompressor.get(), output_fullptr.ptr_,
+                                 decompressed_size,
                                    compressed_data, compressed_size);
 
       auto decompress_end = std::chrono::high_resolution_clock::now();
@@ -1273,7 +1379,18 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
     std::vector<char> cbuf(input_size + (input_size / 20) + 1024);
     size_t csize = cbuf.size();
     auto in = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-    bool ok = compressor->Compress(cbuf.data(), csize, in.ptr_, input_size);
+    // Chunked when it fits, so a GPU consumer can decode this page
+    // in-kernel with one thread per chunk (see namespace chunked).
+    size_t ch = chunked::CompressChunked(compressor.get(), in.ptr_, input_size,
+                                         cbuf.data(), cbuf.size());
+    bool ok;
+    if (ch != 0) {
+      csize = ch;
+      ok = true;
+    } else {
+      csize = cbuf.size();
+      ok = compressor->Compress(cbuf.data(), csize, in.ptr_, input_size);
+    }
     size_t hsz = sizeof(CompressionHeader);
     size_t total = csize + hsz;
 
@@ -1643,7 +1760,7 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
           if (bounce != nullptr) ReleaseDevFetch((char *) bounce);
         } else
 #endif
-        ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+        ok = chunked::DecompressAny(dec.get(), out.ptr_, dsize, cdata, csize);
       } else if (ctp::IsDevicePointer(out.ptr_)) {
         std::vector<char> staging(dsize);
 #if CTP_ENABLE_GPU
@@ -1653,7 +1770,8 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
               dsize);
         } else
 #endif
-        ok = dec->Decompress(staging.data(), dsize, cdata, csize);
+        ok = chunked::DecompressAny(dec.get(), staging.data(), dsize, cdata,
+                                    csize);
         if (ok) write_out(out.ptr_, staging.data(), dsize);
         // DEBUG(first few): prove the bytes actually landed at out.ptr_.
         } else {
@@ -1663,7 +1781,7 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
               cdata, csize + sizeof(ctp::raw_lz4::Table), out.ptr_, dsize);
         } else
 #endif
-        ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+        ok = chunked::DecompressAny(dec.get(), out.ptr_, dsize, cdata, csize);
       }
       s_dec_us += now_us() - t_dec0;
       const unsigned long long n2 = ++s_n;
@@ -1953,8 +2071,13 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
     if (compressed_size == 0) return false;
   } else
 #endif
-  if (!compressor->Compress(compressed.data(), compressed_size,
-                            const_cast<char *>(src), size)) {
+  if (size_t ch = chunked::CompressChunked(compressor.get(), src, size,
+                                          compressed.data(),
+                                          compressed.size())) {
+    // Chunked payload: decodable chunk-parallel, including in-kernel.
+    compressed_size = ch;
+  } else if (!compressor->Compress(compressed.data(), compressed_size,
+                                   const_cast<char *>(src), size)) {
     return false;
   }
   size_t header_size = sizeof(CompressionHeader);
@@ -2034,7 +2157,7 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
     }
   }
 #endif
-  if (!decompressor->Decompress(dst, decompressed,
+  if (!chunked::DecompressAny(decompressor.get(), dst, decompressed,
                                 const_cast<char *>(stored) +
                                     sizeof(CompressionHeader),
                                 stored_size - sizeof(CompressionHeader))) {

@@ -531,7 +531,12 @@ CTP_GPU_FUN clio::run::u32 EvictSlot(::clio::run::gpu::IpcManager *ipc,
  *  Host definitions: CompressionHeader in compressor_runtime.cc and
  *  ctp::raw_lz4::Table in clio_ctp/compress/nvcomp.h. */
 constexpr clio::run::u32 kCteHdrMagic = 0x43544543u;   // 'CTEC'
-constexpr clio::run::u32 kRawLz4Magic = 0x43344252u;   // 'RB4C'
+constexpr clio::run::u32 kRawLz4Magic = 0x43344252u;   // 'RB4C' (nvcomp raw)
+/** Host-produced chunked payload (compressor_runtime's namespace chunked).
+ *  Same layout, also standard LZ4 blocks, but a distinct magic so host
+ *  readers that detect an nvcomp RAW frame by magic are not confused. Both
+ *  decode identically here. */
+constexpr clio::run::u32 kHostChunkMagic = 0x43344248u;   // 'HB4C'
 constexpr clio::run::u32 kCteHdrBytes = 32u;           // sizeof(CompressionHeader)
 constexpr clio::run::u32 kRawLz4Chunk = 64u * 1024u;
 constexpr clio::run::u32 kRawLz4MaxChunks = 64u;
@@ -616,7 +621,8 @@ CTP_GPU_FUN bool BlockDecompressFrame(const unsigned char *frame,
   if (orig != out_bytes) return false;
 
   const unsigned char *tbl = frame + kCteHdrBytes;
-  if (*(const clio::run::u32 *) tbl != kRawLz4Magic) {
+  const clio::run::u32 tbl_magic = *(const clio::run::u32 *) tbl;
+  if (tbl_magic != kRawLz4Magic && tbl_magic != kHostChunkMagic) {
     // No chunk table: the host lz4 codec stores ONE raw LZ4 block covering
     // the whole page, immediately after the header. LZ4 block decoding is
     // inherently serial (each match refers back into the bytes just
