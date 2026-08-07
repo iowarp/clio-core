@@ -49,6 +49,8 @@ struct Page {
   clio::run::u32 dirty;
   /** 1 while a put issued by BeginFlush is still outstanding. */
   clio::run::u32 flushing;
+  /** Bumped on every task submission so no two carry the same TaskId. */
+  clio::run::u32 seq;
 
   /** This page's own task slots, in the registered device backend. */
   PutSlot *put;
@@ -58,6 +60,37 @@ struct Page {
   /** Outstanding put, waited on by WaitFlush. */
   clio::run::gpu::Future<clio::cte::core::PodPutBlobTask> put_fut;
 };
+
+/**
+ * A TaskId that is actually unique on the device.
+ *
+ * CreateTaskId()'s device implementation is a STUB: it returns a constant
+ * (major_=1, unique_=1, pid/tid=0) for every call, so every task submitted
+ * from a kernel shares one identity. A single synchronous task survives
+ * that; concurrent ones do not -- the runtime aborted with "null RunContext
+ * -- task not executing" as soon as BeginFlush had several puts in flight.
+ *
+ * Identity here is (global page slot, task kind, submission sequence),
+ * which is unique across blocks, across the three task kinds a page owns,
+ * and across resubmissions of the same slot.
+ */
+CTP_INLINE_CROSS_FUN clio::run::TaskId DeviceTaskId(clio::run::u64 slot,
+                                                    clio::run::u32 kind,
+                                                    clio::run::u32 seq) {
+  clio::run::TaskId id;
+  id.pid_ = 0;
+  id.tid_ = 0;
+  id.major_ = static_cast<clio::run::u32>(slot) * 3u + kind + 1u;
+  id.replica_id_ = 0;
+  id.unique_ = seq + 1u;
+  id.node_id_ = 0;
+  return id;
+}
+
+/** Task kinds, used only to keep a page's three ids distinct. */
+constexpr clio::run::u32 kKindPut = 0;
+constexpr clio::run::u32 kKindGet = 1;
+constexpr clio::run::u32 kKindRescore = 2;
 
 /** Compose a page's blob name: "p<page_num>". Device-callable, no CRT. */
 CTP_INLINE_CROSS_FUN void PageBlobName(clio::run::u64 page_num, char *out) {

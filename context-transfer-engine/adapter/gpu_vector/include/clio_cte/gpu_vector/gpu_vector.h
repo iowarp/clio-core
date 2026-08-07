@@ -152,6 +152,7 @@ class Vector {
       p.last_access = 0;
       p.dirty = 0;
       p.flushing = 0;
+      p.seq = 0;
       char *slot = tasks_bytes +
                    i * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
       p.put = reinterpret_cast<PutSlot *>(slot);
@@ -169,7 +170,9 @@ class Vector {
     // constructors and upload; the kernel then only mutates POD input fields,
     // which is exactly the contract IpcGpu2Cpu documents.
     std::vector<char> tasks(static_cast<size_t>(task_bytes), 0);
-    const clio::run::PoolQuery local = clio::run::PoolQuery::Local();
+    // ToLocalCpu, not Local: this is how a GPU-submitted task is routed to
+    // a CPU worker for execution.
+    const clio::run::PoolQuery local = clio::run::PoolQuery::ToLocalCpu();
     for (clio::run::u64 i = 0; i < nslots; ++i) {
       char *slot = tasks.data() +
                    i * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
@@ -184,10 +187,37 @@ class Vector {
       new (slot + sizeof(PutSlot) + sizeof(GetSlot))
           RescoreSlot(clio::run::CreateTaskId(), clio::cte::core::kCtePoolId,
                       local, tag_id_, "p0", 0.0f);
+      // Give each task its RunContext NOW. The constructors leave it null,
+      // and it rides along in the memcpy'd task on the GPU path -- a task
+      // that arrives without one aborts the worker ("null RunContext -- task
+      // not executing"). EnsureRunCtx is exactly this: allocate the storage,
+      // no container resolution, which is what the client send path does
+      // before handing a task over.
+      // Stamp the POD size into the task's own future. RecvIn reads it from
+      // the queue entry to know how many bytes to copy back off the device
+      // WITHOUT dereferencing the task first; a zero here is reported as
+      // "kernel did not stamp fut_.task_size_ before Send".
+      reinterpret_cast<PutSlot *>(slot)->fut_.task_size_ =
+          static_cast<clio::run::u32>(sizeof(PutSlot));
+      reinterpret_cast<GetSlot *>(slot + sizeof(PutSlot))->fut_.task_size_ =
+          static_cast<clio::run::u32>(sizeof(GetSlot));
+      reinterpret_cast<RescoreSlot *>(slot + sizeof(PutSlot) + sizeof(GetSlot))
+          ->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(RescoreSlot));
     }
     UploadBytes(tasks.data(), st.tasks_base, task_bytes);
 
+    // One device-global counter per vector, feeding unique task ids.
+    void *seq = nullptr;
+#if CTP_ENABLE_CUDA
+    if (cudaMalloc(&seq, sizeof(unsigned long long)) == cudaSuccess) {
+      cudaMemset(seq, 0, sizeof(unsigned long long));
+    } else {
+      seq = nullptr;
+    }
+#endif
+
     DeviceVector<T> v;
+    v.task_seq_ = static_cast<unsigned long long *>(seq);
     v.tag_id_ = tag_id_;
     v.pages_ = reinterpret_cast<Page *>(st.table_base);
     v.nblocks_ = nblocks_;

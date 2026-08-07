@@ -46,6 +46,15 @@ class DeviceVector {
   clio::run::PoolId pool_id_;
   /** Allocator of the backend holding the task slots. */
   ctp::ipc::AllocatorId task_alloc_id_;
+  /**
+   * Device-global counter handing out strictly increasing task ids.
+   *
+   * CreateTaskId()'s device build is a stub returning one constant for every
+   * call, so identity has to come from somewhere. Deriving it from (slot,
+   * kind) alone was not enough -- every device task also carries pid_=tid_=0,
+   * so ids must be distinct in the fields that actually vary.
+   */
+  unsigned long long *task_seq_ = nullptr;
 
 #if CTP_IS_GPU_COMPILER
   // ---- device API -----------------------------------------------------
@@ -139,10 +148,10 @@ class DeviceVector {
     auto *t = slot->rescore;
     t->task_flags_.Clear();
     t->return_code_.store(0);
-    t->task_id_ = clio::run::CreateTaskId();
+    t->task_id_ = NextTaskId(kKindRescore);
     t->pool_id_ = pool_id_;
     t->method_ = clio::cte::core::Method::kPodReorganizeBlob;
-    t->pool_query_ = clio::run::PoolQuery::Local();
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
     t->tag_id_ = tag_id_;
     char name[32];
     PageBlobName(page_id, name);
@@ -172,6 +181,18 @@ class DeviceVector {
   CTP_GPU_FUN Page *BlockPages() const {
     const clio::run::u32 b = blockIdx.x % nblocks_;
     return pages_ + static_cast<clio::run::u64>(b) * pages_per_block_;
+  }
+
+  /** A globally unique id for the next task this vector submits. */
+  CTP_GPU_FUN clio::run::TaskId NextTaskId(clio::run::u32 kind) const {
+    unsigned long long n =
+        (task_seq_ != nullptr) ? atomicAdd(task_seq_, 1ull) : 0ull;
+    return DeviceTaskId(n, kind, static_cast<clio::run::u32>(n));
+  }
+
+  /** Index of `p` in the whole page table -- the basis of its task ids. */
+  CTP_GPU_FUN clio::run::u64 SlotOf(const Page *p) const {
+    return static_cast<clio::run::u64>(p - pages_);
   }
 
   CTP_GPU_FUN Page *Find(clio::run::u64 page_num) const {
@@ -209,10 +230,10 @@ class DeviceVector {
     auto *t = p->put;
     t->task_flags_.Clear();
     t->return_code_.store(0);
-    t->task_id_ = clio::run::CreateTaskId();
+    t->task_id_ = NextTaskId(kKindPut);
     t->pool_id_ = pool_id_;
     t->method_ = clio::cte::core::Method::kPodPutBlob;
-    t->pool_query_ = clio::run::PoolQuery::Local();
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
     t->tag_id_ = tag_id_;
     char name[32];
     PageBlobName(p->page_num, name);
@@ -240,10 +261,10 @@ class DeviceVector {
     auto *t = p->get;
     t->task_flags_.Clear();
     t->return_code_.store(0);
-    t->task_id_ = clio::run::CreateTaskId();
+    t->task_id_ = NextTaskId(kKindGet);
     t->pool_id_ = pool_id_;
     t->method_ = clio::cte::core::Method::kPodGetBlob;
-    t->pool_query_ = clio::run::PoolQuery::Local();
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
     t->tag_id_ = tag_id_;
     char name[32];
     PageBlobName(page_num, name);
