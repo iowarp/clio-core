@@ -72,7 +72,12 @@ bool g_initialized = false;
 inline clio::run::PoolId StoragePool() { return clio::run::PoolId(600, 0); }
 
 constexpr int kMaxH = 256;
-constexpr int kMaxC = 64;
+// ogbn-papers100M has 172 classes, so this must exceed 64 (arxiv 40 / products 47).
+constexpr int kMaxC = 192;
+// Every kValStride-th node is held out as validation: excluded from the loss and
+// from the gradient, scored separately. Deterministic (index-based), so it does
+// not disturb the bit-exactness of the in-core vs streamed comparison.
+constexpr unsigned long long kValStride = 10;
 
 double NowSec() {
   return std::chrono::duration<double>(
@@ -137,7 +142,8 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
                                 const long long *labels, int F, int H, int C,
                                 const float *W1, const float *b1, const float *W2,
                                 const float *b2, float *h1_out, float *dz1_out,
-                                float *dz2_out, double *loss_buf, int *correct, int *count) {
+                                float *dz2_out, double *loss_buf, int *correct, int *count,
+                                int *val_correct, int *val_count) {
   clio::run::u64 n = blockIdx.x * (clio::run::u64)blockDim.x + threadIdx.x;
   if (n >= nn) return;
   long long y = labels[node_lo + n];
@@ -162,6 +168,13 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
   int pred = 0; float pmax = -1.f; float p[kMaxC];
   for (int c = 0; c < C; ++c) { p[c] = z2[c] / sum; if (p[c] > pmax) { pmax = p[c]; pred = c; } }
+  // Held-out validation node: score it, but contribute neither loss nor gradient.
+  // dz1_out/dz2_out/h1_out were zeroed above, so returning here keeps its grad at 0.
+  if (((node_lo + n) % kValStride) == (kValStride - 1)) {
+    if (pred == (int)y) atomicAdd(val_correct, 1);
+    atomicAdd(val_count, 1);
+    return;
+  }
   loss_buf[n] = -log((double)fmaxf(p[y], 1e-30f));
   if (pred == (int)y) atomicAdd(correct, 1);
   atomicAdd(count, 1);
@@ -285,21 +298,25 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   REQUIRE(cudaMalloc(&dz2_buf, max_nn * C * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&d_scratch, max_nn * F * sizeof(float)) == cudaSuccess);
   double *loss_buf; REQUIRE(cudaMalloc(&loss_buf, max_nn * sizeof(double)) == cudaSuccess);
-  double *d_loss; int *d_correct, *d_count;
+  double *d_loss; int *d_correct, *d_count, *d_vcorrect, *d_vcount;
   REQUIRE(cudaMalloc(&d_loss, sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&d_correct, sizeof(int)) == cudaSuccess);
   REQUIRE(cudaMalloc(&d_count, sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_vcorrect, sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_vcount, sizeof(int)) == cudaSuccess);
 
   clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
 
   // One epoch over a window provider. get_win(win_idx, first_node, nn) fills
   // d_scratch (nn*F). Returns final (loss,acc). Deterministic accumulation.
   auto run_epoch = [&](std::function<void(clio::run::u64, clio::run::u64, clio::run::u64)> gather,
-                       double &out_loss, double &out_acc, clio::run::u64 &out_count) {
+                       double &out_loss, double &out_acc, clio::run::u64 &out_count,
+                       double &out_vacc) {
     cudaMemset(gW1, 0, H * F * sizeof(double)); cudaMemset(gb1, 0, H * sizeof(double));
     cudaMemset(gW2, 0, C * H * sizeof(double)); cudaMemset(gb2, 0, C * sizeof(double));
     cudaMemset(d_loss, 0, sizeof(double)); cudaMemset(d_correct, 0, sizeof(int));
     cudaMemset(d_count, 0, sizeof(int));
+    cudaMemset(d_vcorrect, 0, sizeof(int)); cudaMemset(d_vcount, 0, sizeof(int));
     for (clio::run::u64 w = 0; w < K; w += window) {
       clio::run::u64 first = w * page_rows;
       clio::run::u64 nn = (clio::run::u64)window * page_rows;
@@ -307,7 +324,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       int tpb = 128;
       TrainNodeKernel<<<(int)((nn + tpb - 1) / tpb), tpb>>>(
           d_scratch, nn, first, d_lab, F, H, C, dW1, db1, dW2, db2,
-          h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count);
+          h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count,
+          d_vcorrect, d_vcount);
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
       GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
       GradW2Kernel<<<(C * H + tpb - 1) / tpb, tpb>>>(h1_buf, dz2_buf, nn, H, C, gW2, gb2);
@@ -322,6 +340,9 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     cudaMemcpy(&hloss, d_loss, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(&hcorr, d_correct, sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&hcnt, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+    int hvcorr = 0, hvcnt = 0;
+    cudaMemcpy(&hvcorr, d_vcorrect, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&hvcnt, d_vcount, sizeof(int), cudaMemcpyDeviceToHost);
     std::vector<float> W1(H * F), b1(H), W2(C * H), b2(C);
     cudaMemcpy(W1.data(), dW1, H * F * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(b1.data(), db1, H * sizeof(float), cudaMemcpyDeviceToHost);
@@ -338,6 +359,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     cudaMemcpy(db2, b2.data(), C * sizeof(float), cudaMemcpyHostToDevice);
     out_loss = hloss / std::max<int>(1, hcnt); out_acc = (double)hcorr / std::max<int>(1, hcnt);
     out_count = (clio::run::u64)hcnt;
+    out_vacc = hvcnt ? (double)hvcorr / (double)hvcnt : 0.0;
   };
 
   auto reset_weights = [&]() {
@@ -348,7 +370,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   };
 
   // =========================== IN-CORE baseline ===========================
-  std::vector<double> base_loss(epochs), base_acc(epochs);
+  std::vector<double> base_loss(epochs), base_acc(epochs), base_vacc(epochs);
   std::string base_status = "OOM"; double base_time = -1.0;
   {
     size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
@@ -369,12 +391,13 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
         clio::run::u64 cnt;
         run_epoch([&](clio::run::u64, clio::run::u64 first, clio::run::u64 nn) {
           cudaMemcpy(d_scratch, d_all + first * F, nn * F * sizeof(float), cudaMemcpyDeviceToDevice);
-        }, base_loss[e], base_acc[e], cnt);
+        }, base_loss[e], base_acc[e], cnt, base_vacc[e]);
       }
       base_time = NowSec() - t0; base_status = "OK";
       cudaFree(d_all);
-      std::fprintf(stderr, "[TRAIN] IN-CORE: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f (%.2fs)\n",
-                   base_loss[0], base_acc[0], epochs - 1, base_loss[epochs - 1], base_acc[epochs - 1], base_time);
+      std::fprintf(stderr, "[TRAIN] IN-CORE: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f val_acc=%.4f (%.2fs)\n",
+                   base_loss[0], base_acc[0], epochs - 1, base_loss[epochs - 1], base_acc[epochs - 1],
+                   base_vacc[epochs - 1], base_time);
     }
   }
 
@@ -412,7 +435,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
 
   gv::Vector<float> vec(tag, 1, 0, 2 * window, 0, page_size, 20000, gv::CacheMode::kLegacy,
                         32, false, StoragePool());
-  std::vector<double> et_loss(epochs), et_acc(epochs);
+  std::vector<double> et_loss(epochs), et_acc(epochs), et_vacc(epochs);
   reset_weights();
   double et_t0 = NowSec();
   for (int e = 0; e < epochs; ++e) {
@@ -425,26 +448,30 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       GnnGatherKernel<<<1, 32>>>(gpu_info, vec.Device(), first * (clio::run::u64)F,
                                  (first + nn) * (clio::run::u64)F, d_scratch);
       ctp::GpuApi::Synchronize();
-    }, et_loss[e], et_acc[e], cnt);
+    }, et_loss[e], et_acc[e], cnt, et_vacc[e]);
+    std::fprintf(stderr, "[TRAIN]   eternia e%02d loss=%.6f acc=%.4f val_acc=%.4f (%.1fs elapsed)\n",
+                 e, et_loss[e], et_acc[e], et_vacc[e], NowSec() - et_t0);
   }
   double et_time = NowSec() - et_t0;
   const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
   std::fprintf(stderr,
-      "[TRAIN] ETERNIA: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f (%.2fs)  "
+      "[TRAIN] ETERNIA: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f val_acc=%.4f (%.2fs)  "
       "peak GPU window=%lluMiB\n", et_loss[0], et_acc[0], epochs - 1,
-      et_loss[epochs - 1], et_acc[epochs - 1], et_time, (unsigned long long)(peak_win >> 20));
+      et_loss[epochs - 1], et_acc[epochs - 1], et_vacc[epochs - 1], et_time,
+      (unsigned long long)(peak_win >> 20));
 
   // ---- Compare curves (bit-exact where in-core ran) ----
   std::string exact = "n/a(OOM)";
   if (base_status == "OK") {
-    double maxdl = 0, maxda = 0;
+    double maxdl = 0, maxda = 0, maxdv = 0;
     for (int e = 0; e < epochs; ++e) {
       maxdl = std::max(maxdl, std::fabs(base_loss[e] - et_loss[e]));
       maxda = std::max(maxda, std::fabs(base_acc[e] - et_acc[e]));
+      maxdv = std::max(maxdv, std::fabs(base_vacc[e] - et_vacc[e]));
     }
-    exact = (maxdl == 0.0 && maxda == 0.0) ? "BIT-EXACT" : "CLOSE";
-    std::fprintf(stderr, "[TRAIN] VERIFY vs in-core: max|dloss|=%.3e max|dacc|=%.3e -> %s\n",
-                 maxdl, maxda, exact.c_str());
+    exact = (maxdl == 0.0 && maxda == 0.0 && maxdv == 0.0) ? "BIT-EXACT" : "CLOSE";
+    std::fprintf(stderr, "[TRAIN] VERIFY vs in-core: max|dloss|=%.3e max|dacc|=%.3e max|dvacc|=%.3e -> %s\n",
+                 maxdl, maxda, maxdv, exact.c_str());
     std::fprintf(stderr, "[TRAIN] per-epoch (in-core || eternia):\n");
     for (int e = 0; e < epochs; ++e)
       std::fprintf(stderr, "   e%02d  loss %.6f acc %.4f  ||  loss %.6f acc %.4f\n",
@@ -452,8 +479,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     REQUIRE(exact == "BIT-EXACT");
   } else {
     std::fprintf(stderr, "[TRAIN] in-core OOM'd -> Eternia is the ONLY method that TRAINED this "
-                 "%lluMiB feature matrix. Final acc=%.4f\n",
-                 (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1]);
+                 "%lluMiB feature matrix. Final train_acc=%.4f val_acc=%.4f\n",
+                 (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1], et_vacc[epochs - 1]);
     REQUIRE(et_acc[epochs - 1] > et_acc[0]);  // training made progress
   }
   std::fprintf(stderr, "====================================================\n");
@@ -462,13 +489,22 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   if (csv) {
     std::ifstream probe(csv); bool empty = !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
     probe.close(); std::ofstream out(csv, std::ios::app);
-    if (out) { if (empty) out << "A_mib,nodes,H,epochs,base_status,base_final_acc,eternia_final_acc,"
-                                 "stored_mib,ratio,peak_gpu_mib,bit_exact\n";
-      out << (dataset_bytes >> 20) << "," << N << "," << H << "," << epochs << "," << base_status << ","
-          << (base_status == "OK" ? base_acc[epochs - 1] : -1.0) << "," << et_acc[epochs - 1] << ","
-          << (stored >> 20) << "," << ratio << "," << (peak_win >> 20) << "," << exact << "\n"; }
+    const char *lib_e = std::getenv("CLIO_CTE_COMPRESS_LIB");
+    const char *pre_e = std::getenv("CLIO_CTE_COMPRESS_PRESET");
+    if (out) { if (empty) out << "data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,"
+                                 "base_final_vacc,eternia_final_acc,eternia_final_vacc,stored_mib,ratio,"
+                                 "peak_gpu_mib,store_s,base_epoch_s,eternia_epoch_s,bit_exact\n";
+      out << dir << "," << (lib_e ? lib_e : "default") << "," << (pre_e ? pre_e : "default") << ","
+          << (dataset_bytes >> 20) << "," << N << "," << H << "," << epochs << "," << base_status << ","
+          << (base_status == "OK" ? base_acc[epochs - 1] : -1.0) << ","
+          << (base_status == "OK" ? base_vacc[epochs - 1] : -1.0) << ","
+          << et_acc[epochs - 1] << "," << et_vacc[epochs - 1] << ","
+          << (stored >> 20) << "," << ratio << "," << (peak_win >> 20) << "," << store_dt << ","
+          << (base_status == "OK" ? base_time / epochs : -1.0) << "," << et_time / epochs << ","
+          << exact << "\n"; }
   }
 
+  cudaFree(d_vcorrect); cudaFree(d_vcount);
   cudaFree(d_lab); cudaFree(dW1); cudaFree(db1); cudaFree(dW2); cudaFree(db2);
   cudaFree(gW1); cudaFree(gb1); cudaFree(gW2); cudaFree(gb2);
   cudaFree(h1_buf); cudaFree(dz1_buf); cudaFree(dz2_buf); cudaFree(d_scratch);

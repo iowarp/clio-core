@@ -214,6 +214,9 @@ if(CLIO_CORE_ENABLE_CUDA)
 
     # Real-data counterpart: k-means over a compressed SIFT1M dataset, checked
     # against an uncompressed in-memory baseline (no synthetic ground truth).
+    # NOTE: test_gpu_vector_kmeans_real_gpu.cc is referenced by this branch but was never committed to
+    # any branch; guard the target so the tree can still configure.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_vector_kmeans_real_gpu.cc")
     add_cuda_executable(test_gpu_vector_kmeans_real FALSE
         test_gpu_vector_kmeans_real_gpu.cc
         INCLUDE_DIRS
@@ -252,6 +255,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     # GNN (GraphSAGE-mean) forward over a LOSSLESS zstd-compressed ogbn-arxiv
     # feature matrix, host-staged through the compressor, checked bit-for-bit
     # against an uncompressed baseline.
+    endif()
     add_cuda_executable(test_gpu_vector_gnn FALSE
         test_gpu_vector_gnn_gpu.cc
         INCLUDE_DIRS
@@ -328,6 +332,9 @@ if(CLIO_CORE_ENABLE_CUDA)
     # Capacity comparison: traditional in-core GPU k-means (whole dataset resident,
     # OOMs past HBM) vs Eternia (compressed/tiered, streams a fixed window). Bench,
     # not registered as a ctest (needs the SIFT dataset + a size env); build only.
+    # NOTE: test_gpu_vector_kmeans_capacity_gpu.cc is referenced by this branch but was never committed to
+    # any branch; guard the target so the tree can still configure.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_vector_kmeans_capacity_gpu.cc")
     add_cuda_executable(test_gpu_vector_kmeans_capacity FALSE
         test_gpu_vector_kmeans_capacity_gpu.cc
         INCLUDE_DIRS
@@ -358,6 +365,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     # GNN capacity comparison: GraphSAGE aggregation+readout over a feature matrix
     # larger than HBM -- traditional in-core (OOMs) vs Eternia zstd-compressed +
     # tiered streaming (bounded window). Build-only (needs data + size env).
+    endif()
     add_cuda_executable(test_gpu_vector_gnn_capacity FALSE
         test_gpu_vector_gnn_capacity_gpu.cc
         INCLUDE_DIRS

@@ -41,15 +41,27 @@ except Exception:
     HAVE_PANDAS = False
 
 
-def read_edges(raw_dir):
-    """Load the DIRECTED edge list (src,dst) int64 [E,2]."""
+def read_edges(raw_dir, edges_npy=None):
+    """Load the DIRECTED edge list. Returns (src, dst) int64 arrays.
+
+    arxiv/products ship raw CSVs; ogbn-papers100M ships an edge_index .npy
+    (shape (2,E)) unpacked by gnn_prep.py, which is memory-mapped rather than
+    parsed so a 1.6e9-edge list costs no extra RAM.
+    """
+    if edges_npy:
+        ei = np.load(edges_npy, mmap_mode="r")
+        if ei.shape[0] != 2:
+            ei = ei.T
+        return np.asarray(ei[0], dtype=np.int64), np.asarray(ei[1], dtype=np.int64)
     path = os.path.join(raw_dir, "edge.csv.gz")
     if HAVE_PANDAS:
         df = pd.read_csv(path, header=None, compression="gzip", dtype=np.int64)
-        return df.to_numpy()
-    with gzip.open(path, "rt") as f:
-        rows = [ln.split(",") for ln in f if ln.strip()]
-    return np.asarray(rows, dtype=np.int64)
+        e = df.to_numpy()
+    else:
+        with gzip.open(path, "rt") as f:
+            rows = [ln.split(",") for ln in f if ln.strip()]
+        e = np.asarray(rows, dtype=np.int64)
+    return e[:, 0], e[:, 1]
 
 
 def build_csr(key, val, N):
@@ -98,7 +110,8 @@ def sample_nbrs(nodes, indptr, indices, fanout, rng):
     return indices[starts[pick] + rand]
 
 
-def build_minibatch_node_batches(N, in_indptr, in_indices, batch, fanout, seed=0):
+def build_minibatch_node_batches(N, in_indptr, in_indices, batch, fanout, seed=0,
+                                 max_batches=0):
     """PRIMARY trace: fanout-limited GraphSAGE sampling. Returns a list of per-batch
     NODE-id arrays = unique({seeds} U sampled-1hop U sampled-2hop). Page-granularity
     independent, so each granularity re-pages the same node batches."""
@@ -106,7 +119,13 @@ def build_minibatch_node_batches(N, in_indptr, in_indices, batch, fanout, seed=0
     seeds_all = np.arange(N, dtype=np.int64)
     rng.shuffle(seeds_all)
     batches = []
-    for b0 in range(0, N, batch):
+    # A full epoch over ogbn-papers100M is ~108k minibatches; sampling a random
+    # subset of them estimates the same hit rate at a fraction of the cost. The
+    # seed order is already shuffled, so a prefix IS a uniform random subset.
+    n_all = (N + batch - 1) // batch
+    n_take = n_all if max_batches <= 0 else min(n_all, max_batches)
+    for bi in range(n_take):
+        b0 = bi * batch
         seeds = seeds_all[b0:b0 + batch]
         h1 = np.unique(sample_nbrs(seeds, in_indptr, in_indices, fanout[0], rng))
         h2 = (np.unique(sample_nbrs(h1, in_indptr, in_indices, fanout[1], rng))
@@ -142,7 +161,7 @@ def hitrate_lru(pages, capacity):
 
 
 def evaluate(rows_per_page, N, node_predictor, node_deg, batches, sweep_node_seq,
-             budgets, do_lru, rng):
+             budgets, do_lru, rng, lru_limit=0):
     """Hit rates for every policy at one page granularity. Returns
     {trace: {policy: {pct: hitrate}}} plus (npages, page_seqs)."""
     npages = (N + rows_per_page - 1) // rows_per_page
@@ -181,7 +200,10 @@ def evaluate(rows_per_page, N, node_predictor, node_deg, batches, sweep_node_seq
             pol["degree-pin"][pct] = float(dg_mask[pages].mean())
             pol["first-C"][pct] = float((pages < c).mean())
             pol["random-C"][pct] = float(rmask[pages].mean())
-            pol["LRU"][pct] = (hitrate_lru(pages, c) if do_lru else float("nan"))
+            # LRU is a pure-Python O(n) walk; cap the prefix so a 3.2e9-access
+            # papers100M sweep does not run for days (reported as a prefix estimate).
+            lru_pages = pages if not lru_limit else pages[:lru_limit]
+            pol["LRU"][pct] = (hitrate_lru(lru_pages, c) if do_lru else float("nan"))
         out[tn] = pol
     return npages, traces, out
 
@@ -193,6 +215,15 @@ def main():
     ap.add_argument("--damping", type=float, default=0.85)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--md-out", default=None)
+    ap.add_argument("--edges", default=None,
+                    help="edge_index .npy (papers100M); default reads raw/edge.csv.gz")
+    ap.add_argument("--max-batches", type=int, default=0,
+                    help="cap sampled minibatches (0 = a full epoch)")
+    ap.add_argument("--sweep-sample", type=int, default=0,
+                    help="subsample the full-sweep read sequence to this many "
+                         "accesses (0 = all; papers100M has 3.2e9)")
+    ap.add_argument("--lru-limit", type=int, default=20_000_000,
+                    help="max accesses fed to the O(n) Python LRU (0 = no cap)")
     args = ap.parse_args()
 
     with open(os.path.join(args.data, "meta.txt")) as f:
@@ -200,8 +231,7 @@ def main():
     row_bytes = F * 4
     print(f"[PR] dataset N={N} F={F} C={C} row={row_bytes}B")
 
-    edges = read_edges(os.path.join(args.data, "raw"))
-    src, dst = edges[:, 0], edges[:, 1]
+    src, dst = read_edges(os.path.join(args.data, "raw"), args.edges)
     E = src.shape[0]
     outdeg = np.bincount(src, minlength=N).astype(np.int64)
     indeg = np.bincount(dst, minlength=N).astype(np.int64)
@@ -228,8 +258,14 @@ def main():
 
     fanout = (15, 10)
     batches = build_minibatch_node_batches(N, in_indptr, in_indices, args.batch,
-                                           fanout, seed=0)
+                                           fanout, seed=0,
+                                           max_batches=args.max_batches)
     sweep_node_seq = in_indices  # each in-neighbor read once, in id order
+    if args.sweep_sample and sweep_node_seq.shape[0] > args.sweep_sample:
+        step = sweep_node_seq.shape[0] // args.sweep_sample
+        sweep_node_seq = np.ascontiguousarray(sweep_node_seq[::step])
+        print(f"[PR] full-sweep subsampled 1-in-{step} -> {len(sweep_node_seq):,} "
+              f"accesses (of {len(in_indices):,})")
     prim_total = int(sum(np.unique(b).size for b in batches))
     print(f"[PR] minibatch batches={len(batches)} | full-sweep reads={len(sweep_node_seq):,}")
 
@@ -242,7 +278,10 @@ def main():
     def emit(s=""):
         print(s); lines.append(s)
 
-    emit(f"\n## PageRank page-access prediction vs simple caching (ogbn-arxiv)\n")
+    # The dataset name was hardcoded to ogbn-arxiv, which mislabels every report
+    # produced for any other dataset; take it from the data directory instead.
+    ds_name = os.path.basename(os.path.abspath(args.data).rstrip("/")) or "unknown"
+    emit(f"\n## PageRank page-access prediction vs simple caching ({ds_name})\n")
     emit(f"N={N} nodes, F={F} (row={row_bytes} B), directed E={E:,}, reverse-PR "
          f"damping {args.damping}/{args.iters} it. GraphSAGE fanout {fanout}, "
          f"batch {args.batch}. Each MISS = one zstd decompress + page refetch.\n")
@@ -258,7 +297,8 @@ def main():
         do_lru = (rpp >= 8)  # LRU loop is O(seq); skip only if seq huge (node-lvl minibatch)
         do_lru_here = do_lru or (prim_total < 3_000_000)
         npages, traces, res = evaluate(rpp, N, predictor, tot_deg, batches,
-                                       sweep_node_seq, budgets, do_lru_here, rng)
+                                       sweep_node_seq, budgets, do_lru_here, rng,
+                                       lru_limit=args.lru_limit)
         detail[rpp] = (npages, res)
         pk = f"{rpp} row" + ("s" if rpp != 1 else "") + f" ({rpp*row_bytes//1024 if rpp*row_bytes>=1024 else rpp*row_bytes}{'KiB' if rpp*row_bytes>=1024 else 'B'}, {npages} pages)"
         for tn in ("minibatch", "full-sweep"):
