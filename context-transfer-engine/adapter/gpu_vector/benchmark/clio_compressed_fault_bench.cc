@@ -251,6 +251,7 @@ int main(int argc, char **argv) {
                           /*allow_cold_miss_fault=*/true, storage_pool,
                           /*family_pages=*/num_pages);
   vec.SetLogicalBytes(data_bytes);
+  std::vector<uint64_t> page_sum(num_pages, 0);
   const uint64_t t_seed0 = NowMs();
   {
     clio::cte::core::Client put_client(c.compressed
@@ -261,6 +262,9 @@ int main(int argc, char **argv) {
       for (uint64_t p = 0; p < pages_per_slice; ++p) {
         const uint64_t gp = sl * pages_per_slice + p;
         FillSlice(host.data(), kPage, gp, c.fill_const_frac);
+        uint64_t ps = 0;
+        for (uint64_t j = 0; j < kPage; ++j) ps += host[j];
+        page_sum[gp] = ps;
         auto buf = CLIO_CPU_IPC->AllocateBuffer(kPage);
         std::memcpy(buf.ptr_, host.data(), kPage);
         // Seed COLD (0.3): placement follows the score protocol -- only the
@@ -350,6 +354,9 @@ int main(int argc, char **argv) {
   // epoch matches the slice's latest touch, so re-promotion refreshes
   // recency instead of leaving the hottest slice first in line.
   std::deque<std::pair<uint64_t, uint64_t>> promo_lru;
+  uint64_t bounces = 0;
+  uint64_t t_direct = 0, t_task = 0, t_consume = 0;
+  int pending_evicts_ratio = 0;
   std::vector<uint64_t> promo_epoch(slices, 0);
   uint64_t promoted_bytes = 0;
   std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> reorgs;
@@ -385,7 +392,7 @@ int main(int argc, char **argv) {
       } else {
         promoted[sl] = 1;
         promo_lru.emplace_back(sl, ++promo_epoch[sl]);
-        promoted_bytes += (uint64_t) (c.slice_bytes * 0.75);
+        promoted_bytes += (uint64_t) (c.slice_bytes * (c.compressed ? 0.36 : 1.0));
         // 1.0, not 0.95: MaxBwDpe treats targets with score > blob score
         // as FALLBACK, so anything below the hbm tier's 1.0 puts hbm in
         // the fallback group and the blob lands in ram.
@@ -399,30 +406,49 @@ int main(int argc, char **argv) {
     // that mostly fits). Evict LRU promoted slices only when the promoted
     // footprint nears the tier cap.
     if (prefetch_on) {
-      const uint64_t est_slice = (uint64_t) (c.slice_bytes * 0.75);
+      // Measured lz4 ratio on this data is ~0.34; overestimating stored size
+      // made the budget refuse promotions at half the tier's true capacity.
+      const uint64_t est_slice = (uint64_t) (c.slice_bytes *
+          (c.compressed ? 0.36 : 1.0));
       const uint64_t budget = (c.hbm_mb << 20) * 85 / 100;
-      uint64_t scanned = 0;
-      while (promoted_bytes + est_slice * c.k_sel > budget &&
-             !promo_lru.empty() && scanned < promo_lru.size() + 8) {
-        auto [victim, epoch] = promo_lru.front();
-        promo_lru.pop_front();
-        ++scanned;
-        if (!promoted[victim] || promo_epoch[victim] != epoch) {
-          continue;   // stale entry: slice was refreshed or already evicted
+      // Bounced promotions mean the tier is REALLY full whatever our
+      // estimate says: evict to make room so retries converge.
+      const uint64_t forced = bounces;
+      bounces = 0;
+      auto evict_one = [&]() -> bool {
+        uint64_t scanned = 0;
+        while (!promo_lru.empty() && scanned < promo_lru.size() + 8) {
+          auto [victim, epoch] = promo_lru.front();
+          promo_lru.pop_front();
+          ++scanned;
+          if (!promoted[victim] || promo_epoch[victim] != epoch) {
+            continue;   // stale: refreshed or already evicted
+          }
+          bool ahead = false;
+          for (uint64_t j2 = i;
+               j2 < std::min<uint64_t>(i + kLookahead, access.size());
+               ++j2) {
+            if (access[j2] == victim) { ahead = true; break; }
+          }
+          if (ahead) {
+            promo_lru.emplace_back(victim, epoch);   // still needed
+            continue;
+          }
+          promoted[victim] = 0;
+          promoted_bytes -= est_slice;
+          set_score(victim, 0.30f);
+          return true;
         }
-        bool ahead = false;
-        for (uint64_t j2 = i;
-             j2 < std::min<uint64_t>(i + kLookahead, access.size()); ++j2) {
-          if (access[j2] == victim) { ahead = true; break; }
-        }
-        if (ahead) {
-          promo_lru.emplace_back(victim, epoch);   // still needed
-          continue;
-        }
-        promoted[victim] = 0;
-        promoted_bytes -= est_slice;
-        set_score(victim, 0.30f);
+        return false;
+      };
+      for (uint64_t e2 = 0; e2 < forced; ++e2) {
+        if (!evict_one()) break;
       }
+      while (promoted_bytes + est_slice * c.k_sel > budget) {
+        if (!evict_one()) break;
+      }
+      pending_evicts_ratio = 0;   // placeholder anchor
+      (void) pending_evicts_ratio;
     }
     batch.clear();
     // ZERO-TASK first: promoted, hbm-resident frames resolve straight to
@@ -443,21 +469,44 @@ int main(int argc, char **argv) {
       }
       batch.emplace_back(dst, sl);
     }
+    const uint64_t tp0 = NowMs();
     gv::HbmDirectFetchBatch(vec, core_cli, want, &leftover, &dstats);
+    t_direct += NowMs() - tp0;
+    // Self-correcting accounting: a leftover whose record shows a score
+    // below threshold is a promotion that BOUNCED off a full tier (the
+    // landed-tier score makes that visible). Clear its promoted state and
+    // refund the budget so eviction/retry can converge.
+    if (prefetch_on) {
+      for (const auto &lw : leftover) {
+        const uint64_t sl = lw.gp / pages_per_slice;
+        if (!promoted[sl]) continue;
+        clio::cte::core::ShmBlobRecord r2;
+        if (core_cli.TryGetBlobRecordShm(vec.TagId(),
+                                         vec.PageBlobName(lw.gp), &r2) &&
+            r2.score_ < 0.9f) {
+          promoted[sl] = 0;
+          promoted_bytes -= (uint64_t) (c.slice_bytes * (c.compressed ? 0.36 : 1.0));
+          bounces += 1;   // tier genuinely full: evict below
+        }
+      }
+    }
     for (const auto &lw : leftover) {
       if (!vec.FetchSpanDeviceAsync(lw.dst, lw.gp * kPage, lw.len, &fl)) {
         ++fails;
       }
     }
+    const uint64_t tp1 = NowMs();
     if (!vec.WaitFetches(fl)) ++fails;
+    t_task += NowMs() - tp1;
+    const uint64_t tp2 = NowMs();
     for (auto &pr : batch) {
       ConsumeKernel<<<256, 256>>>(pr.first, c.slice_bytes, d_sum);
       for (uint64_t p = 0; p < pages_per_slice; ++p) {
-        expected += SliceSum(kPage, pr.second * pages_per_slice + p,
-                             c.fill_const_frac);
+        expected += page_sum[pr.second * pages_per_slice + p];
       }
       fetched += c.slice_bytes;
     }
+    t_consume += NowMs() - tp2;
   }
   while (!reorgs.empty()) drain_one();
   std::printf("CFB reorg: %llu ok, %llu failed\n",
@@ -482,6 +531,8 @@ int main(int argc, char **argv) {
       run_ms / 1000.0, c.tokens * 1000.0 / (double) run_ms,
       (double) fetched / (1ull << 30) / (run_ms / 1000.0),
       got == expected ? "OK" : "MISMATCH", (unsigned long long) fails);
+  std::printf("CFB time: direct=%.1fs task=%.1fs consume=%.1fs\n",
+              t_direct / 1000.0, t_task / 1000.0, t_consume / 1000.0);
   std::printf("CFB direct: %llu hits %llu misses | no_rec=%llu cold=%llu "
               "trunc=%llu unresolv=%llu moved=%llu\n",
               (unsigned long long) dstats.hits,

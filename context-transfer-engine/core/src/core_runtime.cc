@@ -2927,7 +2927,25 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     // mirror re-publish below.
     blob_info.blocks_ = std::move(staging.blocks_);
     blob_info.total_size_cache_ = staging.total_size_cache_;
-    blob_info.score_ = placed_score;
+    // TRUTHFUL score: record the score of the tier the blob actually LANDED
+    // on, not the one the caller asked for. Placement near a full tier
+    // silently falls back to a lower tier at the requested score, which
+    // left clients (the score-driven prefetcher, the zero-task hbm read
+    // path) believing a promotion succeeded when the blocks were still in
+    // ram -- they could neither trust the record nor correct their
+    // capacity accounting. With the landed-tier score, a bounced promotion
+    // is visible (score < requested) and retryable.
+    {
+      float landed = placed_score;
+      if (!blob_info.blocks_.empty()) {
+        TargetInfo *tinfo = registered_targets_.find(
+            blob_info.blocks_[0].bdev_client_.pool_id_);
+        if (tinfo != nullptr) {
+          landed = tinfo->target_score_;
+        }
+      }
+      blob_info.score_ = landed;
+    }
     blob_info.BumpPlacementGen();
 
     // WAL: log the new block layout (kExtendBlob replays with full-replacement

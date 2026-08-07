@@ -91,6 +91,7 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
   }
   std::vector<Pending> pend;
   pend.reserve(want.size());
+  std::vector<size_t> raw_served;
   // Pass 1: resolve + gather (D2D, async on our stream).
   clio::run::u64 gather_bytes = 0;
   std::vector<clio::cte::core::ShmBlobRecord> recs(want.size());
@@ -103,7 +104,7 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
       if (stats) stats->no_rec++;
       continue;
     }
-    if (rec.score_ < 0.9f || !rec.IsTransformed()) {
+    if (rec.score_ < 0.9f) {
       if (stats) stats->cold++;
       continue;
     }
@@ -183,9 +184,23 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
       if (stats) stats->misses++;
       continue;
     }
+    if (!rec.IsTransformed()) {
+      // RAW blob: the gathered bytes ARE the data -- copy to dst directly,
+      // no decompress. (Gathered to scratch first because blocks scatter.)
+      const clio::run::u64 n =
+          std::min<clio::run::u64>(want[i].len, rec.total_size_);
+      if (cudaMemcpyAsync(want[i].dst, frame, n, cudaMemcpyDeviceToDevice,
+                          stream) == cudaSuccess) {
+        raw_served.push_back(i);
+      } else {
+        leftover->push_back(want[i]);
+        if (stats) stats->misses++;
+      }
+      continue;
+    }
     pend.push_back(Pending{&want[i], rec, frame, rec.total_size_});
   }
-  if (pend.empty()) return true;
+  if (pend.empty() && raw_served.empty()) return true;
   // Pass 2: headers + tables (small D2H), one sync.
   // (CompressionHeader wire layout: 3x u32 + pad + 2x u64 = 32 bytes.)
   const size_t kHdr = 32;
@@ -221,6 +236,23 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
     all_ok = ctp::raw_lz4::DecompressBatch(frames.data(), frames.size(),
                                            stream) &&
              cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  // Raw-served frames: ensure their D2D copies completed, then gen-check.
+  if (!raw_served.empty()) {
+    cudaStreamSynchronize(stream);
+    for (size_t ri : raw_served) {
+      clio::cte::core::ShmBlobRecord after;
+      const std::string name = vec.PageBlobName(want[ri].gp);
+      const bool still =
+          cli.TryGetBlobRecordShm(vec.TagId(), name, &after) &&
+          after.placement_gen_ == recs[ri].placement_gen_;
+      if (!still) {
+        leftover->push_back(want[ri]);
+        if (stats) { stats->misses++; stats->moved++; }
+      } else if (stats) {
+        stats->hits++;
+      }
+    }
   }
   // Pass 4: placement_gen recheck -- a frame whose blocks moved mid-read is
   // poisoned; refetch it through the task path.
