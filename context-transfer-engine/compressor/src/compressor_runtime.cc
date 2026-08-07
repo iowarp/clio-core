@@ -32,6 +32,8 @@
  */
 
 // Copyright 2024 IOWarp contributors
+#include <atomic>
+#include <chrono>
 #include <clio_cte/compressor/compressor_runtime.h>
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
@@ -1285,30 +1287,33 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
 // compressed size is over-estimated (cuSZp's stream is self-delimiting).
 char *Runtime::AcquireDevFetch(clio::run::u64 size) {
   std::unique_lock<std::mutex> lk(dev_fetch_mtx_);
-  for (;;) {
-    if (!dev_fetch_free_.empty() && dev_fetch_size_ >= size) {
-      char *b = dev_fetch_free_.back();
-      dev_fetch_free_.pop_back();
+  if (!dev_fetch_free_.empty() && dev_fetch_size_ >= size) {
+    char *b = dev_fetch_free_.back();
+    dev_fetch_free_.pop_back();
+    return b;
+  }
+  if (dev_fetch_alloced_ < kDevFetchPoolCap || dev_fetch_size_ < size) {
+    // (Re)allocate outside the fault hot loop: this runs at most
+    // kDevFetchPoolCap times per size class, typically once at warmup —
+    // NOT per fault, which is what deadlocked.
+    if (dev_fetch_size_ < size) {
+      for (char *b : dev_fetch_free_) ctp::GpuApi::Free(b);
+      dev_fetch_free_.clear();
+      dev_fetch_alloced_ = 0;
+      dev_fetch_size_ = size;
+    }
+    char *b = ctp::GpuApi::Malloc<char>(dev_fetch_size_);
+    if (b != nullptr) {
+      ++dev_fetch_alloced_;
       return b;
     }
-    if (dev_fetch_alloced_ < kDevFetchPoolCap || dev_fetch_size_ < size) {
-      // (Re)allocate outside the fault hot loop: this runs at most
-      // kDevFetchPoolCap times per size class, typically once at warmup —
-      // NOT per fault, which is what deadlocked.
-      if (dev_fetch_size_ < size) {
-        for (char *b : dev_fetch_free_) ctp::GpuApi::Free(b);
-        dev_fetch_free_.clear();
-        dev_fetch_alloced_ = 0;
-        dev_fetch_size_ = size;
-      }
-      char *b = ctp::GpuApi::Malloc<char>(dev_fetch_size_);
-      if (b != nullptr) {
-        ++dev_fetch_alloced_;
-        return b;
-      }
-    }
-    dev_fetch_cv_.wait(lk);
   }
+  // NEVER wait here: a condition-variable wait inside a task body parks the
+  // WORKER THREAD, and with more concurrent gets than pool slots the
+  // continuations that would release buffers can never run -- deadlock by
+  // starvation (observed with 16-deep batched host-API fetches). The caller
+  // falls back to a host fetch buffer.
+  return nullptr;
 }
 
 void Runtime::ReleaseDevFetch(char *buf) {
@@ -1322,6 +1327,13 @@ void Runtime::ReleaseDevFetch(char *buf) {
 template <typename GetT>
 clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     clio::run::shared_ptr<GetT>& task) {
+  {
+    static std::atomic<int> s_entries{0};
+    const int e = ++s_entries;
+    if (e <= 3 || (e & 4095) == 0) {
+      std::fprintf(stderr, "[cfb-entry] DecompressGetBlobImpl n=%d\n", e);
+    }
+  }
   try {
     clio::run::u64 expected_size = task->size_;
     if (task->blob_data_.IsNull()) { task->return_code_ = 1; CLIO_CO_RETURN; }
@@ -1389,12 +1401,22 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     } else {
       tmpp = tmp.shm_.template Cast<void>();
     }
+    static std::atomic<unsigned long long> s_n{0}, s_core_us{0},
+        s_hdr_us{0}, s_dec_us{0};
+    auto now_us = [] {
+      return (unsigned long long)
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const unsigned long long t_core0 = now_us();
     auto gt = core_client_->AsyncGetBlob(task->tag_id_, name, task->offset_,
         fetch_size, task->flags_, tmpp,
         ForwardQuery(task->tag_id_, name));
     CLIO_CO_AWAIT(gt);
+    s_core_us += now_us() - t_core0;
     if (gt->return_code_ != 0) { free_tmp();
       task->return_code_ = 10 + gt->return_code_; CLIO_CO_RETURN; }
+    const unsigned long long t_hdr0 = now_us();
 
     // The header must be readable on the host; for a device fetch buffer pull
     // just the 32-byte header across.
@@ -1402,11 +1424,12 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     CompressionHeader header_host;
 #if CTP_ENABLE_GPU
     if (dev_tmp != nullptr) {
-      void *hstream = ctp::GpuApi::CreateStream();
+      // Cached per-thread stream: create/sync/destroy per task cost ~0.3 ms.
+      static thread_local void *s_hdr_stream = nullptr;
+      if (s_hdr_stream == nullptr) s_hdr_stream = ctp::GpuApi::CreateStream();
       ctp::GpuApi::MemcpyAsync(reinterpret_cast<char*>(&header_host), dev_tmp,
-                               hsz, hstream);
-      ctp::GpuApi::Synchronize(hstream);
-      ctp::GpuApi::DestroyStream(hstream);
+                               hsz, s_hdr_stream);
+      ctp::GpuApi::Synchronize(s_hdr_stream);
     } else
 #endif
     {
@@ -1482,6 +1505,8 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
         cdata = chost.data();
       }
       bool ok;
+      s_hdr_us += now_us() - t_hdr0;
+      const unsigned long long t_dec0 = now_us();
       if (ctp::IsDevicePointer(out.ptr_) && gpu_codec) {
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
       } else if (ctp::IsDevicePointer(out.ptr_)) {
@@ -1491,6 +1516,15 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
         // DEBUG(first few): prove the bytes actually landed at out.ptr_.
         } else {
         ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      }
+      s_dec_us += now_us() - t_dec0;
+      const unsigned long long n2 = ++s_n;
+      if ((n2 & 1023) == 0) {
+        std::fprintf(stderr,
+                     "[cfb-prof] n=%llu core=%.2fms hdr=%.2fms dec=%.2fms "
+                     "(avg per task)\n",
+                     n2, s_core_us / 1000.0 / n2, s_hdr_us / 1000.0 / n2,
+                     s_dec_us / 1000.0 / n2);
       }
       free_tmp();
       task->return_code_ = ok ? 0 : 5;
@@ -1911,6 +1945,18 @@ clio::run::TaskResume Runtime::PutBlob(
 
 clio::run::TaskResume Runtime::GetBlob(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
+  if (task->offset_ == 0 && task->context_.replica_ == 0) {
+    // Whole-frame read: take the pod-fault decompress path directly -- a
+    // SINGLE core read of the compressed frame (D2D from an hbm:: tier into
+    // the pooled device fetch buffer) + nvcomp decompress straight into the
+    // caller's destination; uncompressed blobs pass through via its header
+    // check. The interposer below served compressed reads with forward +
+    // GetBlobSize + whole-blob refetch + staged decompress + slice: four
+    // hops and multiple full-page copies PER READ (measured ~2.6 ms/MiB,
+    // the entire fetch ceiling of the compressed fault path).
+    CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
+    CLIO_CO_RETURN;
+  }
   CLIO_TASK_BODY_BEGIN
   // Serve the read as-is first: the untransformed case (and every replica-
   // addressed read) costs nothing extra, and the core reports the blob's

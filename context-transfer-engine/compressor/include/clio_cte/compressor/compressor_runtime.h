@@ -142,7 +142,7 @@ private:
    * sync vs the spin-waiting faulting kernel). Grow-once ring, mutex+cv
    * guarded, capped at kDevFetchPoolCap buffers.
    */
-  static constexpr int kDevFetchPoolCap = 8;
+  static constexpr int kDevFetchPoolCap = 32;
   std::mutex dev_fetch_mtx_;
   std::condition_variable dev_fetch_cv_;
   std::vector<char *> dev_fetch_free_;
