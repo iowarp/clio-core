@@ -47,6 +47,35 @@ size_t ModelWeightsAssimilator::ParseFormatParam(const std::string& format,
   return static_cast<size_t>(parsed);
 }
 
+PageMap ModelWeightsAssimilator::BuildPageMap(const AssimilationCtx& ctx,
+                                             clio::run::u64 page_size) {
+  const std::string path = GetUrlPath(ctx.src);
+  const size_t total = GetFileSize(path);
+  if (total == 0 || page_size == 0) return PageMap();
+  const bool flat = ParseFormatParam(ctx.format, "flat", 0) != 0;
+  const size_t nblocks_cfg = ParseFormatParam(ctx.format, "nblocks", 1);
+  const size_t nblocks = nblocks_cfg == 0 ? 1 : nblocks_cfg;
+  const size_t num_pages = (total + page_size - 1) / page_size;
+  const size_t ppb = (num_pages + nblocks - 1) / nblocks;
+  std::vector<PageExtent> ex;
+  ex.reserve(num_pages);
+  for (size_t p = 0; p < num_pages; ++p) {
+    const clio::run::u64 off = (clio::run::u64) p * page_size;
+    const clio::run::u64 n =
+        std::min<clio::run::u64>(page_size, total - off);
+    if (flat) {
+      // One blob, offset-addressed: the page space IS the blob.
+      ex.push_back(PageExtent{"w", off, off, n});
+    } else {
+      // Per-page blobs, bare-stem named exactly as Schedule() writes them.
+      const size_t blk = ppb ? p / ppb : 0;
+      ex.push_back(PageExtent{
+          "b" + std::to_string(blk) + "_pi" + std::to_string(p), 0, off, n});
+    }
+  }
+  return PageMap::Build(page_size, std::move(ex));
+}
+
 clio::run::TaskResume ModelWeightsAssimilator::Schedule(
     const AssimilationCtx& ctx, int& error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
@@ -125,6 +154,29 @@ clio::run::TaskResume ModelWeightsAssimilator::Schedule(
     HLOG(kError, "ModelWeightsAssimilator: failed to get/create tag '{}'", tag_name);
     error_code = -3;
     CLIO_CO_RETURN;
+  }
+
+  // ----- Page map blob (pagify): the page-space layout -----
+  // Consumers address this dataset as page 0, 1, 2, ... and resolve those
+  // numbers through this map, so they never encode a blob-naming or
+  // layout convention of their own.
+  {
+    PageMap pm = BuildPageMap(ctx, page_size);
+    if (pm.NumPages() > 0) {
+      const std::string text = pm.Serialize();
+      auto pbuf = CLIO_IPC->AllocateBuffer(text.size());
+      std::memcpy(pbuf.ptr_, text.data(), text.size());
+      auto ptask = cte_client_->AsyncPutBlob(
+          tag_id, "pagemap", 0, text.size(),
+          pbuf.shm_.template Cast<void>(), 1.0f,
+          clio::cte::core::Context(), 0);
+      CLIO_CO_AWAIT(ptask);
+      if (ptask->return_code_ != 0) {
+        HLOG(kWarning, "ModelWeightsAssimilator: pagemap PutBlob rc={}",
+             ptask->return_code_);
+      }
+      CLIO_IPC->FreeBuffer(pbuf);
+    }
   }
 
   // ----- Manifest blob (geometry; ignored by the vector) -----

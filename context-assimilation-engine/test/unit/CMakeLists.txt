@@ -814,3 +814,33 @@ if(CAE_LABELING_ENABLED)
 
   install(TARGETS test_cae_label_client DESTINATION bin)
 endif()
+
+#------------------------------------------------------------------------------
+# PageMap (pagify): unified page numbering, incl. partial and mixed pages.
+#------------------------------------------------------------------------------
+add_executable(test_page_map
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_page_map.cc
+)
+
+target_include_directories(test_page_map
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_page_map
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_page_map DESTINATION bin)
+
+add_test(NAME cae_page_map COMMAND test_page_map)
+set_tests_properties(cae_page_map PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;pagemap"
+)

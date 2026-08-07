@@ -61,6 +61,19 @@ class ModelWeightsAssimilator : public BaseAssimilator {
   clio::run::TaskResume Schedule(const AssimilationCtx& ctx,
                                  int& error_code) override;
 
+  /**
+   * PAGIFY (GGUF): the model file laid out linearly across the page space.
+   *
+   * Assimilation writes fixed-size page blobs, so the map is one extent
+   * per page -- but expressing it as EXTENTS rather than "page N == blob
+   * b0_pi<N>" is what lets the same consumer read a layout where a page
+   * mixes several blobs, or holds only part of one, without knowing which
+   * layout it got. The final page is short whenever the file is not a
+   * multiple of the page size, which is already the partial case.
+   */
+  PageMap BuildPageMap(const AssimilationCtx& ctx,
+                       clio::run::u64 page_size) override;
+
  private:
   std::string GetUrlProtocol(const std::string& url);
   std::string GetUrlPath(const std::string& url);
