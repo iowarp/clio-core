@@ -26,6 +26,7 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -271,6 +272,27 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
     }
   }
   return true;
+}
+
+/**
+ * Install the zero-task read path on `vec`: from here, every whole-page
+ * fetch the vector issues is offered to the in-process resolver first, and
+ * only refusals become GetBlob tasks. One shared client + stats block per
+ * vector. Safe to call once at init; a null install is a no-op.
+ */
+template <typename VecT>
+inline void InstallDirectReads(VecT &vec, DirectStats *stats) {
+  auto cli = std::make_shared<clio::cte::core::Client>(
+      clio::cte::core::kCtePoolId);
+  cli->AttachShmCache();
+  VecT *vp = &vec;
+  vec.SetDirectPageFn([vp, cli, stats](clio::run::u64 gp, uint8_t *dst,
+                                       clio::run::u64 len) -> bool {
+    std::vector<DirectWant> want{DirectWant{gp, dst, len}};
+    std::vector<DirectWant> leftover;
+    HbmDirectFetchBatch(*vp, *cli, want, &leftover, stats);
+    return leftover.empty();
+  });
 }
 
 }  // namespace clio::cte::gpu_vector

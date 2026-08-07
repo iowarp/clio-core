@@ -300,6 +300,22 @@ class Vector {
 #endif
   }
 
+  /** Zero-task read hook. When set, FetchSpanDeviceAsync offers each
+   *  whole page to this callback FIRST: a page whose promotion has landed
+   *  (score >= 0.9, blocks in a device tier) can be resolved in-process
+   *  and copied device-to-device with no task at all, and only the
+   *  refusals become GetBlob tasks. Set by the direct-read layer
+   *  (gpu_vector_hbm_direct.h); null leaves the task path unchanged.
+   *  Returns true if it served the page. */
+  using DirectPageFn =
+      std::function<bool(clio::run::u64 gp, unsigned char *dst,
+                         clio::run::u64 len)>;
+  void SetDirectPageFn(DirectPageFn fn) {
+#if !CTP_IS_DEVICE_PASS
+    if (impl_) impl_->direct_page = std::move(fn);
+#endif
+  }
+
   /** MEASURED stored/original ratio, sampled from the first `n_sample`
    *  page blobs after assimilation. 0 when unknown (no pages, or the
    *  sizes are unavailable). Callers use this to size tiers by what the
@@ -388,6 +404,14 @@ class Vector {
     return impl_ ? impl_->ring_cap : 0;
 #else
     return 0;
+#endif
+  }
+
+  /** Zero-task read counters (see SetDirectPageFn). */
+  void DirectStatsCounts(clio::run::u64 *hits, clio::run::u64 *misses) const {
+#if !CTP_IS_DEVICE_PASS
+    if (hits) *hits = impl_ ? impl_->direct_hits : 0;
+    if (misses) *misses = impl_ ? impl_->direct_misses : 0;
 #endif
   }
 
@@ -1198,6 +1222,10 @@ struct Vector<T>::Impl {
   clio::run::u64 span_hits = 0, span_misses = 0;
   /** In-flight score promotions (see PromoteSpan). */
   std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> promos;
+  /** Zero-task page resolver (see SetDirectPageFn). */
+  std::function<bool(clio::run::u64, unsigned char *, clio::run::u64)>
+      direct_page;
+  clio::run::u64 direct_hits = 0, direct_misses = 0;
   /** Permanent (first-touch) admissions get exact cudaMallocs under
    *  their own budget -- static model tensors, reused every token. */
   clio::run::u64 static_bytes = 0, static_cap = 3ull << 30;
@@ -1906,6 +1934,16 @@ inline bool Vector<T>::FetchSpanDeviceAsync(unsigned char *dst_dev,
     const clio::run::u64 poff = cur - gp * page;
     const clio::run::u64 seg  =
         std::min<clio::run::u64>(page - poff, off + len - cur);
+    // ZERO-TASK first: a promoted, device-resident page resolves in
+    // process (D2D + client-side decompress) with no task at all.
+    if (impl_->direct_page && poff == 0 && seg == page &&
+        impl_->direct_page(gp, (unsigned char *) dst_dev + (cur - off),
+                           seg)) {
+      ++impl_->direct_hits;
+      cur += seg;
+      continue;
+    }
+    if (impl_->direct_page) ++impl_->direct_misses;
     const std::string name =
         view_.base.flat_layout ? std::string("w") : PageBlobName(gp);
     const clio::run::u64 boff = view_.base.flat_layout ? cur : poff;
