@@ -527,6 +527,93 @@ CTP_GPU_FUN clio::run::u32 EvictSlot(::clio::run::gpu::IpcManager *ipc,
   return EvictSlotInRange(ipc, v, block_idx, 0, v.base.gpu_pages_per_block);
 }
 
+/** Device address of page `gp` inside the kHbm tier, or 0 if not resident
+ *  there / no directory was published. */
+CTP_INLINE_GPU_FUN clio::run::u64 DevPageAddr(const DeviceViewBase &v,
+                                              int32_t gp) {
+  if (v.dev_page_addr == nullptr || gp < 0) return 0;
+  if ((clio::run::u64) gp >= v.dev_page_count) return 0;
+  return v.dev_page_addr[gp];
+}
+
+/** Block-collective copy of `bytes` from device memory to device memory.
+ *  Every thread of the block must call this. 16-byte vector loads where the
+ *  operands allow, byte tail otherwise. */
+CTP_GPU_FUN void BlockCopyPage(void *dst, const void *src,
+                               clio::run::u64 bytes) {
+  const clio::run::u64 a = (clio::run::u64) dst | (clio::run::u64) src;
+  if ((a & 15u) == 0) {
+    const clio::run::u64 n16 = bytes >> 4;
+    auto *d4 = (uint4 *) dst;
+    const auto *s4 = (const uint4 *) src;
+    for (clio::run::u64 i = threadIdx.x; i < n16; i += blockDim.x) {
+      d4[i] = s4[i];
+    }
+    for (clio::run::u64 i = (n16 << 4) + threadIdx.x; i < bytes;
+         i += blockDim.x) {
+      ((char *) dst)[i] = ((const char *) src)[i];
+    }
+    return;
+  }
+  for (clio::run::u64 i = threadIdx.x; i < bytes; i += blockDim.x) {
+    ((char *) dst)[i] = ((const char *) src)[i];
+  }
+}
+
+/**
+ * Block-collective slot claim for `target_page`, with NO task issued.
+ *
+ * Returns a slot that either already holds the page (kPageBusy clear, no
+ * copy needed) or is claimed and busy for the caller to fill. nullptr if no
+ * slot could be claimed, in which case the caller falls back to the task
+ * path. Exactly one thread mutates the page table; every lane then locates
+ * the slot itself, so nothing is broadcast.
+ */
+template <typename T>
+CTP_GPU_FUN Page *BlockClaimSlot(::clio::run::gpu::IpcManager *ipc,
+                                 const DeviceView<T> &v,
+                                 clio::run::u32 block_idx,
+                                 int32_t target_page) {
+  Block *b = GetBlock(v.base, block_idx);
+  const clio::run::u32 total = TotalPagesPerBlock(v.base);
+  if (threadIdx.x == 0) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      Page *hit = nullptr;
+      for (clio::run::u32 s = 0; s < total; ++s) {
+        Page *p = &b->pages[s];
+        if (p->page_idx == target_page && !(p->flags & kPageBusy)) {
+          hit = p;
+          break;
+        }
+      }
+      if (hit != nullptr) {
+        DrainGet(hit, const_cast<DeviceViewBase *>(&v.base));
+        break;
+      }
+      const clio::run::u32 slot = EvictSlot(ipc, v, block_idx);
+      if (slot == kNoSlot) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(256);
+#endif
+        continue;
+      }
+      // Claimed: stays kPageBusy so no other block reads it half-copied.
+      b->pages[slot].page_idx = target_page;
+      break;
+    }
+  }
+  __syncthreads();
+  Page *found = nullptr;
+  for (clio::run::u32 s = 0; s < total; ++s) {
+    Page *p = &b->pages[s];
+    if (p->page_idx == target_page) {
+      found = p;
+      break;
+    }
+  }
+  return found;
+}
+
 /**
  * BLOCK-collective page fault: bring `target_page` into this cache block.
  *
@@ -547,6 +634,34 @@ CTP_GPU_FUN Page *BlockFaultPage(::clio::run::gpu::IpcManager *ipc,
                                  int32_t target_page, FamFn fam_fn) {
   Block *b = GetBlock(v.base, block_idx);
   const clio::run::u32 total = TotalPagesPerBlock(v.base);
+
+  // FAST PATH: the page is already in VRAM, so the block copies it itself
+  // and no task is created. Every thread reads the same directory entry, so
+  // the decision is uniform across the block with nothing broadcast.
+  const clio::run::u64 src_addr = DevPageAddr(v.base, target_page);
+  if (src_addr != 0) {
+    Page *dst = BlockClaimSlot(ipc, v, block_idx, target_page);
+    if (dst != nullptr) {
+      // Only the claimer copies; a slot that was already resident comes back
+      // with kPageBusy clear and needs no copy at all.
+      if (dst->flags & kPageBusy) {
+        BlockCopyPage(dst->device_ptr, (const void *) src_addr,
+                      v.base.page_size_bytes);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          if (v.base.stats) {
+            atomicAdd_system(&v.base.stats->resolve_fault_get, 1ULL);
+            atomicAdd_system(&v.base.stats->fault_get_ok, 1ULL);
+          }
+          detail::ReleaseBusy(dst);
+        }
+        __syncthreads();
+      }
+      return dst;
+    }
+    // Could not claim a slot; fall through to the task path.
+  }
+
   // One thread mutates the page table for the entire block.
   if (threadIdx.x == 0) {
     // Retry across the whole resolve: a failed claim means every slot was

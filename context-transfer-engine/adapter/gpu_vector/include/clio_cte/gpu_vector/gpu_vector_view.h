@@ -132,6 +132,23 @@ struct DeviceViewBase {
    * kernels may override per-fault via the FamFn lambda on dev::vector.
    */
   clio::run::u64 fam_ppb;
+  /**
+   * Device-resident page directory: dev_page_addr[gp] is the DEVICE address
+   * of page gp's bytes inside the kHbm tier, or 0 if the page is not
+   * directly resolvable there. Device pointer itself (kDeviceMem), or
+   * nullptr when the directory was not built.
+   *
+   * This exists to keep an HBM-resident fault OFF the host entirely. Serving
+   * such a fault through a task means the runtime issues a device-to-device
+   * copy while the faulting kernel is still resident; that copy needs SM
+   * time, the spinning kernel owns every SM, and neither side can proceed.
+   * Measured: 32 MB device tier (faults served from host over the DMA copy
+   * engine) 3/3 clean, 700 MB device tier (same faults served D2D) 3/4 hung.
+   * When the bytes are already in VRAM the block can just copy them itself,
+   * which is both deadlock-free and strictly less work.
+   */
+  const clio::run::u64 *dev_page_addr;
+  clio::run::u64 dev_page_count;   /**< entries in dev_page_addr. */
 };
 
 /** Default family policy: derived from the view's fam_ppb (see above). */

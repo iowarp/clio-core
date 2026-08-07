@@ -522,6 +522,15 @@ int main(int argc, char **argv) {
       }
       fetched += c.slice_bytes;
     }
+    // Publish the device page directory BEFORE the launch: pages already in
+    // VRAM are then faulted by the block itself, with no task and no
+    // device-to-device copy queued behind a resident kernel. It allocates
+    // device memory, which is device-synchronizing, so it must happen while
+    // no kernel is running.
+    const uint64_t n_direct = vec.BuildDevicePageTable(num_pages);
+    std::fprintf(stderr, "CFB: device page directory: %llu/%llu pages\n",
+                 (unsigned long long) n_direct,
+                 (unsigned long long) num_pages);
     const uint64_t t_k0 = NowMs();
     // Wide blocks are safe because the page is sized to the slice: every
     // warp in the block is inside the same page for the whole read_range,

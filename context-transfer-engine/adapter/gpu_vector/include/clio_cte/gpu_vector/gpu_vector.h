@@ -359,6 +359,27 @@ class Vector {
    *  data ACTUALLY compresses to instead of a per-model guess. */
   double MeasuredRatio(clio::run::u64 n_sample = 24);
 
+  /**
+   * Publish a device-side directory of the pages that are resident in the
+   * kHbm tier, so the faulting BLOCK copies those bytes itself instead of
+   * asking the runtime for them.
+   *
+   * This is what keeps an HBM-resident fault off the host. Serving one
+   * through a task makes the runtime issue a device-to-device copy while
+   * the faulting kernel is still resident; that copy needs SM time, the
+   * spinning kernel owns every SM, and the two wait on each other forever.
+   * Copying in-kernel is both deadlock-free and less work -- the bytes are
+   * already in VRAM.
+   *
+   * Call AFTER the data is placed and BEFORE launching a kernel that
+   * faults: it allocates device memory, which is itself device-
+   * synchronizing and must not happen while a kernel is resident.
+   *
+   * Pages whose bytes are not a single contiguous kHbm block are left 0 and
+   * keep using the task path. Returns the number of pages published.
+   */
+  clio::run::u64 BuildDevicePageTable(clio::run::u64 num_pages);
+
   /** Raise the scores of the pages spanning [off, off+len) so the CTE's
    *  organizer migrates them INTO the top tier (kHbm) before use. This is
    *  the prefetch primitive: a metadata op, never a data copy. Promotions
@@ -1316,6 +1337,8 @@ struct Vector<T>::Impl {
   clio::run::u64 static_bytes = 0, static_cap = 3ull << 30;
   /** Page->family policy (see Vector ctor). 0 => single family b0. */
   clio::run::u64 fam_ppb = 0;
+  /** Device page directory published to DeviceViewBase::dev_page_addr. */
+  clio::run::u64 *dev_page_tbl = nullptr;
   /** Optional full-name override for host-side page name composition. */
   std::function<std::string(clio::run::u64)> host_namer;
   bool flat_layout = false;   /**< model stored as one flat blob "w". */
@@ -1541,6 +1564,10 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
     }
   }
   view_.base.stats = impl_->stats;
+  // Not built until BuildDevicePageTable() runs; 0/nullptr means "every
+  // fault goes through the task path", i.e. exactly the old behaviour.
+  view_.base.dev_page_addr = nullptr;
+  view_.base.dev_page_count = 0;
   view_.page_capacity_t = page_size_bytes / sizeof(T);
   impl_->nblocks_cached = nblocks;
   impl_->page_size_cached = page_size_bytes;
@@ -2074,6 +2101,67 @@ inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
 }
 
 template <typename T>
+inline clio::run::u64 Vector<T>::BuildDevicePageTable(
+    clio::run::u64 num_pages) {
+#if !CTP_IS_DEVICE_PASS
+  view_.base.dev_page_addr = nullptr;
+  view_.base.dev_page_count = 0;
+  if (!impl_ || num_pages == 0) return 0;
+  const clio::run::u64 page = view_.base.page_size_bytes;
+
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+  cte.AttachShmCache();
+  std::vector<clio::run::u64> tbl(num_pages, 0ull);
+  clio::run::u64 n_res = 0;
+  for (clio::run::u64 gp = 0; gp < num_pages; ++gp) {
+    clio::cte::core::ShmBlobRecord rec;
+    if (!cte.TryGetBlobRecordShm(view_.base.tag_id, PageBlobName(gp), &rec)) {
+      continue;
+    }
+    if ((rec.flags_ & clio::cte::core::kShmBlobTruncated) != 0) continue;
+    // One contiguous kHbm block covering the whole page. Anything else
+    // (split across blocks, a lower tier, compressed/short) keeps the task
+    // path -- correctness first; this is an optimization, not a mechanism.
+    if (rec.num_blocks_ != 1) continue;
+    const auto &blk = rec.blocks_[0];
+    if (blk.bdev_type_ !=
+        (clio::run::u32) clio::run::bdev::BdevType::kHbm) {
+      continue;
+    }
+    if (blk.size_ < page || rec.total_size_ < page) continue;
+    auto *t = clio::run::bdev::MemBdevTransport::LookupHbm(blk.target_pool_);
+    if (t == nullptr) continue;
+    char *src = t->ResolveHbmSpan(blk.target_offset_, page);
+    if (src == nullptr) continue;
+    tbl[gp] = (clio::run::u64) src;
+    ++n_res;
+  }
+  if (n_res == 0) return 0;
+
+  if (impl_->dev_page_tbl == nullptr) {
+    void *d = nullptr;
+    if (cudaMalloc(&d, num_pages * sizeof(clio::run::u64)) != cudaSuccess) {
+      cudaGetLastError();
+      return 0;
+    }
+    impl_->dev_page_tbl = static_cast<clio::run::u64 *>(d);
+  }
+  if (cudaMemcpy(impl_->dev_page_tbl, tbl.data(),
+                 num_pages * sizeof(clio::run::u64),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  view_.base.dev_page_addr = impl_->dev_page_tbl;
+  view_.base.dev_page_count = num_pages;
+  return n_res;
+#else
+  (void) num_pages;
+  return 0;
+#endif
+}
+
+template <typename T>
 inline double Vector<T>::MeasuredRatio(clio::run::u64 n_sample) {
 #if !CTP_IS_DEVICE_PASS
   if (!impl_ || view_.base.flat_layout) return 0.0;
@@ -2235,6 +2323,7 @@ inline Vector<T>::~Vector() {
       cudaFree(ptr);
     }
   }
+  if (impl_->dev_page_tbl) cudaFree(impl_->dev_page_tbl);
   if (impl_->span_slab) cudaFree(impl_->span_slab);
   if (impl_->stage_ring) cudaFree(impl_->stage_ring);
   if (impl_->host_arena) cudaFreeHost(impl_->host_arena);
