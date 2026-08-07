@@ -140,7 +140,8 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
   {
     std::ofstream cfg("gpu_vector_workloads.yaml");
     REQUIRE(cfg.is_open());
-    cfg << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
+    cfg << "networking:\n  port: 9432\n\n"
+        << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
         << "gpu:\n  queue_depth: 4096\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_workloads.yaml", 1);

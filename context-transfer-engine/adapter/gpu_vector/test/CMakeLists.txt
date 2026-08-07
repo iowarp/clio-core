@@ -32,6 +32,11 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_tests_properties(cte_gpu_vector_smoke PROPERTIES
         TIMEOUT 900
         LABELS "cte;gpu;gpu_vector"
+        # Without the cleanup fixture nothing reclaims the runtime's TCP port
+        # or its SHM between test BINARIES, and the second one to run inherits
+        # them. Measured: each passes 5/5 alone, together they failed 4 of 5.
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
     )
     add_cuda_executable(test_gpu_vector_workloads FALSE
         test_gpu_vector_workloads_gpu.cc
@@ -62,5 +67,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_tests_properties(cte_gpu_vector_workloads PROPERTIES
         TIMEOUT 900
         LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
     )
 endif()

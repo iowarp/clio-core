@@ -107,7 +107,8 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   {
     std::ofstream cfg("gpu_vector_test.yaml");
     REQUIRE(cfg.is_open());
-    cfg << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
+    cfg << "networking:\n  port: 9431\n\n"
+        << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
         << "gpu:\n  queue_depth: 4096\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_test.yaml", 1);
