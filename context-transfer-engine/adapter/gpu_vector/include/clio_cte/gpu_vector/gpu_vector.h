@@ -29,6 +29,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <deque>
 #include <functional>
 #include <unordered_map>
 #include <thread>
@@ -298,6 +299,19 @@ class Vector {
     if (impl_ && impl_->mirror_bytes == 0) impl_->mirror_bytes = n;
 #endif
   }
+
+  /** Raise the scores of the pages spanning [off, off+len) so the CTE's
+   *  organizer migrates them INTO the top tier (kHbm) before use. This is
+   *  the prefetch primitive: a metadata op, never a data copy. Promotions
+   *  are fire-and-forget with a bounded in-flight window; score 1.0 is
+   *  required (a lower score puts the 1.0 tier in the DPE's fallback
+   *  group). Demote with score < 0.9 when the span leaves the window. */
+  void PromoteSpan(clio::run::u64 off, clio::run::u64 len, float score);
+  /** Drain outstanding promotions (bounded; call before teardown). */
+  void DrainPromotions();
+  /** True when this page's cached record already shows a top-tier score,
+   *  i.e. a promotion has landed and the zero-task read path can serve it. */
+  bool PageIsPromoted(clio::run::u64 gp);
 
   /** Partial-mode page residency (see BuildHostTier). */
   unsigned char *EnsureHostPage(clio::run::u64 gp);
@@ -1167,10 +1181,17 @@ struct Vector<T>::Impl {
   cudaStream_t copy_stream = nullptr;
   cudaEvent_t copy_events[256] = {};
   clio::run::u32 copy_ev_idx = 0;
-  /** Span cache: flat offset -> device pointer (slab or permanent). */
-  std::unordered_map<clio::run::u64, unsigned char *> span_cache;
+  /** Span cache: flat offset -> (device pointer, span length). Length is
+   *  part of the contract: page-aligned spans of ADJACENT tensors can
+   *  share a start offset, and returning a shorter cached buffer for a
+   *  longer request let the kernel read past the allocation (illegal
+   *  memory access on the compressed llama path). */
+  std::unordered_map<clio::run::u64,
+                     std::pair<unsigned char *, clio::run::u64>> span_cache;
   std::unordered_map<clio::run::u64, clio::run::u32> span_seen;
   clio::run::u64 span_hits = 0, span_misses = 0;
+  /** In-flight score promotions (see PromoteSpan). */
+  std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> promos;
   /** Permanent (first-touch) admissions get exact cudaMallocs under
    *  their own budget -- static model tensors, reused every token. */
   clio::run::u64 static_bytes = 0, static_cap = 3ull << 30;
@@ -1774,9 +1795,9 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
   if (impl_->mirror_bytes != 0 && off >= impl_->mirror_bytes) return nullptr;
   if (len > impl_->mirror_bytes - off) len = impl_->mirror_bytes - off;
   auto it = impl_->span_cache.find(off);
-  if (it != impl_->span_cache.end()) {
+  if (it != impl_->span_cache.end() && it->second.second >= len) {
     impl_->span_hits++;
-    return it->second;
+    return it->second.first;
   }
   impl_->span_misses++;
   unsigned char *dst = nullptr;
@@ -1800,7 +1821,7 @@ inline const unsigned char *Vector<T>::PinnedSpan(clio::run::u64 off,
     // dst stays allocated but unmapped; do not cache a bad span.
     return nullptr;
   }
-  impl_->span_cache.emplace(off, dst);
+  impl_->span_cache[off] = {dst, len};   // longer span replaces a shorter
   if (copied) *copied = true;
   return dst;
 #else
@@ -1909,6 +1930,53 @@ inline bool Vector<T>::FetchSpanDevice(unsigned char *dst_dev,
 }
 
 template <typename T>
+inline void Vector<T>::PromoteSpan(clio::run::u64 off, clio::run::u64 len,
+                                   float score) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_) return;
+  const clio::run::u64 page = view_.base.page_size_bytes;
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+  for (clio::run::u64 gp = off / page; gp <= (off + len - 1) / page; ++gp) {
+    if (view_.base.flat_layout) break;   // flat blob: one blob, no per-page
+    impl_->promos.push_back(cte.AsyncReorganizeBlob(
+        view_.base.tag_id, PageBlobName(gp), score,
+        clio::run::PoolQuery::Local()));
+    while (impl_->promos.size() > 192) {
+      impl_->promos.front().Wait();
+      impl_->promos.pop_front();
+    }
+  }
+#else
+  (void) off; (void) len; (void) score;
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::DrainPromotions() {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_) return;
+  while (!impl_->promos.empty()) {
+    impl_->promos.front().Wait();
+    impl_->promos.pop_front();
+  }
+#endif
+}
+
+template <typename T>
+inline bool Vector<T>::PageIsPromoted(clio::run::u64 gp) {
+#if !CTP_IS_DEVICE_PASS
+  if (!impl_) return false;
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+  clio::cte::core::ShmBlobRecord rec;
+  return cte.TryGetBlobRecordShm(view_.base.tag_id, PageBlobName(gp), &rec) &&
+         rec.score_ >= 0.9f;
+#else
+  (void) gp;
+  return false;
+#endif
+}
+
+template <typename T>
 inline unsigned char *Vector<T>::StageTransient(clio::run::u64 len,
                                                 void *main_stream) {
 #if !CTP_IS_DEVICE_PASS
@@ -1982,9 +2050,10 @@ inline Vector<T>::~Vector() {
   for (auto &kv : impl_->span_cache) {
     // Slab entries are freed with the slab; permanent spans are exact
     // allocations outside it.
-    if (impl_->span_slab == nullptr || kv.second < impl_->span_slab ||
-        kv.second >= impl_->span_slab + impl_->slab_cap) {
-      cudaFree(kv.second);
+    unsigned char *ptr = kv.second.first;
+    if (impl_->span_slab == nullptr || ptr < impl_->span_slab ||
+        ptr >= impl_->span_slab + impl_->slab_cap) {
+      cudaFree(ptr);
     }
   }
   if (impl_->span_slab) cudaFree(impl_->span_slab);
