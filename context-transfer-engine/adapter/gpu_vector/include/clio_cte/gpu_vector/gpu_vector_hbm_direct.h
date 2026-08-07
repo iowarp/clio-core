@@ -322,12 +322,15 @@ inline void InstallDirectReads(VecT &vec, DirectStats *stats) {
       clio::cte::core::kCtePoolId);
   cli->AttachShmCache();
   VecT *vp = &vec;
-  vec.SetDirectPageFn([vp, cli, stats](clio::run::u64 gp, uint8_t *dst,
-                                       clio::run::u64 len) -> bool {
-    std::vector<DirectWant> want{DirectWant{gp, dst, len}};
-    std::vector<DirectWant> leftover;
-    HbmDirectFetchBatch(*vp, *cli, want, &leftover, stats);
-    return leftover.empty();
+  using PP = typename VecT::PendingPage;
+  vec.SetDirectBatchFn([vp, cli, stats](const std::vector<PP> &want,
+                                        std::vector<PP> *leftover) {
+    std::vector<DirectWant> w;
+    w.reserve(want.size());
+    for (const auto &p : want) w.push_back(DirectWant{p.gp, p.dst, p.len});
+    std::vector<DirectWant> lo;
+    HbmDirectFetchBatch(*vp, *cli, w, &lo, stats);
+    for (const auto &l : lo) leftover->push_back(PP{l.gp, l.dst, l.len});
   });
 }
 

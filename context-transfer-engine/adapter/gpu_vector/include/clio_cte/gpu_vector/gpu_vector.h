@@ -272,6 +272,28 @@ class Vector {
   bool WaitFetches(FetchList &fl) {
 #if !CTP_IS_DEVICE_PASS
     bool ok = true;
+    // Flush deferred zero-task pages FIRST (one batched decompress), then
+    // fall back to tasks for whatever it could not serve.
+    if (impl_ && !impl_->pending_direct.empty()) {
+      std::vector<PendingPage> want;
+      want.swap(impl_->pending_direct);
+      std::vector<PendingPage> leftover;
+      impl_->direct_batch(want, &leftover);
+      impl_->direct_hits += want.size() - leftover.size();
+      impl_->direct_misses += leftover.size();
+      // Re-queue leftovers as TASKS. The flag is load-bearing: without it
+      // the re-entrant call defers them again, and clearing the pending
+      // list then DROPPED them -- the pages were never fetched and the
+      // model computed on stale staging memory (garbage output at speed).
+      impl_->in_direct_flush = true;
+      for (const auto &lp : leftover) {
+        if (!FetchSpanDeviceAsync(lp.dst, lp.gp * view_.base.page_size_bytes,
+                                  lp.len, &fl)) {
+          ok = false;
+        }
+      }
+      impl_->in_direct_flush = false;
+    }
     for (auto &f : fl) {
       f.Wait();
       if (f->GetReturnCode() != 0) ok = false;
@@ -307,12 +329,21 @@ class Vector {
    *  refusals become GetBlob tasks. Set by the direct-read layer
    *  (gpu_vector_hbm_direct.h); null leaves the task path unchanged.
    *  Returns true if it served the page. */
-  using DirectPageFn =
-      std::function<bool(clio::run::u64 gp, unsigned char *dst,
-                         clio::run::u64 len)>;
-  void SetDirectPageFn(DirectPageFn fn) {
+  struct PendingPage {
+    clio::run::u64 gp;
+    unsigned char *dst;
+    clio::run::u64 len;
+  };
+  /** Serves a BATCH of pages; unserved ones are appended to `leftover`.
+   *  Batching matters: the resolver's decompress is one nvcomp launch per
+   *  CALL, so a per-page hook paid a launch and a sync per page (~1600 per
+   *  token on a MoE model). */
+  using DirectBatchFn =
+      std::function<void(const std::vector<PendingPage> &want,
+                         std::vector<PendingPage> *leftover)>;
+  void SetDirectBatchFn(DirectBatchFn fn) {
 #if !CTP_IS_DEVICE_PASS
-    if (impl_) impl_->direct_page = std::move(fn);
+    if (impl_) impl_->direct_batch = std::move(fn);
 #endif
   }
 
@@ -1222,9 +1253,13 @@ struct Vector<T>::Impl {
   clio::run::u64 span_hits = 0, span_misses = 0;
   /** In-flight score promotions (see PromoteSpan). */
   std::deque<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> promos;
-  /** Zero-task page resolver (see SetDirectPageFn). */
-  std::function<bool(clio::run::u64, unsigned char *, clio::run::u64)>
-      direct_page;
+  /** Zero-task batch resolver (see SetDirectBatchFn) + pages deferred to
+   *  it, flushed by WaitFetches so ONE decompress launch covers the whole
+   *  staging batch. */
+  std::function<void(const std::vector<PendingPage> &,
+                     std::vector<PendingPage> *)> direct_batch;
+  std::vector<PendingPage> pending_direct;
+  bool in_direct_flush = false;
   clio::run::u64 direct_hits = 0, direct_misses = 0;
   /** Permanent (first-touch) admissions get exact cudaMallocs under
    *  their own budget -- static model tensors, reused every token. */
@@ -1934,16 +1969,16 @@ inline bool Vector<T>::FetchSpanDeviceAsync(unsigned char *dst_dev,
     const clio::run::u64 poff = cur - gp * page;
     const clio::run::u64 seg  =
         std::min<clio::run::u64>(page - poff, off + len - cur);
-    // ZERO-TASK first: a promoted, device-resident page resolves in
-    // process (D2D + client-side decompress) with no task at all.
-    if (impl_->direct_page && poff == 0 && seg == page &&
-        impl_->direct_page(gp, (unsigned char *) dst_dev + (cur - off),
-                           seg)) {
-      ++impl_->direct_hits;
+    // ZERO-TASK: defer whole pages to the batch resolver, flushed once in
+    // WaitFetches -- one decompress launch for the entire staging batch
+    // instead of one per page.
+    if (impl_->direct_batch && !impl_->in_direct_flush && poff == 0 &&
+        seg == page) {
+      impl_->pending_direct.push_back(
+          PendingPage{gp, (unsigned char *) dst_dev + (cur - off), seg});
       cur += seg;
       continue;
     }
-    if (impl_->direct_page) ++impl_->direct_misses;
     const std::string name =
         view_.base.flat_layout ? std::string("w") : PageBlobName(gp);
     const clio::run::u64 boff = view_.base.flat_layout ? cur : poff;
