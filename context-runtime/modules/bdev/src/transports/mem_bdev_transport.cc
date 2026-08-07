@@ -95,7 +95,12 @@ bool MemBdevTransport::Init(const CreateParams& params,
   //
   // Faulting the pages in here costs nothing extra (the tier is sized to be
   // filled) and makes the read/write paths allocation-free by construction.
-  if (bdev_type_ == BdevType::kHbm &&
+  //
+  // kPinned counts for exactly the same reason: its pages come from
+  // cudaMallocHost, which is also device-synchronizing. A tier does not have
+  // to live in VRAM to deadlock a resident kernel -- it only has to allocate
+  // through the CUDA allocator while servicing that kernel's fault.
+  if ((bdev_type_ == BdevType::kHbm || bdev_type_ == BdevType::kPinned) &&
       ram_capacity_ != std::numeric_limits<clio::run::u64>::max()) {
     const size_t npages =
         (size_t) ((ram_capacity_ + kRamPageSize - 1) / kRamPageSize);
