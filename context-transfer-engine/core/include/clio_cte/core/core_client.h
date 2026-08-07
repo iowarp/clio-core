@@ -354,6 +354,43 @@ class Client : public clio::run::ContainerClient {
     return true;
   }
 
+  /**
+   * Like TryGetBlobViewShm, but for a caller that will apply the blob's
+   * TRANSFORM itself (issue #818's rule is "never hand codec bytes back as
+   * data" -- this hands them back explicitly as codec bytes, to a caller
+   * that asked for exactly that). Used by the gpu_vector's zero-task read
+   * path, which decompresses client-side, so a compressed blob resident in
+   * a node-local RAM tier can be served without any task at all.
+   *
+   * Same discipline otherwise: node-local RAM-backed single-extent blobs
+   * only, zero size distrusted, and the caller must re-check the placement
+   * generation after consuming the bytes.
+   */
+  bool TryGetStoredViewShm(const TagId &tag_id, const std::string &blob_name,
+                           char **ptr, size_t *size, clio::run::u64 *gen) {
+    if (shm_root_ == nullptr || ptr == nullptr || size == nullptr ||
+        gen == nullptr) {
+      return false;
+    }
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) return false;
+    if (rec.num_blocks_ != 1 || rec.total_size_ == 0) return false;
+    if ((rec.flags_ & kShmBlobTruncated) != 0) return false;
+    const ShmBlockDesc &src = rec.blocks_[0];
+    // RAM-backed and node-local only: those are the segments a client can
+    // map (MapRamBdev validates the header before returning a base).
+    if (src.bdev_type_ !=
+        static_cast<clio::run::u32>(clio::run::bdev::BdevType::kRam)) {
+      return false;
+    }
+    char *base = MapRamBdev(src.target_pool_);
+    if (base == nullptr) return false;
+    *ptr = base + src.target_offset_;
+    *size = rec.total_size_;
+    *gen = rec.placement_gen_;
+    return true;
+  }
+
   /** Re-validate a view taken with TryGetBlobViewShm: true iff the blob's
    *  placement generation is unchanged (bytes consumed from the view were
    *  stable). */

@@ -105,18 +105,29 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
       if (stats) stats->no_rec++;
       continue;
     }
-    if (rec.score_ < 0.9f) {
-      if (stats) stats->cold++;
-      continue;
-    }
+    // No score gate: a page below 0.9 lives in a lower tier, and this
+    // path can now serve THOSE too (H2D of the compressed frame). The
+    // score still decides PLACEMENT -- it just no longer decides whether
+    // a read needs a task.
     if ((rec.flags_ & clio::cte::core::kShmBlobTruncated) != 0) {
       if (stats) stats->trunc++;
       continue;
     }
     if (rec.num_blocks_ == 0 || rec.num_blocks_ > clio::cte::core::kMaxInlineBlocks) continue;
     bool resolvable = true;
+    bool from_ram = false;
     for (clio::run::u32 b = 0; b < rec.num_blocks_; ++b) {
       const auto &blk = rec.blocks_[b];
+      if (blk.bdev_type_ ==
+          (clio::run::u32) clio::run::bdev::BdevType::kRam) {
+        // RAM-tier page: the runtime's segment is mappable in-process, so
+        // the frame can be pulled H2D and decompressed client-side --
+        // still no task, just a PCIe copy of COMPRESSED bytes instead of a
+        // D2D copy. This is what makes a miss cheap when the model is far
+        // larger than the device tier.
+        from_ram = true;
+        continue;
+      }
       if (blk.bdev_type_ !=
           (clio::run::u32) clio::run::bdev::BdevType::kHbm) {
         resolvable = false;
@@ -127,6 +138,16 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
           t->ResolveHbmSpan(blk.target_offset_, blk.size_) == nullptr) {
         resolvable = false;
         break;
+      }
+    }
+    if (from_ram) {
+      // Mixed layouts are not worth the bookkeeping; require all-RAM.
+      char *hp = nullptr;
+      size_t hsz2 = 0;
+      clio::run::u64 hgen = 0;
+      if (!cli.TryGetStoredViewShm(vec.TagId(), name, &hp, &hsz2, &hgen) ||
+          hsz2 != rec.total_size_) {
+        resolvable = false;
       }
     }
     if (!resolvable) {
@@ -170,6 +191,21 @@ inline bool HbmDirectFetchBatch(VecT &vec, clio::cte::core::Client &cli,
     bool copied_ok = true;
     for (clio::run::u32 b = 0; b < rec.num_blocks_ && copied_ok; ++b) {
       const auto &blk = rec.blocks_[b];
+      if (blk.bdev_type_ ==
+          (clio::run::u32) clio::run::bdev::BdevType::kRam) {
+        char *hp = nullptr;
+        size_t hsz2 = 0;
+        clio::run::u64 hgen = 0;
+        const std::string nm = vec.PageBlobName(want[i].gp);
+        if (!cli.TryGetStoredViewShm(vec.TagId(), nm, &hp, &hsz2, &hgen) ||
+            cudaMemcpyAsync(frame + off, hp, blk.size_,
+                            cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+          copied_ok = false;
+          break;
+        }
+        off += blk.size_;
+        continue;
+      }
       auto *t = MemBdevTransport::LookupHbm(blk.target_pool_);
       char *src = t->ResolveHbmSpan(blk.target_offset_, blk.size_);
       if (src == nullptr ||
