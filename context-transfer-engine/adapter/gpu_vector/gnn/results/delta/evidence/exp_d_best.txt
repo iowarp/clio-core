@@ -1,0 +1,21 @@
+[TRAIN] A=54208MiB (111017984 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=30 lr=0.200  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: *** OOM *** cannot place 54208MiB A resident.
+[97m/u/rpawar/clio-core/context-transfer-engine/compressor/src/compressor_runtime.cc:199 INFO 180216 CompressorPinWireId Compressor pinned via CLIO_CTE_COMPRESS_LIB: cuszp (wire=20, preset=3)[0m
+[TRAIN] ETERNIA: stored A 54208MiB -> 23164MiB zstd (2.340x) in 95.48s
+[TRAIN]   eternia e00 loss=5.133192 acc=0.0010 val_acc=0.0010 (272.5s elapsed)
+[TRAIN]   eternia e01 loss=5.115912 acc=0.0014 val_acc=0.0016 (544.8s elapsed)
+[TRAIN]   eternia e02 loss=5.099378 acc=0.0209 val_acc=0.0199 (817.2s elapsed)
+[TRAIN]   eternia e03 loss=5.083233 acc=0.0562 val_acc=0.0556 (1089.5s elapsed)
+[TRAIN]   eternia e04 loss=5.067161 acc=0.0620 val_acc=0.0616 (1361.8s elapsed)
+[TRAIN]   eternia e05 loss=5.050910 acc=0.0626 val_acc=0.0622 (1634.2s elapsed)
+[TRAIN]   eternia e06 loss=5.034272 acc=0.0626 val_acc=0.0623 (1906.5s elapsed)
+[TRAIN]   eternia e07 loss=5.017080 acc=0.0626 val_acc=0.0623 (2178.8s elapsed)
+[TRAIN]   eternia e08 loss=4.999201 acc=0.0626 val_acc=0.0623 (2451.2s elapsed)
+[TRAIN]   eternia e09 loss=4.980545 acc=0.0626 val_acc=0.0623 (2723.5s elapsed)
+[TRAIN]   eternia e10 loss=4.961052 acc=0.0626 val_acc=0.0623 (2995.8s elapsed)
+[TRAIN]   eternia e11 loss=4.940682 acc=0.0626 val_acc=0.0623 (3268.1s elapsed)
+[TRAIN]   eternia e12 loss=4.919420 acc=0.0626 val_acc=0.0623 (3540.5s elapsed)
+[TRAIN]   eternia e13 loss=4.897277 acc=0.0626 val_acc=0.0623 (3812.8s elapsed)
+[TRAIN]   eternia e14 loss=4.874300 acc=0.0626 val_acc=0.0623 (4085.1s elapsed)
+[TRAIN]   eternia e15 loss=4.850578 acc=0.0626 val_acc=0.0623 (4357.4s elapsed)
+[TRAIN]   eternia e16 loss=4.826247 acc=0.0626 val_acc=0.0623 (4629.7s elapsed)
