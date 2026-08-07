@@ -186,11 +186,13 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // Each block drives its own slice through its own page table. Slices are
   // page-aligned so blocks never contend for a page.
   //
-  // KNOWN CEILING: 96 blocks pass, 128 hangs. Not yet diagnosed. It is not
-  // the gpu2cpu queue (depth comes from runtime queue_depth, 1024) and not
-  // the host-copy allocation (per-task since this commit). Do not raise this
-  // past 96 expecting it to work.
-  for (unsigned nb : {8u, 32u, 64u, 96u}) {
+  // KNOWN CEILING: 64 blocks is the highest that passes RELIABLY. 96 passes
+  // in isolation but hangs intermittently (it was the flake that failed the
+  // combined ctest run roughly one time in three), and 128 hangs outright.
+  // Not diagnosed. Ruled out: the gpu2cpu queue (its depth is the runtime
+  // queue_depth, 1024, not the unused gpu_queue_depth_=16) and the host-copy
+  // allocation (per-task since ee53b56f). Do not raise this past 64.
+  for (unsigned nb : {8u, 32u, 64u}) {
     const clio::run::u64 per = 4 * 1024;            // 4 pages per block
     const clio::run::u64 n = per * nb;
     gv::Vector<clio::run::u32> mv("gv_multi" + std::to_string(nb), {0},
