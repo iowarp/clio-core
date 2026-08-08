@@ -89,8 +89,17 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     // a kernel is resident blocks until that kernel finishes (see
     // GpuApi::BorrowStream), and a queue copy queued behind a multi-megabyte
     // data copy would add that copy's latency to every task on the GPU.
-    if (const char *dr = std::getenv("CLIO_GPU_DEVRING")) {
-      if (*dr != '\0' && std::string(dr) != "0" && std::string(dr) != "false") {
+    // ON BY DEFAULT. It cleared the gate the design set: 23/23 tests,
+    // compute-sanitizer 0 errors, correct through 64 blocks and
+    // multi-oversub-64, and faster on every workload measured (sync demand
+    // faults 493 -> 801 MB/s). CLIO_GPU_DEVRING=0 falls back to the managed
+    // queue for bisecting a regression to this transport.
+    {
+      const char *dr = std::getenv("CLIO_GPU_DEVRING");
+      const bool use_ring =
+          (dr == nullptr) || (*dr != '\0' && std::string(dr) != "0" &&
+                              std::string(dr) != "false");
+      if (use_ring) {
         void *ring_mem = nullptr;
 #if CTP_ENABLE_CUDA
         if (cudaMalloc(&ring_mem, sizeof(clio::run::GpuDeviceRing)) !=
