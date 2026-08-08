@@ -207,8 +207,8 @@ int main(int argc, char **argv) {
   {
     std::ofstream cfg("gpu_vector_flush.yaml");
     cfg << "networking:\n  port: 9437\n\n"
-        << "runtime:\n  num_threads: 8\n  queue_depth: 65536\n\n"
-        << "gpu:\n  queue_depth: 65536\n\n"
+        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n\n"
+        << "gpu:\n  queue_depth: 8192\n\n"
         << "compose:\n"
         << "  - mod_name: clio_bdev\n"
         << "    pool_name: \"ram::chi_default_bdev\"\n"
