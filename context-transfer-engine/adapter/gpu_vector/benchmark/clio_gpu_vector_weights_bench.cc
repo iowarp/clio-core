@@ -93,8 +93,11 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per; ++i) {
-    v.RefFault(base + i) = Weight(base + i);
+  for (clio::run::u64 i = 0; i < per;) {
+    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      v[base + i] = Weight(base + i);
+      }
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -127,12 +130,15 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
         // keeps it in the top tier before this block reaches it.
         v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
       }
-      (void) v.AtFault(base + off);   // fault it in
+      (void) v.HoldPage(base + off, 1);   // fault it in
     }
     if (threadIdx.x != 0) continue;
-    for (clio::run::u64 i = 0; i < n; ++i) {
-      acc += static_cast<unsigned long long>(v.AtFault(base + off + i)) *
-             Activation(base + off + i);
+    for (clio::run::u64 i = 0; i < n;) {
+      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
+      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+        acc += static_cast<unsigned long long>(v[base + off + i]) *
+               Activation(base + off + i);
+          }
     }
   }
   atomicAdd(sum, acc);

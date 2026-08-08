@@ -83,37 +83,8 @@ __global__ void GrayScottRaw(const float *ui, const float *vi, float *uo,
   }
 }
 
-/** The SAME step, through the vector. */
-__global__ void GrayScottVec(clio::run::IpcManagerGpuInfo info,
-                             gv::DeviceVector<float> ui,
-                             gv::DeviceVector<float> vi,
-                             gv::DeviceVector<float> uo,
-                             gv::DeviceVector<float> vo, u32 dim) {
-  CLIO_GPU_INIT(info, nullptr);
-  ui.ipc_ = g_ipc_manager_ptr;
-  vi.ipc_ = g_ipc_manager_ptr;
-  uo.ipc_ = g_ipc_manager_ptr;
-  vo.ipc_ = g_ipc_manager_ptr;
-  const u64 cells = static_cast<u64>(dim) * dim;
-  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
-       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    const int x = static_cast<int>(idx % dim);
-    const int y = static_cast<int>(idx / dim);
-    const u64 l = y * dim + Wrap(x - 1, dim);
-    const u64 r = y * dim + Wrap(x + 1, dim);
-    const u64 d = Wrap(y - 1, dim) * dim + x;
-    const u64 t = Wrap(y + 1, dim) * dim + x;
-    const float u = ui.AtFault(idx), v = vi.AtFault(idx);
-    const float lu = ui.AtFault(l) + ui.AtFault(r) + ui.AtFault(d) + ui.AtFault(t) - 4.0f * u;
-    const float lv = vi.AtFault(l) + vi.AtFault(r) + vi.AtFault(d) + vi.AtFault(t) - 4.0f * v;
-    const float uvv = u * v * v;
-    uo.RefFault(idx) = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
-    vo.RefFault(idx) = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
-  }
-}
-
 /**
- * The same step again, but through the INDEXING FAST PATH.
+ * The same step, through the vector, using the INDEXING FAST PATH.
  *
  * HoldPage resolves each field's page once, up front; the loop then uses
  * operator[]/at(), which index the held page with no resolution at all. This
@@ -176,10 +147,14 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
     float a, b;
     InitCell(idx, dim, &a, &b);
-    u.RefFault(idx) = a;
-    v.RefFault(idx) = b;
-    uo.RefFault(idx) = a;
-    vo.RefFault(idx) = b;
+    u.HoldPage(idx, 1);
+    v.HoldPage(idx, 1);
+    uo.HoldPage(idx, 1);
+    vo.HoldPage(idx, 1);
+    u[idx] = a;
+    v[idx] = b;
+    uo[idx] = a;
+    vo[idx] = b;
   }
 }
 
@@ -191,7 +166,8 @@ __global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    dst[idx] = src.AtFault(idx);
+    src.HoldPage(idx, 1);
+    dst[idx] = src.at(idx);
   }
 }
 

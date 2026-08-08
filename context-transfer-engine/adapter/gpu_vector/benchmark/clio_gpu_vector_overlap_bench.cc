@@ -64,17 +64,20 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   const u64 base = static_cast<u64>(blockIdx.x) * per;
   const u64 pages = per / v.elems_per_page_;
-  for (u64 p = 0; p < pages; ++p) {
-    const u64 off = base + p * v.elems_per_page_;
-    for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      v.RefFault(off + i) = Elem(off + i);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      v.BeginFlush(off, v.elems_per_page_);
-      v.WaitFlush(off, v.elems_per_page_);
-    }
-    __syncthreads();
+  for (clio::run::u64 p = 0; p < pages;) {
+    const clio::run::u64 run_p = v.HoldPage(off + i, (pages) - p);
+    for (clio::run::u64 k_p = 0; k_p < run_p; ++k_p, ++p) {
+      const u64 off = base + p * v.elems_per_page_;
+      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+        v[off + i] = Elem(off + i);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        v.BeginFlush(off, v.elems_per_page_);
+        v.WaitFlush(off, v.elems_per_page_);
+      }
+      __syncthreads();
+      }
   }
 }
 
@@ -114,50 +117,53 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
   const u64 pages = per / v.elems_per_page_;
   unsigned long long acc = 0;
 
-  for (u64 p = 0; p < pages; ++p) {
-    if (prefetch && threadIdx.x == 0) {
-      // Pin the page about to be used, so a prefetch's slot claim evicts a
-      // page we have already finished with rather than the one in use.
-      v.RescorePage(first_page + p, 1000.0f);
-      // Keep `depth` pages in flight, not one. A page fault here costs about
-      // 370 us, almost all of it gpu2cpu round trip rather than transfer (the
-      // page is 64 KB -- microseconds of copy). One page of lookahead cannot
-      // cover that unless a page's compute exceeds the whole round trip, which
-      // is why the single-page version waited on EVERY prefetch it issued.
-      for (u32 d = 1; d <= depth; ++d) {
-        const u64 want = p + d;
-        if (want < pages) v.BeginFetch(first_page + want);
+  for (clio::run::u64 p = 0; p < pages;) {
+    const clio::run::u64 run_p = v.HoldPage(off + i, (pages) - p);
+    for (clio::run::u64 k_p = 0; k_p < run_p; ++k_p, ++p) {
+      if (prefetch && threadIdx.x == 0) {
+        // Pin the page about to be used, so a prefetch's slot claim evicts a
+        // page we have already finished with rather than the one in use.
+        v.RescorePage(first_page + p, 1000.0f);
+        // Keep `depth` pages in flight, not one. A page fault here costs about
+        // 370 us, almost all of it gpu2cpu round trip rather than transfer (the
+        // page is 64 KB -- microseconds of copy). One page of lookahead cannot
+        // cover that unless a page's compute exceeds the whole round trip, which
+        // is why the single-page version waited on EVERY prefetch it issued.
+        for (u32 d = 1; d <= depth; ++d) {
+          const u64 want = p + d;
+          if (want < pages) v.BeginFetch(first_page + want);
+        }
       }
-    }
-    __syncthreads();
+      __syncthreads();
 
-    const u64 off = base + p * v.elems_per_page_;
-    unsigned long long local = 0;
-    for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      local += v.AtFault(off + i);
-    }
-    acc += local;
-    __syncthreads();
-
-    // The compute half of the mix. Every lane works, like real compute.
-    // Seed from the PAGE and the data just read, so the chain is not
-    // loop-invariant. Seeding it from threadIdx alone lets the compiler hoist
-    // the whole chain out of the page loop and compute it once -- the
-    // "compute" would then cost 1/pages of what it claims to.
-    acc += static_cast<unsigned long long>(
-        DoWork(compute_iters, 1.0f + static_cast<float>(threadIdx.x) +
-                                  static_cast<float>(p) +
-                                  static_cast<float>(local & 0xff)) *
-        1.0e-9f);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      if (prefetch) {
-        // Release the page we just finished: lowest score makes it the next
-        // eviction victim, which is what frees a slot for the prefetch after.
-        v.RescorePage(first_page + p, -1000.0f);
+      const u64 off = base + p * v.elems_per_page_;
+      unsigned long long local = 0;
+      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+        local += v[off + i];
       }
-    }
-    __syncthreads();
+      acc += local;
+      __syncthreads();
+
+      // The compute half of the mix. Every lane works, like real compute.
+      // Seed from the PAGE and the data just read, so the chain is not
+      // loop-invariant. Seeding it from threadIdx alone lets the compiler hoist
+      // the whole chain out of the page loop and compute it once -- the
+      // "compute" would then cost 1/pages of what it claims to.
+      acc += static_cast<unsigned long long>(
+          DoWork(compute_iters, 1.0f + static_cast<float>(threadIdx.x) +
+                                    static_cast<float>(p) +
+                                    static_cast<float>(local & 0xff)) *
+          1.0e-9f);
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        if (prefetch) {
+          // Release the page we just finished: lowest score makes it the next
+          // eviction victim, which is what frees a slot for the prefetch after.
+          v.RescorePage(first_page + p, -1000.0f);
+        }
+      }
+      __syncthreads();
+      }
   }
   atomicAdd(total, acc);
 }

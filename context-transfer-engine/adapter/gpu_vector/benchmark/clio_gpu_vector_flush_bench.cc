@@ -64,20 +64,23 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   const u64 region_elems = pages_per_region * v.elems_per_page_;
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
-  for (u64 it = 0; it < iters; ++it) {
-    const u64 off = block_base + it * region_elems;
-    for (u64 pg = 0; pg < pages_per_region; ++pg) {
-      const u64 poff = off + pg * v.elems_per_page_;
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-        v.RefFault(poff + i) = Val(poff + i, 0u);
+  for (clio::run::u64 it = 0; it < iters;) {
+    const clio::run::u64 run_it = v.HoldPage(poff + i, (iters) - it);
+    for (clio::run::u64 k_it = 0; k_it < run_it; ++k_it, ++it) {
+      const u64 off = block_base + it * region_elems;
+      for (u64 pg = 0; pg < pages_per_region; ++pg) {
+        const u64 poff = off + pg * v.elems_per_page_;
+        for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+          v[poff + i] = Val(poff + i, 0u);
+        }
+        __syncthreads();
+      }
+      if (threadIdx.x == 0) {
+        v.BeginFlush(off, region_elems);
+        v.WaitFlush(off, region_elems);
       }
       __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-      v.BeginFlush(off, region_elems);
-      v.WaitFlush(off, region_elems);
-    }
-    __syncthreads();
+      }
   }
 }
 
@@ -99,40 +102,43 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
   long long prev = -1;
 
-  for (u64 it = 0; it < iters; ++it) {
-    // ---- compute ----
-    Spin(spin_us, clock_khz);
-    __syncthreads();
+  for (clio::run::u64 it = 0; it < iters;) {
+    const clio::run::u64 run_it = v.HoldPage(poff + i, (iters) - it);
+    for (clio::run::u64 k_it = 0; k_it < run_it; ++k_it, ++it) {
+      // ---- compute ----
+      Spin(spin_us, clock_khz);
+      __syncthreads();
 
-    // ---- async: collect the previous flush, which has been running under
-    //      the spin above ----
-    if (async && do_write && threadIdx.x == 0 && prev >= 0) {
-      v.WaitFlush(block_base + static_cast<u64>(prev) * region_elems,
-                  region_elems);
-    }
-    __syncthreads();
-
-    if (do_write) {
-      const u64 off = block_base + it * region_elems;
-      // Page at a time, so the whole block is inside one page at any moment --
-      // the granularity the vector's paging contract assumes.
-      for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 poff = off + pg * v.elems_per_page_;
-        for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-          v.RefFault(poff + i) = Val(poff + i, pass);
-        }
-        __syncthreads();
-      }
-      // ---- block-level flush: ONE call covering the whole region ----
-      if (threadIdx.x == 0) {
-        v.BeginFlush(off, region_elems);
-        if (!async) {
-          v.WaitFlush(off, region_elems);
-        }
+      // ---- async: collect the previous flush, which has been running under
+      //      the spin above ----
+      if (async && do_write && threadIdx.x == 0 && prev >= 0) {
+        v.WaitFlush(block_base + static_cast<u64>(prev) * region_elems,
+                    region_elems);
       }
       __syncthreads();
-      prev = static_cast<long long>(it);
-    }
+
+      if (do_write) {
+        const u64 off = block_base + it * region_elems;
+        // Page at a time, so the whole block is inside one page at any moment --
+        // the granularity the vector's paging contract assumes.
+        for (u64 pg = 0; pg < pages_per_region; ++pg) {
+          const u64 poff = off + pg * v.elems_per_page_;
+          for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+            v[poff + i] = Val(poff + i, pass);
+          }
+          __syncthreads();
+        }
+        // ---- block-level flush: ONE call covering the whole region ----
+        if (threadIdx.x == 0) {
+          v.BeginFlush(off, region_elems);
+          if (!async) {
+            v.WaitFlush(off, region_elems);
+          }
+        }
+        __syncthreads();
+        prev = static_cast<long long>(it);
+      }
+      }
   }
 
   if (async && do_write && threadIdx.x == 0 && prev >= 0) {

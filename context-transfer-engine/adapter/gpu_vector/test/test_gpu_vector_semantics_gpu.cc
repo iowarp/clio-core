@@ -56,7 +56,7 @@ CTP_INLINE_CROSS_FUN u32 Val(u64 i, u32 salt) {
 // PATTERN and not of how the hardware happened to schedule warps.
 // ---------------------------------------------------------------------------
 
-/** v.RefFault(base + i) = Val(base + i, salt), then optionally flush the range. */
+/** v[base + i] = Val(base + i, salt), then optionally flush the range. */
 __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 base, u64 count,
                             u32 salt, int flush) {
@@ -64,8 +64,11 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
-  for (u64 i = 0; i < count; ++i) {
-    v.RefFault(off + i) = Val(off + i, salt);
+  for (clio::run::u64 i = 0; i < count;) {
+    const clio::run::u64 run_i = v.HoldPage(off + i, (count) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      v[off + i] = Val(off + i, salt);
+      }
   }
   if (flush) {
     v.BeginFlush(off, count);
@@ -73,7 +76,7 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
-/** Verify v.RefFault(base+i) == Val(base+i, salt); count mismatches. */
+/** Verify v[base+i] == Val(base+i, salt); count mismatches. */
 __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<u32> v, u64 base, u64 count,
                              u32 salt, unsigned long long *bad) {
@@ -82,8 +85,11 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
   unsigned long long local = 0;
-  for (u64 i = 0; i < count; ++i) {
-    if (v.AtFault(off + i) != Val(off + i, salt)) ++local;
+  for (clio::run::u64 i = 0; i < count;) {
+    const clio::run::u64 run_i = v.HoldPage(off + i, (count) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      if (v[off + i] != Val(off + i, salt)) ++local;
+      }
   }
   atomicAdd(bad, local);
 }
@@ -98,7 +104,9 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
   unsigned long long acc = 0;
   for (u32 p = 0; p < passes; ++p) {
     for (u64 k = 0; k < npages; ++k) {
-      acc += v.AtFault((first_page + k) * v.elems_per_page_);
+      const u64 off = (first_page + k) * v.elems_per_page_;
+      v.HoldPage(off, 1);
+      acc += v.at(off);
     }
   }
   atomicAdd(sink, acc);
@@ -112,8 +120,12 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
+  // One page per step, in the given order -- these touches are deliberately
+  // NOT contiguous, so each needs its own hold.
   for (u32 i = 0; i < n; ++i) {
-    acc += v.AtFault(pages[i] * v.elems_per_page_);
+    const u64 off = pages[i] * v.elems_per_page_;
+    v.HoldPage(off, 1);
+    acc += v.at(off);
   }
   atomicAdd(sink, acc);
 }
@@ -166,9 +178,13 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const u64 last_of_prev = boundary_page * v.elems_per_page_ - 1;
   const u64 first_of_next = boundary_page * v.elems_per_page_;
+  // The two elements straddle a page boundary, so each needs its own hold --
+  // one hold cannot cover both, which is exactly what this test checks.
   for (u32 r = 0; r < reps; ++r) {
-    v.RefFault(last_of_prev) = Val(last_of_prev, 7u);
-    v.RefFault(first_of_next) = Val(first_of_next, 7u);
+    v.HoldPage(last_of_prev, 1);
+    v[last_of_prev] = Val(last_of_prev, 7u);
+    v.HoldPage(first_of_next, 1);
+    v[first_of_next] = Val(first_of_next, 7u);
   }
   v.BeginFlush(last_of_prev, 2);
   v.WaitFlush(last_of_prev, 2);
@@ -191,8 +207,9 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
   const u64 pages = count / v.elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = p * v.elems_per_page_;
+    v.HoldPage(base, v.elems_per_page_);
     for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      if (v.AtFault(base + i) != Val(base + i, salt)) ++local;
+      if (v.at(base + i) != Val(base + i, salt)) ++local;
     }
     __syncthreads();
   }
@@ -211,15 +228,18 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
   const u64 pages = count / v.elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = slice + p * v.elems_per_page_;
-    for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      v.RefFault(base + i) = Val(base + i, salt);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      v.BeginFlush(base, v.elems_per_page_);
-      v.WaitFlush(base, v.elems_per_page_);
-    }
-    __syncthreads();
+    v.HoldPage(base, v.elems_per_page_);
+    {
+      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+        v[base + i] = Val(base + i, salt);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        v.BeginFlush(base, v.elems_per_page_);
+        v.WaitFlush(base, v.elems_per_page_);
+      }
+      __syncthreads();
+      }
   }
 }
 
@@ -240,13 +260,16 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
   const u64 first = slice / v.elems_per_page_;
   unsigned long long local = 0;
   for (u64 p = 0; p < pages; ++p) {
-    if (p + 1 < pages) v.BeginFetch(first + p + 1);
-    v.RescorePage(first + p, 1000.0f);
-    const u64 off = slice + p * v.elems_per_page_;
-    for (u64 i = 0; i < v.elems_per_page_; ++i) {
-      if (v.AtFault(off + i) != Val(off + i, salt)) ++local;
-    }
-    v.RescorePage(first + p, -1000.0f);
+    {
+      if (p + 1 < pages) v.BeginFetch(first + p + 1);
+      v.RescorePage(first + p, 1000.0f);
+      const u64 off = slice + p * v.elems_per_page_;
+      v.HoldPage(off, v.elems_per_page_);
+      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+        if (v[off + i] != Val(off + i, salt)) ++local;
+      }
+      v.RescorePage(first + p, -1000.0f);
+      }
   }
   atomicAdd(bad, local);
 }

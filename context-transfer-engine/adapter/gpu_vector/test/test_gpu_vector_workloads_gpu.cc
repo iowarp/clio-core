@@ -61,8 +61,11 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per; ++i) {
-    v.RefFault(base + i) = Seed(base + i);
+  for (clio::run::u64 i = 0; i < per;) {
+    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      v[base + i] = Seed(base + i);
+      }
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -83,8 +86,11 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
-    for (clio::run::u64 i = 0; i < n; ++i) {
-      v.RefFault(base + off + i) = Step(v.AtFault(base + off + i));
+    for (clio::run::u64 i = 0; i < n;) {
+      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
+      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+        v[base + off + i] = Step(v[base + off + i]);
+          }
     }
     // Double buffer: hand this page to the runtime NOW and keep computing.
     v.BeginFlush(base + off, n);
@@ -113,8 +119,11 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
     if (off + page_elems < per) {
       v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
     }
-    for (clio::run::u64 i = 0; i < n; ++i) {
-      acc += v.AtFault(base + off + i);
+    for (clio::run::u64 i = 0; i < n;) {
+      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
+      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+        acc += v[base + off + i];
+          }
     }
   }
   atomicAdd(sum, acc);

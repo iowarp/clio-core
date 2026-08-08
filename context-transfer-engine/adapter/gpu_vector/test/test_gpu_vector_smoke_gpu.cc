@@ -43,8 +43,11 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_GPU_INIT(info, nullptr);
   v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  for (clio::run::u64 i = 0; i < n; ++i) {
-    v.RefFault(i) = static_cast<clio::run::u32>(i * 7 + 1);
+  for (clio::run::u64 i = 0; i < n;) {
+    const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      v[i] = static_cast<clio::run::u32>(i * 7 + 1);
+      }
   }
   v.BeginFlush(0, n);
   v.WaitFlush(0, n);
@@ -57,10 +60,13 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_GPU_INIT(info, nullptr);
   v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  for (clio::run::u64 i = 0; i < n; ++i) {
-    if (v.AtFault(i) != static_cast<clio::run::u32>(i * 7 + 1)) {
-      atomicAdd(bad, 1ull);
-    }
+  for (clio::run::u64 i = 0; i < n;) {
+    const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      if (v[i] != static_cast<clio::run::u32>(i * 7 + 1)) {
+        atomicAdd(bad, 1ull);
+      }
+      }
   }
 }
 
@@ -77,8 +83,11 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per; ++i) {
-    v.RefFault(base + i) = static_cast<clio::run::u32>((base + i) * 7 + 1);
+  for (clio::run::u64 i = 0; i < per;) {
+    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      v[base + i] = static_cast<clio::run::u32>((base + i) * 7 + 1);
+      }
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -91,10 +100,13 @@ __global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per; ++i) {
-    if (v.AtFault(base + i) != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
-      atomicAdd(bad, 1ull);
-    }
+  for (clio::run::u64 i = 0; i < per;) {
+    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
+    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
+      if (v[base + i] != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
+        atomicAdd(bad, 1ull);
+      }
+      }
   }
 }
 

@@ -156,6 +156,12 @@ class DeviceVector {
         p = ResolveLocked(pn);
         UnlockBlock();
       }
+      // Recency must be stamped on a HIT as well, not just in ResolveLocked.
+      // Once the lock-free path started serving hits, ResolveLocked stopped
+      // running for them, so re-touching a resident page no longer refreshed
+      // it and LRU evicted the most recently used page instead of the oldest.
+      // Still once per page TRANSITION, never per element.
+      p->last_access = Now();
       last_page_ = p;
     }
     const clio::run::u64 within = IndexIn(off, p);
@@ -169,8 +175,9 @@ class DeviceVector {
    * Assumes HoldPage() covers `off`: it indexes last_page_ directly, which is
    * what makes it cost about the same as a pointer dereference. Accessing
    * outside the held run reads the wrong page's bytes, so the run length
-   * HoldPage returned is a contract, not a hint. Use RefFault/AtFault when the
-   * access pattern is not known ahead of time and demand faulting is wanted.
+   * HoldPage returned is a contract, not a hint: re-hold before stepping past
+   * it. There is deliberately no resolve-per-access accessor -- that path cost
+   * 12x a raw pointer even when it always hit, and hold-and-iterate is 1.44x.
    */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
     Page *p = last_page_;
@@ -184,17 +191,28 @@ class DeviceVector {
     return static_cast<const T *>(p->data)[IndexIn(off, p)];
   }
 
-  /** Demand-faulting write access: resolves the page on every call. */
-  CTP_GPU_FUN T &RefFault(clio::run::u64 off) {
-    Page *p = Resolve(PageOf(off));
+  /**
+   * Hold `count` elements from `off` and hand back a RAW pointer to them.
+   *
+   * Same contract as HoldPage, but returns the base pointer so a hot loop can
+   * keep it in a register instead of re-reading last_page_ (which lives in the
+   * by-value view's per-thread LOCAL memory) on every access. Use when the
+   * inner loop is tight enough for that load to matter.
+   */
+  CTP_GPU_FUN T *HoldRaw(clio::run::u64 off, clio::run::u64 count,
+                         clio::run::u64 *run) {
+    *run = HoldPage(off, count);
+    Page *p = last_page_;
     p->dirty = 1u;
-    return static_cast<T *>(p->data)[IndexIn(off, p)];
+    return static_cast<T *>(p->data) + IndexIn(off, p);
   }
 
-  /** Demand-faulting read access: resolves the page on every call. */
-  CTP_GPU_FUN const T &AtFault(clio::run::u64 off) {
-    Page *p = Resolve(PageOf(off));
-    return static_cast<const T *>(p->data)[IndexIn(off, p)];
+  /** Read-only form of HoldRaw: does not dirty the page. */
+  CTP_GPU_FUN const T *HoldRawConst(clio::run::u64 off, clio::run::u64 count,
+                                    clio::run::u64 *run) {
+    *run = HoldPage(off, count);
+    const Page *p = last_page_;
+    return static_cast<const T *>(p->data) + IndexIn(off, p);
   }
 
   /**
