@@ -44,7 +44,7 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   for (clio::run::u64 i = 0; i < n; ++i) {
-    v[i] = static_cast<clio::run::u32>(i * 7 + 1);
+    v.RefFault(i) = static_cast<clio::run::u32>(i * 7 + 1);
   }
   v.BeginFlush(0, n);
   v.WaitFlush(0, n);
@@ -58,7 +58,7 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   for (clio::run::u64 i = 0; i < n; ++i) {
-    if (v.at(i) != static_cast<clio::run::u32>(i * 7 + 1)) {
+    if (v.AtFault(i) != static_cast<clio::run::u32>(i * 7 + 1)) {
       atomicAdd(bad, 1ull);
     }
   }
@@ -78,7 +78,7 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    v[base + i] = static_cast<clio::run::u32>((base + i) * 7 + 1);
+    v.RefFault(base + i) = static_cast<clio::run::u32>((base + i) * 7 + 1);
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -92,7 +92,7 @@ __global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    if (v.at(base + i) != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
+    if (v.AtFault(base + i) != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
       atomicAdd(bad, 1ull);
     }
   }

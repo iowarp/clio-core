@@ -56,7 +56,7 @@ CTP_INLINE_CROSS_FUN u32 Val(u64 i, u32 salt) {
 // PATTERN and not of how the hardware happened to schedule warps.
 // ---------------------------------------------------------------------------
 
-/** v[base + i] = Val(base + i, salt), then optionally flush the range. */
+/** v.RefFault(base + i) = Val(base + i, salt), then optionally flush the range. */
 __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 base, u64 count,
                             u32 salt, int flush) {
@@ -65,7 +65,7 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
   for (u64 i = 0; i < count; ++i) {
-    v[off + i] = Val(off + i, salt);
+    v.RefFault(off + i) = Val(off + i, salt);
   }
   if (flush) {
     v.BeginFlush(off, count);
@@ -73,7 +73,7 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
-/** Verify v[base+i] == Val(base+i, salt); count mismatches. */
+/** Verify v.RefFault(base+i) == Val(base+i, salt); count mismatches. */
 __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<u32> v, u64 base, u64 count,
                              u32 salt, unsigned long long *bad) {
@@ -83,7 +83,7 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
   unsigned long long local = 0;
   for (u64 i = 0; i < count; ++i) {
-    if (v.at(off + i) != Val(off + i, salt)) ++local;
+    if (v.AtFault(off + i) != Val(off + i, salt)) ++local;
   }
   atomicAdd(bad, local);
 }
@@ -98,7 +98,7 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
   unsigned long long acc = 0;
   for (u32 p = 0; p < passes; ++p) {
     for (u64 k = 0; k < npages; ++k) {
-      acc += v.at((first_page + k) * v.elems_per_page_);
+      acc += v.AtFault((first_page + k) * v.elems_per_page_);
     }
   }
   atomicAdd(sink, acc);
@@ -113,7 +113,7 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
   for (u32 i = 0; i < n; ++i) {
-    acc += v.at(pages[i] * v.elems_per_page_);
+    acc += v.AtFault(pages[i] * v.elems_per_page_);
   }
   atomicAdd(sink, acc);
 }
@@ -167,8 +167,8 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
   const u64 last_of_prev = boundary_page * v.elems_per_page_ - 1;
   const u64 first_of_next = boundary_page * v.elems_per_page_;
   for (u32 r = 0; r < reps; ++r) {
-    v[last_of_prev] = Val(last_of_prev, 7u);
-    v[first_of_next] = Val(first_of_next, 7u);
+    v.RefFault(last_of_prev) = Val(last_of_prev, 7u);
+    v.RefFault(first_of_next) = Val(first_of_next, 7u);
   }
   v.BeginFlush(last_of_prev, 2);
   v.WaitFlush(last_of_prev, 2);
@@ -192,7 +192,7 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = p * v.elems_per_page_;
     for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      if (v.at(base + i) != Val(base + i, salt)) ++local;
+      if (v.AtFault(base + i) != Val(base + i, salt)) ++local;
     }
     __syncthreads();
   }
@@ -212,7 +212,7 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = slice + p * v.elems_per_page_;
     for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      v[base + i] = Val(base + i, salt);
+      v.RefFault(base + i) = Val(base + i, salt);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -244,7 +244,7 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
     v.RescorePage(first + p, 1000.0f);
     const u64 off = slice + p * v.elems_per_page_;
     for (u64 i = 0; i < v.elems_per_page_; ++i) {
-      if (v.at(off + i) != Val(off + i, salt)) ++local;
+      if (v.AtFault(off + i) != Val(off + i, salt)) ++local;
     }
     v.RescorePage(first + p, -1000.0f);
   }

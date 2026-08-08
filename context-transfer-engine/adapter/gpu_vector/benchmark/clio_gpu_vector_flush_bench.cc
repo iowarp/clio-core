@@ -69,7 +69,7 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.elems_per_page_;
       for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-        v[poff + i] = Val(poff + i, 0u);
+        v.RefFault(poff + i) = Val(poff + i, 0u);
       }
       __syncthreads();
     }
@@ -119,7 +119,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.elems_per_page_;
         for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-          v[poff + i] = Val(poff + i, pass);
+          v.RefFault(poff + i) = Val(poff + i, pass);
         }
         __syncthreads();
       }

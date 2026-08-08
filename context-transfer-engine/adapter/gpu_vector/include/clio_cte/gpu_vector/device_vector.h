@@ -104,14 +104,67 @@ class DeviceVector {
    * The non-const form marks the page dirty: a reference handed out for
    * writing cannot be observed later, so the write must be assumed.
    */
+  /**
+   * Pin the page holding `off` and report how far you can walk from there.
+   *
+   * This is the indexing fast path. It resolves the page ONCE -- faulting it in
+   * if needed -- caches it in last_page_, and returns how many elements can be
+   * read or written sequentially from `off` before leaving that page. The
+   * caller loops over that run using operator[]/at(), which then do no
+   * resolution at all.
+   *
+   * Why this exists: resolving per element cost 64x a raw pointer on resident
+   * data. About a fifth of that was the unavoidable bookkeeping (a local-memory
+   * load of last_page_, then two dependent loads to reach the bytes); the rest
+   * was the page-TRANSITION path, which takes the block lock -- atomicCAS plus
+   * two __threadfence()s -- and linearly scans the page table, and which 256
+   * threads hit simultaneously and serialise on. Hoisting the transition out of
+   * the inner loop removes that entirely: one resolution per page instead of
+   * one per element.
+   *
+   * @param off   first element to be accessed
+   * @param count how many the caller would like to walk
+   * @return elements accessible from `off` without another HoldPage; always
+   *         >= 1 and <= count. Loop that many, then call again.
+   */
+  CTP_GPU_FUN clio::run::u64 HoldPage(clio::run::u64 off,
+                                      clio::run::u64 count) {
+    Page *p = Resolve(PageOf(off));
+    const clio::run::u64 within = IndexIn(off, p);
+    const clio::run::u64 left = elems_per_page_ - within;
+    return (count < left) ? count : left;
+  }
+
+  /**
+   * Element access through the HELD page -- no resolution, no checks.
+   *
+   * Assumes HoldPage() covers `off`: it indexes last_page_ directly, which is
+   * what makes it cost about the same as a pointer dereference. Accessing
+   * outside the held run reads the wrong page's bytes, so the run length
+   * HoldPage returned is a contract, not a hint. Use RefFault/AtFault when the
+   * access pattern is not known ahead of time and demand faulting is wanted.
+   */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
+    Page *p = last_page_;
+    p->dirty = 1u;
+    return static_cast<T *>(p->data)[IndexIn(off, p)];
+  }
+
+  /** Read-only access through the held page. Does NOT dirty it. */
+  CTP_GPU_FUN const T &at(clio::run::u64 off) const {
+    const Page *p = last_page_;
+    return static_cast<const T *>(p->data)[IndexIn(off, p)];
+  }
+
+  /** Demand-faulting write access: resolves the page on every call. */
+  CTP_GPU_FUN T &RefFault(clio::run::u64 off) {
     Page *p = Resolve(PageOf(off));
     p->dirty = 1u;
     return static_cast<T *>(p->data)[IndexIn(off, p)];
   }
 
-  /** Read-only access: does NOT dirty the page. */
-  CTP_GPU_FUN const T &at(clio::run::u64 off) {
+  /** Demand-faulting read access: resolves the page on every call. */
+  CTP_GPU_FUN const T &AtFault(clio::run::u64 off) {
     Page *p = Resolve(PageOf(off));
     return static_cast<const T *>(p->data)[IndexIn(off, p)];
   }

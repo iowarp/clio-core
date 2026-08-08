@@ -77,7 +77,7 @@ __global__ void SeedWeightsKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    v[base + i] = Weight(base + i);
+    v.RefFault(base + i) = Weight(base + i);
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -98,7 +98,7 @@ __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   unsigned long long acc = 0;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    acc += static_cast<unsigned long long>(v.at(base + i)) *
+    acc += static_cast<unsigned long long>(v.AtFault(base + i)) *
            Activation(base + i);
   }
   atomicAdd(sum, acc);

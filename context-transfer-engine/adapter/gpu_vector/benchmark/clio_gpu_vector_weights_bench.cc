@@ -94,7 +94,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    v[base + i] = Weight(base + i);
+    v.RefFault(base + i) = Weight(base + i);
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -127,11 +127,11 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
         // keeps it in the top tier before this block reaches it.
         v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
       }
-      (void) v.at(base + off);   // fault it in
+      (void) v.AtFault(base + off);   // fault it in
     }
     if (threadIdx.x != 0) continue;
     for (clio::run::u64 i = 0; i < n; ++i) {
-      acc += static_cast<unsigned long long>(v.at(base + off + i)) *
+      acc += static_cast<unsigned long long>(v.AtFault(base + off + i)) *
              Activation(base + off + i);
     }
   }

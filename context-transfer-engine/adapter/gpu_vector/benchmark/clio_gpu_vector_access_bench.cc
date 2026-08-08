@@ -103,6 +103,47 @@ __global__ void GrayScottVec(clio::run::IpcManagerGpuInfo info,
     const u64 r = y * dim + Wrap(x + 1, dim);
     const u64 d = Wrap(y - 1, dim) * dim + x;
     const u64 t = Wrap(y + 1, dim) * dim + x;
+    const float u = ui.AtFault(idx), v = vi.AtFault(idx);
+    const float lu = ui.AtFault(l) + ui.AtFault(r) + ui.AtFault(d) + ui.AtFault(t) - 4.0f * u;
+    const float lv = vi.AtFault(l) + vi.AtFault(r) + vi.AtFault(d) + vi.AtFault(t) - 4.0f * v;
+    const float uvv = u * v * v;
+    uo.RefFault(idx) = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
+    vo.RefFault(idx) = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
+  }
+}
+
+/**
+ * The same step again, but through the INDEXING FAST PATH.
+ *
+ * HoldPage resolves each field's page once, up front; the loop then uses
+ * operator[]/at(), which index the held page with no resolution at all. This
+ * is only valid while every access stays inside the held page -- here that
+ * means one page per field, which the caller guarantees before launching.
+ */
+__global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<float> ui,
+                              gv::DeviceVector<float> vi,
+                              gv::DeviceVector<float> uo,
+                              gv::DeviceVector<float> vo, u32 dim) {
+  CLIO_GPU_INIT(info, nullptr);
+  ui.ipc_ = g_ipc_manager_ptr;
+  vi.ipc_ = g_ipc_manager_ptr;
+  uo.ipc_ = g_ipc_manager_ptr;
+  vo.ipc_ = g_ipc_manager_ptr;
+  const u64 cells = static_cast<u64>(dim) * dim;
+  // One resolution per field for the whole kernel, instead of one per access.
+  ui.HoldPage(0, cells);
+  vi.HoldPage(0, cells);
+  uo.HoldPage(0, cells);
+  vo.HoldPage(0, cells);
+  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
+       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    const int x = static_cast<int>(idx % dim);
+    const int y = static_cast<int>(idx / dim);
+    const u64 l = y * dim + Wrap(x - 1, dim);
+    const u64 r = y * dim + Wrap(x + 1, dim);
+    const u64 d = Wrap(y - 1, dim) * dim + x;
+    const u64 t = Wrap(y + 1, dim) * dim + x;
     const float u = ui.at(idx), v = vi.at(idx);
     const float lu = ui.at(l) + ui.at(r) + ui.at(d) + ui.at(t) - 4.0f * u;
     const float lv = vi.at(l) + vi.at(r) + vi.at(d) + vi.at(t) - 4.0f * v;
@@ -135,10 +176,10 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
     float a, b;
     InitCell(idx, dim, &a, &b);
-    u[idx] = a;
-    v[idx] = b;
-    uo[idx] = a;
-    vo[idx] = b;
+    u.RefFault(idx) = a;
+    v.RefFault(idx) = b;
+    uo.RefFault(idx) = a;
+    vo.RefFault(idx) = b;
   }
 }
 
@@ -150,7 +191,7 @@ __global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    dst[idx] = src.at(idx);
+    dst[idx] = src.AtFault(idx);
   }
 }
 
@@ -273,7 +314,7 @@ int main(int argc, char **argv) {
   }
 
   // ---- vector: cache holds every page, so nothing ever faults while timing --
-  double vec_ms = 1e30;
+  double vec_ms = 1e30, hold_ms = 1e30;
   {
     gv::Vector<float> vu("gs_u", {0}, page_bytes, blocks,
                          static_cast<u32>(pages), cells);
@@ -344,6 +385,49 @@ int main(int argc, char **argv) {
         cudaFree(cv);
       }
     }
+    // ---- fast path, when each field is a single page ----
+    if (pages == 1) {
+      for (u32 r = 0; r < repeat; ++r) {
+        InitVec<<<blocks, threads>>>(gpu, du, dv, du2, dv2, dim);
+        cudaDeviceSynchronize();
+        const double t0 = NowMs();
+        auto a = du, b = dv, c = du2, d = dv2;
+        for (u32 s2 = 0; s2 < steps; ++s2) {
+          GrayScottHold<<<blocks, threads>>>(gpu, a, b, c, d, dim);
+          auto ta = a; a = c; c = ta;
+          auto tb = b; b = d; d = tb;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+          std::fprintf(stderr, "hold step failed: %s\n",
+                       cudaGetErrorString(cudaGetLastError()));
+          return 1;
+        }
+        const double ms = NowMs() - t0;
+        if (ms < hold_ms) hold_ms = ms;
+        if (r + 1 == repeat) {
+          float *cu = nullptr;
+          cudaMalloc(&cu, cells * sizeof(float));
+          VecToRaw<<<blocks, threads>>>(gpu, a, cu, dim);
+          cudaDeviceSynchronize();
+          std::vector<float> hu(cells), hru(cells);
+          cudaMemcpy(hu.data(), cu, cells * sizeof(float),
+                     cudaMemcpyDeviceToHost);
+          cudaMemcpy(hru.data(), ru, cells * sizeof(float),
+                     cudaMemcpyDeviceToHost);
+          u64 bad = 0;
+          for (u64 i = 0; i < cells; ++i) {
+            if (std::fabs(hu[i] - hru[i]) > 1e-5) ++bad;
+          }
+          std::printf("  HoldPage agreement: %llu/%llu cells differ\n",
+                      (unsigned long long) bad, (unsigned long long) cells);
+          if (bad != 0) {
+            std::fprintf(stderr, "HOLD RESULTS DISAGREE -- timings void\n");
+            return 1;
+          }
+          cudaFree(cu);
+        }
+      }
+    }
     const auto st = vu.ReadStats(0);
     std::printf("  vector I/O during timing: faults=%llu puts=%llu evicts=%llu"
                 " (must be 0)\n",
@@ -361,6 +445,16 @@ int main(int argc, char **argv) {
       "  added cost       %8.2f ns/access\n",
       raw_ms, raw_ms * 1e6 / accesses, vec_ms, vec_ms * 1e6 / accesses,
       vec_ms / raw_ms, (vec_ms - raw_ms) * 1e6 / accesses);
+  if (hold_ms < 1e29) {
+    std::printf(
+        "  gpu_vector+Hold  %8.2f ms   (%.2f ns/access)\n"
+        "  slowdown vs raw  %8.2fx\n"
+        "  speedup vs fault %8.2fx\n",
+        hold_ms, hold_ms * 1e6 / accesses, hold_ms / raw_ms, vec_ms / hold_ms);
+  } else {
+    std::printf("  gpu_vector+Hold      n/a   (needs 1 page/field; use "
+                "--page-kb >= field size)\n");
+  }
 
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;

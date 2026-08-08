@@ -62,7 +62,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per; ++i) {
-    v[base + i] = Seed(base + i);
+    v.RefFault(base + i) = Seed(base + i);
   }
   v.BeginFlush(base, per);
   v.WaitFlush(base, per);
@@ -84,7 +84,7 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
     for (clio::run::u64 i = 0; i < n; ++i) {
-      v[base + off + i] = Step(v.at(base + off + i));
+      v.RefFault(base + off + i) = Step(v.AtFault(base + off + i));
     }
     // Double buffer: hand this page to the runtime NOW and keep computing.
     v.BeginFlush(base + off, n);
@@ -114,7 +114,7 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
       v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
     }
     for (clio::run::u64 i = 0; i < n; ++i) {
-      acc += v.at(base + off + i);
+      acc += v.AtFault(base + off + i);
     }
   }
   atomicAdd(sum, acc);

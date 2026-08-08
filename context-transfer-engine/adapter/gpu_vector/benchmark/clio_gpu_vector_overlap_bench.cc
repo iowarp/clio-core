@@ -67,7 +67,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   for (u64 p = 0; p < pages; ++p) {
     const u64 off = base + p * v.elems_per_page_;
     for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      v[off + i] = Elem(off + i);
+      v.RefFault(off + i) = Elem(off + i);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -134,7 +134,7 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
     const u64 off = base + p * v.elems_per_page_;
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
-      local += v.at(off + i);
+      local += v.AtFault(off + i);
     }
     acc += local;
     __syncthreads();
