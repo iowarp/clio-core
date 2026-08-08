@@ -56,9 +56,18 @@ class Lz4 : public Compressor {
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    output_size = LZ4_decompress_safe((char *)input, (char *)output,
-                                      (int)input_size, (int)output_size);
-    return output_size != 0;
+    // LZ4_decompress_safe returns a NEGATIVE value on failure. Assigning it
+    // straight into a size_t made it enormous, and `!= 0` then reported
+    // SUCCESS -- so a failed decompression was handed back as valid data with
+    // a garbage length. Check the signed result before converting.
+    int rc = LZ4_decompress_safe((char *)input, (char *)output,
+                                 (int)input_size, (int)output_size);
+    if (rc <= 0) {
+      output_size = 0;
+      return false;
+    }
+    output_size = static_cast<size_t>(rc);
+    return true;
   }
 };
 

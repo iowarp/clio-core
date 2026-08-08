@@ -70,23 +70,39 @@ struct CompressionHeader {
   uint32_t compress_lib_;     // Compression library ID
   uint32_t compress_preset_;  // Compression preset
   uint64_t original_size_;    // Original uncompressed size
+  /**
+   * EXACT compressed payload size (bytes following this header).
+   *
+   * Frame-exact codecs need it. A reader does not know the compressed length
+   * a priori, so it over-allocates its fetch and the trailing bytes are
+   * garbage; passing that over-estimate to LZ4_decompress_safe (or zstd) makes
+   * decompression FAIL. Without this field the reader could only guess
+   * "request size minus header", which is exactly that over-estimate.
+   *
+   * 0 means "written before this field existed" -- readers fall back to the
+   * derived estimate for those blobs.
+   */
+  uint64_t compressed_size_;
 
   CompressionHeader()
       : magic_(kMagic),
         compress_lib_(0),
         compress_preset_(0),
-        original_size_(0) {}
+        original_size_(0),
+        compressed_size_(0) {}
 
-  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size)
+  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size,
+                    uint64_t comp_size = 0)
       : magic_(kMagic),
         compress_lib_(lib),
         compress_preset_(preset),
-        original_size_(orig_size) {}
+        original_size_(orig_size),
+        compressed_size_(comp_size) {}
 
   bool IsValid() const { return magic_ == kMagic; }
 };
-static_assert(sizeof(CompressionHeader) == 24,
-              "CompressionHeader must be 24 bytes");
+static_assert(sizeof(CompressionHeader) == 32,
+              "CompressionHeader must be 32 bytes");
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -764,7 +780,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
       // Write compression header
       CompressionHeader header(context.compress_lib_, context.compress_preset_,
-                               input_size);
+                               input_size, compressed_size);
       std::memcpy(compressed_shm.ptr_, &header, header_size);
 
       // Write compressed data after header
@@ -925,9 +941,20 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
 
       auto decompress_start = std::chrono::high_resolution_clock::now();
 
-      // Get compressed data (after header)
+      // Get compressed data (after header).
+      //
+      // Use the EXACT payload length the writer recorded. Deriving it from the
+      // request size minus the header is an OVER-ESTIMATE: the reader does not
+      // know the compressed length a priori and over-allocates its fetch, so
+      // the trailing bytes are garbage. Frame-exact codecs (lz4, zstd) then
+      // fail on the bogus length -- which is exactly what
+      // CompressionHeader::compressed_size_ was added to carry. Fall back to
+      // the derived value for blobs written before that field existed
+      // (compressed_size_ == 0).
       char* compressed_data = temp_buffer.ptr_ + header_size;
-      size_t compressed_size = expected_size - header_size;
+      size_t compressed_size = (header->compressed_size_ != 0)
+          ? static_cast<size_t>(header->compressed_size_)
+          : (expected_size - header_size);
 
       // Decompress to output buffer
       auto output_fullptr =
@@ -1228,7 +1255,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   if (shm.IsNull()) {
     return false;
   }
-  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size);
+  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size,
+                           compressed_size);
   std::memcpy(shm.ptr_, &header, header_size);
   std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
