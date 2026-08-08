@@ -72,3 +72,34 @@ Measured overhead is ~50-66us per put, which caps the GPU flush plateau at
 - context-runtime/src/ipc/ipc_gpu2cpu.cc + worker.cc (CPU drain -> batched
   copies; keep ONE-batch-per-poll bounded so the single-lane worker still
   yields -- do NOT reintroduce the d265bdb3 batch-drain deadlock shape)
+
+## Status: IMPLEMENTED AND DEFAULT (ce118908)
+
+Gate cleared:
+- 23/23 ctest (gpu_vector + compressor + bdev) with the ring active
+- compute-sanitizer 0 errors on test_gpu_vector_smoke
+- correct through 64 blocks and multi-oversub-64
+- faster on every workload measured:
+
+| workload                | managed | ring | |
+|-------------------------|---------|------|-|
+| sync demand faults      | 493 MB/s | 801 MB/s | 1.6x |
+| read async overlap      | 175 ms   | 138 ms   | 1.27x |
+| flush 8 blocks          | 5859 MB/s | 6051 MB/s | +3% |
+| flush 64 blocks         | 6541 MB/s | 6558 MB/s | flat |
+
+The read path gains and the flush path does not, which is the design working
+as predicted: a flush already pipelines many puts so its per-submission
+crossing hides behind data transfer, while a demand fault is a BLOCKING round
+trip whose latency is exactly the submit atomic plus the completion poll --
+the two PCIe crossings the ring removes.
+
+CLIO_GPU_DEVRING=0 restores the managed queue for bisecting.
+
+### Not yet done
+- Response batching. Completions are still written per task by SendOut; the
+  design's batched H2D response path is unimplemented. Reads would gain again
+  from it (the completion poll is now local, but the CPU still crosses per
+  completion).
+- Flush is bounded by per-put TASK cost (~50-66us), not the transport, so it
+  needs 8MB pages or a region-level put to approach the 12.9 GB/s PCIe ceiling.
