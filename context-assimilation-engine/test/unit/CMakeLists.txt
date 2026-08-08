@@ -814,3 +814,92 @@ if(CAE_LABELING_ENABLED)
 
   install(TARGETS test_cae_label_client DESTINATION bin)
 endif()
+
+# PageMap (pagify): unified page numbering, incl. partial and mixed pages.
+#------------------------------------------------------------------------------
+add_executable(test_page_map
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_page_map.cc
+)
+
+target_include_directories(test_page_map
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_page_map
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_page_map DESTINATION bin)
+
+add_test(NAME cae_page_map COMMAND test_page_map)
+set_tests_properties(cae_page_map PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;pagemap"
+)
+
+#------------------------------------------------------------------------------
+# Pagify: page-number -> blob slices -> constructed page
+#------------------------------------------------------------------------------
+add_executable(test_pagify
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_pagify.cc
+)
+
+target_include_directories(test_pagify
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_pagify
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_pagify DESTINATION bin)
+
+add_test(NAME cae_pagify COMMAND test_pagify)
+set_tests_properties(cae_pagify PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;pagemap;pagify"
+)
+
+#------------------------------------------------------------------------------
+# pagify through the CAE's CTE interceptor (end to end)
+#------------------------------------------------------------------------------
+add_executable(test_cae_pagify
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_pagify.cc
+)
+
+target_include_directories(test_cae_pagify
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_pagify
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_cae_pagify DESTINATION bin)
+
+add_test(NAME cae_pagify_interpose COMMAND test_cae_pagify)
+set_tests_properties(cae_pagify_interpose PROPERTIES
+  TIMEOUT 120
+  LABELS "coverage;cae;pagify;interpose"
+)
