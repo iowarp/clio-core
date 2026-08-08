@@ -222,7 +222,14 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // ---- many blocks AND oversubscribed ----------------------------------
   // Both pressures at once: 64 blocks, each walking 4 pages through 2 slots,
   // so every block evicts and writes back mid-kernel while 63 others do the
-  // same. 128 here still hangs (see the note above), so this stops at 64.
+  // same. 128 here still hangs, and the runtime's own heartbeat says why it
+  // is NOT a producer-side problem: processed= freezes while outstanding=91
+  // sits queued with blocked=0, i.e. the CPU workers stall with work waiting.
+  // That points at a worker blocking in a CUDA call while 128 resident blocks
+  // spin, not at anything the vector does. Switching the CTE tier to pinned
+  // memory (to make the transfers pure DMA) was tried and made it worse --
+  // it also broke the non-evicting 128 case -- so that is not the cause
+  // either. Left at 64 pending a real diagnosis.
   {
     const unsigned nb = 64u;
     const clio::run::u64 per = 4 * 1024;
