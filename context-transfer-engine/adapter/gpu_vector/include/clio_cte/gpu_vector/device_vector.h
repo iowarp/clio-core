@@ -129,7 +129,35 @@ class DeviceVector {
    */
   CTP_GPU_FUN clio::run::u64 HoldPage(clio::run::u64 off,
                                       clio::run::u64 count) {
-    Page *p = Resolve(PageOf(off));
+    const clio::run::u64 pn = PageOf(off);
+    Page *p = last_page_;
+    if (p == nullptr || p->page_num != pn || p->fetching) {
+      // Look the page up WITHOUT the block lock. Taking it here is what made
+      // the fast path slower than demand faulting: at kernel entry every
+      // thread misses, so a whole block serialises through atomicCAS and two
+      // __threadfence()s each, once per vector per launch. A resident page
+      // needs no exclusive access -- only claiming a slot or evicting does.
+      //
+      // The scan is safe against a concurrent fault because a slot publishes
+      // `fetching` BEFORE its page_num (see ClaimSlot), so a page that looks
+      // resident here really is: the two are ordered by a threadfence, and a
+      // scanner that sees the new page_num also sees fetching set and falls
+      // through to the locked path.
+      p = nullptr;
+      Page *tbl = BlockPages();
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (tbl[i].page_num == pn && !tbl[i].fetching) {
+          p = &tbl[i];
+          break;
+        }
+      }
+      if (p == nullptr) {
+        LockBlock();          // a real miss: claiming/eviction needs the lock
+        p = ResolveLocked(pn);
+        UnlockBlock();
+      }
+      last_page_ = p;
+    }
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = elems_per_page_ - within;
     return (count < left) ? count : left;
@@ -605,11 +633,16 @@ class DeviceVector {
     // The fast path may only skip the lock for a page that is fully resident;
     // one still being prefetched has to go through the slow path to wait.
     if (p != nullptr && p->page_num == page_num && !p->fetching) return p;
-    // Everything past the per-thread fast path touches the shared page table
-    // (residency search, slot claim, eviction, the fault itself), so it is all
-    // under the block's lock. Without it, concurrent lanes claim the same free
-    // slot and submit competing gets into one task slot.
     LockBlock();
+    p = ResolveLocked(page_num);
+    UnlockBlock();
+    last_page_ = p;
+    return p;
+  }
+
+  /** Resolve with the block lock ALREADY held. */
+  CTP_GPU_FUN Page *ResolveLocked(clio::run::u64 page_num) {
+    Page *p = nullptr;
     // Recency is stamped HERE, on a page transition, not per element access.
     // Doing it in operator[]/at() cost a clock64() and a global write on every
     // element: a single-threaded pass over a 64 KiB page spent milliseconds in
@@ -645,6 +678,11 @@ class DeviceVector {
         }
         if (free_slot != pages_per_block_) {
           p = &tbl[free_slot];
+          // Order matters: mark the slot busy and publish that BEFORE the
+          // page number, so HoldPage's lock-free scan cannot see a page that
+          // looks resident while its bytes are still in flight.
+          p->fetching = 1u;
+          __threadfence_block();
           p->page_num = page_num;
           p->dirty = 0u;
           p->flushing = 0u;
@@ -656,8 +694,6 @@ class DeviceVector {
       }
     }
     if (p != nullptr) p->last_access = Now();
-    UnlockBlock();
-    last_page_ = p;
     return p;
   }
 
