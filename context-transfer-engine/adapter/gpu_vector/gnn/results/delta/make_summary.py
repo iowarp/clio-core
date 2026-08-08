@@ -50,12 +50,9 @@ def load(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    # Default to the CSVs committed alongside this script rather than an absolute
-    # home path, so the tree works wherever it is checked out.
-    here = os.path.dirname(os.path.abspath(__file__))
-    ap.add_argument("--train-csv", default=os.path.join(here, "csv", "gnn_train_results.csv"))
-    ap.add_argument("--cap-csv", default=os.path.join(here, "csv", "gnn_cap_results.csv"))
-    ap.add_argument("--out", default=os.path.join(here, "csv", "SUMMARY.md"))
+    ap.add_argument("--train-csv", default="/u/rpawar/gnnbench/results/gnn_train_results.csv")
+    ap.add_argument("--cap-csv", default="/u/rpawar/gnnbench/results/gnn_cap_results.csv")
+    ap.add_argument("--out", default="/u/rpawar/gnnbench/results/SUMMARY.md")
     args = ap.parse_args()
 
     rows = []

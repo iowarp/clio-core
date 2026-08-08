@@ -18,29 +18,45 @@ subsampled.
 
 ```
 [TRAIN] IN-CORE: *** OOM *** cannot place 54208MiB A resident.
-[TRAIN] ETERNIA: stored A 54208MiB -> 50257MiB (1.079x) in 158.62s
-[TRAIN] ETERNIA: epoch0 loss=5.133193 acc=0.0010 -> epoch29 loss=4.552200
-        acc=0.0626 val_acc=0.0623 (8351.22s)   peak GPU window = 64MiB
+[TRAIN] ETERNIA: stored A 54208MiB -> 50257MiB (1.079x) in 185.98s
+[TRAIN] ETERNIA: epoch0 loss=3.116351 acc=0.2958 -> epoch29 loss=1.295001
+        acc=0.6113 val_acc=0.6118 (10732.06s)  peak GPU window = 64MiB
 [TRAIN] in-core OOM'd -> Eternia is the ONLY method that TRAINED this matrix.
 Passed: 1  Failed: 0
 ```
 
 **The claim holds: in-core cannot run this graph at all; Eternia trains it inside a
-64 MiB HBM window — 847x smaller than the feature matrix — and the loss decreases
-monotonically for 30 epochs.**
+64 MiB HBM window — 847x smaller than the feature matrix — to 61.1% train /
+61.2% validation accuracy, with loss decreasing monotonically for 30 epochs.**
 
-This is a **capacity** result, not a performance one. The epoch time (278 s) is
+This is a **capacity** result, not a performance one. The epoch time (358 s) is
 bottlenecked by a readout path that runs ~100x below PCIe bandwidth — see 4b.
 
-### Honest caveat on accuracy
+### The update rule matters far more than anything else
 
-Final train/val accuracy is **6.26% / 6.23%**, which is exactly the majority-class
-floor: the largest of the 172 classes holds 0.0626 of the labelled nodes. 30
-full-batch gradient steps on a 1-hop SIGN model is not enough to leave that floor,
-and only **1.39%** of papers100M nodes carry a label (1,546,782 / 111,059,956). The
-accuracy number here demonstrates *the pipeline runs and learns* (loss 5.133 ->
-4.552, monotone); it is **not** a competitive accuracy result and should not be
-quoted as one. **Loss is the only discriminating metric in these runs.**
+The run above uses **mini-batch SGD** (`CLIO_GNN_MINIBATCH=1`, batch =
+page_rows x window = 131,072 rows -> ~847 updates/epoch). The originally-measured
+configuration was **full-batch GD**, which performs exactly **one weight update per
+epoch** — so 30 epochs was 30 updates, and the model never escaped the
+majority-class floor (0.0626 = the share of the largest of the 172 classes):
+
+| papers100M, 30 epochs, lr 0.2, identical data | updates | train / val acc | final loss |
+|---|---|---|---|
+| full-batch GD (one update per epoch) | 30 | 6.26% / 6.23% | 4.552200 |
+| **mini-batch SGD** | **~25,400** | **61.13% / 61.18%** | **1.295001** |
+| mini-batch SGD, 10 epochs | ~8,470 | 57.86% / 57.89% | 1.447957 |
+
+Same features, same lr, same model, same streaming path — **9.8x the accuracy**
+purely from doing more weight updates. Both configurations OOM in-core and both run
+at the same 64 MiB window, so this changes nothing about the capacity claim; it
+changes only whether the accuracy number is meaningful.
+
+**Remaining caveats on the accuracy number.** Only **1.39%** of papers100M nodes
+carry a label (1,546,782 / 111,059,956). The validation split here is *every 10th
+node by index* (`kValStride = 10`), **not** OGB's official time-based split, so
+61.18% is **not** comparable to the ogbn-papers100M leaderboard — an index split is
+easier than a temporal one. Loss was still falling at epoch 30 (1.295 and
+decreasing), so this is a floor for this model, not its ceiling.
 
 ---
 
@@ -55,13 +71,37 @@ All 30 epochs agree digit-for-digit between the in-core baseline and the streame
 Eternia path. Peak GPU window **1 MiB** vs 82 MiB resident; ratio 1.067x;
 0.150 s/epoch in-core vs 0.309 s/epoch streamed.
 
+### Bit-exactness also holds under mini-batch SGD
+
+Mini-batch updates are order-dependent, so bit-exactness was not a given. It holds
+anyway — windows are issued in order on a single stream, so both paths perform the
+identical update sequence. `max|dloss| = max|dacc| = max|dvacc| = 0.000e+00` on all
+four arxiv configurations below:
+
+| arxiv, lr 0.2 | updates | train acc | val acc | final loss | peak window | bit-exact |
+|---|---|---|---|---|---|---|
+| full-batch, 30 ep | 30 | 0.1882 | 0.1887 | 2.986905 | 32 MiB | **yes** |
+| mini-batch, 5 ep, batch 4096 | ~205 | 0.3490 | 0.3486 | 2.434244 | 2 MiB | **yes** |
+| mini-batch, 30 ep, batch 16384 | ~310 | 0.4515 | 0.4519 | 2.123241 | 8 MiB | **yes** |
+| **mini-batch, 30 ep, batch 4096** | **~1,230** | **0.5859** | **0.5886** | **1.492313** | **2 MiB** | **yes** |
+
+Accuracy is monotone in *update count*, independent of epoch count and batch size:
+5 mini-batch epochs (~205 updates) beat 30 full-batch epochs (30 updates), 0.3490 vs
+0.1882, in one-sixth the epochs. Note also that mini-batching **shrinks** the peak
+window (32 MiB -> 2 MiB), because the window *is* the batch.
+
+Raising the learning rate does **not** substitute for more updates — on a 2M-node
+papers100M tile, lr 5.0 and lr 50.0 both landed *below* the majority-class floor
+(0.0709 vs floor 0.1242), and lr 5.0 was still stuck at the floor after 300 epochs.
+lr 0.2 was already correct; update count was the only lever.
+
 ---
 
 ## 3. Compression tradeoff (task d) — zstd vs cuSZp on identical data
 
 Same dataset, same seed, same 30 epochs.
 
-| | zstd (lossless) | cuSZp (lossy, balanced) |
+| (full-batch GD, 30 epochs) | zstd (lossless) | cuSZp (lossy, balanced) |
 |---|---|---|
 | stored | 50,257 MiB (49.1 GiB) | **17,342 MiB (16.9 GiB)** |
 | ratio | 1.079x | **3.126x** |
@@ -73,6 +113,11 @@ Same dataset, same seed, same 30 epochs.
 | final train / val acc | 6.26% / 6.23% | 6.26% / 6.23% |
 
 Max per-epoch loss divergence over all 30 epochs: **1.0e-06**.
+
+> These codec runs used **full-batch GD**, which is why their accuracy sits at the
+> 6.26% majority-class floor — see section 1. That is a property of the update rule,
+> not of the codecs: both arms are identical to 1e-06 in loss, which is the point of
+> the comparison. The codec sweep was not re-run under mini-batch.
 
 **This is what makes the "compression expands GPU memory" claim real.** Lossless
 zstd achieves only **1.079x** on these features — it does *not* meaningfully expand
@@ -246,6 +291,11 @@ coarse pages with reordering. The full-sweep trace is subsampled 1-in-53 (30.5M 
 
 * The train/capacity tests print `... -> NNNNMiB zstd (R x)` regardless of the active
   codec; the string is a hardcoded literal. Under cuSZp the log still says "zstd".
+* The training CSV has **no column recording the update rule**, so full-batch and
+  mini-batch rows are indistinguishable in `SUMMARY.md` except by their accuracy.
+  Runs are separated by file instead: `gnn_train_results.csv` (full-batch),
+  `gnn_minibatch.csv` (arxiv mini-batch), `gnn_papers_minibatch.csv` (papers100M
+  mini-batch); `gnn_train_all.csv` is their concatenation.
 * `results/gnn_cap_results.csv` has **no `lib`/`preset` column**, so zstd and cuSZp
   rows are distinguishable only by ratio. Worse, the four cuSZp points that tripped
   the bit-exact `REQUIRE` aborted *before* writing their CSV row — only the 111M

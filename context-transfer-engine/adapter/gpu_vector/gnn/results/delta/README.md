@@ -23,20 +23,28 @@ On real, non-tiled ogbn-papers100M — 111,017,984 nodes x 128-d aggregated feat
 ```
 IN-CORE: *** OOM *** cannot place 54208MiB A resident.
 ETERNIA: 54208 -> 50257 MiB (1.079x);  peak GPU window = 64 MiB
-         loss 5.133193 -> 4.552200 over 30 epochs
+         loss 3.116351 -> 1.295001,  acc 61.13% / val 61.18%,  30 epochs
 ```
 
 The in-core path cannot run this graph; Eternia trains it inside a **64 MiB** HBM
 window (847x smaller), and the peak window stays **flat at 64 MiB across a 56x range
 of feature-matrix sizes** (960 MiB -> 54,208 MiB).
 
+That accuracy needs **mini-batch SGD** (`CLIO_GNN_MINIBATCH=1`). Under the original
+full-batch GD an epoch is a *single* weight update, so 30 epochs was 30 updates and
+accuracy stalled at the 172-class majority floor (6.26%). Same data, same lr, same
+window -> **9.8x the accuracy** purely from more updates. See RESULTS.md section 1.
+
 ## Read the caveats before quoting anything
 
 `RESULTS.md` states these at length; in short:
 
-* **Final accuracy is not a meaningful ML result.** 6.26% / 6.23% is exactly the
-  172-class majority-class floor (only 1.39% of papers100M nodes are labelled, and
-  30 full-batch steps do not escape it). Loss is the discriminating metric.
+* **The accuracy number depends entirely on the update rule.** Mini-batch gives
+  61.13% / 61.18%; full-batch GD gives 6.26% (the majority-class floor). The
+  codec comparison in RESULTS.md section 3 was measured under FULL-batch and has
+  not been re-run, so its accuracy column still shows the floor.
+* **The validation split is every 10th node by index**, not OGB's official
+  time-based split, so 61.18% is NOT comparable to the papers100M leaderboard.
 * **Lossless compression is only 1.079x**, so the capacity win comes from
   bounded-window streaming, *not* from compression. Only lossy cuSZp reaches 3.126x.
 * **No performance claim should be drawn from these runs.** Readout throughput is

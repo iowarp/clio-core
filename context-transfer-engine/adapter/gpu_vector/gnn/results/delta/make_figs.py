@@ -21,8 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-LOGS = os.environ.get("GNN_LOGS",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence"))
+LOGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
 
 # "   e00  loss 3.741445 acc 0.0136  ||  loss 3.741445 acc 0.0136"
@@ -34,15 +33,6 @@ RE_ET = re.compile(
 # "[TRAIN] ETERNIA: stored A 54208MiB -> 50257MiB zstd (1.079x) in 158.62s"
 RE_STORE = re.compile(r"stored A (\d+)MiB -> (\d+)MiB \S+ \(([\d.]+)x\)")
 RE_PEAK = re.compile(r"peak GPU window=(\d+)MiB")
-
-
-def _log(stem):
-    """Accept either a full run log (<stem>.log) or the committed extract (<stem>.txt)."""
-    for ext in (".log", ".txt"):
-        p = os.path.join(LOGS, stem + ext)
-        if os.path.exists(p):
-            return p
-    return os.path.join(LOGS, stem + ".log")
 
 
 def read(path):
@@ -191,10 +181,10 @@ def fig_codec(zstd_txt, cuszp_txt):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    arxiv = read(_log("exp_a_arxiv_zstd"))
-    zstd = read(_log("exp_b_full30"))
+    arxiv = read(os.path.join(LOGS, "exp_a_arxiv_zstd.log"))
+    zstd = read(os.path.join(LOGS, "exp_b_full30.log"))
     fig_training(arxiv, zstd)
-    cus = _log("exp_d_cuszp_bal")
+    cus = os.path.join(LOGS, "exp_d_cuszp_bal.log")
     if os.path.exists(cus):
         fig_codec(zstd, read(cus))
 

@@ -3,3 +3,4 @@ data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,base_final_vacc,
 /tmp/gnn/data/papers100M,zstd,balanced,54208,111017984,64,3,OOM,-1,-1,0.0208873,0.0198598,50257,1.07861,64,188.42,-1,281.277,n/a(OOM)
 /tmp/gnn/data/papers100M,zstd,balanced,54208,111017984,64,30,OOM,-1,-1,0.0626462,0.0622677,50257,1.07861,64,158.624,-1,278.374,n/a(OOM)
 /tmp/gnn/data/papers100M,cuszp,balanced,54208,111017984,64,30,OOM,-1,-1,0.0626462,0.0622677,17342,3.12581,64,88.8244,-1,272.18,n/a(OOM)
+/tmp/gnn/data/papers100M,cuszp,best,54208,111017984,64,30,OOM,-1,-1,0.0626462,0.0622677,23164,2.34016,64,95.4796,-1,272.331,n/a(OOM)

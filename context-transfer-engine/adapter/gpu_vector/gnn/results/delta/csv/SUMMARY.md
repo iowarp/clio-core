@@ -12,6 +12,20 @@
 | papers100M | Eternia-zstd (balanced, 30 ep) | 64 MiB | 1.079x | 6.26% / 6.23% | 4.6 min | n/a(OOM) |
 | papers100M | in-core (resident, 30 ep) | OOM (needs 52.9 GiB) | - | OOM | OOM | n/a (OOM) |
 | papers100M | Eternia-cuszp (balanced, 30 ep) | 64 MiB | 3.126x | 6.26% / 6.23% | 4.5 min | n/a(OOM) |
+| papers100M | in-core (resident, 30 ep) | OOM (needs 52.9 GiB) | - | OOM | OOM | n/a (OOM) |
+| papers100M | Eternia-cuszp (best, 30 ep) | 64 MiB | 2.340x | 6.26% / 6.23% | 4.5 min | n/a(OOM) |
+| arxiv | in-core (resident, 30 ep) | 96 MiB | 1.00x (uncompressed) | 18.82% / 18.87% | 0.14 s | baseline |
+| arxiv | Eternia-zstd (balanced, 30 ep) | 32 MiB | 1.078x | 18.82% / 18.87% | 0.53 s | BIT-EXACT |
+| arxiv | in-core (resident, 30 ep) | 84 MiB | 1.00x (uncompressed) | 58.59% / 58.86% | 0.12 s | baseline |
+| arxiv | Eternia-zstd (balanced, 30 ep) | 2 MiB | 1.076x | 58.59% / 58.86% | 0.38 s | BIT-EXACT |
+| arxiv | in-core (resident, 5 ep) | 84 MiB | 1.00x (uncompressed) | 34.91% / 34.86% | 0.12 s | baseline |
+| arxiv | Eternia-zstd (balanced, 5 ep) | 2 MiB | 1.076x | 34.91% / 34.86% | 0.38 s | BIT-EXACT |
+| arxiv | in-core (resident, 30 ep) | 88 MiB | 1.00x (uncompressed) | 45.15% / 45.19% | 0.11 s | baseline |
+| arxiv | Eternia-zstd (balanced, 30 ep) | 8 MiB | 1.077x | 45.15% / 45.19% | 0.39 s | BIT-EXACT |
+| papers100M | in-core (resident, 10 ep) | OOM (needs 52.9 GiB) | - | OOM | OOM | n/a (OOM) |
+| papers100M | Eternia-zstd (balanced, 10 ep) | 64 MiB | 1.079x | 57.86% / 57.89% | 6.0 min | n/a(OOM) |
+| papers100M | in-core (resident, 30 ep) | OOM (needs 52.9 GiB) | - | OOM | OOM | n/a (OOM) |
+| papers100M | Eternia-zstd (balanced, 30 ep) | 64 MiB | 1.079x | 61.13% / 61.18% | 6.0 min | n/a(OOM) |
 
 ## Forward capacity (test_gpu_vector_gnn_capacity)
 

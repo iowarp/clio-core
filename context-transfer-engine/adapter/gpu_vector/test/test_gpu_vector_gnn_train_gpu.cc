@@ -238,6 +238,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   REQUIRE(H <= kMaxH);
   const int epochs = std::getenv("CLIO_GNN_EPOCHS") ? std::atoi(std::getenv("CLIO_GNN_EPOCHS")) : 30;
   const float lr = std::getenv("CLIO_GNN_LR") ? (float)std::atof(std::getenv("CLIO_GNN_LR")) : 0.5f;
+  // CLIO_GNN_MINIBATCH=1 switches from full-batch GD (one update per epoch) to
+  // mini-batch SGD (one update per streamed window). Default 0 keeps the exact
+  // full-batch behaviour the bit-exactness results were measured with.
+  const bool kMinibatch = std::getenv("CLIO_GNN_MINIBATCH") &&
+                          std::atoi(std::getenv("CLIO_GNN_MINIBATCH")) != 0;
   const clio::run::u32 window = std::getenv("CLIO_GNN_WINDOW") ? (clio::run::u32)std::atoi(std::getenv("CLIO_GNN_WINDOW")) : 4;
   const clio::run::u64 page_rows = std::getenv("CLIO_GNN_PAGE_ROWS") ? (clio::run::u64)std::atoi(std::getenv("CLIO_GNN_PAGE_ROWS")) : 512;
   const clio::run::u64 page_size = page_rows * (clio::run::u64)F * sizeof(float);
@@ -251,6 +256,19 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u64 dataset_bytes = total_elems * sizeof(float);
 
   size_t gfree = 0, gtot = 0; cudaMemGetInfo(&gfree, &gtot);
+  // Device-wide free memory BEFORE this test allocates anything. The GPU is
+  // exclusive to this job, so (g_gpu_free0 - free_now) is this process's total
+  // device footprint -- not just the feature window, but weights, labels, page
+  // cache and runtime buffers too. This is the number to quote as "peak GPU".
+  const size_t g_gpu_free0 = gfree;
+  size_t g_peak_gpu = 0;
+  auto track_peak = [&]() {
+    size_t fnow = 0, tnow = 0;
+    if (cudaMemGetInfo(&fnow, &tnow) == cudaSuccess && g_gpu_free0 > fnow) {
+      size_t used = g_gpu_free0 - fnow;
+      if (used > g_peak_gpu) g_peak_gpu = used;
+    }
+  };
   std::fprintf(stderr,
       "\n============== GNN TRAINING (Eternia) ==============\n"
       "[TRAIN] A=%lluMiB (%llu nodes x %d-d agg, real tiled)  F=%d H=%d C=%d  "
@@ -317,6 +335,37 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     cudaMemset(d_loss, 0, sizeof(double)); cudaMemset(d_correct, 0, sizeof(int));
     cudaMemset(d_count, 0, sizeof(int));
     cudaMemset(d_vcorrect, 0, sizeof(int)); cudaMemset(d_vcount, 0, sizeof(int));
+
+    // Apply one SGD step from the currently accumulated gradients, normalised by
+    // `nrm` contributing nodes, then (in mini-batch mode) clear them for the next
+    // batch. Weights are tiny (H*F + C*H floats), so the host round-trip is cheap.
+    auto apply_step = [&](int nrm, bool clear_grads) {
+      std::vector<double> aW1(H * F), ab1(H), aW2(C * H), ab2(C);
+      cudaMemcpy(aW1.data(), gW1, H * F * sizeof(double), cudaMemcpyDeviceToHost);
+      cudaMemcpy(ab1.data(), gb1, H * sizeof(double), cudaMemcpyDeviceToHost);
+      cudaMemcpy(aW2.data(), gW2, C * H * sizeof(double), cudaMemcpyDeviceToHost);
+      cudaMemcpy(ab2.data(), gb2, C * sizeof(double), cudaMemcpyDeviceToHost);
+      std::vector<float> aw1(H * F), ab1f(H), aw2(C * H), ab2f(C);
+      cudaMemcpy(aw1.data(), dW1, H * F * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(ab1f.data(), db1, H * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(aw2.data(), dW2, C * H * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(ab2f.data(), db2, C * sizeof(float), cudaMemcpyDeviceToHost);
+      float ainv = 1.0f / (float)std::max<int>(1, nrm);
+      for (int i = 0; i < H * F; ++i) aw1[i] -= lr * (float)(aW1[i] * ainv);
+      for (int i = 0; i < H; ++i) ab1f[i] -= lr * (float)(ab1[i] * ainv);
+      for (int i = 0; i < C * H; ++i) aw2[i] -= lr * (float)(aW2[i] * ainv);
+      for (int i = 0; i < C; ++i) ab2f[i] -= lr * (float)(ab2[i] * ainv);
+      cudaMemcpy(dW1, aw1.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
+      cudaMemcpy(db1, ab1f.data(), H * sizeof(float), cudaMemcpyHostToDevice);
+      cudaMemcpy(dW2, aw2.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
+      cudaMemcpy(db2, ab2f.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+      if (clear_grads) {
+        cudaMemset(gW1, 0, H * F * sizeof(double)); cudaMemset(gb1, 0, H * sizeof(double));
+        cudaMemset(gW2, 0, C * H * sizeof(double)); cudaMemset(gb2, 0, C * sizeof(double));
+      }
+    };
+    int prev_cnt = 0;   // labelled nodes seen before the current batch
+
     for (clio::run::u64 w = 0; w < K; w += window) {
       clio::run::u64 first = w * page_rows;
       clio::run::u64 nn = (clio::run::u64)window * page_rows;
@@ -327,8 +376,19 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
           h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count,
           d_vcorrect, d_vcount);
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
+      track_peak();
       GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
       GradW2Kernel<<<(C * H + tpb - 1) / tpb, tpb>>>(h1_buf, dz2_buf, nn, H, C, gW2, gb2);
+      if (kMinibatch) {
+        // Mini-batch SGD: one weight update per window instead of one per epoch,
+        // so an epoch performs ceil(K/window) updates rather than 1. Normalise by
+        // the labelled nodes in THIS batch (d_count accumulates across the epoch).
+        ctp::GpuApi::Synchronize();
+        int cnt_now = 0;
+        cudaMemcpy(&cnt_now, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+        apply_step(cnt_now - prev_cnt, /*clear_grads=*/true);
+        prev_cnt = cnt_now;
+      }
     }
     ctp::GpuApi::Synchronize();
     // SGD update on host (weights are small).
@@ -349,6 +409,15 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     cudaMemcpy(W2.data(), dW2, C * H * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(b2.data(), db2, C * sizeof(float), cudaMemcpyDeviceToHost);
     float inv = 1.0f / (float)std::max<int>(1, hcnt);
+    if (kMinibatch) {
+      // Updates were already applied per window; do not apply an extra epoch-level
+      // step (that would double-count and use stale, cleared gradients).
+      out_loss = hloss / std::max<int>(1, hcnt);
+      out_acc = (double)hcorr / std::max<int>(1, hcnt);
+      out_count = (clio::run::u64)hcnt;
+      out_vacc = hvcnt ? (double)hvcorr / (double)hvcnt : 0.0;
+      return;
+    }
     for (int i = 0; i < H * F; ++i) W1[i] -= lr * (float)(hW1[i] * inv);
     for (int i = 0; i < H; ++i) b1[i] -= lr * (float)(hb1[i] * inv);
     for (int i = 0; i < C * H; ++i) W2[i] -= lr * (float)(hW2[i] * inv);
@@ -459,6 +528,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       "peak GPU window=%lluMiB\n", et_loss[0], et_acc[0], epochs - 1,
       et_loss[epochs - 1], et_acc[epochs - 1], et_vacc[epochs - 1], et_time,
       (unsigned long long)(peak_win >> 20));
+  std::fprintf(stderr,
+      "[TRAIN] PEAK GPU (whole process, incl. labels + page cache + runtime): "
+      "%lluMiB  (feature window alone: %lluMiB)\n",
+      (unsigned long long)(g_peak_gpu >> 20),
+      (unsigned long long)(2ull * window * page_size >> 20));
 
   // ---- Compare curves (bit-exact where in-core ran) ----
   std::string exact = "n/a(OOM)";
