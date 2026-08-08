@@ -119,7 +119,26 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   thread_local std::unordered_map<const void *, char *> task_scratch_by_slot;
   char *&slot_buf = task_scratch_by_slot[gpu_task_raw];
   if (slot_buf == nullptr) {
+    // PINNED, not new[]. cudaMemcpyAsync from PAGEABLE host memory is
+    // effectively synchronous -- the driver stages it through an internal
+    // pinned buffer -- so SendOut's "async" completion copies degenerated to
+    // synchronous ones and measured no faster than the stream-synchronising
+    // path they replaced (read 785 -> 744 MB/s, i.e. slightly worse for the
+    // extra bookkeeping). Pinning the staging buffer is the prerequisite that
+    // makes the async completion path actually asynchronous. These buffers
+    // are per device-task-slot and long-lived, so the pinning cost is paid
+    // once per slot, not per task.
+#if CTP_ENABLE_CUDA
+    void *pinned = nullptr;
+    if (cudaHostAlloc(&pinned, kTaskScratchBytes, cudaHostAllocDefault) ==
+        cudaSuccess) {
+      slot_buf = static_cast<char *>(pinned);
+    } else {
+      slot_buf = new char[kTaskScratchBytes];
+    }
+#else
     slot_buf = new char[kTaskScratchBytes];
+#endif
   }
   char *task_scratch = slot_buf;
 
@@ -233,13 +252,65 @@ void IpcGpu2Cpu::SendOut(
   const bool device_task =
       future_shm->gpu_task_device_ptr_ != 0 && future_shm->gpu_task_size_ != 0;
 
-  if (device_task) {
+  // ASYNC COMPLETION PATH.
+  //
+  // DeviceAwareMemcpy ends in cudaStreamSynchronize and opens with two
+  // cudaPointerGetAttributes queries, and SendOut calls it TWICE per task --
+  // so every completion cost two full stream syncs and four attribute queries
+  // while the worker sat blocked. Issuing both copies async on the ring's
+  // dedicated stream lets the driver pipeline them and returns the worker to
+  // its lane immediately.
+  //
+  // The ordering invariant survives BY CONSTRUCTION rather than by blocking:
+  // the two copies go to the SAME stream in the required order, so the flag
+  // cannot land before the payload. That flag is the kernel's release signal
+  // -- the moment it flips the producer may resubmit the slot -- and stream
+  // order is exactly the guarantee that makes deferring it safe.
+  //
+  // The host staging buffer stays valid across the async copies: it is keyed
+  // by device task address and only reused when the kernel resubmits that
+  // slot, which it can only do after observing the flag, which the stream
+  // orders after the payload copy has completed.
+  void *ring_stream = nullptr;
+  {
+    auto *gpu_ipc = ipc ? ipc->GetGpuIpcManager() : nullptr;
+    if (gpu_ipc != nullptr) ring_stream = gpu_ipc->GetRingStream(0);
+  }
+  // OFF by default: MEASURED SLOWER, twice, for a structural reason.
+  //
+  // The completion flag is the kernel's release signal, and a demand fault is
+  // a BLOCKING round trip -- the kernel spins on that flag and can do nothing
+  // until it lands. Deferring the write onto a stream (which also carries
+  // RingNext's drain copies and their cudaStreamSynchronize) delays precisely
+  // what the GPU is waiting for:
+  //     sync completions   792 MB/s     async   672 MB/s   (read, pinned)
+  //     sync completions  6119 MB/s     async  5746 MB/s   (flush, 8 blocks)
+  // Pinning the staging buffer first (so cudaMemcpyAsync is genuinely async
+  // rather than internally staged) did not rescue it -- that removed the
+  // confound, and the result held.
+  //
+  // Asynchrony pays when nothing is blocked on the result. Here something
+  // always is. It is kept behind this flag because it WOULD pay for a
+  // fire-and-forget completion class (e.g. rescore hints, which no one waits
+  // on) -- that is the shape worth revisiting, not this one.
+  static const bool async_complete = [] {
+    const char *e = std::getenv("CLIO_GPU_ASYNC_COMPLETE");
+    return e != nullptr && !(std::string(e) == "0" || std::string(e) == "false");
+  }();
+  const bool use_async = device_task && async_complete && ring_stream != nullptr;
+
+  if (device_task && !use_async) {
     // kDeviceMem: write back the mutated POD. is_complete_ is still 0 here on
     // purpose -- the flag is flipped at the END of this function, once nothing
     // else will touch the task (see below).
     ctp::DeviceAwareMemcpy(
         reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_), host_task,
         future_shm->gpu_task_size_);
+  } else if (use_async) {
+    ctp::GpuApi::MemcpyAsync(
+        reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_),
+        reinterpret_cast<const char *>(host_task),
+        future_shm->gpu_task_size_, ring_stream);
   }
 
   // Mark complete: for kPinnedHost / kManagedUvm this storage is shared with
@@ -258,11 +329,22 @@ void IpcGpu2Cpu::SendOut(
     size_t complete_off =
         reinterpret_cast<char *>(&host_task->fut_.is_complete_.x) -
         reinterpret_cast<char *>(host_task);
-    u32 one = 1;
-    ctp::DeviceAwareMemcpy(
-        reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
-            complete_off,
-        &one, sizeof(u32));
+    if (use_async) {
+      // The flag byte is read from the STAGING task, which already holds 1
+      // after SetComplete() above -- so this needs no separate host source
+      // whose lifetime we would have to manage past this return.
+      ctp::GpuApi::MemcpyAsync(
+          reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+              complete_off,
+          reinterpret_cast<const char *>(host_task) + complete_off,
+          sizeof(u32), ring_stream);
+    } else {
+      u32 one = 1;
+      ctp::DeviceAwareMemcpy(
+          reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+              complete_off,
+          &one, sizeof(u32));
+    }
   }
   (void)ipc;
 }

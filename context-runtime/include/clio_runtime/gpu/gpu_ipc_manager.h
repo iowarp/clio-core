@@ -221,6 +221,19 @@ class IpcManager {
    */
   CLIO_RUN_GPU_API bool RingNext(u32 gpu_id, clio::run::GpuRingEntry *out);
 
+  /**
+   * The dedicated copy stream for a device's ring, or null.
+   *
+   * SendOut publishes completions on it: issuing the POD writeback and then
+   * the completion flag as two async copies on ONE stream keeps
+   * payload-before-flag ordering (the invariant the kernel's release signal
+   * depends on) without the caller blocking on either.
+   */
+  void *GetRingStream(u32 gpu_id) const {
+    if (gpu_id >= per_gpu_devices_.size()) return nullptr;
+    return per_gpu_devices_[gpu_id].ring.stream;
+  }
+
   std::vector<PerGpuDeviceState> per_gpu_devices_;
 
   /**
