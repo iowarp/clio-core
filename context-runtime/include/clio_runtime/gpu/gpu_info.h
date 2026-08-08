@@ -48,8 +48,18 @@ namespace clio::run {
  * needs only the gpu2cpu queue pointer and the device id to push tasks.
  */
 struct IpcManagerGpuInfo {
-  /** GPU->CPU queue (pinned host memory; CPU worker polls, GPU pushes). */
+  /** GPU->CPU queue (managed memory; CPU worker polls, GPU pushes). */
   GpuTaskQueue *gpu2cpu_queue = nullptr;
+
+  /**
+   * GPU->CPU submission ring in DEVICE memory (CLIO_GPU_DEVRING=1).
+   *
+   * When set, kernels push here with device-scope atomics instead of doing a
+   * system-scoped atomic on host memory across PCIe, and the CPU drains it in
+   * batches. Null selects the legacy managed-memory queue above, which stays
+   * the default until the device ring has proven itself on the full suite.
+   */
+  struct GpuDeviceRing *gpu2cpu_ring = nullptr;
 
   /** Logical GPU device id. */
   u32 gpu_id = 0;

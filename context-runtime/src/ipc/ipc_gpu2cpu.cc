@@ -7,6 +7,7 @@
 
 #include <unordered_map>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
@@ -30,7 +31,25 @@ namespace clio::run {
  */
 bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) {
   gpu::Future<Task> gpu_future;
-  if (!gpu_lane->Pop(gpu_future)) {
+  // Device-ring path: the queue lives on the GPU, so there is nothing to Pop
+  // from -- the mirror hands back one submission from its batched drain. The
+  // entry carries exactly what the legacy queue entry did (raw task address,
+  // its backend's AllocatorId, and the POD size), so everything below this
+  // point is untouched by which transport delivered it.
+  auto *gpu_ipc = ipc->GetGpuIpcManager();
+  bool from_ring = false;
+  if (gpu_ipc != nullptr) {
+    GpuRingEntry e;
+    if (gpu_ipc->RingNext(0, &e)) {
+      ctp::ipc::FullPtr<Task> fp;
+      fp.shm_.alloc_id_ = ctp::ipc::AllocatorId{e.alloc_major, e.alloc_minor};
+      fp.shm_.off_ = e.task_addr;
+      fp.ptr_ = reinterpret_cast<Task *>(e.task_addr);
+      gpu_future = gpu::Future<Task>(fp, e.task_size);
+      from_ring = true;
+    }
+  }
+  if (!from_ring && !gpu_lane->Pop(gpu_future)) {
     return false;
   }
   const u32 worker_id = worker->GetId();

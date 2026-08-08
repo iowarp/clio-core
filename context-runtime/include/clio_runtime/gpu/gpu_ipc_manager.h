@@ -38,6 +38,7 @@
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/gpu/gpu_info.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 
@@ -175,6 +176,29 @@ class IpcManager {
     MemKind kind = MemKind::kPinnedHost;
   };
 
+  /**
+   * Host-side mirror of a device-memory submission ring.
+   *
+   * The ring lives on the GPU, so the CPU cannot Pop() from it -- it copies.
+   * One D2H copy brings back a whole span of submissions, which is the entire
+   * point: per-request bus crossings become per-BATCH crossings. Drained
+   * entries are held here and handed out one at a time, so the worker keeps
+   * its existing one-task-per-poll pacing (batching the WORKER's dequeue is
+   * what deadlocked in d265bdb3 -- this batches the TRANSPORT only).
+   */
+  struct GpuRingMirror {
+    clio::run::GpuDeviceRing *dev_ring = nullptr;  ///< device address of the ring
+    void *stream = nullptr;                    ///< dedicated copy stream
+    /** Slots consumed so far; the device sees this via a published tail_. */
+    unsigned long long tail = 0;
+    /** Entries drained but not yet handed to a worker. */
+    std::vector<clio::run::GpuRingEntry> pending;
+    size_t pending_pos = 0;                    ///< read cursor into `pending`
+    /** Pinned staging for the D2H copies (avoids a pageable-copy sync). */
+    void *stage_entries = nullptr;
+    void *stage_ready = nullptr;
+  };
+
   /** Per-physical-GPU state: queue + queue backend + client backends. */
   struct PerGpuDeviceState {
     /** Pinned host backend holding the GpuTaskQueue. */
@@ -185,7 +209,17 @@ class IpcManager {
     /** AllocatorId → registered client backend. */
     std::unordered_map<u64, ClientBackend> client_backends;
     u32 gpu_id = 0;
+    /** Device-ring state; dev_ring stays null when the legacy queue is used. */
+    GpuRingMirror ring;
   };
+
+  /**
+   * Drain up to `max_out` submissions from the device ring into the mirror's
+   * pending list, and return the next one. Returns false when nothing is
+   * ready. Host-only; implemented in gpu2cpu_init_hip.cc beside the ring's
+   * allocation so the copy logic sits next to the layout it depends on.
+   */
+  CLIO_RUN_GPU_API bool RingNext(u32 gpu_id, clio::run::GpuRingEntry *out);
 
   std::vector<PerGpuDeviceState> per_gpu_devices_;
 
@@ -216,6 +250,7 @@ class IpcManager {
     IpcManagerGpuInfo info;
     if (gpu_id >= per_gpu_devices_.size()) return info;
     info.gpu2cpu_queue = per_gpu_devices_[gpu_id].gpu2cpu_queue.ptr_;
+    info.gpu2cpu_ring = per_gpu_devices_[gpu_id].ring.dev_ring;
     info.gpu_id = gpu_id;
     return info;
   }

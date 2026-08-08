@@ -9,6 +9,7 @@
 #define CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
 #include "clio_ctp/util/gpu_intrinsics.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -71,6 +72,24 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
   task_for_queue.shm_.off_ = reinterpret_cast<size_t>(task_ptr.ptr_);
   task_for_queue.ptr_ = static_cast<Task *>(task_ptr.ptr_);
   gpu::Future<Task> task_future(task_for_queue, task_size);
+
+  // DEVICE RING (CLIO_GPU_DEVRING=1): push with a device-scope atomic into
+  // device memory. No system-scoped atomic, no PCIe crossing per submission --
+  // the CPU picks these up in batches. Falls through to the legacy managed
+  // queue when the ring was not allocated.
+  if (ipc->gpu_info_.gpu2cpu_ring != nullptr) {
+    GpuRingEntry e;
+    e.task_addr = reinterpret_cast<u64>(task_ptr.ptr_);
+    e.alloc_major = task_ptr.shm_.alloc_id_.major_;
+    e.alloc_minor = task_ptr.shm_.alloc_id_.minor_;
+    e.task_size = task_size;
+    // Release: the task POD's fields (written by the caller above) must be
+    // visible before the entry that advertises them. The ring's own Push adds
+    // the entry-before-stamp fence internally.
+    CTP_DEVICE_FENCE_SYSTEM();
+    ipc->gpu_info_.gpu2cpu_ring->Push(e);
+    return future;
+  }
 
   CTP_DEVICE_FENCE_SYSTEM();
   auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
