@@ -608,6 +608,9 @@ class DeviceVector {
     Bump(stat_prefetches_);
     p->fetching = 1u;                     // already set by the claim; keep it
     p->get_fut = ipc_->Send(SlotPtr(p->get));
+    if (p->get_fut.IsNull()) {
+      Bump(stat_get_errors_);
+    }
   }
 
   /** Wait for an in-flight asynchronous get on `p`. */
@@ -650,6 +653,13 @@ class DeviceVector {
     // demand-faulting read path returned a wrong checksum while the
     // prefetching path (which does set p->get_fut) returned the right one.
     p->get_fut = ipc_->Send(SlotPtr(p->get));
+    // An empty future means the submission was DISCARDED (queue missing or a
+    // refused send). Waiting on it returns immediately and the stale return
+    // code reads 0, so without this check the slot's previous page is served
+    // as this one -- silently. That exact failure shipped once already.
+    if (p->get_fut.IsNull()) {
+      Bump(stat_get_errors_);
+    }
     p->get_fut.Wait();                    // demand faults block by definition
     // CHECK IT. A failed get leaves this slot holding the page it held before,
     // and the caller reads that as if it were the page it asked for.

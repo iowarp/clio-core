@@ -37,9 +37,19 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr) {
   gpu::Future<TaskT> future;
 
-#if CTP_IS_GPU_COMPILER
-  if (threadIdx.x != 0) return future;
-#endif
+  // Any thread may enqueue. This used to be `if (threadIdx.x != 0) return
+  // future;` -- a silent no-op for every thread but 0, from a "caller
+  // broadcasts" design the gpu_vector never followed. The vector serialises
+  // submissions under a per-block lock, and the winning lane is whichever
+  // thread got the lock: with one warp the hardware happens to resolve the
+  // contention to lane 0 (so every test passed), with several warps the
+  // winner is usually NOT threadIdx.x==0 and its page get was silently
+  // discarded -- Wait() returned on an empty future, the stale return code
+  // read 0, and the slot served its PREVIOUS page's bytes as the new page.
+  // Measured: 96 of 128 pages corrupt at 256 threads, zero at 32. The queue
+  // push below is a multi-producer atomic claim, so concurrent senders from
+  // any thread are safe; callers that want one submission per block must
+  // elect a sender themselves, which every caller in the tree already does.
 
   if (task_ptr.IsNull() || !ipc->gpu_info_.gpu2cpu_queue) {
     return future;
@@ -97,9 +107,12 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN void gpu::Future<TaskT, AllocT>::Wait() {
 #if CTP_IS_GPU || CTP_IS_SYCL_DEVICE
-#if CTP_IS_GPU_COMPILER
-  if (threadIdx.x != 0) return;
-#endif
+  // Any thread may wait. This was `if (threadIdx.x != 0) return;` -- the same
+  // broadcast-era guard as SendIn's, and the second half of the same bug: once
+  // sends were allowed from any lane, a non-zero faulting lane would enqueue
+  // the get and then "wait" by returning INSTANTLY, reading the page while the
+  // CPU was still filling it. Symptom moved from deterministic stale pages to
+  // racy ones. The poll and the system fence below are per-thread safe.
   if (task_ptr_.IsNull()) return;
   volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
       &task_ptr_.ptr_->fut_.is_complete_.x);

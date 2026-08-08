@@ -149,6 +149,100 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
+/**
+ * The READ mirror of SpinWriteFlushKernel: spin, then read a region.
+ *
+ * sync  (async=0)  touch the region and let it demand-fault, page by page.
+ * async (async=1)  BeginFetch every page of the NEXT region before reading
+ *                  this one, so those transfers run under this region's spin
+ *                  and read. RescorePage pins what is being fetched and
+ *                  releases what has been consumed, so the prefetch's slot
+ *                  claim evicts a finished page rather than one still in use.
+ *
+ * The cache holds exactly two regions, so a prefetched region can be resident
+ * alongside the one being read and nothing else fits -- prefetching either
+ * lands in time or it does not.
+ */
+__global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
+                                       gv::DeviceVector<u32> v, u64 iters,
+                                       u64 pages_per_region, u32 spin_us,
+                                       u64 clock_khz, int async,
+                                       unsigned long long *sum,
+                                       unsigned long long *bad,
+                                       unsigned long long *first_bad,
+                                       unsigned long long *bad_off,
+                                       u32 *bad_got) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  const u64 region_elems = pages_per_region * v.elems_per_page_;
+  const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
+  unsigned long long acc = 0;
+
+  for (u64 it = 0; it < iters; ++it) {
+    Spin(spin_us, clock_khz);
+    __syncthreads();
+
+    // Ask for the next region BEFORE consuming this one.
+    if (async && threadIdx.x == 0 && it + 1 < iters) {
+      const u64 nxt = block_base + (it + 1) * region_elems;
+      for (u64 pg = 0; pg < pages_per_region; ++pg) {
+        const u64 pn = v.PageOf(nxt + pg * v.elems_per_page_);
+        v.RescorePage(pn, 1000.0f);
+        v.BeginFetch(pn);
+      }
+    }
+    __syncthreads();
+
+    const u64 off = block_base + it * region_elems;
+    for (u64 pg = 0; pg < pages_per_region; ++pg) {
+      const u64 poff = off + pg * v.elems_per_page_;
+      v.HoldPage(poff, v.elems_per_page_);
+      unsigned long long local = 0;
+      unsigned long long wrong = 0;
+      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+        const u32 got = v.at(poff + i);
+        local += got;
+        // Compare element by element: a single global sum says only THAT
+        // something is wrong, never which page or offset.
+        if (got != Val(poff + i, 0u)) {
+          ++wrong;
+          atomicMin(first_bad, static_cast<unsigned long long>(v.PageOf(poff)));
+          // Capture the actual bytes. Val is invertible mod 2^32, so the host
+          // can recover WHICH index produced this value -- that turns "wrong"
+          // into "came from offset X", which is the difference between
+          // guessing and knowing.
+          const unsigned long long prev =
+              atomicMin(bad_off, static_cast<unsigned long long>(poff + i));
+          if (poff + i < prev) *bad_got = got;
+        }
+      }
+      acc += local;
+      if (wrong) atomicAdd(bad, wrong);
+      __syncthreads();
+      // Consumed: lowest score makes it the next victim, freeing a slot for
+      // the prefetch that follows.
+      if (async && threadIdx.x == 0) {
+        v.RescorePage(v.PageOf(poff), -1000.0f);
+      }
+      __syncthreads();
+    }
+  }
+  atomicAdd(sum, acc);
+}
+
+/** Diagnostic: each slot's page_num and the first word of its buffer. */
+__global__ void DumpSlotsKernel(gv::DeviceVector<u32> v,
+                                unsigned long long *out) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  for (clio::run::u32 i = 0; i < v.pages_per_block_; ++i) {
+    out[2 * i] = v.pages_[i].page_num;
+    out[2 * i + 1] =
+        (v.pages_[i].page_num == gv::kNoPage || v.pages_[i].data == nullptr)
+            ? 0ull
+            : static_cast<const u32 *>(v.pages_[i].data)[0];
+  }
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
@@ -161,6 +255,7 @@ struct Args {
   u64 flush_mb = 128;    // region flushed per iteration
   u32 threads = 256;
   u32 repeat = 3;
+  bool read = false;     // read+prefetch benchmark instead of write+flush
 };
 
 double NowMs() {
@@ -185,6 +280,7 @@ int main(int argc, char **argv) {
     else if (f == "--flush-mb") a.flush_mb = std::atoll(next());
     else if (f == "--threads") a.threads = std::atoi(next());
     else if (f == "--repeat") a.repeat = std::atoi(next());
+    else if (f == "--read") a.read = true;
     else if (f == "--help") {
       std::printf(
           "usage: %s [--blocks N] [--iters N] [--spin-us N] [--page-kb N] "
@@ -201,11 +297,21 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "flush region smaller than one page\n");
     return 1;
   }
-  // Every region resident at once: no faults and no evictions while timing.
-  const u64 slots = pages_per_region * a.iters;
-  const u64 n = page_elems * slots * a.blocks;
+  // The vector's LOGICAL size is the whole working set in both modes -- it is
+  // what the kernel walks. The CACHE size is what differs: write mode holds
+  // every region so the flush is the only I/O; read mode holds just two, so
+  // the working set exceeds it and every region must be faulted in.
+  //
+  // These were conflated (n was derived from the cache size), which left the
+  // vector claiming a size of 2 regions while the kernel read 8.
+  const u64 pages_per_block_total = pages_per_region * a.iters;
+  const u64 slots = a.read ? (pages_per_region * 2) : pages_per_block_total;
+  const u64 n = page_elems * pages_per_block_total * a.blocks;
   const double resident_mb =
       static_cast<double>(slots * page_bytes * a.blocks) / (1024.0 * 1024.0);
+  const double working_mb = static_cast<double>(pages_per_block_total *
+                                                page_bytes * a.blocks) /
+                            (1024.0 * 1024.0);
 
   {
     std::ofstream cfg("gpu_vector_flush.yaml");
@@ -265,6 +371,176 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "warm failed: %s\n",
                  cudaGetErrorString(cudaGetLastError()));
     return 1;
+  }
+
+  // ---------------- read + prefetch mode -----------------------------
+  if (a.read) {
+    unsigned long long *d_sum = nullptr;
+    cudaMalloc(&d_sum, sizeof(unsigned long long));
+    unsigned long long *d_bad = nullptr, *d_first = nullptr, *d_boff = nullptr;
+    u32 *d_bgot = nullptr;
+    cudaMalloc(&d_bad, sizeof(unsigned long long));
+    cudaMalloc(&d_first, sizeof(unsigned long long));
+    cudaMalloc(&d_boff, sizeof(unsigned long long));
+    cudaMalloc(&d_bgot, sizeof(u32));
+    auto rrun = [&](u32 spin, int async, unsigned long long *out) {
+      double best = 1e30;
+      for (u32 r = 0; r < a.repeat; ++r) {
+        cudaMemset(d_sum, 0, sizeof(unsigned long long));
+        cudaMemset(d_bad, 0, sizeof(unsigned long long));
+        const unsigned long long big = ~0ull;
+        cudaMemcpy(d_first, &big, sizeof(big), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_boff, &big, sizeof(big), cudaMemcpyHostToDevice);
+        cudaMemset(d_bgot, 0, sizeof(u32));
+        vec.ResetStats();
+        cudaDeviceSynchronize();
+        const double t0 = NowMs();
+        SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
+            gpu, dev, a.iters, pages_per_region, spin, clock_khz, async, d_sum,
+            d_bad, d_first, d_boff, d_bgot);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+          std::fprintf(stderr, "read kernel failed: %s\n",
+                       cudaGetErrorString(cudaGetLastError()));
+          std::exit(1);
+        }
+        const double ms = NowMs() - t0;
+        if (ms < best) best = ms;
+      }
+      cudaMemcpy(out, d_sum, sizeof(*out), cudaMemcpyDeviceToHost);
+      unsigned long long nb = 0, fb = 0;
+      cudaMemcpy(&nb, d_bad, sizeof(nb), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&fb, d_first, sizeof(fb), cudaMemcpyDeviceToHost);
+      unsigned long long bo = 0; u32 bg = 0;
+      cudaMemcpy(&bo, d_boff, sizeof(bo), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&bg, d_bgot, sizeof(bg), cudaMemcpyDeviceToHost);
+      const auto st_now = vec.ReadStats(0);
+      std::printf("    [%s spin=%u] wrong_elems=%llu first_bad_page=%lld "
+                  "faults=%llu GET_ERRORS=%llu\n",
+                  async ? "async" : "sync", spin, nb,
+                  (fb == ~0ull) ? -1LL : (long long) fb,
+                  (unsigned long long) st_now.faults,
+                  (unsigned long long) st_now.get_errors);
+      if (nb && bo != ~0ull) {
+        // Invert Val: got = j*A + 1 (mod 2^32) => j = (got-1) * A^-1.
+        const u32 A = 2654435761u;
+        u32 inv = 1u;
+        for (int k = 0; k < 6; ++k) inv *= (2u - A * inv);
+        const u32 src = static_cast<u32>((bg - 1u) * inv);
+        std::printf("      first bad offset=%llu got=%u -> that value is "
+                    "Val(%u), i.e. offset %lld away (%.3f pages)\n",
+                    bo, bg, src, (long long) src - (long long) bo,
+                    ((double) src - (double) bo) / (double) page_elems);
+      }
+      return best;
+    };
+
+    // ---- PROBE: does fetched data ever reach device memory? -----------
+    // Fault ONE region synchronously (pages 0..15 land in slots that held
+    // pages 96..111 from the warm pass), wait 300ms after the kernel exits so
+    // any straggling copy has long finished, then dump what is PHYSICALLY in
+    // each slot. Data from pages 0..15 => copies land, readers raced them.
+    // Data still from 96..111 => the copies never arrived at all.
+    {
+      cudaMemset(d_sum, 0, sizeof(unsigned long long));
+      cudaMemset(d_bad, 0, sizeof(unsigned long long));
+      const unsigned long long big2 = ~0ull;
+      cudaMemcpy(d_first, &big2, sizeof(big2), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_boff, &big2, sizeof(big2), cudaMemcpyHostToDevice);
+      cudaMemset(d_bgot, 0, sizeof(u32));
+      SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
+          gpu, dev, 1, pages_per_region, 0, clock_khz, 0, d_sum, d_bad,
+          d_first, d_boff, d_bgot);
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::fprintf(stderr, "probe kernel failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return 1;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      unsigned long long *d_dump = nullptr;
+      cudaMalloc(&d_dump, 2 * slots * sizeof(unsigned long long));
+      DumpSlotsKernel<<<1, 32>>>(dev, d_dump);
+      cudaDeviceSynchronize();
+      std::vector<unsigned long long> hd(2 * slots);
+      cudaMemcpy(hd.data(), d_dump, 2 * slots * sizeof(unsigned long long),
+                 cudaMemcpyDeviceToHost);
+      const u32 A2 = 2654435761u;
+      u32 inv2 = 1u;
+      for (int k = 0; k < 6; ++k) inv2 *= (2u - A2 * inv2);
+      unsigned long long nbad = 0;
+      cudaMemcpy(&nbad, d_bad, sizeof(nbad), cudaMemcpyDeviceToHost);
+      std::printf("  PROBE (1 region, sync, wrong_elems=%llu):\n", nbad);
+      for (u64 i2 = 0; i2 < slots; ++i2) {
+        const unsigned long long pn = hd[2 * i2];
+        if (pn == ~0ull) continue;
+        const u32 got0 = static_cast<u32>(hd[2 * i2 + 1]);
+        const u32 src = (got0 - 1u) * inv2;
+        const u64 src_page = src / page_elems;
+        std::printf("    slot %2llu claims page %3llu -- buffer holds page "
+                    "%llu%s\n",
+                    (unsigned long long) i2, pn, (unsigned long long) src_page,
+                    (pn == src_page) ? "" : "   <-- STALE");
+      }
+      cudaFree(d_dump);
+      // Probe consumed region 0's warm state; restore it for the real runs.
+      WarmKernel<<<a.blocks, a.threads>>>(gpu, dev, a.iters, pages_per_region);
+      cudaDeviceSynchronize();
+    }
+
+    // The warm pass wrote Val(idx, 0) everywhere; that is what must come back.
+    unsigned long long want = 0;
+    const u64 total = static_cast<u64>(a.blocks) * a.iters * pages_per_region *
+                      page_elems;
+    for (u64 i = 0; i < total; ++i) want += Val(i, 0u);
+
+    unsigned long long g_spin = 0, g_io = 0, g_sync = 0, g_async = 0;
+    const double spin_only = rrun(a.spin_us, 0, &g_spin);
+    const double io_only = rrun(0, 0, &g_io);
+    const auto io_st = vec.ReadStats(0);
+    const double sync_ms = rrun(a.spin_us, 0, &g_sync);
+    const auto sync_st = vec.ReadStats(0);
+    const double async_ms = rrun(a.spin_us, 1, &g_async);
+    const auto async_st = vec.ReadStats(0);
+
+    const bool ok = (g_sync == want && g_async == want && g_io == want);
+    if (!ok) {
+      std::fprintf(stderr,
+                   "  want=%llu  read-only=%llu  sync=%llu  async=%llu\n"
+                   "  (all three should equal want; which ones differ says "
+                   "whether this is a prefetch bug or a warm/seed bug)\n",
+                   want, g_io, g_sync, g_async);
+    }
+    const double mx = (spin_only > io_only) ? spin_only : io_only;
+    std::printf(
+        "\n  READ + PREFETCH  (cache holds 2 of %llu regions -- every region "
+        "faults)\n"
+        "  spin only        %8.2f ms\n"
+        "  read only        %8.2f ms   (faults=%llu, %.0f MB/s)\n"
+        "  ---------------------------------------------\n"
+        "  sync  measured   %8.2f ms   (faults=%llu)\n"
+        "  async measured   %8.2f ms   (faults=%llu prefetch=%llu landed=%llu "
+        "late=%llu)  %s\n"
+        "  ---------------------------------------------\n"
+        "  sum  spin+read   %8.2f ms   <- what NO overlap costs\n"
+        "  max  spin,read   %8.2f ms   <- what FULL overlap costs\n"
+        "  speedup async    %8.2fx\n"
+        "  read hidden      %8.1f %%\n",
+        (unsigned long long) a.iters, spin_only, io_only,
+        (unsigned long long) io_st.faults,
+        (io_only > 0.0) ? (resident_mb * a.iters / 2.0) / (io_only / 1000.0) : 0.0,
+        sync_ms, (unsigned long long) sync_st.faults,
+        async_ms, (unsigned long long) async_st.faults,
+        (unsigned long long) async_st.prefetches,
+        (unsigned long long) async_st.prefetch_hits,
+        (unsigned long long) async_st.prefetch_late,
+        ok ? "data=OK" : "data=MISMATCH",
+        spin_only + io_only, mx, sync_ms / async_ms,
+        (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0);
+    if (!ok) {
+      std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");
+      return 1;
+    }
+    clio::run::CLIO_RUNTIME_FINALIZE();
+    return 0;
   }
 
   u32 pass = 1;
