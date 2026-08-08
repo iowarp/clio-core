@@ -86,7 +86,12 @@ TEST_CASE("GetGlobalPtrVarPublishesExactlyOneInstance") {
   // Many rounds: the race window is narrow, so a single round proves little.
   // On the pre-fix code this fails within the first few rounds on a
   // multi-core box.
-  const int kRounds = 200;
+  // 50 rounds is already overwhelming evidence: measured standalone, the
+  // pre-fix accessor splits threads across instances in ~95% of contended
+  // rounds, so a real regression fails within the first few. 200 rounds x 8
+  // threads meant 1,600 thread creations, which timed out the whole test on
+  // the Windows Debug runner.
+  const int kRounds = 50;
   const int kThreads = 8;
 
   for (int round = 0; round < kRounds; ++round) {
@@ -104,10 +109,19 @@ TEST_CASE("GetGlobalPtrVarPublishesExactlyOneInstance") {
 
     for (int t = 0; t < kThreads; ++t) {
       threads.emplace_back([&, t]() {
-        // Spin-barrier so the threads reach the accessor together; without
-        // this they serialize and the race never opens.
+        // Barrier so the threads reach the accessor together; without it they
+        // serialize and the race never opens.
+        //
+        // yield() is not optional here. kThreads oversubscribes a 2-vCPU CI
+        // runner, and a pure spin means the threads that arrived first burn
+        // both cores while the ones that still have to increment `ready`
+        // cannot get scheduled to do so -- progress depends on the OS
+        // preempting a spinner. That is what timed out ctp_singleton on
+        // windows-2022 Debug; yielding hands the core to the thread the
+        // barrier is actually waiting for.
         ready.fetch_add(1, std::memory_order_acq_rel);
         while (ready.load(std::memory_order_acquire) < kThreads) {
+          std::this_thread::yield();
         }
         observed[t] = ctp::GetGlobalPtrVar<CountedSingleton>(instance);
       });

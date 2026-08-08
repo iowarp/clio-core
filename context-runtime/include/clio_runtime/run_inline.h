@@ -81,8 +81,11 @@ inline clio::run::Future<TaskT> RunInlineOrSend(
   if (InlineRunEnvEnabled() && ipc_manager != nullptr &&
       CLIO_RUNTIME_MANAGER != nullptr && CLIO_RUNTIME_MANAGER->IsRuntime() &&
       ipc_manager->GetNumHosts() <= 1 && CLIO_CUR_WORKER != nullptr) {
+    // The REAL container, not the static one: this path runs the module's
+    // handler, which needs the container that Create initialized. The static
+    // container holds only the pool's task-stat model (issue #956).
     clio::run::DynamicContainer dc =
-        CLIO_POOL_MANAGER->GetStaticContainer(task->pool_id_);
+        CLIO_POOL_MANAGER->GetRealOrStaticContainer(task->pool_id_);
     clio::run::ContainerHold c = dc.get();
     if (c != nullptr) {
       // Same synthesized-completed-future shape as the batch-merged sink and

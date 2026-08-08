@@ -34,6 +34,7 @@
 #ifndef CLIO_RUNTIME_INCLUDE_CONTAINER_H_
 #define CLIO_RUNTIME_INCLUDE_CONTAINER_H_
 
+#include <atomic>
 #include <cmath>
 #include <clio_ctp/data_structures/serialization/global_serialize.h>
 #include <iostream>
@@ -45,10 +46,12 @@
 #include "clio_runtime/batch_groups.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/corwlock.h"
+#include "clio_runtime/dynamic_container.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
 #include "clio_runtime/local_task_archives.h"
+#include "clio_runtime/task_stat_model.h"
 #include "clio_runtime/types.h"
 
 // Forward declarations to avoid circular dependencies
@@ -117,6 +120,21 @@ class Container {
   std::vector<float> method_mape_wall_;   ///< Per-method wall clock MAPE
   std::vector<std::string> method_names_;  ///< Per-method human-readable names
   float learning_rate_ = 0.2f;      ///< SGD learning rate for model updates
+  /** Handle to this pool's static container, which OWNS the task-stat model.
+   *  Cached here at registration time (PoolManager::RegisterContainer) so the
+   *  inference and reinforcement paths never have to re-query the PoolManager
+   *  — those run per task, and a map lookup under the pool metadata lock on
+   *  every task begin/end is exactly the kind of contention the by-value
+   *  DynamicContainer handle exists to avoid. Invalid on the static container
+   *  itself (it IS the owner) and on a container whose pool has no static
+   *  container yet, in which case the model degrades to this container's own
+   *  vectors. */
+  DynamicContainer static_container_;
+  /** Set by every model write, cleared once the weights have been written to
+   *  disk, so the periodic flush skips pools that learned nothing since the
+   *  last save. Atomic because task completions on many workers set it
+   *  concurrently. */
+  std::atomic<bool> model_dirty_{false};
   /** Default RPC visibility for this container (from compose
    *  container_visibility). */
   MethodProperty container_visibility_;
@@ -175,6 +193,53 @@ class Container {
   void SetMethodNames(const std::vector<std::string>& names) {
     method_names_ = names;
   }
+
+  /**
+   * Point this container at the pool's static container, which owns the
+   * task-stat model. Called once by PoolManager::RegisterContainer, before the
+   * container serves tasks. Passing a handle to `this` (or an invalid handle)
+   * leaves the container owning its own model — that is how the static
+   * container itself is left.
+   */
+  void SetStaticContainer(const DynamicContainer &static_container) {
+    if (static_container.IsValid() && &(*static_container.get()) != this) {
+      static_container_ = static_container;
+    } else {
+      static_container_ = DynamicContainer();
+    }
+  }
+
+  /** @return the pool's static container handle (invalid on the static
+   *  container itself, which needs no indirection). */
+  const DynamicContainer &GetStaticContainer() const {
+    return static_container_;
+  }
+
+  /** @return true if this container owns the model (i.e. it is the pool's
+   *  static container, or the pool has no static container). */
+  bool IsModelOwner() const { return !static_container_.IsValid(); }
+
+ protected:
+  /**
+   * The container whose per-method vectors back every model read and write.
+   *
+   * The model is per POOL, not per container: a pool's containers all execute
+   * the same methods with the same code, so splitting the learning across them
+   * just means each one converges more slowly, from a different seed, and the
+   * numbers the monitor reports (which come from the static container) stop
+   * matching the numbers the scheduler actually used. Routing every access
+   * through the static container keeps one model per pool per node.
+   */
+  Container &ModelOwner() {
+    return static_container_.IsValid() ? *static_container_.get() : *this;
+  }
+  const Container &ModelOwner() const {
+    return static_container_.IsValid()
+               ? const_cast<const Container &>(*static_container_.get())
+               : *this;
+  }
+
+ public:
 
   /**
    * Configure per-RPC access control from a compose PoolConfig. Must be called
@@ -272,9 +337,10 @@ class Container {
    * @return Predicted CPU time in microseconds
    */
   float InferCpuTime(u32 method_id, const TaskStat &stat) {
+    const Container &owner = ModelOwner();
     float x = static_cast<float>(stat.compute_) + 1.0f;
-    if (method_id < method_model_.size()) {
-      return method_model_[method_id] * x;
+    if (method_id < owner.method_model_.size()) {
+      return owner.method_model_[method_id] * x;
     }
     return x;
   }
@@ -286,9 +352,10 @@ class Container {
    * @return Predicted wall clock time in microseconds
    */
   float InferWallClockTime(u32 method_id, const TaskStat &stat) {
+    const Container &owner = ModelOwner();
     float x = stat.wall_time_ + 1.0f;
-    if (method_id < method_model_wall_.size()) {
-      return method_model_wall_[method_id] * x;
+    if (method_id < owner.method_model_wall_.size()) {
+      return owner.method_model_wall_[method_id] * x;
     }
     return x;
   }
@@ -299,15 +366,18 @@ class Container {
    */
   void ReinforceCpuModel(u32 method_id, float pred_cpu, float real_cpu,
                          const TaskStat &stat) {
-    if (method_id >= method_model_.size()) return;
+    Container &owner = ModelOwner();
+    if (method_id >= owner.method_model_.size()) return;
+    float lr = owner.learning_rate_;
     float x = static_cast<float>(stat.compute_) + 1.0f;
     float e = pred_cpu - real_cpu;
-    method_model_[method_id] -= learning_rate_ * (e / x);
+    owner.method_model_[method_id] -= lr * (e / x);
     if (real_cpu > 0) {
       float ape = std::abs(e) / real_cpu;
-      method_mape_[method_id] = (1.0f - learning_rate_) * method_mape_[method_id]
-                               + learning_rate_ * ape;
+      owner.method_mape_[method_id] =
+          (1.0f - lr) * owner.method_mape_[method_id] + lr * ape;
     }
+    owner.model_dirty_ = true;
   }
 
   /**
@@ -316,15 +386,63 @@ class Container {
    */
   void ReinforceWallModel(u32 method_id, float pred_wall, float real_wall,
                           const TaskStat &stat) {
-    if (method_id >= method_model_wall_.size()) return;
+    Container &owner = ModelOwner();
+    if (method_id >= owner.method_model_wall_.size()) return;
+    float lr = owner.learning_rate_;
     float x = stat.wall_time_ + 1.0f;
     float e = pred_wall - real_wall;
-    method_model_wall_[method_id] -= learning_rate_ * (e / x);
+    owner.method_model_wall_[method_id] -= lr * (e / x);
     if (real_wall > 0) {
       float ape = std::abs(e) / real_wall;
-      method_mape_wall_[method_id] = (1.0f - learning_rate_) * method_mape_wall_[method_id]
-                                    + learning_rate_ * ape;
+      owner.method_mape_wall_[method_id] =
+          (1.0f - lr) * owner.method_mape_wall_[method_id] + lr * ape;
     }
+    owner.model_dirty_ = true;
+  }
+
+  /**
+   * Seed a method's CPU / wall-clock coefficient directly, bypassing SGD.
+   * For modules that restore their own measured device profile at Create time
+   * (bdev does this from its perf-stats file) so inference starts warm instead
+   * of at the 1.0 seed. Writes land on the model owner, so a module may call
+   * this from any of the pool's containers.
+   */
+  void SetMethodCpuCoef(u32 method_id, float coef) {
+    Container &owner = ModelOwner();
+    if (method_id >= owner.method_model_.size()) return;
+    owner.method_model_[method_id] = coef;
+    owner.model_dirty_ = true;
+  }
+  void SetMethodWallCoef(u32 method_id, float coef) {
+    Container &owner = ModelOwner();
+    if (method_id >= owner.method_model_wall_.size()) return;
+    owner.method_model_wall_[method_id] = coef;
+    owner.model_dirty_ = true;
+  }
+
+  /**
+   * Snapshot the model owner's per-method weights, keyed by method name, for
+   * persistence or introspection. Defined in task_stat_model.cc.
+   */
+  TaskStatModelSnapshot ExportModel() const;
+
+  /**
+   * Overwrite the model owner's weights from a previously saved snapshot,
+   * matching entries by method NAME. Methods missing from the snapshot keep
+   * whatever DefineModel seeded; names the binary no longer defines are
+   * ignored. Defined in task_stat_model.cc.
+   * @return number of methods restored.
+   */
+  size_t ImportModel(const TaskStatModelSnapshot &snapshot);
+
+  /** @return true if the model owner has been updated since the last
+   *  ClearModelDirty() — used to skip rewriting an unchanged model file. */
+  bool IsModelDirty() const {
+    return ModelOwner().model_dirty_.load(std::memory_order_relaxed);
+  }
+  /** Mark the model owner's weights as persisted. */
+  void ClearModelDirty() {
+    ModelOwner().model_dirty_.store(false, std::memory_order_relaxed);
   }
 
   /**
@@ -333,18 +451,31 @@ class Container {
    * @return MAPE as a fraction (0.0 = perfect, 1.0 = 100% error)
    */
   float GetMethodMape(u32 method_id) const {
-    if (method_id < method_mape_.size()) {
-      return method_mape_[method_id];
+    const Container &owner = ModelOwner();
+    if (method_id < owner.method_mape_.size()) {
+      return owner.method_mape_[method_id];
     }
     return 0.0f;
   }
 
-  const std::vector<float>& GetMethodModel() const { return method_model_; }
-  const std::vector<float>& GetMethodMapeVec() const { return method_mape_; }
-  const std::vector<float>& GetMethodModelWall() const { return method_model_wall_; }
-  const std::vector<float>& GetMethodMapeWallVec() const { return method_mape_wall_; }
+  // Model accessors read through the model owner, so a caller holding ANY of
+  // the pool's containers sees the same weights the scheduler is using.
+  const std::vector<float>& GetMethodModel() const {
+    return ModelOwner().method_model_;
+  }
+  const std::vector<float>& GetMethodMapeVec() const {
+    return ModelOwner().method_mape_;
+  }
+  const std::vector<float>& GetMethodModelWall() const {
+    return ModelOwner().method_model_wall_;
+  }
+  const std::vector<float>& GetMethodMapeWallVec() const {
+    return ModelOwner().method_mape_wall_;
+  }
+  /** Method names are per-container (set by the module's own Init), not part
+   *  of the shared model, so this one is deliberately NOT redirected. */
   const std::vector<std::string>& GetMethodNames() const { return method_names_; }
-  float GetLearningRate() const { return learning_rate_; }
+  float GetLearningRate() const { return ModelOwner().learning_rate_; }
 
   /** Mark container as plugged (no new tasks accepted) */
   void SetPlugged() { flags_.SetBits(CONTAINER_PLUG); }

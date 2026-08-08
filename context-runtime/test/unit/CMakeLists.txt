@@ -40,6 +40,12 @@ set(LOCAL_TASK_ARCHIVE_TEST_SOURCES
   test_local_task_archive.cc
 )
 
+# Task-stat model persistence test executable (issue #956)
+set(TASK_STAT_MODEL_TEST_TARGET clio_run_task_stat_model_tests)
+set(TASK_STAT_MODEL_TEST_SOURCES
+  test_task_stat_model.cc
+)
+
 # Per-Process Shared Memory test executable
 set(PER_PROCESS_SHM_TEST_TARGET clio_run_per_process_shm_tests)
 set(PER_PROCESS_SHM_TEST_SOURCES
@@ -217,6 +223,34 @@ set_target_properties(${LOCAL_TASK_ARCHIVE_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${LOCAL_TASK_ARCHIVE_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create Task-Stat Model test executable (issue #956)
+add_executable(${TASK_STAT_MODEL_TEST_TARGET} ${TASK_STAT_MODEL_TEST_SOURCES})
+
+target_include_directories(${TASK_STAT_MODEL_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+  ${CLIO_RUN_ROOT}/modules/bdev/include   # For bdev tasks
+)
+
+target_link_libraries(${TASK_STAT_MODEL_TEST_TARGET}
+  clio_admin_runtime          # Admin module runtime
+  clio_admin_client           # Admin module client
+  clio_bdev_runtime           # Bdev module runtime
+  clio_bdev_client            # Bdev module client
+  ctp::cxx                       # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -667,6 +701,18 @@ if(CLIO_CORE_ENABLE_TESTS)
   # Single ctest entry runs the whole binary in one clio_run init/finalize cycle.
   # Previously 8 redundant entries each invoked the full unfiltered binary, which
   # serialized via RESOURCE_LOCK but multiplied clio_run shutdown ZMQ-race exposure.
+  # Task-stat model persistence (issue #956). Own ctest entry => own process:
+  # it brings up an in-process runtime and CLIO_INIT is once-per-process.
+  add_test(
+    NAME cr_task_stat_model_tests
+    COMMAND ${TASK_STAT_MODEL_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_task_stat_model_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 300
+  )
+
   add_test(
     NAME cr_unit_tests
     COMMAND ${TEST_TARGET}
@@ -1208,6 +1254,7 @@ set(_install_test_targets
   ${UNORDERED_MAP_LL_TEST_TARGET}
   ${SAVE_LOAD_TASK_TEST_TARGET}
   ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
+  ${TASK_STAT_MODEL_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}

@@ -73,6 +73,22 @@ inline size_t RuntimeHeapBytes() {
 // Poll until the runtime private-heap usage stops changing (so async server-side
 // frees — which can lag the client's Wait() — have settled) or a short bound
 // elapses. Returns early once stable, so the common case costs ~20 ms.
+// Number of workers the in-process runtime currently owns, or 0 if there is
+// no runtime. Used to tell a genuine leak apart from an elastic worker being
+// spawned mid-test -- see the leak check below.
+inline size_t RuntimeWorkerCount() {
+#ifdef CLIO_WORK_ORCHESTRATOR
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  return orch == nullptr ? 0 : static_cast<size_t>(orch->GetTotalWorkerCount());
+#else
+  // simple_test.h is shared with context-transport-primitives, whose tests do
+  // not link or include the runtime's work orchestrator. No orchestrator means
+  // no elastic workers to account for, so the leak check keeps its original
+  // strict behaviour there.
+  return 0;
+#endif
+}
+
 inline size_t StabilizeRuntimeHeap() {
   size_t prev = RuntimeHeapBytes();
   for (int i = 0; i < 50; ++i) {  // up to ~0.5 s
@@ -273,6 +289,8 @@ inline int run_all_tests(const std::string& filter = "") {
             test.first.find("[noleak]") == std::string::npos;
         const size_t heap_before =
             leak_check ? detail::StabilizeRuntimeHeap() : 0;
+        const size_t workers_before =
+            leak_check ? detail::RuntimeWorkerCount() : 0;
         ++executed_count;
 #endif
 
@@ -281,7 +299,32 @@ inline int run_all_tests(const std::string& filter = "") {
 #ifdef CTP_ALLOC_TRACK_SIZE
             if (leak_check) {
                 const size_t heap_after = detail::StabilizeRuntimeHeap();
-                if (heap_after > heap_before + detail::kLeakToleranceBytes) {
+                // A test that happens to saturate a cost class makes the
+                // scheduler spawn an ELASTIC worker (#785). That worker's
+                // lanes/queues/bookkeeping are process-lifetime state owned by
+                // the runtime, not something this test leaked -- but the
+                // before/after delta charges it to whichever test was running
+                // when the spawn fired. Since saturation is load- and
+                // timing-dependent, the victim moves between environments
+                // (issue #942: AsyncGetTargetInfo in CI, AsyncUnregisterTarget
+                // locally, constant ~147 KB either way), so no [noleak] tag can
+                // predict it -- tagging the suspected tests just moved the
+                // failure to a test that does not even use the same fixture.
+                // Treat a worker-count increase the same way the first test is
+                // treated: legitimate one-time runtime growth.
+                const size_t workers_after = detail::RuntimeWorkerCount();
+                const bool spawned_worker = workers_after > workers_before;
+                if (spawned_worker) {
+                    std::cout << "  [leak-check skipped] runtime spawned "
+                              << (workers_after - workers_before)
+                              << " worker(s) during this test; the "
+                              << (heap_after > heap_before
+                                      ? heap_after - heap_before : 0)
+                              << " byte delta is their process-lifetime state"
+                              << std::endl;
+                }
+                if (!spawned_worker &&
+                    heap_after > heap_before + detail::kLeakToleranceBytes) {
                     std::ostringstream oss;
                     oss << "Runtime-heap leak in test '" << test.first << "': "
                         << (heap_after - heap_before)

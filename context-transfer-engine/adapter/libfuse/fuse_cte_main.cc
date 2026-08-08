@@ -72,7 +72,11 @@
 // /dev/fuse fd, we need to drive the FUSE protocol on that fd directly
 // instead of having libfuse mount its own. Plain read/writev syscalls
 // suffice; splice is optional.
-#ifndef __APPLE__
+// The FUSE_VERSION arm matches the guard in main(): below libfuse 3.14 the
+// custom-io path is compiled out entirely, and defining these here anyway
+// would leave two unused statics behind (-Wunused-function, fatal under
+// -Werror).
+#if !defined(__APPLE__) && FUSE_VERSION >= FUSE_MAKE_VERSION(3, 14)
 static ssize_t cte_custom_writev(int fd, struct iovec *iov, int count,
                                  void * /*userdata*/) {
   return writev(fd, iov, count);
@@ -81,7 +85,7 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
                                void * /*userdata*/) {
   return read(fd, buf, buf_len);
 }
-#endif  // __APPLE__
+#endif  // !__APPLE__ && FUSE_VERSION >= 3.14
 #endif  // _WIN32
 
 int main(int argc, char *argv[]) {
@@ -119,6 +123,28 @@ int main(int argc, char *argv[]) {
   if (prefd == -1) {
     return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
   }
+
+#if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)
+  // Built against libfuse older than 3.14, where `struct fuse_custom_io` is
+  // not declared at all. The dlsym dance below handles a RUNTIME libfuse that
+  // lacks fuse_session_custom_io, but it cannot help here: the struct is an
+  // incomplete type, so the initializer below is a hard compile error rather
+  // than a link error. The manylinux images ship libfuse 3.10.2, which is
+  // exactly this case -- enabling the FUSE adapter for Linux wheels without
+  // this guard fails the wheel build outright.
+  //
+  // Only the Apptainer fd-injection path is lost. Normal mounting still works
+  // through the fuse_main() path above, which is what every non-Apptainer
+  // caller (including the wheel's documented `clio_cte_fuse <mnt>` usage)
+  // takes. The message matches the runtime-missing-symbol case below.
+  (void)new_argc;
+  std::fprintf(stderr,
+               "clio_cte_fuse: this binary was built against libfuse %d.%d; "
+               "--fusemount (/dev/fd/N) mode needs 3.14+ headers at build "
+               "time.\n",
+               FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
+  return 1;
+#else
 
   // Apptainer 1.2.5 (unprivileged, no starter-suid) doesn't actually
   // call mount(2) when --fusemount kicks in for a user-supplied
@@ -222,5 +248,6 @@ int main(int argc, char *argv[]) {
   fuse_destroy(fuse);
   fuse_opt_free_args(&args);
   return ret;
+#endif  // FUSE_VERSION < 3.14
 #endif  // _WIN32 || __APPLE__
 }

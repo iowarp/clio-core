@@ -725,8 +725,11 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     return;
   }
 
+  // The origin task is about to be completed through EndTask, which calls the
+  // module's UpdateWork on its ExecContainer — so this must resolve to the real
+  // local container, not the pool's model-only static container (issue #956).
   clio::run::DynamicContainer container =
-      CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
+      CLIO_POOL_MANAGER->GetRealOrStaticContainer(origin_task->pool_id_);
   if (container) {
     origin_task->ExecContainer() = container;
   }

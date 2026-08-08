@@ -38,6 +38,11 @@ install(TARGETS clio_cte_semantic_bench
 # operations (4 KiB / 1 MiB read+write, stat-size, small/large readdir, rename)
 # under a configurable percentage mix so the combined profile can be compared
 # against each operation in isolation.
+# NOT WIN32: this drives the descriptor layer (OpenFd/PreadFd/PwriteFd/
+# StatPath/ReaddirPath/RenamePath), which filesystem_client.h compiles out
+# behind `#if !defined(_WIN32)`. Building it on Windows fails with a wall of
+# C2039 "is not a member" and took out the Windows wheel and package jobs.
+if(NOT WIN32)
 add_executable(clio_cte_reliability_bench
   clio_cte_reliability_bench.cc
 )
@@ -54,6 +59,7 @@ target_compile_features(clio_cte_reliability_bench PRIVATE cxx_std_17)
 install(TARGETS clio_cte_reliability_bench
   RUNTIME DESTINATION bin
 )
+endif()  # NOT WIN32
 
 # POSIX baseline for the reliability benchmark: the same eight-operation mixed
 # workload driven through plain pwrite/pread/stat/opendir/rename against an
@@ -61,6 +67,10 @@ install(TARGETS clio_cte_reliability_bench
 # from clio on purpose — it is the "what if we just used the filesystem"
 # control, and it takes the same flags and emits the same CSV so one driver can
 # run both.
+# NOT WIN32: pure POSIX control (dirent.h, pwrite/pread/opendir). It exists to
+# answer "what if we just used the filesystem", so a Windows port would be a
+# different benchmark, not a build fix.
+if(NOT WIN32)
 add_executable(posix_fs_bench
   posix_fs_bench.cc
 )
@@ -71,6 +81,7 @@ target_compile_features(posix_fs_bench PRIVATE cxx_std_17)
 install(TARGETS posix_fs_bench
   RUNTIME DESTINATION bin
 )
+endif()  # NOT WIN32
 
 # Create clio_cte_score_bench executable (MPI-based score/demotion benchmark)
 # Only build if MPI is enabled

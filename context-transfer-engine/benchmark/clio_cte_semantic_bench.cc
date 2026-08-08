@@ -165,7 +165,18 @@ int main(int argc, char **argv) {
   // SemanticSearch lives in the indexer chimod (issue #905), composed at
   // 564.0 in the default chain — and puts must flow through it to be
   // indexed. Default the client binding there; CLIO_CTE_POOL still wins.
-  setenv("CLIO_CTE_POOL", "564.0", /*overwrite=*/0);
+  // setenv() is POSIX; MSVC has no such function, which broke the Windows
+  // wheel and package builds when the indexer extraction (#905) added this
+  // line. _putenv_s always overwrites, so replicate overwrite=0 by only
+  // setting the variable when it is absent -- an explicit CLIO_CTE_POOL from
+  // the environment must still win, which is the whole point of the flag.
+  if (std::getenv("CLIO_CTE_POOL") == nullptr) {
+#if defined(_WIN32)
+    _putenv_s("CLIO_CTE_POOL", "564.0");
+#else
+    setenv("CLIO_CTE_POOL", "564.0", /*overwrite=*/0);
+#endif
+  }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     HLOG(kError, "Failed to initialize CTE client");
     return 1;

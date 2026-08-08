@@ -782,8 +782,13 @@ void Runtime::MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task) {
     const auto *info = pool_manager->GetPoolInfo(pid);
     if (!info) continue;
 
-    // Get the static container for model data
+    // The model lives on the static container, which owns it for the whole
+    // pool (issue #956) — so this reports exactly the weights every container
+    // of the pool schedules with.
     auto container = pool_manager->GetStaticContainer(pid).get();
+    // …but report the id of a container that actually serves tasks; the static
+    // container's id is a reserved sentinel and would be meaningless here.
+    auto serving = pool_manager->GetRealOrStaticContainer(pid).get();
 
     pk.pack_map(6);
 
@@ -797,7 +802,7 @@ void Runtime::MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task) {
     pk.pack(info->chimod_name_);
 
     pk.pack("container_id");
-    pk.pack(container ? container->container_id_ : 0u);
+    pk.pack(serving ? serving->container_id_ : 0u);
 
     // Model data: array of per-method entries
     if (container) {
@@ -2229,8 +2234,7 @@ clio::run::TaskResume Runtime::RecoverContainers(
       continue;
     }
     container.get()->Recover(ra.pool_id_, ra.pool_name_, ra.container_id_);
-    pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container,
-                                    false);
+    pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container);
     task->num_recovered_++;
   }
 
@@ -2282,6 +2286,16 @@ clio::run::TaskResume Runtime::SystemMonitor(clio::run::shared_ptr<SystemMonitor
   // Push into ring buffer
   if (system_stats_ring_) {
     system_stats_ring_->Push(stats);
+  }
+
+  // Persist each pool's learned task-stat model (issue #956). This 1 Hz task is
+  // the runtime's existing "sample everything" heartbeat, so it is the natural
+  // driver; FlushModels throttles itself to one write per pool per flush
+  // interval and skips pools whose weights have not changed, so the common tick
+  // does no I/O at all. Without a periodic save the weights would only survive
+  // a graceful shutdown.
+  if (auto *pool_manager = CLIO_POOL_MANAGER) {
+    pool_manager->FlushModels();
   }
 
   cur_task->SetDidWork(true);

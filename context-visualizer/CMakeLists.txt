@@ -42,6 +42,20 @@ if(NOT _VIS_SITE_RC EQUAL 0 OR _VIS_SITE_REL STREQUAL "")
     set(_VIS_SITE_REL "lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
 endif()
 
+# os.path.relpath returns the native separator, so on Windows the line above
+# yields "Lib\site-packages". Interpolated into an install(DESTINATION ...)
+# that reaches cmake_install.cmake verbatim, and CMake then rejects the
+# backslash as an escape:
+#
+#   Syntax error ... when parsing string
+#     ${CMAKE_INSTALL_PREFIX}/lib\python3.14\site-packages/context_visualizer
+#   Invalid character escape '\p'.
+#
+# which failed `Build Windows package (x86_64)` at CPack time -- after a fully
+# successful compile, so it looked like a packaging problem rather than a path
+# problem. Normalise to forward slashes; CMake accepts those on every platform.
+file(TO_CMAKE_PATH "${_VIS_SITE_REL}" _VIS_SITE_REL)
+
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/context_visualizer/
     DESTINATION "${_VIS_SITE_REL}/context_visualizer"

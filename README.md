@@ -82,20 +82,9 @@ The wheel includes the CLIO runtime, the `clio_run` CLI, the CTE, CAE, and
 CEE engines, and the `clio_cee` Python bindings. A default configuration is
 seeded at `~/.clio/clio.yaml` on first import.
 
-### Conda
+### Extra features
 
-Prebuilt `iowarp-core` packages are published to the
-[`iowarp` channel on Anaconda.org](https://anaconda.org/iowarp/iowarp-core).
-With [Miniconda](https://www.anaconda.com/download/success) installed:
-
-```bash
-conda create -n iowarp -c iowarp -c conda-forge iowarp-core
-conda activate iowarp
-```
-
-Dependencies are pulled from conda-forge instead of being statically linked.
-
-Switch to a source build below if you need any of:
+The pip wheel covers the common case. Build from source if you need any of:
 
 - NVIDIA GPU (CUDA) or AMD GPU (ROCm) acceleration
 - MPI for distributed multi-node deployment
@@ -105,27 +94,19 @@ Switch to a source build below if you need any of:
 - Custom ChiMods built against the C++ headers
 - Sanitizer or debug builds
 
-### Source build (Conda)
-
-Build the conda recipe yourself to enable extra features. `IOWARP_PRESET`
-selects a [CMake preset](CMakePresets.json):
-
 ```bash
 git clone --recurse-submodules https://github.com/iowarp/clio-core.git
 cd clio-core
 
-# conda-build is a base-env plugin — install it there
-conda install -n base -y conda-build -c conda-forge
-
 # Common presets: release, debug, cuda-release, rocm-release
-IOWARP_PRESET=release conda build installers/conda/ \
-    -c conda-forge --output-folder build/conda-output
-conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
+cmake --preset=release
+cmake --build build -j"$(nproc)"
+sudo cmake --install build
 ```
 
-For a full **bare-metal source build** (without Conda) with the per-feature
-apt / dnf dependency list and the complete `CLIO_*_ENABLE_*` flag checklist,
-see [INSTALL.md](INSTALL.md). Other methods (Docker, Spack) are documented in
+For the per-feature apt / dnf dependency list and the complete
+`CLIO_*_ENABLE_*` flag checklist, see [INSTALL.md](INSTALL.md). Other install
+methods (Conda, Docker, Spack) are documented in
 [docs/getting-started/installation](docs/docs/getting-started/installation.mdx).
 
 ## Components
@@ -156,6 +137,70 @@ To override the configuration, point `CLIO_SERVER_CONF` at your own YAML file:
 export CLIO_SERVER_CONF=/path/to/my_config.yaml
 clio_run start
 ```
+
+### FUSE filesystem
+
+`clio_cte_fuse` exposes the Context Transfer Engine as a POSIX filesystem, so
+unmodified applications read and write IOWarp-managed data through ordinary
+file I/O. The wheel ships this binary on Linux and Windows; macOS wheels do not
+(macOS has no FUSE3 API).
+
+**1. Install the FUSE runtime.** `libfuse3` is a system dependency and is
+deliberately not bundled in the wheel, so install your distribution's package:
+
+```bash
+sudo apt install fuse3 libfuse3-3      # Debian / Ubuntu
+sudo dnf install fuse3 fuse3-libs      # Fedora / RHEL
+```
+
+On Windows, install [WinFsp](https://winfsp.dev) instead. The `clio_cte_fuse`
+console script prepends WinFsp's `bin` directory to `PATH` itself, so
+`winfsp-x64.dll` resolves without a system-wide `PATH` edit.
+
+**2. Mount.** Start the runtime, then point the daemon at a mountpoint. The
+daemon create-or-binds the filesystem pool and the CTE pool underneath it, so
+no separate `compose` step is required:
+
+```bash
+clio_run start &
+mkdir -p ~/clio-mnt
+CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+```
+
+`CLIO_WITH_RUNTIME=0` attaches to the runtime you just started rather than
+spawning an embedded one — without it the daemon brings up its own runtime and
+the data will not be visible to other clients. `-f` keeps the daemon in the
+foreground, which is the configuration CI exercises. Every remaining argument
+is handed to `fuse_main`, so standard libfuse options apply (`-o allow_other`,
+`-d` for protocol tracing). On Windows the mountpoint is a drive letter:
+`clio_cte_fuse Z:`.
+
+The mount then behaves like any other filesystem:
+
+```bash
+cp big_input.h5 ~/clio-mnt/
+python analysis.py ~/clio-mnt/big_input.h5
+```
+
+**3. Unmount:**
+
+```bash
+fusermount3 -u ~/clio-mnt      # or: fusermount -u ~/clio-mnt
+```
+
+To size the storage tiers explicitly instead of taking the defaults, compose a
+CTE pool before mounting — see
+[`context-transfer-engine/test/integration/fuse-manual/cte_compose.yaml`](context-transfer-engine/test/integration/fuse-manual/cte_compose.yaml)
+for a working single-tier example:
+
+```bash
+clio_run compose start my_cte.yaml
+```
+
+Two semantics worth knowing: writes are write-through, so each `write()`
+reaches the chimod synchronously and the logical file size is always exact;
+and the kernel attribute and entry caches are disabled, so metadata that
+another client changed is never served stale.
 
 ### Python: bundle, query, retrieve
 

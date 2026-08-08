@@ -63,9 +63,13 @@ add_test(NAME ctp_singleton COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_singleton_exec)
 
 # Same precompiled-Catch2 sigaction false positives as the other cases here.
+# TIMEOUT: this test deliberately oversubscribes the box with racing threads,
+# so if the barrier ever regresses it should fail FAST and say so, not sit on
+# ctest's 1500s default -- that is how it presented on windows-2022 Debug
+# (ctp_singleton (Timeout), whole job red, no indication which test hung).
 set_tests_properties(
   ctp_singleton
-  PROPERTIES LABELS "msan_skip"
+  PROPERTIES LABELS "msan_skip" TIMEOUT 180
 )
 
 install(TARGETS

@@ -83,7 +83,14 @@ CLIO_CORE_ENABLE_MPI = "OFF"
 CLIO_CORE_ENABLE_HDF5 = "OFF"
 CLIO_CORE_ENABLE_ELF = "OFF"
 CLIO_CTE_ENABLE_COMPRESS = "OFF"
+# FUSE adapter: OFF here is the macOS value; Linux and Windows wheels turn
+# it ON via the per-OS overrides at the bottom of this file (#899).
 CLIO_CTE_ENABLE_FUSE_ADAPTER = "OFF"
+# Cache + replication chimods ship by default (#886/#899). They already
+# default ON in CMake; pin them here so a future default flip cannot
+# silently drop them from published wheels.
+CLIO_CTE_ENABLE_CACHE = "ON"
+CLIO_CTE_ENABLE_REPLICATION = "ON"
 CLIO_CORE_ENABLE_ENCRYPT = "OFF"
 CLIO_CORE_ENABLE_CUDA = "OFF"
 CLIO_CORE_ENABLE_ROCM = "OFF"
@@ -95,3 +102,39 @@ CTP_LOG_LEVEL = "1"
 provider = "scikit_build_core.metadata.regex"
 input = "CMakeLists.txt"
 regex = 'project\(iowarp-core VERSION (?P<value>[\d.]+)'
+
+# ---------------------------------------------------------------------------
+# Per-OS overrides (#899): ship the OS-specific FUSE adapter by default.
+# `if.platform-system` regex-matches sys.platform ("linux", "win32",
+# "darwin").
+#   - Linux: libfuse3. The binary links libfuse3.so.3, which the wheel does
+#     NOT bundle (see repair_wheel.sh — external system libs stay external);
+#     users need their distro's fuse3/libfuse3 packages at mount time, as
+#     documented in iowarp_core._cli.cte_fuse_main.
+#   - Windows: WinFsp (https://winfsp.dev). The build finds WinFsp's
+#     FUSE3-compatible SDK (adapter/libfuse/CMakeLists.txt); end users need
+#     the WinFsp runtime installed.
+#   - macOS: stays OFF — there is no fuse3 pkg-config on macOS (macFUSE
+#     exposes the FUSE2 API), so the base define above applies.
+#
+# These MUST live here, not only in installers/pip/pyproject.toml: CI runs
+# `cibuildwheel` from the repo root with no working-directory, so cibuildwheel
+# builds THIS file's package. #899 added the overrides to the installers/pip
+# copy only, so every published wheel silently shipped without the FUSE
+# adapter -- and only the Windows wheel test caught it, because the Linux
+# check tolerates a nonzero exit from the `clio_cte_fuse` console script,
+# which exists as an entry point even when the binary behind it does not.
+# ---------------------------------------------------------------------------
+# inherit.cmake.define = "append" is load-bearing: without it an override's
+# cmake.define table REPLACES the whole base table (verified against
+# scikit-build-core 0.12 and re-verified against 1.0.3), silently dropping
+# STATIC_DEPS and every other base define from the wheel build.
+[[tool.scikit-build.overrides]]
+if.platform-system = "linux"
+inherit.cmake.define = "append"
+cmake.define.CLIO_CTE_ENABLE_FUSE_ADAPTER = "ON"
+
+[[tool.scikit-build.overrides]]
+if.platform-system = "win32"
+inherit.cmake.define = "append"
+cmake.define.CLIO_CTE_ENABLE_FUSE_ADAPTER = "ON"

@@ -2464,6 +2464,41 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     }
     BlobReadPinGuard read_pin_guard(blob_info_ptr.get());
 
+    // Liveness re-check, and it MUST be here -- after the pin, not before it
+    // (issue #753). The torn-layout loop above only waits while a writer HOLDS
+    // the token; once DelBlob finishes it releases the token, frees every
+    // extent and erases the name binding -- but a reader that resolved
+    // blob_info_ptr before that still holds the BlobInfo alive. Checking the
+    // size before TryPinRead leaves the whole delete free to complete in the
+    // window between the check and the pin: the reader then pins a dead blob,
+    // snapshots an EMPTY blocks_, and ReadData reports success without reading
+    // a byte (it succeeds for ranges no block covers). The caller gets rc=0
+    // and its own untouched buffer -- indistinguishable from a real read, and
+    // once the freed extents are recycled by another put the same window hands
+    // back whatever now lives there. That is the failure
+    // 'DelBlob under pipelined reads never yields garbage' asserts on.
+    //
+    // Once the pin is held the state is stable: TryPinRead refuses while the
+    // drain bit is set, so no extent-freeing mutator can be mid-flight here.
+    // Either the delete already finished -- caught below -- or it has not
+    // started and must drain this pin first.
+    //
+    // A deleted blob must read as ABSENT, exactly like the replica case above.
+    // This does not change past-EOF behaviour for a live blob: a non-empty blob
+    // whose range extends beyond its size still takes the short-read path.
+    // The replica arm is re-checked here for the same reason: the early-out
+    // above runs before the pin, so it has the identical window. Re-reading it
+    // under the pin is what actually makes it safe.
+    const bool blob_is_gone =
+        replica_sel > 0
+            ? blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_ ==
+                  0
+            : blob_info_ptr->GetTotalSize() == 0;
+    if (blob_is_gone) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
     // Snapshot the block layout BEFORE the read I/O. ReadData co_awaits a bdev
     // read per block; a concurrent PutBlob/Truncate (holding the per-blob write
     // token) may ExtendBlob/ResizeBlob and push_back into the SAME blocks_
@@ -6780,8 +6815,11 @@ clio::run::TaskResume Runtime::AllocateFromTarget(
   // the task path already exercises. Remote/non-local targets and containers
   // that decline (or ENOSPC) fall through to the task path unchanged.
   if (target_info.target_query_.IsLocalMode()) {
-    auto inline_dc =
-        CLIO_POOL_MANAGER->GetStaticContainer(target_info.bdev_client_.pool_id_);
+    // The REAL bdev container: InlineOp reaches into the live block allocator,
+    // which only the container that ran Create owns. The pool's static
+    // container carries the task-stat model and nothing else (issue #956).
+    auto inline_dc = CLIO_POOL_MANAGER->GetRealOrStaticContainer(
+        target_info.bdev_client_.pool_id_);
     auto inline_c = inline_dc.get();  // ContainerHold keeps the container pinned
     if (inline_c) {
       clio::run::u64 inline_size = size;

@@ -5,6 +5,20 @@ on:
   push:
     branches: main
     tags: ['v*']
+  # Validate packaging changes BEFORE they reach main (#953). Without this the
+  # workflow only ran post-merge, so a packaging break was discovered on main
+  # -- which is exactly how the wheels shipped for days with the FUSE adapter
+  # silently disabled, and how a Linux+FUSE combination that had never once
+  # been compiled in CI got enabled. Paths-filtered so ordinary source PRs do
+  # not pay for a full multi-arch wheel matrix; anything that can change what
+  # lands in a wheel is listed here.
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'installers/pip/**'
+      - '.github/workflows/build-pip.yml'
+      - 'CMakeLists.txt'
+      - 'context-transfer-engine/adapter/libfuse/**'
 
 permissions:
   contents: write
@@ -408,6 +422,18 @@ jobs:
               apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
+            fi
+            # Assert the BINARY is in the wheel before exercising it. The
+            # `clio_cte_fuse` console script is a [project.scripts] entry
+            # point, so it exists even when the binary behind it does not --
+            # it then exits nonzero-but-not-signalled, which the heuristic
+            # below tolerates. That blind spot is why every wheel shipped
+            # without the FUSE adapter and only the Windows job (which does
+            # Test-Path on the .exe) ever noticed.
+            BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
+            if [ ! -x "$BIN_DIR/clio_cte_fuse" ]; then
+              echo "FAIL: clio_cte_fuse missing from wheel bin dir ($BIN_DIR)"
+              exit 1
             fi
             clio_cte_fuse --help || rc=$?
             rc=${rc:-0}

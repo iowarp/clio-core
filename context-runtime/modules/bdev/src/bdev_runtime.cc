@@ -147,11 +147,15 @@ void Runtime::LoadPerfStats() {
   perf_metrics_ = m;
   // Seed the learned wall-clock model so InferWallClockTime (which GetStats
   // derives its bandwidth from) starts warm instead of at the 1.0 seed.
-  if (wall_read > 0.0f && Method::kRead < method_model_wall_.size()) {
-    method_model_wall_[Method::kRead] = wall_read;
+  // SetMethodWallCoef writes through to the pool's model owner (the static
+  // container) — writing method_model_wall_ directly would land on this
+  // container's own now-unused table and the seed would be invisible to both
+  // inference and the monitor (issue #956).
+  if (wall_read > 0.0f) {
+    SetMethodWallCoef(Method::kRead, wall_read);
   }
-  if (wall_write > 0.0f && Method::kWrite < method_model_wall_.size()) {
-    method_model_wall_[Method::kWrite] = wall_write;
+  if (wall_write > 0.0f) {
+    SetMethodWallCoef(Method::kWrite, wall_write);
   }
   HLOG(kInfo,
        "bdev '{}': restored perf stats from {} (read {} MB/s, write {} MB/s)",
@@ -168,10 +172,13 @@ void Runtime::SavePerfStats(bool force) {
     return;
   }
   last_perf_save_ = now;
-  float wall_read = (Method::kRead < method_model_wall_.size())
-                        ? method_model_wall_[Method::kRead] : 0.0f;
-  float wall_write = (Method::kWrite < method_model_wall_.size())
-                         ? method_model_wall_[Method::kWrite] : 0.0f;
+  // Read through the accessor: the live coefficients belong to the pool's
+  // model owner, not to this container's own table (issue #956).
+  const std::vector<float> &wall_model = GetMethodModelWall();
+  float wall_read = (Method::kRead < wall_model.size())
+                        ? wall_model[Method::kRead] : 0.0f;
+  float wall_write = (Method::kWrite < wall_model.size())
+                         ? wall_model[Method::kWrite] : 0.0f;
   SavePerfStatsFile(perf_stats_path_, perf_metrics_, wall_read, wall_write);
 }
 

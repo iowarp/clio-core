@@ -477,6 +477,14 @@ jobs:
     - name: Install WinFsp (FUSE adapter SDK)
       run: choco install winfsp -y --no-progress
 
+    # cpack -G NSIS below shells out to makensis. Nothing installed it, so the
+    # job failed with "Cannot find NSIS compiler makensis ... Cannot initialize
+    # the generator NSIS" -- after a successful compile AND a successful ZIP
+    # package, so it reads as a packaging-config problem rather than a missing
+    # tool. The runner image does not ship NSIS.
+    - name: Install NSIS (installer generator for cpack -G NSIS)
+      run: choco install nsis -y --no-progress
+
     - name: Configure with CMake
       run: |
         # Cache + replication pins: same rationale as build-deb (#899).
@@ -535,8 +543,21 @@ jobs:
         Write-Host "Extracting $zip"
         Expand-Archive $zip -DestinationPath extracted
         # The archive wraps everything in one iowarp-core-<ver>-win64/ root.
-        $root = (Get-ChildItem extracted -Directory | Select-Object -First 1).FullName
+        # The ZIP may or may not carry a versioned top-level directory: with
+        # CPACK_INCLUDE_TOPLEVEL_DIRECTORY it extracts as
+        # <name>-<ver>-win64/bin/..., without it as bin/... directly. Assuming
+        # the former produced 'extracted\bin\bin\clio_run.exe' -- a doubled
+        # segment -- and the job failed with "is not recognized as a name of a
+        # cmdlet". This step had never actually run before (the Windows package
+        # build failed earlier in the pipeline, so it was always skipped), so
+        # the bug was latent. Accept either layout.
+        $root = if (Test-Path (Join-Path "extracted" "bin")) {
+                  (Resolve-Path "extracted").Path
+                } else {
+                  (Get-ChildItem extracted -Directory | Select-Object -First 1).FullName
+                }
         $bin = Join-Path $root "bin"
+        Write-Host "=== package layout: root=$root bin=$bin ==="
 
         Write-Host "=== clio_run.exe --help ==="
         & "$bin\clio_run.exe" --help

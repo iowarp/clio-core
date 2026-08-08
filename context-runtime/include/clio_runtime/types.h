@@ -431,6 +431,12 @@ using WorkerId = u32;
 using LaneId = u32;
 using ContainerId = u32;
 static constexpr ContainerId kInvalidContainerId = static_cast<ContainerId>(-1);
+/** Container id of a pool's static container. The static container is not a
+ *  member of the pool's container set (it is never addressed, never routed to,
+ *  and holds no module state) — it exists once per pool per node to own the
+ *  task-stat model and to serve the stateless task APIs, so it gets a reserved
+ *  id that can never collide with a real node-derived container id. */
+static constexpr ContainerId kStaticContainerId = static_cast<ContainerId>(-2);
 using MinorId = u32;
 
 // Container addressing system types
