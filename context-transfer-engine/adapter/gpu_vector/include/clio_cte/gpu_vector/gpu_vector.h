@@ -74,17 +74,35 @@ class Vector {
       throw std::runtime_error("gpu_vector: could not resolve tag " + tag_name);
     }
     tag_id_ = tag->tag_id_;
-    for (int gpu : gpu_ids) {
-      BuildDevice(gpu);
+    // If one GPU fails to build, release the ones already built: a throwing
+    // constructor means no destructor runs, so this is the only chance.
+    try {
+      for (int gpu : gpu_ids) {
+        BuildDevice(gpu);
+      }
+    } catch (...) {
+      for (auto &kv : devs_) {
+        Free(kv.second);
+      }
+      devs_.clear();
+      throw;
     }
   }
 
+  /** Releases every device allocation this vector made. Callers free nothing. */
   ~Vector() {
     for (auto &kv : devs_) {
       Free(kv.second);
     }
   }
 
+  /**
+   * Non-copyable BY DESIGN, not as an oversight: a vector owns registered GPU
+   * backends and raw device buffers, and a second owner of those would free
+   * them twice. Share one with a std::shared_ptr<Vector<T>> rather than
+   * copying it; the device VIEW (GetDevice) is the thing meant to be copied,
+   * and it is a non-owning value type precisely so kernels can take it.
+   */
   Vector(const Vector &) = delete;
   Vector &operator=(const Vector &) = delete;
 
@@ -97,6 +115,65 @@ class Vector {
     return it->second.view;
   }
 
+  /** Paging activity since the last ResetStats(). */
+  struct Stats {
+    clio::run::u64 faults = 0;   // pages read in from the CTE
+    clio::run::u64 puts = 0;     // pages written back
+    clio::run::u64 evicts = 0;   // slots reclaimed
+  };
+
+  /**
+   * Turn on device-side paging counters for every device view.
+   *
+   * Off by default -- the counters cost an atomic per page event, which is
+   * nothing against a fault's round trip but is not free. Tests use them to
+   * assert the paging POLICY (hit/miss, writeback, victim choice), which the
+   * returned data alone cannot distinguish.
+   */
+  void EnableStats() {
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      if (kv.second.stats != nullptr) continue;
+      void *mem = nullptr;
+      if (cudaMalloc(&mem, 3 * sizeof(unsigned long long)) != cudaSuccess) {
+        throw std::runtime_error("gpu_vector: stats allocation failed");
+      }
+      cudaMemset(mem, 0, 3 * sizeof(unsigned long long));
+      auto *c = static_cast<unsigned long long *>(mem);
+      kv.second.stats = c;
+      kv.second.view.stat_faults_ = c;
+      kv.second.view.stat_puts_ = c + 1;
+      kv.second.view.stat_evicts_ = c + 2;
+    }
+#endif
+  }
+
+  void ResetStats() {
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      if (kv.second.stats != nullptr) {
+        cudaMemset(kv.second.stats, 0, 3 * sizeof(unsigned long long));
+      }
+    }
+#endif
+  }
+
+  Stats ReadStats(int dev_id) const {
+    Stats s;
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(dev_id);
+    if (it == devs_.end() || it->second.stats == nullptr) return s;
+    unsigned long long h[3] = {0, 0, 0};
+    cudaMemcpy(h, it->second.stats, sizeof(h), cudaMemcpyDeviceToHost);
+    s.faults = h[0];
+    s.puts = h[1];
+    s.evicts = h[2];
+#else
+    (void) dev_id;
+#endif
+    return s;
+  }
+
   const clio::cte::core::TagId &TagId() const { return tag_id_; }
   clio::run::u64 PageBytes() const { return page_bytes_; }
   clio::run::u64 NumPages() const {
@@ -106,6 +183,7 @@ class Vector {
 
  private:
   struct DevState {
+    int gpu_id = 0;
     DeviceVector<T> view;
     char *pages_base = nullptr;     // page bytes
     char *table_base = nullptr;     // Page[] table
@@ -113,6 +191,7 @@ class Vector {
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
     ctp::ipc::AllocatorId tasks_alloc;
+    unsigned long long *stats = nullptr;   // [faults, puts, evicts], or null
   };
 
   /**
@@ -126,6 +205,7 @@ class Vector {
   void BuildDevice(int gpu_id) {
     auto *ipc = CLIO_CPU_IPC;
     DevState st;
+    st.gpu_id = gpu_id;
     const clio::run::u64 nslots =
         static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
 
@@ -222,7 +302,18 @@ class Vector {
     }
 #endif
 
+    // One page-table lock per block, zeroed (0 == free).
+    void *locks = nullptr;
+#if CTP_ENABLE_CUDA
+    if (cudaMalloc(&locks, nblocks_ * sizeof(int)) == cudaSuccess) {
+      cudaMemset(locks, 0, nblocks_ * sizeof(int));
+    } else {
+      throw std::runtime_error("gpu_vector: page-table lock allocation failed");
+    }
+#endif
+
     DeviceVector<T> v;
+    v.block_locks_ = static_cast<int *>(locks);
     v.task_seq_ = static_cast<unsigned long long *>(seq);
     v.tag_id_ = tag_id_;
     v.pages_ = reinterpret_cast<Page *>(st.table_base);
@@ -258,9 +349,46 @@ class Vector {
 #endif
   }
 
+  /**
+   * Release everything one device view owns.
+   *
+   * A vector allocates three registered GPU backends (page bytes, page table,
+   * task slots) plus two raw device buffers (the task-id counter and, if
+   * enabled, the stats block). All five are owned by THIS object and are
+   * released here, so a Vector that goes out of scope leaves nothing behind --
+   * the caller never frees anything by hand. Vectors that must outlive a scope
+   * or be shared belong in a shared_ptr; copying is deleted precisely because
+   * two owners of these allocations would double-free them.
+   */
   static void Free(DevState &st) {
-    // The backends are owned by the IpcManager registration; nothing to
-    // release here beyond dropping our pointers.
+    auto *ipc = CLIO_CPU_IPC;
+    const auto gpu = static_cast<clio::run::u32>(st.gpu_id);
+    if (ipc != nullptr) {
+      if (!st.pages_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.pages_alloc);
+      if (!st.table_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.table_alloc);
+      if (!st.tasks_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.tasks_alloc);
+    }
+    st.pages_alloc = ctp::ipc::AllocatorId::GetNull();
+    st.table_alloc = ctp::ipc::AllocatorId::GetNull();
+    st.tasks_alloc = ctp::ipc::AllocatorId::GetNull();
+#if CTP_ENABLE_CUDA
+    if (st.stats != nullptr) {
+      cudaFree(st.stats);
+      st.stats = nullptr;
+    }
+    if (st.view.task_seq_ != nullptr) {
+      cudaFree(st.view.task_seq_);
+    }
+    if (st.view.block_locks_ != nullptr) {
+      cudaFree(st.view.block_locks_);
+    }
+#endif
+    st.view.block_locks_ = nullptr;
+    st.view.task_seq_ = nullptr;
+    st.view.stat_faults_ = nullptr;
+    st.view.stat_puts_ = nullptr;
+    st.view.stat_evicts_ = nullptr;
+    st.view.pages_ = nullptr;
     st.pages_base = nullptr;
     st.table_base = nullptr;
     st.tasks_base = nullptr;

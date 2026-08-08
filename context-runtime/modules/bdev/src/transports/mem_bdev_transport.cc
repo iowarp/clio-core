@@ -406,7 +406,13 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   // Device source: enqueue every chunk copy asynchronously on a per-task stream
   // and yield the worker while the transfers are in flight, so concurrent write
   // tasks overlap on the copy engines instead of each blocking a worker.
-  void *stream = ctp::GpuApi::CreateStream();
+  // Borrowed from the pre-created pool -- see GpuApi::BorrowStream and the
+  // matching comment in ReadBlocks below.
+  void *stream = ctp::GpuApi::BorrowStream();
+  while (stream == nullptr) {
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+    stream = ctp::GpuApi::BorrowStream();
+  }
   clio::run::u64 bytes_written = 0;
   int rc = LaunchWriteBlocksGpu(task, data_ptr.ptr_, stream, bytes_written);
   if (force_sync_gpu_) {
@@ -417,7 +423,7 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
       CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
   }
-  ctp::GpuApi::DestroyStream(stream);
+  ctp::GpuApi::ReturnStream(stream);
 
   task->return_code_ = rc;
   task->bytes_written_ = bytes_written;
@@ -543,7 +549,15 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
 
   // Device destination: enqueue async copies on a per-task stream and yield
   // while they run.
-  void *stream = ctp::GpuApi::CreateStream();
+  // Borrowed from a pre-created pool, never created here: creating a stream
+  // while a kernel is resident blocks until that kernel finishes, and the
+  // kernels this serves spin until this very read completes. Yield until one
+  // frees up rather than making a new one. See GpuApi::BorrowStream.
+  void *stream = ctp::GpuApi::BorrowStream();
+  while (stream == nullptr) {
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+    stream = ctp::GpuApi::BorrowStream();
+  }
   clio::run::u64 bytes_read = 0;
   int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
   if (force_sync_gpu_) {
@@ -554,7 +568,7 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
       CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
   }
-  ctp::GpuApi::DestroyStream(stream);
+  ctp::GpuApi::ReturnStream(stream);
 
   task->return_code_ = rc;
   task->bytes_read_ = bytes_read;

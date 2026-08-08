@@ -35,6 +35,9 @@
 #define CTP_UTIL_GPU_API_H
 
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/util/logging.h"
@@ -154,6 +157,105 @@ class GpuApi {
 #if CTP_ENABLE_SYCL
     delete static_cast<sycl::queue *>(stream);
 #endif
+  }
+
+  /** Device the calling thread is currently bound to (0 when not applicable). */
+  static int CurrentDevice() {
+    int dev = 0;
+#if CTP_ENABLE_ROCM
+    hipGetDevice(&dev);
+#endif
+#if CTP_ENABLE_CUDA
+    cudaGetDevice(&dev);
+#endif
+    return dev;
+  }
+
+  /** Free streams per device. Function-local so the header stays standalone. */
+  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
+    static std::unordered_map<int, std::vector<void *>> pool;
+    return pool;
+  }
+
+  static std::mutex &StreamPoolMutex() {
+    static std::mutex mtx;
+    return mtx;
+  }
+
+  /** Whether a device's pool has been pre-created. */
+  static std::unordered_map<int, bool> &PoolWarmed() {
+    static std::unordered_map<int, bool> warmed;
+    return warmed;
+  }
+
+  /**
+   * Borrow a stream from a process-wide pool, creating one only if the pool
+   * is empty. Return it with ReturnStream when the task's work has completed.
+   *
+   * Creating and destroying a stream PER I/O deadlocks the runtime under
+   * concurrency. cuStreamCreate and cuStreamDestroy both take a write lock on
+   * the CUDA context, so every worker doing device I/O serialises on one
+   * rwlock inside libcuda; worse, cuStreamDestroy waits for the device. When
+   * the device work in question is a kernel that is itself SPINNING on those
+   * very I/Os to complete (a demand-paged GPU vector), the two wait on each
+   * other and neither ever finishes. Observed with a paged vector at 96 CUDA
+   * blocks: every compute worker parked in pthread_rwlock_wrlock under
+   * cuStreamCreate/cuStreamDestroy, the runtime reporting "ALL compute workers
+   * stalled", and the kernel never returning. 64 blocks happened to stay under
+   * the contention threshold, which is why this looked like a block-count bug.
+   *
+   * A borrowed stream is owned EXCLUSIVELY by its task, so StreamQuery on it
+   * still means "my copies are done" and not "the pool is idle" -- which is
+   * why this is a pool rather than one shared stream per thread. Pooled
+   * streams are never destroyed; they are process-lifetime objects.
+   */
+  static void *BorrowStream() {
+    const int dev = CurrentDevice();
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    auto &free_list = StreamPool()[dev];
+    if (!free_list.empty()) {
+      void *s = free_list.back();
+      free_list.pop_back();
+      return s;
+    }
+    // Exhausted. Do NOT create one here: creating a stream while a kernel is
+    // resident blocks for as long as that kernel runs, and the kernels this
+    // serves are demand-paged ones that spin until THIS I/O completes. Two
+    // shapes of that were measured and both deadlocked -- creating per cold
+    // task (hung at 128 blocks) and creating a batch under this mutex (hung at
+    // 96, because the holder blocked inside libcuda with everyone queued
+    // behind it). The caller yields and retries instead; a stream comes back
+    // as soon as any in-flight copy finishes.
+    if (!PoolWarmed()[dev]) {
+      // Never warmed (no GPU init in this process): bootstrap exactly one so
+      // an un-warmed process still makes progress.
+      PoolWarmed()[dev] = true;
+      return CreateStream();
+    }
+    return nullptr;
+  }
+
+  /**
+   * Pre-create the stream pool for the current device.
+   *
+   * MUST be called during initialization, before any long-running kernel can
+   * be resident -- that is the entire point. See BorrowStream.
+   */
+  static void WarmStreamPool(int count) {
+    const int dev = CurrentDevice();
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    auto &free_list = StreamPool()[dev];
+    for (int i = 0; i < count; ++i) {
+      free_list.push_back(CreateStream());
+    }
+    PoolWarmed()[dev] = true;
+  }
+
+  /** Give a borrowed stream back. The stream is NOT destroyed. */
+  static void ReturnStream(void *stream) {
+    if (stream == nullptr) return;
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    StreamPool()[CurrentDevice()].push_back(stream);
   }
 
   static void GetIpcMemHandle(GpuIpcMemHandle &ipc, void *data) {

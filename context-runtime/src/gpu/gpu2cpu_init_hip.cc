@@ -69,6 +69,17 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
 
     ctp::GpuApi::SetDevice(gpu_id);
 
+    // Pre-create the device-I/O stream pool HERE, while no user kernel can be
+    // resident. Creating a stream later, from the bdev's GPU read/write path,
+    // takes the CUDA context write lock and blocks until the device is free --
+    // and the kernels that path serves are demand-paged ones spinning until
+    // that very I/O completes, so the two deadlock. Measured with a paged GPU
+    // vector: every compute worker parked in pthread_rwlock_wrlock under
+    // cuStreamCreate/cuStreamDestroy and the runtime reported "ALL compute
+    // workers stalled". See ctp::GpuApi::BorrowStream.
+    constexpr int kIoStreamPoolSize = 64;
+    ctp::GpuApi::WarmStreamPool(kIoStreamPoolSize);
+
     dev.queue_backend = ctp::GpuApi::MallocHost<char>(kQueueBackendBytes);
     if (!dev.queue_backend) {
       HLOG(kError, "ServerInitGpuQueues: MallocHost for queue backend "

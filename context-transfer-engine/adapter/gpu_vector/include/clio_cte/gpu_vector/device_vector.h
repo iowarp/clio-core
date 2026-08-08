@@ -58,6 +58,31 @@ class DeviceVector {
    * so ids must be distinct in the fields that actually vary.
    */
   unsigned long long *task_seq_ = nullptr;
+  /**
+   * Optional instrumentation, null unless Vector::EnableStats() is called.
+   *
+   * Final values alone cannot tell a correct pager from a broken one: a cache
+   * that never evicts, one that re-faults every access, and one that honours
+   * scores all return the SAME bytes. These counters make the policy itself
+   * assertable -- a test can demand an exact number of faults for a known walk
+   * and so pin down hit/miss behaviour, writeback of dirty pages, and which
+   * page eviction actually chose.
+   */
+  /**
+   * One spin lock per block, guarding that block's page table.
+   *
+   * Without it the fault path is only safe when a single lane runs it. With
+   * all 32 lanes of a warp missing the same page, every lane independently
+   * found the same free slot, claimed it, and fired its own get into the same
+   * page's single task slot -- measured 7037 wrong elements out of 8192. The
+   * lock makes the first lane in do the fault while the rest wait and then
+   * find the page resident, which is the behaviour the "a warp sees one page"
+   * contract always implied but never enforced.
+   */
+  int *block_locks_ = nullptr;
+  unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
+  unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
+  unsigned long long *stat_evicts_ = nullptr;   // slots reclaimed
 
 #if CTP_IS_GPU_COMPILER
   // ---- device API -----------------------------------------------------
@@ -87,6 +112,13 @@ class DeviceVector {
    * whole and waited on, because its bytes are the only copy.
    */
   CTP_GPU_FUN void EvictPages(clio::run::u32 num_pages) {
+    LockBlock();
+    EvictLocked(num_pages);
+    UnlockBlock();
+  }
+
+  /** EvictPages' body, for callers that already hold the block lock. */
+  CTP_GPU_FUN void EvictLocked(clio::run::u32 num_pages) {
     Page *tbl = BlockPages();
     for (clio::run::u32 k = 0; k < num_pages; ++k) {
       clio::run::u32 victim = pages_per_block_;
@@ -111,6 +143,7 @@ class DeviceVector {
       p->page_num = kNoPage;
       p->dirty = 0u;
       p->flushing = 0u;
+      Bump(stat_evicts_);
     }
   }
 
@@ -120,17 +153,21 @@ class DeviceVector {
    * are now, and a later write re-dirties the page for the next flush.
    */
   CTP_GPU_FUN void BeginFlush(clio::run::u64 off, clio::run::u64 count) {
+    LockBlock();
     ForEachResident(off, count, [this](Page *p) {
       if (!p->dirty) return;
       SubmitPut(p);
     });
+    UnlockBlock();
   }
 
   /** Wait for the puts started by BeginFlush over the same range. */
   CTP_GPU_FUN void WaitFlush(clio::run::u64 off, clio::run::u64 count) {
+    LockBlock();
     ForEachResident(off, count, [this](Page *p) {
       if (p->flushing) AwaitPut(p);
     });
+    UnlockBlock();
   }
 
   /**
@@ -140,6 +177,13 @@ class DeviceVector {
    * which is what makes this usable as a prefetch hint.
    */
   CTP_GPU_FUN void RescorePage(clio::run::u64 page_id, float score) {
+    LockBlock();
+    RescoreLocked(page_id, score);
+    UnlockBlock();
+  }
+
+ private:
+  CTP_GPU_FUN void RescoreLocked(clio::run::u64 page_id, float score) {
     Page *p = Find(page_id);
     if (p != nullptr) {
       p->score = score;
@@ -165,6 +209,7 @@ class DeviceVector {
     (void) ipc_->Send(SlotPtr(slot->rescore));
   }
 
+ public:
   /** Number of elements in the vector. */
   CTP_GPU_FUN clio::run::u64 size() const { return size_; }
 
@@ -174,6 +219,37 @@ class DeviceVector {
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
   Page *last_page_ = nullptr;
+
+  /**
+   * Take this block's page-table lock.
+   *
+   * Safe to contend on from within a warp because independent thread
+   * scheduling (Volta and later, which the runtime already assumes -- see the
+   * __nanosleep in ipc_gpu2cpu_impl.h) lets the holder make progress while its
+   * warp-mates spin. The critical section can be long: it covers a page fault's
+   * whole round trip, which is exactly the point -- lanes that wanted the same
+   * page are held until it is resident, then find it with no fault of their own.
+   */
+  CTP_GPU_FUN void LockBlock() {
+    if (block_locks_ == nullptr) return;
+    int *lk = block_locks_ + (blockIdx.x % nblocks_);
+    while (atomicCAS(lk, 0, 1) != 0) {
+      __nanosleep(32);
+    }
+    __threadfence();
+  }
+
+  CTP_GPU_FUN void UnlockBlock() {
+    if (block_locks_ == nullptr) return;
+    // Publish every page-table write before the lock is observed free.
+    __threadfence();
+    atomicExch(block_locks_ + (blockIdx.x % nblocks_), 0);
+  }
+
+  /** Increment an instrumentation counter if the test enabled it. */
+  CTP_GPU_FUN void Bump(unsigned long long *c) const {
+    if (c != nullptr) atomicAdd(c, 1ull);
+  }
 
   CTP_GPU_FUN clio::run::u64 Now() const {
     return static_cast<clio::run::u64>(clock64());
@@ -269,6 +345,7 @@ class DeviceVector {
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = compress_lib_;
     ClearRunCtx(t);
+    Bump(stat_puts_);
     p->put_fut = ipc_->Send(SlotPtr(p->put));
     // Clean as of THIS put: the bytes it carries are what the page held
     // when it was submitted. A later write dirties it again for the next.
@@ -300,6 +377,7 @@ class DeviceVector {
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
     ClearRunCtx(t);
+    Bump(stat_faults_);
     auto fut = ipc_->Send(SlotPtr(p->get));
     fut.Wait();                           // page faults are synchronous
   }
@@ -315,6 +393,11 @@ class DeviceVector {
   CTP_GPU_FUN Page *Resolve(clio::run::u64 page_num) {
     Page *p = last_page_;
     if (p != nullptr && p->page_num == page_num) return p;
+    // Everything past the per-thread fast path touches the shared page table
+    // (residency search, slot claim, eviction, the fault itself), so it is all
+    // under the block's lock. Without it, concurrent lanes claim the same free
+    // slot and submit competing gets into one task slot.
+    LockBlock();
     // Recency is stamped HERE, on a page transition, not per element access.
     // Doing it in operator[]/at() cost a clock64() and a global write on every
     // element: a single-threaded pass over a 64 KiB page spent milliseconds in
@@ -340,10 +423,11 @@ class DeviceVector {
           SubmitGet(p, page_num);
           break;
         }
-        EvictPages(1);
+        EvictLocked(1);   // already holding the lock
       }
     }
     if (p != nullptr) p->last_access = Now();
+    UnlockBlock();
     last_page_ = p;
     return p;
   }
