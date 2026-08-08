@@ -35,7 +35,7 @@ namespace clio::run {
 // We previously launched a single-thread kernel to construct the
 // BuddyAllocator + GpuTaskQueue in device memory, but the kernel had no
 // host/device asymmetry that required device-side construction (the
-// queue_backend is pinned host memory mapped 1:1 into device address
+// queue_backend is MANAGED memory, addressable 1:1 from host and device
 // space) and the cross-shared-library kernel registration was unreliable
 // under HIP-NVCC ("cudaErrorInvalidDeviceFunction" on launch).
 
@@ -80,9 +80,20 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     constexpr int kIoStreamPoolSize = 64;
     ctp::GpuApi::WarmStreamPool(kIoStreamPoolSize);
 
-    dev.queue_backend = ctp::GpuApi::MallocHost<char>(kQueueBackendBytes);
+    // MANAGED, not pinned host memory. The device pushes to this queue with a
+    // SYSTEM-SCOPED atomic (the ring head), and this GPU reports
+    // cudaDevAttrHostNativeAtomicSupported = 0 -- it cannot perform atomics on
+    // host memory at all, so that atomic was invalid on every single device
+    // task submission: every page fault, every flush, every prefetch.
+    // compute-sanitizer flagged it in EVERY gpu_vector binary, including tests
+    // that pass, which were relying on undefined behaviour that usually
+    // happened to work. No cudaHostAlloc flag can fix that; the memory simply
+    // must not be host memory. Managed memory does support system-wide atomics
+    // here (cudaDevAttrConcurrentManagedAccess = 1) and keeps the single
+    // address space the queue's construction relies on.
+    dev.queue_backend = ctp::GpuApi::MallocManaged<char>(kQueueBackendBytes);
     if (!dev.queue_backend) {
-      HLOG(kError, "ServerInitGpuQueues: MallocHost for queue backend "
+      HLOG(kError, "ServerInitGpuQueues: MallocManaged for queue backend "
            "failed (gpu_id={})", gpu_id);
       FinalizeGpuQueues();
       return false;
@@ -90,7 +101,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
 
-    // Host-side construction. queue_backend is pinned host memory mapped
+    // Host-side construction. queue_backend is managed memory mapped
     // into device address space at the same virtual address, so the
     // BuddyAllocator's internal offset-based bookkeeping is safe to set
     // up from the host. We previously constructed inside a single-thread
@@ -137,7 +148,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
 void gpu::IpcManager::FinalizeGpuQueues() {
   for (auto &dev : per_gpu_devices_) {
     if (dev.queue_backend) {
-      ctp::GpuApi::FreeHost(dev.queue_backend);
+      ctp::GpuApi::Free(dev.queue_backend);
       dev.queue_backend = nullptr;
     }
     dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();

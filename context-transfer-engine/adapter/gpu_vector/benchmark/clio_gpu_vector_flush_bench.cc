@@ -122,6 +122,9 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
         // the granularity the vector's paging contract assumes.
         for (u64 pg = 0; pg < pages_per_region; ++pg) {
           const u64 poff = off + pg * v.elems_per_page_;
+          // Required: operator[] indexes the HELD page and does no resolution,
+          // so without this last_page_ is null and the write dereferences it.
+          v.HoldPage(poff, v.elems_per_page_);
           for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
             v[poff + i] = Val(poff + i, pass);
           }
