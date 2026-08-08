@@ -585,6 +585,11 @@ class DeviceVector {
       if (free_slot == pages_per_block_) return false;
     }
     Page *p = &tbl[free_slot];
+    // Same ordering as the synchronous claim: busy first, then the page
+    // number. Reversed, HoldPage's lock-free scan can see a slot that looks
+    // resident while its transfer is still in flight.
+    p->fetching = 1u;
+    __threadfence_block();
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -598,8 +603,8 @@ class DeviceVector {
     PrepareGet(p, page_num);
     Bump(stat_faults_);
     Bump(stat_prefetches_);
+    p->fetching = 1u;                     // already set by the claim; keep it
     p->get_fut = ipc_->Send(SlotPtr(p->get));
-    p->fetching = 1u;
   }
 
   /** Wait for an in-flight asynchronous get on `p`. */
@@ -633,8 +638,15 @@ class DeviceVector {
   CTP_GPU_FUN void SubmitGet(Page *p, clio::run::u64 page_num) {
     PrepareGet(p, page_num);
     Bump(stat_faults_);
-    auto fut = ipc_->Send(SlotPtr(p->get));
-    fut.Wait();                           // demand faults block by definition
+    // Store the future in the PAGE, not a local. The claim path publishes
+    // fetching=1 before this runs, so another thread can reach AwaitFetch for
+    // this page -- and AwaitFetch waits on p->get_fut. With a local future
+    // that field held a stale/empty value, the wait returned immediately and
+    // the caller read a page whose bytes had not arrived. That is why the
+    // demand-faulting read path returned a wrong checksum while the
+    // prefetching path (which does set p->get_fut) returned the right one.
+    p->get_fut = ipc_->Send(SlotPtr(p->get));
+    p->get_fut.Wait();                    // demand faults block by definition
     p->fetching = 0u;
   }
 
