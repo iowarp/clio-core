@@ -137,15 +137,19 @@ add_custom_command(TARGET test_transparent_compress POST_BUILD
     ${CMAKE_CURRENT_BINARY_DIR}/test_transparent_compress_config.yaml
 )
 
-add_test(NAME compressor_transparent_putblob
-    COMMAND test_transparent_compress "Transparent PutBlob")
-
-add_test(NAME compressor_transparent_getblob
-    COMMAND test_transparent_compress "Transparent GetBlob")
+# ONE test, running both cases in a single process.
+#
+# They were two ctest entries invoking this same binary with different name
+# filters, i.e. two separate PROCESSES. The GetBlob case reads the blob "we
+# created in the previous test", but that blob lives in the runtime the
+# PutBlob process started and took with it, so GetBlob could only ever fail
+# with a non-zero return code. Running the binary unfiltered executes both
+# cases in order against one runtime, which is what the test was written for.
+add_test(NAME compressor_transparent
+    COMMAND test_transparent_compress)
 
 set_tests_properties(
-    compressor_transparent_putblob
-    compressor_transparent_getblob
+    compressor_transparent
     PROPERTIES
         TIMEOUT 120
         LABELS "compressor;transparent;integration;msan_skip"
