@@ -248,18 +248,33 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
   const u32 first = std::min<u32>(static_cast<u32>(n),
                                   clio::run::kGpuRingCapacity - begin);
   const u32 second = static_cast<u32>(n) - first;
+  // ORDER MATTERS: sample the READY STAMPS FIRST, then the entries.
+  //
+  // The stamp is what certifies an entry, so it must be read BEFORE the data
+  // it certifies. Copying entries first admits a torn read: entry[i] is
+  // sampled while the producer has only claimed the slot (garbage), the
+  // producer then writes the entry and publishes its stamp, and the later
+  // stamp copy reports "ready" for bytes we already captured as garbage. The
+  // CPU then accepts a zeroed entry -- observed at 64 blocks as
+  // "null task off_ in queue entry" and "task_size_=0". Reading the stamp
+  // first inverts the race into a safe one: a stamp seen as ready means the
+  // entry was written strictly earlier, so the entry copy that follows cannot
+  // miss it. A stamp not yet ready simply defers that entry to the next poll.
+  cudaMemcpyAsync(rdy, &m.dev_ring->ready_[begin],
+                  first * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+  if (second) {
+    cudaMemcpyAsync(rdy + first, &m.dev_ring->ready_[0],
+                    second * sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                    stream);
+  }
+  cudaStreamSynchronize(stream);
   cudaMemcpyAsync(ents, &m.dev_ring->entries_[begin],
                   first * sizeof(clio::run::GpuRingEntry),
                   cudaMemcpyDeviceToHost, stream);
-  cudaMemcpyAsync(rdy, &m.dev_ring->ready_[begin],
-                  first * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
   if (second) {
     cudaMemcpyAsync(ents + first, &m.dev_ring->entries_[0],
                     second * sizeof(clio::run::GpuRingEntry),
                     cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(rdy + first, &m.dev_ring->ready_[0],
-                    second * sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                    stream);
   }
   cudaStreamSynchronize(stream);
 

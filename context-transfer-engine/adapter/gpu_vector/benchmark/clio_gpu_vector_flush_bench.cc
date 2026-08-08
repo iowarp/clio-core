@@ -268,6 +268,11 @@ double NowMs() {
 
 int main(int argc, char **argv) {
   Args a;
+  // GV_TIER_TYPE=ram|pinned. Pageable ("ram") makes cudaMemcpyAsync
+  // host-synchronous and forces the driver to stage every device transfer
+  // through an internal pinned buffer -- a D2H followed by an H2H.
+  const char *tier_type_env = getenv("GV_TIER_TYPE");
+  const std::string tier_type = tier_type_env ? tier_type_env : "ram";
   // Worker doze experiment: sequential single-block ops measured ~30ms each
   // while flooded ops cost ~35us. If that gap is workers sleeping between
   // ops, making them busy-wait the whole run should erase it.
@@ -334,7 +339,8 @@ int main(int argc, char **argv) {
         << "    pool_id: \"512.0\"\n"
         << "    storage:\n"
         << "      - path: \"ram::gv_flush_tier\"\n"
-        << "        bdev_type: \"ram\"\n        capacity_limit: \"12GB\"\n"
+        << "        bdev_type: \"" << tier_type << "\"\n"
+        << "        capacity_limit: \"12GB\"\n"
         << "        score: 1.0\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
