@@ -441,9 +441,24 @@ const std::vector<GpuTaskLane *> &Worker::GetGpuLanes() const {
 }
 
 u32 Worker::ProcessNewTasksGpu() {
+  // Drain a BATCH per poll, not one task.
+  //
+  // ONE lane serves every block on the GPU, so popping a single task per
+  // polling iteration rate-limits every device fault to the worker loop's
+  // cadence -- measured with a demand-paged vector, a page fault cost ~4.8ms
+  // and the cost was identical whether the page came from GPU memory or host
+  // RAM, because the queue wait dwarfed the transfer. The CPU lane path
+  // already drains up to 16 per iteration (ProcessNewTasks); this brings the
+  // GPU path in line.
+  //
+  // Bounded so one busy lane cannot starve the worker's other duties.
+  static constexpr u32 kMaxGpuTasksPerIteration = 16;
   u32 total = 0;
   for (auto *gpu_lane : gpu_lanes_) {
-    if (ProcessNewTaskGpu(gpu_lane)) {
+    for (u32 i = 0; i < kMaxGpuTasksPerIteration; ++i) {
+      if (!ProcessNewTaskGpu(gpu_lane)) {
+        break;   // lane empty
+      }
       ++total;
     }
   }

@@ -72,14 +72,12 @@ class DeviceVector {
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
     Page *p = Resolve(off / elems_per_page_);
     p->dirty = 1u;
-    p->last_access = Now();
     return static_cast<T *>(p->data)[off - p->page_num * elems_per_page_];
   }
 
   /** Read-only access: does NOT dirty the page. */
   CTP_GPU_FUN const T &at(clio::run::u64 off) {
     Page *p = Resolve(off / elems_per_page_);
-    p->last_access = Now();
     return static_cast<const T *>(p->data)[off - p->page_num * elems_per_page_];
   }
 
@@ -317,6 +315,11 @@ class DeviceVector {
   CTP_GPU_FUN Page *Resolve(clio::run::u64 page_num) {
     Page *p = last_page_;
     if (p != nullptr && p->page_num == page_num) return p;
+    // Recency is stamped HERE, on a page transition, not per element access.
+    // Doing it in operator[]/at() cost a clock64() and a global write on every
+    // element: a single-threaded pass over a 64 KiB page spent milliseconds in
+    // bookkeeping, which swamped the fault path and made storage tier and
+    // codec differences unmeasurable. LRU only needs page granularity anyway.
     p = Find(page_num);
     if (p == nullptr) {
       Page *tbl = BlockPages();
@@ -340,6 +343,7 @@ class DeviceVector {
         EvictPages(1);
       }
     }
+    if (p != nullptr) p->last_access = Now();
     last_page_ = p;
     return p;
   }

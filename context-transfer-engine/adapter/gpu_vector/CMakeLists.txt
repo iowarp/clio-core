@@ -17,6 +17,8 @@ target_link_libraries(clio_cte_gpu_vector INTERFACE
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
         DESTINATION include)
 
+add_subdirectory(benchmark)
+
 if(CLIO_CORE_ENABLE_TESTS)
     add_subdirectory(test)
 endif()
