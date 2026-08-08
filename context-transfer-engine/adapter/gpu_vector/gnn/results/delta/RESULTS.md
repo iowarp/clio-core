@@ -112,7 +112,13 @@ Same dataset, same seed, same 30 epochs.
 | epoch 29 loss | 4.552200 | 4.552200 |
 | final train / val acc | 6.26% / 6.23% | 6.26% / 6.23% |
 
-Max per-epoch loss divergence over all 30 epochs: **1.0e-06**.
+Max per-epoch loss divergence over all 30 epochs: **1.0e-06** (full-batch).
+
+Under **mini-batch** the same comparison gives **3.0e-04** at epoch 0, falling to
+2.9e-05 by epoch 2 — roughly 300x larger than full-batch, because the lossy error
+now perturbs each of ~847 updates per epoch instead of a single one. Still
+negligible (final accuracy 0.4979/0.4992 cuSZp vs 0.4978/0.4992 zstd at 3 epochs),
+but **quote ~3e-04 for mini-batch, not 1e-06**.
 
 > These codec runs used **full-batch GD**, which is why their accuracy sits at the
 > 6.26% majority-class floor — see section 1. That is a property of the update rule,
@@ -231,7 +237,8 @@ now samples `cudaMemGetInfo` every window and reports
 |---|---|---|---|---|
 | ogbn-arxiv | 131,072 | 64 MiB | **822 MiB** | 128 MiB |
 | ogbn-products | 2,490,368 | 950 MiB | **1,652 MiB** | 100 MiB |
-| **ogbn-papers100M** | 111,017,984 | **0 (OOMs)** | **~1,660 MiB (est.)** | 64 MiB |
+| **ogbn-papers100M** (zstd) | 111,017,984 | **0 (OOMs)** | **1,734 MiB** (measured) | 64 MiB |
+| **ogbn-papers100M** (cuSZp) | 111,017,984 | **0 (OOMs)** | **2,858 MiB** (measured) | 64 MiB |
 
 Decomposing the two measured points (peak = in-core A + labels + window buffers +
 CUDA context) gives, for papers100M: labels 847 MiB (N x 8 B) + window buffers
@@ -244,10 +251,16 @@ allocation, because in-core OOMs and never allocates. Total **~1.6 GiB**, i.e. t
 (64 MiB).** The window is bounded and independent of N; the labels are O(N) and are
 not. That is a real limit of the current design and should be stated as such.
 
-> The papers100M row is **extrapolated from two measured points, not measured
-> directly** — the papers100M dataset lives on node-local scratch that is destroyed
-> when the allocation ends, and re-prep costs ~45 min. arxiv and products are
-> direct measurements.
+**The papers100M rows are now measured directly** (job 20936257). The earlier
+extrapolation predicted ~1,660 MiB; the measured zstd figure is 1,734 MiB, a 4%
+error — but it missed cuSZp entirely. **The GPU codec costs 1.1 GiB more than the
+CPU codec** (2,858 vs 1,734 MiB) because cuSZp decompresses on-device and needs
+its own working buffers, which zstd does not. Quote **1.7 GiB for lossless and
+2.8 GiB for lossy** — there is no single peak-GPU number for the system.
+
+So the 52.9 GiB matrix trains in **~1.7 GiB (zstd, ~31x)** or **~2.8 GiB (cuSZp,
+~19x)**. The lossy codec buys 3.126x on *stored* size at the cost of ~1.1 GiB more
+*resident* GPU — a tradeoff worth stating explicitly.
 
 ---
 
