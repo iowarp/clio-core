@@ -41,6 +41,9 @@
 #define H5FDclio_H
 
 #include <hdf5.h>
+/* Declares H5PLget_plugin_type/H5PLget_plugin_info with H5PLUGIN_DLL, which is
+ * the export attribute HDF5's plugin loader requires on Windows. */
+#include <H5PLextern.h>
 
 #define H5FD_CLIO_NAME  "clio_vfd"
 #define H5FD_CLIO_VALUE ((H5FD_class_value_t)(3200))
@@ -67,8 +70,11 @@ herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled);
  * what an open through this FAPL would actually do. */
 herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/);
 
-H5PL_type_t H5PLget_plugin_type(void);
-const void* H5PLget_plugin_info(void);
+/* H5PLget_plugin_type/H5PLget_plugin_info are declared by <H5PLextern.h>
+ * (included above) with H5PLUGIN_DLL. Re-declaring them bare here made the
+ * two declarations disagree about linkage, which MSVC rejects outright
+ * (C2375) -- and an entry point without the export attribute is one HDF5's
+ * plugin loader cannot find on Windows. */
 
 #ifdef __cplusplus
 }

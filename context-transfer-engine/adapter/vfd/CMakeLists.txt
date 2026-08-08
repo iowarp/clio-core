@@ -14,8 +14,15 @@ endif()
 message(STATUS "VFD: building against HDF5 ${HDF5_VERSION} (${HDF5_INCLUDE_DIRS})")
 
 # Dynamically loaded VFDs must be shared libraries.
-add_library(clio_vfd SHARED
-  ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio.cc)
+set(CLIO_VFD_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio.cc)
+if(WIN32)
+  # Win32 half of the platform layer. A separate translation unit so that
+  # <windows.h> -- and the macros it defines over ordinary identifiers like
+  # Yield() -- never reaches the driver body or clio's headers.
+  list(APPEND CLIO_VFD_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio_compat_win.cc)
+endif()
+
+add_library(clio_vfd SHARED ${CLIO_VFD_SOURCES})
 set_target_properties(clio_vfd PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
