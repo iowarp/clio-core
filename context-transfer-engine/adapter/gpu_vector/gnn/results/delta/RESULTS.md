@@ -220,6 +220,37 @@ unmeasured — no profiling was done.
 
 ---
 
+## 4c. Peak GPU — measured, not just the feature window
+
+The tests report a *feature window* (64 MiB), which is the bounded streaming
+buffer. That is **not** the process's GPU footprint. `test_gpu_vector_gnn_train`
+now samples `cudaMemGetInfo` every window and reports
+`free_at_start - free_now`, i.e. everything this process holds on the device.
+
+| dataset | N (tiled) | in-core A resident | **PEAK GPU** | feature window |
+|---|---|---|---|---|
+| ogbn-arxiv | 131,072 | 64 MiB | **822 MiB** | 128 MiB |
+| ogbn-products | 2,490,368 | 950 MiB | **1,652 MiB** | 100 MiB |
+| **ogbn-papers100M** | 111,017,984 | **0 (OOMs)** | **~1,660 MiB (est.)** | 64 MiB |
+
+Decomposing the two measured points (peak = in-core A + labels + window buffers +
+CUDA context) gives, for papers100M: labels 847 MiB (N x 8 B) + window buffers
+215 MiB (C=172 inflates `dz2_buf`) + CUDA context ~600 MiB + CTE HBM tier 0 (it
+spills to DRAM — every capacity run logged `split HBM=0MiB`) + **no** in-core
+allocation, because in-core OOMs and never allocates. Total **~1.6 GiB**, i.e. the
+52.9 GiB matrix trains in ~1.6 GiB of GPU — a **~33x** reduction.
+
+**The peak is dominated by the labels (847 MiB), not by the feature window
+(64 MiB).** The window is bounded and independent of N; the labels are O(N) and are
+not. That is a real limit of the current design and should be stated as such.
+
+> The papers100M row is **extrapolated from two measured points, not measured
+> directly** — the papers100M dataset lives on node-local scratch that is destroyed
+> when the allocation ends, and re-prep costs ~45 min. arxiv and products are
+> direct measurements.
+
+---
+
 ## 5. Feature-cache prediction (task e) — reverse-PageRank on the real graph
 
 `N=111,059,956`, directed `E=1,615,685,872`, `avg_out=avg_in=14.55`. Forward PR
