@@ -225,6 +225,22 @@ private:
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
 
   /**
+   * POD variants, used by DEVICE producers such as gpu_vector.
+   *
+   * Without these the interposer's default case forwards a Pod task straight
+   * to the next pool, so pages written from a kernel are stored UNCOMPRESSED
+   * while everything reports success -- compression silently does nothing for
+   * the one producer that most needs it.
+   *
+   * Their blob_data_ usually points at DEVICE memory, so every access goes
+   * through ctp::DeviceAwareMemcpy rather than a plain memcpy.
+   */
+  clio::run::TaskResume CompressPodPutBlob(
+      clio::run::shared_ptr<clio::cte::core::PodPutBlobTask> &task);
+  clio::run::TaskResume DecompressPodGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task);
+
+  /**
    * Schedule a task by resolving Dynamic pool queries.
    */
   clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;

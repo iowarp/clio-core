@@ -52,8 +52,14 @@ class Vector {
    */
   Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
-         clio::run::u32 pages_per_block, clio::run::u64 num_elems)
-      : page_bytes_(page_bytes),
+         clio::run::u32 pages_per_block, clio::run::u64 num_elems,
+         clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
+         int compress_lib = 0)
+      : storage_pool_id_(storage_pool_id.IsNull()
+                             ? clio::cte::core::kCtePoolId
+                             : storage_pool_id),
+        compress_lib_(compress_lib),
+        page_bytes_(page_bytes),
         nblocks_(nblocks),
         pages_per_block_(pages_per_block),
         num_elems_(num_elems) {
@@ -225,7 +231,8 @@ class Vector {
     v.page_bytes_ = page_bytes_;
     v.elems_per_page_ = page_bytes_ / sizeof(T);
     v.size_ = num_elems_;
-    v.pool_id_ = clio::cte::core::kCtePoolId;
+    v.pool_id_ = storage_pool_id_;
+    v.compress_lib_ = compress_lib_;
     v.task_alloc_id_ = st.tasks_alloc;
     st.view = v;
     devs_[gpu_id] = st;
@@ -259,6 +266,11 @@ class Vector {
     st.tasks_base = nullptr;
   }
 
+  /** Where page tasks are addressed. Point this at a COMPRESSOR pool to have
+   *  pages stored compressed; it interposes and forwards to the core. */
+  clio::run::PoolId storage_pool_id_;
+  /** Codec wire id stamped on page puts; 0 stores raw. */
+  int compress_lib_ = 0;
   clio::cte::core::TagId tag_id_;
   clio::run::u64 page_bytes_;
   clio::run::u32 nblocks_;

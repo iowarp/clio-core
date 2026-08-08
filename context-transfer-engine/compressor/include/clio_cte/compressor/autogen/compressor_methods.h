@@ -29,6 +29,13 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize =
     clio::cte::core::Method::kGetBlobSize;
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
+// POD variants, used by device producers (gpu_vector). Without these the
+// interposer's default case forwards them straight through and the data is
+// stored UNCOMPRESSED with no indication that compression was skipped.
+GLOBAL_CROSS_CONST clio::run::u32 kPodPutBlob =
+    clio::cte::core::Method::kPodPutBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kPodGetBlob =
+    clio::cte::core::Method::kPodGetBlob;
 
 // compressor-specific methods, numbered ABOVE the core's method-id space —
 // a collision would shadow a forwarded core verb (they previously sat on
@@ -51,6 +58,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kGetBlob] = "GetBlob";
     v[kGetBlobSize] = "GetBlobSize";
     v[kMultiPutBlob] = "MultiPutBlob";
+    v[kPodPutBlob] = "PodPutBlob";
+    v[kPodGetBlob] = "PodGetBlob";
     v[100] = "DynamicSchedule";
     v[101] = "Compress";
     v[102] = "Decompress";

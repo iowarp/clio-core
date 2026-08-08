@@ -46,6 +46,9 @@ class DeviceVector {
   clio::run::PoolId pool_id_;
   /** Allocator of the backend holding the task slots. */
   ctp::ipc::AllocatorId task_alloc_id_;
+  /** Codec wire id stamped on page PUTs. 0 stores raw. The compressor pool
+   *  reads this from the task context to decide whether to compress. */
+  int compress_lib_ = 0;
   /**
    * Device-global counter handing out strictly increasing task ids.
    *
@@ -265,6 +268,8 @@ class DeviceVector {
     t->blob_data_ = RawPtr(p->data);
     t->score_ = p->score;
     t->flags_ = 0;
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
     ClearRunCtx(t);
     p->put_fut = ipc_->Send(SlotPtr(p->put));
     // Clean as of THIS put: the bytes it carries are what the page held

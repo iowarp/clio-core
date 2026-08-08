@@ -1359,6 +1359,163 @@ clio::run::TaskResume Runtime::PutBlob(
   CLIO_TASK_BODY_END
 }
 
+/**
+ * POD PutBlob from a device producer (gpu_vector page flush).
+ *
+ * Same contract as PutBlob: whole-blob writes with a codec requested get
+ * compressed, everything else forwards untouched. The difference is that
+ * blob_data_ points at DEVICE memory, so the payload is staged to host before
+ * the codec sees it -- a codec cannot read a device pointer.
+ *
+ * Without this handler the interposer's default case forwarded these straight
+ * through, so pages written from a kernel were stored UNCOMPRESSED while
+ * every layer reported success.
+ */
+clio::run::TaskResume Runtime::CompressPodPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PodPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::cte::core::Context &ctx = task->context_;
+    if (ctx.compress_lib_ <= 0 || ctx.replica_ != 0 || task->offset_ != 0 ||
+        task->size_ == 0) {
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    auto src_full =
+        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    if (src_full.ptr_ == nullptr) {
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    // Stage device -> host. DeviceAwareMemcpy resolves the pointer kind, so
+    // this is also correct when the producer handed us host memory.
+    std::vector<char> host(static_cast<size_t>(task->size_));
+    ctp::DeviceAwareMemcpy(host.data(), src_full.ptr_,
+                           static_cast<size_t>(task->size_));
+
+    ctp::ipc::FullPtr<char> stored;
+    clio::run::u64 stored_size = 0;
+    if (!CompressIntoShm(ctx, host.data(), task->size_, &stored,
+                         &stored_size)) {
+      // Not worth compressing (or the codec failed): store the raw bytes and
+      // record NO codec, so a reader never tries to decompress them.
+      ctx.compress_lib_ = 0;
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    if (!core_client_) {
+      core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+    }
+    auto put = core_client_->AsyncPutBlob(
+        task->tag_id_, task->blob_name_.str(), 0, stored_size,
+        stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
+        clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(put);
+    task->context_ = put->context_;
+    task->return_code_ = put->GetReturnCode();
+    CLIO_IPC->FreeBuffer(stored);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+/**
+ * POD GetBlob for a device consumer (gpu_vector page fault).
+ *
+ * Reads the STORED bytes, decompresses when they carry our header, and lands
+ * the result in the caller's DEVICE buffer. The stored form is detected from
+ * the header magic rather than from the request, so a blob written raw
+ * (because compression was not worth it) reads back correctly through the
+ * same path.
+ */
+clio::run::TaskResume Runtime::DecompressPodGetBlob(
+    clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    if (!core_client_) {
+      core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+    }
+    clio::run::u64 stored_size = 0;
+    {
+      auto sz = core_client_->AsyncGetBlobSize(task->tag_id_,
+                                               task->blob_name_.str());
+      CLIO_CO_AWAIT(sz);
+      if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
+        task->return_code_ = sz->GetReturnCode() != 0 ? sz->GetReturnCode() : 1;
+        CLIO_CO_RETURN;
+      }
+      stored_size = sz->size_;
+    }
+    auto buf = CLIO_IPC->AllocateBuffer(stored_size);
+    if (buf.IsNull()) {
+      task->return_code_ = 4;
+      CLIO_CO_RETURN;
+    }
+    {
+      auto get = core_client_->AsyncGetBlob(
+          task->tag_id_, task->blob_name_.str(), 0, stored_size, 0,
+          buf.shm_.template Cast<void>(), clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(get);
+      if (get->GetReturnCode() != 0) {
+        task->return_code_ = get->GetReturnCode();
+        CLIO_IPC->FreeBuffer(buf);
+        CLIO_CO_RETURN;
+      }
+    }
+    auto dst_full =
+        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    if (dst_full.ptr_ == nullptr) {
+      task->return_code_ = 1;
+      CLIO_IPC->FreeBuffer(buf);
+      CLIO_CO_RETURN;
+    }
+
+    const size_t hdr = sizeof(CompressionHeader);
+    auto *header = reinterpret_cast<CompressionHeader *>(buf.ptr_);
+    if (stored_size > hdr && header->IsValid()) {
+      std::string library_name =
+          ctp::CompressionFactory::NameForWireId(header->compress_lib_);
+      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+      if (header->compress_preset_ == 1) {
+        preset = ctp::CompressionPreset::FAST;
+      } else if (header->compress_preset_ == 3) {
+        preset = ctp::CompressionPreset::BEST;
+      }
+      auto codec = ctp::CompressionFactory::GetPreset(library_name, preset);
+      if (!codec) {
+        task->return_code_ = 3;
+        CLIO_IPC->FreeBuffer(buf);
+        CLIO_CO_RETURN;
+      }
+      // Exact payload length -- see CompressionHeader::compressed_size_.
+      size_t payload = (header->compressed_size_ != 0)
+                           ? static_cast<size_t>(header->compressed_size_)
+                           : (stored_size - hdr);
+      std::vector<char> plain(static_cast<size_t>(header->original_size_));
+      size_t out = plain.size();
+      if (!codec->Decompress(plain.data(), out, buf.ptr_ + hdr, payload) ||
+          out != plain.size()) {
+        task->return_code_ = 5;
+        CLIO_IPC->FreeBuffer(buf);
+        CLIO_CO_RETURN;
+      }
+      const size_t n = std::min<size_t>(task->size_, plain.size());
+      ctp::DeviceAwareMemcpy(dst_full.ptr_, plain.data(), n);
+    } else {
+      // Stored raw: hand the bytes back untouched.
+      const size_t n = std::min<size_t>(task->size_, stored_size);
+      ctp::DeviceAwareMemcpy(dst_full.ptr_, buf.ptr_, n);
+    }
+    CLIO_IPC->FreeBuffer(buf);
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetBlob(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
