@@ -93,6 +93,9 @@ class DeviceVector {
   /** Faults whose prefetch was issued but had NOT landed yet. */
   unsigned long long *stat_prefetch_late_ = nullptr;
   unsigned long long *stat_rescores_ = nullptr;      // reorganize hints sent
+  /** Gets that came back with a NON-ZERO return code. SubmitGet never checked
+   *  this, so a failed read silently left the slot's previous page in place. */
+  unsigned long long *stat_get_errors_ = nullptr;
 
 #if CTP_IS_GPU_COMPILER
   // ---- device API -----------------------------------------------------
@@ -611,6 +614,7 @@ class DeviceVector {
   CTP_GPU_FUN void AwaitFetch(Page *p) {
     if (!p->fetching) return;
     p->get_fut.Wait();
+    if (p->get->GetReturnCode() != 0) Bump(stat_get_errors_);
     p->fetching = 0u;
   }
 
@@ -647,6 +651,9 @@ class DeviceVector {
     // prefetching path (which does set p->get_fut) returned the right one.
     p->get_fut = ipc_->Send(SlotPtr(p->get));
     p->get_fut.Wait();                    // demand faults block by definition
+    // CHECK IT. A failed get leaves this slot holding the page it held before,
+    // and the caller reads that as if it were the page it asked for.
+    if (p->get->GetReturnCode() != 0) Bump(stat_get_errors_);
     p->fetching = 0u;
   }
 

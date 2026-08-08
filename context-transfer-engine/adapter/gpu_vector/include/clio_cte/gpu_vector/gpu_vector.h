@@ -124,8 +124,9 @@ class Vector {
     clio::run::u64 prefetch_hits = 0;   // arrivals found already in flight
     clio::run::u64 rescores = 0;        // placement hints sent
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
+    clio::run::u64 get_errors = 0;      // gets that returned non-zero
   };
-  static constexpr int kNumStats = 7;
+  static constexpr int kNumStats = 8;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -154,6 +155,7 @@ class Vector {
       kv.second.view.stat_prefetch_hits_ = c + 4;
       kv.second.view.stat_rescores_ = c + 5;
       kv.second.view.stat_prefetch_late_ = c + 6;
+      kv.second.view.stat_get_errors_ = c + 7;
     }
 #endif
   }
@@ -182,6 +184,7 @@ class Vector {
     s.prefetch_hits = h[4];
     s.rescores = h[5];
     s.prefetch_late = h[6];
+    s.get_errors = h[7];
 #else
     (void) dev_id;
 #endif
