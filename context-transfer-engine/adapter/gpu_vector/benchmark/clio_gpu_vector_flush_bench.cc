@@ -379,6 +379,33 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // GV_PROBE_GET: time HOST-side GetBlob directly -- no GPU queue, no page
+  // table, no kernel. Separates "GetBlob is slow" from "the GPU round trip or
+  // the vector's per-fault table scans are slow".
+  if (getenv("GV_PROBE_GET")) {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    std::vector<char> buf(page_bytes);
+    auto probe = [&](const char *name, int n) {
+      double best = 1e30, sum = 0;
+      for (int i = 0; i < n; ++i) {
+        const double t0 = NowMs();
+        auto f = core.AsyncGetBlob(vec.TagId(), std::string(name), 0,
+                                   page_bytes, 0, buf.data());
+        f.Wait();
+        (void) f->GetReturnCode();
+        const double ms = NowMs() - t0;
+        sum += ms;
+        if (ms < best) best = ms;
+      }
+      std::printf("  host GetBlob %-12s x%d: avg %8.1f us  best %8.1f us\n",
+                  name, n, sum * 1000.0 / n, best * 1000.0);
+    };
+    probe("p0", 100);            // exists (warm flushed it)
+    probe("nonexistent", 100);   // missing
+    clio::run::CLIO_RUNTIME_FINALIZE();
+    return 0;
+  }
+
   // ---------------- read + prefetch mode -----------------------------
   if (a.read) {
     unsigned long long *d_sum = nullptr;
