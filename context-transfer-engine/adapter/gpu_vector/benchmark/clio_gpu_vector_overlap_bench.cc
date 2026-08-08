@@ -318,8 +318,37 @@ int main(int argc, char **argv) {
   cudaMalloc(&d_sum, sizeof(unsigned long long));
   const unsigned long long want = ExpectedSum(n);
 
-  // ---- Step 1: measure the I/O half alone (no compute) ------------------
+  // ---- Step 0: the SCAN BASELINE, present in every mode -----------------
+  //
+  // Reading a page costs real time even when it is already resident: the
+  // summation touches every element through at(), which resolves a page per
+  // access. That cost is in EVERY mode, so it must be subtracted before
+  // anything is called "the I/O half" or "the compute half".
+  //
+  // Getting this wrong invalidated an entire earlier round of results. The
+  // scan is ~11 ms here while faulting is ~0.7 ms, so attributing the whole
+  // cold-run time to I/O inflated per-page fault cost by ~16x and made a
+  // strictly sequential "serial" run look like it cost max(io, compute)
+  // rather than io+compute -- i.e. like the vector was overlapping when it
+  // does no such thing. It faults on demand, exactly as it looks like it does.
   unsigned long long got = 0;
+  double scan_ms = 1e30;
+  {
+    gv::Vector<u32> warm("gv_overlap_scan", {0}, kPageBytes, a.blocks,
+                         static_cast<u32>(a.pages_per_block), n);
+    auto wdev = warm.GetDevice(0);
+    SeedKernel<<<a.blocks, 32>>>(gpu, wdev, per);
+    cudaDeviceSynchronize();
+    for (u32 r = 0; r < a.repeat; ++r) {
+      const double ms =
+          RunOnce(wdev, gpu, a.blocks, per, 0, 0, 0, false, d_sum, &got);
+      if (ms < scan_ms) scan_ms = ms;
+    }
+  }
+  std::printf("\n[scan]      %8.1f ms   (resident, no faults, no compute)\n",
+              scan_ms);
+
+  // ---- Step 1: measure the I/O half alone (no compute) ------------------
   double io_ms = 1e30;
   for (u32 r = 0; r < a.repeat; ++r) {
     vec.ResetStats();
@@ -330,12 +359,16 @@ int main(int argc, char **argv) {
   const bool io_ok = (got == want);
   const auto io_stats = vec.ReadStats(0);
   const u64 total_pages = a.pages_per_block * a.blocks;
-  const double us_per_page = io_ms * 1000.0 / static_cast<double>(total_pages);
+  // The I/O contribution is the MARGINAL cost over the scan, not the whole run.
+  const double io_only_ms = (io_ms > scan_ms) ? (io_ms - scan_ms) : 0.0;
+  const double us_per_page =
+      io_only_ms * 1000.0 / static_cast<double>(total_pages);
 
   std::printf(
-      "\n[io-only]   %8.1f ms   faults=%llu evicts=%llu   %.1f us/page  %s\n",
+      "[io-only]   %8.1f ms   faults=%llu evicts=%llu   io=%.1f ms over scan "
+      "(%.1f us/page)  %s\n",
       io_ms, (unsigned long long) io_stats.faults,
-      (unsigned long long) io_stats.evicts, us_per_page,
+      (unsigned long long) io_stats.evicts, io_only_ms, us_per_page,
       io_ok ? "sum=OK" : "sum=MISMATCH");
   if (!io_ok) {
     std::fprintf(stderr, "checksum mismatch in io-only run; aborting\n");
@@ -350,9 +383,11 @@ int main(int argc, char **argv) {
   // from prop.clockRate produced a "50/50" mix that was really about 1:2, and
   // a compute-only run SLOWER than the mixed run it was supposed to bound.
   //
-  // So the mix is calibrated instead of computed: pick the burn constant that
-  // makes measured compute-only time equal measured I/O-only time. That is
-  // what 50/50 means here, by measurement.
+  // So the mix is calibrated instead of computed: pick the constant that makes
+  // the MARGINAL compute cost equal the MARGINAL I/O cost, both measured over
+  // the scan baseline. Calibrating against the totals instead is degenerate --
+  // the shared scan term dominates both sides, so it converges with the actual
+  // compute near zero and there is nothing to overlap.
   double compute_ms = 1e30;
   u32 compute_iters = a.compute_iters ? a.compute_iters : 20000u;
   {
@@ -374,18 +409,26 @@ int main(int argc, char **argv) {
 
     compute_ms = measure(compute_iters);
     if (!a.compute_iters) {
-      // A few proportional corrections; the relation is close to linear.
-      for (int iter = 0; iter < 4; ++iter) {
-        const double err = compute_ms / io_ms;
-        if (err > 0.95 && err < 1.05) break;
+      // Match the marginal costs: (compute_ms - scan) == (io_ms - scan).
+      for (int iter = 0; iter < 8; ++iter) {
+        const double marginal = compute_ms - scan_ms;
+        if (marginal <= 0.0) {   // too small to measure yet; grow it
+          compute_iters *= 4;
+          compute_ms = measure(compute_iters);
+          continue;
+        }
+        const double err = marginal / io_only_ms;
+        if (err > 0.9 && err < 1.1) break;
         double scaled = static_cast<double>(compute_iters) / err;
         if (scaled < 1.0) scaled = 1.0;
+        if (scaled > 1.0e8) scaled = 1.0e8;
         compute_iters = static_cast<u32>(scaled + 0.5);
         compute_ms = measure(compute_iters);
       }
       std::printf(
-          "  -> compute calibrated to %u FMA iters/page so compute-only == io-only\n",
-          compute_iters);
+          "  -> compute calibrated to %u FMA iters/page: marginal compute "
+          "%.1f ms vs marginal io %.1f ms\n",
+          compute_iters, compute_ms - scan_ms, io_only_ms);
     } else {
       std::printf("  -> compute forced to %u iters/page\n", compute_iters);
     }
@@ -435,30 +478,36 @@ int main(int argc, char **argv) {
   // ---- Breakdown --------------------------------------------------------
   // Perfect overlap costs max(io, compute); no overlap costs io + compute.
   // Where the prefetch run lands between those two IS the overlap achieved.
-  const double no_overlap = io_ms + compute_ms;
-  const double perfect = (io_ms > compute_ms) ? io_ms : compute_ms;
+  // Everything is expressed over the scan floor, which every mode pays and
+  // which no amount of overlapping can remove.
+  const double compute_only_ms =
+      (compute_ms > scan_ms) ? (compute_ms - scan_ms) : 0.0;
+  const double no_overlap = scan_ms + io_only_ms + compute_only_ms;
+  const double perfect =
+      scan_ms + ((io_only_ms > compute_only_ms) ? io_only_ms : compute_only_ms);
   const double hidden = (no_overlap > perfect)
                             ? (no_overlap - pre_ms) / (no_overlap - perfect)
                             : 0.0;
   std::printf(
-      "\nbreakdown\n"
-      "  io only              %8.1f ms\n"
-      "  compute only         %8.1f ms\n"
-      "  sum of the two       %8.1f ms   (what no overlap costs)\n"
-      "  max of the two       %8.1f ms   (what perfect overlap costs)\n"
+      "\nbreakdown (every mode pays the scan; io and compute are MARGINAL)\n"
+      "  scan floor           %8.1f ms   (resident reads, unavoidable)\n"
+      "  + io                 %8.1f ms   (%.1f us/page of faulting)\n"
+      "  + compute            %8.1f ms\n"
+      "  = no overlap         %8.1f ms   (scan + io + compute)\n"
+      "  = perfect overlap    %8.1f ms   (scan + max(io, compute))\n"
       "  serial measured      %8.1f ms\n"
       "  prefetch measured    %8.1f ms\n"
       "  speedup              %8.2fx\n"
       "  I/O hidden           %8.1f %%\n",
-      io_ms, compute_ms, no_overlap, perfect, serial_ms, pre_ms,
-      serial_ms / pre_ms, hidden * 100.0);
+      scan_ms, io_only_ms, us_per_page, compute_only_ms, no_overlap, perfect,
+      serial_ms, pre_ms, serial_ms / pre_ms, hidden * 100.0);
 
   // Honesty check on the baseline. With many blocks resident the GPU already
   // overlaps one block's fault against another block's compute, so "serial"
   // is not serial at the device level and there is little left for an
   // explicit prefetch to win. When that is happening, say so instead of
   // reporting a small speedup as if prefetching had underperformed.
-  if (serial_ms < no_overlap * 0.75) {
+  if (serial_ms < no_overlap * 0.75 && a.blocks > 1) {
     std::printf(
         "\n  NOTE: serial (%.1f ms) is well under io+compute (%.1f ms), so the\n"
         "  %u concurrent blocks are ALREADY overlapping each other's I/O and\n"

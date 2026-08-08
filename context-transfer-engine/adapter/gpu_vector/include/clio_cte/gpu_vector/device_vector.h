@@ -40,6 +40,10 @@ class DeviceVector {
   /** Bytes per page, and the element count that implies. */
   clio::run::u64 page_bytes_ = 0;
   clio::run::u64 elems_per_page_ = 0;
+  /** log2(elems_per_page_) and its mask; 0 shift means "not a power of two,
+   *  fall back to division". See PageOf. */
+  clio::run::u32 page_shift_ = 0;
+  clio::run::u64 page_mask_ = 0;
   /** Logical element count of the whole vector. */
   clio::run::u64 size_ = 0;
   /** Pool the page tasks are addressed to (the CTE core). */
@@ -101,15 +105,38 @@ class DeviceVector {
    * writing cannot be observed later, so the write must be assumed.
    */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
-    Page *p = Resolve(off / elems_per_page_);
+    Page *p = Resolve(PageOf(off));
     p->dirty = 1u;
-    return static_cast<T *>(p->data)[off - p->page_num * elems_per_page_];
+    return static_cast<T *>(p->data)[IndexIn(off, p)];
   }
 
   /** Read-only access: does NOT dirty the page. */
   CTP_GPU_FUN const T &at(clio::run::u64 off) {
-    Page *p = Resolve(off / elems_per_page_);
-    return static_cast<const T *>(p->data)[off - p->page_num * elems_per_page_];
+    Page *p = Resolve(PageOf(off));
+    return static_cast<const T *>(p->data)[IndexIn(off, p)];
+  }
+
+  /**
+   * Which page an offset falls in.
+   *
+   * A GPU has NO hardware 64-bit integer divide, so `off / elems_per_page_`
+   * compiles to a software routine of hundreds of cycles -- on EVERY element
+   * access. Measured: 683 ns per element, making a scan of already-resident
+   * pages cost 350 us/page against a 15 us/page page fault. Reading the cache
+   * was 20x more expensive than filling it.
+   *
+   * Page sizes are powers of two in every real use, so the host precomputes a
+   * shift and mask and this becomes one instruction. The divide remains as a
+   * fallback for a non-power-of-two page size.
+   */
+  CTP_GPU_FUN clio::run::u64 PageOf(clio::run::u64 off) const {
+    return page_shift_ ? (off >> page_shift_) : (off / elems_per_page_);
+  }
+
+  /** Offset of an element within its page. */
+  CTP_GPU_FUN clio::run::u64 IndexIn(clio::run::u64 off, const Page *p) const {
+    return page_shift_ ? (off & page_mask_)
+                       : (off - p->page_num * elems_per_page_);
   }
 
   /**

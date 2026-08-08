@@ -340,6 +340,17 @@ class Vector {
     v.pages_per_block_ = pages_per_block_;
     v.page_bytes_ = page_bytes_;
     v.elems_per_page_ = page_bytes_ / sizeof(T);
+    // Precompute the shift so device-side element access is a shift and a mask
+    // instead of a 64-bit divide, which a GPU has to emulate in software.
+    v.page_shift_ = 0;
+    v.page_mask_ = 0;
+    const clio::run::u64 epp = v.elems_per_page_;
+    if (epp != 0 && (epp & (epp - 1)) == 0) {
+      clio::run::u32 sh = 0;
+      while ((static_cast<clio::run::u64>(1) << sh) < epp) ++sh;
+      v.page_shift_ = sh;
+      v.page_mask_ = epp - 1;
+    }
     v.size_ = num_elems_;
     v.pool_id_ = storage_pool_id_;
     v.compress_lib_ = compress_lib_;
