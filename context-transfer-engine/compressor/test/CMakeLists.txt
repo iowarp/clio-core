@@ -65,36 +65,47 @@ target_link_libraries(test_compressor_functional
   ${CMAKE_THREAD_LIBS_INIT}     # Threading support
 )
 
-# Register functional tests - use test names (simple_test.h filters by name)
-add_test(NAME compressor_compress_lz4
-    COMMAND test_compressor_functional "CompressTask - LZ4 Compression")
+# Stage the functional tests' compose config next to the binary.
+add_custom_command(TARGET test_compressor_functional POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_compressor_functional_config.yaml
+    ${CMAKE_BINARY_DIR}/bin/test_compressor_functional_config.yaml
+)
 
-add_test(NAME compressor_decompress_lz4
-    COMMAND test_compressor_functional "DecompressTask - LZ4 Decompression")
+# Register functional tests. The filter must match a TEST_CASE name EXACTLY:
+# simple_test.h runs the cases whose name contains the argument, and prints
+# "Running 0 test(s) matching filter ..." then exits 0 when nothing matches.
+#
+# Six of the seven filters here named tests that do not exist ("CompressTask -
+# LZ4 Compression" and friends), so those entries ran nothing and passed
+# vacuously -- a green compressor suite that executed no compressor code. The
+# names below are taken from the TEST_CASE declarations in
+# test_compressor_functional.cc.
+add_test(NAME compressor_basic_compress_store
+    COMMAND test_compressor_functional "Basic Compress and Store")
 
-add_test(NAME compressor_roundtrip_integrity
-    COMMAND test_compressor_functional "Round-trip - Data Integrity")
-
-add_test(NAME compressor_compression_ratios
-    COMMAND test_compressor_functional "Compression Ratio - Data Patterns")
+add_test(NAME compressor_decompress_retrieve
+    COMMAND test_compressor_functional "Decompress and Retrieve")
 
 add_test(NAME compressor_dynamic_schedule
-    COMMAND test_compressor_functional "DynamicSchedule - Compression Selection")
+    COMMAND test_compressor_functional "Dynamic Schedule Compression")
 
 add_test(NAME compressor_multiple_libraries
-    COMMAND test_compressor_functional "Multiple Libraries - Compression")
+    COMMAND test_compressor_functional "Multiple Compression Libraries")
+
+add_test(NAME compressor_no_compression_passthrough
+    COMMAND test_compressor_functional "No Compression Passthrough")
 
 add_test(NAME compressor_error_handling
     COMMAND test_compressor_functional "Error Handling - Invalid Parameters")
 
 # Set test properties
 set_tests_properties(
-    compressor_compress_lz4
-    compressor_decompress_lz4
-    compressor_roundtrip_integrity
-    compressor_compression_ratios
+    compressor_basic_compress_store
+    compressor_decompress_retrieve
     compressor_dynamic_schedule
     compressor_multiple_libraries
+    compressor_no_compression_passthrough
     compressor_error_handling
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout

@@ -1,0 +1,23 @@
+# Compose config for the compressor FUNCTIONAL tests.
+#
+# These tests create their CTE core and compressor pools programmatically
+# (CreateCorePool / CreateCompressorPool). That needs a block device to exist
+# first -- without one the core pool cannot be created, and because the tests
+# never checked the create return code, every later task was addressed to a
+# pool that did not exist and simply never completed. Composing the bdev here
+# is what makes the programmatic creation succeed.
+
+networking:
+  port: 9417
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"

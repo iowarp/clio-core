@@ -127,6 +127,11 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
  */
 void InitializeClio() {
   // Initialize CLIO Runtime runtime in client mode with runtime
+  // Compose a bdev before init: CreateCorePool below needs one, and without
+  // it pool creation fails silently and every task addressed to those pools
+  // hangs forever.
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF",
+                          "test_compressor_functional_config.yaml", 1);
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
     throw std::runtime_error("Failed to initialize Clio runtime");
