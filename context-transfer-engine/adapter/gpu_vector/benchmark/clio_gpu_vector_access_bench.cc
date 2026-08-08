@@ -315,7 +315,7 @@ int main(int argc, char **argv) {
       const double t0 = NowMs();
       auto a = du, b = dv, c = du2, d = dv2;
       for (u32 s = 0; s < steps; ++s) {
-        GrayScottVec<<<blocks, threads>>>(gpu, a, b, c, d, dim);
+        GrayScottHold<<<blocks, threads>>>(gpu, a, b, c, d, dim);
         auto ta = a; a = c; c = ta;
         auto tb = b; b = d; d = tb;
       }

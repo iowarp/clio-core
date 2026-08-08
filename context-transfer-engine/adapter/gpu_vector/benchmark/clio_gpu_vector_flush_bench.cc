@@ -64,12 +64,12 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   const u64 region_elems = pages_per_region * v.elems_per_page_;
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
-  for (clio::run::u64 it = 0; it < iters;) {
-    const clio::run::u64 run_it = v.HoldPage(poff + i, (iters) - it);
-    for (clio::run::u64 k_it = 0; k_it < run_it; ++k_it, ++it) {
+  for (u64 it = 0; it < iters; ++it) {
+    {
       const u64 off = block_base + it * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.elems_per_page_;
+        v.HoldPage(poff, v.elems_per_page_);
         for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
           v[poff + i] = Val(poff + i, 0u);
         }
@@ -102,9 +102,8 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
   long long prev = -1;
 
-  for (clio::run::u64 it = 0; it < iters;) {
-    const clio::run::u64 run_it = v.HoldPage(poff + i, (iters) - it);
-    for (clio::run::u64 k_it = 0; k_it < run_it; ++k_it, ++it) {
+  for (u64 it = 0; it < iters; ++it) {
+    {
       // ---- compute ----
       Spin(spin_us, clock_khz);
       __syncthreads();
@@ -141,7 +140,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
       }
   }
 
-  if (async && do_write && threadIdx.x == 0 && prev >= 0) {
+  if (async == 1 && do_write && threadIdx.x == 0 && prev >= 0) {
     v.WaitFlush(block_base + static_cast<u64>(prev) * region_elems,
                 region_elems);
   }

@@ -64,10 +64,10 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   v.ipc_ = g_ipc_manager_ptr;
   const u64 base = static_cast<u64>(blockIdx.x) * per;
   const u64 pages = per / v.elems_per_page_;
-  for (clio::run::u64 p = 0; p < pages;) {
-    const clio::run::u64 run_p = v.HoldPage(off + i, (pages) - p);
-    for (clio::run::u64 k_p = 0; k_p < run_p; ++k_p, ++p) {
+  for (u64 p = 0; p < pages; ++p) {
+    {
       const u64 off = base + p * v.elems_per_page_;
+      v.HoldPage(off, v.elems_per_page_);
       for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
         v[off + i] = Elem(off + i);
       }
@@ -117,9 +117,8 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
   const u64 pages = per / v.elems_per_page_;
   unsigned long long acc = 0;
 
-  for (clio::run::u64 p = 0; p < pages;) {
-    const clio::run::u64 run_p = v.HoldPage(off + i, (pages) - p);
-    for (clio::run::u64 k_p = 0; k_p < run_p; ++k_p, ++p) {
+  for (u64 p = 0; p < pages; ++p) {
+    {
       if (prefetch && threadIdx.x == 0) {
         // Pin the page about to be used, so a prefetch's slot claim evicts a
         // page we have already finished with rather than the one in use.
