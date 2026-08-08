@@ -149,18 +149,12 @@ void CleanupClio() {
  * Create and return pool ID for core chimod
  */
 clio::run::PoolId CreateCorePool() {
-  clio::run::PoolId core_pool_id = clio::run::PoolId(1, 1);
-  clio::cte::core::Client core_client;
-
-  clio::cte::core::CreateParams core_params;
-  auto create_task = core_client.AsyncCreate(
-      clio::run::PoolQuery::Local(),
-      "test_core_pool",
-      core_pool_id,
-      core_params);
-  create_task.Wait();
-
-  return core_pool_id;
+  // Use the CTE core composed by test_compressor_functional_config.yaml.
+  //
+  // This used to build a pool with a default CreateParams, which carries no
+  // storage targets -- so the PutBlob that Compress performs at the end had
+  // nowhere to land and returned an error. The composed pool has a RAM tier.
+  return clio::run::PoolId(513, 0);
 }
 
 /**
