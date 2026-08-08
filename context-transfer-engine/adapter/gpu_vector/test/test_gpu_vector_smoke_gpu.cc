@@ -229,7 +229,11 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // spin, not at anything the vector does. Switching the CTE tier to pinned
   // memory (to make the transfers pure DMA) was tried and made it worse --
   // it also broke the non-evicting 128 case -- so that is not the cause
-  // either. Left at 64 pending a real diagnosis.
+  // either. Raising num_threads 4 -> 16, on the theory that every
+  // RecvIn/SendOut blocks its worker in a CUDA memcpy and 128 concurrent
+  // faults simply outnumber the workers, also did not help. Left at 64
+  // pending a real diagnosis; the next step needs a debugger on the stalled
+  // workers, which this container cannot do (ptrace is restricted).
   {
     const unsigned nb = 64u;
     const clio::run::u64 per = 4 * 1024;
