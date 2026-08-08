@@ -49,6 +49,16 @@ struct Page {
   clio::run::u32 dirty;
   /** 1 while a put issued by BeginFlush is still outstanding. */
   clio::run::u32 flushing;
+  /**
+   * 1 while an ASYNCHRONOUS get issued by BeginFetch is still in flight.
+   *
+   * A fetching page is not yet readable and must never be chosen as an
+   * eviction victim -- its slot is already promised to an in-flight transfer.
+   * Resolve waits on it rather than re-issuing.
+   */
+  clio::run::u32 fetching;
+  /** 1 while a fire-and-forget rescore is still outstanding on this slot. */
+  clio::run::u32 rescoring;
   /** Bumped on every task submission so no two carry the same TaskId. */
   clio::run::u32 seq;
 
@@ -59,6 +69,10 @@ struct Page {
 
   /** Outstanding put, waited on by WaitFlush. */
   clio::run::gpu::Future<clio::cte::core::PodPutBlobTask> put_fut;
+  /** Outstanding asynchronous get, waited on by Resolve/WaitFetch. */
+  clio::run::gpu::Future<clio::cte::core::PodGetBlobTask> get_fut;
+  /** Outstanding rescore, waited on before the slot is reused. */
+  clio::run::gpu::Future<clio::cte::core::PodReorganizeBlobTask> rescore_fut;
 };
 
 /**

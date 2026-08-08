@@ -223,6 +223,46 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
+/**
+ * Walk pages while prefetching the next one, the way an overlapping kernel
+ * does. Correctness here is what makes the overlap benchmark meaningful: a
+ * prefetch that lands in the wrong slot, or that a demand fault re-issues on
+ * top of, produces wrong data rather than a slow run.
+ */
+__global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
+                                   gv::DeviceVector<u32> v, u64 count,
+                                   u32 salt, unsigned long long *bad) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  const u64 slice = static_cast<u64>(blockIdx.x) * count;
+  const u64 pages = count / v.elems_per_page_;
+  const u64 first = slice / v.elems_per_page_;
+  unsigned long long local = 0;
+  for (u64 p = 0; p < pages; ++p) {
+    if (p + 1 < pages) v.BeginFetch(first + p + 1);
+    v.RescorePage(first + p, 1000.0f);
+    const u64 off = slice + p * v.elems_per_page_;
+    for (u64 i = 0; i < v.elems_per_page_; ++i) {
+      if (v.at(off + i) != Val(off + i, salt)) ++local;
+    }
+    v.RescorePage(first + p, -1000.0f);
+  }
+  atomicAdd(bad, local);
+}
+
+/** Rescore the same page repeatedly, hammering the fire-and-forget slot. */
+__global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
+                                   gv::DeviceVector<u32> v, u64 page,
+                                   u32 reps) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  for (u32 r = 0; r < reps; ++r) {
+    v.RescorePage(page, static_cast<float>(r));
+  }
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
@@ -816,6 +856,65 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       std::fflush(stderr);
       REQUIRE(ReadCounter(bad) == 0);
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Prefetching returns the SAME data as demand faulting, on an
+  // oversubscribed cache where every prefetch has to evict something. Also
+  // asserts the prefetch is actually being used: a run where the arrivals
+  // were never in flight when needed would report zero hits.
+  // -------------------------------------------------------------------
+  {
+    constexpr u64 kPages = 16;
+    Fixture f("gv_sem_prefetch", 4, 4, kPages * 4);
+    const u64 per = kPages * kPageElems;
+    WriteKernel<<<4, 32>>>(g_gpu, f.dev, 0, per, 15u, 1);
+    Sync();
+    EvictKernel<<<4, 32>>>(g_gpu, f.dev, 4u);
+    Sync();
+
+    f.Reset();
+    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    PrefetchWalkKernel<<<4, 32>>>(g_gpu, f.dev, per, 15u, bad);
+    Sync();
+    auto s = f.Stats();
+    std::fprintf(stderr,
+                 "[prefetch] mismatches=%llu faults=%llu prefetches=%llu "
+                 "hits=%llu rescores=%llu\n",
+                 ReadCounter(bad), (unsigned long long) s.faults,
+                 (unsigned long long) s.prefetches,
+                 (unsigned long long) s.prefetch_hits,
+                 (unsigned long long) s.rescores);
+    REQUIRE(ReadCounter(bad) == 0);
+    // Each block prefetches every page after its first.
+    REQUIRE(s.prefetches == 4 * (kPages - 1));
+    // A page must never be fetched twice: a prefetch followed by a demand
+    // fault for the same page would mean the wait path is not working.
+    REQUIRE(s.faults == 4 * kPages);
+  }
+
+  // -------------------------------------------------------------------
+  // Rescore is fire-and-forget, so its task slot can still be executing when
+  // the next one is issued. Hammer it: without the wait-before-reuse this
+  // mutates a task the runtime is reading.
+  // -------------------------------------------------------------------
+  {
+    Fixture f("gv_sem_rescore_storm", 1, 4, 4);
+    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, 1);
+    Sync();
+
+    f.Reset();
+    RescoreStormKernel<<<1, 32>>>(g_gpu, f.dev, 0, 64u);
+    Sync();
+    auto s = f.Stats();
+    std::fprintf(stderr, "[rescore-storm] rescores=%llu (expect 64)\n",
+                 (unsigned long long) s.rescores);
+    REQUIRE(s.rescores == 64);
+
+    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, bad);
+    Sync();
+    REQUIRE(ReadCounter(bad) == 0);
   }
 
   cudaFree(bad);

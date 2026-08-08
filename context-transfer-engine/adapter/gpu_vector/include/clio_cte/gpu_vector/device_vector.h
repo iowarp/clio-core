@@ -83,6 +83,12 @@ class DeviceVector {
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
   unsigned long long *stat_evicts_ = nullptr;   // slots reclaimed
+  unsigned long long *stat_prefetches_ = nullptr;    // BeginFetch gets issued
+  /** Faults that found the page already in flight -- prefetch paid off. */
+  unsigned long long *stat_prefetch_hits_ = nullptr;
+  /** Faults whose prefetch was issued but had NOT landed yet. */
+  unsigned long long *stat_prefetch_late_ = nullptr;
+  unsigned long long *stat_rescores_ = nullptr;      // reorganize hints sent
 
 #if CTP_IS_GPU_COMPILER
   // ---- device API -----------------------------------------------------
@@ -117,6 +123,30 @@ class DeviceVector {
     UnlockBlock();
   }
 
+  /**
+   * Drop this block's whole cache: flush anything dirty, then clear every
+   * slot AND its score.
+   *
+   * EvictPages alone is not enough to get back to a cold cache, because a
+   * page left with a high score from a previous phase keeps steering eviction
+   * afterwards. Benchmarks need this to make two modes start from identical
+   * state; without it, whichever mode ran second inherits a warm cache and
+   * the comparison is meaningless.
+   */
+  CTP_GPU_FUN void DropAll() {
+    LockBlock();
+    Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      tbl[i].score = 0.0f;
+    }
+    EvictLocked(pages_per_block_);
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      tbl[i].last_access = 0;
+    }
+    UnlockBlock();
+    last_page_ = nullptr;   // the per-thread cache now points at a free slot
+  }
+
   /** EvictPages' body, for callers that already hold the block lock. */
   CTP_GPU_FUN void EvictLocked(clio::run::u32 num_pages) {
     Page *tbl = BlockPages();
@@ -124,6 +154,10 @@ class DeviceVector {
       clio::run::u32 victim = pages_per_block_;
       for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
         if (tbl[i].page_num == kNoPage) continue;
+        // A page with a transfer in flight is not a candidate: its slot is
+        // already promised to that transfer, and evicting it would let the
+        // copy land in a slot that now belongs to a different page.
+        if (tbl[i].fetching) continue;
         if (victim == pages_per_block_) {
           victim = i;
           continue;
@@ -161,6 +195,34 @@ class DeviceVector {
     UnlockBlock();
   }
 
+  /**
+   * Start faulting `page_num` in WITHOUT waiting for it.
+   *
+   * This is what makes compute and I/O overlap: the kernel asks for the page
+   * it will need next, keeps computing on the page it already has, and by the
+   * time it dereferences the new one the bytes have arrived. Resolve waits on
+   * an in-flight fetch rather than issuing a second get, so a prefetch that
+   * has not landed yet degrades to exactly the synchronous cost and never to
+   * a wrong result.
+   *
+   * @return false if no slot could be freed (every resident page is pinned by
+   *         an in-flight transfer), in which case nothing was started.
+   */
+  CTP_GPU_FUN bool BeginFetch(clio::run::u64 page_num) {
+    LockBlock();
+    const bool ok = BeginFetchLocked(page_num);
+    UnlockBlock();
+    return ok;
+  }
+
+  /** Wait for a page started by BeginFetch, if it is still in flight. */
+  CTP_GPU_FUN void WaitFetch(clio::run::u64 page_num) {
+    LockBlock();
+    Page *p = Find(page_num);
+    if (p != nullptr) AwaitFetch(p);
+    UnlockBlock();
+  }
+
   /** Wait for the puts started by BeginFlush over the same range. */
   CTP_GPU_FUN void WaitFlush(clio::run::u64 off, clio::run::u64 count) {
     LockBlock();
@@ -190,6 +252,15 @@ class DeviceVector {
     }
     Page *slot = (p != nullptr) ? p : &BlockPages()[page_id % pages_per_block_];
     if (slot->rescore == nullptr) return;
+    // A rescore is fire-and-forget, so the previous one on this slot may still
+    // be executing. Reusing the task in place would mutate a task the runtime
+    // is reading. Rescoring is a hot operation when it is used as a prefetch
+    // hint (twice per page: pin, then release), so this is reachable in normal
+    // use, not just in theory.
+    if (slot->rescoring) {
+      slot->rescore_fut.Wait();
+      slot->rescoring = 0u;
+    }
     auto *t = slot->rescore;
     t->task_flags_.Clear();
     t->return_code_.store(0);
@@ -206,7 +277,9 @@ class DeviceVector {
     // Fire and forget: a hint that arrives late is still useful, and
     // waiting here would serialise the kernel behind placement.
     ClearRunCtx(t);
-    (void) ipc_->Send(SlotPtr(slot->rescore));
+    Bump(stat_rescores_);
+    slot->rescore_fut = ipc_->Send(SlotPtr(slot->rescore));
+    slot->rescoring = 1u;
   }
 
  public:
@@ -359,8 +432,59 @@ class DeviceVector {
     p->flushing = 0u;
   }
 
-  /** Fault `page_num` into `p` with a synchronous PodGetBlobTask. */
-  CTP_GPU_FUN void SubmitGet(Page *p, clio::run::u64 page_num) {
+  /**
+   * Claim a slot for `page_num` and start its get, without waiting.
+   * Caller must hold the block lock.
+   */
+  CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num) {
+    if (Find(page_num) != nullptr) return true;   // resident or already coming
+    Page *tbl = BlockPages();
+    clio::run::u32 free_slot = pages_per_block_;
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      if (tbl[i].page_num == kNoPage) {
+        free_slot = i;
+        break;
+      }
+    }
+    if (free_slot == pages_per_block_) {
+      EvictLocked(1);
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (tbl[i].page_num == kNoPage) {
+          free_slot = i;
+          break;
+        }
+      }
+      // Everything resident is mid-transfer: report failure rather than
+      // stalling, so the caller simply falls back to a demand fault later.
+      if (free_slot == pages_per_block_) return false;
+    }
+    Page *p = &tbl[free_slot];
+    p->page_num = page_num;
+    p->dirty = 0u;
+    p->flushing = 0u;
+    p->score = 0.0f;
+    SubmitGetAsync(p, page_num);
+    return true;
+  }
+
+  /** Issue this page's get and return immediately. */
+  CTP_GPU_FUN void SubmitGetAsync(Page *p, clio::run::u64 page_num) {
+    PrepareGet(p, page_num);
+    Bump(stat_faults_);
+    Bump(stat_prefetches_);
+    p->get_fut = ipc_->Send(SlotPtr(p->get));
+    p->fetching = 1u;
+  }
+
+  /** Wait for an in-flight asynchronous get on `p`. */
+  CTP_GPU_FUN void AwaitFetch(Page *p) {
+    if (!p->fetching) return;
+    p->get_fut.Wait();
+    p->fetching = 0u;
+  }
+
+  /** Fill in the get task's fields for `page_num`. */
+  CTP_GPU_FUN void PrepareGet(Page *p, clio::run::u64 page_num) {
     auto *t = p->get;
     t->task_flags_.Clear();
     t->return_code_.store(0);
@@ -377,9 +501,15 @@ class DeviceVector {
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
     ClearRunCtx(t);
+  }
+
+  /** Fault `page_num` into `p` with a SYNCHRONOUS get. */
+  CTP_GPU_FUN void SubmitGet(Page *p, clio::run::u64 page_num) {
+    PrepareGet(p, page_num);
     Bump(stat_faults_);
     auto fut = ipc_->Send(SlotPtr(p->get));
-    fut.Wait();                           // page faults are synchronous
+    fut.Wait();                           // demand faults block by definition
+    p->fetching = 0u;
   }
 
   /**
@@ -392,7 +522,9 @@ class DeviceVector {
    */
   CTP_GPU_FUN Page *Resolve(clio::run::u64 page_num) {
     Page *p = last_page_;
-    if (p != nullptr && p->page_num == page_num) return p;
+    // The fast path may only skip the lock for a page that is fully resident;
+    // one still being prefetched has to go through the slow path to wait.
+    if (p != nullptr && p->page_num == page_num && !p->fetching) return p;
     // Everything past the per-thread fast path touches the shared page table
     // (residency search, slot claim, eviction, the fault itself), so it is all
     // under the block's lock. Without it, concurrent lanes claim the same free
@@ -404,6 +536,23 @@ class DeviceVector {
     // bookkeeping, which swamped the fault path and made storage tier and
     // codec differences unmeasurable. LRU only needs page granularity anyway.
     p = Find(page_num);
+    if (p != nullptr) {
+      // Already coming: a prefetch beat us here. Wait for that transfer
+      // instead of issuing a second get into the same slot.
+      if (p->fetching) {
+        // Count whether the prefetch actually LANDED in time, not merely that
+        // one was outstanding. `fetching` stays set until someone waits, so
+        // testing the flag alone reports a hit even for a transfer that
+        // finished long ago -- it measured nothing and read as 100% hits at
+        // every prefetch depth.
+        if (p->get->fut_.is_complete_.load() != 0) {
+          Bump(stat_prefetch_hits_);
+        } else {
+          Bump(stat_prefetch_late_);
+        }
+        AwaitFetch(p);
+      }
+    }
     if (p == nullptr) {
       Page *tbl = BlockPages();
       for (;;) {

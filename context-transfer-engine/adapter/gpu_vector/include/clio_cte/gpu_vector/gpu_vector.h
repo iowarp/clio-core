@@ -120,7 +120,12 @@ class Vector {
     clio::run::u64 faults = 0;   // pages read in from the CTE
     clio::run::u64 puts = 0;     // pages written back
     clio::run::u64 evicts = 0;   // slots reclaimed
+    clio::run::u64 prefetches = 0;      // gets issued by BeginFetch
+    clio::run::u64 prefetch_hits = 0;   // arrivals found already in flight
+    clio::run::u64 rescores = 0;        // placement hints sent
+    clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
   };
+  static constexpr int kNumStats = 7;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -135,15 +140,20 @@ class Vector {
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
       void *mem = nullptr;
-      if (cudaMalloc(&mem, 3 * sizeof(unsigned long long)) != cudaSuccess) {
+      const size_t bytes = kNumStats * sizeof(unsigned long long);
+      if (cudaMalloc(&mem, bytes) != cudaSuccess) {
         throw std::runtime_error("gpu_vector: stats allocation failed");
       }
-      cudaMemset(mem, 0, 3 * sizeof(unsigned long long));
+      cudaMemset(mem, 0, bytes);
       auto *c = static_cast<unsigned long long *>(mem);
       kv.second.stats = c;
       kv.second.view.stat_faults_ = c;
       kv.second.view.stat_puts_ = c + 1;
       kv.second.view.stat_evicts_ = c + 2;
+      kv.second.view.stat_prefetches_ = c + 3;
+      kv.second.view.stat_prefetch_hits_ = c + 4;
+      kv.second.view.stat_rescores_ = c + 5;
+      kv.second.view.stat_prefetch_late_ = c + 6;
     }
 #endif
   }
@@ -152,7 +162,7 @@ class Vector {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) {
-        cudaMemset(kv.second.stats, 0, 3 * sizeof(unsigned long long));
+        cudaMemset(kv.second.stats, 0, kNumStats * sizeof(unsigned long long));
       }
     }
 #endif
@@ -163,11 +173,15 @@ class Vector {
 #if CTP_ENABLE_CUDA
     auto it = devs_.find(dev_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[3] = {0, 0, 0};
+    unsigned long long h[kNumStats] = {0};
     cudaMemcpy(h, it->second.stats, sizeof(h), cudaMemcpyDeviceToHost);
     s.faults = h[0];
     s.puts = h[1];
     s.evicts = h[2];
+    s.prefetches = h[3];
+    s.prefetch_hits = h[4];
+    s.rescores = h[5];
+    s.prefetch_late = h[6];
 #else
     (void) dev_id;
 #endif
@@ -238,6 +252,8 @@ class Vector {
       p.last_access = 0;
       p.dirty = 0;
       p.flushing = 0;
+      p.fetching = 0;
+      p.rescoring = 0;
       p.seq = 0;
       char *slot = tasks_bytes +
                    i * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
@@ -246,6 +262,9 @@ class Vector {
       p.rescore = reinterpret_cast<RescoreSlot *>(
           slot + sizeof(PutSlot) + sizeof(GetSlot));
       p.put_fut = clio::run::gpu::Future<clio::cte::core::PodPutBlobTask>();
+      p.get_fut = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
+      p.rescore_fut =
+          clio::run::gpu::Future<clio::cte::core::PodReorganizeBlobTask>();
     }
     UploadTable(table, st.table_base);
 
