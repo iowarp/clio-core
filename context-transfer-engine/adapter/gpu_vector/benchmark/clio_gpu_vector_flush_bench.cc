@@ -268,6 +268,11 @@ double NowMs() {
 
 int main(int argc, char **argv) {
   Args a;
+  // Worker doze experiment: sequential single-block ops measured ~30ms each
+  // while flooded ops cost ~35us. If that gap is workers sleeping between
+  // ops, making them busy-wait the whole run should erase it.
+  long busy_us = 10000;
+  if (const char *e = getenv("GV_BUSY_US")) busy_us = atol(e);
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
     auto next = [&]() -> const char * {
@@ -316,7 +321,8 @@ int main(int argc, char **argv) {
   {
     std::ofstream cfg("gpu_vector_flush.yaml");
     cfg << "networking:\n  port: 9437\n\n"
-        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n\n"
+        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
+        << "  first_busy_wait: " << busy_us << "\n\n"
         << "gpu:\n  queue_depth: 8192\n\n"
         << "compose:\n"
         << "  - mod_name: clio_bdev\n"
