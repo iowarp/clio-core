@@ -47,14 +47,20 @@
 #endif
 #include "cte_env.h"
 
-using kvhdf5::byte_t;
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kvhdf5::byte_t;` here is a conflicting redeclaration and this TU
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 namespace {
 
 // chunk c, byte i -> ((seed + c) ^ i) & 0xFF; distinct seed per snapshot so a
 // stale buffer/blob would MISMATCH rather than silently coincide.
-constexpr byte_t LifePattern(unsigned seed, unsigned i) {
-    return static_cast<byte_t>((seed ^ i) & 0xFFu);
+constexpr kv_byte_t LifePattern(unsigned seed, unsigned i) {
+    return static_cast<kv_byte_t>((seed ^ i) & 0xFFu);
 }
 
 }  // namespace
@@ -65,10 +71,10 @@ __global__ void LifecycleFillWriteKernel(kvhdf5::GpuDatasetHandle h, unsigned se
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = 0; c < h.Count(); ++c) {
-        byte_t* dst = h.Data(c);
+        kv_byte_t* dst = h.Data(c);
         uint64_t n = h.Size(c);
         for (uint64_t i = threadIdx.x; i < n; i += blockDim.x)
-            dst[i] = static_cast<byte_t>(((seed + c) ^ i) & 0xFFu);
+            dst[i] = static_cast<kv_byte_t>(((seed + c) ^ i) & 0xFFu);
         __threadfence_system();
         __syncthreads();
         h.Write(c);        // fused Send().Wait(): <= 1 in-flight
@@ -79,13 +85,13 @@ __global__ void LifecycleFillWriteKernel(kvhdf5::GpuDatasetHandle h, unsigned se
 // Data-dependent FLOP burn so the async snapshot has real compute to overlap (and
 // to mirror the heavy-kernel factor in the original corruption regime). `wb`
 // (always 0) keeps `acc` live without ever writing the data back.
-__device__ void LifeCompute(byte_t* dst, uint64_t n, unsigned iters, unsigned wb) {
+__device__ void LifeCompute(kv_byte_t* dst, uint64_t n, unsigned iters, unsigned wb) {
     if (iters == 0) return;
     float acc = 1.0f;
     for (unsigned k = 0; k < iters; ++k)
         for (uint64_t i = threadIdx.x; i < n; i += blockDim.x)
             acc = acc * 1.0000001f + static_cast<float>(dst[i]) * 1e-6f;
-    if (wb && acc < 0.0f) dst[threadIdx.x % n] = static_cast<byte_t>(acc);
+    if (wb && acc < 0.0f) dst[threadIdx.x % n] = static_cast<kv_byte_t>(acc);
 }
 
 // ASYNC producer: one block fires every chunk's PutBlob without waiting, then
@@ -97,10 +103,10 @@ __global__ void LifecycleAsyncFillWriteKernel(kvhdf5::GpuDatasetHandle h,
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = 0; c < h.Count(); ++c) {
-        byte_t* dst = h.Data(c);
+        kv_byte_t* dst = h.Data(c);
         uint64_t n = h.Size(c);
         for (uint64_t i = threadIdx.x; i < n; i += blockDim.x)
-            dst[i] = static_cast<byte_t>(((seed + c) ^ i) & 0xFFu);
+            dst[i] = static_cast<kv_byte_t>(((seed + c) ^ i) & 0xFFu);
         LifeCompute(dst, n, iters, /*wb=*/0u);
         __threadfence_system();
         __syncthreads();
@@ -124,7 +130,7 @@ clio::cte::core::TagId MakeTag(const char* name) {
     return t->tag_id_;
 }
 
-std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag,
+std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag,
                                  const std::string& name, uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -134,7 +140,7 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag,
                                            /*flags=*/clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }
@@ -180,7 +186,7 @@ void RunLifecycle(unsigned snapshots, unsigned chunks, unsigned chunk_bytes,
         clio::cte::core::TagId tag =
             MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str());
         for (unsigned c = 0; c < chunks; ++c) {
-            std::vector<byte_t> expected(chunk_bytes);
+            std::vector<kv_byte_t> expected(chunk_bytes);
             for (unsigned i = 0; i < chunk_bytes; ++i)
                 expected[i] = LifePattern(seed + c, i);
             auto got = HostReadBlob(tag, std::to_string(c), chunk_bytes);
@@ -228,7 +234,7 @@ void RunLifecycleAsync(unsigned snapshots, unsigned chunks, unsigned chunk_bytes
         clio::cte::core::TagId tag =
             MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str());
         for (unsigned c = 0; c < chunks; ++c) {
-            std::vector<byte_t> expected(chunk_bytes);
+            std::vector<kv_byte_t> expected(chunk_bytes);
             for (unsigned i = 0; i < chunk_bytes; ++i)
                 expected[i] = LifePattern(seed + c, i);
             auto got = HostReadBlob(tag, std::to_string(c), chunk_bytes);

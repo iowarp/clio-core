@@ -78,7 +78,13 @@
 #endif
 #endif
 
-using kvhdf5::byte_t;
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kvhdf5::byte_t;` here is a conflicting redeclaration and this TU
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 namespace {
 struct GsParams { float Du, Dv, F, k, dt; };
@@ -116,7 +122,7 @@ __global__ void GsStepKernel(const float* u, const float* v, float* un, float* v
 // multiples). Being its OWN completed kernel gives kernel-boundary ordering, so the staged
 // writes are visible to the subsequent submit kernel and the server's readback — no
 // __threadfence_system needed (that fence was only for the old same-kernel copy+enqueue).
-__global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const byte_t* src) {
+__global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const kv_byte_t* src) {
     uint32_t c = blockIdx.y;
     uint64_t n = h.Size(c);
     const uint32_t* s = reinterpret_cast<const uint32_t*>(src + uint64_t(c) * n);
@@ -457,7 +463,7 @@ clio::cte::core::TagId MakeTag(const char* name) {
     return t->tag_id_;
 }
 
-std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
+std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
                                  uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -467,7 +473,7 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& 
                                            clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }
@@ -532,7 +538,7 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     if (copy_bpc > 2048) copy_bpc = 2048;
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
-        const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
+        const kv_byte_t* bsrc = reinterpret_cast<const kv_byte_t*>(src);
         TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(ds[si].Handle(), bsrc);  // multi-block stage
         if (async) {
             TwSnapFireKernel<<<1, 256>>>(ds[si].Handle());
