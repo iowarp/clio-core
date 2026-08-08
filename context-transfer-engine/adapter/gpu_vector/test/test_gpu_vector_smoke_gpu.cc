@@ -232,8 +232,16 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // either. Raising num_threads 4 -> 16, on the theory that every
   // RecvIn/SendOut blocks its worker in a CUDA memcpy and 128 concurrent
   // faults simply outnumber the workers, also did not help. Left at 64
-  // pending a real diagnosis; the next step needs a debugger on the stalled
-  // workers, which this container cannot do (ptrace is restricted).
+  // pending a real diagnosis.
+  //
+  // Thread states during the hang (from /proc, since ptrace is restricted
+  // here): 31 in ep_poll, FOUR in poll_schedule_timeout, 2 in
+  // hrtimer_nanosleep, 2 futex, 2 running. Nothing is blocked in an
+  // uninterruptible driver ioctl, so the workers are not deadlocked on the
+  // GPU -- they are sitting in CUDA's polling wait for an operation that
+  // never completes, while 128 resident blocks spin. That is the thread to
+  // pull next: which GPU operation is outstanding, and why the device never
+  // retires it.
   {
     const unsigned nb = 64u;
     const clio::run::u64 per = 4 * 1024;
