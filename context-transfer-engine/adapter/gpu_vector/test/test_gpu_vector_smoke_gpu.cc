@@ -242,6 +242,11 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   // never completes, while 128 resident blocks spin. That is the thread to
   // pull next: which GPU operation is outstanding, and why the device never
   // retires it.
+  //
+  // Also eliminated: launching the faulting kernel on a NON-BLOCKING stream
+  // instead of the legacy default one. Every stream the runtime creates is
+  // already cudaStreamNonBlocking, so nothing waits on the legacy stream, and
+  // the hang is unchanged either way.
   {
     const unsigned nb = 64u;
     const clio::run::u64 per = 4 * 1024;
