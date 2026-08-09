@@ -42,6 +42,7 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <memory>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 #include <clio_cte/compressor/compressor_tasks.h>
 #include <clio_cte/compressor/compressor_client.h>
@@ -367,7 +368,8 @@ private:
    * caller's page, written directly.
    */
   struct CodecSlot {
-    void *buf = nullptr;     // CUdeviceptr, in codec_ctx_
+    void *buf = nullptr;   // compressed bytes, CUdeviceptr in codec_ctx_
+    void *obuf = nullptr;  // decompressed bytes, plain ctx2 device memory
     void *stream = nullptr;  // CUstream, in codec_ctx_
   };
   std::vector<CodecSlot> codec_slots_;
@@ -378,6 +380,52 @@ private:
   /** Take a slot, or SIZE_MAX if all are busy (caller falls back). */
   size_t AcquireCodecSlot();
   void ReleaseCodecSlot(size_t idx);
+
+  /**
+   * BATCHED GPU decompression -- INCOMPLETE, off unless
+   * CLIO_COMPRESS_GPU_BATCH=1.
+   *
+   * Entering the codec context costs a fixed ~2.33 ms driver time slice,
+   * unaffected by spin backoff or resident block count, so one page per entry
+   * caps this path near 110 MB/s. Batching is the only lever, and the pages
+   * are there to batch: each CUDA block faults independently.
+   *
+   * State of the work, so the next person does not repeat it:
+   *  - A dedicated thread owns the batch. Three earlier versions made a
+   *    WAITING FIBER the leader and each deadlocked differently; a fiber that
+   *    is itself blocking a GPU block cannot also be responsible for other
+   *    fibers' progress.
+   *  - The codec must NOT write the caller's managed page from this thread.
+   *    Doing so hangs inside Decompress: the page is mapped by the faulting
+   *    context too, and the migration that write needs cannot happen while
+   *    that context's kernel is resident. Decompress into plain ctx2 memory
+   *    and cuMemcpyDtoDAsync into the page -- copies were never blocked.
+   *  - With that, items complete and batching demonstrably groups requests
+   *    (three in one context entry, observed). It then STALLS after a few
+   *    batches. That is the open bug.
+   *
+   * Two properties keep every failure benign and must stay: requests are
+   * shared_ptr, so a waiter that gives up cannot leave the drainer writing
+   * into a dead stack frame; and waiting is bounded, so a wedged drainer
+   * degrades to the host path instead of hanging.
+   */
+  struct PendingDecomp {
+    const char *stored = nullptr;
+    size_t stored_size = 0;
+    void *dst = nullptr;
+    size_t dst_bytes = 0;
+    std::atomic<bool> done{false};
+    std::atomic<bool> abandoned{false};
+    bool ok = false;
+  };
+  std::mutex batch_mu_;
+  std::vector<std::shared_ptr<PendingDecomp>> batch_;
+  std::thread batch_thread_;
+  std::atomic<bool> batch_stop_{false};
+  bool batch_enabled_ = false;
+
+  void BatchDrainLoop();
+  void RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch);
 
   /** Build codec_ctx_ + its buffers. Best effort; false leaves GPU codecs off. */
   bool InitCodecContext();

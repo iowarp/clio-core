@@ -61,6 +61,11 @@
 
 namespace clio::cte::compressor {
 
+/** Waiter poll interval and cap for the batched GPU decompress path. 20us x
+ *  5000 = 100 ms: far longer than a batch needs, far shorter than a hang. */
+static constexpr double kDecompWaitPollUs = 20.0;
+static constexpr int kDecompWaitMaxSpins = 5000;
+
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
@@ -1971,11 +1976,36 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     {
       auto dst_dev =
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-      const bool _dev = dst_dev.ptr_ != nullptr && ctp::IsDeviceAccessible(dst_dev.ptr_);
-      const bool _gd = _dev && GpuDecompressToDevice(buf.ptr_, stored_size, dst_dev.ptr_,
-                                static_cast<size_t>(task->size_));
-      if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_decomp dev=%d ok=%d stored=%zu\n", (int)_dev, (int)_gd, (size_t)stored_size);
-      if (_gd) {
+      const bool dev_ok =
+          dst_dev.ptr_ != nullptr && ctp::IsDeviceAccessible(dst_dev.ptr_);
+      if (dev_ok && batch_enabled_) {
+        // Hand the page to the drainer and wait on our OWN flag only; nothing
+        // here is responsible for another request's progress.
+        auto req = std::make_shared<PendingDecomp>();
+        req->stored = buf.ptr_;
+        req->stored_size = stored_size;
+        req->dst = dst_dev.ptr_;
+        req->dst_bytes = static_cast<size_t>(task->size_);
+        {
+          std::lock_guard<std::mutex> g(batch_mu_);
+          batch_.push_back(req);
+        }
+        int spins = 0;
+        while (!req->done.load(std::memory_order_acquire) &&
+               spins < kDecompWaitMaxSpins) {
+          CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+          ++spins;
+        }
+        if (!req->done.load(std::memory_order_acquire)) {
+          req->abandoned.store(true, std::memory_order_release);
+        } else if (req->ok) {
+          CLIO_IPC->FreeBuffer(buf);
+          task->return_code_ = 0;
+          CLIO_CO_RETURN;
+        }
+      } else if (dev_ok &&
+                 GpuDecompressToDevice(buf.ptr_, stored_size, dst_dev.ptr_,
+                                       static_cast<size_t>(task->size_))) {
         CLIO_IPC->FreeBuffer(buf);
         task->return_code_ = 0;
         CLIO_CO_RETURN;
