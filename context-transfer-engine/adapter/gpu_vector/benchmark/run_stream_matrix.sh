@@ -49,7 +49,7 @@ for zero in ${ZERO_PCTS}; do
       rm -f /dev/shm/clio_* 2>/dev/null
       "${BENCH}" --blocks "${BLOCKS}" --pages "${PAGES}" --page-kb "${PAGE_KB}" \
                  --total-mb "${total}" --zero-pct "${zero}" \
-                 --vram-mb "${VRAM_MB}" --spill-mb "${SPILL_MB}" \
+                 --vram-mb "${VRAM_MB}" --tier-type hbm --spill-mb "${SPILL_MB}" \
                  --threads "${THREADS}" ${flag} 2>/dev/null | grep '^GVS ' \
         || echo "GVS mode=${mode} zero=${zero}% total=${total}MB FAILED"
     done
