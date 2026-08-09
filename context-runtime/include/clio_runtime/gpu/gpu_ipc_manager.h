@@ -194,9 +194,13 @@ class IpcManager {
     /** Entries drained but not yet handed to a worker. */
     std::vector<clio::run::GpuRingEntry> pending;
     size_t pending_pos = 0;                    ///< read cursor into `pending`
-    /** Pinned staging for the D2H copies (avoids a pageable-copy sync). */
-    void *stage_entries = nullptr;
-    void *stage_ready = nullptr;
+    /**
+     * The ring payload, in PINNED HOST memory. The host reads these directly;
+     * the device writes them through the mapped device pointers stored in the
+     * ring. No staging and no copy is involved on the read path any more.
+     */
+    clio::run::GpuRingEntry *host_entries = nullptr;
+    unsigned int *host_ready = nullptr;
   };
 
   /** Per-physical-GPU state: queue + queue backend + client backends. */

@@ -113,11 +113,49 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
           FinalizeGpuQueues();
           return false;
         }
-        // Construct on the host, then upload once: head_/tail_ zeroed and all
-        // ready stamps cleared, which is the state the protocol assumes.
+        // The PAYLOAD lives in mapped, pinned host memory so the consumer can
+        // read submissions with plain loads. cudaHostAllocMapped is what makes
+        // the same bytes addressable from a kernel; cudaHostGetDevicePointer
+        // yields the address the device must use.
+#if CTP_ENABLE_CUDA
+        void *h_ents = nullptr, *h_rdy = nullptr;
+        void *d_ents = nullptr, *d_rdy = nullptr;
+        bool host_ok =
+            cudaHostAlloc(&h_ents,
+                          clio::run::kGpuRingCapacity *
+                              sizeof(clio::run::GpuRingEntry),
+                          cudaHostAllocMapped) == cudaSuccess &&
+            cudaHostAlloc(&h_rdy,
+                          clio::run::kGpuRingCapacity * sizeof(unsigned int),
+                          cudaHostAllocMapped) == cudaSuccess;
+        if (host_ok) {
+          // Stamps must read "not ready" before any producer runs, or the
+          // consumer would accept whatever the allocation happened to contain.
+          std::memset(h_rdy, 0,
+                      clio::run::kGpuRingCapacity * sizeof(unsigned int));
+          std::memset(h_ents, 0,
+                      clio::run::kGpuRingCapacity *
+                          sizeof(clio::run::GpuRingEntry));
+          host_ok = cudaHostGetDevicePointer(&d_ents, h_ents, 0) == cudaSuccess &&
+                    cudaHostGetDevicePointer(&d_rdy, h_rdy, 0) == cudaSuccess;
+        }
+        if (!host_ok) {
+          HLOG(kError, "ServerInitGpuQueues: mapped host ring alloc failed "
+               "(gpu_id={})", gpu_id);
+          FinalizeGpuQueues();
+          return false;
+        }
+        dev.ring.host_entries = static_cast<clio::run::GpuRingEntry *>(h_ents);
+        dev.ring.host_ready = static_cast<unsigned int *>(h_rdy);
+#endif
+        // Construct on the host, then upload once: head_/tail_ zeroed and the
+        // payload pointers set to the DEVICE-side addresses of the pinned
+        // allocations above.
         {
           auto *init = new clio::run::GpuDeviceRing();
 #if CTP_ENABLE_CUDA
+          init->entries_ = static_cast<clio::run::GpuRingEntry *>(d_ents);
+          init->ready_ = static_cast<unsigned int *>(d_rdy);
           cudaMemcpy(ring_mem, init, sizeof(*init), cudaMemcpyHostToDevice);
 #endif
           delete init;
@@ -125,13 +163,6 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
         dev.ring.dev_ring = static_cast<clio::run::GpuDeviceRing *>(ring_mem);
         dev.ring.stream = ctp::GpuApi::CreateStream();
         dev.ring.tail = 0;
-#if CTP_ENABLE_CUDA
-        cudaHostAlloc(&dev.ring.stage_entries,
-                      clio::run::kGpuRingCapacity *
-                          sizeof(clio::run::GpuRingEntry), 0);
-        cudaHostAlloc(&dev.ring.stage_ready,
-                      clio::run::kGpuRingCapacity * sizeof(unsigned int), 0);
-#endif
         HLOG(kInfo, "ServerInitGpuQueues: gpu_id={} DEVICE ring at {} "
              "(capacity {})", gpu_id, ring_mem,
              clio::run::kGpuRingCapacity);
@@ -218,7 +249,7 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
 #if CTP_ENABLE_CUDA
   if (gpu_id >= per_gpu_devices_.size()) return false;
   auto &m = per_gpu_devices_[gpu_id].ring;
-  if (m.dev_ring == nullptr) return false;
+  if (m.dev_ring == nullptr || m.host_ready == nullptr) return false;
 
   // Serve from the already-drained batch first.
   if (m.pending_pos < m.pending.size()) {
@@ -228,72 +259,35 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
   m.pending.clear();
   m.pending_pos = 0;
 
-  auto *stream = static_cast<cudaStream_t>(m.stream);
-
-  // 1. How far has the producer claimed?
-  unsigned long long head = 0;
-  cudaMemcpyAsync(&head, &m.dev_ring->head_, sizeof(head),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
-  if (head <= m.tail) return false;
-
-  unsigned long long n = head - m.tail;
-  if (n > clio::run::kGpuRingCapacity) n = clio::run::kGpuRingCapacity;
-  const u32 begin = static_cast<u32>(m.tail) & clio::run::kGpuRingMask;
-
-  // 2. Copy the span. It wraps at most once, so at most two copies -- still
-  //    O(1) bus crossings for O(n) submissions, which is the whole point.
-  auto *ents = static_cast<clio::run::GpuRingEntry *>(m.stage_entries);
-  auto *rdy = static_cast<unsigned int *>(m.stage_ready);
-  const u32 first = std::min<u32>(static_cast<u32>(n),
-                                  clio::run::kGpuRingCapacity - begin);
-  const u32 second = static_cast<u32>(n) - first;
-  // ORDER MATTERS: sample the READY STAMPS FIRST, then the entries.
+  // THE STAMP IS THE ARRIVAL SIGNAL. head_ is never probed: it lives in device
+  // memory and reading it cost a copy plus a synchronize on EVERY poll,
+  // including the overwhelming majority that find nothing. A stamp carrying
+  // the generation this slot is due is proof both that a producer claimed it
+  // and that it finished writing, which is strictly more than head_ told us.
   //
-  // The stamp is what certifies an entry, so it must be read BEFORE the data
-  // it certifies. Copying entries first admits a torn read: entry[i] is
-  // sampled while the producer has only claimed the slot (garbage), the
-  // producer then writes the entry and publishes its stamp, and the later
-  // stamp copy reports "ready" for bytes we already captured as garbage. The
-  // CPU then accepts a zeroed entry -- observed at 64 blocks as
-  // "null task off_ in queue entry" and "task_size_=0". Reading the stamp
-  // first inverts the race into a safe one: a stamp seen as ready means the
-  // entry was written strictly earlier, so the entry copy that follows cannot
-  // miss it. A stamp not yet ready simply defers that entry to the next poll.
-  cudaMemcpyAsync(rdy, &m.dev_ring->ready_[begin],
-                  first * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
-  if (second) {
-    cudaMemcpyAsync(rdy + first, &m.dev_ring->ready_[0],
-                    second * sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                    stream);
-  }
-  cudaStreamSynchronize(stream);
-  cudaMemcpyAsync(ents, &m.dev_ring->entries_[begin],
-                  first * sizeof(clio::run::GpuRingEntry),
-                  cudaMemcpyDeviceToHost, stream);
-  if (second) {
-    cudaMemcpyAsync(ents + first, &m.dev_ring->entries_[0],
-                    second * sizeof(clio::run::GpuRingEntry),
-                    cudaMemcpyDeviceToHost, stream);
-  }
-  cudaStreamSynchronize(stream);
-
-  // 3. Accept the contiguous READY prefix only. A claimed-but-unwritten slot
-  //    stops the batch; it will be there next poll. The stamp must match the
-  //    slot's generation, so a wrapped slot cannot masquerade as a fresh one.
+  // Reading the stamp before the entry is still what makes this safe, and it
+  // is now free: the producer's __threadfence_system() orders its entry write
+  // ahead of its stamp write, so a stamp we observe as ready guarantees the
+  // entry beside it is complete.
+  auto *rdy = static_cast<volatile unsigned int *>(
+      static_cast<void *>(m.host_ready));
   u32 accepted = 0;
-  for (u32 i = 0; i < n; ++i) {
-    const unsigned long long slot = m.tail + i;
+  while (accepted < clio::run::kGpuRingCapacity) {
+    const unsigned long long slot = m.tail + accepted;
+    const u32 idx = static_cast<u32>(slot) & clio::run::kGpuRingMask;
     const unsigned int want =
         static_cast<unsigned int>(slot / clio::run::kGpuRingCapacity) + 1u;
-    if (rdy[i] != want) break;
-    m.pending.push_back(ents[i]);
+    if (rdy[idx] != want) break;   // nothing there, or not finished yet
+    m.pending.push_back(m.host_entries[idx]);
     ++accepted;
   }
   if (accepted == 0) return false;
 
-  // 4. Publish the new tail so producers blocked on a full ring advance.
+  // Publish the new tail so producers blocked on a full ring advance. This is
+  // the only CUDA call left on this path, and it is paid per BATCH of real
+  // work rather than per poll.
   m.tail += accepted;
+  auto *stream = static_cast<cudaStream_t>(m.stream);
   cudaMemcpyAsync(&m.dev_ring->tail_, &m.tail, sizeof(m.tail),
                   cudaMemcpyHostToDevice, stream);
   cudaStreamSynchronize(stream);
@@ -317,13 +311,13 @@ void gpu::IpcManager::FinalizeGpuQueues() {
       dev.ring.dev_ring = nullptr;
     }
 #if CTP_ENABLE_CUDA
-    if (dev.ring.stage_entries) {
-      cudaFreeHost(dev.ring.stage_entries);
-      dev.ring.stage_entries = nullptr;
+    if (dev.ring.host_entries) {
+      cudaFreeHost(dev.ring.host_entries);
+      dev.ring.host_entries = nullptr;
     }
-    if (dev.ring.stage_ready) {
-      cudaFreeHost(dev.ring.stage_ready);
-      dev.ring.stage_ready = nullptr;
+    if (dev.ring.host_ready) {
+      cudaFreeHost(dev.ring.host_ready);
+      dev.ring.host_ready = nullptr;
     }
 #endif
     dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();

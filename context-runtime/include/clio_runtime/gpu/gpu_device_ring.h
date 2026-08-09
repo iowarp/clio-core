@@ -2,15 +2,41 @@
  * All rights reserved. BSD 3-Clause License. See LICENSE file. */
 
 /**
- * The gpu2cpu submission ring, living in DEVICE memory.
+ * The gpu2cpu submission ring: SPLIT between device and pinned host memory.
  *
- * The queue used to live in host memory, which forced every device push to be
- * a SYSTEM-scoped atomic across PCIe -- illegal outright on GPUs that report
- * cudaDevAttrHostNativeAtomicSupported = 0 (this machine), and a bus round trip
- * even where it is legal. Moving the ring onto the device makes a push a plain
- * DEVICE-scope atomic on local memory, and makes Wait() poll local memory, so
- * the only PCIe traffic left is the CPU's batched drain: one copy carries many
- * requests instead of each request paying its own crossing.
+ * History, because both halves of this design were forced by measurement.
+ *
+ * The ring first lived entirely in host memory, which made every device push a
+ * SYSTEM-scoped atomic across PCIe -- illegal outright on GPUs reporting
+ * cudaDevAttrHostNativeAtomicSupported = 0 (this machine), not merely slow.
+ * Moving it wholesale onto the device fixed that: a push became a plain
+ * DEVICE-scope atomic on local memory.
+ *
+ * But an all-device ring cannot be READ by the host without a copy, so every
+ * poll cost a cudaMemcpyAsync plus a cudaStreamSynchronize -- even an idle one,
+ * which only probes head_. Profiling llama decode showed the bill: 1,015,702
+ * device-to-host copies averaging 95 bytes, 1.58M stream synchronizes, 8.7 s of
+ * cudaStreamSynchronize against 4.6 s of actual GPU work. Worse than the time
+ * itself, each call takes the CUDA context lock and contends with compute --
+ * the same mul_mat kernel measured 437 us median and 171 ms max.
+ *
+ * So the ring is split by WHO NEEDS ATOMICITY versus WHO NEEDS VISIBILITY:
+ *
+ *   head_, tail_        DEVICE memory. head_ is the target of atomicAdd, which
+ *                       must be device-scope to be legal here. tail_ is read by
+ *                       producers on every push, so it must be local to them.
+ *
+ *   ready_, entries_    PINNED HOST memory, mapped so the device can write it.
+ *                       The host then reads submissions with ordinary loads:
+ *                       no copy, no synchronize, no context lock.
+ *
+ * Publication uses __threadfence_system() and volatile stores rather than a
+ * host-memory atomic, so nothing here depends on native host atomics.
+ *
+ * The consumer no longer probes head_ at all. A stamp IS the arrival signal:
+ * the host looks at ready_[tail & mask] and, if it carries the generation it
+ * expects, an entry is there. An idle poll is therefore one host load of
+ * pinned memory and costs no CUDA API whatsoever.
  *
  * LAYOUT IS DELIBERATELY EXPLICIT AND POD. The CPU reads these fields by
  * cudaMemcpy from device memory, so it cannot rely on any container's internal
@@ -77,10 +103,16 @@ struct GpuDeviceRing {
   unsigned long long head_ = 0;
   /** Consumer position. Host-owned; published H2D so producers see space. */
   unsigned long long tail_ = 0;
-  /** Publication stamps, one per slot (see the sequence rule above). */
-  unsigned int ready_[kGpuRingCapacity] = {};
-  /** The submissions. */
-  GpuRingEntry entries_[kGpuRingCapacity] = {};
+  /**
+   * Publication stamps and submissions, in PINNED HOST memory.
+   *
+   * These are device pointers OBTAINED FROM cudaHostGetDevicePointer for a
+   * mapped host allocation, so the same bytes are addressable from a kernel
+   * and from ordinary host code. They are pointers rather than inline arrays
+   * precisely because the storage is not in this struct's memory space.
+   */
+  unsigned int *ready_ = nullptr;
+  GpuRingEntry *entries_ = nullptr;
 
 #if CTP_IS_GPU_COMPILER
   /**
@@ -112,7 +144,12 @@ struct GpuDeviceRing {
     }
 
     entries_[idx] = e;
-    __threadfence();                          // entry visible before its stamp
+    // SYSTEM scope, not device scope: the reader is the CPU, and a plain
+    // __threadfence() only orders against other device threads. This is a
+    // FENCE, not an atomic, so it is well defined regardless of whether the
+    // GPU supports native atomics on host memory -- which is the property that
+    // lets the payload live in host memory at all.
+    __threadfence_system();                   // entry visible before its stamp
     *const_cast<volatile unsigned int *>(&ready_[idx]) = stamp;
     return true;
   }
