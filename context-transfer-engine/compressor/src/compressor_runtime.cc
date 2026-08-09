@@ -51,6 +51,7 @@
 #include "clio_runtime/work_orchestrator.h"
 #include "clio_runtime/worker.h"
 #include "clio_ctp/compress/compress_factory.h"
+#include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
 
@@ -114,6 +115,51 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   if (!config_.next_pool_id_.IsNull()) {
     core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
   }
+
+  // One GPU stream for every GPU codec this module hands out, created HERE --
+  // once, at module creation -- and never inside an operation.
+  //
+  // A codec that creates its own stream deadlocks the device: cudaStreamCreate
+  // blocks while a kernel is resident, and the kernels a GPU codec serves are
+  // precisely the ones suspended waiting for the compress or decompress being
+  // set up. Creating it at Create time is also simply where it belongs: stream
+  // creation is expensive and its cost has nothing to do with any one blob.
+#if CTP_ENABLE_GPU
+  if (gpu_stream_ == nullptr) {
+    gpu_stream_ = ctp::GpuApi::CreateStream();
+    ctp::CompressionFactory::SetGpuStream(gpu_stream_);
+    HLOG(kInfo, "compressor: GPU codec stream created ({})",
+         gpu_stream_ != nullptr ? "ok" : "unavailable, using default stream");
+  }
+#endif
+
+#if CTP_ENABLE_GPU
+  // One device allocation for the compressed side of GPU codec operations.
+  // See the header for why this cannot be done per operation.
+  if (gpu_scratch_base_ == nullptr) {
+    size_t total_bytes = 128ULL << 20;
+    if (const char *e = std::getenv("CLIO_COMPRESS_GPU_SCRATCH_MB")) {
+      const long mb = std::atol(e);
+      if (mb > 0) total_bytes = static_cast<size_t>(mb) << 20;
+    }
+    constexpr size_t kSlabs = 16;
+    gpu_scratch_slab_ = total_bytes / kSlabs;
+    gpu_scratch_base_ = ctp::GpuApi::Malloc<char>(total_bytes);
+    if (gpu_scratch_base_ != nullptr) {
+      gpu_scratch_free_.reserve(kSlabs);
+      for (size_t i = 0; i < kSlabs; ++i) {
+        gpu_scratch_free_.push_back(gpu_scratch_base_ + i * gpu_scratch_slab_);
+      }
+      HLOG(kInfo, "compressor: {} MB device scratch ({} slabs of {} KB)",
+           total_bytes >> 20, kSlabs, gpu_scratch_slab_ >> 10);
+    } else {
+      gpu_scratch_slab_ = 0;
+      HLOG(kWarning,
+           "compressor: device scratch allocation failed -- GPU codecs will "
+           "use the host path");
+    }
+  }
+#endif
 
   // Initialize atomic counters
   compression_logical_time_ = 0;
@@ -1223,6 +1269,49 @@ clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumers
 // shared with the replication chimod; only the transform policy lives here.
 // ============================================================================
 
+char *Runtime::AcquireGpuScratch(size_t bytes) {
+  std::lock_guard<std::mutex> guard(gpu_scratch_mu_);
+  if (bytes > gpu_scratch_slab_ || gpu_scratch_free_.empty()) {
+    return nullptr;
+  }
+  char *p = gpu_scratch_free_.back();
+  gpu_scratch_free_.pop_back();
+  return p;
+}
+
+void Runtime::ReleaseGpuScratch(char *ptr) {
+  if (ptr == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(gpu_scratch_mu_);
+  gpu_scratch_free_.push_back(ptr);
+}
+
+bool Runtime::IsGpuCodec(int wire_id) {
+  if (wire_id <= 0) {
+    return false;
+  }
+  const std::string name = ctp::CompressionFactory::NameForWireId(wire_id);
+  return name.rfind("nvcomp-", 0) == 0;
+}
+
+int Runtime::CpuEquivalentCodec(int gpu_wire_id) {
+  const std::string name =
+      ctp::CompressionFactory::NameForWireId(gpu_wire_id);
+  if (name.rfind("nvcomp-", 0) != 0) {
+    return gpu_wire_id;
+  }
+  // "nvcomp-lz4" -> "lz4", and so on. gdeflate/deflate have no exact CPU twin
+  // in the registry; zlib is the same DEFLATE bitstream family, and ans has
+  // none at all, which GetWireId reports as 0 (store raw).
+  std::string cpu = name.substr(7);
+  if (cpu == "gdeflate" || cpu == "deflate") {
+    cpu = "zlib";
+  }
+  const int id = ctp::CompressionFactory::GetWireId(cpu);
+  return id;
+}
+
 bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
                               clio::run::u64 size,
                               ctp::ipc::FullPtr<char> *stored,
@@ -1396,6 +1485,41 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
                                   task.template Cast<clio::run::Task>()));
       CLIO_CO_RETURN;
     }
+    // A GPU codec CANNOT run here. This handler services a gpu_vector page
+    // fault, which means a kernel is resident on the device and spinning until
+    // this returns; a GPU codec needs that same device to do its work, so it
+    // blocks forever waiting for a kernel that is waiting for it. Measured
+    // directly: NvComp::Compress was entered and never returned, and the
+    // runtime's own stall detector reported the worker stuck on one task for
+    // 87 seconds. Preallocating the stream and every buffer -- so nvcomp
+    // allocates nothing at all -- does not help, because the cycle is over the
+    // DEVICE, not over any allocator.
+    //
+    // Substitute the CPU codec of the same family rather than failing: the
+    // header records the codec actually used, so readers stay correct, and the
+    // caller gets compression instead of a hang. Making a GPU codec genuinely
+    // work for a paging consumer needs decompression that does not contend
+    // with the consumer kernel -- either driven off the fault path entirely,
+    // or performed device-side inside the consumer itself.
+    if (IsGpuCodec(ctx.compress_lib_)) {
+      const int cpu_lib = CpuEquivalentCodec(ctx.compress_lib_);
+      static std::once_flag warned;
+      std::call_once(warned, [&]() {
+        HLOG(kWarning,
+             "compressor: GPU codec '{}' cannot service a device page fault "
+             "(the faulting kernel holds the device); using CPU codec '{}' "
+             "instead",
+             ctp::CompressionFactory::NameForWireId(ctx.compress_lib_),
+             ctp::CompressionFactory::NameForWireId(cpu_lib));
+      });
+      ctx.compress_lib_ = cpu_lib;
+      if (ctx.compress_lib_ <= 0) {
+        CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
+                                    task.template Cast<clio::run::Task>()));
+        CLIO_CO_RETURN;
+      }
+    }
+
     // Stage device -> host. DeviceAwareMemcpy resolves the pointer kind, so
     // this is also correct when the producer handed us host memory.
     //

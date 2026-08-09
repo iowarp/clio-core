@@ -85,14 +85,26 @@ enum class NvCompAlgo {
  */
 class NvComp : public Compressor {
  public:
-  explicit NvComp(NvCompAlgo algo = NvCompAlgo::LZ4) : algo_(algo) {}
+  /**
+   * @param algo    algorithm this instance runs
+   * @param stream  stream to run on, owned by the CALLER and created once
+   *                (see CompressionFactory::SetGpuStream). Null means the
+   *                default stream.
+   *
+   * This class deliberately does NOT create a stream. cudaStreamCreate blocks
+   * while a kernel is resident, and the kernels a GPU codec serves are exactly
+   * the ones that spin waiting for it: a gpu_vector page fault suspends its
+   * block until the page comes back, so creating a stream inside the fault
+   * deadlocks the device against itself (measured: a 2 GB nvcomp run made no
+   * progress in ten minutes). Streams are created once, when the owning module
+   * is created, and handed in here.
+   */
+  explicit NvComp(NvCompAlgo algo = NvCompAlgo::LZ4, void *stream = nullptr)
+      : algo_(algo), stream_(static_cast<cudaStream_t>(stream)) {}
 
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    cudaStream_t stream = stream_;  // caller-owned; never created here
     uint8_t *d_in = nullptr;
     uint8_t *d_out = nullptr;
     bool free_in = false;
@@ -148,16 +160,13 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+
     return ok;
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    cudaStream_t stream = stream_;  // caller-owned; never created here
     uint8_t *d_in = nullptr;
     uint8_t *d_out = nullptr;
     bool free_in = false;
@@ -205,7 +214,7 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+
     return ok;
   }
 
@@ -296,6 +305,8 @@ class NvComp : public Compressor {
 #undef CTP_NVCOMP_MAKE
 
   NvCompAlgo algo_;
+  /** Not owned: created once by the module, outlives every operation. */
+  cudaStream_t stream_ = nullptr;
 };
 
 }  // namespace ctp

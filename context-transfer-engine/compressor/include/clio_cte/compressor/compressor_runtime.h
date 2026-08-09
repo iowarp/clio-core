@@ -286,6 +286,52 @@ private:
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
   ctp::ipc::ShmPtr<CompressionTelemetryLog> compression_telemetry_log_;
   std::atomic<std::uint64_t> compression_logical_time_;
+  /** Stream every GPU codec runs on, created once in Create() and handed to
+   *  CompressionFactory. Owned here, so it outlives any compressor the factory
+   *  produced. Null on a build or host with no GPU, which the codecs read as
+   *  "use the default stream". */
+  void *gpu_stream_ = nullptr;
+
+  /**
+   * Device buffers for the COMPRESSED side of a GPU codec operation: one
+   * allocation, carved into equal slabs, one slab per in-flight operation.
+   *
+   * This is not a staging copy of the payload. The payload never needs one:
+   * on a read the destination is already the caller's device page and nvcomp
+   * decompresses straight into it; on a write the source is already the
+   * device page. What needs a buffer is the compressed bitstream -- it has to
+   * be read out of (or written into) a CTE blob, and on a write its size is
+   * not known until the codec finishes, so it cannot go directly into a
+   * right-sized blob buffer.
+   *
+   * Preallocated because the alternative is nvcomp allocating it per call.
+   * nvcomp allocates NOTHING when handed device pointers on both sides; it
+   * falls back to cudaMalloc only because a host buffer forces it to. That
+   * fallback does not merely cost time, it hangs: cudaMalloc and especially
+   * cudaFree synchronize the device, and a gpu_vector page fault runs while
+   * its block spins waiting for the very operation being set up -- so the
+   * allocation waits on a kernel that is waiting on the allocation. (Measured:
+   * 128 MB through nvcomp made no progress in 200 s.) Stream creation had the
+   * identical failure mode, which is why the stream above is created once too.
+   *
+   * A request larger than a slab, or one arriving with every slab out, is
+   * refused. Callers must fall back to the host path or store raw -- never
+   * allocate.
+   */
+  char *gpu_scratch_base_ = nullptr;
+  size_t gpu_scratch_slab_ = 0;
+  std::vector<char *> gpu_scratch_free_;
+  std::mutex gpu_scratch_mu_;
+
+  /** @return a device buffer of at least `bytes`, or nullptr. Never allocates. */
+  char *AcquireGpuScratch(size_t bytes);
+  /** Return a buffer from AcquireGpuScratch; null is ignored. */
+  void ReleaseGpuScratch(char *ptr);
+  /** @return true if `wire_id` names a codec that runs on the GPU. */
+  static bool IsGpuCodec(int wire_id);
+  /** @return the CPU codec of the same family as a GPU codec, or 0 if none.
+   *  Used on the device page-fault path, where a GPU codec cannot run. */
+  static int CpuEquivalentCodec(int gpu_wire_id);
 
   // Configuration
   CompressorConfig config_;

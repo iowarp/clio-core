@@ -200,6 +200,19 @@ class CompressionFactory {
   }
 
   /**
+   * Reverse of NameForWireId: the frozen wire id for a canonical name.
+   *
+   * @param library_name canonical lowercase name (or a registered alias)
+   * @return the wire id, or 0 if the name is not in the registry. 0 is the
+   *         same "no codec" value the CTE context uses, so a caller can pass
+   *         the result straight through without a special case.
+   */
+  static int GetWireId(const std::string& library_name) {
+    const CompressorInfo* info = FindByName(library_name);
+    return info ? info->wire_id : 0;
+  }
+
+  /**
    * Get string name for preset.
    *
    * @param preset Compression preset
@@ -215,7 +228,33 @@ class CompressionFactory {
     }
   }
 
+  /**
+   * Set the stream every GPU codec runs on.
+   *
+   * Called ONCE by the module that owns GPU compression, when that module is
+   * created -- not per operation. A GPU codec must never create its own
+   * stream: cudaStreamCreate blocks while a kernel is resident, and the
+   * kernels these codecs serve are the ones waiting on the very operation
+   * being set up, so creating a stream inside a page fault deadlocks the
+   * device against itself.
+   *
+   * The stream is owned by the caller and must outlive every compressor this
+   * factory hands out. A null stream (nothing ever set it) means the default
+   * stream, which always exists.
+   */
+  static void SetGpuStream(void *stream) { GpuStreamSlot() = stream; }
+
+  /** @return the stream set by SetGpuStream, or null for the default one. */
+  static void *GetGpuStream() { return GpuStreamSlot(); }
+
  private:
+  /** Storage for the process-wide GPU codec stream. Function-local static so
+   *  the header stays free of a definition. */
+  static void *&GpuStreamSlot() {
+    static void *stream = nullptr;
+    return stream;
+  }
+
   /** Signature of a function that constructs a compressor for a given preset. */
   using MakeFn = std::unique_ptr<Compressor> (*)(CompressionPreset);
 
@@ -349,35 +388,35 @@ class CompressionFactory {
   }
   static std::unique_ptr<Compressor> MakeNvCompSnappy(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY);
+    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY, GetGpuStream());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompZstd(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::ZSTD);
+    return std::make_unique<NvComp>(NvCompAlgo::ZSTD, GetGpuStream());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompGdeflate(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE);
+    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE, GetGpuStream());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompDeflate(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE);
+    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE, GetGpuStream());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompAns(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::ANS);
+    return std::make_unique<NvComp>(NvCompAlgo::ANS, GetGpuStream());
 #else
     return nullptr;
 #endif

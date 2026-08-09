@@ -62,7 +62,8 @@ namespace {
 
 const clio::run::PoolId kCompressorPool(512, 0);
 const clio::run::PoolId kCorePool(513, 0);
-constexpr int kLz4WireId = 4;  // CompressionFactory registry: {"lz4", 4, ...}
+constexpr int kLz4WireId = 4;         // registry: {"lz4", 4, ...}      CPU
+constexpr int kNvcompLz4WireId = 11;  // registry: {"nvcomp-lz4", 11, ...} GPU
 
 }  // namespace
 
@@ -190,6 +191,7 @@ int main(int argc, char **argv) {
   u32 threads = 256;
   u64 stored_sample = 1024;  // pages probed for the stored-size estimate
   bool compressed = false;
+  bool gpu_codec = false;  // nvcomp: decompress ON the GPU
   const char *tier_type = "pinned";  // pageable staging halves device I/O
 
   for (int i = 1; i < argc; ++i) {
@@ -207,6 +209,7 @@ int main(int argc, char **argv) {
     else if (f == "--threads") threads = static_cast<u32>(std::atoll(next()));
     else if (f == "--stored-sample") stored_sample = std::atoll(next());
     else if (f == "--compressed") compressed = true;
+    else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
     else if (f == "--help") {
       std::printf(
@@ -291,13 +294,15 @@ int main(int argc, char **argv) {
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
   const std::string tag =
-      std::string("gvs_") + (compressed ? "lz4" : "raw") + "_" +
+      std::string("gvs_") + (!compressed ? "raw" : (gpu_codec ? "nvlz4" : "lz4")) + "_" +
       std::to_string(total_mb) + "_" + std::to_string(vram_mb) + "_" +
       std::to_string(zero_pct) + "_" + std::to_string(page_kb);
 
   gv::Vector<u32> vec(tag, {0}, page_bytes, blocks,
                       static_cast<u32>(pages_per_block_resident), n,
-                      kCompressorPool, compressed ? kLz4WireId : 0);
+                      kCompressorPool,
+                      !compressed ? 0
+                                  : (gpu_codec ? kNvcompLz4WireId : kLz4WireId));
   auto dev = vec.GetDevice(0);
 
   // ---- write stream --------------------------------------------------------
@@ -379,7 +384,7 @@ int main(int argc, char **argv) {
       "page=%lluKB zero=%u%% vram=%lluMB total=%.0fMB stored=%.0fMB "
       "ratio=%.2fx oversub=%.2fx "
       "write_ms=%.1f write_GBps=%.2f read_ms=%.1f read_GBps=%.2f checksum=%s\n",
-      compressed ? "lz4" : "raw", blocks, threads,
+      !compressed ? "raw" : (gpu_codec ? "nvcomp-lz4" : "lz4"), blocks, threads,
       (unsigned long long) pages_per_block,
       (unsigned long long) pages_per_block_resident,
       (unsigned long long) page_kb, zero_pct, (unsigned long long) vram_mb,
