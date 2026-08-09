@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zlib_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zlib_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_ZLIB
 
 #include <zlib.h>
 
@@ -105,6 +106,6 @@ class Zlib : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_ZLIB
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zlib_H_

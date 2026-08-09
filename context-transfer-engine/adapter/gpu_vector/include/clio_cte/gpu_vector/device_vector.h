@@ -53,6 +53,7 @@ class DeviceVector {
   /** Codec wire id stamped on page PUTs. 0 stores raw. The compressor pool
    *  reads this from the task context to decide whether to compress. */
   int compress_lib_ = 0;
+  int compress_preset_ = 1;  // 1 FAST -- see gpu_vector.h
   /**
    * Device-global counter handing out strictly increasing task ids.
    *
@@ -83,6 +84,20 @@ class DeviceVector {
    * find the page resident, which is the behaviour the "a warp sees one page"
    * contract always implied but never enforced.
    */
+  /**
+   * Batched writeback state, one MultiPutBatch array per block.
+   *
+   * A page flush costs one task SUBMISSION per page, and on the device path
+   * that submission is the expense -- a context entry is a fixed cost whatever
+   * rides on it. `multi_per_block_` is sized so a block's ENTIRE page cache
+   * fits in that many batches (ceil(pages_per_block_ / kPodMultiMax)), which
+   * is the case worth optimizing: 256 pages flush in 4 submissions, not 256.
+   *
+   * Null / zero when the host did not provision them, in which case
+   * FlushBlockBatched falls back to the scalar path.
+   */
+  MultiBatch *multi_ = nullptr;
+  clio::run::u32 multi_per_block_ = 0;
   int *block_locks_ = nullptr;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
@@ -325,6 +340,55 @@ class DeviceVector {
   }
 
   /**
+   * Write back every dirty page in THIS block using batched puts.
+   *
+   * Synchronous by construction: all batches are submitted, then all are
+   * waited on, with the block lock held the whole time. That is what makes it
+   * safe to add without a new state machine -- no other thread can observe a
+   * page mid-batch, so pages need no per-page `flushing` bookkeeping and the
+   * existing scalar invariants are untouched. The overlap that matters is
+   * already there: the batches are all in flight at once.
+   *
+   * A page is marked clean only if ITS OWN record succeeded. The scalar path
+   * clears `dirty` at submission time; here the per-record return code is
+   * available, so a failed page stays dirty and will be retried rather than
+   * being silently dropped.
+   *
+   * @return the number of pages successfully written back.
+   */
+  CTP_GPU_FUN clio::run::u32 FlushBlockBatched() {
+    LockBlock();
+    const clio::run::u32 n = FlushBlockBatchedLocked();
+    UnlockBlock();
+    return n;
+  }
+
+  /**
+   * Fault pages [first_page, first_page + n) into this block's cache with
+   * BATCHED gets, and wait for them.
+   *
+   * This is the read-side counterpart to FlushBlockBatched, and it exists for
+   * the same measured reason: a fault costs ~110us of round trip against ~6us
+   * of actual 256 KB device-to-device copy, so the SUBMISSION is ~95% of a
+   * read and cutting bytes (by compressing) cannot pay for itself while every
+   * page costs one. n pages in one submission amortizes that, which is the
+   * only way reduced bytes can turn into reduced time.
+   *
+   * Blocking by design: a streaming reader asks for its next chunk, gets it
+   * all at once, and then walks it with no faults at all. `n` is clamped to
+   * what the cache can actually hold and to kPodMultiMax.
+   *
+   * @return the number of pages now resident and valid.
+   */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatched(clio::run::u64 first_page,
+                                               clio::run::u32 n) {
+    LockBlock();
+    const clio::run::u32 got = FetchPagesBatchedLocked(first_page, n);
+    UnlockBlock();
+    return got;
+  }
+
+  /**
    * Start faulting `page_num` in WITHOUT waiting for it.
    *
    * This is what makes compute and I/O overlap: the kernel asks for the page
@@ -457,6 +521,12 @@ class DeviceVector {
     return static_cast<clio::run::u64>(clock64());
   }
 
+  /** This block's batch slots -- same partitioning as the page table. */
+  CTP_GPU_FUN MultiBatch *BlockBatches() const {
+    const clio::run::u32 b = blockIdx.x % nblocks_;
+    return multi_ + static_cast<clio::run::u64>(b) * multi_per_block_;
+  }
+
   /** This block's slice of the page table. */
   CTP_GPU_FUN Page *BlockPages() const {
     const clio::run::u32 b = blockIdx.x % nblocks_;
@@ -542,10 +612,27 @@ class DeviceVector {
     t->offset_ = 0;
     t->size_ = page_bytes_;
     t->blob_data_ = RawPtr(p->data);
-    t->score_ = p->score;
+    // An UNSCORED page must say "no opinion" (-1), not "score zero".
+    //
+    // The two numbers mean opposite things. Device-side, score 0 is this
+    // page's eviction rank -- the default, meaning "evict me first". To the
+    // CTE it is a placement request, and MaxBwDpe prefers targets whose
+    // target_score_ is <= the blob's; with tiers at 1.0 (top) and 0.2 (spill),
+    // a 0.0 blob matches NEITHER, so both became fallbacks and the ranking
+    // deliberately picks the slowest of those first. Every page therefore
+    // landed on the spill tier and the fast top tier went unused -- measured:
+    // reads under a throttled spill tier were fully throttled, while the same
+    // cap on the top tier changed nothing at all because nothing read from it.
+    //
+    // -1 asks the CTE for its default (1.0 for a new blob), i.e. the fastest
+    // tier that fits, which is what a page cache writing back hot data wants.
+    // An explicitly rescored page still sends its own score, so RescorePage
+    // keeps steering placement.
+    t->score_ = (p->score > 0.0f) ? p->score : -1.0f;
     t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
     ClearRunCtx(t);
     Bump(stat_puts_);
     p->put_fut = ipc_->Send(SlotPtr(p->put));
@@ -553,6 +640,200 @@ class DeviceVector {
     // when it was submitted. A later write dirties it again for the next.
     p->dirty = 0u;
     p->flushing = 1u;
+  }
+
+  /** Header fields of a batch task; the records are appended by the caller. */
+  CTP_GPU_FUN void PrepareMultiPut(
+      clio::cte::core::PodMultiPutBlobTask *t) const {
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindPut);
+    t->pool_id_ = pool_id_;
+    t->method_ = clio::cte::core::Method::kPodMultiPutBlob;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = tag_id_;
+    t->count_ = 0;
+    t->flags_ = 0;
+    t->num_ok_ = 0;
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
+    ClearRunCtx(t);
+  }
+
+  /** Header fields of a batched get; records are appended by the caller. */
+  CTP_GPU_FUN void PrepareMultiGet(
+      clio::cte::core::PodMultiGetBlobTask *t) const {
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindGet);
+    t->pool_id_ = pool_id_;
+    t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = tag_id_;
+    t->count_ = 0;
+    t->flags_ = 0;
+    t->num_ok_ = 0;
+    // Same codec the PUT declared: a page written through the compressor is
+    // STORED compressed, so a get with an empty context asks for the stored
+    // bytes rather than the data.
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
+    ClearRunCtx(t);
+  }
+
+  /** FlushBlockBatched's body, for callers already holding the block lock. */
+  CTP_GPU_FUN clio::run::u32 FlushBlockBatchedLocked() {
+    Page *tbl = BlockPages();
+    // Not provisioned (host did not allocate batch slots): do it scalar-wise
+    // rather than silently skipping the flush.
+    if (multi_ == nullptr || multi_per_block_ == 0) {
+      clio::run::u32 done = 0;
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (!tbl[i].dirty && !tbl[i].flushing) continue;
+        SubmitPut(&tbl[i]);
+        AwaitPut(&tbl[i]);
+        ++done;
+      }
+      return done;
+    }
+    // A scalar put still in flight owns that page's bytes; batching it now
+    // would put the same page on the wire twice.
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      if (tbl[i].flushing) AwaitPut(&tbl[i]);
+    }
+
+    MultiBatch *mb = BlockBatches();
+    clio::run::u32 nb = 0;              // batches with records in them
+    clio::run::u32 filled = 0;          // records in batch nb
+    PrepareMultiPut(mb[0].put);
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      Page *p = &tbl[i];
+      if (p->page_num == kNoPage || !p->dirty) continue;
+      if (filled == clio::cte::core::kPodMultiMax) {
+        // Full: submit and move on. multi_per_block_ is sized so this can
+        // only run out if the host provisioned fewer batches than pages.
+        mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
+        ++nb;
+        filled = 0;
+        if (nb == multi_per_block_) break;
+        PrepareMultiPut(mb[nb].put);
+      }
+      char name[32];
+      PageBlobName(p->page_num, name);
+      // Same placement contract as SubmitPut: an unscored page asks for the
+      // CTE's default tier rather than requesting score zero.
+      mb[nb].put->Add(name, 0, page_bytes_, RawPtr(p->data),
+                      (p->score > 0.0f) ? p->score : -1.0f);
+      mb[nb].page_slot[filled] = i;
+      ++filled;
+      Bump(stat_puts_);
+    }
+    clio::run::u32 nsub = nb;
+    if (filled > 0) {
+      mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
+      nsub = nb + 1;
+    }
+
+    clio::run::u32 ok = 0;
+    for (clio::run::u32 b = 0; b < nsub; ++b) {
+      mb[b].put_fut.Wait();
+      auto *t = mb[b].put;
+      for (clio::run::u32 r = 0; r < t->count_; ++r) {
+        Page *p = &tbl[mb[b].page_slot[r]];
+        // Clean only on this record's own success -- a failed page keeps its
+        // dirty bit and gets written back on the next flush or eviction.
+        if (t->reqs_[r].rc_ == 0) {
+          p->dirty = 0u;
+          ++ok;
+        }
+      }
+    }
+    return ok;
+  }
+
+  /** FetchPagesBatched's body, for callers already holding the block lock. */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedLocked(clio::run::u64 first_page,
+                                                     clio::run::u32 n) {
+    Page *tbl = BlockPages();
+    if (multi_ == nullptr || multi_per_block_ == 0) {
+      // Not provisioned: fault them one at a time rather than silently
+      // returning nothing.
+      clio::run::u32 got = 0;
+      for (clio::run::u32 k = 0; k < n; ++k) {
+        if (ResolveLocked(first_page + k) != nullptr) ++got;
+      }
+      return got;
+    }
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    // A batch cannot exceed the cache: claiming more slots than exist would
+    // evict a page this same batch already claimed.
+    if (n > pages_per_block_) n = pages_per_block_;
+
+    MultiBatch *mb = BlockBatches();
+    PrepareMultiGet(mb[0].get);
+    clio::run::u32 filled = 0;
+    clio::run::u32 resident = 0;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first_page + k;
+      Page *p = Find(pg);
+      if (p != nullptr) {
+        // Already here (or already in flight from a scalar prefetch): let the
+        // existing path finish it rather than issuing a second get.
+        if (p->fetching) AwaitFetch(p);
+        ++resident;
+        continue;
+      }
+      clio::run::u32 slot = pages_per_block_;
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (tbl[i].page_num == kNoPage) { slot = i; break; }
+      }
+      if (slot == pages_per_block_) {
+        EvictLocked(1);
+        for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+          if (tbl[i].page_num == kNoPage) { slot = i; break; }
+        }
+        if (slot == pages_per_block_) break;  // everything is pinned
+      }
+      Page *np = &tbl[slot];
+      // fetching FIRST, then the page number -- same ordering the scalar claim
+      // uses, and it is what keeps EvictLocked from choosing a slot this batch
+      // has already claimed but not yet filled.
+      np->fetching = 1u;
+      __threadfence_block();
+      np->page_num = pg;
+      np->dirty = 0u;
+      np->flushing = 0u;
+      np->score = 0.0f;
+      char name[32];
+      PageBlobName(pg, name);
+      mb[0].get->Add(name, 0, page_bytes_, RawPtr(np->data));
+      mb[0].page_slot[filled] = slot;
+      ++filled;
+      Bump(stat_faults_);
+      Bump(stat_prefetches_);
+    }
+    if (filled == 0) return resident;
+
+    mb[0].get_fut = ipc_->Send(SlotPtr(mb[0].get));
+    mb[0].get_fut.Wait();
+    auto *t = mb[0].get;
+    clio::run::u32 ok = 0;
+    for (clio::run::u32 r = 0; r < filled; ++r) {
+      Page *p = &tbl[mb[0].page_slot[r]];
+      p->fetching = 0u;
+      if (r < t->count_ && t->reqs_[r].rc_ == 0) {
+        ++ok;
+      } else {
+        // A failed get leaves the slot holding whatever it held before. Free
+        // it rather than letting the caller read those bytes as this page --
+        // serving stale data silently is the one outcome worse than a miss.
+        p->page_num = kNoPage;
+        Bump(stat_get_errors_);
+      }
+    }
+    return resident + ok;
   }
 
   CTP_GPU_FUN void AwaitPut(Page *p) {
@@ -638,6 +919,18 @@ class DeviceVector {
     t->size_ = page_bytes_;
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
+    // The GET must declare the same codec the PUT did. A page written through
+    // the compressor is stored in its COMPRESSED form, so a reader that says
+    // nothing about compression is asking for the stored bytes, not its data.
+    // This was latent for as long as the compressor decompressed every device
+    // read regardless of what the request asked for; the moment the no-codec
+    // read became a straight pass-through to the core (the copy this avoids is
+    // a whole extra staging round trip), a get with an empty context silently
+    // returned compressed bytes -- and only for pages the codec had actually
+    // shrunk, so incompressible data still looked correct.
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
     ClearRunCtx(t);
   }
 

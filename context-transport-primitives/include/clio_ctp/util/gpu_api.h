@@ -404,6 +404,48 @@ class GpuApi {
 #endif
   }
 
+  /**
+   * Like IsDevicePointer, but TRUE for managed (UVM) memory too.
+   *
+   * Managed memory is addressable by both the host and every context on the
+   * device, so for the question "may a GPU touch this?" it is a yes -- while
+   * cudaPointerGetAttributes reports it as cudaMemoryTypeManaged, not
+   * ...TypeDevice, so the stricter check says no. Use THIS one to decide
+   * whether to take a GPU path; use IsDevicePointer only when the memory must
+   * be device-resident specifically.
+   *
+   * gpu_vector's page cache is managed precisely so a codec running in another
+   * CUDA context can write into a faulting page. With the strict check those
+   * pages read as host memory and every GPU path silently declines.
+   */
+  template <typename T>
+  static bool IsDeviceAccessiblePointer(T *ptr) {
+    if (ptr == nullptr) return false;
+#if CTP_ENABLE_ROCM
+    hipPointerAttribute_t a{};
+    if (hipPointerGetAttributes(&a, (void *)ptr) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+#if defined(HIP_VERSION) && HIP_VERSION >= 60000000
+    return a.type == hipMemoryTypeDevice || a.type == hipMemoryTypeManaged;
+#else
+    return a.memoryType == hipMemoryTypeDevice ||
+           a.memoryType == hipMemoryTypeManaged;
+#endif
+#elif CTP_ENABLE_CUDA
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, (void *)ptr) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+#else
+    (void)ptr;
+    return false;
+#endif
+  }
+
   template <typename T>
   static void Memset(T *dst, int value, size_t size) {
     if (IsDevicePointer(dst)) {
@@ -663,6 +705,12 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
 /** True if ptr is device (USM) memory the host cannot dereference; false on a
  *  non-GPU build. Header-only replacement for the old g_is_device_pointer
  *  hook. */
+/** True if a GPU may touch `ptr`: device OR managed memory. Prefer this over
+ *  IsDevicePointer when deciding whether to take a GPU path. */
+inline bool IsDeviceAccessible(const void *ptr) {
+  return GpuApi::IsDeviceAccessiblePointer(const_cast<void *>(ptr));
+}
+
 inline bool IsDevicePointer(const void *ptr) {
   return GpuApi::IsDevicePointer(const_cast<void *>(ptr));
 }

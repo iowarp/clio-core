@@ -156,6 +156,78 @@ __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
   v.WaitFlush(off, count);
 }
 
+/**
+ * Fill `npages` pages, then write the WHOLE block cache back with batched
+ * puts. Reports how many pages the batched flush claims it wrote.
+ */
+__global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u64 npages, u32 salt,
+                                 unsigned long long *flushed) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  for (u64 p = 0; p < npages; ++p) {
+    const u64 base = p * v.elems_per_page_;
+    for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
+      const clio::run::u64 run_i = v.HoldPage(base + i, v.elems_per_page_ - i);
+      for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
+        v[base + i] = Val(base + i, salt);
+      }
+    }
+  }
+  atomicAdd(flushed,
+            static_cast<unsigned long long>(v.FlushBlockBatched()));
+}
+
+/**
+ * Batched-fetch `npages` in chunks of `chunk`, then verify every element.
+ * Reports mismatches and how many pages the batched fetch reported resident.
+ */
+__global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u64 npages, u32 chunk,
+                                 u32 salt, unsigned long long *bad,
+                                 unsigned long long *got) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  unsigned long long local = 0;
+  unsigned long long fetched = 0;
+  for (u64 k = 0; k < npages; k += chunk) {
+    u64 n = npages - k;
+    if (n > chunk) n = chunk;
+    fetched += v.FetchPagesBatched(k, static_cast<u32>(n));
+    for (u64 j = 0; j < n; ++j) {
+      const u64 off = (k + j) * v.elems_per_page_;
+      v.HoldPage(off, v.elems_per_page_);
+      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+        if (v[off + i] != Val(off + i, salt)) ++local;
+      }
+    }
+  }
+  atomicAdd(bad, local);
+  atomicAdd(got, fetched);
+}
+
+/** Drop the calling block's cache, so the next reads must fault. */
+__global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<u32> v) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  v.DropAll();
+}
+
+/** Batched-flush a block whose pages should already be clean. */
+__global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v,
+                                 unsigned long long *flushed) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  atomicAdd(flushed,
+            static_cast<unsigned long long>(v.FlushBlockBatched()));
+}
+
 __global__ void SizeKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 *out) {
   CLIO_GPU_INIT(info, nullptr);
@@ -395,6 +467,68 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
 
   unsigned long long *bad = NewCounter();
   unsigned long long *sink = NewCounter();
+
+  // -------------------------------------------------------------------
+  // BATCHED WRITEBACK. A block's whole page cache goes back in
+  // ceil(slots / kPodMultiMax) submissions instead of one per page. The
+  // check that matters is from the HOST: "the kernel believes it flushed"
+  // and "the bytes are in the CTE" are different claims, and a batch that
+  // silently dropped records would pass a device-side readback because the
+  // pages are still resident and still hold the values.
+  // -------------------------------------------------------------------
+  {
+    const u64 kPages = 6;
+    Fixture f("gv_sem_batch_flush", 1, static_cast<u32>(kPages), kPages);
+    unsigned long long *flushed = NewCounter();
+    BatchFlushKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 21u, flushed);
+    Sync();
+    const unsigned long long nflushed = ReadCounter(flushed);
+    std::fprintf(stderr, "[batch-flush] pages=%llu flushed=%llu\n",
+                 (unsigned long long) kPages, nflushed);
+    // Every dirty page, and no more: a batch that double-counted records or
+    // one that stopped at the first would both miss this.
+    REQUIRE(nflushed == kPages);
+    for (u64 p = 0; p < kPages; ++p) {
+      REQUIRE(HostPageMatches(f.vec.TagId(), p, 21u));
+    }
+    // The pages are clean now, so a second batched flush has nothing to do.
+    unsigned long long *again = NewCounter();
+    FlushAgainKernel<<<1, 32>>>(g_gpu, f.dev, again);
+    Sync();
+    REQUIRE(ReadCounter(again) == 0);
+    cudaFree(flushed);
+    cudaFree(again);
+  }
+
+  // -------------------------------------------------------------------
+  // BATCHED FAULTING. One get per chunk of pages instead of one per page.
+  // The data must be identical to what per-page faulting returns -- a batch
+  // that mismatched a record to its slot would return the RIGHT bytes for
+  // the WRONG page, which no checksum over a single page can catch, so this
+  // verifies every element of every page against its own page number.
+  // -------------------------------------------------------------------
+  {
+    const u64 kPages = 12;
+    // Cache smaller than the working set: chunks must evict and refill,
+    // which is where a slot-reuse bug would show.
+    Fixture f("gv_sem_batch_fetch", 1, 4, kPages);
+    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1);
+    Sync();
+    DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
+    Sync();
+
+    unsigned long long *got = NewCounter();
+    f.Reset();
+    BatchFetchKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got);
+    Sync();
+    const unsigned long long nbad = ReadCounter(bad);
+    std::fprintf(stderr, "[batch-fetch] pages=%llu resident=%llu bad=%llu\n",
+                 (unsigned long long) kPages, ReadCounter(got), nbad);
+    REQUIRE(nbad == 0);
+    REQUIRE(ReadCounter(got) == kPages);
+    REQUIRE(cudaMemset(bad, 0, sizeof(*bad)) == cudaSuccess);
+    cudaFree(got);
+  }
 
   // -------------------------------------------------------------------
   // A resident page is a HIT. Nothing else in the suite proves the cache

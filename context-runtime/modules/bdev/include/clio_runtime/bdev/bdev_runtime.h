@@ -152,6 +152,54 @@ class Runtime : public clio::run::Container {
 
   Client client_;
   BdevType bdev_type_;
+  /**
+   * Optional synthetic bandwidth cap, in MB/s; 0 disables it.
+   *
+   * Tiering questions -- "is it worth compressing what spills?" -- are only
+   * answerable when the spill tier is actually slower than the thing you are
+   * trading against. On a host whose every tier is RAM-speed there is no such
+   * tier to measure against, and the answer comes out "never" for reasons that
+   * are about the host rather than about the design.
+   *
+   * Set per bdev from the environment (CLIO_BDEV_THROTTLE_MBPS, restricted to
+   * the pools named by CLIO_BDEV_THROTTLE_MATCH) so it can only ever be armed
+   * deliberately: a benchmarking facility, not a config surface, and off in
+   * every normal run.
+   */
+  double throttle_mbps_ = 0.0;
+
+  /**
+   * Shared completion timeline for the cap, in microseconds.
+   *
+   * A per-request delay is NOT a bandwidth cap. Delaying each transfer by the
+   * time it "should" have taken caps LATENCY, and concurrency hides latency:
+   * with 16 blocks in flight the waits overlapped and a 400 MB/s cap measured
+   * 3.8 GB/s, i.e. no cap at all. Each request instead reserves the next slice
+   * of this timeline, so N concurrent requests queue up behind one another and
+   * the device delivers the configured rate no matter how many are in flight.
+   */
+  std::atomic<double> throttle_next_free_us_{0.0};
+
+  /**
+   * Per-device I/O accounting, armed by CLIO_BDEV_IO_TRACE.
+   *
+   * Tiering questions need to know what each TIER actually did, and the
+   * aggregate counters cannot answer that: they say nothing about which
+   * device served the traffic, so "the pager wrote 128 MB" and "the pager
+   * wrote 128 MB three times to the slowest tier" look identical. Measuring
+   * this is what exposed both the placement bug and the write amplification.
+   */
+  bool io_trace_ = false;
+  clio::run::u64 io_trace_period_ = 64;
+  std::string trace_name_;
+  std::atomic<clio::run::u64> trace_r_ops_{0}, trace_r_bytes_{0};
+  std::atomic<clio::run::u64> trace_w_ops_{0}, trace_w_bytes_{0};
+
+  /** Log this device's running totals every `kIoTracePeriod` operations. */
+  void TraceIo(clio::run::u64 bytes, bool is_write);
+
+  /** Reserve this transfer's slice of the device timeline and wait for it. */
+  clio::run::TaskResume ThrottleFor(clio::run::u64 bytes);
 
   std::unique_ptr<BdevTransport> transport_;
 

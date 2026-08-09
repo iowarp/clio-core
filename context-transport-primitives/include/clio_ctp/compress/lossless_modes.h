@@ -36,14 +36,30 @@
 
 #if CTP_ENABLE_COMPRESS
 
+// Each codec's header AND its wrapper class are compiled out when the
+// library was not found at configure time (see the note in snappy.h). The
+// LosslessMode enum below stays unconditional: it is a plain enum the factory
+// and callers name regardless of which codecs exist.
+#if CTP_ENABLE_ZLIB
 #include <zlib.h>
+#endif
+#if CTP_ENABLE_BZIP2
 #include <bzlib.h>
+#endif
+#if CTP_ENABLE_ZSTD
 #include <zstd.h>
+#endif
+#if CTP_ENABLE_LZ4
 #include <lz4.h>
 #include <lz4hc.h>
+#endif
+#if CTP_ENABLE_LZMA
 #include <lzma.h>
+#endif
+#if CTP_ENABLE_BROTLI
 #include <brotli/encode.h>
 #include <brotli/decode.h>
+#endif
 
 #include "compress.h"
 
@@ -59,6 +75,7 @@ enum class LosslessMode {
   BEST       // Best compression, slower (level 9+)
 };
 
+#if CTP_ENABLE_ZLIB
 /**
  * ZLIB wrapper with compression level support.
  * Levels: 1 (fast) to 9 (best compression)
@@ -134,7 +151,9 @@ class ZlibWithModes : public Compressor {
     return true;
   }
 };
+#endif  // CTP_ENABLE_ZLIB
 
+#if CTP_ENABLE_BZIP2
 /**
  * BZIP2 wrapper with compression level support.
  * Levels: 1 (fast) to 9 (best compression)
@@ -181,7 +200,9 @@ class Bzip2WithModes : public Compressor {
     return ret == BZ_OK;
   }
 };
+#endif  // CTP_ENABLE_BZIP2
 
+#if CTP_ENABLE_ZSTD
 /**
  * ZSTD wrapper with compression level support.
  * Levels: 1 (fast) to 22 (best compression), default is 3
@@ -220,7 +241,9 @@ class ZstdWithModes : public Compressor {
     return output_size != 0;
   }
 };
+#endif  // CTP_ENABLE_ZSTD
 
+#if CTP_ENABLE_LZ4
 /**
  * LZ4 wrapper with compression mode support.
  * Uses LZ4_compress_default (fast) or LZ4_compress_HC (high compression)
@@ -281,7 +304,9 @@ class Lz4WithModes : public Compressor {
     return true;
   }
 };
+#endif  // CTP_ENABLE_LZ4
 
+#if CTP_ENABLE_LZMA
 /**
  * LZMA wrapper with compression level support.
  * Levels: 0 (fast) to 9 (best compression)
@@ -353,7 +378,9 @@ class LzmaWithModes : public Compressor {
     return true;
   }
 };
+#endif  // CTP_ENABLE_LZMA
 
+#if CTP_ENABLE_BROTLI
 /**
  * Brotli wrapper with compression quality support.
  * Quality levels: 0 (fast) to 11 (best compression)
@@ -404,6 +431,7 @@ class BrotliWithModes : public Compressor {
     return false;
   }
 };
+#endif  // CTP_ENABLE_BROTLI
 
 }  // namespace ctp
 

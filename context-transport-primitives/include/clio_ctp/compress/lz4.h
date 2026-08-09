@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZ4
 
 #include <lz4.h>
 
@@ -73,6 +74,6 @@ class Lz4 : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_LZ4
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_

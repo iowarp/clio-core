@@ -266,6 +266,16 @@ public:
   clio::run::TaskResume PodReorganizeBlob(
       clio::run::shared_ptr<PodReorganizeBlobTask> &task);
 
+  /** Batched POD paging (one scheduled task carries up to kPodMultiMax page
+   *  requests). Each record runs as a nested scalar call on this fiber, so the
+   *  batch amortizes task machinery without changing per-page semantics. */
+  clio::run::TaskResume PodMultiPutBlob(
+      clio::run::shared_ptr<PodMultiPutBlobTask> &task);
+  clio::run::TaskResume PodMultiGetBlob(
+      clio::run::shared_ptr<PodMultiGetBlobTask> &task);
+  clio::run::TaskResume PodMultiScore(
+      clio::run::shared_ptr<PodMultiScoreTask> &task);
+
   /**
    * Delete blob operation - removes blob and decrements tag size
    * Returns TaskResume for coroutine-based async operations

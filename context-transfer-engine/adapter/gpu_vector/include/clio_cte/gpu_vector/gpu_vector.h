@@ -54,11 +54,12 @@ class Vector {
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 pages_per_block, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0)
+         int compress_lib = 0, int compress_preset = 1)
       : storage_pool_id_(storage_pool_id.IsNull()
                              ? clio::cte::core::kCtePoolId
                              : storage_pool_id),
         compress_lib_(compress_lib),
+        compress_preset_(compress_preset),
         page_bytes_(page_bytes),
         nblocks_(nblocks),
         pages_per_block_(pages_per_block),
@@ -105,6 +106,18 @@ class Vector {
    */
   Vector(const Vector &) = delete;
   Vector &operator=(const Vector &) = delete;
+
+  /**
+   * @return true if `wire_id` names a codec that decompresses ON the GPU.
+   *
+   * Only these need the page cache to be reachable from another CUDA context.
+   * The ids are the compressor registry's frozen wire values for the nvcomp
+   * family (see CompressionFactory's registry); they are matched by range
+   * rather than by name so this header need not pull in the codec factory.
+   */
+  static bool IsGpuCodec(int wire_id) {
+    return wire_id >= 11 && wire_id <= 16;  // nvcomp-lz4 .. nvcomp-ans
+  }
 
   /** Device view for `dev_id`, to be passed to a kernel by value. */
   DeviceVector<T> GetDevice(int dev_id) const {
@@ -205,6 +218,9 @@ class Vector {
     char *pages_base = nullptr;     // page bytes
     char *table_base = nullptr;     // Page[] table
     char *tasks_base = nullptr;     // task slots
+    char *multi_task_base = nullptr;  // batched-put task slots
+    char *multi_tbl_base = nullptr;   // MultiBatch[] table
+    ctp::ipc::AllocatorId multi_tbl_alloc;
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
     ctp::ipc::AllocatorId tasks_alloc;
@@ -226,19 +242,63 @@ class Vector {
     const clio::run::u64 nslots =
         static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
 
+    // Page bytes are MANAGED when a GPU codec is in play, plain device memory
+    // otherwise.
+    //
+    // A GPU codec cannot run in the context whose kernel is spinning on the
+    // fault, so it runs in its own context -- and a plain cudaMalloc pointer is
+    // only valid in the context that made it. Managed memory is addressable
+    // from every context on the device, which is what lets the codec
+    // decompress STRAIGHT INTO the page the fault is waiting on: no host
+    // staging, no peer copy, no second buffer. That is the whole point of
+    // compressing on the GPU and it is not expressible with kDeviceMem.
+    //
+    // It is not free: managed pages measured ~12% slower on the raw read path
+    // (1.95 vs 2.22 GB/s), which is migration bookkeeping nobody who is not
+    // compressing should pay. So the choice follows the codec.
+    //
+    // Only the page bytes are affected either way. The page table and task
+    // slots stay device-resident: the kernel alone touches them, never the
+    // codec, so managing them would buy nothing and cost migration.
+    const auto page_kind =
+        IsGpuCodec(compress_lib_)
+            ? clio::run::gpu::IpcManager::MemKind::kManagedUvm
+            : clio::run::gpu::IpcManager::MemKind::kDeviceMem;
     st.pages_alloc = ipc->AllocateAndRegisterGpuBackend(
-        gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-        nslots * page_bytes_, &st.pages_base);
+        gpu_id, page_kind, nslots * page_bytes_, &st.pages_base);
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nslots * sizeof(Page), &st.table_base);
-    const clio::run::u64 task_bytes =
+    // Batched writeback slots: enough per block that the block's WHOLE page
+    // cache flushes in that many submissions (256 pages -> 4 batches). The
+    // submission is the cost on this path, so the count is derived from the
+    // cache size rather than being a tunable.
+    const clio::run::u64 multi_per_block =
+        (pages_per_block_ + clio::cte::core::kPodMultiMax - 1) /
+        clio::cte::core::kPodMultiMax;
+    const clio::run::u64 nbatch =
+        static_cast<clio::run::u64>(nblocks_) * multi_per_block;
+    const clio::run::u64 scalar_task_bytes =
         nslots * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
+    const clio::run::u64 multi_task_bytes =
+        nbatch * (sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
+    // The batch tasks share the per-page slots' backend ON PURPOSE. SlotPtr
+    // stamps `task_alloc_id_` -- ONE allocator id -- on every task it sends,
+    // so a task living in a different registered backend reaches the runtime
+    // labeled with the wrong allocator and is never resolved: the kernel then
+    // waits forever on a completion that cannot come.
+    const clio::run::u64 task_bytes = scalar_task_bytes + multi_task_bytes;
     st.tasks_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem, task_bytes,
         &st.tasks_base);
+    st.multi_task_base = st.tasks_base + scalar_task_bytes;
+
+    st.multi_tbl_alloc = ipc->AllocateAndRegisterGpuBackend(
+        gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+        nbatch * sizeof(MultiBatch), &st.multi_tbl_base);
+
     if (st.pages_alloc.IsNull() || st.table_alloc.IsNull() ||
-        st.tasks_alloc.IsNull()) {
+        st.tasks_alloc.IsNull() || st.multi_tbl_alloc.IsNull()) {
       throw std::runtime_error("gpu_vector: device backend allocation failed");
     }
 
@@ -314,6 +374,40 @@ class Vector {
     }
     UploadBytes(tasks.data(), st.tasks_base, task_bytes);
 
+    // Batch tasks: same rules as the per-page slots -- CONSTRUCTED (a zeroed
+    // task arrives at the worker with a null RunContext and aborts it) and
+    // stamped with their POD size so RecvIn knows how many bytes to copy back
+    // without dereferencing the task.
+    {
+      const size_t pair = sizeof(MultiPutSlot) + sizeof(MultiGetSlot);
+      std::vector<char> mtasks(static_cast<size_t>(nbatch) * pair, 0);
+      std::vector<MultiBatch> mtbl(static_cast<size_t>(nbatch));
+      for (clio::run::u64 i = 0; i < nbatch; ++i) {
+        char *slot = mtasks.data() + static_cast<size_t>(i) * pair;
+        new (slot) MultiPutSlot(clio::run::CreateTaskId(),
+                                clio::cte::core::kCtePoolId, local, tag_id_);
+        new (slot + sizeof(MultiPutSlot))
+            MultiGetSlot(clio::run::CreateTaskId(), clio::cte::core::kCtePoolId,
+                         local, tag_id_);
+        reinterpret_cast<MultiPutSlot *>(slot)->fut_.task_size_ =
+            static_cast<clio::run::u32>(sizeof(MultiPutSlot));
+        reinterpret_cast<MultiGetSlot *>(slot + sizeof(MultiPutSlot))
+            ->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(MultiGetSlot));
+        char *dev = st.multi_task_base + static_cast<size_t>(i) * pair;
+        mtbl[static_cast<size_t>(i)].put = reinterpret_cast<MultiPutSlot *>(dev);
+        mtbl[static_cast<size_t>(i)].get =
+            reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
+        mtbl[static_cast<size_t>(i)].put_fut =
+            clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
+        mtbl[static_cast<size_t>(i)].get_fut =
+            clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
+      }
+      UploadBytes(mtasks.data(), st.multi_task_base,
+                  static_cast<clio::run::u64>(nbatch) * pair);
+      UploadBytes(mtbl.data(), st.multi_tbl_base,
+                  nbatch * sizeof(MultiBatch));
+    }
+
     // One device-global counter per vector, feeding unique task ids.
     void *seq = nullptr;
 #if CTP_ENABLE_CUDA
@@ -357,7 +451,10 @@ class Vector {
     v.size_ = num_elems_;
     v.pool_id_ = storage_pool_id_;
     v.compress_lib_ = compress_lib_;
+    v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
+    v.multi_ = reinterpret_cast<MultiBatch *>(st.multi_tbl_base);
+    v.multi_per_block_ = static_cast<clio::run::u32>(multi_per_block);
     st.view = v;
     devs_[gpu_id] = st;
   }
@@ -400,10 +497,14 @@ class Vector {
       if (!st.pages_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.pages_alloc);
       if (!st.table_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.table_alloc);
       if (!st.tasks_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.tasks_alloc);
+      if (!st.multi_tbl_alloc.IsNull()) {
+        ipc->FreeGpuBackend(gpu, st.multi_tbl_alloc);
+      }
     }
     st.pages_alloc = ctp::ipc::AllocatorId::GetNull();
     st.table_alloc = ctp::ipc::AllocatorId::GetNull();
     st.tasks_alloc = ctp::ipc::AllocatorId::GetNull();
+    st.multi_tbl_alloc = ctp::ipc::AllocatorId::GetNull();
 #if CTP_ENABLE_CUDA
     if (st.stats != nullptr) {
       cudaFree(st.stats);
@@ -432,6 +533,15 @@ class Vector {
   clio::run::PoolId storage_pool_id_;
   /** Codec wire id stamped on page puts; 0 stores raw. */
   int compress_lib_ = 0;
+  /** Compressor preset: 1 FAST, 2 BALANCED, 3 BEST. Defaults to FAST, and
+   *  deliberately so. A page store sits inside a device fault, and the
+   *  compressor maps BALANCED (the module-wide default) to LZ4_compress_HC
+   *  level 6 -- tens of MB/s on data that does not compress easily, against
+   *  hundreds for LZ4_compress_default. Paying HC prices to shrink a page
+   *  cache entry is the wrong trade: the page is about to be read back over
+   *  the bus, and the ratio difference between FAST and HC is small next to
+   *  the order of magnitude in throughput. */
+  int compress_preset_ = 1;
   clio::cte::core::TagId tag_id_;
   clio::run::u64 page_bytes_;
   clio::run::u32 nblocks_;

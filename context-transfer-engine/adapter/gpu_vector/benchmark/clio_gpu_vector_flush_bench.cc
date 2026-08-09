@@ -358,9 +358,11 @@ int main(int argc, char **argv) {
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
-  cudaDeviceProp prop{};
-  cudaGetDeviceProperties(&prop, 0);
-  const u64 clock_khz = static_cast<u64>(prop.clockRate);
+  // cudaDeviceProp::clockRate was removed in CUDA 13; the attribute query is
+  // the supported way to ask and works on every version.
+  int clock_khz_i = 0;
+  cudaDeviceGetAttribute(&clock_khz_i, cudaDevAttrClockRate, 0);
+  const u64 clock_khz = static_cast<u64>(clock_khz_i);
 
   std::printf(
       "gpu_vector block-level flush benchmark\n"

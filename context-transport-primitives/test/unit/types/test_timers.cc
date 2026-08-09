@@ -37,11 +37,11 @@
 #include "clio_ctp/util/timer_mpi.h"
 #include "clio_ctp/util/timer_thread.h"
 
-#ifdef CTP_ENABLE_MPI
+#if CTP_ENABLE_MPI
 #include <mpi.h>
 #endif
 
-#ifdef CTP_ENABLE_OPENMP
+#if CTP_ENABLE_OPENMP
 #include <omp.h>
 #endif
 
@@ -67,7 +67,7 @@ TEST_CASE("TestTimer") {
   HLOG(kInfo, "Print timer: {}", timer.GetSec());
 }
 
-#ifdef CTP_ENABLE_MPI
+#if CTP_ENABLE_MPI
 TEST_CASE("TestMpiTimer") {
   ctp::MpiTimer mpi_timer(MPI_COMM_WORLD);
   mpi_timer.Resume();
@@ -80,7 +80,7 @@ TEST_CASE("TestMpiTimer") {
 }
 #endif
 
-#ifdef CTP_ENABLE_OPENMP
+#if CTP_ENABLE_OPENMP
 TEST_CASE("TestOmpTimer") {
   ctp::ThreadTimer omp_timer(4);
 #pragma omp parallel shared(omp_timer) num_threads(4)

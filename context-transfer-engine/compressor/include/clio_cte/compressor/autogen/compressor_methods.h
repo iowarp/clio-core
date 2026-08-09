@@ -36,6 +36,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodPutBlob =
     clio::cte::core::Method::kPodPutBlob;
 GLOBAL_CROSS_CONST clio::run::u32 kPodGetBlob =
     clio::cte::core::Method::kPodGetBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob =
+    clio::cte::core::Method::kPodMultiPutBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob =
+    clio::cte::core::Method::kPodMultiGetBlob;
 
 // compressor-specific methods, numbered ABOVE the core's method-id space —
 // a collision would shadow a forwarded core verb (they previously sat on
@@ -60,6 +64,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kMultiPutBlob] = "MultiPutBlob";
     v[kPodPutBlob] = "PodPutBlob";
     v[kPodGetBlob] = "PodGetBlob";
+    v[kPodMultiPutBlob] = "PodMultiPutBlob";
+    v[kPodMultiGetBlob] = "PodMultiGetBlob";
     v[100] = "DynamicSchedule";
     v[101] = "Compress";
     v[102] = "Decompress";

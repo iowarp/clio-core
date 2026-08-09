@@ -48,6 +48,12 @@ bool MemBdevTransport::Init(const CreateParams& params,
     InitShmBacking(runtime->pool_id_);
   }
 
+  // kHbm is DEVICE memory. Until this existed it was silently the same host
+  // heap as kRam, so a "GPU tier" cost exactly what the tier below it cost.
+  if (bdev_type_ == BdevType::kHbm) {
+    InitDeviceBacking();
+  }
+
   // CLIO_PREFAULT: pre-fault the RAM segment at init instead of (or ahead of)
   // the incremental allocation-time population. "0" means the WHOLE mapping;
   // any other value is a size string (ConfigParse::ParseSize, e.g. "512MB",
@@ -86,6 +92,30 @@ bool MemBdevTransport::Init(const CreateParams& params,
   }
 
   return true;
+}
+
+void MemBdevTransport::InitDeviceBacking() {
+#if CTP_ENABLE_GPU
+  if (ram_capacity_ == 0) {
+    return;
+  }
+  device_base_ = ctp::GpuApi::Malloc<char>(static_cast<size_t>(ram_capacity_));
+  if (device_base_ == nullptr) {
+    HLOG(kWarning,
+         "HBM bdev: cudaMalloc of {} bytes failed -- falling back to host "
+         "memory. This tier is NOT device-resident; treat any tiering "
+         "measurement taken against it as host-to-host.",
+         ram_capacity_);
+    return;
+  }
+  device_usable_ = static_cast<size_t>(ram_capacity_);
+  device_backed_ = true;
+  HLOG(kInfo, "HBM bdev: {} bytes of DEVICE memory allocated", ram_capacity_);
+#else
+  HLOG(kWarning,
+       "HBM bdev requested in a build with no GPU support -- this tier is "
+       "host memory, not device memory");
+#endif
 }
 
 void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
@@ -172,6 +202,15 @@ void MemBdevTransport::Destroy() {
     shm_backed_ = false;
     shm_backend_.shm_destroy();
   }
+#if CTP_ENABLE_GPU
+  if (device_backed_ && device_base_ != nullptr) {
+    ctp::GpuApi::Free(device_base_);
+  }
+#endif
+  device_base_ = nullptr;
+  device_usable_ = 0;
+  device_backed_ = false;
+
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   for (RamPage &page : ram_pages_) {
     FreeRamPage(page);
@@ -244,6 +283,12 @@ void MemBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& block
 }
 
 char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
+  // Device-backed (kHbm): one cudaMalloc covers the capacity, so a page is an
+  // offset into it -- nothing to allocate, and nothing on the host heap.
+  if (device_backed_ && device_base_ != nullptr &&
+      DevicePageInBounds(page_idx)) {
+    return device_base_ + page_idx * kRamPageSize;
+  }
   // SHM-backed devices need no per-page allocation at all: the whole capacity
   // is one sparse mapping, so a page is just an offset into it.
   //
@@ -289,6 +334,10 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
 }
 
 char* MemBdevTransport::GetRamPage(size_t page_idx) const {
+  if (device_backed_ && device_base_ != nullptr &&
+      DevicePageInBounds(page_idx)) {
+    return device_base_ + page_idx * kRamPageSize;
+  }
   if (shm_backed_ && shm_base_ != nullptr && ShmPageInBounds(page_idx)) {
     return shm_base_ + page_idx * kRamPageSize;
   }
@@ -396,9 +445,15 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
     CLIO_CO_RETURN;
   }
 
-  // Host source: a synchronous host->host memcpy is fastest and gains nothing
-  // from a GPU stream.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host source AND host pages: a synchronous host->host memcpy is fastest and
+  // gains nothing from a GPU stream.
+  //
+  // device_backed_ has to be part of this test, not just the source pointer.
+  // On a kHbm pool the PAGE is device memory, so plain memcpy into it is
+  // invalid no matter where the source lives -- the host->host path would
+  // fault or silently corrupt. Routing on the source alone was safe only
+  // while kHbm quietly used host memory.
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     WriteBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
@@ -541,8 +596,12 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
     CLIO_CO_RETURN;
   }
 
-  // Host destination: synchronous host<->host copy.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host destination AND host pages: synchronous host<->host copy.
+  //
+  // As on the write side, device_backed_ must be part of the test: on a kHbm
+  // pool the SOURCE page is device memory, so memcpy out of it is invalid
+  // however the destination is allocated.
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     ReadBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }

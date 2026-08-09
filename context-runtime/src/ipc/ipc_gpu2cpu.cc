@@ -109,16 +109,44 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   // previous completion has been observed by the kernel, so reusing its buffer
   // is safe by the same invariant the producer already relies on. Nothing is
   // freed, and the total is bounded by the task slots the client allocated.
-  static constexpr size_t kTaskScratchBytes = 4096;
-  if (task_pod_size > kTaskScratchBytes) {
+  //
+  // The buffer is sized to the TASK, not to a fixed constant. It used to be a
+  // flat 4096 bytes, which silently rejected any task bigger than that -- the
+  // batched paging tasks (PodMultiPutBlob and friends, ~5.4 KB with 64 records)
+  // were dropped here with only a log line, so the kernel waited forever on a
+  // completion that was never going to come. Sizing per slot also stops the
+  // scalar slots, which need a few hundred bytes, from pinning 4 KB each.
+  //
+  // kTaskScratchMax is a sanity bound, not a working limit: a task_size_ past
+  // it means the stamp is garbage, and copying that many bytes out of device
+  // memory would be the actual bug.
+  static constexpr size_t kTaskScratchMax = 1 << 20;  // 1 MB
+  if (task_pod_size > kTaskScratchMax) {
     HLOG(kError,
          "IpcGpu2Cpu::RecvIn: worker {} task_pod_size {} exceeds max {}",
-         worker_id, task_pod_size, kTaskScratchBytes);
+         worker_id, task_pod_size, kTaskScratchMax);
     return true;
   }
-  thread_local std::unordered_map<const void *, char *> task_scratch_by_slot;
-  char *&slot_buf = task_scratch_by_slot[gpu_task_raw];
+  struct TaskScratch {
+    char *buf = nullptr;
+    size_t bytes = 0;
+  };
+  thread_local std::unordered_map<const void *, TaskScratch>
+      task_scratch_by_slot;
+  TaskScratch &scratch = task_scratch_by_slot[gpu_task_raw];
+  // A slot always submits the same task type, so this grows at most once.
+  if (scratch.buf != nullptr && scratch.bytes < task_pod_size) {
+    // Deliberately not freed: another in-flight coroutine may still be running
+    // out of the old buffer (see the ownership note above). Slots are bounded,
+    // and this can only happen once per slot.
+    scratch.buf = nullptr;
+  }
+  const size_t kTaskScratchBytes = (task_pod_size > 4096)
+                                       ? static_cast<size_t>(task_pod_size)
+                                       : 4096;
+  char *&slot_buf = scratch.buf;
   if (slot_buf == nullptr) {
+    scratch.bytes = kTaskScratchBytes;
     // PINNED, not new[]. cudaMemcpyAsync from PAGEABLE host memory is
     // effectively synchronous -- the driver stages it through an internal
     // pinned buffer -- so SendOut's "async" completion copies degenerated to

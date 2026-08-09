@@ -42,6 +42,7 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <memory>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 #include <clio_cte/compressor/compressor_tasks.h>
 #include <clio_cte/compressor/compressor_client.h>
@@ -87,7 +88,18 @@ public:
   using CreateParams = CompressorConfig; // Required for CLIO_TASK_CC (defined in compressor_tasks.h)
 
   Runtime() = default;
-  ~Runtime() override = default;
+  /**
+   * Stops the codec drainer thread.
+   *
+   * std::thread's destructor calls std::terminate if the thread is still
+   * joinable, and DestroyCodecContext -- the only place that joined it -- is
+   * reachable only from Create's failure path, never at shutdown. So a run
+   * that had used batched decompression aborted on teardown with "terminate
+   * called without an active exception". Only the thread is stopped here; the
+   * CUDA teardown stays in DestroyCodecContext, where the context is known to
+   * still be valid.
+   */
+  ~Runtime() override;
 
 
   /**
@@ -240,6 +252,16 @@ private:
   clio::run::TaskResume DecompressPodGetBlob(
       clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task);
 
+  /** Batched POD paging (kPodMultiPutBlob / kPodMultiGetBlob). Each record is
+   *  fanned into a scalar Pod task and run through the scalar handler above,
+   *  so compression semantics are identical per page and no codec logic is
+   *  duplicated. The win the batch is actually after is on the SUBMISSION
+   *  side -- one device->host queue entry per batch instead of per page. */
+  clio::run::TaskResume CompressPodMultiPutBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiPutBlobTask> &task);
+  clio::run::TaskResume DecompressPodMultiGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
+
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
@@ -286,6 +308,180 @@ private:
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
   ctp::ipc::ShmPtr<CompressionTelemetryLog> compression_telemetry_log_;
   std::atomic<std::uint64_t> compression_logical_time_;
+  /** Stream every GPU codec runs on, created once in Create() and handed to
+   *  CompressionFactory. Owned here, so it outlives any compressor the factory
+   *  produced. Null on a build or host with no GPU, which the codecs read as
+   *  "use the default stream". */
+  void *gpu_stream_ = nullptr;
+
+  /**
+   * Device buffers for the COMPRESSED side of a GPU codec operation: one
+   * allocation, carved into equal slabs, one slab per in-flight operation.
+   *
+   * This is not a staging copy of the payload. The payload never needs one:
+   * on a read the destination is already the caller's device page and nvcomp
+   * decompresses straight into it; on a write the source is already the
+   * device page. What needs a buffer is the compressed bitstream -- it has to
+   * be read out of (or written into) a CTE blob, and on a write its size is
+   * not known until the codec finishes, so it cannot go directly into a
+   * right-sized blob buffer.
+   *
+   * Preallocated because the alternative is nvcomp allocating it per call.
+   * nvcomp allocates NOTHING when handed device pointers on both sides; it
+   * falls back to cudaMalloc only because a host buffer forces it to. That
+   * fallback does not merely cost time, it hangs: cudaMalloc and especially
+   * cudaFree synchronize the device, and a gpu_vector page fault runs while
+   * its block spins waiting for the very operation being set up -- so the
+   * allocation waits on a kernel that is waiting on the allocation. (Measured:
+   * 128 MB through nvcomp made no progress in 200 s.) Stream creation had the
+   * identical failure mode, which is why the stream above is created once too.
+   *
+   * A request larger than a slab, or one arriving with every slab out, is
+   * refused. Callers must fall back to the host path or store raw -- never
+   * allocate.
+   */
+  char *gpu_scratch_base_ = nullptr;
+  size_t gpu_scratch_slab_ = 0;
+  std::vector<char *> gpu_scratch_free_;
+  std::mutex gpu_scratch_mu_;
+
+  /** @return a device buffer of at least `bytes`, or nullptr. Never allocates. */
+  char *AcquireGpuScratch(size_t bytes);
+  /** Return a buffer from AcquireGpuScratch; null is ignored. */
+  void ReleaseGpuScratch(char *ptr);
+  /** @return true if `wire_id` names a codec that runs on the GPU. */
+  static bool IsGpuCodec(int wire_id);
+
+  /**
+   * A DEDICATED CUDA context for GPU codecs, and the device buffers they use.
+   *
+   * A GPU codec cannot run in the context that raised the page fault. An
+   * indefinitely-resident kernel blocks every kernel launched after it in the
+   * same context -- measured with a standalone reproducer: a 1-block marker
+   * kernel launched behind a spinner never executed at all, while the same
+   * marker behind a FINITE long kernel overlapped at full speed. The gpu_vector
+   * consumer spins until its fault completes, so nvcomp's kernels never ran and
+   * the fault never returned.
+   *
+   * Contexts, unlike kernels within a context, ARE time-sliced by the driver.
+   * A codec kernel in a second context runs while the consumer spins (measured:
+   * 100 ms), and cuMemcpyPeer bridges the result back into the faulting
+   * context's page -- a copy-engine operation, and copy engines were never the
+   * thing being blocked (which is why the raw path always worked).
+   *
+   * Created ONCE here, at module creation. cuCtxCreate and cuCtxDestroy both
+   * synchronize, so doing either while a kernel spins is its own deadlock.
+   */
+  void *codec_ctx_ = nullptr;    // CUcontext, owned
+  void *primary_ctx_ = nullptr;  // CUcontext of the faulting side, not owned
+  /**
+   * A pool of independent codec slots, NOT one shared buffer.
+   *
+   * Each slot is a device staging buffer for the compressed bytes plus its own
+   * stream, so operations proceed concurrently. That is the whole point: a
+   * codec operation waits on a driver context switch (~7.6 ms), and switches
+   * are per SLICE, not per operation. Serializing behind one mutex made every
+   * fault pay its own switch, which is why prefetching more pages changed
+   * nothing at all -- the extra fetches simply queued. With independent slots
+   * the concurrent faults land in the same slice and share its cost.
+   *
+   * Only the compressed side needs a buffer. The decompressed side is the
+   * caller's page, written directly.
+   */
+  struct CodecSlot {
+    void *buf = nullptr;   // compressed bytes, CUdeviceptr in codec_ctx_
+    void *obuf = nullptr;  // decompressed bytes, plain ctx2 device memory
+    void *stream = nullptr;  // CUstream, in codec_ctx_
+  };
+  std::vector<CodecSlot> codec_slots_;
+  std::vector<size_t> codec_free_;  // indices of slots not in use
+  size_t codec_buf_bytes_ = 0;
+  std::mutex codec_mu_;  // guards codec_free_ ONLY, never a whole operation
+
+  /** Take a slot, or SIZE_MAX if all are busy (caller falls back). */
+  size_t AcquireCodecSlot();
+  void ReleaseCodecSlot(size_t idx);
+
+  /**
+   * BATCHED GPU decompression -- INCOMPLETE, off unless
+   * CLIO_COMPRESS_GPU_BATCH=1.
+   *
+   * Entering the codec context costs a fixed ~2.33 ms driver time slice,
+   * unaffected by spin backoff or resident block count, so one page per entry
+   * caps this path near 110 MB/s. Batching is the only lever, and the pages
+   * are there to batch: each CUDA block faults independently.
+   *
+   * State of the work, so the next person does not repeat it:
+   *  - A dedicated thread owns the batch. Three earlier versions made a
+   *    WAITING FIBER the leader and each deadlocked differently; a fiber that
+   *    is itself blocking a GPU block cannot also be responsible for other
+   *    fibers' progress.
+   *  - The codec must NOT write the caller's managed page from this thread.
+   *    Doing so hangs inside Decompress: the page is mapped by the faulting
+   *    context too, and the migration that write needs cannot happen while
+   *    that context's kernel is resident. Decompress into plain ctx2 memory
+   *    and cuMemcpyDtoDAsync into the page -- copies were never blocked.
+   *  - With that, items complete and batching demonstrably groups requests
+   *    (three in one context entry, observed). It then STALLS after a few
+   *    batches. That is the open bug.
+   *
+   * Two properties keep every failure benign and must stay: requests are
+   * shared_ptr, so a waiter that gives up cannot leave the drainer writing
+   * into a dead stack frame; and waiting is bounded, so a wedged drainer
+   * degrades to the host path instead of hanging.
+   */
+  struct PendingDecomp {
+    /**
+     * The request owns its compressed bytes.
+     *
+     * Pointing at the waiter's SHM buffer was a use-after-free waiting to
+     * happen: on timeout the waiter marks itself abandoned and proceeds down
+     * the host path, which consumes and FREES that buffer, while the drainer
+     * may still be reading it. shared_ptr keeps this struct alive; it says
+     * nothing about the buffer the struct points at. Copying costs one memcpy
+     * of the COMPRESSED bytes, which are small by construction -- that is the
+     * whole point of having compressed them.
+     */
+    std::vector<char> stored_bytes;
+    size_t stored_size = 0;
+    void *dst = nullptr;
+    size_t dst_bytes = 0;
+    std::atomic<bool> done{false};
+    std::atomic<bool> abandoned{false};
+    bool ok = false;
+  };
+  std::mutex batch_mu_;
+  std::vector<std::shared_ptr<PendingDecomp>> batch_;
+  std::thread batch_thread_;
+  std::atomic<bool> batch_stop_{false};
+  bool batch_enabled_ = false;
+
+  void BatchDrainLoop();
+  void RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch);
+
+  /** Build codec_ctx_ + its buffers. Best effort; false leaves GPU codecs off. */
+  bool InitCodecContext();
+  /** Tear the codec context down. Must not run while a kernel is resident. */
+  void DestroyCodecContext();
+  /** @return true if the GPU codec path is usable. */
+  bool HasCodecContext() const { return codec_ctx_ != nullptr; }
+
+  /**
+   * Decompress a stored blob into `dst_device` using a GPU codec, entirely on
+   * the device. Returns false if the GPU path is unavailable or fails, in
+   * which case the caller must use the host path.
+   */
+  bool GpuDecompressToDevice(const char *stored_host, size_t stored_size,
+                             void *dst_device, size_t dst_bytes);
+  /**
+   * Compress `src_device` with a GPU codec. On success fills `out_host` (which
+   * must hold at least the codec's bound) and sets *out_size.
+   */
+  bool GpuCompressFromDevice(int wire_id, const void *src_device, size_t size,
+                             char *out_host, size_t out_cap, size_t *out_size);
+  /** @return the CPU codec of the same family as a GPU codec, or 0 if none.
+   *  Used on the device page-fault path, where a GPU codec cannot run. */
+  static int CpuEquivalentCodec(int gpu_wire_id);
 
   // Configuration
   CompressorConfig config_;

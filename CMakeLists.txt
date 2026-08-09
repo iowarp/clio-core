@@ -430,64 +430,163 @@ set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
 # Thread support
 find_package(Threads REQUIRED)
 
+# CUDA 13 moved libcu++ (cuda/std/*) under include/cccl. Anything including
+# <cuda/std/...> -- kvhdf5 does -- otherwise fails with a bare
+# "cuda/std/cstdint: No such file or directory". This has to be at top level:
+# include_directories() only affects the directory that calls it and the
+# subdirectories added after, so setting it inside a helper invoked from one
+# component never reaches the others. Harmless on older toolkits, where the
+# directory does not exist.
+if(CLIO_CORE_ENABLE_CUDA)
+    foreach(_cccl "${CUDAToolkit_INCLUDE_DIRS}/cccl"
+                  "/usr/local/cuda/targets/x86_64-linux/include/cccl")
+        if(EXISTS "${_cccl}")
+            message(STATUS "libcu++ (CUDA 13 layout) at ${_cccl}")
+            include_directories("${_cccl}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 # Compression libraries (conditional)
 if(CLIO_CTE_ENABLE_COMPRESS)
     message(STATUS "CLIO_CTE_ENABLE_COMPRESS is ON")
 
+    # EVERY codec is optional.
+    #
+    # These used to be REQUIRED, which made enabling compression an
+    # all-or-nothing proposition: a box missing any single one of nine dev
+    # packages could not configure at all, even to use a codec it did have.
+    # The GPU-side codecs (nvcomp, cuSZ, ...) were already detected this way;
+    # the lossless CPU ones now match. A codec that is not found is compiled
+    # out via its CTP_ENABLE_<X> definition, and CompressionFactory returns
+    # nullptr for it -- which every caller already handles, because that is
+    # what the optional GPU codecs have always done.
+    set(CLIO_CTP_ENABLE_ZSTD OFF)
+    set(CLIO_CTP_ENABLE_LZ4 OFF)
+    set(CLIO_CTP_ENABLE_ZLIB OFF)
+    set(CLIO_CTP_ENABLE_LZMA OFF)
+    set(CLIO_CTP_ENABLE_BROTLI OFF)
+    set(CLIO_CTP_ENABLE_BLOSC2 OFF)
+    set(CLIO_CTP_ENABLE_BZIP2 OFF)
+    set(CLIO_CTP_ENABLE_LZO OFF)
+    set(CLIO_CTP_ENABLE_SNAPPY OFF)
+
+    # A .pc file is not proof the headers are installed: conda ships
+    # libbrotlidec.pc from a RUNTIME-only package, so pkg-config reports
+    # brotli found and the build then dies on a missing brotli/decode.h.
+    # Every pkg-config codec therefore also has to locate its principal
+    # header before being declared usable.
+    macro(clio_check_codec_header out_var pkg header)
+        find_path(${out_var} ${header} HINTS ${${pkg}_INCLUDE_DIRS})
+    endmacro()
+
     # Libraries with pkg-config support
-    pkg_check_modules(libzstd REQUIRED libzstd)
-    message(STATUS "found zstd.h at ${libzstd_INCLUDE_DIRS}")
+    pkg_check_modules(libzstd QUIET libzstd)
+    clio_check_codec_header(_zstd_hdr libzstd zstd.h)
+    if(libzstd_FOUND AND _zstd_hdr)
+        set(CLIO_CTP_ENABLE_ZSTD ON)
+        message(STATUS "found zstd.h at ${libzstd_INCLUDE_DIRS}")
+    else()
+        message(STATUS "zstd not found - zstd codec disabled (apt: libzstd-dev)")
+    endif()
 
-    pkg_check_modules(liblz4 REQUIRED liblz4)
-    message(STATUS "found lz4.h at ${liblz4_INCLUDE_DIRS}")
+    pkg_check_modules(liblz4 QUIET liblz4)
+    clio_check_codec_header(_lz4_hdr liblz4 lz4.h)
+    if(liblz4_FOUND AND _lz4_hdr)
+        set(CLIO_CTP_ENABLE_LZ4 ON)
+        message(STATUS "found lz4.h at ${liblz4_INCLUDE_DIRS}")
+    else()
+        message(STATUS "lz4 not found - lz4 codec disabled (apt: liblz4-dev)")
+    endif()
 
-    pkg_check_modules(zlib REQUIRED zlib)
-    message(STATUS "found zlib.h at ${zlib_INCLUDE_DIRS}")
+    pkg_check_modules(zlib QUIET zlib)
+    clio_check_codec_header(_zlib_hdr zlib zlib.h)
+    if(zlib_FOUND AND _zlib_hdr)
+        set(CLIO_CTP_ENABLE_ZLIB ON)
+        message(STATUS "found zlib.h at ${zlib_INCLUDE_DIRS}")
+    else()
+        message(STATUS "zlib not found - zlib codec disabled (apt: zlib1g-dev)")
+    endif()
 
-    pkg_check_modules(liblzma REQUIRED liblzma)
-    message(STATUS "found liblzma.h at ${liblzma_INCLUDE_DIRS}")
+    pkg_check_modules(liblzma QUIET liblzma)
+    clio_check_codec_header(_lzma_hdr liblzma lzma.h)
+    if(liblzma_FOUND AND _lzma_hdr)
+        set(CLIO_CTP_ENABLE_LZMA ON)
+        message(STATUS "found liblzma.h at ${liblzma_INCLUDE_DIRS}")
+    else()
+        message(STATUS "lzma not found - lzma codec disabled (apt: liblzma-dev)")
+    endif()
 
-    pkg_check_modules(libbrotlicommon REQUIRED libbrotlicommon libbrotlidec libbrotlienc)
-    message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
+    pkg_check_modules(libbrotlicommon QUIET libbrotlicommon libbrotlidec libbrotlienc)
+    clio_check_codec_header(_brotli_hdr libbrotlicommon brotli/decode.h)
+    if(libbrotlicommon_FOUND AND _brotli_hdr)
+        set(CLIO_CTP_ENABLE_BROTLI ON)
+        message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
+    else()
+        message(STATUS "brotli not found - brotli codec disabled (apt: libbrotli-dev)")
+    endif()
 
-    pkg_check_modules(blosc2 REQUIRED blosc2)
-    message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+    pkg_check_modules(blosc2 QUIET blosc2)
+    clio_check_codec_header(_blosc2_hdr blosc2 blosc2.h)
+    if(blosc2_FOUND AND _blosc2_hdr)
+        set(CLIO_CTP_ENABLE_BLOSC2 ON)
+        message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+    else()
+        message(STATUS "blosc2 not found - blosc codec disabled (apt: libblosc2-dev)")
+    endif()
+
+    # The find_path/find_library codecs need the same prefixes pkg-config
+    # already knows about. Without this bzip2 read as "not found" on a host
+    # whose bzlib.h sits in a conda prefix, while zstd and lz4 right beside it
+    # were found -- because those came through pkg-config, which had been told
+    # where to look, and these had not.
+    set(CLIO_CODEC_HINTS "$ENV{CONDA_PREFIX}" ${CMAKE_PREFIX_PATH})
 
     # bzip2
-    find_path(bzip2_INCLUDE_DIR bzlib.h REQUIRED)
-    find_library(bzip2_LIBRARY bz2 REQUIRED)
+    find_path(bzip2_INCLUDE_DIR bzlib.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(bzip2_LIBRARY bz2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(bzip2_INCLUDE_DIR AND bzip2_LIBRARY)
+        set(CLIO_CTP_ENABLE_BZIP2 ON)
         set(bzip2_INCLUDE_DIRS ${bzip2_INCLUDE_DIR})
         set(bzip2_LIBRARIES bz2)
         get_filename_component(bzip2_LIBRARY_DIRS "${bzip2_LIBRARY}" DIRECTORY)
         message(STATUS "found bz2.h at ${bzip2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "bzip2 not found. Install with: apt-get install libbz2-dev")
+        message(STATUS "bzip2 not found - bzip2 codec disabled (apt: libbz2-dev)")
     endif()
 
     # lzo
-    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h REQUIRED)
-    find_library(lzo2_LIBRARY lzo2 REQUIRED)
+    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(lzo2_LIBRARY lzo2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(lzo2_INCLUDE_DIR AND lzo2_LIBRARY)
+        set(CLIO_CTP_ENABLE_LZO ON)
         set(lzo2_INCLUDE_DIRS ${lzo2_INCLUDE_DIR})
         set(lzo2_LIBRARIES lzo2)
         get_filename_component(lzo2_LIBRARY_DIRS "${lzo2_LIBRARY}" DIRECTORY)
         get_filename_component(lzo2_dir "${lzo2_INCLUDE_DIRS}" DIRECTORY)
         message(STATUS "found lzo2.h at ${lzo2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "lzo not found. Install with: apt-get install liblzo2-dev")
+        message(STATUS "lzo not found - lzo codec disabled (apt: liblzo2-dev)")
     endif()
 
     # snappy
-    find_path(snappy_INCLUDE_DIR snappy.h REQUIRED)
-    find_library(snappy_LIBRARY snappy REQUIRED)
+    find_path(snappy_INCLUDE_DIR snappy.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(snappy_LIBRARY snappy HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(snappy_INCLUDE_DIR AND snappy_LIBRARY)
+        set(CLIO_CTP_ENABLE_SNAPPY ON)
         set(snappy_INCLUDE_DIRS ${snappy_INCLUDE_DIR})
         set(snappy_LIBRARIES snappy)
         get_filename_component(snappy_LIBRARY_DIRS "${snappy_LIBRARY}" DIRECTORY)
         message(STATUS "found snappy.h at ${snappy_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "snappy not found. Install with: apt-get install libsnappy-dev")
+        message(STATUS "snappy not found - snappy codec disabled (apt: libsnappy-dev)")
     endif()
 
     # LibPressio - try find_package first (CMake-based), fall back to pkg-config
@@ -645,39 +744,28 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
     endif()
 
-    set(COMPRESS_LIBS
-        bz2
-        ${lzo2_LIBRARIES}
-        ${libzstd_LIBRARIES}
-        ${liblz4_LIBRARIES}
-        ${zlib_LIBRARIES}
-        ${liblzma_LIBRARIES}
-        ${libbrotlicommon_LIBRARIES}
-        ${snappy_LIBRARIES}
-        ${blosc2_LIBRARIES}
-    )
-    set(COMPRESS_INCLUDES
-        ${bzip2_INCLUDE_DIRS}
-        ${lzo2_INCLUDE_DIRS} ${lzo2_dir}
-        ${libzstd_INCLUDE_DIRS}
-        ${liblz4_INCLUDE_DIRS}
-        ${zlib_INCLUDE_DIRS}
-        ${liblzma_INCLUDE_DIRS}
-        ${libbrotlicommon_INCLUDE_DIRS}
-        ${snappy_INCLUDE_DIRS}
-        ${blosc2_INCLUDE_DIRS}
-    )
-    set(COMPRESS_LIB_DIRS
-        ${bzip2_LIBRARY_DIRS}
-        ${lzo2_LIBRARY_DIRS}
-        ${libzstd_LIBRARY_DIRS}
-        ${liblz4_LIBRARY_DIRS}
-        ${zlib_LIBRARY_DIRS}
-        ${liblzma_LIBRARY_DIRS}
-        ${libbrotlicommon_LIBRARY_DIRS}
-        ${snappy_LIBRARY_DIRS}
-        ${blosc2_LIBRARY_DIRS}
-    )
+    # Only the codecs actually found contribute libs/includes. An absent one
+    # leaves its *_LIBRARIES empty anyway, but listing it unconditionally also
+    # dragged in a bare `bz2` link flag for a library that may not exist.
+    set(COMPRESS_LIBS "")
+    set(COMPRESS_INCLUDES "")
+    set(COMPRESS_LIB_DIRS "")
+    macro(clio_add_codec enabled libs includes libdirs)
+        if(${enabled})
+            list(APPEND COMPRESS_LIBS ${libs})
+            list(APPEND COMPRESS_INCLUDES ${includes})
+            list(APPEND COMPRESS_LIB_DIRS ${libdirs})
+        endif()
+    endmacro()
+    clio_add_codec(CLIO_CTP_ENABLE_BZIP2  "${bzip2_LIBRARIES}"          "${bzip2_INCLUDE_DIRS}"          "${bzip2_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZO    "${lzo2_LIBRARIES}"           "${lzo2_INCLUDE_DIRS};${lzo2_dir}" "${lzo2_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_ZSTD   "${libzstd_LIBRARIES}"        "${libzstd_INCLUDE_DIRS}"        "${libzstd_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZ4    "${liblz4_LIBRARIES}"         "${liblz4_INCLUDE_DIRS}"         "${liblz4_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_ZLIB   "${zlib_LIBRARIES}"           "${zlib_INCLUDE_DIRS}"           "${zlib_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZMA   "${liblzma_LIBRARIES}"        "${liblzma_INCLUDE_DIRS}"        "${liblzma_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_BROTLI "${libbrotlicommon_LIBRARIES}" "${libbrotlicommon_INCLUDE_DIRS}" "${libbrotlicommon_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_SNAPPY "${snappy_LIBRARIES}"         "${snappy_INCLUDE_DIRS}"         "${snappy_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_BLOSC2 "${blosc2_LIBRARIES}"         "${blosc2_INCLUDE_DIRS}"         "${blosc2_LIBRARY_DIRS}")
     # Only add libpressio if found
     if(CLIO_CTP_ENABLE_LIBPRESSIO)
         list(APPEND COMPRESS_LIBS ${libpressio_LIBRARIES})
@@ -713,6 +801,13 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_LIBS ${cuszp_LIBRARIES})
         list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
     endif()
+
+    # Make the per-codec switches available to subdirectories (CTP), same as
+    # the GPU codecs below.
+    foreach(_codec ZSTD LZ4 ZLIB LZMA BROTLI BLOSC2 BZIP2 LZO SNAPPY)
+        set(CLIO_CTP_ENABLE_${_codec} ${CLIO_CTP_ENABLE_${_codec}}
+            CACHE BOOL "Enable ${_codec} codec (auto-detected)" FORCE)
+    endforeach()
 
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
