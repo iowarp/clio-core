@@ -252,6 +252,16 @@ private:
   clio::run::TaskResume DecompressPodGetBlob(
       clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task);
 
+  /** Batched POD paging (kPodMultiPutBlob / kPodMultiGetBlob). Each record is
+   *  fanned into a scalar Pod task and run through the scalar handler above,
+   *  so compression semantics are identical per page and no codec logic is
+   *  duplicated. The win the batch is actually after is on the SUBMISSION
+   *  side -- one device->host queue entry per batch instead of per page. */
+  clio::run::TaskResume CompressPodMultiPutBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiPutBlobTask> &task);
+  clio::run::TaskResume DecompressPodMultiGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
+
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */

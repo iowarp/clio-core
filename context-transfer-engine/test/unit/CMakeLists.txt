@@ -1898,3 +1898,36 @@ install(TARGETS test_safe_bdev_recovery_e2e
 )
 
 endif()  # TARGET clio_safe_bdev_runtime
+
+# Batched POD paging: PodMultiPutBlob / PodMultiGetBlob / PodMultiScore.
+# Needs the compressor client for the interposed-batch case.
+if(TARGET clio_cte_compressor_client)
+add_executable(test_pod_multi_paging test_pod_multi_paging.cc)
+target_include_directories(test_pod_multi_paging PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+)
+target_link_libraries(test_pod_multi_paging
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_pod_multi_paging
+    COMMAND test_pod_multi_paging)
+
+set_tests_properties(
+    cte_pod_multi_paging
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cte;pod"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()

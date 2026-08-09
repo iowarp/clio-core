@@ -2254,6 +2254,76 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
   CLIO_TASK_BODY_END
 }
 
+
+// Batched POD paging. Fan each record into the scalar Pod task and run it
+// through the scalar handler, so every page gets byte-identical compression
+// treatment (codec choice, header, GPU-codec substitution) and there is exactly
+// one place where that logic lives. The batch's payoff is on the submission
+// side: the device enqueues one task for up to kPodMultiMax pages.
+clio::run::TaskResume Runtime::CompressPodMultiPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PodMultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    task->num_ok_ = 0;
+    int first_rc = 0;
+    clio::run::u32 n = task->count_;
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      auto &req = task->reqs_[i];
+      auto sub = ipc_manager->NewTask<clio::cte::core::PodPutBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), task->tag_id_,
+          req.blob_name_.c_str(), req.offset_, req.size_, req.data_,
+          req.score_, task->context_, task->flags_);
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(CompressPodPutBlob(sub));
+      int rc = sub->GetReturnCode();
+      req.rc_ = static_cast<clio::run::u32>(rc);
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (first_rc == 0) {
+        first_rc = rc;
+      }
+    }
+    task->SetReturnCode(first_rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
+    clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    task->num_ok_ = 0;
+    int first_rc = 0;
+    clio::run::u32 n = task->count_;
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      auto &req = task->reqs_[i];
+      auto sub = ipc_manager->NewTask<clio::cte::core::PodGetBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), task->tag_id_,
+          req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+          req.data_, task->context_);
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(DecompressPodGetBlob(sub));
+      int rc = sub->GetReturnCode();
+      req.rc_ = static_cast<clio::run::u32>(rc);
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (first_rc == 0) {
+        first_rc = rc;
+      }
+    }
+    task->SetReturnCode(first_rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetBlob(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN

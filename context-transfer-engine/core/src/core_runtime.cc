@@ -3321,6 +3321,103 @@ clio::run::TaskResume Runtime::PodReorganizeBlob(
   return ReorganizeBlobImpl(task);
 }
 
+// Batched POD paging (gpu_vector flush/fault batching). A block's page cache
+// flush is one queue entry per kPodMultiMax pages instead of one per page,
+// which is what makes the GPU fault path affordable: the device-side cost is
+// dominated by per-task submission, not by the bytes moved.
+//
+// Each record executes as a NESTED scalar call on this fiber, exactly like
+// MultiPutBlob does — so a batched page keeps scalar-identical semantics
+// (interposition, replica addressing, scoring) and no code path is duplicated.
+// Per-record rc lands in reqs_[i].rc_; the task rc is the first failure so a
+// caller that ignores the detail still sees the batch fail.
+clio::run::TaskResume Runtime::PodMultiPutBlob(
+    clio::run::shared_ptr<PodMultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    auto &req = task->reqs_[i];
+    auto sub = ipc_manager->NewTask<PodPutBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        req.offset_, req.size_, req.data_, req.score_, task->context_,
+        task->flags_);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PodPutBlob(sub));
+    int rc = sub->GetReturnCode();
+    req.rc_ = static_cast<clio::run::u32>(rc);
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (first_rc == 0) {
+      first_rc = rc;
+    }
+  }
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
+}
+
+clio::run::TaskResume Runtime::PodMultiGetBlob(
+    clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    auto &req = task->reqs_[i];
+    auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        req.offset_, req.size_, task->flags_, req.data_, task->context_);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PodGetBlob(sub));
+    int rc = sub->GetReturnCode();
+    req.rc_ = static_cast<clio::run::u32>(rc);
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (first_rc == 0) {
+      first_rc = rc;
+    }
+  }
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
+}
+
+// Batched rescore. `size_`/`data_` are unused here; only blob_name_ and score_
+// carry meaning, which keeps one record type across all three batched ops.
+clio::run::TaskResume Runtime::PodMultiScore(
+    clio::run::shared_ptr<PodMultiScoreTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    auto &req = task->reqs_[i];
+    auto sub = ipc_manager->NewTask<PodReorganizeBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        req.score_);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PodReorganizeBlob(sub));
+    int rc = sub->GetReturnCode();
+    req.rc_ = static_cast<clio::run::u32>(rc);
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (first_rc == 0) {
+      first_rc = rc;
+    }
+  }
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
+}
+
 // Periodic internal data-organizer driver (issue #738). All organization
 // logic lives in the configured DataOrganizer; this handler only delegates.
 clio::run::TaskResume Runtime::DynamicReorganize(

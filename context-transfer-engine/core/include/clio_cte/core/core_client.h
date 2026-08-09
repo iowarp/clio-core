@@ -2369,6 +2369,33 @@ class Client : public clio::run::ContainerClient {
                            blob_data, pool_query);
   }
 
+  // ===========================================================================
+  // Batched POD paging. One task carries up to kPodMultiMax page requests, so
+  // a full page-cache flush costs a handful of submissions instead of one per
+  // page. Build the task, Add() records until it returns false, then Send.
+  // ===========================================================================
+
+  /** Allocate an empty batch of `TaskT` (PodMulti{Put,Get}BlobTask /
+   *  PodMultiScoreTask) for the caller to fill with Add(). */
+  template <typename TaskT>
+  clio::run::shared_ptr<TaskT> NewPodBatch(
+      const TagId &tag_id, const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<TaskT>(clio::run::CreateTaskId(), pool_id_,
+                                            pool_query, tag_id);
+    task.get()->context_ = context;
+    task.get()->flags_ = flags;
+    return task;
+  }
+
+  /** Submit a batch built with NewPodBatch(). */
+  template <typename TaskT>
+  clio::run::Future<TaskT> AsyncPodBatch(clio::run::shared_ptr<TaskT> &task) {
+    return CLIO_CPU_IPC->Send(task);
+  }
+
   clio::run::Future<PodReorganizeBlobTask> AsyncPodReorganizeBlob(
       const TagId &tag_id, const std::string &blob_name, float new_score,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
