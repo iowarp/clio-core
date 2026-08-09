@@ -664,8 +664,16 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Make was_created a local variable
   bool was_created;
 
-  // Validate pool parameters
+  // Validate pool parameters.
+  //
+  // EVERY failure below must set a return code. Without one the task completes
+  // with 0, and 0 means success to the compose driver -- which then logs
+  // "Successfully created pool" for a pool that does not exist. A ChiMod whose
+  // .so fails to dlopen took exactly that path: the pool was silently absent,
+  // every blob bypassed the module, and the only symptom was a stored size of
+  // zero much later.
   if (!ValidatePoolParams(chimod_name, pool_name)) {
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -690,6 +698,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     HLOG(kError,
          "PoolManager: Cannot create pool with null PoolId. Users must provide "
          "explicit pool ID.");
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -727,6 +736,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   if (!module_manager) {
     HLOG(kError, "PoolManager: Module manager not available");
     ErasePoolMetadata(target_pool_id);
+    task->SetReturnCode(ENODEV);
     CLIO_CO_RETURN;
   }
 
@@ -741,6 +751,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(ENOENT);
       CLIO_CO_RETURN;
     }
 
@@ -784,6 +795,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to register container");
       container.get().Destroy(chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(EIO);
       CLIO_CO_RETURN;
     }
 
@@ -816,6 +828,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   } catch (const std::exception& e) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());
+    task->SetReturnCode(EIO);
     if (container) {
       // Unregister if it was registered before the exception
       UnregisterContainer(target_pool_id, node_id);
