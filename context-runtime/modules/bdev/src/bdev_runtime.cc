@@ -404,6 +404,24 @@ double ThrottleNowUs() {
  * and one line per operation would itself perturb what is being measured.
  */
 void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
+  // Decided ONCE per process, not per container, and read here rather than in
+  // Create: a container that never ran Create kept io_trace_ = false and its
+  // traffic vanished from the totals. That is exactly how a read path can look
+  // like it is skipping work when it is only skipping the instrument -- 8192
+  // reads were issued and 4484 were counted.
+  static const bool s_trace = [] {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    return tr != nullptr && *tr != '\0' && *tr != '0';
+  }();
+  static const clio::run::u64 s_period = [] {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    const int p = (tr != nullptr) ? std::atoi(tr) : 0;
+    return (p > 0) ? static_cast<clio::run::u64>(p) : 64;
+  }();
+  if (!s_trace) {
+    return;
+  }
+  io_trace_period_ = s_period;
   clio::run::u64 n;
   if (is_write) {
     trace_w_bytes_.fetch_add(bytes);
@@ -463,7 +481,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_AWAIT(transport_->WriteBlocks(ctp::ipc::FullPtr<WriteTask>(task.get())));
     total_writes_.fetch_add(1);
     total_bytes_written_.fetch_add(task->bytes_written_);
-    if (io_trace_) TraceIo(task->bytes_written_, true);
+    TraceIo(task->bytes_written_, true);
     if (throttle_mbps_ > 0.0) {
       CLIO_CO_AWAIT(ThrottleFor(task->bytes_written_));
     }
@@ -479,6 +497,11 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
+  // Counted at ENTRY, before the kNoop early-out: that path reports success
+  // and claims bytes_read_ = length without touching storage, so counting
+  // after it hides exactly the reads that did no I/O.
+  TraceIo(task->length_, false);
+
   if (bdev_type_ == BdevType::kNoop) {
     task->return_code_ = 0;
     task->bytes_read_ = task->length_;
@@ -489,7 +512,6 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     CLIO_CO_AWAIT(transport_->ReadBlocks(ctp::ipc::FullPtr<ReadTask>(task.get())));
     total_reads_.fetch_add(1);
     total_bytes_read_.fetch_add(task->bytes_read_);
-    if (io_trace_) TraceIo(task->bytes_read_, false);
     if (throttle_mbps_ > 0.0) {
       CLIO_CO_AWAIT(ThrottleFor(task->bytes_read_));
     }
