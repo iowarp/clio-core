@@ -179,6 +179,44 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
             static_cast<unsigned long long>(v.FlushBlockBatched()));
 }
 
+/**
+ * Batched-fetch `npages` in chunks of `chunk`, then verify every element.
+ * Reports mismatches and how many pages the batched fetch reported resident.
+ */
+__global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u64 npages, u32 chunk,
+                                 u32 salt, unsigned long long *bad,
+                                 unsigned long long *got) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  unsigned long long local = 0;
+  unsigned long long fetched = 0;
+  for (u64 k = 0; k < npages; k += chunk) {
+    u64 n = npages - k;
+    if (n > chunk) n = chunk;
+    fetched += v.FetchPagesBatched(k, static_cast<u32>(n));
+    for (u64 j = 0; j < n; ++j) {
+      const u64 off = (k + j) * v.elems_per_page_;
+      v.HoldPage(off, v.elems_per_page_);
+      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+        if (v[off + i] != Val(off + i, salt)) ++local;
+      }
+    }
+  }
+  atomicAdd(bad, local);
+  atomicAdd(got, fetched);
+}
+
+/** Drop the calling block's cache, so the next reads must fault. */
+__global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<u32> v) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  v.DropAll();
+}
+
 /** Batched-flush a block whose pages should already be clean. */
 __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v,
@@ -460,6 +498,36 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     REQUIRE(ReadCounter(again) == 0);
     cudaFree(flushed);
     cudaFree(again);
+  }
+
+  // -------------------------------------------------------------------
+  // BATCHED FAULTING. One get per chunk of pages instead of one per page.
+  // The data must be identical to what per-page faulting returns -- a batch
+  // that mismatched a record to its slot would return the RIGHT bytes for
+  // the WRONG page, which no checksum over a single page can catch, so this
+  // verifies every element of every page against its own page number.
+  // -------------------------------------------------------------------
+  {
+    const u64 kPages = 12;
+    // Cache smaller than the working set: chunks must evict and refill,
+    // which is where a slot-reuse bug would show.
+    Fixture f("gv_sem_batch_fetch", 1, 4, kPages);
+    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1);
+    Sync();
+    DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
+    Sync();
+
+    unsigned long long *got = NewCounter();
+    f.Reset();
+    BatchFetchKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got);
+    Sync();
+    const unsigned long long nbad = ReadCounter(bad);
+    std::fprintf(stderr, "[batch-fetch] pages=%llu resident=%llu bad=%llu\n",
+                 (unsigned long long) kPages, ReadCounter(got), nbad);
+    REQUIRE(nbad == 0);
+    REQUIRE(ReadCounter(got) == kPages);
+    REQUIRE(cudaMemset(bad, 0, sizeof(*bad)) == cudaSuccess);
+    cudaFree(got);
   }
 
   // -------------------------------------------------------------------

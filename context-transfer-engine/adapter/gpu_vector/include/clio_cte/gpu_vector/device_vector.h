@@ -96,7 +96,7 @@ class DeviceVector {
    * Null / zero when the host did not provision them, in which case
    * FlushBlockBatched falls back to the scalar path.
    */
-  MultiPutBatch *multi_ = nullptr;
+  MultiBatch *multi_ = nullptr;
   clio::run::u32 multi_per_block_ = 0;
   int *block_locks_ = nullptr;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
@@ -364,6 +364,31 @@ class DeviceVector {
   }
 
   /**
+   * Fault pages [first_page, first_page + n) into this block's cache with
+   * BATCHED gets, and wait for them.
+   *
+   * This is the read-side counterpart to FlushBlockBatched, and it exists for
+   * the same measured reason: a fault costs ~110us of round trip against ~6us
+   * of actual 256 KB device-to-device copy, so the SUBMISSION is ~95% of a
+   * read and cutting bytes (by compressing) cannot pay for itself while every
+   * page costs one. n pages in one submission amortizes that, which is the
+   * only way reduced bytes can turn into reduced time.
+   *
+   * Blocking by design: a streaming reader asks for its next chunk, gets it
+   * all at once, and then walks it with no faults at all. `n` is clamped to
+   * what the cache can actually hold and to kPodMultiMax.
+   *
+   * @return the number of pages now resident and valid.
+   */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatched(clio::run::u64 first_page,
+                                               clio::run::u32 n) {
+    LockBlock();
+    const clio::run::u32 got = FetchPagesBatchedLocked(first_page, n);
+    UnlockBlock();
+    return got;
+  }
+
+  /**
    * Start faulting `page_num` in WITHOUT waiting for it.
    *
    * This is what makes compute and I/O overlap: the kernel asks for the page
@@ -497,7 +522,7 @@ class DeviceVector {
   }
 
   /** This block's batch slots -- same partitioning as the page table. */
-  CTP_GPU_FUN MultiPutBatch *BlockBatches() const {
+  CTP_GPU_FUN MultiBatch *BlockBatches() const {
     const clio::run::u32 b = blockIdx.x % nblocks_;
     return multi_ + static_cast<clio::run::u64>(b) * multi_per_block_;
   }
@@ -620,6 +645,28 @@ class DeviceVector {
     ClearRunCtx(t);
   }
 
+  /** Header fields of a batched get; records are appended by the caller. */
+  CTP_GPU_FUN void PrepareMultiGet(
+      clio::cte::core::PodMultiGetBlobTask *t) const {
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindGet);
+    t->pool_id_ = pool_id_;
+    t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = tag_id_;
+    t->count_ = 0;
+    t->flags_ = 0;
+    t->num_ok_ = 0;
+    // Same codec the PUT declared: a page written through the compressor is
+    // STORED compressed, so a get with an empty context asks for the stored
+    // bytes rather than the data.
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
+    ClearRunCtx(t);
+  }
+
   /** FlushBlockBatched's body, for callers already holding the block lock. */
   CTP_GPU_FUN clio::run::u32 FlushBlockBatchedLocked() {
     Page *tbl = BlockPages();
@@ -641,39 +688,39 @@ class DeviceVector {
       if (tbl[i].flushing) AwaitPut(&tbl[i]);
     }
 
-    MultiPutBatch *mb = BlockBatches();
+    MultiBatch *mb = BlockBatches();
     clio::run::u32 nb = 0;              // batches with records in them
     clio::run::u32 filled = 0;          // records in batch nb
-    PrepareMultiPut(mb[0].task);
+    PrepareMultiPut(mb[0].put);
     for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
       Page *p = &tbl[i];
       if (p->page_num == kNoPage || !p->dirty) continue;
       if (filled == clio::cte::core::kPodMultiMax) {
         // Full: submit and move on. multi_per_block_ is sized so this can
         // only run out if the host provisioned fewer batches than pages.
-        mb[nb].fut = ipc_->Send(SlotPtr(mb[nb].task));
+        mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
         ++nb;
         filled = 0;
         if (nb == multi_per_block_) break;
-        PrepareMultiPut(mb[nb].task);
+        PrepareMultiPut(mb[nb].put);
       }
       char name[32];
       PageBlobName(p->page_num, name);
-      mb[nb].task->Add(name, 0, page_bytes_, RawPtr(p->data), p->score);
+      mb[nb].put->Add(name, 0, page_bytes_, RawPtr(p->data), p->score);
       mb[nb].page_slot[filled] = i;
       ++filled;
       Bump(stat_puts_);
     }
     clio::run::u32 nsub = nb;
     if (filled > 0) {
-      mb[nb].fut = ipc_->Send(SlotPtr(mb[nb].task));
+      mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
       nsub = nb + 1;
     }
 
     clio::run::u32 ok = 0;
     for (clio::run::u32 b = 0; b < nsub; ++b) {
-      mb[b].fut.Wait();
-      auto *t = mb[b].task;
+      mb[b].put_fut.Wait();
+      auto *t = mb[b].put;
       for (clio::run::u32 r = 0; r < t->count_; ++r) {
         Page *p = &tbl[mb[b].page_slot[r]];
         // Clean only on this record's own success -- a failed page keeps its
@@ -685,6 +732,89 @@ class DeviceVector {
       }
     }
     return ok;
+  }
+
+  /** FetchPagesBatched's body, for callers already holding the block lock. */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedLocked(clio::run::u64 first_page,
+                                                     clio::run::u32 n) {
+    Page *tbl = BlockPages();
+    if (multi_ == nullptr || multi_per_block_ == 0) {
+      // Not provisioned: fault them one at a time rather than silently
+      // returning nothing.
+      clio::run::u32 got = 0;
+      for (clio::run::u32 k = 0; k < n; ++k) {
+        if (ResolveLocked(first_page + k) != nullptr) ++got;
+      }
+      return got;
+    }
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    // A batch cannot exceed the cache: claiming more slots than exist would
+    // evict a page this same batch already claimed.
+    if (n > pages_per_block_) n = pages_per_block_;
+
+    MultiBatch *mb = BlockBatches();
+    PrepareMultiGet(mb[0].get);
+    clio::run::u32 filled = 0;
+    clio::run::u32 resident = 0;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first_page + k;
+      Page *p = Find(pg);
+      if (p != nullptr) {
+        // Already here (or already in flight from a scalar prefetch): let the
+        // existing path finish it rather than issuing a second get.
+        if (p->fetching) AwaitFetch(p);
+        ++resident;
+        continue;
+      }
+      clio::run::u32 slot = pages_per_block_;
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (tbl[i].page_num == kNoPage) { slot = i; break; }
+      }
+      if (slot == pages_per_block_) {
+        EvictLocked(1);
+        for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+          if (tbl[i].page_num == kNoPage) { slot = i; break; }
+        }
+        if (slot == pages_per_block_) break;  // everything is pinned
+      }
+      Page *np = &tbl[slot];
+      // fetching FIRST, then the page number -- same ordering the scalar claim
+      // uses, and it is what keeps EvictLocked from choosing a slot this batch
+      // has already claimed but not yet filled.
+      np->fetching = 1u;
+      __threadfence_block();
+      np->page_num = pg;
+      np->dirty = 0u;
+      np->flushing = 0u;
+      np->score = 0.0f;
+      char name[32];
+      PageBlobName(pg, name);
+      mb[0].get->Add(name, 0, page_bytes_, RawPtr(np->data));
+      mb[0].page_slot[filled] = slot;
+      ++filled;
+      Bump(stat_faults_);
+      Bump(stat_prefetches_);
+    }
+    if (filled == 0) return resident;
+
+    mb[0].get_fut = ipc_->Send(SlotPtr(mb[0].get));
+    mb[0].get_fut.Wait();
+    auto *t = mb[0].get;
+    clio::run::u32 ok = 0;
+    for (clio::run::u32 r = 0; r < filled; ++r) {
+      Page *p = &tbl[mb[0].page_slot[r]];
+      p->fetching = 0u;
+      if (r < t->count_ && t->reqs_[r].rc_ == 0) {
+        ++ok;
+      } else {
+        // A failed get leaves the slot holding whatever it held before. Free
+        // it rather than letting the caller read those bytes as this page --
+        // serving stale data silently is the one outcome worse than a miss.
+        p->page_num = kNoPage;
+        Bump(stat_get_errors_);
+      }
+    }
+    return resident + ok;
   }
 
   CTP_GPU_FUN void AwaitPut(Page *p) {

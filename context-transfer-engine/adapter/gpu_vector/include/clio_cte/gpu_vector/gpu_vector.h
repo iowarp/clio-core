@@ -219,7 +219,7 @@ class Vector {
     char *table_base = nullptr;     // Page[] table
     char *tasks_base = nullptr;     // task slots
     char *multi_task_base = nullptr;  // batched-put task slots
-    char *multi_tbl_base = nullptr;   // MultiPutBatch[] table
+    char *multi_tbl_base = nullptr;   // MultiBatch[] table
     ctp::ipc::AllocatorId multi_tbl_alloc;
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
@@ -280,7 +280,8 @@ class Vector {
         static_cast<clio::run::u64>(nblocks_) * multi_per_block;
     const clio::run::u64 scalar_task_bytes =
         nslots * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
-    const clio::run::u64 multi_task_bytes = nbatch * sizeof(MultiPutSlot);
+    const clio::run::u64 multi_task_bytes =
+        nbatch * (sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
     // The batch tasks share the per-page slots' backend ON PURPOSE. SlotPtr
     // stamps `task_alloc_id_` -- ONE allocator id -- on every task it sends,
     // so a task living in a different registered backend reaches the runtime
@@ -294,7 +295,7 @@ class Vector {
 
     st.multi_tbl_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-        nbatch * sizeof(MultiPutBatch), &st.multi_tbl_base);
+        nbatch * sizeof(MultiBatch), &st.multi_tbl_base);
 
     if (st.pages_alloc.IsNull() || st.table_alloc.IsNull() ||
         st.tasks_alloc.IsNull() || st.multi_tbl_alloc.IsNull()) {
@@ -378,25 +379,33 @@ class Vector {
     // stamped with their POD size so RecvIn knows how many bytes to copy back
     // without dereferencing the task.
     {
-      std::vector<char> mtasks(
-          static_cast<size_t>(nbatch * sizeof(MultiPutSlot)), 0);
-      std::vector<MultiPutBatch> mtbl(static_cast<size_t>(nbatch));
+      const size_t pair = sizeof(MultiPutSlot) + sizeof(MultiGetSlot);
+      std::vector<char> mtasks(static_cast<size_t>(nbatch) * pair, 0);
+      std::vector<MultiBatch> mtbl(static_cast<size_t>(nbatch));
       for (clio::run::u64 i = 0; i < nbatch; ++i) {
-        char *slot = mtasks.data() + i * sizeof(MultiPutSlot);
+        char *slot = mtasks.data() + static_cast<size_t>(i) * pair;
         new (slot) MultiPutSlot(clio::run::CreateTaskId(),
                                 clio::cte::core::kCtePoolId, local, tag_id_);
+        new (slot + sizeof(MultiPutSlot))
+            MultiGetSlot(clio::run::CreateTaskId(), clio::cte::core::kCtePoolId,
+                         local, tag_id_);
         reinterpret_cast<MultiPutSlot *>(slot)->fut_.task_size_ =
             static_cast<clio::run::u32>(sizeof(MultiPutSlot));
-        mtbl[static_cast<size_t>(i)].task =
-            reinterpret_cast<MultiPutSlot *>(st.multi_task_base +
-                                             i * sizeof(MultiPutSlot));
-        mtbl[static_cast<size_t>(i)].fut =
+        reinterpret_cast<MultiGetSlot *>(slot + sizeof(MultiPutSlot))
+            ->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(MultiGetSlot));
+        char *dev = st.multi_task_base + static_cast<size_t>(i) * pair;
+        mtbl[static_cast<size_t>(i)].put = reinterpret_cast<MultiPutSlot *>(dev);
+        mtbl[static_cast<size_t>(i)].get =
+            reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
+        mtbl[static_cast<size_t>(i)].put_fut =
             clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
+        mtbl[static_cast<size_t>(i)].get_fut =
+            clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
       }
       UploadBytes(mtasks.data(), st.multi_task_base,
-                  nbatch * sizeof(MultiPutSlot));
+                  static_cast<clio::run::u64>(nbatch) * pair);
       UploadBytes(mtbl.data(), st.multi_tbl_base,
-                  nbatch * sizeof(MultiPutBatch));
+                  nbatch * sizeof(MultiBatch));
     }
 
     // One device-global counter per vector, feeding unique task ids.
@@ -444,7 +453,7 @@ class Vector {
     v.compress_lib_ = compress_lib_;
     v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
-    v.multi_ = reinterpret_cast<MultiPutBatch *>(st.multi_tbl_base);
+    v.multi_ = reinterpret_cast<MultiBatch *>(st.multi_tbl_base);
     v.multi_per_block_ = static_cast<clio::run::u32>(multi_per_block);
     st.view = v;
     devs_[gpu_id] = st;

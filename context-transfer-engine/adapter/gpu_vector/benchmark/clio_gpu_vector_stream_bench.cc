@@ -185,6 +185,46 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
   atomicAdd(sum, acc);
 }
 
+/**
+ * Streaming read that faults in CHUNKS: one batched get per `chunk` pages,
+ * then a fault-free walk over them.
+ *
+ * Why this exists: a fault costs ~110us of round trip against ~6us of actual
+ * 256 KB device-to-device copy, so ~95% of a read is the submission itself.
+ * While every page costs one, compressing cannot pay for itself no matter how
+ * well it compresses -- there are simply no bytes on the critical path to
+ * save. Amortizing the submission over `chunk` pages is what lets a smaller
+ * stored size turn into a shorter read.
+ */
+__global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
+                                        gv::DeviceVector<u32> v,
+                                        u64 pages_per_block, u32 chunk,
+                                        unsigned long long *sum) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  const u64 pe = v.elems_per_page_;
+  const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
+  unsigned long long acc = 0;
+  for (u64 k = 0; k < pages_per_block; k += chunk) {
+    u64 n = pages_per_block - k;
+    if (n > chunk) n = chunk;
+    if (threadIdx.x == 0) {
+      v.FetchPagesBatched(base_page + k, static_cast<u32>(n));
+    }
+    __syncthreads();
+    // The chunk is resident now, so this walk faults on nothing.
+    for (u64 j = 0; j < n; ++j) {
+      const u64 off = (base_page + k + j) * pe;
+      v.HoldPage(off, pe);
+      for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
+        acc += static_cast<unsigned long long>(v[off + i]);
+      }
+      __syncthreads();
+    }
+  }
+  atomicAdd(sum, acc);
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
@@ -214,6 +254,7 @@ int main(int argc, char **argv) {
   u32 threads = 256;
   u64 stored_sample = 1024;  // pages probed for the stored-size estimate
   u32 prefetch_depth = 0;    // pages kept in flight ahead of the reader
+  u32 read_batch = 0;        // pages per batched get (0 = per-page faults)
   bool compressed = false;
   bool gpu_codec = false;  // nvcomp: decompress ON the GPU
   const char *tier_type = "pinned";  // pageable staging halves device I/O
@@ -240,6 +281,7 @@ int main(int argc, char **argv) {
     else if (f == "--threads") threads = static_cast<u32>(std::atoll(next()));
     else if (f == "--stored-sample") stored_sample = std::atoll(next());
     else if (f == "--prefetch") prefetch_depth = static_cast<u32>(std::atoll(next()));
+    else if (f == "--read-batch") read_batch = static_cast<u32>(std::atoll(next()));
     else if (f == "--compressed") compressed = true;
     else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
@@ -259,7 +301,8 @@ int main(int argc, char **argv) {
           "  --vram-mb   top-tier capacity: the 'VRAM' the data is sized against\n"
           "  --spill-type  tier below the top one: ram|file (default ram)\n"
           "  --spill-path  backing file when --spill-type file\n"
-          "  --prefetch    pages kept in flight ahead of the reader (0 = sync)\n",
+          "  --prefetch    pages kept in flight ahead of the reader (0 = sync)\n"
+          "  --read-batch  pages per BATCHED get (0 = one fault per page)\n",
           argv[0]);
       return 0;
     }
@@ -412,8 +455,22 @@ int main(int argc, char **argv) {
   cudaMalloc(&d_sum, sizeof(unsigned long long));
   cudaMemset(d_sum, 0, sizeof(unsigned long long));
   const double r0 = NowMs();
-  StreamReadKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
-                                        prefetch_depth, d_sum);
+  if (read_batch > 0) {
+    // The chunk has to fit the cache -- a batch larger than the block's slots
+    // would evict pages the same batch just claimed -- and one task holds at
+    // most kPodMultiMax records.
+    if (read_batch > pages_per_block_resident) {
+      read_batch = static_cast<u32>(pages_per_block_resident);
+    }
+    if (read_batch > clio::cte::core::kPodMultiMax) {
+      read_batch = clio::cte::core::kPodMultiMax;
+    }
+    StreamReadBatchedKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
+                                                 read_batch, d_sum);
+  } else {
+    StreamReadKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
+                                          prefetch_depth, d_sum);
+  }
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::fprintf(stderr, "stream: read kernel failed: %s\n",
                  cudaGetErrorString(cudaGetLastError()));
