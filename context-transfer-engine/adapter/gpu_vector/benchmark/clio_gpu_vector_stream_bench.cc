@@ -178,7 +178,7 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
     __syncthreads();
     v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-      acc += static_cast<unsigned long long>(v[off + i]);
+      acc += static_cast<unsigned long long>(v.at(off + i));
     }
     __syncthreads();
   }
@@ -217,7 +217,7 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
       const u64 off = (base_page + k + j) * pe;
       v.HoldPage(off, pe);
       for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-        acc += static_cast<unsigned long long>(v[off + i]);
+        acc += static_cast<unsigned long long>(v.at(off + i));
       }
       __syncthreads();
     }

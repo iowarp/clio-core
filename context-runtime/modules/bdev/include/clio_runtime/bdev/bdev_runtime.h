@@ -180,6 +180,23 @@ class Runtime : public clio::run::Container {
    */
   std::atomic<double> throttle_next_free_us_{0.0};
 
+  /**
+   * Per-device I/O accounting, armed by CLIO_BDEV_IO_TRACE.
+   *
+   * Tiering questions need to know what each TIER actually did, and the
+   * aggregate counters cannot answer that: they say nothing about which
+   * device served the traffic, so "the pager wrote 128 MB" and "the pager
+   * wrote 128 MB three times to the slowest tier" look identical. Measuring
+   * this is what exposed both the placement bug and the write amplification.
+   */
+  bool io_trace_ = false;
+  std::string trace_name_;
+  std::atomic<clio::run::u64> trace_r_ops_{0}, trace_r_bytes_{0};
+  std::atomic<clio::run::u64> trace_w_ops_{0}, trace_w_bytes_{0};
+
+  /** Log this device's running totals every `kIoTracePeriod` operations. */
+  void TraceIo(clio::run::u64 bytes, bool is_write);
+
   /** Reserve this transfer's slice of the device timeline and wait for it. */
   clio::run::TaskResume ThrottleFor(clio::run::u64 bytes);
 

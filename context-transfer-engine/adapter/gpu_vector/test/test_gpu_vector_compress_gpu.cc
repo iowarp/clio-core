@@ -103,7 +103,7 @@ __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
   for (clio::run::u64 i = 0; i < per;) {
     const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
     for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      acc += static_cast<unsigned long long>(v[base + i]) *
+      acc += static_cast<unsigned long long>(v.at(base + i)) *
              Activation(base + i);
       }
   }
@@ -145,7 +145,7 @@ __global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
       for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
         const clio::run::u64 run_i = v.HoldPage(off + i, v.elems_per_page_ - i);
         for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
-          acc += static_cast<unsigned long long>(v[off + i]) *
+          acc += static_cast<unsigned long long>(v.at(off + i)) *
                  Activation(off + i);
         }
       }

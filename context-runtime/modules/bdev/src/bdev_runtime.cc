@@ -262,6 +262,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
   }
 
+  {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    io_trace_ = (tr != nullptr && *tr != '\0' && *tr != '0');
+    trace_name_ = task->pool_name_.str();
+  }
+
   // pool_name doubles as the file path (kFile) / S3 bucket (kS3); it lives on
   // the create task, not in CreateParams.
   if (!transport_->Init(params, task->pool_name_.str(), this)) {
@@ -385,6 +391,29 @@ double ThrottleNowUs() {
  * thread would stall every other task on that worker -- turning a per-device
  * cap into a global one and measuring the wrong thing entirely.
  */
+/**
+ * Running per-device I/O totals, so a tier's traffic can be compared against
+ * the logical dataset. Periodic rather than per-op: the point is the ratio,
+ * and one line per operation would itself perturb what is being measured.
+ */
+void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
+  static constexpr clio::run::u64 kIoTracePeriod = 512;
+  clio::run::u64 n;
+  if (is_write) {
+    trace_w_bytes_.fetch_add(bytes);
+    n = trace_w_ops_.fetch_add(1) + 1;
+  } else {
+    trace_r_bytes_.fetch_add(bytes);
+    n = trace_r_ops_.fetch_add(1) + 1;
+  }
+  if ((n % kIoTracePeriod) != 0) {
+    return;
+  }
+  HLOG(kWarning, "[IO] {} reads={} rMB={} writes={} wMB={}", trace_name_,
+       trace_r_ops_.load(), trace_r_bytes_.load() / (1024 * 1024),
+       trace_w_ops_.load(), trace_w_bytes_.load() / (1024 * 1024));
+}
+
 clio::run::TaskResume Runtime::ThrottleFor(clio::run::u64 bytes) {
   CLIO_TASK_BODY_BEGIN
   const double want_us =
@@ -424,6 +453,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_AWAIT(transport_->WriteBlocks(ctp::ipc::FullPtr<WriteTask>(task.get())));
     total_writes_.fetch_add(1);
     total_bytes_written_.fetch_add(task->bytes_written_);
+    if (io_trace_) TraceIo(task->bytes_written_, true);
     if (throttle_mbps_ > 0.0) {
       CLIO_CO_AWAIT(ThrottleFor(task->bytes_written_));
     }
@@ -449,6 +479,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     CLIO_CO_AWAIT(transport_->ReadBlocks(ctp::ipc::FullPtr<ReadTask>(task.get())));
     total_reads_.fetch_add(1);
     total_bytes_read_.fetch_add(task->bytes_read_);
+    if (io_trace_) TraceIo(task->bytes_read_, false);
     if (throttle_mbps_ > 0.0) {
       CLIO_CO_AWAIT(ThrottleFor(task->bytes_read_));
     }
