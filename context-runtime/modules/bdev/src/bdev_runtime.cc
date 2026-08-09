@@ -265,6 +265,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   {
     const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
     io_trace_ = (tr != nullptr && *tr != '\0' && *tr != '0');
+    // The value doubles as the reporting period: 1 logs every operation,
+    // which is what makes an exact op count possible when the totals do not
+    // reconcile with the expected number of pages.
+    if (io_trace_) {
+      const int p = std::atoi(tr);
+      io_trace_period_ = (p > 0) ? static_cast<clio::run::u64>(p) : 64;
+    }
     trace_name_ = task->pool_name_.str();
   }
 
@@ -397,7 +404,6 @@ double ThrottleNowUs() {
  * and one line per operation would itself perturb what is being measured.
  */
 void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
-  static constexpr clio::run::u64 kIoTracePeriod = 64;
   clio::run::u64 n;
   if (is_write) {
     trace_w_bytes_.fetch_add(bytes);
@@ -406,7 +412,7 @@ void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
     trace_r_bytes_.fetch_add(bytes);
     n = trace_r_ops_.fetch_add(1) + 1;
   }
-  if ((n % kIoTracePeriod) != 0) {
+  if ((n % io_trace_period_) != 0) {
     return;
   }
   HLOG(kWarning, "[IO] {} reads={} rMB={} writes={} wMB={}", trace_name_,

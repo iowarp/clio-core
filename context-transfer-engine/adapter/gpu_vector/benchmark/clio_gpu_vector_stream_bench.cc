@@ -423,6 +423,8 @@ int main(int argc, char **argv) {
                       kCompressorPool,
                       !compressed ? 0
                                   : (gpu_codec ? kNvcompLz4WireId : kLz4WireId));
+
+  vec.EnableStats();
   auto dev = vec.GetDevice(0);
 
   // ---- write stream --------------------------------------------------------
@@ -509,6 +511,28 @@ int main(int argc, char **argv) {
       want += static_cast<unsigned long long>(Value(p, off + i, zero_pct)) *
               PosWeight(off + i);
     }
+  }
+
+  // Pager counters. Read these carefully before concluding anything:
+  //
+  //   faults      ~2x the page count, because the WRITE phase faults each
+  //               page before writing it (write-allocate) and the read phase
+  //               faults it again.
+  //   get_errors  ~1x the page count, and BENIGN: the write phase's first
+  //               touch of a page asks the CTE for a blob that does not exist
+  //               yet. It looks like a total failure of the read path and is
+  //               not one -- verify against num_ok on the batch before
+  //               believing otherwise.
+  //   prefetch    counts batched claims, so ~1x the page count on a read pass.
+  {
+    const auto st = vec.ReadStats(0);
+    std::fprintf(stderr,
+                 "GVSTAT faults=%llu puts=%llu evicts=%llu prefetch=%llu "
+                 "get_errors=%llu\n",
+                 (unsigned long long) st.faults, (unsigned long long) st.puts,
+                 (unsigned long long) st.evicts,
+                 (unsigned long long) st.prefetches,
+                 (unsigned long long) st.get_errors);
   }
 
   const bool ok = (got == want);

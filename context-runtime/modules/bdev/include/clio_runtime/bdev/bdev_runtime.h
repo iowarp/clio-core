@@ -190,6 +190,7 @@ class Runtime : public clio::run::Container {
    * this is what exposed both the placement bug and the write amplification.
    */
   bool io_trace_ = false;
+  clio::run::u64 io_trace_period_ = 64;
   std::string trace_name_;
   std::atomic<clio::run::u64> trace_r_ops_{0}, trace_r_bytes_{0};
   std::atomic<clio::run::u64> trace_w_ops_{0}, trace_w_bytes_{0};
