@@ -453,7 +453,7 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   // invalid no matter where the source lives -- the host->host path would
   // fault or silently corrupt. Routing on the source alone was safe only
   // while kHbm quietly used host memory.
-  if (!device_backed_ && !ctp::IsDevicePointer(data_ptr.ptr_)) {
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     WriteBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
@@ -601,7 +601,7 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   // As on the write side, device_backed_ must be part of the test: on a kHbm
   // pool the SOURCE page is device memory, so memcpy out of it is invalid
   // however the destination is allocated.
-  if (!device_backed_ && !ctp::IsDevicePointer(data_ptr.ptr_)) {
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     ReadBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }

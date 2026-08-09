@@ -107,6 +107,18 @@ class Vector {
   Vector(const Vector &) = delete;
   Vector &operator=(const Vector &) = delete;
 
+  /**
+   * @return true if `wire_id` names a codec that decompresses ON the GPU.
+   *
+   * Only these need the page cache to be reachable from another CUDA context.
+   * The ids are the compressor registry's frozen wire values for the nvcomp
+   * family (see CompressionFactory's registry); they are matched by range
+   * rather than by name so this header need not pull in the codec factory.
+   */
+  static bool IsGpuCodec(int wire_id) {
+    return wire_id >= 11 && wire_id <= 16;  // nvcomp-lz4 .. nvcomp-ans
+  }
+
   /** Device view for `dev_id`, to be passed to a kernel by value. */
   DeviceVector<T> GetDevice(int dev_id) const {
     auto it = devs_.find(dev_id);
@@ -227,9 +239,30 @@ class Vector {
     const clio::run::u64 nslots =
         static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
 
+    // Page bytes are MANAGED when a GPU codec is in play, plain device memory
+    // otherwise.
+    //
+    // A GPU codec cannot run in the context whose kernel is spinning on the
+    // fault, so it runs in its own context -- and a plain cudaMalloc pointer is
+    // only valid in the context that made it. Managed memory is addressable
+    // from every context on the device, which is what lets the codec
+    // decompress STRAIGHT INTO the page the fault is waiting on: no host
+    // staging, no peer copy, no second buffer. That is the whole point of
+    // compressing on the GPU and it is not expressible with kDeviceMem.
+    //
+    // It is not free: managed pages measured ~12% slower on the raw read path
+    // (1.95 vs 2.22 GB/s), which is migration bookkeeping nobody who is not
+    // compressing should pay. So the choice follows the codec.
+    //
+    // Only the page bytes are affected either way. The page table and task
+    // slots stay device-resident: the kernel alone touches them, never the
+    // codec, so managing them would buy nothing and cost migration.
+    const auto page_kind =
+        IsGpuCodec(compress_lib_)
+            ? clio::run::gpu::IpcManager::MemKind::kManagedUvm
+            : clio::run::gpu::IpcManager::MemKind::kDeviceMem;
     st.pages_alloc = ipc->AllocateAndRegisterGpuBackend(
-        gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-        nslots * page_bytes_, &st.pages_base);
+        gpu_id, page_kind, nslots * page_bytes_, &st.pages_base);
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nslots * sizeof(Page), &st.table_base);

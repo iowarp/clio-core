@@ -1311,20 +1311,15 @@ class CodecCtxGuard {
 }  // namespace
 
 bool Runtime::InitCodecContext() {
-  // OPT-IN, and it should stay that way until faults are batched.
+  // Set CLIO_COMPRESS_GPU_CODEC=0 to force GPU codecs onto the CPU path.
   //
-  // This path is CORRECT -- verified end to end, same 1.43x ratio as the CPU
-  // codec -- and it is roughly 30x SLOWER: 0.04/0.03 GB/s against the CPU
-  // codec's 1.15/1.45 on the same 2 GB, 4x-oversubscribed run. That is about
-  // 8 ms per page, which is a driver context time-slice.
-  //
-  // The irony is exact: time-slicing between contexts is the only reason a GPU
-  // codec can run at all while the faulting kernel spins, and paying one
-  // time-slice per fault is what makes it lose. Nothing here is tuned badly;
-  // the unit of work is wrong. It becomes worthwhile only if many pages are
-  // decompressed per context switch, i.e. if the fault path batches.
-  const char *opt_in = std::getenv("CLIO_COMPRESS_GPU_CODEC");
-  if (opt_in == nullptr || opt_in[0] != '1') {
+  // On by default: a GPU codec exists so that a compressed page is decompressed
+  // where it is needed, straight into the faulting page, with nothing staged
+  // through the host. Falling back to the CPU codec throws that away -- it
+  // stages the page out, decompresses, and stages a full uncompressed page
+  // back in, which is strictly more work than not compressing at all.
+  const char *opt_out = std::getenv("CLIO_COMPRESS_GPU_CODEC");
+  if (opt_out != nullptr && opt_out[0] == '0') {
     return false;
   }
   if (cuInit(0) != CUDA_SUCCESS) {
@@ -1420,7 +1415,7 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
     if (!guard.ok()) {
       return false;
     }
-    // Only the COMPRESSED bytes cross the bus; the page itself never does.
+    // Only the COMPRESSED bytes are staged; the page itself never moves.
     if (cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(codec_in_),
                      stored_host + hdr, payload) != CUDA_SUCCESS) {
       return false;
@@ -1428,26 +1423,16 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
     auto codec = ctp::CompressionFactory::GetPreset(
         ctp::CompressionFactory::NameForWireId(header->compress_lib_),
         ctp::CompressionPreset::BALANCED);
-    if (!codec || !codec->Decompress(codec_out_, out, codec_in_, payload)) {
+    // DECOMPRESS DIRECTLY INTO THE FAULT'S PAGE. dst_device is the page the
+    // faulting block is waiting on, it is exactly dst_bytes long, and it is
+    // managed memory so this context can write it. nvcomp writes into the
+    // caller's output when it is device memory big enough for the decompressed
+    // size, so there is no intermediate buffer and nothing to copy afterwards.
+    if (!codec || !codec->Decompress(dst_device, out, codec_in_, payload)) {
       return false;
     }
-  }
-  // Copy engine, across contexts, straight into the caller's page -- async on
-  // the codec stream so it never waits on the faulting context's spinning
-  // kernel (see the note in GpuCompressFromDevice).
-  {
-    CodecCtxGuard guard(codec_ctx_);
-    if (!guard.ok()) {
-      return false;
-    }
-    CUstream cs = static_cast<CUstream>(gpu_stream_);
-    CUresult r = cuMemcpyPeerAsync(
-        reinterpret_cast<CUdeviceptr>(dst_device),
-        static_cast<CUcontext>(primary_ctx_),
-        reinterpret_cast<CUdeviceptr>(codec_out_),
-        static_cast<CUcontext>(codec_ctx_), std::min(out, dst_bytes), cs);
-    if (r == CUDA_SUCCESS) r = cuStreamSynchronize(cs);
-    return r == CUDA_SUCCESS;
+    return cuStreamSynchronize(static_cast<CUstream>(gpu_stream_)) ==
+           CUDA_SUCCESS;
   }
 }
 
@@ -1744,7 +1729,7 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
     // or performed device-side inside the consumer itself.
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
     if (IsGpuCodec(ctx.compress_lib_) && HasCodecContext() &&
-        ctp::IsDevicePointer(src_full.ptr_)) {
+        ctp::IsDeviceAccessible(src_full.ptr_)) {
       const size_t sz = static_cast<size_t>(task->size_);
       const size_t bound = sz + (sz / 20) + 1024;
       const size_t hdr_sz = sizeof(CompressionHeader);
@@ -1928,7 +1913,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     {
       auto dst_dev =
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-      const bool _dev = dst_dev.ptr_ != nullptr && ctp::IsDevicePointer(dst_dev.ptr_);
+      const bool _dev = dst_dev.ptr_ != nullptr && ctp::IsDeviceAccessible(dst_dev.ptr_);
       const bool _gd = _dev && GpuDecompressToDevice(buf.ptr_, stored_size, dst_dev.ptr_,
                                 static_cast<size_t>(task->size_));
       if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_decomp dev=%d ok=%d stored=%zu\n", (int)_dev, (int)_gd, (size_t)stored_size);
