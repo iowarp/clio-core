@@ -1430,11 +1430,33 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
  * the header magic rather than from the request, so a blob written raw
  * (because compression was not worth it) reads back correctly through the
  * same path.
+ *
+ * A request with NO codec is forwarded instead of interposed. That is not an
+ * optimization of a rare case: it is the whole uncompressed path. Interposing
+ * means allocating a host SHM buffer, reading the blob into it, and copying
+ * that to the caller's device pointer -- storage -> host -> device. Forwarding
+ * hands the caller's own destination pointer to the core, so the bdev copies
+ * straight into it (MemBdevTransport::ReadBlocks dispatches on
+ * IsDevicePointer), which is one transfer instead of two and is a
+ * device-to-device copy whenever the tier holding the blob is device memory.
+ * Compare CompressPodPutBlob, which has always forwarded the no-codec case;
+ * the read side was interposing unconditionally, so simply composing the
+ * compressor into a chain doubled the cost of every uncompressed device read.
+ *
+ * The codec is taken from the REQUEST, matching the put side: a reader asks
+ * with the same context it wrote with. A blob stored raw because compression
+ * did not pay still reads correctly when the request does carry a codec --
+ * that case is detected below from the header magic, as before.
  */
 clio::run::TaskResume Runtime::DecompressPodGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
+    if (task->context_.compress_lib_ <= 0) {
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodGetBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
     if (!core_client_) {
       core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
     }

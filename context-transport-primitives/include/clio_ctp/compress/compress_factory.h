@@ -243,13 +243,76 @@ class CompressionFactory {
   };
 
   // Construction helpers for single-mode and backend-guarded compressors.
-  // (Multi-mode lossless compressors use CreateLossless<T> directly.)
   static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
+#if CTP_ENABLE_SNAPPY
     return std::make_unique<Snappy>();
+#else
+    return nullptr;
+#endif
   }
   static std::unique_ptr<Compressor> MakeBlosc(CompressionPreset) {
+#if CTP_ENABLE_BLOSC2
     return std::make_unique<Blosc>();
+#else
+    return nullptr;
+#endif
   }
+
+  // Optional lossless codecs. The registry ROW must survive even when the
+  // backend is absent: wire_id and base_id are frozen protocol values, and
+  // NameForWireId still has to resolve them so a blob written on a box that
+  // had the codec reports the right name on one that does not. Only the
+  // constructor goes away -- exactly the nullptr contract the lossy/GPU
+  // backends have always used.
+  static std::unique_ptr<Compressor> MakeBrotli(CompressionPreset preset) {
+#if CTP_ENABLE_BROTLI
+    return CreateLossless<BrotliWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeBzip2(CompressionPreset preset) {
+#if CTP_ENABLE_BZIP2
+    return CreateLossless<Bzip2WithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeLz4(CompressionPreset preset) {
+#if CTP_ENABLE_LZ4
+    return CreateLossless<Lz4WithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeLzma(CompressionPreset preset) {
+#if CTP_ENABLE_LZMA
+    return CreateLossless<LzmaWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeZlib(CompressionPreset preset) {
+#if CTP_ENABLE_ZLIB
+    return CreateLossless<ZlibWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeZstd(CompressionPreset preset) {
+#if CTP_ENABLE_ZSTD
+    return CreateLossless<ZstdWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+
   static std::unique_ptr<Compressor> MakeZfp(CompressionPreset preset) {
 #if CTP_ENABLE_LIBPRESSIO
     return CreateLossy("zfp", preset);
@@ -401,17 +464,17 @@ class CompressionFactory {
   static const auto& Registry() {
     //                                          name  wire base single  make
     static constexpr std::array kRegistry = {
-        CompressorInfo{"brotli",      0,  6, false, &CreateLossless<BrotliWithModes>},
-        CompressorInfo{"bzip2",       1,  1, false, &CreateLossless<Bzip2WithModes>},
+        CompressorInfo{"brotli",      0,  6, false, &MakeBrotli},
+        CompressorInfo{"bzip2",       1,  1, false, &MakeBzip2},
         CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc},
         CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip},
-        CompressorInfo{"lz4",         4,  3, false, &CreateLossless<Lz4WithModes>},
-        CompressorInfo{"lzma",        5,  5, false, &CreateLossless<LzmaWithModes>},
+        CompressorInfo{"lz4",         4,  3, false, &MakeLz4},
+        CompressorInfo{"lzma",        5,  5, false, &MakeLzma},
         CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy},
         CompressorInfo{"sz3",         7, 11, false, &MakeSz3},
         CompressorInfo{"zfp",         8, 10, false, &MakeZfp},
-        CompressorInfo{"zlib",        9,  4, false, &CreateLossless<ZlibWithModes>},
-        CompressorInfo{"zstd",       10,  2, false, &CreateLossless<ZstdWithModes>},
+        CompressorInfo{"zlib",        9,  4, false, &MakeZlib},
+        CompressorInfo{"zstd",       10,  2, false, &MakeZstd},
         CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4},
         CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy},
         CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd},

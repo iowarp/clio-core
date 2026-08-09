@@ -332,60 +332,76 @@ int main(int argc, char* argv[]) {
   HLOG(kInfo, "Initializing compression libraries...");
 
   // ZSTD (3 modes)
+#if CTP_ENABLE_ZSTD
   compressors.push_back({"zstd", "fast",
                          std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"zstd", "balanced",
                          std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"zstd", "best",
                          std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZSTD
 
   // LZ4 (3 modes)
+#if CTP_ENABLE_LZ4
   compressors.push_back({"lz4", "fast",
                          std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"lz4", "balanced",
                          std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"lz4", "best",
                          std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZ4
 
   // Blosc2 (1 mode)
+#if CTP_ENABLE_BLOSC2
   compressors.push_back({"blosc2", "default",
                          std::make_unique<ctp::Blosc>()});
+#endif  // CTP_ENABLE_BLOSC2
 
   // ZLIB (3 modes)
+#if CTP_ENABLE_ZLIB
   compressors.push_back({"zlib", "fast",
                          std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"zlib", "balanced",
                          std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"zlib", "best",
                          std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZLIB
 
   // BZIP2 (3 modes)
+#if CTP_ENABLE_BZIP2
   compressors.push_back({"bzip2", "fast",
                          std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"bzip2", "balanced",
                          std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"bzip2", "best",
                          std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BZIP2
 
   // LZMA (3 modes)
+#if CTP_ENABLE_LZMA
   compressors.push_back({"lzma", "fast",
                          std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"lzma", "balanced",
                          std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"lzma", "best",
                          std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZMA
 
   // BROTLI (3 modes)
+#if CTP_ENABLE_BROTLI
   compressors.push_back({"brotli", "fast",
                          std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::FAST)});
   compressors.push_back({"brotli", "balanced",
                          std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BALANCED)});
   compressors.push_back({"brotli", "best",
                          std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BROTLI
 
   // SNAPPY (1 mode)
+#if CTP_ENABLE_SNAPPY
   compressors.push_back({"snappy", "default",
                          std::make_unique<ctp::Snappy>()});
+#endif  // CTP_ENABLE_SNAPPY
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_LIBPRESSIO
   // Lossy compressors (LibPressio)

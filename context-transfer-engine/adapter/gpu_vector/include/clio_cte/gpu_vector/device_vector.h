@@ -638,6 +638,17 @@ class DeviceVector {
     t->size_ = page_bytes_;
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
+    // The GET must declare the same codec the PUT did. A page written through
+    // the compressor is stored in its COMPRESSED form, so a reader that says
+    // nothing about compression is asking for the stored bytes, not its data.
+    // This was latent for as long as the compressor decompressed every device
+    // read regardless of what the request asked for; the moment the no-codec
+    // read became a straight pass-through to the core (the copy this avoids is
+    // a whole extra staging round trip), a get with an empty context silently
+    // returned compressed bytes -- and only for pages the codec had actually
+    // shrunk, so incompressible data still looked correct.
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
     ClearRunCtx(t);
   }
 

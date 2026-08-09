@@ -638,6 +638,7 @@ std::vector<CompressorConfig> InitializeCompressors() {
 
 #ifdef CTP_ENABLE_COMPRESS
   // ZSTD: 3 levels (fast, balanced, best)
+#if CTP_ENABLE_ZSTD
   configs.push_back({"zstd", "fast",
                      std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::FAST),
                      std::make_unique<std::mutex>()});
@@ -645,54 +646,69 @@ std::vector<CompressorConfig> InitializeCompressors() {
                      std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"zstd", "best",
                      std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZSTD
 
   // LZ4: 3 levels
+#if CTP_ENABLE_LZ4
   configs.push_back({"lz4", "fast",
                      std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::FAST)});
   configs.push_back({"lz4", "balanced",
                      std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"lz4", "best",
                      std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZ4
 
   // ZLIB: 3 levels
+#if CTP_ENABLE_ZLIB
   configs.push_back({"zlib", "fast",
                      std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::FAST)});
   configs.push_back({"zlib", "balanced",
                      std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"zlib", "best",
                      std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZLIB
 
   // BZIP2: 3 levels
+#if CTP_ENABLE_BZIP2
   configs.push_back({"bzip2", "fast",
                      std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::FAST)});
   configs.push_back({"bzip2", "balanced",
                      std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"bzip2", "best",
                      std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BZIP2
 
   // LZMA: 3 levels
+#if CTP_ENABLE_LZMA
   configs.push_back({"lzma", "fast",
                      std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::FAST)});
   configs.push_back({"lzma", "balanced",
                      std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"lzma", "best",
                      std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZMA
 
   // BROTLI: 3 levels
+#if CTP_ENABLE_BROTLI
   configs.push_back({"brotli", "fast",
                      std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::FAST)});
   configs.push_back({"brotli", "balanced",
                      std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BALANCED)});
   configs.push_back({"brotli", "best",
                      std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BROTLI
 
   // SNAPPY: 1 default config
+#if CTP_ENABLE_SNAPPY
   configs.push_back({"snappy", "default", std::make_unique<ctp::Snappy>(),
                      std::make_unique<std::mutex>()});
+#endif  // CTP_ENABLE_SNAPPY
 
   // Blosc2: 1 default config
+#if CTP_ENABLE_BLOSC2
   configs.push_back({"blosc2", "default", std::make_unique<ctp::Blosc>(),
                      std::make_unique<std::mutex>()});
+#endif  // CTP_ENABLE_BLOSC2
 
 #ifdef CTP_ENABLE_LIBPRESSIO
   // ZFP: 3 modes (fast, balanced, best)
