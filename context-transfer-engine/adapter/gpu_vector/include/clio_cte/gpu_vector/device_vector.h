@@ -612,7 +612,23 @@ class DeviceVector {
     t->offset_ = 0;
     t->size_ = page_bytes_;
     t->blob_data_ = RawPtr(p->data);
-    t->score_ = p->score;
+    // An UNSCORED page must say "no opinion" (-1), not "score zero".
+    //
+    // The two numbers mean opposite things. Device-side, score 0 is this
+    // page's eviction rank -- the default, meaning "evict me first". To the
+    // CTE it is a placement request, and MaxBwDpe prefers targets whose
+    // target_score_ is <= the blob's; with tiers at 1.0 (top) and 0.2 (spill),
+    // a 0.0 blob matches NEITHER, so both became fallbacks and the ranking
+    // deliberately picks the slowest of those first. Every page therefore
+    // landed on the spill tier and the fast top tier went unused -- measured:
+    // reads under a throttled spill tier were fully throttled, while the same
+    // cap on the top tier changed nothing at all because nothing read from it.
+    //
+    // -1 asks the CTE for its default (1.0 for a new blob), i.e. the fastest
+    // tier that fits, which is what a page cache writing back hot data wants.
+    // An explicitly rescored page still sends its own score, so RescorePage
+    // keeps steering placement.
+    t->score_ = (p->score > 0.0f) ? p->score : -1.0f;
     t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = compress_lib_;
@@ -706,7 +722,10 @@ class DeviceVector {
       }
       char name[32];
       PageBlobName(p->page_num, name);
-      mb[nb].put->Add(name, 0, page_bytes_, RawPtr(p->data), p->score);
+      // Same placement contract as SubmitPut: an unscored page asks for the
+      // CTE's default tier rather than requesting score zero.
+      mb[nb].put->Add(name, 0, page_bytes_, RawPtr(p->data),
+                      (p->score > 0.0f) ? p->score : -1.0f);
       mb[nb].page_slot[filled] = i;
       ++filled;
       Bump(stat_puts_);

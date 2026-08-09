@@ -110,6 +110,50 @@ __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
   atomicAdd(sum, acc);
 }
 
+/**
+ * Same dot product, but the pages are faulted in CHUNKS via the batched get
+ * rather than one at a time.
+ *
+ * The batched path is now the fault path, and it reaches the compressor as a
+ * PodMultiGetBlob rather than N PodGetBlobs -- a different task, a different
+ * handler, and a different record-to-page mapping. A codec that decompressed
+ * into the wrong record's page would still return plausible page-sized data,
+ * so the check has to be an exact whole-vector calculation, not a per-page
+ * checksum.
+ */
+__global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
+                                        gv::DeviceVector<clio::run::u32> v,
+                                        clio::run::u64 per, clio::run::u32 chunk,
+                                        unsigned long long *sum) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  if (threadIdx.x != 0) return;
+  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
+  const clio::run::u64 first_page = base / v.elems_per_page_;
+  const clio::run::u64 npages = per / v.elems_per_page_;
+  unsigned long long acc = 0;
+  // HoldPage before indexing: operator[] deliberately does NO resolution (that
+  // is the whole point of the hold), so indexing straight after a batched
+  // fetch dereferences this thread's stale page cache. Costs an illegal
+  // access, not a wrong answer, which is at least loud.
+  for (clio::run::u64 p = 0; p < npages; p += chunk) {
+    clio::run::u64 n = npages - p;
+    if (n > chunk) n = chunk;
+    v.FetchPagesBatched(first_page + p, static_cast<clio::run::u32>(n));
+    for (clio::run::u64 j = 0; j < n; ++j) {
+      const clio::run::u64 off = base + (p + j) * v.elems_per_page_;
+      for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
+        const clio::run::u64 run_i = v.HoldPage(off + i, v.elems_per_page_ - i);
+        for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
+          acc += static_cast<unsigned long long>(v[off + i]) *
+                 Activation(off + i);
+        }
+      }
+    }
+  }
+  atomicAdd(sum, acc);
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
@@ -184,18 +228,26 @@ TEST_CASE("gpu_vector: model weights through the compression path",
     clio::run::u32 pages_per_block;  // device cache slots
     clio::run::u64 pages;            // pages the block walks
     unsigned nblocks;
+    clio::run::u32 chunk;            // >0: fault in batches of this many
   };
   // {raw, lz4} x {fits, does not fit}, at two scales. "fits" gives the block
   // as many slots as pages; "oversub" gives it two, so every page is evicted
   // and re-faulted and each one round-trips through the codec repeatedly.
   const std::vector<Config> configs = {
-      {"raw-fits", 0, 8u, 8u, 1u},
-      {"lz4-fits", kLz4WireId, 8u, 8u, 1u},
-      {"raw-oversub", 0, 2u, 8u, 1u},
-      {"lz4-oversub", kLz4WireId, 2u, 8u, 1u},
+      {"raw-fits", 0, 8u, 8u, 1u, 0u},
+      {"lz4-fits", kLz4WireId, 8u, 8u, 1u, 0u},
+      {"raw-oversub", 0, 2u, 8u, 1u, 0u},
+      {"lz4-oversub", kLz4WireId, 2u, 8u, 1u, 0u},
       // Larger scale, several blocks, both stored forms.
-      {"raw-scale", 0, 4u, 16u, 8u},
-      {"lz4-scale", kLz4WireId, 4u, 16u, 8u},
+      {"raw-scale", 0, 4u, 16u, 8u, 0u},
+      {"lz4-scale", kLz4WireId, 4u, 16u, 8u, 0u},
+      // Same ground truth through the BATCHED fault path, which is what the
+      // reader actually uses now. Oversubscribed so every chunk evicts and
+      // refills, and chunked at the full cache size so a batch that mismatched
+      // records to slots could not hide behind a spare slot.
+      {"raw-oversub-batch", 0, 2u, 8u, 1u, 2u},
+      {"lz4-oversub-batch", kLz4WireId, 2u, 8u, 1u, 2u},
+      {"lz4-scale-batch", kLz4WireId, 4u, 16u, 8u, 4u},
   };
 
   for (const Config &c : configs) {
@@ -213,8 +265,21 @@ TEST_CASE("gpu_vector: model weights through the compression path",
     unsigned long long *d_sum = nullptr;
     REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
-    WeightsDotKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0), per, d_sum);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    if (c.chunk > 0) {
+      WeightsDotBatchedKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0),
+                                                 per, c.chunk, d_sum);
+    } else {
+      WeightsDotKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0), per,
+                                          d_sum);
+    }
+    {
+      const cudaError_t e = cudaDeviceSynchronize();
+      if (e != cudaSuccess) {
+        std::fprintf(stderr, "[%s] CUDA ERROR after dot kernel: %s\n", c.name,
+                     cudaGetErrorString(e));
+      }
+      REQUIRE(e == cudaSuccess);
+    }
 
     unsigned long long got = 0;
     REQUIRE(cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost) ==
