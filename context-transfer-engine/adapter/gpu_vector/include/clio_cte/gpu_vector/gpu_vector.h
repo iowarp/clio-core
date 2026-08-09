@@ -149,6 +149,20 @@ class Vector {
    * assert the paging POLICY (hit/miss, writeback, victim choice), which the
    * returned data alone cannot distinguish.
    */
+  struct DevState;   // defined below; only the name is needed here
+
+  /** Copy the host image of the header to the device and point the view at it. */
+  void PublishHeader(DevState &st) {
+#if CTP_ENABLE_CUDA
+    if (st.d_hdr == nullptr &&
+        cudaMalloc(&st.d_hdr, sizeof(VecHeader)) != cudaSuccess) {
+      throw std::runtime_error("gpu_vector: header allocation failed");
+    }
+    cudaMemcpy(st.d_hdr, &st.hdr, sizeof(VecHeader), cudaMemcpyHostToDevice);
+    st.view.h_ = st.d_hdr;
+#endif
+  }
+
   void EnableStats() {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
@@ -161,14 +175,15 @@ class Vector {
       cudaMemset(mem, 0, bytes);
       auto *c = static_cast<unsigned long long *>(mem);
       kv.second.stats = c;
-      kv.second.view.stat_faults_ = c;
-      kv.second.view.stat_puts_ = c + 1;
-      kv.second.view.stat_evicts_ = c + 2;
-      kv.second.view.stat_prefetches_ = c + 3;
-      kv.second.view.stat_prefetch_hits_ = c + 4;
-      kv.second.view.stat_rescores_ = c + 5;
-      kv.second.view.stat_prefetch_late_ = c + 6;
-      kv.second.view.stat_get_errors_ = c + 7;
+      kv.second.hdr.stat_faults_ = c;
+      kv.second.hdr.stat_puts_ = c + 1;
+      kv.second.hdr.stat_evicts_ = c + 2;
+      kv.second.hdr.stat_prefetches_ = c + 3;
+      kv.second.hdr.stat_prefetch_hits_ = c + 4;
+      kv.second.hdr.stat_rescores_ = c + 5;
+      kv.second.hdr.stat_prefetch_late_ = c + 6;
+      kv.second.hdr.stat_get_errors_ = c + 7;
+      PublishHeader(kv.second);   // the device reads the header, not the view
     }
 #endif
   }
@@ -215,6 +230,9 @@ class Vector {
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
+    /** Host-side image of the shared state, and its device copy. */
+    VecHeader hdr;
+    VecHeader *d_hdr = nullptr;
     char *pages_base = nullptr;     // page bytes
     char *table_base = nullptr;     // Page[] table
     char *tasks_base = nullptr;     // task slots
@@ -428,7 +446,7 @@ class Vector {
     }
 #endif
 
-    DeviceVector<T> v;
+    VecHeader v;   // filled here, then uploaded; the view only points at it
     v.block_locks_ = static_cast<int *>(locks);
     v.task_seq_ = static_cast<unsigned long long *>(seq);
     v.tag_id_ = tag_id_;
@@ -455,7 +473,8 @@ class Vector {
     v.task_alloc_id_ = st.tasks_alloc;
     v.multi_ = reinterpret_cast<MultiBatch *>(st.multi_tbl_base);
     v.multi_per_block_ = static_cast<clio::run::u32>(multi_per_block);
-    st.view = v;
+    st.hdr = v;
+    PublishHeader(st);
     devs_[gpu_id] = st;
   }
 
@@ -510,19 +529,19 @@ class Vector {
       cudaFree(st.stats);
       st.stats = nullptr;
     }
-    if (st.view.task_seq_ != nullptr) {
-      cudaFree(st.view.task_seq_);
+    if (st.hdr.task_seq_ != nullptr) {
+      cudaFree(st.hdr.task_seq_);
     }
-    if (st.view.block_locks_ != nullptr) {
-      cudaFree(st.view.block_locks_);
+    if (st.hdr.block_locks_ != nullptr) {
+      cudaFree(st.hdr.block_locks_);
     }
 #endif
-    st.view.block_locks_ = nullptr;
-    st.view.task_seq_ = nullptr;
-    st.view.stat_faults_ = nullptr;
-    st.view.stat_puts_ = nullptr;
-    st.view.stat_evicts_ = nullptr;
-    st.view.pages_ = nullptr;
+    st.hdr.block_locks_ = nullptr;
+    st.hdr.task_seq_ = nullptr;
+    st.hdr.stat_faults_ = nullptr;
+    st.hdr.stat_puts_ = nullptr;
+    st.hdr.stat_evicts_ = nullptr;
+    st.hdr.pages_ = nullptr;
     st.pages_base = nullptr;
     st.table_base = nullptr;
     st.tasks_base = nullptr;

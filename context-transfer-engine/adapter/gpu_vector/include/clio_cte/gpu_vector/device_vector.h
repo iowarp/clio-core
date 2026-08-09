@@ -26,11 +26,23 @@ namespace clio::cte::gpu_vector {
  * Device-side view of the vector. Constructed on the host by
  * Vector::GetDevice() and copied into the kernel as a plain argument.
  */
-template <typename T>
-class DeviceVector {
- public:
-  DeviceVector() = default;
-
+/**
+ * Everything about a vector that is the SAME for every thread, kept in
+ * GLOBAL memory next to the page table rather than inside the view.
+ *
+ * The view used to carry all of this by value. That is ~200 bytes, and it
+ * only stays in constant memory while nothing writes to it -- the moment a
+ * kernel assigns ipc_, or HoldPage updates last_page_, the compiler must give
+ * every thread a private copy in LOCAL memory. Measured on the llama mat-vec
+ * kernel: 1024 bytes of stack per thread and 64 registers, which pinned the
+ * launch to one block per SM, and a single spill store (STL.64) carried 50%
+ * of all warp stall samples.
+ *
+ * Exactly one field here is ever read on the hot path (the geometry); the
+ * submit-only fields and the statistics counters are touched on a fault,
+ * which already costs a round trip. So they cost nothing behind a pointer.
+ */
+struct VecHeader {
   // ---- layout, filled in by the host ---------------------------------
   clio::cte::core::TagId tag_id_;
   /** Page table for ALL blocks: nblocks_ * pages_per_block_ entries. */
@@ -112,6 +124,16 @@ class DeviceVector {
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
 
+};
+
+template <typename T>
+class DeviceVector {
+ public:
+  DeviceVector() = default;
+
+  /** Everything shared: geometry, submit state, counters. */
+  const VecHeader *h_ = nullptr;
+
 #if CTP_IS_GPU_COMPILER
   // ---- device API -----------------------------------------------------
 
@@ -163,7 +185,7 @@ class DeviceVector {
       // through to the locked path.
       p = nullptr;
       Page *tbl = BlockPages();
-      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (tbl[i].page_num == pn && !tbl[i].fetching) {
           p = &tbl[i];
           break;
@@ -183,7 +205,7 @@ class DeviceVector {
       last_page_ = p;
     }
     const clio::run::u64 within = IndexIn(off, p);
-    const clio::run::u64 left = elems_per_page_ - within;
+    const clio::run::u64 left = h_->elems_per_page_ - within;
     return (count < left) ? count : left;
   }
 
@@ -236,7 +258,7 @@ class DeviceVector {
   /**
    * Which page an offset falls in.
    *
-   * A GPU has NO hardware 64-bit integer divide, so `off / elems_per_page_`
+   * A GPU has NO hardware 64-bit integer divide, so `off / h_->elems_per_page_`
    * compiles to a software routine of hundreds of cycles -- on EVERY element
    * access. Measured: 683 ns per element, making a scan of already-resident
    * pages cost 350 us/page against a 15 us/page page fault. Reading the cache
@@ -247,13 +269,13 @@ class DeviceVector {
    * fallback for a non-power-of-two page size.
    */
   CTP_GPU_FUN clio::run::u64 PageOf(clio::run::u64 off) const {
-    return page_shift_ ? (off >> page_shift_) : (off / elems_per_page_);
+    return h_->page_shift_ ? (off >> h_->page_shift_) : (off / h_->elems_per_page_);
   }
 
   /** Offset of an element within its page. */
   CTP_GPU_FUN clio::run::u64 IndexIn(clio::run::u64 off, const Page *p) const {
-    return page_shift_ ? (off & page_mask_)
-                       : (off - p->page_num * elems_per_page_);
+    return h_->page_shift_ ? (off & h_->page_mask_)
+                       : (off - p->page_num * h_->elems_per_page_);
   }
 
   /**
@@ -280,11 +302,11 @@ class DeviceVector {
   CTP_GPU_FUN void DropAll() {
     LockBlock();
     Page *tbl = BlockPages();
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       tbl[i].score = 0.0f;
     }
-    EvictLocked(pages_per_block_);
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    EvictLocked(h_->pages_per_block_);
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       tbl[i].last_access = 0;
     }
     UnlockBlock();
@@ -295,14 +317,14 @@ class DeviceVector {
   CTP_GPU_FUN void EvictLocked(clio::run::u32 num_pages) {
     Page *tbl = BlockPages();
     for (clio::run::u32 k = 0; k < num_pages; ++k) {
-      clio::run::u32 victim = pages_per_block_;
-      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      clio::run::u32 victim = h_->pages_per_block_;
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (tbl[i].page_num == kNoPage) continue;
         // A page with a transfer in flight is not a candidate: its slot is
         // already promised to that transfer, and evicting it would let the
         // copy land in a slot that now belongs to a different page.
         if (tbl[i].fetching) continue;
-        if (victim == pages_per_block_) {
+        if (victim == h_->pages_per_block_) {
           victim = i;
           continue;
         }
@@ -312,7 +334,7 @@ class DeviceVector {
           victim = i;
         }
       }
-      if (victim == pages_per_block_) return;   // nothing resident
+      if (victim == h_->pages_per_block_) return;   // nothing resident
       Page *p = &tbl[victim];
       if (p->dirty || p->flushing) {
         SubmitPut(p);
@@ -321,7 +343,7 @@ class DeviceVector {
       p->page_num = kNoPage;
       p->dirty = 0u;
       p->flushing = 0u;
-      Bump(stat_evicts_);
+      Bump(h_->stat_evicts_);
     }
   }
 
@@ -443,7 +465,7 @@ class DeviceVector {
     if (p != nullptr) {
       p->score = score;
     }
-    Page *slot = (p != nullptr) ? p : &BlockPages()[page_id % pages_per_block_];
+    Page *slot = (p != nullptr) ? p : &BlockPages()[page_id % h_->pages_per_block_];
     if (slot->rescore == nullptr) return;
     // A rescore is fire-and-forget, so the previous one on this slot may still
     // be executing. Reusing the task in place would mutate a task the runtime
@@ -458,10 +480,10 @@ class DeviceVector {
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = NextTaskId(kKindRescore);
-    t->pool_id_ = pool_id_;
+    t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodReorganizeBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-    t->tag_id_ = tag_id_;
+    t->tag_id_ = h_->tag_id_;
     char name[32];
     PageBlobName(page_id, name);
     t->blob_name_ = name;
@@ -470,17 +492,15 @@ class DeviceVector {
     // Fire and forget: a hint that arrives late is still useful, and
     // waiting here would serialise the kernel behind placement.
     ClearRunCtx(t);
-    Bump(stat_rescores_);
-    slot->rescore_fut = ipc_->Send(SlotPtr(slot->rescore));
+    Bump(h_->stat_rescores_);
+    slot->rescore_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(slot->rescore));
     slot->rescoring = 1u;
   }
 
  public:
   /** Number of elements in the vector. */
-  CTP_GPU_FUN clio::run::u64 size() const { return size_; }
+  CTP_GPU_FUN clio::run::u64 size() const { return h_->size_; }
 
-  /** Set by the kernel prologue (see CLIO_GPU_INIT). */
-  clio::run::gpu::IpcManager *ipc_ = nullptr;
 
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
@@ -497,8 +517,8 @@ class DeviceVector {
    * page are held until it is resident, then find it with no fault of their own.
    */
   CTP_GPU_FUN void LockBlock() {
-    if (block_locks_ == nullptr) return;
-    int *lk = block_locks_ + (blockIdx.x % nblocks_);
+    if (h_->block_locks_ == nullptr) return;
+    int *lk = h_->block_locks_ + (blockIdx.x % h_->nblocks_);
     while (atomicCAS(lk, 0, 1) != 0) {
       __nanosleep(32);
     }
@@ -506,10 +526,10 @@ class DeviceVector {
   }
 
   CTP_GPU_FUN void UnlockBlock() {
-    if (block_locks_ == nullptr) return;
+    if (h_->block_locks_ == nullptr) return;
     // Publish every page-table write before the lock is observed free.
     __threadfence();
-    atomicExch(block_locks_ + (blockIdx.x % nblocks_), 0);
+    atomicExch(h_->block_locks_ + (blockIdx.x % h_->nblocks_), 0);
   }
 
   /** Increment an instrumentation counter if the test enabled it. */
@@ -523,31 +543,31 @@ class DeviceVector {
 
   /** This block's batch slots -- same partitioning as the page table. */
   CTP_GPU_FUN MultiBatch *BlockBatches() const {
-    const clio::run::u32 b = blockIdx.x % nblocks_;
-    return multi_ + static_cast<clio::run::u64>(b) * multi_per_block_;
+    const clio::run::u32 b = blockIdx.x % h_->nblocks_;
+    return h_->multi_ + static_cast<clio::run::u64>(b) * h_->multi_per_block_;
   }
 
   /** This block's slice of the page table. */
   CTP_GPU_FUN Page *BlockPages() const {
-    const clio::run::u32 b = blockIdx.x % nblocks_;
-    return pages_ + static_cast<clio::run::u64>(b) * pages_per_block_;
+    const clio::run::u32 b = blockIdx.x % h_->nblocks_;
+    return h_->pages_ + static_cast<clio::run::u64>(b) * h_->pages_per_block_;
   }
 
   /** A globally unique id for the next task this vector submits. */
   CTP_GPU_FUN clio::run::TaskId NextTaskId(clio::run::u32 kind) const {
     unsigned long long n =
-        (task_seq_ != nullptr) ? atomicAdd(task_seq_, 1ull) : 0ull;
+        (h_->task_seq_ != nullptr) ? atomicAdd(h_->task_seq_, 1ull) : 0ull;
     return DeviceTaskId(n, kind, static_cast<clio::run::u32>(n));
   }
 
   /** Index of `p` in the whole page table -- the basis of its task ids. */
   CTP_GPU_FUN clio::run::u64 SlotOf(const Page *p) const {
-    return static_cast<clio::run::u64>(p - pages_);
+    return static_cast<clio::run::u64>(p - h_->pages_);
   }
 
   CTP_GPU_FUN Page *Find(clio::run::u64 page_num) const {
     Page *tbl = BlockPages();
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       if (tbl[i].page_num == page_num) return &tbl[i];
     }
     return nullptr;
@@ -556,7 +576,7 @@ class DeviceVector {
   template <typename TaskT>
   CTP_GPU_FUN ctp::ipc::FullPtr<TaskT> SlotPtr(TaskT *task) const {
     ctp::ipc::FullPtr<TaskT> fp;
-    fp.shm_.alloc_id_ = task_alloc_id_;
+    fp.shm_.alloc_id_ = h_->task_alloc_id_;
     fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
     fp.ptr_ = task;
     return fp;
@@ -602,15 +622,15 @@ class DeviceVector {
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = NextTaskId(kKindPut);
-    t->pool_id_ = pool_id_;
+    t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodPutBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-    t->tag_id_ = tag_id_;
+    t->tag_id_ = h_->tag_id_;
     char name[32];
     PageBlobName(p->page_num, name);
     t->blob_name_ = name;
     t->offset_ = 0;
-    t->size_ = page_bytes_;
+    t->size_ = h_->page_bytes_;
     t->blob_data_ = RawPtr(p->data);
     // An UNSCORED page must say "no opinion" (-1), not "score zero".
     //
@@ -631,11 +651,11 @@ class DeviceVector {
     t->score_ = (p->score > 0.0f) ? p->score : -1.0f;
     t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
-    t->context_.compress_lib_ = compress_lib_;
-    t->context_.compress_preset_ = compress_preset_;
+    t->context_.compress_lib_ = h_->compress_lib_;
+    t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
-    Bump(stat_puts_);
-    p->put_fut = ipc_->Send(SlotPtr(p->put));
+    Bump(h_->stat_puts_);
+    p->put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->put));
     // Clean as of THIS put: the bytes it carries are what the page held
     // when it was submitted. A later write dirties it again for the next.
     p->dirty = 0u;
@@ -648,16 +668,16 @@ class DeviceVector {
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = NextTaskId(kKindPut);
-    t->pool_id_ = pool_id_;
+    t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodMultiPutBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-    t->tag_id_ = tag_id_;
+    t->tag_id_ = h_->tag_id_;
     t->count_ = 0;
     t->flags_ = 0;
     t->num_ok_ = 0;
     t->context_ = clio::cte::core::Context();
-    t->context_.compress_lib_ = compress_lib_;
-    t->context_.compress_preset_ = compress_preset_;
+    t->context_.compress_lib_ = h_->compress_lib_;
+    t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
   }
 
@@ -667,10 +687,10 @@ class DeviceVector {
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = NextTaskId(kKindGet);
-    t->pool_id_ = pool_id_;
+    t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-    t->tag_id_ = tag_id_;
+    t->tag_id_ = h_->tag_id_;
     t->count_ = 0;
     t->flags_ = 0;
     t->num_ok_ = 0;
@@ -678,8 +698,8 @@ class DeviceVector {
     // STORED compressed, so a get with an empty context asks for the stored
     // bytes rather than the data.
     t->context_ = clio::cte::core::Context();
-    t->context_.compress_lib_ = compress_lib_;
-    t->context_.compress_preset_ = compress_preset_;
+    t->context_.compress_lib_ = h_->compress_lib_;
+    t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
   }
 
@@ -688,9 +708,9 @@ class DeviceVector {
     Page *tbl = BlockPages();
     // Not provisioned (host did not allocate batch slots): do it scalar-wise
     // rather than silently skipping the flush.
-    if (multi_ == nullptr || multi_per_block_ == 0) {
+    if (h_->multi_ == nullptr || h_->multi_per_block_ == 0) {
       clio::run::u32 done = 0;
-      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (!tbl[i].dirty && !tbl[i].flushing) continue;
         SubmitPut(&tbl[i]);
         AwaitPut(&tbl[i]);
@@ -700,7 +720,7 @@ class DeviceVector {
     }
     // A scalar put still in flight owns that page's bytes; batching it now
     // would put the same page on the wire twice.
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       if (tbl[i].flushing) AwaitPut(&tbl[i]);
     }
 
@@ -708,31 +728,31 @@ class DeviceVector {
     clio::run::u32 nb = 0;              // batches with records in them
     clio::run::u32 filled = 0;          // records in batch nb
     PrepareMultiPut(mb[0].put);
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
       if (p->page_num == kNoPage || !p->dirty) continue;
       if (filled == clio::cte::core::kPodMultiMax) {
-        // Full: submit and move on. multi_per_block_ is sized so this can
+        // Full: submit and move on. h_->multi_per_block_ is sized so this can
         // only run out if the host provisioned fewer batches than pages.
-        mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
+        mb[nb].put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(mb[nb].put));
         ++nb;
         filled = 0;
-        if (nb == multi_per_block_) break;
+        if (nb == h_->multi_per_block_) break;
         PrepareMultiPut(mb[nb].put);
       }
       char name[32];
       PageBlobName(p->page_num, name);
       // Same placement contract as SubmitPut: an unscored page asks for the
       // CTE's default tier rather than requesting score zero.
-      mb[nb].put->Add(name, 0, page_bytes_, RawPtr(p->data),
+      mb[nb].put->Add(name, 0, h_->page_bytes_, RawPtr(p->data),
                       (p->score > 0.0f) ? p->score : -1.0f);
       mb[nb].page_slot[filled] = i;
       ++filled;
-      Bump(stat_puts_);
+      Bump(h_->stat_puts_);
     }
     clio::run::u32 nsub = nb;
     if (filled > 0) {
-      mb[nb].put_fut = ipc_->Send(SlotPtr(mb[nb].put));
+      mb[nb].put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(mb[nb].put));
       nsub = nb + 1;
     }
 
@@ -757,7 +777,7 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u32 FetchPagesBatchedLocked(clio::run::u64 first_page,
                                                      clio::run::u32 n) {
     Page *tbl = BlockPages();
-    if (multi_ == nullptr || multi_per_block_ == 0) {
+    if (h_->multi_ == nullptr || h_->multi_per_block_ == 0) {
       // Not provisioned: fault them one at a time rather than silently
       // returning nothing.
       clio::run::u32 got = 0;
@@ -769,7 +789,7 @@ class DeviceVector {
     if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
     // A batch cannot exceed the cache: claiming more slots than exist would
     // evict a page this same batch already claimed.
-    if (n > pages_per_block_) n = pages_per_block_;
+    if (n > h_->pages_per_block_) n = h_->pages_per_block_;
 
     MultiBatch *mb = BlockBatches();
     PrepareMultiGet(mb[0].get);
@@ -785,16 +805,16 @@ class DeviceVector {
         ++resident;
         continue;
       }
-      clio::run::u32 slot = pages_per_block_;
-      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      clio::run::u32 slot = h_->pages_per_block_;
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (tbl[i].page_num == kNoPage) { slot = i; break; }
       }
-      if (slot == pages_per_block_) {
+      if (slot == h_->pages_per_block_) {
         EvictLocked(1);
-        for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
           if (tbl[i].page_num == kNoPage) { slot = i; break; }
         }
-        if (slot == pages_per_block_) break;  // everything is pinned
+        if (slot == h_->pages_per_block_) break;  // everything is pinned
       }
       Page *np = &tbl[slot];
       // fetching FIRST, then the page number -- same ordering the scalar claim
@@ -808,15 +828,15 @@ class DeviceVector {
       np->score = 0.0f;
       char name[32];
       PageBlobName(pg, name);
-      mb[0].get->Add(name, 0, page_bytes_, RawPtr(np->data));
+      mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
       mb[0].page_slot[filled] = slot;
       ++filled;
-      Bump(stat_faults_);
-      Bump(stat_prefetches_);
+      Bump(h_->stat_faults_);
+      Bump(h_->stat_prefetches_);
     }
     if (filled == 0) return resident;
 
-    mb[0].get_fut = ipc_->Send(SlotPtr(mb[0].get));
+    mb[0].get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(mb[0].get));
     mb[0].get_fut.Wait();
     auto *t = mb[0].get;
     clio::run::u32 ok = 0;
@@ -830,7 +850,7 @@ class DeviceVector {
         // it rather than letting the caller read those bytes as this page --
         // serving stale data silently is the one outcome worse than a miss.
         p->page_num = kNoPage;
-        Bump(stat_get_errors_);
+        Bump(h_->stat_get_errors_);
       }
     }
     return resident + ok;
@@ -849,16 +869,16 @@ class DeviceVector {
   CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num) {
     if (Find(page_num) != nullptr) return true;   // resident or already coming
     Page *tbl = BlockPages();
-    clio::run::u32 free_slot = pages_per_block_;
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    clio::run::u32 free_slot = h_->pages_per_block_;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       if (tbl[i].page_num == kNoPage) {
         free_slot = i;
         break;
       }
     }
-    if (free_slot == pages_per_block_) {
+    if (free_slot == h_->pages_per_block_) {
       EvictLocked(1);
-      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (tbl[i].page_num == kNoPage) {
           free_slot = i;
           break;
@@ -866,7 +886,7 @@ class DeviceVector {
       }
       // Everything resident is mid-transfer: report failure rather than
       // stalling, so the caller simply falls back to a demand fault later.
-      if (free_slot == pages_per_block_) return false;
+      if (free_slot == h_->pages_per_block_) return false;
     }
     Page *p = &tbl[free_slot];
     // Same ordering as the synchronous claim: busy first, then the page
@@ -885,12 +905,12 @@ class DeviceVector {
   /** Issue this page's get and return immediately. */
   CTP_GPU_FUN void SubmitGetAsync(Page *p, clio::run::u64 page_num) {
     PrepareGet(p, page_num);
-    Bump(stat_faults_);
-    Bump(stat_prefetches_);
+    Bump(h_->stat_faults_);
+    Bump(h_->stat_prefetches_);
     p->fetching = 1u;                     // already set by the claim; keep it
-    p->get_fut = ipc_->Send(SlotPtr(p->get));
+    p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
     if (p->get_fut.IsNull()) {
-      Bump(stat_get_errors_);
+      Bump(h_->stat_get_errors_);
     }
   }
 
@@ -898,7 +918,7 @@ class DeviceVector {
   CTP_GPU_FUN void AwaitFetch(Page *p) {
     if (!p->fetching) return;
     p->get_fut.Wait();
-    if (p->get->GetReturnCode() != 0) Bump(stat_get_errors_);
+    if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
     p->fetching = 0u;
   }
 
@@ -908,15 +928,15 @@ class DeviceVector {
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = NextTaskId(kKindGet);
-    t->pool_id_ = pool_id_;
+    t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodGetBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-    t->tag_id_ = tag_id_;
+    t->tag_id_ = h_->tag_id_;
     char name[32];
     PageBlobName(page_num, name);
     t->blob_name_ = name;
     t->offset_ = 0;
-    t->size_ = page_bytes_;
+    t->size_ = h_->page_bytes_;
     t->blob_data_ = RawPtr(p->data);
     t->flags_ = 0;
     // The GET must declare the same codec the PUT did. A page written through
@@ -929,15 +949,15 @@ class DeviceVector {
     // returned compressed bytes -- and only for pages the codec had actually
     // shrunk, so incompressible data still looked correct.
     t->context_ = clio::cte::core::Context();
-    t->context_.compress_lib_ = compress_lib_;
-    t->context_.compress_preset_ = compress_preset_;
+    t->context_.compress_lib_ = h_->compress_lib_;
+    t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
   }
 
   /** Fault `page_num` into `p` with a SYNCHRONOUS get. */
   CTP_GPU_FUN void SubmitGet(Page *p, clio::run::u64 page_num) {
     PrepareGet(p, page_num);
-    Bump(stat_faults_);
+    Bump(h_->stat_faults_);
     // Store the future in the PAGE, not a local. The claim path publishes
     // fetching=1 before this runs, so another thread can reach AwaitFetch for
     // this page -- and AwaitFetch waits on p->get_fut. With a local future
@@ -945,18 +965,18 @@ class DeviceVector {
     // the caller read a page whose bytes had not arrived. That is why the
     // demand-faulting read path returned a wrong checksum while the
     // prefetching path (which does set p->get_fut) returned the right one.
-    p->get_fut = ipc_->Send(SlotPtr(p->get));
+    p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
     // An empty future means the submission was DISCARDED (queue missing or a
     // refused send). Waiting on it returns immediately and the stale return
     // code reads 0, so without this check the slot's previous page is served
     // as this one -- silently. That exact failure shipped once already.
     if (p->get_fut.IsNull()) {
-      Bump(stat_get_errors_);
+      Bump(h_->stat_get_errors_);
     }
     p->get_fut.Wait();                    // demand faults block by definition
     // CHECK IT. A failed get leaves this slot holding the page it held before,
     // and the caller reads that as if it were the page it asked for.
-    if (p->get->GetReturnCode() != 0) Bump(stat_get_errors_);
+    if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
     p->fetching = 0u;
   }
 
@@ -999,9 +1019,9 @@ class DeviceVector {
         // finished long ago -- it measured nothing and read as 100% hits at
         // every prefetch depth.
         if (p->get->fut_.is_complete_.load() != 0) {
-          Bump(stat_prefetch_hits_);
+          Bump(h_->stat_prefetch_hits_);
         } else {
-          Bump(stat_prefetch_late_);
+          Bump(h_->stat_prefetch_late_);
         }
         AwaitFetch(p);
       }
@@ -1009,14 +1029,14 @@ class DeviceVector {
     if (p == nullptr) {
       Page *tbl = BlockPages();
       for (;;) {
-        clio::run::u32 free_slot = pages_per_block_;
-        for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        clio::run::u32 free_slot = h_->pages_per_block_;
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
           if (tbl[i].page_num == kNoPage) {
             free_slot = i;
             break;
           }
         }
-        if (free_slot != pages_per_block_) {
+        if (free_slot != h_->pages_per_block_) {
           p = &tbl[free_slot];
           // Order matters: mark the slot busy and publish that BEFORE the
           // page number, so HoldPage's lock-free scan cannot see a page that
@@ -1042,10 +1062,10 @@ class DeviceVector {
   CTP_GPU_FUN void ForEachResident(clio::run::u64 off, clio::run::u64 count,
                                    Fn fn) {
     if (count == 0) return;
-    const clio::run::u64 first = off / elems_per_page_;
-    const clio::run::u64 last = (off + count - 1) / elems_per_page_;
+    const clio::run::u64 first = off / h_->elems_per_page_;
+    const clio::run::u64 last = (off + count - 1) / h_->elems_per_page_;
     Page *tbl = BlockPages();
-    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       if (tbl[i].page_num == kNoPage) continue;
       if (tbl[i].page_num < first || tbl[i].page_num > last) continue;
       fn(&tbl[i]);
