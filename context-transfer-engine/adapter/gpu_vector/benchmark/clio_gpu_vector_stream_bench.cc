@@ -436,6 +436,18 @@ int main(int argc, char **argv) {
     return 1;
   }
   const double write_ms = NowMs() - w0;
+  {
+    // Counters at the PHASE BOUNDARY. Totals alone cannot say whether a
+    // get_error happened while writing (a first touch of a page that does not
+    // exist yet -- benign) or while reading (a failed fault, which is not).
+    const auto st = vec.ReadStats(0);
+    std::fprintf(stderr,
+                 "GVSTAT-WRITE faults=%llu puts=%llu evicts=%llu "
+                 "get_errors=%llu\n",
+                 (unsigned long long) st.faults, (unsigned long long) st.puts,
+                 (unsigned long long) st.evicts,
+                 (unsigned long long) st.get_errors);
+  }
 
   // ---- what it actually cost to store --------------------------------------
   // Summing the stored blob sizes is the only honest compression ratio: it is
