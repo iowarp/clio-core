@@ -1411,6 +1411,16 @@ void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch)
   }
   const size_t hdr = sizeof(CompressionHeader);
   std::vector<size_t> slots(batch.size(), SIZE_MAX);
+  std::vector<size_t> payloads(batch.size(), 0);
+
+  // PASS 1: enqueue every host->device copy. No codec call yet.
+  //
+  // nvcomp inspects the bitstream to build its manager, and that read is NOT
+  // ordered behind an async copy on our stream -- calling Decompress straight
+  // after cuMemcpyHtoDAsync had it parsing bytes that had not landed, which
+  // failed 12 of every 16 items while the 3 or 4 that happened to win the race
+  // succeeded. The copies are issued together and waited for together, so the
+  // batch still enters the context once.
   for (size_t i = 0; i < batch.size(); ++i) {
     auto &p = batch[i];
     if (p->abandoned.load(std::memory_order_acquire)) continue;
@@ -1419,42 +1429,66 @@ void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch)
     if (p->stored_size <= hdr || !header->IsValid() ||
         !IsGpuCodec(header->compress_lib_) ||
         p->stored_size > codec_buf_bytes_ || p->dst_bytes > codec_buf_bytes_) {
-      continue;
+      continue;  // not ours; the waiter takes the host path
     }
     slots[i] = AcquireCodecSlot();
     if (slots[i] == SIZE_MAX) continue;
+    payloads[i] = (header->compressed_size_ != 0)
+                      ? static_cast<size_t>(header->compressed_size_)
+                      : (p->stored_size - hdr);
+    if (cuMemcpyHtoDAsync(
+            reinterpret_cast<CUdeviceptr>(codec_slots_[slots[i]].buf),
+            p->stored_bytes.data() + hdr, payloads[i],
+            static_cast<CUstream>(codec_slots_[slots[i]].stream)) !=
+        CUDA_SUCCESS) {
+      ReleaseCodecSlot(slots[i]);
+      slots[i] = SIZE_MAX;
+    }
+  }
+
+  // Wait for all of them at once.
+  for (size_t i = 0; i < batch.size(); ++i) {
+    if (slots[i] != SIZE_MAX) {
+      cuStreamSynchronize(static_cast<CUstream>(codec_slots_[slots[i]].stream));
+    }
+  }
+
+  // PASS 2: decompress, then copy each result into its caller's page.
+  for (size_t i = 0; i < batch.size(); ++i) {
+    if (slots[i] == SIZE_MAX) continue;
+    auto &p = batch[i];
+    const auto *header =
+        reinterpret_cast<const CompressionHeader *>(p->stored_bytes.data());
     void *sbuf = codec_slots_[slots[i]].buf;
     void *obuf = codec_slots_[slots[i]].obuf;
     CUstream st = static_cast<CUstream>(codec_slots_[slots[i]].stream);
-    const size_t payload = (header->compressed_size_ != 0)
-                               ? static_cast<size_t>(header->compressed_size_)
-                               : (p->stored_size - hdr);
-    if (cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(sbuf),
-                          p->stored_bytes.data() + hdr, payload,
-                          st) != CUDA_SUCCESS) {
-      continue;
-    }
     ctp::CompressionFactory::SetGpuStreamForThread(st);
     auto codec = ctp::CompressionFactory::GetPreset(
         ctp::CompressionFactory::NameForWireId(header->compress_lib_),
         ctp::CompressionPreset::BALANCED);
     size_t out = codec_buf_bytes_;
-    // Decompress into PLAIN ctx2 memory, then COPY into the caller's managed
-    // page: letting the codec write that page from this thread hangs inside
-    // Decompress (see PendingDecomp), while a copy is copy-engine work.
-    const bool dok = codec && codec->Decompress(obuf, out, sbuf, payload);
+    // Into PLAIN ctx2 memory, never the caller's managed page: writing that
+    // page from this thread hangs inside Decompress (see PendingDecomp).
+    const bool dok = codec && codec->Decompress(obuf, out, sbuf, payloads[i]);
     ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+    if (!dok && getenv("CLIO_CODEC_TRACE")) {
+      fprintf(stderr, "[DRAIN] decompress FAILED payload=%zu\n", payloads[i]);
+      fflush(stderr);
+    }
     if (dok) {
       const size_t n = std::min(out, p->dst_bytes);
       p->ok = cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(p->dst),
-                                reinterpret_cast<CUdeviceptr>(obuf), n,
-                                st) == CUDA_SUCCESS &&
+                                reinterpret_cast<CUdeviceptr>(obuf), n, st) ==
+                  CUDA_SUCCESS &&
               cuStreamSynchronize(st) == CUDA_SUCCESS;
     }
+    ReleaseCodecSlot(slots[i]);
+    slots[i] = SIZE_MAX;
   }
   for (size_t i = 0; i < batch.size(); ++i) {
     if (slots[i] != SIZE_MAX) ReleaseCodecSlot(slots[i]);
   }
+  // Publish LAST: a waiter may be freed the instant it observes done.
   for (auto &p : batch) p->done.store(true, std::memory_order_release);
 }
 
@@ -1489,11 +1523,17 @@ void Runtime::BatchDrainLoop() {
       mine.swap(batch_);
     }
     if (mine.empty()) continue;
-    if (getenv("CLIO_CODEC_TRACE")) {
-      fprintf(stderr, "[DRAIN] batch of %zu\n", mine.size());
+    const bool trace = getenv("CLIO_CODEC_TRACE") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    RunDecompBatch(mine);
+    if (trace) {
+      size_t nok = 0;
+      for (auto &p : mine) nok += p->ok ? 1 : 0;
+      fprintf(stderr, "[DRAIN] batch=%zu ok=%zu in %.1f ms\n", mine.size(), nok,
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count());
       fflush(stderr);
     }
-    RunDecompBatch(mine);
   }
 }
 
@@ -2113,6 +2153,10 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         }
         if (!req->done.load(std::memory_order_acquire)) {
           req->abandoned.store(true, std::memory_order_release);
+          if (getenv("CLIO_CODEC_TRACE")) {
+            fprintf(stderr, "[DRAIN] waiter TIMEOUT\n");
+            fflush(stderr);
+          }
         } else if (req->ok) {
           CLIO_IPC->FreeBuffer(buf);
           task->return_code_ = 0;
