@@ -1449,14 +1449,26 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
   CUstream sstream = static_cast<CUstream>(codec_slots_[slot].stream);
   size_t out = dst_bytes;
   bool ok = false;
+  const auto t_beg = std::chrono::steady_clock::now();
+  auto t_mid = t_beg;
+  auto t_end = t_beg;
   {
     CodecCtxGuard guard(codec_ctx_);
     if (guard.ok()) {
       // Only the COMPRESSED bytes are staged; the page itself never moves.
+      // ONE synchronize, not two. Every operation in this context waits for a
+      // driver time slice (measured: a 44 KB H2D took 2.1 ms), so syncing
+      // between the copy and the codec paid that wait twice per fault. The
+      // copy is enqueued on the SAME stream the codec will use, so ordering is
+      // guaranteed without a host-side wait in between.
       if (cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(sbuf),
                             stored_host + hdr, payload,
-                            sstream) == CUDA_SUCCESS &&
-          cuStreamSynchronize(sstream) == CUDA_SUCCESS) {
+                            sstream) == CUDA_SUCCESS) {
+        t_mid = std::chrono::steady_clock::now();
+        // Bind the codec to THIS slot's stream; otherwise every concurrent
+        // operation runs on the one stream the factory holds and they
+        // serialize, which is what the per-slot buffers exist to prevent.
+        ctp::CompressionFactory::SetGpuStreamForThread(sstream);
         auto codec = ctp::CompressionFactory::GetPreset(
             ctp::CompressionFactory::NameForWireId(header->compress_lib_),
             ctp::CompressionPreset::BALANCED);
@@ -1465,10 +1477,28 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
         // this context can write it. nvcomp writes into the caller's output
         // when it is device memory big enough -- no intermediate, no copy back.
         ok = codec && codec->Decompress(dst_device, out, sbuf, payload);
+        ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+        t_end = std::chrono::steady_clock::now();
       }
     }
   }
   ReleaseCodecSlot(slot);
+  if (getenv("CLIO_CODEC_TIME")) {
+    // Split the operation: how much is the H2D of the compressed bytes, how
+    // much is the codec itself (which is where a context switch would land).
+    static std::atomic<long long> n{0}, tot_us{0}, cop_us{0};
+    const long long a_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        t_mid - t_beg).count();
+    const long long b_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        t_end - t_mid).count();
+    tot_us += a_us; cop_us += b_us;
+    const long long c = ++n;
+    if (c % 64 == 0) {
+      fprintf(stderr, "[TIME] decomp n=%lld avg_h2d=%lldus avg_codec=%lldus\n",
+              c, tot_us.load() / c, cop_us.load() / c);
+      fflush(stderr);
+    }
+  }
   return ok;
 }
 
@@ -1493,6 +1523,7 @@ bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
   {
     CodecCtxGuard guard(codec_ctx_);
     if (guard.ok()) {
+      ctp::CompressionFactory::SetGpuStreamForThread(sstream);
       auto codec = ctp::CompressionFactory::GetPreset(
           ctp::CompressionFactory::NameForWireId(wire_id),
           ctp::CompressionPreset::BALANCED);
@@ -1506,6 +1537,7 @@ bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
           cuStreamSynchronize(sstream) == CUDA_SUCCESS) {
         ok = true;
       }
+      ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
     }
   }
   ReleaseCodecSlot(slot);

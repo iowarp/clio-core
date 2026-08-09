@@ -244,14 +244,35 @@ class CompressionFactory {
    */
   static void SetGpuStream(void *stream) { GpuStreamSlot() = stream; }
 
-  /** @return the stream set by SetGpuStream, or null for the default one. */
-  static void *GetGpuStream() { return GpuStreamSlot(); }
+  /**
+   * Override the stream for GPU codecs built on THIS thread only.
+   *
+   * A caller running several codec operations concurrently needs each one on
+   * its own stream, or they serialize against each other and its per-operation
+   * buffers buy nothing. The override is thread-local because a codec is
+   * constructed and used within one operation on one thread; pass null to go
+   * back to the process-wide stream.
+   */
+  static void SetGpuStreamForThread(void *stream) { GpuStreamTls() = stream; }
+
+  /** @return the thread's stream override if set, else the process-wide one,
+   *  else null (meaning the default stream). */
+  static void *GetGpuStream() {
+    void *tls = GpuStreamTls();
+    return tls != nullptr ? tls : GpuStreamSlot();
+  }
 
  private:
   /** Storage for the process-wide GPU codec stream. Function-local static so
    *  the header stays free of a definition. */
   static void *&GpuStreamSlot() {
     static void *stream = nullptr;
+    return stream;
+  }
+
+  /** Per-thread stream override; see SetGpuStreamForThread. */
+  static void *&GpuStreamTls() {
+    static thread_local void *stream = nullptr;
     return stream;
   }
 
