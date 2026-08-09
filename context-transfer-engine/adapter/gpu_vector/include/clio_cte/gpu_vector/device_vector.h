@@ -546,6 +546,25 @@ class DeviceVector {
    */
   clio::run::u32 last_slot_ = 0;
 
+ public:
+  /** BlockPages() uses this instead of blockIdx.x when set. */
+  static constexpr clio::run::u32 kNoBlockOverride = ~0u;
+  /**
+   * Which page-table partition this thread addresses; kNoBlockOverride means
+   * blockIdx.x, the default and the only behaviour before launch fusion.
+   *
+   * Fusion by grid partition gives a fused member blocks whose GLOBAL index
+   * differs from the index its own scalar launch (and the warm-up, which
+   * launches per weight) would have had -- so its resolves looked in tables
+   * that never held its pages. Setting this to the member-local block index
+   * restores the exact table its scalar launch would use. Two members' blocks
+   * may then address one table concurrently; resident lookups are lock-free
+   * reads and the fault path takes the table's lock, so both remain safe.
+   */
+  clio::run::u32 block_override_ = kNoBlockOverride;
+
+ private:
+
   /**
    * Take this block's page-table lock.
    *
@@ -589,7 +608,9 @@ class DeviceVector {
 
   /** This block's slice of the page table. */
   CTP_GPU_FUN Page *BlockPages() const {
-    const clio::run::u32 b = blockIdx.x % h_->nblocks_;
+    const clio::run::u32 raw =
+        block_override_ != kNoBlockOverride ? block_override_ : blockIdx.x;
+    const clio::run::u32 b = raw % h_->nblocks_;
     return h_->pages_ + static_cast<clio::run::u64>(b) * h_->pages_per_block_;
   }
 
