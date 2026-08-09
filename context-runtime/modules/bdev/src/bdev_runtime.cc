@@ -399,12 +399,13 @@ clio::run::TaskResume Runtime::ThrottleFor(clio::run::u64 bytes) {
   } while (!throttle_next_free_us_.compare_exchange_weak(
       prev, start + want_us, std::memory_order_relaxed));
   const double deadline = start + want_us;
-  // Yield in bounded slices so the wait stays responsive and one slow transfer
-  // cannot monopolize a fiber's scheduling slot.
+  // Wait to the reserved deadline. Yields rather than sleeps: this runs on a
+  // worker fiber, and blocking the thread would stall every other task on it,
+  // turning a per-device cap into a global one.
   for (;;) {
     const double left = deadline - ThrottleNowUs();
     if (left <= 0.0) break;
-    CLIO_CO_AWAIT(clio::run::yield((left > 500.0) ? 500.0 : left));
+    CLIO_CO_AWAIT(clio::run::yield(left));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
