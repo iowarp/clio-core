@@ -35,6 +35,23 @@ using PutSlot = clio::cte::core::PodPutBlobTask;
 using GetSlot = clio::cte::core::PodGetBlobTask;
 using RescoreSlot = clio::cte::core::PodReorganizeBlobTask;
 
+using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
+
+/**
+ * One batched-writeback slot: the task, its future, and the page-table index
+ * each record came from.
+ *
+ * The record->slot mapping has to be recorded at fill time because the batch
+ * only carries blob NAMES; without it the completion pass cannot tell which
+ * page a per-record return code belongs to, and a partial failure would have
+ * to be treated as total.
+ */
+struct MultiPutBatch {
+  MultiPutSlot *task;
+  clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> fut;
+  clio::run::u32 page_slot[clio::cte::core::kPodMultiMax];
+};
+
 /** One resident page. */
 struct Page {
   /** Which page of the vector this slot holds; kNoPage when free. */

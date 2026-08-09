@@ -84,6 +84,20 @@ class DeviceVector {
    * find the page resident, which is the behaviour the "a warp sees one page"
    * contract always implied but never enforced.
    */
+  /**
+   * Batched writeback state, one MultiPutBatch array per block.
+   *
+   * A page flush costs one task SUBMISSION per page, and on the device path
+   * that submission is the expense -- a context entry is a fixed cost whatever
+   * rides on it. `multi_per_block_` is sized so a block's ENTIRE page cache
+   * fits in that many batches (ceil(pages_per_block_ / kPodMultiMax)), which
+   * is the case worth optimizing: 256 pages flush in 4 submissions, not 256.
+   *
+   * Null / zero when the host did not provision them, in which case
+   * FlushBlockBatched falls back to the scalar path.
+   */
+  MultiPutBatch *multi_ = nullptr;
+  clio::run::u32 multi_per_block_ = 0;
   int *block_locks_ = nullptr;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
@@ -326,6 +340,30 @@ class DeviceVector {
   }
 
   /**
+   * Write back every dirty page in THIS block using batched puts.
+   *
+   * Synchronous by construction: all batches are submitted, then all are
+   * waited on, with the block lock held the whole time. That is what makes it
+   * safe to add without a new state machine -- no other thread can observe a
+   * page mid-batch, so pages need no per-page `flushing` bookkeeping and the
+   * existing scalar invariants are untouched. The overlap that matters is
+   * already there: the batches are all in flight at once.
+   *
+   * A page is marked clean only if ITS OWN record succeeded. The scalar path
+   * clears `dirty` at submission time; here the per-record return code is
+   * available, so a failed page stays dirty and will be retried rather than
+   * being silently dropped.
+   *
+   * @return the number of pages successfully written back.
+   */
+  CTP_GPU_FUN clio::run::u32 FlushBlockBatched() {
+    LockBlock();
+    const clio::run::u32 n = FlushBlockBatchedLocked();
+    UnlockBlock();
+    return n;
+  }
+
+  /**
    * Start faulting `page_num` in WITHOUT waiting for it.
    *
    * This is what makes compute and I/O overlap: the kernel asks for the page
@@ -458,6 +496,12 @@ class DeviceVector {
     return static_cast<clio::run::u64>(clock64());
   }
 
+  /** This block's batch slots -- same partitioning as the page table. */
+  CTP_GPU_FUN MultiPutBatch *BlockBatches() const {
+    const clio::run::u32 b = blockIdx.x % nblocks_;
+    return multi_ + static_cast<clio::run::u64>(b) * multi_per_block_;
+  }
+
   /** This block's slice of the page table. */
   CTP_GPU_FUN Page *BlockPages() const {
     const clio::run::u32 b = blockIdx.x % nblocks_;
@@ -555,6 +599,92 @@ class DeviceVector {
     // when it was submitted. A later write dirties it again for the next.
     p->dirty = 0u;
     p->flushing = 1u;
+  }
+
+  /** Header fields of a batch task; the records are appended by the caller. */
+  CTP_GPU_FUN void PrepareMultiPut(
+      clio::cte::core::PodMultiPutBlobTask *t) const {
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindPut);
+    t->pool_id_ = pool_id_;
+    t->method_ = clio::cte::core::Method::kPodMultiPutBlob;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = tag_id_;
+    t->count_ = 0;
+    t->flags_ = 0;
+    t->num_ok_ = 0;
+    t->context_ = clio::cte::core::Context();
+    t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
+    ClearRunCtx(t);
+  }
+
+  /** FlushBlockBatched's body, for callers already holding the block lock. */
+  CTP_GPU_FUN clio::run::u32 FlushBlockBatchedLocked() {
+    Page *tbl = BlockPages();
+    // Not provisioned (host did not allocate batch slots): do it scalar-wise
+    // rather than silently skipping the flush.
+    if (multi_ == nullptr || multi_per_block_ == 0) {
+      clio::run::u32 done = 0;
+      for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+        if (!tbl[i].dirty && !tbl[i].flushing) continue;
+        SubmitPut(&tbl[i]);
+        AwaitPut(&tbl[i]);
+        ++done;
+      }
+      return done;
+    }
+    // A scalar put still in flight owns that page's bytes; batching it now
+    // would put the same page on the wire twice.
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      if (tbl[i].flushing) AwaitPut(&tbl[i]);
+    }
+
+    MultiPutBatch *mb = BlockBatches();
+    clio::run::u32 nb = 0;              // batches with records in them
+    clio::run::u32 filled = 0;          // records in batch nb
+    PrepareMultiPut(mb[0].task);
+    for (clio::run::u32 i = 0; i < pages_per_block_; ++i) {
+      Page *p = &tbl[i];
+      if (p->page_num == kNoPage || !p->dirty) continue;
+      if (filled == clio::cte::core::kPodMultiMax) {
+        // Full: submit and move on. multi_per_block_ is sized so this can
+        // only run out if the host provisioned fewer batches than pages.
+        mb[nb].fut = ipc_->Send(SlotPtr(mb[nb].task));
+        ++nb;
+        filled = 0;
+        if (nb == multi_per_block_) break;
+        PrepareMultiPut(mb[nb].task);
+      }
+      char name[32];
+      PageBlobName(p->page_num, name);
+      mb[nb].task->Add(name, 0, page_bytes_, RawPtr(p->data), p->score);
+      mb[nb].page_slot[filled] = i;
+      ++filled;
+      Bump(stat_puts_);
+    }
+    clio::run::u32 nsub = nb;
+    if (filled > 0) {
+      mb[nb].fut = ipc_->Send(SlotPtr(mb[nb].task));
+      nsub = nb + 1;
+    }
+
+    clio::run::u32 ok = 0;
+    for (clio::run::u32 b = 0; b < nsub; ++b) {
+      mb[b].fut.Wait();
+      auto *t = mb[b].task;
+      for (clio::run::u32 r = 0; r < t->count_; ++r) {
+        Page *p = &tbl[mb[b].page_slot[r]];
+        // Clean only on this record's own success -- a failed page keeps its
+        // dirty bit and gets written back on the next flush or eviction.
+        if (t->reqs_[r].rc_ == 0) {
+          p->dirty = 0u;
+          ++ok;
+        }
+      }
+    }
+    return ok;
   }
 
   CTP_GPU_FUN void AwaitPut(Page *p) {

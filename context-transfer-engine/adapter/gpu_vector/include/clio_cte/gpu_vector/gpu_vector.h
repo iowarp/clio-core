@@ -218,6 +218,9 @@ class Vector {
     char *pages_base = nullptr;     // page bytes
     char *table_base = nullptr;     // Page[] table
     char *tasks_base = nullptr;     // task slots
+    char *multi_task_base = nullptr;  // batched-put task slots
+    char *multi_tbl_base = nullptr;   // MultiPutBatch[] table
+    ctp::ipc::AllocatorId multi_tbl_alloc;
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
     ctp::ipc::AllocatorId tasks_alloc;
@@ -266,13 +269,35 @@ class Vector {
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nslots * sizeof(Page), &st.table_base);
-    const clio::run::u64 task_bytes =
+    // Batched writeback slots: enough per block that the block's WHOLE page
+    // cache flushes in that many submissions (256 pages -> 4 batches). The
+    // submission is the cost on this path, so the count is derived from the
+    // cache size rather than being a tunable.
+    const clio::run::u64 multi_per_block =
+        (pages_per_block_ + clio::cte::core::kPodMultiMax - 1) /
+        clio::cte::core::kPodMultiMax;
+    const clio::run::u64 nbatch =
+        static_cast<clio::run::u64>(nblocks_) * multi_per_block;
+    const clio::run::u64 scalar_task_bytes =
         nslots * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
+    const clio::run::u64 multi_task_bytes = nbatch * sizeof(MultiPutSlot);
+    // The batch tasks share the per-page slots' backend ON PURPOSE. SlotPtr
+    // stamps `task_alloc_id_` -- ONE allocator id -- on every task it sends,
+    // so a task living in a different registered backend reaches the runtime
+    // labeled with the wrong allocator and is never resolved: the kernel then
+    // waits forever on a completion that cannot come.
+    const clio::run::u64 task_bytes = scalar_task_bytes + multi_task_bytes;
     st.tasks_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem, task_bytes,
         &st.tasks_base);
+    st.multi_task_base = st.tasks_base + scalar_task_bytes;
+
+    st.multi_tbl_alloc = ipc->AllocateAndRegisterGpuBackend(
+        gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+        nbatch * sizeof(MultiPutBatch), &st.multi_tbl_base);
+
     if (st.pages_alloc.IsNull() || st.table_alloc.IsNull() ||
-        st.tasks_alloc.IsNull()) {
+        st.tasks_alloc.IsNull() || st.multi_tbl_alloc.IsNull()) {
       throw std::runtime_error("gpu_vector: device backend allocation failed");
     }
 
@@ -348,6 +373,32 @@ class Vector {
     }
     UploadBytes(tasks.data(), st.tasks_base, task_bytes);
 
+    // Batch tasks: same rules as the per-page slots -- CONSTRUCTED (a zeroed
+    // task arrives at the worker with a null RunContext and aborts it) and
+    // stamped with their POD size so RecvIn knows how many bytes to copy back
+    // without dereferencing the task.
+    {
+      std::vector<char> mtasks(
+          static_cast<size_t>(nbatch * sizeof(MultiPutSlot)), 0);
+      std::vector<MultiPutBatch> mtbl(static_cast<size_t>(nbatch));
+      for (clio::run::u64 i = 0; i < nbatch; ++i) {
+        char *slot = mtasks.data() + i * sizeof(MultiPutSlot);
+        new (slot) MultiPutSlot(clio::run::CreateTaskId(),
+                                clio::cte::core::kCtePoolId, local, tag_id_);
+        reinterpret_cast<MultiPutSlot *>(slot)->fut_.task_size_ =
+            static_cast<clio::run::u32>(sizeof(MultiPutSlot));
+        mtbl[static_cast<size_t>(i)].task =
+            reinterpret_cast<MultiPutSlot *>(st.multi_task_base +
+                                             i * sizeof(MultiPutSlot));
+        mtbl[static_cast<size_t>(i)].fut =
+            clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
+      }
+      UploadBytes(mtasks.data(), st.multi_task_base,
+                  nbatch * sizeof(MultiPutSlot));
+      UploadBytes(mtbl.data(), st.multi_tbl_base,
+                  nbatch * sizeof(MultiPutBatch));
+    }
+
     // One device-global counter per vector, feeding unique task ids.
     void *seq = nullptr;
 #if CTP_ENABLE_CUDA
@@ -393,6 +444,8 @@ class Vector {
     v.compress_lib_ = compress_lib_;
     v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
+    v.multi_ = reinterpret_cast<MultiPutBatch *>(st.multi_tbl_base);
+    v.multi_per_block_ = static_cast<clio::run::u32>(multi_per_block);
     st.view = v;
     devs_[gpu_id] = st;
   }
@@ -435,10 +488,14 @@ class Vector {
       if (!st.pages_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.pages_alloc);
       if (!st.table_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.table_alloc);
       if (!st.tasks_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.tasks_alloc);
+      if (!st.multi_tbl_alloc.IsNull()) {
+        ipc->FreeGpuBackend(gpu, st.multi_tbl_alloc);
+      }
     }
     st.pages_alloc = ctp::ipc::AllocatorId::GetNull();
     st.table_alloc = ctp::ipc::AllocatorId::GetNull();
     st.tasks_alloc = ctp::ipc::AllocatorId::GetNull();
+    st.multi_tbl_alloc = ctp::ipc::AllocatorId::GetNull();
 #if CTP_ENABLE_CUDA
     if (st.stats != nullptr) {
       cudaFree(st.stats);
