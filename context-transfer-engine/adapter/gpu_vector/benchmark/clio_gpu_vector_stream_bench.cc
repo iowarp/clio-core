@@ -142,17 +142,40 @@ __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
   }
 }
 
-/** Read pass: stream the whole slice back and checksum it. */
+/**
+ * Read pass: stream the whole slice back and checksum it.
+ *
+ * `depth` pages are kept in flight ahead of the one being consumed. A fault is
+ * a synchronous round trip to the CPU, so consuming page k while nothing else
+ * is outstanding exposes that latency in full, once per page. It matters much
+ * more for a compressed vector: a GPU codec runs in its own CUDA context and
+ * each fault waits on a driver context switch (~7.6 ms measured), which is
+ * latency to be overlapped, not bandwidth to be saved. depth=0 keeps the old
+ * strictly-synchronous behaviour for comparison.
+ */
 __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 pages_per_block,
-                                 unsigned long long *sum) {
+                                 u32 depth, unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
   v.ipc_ = g_ipc_manager_ptr;
   const u64 pe = v.elems_per_page_;
   const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
   unsigned long long acc = 0;
+  // Prime the pipeline.
+  if (threadIdx.x == 0) {
+    for (u64 d = 0; d < depth && d < pages_per_block; ++d) {
+      v.BeginFetch(base_page + d);
+    }
+  }
+  __syncthreads();
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 off = (base_page + k) * pe;
+    // Start the page `depth` ahead before touching this one, so the fault for
+    // it is already in flight by the time we get there.
+    if (threadIdx.x == 0 && depth > 0 && k + depth < pages_per_block) {
+      v.BeginFetch(base_page + k + depth);
+    }
+    __syncthreads();
     v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       acc += static_cast<unsigned long long>(v[off + i]);
@@ -190,6 +213,7 @@ int main(int argc, char **argv) {
   u64 spill_mb = 16384;   // tier below it
   u32 threads = 256;
   u64 stored_sample = 1024;  // pages probed for the stored-size estimate
+  u32 prefetch_depth = 0;    // pages kept in flight ahead of the reader
   bool compressed = false;
   bool gpu_codec = false;  // nvcomp: decompress ON the GPU
   const char *tier_type = "pinned";  // pageable staging halves device I/O
@@ -215,6 +239,7 @@ int main(int argc, char **argv) {
     else if (f == "--spill-mb") spill_mb = std::atoll(next());
     else if (f == "--threads") threads = static_cast<u32>(std::atoll(next()));
     else if (f == "--stored-sample") stored_sample = std::atoll(next());
+    else if (f == "--prefetch") prefetch_depth = static_cast<u32>(std::atoll(next()));
     else if (f == "--compressed") compressed = true;
     else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
@@ -233,7 +258,8 @@ int main(int argc, char **argv) {
           "  --zero-pct  %% of pages that are all-zero (compressible)\n"
           "  --vram-mb   top-tier capacity: the 'VRAM' the data is sized against\n"
           "  --spill-type  tier below the top one: ram|file (default ram)\n"
-          "  --spill-path  backing file when --spill-type file\n",
+          "  --spill-path  backing file when --spill-type file\n"
+          "  --prefetch    pages kept in flight ahead of the reader (0 = sync)\n",
           argv[0]);
       return 0;
     }
@@ -315,6 +341,20 @@ int main(int argc, char **argv) {
       std::to_string(total_mb) + "_" + std::to_string(vram_mb) + "_" +
       std::to_string(zero_pct) + "_" + std::to_string(page_kb);
 
+  // A prefetch depth at or above the per-block slot count deadlocks: every
+  // slot ends up pinned by an in-flight fetch, so the page actually being read
+  // can never claim one and the block spins forever. Leave at least one slot
+  // for the reader.
+  if (pages_per_block_resident > 1 &&
+      prefetch_depth > pages_per_block_resident - 1) {
+    prefetch_depth = static_cast<u32>(pages_per_block_resident - 1);
+    std::fprintf(stderr, "stream: prefetch clamped to %u (slots/blk=%llu)\n",
+                 prefetch_depth,
+                 (unsigned long long) pages_per_block_resident);
+  } else if (pages_per_block_resident <= 1) {
+    prefetch_depth = 0;
+  }
+
   gv::Vector<u32> vec(tag, {0}, page_bytes, blocks,
                       static_cast<u32>(pages_per_block_resident), n,
                       kCompressorPool,
@@ -372,7 +412,8 @@ int main(int argc, char **argv) {
   cudaMalloc(&d_sum, sizeof(unsigned long long));
   cudaMemset(d_sum, 0, sizeof(unsigned long long));
   const double r0 = NowMs();
-  StreamReadKernel<<<blocks, threads>>>(gpu, dev, pages_per_block, d_sum);
+  StreamReadKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
+                                        prefetch_depth, d_sum);
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::fprintf(stderr, "stream: read kernel failed: %s\n",
                  cudaGetErrorString(cudaGetLastError()));

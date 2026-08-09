@@ -1356,22 +1356,50 @@ bool Runtime::InitCodecContext() {
     const long mb = std::atol(e);
     if (mb > 0) buf = static_cast<size_t>(mb) << 20;
   }
+  size_t slots = 16;
+  if (const char *e = std::getenv("CLIO_COMPRESS_GPU_SLOTS")) {
+    const long n = std::atol(e);
+    if (n > 0) slots = static_cast<size_t>(n);
+  }
   CodecCtxGuard guard(codec_ctx_);
   if (!guard.ok()) {
     return false;
   }
-  CUdeviceptr din = 0, dout = 0;
-  if (cuMemAlloc(&din, buf) != CUDA_SUCCESS ||
-      cuMemAlloc(&dout, buf) != CUDA_SUCCESS) {
-    return false;
+  codec_slots_.resize(slots);
+  for (size_t i = 0; i < slots; ++i) {
+    CUdeviceptr d = 0;
+    if (cuMemAlloc(&d, buf) != CUDA_SUCCESS) {
+      return false;
+    }
+    codec_slots_[i].buf = reinterpret_cast<void *>(d);
+    // A stream PER SLOT. Sharing one stream would serialize the concurrent
+    // operations this pool exists to allow, since each waits on its own work.
+    codec_slots_[i].stream = ctp::GpuApi::CreateStream();
+    codec_free_.push_back(i);
   }
-  codec_in_ = reinterpret_cast<void *>(din);
-  codec_out_ = reinterpret_cast<void *>(dout);
   codec_buf_bytes_ = buf;
-  // The codec's stream must belong to the codec context.
-  gpu_stream_ = ctp::GpuApi::CreateStream();
+  // The factory's stream is only a default for codecs built outside this pool.
+  gpu_stream_ = codec_slots_[0].stream;
   ctp::CompressionFactory::SetGpuStream(gpu_stream_);
   return true;
+}
+
+size_t Runtime::AcquireCodecSlot() {
+  std::lock_guard<std::mutex> guard(codec_mu_);
+  if (codec_free_.empty()) {
+    return SIZE_MAX;
+  }
+  const size_t idx = codec_free_.back();
+  codec_free_.pop_back();
+  return idx;
+}
+
+void Runtime::ReleaseCodecSlot(size_t idx) {
+  if (idx == SIZE_MAX) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(codec_mu_);
+  codec_free_.push_back(idx);
 }
 
 void Runtime::DestroyCodecContext() {
@@ -1381,14 +1409,19 @@ void Runtime::DestroyCodecContext() {
   {
     CodecCtxGuard guard(codec_ctx_);
     if (guard.ok()) {
-      if (codec_in_) cuMemFree(reinterpret_cast<CUdeviceptr>(codec_in_));
-      if (codec_out_) cuMemFree(reinterpret_cast<CUdeviceptr>(codec_out_));
+      for (auto &slot : codec_slots_) {
+        if (slot.buf != nullptr) {
+          cuMemFree(reinterpret_cast<CUdeviceptr>(slot.buf));
+        }
+      }
     }
   }
+  codec_slots_.clear();
+  codec_free_.clear();
   cuCtxDestroy(static_cast<CUcontext>(codec_ctx_));
   codec_ctx_ = nullptr;
-  codec_in_ = codec_out_ = nullptr;
   codec_buf_bytes_ = 0;
+  gpu_stream_ = nullptr;
 }
 
 bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
@@ -1408,32 +1441,35 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
   const size_t payload = (header->compressed_size_ != 0)
                              ? static_cast<size_t>(header->compressed_size_)
                              : (stored_size - hdr);
-  std::lock_guard<std::mutex> one_at_a_time(codec_mu_);
+  const size_t slot = AcquireCodecSlot();
+  if (slot == SIZE_MAX) {
+    return false;  // all slots busy: caller uses the host path this time
+  }
+  void *sbuf = codec_slots_[slot].buf;
+  CUstream sstream = static_cast<CUstream>(codec_slots_[slot].stream);
   size_t out = dst_bytes;
+  bool ok = false;
   {
     CodecCtxGuard guard(codec_ctx_);
-    if (!guard.ok()) {
-      return false;
+    if (guard.ok()) {
+      // Only the COMPRESSED bytes are staged; the page itself never moves.
+      if (cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(sbuf),
+                            stored_host + hdr, payload,
+                            sstream) == CUDA_SUCCESS &&
+          cuStreamSynchronize(sstream) == CUDA_SUCCESS) {
+        auto codec = ctp::CompressionFactory::GetPreset(
+            ctp::CompressionFactory::NameForWireId(header->compress_lib_),
+            ctp::CompressionPreset::BALANCED);
+        // DECOMPRESS DIRECTLY INTO THE FAULT'S PAGE. dst_device is the page the
+        // faulting block is waiting on, exactly dst_bytes long, and managed, so
+        // this context can write it. nvcomp writes into the caller's output
+        // when it is device memory big enough -- no intermediate, no copy back.
+        ok = codec && codec->Decompress(dst_device, out, sbuf, payload);
+      }
     }
-    // Only the COMPRESSED bytes are staged; the page itself never moves.
-    if (cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(codec_in_),
-                     stored_host + hdr, payload) != CUDA_SUCCESS) {
-      return false;
-    }
-    auto codec = ctp::CompressionFactory::GetPreset(
-        ctp::CompressionFactory::NameForWireId(header->compress_lib_),
-        ctp::CompressionPreset::BALANCED);
-    // DECOMPRESS DIRECTLY INTO THE FAULT'S PAGE. dst_device is the page the
-    // faulting block is waiting on, it is exactly dst_bytes long, and it is
-    // managed memory so this context can write it. nvcomp writes into the
-    // caller's output when it is device memory big enough for the decompressed
-    // size, so there is no intermediate buffer and nothing to copy afterwards.
-    if (!codec || !codec->Decompress(dst_device, out, codec_in_, payload)) {
-      return false;
-    }
-    return cuStreamSynchronize(static_cast<CUstream>(gpu_stream_)) ==
-           CUDA_SUCCESS;
   }
+  ReleaseCodecSlot(slot);
+  return ok;
 }
 
 bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
@@ -1445,51 +1481,41 @@ bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
     CTRACE("comp: no ctx or too big (size=%zu cap=%zu)\n", size, codec_buf_bytes_);
     return false;
   }
-  std::lock_guard<std::mutex> one_at_a_time(codec_mu_);
+  const size_t slot = AcquireCodecSlot();
+  if (slot == SIZE_MAX) {
+    CTRACE("comp: all slots busy\n");
+    return false;
+  }
+  void *sbuf = codec_slots_[slot].buf;
+  CUstream sstream = static_cast<CUstream>(codec_slots_[slot].stream);
   size_t csize = codec_buf_bytes_;
+  bool ok = false;
   {
-    // ASYNC on the codec context's stream, then wait on THAT stream only.
-    // The synchronous cuMemcpyPeer waits for pending work in the source
-    // context -- which is the faulting context, whose kernel is spinning until
-    // this very call returns. It deadlocked exactly there.
     CodecCtxGuard guard(codec_ctx_);
-    if (!guard.ok()) { CTRACE("comp: ctx push failed\n"); return false; }
-    CUstream cs = static_cast<CUstream>(gpu_stream_);
-    CUresult r = cuMemcpyPeerAsync(
-        reinterpret_cast<CUdeviceptr>(codec_in_),
-        static_cast<CUcontext>(codec_ctx_),
-        reinterpret_cast<CUdeviceptr>(const_cast<void *>(src_device)),
-        static_cast<CUcontext>(primary_ctx_), size, cs);
-    if (r == CUDA_SUCCESS) r = cuStreamSynchronize(cs);
-    if (r != CUDA_SUCCESS) {
-      const char *e = nullptr; cuGetErrorString(r, &e);
-      CTRACE("comp: cuMemcpyPeerAsync in FAILED: %s\n", e ? e : "?");
-      return false;
-    }
-    auto codec = ctp::CompressionFactory::GetPreset(
-        ctp::CompressionFactory::NameForWireId(wire_id),
-        ctp::CompressionPreset::BALANCED);
-    if (!codec) { CTRACE("comp: no codec for wire %d\n", wire_id); return false; }
-    if (!codec->Compress(codec_out_, csize, const_cast<void *>(codec_in_),
-                         size)) {
-      CTRACE("comp: codec->Compress returned false\n");
-      return false;
-    }
-    if (csize > out_cap) {
-      CTRACE("comp: csize %zu > out_cap %zu\n", csize, out_cap);
-      return false;
-    }
-    CUresult r2 = cuMemcpyDtoH(out_host,
-                               reinterpret_cast<CUdeviceptr>(codec_out_), csize);
-    if (r2 != CUDA_SUCCESS) {
-      const char *e = nullptr; cuGetErrorString(r2, &e);
-      CTRACE("comp: cuMemcpyDtoH FAILED: %s\n", e ? e : "?");
-      return false;
+    if (guard.ok()) {
+      auto codec = ctp::CompressionFactory::GetPreset(
+          ctp::CompressionFactory::NameForWireId(wire_id),
+          ctp::CompressionPreset::BALANCED);
+      // Compress FROM the caller's page (managed, so readable here) INTO this
+      // slot's device buffer. The page never leaves the device.
+      if (codec && codec->Compress(sbuf, csize, const_cast<void *>(src_device),
+                                   size) &&
+          csize <= out_cap &&
+          cuMemcpyDtoHAsync(out_host, reinterpret_cast<CUdeviceptr>(sbuf),
+                            csize, sstream) == CUDA_SUCCESS &&
+          cuStreamSynchronize(sstream) == CUDA_SUCCESS) {
+        ok = true;
+      }
     }
   }
-  *out_size = csize;
-  CTRACE("comp: OK csize=%zu\n", csize);
-  return true;
+  ReleaseCodecSlot(slot);
+  if (ok) {
+    *out_size = csize;
+    CTRACE("comp: OK csize=%zu\n", csize);
+  } else {
+    CTRACE("comp: failed\n");
+  }
+  return ok;
 #undef CTRACE
 }
 

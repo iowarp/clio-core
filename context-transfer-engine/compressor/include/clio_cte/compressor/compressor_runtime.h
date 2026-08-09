@@ -352,10 +352,32 @@ private:
    */
   void *codec_ctx_ = nullptr;    // CUcontext, owned
   void *primary_ctx_ = nullptr;  // CUcontext of the faulting side, not owned
-  void *codec_in_ = nullptr;     // CUdeviceptr, in codec_ctx_
-  void *codec_out_ = nullptr;    // CUdeviceptr, in codec_ctx_
+  /**
+   * A pool of independent codec slots, NOT one shared buffer.
+   *
+   * Each slot is a device staging buffer for the compressed bytes plus its own
+   * stream, so operations proceed concurrently. That is the whole point: a
+   * codec operation waits on a driver context switch (~7.6 ms), and switches
+   * are per SLICE, not per operation. Serializing behind one mutex made every
+   * fault pay its own switch, which is why prefetching more pages changed
+   * nothing at all -- the extra fetches simply queued. With independent slots
+   * the concurrent faults land in the same slice and share its cost.
+   *
+   * Only the compressed side needs a buffer. The decompressed side is the
+   * caller's page, written directly.
+   */
+  struct CodecSlot {
+    void *buf = nullptr;     // CUdeviceptr, in codec_ctx_
+    void *stream = nullptr;  // CUstream, in codec_ctx_
+  };
+  std::vector<CodecSlot> codec_slots_;
+  std::vector<size_t> codec_free_;  // indices of slots not in use
   size_t codec_buf_bytes_ = 0;
-  std::mutex codec_mu_;          // one codec operation at a time
+  std::mutex codec_mu_;  // guards codec_free_ ONLY, never a whole operation
+
+  /** Take a slot, or SIZE_MAX if all are busy (caller falls back). */
+  size_t AcquireCodecSlot();
+  void ReleaseCodecSlot(size_t idx);
 
   /** Build codec_ctx_ + its buffers. Best effort; false leaves GPU codecs off. */
   bool InitCodecContext();
