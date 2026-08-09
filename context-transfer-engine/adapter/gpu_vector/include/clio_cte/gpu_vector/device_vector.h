@@ -193,26 +193,30 @@ class DeviceVector {
       // scanning ~400 occupied slots), invariant to every inner-loop change
       // because it runs before any of them.
       const clio::run::u32 ppb = h_->pages_per_block_;
-      // DIRECT SLOT FIRST: pages are placed at pn % ppb when that slot is
-      // free (see the claim sites), so in the common case this is ONE probe.
-      // last_slot_ starts each launch at 0, so without this the first hold of
-      // every warp still walked to wherever the weight's pages sat.
+      // OPEN-ADDRESSED LOOKUP. Pages are placed at pn % ppb, or failing that
+      // at the next free slot linearly (see the claim sites), so a lookup
+      // probes from the direct slot and an EMPTY slot proves absence. At the
+      // ~0.5 load factor residency produces, chains average under two probes.
+      //
+      // The previous scheme (direct probe, then a rotated full scan) measured
+      // ~10 us per resolve for collided pages -- the scan walked hundreds of
+      // slots, and half the pages had collided at warm time.
+      //
+      // Deletions (evictions) punch holes that can cut a chain short; the
+      // empty-slot early-out then reports a false miss, which falls to the
+      // LOCKED path whose full scan under the lock is authoritative. That is
+      // correctness preserved at streaming-mode cost; when nothing evicts,
+      // chains have no holes.
       {
         const clio::run::u32 d = (clio::run::u32) (pn % ppb);
-        if (tbl[d].page_num == pn && !tbl[d].fetching) {
-          p = &tbl[d];
-          last_slot_ = d;
-        }
-      }
-      if (p == nullptr) {
         for (clio::run::u32 k = 0; k < ppb; ++k) {
-          clio::run::u32 i = last_slot_ + k;
+          clio::run::u32 i = d + k;
           if (i >= ppb) i -= ppb;
           if (tbl[i].page_num == pn && !tbl[i].fetching) {
             p = &tbl[i];
-            last_slot_ = i;
             break;
           }
+          if (tbl[i].page_num == kNoPage) break;   // absence proven
         }
       }
       if (p == nullptr) {
@@ -842,15 +846,16 @@ class DeviceVector {
         continue;
       }
       clio::run::u32 slot = h_->pages_per_block_;
-      // Direct slot first, same reasoning as ResolveLocked: placement is what
-      // makes the one-probe lookup possible.
+      // Open addressing, same probe order as the lookup: first free slot at
+      // or after pg % ppb, wrapping.
       {
-        const clio::run::u32 d = (clio::run::u32) (pg % h_->pages_per_block_);
-        if (tbl[d].page_num == kNoPage) slot = d;
-      }
-      if (slot == h_->pages_per_block_)
-      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-        if (tbl[i].page_num == kNoPage) { slot = i; break; }
+        const clio::run::u32 ppb3 = h_->pages_per_block_;
+        const clio::run::u32 d = (clio::run::u32) (pg % ppb3);
+        for (clio::run::u32 k = 0; k < ppb3; ++k) {
+          clio::run::u32 i = d + k;
+          if (i >= ppb3) i -= ppb3;
+          if (tbl[i].page_num == kNoPage) { slot = i; break; }
+        }
       }
       if (slot == h_->pages_per_block_) {
         EvictLocked(1);
@@ -1073,18 +1078,15 @@ class DeviceVector {
       Page *tbl = BlockPages();
       for (;;) {
         clio::run::u32 free_slot = h_->pages_per_block_;
-        // Prefer the DIRECT slot pn % ppb so lookups can find the page in one
-        // probe; any free slot is still correct, just slower to find later.
+        // Open addressing: claim the first free slot AT OR AFTER pn % ppb,
+        // wrapping, so lookups can probe the same order and stop at an empty.
         {
-          const clio::run::u32 d =
-              (clio::run::u32) (page_num % h_->pages_per_block_);
-          if (tbl[d].page_num == kNoPage) free_slot = d;
-        }
-        if (free_slot == h_->pages_per_block_)
-        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-          if (tbl[i].page_num == kNoPage) {
-            free_slot = i;
-            break;
+          const clio::run::u32 ppb2 = h_->pages_per_block_;
+          const clio::run::u32 d = (clio::run::u32) (page_num % ppb2);
+          for (clio::run::u32 k = 0; k < ppb2; ++k) {
+            clio::run::u32 i = d + k;
+            if (i >= ppb2) i -= ppb2;
+            if (tbl[i].page_num == kNoPage) { free_slot = i; break; }
           }
         }
         if (free_slot != h_->pages_per_block_) {
