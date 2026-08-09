@@ -54,11 +54,12 @@ class Vector {
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 pages_per_block, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0)
+         int compress_lib = 0, int compress_preset = 1)
       : storage_pool_id_(storage_pool_id.IsNull()
                              ? clio::cte::core::kCtePoolId
                              : storage_pool_id),
         compress_lib_(compress_lib),
+        compress_preset_(compress_preset),
         page_bytes_(page_bytes),
         nblocks_(nblocks),
         pages_per_block_(pages_per_block),
@@ -357,6 +358,7 @@ class Vector {
     v.size_ = num_elems_;
     v.pool_id_ = storage_pool_id_;
     v.compress_lib_ = compress_lib_;
+    v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
     st.view = v;
     devs_[gpu_id] = st;
@@ -432,6 +434,15 @@ class Vector {
   clio::run::PoolId storage_pool_id_;
   /** Codec wire id stamped on page puts; 0 stores raw. */
   int compress_lib_ = 0;
+  /** Compressor preset: 1 FAST, 2 BALANCED, 3 BEST. Defaults to FAST, and
+   *  deliberately so. A page store sits inside a device fault, and the
+   *  compressor maps BALANCED (the module-wide default) to LZ4_compress_HC
+   *  level 6 -- tens of MB/s on data that does not compress easily, against
+   *  hundreds for LZ4_compress_default. Paying HC prices to shrink a page
+   *  cache entry is the wrong trade: the page is about to be read back over
+   *  the bus, and the ratio difference between FAST and HC is small next to
+   *  the order of magnitude in throughput. */
+  int compress_preset_ = 1;
   clio::cte::core::TagId tag_id_;
   clio::run::u64 page_bytes_;
   clio::run::u32 nblocks_;

@@ -53,6 +53,7 @@ class DeviceVector {
   /** Codec wire id stamped on page PUTs. 0 stores raw. The compressor pool
    *  reads this from the task context to decide whether to compress. */
   int compress_lib_ = 0;
+  int compress_preset_ = 1;  // 1 FAST -- see gpu_vector.h
   /**
    * Device-global counter handing out strictly increasing task ids.
    *
@@ -546,6 +547,7 @@ class DeviceVector {
     t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
     ClearRunCtx(t);
     Bump(stat_puts_);
     p->put_fut = ipc_->Send(SlotPtr(p->put));
@@ -649,6 +651,7 @@ class DeviceVector {
     // shrunk, so incompressible data still looked correct.
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = compress_lib_;
+    t->context_.compress_preset_ = compress_preset_;
     ClearRunCtx(t);
   }
 

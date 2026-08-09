@@ -1240,25 +1240,32 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
     return false;
   }
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::vector<char> compressed(size + (size / 20) + 1024);
-  size_t compressed_size = compressed.size();
-  if (!compressor->Compress(compressed.data(), compressed_size,
-                            const_cast<char *>(src), size)) {
-    return false;
-  }
+  // Compress STRAIGHT INTO the shm buffer the bytes are headed for. Going via
+  // a std::vector cost a full-payload heap allocation and a second pass over
+  // the compressed bytes on every single blob -- per PAGE on the gpu_vector
+  // path, where blobs are pages. The buffer is sized to the codec's worst-case
+  // bound and only `total` bytes are ever handed to PutBlob, so the slack
+  // costs an allocation size, not I/O.
   size_t header_size = sizeof(CompressionHeader);
-  size_t total = compressed_size + header_size;
-  if (total >= size) {
-    return false;  // not beneficial — caller stores raw
-  }
-  auto shm = CLIO_IPC->AllocateBuffer(total);
+  const size_t bound = size + (size / 20) + 1024;
+  auto shm = CLIO_IPC->AllocateBuffer(header_size + bound);
   if (shm.IsNull()) {
     return false;
+  }
+  size_t compressed_size = bound;
+  if (!compressor->Compress(shm.ptr_ + header_size, compressed_size,
+                            const_cast<char *>(src), size)) {
+    CLIO_IPC->FreeBuffer(shm);
+    return false;
+  }
+  size_t total = compressed_size + header_size;
+  if (total >= size) {
+    CLIO_IPC->FreeBuffer(shm);
+    return false;  // not beneficial — caller stores raw
   }
   CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size,
                            compressed_size);
   std::memcpy(shm.ptr_, &header, header_size);
-  std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::high_resolution_clock::now() - t0)
                   .count();
@@ -1391,7 +1398,18 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
     }
     // Stage device -> host. DeviceAwareMemcpy resolves the pointer kind, so
     // this is also correct when the producer handed us host memory.
-    std::vector<char> host(static_cast<size_t>(task->size_));
+    //
+    // The buffer is per-thread and reused. A fresh std::vector per call meant
+    // a page-sized heap allocation (and its first-touch page faults) on every
+    // blob -- on the gpu_vector path that is once per PAGE, in the middle of a
+    // synchronous device fault. Reuse is safe here because the buffer is
+    // filled and consumed with no suspension in between: a fiber cannot yield
+    // between this copy and CompressIntoShm below, so no other fiber on this
+    // thread can observe it mid-use.
+    static thread_local std::vector<char> host;
+    if (host.size() < static_cast<size_t>(task->size_)) {
+      host.resize(static_cast<size_t>(task->size_));
+    }
     ctp::DeviceAwareMemcpy(host.data(), src_full.ptr_,
                            static_cast<size_t>(task->size_));
 
@@ -1516,15 +1534,26 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       size_t payload = (header->compressed_size_ != 0)
                            ? static_cast<size_t>(header->compressed_size_)
                            : (stored_size - hdr);
-      std::vector<char> plain(static_cast<size_t>(header->original_size_));
-      size_t out = plain.size();
+      // Per-thread and reused, for the same reason as the put side: this runs
+      // inside a synchronous device page fault, and a page-sized allocation
+      // per fault is pure latency. Nothing suspends between the decompress
+      // and the copy out, so the buffer cannot be observed mid-use.
+      static thread_local std::vector<char> plain;
+      const size_t original = static_cast<size_t>(header->original_size_);
+      if (plain.size() < original) {
+        plain.resize(original);
+      }
+      size_t out = original;
       if (!codec->Decompress(plain.data(), out, buf.ptr_ + hdr, payload) ||
-          out != plain.size()) {
+          out != original) {
         task->return_code_ = 5;
         CLIO_IPC->FreeBuffer(buf);
         CLIO_CO_RETURN;
       }
-      const size_t n = std::min<size_t>(task->size_, plain.size());
+      // `original`, NOT plain.size(): the buffer is reused and only grows, so
+      // its size is a high-water mark from some earlier, larger blob. Copying
+      // that many bytes would hand the caller the tail of a previous page.
+      const size_t n = std::min<size_t>(task->size_, original);
       ctp::DeviceAwareMemcpy(dst_full.ptr_, plain.data(), n);
     } else {
       // Stored raw: hand the bytes back untouched.
