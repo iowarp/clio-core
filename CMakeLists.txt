@@ -430,6 +430,24 @@ set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
 # Thread support
 find_package(Threads REQUIRED)
 
+# CUDA 13 moved libcu++ (cuda/std/*) under include/cccl. Anything including
+# <cuda/std/...> -- kvhdf5 does -- otherwise fails with a bare
+# "cuda/std/cstdint: No such file or directory". This has to be at top level:
+# include_directories() only affects the directory that calls it and the
+# subdirectories added after, so setting it inside a helper invoked from one
+# component never reaches the others. Harmless on older toolkits, where the
+# directory does not exist.
+if(CLIO_CORE_ENABLE_CUDA)
+    foreach(_cccl "${CUDAToolkit_INCLUDE_DIRS}/cccl"
+                  "/usr/local/cuda/targets/x86_64-linux/include/cccl")
+        if(EXISTS "${_cccl}")
+            message(STATUS "libcu++ (CUDA 13 layout) at ${_cccl}")
+            include_directories("${_cccl}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 # Compression libraries (conditional)
 if(CLIO_CTE_ENABLE_COMPRESS)
     message(STATUS "CLIO_CTE_ENABLE_COMPRESS is ON")

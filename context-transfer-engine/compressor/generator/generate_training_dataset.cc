@@ -63,10 +63,10 @@
 #include <clio_ctp/util/logging.h>
 
 // Compression libraries
-#ifdef CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/lossless_modes.h"
-#ifdef CTP_ENABLE_LIBPRESSIO
+#if CTP_ENABLE_LIBPRESSIO
 #include "clio_ctp/compress/libpressio.h"
 #include "clio_ctp/compress/libpressio_modes.h"
 #endif
@@ -102,7 +102,7 @@ struct DistributionConfig {
 struct CompressorConfig {
   std::string library_name;
   std::string preset_name;
-#ifdef CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS
   std::unique_ptr<ctp::Compressor> compressor;
   std::unique_ptr<std::mutex> compressor_mutex;  // Thread-safe access to compressor
 #endif
@@ -636,7 +636,7 @@ std::vector<BinConfig> ScaleBinsForType(const std::vector<BinConfig>& normalized
 std::vector<CompressorConfig> InitializeCompressors() {
   std::vector<CompressorConfig> configs;
 
-#ifdef CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS
   // ZSTD: 3 levels (fast, balanced, best)
 #if CTP_ENABLE_ZSTD
   configs.push_back({"zstd", "fast",
@@ -710,7 +710,7 @@ std::vector<CompressorConfig> InitializeCompressors() {
                      std::make_unique<std::mutex>()});
 #endif  // CTP_ENABLE_BLOSC2
 
-#ifdef CTP_ENABLE_LIBPRESSIO
+#if CTP_ENABLE_LIBPRESSIO
   // ZFP: 3 modes (fast, balanced, best)
   configs.push_back({"zfp", "fast",
                      std::make_unique<ctp::LibPressioWithModes>("zfp", ctp::CompressionMode::FAST)});
@@ -794,7 +794,7 @@ BenchmarkResult CompressData(const std::string& type_name, const GeneratedData<T
   result.decompress_time_ms = 0.0;
   result.psnr = 0.0;
 
-#ifdef CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS
   size_t data_size = gen_data.data.size() * sizeof(T);
 
   // Prepare buffers
@@ -883,7 +883,7 @@ BenchmarkResult BenchmarkSampleTyped(const std::string& type_name, size_t data_s
   result.first_derivative = stats[2];
   result.second_derivative = stats[3];
 
-#ifdef CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS
   // Prepare buffers
   std::vector<uint8_t> compressed(data_size * 2);
   std::vector<uint8_t> decompressed(data_size);
