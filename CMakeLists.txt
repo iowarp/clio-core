@@ -536,9 +536,18 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "blosc2 not found - blosc codec disabled (apt: libblosc2-dev)")
     endif()
 
+    # The find_path/find_library codecs need the same prefixes pkg-config
+    # already knows about. Without this bzip2 read as "not found" on a host
+    # whose bzlib.h sits in a conda prefix, while zstd and lz4 right beside it
+    # were found -- because those came through pkg-config, which had been told
+    # where to look, and these had not.
+    set(CLIO_CODEC_HINTS "$ENV{CONDA_PREFIX}" ${CMAKE_PREFIX_PATH})
+
     # bzip2
-    find_path(bzip2_INCLUDE_DIR bzlib.h)
-    find_library(bzip2_LIBRARY bz2)
+    find_path(bzip2_INCLUDE_DIR bzlib.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(bzip2_LIBRARY bz2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(bzip2_INCLUDE_DIR AND bzip2_LIBRARY)
         set(CLIO_CTP_ENABLE_BZIP2 ON)
         set(bzip2_INCLUDE_DIRS ${bzip2_INCLUDE_DIR})
@@ -550,8 +559,10 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     endif()
 
     # lzo
-    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h)
-    find_library(lzo2_LIBRARY lzo2)
+    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(lzo2_LIBRARY lzo2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(lzo2_INCLUDE_DIR AND lzo2_LIBRARY)
         set(CLIO_CTP_ENABLE_LZO ON)
         set(lzo2_INCLUDE_DIRS ${lzo2_INCLUDE_DIR})
@@ -564,8 +575,10 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     endif()
 
     # snappy
-    find_path(snappy_INCLUDE_DIR snappy.h)
-    find_library(snappy_LIBRARY snappy)
+    find_path(snappy_INCLUDE_DIR snappy.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(snappy_LIBRARY snappy HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(snappy_INCLUDE_DIR AND snappy_LIBRARY)
         set(CLIO_CTP_ENABLE_SNAPPY ON)
         set(snappy_INCLUDE_DIRS ${snappy_INCLUDE_DIR})
