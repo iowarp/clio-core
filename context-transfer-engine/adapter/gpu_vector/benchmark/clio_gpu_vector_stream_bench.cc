@@ -92,6 +92,20 @@ CTP_INLINE_CROSS_FUN bool PageIsZero(u64 p, u32 zero_pct) {
  * value set, a slowly varying field) leaves byte-level structure that lz4
  * finds, and then --zero-pct stops controlling the ratio.
  */
+/**
+ * Position weight for the read checksum.
+ *
+ * An unweighted sum cannot see a PERMUTATION: if the batched fault path
+ * mapped a record to the wrong slot and two pages' contents were exchanged,
+ * the total would be bit-identical and the run would still report
+ * checksum=OK. That is precisely the failure the batched path can produce,
+ * so every term is weighted by its own index. Overflow wraps, which is fine
+ * -- host and device do the same u64 arithmetic.
+ */
+CTP_INLINE_CROSS_FUN unsigned long long PosWeight(u64 idx) {
+  return static_cast<unsigned long long>(idx) * 2654435761ull + 1ull;
+}
+
 CTP_INLINE_CROSS_FUN u32 Value(u64 p, u64 i, u32 zero_pct) {
   if (PageIsZero(p, zero_pct)) return 0u;
   u64 h = (i + 0x1234567ull) * 0xD6E8FEB86659FD93ull;
@@ -178,7 +192,8 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
     __syncthreads();
     v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-      acc += static_cast<unsigned long long>(v.at(off + i));
+      acc += static_cast<unsigned long long>(v.at(off + i)) *
+             PosWeight(off + i);
     }
     __syncthreads();
   }
@@ -217,7 +232,8 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
       const u64 off = (base_page + k + j) * pe;
       v.HoldPage(off, pe);
       for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-        acc += static_cast<unsigned long long>(v.at(off + i));
+        acc += static_cast<unsigned long long>(v.at(off + i)) *
+               PosWeight(off + i);
       }
       __syncthreads();
     }
@@ -490,7 +506,8 @@ int main(int argc, char **argv) {
     if (PageIsZero(p, zero_pct)) continue;  // contributes nothing
     const u64 off = p * page_elems;
     for (u64 i = 0; i < page_elems; ++i) {
-      want += Value(p, off + i, zero_pct);
+      want += static_cast<unsigned long long>(Value(p, off + i, zero_pct)) *
+              PosWeight(off + i);
     }
   }
 
