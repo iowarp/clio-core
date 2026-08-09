@@ -255,6 +255,7 @@ int main(int argc, char **argv) {
   u64 stored_sample = 1024;  // pages probed for the stored-size estimate
   u32 prefetch_depth = 0;    // pages kept in flight ahead of the reader
   u32 read_batch = 0;        // pages per batched get (0 = per-page faults)
+  u32 rt_threads = 8;        // runtime worker threads
   bool compressed = false;
   bool gpu_codec = false;  // nvcomp: decompress ON the GPU
   const char *tier_type = "pinned";  // pageable staging halves device I/O
@@ -282,6 +283,7 @@ int main(int argc, char **argv) {
     else if (f == "--stored-sample") stored_sample = std::atoll(next());
     else if (f == "--prefetch") prefetch_depth = static_cast<u32>(std::atoll(next()));
     else if (f == "--read-batch") read_batch = static_cast<u32>(std::atoll(next()));
+    else if (f == "--rt-threads") rt_threads = static_cast<u32>(std::atoll(next()));
     else if (f == "--compressed") compressed = true;
     else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
@@ -302,7 +304,8 @@ int main(int argc, char **argv) {
           "  --spill-type  tier below the top one: ram|file (default ram)\n"
           "  --spill-path  backing file when --spill-type file\n"
           "  --prefetch    pages kept in flight ahead of the reader (0 = sync)\n"
-          "  --read-batch  pages per BATCHED get (0 = one fault per page)\n",
+          "  --read-batch  pages per BATCHED get (0 = one fault per page)\n"
+          "  --rt-threads  runtime worker threads (default 8)\n",
           argv[0]);
       return 0;
     }
@@ -333,7 +336,8 @@ int main(int argc, char **argv) {
         // Workers that fall asleep add their wake-up latency to every page
         // fault, which is a synchronous round trip; that noise is the same
         // order as the effect being measured.
-        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
+        << "runtime:\n  num_threads: " << rt_threads
+        << "\n  queue_depth: 8192\n"
         << "  first_busy_wait: 2000000000\n\n"
         << "gpu:\n  queue_depth: 8192\n\n"
         << "compose:\n"
