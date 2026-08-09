@@ -1355,7 +1355,18 @@ bool Runtime::InitCodecContext() {
   primary_ctx_ = primary;
 
   CUcontext ctx = nullptr;
-  if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS) {
+  // cuCtxCreate is an API-versioned macro and CUDA 13 repointed it: 12.x maps
+  // it to cuCtxCreate_v2(ctx, flags, dev), 13.x to cuCtxCreate_v4(ctx,
+  // CUctxCreateParams*, flags, dev). Writing only the v4 form made this file
+  // fail to compile against a 12.x toolkit ("cannot convert std::nullptr_t to
+  // unsigned int"), which is easy to miss because the toolkit that supplies
+  // the headers need not be the one on /usr/local/cuda.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+  const CUresult ctx_rc = cuCtxCreate(&ctx, nullptr, 0, dev);
+#else
+  const CUresult ctx_rc = cuCtxCreate(&ctx, 0, dev);
+#endif
+  if (ctx_rc != CUDA_SUCCESS) {
     return false;
   }
   // cuCtxCreate leaves the new context CURRENT. Everything after Create runs
