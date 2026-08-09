@@ -1377,6 +1377,11 @@ bool Runtime::InitCodecContext() {
       return false;
     }
     codec_slots_[i].buf = reinterpret_cast<void *>(d);
+    CUdeviceptr o = 0;
+    if (cuMemAlloc(&o, buf) != CUDA_SUCCESS) {
+      return false;
+    }
+    codec_slots_[i].obuf = reinterpret_cast<void *>(o);
     // A stream PER SLOT. Sharing one stream would serialize the concurrent
     // operations this pool exists to allow, since each waits on its own work.
     codec_slots_[i].stream = ctp::GpuApi::CreateStream();
@@ -1386,7 +1391,110 @@ bool Runtime::InitCodecContext() {
   // The factory's stream is only a default for codecs built outside this pool.
   gpu_stream_ = codec_slots_[0].stream;
   ctp::CompressionFactory::SetGpuStream(gpu_stream_);
+  // Batched decompression is opt-in while it is brought up; the synchronous
+  // per-fault path stays the default.
+  const char *batch_env = std::getenv("CLIO_COMPRESS_GPU_BATCH");
+  batch_enabled_ = (batch_env != nullptr && batch_env[0] == '1');
+  if (batch_enabled_) {
+    batch_stop_.store(false, std::memory_order_release);
+    batch_thread_ = std::thread([this]() { BatchDrainLoop(); });
+    HLOG(kWarning, "compressor: batched GPU decompress ENABLED (experimental)");
+  }
   return true;
+}
+
+void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch) {
+  CodecCtxGuard guard(codec_ctx_);
+  if (!guard.ok()) {
+    for (auto &p : batch) p->done.store(true, std::memory_order_release);
+    return;
+  }
+  const size_t hdr = sizeof(CompressionHeader);
+  std::vector<size_t> slots(batch.size(), SIZE_MAX);
+  for (size_t i = 0; i < batch.size(); ++i) {
+    auto &p = batch[i];
+    if (p->abandoned.load(std::memory_order_acquire)) continue;
+    const auto *header =
+        reinterpret_cast<const CompressionHeader *>(p->stored_bytes.data());
+    if (p->stored_size <= hdr || !header->IsValid() ||
+        !IsGpuCodec(header->compress_lib_) ||
+        p->stored_size > codec_buf_bytes_ || p->dst_bytes > codec_buf_bytes_) {
+      continue;
+    }
+    slots[i] = AcquireCodecSlot();
+    if (slots[i] == SIZE_MAX) continue;
+    void *sbuf = codec_slots_[slots[i]].buf;
+    void *obuf = codec_slots_[slots[i]].obuf;
+    CUstream st = static_cast<CUstream>(codec_slots_[slots[i]].stream);
+    const size_t payload = (header->compressed_size_ != 0)
+                               ? static_cast<size_t>(header->compressed_size_)
+                               : (p->stored_size - hdr);
+    if (cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(sbuf),
+                          p->stored_bytes.data() + hdr, payload,
+                          st) != CUDA_SUCCESS) {
+      continue;
+    }
+    ctp::CompressionFactory::SetGpuStreamForThread(st);
+    auto codec = ctp::CompressionFactory::GetPreset(
+        ctp::CompressionFactory::NameForWireId(header->compress_lib_),
+        ctp::CompressionPreset::BALANCED);
+    size_t out = codec_buf_bytes_;
+    // Decompress into PLAIN ctx2 memory, then COPY into the caller's managed
+    // page: letting the codec write that page from this thread hangs inside
+    // Decompress (see PendingDecomp), while a copy is copy-engine work.
+    const bool dok = codec && codec->Decompress(obuf, out, sbuf, payload);
+    ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+    if (dok) {
+      const size_t n = std::min(out, p->dst_bytes);
+      p->ok = cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(p->dst),
+                                reinterpret_cast<CUdeviceptr>(obuf), n,
+                                st) == CUDA_SUCCESS &&
+              cuStreamSynchronize(st) == CUDA_SUCCESS;
+    }
+  }
+  for (size_t i = 0; i < batch.size(); ++i) {
+    if (slots[i] != SIZE_MAX) ReleaseCodecSlot(slots[i]);
+  }
+  for (auto &p : batch) p->done.store(true, std::memory_order_release);
+}
+
+void Runtime::BatchDrainLoop() {
+  // Linger before draining. Taking the queue the moment it is non-empty yields
+  // batches of one, and a batch of one costs what no batching costs -- the
+  // context entry is charged per ENTRY, not per page. Bounded both ways: stop
+  // early once enough have gathered, give up after kLingerMaxUs so a lone
+  // fault is not held hostage to peers that never arrive.
+  constexpr int kLingerStepUs = 50;
+  constexpr int kLingerMaxUs = 400;
+  const size_t target = codec_slots_.size();
+  while (!batch_stop_.load(std::memory_order_acquire)) {
+    size_t queued = 0;
+    {
+      std::lock_guard<std::mutex> g(batch_mu_);
+      queued = batch_.size();
+    }
+    if (queued == 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(kLingerStepUs));
+      continue;
+    }
+    for (int waited = 0; queued < target && waited < kLingerMaxUs;
+         waited += kLingerStepUs) {
+      std::this_thread::sleep_for(std::chrono::microseconds(kLingerStepUs));
+      std::lock_guard<std::mutex> g(batch_mu_);
+      queued = batch_.size();
+    }
+    std::vector<std::shared_ptr<PendingDecomp>> mine;
+    {
+      std::lock_guard<std::mutex> g(batch_mu_);
+      mine.swap(batch_);
+    }
+    if (mine.empty()) continue;
+    if (getenv("CLIO_CODEC_TRACE")) {
+      fprintf(stderr, "[DRAIN] batch of %zu\n", mine.size());
+      fflush(stderr);
+    }
+    RunDecompBatch(mine);
+  }
 }
 
 size_t Runtime::AcquireCodecSlot() {
@@ -1411,12 +1519,17 @@ void Runtime::DestroyCodecContext() {
   if (codec_ctx_ == nullptr) {
     return;
   }
+  batch_stop_.store(true, std::memory_order_release);
+  if (batch_thread_.joinable()) batch_thread_.join();
   {
     CodecCtxGuard guard(codec_ctx_);
     if (guard.ok()) {
       for (auto &slot : codec_slots_) {
         if (slot.buf != nullptr) {
           cuMemFree(reinterpret_cast<CUdeviceptr>(slot.buf));
+        }
+        if (slot.obuf != nullptr) {
+          cuMemFree(reinterpret_cast<CUdeviceptr>(slot.obuf));
         }
       }
     }
@@ -1982,7 +2095,9 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         // Hand the page to the drainer and wait on our OWN flag only; nothing
         // here is responsible for another request's progress.
         auto req = std::make_shared<PendingDecomp>();
-        req->stored = buf.ptr_;
+        // Own the bytes: the waiter may time out and free buf while the
+        // drainer is still working (see PendingDecomp).
+        req->stored_bytes.assign(buf.ptr_, buf.ptr_ + stored_size);
         req->stored_size = stored_size;
         req->dst = dst_dev.ptr_;
         req->dst_bytes = static_cast<size_t>(task->size_);

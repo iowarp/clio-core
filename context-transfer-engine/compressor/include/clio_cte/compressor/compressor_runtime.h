@@ -410,7 +410,18 @@ private:
    * degrades to the host path instead of hanging.
    */
   struct PendingDecomp {
-    const char *stored = nullptr;
+    /**
+     * The request owns its compressed bytes.
+     *
+     * Pointing at the waiter's SHM buffer was a use-after-free waiting to
+     * happen: on timeout the waiter marks itself abandoned and proceeds down
+     * the host path, which consumes and FREES that buffer, while the drainer
+     * may still be reading it. shared_ptr keeps this struct alive; it says
+     * nothing about the buffer the struct points at. Copying costs one memcpy
+     * of the COMPRESSED bytes, which are small by construction -- that is the
+     * whole point of having compressed them.
+     */
+    std::vector<char> stored_bytes;
     size_t stored_size = 0;
     void *dst = nullptr;
     size_t dst_bytes = 0;
