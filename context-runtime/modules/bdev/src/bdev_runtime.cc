@@ -415,7 +415,11 @@ void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
   if ((n % io_trace_period_) != 0) {
     return;
   }
-  HLOG(kWarning, "[IO] {} reads={} rMB={} writes={} wMB={}", trace_name_,
+  // Container id included on purpose: a pool can have MORE THAN ONE
+  // container, each with its own counters, and totals that ignore that
+  // undercount by however many containers were not looked at.
+  HLOG(kWarning, "[IO] {}#{} reads={} rMB={} writes={} wMB={}", trace_name_,
+       container_id_,
        trace_r_ops_.load(), trace_r_bytes_.load() / (1024 * 1024),
        trace_w_ops_.load(), trace_w_bytes_.load() / (1024 * 1024));
 }
