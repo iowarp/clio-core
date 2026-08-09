@@ -193,6 +193,13 @@ int main(int argc, char **argv) {
   bool compressed = false;
   bool gpu_codec = false;  // nvcomp: decompress ON the GPU
   const char *tier_type = "pinned";  // pageable staging halves device I/O
+  // The tier BELOW the top one. "ram" keeps the spill in host memory, which is
+  // still fast -- so compression only buys capacity there, never read
+  // bandwidth. Point this at a file to model the reason compression exists:
+  // when the overflow medium is slow, compressing means fewer bytes actually
+  // read back, and the compressed read can beat the raw one outright.
+  const char *spill_type = "ram";
+  const char *spill_path = "";
 
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
@@ -211,6 +218,8 @@ int main(int argc, char **argv) {
     else if (f == "--compressed") compressed = true;
     else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
+    else if (f == "--spill-type") spill_type = next();
+    else if (f == "--spill-path") spill_path = next();
     else if (f == "--help") {
       std::printf(
           "usage: %s [--blocks N] [--pages P] [--page-kb K] [--total-mb M]\n"
@@ -222,7 +231,9 @@ int main(int argc, char **argv) {
           "  --page-kb   page granularity (the codec's unit)\n"
           "  --total-mb  total data streamed\n"
           "  --zero-pct  %% of pages that are all-zero (compressible)\n"
-          "  --vram-mb   top-tier capacity: the 'VRAM' the data is sized against\n",
+          "  --vram-mb   top-tier capacity: the 'VRAM' the data is sized against\n"
+          "  --spill-type  tier below the top one: ram|file (default ram)\n"
+          "  --spill-path  backing file when --spill-type file\n",
           argv[0]);
       return 0;
     }
@@ -274,8 +285,14 @@ int main(int argc, char **argv) {
         << "        bdev_type: \"" << tier_type << "\"\n"
         << "        capacity_limit: \"" << vram_mb << "MB\"\n"
         << "        score: 1.0\n"
-        << "      - path: \"ram::gv_stream_spill\"\n"
-        << "        bdev_type: \"ram\"\n"
+        << "      - path: \""
+        << (std::string(spill_type) == "file"
+                ? (std::string(spill_path).empty()
+                       ? std::string("/tmp/gv_stream_spill.bin")
+                       : std::string(spill_path))
+                : std::string("ram::gv_stream_spill"))
+        << "\"\n"
+        << "        bdev_type: \"" << spill_type << "\"\n"
         << "        capacity_limit: \"" << spill_mb << "MB\"\n"
         << "        score: 0.2\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
