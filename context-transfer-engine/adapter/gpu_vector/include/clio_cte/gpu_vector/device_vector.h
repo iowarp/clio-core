@@ -185,10 +185,34 @@ class DeviceVector {
       // through to the locked path.
       p = nullptr;
       Page *tbl = BlockPages();
-      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-        if (tbl[i].page_num == pn && !tbl[i].fetching) {
-          p = &tbl[i];
-          break;
+      // Rotated scan: start at the LAST HIT slot and wrap. Worst case visits
+      // the same slots; the sequential-walk case hits on the first probe or
+      // two, because FetchPagesBatchedLocked claims first-free slots in order
+      // so consecutive pages sit in consecutive slots. Starting at 0 instead
+      // measured as a ~115 us floor on every launch (each warp's first hold
+      // scanning ~400 occupied slots), invariant to every inner-loop change
+      // because it runs before any of them.
+      const clio::run::u32 ppb = h_->pages_per_block_;
+      // DIRECT SLOT FIRST: pages are placed at pn % ppb when that slot is
+      // free (see the claim sites), so in the common case this is ONE probe.
+      // last_slot_ starts each launch at 0, so without this the first hold of
+      // every warp still walked to wherever the weight's pages sat.
+      {
+        const clio::run::u32 d = (clio::run::u32) (pn % ppb);
+        if (tbl[d].page_num == pn && !tbl[d].fetching) {
+          p = &tbl[d];
+          last_slot_ = d;
+        }
+      }
+      if (p == nullptr) {
+        for (clio::run::u32 k = 0; k < ppb; ++k) {
+          clio::run::u32 i = last_slot_ + k;
+          if (i >= ppb) i -= ppb;
+          if (tbl[i].page_num == pn && !tbl[i].fetching) {
+            p = &tbl[i];
+            last_slot_ = i;
+            break;
+          }
         }
       }
       if (p == nullptr) {
@@ -505,6 +529,18 @@ class DeviceVector {
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
   Page *last_page_ = nullptr;
+  /**
+   * Slot index where the lock-free scan STARTS: the last hit.
+   *
+   * The scan is O(pages_per_block) and residency sizing makes that large
+   * (816 slots, ~424 occupied). From slot 0 it measured as a ~115 us floor on
+   * every kernel launch -- each warp's first HoldPage walking ~400 slots --
+   * invariant to every inner-loop optimization because it precedes them.
+   * FetchPagesBatchedLocked claims first-free slots in order, so consecutive
+   * pages sit in consecutive slots and a scan starting at the last hit finds
+   * a sequential walk's next page in a probe or two.
+   */
+  clio::run::u32 last_slot_ = 0;
 
   /**
    * Take this block's page-table lock.
@@ -806,6 +842,13 @@ class DeviceVector {
         continue;
       }
       clio::run::u32 slot = h_->pages_per_block_;
+      // Direct slot first, same reasoning as ResolveLocked: placement is what
+      // makes the one-probe lookup possible.
+      {
+        const clio::run::u32 d = (clio::run::u32) (pg % h_->pages_per_block_);
+        if (tbl[d].page_num == kNoPage) slot = d;
+      }
+      if (slot == h_->pages_per_block_)
       for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         if (tbl[i].page_num == kNoPage) { slot = i; break; }
       }
@@ -1030,6 +1073,14 @@ class DeviceVector {
       Page *tbl = BlockPages();
       for (;;) {
         clio::run::u32 free_slot = h_->pages_per_block_;
+        // Prefer the DIRECT slot pn % ppb so lookups can find the page in one
+        // probe; any free slot is still correct, just slower to find later.
+        {
+          const clio::run::u32 d =
+              (clio::run::u32) (page_num % h_->pages_per_block_);
+          if (tbl[d].page_num == kNoPage) free_slot = d;
+        }
+        if (free_slot == h_->pages_per_block_)
         for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
           if (tbl[i].page_num == kNoPage) {
             free_slot = i;
