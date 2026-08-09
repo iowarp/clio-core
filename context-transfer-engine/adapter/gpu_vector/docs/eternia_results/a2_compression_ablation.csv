@@ -1,0 +1,5 @@
+dataset_gib,mode,store_s,km_runtime_s,stored_mib,ratio
+4,eternia,19.36,47.31,1200,3.41
+4,tier_only,18.26,41.26,4096,1.00
+9,eternia,44.32,105.77,2701,3.41
+9,tier_only,42.04,92.05,9216,1.00

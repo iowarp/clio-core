@@ -212,6 +212,73 @@ if(CLIO_CORE_ENABLE_CUDA)
         LABELS "gpu;cuda;cte;gpu_vector;compress;kmeans"
     )
 
+    # Real-data counterpart: k-means over a compressed SIFT1M dataset, checked
+    # against an uncompressed in-memory baseline (no synthetic ground truth).
+    add_cuda_executable(test_gpu_vector_kmeans_real FALSE
+        test_gpu_vector_kmeans_real_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_kmeans_real PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_kmeans_real_cuda COMMAND test_gpu_vector_kmeans_real
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_kmeans_real_cuda PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10592;CLIO_CTE_COMPRESS_LIB=cuszp"
+        TIMEOUT 600
+        LABELS "gpu;cuda;cte;gpu_vector;compress;kmeans;real"
+    )
+
+    # Capacity comparison: traditional in-core GPU k-means (whole dataset resident,
+    # OOMs past HBM) vs Eternia (compressed/tiered, streams a fixed window). Bench,
+    # not registered as a ctest (needs the SIFT dataset + a size env); build only.
+    add_cuda_executable(test_gpu_vector_kmeans_capacity FALSE
+        test_gpu_vector_kmeans_capacity_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_kmeans_capacity PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
     # Distributed compressed GPU vector: compress in HBM on one GPU node, store
     # compressed pages across a multi-node cte_core, read back + decompress.
     # Runs as a client under test/integration/distributed_slurm/run_slurm_gpu.

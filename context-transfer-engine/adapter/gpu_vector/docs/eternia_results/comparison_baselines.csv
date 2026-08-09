@@ -1,0 +1,15 @@
+technology,mode,dataset_gib,iters,km_total_s,km_per_iter_s,status,notes
+eternia,compress+tier+stream,3,3,33.23,11.08,runs,real SIFT; runs > HBM
+eternia,compress+tier+stream,6,3,66.45,22.15,runs,
+eternia,compress+tier+stream,9,3,100.04,33.35,runs,runs > HBM (8 GiB GPU)
+eternia,compress+tier+stream,12,3,131.30,43.77,runs,runs > HBM (8 GiB GPU)
+traditional,cudaMalloc-incore,3,3,8.98,2.99,runs,
+traditional,cudaMalloc-incore,6,3,17.86,5.95,runs,fastest where it fits
+traditional,cudaMalloc-incore,9,3,,,OOM,exceeds HBM
+traditional,cudaMalloc-incore,12,3,,,OOM,exceeds HBM
+uvm,cudaMallocManaged-oversub,3,1,649.20,649.20,runs,WSL2 host-resident ~200x slow; oversubscribes (10 GiB touch ok) but numbers NOT representative -> Delta
+nvshmem,symmetric-heap-1PE,1.5,2,8.42,4.21,runs,in-core (heap=HBM); real SIFT k-means OK
+nvshmem,symmetric-heap-1PE,3,2,,,capped,cudaIpcGetMemHandle OOM on WSL2 (~2-3 GiB IPC ceiling) -> Delta
+mpi_cuda_aware,gpu-pointer-2rank-1gpu,,,,,,blocked,segfault (WSL2 CUDA-IPC) -> Delta multi-GPU
+nccl,collectives-socket-artificial-nodes,,,,,,runs,2 ranks/1 GPU WORK on WSL2 via NCCL_MULTI_RANK_GPU_ENABLE=1 + socket transport (allreduce OK); artificial nodes share the one 8GB GPU -> no capacity gain; real N-GPU scaling needs multi-GPU/Delta
+bam,gpu-initiated-nvme,,,,,,infeasible,no /dev/nvme in container; needs bare-metal NVMe + driver -> Delta/bare-metal

@@ -1,0 +1,3 @@
+method,ms_per_checkpoint,bandwidth_gib_s,footprint_mib,location,ratio_vs_traditional
+traditional,2198.31,0.11,1024.0,disk,1.0
+eternia,448.18,0.56,140.1,hbm,7.3

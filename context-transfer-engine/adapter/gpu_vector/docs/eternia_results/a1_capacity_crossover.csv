@@ -1,0 +1,5 @@
+dataset_gib,traditional_status,traditional_runtime_s,eternia_store_s,eternia_km_runtime_s,eternia_stored_mib,eternia_ratio,eternia_peak_gpu_mib
+3,OK,9.52,13.49,33.23,900,3.41,4
+6,OK,17.95,26.57,66.45,1800,3.41,4
+9,OOM,,40.63,100.04,2701,3.41,4
+12,OOM,,53.54,131.30,3601,3.41,4

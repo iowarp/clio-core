@@ -36,6 +36,12 @@ void MemBdevTransport::Destroy() {
 void MemBdevTransport::FreeRamPage(RamPage &page) {
   if (page.data == nullptr) return;
 #if CTP_ENABLE_GPU
+  if (page.device) {
+    ctp::GpuApi::Free(page.data);
+    page.data = nullptr;
+    page.device = false;
+    return;
+  }
   if (page.pinned) {
     ctp::GpuApi::FreeHost(page.data);
     page.data = nullptr;
@@ -64,7 +70,19 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
   RamPage &page = ram_pages_[page_idx];
   if (page.data == nullptr) {
 #if CTP_ENABLE_GPU
-    if (bdev_type_ == BdevType::kPinned) {
+    if (bdev_type_ == BdevType::kHbm) {
+      // Real GPU High-Bandwidth Memory: the page lives in device memory
+      // (cudaMalloc), so the kHbm tier actually consumes GPU HBM (matching the
+      // BdevType enum contract). Writes/reads go through the async GPU copy path
+      // (see WriteBlocks/ReadBlocks) since host memcpy cannot touch it.
+      page.data = ctp::GpuApi::Malloc<char>(kRamPageSize);
+      if (page.data != nullptr) {
+        page.device = true;
+      }
+      // Malloc returns nullptr with no usable GPU backend (or if device memory
+      // is exhausted); fall through to the pageable host path so kHbm still
+      // functions (degraded to host) rather than failing outright.
+    } else if (bdev_type_ == BdevType::kPinned) {
       // Page-locked host memory keeps cudaMemcpyAsync/hipMemcpyAsync truly
       // asynchronous, so concurrent GPU transfers overlap instead of the
       // driver silently serializing them through a pageable staging copy.
@@ -79,6 +97,7 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
     if (page.data == nullptr) {
       page.data = new char[kRamPageSize];
       page.pinned = false;
+      page.device = false;
     }
   }
   return page.data;
@@ -175,14 +194,18 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
-  // Host source: a synchronous host->host memcpy is fastest and gains nothing
-  // from a GPU stream.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host source AND host backing: a synchronous host->host memcpy is fastest and
+  // gains nothing from a GPU stream. If the backing is device memory (kHbm), the
+  // async GPU path is REQUIRED even for a host source (host memcpy cannot write
+  // device memory) — cudaMemcpyDefault then does the H2D copy.
+  const bool backing_is_device = (bdev_type_ == BdevType::kHbm);
+  if (!ctp::IsDevicePointer(data_ptr.ptr_) && !backing_is_device) {
     WriteBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
 
-  // Device source: enqueue every chunk copy asynchronously on a per-task stream
+  // Device source or device backing: enqueue every chunk copy asynchronously on
+  // a per-task stream
   // and yield the worker while the transfers are in flight, so concurrent write
   // tasks overlap on the copy engines instead of each blocking a worker.
   void *stream = ctp::GpuApi::CreateStream();
@@ -301,14 +324,17 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
-  // Host destination: synchronous host<->host copy.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host destination AND host backing: synchronous host<->host copy. Device
+  // backing (kHbm) requires the async GPU path even for a host destination
+  // (host memcpy cannot read device memory) — cudaMemcpyDefault does D2H.
+  const bool backing_is_device = (bdev_type_ == BdevType::kHbm);
+  if (!ctp::IsDevicePointer(data_ptr.ptr_) && !backing_is_device) {
     ReadBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
 
-  // Device destination: enqueue async copies on a per-task stream and yield
-  // while they run.
+  // Device destination or device backing: enqueue async copies on a per-task
+  // stream and yield while they run.
   void *stream = ctp::GpuApi::CreateStream();
   clio::run::u64 bytes_read = 0;
   int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);

@@ -53,7 +53,8 @@ class MemBdevTransport : public BdevTransport {
   // allocator owns `data` so it is released through the matching free path.
   struct RamPage {
     char* data = nullptr;
-    bool pinned = false;
+    bool pinned = false;   // page-locked host memory (cudaMallocHost)
+    bool device = false;   // real GPU device memory (cudaMalloc) — kHbm tier
   };
 
   mutable std::mutex ram_pages_mu_;
