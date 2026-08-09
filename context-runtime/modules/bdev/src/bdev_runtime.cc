@@ -243,6 +243,25 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     CLIO_CO_RETURN;
   }
 
+  // Synthetic bandwidth cap, armed only from the environment. Matching on the
+  // pool name is what makes it useful: a tiering experiment needs the SPILL
+  // tier slowed down while the tier above it stays at full speed, and
+  // throttling everything would just scale the whole system down.
+  {
+    const char *mbps = clio::run::env::GetCompat("BDEV_THROTTLE_MBPS");
+    if (mbps != nullptr && *mbps != '\0') {
+      const char *match = clio::run::env::GetCompat("BDEV_THROTTLE_MATCH");
+      const std::string name = task->pool_name_.str();
+      if (match == nullptr || *match == '\0' ||
+          name.find(match) != std::string::npos) {
+        throttle_mbps_ = std::atof(mbps);
+        if (throttle_mbps_ > 0.0) {
+          HLOG(kInfo, "bdev '{}' throttled to {} MB/s", name, throttle_mbps_);
+        }
+      }
+    }
+  }
+
   // pool_name doubles as the file path (kFile) / S3 bucket (kS3); it lives on
   // the create task, not in CreateParams.
   if (!transport_->Init(params, task->pool_name_.str(), this)) {
@@ -350,6 +369,47 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/** Steady-clock microseconds, for the synthetic bandwidth cap. */
+double ThrottleNowUs() {
+  return std::chrono::duration<double, std::micro>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+/**
+ * Reserve this transfer's slice of the device's timeline, then wait for it.
+ *
+ * YIELDS rather than sleeps: this runs on a worker fiber, and blocking the
+ * thread would stall every other task on that worker -- turning a per-device
+ * cap into a global one and measuring the wrong thing entirely.
+ */
+clio::run::TaskResume Runtime::ThrottleFor(clio::run::u64 bytes) {
+  CLIO_TASK_BODY_BEGIN
+  const double want_us =
+      (static_cast<double>(bytes) / (throttle_mbps_ * 1024.0 * 1024.0)) * 1e6;
+  const double now = ThrottleNowUs();
+  // Claim [start, start + want_us) on the shared timeline. A device that is
+  // idle starts now; a busy one queues behind whatever is already booked.
+  double prev = throttle_next_free_us_.load(std::memory_order_relaxed);
+  double start;
+  do {
+    start = (prev > now) ? prev : now;
+  } while (!throttle_next_free_us_.compare_exchange_weak(
+      prev, start + want_us, std::memory_order_relaxed));
+  const double deadline = start + want_us;
+  // Yield in bounded slices so the wait stays responsive and one slow transfer
+  // cannot monopolize a fiber's scheduling slot.
+  for (;;) {
+    const double left = deadline - ThrottleNowUs();
+    if (left <= 0.0) break;
+    CLIO_CO_AWAIT(clio::run::yield((left > 500.0) ? 500.0 : left));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
@@ -363,6 +423,9 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_AWAIT(transport_->WriteBlocks(ctp::ipc::FullPtr<WriteTask>(task.get())));
     total_writes_.fetch_add(1);
     total_bytes_written_.fetch_add(task->bytes_written_);
+    if (throttle_mbps_ > 0.0) {
+      CLIO_CO_AWAIT(ThrottleFor(task->bytes_written_));
+    }
   } else {
     task->return_code_ = 1;
     task->bytes_written_ = 0;
@@ -385,6 +448,9 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     CLIO_CO_AWAIT(transport_->ReadBlocks(ctp::ipc::FullPtr<ReadTask>(task.get())));
     total_reads_.fetch_add(1);
     total_bytes_read_.fetch_add(task->bytes_read_);
+    if (throttle_mbps_ > 0.0) {
+      CLIO_CO_AWAIT(ThrottleFor(task->bytes_read_));
+    }
   } else {
     task->return_code_ = 1;
     task->bytes_read_ = 0;
