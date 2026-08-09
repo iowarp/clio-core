@@ -42,6 +42,7 @@
 #include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
+#include <nvcomp/version.h>
 #include <nvcomp/snappy.hpp>
 #include <nvcomp/zstd.hpp>
 
@@ -253,30 +254,46 @@ class NvComp : public Compressor {
     return d;
   }
 
-  /** Construct the nvcomp manager for the configured algorithm. */
+  /**
+   * Construct the nvcomp manager for the configured algorithm.
+   *
+   * nvcomp 5 renamed the option structs (nvcompBatchedXDefaultOpts ->
+   * nvcompBatchedXCompressDefaultOpts) AND inserted a decompress-options
+   * parameter ahead of the stream, so the 3-argument form silently becomes a
+   * type error rather than a deprecation. Both spellings are kept: the
+   * redistributable, the distro packages and CI images are not all on the same
+   * major, and a wrapper that only builds against whichever one happens to be
+   * installed here is not much of a wrapper.
+   */
+#if defined(NVCOMP_VER_MAJOR) && NVCOMP_VER_MAJOR >= 5
+#define CTP_NVCOMP_MAKE(Manager, Algo)                                    \
+  return std::make_shared<nvcomp::Manager>(                               \
+      kChunkSize, nvcompBatched##Algo##CompressDefaultOpts,               \
+      nvcompBatched##Algo##DecompressDefaultOpts, stream)
+#else
+#define CTP_NVCOMP_MAKE(Manager, Algo)                                    \
+  return std::make_shared<nvcomp::Manager>(                               \
+      kChunkSize, nvcompBatched##Algo##DefaultOpts, stream)
+#endif
+
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
     switch (algo_) {
       case NvCompAlgo::LZ4:
-        return std::make_shared<nvcomp::LZ4Manager>(
-            kChunkSize, nvcompBatchedLZ4DefaultOpts, stream);
+        CTP_NVCOMP_MAKE(LZ4Manager, LZ4);
       case NvCompAlgo::SNAPPY:
-        return std::make_shared<nvcomp::SnappyManager>(
-            kChunkSize, nvcompBatchedSnappyDefaultOpts, stream);
+        CTP_NVCOMP_MAKE(SnappyManager, Snappy);
       case NvCompAlgo::ZSTD:
-        return std::make_shared<nvcomp::ZstdManager>(
-            kChunkSize, nvcompBatchedZstdDefaultOpts, stream);
+        CTP_NVCOMP_MAKE(ZstdManager, Zstd);
       case NvCompAlgo::GDEFLATE:
-        return std::make_shared<nvcomp::GdeflateManager>(
-            kChunkSize, nvcompBatchedGdeflateDefaultOpts, stream);
+        CTP_NVCOMP_MAKE(GdeflateManager, Gdeflate);
       case NvCompAlgo::DEFLATE:
-        return std::make_shared<nvcomp::DeflateManager>(
-            kChunkSize, nvcompBatchedDeflateDefaultOpts, stream);
+        CTP_NVCOMP_MAKE(DeflateManager, Deflate);
       case NvCompAlgo::ANS:
-        return std::make_shared<nvcomp::ANSManager>(
-            kChunkSize, nvcompBatchedANSDefaultOpts, stream);
+        CTP_NVCOMP_MAKE(ANSManager, ANS);
     }
     return nullptr;
   }
+#undef CTP_NVCOMP_MAKE
 
   NvCompAlgo algo_;
 };
