@@ -1311,14 +1311,18 @@ class CodecCtxGuard {
 }  // namespace
 
 bool Runtime::InitCodecContext() {
-  // OPT-IN while the device-side codec path is still being brought up.
+  // OPT-IN, and it should stay that way until faults are batched.
   //
-  // The mechanism is proven -- a codec kernel in a second context runs while
-  // the faulting kernel spins, and cuMemcpyPeer returns the result -- but the
-  // in-module path still fails its first compress and then stalls, and a
-  // compressor that can hang the runtime is worse than one that is merely
-  // slower. Default OFF means GPU codecs take the CPU substitution, which is
-  // correct and live. Set CLIO_COMPRESS_GPU_CODEC=1 to work on the GPU path.
+  // This path is CORRECT -- verified end to end, same 1.43x ratio as the CPU
+  // codec -- and it is roughly 30x SLOWER: 0.04/0.03 GB/s against the CPU
+  // codec's 1.15/1.45 on the same 2 GB, 4x-oversubscribed run. That is about
+  // 8 ms per page, which is a driver context time-slice.
+  //
+  // The irony is exact: time-slicing between contexts is the only reason a GPU
+  // codec can run at all while the faulting kernel spins, and paying one
+  // time-slice per fault is what makes it lose. Nothing here is tuned badly;
+  // the unit of work is wrong. It becomes worthwhile only if many pages are
+  // decompressed per context switch, i.e. if the fault path batches.
   const char *opt_in = std::getenv("CLIO_COMPRESS_GPU_CODEC");
   if (opt_in == nullptr || opt_in[0] != '1') {
     return false;
@@ -1428,53 +1432,82 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
       return false;
     }
   }
-  // Copy engine, across contexts, straight into the caller's page.
-  return cuMemcpyPeer(reinterpret_cast<CUdeviceptr>(dst_device),
-                      static_cast<CUcontext>(primary_ctx_),
-                      reinterpret_cast<CUdeviceptr>(codec_out_),
-                      static_cast<CUcontext>(codec_ctx_),
-                      std::min(out, dst_bytes)) == CUDA_SUCCESS;
+  // Copy engine, across contexts, straight into the caller's page -- async on
+  // the codec stream so it never waits on the faulting context's spinning
+  // kernel (see the note in GpuCompressFromDevice).
+  {
+    CodecCtxGuard guard(codec_ctx_);
+    if (!guard.ok()) {
+      return false;
+    }
+    CUstream cs = static_cast<CUstream>(gpu_stream_);
+    CUresult r = cuMemcpyPeerAsync(
+        reinterpret_cast<CUdeviceptr>(dst_device),
+        static_cast<CUcontext>(primary_ctx_),
+        reinterpret_cast<CUdeviceptr>(codec_out_),
+        static_cast<CUcontext>(codec_ctx_), std::min(out, dst_bytes), cs);
+    if (r == CUDA_SUCCESS) r = cuStreamSynchronize(cs);
+    return r == CUDA_SUCCESS;
+  }
 }
 
 bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
                                     size_t size, char *out_host, size_t out_cap,
                                     size_t *out_size) {
+#define CTRACE(...) do { if (getenv("CLIO_CODEC_TRACE")) { \
+    fprintf(stderr, "[TRACE] " __VA_ARGS__); fflush(stderr);} } while (0)
   if (!HasCodecContext() || size > codec_buf_bytes_) {
+    CTRACE("comp: no ctx or too big (size=%zu cap=%zu)\n", size, codec_buf_bytes_);
     return false;
   }
   std::lock_guard<std::mutex> one_at_a_time(codec_mu_);
   size_t csize = codec_buf_bytes_;
   {
-    // Pull the page into the codec context with the copy engine, then compress
-    // there. Both stay on the device.
-    if (cuMemcpyPeer(reinterpret_cast<CUdeviceptr>(codec_in_),
-                     static_cast<CUcontext>(codec_ctx_),
-                     reinterpret_cast<CUdeviceptr>(const_cast<void *>(src_device)),
-                     static_cast<CUcontext>(primary_ctx_), size) != CUDA_SUCCESS) {
-      return false;
-    }
+    // ASYNC on the codec context's stream, then wait on THAT stream only.
+    // The synchronous cuMemcpyPeer waits for pending work in the source
+    // context -- which is the faulting context, whose kernel is spinning until
+    // this very call returns. It deadlocked exactly there.
     CodecCtxGuard guard(codec_ctx_);
-    if (!guard.ok()) {
+    if (!guard.ok()) { CTRACE("comp: ctx push failed\n"); return false; }
+    CUstream cs = static_cast<CUstream>(gpu_stream_);
+    CUresult r = cuMemcpyPeerAsync(
+        reinterpret_cast<CUdeviceptr>(codec_in_),
+        static_cast<CUcontext>(codec_ctx_),
+        reinterpret_cast<CUdeviceptr>(const_cast<void *>(src_device)),
+        static_cast<CUcontext>(primary_ctx_), size, cs);
+    if (r == CUDA_SUCCESS) r = cuStreamSynchronize(cs);
+    if (r != CUDA_SUCCESS) {
+      const char *e = nullptr; cuGetErrorString(r, &e);
+      CTRACE("comp: cuMemcpyPeerAsync in FAILED: %s\n", e ? e : "?");
       return false;
     }
     auto codec = ctp::CompressionFactory::GetPreset(
         ctp::CompressionFactory::NameForWireId(wire_id),
         ctp::CompressionPreset::BALANCED);
-    if (!codec || !codec->Compress(codec_out_, csize,
-                                   const_cast<void *>(codec_in_), size)) {
+    if (!codec) { CTRACE("comp: no codec for wire %d\n", wire_id); return false; }
+    if (!codec->Compress(codec_out_, csize, const_cast<void *>(codec_in_),
+                         size)) {
+      CTRACE("comp: codec->Compress returned false\n");
       return false;
     }
     if (csize > out_cap) {
+      CTRACE("comp: csize %zu > out_cap %zu\n", csize, out_cap);
       return false;
     }
-    if (cuMemcpyDtoH(out_host, reinterpret_cast<CUdeviceptr>(codec_out_),
-                     csize) != CUDA_SUCCESS) {
+    CUresult r2 = cuMemcpyDtoH(out_host,
+                               reinterpret_cast<CUdeviceptr>(codec_out_), csize);
+    if (r2 != CUDA_SUCCESS) {
+      const char *e = nullptr; cuGetErrorString(r2, &e);
+      CTRACE("comp: cuMemcpyDtoH FAILED: %s\n", e ? e : "?");
       return false;
     }
   }
   *out_size = csize;
+  CTRACE("comp: OK csize=%zu\n", csize);
   return true;
+#undef CTRACE
 }
+
 #endif  // CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
 
 char *Runtime::AcquireGpuScratch(size_t bytes) {
