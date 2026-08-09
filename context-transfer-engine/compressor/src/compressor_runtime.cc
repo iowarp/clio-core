@@ -52,6 +52,10 @@
 #include "clio_runtime/worker.h"
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/util/gpu_api.h"
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
 
@@ -124,12 +128,28 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // precisely the ones suspended waiting for the compress or decompress being
   // set up. Creating it at Create time is also simply where it belongs: stream
   // creation is expensive and its cost has nothing to do with any one blob.
-#if CTP_ENABLE_GPU
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+  // A GPU codec also needs its OWN CUDA context (see the header): it cannot run
+  // in the context whose kernel is spinning on the fault. InitCodecContext
+  // creates that context, its buffers, and the stream INSIDE it.
+  if (codec_ctx_ == nullptr) {
+    const bool _ok = InitCodecContext();
+    if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] InitCodecContext -> %d\n", (int)_ok);
+    if (_ok) {
+      HLOG(kInfo,
+           "compressor: GPU codec context ready ({} MB device buffers)",
+           codec_buf_bytes_ >> 20);
+    } else {
+      DestroyCodecContext();
+      HLOG(kWarning,
+           "compressor: GPU codec context unavailable; GPU codecs fall back "
+           "to their CPU equivalent");
+    }
+  }
+#elif CTP_ENABLE_GPU
   if (gpu_stream_ == nullptr) {
     gpu_stream_ = ctp::GpuApi::CreateStream();
     ctp::CompressionFactory::SetGpuStream(gpu_stream_);
-    HLOG(kInfo, "compressor: GPU codec stream created ({})",
-         gpu_stream_ != nullptr ? "ok" : "unavailable, using default stream");
   }
 #endif
 
@@ -1269,6 +1289,194 @@ clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumers
 // shared with the replication chimod; only the transform policy lives here.
 // ============================================================================
 
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+namespace {
+/** Make the codec context current for a scope, then restore the caller's. */
+class CodecCtxGuard {
+ public:
+  explicit CodecCtxGuard(void *ctx) : ok_(false) {
+    ok_ = (cuCtxPushCurrent(static_cast<CUcontext>(ctx)) == CUDA_SUCCESS);
+  }
+  ~CodecCtxGuard() {
+    if (ok_) {
+      CUcontext popped = nullptr;
+      cuCtxPopCurrent(&popped);
+    }
+  }
+  bool ok() const { return ok_; }
+
+ private:
+  bool ok_;
+};
+}  // namespace
+
+bool Runtime::InitCodecContext() {
+  // OPT-IN while the device-side codec path is still being brought up.
+  //
+  // The mechanism is proven -- a codec kernel in a second context runs while
+  // the faulting kernel spins, and cuMemcpyPeer returns the result -- but the
+  // in-module path still fails its first compress and then stalls, and a
+  // compressor that can hang the runtime is worse than one that is merely
+  // slower. Default OFF means GPU codecs take the CPU substitution, which is
+  // correct and live. Set CLIO_COMPRESS_GPU_CODEC=1 to work on the GPU path.
+  const char *opt_in = std::getenv("CLIO_COMPRESS_GPU_CODEC");
+  if (opt_in == nullptr || opt_in[0] != '1') {
+    return false;
+  }
+  if (cuInit(0) != CUDA_SUCCESS) {
+    return false;
+  }
+  CUdevice dev;
+  if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) {
+    return false;
+  }
+  // Remember whichever context the faulting side uses; peer copies name it
+  // explicitly. cudaFree(0) forces the runtime's primary context to exist so
+  // there is something to record.
+  cudaFree(nullptr);
+  CUcontext primary = nullptr;
+  if (cuCtxGetCurrent(&primary) != CUDA_SUCCESS || primary == nullptr) {
+    if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS) {
+      return false;
+    }
+  }
+  primary_ctx_ = primary;
+
+  CUcontext ctx = nullptr;
+  if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS) {
+    return false;
+  }
+  // cuCtxCreate leaves the new context CURRENT. Everything after Create runs
+  // on the faulting side, so put its context back immediately.
+  CUcontext popped = nullptr;
+  cuCtxPopCurrent(&popped);
+  codec_ctx_ = ctx;
+
+  size_t buf = 8ULL << 20;
+  if (const char *e = std::getenv("CLIO_COMPRESS_GPU_BUF_MB")) {
+    const long mb = std::atol(e);
+    if (mb > 0) buf = static_cast<size_t>(mb) << 20;
+  }
+  CodecCtxGuard guard(codec_ctx_);
+  if (!guard.ok()) {
+    return false;
+  }
+  CUdeviceptr din = 0, dout = 0;
+  if (cuMemAlloc(&din, buf) != CUDA_SUCCESS ||
+      cuMemAlloc(&dout, buf) != CUDA_SUCCESS) {
+    return false;
+  }
+  codec_in_ = reinterpret_cast<void *>(din);
+  codec_out_ = reinterpret_cast<void *>(dout);
+  codec_buf_bytes_ = buf;
+  // The codec's stream must belong to the codec context.
+  gpu_stream_ = ctp::GpuApi::CreateStream();
+  ctp::CompressionFactory::SetGpuStream(gpu_stream_);
+  return true;
+}
+
+void Runtime::DestroyCodecContext() {
+  if (codec_ctx_ == nullptr) {
+    return;
+  }
+  {
+    CodecCtxGuard guard(codec_ctx_);
+    if (guard.ok()) {
+      if (codec_in_) cuMemFree(reinterpret_cast<CUdeviceptr>(codec_in_));
+      if (codec_out_) cuMemFree(reinterpret_cast<CUdeviceptr>(codec_out_));
+    }
+  }
+  cuCtxDestroy(static_cast<CUcontext>(codec_ctx_));
+  codec_ctx_ = nullptr;
+  codec_in_ = codec_out_ = nullptr;
+  codec_buf_bytes_ = 0;
+}
+
+bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
+                                    void *dst_device, size_t dst_bytes) {
+  if (!HasCodecContext() || stored_size > codec_buf_bytes_ ||
+      dst_bytes > codec_buf_bytes_) {
+    return false;
+  }
+  const size_t hdr = sizeof(CompressionHeader);
+  if (stored_size <= hdr) {
+    return false;
+  }
+  const auto *header = reinterpret_cast<const CompressionHeader *>(stored_host);
+  if (!header->IsValid() || !IsGpuCodec(header->compress_lib_)) {
+    return false;
+  }
+  const size_t payload = (header->compressed_size_ != 0)
+                             ? static_cast<size_t>(header->compressed_size_)
+                             : (stored_size - hdr);
+  std::lock_guard<std::mutex> one_at_a_time(codec_mu_);
+  size_t out = dst_bytes;
+  {
+    CodecCtxGuard guard(codec_ctx_);
+    if (!guard.ok()) {
+      return false;
+    }
+    // Only the COMPRESSED bytes cross the bus; the page itself never does.
+    if (cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(codec_in_),
+                     stored_host + hdr, payload) != CUDA_SUCCESS) {
+      return false;
+    }
+    auto codec = ctp::CompressionFactory::GetPreset(
+        ctp::CompressionFactory::NameForWireId(header->compress_lib_),
+        ctp::CompressionPreset::BALANCED);
+    if (!codec || !codec->Decompress(codec_out_, out, codec_in_, payload)) {
+      return false;
+    }
+  }
+  // Copy engine, across contexts, straight into the caller's page.
+  return cuMemcpyPeer(reinterpret_cast<CUdeviceptr>(dst_device),
+                      static_cast<CUcontext>(primary_ctx_),
+                      reinterpret_cast<CUdeviceptr>(codec_out_),
+                      static_cast<CUcontext>(codec_ctx_),
+                      std::min(out, dst_bytes)) == CUDA_SUCCESS;
+}
+
+bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
+                                    size_t size, char *out_host, size_t out_cap,
+                                    size_t *out_size) {
+  if (!HasCodecContext() || size > codec_buf_bytes_) {
+    return false;
+  }
+  std::lock_guard<std::mutex> one_at_a_time(codec_mu_);
+  size_t csize = codec_buf_bytes_;
+  {
+    // Pull the page into the codec context with the copy engine, then compress
+    // there. Both stay on the device.
+    if (cuMemcpyPeer(reinterpret_cast<CUdeviceptr>(codec_in_),
+                     static_cast<CUcontext>(codec_ctx_),
+                     reinterpret_cast<CUdeviceptr>(const_cast<void *>(src_device)),
+                     static_cast<CUcontext>(primary_ctx_), size) != CUDA_SUCCESS) {
+      return false;
+    }
+    CodecCtxGuard guard(codec_ctx_);
+    if (!guard.ok()) {
+      return false;
+    }
+    auto codec = ctp::CompressionFactory::GetPreset(
+        ctp::CompressionFactory::NameForWireId(wire_id),
+        ctp::CompressionPreset::BALANCED);
+    if (!codec || !codec->Compress(codec_out_, csize,
+                                   const_cast<void *>(codec_in_), size)) {
+      return false;
+    }
+    if (csize > out_cap) {
+      return false;
+    }
+    if (cuMemcpyDtoH(out_host, reinterpret_cast<CUdeviceptr>(codec_out_),
+                     csize) != CUDA_SUCCESS) {
+      return false;
+    }
+  }
+  *out_size = csize;
+  return true;
+}
+#endif  // CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+
 char *Runtime::AcquireGpuScratch(size_t bytes) {
   std::lock_guard<std::mutex> guard(gpu_scratch_mu_);
   if (bytes > gpu_scratch_slab_ || gpu_scratch_free_.empty()) {
@@ -1501,6 +1709,47 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
     // work for a paging consumer needs decompression that does not contend
     // with the consumer kernel -- either driven off the fault path entirely,
     // or performed device-side inside the consumer itself.
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+    if (IsGpuCodec(ctx.compress_lib_) && HasCodecContext() &&
+        ctp::IsDevicePointer(src_full.ptr_)) {
+      const size_t sz = static_cast<size_t>(task->size_);
+      const size_t bound = sz + (sz / 20) + 1024;
+      const size_t hdr_sz = sizeof(CompressionHeader);
+      auto shm = CLIO_IPC->AllocateBuffer(hdr_sz + bound);
+      size_t csize = 0;
+      const bool _gc = !shm.IsNull() &&
+          GpuCompressFromDevice(ctx.compress_lib_, src_full.ptr_, sz,
+                                shm.ptr_ + hdr_sz, bound, &csize);
+      if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_comp ok=%d csize=%zu sz=%zu\n", (int)_gc, csize, sz);
+      if (_gc && csize + hdr_sz < sz) {
+        CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_,
+                                 task->size_, csize);
+        std::memcpy(shm.ptr_, &header, hdr_sz);
+        ctx.actual_original_size_ = task->size_;
+        ctx.actual_compressed_size_ = csize + hdr_sz;
+        ctx.actual_compression_ratio_ =
+            static_cast<double>(sz) / static_cast<double>(csize + hdr_sz);
+        ctx.transform_flags_ |= clio::cte::core::kBlobTransformed |
+                                clio::cte::core::kBlobTransformCompressed;
+        if (!core_client_) {
+          core_client_ =
+              std::make_unique<clio::cte::core::Client>(CorePoolId());
+        }
+        auto put = core_client_->AsyncPutBlob(
+            task->tag_id_, task->blob_name_.str(), 0, csize + hdr_sz,
+            shm.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
+            clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(put);
+        task->context_ = put->context_;
+        task->return_code_ = put->GetReturnCode();
+        CLIO_IPC->FreeBuffer(shm);
+        CLIO_CO_RETURN;
+      }
+      if (!shm.IsNull()) {
+        CLIO_IPC->FreeBuffer(shm);
+      }
+    }
+#endif
     if (IsGpuCodec(ctx.compress_lib_)) {
       const int cpu_lib = CpuEquivalentCodec(ctx.compress_lib_);
       static std::once_flag warned;
@@ -1639,6 +1888,24 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
 
     const size_t hdr = sizeof(CompressionHeader);
     auto *header = reinterpret_cast<CompressionHeader *>(buf.ptr_);
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+    // GPU codec: decompress in the codec context and peer-copy into the page.
+    // Only the compressed bytes crossed the bus to get here; the page itself
+    // never leaves the device.
+    {
+      auto dst_dev =
+          CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      const bool _dev = dst_dev.ptr_ != nullptr && ctp::IsDevicePointer(dst_dev.ptr_);
+      const bool _gd = _dev && GpuDecompressToDevice(buf.ptr_, stored_size, dst_dev.ptr_,
+                                static_cast<size_t>(task->size_));
+      if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_decomp dev=%d ok=%d stored=%zu\n", (int)_dev, (int)_gd, (size_t)stored_size);
+      if (_gd) {
+        CLIO_IPC->FreeBuffer(buf);
+        task->return_code_ = 0;
+        CLIO_CO_RETURN;
+      }
+    }
+#endif
     if (stored_size > hdr && header->IsValid()) {
       std::string library_name =
           ctp::CompressionFactory::NameForWireId(header->compress_lib_);

@@ -329,6 +329,54 @@ private:
   void ReleaseGpuScratch(char *ptr);
   /** @return true if `wire_id` names a codec that runs on the GPU. */
   static bool IsGpuCodec(int wire_id);
+
+  /**
+   * A DEDICATED CUDA context for GPU codecs, and the device buffers they use.
+   *
+   * A GPU codec cannot run in the context that raised the page fault. An
+   * indefinitely-resident kernel blocks every kernel launched after it in the
+   * same context -- measured with a standalone reproducer: a 1-block marker
+   * kernel launched behind a spinner never executed at all, while the same
+   * marker behind a FINITE long kernel overlapped at full speed. The gpu_vector
+   * consumer spins until its fault completes, so nvcomp's kernels never ran and
+   * the fault never returned.
+   *
+   * Contexts, unlike kernels within a context, ARE time-sliced by the driver.
+   * A codec kernel in a second context runs while the consumer spins (measured:
+   * 100 ms), and cuMemcpyPeer bridges the result back into the faulting
+   * context's page -- a copy-engine operation, and copy engines were never the
+   * thing being blocked (which is why the raw path always worked).
+   *
+   * Created ONCE here, at module creation. cuCtxCreate and cuCtxDestroy both
+   * synchronize, so doing either while a kernel spins is its own deadlock.
+   */
+  void *codec_ctx_ = nullptr;    // CUcontext, owned
+  void *primary_ctx_ = nullptr;  // CUcontext of the faulting side, not owned
+  void *codec_in_ = nullptr;     // CUdeviceptr, in codec_ctx_
+  void *codec_out_ = nullptr;    // CUdeviceptr, in codec_ctx_
+  size_t codec_buf_bytes_ = 0;
+  std::mutex codec_mu_;          // one codec operation at a time
+
+  /** Build codec_ctx_ + its buffers. Best effort; false leaves GPU codecs off. */
+  bool InitCodecContext();
+  /** Tear the codec context down. Must not run while a kernel is resident. */
+  void DestroyCodecContext();
+  /** @return true if the GPU codec path is usable. */
+  bool HasCodecContext() const { return codec_ctx_ != nullptr; }
+
+  /**
+   * Decompress a stored blob into `dst_device` using a GPU codec, entirely on
+   * the device. Returns false if the GPU path is unavailable or fails, in
+   * which case the caller must use the host path.
+   */
+  bool GpuDecompressToDevice(const char *stored_host, size_t stored_size,
+                             void *dst_device, size_t dst_bytes);
+  /**
+   * Compress `src_device` with a GPU codec. On success fills `out_host` (which
+   * must hold at least the codec's bound) and sets *out_size.
+   */
+  bool GpuCompressFromDevice(int wire_id, const void *src_device, size_t size,
+                             char *out_host, size_t out_cap, size_t *out_size);
   /** @return the CPU codec of the same family as a GPU codec, or 0 if none.
    *  Used on the device page-fault path, where a GPU codec cannot run. */
   static int CpuEquivalentCodec(int gpu_wire_id);
