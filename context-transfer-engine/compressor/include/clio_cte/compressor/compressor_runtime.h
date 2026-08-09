@@ -88,7 +88,18 @@ public:
   using CreateParams = CompressorConfig; // Required for CLIO_TASK_CC (defined in compressor_tasks.h)
 
   Runtime() = default;
-  ~Runtime() override = default;
+  /**
+   * Stops the codec drainer thread.
+   *
+   * std::thread's destructor calls std::terminate if the thread is still
+   * joinable, and DestroyCodecContext -- the only place that joined it -- is
+   * reachable only from Create's failure path, never at shutdown. So a run
+   * that had used batched decompression aborted on teardown with "terminate
+   * called without an active exception". Only the thread is stopped here; the
+   * CUDA teardown stays in DestroyCodecContext, where the context is known to
+   * still be valid.
+   */
+  ~Runtime() override;
 
 
   /**

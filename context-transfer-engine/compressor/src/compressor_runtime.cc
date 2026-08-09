@@ -64,7 +64,15 @@ namespace clio::cte::compressor {
 /** Waiter poll interval and cap for the batched GPU decompress path. 20us x
  *  5000 = 100 ms: far longer than a batch needs, far shorter than a hang. */
 static constexpr double kDecompWaitPollUs = 20.0;
-static constexpr int kDecompWaitMaxSpins = 5000;
+/**
+ * The wait must cover QUEUEING, not just one batch.
+ *
+ * A request that arrives just after a batch starts waits for that batch, then
+ * the linger, then its own batch -- with 50-70 ms batches that is ~140 ms, and
+ * a 100 ms budget timed out reliably. The bound exists only so a wedged
+ * drainer cannot hang a worker forever, so it should be generous: 2 s.
+ */
+static constexpr int kDecompWaitMaxSpins = 100000;
 
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
@@ -1555,6 +1563,13 @@ void Runtime::ReleaseCodecSlot(size_t idx) {
   codec_free_.push_back(idx);
 }
 
+Runtime::~Runtime() {
+  batch_stop_.store(true, std::memory_order_release);
+  if (batch_thread_.joinable()) {
+    batch_thread_.join();
+  }
+}
+
 void Runtime::DestroyCodecContext() {
   if (codec_ctx_ == nullptr) {
     return;
@@ -2171,6 +2186,22 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       }
     }
 #endif
+    if (stored_size > hdr && header->IsValid() &&
+        IsGpuCodec(header->compress_lib_)) {
+      // A GPU codec must NEVER run here. This is the faulting context, whose
+      // kernel is spinning until this returns, so a codec that needs the device
+      // waits on a kernel that is waiting on it. Reaching this point means the
+      // batched path could not serve the page, and there is no CPU fallback --
+      // an nvcomp bitstream is not a CPU-lz4 bitstream. Fail the read loudly
+      // rather than deadlock the runtime.
+      HLOG(kError,
+           "compressor: GPU-compressed blob '{}' could not be served by the "
+           "codec context; failing the read rather than deadlocking",
+           task->blob_name_.str());
+      task->return_code_ = 6;
+      CLIO_IPC->FreeBuffer(buf);
+      CLIO_CO_RETURN;
+    }
     if (stored_size > hdr && header->IsValid()) {
       std::string library_name =
           ctp::CompressionFactory::NameForWireId(header->compress_lib_);
