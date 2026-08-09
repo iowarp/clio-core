@@ -397,7 +397,7 @@ double ThrottleNowUs() {
  * and one line per operation would itself perturb what is being measured.
  */
 void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
-  static constexpr clio::run::u64 kIoTracePeriod = 512;
+  static constexpr clio::run::u64 kIoTracePeriod = 64;
   clio::run::u64 n;
   if (is_write) {
     trace_w_bytes_.fetch_add(bytes);
