@@ -44,7 +44,7 @@ extern "C" int clio_direct_read(unsigned long long pool_id,
 // gpu_vector can resolve page blobs to (pool, target offset) at init.
 extern "C" void clio_cte_locate_register(
     int (*fn)(void *, const void *, const char *, unsigned long long *,
-              unsigned long long *),
+              unsigned long long *, unsigned long long *),
     void *ctx);
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_cte/core/core_config.h>
@@ -513,7 +513,8 @@ namespace {
 // FIRST block's (pool, target offset) — page blobs are single-block.
 int CteLocateTrampoline(void *ctx, const void *tag_id_p, const char *name,
                         unsigned long long *pool_u64,
-                        unsigned long long *target_off) {
+                        unsigned long long *target_off,
+                        unsigned long long *stored_size) {
   auto *rt = static_cast<Runtime *>(ctx);
   const auto *tag_id = static_cast<const TagId *>(tag_id_p);
   const std::string key = std::to_string(tag_id->major_) + "." +
@@ -522,6 +523,8 @@ int CteLocateTrampoline(void *ctx, const void *tag_id_p, const char *name,
   if (!bi || bi->blocks_.empty()) return -1;
   *pool_u64 = bi->blocks_[0].bdev_client_.pool_id_.ToU64();
   *target_off = bi->blocks_[0].target_offset_;
+  // STORED size (post-codec): what an in-kernel decompressor must read.
+  *stored_size = bi->blocks_[0].size_;
   return 0;
 }
 }  // namespace

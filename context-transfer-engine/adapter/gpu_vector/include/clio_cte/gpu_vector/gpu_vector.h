@@ -31,7 +31,8 @@
 
 extern "C" int clio_cte_locate(const void *tag_id, const char *name,
                                unsigned long long *pool_u64,
-                               unsigned long long *target_off);
+                               unsigned long long *target_off,
+                               unsigned long long *stored_size);
 extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
 
 namespace clio::cte::gpu_vector {
@@ -238,32 +239,41 @@ class Vector {
     const clio::run::u64 npages =
         (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
     if (npages == 0) return;
-    unsigned long long pool = 0, toff = 0;
-    if (clio_cte_locate(&tag_id_, "p0", &pool, &toff) != 0) return;
+    unsigned long long pool = 0, toff = 0, ssz = 0;
+    if (clio_cte_locate(&tag_id_, "p0", &pool, &toff, &ssz) != 0) return;
     char *base = clio_direct_dev_base(pool);
     if (base == nullptr) return;   // not a device tier
     std::vector<unsigned long long> offs(npages, ~0ull);
+    std::vector<unsigned long long> csz(npages, 0);
     clio::run::u64 mapped = 0;
     for (clio::run::u64 pg = 0; pg < npages; ++pg) {
       char name[32];
       PageBlobName(pg, name);
-      unsigned long long p2 = 0, o2 = 0;
-      if (clio_cte_locate(&tag_id_, name, &p2, &o2) == 0 && p2 == pool) {
+      unsigned long long p2 = 0, o2 = 0, s2 = 0;
+      if (clio_cte_locate(&tag_id_, name, &p2, &o2, &s2) == 0 && p2 == pool) {
         offs[pg] = o2;
+        csz[pg] = s2;
         ++mapped;
       }
     }
     void *dev_offs = nullptr;
+    void *dev_csz = nullptr;
     if (cudaMalloc(&dev_offs, npages * sizeof(unsigned long long)) !=
-        cudaSuccess) {
+            cudaSuccess ||
+        cudaMalloc(&dev_csz, npages * sizeof(unsigned long long)) !=
+            cudaSuccess) {
       return;
     }
     cudaMemcpy(dev_offs, offs.data(), npages * sizeof(unsigned long long),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_csz, csz.data(), npages * sizeof(unsigned long long),
                cudaMemcpyHostToDevice);
     for (auto &kv : devs_) {
       kv.second.hdr.tier_base_ = base;
       kv.second.hdr.tier_off_ =
           static_cast<const unsigned long long *>(dev_offs);
+      kv.second.hdr.tier_csize_ =
+          static_cast<const unsigned long long *>(dev_csz);
       PublishHeader(kv.second);
     }
     fully_device_mapped_ = (mapped == npages);

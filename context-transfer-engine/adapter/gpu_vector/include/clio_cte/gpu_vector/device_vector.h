@@ -140,6 +140,9 @@ struct VecHeader {
   // tier_off_[p] == ~0ull means page p is not device-resident.
   char *tier_base_ = nullptr;
   const unsigned long long *tier_off_ = nullptr;
+  /** Stored (post-codec) size per page — the input length for an in-kernel
+   *  decompressor when the tier holds COMPRESSED pages. */
+  const unsigned long long *tier_csize_ = nullptr;
 
 };
 
