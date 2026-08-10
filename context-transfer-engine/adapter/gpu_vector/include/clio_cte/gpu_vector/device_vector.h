@@ -980,17 +980,29 @@ class DeviceVector {
   }
 
   /** FetchPagesBatched's body, for callers already holding the block lock. */
-  /**
-   * The table's dedicated ASYNC batch slot: the LAST of its multi_per_block_
-   * MultiBatch entries. The synchronous batch path only ever uses mb[0], so
-   * giving async its own slot means a gate fault never waits behind a
-   * sibling prefetch that happens to target the same table.
-   */
-  CTP_GPU_FUN MultiBatch *AsyncBatchSlot() const {
-    return &BlockBatches()[h_->multi_per_block_ - 1];
+  /** Async batch slots: the LAST kAsyncBatchSlots of the table's
+   *  multi_per_block_ MultiBatch entries. The synchronous batch path only
+   *  ever uses mb[0], so async batches never make a gate fault wait behind
+   *  a sibling prefetch on the same table; several slots because one layer's
+   *  prefetch wave overlapping the previous layer's on a shared table was
+   *  otherwise a dropped hint (= a sync fault two launches later). */
+  // Measured: 3 beats 1 (dropped hints become sync faults) and beats 6
+  // (more outstanding claims churned the eviction window; one K=6 run hit
+  // 107 ms/tok vs the 75 baseline).
+  static constexpr clio::run::u32 kAsyncBatchSlots = 3;
+
+  CTP_GPU_FUN clio::run::u32 AsyncSlotCount() const {
+    const clio::run::u32 mpb = h_->multi_per_block_;
+    if (mpb < 2) return 0;
+    const clio::run::u32 avail = mpb - 1;  // mb[0] is the sync slot
+    return avail < kAsyncBatchSlots ? avail : kAsyncBatchSlots;
   }
 
-  /** Non-blocking completion probe of the table's async batch future. */
+  CTP_GPU_FUN MultiBatch *AsyncBatchSlot(clio::run::u32 k) const {
+    return &BlockBatches()[h_->multi_per_block_ - 1 - k];
+  }
+
+  /** Non-blocking completion probe of an async batch future. */
   CTP_GPU_FUN bool MultiGetDone(MultiBatch *mb) {
     if (mb->get_fut.IsNull()) return true;
     volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
@@ -998,14 +1010,9 @@ class DeviceVector {
     return ((*fp) & 1u) != 0u;
   }
 
-  /**
-   * Complete this table's outstanding async batch, if any: wait for the
-   * multi, clear the fetching=2 marks, free slots whose record failed.
-   * Caller must hold the block lock.
-   */
-  CTP_GPU_FUN void SettleBatchLocked() {
-    if (h_->multi_ == nullptr || h_->multi_per_block_ < 2) return;
-    MultiBatch *mb = AsyncBatchSlot();
+  /** Settle ONE async slot: wait for the multi, clear the fetching=2 marks,
+   *  free slots whose record failed. Caller must hold the block lock. */
+  CTP_GPU_FUN void SettleOneLocked(MultiBatch *mb) {
     if (mb->async_pending == 0u) return;
     mb->get_fut.Wait();
     auto *t = mb->get;
@@ -1023,20 +1030,44 @@ class DeviceVector {
     mb->async_pending = 0u;
   }
 
+  /**
+   * Complete every outstanding async batch on this table. A fetching=2 page
+   * does not record WHICH batch fetched it, so a toucher settles them all —
+   * by touch time they are almost always complete anyway.
+   * Caller must hold the block lock.
+   */
+  CTP_GPU_FUN void SettleBatchLocked() {
+    if (h_->multi_ == nullptr) return;
+    const clio::run::u32 cnt = AsyncSlotCount();
+    for (clio::run::u32 k = 0; k < cnt; ++k) SettleOneLocked(AsyncBatchSlot(k));
+  }
+
   /** Async batched fetch body; see FetchPagesBatchedAsync. Lock held. */
   CTP_GPU_FUN clio::run::u32 FetchPagesBatchedAsyncLocked(
       clio::run::u64 first_page, clio::run::u32 n) {
-    // Needs a slot of its own (see AsyncBatchSlot); with only one per table
+    // Needs slots of its own (see AsyncBatchSlot); with only mb[0] available
     // async fetching would contend with the synchronous path, so disable it.
-    if (h_->multi_ == nullptr || h_->multi_per_block_ < 2) return 0;
-    MultiBatch *mb = AsyncBatchSlot();
-    if (mb->async_pending != 0u) {
-      // A batch is already in flight on this table. Settle it if it is done;
-      // otherwise drop the hint — a prefetch that stacks behind another
-      // prefetch would serialize the callers, which is the exact failure the
-      // async form exists to avoid.
-      if (!MultiGetDone(mb)) return 0;
-      SettleBatchLocked();
+    if (h_->multi_ == nullptr) return 0;
+    const clio::run::u32 cnt = AsyncSlotCount();
+    if (cnt == 0) return 0;
+    MultiBatch *mb = nullptr;
+    for (clio::run::u32 k = 0; k < cnt; ++k) {
+      MultiBatch *cand = AsyncBatchSlot(k);
+      if (cand->async_pending == 0u) {
+        mb = cand;
+        break;
+      }
+      if (MultiGetDone(cand)) {
+        SettleOneLocked(cand);
+        mb = cand;
+        break;
+      }
+    }
+    if (mb == nullptr) {
+      // Every slot carries an unfinished batch. Drop the hint, never queue —
+      // stacked prefetches serialize their callers, which is the exact
+      // failure the async form exists to avoid.
+      return 0;
     }
     if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
     if (n > h_->pages_per_block_) n = h_->pages_per_block_;
