@@ -209,8 +209,20 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     // are per device-task-slot and long-lived, so the pinning cost is paid
     // once per slot, not per task.
 #if CTP_ENABLE_CUDA
+    // CLIO_GPU2CPU_PAGEABLE_SCRATCH: skip cudaHostAlloc for slot scratch.
+    // cudaHostAlloc takes the CUDA context WRITE lock, and this allocation
+    // happens on the fault-service path -- while a faulting kernel is
+    // resident and the client thread may hold the read lock inside a stream
+    // synchronize. That is the session's recurring deadlock triangle (see
+    // the cudaFree and lazy-module-load incidents). Under workloads that
+    // keep discovering new task slots mid-decode (MoE batch slots), the
+    // allocation must not require the context lock; pageable scratch makes
+    // DeviceAwareMemcpy internally staged (slower) but cannot deadlock.
+    static const bool pageable_scratch =
+        std::getenv("CLIO_GPU2CPU_PAGEABLE_SCRATCH") != nullptr;
     void *pinned = nullptr;
-    if (cudaHostAlloc(&pinned, kTaskScratchBytes, cudaHostAllocDefault) ==
+    if (!pageable_scratch &&
+        cudaHostAlloc(&pinned, kTaskScratchBytes, cudaHostAllocDefault) ==
         cudaSuccess) {
       slot_buf = static_cast<char *>(pinned);
     } else {
