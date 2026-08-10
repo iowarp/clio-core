@@ -634,6 +634,35 @@ extern "C" void clio_direct_read_unregister(unsigned long long pool_id) {
   g_direct_read_map.erase(pool_id);
 }
 
+// Device-tier DIRECT MAP: a device-backed (kHbm) bdev publishes its
+// device_base_ so a device-resident consumer (the gpu_vector) can resolve
+// tier-resident bytes to a DIRECT DEVICE POINTER instead of copying.
+// Rationale (measured, 2026-08-10): D2H reads from cudaMalloc memory queue
+// behind a resident kernel's channel and wedge the fault service; a mapped
+// pointer removes the copy entirely — zero DMA per fault.
+namespace {
+std::mutex g_dev_base_mu;
+std::unordered_map<unsigned long long, char *> g_dev_base_map;
+}  // namespace
+
+extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
+                                              char *base) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  g_dev_base_map[pool_id] = base;
+}
+
+extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  g_dev_base_map.erase(pool_id);
+}
+
+/** @return the pool's device base pointer, or nullptr if not device-backed. */
+extern "C" char *clio_direct_dev_base(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  auto it = g_dev_base_map.find(pool_id);
+  return it == g_dev_base_map.end() ? nullptr : it->second;
+}
+
 /** @return 0 on success; nonzero → caller must fall back to the task path. */
 extern "C" int clio_direct_read(unsigned long long pool_id,
                                 unsigned long long off, unsigned long long size,

@@ -13,6 +13,9 @@ extern "C" void clio_direct_read_register(
     int (*fn)(void *, unsigned long long, unsigned long long, char *),
     void *ctx);
 extern "C" void clio_direct_read_unregister(unsigned long long pool_id);
+extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
+                                              char *base);
+extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
@@ -323,6 +326,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   if (throttle_mbps_ <= 0.0 && !io_trace_) {
     auto *mem = dynamic_cast<MemBdevTransport *>(transport_.get());
     if (mem != nullptr) {
+      // Device-backed tier: publish the device base for zero-copy mapping.
+      char *db = mem->DeviceBase();
+      if (db != nullptr) {
+        clio_direct_dev_base_register(pool_id_.ToU64(), db);
+      }
       clio_direct_read_register(
           pool_id_.ToU64(),
           [](void *ctx, unsigned long long off, unsigned long long size,
@@ -711,6 +719,7 @@ void Runtime::StopHealthPolling() {
     // Retract the direct-read entry BEFORE tearing down the transport it
     // points at (no-op if this pool never registered one).
     clio_direct_read_unregister(pool_id_.ToU64());
+    clio_direct_dev_base_unregister(pool_id_.ToU64());
     transport_->Destroy();
     transport_.reset();
   }

@@ -13,6 +13,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 
 namespace clio::run::bdev {
@@ -493,7 +494,7 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   int rc = LaunchWriteBlocksGpu(task, data_ptr.ptr_, stream, bytes_written);
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
@@ -593,13 +594,49 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
           char *slab = bounce_ + (size_t) si * kBounceBytes;
           std::lock_guard<std::mutex> bl(bounce_mu_[si]);
           clio::run::u64 done = 0;
+          void *bstream = stream;
           while (done < chunk) {
             const clio::run::u64 c2 =
                 std::min<clio::run::u64>(chunk - done, kBounceBytes);
-            ctp::GpuApi::MemcpyAsync(slab, page + intra + done, c2, stream);
-            ctp::GpuApi::MemcpyAsync(dst + done, slab, c2, stream);
-            ctp::GpuApi::Synchronize(stream);
+            // DIAGNOSTIC + SELF-HEAL for the captured wedge (Synchronize on
+            // a borrowed stream never returning while a fresh process's CE
+            // is healthy): bounded poll instead of a blind Synchronize; on
+            // timeout, DISCARD the suspect stream (never return it to the
+            // pool) and re-enqueue the same copies on a fresh one. If the
+            // retry completes instantly the wedge is per-stream state, and
+            // this both proves it and unwedges the service.
+            bool ok2 = false;
+            for (int att = 0; att < 3 && !ok2; ++att) {
+              ctp::GpuApi::MemcpyAsync(slab, page + intra + done, c2, bstream);
+              ctp::GpuApi::MemcpyAsync(dst + done, slab, c2, bstream);
+              for (int sp = 0; sp < 2000; ++sp) {   // ~100 ms budget
+                if (ctp::GpuApi::StreamQuery(bstream)) { ok2 = true; break; }
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+              }
+              if (!ok2) {
+                HLOG(kError,
+                     "kHbm bounce: stream {} stuck >100ms (attempt {}) — "
+                     "discarding it and retrying on a fresh stream",
+                     bstream, att);
+                void *nb = ctp::GpuApi::BorrowStream();
+                for (int bw = 0; nb == nullptr && bw < 1000; ++bw) {
+                  std::this_thread::sleep_for(std::chrono::microseconds(100));
+                  nb = ctp::GpuApi::BorrowStream();
+                }
+                if (nb != nullptr) bstream = nb;  // else keep polling old
+              }
+            }
+            if (!ok2) {
+              HLOG(kError, "kHbm bounce: copies stuck on 3 distinct streams — "
+                           "genuine transfer stall, not stream state");
+            }
             done += c2;
+          }
+          if (bstream != stream) {
+            // We completed on a substitute; return IT and let the caller's
+            // original (stuck) stream leak deliberately — it must never
+            // re-enter the pool.
+            ctp::GpuApi::ReturnStream(bstream);
           }
         } else {
           ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, stream);
@@ -663,7 +700,7 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
@@ -730,7 +767,7 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
     // Copy-engine work only — safe to block on even with a faulting kernel
     // resident (kernels block later LAUNCHES, not DMA).
     const unsigned long long ev_s0 = __rdtsc();
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);   // never block in driver sync
     ctp::GpuApi::ReturnStream(stream);
     clio_evlat_add(3, __rdtsc() - ev_s0);  // ch3: DirectRead sync portion
   }

@@ -48,6 +48,9 @@ class MemBdevTransport : public BdevTransport {
    */
   int DirectRead(clio::run::u64 off, clio::run::u64 size, char* dst);
 
+  /** Device base of a kHbm tier (nullptr otherwise) — zero-copy mapping. */
+  char *DeviceBase() const { return device_backed_ ? device_base_ : nullptr; }
+
  private:
   StandardBlockAllocator allocator_;
   clio::run::u64 ram_capacity_{0};
