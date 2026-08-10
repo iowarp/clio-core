@@ -5,7 +5,11 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
+#include <algorithm>
 #include <atomic>
+#include <unordered_map>
+#include <vector>
+#include <x86intrin.h>
 #include <exception>
 #include <unordered_map>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
@@ -46,8 +50,11 @@ struct EvRec {
   unsigned long long seq;
   unsigned long long slot;   // device task address
   unsigned long long aux;    // task_id unique / rc
+  unsigned long long tsc;    // __rdtsc(): a plain instruction, NOT a clock
+                             // call -- steady_clock in this hot path shifted
+                             // timing enough to hang the runtime (lost-wake).
   unsigned int tid;          // worker id (or 0xFFFF for unknown)
-  char kind;                 // S=stage C=beginctx R=routed P=pod-writeback F=flip
+  char kind;                 // S=stage C=beginctx P=pod-writeback F=flip
 };
 constexpr unsigned kEvCap = 4096;
 EvRec g_ev[kEvCap];
@@ -58,6 +65,7 @@ void EvPush(char kind, unsigned tid, unsigned long long slot,
   const unsigned long long n =
       g_ev_seq.fetch_add(1, std::memory_order_relaxed);
   EvRec &r = g_ev[n % kEvCap];
+  r.tsc = __rdtsc();
   r.seq = n; r.slot = slot; r.aux = aux; r.tid = tid; r.kind = kind;
 }
 
@@ -76,8 +84,57 @@ void EvDumpOnTerminate() {
   if (g_prev_term) g_prev_term();
   abort();
 }
+/**
+ * Phase report over the ring: per slot, S->C (staging), C->P (route +
+ * handler + storage read), P->F (completion copies). Cycles at ~TSC rate;
+ * ratios are what matter. atexit only, and only under CLIO_EVLAT.
+ */
+void EvLatencyReport() {
+  const unsigned long long end = g_ev_seq.load();
+  const unsigned long long begin = end > kEvCap ? end - kEvCap : 0;
+  struct Open { unsigned long long s = 0, c = 0, p = 0; };
+  std::unordered_map<unsigned long long, Open> open;
+  std::vector<double> sc, cp, pf;
+  for (unsigned long long n = begin; n < end; ++n) {
+    const EvRec &r = g_ev[n % kEvCap];
+    if (r.seq != n) continue;
+    Open &o = open[r.slot];
+    switch (r.kind) {
+      case 'S': o.s = r.tsc; break;
+      case 'C': o.c = r.tsc; break;
+      case 'P': o.p = r.tsc; break;
+      case 'F':
+        if (o.s && o.c && o.p && o.p > o.c && o.c > o.s && r.tsc > o.p) {
+          sc.push_back((double) (o.c - o.s));
+          cp.push_back((double) (o.p - o.c));
+          pf.push_back((double) (r.tsc - o.p));
+        }
+        o = Open{};
+        break;
+      default: break;
+    }
+  }
+  auto rep = [](const char *name, std::vector<double> &v) {
+    if (v.empty()) return;
+    std::sort(v.begin(), v.end());
+    const double us = 1.0 / 2995.0;   // ~3 GHz TSC -> microseconds
+    fprintf(stderr, "clio-evlat %-4s n=%zu p50=%.0fus p90=%.0fus p99=%.0fus\n",
+            name, v.size(), v[v.size() / 2] * us,
+            v[(size_t) (v.size() * 0.9)] * us,
+            v[(size_t) (v.size() * 0.99)] * us);
+  };
+  rep("S-C", sc);
+  rep("C-P", cp);
+  rep("P-F", pf);
+}
+
 struct EvInit {
-  EvInit() { g_prev_term = std::set_terminate(EvDumpOnTerminate); }
+  EvInit() {
+    g_prev_term = std::set_terminate(EvDumpOnTerminate);
+    if (std::getenv("CLIO_EVLAT") != nullptr) {
+      std::atexit(EvLatencyReport);
+    }
+  }
 } g_ev_init;
 }  // namespace
 
@@ -327,7 +384,15 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   EvPush('C', worker_id, reinterpret_cast<unsigned long long>(gpu_task_raw),
          task_raw->task_id_.unique_);
 
-  RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
+  // Inline start when local (CLIO_GPU2CPU_INLINE=1): force_enqueue costs a
+  // queue hop + worker pickup on EVERY device task, and the rdtsc phase probe
+  // puts 95% of fault-service latency (p50 349 us) between routing and
+  // write-back. The handler is a coroutine -- it suspends on its awaits --
+  // so starting it inline on the drain worker does not stall the drain.
+  static const bool inline_start =
+      std::getenv("CLIO_GPU2CPU_INLINE") != nullptr;
+  RouteResult route_result =
+      ipc->RouteTask(future, /*force_enqueue=*/!inline_start);
   HLOG(kDebug,
        "IpcGpu2Cpu::RecvIn: worker {} RouteTask returned {} pool={} method={}",
        worker_id, (int)route_result, pool_id, method_id);
