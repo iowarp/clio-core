@@ -185,6 +185,16 @@ class Vector {
       kv.second.hdr.stat_prefetch_late_ = c + 6;
       kv.second.hdr.stat_get_errors_ = c + 7;
       kv.second.hdr.stat_pf_dropped_ = c + 8;
+      if (getenv("CLIO_FAULT_HIST") != nullptr) {
+        const clio::run::u64 npg =
+            (kv.second.hdr.size_ + kv.second.hdr.page_bytes_ - 1) /
+            kv.second.hdr.page_bytes_;
+        void *hm = nullptr;
+        if (cudaMalloc(&hm, npg * sizeof(unsigned int)) == cudaSuccess) {
+          cudaMemset(hm, 0, npg * sizeof(unsigned int));
+          kv.second.hdr.fault_hist_ = static_cast<unsigned int *>(hm);
+        }
+      }
       PublishHeader(kv.second);   // the device reads the header, not the view
     }
 #endif
@@ -198,6 +208,22 @@ class Vector {
       }
     }
 #endif
+  }
+
+  /** Copy back the per-page fault histogram (empty if not enabled). */
+  std::vector<unsigned int> ReadFaultHist(int dev_id) const {
+    std::vector<unsigned int> h;
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(dev_id);
+    if (it == devs_.end() || it->second.hdr.fault_hist_ == nullptr) return h;
+    const clio::run::u64 npg =
+        (it->second.hdr.size_ + it->second.hdr.page_bytes_ - 1) /
+        it->second.hdr.page_bytes_;
+    h.resize(npg);
+    cudaMemcpy(h.data(), it->second.hdr.fault_hist_,
+               npg * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+#endif
+    return h;
   }
 
   Stats ReadStats(int dev_id) const {

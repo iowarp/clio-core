@@ -330,6 +330,17 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
     if (page.data == nullptr) {
       page.data = new char[kRamPageSize];
       page.pinned = false;
+      if (bdev_type_ == BdevType::kPinned) {
+        // NOT silent: a pageable page on a kPinned tier turns every async
+        // DMA out of it into a driver-staged synchronous copy (~2x per-read
+        // cost). One run with a few of these looks like an unexplained
+        // 50->75 ms/tok mode flip — log it so the flip is attributable.
+        HLOG(kError,
+             "kPinned bdev '{}': page-locked alloc of page {} ({} MB) FAILED"
+             " — falling back to pageable memory; reads of this page will be"
+             " staged-synchronous",
+             shm_name_, page_idx, kRamPageSize >> 20);
+      }
     }
   }
   return page.data;

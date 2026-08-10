@@ -124,6 +124,10 @@ struct VecHeader {
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
   unsigned long long *stat_pf_dropped_ = nullptr;  // async hints dropped
+  // Optional per-page fault counter (CLIO_FAULT_HIST): distinguishes churn
+  // (same pages refaulted) from coverage (more unique pages) between the
+  // bistable attractors. Device array of one u32 per vector page.
+  unsigned int *fault_hist_ = nullptr;
 
 };
 
@@ -303,9 +307,15 @@ class DeviceVector {
       for (clio::run::u32 k = 0; k < w; ++k) {
         clio::run::u32 i = d + k;
         if (i >= ppb) i -= ppb;
-        if (tbl[i].page_num == pn && !tbl[i].fetching) {
-          p = &tbl[i];
-          break;
+        if (tbl[i].page_num == pn) {
+          // Re-read fetching AFTER the page_num match through volatile: the
+          // claim stores fetching first (device fence between), so a probe
+          // that saw the new page_num must also see fetching != 0.
+          if (*(volatile clio::run::u32 *) &tbl[i].fetching == 0u) {
+            p = &tbl[i];
+            break;
+          }
+          return nullptr;  // claimed / in flight: miss
         }
         if (tbl[i].page_num == kNoPage) break;
       }
@@ -1103,7 +1113,12 @@ class DeviceVector {
       if (slot == ~0u) break;
       Page *np = &tbl[slot];
       np->fetching = 2u;  // batch-async: settled via SettleBatchLocked
-      __threadfence_block();
+      // DEVICE-wide: the readers that must observe fetching before the new
+      // page_num are lock-free probes in OTHER blocks. A block fence let
+      // them see the claimed page_num with fetching still 0 and read the
+      // EVICTED page's bytes for the whole async in-flight window — the
+      // intermittent-garbage-output bug.
+      __threadfence();
       np->page_num = pg;
       np->dirty = 0u;
       np->flushing = 0u;
@@ -1118,6 +1133,7 @@ class DeviceVector {
       ++filled;
       Bump(h_->stat_faults_);
       Bump(h_->stat_prefetches_);
+      if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
     }
     if (filled == 0) return 0;
     mb->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
@@ -1165,7 +1181,7 @@ class DeviceVector {
       // uses, and it is what keeps EvictLocked from choosing a slot this batch
       // has already claimed but not yet filled.
       np->fetching = 1u;
-      __threadfence_block();
+      __threadfence();  // device-wide; see the async claim note
       np->page_num = pg;
       np->dirty = 0u;
       np->flushing = 0u;
@@ -1181,6 +1197,7 @@ class DeviceVector {
       ++filled;
       Bump(h_->stat_faults_);
       Bump(h_->stat_prefetches_);
+      if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
     }
     if (filled == 0) return resident;
 
