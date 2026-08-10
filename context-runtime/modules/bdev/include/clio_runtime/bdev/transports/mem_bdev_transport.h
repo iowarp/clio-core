@@ -36,6 +36,18 @@ class MemBdevTransport : public BdevTransport {
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
+  /**
+   * Synchronous single-extent read, callable from ANY worker fiber — the
+   * fault-chain level-collapse entry (see clio_direct_read in the core lib).
+   * No task, no coroutine, no yield: host destinations memcpy inline; device
+   * destinations enqueue on a borrowed stream and block on it (~45 µs for a
+   * pinned-tier page vs ~500 µs of await-resume latency on the task path).
+   *
+   * @return 0 on success; nonzero → caller must fall back to the task path
+   *         (device-backed tier, out of bounds, or no stream available).
+   */
+  int DirectRead(clio::run::u64 off, clio::run::u64 size, char* dst);
+
  private:
   StandardBlockAllocator allocator_;
   clio::run::u64 ram_capacity_{0};

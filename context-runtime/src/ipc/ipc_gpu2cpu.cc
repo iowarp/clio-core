@@ -11,7 +11,7 @@
 #include <vector>
 #include <x86intrin.h>
 #include <exception>
-#include <unordered_map>
+#include <mutex>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
 
@@ -78,7 +78,7 @@ struct EvChan {
 EvChan g_chan[8];
 const char *g_chan_name[8] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
-                              "bdev_read",  "c7"};
+                              "bdev_read",  "direct_read"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -577,3 +577,52 @@ void IpcGpu2Cpu::SendOut(
 }  // namespace clio::run
 
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+
+// ---------------------------------------------------------------------------
+// Direct-read registry: fault-chain level collapse. Deliberately OUTSIDE the
+// GPU guard — CPU-only builds must still resolve these symbols.
+//
+// The measured systemic cost in the GPU fault chain is not the copy or the
+// handler — it is the coroutine await-RESUME latency paid per dispatched task
+// level (~240 µs/level, stacked 2-3 deep per record). A bdev transport whose
+// read is synchronously servable in-process (the mem transport: resolve page,
+// one pinned-H2D DMA) registers itself here keyed by pool id; the CTE read
+// path then services tier-resident blocks inline on its own fiber with ZERO
+// dispatched sub-tasks. Lives in the core runtime lib (like clio_evlat_add)
+// because both the bdev module and the CTE module link it but not each other.
+// ---------------------------------------------------------------------------
+namespace {
+struct DirectReadEntry {
+  int (*fn)(void *, unsigned long long, unsigned long long, char *);
+  void *ctx;
+};
+std::mutex g_direct_read_mu;
+std::unordered_map<unsigned long long, DirectReadEntry> g_direct_read_map;
+}  // namespace
+
+extern "C" void clio_direct_read_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, char *),
+    void *ctx) {
+  std::lock_guard<std::mutex> lk(g_direct_read_mu);
+  g_direct_read_map[pool_id] = DirectReadEntry{fn, ctx};
+}
+
+extern "C" void clio_direct_read_unregister(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_direct_read_mu);
+  g_direct_read_map.erase(pool_id);
+}
+
+/** @return 0 on success; nonzero → caller must fall back to the task path. */
+extern "C" int clio_direct_read(unsigned long long pool_id,
+                                unsigned long long off, unsigned long long size,
+                                char *dst) {
+  DirectReadEntry e{nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lk(g_direct_read_mu);
+    auto it = g_direct_read_map.find(pool_id);
+    if (it == g_direct_read_map.end()) return -1;
+    e = it->second;
+  }
+  return e.fn(e.ctx, off, size, dst);
+}

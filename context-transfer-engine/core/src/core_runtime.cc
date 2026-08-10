@@ -33,6 +33,13 @@
 
 #include <x86intrin.h>
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+// Direct-read registry (core runtime lib): a node-local mem-transport bdev
+// publishes a synchronous read entry; ReadData services those blocks inline
+// on its own fiber, skipping the dispatched ReadTask and its per-level
+// await-resume latency. Returns 0 on success; nonzero → task path.
+extern "C" int clio_direct_read(unsigned long long pool_id,
+                                unsigned long long off, unsigned long long size,
+                                char *dst);
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
@@ -3387,35 +3394,71 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
   int first_rc = 0;
   clio::run::u32 n = task->count_;
   if (n > kPodMultiMax) n = kPodMultiMax;
-  // ISSUE ALL, THEN AWAIT ALL. The nested-coroutine form
-  // (CLIO_CO_AWAIT(PodGetBlob(sub)) inside the loop) ran the records
-  // SEQUENTIALLY -- a 10-record batch cost ten full read round trips, which
-  // made batched paging amortize the submission but not the reads (measured
-  // ~1.2 ms per expert batch on the MoE fault path, serial-equivalent).
-  // Dispatching the subtasks as real tasks lets the bdev reads overlap
-  // across workers; the awaits then collect mostly-finished futures.
+  // Two regimes, picked by batch size — the tradeoff INVERTED when ReadData
+  // grew its direct-read path (clio_direct_read):
+  //  - Dispatch (issue-all/await-all): overlaps reads across workers, but
+  //    every subtask await pays the blocked-queue resume cadence (~560 µs
+  //    measured ON TOP of an 80 µs direct-read child).
+  //  - Inline (CLIO_CO_AWAIT(PodGetBlob(sub)) on this fiber): serial, but a
+  //    tier-resident record now completes synchronously in ~80 µs with no
+  //    dispatch and no resume. For the MoE fault path (2-3 records/batch)
+  //    serial-inline beats parallel-dispatch ~4×.
+  // Small batches inline; large batches keep the dispatch overlap.
+  // CLIO_MULTI_INLINE=0 forces dispatch-always, =1 inline-always.
   {
-    clio::run::Future<PodGetBlobTask> futs[kPodMultiMax];
-    for (clio::run::u32 i = 0; i < n; ++i) {
-      auto &req = task->reqs_[i];
-      auto sub = ipc_manager->NewTask<PodGetBlobTask>(
-          clio::run::CreateTaskId(), task->pool_id_,
-          clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
-          req.offset_, req.size_, task->flags_, req.data_, task->context_);
-      futs[i] = ipc_manager->Send(sub);
+    clio::run::u32 inline_max = 8;
+    {
+      static const int env_inline = [] {
+        const char *e = getenv("CLIO_MULTI_INLINE");
+        return e == nullptr ? -1 : atoi(e);
+      }();
+      if (env_inline == 0) inline_max = 0;
+      if (env_inline == 1) inline_max = kPodMultiMax;
     }
-    const unsigned long long ev_t1 = __rdtsc();
-    for (clio::run::u32 i = 0; i < n; ++i) {
-      CLIO_CO_AWAIT(futs[i]);
-      int rc = futs[i]->GetReturnCode();
-      task->reqs_[i].rc_ = static_cast<clio::run::u32>(rc);
-      if (rc == 0) {
-        task->num_ok_++;
-      } else if (first_rc == 0) {
-        first_rc = rc;
+    if (n <= inline_max) {
+      const unsigned long long ev_t1 = __rdtsc();
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        auto &req = task->reqs_[i];
+        auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+            clio::run::CreateTaskId(), task->pool_id_,
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+            req.data_, task->context_);
+        sub.get()->BeginRunContext();
+        CLIO_CO_AWAIT(PodGetBlob(sub));
+        int rc = sub->GetReturnCode();
+        req.rc_ = static_cast<clio::run::u32>(rc);
+        if (rc == 0) {
+          task->num_ok_++;
+        } else if (first_rc == 0) {
+          first_rc = rc;
+        }
       }
+      clio_evlat_add(1, __rdtsc() - ev_t1);
+    } else {
+      clio::run::Future<PodGetBlobTask> futs[kPodMultiMax];
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        auto &req = task->reqs_[i];
+        auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+            clio::run::CreateTaskId(), task->pool_id_,
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+            req.data_, task->context_);
+        futs[i] = ipc_manager->Send(sub);
+      }
+      const unsigned long long ev_t1 = __rdtsc();
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        CLIO_CO_AWAIT(futs[i]);
+        int rc = futs[i]->GetReturnCode();
+        task->reqs_[i].rc_ = static_cast<clio::run::u32>(rc);
+        if (rc == 0) {
+          task->num_ok_++;
+        } else if (first_rc == 0) {
+          first_rc = rc;
+        }
+      }
+      clio_evlat_add(1, __rdtsc() - ev_t1);
     }
-    clio_evlat_add(1, __rdtsc() - ev_t1);
   }
   clio_evlat_add(0, __rdtsc() - ev_t0);
   task->SetReturnCode(first_rc);
@@ -6832,6 +6875,32 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
       clio::run::bdev::Block bdev_block(
           block.target_offset_ + read_start_in_block, read_size, 0);
       ctp::ipc::ShmPtr<> data_ptr = data + data_buffer_offset;
+
+      // Level collapse (fault-chain): if the target bdev is node-local and
+      // registered a direct-read entry (mem transport, unthrottled), read it
+      // RIGHT HERE on this fiber. No dispatched task, no await, and — the
+      // measured point — no per-level await-RESUME latency (~240 µs each,
+      // stacked 2-3 deep on the task path). Any failure falls through to the
+      // task path unchanged.
+      static const bool direct_read_enabled = [] {
+        const char *e = getenv("CLIO_DIRECT_READ");
+        return e == nullptr || e[0] != '0';
+      }();
+      if (direct_read_enabled &&
+          TargetIsNodeLocal(block.target_query_, block.bdev_client_.pool_id_)) {
+        auto *ipc_mgr = CLIO_IPC;
+        char *dst = ipc_mgr->ToFullPtr(data_ptr).Cast<char>().ptr_;
+        if (dst != nullptr) {
+          unsigned long long ev_d0 = __rdtsc();
+          if (clio_direct_read(block.bdev_client_.pool_id_.ToU64(),
+                               bdev_block.offset_, read_size, dst) == 0) {
+            clio_evlat_add(7, __rdtsc() - ev_d0);  // ch7: direct_read
+            remaining_size -= read_size;
+            block_offset_in_blob += block.size_;
+            continue;
+          }
+        }
+      }
 
       // Wrap single block in clio::run::priv::vector for AsyncRead
       clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);

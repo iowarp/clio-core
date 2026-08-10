@@ -3,6 +3,8 @@
  * All rights reserved.
  */
 
+#include <x86intrin.h>
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -633,6 +635,64 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   task->bytes_read_ = bytes_read;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
+                                 char* dst) {
+  if (size == 0) return 0;
+  if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max() &&
+      off + size > ram_capacity_) {
+    return -1;
+  }
+  // A device-backed tier's pages are device memory; that path keeps the task
+  // route (its D2D copies have their own scheduling constraints).
+  if (device_backed_) return -1;
+
+  const bool dev_dst = ctp::IsDeviceAccessible(dst);
+  void* stream = nullptr;
+  if (dev_dst) {
+    // Borrowed, never created (creating a stream needs the context write lock
+    // a resident faulting kernel holds — see ReadBlocks). If none is free
+    // RIGHT NOW, fall back to the task path rather than spin on the caller's
+    // fiber.
+    stream = ctp::GpuApi::BorrowStream();
+    if (stream == nullptr) return -1;
+  }
+
+  clio::run::u64 cur_off = off;
+  clio::run::u64 left = size;
+  clio::run::u64 data_offset = 0;
+  while (left > 0) {
+    size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
+    clio::run::u64 intra = cur_off % kRamPageSize;
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    char* page = GetRamPage(page_idx);
+    char* d = dst + data_offset;
+    if (dev_dst) {
+      if (page != nullptr) {
+        ctp::GpuApi::MemcpyAsync(d, page + intra, chunk, stream);
+      } else {
+        ctp::GpuApi::MemsetAsync(d, 0, chunk, stream);
+      }
+    } else {
+      if (page != nullptr) {
+        std::memcpy(d, page + intra, chunk);
+      } else {
+        std::memset(d, 0, chunk);
+      }
+    }
+    cur_off += chunk;
+    data_offset += chunk;
+    left -= chunk;
+  }
+
+  if (dev_dst) {
+    // Copy-engine work only — safe to block on even with a faulting kernel
+    // resident (kernels block later LAUNCHES, not DMA).
+    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::ReturnStream(stream);
+  }
+  return 0;
 }
 
 } // namespace clio::run::bdev
