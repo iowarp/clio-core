@@ -3,6 +3,8 @@
  * All rights reserved.
  */
 
+#include <x86intrin.h>
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
@@ -496,6 +498,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_b0 = __rdtsc();
 
   // Counted at ENTRY, before the kNoop early-out: that path reports success
   // and claims bytes_read_ = length without touching storage, so counting
@@ -505,7 +508,8 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   if (bdev_type_ == BdevType::kNoop) {
     task->return_code_ = 0;
     task->bytes_read_ = task->length_;
-    CLIO_CO_RETURN;
+    clio_evlat_add(6, __rdtsc() - ev_b0);
+  CLIO_CO_RETURN;
   }
 
   if (transport_) {
@@ -520,6 +524,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     task->bytes_read_ = 0;
   }
 
+  clio_evlat_add(6, __rdtsc() - ev_b0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

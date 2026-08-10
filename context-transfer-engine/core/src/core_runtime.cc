@@ -31,6 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <x86intrin.h>
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
@@ -2318,6 +2320,7 @@ clio::run::u64 Runtime::EstimateIoTimeNs(
 template <typename TaskT>
 clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_g0 = __rdtsc();
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
@@ -2346,7 +2349,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           const auto &seg = task->segments_[i];
           if (seg.size_ == 0 || seg.data_.IsNull()) {
             task->return_code_ = 1;
-            CLIO_CO_RETURN;
+            clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
           }
           if (seg.blob_off_ < lo) lo = seg.blob_off_;
           if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
@@ -2359,13 +2363,15 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Validate input parameters
     if (size == 0) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Validate that blob_name is provided
     if (blob_name.empty()) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Step 1: Check if blob exists
@@ -2374,7 +2380,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // If blob doesn't exist, error
     if (blob_info_ptr == nullptr) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Replica-targeted read (issue #886): Context::replica_ == N > 0 serves
@@ -2390,12 +2397,14 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                                      /*create=*/false);
       if (replica_sel == 0) {
         task->return_code_ = 1;
-        CLIO_CO_RETURN;
+        clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
       }
     } else if (replica_sel < 0) {
       // kAllReplicas and friends: a read needs one concrete source.
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Torn-layout guard (issue #753): a reorganize holds this blob's write
@@ -2428,7 +2437,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_ ==
             0) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // OUT: report the blob's transform state so every Get caller -- scalar,
@@ -2496,7 +2506,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
             : blob_info_ptr->GetTotalSize() == 0;
     if (blob_is_gone) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Snapshot the block layout BEFORE the read I/O. ReadData co_awaits a bdev
@@ -2530,17 +2541,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                             seg.blob_off_, read_result));
           if (read_result != 0) {
             task->return_code_ = read_result;
-            CLIO_CO_RETURN;
+            clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
           }
         }
       }
     } else {
       clio::run::u32 read_result = 0;
+      clio_evlat_add(5, __rdtsc() - ev_g0);   // metadata phase
+      { const unsigned long long ev_r0 = __rdtsc();
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
                         read_result));
+      clio_evlat_add(4, __rdtsc() - ev_r0); }  // ReadData await
+
       if (read_result != 0) {
         task->return_code_ = read_result;
-        CLIO_CO_RETURN;
+        clio_evlat_add(2, __rdtsc() - ev_g0);
+  CLIO_CO_RETURN;
       }
     }
 
@@ -2571,6 +2588,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  clio_evlat_add(2, __rdtsc() - ev_g0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -3364,6 +3382,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
     clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_CPU_IPC;
+  const unsigned long long ev_t0 = __rdtsc();
   task->num_ok_ = 0;
   int first_rc = 0;
   clio::run::u32 n = task->count_;
@@ -3385,6 +3404,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
           req.offset_, req.size_, task->flags_, req.data_, task->context_);
       futs[i] = ipc_manager->Send(sub);
     }
+    const unsigned long long ev_t1 = __rdtsc();
     for (clio::run::u32 i = 0; i < n; ++i) {
       CLIO_CO_AWAIT(futs[i]);
       int rc = futs[i]->GetReturnCode();
@@ -3395,7 +3415,9 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
         first_rc = rc;
       }
     }
+    clio_evlat_add(1, __rdtsc() - ev_t1);
   }
+  clio_evlat_add(0, __rdtsc() - ev_t0);
   task->SetReturnCode(first_rc);
   CLIO_CO_RETURN;
 }
