@@ -173,7 +173,7 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
         << "        bdev_type: \"" << (std::getenv("CLIO_RACE_TIER")
                                             ? std::getenv("CLIO_RACE_TIER")
                                             : "ram")
-        << "\"\n        capacity_limit: \"2GB\"\n"
+        << "\"\n        capacity_limit: \"3GB\"\n"
         << "        score: 1.0\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
@@ -191,13 +191,16 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   // 24 seed blocks x 8 pages = 192 pages of truth; the stress phase runs 24
   // blocks with only 8 cache slots per table — heavy oversubscription, so
   // claim/evict runs constantly against the lock-free probes.
-  constexpr unsigned kBlocks = 24;
+  constexpr unsigned kBlocks = 48;
   // pages_per_block must exceed 128 so multi_per_block >= 3 and the ASYNC
   // batch slots exist at all (ceil(ppb/64) - 1 of them); 384 pages walked
   // through 192 slots keeps claim/evict hot.
-  constexpr clio::run::u64 kPagesPerSlice = 384;
+  constexpr clio::run::u64 kPagesPerSlice = 480;
   constexpr clio::run::u64 kTotalPages = kBlocks * kPagesPerSlice;
-  constexpr int kIters = 512;
+  // Pressure high enough to model llama's sustained fault storms — the
+  // managed-queue migration wedge needs continuous device pushes + CPU
+  // drains under resident kernels, not a short burst.
+  constexpr int kIters = 8192;
   const clio::run::u64 n = kTotalPages * kPageElems;
 
   gv::Vector<clio::run::u32> vec("gv_race", {0}, kPageBytes, kBlocks,
