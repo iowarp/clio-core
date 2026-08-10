@@ -77,7 +77,19 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
                                  clio::run::u64 total_pages, int iters,
                                  unsigned long long *err) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
+  // SM SATURATION: idle warps stay RESIDENT (camped on a shared flag) for
+  // the kernel's whole life — the llama wedge ingredient a thread0-only
+  // grid lacks. With SMs empty, UVM migrations of the managed gpu2cpu
+  // queue schedule freely and the wedge never fires; saturated, a stalled
+  // migration freezes the copy engines (the captured mechanism).
+  __shared__ volatile int s_done;
+  if (threadIdx.x == 0) s_done = 0;
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    while (!s_done) {
+    }
+    return;
+  }
 
   __shared__ gv::VecHeader s_hdr;
   {
@@ -141,6 +153,7 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
       }
     }
   }
+  s_done = 1;   // release the camped warps
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -277,8 +290,8 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   REQUIRE(cudaMalloc(&err, 4 * sizeof(unsigned long long)) == cudaSuccess);
   REQUIRE(cudaMemset(err, 0, 4 * sizeof(unsigned long long)) == cudaSuccess);
 
-  RaceStressKernel<<<kBlocks, 32>>>(gpu_info, vec.GetDevice(0), kTotalPages,
-                                    kIters, err);
+  RaceStressKernel<<<kBlocks, 256>>>(gpu_info, vec.GetDevice(0), kTotalPages,
+                                     kIters, err);
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   unsigned long long h[4] = {0};
