@@ -521,6 +521,10 @@ int CteLocateTrampoline(void *ctx, const void *tag_id_p, const char *name,
                           std::to_string(tag_id->minor_) + "." + name;
   std::shared_ptr<BlobInfo> bi = rt->LocateBlobShared(key);
   if (!bi || bi->blocks_.empty()) return -1;
+  // A multi-extent blob has no single (offset, size) — mapping its first
+  // block would serve a truncated page. Report it distinctly so the mapper
+  // leaves the page on the fetch path.
+  if (bi->blocks_.size() != 1) return -2;
   *pool_u64 = bi->blocks_[0].bdev_client_.pool_id_.ToU64();
   *target_off = bi->blocks_[0].target_offset_;
   // STORED size (post-codec): what an in-kernel decompressor must read.

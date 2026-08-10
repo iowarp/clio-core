@@ -20,6 +20,18 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/gpu_vector/page.h>
 
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+// In-kernel decompression of encoded device-tier pages. Opt-in per TU: the
+// nvcomp device API needs -rdc and libnvcomp_device_static at the DEVICE
+// link, which only the ggml-cuda-clio bridge target provides. Every other
+// includer compiles the fetch-path fallback only.
+// backend_api.hpp includes only the ans implementation; lz4's device
+// kernels must be pulled in by hand (nvcomp 4.x packaging quirk).
+#include <nvcomp/device/user_api.hpp>
+#include <nvcomp/device/detail/lz4/decompress_device.cuh>
+#include <cooperative_groups.h>
+#endif
+
 namespace clio::cte::gpu_vector {
 
 /**
@@ -143,7 +155,18 @@ struct VecHeader {
   /** Stored (post-codec) size per page — the input length for an in-kernel
    *  decompressor when the tier holds COMPRESSED pages. */
   const unsigned long long *tier_csize_ = nullptr;
-
+  // ENCODED device-tier map (compressed kHbm). A page whose stored blob is a
+  // CTEC + nvcomp-HLIF lz4 stream cannot be served by pointer; instead the
+  // faulting WARP decompresses the tier bytes straight into a claimed slot
+  // (nvcomp device API) — no CPU, no DMA, so nothing can channel-order
+  // behind a resident kernel. Identity-stored pages keep tier_off_;
+  // encoded pages leave tier_off_ = ~0 and populate these tables instead.
+  // tier_chunk_off_[pg*cpp + c] is the ABSOLUTE tier offset of chunk c of
+  // page pg (~0 = page not encoded-mapped); tier_chunk_csz_ its compressed
+  // size. Chunk raw size is fixed at 64 KiB (the compressor's HLIF chunk).
+  const unsigned long long *tier_chunk_off_ = nullptr;
+  const unsigned int *tier_chunk_csz_ = nullptr;
+  unsigned int tier_chunks_per_page_ = 0;
 };
 
 template <typename T>
@@ -713,6 +736,256 @@ class DeviceVector {
     return got;
   }
 
+  /** Raw (uncompressed) size of one encoded-tier chunk: the compressor's
+   *  HLIF chunk size. Compile-time because the nvcomp device decompressor
+   *  takes it as a template parameter; BuildDeviceTierMap refuses to map a
+   *  stream whose chunk size differs. */
+  static constexpr clio::run::u32 kNvChunkRaw = 64u * 1024u;
+
+  /** @return true when `pg` can be materialized by in-kernel decompression
+   *  (its chunk-table entry is populated). Safe to call from any thread. */
+  CTP_GPU_FUN bool PageEncodedMapped(clio::run::u64 pg) const {
+    return h_->tier_base_ != nullptr && h_->tier_chunk_off_ != nullptr &&
+           h_->tier_chunks_per_page_ != 0u &&
+           h_->tier_chunk_off_[pg * h_->tier_chunks_per_page_] != ~0ull;
+  }
+
+  /**
+   * Standard LZ4 block decode, ONE thread. nvcomp's uchar lz4 chunks are
+   * standard LZ4 blocks (verified byte-exact against LZ4Manager output), so
+   * this needs no nvcomp linkage and compiles in EVERY GPU TU — the airtight
+   * fault service for single-thread sites (scalar Resolve, single-lane
+   * batched fetch) where the warp-cooperative decoder cannot run. Slow next
+   * to the warp decoder, but these sites are the residue the batch missed;
+   * the alternative was a CPU-serviced fetch, which can channel-order behind
+   * the resident kernel and wedge.
+   *
+   * @return true iff exactly `out_len` bytes were produced.
+   */
+  CTP_GPU_FUN static bool Lz4DecodeSerial(const unsigned char *in,
+                                          clio::run::u64 in_len,
+                                          unsigned char *out,
+                                          clio::run::u64 out_len) {
+    const unsigned char *ie = in + in_len;
+    unsigned char *o = out;
+    unsigned char *oe = out + out_len;
+    while (in < ie) {
+      const unsigned tok = *in++;
+      clio::run::u64 ll = tok >> 4;
+      if (ll == 15u) {
+        unsigned b;
+        do {
+          if (in >= ie) return false;
+          b = *in++;
+          ll += b;
+        } while (b == 255u);
+      }
+      if (in + ll > ie || o + ll > oe) return false;
+      for (clio::run::u64 i = 0; i < ll; ++i) *o++ = *in++;
+      if (in >= ie) break;  // final sequence carries literals only
+      if (in + 2 > ie) return false;
+      const unsigned moff = in[0] | (static_cast<unsigned>(in[1]) << 8);
+      in += 2;
+      if (moff == 0u || static_cast<clio::run::u64>(o - out) < moff) {
+        return false;
+      }
+      clio::run::u64 ml = tok & 15u;
+      if (ml == 15u) {
+        unsigned b;
+        do {
+          if (in >= ie) return false;
+          b = *in++;
+          ml += b;
+        } while (b == 255u);
+      }
+      ml += 4;
+      if (o + ml > oe) return false;
+      const unsigned char *m = o - moff;
+      for (clio::run::u64 i = 0; i < ml; ++i) *o++ = *m++;  // overlap-safe
+    }
+    return o == oe;
+  }
+
+  /** Serial in-kernel decode of encoded page `pg` into `dst` (page bytes). */
+  CTP_GPU_FUN bool DecodePageSerialInto(clio::run::u64 pg, char *dst) {
+    const clio::run::u32 cpp = h_->tier_chunks_per_page_;
+    const clio::run::u64 base_i = pg * cpp;
+    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
+    if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
+    for (clio::run::u32 c = 0; c < cpp; ++c) {
+      const clio::run::u64 done =
+          static_cast<clio::run::u64>(c) * kNvChunkRaw;
+      if (done >= want_total) break;
+      const unsigned long long coff = h_->tier_chunk_off_[base_i + c];
+      const unsigned csz = h_->tier_chunk_csz_[base_i + c];
+      if (coff == ~0ull || csz == 0u) return false;
+      clio::run::u64 want = want_total - done;
+      if (want > kNvChunkRaw) want = kNvChunkRaw;
+      if (!Lz4DecodeSerial(reinterpret_cast<const unsigned char *>(
+                               h_->tier_base_ + coff),
+                           csz,
+                           reinterpret_cast<unsigned char *>(dst) + done,
+                           want)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+  /**
+   * Materialize one ENCODED tier page by warp-cooperative decompression.
+   *
+   * All 32 lanes of the calling warp must be active (nvcomp's lz4 device
+   * decompressor is a warp-group primitive). Lane 0 claims a slot under the
+   * block lock exactly like the batched fetch — fetching=3 marks "in-kernel
+   * decode in flight", which AwaitFetch spin-waits on (the slot's get_fut is
+   * STALE for a decoded page; waiting on it would clear fetching mid-decode
+   * and serve half-written bytes). Then the warp decodes each 64 KiB HLIF
+   * chunk from the tier straight into the slot and lane 0 publishes.
+   *
+   * No CPU, no DMA, no child kernel: nothing here can channel-order behind
+   * a resident kernel, which is the whole reason this path exists.
+   *
+   * @return true when the page is resident (decoded here, already resident,
+   *         or being fetched by someone else); false when the claim or the
+   *         decode failed (caller falls back to the CPU fetch path).
+   */
+  CTP_GPU_FUN bool DecodePageWarp(clio::run::u64 pg) {
+    using lz4_decomp = decltype(
+        nvcomp::device::Grouptype<nvcomp::device::nvcomp_grouptype::warp>() +
+        nvcomp::device::Algo<nvcomp::device::nvcomp_algo::lz4>() +
+        nvcomp::device::Datatype<nvcomp::device::nvcomp_datatype::uint8>() +
+        nvcomp::device::Direction<
+            nvcomp::device::nvcomp_direction::decompress>() +
+        nvcomp::device::MaxUncompChunkSize<kNvChunkRaw>());
+    // 896 B of shared scratch per decoding warp (ShmemSizeGroup for lz4
+    // decompress). Static __shared__: only kernels that reach this function
+    // pay for it, and 8 warp slots cover every bridge kernel's block shape.
+    constexpr clio::run::u32 kDecodeWarps = 8;
+    constexpr clio::run::u32 kWarpShmem = 896;
+    __shared__ __align__(8) unsigned char nv_sm[kDecodeWarps][kWarpShmem];
+    unsigned char *sm = nv_sm[(threadIdx.x >> 5) % kDecodeWarps];
+    const unsigned lane = threadIdx.x & 31u;
+
+    int outcome = 0;  // 0 = resident/in-flight elsewhere, 1 = decode, 2 = fail
+    unsigned long long slot_bits = 0;
+    if (lane == 0) {
+      LockBlock();
+      Page *p = Find(pg);
+      if (p != nullptr) {
+        outcome = 0;  // resident or in flight: AwaitFetch handles the rest
+        UnlockBlock();
+      } else {
+        const clio::run::u32 sl = ClaimSlotWindowLocked(pg);
+        if (sl == ~0u) {
+          outcome = 2;
+          UnlockBlock();
+        } else {
+          Page *np = &BlockPages()[sl];
+          np->gen += 1u;
+          np->fetching = 3u;  // in-kernel decode; see AwaitFetch
+          __threadfence();    // device-wide, same ordering as the fetch claim
+          np->page_num = pg;
+          np->dirty = 0u;
+          np->flushing = 0u;
+          np->score = 2.0f;
+          np->last_access = Now();
+          Bump(h_->stat_faults_);
+          if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
+          UnlockBlock();
+          slot_bits = reinterpret_cast<unsigned long long>(np);
+          outcome = 1;
+        }
+      }
+    }
+    outcome = __shfl_sync(0xffffffffu, outcome, 0);
+    if (outcome != 1) return outcome == 0;
+    slot_bits = __shfl_sync(0xffffffffu, slot_bits, 0);
+    Page *np = reinterpret_cast<Page *>(slot_bits);
+
+    auto warp = cooperative_groups::tiled_partition<32>(
+        cooperative_groups::this_thread_block());
+    const clio::run::u32 cpp = h_->tier_chunks_per_page_;
+    const clio::run::u64 base_i = pg * cpp;
+    // The tail page decodes fewer bytes than page_bytes_; derive its true
+    // extent from the vector size rather than carrying a per-chunk table.
+    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
+    if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
+    bool ok = true;
+    for (clio::run::u32 c = 0; c < cpp; ++c) {
+      const clio::run::u64 done = static_cast<clio::run::u64>(c) * kNvChunkRaw;
+      if (done >= want_total) break;
+      const unsigned long long coff = h_->tier_chunk_off_[base_i + c];
+      const unsigned csz = h_->tier_chunk_csz_[base_i + c];
+      if (coff == ~0ull || csz == 0u) {
+        ok = false;
+        break;
+      }
+      clio::run::u64 want = want_total - done;
+      if (want > kNvChunkRaw) want = kNvChunkRaw;
+      lz4_decomp dc;
+      size_t out_sz = 0;
+      dc.decompress(h_->tier_base_ + coff,
+                    static_cast<char *>(np->data) + done,
+                    static_cast<size_t>(csz), &out_sz, sm,
+                    /*tmp_buf=*/nullptr, warp);
+      // The API does not document which lane receives out_sz; take the
+      // warp-wide max so every lane agrees before the loop condition.
+      unsigned osz32 = static_cast<unsigned>(out_sz);
+      osz32 = __reduce_max_sync(0xffffffffu, osz32);
+      if (osz32 != static_cast<unsigned>(want)) {
+        ok = false;
+        break;
+      }
+    }
+    __syncwarp();
+    if (lane == 0) {
+      if (ok) {
+        __threadfence();     // bytes before the fetching clear, device-wide
+        np->fetching = 0u;
+      } else {
+        // Free the slot LOCKLESSLY — an AwaitFetch waiter may spin on
+        // fetching=3 while HOLDING this block's lock, so taking it here
+        // would deadlock. Claimers skip fetching!=0 slots, so the transient
+        // (kNoPage, fetching=3) state is never grabbed.
+        np->page_num = kNoPage;
+        Bump(h_->stat_get_errors_);
+        __threadfence();
+        np->fetching = 0u;
+      }
+    }
+    __syncwarp();
+    return ok;
+  }
+
+  /**
+   * Warp-wide batched materialization: encoded mapped pages decode in-kernel
+   * (whole warp), everything else falls through to ONE synchronous batched
+   * CPU fetch by lane 0. Call with all 32 lanes active.
+   */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedWarp(clio::run::u64 first_page,
+                                                   clio::run::u32 n) {
+    clio::run::u32 decoded = 0;
+    bool any_cpu = false;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first_page + k;
+      if (PageEncodedMapped(pg)) {
+        if (DecodePageWarp(pg)) ++decoded;
+      } else if (h_->tier_off_ == nullptr || h_->tier_off_[pg] == ~0ull) {
+        any_cpu = true;  // identity-mapped pages need nothing at all
+      }
+    }
+    if (!any_cpu) return decoded;
+    clio::run::u32 got = 0;
+    if ((threadIdx.x & 31u) == 0u) {
+      got = FetchPagesBatched(first_page, n);
+    }
+    got = __shfl_sync(0xffffffffu, got, 0);
+    return got;
+  }
+#endif  // CLIO_GV_NVCOMP_DEVICE
+
   /**
    * Start faulting `page_num` in WITHOUT waiting for it.
    *
@@ -1228,6 +1501,10 @@ class DeviceVector {
     for (clio::run::u32 k = 0; k < n; ++k) {
       const clio::run::u64 pg = first_page + k;
       if (Find(pg) != nullptr) continue;  // resident or already coming
+      // Encoded mapped pages must NEVER ride a CPU-serviced get (it can
+      // channel-order behind the resident kernel). This is a prefetch HINT,
+      // so dropping the page is always safe; a toucher decodes it in-kernel.
+      if (PageEncodedMapped(pg)) continue;
       const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
       if (slot == ~0u) break;
       Page *np = &tbl[slot];
@@ -1311,6 +1588,24 @@ class DeviceVector {
       // measured as more faults per token than routed pages.
       np->score = 2.0f;
       np->last_access = Now();
+      if (PageEncodedMapped(pg)) {
+        // Decode in-kernel rather than joining the CPU multi-get: a CPU-
+        // serviced read of an encoded page runs the wedge-prone GPU-codec
+        // path. Serial here because this site is single-thread; the warp
+        // resolver (FetchPagesBatchedWarp) is the fast path.
+        const bool dok =
+            DecodePageSerialInto(pg, static_cast<char *>(np->data));
+        __threadfence();
+        if (!dok) {
+          np->page_num = kNoPage;
+          Bump(h_->stat_get_errors_);
+        }
+        np->fetching = 0u;
+        Bump(h_->stat_faults_);
+        if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
+        if (dok) ++resident;
+        continue;
+      }
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
@@ -1354,6 +1649,9 @@ class DeviceVector {
    */
   CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num) {
     if (Find(page_num) != nullptr) return true;   // resident or already coming
+    // Encoded mapped pages never ride a CPU get (wedge class); this is a
+    // prefetch, so simply decline — the demand path decodes in-kernel.
+    if (PageEncodedMapped(page_num)) return false;
     Page *tbl = BlockPages();
     clio::run::u32 free_slot = h_->pages_per_block_;
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -1404,6 +1702,18 @@ class DeviceVector {
       // not a per-page get, so the page's own future carries nothing. Settle
       // the whole batch (this also clears every sibling page it fetched).
       SettleBatchLocked();
+      return;
+    }
+    if (p->fetching == 3u) {
+      // In-kernel decode (DecodePageWarp) in flight: the slot's get_fut is
+      // STALE — waiting on it would return instantly and expose half-written
+      // bytes. The decoder publishes fetching=0 without needing this block's
+      // lock, so spinning here is deadlock-free even for lock-holders.
+      volatile clio::run::u32 *f =
+          reinterpret_cast<volatile clio::run::u32 *>(&p->fetching);
+      while (*f == 3u) {
+        __nanosleep(64);
+      }
       return;
     }
     p->get_fut.Wait();
@@ -1531,6 +1841,30 @@ class DeviceVector {
           p->dirty = 0u;
           p->flushing = 0u;
           p->score = 0.0f;
+          if (PageEncodedMapped(page_num)) {
+            // In-kernel serial decode: the CPU-serviced get would run the
+            // GPU-codec path, which can channel-order behind this very
+            // kernel and wedge. Completes synchronously, so the caller's
+            // AwaitFetch sees fetching == 0 and does not touch the (stale)
+            // future.
+            const bool dok =
+                DecodePageSerialInto(page_num, static_cast<char *>(p->data));
+            __threadfence();
+            if (!dok) {
+              // Corrupt chunk table or stream. Callers cannot take a null
+              // page, so fall back to the CPU-serviced read as the last
+              // resort (wedge-risk accepted over serving garbage).
+              Bump(h_->stat_get_errors_);
+              SubmitGet(p, page_num);
+            } else {
+              p->fetching = 0u;
+              Bump(h_->stat_faults_);
+              if (h_->fault_hist_ != nullptr) {
+                atomicAdd(&h_->fault_hist_[page_num], 1u);
+              }
+            }
+            break;
+          }
           SubmitGet(p, page_num);
           break;
         }

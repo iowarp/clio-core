@@ -22,6 +22,7 @@
 #include <clio_cte/gpu_vector/device_vector.h>
 #include <clio_cte/gpu_vector/page.h>
 
+#include <algorithm>
 #include <cstring>
 #include <new>
 #include <map>
@@ -223,37 +224,117 @@ class Vector {
    *  fault; warm-up and slot prefetching are pointless). */
   bool FullyDeviceMapped() const { return fully_device_mapped_; }
 
-  void BuildDeviceTierMap() {
+  /**
+   * @param decode_in_kernel true when the CALLER's device code was compiled
+   *        with CLIO_GV_NVCOMP_DEVICE (in-kernel lz4 decompress available).
+   *        Only then may encoded (compressed) pages be chunk-mapped; without
+   *        it a codec tag keeps the fetch path for every page.
+   */
+  void BuildDeviceTierMap(bool decode_in_kernel = false) {
 #if CTP_ENABLE_CUDA
     if (devs_.empty()) return;
     // GENERALITY GATE: a direct pointer is only valid when the STORED bytes
     // are the representation the kernels read. Identity-stored tags (raw
-    // F16/Q4_K, and FP8 whose kernels decode e4m3 in-register) qualify; a
-    // tag read through a codec (compress_lib_ != 0) stores an nvcomp stream
-    // — those pages MUST materialize through the fetch+decompress path, so
-    // they never map. The page cache's contract: the tier holds the encoded
-    // representation, the cache holds the decoded one; mapping is the
-    // identity-codec specialization of that contract, not a bypass.
-    if (compress_lib_ != 0) return;
+    // F16/Q4_K, and FP8 whose kernels decode e4m3 in-register) map by
+    // pointer. A tag read through a codec (compress_lib_ != 0) stores a
+    // CTEC + nvcomp-HLIF stream: those pages map through the CHUNK tables
+    // and materialize by in-kernel decompression — the tier still holds the
+    // encoded representation and the page cache the decoded one, exactly the
+    // cache's contract; only the decompressor moved on-device. Codec pages
+    // whose stream the mapper cannot validate (or when the device decoder
+    // was not compiled in) keep the CPU fetch path.
+    // kNvcompLz4Wire: the compressor registry's frozen wire id for
+    // nvcomp-lz4 — the one codec the in-kernel decoder speaks.
+    constexpr int kNvcompLz4Wire = 11;
+    const bool encoded = compress_lib_ != 0;
+    if (encoded && (!decode_in_kernel || compress_lib_ != kNvcompLz4Wire)) {
+      return;
+    }
     const auto &h0 = devs_.begin()->second.hdr;
     const clio::run::u64 npages =
         (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
     if (npages == 0) return;
+    constexpr clio::run::u64 kChunkRaw = 64ull * 1024ull;  // HLIF chunk
+    const clio::run::u64 cpp = (h0.page_bytes_ + kChunkRaw - 1) / kChunkRaw;
+    const bool map_dbg0 = std::getenv("CLIO_MAP_DEBUG") != nullptr;
     unsigned long long pool = 0, toff = 0, ssz = 0;
-    if (clio_cte_locate(&tag_id_, "p0", &pool, &toff, &ssz) != 0) return;
+    const int rc0 = clio_cte_locate(&tag_id_, "p0", &pool, &toff, &ssz);
+    if (rc0 != 0) {
+      if (map_dbg0) {
+        std::fprintf(stderr, "gpu_vector: map OFF — locate(p0) rc=%d\n", rc0);
+      }
+      return;
+    }
     char *base = clio_direct_dev_base(pool);
-    if (base == nullptr) return;   // not a device tier
+    if (base == nullptr) {
+      if (map_dbg0) {
+        std::fprintf(stderr,
+                     "gpu_vector: map OFF — pool %llx has no device base\n",
+                     pool);
+      }
+      return;   // not a device tier
+    }
     std::vector<unsigned long long> offs(npages, ~0ull);
     std::vector<unsigned long long> csz(npages, 0);
-    clio::run::u64 mapped = 0;
+    std::vector<unsigned long long> chunk_off;
+    std::vector<unsigned int> chunk_csz;
+    if (encoded) {
+      chunk_off.assign(npages * cpp, ~0ull);
+      chunk_csz.assign(npages * cpp, 0u);
+    }
+    const bool map_debug = std::getenv("CLIO_MAP_DEBUG") != nullptr;
+    clio::run::u64 mapped = 0, chunk_mapped = 0;
     for (clio::run::u64 pg = 0; pg < npages; ++pg) {
       char name[32];
       PageBlobName(pg, name);
       unsigned long long p2 = 0, o2 = 0, s2 = 0;
-      if (clio_cte_locate(&tag_id_, name, &p2, &o2, &s2) == 0 && p2 == pool) {
+      const int lrc = clio_cte_locate(&tag_id_, name, &p2, &o2, &s2);
+      if (lrc != 0 || p2 != pool) {
+        if (map_debug) {
+          std::fprintf(stderr,
+                       "gpu_vector: map SKIP pg=%llu locate rc=%d pool=%llx "
+                       "(want %llx)\n",
+                       (unsigned long long) pg, lrc, p2, pool);
+        }
+        continue;
+      }
+      const clio::run::u64 raw_bytes =
+          std::min<clio::run::u64>(h0.page_bytes_,
+                                   h0.size_ - pg * h0.page_bytes_);
+      if (!encoded) {
         offs[pg] = o2;
         csz[pg] = s2;
         ++mapped;
+        continue;
+      }
+      // Encoded tag: the stored blob is [32 B CTEC header][nvcomp HLIF
+      // stream]. Parse both on the host and record each chunk's absolute
+      // tier offset + compressed size. Any validation failure leaves the
+      // page on the fetch path — mapping must never guess.
+      bool had_magic = false;
+      if (ParseEncodedBlob(base, o2, s2, raw_bytes, kChunkRaw,
+                           &chunk_off[pg * cpp], &chunk_csz[pg * cpp], cpp,
+                           &had_magic)) {
+        ++chunk_mapped;
+      } else if (!had_magic && s2 <= raw_bytes) {
+        // No CTEC magic and the stored size fits the page: the compressor
+        // stored this page RAW (incompressible, or the short tail page of a
+        // page-padded image). Identity-map it. A blob WITH the magic that
+        // failed to parse must stay on the fetch path — identity-mapping it
+        // would serve compressed bytes as elements.
+        offs[pg] = o2;
+        csz[pg] = s2;
+        ++mapped;
+      } else if (map_debug) {
+        unsigned long long w[16] = {0};
+        cudaMemcpy(w, base + o2, sizeof(w), cudaMemcpyDeviceToHost);
+        std::fprintf(stderr,
+                     "gpu_vector: map SKIP pg=%llu stored=%llu raw=%llu "
+                     "ctec=[%llx %llx %llx %llx] hlif=[%llu %llu %llu %llu "
+                     "%llu %llu %llu %llu]\n",
+                     (unsigned long long) pg, s2,
+                     (unsigned long long) raw_bytes, w[0], w[1], w[2], w[3],
+                     w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
       }
     }
     void *dev_offs = nullptr;
@@ -268,21 +349,141 @@ class Vector {
                cudaMemcpyHostToDevice);
     cudaMemcpy(dev_csz, csz.data(), npages * sizeof(unsigned long long),
                cudaMemcpyHostToDevice);
+    void *dev_choff = nullptr;
+    void *dev_chcsz = nullptr;
+    if (encoded && chunk_mapped > 0) {
+      if (cudaMalloc(&dev_choff,
+                     chunk_off.size() * sizeof(unsigned long long)) !=
+              cudaSuccess ||
+          cudaMalloc(&dev_chcsz, chunk_csz.size() * sizeof(unsigned int)) !=
+              cudaSuccess) {
+        return;
+      }
+      cudaMemcpy(dev_choff, chunk_off.data(),
+                 chunk_off.size() * sizeof(unsigned long long),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(dev_chcsz, chunk_csz.data(),
+                 chunk_csz.size() * sizeof(unsigned int),
+                 cudaMemcpyHostToDevice);
+    }
     for (auto &kv : devs_) {
       kv.second.hdr.tier_base_ = base;
       kv.second.hdr.tier_off_ =
           static_cast<const unsigned long long *>(dev_offs);
       kv.second.hdr.tier_csize_ =
           static_cast<const unsigned long long *>(dev_csz);
+      if (dev_choff != nullptr) {
+        kv.second.hdr.tier_chunk_off_ =
+            static_cast<const unsigned long long *>(dev_choff);
+        kv.second.hdr.tier_chunk_csz_ =
+            static_cast<const unsigned int *>(dev_chcsz);
+        kv.second.hdr.tier_chunks_per_page_ =
+            static_cast<unsigned int>(cpp);
+      }
       PublishHeader(kv.second);
     }
+    // Encoded pages still materialize through slots, so "fully mapped" (=
+    // reads never fault, warm-up pointless) only counts identity pages.
     fully_device_mapped_ = (mapped == npages);
     std::fprintf(stderr,
-                 "gpu_vector: DEVICE-TIER MAP active — %llu/%llu pages "
-                 "zero-copy\n",
-                 (unsigned long long) mapped, (unsigned long long) npages);
+                 "gpu_vector: DEVICE-TIER MAP active — %llu/%llu zero-copy, "
+                 "%llu/%llu in-kernel-decode\n",
+                 (unsigned long long) mapped, (unsigned long long) npages,
+                 (unsigned long long) chunk_mapped,
+                 (unsigned long long) npages);
 #endif
   }
+
+#if CTP_ENABLE_CUDA
+  /**
+   * Validate one encoded blob's headers and fill its chunk-table slice.
+   *
+   * Layout (proven byte-exact against nvcomp 4.2's LZ4Manager output):
+   *   [32 B CTEC: magic 0x43544543, lib u32, preset u32, orig u64, comp u64]
+   *   [HLIF: magic u64 @0, comp_bytes u64 @8, uncomp u64 @16, nchunks u64
+   *    @24, chunk_size u64 @48, data_start u64 @56 (= 72 + 16*nchunks),
+   *    chunk offsets u64[n] @72 (relative to data_start, 8-aligned),
+   *    comp sizes u64[n] following]
+   *
+   * @return true and fills off_out/csz_out[0..nchunks) on success.
+   */
+  bool ParseEncodedBlob(const char *base, unsigned long long blob_off,
+                        unsigned long long stored_size,
+                        clio::run::u64 raw_bytes, clio::run::u64 chunk_raw,
+                        unsigned long long *off_out, unsigned int *csz_out,
+                        clio::run::u64 cpp, bool *had_magic) {
+    constexpr clio::run::u32 kCtecMagic = 0x43544543u;
+    constexpr unsigned long long kHlifMagic = 1385239334ull;
+    *had_magic = false;
+    // Magic probe first: even a blob too short for a full header must be
+    // classified (raw short tail vs corrupt codec stream).
+    if (stored_size >= 4) {
+      unsigned int m = 0;
+      if (cudaMemcpy(&m, base + blob_off, 4, cudaMemcpyDeviceToHost) ==
+          cudaSuccess) {
+        *had_magic = (m == kCtecMagic);
+      }
+    }
+    if (!*had_magic) return false;                            // stored raw
+    const clio::run::u64 want_chunks = (raw_bytes + chunk_raw - 1) / chunk_raw;
+    if (want_chunks == 0 || want_chunks > cpp) return false;
+    // CTEC(32) + HLIF fixed(72) + offset/size tables.
+    const clio::run::u64 hdr_bytes = 32 + 72 + 16 * want_chunks;
+    if (stored_size < hdr_bytes) return false;
+    std::vector<unsigned char> hdr(hdr_bytes);
+    if (cudaMemcpy(hdr.data(), base + blob_off, hdr_bytes,
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      return false;
+    }
+    const unsigned char *p = hdr.data();
+    auto rd32 = [&](clio::run::u64 at) {
+      unsigned int v;
+      std::memcpy(&v, p + at, 4);
+      return v;
+    };
+    auto rd64 = [&](clio::run::u64 at) {
+      unsigned long long v;
+      std::memcpy(&v, p + at, 8);
+      return v;
+    };
+    (void) rd32;
+    if (rd32(4) != static_cast<unsigned>(compress_lib_)) return false;
+    // orig size: the tail page's blob holds only the image's real bytes,
+    // so accept any orig <= the page extent (decode fills that much).
+    // Offset 16, not 12 — CompressionHeader aligns the u64 after the three
+    // u32s (4 bytes of padding follow preset_).
+    const unsigned long long orig = rd64(16);
+    if (orig == 0 || orig > raw_bytes) return false;
+    const unsigned char *h = p + 32;                          // HLIF stream
+    auto hd64 = [&](clio::run::u64 at) {
+      unsigned long long v;
+      std::memcpy(&v, h + at, 8);
+      return v;
+    };
+    if ((hd64(0) & 0xffffffffull) != kHlifMagic) return false;
+    if (hd64(16) != orig) return false;
+    const unsigned long long nchunks = hd64(24);
+    if (nchunks != want_chunks) return false;
+    if (hd64(48) != chunk_raw) return false;
+    const unsigned long long dstart = hd64(56);
+    if (dstart != 72 + 16 * nchunks) return false;
+    // Chunk starts must stay 8-aligned for the device decompressor; the
+    // blob and stream bases are checked once, the table offsets per chunk.
+    if ((blob_off + 32 + dstart) % 8 != 0) return false;
+    unsigned long long prev_end = 0;
+    for (unsigned long long c = 0; c < nchunks; ++c) {
+      const unsigned long long rel = hd64(72 + 8 * c);
+      const unsigned long long cs = hd64(72 + 8 * nchunks + 8 * c);
+      if (rel % 8 != 0 || cs == 0 || cs > 0xffffffffull) return false;
+      if (rel < prev_end) return false;                       // overlap
+      if (32 + dstart + rel + cs > stored_size) return false;  // OOB
+      off_out[c] = blob_off + 32 + dstart + rel;
+      csz_out[c] = static_cast<unsigned int>(cs);
+      prev_end = rel + cs;
+    }
+    return true;
+  }
+#endif
 
   void ResetStats() {
 #if CTP_ENABLE_CUDA
