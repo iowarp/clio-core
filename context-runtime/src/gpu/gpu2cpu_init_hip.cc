@@ -190,6 +190,23 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     }
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
+#if CTP_ENABLE_CUDA
+    // Pin the managed queue's RESIDENCE to the host and give the GPU a fixed
+    // remote mapping instead of migration rights. Concurrent CPU drain +
+    // device atomics on migratable managed pages under a RESIDENT kernel
+    // stalls UVM migrations, and migrations share the copy engines — one
+    // stalled migration froze every CE transfer on the device (captured:
+    // cuStreamSynchronize wedged, 0% MEM util, free SMs irrelevant). With
+    // AccessedBy there is nothing to migrate, ever.
+    {
+      int dev_id = 0;
+      cudaGetDevice(&dev_id);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_id);
+    }
+#endif
 
     // Host-side construction. queue_backend is managed memory mapped
     // into device address space at the same virtual address, so the
