@@ -63,8 +63,10 @@ class MemBdevTransport : public BdevTransport {
   // Pinned bounce slab for device-backed (kHbm) reads — D2D copies deadlock
   // against resident faulting kernels (SM-starved driver copy-kernel).
   static constexpr size_t kBounceBytes = 4u << 20;
+  static constexpr unsigned kBounceSlabs = 4;  // parallel CE lanes
   char *bounce_ = nullptr;
-  std::mutex bounce_mu_;
+  std::mutex bounce_mu_[kBounceSlabs];
+  std::atomic<unsigned> bounce_rr_{0};
 
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
 

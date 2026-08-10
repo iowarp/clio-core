@@ -119,7 +119,7 @@ void MemBdevTransport::InitDeviceBacking() {
   // D2H + H2D are copy-engine DMA, immune to SM occupancy. Allocated HERE
   // (init, no kernel resident) because cudaMallocHost on the fault path is
   // its own deadlock.
-  bounce_ = ctp::GpuApi::MallocHost<char>(kBounceBytes);
+  bounce_ = ctp::GpuApi::MallocHost<char>(kBounceBytes * kBounceSlabs);
   HLOG(kInfo, "HBM bdev: {} bytes of DEVICE memory allocated", ram_capacity_);
 #else
   HLOG(kWarning,
@@ -587,13 +587,17 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
           // Serialize through the pinned bounce slab under a plain mutex —
           // synchronous, no coroutine yield inside the hold, so fibers on
           // this worker cannot interleave a second claim of the slab.
-          std::lock_guard<std::mutex> bl(bounce_mu_);
+          const unsigned si =
+              bounce_rr_.fetch_add(1, std::memory_order_relaxed) %
+              kBounceSlabs;
+          char *slab = bounce_ + (size_t) si * kBounceBytes;
+          std::lock_guard<std::mutex> bl(bounce_mu_[si]);
           clio::run::u64 done = 0;
           while (done < chunk) {
             const clio::run::u64 c2 =
                 std::min<clio::run::u64>(chunk - done, kBounceBytes);
-            ctp::GpuApi::MemcpyAsync(bounce_, page + intra + done, c2, stream);
-            ctp::GpuApi::MemcpyAsync(dst + done, bounce_, c2, stream);
+            ctp::GpuApi::MemcpyAsync(slab, page + intra + done, c2, stream);
+            ctp::GpuApi::MemcpyAsync(dst + done, slab, c2, stream);
             ctp::GpuApi::Synchronize(stream);
             done += c2;
           }
