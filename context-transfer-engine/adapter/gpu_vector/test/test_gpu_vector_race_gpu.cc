@@ -142,7 +142,20 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
     REQUIRE(cfg.is_open());
     cfg << "networking:\n  port: 9433\n\n"
         << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
-        << "gpu:\n  queue_depth: 4096\n";
+        << "gpu:\n  queue_depth: 4096\n\n"
+        // The seeded image is ~1.2 GB; the default core's target is far
+        // smaller (host puts failed ENOMEM at page 800 without this).
+        // Compose the DEFAULT core pool (name+id the client binds to) with
+        // a big tier, so both the host client and the vector use it.
+        << "compose:\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: clio_cte_core\n    pool_query: local\n"
+        << "    pool_id: \"512.0\"\n"
+        << "    storage:\n"
+        << "      - path: \"ram::gv_race_tier\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \"2GB\"\n"
+        << "        score: 1.0\n"
+        << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_race.yaml", 1);
   }
@@ -170,9 +183,72 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   gv::Vector<clio::run::u32> vec("gv_race", {0}, kPageBytes, kBlocks,
                                  /*pages_per_block=*/192, n);
 
-  RaceSeedKernel<<<kBlocks, 32>>>(gpu_info, vec.GetDevice(0),
-                                  kPagesPerSlice * kPageElems);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  // HOST-side seed: put every page's pattern straight through the CTE
+  // client. The GPU flush path is deliberately NOT used — a walk larger
+  // than the cache DROPS dirty evictions by design (weights are read-only
+  // in the paged kernels), so a GPU-seeded oversubscribed image is missing
+  // pages before the stress even starts. Host puts make the storage state
+  // exact, so any stress mismatch indicts the DEVICE READ path alone.
+  {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(kPageBytes);
+    REQUIRE(shm.ptr_ != nullptr);
+    for (clio::run::u64 pg = 0; pg < kTotalPages; ++pg) {
+      auto *w = reinterpret_cast<clio::run::u32 *>(shm.ptr_);
+      for (clio::run::u64 i = 0; i < kPageElems; ++i) {
+        w[i] = Seed(pg * kPageElems + i);
+      }
+      char name[32];
+      gv::PageBlobName(pg, name);
+      auto f = core.AsyncPutBlob(vec.TagId(), std::string(name), 0,
+                                 kPageBytes, shm.Cast<void>().shm_);
+      f.Wait();
+      if (f->GetReturnCode() != 0) {
+        std::fprintf(stderr, "seed put %s rc=%d\n", name,
+                     f->GetReturnCode());
+      }
+      REQUIRE(f->GetReturnCode() == 0);
+    }
+  }
+
+  // Split write-path from read-path corruption BEFORE the stress phase:
+  // verify the seeded blobs from the HOST. A wrong byte here means the
+  // batched flush already stored another page's data; a clean pass here
+  // followed by a stress failure indicts the device read path.
+  {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    std::vector<clio::run::u32> buf(kPageElems, 0u);
+    clio::run::u64 bad_pages = 0;
+    for (clio::run::u64 pg = 0; pg < kTotalPages; pg += 7) {
+      char name[32];
+      gv::PageBlobName(pg, name);
+      auto f = core.AsyncGetBlob(vec.TagId(), std::string(name), 0, kPageBytes,
+                                 0, reinterpret_cast<char *>(buf.data()));
+      f.Wait();
+      if (f->GetReturnCode() != 0) {
+        std::fprintf(stderr, "seed-verify: host read %s rc=%d\n", name,
+                     f->GetReturnCode());
+        ++bad_pages;
+        continue;
+      }
+      for (clio::run::u64 i = 0; i < kPageElems; i += kPageElems / 4) {
+        const clio::run::u64 el = pg * kPageElems + i;
+        if (buf[i] != Seed(el)) {
+          std::fprintf(stderr,
+                       "seed-verify: page %llu el %llu got=0x%x want=0x%x\n",
+                       (unsigned long long) pg, (unsigned long long) el,
+                       buf[i], Seed(el));
+          ++bad_pages;
+          break;
+        }
+      }
+    }
+    if (bad_pages != 0) {
+      std::fprintf(stderr, "seed-verify: %llu corrupt pages BEFORE stress\n",
+                   (unsigned long long) bad_pages);
+    }
+    REQUIRE(bad_pages == 0);
+  }
 
   unsigned long long *err = nullptr;
   REQUIRE(cudaMalloc(&err, 4 * sizeof(unsigned long long)) == cudaSuccess);
