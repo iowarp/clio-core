@@ -577,7 +577,7 @@ class DeviceVector {
    */
   CTP_GPU_FUN void LockBlock() {
     if (h_->block_locks_ == nullptr) return;
-    int *lk = h_->block_locks_ + (blockIdx.x % h_->nblocks_);
+    int *lk = h_->block_locks_ + BlockIndex();
     while (atomicCAS(lk, 0, 1) != 0) {
       __nanosleep(32);
     }
@@ -588,7 +588,7 @@ class DeviceVector {
     if (h_->block_locks_ == nullptr) return;
     // Publish every page-table write before the lock is observed free.
     __threadfence();
-    atomicExch(h_->block_locks_ + (blockIdx.x % h_->nblocks_), 0);
+    atomicExch(h_->block_locks_ + BlockIndex(), 0);
   }
 
   /** Increment an instrumentation counter if the test enabled it. */
@@ -602,16 +602,31 @@ class DeviceVector {
 
   /** This block's batch slots -- same partitioning as the page table. */
   CTP_GPU_FUN MultiBatch *BlockBatches() const {
-    const clio::run::u32 b = blockIdx.x % h_->nblocks_;
-    return h_->multi_ + static_cast<clio::run::u64>(b) * h_->multi_per_block_;
+    return h_->multi_ +
+           static_cast<clio::run::u64>(BlockIndex()) * h_->multi_per_block_;
   }
 
   /** This block's slice of the page table. */
-  CTP_GPU_FUN Page *BlockPages() const {
+  /**
+   * THE block index -- the only definition. The page table, its lock, and
+   * the batch slots must all be selected by the SAME index: when fused
+   * launches introduced block_override_, only BlockPages() was updated, so a
+   * fused member's blocks mutated one table while holding a DIFFERENT
+   * table's lock. Two same-table blocks faulting concurrently then raced the
+   * claim/evict path unserialized -- the same page slot claimed twice, its
+   * get task submitted twice, and the second host staging clobbering the
+   * first's RunContext ("null RunContext" at varying points, constant under
+   * an eviction storm, rare but latent in ordinary fused decode).
+   */
+  CTP_GPU_FUN clio::run::u32 BlockIndex() const {
     const clio::run::u32 raw =
         block_override_ != kNoBlockOverride ? block_override_ : blockIdx.x;
-    const clio::run::u32 b = raw % h_->nblocks_;
-    return h_->pages_ + static_cast<clio::run::u64>(b) * h_->pages_per_block_;
+    return raw % h_->nblocks_;
+  }
+
+  CTP_GPU_FUN Page *BlockPages() const {
+    return h_->pages_ +
+           static_cast<clio::run::u64>(BlockIndex()) * h_->pages_per_block_;
   }
 
   /** A globally unique id for the next task this vector submits. */
