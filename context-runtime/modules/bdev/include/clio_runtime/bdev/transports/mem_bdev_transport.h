@@ -60,6 +60,12 @@ class MemBdevTransport : public BdevTransport {
   // identical device workload. Off in all normal operation.
   bool force_sync_gpu_{false};
 
+  // Pinned bounce slab for device-backed (kHbm) reads — D2D copies deadlock
+  // against resident faulting kernels (SM-starved driver copy-kernel).
+  static constexpr size_t kBounceBytes = 4u << 20;
+  char *bounce_ = nullptr;
+  std::mutex bounce_mu_;
+
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
 
  public:

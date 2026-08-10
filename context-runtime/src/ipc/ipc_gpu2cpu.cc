@@ -12,6 +12,7 @@
 #include <x86intrin.h>
 #include <exception>
 #include <mutex>
+#include <csignal>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
 
@@ -163,9 +164,29 @@ void EvChanReport() {
   }
 }
 
+// On-demand dump for HANGS: kill -USR1 <pid> prints the last ring events
+// and per-slot latency report without killing the process. fprintf in a
+// signal handler is not strictly async-signal-safe; acceptable for a
+// diagnosis tool that only ever runs on an already-wedged process.
+void EvDumpOnSignal(int) {
+  const unsigned long long end = g_ev_seq.load();
+  const unsigned long long begin = end > 256 ? end - 256 : 0;
+  fprintf(stderr, "==== gpu2cpu evlog (SIGUSR1, last %llu of %llu) ====\n",
+          end - begin, end);
+  for (unsigned long long n = begin; n < end; ++n) {
+    const EvRec &r = g_ev[n % kEvCap];
+    if (r.seq != n) continue;
+    fprintf(stderr, "  #%llu w%u %c slot=%llx aux=%llu\n", r.seq, r.tid,
+            r.kind, r.slot, r.aux);
+  }
+  fprintf(stderr, "==== end evlog ====\n");
+  fflush(stderr);
+}
+
 struct EvInit {
   EvInit() {
     g_prev_term = std::set_terminate(EvDumpOnTerminate);
+    signal(SIGUSR1, EvDumpOnSignal);
     if (std::getenv("CLIO_EVLAT") != nullptr) {
       std::atexit(EvChanReport);
     }

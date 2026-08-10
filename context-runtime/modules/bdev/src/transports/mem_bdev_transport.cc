@@ -112,6 +112,14 @@ void MemBdevTransport::InitDeviceBacking() {
   }
   device_usable_ = static_cast<size_t>(ram_capacity_);
   device_backed_ = true;
+  // PROVEN deadlock (see gpu-vector kHbm hang, 2026-08-10): intra-device
+  // cudaMemcpyAsync needs SM execution, and a resident faulting kernel
+  // occupying every SM starves it forever while spinning for that very
+  // copy. Bounce device-tier reads through this pinned slab instead:
+  // D2H + H2D are copy-engine DMA, immune to SM occupancy. Allocated HERE
+  // (init, no kernel resident) because cudaMallocHost on the fault path is
+  // its own deadlock.
+  bounce_ = ctp::GpuApi::MallocHost<char>(kBounceBytes);
   HLOG(kInfo, "HBM bdev: {} bytes of DEVICE memory allocated", ram_capacity_);
 #else
   HLOG(kWarning,
@@ -574,7 +582,24 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
       // dst is device memory here; enqueue the copy (or a zero-fill for a
       // never-written region) on the stream without waiting.
       if (page) {
-        ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, stream);
+        if (device_backed_ && bounce_ != nullptr) {
+          // Device-tier source: NEVER D2D (SM-starved deadlock, see Init).
+          // Serialize through the pinned bounce slab under a plain mutex —
+          // synchronous, no coroutine yield inside the hold, so fibers on
+          // this worker cannot interleave a second claim of the slab.
+          std::lock_guard<std::mutex> bl(bounce_mu_);
+          clio::run::u64 done = 0;
+          while (done < chunk) {
+            const clio::run::u64 c2 =
+                std::min<clio::run::u64>(chunk - done, kBounceBytes);
+            ctp::GpuApi::MemcpyAsync(bounce_, page + intra + done, c2, stream);
+            ctp::GpuApi::MemcpyAsync(dst + done, bounce_, c2, stream);
+            ctp::GpuApi::Synchronize(stream);
+            done += c2;
+          }
+        } else {
+          ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, stream);
+        }
       } else {
         ctp::GpuApi::MemsetAsync(dst, 0, chunk, stream);
       }
@@ -700,8 +725,10 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
   if (dev_dst) {
     // Copy-engine work only — safe to block on even with a faulting kernel
     // resident (kernels block later LAUNCHES, not DMA).
+    const unsigned long long ev_s0 = __rdtsc();
     ctp::GpuApi::Synchronize(stream);
     ctp::GpuApi::ReturnStream(stream);
+    clio_evlat_add(3, __rdtsc() - ev_s0);  // ch3: DirectRead sync portion
   }
   return 0;
 }
