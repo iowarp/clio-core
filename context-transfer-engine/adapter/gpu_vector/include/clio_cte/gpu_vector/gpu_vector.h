@@ -138,8 +138,9 @@ class Vector {
     clio::run::u64 rescores = 0;        // placement hints sent
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
+    clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
   };
-  static constexpr int kNumStats = 8;
+  static constexpr int kNumStats = 9;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -183,6 +184,7 @@ class Vector {
       kv.second.hdr.stat_rescores_ = c + 5;
       kv.second.hdr.stat_prefetch_late_ = c + 6;
       kv.second.hdr.stat_get_errors_ = c + 7;
+      kv.second.hdr.stat_pf_dropped_ = c + 8;
       PublishHeader(kv.second);   // the device reads the header, not the view
     }
 #endif
@@ -213,6 +215,7 @@ class Vector {
     s.rescores = h[5];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
+    s.pf_dropped = h[8];
 #else
     (void) dev_id;
 #endif

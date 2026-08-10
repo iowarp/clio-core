@@ -123,6 +123,7 @@ struct VecHeader {
   /** Gets that came back with a NON-ZERO return code. SubmitGet never checked
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
+  unsigned long long *stat_pf_dropped_ = nullptr;  // async hints dropped
 
 };
 
@@ -312,7 +313,13 @@ class DeviceVector {
         return nullptr;
       }
       p->last_access = Now();
-      p->score += 1.0f;   // frequency: what the window eviction ranks by
+      p->score += 1.0f;   // frequency: what the window eviction ranks by.
+      // The bistable-attractor caveat: on the MoE workload identical runs
+      // land at 13k or 22-36k faults depending on first-burst timing. Both
+      // a HIGHER fresh score (4.0) and a steeper reuse gradient (+2 touch,
+      // 1.0 fresh) were measured WORSE than this policy (5-6/7 slow runs vs
+      // 3/4 fast here) — do not re-tune blind; measure page-level churn
+      // first.
       last_page_ = p;
     }
     const clio::run::u64 within = IndexIn(off, p);
@@ -405,6 +412,20 @@ class DeviceVector {
    */
   static constexpr clio::run::u32 kProbeWindow = 64;
   CTP_GPU_FUN clio::run::u32 ClaimSlotWindowLocked(clio::run::u64 pn) {
+    clio::run::u32 s = ClaimSlotWindowOnceLocked(pn);
+    if (s == ~0u) {
+      // Every candidate is mid-transfer. If any are fetching=2 their batch
+      // may long since have LANDED — nothing settles an async batch until a
+      // toucher hits one of ITS pages, so a window can fill with landed-but-
+      // unsettled pages and starve every claimer whose page is not among
+      // them (observed: kernel spun forever, CPU idle). Settle and rescan.
+      SettleBatchLocked();
+      s = ClaimSlotWindowOnceLocked(pn);
+    }
+    return s;
+  }
+
+  CTP_GPU_FUN clio::run::u32 ClaimSlotWindowOnceLocked(clio::run::u64 pn) {
     Page *tbl = BlockPages();
     const clio::run::u32 ppb = h_->pages_per_block_;
     const clio::run::u32 d = (clio::run::u32) (pn % ppb);
@@ -1067,6 +1088,7 @@ class DeviceVector {
       // Every slot carries an unfinished batch. Drop the hint, never queue —
       // stacked prefetches serialize their callers, which is the exact
       // failure the async form exists to avoid.
+      Bump(h_->stat_pf_dropped_);
       return 0;
     }
     if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
@@ -1085,6 +1107,8 @@ class DeviceVector {
       np->page_num = pg;
       np->dirty = 0u;
       np->flushing = 0u;
+      // Same as the sync claim. 4.0 (protect prefetches) and 1.0 (steep
+      // reuse gradient) were both measured worse — see the eviction note.
       np->score = 2.0f;
       np->last_access = Now();
       char name[32];
