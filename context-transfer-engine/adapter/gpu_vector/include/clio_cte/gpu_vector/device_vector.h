@@ -209,7 +209,8 @@ class DeviceVector {
       // chains have no holes.
       {
         const clio::run::u32 d = (clio::run::u32) (pn % ppb);
-        for (clio::run::u32 k = 0; k < ppb; ++k) {
+        const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
+        for (clio::run::u32 k = 0; k < w; ++k) {
           clio::run::u32 i = d + k;
           if (i >= ppb) i -= ppb;
           if (tbl[i].page_num == pn && !tbl[i].fetching) {
@@ -273,6 +274,49 @@ class DeviceVector {
     Page *p = last_page_;
     p->dirty = 1u;
     return static_cast<T *>(p->data) + IndexIn(off, p);
+  }
+
+  /**
+   * PROBE-ONLY hold: the lock-free resident lookup and nothing else.
+   *
+   * Returns null on a miss instead of falling into the locked fault path, so
+   * a caller with a BETTER recovery than a scalar fault (a batched fetch of
+   * a whole expert, say) can take it. On a hit it is exactly HoldRawConst.
+   * Exists because FetchPagesBatched holds the table lock across its whole
+   * wait -- correct, but it means resident lookups that share a table with
+   * an in-flight batch convoy behind ~ms of lock hold unless they can probe
+   * without locking first.
+   */
+  CTP_GPU_FUN const T *TryHoldRawConst(clio::run::u64 off,
+                                       clio::run::u64 count,
+                                       clio::run::u64 *run) {
+    const clio::run::u64 pn = PageOf(off);
+    Page *p = last_page_;
+    if (p == nullptr || p->page_num != pn || p->fetching) {
+      p = nullptr;
+      Page *tbl = BlockPages();
+      const clio::run::u32 ppb = h_->pages_per_block_;
+      const clio::run::u32 d = (clio::run::u32) (pn % ppb);
+      const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
+      for (clio::run::u32 k = 0; k < w; ++k) {
+        clio::run::u32 i = d + k;
+        if (i >= ppb) i -= ppb;
+        if (tbl[i].page_num == pn && !tbl[i].fetching) {
+          p = &tbl[i];
+          break;
+        }
+        if (tbl[i].page_num == kNoPage) break;
+      }
+      if (p == nullptr) {
+        return nullptr;
+      }
+      p->last_access = Now();
+      last_page_ = p;
+    }
+    const clio::run::u64 within = IndexIn(off, p);
+    const clio::run::u64 left = h_->elems_per_page_ - within;
+    *run = (count < left) ? count : left;
+    return static_cast<const T *>(p->data) + within;
   }
 
   /** Read-only form of HoldRaw: does not dirty the page. */
@@ -339,6 +383,53 @@ class DeviceVector {
     }
     UnlockBlock();
     last_page_ = nullptr;   // the per-thread cache now points at a free slot
+  }
+
+  /**
+   * Claim a slot for `pn` within a BOUNDED probe window of its home slot.
+   *
+   * Open addressing degrades catastrophically at full load: with the table
+   * 100% occupied (an out-of-core working set churning through LRU, the MoE
+   * case), an unsuccessful probe scanned every slot (~743 dependent global
+   * loads) and successful chains grew to hundreds -- measured as ~3 ms of
+   * per-launch dwell that no compute optimization touched. Bounding the
+   * probe to kProbeWindow slots and EVICTING THE WINDOW'S LRU when no slot
+   * is free keeps every chain shorter than the window, permanently, at the
+   * cost of approximating global LRU by window-local LRU.
+   *
+   * Caller must hold the block lock. Returns the claimed slot, its entry
+   * reset and NOT yet marked fetching; ~0u if every window slot is pinned by
+   * an in-flight transfer.
+   */
+  static constexpr clio::run::u32 kProbeWindow = 64;
+  CTP_GPU_FUN clio::run::u32 ClaimSlotWindowLocked(clio::run::u64 pn) {
+    Page *tbl = BlockPages();
+    const clio::run::u32 ppb = h_->pages_per_block_;
+    const clio::run::u32 d = (clio::run::u32) (pn % ppb);
+    const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
+    clio::run::u32 victim = ~0u;
+    unsigned long long best = ~0ull;
+    for (clio::run::u32 k = 0; k < w; ++k) {
+      clio::run::u32 i = d + k;
+      if (i >= ppb) i -= ppb;
+      Page &pgi = tbl[i];
+      if (pgi.page_num == kNoPage) {
+        return i;
+      }
+      if (!pgi.fetching && !pgi.flushing && !pgi.rescoring &&
+          (unsigned long long) pgi.last_access < best) {
+        best = (unsigned long long) pgi.last_access;
+        victim = i;
+      }
+    }
+    if (victim == ~0u) {
+      return ~0u;
+    }
+    // Weights are read-only here (dirty is never set on this path); dropping
+    // the clean victim is a metadata write.
+    tbl[victim].page_num = kNoPage;
+    Bump(h_->stat_evicts_);
+    return victim;
   }
 
   /** EvictPages' body, for callers that already hold the block lock. */
@@ -881,25 +972,8 @@ class DeviceVector {
         ++resident;
         continue;
       }
-      clio::run::u32 slot = h_->pages_per_block_;
-      // Open addressing, same probe order as the lookup: first free slot at
-      // or after pg % ppb, wrapping.
-      {
-        const clio::run::u32 ppb3 = h_->pages_per_block_;
-        const clio::run::u32 d = (clio::run::u32) (pg % ppb3);
-        for (clio::run::u32 k = 0; k < ppb3; ++k) {
-          clio::run::u32 i = d + k;
-          if (i >= ppb3) i -= ppb3;
-          if (tbl[i].page_num == kNoPage) { slot = i; break; }
-        }
-      }
-      if (slot == h_->pages_per_block_) {
-        EvictLocked(1);
-        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-          if (tbl[i].page_num == kNoPage) { slot = i; break; }
-        }
-        if (slot == h_->pages_per_block_) break;  // everything is pinned
-      }
+      const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
+      if (slot == ~0u) break;   // whole window pinned by in-flight transfers
       Page *np = &tbl[slot];
       // fetching FIRST, then the page number -- same ordering the scalar claim
       // uses, and it is what keeps EvictLocked from choosing a slot this batch
@@ -961,16 +1035,11 @@ class DeviceVector {
       }
     }
     if (free_slot == h_->pages_per_block_) {
-      EvictLocked(1);
-      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-        if (tbl[i].page_num == kNoPage) {
-          free_slot = i;
-          break;
-        }
-      }
-      // Everything resident is mid-transfer: report failure rather than
+      const clio::run::u32 wslot = ClaimSlotWindowLocked(page_num);
+      // Everything in the window is mid-transfer: report failure rather than
       // stalling, so the caller simply falls back to a demand fault later.
-      if (free_slot == h_->pages_per_block_) return false;
+      if (wslot == ~0u) return false;
+      free_slot = wslot;
     }
     Page *p = &tbl[free_slot];
     // Same ordering as the synchronous claim: busy first, then the page
@@ -1113,19 +1182,8 @@ class DeviceVector {
     if (p == nullptr) {
       Page *tbl = BlockPages();
       for (;;) {
-        clio::run::u32 free_slot = h_->pages_per_block_;
-        // Open addressing: claim the first free slot AT OR AFTER pn % ppb,
-        // wrapping, so lookups can probe the same order and stop at an empty.
-        {
-          const clio::run::u32 ppb2 = h_->pages_per_block_;
-          const clio::run::u32 d = (clio::run::u32) (page_num % ppb2);
-          for (clio::run::u32 k = 0; k < ppb2; ++k) {
-            clio::run::u32 i = d + k;
-            if (i >= ppb2) i -= ppb2;
-            if (tbl[i].page_num == kNoPage) { free_slot = i; break; }
-          }
-        }
-        if (free_slot != h_->pages_per_block_) {
+        clio::run::u32 free_slot = ClaimSlotWindowLocked(page_num);
+        if (free_slot != ~0u) {
           p = &tbl[free_slot];
           // Order matters: mark the slot busy and publish that BEFORE the
           // page number, so HoldPage's lock-free scan cannot see a page that
@@ -1139,6 +1197,11 @@ class DeviceVector {
           SubmitGet(p, page_num);
           break;
         }
+        // Whole window pinned by in-flight transfers: brief wait, retry.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(200);
+#endif
+        continue;
         EvictLocked(1);   // already holding the lock
       }
     }

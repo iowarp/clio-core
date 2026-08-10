@@ -3368,20 +3368,32 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
   int first_rc = 0;
   clio::run::u32 n = task->count_;
   if (n > kPodMultiMax) n = kPodMultiMax;
-  for (clio::run::u32 i = 0; i < n; ++i) {
-    auto &req = task->reqs_[i];
-    auto sub = ipc_manager->NewTask<PodGetBlobTask>(
-        clio::run::CreateTaskId(), task->pool_id_,
-        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
-        req.offset_, req.size_, task->flags_, req.data_, task->context_);
-    sub.get()->BeginRunContext();
-    CLIO_CO_AWAIT(PodGetBlob(sub));
-    int rc = sub->GetReturnCode();
-    req.rc_ = static_cast<clio::run::u32>(rc);
-    if (rc == 0) {
-      task->num_ok_++;
-    } else if (first_rc == 0) {
-      first_rc = rc;
+  // ISSUE ALL, THEN AWAIT ALL. The nested-coroutine form
+  // (CLIO_CO_AWAIT(PodGetBlob(sub)) inside the loop) ran the records
+  // SEQUENTIALLY -- a 10-record batch cost ten full read round trips, which
+  // made batched paging amortize the submission but not the reads (measured
+  // ~1.2 ms per expert batch on the MoE fault path, serial-equivalent).
+  // Dispatching the subtasks as real tasks lets the bdev reads overlap
+  // across workers; the awaits then collect mostly-finished futures.
+  {
+    clio::run::Future<PodGetBlobTask> futs[kPodMultiMax];
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      auto &req = task->reqs_[i];
+      auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+          req.offset_, req.size_, task->flags_, req.data_, task->context_);
+      futs[i] = ipc_manager->Send(sub);
+    }
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      CLIO_CO_AWAIT(futs[i]);
+      int rc = futs[i]->GetReturnCode();
+      task->reqs_[i].rc_ = static_cast<clio::run::u32>(rc);
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (first_rc == 0) {
+        first_rc = rc;
+      }
     }
   }
   task->SetReturnCode(first_rc);

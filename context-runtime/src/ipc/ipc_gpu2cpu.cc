@@ -209,22 +209,42 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     // are per device-task-slot and long-lived, so the pinning cost is paid
     // once per slot, not per task.
 #if CTP_ENABLE_CUDA
-    // CLIO_GPU2CPU_PAGEABLE_SCRATCH: skip cudaHostAlloc for slot scratch.
-    // cudaHostAlloc takes the CUDA context WRITE lock, and this allocation
-    // happens on the fault-service path -- while a faulting kernel is
-    // resident and the client thread may hold the read lock inside a stream
-    // synchronize. That is the session's recurring deadlock triangle (see
-    // the cudaFree and lazy-module-load incidents). Under workloads that
-    // keep discovering new task slots mid-decode (MoE batch slots), the
-    // allocation must not require the context lock; pageable scratch makes
-    // DeviceAwareMemcpy internally staged (slower) but cannot deadlock.
-    static const bool pageable_scratch =
-        std::getenv("CLIO_GPU2CPU_PAGEABLE_SCRATCH") != nullptr;
-    void *pinned = nullptr;
-    if (!pageable_scratch &&
-        cudaHostAlloc(&pinned, kTaskScratchBytes, cudaHostAllocDefault) ==
-        cudaSuccess) {
-      slot_buf = static_cast<char *>(pinned);
+    // Slot scratch must be PINNED (pageable makes every completion copy an
+    // internally staged synchronous one -- measured as the difference
+    // between a working and a crawling MoE fault pipeline) and must NOT be
+    // allocated with cudaHostAlloc here: this code runs on the fault-service
+    // path while a faulting kernel is resident, and cudaHostAlloc takes the
+    // CUDA context WRITE lock -- the session's recurring deadlock triangle.
+    //
+    // So the scratch comes from a pinned POOL allocated once, lazily, in
+    // 64 MB slabs. The slab allocation itself still calls cudaHostAlloc, but
+    // only when the pool is exhausted; the pool is sized so that happens at
+    // startup (first slot discoveries) and effectively never mid-decode.
+    // Slabs are never freed; slot scratch was already immortal by design.
+    struct PinnedPool {
+      char *cur = nullptr;
+      size_t left = 0;
+      char *take(size_t n) {
+        n = (n + 255) & ~size_t(255);
+        if (n > left) {
+          const size_t slab = n > (64u << 20) ? n : (64u << 20);
+          void *p = nullptr;
+          if (cudaHostAlloc(&p, slab, cudaHostAllocDefault) != cudaSuccess) {
+            return nullptr;
+          }
+          cur = static_cast<char *>(p);
+          left = slab;
+        }
+        char *r = cur;
+        cur += n;
+        left -= n;
+        return r;
+      }
+    };
+    static thread_local PinnedPool pool;
+    char *pooled = pool.take(kTaskScratchBytes);
+    if (pooled != nullptr) {
+      slot_buf = pooled;
     } else {
       slot_buf = new char[kTaskScratchBytes];
     }
