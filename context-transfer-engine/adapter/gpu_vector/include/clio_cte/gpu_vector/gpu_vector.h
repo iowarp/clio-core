@@ -225,6 +225,15 @@ class Vector {
   void BuildDeviceTierMap() {
 #if CTP_ENABLE_CUDA
     if (devs_.empty()) return;
+    // GENERALITY GATE: a direct pointer is only valid when the STORED bytes
+    // are the representation the kernels read. Identity-stored tags (raw
+    // F16/Q4_K, and FP8 whose kernels decode e4m3 in-register) qualify; a
+    // tag read through a codec (compress_lib_ != 0) stores an nvcomp stream
+    // — those pages MUST materialize through the fetch+decompress path, so
+    // they never map. The page cache's contract: the tier holds the encoded
+    // representation, the cache holds the decoded one; mapping is the
+    // identity-codec specialization of that contract, not a bypass.
+    if (compress_lib_ != 0) return;
     const auto &h0 = devs_.begin()->second.hdr;
     const clio::run::u64 npages =
         (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
