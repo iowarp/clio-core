@@ -27,6 +27,7 @@
 #include "clio_ctp/util/logging.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -278,7 +279,23 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
     const unsigned int want =
         static_cast<unsigned int>(slot / clio::run::kGpuRingCapacity) + 1u;
     if (rdy[idx] != want) break;   // nothing there, or not finished yet
-    m.pending.push_back(m.host_entries[idx]);
+    // ACQUIRE between the stamp and the entry. The stamp is volatile but the
+    // entry is not, and nothing here stopped the COMPILER from hoisting the
+    // entry load above the stamp check -- accepting a stale entry whose stamp
+    // lands just in time. A stale entry is the PREVIOUS generation's task
+    // address: a completed task whose device POD carries the freed RunContext
+    // pointer SendOut wrote back, which the staged copy then presents as live
+    // ("SetAwaitedFshm: null RunContext" mid-execution under the
+    // CLIO_FUSE_SCALE reproducer). The old device-memory ring had this
+    // ordering physically, as two separate copy batches; the pinned rewrite
+    // must state it.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    GpuRingEntry e = m.host_entries[idx];
+    // Seqlock-style recheck: if the stamp no longer matches, the entry bytes
+    // we read may be torn; leave the slot for the next poll.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (rdy[idx] != want) break;
+    m.pending.push_back(e);
     ++accepted;
   }
   if (accepted == 0) return false;
