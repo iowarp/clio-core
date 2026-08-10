@@ -116,6 +116,16 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
       q = v.HoldRawConst(pn * kPageElems, kPageElems, &run);
     }
     if (q == nullptr) continue;  // window pinned; not a data error
+    // LONG READ: hold the raw pointer across ~50 us of "compute" before
+    // verifying — the MoE row loop's shape. Nothing pins a held page, so
+    // another block's claim (sync fault or async prefetch) can evict and
+    // recycle this slot mid-read; the verify below then sees another
+    // page's bytes.
+    {
+      const long long t0 = clock64();
+      while (clock64() - t0 < 100000) {
+      }
+    }
     // Verify a sample of the page (first, middle, last of the run).
     const clio::run::u64 idx[3] = {0, run / 2, run - 1};
     for (int k = 0; k < 3; ++k) {
