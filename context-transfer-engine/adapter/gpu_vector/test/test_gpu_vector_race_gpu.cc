@@ -162,8 +162,18 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
         << "    pool_name: clio_cte_core\n    pool_query: local\n"
         << "    pool_id: \"512.0\"\n"
         << "    storage:\n"
-        << "      - path: \"ram::gv_race_tier\"\n"
-        << "        bdev_type: \"ram\"\n        capacity_limit: \"2GB\"\n"
+        // CLIO_RACE_TIER=hbm turns this into the sub-minute kHbm wedge
+        // repro (managed-queue migration ping-pong under resident faulting
+        // kernels): same machinery as the 4-minute llama runs, verdict in
+        // the test's own runtime (~30 s; a 60 s timeout = wedge).
+        << "      - path: \"" << (std::getenv("CLIO_RACE_TIER")
+                                       ? std::getenv("CLIO_RACE_TIER")
+                                       : "ram")
+        << "::gv_race_tier\"\n"
+        << "        bdev_type: \"" << (std::getenv("CLIO_RACE_TIER")
+                                            ? std::getenv("CLIO_RACE_TIER")
+                                            : "ram")
+        << "\"\n        capacity_limit: \"2GB\"\n"
         << "        score: 1.0\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
