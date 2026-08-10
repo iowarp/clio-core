@@ -379,6 +379,20 @@ class DeviceVector {
     return q;
   }
 
+  /** HoldRawConst (faulting) that also captures slot + claim generation for
+   *  seqlock validation. On a miss it faults synchronously, then re-probes
+   *  to pick up the landed slot's generation. */
+  CTP_GPU_FUN const T *HoldRawConstG(clio::run::u64 off, clio::run::u64 count,
+                                     clio::run::u64 *run,
+                                     clio::run::u32 *gen_out,
+                                     Page **slot_out) {
+    const T *q = TryHoldRawConstG(off, count, run, gen_out, slot_out);
+    if (q != nullptr) return q;
+    q = HoldRawConst(off, count, run);
+    if (q == nullptr) return nullptr;
+    return TryHoldRawConstG(off, count, run, gen_out, slot_out);
+  }
+
   /** @return true if the slot still holds the same claim generation (no
    *  recycle happened since the paired TryHoldRawConstG). */
   CTP_GPU_FUN bool HoldStillValid(Page *slot, clio::run::u32 gen) {
