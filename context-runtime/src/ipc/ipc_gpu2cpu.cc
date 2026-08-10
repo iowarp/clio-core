@@ -5,6 +5,8 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
+#include <atomic>
+#include <exception>
 #include <unordered_map>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
@@ -29,6 +31,56 @@ namespace clio::run {
  * back and flip FUTURE_COMPLETE), then route it. Moved here from the worker so
  * the worker never deserializes tasks/futures. Runs on the worker thread.
  */
+
+// ---------------------------------------------------------------------------
+// Lifecycle event log for the per-slot scratch race (issue #961).
+//
+// A tiny always-on ring of {seq, tid, kind, slot, aux} records, dumped from a
+// chained std::terminate handler -- so when "null RunContext" throws anywhere,
+// the last events for every slot print without instrumenting task.h. Lock-free
+// via a relaxed atomic index; recording costs ~2 atomics per event on a path
+// that already does synchronous CUDA copies.
+// ---------------------------------------------------------------------------
+namespace {
+struct EvRec {
+  unsigned long long seq;
+  unsigned long long slot;   // device task address
+  unsigned long long aux;    // task_id unique / rc
+  unsigned int tid;          // worker id (or 0xFFFF for unknown)
+  char kind;                 // S=stage C=beginctx R=routed P=pod-writeback F=flip
+};
+constexpr unsigned kEvCap = 4096;
+EvRec g_ev[kEvCap];
+std::atomic<unsigned long long> g_ev_seq{0};
+
+void EvPush(char kind, unsigned tid, unsigned long long slot,
+            unsigned long long aux) {
+  const unsigned long long n =
+      g_ev_seq.fetch_add(1, std::memory_order_relaxed);
+  EvRec &r = g_ev[n % kEvCap];
+  r.seq = n; r.slot = slot; r.aux = aux; r.tid = tid; r.kind = kind;
+}
+
+std::terminate_handler g_prev_term = nullptr;
+void EvDumpOnTerminate() {
+  const unsigned long long end = g_ev_seq.load();
+  const unsigned long long begin = end > 256 ? end - 256 : 0;
+  fprintf(stderr, "==== gpu2cpu evlog (last %llu events) ====\n", end - begin);
+  for (unsigned long long n = begin; n < end; ++n) {
+    const EvRec &r = g_ev[n % kEvCap];
+    if (r.seq != n) continue;   // overwritten mid-dump
+    fprintf(stderr, "  #%llu w%u %c slot=%llx aux=%llu\n",
+            r.seq, r.tid, r.kind, r.slot, r.aux);
+  }
+  fprintf(stderr, "==== end evlog ====\n");
+  if (g_prev_term) g_prev_term();
+  abort();
+}
+struct EvInit {
+  EvInit() { g_prev_term = std::set_terminate(EvDumpOnTerminate); }
+} g_ev_init;
+}  // namespace
+
 bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) {
   gpu::Future<Task> gpu_future;
   // Device-ring path: the queue lives on the GPU, so there is nothing to Pop
@@ -177,6 +229,8 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   } else {
     task_raw = static_cast<Task *>(gpu_task_raw);
   }
+  EvPush('S', worker_id, reinterpret_cast<unsigned long long>(gpu_task_raw),
+         task_raw->task_id_.unique_);
 
   // Signal completion directly on the (possibly device-resident) Task's
   // embedded flag so the kernel poll-loop unblocks on the error paths below.
@@ -238,6 +292,8 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  EvPush('C', worker_id, reinterpret_cast<unsigned long long>(gpu_task_raw),
+         task_raw->task_id_.unique_);
 
   RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
   HLOG(kDebug,
@@ -327,6 +383,10 @@ void IpcGpu2Cpu::SendOut(
   }();
   const bool use_async = device_task && async_complete && ring_stream != nullptr;
 
+  if (device_task) {
+    EvPush('P', 0xFFFF, future_shm->gpu_task_device_ptr_,
+           host_task->task_id_.unique_);
+  }
   if (device_task && !use_async) {
     // kDeviceMem: write back the mutated POD. is_complete_ is still 0 here on
     // purpose -- the flag is flipped at the END of this function, once nothing
@@ -372,6 +432,8 @@ void IpcGpu2Cpu::SendOut(
           reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
               complete_off,
           &one, sizeof(u32));
+      EvPush('F', 0xFFFF, future_shm->gpu_task_device_ptr_,
+             host_task->task_id_.unique_);
     }
   }
   (void)ipc;
