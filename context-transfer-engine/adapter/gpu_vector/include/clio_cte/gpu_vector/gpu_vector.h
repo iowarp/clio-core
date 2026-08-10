@@ -139,8 +139,10 @@ class Vector {
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
     clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
+    clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
+    clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
   };
-  static constexpr int kNumStats = 9;
+  static constexpr int kNumStats = 11;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -185,6 +187,8 @@ class Vector {
       kv.second.hdr.stat_prefetch_late_ = c + 6;
       kv.second.hdr.stat_get_errors_ = c + 7;
       kv.second.hdr.stat_pf_dropped_ = c + 8;
+      kv.second.hdr.stat_verify_ok_ = c + 9;
+      kv.second.hdr.stat_verify_lost_ = c + 10;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
         const clio::run::u64 npg =
             (kv.second.hdr.size_ + kv.second.hdr.page_bytes_ - 1) /
@@ -242,6 +246,8 @@ class Vector {
     s.prefetch_late = h[6];
     s.get_errors = h[7];
     s.pf_dropped = h[8];
+    s.verify_ok = h[9];
+    s.verify_lost = h[10];
 #else
     (void) dev_id;
 #endif

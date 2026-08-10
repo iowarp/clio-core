@@ -70,6 +70,10 @@ struct MultiBatch {
 struct Page {
   /** Which page of the vector this slot holds; kNoPage when free. */
   clio::run::u64 page_num;
+  /** Claim generation: bumped every time this slot is (re)claimed. A reader
+   *  that captured gen at hold time and sees it unchanged after computing
+   *  knows the slot was never recycled mid-read (seqlock validate). */
+  clio::run::u32 gen;
   /** This page's bytes, in the device page backend. */
   void *data;
   /** Set by RescorePage; EvictPages takes the lowest. */

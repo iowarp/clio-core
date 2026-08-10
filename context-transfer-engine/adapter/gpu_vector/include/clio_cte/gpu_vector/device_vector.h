@@ -128,6 +128,11 @@ struct VecHeader {
   // (same pages refaulted) from coverage (more unique pages) between the
   // bistable attractors. Device array of one u32 per vector page.
   unsigned int *fault_hist_ = nullptr;
+  // CLIO_MOE_VERIFY in-vivo counters: after computing an item the kernel
+  // re-probes its page; lost = the held pointer no longer resolves to the
+  // same slot (evicted/recycled mid-read).
+  unsigned long long *stat_verify_ok_ = nullptr;
+  unsigned long long *stat_verify_lost_ = nullptr;
 
 };
 
@@ -336,6 +341,28 @@ class DeviceVector {
     const clio::run::u64 left = h_->elems_per_page_ - within;
     *run = (count < left) ? count : left;
     return static_cast<const T *>(p->data) + within;
+  }
+
+  /** TryHoldRawConst that also captures the slot's claim generation, for
+   *  seqlock validation after a long raw read (see Page::gen). */
+  CTP_GPU_FUN const T *TryHoldRawConstG(clio::run::u64 off,
+                                        clio::run::u64 count,
+                                        clio::run::u64 *run,
+                                        clio::run::u32 *gen_out,
+                                        Page **slot_out) {
+    const T *q = TryHoldRawConst(off, count, run);
+    if (q != nullptr && last_page_ != nullptr) {
+      *slot_out = last_page_;
+      *gen_out = *(volatile clio::run::u32 *) &last_page_->gen;
+    }
+    return q;
+  }
+
+  /** @return true if the slot still holds the same claim generation (no
+   *  recycle happened since the paired TryHoldRawConstG). */
+  CTP_GPU_FUN bool HoldStillValid(Page *slot, clio::run::u32 gen) {
+    __threadfence();
+    return *(volatile clio::run::u32 *) &slot->gen == gen;
   }
 
   /** Read-only form of HoldRaw: does not dirty the page. */
@@ -1112,6 +1139,7 @@ class DeviceVector {
       const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
       if (slot == ~0u) break;
       Page *np = &tbl[slot];
+      np->gen += 1u;
       np->fetching = 2u;  // batch-async: settled via SettleBatchLocked
       // DEVICE-wide: the readers that must observe fetching before the new
       // page_num are lock-free probes in OTHER blocks. A block fence let
@@ -1180,6 +1208,7 @@ class DeviceVector {
       // fetching FIRST, then the page number -- same ordering the scalar claim
       // uses, and it is what keeps EvictLocked from choosing a slot this batch
       // has already claimed but not yet filled.
+      np->gen += 1u;
       np->fetching = 1u;
       __threadfence();  // device-wide; see the async claim note
       np->page_num = pg;
@@ -1254,6 +1283,7 @@ class DeviceVector {
     // resident while its transfer is still in flight.
     p->fetching = 1u;
     __threadfence_block();
+    p->gen += 1u;
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -1404,6 +1434,7 @@ class DeviceVector {
           // looks resident while its bytes are still in flight.
           p->fetching = 1u;
           __threadfence_block();
+          p->gen += 1u;
           p->page_num = page_num;
           p->dirty = 0u;
           p->flushing = 0u;
