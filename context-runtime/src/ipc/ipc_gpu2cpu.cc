@@ -662,7 +662,7 @@ extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id) {
 namespace {
 struct LocateEntry {
   int (*fn)(void *, const void *, const char *, unsigned long long *,
-            unsigned long long *);
+            unsigned long long *, unsigned long long *);
   void *ctx;
 };
 std::mutex g_locate_mu;
@@ -671,7 +671,7 @@ LocateEntry g_locate{nullptr, nullptr};
 
 extern "C" void clio_cte_locate_register(
     int (*fn)(void *, const void *, const char *, unsigned long long *,
-              unsigned long long *),
+              unsigned long long *, unsigned long long *),
     void *ctx) {
   std::lock_guard<std::mutex> lk(g_locate_mu);
   g_locate = LocateEntry{fn, ctx};
@@ -681,14 +681,15 @@ extern "C" void clio_cte_locate_register(
  *  (pointer to a cte TagId); nonzero when unknown. */
 extern "C" int clio_cte_locate(const void *tag_id, const char *name,
                                unsigned long long *pool_u64,
-                               unsigned long long *target_off) {
+                               unsigned long long *target_off,
+                               unsigned long long *stored_size) {
   LocateEntry e{nullptr, nullptr};
   {
     std::lock_guard<std::mutex> lk(g_locate_mu);
     e = g_locate;
   }
   if (e.fn == nullptr) return -1;
-  return e.fn(e.ctx, tag_id, name, pool_u64, target_off);
+  return e.fn(e.ctx, tag_id, name, pool_u64, target_off, stored_size);
 }
 
 /** @return the pool's device base pointer, or nullptr if not device-backed. */

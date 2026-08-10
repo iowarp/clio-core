@@ -5,6 +5,8 @@
 
 #include <x86intrin.h>
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream);
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -612,6 +614,35 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
               for (int sp = 0; sp < 2000; ++sp) {   // ~100 ms budget
                 if (ctp::GpuApi::StreamQuery(bstream)) { ok2 = true; break; }
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+              }
+              if (!ok2 && att == 1) {
+                // EXPERIMENT (user question: do CPU-LAUNCHED KERNELS
+                // schedule while engine copies stall?): service this
+                // segment with a copy KERNEL on the fresh stream. Kernels
+                // are SM-scheduled; the 28-block compute grid leaves 20+
+                // SMs idle. Completion here proves the CPU-launched-kernel
+                // fault-service design is viable.
+#if CTP_ENABLE_CUDA
+                void *ks = ctp::GpuApi::BorrowStream();
+                if (ks != nullptr) {
+                  ctp_copy_kernel_launch(slab, page + intra + done, c2, ks);
+                  ctp_copy_kernel_launch(dst + done, slab, c2, ks);
+                  bool kok = false;
+                  for (int sp = 0; sp < 4000; ++sp) {
+                    if (ctp::GpuApi::StreamQuery(ks)) { kok = true; break; }
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(50));
+                  }
+                  HLOG(kError,
+                       "kHbm bounce: COPY-KERNEL fallback {} (stream {})",
+                       kok ? "COMPLETED — CPU-launched kernels schedule "
+                             "under the wedge"
+                           : "ALSO STALLED",
+                       ks);
+                  ctp::GpuApi::ReturnStream(ks);
+                  if (kok) { ok2 = true; }
+                }
+#endif
               }
               if (!ok2) {
                 HLOG(kError,
