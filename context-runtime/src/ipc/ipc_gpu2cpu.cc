@@ -656,6 +656,41 @@ extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id) {
   g_dev_base_map.erase(pool_id);
 }
 
+// CTE blob locator: lets an in-process consumer (gpu_vector init) resolve a
+// blob name to its (bdev pool, target offset) without a task round trip —
+// the metadata needed to build the zero-copy device-offset table.
+namespace {
+struct LocateEntry {
+  int (*fn)(void *, const void *, const char *, unsigned long long *,
+            unsigned long long *);
+  void *ctx;
+};
+std::mutex g_locate_mu;
+LocateEntry g_locate{nullptr, nullptr};
+}  // namespace
+
+extern "C" void clio_cte_locate_register(
+    int (*fn)(void *, const void *, const char *, unsigned long long *,
+              unsigned long long *),
+    void *ctx) {
+  std::lock_guard<std::mutex> lk(g_locate_mu);
+  g_locate = LocateEntry{fn, ctx};
+}
+
+/** @return 0 and fills (pool_u64, target_off) for blob `name` in `tag_id`
+ *  (pointer to a cte TagId); nonzero when unknown. */
+extern "C" int clio_cte_locate(const void *tag_id, const char *name,
+                               unsigned long long *pool_u64,
+                               unsigned long long *target_off) {
+  LocateEntry e{nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lk(g_locate_mu);
+    e = g_locate;
+  }
+  if (e.fn == nullptr) return -1;
+  return e.fn(e.ctx, tag_id, name, pool_u64, target_off);
+}
+
 /** @return the pool's device base pointer, or nullptr if not device-backed. */
 extern "C" char *clio_direct_dev_base(unsigned long long pool_id) {
   std::lock_guard<std::mutex> lk(g_dev_base_mu);

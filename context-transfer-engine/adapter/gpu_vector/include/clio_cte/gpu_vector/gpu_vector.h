@@ -29,6 +29,11 @@
 #include <string>
 #include <vector>
 
+extern "C" int clio_cte_locate(const void *tag_id, const char *name,
+                               unsigned long long *pool_u64,
+                               unsigned long long *target_off);
+extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
+
 namespace clio::cte::gpu_vector {
 
 #if !CTP_IS_DEVICE_PASS
@@ -201,6 +206,56 @@ class Vector {
       }
       PublishHeader(kv.second);   // the device reads the header, not the view
     }
+#endif
+  }
+
+  /**
+   * ZERO-COPY DEVICE-TIER MAP. If this tag's page blobs live on a kHbm bdev
+   * (device memory), build a per-page offset table and hand the device view
+   * a direct pointer: faults become pointer arithmetic — no slot, no fetch,
+   * no DMA (a D2H read under a resident kernel queues behind its channel
+   * and can wedge the fault service; mapping removes the transfer class).
+   * Call AFTER ingest so the blobs exist. No-op for host tiers.
+   */
+  void BuildDeviceTierMap() {
+#if CTP_ENABLE_CUDA
+    if (devs_.empty()) return;
+    const auto &h0 = devs_.begin()->second.hdr;
+    const clio::run::u64 npages =
+        (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
+    if (npages == 0) return;
+    unsigned long long pool = 0, toff = 0;
+    if (clio_cte_locate(&tag_id_, "p0", &pool, &toff) != 0) return;
+    char *base = clio_direct_dev_base(pool);
+    if (base == nullptr) return;   // not a device tier
+    std::vector<unsigned long long> offs(npages, ~0ull);
+    clio::run::u64 mapped = 0;
+    for (clio::run::u64 pg = 0; pg < npages; ++pg) {
+      char name[32];
+      PageBlobName(pg, name);
+      unsigned long long p2 = 0, o2 = 0;
+      if (clio_cte_locate(&tag_id_, name, &p2, &o2) == 0 && p2 == pool) {
+        offs[pg] = o2;
+        ++mapped;
+      }
+    }
+    void *dev_offs = nullptr;
+    if (cudaMalloc(&dev_offs, npages * sizeof(unsigned long long)) !=
+        cudaSuccess) {
+      return;
+    }
+    cudaMemcpy(dev_offs, offs.data(), npages * sizeof(unsigned long long),
+               cudaMemcpyHostToDevice);
+    for (auto &kv : devs_) {
+      kv.second.hdr.tier_base_ = base;
+      kv.second.hdr.tier_off_ =
+          static_cast<const unsigned long long *>(dev_offs);
+      PublishHeader(kv.second);
+    }
+    std::fprintf(stderr,
+                 "gpu_vector: DEVICE-TIER MAP active — %llu/%llu pages "
+                 "zero-copy\n",
+                 (unsigned long long) mapped, (unsigned long long) npages);
 #endif
   }
 

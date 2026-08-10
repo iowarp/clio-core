@@ -133,6 +133,13 @@ struct VecHeader {
   // same slot (evicted/recycled mid-read).
   unsigned long long *stat_verify_ok_ = nullptr;
   unsigned long long *stat_verify_lost_ = nullptr;
+  // ZERO-COPY DEVICE-TIER MAP: when the tag's pages live on a kHbm bdev,
+  // faults resolve to tier_base_ + tier_off_[page] directly — no slot claim,
+  // no fetch, no DMA (device-memory reads under a resident kernel queue
+  // behind its channel and wedge; a mapped pointer removes the transfer).
+  // tier_off_[p] == ~0ull means page p is not device-resident.
+  char *tier_base_ = nullptr;
+  const unsigned long long *tier_off_ = nullptr;
 
 };
 
@@ -180,6 +187,19 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 HoldPage(clio::run::u64 off,
                                       clio::run::u64 count) {
     const clio::run::u64 pn = PageOf(off);
+    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
+        h_->tier_off_[pn] != ~0ull) {
+      // Direct-mapped page: no residency management. operator[] resolves
+      // through GetPagePtr-style holds only for slot pages, so expose the
+      // mapped bytes via last_page_-less run accounting.
+      const clio::run::u64 within = off - pn * h_->elems_per_page_;
+      const clio::run::u64 left = h_->elems_per_page_ - within;
+      map_ptr_ = reinterpret_cast<T *>(h_->tier_base_ + h_->tier_off_[pn]);
+      map_pn_ = pn;
+      last_was_map_ = true;
+      return (count < left) ? count : left;
+    }
+    last_was_map_ = false;
     Page *p = last_page_;
     if (p == nullptr || p->page_num != pn || p->fetching) {
       // Look the page up WITHOUT the block lock. Taking it here is what made
@@ -266,6 +286,7 @@ class DeviceVector {
    * @return the held page's data, or nullptr if no page has been resolved.
    */
   CTP_GPU_FUN T *GetPagePtr() const {
+    if (last_was_map_) return map_ptr_;
     return last_page_ != nullptr ? static_cast<T *>(last_page_->data)
                                  : nullptr;
   }
@@ -281,6 +302,11 @@ class DeviceVector {
    * 12x a raw pointer even when it always hit, and hold-and-iterate is 1.44x.
    */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
+    if (map_ptr_ != nullptr && PageOf(off) == map_pn_) {
+      // Direct-mapped tier page (read-mostly by contract; writes would land
+      // in the TIER, which for weights never happens).
+      return map_ptr_[off - map_pn_ * h_->elems_per_page_];
+    }
     Page *p = last_page_;
     p->dirty = 1u;
     return static_cast<T *>(p->data)[IndexIn(off, p)];
@@ -288,6 +314,9 @@ class DeviceVector {
 
   /** Read-only access through the held page. Does NOT dirty it. */
   CTP_GPU_FUN const T &at(clio::run::u64 off) const {
+    if (map_ptr_ != nullptr && PageOf(off) == map_pn_) {
+      return map_ptr_[off - map_pn_ * h_->elems_per_page_];
+    }
     const Page *p = last_page_;
     return static_cast<const T *>(p->data)[IndexIn(off, p)];
   }
@@ -323,6 +352,25 @@ class DeviceVector {
                                        clio::run::u64 count,
                                        clio::run::u64 *run) {
     const clio::run::u64 pn = PageOf(off);
+    // Device-tier direct map: immutable, lock-free, no slot involved.
+    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
+        h_->tier_off_[pn] != ~0ull) {
+      const clio::run::u64 within = off - pn * h_->elems_per_page_;
+      clio::run::u64 r = h_->elems_per_page_ - within;
+      if (count < r) r = count;
+      *run = r;
+      return reinterpret_cast<const T *>(h_->tier_base_ +
+                                         h_->tier_off_[pn]) + within;
+    }
+    // Device-tier direct map: immutable, lock-free, no slot involved.
+    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
+        h_->tier_off_[pn] != ~0ull) {
+      const clio::run::u64 within = off - pn * h_->elems_per_page_;
+      *run = h_->elems_per_page_ - within;
+      if (count < *run) *run = count;
+      return reinterpret_cast<const T *>(h_->tier_base_ +
+                                         h_->tier_off_[pn]) + within;
+    }
     Page *p = last_page_;
     if (p == nullptr || p->page_num != pn || p->fetching) {
       p = nullptr;
@@ -396,6 +444,7 @@ class DeviceVector {
   /** @return true if the slot still holds the same claim generation (no
    *  recycle happened since the paired TryHoldRawConstG). */
   CTP_GPU_FUN bool HoldStillValid(Page *slot, clio::run::u32 gen) {
+    if (slot == nullptr) return true;   // direct-mapped: immutable
     __threadfence();
     return *(volatile clio::run::u32 *) &slot->gen == gen;
   }
@@ -756,6 +805,9 @@ class DeviceVector {
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
   Page *last_page_ = nullptr;
+  T *map_ptr_ = nullptr;              // direct-mapped page (HoldPage path)
+  clio::run::u64 map_pn_ = ~0ull;
+  bool last_was_map_ = false;
   /**
    * Slot index where the lock-free scan STARTS: the last hit.
    *

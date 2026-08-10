@@ -40,6 +40,12 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" int clio_direct_read(unsigned long long pool_id,
                                 unsigned long long off, unsigned long long size,
                                 char *dst);
+// Zero-copy device-tier mapping: register an in-process blob locator so the
+// gpu_vector can resolve page blobs to (pool, target offset) at init.
+extern "C" void clio_cte_locate_register(
+    int (*fn)(void *, const void *, const char *, unsigned long long *,
+              unsigned long long *),
+    void *ctx);
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
@@ -502,8 +508,31 @@ void Runtime::MirrorBlobToShm(const std::string &composite_key,
   shm_cache_.PutBlob(composite_key, rec);
 }
 
+namespace {
+// In-process blob locator (see clio_cte_locate in the core lib). Returns the
+// FIRST block's (pool, target offset) — page blobs are single-block.
+int CteLocateTrampoline(void *ctx, const void *tag_id_p, const char *name,
+                        unsigned long long *pool_u64,
+                        unsigned long long *target_off) {
+  auto *rt = static_cast<Runtime *>(ctx);
+  const auto *tag_id = static_cast<const TagId *>(tag_id_p);
+  const std::string key = std::to_string(tag_id->major_) + "." +
+                          std::to_string(tag_id->minor_) + "." + name;
+  std::shared_ptr<BlobInfo> bi = rt->LocateBlobShared(key);
+  if (!bi || bi->blocks_.empty()) return -1;
+  *pool_u64 = bi->blocks_[0].bdev_client_.pool_id_.ToU64();
+  *target_off = bi->blocks_[0].target_offset_;
+  return 0;
+}
+}  // namespace
+
+std::shared_ptr<BlobInfo> Runtime::LocateBlobShared(const std::string &key) {
+  return tag_blob_name_to_info_.get(key);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio_cte_locate_register(&CteLocateTrampoline, this);
   // Initialize unordered_map_ll instances with appropriately sized bucket
   // counts. Tag/blob maps are large to avoid excessive collisions at scale.
   // Target maps stay small — target counts are O(1–10), not O(100K) — so
