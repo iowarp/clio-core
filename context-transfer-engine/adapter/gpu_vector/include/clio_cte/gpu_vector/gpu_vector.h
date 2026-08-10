@@ -148,6 +148,7 @@ class Vector {
     clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
   };
   static constexpr int kNumStats = 11;
+  bool fully_device_mapped_ = false;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -217,6 +218,10 @@ class Vector {
    * and can wedge the fault service; mapping removes the transfer class).
    * Call AFTER ingest so the blobs exist. No-op for host tiers.
    */
+  /** @return true when BuildDeviceTierMap mapped every page (reads never
+   *  fault; warm-up and slot prefetching are pointless). */
+  bool FullyDeviceMapped() const { return fully_device_mapped_; }
+
   void BuildDeviceTierMap() {
 #if CTP_ENABLE_CUDA
     if (devs_.empty()) return;
@@ -252,6 +257,7 @@ class Vector {
           static_cast<const unsigned long long *>(dev_offs);
       PublishHeader(kv.second);
     }
+    fully_device_mapped_ = (mapped == npages);
     std::fprintf(stderr,
                  "gpu_vector: DEVICE-TIER MAP active — %llu/%llu pages "
                  "zero-copy\n",
