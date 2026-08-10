@@ -250,6 +250,27 @@ class DeviceVector {
   }
 
   /**
+   * Raw pointer to the page most recently resolved by HoldPage on THIS
+   * DeviceVector copy — page-relative access without per-element global
+   * offset arithmetic:
+   *
+   *   v.HoldPage(pn * elems_per_page, elems_per_page);
+   *   T *page = v.GetPagePtr();
+   *   ... page[i] ...            // i is an index WITHIN the page
+   *
+   * Same lifetime rule as every raw hold: nothing pins the slot, so a
+   * concurrent claim can recycle it mid-read. For long reads, capture the
+   * claim generation (TryHoldRawConstG) and validate with HoldStillValid
+   * after — see the kq kernel's seqlock retry.
+   *
+   * @return the held page's data, or nullptr if no page has been resolved.
+   */
+  CTP_GPU_FUN T *GetPagePtr() const {
+    return last_page_ != nullptr ? static_cast<T *>(last_page_->data)
+                                 : nullptr;
+  }
+
+  /**
    * Element access through the HELD page -- no resolution, no checks.
    *
    * Assumes HoldPage() covers `off`: it indexes last_page_ directly, which is
