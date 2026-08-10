@@ -231,6 +231,7 @@ class DeviceVector {
       // it and LRU evicted the most recently used page instead of the oldest.
       // Still once per page TRANSITION, never per element.
       p->last_access = Now();
+      p->score += 1.0f;
       last_page_ = p;
     }
     const clio::run::u64 within = IndexIn(off, p);
@@ -311,6 +312,7 @@ class DeviceVector {
         return nullptr;
       }
       p->last_access = Now();
+      p->score += 1.0f;   // frequency: what the window eviction ranks by
       last_page_ = p;
     }
     const clio::run::u64 within = IndexIn(off, p);
@@ -408,7 +410,7 @@ class DeviceVector {
     const clio::run::u32 d = (clio::run::u32) (pn % ppb);
     const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
     clio::run::u32 victim = ~0u;
-    unsigned long long best = ~0ull;
+    float best = 3.4e38f;
     for (clio::run::u32 k = 0; k < w; ++k) {
       clio::run::u32 i = d + k;
       if (i >= ppb) i -= ppb;
@@ -416,9 +418,22 @@ class DeviceVector {
       if (pgi.page_num == kNoPage) {
         return i;
       }
+      // FREQUENCY, not recency. With the working set larger than the cache,
+      // LRU converges to ~0% hit rate: every page's reuse distance exceeds
+      // capacity, so everything is evicted before its next use. Routed-expert
+      // traffic is SKEWED -- hot experts recur -- and a touch-count score
+      // keeps them resident while cold ones churn.
+      //
+      // Aging must be LINEAR and slow. Halving per claim scan was ~0.5^23
+      // per token (a table sees ~23 claims/token): every score decayed to
+      // zero between touches, eviction degenerated to random, and a batch's
+      // own just-fetched pages self-evicted at score ~0.004. At -0.02 per
+      // scan, a page touched once per token sustains ~+0.5/token net while
+      // an untouched one loses its history in ~50 claims.
+      pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
       if (!pgi.fetching && !pgi.flushing && !pgi.rescoring &&
-          (unsigned long long) pgi.last_access < best) {
-        best = (unsigned long long) pgi.last_access;
+          pgi.score < best) {
+        best = pgi.score;
         victim = i;
       }
     }
@@ -983,7 +998,11 @@ class DeviceVector {
       np->page_num = pg;
       np->dirty = 0u;
       np->flushing = 0u;
-      np->score = 0.0f;
+      // A fresh page must not be the window's instant victim: claimed with
+      // score 0 and stale last_access it was FIRST in line for eviction --
+      // measured as more faults per token than routed pages.
+      np->score = 2.0f;
+      np->last_access = Now();
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
