@@ -34,7 +34,11 @@
 namespace gv = clio::cte::gpu_vector;
 
 namespace {
-constexpr clio::run::u64 kPageBytes = 4096;
+// 512 KiB pages — the MoE workload's granularity. The 4 KiB first cut
+// PASSED on known-broken code: its DMA lands in microseconds, so the
+// claim->land window the race needs never opened. Window length is the
+// amplification lever, not iteration count.
+constexpr clio::run::u64 kPageBytes = 128ull << 10;
 constexpr clio::run::u64 kPageElems = kPageBytes / sizeof(clio::run::u32);
 
 /** Seed value for element i. */
@@ -54,9 +58,12 @@ __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
     for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
       v[base + i] = Seed(base + i);
     }
+    // Flush per page: the slice is larger than the cache, and an evicted
+    // dirty page is DROPPED, not written back (weights-path assumption) —
+    // deferring the flush to the end seeds cross-page garbage.
+    v.BeginFlush(base, i);
+    v.WaitFlush(base, i);
   }
-  v.BeginFlush(base, per);
-  v.WaitFlush(base, per);
 }
 
 /**
@@ -93,11 +100,11 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
 
     // Async prefetch of an unrelated page range every few iterations —
     // the long in-flight window is what widens claim races enough to fire.
-    if ((it & 3) == 0) {
+    {
       rng = rng * 1664525u + 1013904223u;
       const clio::run::u64 pf = rng % total_pages;
       v.block_override_ = (clio::run::u32) (pf % s_hdr.nblocks_);
-      v.FetchPagesBatchedAsync(pf, 2);
+      v.FetchPagesBatchedAsync(pf, 4);
       v.block_override_ = (clio::run::u32) (pn % s_hdr.nblocks_);
     }
 
@@ -152,13 +159,16 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   // blocks with only 8 cache slots per table — heavy oversubscription, so
   // claim/evict runs constantly against the lock-free probes.
   constexpr unsigned kBlocks = 24;
-  constexpr clio::run::u64 kPagesPerSlice = 8;
+  // pages_per_block must exceed 128 so multi_per_block >= 3 and the ASYNC
+  // batch slots exist at all (ceil(ppb/64) - 1 of them); 384 pages walked
+  // through 192 slots keeps claim/evict hot.
+  constexpr clio::run::u64 kPagesPerSlice = 384;
   constexpr clio::run::u64 kTotalPages = kBlocks * kPagesPerSlice;
   constexpr int kIters = 512;
   const clio::run::u64 n = kTotalPages * kPageElems;
 
   gv::Vector<clio::run::u32> vec("gv_race", {0}, kPageBytes, kBlocks,
-                                 /*pages_per_block=*/8, n);
+                                 /*pages_per_block=*/192, n);
 
   RaceSeedKernel<<<kBlocks, 32>>>(gpu_info, vec.GetDevice(0),
                                   kPagesPerSlice * kPageElems);
