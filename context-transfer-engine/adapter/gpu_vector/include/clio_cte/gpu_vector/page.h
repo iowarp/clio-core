@@ -58,6 +58,12 @@ struct MultiBatch {
   clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> put_fut;
   clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask> get_fut;
   clio::run::u32 page_slot[clio::cte::core::kPodMultiMax];
+  /** Nonzero: get_fut carries an ASYNC batch that has not been settled.
+   *  Its pages are marked fetching=2; AwaitFetch on any of them settles the
+   *  whole batch. One outstanding async batch per table. */
+  clio::run::u32 async_pending;
+  /** Number of records in the un-settled async batch. */
+  clio::run::u32 async_n;
 };
 
 /** One resident page. */

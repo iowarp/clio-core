@@ -419,6 +419,8 @@ class Vector {
             clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
         mtbl[static_cast<size_t>(i)].get_fut =
             clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
+        mtbl[static_cast<size_t>(i)].async_pending = 0;
+        mtbl[static_cast<size_t>(i)].async_n = 0;
       }
       UploadBytes(mtasks.data(), st.multi_task_base,
                   static_cast<clio::run::u64>(nbatch) * pair);

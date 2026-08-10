@@ -545,6 +545,30 @@ class DeviceVector {
   }
 
   /**
+   * Issue ONE batched get for the missing pages of [first_page, first_page+n)
+   * WITHOUT waiting for it — the batched analogue of BeginFetch, and the
+   * primitive that makes fetch/compute PIPELINING possible: the synchronous
+   * FetchPagesBatched holds the table lock through the whole round trip
+   * (~300 µs), so nothing it "prefetched" ever overlapped anything.
+   *
+   * Claimed pages are marked fetching=2; any later toucher (AwaitFetch via
+   * Resolve/Hold, or the synchronous batch) settles the WHOLE batch. One
+   * outstanding async batch per table: if one is already in flight and not
+   * yet complete, this returns 0 and fetches nothing — the caller is
+   * prefetching, so dropping the hint is always safe.
+   *
+   * @return pages actually claimed and issued (0 = all resident/in-flight,
+   *         batch slot busy, or batching not provisioned).
+   */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedAsync(clio::run::u64 first_page,
+                                                    clio::run::u32 n) {
+    LockBlock();
+    const clio::run::u32 got = FetchPagesBatchedAsyncLocked(first_page, n);
+    UnlockBlock();
+    return got;
+  }
+
+  /**
    * Start faulting `page_num` in WITHOUT waiting for it.
    *
    * This is what makes compute and I/O overlap: the kernel asks for the page
@@ -956,6 +980,98 @@ class DeviceVector {
   }
 
   /** FetchPagesBatched's body, for callers already holding the block lock. */
+  /**
+   * The table's dedicated ASYNC batch slot: the LAST of its multi_per_block_
+   * MultiBatch entries. The synchronous batch path only ever uses mb[0], so
+   * giving async its own slot means a gate fault never waits behind a
+   * sibling prefetch that happens to target the same table.
+   */
+  CTP_GPU_FUN MultiBatch *AsyncBatchSlot() const {
+    return &BlockBatches()[h_->multi_per_block_ - 1];
+  }
+
+  /** Non-blocking completion probe of the table's async batch future. */
+  CTP_GPU_FUN bool MultiGetDone(MultiBatch *mb) {
+    if (mb->get_fut.IsNull()) return true;
+    volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
+        &mb->get_fut.get()->fut_.is_complete_.x);
+    return ((*fp) & 1u) != 0u;
+  }
+
+  /**
+   * Complete this table's outstanding async batch, if any: wait for the
+   * multi, clear the fetching=2 marks, free slots whose record failed.
+   * Caller must hold the block lock.
+   */
+  CTP_GPU_FUN void SettleBatchLocked() {
+    if (h_->multi_ == nullptr || h_->multi_per_block_ < 2) return;
+    MultiBatch *mb = AsyncBatchSlot();
+    if (mb->async_pending == 0u) return;
+    mb->get_fut.Wait();
+    auto *t = mb->get;
+    Page *tbl = BlockPages();
+    for (clio::run::u32 r = 0; r < mb->async_n; ++r) {
+      Page *p = &tbl[mb->page_slot[r]];
+      if (p->fetching == 2u) p->fetching = 0u;
+      if (!(r < t->count_ && t->reqs_[r].rc_ == 0)) {
+        // Same rule as the synchronous batch: a failed record must free its
+        // slot, never serve its stale bytes as this page.
+        p->page_num = kNoPage;
+        Bump(h_->stat_get_errors_);
+      }
+    }
+    mb->async_pending = 0u;
+  }
+
+  /** Async batched fetch body; see FetchPagesBatchedAsync. Lock held. */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedAsyncLocked(
+      clio::run::u64 first_page, clio::run::u32 n) {
+    // Needs a slot of its own (see AsyncBatchSlot); with only one per table
+    // async fetching would contend with the synchronous path, so disable it.
+    if (h_->multi_ == nullptr || h_->multi_per_block_ < 2) return 0;
+    MultiBatch *mb = AsyncBatchSlot();
+    if (mb->async_pending != 0u) {
+      // A batch is already in flight on this table. Settle it if it is done;
+      // otherwise drop the hint — a prefetch that stacks behind another
+      // prefetch would serialize the callers, which is the exact failure the
+      // async form exists to avoid.
+      if (!MultiGetDone(mb)) return 0;
+      SettleBatchLocked();
+    }
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    if (n > h_->pages_per_block_) n = h_->pages_per_block_;
+    Page *tbl = BlockPages();
+    PrepareMultiGet(mb->get);
+    clio::run::u32 filled = 0;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first_page + k;
+      if (Find(pg) != nullptr) continue;  // resident or already coming
+      const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
+      if (slot == ~0u) break;
+      Page *np = &tbl[slot];
+      np->fetching = 2u;  // batch-async: settled via SettleBatchLocked
+      __threadfence_block();
+      np->page_num = pg;
+      np->dirty = 0u;
+      np->flushing = 0u;
+      np->score = 2.0f;
+      np->last_access = Now();
+      char name[32];
+      PageBlobName(pg, name);
+      mb->get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      mb->page_slot[filled] = slot;
+      ++filled;
+      Bump(h_->stat_faults_);
+      Bump(h_->stat_prefetches_);
+    }
+    if (filled == 0) return 0;
+    mb->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+        SlotPtr(mb->get));
+    mb->async_pending = 1u;
+    mb->async_n = filled;
+    return filled;
+  }
+
   CTP_GPU_FUN clio::run::u32 FetchPagesBatchedLocked(clio::run::u64 first_page,
                                                      clio::run::u32 n) {
     Page *tbl = BlockPages();
@@ -1089,6 +1205,13 @@ class DeviceVector {
   /** Wait for an in-flight asynchronous get on `p`. */
   CTP_GPU_FUN void AwaitFetch(Page *p) {
     if (!p->fetching) return;
+    if (p->fetching == 2u) {
+      // Claimed by an async batch: its bytes arrive with the batch's multi,
+      // not a per-page get, so the page's own future carries nothing. Settle
+      // the whole batch (this also clears every sibling page it fetched).
+      SettleBatchLocked();
+      return;
+    }
     p->get_fut.Wait();
     if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
     p->fetching = 0u;
