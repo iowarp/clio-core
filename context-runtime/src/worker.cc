@@ -1471,7 +1471,21 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
       !task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT) &&
       (task_ptr->GetParentTask().IsNull() ||
        task_ptr->GetParentTask()->EventQueue() == nullptr);
-  if (signals_inprocess_client) {
+  // GPU-submitted tasks have the SAME hazard as the in-process client case
+  // above, with the kernel in the client's role: IpcGpu2Cpu::SendOut's last
+  // act flips the task's device-side completion flag, and the INSTANT it
+  // flips, the kernel may resubmit the slot -- whereupon another worker's
+  // RecvIn stages the new submission into the same per-slot scratch buffer
+  // and calls BeginRunContext on it. break_self_cycle after SendOut then
+  // mutates that scratch underneath the new submission, observed as
+  // "SetRunWorkerId: null RunContext" under repeated mid-decode batched
+  // fetches (56 clio_warm_range launches; see clio-core issue #961). RecvIn
+  // wraps the scratch NON-OWNING, so breaking the cycle first frees nothing;
+  // it only finishes every host-side mutation before the release signal.
+  const bool signal_is_release =
+      signals_inprocess_client ||
+      future_shm->origin_ == ClientOrigin::kClientGpu2Cpu;
+  if (signal_is_release) {
     break_self_cycle();
     IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
   } else {
