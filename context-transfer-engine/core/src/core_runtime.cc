@@ -3415,6 +3415,11 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
       if (env_inline == 0) inline_max = 0;
       if (env_inline == 1) inline_max = kPodMultiMax;
     }
+    // A PREFETCH batch's completion latency is off the caller's critical
+    // path — dispatch it across workers so a concurrent DEMAND fault (which
+    // is latency-critical and served inline) never queues behind it.
+    if (task->flags_ & kCtePrefetchHint) inline_max = 0;
+    const clio::run::u32 sub_flags = task->flags_ & ~kCtePrefetchHint;
     if (n <= inline_max) {
       const unsigned long long ev_t1 = __rdtsc();
       for (clio::run::u32 i = 0; i < n; ++i) {
@@ -3422,7 +3427,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
         auto sub = ipc_manager->NewTask<PodGetBlobTask>(
             clio::run::CreateTaskId(), task->pool_id_,
             clio::run::PoolQuery::Local(), task->tag_id_,
-            req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
             req.data_, task->context_);
         sub.get()->BeginRunContext();
         CLIO_CO_AWAIT(PodGetBlob(sub));
@@ -3442,7 +3447,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
         auto sub = ipc_manager->NewTask<PodGetBlobTask>(
             clio::run::CreateTaskId(), task->pool_id_,
             clio::run::PoolQuery::Local(), task->tag_id_,
-            req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
             req.data_, task->context_);
         futs[i] = ipc_manager->Send(sub);
       }

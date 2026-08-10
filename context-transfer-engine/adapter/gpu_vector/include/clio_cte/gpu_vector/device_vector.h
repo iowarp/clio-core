@@ -1153,6 +1153,8 @@ class DeviceVector {
     if (n > h_->pages_per_block_) n = h_->pages_per_block_;
     Page *tbl = BlockPages();
     PrepareMultiGet(mb->get);
+    // Prefetch, not demand: let the CTE service it off the critical path.
+    mb->get->flags_ = clio::cte::core::kCtePrefetchHint;
     clio::run::u32 filled = 0;
     for (clio::run::u32 k = 0; k < n; ++k) {
       const clio::run::u64 pg = first_page + k;
