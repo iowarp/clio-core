@@ -300,6 +300,37 @@ struct YieldFrame {
     __syncthreads();
 
 /**
+ * Yield if ANY thread in the block asks to, otherwise fall straight through.
+ *
+ * This is the shape a page-fault wait actually has: a fault is a per-thread
+ * event, but suspending is a per-block one, so a warp that missed cannot
+ * suspend alone and a warp that hit cannot run ahead. Every thread votes with
+ * `cond` and __syncthreads_or makes the decision uniform, which is what keeps
+ * the yield -- and the __syncthreads inside it -- legal.
+ *
+ * The resume label sits BEFORE the vote, so coming back RE-EVALUATES `cond`.
+ * That turns the construct into a retry loop with the host in the middle of
+ * it: suspend, host services the faults, resume, re-check, and fall through
+ * once nobody is still waiting. A thread that never faulted simply votes 0
+ * every round and rides along.
+ *
+ * `cond` therefore runs once per entry and must be a pure test -- it is a
+ * question about state, not the thing that changes it.
+ */
+#define CLIO_YIELD_IF(cond)                                                   \
+  case __LINE__:                                                              \
+    if (__syncthreads_or((cond) ? 1 : 0)) {                                   \
+      _cy_f.Suspend(__LINE__);                                                \
+      if (threadIdx.x == 0) {                                                 \
+        clio::run::gpu::YieldTls().block_state_->status_ =                    \
+            clio::run::gpu::kYieldSuspended;                                  \
+      }                                                                       \
+      __threadfence_system();                                                 \
+      __syncthreads();                                                        \
+      return;                                                                 \
+    }
+
+/**
  * Call another yieldable function, propagating a yield out through this one.
  *
  * The resume label sits BEFORE the call on purpose: coming back means

@@ -82,6 +82,40 @@ __global__ void NestKernel(gy::YieldableView<> v, gy::YieldStackView stack,
   CLIO_YEND();
 }
 
+/**
+ * Models a page-fault wait: `need` is how many service rounds this LANE still
+ * requires. Only some lanes (and some whole warps) ever need any.
+ */
+__global__ void FaultKernel(gy::YieldableView<> v, gy::YieldStackView stack,
+                            const u32 *need, u32 *out, u32 *entries) {
+  CLIO_YKERNEL_ENTER(v, stack);
+  if (threadIdx.x == 0) {
+    atomicAdd(&entries[v.Block()], 1u);
+  }
+
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(u32, tag, 0x5A000000u | (v.Block() << 8) | threadIdx.x);
+
+  CLIO_YBEGIN();
+
+  // A per-thread condition turned into a per-block decision. A lane with
+  // nothing to wait for votes 0 and rides along with the ones that do.
+  CLIO_YIELD_IF(need[v.Block() * blockDim.x + threadIdx.x] > 0);
+
+  // Reached only when NO lane in the block is still waiting.
+  out[v.Block() * blockDim.x + threadIdx.x] = tag;
+
+  CLIO_YEND();
+}
+
+/** Stands in for the host servicing faults between rounds. */
+__global__ void ServiceFaultsKernel(u32 *need, u32 n) {
+  const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && need[i] > 0) {
+    need[i] -= 1;
+  }
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 TEST_CASE("YieldStack - per-lane locals survive a nested yield",
@@ -153,6 +187,95 @@ TEST_CASE("YieldStack - per-lane locals survive a nested yield",
       REQUIRE(tag[i] == (0xA5000000u | (b << 8) | t));
     }
   }
+}
+
+TEST_CASE("YieldStack - YIELD_IF suspends the block if ANY lane must wait",
+          "[gpu][yieldable][stack]") {
+  constexpr u32 kB = 4;
+  constexpr u32 kT = 64;  // two warps, so a whole warp can fault alone
+  gy::Yieldable<> y(kB, kT);
+  gy::YieldStack stack(kB, kT, kLaneBytes);
+
+  const size_t n = static_cast<size_t>(kB) * kT;
+  std::vector<u32> h_need(n, 0);
+  // block 0: nobody waits           -> falls straight through, 1 round
+  // block 1: only the SECOND warp   -> 2 rounds
+  // block 2: a single lane, 3 waits -> 4 rounds
+  // block 3: every odd lane, 2 waits-> 3 rounds
+  for (u32 t = 32; t < kT; ++t) h_need[1 * kT + t] = 1;
+  h_need[2 * kT + 5] = 3;
+  for (u32 t = 1; t < kT; t += 2) h_need[3 * kT + t] = 2;
+
+  u32 *d_need = nullptr;
+  u32 *d_out = nullptr;
+  u32 *d_entries = nullptr;
+  REQUIRE(cudaMalloc(&d_need, n * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_need, h_need.data(), n * sizeof(u32),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_out, n * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_out, 0, n * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_entries, kB * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_entries, 0, kB * sizeof(u32)) == cudaSuccess);
+
+  std::vector<u32> pending_trace;
+  u32 services = 0;
+  y.RunToCompletion(
+      [&](dim3 grid, dim3 block, gy::YieldableView<> view) {
+        pending_trace.push_back(view.num_pending_);
+        FaultKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+            view, stack.View(), d_need, d_out, d_entries);
+      },
+      [&]() {
+        // The service itself is a KERNEL, which is only possible because no
+        // kernel is resident between rounds.
+        ++services;
+        ServiceFaultsKernel<<<(n + 127) / 128, 128>>>(d_need,
+                                                      static_cast<u32>(n));
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      },
+      /*max_rounds=*/32);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  std::vector<u32> out(n, 0);
+  std::vector<u32> entries(kB, 0);
+  REQUIRE(cudaMemcpy(out.data(), d_out, n * sizeof(u32),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(entries.data(), d_entries, kB * sizeof(u32),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  std::fprintf(stderr, "[yield-if] services=%u entries=%u %u %u %u pending:",
+               services, entries[0], entries[1], entries[2], entries[3]);
+  for (u32 p : pending_trace) std::fprintf(stderr, " %u", p);
+  std::fprintf(stderr, "\n");
+
+  REQUIRE(y.NumPending() == 0);
+
+  // A block whose lanes all vote 0 never suspends: one entry, no yield.
+  REQUIRE(entries[0] == 1);
+  // Otherwise a block is entered once per wait it could not satisfy, plus the
+  // entry that gets through -- driven by its SLOWEST lane, not its average.
+  REQUIRE(entries[1] == 2);
+  REQUIRE(entries[2] == 4);
+  REQUIRE(entries[3] == 3);
+
+  // Blocks retire as their slowest lane clears.
+  REQUIRE(pending_trace.size() == 4);
+  REQUIRE(pending_trace[0] == 4);
+  REQUIRE(pending_trace[1] == 3);
+  REQUIRE(pending_trace[2] == 2);
+  REQUIRE(pending_trace[3] == 1);
+
+  // Every lane got through, including the ones that never waited, and the
+  // caller local survived however many suspends its block took.
+  for (u32 b = 0; b < kB; ++b) {
+    for (u32 t = 0; t < kT; ++t) {
+      REQUIRE(out[b * kT + t] == (0x5A000000u | (b << 8) | t));
+    }
+  }
+
+  cudaFree(d_need);
+  cudaFree(d_out);
+  cudaFree(d_entries);
 }
 
 SIMPLE_TEST_MAIN()
