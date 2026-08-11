@@ -126,6 +126,22 @@ class Vector {
     return wire_id >= 11 && wire_id <= 16;  // nvcomp-lz4 .. nvcomp-ans
   }
 
+  /**
+   * Pages spanned by the whole vector.
+   *
+   * ONE definition, because getting it wrong is silent: `size_` counts
+   * ELEMENTS while `page_bytes_` counts BYTES, and the three call sites that
+   * open-coded `(size_ + page_bytes_ - 1) / page_bytes_` all undercounted by
+   * sizeof(T). For a u32 vector that sized the tier-offset table at a quarter
+   * of the page count, so every page past the quarter mark read tier_off_ out
+   * of bounds and served another page's bytes -- while `mapped == npages`
+   * still reported the map fully built.
+   */
+  static clio::run::u64 NumPagesOf(const VecHeader &h) {
+    if (h.elems_per_page_ == 0) return 0;
+    return (h.size_ + h.elems_per_page_ - 1) / h.elems_per_page_;
+  }
+
   /** Device view for `dev_id`, to be passed to a kernel by value. */
   DeviceVector<T> GetDevice(int dev_id) const {
     auto it = devs_.find(dev_id);
@@ -198,9 +214,7 @@ class Vector {
       kv.second.hdr.stat_verify_ok_ = c + 9;
       kv.second.hdr.stat_verify_lost_ = c + 10;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
-        const clio::run::u64 npg =
-            (kv.second.hdr.size_ + kv.second.hdr.page_bytes_ - 1) /
-            kv.second.hdr.page_bytes_;
+        const clio::run::u64 npg = NumPagesOf(kv.second.hdr);
         void *hm = nullptr;
         if (cudaMalloc(&hm, npg * sizeof(unsigned int)) == cudaSuccess) {
           cudaMemset(hm, 0, npg * sizeof(unsigned int));
@@ -259,8 +273,14 @@ class Vector {
       return MapResult::kDisabled;
     }
     const auto &h0 = devs_.begin()->second.hdr;
-    const clio::run::u64 npages =
-        (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
+    // size_ counts ELEMENTS, so it must be divided by elements-per-page.
+    // Dividing it by page_BYTES undercounts by sizeof(T) -- for u32 pages it
+    // produced a table a quarter the size of the vector, and every page past
+    // the end indexed tier_off_ OUT OF BOUNDS. Whatever garbage sat there was
+    // then treated as a valid tier offset, so those pages silently served
+    // another page's bytes (and mapped == npages still reported "fully
+    // mapped"). Assert the invariant rather than trusting the arithmetic.
+    const clio::run::u64 npages = NumPagesOf(h0);
     if (npages == 0) return MapResult::kDisabled;
     constexpr clio::run::u64 kChunkRaw = 64ull * 1024ull;  // HLIF chunk
     const clio::run::u64 cpp = (h0.page_bytes_ + kChunkRaw - 1) / kChunkRaw;
@@ -351,6 +371,30 @@ class Vector {
                      (unsigned long long) pg, s2,
                      (unsigned long long) raw_bytes, w[0], w[1], w[2], w[3],
                      w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+      }
+    }
+    if (map_debug) {
+      // Dump the identity table and flag any two pages whose extents overlap:
+      // a page served from another page's bytes is silent corruption, and the
+      // per-page offsets are the only place it is visible.
+      for (clio::run::u64 pg = 0; pg < npages; ++pg) {
+        if (offs[pg] == ~0ull) continue;
+        for (clio::run::u64 q = 0; q < pg; ++q) {
+          if (offs[q] == ~0ull) continue;
+          const bool overlap =
+              offs[pg] < offs[q] + csz[q] && offs[q] < offs[pg] + csz[pg];
+          if (overlap) {
+            std::fprintf(stderr,
+                         "gpu_vector: map OVERLAP pg=%llu [%llu,+%llu) vs "
+                         "pg=%llu [%llu,+%llu)\n",
+                         (unsigned long long) pg, offs[pg], csz[pg],
+                         (unsigned long long) q, offs[q], csz[q]);
+          }
+        }
+      }
+      for (clio::run::u64 pg = 0; pg < npages && pg < 32; ++pg) {
+        std::fprintf(stderr, "gpu_vector: map pg=%llu off=%llu csz=%llu\n",
+                     (unsigned long long) pg, offs[pg], csz[pg]);
       }
     }
     void *dev_offs = nullptr;
@@ -527,9 +571,7 @@ class Vector {
 #if CTP_ENABLE_CUDA
     auto it = devs_.find(dev_id);
     if (it == devs_.end() || it->second.hdr.fault_hist_ == nullptr) return h;
-    const clio::run::u64 npg =
-        (it->second.hdr.size_ + it->second.hdr.page_bytes_ - 1) /
-        it->second.hdr.page_bytes_;
+    const clio::run::u64 npg = NumPagesOf(it->second.hdr);
     h.resize(npg);
     cudaMemcpy(h.data(), it->second.hdr.fault_hist_,
                npg * sizeof(unsigned int), cudaMemcpyDeviceToHost);

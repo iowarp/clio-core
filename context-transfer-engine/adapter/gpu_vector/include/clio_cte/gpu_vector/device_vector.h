@@ -1197,6 +1197,33 @@ class DeviceVector {
     }
     __syncthreads();
     CLIO_YBEGIN();
+    // 0. NO HOST FETCH NEEDED. A page the tier map covers resolves entirely
+    //    on the device, so it must not enter the evict/fetch machinery below:
+    //    a mapped page owns no cache slot, so IsResident() is false for it
+    //    FOREVER and the block would suspend on a fetch that nobody will ever
+    //    complete. That is exactly what pinned the compressed run at the
+    //    200000-round cap and corrupted the identity-mapped raw run.
+    //
+    //      - identity-mapped: HoldPage hands back a pointer into the tier.
+    //      - encoded-mapped: the warp decompresses the page with nvcomp
+    //        straight out of the tier -- device pointer in, device pointer
+    //        out. No CPU, no DMA, nothing that can channel-order behind this
+    //        kernel, so there is nothing to yield on.
+    //
+    // Written as if/else rather than an early return because CLIO_YEND emits
+    // the switch's closing brace: a second one here would unbalance it.
+    if (!PageNeedsHostFetch(PageOf(off))) {
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+      // Warp 0 decodes on behalf of the block. DecodePageWarp claims the slot
+      // under the block lock and needs all 32 lanes of the calling warp.
+      if (threadIdx.x < 32u && !IsResident(PageOf(off))) {
+        DecodePageWarp(PageOf(off));
+      }
+      __syncthreads();
+#endif
+      *run_out = HoldPage(off, count);
+    } else {
+
     // 1. WRITEBACK. Making room can require flushing a dirty victim, and the
     //    blocking path waits for that put in-kernel. On the kHbm tier that
     //    put is a device copy which cannot schedule behind the very kernel
@@ -1205,7 +1232,7 @@ class DeviceVector {
     if (threadIdx.x == 0) {
       StartEvictionAsync(PageOf(off));
     }
-    CLIO_YIELD_IF(AnyTransferInFlight());
+    CLIO_YIELD_IF_RESUME_WHEN(AnyTransferInFlight(), FlushWaitTag());
     // Retire the writeback WITHIN this entry, before fetching. Not redundant
     // with the prologue reap: without it the flushed page still occupies its
     // slot, BeginFetch finds nothing free, and falls into the blocking
@@ -1222,12 +1249,63 @@ class DeviceVector {
     if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
       BeginFetch(PageOf(off));
     }
-    CLIO_YIELD_IF(!IsResident(PageOf(off)));
+    // Hand the host the address of the completion flag this block is parked
+    // on, so it can poll 4 bytes instead of relaunching the whole grid to ask.
+    CLIO_YIELD_IF_RESUME_WHEN(!IsResident(PageOf(off)),
+                              FetchWaitTag(PageOf(off)));
 
     // 3. Resident for the whole block now, so this is the lock-free fast path
     //    and every lane may read the page.
     *run_out = HoldPage(off, count);
+    }  // end host-fetch branch
     CLIO_YEND();
+  }
+
+  /**
+   * @return true when resolving `pn` requires the HOST -- i.e. the tier map
+   *         covers it neither as an identity-mapped page nor as an encoded
+   *         page this build can decode in-kernel.
+   *
+   * Only such a page may enter the evict/fetch/suspend path: a map-backed
+   * page never gets a cache slot through a fetch, so waiting for residency on
+   * one waits forever.
+   */
+  CTP_GPU_FUN bool PageNeedsHostFetch(clio::run::u64 pn) const {
+    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
+        h_->tier_off_[pn] != ~0ull) {
+      return false;  // identity-mapped: a pointer into the tier
+    }
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+    if (PageEncodedMapped(pn)) {
+      return false;  // decodes in-kernel, straight out of the tier
+    }
+#endif
+    return true;
+  }
+
+  /**
+   * Device address of the completion flag for `page_num`'s in-flight get, or 0
+   * if there is nothing specific to wait on (no slot claimed yet, so the block
+   * should be relaunched to claim one).
+   */
+  CTP_GPU_FUN clio::run::u64 FetchWaitTag(clio::run::u64 page_num) const {
+    const Page *p = Find(page_num);
+    if (p == nullptr || !p->fetching) {
+      return 0;
+    }
+    return reinterpret_cast<clio::run::u64>(&p->get->fut_.is_complete_.x);
+  }
+
+  /** Same, for the first writeback still outstanding in this block. */
+  CTP_GPU_FUN clio::run::u64 FlushWaitTag() const {
+    const Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      const Page *p = &tbl[i];
+      if (p->flushing && p->put->fut_.is_complete_.load() == 0) {
+        return reinterpret_cast<clio::run::u64>(&p->put->fut_.is_complete_.x);
+      }
+    }
+    return 0;
   }
 
   /**
