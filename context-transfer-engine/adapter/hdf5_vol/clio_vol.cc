@@ -674,6 +674,38 @@ static bool clio_is_whole_read(hid_t mem_space_id, hid_t file_space_id) {
 }
 
 /**
+ * Number of elements a transfer's buffer holds, per HDF5's actual space
+ * semantics -- NOT just "the dataset's full extent whenever mem_space is
+ * H5S_ALL". mem_space_id == H5S_ALL means "the buffer is a contiguous
+ * array sized to match whatever is selected in file_space_id", so a
+ * whole-memory-space transfer against a PARTIAL (hyperslab) file
+ * selection is only as large as that selection -- resolving it against
+ * the dataset's full extent instead over-reads/over-writes the caller's
+ * buffer by however much the selection is smaller than the dataset.
+ * (This one call, when both spaces happen to be H5S_ALL, degenerates to
+ * exactly the dataset's full extent, which is why every earlier call site
+ * that assumed that got away with it -- they only ever had whole-dataset
+ * selections to deal with.)
+ */
+static hssize_t clio_transfer_nelem(clio_dataset_t *dataset, hid_t mem_space_id,
+                                     hid_t file_space_id, hid_t dxpl_id) {
+  hid_t sel_space = (mem_space_id != H5S_ALL) ? mem_space_id : file_space_id;
+  hid_t owned_space = H5I_INVALID_HID;
+  if (sel_space == H5S_ALL) {
+    H5VL_dataset_get_args_t get_args;
+    get_args.op_type = H5VL_DATASET_GET_SPACE;
+    get_args.args.get_space.space_id = H5I_INVALID_HID;
+    H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
+                    &get_args, dxpl_id, nullptr);
+    sel_space = get_args.args.get_space.space_id;
+    owned_space = sel_space;
+  }
+  hssize_t nelem = (sel_space >= 0) ? H5Sget_select_npoints(sel_space) : -1;
+  if (owned_space >= 0) H5Sclose(owned_space);
+  return nelem;
+}
+
+/**
  * Helper: true when the transfer plist requests collective MPI-IO. Collective
  * transfers must stay on the native VOL — serving some ranks from cache while
  * others miss would desynchronise the collective call and deadlock.
@@ -1039,10 +1071,30 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       /* The native VOL is the authoritative store: its status IS this call's
          status. Discarding it (as this did) reported success for writes that
          never reached the file -- ENOSPC, filter failure, a bad selection. */
+      /* This is the uncacheable branch (partial/collective/non-whole write),
+         so it never goes through the chunk-staging path below that already
+         handles device pointers. buf[d] may still be a GPU device pointer
+         here (H5Dwrite places no restriction on selection shape when the
+         caller passes device memory), and the native VOL underneath expects
+         a host-dereferenceable buffer -- stage it the same way the cacheable
+         write path (and NeuroPress's own gpu_bypass_dh_write) does. */
+      const void *native_write_buf = buf[d];
+      std::vector<char> native_write_staging;
+      if (ctp::IsDevicePointer(buf[d])) {
+        hssize_t nelem = clio_transfer_nelem(dataset, mem_space_id[d],
+                                             file_space_id[d], dxpl_id);
+        if (nelem > 0) {
+          size_t total_size =
+              static_cast<size_t>(nelem) * H5Tget_size(mem_type_id[d]);
+          native_write_staging.resize(total_size);
+          ctp::DeviceAwareMemcpy(native_write_staging.data(), buf[d], total_size);
+          native_write_buf = native_write_staging.data();
+        }
+      }
       herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                          dataset->obj.under_vol_id,
                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                         dxpl_id, &buf[d], req);
+                         dxpl_id, &native_write_buf, req);
       if (rc < 0) ret_value = rc;
       /* This write did NOT refresh the whole linear image, so any cached image
          is now stale. Invalidate it (drop the chunk_0 hit-test key) so later
@@ -1283,6 +1335,54 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
 }
 
 /**
+ * Read through the native VOL into dst, staging via a host buffer first if
+ * dst is a GPU device pointer. Native HDF5 dereferences its destination
+ * buffer directly on the host (H5D__contig_readvv_sieve_cb has no concept
+ * of GPU memory), so a raw device pointer here segfaults deep inside
+ * libhdf5 -- the same constraint the write path and the cache-miss read
+ * path above both document. Every native-passthrough fallback in
+ * clio_dataset_read() below goes through this one helper so the staging
+ * logic (and its size-resolution edge cases) lives in exactly one place.
+ */
+static herr_t clio_native_read_device_safe(clio_dataset_t *dataset,
+                                            hid_t mem_type_id,
+                                            hid_t mem_space_id,
+                                            hid_t file_space_id,
+                                            hid_t dxpl_id, void *dst,
+                                            void **req) {
+  if (!ctp::IsDevicePointer(dst)) {
+    void *buf = dst;
+    return H5VLdataset_read(1, &dataset->obj.under_object,
+                            dataset->obj.under_vol_id, &mem_type_id,
+                            &mem_space_id, &file_space_id, dxpl_id, &buf, req);
+  }
+
+  hssize_t nelem =
+      clio_transfer_nelem(dataset, mem_space_id, file_space_id, dxpl_id);
+  if (nelem <= 0) {
+    /* Can't size a staging buffer -- pass the device pointer straight
+       through. If the underlying VOL can't handle it either, that failure
+       is no worse than the un-staged behavior this helper replaces. */
+    void *buf = dst;
+    return H5VLdataset_read(1, &dataset->obj.under_object,
+                            dataset->obj.under_vol_id, &mem_type_id,
+                            &mem_space_id, &file_space_id, dxpl_id, &buf, req);
+  }
+
+  size_t total_size = static_cast<size_t>(nelem) * H5Tget_size(mem_type_id);
+  std::vector<char> staging(total_size);
+  void *staging_buf = staging.data();
+  herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
+                               dataset->obj.under_vol_id, &mem_type_id,
+                               &mem_space_id, &file_space_id, dxpl_id,
+                               &staging_buf, req);
+  if (rc >= 0) {
+    ctp::DeviceAwareMemcpy(dst, staging.data(), total_size);
+  }
+  return rc;
+}
+
+/**
  * Dataset read — CTE read-through cache.
  *
  * For whole-dataset, independent reads the data is served from the CTE tier
@@ -1321,10 +1421,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     if (!cacheable_flat) {
       /* Propagate the native status: a failed read previously returned success
          with the user's buffer untouched. */
-      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                        dataset->obj.under_vol_id,
-                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                        dxpl_id, &buf[d], req);
+      herr_t rc = clio_native_read_device_safe(
+          dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+          dxpl_id, buf[d], req);
       if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -1344,10 +1443,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                            mem_space_id[d], file_space_id[d],
                                            dxpl_id, buf[d]);
       if (!served) {
-        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                          dataset->obj.under_vol_id,
-                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                          dxpl_id, &buf[d], req);
+        herr_t rc = clio_native_read_device_safe(
+            dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+            dxpl_id, buf[d], req);
         if (rc < 0) ret_value = rc;
       }
       if (tracing)
@@ -1370,10 +1468,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     if (space >= 0) H5Sclose(space);
     if (nelem <= 0) {
       /* Can't size it — fall back to native for safety. */
-      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                        dataset->obj.under_vol_id,
-                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                        dxpl_id, &buf[d], req);
+      herr_t rc = clio_native_read_device_safe(
+          dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+          dxpl_id, buf[d], req);
       if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -1450,10 +1547,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
          a partially-filled buffer with a success status. */
       if (!clio_read_cached_image(dataset, total_size, dst)) {
         clio_invalidate_dataset(dataset);
-        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                          dataset->obj.under_vol_id,
-                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                          dxpl_id, &buf[d], req);
+        herr_t rc = clio_native_read_device_safe(
+            dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+            dxpl_id, dst, req);
         if (rc < 0) ret_value = rc;
       }
     }

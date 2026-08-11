@@ -151,4 +151,95 @@ TEST_CASE("HDF5 VOL IO - Write/read survives a real GPU device pointer",
   REQUIRE(H5Pclose(fapl) >= 0);
 }
 
+TEST_CASE("HDF5 VOL IO - Partial (hyperslab) write survives a real GPU "
+          "device pointer",
+          "[hdf5_vol][io][gpu][partial]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    return;
+  }
+
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string kPartialH5File = "/tmp/clio_vol_gpu_ptr_partial_test.h5";
+  std::remove(kPartialH5File.c_str());
+
+  hid_t file = H5Fcreate(kPartialH5File.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+
+  hsize_t dims[1] = {kNumElems};
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  REQUIRE(space >= 0);
+
+  hid_t dset = H5Dcreate2(file, "data_partial", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  // Whole-dataset baseline write (H5S_ALL/H5S_ALL) -- this path was already
+  // fixed and verified above; used here only to seed known content.
+  std::vector<int> wbuf_full(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) {
+    wbuf_full[i] = static_cast<int>(i * 3 + 1);
+  }
+  int *d_wbuf_full = nullptr;
+  REQUIRE(cudaMalloc(&d_wbuf_full, kNumElems * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_wbuf_full, wbuf_full.data(), kNumElems * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   d_wbuf_full) >= 0);
+
+  // THE ACTUAL CHECK: overwrite only the first half via a hyperslab
+  // selection (file_space_id != H5S_ALL) -- this is exactly the
+  // "uncacheable write" branch (clio_is_whole_read() is false for a
+  // partial selection), which passes the caller's buffer straight to the
+  // native VOL. Before the fix, a device pointer here segfaulted the same
+  // way the whole-dataset path did prior to the first GPU-pointer fix.
+  const size_t kHalf = kNumElems / 2;
+  std::vector<int> wbuf_half(kHalf);
+  for (size_t i = 0; i < kHalf; ++i) {
+    wbuf_half[i] = static_cast<int>(1000000 + i);
+  }
+  int *d_wbuf_half = nullptr;
+  REQUIRE(cudaMalloc(&d_wbuf_half, kHalf * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_wbuf_half, wbuf_half.data(), kHalf * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  hsize_t h_start[1] = {0};
+  hsize_t h_count[1] = {kHalf};
+  REQUIRE(H5Sselect_hyperslab(space, H5S_SELECT_SET, h_start, nullptr,
+                              h_count, nullptr) >= 0);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, space, H5P_DEFAULT,
+                   d_wbuf_half) >= 0);
+  REQUIRE(H5Sselect_all(space) >= 0);
+
+  // Verify via a whole-dataset read (already-fixed, already-verified path):
+  // first half must be the hyperslab overwrite, second half the original.
+  int *d_rbuf = nullptr;
+  REQUIRE(cudaMalloc(&d_rbuf, kNumElems * sizeof(int)) == cudaSuccess);
+  REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  d_rbuf) >= 0);
+  std::vector<int> rbuf(kNumElems, 0);
+  REQUIRE(cudaMemcpy(rbuf.data(), d_rbuf, kNumElems * sizeof(int),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  bool match = true;
+  for (size_t i = 0; i < kHalf; ++i) {
+    if (rbuf[i] != wbuf_half[i]) { match = false; break; }
+  }
+  for (size_t i = kHalf; i < kNumElems && match; ++i) {
+    if (rbuf[i] != wbuf_full[i]) { match = false; break; }
+  }
+  REQUIRE(match);
+
+  cudaFree(d_wbuf_full);
+  cudaFree(d_wbuf_half);
+  cudaFree(d_rbuf);
+
+  REQUIRE(H5Dclose(dset) >= 0);
+  REQUIRE(H5Sclose(space) >= 0);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
 SIMPLE_TEST_MAIN()
