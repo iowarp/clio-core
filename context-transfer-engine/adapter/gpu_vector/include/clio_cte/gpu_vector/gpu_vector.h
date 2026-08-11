@@ -732,6 +732,7 @@ class Vector {
       p.dirty = 0;
       p.flushing = 0;
       p.fetching = 0;
+      p.evicting = 0;
       p.rescoring = 0;
       p.seq = 0;
       char *slot = tasks_bytes +

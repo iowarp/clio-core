@@ -93,6 +93,16 @@ struct Page {
    */
   clio::run::u32 fetching;
   /** 1 while a fire-and-forget rescore is still outstanding on this slot. */
+  /**
+   * This page's in-flight put is an EVICTION, not a plain writeback.
+   *
+   * ReapFlushed cannot otherwise tell them apart, and the two want opposite
+   * things when the put lands: an eviction frees the slot, a BeginFlush
+   * leaves the page resident and clean. Without this it did the former for
+   * both, so every BeginFlush silently dropped the page from the cache and
+   * counted itself as an eviction.
+   */
+  clio::run::u32 evicting;
   clio::run::u32 rescoring;
   /** Bumped on every task submission so no two carry the same TaskId. */
   clio::run::u32 seq;

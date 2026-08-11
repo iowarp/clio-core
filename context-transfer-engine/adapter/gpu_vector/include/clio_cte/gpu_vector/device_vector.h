@@ -636,6 +636,97 @@ class DeviceVector {
     return victim;
   }
 
+  /**
+   * Evict `num_pages`, SUSPENDING for the writebacks instead of blocking.
+   *
+   * EvictPages cannot be made yieldable by wrapping it: it calls AwaitPut,
+   * which waits for the victim's put INSIDE the kernel, and on a device tier
+   * that put is a device copy that cannot schedule while this kernel occupies
+   * the SMs. Wrapping the blocking call in a yield frame only moves the
+   * deadlock -- one lane blocks while the rest of the block sits at the
+   * barrier (measured: converting the semantics test's EvictKernel that way
+   * hung it).
+   *
+   * So the wait has to be the yield itself: submit every victim's writeback,
+   * leave the kernel, and free the slots on the round after the puts landed.
+   *
+   * Callers must be yieldable and must invoke this through CLIO_YCALL.
+   */
+  CTP_GPU_FUN void EvictPagesYield(clio::run::u32 num_pages) {
+    CLIO_YFRAME();
+    // ONE victim per iteration, and the chosen slot lives in the frame so it
+    // survives the suspend. Submitting them all up front and then freeing
+    // "everything clean" after the yield would evict the whole cache, not
+    // num_pages of it, because nothing would distinguish this eviction's
+    // victims from pages a concurrent BeginFlush had cleaned.
+    CLIO_YLOCAL_INIT(clio::run::u32, k, 0);
+    CLIO_YLOCAL_INIT(clio::run::u32, victim, 0);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      ReapFlushed();
+      ReapFetched();
+    }
+    __syncthreads();
+
+    CLIO_YBEGIN();
+    for (; k < num_pages; ++k) {
+      // 1. Pick a victim and submit its writeback WITHOUT waiting.
+      if (threadIdx.x == 0) {
+        LockBlock();
+        Page *tbl = BlockPages();
+        victim = h_->pages_per_block_;
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+          if (tbl[i].page_num == kNoPage) continue;
+          if (tbl[i].fetching || tbl[i].flushing) continue;
+          if (victim == h_->pages_per_block_ ||
+              tbl[i].score < tbl[victim].score ||
+              (tbl[i].score == tbl[victim].score &&
+               tbl[i].last_access < tbl[victim].last_access)) {
+            victim = i;
+          }
+        }
+        if (victim != h_->pages_per_block_) {
+          Page *p = &tbl[victim];
+          if (p->dirty) {
+            p->evicting = 1u;   // tells ReapFlushed to release the slot
+            SubmitPut(p);       // async; retired by the reap after the yield
+          } else {
+            p->page_num = kNoPage;
+            Bump(h_->stat_evicts_);
+            victim = h_->pages_per_block_;   // nothing left to wait for
+          }
+        }
+        UnlockBlock();
+      }
+      __syncthreads();
+
+      // 2. Leave while the put runs. This is the whole point: the blocking
+      //    form waits here, and on a device tier that put cannot schedule
+      //    while this kernel holds the SMs.
+      CLIO_YIELD_IF_RESUME_WHEN(AnyTransferInFlight(), FlushWaitTag());
+
+      // 3. Retire the put and release the slot. ReapFlushed reads the return
+      //    code, so a writeback that FAILED leaves the page dirty -- and a
+      //    still-dirty page must NOT be freed here, or its only copy is gone.
+      //    That is exactly how a rejected put used to lose data silently.
+      if (threadIdx.x == 0) {
+        ReapFlushed();
+        LockBlock();
+        if (victim < h_->pages_per_block_) {
+          Page *p = &BlockPages()[victim];
+          if (!p->fetching && !p->flushing && !p->dirty &&
+              p->page_num != kNoPage) {
+            p->page_num = kNoPage;
+            Bump(h_->stat_evicts_);
+          }
+        }
+        UnlockBlock();
+      }
+      __syncthreads();
+    }
+    CLIO_YEND();
+  }
+
   /** EvictPages' body, for callers that already hold the block lock. */
   CTP_GPU_FUN void EvictLocked(clio::run::u32 num_pages) {
     Page *tbl = BlockPages();
@@ -1358,6 +1449,7 @@ class DeviceVector {
     if (victim != h_->pages_per_block_) {
       Page *p = &tbl[victim];
       if (p->dirty || p->flushing) {
+        p->evicting = 1u;      // tells ReapFlushed to release the slot
         SubmitPut(p);          // async; the caller yields on AnyTransferInFlight
       } else {
         p->page_num = kNoPage;
@@ -1402,10 +1494,21 @@ class DeviceVector {
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
       if (p->flushing && p->put->fut_.is_complete_.load() != 0) {
-        AwaitPut(p);
-        p->page_num = kNoPage;
-        p->dirty = 0u;
-        Bump(h_->stat_evicts_);
+        AwaitPut(p);   // clears `flushing`; re-dirties the page if it FAILED
+        if (p->evicting && !p->dirty) {
+          // Eviction: the bytes are safely stored, so release the slot.
+          p->page_num = kNoPage;
+          p->evicting = 0u;
+          Bump(h_->stat_evicts_);
+        } else if (p->evicting) {
+          // The writeback failed, so the cache holds the only copy. Keep the
+          // page and let the next attempt retry rather than dropping it.
+          p->evicting = 0u;
+        }
+        // A plain BeginFlush writeback leaves the page RESIDENT and clean --
+        // that is its contract ("a later write re-dirties the page"). Freeing
+        // the slot here evicted every flushed page and counted it as an
+        // eviction, which is where a no-op EvictPages(0) got 4 evicts from.
       }
     }
     UnlockBlock();
