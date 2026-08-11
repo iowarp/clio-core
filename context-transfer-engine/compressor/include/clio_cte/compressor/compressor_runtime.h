@@ -479,6 +479,18 @@ private:
    */
   bool GpuCompressFromDevice(int wire_id, const void *src_device, size_t size,
                              char *out_host, size_t out_cap, size_t *out_size);
+  /**
+   * Compress `src_device` with a GPU codec, leaving the result in DEVICE
+   * memory (`out_device`). Device pointer in, device pointer out: nothing is
+   * staged through the host, so a blob bound for the kHBM tier never leaves
+   * the GPU.
+   */
+  bool GpuCompressToDevice(int wire_id, const void *src_device, size_t size,
+                           char *out_device, size_t out_cap, size_t *out_size);
+#if CTP_ENABLE_GPU
+  /** ShmPtr addressing a pointer inside the registered device scratch. */
+  ctp::ipc::ShmPtr<void> ScratchShmPtr(char *p) const;
+#endif
   /** @return the CPU codec of the same family as a GPU codec, or 0 if none.
    *  Used on the device page-fault path, where a GPU codec cannot run. */
   static int CpuEquivalentCodec(int gpu_wire_id);

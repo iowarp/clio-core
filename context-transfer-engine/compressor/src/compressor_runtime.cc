@@ -177,6 +177,9 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
     constexpr size_t kSlabs = 16;
     gpu_scratch_slab_ = total_bytes / kSlabs;
+    // The compressed bytes are handed straight to PutBlob and written to the
+    // device tier from here, so this stays plain device memory -- see
+    // ScratchShmPtr for how a raw device pointer is addressed.
     gpu_scratch_base_ = ctp::GpuApi::Malloc<char>(total_bytes);
     if (gpu_scratch_base_ != nullptr) {
       gpu_scratch_free_.reserve(kSlabs);
@@ -1688,6 +1691,54 @@ bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
   return ok;
 }
 
+/**
+ * Compress device -> device: the compressed bytes land in `out_device` and
+ * never touch host memory.
+ *
+ * Same codec call as GpuCompressFromDevice; the only difference is that the
+ * result stays where PutBlob can write it straight to the device tier,
+ * instead of being copied D2H only to be copied H2D again.
+ */
+bool Runtime::GpuCompressToDevice(int wire_id, const void *src_device,
+                                  size_t size, char *out_device,
+                                  size_t out_cap, size_t *out_size) {
+  if (!HasCodecContext() || size > codec_buf_bytes_) {
+    return false;
+  }
+  const size_t slot = AcquireCodecSlot();
+  if (slot == SIZE_MAX) {
+    return false;
+  }
+  void *sbuf = codec_slots_[slot].buf;
+  CUstream sstream = static_cast<CUstream>(codec_slots_[slot].stream);
+  size_t csize = codec_buf_bytes_;
+  bool ok = false;
+  {
+    CodecCtxGuard guard(codec_ctx_);
+    if (guard.ok()) {
+      ctp::CompressionFactory::SetGpuStreamForThread(sstream);
+      auto codec = ctp::CompressionFactory::GetPreset(
+          ctp::CompressionFactory::NameForWireId(wire_id),
+          ctp::CompressionPreset::BALANCED);
+      if (codec && codec->Compress(sbuf, csize, const_cast<void *>(src_device),
+                                   size) &&
+          csize <= out_cap &&
+          cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(out_device),
+                            reinterpret_cast<CUdeviceptr>(sbuf), csize,
+                            sstream) == CUDA_SUCCESS &&
+          cuStreamSynchronize(sstream) == CUDA_SUCCESS) {
+        ok = true;
+      }
+      ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+    }
+  }
+  ReleaseCodecSlot(slot);
+  if (ok) {
+    *out_size = csize;
+  }
+  return ok;
+}
+
 bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
                                     size_t size, char *out_host, size_t out_cap,
                                     size_t *out_size) {
@@ -1738,6 +1789,23 @@ bool Runtime::GpuCompressFromDevice(int wire_id, const void *src_device,
 }
 
 #endif  // CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+
+#if CTP_ENABLE_GPU
+/**
+ * ShmPtr addressing a RAW device pointer.
+ *
+ * A null allocator id means "off_ is already an absolute address", which is
+ * how gpu_vector hands its device pages to PodPutBlob (DeviceVector::RawPtr).
+ * Resolving it through an allocator instead yields a pointer the bdev's
+ * cudaMemcpyAsync cannot read -- it segfaults inside the driver.
+ */
+ctp::ipc::ShmPtr<void> Runtime::ScratchShmPtr(char *p) const {
+  ctp::ipc::ShmPtr<void> sp;
+  sp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+  sp.off_ = reinterpret_cast<clio::run::u64>(p);
+  return sp;
+}
+#endif
 
 char *Runtime::AcquireGpuScratch(size_t bytes) {
   std::lock_guard<std::mutex> guard(gpu_scratch_mu_);
@@ -1984,16 +2052,41 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
       const size_t sz = static_cast<size_t>(task->size_);
       const size_t bound = sz + (sz / 20) + 1024;
       const size_t hdr_sz = sizeof(CompressionHeader);
-      auto shm = CLIO_IPC->AllocateBuffer(hdr_sz + bound);
+      // Compress DEVICE -> DEVICE and put from device memory. The compressed
+      // bytes are destined for the kHBM tier, so staging them through a host
+      // SHM buffer (as this did) meant a D2H copy followed immediately by an
+      // H2D copy of the same bytes, on every page written.
+      // WAIT for a scratch slab and a codec slot rather than giving up on
+      // them. Both pools are small and every concurrent page put draws from
+      // them, so transient exhaustion is normal -- it is not evidence that the
+      // GPU cannot do the work, and treating it as such is how a CPU fallback
+      // creeps back in. (Measured: 2 of 256 pages lost the race.)
+      char *scratch = nullptr;
       size_t csize = 0;
-      const bool _gc = !shm.IsNull() &&
-          GpuCompressFromDevice(ctx.compress_lib_, src_full.ptr_, sz,
-                                shm.ptr_ + hdr_sz, bound, &csize);
+      bool _gc = false;
+      for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (scratch == nullptr) {
+          scratch = AcquireGpuScratch(hdr_sz + bound);
+        }
+        if (scratch != nullptr) {
+          _gc = GpuCompressToDevice(ctx.compress_lib_, src_full.ptr_, sz,
+                                    scratch + hdr_sz, bound, &csize);
+          if (_gc) break;
+          // Compression itself can only fail here for want of a codec slot;
+          // a genuine codec error would fail identically on retry and is
+          // caught by the bounded loop.
+        }
+        CLIO_CO_AWAIT(clio::run::yield(50.0));
+      }
       if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_comp ok=%d csize=%zu sz=%zu\n", (int)_gc, csize, sz);
       if (_gc && csize + hdr_sz < sz) {
+        // The header goes to the device too -- it is the first bytes of the
+        // stored blob, and BuildDeviceTierMap parses it out of the tier.
         CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_,
                                  task->size_, csize);
-        std::memcpy(shm.ptr_, &header, hdr_sz);
+        // 32 bytes of METADATA, not payload: the compressed bytes themselves
+        // are already on the device and stay there.
+        ctp::DeviceAwareMemcpy(scratch, &header, hdr_sz);
         ctx.actual_original_size_ = task->size_;
         ctx.actual_compressed_size_ = csize + hdr_sz;
         ctx.actual_compression_ratio_ =
@@ -2006,36 +2099,34 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
         }
         auto put = core_client_->AsyncPutBlob(
             task->tag_id_, task->blob_name_.str(), 0, csize + hdr_sz,
-            shm.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
+            ScratchShmPtr(scratch), task->score_, ctx, task->flags_,
             clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put);
         task->context_ = put->context_;
         task->return_code_ = put->GetReturnCode();
-        CLIO_IPC->FreeBuffer(shm);
+        ReleaseGpuScratch(scratch);
         CLIO_CO_RETURN;
       }
-      if (!shm.IsNull()) {
-        CLIO_IPC->FreeBuffer(shm);
-      }
+      ReleaseGpuScratch(scratch);
     }
 #endif
     if (IsGpuCodec(ctx.compress_lib_)) {
-      const int cpu_lib = CpuEquivalentCodec(ctx.compress_lib_);
-      static std::once_flag warned;
-      std::call_once(warned, [&]() {
-        HLOG(kWarning,
-             "compressor: GPU codec '{}' cannot service a device page fault "
-             "(the faulting kernel holds the device); using CPU codec '{}' "
-             "instead",
-             ctp::CompressionFactory::NameForWireId(ctx.compress_lib_),
-             ctp::CompressionFactory::NameForWireId(cpu_lib));
-      });
-      ctx.compress_lib_ = cpu_lib;
-      if (ctx.compress_lib_ <= 0) {
-        CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
-                                    task.template Cast<clio::run::Task>()));
-        CLIO_CO_RETURN;
-      }
+      // NO CPU SUBSTITUTION. This used to silently swap in the CPU codec of
+      // the same family, on the theory that "a GPU codec cannot service a
+      // device page fault (the faulting kernel holds the device)". Yieldable
+      // kernels removed that premise: a faulting block suspends and the
+      // kernel exits, so the device is free while the codec runs. Falling
+      // back would produce a CPU-lz4 bitstream that the in-kernel decoder
+      // cannot read, quietly forcing every later read onto the host path --
+      // i.e. it would report a GPU codec while delivering a CPU one.
+      HLOG(kError,
+           "compressor: GPU codec '{}' requested but the device codec path "
+           "did not run (codec context: {}, device src: {}). Failing the put "
+           "rather than silently substituting a CPU codec.",
+           ctp::CompressionFactory::NameForWireId(ctx.compress_lib_),
+           HasCodecContext(), ctp::IsDeviceAccessible(src_full.ptr_));
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
     }
 
     // Stage device -> host. DeviceAwareMemcpy resolves the pointer kind, so
