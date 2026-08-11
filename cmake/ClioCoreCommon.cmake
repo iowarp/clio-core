@@ -495,6 +495,18 @@ endfunction()
 #   add_cuda_library(TARGET SHARED|STATIC DO_COPY source1.cc ...
 #       [INCLUDE_DIRS dir1 dir2 ...]
 #       [LINK_LIBS lib1 lib2 ...])
+# RDC (separable compilation) is nvcc-only here. Under clang-CUDA, CMake's
+# device-link step drives fatbinary with pre-CUDA-13 options ("fatbinary
+# fatal: Unknown option 'im'"), and none of this tree's device code needs
+# cross-TU device linking anyway -- every kernel's device callees live in
+# headers, so each TU's fatbin is self-contained (proved by the manual
+# clang builds of the gpu_vector bench and the llama bridge).
+if(CMAKE_CUDA_COMPILER MATCHES "clang")
+    set(CLIO_CUDA_SEPARABLE OFF)
+else()
+    set(CLIO_CUDA_SEPARABLE ON)
+endif()
+
 function(add_cuda_library TARGET SHARED DO_COPY)
     cmake_parse_arguments(CUDA "" "" "INCLUDE_DIRS;LINK_LIBS" ${ARGN})
     set(SRC_FILES ${CUDA_UNPARSED_ARGUMENTS})
@@ -525,13 +537,13 @@ function(add_cuda_library TARGET SHARED DO_COPY)
         # CLIO_RUN_GPU_API on the ChiServerBootstrap* entry points, CTP_DLL in
         # clio_ctp_cuda).
         set_target_properties(${TARGET} PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared
         )
     else()
         set_target_properties(${TARGET} PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Static
         )
@@ -571,7 +583,7 @@ function(add_cuda_executable TARGET DO_COPY)
     set_cuda_sources("${DO_COPY}" "${SRC_FILES}" CUDA_SOURCE_FILES)
     add_executable(${TARGET} ${CUDA_SOURCE_FILES})
     set_target_properties(${TARGET} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
         POSITION_INDEPENDENT_CODE ON
     )
 
