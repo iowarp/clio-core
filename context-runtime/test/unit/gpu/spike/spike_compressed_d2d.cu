@@ -19,6 +19,34 @@
 #include <cstdio>
 #include <cstddef>
 
+namespace std {
+template <typename Promise = void> struct coroutine_handle;
+template <> struct coroutine_handle<void> {
+  void *ptr_ = nullptr;
+  __host__ __device__ constexpr coroutine_handle() noexcept {}
+  __host__ __device__ constexpr coroutine_handle(decltype(nullptr)) noexcept {}
+  __host__ __device__ static coroutine_handle from_address(void *a) noexcept {
+    coroutine_handle h; h.ptr_ = a; return h; }
+  __host__ __device__ void *address() const noexcept { return ptr_; }
+  __host__ __device__ void resume() const { __builtin_coro_resume(ptr_); }
+  __host__ __device__ bool done() const { return __builtin_coro_done(ptr_); }
+};
+template <typename Promise> struct coroutine_handle : coroutine_handle<void> {
+  __host__ __device__ static coroutine_handle from_promise(Promise &p) {
+    coroutine_handle h;
+    h.ptr_ = __builtin_coro_promise(reinterpret_cast<char *>(&p), alignof(Promise), true);
+    return h; }
+  __host__ __device__ static coroutine_handle from_address(void *a) noexcept {
+    coroutine_handle h; h.ptr_ = a; return h; }
+};
+template <typename R, typename...> struct coroutine_traits { using promise_type = typename R::promise_type; };
+struct suspend_always {
+  __host__ __device__ bool await_ready() const noexcept { return false; }
+  __host__ __device__ void await_suspend(coroutine_handle<>) const noexcept {}
+  __host__ __device__ void await_resume() const noexcept {}
+};
+}  // namespace std
+
 #define BLOCKS 16
 #define THREADS 256
 #define NLANE (BLOCKS * THREADS)
@@ -65,6 +93,60 @@ __global__ void KSwitch(const float *cache, const int *resident, const float *ac
 done:
   { const int any = __syncthreads_or(suspended);
     if (threadIdx.x == 0) pending[blockIdx.x] = any; }
+}
+
+// ---------------- CORO: same algorithm, co_await instead of the switch ----
+#define LANE_BYTES 128
+__device__ char g_arena[(size_t)NLANE * LANE_BYTES];
+__device__ unsigned g_off[NLANE];
+
+struct Task {
+  struct promise_type {
+    __device__ Task get_return_object() {
+      return Task{std::coroutine_handle<promise_type>::from_promise(*this)}; }
+    __device__ std::suspend_always initial_suspend() noexcept { return {}; }
+    __device__ std::suspend_always final_suspend() noexcept { return {}; }
+    __device__ void return_void() {}
+    __device__ void unhandled_exception() {}
+    __device__ void *operator new(size_t n) {
+      const unsigned l = Gid(); const unsigned o = g_off[l];
+      g_off[l] = o + (unsigned)((n + 15) & ~15u);
+      return g_arena + (size_t)l * LANE_BYTES + o; }
+    __device__ void operator delete(void *, size_t) {}
+  };
+  std::coroutine_handle<promise_type> h_;
+};
+
+__device__ Task CoroModel(const float *cache, const int *resident, const float *act,
+                          float *out, int *want) {
+  float acc = 0.0f;
+  for (unsigned p = 0; p < MODEL_PAGES; ++p) {
+    const unsigned slot = p % CACHE_PAGES;
+    while (resident[blockIdx.x * CACHE_PAGES + slot] != (int)p) {
+      if (threadIdx.x == 0) want[blockIdx.x] = (int)p;
+      co_await std::suspend_always{};
+    }
+    const size_t base = SlotBase(slot);
+    for (unsigned e = threadIdx.x; e < PAGE_ELEMS; e += THREADS)
+      acc += cache[base + e] * act[e];
+  }
+  out[Gid()] = acc;
+}
+
+__global__ void KCoroStart(const float *cache, const int *resident, const float *act,
+                           float *out, int *want, void **saved, int *pending) {
+  g_off[Gid()] = 0;
+  Task t = CoroModel(cache, resident, act, out, want);
+  saved[Gid()] = t.h_.address();
+  t.h_.resume();
+  const int any = __syncthreads_or(t.h_.done() ? 0 : 1);
+  if (threadIdx.x == 0) pending[blockIdx.x] = any;
+}
+__global__ void KCoroResume(void **saved, int *pending) {
+  auto h = std::coroutine_handle<>::from_address(saved[Gid()]);
+  if (!h.done()) h.resume();
+  const int any = __syncthreads_or(h.done() ? 0 : 1);
+  if (threadIdx.x == 0) pending[blockIdx.x] = any;
 }
 
 /** The whole model resident and UNCOMPRESSED -- the ceiling. */
@@ -165,12 +247,22 @@ int main() {
   };
 
   // Compressed, served on the device
-  auto run_d2d = [&](int work, int *rounds_out) {
+  void **d_saved; cudaMalloc(&d_saved, NLANE * sizeof(void *));
+
+  // coro==false -> macro switch shape; coro==true -> co_await
+  auto run_d2d = [&](int work, bool coro, int *rounds_out) {
     reset(); int pending = 1, guard = 0, rounds = 0;
+    if (coro) {
+      KCoroStart<<<BLOCKS, THREADS>>>(d_cache, d_res, d_act, d_out, d_want, d_saved, d_pend);
+      ++rounds;
+      cudaMemcpy(h_pend, d_pend, sizeof(h_pend), cudaMemcpyDeviceToHost);
+      pending = 0; for (int i = 0; i < BLOCKS; ++i) pending |= h_pend[i];
+    }
     while (pending && guard++ < 256) {
       KDecompress<<<BLOCKS, THREADS>>>(d_comp, d_cache, d_want, work);
       mark_resident();
-      KSwitch<<<BLOCKS, THREADS>>>(d_cache, d_res, d_act, d_out, d_want, d_pend);
+      if (coro) KCoroResume<<<BLOCKS, THREADS>>>(d_saved, d_pend);
+      else KSwitch<<<BLOCKS, THREADS>>>(d_cache, d_res, d_act, d_out, d_want, d_pend);
       ++rounds;
       cudaMemcpy(h_pend, d_pend, sizeof(h_pend), cudaMemcpyDeviceToHost);
       pending = 0; for (int i = 0; i < BLOCKS; ++i) pending |= h_pend[i];
@@ -199,12 +291,17 @@ int main() {
          pcie_ms, (model_bytes / 1073741824.0) / (pcie_ms / 1000.0),
          pcie_ms / resident_ms, rr);
 
+  // Warm BOTH mechanisms before timing either: whichever runs first
+  // otherwise absorbs first-touch cost and looks slower (spike 6's trap).
+  for (int w2 = 0; w2 < 2; ++w2) { run_d2d(0, false, nullptr); run_d2d(0, true, nullptr); }
+  cudaDeviceSynchronize();
+
+  printf("\n%-16s %-6s %10s %10s %8s\n", "compressed D2D", "codec", "SWITCH", "CORO", "delta");
   for (int work : {0, 4, 16, 64}) {
-    const float ms = time_it([&]{ run_d2d(work, &rr); }, 3);
-    printf("%-14s w=%-4d %8.2f ms  %7.1f GB/s  %5.1fx   (%.2fx vs PCIe)\n",
-           "compressed D2D", work, ms,
-           (model_bytes / 1073741824.0) / (ms / 1000.0), ms / resident_ms,
-           pcie_ms / ms);
+    const float ms_sw = time_it([&]{ run_d2d(work, false, &rr); }, 3);
+    const float ms_co = time_it([&]{ run_d2d(work, true, &rr); }, 3);
+    printf("%-16s w=%-4d %8.2f ms %8.2f ms %7.2fx  (SWITCH %.2fx vs PCIe)\n",
+           "", work, ms_sw, ms_co, ms_co / ms_sw, pcie_ms / ms_sw);
   }
   return 0;
 }
