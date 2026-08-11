@@ -48,6 +48,7 @@ endif()
 target_link_libraries(clio_hdf5_vol
     clio_cte_core_client
     clio_cte_core_runtime
+    clio_cte_compressor_client
     clio::run::admin_runtime
     clio::run::admin_client
     clio::run::bdev_runtime

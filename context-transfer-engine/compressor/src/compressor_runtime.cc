@@ -724,6 +724,22 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         core_client_ = std::make_unique<clio::cte::core::Client>(core_id);
       }
     }
+    // Neither this chimod's own compose config nor the caller supplied a
+    // core pool to store into -- every use of core_client_ below would
+    // dereference a null unique_ptr. Fail the task instead of crashing the
+    // whole runtime process on what is really a caller/deployment
+    // misconfiguration (e.g. a compressor pool created without
+    // CompressorConfig.next_pool_id_, called via the AsyncPutBlob
+    // convenience override instead of AsyncDynamicSchedule/AsyncCompress'
+    // explicit core_pool_id parameter).
+    if (!core_client_) {
+      HLOG(kError,
+           "Compress: no core pool available (compose next_pool_id_ unset "
+           "and caller passed no explicit core_pool_id) -- cannot store "
+           "the result");
+      task->return_code_ = 7;  // No core pool available
+      CLIO_CO_RETURN;
+    }
 
     // Get tier score for output
     float tier_score = 0.0F;
@@ -930,6 +946,16 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       if (!core_id.IsNull()) {
         core_client_ = std::make_unique<clio::cte::core::Client>(core_id);
       }
+    }
+    // See the matching guard in Compress(): without a resolved core pool,
+    // the unconditional core_client_->AsyncGetBlob() below null-derefs.
+    if (!core_client_) {
+      HLOG(kError,
+           "Decompress: no core pool available (compose next_pool_id_ unset "
+           "and caller passed no explicit core_pool_id) -- cannot fetch the "
+           "blob to decompress");
+      task->return_code_ = 3;  // No core pool available
+      CLIO_CO_RETURN;
     }
 
     // Ask core directly (bypassing this class's own GetBlobSize override,

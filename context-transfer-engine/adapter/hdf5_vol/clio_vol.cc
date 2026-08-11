@@ -31,6 +31,7 @@
 #include <H5FDmpio.h>       /* H5Pget_dxpl_mpio (collective-IO detection) */
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -53,6 +54,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
+#include <clio_cte/compressor/compressor_client.h>
 
 /* The connector's capability set. Defined once because it is reported from two
    places (the class literal and introspect_get_cap_flags) that must agree. */
@@ -92,6 +94,14 @@ struct clio_file_t {
   clio::cte::core::TagId tag_id;
   std::string file_name;
   size_t chunk_size;
+  /* Set (non-null) when the FAPL configured a compressor chimod pool via
+     clio_vol_info_t. When set, cacheable H5Dwrite/H5Dread chunk transfers
+     route through this compressor::Client (AsyncPutBlob analyzes + compresses
+     + stores; AsyncGetBlob fetches + decompresses) instead of going straight
+     to the CTE core pool uncompressed. Owned per-file, mirroring how
+     chunk_size is resolved once at open and reused for every dataset in the
+     file -- there is no per-dataset override. */
+  std::unique_ptr<clio::cte::compressor::Client> compressor_client;
   /* False when the CTE tier is bypassed entirely for this file: either the user
      disabled it (CLIO_VOL_CACHE=0) or the CLIO runtime was unreachable at open.
      The connector then behaves as a pure pass-through to the native VOL, which
@@ -142,6 +152,12 @@ struct clio_dataset_t {
   bool cacheable;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
+  /* Same as pending_puts, but for chunks routed through the compressor
+     chimod (file->compressor_client set) -- DynamicScheduleTask is a
+     different Task type than core's PutBlobTask, so it cannot share the
+     vector above even though both are drained the same way. */
+  std::vector<clio::run::Future<clio::cte::compressor::DynamicScheduleTask>>
+      pending_compressed_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
   /* Telemetry-only storage-layout probe, filled lazily on first traced access
      (never touched unless CLIO_VOL_TRACE is set). */
@@ -193,7 +209,14 @@ static bool drain_dataset_puts(clio_dataset_t *dset) {
       ok = false;
     }
   }
+  for (auto &future : dset->pending_compressed_puts) {
+    future.Wait();
+    if (future->GetReturnCode() != 0) {
+      ok = false;
+    }
+  }
   dset->pending_puts.clear();
+  dset->pending_compressed_puts.clear();
   dset->pending_buffers.clear();
   return ok;
 }
@@ -443,6 +466,29 @@ static size_t clio_resolve_chunk_size(hid_t fapl_id) {
   return chunk_size;
 }
 
+/* Resolve the compressor chimod pool for a file, same precedence as
+   clio_resolve_chunk_size(): connector info, then CLIO_VOL_COMPRESSOR_POOL
+   ("major" or "major.minor"), then "unset" (GetNull() -- writes stay
+   uncompressed, today's behavior). */
+static clio::run::PoolId clio_resolve_compressor_pool(hid_t fapl_id) {
+  clio::run::PoolId pool_id = clio::run::PoolId::GetNull();
+  clio_vol_info_t *vol_info = nullptr;
+  H5Pget_vol_info(fapl_id, reinterpret_cast<void **>(&vol_info));
+  if (vol_info && vol_info->compressor_pool_major != 0) {
+    pool_id = clio::run::PoolId(vol_info->compressor_pool_major,
+                                 vol_info->compressor_pool_minor);
+  }
+  const char *env_pool = std::getenv("CLIO_VOL_COMPRESSOR_POOL");
+  if (env_pool && *env_pool) {
+    unsigned major = 0, minor = 0;
+    int parsed = std::sscanf(env_pool, "%u.%u", &major, &minor);
+    if (parsed >= 1 && major != 0) {
+      pool_id = clio::run::PoolId(major, minor);
+    }
+  }
+  return pool_id;
+}
+
 /* Build the connector's file wrapper around an already-opened native file, and
    bind its CTE tag if the cache is usable. `truncated` means the native file was
    just emptied (H5F_ACC_TRUNC), so any tag left over from a PREVIOUS file of the
@@ -451,7 +497,9 @@ static size_t clio_resolve_chunk_size(hid_t fapl_id) {
    creating a file over an old one and then reading a dataset the new file never
    wrote would hit the old file's cached blobs. */
 static clio_file_t *clio_make_file(void *under_file, const char *name,
-                                     size_t chunk_size, bool truncated) {
+                                     size_t chunk_size,
+                                     const clio::run::PoolId &compressor_pool_id,
+                                     bool truncated) {
   auto *file = new clio_file_t;
   file->obj.under_object = under_file;
   file->obj.under_vol_id = H5VL_NATIVE;
@@ -461,6 +509,16 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->chunk_size = chunk_size;
   file->cache_enabled = clio_cache_env_enabled();
   file->trace = clio::trace::open_file(name);
+  if (!compressor_pool_id.IsNull()) {
+    /* Runtime-internal one-arg ctor: only the compressor pool is known here,
+       exactly the situation its doc comment describes. Its own chimod config
+       (next_pool_id_, set at AsyncCreateCompressor time) resolves which core
+       pool to forward compressed blobs to -- this client never needs the
+       inherited pass-through pool_id_ for anything, since get_cte_client()
+       remains the one used for tags/deletes/etc. */
+    file->compressor_client =
+        std::make_unique<clio::cte::compressor::Client>(compressor_pool_id);
+  }
 
   auto *cte_client = file->cache_enabled ? get_cte_client() : nullptr;
   if (!cte_client) {
@@ -488,6 +546,7 @@ static void *clio_file_create(const char *name, unsigned flags,
                                 hid_t fcpl_id, hid_t fapl_id,
                                 hid_t dxpl_id, void **req) {
   size_t chunk_size = clio_resolve_chunk_size(fapl_id);
+  clio::run::PoolId compressor_pool_id = clio_resolve_compressor_pool(fapl_id);
 
   /* Create file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -499,12 +558,14 @@ static void *clio_file_create(const char *name, unsigned flags,
 
   /* H5Fcreate always yields an empty file (TRUNC replaces an existing one,
      EXCL/CREAT means there was none), so any pre-existing tag is stale. */
-  return clio_make_file(under_file, name, chunk_size, /*truncated*/ true);
+  return clio_make_file(under_file, name, chunk_size, compressor_pool_id,
+                          /*truncated*/ true);
 }
 
 static void *clio_file_open(const char *name, unsigned flags,
                               hid_t fapl_id, hid_t dxpl_id, void **req) {
   size_t chunk_size = clio_resolve_chunk_size(fapl_id);
+  clio::run::PoolId compressor_pool_id = clio_resolve_compressor_pool(fapl_id);
 
   /* Open file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -513,7 +574,8 @@ static void *clio_file_open(const char *name, unsigned flags,
   H5Pclose(native_fapl);
   if (!under_file) return nullptr;
 
-  return clio_make_file(under_file, name, chunk_size, /*truncated*/ false);
+  return clio_make_file(under_file, name, chunk_size, compressor_pool_id,
+                          /*truncated*/ false);
 }
 
 static herr_t clio_file_get(void *obj, H5VL_file_get_args_t *args,
@@ -1154,11 +1216,36 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
 
-      auto future = cte_client->AsyncPutBlob(
-          dataset->file->tag_id, blob_name, offset, this_size,
-          blob_data, -1.0f, clio::cte::core::Context(), 0);
+      /* When the file was opened with a compressor pool configured, route
+         through it instead of the raw core client: compressor::Client's
+         AsyncDynamicSchedule analyzes the chunk (NeuroPress dynamic
+         selection among them), compresses, and stores via core PutBlob --
+         rather than storing the chunk uncompressed. The two return
+         different Task types (DynamicScheduleTask vs PutBlobTask), so they
+         go into separate pending-future vectors drained the same way on
+         close.
 
-      dataset->pending_puts.push_back(std::move(future));
+         AsyncDynamicSchedule (not the AsyncPutBlob override) so the core
+         pool id can be passed explicitly: the override always sends
+         PoolId::GetNull() for it, which only resolves if the compressor
+         pool's own compose config set next_pool_id_ -- a VOL-opened
+         compressor pool has no such guarantee, and an unresolved core
+         client null-derefs deep in the compressor runtime instead of
+         failing cleanly. cte_client->pool_id_ is the core pool this VOL
+         connector's own CTE core client is already bound to, so compressed
+         chunks land in the same core pool uncompressed chunks would have. */
+      if (dataset->file->compressor_client) {
+        auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
+            clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+            offset, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+            0, cte_client->pool_id_);
+        dataset->pending_compressed_puts.push_back(std::move(future));
+      } else {
+        auto future = cte_client->AsyncPutBlob(
+            dataset->file->tag_id, blob_name, offset, this_size,
+            blob_data, -1.0f, clio::cte::core::Context(), 0);
+        dataset->pending_puts.push_back(std::move(future));
+      }
       dataset->pending_buffers.push_back(std::move(buffer));
     }
 
@@ -1213,13 +1300,55 @@ static bool clio_cache_populated(clio_dataset_t *dataset) {
    whole-read hit path and selection serving. */
 static bool clio_read_cached_image(clio_dataset_t *dataset,
                                      size_t total_size, char *dst) {
-  auto *cte_client = get_cte_client();
   size_t chunk_size = dataset->file->chunk_size;
   size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
-  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futures;
   std::vector<ctp::ipc::FullPtr<char>> buffers;
-  futures.reserve(num_chunks);
   buffers.reserve(num_chunks);
+
+  /* Chunks written through the compressor chimod are stored COMPRESSED --
+     fetching them with the raw core client (no decompression) would hand
+     back compressed bytes as if they were the real data. Whichever client
+     wrote the chunk must be the one that reads it back, so this mirrors the
+     branch in clio_dataset_write() exactly, keyed the same way (whether
+     file->compressor_client is set). */
+  if (dataset->file->compressor_client) {
+    auto *compressor_client = dataset->file->compressor_client.get();
+    /* See the write-side comment in clio_dataset_write(): the convenience
+       AsyncGetBlob override always sends a null core_pool_id, which only
+       resolves via compose config; use the explicit-core-pool-id method
+       with the CTE core client's own pool id instead, so a VOL-opened
+       compressor pool (no compose config of its own) doesn't null-deref
+       inside the compressor runtime. */
+    auto *cte_client = get_cte_client();
+    std::vector<clio::run::Future<clio::cte::compressor::DecompressTask>>
+        futures;
+    futures.reserve(num_chunks);
+    for (size_t i = 0; i < num_chunks; ++i) {
+      size_t offset = i * chunk_size;
+      size_t this_size = std::min(chunk_size, total_size - offset);
+      auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+      if (buffer.IsNull()) return false;
+      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+      std::string blob_name = dataset->dataset_path + "/chunk_" +
+                              std::to_string(i);
+      futures.push_back(compressor_client->AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+          offset, this_size, 0, blob_data, cte_client->pool_id_));
+      buffers.push_back(std::move(buffer));
+    }
+    for (size_t i = 0; i < futures.size(); ++i) {
+      futures[i].Wait();
+      if (futures[i]->GetReturnCode() != 0) return false;
+      size_t offset = i * chunk_size;
+      size_t this_size = std::min(chunk_size, total_size - offset);
+      ctp::DeviceAwareMemcpy(dst + offset, buffers[i].ptr_, this_size);
+    }
+    return true;
+  }
+
+  auto *cte_client = get_cte_client();
+  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futures;
+  futures.reserve(num_chunks);
   for (size_t i = 0; i < num_chunks; ++i) {
     size_t offset = i * chunk_size;
     size_t this_size = std::min(chunk_size, total_size - offset);
@@ -1529,11 +1658,28 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
         std::string blob_name = dataset->dataset_path + "/chunk_" +
                                 std::to_string(i);
-        auto fut = cte_client->AsyncPutBlob(
-            dataset->file->tag_id, blob_name, offset, this_size, blob_data,
-            -1.0f, clio::cte::core::Context(), 0);
-        fut.Wait();
-        if (fut->GetReturnCode() != 0) staged_ok = false;
+        /* Must match whichever client will later read this chunk back
+           (clio_read_cached_image() branches the same way): staging it
+           uncompressed via the core client here, then decompressing it on
+           read, would corrupt the image. */
+        int rc_code;
+        if (dataset->file->compressor_client) {
+          /* Explicit core_pool_id, same reason as clio_dataset_write()'s
+             write-side branch. */
+          auto fut = dataset->file->compressor_client->AsyncDynamicSchedule(
+              clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+              offset, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+              0, cte_client->pool_id_);
+          fut.Wait();
+          rc_code = fut->GetReturnCode();
+        } else {
+          auto fut = cte_client->AsyncPutBlob(
+              dataset->file->tag_id, blob_name, offset, this_size, blob_data,
+              -1.0f, clio::cte::core::Context(), 0);
+          fut.Wait();
+          rc_code = fut->GetReturnCode();
+        }
+        if (rc_code != 0) staged_ok = false;
       }
       if (!staged_ok) {
         clio_invalidate_dataset(dataset);
