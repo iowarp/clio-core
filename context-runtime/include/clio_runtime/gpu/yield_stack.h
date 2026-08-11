@@ -70,6 +70,31 @@
  * specific to this mechanism, it applies equally to a coroutine-based design
  * whose lanes suspend independently.
  *
+ * COST OF A YLOCAL, AND THE ONE RULE THAT FOLLOWS
+ *
+ * A YLOCAL is a reference into device memory, and nvcc does NOT promote it to
+ * a register across a loop. Measured, 64 blocks x 256 threads summing a 4 MB
+ * array (times relative to the same loop with an ordinary local):
+ *
+ *     ordinary local                                    1.00x
+ *     YLOCAL, register copy for the loop                0.90x   <-- free
+ *     YLOCAL used directly, yield OUTSIDE the loop     28.8x
+ *     YLOCAL used directly, yield INSIDE the loop      49.6x
+ *
+ * So: a YLOCAL is for values that must SURVIVE a yield, not for values a loop
+ * touches. Pull a register copy for the yield-free region and write it back:
+ *
+ *     { u64 r = acc;                          // register
+ *       for (...) r += data[e];               // hot loop, no frame traffic
+ *       acc = r; }                            // back to the frame
+ *
+ * That single move is the difference between 29x and free, and it is why the
+ * realistic paged benchmark (spike 4) came out at 1.19x rather than 10x.
+ *
+ * A suspend point INSIDE the loop costs another ~1.7x on top, because the live
+ * values must be in the frame at that point on every iteration. Yield at the
+ * coarsest granularity the algorithm allows -- per page, not per element.
+ *
  * LAYOUT NOTE (deliberate, and a known cost)
  *
  * A lane's frames are CONTIGUOUS, so `T &` references into them are possible
