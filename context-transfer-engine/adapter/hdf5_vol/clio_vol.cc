@@ -49,6 +49,7 @@
    clio.h alone). Without this include the linker leaves the
    templated symbols undefined in our .so. */
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
@@ -1089,10 +1090,13 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       size_t offset = i * chunk_size;
       size_t this_size = std::min(chunk_size, total_size - offset);
 
-      /* Allocate SHM buffer and copy data */
+      /* Allocate SHM buffer and copy data. The caller's buffer (src) may be a
+       * GPU device pointer (an app writing straight from GPU-resident data);
+       * DeviceAwareMemcpy detects that and routes through the CUDA/ROCm/SYCL
+       * copy path instead of dereferencing device memory from host code. */
       auto buffer = CLIO_IPC->AllocateBuffer(this_size);
       if (buffer.IsNull()) return -1;
-      std::memcpy(buffer.ptr_, src + offset, this_size);
+      ctp::DeviceAwareMemcpy(buffer.ptr_, src + offset, this_size);
 
       ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
       std::string blob_name = dataset->dataset_path + "/chunk_" +
@@ -1108,11 +1112,24 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
 
     /* Write to the native VOL -- the authoritative store. Its status is this
        call's status; if it failed, the bytes we just staged into CTE describe
-       data the file does not contain, so drop them. */
+       data the file does not contain, so drop them.
+       Native HDF5 has no concept of GPU memory: H5D__contig_writevv_sieve_cb
+       (and friends) dereference this buffer directly on the host, so a raw
+       device pointer here segfaults deep inside libhdf5 -- not something we
+       can fix on the native side. Stage a host copy first when buf[d] is a
+       device pointer (mirrors NeuroPress's own gpu_bypass_dh_write, which
+       hits this exact same constraint on its own native-passthrough path). */
+    const void *native_write_buf = buf[d];
+    std::vector<char> native_write_staging;
+    if (ctp::IsDevicePointer(buf[d])) {
+      native_write_staging.resize(total_size);
+      ctp::DeviceAwareMemcpy(native_write_staging.data(), buf[d], total_size);
+      native_write_buf = native_write_staging.data();
+    }
     herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                        dataset->obj.under_vol_id,
                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                       dxpl_id, &buf[d], req);
+                       dxpl_id, &native_write_buf, req);
     if (rc < 0) {
       ret_value = rc;
       drain_dataset_puts(dataset);
@@ -1167,7 +1184,9 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
     futures[i].Wait();
     size_t offset = i * chunk_size;
     size_t this_size = std::min(chunk_size, total_size - offset);
-    std::memcpy(dst + offset, buffers[i].ptr_, this_size);
+    // dst is the caller's buffer -- same GPU-pointer caveat as the write
+    // path above.
+    ctp::DeviceAwareMemcpy(dst + offset, buffers[i].ptr_, this_size);
   }
   return true;
 }
@@ -1379,11 +1398,25 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     }
 
     if (cached == 0) {
-      /* MISS — native read is the source of truth, then stage into the tier. */
+      /* MISS — native read is the source of truth, then stage into the tier.
+         Native HDF5 dereferences the destination buffer directly on the host
+         (same constraint as the write path above -- H5D__contig_readvv_sieve_cb
+         has no concept of GPU memory), so read into a host staging buffer when
+         dst is a device pointer; the CTE staging loop below then sources from
+         that same staging buffer, and the result is copied out to the real
+         (device) dst once at the end. */
+      bool dst_on_device = ctp::IsDevicePointer(dst);
+      std::vector<char> native_read_staging;
+      char *native_read_dst = dst;
+      if (dst_on_device) {
+        native_read_staging.resize(total_size);
+        native_read_dst = native_read_staging.data();
+      }
+      void *native_read_buf = native_read_dst;
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
                                    &mem_type_id[d], &mem_space_id[d],
-                                   &file_space_id[d], dxpl_id, &buf[d], req);
+                                   &file_space_id[d], dxpl_id, &native_read_buf, req);
       if (rc < 0) return rc;
       /* Stage into the tier. Best-effort, but a PARTIAL stage must not be left
          behind: chunk_0 present is the hit test, so a run that stages chunk_0
@@ -1395,7 +1428,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         size_t this_size = std::min(chunk_size, total_size - offset);
         auto buffer = CLIO_IPC->AllocateBuffer(this_size);
         if (buffer.IsNull()) { staged_ok = false; break; }
-        std::memcpy(buffer.ptr_, dst + offset, this_size);
+        std::memcpy(buffer.ptr_, native_read_dst + offset, this_size);
         ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
         std::string blob_name = dataset->dataset_path + "/chunk_" +
                                 std::to_string(i);
@@ -1407,6 +1440,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
       }
       if (!staged_ok) {
         clio_invalidate_dataset(dataset);
+      }
+      if (dst_on_device) {
+        ctp::DeviceAwareMemcpy(dst, native_read_staging.data(), total_size);
       }
     } else {
       /* HIT — serve the whole image from the CTE tier. If reassembly fails we

@@ -127,6 +127,50 @@ if(NOT WIN32)
   )
 endif()
 
+#------------------------------------------------------------------------------
+# GPU device-pointer passthrough: H5Dwrite/H5Dread with a real cudaMalloc
+# buffer. Its own executable/ctest entry (not folded into test_hdf5_vol_io)
+# so a crash here is an isolated, clearly-attributed failure rather than
+# taking the whole IO suite down with it. Only registered when CUDA is on;
+# without it the connector's write/read paths never see a device pointer.
+#------------------------------------------------------------------------------
+if(NOT WIN32 AND CLIO_CORE_ENABLE_CUDA)
+  add_executable(test_hdf5_vol_gpu_ptr
+      test_hdf5_vol_gpu_ptr.cc
+  )
+
+  target_include_directories(test_hdf5_vol_gpu_ptr PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+      ${CMAKE_SOURCE_DIR}/context-runtime/test
+      ${HDF5_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(test_hdf5_vol_gpu_ptr
+      clio_hdf5_vol
+      clio_cte_core_runtime
+      clio_cte_core_client
+      clio::run::admin_runtime
+      clio::run::admin_client
+      clio::run::bdev_runtime
+      clio::run::bdev_client
+      ctp::cxx
+      ctp::cuda_cxx
+      ${HDF5_LIBRARIES}
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  add_test(NAME cte_hdf5_vol_gpu_ptr
+      COMMAND test_hdf5_vol_gpu_ptr "Write/read survives a real GPU device pointer")
+
+  set_tests_properties(cte_hdf5_vol_gpu_ptr PROPERTIES
+      TIMEOUT 300
+      LABELS "unit;adapter;hdf5_vol;cte;gpu"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
+  )
+
+  install(TARGETS test_hdf5_vol_gpu_ptr RUNTIME DESTINATION bin)
+endif()
+
 install(
     TARGETS test_hdf5_vol_adapter test_hdf5_vol_io
     RUNTIME DESTINATION bin
