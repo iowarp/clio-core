@@ -420,8 +420,29 @@ int main(int argc, char **argv) {
               gpu_info, vec.GetDevice(0), per, kPageElems, flat_pct, view,
               sstack.View());
         },
-        []{}, /*max_rounds=*/200000);
+        []{},
+        // 50k rounds is ~30x what a healthy seed of this size needs (measured
+        // 1734 for 256 pages). The cap exists to turn a NON-CONVERGING seed
+        // into a fast, loud failure instead of a seven-minute wedge: when the
+        // tier is genuinely full every writeback fails, those pages correctly
+        // stay dirty, no slot can ever be cleaned, and the fault path spins
+        // forever with nothing to report. Out of space must look like an
+        // error, not a hang.
+        /*max_rounds=*/50000);
     std::fprintf(stderr, "[seed] yieldable, rounds=%u\n", seed_rounds);
+    {
+      const auto seed_stats = vec.ReadStats(0);
+      if (seed_rounds >= 50000 || seed_stats.put_errors != 0) {
+        std::fprintf(stderr,
+                     "bench: SEED DID NOT CONVERGE (rounds=%u, "
+                     "put_errors=%llu). The tier cannot hold this image -- "
+                     "raise --hbm-mb, lower --pages, or compress harder. "
+                     "Refusing to report a measurement.\n",
+                     seed_rounds,
+                     (unsigned long long) seed_stats.put_errors);
+        return 1;
+      }
+    }
   } else {
       SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
   }
