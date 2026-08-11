@@ -233,14 +233,12 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   // device base, so kBuilt is itself the assertion that the bytes are in
   // device memory. decode_in_kernel=true additionally requires every mapped
   // page to be a chunk-parsed nvcomp stream.
-  gv::Vector<clio::run::u32>::MapResult mr =
-      gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound;
-  for (int attempt = 0; attempt < 200; ++attempt) {
-    mr = vec.BuildDeviceTierMap(/*decode_in_kernel=*/true);
-    if (mr != gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  REQUIRE(mr == gv::Vector<clio::run::u32>::MapResult::kBuilt);
+  // No device tier map for an encoded tag: decompression is launched by the
+  // CPU and batched, so encoded pages take the fetch path rather than being
+  // decoded inside the faulting kernel.
+  const gv::Vector<clio::run::u32>::MapResult mr =
+      vec.BuildDeviceTierMap(/*decode_in_kernel=*/false);
+  REQUIRE(mr == gv::Vector<clio::run::u32>::MapResult::kDisabled);
 
   // The compressed image has to be SMALLER than the raw one, or the codec did
   // not run and everything above passed for the wrong reason.

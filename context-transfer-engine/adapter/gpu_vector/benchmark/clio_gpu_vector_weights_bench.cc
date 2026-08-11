@@ -511,15 +511,13 @@ int main(int argc, char **argv) {
             : "disabled";
     std::fprintf(stderr, "[map] BuildDeviceTierMap(%d) = %s, fully_mapped=%d\n",
                  (int)kDecodeInKernel, mrs, (int)vec.FullyDeviceMapped());
-    // A compressed run that cannot map is measuring the scalar fallback, which
-    // is not what this benchmark claims to report. Fail rather than mislead.
-    if (compressed && gpu_codec &&
-        mr != gv::Vector<clio::run::u32>::MapResult::kBuilt) {
+    // A COMPRESSED run is expected to report kDisabled: encoded pages are no
+    // longer device-mapped, because decompression is launched by the CPU and
+    // batched rather than run inside the faulting kernel. Only a RAW run maps
+    // (identity, zero-copy).
+    if (!compressed && mr != gv::Vector<clio::run::u32>::MapResult::kBuilt) {
       std::fprintf(stderr,
-                   "bench: --compressed requires an in-kernel nvcomp device "
-                   "map (got %s). Refusing to report a fallback result as "
-                   "nvcomp.\n",
-                   mrs);
+                   "bench: raw run expected a device tier map (got %s)\n", mrs);
       return 1;
     }
   }

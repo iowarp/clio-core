@@ -388,6 +388,34 @@ private:
    * Only the compressed side needs a buffer. The decompressed side is the
    * caller's page, written directly.
    */
+  /** One page's worth of work for the batched decompressor. */
+  struct DecompItem {
+    const void *src_device = nullptr;  // stored blob, device memory
+    size_t stored_size = 0;
+    void *dst_device = nullptr;        // page, device memory
+    size_t dst_bytes = 0;
+  };
+
+  /**
+   * Decompress every item in ONE nvcomp launch on the module stream, with a
+   * single synchronize for the whole batch.
+   */
+  size_t GpuDecompressBatch(const std::vector<DecompItem> &items,
+                            std::vector<char> *ok);
+
+  /**
+   * The compression module's ONE CUDA stream.
+   *
+   * Created on first use inside the codec context and reused for every
+   * operation. There is no reason for a stream per compression: a stream is
+   * an ordering domain, and the batched decompressor already expresses all
+   * the parallelism by handing nvcomp every chunk at once. cudaStreamCreate
+   * is also not free -- creating one per fault deadlocked against a resident
+   * kernel before the fault path learned to yield.
+   */
+  void *ModuleStream();
+  void *module_stream_ = nullptr;
+
   struct CodecSlot {
     void *buf = nullptr;   // compressed bytes, CUdeviceptr in codec_ctx_
     void *obuf = nullptr;  // decompressed bytes, plain ctx2 device memory
@@ -443,6 +471,13 @@ private:
      * whole point of having compressed them.
      */
     std::vector<char> stored_bytes;
+    /**
+     * The stored image in DEVICE memory, when the requester already fetched
+     * it there (the gpu_vector fault path does). Preferred over stored_bytes:
+     * the batched decompressor takes device pointers, so this needs no upload
+     * and the compressed payload never touches the host at all.
+     */
+    const void *src_device = nullptr;
     size_t stored_size = 0;
     void *dst = nullptr;
     size_t dst_bytes = 0;

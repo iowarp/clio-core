@@ -277,9 +277,15 @@ class Vector {
     // was not compiled in) keep the CPU fetch path.
     // kNvcompLz4Wire: the compressor registry's frozen wire id for
     // nvcomp-lz4 — the one codec the in-kernel decoder speaks.
-    constexpr int kNvcompLz4Wire = 11;
+    // ENCODED tags are never mapped any more. The chunk tables existed to
+    // feed an in-kernel decoder, and that decoder is gone: decompression is
+    // launched by the CPU, batched, on the compressor's stream. Mapping an
+    // encoded page now would only hide it from the fetch path that decodes
+    // it. `decode_in_kernel` is accepted and ignored so callers need not
+    // change; identity (raw) tags still map and still read zero-copy.
+    (void) decode_in_kernel;
     const bool encoded = compress_lib_ != 0;
-    if (encoded && (!decode_in_kernel || compress_lib_ != kNvcompLz4Wire)) {
+    if (encoded) {
       return MapResult::kDisabled;
     }
     const auto &h0 = devs_.begin()->second.hdr;

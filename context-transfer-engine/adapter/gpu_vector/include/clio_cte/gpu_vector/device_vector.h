@@ -1506,66 +1506,21 @@ class DeviceVector {
       // route costs three task round trips, a codec slot and a stream sync
       // per page (~1.6ms vs ~40us for a spilled raw page) and puts the CPU
       // back on a GPU fault.
-      if (SpilledEncodedPage(PageOf(off))) {
-        LockBlock();
-        BeginSpilledFetchLocked(PageOf(off));
-        UnlockBlock();
-      } else {
-        // A DEMAND fetch: the access already happened, so this counts as a
-        // fault but not as a prefetch.
-        BeginFetch(PageOf(off), /*is_prefetch=*/false);
-      }
+      // A DEMAND fetch: the access already happened, so this counts as a
+      // fault but not as a prefetch. An ENCODED page goes exactly the same
+      // way -- the compressor decodes it on the host's stream, batched with
+      // every other page pending in that drain. There is deliberately no
+      // codec call in this file: device-side LZ4 internals are not portable
+      // across GPUs, and the I/O path belongs to the CPU.
+      BeginFetch(PageOf(off), /*is_prefetch=*/false);
     }
     // Hand the host the address of the completion flag this block is parked
     // on, so it can poll 4 bytes instead of relaunching the whole grid to ask.
     // Stop yielding once the stored bytes LAND, not once the page is
     // resident: a spilled page becomes resident only after the decode below,
     // which needs the whole block back.
-    CLIO_YIELD_IF_RESUME_WHEN(
-        !IsResident(PageOf(off)) && !SpilledReady(PageOf(off)),
-        FetchWaitTag(PageOf(off)));
-
-    // 2b. DECODE, block-collective. The nvcomp warp decoder needs all 32
-    //     lanes, so this cannot live in ReapFetched (thread 0 only) -- which
-    //     is also why fetching=4 is a state those paths refuse to publish.
-#if defined(CLIO_GV_NVCOMP_DEVICE)
-    if (SpilledReady(PageOf(off))) {
-      Page *sp = Find(PageOf(off));
-      const clio::run::u64 sn = h_->stored_size_[PageOf(off)];
-      bool sok = false;
-      if (threadIdx.x < 32u && sp != nullptr) {
-        const unsigned char *blob =
-            reinterpret_cast<const unsigned char *>(ScratchFor(sp));
-        if (sp->get->GetReturnCode() == 0) {
-          sok = DecodeSpilledWarp(blob, sn, sp, NvScratch(0));
-          if (!sok && sn == h_->page_bytes_) {
-            // No CTEC magic and the stored image is a whole page: the
-            // compressor kept this page RAW because it did not shrink. The
-            // scratch already holds the page's bytes.
-            for (clio::run::u64 i = (threadIdx.x & 31u); i < sn; i += 32u) {
-              static_cast<char *>(sp->data)[i] =
-                  reinterpret_cast<const char *>(blob)[i];
-            }
-            sok = true;
-          }
-        }
-        sok = (__ballot_sync(0xffffffffu, sok) != 0u);
-      }
-      __syncthreads();
-      if (threadIdx.x == 0 && sp != nullptr) {
-        if (sok) {
-          __threadfence();
-          sp->fetching = 0u;            // publish: decoded, readable
-        } else {
-          Bump(h_->stat_get_errors_);
-          sp->page_num = kNoPage;       // never serve undecoded bytes
-          __threadfence();
-          sp->fetching = 0u;
-        }
-      }
-      __syncthreads();
-    }
-#endif
+    CLIO_YIELD_IF_RESUME_WHEN(!IsResident(PageOf(off)),
+                              FetchWaitTag(PageOf(off)));
 
     // 3. Resident for the whole block now, so this is the lock-free fast path
     //    and every lane may read the page.
