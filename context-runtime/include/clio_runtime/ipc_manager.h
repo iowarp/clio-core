@@ -1146,8 +1146,13 @@ class IpcManager {
     // Acquire reader lock for thread-safe access
     allocator_map_lock_.ReadLock();
 
+    // (alloc_map_ is the live registry; a stale `alloc_vector_` member was
+    // referenced here for a long time without anyone noticing, because no
+    // caller instantiates this overload -- clang's definition-time lookup is
+    // what finally flagged it.)
     ctp::ipc::FullPtr<T> result;
-    for (auto *alloc : alloc_vector_) {
+    for (auto &kv : alloc_map_) {
+      auto *alloc = kv.second;
       if (alloc && alloc->ContainsPtr(ptr)) {
         result = ctp::ipc::FullPtr<T>(alloc, ptr);
         allocator_map_lock_.ReadUnlock();

@@ -690,6 +690,9 @@ class Vector {
   }
 
  private:
+  // NOTE: forward-declared in the public section above; the definition must
+  // carry the same access, or clang rejects the redeclaration ([class.mem]).
+ public:
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
@@ -710,6 +713,7 @@ class Vector {
     unsigned long long *stats = nullptr;   // [faults, puts, evicts], or null
   };
 
+ private:
   /**
    * Allocate and register everything one GPU needs, then publish a view.
    *
