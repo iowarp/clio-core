@@ -155,6 +155,49 @@ __global__ void ProbeKernel(gy::YieldableView<> v, gy::YieldStackView stack,
   CLIO_YEND();
 }
 
+// ---------------------------------------------------------------------------
+// Worked example: a subfunction that yields, called from a LOOP in the kernel.
+//
+// This is the case where the frame stack earns its keep. Each iteration makes
+// a FRESH call to the subfunction; a resume re-enters the SAME call it
+// suspended in. The frame stack is what tells those two apart.
+// ---------------------------------------------------------------------------
+
+/** Log an event as code*100+value, in order. Thread 0 only, one block. */
+__device__ __forceinline__ void Ev(u32 *log, u32 *n, u32 code, u32 value) {
+  if (threadIdx.x == 0) {
+    const u32 i = atomicAdd(n, 1u);
+    if (i < 64) log[i] = code * 100 + value;
+  }
+}
+
+/** Suspends in the MIDDLE of itself, so the caller cannot paper over it. */
+__device__ void ProcessPage(u32 page, u32 *log, u32 *n) {
+  CLIO_YFRAME();
+  CLIO_YBEGIN();
+  Ev(log, n, 1, page);  // inner-begin
+  CLIO_YIELD_STACK();
+  Ev(log, n, 2, page);  // inner-end  (after the resume)
+  CLIO_YEND();
+}
+
+__global__ void LoopCallKernel(gy::YieldableView<> v, gy::YieldStackView stack,
+                               u32 npages, u32 *log, u32 *n) {
+  CLIO_YKERNEL_ENTER(v, stack);
+  Ev(log, n, 5, 0);  // kernel-entry: marks every (re)entry
+
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(u32, i, 0);  // the loop counter must survive the suspend
+
+  CLIO_YBEGIN();
+  for (; i < npages; ++i) {
+    CLIO_YCALL(ProcessPage(i, log, n));
+    Ev(log, n, 3, i);  // outer-after-call
+  }
+  Ev(log, n, 4, 0);  // outer-done
+  CLIO_YEND();
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 TEST_CASE("YieldStack - per-lane locals survive a nested yield",
@@ -360,6 +403,65 @@ TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
   REQUIRE(c[3] == kEntries);  // CLIO_YCALL argument expressions
 
   cudaFree(d_c);
+}
+
+TEST_CASE("YieldStack - subfunction yields inside a caller's loop",
+          "[gpu][yieldable][stack]") {
+  constexpr u32 kPages = 3;
+  gy::Yieldable<> y(1, 32);
+  gy::YieldStack stack(1, 32, kLaneBytes);
+
+  u32 *d_log = nullptr;
+  u32 *d_n = nullptr;
+  REQUIRE(cudaMalloc(&d_log, 64 * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_log, 0, 64 * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_n, sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_n, 0, sizeof(u32)) == cudaSuccess);
+
+  u32 entries = 0;
+  y.RunToCompletion(
+      [&](dim3 grid, dim3 block, gy::YieldableView<> view) {
+        ++entries;
+        LoopCallKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+            view, stack.View(), kPages, d_log, d_n);
+      },
+      [&]() {}, /*max_rounds=*/32);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  u32 n = 0;
+  REQUIRE(cudaMemcpy(&n, d_n, sizeof(u32), cudaMemcpyDeviceToHost) ==
+          cudaSuccess);
+  std::vector<u32> log(n);
+  REQUIRE(cudaMemcpy(log.data(), d_log, n * sizeof(u32),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  const char *name[] = {"?", "inner-begin", "inner-end", "after-call",
+                        "outer-done", "ENTRY"};
+  std::fprintf(stderr, "[loopcall] entries=%u events=%u\n", entries, n);
+  for (u32 e : log) {
+    std::fprintf(stderr, "   %-11s %u\n", name[e / 100], e % 100);
+  }
+
+  // One entry per suspend, plus the one that finishes: the subfunction yields
+  // once per page, so kPages suspends.
+  REQUIRE(entries == kPages + 1);
+
+  // The exact interleaving. Each entry resumes the call it suspended in,
+  // finishes it, then the LOOP makes the next call fresh -- which suspends
+  // again, ending the entry.
+  const u32 want[] = {
+      500, 100,             // entry 1: begin page 0, suspend
+      500, 200, 300, 101,   // entry 2: end 0, after-call 0, begin 1, suspend
+      500, 201, 301, 102,   // entry 3: end 1, after-call 1, begin 2, suspend
+      500, 202, 302, 400,   // entry 4: end 2, after-call 2, loop ends, done
+  };
+  REQUIRE(n == sizeof(want) / sizeof(want[0]));
+  for (u32 i = 0; i < n; ++i) {
+    REQUIRE(log[i] == want[i]);
+  }
+
+  cudaFree(d_log);
+  cudaFree(d_n);
 }
 
 SIMPLE_TEST_MAIN()
