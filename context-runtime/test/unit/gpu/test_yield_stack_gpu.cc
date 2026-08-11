@@ -116,6 +116,45 @@ __global__ void ServiceFaultsKernel(u32 *need, u32 n) {
   }
 }
 
+/**
+ * Instrumented to answer one question exactly: on resume, does execution land
+ * at the yield, or is anything before it run again?
+ *
+ * Each counter marks a distinct program point. Straight-line code that already
+ * ran must show 1; the loop body must show exactly one execution per
+ * iteration; anything deliberately re-evaluated must show one per entry.
+ */
+__device__ void ProbeInner(u32 iters, u32 *c) {
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(u32, k, 0);
+  CLIO_YBEGIN();
+  if (threadIdx.x == 0) atomicAdd(&c[0], 1u);  // callee prologue
+  for (; k < iters; ++k) {
+    if (threadIdx.x == 0) atomicAdd(&c[1], 1u);  // loop body, before yield
+    CLIO_YIELD_STACK();
+    if (threadIdx.x == 0) atomicAdd(&c[2], 1u);  // loop body, after yield
+  }
+  CLIO_YEND();
+}
+
+/** Sits in a CLIO_YCALL argument, to see whether arguments are re-evaluated. */
+__device__ u32 ProbeArg(u32 *c, u32 v) {
+  if (threadIdx.x == 0) atomicAdd(&c[3], 1u);
+  return v;
+}
+
+__global__ void ProbeKernel(gy::YieldableView<> v, gy::YieldStackView stack,
+                            u32 iters, u32 *c) {
+  CLIO_YKERNEL_ENTER(v, stack);
+  if (threadIdx.x == 0) atomicAdd(&c[4], 1u);  // BEFORE the switch: every entry
+  CLIO_YFRAME();
+  CLIO_YBEGIN();
+  if (threadIdx.x == 0) atomicAdd(&c[5], 1u);  // inside switch, before the call
+  CLIO_YCALL(ProbeInner(ProbeArg(c, iters), c));
+  if (threadIdx.x == 0) atomicAdd(&c[6], 1u);  // after the call returns
+  CLIO_YEND();
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 TEST_CASE("YieldStack - per-lane locals survive a nested yield",
@@ -276,6 +315,51 @@ TEST_CASE("YieldStack - YIELD_IF suspends the block if ANY lane must wait",
   cudaFree(d_need);
   cudaFree(d_out);
   cudaFree(d_entries);
+}
+
+TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
+          "[gpu][yieldable][stack]") {
+  constexpr u32 kIters = 3;
+  gy::Yieldable<> y(1, 32);
+  gy::YieldStack stack(1, 32, kLaneBytes);
+
+  u32 *d_c = nullptr;
+  REQUIRE(cudaMalloc(&d_c, 8 * sizeof(u32)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_c, 0, 8 * sizeof(u32)) == cudaSuccess);
+
+  y.RunToCompletion(
+      [&](dim3 grid, dim3 block, gy::YieldableView<> view) {
+        ProbeKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(view, stack.View(),
+                                                            kIters, d_c);
+      },
+      [&]() {}, /*max_rounds=*/32);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  u32 c[8] = {0};
+  REQUIRE(cudaMemcpy(c, d_c, 8 * sizeof(u32), cudaMemcpyDeviceToHost) ==
+          cudaSuccess);
+  std::fprintf(stderr,
+               "[resume] callee_prologue=%u loop_before=%u loop_after=%u "
+               "ycall_arg=%u kernel_prologue=%u switch_head=%u after_call=%u\n",
+               c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+
+  // 3 yields, so 4 entries into the kernel.
+  const u32 kEntries = kIters + 1;
+
+  // NOT re-run: straight-line code the switch jumps over.
+  REQUIRE(c[5] == 1);  // between YBEGIN and the call
+  REQUIRE(c[0] == 1);  // the callee's own prologue
+  REQUIRE(c[6] == 1);  // after the call, reached once at the end
+
+  // Run exactly once per iteration -- the loop continues, it does not restart.
+  REQUIRE(c[1] == kIters);
+  REQUIRE(c[2] == kIters);
+
+  // DELIBERATELY re-run once per entry.
+  REQUIRE(c[4] == kEntries);  // everything before CLIO_YBEGIN
+  REQUIRE(c[3] == kEntries);  // CLIO_YCALL argument expressions
+
+  cudaFree(d_c);
 }
 
 SIMPLE_TEST_MAIN()
