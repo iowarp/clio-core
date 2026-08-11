@@ -302,6 +302,10 @@ int main(int argc, char **argv) {
   unsigned blocks = 16;
   clio::run::u64 hbm_mb = 64;
   bool hbm_only = false;   // omit the host spill tier entirely
+  // Threads per block. 32 = ONE warp, which means one warp is all there is to
+  // decode with; the in-kernel nvcomp decoder is warp-cooperative, so a wider
+  // block is what lets several pages decode at once.
+  clio::run::u32 nthreads = 32;
   clio::run::u64 pages_per_block = 16;
   clio::run::u32 slots = 4;
   bool compressed = false;
@@ -317,6 +321,7 @@ int main(int argc, char **argv) {
     if (a == "--blocks") blocks = static_cast<unsigned>(next());
     else if (a == "--hbm-mb") hbm_mb = static_cast<clio::run::u64>(next());
     else if (a == "--hbm-only") hbm_only = true;
+    else if (a == "--threads") nthreads = static_cast<clio::run::u32>(next());
     else if (a == "--pages") pages_per_block = static_cast<clio::run::u64>(next());
     else if (a == "--slots") slots = static_cast<clio::run::u32>(next());
     else if (a == "--compressed") compressed = true;
@@ -327,7 +332,7 @@ int main(int argc, char **argv) {
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
-                   "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--pages P] "
+                   "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--threads T] [--pages P] "
                    "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n"
                    "       [--yieldable]  block-collective faults, parallel page reads\n",
                    argv[0]);
@@ -413,8 +418,8 @@ int main(int argc, char **argv) {
 
   clio::run::u32 seed_checks = 0;
   if (yieldable) {
-    gy::Yieldable<> sdrv(blocks, 32);
-    gy::YieldStack sstack(blocks, 32, 256);
+    gy::Yieldable<> sdrv(blocks, nthreads);
+    gy::YieldStack sstack(blocks, nthreads, 256);
     const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           SeedKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -541,8 +546,8 @@ int main(int argc, char **argv) {
     cudaMemset(d_page_visits, 0, total_pages * sizeof(unsigned));
     const clio::run::u64 t0 = NowMs();
     if (yieldable) {
-      gy::Yieldable<> drv(blocks, 32);
-      gy::YieldStack ystack(blocks, 32, 256);
+      gy::Yieldable<> drv(blocks, nthreads);
+      gy::YieldStack ystack(blocks, nthreads, 256);
       rounds = drv.RunToCompletion(
           [&](dim3 g, dim3 b, gy::YieldableView<> view) {
             WeightsKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -627,12 +632,12 @@ int main(int argc, char **argv) {
   }
 
   std::fprintf(stderr,
-               "GVW mode=%s%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
+               "GVW mode=%s%s blocks=%u thr=%u hbm=%lluMB slots=%u pages=%llu "
                "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
                "checksum=%s put_errors=%llu faults=%llu get_errors=%llu "
                "evicts=%llu rounds=%u\n",
                compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
-               yieldable ? "+yield" : "", blocks,
+               yieldable ? "+yield" : "", blocks, nthreads,
                (unsigned long long) hbm_mb, slots,
                (unsigned long long) (n / kPageElems), flat_pct,
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
