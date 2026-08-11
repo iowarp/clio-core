@@ -11,6 +11,15 @@ add_dependencies(test_compress_model_exec clio_ctp_compress_model)
 target_link_libraries(test_compress_model_exec
         clio_ctp_host clio_ctp_compress_model Catch2::Catch2)
 
+# This TU is pure C++ and does not use CUDA itself, but clio_ctp.h
+# unconditionally includes <cuda_runtime_api.h> whenever the project-wide
+# CTP_ENABLE_CUDA is on (macros.h) -- without this, the include fails as
+# soon as any build enables CUDA anywhere, even though this target never
+# calls into it.
+if(CLIO_CTP_ENABLE_CUDA AND TARGET ctp::cuda_cxx)
+    target_link_libraries(test_compress_model_exec ctp::cuda_cxx)
+endif()
+
 # Real, shipped NeuroPress .nnwt weights (see src/compress/model/weights/) --
 # used by the "loads real weights" test so it exercises the actual pretrained
 # model rather than a synthetic stand-in.
