@@ -230,9 +230,17 @@ class Vector {
    *        Only then may encoded (compressed) pages be chunk-mapped; without
    *        it a codec tag keeps the fetch path for every page.
    */
-  void BuildDeviceTierMap(bool decode_in_kernel = false) {
+  /** BuildDeviceTierMap outcome: what to do about an absent map. */
+  enum class MapResult {
+    kBuilt = 0,      ///< tables published (identity, chunk, or both)
+    kNoDeviceTier,   ///< permanent: blobs live on a host tier
+    kBlobsNotFound,  ///< transient: ingest/compressor puts not landed yet
+    kDisabled,       ///< permanent: codec unsupported or decoder not built
+  };
+
+  MapResult BuildDeviceTierMap(bool decode_in_kernel = false) {
 #if CTP_ENABLE_CUDA
-    if (devs_.empty()) return;
+    if (devs_.empty()) return MapResult::kDisabled;
     // GENERALITY GATE: a direct pointer is only valid when the STORED bytes
     // are the representation the kernels read. Identity-stored tags (raw
     // F16/Q4_K, and FP8 whose kernels decode e4m3 in-register) map by
@@ -248,12 +256,12 @@ class Vector {
     constexpr int kNvcompLz4Wire = 11;
     const bool encoded = compress_lib_ != 0;
     if (encoded && (!decode_in_kernel || compress_lib_ != kNvcompLz4Wire)) {
-      return;
+      return MapResult::kDisabled;
     }
     const auto &h0 = devs_.begin()->second.hdr;
     const clio::run::u64 npages =
         (h0.size_ + h0.page_bytes_ - 1) / h0.page_bytes_;
-    if (npages == 0) return;
+    if (npages == 0) return MapResult::kDisabled;
     constexpr clio::run::u64 kChunkRaw = 64ull * 1024ull;  // HLIF chunk
     const clio::run::u64 cpp = (h0.page_bytes_ + kChunkRaw - 1) / kChunkRaw;
     const bool map_dbg0 = std::getenv("CLIO_MAP_DEBUG") != nullptr;
@@ -263,7 +271,9 @@ class Vector {
       if (map_dbg0) {
         std::fprintf(stderr, "gpu_vector: map OFF — locate(p0) rc=%d\n", rc0);
       }
-      return;
+      // The blob is simply not there (yet): with a compressor composed, the
+      // ingest's puts complete asynchronously, so the caller should retry.
+      return MapResult::kBlobsNotFound;
     }
     char *base = clio_direct_dev_base(pool);
     if (base == nullptr) {
@@ -272,7 +282,7 @@ class Vector {
                      "gpu_vector: map OFF — pool %llx has no device base\n",
                      pool);
       }
-      return;   // not a device tier
+      return MapResult::kNoDeviceTier;
     }
     std::vector<unsigned long long> offs(npages, ~0ull);
     std::vector<unsigned long long> csz(npages, 0);
@@ -343,7 +353,7 @@ class Vector {
             cudaSuccess ||
         cudaMalloc(&dev_csz, npages * sizeof(unsigned long long)) !=
             cudaSuccess) {
-      return;
+      return MapResult::kDisabled;
     }
     cudaMemcpy(dev_offs, offs.data(), npages * sizeof(unsigned long long),
                cudaMemcpyHostToDevice);
@@ -357,7 +367,7 @@ class Vector {
               cudaSuccess ||
           cudaMalloc(&dev_chcsz, chunk_csz.size() * sizeof(unsigned int)) !=
               cudaSuccess) {
-        return;
+        return MapResult::kDisabled;
       }
       cudaMemcpy(dev_choff, chunk_off.data(),
                  chunk_off.size() * sizeof(unsigned long long),
@@ -391,6 +401,9 @@ class Vector {
                  (unsigned long long) mapped, (unsigned long long) npages,
                  (unsigned long long) chunk_mapped,
                  (unsigned long long) npages);
+    return MapResult::kBuilt;
+#else
+    return MapResult::kDisabled;
 #endif
   }
 
