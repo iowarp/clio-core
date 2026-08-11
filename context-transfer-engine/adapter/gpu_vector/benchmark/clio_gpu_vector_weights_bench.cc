@@ -44,6 +44,7 @@
 #include <vector>
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 
 namespace {
 
@@ -87,6 +88,56 @@ clio::run::u64 NowMs() {
 }
 
 }  // namespace
+
+/**
+ * Seeding is the phase that actually wedges, so it yields too.
+ *
+ * Every page it writes is dirty, so making room for the next one flushes the
+ * previous one -- and on the kHbm tier that writeback is a device copy that
+ * cannot schedule while this kernel sits on the SM waiting for it. Suspending
+ * lets the copy run.
+ */
+__global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<clio::run::u32> v,
+                                clio::run::u64 per,
+                                clio::run::u64 page_elems,
+                                gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; off < per; off += page_elems) {
+    CLIO_YCALL(v.HoldPageYield(
+        base + off, (off + page_elems <= per) ? page_elems : (per - off),
+        &run));
+    {
+      const clio::run::u64 n =
+          (off + page_elems <= per) ? page_elems : (per - off);
+      // The page is resident for the whole block, so every lane may write.
+      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
+        v[base + off + i] = Weight(base + off + i);
+      }
+    }
+  }
+  // Final writeback, also without blocking in-kernel.
+  //
+  // The barrier is load-bearing: SubmitPut clears `dirty` as it submits, so a
+  // lane still writing the last page when thread 0 flushes loses its writes
+  // AND leaves the page looking clean. That cost ~1% of the checksum.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
+}
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
@@ -144,8 +195,6 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
   atomicAdd(sum, acc);
 }
 
-namespace gy = clio::run::gpu;
-
 /**
  * The same weighted sum, but the block SUSPENDS on a miss instead of one lane
  * blocking on it.
@@ -185,20 +234,19 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
   const clio::run::u64 base =
       static_cast<clio::run::u64>(yv.Block()) * per;
 
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+
   CLIO_YBEGIN();
   for (; off < per; off += page_elems) {
-    // One lane issues the fetch; issuing it from every lane would submit the
-    // same page many times.
-    if (threadIdx.x == 0 && !v.IsResident((base + off) / page_elems)) {
-      v.BeginFetch((base + off) / page_elems);
-    }
-    CLIO_YIELD_IF(!v.IsResident((base + off) / page_elems));
+    // The VECTOR owns the fault now: this suspends the block on a miss and
+    // comes back with the page resident. YCALL is what carries that suspend
+    // out through this kernel.
+    CLIO_YCALL(v.HoldPageYield(
+        base + off, (off + page_elems <= per) ? page_elems : (per - off),
+        &run));
     {
-      // Past the yield the page is resident for the whole block, so HoldPage
-      // takes its lock-free fast path and every lane can read.
       const clio::run::u64 n =
           (off + page_elems <= per) ? page_elems : (per - off);
-      (void) v.HoldPage(base + off, n);
       unsigned long long r = 0;                   // register, not the frame
       for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
         r += static_cast<unsigned long long>(v.at(base + off + i)) *
@@ -306,7 +354,20 @@ int main(int argc, char **argv) {
                                  kCompressorPool,
                                  compressed ? kLz4WireId : 0);
 
-  SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
+  if (yieldable) {
+    gy::Yieldable<> sdrv(blocks, 32);
+    gy::YieldStack sstack(blocks, 32, 256);
+    const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          SeedKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu_info, vec.GetDevice(0), per, kPageElems, view,
+              sstack.View());
+        },
+        []{}, /*max_rounds=*/200000);
+    std::fprintf(stderr, "[seed] yieldable, rounds=%u\n", seed_rounds);
+  } else {
+    SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
+  }
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::fprintf(stderr, "bench: seed failed\n");
     return 1;
@@ -361,7 +422,12 @@ int main(int argc, char **argv) {
     const clio::run::u64 ms = NowMs() - t0;
     unsigned long long got = 0;
     cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost);
-    if (got != want) ok = false;
+    if (got != want) {
+      ok = false;
+      std::fprintf(stderr, "[cmp] got=%llu want=%llu ratio=%.4f\n",
+                   (unsigned long long) got, (unsigned long long) want,
+                   want ? (double) got / (double) want : 0.0);
+    }
     const double gbps =
         (ms == 0) ? 0.0
                   : (static_cast<double>(logical) / (1024.0 * 1024.0 * 1024.0)) /

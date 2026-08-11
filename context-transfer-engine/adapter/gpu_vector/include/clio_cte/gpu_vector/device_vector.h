@@ -16,6 +16,8 @@
 #define CLIO_CTE_GPU_VECTOR_DEVICE_VECTOR_H_
 
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/types.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/gpu_vector/page.h>
@@ -1154,6 +1156,159 @@ class DeviceVector {
    * @return false if no slot could be freed (every resident page is pinned by
    *         an in-flight transfer), in which case nothing was started.
    */
+  /**
+   * Hold a page, SUSPENDING the block on a miss instead of blocking in place.
+   *
+   * This is the fault path the vector is meant to use. The blocking form waits
+   * inside the kernel, and a resident kernel prevents every later launch in
+   * the context from running -- which is precisely the work that would service
+   * the fault. That is the deadlock behind the kHbm-tier hangs: the host
+   * cannot create a stream, run a codec, or in some cases schedule the copy,
+   * because the kernel waiting for it never leaves the device.
+   *
+   * Here the block votes, suspends, and the KERNEL EXITS. The host is then
+   * free to do anything at all, and the driver relaunches the block once the
+   * page has landed. Past the yield the page is resident for every lane, so
+   * the hold underneath takes its lock-free fast path and the whole block can
+   * read the page in parallel -- which the blocking form could not do,
+   * because a lane other than 0 that missed would enter a fault path where
+   * Send and Wait are no-ops for it and then read an unpopulated page.
+   *
+   * Callers must be yieldable and must invoke this through CLIO_YCALL, which
+   * is what lets the suspend travel out through them. `run_out` should be a
+   * CLIO_YLOCAL so its address is stable across the suspend.
+   */
+  CTP_GPU_FUN void HoldPageYield(clio::run::u64 off, clio::run::u64 count,
+                                 clio::run::u64 *run_out) {
+    CLIO_YFRAME();
+    // FIRST: wait for the whole block to be done with whatever it was doing.
+    //
+    // Now that a hold makes the page readable by EVERY lane, the lanes are
+    // still reading the previous page when one of them arrives here -- and
+    // this call evicts. Thread 0 running ahead would submit a writeback for,
+    // or free, a page its neighbours are mid-way through. That showed up as a
+    // flaky checksum losing ~4.5% of the sum, never as a hang.
+    __syncthreads();
+    // Before the switch, so this runs on every entry INCLUDING each resume:
+    // that is what turns "the transfer landed" into "the page is usable".
+    if (threadIdx.x == 0) {
+      ReapFetched();
+      ReapFlushed();
+    }
+    __syncthreads();
+    CLIO_YBEGIN();
+    // 1. WRITEBACK. Making room can require flushing a dirty victim, and the
+    //    blocking path waits for that put in-kernel. On the kHbm tier that
+    //    put is a device copy which cannot schedule behind the very kernel
+    //    waiting for it, which is the deadlock this whole design exists to
+    //    remove. Submit it and leave instead.
+    if (threadIdx.x == 0) {
+      StartEvictionAsync(PageOf(off));
+    }
+    CLIO_YIELD_IF(AnyTransferInFlight());
+
+    // 2. FETCH. Same shape: issue it from one lane, then leave.
+    if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
+      BeginFetch(PageOf(off));
+    }
+    CLIO_YIELD_IF(!IsResident(PageOf(off)));
+
+    // 3. Resident for the whole block now, so this is the lock-free fast path
+    //    and every lane may read the page.
+    *run_out = HoldPage(off, count);
+    CLIO_YEND();
+  }
+
+  /**
+   * True while any of this block's pages still has a put or get outstanding.
+   *
+   * Deliberately lock-free and approximate: it is a yield predicate, re-run on
+   * every resume, so a stale read costs one extra round rather than a wrong
+   * answer. Taking the block lock here would have all 32 lanes serialise
+   * through an atomicCAS on what is meant to be a cheap test.
+   */
+  CTP_GPU_FUN bool AnyTransferInFlight() const {
+    const Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      const Page *p = &tbl[i];
+      if (p->flushing && p->put->fut_.is_complete_.load() == 0) return true;
+      if (p->fetching && p->get->fut_.is_complete_.load() == 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Free a slot for `page_num` WITHOUT waiting: if the victim is dirty its
+   * put is submitted and the slot is left in flight for the caller to yield
+   * on. Clean victims are dropped immediately.
+   */
+  CTP_GPU_FUN void StartEvictionAsync(clio::run::u64 page_num) {
+    if (Find(page_num) != nullptr) return;          // already here or coming
+    LockBlock();
+    Page *tbl = BlockPages();
+    clio::run::u32 victim = h_->pages_per_block_;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      if (tbl[i].page_num == kNoPage) { UnlockBlock(); return; }  // free slot
+      if (tbl[i].fetching || tbl[i].flushing) continue;
+      if (victim == h_->pages_per_block_ ||
+          tbl[i].score < tbl[victim].score ||
+          (tbl[i].score == tbl[victim].score &&
+           tbl[i].last_access < tbl[victim].last_access)) {
+        victim = i;
+      }
+    }
+    if (victim != h_->pages_per_block_) {
+      Page *p = &tbl[victim];
+      if (p->dirty || p->flushing) {
+        SubmitPut(p);          // async; the caller yields on AnyTransferInFlight
+      } else {
+        p->page_num = kNoPage;
+        Bump(h_->stat_evicts_);
+      }
+    }
+    UnlockBlock();
+  }
+
+  /**
+   * Clear `fetching` on gets that have landed.
+   *
+   * Nothing else does: AwaitFetch is what retires a fetch, and the blocking
+   * path called it from inside the wait. Without this the page arrives but
+   * stays flagged in flight, IsResident keeps reporting false, and the block
+   * suspends forever -- which is exactly how the first yieldable run burned
+   * 200000 rounds and then produced a wrong checksum.
+   */
+  CTP_GPU_FUN void ReapFetched() {
+    LockBlock();
+    Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      Page *p = &tbl[i];
+      if (p->fetching && p->get->fut_.is_complete_.load() != 0) {
+        AwaitFetch(p);          // complete already, so this cannot block
+      }
+    }
+    UnlockBlock();
+  }
+
+  /**
+   * Retire slots whose writeback has landed. Called after the yield, when the
+   * puts are known complete, so AwaitPut cannot block.
+   */
+  CTP_GPU_FUN void ReapFlushed() {
+    LockBlock();
+    Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      Page *p = &tbl[i];
+      if (p->flushing && p->put->fut_.is_complete_.load() != 0) {
+        AwaitPut(p);
+        p->page_num = kNoPage;
+        p->dirty = 0u;
+        Bump(h_->stat_evicts_);
+      }
+    }
+    UnlockBlock();
+  }
+
   /**
    * Is `page_num` resident AND finished arriving? Never blocks, never faults.
    *
