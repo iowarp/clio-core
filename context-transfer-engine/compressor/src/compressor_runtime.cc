@@ -3440,6 +3440,85 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       reqs[i] = r;
       ++batched;
     }
+    // SPILLED records, batched the same way. These live on a HOST tier, so
+    // their stored bytes must be fetched first -- ALL of them concurrently,
+    // into one scratch slab with a page-sized slot per record. locate() gives
+    // the stored size in-process, so there is no GetBlobSize task at all.
+    // They then join the SAME decode group as the tier-resident records.
+    //
+    // Before this they fell to the per-record path below: up to 64 records
+    // awaited ONE AT A TIME, each paying two CTE round trips plus its own
+    // unbatched decode. That serialization is why the both-spill regime lost
+    // to raw by 2x despite moving 8x fewer bytes over PCIe.
+    char *sp_slab = nullptr;
+    std::vector<clio::run::u32> sp_idx;
+    std::vector<clio::run::u64> sp_sz;
+    if (IsGpuCodec(task->context_.compress_lib_)) {
+      clio::run::u64 slot_b = 0;
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        if (reqs[i]) continue;
+        auto &req = task->reqs_[i];
+        auto dst =
+            ipc_manager->ToFullPtr<char>(req.data_.template Cast<char>());
+        if (dst.ptr_ == nullptr || !ctp::IsDeviceAccessible(dst.ptr_)) {
+          continue;
+        }
+        unsigned long long lpool = 0, loff = 0, lsz = 0;
+        if (clio_cte_locate(&task->tag_id_, req.blob_name_.c_str(), &lpool,
+                            &loff, &lsz) != 0 ||
+            lsz <= sizeof(CompressionHeader) || lsz > req.size_) {
+          continue;
+        }
+        if (clio_direct_dev_base(lpool) != nullptr) continue;  // tier path
+        if (req.size_ > slot_b) slot_b = req.size_;
+        sp_idx.push_back(i);
+        sp_sz.push_back(lsz);
+      }
+      if (!sp_idx.empty()) {
+        for (int a = 0; a < 10000 && sp_slab == nullptr; ++a) {
+          sp_slab = AcquireGpuScratch(sp_idx.size() * slot_b);
+          if (sp_slab == nullptr) CLIO_CO_AWAIT(clio::run::yield(50.0));
+        }
+        if (sp_slab != nullptr) {
+          if (!core_client_) {
+            core_client_ =
+                std::make_unique<clio::cte::core::Client>(CorePoolId());
+          }
+          using GetFutT = decltype(core_client_->AsyncGetBlob(
+              task->tag_id_, std::string(), (clio::run::u64) 0,
+              (clio::run::u64) 0, (clio::run::u32) 0,
+              ctp::ipc::ShmPtr<void>(), clio::run::PoolQuery::Local()));
+          std::vector<GetFutT> futs;
+          futs.reserve(sp_idx.size());
+          // Fire EVERY get, then await them: total latency is the max of the
+          // set, not the sum.
+          for (size_t k = 0; k < sp_idx.size(); ++k) {
+            auto &req = task->reqs_[sp_idx[k]];
+            futs.push_back(core_client_->AsyncGetBlob(
+                task->tag_id_, std::string(req.blob_name_.c_str()), 0,
+                sp_sz[k], 0, ScratchShmPtr(sp_slab + k * slot_b),
+                clio::run::PoolQuery::Local()));
+          }
+          for (auto &f : futs) {
+            CLIO_CO_AWAIT(f);
+          }
+          for (size_t k = 0; k < sp_idx.size(); ++k) {
+            if (futs[k]->GetReturnCode() != 0) continue;
+            const clio::run::u32 i = sp_idx[k];
+            auto dst = ipc_manager->ToFullPtr<char>(
+                task->reqs_[i].data_.template Cast<char>());
+            auto r = std::make_shared<PendingDecomp>();
+            r->src_device = sp_slab + k * slot_b;   // scratch: never cached
+            r->stored_size = static_cast<size_t>(sp_sz[k]);
+            r->dst = dst.ptr_;
+            r->dst_bytes = static_cast<size_t>(task->reqs_[i].size_);
+            reqs[i] = r;
+            ++batched;
+          }
+        }
+      }
+    }
+
     if (batched != 0) {
       {
         std::lock_guard<std::mutex> g(batch_mu_);
@@ -3471,6 +3550,11 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
           reqs[i] = nullptr;   // retry through the per-record path
           if (first_rc == 0) first_rc = 1;
         }
+      }
+      if (sp_slab != nullptr) {
+        // Every group member is settled (done observed), so the batch's
+        // event has fired and the GPU is finished reading the slab.
+        ReleaseGpuScratch(sp_slab);
       }
     }
 #endif
