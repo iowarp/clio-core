@@ -35,7 +35,11 @@
  * ill-formed is structurally impossible here.
  *
  * What is still manual is the DECLARATION SITE: locals live across a yield
- * only if declared with CLIO_YLOCAL at the top. Deciding that automatically
+ * only if declared with CLIO_YLOCAL at the top. Nothing diagnoses a miss --
+ * nvcc's device pass accepts a plain initialized local held across a yield
+ * without a word, so it survives compilation and then reads back garbage after
+ * a resume. Host g++ rejects the same shape, so a clang-CUDA lint build is the
+ * cheapest place to catch it until the AST pass exists. Deciding that automatically
  * means a liveness analysis over the CFG and hoisting the declarations, i.e. a
  * Clang pass over the AST. That pass would emit exactly these macros, so it is
  * additive rather than a redesign.

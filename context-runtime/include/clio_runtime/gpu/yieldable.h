@@ -39,11 +39,17 @@
  *       CLIO_YIELD(y);
  *     }
  *
- * Getting this wrong is a COMPILE error ("jump to case label crosses
- * initialization"), not silent corruption, which is the main reason to prefer
- * this shape over anything cleverer. Automatic capture of the whole live stack
- * needs a source-to-source pass over the AST (what FLEP, ASPLOS'17, built);
- * such a pass could target this same runtime later.
+ * DO NOT COUNT ON THE COMPILER TO CATCH THIS. Host g++ does reject the shape
+ * ("jump to case label crosses initialization"), but nvcc's DEVICE pass was
+ * measured accepting an un-hoisted, initialized local across a yield with no
+ * error and no warning. The variable is then simply not re-initialized on
+ * resume and holds whatever the slot happens to contain -- silent, and exactly
+ * the failure this comment used to claim was impossible.
+ *
+ * Automatic capture of the whole live stack needs a source-to-source pass over
+ * the AST (what FLEP, ASPLOS'17, built); such a pass could target this same
+ * runtime later, and would also be the natural place to make the un-hoisted
+ * case diagnosable.
  *
  * YIELDS ARE BLOCK-COLLECTIVE
  *
