@@ -1501,14 +1501,71 @@ class DeviceVector {
 
     // 2. FETCH. Same shape: issue it from one lane, then leave.
     if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
-      // A DEMAND fetch: the access already happened, so this counts as a
-      // fault but not as a prefetch.
-      BeginFetch(PageOf(off), /*is_prefetch=*/false);
+      // An encoded page the map does not cover is fetched STORED and decoded
+      // here, rather than asking the compressor for its logical bytes: that
+      // route costs three task round trips, a codec slot and a stream sync
+      // per page (~1.6ms vs ~40us for a spilled raw page) and puts the CPU
+      // back on a GPU fault.
+      if (SpilledEncodedPage(PageOf(off))) {
+        LockBlock();
+        BeginSpilledFetchLocked(PageOf(off));
+        UnlockBlock();
+      } else {
+        // A DEMAND fetch: the access already happened, so this counts as a
+        // fault but not as a prefetch.
+        BeginFetch(PageOf(off), /*is_prefetch=*/false);
+      }
     }
     // Hand the host the address of the completion flag this block is parked
     // on, so it can poll 4 bytes instead of relaunching the whole grid to ask.
-    CLIO_YIELD_IF_RESUME_WHEN(!IsResident(PageOf(off)),
-                              FetchWaitTag(PageOf(off)));
+    // Stop yielding once the stored bytes LAND, not once the page is
+    // resident: a spilled page becomes resident only after the decode below,
+    // which needs the whole block back.
+    CLIO_YIELD_IF_RESUME_WHEN(
+        !IsResident(PageOf(off)) && !SpilledReady(PageOf(off)),
+        FetchWaitTag(PageOf(off)));
+
+    // 2b. DECODE, block-collective. The nvcomp warp decoder needs all 32
+    //     lanes, so this cannot live in ReapFetched (thread 0 only) -- which
+    //     is also why fetching=4 is a state those paths refuse to publish.
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+    if (SpilledReady(PageOf(off))) {
+      Page *sp = Find(PageOf(off));
+      const clio::run::u64 sn = h_->stored_size_[PageOf(off)];
+      bool sok = false;
+      if (threadIdx.x < 32u && sp != nullptr) {
+        const unsigned char *blob =
+            reinterpret_cast<const unsigned char *>(ScratchFor(sp));
+        if (sp->get->GetReturnCode() == 0) {
+          sok = DecodeSpilledWarp(blob, sn, sp, NvScratch(0));
+          if (!sok && sn == h_->page_bytes_) {
+            // No CTEC magic and the stored image is a whole page: the
+            // compressor kept this page RAW because it did not shrink. The
+            // scratch already holds the page's bytes.
+            for (clio::run::u64 i = (threadIdx.x & 31u); i < sn; i += 32u) {
+              static_cast<char *>(sp->data)[i] =
+                  reinterpret_cast<const char *>(blob)[i];
+            }
+            sok = true;
+          }
+        }
+        sok = (__ballot_sync(0xffffffffu, sok) != 0u);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0 && sp != nullptr) {
+        if (sok) {
+          __threadfence();
+          sp->fetching = 0u;            // publish: decoded, readable
+        } else {
+          Bump(h_->stat_get_errors_);
+          sp->page_num = kNoPage;       // never serve undecoded bytes
+          __threadfence();
+          sp->fetching = 0u;
+        }
+      }
+      __syncthreads();
+    }
+#endif
 
     // 3. Resident for the whole block now, so this is the lock-free fast path
     //    and every lane may read the page.
@@ -1629,6 +1686,7 @@ class DeviceVector {
     Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
+      if (p->fetching == 4u) continue;   // decode-pending; see AwaitFetch
       if (p->fetching && p->get->fut_.is_complete_.load() != 0) {
         // NOTE: a failed get is NOT freed here. First touch of a page that
         // does not exist yet fails by design, and the slot staying claimed is
@@ -2407,6 +2465,103 @@ class DeviceVector {
     return true;
   }
 
+  /** @return true when `pn` is an encoded page this build can fetch STORED
+   *  and decode in the faulting warp. Only meaningful once
+   *  PageNeedsHostFetch(pn) has already said the map does not cover it. */
+  CTP_GPU_FUN bool SpilledEncodedPage(clio::run::u64 pn) const {
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+    return h_->compress_lib_ != 0 && h_->cscratch_ != nullptr &&
+           h_->stored_size_ != nullptr && h_->stored_size_[pn] != 0 &&
+           h_->stored_size_[pn] <= h_->page_bytes_;
+#else
+    (void) pn;
+    return false;
+#endif
+  }
+
+  /** This slot's compressed-image scratch (one page's worth per slot). */
+  CTP_GPU_FUN char *ScratchFor(const Page *p) const {
+    const clio::run::u64 idx =
+        static_cast<clio::run::u64>(p - BlockPages()) +
+        static_cast<clio::run::u64>(BlockIndex()) * h_->pages_per_block_;
+    return h_->cscratch_ + idx * h_->page_bytes_;
+  }
+
+  /**
+   * Fetch a SPILLED encoded page's STORED bytes into scratch, without waiting.
+   *
+   * The routine fetch asks the compressor for the page's LOGICAL bytes, which
+   * costs three task round trips, a codec slot and a stream sync per page --
+   * measured ~1.6ms against ~40us for a spilled raw page. This asks for the
+   * stored image instead: an EMPTY codec context makes the read a straight
+   * pass-through to the core, so the compressor never decompresses it and the
+   * faulting warp decodes it itself.
+   *
+   * Caller must hold the block lock. Marks the page fetching=4, meaning
+   * "bytes in flight, NOT yet decoded" -- AwaitFetch and ReapFetched both
+   * refuse to publish that state.
+   */
+  CTP_GPU_FUN bool BeginSpilledFetchLocked(clio::run::u64 page_num) {
+    if (Find(page_num) != nullptr) return true;      // resident or coming
+    Page *tbl = BlockPages();
+    clio::run::u32 slot = h_->pages_per_block_;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      if (tbl[i].page_num == kNoPage) { slot = i; break; }
+    }
+    if (slot == h_->pages_per_block_) {
+      slot = ClaimSlotWindowLocked(page_num);
+      if (slot == ~0u) return false;                 // no room; try later
+    }
+    Page *p = &tbl[slot];
+    p->fetching = 4u;
+    __threadfence_block();
+    p->gen += 1u;
+    p->page_num = page_num;
+    p->dirty = 0u;
+    p->flushing = 0u;
+    p->evicting = 0u;
+    p->score = 0.0f;
+
+    auto *t = p->get;
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindGet);
+    t->pool_id_ = h_->pool_id_;
+    t->method_ = clio::cte::core::Method::kPodGetBlob;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = h_->tag_id_;
+    char nm[32];
+    PageBlobName(page_num, nm);
+    t->blob_name_ = nm;
+    t->offset_ = 0;
+    t->size_ = h_->stored_size_[page_num];
+    t->blob_data_ = RawPtr(ScratchFor(p));
+    t->flags_ = 0;
+    // EMPTY context on purpose: that is what makes this a pass-through and
+    // returns the stored bytes. PrepareGet sets the codec precisely to get
+    // the opposite behaviour.
+    t->context_ = clio::cte::core::Context();
+    ClearRunCtx(t);
+    Bump(h_->stat_faults_);
+    p->get_fut =
+        clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
+    if (p->get_fut.IsNull()) {
+      Bump(h_->stat_get_errors_);
+      p->page_num = kNoPage;
+      p->fetching = 0u;
+      return false;
+    }
+    return true;
+  }
+
+  /** @return true when `pn`'s stored bytes have landed and it is waiting to
+   *  be decoded by the block. */
+  CTP_GPU_FUN bool SpilledReady(clio::run::u64 pn) const {
+    const Page *p = Find(pn);
+    return p != nullptr && p->fetching == 4u &&
+           p->get->fut_.is_complete_.load() != 0;
+  }
+
   /**
    * Issue this page's get and return immediately.
    *
@@ -2436,6 +2591,17 @@ class DeviceVector {
       // not a per-page get, so the page's own future carries nothing. Settle
       // the whole batch (this also clears every sibling page it fetched).
       SettleBatchLocked();
+      return;
+    }
+    if (p->fetching == 4u) {
+      // Compressed bytes are in flight (or landed) in cscratch and the page
+      // has NOT been decoded yet. Publishing it here would hand the caller
+      // the COMPRESSED image as page data -- silent corruption. Do not touch
+      // it: the decode is block-collective (the nvcomp warp decoder needs all
+      // 32 lanes) and HoldPageYield drives it once the whole block is present.
+      // Spinning would deadlock instead: thread 0 reaches this from
+      // HoldPageYield's prologue while the rest of the block waits at the
+      // barrier that would release the decode.
       return;
     }
     if (p->fetching == 3u) {
