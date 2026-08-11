@@ -205,12 +205,17 @@ struct CreateParams {
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment) {
-    // Set conservative default performance characteristics
+    // Set conservative default performance characteristics, then let the
+    // device type refine them. This ctor is what RegisterTarget uses for every
+    // CTE storage target, so without the refinement a kHbm target and a kRam
+    // target report identical bandwidth to the DPE and the GPU tier is never
+    // selected.
     perf_metrics_.read_bandwidth_mbps_ = 100.0;
     perf_metrics_.write_bandwidth_mbps_ = 80.0;
     perf_metrics_.read_latency_us_ = 1000.0;
     perf_metrics_.write_latency_us_ = 1200.0;
     perf_metrics_.iops_ = 1000.0;
+    ApplyDefaultPerfForType();
 
     // Debug: Log what parameters were received
     HLOG(kDebug,
@@ -241,12 +246,13 @@ struct CreateParams {
            alignment_, perf_metrics_.read_bandwidth_mbps_,
            perf_metrics_.write_bandwidth_mbps_);
     } else {
-      // Use default performance characteristics
+      // Use default performance characteristics, refined by device type.
       perf_metrics_.read_bandwidth_mbps_ = 100.0;
       perf_metrics_.write_bandwidth_mbps_ = 80.0;
       perf_metrics_.read_latency_us_ = 1000.0;
       perf_metrics_.write_latency_us_ = 1200.0;
       perf_metrics_.iops_ = 1000.0;
+      ApplyDefaultPerfForType();
       HLOG(kDebug,
            "DEBUG: CreateParams constructor called with default performance: "
            "bdev_type={}, total_size={}, io_depth={}, alignment={}",
@@ -260,6 +266,41 @@ struct CreateParams {
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
        persistence_level_, alloc_log_path_, growth_unit_, populate_unit_);
+  }
+
+  /**
+   * Set perf_metrics_ to values representative of bdev_type_.
+   *
+   * These only need to be ORDERED correctly -- the DPE ranks targets by them,
+   * it does not model absolute throughput. Device HBM must outrank host RAM,
+   * host RAM must outrank pinned staging and disk.
+   */
+  void ApplyDefaultPerfForType() {
+    switch (bdev_type_) {
+      case BdevType::kHbm:  // on-device HBM: ~1-3 TB/s on current parts
+        perf_metrics_.read_bandwidth_mbps_ = 1500000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 1500000.0;
+        perf_metrics_.read_latency_us_ = 1.0;
+        perf_metrics_.write_latency_us_ = 1.0;
+        perf_metrics_.iops_ = 10000000.0;
+        break;
+      case BdevType::kRam:  // host DRAM
+        perf_metrics_.read_bandwidth_mbps_ = 20000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 20000.0;
+        perf_metrics_.read_latency_us_ = 5.0;
+        perf_metrics_.write_latency_us_ = 5.0;
+        perf_metrics_.iops_ = 1000000.0;
+        break;
+      case BdevType::kPinned:  // host DRAM reachable by DMA, but staged
+        perf_metrics_.read_bandwidth_mbps_ = 12000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 12000.0;
+        perf_metrics_.read_latency_us_ = 10.0;
+        perf_metrics_.write_latency_us_ = 10.0;
+        perf_metrics_.iops_ = 500000.0;
+        break;
+      default:  // kFile / kS3 / kGcs / kNoop keep the conservative estimates
+        break;
+    }
   }
 
   /**
@@ -288,6 +329,14 @@ struct CreateParams {
       } else if (type_str == "gcs") {
         bdev_type_ = BdevType::kGcs;
       }
+      // The type now implies its speed. Before this, EVERY bdev type kept the
+      // conservative file defaults (100/80 MB/s), so a kHbm tier and a kRam
+      // tier were indistinguishable to MaxBwDpe: they tied on write bandwidth
+      // and the tie fell to input order, which put RAM first. The effect was
+      // that a configured GPU tier never received a single blob -- the "GPU
+      // tier" measurements were host-tier measurements. An explicit
+      // perf_metrics block below still overrides these.
+      ApplyDefaultPerfForType();
     }
 
     // Load capacity/total_size (parse size strings like "2GB", "512MB")

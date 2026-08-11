@@ -430,6 +430,48 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Publish the device tier map. Until this runs, PageEncodedMapped() is false
+  // for every page, so encoded pages can NEVER decode in-kernel no matter how
+  // the binary was compiled -- they silently take the scalar LZ4 fallback and
+  // the run reports "nvcomp" while never calling nvcomp.
+  //
+  // The compressor's puts land asynchronously, so kBlobsNotFound is a retry,
+  // not a failure.
+#if defined(CLIO_GV_NVCOMP_DEVICE)
+  constexpr bool kDecodeInKernel = true;
+#else
+  constexpr bool kDecodeInKernel = false;
+#endif
+  {
+    gv::Vector<clio::run::u32>::MapResult mr =
+        gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      mr = vec.BuildDeviceTierMap(kDecodeInKernel);
+      if (mr != gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const char *mrs =
+        mr == gv::Vector<clio::run::u32>::MapResult::kBuilt ? "built"
+        : mr == gv::Vector<clio::run::u32>::MapResult::kNoDeviceTier
+            ? "no-device-tier"
+        : mr == gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound
+            ? "blobs-not-found"
+            : "disabled";
+    std::fprintf(stderr, "[map] BuildDeviceTierMap(%d) = %s, fully_mapped=%d\n",
+                 (int)kDecodeInKernel, mrs, (int)vec.FullyDeviceMapped());
+    // A compressed run that cannot map is measuring the scalar fallback, which
+    // is not what this benchmark claims to report. Fail rather than mislead.
+    if (compressed && gpu_codec &&
+        mr != gv::Vector<clio::run::u32>::MapResult::kBuilt) {
+      std::fprintf(stderr,
+                   "bench: --compressed requires an in-kernel nvcomp device "
+                   "map (got %s). Refusing to report a fallback result as "
+                   "nvcomp.\n",
+                   mrs);
+      return 1;
+    }
+  }
+
   unsigned long long *d_sum = nullptr;
   cudaMalloc(&d_sum, sizeof(unsigned long long));
   const clio::run::u64 total_pages = n / kPageElems;
@@ -460,7 +502,16 @@ int main(int argc, char **argv) {
                 gpu_info, vec.GetDevice(0), per, kPageElems, d_sum, d_page_sum,
                 d_page_visits, view, ystack.View());
           },
-          []{}, /*max_rounds=*/200000);
+          []{},
+          /*max_rounds=*/200000,
+          [](clio::run::u32, clio::run::u64 tag) {
+            // 4 bytes over PCIe (~5us) instead of relaunching the grid (~50us+)
+            // just to have the block discover its page has not landed.
+            unsigned flag = 0;
+            cudaMemcpy(&flag, reinterpret_cast<const void *>(tag),
+                       sizeof(flag), cudaMemcpyDeviceToHost);
+            return flag != 0;
+          });
     } else {
       WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, kPageElems,
                                     prefetch, d_sum);
