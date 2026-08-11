@@ -1,0 +1,10 @@
+=== Phase2 scaling: NGPU=8 PAGES=32768 (8192 MiB/GPU) job 20990731 on gpuc03.delta.ncsa.illinois.edu ===
+GPU 0: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=112.1635 store_mibps=73.0 read_io_s=63.4858 read_mibps=129.0
+GPU 1: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=113.4003 store_mibps=72.2 read_io_s=62.9890 read_mibps=130.1
+GPU 2: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=112.4707 store_mibps=72.8 read_io_s=67.9487 read_mibps=120.6
+GPU 3: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=112.5959 store_mibps=72.8 read_io_s=67.0054 read_mibps=122.3
+GPU 4: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=112.8198 store_mibps=72.6 read_io_s=67.5809 read_mibps=121.2
+GPU 5: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=109.6250 store_mibps=74.7 read_io_s=67.3168 read_mibps=121.7
+GPU 6: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=112.8272 store_mibps=72.6 read_io_s=67.8061 read_mibps=120.8
+GPU 7: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=111.6471 store_mibps=73.4 read_io_s=66.9690 read_mibps=122.3
+[P2SUMMARY] ngpu=8 pages_per_gpu=32768 gpus_passed=8/8 agg_store_mibps=584.1 agg_read_mibps=988

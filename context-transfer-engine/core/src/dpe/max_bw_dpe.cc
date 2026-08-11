@@ -100,8 +100,20 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
     }
   }
 
-  // Sort low_score targets by performance (already correct order for placement)
-  std::sort(low_score_targets.begin(), low_score_targets.end(), perf_comparator);
+  // Sort low_score targets by configured tier priority first (higher
+  // target_score_ = faster tier, placed first so data fills HBM->DRAM->NVMe->PFS
+  // and only overflows to the next tier once the current one is full), then by
+  // measured performance as a tiebreak. The configured score is authoritative
+  // for tier ordering; bandwidth alone is unreliable here because bdevs report
+  // identical default bandwidth unless per-tier perf_metrics are set, which
+  // would leave same-bandwidth tiers in an undefined std::sort order.
+  std::sort(low_score_targets.begin(), low_score_targets.end(),
+            [&perf_comparator](const TargetInfo& a, const TargetInfo& b) {
+              if (a.target_score_ != b.target_score_) {
+                return a.target_score_ > b.target_score_;
+              }
+              return perf_comparator(a, b);
+            });
 
   // Sort high_score targets by performance in REVERSE order
   // (when falling back to higher tiers, prefer lower-performing ones first)

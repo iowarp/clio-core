@@ -1,0 +1,5 @@
+ngpu,pages_per_gpu,gpus_passed,agg_store_mibps,agg_read_mibps
+1,32768,1,289.1,197.2
+2,32768,2,574.5,388
+4,32768,4,1021.7,875.3
+8,32768,8,584.1,988

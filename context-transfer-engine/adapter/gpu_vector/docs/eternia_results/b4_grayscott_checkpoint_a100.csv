@@ -1,0 +1,9 @@
+grid,field_mib,method,ms_per_checkpoint,bandwidth_gib_s,footprint_mib,location,speedup_vs_traditional,footprint_reduction_x
+4096x4096,64,traditional_d2h_pfs,206.37,0.30,512.0,disk,1.00,1.0
+4096x4096,64,eternia_compress_hbm,54.62,1.14,68.2,hbm,3.78,7.5
+8192x8192,256,traditional_d2h_pfs,434.51,0.58,2048.0,disk,1.00,1.0
+8192x8192,256,eternia_compress_hbm,107.35,2.33,283.9,hbm,4.05,7.2
+16384x16384,1024,traditional_d2h_pfs,1418.70,0.70,8192.0,disk,1.00,1.0
+16384x16384,1024,eternia_compress_hbm,312.95,3.20,459.6,hbm,4.53,17.8
+16384x32768,2048,traditional_d2h_pfs,2636.86,0.76,16384.0,disk,1.00,1.0
+16384x32768,2048,eternia_compress_hbm,557.47,3.59,512.0,hbm,4.73,32.0

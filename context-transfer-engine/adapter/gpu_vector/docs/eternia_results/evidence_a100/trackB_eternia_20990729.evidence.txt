@@ -1,0 +1,4 @@
+=== Phase2 scaling: NGPU=2 PAGES=32768 (8192 MiB/GPU) job 20990729 on gpua035.delta.ncsa.illinois.edu ===
+GPU 0: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=28.4800 store_mibps=287.6 read_io_s=42.2781 read_mibps=193.8
+GPU 1: exit=0 pass=1 | [DIST][THROUGHPUT] rank=0 nnodes=1 pages=32768 field_mib=8192.0 store_s=28.5538 store_mibps=286.9 read_io_s=42.1788 read_mibps=194.2
+[P2SUMMARY] ngpu=2 pages_per_gpu=32768 gpus_passed=2/2 agg_store_mibps=574.5 agg_read_mibps=388

@@ -1,0 +1,18 @@
++ echo '######### SIZE 32 GiB #########'
+######### SIZE 32 GiB #########
++ stdbuf -oL grep --line-buffered -aE '\[CAP\]|peak GPU|UVM:|STAGED:|TRADITIONAL:|split:'
+[CAP] dataset=32768MiB (67108864 pts x 128-d SIFT, tiled)  GPU=40442MiB total, 40016MiB free  iters=1  window=4 pages (8MiB)  mode=ETERNIA(compress+tier)
+[CAP] TRADITIONAL: OK, ran in 15.11s, final inertia=98616773.0  peak GPU=33198MiB (whole dataset resident + context).
+[CAP] ETERNIA: stored in 49.58s -> 9604MiB compressed (3.41x)  split: HBM=2048MiB + DRAM=7556MiB + NVMe=0MiB + PFS=0MiB
+[CAP] ETERNIA: OK, k-means ran in 136.13s, final inertia=98574184.7  peak GPU=3614MiB (whole-process: HBM cache+cuSZp+window+context; 9.1x smaller than the 32768MiB dataset).
+[CAP] UVM: OK, ran in 15.38s inertia=98616773.0 peak GPU=36386MiB (managed oversubscription)
+[CAP] STAGED: OK, ran in 53.56s inertia=98616773.0 peak GPU=3618MiB (host->device window streaming, uncompressed)
++ echo '######### SIZE 48 GiB #########'
+######### SIZE 48 GiB #########
++ stdbuf -oL grep --line-buffered -aE '\[CAP\]|peak GPU|UVM:|STAGED:|TRADITIONAL:|split:'
+[CAP] dataset=49152MiB (100663296 pts x 128-d SIFT, tiled)  GPU=40442MiB total, 40016MiB free  iters=1  window=4 pages (8MiB)  mode=ETERNIA(compress+tier)
+[CAP] TRADITIONAL: *** OOM *** cannot place 49152MiB dataset in 40014MiB of free HBM -> traditional in-core k-means CANNOT run this dataset.
+[CAP] ETERNIA: stored in 73.02s -> 14406MiB compressed (3.41x)  split: HBM=2048MiB + DRAM=8191MiB + NVMe=4166MiB + PFS=0MiB
+[CAP] ETERNIA: OK, k-means ran in 210.67s, final inertia=147863455.3  peak GPU=3614MiB (whole-process: HBM cache+cuSZp+window+context; 13.6x smaller than the 49152MiB dataset).
+[CAP] UVM: skipped at 48GiB (> 40GiB HBM: full k-means sweep thrashes managed pages, impractically slow)
+[CAP] STAGED: OK, ran in 80.30s inertia=147927338.8 peak GPU=3618MiB (host->device window streaming, uncompressed)

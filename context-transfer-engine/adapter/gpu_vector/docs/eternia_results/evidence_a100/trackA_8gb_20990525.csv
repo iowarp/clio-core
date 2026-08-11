@@ -1,0 +1,5 @@
+method,size_gib,ran,peak_gpu_mib,throughput_mibps,time_per_iter_s,inertia,iters
+eternia,8,ran,3614,227.5,36.001,24644268.2,1
+traditional_incore,8,ran,8622,2162.6,3.788,24654915.4,1
+uvm,8,ran,11806,2102.0,3.897,24654915.4,1
+staged,8,ran,3618,611.1,13.405,24654915.4,1

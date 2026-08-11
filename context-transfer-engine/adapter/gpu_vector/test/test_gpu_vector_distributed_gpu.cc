@@ -146,7 +146,10 @@ TEST_CASE("gpu_vector: Gray-Scott checkpoint compressed pages distribute across 
 
   const clio::run::u64 page_size = 256ULL * 1024;      // >=256 KiB: cuSZp-correct
   const clio::run::u64 epp = page_size / sizeof(float);
-  const clio::run::u32 K = 64;                          // pages (16 MiB logical)
+  // Pages per GPU (dataset size). Env-configurable so a weak-scaling study can
+  // grow the per-GPU checkpoint (default 64 pages = 16 MiB keeps the original
+  // correctness-test size). cols stays 2048; rows scales with K.
+  const clio::run::u32 K = (clio::run::u32)EnvInt("CLIO_DIST_PAGES", 64);
   const clio::run::u64 total = (clio::run::u64)K * epp; // field elements
   const int cols = 2048;                                // 2048x2048 = 4M = K*epp
   const int rows = (int)(total / cols);
@@ -192,6 +195,7 @@ TEST_CASE("gpu_vector: Gray-Scott checkpoint compressed pages distribute across 
   ctx.compress_preset_ = 2;       // BALANCED -> abs error bound 1e-3
 
   // ---- Checkpoint: compress each page of U IN HBM, store (fan out) ----
+  auto store_t0 = std::chrono::steady_clock::now();
   for (clio::run::u32 P = 0; P < K; ++P) {
     std::string name = std::string(tag) + "_b0_pi" + std::to_string(P);
     auto pf = comp.AsyncPutBlob(tag_id, name, (clio::run::u64)0, page_size,
@@ -200,6 +204,8 @@ TEST_CASE("gpu_vector: Gray-Scott checkpoint compressed pages distribute across 
     pf.Wait();
     REQUIRE(pf->GetReturnCode() == 0);
   }
+  double store_dt = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - store_t0).count();
   std::fprintf(stderr,
                "[DIST] checkpointed %u compressed GS pages (%lluMiB) across %d "
                "nodes\n",
@@ -210,13 +216,17 @@ TEST_CASE("gpu_vector: Gray-Scott checkpoint compressed pages distribute across 
   REQUIRE(cudaMalloc(&readbuf, page_size) == cudaSuccess);
   auto *host = static_cast<float *>(std::malloc(page_size));
   double max_err = 0.0;
+  double read_io_dt = 0.0;  // GetBlob (fetch+decompress) time only, excl. verify
   for (clio::run::u32 P = 0; P < K; ++P) {
     cudaMemset(readbuf, 0, page_size);
     std::string name = std::string(tag) + "_b0_pi" + std::to_string(P);
+    auto rd_t0 = std::chrono::steady_clock::now();
     auto gf = comp.AsyncGetBlob(tag_id, name, (clio::run::u64)0, page_size,
                                 /*flags=*/0, DevPtr(readbuf),
                                 clio::run::PoolQuery::Local());
     gf.Wait();
+    read_io_dt += std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - rd_t0).count();
     REQUIRE(gf->GetReturnCode() == 0);
     cudaMemcpy(host, readbuf, page_size, cudaMemcpyDeviceToHost);
     for (clio::run::u64 j = 0; j < epp; ++j)
@@ -227,6 +237,15 @@ TEST_CASE("gpu_vector: Gray-Scott checkpoint compressed pages distribute across 
                "[DIST] read back %u GS pages from the distributed store; "
                "max_abs_err=%.3e vs pre-checkpoint field (eb=1e-3)\n",
                K, max_err);
+  // Per-GPU throughput (this rank). An external harness sums these across GPUs
+  // for aggregate/scaling-efficiency numbers.
+  const double mib = (double)(field_bytes) / (1024.0 * 1024.0);
+  std::fprintf(stderr,
+               "[DIST][THROUGHPUT] rank=%d nnodes=%d pages=%u field_mib=%.1f "
+               "store_s=%.4f store_mibps=%.1f read_io_s=%.4f read_mibps=%.1f\n",
+               rank, nnodes, K, mib, store_dt,
+               store_dt > 0 ? mib / store_dt : 0.0, read_io_dt,
+               read_io_dt > 0 ? mib / read_io_dt : 0.0);
   REQUIRE(max_err <= 2.0e-3);
 
   std::free(host);

@@ -1,0 +1,9 @@
+method,gpus,pooled_gib,agg_throughput_mibps,efficiency,peak_gpu_mib_per_gpu,max_total_gib,notes
+eternia_distributed,1,8,289.1,1.000,~2500 (8GiB field x4 + HBM compressed cache),8,per-GPU cuSZp 8GiB/GPU; compressed 3.4x on-GPU
+eternia_distributed,2,16,574.5,0.994,~2500 (8GiB field x4 + HBM compressed cache),16,per-GPU cuSZp 8GiB/GPU; compressed 3.4x on-GPU
+eternia_distributed,4,32,1021.7,0.884,~2500 (8GiB field x4 + HBM compressed cache),32,per-GPU cuSZp 8GiB/GPU; compressed 3.4x on-GPU
+eternia_distributed,8,64,584.1,0.253,~2500 (8GiB field x4 + HBM compressed cache),64,per-GPU cuSZp 8GiB/GPU; compressed 3.4x on-GPU
+nvshmem,2,64,interconnect-bound,n/a,"32768 (uncompressed 1.0x, measured)",80,symmetric heap holds UNCOMPRESSED; ceiling = sum of physical HBM
+nvshmem,4,128,interconnect-bound,n/a,"32768 (uncompressed 1.0x, measured)",160,measured on Delta bare-metal (job 20990679)
+nccl,N,N*40,interconnect-bound,n/a,~40960 (uncompressed 1.0x),N*40,collectives; shard uncompressed across GPUs; no per-GPU expansion
+mpi_cuda_aware,N,N*40,interconnect-bound,n/a,~40960 (uncompressed 1.0x),N*40,GPU-pointer send/recv; uncompressed shards

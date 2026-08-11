@@ -1,0 +1,5 @@
+# NVSHMEM bare-metal (HPC-SDK 25.3, sm_80) Track B pooling, job 20990679
+# per-GPU shard = 32 GiB (32768 MiB); measured physical HBM = 32768 MiB/GPU (1.0x, uncompressed)
+ngpu,pooled_gib,peak_gpu_mib_per_gpu,expansion,max_total_gib
+2,64,32768,1.0,80
+4,128,32768,1.0,160
