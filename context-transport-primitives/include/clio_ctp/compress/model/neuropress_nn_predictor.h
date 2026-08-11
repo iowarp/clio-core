@@ -101,6 +101,31 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   CompressionPrediction Predict(
       const CompressionFeatures& features) override;
 
+  /**
+   * @brief Online SGD update from real (predicted vs. actual) outcomes.
+   *
+   * Ports NeuroPress's nnSGDKernel (src/nn/nn_gpu.cu) to plain scalar CPU
+   * code: per-sample forward pass, log1p-encoded clamped targets, noise
+   * gating, uncertainty weighting (Kendall et al. 2018 log-variance),
+   * per-output backward passes with PCGrad-lite gradient-conflict
+   * projection and per-output gradient clipping, trust-region step sizing,
+   * EMA-smoothed updates with anti-flip damping, and weight clamping.
+   * State (log_var_, ema_weights_/ema_biases_, sgd_call_count_) persists
+   * across calls, exactly as the original's device-resident NNWeightsGPU
+   * does across kernel launches.
+   *
+   * @param features Per-sample candidate features (up to 8 per call,
+   *   matching NeuroPress's NN_MAX_SGD_SAMPLES batch size -- extra
+   *   samples beyond the first 8 are ignored, matching upstream's own
+   *   truncation).
+   * @param labels Per-sample real outcomes, same length as features.
+   * @return true if the weight update was applied (false if not ready,
+   *   inputs are malformed, or the computed gradient/step was non-finite
+   *   and the update was safely skipped).
+   */
+  bool Train(const std::vector<CompressionFeatures>& features,
+            const std::vector<TrainingLabels>& labels) override;
+
  private:
   /**
    * @brief Build the 8-input NeuroPress vector from CompressionFeatures.
@@ -161,6 +186,28 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   std::vector<size_t> bias_offsets_;
 
   bool is_ready_ = false;
+
+  // ---- Online-learning (SGD) state -- ported from NeuroPress's
+  // nnSGDKernel (src/nn/nn_gpu.cu). Persists across Train() calls, mirroring
+  // the original's device-resident NNWeightsGPU fields. Sized/zeroed in
+  // Load() once weights_/biases_ are known. Not part of the .nnwt file
+  // format (matches upstream: log_var/EMA/call_count are runtime-only
+  // learning state, never serialized to the weight file either).
+  static constexpr int kMaxSGDSamples = 8;  // NeuroPress's NN_MAX_SGD_SAMPLES
+  std::vector<float> log_var_;       // [kOutputDim] uncertainty log-variance
+  std::vector<float> ema_weights_;   // same layout as weights_, grad EMA
+  std::vector<float> ema_biases_;    // same layout as biases_, grad EMA
+  int sgd_call_count_ = 0;
+
+  /** @brief Cached forward-pass activations for one sample (SGD backprop). */
+  struct SGDActivations {
+    std::vector<float> x;                        // [kInputDim] standardized
+    std::vector<float> z1, h1, z2, h2, z3, h3, z4, h4;  // [kHiddenDim] each
+    std::vector<float> y;                         // [kOutputDim] raw output
+  };
+
+  /** @brief Forward pass that additionally caches per-layer activations. */
+  SGDActivations ForwardWithCache(const std::vector<float>& x_norm) const;
 };
 
 }  // namespace ctp::compress::model

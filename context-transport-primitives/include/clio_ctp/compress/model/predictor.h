@@ -198,16 +198,33 @@ inline CompressionFeatures MakeCompressionFeatures(const DataFeatures &d,
 }
 
 /**
- * @brief Training labels for the multi-output model.
+ * @brief Training labels for the multi-output model: real, observed outcomes
+ * of an actual compress/decompress, paired with the CompressionFeatures that
+ * were used to pick the candidate. Feed to Train() for online learning.
+ *
+ * Convention (matches NeuroPress's own SGDSample semantics exactly, so a
+ * predictor porting its training rule doesn't need a second convention):
+ *  - compression_time_ms / decompression_time_ms: 0 (default) means "not
+ *    measured, skip this output's gradient" -- only a strictly positive
+ *    measured duration trains that head.
+ *  - psnr_db: negative means "not applicable, skip this output's gradient"
+ *    (e.g. a lossless candidate has no PSNR); 0 means "measured and
+ *    lossless" (treated as maximal quality); positive is a real measured
+ *    PSNR in dB.
  */
 struct TrainingLabels {
   float compression_ratio = 0;
   float psnr_db = 0;
   float compression_time_ms = 0;
+  float decompression_time_ms = 0;
 
   TrainingLabels() = default;
-  TrainingLabels(float ratio, float psnr, float time)
-      : compression_ratio(ratio), psnr_db(psnr), compression_time_ms(time) {}
+  TrainingLabels(float ratio, float psnr, float time,
+                 float decompress_time = 0)
+      : compression_ratio(ratio),
+        psnr_db(psnr),
+        compression_time_ms(time),
+        decompression_time_ms(decompress_time) {}
 };
 
 /** @brief Which concrete model backs a predictor. */

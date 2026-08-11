@@ -348,7 +348,108 @@ TEST_CASE("NeuroPressNNPredictor's algo_id encoding does not collide "
   REQUIRE(zstd.compression_ratio != cascaded.compression_ratio);
   REQUIRE(gdeflate.compression_ratio != bitcomp.compression_ratio);
 }
+
+TEST_CASE("NeuroPressNNPredictor::Train() moves predictions toward "
+          "real observed outcomes (issue #693 Cycle 4)") {
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  DataFeatures data;
+  data.chunk_size_bytes = 1024 * 1024;
+  data.shannon_entropy = 3.0;
+  data.mad = 0.2;
+  data.second_derivative_mean = 0.15;
+  data.data_type_float = 1.0;
+
+  CandidateConfig candidate;
+  candidate.base_id = 15;  // nvcomp-zstd
+  candidate.preset_id = 2;
+  auto features = MakeCompressionFeatures(data, candidate);
+
+  double before = nn.Predict(features).compression_ratio;
+
+  // A real, consistent, observed outcome for this exact candidate --
+  // repeated Train() calls (mirrors how compressor_runtime.cc will feed
+  // one real (predicted, actual) pair per real compression) should pull
+  // the prediction toward it, not leave it unchanged or move it away.
+  const float kTrueRatio = 20.0f;
+  TrainingLabels label(kTrueRatio, /*psnr=*/0.0f, /*comp_time_ms=*/5.0f,
+                       /*decomp_time_ms=*/2.0f);
+  std::vector<CompressionFeatures> batch_feats(1, features);
+  std::vector<TrainingLabels> batch_labels(1, label);
+
+  bool any_update_applied = false;
+  for (int i = 0; i < 200; ++i) {
+    if (nn.Train(batch_feats, batch_labels)) any_update_applied = true;
+  }
+  REQUIRE(any_update_applied);
+
+  double after = nn.Predict(features).compression_ratio;
+  REQUIRE(std::isfinite(after));
+  INFO("before=" << before << " after=" << after << " true=" << kTrueRatio);
+  REQUIRE(std::fabs(after - kTrueRatio) < std::fabs(before - kTrueRatio));
+}
+
+TEST_CASE("NeuroPressNNPredictor::Train() stays numerically stable under "
+          "repeated adversarial/out-of-distribution labels") {
+  // Regression coverage for the clipping/clamping/trust-region machinery
+  // (gradient clipping, weight clamp, NaN/Inf sanitization) -- without it,
+  // extreme labels cause weight explosion or NaN propagation within a few
+  // SGD steps.
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  DataFeatures data;
+  data.chunk_size_bytes = 512;
+  data.shannon_entropy = 7.9;
+  data.mad = 0.95;
+  data.second_derivative_mean = 0.9;
+  data.data_type_float = 0.0;
+
+  std::vector<CompressionFeatures> batch_feats;
+  std::vector<TrainingLabels> batch_labels;
+  for (int base_id : {13, 15, 18, 23}) {
+    CandidateConfig c;
+    c.base_id = base_id;
+    c.preset_id = 3;
+    batch_feats.push_back(MakeCompressionFeatures(data, c));
+    // Deliberately extreme/conflicting: huge ratio, tiny comp_time, huge
+    // decomp_time, near-zero PSNR -- pushes every output head hard, and
+    // some pairs are directionally conflicting for the shared layers.
+    batch_labels.emplace_back(9999.0f, 0.01f, 0.02f, 4999.0f);
+  }
+
+  for (int i = 0; i < 500; ++i) {
+    nn.Train(batch_feats, batch_labels);
+  }
+
+  for (const auto &f : batch_feats) {
+    auto pred = nn.Predict(f);
+    REQUIRE(std::isfinite(pred.compression_ratio));
+    REQUIRE(std::isfinite(pred.compression_time_ms));
+    REQUIRE(std::isfinite(pred.psnr_db));
+  }
+}
+
+TEST_CASE("NeuroPressNNPredictor::Train() input validation") {
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+
+  std::vector<CompressionFeatures> feats(2);
+  std::vector<TrainingLabels> labels(3);  // mismatched size
+  REQUIRE_FALSE(nn.Train(feats, labels));
+  REQUIRE_FALSE(nn.Train({}, {}));
+}
 #endif  // CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+
+TEST_CASE("NeuroPressNNPredictor::Train() is safe on a not-ready model") {
+  NeuroPressNNPredictor nn;  // never loaded
+  std::vector<CompressionFeatures> feats(1);
+  std::vector<TrainingLabels> labels(1);
+  REQUIRE_FALSE(nn.Train(feats, labels));
+}
 
 TEST_CASE("Rank() is safe on a not-ready model") {
   NeuroPressNNPredictor nn;  // never loaded

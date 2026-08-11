@@ -10,6 +10,7 @@
 
 #include "clio_ctp/compress/model/neuropress_nn_predictor.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -121,6 +122,14 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
   if (!file) {
     return false;
   }
+
+  // Online-learning state: fresh on every Load(), matching upstream's
+  // per-process device-resident state (a reload starts learning over).
+  // log_var_ = 0 -> initial precision weight exp(-0.5*0) = 1.0 (neutral).
+  log_var_.assign(output_dim, 0.0f);
+  ema_weights_.assign(weights_.size(), 0.0f);
+  ema_biases_.assign(biases_.size(), 0.0f);
+  sgd_call_count_ = 0;
 
   is_ready_ = true;
   return true;
@@ -288,6 +297,53 @@ std::vector<float> NeuroPressNNPredictor::ForwardPass(
   return x;
 }
 
+NeuroPressNNPredictor::SGDActivations NeuroPressNNPredictor::ForwardWithCache(
+    const std::vector<float>& x_norm) const {
+  SGDActivations a;
+  a.x = x_norm;
+
+  size_t w0 = weight_offsets_[0], b0 = bias_offsets_[0];
+  a.z1.resize(kHiddenDim);
+  a.h1.resize(kHiddenDim);
+  for (uint32_t i = 0; i < kHiddenDim; ++i) {
+    float sum = biases_[b0 + i];
+    for (uint32_t j = 0; j < kInputDim; ++j) {
+      sum += weights_[w0 + i * kInputDim + j] * a.x[j];
+    }
+    a.z1[i] = sum;
+    a.h1[i] = std::max(0.0f, sum);
+  }
+
+  auto hidden_layer = [&](const std::vector<float>& h_in, int layer_idx,
+                          std::vector<float>& z_out, std::vector<float>& h_out) {
+    size_t w = weight_offsets_[layer_idx], b = bias_offsets_[layer_idx];
+    z_out.resize(kHiddenDim);
+    h_out.resize(kHiddenDim);
+    for (uint32_t i = 0; i < kHiddenDim; ++i) {
+      float sum = biases_[b + i];
+      for (uint32_t j = 0; j < kHiddenDim; ++j) {
+        sum += weights_[w + i * kHiddenDim + j] * h_in[j];
+      }
+      z_out[i] = sum;
+      h_out[i] = std::max(0.0f, sum);
+    }
+  };
+  hidden_layer(a.h1, 1, a.z2, a.h2);
+  hidden_layer(a.h2, 2, a.z3, a.h3);
+  hidden_layer(a.h3, 3, a.z4, a.h4);
+
+  size_t w4 = weight_offsets_[4], b4 = bias_offsets_[4];
+  a.y.resize(kOutputDim);
+  for (uint32_t i = 0; i < kOutputDim; ++i) {
+    float sum = biases_[b4 + i];
+    for (uint32_t j = 0; j < kHiddenDim; ++j) {
+      sum += weights_[w4 + i * kHiddenDim + j] * a.h4[j];
+    }
+    a.y[i] = sum;
+  }
+  return a;
+}
+
 std::vector<float> NeuroPressNNPredictor::InverseTransform(
     const std::vector<float>& y_norm) const {
   std::vector<float> result(y_norm.size());
@@ -348,6 +404,340 @@ CompressionPrediction NeuroPressNNPredictor::Predict(
   ratio = std::max(0.001, std::min(100.0, ratio));
 
   return CompressionPrediction(ratio, psnr, comp_time, infer_ms);
+}
+
+bool NeuroPressNNPredictor::Train(
+    const std::vector<CompressionFeatures>& features,
+    const std::vector<TrainingLabels>& labels) {
+  if (!is_ready_ || features.empty() || features.size() != labels.size()) {
+    return false;
+  }
+  const size_t num_samples =
+      std::min(features.size(), static_cast<size_t>(kMaxSGDSamples));
+
+  // ---- Per-sample forward pass + target/error computation (nn_gpu.cu's
+  // per-sample loop, lines ~690-853) ----
+  std::vector<SGDActivations> acts(num_samples);
+  std::vector<std::array<float, kOutputDim>> d5_clamped(num_samples);
+  std::vector<std::array<float, kOutputDim>> d5_raw(num_samples);
+
+  for (size_t si = 0; si < num_samples; ++si) {
+    auto x = FeaturesTo8Input(features[si]);
+    auto x_norm = Standardize(x);
+    acts[si] = ForwardWithCache(x_norm);
+    const auto& y = acts[si].y;
+    const TrainingLabels& lbl = labels[si];
+
+    std::array<float, kOutputDim> d5{};
+
+    // Output 2: compression ratio (log1p target, always trained).
+    {
+      float clamped = std::max(0.5f, std::min(lbl.compression_ratio, 10000.0f));
+      float y_std2 = std::max(y_stds_[2], 1e-8f);
+      d5[2] = y[2] - (std::log1p(clamped) - y_means_[2]) / y_std2;
+    }
+    // Output 0: compression time (0 = not measured, skip).
+    if (lbl.compression_time_ms > 0.0f) {
+      float clamped = std::max(0.01f, std::min(lbl.compression_time_ms, 5000.0f));
+      float y_std0 = std::max(y_stds_[0], 1e-8f);
+      d5[0] = y[0] - (std::log1p(clamped) - y_means_[0]) / y_std0;
+    } else {
+      d5[0] = 0.0f;
+    }
+    // Output 1: decompression time (0 = not measured, skip).
+    if (lbl.decompression_time_ms > 0.0f) {
+      float clamped = std::max(0.01f, std::min(lbl.decompression_time_ms, 5000.0f));
+      float y_std1 = std::max(y_stds_[1], 1e-8f);
+      d5[1] = y[1] - (std::log1p(clamped) - y_means_[1]) / y_std1;
+    } else {
+      d5[1] = 0.0f;
+    }
+    // Output 3: PSNR (negative = not applicable, skip; 0 = lossless -> 120dB).
+    if (lbl.psnr_db >= 0.0f) {
+      float psnr_val = (lbl.psnr_db == 0.0f) ? 120.0f : lbl.psnr_db;
+      float clamped_psnr = std::min(psnr_val, 120.0f);
+      float y_std3 = std::max(y_stds_[3], 1e-8f);
+      d5[3] = y[3] - (clamped_psnr - y_means_[3]) / y_std3;
+    } else {
+      d5[3] = 0.0f;
+    }
+    // Outputs 4-7 (rmse/max_error/mae/ssim) are not trained by online SGD,
+    // matching upstream -- those are offline-trainer-only labels.
+    for (int o = 4; o < static_cast<int>(kOutputDim); ++o) d5[o] = 0.0f;
+
+    // Noise gate: a comp_time error under ~10% of a std-dev is GPU/host
+    // timing jitter, not a real prediction error -- don't train on it.
+    constexpr float kNoiseGateThresh = 0.10f;
+    if (std::fabs(d5[0]) < kNoiseGateThresh) d5[0] = 0.0f;
+
+    d5_raw[si] = d5;  // RAW error, cached for uncertainty weighting below
+
+    // Clamp to +-0.5 std-dev (Huber-style) so a single OOD sample can't
+    // cause a catastrophic weight jump.
+    constexpr float kSgdErrorDelta = 0.5f;
+    for (int o = 0; o < static_cast<int>(kOutputDim); ++o) {
+      d5[o] = std::max(-kSgdErrorDelta, std::min(d5[o], kSgdErrorDelta));
+    }
+    d5_clamped[si] = d5;
+  }
+
+  // ---- Phase 1.5: Uncertainty weighting (Kendall et al., 2018) ----
+  // Each output has a learned log_var[o]; precision = exp(-log_var[o]).
+  // Noisy outputs (large raw MSE) get down-weighted before backprop so they
+  // don't destabilize the shared hidden layers.
+  constexpr float kUwLr = 0.01f;
+  constexpr float kUwLogVarMin = -2.0f;
+  constexpr float kUwLogVarMax = 4.0f;
+  for (int o = 0; o < static_cast<int>(kOutputDim); ++o) {
+    float lv = log_var_[o];
+    float precision = std::exp(std::max(-20.0f, std::min(20.0f, -lv)));
+    float raw_mse = 0.0f;
+    for (size_t si = 0; si < num_samples; ++si) {
+      float e = d5_raw[si][o];
+      raw_mse += e * e;
+    }
+    raw_mse /= static_cast<float>(num_samples);
+    float grad_lv = 0.5f * (1.0f - precision * raw_mse);
+    lv -= kUwLr * grad_lv;
+    lv = std::max(kUwLogVarMin, std::min(lv, kUwLogVarMax));
+    log_var_[o] = lv;
+    float uw = std::exp(std::max(-20.0f, std::min(20.0f, -0.5f * lv)));
+    for (size_t si = 0; si < num_samples; ++si) {
+      d5_clamped[si][o] *= uw;
+    }
+  }
+
+  // ---- Phase 2: per-output backward passes with PCGrad-lite, accumulated
+  // into a combined (region-0-equivalent) gradient ----
+  constexpr float kGradClipThreshold = 0.1f;
+  constexpr float kPcgradCosThresh = -0.1f;
+  constexpr float kDefaultLearningRate = 0.01f;  // NeuroPress's g_reinforce_lr default
+
+  std::vector<float> combined_dw(weights_.size(), 0.0f);
+  std::vector<float> combined_db(biases_.size(), 0.0f);
+
+  for (int target_out = 0; target_out < static_cast<int>(kOutputDim); ++target_out) {
+    std::vector<float> out_dw(weights_.size(), 0.0f);
+    std::vector<float> out_db(biases_.size(), 0.0f);
+
+    for (size_t si = 0; si < num_samples; ++si) {
+      const auto& a = acts[si];
+
+      // Step 1: L4 backward delta for ALL outputs (needed for PCGrad),
+      // normalized to unit vectors for scale-invariant cosine comparison.
+      std::array<std::array<float, kHiddenDim>, kOutputDim> dz4_all{};
+      for (int o = 0; o < static_cast<int>(kOutputDim); ++o) {
+        float es = d5_clamped[si][o];
+        float norm_sq = 0.0f;
+        for (uint32_t t = 0; t < kHiddenDim; ++t) {
+          float dh4_t = weights_[weight_offsets_[4] + o * kHiddenDim + t] * es;
+          float v = (a.z4[t] > 0.0f) ? dh4_t : 0.0f;
+          dz4_all[o][t] = v;
+          norm_sq += v * v;
+        }
+        float norm = std::sqrt(norm_sq) + 1e-6f;
+        for (uint32_t t = 0; t < kHiddenDim; ++t) dz4_all[o][t] /= norm;
+      }
+
+      // Step 2: PCGrad projection -- only project against outputs whose
+      // gradient direction truly conflicts (cosine < -0.1), ignoring noise
+      // within that margin (matters for single/few-sample SGD).
+      std::array<float, kHiddenDim> my_dz4;
+      for (uint32_t t = 0; t < kHiddenDim; ++t) my_dz4[t] = dz4_all[target_out][t];
+      for (int j = 0; j < static_cast<int>(kOutputDim); ++j) {
+        if (j == target_out) continue;
+        float cos_ij = 0.0f;
+        for (uint32_t t = 0; t < kHiddenDim; ++t) cos_ij += my_dz4[t] * dz4_all[j][t];
+        if (cos_ij < kPcgradCosThresh) {
+          for (uint32_t t = 0; t < kHiddenDim; ++t) my_dz4[t] -= cos_ij * dz4_all[j][t];
+        }
+      }
+      float err_mag = std::fabs(d5_clamped[si][target_out]);
+      std::array<float, kHiddenDim> dz4;
+      for (uint32_t t = 0; t < kHiddenDim; ++t) dz4[t] = my_dz4[t] * err_mag;
+
+      // Step 3: W5/b5 gradient uses the ORIGINAL (unprojected) error.
+      float error_signal = d5_clamped[si][target_out];
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        out_dw[weight_offsets_[4] + target_out * kHiddenDim + t] +=
+            error_signal * a.h4[t];
+      }
+      out_db[bias_offsets_[4] + target_out] += error_signal;
+
+      // Step 4/4b/4c: L4 gradient + backward L4->L3 (using PROJECTED dz4).
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        for (uint32_t i = 0; i < kHiddenDim; ++i)
+          out_dw[weight_offsets_[3] + t * kHiddenDim + i] += dz4[t] * a.h3[i];
+        out_db[bias_offsets_[3] + t] += dz4[t];
+      }
+      std::array<float, kHiddenDim> dz3{};
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        float dh3_t = 0.0f;
+        for (uint32_t j = 0; j < kHiddenDim; ++j)
+          dh3_t += weights_[weight_offsets_[3] + j * kHiddenDim + t] * dz4[j];
+        dz3[t] = (a.z3[t] > 0.0f) ? dh3_t : 0.0f;
+      }
+
+      // Step 5/5b: L3 gradient + backward L3->L2.
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        for (uint32_t i = 0; i < kHiddenDim; ++i)
+          out_dw[weight_offsets_[2] + t * kHiddenDim + i] += dz3[t] * a.h2[i];
+        out_db[bias_offsets_[2] + t] += dz3[t];
+      }
+      std::array<float, kHiddenDim> dz2{};
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        float dh2_t = 0.0f;
+        for (uint32_t j = 0; j < kHiddenDim; ++j)
+          dh2_t += weights_[weight_offsets_[2] + j * kHiddenDim + t] * dz3[j];
+        dz2[t] = (a.z2[t] > 0.0f) ? dh2_t : 0.0f;
+      }
+
+      // Step 6/6b: L2 gradient + backward L2->L1, then L1 gradient.
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        for (uint32_t i = 0; i < kHiddenDim; ++i)
+          out_dw[weight_offsets_[1] + t * kHiddenDim + i] += dz2[t] * a.h1[i];
+        out_db[bias_offsets_[1] + t] += dz2[t];
+      }
+      std::array<float, kHiddenDim> dz1{};
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        float dh1_t = 0.0f;
+        for (uint32_t j = 0; j < kHiddenDim; ++j)
+          dh1_t += weights_[weight_offsets_[1] + j * kHiddenDim + t] * dz2[j];
+        dz1[t] = (a.z1[t] > 0.0f) ? dh1_t : 0.0f;
+      }
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        for (uint32_t i = 0; i < kInputDim; ++i)
+          out_dw[weight_offsets_[0] + t * kInputDim + i] += dz1[t] * a.x[i];
+        out_db[bias_offsets_[0] + t] += dz1[t];
+      }
+    }  // per-sample
+
+    // Average this output's gradient over samples, clip by its own norm
+    // (only the parameters it actually touches: shared L1-L4 + its own
+    // W5/b5 row), then fold the (learning-rate + clip-scaled) result into
+    // the combined gradient.
+    float inv_n = 1.0f / static_cast<float>(num_samples);
+    double norm_sq = 0.0;
+    for (uint32_t layer = 0; layer < 4; ++layer) {
+      size_t wsz = (layer == 0) ? size_t{kHiddenDim} * kInputDim
+                                 : size_t{kHiddenDim} * kHiddenDim;
+      size_t wo = weight_offsets_[layer], bo = bias_offsets_[layer];
+      for (size_t k = 0; k < wsz; ++k) {
+        out_dw[wo + k] *= inv_n;
+        norm_sq += static_cast<double>(out_dw[wo + k]) * out_dw[wo + k];
+      }
+      for (uint32_t k = 0; k < kHiddenDim; ++k) {
+        out_db[bo + k] *= inv_n;
+        norm_sq += static_cast<double>(out_db[bo + k]) * out_db[bo + k];
+      }
+    }
+    {
+      size_t wo = weight_offsets_[4], bo = bias_offsets_[4];
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        size_t idx = wo + target_out * kHiddenDim + t;
+        out_dw[idx] *= inv_n;
+        norm_sq += static_cast<double>(out_dw[idx]) * out_dw[idx];
+      }
+      out_db[bo + target_out] *= inv_n;
+      norm_sq += static_cast<double>(out_db[bo + target_out]) *
+                out_db[bo + target_out];
+    }
+    float out_norm = static_cast<float>(std::sqrt(norm_sq)) + 1e-8f;
+    float clip_scale =
+        (out_norm > kGradClipThreshold) ? (kGradClipThreshold / out_norm) : 1.0f;
+    float lr_out = kDefaultLearningRate * clip_scale;
+
+    for (uint32_t layer = 0; layer < 4; ++layer) {
+      size_t wsz = (layer == 0) ? size_t{kHiddenDim} * kInputDim
+                                 : size_t{kHiddenDim} * kHiddenDim;
+      size_t wo = weight_offsets_[layer], bo = bias_offsets_[layer];
+      for (size_t k = 0; k < wsz; ++k) combined_dw[wo + k] += lr_out * out_dw[wo + k];
+      for (uint32_t k = 0; k < kHiddenDim; ++k) combined_db[bo + k] += lr_out * out_db[bo + k];
+    }
+    {
+      size_t wo = weight_offsets_[4], bo = bias_offsets_[4];
+      for (uint32_t t = 0; t < kHiddenDim; ++t) {
+        size_t idx = wo + target_out * kHiddenDim + t;
+        combined_dw[idx] += lr_out * out_dw[idx];
+      }
+      combined_db[bo + target_out] += lr_out * out_db[bo + target_out];
+    }
+  }  // per target_out
+
+  // ---- Trust-region step, anti-flip damping, EMA smoothing, weight update
+  // (nn_gpu.cu's Steps 5-9) ----
+  constexpr float kEmaDecay = 0.85f;
+  constexpr float kTrustK = 0.08f;
+  constexpr float kMaxStep = 0.02f;
+  constexpr float kMinStep = 1e-4f;
+  constexpr float kAntiFlipDamp = 0.5f;
+  constexpr float kWClamp = 10.0f;
+
+  // Normalize the combined gradient to a unit direction (trust-region:
+  // decouple update direction from magnitude).
+  double g_norm_sq = 0.0;
+  for (float v : combined_dw) g_norm_sq += static_cast<double>(v) * v;
+  for (float v : combined_db) g_norm_sq += static_cast<double>(v) * v;
+  float g_norm = static_cast<float>(std::sqrt(g_norm_sq)) + 1e-8f;
+  float inv_norm = 1.0f / g_norm;
+  for (float& v : combined_dw) v *= inv_norm;
+  for (float& v : combined_db) v *= inv_norm;
+
+  // Step size = k * average |raw error| across active outputs/samples,
+  // clamped to [MIN_STEP, MAX_STEP].
+  float sum_err = 0.0f;
+  int err_count = 0;
+  for (size_t si = 0; si < num_samples; ++si) {
+    for (int o = 0; o < static_cast<int>(kOutputDim); ++o) {
+      float e = std::fabs(d5_raw[si][o]);
+      if (e > 0.0f) { sum_err += e; ++err_count; }
+    }
+  }
+  float avg_err = (err_count > 0) ? sum_err / static_cast<float>(err_count) : 0.0f;
+  float step = std::max(kMinStep, std::min(kMaxStep, kTrustK * avg_err));
+
+  // Anti-flip damping: if the new gradient direction points opposite the
+  // EMA (recent) direction, halve the step -- only after warmup, since the
+  // first few calls have no meaningful EMA yet.
+  bool warmed_up = (sgd_call_count_ > 3);
+  if (warmed_up) {
+    double dot_ema = 0.0;
+    for (size_t i = 0; i < combined_dw.size(); ++i)
+      dot_ema += static_cast<double>(combined_dw[i]) * ema_weights_[i];
+    for (size_t i = 0; i < combined_db.size(); ++i)
+      dot_ema += static_cast<double>(combined_db[i]) * ema_biases_[i];
+    if (dot_ema < 0.0) step *= kAntiFlipDamp;
+  }
+
+  // Sanitize (a corrupted forward pass could have produced NaN/Inf) before
+  // it permanently poisons the EMA buffer.
+  for (float& v : combined_dw) if (!std::isfinite(v)) v = 0.0f;
+  for (float& v : combined_db) if (!std::isfinite(v)) v = 0.0f;
+
+  float ema_new = 1.0f - kEmaDecay;
+  for (size_t i = 0; i < ema_weights_.size(); ++i)
+    ema_weights_[i] = kEmaDecay * ema_weights_[i] + ema_new * combined_dw[i];
+  for (size_t i = 0; i < ema_biases_.size(); ++i)
+    ema_biases_[i] = kEmaDecay * ema_biases_[i] + ema_new * combined_db[i];
+
+  ++sgd_call_count_;
+
+  // NaN/Inf guard: a single corrupted sample must not be allowed to destroy
+  // the network. The EMA above is already sanitized, so skipping the
+  // update here just means "wait for a cleaner gradient next call."
+  if (!std::isfinite(step) || !std::isfinite(g_norm)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < weights_.size(); ++i) {
+    float w = weights_[i] - step * ema_weights_[i];
+    weights_[i] = std::max(-kWClamp, std::min(kWClamp, w));
+  }
+  for (size_t i = 0; i < biases_.size(); ++i) {
+    float b = biases_[i] - step * ema_biases_[i];
+    biases_[i] = std::max(-kWClamp, std::min(kWClamp, b));
+  }
+  return true;
 }
 
 }  // namespace ctp::compress::model
