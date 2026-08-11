@@ -10,6 +10,7 @@ set(COMPRESSOR_SOURCES
     src/compressor_runtime.cc
     src/models/linreg_table_predictor.cc
     src/models/qtable_predictor.cc
+    src/models/neuropress_bridge.cc
     src/autogen/compressor_lib_exec.cc
 )
 
@@ -36,6 +37,7 @@ add_clio_module_runtime(
     ${COMPRESSOR_SOURCES}
   LINK_LIBRARIES
     ctp::compress
+    ctp::compress_model
 )
 
 # Link optional dependencies if available

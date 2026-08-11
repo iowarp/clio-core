@@ -74,6 +74,25 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
+   * Initialize a default-constructed client with the compressor pool ID.
+   *
+   * ContainerClient::Init(PoolId) is virtual but only sets the inherited
+   * pool_id_ (the CORE pool, for the pass-through methods this class does
+   * not override); it has no way to reach this class's own
+   * compressor_pool_id_. Without this override, Client().Init(id) silently
+   * leaves compressor_pool_id_ at its default (0,0) -- a pool that does not
+   * exist -- so every AsyncCompress/AsyncDynamicSchedule/etc. call routes to
+   * nothing and the caller's task.Wait() blocks forever (the unroutable task
+   * lands in a worker retry queue with no eventual-failure path). Mirrors the
+   * one-arg constructor above: same ID used for both, since the caller
+   * (Init, single-arg) by definition doesn't have a separate core pool id.
+   */
+  void Init(const clio::run::PoolId &compressor_pool_id) override {
+    compressor_pool_id_ = compressor_pool_id;
+    clio::cte::core::Client::Init(compressor_pool_id);
+  }
+
+  /**
    * Create the compressor container.
    */
   clio::run::Future<CreateTask> AsyncCreateCompressor(

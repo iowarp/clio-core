@@ -200,6 +200,19 @@ class CompressionFactory {
   }
 
   /**
+   * Map a canonical library name to its CTE wire ID. Reverse of
+   * NameForWireId(). Unknown names fall back to zstd's wire id (10), the
+   * same historical default NameForWireId() falls back to by name.
+   *
+   * @param library_name Canonical (case-insensitive) library name
+   * @return Wire ID (compress_lib_), or zstd's wire id if unknown
+   */
+  static int WireIdForName(const std::string& library_name) {
+    const CompressorInfo* info = FindByName(library_name);
+    return info ? info->wire_id : FindByName("zstd")->wire_id;
+  }
+
+  /**
    * Get string name for preset.
    *
    * @param preset Compression preset

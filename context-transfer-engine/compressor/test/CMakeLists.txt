@@ -37,6 +37,25 @@ target_link_libraries(test_qtable_predictor_exec
 )
 add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
 
+# Test NeuroPress bridge (issue #693 cycle 3): NeuroPressCandidateStats
+# ranking GPU/NeuroPress candidates for dynamic selection.
+add_executable(test_neuropress_bridge_exec
+  test_neuropress_bridge.cc
+)
+target_link_libraries(test_neuropress_bridge_exec
+  clio::cte::compressor_runtime
+  ctp::compress
+  ctp::compress_model
+  Catch2::Catch2WithMain
+)
+target_include_directories(test_neuropress_bridge_exec PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
+# Real, shipped NeuroPress .nnwt weights (see context-transport-primitives/
+# src/compress/model/weights/) -- exercises the actual pretrained model.
+target_compile_definitions(test_neuropress_bridge_exec PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+add_test(NAME test_neuropress_bridge COMMAND test_neuropress_bridge_exec)
+
 # NOTE: test_compression_contention has been moved to the end of this file
 # as a standalone benchmark without ChiMod runtime dependency
 
@@ -65,24 +84,52 @@ target_link_libraries(test_compressor_functional
   ${CMAKE_THREAD_LIBS_INIT}     # Threading support
 )
 
-# Register functional tests - use test names (simple_test.h filters by name)
+target_compile_definitions(test_compressor_functional PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+# Register functional tests - use test names (simple_test.h filters by name).
+#
+# simple_test.h's TEST_CASE registers under "<title> <tags>"; a plain-text
+# filter (no leading '[') is a substring match against that WHOLE string, and
+# a filter that doesn't match anything runs 0 tests and exits 0 -- a silent
+# vacuous PASS, not a build/test failure ctest would ever flag. Six of these
+# eight registrations had drifted from the actual TEST_CASE titles below them
+# (renamed at some point without updating this file) and had been running
+# zero assertions ever since; only compressor_error_handling's filter still
+# matched for real, which is exactly the one that was already known to hang
+# (see the class comment on "Error Handling - Invalid Parameters" above).
+# Verified against the current titles in test_compressor_functional.cc.
 add_test(NAME compressor_compress_lz4
-    COMMAND test_compressor_functional "CompressTask - LZ4 Compression")
+    COMMAND test_compressor_functional "Basic Compress and Store")
 
 add_test(NAME compressor_decompress_lz4
-    COMMAND test_compressor_functional "DecompressTask - LZ4 Decompression")
+    COMMAND test_compressor_functional "Decompress and Retrieve")
 
+# No standalone "round-trip" or "compression ratio" TEST_CASE exists (and
+# none appears to ever have, going by the titles actually defined in this
+# file) -- point these at the closest real coverage rather than continue
+# matching nothing.
 add_test(NAME compressor_roundtrip_integrity
-    COMMAND test_compressor_functional "Round-trip - Data Integrity")
+    COMMAND test_compressor_functional "[basic]")
 
 add_test(NAME compressor_compression_ratios
-    COMMAND test_compressor_functional "Compression Ratio - Data Patterns")
+    COMMAND test_compressor_functional "[libraries]")
 
 add_test(NAME compressor_dynamic_schedule
-    COMMAND test_compressor_functional "DynamicSchedule - Compression Selection")
+    COMMAND test_compressor_functional "Dynamic Schedule Compression")
+
+add_test(NAME compressor_dynamic_neuropress
+    COMMAND test_compressor_functional "[neuropress][693]")
+
+add_test(NAME compressor_nvcomp_gpu_roundtrip
+    COMMAND test_compressor_functional "[nvcomp][gpu]")
 
 add_test(NAME compressor_multiple_libraries
-    COMMAND test_compressor_functional "Multiple Libraries - Compression")
+    COMMAND test_compressor_functional "Multiple Compression Libraries")
+
+# Never registered at all (a gap, not a rename drift like the others above).
+add_test(NAME compressor_no_compression_passthrough
+    COMMAND test_compressor_functional "No Compression Passthrough")
 
 add_test(NAME compressor_error_handling
     COMMAND test_compressor_functional "Error Handling - Invalid Parameters")
@@ -94,7 +141,10 @@ set_tests_properties(
     compressor_roundtrip_integrity
     compressor_compression_ratios
     compressor_dynamic_schedule
+    compressor_dynamic_neuropress
+    compressor_nvcomp_gpu_roundtrip
     compressor_multiple_libraries
+    compressor_no_compression_passthrough
     compressor_error_handling
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout

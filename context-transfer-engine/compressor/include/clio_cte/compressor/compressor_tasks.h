@@ -58,6 +58,11 @@ struct CompressorConfig {
   std::string linreg_model_path_;
   std::string distribution_model_path_;
   std::string dnn_model_weights_path_;
+  // Directory of a trained NeuroPress NN's .nnwt weights (issue #693 Cycle
+  // 3). Not yet consulted by Runtime -- wiring EstCompressionStats() to load
+  // and rank against this predictor is still pending; this field only
+  // carries the path through CreateParams for now.
+  std::string neuropress_model_path_;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -80,6 +85,7 @@ struct CompressorConfig {
         linreg_model_path_(other.linreg_model_path_),
         distribution_model_path_(other.distribution_model_path_),
         dnn_model_weights_path_(other.dnn_model_weights_path_),
+        neuropress_model_path_(other.neuropress_model_path_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -93,8 +99,8 @@ struct CompressorConfig {
     // created compressor pool straight to the default core, bypassing any
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
-       tracking_enabled_);
+       dnn_model_weights_path_, neuropress_model_path_, trace_folder_path_,
+       next_pool_id_, tracking_enabled_);
   }
 
   /**

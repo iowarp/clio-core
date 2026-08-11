@@ -848,7 +848,16 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     // toward this reader. No-op when tracking_enabled_=false.
     RegisterConsumer(task->tag_id_, task->pool_query_.GetReturnNode());
 
-    // Extract task parameters (same as GetBlobTask)
+    // Extract task parameters (same as GetBlobTask). task->size_ is the
+    // caller-declared LOGICAL (original, uncompressed) size -- compression
+    // is only ever kept when it makes the stored blob strictly smaller (see
+    // Compress()'s "total_stored_size < input_size" check), so it is a safe
+    // UPPER bound, but it is not the actual number of bytes physically
+    // stored. Using it directly as compressed_size below over-reads past the
+    // true compressed stream into the destination buffer's uninitialized
+    // tail, which corrupts the decompressor's input; LZ4 in particular then
+    // returns a negative status that silently underflows the unsigned
+    // output_size and gets reported as success with a garbage size.
     clio::run::u64 expected_size = task->size_;
 
     // Validate output buffer
@@ -866,9 +875,23 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       }
     }
 
-    // Allocate temporary buffer to receive compressed data from GetBlob
-    // We don't know the compressed size, so allocate expected_size as upper
-    // bound
+    // Ask core directly (bypassing this class's own GetBlobSize override,
+    // which deliberately reports the LOGICAL size) for the blob's actual
+    // PHYSICAL size -- the true number of bytes to read and hand to the
+    // decompressor. Falls back to the logical-size upper bound if the query
+    // fails, so a size-lookup problem degrades to the old (possibly
+    // over-reading) behavior rather than aborting the read outright.
+    if (core_client_) {
+      auto size_task = core_client_->AsyncGetBlobSize(
+          task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(size_task);
+      if (size_task->return_code_ == 0 && size_task->size_ > 0) {
+        expected_size = size_task->size_;
+      }
+    }
+
+    // Allocate temporary buffer to receive compressed data from GetBlob,
+    // sized to the blob's actual physical size (see above).
     auto temp_buffer = CLIO_IPC->AllocateBuffer(expected_size);
     if (temp_buffer.IsNull()) {
       task->return_code_ = 2;  // Memory allocation failed

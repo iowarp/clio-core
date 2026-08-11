@@ -525,7 +525,14 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # exposes the imported target nvcomp::nvcomp (which pulls in CUDA::cudart).
     set(CLIO_CTP_ENABLE_NVCOMP OFF)
     if(CLIO_CORE_ENABLE_CUDA)
-        find_package(nvcomp QUIET)
+        # The Debian/Ubuntu libnvcomp5-dev-cuda-12 package ships a real
+        # nvcomp-config.cmake, but installs it under a package-namespaced
+        # path (.../cmake/libnvcomp5-dev-cuda-12/nvcomp/) that is not on
+        # find_package's default search path, so the plain call below finds
+        # nothing on a fresh checkout even though nvcomp is fully installed.
+        # Hint the well-known apt location as a fallback search path.
+        find_package(nvcomp QUIET
+            HINTS /usr/lib/x86_64-linux-gnu/cmake/libnvcomp5-dev-cuda-12/nvcomp)
         if(nvcomp_FOUND)
             message(STATUS "found nvcomp ${nvcomp_VERSION} (GPU compression) - target nvcomp::nvcomp")
             set(CLIO_CTP_ENABLE_NVCOMP ON)

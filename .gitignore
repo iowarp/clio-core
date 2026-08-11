@@ -137,8 +137,12 @@ external/boost-*.tar.gz
 external/boost-*/
 external/boost/
 
-# Model weights (large binaries)
+# Model weights (large binaries). NOT meant to catch source directories that
+# happen to be named "models/" (e.g. the compressor chimod's predictor
+# implementations) -- those are excluded below.
 models/
+!context-transfer-engine/compressor/include/clio_cte/compressor/models/
+!context-transfer-engine/compressor/src/models/
 
 # Submodules managed by .gitmodules
 #external/libzmq/

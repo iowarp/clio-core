@@ -49,6 +49,7 @@
 #include "simple_test.h"
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <vector>
 #include <random>
 
@@ -81,7 +82,18 @@ namespace CompLib {
   constexpr int ZFP = 8;
   constexpr int ZLIB = 9;
   constexpr int ZSTD = 10;
-  constexpr int NVCOMP_LZ4 = 11;  // GPU compressor (requires nvcomp build)
+  // GPU compressors (require nvcomp build). These 8 wire ids are exactly
+  // NeuroPress's GPUCOMPRESS_ALGO_AUTO action space (gpucompress.h) --
+  // LZ4/SNAPPY/DEFLATE/GDEFLATE/ZSTD/ANS/CASCADED/BITCOMP -- registered in
+  // CompressionFactory's frozen wire-id namespace.
+  constexpr int NVCOMP_LZ4 = 11;
+  constexpr int NVCOMP_SNAPPY = 12;
+  constexpr int NVCOMP_ZSTD = 13;
+  constexpr int NVCOMP_GDEFLATE = 14;
+  constexpr int NVCOMP_DEFLATE = 15;
+  constexpr int NVCOMP_ANS = 16;
+  constexpr int NVCOMP_CASCADED = 21;
+  constexpr int NVCOMP_BITCOMP = 22;
 }
 
 /**
@@ -155,6 +167,22 @@ clio::run::PoolId CreateCorePool() {
       core_params);
   create_task.Wait();
 
+  // Without a registered storage target, ExtendBlob's DPE placement step
+  // sees an empty target list and every real PutBlob fails with "No storage
+  // devices configured" (core_runtime.cc's ExtendBlob, error_code=1 ->
+  // return_code_=11) -- regardless of which compressor was used or whether
+  // compression itself succeeded. RAM-backed, sized generously so functional
+  // tests can safely exercise multi-MB payloads (e.g. nvcomp round-trips).
+  core_client.Init(core_pool_id);
+  auto reg_task = core_client.AsyncRegisterTarget(
+      "test_compressor_ram_target", clio::run::bdev::BdevType::kRam,
+      static_cast<clio::run::u64>(256) * 1024 * 1024,
+      clio::run::PoolQuery::Local(), clio::run::PoolId(700, 0));
+  reg_task.Wait();
+  if (reg_task->GetReturnCode() != 0) {
+    throw std::runtime_error("CreateCorePool: failed to register storage target");
+  }
+
   return core_pool_id;
 }
 
@@ -169,6 +197,23 @@ clio::run::PoolId CreateCompressorPool() {
       clio::run::PoolQuery::Local(),
       "test_compressor_pool",
       compressor_pool_id);
+  create_task.Wait();
+
+  return compressor_pool_id;
+}
+
+/**
+ * Create and return pool ID for a compressor chimod configured with a
+ * specific CompressorConfig (e.g. to point it at a predictor model on
+ * disk), rather than the all-defaults pool CreateCompressorPool() makes.
+ */
+clio::run::PoolId CreateCompressorPoolWithConfig(
+    const clio::run::PoolId &compressor_pool_id,
+    const std::string &pool_name, const CompressorConfig &config) {
+  Client compressor_client;
+
+  auto create_task = compressor_client.AsyncCreateCompressor(
+      clio::run::PoolQuery::Local(), pool_name, compressor_pool_id, config);
   create_task.Wait();
 
   return compressor_pool_id;
@@ -368,6 +413,87 @@ TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
 }
 
 /**
+ * Test Case 3b (issue #693 Cycle 3): with a NeuroPress model configured,
+ * DynamicSchedule must actually consult clio_ctp::compress::model's wider
+ * candidate set (11 CPU compressors x 3 presets via NeuroPressCandidateStats)
+ * instead of silently continuing to use the old 4-library hardcoded
+ * candidate_lib_configs list in EstCompressionStats(). The old hardcoded
+ * list can only ever pick wire ids {1 bzip2, 4 lz4, 9 zlib, 10 zstd} (or 0
+ * as the "nothing beat ratio 1.0" fallback); this test drives DynamicSchedule
+ * across several distinct data patterns/sizes and requires at least one
+ * selection to land on a wire id that ONLY the wider action space can reach
+ * (blosc2/fpzip/lzma/snappy/sz3/zfp), proving the NeuroPress path is what
+ * actually ran, not just that the old path happens to still work.
+ */
+TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
+          "[compressor][functional][dynamic][neuropress][693]") {
+#ifndef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+#error "CLIO_CTP_NEUROPRESS_WEIGHTS_DIR must be set by CMake"
+#endif
+
+  CTETestFixture fixture;
+
+  // Point a second, separately-configured compressor pool at the same
+  // trained NeuroPress weights Cycle 1/3's other tests already validated,
+  // instead of the fixture's default (unconfigured) compressor pool.
+  CompressorConfig config;
+  config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;
+  clio::run::PoolId neuropress_pool_id =
+      CreateCompressorPoolWithConfig(clio::run::PoolId(2, 42),
+                                     "test_compressor_pool_neuropress",
+                                     config);
+  Client neuropress_client;
+  neuropress_client.Init(neuropress_pool_id);
+
+  struct Trial { std::string pattern; size_t size; };
+  std::vector<Trial> trials = {
+      {"zeros", 4 * 1024},      {"zeros", 1024 * 1024},
+      {"ones", 64 * 1024},      {"repeating", 64 * 1024},
+      {"repeating", 1024 * 1024}, {"text", 64 * 1024},
+      {"text", 1024 * 1024},    {"random", 64 * 1024},
+  };
+
+  // Wire ids only reachable through the wider (11 compressor) action space
+  // NeuroPressCandidateStats draws from -- the old hardcoded list in
+  // EstCompressionStats() never emits any of these.
+  const std::set<int> kOnlyViaWiderActionSpace = {
+      CompLib::BLOSC2, CompLib::FPZIP, CompLib::LZMA,
+      CompLib::SNAPPY, CompLib::SZ3,   CompLib::ZFP};
+
+  std::set<int> observed_libs;
+  for (const auto &trial : trials) {
+    auto test_data = GenerateTestData(trial.size, trial.pattern);
+    auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+    REQUIRE(!shm_buffer.IsNull());
+    ctp::ipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+
+    Context context;
+    context.dynamic_compress_ = 0;  // Dynamic mode
+    context.max_performance_ = false;  // Optimize for ratio
+
+    auto task = neuropress_client.AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), fixture.tag_id_,
+        "test_blob_neuropress_" + trial.pattern, 0, test_data.size(),
+        blob_data, 0.5f, context, 0, fixture.core_pool_id_);
+    task.Wait();
+
+    REQUIRE(task->return_code_ == 0);
+    observed_libs.insert(task->context_.compress_lib_);
+
+    CLIO_IPC->FreeBuffer(shm_buffer);
+  }
+
+  bool reached_wider_action_space = false;
+  for (int lib : observed_libs) {
+    if (kOnlyViaWiderActionSpace.count(lib) > 0) {
+      reached_wider_action_space = true;
+      break;
+    }
+  }
+  REQUIRE(reached_wider_action_space);
+}
+
+/**
  * Test Case 4: Multiple Compression Libraries
  * Tests compression with various libraries
  */
@@ -527,43 +653,71 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
 
   CTETestFixture fixture;
 
-  auto original_data = GenerateTestData(64 * 1024, "text");
+  // Every wire id in NeuroPress's GPUCOMPRESS_ALGO_AUTO action space
+  // (gpucompress.h) -- statically selecting each one and round-tripping
+  // through Clio's actual Compress/Decompress tasks proves the whole chain
+  // (CompressionFactory -> NvComp wrapper -> CTE storage -> decompress)
+  // correctly passes data for every algorithm NeuroPress can pick, before
+  // trusting the NN to pick among them dynamically.
+  std::vector<std::pair<int, std::string>> algorithms = {
+      {CompLib::NVCOMP_LZ4, "nvcomp-lz4"},
+      {CompLib::NVCOMP_SNAPPY, "nvcomp-snappy"},
+      {CompLib::NVCOMP_DEFLATE, "nvcomp-deflate"},
+      {CompLib::NVCOMP_GDEFLATE, "nvcomp-gdeflate"},
+      {CompLib::NVCOMP_ZSTD, "nvcomp-zstd"},
+      {CompLib::NVCOMP_ANS, "nvcomp-ans"},
+      {CompLib::NVCOMP_CASCADED, "nvcomp-cascaded"},
+      {CompLib::NVCOMP_BITCOMP, "nvcomp-bitcomp"},
+  };
 
-  // Compress + store via the chimod using the GPU compressor.
-  auto put_buffer = fixture.AllocateAndCopyData(original_data);
-  REQUIRE(!put_buffer.IsNull());
-  ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+  for (const auto& [lib_id, lib_name] : algorithms) {
+    SECTION(lib_name) {
+      // 64 MiB: large enough to be representative of real GPU chunk-based
+      // compression (nvcomp's per-chunk overhead/behavior on a 64 KiB
+      // buffer is not representative of the multi-MB writes Clio actually
+      // handles). The *stored* (compressed) blob is far smaller than this,
+      // so it comfortably fits the 256 MiB test RAM target even across all
+      // 8 SECTION iterations.
+      auto original_data = GenerateTestData(64 * 1024 * 1024, "text");
 
-  Context context;
-  context.compress_lib_ = CompLib::NVCOMP_LZ4;
-  context.compress_preset_ = 2;
+      // Compress + store via the chimod using the GPU compressor.
+      auto put_buffer = fixture.AllocateAndCopyData(original_data);
+      REQUIRE(!put_buffer.IsNull());
+      ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
 
-  auto compress_task = fixture.compressor_client_.AsyncCompress(
-      clio::run::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
-      original_data.size(), put_blob_data, 0.5f, context, 0,
-      fixture.core_pool_id_);
-  compress_task.Wait();
-  REQUIRE(compress_task->return_code_ == 0);
-  CLIO_IPC->FreeBuffer(put_buffer);
+      Context context;
+      context.compress_lib_ = lib_id;
+      context.compress_preset_ = 2;
 
-  // Retrieve + decompress via the chimod and verify integrity.
-  auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
-  REQUIRE(!get_buffer.IsNull());
-  ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+      std::string blob_name = "test_blob_" + lib_name;
+      auto compress_task = fixture.compressor_client_.AsyncCompress(
+          clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+          original_data.size(), put_blob_data, 0.5f, context, 0,
+          fixture.core_pool_id_);
+      compress_task.Wait();
+      REQUIRE(compress_task->return_code_ == 0);
+      CLIO_IPC->FreeBuffer(put_buffer);
 
-  auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
-      clio::run::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
-      original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
-  decompress_task.Wait();
-  REQUIRE(decompress_task->return_code_ == 0);
-  REQUIRE(decompress_task->output_size_ == original_data.size());
+      // Retrieve + decompress via the chimod and verify integrity.
+      auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
+      REQUIRE(!get_buffer.IsNull());
+      ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
 
-  auto retrieved_data =
-      fixture.ReadFromSharedMemory(get_buffer, original_data.size());
-  REQUIRE(std::memcmp(original_data.data(), retrieved_data.data(),
-                      original_data.size()) == 0);
-  INFO("nvcomp-lz4 GPU round-trip verified");
-  CLIO_IPC->FreeBuffer(get_buffer);
+      auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+          original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
+      decompress_task.Wait();
+      REQUIRE(decompress_task->return_code_ == 0);
+      REQUIRE(decompress_task->output_size_ == original_data.size());
+
+      auto retrieved_data =
+          fixture.ReadFromSharedMemory(get_buffer, original_data.size());
+      REQUIRE(std::memcmp(original_data.data(), retrieved_data.data(),
+                          original_data.size()) == 0);
+      INFO(lib_name << " GPU round-trip verified");
+      CLIO_IPC->FreeBuffer(get_buffer);
+    }
+  }
 }
 #endif  // CTP_ENABLE_NVCOMP
 
