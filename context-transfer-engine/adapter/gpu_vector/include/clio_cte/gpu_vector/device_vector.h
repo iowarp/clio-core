@@ -1154,6 +1154,22 @@ class DeviceVector {
    * @return false if no slot could be freed (every resident page is pinned by
    *         an in-flight transfer), in which case nothing was started.
    */
+  /**
+   * Is `page_num` resident AND finished arriving? Never blocks, never faults.
+   *
+   * This is the query a yieldable kernel tests before suspending: a page that
+   * is claimed but still `fetching` is NOT usable, so it must report false or
+   * the caller would read a slot whose transfer has not landed. Lock-free on
+   * purpose -- taking the block lock here would serialise every thread of the
+   * block on what is meant to be a cheap predicate, and the claim protocol
+   * publishes `fetching` before `page_num` precisely so a scanner cannot see a
+   * half-claimed slot as ready.
+   */
+  CTP_GPU_FUN bool IsResident(clio::run::u64 page_num) const {
+    const Page *p = Find(page_num);
+    return p != nullptr && !p->fetching;
+  }
+
   CTP_GPU_FUN bool BeginFetch(clio::run::u64 page_num) {
     LockBlock();
     const bool ok = BeginFetchLocked(page_num);

@@ -31,6 +31,8 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <chrono>
 #include <cstdio>
@@ -144,6 +146,74 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
   atomicAdd(sum, acc);
 }
 
+namespace gy = clio::run::gpu;
+
+/**
+ * The same weighted sum, but the block SUSPENDS on a miss instead of one lane
+ * blocking on it.
+ *
+ * The non-yieldable kernel above is single-threaded per block on purpose, and
+ * its comment explains why: parallelising the page read was 6x faster and
+ * WRONG, because a lane other than 0 that missed entered the fault path where
+ * Send and Wait are no-ops for it and then read an unpopulated page. What it
+ * asks for is "a block-collective fault in the vector itself".
+ *
+ * CLIO_YIELD_IF is that fault. Every lane votes on whether its page is
+ * resident, the whole block suspends if ANY lane is waiting, and the kernel
+ * exits so the fetch can land. On resume the page is resident for everyone, so
+ * the read is an ordinary parallel loop with no fault path in it at all.
+ */
+__global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
+                                   gv::DeviceVector<clio::run::u32> v,
+                                   clio::run::u64 per,
+                                   clio::run::u64 page_elems,
+                                   unsigned long long *sum,
+                                   gy::YieldableView<> yv,
+                                   gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.ipc_ = g_ipc_manager_ptr;
+  // The driver relaunches only unfinished blocks, so blockIdx.x is not this
+  // block's identity. block_override_ already exists for launch fusion and is
+  // exactly the hook needed here.
+  v.block_override_ = yv.Block();
+
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  // Only these two cross a suspend. Both are touched once per PAGE, never in
+  // the inner loop, which is what keeps the frame off the hot path.
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(unsigned long long, acc, 0);
+  // Declared before the switch: re-derived on every entry, so the resume
+  // cannot jump over its initialization.
+  const clio::run::u64 base =
+      static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; off < per; off += page_elems) {
+    // One lane issues the fetch; issuing it from every lane would submit the
+    // same page many times.
+    if (threadIdx.x == 0 && !v.IsResident((base + off) / page_elems)) {
+      v.BeginFetch((base + off) / page_elems);
+    }
+    CLIO_YIELD_IF(!v.IsResident((base + off) / page_elems));
+    {
+      // Past the yield the page is resident for the whole block, so HoldPage
+      // takes its lock-free fast path and every lane can read.
+      const clio::run::u64 n =
+          (off + page_elems <= per) ? page_elems : (per - off);
+      (void) v.HoldPage(base + off, n);
+      unsigned long long r = 0;                   // register, not the frame
+      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
+        r += static_cast<unsigned long long>(v.at(base + off + i)) *
+             Activation(base + off + i);
+      }
+      acc += r;
+    }
+  }
+  atomicAdd(sum, acc);
+  CLIO_YEND();
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 int main(int argc, char **argv) {
@@ -154,6 +224,7 @@ int main(int argc, char **argv) {
   bool compressed = false;
   int prefetch = 1;
   int repeat = 3;
+  bool yieldable = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -164,11 +235,13 @@ int main(int argc, char **argv) {
     else if (a == "--slots") slots = static_cast<clio::run::u32>(next());
     else if (a == "--compressed") compressed = true;
     else if (a == "--no-prefetch") prefetch = 0;
+    else if (a == "--yieldable") yieldable = true;
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
                    "usage: %s [--blocks N] [--hbm-mb M] [--pages P] "
-                   "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n",
+                   "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n"
+                   "       [--yieldable]  block-collective faults, parallel page reads\n",
                    argv[0]);
       return 0;
     }
@@ -264,13 +337,26 @@ int main(int argc, char **argv) {
   }
 
   double best_gbps = 0.0;
+  clio::run::u32 rounds = 0;
   clio::run::u64 best_ms = 0;
   bool ok = true;
   for (int r = 0; r < repeat; ++r) {
     cudaMemset(d_sum, 0, sizeof(unsigned long long));
     const clio::run::u64 t0 = NowMs();
-    WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, kPageElems,
-                                  prefetch, d_sum);
+    if (yieldable) {
+      gy::Yieldable<> drv(blocks, 32);
+      gy::YieldStack ystack(blocks, 32, 256);
+      rounds = drv.RunToCompletion(
+          [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+            WeightsKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                gpu_info, vec.GetDevice(0), per, kPageElems, d_sum, view,
+                ystack.View());
+          },
+          []{}, /*max_rounds=*/200000);
+    } else {
+      WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, kPageElems,
+                                    prefetch, d_sum);
+    }
     if (cudaDeviceSynchronize() != cudaSuccess) {
       std::fprintf(stderr, "bench: kernel failed\n");
       return 1;
@@ -291,15 +377,16 @@ int main(int argc, char **argv) {
   cudaFree(d_sum);
 
   std::fprintf(stderr,
-               "GVW mode=%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
+               "GVW mode=%s%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
                "logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
-               "checksum=%s\n",
-               compressed ? "lz4" : "raw", blocks,
+               "checksum=%s rounds=%u\n",
+               compressed ? "lz4" : "raw", yieldable ? "+yield" : "", blocks,
                (unsigned long long) hbm_mb, slots,
                (unsigned long long) (n / kPageElems),
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
-               (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH");
+               (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
+               rounds);
   return ok ? 0 : 1;
 }
 
