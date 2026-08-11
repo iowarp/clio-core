@@ -59,6 +59,19 @@ __device__ __forceinline__ size_t SlotBase(unsigned slot) {
   return ((size_t)blockIdx.x * CACHE_PAGES + slot) * PAGE_ELEMS;
 }
 
+// ---------------- RESIDENT: the whole model is already in GPU memory ----
+// No paging, no faults, no yield machinery. The ceiling this is measured
+// against, and what you get if the model simply fits.
+__global__ void KResident(const float *model, const float *act, float *out) {
+  float acc = 0.0f;
+  for (unsigned p = 0; p < MODEL_PAGES; ++p) {
+    const size_t base = ((size_t)blockIdx.x * MODEL_PAGES + p) * PAGE_ELEMS;
+    for (unsigned e = threadIdx.x; e < PAGE_ELEMS; e += THREADS)
+      acc += model[base + e] * act[e];
+  }
+  out[Gid()] = acc;
+}
+
 // ---------------- SWITCH ----------------
 struct Frame { unsigned point_; unsigned p_; float acc_; unsigned pad_; };
 __device__ Frame g_frames[NLANE];
@@ -147,6 +160,8 @@ __global__ void KCoroResume(void **saved, int *pending) {
   if (threadIdx.x == 0) pending[blockIdx.x] = any;
 }
 
+static float g_resident_ms = 0.0f;
+
 int main() {
   const size_t page_bytes = (size_t)PAGE_ELEMS * sizeof(float);
   const size_t model_bytes = (size_t)BLOCKS * MODEL_PAGES * page_bytes;
@@ -221,6 +236,24 @@ int main() {
     }
   }
 
+  // Ceiling: the same arithmetic with the model resident in GPU memory.
+  float *d_full = nullptr;
+  const bool have_full = (cudaMalloc(&d_full, model_bytes) == cudaSuccess);
+  if (have_full) {
+    cudaMemcpy(d_full, h_model, model_bytes, cudaMemcpyHostToDevice);
+    KResident<<<BLOCKS, THREADS>>>(d_full, d_act, d_out);
+    cudaDeviceSynchronize();
+    cudaEvent_t a, b2; cudaEventCreate(&a); cudaEventCreate(&b2);
+    cudaEventRecord(a);
+    for (int r = 0; r < 10; ++r) KResident<<<BLOCKS, THREADS>>>(d_full, d_act, d_out);
+    cudaEventRecord(b2); cudaEventSynchronize(b2);
+    float ms = 0; cudaEventElapsedTime(&ms, a, b2); ms /= 10;
+    printf("  %-9s %8.2f ms   rounds=  1   read=%.0f MB   %.2f GB/s (device memory)\n",
+           "RESIDENT", ms, model_bytes / 1048576.0,
+           (model_bytes / 1073741824.0) / (ms / 1000.0));
+    g_resident_ms = ms;
+  }
+
   const int REPS = 3;
   for (int variant = 0; variant < 2; ++variant) {
     const char *name = variant == 0 ? "SWITCH" : "CORO";
@@ -252,9 +285,11 @@ int main() {
       rounds_seen = rounds; bytes_seen = bytes;
       cudaEventDestroy(a); cudaEventDestroy(b2);
     }
-    printf("  %-7s %8.2f ms   rounds=%3d   fetched=%.0f MB   %.2f GB/s effective\n",
+    printf("  %-9s %8.2f ms   rounds=%3d   fetched=%.0f MB   %.2f GB/s effective"
+           "   %.1fx resident\n",
            name, best, rounds_seen, bytes_seen / 1048576.0,
-           (bytes_seen / 1073741824.0) / (best / 1000.0));
+           (bytes_seen / 1073741824.0) / (best / 1000.0),
+           g_resident_ms > 0 ? best / g_resident_ms : 0.0);
   }
   return 0;
 }
