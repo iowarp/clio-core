@@ -286,6 +286,38 @@ class Vector {
     (void) decode_in_kernel;
     const bool encoded = compress_lib_ != 0;
     if (encoded) {
+      // Encoded tags get NO offset map -- but they DO get the stored-size
+      // table. It is the run-fetch's existence proof: a page with a known
+      // stored size has been written and can safely be part of a multi-get
+      // run, while during SEEDING the table does not exist yet, so runs are
+      // structurally off and first-touch write-allocate keeps its slots.
+      // (Run-faulting without this gate livelocked the seed at 459600
+      // rounds: every fault's run claimed slots for first-touch gets that
+      // all fail, and concurrent runs evicted write-allocate slots mid-write.)
+      const auto &eh = devs_.begin()->second.hdr;
+      const clio::run::u64 enp = NumPagesOf(eh);
+      if (enp != 0) {
+        std::vector<unsigned long long> esz(enp, 0);
+        for (clio::run::u64 pg = 0; pg < enp; ++pg) {
+          char name[32];
+          PageBlobName(pg, name);
+          unsigned long long p2 = 0, o2 = 0, s2 = 0;
+          if (clio_cte_locate(&tag_id_, name, &p2, &o2, &s2) == 0) {
+            esz[pg] = s2;
+          }
+        }
+        void *dev_esz = nullptr;
+        if (cudaMalloc(&dev_esz, enp * sizeof(unsigned long long)) ==
+            cudaSuccess) {
+          cudaMemcpy(dev_esz, esz.data(), enp * sizeof(unsigned long long),
+                     cudaMemcpyHostToDevice);
+          for (auto &kv : devs_) {
+            kv.second.hdr.stored_size_ =
+                static_cast<const unsigned long long *>(dev_esz);
+            PublishHeader(kv.second);
+          }
+        }
+      }
       return MapResult::kDisabled;
     }
     const auto &h0 = devs_.begin()->second.hdr;

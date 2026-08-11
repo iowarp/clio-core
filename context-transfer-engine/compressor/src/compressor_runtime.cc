@@ -1532,7 +1532,11 @@ void Runtime::BatchDrainLoop() {
           std::lock_guard<std::mutex> g(batch_mu_);
           q = batch_.size();
         }
-        if (q >= 32) break;
+        // A run-multi enqueues its ~16 records ATOMICALLY -- it already IS a
+        // batch, and holding it for more peers charged every multi the full
+        // linger. 8 chunks is where the per-launch cost is mostly amortized
+        // (151us fixed -> ~19us/chunk).
+        if (q >= 8) break;
         std::this_thread::sleep_for(std::chrono::microseconds(50));
       }
     }
@@ -3388,6 +3392,8 @@ clio::run::TaskResume Runtime::CompressPodMultiPutBlob(
 clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  const auto mg_t0 = std::chrono::steady_clock::now();
+
   {
     auto *ipc_manager = CLIO_CPU_IPC;
     task->num_ok_ = 0;
@@ -3487,6 +3493,18 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         task->num_ok_++;
       } else if (first_rc == 0) {
         first_rc = rc;
+      }
+    }
+    if (getenv("CLIO_CODEC_TIME")) {
+      static std::atomic<long long> mgn{0}, mgus{0}, mgpages{0};
+      mgus += std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - mg_t0).count();
+      mgpages += n;
+      const long long c = ++mgn;
+      if (c % 128 == 0) {
+        fprintf(stderr, "[TIME] multi n=%lld avg=%lldus avg_pages=%.1f\n", c,
+                mgus.load() / c, (double) mgpages.load() / c);
+        fflush(stderr);
       }
     }
     task->SetReturnCode(task->num_ok_ == n ? 0 : first_rc);

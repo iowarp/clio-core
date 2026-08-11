@@ -1037,17 +1037,27 @@ class DeviceVector {
       // compressor decodes it on the host's stream, batched with whatever
       // else is pending. No codec call in this file by design.
       //
-      // TRIED AND REVERTED: also issuing FetchPagesBatchedAsync here, to give
-      // the compressor a whole run to decode at once. It is inert at small
-      // cache sizes (the async batch slots are ceil(ppb/64)-1, so there are
-      // NONE below 128 pages per block) and harmful once they exist: a
-      // kPodMultiMax prefetch on every fault floods the cache with pages the
-      // block has not asked for, and during seeding it takes the slots the
-      // writer needs -- the seed stopped converging (459600 rounds, no put
-      // errors, i.e. livelock rather than out-of-space). Feeding the batched
-      // decoder needs a prefetch policy that knows the access pattern, not a
-      // blind window on the fault path.
-      BeginFetch(PageOf(off), /*is_prefetch=*/false);
+      // A DEMAND fetch: the access already happened. For an ENCODED tag,
+      // fault a RUN via ONE multi-get (BeginFetchRunLocked): nvcomp's
+      // batched decompress costs ~151us PER LAUNCH regardless of chunk
+      // count, so chunks-per-launch is the only number that matters, and a
+      // demand-directed run x the concurrent blocks is what fills launches.
+      // This is NOT the reverted blind prefetch: the run starts AT the
+      // faulted page, walks the direction the block is already reading, and
+      // ends the moment a slot claim declines -- it cannot starve a writer,
+      // because the claim refuses dirty victims and the run refuses to wait.
+      // Raw tags keep the single fetch; a DMA has no launch economics.
+      if (h_->compress_lib_ != 0) {
+        LockBlock();
+        const clio::run::u32 got =
+            BeginFetchRunLocked(PageOf(off), clio::cte::core::kPodMultiMax);
+        UnlockBlock();
+        if (got == 0 && !IsResident(PageOf(off))) {
+          BeginFetch(PageOf(off), /*is_prefetch=*/false);
+        }
+      } else {
+        BeginFetch(PageOf(off), /*is_prefetch=*/false);
+      }
     }
     // Hand the host the address of the completion flag this block is parked
     // on, so it can poll 4 bytes instead of relaunching the whole grid to ask.
@@ -1933,6 +1943,10 @@ class DeviceVector {
     for (clio::run::u32 k = 0; k < n; ++k) {
       const clio::run::u64 pg = first_page + k;
       if (pg >= npages_total) break;
+      // Existence proof required: no stored size means the page has never
+      // been written (or the table is not published yet, i.e. seeding), and
+      // a run of first-touch gets is how the seed livelocked.
+      if (h_->stored_size_ == nullptr || h_->stored_size_[pg] == 0) break;
       if (Find(pg) != nullptr) continue;      // resident or already coming
       const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
       if (slot == ~0u) break;                 // window pinned; run ends here
