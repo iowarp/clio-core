@@ -620,7 +620,15 @@ class DeviceVector {
       if (h_->tier_chunk_off_ == nullptr) {
         pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
       }
-      if (!pgi.fetching && !pgi.flushing && !pgi.rescoring &&
+      // `dirty` belongs in this test. This path DROPS its victim outright --
+      // it does not write it back -- on the stated assumption that "weights
+      // are read-only here, dirty is never set on this path". That holds for
+      // an inference table and for nothing else: the same claim serves the
+      // prefetch and the batched fetch, both reachable from a read-WRITE
+      // workload, and dropping a dirty page there discards the only copy of
+      // its writes. Skipping dirty victims costs at worst a declined claim,
+      // which the caller already handles; the alternative is silent loss.
+      if (!pgi.fetching && !pgi.flushing && !pgi.rescoring && !pgi.dirty &&
           pgi.score < best) {
         best = pgi.score;
         victim = i;
@@ -629,8 +637,8 @@ class DeviceVector {
     if (victim == ~0u) {
       return ~0u;
     }
-    // Weights are read-only here (dirty is never set on this path); dropping
-    // the clean victim is a metadata write.
+    // The victim is CLEAN (guaranteed above), so dropping it is a metadata
+    // write and loses nothing.
     tbl[victim].page_num = kNoPage;
     Bump(h_->stat_evicts_);
     return victim;

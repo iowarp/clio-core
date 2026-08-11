@@ -189,6 +189,53 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YEND();
 }
 
+/**
+ * Dirty every page, then force the claim path to look for a slot.
+ *
+ * The claim used by BeginFetch (and by the batched fetch) picks its victim on
+ * score alone and DROPS it without writing it back, which is only safe when
+ * the victim is clean. Here every page is dirty and unflushed, so a claim
+ * that ignores `dirty` discards the only copy of those writes and the
+ * host-side verification fails.
+ */
+__global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<clio::run::u32> v,
+                                 clio::run::u64 per, clio::run::u64 page_elems,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+  const clio::run::u64 npages = per / page_elems;
+
+  CLIO_YBEGIN();
+  for (; off < per; off += run) {
+    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + off + k] = Seed(base + off + k);
+    }
+    // Ask for a page far ahead while THIS one is still dirty. With the cache
+    // full of dirty pages the claim must decline; if it evicts one anyway,
+    // those writes are gone.
+    if (threadIdx.x == 0) {
+      const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
+      v.BeginFetch(base / page_elems + ahead);
+    }
+    __syncthreads();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
@@ -315,6 +362,60 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
                  (unsigned long long) (n / kPageElems), got, want);
     REQUIRE(got == want);
   }
+}
+
+TEST_CASE("gpu_vector: a slot claim must not drop a DIRTY page",
+          "[gpu_vector][workloads][dirty-claim]") {
+  // Reuses the runtime the case above initialised: CLIO_INIT is once per
+  // PROCESS and a second one hangs.
+  clio::run::IpcManagerGpuInfo gi =
+      CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+  const unsigned kBlocks = 2;
+  const clio::run::u64 kPagesPerBlock = 8;
+  const clio::run::u32 kSlots = 3;   // far fewer slots than pages, so claims
+                                     // really do have to find a victim
+  const clio::run::u64 per = kPagesPerBlock * kPageElems;
+  const clio::run::u64 n = per * kBlocks;
+
+  gv::Vector<clio::run::u32> vec("gv_dirty_claim", {0}, kPageBytes, kBlocks,
+                                 kSlots, n);
+  vec.EnableStats();
+  RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                            gy::YieldStackView sv) {
+    DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
+                                                      per, kPageElems, vw, sv);
+  });
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  const auto st = vec.ReadStats(0);
+  std::fprintf(stderr,
+               "  [dirty-claim] faults=%llu puts=%llu evicts=%llu "
+               "put_errors=%llu\n",
+               (unsigned long long) st.faults, (unsigned long long) st.puts,
+               (unsigned long long) st.evicts,
+               (unsigned long long) st.put_errors);
+  REQUIRE(st.put_errors == 0);
+
+  // Every element must come back from the CTE with the value written. A claim
+  // that dropped a dirty victim loses a whole page of them.
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  std::vector<clio::run::u32> buf(static_cast<size_t>(kPageElems), 0u);
+  clio::run::u64 mismatches = 0;
+  for (clio::run::u64 pg = 0; pg < n / kPageElems; ++pg) {
+    char name[32];
+    gv::PageBlobName(pg, name);
+    auto rd = core.AsyncGetBlob(vec.TagId(), name, 0, kPageBytes, 0,
+                                reinterpret_cast<char *>(buf.data()));
+    rd.Wait();
+    REQUIRE(rd->GetReturnCode() == 0);
+    for (clio::run::u64 i = 0; i < kPageElems; ++i) {
+      if (buf[static_cast<size_t>(i)] != Seed(pg * kPageElems + i)) {
+        ++mismatches;
+      }
+    }
+  }
+  std::fprintf(stderr, "  [dirty-claim] mismatches=%llu\n",
+               (unsigned long long) mismatches);
+  REQUIRE(mismatches == 0);
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
