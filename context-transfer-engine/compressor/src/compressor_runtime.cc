@@ -837,7 +837,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     size_t header_size = sizeof(CompressionHeader);
     size_t total_stored_size = compressed_size + header_size;
 
-    if (success && total_stored_size < input_size) {
+    // Same meaningful-gain bar as CompressIntoShm (see there): marginal
+    // compression charges every reader a decompress for ~no capacity.
+    if (success && total_stored_size < input_size - input_size / 8) {
       // Compression succeeded and reduced size (including header overhead)
       compressed_buffer.resize(compressed_size);
 
@@ -1816,9 +1818,16 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
     return false;
   }
   size_t total = compressed_size + header_size;
-  if (total >= size) {
+  // MEANINGFUL gain required, not any gain. Every reader of a compressed
+  // blob pays a decompress; on the gpu_vector device-tier path that is an
+  // in-kernel decode per page fault. Storing at 93% of raw was measured to
+  // double a paged eval for a ~7% capacity win — a straight loss for any
+  // consumer. An eighth is a deliberately conservative bar: genuinely
+  // compressible data (<=87.5%) sails through, marginal data stays raw and
+  // (on device tiers) zero-copy mappable.
+  if (total >= size - size / 8) {
     CLIO_IPC->FreeBuffer(shm);
-    return false;  // not beneficial — caller stores raw
+    return false;  // not beneficial enough — caller stores raw
   }
   CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size,
                            compressed_size);

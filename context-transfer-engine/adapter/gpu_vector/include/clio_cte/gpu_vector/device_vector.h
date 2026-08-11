@@ -760,6 +760,13 @@ class DeviceVector {
            h_->tier_chunk_off_[pg * h_->tier_chunks_per_page_] != ~0ull;
   }
 
+  /** Lock-free residency probe. RACY BY DESIGN: a concurrent claim can
+   *  make it misread one page — callers only use it to decide whether a
+   *  batched fault phase is worth entering, where either error is safe. */
+  CTP_GPU_FUN bool ProbeResident(clio::run::u64 pg) const {
+    return Find(pg) != nullptr;
+  }
+
   /** @return true when every page of [first, first+n) resolves without the
    *  CPU: identity-mapped (zero-copy) or encoded-mapped (in-kernel decode). */
   CTP_GPU_FUN bool RangeFullyMapped(clio::run::u64 first,
