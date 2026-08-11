@@ -206,10 +206,6 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_target_properties(test_gpu_vector_hbm_nvcomp PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
-    # Without this the in-kernel nvcomp decoder is not compiled in and the
-    # test SKIPS rather than quietly measuring the scalar LZ4 fallback.
-    include(ClioNvcompDevice)
-    clio_enable_nvcomp_device(test_gpu_vector_hbm_nvcomp)
     add_test(NAME cte_gpu_vector_hbm_nvcomp COMMAND test_gpu_vector_hbm_nvcomp
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

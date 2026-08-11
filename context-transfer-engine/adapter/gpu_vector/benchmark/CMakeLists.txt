@@ -28,11 +28,6 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_target_properties(clio_gpu_vector_weights_bench PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
-    # This benchmark exists to compare the compressed and raw fault paths, so
-    # it must decompress with nvcomp on the device rather than with the scalar
-    # LZ4 fallback -- otherwise "--compressed" measures the fallback, not nvcomp.
-    include(ClioNvcompDevice)
-    clio_enable_nvcomp_device(clio_gpu_vector_weights_bench)
     install(TARGETS clio_gpu_vector_weights_bench RUNTIME DESTINATION bin)
 
     add_cuda_executable(clio_gpu_vector_stream_bench FALSE

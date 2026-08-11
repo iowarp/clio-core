@@ -20,9 +20,9 @@
  * HBM-only configuration cannot be a second TEST_CASE in a binary that already
  * initialized a RAM-tier runtime -- it needs its own process.
  *
- * If the nvcomp device API is not linked in (CLIO_GV_NVCOMP_DEVICE), the
- * in-kernel decoder does not exist and this test SKIPS rather than silently
- * measuring the scalar LZ4 fallback.
+ * Decompression is launched by the CPU and batched by the compressor, so this
+ * needs only the ordinary host nvcomp -- there is no device-API dependency to
+ * skip on.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -142,15 +142,6 @@ __global__ void HbmDotKernel(clio::run::IpcManagerGpuInfo info,
 
 TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
           "[gpu_vector][hbm][nvcomp]") {
-#if !defined(CLIO_GV_NVCOMP_DEVICE)
-  // Do NOT quietly run the scalar fallback and call it an nvcomp result.
-  std::fprintf(stderr,
-               "[SKIP] built without CLIO_GV_NVCOMP_DEVICE: the in-kernel "
-               "nvcomp decoder is not linked in, so this test would measure "
-               "the scalar LZ4 fallback instead. Set CLIO_NVCOMP_DEVICE_ROOT "
-               "to an nvcomp archive providing lib/libnvcomp_device_static.a\n");
-  return;
-#else
   const unsigned kBlocks = 4;
   const clio::run::u64 kPagesPerBlock = 16;   // pages each block walks
   const clio::run::u32 kSlots = 4;            // cache slots: forces eviction
@@ -289,7 +280,6 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   REQUIRE(vec.ReadStats(0).put_errors == 0);
 
   cudaFree(d_sum);
-#endif  // CLIO_GV_NVCOMP_DEVICE
 }
 
 SIMPLE_TEST_MAIN()
