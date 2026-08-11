@@ -420,6 +420,22 @@ private:
   void *ModuleStream();
   void *module_stream_ = nullptr;
 
+  /**
+   * The module's stream POOL, created once at first use.
+   *
+   * MEASURED: nvcomp's batched decompress costs ~151us per launch on one
+   * stream, and that cost is kernel DURATION, not host overhead -- it
+   * overlaps almost perfectly across streams (150.6 / 77.0 / 39.7 / 20.9 us
+   * effective at 1/2/4/8 streams). Serializing every decode on a single
+   * stream was the whole reason the compressed fault path lost to raw. A
+   * fixed pool created once is still "one set of streams for the module",
+   * not a stream per compression.
+   */
+  static constexpr size_t kModuleStreams = 8;
+  void *module_streams_[kModuleStreams] = {};
+  std::atomic<unsigned> module_stream_rr_{0};
+  void *ModuleStreamRR();
+
   // ---- persistent state for the batched decoder (drain thread ONLY) ----
   //
   // The first implementation paid, PER DRAIN: one cudaStreamSynchronize per
@@ -545,6 +561,11 @@ private:
     void *pin = nullptr;
     void *dev = nullptr;
     void *ev = nullptr;      // cudaEvent_t
+    void *ev0 = nullptr;     // timing event at launch, for diagnostics
+    /** Per-slot nvcomp temp: launches on DIFFERENT streams run concurrently
+     *  and cannot share scratch the way the serialized design could. */
+    void *temp = nullptr;
+    size_t temp_cap = 0;
     size_t nch = 0;
     std::vector<size_t> item_first;
     std::vector<size_t> item_n;

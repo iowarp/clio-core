@@ -1785,6 +1785,30 @@ bool ParseBlobChunks(const unsigned char *hdr, size_t hdr_len,
  *
  * @return number of items decoded; `ok[i]` says which.
  */
+void *Runtime::ModuleStreamRR() {
+#if CTP_ENABLE_GPU
+  if (module_streams_[0] == nullptr) {
+    for (size_t i = 0; i < kModuleStreams; ++i) {
+      // NON-BLOCKING: the vector's grid relaunches go to the LEGACY default
+      // stream, and every such launch is a device-wide barrier that fences
+      // ordinary streams -- which stopped the pool's kernels from
+      // overlapping at all (measured span ~600us for ~151us of work).
+      // Non-blocking streams are exempt from legacy-stream synchronization.
+      cudaStream_t st = nullptr;
+      if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) ==
+          cudaSuccess) {
+        module_streams_[i] = st;
+      }
+    }
+  }
+  const unsigned k =
+      module_stream_rr_.fetch_add(1, std::memory_order_relaxed);
+  return module_streams_[k % kModuleStreams];
+#else
+  return nullptr;
+#endif
+}
+
 void *Runtime::ModuleStream() {
 #if CTP_ENABLE_GPU
   if (module_stream_ == nullptr) {
@@ -1840,9 +1864,14 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
     std::lock_guard<std::mutex> g(dslot_mu_);
     sl.busy = false;
   };
-  CodecCtxGuard guard(codec_ctx_);
-  cudaStream_t stream =
-      guard.ok() ? static_cast<cudaStream_t>(ModuleStream()) : nullptr;
+  // PRIMARY context, deliberately. The dedicated codec context predates
+  // yielding: it existed so codec kernels could launch while a faulting
+  // kernel spun in the primary context. Yielding removed that -- the device
+  // is free between rounds -- and keeping the codec in a SECOND context
+  // forces the driver to TIMESLICE between contexts: the measured GPU span
+  // of a ~151us decode was ~680us in situ, purely from context switching.
+  // (It is also why a 44KB H2D in the codec context once measured 2.1ms.)
+  cudaStream_t stream = static_cast<cudaStream_t>(ModuleStreamRR());
   if (stream == nullptr) { release(); return -1; }
   if (sl.pin == nullptr && cudaMallocHost(&sl.pin, arena) != cudaSuccess) {
     sl.pin = nullptr; release(); return -1;
@@ -1850,10 +1879,14 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
   if (sl.dev == nullptr && cudaMalloc(&sl.dev, arena) != cudaSuccess) {
     sl.dev = nullptr; release(); return -1;
   }
-  if (sl.ev == nullptr &&
-      cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(&sl.ev),
-                               cudaEventDisableTiming) != cudaSuccess) {
-    sl.ev = nullptr; release(); return -1;
+  if (sl.ev == nullptr) {
+    const unsigned f = getenv("CLIO_CODEC_TIME") != nullptr
+                           ? 0u                       // timing-enabled
+                           : cudaEventDisableTiming;
+    if (cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(&sl.ev),
+                                 f) != cudaSuccess) {
+      sl.ev = nullptr; release(); return -1;
+    }
   }
 
   // Fixed strides (kSlotMaxChunks), so host and device layouts can never
@@ -1895,10 +1928,18 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
   auto *d_optr = reinterpret_cast<void **>(dev + C * 24);
   auto *d_osz = reinterpret_cast<size_t *>(dev + C * 32);
   auto *d_status = reinterpret_cast<nvcompStatus_t *>(dev + C * 40);
+  if (getenv("CLIO_CODEC_TIME") != nullptr) {
+    if (sl.ev0 == nullptr) {
+      cudaEventCreate(reinterpret_cast<cudaEvent_t *>(&sl.ev0));
+    }
+    cudaEventRecord(static_cast<cudaEvent_t>(sl.ev0), stream);
+  }
   cudaMemcpyAsync(dev, pin, C * 32, cudaMemcpyHostToDevice, stream);
   cudaMemsetAsync(dev + C * 32, 0, C * 8 + C * st_sz, stream);
   {
-    // Shared temp: single stream => the kernels using it are serialized.
+    // Temp requirement: high-water cached globally (mutex); the BUFFER is per
+    // slot, because launches on different streams overlap and cannot share
+    // scratch.
     std::lock_guard<std::mutex> g(dslot_mu_);
     if (w > dtemp_hw_nch_ || max_unc > dtemp_hw_unc_) {
       size_t tb = 0;
@@ -1910,20 +1951,20 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
       dtemp_hw_nch_ = w;
       dtemp_hw_unc_ = max_unc;
       dtemp_bytes_ = tb;
-      if (tb > dtemp_cap_) {
-        if (dtemp_ != nullptr) cudaFree(dtemp_);
-        dtemp_cap_ = tb * 2;
-        if (cudaMalloc(&dtemp_, dtemp_cap_) != cudaSuccess) {
-          dtemp_ = nullptr;
-          dtemp_cap_ = 0;
-          release();
-          return -1;
-        }
-      }
+    }
+  }
+  if (dtemp_bytes_ > sl.temp_cap) {
+    if (sl.temp != nullptr) cudaFree(sl.temp);
+    sl.temp_cap = dtemp_bytes_ * 2;
+    if (cudaMalloc(&sl.temp, sl.temp_cap) != cudaSuccess) {
+      sl.temp = nullptr;
+      sl.temp_cap = 0;
+      release();
+      return -1;
     }
   }
   if (!NvcompBatchedDecompressImpl(wire, d_cptr, d_csz, d_obytes, d_osz, w,
-                                   dtemp_, dtemp_bytes_, d_optr, d_status,
+                                   sl.temp, dtemp_bytes_, d_optr, d_status,
                                    stream)) {
     release();
     return -1;
@@ -2005,8 +2046,7 @@ int Runtime::DecompPoll(int slot, char *ok_out, size_t n) {
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
   if (slot < 0 || slot >= static_cast<int>(kDecompSlots)) return 0;
   DecompSlot &sl = dslots_[slot];
-  CodecCtxGuard guard(codec_ctx_);
-  if (!guard.ok()) return 0;
+  // Primary context; see LaunchDecompOne.
   const cudaError_t q = cudaEventQuery(static_cast<cudaEvent_t>(sl.ev));
   if (q == cudaErrorNotReady) return -1;   // caller yields and asks again
   const char *pin = static_cast<const char *>(sl.pin);
@@ -2015,6 +2055,21 @@ int Runtime::DecompPoll(int slot, char *ok_out, size_t n) {
   const auto *h_osz = reinterpret_cast<const size_t *>(pin + C * 32);
   const auto *h_status =
       reinterpret_cast<const nvcompStatus_t *>(pin + C * 40);
+  if (getenv("CLIO_CODEC_TIME") != nullptr && sl.ev0 != nullptr &&
+      q == cudaSuccess) {
+    float gms = 0.0f;
+    if (cudaEventElapsedTime(&gms, static_cast<cudaEvent_t>(sl.ev0),
+                             static_cast<cudaEvent_t>(sl.ev)) == cudaSuccess) {
+      static std::atomic<long long> gn{0}, gus{0};
+      gus += static_cast<long long>(gms * 1000.0f);
+      const long long c = ++gn;
+      if (c % 256 == 0) {
+        fprintf(stderr, "[TIME] gpu-span avg=%lldus (n=%lld)\n",
+                gus.load() / c, c);
+        fflush(stderr);
+      }
+    }
+  }
   int all = (q == cudaSuccess) ? 1 : 0;
   for (size_t i = 0; i < sl.item_first.size(); ++i) {
     bool good = (q == cudaSuccess) && sl.item_n[i] != 0;
@@ -2061,9 +2116,11 @@ bool Runtime::LaunchDecompBatch(
   }
   if (seg == nullptr) return false;   // caller retires and retries
 
-  CodecCtxGuard guard(codec_ctx_);
-  cudaStream_t stream =
-      guard.ok() ? static_cast<cudaStream_t>(ModuleStream()) : nullptr;
+  // Primary context + the non-blocking stream POOL: the dedicated codec
+  // context predates yielding and only added context-switch stalls, and a
+  // single stream serialized ~151us kernels that overlap almost perfectly
+  // across streams (150.6 -> 20.9us effective at 8).
+  cudaStream_t stream = static_cast<cudaStream_t>(ModuleStreamRR());
   auto fail_all = [&]() {
     for (auto &pd : owners) pd->done.store(true, std::memory_order_release);
     return true;
@@ -2315,14 +2372,9 @@ size_t Runtime::RetireBatches() {
   bool any = false;
   for (auto &seg : bd_segs_) any = any || seg.busy;
   if (!any) return 0;
-  // The module stream -- and therefore its events -- live in codec_ctx_.
-  // Querying an event from outside its context does not report "not ready",
-  // it reports an ERROR, and treating that as not-ready left every segment
-  // busy forever: nothing retired, every waiter timed out into the fallback
-  // path, and abandoned scratch was reused under an in-flight batch
-  // (checksum MISMATCH). The guard must wrap the query.
-  CodecCtxGuard guard(codec_ctx_);
-  if (!guard.ok()) return 0;
+  // Everything on this path lives in the PRIMARY context now; no guard.
+  // (Historical: when it lived in codec_ctx_, an unguarded query reported an
+  // ERROR rather than not-ready, and every segment wedged busy forever.)
   for (auto &seg : bd_segs_) {
     if (!seg.busy) continue;
     const cudaError_t q = cudaEventQuery(static_cast<cudaEvent_t>(seg.ev));
@@ -3140,7 +3192,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                 ++spins;
               }
               if (req->done.load(std::memory_order_acquire) && req->ok) {
-                // done means the launch's event fired: the GPU is finished
+                // done means the batch's event fired: the GPU is finished
                 // with the scratch.
                 ReleaseGpuScratch(dscratch);
                 task->return_code_ = 0;

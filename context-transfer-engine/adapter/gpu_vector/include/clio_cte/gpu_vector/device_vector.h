@@ -1096,6 +1096,16 @@ class DeviceVector {
     if (p == nullptr || !p->fetching) {
       return 0;
     }
+    if (p->fetching == 2u) {
+      // Run-fetched: the page's own future is stale; the thing to wait for
+      // is the multi carrying it.
+      MultiBatch *mb = BlockBatches();
+      if (mb[0].async_pending != 0u && !mb[0].get_fut.IsNull()) {
+        return reinterpret_cast<clio::run::u64>(
+            &mb[0].get_fut.get()->fut_.is_complete_.x);
+      }
+      return 0;
+    }
     return reinterpret_cast<clio::run::u64>(&p->get->fut_.is_complete_.x);
   }
 
@@ -1718,6 +1728,8 @@ class DeviceVector {
     if (h_->multi_ == nullptr) return;
     const clio::run::u32 cnt = AsyncSlotCount();
     for (clio::run::u32 k = 0; k < cnt; ++k) SettleOneLocked(AsyncBatchSlot(k));
+    // The run-fetch (BeginFetchRunLocked) parks its batch on the SYNC slot.
+    if (h_->multi_ != nullptr) SettleOneLocked(&BlockBatches()[0]);
   }
 
   /** Async batched fetch body; see FetchPagesBatchedAsync. Lock held. */
@@ -1874,6 +1886,68 @@ class DeviceVector {
       }
     }
     return resident + ok;
+  }
+
+  /**
+   * Fault a RUN of pages with ONE multi-get, without waiting.
+   *
+   * This is what lets the CPU-side decoder batch. nvcomp's batched
+   * decompress costs ~151us PER LAUNCH regardless of chunk count (2.4us per
+   * chunk at 64), so single-page faults can never be competitive at scale:
+   * the launch count is the cost. A run of pages per fault, multiplied by
+   * the concurrent faulting blocks, is what fills 64-chunk launches.
+   *
+   * Uses the SYNC multi slot (mb[0]) exactly as FetchPagesBatched does, but
+   * Sends without Waiting: pages are marked fetching=2 and the batch is
+   * settled by the same SettleBatchLocked machinery that serves the async
+   * prefetch slots. Declines (returns 0) when mb[0] is still carrying a
+   * previous run. Caller holds the block lock.
+   */
+  CTP_GPU_FUN clio::run::u32 BeginFetchRunLocked(clio::run::u64 first_page,
+                                                 clio::run::u32 n) {
+    if (h_->multi_ == nullptr) return 0;
+    MultiBatch *mb = BlockBatches();
+    if (mb[0].async_pending != 0u) {
+      if (!MultiGetDone(&mb[0])) return 0;   // previous run still in flight
+      SettleOneLocked(&mb[0]);
+    }
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    if (n > h_->pages_per_block_) n = h_->pages_per_block_;
+    const clio::run::u64 npages_total =
+        (h_->size_ + h_->elems_per_page_ - 1) / h_->elems_per_page_;
+    Page *tbl = BlockPages();
+    PrepareMultiGet(mb[0].get);
+    clio::run::u32 filled = 0;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first_page + k;
+      if (pg >= npages_total) break;
+      if (Find(pg) != nullptr) continue;      // resident or already coming
+      const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
+      if (slot == ~0u) break;                 // window pinned; run ends here
+      Page *np = &tbl[slot];
+      np->gen += 1u;
+      np->fetching = 2u;                      // settled via SettleBatchLocked
+      __threadfence();
+      np->page_num = pg;
+      np->dirty = 0u;
+      np->flushing = 0u;
+      np->evicting = 0u;
+      np->score = 2.0f;
+      np->last_access = Now();
+      char name[32];
+      PageBlobName(pg, name);
+      mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      mb[0].page_slot[filled] = slot;
+      ++filled;
+      Bump(h_->stat_faults_);
+      if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
+    }
+    if (filled == 0) return 0;
+    mb[0].async_n = filled;
+    mb[0].async_pending = 1u;
+    mb[0].get_fut =
+        clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(mb[0].get));
+    return filled;
   }
 
   CTP_GPU_FUN void AwaitPut(Page *p) {
