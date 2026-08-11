@@ -481,12 +481,17 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
       {"text", 1024 * 1024},    {"random", 64 * 1024},
   };
 
-  // Wire ids only reachable through the wider (11 compressor) action space
-  // NeuroPressCandidateStats draws from -- the old hardcoded list in
-  // EstCompressionStats() never emits any of these.
-  const std::set<int> kOnlyViaWiderActionSpace = {
-      CompLib::BLOSC2, CompLib::FPZIP, CompLib::LZMA,
-      CompLib::SNAPPY, CompLib::SZ3,   CompLib::ZFP};
+  // Wire ids only reachable through the wider action space
+  // NeuroPressCandidateStats draws from (11 CPU compressors + the full GPU
+  // action space -- nvcomp's 8 algorithms, cuSZ, ndzip, cuSZp, zfp-sycl) --
+  // the old hardcoded candidate_lib_configs list in EstCompressionStats()
+  // only ever emits {1 bzip2, 4 lz4, 9 zlib, 10 zstd} (wire id 0 excluded:
+  // it's BestCompressRatio's "nothing beat ratio 1.0" fallback sentinel as
+  // well as brotli's real wire id, so seeing it alone wouldn't prove
+  // anything). Anything else -- including a GPU pick, which is an even
+  // stronger signal that NeuroPress's own ranking (not the old heuristic)
+  // actually ran -- proves the wider space was reached.
+  const std::set<int> kOldHardcodedOrAmbiguous = {0, 1, 4, 9, 10};
 
   std::set<int> observed_libs;
   for (const auto &trial : trials) {
@@ -513,7 +518,7 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
 
   bool reached_wider_action_space = false;
   for (int lib : observed_libs) {
-    if (kOnlyViaWiderActionSpace.count(lib) > 0) {
+    if (kOldHardcodedOrAmbiguous.count(lib) == 0) {
       reached_wider_action_space = true;
       break;
     }

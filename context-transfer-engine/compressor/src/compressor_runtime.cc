@@ -53,6 +53,7 @@
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_cte/compressor/models/neuropress_bridge.h"
 
 namespace clio::cte::compressor {
 
@@ -178,7 +179,28 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
 #endif  // CLIO_COMPRESSOR_ENABLE_DENSE_NN
 
-  if (!qtable_predictor_ && !linreg_predictor_) {
+  // Load NeuroPress NN model if configured (issue #693 Cycle 3). Consulted
+  // first in EstCompressionStats()'s dynamic-selection path -- see there.
+  if (!config_.neuropress_model_path_.empty()) {
+    try {
+      HLOG(kDebug, "Loading NeuroPress NN model from: {}",
+           config_.neuropress_model_path_);
+      neuropress_predictor_ =
+          std::make_unique<ctp::compress::model::NeuroPressNNPredictor>();
+      if (neuropress_predictor_->Load(config_.neuropress_model_path_)) {
+        HLOG(kDebug, "NeuroPress NN model loaded successfully");
+      } else {
+        HLOG(kWarning, "Failed to load NeuroPress NN model from: {}",
+             config_.neuropress_model_path_);
+        neuropress_predictor_.reset();
+      }
+    } catch (const std::exception& e) {
+      HLOG(kError, "Exception while loading NeuroPress NN model: {}", e.what());
+      neuropress_predictor_.reset();
+    }
+  }
+
+  if (!qtable_predictor_ && !linreg_predictor_ && !neuropress_predictor_) {
     HLOG(kDebug,
          "No compression predictor configured, dynamic compression prediction "
          "disabled");
@@ -202,6 +224,7 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
     // Reset predictors
     qtable_predictor_.reset();
     linreg_predictor_.reset();
+    neuropress_predictor_.reset();
     // No distribution_classifier_ to reset
 
 #ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
@@ -315,6 +338,40 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   double second_derivative_mean =
       ctp::DataStatisticsFactory::CalculateSecondDerivative(
           chunk, num_elements, data_type);
+
+  // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
+  // qtable/dense-NN heuristics below -- it ranks the full
+  // clio_ctp::compress::model candidate set (11 CPU compressors x 3 presets,
+  // plus the 8-algorithm nvcomp GPU action space), not just this function's
+  // old 5-candidate hardcoded list.
+  if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+      neuropress_predictor_->IsReady()) {
+    bool data_type_float = (context.data_type_ == 1);
+    auto neuropress_stats = NeuroPressCandidateStats(
+        *neuropress_predictor_, chunk_size, entropy, mad,
+        second_derivative_mean, data_type_float);
+    // Apply the same PSNR filter the legacy per-candidate loop below uses,
+    // since NeuroPressCandidateStats itself is PSNR-agnostic (issue #693).
+    if (context.target_psnr_ > 0) {
+      std::vector<CompressionStats> filtered;
+      filtered.reserve(neuropress_stats.size());
+      for (const auto& stat : neuropress_stats) {
+        if (stat.psnr_db_ > 0 && stat.psnr_db_ < context.target_psnr_) continue;
+        filtered.push_back(stat);
+      }
+      neuropress_stats = std::move(filtered);
+    }
+    if (!neuropress_stats.empty()) {
+      HLOG(kDebug,
+           "NeuroPress dynamic selection: chunk_size={} entropy={} mad={} "
+           "-> top pick wire_id={} ({} candidates ranked)",
+           chunk_size, entropy, mad, neuropress_stats.front().compress_lib_,
+           neuropress_stats.size());
+      return neuropress_stats;
+    }
+    // Fall through to the legacy heuristics below if NeuroPress produced no
+    // usable candidates.
+  }
 
   // Determine candidate compression libraries and configs
   // Library IDs: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,

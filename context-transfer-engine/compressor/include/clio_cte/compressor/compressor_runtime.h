@@ -49,6 +49,7 @@
 #include <clio_cte/compressor/models/qtable_predictor.h>
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
+#include <clio_ctp/compress/model/neuropress_nn_predictor.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
 
@@ -265,6 +266,14 @@ private:
 #ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
   std::unique_ptr<DenseNNPredictor> nn_predictor_;
 #endif
+
+  // NeuroPress NN predictor (issue #693 Cycle 3). Consulted first in
+  // EstCompressionStats()'s dynamic-selection path when loaded/ready --
+  // it ranks the full clio_ctp::compress::model candidate set (CPU + GPU),
+  // not just the legacy 5-candidate hardcoded list qtable/nn_predictor
+  // choose among.
+  std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
+      neuropress_predictor_;
 
   // Compression telemetry ring buffer for performance monitoring
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
