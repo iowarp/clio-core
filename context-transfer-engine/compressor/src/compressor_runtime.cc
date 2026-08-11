@@ -55,6 +55,16 @@
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+// In-process blob locator, registered by the CTE core. Lets the compressor
+// find where a blob physically lives, which is how a page already resident on
+// a DEVICE tier is decoded straight out of that tier instead of being fetched
+// into scratch first.
+extern "C" int clio_cte_locate(const void *tag_id, const char *name,
+                               unsigned long long *pool_u64,
+                               unsigned long long *target_off,
+                               unsigned long long *stored_size);
+extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
 #if CTP_ENABLE_NVCOMP
 // The C batched entry points, from the ORDINARY host library. Every algorithm
 // exposes the same eleven-parameter signature, which is what lets one dispatch
@@ -2566,6 +2576,45 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       if (dst_probe.ptr_ != nullptr &&
           ctp::IsDeviceAccessible(dst_probe.ptr_)) {
+        // FIRST: is the blob already in device memory? If it is on a kHbm
+        // tier the bytes are right there, and fetching them into scratch
+        // would copy device memory to device memory for nothing -- two task
+        // round trips (GetBlobSize + GetBlob) to move data that never needed
+        // to move. Decode straight from the tier instead.
+        {
+          unsigned long long lpool = 0, loff = 0, lsz = 0;
+          if (clio_cte_locate(&task->tag_id_, task->blob_name_.str().c_str(),
+                              &lpool, &loff, &lsz) == 0 &&
+              lsz > sizeof(CompressionHeader)) {
+            char *tier = clio_direct_dev_base(lpool);
+            if (tier != nullptr) {
+              CompressionHeader thdr;
+              ctp::DeviceAwareMemcpy(&thdr, tier + loff, sizeof(thdr));
+              if (thdr.IsValid() && IsGpuCodec(thdr.compress_lib_)) {
+                auto req = std::make_shared<PendingDecomp>();
+                req->src_device = tier + loff;
+                req->stored_size = static_cast<size_t>(lsz);
+                req->dst = dst_probe.ptr_;
+                req->dst_bytes = static_cast<size_t>(task->size_);
+                {
+                  std::lock_guard<std::mutex> g(batch_mu_);
+                  batch_.push_back(req);
+                }
+                int tspins = 0;
+                while (!req->done.load(std::memory_order_acquire) &&
+                       tspins < kDecompWaitMaxSpins) {
+                  CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+                  ++tspins;
+                }
+                if (req->done.load(std::memory_order_acquire) && req->ok) {
+                  task->return_code_ = 0;
+                  CLIO_CO_RETURN;
+                }
+                req->abandoned.store(true, std::memory_order_release);
+              }
+            }
+          }
+        }
         char *dscratch = nullptr;
         for (int attempt = 0; attempt < 10000 && dscratch == nullptr;
              ++attempt) {
