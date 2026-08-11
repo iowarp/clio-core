@@ -1187,6 +1187,18 @@ class DeviceVector {
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
       if (p->fetching == 4u) continue;   // decode-pending; see AwaitFetch
+      if (p->fetching == 2u) {
+        // Run-fetched: the page's own future is STALE, so gating on it left
+        // landed runs unsettled here -- the block then churned through ~40
+        // resume/suspend rounds per multi until the stale flag happened to
+        // read complete. Ask the multi itself, and only settle when it is
+        // genuinely done (SettleOneLocked WAITS, which pre-yield must not).
+        MultiBatch *mb = BlockBatches();
+        if (mb[0].async_pending != 0u && MultiGetDone(&mb[0])) {
+          SettleOneLocked(&mb[0]);
+        }
+        continue;
+      }
       if (p->fetching && p->get->fut_.is_complete_.load() != 0) {
         // NOTE: a failed get is NOT freed here. First touch of a page that
         // does not exist yet fails by design, and the slot staying claimed is

@@ -1507,11 +1507,14 @@ void Runtime::BatchDrainLoop() {
     RetireBatches();
     bool busy = false;
     for (auto &c : bd_segs_) busy = busy || c.busy;
-    if (busy) {
-      // Let arrivals accumulate; poll tightly so retirement is prompt.
-      std::this_thread::sleep_for(std::chrono::microseconds(5));
-      continue;
-    }
+    // Launch WHILE batches are in flight -- up to kBatchSegs on the stream
+    // pool. Gating to one batch at a time serialized 6230 launches x ~600us
+    // spans into ~3.7s of the 2GB wall, with four segments and eight streams
+    // idle. (The old "pipelining is slower" result was real but measured at
+    // batches of 1.7, where publication latency dominated; at ~16-item
+    // batches the overlap wins.) The only remaining reason to pause is a
+    // completely empty queue.
+    (void) busy;
     // Linger BOUNDED and only while nothing is in flight: with the measured
     // ~151us fixed cost per nvcomp launch, a batch of 1 costs 60x more per
     // chunk than a batch of 64, so waiting a fraction of a launch's cost to
@@ -3115,20 +3118,21 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                               &lpool, &loff, &lsz) == 0 &&
               lsz > sizeof(CompressionHeader)) {
             char *tier = clio_direct_dev_base(lpool);
-            if (tier != nullptr) {
-              const size_t tsnap = std::min<size_t>(lsz, 4096);
-              std::vector<char> thsnap(tsnap);
-              ctp::DeviceAwareMemcpy(thsnap.data(), tier + loff, tsnap);
-              CompressionHeader thdr;
-              std::memcpy(&thdr, thsnap.data(),
-                          std::min(sizeof(thdr), thsnap.size()));
-              if (thdr.IsValid() && IsGpuCodec(thdr.compress_lib_)) {
+            // NO header snapshot here. It was a 4KB SYNCHRONOUS cudaMemcpy
+            // on the worker, per fault -- the one blocking device operation
+            // left on this path, and raw has nothing like it. The gate the
+            // header answered (is this a GPU-codec blob?) is already in the
+            // task CONTEXT, and the drain resolves chunk tables from its
+            // cache, or with ONE batched pinned read for new blobs. A page
+            // the compressor stored raw simply fails the parse there and
+            // falls back per-record.
+            if (tier != nullptr && IsGpuCodec(task->context_.compress_lib_)) {
+              {
                 // Launch OUR OWN decode and yield-poll its event: same shape
                 // as the raw path (worker enqueues its transfer, polls its
                 // flag). The drain-queue hop measured 580us/fault against
                 // raw's ~65us.
                 auto req = std::make_shared<PendingDecomp>();
-                req->stored_bytes = std::move(thsnap);
                 req->src_stable = true;
                 req->src_device = tier + loff;
                 req->stored_size = static_cast<size_t>(lsz);
@@ -3165,18 +3169,10 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
               ScratchShmPtr(dscratch), clio::run::PoolQuery::Local());
           CLIO_CO_AWAIT(dget);
           if (dget->GetReturnCode() == 0) {
-            // Snapshot the header REGION (not the payload): the drain
-            // parses the chunk table from these host bytes, so launching a
-            // batch needs no device read and no wait at all.
-            const size_t snap = std::min<size_t>(stored_size, 4096);
-            std::vector<char> hsnap(snap);
-            ctp::DeviceAwareMemcpy(hsnap.data(), dscratch, snap);
-            CompressionHeader dhdr;
-            std::memcpy(&dhdr, hsnap.data(),
-                        std::min(sizeof(dhdr), hsnap.size()));
-            if (dhdr.IsValid() && IsGpuCodec(dhdr.compress_lib_)) {
+            // No worker-side snapshot (a sync cudaMemcpy per fault); the
+            // drain reads headers batched and pinned, one wait per NEW blob.
+            if (IsGpuCodec(task->context_.compress_lib_)) {
               auto req = std::make_shared<PendingDecomp>();
-              req->stored_bytes = std::move(hsnap);
               req->src_device = dscratch;
               req->stored_size = stored_size;
               req->dst = dst_probe.ptr_;
@@ -3426,14 +3422,10 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       }
       char *tier = clio_direct_dev_base(lpool);
       if (tier == nullptr) continue;
-      const size_t msnap = std::min<size_t>(lsz, 4096);
-      std::vector<char> mhsnap(msnap);
-      ctp::DeviceAwareMemcpy(mhsnap.data(), tier + loff, msnap);
-      CompressionHeader thdr;
-      std::memcpy(&thdr, mhsnap.data(), std::min(sizeof(thdr), mhsnap.size()));
-      if (!thdr.IsValid() || !IsGpuCodec(thdr.compress_lib_)) continue;
+      // No snapshot: see the single-page site. The context carries the
+      // codec; the drain owns header parsing.
+      if (!IsGpuCodec(task->context_.compress_lib_)) continue;
       auto r = std::make_shared<PendingDecomp>();
-      r->stored_bytes = std::move(mhsnap);
       r->src_stable = true;      // the blob's home on the tier
       r->src_device = tier + loff;
       r->stored_size = static_cast<size_t>(lsz);
