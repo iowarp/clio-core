@@ -201,10 +201,26 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     {
       int dev_id = 0;
       cudaGetDevice(&dev_id);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+      // CUDA 13 retired the (advice, int device) overload: the location is now
+      // a cudaMemLocation, so passing a device id straight through no longer
+      // compiles. Same advice, spelled for the current toolkit.
+      cudaMemLocation host_loc{};
+      host_loc.type = cudaMemLocationTypeHost;
+      host_loc.id = 0;
+      cudaMemLocation dev_loc{};
+      dev_loc.type = cudaMemLocationTypeDevice;
+      dev_loc.id = dev_id;
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, host_loc);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_loc);
+#else
       cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
                     cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
       cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
                     cudaMemAdviseSetAccessedBy, dev_id);
+#endif
     }
 #endif
 
