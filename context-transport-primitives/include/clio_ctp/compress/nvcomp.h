@@ -38,6 +38,8 @@
 
 #include <cuda_runtime.h>
 #include <nvcomp/ans.hpp>
+#include <nvcomp/bitcomp.hpp>
+#include <nvcomp/cascaded.hpp>
 #include <nvcomp/deflate.hpp>
 #include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
@@ -66,6 +68,8 @@ enum class NvCompAlgo {
   GDEFLATE,
   DEFLATE,
   ANS,
+  CASCADED,
+  BITCOMP,
 };
 
 /**
@@ -256,24 +260,44 @@ class NvComp : public Compressor {
   /** Construct the nvcomp manager for the configured algorithm. */
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
     switch (algo_) {
+      // NOTE: nvcomp >= 5.x split each algorithm's single "DefaultOpts" into
+      // separate Compress/Decompress opts (discovered while adding Cascaded/
+      // Bitcomp below -- the single-opts symbols no longer exist and these
+      // 6 pre-existing cases failed to compile against the installed
+      // nvcomp 5.3.0.16; fixed here using the same two-opts pattern nvcomp
+      // itself now uses everywhere).
       case NvCompAlgo::LZ4:
         return std::make_shared<nvcomp::LZ4Manager>(
-            kChunkSize, nvcompBatchedLZ4DefaultOpts, stream);
+            kChunkSize, nvcompBatchedLZ4CompressDefaultOpts,
+            nvcompBatchedLZ4DecompressDefaultOpts, stream);
       case NvCompAlgo::SNAPPY:
         return std::make_shared<nvcomp::SnappyManager>(
-            kChunkSize, nvcompBatchedSnappyDefaultOpts, stream);
+            kChunkSize, nvcompBatchedSnappyCompressDefaultOpts,
+            nvcompBatchedSnappyDecompressDefaultOpts, stream);
       case NvCompAlgo::ZSTD:
         return std::make_shared<nvcomp::ZstdManager>(
-            kChunkSize, nvcompBatchedZstdDefaultOpts, stream);
+            kChunkSize, nvcompBatchedZstdCompressDefaultOpts,
+            nvcompBatchedZstdDecompressDefaultOpts, stream);
       case NvCompAlgo::GDEFLATE:
         return std::make_shared<nvcomp::GdeflateManager>(
-            kChunkSize, nvcompBatchedGdeflateDefaultOpts, stream);
+            kChunkSize, nvcompBatchedGdeflateCompressDefaultOpts,
+            nvcompBatchedGdeflateDecompressDefaultOpts, stream);
       case NvCompAlgo::DEFLATE:
         return std::make_shared<nvcomp::DeflateManager>(
-            kChunkSize, nvcompBatchedDeflateDefaultOpts, stream);
+            kChunkSize, nvcompBatchedDeflateCompressDefaultOpts,
+            nvcompBatchedDeflateDecompressDefaultOpts, stream);
       case NvCompAlgo::ANS:
         return std::make_shared<nvcomp::ANSManager>(
-            kChunkSize, nvcompBatchedANSDefaultOpts, stream);
+            kChunkSize, nvcompBatchedANSCompressDefaultOpts,
+            nvcompBatchedANSDecompressDefaultOpts, stream);
+      case NvCompAlgo::CASCADED:
+        return std::make_shared<nvcomp::CascadedManager>(
+            kChunkSize, nvcompBatchedCascadedCompressDefaultOpts,
+            nvcompBatchedCascadedDecompressDefaultOpts, stream);
+      case NvCompAlgo::BITCOMP:
+        return std::make_shared<nvcomp::BitcompManager>(
+            kChunkSize, nvcompBatchedBitcompCompressDefaultOpts,
+            nvcompBatchedBitcompDecompressDefaultOpts, stream);
     }
     return nullptr;
   }

@@ -12,6 +12,7 @@
  * through Save/Load), the NeuroPress NN (not-ready safety + missing-model load),
  * and the XGBoost stub (disabled by default, must degrade gracefully).
  */
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <string>
@@ -173,6 +174,109 @@ TEST_CASE("Rank() bulk-ranks candidates best-first (primary API)") {
     REQUIRE(ranked_time[i - 1].score >= ranked_time[i].score);
   }
 }
+
+TEST_CASE("DefaultCandidates(gpu) covers NeuroPress's full 8-algorithm "
+          "action space") {
+  // NeuroPress's NN action space is 8 GPU algorithms (LZ4, Snappy, Deflate,
+  // Gdeflate, Zstd, ANS, Cascaded, Bitcomp) x 2 preprocessing options. Six of
+  // the eight are already registered; Cascaded and Bitcomp are the gap.
+  const std::vector<std::string> kNeuroPressAlgos = {
+      "nvcomp-lz4",  "nvcomp-snappy",   "nvcomp-deflate", "nvcomp-gdeflate",
+      "nvcomp-zstd", "nvcomp-ans",      "nvcomp-cascaded", "nvcomp-bitcomp"};
+  for (const auto &algo : kNeuroPressAlgos) {
+    bool found = false;
+    for (const auto &e : KnownCompressors()) {
+      if (algo == e.name) {
+        found = true;
+        REQUIRE(e.is_gpu);
+        break;
+      }
+    }
+    INFO("missing NeuroPress action-space algorithm: " << algo);
+    REQUIRE(found);
+  }
+
+  // Every entry must carry a unique, non-zero base_id (frozen ML-scheme id).
+  std::vector<int> ids;
+  for (const auto &e : KnownCompressors()) {
+    REQUIRE(e.base_id != 0);
+    ids.push_back(e.base_id);
+  }
+  std::sort(ids.begin(), ids.end());
+  REQUIRE(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+
+  auto gpu_candidates = DefaultCandidates(/*include_gpu=*/true);
+  int cascaded_count = 0, bitcomp_count = 0;
+  for (const auto &c : gpu_candidates) {
+    if (c.library_name == "nvcomp-cascaded") ++cascaded_count;
+    if (c.library_name == "nvcomp-bitcomp") ++bitcomp_count;
+  }
+  REQUIRE(cascaded_count > 0);
+  REQUIRE(bitcomp_count > 0);
+}
+
+#ifdef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+TEST_CASE("NeuroPressNNPredictor loads the real pretrained weights and "
+          "ranks GPU candidates sensibly") {
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  // Highly compressible: near-zero entropy/MAD/curvature (e.g. a flat or
+  // slowly-varying field).
+  DataFeatures compressible;
+  compressible.chunk_size_bytes = 4 * 1024 * 1024;
+  compressible.shannon_entropy = 0.5;
+  compressible.mad = 0.02;
+  compressible.second_derivative_mean = 0.01;
+  compressible.data_type_float = 1.0;
+
+  // Near-incompressible: high entropy/MAD (e.g. noise).
+  DataFeatures noisy = compressible;
+  noisy.shannon_entropy = 7.8;
+  noisy.mad = 0.9;
+  noisy.second_derivative_mean = 0.8;
+
+  auto gpu_candidates = DefaultCandidates(/*include_gpu=*/true);
+  REQUIRE(gpu_candidates.size() > DefaultCandidates(false).size());
+
+  auto ranked_compressible = RankDefault(nn, compressible, RankingWeights(),
+                                         /*include_gpu=*/true);
+  auto ranked_noisy = RankDefault(nn, noisy, RankingWeights(),
+                                  /*include_gpu=*/true);
+  REQUIRE(ranked_compressible.size() == gpu_candidates.size());
+  REQUIRE(ranked_noisy.size() == gpu_candidates.size());
+
+  // Sorted best-first, finite predictions, on both inputs.
+  for (const auto *ranked : {&ranked_compressible, &ranked_noisy}) {
+    for (size_t i = 0; i < ranked->size(); ++i) {
+      REQUIRE(std::isfinite((*ranked)[i].prediction.compression_ratio));
+      REQUIRE(std::isfinite((*ranked)[i].score));
+      if (i > 0) REQUIRE((*ranked)[i - 1].score >= (*ranked)[i].score);
+    }
+  }
+
+  // Behavioral sanity: the model must actually respond to the data
+  // statistics, not just return a constant. The winning candidate's
+  // predicted ratio for near-zero-entropy data should beat the winning
+  // candidate's predicted ratio for high-entropy noise.
+  REQUIRE(ranked_compressible.front().prediction.compression_ratio >
+          ranked_noisy.front().prediction.compression_ratio);
+
+  // The GPU candidate set (nvcomp/cusz/ndzip) must actually be reachable by
+  // ranking, not just present in DefaultCandidates() -- confirm at least one
+  // GPU compressor (base_id >= 13 per the CompressionFactory registry)
+  // appears somewhere in the ranked results.
+  bool saw_gpu_candidate = false;
+  for (const auto &r : ranked_compressible) {
+    if (r.candidate.base_id >= 13) {
+      saw_gpu_candidate = true;
+      break;
+    }
+  }
+  REQUIRE(saw_gpu_candidate);
+}
+#endif  // CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
 
 TEST_CASE("Rank() is safe on a not-ready model") {
   NeuroPressNNPredictor nn;  // never loaded

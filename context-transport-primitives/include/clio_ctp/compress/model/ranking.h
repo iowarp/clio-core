@@ -47,6 +47,9 @@ inline const std::vector<CompressorEntry> &KnownCompressors() {
       // GPU lossy / misc
       {"zfp-sycl", 19, true}, {"cusz", 20, true}, {"ndzip", 21, true},
       {"cuszp", 22, true},
+      // GPU lossless (nvcomp) -- completes NeuroPress's 8-algorithm action
+      // space (LZ4/Snappy/Deflate/Gdeflate/Zstd/ANS/Cascaded/Bitcomp).
+      {"nvcomp-cascaded", 23, true}, {"nvcomp-bitcomp", 24, true},
   };
   return kEntries;
 }

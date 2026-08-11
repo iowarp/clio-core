@@ -319,6 +319,22 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // Completes NeuroPress's 8-algorithm GPU action space (the other 6 are
+  // above): both single-mode like the other nvcomp lossless codecs.
+  static std::unique_ptr<Compressor> MakeNvCompCascaded(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::CASCADED);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompBitcomp(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::BITCOMP);
+#else
+    return nullptr;
+#endif
+  }
   // GPU (SYCL/Intel-XPU) zfp. LOSSY fixed-rate only -- zfp's GPU backends do
   // not support reversible/precision/accuracy modes -- so, unlike the
   // single-mode nvcomp lossless codecs, presets map to fixed bit rates
@@ -422,6 +438,8 @@ class CompressionFactory {
         CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
         CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
+        CompressorInfo{"nvcomp-cascaded", 21, 23, true, &MakeNvCompCascaded},
+        CompressorInfo{"nvcomp-bitcomp",  22, 24, true, &MakeNvCompBitcomp},
     };
     return kRegistry;
   }
