@@ -131,6 +131,20 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
   ema_biases_.assign(biases_.size(), 0.0f);
   sgd_call_count_ = 0;
 
+#if CTP_ENABLE_NEUROPRESS_GPU
+  // Upload to device -- this is what actually makes Predict()/Train() run
+  // as CUDA kernels below, matching NeuroPress's own device-resident
+  // design. gpu_weights_ stays null (falls back to the CPU path this class
+  // already has) if CUDA is compiled in but no device is available at
+  // runtime -- e.g. a CUDA-built binary running on a CPU-only host.
+  gpu::NeuroPressGpuWeights* raw = gpu::NeuroPressGpuLoad(
+      weights_.data(), weights_.size(), biases_.data(), biases_.size(),
+      x_means_.data(), x_stds_.data(), y_means_.data(), y_stds_.data());
+  gpu_weights_.reset(raw, [](gpu::NeuroPressGpuWeights* p) {
+    gpu::NeuroPressGpuFree(p);
+  });
+#endif
+
   is_ready_ = true;
   return true;
 }
@@ -139,6 +153,16 @@ bool NeuroPressNNPredictor::Save(const std::string& model_dir) {
   if (!is_ready_ || weights_.empty() || biases_.empty()) {
     return false;
   }
+
+#if CTP_ENABLE_NEUROPRESS_GPU
+  // weights_/biases_ are a stale snapshot from Load() time once training
+  // has run on the GPU -- pull the current (trained) values back before
+  // writing the file, or Save() would silently persist the untrained model.
+  if (gpu_weights_) {
+    gpu::NeuroPressGpuDownloadWeights(gpu_weights_.get(), weights_.data(),
+                                      biases_.data());
+  }
+#endif
 
   std::string path = model_dir;
   if (!path.empty() && path.back() != '/') {
@@ -374,36 +398,78 @@ CompressionPrediction NeuroPressNNPredictor::Predict(
   if (!is_ready_) {
     return CompressionPrediction();
   }
+  auto batch = PredictBatch({features});
+  return batch.empty() ? CompressionPrediction() : batch.front();
+}
+
+std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
+    const std::vector<CompressionFeatures>& batch) {
+  if (batch.empty()) {
+    return {};
+  }
+  if (!is_ready_) {
+    // Base class contract (see predictor.h's default PredictBatch(), and
+    // Rank(), which indexes preds[i] against candidates[i] unconditionally):
+    // callers assume the returned vector is always exactly batch.size()
+    // long, even for a not-ready model -- Predict() itself already returns
+    // a default CompressionPrediction() in that case, so match it here.
+    return std::vector<CompressionPrediction>(batch.size());
+  }
 
   auto start_time = std::chrono::high_resolution_clock::now();
+  std::vector<CompressionPrediction> results;
+  results.reserve(batch.size());
 
-  // Map features to 8-input vector
-  auto x = FeaturesTo8Input(features);
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    // Real batched path: one kernel launch scores the WHOLE candidate set
+    // (mirrors NeuroPress's nnFusedInferenceKernel) -- the host only
+    // touches the small raw 8-dim inputs and the 4-value outputs, never
+    // the weights or activations.
+    std::vector<float> raw_inputs(batch.size() * kInputDim);
+    for (size_t i = 0; i < batch.size(); ++i) {
+      auto x = FeaturesTo8Input(batch[i]);
+      std::copy(x.begin(), x.end(), raw_inputs.begin() +
+                static_cast<long>(i * kInputDim));
+    }
+    std::vector<float> comp_time(batch.size()), decomp_time(batch.size()),
+        ratio(batch.size()), psnr(batch.size());
+    gpu::NeuroPressGpuInferBatch(gpu_weights_.get(), raw_inputs.data(),
+                                 static_cast<int>(batch.size()),
+                                 comp_time.data(), decomp_time.data(),
+                                 ratio.data(), psnr.data());
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double infer_ms = std::chrono::duration<double, std::milli>(
+                          end_time - start_time)
+                          .count() /
+                      static_cast<double>(batch.size());
+    for (size_t i = 0; i < batch.size(); ++i) {
+      results.emplace_back(ratio[i], psnr[i], comp_time[i], infer_ms);
+    }
+    return results;
+  }
+#endif
 
-  // Standardize
-  auto x_norm = Standardize(x);
+  // CPU fallback: same per-candidate math as before, looped.
+  for (const auto& features : batch) {
+    auto x = FeaturesTo8Input(features);
+    auto x_norm = Standardize(x);
+    auto y_norm = ForwardPass(x_norm);
+    auto y = InverseTransform(y_norm);
 
-  // Forward pass
-  auto y_norm = ForwardPass(x_norm);
-
-  // Inverse transform
-  auto y = InverseTransform(y_norm);
-
+    double comp_time = std::max(1.0, static_cast<double>(y[0]));
+    double ratio =
+        std::max(0.001, std::min(100.0, static_cast<double>(y[2])));
+    double psnr = y[3];
+    results.emplace_back(ratio, psnr, comp_time, 0.0);
+  }
   auto end_time = std::chrono::high_resolution_clock::now();
-  double infer_ms =
-      std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-  // NeuroPress outputs: [comp_time, decomp_time, ratio, psnr, ...]
-  // Map to CompressionPrediction
-  double comp_time = y[0];
-  double ratio = y[2];
-  double psnr = y[3];
-
-  // Clamp: comp_time >= 1ms, ratio in (0, 100]
-  comp_time = std::max(1.0, comp_time);
-  ratio = std::max(0.001, std::min(100.0, ratio));
-
-  return CompressionPrediction(ratio, psnr, comp_time, infer_ms);
+  double infer_ms = std::chrono::duration<double, std::milli>(
+                        end_time - start_time)
+                        .count() /
+                    static_cast<double>(batch.size());
+  for (auto& r : results) r.inference_time_ms = infer_ms;
+  return results;
 }
 
 bool NeuroPressNNPredictor::Train(
@@ -415,7 +481,28 @@ bool NeuroPressNNPredictor::Train(
   const size_t num_samples =
       std::min(features.size(), static_cast<size_t>(kMaxSGDSamples));
 
-  // ---- Per-sample forward pass + target/error computation (nn_gpu.cu's
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    // Real SGD kernel: forward + backward + weight update entirely
+    // on-device (see neuropress_nn_gpu_kernels.cu's SGDKernel), mirroring
+    // nnSGDKernel exactly rather than the CPU port below.
+    std::vector<gpu::NeuroPressGpuSGDSample> gpu_samples(num_samples);
+    for (size_t si = 0; si < num_samples; ++si) {
+      auto x = FeaturesTo8Input(features[si]);
+      std::copy(x.begin(), x.end(), gpu_samples[si].raw_input);
+      gpu_samples[si].actual_ratio = labels[si].compression_ratio;
+      gpu_samples[si].actual_comp_time_ms = labels[si].compression_time_ms;
+      gpu_samples[si].actual_decomp_time_ms = labels[si].decompression_time_ms;
+      gpu_samples[si].actual_psnr_db = labels[si].psnr_db;
+    }
+    return gpu::NeuroPressGpuTrain(gpu_weights_.get(), gpu_samples.data(),
+                                   static_cast<int>(num_samples));
+  }
+#endif
+
+  // ---- CPU fallback (used when CUDA is unavailable or no device was
+  // present at Load() time) ----
+  // Per-sample forward pass + target/error computation (nn_gpu.cu's
   // per-sample loop, lines ~690-853) ----
   std::vector<SGDActivations> acts(num_samples);
   std::vector<std::array<float, kOutputDim>> d5_clamped(num_samples);

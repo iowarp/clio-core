@@ -5,12 +5,19 @@
 
 /**
  * @file neuropress_nn_predictor.h
- * @brief NeuroPress dense multi-output neural net predictor (pure C++ CPU).
+ * @brief NeuroPress dense multi-output neural net predictor.
  *
  * Implements CompressionPredictor using a 5-layer feedforward network
  * (8 → 64 → 64 → 64 → 64 → 8) with ReLU on hidden layers. Weights are loaded
- * from a .nnwt binary format (little-endian, version 2). Inference is CPU-only
- * using standard library (no CUDA, no external deps beyond stdlib).
+ * from a .nnwt binary format (little-endian, version 2).
+ *
+ * When built with CUDA (CTP_ENABLE_NEUROPRESS_GPU=1), inference and online
+ * SGD training run as real CUDA kernels operating on device-resident
+ * weights -- matching the original NeuroPress project's own design
+ * (src/nn/nn_gpu.cu), where the host never touches the decision data. When
+ * CUDA is unavailable, or no device is present at runtime, this falls back
+ * to an equivalent pure-C++ CPU implementation (same algorithm, same
+ * constants) so the predictor still works, just without GPU acceleration.
  *
  * .nnwt Layout (little-endian):
  *   - Header (24 bytes): magic=0x4E4E5754, version=2, num_layers, input_dim,
@@ -26,8 +33,13 @@
 
 #include "clio_ctp/compress/model/predictor.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#if CTP_ENABLE_NEUROPRESS_GPU
+#include "clio_ctp/compress/model/neuropress_nn_gpu_kernels.h"
+#endif
 
 namespace ctp::compress::model {
 
@@ -100,6 +112,20 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    */
   CompressionPrediction Predict(
       const CompressionFeatures& features) override;
+
+  /**
+   * @brief Predict metrics for a whole candidate batch in one call.
+   *
+   * On the GPU backend this is the REAL batched path: one kernel launch
+   * scores every candidate (mirrors NeuroPress's nnFusedInferenceKernel),
+   * rather than the base class's default of looping Predict() once per
+   * candidate. Rank() already calls PredictBatch() exactly once with the
+   * full candidate set, so overriding this (not Predict()) is what makes
+   * Rank() itself GPU-batched for free. On the CPU fallback this is
+   * equivalent to looping Predict().
+   */
+  std::vector<CompressionPrediction> PredictBatch(
+      const std::vector<CompressionFeatures>& batch) override;
 
   /**
    * @brief Online SGD update from real (predicted vs. actual) outcomes.
@@ -186,6 +212,17 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   std::vector<size_t> bias_offsets_;
 
   bool is_ready_ = false;
+
+#if CTP_ENABLE_NEUROPRESS_GPU
+  // Device-resident weights + online-learning state (log_var, EMA gradient,
+  // call count all live on the GPU too -- see neuropress_nn_gpu_kernels.cu).
+  // shared_ptr with a custom deleter (not unique_ptr) so this class's
+  // existing defaulted copy/move constructors stay correct: a copy shares
+  // the device handle rather than double-freeing it. Null when CUDA is
+  // compiled in but no device was available at Load() time -- Predict()/
+  // Train() fall back to the CPU path below in that case.
+  std::shared_ptr<gpu::NeuroPressGpuWeights> gpu_weights_;
+#endif
 
   // ---- Online-learning (SGD) state -- ported from NeuroPress's
   // nnSGDKernel (src/nn/nn_gpu.cu). Persists across Train() calls, mirroring

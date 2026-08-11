@@ -16,7 +16,44 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
     neuropress_nn_predictor.cc
 )
 
+# NeuroPress GPU backend: when CUDA is available, its inference and online-
+# SGD training run as real CUDA kernels operating on device-resident
+# weights, matching the original NeuroPress project's own design (src/nn/
+# nn_gpu.cu) rather than falling back to the pure-C++ CPU port. Added
+# directly into this target (not a separate library) so it doesn't need its
+# own entry in the ClioCtp install(EXPORT) set -- the other predictors
+# (Q-table/linreg/XGBoost) stay untouched either way.
+if(CLIO_CORE_ENABLE_CUDA)
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC neuropress_nn_gpu_kernels.cu)
+endif()
+
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
+
+if(CLIO_CORE_ENABLE_CUDA)
+    if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE)
+        set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}"
+            CACHE STRING "CUDA architectures to compile for" FORCE)
+    endif()
+    set_source_files_properties(neuropress_nn_gpu_kernels.cu PROPERTIES LANGUAGE CUDA)
+    set_target_properties(clio_ctp_compress_model PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RUNTIME_LIBRARY Static
+    )
+    # Plain CUDA runtime only -- NOT ctp::cuda_cxx/clio_ctp_cuda, which
+    # creates a real dependency cycle here (clio_ctp_cuda's own sources
+    # already link clio_ctp_compress_model, and this target linking back to
+    # clio_ctp_cuda closes the loop; CMake refuses cycles between a shared
+    # and a static library). This .cu file only calls the plain CUDA
+    # runtime API (cudaMalloc/cudaMemcpy/kernel launches), none of CTP's
+    # own GPU utility headers, so it doesn't need that heavier target.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(clio_ctp_compress_model PRIVATE CUDA::cudart)
+    target_compile_definitions(clio_ctp_compress_model PUBLIC CTP_ENABLE_NEUROPRESS_GPU=1)
+    message(STATUS "clio_ctp_compress_model: NeuroPress GPU backend enabled (CUDA)")
+else()
+    target_compile_definitions(clio_ctp_compress_model PUBLIC CTP_ENABLE_NEUROPRESS_GPU=0)
+endif()
 
 target_include_directories(clio_ctp_compress_model PUBLIC
     $<BUILD_INTERFACE:${CLIO_CTP_ROOT}/include>
