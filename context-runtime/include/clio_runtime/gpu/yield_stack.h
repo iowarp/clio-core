@@ -52,6 +52,24 @@
  * shared allocation are reserved for this; a kernel that also wants dynamic
  * shared memory must offset past it (CLIO_YIELD_SMEM_BYTES).
  *
+ * WHY YIELDS STAY BLOCK-COLLECTIVE (decided, not defaulted)
+ *
+ * The per-lane frame and per-lane resume point would ALSO support lanes
+ * suspending at different places; the only thing forbidding it is the
+ * __syncthreads inside the yield macros. That barrier is kept on purpose.
+ *
+ * Consumers here need a divergent PREDICATE, not a divergent POSITION: with a
+ * page cache whose contract is that a warp's accesses land in one page, the
+ * only per-thread question is "must I wait?", which CLIO_YIELD_IF already
+ * votes on with __syncthreads_or. Nobody needs lane 3 suspended at one line
+ * while lane 7 is suspended at another.
+ *
+ * Keeping suspension uniform is also what allows __syncthreads ANYWHERE ELSE
+ * in the body. If lanes could exit at arbitrary points, every later
+ * cooperative barrier in that kernel could deadlock -- and that hazard is not
+ * specific to this mechanism, it applies equally to a coroutine-based design
+ * whose lanes suspend independently.
+ *
  * LAYOUT NOTE (deliberate, and a known cost)
  *
  * A lane's frames are CONTIGUOUS, so `T &` references into them are possible
@@ -87,9 +105,19 @@ struct YieldLaneHeader {
   clio::run::u32 live_depth_;
   /** Depth reached so far during THIS entry. Reset at kernel entry. */
   clio::run::u32 cur_depth_;
-  clio::run::u32 pad_;
+  /** Nonzero if this lane blew a limit; see kYieldErr* below. */
+  clio::run::u32 error_;
   /** Offset of each live frame, indexed by depth. */
   clio::run::u32 frame_off_[kYieldMaxDepth];
+};
+
+/** Limit violations. These corrupt silently if unchecked, so they trap. */
+enum YieldError : clio::run::u32 {
+  kYieldErrNone = 0,
+  /** More nested yieldable calls live at once than kYieldMaxDepth. */
+  kYieldErrDepth = 1,
+  /** This lane's frames outgrew bytes_per_lane. */
+  kYieldErrOverflow = 2,
 };
 
 /** Header of one call frame: everything before the locals. */
@@ -135,6 +163,17 @@ struct YieldSmem {
 
 /** Dynamic shared memory a yieldable kernel must reserve, in bytes. */
 #define CLIO_YIELD_SMEM_BYTES (sizeof(clio::run::gpu::YieldSmem))
+
+/**
+ * Limit checks. On by default: the failures they catch (nesting too deep, a
+ * lane's frames overrunning into its neighbour's) are silent corruption that
+ * surfaces later as wrong data somewhere unrelated. Each is a compare against
+ * a value already in registers, against a path that is already touching
+ * global memory.
+ */
+#ifndef CLIO_YIELD_CHECKS
+#define CLIO_YIELD_CHECKS 1
+#endif
 
 #if defined(__CUDACC__)
 
@@ -199,6 +238,14 @@ struct YieldFrame {
     lane_ = YieldLane();
     lane_base_ = reinterpret_cast<char *>(lane_);
     const clio::run::u32 d = lane_->cur_depth_++;
+#if CLIO_YIELD_CHECKS
+    if (d >= kYieldMaxDepth) {
+      lane_->error_ = kYieldErrDepth;
+      printf("[yield] block %u lane %u: nesting past kYieldMaxDepth=%u\n",
+             blockIdx.x, threadIdx.x, (unsigned)kYieldMaxDepth);
+      __trap();
+    }
+#endif
     if (d < lane_->live_depth_) {
       // Resuming: this call already has a frame, with its locals in it.
       fp_ = lane_->frame_off_[d];
@@ -227,6 +274,18 @@ struct YieldFrame {
                                          clio::run::u32 align) {
     clio::run::u32 off = (lcur_ + (align - 1)) & ~(align - 1);
     lcur_ = off + size;
+#if CLIO_YIELD_CHECKS
+    // Silent otherwise: the next lane's frames are directly after this one, so
+    // an overflow writes a NEIGHBOUR's locals and both lanes go wrong later,
+    // far from here.
+    if (lcur_ > YieldTls().stack_.bytes_per_lane_) {
+      lane_->error_ = kYieldErrOverflow;
+      printf("[yield] block %u lane %u: frame overflow, need %u > %u bytes\n",
+             blockIdx.x, threadIdx.x, lcur_,
+             YieldTls().stack_.bytes_per_lane_);
+      __trap();
+    }
+#endif
     if (fresh_ && lcur_ > lane_->sp_) {
       lane_->sp_ = lcur_;
     }
@@ -372,6 +431,7 @@ __global__ inline void YieldStackInitKernel(YieldStackView v,
   h->sp_ = sizeof(YieldLaneHeader);
   h->live_depth_ = 0;
   h->cur_depth_ = 0;
+  h->error_ = kYieldErrNone;
 }
 
 }  // namespace clio::run::gpu
