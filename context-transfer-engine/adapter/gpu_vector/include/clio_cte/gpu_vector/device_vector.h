@@ -144,6 +144,9 @@ struct VecHeader {
    *  way and the run still reported success until the checksum disagreed. */
   unsigned long long *stat_put_errors_ = nullptr;
   unsigned long long *stat_pf_dropped_ = nullptr;  // async hints dropped
+  /** CLIO_GV_TRACE_PUT_ERRORS: device-print each failed writeback's page and
+   *  return code. Off by default; a failed put is otherwise only a counter. */
+  unsigned int trace_put_errors_ = 0u;
   // Optional per-page fault counter (CLIO_FAULT_HIST): distinguishes churn
   // (same pages refaulted) from coverage (more unique pages) between the
   // bistable attractors. Device array of one u32 per vector page.
@@ -1700,7 +1703,17 @@ class DeviceVector {
     // tier that fits, which is what a page cache writing back hot data wants.
     // An explicitly rescored page still sends its own score, so RescorePage
     // keeps steering placement.
-    t->score_ = (p->score > 0.0f) ? p->score : -1.0f;
+    // CLAMPED to 1.0. The two scores are different quantities that happen to
+    // share a name: device-side `score` is an eviction RANK -- 2.0 on fault,
+    // +1.0 per touch, unbounded -- while the CTE's is a tier preference in
+    // [0,1] and PutBlob REJECTS anything above 1.0 with rc=5. So every
+    // writeback of a page that had been touched more than once failed, and
+    // failed silently: AwaitPut did not read the return code, so the page was
+    // marked clean and its contents dropped. In the workloads test that lost
+    // 7 of 8 pages -- the reader saw the seeded values, never the computed
+    // ones. Clamping is the right direction as well as the safe one: a hot
+    // page wants the FASTEST tier, which is what 1.0 asks for.
+    t->score_ = (p->score > 0.0f) ? fminf(p->score, 1.0f) : -1.0f;
     t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
@@ -2073,6 +2086,11 @@ class DeviceVector {
     // retries, and count it so the loss is visible rather than silent.
     if (p->put->GetReturnCode() != 0) {
       Bump(h_->stat_put_errors_);
+      if (h_->trace_put_errors_ != 0u) {
+        printf("[gv] page %llu writeback FAILED rc=%d\n",
+               (unsigned long long) p->page_num,
+               (int) p->put->GetReturnCode());
+      }
       p->dirty = 1u;
     }
     p->flushing = 0u;

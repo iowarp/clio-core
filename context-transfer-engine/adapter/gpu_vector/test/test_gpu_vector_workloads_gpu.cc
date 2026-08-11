@@ -26,6 +26,8 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <chrono>
 #include <cstdio>
@@ -37,6 +39,22 @@
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+
+/**
+ * Run a yieldable kernel to completion: re-launch until no block is still
+ * suspended, with a continuation stack backing the blocks' saved state.
+ */
+template <typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, 256);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+}
 
 namespace {
 constexpr clio::run::u64 kPageBytes = 4096;
@@ -56,18 +74,30 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Step(clio::run::u32 v) {
 /** Seed the vector so later kernels have something real to read. */
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
-                           clio::run::u64 per) {
+                           clio::run::u64 per, gy::YieldableView<> yv,
+                           gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[base + i] = Seed(base + i);
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; i < per; i += run) {
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + i + k] = Seed(base + i + k);
+    }
   }
-  v.BeginFlush(base, per);
-  v.WaitFlush(base, per);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /**
@@ -77,23 +107,51 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
  */
 __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
-                                clio::run::u64 per, clio::run::u64 page_elems) {
+                                clio::run::u64 per, clio::run::u64 page_elems,
+                                gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    const clio::run::u64 n =
-        (off + page_elems <= per) ? page_elems : (per - off);
-    for (clio::run::u64 i = 0; i < n;) {
-      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
-      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-        v[base + off + i] = Step(v[base + off + i]);
-          }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  // Advance by `run`, NOT by page_elems: HoldPageYield returns how many
+  // elements are actually reachable from this hold, which can be fewer.
+  // Stepping `run` of them and then skipping a whole page_elems left the
+  // remainder un-Stepped, which showed up as a sum that was too HIGH (Step
+  // reduces the value) by about two elements' worth.
+  CLIO_YBEGIN();
+  for (; off < per; off += run) {
+    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + off + k] = Step(v[base + off + k]);
     }
     // Double buffer: hand this page to the runtime NOW and keep computing.
-    v.BeginFlush(base + off, n);
+    // The barrier matters: SubmitPut clears `dirty` as it submits, so a lane
+    // still writing when thread 0 flushes loses its writes.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      v.BeginFlush(base + off, run);
+    }
+    __syncthreads();
   }
-  v.WaitFlush(base, per);
+  // Then flush the WHOLE slice. The per-page BeginFlush above is the overlap
+  // this workload exists to show, but it is a submission, not a guarantee:
+  // whatever it did not manage to submit stays dirty in the cache and is lost
+  // when the kernel ends. Measured with only the per-page flush: page 0 landed
+  // and pages 1-7 did not, so the reader saw Step(Seed) for the first 1024
+  // elements and plain Seed for the other 7168. The original spelled this the
+  // same way -- BeginFlush per page, then one WaitFlush over the slice.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /**
@@ -104,26 +162,31 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<clio::run::u32> v,
                               clio::run::u64 per, clio::run::u64 page_elems,
-                              unsigned long long *sum) {
+                              unsigned long long *sum, gy::YieldableView<> yv,
+                              gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  unsigned long long acc = 0;
-  for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    const clio::run::u64 n =
-        (off + page_elems <= per) ? page_elems : (per - off);
-    // Hint the NEXT page before reading this one.
-    if (off + page_elems < per) {
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; off < per; off += run) {
+    // Hint the NEXT page before reading this one. One lane: it is a metadata
+    // op, and every lane sending it would be pure duplication.
+    if (threadIdx.x == 0 && off + page_elems < per) {
       v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
     }
-    for (clio::run::u64 i = 0; i < n;) {
-      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
-      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-        acc += v[base + off + i];
-          }
+    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
+    unsigned long long acc = 0;
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      acc += v[base + off + k];
     }
+    atomicAdd(sum, acc);
   }
-  atomicAdd(sum, acc);
+  CLIO_YEND();
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -146,9 +209,25 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
   {
     std::ofstream cfg("gpu_vector_workloads.yaml");
     REQUIRE(cfg.is_open());
+    // Without a compose section the CTE pool is built from default
+    // CreateParams and has NO storage targets, so a page writeback has
+    // nowhere to land and never completes.
     cfg << "networking:\n  port: 9432\n\n"
         << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
-        << "gpu:\n  queue_depth: 4096\n";
+        << "gpu:\n  queue_depth: 4096\n\n"
+        << "compose:\n"
+        << "  - mod_name: clio_bdev\n"
+        << "    pool_name: \"ram::chi_default_bdev\"\n"
+        << "    pool_query: local\n    pool_id: \"301.0\"\n"
+        << "    bdev_type: ram\n    capacity: \"512MB\"\n\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: cte_core\n    pool_query: local\n"
+        << "    pool_id: \"512.0\"\n"
+        << "    storage:\n"
+        << "      - path: \"ram::gv_workloads_tier\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \"256MB\"\n"
+        << "        score: 1.0\n"
+        << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_workloads.yaml", 1);
   }
@@ -187,20 +266,32 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
 
     gv::Vector<clio::run::u32> vec(tag, {0}, kPageBytes, c.nblocks,
                                    c.pages_per_block, n);
+    vec.EnableStats();
     auto dev = vec.GetDevice(0);
 
-    SeedKernel<<<c.nblocks, 32>>>(gpu_info, dev, per);
+    RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+      SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per, vw, sv);
+    });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     // ---- Gray Scott: read-modify-write with overlapped write-back --------
-    GrayScottKernel<<<c.nblocks, 32>>>(gpu_info, dev, per, kPageElems);
+    RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+      GrayScottKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per,
+                                                       kPageElems, vw, sv);
+    });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     // ---- weights: read-only stream with prefetch hints -------------------
     unsigned long long *d_sum = nullptr;
     REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
-    WeightsKernel<<<c.nblocks, 32>>>(gpu_info, dev, per, kPageElems, d_sum);
+    RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+      WeightsKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per,
+                                                     kPageElems, d_sum, vw, sv);
+    });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long got = 0;
@@ -208,6 +299,16 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
             cudaSuccess);
     cudaFree(d_sum);
 
+    {
+      const auto st = vec.ReadStats(0);
+      std::fprintf(stderr,
+                   "  [stats] faults=%llu puts=%llu evicts=%llu "
+                   "put_errors=%llu get_errors=%llu\n",
+                   (unsigned long long) st.faults, (unsigned long long) st.puts,
+                   (unsigned long long) st.evicts,
+                   (unsigned long long) st.put_errors,
+                   (unsigned long long) st.get_errors);
+    }
     const unsigned long long want = ExpectedSum(n);
     std::fprintf(stderr, "[%s] blocks=%u slots=%u pages=%llu sum=%llu want=%llu\n",
                  c.name, c.nblocks, c.pages_per_block,

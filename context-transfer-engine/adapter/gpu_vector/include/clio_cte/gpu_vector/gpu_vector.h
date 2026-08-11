@@ -215,6 +215,8 @@ class Vector {
       kv.second.hdr.stat_verify_ok_ = c + 9;
       kv.second.hdr.stat_verify_lost_ = c + 10;
       kv.second.hdr.stat_put_errors_ = c + 11;
+      kv.second.hdr.trace_put_errors_ =
+          (std::getenv("CLIO_GV_TRACE_PUT_ERRORS") != nullptr) ? 1u : 0u;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
         const clio::run::u64 npg = NumPagesOf(kv.second.hdr);
         void *hm = nullptr;
