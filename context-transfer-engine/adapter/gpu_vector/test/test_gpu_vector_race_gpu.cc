@@ -21,6 +21,8 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <chrono>
 #include <cstdio>
@@ -34,6 +36,19 @@
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+
+/** Run a yieldable kernel to completion (see the other gpu_vector tests). */
+template <typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, 256);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+}
 
 namespace {
 // 512 KiB pages — the MoE workload's granularity. The 4 KiB first cut
@@ -49,23 +64,43 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Seed(clio::run::u64 i) {
 }
 }  // namespace
 
+/**
+ * Seeds a whole slice on the GPU, through the paging path.
+ *
+ * It used to flush after EVERY page, because "an evicted dirty page is
+ * DROPPED, not written back (weights-path assumption)" -- so deferring the
+ * flush seeded cross-page garbage. That assumption was a BUG (the slot claim
+ * chose its victim without checking `dirty`), and it is fixed: an eviction
+ * writes its victim back. One flush at the end is now correct, and the slice
+ * is deliberately larger than the cache so the eviction writeback is what
+ * stores most of it.
+ */
 __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<clio::run::u32> v,
-                               clio::run::u64 per) {
+                               clio::run::u64 per, gy::YieldableView<> yv,
+                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, per - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[base + i] = Seed(base + i);
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; i < per; i += run) {
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + i + k] = Seed(base + i + k);
     }
-    // Flush per page: the slice is larger than the cache, and an evicted
-    // dirty page is DROPPED, not written back (weights-path assumption) —
-    // deferring the flush to the end seeds cross-page garbage.
-    v.BeginFlush(base, i);
-    v.WaitFlush(base, i);
   }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /**
@@ -227,33 +262,31 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   gv::Vector<clio::run::u32> vec("gv_race", {0}, kPageBytes, kBlocks,
                                  /*pages_per_block=*/192, n);
 
-  // HOST-side seed: put every page's pattern straight through the CTE
-  // client. The GPU flush path is deliberately NOT used — a walk larger
-  // than the cache DROPS dirty evictions by design (weights are read-only
-  // in the paged kernels), so a GPU-seeded oversubscribed image is missing
-  // pages before the stress even starts. Host puts make the storage state
-  // exact, so any stress mismatch indicts the DEVICE READ path alone.
+  // GPU seed, through the paging path. This was 23040 sequential host
+  // PutBlobs -- ~5 minutes, and the reason this test ran far over its budget
+  // -- because "the GPU flush path is deliberately NOT used: a walk larger
+  // than the cache DROPS dirty evictions by design". That drop was a bug in
+  // the slot claim, not a design, and it is fixed, so the device path can
+  // seed its own image again. It also makes the seed itself a test of
+  // eviction writeback at scale: 480 pages per block through 192 slots.
   {
-    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
-    ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(kPageBytes);
-    REQUIRE(shm.ptr_ != nullptr);
-    for (clio::run::u64 pg = 0; pg < kTotalPages; ++pg) {
-    if ((pg & 0x7FF) == 0) std::fprintf(stderr, "[race-progress] page %llu/%llu\n", (unsigned long long) pg, (unsigned long long) kTotalPages);
-      auto *w = reinterpret_cast<clio::run::u32 *>(shm.ptr_);
-      for (clio::run::u64 i = 0; i < kPageElems; ++i) {
-        w[i] = Seed(pg * kPageElems + i);
-      }
-      char name[32];
-      gv::PageBlobName(pg, name);
-      auto f = core.AsyncPutBlob(vec.TagId(), std::string(name), 0,
-                                 kPageBytes, shm.Cast<void>().shm_);
-      f.Wait();
-      if (f->GetReturnCode() != 0) {
-        std::fprintf(stderr, "seed put %s rc=%d\n", name,
-                     f->GetReturnCode());
-      }
-      REQUIRE(f->GetReturnCode() == 0);
-    }
+    const clio::run::u64 per = kPagesPerSlice * kPageElems;
+    vec.EnableStats();
+    const clio::run::u32 seed_rounds =
+        RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+          RaceSeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu_info, vec.GetDevice(0), per, vw, sv);
+        });
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    const auto st = vec.ReadStats(0);
+    std::fprintf(stderr,
+                 "[race-seed] rounds=%u faults=%llu puts=%llu evicts=%llu "
+                 "put_errors=%llu\n",
+                 seed_rounds, (unsigned long long) st.faults,
+                 (unsigned long long) st.puts, (unsigned long long) st.evicts,
+                 (unsigned long long) st.put_errors);
+    REQUIRE(st.put_errors == 0);
   }
 
   // Split write-path from read-path corruption BEFORE the stress phase:
