@@ -137,6 +137,12 @@ struct VecHeader {
   /** Gets that came back with a NON-ZERO return code. SubmitGet never checked
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
+  /** Writebacks that came back with a NON-ZERO return code. AwaitPut cleared
+   *  `flushing` without ever reading it, so a put that failed -- a full tier
+   *  being the obvious way -- marked the page CLEAN and dropped its contents
+   *  on the floor. With no spill tier configured, 14 of 16 MB vanished this
+   *  way and the run still reported success until the checksum disagreed. */
+  unsigned long long *stat_put_errors_ = nullptr;
   unsigned long long *stat_pf_dropped_ = nullptr;  // async hints dropped
   // Optional per-page fault counter (CLIO_FAULT_HIST): distinguishes churn
   // (same pages refaulted) from coverage (more unique pages) between the
@@ -2059,6 +2065,16 @@ class DeviceVector {
   CTP_GPU_FUN void AwaitPut(Page *p) {
     if (!p->flushing) return;
     p->put_fut.Wait();
+    // A failed writeback must NOT leave the page clean. Clearing `flushing`
+    // without reading the return code is how a page whose put was rejected
+    // (full tier, no target with space) became indistinguishable from one
+    // safely on storage: the slot was then free to be evicted and the only
+    // copy of those bytes disappeared. Keep it dirty so the next flush
+    // retries, and count it so the loss is visible rather than silent.
+    if (p->put->GetReturnCode() != 0) {
+      Bump(h_->stat_put_errors_);
+      p->dirty = 1u;
+    }
     p->flushing = 0u;
   }
 

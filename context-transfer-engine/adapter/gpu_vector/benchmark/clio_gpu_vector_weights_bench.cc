@@ -301,6 +301,7 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
 int main(int argc, char **argv) {
   unsigned blocks = 16;
   clio::run::u64 hbm_mb = 64;
+  bool hbm_only = false;   // omit the host spill tier entirely
   clio::run::u64 pages_per_block = 16;
   clio::run::u32 slots = 4;
   bool compressed = false;
@@ -315,6 +316,7 @@ int main(int argc, char **argv) {
     auto next = [&]() { return (i + 1 < argc) ? std::atoll(argv[++i]) : 0; };
     if (a == "--blocks") blocks = static_cast<unsigned>(next());
     else if (a == "--hbm-mb") hbm_mb = static_cast<clio::run::u64>(next());
+    else if (a == "--hbm-only") hbm_only = true;
     else if (a == "--pages") pages_per_block = static_cast<clio::run::u64>(next());
     else if (a == "--slots") slots = static_cast<clio::run::u32>(next());
     else if (a == "--compressed") compressed = true;
@@ -325,7 +327,7 @@ int main(int argc, char **argv) {
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
-                   "usage: %s [--blocks N] [--hbm-mb M] [--pages P] "
+                   "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--pages P] "
                    "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n"
                    "       [--yieldable]  block-collective faults, parallel page reads\n",
                    argv[0]);
@@ -362,12 +364,20 @@ int main(int argc, char **argv) {
         << "      - path: \"hbm::gv_bench_hbm\"\n"
         << "        bdev_type: \"hbm\"\n"
         << "        capacity_limit: \"" << hbm_mb << "MB\"\n"
-        << "        score: 1.0\n"
-        << "      - path: \"ram::gv_bench_ram\"\n"
-        << "        bdev_type: \"ram\"\n"
-        << "        capacity_limit: \"2GB\"\n"
-        << "        score: 0.2\n"
-        << "    dpe:\n      dpe_type: \"max_bw\"\n";
+        << "        score: 1.0\n";
+    // The host RAM tier is the SPILL tier, and it is the only place data can
+    // land that is not the GPU. --hbm-only omits it, so "every byte is in
+    // HBM" stops being something the run happens to achieve and becomes
+    // something the configuration cannot violate: with no tier below it, a
+    // page that does not fit in HBM has nowhere to go and the put fails
+    // loudly instead of quietly relocating to the host.
+    if (!hbm_only) {
+      cfg << "      - path: \"ram::gv_bench_ram\"\n"
+          << "        bdev_type: \"ram\"\n"
+          << "        capacity_limit: \"2GB\"\n"
+          << "        score: 0.2\n";
+    }
+    cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gv_weights_bench.yaml", 1);
 
@@ -396,6 +406,10 @@ int main(int argc, char **argv) {
                                  compressed ? (gpu_codec ? kNvcompLz4WireId
                                                         : kLz4WireId)
                                             : 0);
+  // Writeback failures are the one error that used to be invisible: a put that
+  // the CTE rejected still marked its page clean, so the bytes were dropped
+  // and only the checksum noticed. Count them and report.
+  vec.EnableStats();
 
   if (yieldable) {
     gy::Yieldable<> sdrv(blocks, 32);
@@ -562,10 +576,27 @@ int main(int argc, char **argv) {
   }
   cudaFree(d_sum);
 
+  // A run that could not write its data back is not a valid measurement,
+  // however good its throughput looks. Reported SEPARATELY from the checksum:
+  // they are different failures, and a run can lose data while still summing
+  // to the right number over the pages that survived.
+  //
+  // Only WRITEBACK failures count here. A failed GET is normal and expected:
+  // the first touch of a never-written page misses in the CTE by design, and
+  // the claimed slot is what turns that miss into a write-allocate.
+  const auto stats = vec.ReadStats(0);
+  if (stats.put_errors != 0) {
+    std::fprintf(stderr,
+                 "GVW ERROR: %llu writeback(s) FAILED -- the tier could not "
+                 "hold the data, so those pages were never stored. The "
+                 "numbers below are not a valid measurement.\n",
+                 (unsigned long long) stats.put_errors);
+  }
+
   std::fprintf(stderr,
                "GVW mode=%s%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
                "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
-               "checksum=%s rounds=%u\n",
+               "checksum=%s put_errors=%llu rounds=%u\n",
                compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
                yieldable ? "+yield" : "", blocks,
                (unsigned long long) hbm_mb, slots,
@@ -573,7 +604,7 @@ int main(int argc, char **argv) {
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
                (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
-               rounds);
+               (unsigned long long) stats.put_errors, rounds);
   return ok ? 0 : 1;
 }
 

@@ -164,8 +164,9 @@ class Vector {
     clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
     clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
     clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
+    clio::run::u64 put_errors = 0;      // writebacks that returned non-zero
   };
-  static constexpr int kNumStats = 11;
+  static constexpr int kNumStats = 12;
   bool fully_device_mapped_ = false;
 
   /**
@@ -213,6 +214,7 @@ class Vector {
       kv.second.hdr.stat_pf_dropped_ = c + 8;
       kv.second.hdr.stat_verify_ok_ = c + 9;
       kv.second.hdr.stat_verify_lost_ = c + 10;
+      kv.second.hdr.stat_put_errors_ = c + 11;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
         const clio::run::u64 npg = NumPagesOf(kv.second.hdr);
         void *hm = nullptr;
@@ -601,6 +603,7 @@ class Vector {
     s.prefetches = h[3];
     s.prefetch_hits = h[4];
     s.rescores = h[5];
+    s.put_errors = h[11];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
     s.pf_dropped = h[8];
