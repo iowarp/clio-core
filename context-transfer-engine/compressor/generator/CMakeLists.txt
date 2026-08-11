@@ -77,7 +77,7 @@ if(ADIOS2_FOUND OR TARGET adios2::cxx11)
     )
 
     target_link_libraries(gray_scott_analysis PRIVATE
-        adios2::cxx
+        adios2::cxx11
         ctp::compress
         ctp::cxx
         ${CMAKE_THREAD_LIBS_INIT}
