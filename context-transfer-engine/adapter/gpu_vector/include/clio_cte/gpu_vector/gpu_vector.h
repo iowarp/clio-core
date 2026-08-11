@@ -61,8 +61,14 @@ class Vector {
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 pages_per_block, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0, int compress_preset = 1)
-      : storage_pool_id_(storage_pool_id.IsNull()
+         int compress_lib = 0, int compress_preset = 1,
+         // The CTE CORE pool, BEHIND the compressor. A spilled encoded page
+         // is fetched from here so the raw get returns the STORED bytes and
+         // the interposer never decompresses it host-side. Defaults to the
+         // storage pool, which is correct when no compressor is composed.
+         clio::run::PoolId core_pool_id = clio::run::PoolId::GetNull())
+      : core_pool_id_(core_pool_id),
+        storage_pool_id_(storage_pool_id.IsNull()
                              ? clio::cte::core::kCtePoolId
                              : storage_pool_id),
         compress_lib_(compress_lib),
@@ -310,6 +316,11 @@ class Vector {
     }
     std::vector<unsigned long long> offs(npages, ~0ull);
     std::vector<unsigned long long> csz(npages, 0);
+    // STORED size of every page, including the ones this map does not cover.
+    // A spilled encoded page is fetched by a raw get that has to ask for
+    // exactly the stored byte count; 0 means "unknown", and the fault then
+    // keeps the old compressor path.
+    std::vector<unsigned long long> stored_sz(npages, 0);
     std::vector<unsigned long long> chunk_off;
     std::vector<unsigned int> chunk_csz;
     if (encoded) {
@@ -323,6 +334,9 @@ class Vector {
       PageBlobName(pg, name);
       unsigned long long p2 = 0, o2 = 0, s2 = 0;
       const int lrc = clio_cte_locate(&tag_id_, name, &p2, &o2, &s2);
+      // Record the stored size even when the page is NOT on the device tier:
+      // that is exactly the case the in-kernel spilled decode needs it for.
+      if (lrc == 0) stored_sz[pg] = s2;
       if (lrc != 0 || p2 != pool) {
         if (map_debug) {
           std::fprintf(stderr,
@@ -410,6 +424,17 @@ class Vector {
                      (unsigned long long) pg, offs[pg], csz[pg]);
       }
     }
+    void *dev_ssz = nullptr;
+    if (encoded) {
+      if (cudaMalloc(&dev_ssz, npages * sizeof(unsigned long long)) ==
+          cudaSuccess) {
+        cudaMemcpy(dev_ssz, stored_sz.data(),
+                   npages * sizeof(unsigned long long),
+                   cudaMemcpyHostToDevice);
+      } else {
+        dev_ssz = nullptr;
+      }
+    }
     void *dev_offs = nullptr;
     void *dev_csz = nullptr;
     if (cudaMalloc(&dev_offs, npages * sizeof(unsigned long long)) !=
@@ -443,6 +468,8 @@ class Vector {
       kv.second.hdr.decode_trace_ =
           std::getenv("CLIO_DECODE_TRACE") != nullptr ? 1u : 0u;
       kv.second.hdr.tier_base_ = base;
+      kv.second.hdr.stored_size_ =
+          static_cast<const unsigned long long *>(dev_ssz);
       kv.second.hdr.tier_off_ =
           static_cast<const unsigned long long *>(dev_offs);
       kv.second.hdr.tier_csize_ =
@@ -636,6 +663,8 @@ class Vector {
     char *tasks_base = nullptr;     // task slots
     char *multi_task_base = nullptr;  // batched-put task slots
     char *multi_tbl_base = nullptr;   // MultiBatch[] table
+    char *cscratch_base = nullptr;    // per-slot compressed-image scratch
+    ctp::ipc::AllocatorId cscratch_alloc;
     ctp::ipc::AllocatorId multi_tbl_alloc;
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
@@ -685,6 +714,16 @@ class Vector {
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nslots * sizeof(Page), &st.table_base);
+    // Per-slot scratch for a SPILLED encoded page's stored image, so the
+    // faulting warp can decode it without the compressor. Same memory kind as
+    // the pages: the bdev writes into it from the runtime side, so it has to
+    // be addressable there too. One page's worth per slot -- a stored image
+    // is never larger than the page, or it would have been stored raw.
+    // Only allocated for a GPU codec; nothing else can decode in-kernel.
+    if (IsGpuCodec(compress_lib_)) {
+      st.cscratch_alloc = ipc->AllocateAndRegisterGpuBackend(
+          gpu_id, page_kind, nslots * page_bytes_, &st.cscratch_base);
+    }
     // Batched writeback slots: enough per block that the block's WHOLE page
     // cache flushes in that many submissions (256 pages -> 4 batches). The
     // submission is the cost on this path, so the count is derived from the
@@ -869,6 +908,9 @@ class Vector {
     }
     v.size_ = num_elems_;
     v.pool_id_ = storage_pool_id_;
+    v.core_pool_id_ =
+        core_pool_id_.IsNull() ? storage_pool_id_ : core_pool_id_;
+    v.cscratch_ = st.cscratch_base;
     v.compress_lib_ = compress_lib_;
     v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
@@ -950,6 +992,7 @@ class Vector {
 
   /** Where page tasks are addressed. Point this at a COMPRESSOR pool to have
    *  pages stored compressed; it interposes and forwards to the core. */
+  clio::run::PoolId core_pool_id_;
   clio::run::PoolId storage_pool_id_;
   /** Codec wire id stamped on page puts; 0 stores raw. */
   int compress_lib_ = 0;
