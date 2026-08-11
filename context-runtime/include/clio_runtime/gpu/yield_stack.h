@@ -419,6 +419,38 @@ struct YieldFrame {
     }
 
 /**
+ * CLIO_YIELD_IF, plus a token telling the HOST what this block is waiting for.
+ *
+ * Identical suspend semantics; the difference is on the other side. A plain
+ * yield leaves the driver with nothing to go on, so it relaunches immediately
+ * and the block looks again -- which is fine when the wait is a copy and
+ * ruinous when it is a GPU decompress, measured at ~50 relaunches per fault
+ * against ~2. `tag` is handed to the driver's ResumeWhen so the host can test
+ * readiness cheaply and hold the block back until it is worth resuming.
+ *
+ * The token is opaque to the machinery: a device address to poll, a page id,
+ * a sequence number -- whatever the ResumeWhen on the host understands. It is
+ * cleared on resume so a later plain yield is not mistaken for this one.
+ */
+#define CLIO_YIELD_IF_RESUME_WHEN(cond, tag)                                  \
+  case __LINE__:                                                              \
+    if (__syncthreads_or((cond) ? 1 : 0)) {                                   \
+      _cy_f.Suspend(__LINE__);                                                \
+      if (threadIdx.x == 0) {                                                 \
+        clio::run::gpu::YieldTls().block_state_->wait_tag_ =                  \
+            static_cast<clio::run::u64>(tag);                                 \
+        clio::run::gpu::YieldTls().block_state_->status_ =                    \
+            clio::run::gpu::kYieldSuspended;                                  \
+      }                                                                       \
+      __threadfence_system();                                                 \
+      __syncthreads();                                                        \
+      return;                                                                 \
+    }                                                                         \
+    if (threadIdx.x == 0) {                                                   \
+      clio::run::gpu::YieldTls().block_state_->wait_tag_ = 0;                 \
+    }
+
+/**
  * Call another yieldable function, propagating a yield out through this one.
  *
  * The resume label sits BEFORE the call on purpose: coming back means
