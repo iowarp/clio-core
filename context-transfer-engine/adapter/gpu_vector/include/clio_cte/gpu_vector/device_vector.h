@@ -1491,7 +1491,18 @@ class DeviceVector {
     char name[32];
     PageBlobName(page_id, name);
     t->blob_name_ = name;
-    t->new_score_ = score;
+    // CLAMPED into the CTE's [0,1], for the same reason SubmitPut clamps: the
+    // device-side score is an unbounded eviction rank while the CTE's is a
+    // tier preference, and PodReorganizeBlob REJECTS anything outside [0,1].
+    //
+    // Callers say "pin this page" as 1000.0f and "release it" as -1000.0f --
+    // the flush and overlap benchmarks and the semantics test all do. Every
+    // one of those hints was therefore refused by the CTE and did nothing,
+    // silently, because a rescore is fire-and-forget and nobody reads its
+    // return code. The prefetch-hint feature was not merely weak, it was
+    // inert. Clamping preserves the intent exactly: >=1 means the fastest
+    // tier, <=0 means the slowest.
+    t->new_score_ = fminf(fmaxf(score, 0.0f), 1.0f);
     t->replica_ = 0;
     // Fire and forget: a hint that arrives late is still useful, and
     // waiting here would serialise the kernel behind placement.
