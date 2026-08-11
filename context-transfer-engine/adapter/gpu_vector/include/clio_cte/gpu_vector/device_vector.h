@@ -178,6 +178,24 @@ struct VecHeader {
   const unsigned long long *tier_chunk_off_ = nullptr;
   const unsigned int *tier_chunk_csz_ = nullptr;
   unsigned int tier_chunks_per_page_ = 0;
+
+  // ---- SPILLED encoded pages -------------------------------------------
+  // A page the tier map does not cover (its blob is on a host tier) still
+  // has to be decoded. Routing it through the compressor costs THREE task
+  // round trips, a codec slot and a stream sync per page -- measured at
+  // ~1.6ms against ~40us for a spilled raw page, which is why compression
+  // LOSES whenever it spills even though it moves 8x fewer bytes.
+  //
+  // These let the fault fetch the STORED bytes with one raw get (addressed
+  // at the core pool, so the compressor never sees it) into per-slot device
+  // scratch, and decode in the faulting warp exactly like a mapped page.
+  /** Stored (post-codec) size of every page, or ~0 when unknown. */
+  const unsigned long long *stored_size_ = nullptr;
+  /** CTE CORE pool -- bypasses the compressor interposer on the fault. */
+  clio::run::PoolId core_pool_id_;
+  /** nslots * page_bytes_ of device scratch, one slab per cache slot, for
+   *  the compressed image while it is being decoded. */
+  char *cscratch_ = nullptr;
   /** CLIO_DECODE_TRACE: printf each in-kernel decode failure (diagnosis). */
   unsigned int decode_trace_ = 0;
 };
@@ -1023,6 +1041,123 @@ class DeviceVector {
   CTP_GPU_FUN static unsigned char *NvScratch(unsigned warp) {
     __shared__ __align__(8) unsigned char nv_sm[kDecodeWarps][kWarpShmem];
     return nv_sm[warp % kDecodeWarps];
+  }
+
+  /**
+   * Parse a stored encoded blob's header ON THE DEVICE.
+   *
+   * Same layout and the same checks as the host ParseEncodedBlob -- they must
+   * agree, so the offsets are spelled out identically:
+   *
+   *   [CTEC 32B] +0 magic  +4 codec  +16 orig
+   *   [HLIF @32] +0 magic  +16 orig  +24 nchunks  +48 chunk_raw  +56 dstart
+   *              +72 chunk rel offsets[n]   +72+8n chunk sizes[n]
+   *
+   * The host version exists because the MAP is built host-side; this one
+   * exists because a spilled page's bytes only arrive on the device at fault
+   * time, and sending them back to the host to be parsed is the round trip
+   * this whole path is removing.
+   *
+   * @param blob   device pointer to the stored blob
+   * @param n      stored byte count
+   * @param orig_out   decoded size
+   * @param nchunks_out chunk count
+   * @param dstart_out  first chunk's offset from the HLIF base
+   * @return false if it is not a CTEC blob this decoder can read
+   */
+  CTP_GPU_FUN bool ParseEncodedBlobDevice(const unsigned char *blob,
+                                          clio::run::u64 n,
+                                          clio::run::u64 *orig_out,
+                                          clio::run::u64 *nchunks_out,
+                                          clio::run::u64 *dstart_out) const {
+    constexpr unsigned int kCtecMagic = 0x43544543u;
+    constexpr unsigned long long kHlifMagic = 1385239334ull;
+    if (n < 32 + 72) return false;
+    unsigned int m = 0;
+    memcpy(&m, blob, 4);
+    if (m != kCtecMagic) return false;                 // stored raw
+    unsigned long long orig = 0;
+    memcpy(&orig, blob + 16, 8);
+    if (orig == 0 || orig > h_->page_bytes_) return false;
+    const unsigned char *hl = blob + 32;
+    unsigned long long v = 0;
+    memcpy(&v, hl, 8);
+    if ((v & 0xffffffffull) != kHlifMagic) return false;
+    memcpy(&v, hl + 16, 8);
+    if (v != orig) return false;
+    unsigned long long nchunks = 0;
+    memcpy(&nchunks, hl + 24, 8);
+    if (nchunks == 0 || nchunks > kNvChunkMax) return false;
+    memcpy(&v, hl + 48, 8);
+    if (v != kNvChunkRaw) return false;
+    unsigned long long dstart = 0;
+    memcpy(&dstart, hl + 56, 8);
+    if (dstart != 72 + 16 * nchunks) return false;
+    if (n < 32 + dstart) return false;
+    *orig_out = orig;
+    *nchunks_out = nchunks;
+    *dstart_out = dstart;
+    return true;
+  }
+
+  /** Upper bound on chunks per page; page_bytes_ / kNvChunkRaw, +1 slack. */
+  static constexpr clio::run::u32 kNvChunkMax = 64u;
+
+  /**
+   * Warp-cooperative decode of a SPILLED page: the stored blob is sitting in
+   * device scratch (fetched by one raw get), not in the tier, so the chunk
+   * table is parsed from the blob itself rather than taken from the map.
+   *
+   * Byte arithmetic identical to the host mapper: a chunk lives at
+   * blob + 32 + dstart + rel, for `cs` bytes. If those two ever disagree the
+   * decode produces the wrong bytes silently, so they are written to match
+   * line for line.
+   */
+  CTP_GPU_FUN bool DecodeSpilledWarp(const unsigned char *blob,
+                                     clio::run::u64 n, Page *np,
+                                     unsigned char *sm) {
+    using lz4_decomp = decltype(
+        nvcomp::device::Grouptype<nvcomp::device::nvcomp_grouptype::warp>() +
+        nvcomp::device::Algo<nvcomp::device::nvcomp_algo::lz4>() +
+        nvcomp::device::Datatype<nvcomp::device::nvcomp_datatype::uint8>() +
+        nvcomp::device::Direction<
+            nvcomp::device::nvcomp_direction::decompress>() +
+        nvcomp::device::MaxUncompChunkSize<kNvChunkRaw>());
+    auto warp = cooperative_groups::tiled_partition<32>(
+        cooperative_groups::this_thread_block());
+
+    clio::run::u64 orig = 0, nchunks = 0, dstart = 0;
+    if (!ParseEncodedBlobDevice(blob, n, &orig, &nchunks, &dstart)) {
+      return false;
+    }
+    const unsigned char *hl = blob + 32;
+    for (clio::run::u64 c = 0; c < nchunks; ++c) {
+      unsigned long long rel = 0, cs = 0;
+      memcpy(&rel, hl + 72 + 8 * c, 8);
+      memcpy(&cs, hl + 72 + 8 * nchunks + 8 * c, 8);
+      if (cs == 0 || cs > 0xffffffffull) return false;
+      if (32 + dstart + rel + cs > n) return false;          // OOB
+      const clio::run::u64 done = c * kNvChunkRaw;
+      clio::run::u64 want = orig - done;
+      if (want > kNvChunkRaw) want = kNvChunkRaw;
+      lz4_decomp dc;
+      size_t out_sz = 0;
+      dc.decompress(reinterpret_cast<const char *>(blob) + 32 + dstart + rel,
+                    static_cast<char *>(np->data) + done,
+                    static_cast<size_t>(cs), &out_sz, sm,
+                    /*tmp_buf=*/nullptr, warp);
+      unsigned osz32 = static_cast<unsigned>(out_sz);
+      osz32 = __reduce_max_sync(0xffffffffu, osz32);
+      if (osz32 != static_cast<unsigned>(want)) {
+        if (h_->decode_trace_ && (threadIdx.x & 31u) == 0u) {
+          printf("[DECODE-FAIL spilled] c=%llu cs=%llu out=%u want=%llu\n",
+                 (unsigned long long) c, cs, osz32,
+                 (unsigned long long) want);
+        }
+        return false;
+      }
+    }
+    return true;
   }
 
   /** Warp-cooperative nvcomp decode of every chunk of `pg` into `np`'s

@@ -629,7 +629,8 @@ int main(int argc, char **argv) {
   std::fprintf(stderr,
                "GVW mode=%s%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
                "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
-               "checksum=%s put_errors=%llu rounds=%u\n",
+               "checksum=%s put_errors=%llu faults=%llu get_errors=%llu "
+               "evicts=%llu rounds=%u\n",
                compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
                yieldable ? "+yield" : "", blocks,
                (unsigned long long) hbm_mb, slots,
@@ -637,7 +638,10 @@ int main(int argc, char **argv) {
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
                (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
-               (unsigned long long) stats.put_errors, rounds);
+               (unsigned long long) stats.put_errors,
+               (unsigned long long) stats.faults,
+               (unsigned long long) stats.get_errors,
+               (unsigned long long) stats.evicts, rounds);
   return ok ? 0 : 1;
 }
 
