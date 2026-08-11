@@ -101,6 +101,12 @@ if(CLIO_CORE_ENABLE_CUDA)
         LABELS "cte;gpu;gpu_vector"
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
+        # The binary's DEFAULT shape (48 blocks x 8192 iters) is a manual
+        # wedge REPRODUCER cranked far past this budget (seeding alone runs
+        # ~6 min; iterations ~2 s each under storm backpressure). The
+        # registered test caps iterations so the byte-exactness verdict
+        # fits TIMEOUT; hunt wedges by running the binary directly.
+        ENVIRONMENT "CLIO_RACE_ITERS=48"
     )
     add_cuda_executable(test_gpu_vector_semantics FALSE
         test_gpu_vector_semantics_gpu.cc
