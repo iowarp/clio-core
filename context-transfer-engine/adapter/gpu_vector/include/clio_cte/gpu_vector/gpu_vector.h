@@ -322,9 +322,15 @@ class Vector {
       // tier offset + compressed size. Any validation failure leaves the
       // page on the fetch path — mapping must never guess.
       bool had_magic = false;
+      unsigned long long orig = 0;
       if (ParseEncodedBlob(base, o2, s2, raw_bytes, kChunkRaw,
                            &chunk_off[pg * cpp], &chunk_csz[pg * cpp], cpp,
-                           &had_magic)) {
+                           &had_magic, &orig)) {
+        // For a CHUNK-mapped page, tier_csize_ carries the DECODED size —
+        // the tail page's blob holds fewer bytes than the page extent, and
+        // decoding it to the padded size fails (out_sz mismatch) and then
+        // leaks the page to the CPU path, the one remaining wedge risk.
+        csz[pg] = orig;
         ++chunk_mapped;
       } else if (!had_magic && s2 <= raw_bytes) {
         // No CTEC magic and the stored size fits the page: the compressor
@@ -377,6 +383,8 @@ class Vector {
                  cudaMemcpyHostToDevice);
     }
     for (auto &kv : devs_) {
+      kv.second.hdr.decode_trace_ =
+          std::getenv("CLIO_DECODE_TRACE") != nullptr ? 1u : 0u;
       kv.second.hdr.tier_base_ = base;
       kv.second.hdr.tier_off_ =
           static_cast<const unsigned long long *>(dev_offs);
@@ -424,7 +432,8 @@ class Vector {
                         unsigned long long stored_size,
                         clio::run::u64 raw_bytes, clio::run::u64 chunk_raw,
                         unsigned long long *off_out, unsigned int *csz_out,
-                        clio::run::u64 cpp, bool *had_magic) {
+                        clio::run::u64 cpp, bool *had_magic,
+                        unsigned long long *orig_out) {
     constexpr clio::run::u32 kCtecMagic = 0x43544543u;
     constexpr unsigned long long kHlifMagic = 1385239334ull;
     *had_magic = false;
@@ -467,6 +476,7 @@ class Vector {
     // u32s (4 bytes of padding follow preset_).
     const unsigned long long orig = rd64(16);
     if (orig == 0 || orig > raw_bytes) return false;
+    *orig_out = orig;
     const unsigned char *h = p + 32;                          // HLIF stream
     auto hd64 = [&](clio::run::u64 at) {
       unsigned long long v;
@@ -476,7 +486,10 @@ class Vector {
     if ((hd64(0) & 0xffffffffull) != kHlifMagic) return false;
     if (hd64(16) != orig) return false;
     const unsigned long long nchunks = hd64(24);
-    if (nchunks != want_chunks) return false;
+    // Chunk count follows ORIG (the short tail has fewer), bounded by the
+    // table slice the caller allocated.
+    if (nchunks != (orig + chunk_raw - 1) / chunk_raw) return false;
+    if (nchunks > want_chunks) return false;
     if (hd64(48) != chunk_raw) return false;
     const unsigned long long dstart = hd64(56);
     if (dstart != 72 + 16 * nchunks) return false;

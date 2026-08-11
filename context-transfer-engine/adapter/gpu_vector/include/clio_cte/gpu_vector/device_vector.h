@@ -167,6 +167,8 @@ struct VecHeader {
   const unsigned long long *tier_chunk_off_ = nullptr;
   const unsigned int *tier_chunk_csz_ = nullptr;
   unsigned int tier_chunks_per_page_ = 0;
+  /** CLIO_DECODE_TRACE: printf each in-kernel decode failure (diagnosis). */
+  unsigned int decode_trace_ = 0;
 };
 
 template <typename T>
@@ -831,7 +833,11 @@ class DeviceVector {
   CTP_GPU_FUN bool DecodePageSerialInto(clio::run::u64 pg, char *dst) {
     const clio::run::u32 cpp = h_->tier_chunks_per_page_;
     const clio::run::u64 base_i = pg * cpp;
-    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
+    // Same decoded-size rule as DecodeChunksWarp (see there).
+    clio::run::u64 want_total =
+        h_->tier_csize_ != nullptr ? h_->tier_csize_[pg]
+                                   : h_->size_ * sizeof(T) -
+                                         pg * h_->page_bytes_;
     if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
     for (clio::run::u32 c = 0; c < cpp; ++c) {
       const clio::run::u64 done =
@@ -847,6 +853,12 @@ class DeviceVector {
                            csz,
                            reinterpret_cast<unsigned char *>(dst) + done,
                            want)) {
+        if (h_->decode_trace_) {
+          printf("[DECODE-FAIL serial] pg=%llu c=%u coff=%llu csz=%u "
+                 "want=%llu blk=%u tid=%u\n",
+                 (unsigned long long) pg, c, coff, csz,
+                 (unsigned long long) want, blockIdx.x, threadIdx.x);
+        }
         return false;
       }
     }
@@ -901,9 +913,14 @@ class DeviceVector {
         cooperative_groups::this_thread_block());
     const clio::run::u32 cpp = h_->tier_chunks_per_page_;
     const clio::run::u64 base_i = pg * cpp;
-    // The tail page decodes fewer bytes than page_bytes_; derive its true
-    // extent from the vector size rather than carrying a per-chunk table.
-    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
+    // DECODED size from the map (tier_csize_ carries it for chunk-mapped
+    // pages). Deriving it from the vector size was wrong for the tail page:
+    // the vector is page-padded, the blob is not, and demanding the padded
+    // size failed every tail decode and leaked the page to the CPU path.
+    clio::run::u64 want_total =
+        h_->tier_csize_ != nullptr ? h_->tier_csize_[pg]
+                                   : h_->size_ * sizeof(T) -
+                                         pg * h_->page_bytes_;
     if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
     bool ok = true;
     for (clio::run::u32 c = 0; c < cpp; ++c) {
@@ -928,6 +945,12 @@ class DeviceVector {
       unsigned osz32 = static_cast<unsigned>(out_sz);
       osz32 = __reduce_max_sync(0xffffffffu, osz32);
       if (osz32 != static_cast<unsigned>(want)) {
+        if (h_->decode_trace_ && (threadIdx.x & 31u) == 0u) {
+          printf("[DECODE-FAIL warp] pg=%llu c=%u coff=%llu csz=%u out=%u "
+                 "want=%llu blk=%u\n",
+                 (unsigned long long) pg, c, coff, csz, osz32,
+                 (unsigned long long) want, blockIdx.x);
+        }
         ok = false;
         break;
       }
