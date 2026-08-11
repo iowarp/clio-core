@@ -1347,7 +1347,9 @@ class DeviceVector {
 
     // 2. FETCH. Same shape: issue it from one lane, then leave.
     if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
-      BeginFetch(PageOf(off));
+      // A DEMAND fetch: the access already happened, so this counts as a
+      // fault but not as a prefetch.
+      BeginFetch(PageOf(off), /*is_prefetch=*/false);
     }
     // Hand the host the address of the completion flag this block is parked
     // on, so it can poll 4 bytes instead of relaunching the whole grid to ask.
@@ -1530,9 +1532,10 @@ class DeviceVector {
     return p != nullptr && !p->fetching;
   }
 
-  CTP_GPU_FUN bool BeginFetch(clio::run::u64 page_num) {
+  CTP_GPU_FUN bool BeginFetch(clio::run::u64 page_num,
+                              bool is_prefetch = true) {
     LockBlock();
-    const bool ok = BeginFetchLocked(page_num);
+    const bool ok = BeginFetchLocked(page_num, is_prefetch);
     UnlockBlock();
     return ok;
   }
@@ -2214,7 +2217,8 @@ class DeviceVector {
    * Claim a slot for `page_num` and start its get, without waiting.
    * Caller must hold the block lock.
    */
-  CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num) {
+  CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num,
+                                    bool is_prefetch = true) {
     if (Find(page_num) != nullptr) return true;   // resident or already coming
     // Encoded mapped pages never ride a CPU get (wedge class); this is a
     // prefetch, so simply decline — the demand path decodes in-kernel.
@@ -2245,15 +2249,24 @@ class DeviceVector {
     p->dirty = 0u;
     p->flushing = 0u;
     p->score = 0.0f;
-    SubmitGetAsync(p, page_num);
+    SubmitGetAsync(p, page_num, is_prefetch);
     return true;
   }
 
-  /** Issue this page's get and return immediately. */
-  CTP_GPU_FUN void SubmitGetAsync(Page *p, clio::run::u64 page_num) {
+  /**
+   * Issue this page's get and return immediately.
+   *
+   * @param is_prefetch true when this get was asked for AHEAD of the access
+   *        (an explicit BeginFetch hint), false when it is servicing a fault
+   *        that has already happened. Both are faults; only the former is a
+   *        prefetch, and conflating them made stat_prefetches_ meaningless
+   *        the moment the demand path started routing through here.
+   */
+  CTP_GPU_FUN void SubmitGetAsync(Page *p, clio::run::u64 page_num,
+                                  bool is_prefetch = true) {
     PrepareGet(p, page_num);
     Bump(h_->stat_faults_);
-    Bump(h_->stat_prefetches_);
+    if (is_prefetch) Bump(h_->stat_prefetches_);
     p->fetching = 1u;                     // already set by the claim; keep it
     p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
     if (p->get_fut.IsNull()) {
