@@ -1206,6 +1206,17 @@ class DeviceVector {
       StartEvictionAsync(PageOf(off));
     }
     CLIO_YIELD_IF(AnyTransferInFlight());
+    // Retire the writeback WITHIN this entry, before fetching. Not redundant
+    // with the prologue reap: without it the flushed page still occupies its
+    // slot, BeginFetch finds nothing free, and falls into the blocking
+    // EvictLocked -- which frees a slot whose put may still be reading it.
+    // That is how the seed lost writes (stored 0.6MB of a 1.0MB raw model)
+    // and how pages ended up holding each other's data.
+    if (threadIdx.x == 0) {
+      ReapFlushed();
+      ReapFetched();
+    }
+    __syncthreads();
 
     // 2. FETCH. Same shape: issue it from one lane, then leave.
     if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
@@ -1284,6 +1295,10 @@ class DeviceVector {
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
       if (p->fetching && p->get->fut_.is_complete_.load() != 0) {
+        // NOTE: a failed get is NOT freed here. First touch of a page that
+        // does not exist yet fails by design, and the slot staying claimed is
+        // what lets the write land (write-allocate). Freeing it instead made
+        // seeding loop forever and store nothing.
         AwaitFetch(p);          // complete already, so this cannot block
       }
     }

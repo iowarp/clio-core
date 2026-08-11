@@ -52,7 +52,12 @@ constexpr clio::run::u64 kPageBytes = 64 * 1024;
 constexpr clio::run::u64 kPageElems = kPageBytes / sizeof(clio::run::u32);
 const clio::run::PoolId kCompressorPool(512, 0);
 const clio::run::PoolId kCorePool(513, 0);
-constexpr int kLz4WireId = 4;   // CompressionFactory registry: {"lz4", 4, ...}
+constexpr int kLz4WireId = 4;      // registry: {"lz4", 4, ...}   CPU codec
+// GPU codec. This is the one that matters here: decompressing on the device
+// is impossible while a kernel spins on its fault, because the codec is itself
+// a kernel and cannot launch behind a resident one. A yielding fault path is
+// what makes it reachable at all.
+constexpr int kNvcompLz4WireId = 11;  // registry: {"nvcomp-lz4", 11, ...}
 
 /**
  * A weight that compresses like real model data, not like a test pattern.
@@ -65,6 +70,31 @@ constexpr int kLz4WireId = 4;   // CompressionFactory registry: {"lz4", 4, ...}
  * residency actually changes, without pretending weights are trivially
  * compressible.
  */
+CTP_INLINE_CROSS_FUN clio::run::u32 Weight(clio::run::u64 i);
+
+/**
+ * Is this page one of the highly compressible ones?
+ *
+ * Hashed rather than striped so the compressible pages are scattered through
+ * the model: a contiguous compressible half would let the tier hold a solid
+ * run of it and flatter residency for reasons that have nothing to do with the
+ * ratio.
+ */
+CTP_INLINE_CROSS_FUN bool PageIsFlat(clio::run::u64 page, clio::run::u32 pct) {
+  clio::run::u32 h = static_cast<clio::run::u32>(page * 2654435761u);
+  h ^= h >> 15;
+  return (h % 100u) < pct;
+}
+
+CTP_INLINE_CROSS_FUN clio::run::u32 Weight(clio::run::u64 i,
+                                           clio::run::u32 flat_pct) {
+  // A flat page is a single repeated value: what a byte codec collapses.
+  if (PageIsFlat(i / kPageElems, flat_pct)) {
+    return 0x01010101u;
+  }
+  return Weight(i);
+}
+
 CTP_INLINE_CROSS_FUN clio::run::u32 Weight(clio::run::u64 i) {
   // Runs of kRun identical values: structured weight data repeats locally,
   // and it is that repetition -- not the value distribution -- that a byte
@@ -101,6 +131,7 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
                                 clio::run::u64 per,
                                 clio::run::u64 page_elems,
+                                clio::run::u32 flat_pct,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -121,7 +152,7 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
           (off + page_elems <= per) ? page_elems : (per - off);
       // The page is resident for the whole block, so every lane may write.
       for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        v[base + off + i] = Weight(base + off + i);
+        v[base + off + i] = Weight(base + off + i, flat_pct);
       }
     }
   }
@@ -215,6 +246,8 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
                                    clio::run::u64 per,
                                    clio::run::u64 page_elems,
                                    unsigned long long *sum,
+                                   unsigned long long *page_sum,
+                                   unsigned *page_visits,
                                    gy::YieldableView<> yv,
                                    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -253,6 +286,10 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
              Activation(base + off + i);
       }
       acc += r;
+      atomicAdd(&page_sum[(base + off) / page_elems], r);
+      if (threadIdx.x == 0) {
+        atomicAdd(&page_visits[(base + off) / page_elems], 1u);
+      }
     }
   }
   atomicAdd(sum, acc);
@@ -267,9 +304,11 @@ int main(int argc, char **argv) {
   clio::run::u64 pages_per_block = 16;
   clio::run::u32 slots = 4;
   bool compressed = false;
+  bool gpu_codec = true;   // nvcomp by default; --cpu-codec for lz4
   int prefetch = 1;
   int repeat = 3;
   bool yieldable = false;
+  clio::run::u32 flat_pct = 0;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -279,8 +318,10 @@ int main(int argc, char **argv) {
     else if (a == "--pages") pages_per_block = static_cast<clio::run::u64>(next());
     else if (a == "--slots") slots = static_cast<clio::run::u32>(next());
     else if (a == "--compressed") compressed = true;
+    else if (a == "--cpu-codec") gpu_codec = false;
     else if (a == "--no-prefetch") prefetch = 0;
     else if (a == "--yieldable") yieldable = true;
+    else if (a == "--flat-pct") flat_pct = static_cast<clio::run::u32>(next());
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
@@ -352,7 +393,9 @@ int main(int argc, char **argv) {
 
   gv::Vector<clio::run::u32> vec(tag, {0}, kPageBytes, blocks, slots, n,
                                  kCompressorPool,
-                                 compressed ? kLz4WireId : 0);
+                                 compressed ? (gpu_codec ? kNvcompLz4WireId
+                                                        : kLz4WireId)
+                                            : 0);
 
   if (yieldable) {
     gy::Yieldable<> sdrv(blocks, 32);
@@ -360,13 +403,13 @@ int main(int argc, char **argv) {
     const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           SeedKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu_info, vec.GetDevice(0), per, kPageElems, view,
+              gpu_info, vec.GetDevice(0), per, kPageElems, flat_pct, view,
               sstack.View());
         },
         []{}, /*max_rounds=*/200000);
     std::fprintf(stderr, "[seed] yieldable, rounds=%u\n", seed_rounds);
   } else {
-    SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
+      SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
   }
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::fprintf(stderr, "bench: seed failed\n");
@@ -389,9 +432,14 @@ int main(int argc, char **argv) {
 
   unsigned long long *d_sum = nullptr;
   cudaMalloc(&d_sum, sizeof(unsigned long long));
+  const clio::run::u64 total_pages = n / kPageElems;
+  unsigned long long *d_page_sum = nullptr;
+  unsigned *d_page_visits = nullptr;
+  cudaMalloc(&d_page_sum, total_pages * sizeof(unsigned long long));
+  cudaMalloc(&d_page_visits, total_pages * sizeof(unsigned));
   unsigned long long want = 0;
   for (clio::run::u64 i = 0; i < n; ++i) {
-    want += static_cast<unsigned long long>(Weight(i)) * Activation(i);
+    want += static_cast<unsigned long long>(Weight(i, flat_pct)) * Activation(i);
   }
 
   double best_gbps = 0.0;
@@ -400,6 +448,8 @@ int main(int argc, char **argv) {
   bool ok = true;
   for (int r = 0; r < repeat; ++r) {
     cudaMemset(d_sum, 0, sizeof(unsigned long long));
+    cudaMemset(d_page_sum, 0, total_pages * sizeof(unsigned long long));
+    cudaMemset(d_page_visits, 0, total_pages * sizeof(unsigned));
     const clio::run::u64 t0 = NowMs();
     if (yieldable) {
       gy::Yieldable<> drv(blocks, 32);
@@ -407,8 +457,8 @@ int main(int argc, char **argv) {
       rounds = drv.RunToCompletion(
           [&](dim3 g, dim3 b, gy::YieldableView<> view) {
             WeightsKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-                gpu_info, vec.GetDevice(0), per, kPageElems, d_sum, view,
-                ystack.View());
+                gpu_info, vec.GetDevice(0), per, kPageElems, d_sum, d_page_sum,
+                d_page_visits, view, ystack.View());
           },
           []{}, /*max_rounds=*/200000);
     } else {
@@ -427,6 +477,28 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "[cmp] got=%llu want=%llu ratio=%.4f\n",
                    (unsigned long long) got, (unsigned long long) want,
                    want ? (double) got / (double) want : 0.0);
+      std::vector<unsigned long long> ps(total_pages);
+      std::vector<unsigned> pv(total_pages);
+      cudaMemcpy(ps.data(), d_page_sum,
+                 total_pages * sizeof(unsigned long long),
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(pv.data(), d_page_visits, total_pages * sizeof(unsigned),
+                 cudaMemcpyDeviceToHost);
+      int shown = 0;
+      for (clio::run::u64 p = 0; p < total_pages && shown < 6; ++p) {
+        unsigned long long w = 0;
+        for (clio::run::u64 e = 0; e < kPageElems; ++e) {
+          const clio::run::u64 i = p * kPageElems + e;
+          w += (unsigned long long) Weight(i, flat_pct) * Activation(i);
+        }
+        if (ps[p] != w) {
+          std::fprintf(stderr,
+                       "  page %llu: visits=%u got=%llu want=%llu %s\n",
+                       (unsigned long long) p, pv[p], ps[p], w,
+                       (pv[p] != 1) ? "<- visited != once" : "<- wrong data");
+          ++shown;
+        }
+      }
     }
     const double gbps =
         (ms == 0) ? 0.0
@@ -441,11 +513,12 @@ int main(int argc, char **argv) {
 
   std::fprintf(stderr,
                "GVW mode=%s%s blocks=%u hbm=%lluMB slots=%u pages=%llu "
-               "logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
+               "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
                "checksum=%s rounds=%u\n",
-               compressed ? "lz4" : "raw", yieldable ? "+yield" : "", blocks,
+               compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
+               yieldable ? "+yield" : "", blocks,
                (unsigned long long) hbm_mb, slots,
-               (unsigned long long) (n / kPageElems),
+               (unsigned long long) (n / kPageElems), flat_pct,
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
                (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
