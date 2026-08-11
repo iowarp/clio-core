@@ -306,6 +306,7 @@ int main(int argc, char **argv) {
   // decode with; the in-kernel nvcomp decoder is warp-cooperative, so a wider
   // block is what lets several pages decode at once.
   clio::run::u32 nthreads = 32;
+  clio::run::u32 rt_threads = 8;   // runtime worker threads
   clio::run::u64 pages_per_block = 16;
   clio::run::u32 slots = 4;
   bool compressed = false;
@@ -322,6 +323,7 @@ int main(int argc, char **argv) {
     else if (a == "--hbm-mb") hbm_mb = static_cast<clio::run::u64>(next());
     else if (a == "--hbm-only") hbm_only = true;
     else if (a == "--threads") nthreads = static_cast<clio::run::u32>(next());
+    else if (a == "--rt-threads") rt_threads = static_cast<clio::run::u32>(next());
     else if (a == "--pages") pages_per_block = static_cast<clio::run::u64>(next());
     else if (a == "--slots") slots = static_cast<clio::run::u32>(next());
     else if (a == "--compressed") compressed = true;
@@ -351,7 +353,7 @@ int main(int argc, char **argv) {
         // the 1000us default a fault costs ~5ms regardless of where the page
         // lives, which buries the tier/codec difference this benchmark exists
         // to measure. Keep them spinning for the duration of a run.
-        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
+        << "runtime:\n  num_threads: " << rt_threads << "\n  queue_depth: 8192\n"
         << "  first_busy_wait: 2000000000\n\n"
         << "gpu:\n  queue_depth: 8192\n\n"
         << "compose:\n"

@@ -388,6 +388,15 @@ private:
    * Only the compressed side needs a buffer. The decompressed side is the
    * caller's page, written directly.
    */
+public:
+  /** Chunk table of one stored blob (public so the parser can fill it). */
+  struct BlobChunksPub {
+    unsigned long long orig = 0;
+    unsigned long long chunk_raw = 0;
+    std::vector<unsigned long long> rel;
+    std::vector<unsigned long long> csz;
+  };
+
   /** One page's worth of work for the batched decompressor. */
   struct DecompItem {
     const void *src_device = nullptr;  // stored blob, device memory
@@ -396,12 +405,7 @@ private:
     size_t dst_bytes = 0;
   };
 
-  /**
-   * Decompress every item in ONE nvcomp launch on the module stream, with a
-   * single synchronize for the whole batch.
-   */
-  size_t GpuDecompressBatch(const std::vector<DecompItem> &items,
-                            std::vector<char> *ok);
+private:
 
   /**
    * The compression module's ONE CUDA stream.
@@ -415,6 +419,30 @@ private:
    */
   void *ModuleStream();
   void *module_stream_ = nullptr;
+
+  // ---- persistent state for the batched decoder (drain thread ONLY) ----
+  //
+  // The first implementation paid, PER DRAIN: one cudaStreamSynchronize per
+  // item to read its header, seven cudaMalloc/cudaFree pairs for the
+  // descriptor arrays and temp, and uploads from pageable std::vector memory
+  // (which cudaMemcpyAsync stages synchronously). ~260 drains made that
+  // thousands of hidden synchronization points before nvcomp ever ran --
+  // the decompression itself was never the cost.
+  /** Pinned staging for batched header reads (cache misses only). */
+  void *bd_hdrpin_ = nullptr;
+  size_t bd_hdrpin_cap_ = 0;
+  /** Parsed chunk table per stored blob. A blob's table never changes, so a
+   *  page refaulted N times parses its header ONCE, not N times. */
+  struct CachedChunks {
+    size_t stored_size = 0;
+    int wire = 0;        // codec from the blob's CTEC header
+    BlobChunksPub bc;
+  };
+  std::unordered_map<const void *, CachedChunks> bd_cache_;
+  /** Bumped on every put; the drain clears bd_cache_ when it moves, because a
+   *  rewritten blob's chunk table is stale the moment the put lands. */
+  std::atomic<unsigned long long> tier_write_gen_{0};
+  unsigned long long bd_cache_gen_ = ~0ull;
 
   struct CodecSlot {
     void *buf = nullptr;   // compressed bytes, CUdeviceptr in codec_ctx_
@@ -478,6 +506,16 @@ private:
      * and the compressed payload never touches the host at all.
      */
     const void *src_device = nullptr;
+    /**
+     * True only when src_device is STABLE storage (the blob's home on a
+     * device tier). Scratch buffers are reused across pages -- same pointer,
+     * different blob every fault, and compressed sizes cluster tightly enough
+     * that (pointer, size) collides -- so caching a scratch blob's chunk
+     * table serves ANOTHER page's table on the next fault. Measured: every
+     * failure in a mixed batch carried the same stale csz from a previous
+     * occupant of its scratch slot. Only stable sources may be cached.
+     */
+    bool src_stable = false;
     size_t stored_size = 0;
     void *dst = nullptr;
     size_t dst_bytes = 0;
@@ -485,6 +523,131 @@ private:
     std::atomic<bool> abandoned{false};
     bool ok = false;
   };
+
+  /**
+   * Per-REQUEST async decompress: the worker coroutine that owns the fault
+   * launches its own decode on the module stream and yield-polls the event.
+   *
+   * This exists because the drain-thread design, however its batching was
+   * tuned, added a cross-thread hop to every fault: worker -> queue -> drain
+   * -> GPU -> retire poll -> publish -> worker's own poll. Measured 580us per
+   * fault against raw's ~65us, with batches averaging 1.7 because faults
+   * arrive staggered, not together. The raw path is fast precisely because
+   * the worker enqueues its own transfer and polls its own flag; this gives
+   * the codec path the same shape. Concurrent workers' kernels queue
+   * back-to-back on the ONE module stream -- that queue is the pipeline.
+   *
+   * A slot holds the descriptor arenas for up to kSlotMaxChunks chunks
+   * (pinned + device, preallocated once). The shared temp is safe because a
+   * single stream serializes the kernels that use it.
+   */
+  struct DecompSlot {
+    void *pin = nullptr;
+    void *dev = nullptr;
+    void *ev = nullptr;      // cudaEvent_t
+    size_t nch = 0;
+    std::vector<size_t> item_first;
+    std::vector<size_t> item_n;
+    bool busy = false;
+  };
+  static constexpr size_t kDecompSlots = 64;
+  static constexpr size_t kSlotMaxChunks = 64;
+  DecompSlot dslots_[kDecompSlots];
+  std::mutex dslot_mu_;   // slot claim/free + temp high-water only
+  void *dtemp_ = nullptr;
+  size_t dtemp_cap_ = 0;
+  size_t dtemp_bytes_ = 0;
+  size_t dtemp_hw_nch_ = 0;
+  size_t dtemp_hw_unc_ = 0;
+
+  /**
+   * Launch the decode of one or more pages sharing a slot.
+   * @param items  each: {src_device, stored_size, header snapshot, dst,
+   *               dst_bytes}; every chunk of every item rides one launch.
+   * @return slot index, or -1 (no slot free / nothing parseable -- caller
+   *         falls back).
+   */
+  struct OneDecomp {
+    const void *src = nullptr;
+    size_t stored = 0;
+    const char *hdr = nullptr;
+    size_t hdr_len = 0;
+    void *dst = nullptr;
+    size_t dst_bytes = 0;
+  };
+  int LaunchDecompOne(const OneDecomp *items, size_t n);
+
+  /**
+   * COMBINING front door for the fault path, built around the measured
+   * ~151us FIXED cost of one nvcompBatched*DecompressAsync launch (flat from
+   * 1 to 64 chunks -- 150.6us/chunk at batch=1, 2.4us/chunk at batch=64).
+   * Nothing else about this path's cost matters; only chunks per launch.
+   *
+   * A faulting coroutine pushes its request and then: if a launch is in
+   * flight, it simply yield-polls its own flag -- its request rides the NEXT
+   * launch, which whoever gets there first will issue with EVERYTHING queued
+   * by then. The 151us the GPU spends on a launch IS the accumulation window
+   * for the next one; no linger, no drain thread, no cross-thread handoff.
+   */
+  struct CombineReq {
+    OneDecomp od;
+    std::vector<char> hdr_copy;   // keeps od.hdr alive across the wait
+    std::atomic<int> state{0};    // 0 pending, 1 ok, 2 failed
+  };
+  std::mutex comb_mu_;            // guards comb_q_ only
+  std::vector<std::shared_ptr<CombineReq>> comb_q_;
+  std::atomic<bool> comb_launching_{false};
+
+  /** Push `req`, then either launch (taking everything queued) or yield until
+   *  someone else's launch serves it. Returns with req->state settled. */
+  clio::run::TaskResume CombinedDecompWait(std::shared_ptr<CombineReq> req);
+  /** @return -1 still running, else a bitmask-free result: 1 all ok, 0 any
+   *  failed. Frees the slot when it returns >= 0. Item i's own result is in
+   *  ok_out[i] when provided. */
+  int DecompPoll(int slot, char *ok_out, size_t n);
+
+  /**
+   * One in-flight decompress batch. NOTHING in the compressor blocks on it:
+   * the launch records an event and returns; RetireBatches() polls the event
+   * (cudaEventQuery, never a synchronize) and publishes results when it has
+   * fired. The drain thread's sleep between polls is the yield.
+   *
+   * Each segment owns its arenas so several batches can be in flight without
+   * sharing buffers: pinned host (async copies from pageable memory silently
+   * synchronize), a device mirror, and a grow-only nvcomp temp with the
+   * high-water marks that let TempSize be skipped when a batch fits a shape
+   * already computed.
+   */
+  struct BatchSeg {
+    void *pin = nullptr;
+    size_t pin_cap = 0;
+    void *dev = nullptr;
+    size_t dev_cap = 0;
+    void *temp = nullptr;
+    size_t temp_cap = 0;
+    size_t temp_bytes = 0;   // requirement at the high-water shape
+    size_t hw_nch = 0;       // high-water chunk count for temp reuse
+    size_t hw_maxunc = 0;
+    void *ev = nullptr;      // cudaEvent_t, created on first use
+    bool busy = false;
+    std::vector<std::shared_ptr<PendingDecomp>> owners;
+    std::vector<size_t> item_first;
+    std::vector<size_t> item_n;
+    size_t nch = 0;
+  };
+  static constexpr size_t kBatchSegs = 4;
+  BatchSeg bd_segs_[kBatchSegs];
+
+  /**
+   * Launch one batch covering `batch`'s device-resident items, WITHOUT
+   * waiting for it. Items it cannot serve are published done/!ok immediately
+   * so their waiters take the fallback path. Returns false if no segment was
+   * free (caller retires and retries).
+   */
+  bool LaunchDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch);
+
+  /** Poll every busy segment; publish + free the finished ones. Never blocks. */
+  size_t RetireBatches();
   std::mutex batch_mu_;
   std::vector<std::shared_ptr<PendingDecomp>> batch_;
   std::thread batch_thread_;

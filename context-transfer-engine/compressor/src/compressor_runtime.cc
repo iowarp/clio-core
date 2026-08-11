@@ -1455,44 +1455,17 @@ bool Runtime::InitCodecContext() {
 
 void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch) {
   if (batch.empty()) return;
-#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
-  // Build ONE batch covering every pending page and hand it to nvcomp in a
-  // single launch. The old shape here decompressed page by page and
-  // synchronized after each, which is what made a spilled page cost ~1.6ms:
-  // the manager API synchronizes twice per call (create_manager parses the
-  // header on the host, Decompress waits at the end), so N pages meant 2N
-  // serialization points however they were queued.
-  std::vector<DecompItem> items;
-  std::vector<size_t> idx;
-  items.reserve(batch.size());
-  idx.reserve(batch.size());
-  for (size_t i = 0; i < batch.size(); ++i) {
-    auto &p = batch[i];
-    if (p->abandoned.load(std::memory_order_acquire)) continue;
-    if (p->src_device == nullptr) continue;   // host-sourced: not this path
-    DecompItem it;
-    it.src_device = p->src_device;
-    it.stored_size = p->stored_size;
-    it.dst_device = p->dst;
-    it.dst_bytes = p->dst_bytes;
-    items.push_back(it);
-    idx.push_back(i);
-  }
-  if (!items.empty()) {
-    std::vector<char> ok;
-    const size_t n = GpuDecompressBatch(items, &ok);
-    for (size_t k = 0; k < idx.size(); ++k) {
-      batch[idx[k]]->ok = (k < ok.size() && ok[k] != 0);
+  RetireBatches();
+  // The only wait here is for a free SEGMENT, and it is a poll+sleep over
+  // RetireBatches -- nothing in the compressor calls cudaStreamSynchronize.
+  while (!LaunchDecompBatch(batch)) {
+    if (batch_stop_.load(std::memory_order_acquire)) {
+      for (auto &p : batch) p->done.store(true, std::memory_order_release);
+      return;
     }
-    if (getenv("CLIO_CODEC_TRACE")) {
-      fprintf(stderr, "[DRAIN] batch=%zu decoded=%zu in ONE launch\n",
-              items.size(), n);
-      fflush(stderr);
-    }
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+    RetireBatches();
   }
-#endif
-  // Publish LAST: a waiter may be freed the instant it observes done.
-  for (auto &p : batch) p->done.store(true, std::memory_order_release);
 }
 
 /**
@@ -1518,56 +1491,62 @@ void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch)
  * every chunk of every page in the batch at once -- not across launches.
  */
 void Runtime::BatchDrainLoop() {
-  // Linger before draining. Taking the queue the moment it is non-empty yields
-  // batches of one, and a batch of one costs what no batching costs -- the
-  // context entry is charged per ENTRY, not per page. Bounded both ways: stop
-  // early once enough have gathered, give up after kLingerMaxUs so a lone
-  // fault is not held hostage to peers that never arrive.
-  constexpr int kLingerStepUs = 50;
-  int kLingerMaxUs = 400;
-  if (const char *e = std::getenv("CLIO_COMPRESS_LINGER_US")) {
-    const int v = std::atoi(e);
-    if (v > 0) kLingerMaxUs = v;
-  }
-  // How many pages to gather before launching. NOT codec_slots_.size(): the
-  // batched decompressor does not take a codec slot per page -- it builds its
-  // own descriptor arrays and hands nvcomp every chunk in one call -- so the
-  // slot count was an unrelated cap that held batches to 8-16. The linger
-  // bound below still stops a lone fault waiting on peers that never come.
-  size_t target = 128;
-  if (const char *e = std::getenv("CLIO_COMPRESS_BATCH_TARGET")) {
-    const long v = std::atol(e);
-    if (v > 0) target = static_cast<size_t>(v);
-  }
+  // GATHER WHILE THE GPU WORKS. One batch in flight at a time; while it runs,
+  // arrivals accumulate, and the accumulation IS the next batch. That sizes
+  // batches to the arrival rate with no tunable at all:
+  //
+  //   - a fixed linger (tried: 400us) added its full duration to every
+  //     fault's latency -- 27873 relaunch rounds against raw's 1704;
+  //   - zero linger with eager launches (tried) produced batches of 1-2 and
+  //     ~1400 kernel launches, each paying full launch+kernel latency.
+  //
+  // With one batch outstanding, the first fault launches immediately (no
+  // added latency) and every later fault rides the next natural batch. No
+  // synchronize anywhere: the launch records an event, retire polls it.
   while (!batch_stop_.load(std::memory_order_acquire)) {
-    size_t queued = 0;
-    {
-      std::lock_guard<std::mutex> g(batch_mu_);
-      queued = batch_.size();
-    }
-    if (queued == 0) {
-      std::this_thread::sleep_for(std::chrono::microseconds(kLingerStepUs));
+    RetireBatches();
+    bool busy = false;
+    for (auto &c : bd_segs_) busy = busy || c.busy;
+    if (busy) {
+      // Let arrivals accumulate; poll tightly so retirement is prompt.
+      std::this_thread::sleep_for(std::chrono::microseconds(5));
       continue;
     }
-    for (int waited = 0; queued < target && waited < kLingerMaxUs;
-         waited += kLingerStepUs) {
-      std::this_thread::sleep_for(std::chrono::microseconds(kLingerStepUs));
-      std::lock_guard<std::mutex> g(batch_mu_);
-      queued = batch_.size();
+    // Linger BOUNDED and only while nothing is in flight: with the measured
+    // ~151us fixed cost per nvcomp launch, a batch of 1 costs 60x more per
+    // chunk than a batch of 64, so waiting a fraction of a launch's cost to
+    // gather peers is a net win. (Tried without: batches of 1-2, and both the
+    // 128MB and 2GB runs got SLOWER than with the linger.)
+    int linger_us = 300;
+    if (const char *e = std::getenv("CLIO_COMPRESS_LINGER_US")) {
+      const int v = std::atoi(e);
+      if (v >= 0) linger_us = v;
+    }
+    {
+      size_t q = 0;
+      for (int waited = 0; waited < linger_us; waited += 50) {
+        {
+          std::lock_guard<std::mutex> g(batch_mu_);
+          q = batch_.size();
+        }
+        if (q >= 32) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
     }
     std::vector<std::shared_ptr<PendingDecomp>> mine;
     {
       std::lock_guard<std::mutex> g(batch_mu_);
       mine.swap(batch_);
     }
-    if (mine.empty()) continue;
+    if (mine.empty()) {
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+      continue;
+    }
     const bool trace = getenv("CLIO_CODEC_TRACE") != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     RunDecompBatch(mine);
     if (trace) {
-      size_t nok = 0;
-      for (auto &p : mine) nok += p->ok ? 1 : 0;
-      fprintf(stderr, "[DRAIN] batch=%zu ok=%zu in %.1f ms\n", mine.size(), nok,
+      fprintf(stderr, "[DRAIN] gathered=%zu in %.1f ms\n", mine.size(),
               std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0).count());
       fflush(stderr);
@@ -1740,12 +1719,7 @@ bool NvcompBatchedDecompressImpl(int wire, const void *const *cptr,
  *             +56 dstart       +72 rel offsets[n]     +72+8n sizes[n]
  *   chunk c lives at blob + 32 + dstart + rel[c], for size[c] bytes.
  */
-struct BlobChunks {
-  unsigned long long orig = 0;       // decoded bytes
-  unsigned long long chunk_raw = 0;  // uncompressed bytes per chunk
-  std::vector<unsigned long long> rel;   // chunk offset from blob start
-  std::vector<unsigned long long> csz;   // chunk compressed bytes
-};
+using BlobChunks = Runtime::BlobChunksPub;
 
 constexpr unsigned int kCtecMagic = 0x43544543u;
 constexpr unsigned long long kHlifMagic = 1385239334ull;
@@ -1820,120 +1794,598 @@ void *Runtime::ModuleStream() {
   return module_stream_;
 }
 
-size_t Runtime::GpuDecompressBatch(const std::vector<DecompItem> &items,
-                                   std::vector<char> *ok) {
-  ok->assign(items.size(), 0);
-  if (items.empty()) return 0;
+int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
-  CodecCtxGuard guard(codec_ctx_);
-  if (!guard.ok()) return 0;
-  cudaStream_t stream = static_cast<cudaStream_t>(ModuleStream());
-  if (stream == nullptr) return 0;
-
-  // 1. Read every blob's header and chunk table. This is the only host-side
-  //    traffic: ~a few hundred bytes per page, never the payload.
-  const size_t kHdrMax = 32 + 72 + 16 * 1024;   // enough for 1024 chunks
-  std::vector<unsigned char> hdr(kHdrMax);
-  std::vector<BlobChunks> parsed(items.size());
-  std::vector<char> usable(items.size(), 0);
+  if (items == nullptr || n == 0) return -1;
+  // Parse every item's chunk table from its HOST header snapshot -- no device
+  // traffic before the launch.
+  std::vector<BlobChunks> bc(n);
+  std::vector<char> okp(n, 0);
   int wire = 0;
-  for (size_t i = 0; i < items.size(); ++i) {
-    const size_t want = std::min(items[i].stored_size, kHdrMax);
-    if (cudaMemcpyAsync(hdr.data(), items[i].src_device, want,
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
+  size_t nch = 0, max_unc = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (items[i].hdr == nullptr || items[i].hdr_len < 8) continue;
+    int w = 0;
+    std::memcpy(&w, items[i].hdr + 4, 4);
+    if (wire == 0) wire = w;
+    if (w != wire) continue;
+    if (!ParseBlobChunks(
+            reinterpret_cast<const unsigned char *>(items[i].hdr),
+            items[i].hdr_len, items[i].stored, &bc[i])) {
       continue;
     }
-    int w = 0;
-    std::memcpy(&w, hdr.data() + 4, 4);
-    if (wire == 0) wire = w;
-    if (w != wire) continue;                    // mixed codecs: next batch
-    if (!ParseBlobChunks(hdr.data(), want, items[i].stored_size, &parsed[i])) {
-      continue;                                  // raw or unparseable
+    okp[i] = 1;
+    nch += bc[i].rel.size();
+  }
+  if (wire == 0 || nch == 0 || nch > kSlotMaxChunks) return -1;
+
+  // Claim a slot; allocate its arenas on first use.
+  const size_t st_sz = sizeof(nvcompStatus_t);
+  const size_t arena =
+      kSlotMaxChunks * (8 * 5) + ((kSlotMaxChunks * st_sz + 7) & ~size_t(7));
+  int si = -1;
+  {
+    std::lock_guard<std::mutex> g(dslot_mu_);
+    for (size_t k = 0; k < kDecompSlots; ++k) {
+      if (!dslots_[k].busy) {
+        dslots_[k].busy = true;
+        si = static_cast<int>(k);
+        break;
+      }
     }
-    usable[i] = 1;
+  }
+  if (si < 0) return -1;
+  DecompSlot &sl = dslots_[si];
+  auto release = [&]() {
+    std::lock_guard<std::mutex> g(dslot_mu_);
+    sl.busy = false;
+  };
+  CodecCtxGuard guard(codec_ctx_);
+  cudaStream_t stream =
+      guard.ok() ? static_cast<cudaStream_t>(ModuleStream()) : nullptr;
+  if (stream == nullptr) { release(); return -1; }
+  if (sl.pin == nullptr && cudaMallocHost(&sl.pin, arena) != cudaSuccess) {
+    sl.pin = nullptr; release(); return -1;
+  }
+  if (sl.dev == nullptr && cudaMalloc(&sl.dev, arena) != cudaSuccess) {
+    sl.dev = nullptr; release(); return -1;
+  }
+  if (sl.ev == nullptr &&
+      cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(&sl.ev),
+                               cudaEventDisableTiming) != cudaSuccess) {
+    sl.ev = nullptr; release(); return -1;
   }
 
-  // 2. Flatten every page's chunks into one batch.
-  std::vector<const void *> h_cptr;
-  std::vector<size_t> h_csz, h_obytes;
-  std::vector<void *> h_optr;
-  std::vector<size_t> item_first(items.size(), 0), item_n(items.size(), 0);
-  size_t max_unc = 0;
-  for (size_t i = 0; i < items.size(); ++i) {
-    if (!usable[i]) continue;
-    item_first[i] = h_cptr.size();
-    const BlobChunks &b = parsed[i];
+  // Fixed strides (kSlotMaxChunks), so host and device layouts can never
+  // disagree however many chunks a launch carries.
+  char *pin = static_cast<char *>(sl.pin);
+  char *dev = static_cast<char *>(sl.dev);
+  const size_t C = kSlotMaxChunks;
+  auto *h_cptr = reinterpret_cast<const void **>(pin);
+  auto *h_csz = reinterpret_cast<size_t *>(pin + C * 8);
+  auto *h_obytes = reinterpret_cast<size_t *>(pin + C * 16);
+  auto *h_optr = reinterpret_cast<void **>(pin + C * 24);
+  sl.item_first.assign(n, 0);
+  sl.item_n.assign(n, 0);
+  size_t w = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!okp[i]) continue;
+    sl.item_first[i] = w;
+    const BlobChunks &b = bc[i];
     for (size_t c = 0; c < b.rel.size(); ++c) {
       const unsigned long long done = c * b.chunk_raw;
       if (done >= b.orig) break;
       size_t want = static_cast<size_t>(b.orig - done);
       if (want > b.chunk_raw) want = static_cast<size_t>(b.chunk_raw);
       if (done + want > items[i].dst_bytes) break;
-      h_cptr.push_back(static_cast<const char *>(items[i].src_device) +
-                       b.rel[c]);
-      h_csz.push_back(static_cast<size_t>(b.csz[c]));
-      h_obytes.push_back(want);
-      h_optr.push_back(static_cast<char *>(items[i].dst_device) + done);
+      h_cptr[w] = static_cast<const char *>(items[i].src) + b.rel[c];
+      h_csz[w] = static_cast<size_t>(b.csz[c]);
+      h_obytes[w] = want;
+      h_optr[w] = static_cast<char *>(items[i].dst) + done;
       if (want > max_unc) max_unc = want;
-      ++item_n[i];
+      ++w;
+      ++sl.item_n[i];
     }
   }
-  if (h_cptr.empty()) return 0;
-  const size_t nch = h_cptr.size();
-
-  // 3. Upload the descriptor arrays and run ONE batched decompress.
-  DeviceArray<const void *> d_cptr(h_cptr, stream);
-  DeviceArray<size_t> d_csz(h_csz, stream);
-  DeviceArray<size_t> d_obytes(h_obytes, stream);
-  DeviceArray<void *> d_optr(h_optr, stream);
-  DeviceArray<size_t> d_osz(std::vector<size_t>(nch, 0), stream);
-  DeviceArray<nvcompStatus_t> d_status(
-      std::vector<nvcompStatus_t>(nch, nvcompSuccess), stream);
-  if (!d_cptr.ok() || !d_csz.ok() || !d_obytes.ok() || !d_optr.ok() ||
-      !d_osz.ok() || !d_status.ok()) {
-    return 0;
-  }
-  size_t temp_bytes = 0;
-  void *d_temp = nullptr;
-  if (!NvcompBatchedTempSizeImpl(wire, d_cptr.get(), d_csz.get(), nch,
-                                 max_unc, &temp_bytes, d_status.get(),
-                                 stream)) {
-    return 0;
-  }
-  if (temp_bytes != 0 && cudaMalloc(&d_temp, temp_bytes) != cudaSuccess) {
-    return 0;
-  }
-  const bool launched = NvcompBatchedDecompressImpl(
-      wire, d_cptr.get(), d_csz.get(), d_obytes.get(), d_osz.get(), nch,
-      d_temp, temp_bytes, d_optr.get(), d_status.get(), stream);
-  // ONE synchronize for the whole batch -- not one per page.
-  const bool synced =
-      launched && cudaStreamSynchronize(stream) == cudaSuccess;
-  std::vector<size_t> osz(nch, 0);
-  std::vector<nvcompStatus_t> st(nch, nvcompSuccess);
-  if (synced) {
-    d_osz.download(osz.data(), stream);
-    d_status.download(st.data(), stream);
-    cudaStreamSynchronize(stream);
-  }
-  if (d_temp != nullptr) cudaFree(d_temp);
-  if (!synced) return 0;
-
-  // 4. An item succeeded only if every one of its chunks did.
-  size_t done = 0;
-  for (size_t i = 0; i < items.size(); ++i) {
-    if (!usable[i] || item_n[i] == 0) continue;
-    bool good = true;
-    for (size_t c = 0; c < item_n[i]; ++c) {
-      const size_t k = item_first[i] + c;
-      if (st[k] != nvcompSuccess || osz[k] != h_obytes[k]) { good = false; break; }
+  if (w == 0) { release(); return -1; }
+  sl.nch = w;
+  auto *d_cptr = reinterpret_cast<const void **>(dev);
+  auto *d_csz = reinterpret_cast<size_t *>(dev + C * 8);
+  auto *d_obytes = reinterpret_cast<size_t *>(dev + C * 16);
+  auto *d_optr = reinterpret_cast<void **>(dev + C * 24);
+  auto *d_osz = reinterpret_cast<size_t *>(dev + C * 32);
+  auto *d_status = reinterpret_cast<nvcompStatus_t *>(dev + C * 40);
+  cudaMemcpyAsync(dev, pin, C * 32, cudaMemcpyHostToDevice, stream);
+  cudaMemsetAsync(dev + C * 32, 0, C * 8 + C * st_sz, stream);
+  {
+    // Shared temp: single stream => the kernels using it are serialized.
+    std::lock_guard<std::mutex> g(dslot_mu_);
+    if (w > dtemp_hw_nch_ || max_unc > dtemp_hw_unc_) {
+      size_t tb = 0;
+      if (!NvcompBatchedTempSizeImpl(wire, d_cptr, d_csz, w, max_unc, &tb,
+                                     d_status, stream)) {
+        release();
+        return -1;
+      }
+      dtemp_hw_nch_ = w;
+      dtemp_hw_unc_ = max_unc;
+      dtemp_bytes_ = tb;
+      if (tb > dtemp_cap_) {
+        if (dtemp_ != nullptr) cudaFree(dtemp_);
+        dtemp_cap_ = tb * 2;
+        if (cudaMalloc(&dtemp_, dtemp_cap_) != cudaSuccess) {
+          dtemp_ = nullptr;
+          dtemp_cap_ = 0;
+          release();
+          return -1;
+        }
+      }
     }
-    if (good) { (*ok)[i] = 1; ++done; }
   }
-  return done;
+  if (!NvcompBatchedDecompressImpl(wire, d_cptr, d_csz, d_obytes, d_osz, w,
+                                   dtemp_, dtemp_bytes_, d_optr, d_status,
+                                   stream)) {
+    release();
+    return -1;
+  }
+  cudaMemcpyAsync(pin + C * 32, dev + C * 32, C * 8 + C * st_sz,
+                  cudaMemcpyDeviceToHost, stream);
+  cudaEventRecord(static_cast<cudaEvent_t>(sl.ev), stream);
+  return si;
 #else
-  (void) items;
+  (void) items; (void) n;
+  return -1;
+#endif
+}
+
+clio::run::TaskResume Runtime::CombinedDecompWait(
+    std::shared_ptr<CombineReq> req) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::lock_guard<std::mutex> g(comb_mu_);
+    comb_q_.push_back(req);
+  }
+  int spins = 0;
+  while (req->state.load(std::memory_order_acquire) == 0 &&
+         spins < kDecompWaitMaxSpins) {
+    bool expected = false;
+    if (comb_launching_.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel)) {
+      std::vector<std::shared_ptr<CombineReq>> mine;
+      {
+        std::lock_guard<std::mutex> g(comb_mu_);
+        mine.swap(comb_q_);
+      }
+      if (mine.empty()) {
+        comb_launching_.store(false, std::memory_order_release);
+        CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+        ++spins;
+        continue;
+      }
+      // Everything queued rides this launch (split only past the slot's
+      // chunk capacity). The launch's ~151us on the GPU is the window in
+      // which the NEXT batch accumulates.
+      size_t off = 0;
+      while (off < mine.size()) {
+        const size_t take = std::min(mine.size() - off, kSlotMaxChunks);
+        std::vector<OneDecomp> ods(take);
+        for (size_t i = 0; i < take; ++i) ods[i] = mine[off + i]->od;
+        const int slot = LaunchDecompOne(ods.data(), take);
+        if (slot < 0) {
+          for (size_t i = 0; i < take; ++i) {
+            mine[off + i]->state.store(2, std::memory_order_release);
+          }
+        } else {
+          std::vector<char> okv(take, 0);
+          int r = -1;
+          while ((r = DecompPoll(slot, okv.data(), take)) < 0) {
+            CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+          }
+          for (size_t i = 0; i < take; ++i) {
+            mine[off + i]->state.store(okv[i] ? 1 : 2,
+                                       std::memory_order_release);
+          }
+        }
+        off += take;
+      }
+      comb_launching_.store(false, std::memory_order_release);
+    } else {
+      CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+      ++spins;
+    }
+  }
+  if (req->state.load(std::memory_order_acquire) == 0) {
+    req->state.store(2, std::memory_order_release);   // timed out
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+int Runtime::DecompPoll(int slot, char *ok_out, size_t n) {
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+  if (slot < 0 || slot >= static_cast<int>(kDecompSlots)) return 0;
+  DecompSlot &sl = dslots_[slot];
+  CodecCtxGuard guard(codec_ctx_);
+  if (!guard.ok()) return 0;
+  const cudaError_t q = cudaEventQuery(static_cast<cudaEvent_t>(sl.ev));
+  if (q == cudaErrorNotReady) return -1;   // caller yields and asks again
+  const char *pin = static_cast<const char *>(sl.pin);
+  const size_t C = kSlotMaxChunks;
+  const auto *h_obytes = reinterpret_cast<const size_t *>(pin + C * 16);
+  const auto *h_osz = reinterpret_cast<const size_t *>(pin + C * 32);
+  const auto *h_status =
+      reinterpret_cast<const nvcompStatus_t *>(pin + C * 40);
+  int all = (q == cudaSuccess) ? 1 : 0;
+  for (size_t i = 0; i < sl.item_first.size(); ++i) {
+    bool good = (q == cudaSuccess) && sl.item_n[i] != 0;
+    for (size_t c = 0; good && c < sl.item_n[i]; ++c) {
+      const size_t k = sl.item_first[i] + c;
+      if (h_status[k] != nvcompSuccess || h_osz[k] != h_obytes[k]) {
+        good = false;
+      }
+    }
+    if (!good) all = 0;
+    if (ok_out != nullptr && i < n) ok_out[i] = good ? 1 : 0;
+  }
+  {
+    std::lock_guard<std::mutex> g(dslot_mu_);
+    sl.busy = false;
+  }
+  return all;
+#else
+  (void) slot; (void) ok_out; (void) n;
+  return 0;
+#endif
+}
+
+bool Runtime::LaunchDecompBatch(
+    std::vector<std::shared_ptr<PendingDecomp>> &batch) {
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+  // Split what this launch can serve from what it cannot. The rest is
+  // published done/!ok NOW so its waiters take their fallback immediately
+  // instead of burning their timeout.
+  std::vector<std::shared_ptr<PendingDecomp>> owners;
+  for (auto &pd : batch) {
+    if (pd->abandoned.load(std::memory_order_acquire)) continue;
+    if (pd->src_device != nullptr) {
+      owners.push_back(pd);
+    } else {
+      pd->done.store(true, std::memory_order_release);
+    }
+  }
+  if (owners.empty()) return true;
+
+  BatchSeg *seg = nullptr;
+  for (auto &c : bd_segs_) {
+    if (!c.busy) { seg = &c; break; }
+  }
+  if (seg == nullptr) return false;   // caller retires and retries
+
+  CodecCtxGuard guard(codec_ctx_);
+  cudaStream_t stream =
+      guard.ok() ? static_cast<cudaStream_t>(ModuleStream()) : nullptr;
+  auto fail_all = [&]() {
+    for (auto &pd : owners) pd->done.store(true, std::memory_order_release);
+    return true;
+  };
+  if (stream == nullptr) return fail_all();
+
+  {
+    const unsigned long long g =
+        tier_write_gen_.load(std::memory_order_acquire);
+    if (g != bd_cache_gen_) {
+      bd_cache_.clear();
+      bd_cache_gen_ = g;
+    }
+  }
+
+  // Chunk tables: cache, or ONE batched header read. The wait for the header
+  // bytes is an event POLLED with sleeps -- the only wait in this function,
+  // it happens only on the FIRST fault of a blob (refaults hit the cache),
+  // and it never calls cudaStreamSynchronize.
+  constexpr size_t kHdrMax = 32 + 72 + 16 * 1024;
+  const size_t n = owners.size();
+  std::vector<const CachedChunks *> tbl(n, nullptr);
+  std::vector<CachedChunks> local(n);   // parsed-but-uncacheable tables
+  std::vector<size_t> need;
+  for (size_t i = 0; i < n; ++i) {
+    if (owners[i]->src_stable) {
+      auto it = bd_cache_.find(owners[i]->src_device);
+      if (it != bd_cache_.end() &&
+          it->second.stored_size == owners[i]->stored_size) {
+        tbl[i] = &it->second;
+        continue;
+      }
+    }
+    // Header SNAPSHOT from the enqueuer: parse it right here, zero device
+    // traffic, zero waiting. This is what makes a batch of ONE cheap enough
+    // that the drain needs no linger.
+    if (!owners[i]->stored_bytes.empty()) {
+      CachedChunks cc;
+      cc.stored_size = owners[i]->stored_size;
+      const auto *hb = reinterpret_cast<const unsigned char *>(
+          owners[i]->stored_bytes.data());
+      if (owners[i]->stored_bytes.size() >= 8) {
+        std::memcpy(&cc.wire, hb + 4, 4);
+      }
+      if (ParseBlobChunks(hb, owners[i]->stored_bytes.size(),
+                          owners[i]->stored_size, &cc.bc)) {
+        if (owners[i]->src_stable) {
+          auto ins = bd_cache_.emplace(owners[i]->src_device, std::move(cc));
+          tbl[i] = &ins.first->second;
+        } else {
+          local[i] = std::move(cc);
+          tbl[i] = &local[i];
+        }
+        continue;
+      }
+    }
+    need.push_back(i);
+  }
+  if (!need.empty()) {
+    const size_t want_cap = need.size() * kHdrMax;
+    if (bd_hdrpin_cap_ < want_cap) {
+      if (bd_hdrpin_ != nullptr) cudaFreeHost(bd_hdrpin_);
+      bd_hdrpin_cap_ = want_cap * 2;
+      if (cudaMallocHost(&bd_hdrpin_, bd_hdrpin_cap_) != cudaSuccess) {
+        bd_hdrpin_ = nullptr;
+        bd_hdrpin_cap_ = 0;
+        return fail_all();
+      }
+    }
+    for (size_t k = 0; k < need.size(); ++k) {
+      const size_t i = need[k];
+      cudaMemcpyAsync(static_cast<char *>(bd_hdrpin_) + k * kHdrMax,
+                      owners[i]->src_device,
+                      std::min(owners[i]->stored_size, kHdrMax),
+                      cudaMemcpyDeviceToHost, stream);
+    }
+    if (seg->ev == nullptr &&
+        cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(&seg->ev),
+                                 cudaEventDisableTiming) != cudaSuccess) {
+      return fail_all();
+    }
+    cudaEventRecord(static_cast<cudaEvent_t>(seg->ev), stream);
+    while (cudaEventQuery(static_cast<cudaEvent_t>(seg->ev)) ==
+           cudaErrorNotReady) {
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    for (size_t k = 0; k < need.size(); ++k) {
+      const size_t i = need[k];
+      const auto *h =
+          static_cast<const unsigned char *>(bd_hdrpin_) + k * kHdrMax;
+      CachedChunks cc;
+      cc.stored_size = owners[i]->stored_size;
+      std::memcpy(&cc.wire, h + 4, 4);
+      if (ParseBlobChunks(h, std::min(owners[i]->stored_size, kHdrMax),
+                          owners[i]->stored_size, &cc.bc)) {
+        if (owners[i]->src_stable) {
+          auto ins = bd_cache_.emplace(owners[i]->src_device, std::move(cc));
+          tbl[i] = &ins.first->second;
+        } else {
+          local[i] = std::move(cc);
+          tbl[i] = &local[i];
+        }
+      }
+    }
+  }
+
+  const int wire = [&] {
+    for (size_t i = 0; i < n; ++i)
+      if (tbl[i] != nullptr) return tbl[i]->wire;
+    return 0;
+  }();
+  // EXACT chunk count, applying the same rules the flatten below applies.
+  // Estimating it (sum of table sizes) and shrinking later laid the host
+  // arrays out with one stride and the device arrays with another whenever
+  // any item was excluded (a raw-stored page, a wire mismatch): every
+  // pointer in the uploaded arrays was then garbage, all chunks failed, and
+  // that garbage is ADDRESSES -- which is how the checksum got corrupted.
+  auto chunks_of = [&](size_t i) -> size_t {
+    if (tbl[i] == nullptr || tbl[i]->wire != wire) return 0;
+    const BlobChunksPub &b = tbl[i]->bc;
+    size_t m = 0;
+    for (size_t c = 0; c < b.rel.size(); ++c) {
+      const unsigned long long done = c * b.chunk_raw;
+      if (done >= b.orig) break;
+      size_t want = static_cast<size_t>(b.orig - done);
+      if (want > b.chunk_raw) want = static_cast<size_t>(b.chunk_raw);
+      if (done + want > owners[i]->dst_bytes) break;
+      ++m;
+    }
+    return m;
+  };
+  size_t nch = 0;
+  for (size_t i = 0; i < n; ++i) nch += chunks_of(i);
+  if (wire == 0 || nch == 0) return fail_all();
+
+  // Arenas: pinned host + device mirror, per SEGMENT so in-flight batches
+  // never share buffers; grown geometrically, so steady state has ZERO
+  // cudaMalloc calls.
+  const size_t st_sz = sizeof(nvcompStatus_t);
+  const size_t arena = nch * (8 * 5) + ((nch * st_sz + 7) & ~size_t(7));
+  auto grow = [&](void **buf, size_t *cap, bool pinned) {
+    if (*cap >= arena) return true;
+    if (*buf != nullptr) {
+      if (pinned) cudaFreeHost(*buf); else cudaFree(*buf);
+    }
+    *cap = arena * 2;
+    const cudaError_t rc =
+        pinned ? cudaMallocHost(buf, *cap) : cudaMalloc(buf, *cap);
+    if (rc != cudaSuccess) { *buf = nullptr; *cap = 0; return false; }
+    return true;
+  };
+  if (!grow(&seg->pin, &seg->pin_cap, true) ||
+      !grow(&seg->dev, &seg->dev_cap, false)) {
+    return fail_all();
+  }
+  char *pin = static_cast<char *>(seg->pin);
+  char *dev = static_cast<char *>(seg->dev);
+  auto *h_cptr = reinterpret_cast<const void **>(pin);
+  auto *h_csz = reinterpret_cast<size_t *>(pin + nch * 8);
+  auto *h_obytes = reinterpret_cast<size_t *>(pin + nch * 16);
+  auto *h_optr = reinterpret_cast<void **>(pin + nch * 24);
+  seg->item_first.assign(n, 0);
+  seg->item_n.assign(n, 0);
+  size_t w = 0, max_unc = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (tbl[i] == nullptr || tbl[i]->wire != wire) continue;
+    seg->item_first[i] = w;
+    const BlobChunksPub &b = tbl[i]->bc;
+    for (size_t c = 0; c < b.rel.size(); ++c) {
+      const unsigned long long done = c * b.chunk_raw;
+      if (done >= b.orig) break;
+      size_t want = static_cast<size_t>(b.orig - done);
+      if (want > b.chunk_raw) want = static_cast<size_t>(b.chunk_raw);
+      if (done + want > owners[i]->dst_bytes) break;
+      h_cptr[w] = static_cast<const char *>(owners[i]->src_device) + b.rel[c];
+      h_csz[w] = static_cast<size_t>(b.csz[c]);
+      h_obytes[w] = want;
+      h_optr[w] = static_cast<char *>(owners[i]->dst) + done;
+      if (want > max_unc) max_unc = want;
+      ++w;
+      ++seg->item_n[i];
+    }
+  }
+  if (w != nch) return fail_all();   // impossible by construction; be loud
+  auto *d_cptr = reinterpret_cast<const void **>(dev);
+  auto *d_csz = reinterpret_cast<size_t *>(dev + nch * 8);
+  auto *d_obytes = reinterpret_cast<size_t *>(dev + nch * 16);
+  auto *d_optr = reinterpret_cast<void **>(dev + nch * 24);
+  auto *d_osz = reinterpret_cast<size_t *>(dev + nch * 32);
+  auto *d_status = reinterpret_cast<nvcompStatus_t *>(dev + nch * 40);
+  cudaMemcpyAsync(dev, pin, nch * 32, cudaMemcpyHostToDevice, stream);
+  cudaMemsetAsync(dev + nch * 32, 0, nch * 8 + nch * st_sz, stream);
+
+  // Temp: reuse the high-water requirement; TempSize (which synchronizes
+  // internally, nothing to be done about that) runs only when the batch
+  // SHAPE exceeds anything seen before -- a handful of times ever.
+  if (nch > seg->hw_nch || max_unc > seg->hw_maxunc) {
+    size_t tb = 0;
+    if (!NvcompBatchedTempSizeImpl(wire, d_cptr, d_csz, nch, max_unc, &tb,
+                                   d_status, stream)) {
+      return fail_all();
+    }
+    seg->hw_nch = nch;
+    seg->hw_maxunc = max_unc;
+    seg->temp_bytes = tb;
+    if (tb > seg->temp_cap) {
+      if (seg->temp != nullptr) cudaFree(seg->temp);
+      seg->temp_cap = tb * 2;
+      if (cudaMalloc(&seg->temp, seg->temp_cap) != cudaSuccess) {
+        seg->temp = nullptr;
+        seg->temp_cap = 0;
+        return fail_all();
+      }
+    }
+  }
+  if (!NvcompBatchedDecompressImpl(wire, d_cptr, d_csz, d_obytes, d_osz, nch,
+                                   seg->temp, seg->temp_bytes, d_optr,
+                                   d_status, stream)) {
+    return fail_all();
+  }
+  // Results home to the pinned arena, then the EVENT. No synchronize: the
+  // drain loop polls the event and publishes when it fires.
+  cudaMemcpyAsync(pin + nch * 32, dev + nch * 32, nch * 8 + nch * st_sz,
+                  cudaMemcpyDeviceToHost, stream);
+  if (seg->ev == nullptr &&
+      cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(&seg->ev),
+                               cudaEventDisableTiming) != cudaSuccess) {
+    return fail_all();
+  }
+  cudaEventRecord(static_cast<cudaEvent_t>(seg->ev), stream);
+  seg->owners = std::move(owners);
+  seg->nch = nch;
+  seg->busy = true;
+  if (getenv("CLIO_CODEC_TRACE")) {
+    fprintf(stderr, "[DRAIN] launched batch=%zu chunks=%zu (no sync)\n",
+            seg->owners.size(), nch);
+    fflush(stderr);
+  }
+  return true;
+#else
+  for (auto &pd : batch) pd->done.store(true, std::memory_order_release);
+  return true;
+#endif
+}
+
+size_t Runtime::RetireBatches() {
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+  size_t retired = 0;
+  bool any = false;
+  for (auto &seg : bd_segs_) any = any || seg.busy;
+  if (!any) return 0;
+  // The module stream -- and therefore its events -- live in codec_ctx_.
+  // Querying an event from outside its context does not report "not ready",
+  // it reports an ERROR, and treating that as not-ready left every segment
+  // busy forever: nothing retired, every waiter timed out into the fallback
+  // path, and abandoned scratch was reused under an in-flight batch
+  // (checksum MISMATCH). The guard must wrap the query.
+  CodecCtxGuard guard(codec_ctx_);
+  if (!guard.ok()) return 0;
+  for (auto &seg : bd_segs_) {
+    if (!seg.busy) continue;
+    const cudaError_t q = cudaEventQuery(static_cast<cudaEvent_t>(seg.ev));
+    if (q == cudaErrorNotReady) {
+      continue;   // still running; NEVER wait here
+    }
+    if (q != cudaSuccess) {
+      // Real error: fail the batch loudly instead of wedging the segment.
+      for (auto &pd : seg.owners) {
+        pd->ok = false;
+        pd->done.store(true, std::memory_order_release);
+      }
+      seg.owners.clear();
+      seg.busy = false;
+      ++retired;
+      continue;
+    }
+    const char *pin = static_cast<const char *>(seg.pin);
+    const auto *h_obytes =
+        reinterpret_cast<const size_t *>(pin + seg.nch * 16);
+    const auto *h_osz = reinterpret_cast<const size_t *>(pin + seg.nch * 32);
+    const auto *h_status =
+        reinterpret_cast<const nvcompStatus_t *>(pin + seg.nch * 40);
+    for (size_t i = 0; i < seg.owners.size(); ++i) {
+      bool good = seg.item_n[i] != 0;
+      for (size_t c = 0; good && c < seg.item_n[i]; ++c) {
+        const size_t k = seg.item_first[i] + c;
+        if (h_status[k] != nvcompSuccess || h_osz[k] != h_obytes[k]) {
+          good = false;
+        }
+      }
+      seg.owners[i]->ok = good;
+      // Publish LAST: the waiter may be freed the instant it observes done.
+      seg.owners[i]->done.store(true, std::memory_order_release);
+    }
+    if (getenv("CLIO_CODEC_TRACE")) {
+      size_t nok = 0;
+      for (auto &pd : seg.owners) nok += pd->ok ? 1 : 0;
+      fprintf(stderr, "[RETIRE] items=%zu ok=%zu q=%d\n", seg.owners.size(),
+              nok, (int) q);
+      for (size_t i = 0; i < seg.owners.size(); ++i) {
+        if (seg.owners[i]->ok) continue;
+        if (seg.item_n[i] == 0) {
+          fprintf(stderr, "[RETIRE]  item %zu: NO CHUNKS (unparsed/raw)\n", i);
+          continue;
+        }
+        const size_t k = seg.item_first[i];
+        fprintf(stderr,
+                "[RETIRE]  item %zu: n=%zu st=%d osz=%zu want=%zu "
+                "stored=%zu csz0=%zu\n",
+                i, seg.item_n[i], (int) h_status[k], h_osz[k], h_obytes[k],
+                seg.owners[i]->stored_size,
+                reinterpret_cast<const size_t *>(pin + seg.nch * 8)[k]);
+        break;
+      }
+      fflush(stderr);
+    }
+    seg.owners.clear();
+    seg.busy = false;
+    ++retired;
+  }
+  return retired;
+#else
   return 0;
 #endif
 }
@@ -2380,6 +2832,8 @@ clio::run::TaskResume Runtime::PutBlob(
 clio::run::TaskResume Runtime::CompressPodPutBlob(
     clio::run::shared_ptr<clio::cte::core::PodPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // Any put may rewrite a blob whose chunk table the batched decoder cached.
+  tier_write_gen_.fetch_add(1, std::memory_order_release);
   {
     clio::cte::core::Context &ctx = task->context_;
     if (ctx.compress_lib_ <= 0 || ctx.replica_ != 0 || task->offset_ != 0 ||
@@ -2610,10 +3064,20 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
               lsz > sizeof(CompressionHeader)) {
             char *tier = clio_direct_dev_base(lpool);
             if (tier != nullptr) {
+              const size_t tsnap = std::min<size_t>(lsz, 4096);
+              std::vector<char> thsnap(tsnap);
+              ctp::DeviceAwareMemcpy(thsnap.data(), tier + loff, tsnap);
               CompressionHeader thdr;
-              ctp::DeviceAwareMemcpy(&thdr, tier + loff, sizeof(thdr));
+              std::memcpy(&thdr, thsnap.data(),
+                          std::min(sizeof(thdr), thsnap.size()));
               if (thdr.IsValid() && IsGpuCodec(thdr.compress_lib_)) {
+                // Launch OUR OWN decode and yield-poll its event: same shape
+                // as the raw path (worker enqueues its transfer, polls its
+                // flag). The drain-queue hop measured 580us/fault against
+                // raw's ~65us.
                 auto req = std::make_shared<PendingDecomp>();
+                req->stored_bytes = std::move(thsnap);
+                req->src_stable = true;
                 req->src_device = tier + loff;
                 req->stored_size = static_cast<size_t>(lsz);
                 req->dst = dst_probe.ptr_;
@@ -2622,11 +3086,11 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                   std::lock_guard<std::mutex> g(batch_mu_);
                   batch_.push_back(req);
                 }
-                int tspins = 0;
+                int spins = 0;
                 while (!req->done.load(std::memory_order_acquire) &&
-                       tspins < kDecompWaitMaxSpins) {
+                       spins < kDecompWaitMaxSpins) {
                   CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
-                  ++tspins;
+                  ++spins;
                 }
                 if (req->done.load(std::memory_order_acquire) && req->ok) {
                   task->return_code_ = 0;
@@ -2649,15 +3113,18 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
               ScratchShmPtr(dscratch), clio::run::PoolQuery::Local());
           CLIO_CO_AWAIT(dget);
           if (dget->GetReturnCode() == 0) {
-            // Only the 32-byte header comes back to the host, to be validated.
+            // Snapshot the header REGION (not the payload): the drain
+            // parses the chunk table from these host bytes, so launching a
+            // batch needs no device read and no wait at all.
+            const size_t snap = std::min<size_t>(stored_size, 4096);
+            std::vector<char> hsnap(snap);
+            ctp::DeviceAwareMemcpy(hsnap.data(), dscratch, snap);
             CompressionHeader dhdr;
-            ctp::DeviceAwareMemcpy(&dhdr, dscratch, sizeof(dhdr));
+            std::memcpy(&dhdr, hsnap.data(),
+                        std::min(sizeof(dhdr), hsnap.size()));
             if (dhdr.IsValid() && IsGpuCodec(dhdr.compress_lib_)) {
-              // Hand it to the drainer instead of decompressing here. One
-              // page decompressed on its own is one kernel launch and one
-              // synchronize; the drainer collects whatever else is pending
-              // and decodes all of it in a single launch.
               auto req = std::make_shared<PendingDecomp>();
+              req->stored_bytes = std::move(hsnap);
               req->src_device = dscratch;
               req->stored_size = stored_size;
               req->dst = dst_probe.ptr_;
@@ -2672,16 +3139,16 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                 CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
                 ++spins;
               }
-              const bool got = req->done.load(std::memory_order_acquire) &&
-                               req->ok;
-              if (!got) req->abandoned.store(true, std::memory_order_release);
-              ReleaseGpuScratch(dscratch);
-              if (got) {
+              if (req->done.load(std::memory_order_acquire) && req->ok) {
+                // done means the launch's event fired: the GPU is finished
+                // with the scratch.
+                ReleaseGpuScratch(dscratch);
                 task->return_code_ = 0;
                 CLIO_CO_RETURN;
               }
-              // Fall through to the paths below rather than returning a
-              // half-decoded page.
+              req->abandoned.store(true, std::memory_order_release);
+              // The shared release below frees the scratch; the host path
+              // serves the read.
             }
           }
           ReleaseGpuScratch(dscratch);
@@ -2907,10 +3374,15 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       }
       char *tier = clio_direct_dev_base(lpool);
       if (tier == nullptr) continue;
+      const size_t msnap = std::min<size_t>(lsz, 4096);
+      std::vector<char> mhsnap(msnap);
+      ctp::DeviceAwareMemcpy(mhsnap.data(), tier + loff, msnap);
       CompressionHeader thdr;
-      ctp::DeviceAwareMemcpy(&thdr, tier + loff, sizeof(thdr));
+      std::memcpy(&thdr, mhsnap.data(), std::min(sizeof(thdr), mhsnap.size()));
       if (!thdr.IsValid() || !IsGpuCodec(thdr.compress_lib_)) continue;
       auto r = std::make_shared<PendingDecomp>();
+      r->stored_bytes = std::move(mhsnap);
+      r->src_stable = true;      // the blob's home on the tier
       r->src_device = tier + loff;
       r->stored_size = static_cast<size_t>(lsz);
       r->dst = dst.ptr_;
