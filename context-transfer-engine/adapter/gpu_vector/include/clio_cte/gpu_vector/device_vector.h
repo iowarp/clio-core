@@ -907,98 +907,14 @@ class DeviceVector {
     }
     return true;
   }
-
-  /**
-   * Standard LZ4 block decode, ONE thread. nvcomp's uchar lz4 chunks are
-   * standard LZ4 blocks (verified byte-exact against LZ4Manager output), so
-   * this needs no nvcomp linkage and compiles in EVERY GPU TU — the airtight
-   * fault service for single-thread sites (scalar Resolve, single-lane
-   * batched fetch) where the warp-cooperative decoder cannot run. Slow next
-   * to the warp decoder, but these sites are the residue the batch missed;
-   * the alternative was a CPU-serviced fetch, which can channel-order behind
-   * the resident kernel and wedge.
-   *
-   * @return true iff exactly `out_len` bytes were produced.
-   */
-  CTP_GPU_FUN static bool Lz4DecodeSerial(const unsigned char *in,
-                                          clio::run::u64 in_len,
-                                          unsigned char *out,
-                                          clio::run::u64 out_len) {
-    const unsigned char *ie = in + in_len;
-    unsigned char *o = out;
-    unsigned char *oe = out + out_len;
-    while (in < ie) {
-      const unsigned tok = *in++;
-      clio::run::u64 ll = tok >> 4;
-      if (ll == 15u) {
-        unsigned b;
-        do {
-          if (in >= ie) return false;
-          b = *in++;
-          ll += b;
-        } while (b == 255u);
-      }
-      if (in + ll > ie || o + ll > oe) return false;
-      for (clio::run::u64 i = 0; i < ll; ++i) *o++ = *in++;
-      if (in >= ie) break;  // final sequence carries literals only
-      if (in + 2 > ie) return false;
-      const unsigned moff = in[0] | (static_cast<unsigned>(in[1]) << 8);
-      in += 2;
-      if (moff == 0u || static_cast<clio::run::u64>(o - out) < moff) {
-        return false;
-      }
-      clio::run::u64 ml = tok & 15u;
-      if (ml == 15u) {
-        unsigned b;
-        do {
-          if (in >= ie) return false;
-          b = *in++;
-          ml += b;
-        } while (b == 255u);
-      }
-      ml += 4;
-      if (o + ml > oe) return false;
-      const unsigned char *m = o - moff;
-      for (clio::run::u64 i = 0; i < ml; ++i) *o++ = *m++;  // overlap-safe
-    }
-    return o == oe;
-  }
-
-  /** Serial in-kernel decode of encoded page `pg` into `dst` (page bytes). */
-  CTP_GPU_FUN bool DecodePageSerialInto(clio::run::u64 pg, char *dst) {
-    const clio::run::u32 cpp = h_->tier_chunks_per_page_;
-    const clio::run::u64 base_i = pg * cpp;
-    // Same decoded-size rule as DecodeChunksWarp (see there).
-    clio::run::u64 want_total =
-        h_->tier_csize_ != nullptr ? h_->tier_csize_[pg]
-                                   : h_->size_ * sizeof(T) -
-                                         pg * h_->page_bytes_;
-    if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
-    for (clio::run::u32 c = 0; c < cpp; ++c) {
-      const clio::run::u64 done =
-          static_cast<clio::run::u64>(c) * kNvChunkRaw;
-      if (done >= want_total) break;
-      const unsigned long long coff = h_->tier_chunk_off_[base_i + c];
-      const unsigned csz = h_->tier_chunk_csz_[base_i + c];
-      if (coff == ~0ull || csz == 0u) return false;
-      clio::run::u64 want = want_total - done;
-      if (want > kNvChunkRaw) want = kNvChunkRaw;
-      if (!Lz4DecodeSerial(reinterpret_cast<const unsigned char *>(
-                               h_->tier_base_ + coff),
-                           csz,
-                           reinterpret_cast<unsigned char *>(dst) + done,
-                           want)) {
-        if (h_->decode_trace_) {
-          printf("[DECODE-FAIL serial] pg=%llu c=%u coff=%llu csz=%u "
-                 "want=%llu blk=%u tid=%u\n",
-                 (unsigned long long) pg, c, coff, csz,
-                 (unsigned long long) want, blockIdx.x, threadIdx.x);
-        }
-        return false;
-      }
-    }
-    return true;
-  }
+  // The single-thread scalar LZ4 decoder that used to live here is gone too.
+  //
+  // It existed as the "airtight fallback" for sites where the warp decoder
+  // could not run, and it is what a compressed run silently fell back to
+  // whenever the device API was absent -- roughly two orders of magnitude
+  // slower than nvcomp, while still being reported as nvcomp. With the CPU
+  // launching the codec there is no site that needs it, and no way for a run
+  // to land on it by accident.
 
   // NOTE: the in-kernel nvcomp decoder that used to live here is GONE.
   //
@@ -1929,24 +1845,6 @@ class DeviceVector {
       // measured as more faults per token than routed pages.
       np->score = 2.0f;
       np->last_access = Now();
-      if (PageEncodedMapped(pg)) {
-        // Decode in-kernel rather than joining the CPU multi-get: a CPU-
-        // serviced read of an encoded page runs the wedge-prone GPU-codec
-        // path. Serial here because this site is single-thread; the warp
-        // resolver (FetchPagesBatchedWarp) is the fast path.
-        const bool dok =
-            DecodePageSerialInto(pg, static_cast<char *>(np->data));
-        __threadfence();
-        if (!dok) {
-          np->page_num = kNoPage;
-          Bump(h_->stat_get_errors_);
-        }
-        np->fetching = 0u;
-        Bump(h_->stat_faults_);
-        if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
-        if (dok) ++resident;
-        continue;
-      }
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
@@ -2315,30 +2213,6 @@ class DeviceVector {
           p->dirty = 0u;
           p->flushing = 0u;
           p->score = 0.0f;
-          if (PageEncodedMapped(page_num)) {
-            // In-kernel serial decode: the CPU-serviced get would run the
-            // GPU-codec path, which can channel-order behind this very
-            // kernel and wedge. Completes synchronously, so the caller's
-            // AwaitFetch sees fetching == 0 and does not touch the (stale)
-            // future.
-            const bool dok =
-                DecodePageSerialInto(page_num, static_cast<char *>(p->data));
-            __threadfence();
-            if (!dok) {
-              // Corrupt chunk table or stream. Callers cannot take a null
-              // page, so fall back to the CPU-serviced read as the last
-              // resort (wedge-risk accepted over serving garbage).
-              Bump(h_->stat_get_errors_);
-              SubmitGet(p, page_num);
-            } else {
-              p->fetching = 0u;
-              Bump(h_->stat_faults_);
-              if (h_->fault_hist_ != nullptr) {
-                atomicAdd(&h_->fault_hist_[page_num], 1u);
-              }
-            }
-            break;
-          }
           SubmitGet(p, page_num);
           break;
         }
