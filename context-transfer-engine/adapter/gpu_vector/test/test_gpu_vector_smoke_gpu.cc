@@ -6,19 +6,21 @@
  * fault, dirty tracking, BeginFlush/WaitFlush -- so a failure here means
  * the mechanism is broken rather than a policy being wrong.
  *
- * KNOWN LIMITATION: this covers exactly ONE page on purpose. Raising
- * kElems past one page (2048 elements = 2 pages) hangs: the kernel waits
- * on a flush that never completes. Everything the single-page case proves
- * -- fault, write, flush, read-back, byte-exact -- keeps working, so the
- * break is specific to having more than one page in play, not to the
- * mechanism. Not yet diagnosed; do not raise this constant expecting it
- * to work.
+ * The multi-page hang this file used to carry as a KNOWN LIMITATION ("raising
+ * kElems past one page hangs: the kernel waits on a flush that never
+ * completes") was the blocking fault path deadlocking against itself: the
+ * kernel sat on the SM waiting for a writeback, and a resident kernel blocks
+ * every later launch in its context, including the one servicing that
+ * writeback. The kernels here yield now, so more than one page works and the
+ * constant below is 4 pages.
  */
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <cstdio>
 #include <fstream>
@@ -30,6 +32,26 @@
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+
+/**
+ * Run a yieldable kernel to completion.
+ *
+ * Every launch below goes through this: a yielding kernel is not launched
+ * once but re-launched until no block is left suspended, with a fresh
+ * continuation stack backing the blocks' saved state.
+ */
+template <typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, 256);
+  const clio::run::u32 rounds = drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+  return rounds;
+}
 
 namespace {
 constexpr clio::run::u64 kPageBytes = 4096;
@@ -37,35 +59,70 @@ constexpr clio::run::u64 kElems = 4096;          // 4 pages
 }  // namespace
 
 /** Fill every element with a known function of its index. */
+/**
+ * All four kernels fault through HoldPageYield, not the blocking HoldPage.
+ *
+ * The blocking form waits for the fault INSIDE the kernel, and a resident
+ * kernel blocks every later launch in its context -- including the work that
+ * would service the fault. This test wedged in exactly that way: it reached
+ * the first kernel and never came back, with the host parked in
+ * cudaDeviceSynchronize forever. Suspending instead lets the device drain.
+ *
+ * They are also no longer single-threaded. A yield is block-collective (it
+ * ends in __syncthreads), so `if (threadIdx.x != 0) return` would deadlock the
+ * barrier; every lane runs the loop and they split each page between them.
+ */
 __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
-                           clio::run::u64 n) {
+                           clio::run::u64 n, gy::YieldableView<> yv,
+                           gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  for (clio::run::u64 i = 0; i < n;) {
-    const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[i] = static_cast<clio::run::u32>(i * 7 + 1);
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+
+  CLIO_YBEGIN();
+  for (; i < n; i += run) {
+    CLIO_YCALL(v.HoldPageYield(i, n - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[i + k] = static_cast<clio::run::u32>((i + k) * 7 + 1);
+    }
   }
-  v.BeginFlush(0, n);
-  v.WaitFlush(0, n);
+  // SubmitPut clears `dirty` as it submits, so a lane still writing when
+  // thread 0 flushes would lose its writes AND leave the page looking clean.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(0, n);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /** Read everything back and count mismatches. */
 __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<clio::run::u32> v,
-                            clio::run::u64 n, unsigned long long *bad) {
+                            clio::run::u64 n, unsigned long long *bad,
+                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  for (clio::run::u64 i = 0; i < n;) {
-    const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      if (v[i] != static_cast<clio::run::u32>(i * 7 + 1)) {
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+
+  CLIO_YBEGIN();
+  for (; i < n; i += run) {
+    CLIO_YCALL(v.HoldPageYield(i, n - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      if (v[i + k] != static_cast<clio::run::u32>((i + k) * 7 + 1)) {
         atomicAdd(bad, 1ull);
       }
-      }
+    }
   }
+  CLIO_YEND();
 }
 
 /**
@@ -73,37 +130,64 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
  * number of pages, so no two blocks ever touch the same page -- the page
  * table is partitioned per block, and a page resident in two blocks at
  * once would give two independent copies of the same bytes.
+ *
+ * The slice is keyed off yv.Block(), NOT blockIdx.x: the driver relaunches a
+ * COMPACTED grid of whichever blocks are still pending, so blockIdx.x is not
+ * stable across resumes and a block would come back owning someone else's
+ * slice.
  */
 __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
-                                clio::run::u64 per) {
+                                clio::run::u64 per, gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[base + i] = static_cast<clio::run::u32>((base + i) * 7 + 1);
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; i < per; i += run) {
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + i + k] = static_cast<clio::run::u32>((base + i + k) * 7 + 1);
+    }
   }
-  v.BeginFlush(base, per);
-  v.WaitFlush(base, per);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(base, per);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 __global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<clio::run::u32> v,
-                                 clio::run::u64 per, unsigned long long *bad) {
+                                 clio::run::u64 per, unsigned long long *bad,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      if (v[base + i] != static_cast<clio::run::u32>((base + i) * 7 + 1)) {
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
+
+  CLIO_YBEGIN();
+  for (; i < per; i += run) {
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      if (v[base + i + k] !=
+          static_cast<clio::run::u32>((base + i + k) * 7 + 1)) {
         atomicAdd(bad, 1ull);
       }
-      }
+    }
   }
+  CLIO_YEND();
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -115,9 +199,29 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   {
     std::ofstream cfg("gpu_vector_test.yaml");
     REQUIRE(cfg.is_open());
+    // The compose section is NOT optional. Without it the CTE pool is built
+    // from default CreateParams and has NO storage targets, so the first page
+    // writeback has nowhere to land and never completes -- and because this
+    // test faults through the BLOCKING HoldPage, its kernel spins on that
+    // writeback forever and the host hangs in cudaDeviceSynchronize. The test
+    // did not fail, it wedged, which is why it read as a flake rather than a
+    // missing config.
     cfg << "networking:\n  port: 9431\n\n"
         << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
-        << "gpu:\n  queue_depth: 4096\n";
+        << "gpu:\n  queue_depth: 4096\n\n"
+        << "compose:\n"
+        << "  - mod_name: clio_bdev\n"
+        << "    pool_name: \"ram::chi_default_bdev\"\n"
+        << "    pool_query: local\n    pool_id: \"301.0\"\n"
+        << "    bdev_type: ram\n    capacity: \"512MB\"\n\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: cte_core\n    pool_query: local\n"
+        << "    pool_id: \"512.0\"\n"
+        << "    storage:\n"
+        << "      - path: \"ram::gv_smoke_tier\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \"256MB\"\n"
+        << "        score: 1.0\n"
+        << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_test.yaml", 1);
   }
@@ -140,14 +244,16 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   gv::Vector<clio::run::u32> vec("gv_smoke", {0}, kPageBytes,
                                  /*nblocks=*/1, /*pages_per_block=*/4, kElems);
 
-  FillKernel<<<1, 32>>>(gpu_info, vec.GetDevice(0), kElems);
+  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, vw, sv); });
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   unsigned long long *d_bad = nullptr;
   REQUIRE(cudaMalloc(&d_bad, sizeof(unsigned long long)) == cudaSuccess);
   REQUIRE(cudaMemset(d_bad, 0, sizeof(unsigned long long)) == cudaSuccess);
 
-  CheckKernel<<<1, 32>>>(gpu_info, vec.GetDevice(0), kElems, d_bad);
+  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, d_bad, vw, sv); });
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   unsigned long long bad = 1;
@@ -172,13 +278,15 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     gv::Vector<clio::run::u32> big("gv_evict", {0}, kPageBytes,
                                    /*nblocks=*/1, /*pages_per_block=*/4, n);
 
-    FillKernel<<<1, 32>>>(gpu_info, big.GetDevice(0), n);
+    RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long *d2 = nullptr;
     REQUIRE(cudaMalloc(&d2, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d2, 0, sizeof(unsigned long long)) == cudaSuccess);
-    CheckKernel<<<1, 32>>>(gpu_info, big.GetDevice(0), n, d2);
+    RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, d2, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long b2 = 1;
@@ -209,13 +317,15 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
                                   kPageBytes, /*nblocks=*/nb,
                                   /*pages_per_block=*/2, n);
 
-    MultiFillKernel<<<nb, 32>>>(gpu_info, mv.GetDevice(0), per);
+    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long *d3 = nullptr;
     REQUIRE(cudaMalloc(&d3, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d3, 0, sizeof(unsigned long long)) == cudaSuccess);
-    MultiCheckKernel<<<nb, 32>>>(gpu_info, mv.GetDevice(0), per, d3);
+    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, d3, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long b3 = 1;
@@ -261,13 +371,15 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     const clio::run::u64 n = per * nb;
     gv::Vector<clio::run::u32> ov("gv_multi_ov", {0}, kPageBytes, nb,
                                   /*pages_per_block=*/2, n);
-    MultiFillKernel<<<nb, 32>>>(gpu_info, ov.GetDevice(0), per);
+    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long *d4 = nullptr;
     REQUIRE(cudaMalloc(&d4, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d4, 0, sizeof(unsigned long long)) == cudaSuccess);
-    MultiCheckKernel<<<nb, 32>>>(gpu_info, ov.GetDevice(0), per, d4);
+    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, d4, vw, sv); });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
     unsigned long long b4 = 1;
     REQUIRE(cudaMemcpy(&b4, d4, sizeof(b4), cudaMemcpyDeviceToHost) ==
