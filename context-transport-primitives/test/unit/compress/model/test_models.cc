@@ -276,6 +276,78 @@ TEST_CASE("NeuroPressNNPredictor loads the real pretrained weights and "
   }
   REQUIRE(saw_gpu_candidate);
 }
+
+TEST_CASE("NeuroPressNNPredictor inverse-transforms log1p-encoded outputs "
+          "with expm1, matching NeuroPress's own training/export") {
+  // NeuroPress trains comp_time/decomp_time/ratio in log1p() space
+  // (neural_net/core/data.py's OUTPUT_INVERSE) and its own CUDA inference
+  // applies expm1f to undo it (src/nn/nn_gpu.cu). A plain linear inverse
+  // transform silently leaves the log-space value in place. Empirically,
+  // the raw (pre-fix) predicted ratio for this exact input/candidate set
+  // never exceeds ~5.2 (log1p-space is naturally bounded for realistic
+  // trained data) -- a ratio above 10 is only reachable once expm1 is
+  // applied and the value is in real units.
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  DataFeatures compressible;
+  compressible.chunk_size_bytes = 4 * 1024 * 1024;
+  compressible.shannon_entropy = 0.5;
+  compressible.mad = 0.02;
+  compressible.second_derivative_mean = 0.01;
+  compressible.data_type_float = 1.0;
+
+  auto ranked = RankDefault(nn, compressible, RankingWeights(),
+                            /*include_gpu=*/true);
+  REQUIRE(!ranked.empty());
+
+  bool saw_expm1_scale_ratio = false;
+  for (const auto &r : ranked) {
+    if (r.prediction.compression_ratio > 10.0) {
+      saw_expm1_scale_ratio = true;
+      break;
+    }
+  }
+  REQUIRE(saw_expm1_scale_ratio);
+}
+
+TEST_CASE("NeuroPressNNPredictor's algo_id encoding does not collide "
+          "distinct nvcomp algorithms") {
+  // Regression test for issue #693: algo_id was computed as base_id % 8,
+  // which collides nvcomp-zstd (base_id 15) with nvcomp-cascaded (23), and
+  // nvcomp-gdeflate (16) with nvcomp-bitcomp (24) -- both pairs share a
+  // remainder mod 8 despite being distinct one-hot algorithm indices in
+  // NeuroPress's own trained action space (ALGORITHM_NAMES in
+  // neural_net/core/configs.py: lz4=0, snappy=1, deflate=2, gdeflate=3,
+  // zstd=4, ans=5, cascaded=6, bitcomp=7). Confirmed bit-identical
+  // predictions for both pairs before the fix.
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  DataFeatures data;
+  data.chunk_size_bytes = 1024 * 1024;
+  data.shannon_entropy = 4.0;
+  data.mad = 0.3;
+  data.second_derivative_mean = 0.2;
+  data.data_type_float = 1.0;
+
+  auto predict_for = [&](int base_id) {
+    CandidateConfig c;
+    c.base_id = base_id;
+    c.preset_id = 2;
+    return nn.Predict(MakeCompressionFeatures(data, c));
+  };
+
+  auto zstd = predict_for(15);
+  auto cascaded = predict_for(23);
+  auto gdeflate = predict_for(16);
+  auto bitcomp = predict_for(24);
+
+  REQUIRE(zstd.compression_ratio != cascaded.compression_ratio);
+  REQUIRE(gdeflate.compression_ratio != bitcomp.compression_ratio);
+}
 #endif  // CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
 
 TEST_CASE("Rank() is safe on a not-ready model") {

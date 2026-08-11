@@ -187,14 +187,45 @@ bool NeuroPressNNPredictor::Save(const std::string& model_dir) {
 
 bool NeuroPressNNPredictor::IsReady() const { return is_ready_; }
 
+namespace {
+
+// Maps a CompressionFactory base_id to NeuroPress's trained one-hot algo_id
+// (0-7), matching neural_net/core/configs.py's ALGORITHM_NAMES order
+// exactly: ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans',
+// 'cascaded', 'bitcomp']. NeuroPress's action space is ONLY these 8 nvcomp
+// algorithms -- base_id here must be the exact nvcomp base_id from
+// ranking.h's KnownCompressors(), not derived arithmetically (the previous
+// `base_id % 8` collided nvcomp-zstd(15) with nvcomp-cascaded(23), and
+// nvcomp-gdeflate(16) with nvcomp-bitcomp(24), since both pairs share a
+// remainder mod 8 despite being distinct trained indices).
+int NeuroPressAlgoIdForBaseId(int base_id) {
+  switch (base_id) {
+    case 13: return 0;  // nvcomp-lz4
+    case 14: return 1;  // nvcomp-snappy
+    case 17: return 2;  // nvcomp-deflate
+    case 16: return 3;  // nvcomp-gdeflate
+    case 15: return 4;  // nvcomp-zstd
+    case 18: return 5;  // nvcomp-ans
+    case 23: return 6;  // nvcomp-cascaded
+    case 24: return 7;  // nvcomp-bitcomp
+    default:
+      // Outside NeuroPress's trained action space entirely (CPU libraries,
+      // cusz/ndzip/cuszp/zfp-sycl): the model has no representation for
+      // these algorithms at all, so there is no "correct" index -- fall
+      // back to a deterministic, in-range value rather than crashing or
+      // silently colliding with one of the 8 real trained algorithms above.
+      return ((base_id % 8) + 8) % 8;
+  }
+}
+
+}  // namespace
+
 std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
     const CompressionFeatures& features) const {
   // NeuroPress expects: [algo_id, quant, shuffle, error_bound, data_size,
   // entropy, mad, second_derivative]
-  // Map library_config_id to algo_id (0-7): library_id / 10
-  float algo_id = static_cast<float>(static_cast<int>(features.library_config_id) / 10 % 8);
-  if (algo_id < 0) algo_id = 0;
-  if (algo_id >= 8) algo_id = 7;
+  int base_id = static_cast<int>(features.library_config_id) / 10;
+  float algo_id = static_cast<float>(NeuroPressAlgoIdForBaseId(base_id));
 
   return {algo_id,
           static_cast<float>(features.quantize),      // quant preprocessor
@@ -262,6 +293,22 @@ std::vector<float> NeuroPressNNPredictor::InverseTransform(
   std::vector<float> result(y_norm.size());
   for (size_t i = 0; i < y_norm.size(); ++i) {
     result[i] = y_norm[i] * y_stds_[i] + y_means_[i];
+  }
+  // Outputs 0,1,2 (comp_time, decomp_time, ratio) and 4,5,6 (rmse, max_error,
+  // mae) are trained in log1p() space (neural_net/core/data.py's
+  // OUTPUT_INVERSE); NeuroPress's own CUDA inference undoes this with
+  // expm1f (src/nn/nn_gpu.cu). Without it, every consumer of these fields
+  // (compression ratio, compression/decompression time) receives the
+  // log-space value instead of the real one -- de-correlated from actual
+  // units, and wrong whenever compared or combined with a linear-space
+  // quantity (e.g. EstWorkflowCompressTime() mixing predicted ratio with
+  // real chunk_size/bandwidth). Output 3 (psnr) is linear/identity; output
+  // 7 (ssim_nlog) needs a different, non-expm1 inverse this predictor
+  // doesn't currently expose (Predict() never reads index 7).
+  for (int i : {0, 1, 2, 4, 5, 6}) {
+    if (static_cast<size_t>(i) < result.size()) {
+      result[i] = std::expm1(result[i]);
+    }
   }
   return result;
 }

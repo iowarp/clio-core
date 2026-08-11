@@ -105,8 +105,10 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   /**
    * @brief Build the 8-input NeuroPress vector from CompressionFeatures.
    *
-   * Maps: library_config_id → algo_id (0-7); quant/shuffle/error_bound → 0;
-   * data_size, entropy, mad, second_derivative as-is.
+   * Maps: library_config_id → algo_id (0-7, exact for NeuroPress's 8 trained
+   * nvcomp algorithms, best-effort fallback otherwise -- see
+   * NeuroPressAlgoIdForBaseId() in the .cc); quant/shuffle/error_bound
+   * passed through; data_size, entropy, mad, second_derivative as-is.
    *
    * @param features Input features.
    * @return 8-element vector in NeuroPress order.
