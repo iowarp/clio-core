@@ -174,4 +174,49 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    # ------------------------------------------------------------------
+    # The GPU-ONLY path: kHBM tier with no host tier under it, nvcomp, and
+    # a yielding fault path. Its own binary because CLIO_INIT runs once per
+    # PROCESS and the storage tiers are fixed at that moment -- an HBM-only
+    # runtime cannot be a second TEST_CASE beside a RAM-tier one.
+    # ------------------------------------------------------------------
+    add_cuda_executable(test_gpu_vector_hbm_nvcomp FALSE
+        test_gpu_vector_hbm_nvcomp_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_hbm_nvcomp PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    # Without this the in-kernel nvcomp decoder is not compiled in and the
+    # test SKIPS rather than quietly measuring the scalar LZ4 fallback.
+    include(ClioNvcompDevice)
+    clio_enable_nvcomp_device(test_gpu_vector_hbm_nvcomp)
+    add_test(NAME cte_gpu_vector_hbm_nvcomp COMMAND test_gpu_vector_hbm_nvcomp
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_hbm_nvcomp PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;nvcomp"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
 endif()
