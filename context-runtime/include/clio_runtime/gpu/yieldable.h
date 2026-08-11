@@ -62,6 +62,7 @@
 
 #include <clio_runtime/types.h>
 
+#include <type_traits>
 #include <vector>
 
 namespace clio::run::gpu {
@@ -85,6 +86,20 @@ struct YieldBlockState {
   /** 0 = start from the top; otherwise the __LINE__ of the yield to resume. */
   clio::run::u32 resume_point_;
   clio::run::u32 status_;
+  /**
+   * What this block is waiting FOR, for the host to interpret.
+   *
+   * A plain yield tells the driver only "not done", so the driver can do
+   * nothing but relaunch and let the block look again. When the thing being
+   * waited on takes much longer than a launch -- a GPU decompress, say -- that
+   * turns into polling by kernel launch: measured at ~50 relaunches per page
+   * fault against ~2 for a plain copy. This field carries a token the HOST can
+   * test cheaply, so it can wait instead of relaunching.
+   *
+   * Opaque here on purpose: the driver never interprets it, it just hands it
+   * back to the caller's ResumeWhen. 0 means "no token, relaunch freely".
+   */
+  clio::run::u64 wait_tag_;
 };
 
 /** State type for kernels that need no state of their own. */
@@ -224,6 +239,7 @@ class Yieldable {
     for (clio::run::u32 i = 0; i < nblocks_; ++i) {
       host_yield_[i].resume_point_ = 0;
       host_yield_[i].status_ = kYieldSuspended;
+      host_yield_[i].wait_tag_ = 0;
       host_pending_[i] = i;
     }
     num_pending_ = nblocks_;
@@ -234,6 +250,44 @@ class Yieldable {
    * Run one round: launch the pending blocks, wait, and recompute the pending
    * set. Returns true if any block is still unfinished.
    */
+  /**
+   * Round() with a host-side readiness test.
+   *
+   * `resume_when(logical_block, wait_tag)` returns whether that block is worth
+   * relaunching. Blocks that are not ready stay pending and cost nothing; if
+   * NO block is ready the grid is not launched at all and the caller's service
+   * step runs again. That is the difference between waiting for a decompress
+   * and polling for it with kernel launches.
+   */
+  template <typename LaunchFn, typename ResumeWhenFn>
+  bool Round(LaunchFn &&launch, ResumeWhenFn &&resume_when) {
+    if (num_pending_ == 0) {
+      return false;
+    }
+    // Keep only the blocks whose wait has actually been satisfied.
+    clio::run::u32 ready = 0;
+    for (clio::run::u32 i = 0; i < num_pending_; ++i) {
+      const clio::run::u32 b = host_pending_[i];
+      if (host_yield_[b].wait_tag_ == 0 ||
+          resume_when(b, host_yield_[b].wait_tag_)) {
+        host_pending_[ready++] = b;
+      }
+    }
+    if (ready == 0) {
+      return true;              // still pending, just nothing worth launching
+    }
+    const clio::run::u32 saved = num_pending_;
+    num_pending_ = ready;
+    UploadPending();
+    const bool more = Round(std::forward<LaunchFn>(launch));
+    // Blocks held back this round are still pending.
+    if (ready < saved) {
+      RestorePendingFromState();
+      return true;
+    }
+    return more;
+  }
+
   template <typename LaunchFn>
   bool Round(LaunchFn &&launch) {
     if (num_pending_ == 0) {
@@ -271,6 +325,18 @@ class Yieldable {
    * `max_rounds` bounds a kernel that yields forever; 0 means unbounded.
    * Returns the number of rounds executed.
    */
+  /**
+   * `service` may return void, or bool to ABORT: returning false stops the
+   * loop immediately.
+   *
+   * Without that, the only way out of a kernel that can never finish is
+   * max_rounds, which is a guess -- and a guess that has to be huge to avoid
+   * killing a slow-but-healthy run, so a genuine dead end burns minutes
+   * before it reports anything. The caller usually knows the difference
+   * (gpu_vector: a writeback that FAILED means no slot can ever be cleaned,
+   * so the fault path will spin forever), and this lets it say so between
+   * rounds, which is exactly when it can read device state safely.
+   */
   template <typename LaunchFn, typename ServiceFn>
   clio::run::u32 RunToCompletion(LaunchFn &&launch, ServiceFn &&service,
                                  clio::run::u32 max_rounds = 0) {
@@ -280,10 +346,52 @@ class Yieldable {
       if (max_rounds != 0 && rounds >= max_rounds) {
         break;
       }
-      service();
+      if constexpr (std::is_same_v<decltype(service()), bool>) {
+        if (!service()) {
+          aborted_ = true;
+          return rounds;
+        }
+      } else {
+        service();
+      }
     }
     if (num_pending_ == 0) {
       ++rounds;  // count the round that finished the last block
+    }
+    return rounds;
+  }
+
+  /** True when a service callback returned false and stopped the loop. Lets
+   *  the caller tell "finished" from "gave up" without inspecting rounds. */
+  bool Aborted() const { return aborted_; }
+
+  /** Recompute the pending set from device state (used after a partial round). */
+  void RestorePendingFromState() {
+    clio::run::u32 n = 0;
+    for (clio::run::u32 i = 0; i < nblocks_; ++i) {
+      if (host_yield_[i].status_ == kYieldSuspended) {
+        host_pending_[n++] = i;
+      }
+    }
+    num_pending_ = n;
+    UploadPending();
+  }
+
+  /** RunToCompletion with a host-side readiness test; see Round(). */
+  template <typename LaunchFn, typename ServiceFn, typename ResumeWhenFn>
+  clio::run::u32 RunToCompletion(LaunchFn &&launch, ServiceFn &&service,
+                                 clio::run::u32 max_rounds,
+                                 ResumeWhenFn &&resume_when) {
+    clio::run::u32 rounds = 0;
+    while (Round(launch, resume_when)) {
+      ++rounds;
+      if (max_rounds != 0 && rounds >= max_rounds) {
+        break;
+      }
+      service();
+    }
+    if (num_pending_ == 0) {
+      ++rounds;
     }
     return rounds;
   }
@@ -341,6 +449,8 @@ class Yieldable {
   clio::run::u32 nblocks_ = 0;
   clio::run::u32 nthreads_ = 0;
   clio::run::u32 num_pending_ = 0;
+  /** Set when a service callback returned false; see RunToCompletion. */
+  bool aborted_ = false;
   YieldBlockState *d_yield_ = nullptr;
   StateT *d_user_ = nullptr;
   clio::run::u32 *d_pending_ = nullptr;

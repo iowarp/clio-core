@@ -411,6 +411,7 @@ int main(int argc, char **argv) {
   // and only the checksum noticed. Count them and report.
   vec.EnableStats();
 
+  clio::run::u32 seed_checks = 0;
   if (yieldable) {
     gy::Yieldable<> sdrv(blocks, 32);
     gy::YieldStack sstack(blocks, 32, 256);
@@ -420,19 +421,24 @@ int main(int argc, char **argv) {
               gpu_info, vec.GetDevice(0), per, kPageElems, flat_pct, view,
               sstack.View());
         },
-        []{},
-        // 50k rounds is ~30x what a healthy seed of this size needs (measured
-        // 1734 for 256 pages). The cap exists to turn a NON-CONVERGING seed
-        // into a fast, loud failure instead of a seven-minute wedge: when the
-        // tier is genuinely full every writeback fails, those pages correctly
-        // stay dirty, no slot can ever be cleaned, and the fault path spins
-        // forever with nothing to report. Out of space must look like an
-        // error, not a hang.
+        // Abort the moment a writeback FAILS, rather than waiting out a
+        // round cap. A failed put means the tier is full and the page stays
+        // dirty, so no slot can ever be cleaned and the fault path would spin
+        // forever -- the caller knows that, the driver cannot. Checked every
+        // 64 rounds because it costs a device read.
+        [&]() -> bool {
+          if ((++seed_checks & 63u) != 0u) return true;
+          return vec.ReadStats(0).put_errors == 0;
+        },
+        // Backstop for a stall with no put error: ~30x a healthy seed of this
+        // size (measured 1734 rounds for 256 pages).
         /*max_rounds=*/50000);
-    std::fprintf(stderr, "[seed] yieldable, rounds=%u\n", seed_rounds);
+    const bool sdrv_aborted = sdrv.Aborted();
+    std::fprintf(stderr, "[seed] yieldable, rounds=%u%s\n", seed_rounds,
+                 sdrv_aborted ? " ABORTED (writeback failed)" : "");
     {
       const auto seed_stats = vec.ReadStats(0);
-      if (seed_rounds >= 50000 || seed_stats.put_errors != 0) {
+      if (sdrv_aborted || seed_rounds >= 50000 || seed_stats.put_errors != 0) {
         std::fprintf(stderr,
                      "bench: SEED DID NOT CONVERGE (rounds=%u, "
                      "put_errors=%llu). The tier cannot hold this image -- "
