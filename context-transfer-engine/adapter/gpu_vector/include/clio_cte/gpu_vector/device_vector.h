@@ -1507,11 +1507,20 @@ class DeviceVector {
       // per page (~1.6ms vs ~40us for a spilled raw page) and puts the CPU
       // back on a GPU fault.
       // A DEMAND fetch: the access already happened, so this counts as a
-      // fault but not as a prefetch. An ENCODED page goes exactly the same
-      // way -- the compressor decodes it on the host's stream, batched with
-      // every other page pending in that drain. There is deliberately no
-      // codec call in this file: device-side LZ4 internals are not portable
-      // across GPUs, and the I/O path belongs to the CPU.
+      // fault but not as a prefetch. An ENCODED page goes the same way -- the
+      // compressor decodes it on the host's stream, batched with whatever
+      // else is pending. No codec call in this file by design.
+      //
+      // TRIED AND REVERTED: also issuing FetchPagesBatchedAsync here, to give
+      // the compressor a whole run to decode at once. It is inert at small
+      // cache sizes (the async batch slots are ceil(ppb/64)-1, so there are
+      // NONE below 128 pages per block) and harmful once they exist: a
+      // kPodMultiMax prefetch on every fault floods the cache with pages the
+      // block has not asked for, and during seeding it takes the slots the
+      // writer needs -- the seed stopped converging (459600 rounds, no put
+      // errors, i.e. livelock rather than out-of-space). Feeding the batched
+      // decoder needs a prefetch policy that knows the access pattern, not a
+      // blind window on the fault path.
       BeginFetch(PageOf(off), /*is_prefetch=*/false);
     }
     // Hand the host the address of the completion flag this block is parked

@@ -2857,7 +2857,84 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     int first_rc = 0;
     clio::run::u32 n = task->count_;
     if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+    // Enqueue EVERY record's decode, then wait for all of them, so one
+    // multi-get of N pages becomes ONE nvcomp launch.
+    //
+    // This used to await DecompressPodGetBlob per record, in a loop. A task
+    // carrying N pages therefore produced N separate decodes, each waiting on
+    // its own drain -- which is what pinned the batch size near 16 however
+    // many pages the caller asked for, and is precisely "awaiting them one at
+    // a time". The records are independent; nothing required them ordered.
+    //
+    // Only pages already resident on a DEVICE tier take this path: their
+    // bytes are addressable right now, so no fetch is needed before decoding.
+    // Anything else falls through to the per-record path below.
+    std::vector<std::shared_ptr<PendingDecomp>> reqs(n);
+    clio::run::u32 batched = 0;
     for (clio::run::u32 i = 0; i < n; ++i) {
+      auto &req = task->reqs_[i];
+      auto dst = ipc_manager->ToFullPtr<char>(req.data_.template Cast<char>());
+      if (dst.ptr_ == nullptr || !ctp::IsDeviceAccessible(dst.ptr_)) continue;
+      unsigned long long lpool = 0, loff = 0, lsz = 0;
+      if (clio_cte_locate(&task->tag_id_, req.blob_name_.c_str(), &lpool,
+                          &loff, &lsz) != 0 ||
+          lsz <= sizeof(CompressionHeader)) {
+        continue;
+      }
+      char *tier = clio_direct_dev_base(lpool);
+      if (tier == nullptr) continue;
+      CompressionHeader thdr;
+      ctp::DeviceAwareMemcpy(&thdr, tier + loff, sizeof(thdr));
+      if (!thdr.IsValid() || !IsGpuCodec(thdr.compress_lib_)) continue;
+      auto r = std::make_shared<PendingDecomp>();
+      r->src_device = tier + loff;
+      r->stored_size = static_cast<size_t>(lsz);
+      r->dst = dst.ptr_;
+      r->dst_bytes = static_cast<size_t>(req.size_);
+      reqs[i] = r;
+      ++batched;
+    }
+    if (batched != 0) {
+      {
+        std::lock_guard<std::mutex> g(batch_mu_);
+        for (clio::run::u32 i = 0; i < n; ++i) {
+          if (reqs[i]) batch_.push_back(reqs[i]);
+        }
+      }
+      // ONE wait for the whole group, not one per page.
+      for (int spins = 0; spins < kDecompWaitMaxSpins; ++spins) {
+        bool all = true;
+        for (clio::run::u32 i = 0; i < n; ++i) {
+          if (reqs[i] && !reqs[i]->done.load(std::memory_order_acquire)) {
+            all = false;
+            break;
+          }
+        }
+        if (all) break;
+        CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+      }
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        if (!reqs[i]) continue;
+        const bool ok = reqs[i]->done.load(std::memory_order_acquire) &&
+                        reqs[i]->ok;
+        if (!ok) reqs[i]->abandoned.store(true, std::memory_order_release);
+        task->reqs_[i].rc_ = ok ? 0u : 1u;
+        if (ok) {
+          task->num_ok_++;
+        } else {
+          reqs[i] = nullptr;   // retry through the per-record path
+          if (first_rc == 0) first_rc = 1;
+        }
+      }
+    }
+#endif
+
+    for (clio::run::u32 i = 0; i < n; ++i) {
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+      if (reqs[i]) continue;          // already served by the batch above
+#endif
       auto &req = task->reqs_[i];
       auto sub = ipc_manager->NewTask<clio::cte::core::PodGetBlobTask>(
           clio::run::CreateTaskId(), task->pool_id_,
@@ -2874,7 +2951,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         first_rc = rc;
       }
     }
-    task->SetReturnCode(first_rc);
+    task->SetReturnCode(task->num_ok_ == n ? 0 : first_rc);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
