@@ -216,8 +216,12 @@ struct YCoroMain {
  * has to live in the loop. Pass `;` when nothing needs reaping.
  */
 #define CLIO_CO_YIELD_WHEN(reap, cond, tag)                                   \
-  for (;;) {                                                                  \
-    if (threadIdx.x == 0) {                                                   \
+  for (bool _cy_resumed = false;;) {                                          \
+    /* Reap only AFTER a resume -- the macro system's semantics exactly.   */ \
+    /* Its prologue reap covers the first evaluation; reaping before the   */ \
+    /* first vote here doubled the locked slot scans per page hold, which  */ \
+    /* measured as most of the coroutine path's nvcomp-regime overhead.    */ \
+    if (_cy_resumed && threadIdx.x == 0) {                                    \
       reap;                                                                   \
     }                                                                         \
     __syncthreads();                                                          \
@@ -226,6 +230,7 @@ struct YCoroMain {
     }                                                                         \
     co_await ::clio::run::gpu::YCoroSuspend{                                  \
         static_cast<clio::run::u64>(tag)};                                    \
+    _cy_resumed = true;                                                       \
   }
 
 /**
