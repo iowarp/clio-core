@@ -231,6 +231,13 @@ class Yieldable {
   clio::run::u32 NumThreads() const { return nthreads_; }
   /** Blocks that have not finished. */
   clio::run::u32 NumPending() const { return num_pending_; }
+  /** Host copy of one block's state (as of the last completed round). */
+  const YieldBlockState &BlockState(clio::run::u32 b) const {
+    return host_yield_[b];
+  }
+  clio::run::u32 PendingBlock(clio::run::u32 i) const {
+    return host_pending_[i];
+  }
   /** Device user state, for host-side setup before the first round. */
   StateT *DeviceState() const { return d_user_; }
 

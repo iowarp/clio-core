@@ -134,6 +134,18 @@ struct YieldLaneHeader {
   clio::run::u32 error_;
   /** Offset of each live frame, indexed by depth. */
   clio::run::u32 frame_off_[kYieldMaxDepth];
+  /**
+   * COROUTINE MODE ONLY (yield_coro.h, clang-CUDA builds): the deepest
+   * suspended coroutine frame (what the next entry resumes) and the lane's
+   * top-level frame (whose done() ends the lane). Zero = no coroutine live.
+   * The macro machinery never reads these; they ride here so both mechanisms
+   * share one stack allocation and one init kernel.
+   */
+  clio::run::u64 coro_resume_;
+  clio::run::u64 coro_top_;
+  /** 1 = the chain parked for the HOST (vs. an in-device handoff). */
+  clio::run::u32 coro_park_;
+  clio::run::u32 coro_pad_;
 };
 
 /** Limit violations. These corrupt silently if unchecked, so they trap. */
@@ -489,6 +501,9 @@ __global__ inline void YieldStackInitKernel(YieldStackView v,
   h->live_depth_ = 0;
   h->cur_depth_ = 0;
   h->error_ = kYieldErrNone;
+  h->coro_resume_ = 0;
+  h->coro_top_ = 0;
+  h->coro_park_ = 0;
 }
 
 }  // namespace clio::run::gpu

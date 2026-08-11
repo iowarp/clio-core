@@ -17,6 +17,7 @@
 
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yield_coro.h>
 #include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/types.h>
 #include <clio_cte/core/core_tasks.h>
@@ -1073,6 +1074,96 @@ class DeviceVector {
     }  // end host-fetch branch
     CLIO_YEND();
   }
+
+#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
+  /**
+   * HoldPageYield, spelled as a C++20 coroutine (yield_coro.h; clang-CUDA
+   * builds only). Same fault protocol, same host driver -- the difference is
+   * that the COMPILER hoists the state that crosses a suspend instead of
+   * CLIO_YLOCAL doing it by hand.
+   *
+   * The one semantic the macros got for free and this must spell out: a
+   * macro resume re-enters the whole function, so the reap prologue re-ran
+   * before every re-vote. A coroutine resumes INSIDE the loop, so the reap
+   * rides in CLIO_CO_YIELD_WHEN's per-iteration slot -- without it, a landed
+   * transfer is never settled, IsResident() stays false, and the block
+   * yields forever.
+   *
+   * Callers must be coroutines and must invoke this through `co_await`.
+   */
+  __device__ clio::run::gpu::YCoroTask HoldPageCoro(clio::run::u64 off,
+                                                    clio::run::u64 count,
+                                                    clio::run::u64 *run_out) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      ReapFetched();
+      ReapFlushed();
+    }
+    __syncthreads();
+    // Identity-mapped pages resolve on the device; see HoldPageYield step 0.
+    if (!PageNeedsHostFetch(PageOf(off))) {
+      *run_out = HoldPage(off, count);
+      co_return;
+    }
+    // 1. WRITEBACK: submit the victim's put and leave (HoldPageYield step 1).
+    if (threadIdx.x == 0) {
+      StartEvictionAsync(PageOf(off));
+#if defined(CLIO_YCORO_DEVTRACE)
+      printf("[hpc] blk=%u pg=%llu evict-submitted inflight=%d tag=%llx\n",
+             block_override_, (unsigned long long)PageOf(off),
+             (int)AnyTransferInFlight(), (unsigned long long)FlushWaitTag());
+#endif
+    }
+    CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched()), AnyTransferInFlight(),
+                       FlushWaitTag());
+    // Retire the writeback WITHIN this entry, before fetching -- and NOT only
+    // inside the loop above. The loop's exit condition is the RAW completion
+    // flag, so the put can complete in the window between an iteration's reap
+    // and its vote: the loop then breaks with the victim still flushing and
+    // its slot unfreed, BeginFetch below declines (the victim is mid-flush,
+    // every other slot is dirty), and nothing ever re-issues it -- a livelock
+    // the macro version cannot have, because its fall-through path reaps
+    // unconditionally after the yield.
+    if (threadIdx.x == 0) {
+      ReapFlushed();
+      ReapFetched();
+    }
+#if defined(CLIO_YCORO_DEVTRACE)
+    if (threadIdx.x == 0) {
+      printf("[hpc] blk=%u pg=%llu flushwait-done inflight=%d\n",
+             block_override_, (unsigned long long)PageOf(off),
+             (int)AnyTransferInFlight());
+    }
+#endif
+    __syncthreads();
+    // 2. FETCH: issue from one lane, then leave (HoldPageYield step 2 --
+    //    encoded tags fault a RUN so the batched decode gets full launches).
+    if (threadIdx.x == 0 && !IsResident(PageOf(off))) {
+      if (h_->compress_lib_ != 0) {
+        LockBlock();
+        const clio::run::u32 got =
+            BeginFetchRunLocked(PageOf(off), clio::cte::core::kPodMultiMax);
+        UnlockBlock();
+        if (got == 0 && !IsResident(PageOf(off))) {
+          BeginFetch(PageOf(off), /*is_prefetch=*/false);
+        }
+      } else {
+        const bool bf = BeginFetch(PageOf(off), /*is_prefetch=*/false);
+#if defined(CLIO_YCORO_DEVTRACE)
+        printf("[hpc] blk=%u pg=%llu beginfetch=%d resident=%d\n",
+               block_override_, (unsigned long long)PageOf(off), (int)bf,
+               (int)IsResident(PageOf(off)));
+#else
+        (void)bf;
+#endif
+      }
+    }
+    CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched()),
+                       !IsResident(PageOf(off)), FetchWaitTag(PageOf(off)));
+    // 3. Resident for the whole block: the lock-free fast path.
+    *run_out = HoldPage(off, count);
+  }
+#endif  // CLIO_YIELD_CORO
 
   /**
    * @return true when resolving `pn` requires the HOST -- i.e. the tier map
