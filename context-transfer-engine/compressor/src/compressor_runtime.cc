@@ -1495,6 +1495,28 @@ void Runtime::RunDecompBatch(std::vector<std::shared_ptr<PendingDecomp>> &batch)
   for (auto &p : batch) p->done.store(true, std::memory_order_release);
 }
 
+/**
+ * TRIED AND REVERTED: pipelining the launches.
+ *
+ * "Launch several kernels in parallel, do not await them one at a time"
+ * reads as: record an event instead of synchronizing, keep several batches in
+ * flight on the module stream, and retire them as their events fire. That was
+ * built and measured, and it is SLOWER -- 1102ms against 779ms on 8 blocks x
+ * 256 pages into an 8MB tier.
+ *
+ * The reason is that this workload is latency-bound, not throughput-bound.
+ * Every fault blocks a GPU block until its page lands, so what matters is how
+ * soon one batch's results are published, not how many decodes overlap.
+ * Deferring publication to a later drain-loop iteration costs each waiter
+ * more than the overlap wins back. (It also deadlocks at idle unless the loop
+ * polls in-flight batches when no new work arrives: batches were otherwise
+ * only retired by the NEXT launch, so once every caller was waiting, nothing
+ * retired them.)
+ *
+ * So a batch is launched and awaited before the next is built. The
+ * parallelism that pays is INSIDE the launch -- one nvcomp call decoding
+ * every chunk of every page in the batch at once -- not across launches.
+ */
 void Runtime::BatchDrainLoop() {
   // Linger before draining. Taking the queue the moment it is non-empty yields
   // batches of one, and a batch of one costs what no batching costs -- the
