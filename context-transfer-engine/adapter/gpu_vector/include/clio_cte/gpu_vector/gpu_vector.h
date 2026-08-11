@@ -328,9 +328,18 @@ class Vector {
         }
         continue;
       }
+      // Decoded size of this page, in BYTES. The same element/byte mix-up as
+      // NumPagesOf lived here: `h0.size_ - pg * h0.page_bytes_` subtracts
+      // bytes from an ELEMENT count, which lands on exactly 0 for the page at
+      // the boundary (pg * page_bytes_ == size_) and UNDERFLOWS to ~0 past it.
+      // The underflow was harmless because min() then chose page_bytes_, so
+      // the only visible symptom was the single boundary page failing to
+      // validate and silently keeping the host fetch path.
+      const clio::run::u64 elems_before = pg * h0.elems_per_page_;
+      const clio::run::u64 elems_left =
+          (elems_before < h0.size_) ? (h0.size_ - elems_before) : 0;
       const clio::run::u64 raw_bytes =
-          std::min<clio::run::u64>(h0.page_bytes_,
-                                   h0.size_ - pg * h0.page_bytes_);
+          std::min<clio::run::u64>(h0.page_bytes_, elems_left * sizeof(T));
       if (!encoded) {
         offs[pg] = o2;
         csz[pg] = s2;
