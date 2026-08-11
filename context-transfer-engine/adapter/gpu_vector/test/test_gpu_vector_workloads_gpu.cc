@@ -58,7 +58,6 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
                            clio::run::u64 per) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per;) {
@@ -80,7 +79,6 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
                                 clio::run::u64 per, clio::run::u64 page_elems) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
@@ -108,7 +106,6 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
                               clio::run::u64 per, clio::run::u64 page_elems,
                               unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   unsigned long long acc = 0;

@@ -41,7 +41,6 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
                            clio::run::u64 n) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   for (clio::run::u64 i = 0; i < n;) {
     const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
@@ -58,7 +57,6 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<clio::run::u32> v,
                             clio::run::u64 n, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   for (clio::run::u64 i = 0; i < n;) {
     const clio::run::u64 run_i = v.HoldPage(i, (n) - i);
@@ -80,7 +78,6 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
                                 clio::run::u64 per) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per;) {
@@ -97,7 +94,6 @@ __global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<clio::run::u32> v,
                                  clio::run::u64 per, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per;) {

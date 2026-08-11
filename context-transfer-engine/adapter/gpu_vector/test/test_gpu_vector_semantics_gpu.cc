@@ -61,7 +61,6 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 base, u64 count,
                             u32 salt, int flush) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
   for (clio::run::u64 i = 0; i < count;) {
@@ -81,7 +80,6 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<u32> v, u64 base, u64 count,
                              u32 salt, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const u64 off = base + static_cast<u64>(blockIdx.x) * count;
   unsigned long long local = 0;
@@ -99,12 +97,11 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 first_page, u64 npages,
                            u32 passes, unsigned long long *sink) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
   for (u32 p = 0; p < passes; ++p) {
     for (u64 k = 0; k < npages; ++k) {
-      const u64 off = (first_page + k) * v.elems_per_page_;
+      const u64 off = (first_page + k) * v.h_->elems_per_page_;
       v.HoldPage(off, 1);
       acc += v.at(off);
     }
@@ -117,13 +114,12 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<u32> v, const u64 *pages,
                                u32 n, unsigned long long *sink) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
   // One page per step, in the given order -- these touches are deliberately
   // NOT contiguous, so each needs its own hold.
   for (u32 i = 0; i < n; ++i) {
-    const u64 off = pages[i] * v.elems_per_page_;
+    const u64 off = pages[i] * v.h_->elems_per_page_;
     v.HoldPage(off, 1);
     acc += v.at(off);
   }
@@ -133,7 +129,6 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u32 n) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.EvictPages(n);
 }
@@ -141,7 +136,6 @@ __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v, u64 page, float score) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.RescorePage(page, score);
 }
@@ -150,7 +144,6 @@ __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 off, u64 count) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.BeginFlush(off, count);
   v.WaitFlush(off, count);
@@ -164,12 +157,11 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 npages, u32 salt,
                                  unsigned long long *flushed) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   for (u64 p = 0; p < npages; ++p) {
-    const u64 base = p * v.elems_per_page_;
-    for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
-      const clio::run::u64 run_i = v.HoldPage(base + i, v.elems_per_page_ - i);
+    const u64 base = p * v.h_->elems_per_page_;
+    for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {
+      const clio::run::u64 run_i = v.HoldPage(base + i, v.h_->elems_per_page_ - i);
       for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
         v[base + i] = Val(base + i, salt);
       }
@@ -188,7 +180,6 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
                                  u32 salt, unsigned long long *bad,
                                  unsigned long long *got) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long local = 0;
   unsigned long long fetched = 0;
@@ -197,9 +188,9 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
     if (n > chunk) n = chunk;
     fetched += v.FetchPagesBatched(k, static_cast<u32>(n));
     for (u64 j = 0; j < n; ++j) {
-      const u64 off = (k + j) * v.elems_per_page_;
-      v.HoldPage(off, v.elems_per_page_);
-      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+      const u64 off = (k + j) * v.h_->elems_per_page_;
+      v.HoldPage(off, v.h_->elems_per_page_);
+      for (u64 i = 0; i < v.h_->elems_per_page_; ++i) {
         if (v[off + i] != Val(off + i, salt)) ++local;
       }
     }
@@ -212,7 +203,6 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.DropAll();
 }
@@ -222,7 +212,6 @@ __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v,
                                  unsigned long long *flushed) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   atomicAdd(flushed,
             static_cast<unsigned long long>(v.FlushBlockBatched()));
@@ -231,7 +220,6 @@ __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void SizeKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 *out) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   *out = v.size();
 }
@@ -246,10 +234,9 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<u32> v, u64 boundary_page,
                                u32 reps) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
-  const u64 last_of_prev = boundary_page * v.elems_per_page_ - 1;
-  const u64 first_of_next = boundary_page * v.elems_per_page_;
+  const u64 last_of_prev = boundary_page * v.h_->elems_per_page_ - 1;
+  const u64 first_of_next = boundary_page * v.h_->elems_per_page_;
   // The two elements straddle a page boundary, so each needs its own hold --
   // one hold cannot cover both, which is exactly what this test checks.
   for (u32 r = 0; r < reps; ++r) {
@@ -272,15 +259,14 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
                                     gv::DeviceVector<u32> v, u64 count,
                                     u32 salt, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   unsigned long long local = 0;
   // Lane-strided WITHIN a page, page-by-page: at any moment the whole warp is
   // inside one page, which is the granularity contract.
-  const u64 pages = count / v.elems_per_page_;
+  const u64 pages = count / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
-    const u64 base = p * v.elems_per_page_;
-    v.HoldPage(base, v.elems_per_page_);
-    for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+    const u64 base = p * v.h_->elems_per_page_;
+    v.HoldPage(base, v.h_->elems_per_page_);
+    for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
       if (v.at(base + i) != Val(base + i, salt)) ++local;
     }
     __syncthreads();
@@ -293,22 +279,21 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceVector<u32> v, u64 count,
                                      u32 salt) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   // Each block owns its own slice, matching VerifyKernel -- otherwise every
   // block would write the same pages and race on the same blobs.
   const u64 slice = static_cast<u64>(blockIdx.x) * count;
-  const u64 pages = count / v.elems_per_page_;
+  const u64 pages = count / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
-    const u64 base = slice + p * v.elems_per_page_;
-    v.HoldPage(base, v.elems_per_page_);
+    const u64 base = slice + p * v.h_->elems_per_page_;
+    v.HoldPage(base, v.h_->elems_per_page_);
     {
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         v[base + i] = Val(base + i, salt);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        v.BeginFlush(base, v.elems_per_page_);
-        v.WaitFlush(base, v.elems_per_page_);
+        v.BeginFlush(base, v.h_->elems_per_page_);
+        v.WaitFlush(base, v.h_->elems_per_page_);
       }
       __syncthreads();
       }
@@ -325,19 +310,18 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 count,
                                    u32 salt, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const u64 slice = static_cast<u64>(blockIdx.x) * count;
-  const u64 pages = count / v.elems_per_page_;
-  const u64 first = slice / v.elems_per_page_;
+  const u64 pages = count / v.h_->elems_per_page_;
+  const u64 first = slice / v.h_->elems_per_page_;
   unsigned long long local = 0;
   for (u64 p = 0; p < pages; ++p) {
     {
       if (p + 1 < pages) v.BeginFetch(first + p + 1);
       v.RescorePage(first + p, 1000.0f);
-      const u64 off = slice + p * v.elems_per_page_;
-      v.HoldPage(off, v.elems_per_page_);
-      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+      const u64 off = slice + p * v.h_->elems_per_page_;
+      v.HoldPage(off, v.h_->elems_per_page_);
+      for (u64 i = 0; i < v.h_->elems_per_page_; ++i) {
         if (v[off + i] != Val(off + i, salt)) ++local;
       }
       v.RescorePage(first + p, -1000.0f);
@@ -351,7 +335,6 @@ __global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 page,
                                    u32 reps) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   for (u32 r = 0; r < reps; ++r) {
     v.RescorePage(page, static_cast<float>(r));

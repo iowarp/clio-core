@@ -73,7 +73,6 @@ __global__ void SeedWeightsKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceVector<clio::run::u32> v,
                                   clio::run::u64 per) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per;) {
@@ -96,7 +95,6 @@ __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
                                  clio::run::u64 per,
                                  unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   unsigned long long acc = 0;
@@ -126,11 +124,10 @@ __global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
                                         clio::run::u64 per, clio::run::u32 chunk,
                                         unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  const clio::run::u64 first_page = base / v.elems_per_page_;
-  const clio::run::u64 npages = per / v.elems_per_page_;
+  const clio::run::u64 first_page = base / v.h_->elems_per_page_;
+  const clio::run::u64 npages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
   // HoldPage before indexing: operator[] deliberately does NO resolution (that
   // is the whole point of the hold), so indexing straight after a batched
@@ -141,9 +138,9 @@ __global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
     if (n > chunk) n = chunk;
     v.FetchPagesBatched(first_page + p, static_cast<clio::run::u32>(n));
     for (clio::run::u64 j = 0; j < n; ++j) {
-      const clio::run::u64 off = base + (p + j) * v.elems_per_page_;
-      for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
-        const clio::run::u64 run_i = v.HoldPage(off + i, v.elems_per_page_ - i);
+      const clio::run::u64 off = base + (p + j) * v.h_->elems_per_page_;
+      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {
+        const clio::run::u64 run_i = v.HoldPage(off + i, v.h_->elems_per_page_ - i);
         for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
           acc += static_cast<unsigned long long>(v.at(off + i)) *
                  Activation(off + i);
