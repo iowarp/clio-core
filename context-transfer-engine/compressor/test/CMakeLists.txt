@@ -84,6 +84,20 @@ target_link_libraries(test_compressor_functional
   ${CMAKE_THREAD_LIBS_INIT}     # Threading support
 )
 
+# "Static Compress - real GPU device pointer as input" stages a genuine
+# cudaMalloc'd buffer via ctp::DeviceAwareMemcpy/IsDevicePointer. Without
+# ctp::cuda_cxx (which carries CTP_ENABLE_CUDA=1 plus the real CUDA
+# runtime), gpu_api.h's device-aware helpers compile down to their
+# CPU-only fallback (IsDevicePointer always false, DeviceAwareMemcpy always
+# plain std::memcpy) -- which segfaults on a real device pointer instead of
+# actually exercising the staging path, same class of gap the VOL adapter
+# had before its own GPU-pointer fix.
+if(CLIO_CORE_ENABLE_CUDA)
+    target_link_libraries(test_compressor_functional ctp::cuda_cxx)
+elseif(CLIO_CORE_ENABLE_ROCM)
+    target_link_libraries(test_compressor_functional ctp::rocm_cxx)
+endif()
+
 target_compile_definitions(test_compressor_functional PRIVATE
   CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
 
@@ -143,6 +157,15 @@ add_test(NAME compressor_gpu_1gb_sweep
 set_tests_properties(compressor_gpu_1gb_sweep PROPERTIES
     TIMEOUT 900
     LABELS "compressor;functional;chimod;gpu")
+
+# Static (explicit compress_lib_) compression with a REAL cudaMalloc'd
+# device pointer as the source -- see the TEST_CASE comment for why none
+# of the tests above (including the 1GiB sweep) actually cover this.
+add_test(NAME compressor_static_gpu_device_ptr
+    COMMAND test_compressor_functional "[gpu][static][693]")
+set_tests_properties(compressor_static_gpu_device_ptr PROPERTIES
+    TIMEOUT 300
+    LABELS "compressor;functional;chimod;gpu;693")
 
 # Set test properties
 set_tests_properties(

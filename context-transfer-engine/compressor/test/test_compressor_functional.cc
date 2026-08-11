@@ -63,6 +63,7 @@
 
 #if CTP_ENABLE_NVCOMP
 #include <cuda_runtime.h>
+#include <clio_ctp/util/gpu_api.h>
 #endif
 
 using namespace clio::cte::compressor;
@@ -922,6 +923,96 @@ TEST_CASE("GPU Compressor Round-trip - 1GiB dataset",
 #endif  // CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
 }
 #endif  // CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+
+#if CTP_ENABLE_NVCOMP
+/**
+ * Static compression (explicit context.compress_lib_, AsyncCompress -- no
+ * NeuroPress/dynamic analysis) with the SOURCE data living in a real
+ * cudaMalloc'd device allocation, not host memory. Every other static test
+ * above (including the 1GiB sweep) stages its input via
+ * fixture.AllocateAndCopyData(), which is plain host SHM -- none of them
+ * prove Runtime::Compress() is safe when the bytes only exist on the GPU.
+ *
+ * The compressor task API only accepts a host-resident ShmPtr
+ * (Runtime::Compress() dereferences task->blob_data_ directly on the host
+ * via CLIO_IPC->ToFullPtr), so there is no "hand it a device pointer
+ * directly" form -- any caller (the HDF5 VOL connector included, see
+ * clio_dataset_write() in adapter/hdf5_vol/clio_vol.cc) must stage GPU data
+ * into host SHM with a device-aware copy first. This test proves that
+ * staging pattern plus the static compression path together produce a
+ * correct round-trip when the source truly is device memory.
+ */
+TEST_CASE("Static Compress - real GPU device pointer as input",
+          "[compressor][functional][gpu][static][693]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    INFO("No CUDA device available; skipping GPU device-pointer static "
+         "compression test");
+    return;
+  }
+
+  CTETestFixture fixture;
+
+  // Compressible, non-random content (repeating pattern) so a real codec
+  // does something meaningful with it.
+  constexpr size_t kSize = 256 * 1024;
+  std::vector<char> original_data(kSize);
+  for (size_t i = 0; i < kSize; ++i) {
+    original_data[i] = static_cast<char>((i / 64) % 16);
+  }
+
+  char *d_src = nullptr;
+  REQUIRE(cudaMalloc(&d_src, kSize) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_src, original_data.data(), kSize,
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(ctp::IsDevicePointer(d_src));
+
+  auto put_buffer = CLIO_IPC->AllocateBuffer(kSize);
+  REQUIRE(!put_buffer.IsNull());
+  ctp::DeviceAwareMemcpy(put_buffer.ptr_, d_src, kSize);
+  cudaFree(d_src);
+  ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+
+  Context context;
+  context.compress_lib_ = CompLib::LZ4;  // explicit/static, not analyzed
+  context.compress_preset_ = 2;
+
+  std::string blob_name = "test_blob_gpu_static";
+  auto compress_task = fixture.compressor_client_.AsyncCompress(
+      clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+      original_data.size(), put_blob_data, 0.5f, context, 0,
+      fixture.core_pool_id_);
+  compress_task.Wait();
+  REQUIRE(compress_task->return_code_ == 0);
+  CLIO_IPC->FreeBuffer(put_buffer);
+
+  auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
+  REQUIRE(!get_buffer.IsNull());
+  ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+  auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+      clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+      original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
+  decompress_task.Wait();
+  REQUIRE(decompress_task->return_code_ == 0);
+  REQUIRE(decompress_task->output_size_ == original_data.size());
+
+  // Verify by copying the decompressed result back into a fresh device
+  // allocation and comparing there -- proving both ends of a real device
+  // round-trip (GPU in, GPU out), not just that the host-side copy matches.
+  char *d_dst = nullptr;
+  REQUIRE(cudaMalloc(&d_dst, original_data.size()) == cudaSuccess);
+  ctp::DeviceAwareMemcpy(d_dst, get_buffer.ptr_, original_data.size());
+  std::vector<char> rbuf(original_data.size());
+  REQUIRE(cudaMemcpy(rbuf.data(), d_dst, original_data.size(),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  cudaFree(d_dst);
+
+  REQUIRE(std::memcmp(original_data.data(), rbuf.data(),
+                      original_data.size()) == 0);
+  CLIO_IPC->FreeBuffer(get_buffer);
+}
+#endif  // CTP_ENABLE_NVCOMP
 
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()
