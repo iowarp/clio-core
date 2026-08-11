@@ -29,6 +29,8 @@
 #include <thread>
 #include <vector>
 
+#include <cstdlib>
+
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
@@ -212,8 +214,14 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   constexpr clio::run::u64 kTotalPages = kBlocks * kPagesPerSlice;
   // Pressure high enough to model llama's sustained fault storms — the
   // managed-queue migration wedge needs continuous device pushes + CPU
-  // drains under resident kernels, not a short burst.
-  constexpr int kIters = 8192;
+  // drains under resident kernels, not a short burst. CLIO_RACE_ITERS
+  // overrides for a quick byte-exactness verdict (the full 8192 runs many
+  // minutes; correctness bugs historically reproduced within hundreds).
+  int kIters = 8192;
+  if (const char *it_env = std::getenv("CLIO_RACE_ITERS")) {
+    kIters = std::atoi(it_env);
+    if (kIters <= 0) kIters = 8192;
+  }
   const clio::run::u64 n = kTotalPages * kPageElems;
 
   gv::Vector<clio::run::u32> vec("gv_race", {0}, kPageBytes, kBlocks,
@@ -230,6 +238,7 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
     ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(kPageBytes);
     REQUIRE(shm.ptr_ != nullptr);
     for (clio::run::u64 pg = 0; pg < kTotalPages; ++pg) {
+    if ((pg & 0x7FF) == 0) std::fprintf(stderr, "[race-progress] page %llu/%llu\n", (unsigned long long) pg, (unsigned long long) kTotalPages);
       auto *w = reinterpret_cast<clio::run::u32 *>(shm.ptr_);
       for (clio::run::u64 i = 0; i < kPageElems; ++i) {
         w[i] = Seed(pg * kPageElems + i);
