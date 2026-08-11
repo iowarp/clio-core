@@ -635,6 +635,17 @@ class DeviceVector {
       }
     }
     if (victim == ~0u) {
+      // No CLEAN victim: DECLINE. Dropping a dirty page here would discard
+      // the only copy of its writes.
+      //
+      // Deliberately does NOT start a writeback to free one up. That was
+      // tried and it thrashes: this claim runs on every fault, so it evicts
+      // pages the block is still working through, and the seed phase stopped
+      // converging entirely (200000 rounds, cap reached, where it had taken
+      // 43ms). Whoever needs room must arrange it with knowledge of what it
+      // still needs -- HoldPageYield's StartEvictionAsync picks one victim
+      // per fault and waits for it. Declining here just means the caller
+      // falls back to that demand path.
       return ~0u;
     }
     // The victim is CLEAN (guaranteed above), so dropping it is a metadata

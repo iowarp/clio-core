@@ -236,28 +236,47 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
  * Batched-fetch `npages` in chunks of `chunk`, then verify every element.
  * Reports mismatches and how many pages the batched fetch reported resident.
  */
+// Yields, and it MUST. The blocking HoldPage spins in-kernel until a slot
+// can be claimed, and a claim now declines rather than dropping a dirty
+// victim, so with dirty pages in the window this kernel span forever.
 __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 npages, u32 chunk,
                                  u32 salt, unsigned long long *bad,
-                                 unsigned long long *got) {
+                                 unsigned long long *got,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  unsigned long long local = 0;
-  unsigned long long fetched = 0;
-  for (u64 k = 0; k < npages; k += chunk) {
-    u64 n = npages - k;
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, k, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, j, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, n, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+
+  CLIO_YBEGIN();
+  for (; k < npages; k += chunk) {
+    n = npages - k;
     if (n > chunk) n = chunk;
-    fetched += v.FetchPagesBatched(k, static_cast<u32>(n));
-    for (u64 j = 0; j < n; ++j) {
-      const u64 off = (k + j) * v.h_->elems_per_page_;
-      v.HoldPage(off, v.h_->elems_per_page_);
-      for (u64 i = 0; i < v.h_->elems_per_page_; ++i) {
-        if (v[off + i] != Val(off + i, salt)) ++local;
+    if (threadIdx.x == 0) {
+      atomicAdd(got, static_cast<unsigned long long>(
+                         v.FetchPagesBatched(k, static_cast<u32>(n))));
+    }
+    __syncthreads();
+    for (j = 0; j < n; ++j) {
+      CLIO_YCALL(v.HoldPageYield((k + j) * v.h_->elems_per_page_,
+                                 v.h_->elems_per_page_, &run));
+      {
+        const u64 off = (k + j) * v.h_->elems_per_page_;
+        unsigned long long local = 0;
+        for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
+          if (v[off + i] != Val(off + i, salt)) ++local;
+        }
+        if (local != 0) atomicAdd(bad, local);
       }
     }
   }
-  atomicAdd(bad, local);
-  atomicAdd(got, fetched);
+  CLIO_YEND();
 }
 
 /** Drop the calling block's cache, so the next reads must fault. */
@@ -607,7 +626,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
 
     unsigned long long *got = NewCounter();
     f.Reset();
-    BatchFetchKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      BatchFetchKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got, vw_, sv_);
+    });
     Sync();
     const unsigned long long nbad = ReadCounter(bad);
     std::fprintf(stderr, "[batch-fetch] pages=%llu resident=%llu bad=%llu\n",
@@ -1237,11 +1259,12 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     auto s = f.Stats();
     std::fprintf(stderr,
                  "[prefetch] mismatches=%llu faults=%llu prefetches=%llu "
-                 "hits=%llu rescores=%llu\n",
+                 "hits=%llu rescores=%llu dropped=%llu\n",
                  ReadCounter(bad), (unsigned long long) s.faults,
                  (unsigned long long) s.prefetches,
                  (unsigned long long) s.prefetch_hits,
-                 (unsigned long long) s.rescores);
+                 (unsigned long long) s.rescores,
+                 (unsigned long long) s.pf_dropped);
     REQUIRE(ReadCounter(bad) == 0);
     // Each block prefetches every page after its first.
     REQUIRE(s.prefetches == 4 * (kPages - 1));
