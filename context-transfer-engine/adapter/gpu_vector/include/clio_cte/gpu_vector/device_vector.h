@@ -598,7 +598,15 @@ class DeviceVector {
       // own just-fetched pages self-evicted at score ~0.004. At -0.02 per
       // scan, a page touched once per token sustains ~+0.5/token net while
       // an untouched one loses its history in ~50 claims.
-      pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
+      //
+      // NO aging for encoded (chunk-mapped) tags: their eval demotes pages
+      // to ~0 after use (use-once, cyclic reuse), so victims are always
+      // explicit — while an encoded table sees ~40x the claim rate this
+      // constant was tuned for, enough that aging out-ran the +1/token
+      // touch and eroded the pinned residents the demotion exists to keep.
+      if (h_->tier_chunk_off_ == nullptr) {
+        pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
+      }
       if (!pgi.fetching && !pgi.flushing && !pgi.rescoring &&
           pgi.score < best) {
         best = pgi.score;
