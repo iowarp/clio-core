@@ -430,15 +430,21 @@ int main(int argc, char **argv) {
           if ((++seed_checks & 63u) != 0u) return true;
           return vec.ReadStats(0).put_errors == 0;
         },
-        // Backstop for a stall with no put error: ~30x a healthy seed of this
-        // size (measured 1734 rounds for 256 pages).
-        /*max_rounds=*/50000);
+        // Backstop for a stall with no put error. Must SCALE with the image:
+        // a healthy seed costs a few rounds per page (measured 1734 rounds
+        // for 256 pages, ~6.8/page), so a fixed cap that suits a 16MB run
+        // false-trips a 2GB one. 200/page is ~30x headroom.
+        /*max_rounds=*/static_cast<clio::run::u32>(
+            (n / kPageElems) * 200ull + 50000ull));
     const bool sdrv_aborted = sdrv.Aborted();
     std::fprintf(stderr, "[seed] yieldable, rounds=%u%s\n", seed_rounds,
                  sdrv_aborted ? " ABORTED (writeback failed)" : "");
     {
       const auto seed_stats = vec.ReadStats(0);
-      if (sdrv_aborted || seed_rounds >= 50000 || seed_stats.put_errors != 0) {
+      const clio::run::u32 seed_cap =
+          static_cast<clio::run::u32>((n / kPageElems) * 200ull + 50000ull);
+      if (sdrv_aborted || seed_rounds >= seed_cap ||
+          seed_stats.put_errors != 0) {
         std::fprintf(stderr,
                      "bench: SEED DID NOT CONVERGE (rounds=%u, "
                      "put_errors=%llu). The tier cannot hold this image -- "
