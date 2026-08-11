@@ -474,6 +474,20 @@ private:
   bool GpuDecompressToDevice(const char *stored_host, size_t stored_size,
                              void *dst_device, size_t dst_bytes);
   /**
+   * Decompress a stored blob already resident in DEVICE memory into device
+   * memory, with no copy of the payload in either direction.
+   *
+   * Takes the two header fields it needs rather than the header struct, which
+   * this header cannot see. The caller validates the header (it has to bring
+   * those 32 bytes back from the device anyway).
+   *
+   * @param wire_id  codec from the blob's header
+   * @param payload  compressed byte count, excluding the header
+   */
+  bool GpuDecompressFromDevice(const char *stored_device, size_t stored_size,
+                               int wire_id, size_t payload, void *dst_device,
+                               size_t dst_bytes);
+  /**
    * Compress `src_device` with a GPU codec. On success fills `out_host` (which
    * must hold at least the codec's bound) and sets *out_size.
    */

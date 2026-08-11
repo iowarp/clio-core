@@ -1613,6 +1613,60 @@ void Runtime::DestroyCodecContext() {
   gpu_stream_ = nullptr;
 }
 
+/**
+ * Decompress a stored blob that is ALREADY in device memory, into device
+ * memory. Device pointer in, device pointer out, and no copy of the payload
+ * in either direction -- nvcomp reads the compressed bytes where they lie.
+ *
+ * The host-source variant below has to stage the payload H2D into a codec
+ * slot first, and the caller had to bring it D2H out of the tier to call it
+ * at all. For a kHBM tier that is a device->host->device round trip of the
+ * compressed bytes on every read.
+ *
+ * @param stored_device  device pointer to [CompressionHeader][codec bytes]
+ * @param header         host copy of that header (32 bytes of metadata; the
+ *                       host cannot read the device copy directly)
+ */
+bool Runtime::GpuDecompressFromDevice(const char *stored_device,
+                                      size_t stored_size, int wire_id,
+                                      size_t payload, void *dst_device,
+                                      size_t dst_bytes) {
+  if (!HasCodecContext() || dst_bytes > codec_buf_bytes_) {
+    return false;
+  }
+  const size_t hdr = sizeof(CompressionHeader);
+  if (stored_size <= hdr || payload == 0 || !IsGpuCodec(wire_id)) {
+    return false;
+  }
+  const size_t slot = AcquireCodecSlot();
+  if (slot == SIZE_MAX) {
+    return false;
+  }
+  CUstream sstream = static_cast<CUstream>(codec_slots_[slot].stream);
+  size_t out = dst_bytes;
+  bool ok = false;
+  {
+    CodecCtxGuard guard(codec_ctx_);
+    if (guard.ok()) {
+      ctp::CompressionFactory::SetGpuStreamForThread(sstream);
+      auto codec = ctp::CompressionFactory::GetPreset(
+          ctp::CompressionFactory::NameForWireId(wire_id),
+          ctp::CompressionPreset::BALANCED);
+      // Source and destination are both device memory: no staging buffer and
+      // no copy, just the codec.
+      ok = codec && codec->Decompress(dst_device, out,
+                                      const_cast<char *>(stored_device) + hdr,
+                                      payload);
+      if (ok && cuStreamSynchronize(sstream) != CUDA_SUCCESS) {
+        ok = false;
+      }
+      ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+    }
+  }
+  ReleaseCodecSlot(slot);
+  return ok;
+}
+
 bool Runtime::GpuDecompressToDevice(const char *stored_host, size_t stored_size,
                                     void *dst_device, size_t dst_bytes) {
   if (!HasCodecContext() || stored_size > codec_buf_bytes_ ||
@@ -2222,6 +2276,49 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       }
       stored_size = sz->size_;
     }
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+    // DEVICE-RESIDENT read of the stored bytes, when the destination is a
+    // device page. Fetching them into a host buffer first means a D2H out of
+    // the kHBM tier immediately followed by an H2D back into a codec slot --
+    // the compressed payload crossing the bus twice to be decompressed on the
+    // device it started on.
+    {
+      auto dst_probe =
+          CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      if (dst_probe.ptr_ != nullptr &&
+          ctp::IsDeviceAccessible(dst_probe.ptr_)) {
+        char *dscratch = nullptr;
+        for (int attempt = 0; attempt < 10000 && dscratch == nullptr;
+             ++attempt) {
+          dscratch = AcquireGpuScratch(stored_size);
+          if (dscratch == nullptr) CLIO_CO_AWAIT(clio::run::yield(50.0));
+        }
+        if (dscratch != nullptr) {
+          auto dget = core_client_->AsyncGetBlob(
+              task->tag_id_, task->blob_name_.str(), 0, stored_size, 0,
+              ScratchShmPtr(dscratch), clio::run::PoolQuery::Local());
+          CLIO_CO_AWAIT(dget);
+          if (dget->GetReturnCode() == 0) {
+            // Only the 32-byte header comes back to the host, to be validated.
+            CompressionHeader dhdr;
+            ctp::DeviceAwareMemcpy(&dhdr, dscratch, sizeof(dhdr));
+            if (dhdr.IsValid() && IsGpuCodec(dhdr.compress_lib_) &&
+                GpuDecompressFromDevice(
+                    dscratch, stored_size, dhdr.compress_lib_,
+                    (dhdr.compressed_size_ != 0)
+                        ? static_cast<size_t>(dhdr.compressed_size_)
+                        : (stored_size - sizeof(CompressionHeader)),
+                    dst_probe.ptr_, static_cast<size_t>(task->size_))) {
+              ReleaseGpuScratch(dscratch);
+              task->return_code_ = 0;
+              CLIO_CO_RETURN;
+            }
+          }
+          ReleaseGpuScratch(dscratch);
+        }
+      }
+    }
+#endif
     auto buf = CLIO_IPC->AllocateBuffer(stored_size);
     if (buf.IsNull()) {
       task->return_code_ = 4;
