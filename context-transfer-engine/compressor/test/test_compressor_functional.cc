@@ -48,6 +48,7 @@
 
 #include "simple_test.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <vector>
@@ -94,6 +95,14 @@ namespace CompLib {
   constexpr int NVCOMP_ANS = 16;
   constexpr int NVCOMP_CASCADED = 21;
   constexpr int NVCOMP_BITCOMP = 22;
+  // Explicit-selection-only algorithms (not part of NeuroPress's NN action
+  // space, but selectable through Clio's static compress_lib_ path like
+  // everything else). CUSZ/CUSZP are LOSSY (error-bounded); NDZIP is
+  // LOSSLESS. All three require float-aligned data (checked in their
+  // Compress() -- input_size % sizeof(float) must be 0).
+  constexpr int CUSZ = 18;
+  constexpr int NDZIP = 19;
+  constexpr int CUSZP = 20;
 }
 
 /**
@@ -135,6 +144,23 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
 }
 
 /**
+ * Generate smooth scientific-data-like float array (a sum of a few sine
+ * waves, like a sampled sensor/simulation signal). SZ-family compressors
+ * (cuSZ/cuSZp/ndzip) are designed for this kind of data, not arbitrary
+ * bytes reinterpreted as float -- that risks NaN/Inf bit patterns that
+ * are meaningless to compress and undefined to error-bound against.
+ */
+std::vector<float> GenerateFloatTestData(size_t num_floats) {
+  std::vector<float> data(num_floats);
+  for (size_t i = 0; i < num_floats; ++i) {
+    double x = static_cast<double>(i) * 0.001;
+    data[i] = static_cast<float>(50.0 * std::sin(x) + 10.0 * std::sin(x * 17.0) +
+                                 5.0 * std::sin(x * 101.0));
+  }
+  return data;
+}
+
+/**
  * Initialize CLIO Runtime runtime for compressor tests
  */
 void InitializeClio() {
@@ -171,12 +197,14 @@ clio::run::PoolId CreateCorePool() {
   // sees an empty target list and every real PutBlob fails with "No storage
   // devices configured" (core_runtime.cc's ExtendBlob, error_code=1 ->
   // return_code_=11) -- regardless of which compressor was used or whether
-  // compression itself succeeded. RAM-backed, sized generously so functional
-  // tests can safely exercise multi-MB payloads (e.g. nvcomp round-trips).
+  // compression itself succeeded. RAM-backed, sized generously (16 GiB) so
+  // functional tests can safely exercise multi-GB payloads (e.g. the 1 GiB
+  // GPU compressor sweep) even in the worst case where several SECTIONs in
+  // a row fall back to storing the raw, uncompressed blob.
   core_client.Init(core_pool_id);
   auto reg_task = core_client.AsyncRegisterTarget(
       "test_compressor_ram_target", clio::run::bdev::BdevType::kRam,
-      static_cast<clio::run::u64>(256) * 1024 * 1024,
+      static_cast<clio::run::u64>(16) * 1024 * 1024 * 1024,
       clio::run::PoolQuery::Local(), clio::run::PoolId(700, 0));
   reg_task.Wait();
   if (reg_task->GetReturnCode() != 0) {
@@ -720,6 +748,175 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   }
 }
 #endif  // CTP_ENABLE_NVCOMP
+
+#if CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+/**
+ * Static selection of every GPU compressor Clio can build against, run at
+ * 1 GiB: NeuroPress's 8-algorithm nvcomp action space (lossless, byte data)
+ * plus the three explicit-selection-only float compressors NeuroPress also
+ * defines (GPUCOMPRESS_ALGO_CUSZ/NDZIP/CUSZP) -- cuSZ and cuSZp are LOSSY
+ * (error-bounded), ndzip is LOSSLESS. Same static-selection proof as the
+ * 64 MiB "NvComp GPU Round-trip" test above, scaled up and covering the
+ * complete algorithm set instead of just the NN-selectable subset.
+ */
+TEST_CASE("GPU Compressor Round-trip - 1GiB dataset",
+          "[compressor][functional][gpu][1gb]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    INFO("No CUDA device available; skipping 1GiB GPU compressor sweep");
+    return;
+  }
+
+  CTETestFixture fixture;
+  constexpr size_t kOneGiB = static_cast<size_t>(1) * 1024 * 1024 * 1024;
+
+#if CTP_ENABLE_NVCOMP
+  {
+    std::vector<std::pair<int, std::string>> lossless_byte_algos = {
+        {CompLib::NVCOMP_LZ4, "nvcomp-lz4"},
+        {CompLib::NVCOMP_SNAPPY, "nvcomp-snappy"},
+        {CompLib::NVCOMP_DEFLATE, "nvcomp-deflate"},
+        {CompLib::NVCOMP_GDEFLATE, "nvcomp-gdeflate"},
+        {CompLib::NVCOMP_ZSTD, "nvcomp-zstd"},
+        {CompLib::NVCOMP_ANS, "nvcomp-ans"},
+        {CompLib::NVCOMP_CASCADED, "nvcomp-cascaded"},
+        {CompLib::NVCOMP_BITCOMP, "nvcomp-bitcomp"},
+    };
+    auto original_data = GenerateTestData(kOneGiB, "text");
+
+    for (const auto& [lib_id, lib_name] : lossless_byte_algos) {
+      SECTION(lib_name) {
+        auto put_buffer = fixture.AllocateAndCopyData(original_data);
+        REQUIRE(!put_buffer.IsNull());
+        ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+
+        Context context;
+        context.compress_lib_ = lib_id;
+        context.compress_preset_ = 2;
+
+        std::string blob_name = "test_blob_1gb_" + lib_name;
+        auto compress_task = fixture.compressor_client_.AsyncCompress(
+            clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+            original_data.size(), put_blob_data, 0.5f, context, 0,
+            fixture.core_pool_id_);
+        compress_task.Wait();
+        REQUIRE(compress_task->return_code_ == 0);
+        CLIO_IPC->FreeBuffer(put_buffer);
+
+        auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
+        REQUIRE(!get_buffer.IsNull());
+        ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+        auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+            clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+            original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
+        decompress_task.Wait();
+        REQUIRE(decompress_task->return_code_ == 0);
+        REQUIRE(decompress_task->output_size_ == original_data.size());
+
+        auto retrieved_data =
+            fixture.ReadFromSharedMemory(get_buffer, original_data.size());
+        REQUIRE(std::memcmp(original_data.data(), retrieved_data.data(),
+                            original_data.size()) == 0);
+        INFO(lib_name << " 1GiB lossless round-trip verified");
+        CLIO_IPC->FreeBuffer(get_buffer);
+      }
+    }
+  }
+#endif  // CTP_ENABLE_NVCOMP
+
+#if CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+  {
+    // cuSZ/ndzip/cuSZp all require float-aligned input (Compress() rejects
+    // input_size % sizeof(float) != 0), and cuSZ/cuSZp are LOSSY -- exact
+    // memcmp is the wrong check for them. lossless=true (ndzip) verifies
+    // byte-exact; lossless=false (cuSZ/cuSZp, BALANCED preset -> eb=1e-3)
+    // verifies the decompressed signal stays close to the original (a
+    // generous tolerance -- proving Clio's pipeline passes float data
+    // through correctly, not re-verifying the SZ libraries' own internal
+    // error-bound guarantees, which is those projects' own concern).
+    struct FloatAlgo { int lib_id; std::string name; bool lossless; };
+    std::vector<FloatAlgo> float_algos = {
+#if CTP_ENABLE_NDZIP
+        {CompLib::NDZIP, "ndzip", true},
+#endif
+#if CTP_ENABLE_CUSZ
+        {CompLib::CUSZ, "cusz", false},
+#endif
+#if CTP_ENABLE_CUSZP
+        {CompLib::CUSZP, "cuszp", false},
+#endif
+    };
+
+    auto original_floats = GenerateFloatTestData(kOneGiB / sizeof(float));
+    const size_t data_bytes = original_floats.size() * sizeof(float);
+    std::vector<char> original_bytes(data_bytes);
+    std::memcpy(original_bytes.data(), original_floats.data(), data_bytes);
+
+    for (const auto& algo : float_algos) {
+      SECTION(algo.name) {
+        auto put_buffer = fixture.AllocateAndCopyData(original_bytes);
+        REQUIRE(!put_buffer.IsNull());
+        ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+
+        Context context;
+        context.compress_lib_ = algo.lib_id;
+        context.compress_preset_ = 2;  // BALANCED
+
+        std::string blob_name = "test_blob_1gb_" + algo.name;
+        auto compress_task = fixture.compressor_client_.AsyncCompress(
+            clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+            data_bytes, put_blob_data, 0.5f, context, 0,
+            fixture.core_pool_id_);
+        compress_task.Wait();
+        REQUIRE(compress_task->return_code_ == 0);
+        CLIO_IPC->FreeBuffer(put_buffer);
+
+        auto get_buffer = CLIO_IPC->AllocateBuffer(data_bytes);
+        REQUIRE(!get_buffer.IsNull());
+        ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+        auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+            clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+            data_bytes, 0, get_blob_data, fixture.core_pool_id_);
+        decompress_task.Wait();
+        REQUIRE(decompress_task->return_code_ == 0);
+        REQUIRE(decompress_task->output_size_ == data_bytes);
+
+        auto retrieved_bytes = fixture.ReadFromSharedMemory(get_buffer, data_bytes);
+        const float* retrieved_floats =
+            reinterpret_cast<const float*>(retrieved_bytes.data());
+
+        if (algo.lossless) {
+          REQUIRE(std::memcmp(original_bytes.data(), retrieved_bytes.data(),
+                              data_bytes) == 0);
+        } else {
+          double max_abs_error = 0.0;
+          bool saw_nan_or_inf = false;
+          for (size_t i = 0; i < original_floats.size(); ++i) {
+            float v = retrieved_floats[i];
+            if (!std::isfinite(v)) { saw_nan_or_inf = true; break; }
+            double err = std::fabs(static_cast<double>(v) -
+                                   static_cast<double>(original_floats[i]));
+            if (err > max_abs_error) max_abs_error = err;
+          }
+          REQUIRE_FALSE(saw_nan_or_inf);
+          // BALANCED preset eb=1e-3 (cuSZ relative, cuSZp absolute) against
+          // a signal with amplitude ~65 -- 1.0 is a generous ~15-1000x
+          // margin over the nominal bound, so this catches real breakage
+          // (garbage/zeroed output) without being brittle to the exact
+          // error-bound semantics each library implements internally.
+          REQUIRE(max_abs_error < 1.0);
+          INFO(algo.name << " max abs error: " << max_abs_error);
+        }
+        INFO(algo.name << " 1GiB round-trip verified");
+        CLIO_IPC->FreeBuffer(get_buffer);
+      }
+    }
+  }
+#endif  // CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+}
+#endif  // CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
 
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()

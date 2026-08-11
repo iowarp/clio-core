@@ -134,6 +134,16 @@ add_test(NAME compressor_no_compression_passthrough
 add_test(NAME compressor_error_handling
     COMMAND test_compressor_functional "Error Handling - Invalid Parameters")
 
+# Static selection of every GPU compressor at 1 GiB (nvcomp's 8 + the
+# explicit-selection-only cuSZ/ndzip/cuSZp) -- a much heavier run than the
+# other GPU tests, so it gets its own longer TIMEOUT below rather than
+# sharing the 300s default.
+add_test(NAME compressor_gpu_1gb_sweep
+    COMMAND test_compressor_functional "[1gb]")
+set_tests_properties(compressor_gpu_1gb_sweep PROPERTIES
+    TIMEOUT 900
+    LABELS "compressor;functional;chimod;gpu")
+
 # Set test properties
 set_tests_properties(
     compressor_compress_lz4
