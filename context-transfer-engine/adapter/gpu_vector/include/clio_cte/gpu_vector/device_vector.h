@@ -750,6 +750,19 @@ class DeviceVector {
            h_->tier_chunk_off_[pg * h_->tier_chunks_per_page_] != ~0ull;
   }
 
+  /** @return true when every page of [first, first+n) resolves without the
+   *  CPU: identity-mapped (zero-copy) or encoded-mapped (in-kernel decode). */
+  CTP_GPU_FUN bool RangeFullyMapped(clio::run::u64 first,
+                                    clio::run::u32 n) const {
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      const clio::run::u64 pg = first + k;
+      if (h_->tier_off_ != nullptr && h_->tier_off_[pg] != ~0ull) continue;
+      if (PageEncodedMapped(pg)) continue;
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Standard LZ4 block decode, ONE thread. nvcomp's uchar lz4 chunks are
    * standard LZ4 blocks (verified byte-exact against LZ4Manager output), so
@@ -851,7 +864,24 @@ class DeviceVector {
    *         or being fetched by someone else); false when the claim or the
    *         decode failed (caller falls back to the CPU fetch path).
    */
-  CTP_GPU_FUN bool DecodePageWarp(clio::run::u64 pg) {
+  // 896 B of shared scratch per decoding warp (ShmemSizeGroup for lz4
+  // decompress); 8 warp slots cover every bridge kernel's block shape.
+  static constexpr clio::run::u32 kDecodeWarps = 8;
+  static constexpr clio::run::u32 kWarpShmem = 896;
+
+  /** This warp's decode scratch. ONE static __shared__ allocation no matter
+   *  how many call sites reach it — a per-site array would double the cost
+   *  in kernels that use both the warp and the block decode paths. */
+  CTP_GPU_FUN static unsigned char *NvScratch(unsigned warp) {
+    __shared__ __align__(8) unsigned char nv_sm[kDecodeWarps][kWarpShmem];
+    return nv_sm[warp % kDecodeWarps];
+  }
+
+  /** Warp-cooperative nvcomp decode of every chunk of `pg` into `np`'s
+   *  bytes. All 32 lanes of the calling warp must participate; `sm` is this
+   *  warp's kWarpShmem-byte shared scratch. */
+  CTP_GPU_FUN bool DecodeChunksWarp(clio::run::u64 pg, Page *np,
+                                    unsigned char *sm) {
     using lz4_decomp = decltype(
         nvcomp::device::Grouptype<nvcomp::device::nvcomp_grouptype::warp>() +
         nvcomp::device::Algo<nvcomp::device::nvcomp_algo::lz4>() +
@@ -859,13 +889,46 @@ class DeviceVector {
         nvcomp::device::Direction<
             nvcomp::device::nvcomp_direction::decompress>() +
         nvcomp::device::MaxUncompChunkSize<kNvChunkRaw>());
-    // 896 B of shared scratch per decoding warp (ShmemSizeGroup for lz4
-    // decompress). Static __shared__: only kernels that reach this function
-    // pay for it, and 8 warp slots cover every bridge kernel's block shape.
-    constexpr clio::run::u32 kDecodeWarps = 8;
-    constexpr clio::run::u32 kWarpShmem = 896;
-    __shared__ __align__(8) unsigned char nv_sm[kDecodeWarps][kWarpShmem];
-    unsigned char *sm = nv_sm[(threadIdx.x >> 5) % kDecodeWarps];
+    auto warp = cooperative_groups::tiled_partition<32>(
+        cooperative_groups::this_thread_block());
+    const clio::run::u32 cpp = h_->tier_chunks_per_page_;
+    const clio::run::u64 base_i = pg * cpp;
+    // The tail page decodes fewer bytes than page_bytes_; derive its true
+    // extent from the vector size rather than carrying a per-chunk table.
+    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
+    if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
+    bool ok = true;
+    for (clio::run::u32 c = 0; c < cpp; ++c) {
+      const clio::run::u64 done = static_cast<clio::run::u64>(c) * kNvChunkRaw;
+      if (done >= want_total) break;
+      const unsigned long long coff = h_->tier_chunk_off_[base_i + c];
+      const unsigned csz = h_->tier_chunk_csz_[base_i + c];
+      if (coff == ~0ull || csz == 0u) {
+        ok = false;
+        break;
+      }
+      clio::run::u64 want = want_total - done;
+      if (want > kNvChunkRaw) want = kNvChunkRaw;
+      lz4_decomp dc;
+      size_t out_sz = 0;
+      dc.decompress(h_->tier_base_ + coff,
+                    static_cast<char *>(np->data) + done,
+                    static_cast<size_t>(csz), &out_sz, sm,
+                    /*tmp_buf=*/nullptr, warp);
+      // The API does not document which lane receives out_sz; take the
+      // warp-wide max so every lane agrees before the loop condition.
+      unsigned osz32 = static_cast<unsigned>(out_sz);
+      osz32 = __reduce_max_sync(0xffffffffu, osz32);
+      if (osz32 != static_cast<unsigned>(want)) {
+        ok = false;
+        break;
+      }
+    }
+    return ok;
+  }
+
+  CTP_GPU_FUN bool DecodePageWarp(clio::run::u64 pg) {
+    unsigned char *sm = NvScratch(threadIdx.x >> 5);
     const unsigned lane = threadIdx.x & 31u;
 
     int outcome = 0;  // 0 = resident/in-flight elsewhere, 1 = decode, 2 = fail
@@ -903,42 +966,7 @@ class DeviceVector {
     if (outcome != 1) return outcome == 0;
     slot_bits = __shfl_sync(0xffffffffu, slot_bits, 0);
     Page *np = reinterpret_cast<Page *>(slot_bits);
-
-    auto warp = cooperative_groups::tiled_partition<32>(
-        cooperative_groups::this_thread_block());
-    const clio::run::u32 cpp = h_->tier_chunks_per_page_;
-    const clio::run::u64 base_i = pg * cpp;
-    // The tail page decodes fewer bytes than page_bytes_; derive its true
-    // extent from the vector size rather than carrying a per-chunk table.
-    clio::run::u64 want_total = h_->size_ * sizeof(T) - pg * h_->page_bytes_;
-    if (want_total > h_->page_bytes_) want_total = h_->page_bytes_;
-    bool ok = true;
-    for (clio::run::u32 c = 0; c < cpp; ++c) {
-      const clio::run::u64 done = static_cast<clio::run::u64>(c) * kNvChunkRaw;
-      if (done >= want_total) break;
-      const unsigned long long coff = h_->tier_chunk_off_[base_i + c];
-      const unsigned csz = h_->tier_chunk_csz_[base_i + c];
-      if (coff == ~0ull || csz == 0u) {
-        ok = false;
-        break;
-      }
-      clio::run::u64 want = want_total - done;
-      if (want > kNvChunkRaw) want = kNvChunkRaw;
-      lz4_decomp dc;
-      size_t out_sz = 0;
-      dc.decompress(h_->tier_base_ + coff,
-                    static_cast<char *>(np->data) + done,
-                    static_cast<size_t>(csz), &out_sz, sm,
-                    /*tmp_buf=*/nullptr, warp);
-      // The API does not document which lane receives out_sz; take the
-      // warp-wide max so every lane agrees before the loop condition.
-      unsigned osz32 = static_cast<unsigned>(out_sz);
-      osz32 = __reduce_max_sync(0xffffffffu, osz32);
-      if (osz32 != static_cast<unsigned>(want)) {
-        ok = false;
-        break;
-      }
-    }
+    const bool ok = DecodeChunksWarp(pg, np, sm);
     __syncwarp();
     if (lane == 0) {
       if (ok) {
@@ -983,6 +1011,95 @@ class DeviceVector {
     }
     got = __shfl_sync(0xffffffffu, got, 0);
     return got;
+  }
+
+  /** Staging for FetchPagesBatchedBlock — caller provides it in shared
+   *  memory so every warp sees the claim list. */
+  struct DecodeStage {
+    unsigned long long pg[clio::cte::core::kPodMultiMax];
+    Page *slot[clio::cte::core::kPodMultiMax];
+    unsigned char ok[clio::cte::core::kPodMultiMax];
+    unsigned int count;
+  };
+
+  /**
+   * BLOCK-wide batched materialization of encoded pages: thread 0 claims
+   * every missing page (fetching=3), then ALL the block's warps decode
+   * claimed pages concurrently — the single-warp path left 7 of 8 warps
+   * idle and decode throughput is the compressed fault path's ceiling.
+   *
+   * EVERY thread of the block must call (three __syncthreads inside).
+   * Handles ONLY encoded-mapped pages; the caller falls back to the CPU
+   * batch for anything else, exactly like FetchPagesBatchedWarp.
+   *
+   * @return pages decoded (thread-uniform).
+   */
+  CTP_GPU_FUN clio::run::u32 FetchPagesBatchedBlock(clio::run::u64 first_page,
+                                                    clio::run::u32 n,
+                                                    DecodeStage *st) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nwarps = (blockDim.x + 31u) >> 5;
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    if (threadIdx.x == 0) {
+      st->count = 0;
+      LockBlock();
+      for (clio::run::u32 k = 0; k < n; ++k) {
+        const clio::run::u64 pg = first_page + k;
+        if (!PageEncodedMapped(pg)) continue;
+        if (Find(pg) != nullptr) continue;   // resident or in flight
+        const clio::run::u32 sl = ClaimSlotWindowLocked(pg);
+        if (sl == ~0u) break;                // window pinned: rest fault later
+        Page *np = &BlockPages()[sl];
+        np->gen += 1u;
+        np->fetching = 3u;  // in-kernel decode; see AwaitFetch
+        __threadfence();
+        np->page_num = pg;
+        np->dirty = 0u;
+        np->flushing = 0u;
+        np->score = 2.0f;
+        np->last_access = Now();
+        Bump(h_->stat_faults_);
+        if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
+        st->pg[st->count] = pg;
+        st->slot[st->count] = np;
+        st->ok[st->count] = 1u;
+        ++st->count;
+      }
+      UnlockBlock();
+    }
+    __syncthreads();
+    const clio::run::u32 cnt = st->count;
+    // At most kDecodeWarps warps decode — NvScratch has that many rows, and
+    // warp 8 sharing warp 0's row (warp % kDecodeWarps) was a live data race
+    // on the decoder's working memory (surfaced as misaligned-address traps).
+    const unsigned dwarps = nwarps < kDecodeWarps ? nwarps : kDecodeWarps;
+    if (warp < dwarps) {
+      for (clio::run::u32 i = warp; i < cnt; i += dwarps) {
+        const bool ok =
+            DecodeChunksWarp(st->pg[i], st->slot[i], NvScratch(warp));
+        if (lane == 0 && !ok) st->ok[i] = 0u;
+      }
+    }
+    __syncthreads();
+    clio::run::u32 done = 0;
+    if (threadIdx.x == 0) {
+      __threadfence();   // every warp's bytes before any fetching clear
+      for (clio::run::u32 i = 0; i < cnt; ++i) {
+        Page *np = st->slot[i];
+        if (st->ok[i]) {
+          ++done;
+        } else {
+          // Lockless free — same reasoning as DecodePageWarp's fail path.
+          np->page_num = kNoPage;
+          Bump(h_->stat_get_errors_);
+        }
+        np->fetching = 0u;
+      }
+      st->count = done;
+    }
+    __syncthreads();
+    return st->count;
   }
 #endif  // CLIO_GV_NVCOMP_DEVICE
 
