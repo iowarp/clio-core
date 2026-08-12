@@ -209,8 +209,20 @@ void EnsureInit() {
       << "    storage:\n"
       << "      - path: \"ram::cte_ram_tier\"\n"
       << "        bdev_type: \"ram\"\n        capacity_limit: \""
-      << ram_mib << "MB\"\n        score: 1.0\n"
-      << "    dpe:\n      dpe_type: \"max_bw\"\n";
+      << ram_mib << "MB\"\n        score: 1.0\n";
+    // Optional second tier on real storage. The vector is multi-tiered: a RAM
+    // tier sized well below the data plus an NVMe tier behind it is how a
+    // matrix larger than memory is held at all. Set CLIO_GNN_NVME_DIR to a
+    // directory on the device and the CTE will spill to it by score order.
+    if (const char *nvme = std::getenv("CLIO_GNN_NVME_DIR")) {
+      const int nvme_mib = std::getenv("CLIO_GNN_NVME_MIB")
+                               ? std::atoi(std::getenv("CLIO_GNN_NVME_MIB"))
+                               : 8192;
+      f << "      - path: \"" << nvme << "\"\n"
+        << "        bdev_type: \"file\"\n        capacity_limit: \""
+        << nvme_mib << "MB\"\n        score: 0.5\n";
+    }
+    f << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
   std::fprintf(stderr, "[GNN-STREAM] compose=%s\n", cfg.c_str());
