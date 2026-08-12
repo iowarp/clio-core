@@ -140,6 +140,33 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    # 4-node distributed stress (see distributed/run_distributed.sh). Built
+    # always so compile rot is caught; RUN only by the docker harness -- it
+    # needs a cluster and a GPU, so there is deliberately no add_test here.
+    add_cuda_executable(test_gpu_vector_distributed FALSE
+        test_gpu_vector_distributed_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_distributed PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS test_gpu_vector_distributed RUNTIME DESTINATION bin)
+
     # Compressed-tier tests link the compressor pool; with
     # CLIO_CTE_ENABLE_COMPRESS=OFF (the GPU conda job's cuda-release preset)
     # those targets do not exist and CMake degrades them to bare -l flags

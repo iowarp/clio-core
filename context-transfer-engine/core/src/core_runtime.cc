@@ -3362,16 +3362,94 @@ clio::run::TaskResume Runtime::ReorganizeBlobImpl(
 clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
   return PutBlobImpl(task);
 }
+// ---------------------------------------------------------------------------
+// Cross-node forwarding for device-originated (Pod) blob ops.
+//
+// A Pod task's data pointer targets memory only the ORIGIN node can touch (a
+// GPU page or a device task slot), so the task itself must execute on the
+// node that popped it -- ToLocalCpu is a physical constraint, not a routing
+// choice. In a multi-node pool, though, blob metadata lives on the blob's
+// HASHED owner (HashBlobToContainer), so a local Impl for a remote-owned
+// blob would simply miss.
+//
+// The forward closes that gap CPU-side, which is exactly the architecture:
+// the fault handler orchestrates a normal hashed client op (bytes cross the
+// wire in an ordinary Put/GetBlob), and the device-visible copy happens
+// locally with the same device-aware primitive the local path uses. The GPU
+// never knows the page was remote. Single-node pools take the fast path
+// unchanged (TargetIsNodeLocal is true for every blob).
+// ---------------------------------------------------------------------------
+
 clio::run::TaskResume Runtime::PodPutBlob(
     clio::run::shared_ptr<PodPutBlobTask> &task) {
-  return PutBlobImpl(task);
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::string eff_name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
+      eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    }
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(task->tag_id_, eff_name);
+    if (!TargetIsNodeLocal(owner, task->pool_id_)) {
+      // Stage the device bytes into a host bounce, then hand the bytes to
+      // the owning node through the ordinary put path (score and context --
+      // including any compression request -- ride along).
+      char *src = CLIO_IPC->ToFullPtr(task->blob_data_)
+                      .template Cast<char>().ptr_;
+      if (src == nullptr) {
+        task->SetReturnCode(22);  // unmappable source
+        CLIO_CO_RETURN;
+      }
+      std::vector<char> bounce(task->size_);
+      ctp::DeviceAwareMemcpy(bounce.data(), src, task->size_);
+      auto fut = client_.AsyncPutBlob(task->tag_id_, eff_name, task->offset_,
+                                      task->size_, bounce.data(),
+                                      task->score_, task->context_,
+                                      task->flags_, owner);
+      CLIO_CO_AWAIT(fut);
+      task->SetReturnCode(fut->GetReturnCode());
+      CLIO_CO_RETURN;
+    }
+  }
+  CLIO_CO_AWAIT(PutBlobImpl(task));
+  CLIO_CO_RETURN;
 }
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   return GetBlobImpl(task);
 }
 clio::run::TaskResume Runtime::PodGetBlob(
     clio::run::shared_ptr<PodGetBlobTask> &task) {
-  return GetBlobImpl(task);
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::string eff_name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != PodGetBlobTask::kNoPageIdx) {
+      eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    }
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(task->tag_id_, eff_name);
+    if (!TargetIsNodeLocal(owner, task->pool_id_)) {
+      // Fetch the remote-owned bytes into a host bounce through the ordinary
+      // hashed get, then serve the device-visible destination locally.
+      std::vector<char> bounce(task->size_);
+      auto fut = client_.AsyncGetBlob(task->tag_id_, eff_name, task->offset_,
+                                      task->size_, task->flags_,
+                                      bounce.data(), owner);
+      CLIO_CO_AWAIT(fut);
+      task->SetReturnCode(fut->GetReturnCode());
+      if (task->GetReturnCode() == 0) {
+        char *dst = CLIO_IPC->ToFullPtr(task->blob_data_)
+                        .template Cast<char>().ptr_;
+        if (dst != nullptr) {
+          ctp::DeviceAwareMemcpy(dst, bounce.data(), task->size_);
+        } else {
+          task->SetReturnCode(22);  // unmappable destination
+        }
+      }
+      CLIO_CO_RETURN;
+    }
+  }
+  CLIO_CO_AWAIT(GetBlobImpl(task));
+  CLIO_CO_RETURN;
 }
 clio::run::TaskResume Runtime::ReorganizeBlob(
     clio::run::shared_ptr<ReorganizeBlobTask> &task) {
