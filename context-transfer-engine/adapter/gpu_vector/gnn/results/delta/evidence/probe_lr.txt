@@ -1,0 +1,40 @@
+===== PROBE nodes=2000000 epochs=30 lr=0.2 =====
+[TRAIN] A=960MiB (1966080 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=30 lr=0.200  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.286665 acc=0.1255 val_acc=0.1207 (41.11s)
+[TRAIN] ETERNIA: stored A 960MiB -> 890MiB zstd (1.078x) in 3.29s
+[TRAIN] ETERNIA: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.286665 acc=0.1255 val_acc=0.1207 (149.20s)  peak GPU window=64MiB
+[TRAIN] VERIFY vs in-core: max|dloss|=0.000e+00 max|dacc|=0.000e+00 max|dvacc|=0.000e+00 -> BIT-EXACT
+Passed: 1
+Failed: 0
+===== PROBE nodes=2000000 epochs=300 lr=0.2 =====
+[TRAIN] A=960MiB (1966080 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=300 lr=0.200  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=5.121278 acc=0.0009 -> epoch299 loss=3.166214 acc=0.2931 val_acc=0.2811 (410.90s)
+[TRAIN] ETERNIA: stored A 960MiB -> 890MiB zstd (1.078x) in 2.74s
+[TRAIN] ETERNIA: epoch0 loss=5.121278 acc=0.0009 -> epoch299 loss=3.166214 acc=0.2931 val_acc=0.2811 (1463.75s)  peak GPU window=64MiB
+[TRAIN] VERIFY vs in-core: max|dloss|=0.000e+00 max|dacc|=0.000e+00 max|dvacc|=0.000e+00 -> BIT-EXACT
+Passed: 1
+Failed: 0
+===== PROBE nodes=2000000 epochs=30 lr=5.0 =====
+[TRAIN] A=960MiB (1966080 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=30 lr=5.000  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.423430 acc=0.0709 val_acc=0.0775 (41.09s)
+[TRAIN] ETERNIA: stored A 960MiB -> 890MiB zstd (1.078x) in 2.82s
+[TRAIN] ETERNIA: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.423430 acc=0.0709 val_acc=0.0775 (155.74s)  peak GPU window=64MiB
+[TRAIN] VERIFY vs in-core: max|dloss|=0.000e+00 max|dacc|=0.000e+00 max|dvacc|=0.000e+00 -> BIT-EXACT
+Passed: 1
+Failed: 0
+===== PROBE nodes=2000000 epochs=30 lr=50.0 =====
+[TRAIN] A=960MiB (1966080 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=30 lr=50.000  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.243040 acc=0.0709 val_acc=0.0775 (41.09s)
+[TRAIN] ETERNIA: stored A 960MiB -> 890MiB zstd (1.078x) in 3.39s
+[TRAIN] ETERNIA: epoch0 loss=5.121278 acc=0.0009 -> epoch29 loss=4.243040 acc=0.0709 val_acc=0.0775 (148.45s)  peak GPU window=64MiB
+[TRAIN] VERIFY vs in-core: max|dloss|=0.000e+00 max|dacc|=0.000e+00 max|dvacc|=0.000e+00 -> BIT-EXACT
+Passed: 1
+Failed: 0
+===== PROBE nodes=2000000 epochs=300 lr=5.0 =====
+[TRAIN] A=960MiB (1966080 nodes x 128-d agg, real tiled)  F=128 H=64 C=172  epochs=300 lr=5.000  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=5.121278 acc=0.0009 -> epoch299 loss=4.130803 acc=0.1255 val_acc=0.1207 (410.90s)
+[TRAIN] ETERNIA: stored A 960MiB -> 890MiB zstd (1.078x) in 2.74s
+[TRAIN] ETERNIA: epoch0 loss=5.121278 acc=0.0009 -> epoch299 loss=4.130803 acc=0.1255 val_acc=0.1207 (1463.71s)  peak GPU window=64MiB
+[TRAIN] VERIFY vs in-core: max|dloss|=0.000e+00 max|dacc|=0.000e+00 max|dvacc|=0.000e+00 -> BIT-EXACT
+Passed: 1
+Failed: 0

@@ -1,0 +1,3 @@
+data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,base_final_vacc,eternia_final_acc,eternia_final_vacc,stored_mib,ratio,peak_gpu_mib,store_s,base_epoch_s,eternia_epoch_s,bit_exact
+/u/rpawar/gnnbench/data/arxiv,zstd,balanced,82,167936,64,30,OK,0.188954,0.188769,0.188954,0.188769,76,1.06667,1,0.222511,0.149621,0.30911,BIT-EXACT
+/tmp/gnn/data/papers100M,zstd,balanced,54208,111017984,64,3,OOM,-1,-1,0.0208873,0.0198598,50257,1.07861,64,188.42,-1,281.277,n/a(OOM)

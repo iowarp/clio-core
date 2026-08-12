@@ -1,0 +1,18 @@
+HOST gpua002.delta.ncsa.illinois.edu  START Sat Aug  8 11:45:04 CDT 2026
+########## arxiv  (N=169343, C=40) ##########
+[TRAIN] A=64MiB (131072 nodes x 128-d agg, real tiled)  F=128 H=64 C=40  epochs=1 lr=0.200  GPU free=40016MiB  window=2 pages (peak 128MiB)
+[TRAIN] IN-CORE: epoch0 loss=3.741540 acc=0.0137 -> epoch0 loss=3.741540 acc=0.0137 val_acc=0.0117 (0.10s)
+[TRAIN] ETERNIA: stored A 64MiB -> 59MiB zstd (1.078x) in 0.20s
+[TRAIN] ETERNIA: epoch0 loss=3.741540 acc=0.0137 -> epoch0 loss=3.741540 acc=0.0137 val_acc=0.0117 (0.43s)  peak GPU window=64MiB
+[TRAIN] PEAK GPU (whole process, incl. labels + page cache + runtime): 822MiB  (feature window alone: 128MiB)
+Passed: 1
+Failed: 0
+########## products (N=2449029, C=47) ##########
+[TRAIN] A=950MiB (2490368 nodes x 100-d agg, real tiled)  F=100 H=64 C=47  epochs=1 lr=0.200  GPU free=40016MiB  window=2 pages (peak 100MiB)
+[TRAIN] IN-CORE: epoch0 loss=3.401834 acc=0.2251 -> epoch0 loss=3.401834 acc=0.2251 val_acc=0.2251 (1.82s)
+[TRAIN] ETERNIA: stored A 950MiB -> 884MiB zstd (1.074x) in 2.43s
+[TRAIN] ETERNIA: epoch0 loss=3.401834 acc=0.2251 -> epoch0 loss=3.401834 acc=0.2251 val_acc=0.2251 (6.38s)  peak GPU window=50MiB
+[TRAIN] PEAK GPU (whole process, incl. labels + page cache + runtime): 1652MiB  (feature window alone: 100MiB)
+Passed: 1
+Failed: 0
+DONE Sat Aug  8 11:45:29 CDT 2026
