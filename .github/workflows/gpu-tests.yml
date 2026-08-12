@@ -121,10 +121,20 @@ jobs:
     - name: Compile GPU tests (compile-only, no device)
       shell: bash -el {0}
       run: |
+        # CLIO_CORE_ENABLE_TESTS, not BUILD_TESTING: this tree's test
+        # targets are gated on the former, so the old flag configured a
+        # build with NO test targets and the --target list died on
+        # "No rule to make target 'test_yieldable'". CTE + the compressor
+        # must be on too: the compressed-tier tests and the weights bench
+        # only exist when clio_cte_compressor_runtime does.
         cmake -S . -B build-gpu-compile \
           -DCMAKE_BUILD_TYPE=Release \
-          -DBUILD_TESTING=ON \
-          -DCLIO_CORE_ENABLE_CUDA=ON
+          -DCLIO_CORE_ENABLE_RUNTIME=ON \
+          -DCLIO_CORE_ENABLE_CTE=ON \
+          -DCLIO_CORE_ENABLE_TESTS=ON \
+          -DCLIO_CTE_ENABLE_COMPRESS=ON \
+          -DCLIO_CORE_ENABLE_CUDA=ON \
+          -DCMAKE_CUDA_ARCHITECTURES=89-real
         cmake --build build-gpu-compile -j "$(nproc)" \
           --target test_yieldable test_yield_stack \
                    test_gpu_vector_smoke test_gpu_vector_semantics \
