@@ -187,6 +187,22 @@ inline clio::run::PoolId CompressorPool() { return clio::run::PoolId(600, 0); }
 constexpr int kHidden = 256;
 
 void EnsureInit() {
+  // An externally supplied CLIO_SERVER_CONF WINS. These tests compose their own
+  // tiers and used to setenv over the caller's, which silently discarded a
+  // configuration the caller had sized deliberately -- and stayed invisible for
+  // as long as the test's own defaults happened to be big enough. See the same
+  // note in test_gpu_vector_gnn_train_gpu.cc, where it nearly cost a 53 GiB run.
+  if (const char *ext = std::getenv("CLIO_SERVER_CONF")) {
+    std::ifstream probe(ext);
+    if (probe.good()) {
+      std::fprintf(stderr, "[GNN-STREAM] using caller's CLIO_SERVER_CONF=%%s\n", ext);
+      if (g_initialized) return;
+      REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      g_initialized = true;
+      return;
+    }
+  }
   if (g_initialized) return;
   const char *port_env = std::getenv("CLIO_PORT");
   int port = port_env ? std::atoi(port_env) : 10596;
