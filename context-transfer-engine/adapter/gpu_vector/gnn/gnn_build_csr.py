@@ -30,6 +30,17 @@
 #     | python3 gnn_build_csr.py --nodes 111059956 > /dev/null   # (pipe to consumer)
 #
 # Prefer piping straight into gnn_aggregate so the CSR never lands on disk.
+#
+# MEASURED at 400M directed edges (6.4 GiB key array): 2m17s wall, 9.2 GiB peak
+# RSS -- i.e. the key array plus ~2.8 GiB. Scaled to papers100M (1.6e9 directed
+# edges, 25.9 GiB key array) that projects to ~28 GiB peak, which fits.
+#
+# The chunked dedup below is what makes that true. The natural formulation
+# (key[keep] // N and key[keep] % N) measured 24.8 GiB peak on the SAME 6.4 GiB
+# array -- roughly 4x -- because it materialises the mask, evaluates key[keep]
+# twice, and builds a full-size temporary per arithmetic step. At papers100M
+# scale that is ~100 GiB and the process simply dies. The chunked version is
+# ~50% slower and worth it.
 
 import argparse
 import sys
@@ -118,19 +129,43 @@ def main():
     log("sorting keys in place (the long pole)")
     key.sort(kind="stable")
 
-    log("deduping and emitting CSR")
-    # Unique mask over the sorted keys; first element always kept.
-    keep = np.empty(M, dtype=bool)
-    keep[0] = True
-    np.not_equal(key[1:], key[:-1], out=keep[1:])
-    uniq = int(keep.sum())
-    src = (key[keep] // Nu).astype(np.int64)
-    dst = (key[keep] % Nu).astype(np.int64)
-    del key, keep
+    log("deduping and emitting CSR (chunked)")
+    # DO NOT materialise the deduped keys. The obvious version --
+    #     keep = key != shifted(key);  src = key[keep] // N;  dst = key[keep] % N
+    # -- evaluates key[keep] twice and builds a full-size temporary for each of
+    # the mask, the two fancy-index results, and each arithmetic result. At
+    # 400M directed edges that measured 24.8 GiB peak against a 6.4 GiB key
+    # array; scaled to papers100M's 25.9 GiB array it is ~100 GiB and the
+    # process dies. Everything below works in chunks over the sorted array
+    # instead, so the peak is the key array plus counts plus one chunk.
+    CH = 1 << 26
 
-    counts = np.bincount(src, minlength=N).astype(np.int64)
+    def chunk_keep(blk, prev):
+        """Unique mask within a chunk, given the previous chunk's last key."""
+        k = np.empty(blk.shape[0], dtype=bool)
+        k[0] = True if prev is None else bool(blk[0] != prev)
+        np.not_equal(blk[1:], blk[:-1], out=k[1:])
+        return k
+
+    # Pass A: per-source counts. The keys are sorted, so each chunk's sources
+    # are non-decreasing and np.unique gives a handful of (value, count) pairs
+    # rather than an N-sized histogram per chunk.
+    counts = np.zeros(N, dtype=np.int64)
+    uniq = 0
+    prev = None
+    for lo in range(0, M, CH):
+        blk = key[lo:min(lo + CH, M)]
+        k = chunk_keep(blk, prev)
+        ks = blk[k]
+        vals, cnts = np.unique(ks // Nu, return_counts=True)
+        counts[vals.astype(np.int64)] += cnts
+        uniq += int(ks.shape[0])
+        prev = blk[-1]
+        del blk, k, ks, vals, cnts
+
     indptr = np.zeros(N + 1, dtype=np.int64)
     np.cumsum(counts, out=indptr[1:])
+    del counts
     if int(indptr[N]) != uniq:
         raise SystemExit(f"indptr[N]={int(indptr[N])} != uniq={uniq}")
 
@@ -138,8 +173,23 @@ def main():
     out = sys.stdout.buffer
     write_array(out, np.array([N, uniq], dtype=np.int64))
     write_array(out, indptr)
-    write_array(out, dst)
+    del indptr
+
+    # Pass B: emit the destinations straight to the stream, chunk by chunk, so
+    # the 13 GiB indices array never exists in this process at all.
+    prev = None
+    emitted = 0
+    for lo in range(0, M, CH):
+        blk = key[lo:min(lo + CH, M)]
+        k = chunk_keep(blk, prev)
+        d = (blk[k] % Nu).astype(np.int64)
+        out.write(d.tobytes())
+        emitted += int(d.shape[0])
+        prev = blk[-1]
+        del blk, k, d
     out.flush()
+    if emitted != uniq:
+        raise SystemExit(f"emitted {emitted} != uniq {uniq}")
     log("done")
 
 
