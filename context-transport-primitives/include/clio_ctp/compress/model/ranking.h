@@ -62,14 +62,24 @@ inline const std::vector<CompressorEntry> &KnownCompressors() {
  * @param with_preprocessors Also emit byte-shuffle / quantize / both variants
  *                           (error_bound applied to the quantized variants).
  * @param error_bound       Error bound used for the quantized variants.
+ * @param include_cpu       Include CPU-backed compressors. Set false for a
+ *                           device-resident input buffer: the original
+ *                           NeuroPress project's entire action space is
+ *                           GPU-native (nvcomp/cusz/cuszp/ndzip only, see
+ *                           gpucompress_compress.cpp's "stats remain on
+ *                           GPU" design) -- it never had CPU candidates to
+ *                           rank in the first place. Requires include_gpu
+ *                           true or the candidate set comes back empty.
  */
 inline std::vector<CandidateConfig> DefaultCandidates(
     bool include_gpu = false,
     const std::vector<int> &presets = {1, 2, 3},
-    bool with_preprocessors = false, double error_bound = 1e-3) {
+    bool with_preprocessors = false, double error_bound = 1e-3,
+    bool include_cpu = true) {
   std::vector<CandidateConfig> out;
   for (const auto &e : KnownCompressors()) {
     if (e.is_gpu && !include_gpu) continue;
+    if (!e.is_gpu && !include_cpu) continue;
     for (int preset : presets) {
       CandidateConfig base;
       base.base_id = e.base_id;

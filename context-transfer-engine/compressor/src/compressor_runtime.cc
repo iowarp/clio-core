@@ -348,9 +348,16 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
       neuropress_predictor_->IsReady()) {
     bool data_type_float = (context.data_type_ == 1);
+    // A device-resident chunk restricts the candidate set to GPU-native
+    // compressors, matching the original NeuroPress project's action space
+    // (entirely GPU-only -- see DefaultCandidates/NeuroPressCandidateStats):
+    // no CPU codec ever gets ranked for it, so none can be selected and
+    // force a host round-trip of the buffer downstream in Compress().
+    bool chunk_is_device = ctp::IsDevicePointer(chunk);
     auto neuropress_stats = NeuroPressCandidateStats(
         *neuropress_predictor_, chunk_size, entropy, mad,
-        second_derivative_mean, data_type_float);
+        second_derivative_mean, data_type_float, /*include_gpu=*/true,
+        /*include_cpu=*/!chunk_is_device);
     // Apply the same PSNR filter the legacy per-candidate loop below uses,
     // since NeuroPressCandidateStats itself is PSNR-agnostic (issue #693).
     if (context.target_psnr_ > 0) {
@@ -803,6 +810,19 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     auto input_fullptr =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     char* input_ptr = input_fullptr.ptr_;
+
+    // GPU-native libraries (nvcomp/cusz/cuszp/ndzip) accept a device pointer
+    // directly -- they stage their own H2D as needed. Everything else is a
+    // plain host codec that would read a device pointer directly and crash,
+    // so stage a D2H copy ourselves first. NeuroPress's own selection keeps
+    // this a safety net rather than the normal route: EstCompressionStats
+    // excludes CPU candidates for a device-resident buffer, so only the
+    // legacy heuristic fallback (or an explicit/static compress_lib_) can
+    // still land here with a device pointer + CPU library.
+    std::vector<char> device_staging;
+    input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
+        input_ptr, input_size, context.compress_lib_, device_staging);
+
     bool success = compressor->Compress(compressed_buffer.data(),
                                         compressed_size, input_ptr, input_size);
 

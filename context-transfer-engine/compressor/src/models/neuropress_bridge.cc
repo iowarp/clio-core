@@ -41,7 +41,8 @@ namespace clio::cte::compressor {
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float, bool include_gpu) {
+    double second_derivative_mean, bool data_type_float, bool include_gpu,
+    bool include_cpu) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -55,7 +56,8 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   data.data_type_char = data_type_float ? 0.0 : 1.0;
   data.data_type_float = data_type_float ? 1.0 : 0.0;
 
-  std::vector<CandidateConfig> candidates = DefaultCandidates(include_gpu);
+  std::vector<CandidateConfig> candidates =
+      DefaultCandidates(include_gpu, {1, 2, 3}, false, 1e-3, include_cpu);
   std::vector<RankedPrediction> ranked = predictor.Rank(data, candidates);
 
   std::vector<CompressionStats> results;

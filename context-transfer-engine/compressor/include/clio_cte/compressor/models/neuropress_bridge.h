@@ -75,13 +75,18 @@ namespace clio::cte::compressor {
  *   build still rank (the registry is build-independent) but can't
  *   actually execute -- callers driving real compression should filter on
  *   backend availability.
+ * @param include_cpu Include CPU-backed compressors. Pass false when the
+ *   chunk is a device-resident buffer: the original NeuroPress project's
+ *   action space is GPU-native only (see DefaultCandidates), and a CPU
+ *   codec would otherwise have to read the device pointer directly on the
+ *   host to run at all.
  * @return Candidate stats, best-first (mirrors Rank()'s ordering).
  */
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
     double second_derivative_mean, bool data_type_float,
-    bool include_gpu = true);
+    bool include_gpu = true, bool include_cpu = true);
 
 }  // namespace clio::cte::compressor
 

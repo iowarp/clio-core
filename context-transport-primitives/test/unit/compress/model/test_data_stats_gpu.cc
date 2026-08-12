@@ -29,8 +29,14 @@
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
 
 namespace {
-template <typename T>
-void RunParityCase(const std::vector<T> &data, ctp::DataType type) {
+// Shared scaffolding for every parity case below: compute the host
+// reference, copy `data` to a real device allocation, run `gpu_call` on it,
+// and compare. `gpu_call` is what varies per test -- ComputeDeviceStats
+// directly, or ComputeCompressionFeatures's auto-dispatch (the same call
+// EstCompressionStats makes).
+template <typename T, typename Fn>
+void RunParityCase(const std::vector<T> &data, ctp::DataType type,
+                    Fn gpu_call) {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
     return;
@@ -48,15 +54,18 @@ void RunParityCase(const std::vector<T> &data, ctp::DataType type) {
   ctp::GpuApi::Memcpy(device_data, data.data(), data.size() * sizeof(T));
 
   double gpu_entropy = -1.0, gpu_mad = -1.0, gpu_d2 = -1.0;
-  bool ok = ctp::ComputeDeviceStats(device_data, data.size(), type,
-                                     &gpu_entropy, &gpu_mad, &gpu_d2);
-  REQUIRE(ok);
+  gpu_call(device_data, data.size(), type, &gpu_entropy, &gpu_mad, &gpu_d2);
 
   REQUIRE(std::abs(gpu_entropy - host_entropy) < 1e-6);
   REQUIRE(std::abs(gpu_mad - host_mad) < 1e-6);
   REQUIRE(std::abs(gpu_d2 - host_d2) < 1e-6);
 
   ctp::GpuApi::Free(device_data);
+}
+
+void CallComputeDeviceStats(const void *d, size_t n, ctp::DataType t,
+                             double *e, double *m, double *d2) {
+  REQUIRE(ctp::ComputeDeviceStats(d, n, t, e, m, d2));
 }
 }  // namespace
 
@@ -65,7 +74,7 @@ TEST_CASE("ComputeDeviceStats matches the host reference for float data") {
   for (size_t i = 0; i < data.size(); ++i) {
     data[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.013) * 100.0);
   }
-  RunParityCase(data, ctp::DataType::FLOAT32);
+  RunParityCase(data, ctp::DataType::FLOAT32, CallComputeDeviceStats);
 }
 
 TEST_CASE("ComputeDeviceStats matches the host reference for uint8 data") {
@@ -73,51 +82,31 @@ TEST_CASE("ComputeDeviceStats matches the host reference for uint8 data") {
   for (size_t i = 0; i < data.size(); ++i) {
     data[i] = static_cast<uint8_t>((i * 37 + 11) % 256);
   }
-  RunParityCase(data, ctp::DataType::UINT8);
+  RunParityCase(data, ctp::DataType::UINT8, CallComputeDeviceStats);
 }
 
 TEST_CASE("ComputeDeviceStats matches the host reference for constant data") {
   // Zero entropy, zero MAD, zero second derivative -- an edge case the
   // atomics-based reduction must not perturb.
   std::vector<int32_t> data(1024, 42);
-  RunParityCase(data, ctp::DataType::INT32);
+  RunParityCase(data, ctp::DataType::INT32, CallComputeDeviceStats);
 }
 
 TEST_CASE("ComputeCompressionFeatures auto-dispatches device vs host, "
           "matching the exact call EstCompressionStats makes") {
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-    return;
-  }
-
   std::vector<float> data(4096);
   for (size_t i = 0; i < data.size(); ++i) {
     data[i] = static_cast<float>(std::cos(static_cast<double>(i) * 0.021) * 50.0);
   }
-
-  double host_entropy = -1.0, host_mad = -1.0, host_d2 = -1.0;
-  ctp::ComputeCompressionFeatures(data.data(), data.size(),
-                                   ctp::DataType::FLOAT32, &host_entropy,
-                                   &host_mad, &host_d2);
-
-  float *device_data = ctp::GpuApi::Malloc<float>(data.size() * sizeof(float));
-  REQUIRE(device_data != nullptr);
-  ctp::GpuApi::Memcpy(device_data, data.data(), data.size() * sizeof(float));
-
-  double dev_entropy = -1.0, dev_mad = -1.0, dev_d2 = -1.0;
-  ctp::ComputeCompressionFeatures(device_data, data.size(),
-                                   ctp::DataType::FLOAT32, &dev_entropy,
-                                   &dev_mad, &dev_d2);
-
   // Same dispatch, given a device pointer instead of a host one, must reach
   // the on-device kernels and produce the same numbers -- not silently fall
   // through to the host path (which would read device memory and crash) and
   // not silently return zeros.
-  REQUIRE(std::abs(dev_entropy - host_entropy) < 1e-6);
-  REQUIRE(std::abs(dev_mad - host_mad) < 1e-6);
-  REQUIRE(std::abs(dev_d2 - host_d2) < 1e-6);
-
-  ctp::GpuApi::Free(device_data);
+  RunParityCase(data, ctp::DataType::FLOAT32,
+                 [](const void *d, size_t n, ctp::DataType t, double *e,
+                    double *m, double *d2) {
+                   ctp::ComputeCompressionFeatures(d, n, t, e, m, d2);
+                 });
 }
 
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM

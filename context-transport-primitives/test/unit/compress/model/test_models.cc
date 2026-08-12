@@ -215,6 +215,45 @@ TEST_CASE("DefaultCandidates(gpu) covers NeuroPress's full 8-algorithm "
   REQUIRE(bitcomp_count > 0);
 }
 
+TEST_CASE("DefaultCandidates(include_cpu=false) matches the original "
+          "NeuroPress project's GPU-only action space") {
+  // gpucompress_compress.cpp (the original NeuroPress project): "Stats
+  // remain on GPU -- NN inference reads d_stats_ptr directly on device."
+  // Its CompressionAlgorithm enum has zero CPU entries. A caller resolving
+  // a device-resident buffer must be able to reproduce that: GPU
+  // candidates present, CPU candidates entirely absent (not just
+  // deprioritized), so nothing forces a host read of the buffer.
+  auto gpu_only = DefaultCandidates(/*include_gpu=*/true, {1, 2, 3},
+                                     /*with_preprocessors=*/false,
+                                     /*error_bound=*/1e-3,
+                                     /*include_cpu=*/false);
+  REQUIRE(!gpu_only.empty());
+  for (const auto &c : gpu_only) {
+    const CompressorEntry *entry = nullptr;
+    for (const auto &e : KnownCompressors()) {
+      if (e.base_id == c.base_id) { entry = &e; break; }
+    }
+    REQUIRE(entry != nullptr);
+    INFO("unexpected CPU candidate in GPU-only set: " << entry->name);
+    REQUIRE(entry->is_gpu);
+  }
+
+  // Same count as the full GPU set (include_cpu only removes CPU rows).
+  auto gpu_and_cpu = DefaultCandidates(/*include_gpu=*/true);
+  size_t gpu_row_count = 0;
+  for (const auto &e : KnownCompressors()) {
+    if (e.is_gpu) ++gpu_row_count;
+  }
+  REQUIRE(gpu_only.size() == gpu_row_count * 3);  // x3 presets
+  REQUIRE(gpu_only.size() < gpu_and_cpu.size());
+
+  // include_cpu=false with include_gpu=false (the default) leaves nothing
+  // to rank -- callers must pass include_gpu=true alongside it.
+  auto empty = DefaultCandidates(/*include_gpu=*/false, {1, 2, 3}, false,
+                                  1e-3, /*include_cpu=*/false);
+  REQUIRE(empty.empty());
+}
+
 #ifdef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
 TEST_CASE("NeuroPressNNPredictor loads the real pretrained weights and "
           "ranks GPU candidates sensibly") {
