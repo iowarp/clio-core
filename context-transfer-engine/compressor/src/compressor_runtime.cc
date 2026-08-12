@@ -800,12 +800,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
     auto compress_start = std::chrono::high_resolution_clock::now();
 
-    // Allocate buffer for compressed data (worst case: original size + 5%
-    // overhead)
-    std::vector<char> compressed_buffer(input_size + (input_size / 20) + 1024);
+    size_t header_size = sizeof(CompressionHeader);
+    // Worst-case compressed size: original size + 5% overhead.
+    size_t worst_case_size = input_size + (input_size / 20) + 1024;
 
-    // Compress the data
-    size_t compressed_size = compressed_buffer.size();
     // Convert ShmPtr to raw pointer via FullPtr
     auto input_fullptr =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
@@ -823,23 +821,51 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
         input_ptr, input_size, context.compress_lib_, device_staging);
 
-    bool success = compressor->Compress(compressed_buffer.data(),
-                                        compressed_size, input_ptr, input_size);
+    // input_ptr is still device-resident only when StageInputIfNeeded left
+    // it alone, i.e. the codec is GPU-native. Runtime::Compress always runs
+    // co-located with core_client_ (see above), so PutBlob below never
+    // stages this output either -- it flows straight to
+    // MemBdevTransport::WriteBlocks, which is already GPU-aware. Keeping the
+    // compressed OUTPUT on-device too avoids compressor->Compress()'s own
+    // internal D2H (see nvcomp.h's ToDeviceInput/out_is_device) plus this
+    // function's own host memcpy into the SHM buffer below -- down to the
+    // one D2H copy the bdev write does regardless.
+    bool output_on_device = ctp::IsDevicePointer(input_ptr);
+
+    std::vector<char> compressed_buffer;
+    char *device_output = nullptr;
+    ctp::ipc::AllocatorId device_output_alloc_id;
+    if (output_on_device) {
+      device_output_alloc_id = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          header_size + worst_case_size, &device_output);
+      if (device_output_alloc_id.IsNull()) {
+        output_on_device = false;  // Fall back to the host buffer below.
+      }
+    }
+    if (!output_on_device) {
+      compressed_buffer.resize(worst_case_size);
+    }
+    // Compressed bytes land after the header's spot so the device path can
+    // fill the header in-place afterward without a second allocation.
+    char *compress_dst =
+        output_on_device ? (device_output + header_size)
+                          : compressed_buffer.data();
+
+    size_t compressed_size = worst_case_size;
+    bool success = compressor->Compress(compress_dst, compressed_size,
+                                        input_ptr, input_size);
 
     auto compress_end = std::chrono::high_resolution_clock::now();
     double compress_time =
         std::chrono::duration<double, std::milli>(compress_end - compress_start)
             .count();
 
-    // Check if compression succeeded and is beneficial
-    // Include header size in the total stored size
-    size_t header_size = sizeof(CompressionHeader);
+    // Check if compression succeeded and is beneficial (include header size
+    // in the total stored size)
     size_t total_stored_size = compressed_size + header_size;
 
     if (success && total_stored_size < input_size) {
-      // Compression succeeded and reduced size (including header overhead)
-      compressed_buffer.resize(compressed_size);
-
       // Update context with compression statistics
       context.actual_original_size_ = input_size;
       context.actual_compressed_size_ = total_stored_size;
@@ -848,22 +874,35 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           static_cast<double>(total_stored_size);
       context.actual_compress_time_ms_ = compress_time;
 
-      // Allocate shared memory for header + compressed data
-      auto compressed_shm = CLIO_IPC->AllocateBuffer(total_stored_size);
-      if (compressed_shm.IsNull()) {
-        HLOG(kError, "Failed to allocate shared memory for compressed data");
-        task->return_code_ = 4;  // Memory allocation failed
-        CLIO_CO_RETURN;
-      }
-
-      // Write compression header
       CompressionHeader header(context.compress_lib_, context.compress_preset_,
                                input_size);
-      std::memcpy(compressed_shm.ptr_, &header, header_size);
+      ctp::ipc::ShmPtr<> compressed_shm_ptr;
+      ctp::ipc::FullPtr<char> compressed_shm;  // Only used off the device path.
 
-      // Write compressed data after header
-      std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
-                  compressed_size);
+      if (output_on_device) {
+        // Header goes in the room compress_dst was offset past above --
+        // this is the only host touch for the whole compressed buffer, and
+        // it's 24 bytes, not the payload.
+        ctp::GpuApi::Memcpy(device_output,
+                            reinterpret_cast<const char *>(&header),
+                            header_size);
+        compressed_shm_ptr.alloc_id_ = device_output_alloc_id;
+        compressed_shm_ptr.off_ = reinterpret_cast<clio::run::u64>(device_output);
+      } else {
+        compressed_buffer.resize(compressed_size);
+
+        // Allocate shared memory for header + compressed data
+        compressed_shm = CLIO_IPC->AllocateBuffer(total_stored_size);
+        if (compressed_shm.IsNull()) {
+          HLOG(kError, "Failed to allocate shared memory for compressed data");
+          task->return_code_ = 4;  // Memory allocation failed
+          CLIO_CO_RETURN;
+        }
+        std::memcpy(compressed_shm.ptr_, &header, header_size);
+        std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
+                    compressed_size);
+        compressed_shm_ptr = compressed_shm.shm_.template Cast<void>();
+      }
 
       // Tell the runtime these bytes are no longer the caller's bytes, so it
       // can mark the blob authoritatively (issue #818). This is the ONLY place
@@ -873,16 +912,18 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
                                   clio::cte::core::kBlobTransformCompressed;
 
       // Call PutBlob with header + compressed data
-      ctp::ipc::ShmPtr<> compressed_shm_ptr =
-          compressed_shm.shm_.template Cast<void>();
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
           task->flags_, clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(put_task);
 
-      // Free compressed data buffer
-      CLIO_IPC->FreeBuffer(compressed_shm);
+      // Free the compressed-data buffer
+      if (output_on_device) {
+        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, device_output_alloc_id);
+      } else {
+        CLIO_IPC->FreeBuffer(compressed_shm);
+      }
 
       // Log compression telemetry
       CompressionTelemetry telemetry(

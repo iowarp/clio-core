@@ -1012,6 +1012,71 @@ TEST_CASE("Static Compress - real GPU device pointer as input",
                       original_data.size()) == 0);
   CLIO_IPC->FreeBuffer(get_buffer);
 }
+
+TEST_CASE("Compress keeps a device-resident input's compressed output "
+          "on-device (issue #693)",
+          "[compressor][functional][gpu][static][693]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    INFO("No CUDA device available; skipping");
+    return;
+  }
+
+  CTETestFixture fixture;
+
+  // Compressible, non-random content -- unlike test_cte_devmem_putget's
+  // "Static Compress" test above, blob_data_ here is passed straight as a
+  // device ShmPtr (no DeviceAwareMemcpy-into-host staging first), so
+  // Compress() sees a genuinely device-resident input and takes the
+  // output_on_device path.
+  constexpr size_t kSize = 256 * 1024;
+  std::vector<char> original_data(kSize);
+  for (size_t i = 0; i < kSize; ++i) {
+    original_data[i] = static_cast<char>((i / 64) % 16);
+  }
+
+  auto *ipc = CLIO_IPC;
+  char *device_base = nullptr;
+  auto alloc_id = ipc->AllocateAndRegisterGpuBackend(
+      /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, kSize,
+      &device_base);
+  REQUIRE(!alloc_id.IsNull());
+  REQUIRE(device_base != nullptr);
+  ctp::GpuApi::Memcpy(device_base, original_data.data(), kSize);
+
+  ctp::ipc::ShmPtr<> blob_data;
+  blob_data.alloc_id_ = alloc_id;
+  blob_data.off_ = reinterpret_cast<clio::run::u64>(device_base);
+
+  Context context;
+  context.compress_lib_ = CompLib::NVCOMP_LZ4;  // explicit/static, GPU-native
+  context.compress_preset_ = 2;
+
+  std::string blob_name = "test_blob_gpu_output_device";
+  auto compress_task = fixture.compressor_client_.AsyncCompress(
+      clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+      original_data.size(), blob_data, 0.5f, context, 0,
+      fixture.core_pool_id_);
+  compress_task.Wait();
+  REQUIRE(compress_task->return_code_ == 0);
+  ipc->FreeGpuBackend(/*gpu_id=*/0, alloc_id);
+
+  // ---- Decompress and verify the round trip. ----
+  auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
+  REQUIRE(!get_buffer.IsNull());
+  ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+  auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+      clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+      original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
+  decompress_task.Wait();
+  REQUIRE(decompress_task->return_code_ == 0);
+  REQUIRE(decompress_task->output_size_ == original_data.size());
+
+  REQUIRE(std::memcmp(original_data.data(), get_buffer.ptr_,
+                      original_data.size()) == 0);
+  CLIO_IPC->FreeBuffer(get_buffer);
+}
 #endif  // CTP_ENABLE_NVCOMP
 
 // Main function using simple_test.h framework
