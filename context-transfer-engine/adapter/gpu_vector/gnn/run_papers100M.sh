@@ -192,6 +192,13 @@ runtime:
   # than one epoch run.
   main_segment_size: "${MAIN_SEG:-16g}"
   metadata_segment_size: "${META_SEG:-6g}"
+  # NOTE: capping these is necessary but NOT sufficient. The real ceiling is
+  # main + metadata + queue + every RAM bdev's capacity (each bdev gets its own
+  # SHM segment) + the client segments AllocateBuffer creates on demand -- and
+  # those last ones are unbounded: a read-heavy epoch over this store created
+  # 509 of them totalling 57 GiB and released none, which is what exhausts RAM
+  # partway through epoch 1. Count them with
+  #   grep -c 'IncreaseClientShm: Creating' train.log
 gpu:
   queue_depth: 8192
 compose:
