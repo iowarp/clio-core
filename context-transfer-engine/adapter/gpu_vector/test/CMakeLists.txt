@@ -70,6 +70,44 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    add_cuda_executable(test_gpu_vector_race FALSE
+        test_gpu_vector_race_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_race PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_race COMMAND test_gpu_vector_race
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_race PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+        # The binary's DEFAULT shape (48 blocks x 8192 iters) is a manual
+        # wedge REPRODUCER cranked far past this budget (seeding alone runs
+        # ~6 min; iterations ~2 s each under storm backpressure). The
+        # registered test caps iterations so the byte-exactness verdict
+        # fits TIMEOUT; hunt wedges by running the binary directly.
+        ENVIRONMENT "CLIO_RACE_ITERS=48"
+    )
     add_cuda_executable(test_gpu_vector_semantics FALSE
         test_gpu_vector_semantics_gpu.cc
         INCLUDE_DIRS
@@ -133,6 +171,47 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_tests_properties(cte_gpu_vector_compress PROPERTIES
         TIMEOUT 900
         LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    # ------------------------------------------------------------------
+    # The GPU-ONLY path: kHBM tier with no host tier under it, nvcomp, and
+    # a yielding fault path. Its own binary because CLIO_INIT runs once per
+    # PROCESS and the storage tiers are fixed at that moment -- an HBM-only
+    # runtime cannot be a second TEST_CASE beside a RAM-tier one.
+    # ------------------------------------------------------------------
+    add_cuda_executable(test_gpu_vector_hbm_nvcomp FALSE
+        test_gpu_vector_hbm_nvcomp_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_hbm_nvcomp PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_hbm_nvcomp COMMAND test_gpu_vector_hbm_nvcomp
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_hbm_nvcomp PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;nvcomp"
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )

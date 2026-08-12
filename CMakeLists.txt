@@ -1217,9 +1217,67 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # Release configuration
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-    # CUDA: allow constexpr __host__ functions in __host__ __device__ contexts
+    # CUDA dialect flags are per compiler. NOTE: the CUDA language is
+    # enabled by the subprojects (wrp_core_enable_cuda), AFTER this file
+    # runs, so CMAKE_CUDA_COMPILER_ID does not exist yet -- detect clang
+    # from the compiler the user/preset selected instead.
     if(CLIO_CORE_ENABLE_CUDA)
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+        if(CMAKE_CUDA_COMPILER MATCHES "clang")
+            # CMake 3.28's clang-CUDA identification probes with sm_52/30/20,
+            # all removed from CUDA 13's ptxas, so identification fails with
+            # "ptxas fatal: Value 'sm_52' is not defined". Newer CMake probes
+            # with the SDK's own defaults. (pip install cmake gets a current
+            # one without touching the system package.)
+            if(CMAKE_VERSION VERSION_LESS "3.30")
+                message(FATAL_ERROR
+                    "clang as the CUDA compiler needs CMake >= 3.30 with a "
+                    "CUDA 13 toolkit (this CMake ${CMAKE_VERSION} probes "
+                    "compiler identity with GPU archs the toolkit dropped).")
+            endif()
+            # clang -x cuda. Differences from nvcc that matter here:
+            #  - no --expt-relaxed-constexpr (constexpr functions are
+            #    implicitly host+device already) and no -diag-suppress
+            #    (the host-call-from-device sloppiness those numbers hide
+            #    is a hard error under clang -- and fixing the call sites
+            #    is the point);
+            #  - the toolkit is usually newer than the last CUDA release
+            #    this clang was taught about;
+            #  - nvcc adds the toolkit's CCCL directory (cuda/std, thrust,
+            #    cub) to the include path implicitly, clang does not;
+            #  - device TUs in this tree type-pun through differently-typed
+            #    fills (task archives, shared-header copies). nvcc's codegen
+            #    never exploited strict aliasing on them; keep clang from
+            #    being the first (measured: reordered shared-header reads in
+            #    the llama bridge produced wild pointers).
+            find_package(CUDAToolkit REQUIRED)
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-unknown-cuda-version -fno-strict-aliasing")
+            if(EXISTS "${CUDAToolkit_TARGET_DIR}/include/cccl")
+                set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -isystem ${CUDAToolkit_TARGET_DIR}/include/cccl")
+            endif()
+        else()
+            # nvcc: allow constexpr __host__ functions in __host__ __device__
+            # contexts, and quiet the host-call-from-device warning family.
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+        endif()
+    endif()
+
+    # C++20 device coroutines as the yieldable-kernel mechanism
+    # (yield_coro.h). Opt-in, and clang-only: nvcc rejects co_await in
+    # device code outright. The macro mechanism stays the default and the
+    # two share one stack and host protocol, so this flips per build, not
+    # per kernel.
+    option(CLIO_GPU_YIELD_CORO
+           "Yieldable GPU kernels use C++20 device coroutines (requires clang as the CUDA compiler)" OFF)
+    if(CLIO_GPU_YIELD_CORO)
+        if(NOT CLIO_CORE_ENABLE_CUDA)
+            message(FATAL_ERROR "CLIO_GPU_YIELD_CORO requires CLIO_CORE_ENABLE_CUDA=ON")
+        endif()
+        if(NOT CMAKE_CUDA_COMPILER MATCHES "clang")
+            message(FATAL_ERROR "CLIO_GPU_YIELD_CORO requires clang as the CUDA compiler "
+                                "(-DCMAKE_CUDA_COMPILER=clang++-22); nvcc cannot compile device coroutines")
+        endif()
+        add_compile_definitions(CLIO_YIELD_CORO)
+        message(STATUS "Yieldable GPU kernels: C++20 device coroutines (clang)")
     endif()
 
     # AddressSanitizer + LeakSanitizer configuration

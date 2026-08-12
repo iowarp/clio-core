@@ -100,8 +100,24 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
     }
   }
 
-  // Sort low_score targets by performance (already correct order for placement)
-  std::sort(low_score_targets.begin(), low_score_targets.end(), perf_comparator);
+  // Sort low_score targets by CONFIGURED TIER first, then by performance.
+  //
+  // These are the targets the blob is entitled to, so it should get the best
+  // one -- and "best" is what the operator declared via `score`, not what the
+  // bandwidth model guessed. Ranking by bandwidth alone silently discarded the
+  // configured tiering: write_bandwidth_mbps_ comes from InferWallClockTime(),
+  // a PREDICTION with no notion of device type, and it rated a kHbm tier at
+  // 118 MB/s against host RAM at 1600 MB/s. A config that declared
+  // `hbm score 1.0` above `ram score 0.2` therefore placed every blob on RAM
+  // and the GPU tier never received one -- so "GPU tier" numbers were really
+  // host-tier numbers. Performance still breaks ties within a tier.
+  std::sort(low_score_targets.begin(), low_score_targets.end(),
+            [&perf_comparator](const TargetInfo &a, const TargetInfo &b) {
+              if (a.target_score_ != b.target_score_) {
+                return a.target_score_ > b.target_score_;
+              }
+              return perf_comparator(a, b);
+            });
 
   // Sort high_score targets by performance in REVERSE order
   // (when falling back to higher tiers, prefer lower-performing ones first)
@@ -121,6 +137,13 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
 
   HLOG(kDebug, "MaxBwDpe::SelectTargets: returning {} targets ({} preferred, {} fallback)",
        result.size(), low_score_targets.size(), high_score_targets.size());
+  for (size_t i = 0; i < result.size(); ++i) {
+    HLOG(kDebug, "  RANK[{}] pool=({},{}) score={} write_bw={} remaining={}", i,
+         result[i].bdev_client_.pool_id_.major_,
+         result[i].bdev_client_.pool_id_.minor_, result[i].target_score_,
+         result[i].perf_metrics_.write_bandwidth_mbps_,
+         result[i].remaining_space_);
+  }
 
   return result;
 }

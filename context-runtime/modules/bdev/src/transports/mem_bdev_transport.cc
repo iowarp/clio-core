@@ -3,6 +3,10 @@
  * All rights reserved.
  */
 
+#include <x86intrin.h>
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream);
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -11,6 +15,7 @@
 #include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 
 namespace clio::run::bdev {
@@ -101,10 +106,12 @@ void MemBdevTransport::InitDeviceBacking() {
   }
   device_base_ = ctp::GpuApi::Malloc<char>(static_cast<size_t>(ram_capacity_));
   if (device_base_ == nullptr) {
-    HLOG(kWarning,
-         "HBM bdev: cudaMalloc of {} bytes failed -- falling back to host "
-         "memory. This tier is NOT device-resident; treat any tiering "
-         "measurement taken against it as host-to-host.",
+    // Do NOT degrade to host memory. A kHbm tier that is quietly host-backed
+    // turns every tiering number into a host-to-host measurement while still
+    // reporting success, which is worse than not running at all.
+    HLOG(kFatal,
+         "HBM bdev: cudaMalloc of {} bytes failed. The kHbm tier must be "
+         "real device memory; refusing to serve it from host memory.",
          ram_capacity_);
     return;
   }
@@ -328,6 +335,17 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
     if (page.data == nullptr) {
       page.data = new char[kRamPageSize];
       page.pinned = false;
+      if (bdev_type_ == BdevType::kPinned) {
+        // NOT silent: a pageable page on a kPinned tier turns every async
+        // DMA out of it into a driver-staged synchronous copy (~2x per-read
+        // cost). One run with a few of these looks like an unexplained
+        // 50->75 ms/tok mode flip — log it so the flip is attributable.
+        HLOG(kError,
+             "kPinned bdev '{}': page-locked alloc of page {} ({} MB) FAILED"
+             " — falling back to pageable memory; reads of this page will be"
+             " staged-synchronous",
+             shm_name_, page_idx, kRamPageSize >> 20);
+      }
     }
   }
   return page.data;
@@ -472,7 +490,7 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   int rc = LaunchWriteBlocksGpu(task, data_ptr.ptr_, stream, bytes_written);
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
@@ -561,6 +579,14 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
       // dst is device memory here; enqueue the copy (or a zero-fill for a
       // never-written region) on the stream without waiting.
       if (page) {
+        // Device pointer in, device pointer out -- one D2D copy, no host
+        // staging. This used to bounce D2H+H2D through a mutex-serialized
+        // pinned slab because an indefinitely resident faulting kernel
+        // occupied every SM and starved the intra-device copy forever.
+        // Yieldable kernels remove that premise: a faulting block SUSPENDS
+        // and the kernel EXITS, so nothing is resident while this runs.
+        // The bounce is not kept as a fallback -- a silent host detour would
+        // hide exactly the regression that would matter here.
         ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, stream);
       } else {
         ctp::GpuApi::MemsetAsync(dst, 0, chunk, stream);
@@ -621,7 +647,7 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
@@ -633,6 +659,66 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   task->bytes_read_ = bytes_read;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
+                                 char* dst) {
+  if (size == 0) return 0;
+  if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max() &&
+      off + size > ram_capacity_) {
+    return -1;
+  }
+  // A device-backed tier's pages are device memory; that path keeps the task
+  // route (its D2D copies have their own scheduling constraints).
+  if (device_backed_) return -1;
+
+  const bool dev_dst = ctp::IsDeviceAccessible(dst);
+  void* stream = nullptr;
+  if (dev_dst) {
+    // Borrowed, never created (creating a stream needs the context write lock
+    // a resident faulting kernel holds — see ReadBlocks). If none is free
+    // RIGHT NOW, fall back to the task path rather than spin on the caller's
+    // fiber.
+    stream = ctp::GpuApi::BorrowStream();
+    if (stream == nullptr) return -1;
+  }
+
+  clio::run::u64 cur_off = off;
+  clio::run::u64 left = size;
+  clio::run::u64 data_offset = 0;
+  while (left > 0) {
+    size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
+    clio::run::u64 intra = cur_off % kRamPageSize;
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    char* page = GetRamPage(page_idx);
+    char* d = dst + data_offset;
+    if (dev_dst) {
+      if (page != nullptr) {
+        ctp::GpuApi::MemcpyAsync(d, page + intra, chunk, stream);
+      } else {
+        ctp::GpuApi::MemsetAsync(d, 0, chunk, stream);
+      }
+    } else {
+      if (page != nullptr) {
+        std::memcpy(d, page + intra, chunk);
+      } else {
+        std::memset(d, 0, chunk);
+      }
+    }
+    cur_off += chunk;
+    data_offset += chunk;
+    left -= chunk;
+  }
+
+  if (dev_dst) {
+    // Copy-engine work only — safe to block on even with a faulting kernel
+    // resident (kernels block later LAUNCHES, not DMA).
+    const unsigned long long ev_s0 = __rdtsc();
+    ctp::GpuApi::PollSync(stream);   // never block in driver sync
+    ctp::GpuApi::ReturnStream(stream);
+    clio_evlat_add(3, __rdtsc() - ev_s0);  // ch3: DirectRead sync portion
+  }
+  return 0;
 }
 
 } // namespace clio::run::bdev

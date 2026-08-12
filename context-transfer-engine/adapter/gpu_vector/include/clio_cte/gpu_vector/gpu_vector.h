@@ -22,12 +22,19 @@
 #include <clio_cte/gpu_vector/device_vector.h>
 #include <clio_cte/gpu_vector/page.h>
 
+#include <algorithm>
 #include <cstring>
 #include <new>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+extern "C" int clio_cte_locate(const void *tag_id, const char *name,
+                               unsigned long long *pool_u64,
+                               unsigned long long *target_off,
+                               unsigned long long *stored_size);
+extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
 
 namespace clio::cte::gpu_vector {
 
@@ -54,8 +61,14 @@ class Vector {
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 pages_per_block, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0, int compress_preset = 1)
-      : storage_pool_id_(storage_pool_id.IsNull()
+         int compress_lib = 0, int compress_preset = 1,
+         // The CTE CORE pool, BEHIND the compressor. A spilled encoded page
+         // is fetched from here so the raw get returns the STORED bytes and
+         // the interposer never decompresses it host-side. Defaults to the
+         // storage pool, which is correct when no compressor is composed.
+         clio::run::PoolId core_pool_id = clio::run::PoolId::GetNull())
+      : core_pool_id_(core_pool_id),
+        storage_pool_id_(storage_pool_id.IsNull()
                              ? clio::cte::core::kCtePoolId
                              : storage_pool_id),
         compress_lib_(compress_lib),
@@ -119,6 +132,22 @@ class Vector {
     return wire_id >= 11 && wire_id <= 16;  // nvcomp-lz4 .. nvcomp-ans
   }
 
+  /**
+   * Pages spanned by the whole vector.
+   *
+   * ONE definition, because getting it wrong is silent: `size_` counts
+   * ELEMENTS while `page_bytes_` counts BYTES, and the three call sites that
+   * open-coded `(size_ + page_bytes_ - 1) / page_bytes_` all undercounted by
+   * sizeof(T). For a u32 vector that sized the tier-offset table at a quarter
+   * of the page count, so every page past the quarter mark read tier_off_ out
+   * of bounds and served another page's bytes -- while `mapped == npages`
+   * still reported the map fully built.
+   */
+  static clio::run::u64 NumPagesOf(const VecHeader &h) {
+    if (h.elems_per_page_ == 0) return 0;
+    return (h.size_ + h.elems_per_page_ - 1) / h.elems_per_page_;
+  }
+
   /** Device view for `dev_id`, to be passed to a kernel by value. */
   DeviceVector<T> GetDevice(int dev_id) const {
     auto it = devs_.find(dev_id);
@@ -138,8 +167,12 @@ class Vector {
     clio::run::u64 rescores = 0;        // placement hints sent
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
+    clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
+    clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
+    clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
+    clio::run::u64 put_errors = 0;      // writebacks that returned non-zero
   };
-  static constexpr int kNumStats = 8;
+  static constexpr int kNumStats = 12;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -183,8 +216,88 @@ class Vector {
       kv.second.hdr.stat_rescores_ = c + 5;
       kv.second.hdr.stat_prefetch_late_ = c + 6;
       kv.second.hdr.stat_get_errors_ = c + 7;
+      kv.second.hdr.stat_pf_dropped_ = c + 8;
+      kv.second.hdr.stat_verify_ok_ = c + 9;
+      kv.second.hdr.stat_verify_lost_ = c + 10;
+      kv.second.hdr.stat_put_errors_ = c + 11;
+      kv.second.hdr.trace_put_errors_ =
+          (std::getenv("CLIO_GV_TRACE_PUT_ERRORS") != nullptr) ? 1u : 0u;
+      if (getenv("CLIO_FAULT_HIST") != nullptr) {
+        const clio::run::u64 npg = NumPagesOf(kv.second.hdr);
+        void *hm = nullptr;
+        if (cudaMalloc(&hm, npg * sizeof(unsigned int)) == cudaSuccess) {
+          cudaMemset(hm, 0, npg * sizeof(unsigned int));
+          kv.second.hdr.fault_hist_ = static_cast<unsigned int *>(hm);
+        }
+      }
       PublishHeader(kv.second);   // the device reads the header, not the view
     }
+#endif
+  }
+
+  /**
+   * ZERO-COPY DEVICE-TIER MAP. If this tag's page blobs live on a kHbm bdev
+   * (device memory), build a per-page offset table and hand the device view
+   * a direct pointer: faults become pointer arithmetic — no slot, no fetch,
+   * no DMA (a D2H read under a resident kernel queues behind its channel
+   * and can wedge the fault service; mapping removes the transfer class).
+   * Call AFTER ingest so the blobs exist. No-op for host tiers.
+   */
+  /**
+   * Publish the per-page STORED-size table for an ENCODED tag.
+   *
+   * This is metadata, not aliasing: the table is the run-fetch's existence
+   * proof (a page with a known stored size has been written and may join a
+   * multi-get run; during SEEDING the table is absent, so runs are
+   * structurally off and first-touch write-allocate keeps its slots — the
+   * gate that fixed the 459600-round seed livelock).
+   *
+   * The zero-copy device-tier map that used to be built here is GONE, by
+   * decision: it handed GPU kernels pointers into SHARED CTE tier memory,
+   * racing every tier mover (organizer, target evacuation, eviction). All
+   * data now crosses the vector/CTE boundary through orchestrated
+   * transfers only, and the fits-in-VRAM fast path is a PRIVATE cache
+   * sized to the data (slots >= pages), seeded once.
+   *
+   * @return pages whose stored size was found (0 for raw tags, where the
+   *         table is not needed: run-fetch only serves encoded tags).
+   *         Compressor puts land asynchronously, so a caller that wants
+   *         full coverage retries while the count is short of NumPages().
+   */
+  clio::run::u64 PublishStoredSizes() {
+#if CTP_ENABLE_CUDA
+    if (devs_.empty() || compress_lib_ == 0) return 0;
+    const auto &eh = devs_.begin()->second.hdr;
+    const clio::run::u64 enp = NumPagesOf(eh);
+    if (enp == 0) return 0;
+    std::vector<unsigned long long> esz(enp, 0);
+    clio::run::u64 found = 0;
+    for (clio::run::u64 pg = 0; pg < enp; ++pg) {
+      char name[32];
+      PageBlobName(pg, name);
+      unsigned long long p2 = 0, o2 = 0, s2 = 0;
+      if (clio_cte_locate(&tag_id_, name, &p2, &o2, &s2) == 0) {
+        esz[pg] = s2;
+        ++found;
+      }
+    }
+    void *dev_esz = nullptr;
+    if (cudaMalloc(&dev_esz, enp * sizeof(unsigned long long)) !=
+        cudaSuccess) {
+      return 0;
+    }
+    cudaMemcpy(dev_esz, esz.data(), enp * sizeof(unsigned long long),
+               cudaMemcpyHostToDevice);
+    for (auto &kv : devs_) {
+      // Successive retries leak the previous table (enp * 8 bytes); accepted
+      // until the retry loop moves inside (issue #966 cleanup).
+      kv.second.hdr.stored_size_ =
+          static_cast<const unsigned long long *>(dev_esz);
+      PublishHeader(kv.second);
+    }
+    return found;
+#else
+    return 0;
 #endif
   }
 
@@ -196,6 +309,20 @@ class Vector {
       }
     }
 #endif
+  }
+
+  /** Copy back the per-page fault histogram (empty if not enabled). */
+  std::vector<unsigned int> ReadFaultHist(int dev_id) const {
+    std::vector<unsigned int> h;
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(dev_id);
+    if (it == devs_.end() || it->second.hdr.fault_hist_ == nullptr) return h;
+    const clio::run::u64 npg = NumPagesOf(it->second.hdr);
+    h.resize(npg);
+    cudaMemcpy(h.data(), it->second.hdr.fault_hist_,
+               npg * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+#endif
+    return h;
   }
 
   Stats ReadStats(int dev_id) const {
@@ -211,8 +338,12 @@ class Vector {
     s.prefetches = h[3];
     s.prefetch_hits = h[4];
     s.rescores = h[5];
+    s.put_errors = h[11];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
+    s.pf_dropped = h[8];
+    s.verify_ok = h[9];
+    s.verify_lost = h[10];
 #else
     (void) dev_id;
 #endif
@@ -227,6 +358,9 @@ class Vector {
   }
 
  private:
+  // NOTE: forward-declared in the public section above; the definition must
+  // carry the same access, or clang rejects the redeclaration ([class.mem]).
+ public:
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
@@ -238,6 +372,8 @@ class Vector {
     char *tasks_base = nullptr;     // task slots
     char *multi_task_base = nullptr;  // batched-put task slots
     char *multi_tbl_base = nullptr;   // MultiBatch[] table
+    char *cscratch_base = nullptr;    // per-slot compressed-image scratch
+    ctp::ipc::AllocatorId cscratch_alloc;
     ctp::ipc::AllocatorId multi_tbl_alloc;
     ctp::ipc::AllocatorId pages_alloc;
     ctp::ipc::AllocatorId table_alloc;
@@ -245,6 +381,7 @@ class Vector {
     unsigned long long *stats = nullptr;   // [faults, puts, evicts], or null
   };
 
+ private:
   /**
    * Allocate and register everything one GPU needs, then publish a view.
    *
@@ -287,6 +424,16 @@ class Vector {
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nslots * sizeof(Page), &st.table_base);
+    // Per-slot scratch for a SPILLED encoded page's stored image, so the
+    // faulting warp can decode it without the compressor. Same memory kind as
+    // the pages: the bdev writes into it from the runtime side, so it has to
+    // be addressable there too. One page's worth per slot -- a stored image
+    // is never larger than the page, or it would have been stored raw.
+    // Only allocated for a GPU codec; nothing else can decode in-kernel.
+    if (IsGpuCodec(compress_lib_)) {
+      st.cscratch_alloc = ipc->AllocateAndRegisterGpuBackend(
+          gpu_id, page_kind, nslots * page_bytes_, &st.cscratch_base);
+    }
     // Batched writeback slots: enough per block that the block's WHOLE page
     // cache flushes in that many submissions (256 pages -> 4 batches). The
     // submission is the cost on this path, so the count is derived from the
@@ -334,6 +481,7 @@ class Vector {
       p.dirty = 0;
       p.flushing = 0;
       p.fetching = 0;
+      p.evicting = 0;
       p.rescoring = 0;
       p.seq = 0;
       char *slot = tasks_bytes +
@@ -419,6 +567,8 @@ class Vector {
             clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
         mtbl[static_cast<size_t>(i)].get_fut =
             clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
+        mtbl[static_cast<size_t>(i)].async_pending = 0;
+        mtbl[static_cast<size_t>(i)].async_n = 0;
       }
       UploadBytes(mtasks.data(), st.multi_task_base,
                   static_cast<clio::run::u64>(nbatch) * pair);
@@ -446,7 +596,22 @@ class Vector {
     }
 #endif
 
+    // Per-block outstanding-transfer counters, zeroed. Advisory fast-out for
+    // the reap/vote scans (see VecHeader::xfer_cnt_).
+    void *xfers = nullptr;
+#if CTP_ENABLE_CUDA
+    if (std::getenv("CLIO_GV_NO_XFERCNT") != nullptr) {
+      // Bisect switch: null counter -> XferIdle() always false -> the scans
+      // run unconditionally, exactly the pre-counter behavior.
+    } else if (cudaMalloc(&xfers, nblocks_ * sizeof(unsigned int)) == cudaSuccess) {
+      cudaMemset(xfers, 0, nblocks_ * sizeof(unsigned int));
+    } else {
+      throw std::runtime_error("gpu_vector: xfer counter allocation failed");
+    }
+#endif
+
     VecHeader v;   // filled here, then uploaded; the view only points at it
+    v.xfer_cnt_ = static_cast<unsigned int *>(xfers);
     v.block_locks_ = static_cast<int *>(locks);
     v.task_seq_ = static_cast<unsigned long long *>(seq);
     v.tag_id_ = tag_id_;
@@ -468,6 +633,9 @@ class Vector {
     }
     v.size_ = num_elems_;
     v.pool_id_ = storage_pool_id_;
+    v.core_pool_id_ =
+        core_pool_id_.IsNull() ? storage_pool_id_ : core_pool_id_;
+    v.cscratch_ = st.cscratch_base;
     v.compress_lib_ = compress_lib_;
     v.compress_preset_ = compress_preset_;
     v.task_alloc_id_ = st.tasks_alloc;
@@ -535,8 +703,12 @@ class Vector {
     if (st.hdr.block_locks_ != nullptr) {
       cudaFree(st.hdr.block_locks_);
     }
+    if (st.hdr.xfer_cnt_ != nullptr) {
+      cudaFree(st.hdr.xfer_cnt_);
+    }
 #endif
     st.hdr.block_locks_ = nullptr;
+    st.hdr.xfer_cnt_ = nullptr;
     st.hdr.task_seq_ = nullptr;
     st.hdr.stat_faults_ = nullptr;
     st.hdr.stat_puts_ = nullptr;
@@ -549,6 +721,7 @@ class Vector {
 
   /** Where page tasks are addressed. Point this at a COMPRESSOR pool to have
    *  pages stored compressed; it interposes and forwards to the core. */
+  clio::run::PoolId core_pool_id_;
   clio::run::PoolId storage_pool_id_;
   /** Codec wire id stamped on page puts; 0 stores raw. */
   int compress_lib_ = 0;

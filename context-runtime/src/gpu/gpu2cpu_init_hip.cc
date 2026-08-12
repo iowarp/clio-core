@@ -190,6 +190,39 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     }
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
+#if CTP_ENABLE_CUDA
+    // Pin the managed queue's RESIDENCE to the host and give the GPU a fixed
+    // remote mapping instead of migration rights. Concurrent CPU drain +
+    // device atomics on migratable managed pages under a RESIDENT kernel
+    // stalls UVM migrations, and migrations share the copy engines — one
+    // stalled migration froze every CE transfer on the device (captured:
+    // cuStreamSynchronize wedged, 0% MEM util, free SMs irrelevant). With
+    // AccessedBy there is nothing to migrate, ever.
+    {
+      int dev_id = 0;
+      cudaGetDevice(&dev_id);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+      // CUDA 13 retired the (advice, int device) overload: the location is now
+      // a cudaMemLocation, so passing a device id straight through no longer
+      // compiles. Same advice, spelled for the current toolkit.
+      cudaMemLocation host_loc{};
+      host_loc.type = cudaMemLocationTypeHost;
+      host_loc.id = 0;
+      cudaMemLocation dev_loc{};
+      dev_loc.type = cudaMemLocationTypeDevice;
+      dev_loc.id = dev_id;
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, host_loc);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_loc);
+#else
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_id);
+#endif
+    }
+#endif
 
     // Host-side construction. queue_backend is managed memory mapped
     // into device address space at the same virtual address, so the
@@ -379,3 +412,16 @@ CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
 }  // namespace clio::run
 
 #endif  // (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
+
+
+// CPU-launched copy KERNEL service (see mem_bdev_transport bounce): engine
+// copies of device memory stall in channel order behind a resident kernel;
+// kernels are SM-scheduled and run on free SMs. C linkage so the plain-C++
+// transport TU can call it.
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream) {
+#if CTP_ENABLE_CUDA
+  ctp::CtpCopyKernel<uint4><<<64, 256, 0, (cudaStream_t) stream>>>(dst, src,
+                                                                   n);
+#endif
+}

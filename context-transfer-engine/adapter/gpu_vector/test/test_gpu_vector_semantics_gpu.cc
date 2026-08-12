@@ -24,6 +24,8 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <chrono>
 #include <cstdio>
@@ -35,6 +37,19 @@
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+
+/** Run a yieldable kernel to completion (see the other gpu_vector tests). */
+template <typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, 256);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+}
 using clio::run::u32;
 using clio::run::u64;
 
@@ -59,39 +74,55 @@ CTP_INLINE_CROSS_FUN u32 Val(u64 i, u32 salt) {
 /** v[base + i] = Val(base + i, salt), then optionally flush the range. */
 __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 base, u64 count,
-                            u32 salt, int flush) {
+                            u32 salt, int flush, gy::YieldableView<> yv,
+                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  const u64 off = base + static_cast<u64>(blockIdx.x) * count;
-  for (clio::run::u64 i = 0; i < count;) {
-    const clio::run::u64 run_i = v.HoldPage(off + i, (count) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[off + i] = Val(off + i, salt);
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const u64 off = base + static_cast<u64>(yv.Block()) * count;
+
+  CLIO_YBEGIN();
+  for (; i < count; i += run) {
+    CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[off + i + k] = Val(off + i + k, salt);
+    }
   }
-  if (flush) {
+  __syncthreads();
+  if (flush && threadIdx.x == 0) {
     v.BeginFlush(off, count);
-    v.WaitFlush(off, count);
   }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /** Verify v[base+i] == Val(base+i, salt); count mismatches. */
 __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<u32> v, u64 base, u64 count,
-                             u32 salt, unsigned long long *bad) {
+                             u32 salt, unsigned long long *bad,
+                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  const u64 off = base + static_cast<u64>(blockIdx.x) * count;
-  unsigned long long local = 0;
-  for (clio::run::u64 i = 0; i < count;) {
-    const clio::run::u64 run_i = v.HoldPage(off + i, (count) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      if (v[off + i] != Val(off + i, salt)) ++local;
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const u64 off = base + static_cast<u64>(yv.Block()) * count;
+
+  CLIO_YBEGIN();
+  for (; i < count; i += run) {
+    CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run));
+    unsigned long long local = 0;
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      if (v[off + i + k] != Val(off + i + k, salt)) ++local;
+    }
+    if (local != 0) atomicAdd(bad, local);
   }
-  atomicAdd(bad, local);
+  CLIO_YEND();
 }
 
 /** Touch ONE element on each of `npages` pages, `passes` times. */
@@ -99,12 +130,11 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 first_page, u64 npages,
                            u32 passes, unsigned long long *sink) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
   for (u32 p = 0; p < passes; ++p) {
     for (u64 k = 0; k < npages; ++k) {
-      const u64 off = (first_page + k) * v.elems_per_page_;
+      const u64 off = (first_page + k) * v.h_->elems_per_page_;
       v.HoldPage(off, 1);
       acc += v.at(off);
     }
@@ -117,31 +147,39 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<u32> v, const u64 *pages,
                                u32 n, unsigned long long *sink) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   unsigned long long acc = 0;
   // One page per step, in the given order -- these touches are deliberately
   // NOT contiguous, so each needs its own hold.
   for (u32 i = 0; i < n; ++i) {
-    const u64 off = pages[i] * v.elems_per_page_;
+    const u64 off = pages[i] * v.h_->elems_per_page_;
     v.HoldPage(off, 1);
     acc += v.at(off);
   }
   atomicAdd(sink, acc);
 }
 
+// Uses EvictPagesYield, not EvictPages. Wrapping the blocking EvictPages in
+// a yield frame does NOT make it yieldable -- it waits on the victims' puts
+// in-kernel, so thread 0 blocks while the block sits at the barrier, and that
+// hangs. EvictPagesYield makes the wait the suspend itself.
 __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
-                            gv::DeviceVector<u32> v, u32 n) {
+                            gv::DeviceVector<u32> v, u32 n,
+                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  v.EvictPages(n);
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u32, dummy, 0);
+  CLIO_YBEGIN();
+  CLIO_YCALL(v.EvictPagesYield(n));
+  (void) dummy;
+  CLIO_YEND();
 }
 
 __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v, u64 page, float score) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.RescorePage(page, score);
 }
@@ -150,7 +188,6 @@ __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 off, u64 count) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.BeginFlush(off, count);
   v.WaitFlush(off, count);
@@ -162,57 +199,90 @@ __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
  */
 __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 npages, u32 salt,
-                                 unsigned long long *flushed) {
+                                 unsigned long long *flushed,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  for (u64 p = 0; p < npages; ++p) {
-    const u64 base = p * v.elems_per_page_;
-    for (clio::run::u64 i = 0; i < v.elems_per_page_;) {
-      const clio::run::u64 run_i = v.HoldPage(base + i, v.elems_per_page_ - i);
-      for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
-        v[base + i] = Val(base + i, salt);
-      }
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const clio::run::u64 total = npages * v.h_->elems_per_page_;
+
+  CLIO_YBEGIN();
+  // Dirty every page first, THEN flush the whole block in one batched
+  // submission -- that batch is what this test is about.
+  for (; off < total; off += run) {
+    CLIO_YCALL(v.HoldPageYield(off, total - off, &run));
+    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[off + k] = Val(off + k, salt);
     }
   }
-  atomicAdd(flushed,
-            static_cast<unsigned long long>(v.FlushBlockBatched()));
+  // The barrier is load-bearing: FlushBlockBatched submits and clears `dirty`,
+  // so a lane still writing when lane 0 flushes loses its writes AND leaves
+  // the page looking clean.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(flushed,
+              static_cast<unsigned long long>(v.FlushBlockBatched()));
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /**
  * Batched-fetch `npages` in chunks of `chunk`, then verify every element.
  * Reports mismatches and how many pages the batched fetch reported resident.
  */
+// Yields, and it MUST. The blocking HoldPage spins in-kernel until a slot
+// can be claimed, and a claim now declines rather than dropping a dirty
+// victim, so with dirty pages in the window this kernel span forever.
 __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 npages, u32 chunk,
                                  u32 salt, unsigned long long *bad,
-                                 unsigned long long *got) {
+                                 unsigned long long *got,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  unsigned long long local = 0;
-  unsigned long long fetched = 0;
-  for (u64 k = 0; k < npages; k += chunk) {
-    u64 n = npages - k;
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, k, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, j, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, n, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+
+  CLIO_YBEGIN();
+  for (; k < npages; k += chunk) {
+    n = npages - k;
     if (n > chunk) n = chunk;
-    fetched += v.FetchPagesBatched(k, static_cast<u32>(n));
-    for (u64 j = 0; j < n; ++j) {
-      const u64 off = (k + j) * v.elems_per_page_;
-      v.HoldPage(off, v.elems_per_page_);
-      for (u64 i = 0; i < v.elems_per_page_; ++i) {
-        if (v[off + i] != Val(off + i, salt)) ++local;
+    if (threadIdx.x == 0) {
+      atomicAdd(got, static_cast<unsigned long long>(
+                         v.FetchPagesBatched(k, static_cast<u32>(n))));
+    }
+    __syncthreads();
+    for (j = 0; j < n; ++j) {
+      CLIO_YCALL(v.HoldPageYield((k + j) * v.h_->elems_per_page_,
+                                 v.h_->elems_per_page_, &run));
+      {
+        const u64 off = (k + j) * v.h_->elems_per_page_;
+        unsigned long long local = 0;
+        for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
+          if (v[off + i] != Val(off + i, salt)) ++local;
+        }
+        if (local != 0) atomicAdd(bad, local);
       }
     }
   }
-  atomicAdd(bad, local);
-  atomicAdd(got, fetched);
+  CLIO_YEND();
 }
 
 /** Drop the calling block's cache, so the next reads must fault. */
 __global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.DropAll();
 }
@@ -222,7 +292,6 @@ __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v,
                                  unsigned long long *flushed) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   atomicAdd(flushed,
             static_cast<unsigned long long>(v.FlushBlockBatched()));
@@ -231,7 +300,6 @@ __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void SizeKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 *out) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   *out = v.size();
 }
@@ -244,22 +312,36 @@ __global__ void SizeKernel(clio::run::IpcManagerGpuInfo info,
  */
 __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<u32> v, u64 boundary_page,
-                               u32 reps) {
+                               u32 reps, gy::YieldableView<> yv,
+                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  const u64 last_of_prev = boundary_page * v.elems_per_page_ - 1;
-  const u64 first_of_next = boundary_page * v.elems_per_page_;
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u32, r, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const u64 last_of_prev = boundary_page * v.h_->elems_per_page_ - 1;
+  const u64 first_of_next = boundary_page * v.h_->elems_per_page_;
+
   // The two elements straddle a page boundary, so each needs its own hold --
-  // one hold cannot cover both, which is exactly what this test checks.
-  for (u32 r = 0; r < reps; ++r) {
-    v.HoldPage(last_of_prev, 1);
-    v[last_of_prev] = Val(last_of_prev, 7u);
-    v.HoldPage(first_of_next, 1);
-    v[first_of_next] = Val(first_of_next, 7u);
+  // one hold cannot cover both, which is exactly what this test checks. With
+  // a ONE-slot cache they evict each other every step, so each hold is a real
+  // fault and a real writeback: precisely the case the blocking path cannot
+  // service from inside the kernel.
+  CLIO_YBEGIN();
+  for (; r < reps; ++r) {
+    CLIO_YCALL(v.HoldPageYield(last_of_prev, 1, &run));
+    if (threadIdx.x == 0) v[last_of_prev] = Val(last_of_prev, 7u);
+    CLIO_YCALL(v.HoldPageYield(first_of_next, 1, &run));
+    if (threadIdx.x == 0) v[first_of_next] = Val(first_of_next, 7u);
   }
-  v.BeginFlush(last_of_prev, 2);
-  v.WaitFlush(last_of_prev, 2);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    v.BeginFlush(last_of_prev, 2);
+  }
+  __syncthreads();
+  CLIO_YIELD_IF(v.AnyTransferInFlight());
+  CLIO_YEND();
 }
 
 /**
@@ -272,15 +354,14 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
                                     gv::DeviceVector<u32> v, u64 count,
                                     u32 salt, unsigned long long *bad) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   unsigned long long local = 0;
   // Lane-strided WITHIN a page, page-by-page: at any moment the whole warp is
   // inside one page, which is the granularity contract.
-  const u64 pages = count / v.elems_per_page_;
+  const u64 pages = count / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
-    const u64 base = p * v.elems_per_page_;
-    v.HoldPage(base, v.elems_per_page_);
-    for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+    const u64 base = p * v.h_->elems_per_page_;
+    v.HoldPage(base, v.h_->elems_per_page_);
+    for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
       if (v.at(base + i) != Val(base + i, salt)) ++local;
     }
     __syncthreads();
@@ -293,22 +374,21 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceVector<u32> v, u64 count,
                                      u32 salt) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   // Each block owns its own slice, matching VerifyKernel -- otherwise every
   // block would write the same pages and race on the same blobs.
   const u64 slice = static_cast<u64>(blockIdx.x) * count;
-  const u64 pages = count / v.elems_per_page_;
+  const u64 pages = count / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
-    const u64 base = slice + p * v.elems_per_page_;
-    v.HoldPage(base, v.elems_per_page_);
+    const u64 base = slice + p * v.h_->elems_per_page_;
+    v.HoldPage(base, v.h_->elems_per_page_);
     {
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         v[base + i] = Val(base + i, salt);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        v.BeginFlush(base, v.elems_per_page_);
-        v.WaitFlush(base, v.elems_per_page_);
+        v.BeginFlush(base, v.h_->elems_per_page_);
+        v.WaitFlush(base, v.h_->elems_per_page_);
       }
       __syncthreads();
       }
@@ -323,35 +403,55 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
  */
 __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 count,
-                                   u32 salt, unsigned long long *bad) {
+                                   u32 salt, unsigned long long *bad,
+                                   gy::YieldableView<> yv,
+                                   gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  if (threadIdx.x != 0) return;
-  const u64 slice = static_cast<u64>(blockIdx.x) * count;
-  const u64 pages = count / v.elems_per_page_;
-  const u64 first = slice / v.elems_per_page_;
-  unsigned long long local = 0;
-  for (u64 p = 0; p < pages; ++p) {
-    {
+  v.block_override_ = yv.Block();
+  CLIO_YKERNEL_ENTER(yv, ys);
+  CLIO_YFRAME();
+  CLIO_YLOCAL_INIT(clio::run::u64, p, 0);
+  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
+  const u64 slice = static_cast<u64>(yv.Block()) * count;
+  const u64 pages = count / v.h_->elems_per_page_;
+  const u64 first = slice / v.h_->elems_per_page_;
+
+  CLIO_YBEGIN();
+  for (; p < pages; ++p) {
+    // Prefetch + pin the page about to be read, from ONE lane: both are
+    // metadata hints and every lane sending them is pure duplication.
+    if (threadIdx.x == 0) {
       if (p + 1 < pages) v.BeginFetch(first + p + 1);
       v.RescorePage(first + p, 1000.0f);
-      const u64 off = slice + p * v.elems_per_page_;
-      v.HoldPage(off, v.elems_per_page_);
-      for (u64 i = 0; i < v.elems_per_page_; ++i) {
+    }
+    __syncthreads();
+    CLIO_YCALL(v.HoldPageYield(slice + p * v.h_->elems_per_page_,
+                               v.h_->elems_per_page_, &run));
+    {
+      const u64 off = slice + p * v.h_->elems_per_page_;
+      unsigned long long local = 0;
+      for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
         if (v[off + i] != Val(off + i, salt)) ++local;
       }
+      if (local != 0) atomicAdd(bad, local);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
       v.RescorePage(first + p, -1000.0f);
-      }
+    }
+    __syncthreads();
   }
-  atomicAdd(bad, local);
+  CLIO_YEND();
 }
 
 /** Rescore the same page repeatedly, hammering the fire-and-forget slot. */
+// Rescoring is fire-and-forget metadata; it never faults, so it needs no
+// yield frame. Left single-lane on purpose: the test counts the rescores
+// SENT, and every lane sending them would multiply that by the block width.
 __global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 page,
                                    u32 reps) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   for (u32 r = 0; r < reps; ++r) {
     v.RescorePage(page, static_cast<float>(r));
@@ -480,7 +580,11 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     const u64 kPages = 6;
     Fixture f("gv_sem_batch_flush", 1, static_cast<u32>(kPages), kPages);
     unsigned long long *flushed = NewCounter();
-    BatchFlushKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 21u, flushed);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      BatchFlushKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, kPages, 21u, flushed, vw_, sv_);
+    });
     Sync();
     const unsigned long long nflushed = ReadCounter(flushed);
     std::fprintf(stderr, "[batch-flush] pages=%llu flushed=%llu\n",
@@ -512,14 +616,20 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // Cache smaller than the working set: chunks must evict and refill,
     // which is where a slot-reuse bug would show.
     Fixture f("gv_sem_batch_fetch", 1, 4, kPages);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1, vw_, sv_);
+    });
     Sync();
     DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
     Sync();
 
     unsigned long long *got = NewCounter();
     f.Reset();
-    BatchFetchKernel<<<1, 32>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      BatchFetchKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got, vw_, sv_);
+    });
     Sync();
     const unsigned long long nbad = ReadCounter(bad);
     std::fprintf(stderr, "[batch-fetch] pages=%llu resident=%llu bad=%llu\n",
@@ -536,7 +646,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_hits", 1, 4, 4);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 1u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 1u, 1, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
@@ -560,9 +673,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_cold", 1, 2, 8);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 8 * kPageElems, 2u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 8 * kPageElems, 2u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 2u);   // start from an empty cache
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });   // start from an empty cache
     Sync();
 
     f.Reset();
@@ -588,18 +707,27 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     constexpr u64 kPages = 8;
     Fixture f("gv_sem_dirty", 1, 2, kPages);
     f.Reset();
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 3u, 0);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 3u, 0, vw_, sv_);
+    });
     Sync();
     auto sw = f.Stats();
     // Flush whatever is still resident and dirty, then drop everything so
     // the read below cannot be served from the cache.
     FlushKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems);
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 2u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });
     Sync();
 
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 3u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 3u, bad, vw_, sv_);
+    });
     Sync();
     const unsigned long long mism = ReadCounter(bad);
     std::fprintf(stderr,
@@ -624,9 +752,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   {
     constexpr u64 kPages = 8;
     Fixture f("gv_sem_score", 1, 3, kPages);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 4u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 4u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 3u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 3u, vw_, sv_);
+    });
     Sync();
 
     // Make page 0 resident, then pin it with a score nothing else has.
@@ -657,9 +791,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_lru", 1, 2, 4);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 5u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 5u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 2u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });
     Sync();
 
     u64 *warm = UploadPages({0, 1, 0});
@@ -688,7 +828,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_flush", 1, 4, 4);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 6u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 6u, 1, vw_, sv_);
+    });
     Sync();
 
     // Visible to the host while still resident on the device.
@@ -717,16 +860,25 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_evict", 1, 4, 4);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 7u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 7u, 1, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 0u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0u, vw_, sv_);
+    });
     Sync();
     REQUIRE(f.Stats().evicts == 0);
 
     f.Reset();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 99u);   // far more than resident
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 99u, vw_, sv_);
+    });   // far more than resident
     Sync();
     auto s = f.Stats();
     std::fprintf(stderr, "[evict] over-evict evicts=%llu (expect 4)\n",
@@ -735,7 +887,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
 
     // And the data is still correct afterwards.
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 7u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 7u, bad, vw_, sv_);
+    });
     Sync();
     REQUIRE(ReadCounter(bad) == 0);
   }
@@ -747,9 +902,16 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_boundary", 1, 1, 4);
-    BoundaryKernel<<<1, 32>>>(g_gpu, f.dev, 2u, 4u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      BoundaryKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, 4u,
+                                                        vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 1u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 1u, vw_, sv_);
+    });
     Sync();
     // Only ONE element of each page was written, so the whole-page helper
     // does not apply -- check the two straddling elements directly.
@@ -780,12 +942,21 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     gv::Vector<u32> vec("gv_sem_tail", {0}, kPageBytes, 1, 2, n);
     REQUIRE(vec.NumPages() == 6);
     auto dev = vec.GetDevice(0);
-    WriteKernel<<<1, 32>>>(g_gpu, dev, 0, n, 8u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 0, n, 8u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, dev, 2u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 2u, vw_, sv_);
+    });
     Sync();
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, dev, 0, n, 8u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 0, n, 8u, bad, vw_, sv_);
+    });
     Sync();
     std::fprintf(stderr, "[tail] n=%llu pages=%llu mismatches=%llu\n",
                  (unsigned long long) n, (unsigned long long) vec.NumPages(),
@@ -804,12 +975,21 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     constexpr u64 kPagesPerBlock = 4;
     const u64 per = kPagesPerBlock * kPageElems;
     Fixture f("gv_sem_blocks", kBlocks, 2, kPagesPerBlock * kBlocks);
-    WriteKernel<<<kBlocks, 32>>>(g_gpu, f.dev, 0, per, 9u, 1);
+    RunYieldable(kBlocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 9u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<kBlocks, 32>>>(g_gpu, f.dev, 2u);
+    RunYieldable(kBlocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });
     Sync();
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<kBlocks, 32>>>(g_gpu, f.dev, 0, per, 9u, bad);
+    RunYieldable(kBlocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 9u, bad, vw_, sv_);
+    });
     Sync();
     auto s = f.Stats();
     std::fprintf(stderr, "[blocks] mismatches=%llu faults=%llu\n",
@@ -823,9 +1003,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_rescore_absent", 1, 2, 8);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 8 * kPageElems, 10u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 8 * kPageElems, 10u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 2u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
@@ -837,7 +1023,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     REQUIRE(s.faults == 0);
 
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, 8 * kPageElems, 10u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 8 * kPageElems, 10u, bad, vw_, sv_);
+    });
     Sync();
     REQUIRE(ReadCounter(bad) == 0);
   }
@@ -913,9 +1102,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   {
     constexpr u64 kPages = 8;
     Fixture f("gv_sem_lanes", 1, 4, kPages);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 11u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 11u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 4u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
+    });
     Sync();
 
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
@@ -934,9 +1129,15 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   {
     constexpr u64 kPages = 8;
     Fixture f("gv_sem_coalesce", 1, 4, kPages);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 12u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 12u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 4u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
@@ -961,11 +1162,17 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     Fixture f("gv_sem_lane_write", 1, 2, kPages);
     MultiLaneWriteKernel<<<1, 32>>>(g_gpu, f.dev, kPages * kPageElems, 13u);
     Sync();
-    EvictKernel<<<1, 32>>>(g_gpu, f.dev, 2u);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
+    });
     Sync();
 
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems, 13u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 13u, bad, vw_, sv_);
+    });
     Sync();
     std::fprintf(stderr, "[lane-write] mismatches=%llu\n", ReadCounter(bad));
     REQUIRE(ReadCounter(bad) == 0);
@@ -1002,11 +1209,17 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
                 sc.blocks, sc.slots, sc.pages * sc.blocks);
       MultiLaneWriteKernel<<<sc.blocks, 32>>>(g_gpu, f.dev, per, 14u);
       Sync();
-      EvictKernel<<<sc.blocks, 32>>>(g_gpu, f.dev, sc.slots);
+      RunYieldable(sc.blocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, sc.slots, vw_, sv_);
+    });
       Sync();
 
       REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-      VerifyKernel<<<sc.blocks, 32>>>(g_gpu, f.dev, 0, per, 14u, bad);
+      RunYieldable(sc.blocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 14u, bad, vw_, sv_);
+    });
       Sync();
       std::fprintf(stderr, "[scale] blocks=%u slots=%u mismatches=%llu\n",
                    sc.blocks, sc.slots, ReadCounter(bad));
@@ -1025,23 +1238,33 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     constexpr u64 kPages = 16;
     Fixture f("gv_sem_prefetch", 4, 4, kPages * 4);
     const u64 per = kPages * kPageElems;
-    WriteKernel<<<4, 32>>>(g_gpu, f.dev, 0, per, 15u, 1);
+    RunYieldable(4, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 15u, 1, vw_, sv_);
+    });
     Sync();
-    EvictKernel<<<4, 32>>>(g_gpu, f.dev, 4u);
+    RunYieldable(4, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    PrefetchWalkKernel<<<4, 32>>>(g_gpu, f.dev, per, 15u, bad);
+    RunYieldable(4, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      PrefetchWalkKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, per, 15u, bad, vw_, sv_);
+    });
     Sync();
     auto s = f.Stats();
     std::fprintf(stderr,
                  "[prefetch] mismatches=%llu faults=%llu prefetches=%llu "
-                 "hits=%llu rescores=%llu\n",
+                 "hits=%llu rescores=%llu dropped=%llu\n",
                  ReadCounter(bad), (unsigned long long) s.faults,
                  (unsigned long long) s.prefetches,
                  (unsigned long long) s.prefetch_hits,
-                 (unsigned long long) s.rescores);
+                 (unsigned long long) s.rescores,
+                 (unsigned long long) s.pf_dropped);
     REQUIRE(ReadCounter(bad) == 0);
     // Each block prefetches every page after its first.
     REQUIRE(s.prefetches == 4 * (kPages - 1));
@@ -1057,7 +1280,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_rescore_storm", 1, 4, 4);
-    WriteKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, 1);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, 1, vw_, sv_);
+    });
     Sync();
 
     f.Reset();
@@ -1069,7 +1295,10 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     REQUIRE(s.rescores == 64);
 
     REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
-    VerifyKernel<<<1, 32>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, bad);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, bad, vw_, sv_);
+    });
     Sync();
     REQUIRE(ReadCounter(bad) == 0);
   }

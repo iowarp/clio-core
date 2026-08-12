@@ -1680,6 +1680,15 @@ enum class CteOp : clio::run::u32 {
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutReplace = 0x1u;
 
 /**
+ * PodMultiGetBlob hint: this batch is a PREFETCH — its completion latency is
+ * off the caller's critical path. The handler dispatches such batches across
+ * workers instead of servicing them inline, so a concurrent DEMAND fault
+ * (which IS latency-critical) never queues behind them. Stripped before the
+ * flag word is forwarded to the per-blob subtasks.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePrefetchHint = 0x80000000u;
+
+/**
  * CTE Telemetry data structure for performance monitoring
  */
 struct CteTelemetry {

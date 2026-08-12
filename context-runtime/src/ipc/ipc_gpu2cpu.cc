@@ -5,9 +5,14 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
+#include <algorithm>
 #include <atomic>
-#include <exception>
 #include <unordered_map>
+#include <vector>
+#include <x86intrin.h>
+#include <exception>
+#include <mutex>
+#include <csignal>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
 
@@ -46,8 +51,11 @@ struct EvRec {
   unsigned long long seq;
   unsigned long long slot;   // device task address
   unsigned long long aux;    // task_id unique / rc
+  unsigned long long tsc;    // __rdtsc(): a plain instruction, NOT a clock
+                             // call -- steady_clock in this hot path shifted
+                             // timing enough to hang the runtime (lost-wake).
   unsigned int tid;          // worker id (or 0xFFFF for unknown)
-  char kind;                 // S=stage C=beginctx R=routed P=pod-writeback F=flip
+  char kind;                 // S=stage C=beginctx P=pod-writeback F=flip
 };
 constexpr unsigned kEvCap = 4096;
 EvRec g_ev[kEvCap];
@@ -58,9 +66,20 @@ void EvPush(char kind, unsigned tid, unsigned long long slot,
   const unsigned long long n =
       g_ev_seq.fetch_add(1, std::memory_order_relaxed);
   EvRec &r = g_ev[n % kEvCap];
+  r.tsc = __rdtsc();
   r.seq = n; r.slot = slot; r.aux = aux; r.tid = tid; r.kind = kind;
 }
 
+// Cross-module duration channels: CTE handlers and the bdev transport call
+// clio_evlat_add with rdtsc deltas; the atexit report prints avg/max. Wall
+// across coroutine suspends is deliberate -- waits are what we are hunting.
+struct EvChan {
+  std::atomic<unsigned long long> sum{0}, cnt{0}, mx{0};
+};
+EvChan g_chan[8];
+const char *g_chan_name[8] = {"multi_total", "multi_await", "get_total",
+                              "bdev_h2d",   "read_await",  "get_meta",
+                              "bdev_read",  "direct_read"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -76,8 +95,105 @@ void EvDumpOnTerminate() {
   if (g_prev_term) g_prev_term();
   abort();
 }
+/**
+ * Phase report over the ring: per slot, S->C (staging), C->P (route +
+ * handler + storage read), P->F (completion copies). Cycles at ~TSC rate;
+ * ratios are what matter. atexit only, and only under CLIO_EVLAT.
+ */
+void EvLatencyReport() {
+  const unsigned long long end = g_ev_seq.load();
+  const unsigned long long begin = end > kEvCap ? end - kEvCap : 0;
+  struct Open { unsigned long long s = 0, c = 0, p = 0; };
+  std::unordered_map<unsigned long long, Open> open;
+  std::vector<double> sc, cp, pf;
+  for (unsigned long long n = begin; n < end; ++n) {
+    const EvRec &r = g_ev[n % kEvCap];
+    if (r.seq != n) continue;
+    Open &o = open[r.slot];
+    switch (r.kind) {
+      case 'S': o.s = r.tsc; break;
+      case 'C': o.c = r.tsc; break;
+      case 'P': o.p = r.tsc; break;
+      case 'F':
+        if (o.s && o.c && o.p && o.p > o.c && o.c > o.s && r.tsc > o.p) {
+          sc.push_back((double) (o.c - o.s));
+          cp.push_back((double) (o.p - o.c));
+          pf.push_back((double) (r.tsc - o.p));
+        }
+        o = Open{};
+        break;
+      default: break;
+    }
+  }
+  auto rep = [](const char *name, std::vector<double> &v) {
+    if (v.empty()) return;
+    std::sort(v.begin(), v.end());
+    const double us = 1.0 / 2995.0;   // ~3 GHz TSC -> microseconds
+    fprintf(stderr, "clio-evlat %-4s n=%zu p50=%.0fus p90=%.0fus p99=%.0fus\n",
+            name, v.size(), v[v.size() / 2] * us,
+            v[(size_t) (v.size() * 0.9)] * us,
+            v[(size_t) (v.size() * 0.99)] * us);
+  };
+  rep("S-C", sc);
+  rep("C-P", cp);
+  rep("P-F", pf);
+}
+
+}  // namespace
+
+extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
+  if (which < 0 || which >= 8) return;
+  g_chan[which].sum.fetch_add(cycles, std::memory_order_relaxed);
+  g_chan[which].cnt.fetch_add(1, std::memory_order_relaxed);
+  unsigned long long m = g_chan[which].mx.load(std::memory_order_relaxed);
+  while (cycles > m &&
+         !g_chan[which].mx.compare_exchange_weak(m, cycles)) {
+  }
+}
+
+namespace {
+
+void EvChanReport() {
+  const double us = 1.0 / 2995.0;
+  for (int i = 0; i < 8; ++i) {
+    const unsigned long long c = g_chan[i].cnt.load();
+    if (c == 0) continue;
+    fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",
+            g_chan_name[i], c, (double) g_chan[i].sum.load() * us / (double) c,
+            (double) g_chan[i].mx.load() * us);
+  }
+}
+
+// On-demand dump for HANGS: kill -USR1 <pid> prints the last ring events
+// and per-slot latency report without killing the process. fprintf in a
+// signal handler is not strictly async-signal-safe; acceptable for a
+// diagnosis tool that only ever runs on an already-wedged process.
+void EvDumpOnSignal(int) {
+  const unsigned long long end = g_ev_seq.load();
+  const unsigned long long begin = end > 256 ? end - 256 : 0;
+  fprintf(stderr, "==== gpu2cpu evlog (SIGUSR1, last %llu of %llu) ====\n",
+          end - begin, end);
+  for (unsigned long long n = begin; n < end; ++n) {
+    const EvRec &r = g_ev[n % kEvCap];
+    if (r.seq != n) continue;
+    fprintf(stderr, "  #%llu w%u %c slot=%llx aux=%llu\n", r.seq, r.tid,
+            r.kind, r.slot, r.aux);
+  }
+  fprintf(stderr, "==== end evlog ====\n");
+  fflush(stderr);
+}
+
 struct EvInit {
-  EvInit() { g_prev_term = std::set_terminate(EvDumpOnTerminate); }
+  EvInit() {
+    g_prev_term = std::set_terminate(EvDumpOnTerminate);
+    signal(SIGUSR1, EvDumpOnSignal);
+    if (std::getenv("CLIO_EVLAT") != nullptr) {
+      std::atexit(EvChanReport);
+    }
+    if (std::getenv("CLIO_EVLAT") != nullptr) {
+      std::atexit(EvLatencyReport);
+    }
+  }
 } g_ev_init;
 }  // namespace
 
@@ -209,10 +325,42 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     // are per device-task-slot and long-lived, so the pinning cost is paid
     // once per slot, not per task.
 #if CTP_ENABLE_CUDA
-    void *pinned = nullptr;
-    if (cudaHostAlloc(&pinned, kTaskScratchBytes, cudaHostAllocDefault) ==
-        cudaSuccess) {
-      slot_buf = static_cast<char *>(pinned);
+    // Slot scratch must be PINNED (pageable makes every completion copy an
+    // internally staged synchronous one -- measured as the difference
+    // between a working and a crawling MoE fault pipeline) and must NOT be
+    // allocated with cudaHostAlloc here: this code runs on the fault-service
+    // path while a faulting kernel is resident, and cudaHostAlloc takes the
+    // CUDA context WRITE lock -- the session's recurring deadlock triangle.
+    //
+    // So the scratch comes from a pinned POOL allocated once, lazily, in
+    // 64 MB slabs. The slab allocation itself still calls cudaHostAlloc, but
+    // only when the pool is exhausted; the pool is sized so that happens at
+    // startup (first slot discoveries) and effectively never mid-decode.
+    // Slabs are never freed; slot scratch was already immortal by design.
+    struct PinnedPool {
+      char *cur = nullptr;
+      size_t left = 0;
+      char *take(size_t n) {
+        n = (n + 255) & ~size_t(255);
+        if (n > left) {
+          const size_t slab = n > (64u << 20) ? n : (64u << 20);
+          void *p = nullptr;
+          if (cudaHostAlloc(&p, slab, cudaHostAllocDefault) != cudaSuccess) {
+            return nullptr;
+          }
+          cur = static_cast<char *>(p);
+          left = slab;
+        }
+        char *r = cur;
+        cur += n;
+        left -= n;
+        return r;
+      }
+    };
+    static thread_local PinnedPool pool;
+    char *pooled = pool.take(kTaskScratchBytes);
+    if (pooled != nullptr) {
+      slot_buf = pooled;
     } else {
       slot_buf = new char[kTaskScratchBytes];
     }
@@ -295,7 +443,15 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   EvPush('C', worker_id, reinterpret_cast<unsigned long long>(gpu_task_raw),
          task_raw->task_id_.unique_);
 
-  RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
+  // Inline start when local (CLIO_GPU2CPU_INLINE=1): force_enqueue costs a
+  // queue hop + worker pickup on EVERY device task, and the rdtsc phase probe
+  // puts 95% of fault-service latency (p50 349 us) between routing and
+  // write-back. The handler is a coroutine -- it suspends on its awaits --
+  // so starting it inline on the drain worker does not stall the drain.
+  static const bool inline_start =
+      std::getenv("CLIO_GPU2CPU_INLINE") != nullptr;
+  RouteResult route_result =
+      ipc->RouteTask(future, /*force_enqueue=*/!inline_start);
   HLOG(kDebug,
        "IpcGpu2Cpu::RecvIn: worker {} RouteTask returned {} pool={} method={}",
        worker_id, (int)route_result, pool_id, method_id);
@@ -442,3 +598,117 @@ void IpcGpu2Cpu::SendOut(
 }  // namespace clio::run
 
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+
+// ---------------------------------------------------------------------------
+// Direct-read registry: fault-chain level collapse. Deliberately OUTSIDE the
+// GPU guard — CPU-only builds must still resolve these symbols.
+//
+// The measured systemic cost in the GPU fault chain is not the copy or the
+// handler — it is the coroutine await-RESUME latency paid per dispatched task
+// level (~240 µs/level, stacked 2-3 deep per record). A bdev transport whose
+// read is synchronously servable in-process (the mem transport: resolve page,
+// one pinned-H2D DMA) registers itself here keyed by pool id; the CTE read
+// path then services tier-resident blocks inline on its own fiber with ZERO
+// dispatched sub-tasks. Lives in the core runtime lib (like clio_evlat_add)
+// because both the bdev module and the CTE module link it but not each other.
+// ---------------------------------------------------------------------------
+namespace {
+struct DirectReadEntry {
+  int (*fn)(void *, unsigned long long, unsigned long long, char *);
+  void *ctx;
+};
+std::mutex g_direct_read_mu;
+std::unordered_map<unsigned long long, DirectReadEntry> g_direct_read_map;
+}  // namespace
+
+extern "C" void clio_direct_read_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, char *),
+    void *ctx) {
+  std::lock_guard<std::mutex> lk(g_direct_read_mu);
+  g_direct_read_map[pool_id] = DirectReadEntry{fn, ctx};
+}
+
+extern "C" void clio_direct_read_unregister(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_direct_read_mu);
+  g_direct_read_map.erase(pool_id);
+}
+
+// Device-tier DIRECT MAP: a device-backed (kHbm) bdev publishes its
+// device_base_ so a device-resident consumer (the gpu_vector) can resolve
+// tier-resident bytes to a DIRECT DEVICE POINTER instead of copying.
+// Rationale (measured, 2026-08-10): D2H reads from cudaMalloc memory queue
+// behind a resident kernel's channel and wedge the fault service; a mapped
+// pointer removes the copy entirely — zero DMA per fault.
+namespace {
+std::mutex g_dev_base_mu;
+std::unordered_map<unsigned long long, char *> g_dev_base_map;
+}  // namespace
+
+extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
+                                              char *base) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  g_dev_base_map[pool_id] = base;
+}
+
+extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  g_dev_base_map.erase(pool_id);
+}
+
+// CTE blob locator: lets an in-process consumer (gpu_vector init) resolve a
+// blob name to its (bdev pool, target offset) without a task round trip —
+// the metadata needed to build the zero-copy device-offset table.
+namespace {
+struct LocateEntry {
+  int (*fn)(void *, const void *, const char *, unsigned long long *,
+            unsigned long long *, unsigned long long *);
+  void *ctx;
+};
+std::mutex g_locate_mu;
+LocateEntry g_locate{nullptr, nullptr};
+}  // namespace
+
+extern "C" void clio_cte_locate_register(
+    int (*fn)(void *, const void *, const char *, unsigned long long *,
+              unsigned long long *, unsigned long long *),
+    void *ctx) {
+  std::lock_guard<std::mutex> lk(g_locate_mu);
+  g_locate = LocateEntry{fn, ctx};
+}
+
+/** @return 0 and fills (pool_u64, target_off) for blob `name` in `tag_id`
+ *  (pointer to a cte TagId); nonzero when unknown. */
+extern "C" int clio_cte_locate(const void *tag_id, const char *name,
+                               unsigned long long *pool_u64,
+                               unsigned long long *target_off,
+                               unsigned long long *stored_size) {
+  LocateEntry e{nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lk(g_locate_mu);
+    e = g_locate;
+  }
+  if (e.fn == nullptr) return -1;
+  return e.fn(e.ctx, tag_id, name, pool_u64, target_off, stored_size);
+}
+
+/** @return the pool's device base pointer, or nullptr if not device-backed. */
+extern "C" char *clio_direct_dev_base(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_dev_base_mu);
+  auto it = g_dev_base_map.find(pool_id);
+  return it == g_dev_base_map.end() ? nullptr : it->second;
+}
+
+/** @return 0 on success; nonzero → caller must fall back to the task path. */
+extern "C" int clio_direct_read(unsigned long long pool_id,
+                                unsigned long long off, unsigned long long size,
+                                char *dst) {
+  DirectReadEntry e{nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lk(g_direct_read_mu);
+    auto it = g_direct_read_map.find(pool_id);
+    if (it == g_direct_read_map.end()) return -1;
+    e = it->second;
+  }
+  return e.fn(e.ctx, off, size, dst);
+}

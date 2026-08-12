@@ -3,7 +3,21 @@
  * All rights reserved.
  */
 
+#include <x86intrin.h>
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+// Direct-read registry (core runtime lib): fault-chain level collapse. The mem
+// transport's reads are synchronously servable, so the CTE read path can skip
+// the dispatched ReadTask (and its ~240 µs/level await-resume cost) entirely.
+extern "C" void clio_direct_read_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, char *),
+    void *ctx);
+extern "C" void clio_direct_read_unregister(unsigned long long pool_id);
+extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
+                                              char *base);
+extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
+#include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/work_orchestrator.h>
@@ -304,6 +318,30 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // exists.
   LoadPerfStats();
 
+  // Level collapse: a mem transport's reads are synchronously servable, so
+  // publish a direct entry keyed by pool id. Deliberately NOT registered when
+  // the throttle or IO-trace experiment knobs are armed — direct reads bypass
+  // the handler where those are enforced/counted, and a throttling experiment
+  // silently reading at full speed is worse than a slower fault path.
+  if (throttle_mbps_ <= 0.0 && !io_trace_) {
+    auto *mem = dynamic_cast<MemBdevTransport *>(transport_.get());
+    if (mem != nullptr) {
+      // Device-backed tier: publish the device base for zero-copy mapping.
+      char *db = mem->DeviceBase();
+      if (db != nullptr) {
+        clio_direct_dev_base_register(pool_id_.ToU64(), db);
+      }
+      clio_direct_read_register(
+          pool_id_.ToU64(),
+          [](void *ctx, unsigned long long off, unsigned long long size,
+             char *dst) -> int {
+            return static_cast<MemBdevTransport *>(ctx)->DirectRead(off, size,
+                                                                    dst);
+          },
+          mem);
+    }
+  }
+
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -496,6 +534,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_b0 = __rdtsc();
 
   // Counted at ENTRY, before the kNoop early-out: that path reports success
   // and claims bytes_read_ = length without touching storage, so counting
@@ -505,7 +544,8 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   if (bdev_type_ == BdevType::kNoop) {
     task->return_code_ = 0;
     task->bytes_read_ = task->length_;
-    CLIO_CO_RETURN;
+    clio_evlat_add(6, __rdtsc() - ev_b0);
+  CLIO_CO_RETURN;
   }
 
   if (transport_) {
@@ -520,6 +560,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     task->bytes_read_ = 0;
   }
 
+  clio_evlat_add(6, __rdtsc() - ev_b0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -675,6 +716,10 @@ void Runtime::StopHealthPolling() {
     health_poll_thread_.join();
   }
   if (transport_) {
+    // Retract the direct-read entry BEFORE tearing down the transport it
+    // points at (no-op if this pool never registered one).
+    clio_direct_read_unregister(pool_id_.ToU64());
+    clio_direct_dev_base_unregister(pool_id_.ToU64());
     transport_->Destroy();
     transport_.reset();
   }

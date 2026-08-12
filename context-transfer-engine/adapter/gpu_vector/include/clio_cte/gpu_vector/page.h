@@ -58,12 +58,22 @@ struct MultiBatch {
   clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> put_fut;
   clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask> get_fut;
   clio::run::u32 page_slot[clio::cte::core::kPodMultiMax];
+  /** Nonzero: get_fut carries an ASYNC batch that has not been settled.
+   *  Its pages are marked fetching=2; AwaitFetch on any of them settles the
+   *  whole batch. One outstanding async batch per table. */
+  clio::run::u32 async_pending;
+  /** Number of records in the un-settled async batch. */
+  clio::run::u32 async_n;
 };
 
 /** One resident page. */
 struct Page {
   /** Which page of the vector this slot holds; kNoPage when free. */
   clio::run::u64 page_num;
+  /** Claim generation: bumped every time this slot is (re)claimed. A reader
+   *  that captured gen at hold time and sees it unchanged after computing
+   *  knows the slot was never recycled mid-read (seqlock validate). */
+  clio::run::u32 gen;
   /** This page's bytes, in the device page backend. */
   void *data;
   /** Set by RescorePage; EvictPages takes the lowest. */
@@ -83,6 +93,16 @@ struct Page {
    */
   clio::run::u32 fetching;
   /** 1 while a fire-and-forget rescore is still outstanding on this slot. */
+  /**
+   * This page's in-flight put is an EVICTION, not a plain writeback.
+   *
+   * ReapFlushed cannot otherwise tell them apart, and the two want opposite
+   * things when the put lands: an eviction frees the slot, a BeginFlush
+   * leaves the page resident and clean. Without this it did the former for
+   * both, so every BeginFlush silently dropped the page from the cache and
+   * counted itself as an eviction.
+   */
+  clio::run::u32 evicting;
   clio::run::u32 rescoring;
   /** Bumped on every task submission so no two carry the same TaskId. */
   clio::run::u32 seq;
