@@ -203,81 +203,91 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
 // __cudaRegisterLinkedBinary segfault during static init, before main().
 // Same registration/RDC interaction that broke the demo target earlier.
 // ===========================================================================
+#include "clio_ctp/compress/preprocess/byte_shuffle.h"  // kShuffleChunkBytes
+
 namespace ctp::compress::preprocess {
 
 namespace {
 
 /**
- * One block-wide pass per byte position. Every thread in the grid
- * cooperates on each plane, so the access pattern is coalesced on the write
- * side (dst[elem] is contiguous) at the cost of a strided read -- the same
- * trade upstream makes.
+ * Byte planes are built WITHIN each kShuffleChunkBytes block, never across
+ * the whole buffer -- NeuroPress splits the input first
+ * (byte_shuffle_kernels.cu's createDeviceChunkArrays) and each of its blocks
+ * computes `num_elements = chunk_size / ElementSize` for its OWN chunk. A
+ * global plane layout produces different bytes for anything above 256 KiB.
+ *
+ * One thread block per chunk, grid-strided so a large buffer does not need
+ * one block per chunk resident at once. Within a chunk the write side is
+ * coalesced (out[b*n + elem] is contiguous across threads) at the cost of a
+ * strided read -- the same trade upstream makes.
  */
 template <unsigned ElemSize>
 __global__ void ShuffleKernel(const uint8_t *__restrict__ in,
-                              uint8_t *__restrict__ out, size_t num_elements) {
-  size_t elem = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
-  for (; elem < num_elements; elem += stride) {
+                              uint8_t *__restrict__ out, size_t num_bytes,
+                              size_t chunk_bytes) {
+  const size_t num_chunks = (num_bytes + chunk_bytes - 1) / chunk_bytes;
+  for (size_t c = blockIdx.x; c < num_chunks; c += gridDim.x) {
+    const size_t base = c * chunk_bytes;
+    const size_t remain = num_bytes - base;
+    const size_t chunk = remain < chunk_bytes ? remain : chunk_bytes;
+    const size_t n = chunk / ElemSize;
+    const uint8_t *ci = in + base;
+    uint8_t *co = out + base;
+    for (size_t elem = threadIdx.x; elem < n; elem += blockDim.x) {
 #pragma unroll
-    for (unsigned b = 0; b < ElemSize; ++b) {
-      out[b * num_elements + elem] = in[elem * ElemSize + b];
+      for (unsigned b = 0; b < ElemSize; ++b) {
+        co[b * n + elem] = ci[elem * ElemSize + b];
+      }
+    }
+    // Trailing partial element of THIS chunk, copied verbatim
+    // (byte_shuffle_kernels.cu:59-65). Only the last chunk can have one,
+    // since kShuffleChunkBytes is a multiple of every supported ElemSize.
+    for (size_t i = threadIdx.x + n * ElemSize; i < chunk; i += blockDim.x) {
+      co[i] = ci[i];
     }
   }
 }
 
 template <unsigned ElemSize>
 __global__ void UnshuffleKernel(const uint8_t *__restrict__ in,
-                                uint8_t *__restrict__ out,
-                                size_t num_elements) {
-  size_t elem = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
-  for (; elem < num_elements; elem += stride) {
+                                uint8_t *__restrict__ out, size_t num_bytes,
+                                size_t chunk_bytes) {
+  const size_t num_chunks = (num_bytes + chunk_bytes - 1) / chunk_bytes;
+  for (size_t c = blockIdx.x; c < num_chunks; c += gridDim.x) {
+    const size_t base = c * chunk_bytes;
+    const size_t remain = num_bytes - base;
+    const size_t chunk = remain < chunk_bytes ? remain : chunk_bytes;
+    const size_t n = chunk / ElemSize;
+    const uint8_t *ci = in + base;
+    uint8_t *co = out + base;
+    for (size_t elem = threadIdx.x; elem < n; elem += blockDim.x) {
 #pragma unroll
-    for (unsigned b = 0; b < ElemSize; ++b) {
-      out[elem * ElemSize + b] = in[b * num_elements + elem];
+      for (unsigned b = 0; b < ElemSize; ++b) {
+        co[elem * ElemSize + b] = ci[b * n + elem];
+      }
+    }
+    for (size_t i = threadIdx.x + n * ElemSize; i < chunk; i += blockDim.x) {
+      co[i] = ci[i];
     }
   }
-}
-
-/** Trailing bytes that do not form a whole element are copied verbatim,
- *  matching the host implementation's treatment of a partial tail. */
-__global__ void CopyTailKernel(const uint8_t *__restrict__ in,
-                               uint8_t *__restrict__ out, size_t offset,
-                               size_t count) {
-  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < count) out[offset + i] = in[offset + i];
-}
-
-bool LaunchTail(const uint8_t *in, uint8_t *out, size_t num_bytes,
-                size_t body_bytes, cudaStream_t stream) {
-  const size_t tail = num_bytes - body_bytes;
-  if (tail == 0) return true;
-  const int threads = 128;
-  const int blocks = static_cast<int>((tail + threads - 1) / threads);
-  CopyTailKernel<<<blocks, threads, 0, stream>>>(in, out, body_bytes, tail);
-  return cudaGetLastError() == cudaSuccess;
 }
 
 /** Shared validation + launch geometry for both directions. Returns false
  *  if the request is not shuffleable; otherwise fills the launch config. */
 bool PrepareLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
-                   size_t elem_size, size_t *num_elements, int *blocks,
-                   int *threads) {
+                   size_t elem_size, int *blocks, int *threads) {
   if (!in || !out || num_bytes == 0) return false;
   if (elem_size != 2 && elem_size != 4 && elem_size != 8) return false;
-  *num_elements = num_bytes / elem_size;
-  if (*num_elements == 0) return false;
+  if (num_bytes < elem_size) return false;
   *threads = 256;
-  size_t want = (*num_elements + *threads - 1) / *threads;
-  *blocks = static_cast<int>(want > 65535 ? 65535 : want);
+  const size_t num_chunks =
+      (num_bytes + kShuffleChunkBytes - 1) / kShuffleChunkBytes;
+  *blocks = static_cast<int>(num_chunks > 65535 ? 65535 : num_chunks);
   return true;
 }
 
-bool FinishLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
-                  size_t body_bytes, cudaStream_t stream) {
+bool FinishLaunch(cudaStream_t stream) {
   if (cudaGetLastError() != cudaSuccess) return false;
-  if (!LaunchTail(in, out, num_bytes, body_bytes, stream)) return false;
   return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
@@ -287,40 +297,40 @@ bool ByteShuffleDevice(const void *device_in, void *device_out,
                        size_t num_bytes, size_t elem_size) {
   const uint8_t *in = static_cast<const uint8_t *>(device_in);
   uint8_t *out = static_cast<uint8_t *>(device_out);
-  size_t n = 0;
   int blocks = 0, threads = 0;
-  if (!PrepareLaunch(in, out, num_bytes, elem_size, &n, &blocks, &threads)) {
+  if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
   cudaStream_t stream = 0;
+  const size_t cb = kShuffleChunkBytes;
   if (elem_size == 2) {
-    ShuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, n);
+    ShuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   } else if (elem_size == 4) {
-    ShuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, n);
+    ShuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   } else {
-    ShuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, n);
+    ShuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   }
-  return FinishLaunch(in, out, num_bytes, n * elem_size, stream);
+  return FinishLaunch(stream);
 }
 
 bool ByteUnshuffleDevice(const void *device_in, void *device_out,
                          size_t num_bytes, size_t elem_size) {
   const uint8_t *in = static_cast<const uint8_t *>(device_in);
   uint8_t *out = static_cast<uint8_t *>(device_out);
-  size_t n = 0;
   int blocks = 0, threads = 0;
-  if (!PrepareLaunch(in, out, num_bytes, elem_size, &n, &blocks, &threads)) {
+  if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
   cudaStream_t stream = 0;
+  const size_t cb = kShuffleChunkBytes;
   if (elem_size == 2) {
-    UnshuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, n);
+    UnshuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   } else if (elem_size == 4) {
-    UnshuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, n);
+    UnshuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   } else {
-    UnshuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, n);
+    UnshuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   }
-  return FinishLaunch(in, out, num_bytes, n * elem_size, stream);
+  return FinishLaunch(stream);
 }
 
 }  // namespace ctp::compress::preprocess

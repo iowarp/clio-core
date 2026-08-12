@@ -13,16 +13,38 @@
  *   INPUT:  [A0 A1 A2 A3][B0 B1 B2 B3][C0 C1 C2 C3]
  *   OUTPUT: [A0 B0 C0][A1 B1 C1][A2 B2 C2][A3 B3 C3]
  *
+ * The regrouping happens within each kShuffleChunkBytes block independently,
+ * not across the whole buffer -- see that constant for why.
+ *
  * Reversible for elem_size in {2, 4, 8}. Header-only CPU implementation.
  */
 #ifndef CLIO_CTP_COMPRESS_PREPROCESS_BYTE_SHUFFLE_H_
 #define CLIO_CTP_COMPRESS_PREPROCESS_BYTE_SHUFFLE_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace ctp::compress::preprocess {
+
+/**
+ * @brief Bytes per independently-shuffled block.
+ *
+ * NeuroPress does NOT shuffle a buffer as one set of byte planes: it splits
+ * the input into SHUFFLE_CHUNK_SIZE pieces and builds planes within each
+ * piece (src/api/internal.hpp:100 `constexpr size_t SHUFFLE_CHUNK_SIZE =
+ * 256 * 1024`, passed at gpucompress_compress.cpp:461 and :1260, applied per
+ * chunk in byte_shuffle_kernels.cu where `num_elements = chunk_size /
+ * ElementSize` is the CHUNK's element count).
+ *
+ * The distinction is invisible for buffers <= 256 KiB (one chunk = the whole
+ * buffer) but changes every byte handed to the codec above it, and the
+ * shipped model's ratio predictions for shuffle actions were learned against
+ * the chunked layout. Matching the constant keeps the codec input -- and so
+ * the achieved ratio -- comparable with NeuroPress's.
+ */
+constexpr size_t kShuffleChunkBytes = 256 * 1024;
 
 /**
  * @brief Shuffle data from AoS (Array of Structures) to SoA by byte plane.
@@ -54,19 +76,32 @@ inline bool ByteShuffle(const uint8_t* input,
     return false;
   }
 
-  size_t num_elements = num_bytes / elem_size;
-  if (num_elements == 0) {
+  if (num_bytes < elem_size) {
     return false;
   }
 
-  // Process element by element: distribute bytes to planes
-  size_t output_offset = 0;
+  // Planes are built WITHIN each kShuffleChunkBytes block, not across the
+  // whole buffer -- see the constant's docs. Blocks are independent, so the
+  // inverse is the same walk.
+  for (size_t base = 0; base < num_bytes; base += kShuffleChunkBytes) {
+    const size_t chunk = std::min(kShuffleChunkBytes, num_bytes - base);
+    const uint8_t* in = input + base;
+    uint8_t* out = output + base;
+    const size_t num_elements = chunk / elem_size;
+    const size_t leftover = chunk % elem_size;
 
-  for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
-    for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
-      size_t input_offset = elem_idx * elem_size + byte_idx;
-      output[output_offset] = input[input_offset];
-      output_offset++;
+    for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
+      for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
+        out[byte_idx * num_elements + elem_idx] =
+            in[elem_idx * elem_size + byte_idx];
+      }
+    }
+    // Trailing partial element is copied verbatim, matching
+    // byte_shuffle_kernels.cu:59-65. Dropping it (as this did before) left
+    // the caller's tail bytes untouched -- silent corruption on round trip,
+    // since the length was still right.
+    for (size_t i = 0; i < leftover; ++i) {
+      out[elem_size * num_elements + i] = in[elem_size * num_elements + i];
     }
   }
 
@@ -102,19 +137,26 @@ inline bool ByteUnshuffle(const uint8_t* input,
     return false;
   }
 
-  size_t num_elements = num_bytes / elem_size;
-  if (num_elements == 0) {
+  if (num_bytes < elem_size) {
     return false;
   }
 
-  // Process byte plane by plane: gather bytes back to elements
-  size_t input_offset = 0;
+  // Exact inverse of ByteShuffle's per-block walk above.
+  for (size_t base = 0; base < num_bytes; base += kShuffleChunkBytes) {
+    const size_t chunk = std::min(kShuffleChunkBytes, num_bytes - base);
+    const uint8_t* in = input + base;
+    uint8_t* out = output + base;
+    const size_t num_elements = chunk / elem_size;
+    const size_t leftover = chunk % elem_size;
 
-  for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
-    for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
-      size_t output_offset = elem_idx * elem_size + byte_idx;
-      output[output_offset] = input[input_offset];
-      input_offset++;
+    for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
+      for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
+        out[elem_idx * elem_size + byte_idx] =
+            in[byte_idx * num_elements + elem_idx];
+      }
+    }
+    for (size_t i = 0; i < leftover; ++i) {
+      out[elem_size * num_elements + i] = in[elem_size * num_elements + i];
     }
   }
 
@@ -170,9 +212,11 @@ inline std::vector<uint8_t> ByteUnshuffleVector(const uint8_t* input,
  * compiled in, so a caller that must not fall back to the host routines
  * above (they would dereference the device pointer) can fail cleanly.
  *
- * Produces byte-for-byte the same layout as ByteShuffle(): plane `b` starts
- * at `b * (num_bytes / elem_size)`, and a trailing partial element is copied
- * verbatim. Blobs are interchangeable between the two paths.
+ * Produces byte-for-byte the same layout as ByteShuffle(): the buffer is cut
+ * into kShuffleChunkBytes blocks, plane `b` of a block starts at
+ * `b * (block_bytes / elem_size)` within that block, and a trailing partial
+ * element is copied verbatim. Blobs are interchangeable between the two
+ * paths (verified by the preprocess unit tests, which cross both).
  *
  * @param device_in  Device buffer to read.
  * @param device_out Device buffer to write (at least num_bytes, no overlap).

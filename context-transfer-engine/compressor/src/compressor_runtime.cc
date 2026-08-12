@@ -352,10 +352,32 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
 
-  // Determine data type from context
-  // context.data_type_: 0 = char/uint8, 1 = float
-  ctp::DataType data_type = (context.data_type_ == 1) ? ctp::DataType::FLOAT32
-                                                       : ctp::DataType::UINT8;
+  // NeuroPress takes priority over the legacy heuristics below whenever it
+  // is ready, so decide that first -- it determines how the chunk must be
+  // interpreted for the statistics.
+  const bool neuropress_active = context.dynamic_compress_ != 1 &&
+                                 neuropress_predictor_ &&
+                                 neuropress_predictor_->IsReady();
+
+  // Element type for the statistics. NeuroPress has exactly ONE
+  // interpretation -- `num_elements = input_size / sizeof(float)`, hardcoded
+  // at stats_kernel.cu:306 and gpucompress_compress.cpp:273, with the
+  // reduction kernel typed `const float*` and no data-type parameter
+  // anywhere in its stats or NN path. The shipped model.nnwt was normalized
+  // against float32 statistics (x_means[6]=0.189, x_maxs[6]=0.500 for MAD).
+  //
+  // Reading the same bytes as uint8 puts MAD 300-750 sigma outside the
+  // training range and reduces the second derivative to a near-uniform walk
+  // over mantissa bytes, i.e. no signal at all -- and context.data_type_
+  // defaults to 0, so that was the DEFAULT behavior. Match NeuroPress
+  // unconditionally when it is the one ranking. The legacy qtable/dense-NN
+  // path keeps the old context-driven mapping: those models were fit on
+  // Clio's own features, not NeuroPress's.
+  ctp::DataType data_type =
+      neuropress_active
+          ? ctp::DataType::FLOAT32
+          : ((context.data_type_ == 1) ? ctp::DataType::FLOAT32
+                                       : ctp::DataType::UINT8);
   size_t type_size = ctp::DataStatisticsFactory::GetTypeSize(data_type);
 
   // Whole chunk, not a prefix. NeuroPress computes entropy/MAD/second-
@@ -369,9 +391,6 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // same three numbers, an error here shifts the whole ranking, not one
   // entry.
   size_t num_elements = static_cast<size_t>(chunk_size / type_size);
-  if (num_elements == 0) {
-    num_elements = 1;
-  }
 
   // Calculate compression features. A chunk resolved from a CUDA-IPC device
   // buffer is not host-readable -- ComputeCompressionFeatures detects that
@@ -379,16 +398,26 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // itself never has to be staged through host memory just to feed
   // NeuroPress. Falls through to the existing host path otherwise.
   double entropy = 0.0, mad = 0.0, second_derivative_mean = 0.0;
-  const bool features_ok = ctp::ComputeCompressionFeatures(
-      chunk, num_elements, data_type, &entropy, &mad, &second_derivative_mean);
+  // A chunk smaller than one element has no statistics. This used to clamp
+  // num_elements up to 1, which made the stats routines read a whole element
+  // out of a 1-3 byte allocation (a heap over-read on the host, a possible
+  // fault on the device) and then rank on the garbage. NeuroPress refuses
+  // outright -- `if (num_elements == 0 ...) return GPUCOMPRESS_ERROR_NN_
+  // NOT_LOADED` (gpucompress_compress.cpp:274), guarded again at
+  // stats_kernel.cu:307 -- so fall through to the legacy heuristics instead.
+  const bool features_ok =
+      num_elements > 0 &&
+      ctp::ComputeCompressionFeatures(chunk, num_elements, data_type, &entropy,
+                                      &mad, &second_derivative_mean);
   if (!features_ok) {
     // Device-resident chunk whose on-device stats could not be computed.
     // Ranking on the zeros left behind would hand NeuroPress a chunk that
     // looks perfectly compressible and pick accordingly, so skip the
     // model entirely and let the legacy heuristics below decide.
     HLOG(kWarning,
-         "EstCompressionStats: device stats unavailable for a device-resident "
-         "chunk; skipping NeuroPress ranking for it");
+         "EstCompressionStats: no usable statistics for this chunk "
+         "(size={} elem_size={}); skipping NeuroPress ranking for it",
+         chunk_size, type_size);
   }
 
   // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
@@ -926,9 +955,21 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
           data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
 
+          // best_preset is PACKED (preset | shuffle_elem << 8). Feeding it
+          // raw into preset_id corrupts LibraryConfigId() = base_id*10 +
+          // preset_id, which is how the model recovers the algorithm: a
+          // shuffled lz4 (2 | 4<<8 = 1026) yields 13*10 + 1026 = 1156, and
+          // FeaturesTo8Input's 1156/10 = 115 misses every known base_id and
+          // falls back to 115 % 8 = 3 (gdeflate). Every shuffled algorithm
+          // collapsed onto two indices, so SGD trained the wrong head.
+          // NeuroPress has no such hazard -- it carries the 0-31 action id
+          // unchanged from selection into SGD (gpucompress_compress.cpp).
           ctp::compress::model::CandidateConfig candidate;
           candidate.base_id = base_id;
-          candidate.preset_id = best_preset;
+          candidate.preset_id =
+              static_cast<int>(UnpackPreset(static_cast<uint32_t>(best_preset)));
+          candidate.byte_shuffle =
+              UnpackShuffle(static_cast<uint32_t>(best_preset)) != 0;
           candidate.library_name = lib_name;
 
           ctp::compress::model::CompressionFeatures chunk_features =
@@ -1054,9 +1095,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             alt_data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
             alt_data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
 
+            // Packed, same as the primary above -- unpack both halves.
             ctp::compress::model::CandidateConfig alt_candidate;
             alt_candidate.base_id = alt_base_id;
-            alt_candidate.preset_id = alt->compress_preset_;
+            alt_candidate.preset_id = static_cast<int>(
+                UnpackPreset(static_cast<uint32_t>(alt->compress_preset_)));
+            alt_candidate.byte_shuffle =
+                UnpackShuffle(static_cast<uint32_t>(alt->compress_preset_)) != 0;
             alt_candidate.library_name = alt_name;
 
             explore_features.push_back(
@@ -1881,10 +1926,20 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
                               clio::run::u64 *stored_size) {
   std::string library_name =
       ctp::CompressionFactory::NameForWireId(ctx.compress_lib_);
+  // compress_preset_ is PACKED (preset | shuffle_elem << 8) whenever the
+  // selection came from DynamicSchedule. Unpack before comparing, or a
+  // shuffled FAST candidate (1 | 4<<8 = 1025) silently falls through to
+  // BALANCED -- and, worse, the packed value used to be copied verbatim
+  // into the header while no shuffle was ever applied, so Runtime::
+  // Decompress would invert a shuffle that never happened.
+  const uint32_t requested_preset =
+      UnpackPreset(static_cast<uint32_t>(ctx.compress_preset_));
+  const uint32_t requested_shuffle =
+      UnpackShuffle(static_cast<uint32_t>(ctx.compress_preset_));
   ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (ctx.compress_preset_ == 1) {
+  if (requested_preset == 1) {
     preset = ctp::CompressionPreset::FAST;
-  } else if (ctx.compress_preset_ == 3) {
+  } else if (requested_preset == 3) {
     preset = ctp::CompressionPreset::BEST;
   }
   auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
@@ -1892,10 +1947,32 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
     return false;
   }
   auto t0 = std::chrono::high_resolution_clock::now();
+
+  // Honor the shuffle the selector asked for. This path is host-side (src is
+  // a host SHM buffer), so the host routines are the right ones -- but the
+  // blob it writes shares one magic and one header layout with the blobs
+  // Runtime::Compress writes, and either read path may consume either blob.
+  // Applying the shuffle here is what makes the two writers agree.
+  const char *compress_src = src;
+  std::vector<char> shuffle_staging;
+  uint32_t applied_shuffle = 0;
+  if (requested_shuffle != 0 && size >= requested_shuffle &&
+      (size % requested_shuffle) == 0) {
+    shuffle_staging.resize(size);
+    if (ctp::compress::preprocess::ByteShuffle(
+            reinterpret_cast<const uint8_t *>(src), size, requested_shuffle,
+            reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
+      compress_src = shuffle_staging.data();
+      applied_shuffle = requested_shuffle;
+    }
+    // On failure compress_src is untouched and applied_shuffle stays 0, so
+    // the header records "not shuffled" and the read side does nothing.
+  }
+
   std::vector<char> compressed(size + (size / 20) + 1024);
   size_t compressed_size = compressed.size();
   if (!compressor->Compress(compressed.data(), compressed_size,
-                            const_cast<char *>(src), size)) {
+                            const_cast<char *>(compress_src), size)) {
     return false;
   }
   size_t header_size = sizeof(CompressionHeader);
@@ -1907,7 +1984,12 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   if (shm.IsNull()) {
     return false;
   }
-  CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_, size);
+  // Record the shuffle that was ACTUALLY applied, not the one requested --
+  // a declined shuffle (wrong size multiple, allocation failure) must read
+  // back as "not shuffled" or the read side inverts a transform that never
+  // ran. Same rule Runtime::Compress follows.
+  CompressionHeader header(ctx.compress_lib_,
+                           PackPreset(requested_preset, applied_shuffle), size);
   std::memcpy(shm.ptr_, &header, header_size);
   std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
@@ -1939,10 +2021,16 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   }
   std::string library_name = ctp::CompressionFactory::NameForWireId(
       static_cast<int>(header->compress_lib_));
+  // Same packed layout Runtime::Compress writes -- unpack both halves. This
+  // path used to compare the raw field, so a shuffled blob matched neither
+  // 1 nor 3 and silently used BALANCED, and the shuffle was never inverted:
+  // the caller got byte-planes back and no error.
+  const uint32_t stored_preset = UnpackPreset(header->compress_preset_);
+  const uint32_t stored_shuffle = UnpackShuffle(header->compress_preset_);
   ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (header->compress_preset_ == 1) {
+  if (stored_preset == 1) {
     preset = ctp::CompressionPreset::FAST;
-  } else if (header->compress_preset_ == 3) {
+  } else if (stored_preset == 3) {
     preset = ctp::CompressionPreset::BEST;
   }
   auto decompressor = ctp::CompressionFactory::GetPreset(library_name, preset);
@@ -1955,6 +2043,25 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
                                     sizeof(CompressionHeader),
                                 stored_size - sizeof(CompressionHeader))) {
     return 5;
+  }
+
+  // Invert the byte-shuffle before the caller sees the buffer. dst is a host
+  // buffer on this path (the interposer stages through SHM), so the host
+  // routines apply. Failing is the only safe outcome: returning shuffled
+  // bytes is silent corruption, since they are the right LENGTH.
+  if (stored_shuffle != 0 && decompressed >= stored_shuffle &&
+      (decompressed % stored_shuffle) == 0) {
+    std::vector<char> unshuffled(decompressed);
+    if (!ctp::compress::preprocess::ByteUnshuffle(
+            reinterpret_cast<const uint8_t *>(dst), decompressed,
+            stored_shuffle, reinterpret_cast<uint8_t *>(unshuffled.data()))) {
+      HLOG(kError,
+           "DecompressStored: byte-unshuffle failed (elem={} size={}) -- the "
+           "returned buffer would be shuffled garbage, failing instead",
+           stored_shuffle, decompressed);
+      return 5;
+    }
+    std::memcpy(dst, unshuffled.data(), decompressed);
   }
   *out_size = decompressed;
   return 0;
