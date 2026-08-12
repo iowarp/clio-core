@@ -26,9 +26,12 @@
  *   compared for the action native chose, and the chosen algorithm is
  *   compared directly.
  *
- * Lossless throughout: error_bound = 0, which is also what makes upstream
- * mask every quantize action to -INFINITY, so both sides range over the
- * same algorithm x byte-shuffle space.
+ * Every chunk is run at several error bounds. At error_bound = 0 upstream
+ * masks every quantize action to -INFINITY (nn_gpu.cu:238) and the two
+ * sides range over algorithm x byte-shuffle; at a nonzero bound the
+ * quantize half becomes selectable and both sides range over the full
+ * algorithm x quantize x byte-shuffle space. Statistics do not depend on
+ * the bound, so they are computed once per chunk and compared once.
  */
 
 #include <cuda_runtime.h>
@@ -79,11 +82,18 @@ constexpr size_t kTotalBytes = 1ull << 30;   // 1 GiB
 constexpr size_t kChunkBytes = 4ull << 20;   // 4 MiB
 constexpr size_t kNumChunks = kTotalBytes / kChunkBytes;  // 256
 
+// Error bounds swept per chunk. 0.0 keeps the original lossless coverage --
+// the case where upstream masks the quantize half -- and the rest make that
+// half selectable so the two sides are compared over all 32 configs.
+constexpr double kBounds[] = {0.0, 1e-6, 1e-3, 1e-2};
+constexpr size_t kNumBounds = sizeof(kBounds) / sizeof(kBounds[0]);
+
 int g_failures = 0;
 long g_checks = 0;
 double g_max_rel_entropy = 0, g_max_rel_mad = 0, g_max_rel_deriv = 0;
 double g_max_rel_ratio = 0, g_max_rel_ct = 0, g_max_rel_dt = 0;
 int g_algo_mismatches = 0;
+int g_quant_winners[kNumBounds] = {0};
 
 void Track(double a, double b, double *worst) {
   double denom = std::max(1e-12, std::max(std::fabs(a), std::fabs(b)));
@@ -207,26 +217,59 @@ int main(int argc, char **argv) {
     FillDataset<<<blocks, threads>>>(d_data, num_elems, elems_per_chunk);
     cudaDeviceSynchronize();
   }
-  std::printf("Dataset: %zu MiB, %zu chunks of %zu MiB, lossless "
-              "(error_bound=0)\n\n",
+  std::printf("Dataset: %zu MiB, %zu chunks of %zu MiB\n",
               kTotalBytes >> 20, kNumChunks, kChunkBytes >> 20);
+  std::printf("Bounds swept per chunk: %s\n\n",
+              "0 (lossless), 1e-6, 1e-3, 1e-2");
 
-  // Clio's candidate set: the 8 trained nvcomp algorithms x byte-shuffle,
-  // which is what upstream can reach once quantize is masked at eb=0.
-  static const int kTrainedBaseIds[] = {13, 14, 15, 16, 17, 18, 23, 24};
+  // Clio's candidate set, built exactly as neuropress_bridge.cc builds it.
+  //
+  // Order matters. NeuroPress's action space is algo + 8*quant + 16*shuffle
+  // (decodeAction, internal.hpp:167-172) and its bitonic ranking network
+  // uses strict comparators, so it never swaps equal keys and returns the
+  // LOWEST action index on a tie. Clio reproduces that with stable_sort --
+  // first enumerated wins -- which only holds if enumeration runs in
+  // ascending action order: shuffle outer, quant middle, algo inner. This
+  // test previously enumerated algo-outer/shuffle-inner, giving the order
+  // 0, 16, 1, 17, ... so a tie between actions 16 and 1 would have resolved
+  // to 16 here and to 1 upstream.
+  //
+  // The quant skip is Clio's form of upstream's mask
+  // "quant == 1 && error_bound <= 0.0 -> rank_val = -INFINITY"
+  // (nn_gpu.cu:238); the bridge applies the same rule at
+  // neuropress_bridge.cc:183.
+  auto BuildCandidates = [](double eb) {
+    std::vector<CandidateConfig> cands;
+    for (int shuffle = 0; shuffle <= 1; ++shuffle) {
+      for (int quant = 0; quant <= 1; ++quant) {
+        if (quant == 1 && !(eb > 0.0)) continue;
+        for (int algo = 0; algo < 8; ++algo) {
+          CandidateConfig c;
+          c.base_id = BaseIdForAlgoIdx(algo);
+          c.preset_id = 2;
+          c.byte_shuffle = (shuffle != 0);
+          c.quantize = (quant != 0);
+          c.error_bound = (quant != 0) ? eb : 0.0;
+          cands.push_back(c);
+        }
+      }
+    }
+    return cands;
+  };
 
-  // Per-chunk selection table. Every row is written to CSV so all 256 are
-  // inspectable; the console shows a readable subset.
+  // Per-chunk, per-bound selection table. Every row is written to CSV so all
+  // of them are inspectable; the console shows a readable subset.
   std::FILE *csv = std::fopen("neuropress_selection_parity.csv", "w");
   if (csv) {
     std::fprintf(csv,
-                 "chunk,entropy_native,entropy_clio,mad_native,mad_clio,"
-                 "deriv_native,deriv_clio,algo_native,algo_clio,"
-                 "shuffle_native,shuffle_clio,ratio_native,ratio_clio,match\n");
+                 "chunk,error_bound,entropy_native,entropy_clio,mad_native,"
+                 "mad_clio,deriv_native,deriv_clio,algo_native,algo_clio,"
+                 "quant_native,quant_clio,shuffle_native,shuffle_clio,"
+                 "ratio_native,ratio_clio,match\n");
   }
-  std::printf("%-6s %-9s %-17s %-17s %-7s %s\n", "chunk", "entropy",
-              "NATIVE selection", "CLIO selection", "shuf", "match");
-  std::printf("%s\n", std::string(78, '-').c_str());
+  std::printf("%-6s %-8s %-17s %-17s %-7s %-7s %s\n", "chunk", "eb",
+              "NATIVE selection", "CLIO selection", "quant", "shuf", "match");
+  std::printf("%s\n", std::string(86, '-').c_str());
 
   for (size_t ci = 0; ci < kNumChunks; ++ci) {
     const char *d_chunk =
@@ -254,31 +297,7 @@ int main(int argc, char **argv) {
     Expect(n_mad, c_mad, 1e-9, &g_max_rel_mad, "mad", ci);
     Expect(n_der, c_der, 1e-9, &g_max_rel_deriv, "second_derivative", ci);
 
-    // ---- (2) native inference: predicts and selects ----
-    float n_ratio = 0, n_ct = 0, n_dt = 0, n_psnr = 0;
-    int top[NN_NUM_CONFIGS] = {0};
-    int action = gpucompress::runNNInference(n_ent, n_mad, n_der, kChunkBytes,
-                                             /*error_bound=*/0.0, stream,
-                                             &n_ratio, &n_ct, &n_dt, &n_psnr,
-                                             top);
-    cudaStreamSynchronize(stream);
-    ++g_checks;
-    if (action < 0) {
-      std::printf("  [FAIL] chunk %zu: native inference failed\n", ci);
-      ++g_failures;
-      continue;
-    }
-    const int n_algo = action % 8;
-    const int n_quant = (action / 8) % 2;
-    const int n_shuf = (action / 16) % 2;
-    ++g_checks;
-    if (n_quant != 0) {
-      std::printf("  [FAIL] chunk %zu: native chose a QUANTIZE action (%d) "
-                  "at error_bound=0\n", ci, action);
-      ++g_failures;
-    }
-
-    // ---- (3) Clio: rank its own candidates from its OWN stats ----
+    // Stats feed every bound below, so they are computed and compared once.
     DataFeatures data;
     data.chunk_size_bytes = static_cast<double>(kChunkBytes);
     data.shannon_entropy = c_ent;
@@ -286,73 +305,106 @@ int main(int argc, char **argv) {
     data.second_derivative_mean = c_der;
     data.data_type_float = 1.0;
 
-    std::vector<CandidateConfig> cands;
-    for (int base : kTrainedBaseIds) {
-      for (int shuf = 0; shuf < 2; ++shuf) {
-        CandidateConfig c;
-        c.base_id = base;
-        c.preset_id = 2;
-        c.byte_shuffle = (shuf != 0);
-        cands.push_back(c);
+    for (size_t bi = 0; bi < kNumBounds; ++bi) {
+      const double eb = kBounds[bi];
+
+      // ---- (2) native inference: predicts and selects ----
+      float n_ratio = 0, n_ct = 0, n_dt = 0, n_psnr = 0;
+      int top[NN_NUM_CONFIGS] = {0};
+      int action = gpucompress::runNNInference(n_ent, n_mad, n_der, kChunkBytes,
+                                               eb, stream, &n_ratio, &n_ct,
+                                               &n_dt, &n_psnr, top);
+      cudaStreamSynchronize(stream);
+      ++g_checks;
+      if (action < 0) {
+        std::printf("  [FAIL] chunk %zu eb=%g: native inference failed\n", ci,
+                    eb);
+        ++g_failures;
+        continue;
       }
-    }
-    ctp::compress::model::RankingWeights w;
-    w.use_cost_model = true;
-    auto ranked = clio.Rank(data, cands, w);
-    ++g_checks;
-    if (ranked.empty()) {
-      std::printf("  [FAIL] chunk %zu: Clio produced no ranking\n", ci);
-      ++g_failures;
-      continue;
-    }
-
-    // Clio's own winner -> algo index, for the selection comparison.
-    int c_algo = -1;
-    for (int a = 0; a < 8; ++a) {
-      if (BaseIdForAlgoIdx(a) == ranked.front().candidate.base_id) {
-        c_algo = a;
-        break;
+      const int n_algo = action % 8;
+      const int n_quant = (action / 8) % 2;
+      const int n_shuf = (action / 16) % 2;
+      // At a zero bound the quantize half is masked to -INFINITY upstream, so
+      // a quantize winner there would mean the mask stopped working.
+      ++g_checks;
+      if (eb <= 0.0 && n_quant != 0) {
+        std::printf("  [FAIL] chunk %zu: native chose a QUANTIZE action (%d) "
+                    "at error_bound=0\n", ci, action);
+        ++g_failures;
       }
-    }
-    const int c_shuf = ranked.front().candidate.byte_shuffle ? 1 : 0;
-    ++g_checks;
-    if (c_algo != n_algo || c_shuf != n_shuf) {
-      ++g_algo_mismatches;
-      if (g_algo_mismatches <= 10) {
-        std::printf("  [DIFF] chunk %zu selection: native algo=%d shuf=%d, "
-                    "clio algo=%d shuf=%d\n", ci, n_algo, n_shuf, c_algo,
-                    c_shuf);
+      if (n_quant != 0) ++g_quant_winners[bi];
+
+      // ---- (3) Clio: rank its own candidates from its OWN stats ----
+      std::vector<CandidateConfig> cands = BuildCandidates(eb);
+      ctp::compress::model::RankingWeights w;
+      w.use_cost_model = true;
+      auto ranked = clio.Rank(data, cands, w);
+      ++g_checks;
+      if (ranked.empty()) {
+        std::printf("  [FAIL] chunk %zu eb=%g: Clio produced no ranking\n", ci,
+                    eb);
+        ++g_failures;
+        continue;
       }
-      ++g_failures;
-    }
 
-    // ---- (4) prediction parity for the action NATIVE chose ----
-    CandidateConfig chosen;
-    chosen.base_id = BaseIdForAlgoIdx(n_algo);
-    chosen.preset_id = 2;
-    chosen.byte_shuffle = (n_shuf != 0);
-    CompressionFeatures f = MakeCompressionFeatures(data, chosen);
-    auto p = clio.Predict(f);
+      // Clio's own winner -> algo index, for the selection comparison.
+      int c_algo = -1;
+      for (int a = 0; a < 8; ++a) {
+        if (BaseIdForAlgoIdx(a) == ranked.front().candidate.base_id) {
+          c_algo = a;
+          break;
+        }
+      }
+      const int c_quant = ranked.front().candidate.quantize ? 1 : 0;
+      const int c_shuf = ranked.front().candidate.byte_shuffle ? 1 : 0;
+      ++g_checks;
+      const bool sel_match =
+          (c_algo == n_algo && c_quant == n_quant && c_shuf == n_shuf);
+      if (!sel_match) {
+        ++g_algo_mismatches;
+        if (g_algo_mismatches <= 10) {
+          std::printf("  [DIFF] chunk %zu eb=%g selection: native algo=%d "
+                      "q=%d shuf=%d, clio algo=%d q=%d shuf=%d\n",
+                      ci, eb, n_algo, n_quant, n_shuf, c_algo, c_quant, c_shuf);
+        }
+        ++g_failures;
+      }
 
-    Expect(n_ratio, p.compression_ratio, 1e-3, &g_max_rel_ratio, "ratio", ci);
-    Expect(n_ct, p.compression_time_ms, 1e-3, &g_max_rel_ct, "comp_time", ci);
-    Expect(n_dt, p.decompression_time_ms, 1e-3, &g_max_rel_dt, "decomp_time",
-           ci);
+      // ---- (4) prediction parity for the action NATIVE chose ----
+      CandidateConfig chosen;
+      chosen.base_id = BaseIdForAlgoIdx(n_algo);
+      chosen.preset_id = 2;
+      chosen.quantize = (n_quant != 0);
+      chosen.byte_shuffle = (n_shuf != 0);
+      // Mirrors BuildCandidates: a lossless config carries no bound, and
+      // FeaturesTo8Input substitutes the 1e-7 sentinel for it, exactly as
+      // nnInferenceKernel does at nn_gpu.cu:144.
+      chosen.error_bound = (n_quant != 0) ? eb : 0.0;
+      CompressionFeatures f = MakeCompressionFeatures(data, chosen);
+      auto p = clio.Predict(f);
 
-    const bool sel_match = (c_algo == n_algo && c_shuf == n_shuf);
-    if (csv) {
-      std::fprintf(csv,
-                   "%zu,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%s,%s,%d,%d,"
-                   "%.9g,%.9g,%s\n",
-                   ci, n_ent, c_ent, n_mad, c_mad, n_der, c_der,
-                   AlgoName(n_algo),
-                   (c_algo >= 0 ? AlgoName(c_algo) : "none"), n_shuf, c_shuf,
-                   n_ratio, p.compression_ratio, sel_match ? "YES" : "NO");
-    }
-    if (ci < 12 || (ci % 32) == 0 || !sel_match) {
-      std::printf("%-6zu %9.5f %-17s %-17s %d/%-5d %s\n", ci, n_ent,
-                  AlgoName(n_algo), (c_algo >= 0 ? AlgoName(c_algo) : "none"),
-                  n_shuf, c_shuf, sel_match ? "yes" : "*** NO ***");
+      Expect(n_ratio, p.compression_ratio, 1e-3, &g_max_rel_ratio, "ratio", ci);
+      Expect(n_ct, p.compression_time_ms, 1e-3, &g_max_rel_ct, "comp_time", ci);
+      Expect(n_dt, p.decompression_time_ms, 1e-3, &g_max_rel_dt,
+             "decomp_time", ci);
+
+      if (csv) {
+        std::fprintf(csv,
+                     "%zu,%g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%s,%s,%d,%d,"
+                     "%d,%d,%.9g,%.9g,%s\n",
+                     ci, eb, n_ent, c_ent, n_mad, c_mad, n_der, c_der,
+                     AlgoName(n_algo),
+                     (c_algo >= 0 ? AlgoName(c_algo) : "none"), n_quant,
+                     c_quant, n_shuf, c_shuf, n_ratio, p.compression_ratio,
+                     sel_match ? "YES" : "NO");
+      }
+      if (ci < 4 || (ci % 64) == 0 || !sel_match) {
+        std::printf("%-6zu %-8g %-17s %-17s %d/%-5d %d/%-5d %s\n", ci, eb,
+                    AlgoName(n_algo),
+                    (c_algo >= 0 ? AlgoName(c_algo) : "none"), n_quant, c_quant,
+                    n_shuf, c_shuf, sel_match ? "yes" : "*** NO ***");
+      }
     }
   }
 
@@ -362,13 +414,31 @@ int main(int argc, char **argv) {
               g_max_rel_entropy, g_max_rel_mad, g_max_rel_deriv);
   std::printf("  prediction : ratio   %.3g   comp_time %.3g  decomp_time %.3g\n",
               g_max_rel_ratio, g_max_rel_ct, g_max_rel_dt);
-  std::printf("  selection  : %d chunk(s) chose a different algorithm\n",
+  std::printf("  selection  : %d case(s) chose a different config\n",
               g_algo_mismatches);
+
+  // Quantize winners per bound. At eb=0 this must be zero (upstream masks
+  // the quantize half); at every nonzero bound it must be nonzero, otherwise
+  // the sweep never actually reached the quantize configs and the extra
+  // bounds proved nothing beyond what eb=0 already covered.
+  std::printf("  quantize winners per bound:\n");
+  for (size_t bi = 0; bi < kNumBounds; ++bi) {
+    std::printf("    eb=%-8g %4d of %zu chunks\n", kBounds[bi],
+                g_quant_winners[bi], kNumChunks);
+    ++g_checks;
+    if (kBounds[bi] > 0.0 && g_quant_winners[bi] == 0) {
+      std::printf("  [FAIL] eb=%g selected no quantize config in %zu chunks -- "
+                  "the quantize half was never exercised\n",
+                  kBounds[bi], kNumChunks);
+      ++g_failures;
+    }
+  }
 
   if (csv) {
     std::fclose(csv);
     std::printf("\n  full per-chunk table written to "
-                "neuropress_selection_parity.csv (%zu rows)\n", kNumChunks);
+                "neuropress_selection_parity.csv (%zu rows)\n",
+                kNumChunks * kNumBounds);
   }
 
   cudaFree(d_data);
