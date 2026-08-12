@@ -89,7 +89,15 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
                      }),
       candidates.end());
 
-  std::vector<RankedPrediction> ranked = predictor.Rank(data, candidates);
+  // Rank by NeuroPress's own cost model rather than the library default
+  // (ratio only): cost = w0*ct + w1*dt + w2*size/(ratio*bw), minimized.
+  // Selecting on ratio alone picks a codec that squeezes marginally harder
+  // even when it takes far longer to run -- the opposite of what this tier
+  // wants, and not what NeuroPress does.
+  ctp::compress::model::RankingWeights weights;
+  weights.use_cost_model = true;
+  std::vector<RankedPrediction> ranked =
+      predictor.Rank(data, candidates, weights);
 
   std::vector<CompressionStats> results;
   results.reserve(ranked.size());
@@ -101,10 +109,13 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
     auto library_info = ctp::CompressionFactory::GetLibraryInfo(
         static_cast<int>(r.candidate.LibraryConfigId()));
     int wire_id = ctp::CompressionFactory::WireIdForName(library_info.first);
+    // decompress_time_ms_ takes the NN's OWN decompression-time output, not
+    // a copy of the compression time -- they are separate predictions and
+    // the cost model ranks on both.
     results.emplace_back(wire_id, r.candidate.preset_id,
                           r.prediction.compression_ratio,
                           r.prediction.compression_time_ms,
-                          r.prediction.compression_time_ms,
+                          r.prediction.decompression_time_ms,
                           r.prediction.psnr_db);
   }
   return results;

@@ -91,6 +91,15 @@ struct CompressionPrediction {
   double compression_ratio = 0;    /**< Predicted ratio (>1 means smaller) */
   double psnr_db = 0;              /**< Predicted PSNR in dB (0 for lossless) */
   double compression_time_ms = 0; /**< Predicted compression time (ms) */
+  /**
+   * Predicted DEcompression time (ms). The NeuroPress NN emits this as its
+   * own output (index 1, distinct from compression time at index 0) and
+   * ranks with it -- see RankingWeights' cost model. 0 means "not
+   * predicted": models that don't emit it (qtable/linreg/dense-NN) leave it
+   * here, and the cost model treats 0 as "fall back to the compression-time
+   * estimate" rather than as a real zero-cost decompression.
+   */
+  double decompression_time_ms = 0;
   double inference_time_ms = 0;   /**< Model inference latency (ms) */
 
   CompressionPrediction() = default;
@@ -99,6 +108,13 @@ struct CompressionPrediction {
       : compression_ratio(ratio),
         psnr_db(psnr),
         compression_time_ms(compress_time),
+        inference_time_ms(infer_time) {}
+  CompressionPrediction(double ratio, double psnr, double compress_time,
+                        double decompress_time, double infer_time)
+      : compression_ratio(ratio),
+        psnr_db(psnr),
+        compression_time_ms(compress_time),
+        decompression_time_ms(decompress_time),
         inference_time_ms(infer_time) {}
 
   /** @brief Number of predicted outputs (ratio, psnr, time). */
@@ -156,9 +172,58 @@ struct RankingWeights {
   double w_compress_time = 0.0;  /**< Penalty per ms of compression time */
   double w_psnr = 0.0;           /**< Reward per dB of PSNR */
 
+  /**
+   * Cost-model ranking (NeuroPress's own policy, nn_gpu.cu):
+   *
+   *   cost = w0*comp_time + w1*decomp_time + w2*data_size/(ratio*bandwidth)
+   *
+   * and the best candidate is the one MINIMIZING it -- so Score() returns
+   * -cost, keeping "higher score is better" for the shared sort. This
+   * balances the three things that actually cost wall-clock time: producing
+   * the compressed bytes, reading them back, and moving the (now smaller)
+   * bytes to/from storage. Ranking on ratio alone -- the w_ratio default
+   * above -- silently prefers a codec that compresses marginally better but
+   * takes far longer, which is the opposite of what a storage tier wants.
+   *
+   * Off by default so existing callers/models keep the ratio-only behavior;
+   * NeuroPressCandidateStats opts in. Weight and bandwidth defaults mirror
+   * g_rank_w0/w1/w2 (all 1.0) and g_measured_bw_bytes_per_ms (5e6 bytes/ms
+   * = 5 GB/s) from gpucompress_api.cpp.
+   */
+  bool use_cost_model = false;
+  double w_cost_compress_time = 1.0;
+  double w_cost_decompress_time = 1.0;
+  double w_cost_io = 1.0;
+  double bandwidth_bytes_per_ms = 5e6;
+
   double Score(const CompressionPrediction &p) const {
     return w_ratio * p.compression_ratio -
            w_compress_time * p.compression_time_ms + w_psnr * p.psnr_db;
+  }
+
+  /**
+   * Cost-model score for one candidate. `data_size_bytes` is the chunk being
+   * compressed (DataFeatures::chunk_size_bytes). Falls back to Score(p) when
+   * the cost model is off.
+   */
+  double Score(const CompressionPrediction &p, double data_size_bytes) const {
+    if (!use_cost_model) {
+      return Score(p);
+    }
+    // Same policy clamps NeuroPress applies before ranking (nn_gpu.cu):
+    // times floor at 1ms, ratio caps at 100x.
+    double ct = std::max(1.0, p.compression_time_ms);
+    // A model that doesn't predict decompression time reports 0; use the
+    // compression-time estimate rather than scoring it as free.
+    double dt = (p.decompression_time_ms > 0.0)
+                    ? std::max(1.0, p.decompression_time_ms)
+                    : ct;
+    double ratio = std::min(100.0, p.compression_ratio);
+    double bw = (bandwidth_bytes_per_ms > 0.0) ? bandwidth_bytes_per_ms : 1.0;
+    double io_cost = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
+    double cost = w_cost_compress_time * ct + w_cost_decompress_time * dt +
+                  w_cost_io * io_cost;
+    return -cost;  // lower cost is better
   }
 };
 
@@ -298,7 +363,8 @@ class CompressionPredictor {
     std::vector<RankedPrediction> ranked;
     ranked.reserve(candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i) {
-      ranked.push_back({candidates[i], preds[i], weights.Score(preds[i])});
+      ranked.push_back({candidates[i], preds[i],
+                        weights.Score(preds[i], data.chunk_size_bytes)});
     }
     std::sort(ranked.begin(), ranked.end(),
               [](const RankedPrediction &a, const RankedPrediction &b) {

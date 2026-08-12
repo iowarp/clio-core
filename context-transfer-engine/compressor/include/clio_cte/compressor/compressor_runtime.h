@@ -340,10 +340,16 @@ private:
    * @param chunk Pointer to data chunk
    * @param chunk_size Size of chunk in bytes
    * @param context Compression context with parameters
+   * @param out_ranked_by_cost When non-null, set true if the returned stats
+   *   came from NeuroPress and are therefore ALREADY ordered best-first by
+   *   its cost model. Callers must then take element 0 rather than
+   *   re-selecting (BestCompressRatio would re-pick on ratio alone and
+   *   discard the cost ordering, which is the whole point of it).
    * @return Vector of compression statistics for candidate libraries
    */
   std::vector<CompressionStats> EstCompressionStats(
-      const void* chunk, clio::run::u64 chunk_size, const Context& context);
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      bool* out_ranked_by_cost = nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier

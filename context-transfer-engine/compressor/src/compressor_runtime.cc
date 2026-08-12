@@ -316,8 +316,10 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 // ==============================================================================
 
 std::vector<CompressionStats> Runtime::EstCompressionStats(
-    const void* chunk, clio::run::u64 chunk_size, const Context& context) {
+    const void* chunk, clio::run::u64 chunk_size, const Context& context,
+    bool* out_ranked_by_cost) {
   std::vector<CompressionStats> results;
+  if (out_ranked_by_cost) *out_ranked_by_cost = false;
 
   // Determine data type from context
   // context.data_type_: 0 = char/uint8, 1 = float
@@ -367,6 +369,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       neuropress_stats = std::move(filtered);
     }
     if (!neuropress_stats.empty()) {
+      if (out_ranked_by_cost) *out_ranked_by_cost = true;
       HLOG(kDebug,
            "NeuroPress dynamic selection: chunk_size={} entropy={} mad={} "
            "-> top pick wire_id={} ({} candidates ranked)",
@@ -642,7 +645,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     }
 
     // Get compression stats
-    auto stats = EstCompressionStats(chunk_data, chunk_size, context);
+    bool ranked_by_cost = false;
+    auto stats =
+        EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost);
 
     if (stats.empty()) {
       // No valid compression available, disable compression
@@ -664,10 +669,23 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
     }
 
-    // Choose best compression strategy
-    auto [best_tier, best_lib, best_preset, best_time, tier_score] =
-        BestCompressForNode(context, chunk_data, chunk_size, container_id_,
-                            stats);
+    // Choose best compression strategy. When NeuroPress ranked these, the
+    // list is ALREADY best-first under its cost model (comp time + decomp
+    // time + I/O); re-running BestCompressForNode would re-select on ratio
+    // alone and throw that ordering away. Take element 0 instead, which is
+    // what NeuroPress's own action selection does.
+    int best_tier = 0, best_lib = 0, best_preset = 2;
+    double best_time = 0.0;
+    float tier_score = 0.0F;
+    if (ranked_by_cost) {
+      best_lib = stats.front().compress_lib_;
+      best_preset = stats.front().compress_preset_;
+      best_time = stats.front().compress_time_ms_;
+    } else {
+      std::tie(best_tier, best_lib, best_preset, best_time, tier_score) =
+          BestCompressForNode(context, chunk_data, chunk_size, container_id_,
+                              stats);
+    }
 
     // Update context with selected compression library and preset
     context.compress_lib_ = best_lib;

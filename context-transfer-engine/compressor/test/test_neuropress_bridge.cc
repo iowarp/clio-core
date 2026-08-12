@@ -75,12 +75,46 @@ TEST_CASE("NeuroPressCandidateStats ranks GPU candidates for compressible data",
     REQUIRE(name != "");
     REQUIRE(std::isfinite(s.compression_ratio_));
     REQUIRE(s.compression_ratio_ > 0);
+    // Decompression time is the NN's own output (index 1), not a copy of
+    // the compression time (index 0). It used to be aliased, which silently
+    // zeroed out the w1 term of the cost model above.
+    REQUIRE(std::isfinite(s.decompress_time_ms_));
+    REQUIRE(s.decompress_time_ms_ > 0);
   }
 
-  // Best-first: sorted by predicted ratio (default RankingWeights is
-  // ratio-only, so score == ratio).
+  // At least one candidate must show the two times actually differing --
+  // if every one matched, the aliasing bug would be back and the cost
+  // model would be ranking on a duplicated term.
+  bool saw_distinct_decomp_time = false;
+  for (const auto &s : stats) {
+    if (std::fabs(s.decompress_time_ms_ - s.compress_time_ms_) > 1e-6) {
+      saw_distinct_decomp_time = true;
+      break;
+    }
+  }
+  REQUIRE(saw_distinct_decomp_time);
+
+  // Best-first under NeuroPress's OWN cost model, not by ratio: the bridge
+  // opts into RankingWeights::use_cost_model, so the order minimizes
+  // cost = w0*ct + w1*dt + w2*size/(ratio*bw) (nn_gpu.cu). Asserting
+  // descending ratio here would be asserting the pre-Cycle-3 ratio-only
+  // policy, which deliberately no longer holds -- a codec that compresses
+  // marginally better but runs far longer now correctly ranks lower.
+  constexpr double kW0 = 1.0, kW1 = 1.0, kW2 = 1.0;
+  constexpr double kBw = 5e6;  // bytes/ms, mirrors g_measured_bw_bytes_per_ms
+  constexpr double kChunkSize = 4.0 * 1024 * 1024;
+  auto cost_of = [&](const CompressionStats &s) {
+    double ct = std::max(1.0, s.compress_time_ms_);
+    double dt = (s.decompress_time_ms_ > 0.0)
+                    ? std::max(1.0, s.decompress_time_ms_)
+                    : ct;
+    double ratio = std::min(100.0, s.compression_ratio_);
+    return kW0 * ct + kW1 * dt +
+           ((ratio > 0.0) ? kW2 * kChunkSize / (ratio * kBw) : 1e30);
+  };
   for (size_t i = 1; i < stats.size(); ++i) {
-    REQUIRE(stats[i - 1].compression_ratio_ >= stats[i].compression_ratio_);
+    INFO("cost order violated at index " << i);
+    REQUIRE(cost_of(stats[i - 1]) <= cost_of(stats[i]) + 1e-9);
   }
 
   // The GPU action space (nvcomp/cusz/ndzip, wire ids 11-24) must actually

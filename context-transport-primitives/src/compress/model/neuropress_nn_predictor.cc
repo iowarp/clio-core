@@ -444,7 +444,14 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
                           .count() /
                       static_cast<double>(batch.size());
     for (size_t i = 0; i < batch.size(); ++i) {
-      results.emplace_back(ratio[i], psnr[i], comp_time[i], infer_ms);
+      // Policy clamps from NeuroPress's own inference (nn_gpu.cu): times
+      // floor at 1ms, ratio is capped at 100x and floored at 0.1, psnr is
+      // clamped to [0, 120] dB.
+      results.emplace_back(
+          std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
+          std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
+          std::max(1.0, static_cast<double>(comp_time[i])),
+          std::max(1.0, static_cast<double>(decomp_time[i])), infer_ms);
     }
     return results;
   }
@@ -457,11 +464,16 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
     auto y_norm = ForwardPass(x_norm);
     auto y = InverseTransform(y_norm);
 
+    // Same policy clamps as the GPU path above (nn_gpu.cu). y[1] is the
+    // NN's own DEcompression-time output, distinct from y[0]; it is what
+    // the cost model's w1 term ranks on, so it must not be aliased to the
+    // compression time.
     double comp_time = std::max(1.0, static_cast<double>(y[0]));
+    double decomp_time = std::max(1.0, static_cast<double>(y[1]));
     double ratio =
-        std::max(0.001, std::min(100.0, static_cast<double>(y[2])));
-    double psnr = y[3];
-    results.emplace_back(ratio, psnr, comp_time, 0.0);
+        std::max(0.1, std::min(100.0, static_cast<double>(y[2])));
+    double psnr = std::max(0.0, std::min(120.0, static_cast<double>(y[3])));
+    results.emplace_back(ratio, psnr, comp_time, decomp_time, 0.0);
   }
   auto end_time = std::chrono::high_resolution_clock::now();
   double infer_ms = std::chrono::duration<double, std::milli>(
