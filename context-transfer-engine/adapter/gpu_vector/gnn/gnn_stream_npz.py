@@ -18,15 +18,27 @@
 # Print the shape without streaming with --info.
 #
 # NOTE on nesting: the OGB download is a .zip containing raw/data.npz, and an
-# .npz is itself a zip of .npy members. Both layers are opened as streams. A
-# .npy inside an .npz is usually STORED (not deflated), so this reads at disk
-# speed; if it is deflated, Python inflates on the fly and it still never lands
-# on disk.
+# .npz is itself a zip of .npy members -- two zip layers deep.
+#
+# The obvious approach, handing the inner member to zipfile.ZipFile, needs a
+# SEEKABLE view of it, because zipfile reads the central directory at the end.
+# That works only if the inner .npz is STORED in the outer zip. In the real
+# papers100M archive it is DEFLATED, so there is no seekable view without
+# inflating all ~56 GiB to disk first -- which is the flat copy this whole
+# pipeline exists to avoid.
+#
+# So the inner zip is parsed SEQUENTIALLY instead: walk local file headers from
+# the front, and for each .npy member read its numpy header to learn the exact
+# payload length (the local header's size fields are unreliable when the writer
+# used a data descriptor). Nothing seeks backwards, so the outer member can be
+# a plain inflating stream.
 
 import argparse
 import io
+import struct
 import sys
 import zipfile
+import zlib
 
 import numpy as np
 
@@ -45,43 +57,160 @@ def find_npz(zf, want):
     return sorted(cands, key=len)[0]
 
 
-def open_member(path, npz_hint, member):
-    """Return (file_object, close_stack) positioned at the .npy member."""
+def _npy_payload_len(fh):
+    """Read a .npy header from `fh` and return (shape, dtype, payload bytes)."""
+    version = np.lib.format.read_magic(fh)
+    if version[0] == 1:
+        shape, fortran, dtype = np.lib.format.read_array_header_1_0(fh)
+    else:
+        shape, fortran, dtype = np.lib.format.read_array_header_2_0(fh)
+    if fortran:
+        raise SystemExit("fortran-order arrays not supported")
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return shape, dtype, n * dtype.itemsize
+
+
+def _read_exact(fh, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = fh.read(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def _skip(fh, n, blk=1 << 22):
+    while n > 0:
+        got = fh.read(min(blk, n))
+        if not got:
+            raise SystemExit("unexpected EOF while skipping a member")
+        n -= len(got)
+
+
+class Pushback:
+    """Forward-only stream with an unread() buffer.
+
+    Inflating a zip member always over-reads: zlib consumes past the end of the
+    deflate stream and hands the surplus back as unused_data. Those bytes are
+    the next member's header, so they have to go back into the stream.
+    """
+
+    def __init__(self, fh):
+        self._fh, self._buf = fh, b""
+
+    def read(self, n):
+        if not self._buf:
+            return self._fh.read(n)
+        out = self._buf[:n]
+        self._buf = self._buf[len(out):]
+        if len(out) < n:
+            out += self._fh.read(n - len(out)) or b""
+        return out
+
+    def unread(self, b):
+        if b:
+            self._buf = b + self._buf
+
+
+class MemberStream:
+    """Decompressed bytes of one zip member, read forward only."""
+
+    def __init__(self, src, method):
+        self._src = src
+        self._d = zlib.decompressobj(-15) if method == 8 else None
+        self._buf = b""
+        self._eof = False
+
+    def _pump(self):
+        if self._eof:
+            return
+        raw = self._src.read(1 << 20)
+        if not raw:
+            self._eof = True
+            return
+        if self._d is None:
+            self._buf += raw
+            return
+        self._buf += self._d.decompress(raw)
+        if self._d.eof:
+            # Give the surplus back; it belongs to the next local header.
+            self._src.unread(self._d.unused_data)
+            self._eof = True
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            while not self._eof:
+                self._pump()
+            out, self._buf = self._buf, b""
+            return out
+        while len(self._buf) < n and not self._eof:
+            self._pump()
+        out = self._buf[:n]
+        self._buf = self._buf[len(out):]
+        return out
+
+    def drain(self):
+        while not self._eof or self._buf:
+            self._buf = b""
+            if self._eof:
+                break
+            self._pump()
+
+
+def open_inner_sequential(path, npz_hint, member):
+    """Walk the inner .npz forward and stop at `member`'s payload.
+
+    Returns (stream, stack, shape, dtype) with the stream positioned at the
+    first payload byte. Never seeks, so it works when the inner .npz -- and its
+    members -- are deflated, which is what the real papers100M archive is.
+    """
     stack = []
     if path.endswith(".zip"):
         outer = zipfile.ZipFile(path)
         stack.append(outer)
         inner_name = find_npz(outer, npz_hint)
-        log(f"outer zip -> {inner_name}")
-        # ZipFile needs a seekable object; the nested npz must be materialised
-        # in memory only if it is small. OGB's data.npz is huge, so instead we
-        # rely on the outer member being STORED and wrap it with a seekable
-        # view over the outer file handle.
         info = outer.getinfo(inner_name)
-        if info.compress_type != zipfile.ZIP_STORED:
-            raise SystemExit(
-                f"inner {inner_name} is compressed in the outer zip "
-                "(compress_type=%d); cannot stream it seekably. Extract the "
-                "outer zip first, then point --zip at the .npz." %
-                info.compress_type)
-        base = open(path, "rb")
-        stack.append(base)
-        start = info.header_offset
-        base.seek(start)
-        # Skip the local file header to reach the raw member bytes.
-        import struct
+        log(f"outer zip -> {inner_name} "
+            f"({'stored' if info.compress_type == 0 else 'deflated'}, "
+            f"{info.file_size / 2**30:.1f} GiB), parsing sequentially")
+        src = Pushback(outer.open(inner_name))
+    else:
+        fh = open(path, "rb")
+        stack.append(fh)
+        src = Pushback(fh)
+
+    while True:
+        hdr = src.read(30)
+        if len(hdr) < 30:
+            raise SystemExit(f"member '{member}' not found in inner npz")
         sig, ver, flags, comp, t, d, crc, csz, usz, nlen, elen = struct.unpack(
-            "<IHHHHHIIIHH", base.read(30))
+            "<IHHHHHIIIHH", hdr)
+        if sig == 0x02014b50:      # central directory reached
+            raise SystemExit(f"member '{member}' not found in inner npz")
         if sig != 0x04034b50:
-            raise SystemExit("bad local file header in outer zip")
-        base.seek(start + 30 + nlen + elen)
-        view = SubFile(base, base.tell(), info.file_size)
-        inner = zipfile.ZipFile(view)
-        stack.append(inner)
-        return inner, stack
-    inner = zipfile.ZipFile(path)
-    stack.append(inner)
-    return inner, stack
+            raise SystemExit(f"bad local header signature {sig:#x}")
+        name = src.read(nlen).decode()
+        if elen:
+            src.read(elen)
+
+        ms = MemberStream(src, comp)
+        key = name[:-4] if name.endswith(".npy") else name
+        if key == member:
+            shape, dtype, _ = _npy_payload_len(ms)
+            return ms, stack, shape, dtype
+
+        log(f"  skipping member {name}")
+        ms.drain()
+        # A writer that used a data descriptor leaves 12 or 16 bytes after the
+        # payload; peek and consume only if the optional signature is there.
+        tail = src.read(4)
+        if tail and struct.unpack("<I", tail)[0] == 0x08074b50:
+            src.read(12)
+        else:
+            src.unread(tail)
 
 
 class SubFile(io.RawIOBase):
@@ -138,57 +267,41 @@ def main():
                     help="print shape/dtype and exit without streaming")
     args = ap.parse_args()
 
-    zf, stack = open_member(args.zip, args.npz, args.member)
-    names = zf.namelist()
-    target = None
-    for n in names:
-        if n[:-4] == args.member or n == args.member + ".npy":
-            target = n
+    fh, stack, shape, dtype = open_inner_sequential(args.zip, args.npz,
+                                                    args.member)
+    out_dtype = np.dtype(args.dtype) if args.dtype else dtype
+    rows = shape[0]
+    if args.max_rows > 0:
+        rows = min(rows, args.max_rows)
+    cols = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+    total_out = rows * cols * out_dtype.itemsize
+    log(f"member={args.member} shape={shape} dtype={dtype} -> {out_dtype}"
+        + (f"  (limited to first {rows} rows)" if args.max_rows else ""))
+    log(f"streaming {total_out} bytes ({total_out / 2**30:.2f} GiB)")
+    if args.info:
+        print(f"{rows} {cols} {dtype} {out_dtype} {total_out}")
+        return
+
+    row_bytes = cols * dtype.itemsize
+    chunk = max(1, args.rows_per_chunk)
+    done = 0
+    out = sys.stdout.buffer
+    while done < rows:
+        take = min(chunk, rows - done)
+        raw = _read_exact(fh, row_bytes * take)
+        if not raw:
             break
-    if target is None:
-        raise SystemExit(f"member '{args.member}' not in {sorted(names)}")
-
-    with zf.open(target) as fh:
-        version = np.lib.format.read_magic(fh)
-        if version[0] == 1:
-            shape, fortran, dtype = np.lib.format.read_array_header_1_0(fh)
-        else:
-            shape, fortran, dtype = np.lib.format.read_array_header_2_0(fh)
-        if fortran:
-            raise SystemExit("fortran-order arrays not supported")
-        out_dtype = np.dtype(args.dtype) if args.dtype else dtype
-        rows = shape[0]
-        if args.max_rows > 0:
-            rows = min(rows, args.max_rows)
-        cols = int(np.prod(shape[1:])) if len(shape) > 1 else 1
-        total_out = rows * cols * out_dtype.itemsize
-        log(f"member={target} shape={shape} dtype={dtype} -> {out_dtype}"
-            + (f"  (limited to first {rows} rows)" if args.max_rows else ""))
-        log(f"streaming {total_out} bytes ({total_out / 2**30:.2f} GiB)")
-        if args.info:
-            print(f"{rows} {cols} {dtype} {out_dtype} {total_out}")
-            return
-
-        row_bytes = cols * dtype.itemsize
-        chunk = max(1, args.rows_per_chunk)
-        done = 0
-        out = sys.stdout.buffer
-        while done < rows:
-            take = min(chunk, rows - done)
-            raw = fh.read(row_bytes * take)
-            if not raw:
-                break
-            arr = np.frombuffer(raw, dtype=dtype)
-            if out_dtype != dtype:
-                arr = arr.astype(out_dtype, copy=False)
-            out.write(arr.tobytes())
-            done += take
-            if (done // chunk) % 64 == 0:
-                log(f"  {done}/{rows} rows ({100.0 * done / rows:.1f}%)")
-        out.flush()
-        log(f"done: {done}/{rows} rows")
-        if done != rows:
-            raise SystemExit(f"short stream: {done} of {rows} rows")
+        arr = np.frombuffer(raw, dtype=dtype)
+        if out_dtype != dtype:
+            arr = arr.astype(out_dtype, copy=False)
+        out.write(arr.tobytes())
+        done += take
+        if (done // chunk) % 64 == 0:
+            log(f"  {done}/{rows} rows ({100.0 * done / rows:.1f}%)")
+    out.flush()
+    log(f"done: {done}/{rows} rows")
+    if done != rows:
+        raise SystemExit(f"short stream: {done} of {rows} rows")
 
     for s in reversed(stack):
         try:
