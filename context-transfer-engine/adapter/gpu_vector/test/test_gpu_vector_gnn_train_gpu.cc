@@ -281,13 +281,40 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   // shared synthetic fallback -- see gnn_dataset.h. Training on synthetic data
   // still proves what this test asserts (the streamed run tracks the in-core
   // run exactly); only the accuracy numbers need the real thing.
-  gnn_test::Dataset ds =
-      gnn_test::LoadOrSynthDataset(dir, "TRAIN", "agg_features.f32");
+  // STREAM MODE. At papers100M the aggregated matrix is 53 GiB, so the host
+  // copy this test normally makes (ds.feat, then A0 on top of it) is not
+  // merely wasteful, it is impossible -- two copies would be 106 GiB. With
+  // CLIO_GNN_INGEST_FILE set the matrix is never held in host memory at all:
+  // it is paged from the file straight into the CTE, and the shape comes from
+  // the environment instead of from a loaded array.
+  const char *ingest_file = std::getenv("CLIO_GNN_INGEST_FILE");
+  gnn_test::Dataset ds;
+  if (ingest_file == nullptr) {
+    ds = gnn_test::LoadOrSynthDataset(dir, "TRAIN", "agg_features.f32");
+  } else {
+    ds.N = EnvI64("CLIO_GNN_NODES", 0);
+    ds.F = (int)EnvI64("CLIO_GNN_DIM", 0);
+    ds.C = (int)EnvI64("CLIO_GNN_CLASSES", 0);
+    ds.real = true;
+    REQUIRE(ds.N > 0);
+    REQUIRE(ds.F > 0);
+    REQUIRE(ds.C > 0);
+    // Labels are N x 8 bytes (papers100M: 888 MiB) -- small enough to hold.
+    if (const char *lf = std::getenv("CLIO_GNN_LABELS_FILE")) {
+      REQUIRE(gnn_test::ReadFileQuiet(lf, ds.labels));
+    } else {
+      ds.labels.resize((size_t)(ds.N * (std::int64_t)sizeof(std::int64_t)));
+      auto *lw = reinterpret_cast<std::int64_t *>(ds.labels.data());
+      for (std::int64_t i = 0; i < ds.N; ++i) lw[i] = i % ds.C;
+    }
+  }
   clio::run::u64 N0 = (clio::run::u64)ds.N, E0 = (clio::run::u64)ds.E;
   int F = ds.F, C = ds.C;
   REQUIRE(N0 > 0);
   REQUIRE(C <= kMaxC);
-  std::fprintf(stderr, "[TRAIN] source=%s N=%llu F=%d C=%d\n", ds.SourceName(),
+  std::fprintf(stderr, "[TRAIN] source=%s N=%llu F=%d C=%d\n",
+               ingest_file != nullptr ? "STREAMED (external ingest)"
+                                      : ds.SourceName(),
                (unsigned long long)N0, F, C);
   const int H = std::getenv("CLIO_GNN_HIDDEN") ? std::atoi(std::getenv("CLIO_GNN_HIDDEN")) : 64;
   REQUIRE(H <= kMaxH);
@@ -329,13 +356,19 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       "[TRAIN] A=%lluMiB (%llu nodes x %d-d agg, %s tiled)  F=%d H=%d C=%d  "
       "epochs=%d lr=%.3f  GPU free=%zuMiB  window=%u pages (peak %lluMiB)\n",
       (unsigned long long)(dataset_bytes >> 20), (unsigned long long)N, F,
-      ds.real ? "real" : "SYNTHETIC", F, H, C,
+      ingest_file != nullptr ? "streamed"
+                             : (ds.real ? "real" : "SYNTHETIC"), F, H, C,
       epochs, lr, gfree >> 20, window, (unsigned long long)(2ull * window * page_size >> 20));
 
   // ---- Load aggregated features + labels (host), tiled ----
-  std::vector<float> A0(N0 * (clio::run::u64)F);
-  REQUIRE(ds.feat.size() >= A0.size() * sizeof(float));
-  std::memcpy(A0.data(), ds.feat.data(), A0.size() * sizeof(float));
+  // A0 exists only in the non-stream path; see the note at the load above.
+  std::vector<float> A0;
+  if (ingest_file == nullptr) {
+    A0.resize(N0 * (clio::run::u64)F);
+    REQUIRE(ds.feat.size() >= A0.size() * sizeof(float));
+    std::memcpy(A0.data(), ds.feat.data(), A0.size() * sizeof(float));
+    std::vector<char>().swap(ds.feat);  // drop the loader's copy immediately
+  }
   std::vector<long long> lab0(N0);
   REQUIRE(ds.labels.size() >= N0 * sizeof(long long));
   std::memcpy(lab0.data(), ds.labels.data(), N0 * sizeof(long long));
@@ -496,13 +529,27 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
 
   // =========================== IN-CORE baseline ===========================
   std::vector<double> base_loss(epochs), base_acc(epochs), base_vacc(epochs);
-  std::string base_status = "OOM"; double base_time = -1.0;
+  std::string base_status = (ingest_file != nullptr) ? "N/A(stream)" : "OOM";
+  double base_time = -1.0;
   {
     size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
     float *d_all = nullptr; cudaError_t al = cudaErrorMemoryAllocation;
-    if (dataset_bytes + (size_t(384) << 20) < fb) al = cudaMalloc(&d_all, dataset_bytes);
+    // In stream mode there is no host copy to upload from, so the in-core
+    // baseline is not merely too big -- it is unavailable. Report it as such
+    // rather than pretending it OOM'd on GPU memory.
+    if (A0.empty()) {
+      al = cudaErrorMemoryAllocation;
+    } else if (dataset_bytes + (size_t(384) << 20) < fb) {
+      al = cudaMalloc(&d_all, dataset_bytes);
+    }
     if (al != cudaSuccess) {
       cudaGetLastError();
+      if (ingest_file != nullptr) {
+        std::fprintf(stderr,
+                     "[TRAIN] IN-CORE: SKIPPED -- stream mode keeps no host "
+                     "copy to upload, so there is no in-core run to compare "
+                     "against. This is NOT an out-of-memory result.\n");
+      } else
       std::fprintf(stderr, "[TRAIN] IN-CORE: *** OOM *** cannot place %lluMiB A resident.\n",
                    (unsigned long long)(dataset_bytes >> 20));
     } else {
@@ -547,11 +594,27 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   clio::run::u64 hbm0 = h0->remaining_size_, dram0 = r0->remaining_size_;
 
   std::vector<float> pagebuf(epp);
+  std::FILE *ing = nullptr;
+  if (ingest_file != nullptr) {
+    ing = std::fopen(ingest_file, "rb");
+    REQUIRE(ing != nullptr);
+    std::fprintf(stderr, "[TRAIN] streaming pages from %s\n", ingest_file);
+  }
   double store_t0 = NowSec();
   for (clio::run::u64 p = 0; p < K; ++p) {
-    // Tile A into this page (host buffer; zstd is CPU-side).
-    clio::run::u64 start = p * epp;
-    for (clio::run::u64 i = 0; i < epp; ++i) pagebuf[i] = A0[(start + i) % file_elems];
+    if (ing != nullptr) {
+      // Read one page straight from the stream; nothing else is retained.
+      const size_t want = (size_t)(epp * sizeof(float));
+      const size_t got = std::fread(pagebuf.data(), 1, want, ing);
+      if (got < want) {
+        std::memset(reinterpret_cast<char *>(pagebuf.data()) + got, 0,
+                    want - got);
+      }
+    } else {
+      // Tile A into this page (host buffer; zstd is CPU-side).
+      clio::run::u64 start = p * epp;
+      for (clio::run::u64 i = 0; i < epp; ++i) pagebuf[i] = A0[(start + i) % file_elems];
+    }
     ctp::ipc::ShmPtr<> dp; dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
     dp.off_ = reinterpret_cast<clio::run::u64>(pagebuf.data());
     // The vector's fault path asks for "p<page_num>" (PageBlobName in page.h).
@@ -561,6 +624,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     auto pf = comp.AsyncPutBlob(tag_id, name, 0ull, page_size, dp, 0.5f, ctx, 0, clio::run::PoolQuery::Local());
     pf.Wait(); REQUIRE(pf->GetReturnCode() == 0);
   }
+  if (ing != nullptr) std::fclose(ing);
   double store_dt = NowSec() - store_t0;
   auto h1s = hbm_bdev.AsyncGetStats(); h1s.Wait(); auto r1s = dram_bdev.AsyncGetStats(); r1s.Wait();
   clio::run::u64 hbm_used = hbm0 >= h1s->remaining_size_ ? hbm0 - h1s->remaining_size_ : 0;
@@ -632,6 +696,13 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
                    e, base_loss[e], base_acc[e], et_loss[e], et_acc[e]);
     REQUIRE(exact == "BIT-EXACT");
   } else {
+    if (ingest_file != nullptr)
+      std::fprintf(stderr, "[TRAIN] in-core SKIPPED (stream mode) -> trained the "
+                   "%lluMiB matrix straight from the vector. Final train_acc=%.4f "
+                   "val_acc=%.4f\n",
+                   (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1],
+                   et_vacc[epochs - 1]);
+    else
     std::fprintf(stderr, "[TRAIN] in-core OOM'd -> Eternia is the ONLY method that TRAINED this "
                  "%lluMiB feature matrix. Final train_acc=%.4f val_acc=%.4f\n",
                  (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1], et_vacc[epochs - 1]);
