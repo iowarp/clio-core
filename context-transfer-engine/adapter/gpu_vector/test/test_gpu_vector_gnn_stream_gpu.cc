@@ -66,6 +66,8 @@
 #include <thread>
 #include <vector>
 
+#include <clio_cte/core/core_tasks.h>
+
 #include "gnn_dataset.h"
 
 namespace gv = clio::cte::gpu_vector;
@@ -231,6 +233,54 @@ void EnsureInit() {
   g_initialized = true;
 }
 
+/**
+ * Store a raw float32 stream into `tag` as vector pages, in this process.
+ *
+ * Same page naming and codec context as the standalone gnn_ingest tool; it
+ * exists here too because a GPU process must own the runtime (see the call
+ * site), so it cannot delegate the load to the daemon that gnn_ingest targets.
+ */
+bool IngestFromFile(const char *path, const clio::cte::core::TagId &tag,
+                    u64 page_bytes, int codec, int preset, u64 want_pages) {
+  std::FILE *f = std::fopen(path, "rb");
+  if (f == nullptr) {
+    std::fprintf(stderr, "[GNN-STREAM] cannot open ingest file %s\n", path);
+    return false;
+  }
+  clio::cte::core::Client comp(CompressorPool());
+  clio::cte::core::Context ctx;
+  ctx.dynamic_compress_ = 1;
+  ctx.compress_lib_ = codec;
+  ctx.compress_preset_ = preset;
+  ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
+  if (buf.IsNull()) { std::fclose(f); return false; }
+
+  u64 pg = 0;
+  bool ok = true;
+  for (; pg < want_pages; ++pg) {
+    size_t got = std::fread(buf.ptr_, 1, (size_t)page_bytes, f);
+    if (got == 0) break;
+    if (got < page_bytes) std::memset(buf.ptr_ + got, 0, page_bytes - got);
+    char name[32];
+    clio::cte::gpu_vector::PageBlobName(pg, name);
+    auto pf = comp.AsyncPutBlob(tag, name, (u64)0, page_bytes,
+                                buf.shm_.template Cast<void>(), 0.5f, ctx, 0,
+                                clio::run::PoolQuery::Local());
+    pf.Wait();
+    if (pf->GetReturnCode() != 0) {
+      std::fprintf(stderr, "[GNN-STREAM] ingest page %llu rc=%d\n",
+                   (unsigned long long)pg, pf->GetReturnCode());
+      ok = false;
+      break;
+    }
+  }
+  CLIO_IPC->FreeBuffer(buf);
+  std::fclose(f);
+  std::fprintf(stderr, "[GNN-STREAM] ingested %llu/%llu pages from %s\n",
+               (unsigned long long)pg, (unsigned long long)want_pages, path);
+  return ok && pg == want_pages;
+}
+
 /** Run a yieldable kernel to completion (re-launch until no block is pending). */
 template <typename LaunchT>
 u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
@@ -255,6 +305,23 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
                                    : "/workspace/data/ogb/arxiv";
   gnn_test::Dataset ds = gnn_test::LoadOrSynthDataset(data_dir, "GNN-STREAM");
   REQUIRE(ds.N > 0);
+
+  // In end-to-end mode the in-core baseline must be the bytes that were
+  // INGESTED, not the ones this test would have generated -- otherwise the
+  // comparison is against a different matrix and the bit-exact assert fails
+  // for reasons that have nothing to do with the vector.
+  if (const char *ing = std::getenv("CLIO_GNN_INGEST_FILE")) {
+    std::FILE *f = std::fopen(ing, "rb");
+    REQUIRE(f != nullptr);
+    const size_t want = (size_t)ds.FeatBytes();
+    ds.feat.assign(want, 0);
+    const size_t got = std::fread(ds.feat.data(), 1, want, f);
+    std::fclose(f);
+    std::fprintf(stderr,
+                 "[GNN-STREAM] baseline taken from ingest file (%zu of %zu B)\n",
+                 got, want);
+    REQUIRE(got == want);
+  }
   REQUIRE(ds.F > 0);
   REQUIRE(ds.C > 0);
 
@@ -265,6 +332,9 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
                     : kHidden;
   const std::int64_t feat_elems = ds.FeatElems();
   const std::int64_t logical_bytes = ds.FeatBytes();
+  // When set, the feature matrix is loaded from this raw float32 file instead
+  // of being generated and written by a kernel -- the end-to-end path.
+  const char *ingest_file = std::getenv("CLIO_GNN_INGEST_FILE");
   const int codec = (int)EnvI64("CLIO_GNN_COMPRESS_LIB", 10);      // ZSTD
   const int preset = (int)EnvI64("CLIO_GNN_COMPRESS_PRESET", 2);   // BALANCED
   std::fprintf(stderr,
@@ -369,13 +439,33 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
 
     ctp::GpuApi::Synchronize();
     double t0 = NowSec();
-    RunYieldable(nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                              gy::YieldStackView sv) {
-      VecFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu_info, vec.GetDevice(0), d_src, elems_per_block, vw, sv);
-    });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    if (ingest_file != nullptr) {
+      // END-TO-END MODE. The matrix is loaded from an external raw stream --
+      // whatever gnn_stream_npz.py produced -- instead of being written by a
+      // kernel, so this exercises the same path the papers100M load takes.
+      //
+      // It has to happen in THIS process: the GPU queues are only ever created
+      // by ServerInitGpuQueues, there is no client-side attach, so a process
+      // that faults on the GPU must host the runtime itself. Loading via a
+      // separate daemon and then attaching from the GPU side is not possible.
+      REQUIRE(IngestFromFile(ingest_file, vec.TagId(), page_bytes, codec,
+                             preset, pages_total));
+    } else {
+      RunYieldable(nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+        VecFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu_info, vec.GetDevice(0), d_src, elems_per_block, vw, sv);
+      });
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    }
     t_store = NowSec() - t0;
+    if (ingest_file != nullptr) {
+      // Stored sizes must be published before a compressed page can be
+      // fetched with its true (encoded) length.
+      for (int a = 0; a < 50 && vec.PublishStoredSizes() < pages_total; ++a) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
 
     // Wipe the destination so a drain that silently does nothing cannot pass
     // by leaving the baseline bytes in place.
