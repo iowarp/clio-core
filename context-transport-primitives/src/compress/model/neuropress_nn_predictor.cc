@@ -260,10 +260,21 @@ std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
   int base_id = static_cast<int>(features.library_config_id) / 10;
   float algo_id = static_cast<float>(NeuroPressAlgoIdForBaseId(base_id));
 
+  // Lossless configs carry a SENTINEL error bound of 1e-7, not 0. That is
+  // how the model was trained -- neural_net/core/configs.py:44,
+  // `eb_val = eb if quant else 1e-7` -- and nn_gpu.cu:138-144 repeats it at
+  // inference with the comment "training used 1e-7 sentinel for lossless
+  // (quant==0). Inference must match -- do not pass raw 0.0 for lossless
+  // configs." Passing 0.0 put input 3 about 2.4e-6 standard deviations off
+  // upstream's value for every lossless candidate, which is every candidate
+  // Clio ranks.
+  const float error_bound_enc =
+      features.quantize ? static_cast<float>(features.error_bound) : 1e-7f;
+
   return {algo_id,
           static_cast<float>(features.quantize),      // quant preprocessor
           static_cast<float>(features.byte_shuffle),  // shuffle preprocessor
-          static_cast<float>(features.error_bound),   // lossy/quant bound
+          error_bound_enc,                            // lossy/quant bound
           static_cast<float>(features.chunk_size_bytes),
           static_cast<float>(features.shannon_entropy),
           static_cast<float>(features.mad),

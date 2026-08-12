@@ -1129,9 +1129,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // threshold (default 50%, g_exploration_threshold), actually
         // compress the SAME chunk with up to K alternative candidates (the
         // next-best predicted ones, skipping whichever was used for the
-        // real, stored compress) purely to generate more real-outcome
-        // training samples. Never stored or returned -- the primary's
-        // already-persisted result stays authoritative. Simplified from the
+        // real, stored compress). This serves two purposes upstream, and now
+        // both here: it generates real-outcome training samples, AND any
+        // alternative that turns out cheaper than the primary REPLACES the
+        // stored result (see the adoption block after the loop). Simplified from the
         // original's parallel-CUDA-stream implementation to Clio's own
         // synchronous per-candidate Compress() call: same data flow and
         // training outcome, sequential rather than stream-parallel --
@@ -1160,9 +1161,25 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           double best_cost = actual_cost;  // seeded with the primary's own
 
           // Device shuffle scratch for the explored candidates; released
-          // together once the loop is done (exploration output is discarded,
-          // so nothing outlives this scope).
+          // together once the loop is done.
           std::vector<ctp::ipc::AllocatorId> explore_gpu_scratch;
+
+          // Best explored alternative so far, if any beat the primary.
+          // Upstream rewrites the output buffer in place each time it finds
+          // a cheaper action (gpucompress_compress.cpp:912+ "Write winner to
+          // output"), so successive winners simply overwrite one another and
+          // the final buffer holds the cheapest. Clio's blob is already
+          // persisted by AsyncCompress before exploration runs, so the same
+          // observable outcome is reached by remembering the best and
+          // re-storing once after the loop -- upstream's intermediate writes
+          // land in a local buffer nothing can observe.
+          bool have_winner = false;
+          std::vector<char> winner_payload;
+          int winner_lib = 0;
+          uint32_t winner_preset_id = 0;
+          uint32_t winner_shuffle = 0;
+          double winner_ratio = 0.0;
+          double winner_time_ms = 0.0;
 
           for (const auto* alt : alternatives) {
             std::string alt_name =
@@ -1252,9 +1269,40 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
             double alt_ratio = static_cast<double>(chunk_size) /
                                static_cast<double>(alt_compressed_size);
+            // Decompression time is the PRIMARY's prediction, held constant
+            // across every alternative -- upstream passes the same pred_dt
+            // to compute_cost for each explored slot
+            // (gpucompress_compress.cpp:904-905, "decomp_time uses NN
+            // prediction (no decomp at write)"), because nothing is
+            // decompressed at write time so no alternative has a measured
+            // value either. Using each candidate's OWN predicted dt instead
+            // let a difference the exploration never measured move the
+            // ranking, and skewed the regret figure derived from it.
             double alt_cost =
-                cost(alt_time_ms, alt->decompress_time_ms_, alt_ratio);
-            if (alt_cost < best_cost) best_cost = alt_cost;
+                cost(alt_time_ms, predicted->decompress_time_ms_, alt_ratio);
+            if (alt_cost < best_cost) {
+              best_cost = alt_cost;
+              // Adopt it. Upstream's only condition here is that the winner
+              // fits the caller's output buffer; Clio additionally requires
+              // it to still beat storing the bytes raw, because unlike
+              // upstream Clio HAS a raw path (Compress()'s "not beneficial"
+              // branch) and must not replace a raw blob with something
+              // larger than the original.
+              const size_t winner_total =
+                  alt_compressed_size + sizeof(CompressionHeader);
+              if (winner_total < chunk_size) {
+                have_winner = true;
+                winner_payload.assign(
+                    alt_output.begin(),
+                    alt_output.begin() +
+                        static_cast<long>(alt_compressed_size));
+                winner_lib = alt->compress_lib_;
+                winner_preset_id = alt_preset_id;
+                winner_shuffle = alt_applied_shuffle;
+                winner_ratio = alt_ratio;
+                winner_time_ms = alt_time_ms;
+              }
+            }
 
             int alt_base_id = -1;
             for (const auto& entry :
@@ -1299,6 +1347,108 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             }
           }
           explore_gpu_scratch.clear();
+
+          // ---- Adopt the winner (upstream's "Write winner to output") ----
+          // When exploration finds a cheaper action than the one that was
+          // actually used, upstream does NOT merely learn from it: it
+          // replaces the stored result, rewriting the header (algorithm,
+          // shuffle size, original and compressed sizes), the payload, the
+          // reported output size, actual_ratio, algo_to_use and preproc_to_use
+          // (gpucompress_compress.cpp:912-966). The exploration is a real
+          // second chance at the write, not just a source of training data.
+          //
+          // Clio's primary blob is already persisted by the time we get here,
+          // so adopting means storing the winner over it -- a whole-blob put
+          // at the same offset, exactly what the primary itself did. The
+          // Context is updated the same way upstream updates its diagnostics
+          // state, so what the blob records matches what it now contains.
+          if (have_winner) {
+            const size_t hdr_size = sizeof(CompressionHeader);
+            const size_t winner_total = winner_payload.size() + hdr_size;
+            CompressionHeader winner_header(
+                static_cast<uint32_t>(winner_lib),
+                PackPreset(winner_preset_id, winner_shuffle), chunk_size,
+                winner_payload.size());
+
+            auto winner_shm = CLIO_IPC->AllocateBuffer(winner_total);
+            if (winner_shm.IsNull()) {
+              HLOG(kWarning,
+                   "NeuroPress explore: winner found but SHM allocation "
+                   "failed; keeping the primary's stored result");
+            } else {
+              std::memcpy(winner_shm.ptr_, &winner_header, hdr_size);
+              std::memcpy(winner_shm.ptr_ + hdr_size, winner_payload.data(),
+                          winner_payload.size());
+
+              Context winner_ctx = context;
+              winner_ctx.compress_lib_ = winner_lib;
+              winner_ctx.compress_preset_ =
+                  static_cast<int>(PackPreset(winner_preset_id, winner_shuffle));
+              winner_ctx.transform_flags_ |=
+                  clio::cte::core::kBlobTransformed |
+                  clio::cte::core::kBlobTransformCompressed;
+
+              auto winner_put = core_client_->AsyncPutBlob(
+                  task->tag_id_, task->blob_name_.str(), task->offset_,
+                  winner_total, winner_shm.shm_.template Cast<void>(),
+                  task->score_, winner_ctx, task->flags_,
+                  clio::run::PoolQuery::Local());
+              CLIO_CO_AWAIT(winner_put);
+              const int winner_rc = winner_put->return_code_;
+              CLIO_IPC->FreeBuffer(winner_shm);
+
+              if (winner_rc != 0) {
+                // The primary's blob is still intact -- a failed overwrite
+                // leaves the earlier whole-blob put in place -- so this is a
+                // missed improvement, not a lost blob.
+                HLOG(kWarning,
+                     "NeuroPress explore: winner put failed (rc={}); keeping "
+                     "the primary's stored result",
+                     winner_rc);
+              } else {
+                task->context_ = winner_ctx;
+                task->context_.actual_original_size_ = chunk_size;
+                task->context_.actual_compressed_size_ = winner_total;
+                task->context_.actual_compression_ratio_ = winner_ratio;
+                task->context_.actual_compress_time_ms_ = winner_time_ms;
+                // The stored bytes are now the winner's, so the features the
+                // deferred decomp head will join a later read against must
+                // describe the winner, not the primary.
+                ctp::compress::model::DataFeatures win_data;
+                win_data.chunk_size_bytes = static_cast<double>(chunk_size);
+                win_data.shannon_entropy = neuropress_entropy;
+                win_data.mad = neuropress_mad;
+                win_data.second_derivative_mean = neuropress_second_deriv;
+                win_data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
+                win_data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
+                int win_base_id = -1;
+                std::string win_name =
+                    ctp::CompressionFactory::NameForWireId(winner_lib);
+                for (const auto& entry :
+                     ctp::compress::model::KnownCompressors()) {
+                  if (win_name == entry.name) {
+                    win_base_id = entry.base_id;
+                    break;
+                  }
+                }
+                if (win_base_id >= 0) {
+                  ctp::compress::model::CandidateConfig win_candidate;
+                  win_candidate.base_id = win_base_id;
+                  win_candidate.preset_id = static_cast<int>(winner_preset_id);
+                  win_candidate.byte_shuffle = winner_shuffle != 0;
+                  win_candidate.library_name = win_name;
+                  RecordDecompFeatures(
+                      task->blob_name_.str(),
+                      ctp::compress::model::MakeCompressionFeatures(
+                          win_data, win_candidate));
+                }
+                HLOG(kDebug,
+                     "NeuroPress explore: adopted {} (ratio={} time={}ms) over "
+                     "the primary",
+                     win_name, winner_ratio, winner_time_ms);
+              }
+            }
+          }
 
           if (!explore_features.empty()) {
             bool explore_trained =
