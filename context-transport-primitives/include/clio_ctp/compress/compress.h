@@ -66,6 +66,25 @@ inline void *GetGpuCodecStream() {
   return tls != nullptr ? tls : GpuCodecStreamProcess();
 }
 
+/**
+ * The thread override ONLY -- never the process-wide default.
+ *
+ * A codec may adopt the thread override safely: the runtime sets it
+ * immediately before the call and inside the same CUDA context the stream was
+ * created in. The PROCESS-WIDE stream is not safe to adopt, because it is
+ * codec_slots_[0].stream, created inside the compressor's dedicated codec
+ * CUcontext. Using it from a caller running in the primary context (which is
+ * where CompressIntoShm runs) silently breaks the transfers issued on it: the
+ * H2D of the input never lands, the codec compresses ZEROS, and the result is
+ * a compression ratio that is IDENTICAL for every error bound -- 120.471x at
+ * both eb 1e-2 and 1e-3, which is how this was caught, since no lossy codec's
+ * ratio can be invariant to a 10x change in bound.
+ *
+ * A codec with no thread override must create its own stream in whatever
+ * context it was called from.
+ */
+inline void *GetGpuCodecStreamThreadOnly() { return GpuCodecStreamThread(); }
+
 class Compressor {
  public:
   Compressor() = default;

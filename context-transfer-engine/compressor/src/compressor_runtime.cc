@@ -2181,16 +2181,22 @@ bool Runtime::LaunchDecompBatch(
       for (auto &pd : owners) {
         bool gok = false;
         if (codec && pd->stored_size > ghdr) {
+          // PREFER THE DEVICE-RESIDENT IMAGE. With a host source the codec
+          // has to cudaMalloc a device buffer and stage the bytes H2D on
+          // every page, and those allocations starve against the gather
+          // kernel's relaunch loop -- measured 22 decodes in 280s (~12s
+          // each). Device in / device out makes the codec allocate nothing
+          // and keeps a kHBM fault device-to-device, which is the point.
           CompressionHeader h;
           const void *src = nullptr;
-          if (!pd->stored_bytes.empty()) {
+          if (pd->src_device != nullptr &&
+              cudaMemcpyAsync(&h, pd->src_device, ghdr, cudaMemcpyDeviceToHost,
+                              stream) == cudaSuccess &&
+              cudaStreamSynchronize(stream) == cudaSuccess) {
+            src = pd->src_device;
+          } else if (!pd->stored_bytes.empty()) {
             std::memcpy(&h, pd->stored_bytes.data(), ghdr);
             src = pd->stored_bytes.data();
-          } else if (cudaMemcpyAsync(&h, pd->src_device, ghdr,
-                                     cudaMemcpyDeviceToHost,
-                                     stream) == cudaSuccess &&
-                     cudaStreamSynchronize(stream) == cudaSuccess) {
-            src = pd->src_device;
           }
           if (src != nullptr && h.IsValid()) {
             const size_t payload =

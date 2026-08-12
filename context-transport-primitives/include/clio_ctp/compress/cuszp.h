@@ -125,7 +125,7 @@ class Cuszp : public Compressor {
     // device-to-device fault path the compressor runtime has already handed
     // us a slot stream via SetGpuStreamForThread.
     bool own_stream = false;
-    stream = static_cast<cudaStream_t>(GetGpuCodecStream());
+    stream = static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
     if (stream == nullptr && (own_stream = true) &&
         cudaStreamCreate(&stream) != cudaSuccess) {
       return false;
@@ -215,7 +215,7 @@ class Cuszp : public Compressor {
     // device-to-device fault path the compressor runtime has already handed
     // us a slot stream via SetGpuStreamForThread.
     bool own_stream = false;
-    stream = static_cast<cudaStream_t>(GetGpuCodecStream());
+    stream = static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
     if (stream == nullptr && (own_stream = true) &&
         cudaStreamCreate(&stream) != cudaSuccess) {
       return false;
