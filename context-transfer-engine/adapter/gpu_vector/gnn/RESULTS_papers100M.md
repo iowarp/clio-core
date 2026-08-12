@@ -75,13 +75,16 @@ during a single epoch, which exhausted the machine twice. Reading through
 `at()` instead removed it: epoch time fell 32% (409 s -> 279 s) and segment
 growth went to zero.
 
-That change is REVERTED, because it is unsafe today. A dirty page is skipped as
-an eviction victim (the !pgi.dirty test in ClaimSlot), so marking every page
-dirty incidentally made pages non-evictable while lanes still held them. With
-clean pages the slot can be claimed and refilled underneath a lane that is
-still reading, and the sweep returns wrong bytes. The writeback traffic was
-paying for correctness without anyone realising. Restoring at() requires making
-eviction safe against concurrent readers first.
+That change is REVERTED, because it is unsafe today: at() fails bit-exactness
+in 2 of 3 runs where operator[] passes 3 of 3. That much is measured.
+
+The MECHANISM IS NOT ESTABLISHED. The plausible reading is that a dirty page is
+skipped as an eviction victim (the !pgi.dirty test in ClaimSlot), so dirtying
+every page incidentally pins it while lanes still hold it. Against that
+reading: HoldPageYield syncs all lanes before thread 0 evicts, and each block
+owns its own page table, so the obvious intra-block race should already be
+excluded. Restoring at() needs the failure reproduced under instrumentation
+first -- not a fix aimed at this guess.
 
 A residual remains: on compressible data the read path still decompresses, and
 those allocations grow ~2.5 segments per epoch at 10M rows. It does not appear
