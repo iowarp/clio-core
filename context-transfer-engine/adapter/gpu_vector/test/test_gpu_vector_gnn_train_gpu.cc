@@ -767,6 +767,66 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       "peak GPU window=%lluMiB\n", et_loss[0], et_acc[0], epochs - 1,
       et_loss[epochs - 1], et_acc[epochs - 1], et_vacc[epochs - 1], et_time,
       (unsigned long long)(peak_win >> 20));
+
+  // ---- Did the GPU actually read the right bytes? --------------------
+  //
+  // In stream mode there is no in-core baseline, so a PASS here otherwise means
+  // only "the run completed" -- which is how a read path that returned wrong
+  // bytes 2 runs in 3 was once reported as a successful papers100M result.
+  // This samples pages and pulls each one BOTH ways, through the GPU vector's
+  // fault path and through an ordinary CPU GetBlob, and requires agreement.
+  //
+  // KNOW WHAT THIS DOES NOT CATCH. It reads one page per launch, so the cache
+  // is never under pressure and nothing is evicted while a lane still holds it.
+  // Checked directly: with the known-bad at() read path it still reports 32/32
+  // agreeing, because that bug needs a full sweep to surface. This catches
+  // wrong page mapping, a page never stored, and gross corruption -- not
+  // concurrency. The bit-exactness assertion in run_pipeline_test.sh is what
+  // covers the sweep, and it is the check that actually found at().
+  {
+    const int nver = (int)EnvI64("CLIO_GNN_VERIFY_PAGES", 8);
+    if (nver > 0 && K > 0) {
+      ctp::ipc::FullPtr<char> cpu = CLIO_IPC->AllocateBuffer((size_t)page_size);
+      REQUIRE(!cpu.IsNull());
+      std::vector<float> gpu_rows((size_t)epp);
+      std::uint64_t st = 0x243F6A8885A308D3ull;
+      int checked = 0, bad = 0;
+      for (int i = 0; i < nver; ++i) {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        const clio::run::u64 pg = st % K;
+        const clio::run::u64 lo = pg * epp;
+
+        RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                            gy::YieldStackView sv) {
+          GnnGatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu_info, vec.GetDevice(0), lo, lo + epp, d_scratch, vw, sv);
+        });
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        REQUIRE(cudaMemcpy(gpu_rows.data(), d_scratch,
+                           (size_t)(epp * sizeof(float)),
+                           cudaMemcpyDeviceToHost) == cudaSuccess);
+
+        char nm[32];
+        clio::cte::gpu_vector::PageBlobName(pg, nm);
+        auto gf = comp.AsyncGetBlob(tag_id, nm, (clio::run::u64)0, page_size, 0,
+                                    cpu.shm_.template Cast<void>(),
+                                    clio::run::PoolQuery::Local());
+        gf.Wait();
+        if (gf->GetReturnCode() != 0) continue;  // page never stored
+        ++checked;
+        if (std::memcmp(gpu_rows.data(), cpu.ptr_, (size_t)page_size) != 0) {
+          ++bad;
+        }
+      }
+      CLIO_IPC->FreeBuffer(cpu);
+      std::fprintf(stderr,
+                   "[TRAIN] read verify: %d/%d sampled pages agree between the "
+                   "GPU vector and a CPU GetBlob%s\n",
+                   checked - bad, checked, bad ? "  *** MISMATCH ***" : "");
+      REQUIRE(bad == 0);
+    }
+  }
+
   std::fprintf(stderr,
       "[TRAIN] PEAK GPU (whole process, incl. labels + page cache + runtime): "
       "%lluMiB  (feature window alone: %lluMiB)\n",
