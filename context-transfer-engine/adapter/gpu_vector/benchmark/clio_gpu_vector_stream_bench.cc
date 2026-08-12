@@ -128,8 +128,7 @@ __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceVector<u32> v, u64 pages_per_block,
                                   u32 zero_pct) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 pe = v.elems_per_page_;
+  const u64 pe = v.h_->elems_per_page_;
   const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
   long long prev = -1;
   for (u64 k = 0; k < pages_per_block; ++k) {
@@ -171,8 +170,7 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 pages_per_block,
                                  u32 depth, unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 pe = v.elems_per_page_;
+  const u64 pe = v.h_->elems_per_page_;
   const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
   unsigned long long acc = 0;
   // Prime the pipeline.
@@ -216,8 +214,7 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
                                         u64 pages_per_block, u32 chunk,
                                         unsigned long long *sum) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 pe = v.elems_per_page_;
+  const u64 pe = v.h_->elems_per_page_;
   const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
   unsigned long long acc = 0;
   for (u64 k = 0; k < pages_per_block; k += chunk) {
