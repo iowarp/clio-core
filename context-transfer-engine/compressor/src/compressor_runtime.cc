@@ -1554,9 +1554,24 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // user's data, it just happens to be the same length.
       if (success && stored_shuffle != 0 && decompressed_size >= stored_shuffle &&
           (decompressed_size % stored_shuffle) == 0) {
+        // ByteUnshuffle is host code. The caller's output buffer may be
+        // device-resident (a GPU consumer decompressing straight into its own
+        // memory), in which case reading it here would segfault rather than
+        // return a wrong answer -- so stage it down first. DeviceAwareMemcpy
+        // handles both directions, and the pure-host case still costs one
+        // extra copy, which is the price of not having a device unshuffle
+        // kernel.
+        std::vector<char> shuffled_host;
+        const char *unshuffle_src = output_fullptr.ptr_;
+        if (ctp::IsDevicePointer(output_fullptr.ptr_)) {
+          shuffled_host.resize(decompressed_size);
+          ctp::DeviceAwareMemcpy(shuffled_host.data(), output_fullptr.ptr_,
+                                 decompressed_size);
+          unshuffle_src = shuffled_host.data();
+        }
         std::vector<char> unshuffled(decompressed_size);
         if (ctp::compress::preprocess::ByteUnshuffle(
-                reinterpret_cast<const uint8_t *>(output_fullptr.ptr_),
+                reinterpret_cast<const uint8_t *>(unshuffle_src),
                 decompressed_size, stored_shuffle,
                 reinterpret_cast<uint8_t *>(unshuffled.data()))) {
           ctp::DeviceAwareMemcpy(output_fullptr.ptr_, unshuffled.data(),
