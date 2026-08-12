@@ -2748,6 +2748,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
       UnpackPreset(static_cast<uint32_t>(ctx.compress_preset_));
   const uint32_t requested_shuffle =
       UnpackShuffle(static_cast<uint32_t>(ctx.compress_preset_));
+  const bool requested_quant =
+      UnpackQuantEnabled(static_cast<uint32_t>(ctx.compress_preset_));
   ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
   if (requested_preset == 1) {
     preset = ctp::CompressionPreset::FAST;
@@ -2766,13 +2768,39 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   // Runtime::Compress writes, and either read path may consume either blob.
   // Applying the shuffle here is what makes the two writers agree.
   const char *compress_src = src;
+  size_t compress_size = size;
+
+  // Quantize FIRST, then shuffle -- the same order Runtime::Compress and
+  // upstream use (gpucompress_compress.cpp:433-470). This path is host-side
+  // (src is a host SHM buffer), so the host quantizer applies; it shares its
+  // arithmetic with the device kernels, so a blob written here decodes
+  // identically to one written by the device path. Without this the quantize
+  // bit was silently dropped: the data stayed lossless and the header said
+  // so, self-consistent but not the action that was selected.
+  std::vector<char> quant_staging;
+  bool applied_quant = false;
+  ctp::compress::preprocess::QuantizationResult quant_result;
+  if (requested_quant && ctx.error_bound_ > 0.0 && ctx.data_type_ == 1 &&
+      size >= sizeof(float) && (size % sizeof(float)) == 0) {
+    quant_result = ctp::compress::preprocess::Quantize<float>(
+        reinterpret_cast<const float *>(src), size / sizeof(float),
+        ctx.error_bound_);
+    if (!quant_result.quantized_.empty()) {
+      quant_staging.assign(quant_result.quantized_.begin(),
+                           quant_result.quantized_.end());
+      compress_src = quant_staging.data();
+      compress_size = quant_staging.size();
+      applied_quant = true;
+    }
+  }
+
   std::vector<char> shuffle_staging;
   uint32_t applied_shuffle = 0;
-  if (requested_shuffle != 0 && size >= requested_shuffle &&
-      (size % requested_shuffle) == 0) {
-    shuffle_staging.resize(size);
+  if (requested_shuffle != 0) {
+    shuffle_staging.resize(compress_size);
     if (ctp::compress::preprocess::ByteShuffle(
-            reinterpret_cast<const uint8_t *>(src), size, requested_shuffle,
+            reinterpret_cast<const uint8_t *>(compress_src), compress_size,
+            requested_shuffle,
             reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
       compress_src = shuffle_staging.data();
       applied_shuffle = requested_shuffle;
@@ -2784,10 +2812,11 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   std::vector<char> compressed(size + (size / 20) + 1024);
   size_t compressed_size = compressed.size();
   if (!compressor->Compress(compressed.data(), compressed_size,
-                            const_cast<char *>(compress_src), size)) {
+                            const_cast<char *>(compress_src), compress_size)) {
     return false;
   }
-  size_t header_size = sizeof(CompressionHeader);
+  size_t header_size = sizeof(CompressionHeader) +
+                       (applied_quant ? sizeof(QuantHeaderExtension) : 0);
   size_t total = compressed_size + header_size;
   if (total >= size) {
     return false;  // not beneficial — caller stores raw
@@ -2800,10 +2829,25 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   // a declined shuffle (wrong size multiple, allocation failure) must read
   // back as "not shuffled" or the read side inverts a transform that never
   // ran. Same rule Runtime::Compress follows.
-  CompressionHeader header(ctx.compress_lib_,
-                           PackPreset(requested_preset, applied_shuffle), size,
-                           compressed_size);
-  std::memcpy(shm.ptr_, &header, header_size);
+  CompressionHeader header(
+      ctx.compress_lib_,
+      PackPreset(requested_preset, applied_shuffle) |
+          PackQuant(applied_quant, quant_result.precision_),
+      size, compressed_size);
+  QuantHeaderExtension quant_ext{};
+  if (applied_quant) {
+    quant_ext.error_bound = quant_result.effective_error_bound_;
+    quant_ext.scale = quant_result.scale_;
+    quant_ext.data_min = quant_result.data_min_;
+    quant_ext.data_max = quant_result.data_max_;
+  }
+  // Core and extension copied separately -- header_size is 56 for a
+  // quantized blob and the struct is only 24.
+  std::memcpy(shm.ptr_, &header, sizeof(CompressionHeader));
+  if (applied_quant) {
+    std::memcpy(shm.ptr_ + sizeof(CompressionHeader), &quant_ext,
+                sizeof(quant_ext));
+  }
   std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::high_resolution_clock::now() - t0)
@@ -2813,6 +2857,13 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   ctx.actual_compression_ratio_ =
       static_cast<double>(size) / static_cast<double>(total);
   ctx.actual_compress_time_ms_ = ms;
+  // PSNR is defined only when quantization ran; -1 otherwise, so the SGD
+  // withholds the head's gradient (see Runtime::Compress).
+  ctx.actual_psnr_db_ =
+      applied_quant ? AnalyticalPsnr(quant_result.data_max_ -
+                                         quant_result.data_min_,
+                                     quant_result.effective_error_bound_)
+                    : -1.0;
   // The one place that KNOWS the stored bytes are no longer the caller's
   // bytes (issue #818 authoritative transform bit).
   ctx.transform_flags_ |= clio::cte::core::kBlobTransformed |
@@ -2846,6 +2897,18 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   // the caller got byte-planes back and no error.
   const uint32_t stored_preset = UnpackPreset(header->compress_preset_);
   const uint32_t stored_shuffle = UnpackShuffle(header->compress_preset_);
+  const bool stored_quant = UnpackQuantEnabled(header->compress_preset_);
+  const size_t hdr_bytes =
+      sizeof(CompressionHeader) +
+      (stored_quant ? sizeof(QuantHeaderExtension) : 0);
+  if (stored_size < hdr_bytes) {
+    return 6;
+  }
+  QuantHeaderExtension stored_ext{};
+  if (stored_quant) {
+    std::memcpy(&stored_ext, stored + sizeof(CompressionHeader),
+                sizeof(stored_ext));
+  }
   ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
   if (stored_preset == 1) {
     preset = ctp::CompressionPreset::FAST;
@@ -2863,13 +2926,31 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   // blob means, which is the property that broke when only one of them
   // understood the shuffle bits.
   const size_t recorded_size = header->PayloadSize(stored_size);
-  const size_t payload_size = (recorded_size > 0)
-                                  ? recorded_size
-                                  : (stored_size - sizeof(CompressionHeader));
+  const size_t payload_size =
+      (recorded_size > 0) ? recorded_size : (stored_size - hdr_bytes);
+
+  // A quantized blob decompresses to the NARROWED integers, so the codec
+  // writes into a staging buffer and dequantization is what finally fills
+  // the caller's dst. Same shape as Runtime::Decompress and as upstream
+  // (gpucompress_compress.cpp:1253-1296).
+  const size_t quant_elems =
+      stored_quant ? (header->original_size_ / sizeof(float)) : 0;
+  const size_t quant_bytes =
+      stored_quant ? quant_elems * ctp::compress::preprocess::PrecisionToBytes(
+                                       UnpackQuantPrecision(
+                                           header->compress_preset_))
+                   : 0;
+  std::vector<char> quant_staging;
+  char *codec_dst = dst;
   size_t decompressed = header->original_size_;
-  if (!decompressor->Decompress(dst, decompressed,
-                                const_cast<char *>(stored) +
-                                    sizeof(CompressionHeader),
+  if (stored_quant) {
+    quant_staging.resize(quant_bytes);
+    codec_dst = quant_staging.data();
+    decompressed = quant_bytes;
+  }
+
+  if (!decompressor->Decompress(codec_dst, decompressed,
+                                const_cast<char *>(stored) + hdr_bytes,
                                 payload_size)) {
     return 5;
   }
@@ -2881,7 +2962,7 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   if (stored_shuffle != 0) {
     std::vector<char> unshuffled(decompressed);
     if (!ctp::compress::preprocess::ByteUnshuffle(
-            reinterpret_cast<const uint8_t *>(dst), decompressed,
+            reinterpret_cast<const uint8_t *>(codec_dst), decompressed,
             stored_shuffle, reinterpret_cast<uint8_t *>(unshuffled.data()))) {
       HLOG(kError,
            "DecompressStored: byte-unshuffle failed (elem={} size={}) -- the "
@@ -2889,8 +2970,33 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
            stored_shuffle, decompressed);
       return 5;
     }
-    std::memcpy(dst, unshuffled.data(), decompressed);
+    std::memcpy(codec_dst, unshuffled.data(), decompressed);
   }
+
+  // Dequantize LAST, inverting quantize-then-shuffle.
+  if (stored_quant) {
+    ctp::compress::preprocess::QuantizationResult qr;
+    qr.quantized_.assign(quant_staging.begin(), quant_staging.end());
+    qr.precision_ = UnpackQuantPrecision(header->compress_preset_);
+    qr.scale_ = stored_ext.scale;
+    qr.data_min_ = stored_ext.data_min;
+    qr.data_max_ = stored_ext.data_max;
+    qr.effective_error_bound_ = stored_ext.error_bound;
+    qr.num_elements_ = quant_elems;
+    std::vector<float> restored =
+        ctp::compress::preprocess::Dequantize<float>(qr);
+    if (restored.size() != quant_elems) {
+      HLOG(kError,
+           "DecompressStored: dequantization failed (elems={} precision={}) "
+           "-- the returned buffer would be quantized integers, failing "
+           "instead",
+           quant_elems, qr.precision_);
+      return 5;
+    }
+    std::memcpy(dst, restored.data(), restored.size() * sizeof(float));
+    decompressed = header->original_size_;
+  }
+
   *out_size = decompressed;
   return 0;
 }
