@@ -60,6 +60,7 @@
 #ifndef CLIO_RUNTIME_GPU_YIELDABLE_H_
 #define CLIO_RUNTIME_GPU_YIELDABLE_H_
 
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
 
 #include <type_traits>
@@ -301,15 +302,14 @@ class Yieldable {
       return false;
     }
     launch(dim3(num_pending_), dim3(nthreads_), View());
-#if CTP_ENABLE_CUDA
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      return false;
-    }
-    if (cudaMemcpy(host_yield_.data(), d_yield_,
-                   nblocks_ * sizeof(YieldBlockState),
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-      return false;
-    }
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    // GpuApi checks its own errors and aborts on failure, so the previous
+    // "return false on a bad status" branches no longer exist. That is a
+    // behaviour change worth naming: a launch failure used to end the round
+    // quietly and look like completion.
+    ctp::GpuApi::Synchronize();
+    ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
+                        nblocks_ * sizeof(YieldBlockState));
 #endif
     // Compact the still-suspended blocks. Order is preserved so that a block's
     // work stays as sequential as the caller wrote it.
@@ -415,21 +415,22 @@ class Yieldable {
 
  private:
   void Alloc() {
-#if CTP_ENABLE_CUDA
-    cudaMalloc(reinterpret_cast<void **>(&d_yield_),
-               nblocks_ * sizeof(YieldBlockState));
-    cudaMalloc(reinterpret_cast<void **>(&d_user_), nblocks_ * sizeof(StateT));
-    cudaMemset(d_user_, 0, nblocks_ * sizeof(StateT));
-    cudaMalloc(reinterpret_cast<void **>(&d_pending_),
-               nblocks_ * sizeof(clio::run::u32));
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    // GpuApi rather than cuda* directly -- see the note in yield_stack.h.
+    d_yield_ = ctp::GpuApi::Malloc<YieldBlockState>(
+        nblocks_ * sizeof(YieldBlockState));
+    d_user_ = ctp::GpuApi::Malloc<StateT>(nblocks_ * sizeof(StateT));
+    ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+    d_pending_ = ctp::GpuApi::Malloc<clio::run::u32>(
+        nblocks_ * sizeof(clio::run::u32));
 #endif
   }
 
   void Free() {
-#if CTP_ENABLE_CUDA
-    if (d_yield_ != nullptr) cudaFree(d_yield_);
-    if (d_user_ != nullptr) cudaFree(d_user_);
-    if (d_pending_ != nullptr) cudaFree(d_pending_);
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    if (d_yield_ != nullptr) ctp::GpuApi::Free(d_yield_);
+    if (d_user_ != nullptr) ctp::GpuApi::Free(d_user_);
+    if (d_pending_ != nullptr) ctp::GpuApi::Free(d_pending_);
 #endif
     d_yield_ = nullptr;
     d_user_ = nullptr;
@@ -437,18 +438,18 @@ class Yieldable {
   }
 
   void Upload() {
-#if CTP_ENABLE_CUDA
-    cudaMemcpy(d_yield_, host_yield_.data(),
-               nblocks_ * sizeof(YieldBlockState), cudaMemcpyHostToDevice);
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    ctp::GpuApi::Memcpy(d_yield_, host_yield_.data(),
+                        nblocks_ * sizeof(YieldBlockState));
 #endif
     UploadPending();
   }
 
   void UploadPending() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (num_pending_ > 0) {
-      cudaMemcpy(d_pending_, host_pending_.data(),
-                 num_pending_ * sizeof(clio::run::u32), cudaMemcpyHostToDevice);
+      ctp::GpuApi::Memcpy(d_pending_, host_pending_.data(),
+                          num_pending_ * sizeof(clio::run::u32));
     }
 #endif
   }

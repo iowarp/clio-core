@@ -108,6 +108,7 @@
 #ifndef CLIO_RUNTIME_GPU_YIELD_STACK_H_
 #define CLIO_RUNTIME_GPU_YIELD_STACK_H_
 
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/types.h>
 
@@ -529,19 +530,23 @@ class YieldStack {
       : nblocks_(nblocks),
         lanes_per_block_(lanes_per_block),
         bytes_per_lane_(bytes_per_lane) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    // Through GpuApi, not cuda* directly: this header is part of the yielding
+    // machinery every paged kernel depends on, and hard-coding CUDA confines
+    // the whole design to one vendor. GpuApi dispatches to hip/sycl on the
+    // same call.
     const size_t total =
         static_cast<size_t>(nblocks_) * lanes_per_block_ * bytes_per_lane_;
-    cudaMalloc(reinterpret_cast<void **>(&d_base_), total);
-    cudaMemset(d_base_, 0, total);
+    d_base_ = ctp::GpuApi::Malloc<char>(total);
+    ctp::GpuApi::Memset(d_base_, 0, total);
 #endif
     Reset();
   }
 
   ~YieldStack() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (d_base_ != nullptr) {
-      cudaFree(d_base_);
+      ctp::GpuApi::Free(d_base_);
     }
 #endif
     d_base_ = nullptr;
@@ -564,7 +569,7 @@ class YieldStack {
     const clio::run::u32 threads = 128;
     const clio::run::u32 blocks = (nlanes + threads - 1) / threads;
     YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
 #endif
   }
 
