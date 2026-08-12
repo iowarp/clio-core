@@ -17,6 +17,7 @@ extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
 #include <chrono>
 #include <thread>
 #include <cstdlib>
+#include <cstring>
 
 namespace clio::run::bdev {
 
@@ -94,6 +95,38 @@ bool MemBdevTransport::Init(const CreateParams& params,
              static_cast<clio::run::u64>(ms));
       }
     }
+  }
+
+  // Resolve the page allocation policy (see AllocPolicy in bdev_tasks.h).
+  //
+  // A pool with total_size_ == 0 has no meaningful size to preallocate: the
+  // capacity above fell back to DefaultRamCapacityBytes() (80% of system DRAM),
+  // and committing that eagerly would OOM the node. So kEager degrades to lazy
+  // there, with a warning — degrading is strictly safer than throwing, which
+  // would break existing unsized configs for no gain.
+  bool preallocate = false;
+  switch (params.alloc_policy_) {
+    case AllocPolicy::kEager:
+      preallocate = (params.total_size_ != 0);
+      if (!preallocate) {
+        HLOG(kWarning,
+             "bdev: alloc policy 'eager' requires an explicit capacity; this "
+             "pool has none (capacity would default to {} bytes), so pages "
+             "will be allocated lazily instead",
+             ram_capacity_);
+      }
+      break;
+    case AllocPolicy::kLazy:
+      preallocate = false;
+      break;
+    case AllocPolicy::kAuto:
+    default:
+      preallocate = (params.total_size_ != 0);
+      break;
+  }
+
+  if (preallocate) {
+    PreallocateRamPages();
   }
 
   return true;
@@ -197,6 +230,33 @@ void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
   }
 }
 
+void MemBdevTransport::PreallocateRamPages() {
+  // SHM-backed devices need no per-page private-heap allocation at all:
+  // EnsureRamPage resolves every offset directly into shm_base_ and never
+  // touches ram_pages_ for them (see its shm_backed_ branch). Committing and
+  // zeroing private-heap pages here would just be memory and time nobody
+  // reads back through -- and at kRamPageSize == 1 GiB, doing that per pool
+  // for every small kRam device a test suite creates is enough to exhaust a
+  // CI runner outright.
+  if (shm_backed_) return;
+
+  size_t num_pages =
+      static_cast<size_t>((ram_capacity_ + kRamPageSize - 1) / kRamPageSize);
+  std::lock_guard<std::mutex> lock(ram_pages_mu_);
+  ram_pages_.resize(num_pages);
+  for (RamPage &page : ram_pages_) {
+    AllocRamPage(page);
+    if (page.data == nullptr) continue;
+    // Pre-fault (pageable) / zero (both). Pageable pages are otherwise faulted
+    // in 4 KiB at a time by the first write, inside the I/O path; a GPU D2H into
+    // never-touched pageable memory is the slowest copy the driver offers. The
+    // zeroing also preserves the read semantics below: a region that was never
+    // written must read back as zeros, and a preallocated page can no longer be
+    // detected by a null pointer.
+    memset(page.data, 0, kRamPageSize);
+  }
+}
+
 void MemBdevTransport::Destroy() {
   if (shm_backed_) {
     // Mark unusable before tearing the mapping down so a client that is
@@ -289,6 +349,39 @@ void MemBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& block
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
+char* MemBdevTransport::AllocRamPage(RamPage &page) {
+  if (page.data != nullptr) return page.data;
+#if CTP_ENABLE_GPU
+  if (bdev_type_ == BdevType::kPinned) {
+    // Page-locked host memory keeps cudaMemcpyAsync/hipMemcpyAsync truly
+    // asynchronous, so concurrent GPU transfers overlap instead of the
+    // driver silently serializing them through a pageable staging copy.
+    page.data = ctp::GpuApi::MallocHost<char>(kRamPageSize);
+    if (page.data != nullptr) {
+      page.pinned = true;
+    }
+    // MallocHost returns nullptr on a host with no usable GPU backend; fall
+    // through to the pageable path below so kPinned still functions there.
+  }
+#endif
+  if (page.data == nullptr) {
+    page.data = new char[kRamPageSize];
+    page.pinned = false;
+    if (bdev_type_ == BdevType::kPinned) {
+      // NOT silent: a pageable page on a kPinned tier turns every async DMA
+      // out of it into a driver-staged synchronous copy (~2x per-read cost).
+      // One run with a few of these looks like an unexplained 50->75 ms/tok
+      // mode flip -- log it so the flip is attributable.
+      HLOG(kError,
+           "kPinned bdev '{}': page-locked alloc ({} MB) FAILED -- falling"
+           " back to pageable memory; reads of this page will be"
+           " staged-synchronous",
+           shm_name_, kRamPageSize >> 20);
+    }
+  }
+  return page.data;
+}
+
 char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
   // Device-backed (kHbm): one cudaMalloc covers the capacity, so a page is an
   // offset into it -- nothing to allocate, and nothing on the host heap.
@@ -313,42 +406,14 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
     // Fall through to the private-heap path rather than hand back a bad
     // pointer; correctness first, the fast path is only an optimization.
   }
+  // Fast path for a preallocated pool (total_size_ != 0): the page already
+  // exists, so this is a lookup, not an allocation. Only an unsized pool still
+  // allocates here, on the I/O path.
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   if (page_idx >= ram_pages_.size()) {
     ram_pages_.resize(page_idx + 1);
   }
-  RamPage &page = ram_pages_[page_idx];
-  if (page.data == nullptr) {
-#if CTP_ENABLE_GPU
-    if (bdev_type_ == BdevType::kPinned) {
-      // Page-locked host memory keeps cudaMemcpyAsync/hipMemcpyAsync truly
-      // asynchronous, so concurrent GPU transfers overlap instead of the
-      // driver silently serializing them through a pageable staging copy.
-      page.data = ctp::GpuApi::MallocHost<char>(kRamPageSize);
-      if (page.data != nullptr) {
-        page.pinned = true;
-      }
-      // MallocHost returns nullptr on a host with no usable GPU backend; fall
-      // through to the pageable path below so kPinned still functions there.
-    }
-#endif
-    if (page.data == nullptr) {
-      page.data = new char[kRamPageSize];
-      page.pinned = false;
-      if (bdev_type_ == BdevType::kPinned) {
-        // NOT silent: a pageable page on a kPinned tier turns every async
-        // DMA out of it into a driver-staged synchronous copy (~2x per-read
-        // cost). One run with a few of these looks like an unexplained
-        // 50->75 ms/tok mode flip — log it so the flip is attributable.
-        HLOG(kError,
-             "kPinned bdev '{}': page-locked alloc of page {} ({} MB) FAILED"
-             " — falling back to pageable memory; reads of this page will be"
-             " staged-synchronous",
-             shm_name_, page_idx, kRamPageSize >> 20);
-      }
-    }
-  }
-  return page.data;
+  return AllocRamPage(ram_pages_[page_idx]);
 }
 
 char* MemBdevTransport::GetRamPage(size_t page_idx) const {
@@ -362,6 +427,25 @@ char* MemBdevTransport::GetRamPage(size_t page_idx) const {
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   if (page_idx >= ram_pages_.size()) return nullptr;
   return ram_pages_[page_idx].data;
+}
+
+bool MemBdevTransport::IsRamPageCommitted(size_t page_idx) const {
+  // GetRamPage takes ram_pages_mu_ and bounds-checks page_idx, so an
+  // out-of-range index reports "not committed" rather than reading past the end.
+  return GetRamPage(page_idx) != nullptr;
+}
+
+clio::run::u64 MemBdevTransport::CommittedRamBytes() const {
+  std::lock_guard<std::mutex> lock(ram_pages_mu_);
+  clio::run::u64 committed = 0;
+  for (const RamPage &page : ram_pages_) {
+    // Every committed page costs exactly kRamPageSize, whatever fraction of it
+    // the pool is actually using (see AllocRamPage).
+    if (page.data != nullptr) {
+      committed += kRamPageSize;
+    }
+  }
+  return committed;
 }
 
 void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,

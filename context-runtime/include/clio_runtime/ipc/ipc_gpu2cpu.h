@@ -45,7 +45,12 @@ struct IpcGpu2Cpu {
    *                 task_ptr + sizeof(TaskT).
    * @return gpu::Future<TaskT> bound to the FutureShm.
    */
-  template <typename TaskT>
+  // Probing defaults to true so EVERY existing (non-<...>-qualified) caller
+  // resolves to SendIn<true, TaskT> and gets byte-identical codegen to before
+  // this parameter existed. Only the false path (opted into explicitly, e.g. by
+  // the bench's non-probe kernels) strips the probe locals from the instantiated
+  // IR to shed their register pressure.
+  template <bool Probing = true, typename TaskT>
   static CTP_GPU_FUN gpu::Future<TaskT> SendIn(
       gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr);
 

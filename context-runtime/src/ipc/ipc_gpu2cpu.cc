@@ -21,6 +21,7 @@
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
+#include "clio_runtime/gpu/submit_probe.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/worker.h"
@@ -220,6 +221,11 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   if (!from_ring && !gpu_lane->Pop(gpu_future)) {
     return false;
   }
+  // Sample the clock the instant the Pop succeeds — before any decoding — so the
+  // cross-domain poll latency (device push -> CPU observes) is not inflated by
+  // this function's own prologue.
+  auto &probe = gpu::SubmitProbe::Get();
+  const unsigned long long t_pop = probe.On() ? gpu::SubmitProbe::NowNs() : 0;
   const u32 worker_id = worker->GetId();
   HLOG(kDebug, "IpcGpu2Cpu::RecvIn: worker {} popped task from gpu2cpu queue",
        worker_id);
@@ -399,6 +405,35 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   PoolId pool_id = task_raw->pool_id_;
   u32 method_id = task_raw->method_;
 
+  // Producer-only reuse fix: for a kPinnedHost / kManagedUvm task the POD is the
+  // CLIENT-OWNED slot itself (not the per-pop D2H scratch), and every device
+  // Send re-submits that SAME slot as a fresh top-level execution. But the slot
+  // still carries run_ctx_ from its PRIOR submission — the runtime never
+  // destructs it (we WrapNonOwning below) and the device Send only clears fut_,
+  // not run_ctx_. BeginRunContext/EnsureRunCtx deliberately REUSE a non-null
+  // run_ctx_, so without this the second submission inherits the first's
+  // IsStarted()/IsCoroCompleted() state: the worker drives it as a RESUME of an
+  // already-finished coroutine, PutBlob never re-executes, SendOut never fires,
+  // and the kernel's WriteWait spins forever (the historical "dataset REUSE
+  // hangs / one-round-trip-per-dataset" symptom). Freeing the stale context here
+  // makes EnsureRunCtx allocate a clean one — IsStarted() false → StartCoroutine.
+  //
+  // GUARDED on IsCoroCompleted(): only free the prior context once its coroutine
+  // has FINISHED. Under the reuse contract (drain a slot's prior Put before
+  // re-firing it) this is always true by the time the re-fire is popped, since
+  // the device's WriteWait only unblocks after SendOut — which sets completion as
+  // its last write (see SendOut) — so the prior run_ctx_ is idle here. If a caller
+  // VIOLATES that contract and re-fires a slot whose prior coroutine is still in
+  // flight, freeing it would be a use-after-free of a live coroutine frame; the
+  // guard instead leaves the (busy) context alone. That reuse is already undefined
+  // (a live buffer + task being overwritten), but we must not turn it into heap
+  // corruption. Fresh slots (run_ctx_ null) and the D2H-scratch (kDeviceMem) path
+  // are untouched.
+  if (!task_on_device && task_raw->RunCtxPtr() != nullptr &&
+      task_raw->IsCoroCompleted()) {
+    task_raw->ResetRunCtx();
+  }
+
   // task_raw points into a reused worker scratch buffer (or device memory), not
   // a make_shared block — wrap it NON-OWNING so the Future frees nothing.
   Future<Task> future(pool_id, method_id,
@@ -415,6 +450,12 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
 
   auto chi_fshm = future.GetFutureShm();
   chi_fshm->origin_ = ClientOrigin::kClientGpu2Cpu;
+  // Hand the probe record to the task itself. Every downstream hop (the
+  // coroutine start, SendOut) reaches it through this pointer — no lookup, no
+  // lock, and nothing at all for tasks the probe never opened.
+  chi_fshm->probe_rec_ = reinterpret_cast<uintptr_t>(probe.Open(
+      reinterpret_cast<unsigned long long>(gpu_task_raw), t_pop, worker_id,
+      worker->GetIdleIterations(), worker->GetCurrentSleepUs()));
   // Stash the device-side task pointer + size so SendOut can H2D-copy the
   // mutated POD back and flip the task's completion flag (cudaMemcpy when in
   // kDeviceMem). The Task is its own completion record — no gpu::FutureShm.
@@ -443,15 +484,22 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   EvPush('C', worker_id, reinterpret_cast<unsigned long long>(gpu_task_raw),
          task_raw->task_id_.unique_);
 
-  // Inline start when local (CLIO_GPU2CPU_INLINE=1): force_enqueue costs a
-  // queue hop + worker pickup on EVERY device task, and the rdtsc phase probe
-  // puts 95% of fault-service latency (p50 349 us) between routing and
-  // write-back. The handler is a coroutine -- it suspends on its awaits --
-  // so starting it inline on the drain worker does not stall the drain.
+  // The dispatch hop, bracketed by the submit probe. Inline start when local
+  // (CLIO_GPU2CPU_INLINE=1): force_enqueue costs a queue hop + worker pickup
+  // on EVERY device task, and the rdtsc phase probe puts 95% of fault-service
+  // latency (p50 349 us) between routing and write-back. The handler is a
+  // coroutine -- it suspends on its awaits -- so starting it inline on the
+  // drain worker does not stall the drain.
+  auto *prec =
+      reinterpret_cast<gpu::SubmitProbeHostRec *>(chi_fshm->probe_rec_);
+  if (prec) prec->t_pre_route = gpu::SubmitProbe::NowNs();
+
   static const bool inline_start =
       std::getenv("CLIO_GPU2CPU_INLINE") != nullptr;
   RouteResult route_result =
       ipc->RouteTask(future, /*force_enqueue=*/!inline_start);
+
+  if (prec) prec->t_post_route = gpu::SubmitProbe::NowNs();
   HLOG(kDebug,
        "IpcGpu2Cpu::RecvIn: worker {} RouteTask returned {} pool={} method={}",
        worker_id, (int)route_result, pool_id, method_id);
@@ -491,6 +539,10 @@ void IpcGpu2Cpu::SendOut(
   Task *host_task = task_ptr.get();
   const bool device_task =
       future_shm->gpu_task_device_ptr_ != 0 && future_shm->gpu_task_size_ != 0;
+
+  auto *prec =
+      reinterpret_cast<gpu::SubmitProbeHostRec *>(future_shm->probe_rec_);
+  if (prec) prec->t_sendout_begin = gpu::SubmitProbe::NowNs();
 
   // ASYNC COMPLETION PATH.
   //
@@ -556,13 +608,13 @@ void IpcGpu2Cpu::SendOut(
         reinterpret_cast<const char *>(host_task),
         future_shm->gpu_task_size_, ring_stream);
   }
-
-  // Mark complete: for kPinnedHost / kManagedUvm this storage is shared with
-  // the device (the kernel's volatile poll sees it); also wakes host waiters.
   host_task->SetComplete();
 
   // Producer-only model: the client owns the device-memory backend that holds
-  // the task — the runtime does not free it.
+  // the task -- the runtime does not free it. Done BEFORE signalling
+  // completion so that completion is the LAST write SendOut makes to the
+  // shared task POD: the instant the device observes is_complete_ it may
+  // re-arm and re-fire this slot, and anything written after would race that.
   task_ptr->ClearFlags(TASK_DATA_OWNER);
 
   // The device completion flag goes LAST, once nothing here will touch this
@@ -592,6 +644,10 @@ void IpcGpu2Cpu::SendOut(
              host_task->task_id_.unique_);
     }
   }
+
+  // Stamped immediately after completion: the instant the flag the device is
+  // spinning on became writable-visible.
+  if (prec) prec->t_sendout_end = gpu::SubmitProbe::NowNs();
   (void)ipc;
 }
 

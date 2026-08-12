@@ -71,17 +71,11 @@ EXPECT_FAIL = set()
 # One line per known gap, printed next to it. A gap with no explanation is
 # indistinguishable from an allowlist someone added to make a test go quiet.
 GAP_NOTES = {
-    "vol/eparity_cacheon/corrupt_checksum_read":
-        "cache serves its pre-corruption staged copy, so a read that native "
-        "fails on a fletcher32 error succeeds here. The connector has no "
-        "invalidation signal for a change made outside HDF5, so the SAME read "
-        "fails on a cold cache or with CLIO down. Passes cache-off; the VFD "
-        "passes both (its cache is populate-only). Generalises beyond "
-        "corruption: any out-of-band modification can be served stale. "
-        "The fix is a COHERENCE stamp -- file identity captured at close and "
-        "validated at open -- which is an adapter-side change of a few hours, "
-        "NOT the chimod residency op that gates Q2.3. Those are separate "
-        "problems and this gap is the cheap one.",
+    # Empty, and that is the point. The only entry this suite ever carried --
+    # the VOL cache serving a pre-corruption copy of a file damaged behind
+    # HDF5's back -- was closed by the coherence stamp (file identity captured
+    # at close, validated at open). An entry here is a gap that is understood
+    # and written down, never one that is merely inconvenient.
 }
 
 
@@ -1177,7 +1171,16 @@ def _wipe_clio_shm():
 
 def restart_runtime():
     """Kill any clio_run, wipe shm, start fresh from BIN, wait until ready."""
-    subprocess.run(["pkill", "-f", "clio_run"], check=False)
+    # -x (exact process NAME), not -f (full command line). -f matches any
+    # process whose cmdline merely CONTAINS "clio_run" -- which includes the
+    # shell, CI wrapper, or editor that happens to have the word in its command,
+    # and, most reliably, the harness that invoked this suite. It killed three
+    # consecutive admission runs from a wrapper whose only sin was containing
+    # the string in a cleanup command, each time as a bare SIGTERM with an empty
+    # log, which looks like an infrastructure failure rather than a self-inflicted
+    # one. The runtime's process name is exactly "clio_run", so -x is both
+    # narrower and correct.
+    subprocess.run(["pkill", "-x", "clio_run"], check=False)
     time.sleep(2)
     _wipe_clio_shm()
     # Provide clio_run a self-contained compose config (see SUITE_CONF_YAML) so
@@ -1411,6 +1414,203 @@ def _run_c_tests():
     return out
 
 
+def _run_cache_reuse_check():
+    """Does the cache still work on the SECOND file a process touches?
+
+    This exists because a defect that disabled caching for every file after the
+    first passed every other check in this suite. Nothing here asserted that the
+    tier is USED -- only that whatever it returns is correct -- so a connector
+    that silently fell back to native reads was indistinguishable from a working
+    one. Correct, fast, and correct-but-never-cached all look the same to a
+    differential test.
+
+    Method: create N distinct files in ONE process, each written, closed, aged
+    briefly, then read TWICE. The second read of each file must be a cache hit.
+    The failing mode this pins is "hits == 1 regardless of N".
+
+    WHY THE PAUSE AND THE SECOND READ, since neither is what the check is about.
+    The connector will not record a coherence stamp for a file whose mtime is
+    younger than the filesystem's timestamp granularity, because within that
+    window mtime cannot rule out a later same-granule modification (see
+    clio_stamp_ambiguous). A file written and immediately closed is always
+    inside that window, so the closing session records no stamp and the next
+    open has nothing to validate against -- it MUST miss, by design.
+
+    That makes "write, close, reopen, read" the one access shape guaranteed
+    never to hit, which is what this check used to do. It was passing on
+    timing: the workload happened to be slow enough that the close landed
+    outside the window. The pause removes that dependency, and the second read
+    is what actually exercises the tier -- the first read's close is the one
+    that gets to record a stamp, because by then the file has aged.
+
+    This is not the timing dependency being papered over. The behaviour it
+    would otherwise measure -- whether an instant reopen skips the cache -- is
+    asserted deliberately in _run_instant_reopen_check() below, so the trade is
+    pinned somewhere rather than silently baked into this check's timing.
+    """
+    n_files = 4
+    tdir = os.path.join(TMP, "reuse_trace")
+    shutil.rmtree(tdir, ignore_errors=True)
+    os.makedirs(tdir, exist_ok=True)
+
+    prog = (
+        "import h5py, numpy as np, sys, time\n"
+        "for i in range(%d):\n"
+        "    p = '%s/reuse_%%d.h5' %% i\n"
+        "    a = np.arange(4096, dtype='i4')\n"
+        "    with h5py.File(p, 'w') as f: f.create_dataset('d', data=a)\n"
+        "    time.sleep(0.05)   # age past the stamp window; see the docstring\n"
+        "    for _ in range(2):\n"
+        "        with h5py.File(p, 'r') as f:\n"
+        "            assert (f['d'][()] == a).all(), 'data differs on reread'\n"
+    ) % (n_files, TMP)
+
+    env = dict(_env("vol"), CLIO_VOL_TRACE=tdir)
+    r = subprocess.run([sys.executable, "-c", prog], capture_output=True,
+                       text=True, env=env, timeout=240)
+    if r.returncode != 0:
+        print(f"  {'cache_reuse':<22} FAIL  workload failed: "
+              f"{r.stderr.strip()[:160]}")
+        return {"vol/cache_reuse": {"workload_ok": False}}
+
+    hits = 0
+    for fn in glob.glob(os.path.join(tdir, "*.access.json")):
+        try:
+            with open(fn) as fh:
+                doc = json.load(fh)
+        except Exception:  # noqa: BLE001
+            continue
+        for _name, ds in doc.get("datasets", {}).items():
+            hits += ds.get("read_served", {}).get("cache", 0)
+
+    # Every file after the first must also hit. Asserting ">1" rather than
+    # "== n_files" keeps this from being brittle about a single cold start,
+    # while still failing hard on the "only ever one" signature.
+    ok = hits > 1
+    print(f"  {'cache_reuse':<22} {'PASS' if ok else 'FAIL'}  "
+          f"({hits}/{n_files} reads served from the tier across distinct files"
+          + ("" if ok else " -- caching stops after the first file") + ")")
+    return {"vol/cache_reuse": {"reused_across_files": ok}}
+
+
+def _run_instant_reopen_check():
+    """A file reopened the instant it is closed must NOT be served from cache.
+
+    This is the deliberate half of the coherence stamp's fail-closed rule, and
+    it needs its own check because it is a behaviour nobody would infer from a
+    correctness test: the data is right either way. Without this the rule lives
+    only in a comment and in the timing of _run_cache_reuse_check(), and the
+    first person to "optimise away" the withheld stamp would find every test
+    still green while quietly restoring the bug it exists to prevent -- a
+    corrupt file read as fine, whenever the corruption lands in the same
+    timestamp granule as the write it followed.
+
+    What it asserts, in order of what actually matters:
+      1. the data read back is correct (fail-closed must never mean wrong);
+      2. the reopen served ZERO reads from the tier;
+      3. the telemetry NAMES the reason -- the closing session reports
+         `ambiguous`, the reopening session reports `absent` -- so a miss here
+         is attributable rather than mysterious.
+
+    (3) is the part that makes a future performance measurement legible: these
+    are self-inflicted misses, and a benchmark that cannot see them will blame
+    the workload.
+    """
+    tdir = os.path.join(TMP, "instant_trace")
+    shutil.rmtree(tdir, ignore_errors=True)
+    os.makedirs(tdir, exist_ok=True)
+    p = os.path.join(TMP, "instant_reopen.h5")
+    if os.path.exists(p):
+        os.remove(p)
+
+    prog = (
+        "import h5py, numpy as np\n"
+        "a = np.arange(4096, dtype='i4')\n"
+        "with h5py.File('%s', 'w') as f: f.create_dataset('d', data=a)\n"
+        "with h5py.File('%s', 'r') as f:\n"
+        "    assert (f['d'][()] == a).all(), 'data differs on instant reread'\n"
+    ) % (p, p)
+
+    env = dict(_env("vol"), CLIO_VOL_TRACE=tdir)
+    r = subprocess.run([sys.executable, "-c", prog], capture_output=True,
+                       text=True, env=env, timeout=240)
+    checks = {"workload_ok": r.returncode == 0}
+    if r.returncode != 0:
+        print(f"  {'instant_reopen':<22} FAIL  workload failed: "
+              f"{r.stderr.strip()[:160]}")
+        return {"vol/instant_reopen": checks}
+
+    cache_reads, ambiguous, absent = 0, 0, 0
+    for fn in sorted(glob.glob(os.path.join(tdir, "*.access.json"))):
+        try:
+            with open(fn) as fh:
+                doc = json.load(fh)
+        except Exception:  # noqa: BLE001
+            continue
+        coh = doc.get("coherence", {})
+        ambiguous += coh.get("ambiguous", 0)
+        absent += coh.get("absent", 0)
+        for _name, ds in doc.get("datasets", {}).items():
+            cache_reads += ds.get("read_served", {}).get("cache", 0)
+
+    checks["not_served_from_tier"] = cache_reads == 0
+    checks["reason_recorded"] = ambiguous >= 1 and absent >= 1
+    ok = all(checks.values())
+    print(f"  {'instant_reopen':<22} {'PASS' if ok else 'FAIL'}  "
+          f"(tier served {cache_reads} reads; stamp withheld x{ambiguous}, "
+          f"absent-at-open x{absent})")
+    return {"vol/instant_reopen": checks}
+
+
+def _run_bbox_fetch_check():
+    """§4(A): does serving a selection fetch only the chunks its bounding box
+    touches, or the whole cached image?
+
+    Needs a small cache chunk to be observable at all. The default is 1 MiB and
+    the c_selection corpus is 192 bytes, so the entire image is ONE chunk and a
+    bounding box cannot narrow anything -- the check would pass on broken code.
+    CLIO_VOL_CHUNK_SIZE=32 makes the image span six chunks, which is what gives
+    the assertion teeth.
+
+    The measure is `bytes_fetched_from_tier` (bytes pulled OUT of the tier), not
+    read_bytes_from_cache (bytes handed to the application). Before §4(A) every
+    served selection fetched the whole image, so fetched == served_reads x
+    image_bytes exactly; narrowing makes it strictly less. That equality is what
+    this fails on.
+    """
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    binp = os.path.join(TMP, "c_selection")
+    srcp = os.path.join(src_dir, "vol_c_selection_test.c")
+    if not os.path.exists(binp) and not _build_probe("bbox_fetch", binp, srcp):
+        return {"bbox_fetch": {"pass": False}}
+    tdir = os.path.join(TMP, "trace_bbox")
+    os.makedirs(tdir, exist_ok=True)
+    for f in glob.glob(tdir + "/*"):
+        os.remove(f)
+    env = dict(_env("vol"), CLIO_VOL_TRACE=tdir, CLIO_VOL_CHUNK_SIZE="32")
+    r = subprocess.run([binp], capture_output=True, text=True, env=env, timeout=120)
+    checks = {"workload_ok": r.returncode == 0}
+    image_bytes = 8 * 6 * 4          # R x C x sizeof(int), see vol_c_selection_test.c
+    narrowed = False
+    summaries = glob.glob(tdir + "/*.access.json")
+    detail = ""
+    if summaries:
+        try:
+            d = json.load(open(summaries[0]))["datasets"]["m"]
+            served = d["read_served"]["cache"]
+            fetched = d["bytes_fetched_from_tier"]
+            whole_image_cost = served * image_bytes
+            narrowed = 0 < fetched < whole_image_cost
+            detail = (f"fetched {fetched}B for {served} cache-served reads; "
+                      f"whole-image would be {whole_image_cost}B")
+        except Exception as e:
+            detail = f"summary unreadable: {e}"
+    checks["fetch_narrowed"] = narrowed
+    ok = all(checks.values())
+    print(f"  {'bbox_fetch':<20} {'PASS' if ok else 'FAIL'}  ({detail})")
+    return {"bbox_fetch": checks}
+
+
 def _run_trace_check():
     """Verify access telemetry (Part B). Runs the c_selection workload with
     CLIO_VOL_TRACE set and asserts the summary JSON + per-access JSONL are
@@ -1454,9 +1654,42 @@ def _run_trace_check():
             pass
     checks["fields_sane"] = fields_ok
     checks["repeat_detected"] = repeat_ok
+
+    # WRITE-SIDE ACCOUNTING. Nothing here asserted anything about writes, which
+    # is why `write_served.mirrored` could mean "the native write succeeded"
+    # through a release: every read-side field was checked and every write-side
+    # field was taken on faith.
+    #
+    # The pin is an invariant, not a restatement of the implementation: a WRITE
+    # can never be `served` from the cache. Serving is what reads do; a write
+    # puts bytes in, it does not get bytes out. The old code emitted
+    # "served":"cache" on every successfully cached write, so this fails on it.
+    write_ok = False
+    if summaries and jsonls:
+        try:
+            s = json.load(open(summaries[0]))
+            recs = [json.loads(l) for l in open(jsonls[0]) if l.strip()]
+            writes = [r for r in recs if r.get("op") == "write"]
+            ws = s["datasets"]["m"]["write_staged"]
+            write_ok = (
+                bool(writes)
+                and all(r["served"] != "cache" for r in writes)
+                # a staged write reports what it submitted, and only then
+                and all(("staged_bytes" in r) == (r["served"] == "staged")
+                        for r in writes)
+                and ws["staged"] >= 1
+                and ws["bytes_staged"] > 0
+                # the surviving-bytes identity the admission denominator rests on
+                and ws["bytes_resident"] ==
+                    max(0, ws["bytes_staged"] - ws["bytes_discarded"])
+                and s["v"] >= 2)
+        except Exception:
+            pass
+    checks["write_accounting"] = write_ok
+
     ok = all(checks.values())
     print(f"  {'telemetry':<20} {'PASS' if ok else 'FAIL'}  "
-          f"(summary+jsonl, hit_rate/repeat sane)")
+          f"(summary+jsonl, hit_rate/repeat sane, write accounting)")
     return {"telemetry": checks}
 
 
@@ -1838,7 +2071,8 @@ def stop_runtime():
     into later steps of the same CI job. The Linux adapters job runs a FUSE
     mount smoke test after ctest; a leftover runtime holds port 9413 and the
     smoke's clio_run then dies with 'Address already in use'."""
-    subprocess.run(["pkill", "-f", "clio_run"], check=False)
+    # -x, not -f: see restart_runtime() above.
+    subprocess.run(["pkill", "-x", "clio_run"], check=False)
     time.sleep(1)
     _wipe_clio_shm()
 
@@ -1978,8 +2212,12 @@ def driver(args):
     if "vol" in args.modes:
         print("\n-- C tests (VOL-aware APIs h5py can't exercise) --")
         results.update({"vol/" + k: v for k, v in _run_c_tests().items()})
+        print("\n-- cache reuse across files (regression pin) --")
+        results.update(_run_cache_reuse_check())
+        results.update(_run_instant_reopen_check())
         print("\n-- telemetry (access observability) --")
         results.update({"vol/" + k: v for k, v in _run_trace_check().items()})
+        results.update({"vol/" + k: v for k, v in _run_bbox_fetch_check().items()})
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)

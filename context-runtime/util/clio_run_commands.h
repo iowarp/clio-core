@@ -9,6 +9,7 @@
 int RuntimeStart(int argc, char** argv);
 int RuntimeRestart(int argc, char** argv);
 int RuntimeStop(int argc, char** argv);
+int RuntimeStatus(int argc, char** argv);
 int Monitor(int argc, char** argv);
 int Compose(int argc, char** argv);
 int Config(int argc, char** argv);

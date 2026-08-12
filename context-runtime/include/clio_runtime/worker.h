@@ -177,6 +177,13 @@ class Worker {
   /** OS thread id of this worker (valid once Run() has started). #642 */
   u32 GetTid() const { return tid_.load(std::memory_order_acquire); }
 
+  /** Backoff state, for the submit probe: these separate a Pop taken by a
+   *  hot-spinning worker (both zero) from one taken by a worker that had already
+   *  backed off into SuspendMe() — two very different poll latencies that must
+   *  not be averaged together. */
+  u64 GetIdleIterations() const { return idle_iterations_; }
+  u32 GetCurrentSleepUs() const { return current_sleep_us_; }
+
   /**
    * Get the event queue for this worker
    * @return Pointer to this worker's event queue

@@ -26,8 +26,12 @@ target_include_directories(clio_cte_filesystem_runtime PRIVATE
 target_include_directories(clio_cte_filesystem_client PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
 
-# Export dllexport for the g_fs_client global on Windows (reuses clio_cte/api.h).
+# Export the g_fs_client global on Windows. This must be THIS module's macro:
+# defining CLIO_CTE_CORE_BUILDING_DLL here also told the core's headers that
+# g_cte_client was being defined locally, which it is not -- an LNK2019 that
+# stayed hidden while the descriptor layer (its only user here) was excluded
+# from Windows builds.
 if(TARGET clio_cte_filesystem_client)
   target_compile_definitions(clio_cte_filesystem_client PRIVATE
-    CLIO_CTE_CORE_BUILDING_DLL=1)
+    CLIO_CTE_FS_BUILDING_DLL=1)
 endif()

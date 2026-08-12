@@ -36,14 +36,22 @@
  */
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <thread>
 
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/restart_log.h"
 #include "clio_runtime/singletons.h"
+
+#ifdef CLIO_COVERAGE
+// The force/watchdog stop paths end in std::_Exit, which skips the gcov
+// at-exit flush; declared here so those paths can dump counters explicitly.
+extern "C" void __gcov_dump(void);
+#endif
 
 // Global pointer variable definition for CLIO Runtime manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::RuntimeManager, g_runtime_manager);
@@ -499,8 +507,9 @@ void RuntimeManager::ServerFinalize() {
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and
   // its task + Future allocations are reclaimed instead of being abandoned by
-  // the abrupt StopWorkers() below.
-  DrainPendingTasks();
+  // the abrupt StopWorkers() below. The budget is the stop grace period
+  // (default 5000 ms; overridden by clio_run stop --grace-period).
+  DrainPendingTasks(stop_grace_period_ms_.load());
 
   // Stop workers and finalize server components
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
@@ -546,7 +555,91 @@ void RuntimeManager::ServerFinalize() {
   if (!is_client_mode_) {
     is_initialized_ = false;
   }
+
+  // Signal the RequestStop watchdog (if any) that teardown completed so it
+  // stands down instead of force-exiting. Must be the last statement here.
+  finalize_complete_.store(true);
 }
+
+namespace {
+/** Extra time beyond the drain grace period that the stop watchdog allows the
+ *  full teardown (worker joins, container destruction) before force-exiting. */
+constexpr u64 kShutdownTeardownMarginMs = 15000;
+/** Delay before a forced stop kills the process, letting the worker that ran
+ *  the StopRuntime handler flush the task ack to the client. */
+constexpr u64 kForceAckFlushMs = 500;
+
+/**
+ * Unlink this runtime's filesystem artifacts, flush coverage counters, and
+ * terminate the process WITHOUT running atexit handlers or static destructors.
+ * Used by the force-stop and watchdog paths, where running the normal
+ * teardown is either unwanted (force) or already wedged (watchdog) — atexit
+ * would re-enter ServerFinalize from a non-main thread and deadlock.
+ * @param exit_code process exit code (0 = forced stop, 2 = watchdog escalation)
+ */
+[[noreturn]] void ForceProcessExit(int exit_code) {
+  auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager) {
+    ipc_manager->UnlinkOwnArtifacts();
+  }
+#ifdef CLIO_COVERAGE
+  __gcov_dump();
+#endif
+  std::_Exit(exit_code);
+}
+}  // namespace
+
+void RuntimeManager::RequestStop(StopMode mode, u32 grace_period_ms) {
+  if (!is_runtime_mode_) {
+    HLOG(kWarning, "RequestStop: ignored - not in runtime mode");
+    return;
+  }
+  if (mode == StopMode::kGraceful && grace_period_ms == 0) {
+    grace_period_ms = stop_grace_period_ms_.load();
+  }
+  if (stop_requested_.exchange(true)) {
+    HLOG(kDebug, "RequestStop: stop already in progress");
+    return;
+  }
+  stop_grace_period_ms_.store(grace_period_ms);
+
+  if (mode == StopMode::kForce) {
+    HLOG(kInfo, "RequestStop: forced stop - process exits in {} ms",
+         kForceAckFlushMs);
+    std::thread([]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kForceAckFlushMs));
+      ForceProcessExit(0);
+    }).detach();
+    return;
+  }
+
+  HLOG(kInfo,
+       "RequestStop: graceful stop requested (grace period: {} ms); main loop "
+       "will run the full teardown",
+       grace_period_ms);
+  // Watchdog: guarantee the process dies even if the graceful teardown wedges
+  // (stuck worker join, hung container destroy). Uses stderr instead of HLOG
+  // at escalation time — the logging system may be part of what wedged.
+  const u64 deadline_ms =
+      static_cast<u64>(grace_period_ms) + kShutdownTeardownMarginMs;
+  std::thread([this, deadline_ms]() {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(deadline_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (finalize_complete_.load()) {
+        return;  // teardown finished; normal process exit proceeds
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::fprintf(stderr,
+                 "RequestStop watchdog: graceful teardown exceeded %llu ms - "
+                 "forcing exit (code 2)\n",
+                 static_cast<unsigned long long>(deadline_ms));
+    ForceProcessExit(2);
+  }).detach();
+}
+
+bool RuntimeManager::IsStopRequested() const { return stop_requested_.load(); }
 
 bool RuntimeManager::IsInitialized() const { return is_initialized_; }
 

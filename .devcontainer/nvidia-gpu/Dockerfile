@@ -129,6 +129,11 @@ RUN set -eux; \
 #   - ndzip ships no install() rules, so the libs + headers are copied manually.
 #   - clang-18 targets up to sm_90; PTX from the highest arch JITs forward to newer
 #     GPUs (e.g. sm_120 / Blackwell) at runtime.
+#   - HIPSYCL_TARGETS must be set even though the SYCL codec is unused. ndzip's
+#     find_package(hipSYCL) picks up the AdaptiveCpp install at /opt/adaptivecpp in
+#     the deps-nvidia base, which offers both the omp and cuda platforms and hard-
+#     errors ("More than one hipSYCL target platform is available") unless one is
+#     named. `omp` just satisfies the config; the GPU path is NDZIP_WITH_CUDA.
 RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends libomp-18-dev; \
     rm -rf /var/lib/apt/lists/*; \
@@ -143,8 +148,8 @@ RUN set -eux; \
       -DCMAKE_CXX_FLAGS="-march=native" \
       -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_HOME} -Wno-unknown-cuda-version" \
       -DNDZIP_WITH_CUDA=ON \
-      -DNDZIP_WITH_MT=OFF \
       -DHIPSYCL_TARGETS="omp" \
+      -DNDZIP_WITH_MT=OFF \
       -DNDZIP_BUILD_BENCHMARK=OFF \
       -DNDZIP_BUILD_TEST=OFF \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \

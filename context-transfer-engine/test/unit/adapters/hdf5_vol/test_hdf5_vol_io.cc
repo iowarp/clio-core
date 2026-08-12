@@ -85,10 +85,12 @@ hid_t setupVolEnvironment() {
 hid_t makeFapl(hid_t vol_id) {
   hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
   REQUIRE(fapl >= 0);
-  clio_vol_info_t info;
+  // Value-initialized, so every field starts at its documented default and
+  // cache_enabled reads as CLIO_VOL_CACHE_UNSET. Leaving this struct
+  // uninitialized once let stack garbage disable the CTE tier for the file
+  // with nothing logged -- the tests still passed, they just tested nothing.
+  clio_vol_info_t info = {};
   info.under_vol_id = H5VL_NATIVE;
-  info.under_vol_info = nullptr;
-  info.chunk_size = 0;  // fall back to the env-var chunk size
   REQUIRE(H5Pset_vol(fapl, vol_id, &info) >= 0);
   return fapl;
 }
@@ -313,6 +315,232 @@ TEST_CASE("HDF5 VOL IO - Passthrough callbacks", "[hdf5_vol][io]") {
   REQUIRE(H5Dclose(dset) >= 0);
   REQUIRE(H5Sclose(space) >= 0);
   REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+namespace {
+
+/** Size of a chunk blob as the CTE tier holds it, via the file's tag. */
+clio::run::u64 cteBlobSize(const std::string &h5_path,
+                           const std::string &blob_name) {
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto tag = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + h5_path);
+  tag.Wait();
+  REQUIRE(tag->GetReturnCode() == 0);
+  auto sz = cte_client->AsyncGetBlobSize(tag->tag_id_, blob_name);
+  sz.Wait();
+  return sz->size_;
+}
+
+/** Drop one chunk blob out of the tier, standing in for a per-blob eviction. */
+void cteDelBlob(const std::string &h5_path, const std::string &blob_name) {
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto tag = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + h5_path);
+  tag.Wait();
+  REQUIRE(tag->GetReturnCode() == 0);
+  auto del = cte_client->AsyncDelBlob(tag->tag_id_, blob_name);
+  del.Wait();
+  REQUIRE(del->GetReturnCode() == 0);
+}
+
+}  // namespace
+
+TEST_CASE("HDF5 VOL IO - Chunk blobs hold only their own bytes",
+          "[hdf5_vol][io]") {
+  // Regression: chunk blobs were written at their absolute image offset, so
+  // chunk_i physically allocated (and zero-filled) i+1 chunks -- N(N+1)/2
+  // chunks of tier for an N-chunk dataset, invisible to round-trip tests
+  // because the read side used the same offsets. Each chunk blob must be
+  // exactly its own bytes at blob offset 0.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string path = "/tmp/clio_vol_io_chunklayout.h5";
+  std::remove(path.c_str());
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+  hsize_t dims[1] = {kNumElems};  // 16 KiB = 4 chunks at the 4 KiB test chunk
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+  std::vector<int> wbuf(kNumElems, 7);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   wbuf.data()) >= 0);
+  REQUIRE(H5Dclose(dset) >= 0);  // drains the async puts
+  H5Sclose(space);
+  REQUIRE(H5Fclose(file) >= 0);
+
+  REQUIRE(cteBlobSize(path, "data/chunk_0") == 4096);
+  REQUIRE(cteBlobSize(path, "data/chunk_1") == 4096);  // was 8192 (1 chunk hole)
+  REQUIRE(cteBlobSize(path, "data/chunk_3") == 4096);  // was 16384
+
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+TEST_CASE("HDF5 VOL IO - Whole rewrite invalidates when staging is skipped",
+          "[hdf5_vol][io]") {
+  // Regression: under an admission policy that does not stage on write (and
+  // equally while back-pressure holds the gate shut), a whole rewrite updated
+  // the native file but left the previously staged image in the tier, so the
+  // next whole read served pre-rewrite bytes with a success status.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+  setenv("CLIO_VOL_ADMIT", "read-miss", 1);
+
+  const std::string path = "/tmp/clio_vol_io_rewrite.h5";
+  std::remove(path.c_str());
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+  constexpr size_t kN = 1024;  // 4 KiB: one chunk
+  hsize_t dims[1] = {kN};
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  std::vector<int> v1(kN, 1), v2(kN, 2), rbuf(kN, 0);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   v1.data()) >= 0);
+  // First read misses and stages v1 into the tier (read-miss admission).
+  REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  rbuf.data()) >= 0);
+  REQUIRE(rbuf[0] == 1);
+  REQUIRE(cteBlobSize(path, "data/chunk_0") > 0);  // v1 image is cached
+
+  // Whole rewrite: no staging under read-miss, so the v1 image must be
+  // invalidated or the read below hits it.
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   v2.data()) >= 0);
+  REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  rbuf.data()) >= 0);
+  REQUIRE(rbuf[0] == 2);
+  REQUIRE(rbuf[kN - 1] == 2);
+
+  REQUIRE(H5Dclose(dset) >= 0);
+  H5Sclose(space);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+  unsetenv("CLIO_VOL_ADMIT");
+}
+
+TEST_CASE("HDF5 VOL IO - Partial-write-first dataset stays cacheable",
+          "[hdf5_vol][io]") {
+  // Regression: invalidating a dataset that had nothing cached (DelBlob
+  // returns "not found") was treated as an invalidation FAILURE, so any
+  // dataset whose first write was partial was marked uncacheable for the rest
+  // of the session and never staged again.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string path = "/tmp/clio_vol_io_partialfirst.h5";
+  std::remove(path.c_str());
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+  constexpr size_t kN = 1024;  // 4 KiB: one chunk
+  hsize_t dims[1] = {kN};
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  // Partial write first: nothing is cached yet, so the invalidation this
+  // triggers must be a no-op, not a failure.
+  hsize_t mem_dims[1] = {128};
+  hid_t mem_space = H5Screate_simple(1, mem_dims, nullptr);
+  hid_t file_space = H5Dget_space(dset);
+  hsize_t start[1] = {0}, count[1] = {128};
+  REQUIRE(H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, nullptr,
+                              count, nullptr) >= 0);
+  std::vector<int> part(128, 5);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, mem_space, file_space, H5P_DEFAULT,
+                   part.data()) >= 0);
+  H5Sclose(mem_space);
+  H5Sclose(file_space);
+
+  // A whole write afterwards must still stage into the tier.
+  std::vector<int> whole(kN, 9);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   whole.data()) >= 0);
+  REQUIRE(H5Dclose(dset) >= 0);  // drains the async puts
+  H5Sclose(space);
+  REQUIRE(H5Fclose(file) >= 0);
+
+  REQUIRE(cteBlobSize(path, "data/chunk_0") == kN * sizeof(int));
+
+  // And the data itself round-trips.
+  hid_t file2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  REQUIRE(file2 >= 0);
+  hid_t dset2 = H5Dopen2(file2, "data", H5P_DEFAULT);
+  REQUIRE(dset2 >= 0);
+  std::vector<int> rbuf(kN, 0);
+  REQUIRE(H5Dread(dset2, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  rbuf.data()) >= 0);
+  REQUIRE(rbuf[0] == 9);
+  REQUIRE(rbuf[kN - 1] == 9);
+  REQUIRE(H5Dclose(dset2) >= 0);
+  REQUIRE(H5Fclose(file2) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+TEST_CASE("HDF5 VOL IO - A missing chunk is a miss, not garbage",
+          "[hdf5_vol][io]") {
+  // Regression: the reassembly loop ignored every GetBlob return code, so a
+  // chunk that was gone from the tier (per-blob eviction) was memcpy'd from an
+  // uninitialized shared-memory buffer and reported as a cache hit. Only
+  // chunk_0 is hit-tested, so losing any later chunk was silent.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string path = "/tmp/clio_vol_io_evicted.h5";
+  std::remove(path.c_str());
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+  hsize_t dims[1] = {kNumElems};  // 4 chunks at the 4 KiB test chunk size
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+  std::vector<int> wbuf(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) wbuf[i] = static_cast<int>(i * 7 + 3);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   wbuf.data()) >= 0);
+  REQUIRE(H5Dclose(dset) >= 0);  // drains the async puts
+  H5Sclose(space);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(cteBlobSize(path, "data/chunk_2") > 0);
+
+  // Evict a middle chunk. chunk_0 survives, so the read still hit-tests as a
+  // cache hit and must discover the hole during reassembly.
+  cteDelBlob(path, "data/chunk_2");
+
+  hid_t file2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  REQUIRE(file2 >= 0);
+  hid_t dset2 = H5Dopen2(file2, "data", H5P_DEFAULT);
+  REQUIRE(dset2 >= 0);
+  std::vector<int> rbuf(kNumElems, -1);
+  REQUIRE(H5Dread(dset2, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  rbuf.data()) >= 0);
+
+  // Every element comes from the authoritative native file.
+  bool match = true;
+  for (size_t i = 0; i < kNumElems; ++i) {
+    if (rbuf[i] != wbuf[i]) { match = false; break; }
+  }
+  REQUIRE(match);
+
+  // ...and the connector NOTICED. A failed reassembly invalidates the image,
+  // so the hit-test key is gone. Without that, the assertion above could pass
+  // on whatever the recycled buffer happened to hold; this is the part that
+  // actually distinguishes "detected the hole" from "got lucky".
+  REQUIRE(cteBlobSize(path, "data/chunk_0") == 0);
+
+  REQUIRE(H5Dclose(dset2) >= 0);
+  REQUIRE(H5Fclose(file2) >= 0);
   REQUIRE(H5Pclose(fapl) >= 0);
 }
 

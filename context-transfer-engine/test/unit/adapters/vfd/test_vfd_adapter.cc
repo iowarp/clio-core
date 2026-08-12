@@ -47,7 +47,7 @@
 
 namespace {
 const char *kBackend = "/tmp/clio_cte_vfd_test.dat";
-const char *kClioFile = "clio::/tmp/clio_cte_vfd_suite.h5";
+const char *kClioFile = "/tmp/clio_cte_vfd_suite.h5";
 const char *kNativeFile = "/tmp/clio_cte_vfd_suite.h5";
 
 constexpr hsize_t kBig = 512 * 1024;  // multi-page (>4 MiB of doubles)
@@ -65,6 +65,15 @@ bool InitRuntime() {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return false;
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return false;
   auto *cte = CLIO_CTE_CLIENT;
+  // Start from a file we know we can use. Every .h5 fixture in this suite is
+  // removed before it is written; the bdev backing file was the one exception,
+  // and it silently inherited whatever happened to be at this path. A leftover
+  // from an earlier session -- different size, or owned by a different uid and
+  // no longer openable -- made the whole suite fail in setup with "Failed to
+  // open bdev file", which reads like a broken driver rather than stale scratch
+  // state. The fixture should depend on nothing but its own run.
+  std::remove(kBackend);
+
   clio::run::PoolId bdev_pool_id(953, 0);
   clio::run::bdev::Client bdev(bdev_pool_id);
   auto ct = bdev.AsyncCreate(clio::run::PoolQuery::Dynamic(), kBackend,
@@ -324,7 +333,7 @@ int main() {
   // === 3. Differential vs sec2 (native oracle) ============================
   {
     const char *kSec2 = "/tmp/clio_cte_vfd_sec2.h5";
-    const char *kClioDiff = "clio::/tmp/clio_cte_vfd_diff.h5";
+    const char *kClioDiff = "/tmp/clio_cte_vfd_diff.h5";
     const char *kNativeDiff = "/tmp/clio_cte_vfd_diff.h5";
     std::remove(kSec2);
     std::remove(kNativeDiff);
@@ -376,7 +385,7 @@ int main() {
   // === 5. Partial I/O: hyperslab overwrite-in-place =======================
   // (Section 4 -- the external tool matrix -- runs last, after H5close.)
   {
-    const char *kClioPart = "clio::/tmp/clio_cte_vfd_partial.h5";
+    const char *kClioPart = "/tmp/clio_cte_vfd_partial.h5";
     const hsize_t N = kSmall;
     std::vector<int32_t> base(N);
     for (hsize_t i = 0; i < N; ++i) base[i] = static_cast<int32_t>(i);
@@ -422,8 +431,8 @@ int main() {
 
   // === 6. Two VFD files open simultaneously ===============================
   {
-    const char *kA = "clio::/tmp/clio_cte_vfd_a.h5";
-    const char *kB = "clio::/tmp/clio_cte_vfd_b.h5";
+    const char *kA = "/tmp/clio_cte_vfd_a.h5";
+    const char *kB = "/tmp/clio_cte_vfd_b.h5";
     hid_t fa = H5Fcreate(kA, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
     hid_t fb = H5Fcreate(kB, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
     CHECK(fa >= 0 && fb >= 0, "6: create two files at once");
@@ -449,7 +458,7 @@ int main() {
   // an in-process read hits the same page cache, so durability itself is not
   // unit-observable. get_handle must hand back the authoritative POSIX fd.
   {
-    const char *kClioFl = "clio::/tmp/clio_cte_vfd_flush.h5";
+    const char *kClioFl = "/tmp/clio_cte_vfd_flush.h5";
     const char *kNativeFl = "/tmp/clio_cte_vfd_flush.h5";
     std::remove(kNativeFl);
     hid_t f = H5Fcreate(kClioFl, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
@@ -495,7 +504,7 @@ int main() {
   // process), so an independent flock is denied while held and granted after
   // the VFD unlocks on close.
   {
-    const char *kClioLk = "clio::/tmp/clio_cte_vfd_lock.h5";
+    const char *kClioLk = "/tmp/clio_cte_vfd_lock.h5";
     const char *kNativeLk = "/tmp/clio_cte_vfd_lock.h5";
     std::remove(kNativeLk);
     hid_t fapl_lk = H5Pcopy(fapl);
@@ -530,7 +539,7 @@ int main() {
     H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
     H5Eclear2(H5E_DEFAULT);
-    hid_t missing = H5Fopen("clio::/tmp/clio_cte_vfd_absent_xyz.h5",
+    hid_t missing = H5Fopen("/tmp/clio_cte_vfd_absent_xyz.h5",
                             H5F_ACC_RDONLY, fapl);
     bool found_clio_err = false;
     H5Ewalk2(H5E_DEFAULT, H5E_WALK_UPWARD, FindClioErr, &found_clio_err);
@@ -551,7 +560,7 @@ int main() {
   // instant but not in size.)
   {
     const char *kSec2 = "/tmp/clio_cte_vfd_flagsec2.h5";
-    const char *kClioFf = "clio::/tmp/clio_cte_vfd_flagvfd.h5";
+    const char *kClioFf = "/tmp/clio_cte_vfd_flagvfd.h5";
     const char *kNativeFf = "/tmp/clio_cte_vfd_flagvfd.h5";
     std::remove(kSec2);
     std::remove(kNativeFf);
@@ -575,7 +584,7 @@ int main() {
   // File locking is disabled on the FAPL (standard for SWMR): the writer's
   // advisory flock would otherwise block the in-process reader -- same as sec2.
   {
-    const char *kClioSwmr = "clio::/tmp/clio_cte_vfd_swmr.h5";
+    const char *kClioSwmr = "/tmp/clio_cte_vfd_swmr.h5";
     const char *kNativeSwmr = "/tmp/clio_cte_vfd_swmr.h5";
     std::remove(kNativeSwmr);
     hid_t fapl_sw = H5Pcopy(fapl);
@@ -674,7 +683,7 @@ int main() {
               static_cast<const ClioFaplProbe *>(di1)->cache_enabled == 1,
           "12: FAPL round-trips cache_enabled=true");
     H5Pclose(fapl_c);
-    const char *kClioFapl = "clio::/tmp/clio_cte_vfd_fapl.h5";
+    const char *kClioFapl = "/tmp/clio_cte_vfd_fapl.h5";
     std::remove("/tmp/clio_cte_vfd_fapl.h5");
     hid_t f = H5Fcreate(kClioFapl, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_nc);
     CHECK(f >= 0 && WriteRich(f) && H5Fclose(f) >= 0,
@@ -707,7 +716,7 @@ int main() {
   {
     extern unsigned long H5FDclio_read_vector_calls_g;
     extern unsigned long H5FDclio_write_vector_calls_g;
-    const char *kClioVec = "clio::/tmp/clio_cte_vfd_vec.h5";
+    const char *kClioVec = "/tmp/clio_cte_vfd_vec.h5";
     std::remove("/tmp/clio_cte_vfd_vec.h5");
     hid_t dxpl = H5Pcreate(H5P_DATASET_XFER);
     CHECK(dxpl >= 0 && H5Pset_selection_io(dxpl, H5D_SELECTION_IO_MODE_ON) >= 0,
@@ -756,7 +765,7 @@ int main() {
   // on the HDF5 side via stat/reopen and on the CLIO side via the CFS tag) so a
   // deleted file leaves nothing behind in either the filesystem or CTE.
   {
-    const char *kClioDel = "clio::/tmp/clio_cte_vfd_del.h5";
+    const char *kClioDel = "/tmp/clio_cte_vfd_del.h5";
     const char *kNativeDel = "/tmp/clio_cte_vfd_del.h5";
     std::remove(kNativeDel);
     hid_t f = H5Fcreate(kClioDel, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
@@ -801,7 +810,7 @@ int main() {
   // an in-process read hits the page cache. Locking is off so the reader is not
   // blocked by the writer.
   {
-    const char *kClioDur = "clio::/tmp/clio_cte_vfd_durable.h5";
+    const char *kClioDur = "/tmp/clio_cte_vfd_durable.h5";
     const char *kNativeDur = "/tmp/clio_cte_vfd_durable.h5";
     std::remove(kNativeDur);
     std::vector<int32_t> w = MakeI32(kSmall);
@@ -850,11 +859,14 @@ int main() {
   // different file, so the library could open it twice with two independent
   // metadata caches -- corruption, not a performance bug. H5Fget_fileno exposes
   // the shared file struct HDF5 settled on, so equal filenos == cmp() matched.
-  // Three spellings that must all resolve to one file: with the clio:: marker,
-  // without it, and via a redundant path component.
+  // Three spellings that must all resolve to one file. These used to be the
+  // clio::-marked path, the bare path and a dotted path; the marked form is no
+  // longer an accepted input (see section 20), so the distinct spellings are
+  // now bare, doubled-separator, and dotted. The property under test is
+  // unchanged: cmp() must answer on dev/ino, not on the string.
   {
-    const char *kClioId = "clio::/tmp/clio_cte_vfd_ident.h5";
-    const char *kNativeId = "/tmp/clio_cte_vfd_ident.h5";
+    const char *kClioId = "/tmp/clio_cte_vfd_ident.h5";
+    const char *kNativeId = "//tmp/clio_cte_vfd_ident.h5";
     const char *kDotted = "/tmp/../tmp/clio_cte_vfd_ident.h5";
     std::remove(kNativeId);
     hid_t fapl_id_ = H5Pcopy(fapl);
@@ -877,12 +889,12 @@ int main() {
               H5Fget_fileno(e, &fe_no) >= 0,
           "16: H5Fget_fileno on all three");
     CHECK(fa_no == fb_no,
-          "16: clio::-marked and bare paths are ONE file (cmp by dev/ino)");
+          "16: differently-spelled paths are ONE file (cmp by dev/ino)");
     CHECK(fa_no == fe_no,
           "16: redundant path components resolve to the same file");
 
     // Two genuinely different files must still compare different.
-    const char *kOther = "clio::/tmp/clio_cte_vfd_ident_other.h5";
+    const char *kOther = "/tmp/clio_cte_vfd_ident_other.h5";
     std::remove("/tmp/clio_cte_vfd_ident_other.h5");
     hid_t o = H5Fcreate(kOther, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id_);
     CHECK(o >= 0 && WriteDset(o, "d", H5T_NATIVE_INT32, MakeI32(kSmall)) &&
@@ -950,7 +962,7 @@ int main() {
   // The value must survive intact across many passes, including a final pass
   // shorter than the cap and a dataset that is an exact multiple of it.
   {
-    const char *kClioMp = "clio::/tmp/clio_cte_vfd_multipass.h5";
+    const char *kClioMp = "/tmp/clio_cte_vfd_multipass.h5";
     std::remove("/tmp/clio_cte_vfd_multipass.h5");
     // 64 KiB of doubles against a 4 KiB cap => 16+ passes per transfer.
     const hsize_t kN = 8192;
@@ -992,7 +1004,7 @@ int main() {
   // match what they would get natively. Compare against sec2 rather than
   // asserting one particular behavior.
   {
-    const char *kClioCd = "clio::/tmp/clio_cte_vfd_closedeg.h5";
+    const char *kClioCd = "/tmp/clio_cte_vfd_closedeg.h5";
     const char *kSec2Cd = "/tmp/clio_cte_vfd_closedeg_sec2.h5";
     std::remove("/tmp/clio_cte_vfd_closedeg.h5");
     std::remove(kSec2Cd);
@@ -1035,9 +1047,16 @@ int main() {
   }
 
   // === 20. Rejecting unusable file names =================================
-  // An empty name -- directly, or one that is empty once the clio:: marker is
-  // stripped -- has no authoritative file behind it. It must be refused with a
-  // real error, not dereferenced.
+  // An empty name has no authoritative file behind it and must be refused with
+  // a real error rather than dereferenced.
+  //
+  // A clio::-marked name is refused too, and that is a CONTRACT, not a
+  // convenience: the marker is CLIO-internal, and a driver that required it
+  // would make "add CLIO without editing your application" false -- every
+  // filename in the program would have to be rewritten. Refusing it is also
+  // what lets query() advertise POSIX_COMPAT_HANDLE / DEFAULT_VFD_COMPATIBLE,
+  // both of which promise HDF5 that the name it holds is a real path. A marked
+  // name is checked here in its own right, not merely as "empty once stripped".
   {
     H5E_auto2_t of = nullptr;
     void *od = nullptr;
@@ -1045,12 +1064,20 @@ int main() {
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
     hid_t empty = H5Fcreate("", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
     hid_t marker_only = H5Fcreate("clio::", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    hid_t marked = H5Fcreate("clio::/tmp/clio_cte_vfd_marked.h5",
+                             H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
     H5Eset_auto2(H5E_DEFAULT, of, od);
     CHECK(empty < 0, "20: an empty file name is refused");
-    CHECK(marker_only < 0, "20: a name that is empty once stripped is refused");
+    CHECK(marker_only < 0, "20: a bare marker with no path is refused");
+    CHECK(marked < 0, "20: a clio::-marked path is refused (marker is internal)");
+    // ...and nothing was created behind our back at either spelling.
+    CHECK(::access("/tmp/clio_cte_vfd_marked.h5", F_OK) != 0 &&
+              ::access("clio::/tmp/clio_cte_vfd_marked.h5", F_OK) != 0,
+          "20: a refused marked name creates no file");
     if (empty >= 0) H5Fclose(empty);
     if (marker_only >= 0) H5Fclose(marker_only);
-    std::printf("[vfd-suite] ok 20: unusable file names are refused\n");
+    if (marked >= 0) H5Fclose(marked);
+    std::printf("[vfd-suite] ok 20: unusable and marked file names are refused\n");
   }
 
   // === 21. A file already locked by another opener =======================
@@ -1059,7 +1086,7 @@ int main() {
   // Lock contention is the failure a user is most likely to hit and least able
   // to diagnose from a bare error code.
   {
-    const char *kClioBusy = "clio::/tmp/clio_cte_vfd_busy.h5";
+    const char *kClioBusy = "/tmp/clio_cte_vfd_busy.h5";
     const char *kNativeBusy = "/tmp/clio_cte_vfd_busy.h5";
     std::remove(kNativeBusy);
     hid_t fapl_lk = H5Pcopy(fapl);
@@ -1120,6 +1147,115 @@ int main() {
             "4: h5diff repacked == original");
       std::printf("[vfd-suite] ok 4: native tool matrix (h5dump/h5ls/h5repack/h5diff)\n");
     }
+  }
+
+  // === 22. Driver config string ==========================================
+  // The other half of "configurable without source edits". HDF5_DRIVER already
+  // selected this driver; HDF5_DRIVER_CONFIG is how a caller says something
+  // ABOUT it. HDF5 copies that string onto the FAPL and the driver pulls it
+  // with H5Pget_driver_config_str -- there is no H5FD_class_t callback for it,
+  // so this exercises the same code path the environment variable reaches.
+  //
+  // The grammar is the shared CLIO one (key=value;...), matching the dialect the
+  // registered HDF5 VOL connectors already use so a user spells CLIO the way
+  // they spell the rest of a stack.
+  //
+  // A bad config FAILS THE OPEN rather than being ignored. That is the point of
+  // the second half of this section: silently defaulting on a knob the caller
+  // asked for is how someone ends up believing the cache is off when it is on.
+  {
+    H5E_auto2_t of = nullptr;
+    void *od = nullptr;
+    const char *kCfgFile = "/tmp/clio_cte_vfd_cfg.h5";
+
+    struct { const char *cfg; bool want_ok; const char *what; } cases[] = {
+      {"cache=0",           true,  "22: cache=0 accepted"},
+      {"cache=off;",        true,  "22: trailing ';' tolerated"},
+      {"  cache = 1  ",     true,  "22: whitespace tolerated"},
+      {"",                  true,  "22: empty config is valid (says nothing)"},
+      {"bogus=1",           false, "22: unknown key REFUSED, not ignored"},
+      {"cache=maybe",       false, "22: non-boolean cache value REFUSED"},
+      {"cache",             false, "22: entry with no '=' REFUSED"},
+    };
+    for (auto &c : cases) {
+      std::remove(kCfgFile);
+      hid_t cfapl = H5Pcreate(H5P_FILE_ACCESS);
+      H5Eget_auto2(H5E_DEFAULT, &of, &od);
+      H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+      herr_t set = H5Pset_driver_by_name(cfapl, "clio_vfd", c.cfg);
+      hid_t h = (set >= 0)
+                    ? H5Fcreate(kCfgFile, H5F_ACC_TRUNC, H5P_DEFAULT, cfapl)
+                    : H5I_INVALID_HID;
+      H5Eset_auto2(H5E_DEFAULT, of, od);
+      CHECK(c.want_ok ? (h >= 0) : (h < 0), c.what);
+      if (h >= 0) H5Fclose(h);
+      H5Pclose(cfapl);
+    }
+    std::remove(kCfgFile);
+    std::printf("[vfd-suite] ok 22: driver config string parsed and validated\n");
+  }
+
+  // === 23. Byte-altitude access telemetry ================================
+  // The VFD's half of the two-altitude telemetry contract. What is asserted is
+  // not "a file appeared" but the two properties the contract actually rests
+  // on, because both are the kind that rot silently:
+  //
+  //   (a) ABSENT MEANS ABSENT. No byte-altitude record may carry a `dataset`
+  //       key. The driver cannot know which dataset an access belongs to, and
+  //       emitting null/""/0 would let a consumer confuse "not measured" with
+  //       "measured as zero" -- which drive opposite recommendations.
+  //   (b) SESSIONS DO NOT CLOBBER. "create, write, close; open, read, close" is
+  //       two sessions on one path in one process. Keyed by pid alone, the read
+  //       session truncated the write session's artifacts and the summary
+  //       reported ZERO writes for a workload that wrote the whole file.
+  //
+  // Telemetry is checked here rather than trusted because nothing else reads it
+  // yet: until `hdf5 diagnose` exists, a wrong field would sit wrong for months.
+  {
+    const char *kTraceDir = "/tmp/clio_cte_vfd_trace_t";
+    RunCmd(std::string("rm -rf '") + kTraceDir + "'");
+    RunCmd(std::string("mkdir -p '") + kTraceDir + "'");
+    // The trace directory is read once per process, so exercising it needs a
+    // fresh process: re-run this same binary's workload under a child that has
+    // CLIO_VFD_TRACE set. h5cc-free -- we just need SOME HDF5 traffic.
+    // The plugin path is supplied to the CHILD, never required of the parent.
+    // Setting HDF5_PLUGIN_PATH for this test binary would make HDF5 dlopen a
+    // SECOND copy of the driver alongside the one this binary links, each with
+    // its own error-class id -- and section 9, which walks the stack for this
+    // driver's class, would then look for the wrong id and fail. That cost an
+    // hour once; keep the parent environment clean.
+    const char *repo = std::getenv("CLIO_REPO_PATH");
+    const std::string child =
+        std::string("CLIO_VFD_TRACE='") + kTraceDir + "' " +
+        "HDF5_PLUGIN_PATH='" + (repo ? repo : ".") + "' " +
+        "HDF5_DRIVER=clio_vfd CLIO_VFD_CACHE=0 " +
+        "h5dump -H '" + kNativeFile + "' >/dev/null 2>&1";
+    const int rc = RunCmd(child);
+    (void)rc;  /* h5dump may be absent; the assertions below handle that */
+
+    const bool produced =
+        RunCmd(std::string("ls '") + kTraceDir + "'/*.access.json >/dev/null 2>&1") == 0;
+    if (!produced) {
+      std::printf("[vfd-suite] WARN 23: no trace produced (h5dump absent?); "
+                  "skipping telemetry assertions\n");
+    } else {
+      // (a) the absent-field guarantee, checked against the raw records.
+      CHECK(RunCmd(std::string("grep -q dataset '") + kTraceDir +
+                   "'/*.access.jsonl") != 0,
+            "23: byte-altitude records carry NO dataset key (absent==absent)");
+      // The envelope and the self-describing limits must both be present.
+      CHECK(RunCmd(std::string("grep -q '\"altitude\":\"byte\"' '") + kTraceDir +
+                   "'/*.access.json") == 0,
+            "23: summary declares its altitude");
+      CHECK(RunCmd(std::string("grep -q 'cannot_see' '") + kTraceDir +
+                   "'/*.access.json") == 0,
+            "23: summary states what it cannot see");
+      CHECK(RunCmd(std::string("grep -q 'mem_class' '") + kTraceDir +
+                   "'/*.access.json") == 0,
+            "23: metadata-vs-raw split present (the VOL cannot produce this)");
+      std::printf("[vfd-suite] ok 23: byte-altitude telemetry contract\n");
+    }
+    RunCmd(std::string("rm -rf '") + kTraceDir + "'");
   }
 
   std::printf("[vfd-suite] PASS: native write-through verified\n");

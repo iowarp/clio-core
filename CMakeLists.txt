@@ -178,6 +178,18 @@ option(CLIO_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(CLIO_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
 option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.14)" OFF)
 
+# Link libhdf5 into components that READ or WRITE real .h5 files but are not the
+# VOL connector -- today that is CAE (the HDF5 assimilator, and ExportData, which
+# exports a CTE tag as an .h5).
+#
+# This option is what context-assimilation-engine/CMakeLists.txt has always
+# derived CLIO_CAE_ENABLE_HDF5 from, but it was never actually DECLARED anywhere,
+# so it silently evaluated as empty/false and CAE's entire HDF5 path -- including
+# the pre-existing ExportData -- compiled out to "HDF5 support not compiled in".
+# Declaring it makes that code reachable. It stays OFF by default: HDF5 is an
+# optional system dependency and nothing in the default build needs it.
+option(CLIO_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE (assimilator + .h5 export)" OFF)
+
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
@@ -897,7 +909,7 @@ if(CLIO_CORE_ENABLE_LIBFABRIC)
 endif()
 
 # HDF5 (optional - for CAE HDF5 assimilator and CTE HDF5 VOL connector)
-if(CLIO_CTE_ENABLE_HDF5_VOL)
+if(CLIO_CTE_ENABLE_HDF5_VOL OR CLIO_CORE_ENABLE_HDF5)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
@@ -1417,12 +1429,55 @@ if(CLIO_CORE_ENABLE_TESTS)
     # after every test that requires the fixture, even if those tests fail
     # or crash, ensuring temp files do not persist between runs.
     # -----------------------------------------------------------------------
+    # Freeing the runtime ports is the load-bearing half of this fixture, and it
+    # was a silent no-op wherever `fuser` is absent -- which includes the
+    # project's own dev container. `2>/dev/null` swallowed "command not found"
+    # and the trailing `exit 0` made the fixture report success regardless, so
+    # the next test to start an embedded runtime hit
+    #   Failed to start main server on 127.0.0.1:9413 - Address already in use
+    # and died in ~0.02 s. Reproduced at 4 failures in 5 consecutive runs of
+    # `ctest -R "vfd|cte_hdf5_vol_io_"`, while the same tests pass 12/12 in
+    # isolation -- i.e. it presents as a flaky test and is actually a
+    # deterministic missing dependency.
+    #
+    # Try fuser, then ss, then lsof, and say so when none of them exists rather
+    # than pretending the port is clear.
+    #
+    # The per-user IPC dir below is expanded by the SHELL, not by CMake. It was
+    # `${USER}` -- a bare CMake variable, which CMake does not define -- so the
+    # generated command was literally `rm -rf /tmp/clio_`, and the directory it
+    # was meant to clear was never touched on any platform. The spelling here
+    # mirrors SystemInfo::GetMemfdDir exactly, fallback included: CLIO_MEMFD_DIR
+    # override, else /tmp/clio_$USER, else the literal "unknown" that the
+    # runtime itself uses when USER is unset. Guessing a different fallback (the
+    # real uid, say) would clean a directory the runtime never writes to.
+    set(_clio_port_kill
+        # 10620 is the HDF5 VOL I/O suite. Any test moved off the default port
+        # has to be listed here too, or it silently loses the stray-listener
+        # sweep that moving off the default was meant to make unnecessary.
+        # Still missing: 10500/10613/10615/10617 and the 10596-10599 range,
+        # whose suites moved off 9413 without being added here.
+        "_clio_ports='5555 5558 9413 9414 9416 10620'; \
+         if command -v fuser >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do fuser -k \$_p/tcp >/dev/null 2>&1; done; \
+         elif command -v ss >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do \
+             ss -tlnpH \"sport = :\$_p\" 2>/dev/null \
+               | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u \
+               | while read -r _pid; do [ -n \"\$_pid\" ] && kill -9 \"\$_pid\" 2>/dev/null; done; \
+           done; \
+         elif command -v lsof >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do lsof -ti tcp:\$_p 2>/dev/null | xargs -r kill -9 2>/dev/null; done; \
+         else \
+           echo 'clio cleanup: no fuser/ss/lsof; cannot free runtime ports -- back-to-back embedded-runtime tests may fail to bind' >&2; \
+         fi")
+
     set(_clio_cleanup_cmd
-        "fuser -k 5555/tcp 5558/tcp 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+        "${_clio_port_kill}; \
          rm -f /tmp/clio_*.ipc 2>/dev/null; \
          rm -f /tmp/clio_server_timing.log 2>/dev/null; \
          rm -rf /tmp/clio_memfd 2>/dev/null; \
-         rm -rf /tmp/clio_${USER} 2>/dev/null; \
+         rm -rf \"\${CLIO_MEMFD_DIR:-/tmp/clio_\${USER:-unknown}}\" 2>/dev/null; \
          rm -f /dev/shm/sm_segment.* 2>/dev/null; \
          rm -f /dev/shm/test_buddy_bench_* 2>/dev/null; \
          rm -f \"${CMAKE_BINARY_DIR}\"/cte_*.dat* \"${CMAKE_BINARY_DIR}\"/cte_*.yaml \"${CMAKE_BINARY_DIR}\"/*stress*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.yaml \"${CMAKE_BINARY_DIR}\"/temp_unregister_test.dat 2>/dev/null; \
@@ -1685,22 +1740,56 @@ if(CLIO_CORE_ENABLE_TESTS)
     endforeach()
 
     # -----------------------------------------------------------------------
-    # Apply the cleanup fixture to every component test so that the
-    # cr_post_test_cleanup hook runs after the whole suite, even when
-    # individual tests fail. Excludes the cleanup fixtures themselves.
+    # Per-test DEFAULTS: what every test gets unless it opts out.
+    #
+    # Two things. The cleanup fixture, so cr_post_test_cleanup runs after the
+    # suite even when individual tests fail. And isolation from process-global
+    # CLIO state, because the default was the other way round and that is the
+    # expensive half of this tree's debugging cost.
+    #
+    # The specific case: RuntimeManager replays ~/.clio/restart_log.bin on EVERY
+    # startup (manager.cc), re-composing whatever is registered there through the
+    # admin client. That file is HOME-scoped and shared by every test, every
+    # local `clio_run compose start`, and every previous session. 61 test files
+    # stand up a runtime; 7 isolated the WAL by hand. The other 54 inherited
+    # whatever the machine happened to be carrying -- and a foreign entry
+    # composes pool 512.0 with create-params that are not theirs.
+    #
+    # Isolating it per test here rather than per test file means a NEW test is
+    # isolated by default and sharing is what you opt into, which is the way
+    # round it should have been. Tests that genuinely want shared state can
+    # still set the variable themselves.
+    #
+    # PREPENDED, not appended: ctest applies ENVIRONMENT entries in order and the
+    # last assignment wins, so a test that sets the same variable keeps its own
+    # value. (Tests that setenv() in C++ override the process env regardless.)
+    #
+    # Not stamped here, deliberately:
+    #   CLIO_PORT -- would override the port in a test's own CLIO_SERVER_CONF
+    #     yaml (env beats yaml in ConfigManager), pointing the client at a
+    #     different port than the runtime it just started. Isolation that breaks
+    #     working tests is not isolation.
+    #   CLIO_REQUIRE_RUNTIME -- plenty of tests legitimately run with no runtime
+    #     (the *_no_runtime binaries exist to prove the connectors survive that).
+    #     It belongs on suites that mean to measure a live tier, not on all.
     # -----------------------------------------------------------------------
-    function(_clio_require_cleanup_fixture_recursive dir)
+    function(_clio_apply_test_defaults_recursive dir)
         get_directory_property(_tests DIRECTORY "${dir}" TESTS)
         foreach(_t ${_tests})
             if(NOT _t STREQUAL "cr_pre_test_cleanup" AND
                NOT _t STREQUAL "cr_post_test_cleanup")
                 set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
                     FIXTURES_REQUIRED clio_test_cleanup_fixture)
+                get_property(_env TEST ${_t} DIRECTORY "${dir}"
+                             PROPERTY ENVIRONMENT)
+                set_property(TEST ${_t} DIRECTORY "${dir}" PROPERTY ENVIRONMENT
+                    "CLIO_RESTART_LOG=${CMAKE_BINARY_DIR}/test_isolation/${_t}.restart.bin"
+                    ${_env})
             endif()
         endforeach()
         get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
         foreach(_sub ${_subdirs})
-            _clio_require_cleanup_fixture_recursive("${_sub}")
+            _clio_apply_test_defaults_recursive("${_sub}")
         endforeach()
     endfunction()
 
@@ -1714,7 +1803,7 @@ if(CLIO_CORE_ENABLE_TESTS)
         list(GET _pair 0 _component_dir)
         list(GET _pair 1 _component_flag)
         if(${_component_flag} AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
-            _clio_require_cleanup_fixture_recursive(
+            _clio_apply_test_defaults_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
         endif()
     endforeach()

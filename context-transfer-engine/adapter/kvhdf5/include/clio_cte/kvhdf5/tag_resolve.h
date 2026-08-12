@@ -2,8 +2,9 @@
 
 // Runtime side of the path->tag scheme (see tag_path.h): resolve a canonical tag
 // string to an iowarp CTE TagId via get-or-create. Host-only (tags are created on
-// the CPU). Kept out of cpu_dataset.h so the no-iowarp unit build stays clean;
-// only the iowarp-facing layer (GpuCteDataset) pulls this in.
+// the CPU). Kept out of the shared headers (layout.h/dataset_meta.h/chunking.h) so
+// the no-iowarp unit build stays clean; only the iowarp-facing layer
+// (GpuCteDataset) pulls this in.
 
 #include <clio_ctp/constants/macros.h>  // CTP_IS_DEVICE_PASS
 

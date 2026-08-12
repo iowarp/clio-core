@@ -5,8 +5,13 @@
 # CTE adapter singleton implementation - moved to filesystem directory
 # to leverage existing working build configuration
 
-if(UNIX)
-    endif()
+# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it
+# never touches real_api.h, so it does not need ELF support. Gate it on
+# UNIX -- H5FDclio.cc uses <sys/file.h>, <unistd.h> and flock, so Windows
+# needs porting work rather than a gate change.
+if(UNIX AND CLIO_CTE_ENABLE_VFD)
+    add_subdirectory(vfd)
+endif()
 
 # Adapters require ELF support (for real_api.h)
 # Disable all adapters when ELF is disabled
@@ -22,9 +27,6 @@ if(CLIO_CORE_ENABLE_ELF)
     endif()
     if (CLIO_CTE_ENABLE_MPIIO_ADAPTER)
         add_subdirectory(mpiio)
-    endif()
-    if (CLIO_CTE_ENABLE_VFD)
-        add_subdirectory(vfd)
     endif()
     if (CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER)
         add_subdirectory(nvidia_gds)

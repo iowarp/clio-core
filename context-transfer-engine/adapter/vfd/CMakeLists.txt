@@ -20,6 +20,12 @@ set_target_properties(clio_vfd PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(clio_vfd SYSTEM PUBLIC ${HDF5_INCLUDE_DIRS})
+# The CTE root, so shared adapter headers resolve as "adapter/<name>.h" -- the
+# config-string grammar is shared with the VOL connector and must not be
+# duplicated: one CLIO config dialect, one parser. This spelling used to arrive
+# transitively (clio_cte_cfs_adapter exported ${CLIO_CTE_ROOT} PUBLIC); that
+# target is gone, so name it here as the other adapters now do.
+target_include_directories(clio_vfd PRIVATE ${CLIO_CTE_ROOT})
 target_link_libraries(clio_vfd
   clio_cte_filesystem_client  # descriptor layer + chimod client
   clio_cte_core_client

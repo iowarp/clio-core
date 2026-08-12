@@ -14,7 +14,7 @@ namespace clio::cte::filesystem {
 
 // Process-wide filesystem client singleton (defined inside the namespace so it
 // is clio::cte::filesystem::g_fs_client, matching the CLIO_CFS_CLIENT macro).
-CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::filesystem::Client, g_fs_client);
+CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::filesystem::Client, g_fs_client);
 
 /**
  * Create-or-bind the default filesystem pool over the default CTE core pool

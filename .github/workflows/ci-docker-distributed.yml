@@ -1,0 +1,88 @@
+name: Docker Distributed Stop Test
+
+# Distributed docker CI for issue #710 ("Distributed Jarvis Unit Test"):
+# proves that `clio_run stop` consistently kills the WHOLE runtime across a
+# multi-node cluster, leaving zero stale runtime artifacts on any node.
+#
+# clio_run is compiled ONCE inside the iowarp/deps-cpu image so the binary is
+# ABI-compatible with the node containers (which load it from the mounted build
+# dir). run_tests.sh then stands up a 2-node docker-compose cluster wired with
+# SSH and drives Jarvis on node1 to:
+#   * start the runtime on BOTH nodes (Jarvis pssh fan-out),
+#   * stop it via `jarvis ppl stop`  -> `clio_run runtime stop`         (graceful),
+#   * stop it via `jarvis ppl kill`  -> `clio_run runtime stop --force` (force),
+# asserting after each that every node's `clio_run runtime status` reports a
+# clean shutdown (exit 1, no `stale:` paths, no UNRESPONSIVE).
+#
+# This is the GitHub-Actions-native counterpart to the Ares
+# jarvis_clio_core/pipelines/ares/distributed.yaml sweep, which cannot run here
+# because it needs SLURM + apptainer on a real cluster.
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-docker-distributed-${{ github.ref }}
+  # Cancel superseded PR-branch runs only; a merge to a shared branch must
+  # always finish (see cluster-tests.yml for the rationale).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  stop-distributed:
+    name: clio_run stop kills the whole runtime (2-node docker + jarvis pssh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DEPS_IMAGE: iowarp/deps-cpu:latest
+      DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # Authenticated pulls avoid Docker Hub's anonymous rate limit. Skipped
+      # automatically on forked-PR runs where the secret is unavailable.
+      - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Pull dependency image
+        run: docker pull "$DEPS_IMAGE"
+
+      # Compile ONLY clio_run (its runtime start/stop/status subcommands are all
+      # this test needs) inside deps-cpu, so it links the same libraries the node
+      # containers provide at runtime.
+      - name: Build clio_run (inside deps-cpu)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "$DEPS_IMAGE" bash -c '
+              set -e
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF
+              cmake --build build -j"$(nproc)" --target clio_run
+              # Hand ownership back to the runner so the test cluster (which runs
+              # as the runner uid) and post-job cleanup can access build/.
+              chown -R "$HOST_UID:$HOST_GID" build
+            '
+
+      - name: Distributed stop test (2-node cluster, jarvis pssh)
+        run: ./context-runtime/test/integration/chimaera_stop/run_tests.sh
+
+      # run_tests.sh tears its own cluster down on success and failure; this only
+      # fires if the step was killed before its own cleanup ran.
+      - name: Cleanup cluster
+        if: always()
+        run: |
+          docker compose \
+            -f context-runtime/test/integration/chimaera_stop/docker-compose.yaml \
+            down -v 2>/dev/null || true

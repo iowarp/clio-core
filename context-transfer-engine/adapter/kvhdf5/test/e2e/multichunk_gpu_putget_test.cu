@@ -33,7 +33,7 @@
 #include <clio_runtime/singletons.h>
 #include <clio_ctp/util/gpu_api.h>
 
-#include <clio_cte/kvhdf5/cpu_dataset.h>      // Layout
+#include <clio_cte/kvhdf5/dataset_meta.h>      // Layout, DatasetMeta
 #include <clio_cte/kvhdf5/gpu_cte_dataset.h>
 
 #include <cstdio>

@@ -137,9 +137,16 @@ class Future {
 
 }  // namespace gpu
 
-/** Queue type for the per-device gpu2cpu_queue (stores gpu::Future<Task>). */
+/** Queue type for the per-device gpu2cpu_queue (stores gpu::Future<Task>).
+ *
+ * GPU kernels produce into this lane; the CPU GPU-worker drains it, and it
+ * lives in pinned host memory. That makes it a HOST_CONSUMER ring: a producer
+ * parked in Emplace's wait-for-space spin must re-read head_ with a pure
+ * volatile load, never a device-scope atomicAdd RMW (which would write its
+ * stale head_ back over the consumer's store and wedge the ring). */
 using GpuTaskQueue =
-    ctp::ipc::multi_mpsc_ring_buffer<gpu::Future<Task>, CLIO_QUEUE_ALLOC_T>;
+    ctp::ipc::multi_mpsc_host_consumer_ring_buffer<gpu::Future<Task>,
+                                                   CLIO_QUEUE_ALLOC_T>;
 /** Single lane within a GpuTaskQueue. */
 using GpuTaskLane = GpuTaskQueue::ring_buffer_type;
 

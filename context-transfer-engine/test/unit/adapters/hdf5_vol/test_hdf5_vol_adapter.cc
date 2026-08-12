@@ -152,9 +152,8 @@ TEST_CASE("HDF5 VOL - File Access Property List", "[hdf5_vol]") {
   hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
   REQUIRE(fapl >= 0);
 
-  clio_vol_info_t info;
+  clio_vol_info_t info = {};  /* value-init: see clio_vol.h */
   info.under_vol_id = H5I_INVALID_HID;
-  info.under_vol_info = nullptr;
   info.chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
   REQUIRE(H5Pset_vol(fapl, connector_id, &info) >= 0);
 
@@ -203,10 +202,10 @@ TEST_CASE("HDF5 VOL - Info Copy And Free", "[hdf5_vol]") {
   const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
 
-  clio_vol_info_t info;
+  clio_vol_info_t info = {};  /* value-init: see clio_vol.h */
   info.under_vol_id = H5I_INVALID_HID;
-  info.under_vol_info = nullptr;
   info.chunk_size = 4 * 1024;
+  info.cache_enabled = CLIO_VOL_CACHE_OFF;
 
   SECTION("copy produces an independent equal info");
   void *copied = cls->info_cls.copy(&info);
@@ -216,6 +215,9 @@ TEST_CASE("HDF5 VOL - Info Copy And Free", "[hdf5_vol]") {
   REQUIRE(copy->under_vol_id == info.under_vol_id);
   REQUIRE(copy->under_vol_info == nullptr);
   REQUIRE(copy->chunk_size == info.chunk_size);
+  /* cache_enabled must survive the copy: info_cmp compares it, so a copy that
+     dropped it would make an explicit opt-out compare equal to "unset". */
+  REQUIRE(copy->cache_enabled == CLIO_VOL_CACHE_OFF);
 
   SECTION("free releases the copy");
   REQUIRE(cls->info_cls.free(copied) == 0);

@@ -129,6 +129,25 @@ class Client : public clio::run::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+  /**
+   * Asynchronous ImportData - import an HDF5 dataset from a file into a CTE tag
+   * @param tag_name  Name of the CTE tag to import into (== in-file dataset path)
+   * @param input_path  Source file path
+   * @param format  Import format: "hdf5"
+   * @param pool_query  Pool query for routing (default: Local)
+   */
+  clio::run::Future<ImportDataTask> AsyncImportData(
+      const std::string &tag_name,
+      const std::string &input_path,
+      const std::string &format,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<ImportDataTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query,
+        tag_name, input_path, format);
+    return ipc_manager->Send(task);
+  }
+
   clio::run::Future<ProcessHdf5DatasetTask> AsyncProcessHdf5Dataset(
       const clio::run::PoolQuery& pool_query,
       const std::string& file_path,

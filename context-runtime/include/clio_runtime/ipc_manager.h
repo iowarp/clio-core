@@ -1406,6 +1406,33 @@ class IpcManager {
    */
   size_t ClearUserIpcs();
 
+  /**
+   * Unlink this runtime's own filesystem artifacts without unmapping memory.
+   *
+   * Removes the directory entries this runtime created in the per-user memfd
+   * directory: the main/queue segment symlinks, any on-demand data-segment
+   * symlinks owned by this pid, and the local control socket files. The
+   * backing memfds stay alive through this process's file descriptors and
+   * mappings, so already-mapped memory remains valid (unlink-only, no
+   * shm_destroy). Lock-free and async-signal-tolerant enough to be called
+   * from the shutdown watchdog / force-stop threads.
+   *
+   * @return Number of filesystem entries removed
+   */
+  size_t UnlinkOwnArtifacts();
+
+  /**
+   * Unlink only the memfd-directory entries owned by THIS process: on-demand
+   * data segments (clio_<pid>_<idx>) and per-thread MPSC receive segments
+   * (clio-<pid>-<tid>). Safe in CLIENT mode — never touches the runtime's
+   * named segments or sockets. Called from ClientFinalize so short-lived
+   * clients (CLI tools, benchmarks) don't accumulate dead symlinks that
+   * only the next runtime start would reap.
+   *
+   * @return Number of filesystem entries removed
+   */
+  size_t UnlinkOwnPidEntries();
+
  private:
   // Pool query resolution helpers
   std::vector<PoolQuery> ResolveLocalQuery(const PoolQuery &query,

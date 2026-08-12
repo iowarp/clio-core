@@ -1,9 +1,13 @@
 # HDF5 VOL Connector Unit Tests
 #
-# Exercises the connector's plugin entry points, class definition,
-# registration and property-list integration with HDF5. No Clio runtime
-# is required (the connector's initialize callback is nullptr), so these
-# tests run standalone without RESOURCE_LOCK / cleanup fixtures.
+# test_hdf5_vol_adapter exercises the connector's plugin entry points, class
+# definition, registration and property-list integration with HDF5. No Clio
+# runtime is required (the connector's initialize callback is nullptr), so it
+# runs standalone without RESOURCE_LOCK / cleanup fixtures.
+#
+# test_hdf5_vol_io, added later in this same file, is the opposite: it brings up
+# an in-process runtime and DOES need the lock. Do not read the paragraph above
+# as applying to every test registered here.
 #
 # Linking this test also regression-checks issue #518: it consumes
 # ${HDF5_LIBRARIES}, which was empty when HDF5 was found in CONFIG mode
@@ -109,6 +113,26 @@ if(NOT WIN32)
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"
+          # These stand up a real in-process runtime (CLIO_INIT with an
+          # embedded server), so they are NOT the lock-free standalone tests
+          # this file's header describes -- that text predates test_hdf5_vol_io
+          # and only ever applied to test_hdf5_vol_adapter. Every other
+          # runtime-using suite takes the lock; this one did not.
+          #
+          # Hygiene, not a bug fix, and the distinction is worth keeping. An
+          # earlier version of this comment claimed the missing lock caused the
+          # intermittent 30 s "RouteTask: inline retry exhausted" failure at
+          # CLIO_INIT, via two runtimes colliding on port 9413's shared-memory
+          # segment name. That was WRONG and is recorded here so it is not
+          # re-derived: ctest runs serially (no -j, no CTEST_PARALLEL_LEVEL in
+          # CI), so these never overlapped with the VFD suite in the first
+          # place, and the missing lock was inert. The failure did not reproduce
+          # in 140 attempts with the pre-fix configuration restored.
+          #
+          # The lock and the distinct port still belong here -- they are what
+          # every sibling suite does, and they matter the moment anyone runs
+          # ctest with -j -- but nothing here is known to fix that failure.
+          RESOURCE_LOCK "clio_runtime"
           # HDF5_USE_FILE_LOCKING=FALSE: these tests close a file and
           # immediately reopen it. H5Fclose() returns success before the
           # OS-level flock is released, so the reopen intermittently fails on
@@ -123,7 +147,12 @@ if(NOT WIN32)
           # the clio VOL connector keeping a runtime-side handle open past
           # H5Fclose(). If that is real, disabling the lock hides it rather
           # than fixing it -- worth chasing separately.
-          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
+          # CLIO_RESTART_LOG is NOT set here: the top-level CMakeLists stamps a
+          # per-test WAL path on every test now, so isolation from the shared
+          # ~/.clio/restart_log.bin is the default rather than something each
+          # suite remembers to ask for. Setting it here too would be a second
+          # mechanism for one job.
+          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10620;HDF5_USE_FILE_LOCKING=FALSE"
   )
 endif()
 
@@ -151,10 +180,12 @@ install(
 # future regression fails the test. Run them for the authoritative,
 # always-current status; do not rely on numbers copied into comments/prose.
 #
-# The VFD arm carries NO --expect-fail at all. The VOL arm carries exactly ONE
-# entry, named individually and justified below -- not a blanket allowlist. The
-# suite reports an expected-gap entry that starts PASSING, so the allowlist
-# cannot quietly outlive the gap it excuses.
+# NEITHER arm carries an --expect-fail. The VOL arm used to carry exactly one,
+# for the cache serving a pre-corruption copy of a file damaged behind HDF5's
+# back; the coherence stamp closed it and the suite itself said so, printing
+# "previously-failing cases now PASS (drop from --expect-fail)". That mechanism
+# working as designed is why the allowlist is empty rather than forgotten. If a
+# gap is ever added back, name it individually and put its reason in GAP_NOTES.
 #
 # Finding Python3 is necessary but NOT sufficient: the suite is a differential
 # test against a native HDF5 stack and also needs the h5py module plus the HDF5
@@ -173,17 +204,6 @@ if(Python3_FOUND)
             --modes vol
             --bin $<TARGET_FILE_DIR:clio_hdf5_vol>
             --out ${CMAKE_CURRENT_BINARY_DIR}/vol_compat_results.json
-            # KNOWN-OPEN GAP, not a regression. With the cache ON, a file
-            # damaged on disk after being read once is served from the staged
-            # copy, so the read SUCCEEDS where native fails its fletcher32
-            # check -- the cache masking the file's own error. This is
-            # external-modification staleness, documented in
-            # adapter/hdf5_vol/README.md; the connector has no invalidation
-            # signal for a change made behind HDF5's back. The same case with
-            # the cache OFF passes, and the VFD passes it in both settings
-            # (its cache is populate-only, so it has nothing to answer from).
-            # Remove this line if/when staleness detection lands.
-            --expect-fail vol/eparity_cacheon/corrupt_checksum_read
     )
     set_tests_properties(cte_hdf5_vol_compat_suite PROPERTIES
         TIMEOUT 900

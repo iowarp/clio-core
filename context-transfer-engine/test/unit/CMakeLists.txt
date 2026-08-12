@@ -1630,7 +1630,7 @@ endif()
 
 set_tests_properties(cfs_shm_read PROPERTIES
     ENVIRONMENT "${_cfs_shm_read_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
@@ -1684,7 +1684,7 @@ add_test(NAME cte_getblob_priv_inline
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set_tests_properties(cte_getblob_priv_inline PROPERTIES
     ENVIRONMENT "${_getblob_priv_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 120
     LABELS "unit;core;cte;msan_skip")
 
@@ -1694,7 +1694,7 @@ add_test(NAME cte_getblob_priv_separate
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set_tests_properties(cte_getblob_priv_separate PROPERTIES
     ENVIRONMENT "${_getblob_priv_env};CLIO_GETBLOB_PRIV_MODE=separate"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
     LABELS "unit;core;cte;msan_skip")
 
@@ -1732,7 +1732,7 @@ add_test(NAME cte_putblob_priv_inline
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set_tests_properties(cte_putblob_priv_inline PROPERTIES
     ENVIRONMENT "${_getblob_priv_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 120
     LABELS "unit;core;cte;msan_skip")
 
@@ -1741,7 +1741,7 @@ add_test(NAME cte_putblob_priv_separate
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set_tests_properties(cte_putblob_priv_separate PROPERTIES
     ENVIRONMENT "${_getblob_priv_env};CLIO_PUTBLOB_PRIV_MODE=separate"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
     LABELS "unit;core;cte;msan_skip")
 endif()  # UNIX
@@ -1844,7 +1844,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "unit;core;cte;safe_bdev;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
         FIXTURES_REQUIRED "chimaera_test_cleanup_fixture"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
 )
@@ -1886,7 +1886,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "unit;core;cte;safe_bdev;recovery;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
         FIXTURES_REQUIRED "chimaera_test_cleanup_fixture"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
 )

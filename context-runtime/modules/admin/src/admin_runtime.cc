@@ -61,12 +61,6 @@
 #include <unordered_set>
 #include <vector>
 
-#ifdef CLIO_COVERAGE
-// abort() in InitiateShutdown skips the gcov at-exit flush; declared here so
-// the shutdown path can dump counters explicitly (see InitiateShutdown).
-extern "C" void __gcov_dump(void);
-#endif
-
 namespace clio::run::admin {
 
 // Method implementations for Runtime class
@@ -298,38 +292,23 @@ clio::run::TaskResume Runtime::StopRuntime(clio::run::shared_ptr<StopRuntimeTask
   task->return_code_ = 0;
   task->error_message_ = "";
 
-  // Die immediately. SWIM will detect the death and trigger recovery.
   is_shutdown_requested_ = true;
-  HLOG(kInfo, "Admin: Runtime shutdown initiated successfully");
-  InitiateShutdown(task->grace_period_ms_);
+  const bool force =
+      (task->shutdown_flags_ & StopRuntimeTask::kForceShutdown) != 0;
+  HLOG(kInfo, "Admin: Runtime shutdown initiated ({})",
+       force ? "forced" : "graceful");
+
+  // This handler runs on a worker thread, so it must not tear down the
+  // runtime inline (ServerFinalize joins this very worker). RequestStop only
+  // sets flags / spawns detached threads; shutdown proceeds asynchronously
+  // after this task's ack is delivered to the client.
+  auto *runtime_manager = CLIO_RUNTIME_MANAGER;
+  runtime_manager->RequestStop(force
+                                   ? clio::run::RuntimeManager::StopMode::kForce
+                                   : clio::run::RuntimeManager::StopMode::kGraceful,
+                               task->grace_period_ms_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
-}
-
-void Runtime::InitiateShutdown(clio::run::u32 grace_period_ms) {
-  HLOG(kDebug, "Admin: Initiating runtime shutdown with {}ms grace period",
-       grace_period_ms);
-
-  // In a real implementation, this would:
-  // 1. Signal all worker threads to stop
-  // 2. Wait for current tasks to complete (up to grace period)
-  // 3. Clean up all resources
-  // 4. Exit the runtime process
-
-  // For now, we'll just set a flag that other components can check
-  is_shutdown_requested_ = true;
-
-  // Get CLIO Runtime manager to initiate shutdown
-  auto *runtime_manager = CLIO_RUNTIME_MANAGER;
-  if (runtime_manager) {
-    // runtime_manager->InitiateShutdown(grace_period_ms);
-  }
-#ifdef CLIO_COVERAGE
-  // abort() skips the gcov at-exit flush; dump counters explicitly so
-  // daemon-side coverage from runtime tests is not silently discarded.
-  __gcov_dump();
-#endif
-  std::abort();
 }
 
 clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {

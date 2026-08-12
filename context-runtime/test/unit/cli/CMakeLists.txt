@@ -105,7 +105,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_runtime_command_tests PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 110
     LABELS "msan_skip"
   )
@@ -139,7 +139,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_cte_wal_restart PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 110
     LABELS "msan_skip"
   )
@@ -179,7 +179,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_client_crash_leak PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
     LABELS "msan_skip;leak;crash"
   )
@@ -217,7 +217,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cfs PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 110
       LABELS "msan_skip"
     )
@@ -253,7 +253,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cfs_rename PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 180
       LABELS "msan_skip"
     )
@@ -290,7 +290,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cfs_parallel_stress PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 300
       LABELS "msan_skip"
     )
@@ -328,7 +328,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cte_fallback PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 180
       LABELS "msan_skip"
     )
@@ -367,7 +367,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_bdev_acl PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 120
     LABELS "msan_skip"
   )
@@ -405,7 +405,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_fallback_runtime PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
     LABELS "msan_skip"
   )
@@ -466,7 +466,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_compose_restart PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 240
     LABELS "msan_skip"
   )

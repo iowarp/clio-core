@@ -7,6 +7,8 @@
 
 #include <clio_cte/core/core_client.h>
 #include <atomic>
+#include "clio_cte/filesystem/api.h"
+
 #include <chrono>
 #include <cstdlib>
 #if !defined(_WIN32)
@@ -1102,11 +1104,12 @@ class Client : public clio::cte::core::Client {
 #endif
 };
 
-// Process-wide filesystem client singleton (reuses the clio_cte export macro).
-// Declared inside the namespace so it resolves as
-// clio::cte::filesystem::g_fs_client (matching CLIO_CFS_CLIENT below and the
-// definition in filesystem_client.cc), exactly like core's g_cte_client.
-CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
+// Process-wide filesystem client singleton, exported through THIS module's
+// macro (clio_cte/filesystem/api.h) rather than the core's. Declared inside
+// the namespace so it resolves as clio::cte::filesystem::g_fs_client
+// (matching CLIO_CFS_CLIENT below and the definition in
+// filesystem_client.cc), exactly like core's g_cte_client.
+CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
 
 /** Initialize the filesystem client singleton (creates/binds the pool). */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path = "",

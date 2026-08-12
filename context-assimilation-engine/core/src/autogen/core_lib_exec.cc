@@ -70,6 +70,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(ExportData(typed_task));
       break;
     }
+    case Method::kImportData: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<ImportDataTask>();
+      CLIO_CO_AWAIT(ImportData(typed_task));
+      break;
+    }
     case Method::kPutBlob: {
       auto& typed_task = task_ptr.template Cast<PutBlobTask>();
       CLIO_CO_AWAIT(PutBlob(typed_task));
@@ -132,6 +138,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kImportData: {
+      auto& typed_task = task_ptr.template Cast<ImportDataTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kPutBlob: {
       auto& typed_task = task_ptr.template Cast<PutBlobTask>();
       archive << *typed_task;
@@ -189,6 +200,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kExportData: {
       auto& typed_task = task_ptr.template Cast<ExportDataTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kImportData: {
+      auto& typed_task = task_ptr.template Cast<ImportDataTask>();
       archive >> *typed_task;
       break;
     }
@@ -266,6 +282,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kImportData: {
+      auto& typed_task = task_ptr.template Cast<ImportDataTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kPutBlob: {
       auto& typed_task = task_ptr.template Cast<PutBlobTask>();
       archive >> *typed_task;
@@ -336,6 +358,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kExportData: {
       auto& typed_task = task_ptr.template Cast<ExportDataTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kImportData: {
+      auto& typed_task = task_ptr.template Cast<ImportDataTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -440,6 +468,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kImportData: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ImportDataTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<ImportDataTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ImportDataTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kPutBlob: {
       auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
       if (!new_task_ptr.IsNull()) {
@@ -522,6 +561,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<ExportDataTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kImportData: {
+      auto new_task_ptr = ipc_manager->NewTask<ImportDataTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kPutBlob: {
       auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -575,6 +618,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kExportData: {
       auto& typed_task = orig_task.template Cast<ExportDataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kImportData: {
+      auto& typed_task = orig_task.template Cast<ImportDataTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
