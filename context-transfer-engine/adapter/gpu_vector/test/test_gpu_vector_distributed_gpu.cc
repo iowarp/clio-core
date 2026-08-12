@@ -134,7 +134,13 @@ __global__ void ReadRangeKernel(clio::run::IpcManagerGpuInfo info,
   for (; i < elems_per_block; i += run) {
     CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run));
     for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      const u32 got = v[base + i + k];
+      // .at(), not operator[]: the non-const operator marks the page DIRTY, so a
+      // read-only sweep would leave every page it touched needing a writeback.
+      // Each eviction then re-puts and re-compresses a page nothing modified --
+      // measured as puts == evicts on a pure read, and it is what drove the
+      // runtime to allocate a fresh 120 MB SHM segment per compress and exhaust
+      // memory partway through a papers100M epoch.
+      const u32 got = v.at(base + i + k);
       atomicAdd(sum, static_cast<unsigned long long>(got));
       if (got != Pattern(base + i + k, round)) atomicAdd(mismatches, 1ull);
     }
