@@ -35,6 +35,8 @@
  * IPC manager implementation
  */
 
+#include <execinfo.h>
+
 #include "clio_runtime/ipc_manager.h"
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -2239,6 +2241,22 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 
   // 3. All existing allocators are full - create new shared memory segment
   // Calculate segment size: (requested_size + 32MB metadata) * 1.2 multiplier
+  //
+  // These segments are never released, so a workload that keeps landing here
+  // grows shared memory without bound (measured: 509 segments / 57 GiB in one
+  // papers100M epoch). CLIO_SHM_TRACE=1 prints who asked, which is the only
+  // way to tell a genuine capacity need from an allocation the existing
+  // arenas should have been able to serve.
+  if (std::getenv("CLIO_SHM_TRACE") != nullptr) {
+    void *frames[24];
+    int n = backtrace(frames, 24);
+    char **syms = backtrace_symbols(frames, n);
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; callers:", size);
+    for (int i = 0; i < n && syms != nullptr; ++i) {
+      HLOG(kError, "[SHM-TRACE]   {}", syms[i]);
+    }
+    free(syms);
+  }
   size_t new_size = static_cast<size_t>((size + kShmMetadataOverhead) *
                                         kShmAllocationMultiplier);
   if (!IncreaseClientShm(new_size)) {
