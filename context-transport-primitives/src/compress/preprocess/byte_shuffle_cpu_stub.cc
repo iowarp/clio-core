@@ -17,6 +17,7 @@
 
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
+#include "clio_ctp/compress/preprocess/quantization.h"
 
 #if !defined(CTP_ENABLE_CUDA) || !CTP_ENABLE_CUDA
 
@@ -24,6 +25,16 @@ namespace ctp::compress::preprocess {
 
 bool ByteShuffleDevice(const void *, void *, size_t, size_t) { return false; }
 bool ByteUnshuffleDevice(const void *, void *, size_t, size_t) { return false; }
+
+/** Same contract: no device, so no device quantization. */
+bool QuantizeDevice(const void *, size_t, double, void *, size_t *,
+                    DeviceQuantizeParams *) {
+  return false;
+}
+bool DequantizeDevice(const void *, size_t, const DeviceQuantizeParams &,
+                      void *) {
+  return false;
+}
 
 }  // namespace ctp::compress::preprocess
 

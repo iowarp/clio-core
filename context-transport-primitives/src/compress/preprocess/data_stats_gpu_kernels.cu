@@ -350,3 +350,191 @@ bool ByteUnshuffleDevice(const void *device_in, void *device_out,
 }
 
 }  // namespace ctp::compress::preprocess
+
+// ===========================================================================
+// Device quantization (issue #693): the lossy half of NeuroPress's action
+// space. Lives here for the same reason the shuffle kernels do -- adding a
+// separately-device-linked .cu to this RDC-enabled static library breaks
+// __cudaRegisterLinkedBinary at static init.
+//
+// Ported from quantization_kernels.cu. The arithmetic is upstream's; only
+// the plumbing (CUB temp buffers, error reporting) is Clio's.
+// ===========================================================================
+#include <cub/cub.cuh>
+
+#include "clio_ctp/compress/preprocess/quantization.h"
+
+namespace ctp::compress::preprocess {
+
+namespace {
+
+/**
+ * q = round((v - data_min) * scale), clamped to the output width.
+ * Matches quantize_linear_kernel (quantization_kernels.cu:55-81): the clamp
+ * is what keeps an out-of-range value from becoming undefined behavior in
+ * the float->int conversion.
+ */
+template <typename OutT>
+__global__ void QuantizeKernel(const float *__restrict__ in,
+                               OutT *__restrict__ out, size_t n, double scale,
+                               double offset, double lo, double hi) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (; i < n; i += stride) {
+    double centered = static_cast<double>(in[i]) - offset;
+    double q = round(centered * scale);
+    q = fmax(lo, fmin(hi, q));
+    out[i] = static_cast<OutT>(q);
+  }
+}
+
+/** restored = q * inv_scale + offset -- dequantize_linear_kernel:83-99. */
+template <typename InT>
+__global__ void DequantizeKernel(const InT *__restrict__ in,
+                                 float *__restrict__ out, size_t n,
+                                 double inv_scale, double offset) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (; i < n; i += stride) {
+    out[i] = static_cast<float>(static_cast<double>(in[i]) * inv_scale + offset);
+  }
+}
+
+/** CUB min/max over the chunk -- compute_data_range_typed:187-232. */
+bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
+                  double *out_max) {
+  if (n > static_cast<size_t>(INT_MAX)) return false;  // CUB takes an int count
+  float *d_res = nullptr;
+  if (cudaMalloc(&d_res, 2 * sizeof(float)) != cudaSuccess) return false;
+
+  size_t temp_bytes = 0;
+  void *d_temp = nullptr;
+  bool ok = cub::DeviceReduce::Min(nullptr, temp_bytes, d_in, d_res,
+                                   static_cast<int>(n)) == cudaSuccess;
+  if (ok) ok = cudaMalloc(&d_temp, temp_bytes) == cudaSuccess;
+  if (ok) {
+    ok = cub::DeviceReduce::Min(d_temp, temp_bytes, d_in, d_res,
+                                static_cast<int>(n)) == cudaSuccess;
+  }
+  if (ok) {
+    size_t tb = temp_bytes;
+    ok = cub::DeviceReduce::Max(d_temp, tb, d_in, d_res + 1,
+                                static_cast<int>(n)) == cudaSuccess;
+  }
+  float h[2] = {0.0f, 0.0f};
+  if (ok) {
+    ok = cudaMemcpy(h, d_res, 2 * sizeof(float), cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
+  }
+  if (d_temp) cudaFree(d_temp);
+  cudaFree(d_res);
+  if (!ok) return false;
+  *out_min = static_cast<double>(h[0]);
+  *out_max = static_cast<double>(h[1]);
+  return true;
+}
+
+}  // namespace
+
+bool QuantizeDevice(const void *device_in, size_t num_elements,
+                    double error_bound, void *device_out, size_t *out_bytes,
+                    DeviceQuantizeParams *out_params) {
+  if (!device_in || !device_out || !out_bytes || !out_params ||
+      num_elements == 0 || error_bound <= 0.0) {
+    return false;
+  }
+  const float *in = static_cast<const float *>(device_in);
+
+  double data_min = 0.0, data_max = 0.0;
+  if (!DeviceMinMax(in, num_elements, &data_min, &data_max)) return false;
+  const double data_range = data_max - data_min;
+
+  // Effective bound, precision and scale are computed with the SAME
+  // arithmetic as the host Quantize() above, which is upstream's
+  // (quantization_kernels.cu:418-485). Keeping one derivation means the two
+  // cannot drift into disagreeing about how a blob was encoded.
+  const double max_abs = fmax(fabs(data_min), fabs(data_max));
+  const double float_repr_error = max_abs * 2.4e-7;
+  const double safety_margin = error_bound * 0.05;
+  const double available = error_bound - float_repr_error - safety_margin;
+  const double min_eb_for_int32 = data_range / 4.0e9;
+
+  bool achievable = true;
+  double effective_eb;
+  if (available <= 0.0) {
+    effective_eb = fmax(min_eb_for_int32, float_repr_error * 0.1);
+    achievable = false;
+  } else {
+    effective_eb = available;
+  }
+  effective_eb = fmax(effective_eb, min_eb_for_int32);
+  if (!(effective_eb > 0.0)) return false;
+
+  const int precision = ComputeRequiredPrecision(data_range, effective_eb);
+  const double scale = 1.0 / (2.0 * effective_eb);
+  const size_t width = PrecisionToBytes(precision);
+
+  const int threads = 256;
+  int blocks = static_cast<int>((num_elements + threads - 1) / threads);
+  if (blocks > 65535) blocks = 65535;
+  if (blocks < 1) blocks = 1;
+
+  if (width == 1) {
+    QuantizeKernel<int8_t><<<blocks, threads>>>(
+        in, static_cast<int8_t *>(device_out), num_elements, scale, data_min,
+        -128.0, 127.0);
+  } else if (width == 2) {
+    QuantizeKernel<int16_t><<<blocks, threads>>>(
+        in, static_cast<int16_t *>(device_out), num_elements, scale, data_min,
+        -32768.0, 32767.0);
+  } else {
+    QuantizeKernel<int32_t><<<blocks, threads>>>(
+        in, static_cast<int32_t *>(device_out), num_elements, scale, data_min,
+        -2147483648.0, 2147483647.0);
+  }
+  if (cudaGetLastError() != cudaSuccess) return false;
+  if (cudaDeviceSynchronize() != cudaSuccess) return false;
+
+  *out_bytes = num_elements * width;
+  out_params->error_bound = error_bound;
+  out_params->effective_error_bound = effective_eb;
+  out_params->scale = scale;
+  out_params->data_min = data_min;
+  out_params->data_max = data_max;
+  out_params->precision = precision;
+  out_params->bound_achievable = achievable;
+  return true;
+}
+
+bool DequantizeDevice(const void *device_in, size_t num_elements,
+                      const DeviceQuantizeParams &params, void *device_out) {
+  if (!device_in || !device_out || num_elements == 0 || params.scale <= 0.0) {
+    return false;
+  }
+  const double inv_scale = 1.0 / params.scale;
+  const size_t width = PrecisionToBytes(params.precision);
+
+  const int threads = 256;
+  int blocks = static_cast<int>((num_elements + threads - 1) / threads);
+  if (blocks > 65535) blocks = 65535;
+  if (blocks < 1) blocks = 1;
+
+  float *out = static_cast<float *>(device_out);
+  if (width == 1) {
+    DequantizeKernel<int8_t><<<blocks, threads>>>(
+        static_cast<const int8_t *>(device_in), out, num_elements, inv_scale,
+        params.data_min);
+  } else if (width == 2) {
+    DequantizeKernel<int16_t><<<blocks, threads>>>(
+        static_cast<const int16_t *>(device_in), out, num_elements, inv_scale,
+        params.data_min);
+  } else {
+    DequantizeKernel<int32_t><<<blocks, threads>>>(
+        static_cast<const int32_t *>(device_in), out, num_elements, inv_scale,
+        params.data_min);
+  }
+  if (cudaGetLastError() != cudaSuccess) return false;
+  return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+}  // namespace ctp::compress::preprocess

@@ -261,6 +261,57 @@ std::vector<T> Dequantize(const QuantizationResult& result) {
   return output;
 }
 
+/**
+ * @brief Parameters a reader needs to invert a device quantization.
+ *
+ * Mirrors the fields NeuroPress stores in its own header
+ * (compression_header.h:63-66: quant_error_bound, quant_scale, data_min,
+ * data_max) plus the precision, which upstream keeps in quant_flags.
+ * Everything here must survive to the read side or the data is unrecoverable.
+ */
+struct DeviceQuantizeParams {
+  double error_bound = 0.0;      /**< Bound requested by the caller */
+  double effective_error_bound = 0.0;  /**< Bound actually used for the scale */
+  double scale = 0.0;            /**< 1 / (2 * effective_error_bound) */
+  double data_min = 0.0;         /**< Minimum of the original data */
+  double data_max = 0.0;         /**< Maximum of the original data */
+  int precision = 0;             /**< 8, 16 or 32 bits per value */
+  bool bound_achievable = true;  /**< False if eb was below float32 precision */
+};
+
+/**
+ * @brief Quantize a device float32 buffer in place of a device output.
+ *
+ * Device-resident counterpart of Quantize() above, and the one the selection
+ * path can actually use: the data being compressed lives on the GPU, so
+ * quantizing on the host would mean a D2H/H2D round trip per chunk.
+ * Reproduces quantize_simple()'s pipeline (quantization_kernels.cu): CUB
+ * min/max reduction, effective error bound, precision from that bound, then
+ * a clamped linear quantization written at the selected width.
+ *
+ * @param device_in   Device float32 buffer.
+ * @param num_elements Element count (NOT bytes).
+ * @param error_bound Requested absolute bound; must be > 0.
+ * @param device_out  Device output, at least num_elements * 4 bytes.
+ * @param out_bytes   Receives the packed output size.
+ * @param out_params  Receives everything the read side needs to invert this.
+ * @return false if unsupported, if CUDA failed, or if CUDA is not compiled in.
+ */
+bool QuantizeDevice(const void *device_in, size_t num_elements,
+                    double error_bound, void *device_out, size_t *out_bytes,
+                    DeviceQuantizeParams *out_params);
+
+/**
+ * @brief Inverse of QuantizeDevice(): packed integers back to float32.
+ *
+ * @param device_in  Packed quantized values, as QuantizeDevice wrote them.
+ * @param num_elements Element count.
+ * @param params     The parameters QuantizeDevice returned.
+ * @param device_out Device float32 output, at least num_elements * 4 bytes.
+ */
+bool DequantizeDevice(const void *device_in, size_t num_elements,
+                      const DeviceQuantizeParams &params, void *device_out);
+
 }  // namespace ctp::compress::preprocess
 
 #endif  // CLIO_CTP_COMPRESS_PREPROCESS_QUANTIZATION_H_
