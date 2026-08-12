@@ -35,3 +35,6 @@ install(TARGETS test_compress_model_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
+
+# Cross-project NeuroPress differential parity (skipped without the tree).
+add_subdirectory(parity)

@@ -89,13 +89,41 @@ constexpr uint32_t kPresetMask = 0xFFu;
 constexpr uint32_t kShuffleShift = 8;
 constexpr uint32_t kShuffleMask = 0xFFu;
 
+/**
+ * Format version, in bits 16-23 of the same word.
+ *
+ * NeuroPress carries an explicit `uint32_t version` and gates acceptance on
+ * it (compression_header.h:57, isValid() requires `version >= 1 && version
+ * <= COMPRESSION_HEADER_VERSION`), so a reader refuses a layout it does not
+ * understand instead of misparsing it. Clio's header had no such field and
+ * IsValid() checked only the magic -- meaning any future change to what the
+ * bytes mean would be read by an older binary as if nothing had changed.
+ *
+ * There is no room left for a dedicated field (the struct is a full 24 bytes
+ * and is the on-disk format), but compress_preset_ only ever uses bits 0-7
+ * for the preset and 8-15 for the shuffle element size, so bits 16-23 are
+ * free. A blob written before this existed decodes to version 0, which is
+ * exactly right: it IS the original format.
+ *
+ * Bump kFormatVersion whenever the meaning of any header field or of the
+ * bytes that follow changes. Readers accept anything up to their own
+ * version and reject what is newer.
+ */
+constexpr uint32_t kVersionShift = 16;
+constexpr uint32_t kVersionMask = 0xFFu;
+constexpr uint32_t kFormatVersion = 1;  // v0 = pre-versioning original layout
+
 inline uint32_t PackPreset(uint32_t preset, uint32_t shuffle_elem_size) {
   return (preset & kPresetMask) |
-         ((shuffle_elem_size & kShuffleMask) << kShuffleShift);
+         ((shuffle_elem_size & kShuffleMask) << kShuffleShift) |
+         ((kFormatVersion & kVersionMask) << kVersionShift);
 }
 inline uint32_t UnpackPreset(uint32_t packed) { return packed & kPresetMask; }
 inline uint32_t UnpackShuffle(uint32_t packed) {
   return (packed >> kShuffleShift) & kShuffleMask;
+}
+inline uint32_t UnpackVersion(uint32_t packed) {
+  return (packed >> kVersionShift) & kVersionMask;
 }
 
 struct CompressionHeader {
@@ -147,7 +175,21 @@ struct CompressionHeader {
                              : 0u),
         original_size_(orig_size) {}
 
-  bool IsValid() const { return magic_ == kMagic; }
+  /**
+   * @brief Magic matches AND the format is one this build understands.
+   *
+   * Version lives in compress_preset_'s bits 16-23 (see kVersionShift).
+   * Rejecting a NEWER version is the point: without it, a future writer that
+   * redefines a field would be silently misread by this binary rather than
+   * refused. Older versions stay readable -- same rule as upstream's
+   * `version >= 1 && version <= COMPRESSION_HEADER_VERSION`, except that
+   * Clio's floor is 0, since blobs predating the field decode to 0 and that
+   * is a layout this code still reads correctly.
+   */
+  bool IsValid() const {
+    return magic_ == kMagic &&
+           UnpackVersion(compress_preset_) <= kFormatVersion;
+  }
 
   /**
    * @brief Payload length to feed the decompressor, or 0 if unusable.
