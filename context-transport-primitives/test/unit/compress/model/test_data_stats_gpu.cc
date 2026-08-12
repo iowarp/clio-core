@@ -83,4 +83,41 @@ TEST_CASE("ComputeDeviceStats matches the host reference for constant data") {
   RunParityCase(data, ctp::DataType::INT32);
 }
 
+TEST_CASE("ComputeCompressionFeatures auto-dispatches device vs host, "
+          "matching the exact call EstCompressionStats makes") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    return;
+  }
+
+  std::vector<float> data(4096);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<float>(std::cos(static_cast<double>(i) * 0.021) * 50.0);
+  }
+
+  double host_entropy = -1.0, host_mad = -1.0, host_d2 = -1.0;
+  ctp::ComputeCompressionFeatures(data.data(), data.size(),
+                                   ctp::DataType::FLOAT32, &host_entropy,
+                                   &host_mad, &host_d2);
+
+  float *device_data = ctp::GpuApi::Malloc<float>(data.size() * sizeof(float));
+  REQUIRE(device_data != nullptr);
+  ctp::GpuApi::Memcpy(device_data, data.data(), data.size() * sizeof(float));
+
+  double dev_entropy = -1.0, dev_mad = -1.0, dev_d2 = -1.0;
+  ctp::ComputeCompressionFeatures(device_data, data.size(),
+                                   ctp::DataType::FLOAT32, &dev_entropy,
+                                   &dev_mad, &dev_d2);
+
+  // Same dispatch, given a device pointer instead of a host one, must reach
+  // the on-device kernels and produce the same numbers -- not silently fall
+  // through to the host path (which would read device memory and crash) and
+  // not silently return zeros.
+  REQUIRE(std::abs(dev_entropy - host_entropy) < 1e-6);
+  REQUIRE(std::abs(dev_mad - host_mad) < 1e-6);
+  REQUIRE(std::abs(dev_d2 - host_d2) < 1e-6);
+
+  ctp::GpuApi::Free(device_data);
+}
+
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM

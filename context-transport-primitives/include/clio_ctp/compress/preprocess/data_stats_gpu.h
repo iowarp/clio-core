@@ -9,6 +9,7 @@
 #define HERMES_SHM_DATA_STATS_GPU_H
 
 #include "clio_ctp/compress/preprocess/data_stats.h"
+#include "clio_ctp/util/gpu_api.h"
 
 namespace ctp {
 
@@ -34,6 +35,31 @@ namespace ctp {
 bool ComputeDeviceStats(const void *device_data, size_t num_elements,
                          DataType type, double *out_entropy, double *out_mad,
                          double *out_second_derivative);
+
+/**
+ * Computes the same three selection features either on-device (via
+ * ComputeDeviceStats, when `chunk` is GPU-resident) or on-host (via
+ * DataStatisticsFactory, otherwise) -- the exact dispatch
+ * EstCompressionStats uses to feed NeuroPress. Factored out here so the
+ * dispatch itself is unit-testable without pulling in the compressor
+ * chimod's task-dispatch machinery (compression/PutBlob are a separate,
+ * larger device-memory gap this dispatch does not attempt to close).
+ */
+inline void ComputeCompressionFeatures(const void *chunk, size_t num_elements,
+                                        DataType type, double *out_entropy,
+                                        double *out_mad,
+                                        double *out_second_derivative) {
+  if (IsDevicePointer(chunk) &&
+      ComputeDeviceStats(chunk, num_elements, type, out_entropy, out_mad,
+                          out_second_derivative)) {
+    return;
+  }
+  *out_entropy =
+      DataStatisticsFactory::CalculateShannonEntropy(chunk, num_elements, type);
+  *out_mad = DataStatisticsFactory::CalculateMAD(chunk, num_elements, type);
+  *out_second_derivative =
+      DataStatisticsFactory::CalculateSecondDerivative(chunk, num_elements, type);
+}
 
 }  // namespace ctp
 

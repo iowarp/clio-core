@@ -53,7 +53,6 @@
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
-#include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 
@@ -333,25 +332,13 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   }
 
   // Calculate compression features. A chunk resolved from a CUDA-IPC device
-  // buffer is not host-readable -- compute entropy/MAD/second-derivative
-  // on-device (ctp::ComputeDeviceStats) so the buffer itself never has to be
-  // staged through host memory just to feed NeuroPress. Falls through to the
-  // existing host path for ordinary host-resident chunks.
+  // buffer is not host-readable -- ComputeCompressionFeatures detects that
+  // and computes entropy/MAD/second-derivative on-device, so the buffer
+  // itself never has to be staged through host memory just to feed
+  // NeuroPress. Falls through to the existing host path otherwise.
   double entropy = 0.0, mad = 0.0, second_derivative_mean = 0.0;
-  bool computed_on_device = false;
-  if (ctp::IsDevicePointer(chunk)) {
-    computed_on_device = ctp::ComputeDeviceStats(
-        chunk, num_elements, data_type, &entropy, &mad,
-        &second_derivative_mean);
-  }
-  if (!computed_on_device) {
-    entropy = ctp::DataStatisticsFactory::CalculateShannonEntropy(
-        chunk, num_elements, data_type);
-    mad = ctp::DataStatisticsFactory::CalculateMAD(chunk, num_elements,
-                                                     data_type);
-    second_derivative_mean = ctp::DataStatisticsFactory::CalculateSecondDerivative(
-        chunk, num_elements, data_type);
-  }
+  ctp::ComputeCompressionFeatures(chunk, num_elements, data_type, &entropy,
+                                   &mad, &second_derivative_mean);
 
   // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
   // qtable/dense-NN heuristics below -- it ranks the full
