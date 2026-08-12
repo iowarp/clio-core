@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "compress.h"
 #include <cstdio>
@@ -124,12 +125,7 @@ class Cuszp : public Compressor {
     // spinning kernel has deadlocked this runtime before, and on the
     // device-to-device fault path the compressor runtime has already handed
     // us a slot stream via SetGpuStreamForThread.
-    bool own_stream = false;
-    stream = static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
-    if (stream == nullptr && (own_stream = true) &&
-        cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    stream = CodecStream();
     float *d_in = nullptr;
     bool free_in = false;
     unsigned char *d_cmp = nullptr;  // temp worst-case device output buffer
@@ -198,7 +194,6 @@ class Cuszp : public Compressor {
 
     if (d_cmp != nullptr) cudaFree(d_cmp);
     if (free_in) cudaFree(d_in);
-    if (own_stream) cudaStreamDestroy(stream);
     return ok;
   }
 
@@ -214,12 +209,7 @@ class Cuszp : public Compressor {
     // spinning kernel has deadlocked this runtime before, and on the
     // device-to-device fault path the compressor runtime has already handed
     // us a slot stream via SetGpuStreamForThread.
-    bool own_stream = false;
-    stream = static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
-    if (stream == nullptr && (own_stream = true) &&
-        cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    stream = CodecStream();
     float *d_out = nullptr;
     bool free_out = false;
     unsigned char *d_stream = nullptr;
@@ -314,11 +304,164 @@ class Cuszp : public Compressor {
 
     if (free_stream) cudaFree(d_stream);
     if (free_out) cudaFree(d_out);
-    if (own_stream) cudaStreamDestroy(stream);
     return ok;
   }
 
   /** Set the absolute error bound. */
+  /**
+   * The stream this codec runs on. NEVER creates one.
+   *
+   * Creating a stream per operation was both a correctness and a performance
+   * hazard: cudaStreamCreate has deadlocked this runtime against a resident
+   * consumer kernel, and it is pure overhead on a path that already has a
+   * stream to use. The caller supplies one through SetGpuStreamForThread; with
+   * no override we run on the default stream, which is always valid in the
+   * caller's context. Adopting the PROCESS-WIDE override is deliberately not
+   * done here -- it belongs to another CUDA context and using it silently
+   * compresses zeros.
+   */
+  static cudaStream_t CodecStream() {
+    return static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
+  }
+
+  /**
+   * Batched compress: issue every job, then synchronize ONCE.
+   *
+   * cuSZp has no batched kernel, so this cannot fuse the launches, but the
+   * per-job synchronize is what actually hurt: each sync had to win a slot
+   * against the consumer kernel's relaunch loop, which measured 22 decodes in
+   * 280 seconds. Issuing the whole batch back-to-back and waiting once turns
+   * N of those contests into one.
+   */
+  bool CompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/true);
+  }
+
+  /** Batched decompress. See CompressBatch. */
+  bool DecompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/false);
+  }
+
+  /**
+   * Phased batch runner.
+   *
+   * DECOMPRESS is native: all prefixes are read, ONE wait, all decodes are
+   * launched, ONE wait. Two synchronizes for the whole batch instead of two
+   * per job.
+   *
+   * STAGING IS BY RESIDENCY, NOT BY HABIT. A device `src` is decoded from
+   * where it lies and a device `dst` is decoded straight into, so the common
+   * case -- a compressed page on a device tier faulting into a device page
+   * cache -- allocates nothing and copies nothing. A scratch slab is created
+   * only if some job actually has a host pointer, and only large enough for
+   * those jobs.
+   *
+   * COMPRESS still uses the serial fallback. cuSZp reports its compressed size
+   * through a host out-parameter that is only valid after the kernel has run,
+   * so batching it needs a second issue phase for the prefix writes; the
+   * interface is in place for that and decompress is where the measured cost
+   * was.
+   */
+  bool RunBatch(CompressJob *jobs, size_t n, bool compress) {
+    if (compress || n == 0) {
+      return RunBatchSerial(jobs, n, compress);
+    }
+    cudaStream_t stream = CodecStream();
+    std::vector<Prefix> pre(n);
+    std::vector<char> host_pre(n * sizeof(Prefix));
+
+    // Phase 0 -- every prefix, then ONE wait.
+    for (size_t i = 0; i < n; ++i) {
+      jobs[i].ok = false;
+      jobs[i].out_size = 0;
+      if (jobs[i].src == nullptr || jobs[i].dst == nullptr ||
+          jobs[i].src_size < sizeof(Prefix)) {
+        continue;
+      }
+      if (IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        cudaMemcpyAsync(&pre[i], jobs[i].src, sizeof(Prefix),
+                        cudaMemcpyDeviceToHost, stream);
+      } else {
+        std::memcpy(&pre[i], jobs[i].src, sizeof(Prefix));
+      }
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+
+    // Size a scratch slab for the HOST-side jobs only; all-device batches get
+    // no slab at all.
+    size_t slab_need = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (pre[i].magic != kMagic) continue;
+      const size_t nb = static_cast<size_t>(pre[i].elems) * sizeof(float);
+      if (nb == 0 || nb > jobs[i].dst_capacity) continue;
+      if (!IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        slab_need += jobs[i].src_size;
+      }
+      if (!IsDeviceAccessible(jobs[i].dst)) slab_need += nb;
+    }
+    char *slab = nullptr;
+    if (slab_need > 0 && cudaMalloc(&slab, slab_need) != cudaSuccess) {
+      return false;
+    }
+    size_t slab_off = 0;
+    std::vector<void *> host_dst(n, nullptr);
+    std::vector<size_t> host_dst_bytes(n, 0);
+
+    // Phase 1 -- launch every decode, then ONE wait.
+    for (size_t i = 0; i < n; ++i) {
+      if (pre[i].magic != kMagic) continue;
+      const size_t elems = static_cast<size_t>(pre[i].elems);
+      const size_t nb = elems * sizeof(float);
+      if (elems == 0 || nb > jobs[i].dst_capacity) continue;
+
+      const unsigned char *d_stream = nullptr;
+      if (IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        d_stream = static_cast<const unsigned char *>(jobs[i].src) +
+                   sizeof(Prefix);   // decode in place: no staging
+      } else {
+        char *st = slab + slab_off;
+        slab_off += jobs[i].src_size;
+        cudaMemcpyAsync(st, jobs[i].src, jobs[i].src_size,
+                        cudaMemcpyHostToDevice, stream);
+        d_stream =
+            reinterpret_cast<const unsigned char *>(st) + sizeof(Prefix);
+      }
+
+      float *d_out = nullptr;
+      if (IsDeviceAccessible(jobs[i].dst)) {
+        d_out = static_cast<float *>(jobs[i].dst);  // decode straight in
+      } else {
+        d_out = reinterpret_cast<float *>(slab + slab_off);
+        slab_off += nb;
+        host_dst[i] = jobs[i].dst;
+        host_dst_bytes[i] = nb;
+      }
+
+      uint3 dims = {0, 0, 0};
+      cuSZp_decompress(d_out, const_cast<unsigned char *>(d_stream), elems,
+                       static_cast<size_t>(pre[i].cmp_size), pre[i].eb,
+                       CUSZP_DIM_1D, dims, CUSZP_TYPE_FLOAT,
+                       static_cast<cuszp_mode_t>(pre[i].mode), stream);
+      jobs[i].ok = true;
+      jobs[i].out_size = nb;
+      if (host_dst[i] != nullptr) {
+        cudaMemcpyAsync(host_dst[i], d_out, nb, cudaMemcpyDeviceToHost, stream);
+      }
+    }
+    const bool synced = cudaStreamSynchronize(stream) == cudaSuccess &&
+                        cudaGetLastError() == cudaSuccess;
+    if (slab != nullptr) cudaFree(slab);
+    bool all = true;
+    for (size_t i = 0; i < n; ++i) {
+      if (!synced) {
+        jobs[i].ok = false;
+        jobs[i].out_size = 0;
+      }
+      all = all && jobs[i].ok;
+    }
+    return all;
+  }
+
   void SetErrorBound(float eb) { eb_ = eb; }
   /** Get the absolute error bound. */
   float GetErrorBound() const { return eb_; }

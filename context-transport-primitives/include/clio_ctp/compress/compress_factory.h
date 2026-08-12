@@ -114,6 +114,54 @@ class CompressionFactory {
    *     // Use compressor for compression
    *   }
    */
+  /**
+   * Compress a whole batch with ONE codec instance.
+   *
+   * This is the interface callers should reach for. It resolves the codec
+   * once and hands the codec the entire batch, so a GPU codec can issue a
+   * single launch covering every job instead of one per buffer.
+   *
+   * There is no autoselection here and there is not meant to be: the caller
+   * states which library it wants. Picking a codec is a policy decision that
+   * belongs to whoever knows the data, not to the compressor.
+   *
+   * @return true only if every job succeeded; per-job status is in job.ok.
+   */
+  static bool CompressBatch(const std::string& library_name,
+                            CompressionPreset preset, CompressJob* jobs,
+                            size_t n) {
+    auto codec = GetPreset(library_name, preset);
+    if (!codec) {
+      for (size_t i = 0; i < n; ++i) jobs[i].ok = false;
+      return false;
+    }
+    return codec->CompressBatch(jobs, n);
+  }
+
+  /** Decompress a whole batch with one codec instance. See CompressBatch. */
+  static bool DecompressBatch(const std::string& library_name,
+                              CompressionPreset preset, CompressJob* jobs,
+                              size_t n) {
+    auto codec = GetPreset(library_name, preset);
+    if (!codec) {
+      for (size_t i = 0; i < n; ++i) jobs[i].ok = false;
+      return false;
+    }
+    return codec->DecompressBatch(jobs, n);
+  }
+
+  /** Batch by wire id, for callers that carry the id rather than the name. */
+  static bool CompressBatchWire(int wire_id, CompressionPreset preset,
+                                CompressJob* jobs, size_t n) {
+    return CompressBatch(NameForWireId(wire_id), preset, jobs, n);
+  }
+
+  /** Batch by wire id. See CompressBatchWire. */
+  static bool DecompressBatchWire(int wire_id, CompressionPreset preset,
+                                  CompressJob* jobs, size_t n) {
+    return DecompressBatch(NameForWireId(wire_id), preset, jobs, n);
+  }
+
   static std::unique_ptr<Compressor> GetPreset(
       const std::string& library_name,
       CompressionPreset preset = CompressionPreset::BALANCED) {

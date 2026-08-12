@@ -2173,51 +2173,55 @@ bool Runtime::LaunchDecompBatch(
       fflush(stderr);
     }
     if (gwire > 0 && IsGpuCodec(gwire) && !IsNvcompBatchedCodec(gwire)) {
+      // ONE batched call for the whole drain. This used to loop calling the
+      // single-buffer Decompress per page, and each of those synchronized --
+      // 22 decodes in 280 seconds, because every sync had to win a slot
+      // against the consumer kernel's relaunch loop. CompressionFactory's
+      // batch interface issues the whole group and waits once.
+      //
+      // No header parse here: the codec's own frame carries the compressed
+      // length, so handing it the remainder of the blob is enough. Device
+      // pointers are passed straight through, so a page already on a device
+      // tier is decoded in place, into the faulting page, with no staging.
       const size_t ghdr = sizeof(CompressionHeader);
-      auto codec = ctp::CompressionFactory::GetPreset(
-          ctp::CompressionFactory::NameForWireId(gwire),
-          ctp::CompressionPreset::BALANCED);
-      ctp::CompressionFactory::SetGpuStreamForThread(stream);
+      std::vector<ctp::CompressJob> jobs;
+      std::vector<PendingDecomp *> owner_of;
+      jobs.reserve(owners.size());
+      owner_of.reserve(owners.size());
       for (auto &pd : owners) {
-        bool gok = false;
-        if (codec && pd->stored_size > ghdr) {
-          // PREFER THE DEVICE-RESIDENT IMAGE. With a host source the codec
-          // has to cudaMalloc a device buffer and stage the bytes H2D on
-          // every page, and those allocations starve against the gather
-          // kernel's relaunch loop -- measured 22 decodes in 280s (~12s
-          // each). Device in / device out makes the codec allocate nothing
-          // and keeps a kHBM fault device-to-device, which is the point.
-          CompressionHeader h;
-          const void *src = nullptr;
-          if (pd->src_device != nullptr &&
-              cudaMemcpyAsync(&h, pd->src_device, ghdr, cudaMemcpyDeviceToHost,
-                              stream) == cudaSuccess &&
-              cudaStreamSynchronize(stream) == cudaSuccess) {
-            src = pd->src_device;
-          } else if (!pd->stored_bytes.empty()) {
-            std::memcpy(&h, pd->stored_bytes.data(), ghdr);
-            src = pd->stored_bytes.data();
-          }
-          if (src != nullptr && h.IsValid()) {
-            const size_t payload =
-                h.compressed_size_ != 0 ? static_cast<size_t>(h.compressed_size_)
-                                        : pd->stored_size - ghdr;
-            size_t out = pd->dst_bytes;
-            gok = codec->Decompress(
-                pd->dst, out,
-                const_cast<char *>(static_cast<const char *>(src)) + ghdr,
-                payload);
-          }
+        if (pd->stored_size <= ghdr) {
+          pd->ok = false;
+          pd->done.store(true, std::memory_order_release);
+          continue;
         }
-        if (getenv("CLIO_CODEC_TRACE")) {
-          fprintf(stderr, "[GENERIC] decode ok=%d stored=%zu dst=%zu\n",
-                  (int)gok, pd->stored_size, pd->dst_bytes);
-          fflush(stderr);
+        const char *base =
+            pd->src_device != nullptr
+                ? static_cast<const char *>(pd->src_device)
+                : (pd->stored_bytes.empty() ? nullptr
+                                            : pd->stored_bytes.data());
+        if (base == nullptr) {
+          pd->ok = false;
+          pd->done.store(true, std::memory_order_release);
+          continue;
         }
-        pd->ok = gok;
-        pd->done.store(true, std::memory_order_release);
+        ctp::CompressJob j;
+        j.src = base + ghdr;
+        j.src_size = pd->stored_size - ghdr;
+        j.dst = pd->dst;
+        j.dst_capacity = pd->dst_bytes;
+        jobs.push_back(j);
+        owner_of.push_back(pd.get());
       }
-      ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+      if (!jobs.empty()) {
+        ctp::CompressionFactory::SetGpuStreamForThread(stream);
+        ctp::CompressionFactory::DecompressBatchWire(
+            gwire, ctp::CompressionPreset::BALANCED, jobs.data(), jobs.size());
+        ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+          owner_of[i]->ok = jobs[i].ok;
+          owner_of[i]->done.store(true, std::memory_order_release);
+        }
+      }
       return true;
     }
   }

@@ -34,6 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_COMPRESS_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_COMPRESS_H_
 
+#include <cstddef>
+
 // #include "clio_ctp/data_structures/all.h"  // Deleted during hard refactoring
 
 namespace ctp {
@@ -85,6 +87,24 @@ inline void *GetGpuCodecStream() {
  */
 inline void *GetGpuCodecStreamThreadOnly() { return GpuCodecStreamThread(); }
 
+/**
+ * One buffer pair in a batch: where the bytes come from, where they go.
+ *
+ * `src` and `dst` may each be host or device memory, INDEPENDENTLY, and a
+ * codec is required to work out which and move the minimum. When both are on
+ * the device there must be NO staging at all -- no scratch allocation, no
+ * bounce through the host, no copy the codec could have avoided by decoding
+ * straight into `dst`.
+ */
+struct CompressJob {
+  const void *src = nullptr;  /**< input bytes; host or device */
+  size_t src_size = 0;        /**< bytes at src */
+  void *dst = nullptr;        /**< output buffer; host or device */
+  size_t dst_capacity = 0;    /**< bytes available at dst */
+  size_t out_size = 0;        /**< [out] bytes actually written to dst */
+  bool ok = false;            /**< [out] did this job succeed */
+};
+
 class Compressor {
  public:
   Compressor() = default;
@@ -101,6 +121,47 @@ class Compressor {
    * */
   virtual bool Decompress(void *output, size_t &output_size, void *input,
                           size_t input_size) = 0;
+
+  /**
+   * Compress a whole batch.
+   *
+   * The batch is the point: a GPU codec gets to issue ONE launch for every
+   * job instead of one launch per page. Per-page launches were measured
+   * starving against a resident consumer kernel (22 decodes in 280 seconds),
+   * which is the problem this interface exists to remove.
+   *
+   * Each job reports its own `ok` and `out_size`; a failed job does not fail
+   * its neighbours. The return value is true when EVERY job succeeded, so a
+   * caller can check one bool in the common case and inspect per-job status
+   * only when it is false.
+   *
+   * The default implementation loops over the single-buffer calls, so a CPU
+   * codec needs no changes and gains nothing -- which is correct, since a
+   * host codec has no launch to amortize.
+   */
+  virtual bool CompressBatch(CompressJob *jobs, size_t n) {
+    return RunBatchSerial(jobs, n, /*compress=*/true);
+  }
+
+  /** Decompress a whole batch. See CompressBatch. */
+  virtual bool DecompressBatch(CompressJob *jobs, size_t n) {
+    return RunBatchSerial(jobs, n, /*compress=*/false);
+  }
+
+ protected:
+  /** Shared fallback: run each job through the single-buffer entry point. */
+  bool RunBatchSerial(CompressJob *jobs, size_t n, bool compress) {
+    bool all = true;
+    for (size_t i = 0; i < n; ++i) {
+      size_t out = jobs[i].dst_capacity;
+      void *in = const_cast<void *>(jobs[i].src);
+      jobs[i].ok = compress ? Compress(jobs[i].dst, out, in, jobs[i].src_size)
+                            : Decompress(jobs[i].dst, out, in, jobs[i].src_size);
+      jobs[i].out_size = jobs[i].ok ? out : 0;
+      all = all && jobs[i].ok;
+    }
+    return all;
+  }
 };
 
 }  // namespace ctp
