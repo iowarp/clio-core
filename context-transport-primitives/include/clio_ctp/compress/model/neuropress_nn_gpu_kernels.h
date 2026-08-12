@@ -73,8 +73,15 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
  * @param out_* Each sized [num_candidates], already inverse-transformed
  *   into real units (ratio, ms, dB) -- callers don't need to know about
  *   the log1p training convention.
+ *
+ * @return false if any CUDA step failed, in which case the out_* buffers
+ *   hold nothing meaningful. Callers MUST NOT rank on them: zero-filled
+ *   outputs clamp to ratio 0.1 / 1 ms for every candidate, which looks like
+ *   a real (if pessimistic) opinion and leaves the winner to sort order.
+ *   NeuroPress returns -1 here and its caller reports
+ *   GPUCOMPRESS_ERROR_NN_NOT_LOADED (nn_gpu.cu:1944-1971).
  */
-void NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
+bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              int num_candidates, float *out_comp_time_ms,
                              float *out_decomp_time_ms, float *out_ratio,
                              float *out_psnr_db);

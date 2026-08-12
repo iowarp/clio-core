@@ -118,35 +118,51 @@ bool ComputeDeviceStatsTyped(const T *data, size_t num_elements,
 
   unsigned int *d_hist = nullptr;
   double *d_scalars = nullptr;  // [sum, sum_abs_d2, sum_abs_dev]
-  cudaMalloc(&d_hist, kHistBins * sizeof(unsigned int));
-  cudaMemset(d_hist, 0, kHistBins * sizeof(unsigned int));
-  cudaMalloc(&d_scalars, 3 * sizeof(double));
-  cudaMemset(d_scalars, 0, 3 * sizeof(double));
+
+  // Every CUDA step is checked. Returning true on failure used to hand the
+  // caller an entropy computed from an UNINITIALIZED stack histogram with
+  // mad = 0 -- i.e. the "perfectly compressible" corner of the feature
+  // space -- for a chunk nothing is known about. NeuroPress propagates the
+  // failure at every stage (stats_kernel.cu:307-354 returns nullptr, and
+  // gpucompress_compress.cpp:285 bails on it); ComputeCompressionFeatures's
+  // contract already promises the same, so it must actually be able to fail.
+  bool ok = cudaMalloc(&d_hist, kHistBins * sizeof(unsigned int)) ==
+                cudaSuccess &&
+            cudaMemset(d_hist, 0, kHistBins * sizeof(unsigned int)) ==
+                cudaSuccess &&
+            cudaMalloc(&d_scalars, 3 * sizeof(double)) == cudaSuccess &&
+            cudaMemset(d_scalars, 0, 3 * sizeof(double)) == cudaSuccess;
 
   int grid = static_cast<int>(std::min<size_t>(
       (num_elements + kBlockSize - 1) / kBlockSize, 1024));
   if (grid < 1) grid = 1;
 
-  StatsPass1Kernel<T><<<grid, kBlockSize>>>(data, num_elements, d_hist,
-                                             d_scalars, d_scalars + 1);
-
   double h_sum_and_d2[2] = {0.0, 0.0};
-  cudaMemcpy(h_sum_and_d2, d_scalars, 2 * sizeof(double),
-             cudaMemcpyDeviceToHost);
-  double mean = h_sum_and_d2[0] / static_cast<double>(num_elements);
-
-  StatsPass2Kernel<T>
-      <<<grid, kBlockSize>>>(data, num_elements, mean, d_scalars + 2);
-
-  unsigned int h_hist[kHistBins];
+  unsigned int h_hist[kHistBins] = {0};
   double h_sum_abs_dev = 0.0;
-  cudaMemcpy(h_hist, d_hist, kHistBins * sizeof(unsigned int),
-             cudaMemcpyDeviceToHost);
-  cudaMemcpy(&h_sum_abs_dev, d_scalars + 2, sizeof(double),
-             cudaMemcpyDeviceToHost);
+  double mean = 0.0;
+
+  if (ok) {
+    StatsPass1Kernel<T><<<grid, kBlockSize>>>(data, num_elements, d_hist,
+                                               d_scalars, d_scalars + 1);
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaMemcpy(h_sum_and_d2, d_scalars, 2 * sizeof(double),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+  if (ok) {
+    mean = h_sum_and_d2[0] / static_cast<double>(num_elements);
+    StatsPass2Kernel<T>
+        <<<grid, kBlockSize>>>(data, num_elements, mean, d_scalars + 2);
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaMemcpy(h_hist, d_hist, kHistBins * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost) == cudaSuccess &&
+         cudaMemcpy(&h_sum_abs_dev, d_scalars + 2, sizeof(double),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
 
   cudaFree(d_hist);
   cudaFree(d_scalars);
+  if (!ok) return false;
 
   size_t num_bytes = num_elements * sizeof(T);
   double entropy = 0.0;

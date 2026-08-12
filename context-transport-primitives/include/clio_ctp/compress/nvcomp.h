@@ -290,14 +290,41 @@ class NvComp : public Compressor {
         return std::make_shared<nvcomp::ANSManager>(
             kChunkSize, nvcompBatchedANSCompressDefaultOpts,
             nvcompBatchedANSDecompressDefaultOpts, stream);
-      case NvCompAlgo::CASCADED:
+      case NvCompAlgo::CASCADED: {
+        // NeuroPress overrides the nvcomp default here
+        // (compression_factory.cpp:121-126): "Byte-level: correct for any
+        // quantized precision (INT8/16/32)". The default is NOT char --
+        // nvcompBatchedCascadedCompressDefaultOpts is {4096,
+        // NVCOMP_TYPE_INT, 2, 1, 1, {0}} -- so leaving it alone ran
+        // Cascaded's RLE+delta+bitpack pipeline over 32-bit words instead
+        // of bytes, producing a different bitstream (and so a different
+        // ratio label) than the model was trained against. It also made
+        // correctness depend on the input size: nvcomp documents that each
+        // chunk must be a multiple of the element type's size "else this
+        // may crash or produce invalid output", and the manager's final
+        // chunk is input_size % 64 KiB.
+        nvcompBatchedCascadedCompressOpts_t opts =
+            nvcompBatchedCascadedCompressDefaultOpts;
+        opts.type = NVCOMP_TYPE_CHAR;
         return std::make_shared<nvcomp::CascadedManager>(
-            kChunkSize, nvcompBatchedCascadedCompressDefaultOpts,
-            nvcompBatchedCascadedDecompressDefaultOpts, stream);
-      case NvCompAlgo::BITCOMP:
+            kChunkSize, opts, nvcompBatchedCascadedDecompressDefaultOpts,
+            stream);
+      }
+      case NvCompAlgo::BITCOMP: {
+        // Likewise (compression_factory.cpp:128-134): "Good for scientific
+        // data". Bitcomp models the buffer as an array of its declared
+        // type, so the default NVCOMP_TYPE_UCHAR compresses 8-byte-wide
+        // scientific data byte-wise and reaches a materially different
+        // ratio. algorithm 0 matches the default but is set explicitly,
+        // as upstream does.
+        nvcompBatchedBitcompCompressOpts_t opts =
+            nvcompBatchedBitcompCompressDefaultOpts;
+        opts.data_type = NVCOMP_TYPE_LONGLONG;
+        opts.algorithm = 0;
         return std::make_shared<nvcomp::BitcompManager>(
-            kChunkSize, nvcompBatchedBitcompCompressDefaultOpts,
-            nvcompBatchedBitcompDecompressDefaultOpts, stream);
+            kChunkSize, opts, nvcompBatchedBitcompDecompressDefaultOpts,
+            stream);
+      }
     }
     return nullptr;
   }

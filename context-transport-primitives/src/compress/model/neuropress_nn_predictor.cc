@@ -434,19 +434,25 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
     }
     std::vector<float> comp_time(batch.size()), decomp_time(batch.size()),
         ratio(batch.size()), psnr(batch.size());
-    gpu::NeuroPressGpuInferBatch(gpu_weights_.get(), raw_inputs.data(),
-                                 static_cast<int>(batch.size()),
-                                 comp_time.data(), decomp_time.data(),
-                                 ratio.data(), psnr.data());
+    if (!gpu::NeuroPressGpuInferBatch(gpu_weights_.get(), raw_inputs.data(),
+                                      static_cast<int>(batch.size()),
+                                      comp_time.data(), decomp_time.data(),
+                                      ratio.data(), psnr.data())) {
+      // Device inference failed. Returning the zero-filled buffers would
+      // hand the caller a full, well-formed ranking built from nothing, so
+      // return empty instead and let it fall back -- the same contract
+      // EstCompressionStats already honors for a stats failure.
+      return {};
+    }
     auto end_time = std::chrono::high_resolution_clock::now();
     double infer_ms = std::chrono::duration<double, std::milli>(
                           end_time - start_time)
                           .count() /
                       static_cast<double>(batch.size());
     for (size_t i = 0; i < batch.size(); ++i) {
-      // Policy clamps from NeuroPress's own inference (nn_gpu.cu): times
-      // floor at 1ms, ratio is capped at 100x and floored at 0.1, psnr is
-      // clamped to [0, 120] dB.
+      // Already clamped inside the kernel (nn_gpu.cu:217-231 order: sanity
+      // ceiling first, then the policy floors/caps). Repeat the policy half
+      // here so the CPU and GPU paths read identically.
       results.emplace_back(
           std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
           std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
@@ -468,11 +474,19 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
     // NN's own DEcompression-time output, distinct from y[0]; it is what
     // the cost model's w1 term ranks on, so it must not be aliased to the
     // compression time.
-    double comp_time = std::max(1.0, static_cast<double>(y[0]));
-    double decomp_time = std::max(1.0, static_cast<double>(y[1]));
-    double ratio =
-        std::max(0.1, std::min(100.0, static_cast<double>(y[2])));
-    double psnr = std::max(0.0, std::min(120.0, static_cast<double>(y[3])));
+    // Sanity ceiling first, then the policy floors/caps -- nn_gpu.cu:217-231.
+    // The 1e6 ceiling is load-bearing under NaN: std::min(NaN, 1e6) returns
+    // NaN here (unlike CUDA's fminf), but the subsequent std::max(1.0, NaN)
+    // would otherwise make a drifted head the CHEAPEST candidate rather than
+    // the most expensive, so guard the non-finite case explicitly.
+    auto sane = [](double v, double lo, double hi, double fallback) {
+      if (!std::isfinite(v)) return fallback;
+      return std::max(lo, std::min(v, hi));
+    };
+    double comp_time = std::max(1.0, sane(y[0], 1e-6, 1e6, 1e6));
+    double decomp_time = std::max(1.0, sane(y[1], 1e-6, 1e6, 1e6));
+    double ratio = std::min(100.0, sane(y[2], 0.1, 1e5, 0.1));
+    double psnr = sane(y[3], 0.0, 120.0, 0.0);
     results.emplace_back(ratio, psnr, comp_time, decomp_time, 0.0);
   }
   auto end_time = std::chrono::high_resolution_clock::now();
@@ -800,10 +814,18 @@ bool NeuroPressNNPredictor::Train(
   // first few calls have no meaningful EMA yet.
   bool warmed_up = (sgd_call_count_ > 3);
   if (warmed_up) {
+    // TRUNK ONLY -- W5/b5 are excluded. NeuroPress accumulates this dot over
+    // DW1..DB4 and stops (nn_gpu.cu:1380-1402); the trust-region norm just
+    // above it (:1319-1326) deliberately does include W5/b5, so the
+    // narrower scope here is intentional upstream, not an oversight.
+    // Including the unprojected, sign-stable W5 gradient biases the dot
+    // positive and damps the step less often than upstream.
+    const size_t dw_trunk_end = weight_offsets_[4];
+    const size_t db_trunk_end = bias_offsets_[4];
     double dot_ema = 0.0;
-    for (size_t i = 0; i < combined_dw.size(); ++i)
+    for (size_t i = 0; i < dw_trunk_end; ++i)
       dot_ema += static_cast<double>(combined_dw[i]) * ema_weights_[i];
-    for (size_t i = 0; i < combined_db.size(); ++i)
+    for (size_t i = 0; i < db_trunk_end; ++i)
       dot_ema += static_cast<double>(combined_db[i]) * ema_biases_[i];
     if (dot_ema < 0.0) step *= kAntiFlipDamp;
   }

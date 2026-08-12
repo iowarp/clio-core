@@ -888,8 +888,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // algorithm actually used and what really happened) and only differ in
     // which threshold gates them -- exactly mirroring
     // g_reinforce_mape_threshold vs g_exploration_threshold.
+    // actual_compression_ratio_ <= 0 means the codec never produced a
+    // measurable result (Compress() zeroes it on outright failure), so
+    // there is no ground truth to train on. NeuroPress cannot reach this
+    // state -- it always has a real compressed size by the time it learns.
     if (config_.neuropress_online_learning_enabled_ && neuropress_feat_valid &&
-        task->return_code_ == 0) {
+        task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
       const CompressionStats* predicted = nullptr;
       for (const auto& stat : stats) {
         if (stat.compress_lib_ == best_lib &&
@@ -1264,7 +1268,31 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     std::vector<char> shuffle_staging;
     char *shuffle_device_buf = nullptr;
     ctp::ipc::AllocatorId shuffle_device_alloc;
+    // Declared up here, alongside the shuffle scratch, so a single guard
+    // owns both device allocations.
+    ctp::ipc::AllocatorId device_output_alloc_id;
     uint32_t applied_shuffle = 0;
+
+    // Releases both on EVERY exit from this scope. The frees used to live
+    // only in the success branch, so an incompressible chunk (the
+    // not-beneficial path), a failed SHM allocation, or a thrown exception
+    // each leaked input_size bytes of device memory plus the compressed
+    // output buffer -- and incompressible chunks are exactly the workload
+    // that takes that branch repeatedly, so it drained the GPU. NeuroPress
+    // frees on every exit path too (gpucompress_compress.cpp:536-545 and
+    // the sibling checks at :486-519).
+    struct DeviceScratchGuard {
+      ctp::ipc::AllocatorId *ids[2];
+      ~DeviceScratchGuard() {
+        for (auto *id : ids) {
+          if (id && !id->IsNull()) {
+            CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, *id);
+            *id = ctp::ipc::AllocatorId();
+          }
+        }
+      }
+    } device_scratch{{&shuffle_device_alloc, &device_output_alloc_id}};
+
     if (shuffle_elem != 0 && input_size >= shuffle_elem &&
         (input_size % shuffle_elem) == 0) {
       if (ctp::IsDevicePointer(input_ptr)) {
@@ -1314,7 +1342,6 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
     std::vector<char> compressed_buffer;
     char *device_output = nullptr;
-    ctp::ipc::AllocatorId device_output_alloc_id;
     if (output_on_device) {
       device_output_alloc_id = CLIO_IPC->AllocateAndRegisterGpuBackend(
           /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
@@ -1410,15 +1437,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           task->flags_, clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(put_task);
 
-      // Free the compressed-data buffer
-      if (output_on_device) {
-        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, device_output_alloc_id);
-      } else {
+      // Device allocations belong to device_scratch above, which releases
+      // them on every exit; only the host SHM buffer is freed here.
+      if (!output_on_device) {
         CLIO_IPC->FreeBuffer(compressed_shm);
-      }
-      if (!shuffle_device_alloc.IsNull()) {
-        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, shuffle_device_alloc);
-        shuffle_device_alloc = ctp::ipc::AllocatorId();
       }
 
       // Log compression telemetry
@@ -1457,6 +1479,32 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
+
+      // Record what the codec REALLY achieved, even though we discarded its
+      // output. A codec that ran and produced a 1.02x ratio in 8 ms is a
+      // perfectly good training sample -- and it is the sample the model
+      // most needs, since high-entropy chunks are where it mispredicts.
+      // Leaving the Context defaults in place (ratio 1.0, time 0.0) taught
+      // it that the chosen algorithm achieves exactly 1.0x in 0 ms, and
+      // because cost() maps a 0 ratio to 1e30 the MAPE gate then fired on
+      // essentially every such chunk. NeuroPress always has real numbers
+      // here: it computes actual_ratio = input_size / compressed_size
+      // unconditionally (gpucompress_compress.cpp:642-643) and has no
+      // not-beneficial branch at all.
+      //
+      // A genuine codec FAILURE is different -- there is no measurement, so
+      // leave the ratio at 0 and let the learning gate skip the chunk.
+      if (success) {
+        task->context_.actual_original_size_ = input_size;
+        task->context_.actual_compressed_size_ = total_stored_size;
+        task->context_.actual_compression_ratio_ =
+            static_cast<double>(input_size) /
+            static_cast<double>(total_stored_size);
+        task->context_.actual_compress_time_ms_ = compress_time;
+      } else {
+        task->context_.actual_compression_ratio_ = 0.0;
+        task->context_.actual_compress_time_ms_ = 0.0;
+      }
     }
 
   } catch (const std::exception& e) {

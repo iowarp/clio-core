@@ -371,6 +371,74 @@ int main(int argc, char **argv) {
                 gn);
   }
 
+  // ---- Phase 2b: SGD parity with a REVERSING gradient direction. ----
+  // Phase 2's labels rise monotonically, so the combined gradient keeps a
+  // stable sign, dot_ema stays positive on both sides, and the anti-flip
+  // damping branch is never taken asymmetrically -- it agrees by never
+  // firing. That hid a real divergence: NeuroPress accumulates the
+  // current-vs-EMA dot over the TRUNK ONLY (nn_gpu.cu:1380-1402 stops at
+  // DB4), while the port summed all 13576 parameters including the
+  // unprojected, sign-stable W5 block, biasing the dot positive and damping
+  // less often than upstream.
+  //
+  // Alternating far-over and far-under labels past the warmup threshold
+  // (sgd_call_count > 3) force the dot negative on some steps and positive
+  // on others, so a scope mismatch shows up as a factor-of-two step
+  // difference in the weights.
+  std::printf("\n[phase 2b] SGD parity with alternating gradient direction\n");
+  for (size_t step = 0; step < 12; ++step) {
+    const auto &c = chunks[step % chunks.size()];
+    const bool over = (step % 2) == 0;
+    const float actual_ratio = over ? 9.0f : 1.1f;
+    const float actual_ct = over ? 40.0f : 2.0f;
+    const float actual_dt = over ? 25.0f : 1.5f;
+    const int algo_idx = static_cast<int>(step % 8);
+
+    AutoStatsGPU h_stats{};
+    h_stats.entropy = c.entropy;
+    h_stats.mad_normalized = c.mad;
+    h_stats.deriv_normalized = c.deriv;
+    h_stats.num_elements = c.size_bytes / sizeof(float);
+    cudaMemcpy(d_stats, &h_stats, sizeof(h_stats), cudaMemcpyHostToDevice);
+
+    SGDSample s{};
+    s.action = algo_idx;
+    s.actual_ratio = actual_ratio;
+    s.actual_comp_time = actual_ct;
+    s.actual_decomp_time = actual_dt;
+    s.actual_psnr = 0.0f;
+
+    float gn = 0; int clipped = 0, cnt = 0;
+    int rc = gpucompress::runNNSGD(d_stats, &s, 1, c.size_bytes,
+                                   /*error_bound=*/0.0, /*lr=*/0.01f, stream,
+                                   &gn, &clipped, &cnt);
+    cudaStreamSynchronize(stream);
+    if (rc != 0) {
+      std::printf("  [FAIL] native SGD rc=%d at 2b step %zu\n", rc, step);
+      ++g_failures;
+    }
+    ++g_checks;
+
+    CompressionFeatures f;
+    f.chunk_size_bytes = static_cast<double>(c.size_bytes);
+    f.shannon_entropy = c.entropy;
+    f.mad = c.mad;
+    f.second_derivative_mean = c.deriv;
+    f.data_type_float = 1.0;
+    f.library_config_id = BaseIdForAlgoIdx(algo_idx) * 10 + 2;
+    f.config_balanced = 1.0;
+    std::vector<TrainingLabels> labels = {
+        TrainingLabels(actual_ratio, 0.0f, actual_ct, actual_dt)};
+    clio.Train({f}, labels);
+
+    NNWeightsGPU nat{}, cl{};
+    SnapshotNative(&nat);
+    FlattenClio(clio.DebugWeights(), clio.DebugBiases(), &cl);
+    CompareWeights(nat, cl, "sgd-alt step " + std::to_string(step), 2e-5);
+    std::printf("  alt step %2zu (%s): weights compared (grad_norm=%.6g)\n",
+                step, over ? "over " : "under", gn);
+  }
+
   // ---- Phase 3: deferred decompression-head parity. ----
   std::printf("\n[phase 3] deferred decomp-head SGD parity\n");
   {

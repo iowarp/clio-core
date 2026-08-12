@@ -251,41 +251,72 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
     float decomp_time = expm1f(s_y[1] * w->y_stds[1] + w->y_means[1]);
     float ratio = expm1f(s_y[2] * w->y_stds[2] + w->y_means[2]);
     float psnr = s_y[3] * w->y_stds[3] + w->y_means[3];
+    // Sanity clamps BEFORE the policy clamps, exactly as nn_gpu.cu:217-231
+    // orders them. The 1e6 ceiling is what makes a non-finite prediction
+    // safe: fminf(NaN, 1e6) returns 1e6, so a head that SGD has drifted
+    // into NaN ranks WORST. Without it, fmaxf(1.0f, NaN) yields 1.0 and the
+    // broken candidate becomes the cheapest one in the cost model, winning
+    // outright. Same reasoning for the 0.1 ratio floor.
+    comp_time = fmaxf(1e-6f, fminf(comp_time, 1e6f));
+    decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
+    ratio = fmaxf(0.1f, fminf(ratio, 1e5f));
+    psnr = fmaxf(0.0f, fminf(psnr, 120.0f));
+
     out_comp_time[cand] = fmaxf(1.0f, comp_time);
-    out_decomp_time[cand] = decomp_time;
-    out_ratio[cand] = fmaxf(0.001f, fminf(100.0f, ratio));
+    out_decomp_time[cand] = fmaxf(1.0f, decomp_time);
+    out_ratio[cand] = fminf(100.0f, ratio);
     out_psnr[cand] = psnr;
   }
 }
 
-void NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
+bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              int num_candidates, float *out_comp_time_ms,
                              float *out_decomp_time_ms, float *out_ratio,
                              float *out_psnr_db) {
-  if (!w || num_candidates <= 0) return;
+  if (!w || num_candidates <= 0) return false;
 
   float *d_in = nullptr, *d_ct = nullptr, *d_dt = nullptr, *d_r = nullptr,
         *d_p = nullptr;
   size_t in_bytes = sizeof(float) * static_cast<size_t>(num_candidates) * kInputDim;
   size_t out_bytes = sizeof(float) * static_cast<size_t>(num_candidates);
-  cudaMalloc(&d_in, in_bytes);
-  cudaMalloc(&d_ct, out_bytes);
-  cudaMalloc(&d_dt, out_bytes);
-  cudaMalloc(&d_r, out_bytes);
-  cudaMalloc(&d_p, out_bytes);
 
-  cudaMemcpy(d_in, raw_inputs, in_bytes, cudaMemcpyHostToDevice);
-  InferKernel<<<num_candidates, kHiddenDim>>>(w, d_in, d_ct, d_dt, d_r, d_p);
-  cudaMemcpy(out_comp_time_ms, d_ct, out_bytes, cudaMemcpyDeviceToHost);
-  cudaMemcpy(out_decomp_time_ms, d_dt, out_bytes, cudaMemcpyDeviceToHost);
-  cudaMemcpy(out_ratio, d_r, out_bytes, cudaMemcpyDeviceToHost);
-  cudaMemcpy(out_psnr_db, d_p, out_bytes, cudaMemcpyDeviceToHost);
+  // Every step is checked: a silent failure here leaves the caller's output
+  // vectors zero-filled, which survives the policy clamps as a complete and
+  // plausible-looking ranking (ratio 0.1, 1 ms, everywhere) rather than an
+  // error. NeuroPress checks cudaGetLastError and returns -1 (nn_gpu.cu:
+  // 1944-1971); this is the equivalent.
+  bool ok = cudaMalloc(&d_in, in_bytes) == cudaSuccess &&
+            cudaMalloc(&d_ct, out_bytes) == cudaSuccess &&
+            cudaMalloc(&d_dt, out_bytes) == cudaSuccess &&
+            cudaMalloc(&d_r, out_bytes) == cudaSuccess &&
+            cudaMalloc(&d_p, out_bytes) == cudaSuccess;
+
+  if (ok) {
+    ok = cudaMemcpy(d_in, raw_inputs, in_bytes, cudaMemcpyHostToDevice) ==
+         cudaSuccess;
+  }
+  if (ok) {
+    InferKernel<<<num_candidates, kHiddenDim>>>(w, d_in, d_ct, d_dt, d_r, d_p);
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaDeviceSynchronize() == cudaSuccess;
+  }
+  if (ok) {
+    ok = cudaMemcpy(out_comp_time_ms, d_ct, out_bytes,
+                    cudaMemcpyDeviceToHost) == cudaSuccess &&
+         cudaMemcpy(out_decomp_time_ms, d_dt, out_bytes,
+                    cudaMemcpyDeviceToHost) == cudaSuccess &&
+         cudaMemcpy(out_ratio, d_r, out_bytes, cudaMemcpyDeviceToHost) ==
+             cudaSuccess &&
+         cudaMemcpy(out_psnr_db, d_p, out_bytes, cudaMemcpyDeviceToHost) ==
+             cudaSuccess;
+  }
 
   cudaFree(d_in);
   cudaFree(d_ct);
   cudaFree(d_dt);
   cudaFree(d_r);
   cudaFree(d_p);
+  return ok;
 }
 
 // ============================================================================
@@ -630,8 +661,17 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
 
   bool warmed_up = (w->sgd_call_count > 3);
   if (warmed_up) {
+    // TRUNK ONLY (params before the W5 block). NeuroPress accumulates this
+    // dot over DW1..DB4 and stops -- nn_gpu.cu:1380-1402 has no DW5/DB5
+    // term, and the omission is deliberate: the trust-region norm 60 lines
+    // earlier (:1319-1326) explicitly DOES include both. Including them
+    // biases the dot positive, because the W5 gradient (error * h4, with h4
+    // a non-negative ReLU output) is the largest and most sign-stable block
+    // and is not projected by PCGrad -- so the step got damped less often
+    // than upstream, precisely in the oscillation regime the damping exists
+    // to suppress.
     float local_dot = 0.0f;
-    for (int i = t; i < kParamCount; i += kHiddenDim) local_dot += w->combined[i] * w->ema[i];
+    for (int i = t; i < kOffW5; i += kHiddenDim) local_dot += w->combined[i] * w->ema[i];
     s_reduce[t] = local_dot;
     __syncthreads();
     for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
