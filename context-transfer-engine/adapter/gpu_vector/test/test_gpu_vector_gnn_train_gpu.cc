@@ -652,6 +652,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
 
     // The store above already wrote the RAW matrix under `tag`; aggregation
     // reads that and writes `tag_agg`, which the vector then opens.
+    const auto tag_id_raw = tag_id;
     auto agg_tf = core.AsyncGetOrCreateTag(std::string(tag) + "_agg");
     agg_tf.Wait();
     REQUIRE(agg_tf->GetReturnCode() == 0);
@@ -667,6 +668,26 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     REQUIRE(gnn_agg::Aggregate(comp, tag_id, agg_tf->tag_id_, ip, ix, ap));
     std::fprintf(stderr, "[TRAIN] aggregation done in %.1fs\n",
                  NowSec() - agg_t0);
+    // Self-check: at papers100M nothing outside this process can recompute A
+    // to diff against, so sampled rows are recomputed from the stored raw
+    // pages and compared. Cheap relative to the aggregation itself.
+    const int nver = (int)EnvI64("CLIO_GNN_VERIFY_ROWS", 32);
+    if (nver > 0) {
+      REQUIRE(gnn_agg::VerifyRows(comp, tag_id_raw, agg_tf->tag_id_, ip, ix, ap,
+                                  nver, 1e-3, 0x9E3779B97F4A7C15ull));
+      // Prove the checker can fail. Comparing the RAW matrix against the
+      // aggregate formula must mismatch on any graph with edges; if this
+      // reports OK the verifier is not actually checking anything, and the
+      // reassurance it gives at papers100M would be worthless.
+      if (EnvI64("CLIO_GNN_VERIFY_SELFTEST", 1) != 0) {
+        const bool caught = !gnn_agg::VerifyRows(comp, tag_id_raw, tag_id_raw,
+                                                 ip, ix, ap, nver, 1e-3,
+                                                 0x9E3779B97F4A7C15ull);
+        std::fprintf(stderr, "[TRAIN] verifier self-test (raw vs formula): %s\n",
+                     caught ? "correctly MISMATCHED" : "*** DID NOT CATCH ***");
+        REQUIRE(caught);
+      }
+    }
     tag_id = agg_tf->tag_id_;
     vec_tag = std::string(tag) + "_agg";
   }
@@ -752,7 +773,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     std::fprintf(stderr, "[TRAIN] in-core OOM'd -> Eternia is the ONLY method that TRAINED this "
                  "%lluMiB feature matrix. Final train_acc=%.4f val_acc=%.4f\n",
                  (unsigned long long)(dataset_bytes >> 20), et_acc[epochs - 1], et_vacc[epochs - 1]);
-    REQUIRE(et_acc[epochs - 1] > et_acc[0]);  // training made progress
+    // Only meaningful with more than one epoch: at epochs==1 this compares
+    // et_acc[0] with itself and fails for a perfectly valid configuration.
+    if (epochs > 1) {
+      REQUIRE(et_acc[epochs - 1] > et_acc[0]);  // training made progress
+    }
   }
   std::fprintf(stderr, "====================================================\n");
 

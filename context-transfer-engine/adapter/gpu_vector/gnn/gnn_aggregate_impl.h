@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -180,6 +181,98 @@ inline bool Aggregate(clio::cte::core::Client &comp,
   CLIO_IPC->FreeBuffer(inb);
   CLIO_IPC->FreeBuffer(outb);
   return true;
+}
+
+/**
+ * Recompute `nsample` randomly chosen rows the slow way and compare.
+ *
+ * At papers100M there is no external reference: the matrix cannot be held in
+ * host memory, so nothing can recompute A and diff it. A wrong aggregate --
+ * an off-by-one in the page arithmetic, a block boundary that drops
+ * contributions, the vector opened on the wrong tag -- would produce numbers
+ * that look entirely plausible and are simply wrong. This is the only
+ * correctness signal available at that scale, so it is worth the page reads.
+ *
+ * Cost is about (average degree) page fetches per sampled row, with a one-page
+ * cache that the sorted adjacency makes reasonably effective.
+ *
+ * @return true when every sampled row agrees within `tol`.
+ */
+inline bool VerifyRows(clio::cte::core::Client &comp,
+                       const clio::cte::core::TagId &feat_tag,
+                       const clio::cte::core::TagId &out_tag,
+                       const std::int64_t *indptr, const std::int64_t *indices,
+                       const Params &p, int nsample, double tol,
+                       std::uint64_t seed) {
+  const std::int64_t N = p.nodes;
+  const int dim = p.dim;
+  const std::int64_t rows_per_page =
+      (std::int64_t)(p.page_bytes / (dim * sizeof(float)));
+  if (rows_per_page <= 0 || N <= 0) return false;
+
+  ctp::ipc::FullPtr<char> fb = CLIO_IPC->AllocateBuffer((size_t)p.page_bytes);
+  ctp::ipc::FullPtr<char> ab = CLIO_IPC->AllocateBuffer((size_t)p.page_bytes);
+  if (fb.IsNull() || ab.IsNull()) return false;
+  float *fpage = reinterpret_cast<float *>(fb.ptr_);
+  float *apage = reinterpret_cast<float *>(ab.ptr_);
+  std::int64_t cached = -1;
+
+  auto fetch = [&](const clio::cte::core::TagId &tag, std::int64_t pg,
+                   ctp::ipc::FullPtr<char> &buf) -> bool {
+    char name[32];
+    clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
+    auto gf = comp.AsyncGetBlob(tag, name, (clio::run::u64)0,
+                               (clio::run::u64)p.page_bytes, 0,
+                               buf.shm_.template Cast<void>(),
+                               clio::run::PoolQuery::Local());
+    gf.Wait();
+    return gf->GetReturnCode() == 0;
+  };
+  auto feat_row = [&](std::int64_t r, std::vector<double> &out) -> bool {
+    const std::int64_t pg = r / rows_per_page;
+    if (pg != cached) {
+      if (!fetch(feat_tag, pg, fb)) return false;
+      cached = pg;
+    }
+    const float *src = &fpage[(size_t)((r % rows_per_page) * dim)];
+    for (int d = 0; d < dim; ++d) out[(size_t)d] = (double)src[d];
+    return true;
+  };
+
+  std::uint64_t st = seed | 1ull;
+  auto next = [&]() {
+    st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+    return st;
+  };
+
+  std::vector<double> ref((size_t)dim), tmp((size_t)dim);
+  double worst = 0.0;
+  int checked = 0;
+  for (int i = 0; i < nsample; ++i) {
+    const std::int64_t v = (std::int64_t)(next() % (std::uint64_t)N);
+    std::fill(ref.begin(), ref.end(), 0.0);
+    if (!feat_row(v, tmp)) return false;
+    for (int d = 0; d < dim; ++d) ref[(size_t)d] += tmp[(size_t)d];
+    for (std::int64_t k = indptr[(size_t)v]; k < indptr[(size_t)v + 1]; ++k) {
+      if (!feat_row(indices[(size_t)k], tmp)) return false;
+      for (int d = 0; d < dim; ++d) ref[(size_t)d] += tmp[(size_t)d];
+    }
+    const double inv =
+        1.0 / (double)(indptr[(size_t)v + 1] - indptr[(size_t)v] + 1);
+
+    if (!fetch(out_tag, v / rows_per_page, ab)) return false;
+    const float *got = &apage[(size_t)((v % rows_per_page) * dim)];
+    for (int d = 0; d < dim; ++d) {
+      worst = std::max(worst, std::fabs(ref[(size_t)d] * inv - (double)got[d]));
+    }
+    ++checked;
+  }
+
+  CLIO_IPC->FreeBuffer(fb);
+  CLIO_IPC->FreeBuffer(ab);
+  std::fprintf(stderr, "[agg] verified %d sampled rows: worst_abs=%.3e (tol %.1e) -> %s\n",
+               checked, worst, tol, worst <= tol ? "OK" : "MISMATCH");
+  return worst <= tol;
 }
 
 }  // namespace gnn_agg
