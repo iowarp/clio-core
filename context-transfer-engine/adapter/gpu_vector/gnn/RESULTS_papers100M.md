@@ -9,6 +9,21 @@ Reproduce with:
     SKIP_AGG=1 EPOCHS=2 RAM_TIER_MB=6144 NVME_TIER_MB=102400 \
       ZIP=/path/papers100M-bin.zip ./run_papers100M.sh
 
+## Status, honestly
+
+The pipeline runs end to end on the real dataset and is bit-exact at a scale
+where that can be checked (run_pipeline_test.sh). At FULL scale a single epoch
+completes only by consuming essentially all of RAM: shared memory grows ~57 GiB
+during the epoch, so the run below finished with the machine at ~0 MiB free,
+and a repeat with a 4 GiB safety margin was killed by the guard mid-epoch.
+Treat full-scale epochs as not safely runnable on a 60 GiB host until the
+allocator defect below is fixed.
+
+Measured mitigations that do NOT work: a larger page cache (window 4 -> 256,
+64x fewer evictions) leaves segment growth unchanged at 6 per epoch on the 10M
+reproducer, so the growth is not proportional to eviction count and the
+per-eviction explanation is incomplete.
+
 ## What ran
 
 | | |
