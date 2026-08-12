@@ -152,6 +152,7 @@ void EvChanReport() {
 // and per-slot latency report without killing the process. fprintf in a
 // signal handler is not strictly async-signal-safe; acceptable for a
 // diagnosis tool that only ever runs on an already-wedged process.
+#ifdef SIGUSR1
 void EvDumpOnSignal(int) {
   const unsigned long long end = g_ev_seq.load();
   const unsigned long long begin = end > 256 ? end - 256 : 0;
@@ -166,11 +167,15 @@ void EvDumpOnSignal(int) {
   fprintf(stderr, "==== end evlog ====\n");
   fflush(stderr);
 }
+#endif
 
 struct EvInit {
   EvInit() {
     g_prev_term = std::set_terminate(EvDumpOnTerminate);
+#ifdef SIGUSR1
+    // kill -USR1 dump; POSIX only. Windows keeps the terminate/atexit paths.
     signal(SIGUSR1, EvDumpOnSignal);
+#endif
     if (std::getenv("CLIO_EVLAT") != nullptr) {
       std::atexit(EvChanReport);
     }

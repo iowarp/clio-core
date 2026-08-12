@@ -61,20 +61,19 @@ CTP_INLINE_CROSS_FUN u32 Elem(u64 i) { return static_cast<u32>(i % 251); }
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 per) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   const u64 base = static_cast<u64>(blockIdx.x) * per;
-  const u64 pages = per / v.elems_per_page_;
+  const u64 pages = per / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
     {
-      const u64 off = base + p * v.elems_per_page_;
-      v.HoldPage(off, v.elems_per_page_);
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+      const u64 off = base + p * v.h_->elems_per_page_;
+      v.HoldPage(off, v.h_->elems_per_page_);
+      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         v[off + i] = Elem(off + i);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        v.BeginFlush(off, v.elems_per_page_);
-        v.WaitFlush(off, v.elems_per_page_);
+        v.BeginFlush(off, v.h_->elems_per_page_);
+        v.WaitFlush(off, v.h_->elems_per_page_);
       }
       __syncthreads();
       }
@@ -111,10 +110,9 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
                                  u32 compute_iters, int prefetch, u32 depth,
                                  unsigned long long *total) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   const u64 base = static_cast<u64>(blockIdx.x) * per;
-  const u64 first_page = base / v.elems_per_page_;
-  const u64 pages = per / v.elems_per_page_;
+  const u64 first_page = base / v.h_->elems_per_page_;
+  const u64 pages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
 
   for (u64 p = 0; p < pages; ++p) {
@@ -135,9 +133,9 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
       }
       __syncthreads();
 
-      const u64 off = base + p * v.elems_per_page_;
+      const u64 off = base + p * v.h_->elems_per_page_;
       unsigned long long local = 0;
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         local += v[off + i];
       }
       acc += local;
@@ -171,7 +169,6 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
   if (threadIdx.x != 0) return;
   v.DropAll();
 }

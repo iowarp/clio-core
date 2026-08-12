@@ -340,6 +340,19 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
   CLIO_TASK_BODY_END
 }
 
+// OUTSIDE the GPU+nvcomp region on purpose: this destructor is the vtable
+// key function. Guarded, a CPU-only build (deps-cpu containers: no CUDA, no
+// nvcomp) emitted no vtable at all and libclio_cte_compressor_runtime.so
+// failed to link with "undefined reference to vtable". The members it
+// touches are unconditional; the batch thread it joins simply never started
+// without nvcomp.
+Runtime::~Runtime() {
+  batch_stop_.store(true, std::memory_order_release);
+  if (batch_thread_.joinable()) {
+    batch_thread_.join();
+  }
+}
+
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   // Compress placement: consult per-tag consumer tracking (when enabled)
   // so the compressed copy lands on the node that most recently read
@@ -1577,13 +1590,6 @@ void Runtime::ReleaseCodecSlot(size_t idx) {
   }
   std::lock_guard<std::mutex> guard(codec_mu_);
   codec_free_.push_back(idx);
-}
-
-Runtime::~Runtime() {
-  batch_stop_.store(true, std::memory_order_release);
-  if (batch_thread_.joinable()) {
-    batch_thread_.join();
-  }
 }
 
 void Runtime::DestroyCodecContext() {

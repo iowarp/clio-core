@@ -97,10 +97,6 @@ __global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> uo,
                               gv::DeviceVector<float> vo, u32 dim) {
   CLIO_GPU_INIT(info, nullptr);
-  ui.ipc_ = g_ipc_manager_ptr;
-  vi.ipc_ = g_ipc_manager_ptr;
-  uo.ipc_ = g_ipc_manager_ptr;
-  vo.ipc_ = g_ipc_manager_ptr;
   const u64 cells = static_cast<u64>(dim) * dim;
   // One resolution per field for the whole kernel, instead of one per access.
   ui.HoldPage(0, cells);
@@ -138,10 +134,6 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
                         gv::DeviceVector<float> uo, gv::DeviceVector<float> vo,
                         u32 dim) {
   CLIO_GPU_INIT(info, nullptr);
-  u.ipc_ = g_ipc_manager_ptr;
-  v.ipc_ = g_ipc_manager_ptr;
-  uo.ipc_ = g_ipc_manager_ptr;
-  vo.ipc_ = g_ipc_manager_ptr;
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
@@ -162,7 +154,6 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
 __global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
                          gv::DeviceVector<float> src, float *dst, u32 dim) {
   CLIO_GPU_INIT(info, nullptr);
-  src.ipc_ = g_ipc_manager_ptr;
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {

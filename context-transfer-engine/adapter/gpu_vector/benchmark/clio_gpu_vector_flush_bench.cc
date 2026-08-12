@@ -61,16 +61,15 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 iters,
                            u64 pages_per_region) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 region_elems = pages_per_region * v.elems_per_page_;
+  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
   for (u64 it = 0; it < iters; ++it) {
     {
       const u64 off = block_base + it * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 poff = off + pg * v.elems_per_page_;
-        v.HoldPage(poff, v.elems_per_page_);
-        for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+        const u64 poff = off + pg * v.h_->elems_per_page_;
+        v.HoldPage(poff, v.h_->elems_per_page_);
+        for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
           v[poff + i] = Val(poff + i, 0u);
         }
         __syncthreads();
@@ -97,8 +96,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                                      u64 clock_khz, int do_write, u32 pass,
                                      int async) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 region_elems = pages_per_region * v.elems_per_page_;
+  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
   long long prev = -1;
 
@@ -121,11 +119,11 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
         // Page at a time, so the whole block is inside one page at any moment --
         // the granularity the vector's paging contract assumes.
         for (u64 pg = 0; pg < pages_per_region; ++pg) {
-          const u64 poff = off + pg * v.elems_per_page_;
+          const u64 poff = off + pg * v.h_->elems_per_page_;
           // Required: operator[] indexes the HELD page and does no resolution,
           // so without this last_page_ is null and the write dereferences it.
-          v.HoldPage(poff, v.elems_per_page_);
-          for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+          v.HoldPage(poff, v.h_->elems_per_page_);
+          for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
             v[poff + i] = Val(poff + i, pass);
           }
           __syncthreads();
@@ -173,8 +171,7 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
                                        unsigned long long *bad_off,
                                        u32 *bad_got) {
   CLIO_GPU_INIT(info, nullptr);
-  v.ipc_ = g_ipc_manager_ptr;
-  const u64 region_elems = pages_per_region * v.elems_per_page_;
+  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
   const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
   unsigned long long acc = 0;
 
@@ -186,7 +183,7 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
     if (async && threadIdx.x == 0 && it + 1 < iters) {
       const u64 nxt = block_base + (it + 1) * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 pn = v.PageOf(nxt + pg * v.elems_per_page_);
+        const u64 pn = v.PageOf(nxt + pg * v.h_->elems_per_page_);
         v.RescorePage(pn, 1000.0f);
         v.BeginFetch(pn);
       }
@@ -195,11 +192,11 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
 
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
-      const u64 poff = off + pg * v.elems_per_page_;
-      v.HoldPage(poff, v.elems_per_page_);
+      const u64 poff = off + pg * v.h_->elems_per_page_;
+      v.HoldPage(poff, v.h_->elems_per_page_);
       unsigned long long local = 0;
       unsigned long long wrong = 0;
-      for (u64 i = threadIdx.x; i < v.elems_per_page_; i += blockDim.x) {
+      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         const u32 got = v.at(poff + i);
         local += got;
         // Compare element by element: a single global sum says only THAT
@@ -234,12 +231,14 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void DumpSlotsKernel(gv::DeviceVector<u32> v,
                                 unsigned long long *out) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  for (clio::run::u32 i = 0; i < v.pages_per_block_; ++i) {
-    out[2 * i] = v.pages_[i].page_num;
+  // Block 0's slice sits at the front of the shared page table.
+  const gv::Page *tbl = v.h_->pages_;
+  for (clio::run::u32 i = 0; i < v.h_->pages_per_block_; ++i) {
+    out[2 * i] = tbl[i].page_num;
     out[2 * i + 1] =
-        (v.pages_[i].page_num == gv::kNoPage || v.pages_[i].data == nullptr)
+        (tbl[i].page_num == gv::kNoPage || tbl[i].data == nullptr)
             ? 0ull
-            : static_cast<const u32 *>(v.pages_[i].data)[0];
+            : static_cast<const u32 *>(tbl[i].data)[0];
   }
 }
 
