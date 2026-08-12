@@ -14,7 +14,10 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -513,3 +516,137 @@ TEST_CASE("XGBoostPredictor degrades gracefully when disabled") {
     REQUIRE(std::isfinite(pred.compression_ratio));
   }
 }
+
+#ifdef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+TEST_CASE("TrainDecompHead updates ONLY the decompression-time head") {
+  // Port of NeuroPress's nnBatchedDecompSGDKernel (nn_gpu.cu), which forwards
+  // through the frozen trunk and writes only w5 row 1 / b5[1]. A
+  // decompression-time miss must never perturb the shared representation the
+  // other three heads depend on.
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  CompressionFeatures f;
+  f.chunk_size_bytes = 2 * 1024 * 1024;
+  f.shannon_entropy = 3.0;
+  f.mad = 0.3;
+  f.second_derivative_mean = 0.03;
+  f.data_type_float = 1.0;
+  f.library_config_id = 13 * 10 + 2;  // nvcomp-lz4, BALANCED
+  f.config_balanced = 1.0;
+
+  // Baseline predictions for a DIFFERENT candidate, to prove the trunk and
+  // the other heads are untouched.
+  CompressionFeatures other = f;
+  other.library_config_id = 18 * 10 + 2;  // nvcomp-ans
+  auto before_other = nn.Predict(other);
+  auto before = nn.Predict(f);
+
+  // A decompression time far from whatever the model currently predicts, so
+  // the error clears the 0.05 noise gate.
+  double absurd_ms = (before.decompression_time_ms > 50.0) ? 1.0 : 900.0;
+  REQUIRE(nn.TrainDecompHead({f}, {absurd_ms}));
+
+  auto after = nn.Predict(f);
+  auto after_other = nn.Predict(other);
+
+  // The decomp head moved, and moved TOWARD the observed value.
+  REQUIRE(after.decompression_time_ms != before.decompression_time_ms);
+  REQUIRE(std::fabs(after.decompression_time_ms - absurd_ms) <
+          std::fabs(before.decompression_time_ms - absurd_ms));
+
+  // The other three heads are byte-identical: a shared-trunk update would
+  // have perturbed all of them.
+  REQUIRE(after.compression_ratio == before.compression_ratio);
+  REQUIRE(after.compression_time_ms == before.compression_time_ms);
+  REQUIRE(after.psnr_db == before.psnr_db);
+  REQUIRE(after_other.compression_ratio == before_other.compression_ratio);
+  REQUIRE(after_other.compression_time_ms == before_other.compression_time_ms);
+
+  // Guards: mismatched lengths, and a non-measured time, are no-ops.
+  REQUIRE_FALSE(nn.TrainDecompHead({f}, {}));
+  REQUIRE_FALSE(nn.TrainDecompHead({f}, {0.0}));
+  REQUIRE_FALSE(nn.TrainDecompHead({f}, {-1.0}));
+}
+
+TEST_CASE("Train() leaves the decompression-time head to TrainDecompHead") {
+  // Upstream's nnSGDKernel skips output 1 (`if (out == 1) continue;` / `t != 1`)
+  // because the deferred pass owns that head. Checked on the WEIGHTS, not on
+  // the prediction: Train() updates the shared trunk (W1-W4), which shifts
+  // every output including output 1 -- upstream behaves the same way. The
+  // invariant is specifically that w5 row 1 and b5[1] are untouched.
+  //
+  // .nnwt layout (see neuropress_nn_predictor.h): 24-byte header, 32 norm
+  // floats, then per-layer [weights, biases] with layer 4 = 64x8.
+  constexpr size_t kHeaderBytes = 24;
+  constexpr size_t kNormFloats = 32;
+  constexpr size_t kL0 = 8 * 64 + 64;
+  constexpr size_t kLMid = 64 * 64 + 64;
+  constexpr size_t kW5Base = kL0 + 3 * kLMid;      // start of layer-4 weights
+  constexpr size_t kW5Row1 = kW5Base + 1 * 64;     // 64 floats
+  constexpr size_t kB5Base = kW5Base + 64 * 8;
+  constexpr size_t kB5Idx1 = kB5Base + 1;
+
+  auto read_floats = [](const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    std::vector<float> out;
+    if (raw.size() <= kHeaderBytes) return out;
+    size_t n = (raw.size() - kHeaderBytes) / sizeof(float);
+    out.resize(n);
+    std::memcpy(out.data(), raw.data() + kHeaderBytes, n * sizeof(float));
+    return out;
+  };
+
+  NeuroPressNNPredictor nn;
+  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
+  REQUIRE(nn.IsReady());
+
+  const std::string dir_a = "/tmp/clio_np_head_before";
+  const std::string dir_b = "/tmp/clio_np_head_after";
+  std::filesystem::create_directories(dir_a);
+  std::filesystem::create_directories(dir_b);
+  REQUIRE(nn.Save(dir_a));
+
+  CompressionFeatures f;
+  f.chunk_size_bytes = 1024 * 1024;
+  f.shannon_entropy = 6.0;
+  f.mad = 0.5;
+  f.second_derivative_mean = 0.4;
+  f.data_type_float = 1.0;
+  f.library_config_id = 15 * 10 + 2;  // nvcomp-zstd, BALANCED
+  f.config_balanced = 1.0;
+
+  // Supply a real decompression-time label; Train() must still not write that
+  // head's weights.
+  std::vector<TrainingLabels> labels = {
+      TrainingLabels(/*ratio=*/9.0f, /*psnr=*/0.0f, /*time=*/40.0f,
+                     /*decompress_time=*/777.0f)};
+  REQUIRE(nn.Train({f}, labels));
+  REQUIRE(nn.Save(dir_b));
+
+  auto before = read_floats(dir_a + "/model.nnwt");
+  auto after = read_floats(dir_b + "/model.nnwt");
+  REQUIRE(before.size() == after.size());
+  REQUIRE(after.size() > kNormFloats + kB5Idx1);
+
+  // The decomp head is byte-identical.
+  for (size_t i = 0; i < 64; ++i) {
+    INFO("w5 row 1 element " << i << " was modified by Train()");
+    REQUIRE(after[kNormFloats + kW5Row1 + i] ==
+            before[kNormFloats + kW5Row1 + i]);
+  }
+  REQUIRE(after[kNormFloats + kB5Idx1] == before[kNormFloats + kB5Idx1]);
+
+  // Sanity: Train() did update other weights, so the check above is not
+  // passing merely because nothing happened.
+  bool saw_change = false;
+  for (size_t i = 0; i < before.size(); ++i) {
+    if (after[i] != before[i]) { saw_change = true; break; }
+  }
+  REQUIRE(saw_change);
+}
+
+#endif  // CLIO_CTP_NEUROPRESS_WEIGHTS_DIR

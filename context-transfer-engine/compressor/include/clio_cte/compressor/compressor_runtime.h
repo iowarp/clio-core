@@ -41,6 +41,8 @@
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <clio_cte/compressor/compressor_tasks.h>
@@ -274,6 +276,54 @@ private:
   // choose among.
   std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
       neuropress_predictor_;
+
+  /**
+   * Deferred decompression-time learning (NeuroPress's DiagnosticsStore +
+   * gpucompress_batched_decomp_sgd, src/api/). Decompression time is the one
+   * label that cannot be known when data is compressed -- only a later read
+   * reveals it. So Compress records the features it predicted from, keyed by
+   * blob, and Decompress joins its own measured time back to them and trains
+   * the decomp head (NeuroPressNNPredictor::TrainDecompHead).
+   *
+   * Bounded and FIFO-evicted: a blob that is never read back must not pin an
+   * entry forever, and this is a cache of training hints -- dropping the
+   * oldest costs a learning opportunity, never correctness.
+   */
+  struct DecompFeatureRecord {
+    ctp::compress::model::CompressionFeatures features;
+    clio::run::u64 seq;  ///< insertion order, for FIFO eviction
+  };
+  static constexpr size_t kMaxDecompFeatureRecords = 4096;
+  std::mutex decomp_features_mutex_;
+  std::unordered_map<std::string, DecompFeatureRecord> decomp_features_;
+  clio::run::u64 decomp_feature_seq_ = 0;
+
+  /**
+   * Pending decomp-head samples, flushed as ONE averaged update.
+   *
+   * Upstream sweeps its whole diagnostics store at the end of a read
+   * operation, so a single update sees many chunks and its trust region
+   * (step = 0.15 * mean|err|) scales to the batch mean. Clio's Decompress is
+   * per-blob with no equivalent end-of-operation hook, so samples are
+   * accumulated here and flushed on a full batch instead -- preserving the
+   * averaged-gradient semantics rather than taking one noisy step per blob.
+   */
+  static constexpr size_t kDecompBatchSize = 8;
+  std::vector<ctp::compress::model::CompressionFeatures>
+      pending_decomp_features_;
+  std::vector<double> pending_decomp_times_;
+
+  /** Record the features a Compress predicted from, for a later read. */
+  void RecordDecompFeatures(
+      const std::string& blob_key,
+      const ctp::compress::model::CompressionFeatures& features);
+
+  /**
+   * Join a real measured decompression time back to its recorded features
+   * and run the head-only update. No-op when online learning is off, the
+   * blob has no recorded features, or the predictor isn't ready.
+   */
+  void LearnDecompTime(const std::string& blob_key, double measured_ms);
 
   // Compression telemetry ring buffer for performance monitoring
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;

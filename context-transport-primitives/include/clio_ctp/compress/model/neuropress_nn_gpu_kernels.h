@@ -51,6 +51,18 @@ void NeuroPressGpuDownloadWeights(NeuroPressGpuWeights *w, float *weights_out,
                                   float *biases_out);
 
 /**
+ * @brief Push host weights/biases back to the device copy -- the inverse of
+ * NeuroPressGpuDownloadWeights(), same host layout.
+ *
+ * Needed by the deferred decompression-head update
+ * (NeuroPressNNPredictor::TrainDecompHead), which does its arithmetic on the
+ * host so there is exactly ONE implementation of that ported math to audit,
+ * then syncs the result to the device copy inference actually reads.
+ */
+void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
+                                const float *biases);
+
+/**
  * @brief Batched inference: one kernel launch scores every candidate,
  * mirroring NeuroPress's nnFusedInferenceKernel. raw_inputs is row-major
  * [num_candidates x 8], each row [algo_id, quant, shuffle, error_bound,

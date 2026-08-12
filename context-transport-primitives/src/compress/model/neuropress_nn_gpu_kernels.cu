@@ -168,6 +168,33 @@ void NeuroPressGpuDownloadWeights(NeuroPressGpuWeights *w, float *weights_out,
   }
 }
 
+void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
+                                const float *biases) {
+  if (!w || !weights || !biases) return;
+  // Read-modify-write: params[] also holds nothing else, but the device copy
+  // is the live one, so start from it rather than zero-filling anything this
+  // mapping does not cover.
+  float host_params[kParamCount];
+  cudaMemcpy(host_params, &w->params, sizeof(host_params),
+            cudaMemcpyDeviceToHost);
+  int dst_w_off[5] = {kOffW1, kOffW2, kOffW3, kOffW4, kOffW5};
+  int dst_b_off[5] = {kOffB1, kOffB2, kOffB3, kOffB4, kOffB5};
+  size_t src_w_off[5] = {0, kW1, kW1 + kW234, kW1 + 2 * kW234,
+                         kW1 + 3 * kW234};
+  size_t src_b_off[5] = {0, kHiddenDim, 2 * kHiddenDim, 3 * kHiddenDim,
+                         4 * kHiddenDim};
+  int w_sizes[5] = {kW1, kW234, kW234, kW234, kW5};
+  int b_sizes[5] = {kHiddenDim, kHiddenDim, kHiddenDim, kHiddenDim, kOutputDim};
+  for (int layer = 0; layer < 5; ++layer) {
+    std::memcpy(host_params + dst_w_off[layer], weights + src_w_off[layer],
+               sizeof(float) * static_cast<size_t>(w_sizes[layer]));
+    std::memcpy(host_params + dst_b_off[layer], biases + src_b_off[layer],
+               sizeof(float) * static_cast<size_t>(b_sizes[layer]));
+  }
+  cudaMemcpy(&w->params, host_params, sizeof(host_params),
+            cudaMemcpyHostToDevice);
+}
+
 // ============================================================================
 // Inference: one block per candidate, thread t owns hidden neuron t.
 // ============================================================================
@@ -630,7 +657,17 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
 
   bool finite_ok = isfinite(step) && isfinite(g_norm);
   if (finite_ok) {
+    // Output 1 (decompression time) is owned by the deferred head-only pass
+    // (NeuroPressNNPredictor::TrainDecompHead), fed by real measured times a
+    // later read supplies -- so this pass must not write its head weights.
+    // Mirrors nnSGDKernel's `if (out == 1) continue;` / `t != 1`
+    // (nn_gpu.cu). Output 1's error still reaches the shared trunk, exactly
+    // as upstream; only w5 row 1 and b5[1] are withheld.
+    const int skip_w5_begin = kOffW5 + 1 * kHiddenDim;
+    const int skip_w5_end = skip_w5_begin + kHiddenDim;
+    const int skip_b5 = kOffB5 + 1;
     for (int i = t; i < kParamCount; i += kHiddenDim) {
+      if ((i >= skip_w5_begin && i < skip_w5_end) || i == skip_b5) continue;
       float p = w->params[i] - step * w->ema[i];
       w->params[i] = fmaxf(-kWClamp, fminf(kWClamp, p));
     }

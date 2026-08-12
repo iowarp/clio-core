@@ -152,6 +152,36 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   bool Train(const std::vector<CompressionFeatures>& features,
             const std::vector<TrainingLabels>& labels) override;
 
+  /**
+   * @brief Deferred, head-only SGD for the DEcompression-time output.
+   *
+   * Port of NeuroPress's nnBatchedDecompSGDKernel (src/nn/nn_gpu.cu) and its
+   * driver gpucompress_batched_decomp_sgd() (src/api/gpucompress_learning.cpp).
+   *
+   * Decompression time is the one label that cannot be known when the data is
+   * compressed -- only a later read reveals it, possibly much later, possibly
+   * never. So upstream splits it out: Train() above deliberately leaves output
+   * 1's head weights alone (`if (out == 1) continue;`), and this batched pass
+   * owns them, fed by real measured times joined back to the features the
+   * prediction was originally made from.
+   *
+   * Updates ONLY w5 row 1 and b5[1]. The trunk (W1-W4) is read-only here --
+   * a decompression-time miss must not perturb the shared representation the
+   * other three heads depend on.
+   *
+   * Uses its own trust region, deliberately different from Train()'s:
+   * step = clamp(0.15 * mean|err|, 1e-4, 0.05), weights clamped to +-5.
+   *
+   * @param features Per-sample features, as originally predicted from.
+   * @param decompression_times_ms Real measured times, same length. Entries
+   *   <= 0 are skipped (not measured).
+   * @return true if a weight update was applied; false if not ready, inputs
+   *   mismatch, or every sample was gated out as noise.
+   */
+  bool TrainDecompHead(
+      const std::vector<CompressionFeatures>& features,
+      const std::vector<double>& decompression_times_ms);
+
  private:
   /**
    * @brief Build the 8-input NeuroPress vector from CompressionFeatures.

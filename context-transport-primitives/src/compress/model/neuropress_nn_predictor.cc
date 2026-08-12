@@ -828,14 +828,143 @@ bool NeuroPressNNPredictor::Train(
     return false;
   }
 
+  // Output 1 (decompression time) is NOT this pass's to update: its head
+  // weights belong to TrainDecompHead(), fed by real measured times only a
+  // later read can supply. Mirrors nnSGDKernel's `if (out == 1) continue;`
+  // and `t != 1` (nn_gpu.cu), which skip exactly these weights for exactly
+  // this reason. Note upstream still lets output 1's error flow into the
+  // shared trunk (W1-W4) -- only the head itself is withheld -- so the skip
+  // belongs here at the update, not earlier in the gradient accumulation.
+  // Without it the two mechanisms would fight over w5 row 1 as soon as a
+  // real decompression time reaches Train().
+  const size_t kSkipW5RowBegin = weight_offsets_[4] + 1 * kHiddenDim;
+  const size_t kSkipW5RowEnd = kSkipW5RowBegin + kHiddenDim;
+  const size_t kSkipB5Idx = bias_offsets_[4] + 1;
+
   for (size_t i = 0; i < weights_.size(); ++i) {
+    if (i >= kSkipW5RowBegin && i < kSkipW5RowEnd) continue;
     float w = weights_[i] - step * ema_weights_[i];
     weights_[i] = std::max(-kWClamp, std::min(kWClamp, w));
   }
   for (size_t i = 0; i < biases_.size(); ++i) {
+    if (i == kSkipB5Idx) continue;
     float b = biases_[i] - step * ema_biases_[i];
     biases_[i] = std::max(-kWClamp, std::min(kWClamp, b));
   }
+  return true;
+}
+
+bool NeuroPressNNPredictor::TrainDecompHead(
+    const std::vector<CompressionFeatures>& features,
+    const std::vector<double>& decompression_times_ms) {
+  if (!is_ready_ || features.empty() ||
+      features.size() != decompression_times_ms.size()) {
+    return false;
+  }
+
+  // Head-only constants, distinct from Train()'s -- see nn_gpu.cu's
+  // nnBatchedDecompSGDKernel.
+  constexpr float kDecompTrustK = 0.15f;
+  constexpr float kDecompMaxStep = 0.05f;
+  constexpr float kDecompMinStep = 1e-4f;
+  constexpr float kDecompWClamp = 5.0f;
+  constexpr float kDecompErrClamp = 2.0f;   // log-space error clamp
+  constexpr float kDecompNoiseGate = 0.05f;
+
+  const size_t w5_row1 = weight_offsets_[4] + 1 * kHiddenDim;
+  const size_t b5_idx1 = bias_offsets_[4] + 1;
+
+#if CTP_ENABLE_NEUROPRESS_GPU
+  // When inference runs on the device, the device copy is the live one --
+  // updating only the host vectors would leave the change invisible to every
+  // subsequent Predict(). Pull the current weights down first, do the update
+  // on the host (one implementation of this ported math, not two), and push
+  // the result back below.
+  if (gpu_weights_) {
+    gpu::NeuroPressGpuDownloadWeights(gpu_weights_.get(), weights_.data(),
+                                      biases_.data());
+  }
+#endif
+
+  std::vector<float> acc_gw(kHiddenDim, 0.0f);
+  float acc_gb = 0.0f;
+  float acc_abs_err = 0.0f;
+  int valid = 0;
+
+  for (size_t si = 0; si < features.size(); ++si) {
+    double measured = decompression_times_ms[si];
+    if (measured <= 0.0) continue;  // not measured -- nothing to learn from
+
+    // Forward through the frozen trunk to h4, then output 1's head only.
+    auto x = FeaturesTo8Input(features[si]);
+    auto x_norm = Standardize(x);
+    SGDActivations a = ForwardWithCache(x_norm);
+
+    float y_norm = biases_[b5_idx1];
+    for (uint32_t i = 0; i < kHiddenDim; ++i) {
+      y_norm += weights_[w5_row1 + i] * a.h4[i];
+    }
+
+    float y_std1 = std::max(y_stds_[1], 1e-8f);
+    float pred_log = y_norm * y_std1 + y_means_[1];
+
+    float clamped =
+        std::max(0.01f, std::min(static_cast<float>(measured), 5000.0f));
+    float target_log = std::log1p(clamped);
+
+    float err_log = pred_log - target_log;
+    err_log = std::max(-kDecompErrClamp, std::min(kDecompErrClamp, err_log));
+    float err = err_log / y_std1;
+
+    // Noise gate: a sub-threshold error is timing jitter, not a real miss.
+    if (std::fabs(err) < kDecompNoiseGate) continue;
+
+    for (uint32_t t = 0; t < kHiddenDim; ++t) {
+      acc_gw[t] += err * a.h4[t];
+    }
+    acc_gb += err;
+    acc_abs_err += std::fabs(err);
+    ++valid;
+  }
+
+  if (valid == 0) return false;
+
+  const float inv_n = 1.0f / static_cast<float>(valid);
+  for (float& g : acc_gw) g *= inv_n;
+  acc_gb *= inv_n;
+
+  double norm_sq = 0.0;
+  for (float g : acc_gw) norm_sq += static_cast<double>(g) * g;
+  norm_sq += static_cast<double>(acc_gb) * acc_gb;
+  float g_norm = static_cast<float>(std::sqrt(norm_sq)) + 1e-8f;
+
+  // Trust region proportional to the error: a well-calibrated head takes
+  // small steps, which is what stops it oscillating.
+  float mean_abs_err = acc_abs_err * inv_n;
+  float step = std::max(kDecompMinStep,
+                        std::min(kDecompMaxStep, kDecompTrustK * mean_abs_err));
+
+  if (!std::isfinite(step) || !std::isfinite(g_norm)) return false;
+
+  for (uint32_t t = 0; t < kHiddenDim; ++t) {
+    float gw_normed = acc_gw[t] / g_norm;
+    if (!std::isfinite(gw_normed)) continue;
+    float w = weights_[w5_row1 + t] - step * gw_normed;
+    weights_[w5_row1 + t] =
+        std::max(-kDecompWClamp, std::min(kDecompWClamp, w));
+  }
+  float gb_normed = acc_gb / g_norm;
+  if (std::isfinite(gb_normed)) {
+    float b = biases_[b5_idx1] - step * gb_normed;
+    biases_[b5_idx1] = std::max(-kDecompWClamp, std::min(kDecompWClamp, b));
+  }
+
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    gpu::NeuroPressGpuUploadWeights(gpu_weights_.get(), weights_.data(),
+                                    biases_.data());
+  }
+#endif
   return true;
 }
 

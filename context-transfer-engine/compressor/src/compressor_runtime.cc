@@ -624,6 +624,66 @@ static void WriteTraceLog(const std::string& trace_folder,
   }
 }
 
+void Runtime::RecordDecompFeatures(
+    const std::string& blob_key,
+    const ctp::compress::model::CompressionFeatures& features) {
+  std::lock_guard<std::mutex> lock(decomp_features_mutex_);
+  auto it = decomp_features_.find(blob_key);
+  if (it != decomp_features_.end()) {
+    // Overwrite: the newest compression of this blob is what a subsequent
+    // read will actually decompress.
+    it->second.features = features;
+    it->second.seq = decomp_feature_seq_++;
+    return;
+  }
+  if (decomp_features_.size() >= kMaxDecompFeatureRecords) {
+    // FIFO-evict the oldest. These are training hints for blobs that may
+    // never be read back; dropping the stalest one loses a learning
+    // opportunity, never correctness.
+    auto oldest = decomp_features_.begin();
+    for (auto cur = decomp_features_.begin(); cur != decomp_features_.end();
+         ++cur) {
+      if (cur->second.seq < oldest->second.seq) oldest = cur;
+    }
+    decomp_features_.erase(oldest);
+  }
+  decomp_features_.emplace(
+      blob_key, DecompFeatureRecord{features, decomp_feature_seq_++});
+}
+
+void Runtime::LearnDecompTime(const std::string& blob_key,
+                              double measured_ms) {
+  if (!config_.neuropress_online_learning_enabled_ || measured_ms <= 0.0) {
+    return;
+  }
+  if (!neuropress_predictor_ || !neuropress_predictor_->IsReady()) return;
+
+  std::vector<ctp::compress::model::CompressionFeatures> batch_features;
+  std::vector<double> batch_times;
+  {
+    std::lock_guard<std::mutex> lock(decomp_features_mutex_);
+    auto it = decomp_features_.find(blob_key);
+    if (it == decomp_features_.end()) return;  // never compressed here
+    pending_decomp_features_.push_back(it->second.features);
+    pending_decomp_times_.push_back(measured_ms);
+    // Consume it: one measured read trains once. Leaving it would retrain
+    // the same (features, time) pair on every subsequent read of the blob.
+    decomp_features_.erase(it);
+
+    if (pending_decomp_features_.size() < kDecompBatchSize) return;
+    batch_features.swap(pending_decomp_features_);
+    batch_times.swap(pending_decomp_times_);
+  }
+
+  // One averaged update over the batch, matching upstream's
+  // gpucompress_batched_decomp_sgd() -- the trust region scales to the mean
+  // absolute error across chunks, not to whichever single blob was read last.
+  bool trained =
+      neuropress_predictor_->TrainDecompHead(batch_features, batch_times);
+  HLOG(kDebug, "NeuroPress decomp-head SGD: batch={} trained={}",
+       batch_features.size(), trained);
+}
+
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -806,34 +866,42 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // .nnwt file on disk stays untouched, exactly like every NeuroPress
         // runtime API (only gpucompress_load_nn/_reload_nn touch the file,
         // and both are read-only).
-        if (error_pct >
-            static_cast<double>(config_.neuropress_mape_threshold_)) {
-          std::string lib_name =
-              ctp::CompressionFactory::NameForWireId(best_lib);
-          int base_id = -1;
-          for (const auto& entry : ctp::compress::model::KnownCompressors()) {
-            if (lib_name == entry.name) {
-              base_id = entry.base_id;
-              break;
-            }
+        std::string lib_name =
+            ctp::CompressionFactory::NameForWireId(best_lib);
+        int base_id = -1;
+        for (const auto& entry : ctp::compress::model::KnownCompressors()) {
+          if (lib_name == entry.name) {
+            base_id = entry.base_id;
+            break;
           }
-          if (base_id >= 0) {
-            ctp::compress::model::DataFeatures data;
-            data.chunk_size_bytes = static_cast<double>(chunk_size);
-            data.shannon_entropy = neuropress_entropy;
-            data.mad = neuropress_mad;
-            data.second_derivative_mean = neuropress_second_deriv;
-            data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
-            data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
+        }
+        if (base_id >= 0) {
+          ctp::compress::model::DataFeatures data;
+          data.chunk_size_bytes = static_cast<double>(chunk_size);
+          data.shannon_entropy = neuropress_entropy;
+          data.mad = neuropress_mad;
+          data.second_derivative_mean = neuropress_second_deriv;
+          data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
+          data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
 
-            ctp::compress::model::CandidateConfig candidate;
-            candidate.base_id = base_id;
-            candidate.preset_id = best_preset;
-            candidate.library_name = lib_name;
+          ctp::compress::model::CandidateConfig candidate;
+          candidate.base_id = base_id;
+          candidate.preset_id = best_preset;
+          candidate.library_name = lib_name;
 
+          ctp::compress::model::CompressionFeatures chunk_features =
+              ctp::compress::model::MakeCompressionFeatures(data, candidate);
+
+          // Stash for the deferred decomp-head pass. Recorded on EVERY
+          // compress, not just when the MAPE gate below trips: any blob may
+          // be read back later, and that read is the only place a real
+          // decompression time ever becomes available.
+          RecordDecompFeatures(task->blob_name_.str(), chunk_features);
+
+          if (error_pct >
+              static_cast<double>(config_.neuropress_mape_threshold_)) {
             std::vector<ctp::compress::model::CompressionFeatures> features = {
-                ctp::compress::model::MakeCompressionFeatures(data,
-                                                               candidate)};
+                chunk_features};
             std::vector<ctp::compress::model::TrainingLabels> labels = {
                 ctp::compress::model::TrainingLabels(
                     static_cast<float>(context.actual_compression_ratio_),
@@ -1394,6 +1462,11 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       if (success) {
         task->output_size_ = decompressed_size;
         task->decompress_time_ms_ = decompress_time;
+
+        // Deferred decomp-head learning: this is the ONLY point a real
+        // decompression time exists. Join it back to the features the
+        // original Compress predicted from and train that one head.
+        LearnDecompTime(task->blob_name_.str(), decompress_time);
 
         // Log decompression telemetry
         CompressionTelemetry telemetry(
