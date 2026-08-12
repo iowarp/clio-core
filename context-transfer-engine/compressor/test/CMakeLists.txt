@@ -220,15 +220,19 @@ add_custom_command(TARGET test_transparent_compress POST_BUILD
     ${CMAKE_CURRENT_BINARY_DIR}/test_transparent_compress_config.yaml
 )
 
-add_test(NAME compressor_transparent_putblob
-    COMMAND test_transparent_compress "Transparent PutBlob")
-
-add_test(NAME compressor_transparent_getblob
-    COMMAND test_transparent_compress "Transparent GetBlob")
+# One entry, both cases, in declaration order. The GetBlob case reads the
+# blob the PutBlob case writes ("the tag we created in the previous test"),
+# so they are an ordered pair by design -- but as separate ctest entries they
+# ran in separate PROCESSES with the runtime cleanup fixtures firing in
+# between, so GetBlob always started against a wiped runtime and could never
+# find the blob. It failed on every run for that reason alone, with nothing
+# wrong in the compressor. Catch2 takes multiple test specs and runs them in
+# declaration order, which keeps the pair in one process.
+add_test(NAME compressor_transparent_roundtrip
+    COMMAND test_transparent_compress "Transparent PutBlob" "Transparent GetBlob")
 
 set_tests_properties(
-    compressor_transparent_putblob
-    compressor_transparent_getblob
+    compressor_transparent_roundtrip
     PROPERTIES
         TIMEOUT 120
         LABELS "compressor;transparent;integration;msan_skip"
@@ -259,18 +263,20 @@ target_link_libraries(test_adios2_transparent_compress
   ${CMAKE_THREAD_LIBS_INIT}
 )
 
-add_test(NAME adios2_transparent_compress_put
-    COMMAND test_adios2_transparent_compress "ADIOS2 transparent compress - PutBlob")
-
-add_test(NAME adios2_transparent_compress_get
-    COMMAND test_adios2_transparent_compress "ADIOS2 transparent compress - GetBlob")
+# Same ordered-pair rule as compressor_transparent_roundtrip above: the
+# GetBlob case reads what the PutBlob case wrote, so splitting them across
+# processes guaranteed a failure. multi-step below is self-contained and
+# stays its own entry.
+add_test(NAME adios2_transparent_compress_roundtrip
+    COMMAND test_adios2_transparent_compress
+            "ADIOS2 transparent compress - PutBlob"
+            "ADIOS2 transparent compress - GetBlob")
 
 add_test(NAME adios2_transparent_compress_multistep
     COMMAND test_adios2_transparent_compress "ADIOS2 transparent compress - multi-step")
 
 set_tests_properties(
-    adios2_transparent_compress_put
-    adios2_transparent_compress_get
+    adios2_transparent_compress_roundtrip
     adios2_transparent_compress_multistep
     PROPERTIES
         TIMEOUT 120
