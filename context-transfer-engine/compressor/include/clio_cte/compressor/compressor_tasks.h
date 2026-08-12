@@ -62,6 +62,15 @@ struct CompressorConfig {
   // 3). Loaded once at Create() time and consulted by EstCompressionStats()'s
   // dynamic-selection path (compressor_runtime.cc) whenever set.
   std::string neuropress_model_path_;
+  // Master switch for ONLINE LEARNING (SGD Phase 1 + exploration Phase 2).
+  // Off by default, mirroring NeuroPress's own
+  // g_online_learning_enabled{false} (gpucompress_api.cpp), which gates its
+  // whole learning block (gpucompress_compress.cpp) and must be turned on
+  // explicitly via gpucompress_enable_online_learning(). Configuring
+  // neuropress_model_path_ alone must give INFERENCE ONLY: a deployment
+  // that just wants the trained model should not silently get a model whose
+  // weights drift out from under it.
+  bool neuropress_online_learning_enabled_ = false;
   // MAPE (mean absolute percentage error, weighted-cost) threshold that
   // gates online SGD after a real compress (issue #693 Cycle 4f). Mirrors
   // NeuroPress's own g_reinforce_mape_threshold / GPUCOMPRESS_MAPE_LOW_THRESH
@@ -105,6 +114,8 @@ struct CompressorConfig {
         distribution_model_path_(other.distribution_model_path_),
         dnn_model_weights_path_(other.dnn_model_weights_path_),
         neuropress_model_path_(other.neuropress_model_path_),
+        neuropress_online_learning_enabled_(
+            other.neuropress_online_learning_enabled_),
         neuropress_mape_threshold_(other.neuropress_mape_threshold_),
         neuropress_exploration_enabled_(other.neuropress_exploration_enabled_),
         neuropress_exploration_threshold_(
@@ -124,6 +135,7 @@ struct CompressorConfig {
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
        dnn_model_weights_path_, neuropress_model_path_,
+       neuropress_online_learning_enabled_,
        neuropress_mape_threshold_, neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
@@ -150,6 +162,10 @@ struct CompressorConfig {
         }
         if (node["tracking_enabled"]) {
           tracking_enabled_ = node["tracking_enabled"].as<bool>();
+        }
+        if (node["neuropress_online_learning_enabled"]) {
+          neuropress_online_learning_enabled_ =
+              node["neuropress_online_learning_enabled"].as<bool>();
         }
         if (node["neuropress_mape_threshold"]) {
           neuropress_mape_threshold_ =

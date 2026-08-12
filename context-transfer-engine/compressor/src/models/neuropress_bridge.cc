@@ -58,10 +58,19 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   data.data_type_char = data_type_float ? 0.0 : 1.0;
   data.data_type_float = data_type_float ? 1.0 : 0.0;
 
-  // Request the broadest possible set; the filter below is the sole gate
-  // on what NeuroPress is actually allowed to rank.
+  // ONE preset per algorithm, not three. NeuroPress has no preset concept at
+  // all -- its config space is algorithm x quantize x byte-shuffle
+  // (nn_weights.h's NN_NUM_CONFIGS = 32, internal.hpp's decodeAction) -- and
+  // preset is not one of the 8 NN inputs (FeaturesTo8Input). Enumerating
+  // {1,2,3} therefore produced three candidates with a bit-identical feature
+  // vector, hence an identical prediction and an identical score; since
+  // Rank() finishes with std::sort (not stable_sort), which of FAST/BALANCED/
+  // BEST actually got applied to the data was decided by sort tie-breaking
+  // rather than by the model -- and preset genuinely changes codec settings
+  // downstream. Pin BALANCED so the choice is deterministic and the ranked
+  // list has one entry per algorithm, matching the model's real resolution.
   std::vector<CandidateConfig> candidates =
-      DefaultCandidates(/*include_gpu=*/true, {1, 2, 3}, false, 1e-3,
+      DefaultCandidates(/*include_gpu=*/true, {2}, false, 1e-3,
                         /*include_cpu=*/true);
 
   // Restrict to NeuroPress's actual trained action space: the network's

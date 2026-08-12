@@ -327,9 +327,17 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
                                                        : ctp::DataType::UINT8;
   size_t type_size = ctp::DataStatisticsFactory::GetTypeSize(data_type);
 
-  // Calculate number of elements (sample up to 64KB for efficiency)
-  clio::run::u64 sample_bytes = std::min(chunk_size, static_cast<clio::run::u64>(65536));
-  size_t num_elements = sample_bytes / type_size;
+  // Whole chunk, not a prefix. NeuroPress computes entropy/MAD/second-
+  // derivative by grid-striding the ENTIRE buffer (stats_kernel.cu,
+  // entropy_kernel.cu), and the shipped model was normalized against
+  // whole-chunk statistics (x_means[4] ~ 1.4 MB). Sampling only the first
+  // 64 KB fed the model prefix statistics paired with the FULL chunk_size
+  // as the size feature -- a combination that never occurs in training, and
+  // badly wrong for any chunk with a header, a zero-padded prologue, or
+  // spatially varying structure. Since every candidate is scored from these
+  // same three numbers, an error here shifts the whole ranking, not one
+  // entry.
+  size_t num_elements = static_cast<size_t>(chunk_size / type_size);
   if (num_elements == 0) {
     num_elements = 1;
   }
@@ -713,15 +721,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool neuropress_feat_valid = false;
     double neuropress_entropy = 0.0, neuropress_mad = 0.0,
            neuropress_second_deriv = 0.0;
-    if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+    if (config_.neuropress_online_learning_enabled_ &&
+        context.dynamic_compress_ != 1 && neuropress_predictor_ &&
         neuropress_predictor_->IsReady()) {
       ctp::DataType feat_type = (context.data_type_ == 1)
                                     ? ctp::DataType::FLOAT32
                                     : ctp::DataType::UINT8;
       size_t feat_type_size = ctp::DataStatisticsFactory::GetTypeSize(feat_type);
-      clio::run::u64 feat_sample_bytes =
-          std::min(chunk_size, static_cast<clio::run::u64>(65536));
-      size_t feat_num_elements = feat_sample_bytes / feat_type_size;
+      // Whole chunk -- MUST match EstCompressionStats' scope above, or the
+      // features SGD trains on are not the features inference predicted
+      // from, and the model learns against a different input than it saw.
+      size_t feat_num_elements = static_cast<size_t>(chunk_size / feat_type_size);
       if (feat_num_elements == 0) feat_num_elements = 1;
       ctp::ComputeCompressionFeatures(chunk_data, feat_num_elements, feat_type,
                                       &neuropress_entropy, &neuropress_mad,
@@ -747,7 +757,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // algorithm actually used and what really happened) and only differ in
     // which threshold gates them -- exactly mirroring
     // g_reinforce_mape_threshold vs g_exploration_threshold.
-    if (neuropress_feat_valid && task->return_code_ == 0) {
+    if (config_.neuropress_online_learning_enabled_ && neuropress_feat_valid &&
+        task->return_code_ == 0) {
       const CompressionStats* predicted = nullptr;
       for (const auto& stat : stats) {
         if (stat.compress_lib_ == best_lib &&
@@ -1061,8 +1072,6 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       CLIO_CO_RETURN;
     }
 
-    auto compress_start = std::chrono::high_resolution_clock::now();
-
     size_t header_size = sizeof(CompressionHeader);
     // Worst-case compressed size: original size + 5% overhead.
     size_t worst_case_size = input_size + (input_size / 20) + 1024;
@@ -1115,7 +1124,14 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         output_on_device ? (device_output + header_size)
                           : compressed_buffer.data();
 
+    // Time ONLY the compress call. NeuroPress brackets exactly this with
+    // CUDA events (gpucompress_compress.cpp) and its offline labels were
+    // measured the same way, so including the output allocation and the
+    // D2H/H2D staging above would feed the model a systematically inflated
+    // comp_time -- biasing both the log1p target for output 0 and the
+    // error_pct that gates whether training fires at all.
     size_t compressed_size = worst_case_size;
+    auto compress_start = std::chrono::high_resolution_clock::now();
     bool success = compressor->Compress(compress_dst, compressed_size,
                                         input_ptr, input_size);
 
