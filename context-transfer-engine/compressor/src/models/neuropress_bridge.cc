@@ -45,7 +45,7 @@ namespace clio::cte::compressor {
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float) {
+    double second_derivative_mean, bool data_type_float, double error_bound) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -151,14 +151,45 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   // therefore the one remaining dimension upstream can reach and, without
   // this, Clio could not: the parity harness shows native repeatedly
   // selecting actions 20/21/23, all of which have the shuffle bit set.
-  // quantize is deliberately still absent -- it is lossy, needs an error
-  // bound Clio does not plumb, and upstream masks it here anyway.
-  const size_t base_count = candidates.size();
-  candidates.reserve(base_count * 2);
-  for (size_t i = 0; i < base_count; ++i) {
-    CandidateConfig shuffled = candidates[i];
-    shuffled.byte_shuffle = true;
-    candidates.push_back(shuffled);
+  // Expand to the full action space IN UPSTREAM'S ORDER.
+  //
+  // decodeAction (internal.hpp:167-172) numbers an action
+  //     algo + 8*quant + 16*shuffle
+  // so the space enumerates as: 0-7 plain, 8-15 quantized, 16-23 shuffled,
+  // 24-31 quantized+shuffled. Order matters because ties are common and
+  // resolved by position -- ratio saturates at the 100x cap for many
+  // candidates on compressible data, and upstream's bitonic ranking network
+  // uses strict comparators, so the LOWEST action index survives a tie.
+  // Building shuffle-major (as this did) made a lossless shuffled config
+  // beat a quantized unshuffled one on equal cost, where upstream picks the
+  // quantized one.
+  //
+  // Quantized variants exist only with a positive error bound: upstream's
+  // ranking masks them to -INFINITY otherwise (nn_gpu.cu:238) and its
+  // compress path will not run the quantizer (gpucompress_compress.cpp:434),
+  // so a lossless run still ranks exactly the 16 configs it did before and
+  // no existing selection can change.
+  //
+  // The bound rides on the candidate because it is NN input 3, not merely an
+  // execution parameter -- the model was trained with the real bound for
+  // quantized configs and a 1e-7 sentinel for lossless ones
+  // (neural_net/core/configs.py:44).
+  {
+    const std::vector<CandidateConfig> plain = candidates;
+    candidates.clear();
+    candidates.reserve(plain.size() * (error_bound > 0.0 ? 4 : 2));
+    for (int shuffle = 0; shuffle <= 1; ++shuffle) {
+      for (int quant = 0; quant <= 1; ++quant) {
+        if (quant == 1 && !(error_bound > 0.0)) continue;
+        for (const auto &base : plain) {
+          CandidateConfig c = base;
+          c.byte_shuffle = (shuffle != 0);
+          c.quantize = (quant != 0);
+          c.error_bound = (quant != 0) ? error_bound : 0.0;
+          candidates.push_back(c);
+        }
+      }
+    }
   }
 
   // Rank by NeuroPress's own cost model rather than the library default
@@ -191,10 +222,15 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
     // selection survives all the way to Compress() without a wire change.
     // Element size 4 matches NeuroPress's own shuffle_size (internal.hpp:
     // `shuffle_size > 0 ? 4 : 0`).
-    const int preset_field =
-        r.candidate.byte_shuffle
-            ? static_cast<int>((r.candidate.preset_id & 0xFF) | (4u << 8))
-            : r.candidate.preset_id;
+    // Same packed word compressor_runtime.cc's PackPreset/PackQuant build:
+    // bits 0-7 preset, 8-15 shuffle element size, 16-23 format version,
+    // 24 quantize-enabled. Only the ENABLED bit is set here -- the precision
+    // is not known until the quantizer has seen the data's range, so
+    // Compress() fills that in when it writes the header.
+    uint32_t preset_bits = static_cast<uint32_t>(r.candidate.preset_id) & 0xFFu;
+    if (r.candidate.byte_shuffle) preset_bits |= (4u << 8);
+    if (r.candidate.quantize) preset_bits |= (1u << 24);
+    const int preset_field = static_cast<int>(preset_bits);
     results.emplace_back(wire_id, preset_field,
                           r.prediction.compression_ratio,
                           r.prediction.compression_time_ms,

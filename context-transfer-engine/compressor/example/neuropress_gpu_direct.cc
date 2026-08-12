@@ -33,6 +33,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -45,6 +46,9 @@
 #include <clio_ctp/compress/compress_factory.h>
 
 // Defined in neuropress_gpu_direct_kernel.cu.
+unsigned long long CountBoundViolationsOnDevice(const float *d_a,
+                                                const float *d_b,
+                                                size_t num_elems, double bound);
 void LaunchFillRegimes(float *d_buf, size_t num_elems, size_t elems_per_chunk);
 unsigned long long CountMismatchesOnDevice(const float *d_a, const float *d_b,
                                            size_t num_elems);
@@ -56,6 +60,12 @@ constexpr size_t kTotalBytes = 256ull << 20;  // 256 MiB
 constexpr size_t kNumChunks = kTotalBytes / kChunkBytes;
 
 const std::string kBackendFile = "/tmp/neuropress_gpu_direct_backend.dat";
+
+/** Absolute error bound; 0 = lossless. See ctx.error_bound_ below. */
+const double kErrorBound = [] {
+  const char *e = std::getenv("CLIO_NEUROPRESS_ERROR_BOUND");
+  return e ? std::atof(e) : 0.0;
+}();
 
 #define CUDA_CHECK(expr)                                                     \
   do {                                                                       \
@@ -130,6 +140,12 @@ int main() {
   // This data is float32, so say so.
   clio::cte::core::Context ctx;
   ctx.data_type_ = 1;  // float
+  // Error bound for the LOSSY half of NeuroPress's action space. 0 keeps the
+  // run lossless and ranks 16 configs; anything positive makes the 16
+  // quantize configs rankable too, for the full 32 (algorithm x quantize x
+  // byte-shuffle). Same meaning as gpucompress_config_t::error_bound
+  // ("0 = lossless"). Override with CLIO_NEUROPRESS_ERROR_BOUND.
+  ctx.error_bound_ = kErrorBound;
 
   std::cout << "Data:  " << (kTotalBytes >> 20) << " MiB on-device, "
             << kNumChunks << " chunks of " << (kChunkBytes >> 20) << " MiB\n"
@@ -263,12 +279,27 @@ int main() {
             << " ms (" << (kTotalBytes / (1024.0 * 1024.0)) / (decompress_ms / 1000.0)
             << " MiB/s)" << std::endl;
 
-  const unsigned long long mismatches =
-      CountMismatchesOnDevice(d_src, d_dst, kTotalBytes / sizeof(float));
-  std::cout << (mismatches == 0 ? "VERIFIED: round trip matches exactly."
-                                : "MISMATCH: round trip corrupted data.")
-            << " (" << mismatches << " / " << (kTotalBytes / sizeof(float))
-            << " elements differ)" << std::endl;
+  // Lossless runs must match bit for bit. A lossy run (error bound set)
+  // legitimately does not -- what must hold instead is that every element
+  // is within the bound the caller asked for, which is the guarantee
+  // error-bounded quantization makes.
+  const size_t num_elems = kTotalBytes / sizeof(float);
+  unsigned long long mismatches = 0;
+  if (kErrorBound > 0.0) {
+    mismatches = CountBoundViolationsOnDevice(d_src, d_dst, num_elems,
+                                              kErrorBound);
+    std::cout << (mismatches == 0
+                      ? "VERIFIED: every element within the error bound."
+                      : "VIOLATION: elements exceeded the error bound.")
+              << " (" << mismatches << " / " << num_elems
+              << " outside +-" << kErrorBound << ")" << std::endl;
+  } else {
+    mismatches = CountMismatchesOnDevice(d_src, d_dst, num_elems);
+    std::cout << (mismatches == 0 ? "VERIFIED: round trip matches exactly."
+                                  : "MISMATCH: round trip corrupted data.")
+              << " (" << mismatches << " / " << num_elems
+              << " elements differ)" << std::endl;
+  }
 
   cudaFree(d_src);
   cudaFree(d_dst);

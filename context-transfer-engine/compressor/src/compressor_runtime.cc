@@ -53,6 +53,7 @@
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"
+#include "clio_ctp/compress/preprocess/quantization.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 #include "clio_ctp/compress/model/ranking.h"
 #include "clio_ctp/util/logging.h"
@@ -125,6 +126,60 @@ inline uint32_t UnpackShuffle(uint32_t packed) {
 inline uint32_t UnpackVersion(uint32_t packed) {
   return (packed >> kVersionShift) & kVersionMask;
 }
+
+/**
+ * Quantization state, in the last free byte of the same word.
+ *
+ * bit 24    : quantize applied
+ * bits 25-26: precision code (0 = int8, 1 = int16, 2 = int32)
+ *
+ * Upstream keeps the equivalent in its own quant_flags field
+ * (compression_header.h:58, "bits [0-3]=type, [4-7]=precision, [8]=enabled")
+ * and has room for it because its header is 64 bytes. Clio's is 24 and
+ * fixed, so the flags ride here and the four doubles upstream stores
+ * (quant_error_bound, quant_scale, data_min, data_max) go in a header
+ * EXTENSION appended only when quantization actually ran -- see
+ * QuantHeaderExtension. Type is not encoded because LINEAR is the only
+ * quantizer either side implements.
+ */
+constexpr uint32_t kQuantShift = 24;
+constexpr uint32_t kQuantEnabledBit = 1u;
+constexpr uint32_t kQuantPrecisionShift = 1;
+constexpr uint32_t kQuantPrecisionMask = 0x3u;
+
+inline uint32_t PackQuant(bool enabled, int precision) {
+  if (!enabled) return 0;
+  uint32_t code = (precision == 8) ? 0u : (precision == 16) ? 1u : 2u;
+  return (kQuantEnabledBit | (code << kQuantPrecisionShift)) << kQuantShift;
+}
+inline bool UnpackQuantEnabled(uint32_t packed) {
+  return ((packed >> kQuantShift) & kQuantEnabledBit) != 0;
+}
+inline int UnpackQuantPrecision(uint32_t packed) {
+  uint32_t code = (packed >> (kQuantShift + kQuantPrecisionShift)) &
+                  kQuantPrecisionMask;
+  return (code == 0) ? 8 : (code == 1) ? 16 : 32;
+}
+
+/**
+ * The four doubles a reader needs to invert a quantization, appended
+ * directly after the 24-byte core header and present ONLY when the quantize
+ * bit is set. Same values upstream keeps in its extended v2 fields
+ * (compression_header.h:63-66).
+ *
+ * This is why the format carries a version: a reader that does not know
+ * about the extension would compute the wrong payload offset, and the
+ * version gate makes that a clean rejection instead of silent corruption.
+ */
+struct QuantHeaderExtension {
+  double error_bound;
+  double scale;
+  double data_min;
+  double data_max;
+};
+static_assert(sizeof(QuantHeaderExtension) == 32,
+              "QuantHeaderExtension is part of the on-disk format");
+
 
 struct CompressionHeader {
   static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
@@ -208,12 +263,31 @@ struct CompressionHeader {
   size_t PayloadSize(size_t physical_size) const {
     if (compressed_size_ == 0) return 0;
     const size_t payload = static_cast<size_t>(compressed_size_);
-    const size_t total = sizeof(CompressionHeader) + payload;
+    // Header bytes include the quantization extension when present, so the
+    // bound check stays honest for a quantized blob.
+    const size_t hdr = sizeof(CompressionHeader) +
+                       (((compress_preset_ >> 24) & 1u)
+                            ? sizeof(QuantHeaderExtension)
+                            : 0);
+    const size_t total = hdr + payload;
     if (total < payload) return 0;             // wraparound
     if (total > physical_size) return 0;       // does not fit what we have
     return payload;
   }
 };
+/**
+ * @brief Header bytes for this blob: 24 core, plus 32 when quantized.
+ *
+ * Every offset into a stored blob must go through this rather than
+ * sizeof(CompressionHeader), or a quantized blob's payload is read 32 bytes
+ * early.
+ */
+inline size_t HeaderBytesFor(uint32_t packed_preset) {
+  return sizeof(CompressionHeader) +
+         (UnpackQuantEnabled(packed_preset) ? sizeof(QuantHeaderExtension)
+                                            : 0);
+}
+
 static_assert(sizeof(CompressionHeader) == 24,
               "CompressionHeader must be 24 bytes -- it is the on-disk "
               "format; growing it strands every already-written blob");
@@ -532,7 +606,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     bool data_type_float = (context.data_type_ == 1);
     auto neuropress_stats = NeuroPressCandidateStats(
         *neuropress_predictor_, chunk_size, entropy, mad,
-        second_derivative_mean, data_type_float);
+        second_derivative_mean, data_type_float, context.error_bound_);
     // Apply the same PSNR filter the legacy per-candidate loop below uses,
     // since NeuroPressCandidateStats itself is PSNR-agnostic (issue #693).
     if (context.target_psnr_ > 0) {
@@ -1556,6 +1630,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         static_cast<uint32_t>(context.compress_preset_);
     const uint32_t preset_id = UnpackPreset(packed_preset);
     const uint32_t shuffle_elem = UnpackShuffle(packed_preset);
+    // The selector's quantize bit. Set by the ranking when it picks a
+    // quantize action; the actual decision to quantize also needs a
+    // positive error bound, checked below where upstream checks it.
+    const bool quantize_requested = UnpackQuantEnabled(packed_preset);
 
     ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
     if (preset_id == 1) {
@@ -1574,6 +1652,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       CLIO_CO_RETURN;
     }
 
+    // Core header now; grows by the quantization extension below if the
+    // quantize action actually runs. Every offset into the stored blob has
+    // to use THIS, not sizeof(CompressionHeader).
     size_t header_size = sizeof(CompressionHeader);
     // Worst-case compressed size: original size + 5% overhead.
     size_t worst_case_size = input_size + (input_size / 20) + 1024;
@@ -1606,7 +1687,16 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // Declared up here, alongside the shuffle scratch, so a single guard
     // owns both device allocations.
     ctp::ipc::AllocatorId device_output_alloc_id;
+    ctp::ipc::AllocatorId quant_device_alloc;
     uint32_t applied_shuffle = 0;
+
+    // Bytes the CODEC sees. Diverges from input_size the moment quantization
+    // runs, because quantizing float32 to int8/int16 shrinks the buffer
+    // before the codec ever looks at it. Upstream keeps the same distinction
+    // (compress_input_size vs input_size, gpucompress_compress.cpp:440-452).
+    size_t compress_input_size = input_size;
+    bool applied_quant = false;
+    ctp::compress::preprocess::DeviceQuantizeParams quant_params;
 
     // Releases both on EVERY exit from this scope. The frees used to live
     // only in the success branch, so an incompressible chunk (the
@@ -1617,7 +1707,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // frees on every exit path too (gpucompress_compress.cpp:536-545 and
     // the sibling checks at :486-519).
     struct DeviceScratchGuard {
-      ctp::ipc::AllocatorId *ids[2];
+      ctp::ipc::AllocatorId *ids[3];
       ~DeviceScratchGuard() {
         for (auto *id : ids) {
           if (id && !id->IsNull()) {
@@ -1626,7 +1716,55 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           }
         }
       }
-    } device_scratch{{&shuffle_device_alloc, &device_output_alloc_id}};
+    } device_scratch{{&shuffle_device_alloc, &device_output_alloc_id,
+                     &quant_device_alloc}};
+
+    // ---- Quantization, BEFORE the shuffle ----
+    // Upstream's order is quantize then shuffle (gpucompress_compress.cpp:
+    // 433-470), and the read side inverts it in reverse -- unshuffle, then
+    // dequantize (:1253-1296). Getting the order wrong round-trips to
+    // garbage, so both sides here are written against that pairing.
+    //
+    // Gated exactly as upstream gates it: a positive error bound is
+    // required (`cfg.error_bound > 0.0`, :434), which is also the condition
+    // under which its ranking stops masking quantize actions. Float32 only,
+    // since that is the element type the quantizer is defined for and the
+    // one NeuroPress's stats assume.
+    const bool want_quant =
+        quantize_requested && context.error_bound_ > 0.0 &&
+        context.data_type_ == 1 && input_size >= sizeof(float) &&
+        (input_size % sizeof(float)) == 0;
+    if (want_quant && ctp::IsDevicePointer(input_ptr)) {
+      char *quant_buf = nullptr;
+      quant_device_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          input_size, &quant_buf);
+      size_t quant_bytes = 0;
+      if (!quant_device_alloc.IsNull() &&
+          ctp::compress::preprocess::QuantizeDevice(
+              input_ptr, input_size / sizeof(float), context.error_bound_,
+              quant_buf, &quant_bytes, &quant_params)) {
+        input_ptr = quant_buf;          // still device-resident
+        compress_input_size = quant_bytes;
+        applied_quant = true;
+        HLOG(kDebug,
+             "NeuroPress quantize: {} -> {} bytes (precision={} eb={} "
+             "effective_eb={} achievable={})",
+             input_size, quant_bytes, quant_params.precision,
+             context.error_bound_, quant_params.effective_error_bound,
+             quant_params.bound_achievable);
+      } else if (!quant_device_alloc.IsNull()) {
+        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, quant_device_alloc);
+        quant_device_alloc = ctp::ipc::AllocatorId();
+      }
+      // On failure nothing is recorded and the chunk is compressed
+      // losslessly -- the data is still correct, just not the action that
+      // was ranked.
+    }
+
+    if (applied_quant) {
+      header_size += sizeof(QuantHeaderExtension);
+    }
 
     if (shuffle_elem != 0) {
       if (ctp::IsDevicePointer(input_ptr)) {
@@ -1638,10 +1776,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         // same reason (byte_shuffle_kernels.cu).
         shuffle_device_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
             /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-            input_size, &shuffle_device_buf);
+            compress_input_size, &shuffle_device_buf);
         if (!shuffle_device_alloc.IsNull() &&
             ctp::compress::preprocess::ByteShuffleDevice(
-                input_ptr, shuffle_device_buf, input_size, shuffle_elem)) {
+                input_ptr, shuffle_device_buf, compress_input_size, shuffle_elem)) {
           input_ptr = shuffle_device_buf;  // still on the device
           applied_shuffle = shuffle_elem;
         } else if (!shuffle_device_alloc.IsNull()) {
@@ -1650,9 +1788,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           shuffle_device_buf = nullptr;
         }
       } else {
-        shuffle_staging.resize(input_size);
+        shuffle_staging.resize(compress_input_size);
         if (ctp::compress::preprocess::ByteShuffle(
-                reinterpret_cast<const uint8_t *>(input_ptr), input_size,
+                reinterpret_cast<const uint8_t *>(input_ptr), compress_input_size,
                 shuffle_elem,
                 reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
           input_ptr = shuffle_staging.data();
@@ -1701,8 +1839,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // error_pct that gates whether training fires at all.
     size_t compressed_size = worst_case_size;
     auto compress_start = std::chrono::high_resolution_clock::now();
+    // compress_input_size, not input_size: after quantization the codec sees
+    // the narrowed buffer, which is the whole point of the transform.
     bool success = compressor->Compress(compress_dst, compressed_size,
-                                        input_ptr, input_size);
+                                        input_ptr, compress_input_size);
 
     auto compress_end = std::chrono::high_resolution_clock::now();
     double compress_time =
@@ -1733,9 +1873,24 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // if ByteShuffle declined (unsupported element size, or a size that is
       // not a whole number of elements) the bytes are unshuffled and the
       // read side must not try to invert it.
-      CompressionHeader header(context.compress_lib_,
-                               PackPreset(preset_id, applied_shuffle),
-                               input_size, compressed_size);
+      // original_size_ is the TRUE original byte count, not the quantized
+      // one: the read side sizes its output buffer from it and dequantizes
+      // back to exactly that many bytes. compressed_size is the codec's
+      // output. The quantize bit and precision ride in the packed word, and
+      // the four doubles that make the transform invertible go in the
+      // extension written right after this header.
+      CompressionHeader header(
+          context.compress_lib_,
+          PackPreset(preset_id, applied_shuffle) |
+              PackQuant(applied_quant, quant_params.precision),
+          input_size, compressed_size);
+      QuantHeaderExtension quant_ext{};
+      if (applied_quant) {
+        quant_ext.error_bound = quant_params.effective_error_bound;
+        quant_ext.scale = quant_params.scale;
+        quant_ext.data_min = quant_params.data_min;
+        quant_ext.data_max = quant_params.data_max;
+      }
       ctp::ipc::ShmPtr<> compressed_shm_ptr;
       ctp::ipc::FullPtr<char> compressed_shm;  // Only used off the device path.
 
@@ -1743,9 +1898,17 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         // Header goes in the room compress_dst was offset past above --
         // this is the only host touch for the whole compressed buffer, and
         // it's 24 bytes, not the payload.
+        // Core and extension are copied SEPARATELY: header_size is 56 for a
+        // quantized blob, and copying that many bytes out of the 24-byte
+        // struct would read past it.
         ctp::GpuApi::Memcpy(device_output,
                             reinterpret_cast<const char *>(&header),
-                            header_size);
+                            sizeof(CompressionHeader));
+        if (applied_quant) {
+          ctp::GpuApi::Memcpy(device_output + sizeof(CompressionHeader),
+                              reinterpret_cast<const char *>(&quant_ext),
+                              sizeof(quant_ext));
+        }
         compressed_shm_ptr.alloc_id_ = device_output_alloc_id;
         compressed_shm_ptr.off_ = reinterpret_cast<clio::run::u64>(device_output);
       } else {
@@ -1758,7 +1921,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           task->return_code_ = 4;  // Memory allocation failed
           CLIO_CO_RETURN;
         }
-        std::memcpy(compressed_shm.ptr_, &header, header_size);
+        std::memcpy(compressed_shm.ptr_, &header, sizeof(CompressionHeader));
+        if (applied_quant) {
+          std::memcpy(compressed_shm.ptr_ + sizeof(CompressionHeader),
+                      &quant_ext, sizeof(quant_ext));
+        }
         std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
                     compressed_size);
         compressed_shm_ptr = compressed_shm.shm_.template Cast<void>();
@@ -1990,6 +2157,33 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       const uint32_t stored_shuffle = UnpackShuffle(packed_preset);
       clio::run::u64 original_size = header->original_size_;
 
+      // A quantized blob carries a 32-byte extension after the core header,
+      // holding the four doubles that make the transform invertible. Read it
+      // before computing the payload offset -- everything downstream depends
+      // on header_size being right.
+      const bool stored_quant = UnpackQuantEnabled(packed_preset);
+      ctp::compress::preprocess::DeviceQuantizeParams stored_quant_params;
+      if (stored_quant) {
+        header_size += sizeof(QuantHeaderExtension);
+        if (expected_size < header_size) {
+          HLOG(kError,
+               "Decompress: blob '{}' claims quantization but is too small "
+               "to hold the header extension",
+               task->blob_name_.str());
+          CLIO_IPC->FreeBuffer(temp_buffer);
+          task->return_code_ = 6;
+          CLIO_CO_RETURN;
+        }
+        QuantHeaderExtension ext{};
+        std::memcpy(&ext, temp_buffer.ptr_ + sizeof(CompressionHeader),
+                    sizeof(ext));
+        stored_quant_params.effective_error_bound = ext.error_bound;
+        stored_quant_params.scale = ext.scale;
+        stored_quant_params.data_min = ext.data_min;
+        stored_quant_params.data_max = ext.data_max;
+        stored_quant_params.precision = UnpackQuantPrecision(packed_preset);
+      }
+
       // Map the wire ID to a library name via the shared registry (single
       // source of truth; out-of-range falls back to "zstd"). Wire ID is a
       // separate namespace from the factory's ML scheme (base_id*10+preset).
@@ -2035,9 +2229,46 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // Decompress to output buffer
       auto output_fullptr =
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+
+      // A quantized blob decompresses to the NARROWED buffer, not to the
+      // original bytes: the codec's output is int8/int16/int32 values that
+      // only become float32 again after dequantization. So the codec writes
+      // into a scratch of the quantized size, the unshuffle inverts on that
+      // scratch, and dequantize is what finally fills the caller's buffer.
+      // Upstream is shaped the same way (gpucompress_compress.cpp:1253-1296:
+      // decompress, then unshuffle, then dequantize, each into its own
+      // buffer).
+      const size_t quant_elems =
+          stored_quant ? (original_size / sizeof(float)) : 0;
+      const size_t quant_bytes =
+          stored_quant
+              ? quant_elems * ctp::compress::preprocess::PrecisionToBytes(
+                                  stored_quant_params.precision)
+              : 0;
+
+      char *codec_dst = output_fullptr.ptr_;
       size_t decompressed_size = original_size;
+      ctp::ipc::AllocatorId quant_scratch_alloc;
+      char *quant_scratch = nullptr;
+      if (stored_quant) {
+        quant_scratch_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+            quant_bytes, &quant_scratch);
+        if (quant_scratch_alloc.IsNull()) {
+          HLOG(kError,
+               "Decompress: could not allocate the dequantization scratch "
+               "({} bytes) for blob '{}'",
+               quant_bytes, task->blob_name_.str());
+          CLIO_IPC->FreeBuffer(temp_buffer);
+          task->return_code_ = 2;
+          CLIO_CO_RETURN;
+        }
+        codec_dst = quant_scratch;
+        decompressed_size = quant_bytes;
+      }
+
       bool success =
-          decompressor->Decompress(output_fullptr.ptr_, decompressed_size,
+          decompressor->Decompress(codec_dst, decompressed_size,
                                    compressed_data, compressed_size);
 
       CLIO_IPC->FreeBuffer(temp_buffer);
@@ -2046,7 +2277,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // the caller ever sees the buffer -- a shuffled image is not the
       // user's data, it just happens to be the same length.
       if (success && stored_shuffle != 0) {
-        if (ctp::IsDevicePointer(output_fullptr.ptr_)) {
+        if (ctp::IsDevicePointer(codec_dst)) {
           // Unshuffle ON the device, into a scratch device buffer and back.
           // Staging down to the host would work but costs a D2H/H2D round
           // trip per chunk for a GPU consumer decompressing into its own
@@ -2058,7 +2289,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
                   decompressed_size, &scratch);
           if (scratch_alloc.IsNull() ||
               !ctp::compress::preprocess::ByteUnshuffleDevice(
-                  output_fullptr.ptr_, scratch, decompressed_size,
+                  codec_dst, scratch, decompressed_size,
                   stored_shuffle)) {
             HLOG(kError,
                  "Decompress: device byte-unshuffle failed (elem={} size={}) "
@@ -2067,7 +2298,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
                  stored_shuffle, decompressed_size);
             success = false;
           } else {
-            ctp::GpuApi::Memcpy(output_fullptr.ptr_, scratch,
+            ctp::GpuApi::Memcpy(codec_dst, scratch,
                                 decompressed_size);
           }
           if (!scratch_alloc.IsNull()) {
@@ -2076,10 +2307,10 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
         } else {
           std::vector<char> unshuffled(decompressed_size);
           if (ctp::compress::preprocess::ByteUnshuffle(
-                  reinterpret_cast<const uint8_t *>(output_fullptr.ptr_),
+                  reinterpret_cast<const uint8_t *>(codec_dst),
                   decompressed_size, stored_shuffle,
                   reinterpret_cast<uint8_t *>(unshuffled.data()))) {
-            std::memcpy(output_fullptr.ptr_, unshuffled.data(),
+            std::memcpy(codec_dst, unshuffled.data(),
                         decompressed_size);
           } else {
             HLOG(kError,
@@ -2089,6 +2320,29 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
             success = false;
           }
         }
+      }
+
+      // Dequantize LAST, inverting the write side's quantize-then-shuffle
+      // (upstream inverts in the same order, gpucompress_compress.cpp:
+      // 1253-1296). This is what finally produces the caller's float32
+      // bytes, so the reported output size becomes the original size again.
+      if (success && stored_quant) {
+        if (!ctp::compress::preprocess::DequantizeDevice(
+                codec_dst, quant_elems, stored_quant_params,
+                output_fullptr.ptr_)) {
+          HLOG(kError,
+               "Decompress: dequantization failed for blob '{}' (elems={} "
+               "precision={}) -- the returned buffer would be quantized "
+               "integers, failing instead",
+               task->blob_name_.str(), quant_elems,
+               stored_quant_params.precision);
+          success = false;
+        } else {
+          decompressed_size = original_size;
+        }
+      }
+      if (!quant_scratch_alloc.IsNull()) {
+        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, quant_scratch_alloc);
       }
 
       // Stop the clock AFTER the unshuffle, not before it. Upstream's

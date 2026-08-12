@@ -1577,6 +1577,15 @@ struct Context {
                           // (default=2)
   clio::run::u32 target_psnr_;  // The acceptable PSNR for lossy compression (0 means
                           // infinity)
+  // Absolute error bound for error-bounded lossy compression. 0 means
+  // LOSSLESS, exactly as in NeuroPress's gpucompress_config_t
+  // (include/gpucompress.h:124, "Quantization error bound (0 = lossless)").
+  // It is what makes the quantize half of NeuroPress's 32-config action
+  // space reachable: its ranking masks every quantize action to -INFINITY
+  // when error_bound <= 0 (nn_gpu.cu:238), and its compress path refuses to
+  // run the quantizer without a positive bound
+  // (gpucompress_compress.cpp:434).
+  double error_bound_;
   int psnr_chance_;       // The chance PSNR will be validated (default 100%)
   bool max_performance_;  // Compression objective (performance vs ratio)
 
@@ -1611,6 +1620,7 @@ struct Context {
         compress_lib_(0),
         compress_preset_(2),
         target_psnr_(0),
+        error_bound_(0.0),
         psnr_chance_(100),
         max_performance_(false),
         consumer_node_(-1),
@@ -1634,7 +1644,8 @@ struct Context {
              replica_flags_, replica_min_score_, origin_node_, version_,
              dynamic_compress_,
              compress_lib_,
-             compress_preset_, target_psnr_, psnr_chance_, max_performance_,
+             compress_preset_, target_psnr_, error_bound_, psnr_chance_,
+             max_performance_,
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
              actual_original_size_, actual_compressed_size_,
              actual_compression_ratio_, actual_compress_time_ms_,

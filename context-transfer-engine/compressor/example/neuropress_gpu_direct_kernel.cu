@@ -71,6 +71,17 @@ __global__ void CompareBuffers(const float *a, const float *b,
   if (a[i] != b[i]) atomicAdd(mismatch, 1ull);
 }
 
+/** Lossy check: a value is wrong only if it misses the error bound. */
+__global__ void CompareWithinBound(const float *a, const float *b,
+                                   size_t num_elems, double bound,
+                                   unsigned long long *violations) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= num_elems) return;
+  if (fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])) > bound) {
+    atomicAdd(violations, 1ull);
+  }
+}
+
 }  // namespace
 
 void LaunchFillRegimes(float *d_buf, size_t num_elems, size_t elems_per_chunk) {
@@ -81,6 +92,26 @@ void LaunchFillRegimes(float *d_buf, size_t num_elems, size_t elems_per_chunk) {
 }
 
 /** Verify on-device: the data never has to come back to the host at all. */
+/** Elements whose reconstruction misses the error bound (lossy runs). */
+unsigned long long CountBoundViolationsOnDevice(const float *d_a,
+                                                const float *d_b,
+                                                size_t num_elems,
+                                                double bound) {
+  unsigned long long *d_count = nullptr;
+  if (cudaMalloc(&d_count, sizeof(unsigned long long)) != cudaSuccess) {
+    return ~0ull;
+  }
+  cudaMemset(d_count, 0, sizeof(unsigned long long));
+  const int threads = 256;
+  const int blocks = static_cast<int>((num_elems + threads - 1) / threads);
+  CompareWithinBound<<<blocks, threads>>>(d_a, d_b, num_elems, bound, d_count);
+  cudaDeviceSynchronize();
+  unsigned long long h_count = ~0ull;
+  cudaMemcpy(&h_count, d_count, sizeof(h_count), cudaMemcpyDeviceToHost);
+  cudaFree(d_count);
+  return h_count;
+}
+
 unsigned long long CountMismatchesOnDevice(const float *d_a, const float *d_b,
                                            size_t num_elems) {
   unsigned long long *d_count = nullptr;

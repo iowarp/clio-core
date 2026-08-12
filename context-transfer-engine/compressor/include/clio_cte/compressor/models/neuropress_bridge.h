@@ -83,7 +83,8 @@ namespace clio::cte::compressor {
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float);
+    double second_derivative_mean, bool data_type_float,
+    double error_bound = 0.0);
 
 }  // namespace clio::cte::compressor
 

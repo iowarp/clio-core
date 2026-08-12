@@ -9,6 +9,7 @@
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"  // kShuffleChunkBytes
 
 #include <cuda_runtime.h>
+#include <cstdio>
 
 #include <algorithm>
 #include <cmath>
@@ -360,8 +361,6 @@ bool ByteUnshuffleDevice(const void *device_in, void *device_out,
 // Ported from quantization_kernels.cu. The arithmetic is upstream's; only
 // the plumbing (CUB temp buffers, error reporting) is Clio's.
 // ===========================================================================
-#include <cub/cub.cuh>
-
 #include "clio_ctp/compress/preprocess/quantization.h"
 
 namespace ctp::compress::preprocess {
@@ -400,37 +399,92 @@ __global__ void DequantizeKernel(const InT *__restrict__ in,
   }
 }
 
-/** CUB min/max over the chunk -- compute_data_range_typed:187-232. */
+/**
+ * Monotonic float->uint key so integer atomicMin/atomicMax order floats
+ * correctly: for x >= 0 the IEEE bit pattern already orders, for x < 0 it
+ * orders in reverse, and this maps both into one increasing space.
+ */
+__device__ __forceinline__ unsigned int FloatKey(float f) {
+  unsigned int b = __float_as_uint(f);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__host__ __forceinline__ float KeyToFloat(unsigned int k) {
+  unsigned int b = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+  float f;
+  std::memcpy(&f, &b, sizeof(f));
+  return f;
+}
+
+/** Block reduction + one atomic pair per block. */
+__global__ void MinMaxKernel(const float *__restrict__ in, size_t n,
+                             unsigned int *out_min, unsigned int *out_max) {
+  __shared__ unsigned int s_min[kBlockSize];
+  __shared__ unsigned int s_max[kBlockSize];
+  unsigned int lo = 0xFFFFFFFFu, hi = 0u;
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    unsigned int k = FloatKey(in[i]);
+    lo = min(lo, k);
+    hi = max(hi, k);
+  }
+  s_min[threadIdx.x] = lo;
+  s_max[threadIdx.x] = hi;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      s_min[threadIdx.x] = min(s_min[threadIdx.x], s_min[threadIdx.x + s]);
+      s_max[threadIdx.x] = max(s_max[threadIdx.x], s_max[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicMin(out_min, s_min[0]);
+    atomicMax(out_max, s_max[0]);
+  }
+}
+
+/**
+ * Data range, equivalent to compute_data_range_typed (:187-232).
+ *
+ * Hand-rolled rather than CUB: this file lives in an RDC-enabled static
+ * library whose device link is already known to be fragile (see the header
+ * comment above the shuffle kernels), and pulling CUB in made every
+ * reduction fail at runtime with "invalid device function" -- its kernels
+ * were not device-linked for the target architecture. min and max are exact
+ * and order-independent, so a manual reduction is numerically identical to
+ * CUB's, unlike a sum would be.
+ */
 bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
                   double *out_max) {
-  if (n > static_cast<size_t>(INT_MAX)) return false;  // CUB takes an int count
-  float *d_res = nullptr;
-  if (cudaMalloc(&d_res, 2 * sizeof(float)) != cudaSuccess) return false;
+  // Clear any sticky error left by an EARLIER, unrelated CUDA call --
+  // cudaPointerGetAttributes on a host pointer (which IsDevicePointer does
+  // routinely on this path) leaves cudaErrorInvalidValue behind, and the
+  // next launch check would attribute it to this kernel.
+  cudaGetLastError();
 
-  size_t temp_bytes = 0;
-  void *d_temp = nullptr;
-  bool ok = cub::DeviceReduce::Min(nullptr, temp_bytes, d_in, d_res,
-                                   static_cast<int>(n)) == cudaSuccess;
-  if (ok) ok = cudaMalloc(&d_temp, temp_bytes) == cudaSuccess;
+  unsigned int *d_res = nullptr;
+  if (cudaMalloc(&d_res, 2 * sizeof(unsigned int)) != cudaSuccess) return false;
+  unsigned int init[2] = {0xFFFFFFFFu, 0u};
+  bool ok = cudaMemcpy(d_res, init, sizeof(init), cudaMemcpyHostToDevice) ==
+            cudaSuccess;
+
   if (ok) {
-    ok = cub::DeviceReduce::Min(d_temp, temp_bytes, d_in, d_res,
-                                static_cast<int>(n)) == cudaSuccess;
+    int grid = static_cast<int>(
+        std::min<size_t>((n + kBlockSize - 1) / kBlockSize, 1024));
+    if (grid < 1) grid = 1;
+    MinMaxKernel<<<grid, kBlockSize>>>(d_in, n, d_res, d_res + 1);
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaDeviceSynchronize() == cudaSuccess;
   }
+  unsigned int h[2] = {0u, 0u};
   if (ok) {
-    size_t tb = temp_bytes;
-    ok = cub::DeviceReduce::Max(d_temp, tb, d_in, d_res + 1,
-                                static_cast<int>(n)) == cudaSuccess;
+    ok = cudaMemcpy(h, d_res, sizeof(h), cudaMemcpyDeviceToHost) == cudaSuccess;
   }
-  float h[2] = {0.0f, 0.0f};
-  if (ok) {
-    ok = cudaMemcpy(h, d_res, 2 * sizeof(float), cudaMemcpyDeviceToHost) ==
-         cudaSuccess;
-  }
-  if (d_temp) cudaFree(d_temp);
   cudaFree(d_res);
   if (!ok) return false;
-  *out_min = static_cast<double>(h[0]);
-  *out_max = static_cast<double>(h[1]);
+
+  *out_min = static_cast<double>(KeyToFloat(h[0]));
+  *out_max = static_cast<double>(KeyToFloat(h[1]));
   return true;
 }
 
