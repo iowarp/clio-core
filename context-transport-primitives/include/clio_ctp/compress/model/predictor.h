@@ -366,10 +366,18 @@ class CompressionPredictor {
       ranked.push_back({candidates[i], preds[i],
                         weights.Score(preds[i], data.chunk_size_bytes)});
     }
-    std::sort(ranked.begin(), ranked.end(),
-              [](const RankedPrediction &a, const RankedPrediction &b) {
-                return a.score > b.score;
-              });
+    // stable_sort, not sort: ties are reachable because both sides clamp
+    // hard (times floor at 1 ms, ratio caps at 100x), so a highly
+    // compressible chunk can saturate several candidates to a bit-identical
+    // cost. std::sort leaves their relative order unspecified -- it can
+    // differ between container sizes and library versions -- whereas
+    // NeuroPress's bitonic ranking network uses strict comparators and never
+    // swaps equal keys, so it always returns the lowest action index. Stable
+    // sorting reproduces that: first enumerated wins.
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const RankedPrediction &a, const RankedPrediction &b) {
+                       return a.score > b.score;
+                     });
     return ranked;
   }
 

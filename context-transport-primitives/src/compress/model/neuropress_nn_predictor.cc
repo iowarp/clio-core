@@ -407,6 +407,11 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
   if (batch.empty()) {
     return {};
   }
+  // Readers take the same lock as the writers below. Upstream serializes
+  // this with a completion event instead (cudaStreamWaitEvent on g_sgd_done,
+  // nn_gpu.cu:1957), which Clio cannot use because TrainDecompHead's update
+  // is host-side, not a kernel on the SGD stream.
+  std::lock_guard<std::mutex> model_lock(*model_mutex_);
   if (!is_ready_) {
     // Base class contract (see predictor.h's default PredictBatch(), and
     // Rank(), which indexes preds[i] against candidates[i] unconditionally):
@@ -504,6 +509,9 @@ bool NeuroPressNNPredictor::Train(
   if (!is_ready_ || features.empty() || features.size() != labels.size()) {
     return false;
   }
+  // Matches NeuroPress's g_sgd_mutex around every SGD dispatch
+  // (gpucompress_compress.cpp:719, :1021, gpucompress_learning.cpp:100).
+  std::lock_guard<std::mutex> model_lock(*model_mutex_);
   const size_t num_samples =
       std::min(features.size(), static_cast<size_t>(kMaxSGDSamples));
 
@@ -903,6 +911,14 @@ bool NeuroPressNNPredictor::TrainDecompHead(
       features.size() != decompression_times_ms.size()) {
     return false;
   }
+  // Critical here, not merely tidy: the update below is a host-side
+  // read-modify-write that downloads every parameter, edits w5 row 1 and
+  // b5[1], and uploads them all back. Without the lock a concurrent Train()
+  // is silently reverted, because the upload carries a pre-Train snapshot of
+  // the whole trunk. Upstream cannot lose an update this way -- its decomp
+  // update is a device kernel that writes only those two slots
+  // (nn_gpu.cu:2551-2558).
+  std::lock_guard<std::mutex> model_lock(*model_mutex_);
 
   // Head-only constants, distinct from Train()'s -- see nn_gpu.cu's
   // nnBatchedDecompSGDKernel.

@@ -6,6 +6,7 @@
  */
 
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
+#include "clio_ctp/compress/preprocess/byte_shuffle.h"  // kShuffleChunkBytes
 
 #include <cuda_runtime.h>
 
@@ -219,8 +220,6 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
 // __cudaRegisterLinkedBinary segfault during static init, before main().
 // Same registration/RDC interaction that broke the demo target earlier.
 // ===========================================================================
-#include "clio_ctp/compress/preprocess/byte_shuffle.h"  // kShuffleChunkBytes
-
 namespace ctp::compress::preprocess {
 
 namespace {

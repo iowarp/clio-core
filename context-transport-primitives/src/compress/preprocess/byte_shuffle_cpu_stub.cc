@@ -16,6 +16,7 @@
  */
 
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"
+#include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 
 #if !defined(CTP_ENABLE_CUDA) || !CTP_ENABLE_CUDA
 
@@ -25,5 +26,28 @@ bool ByteShuffleDevice(const void *, void *, size_t, size_t) { return false; }
 bool ByteUnshuffleDevice(const void *, void *, size_t, size_t) { return false; }
 
 }  // namespace ctp::compress::preprocess
+
+namespace ctp {
+
+/**
+ * Same contract as the shuffle stubs above, for the same reason.
+ *
+ * data_stats_gpu.h documents ComputeDeviceStats as returning false "if CUDA
+ * support isn't compiled in", and the inline ComputeCompressionFeatures calls
+ * it unconditionally -- but its only definition lives in
+ * data_stats_gpu_kernels.cu, which CMake adds solely under
+ * CLIO_CORE_ENABLE_CUDA. A CPU-only build of the compressor chimod therefore
+ * failed to link, and the host fallback the header describes was unreachable
+ * because the device branch's callee did not exist.
+ */
+bool ComputeDeviceStats(const void *, size_t, DataType, double *out_entropy,
+                        double *out_mad, double *out_second_derivative) {
+  if (out_entropy) *out_entropy = 0.0;
+  if (out_mad) *out_mad = 0.0;
+  if (out_second_derivative) *out_second_derivative = 0.0;
+  return false;
+}
+
+}  // namespace ctp
 
 #endif

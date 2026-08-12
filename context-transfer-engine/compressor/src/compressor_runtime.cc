@@ -440,7 +440,12 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       std::vector<CompressionStats> filtered;
       filtered.reserve(neuropress_stats.size());
       for (const auto& stat : neuropress_stats) {
-        if (stat.psnr_db_ > 0 && stat.psnr_db_ < context.target_psnr_) continue;
+        // No `psnr_db_ > 0 &&` guard: upstream masks purely on
+        // `psnr < min_psnr` (nn_gpu.cu:239), and its psnr is already clamped
+        // to [0, 120], so a candidate predicted at exactly 0 dB is rejected.
+        // The extra guard kept those -- and 0.0 is precisely what a failed
+        // inference leaves behind.
+        if (stat.psnr_db_ < context.target_psnr_) continue;
         filtered.push_back(stat);
       }
       neuropress_stats = std::move(filtered);
@@ -733,16 +738,32 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
     std::lock_guard<std::mutex> lock(decomp_features_mutex_);
     auto it = decomp_features_.find(blob_key);
     if (it == decomp_features_.end()) return;  // never compressed here
-    pending_decomp_features_.push_back(it->second.features);
-    pending_decomp_times_.push_back(measured_ms);
-    // Consume it: one measured read trains once. Leaving it would retrain
-    // the same (features, time) pair on every subsequent read of the blob.
-    decomp_features_.erase(it);
 
-    if (pending_decomp_features_.size() < kDecompBatchSize) return;
-    batch_features.swap(pending_decomp_features_);
-    batch_times.swap(pending_decomp_times_);
+    // Floor the measurement at 1 ms before it becomes a target. Upstream
+    // stores `std::max(1.0f, ms)` (diagnostics_store.hpp:96-102) and its
+    // learning path reads that clamped field, keeping the raw value only
+    // for diagnostics. Sub-millisecond reads are routine for chunks of a
+    // few MB, and feeding the raw value trains toward a target ~4x lower
+    // in log space than upstream would use, dragging the head down until
+    // it hits the +-5 weight clamp.
+    it->second.measured_ms = std::max(1.0, measured_ms);
+
+    // Train over EVERY record that has a measurement, not just this one and
+    // not only once per record. gpucompress_batched_decomp_sgd() re-sweeps
+    // the whole diagnostics store on each read and never consumes entries,
+    // so a chunk read earlier is replayed into every later batch. Consuming
+    // records (and gating on a batch of 8) meant a workload that read back
+    // fewer than 8 blobs never trained the decompression head at all, since
+    // the pending vectors were simply dropped at process exit.
+    batch_features.reserve(decomp_features_.size());
+    batch_times.reserve(decomp_features_.size());
+    for (const auto& entry : decomp_features_) {
+      if (entry.second.measured_ms <= 0.0) continue;
+      batch_features.push_back(entry.second.features);
+      batch_times.push_back(entry.second.measured_ms);
+    }
   }
+  if (batch_features.empty()) return;
 
   // One averaged update over the batch, matching upstream's
   // gpucompress_batched_decomp_sgd() -- the trust region scales to the mean
@@ -1040,14 +1061,26 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           std::vector<ctp::compress::model::TrainingLabels> explore_labels;
           double best_cost = actual_cost;  // seeded with the primary's own
 
+          // Device shuffle scratch for the explored candidates; released
+          // together once the loop is done (exploration output is discarded,
+          // so nothing outlives this scope).
+          std::vector<ctp::ipc::AllocatorId> explore_gpu_scratch;
+
           for (const auto* alt : alternatives) {
             std::string alt_name =
                 ctp::CompressionFactory::NameForWireId(alt->compress_lib_);
+            // Packed, like every other compress_preset_ that came out of
+            // the ranking -- unpack before comparing, or a shuffled FAST
+            // alternative (1 | 4<<8 = 1025) silently reads as BALANCED.
+            const uint32_t alt_preset_id =
+                UnpackPreset(static_cast<uint32_t>(alt->compress_preset_));
+            const uint32_t alt_shuffle =
+                UnpackShuffle(static_cast<uint32_t>(alt->compress_preset_));
             ctp::CompressionPreset alt_preset =
                 ctp::CompressionPreset::BALANCED;
-            if (alt->compress_preset_ == 1) {
+            if (alt_preset_id == 1) {
               alt_preset = ctp::CompressionPreset::FAST;
-            } else if (alt->compress_preset_ == 3) {
+            } else if (alt_preset_id == 3) {
               alt_preset = ctp::CompressionPreset::BEST;
             }
             auto alt_compressor =
@@ -1060,6 +1093,51 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             char* alt_input = ctp::CompressionFactory::StageInputIfNeeded(
                 static_cast<char*>(chunk_data), chunk_size,
                 alt->compress_lib_, alt_device_staging);
+
+            // Apply the alternative's OWN byte-shuffle before measuring it.
+            // Upstream reconstructs the full preprocessing for each explored
+            // action -- decodeAction gives it shuf_size, and it shuffles into
+            // a per-slot buffer before compressing
+            // (gpucompress_compress.cpp:782-855). Compressing unshuffled
+            // bytes here measured a DIFFERENT action than the one being
+            // credited: shuffle usually improves the ratio on float data, so
+            // shuffled candidates looked worse than they are and got
+            // suppressed, and the shuffle dimension never received any
+            // exploration signal at all.
+            std::vector<char> alt_shuffle_staging;
+            uint32_t alt_applied_shuffle = 0;
+            if (alt_shuffle != 0 && chunk_size >= alt_shuffle &&
+                (chunk_size % alt_shuffle) == 0) {
+              if (ctp::IsDevicePointer(alt_input)) {
+                char* alt_shuf_buf = nullptr;
+                ctp::ipc::AllocatorId alt_shuf_alloc =
+                    CLIO_IPC->AllocateAndRegisterGpuBackend(
+                        /*gpu_id=*/0,
+                        clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                        chunk_size, &alt_shuf_buf);
+                if (!alt_shuf_alloc.IsNull()) {
+                  if (ctp::compress::preprocess::ByteShuffleDevice(
+                          alt_input, alt_shuf_buf, chunk_size, alt_shuffle)) {
+                    alt_input = alt_shuf_buf;
+                    alt_applied_shuffle = alt_shuffle;
+                  }
+                  // Exploration output is never stored, so the scratch can be
+                  // released as soon as this candidate is measured -- but the
+                  // compress below still reads it, so free after that.
+                  explore_gpu_scratch.push_back(alt_shuf_alloc);
+                }
+              } else {
+                alt_shuffle_staging.resize(chunk_size);
+                if (ctp::compress::preprocess::ByteShuffle(
+                        reinterpret_cast<const uint8_t*>(alt_input),
+                        chunk_size, alt_shuffle,
+                        reinterpret_cast<uint8_t*>(
+                            alt_shuffle_staging.data()))) {
+                  alt_input = alt_shuffle_staging.data();
+                  alt_applied_shuffle = alt_shuffle;
+                }
+              }
+            }
 
             size_t alt_worst_case = chunk_size + (chunk_size / 20) + 1024;
             std::vector<char> alt_output(alt_worst_case);
@@ -1104,8 +1182,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             alt_candidate.base_id = alt_base_id;
             alt_candidate.preset_id = static_cast<int>(
                 UnpackPreset(static_cast<uint32_t>(alt->compress_preset_)));
-            alt_candidate.byte_shuffle =
-                UnpackShuffle(static_cast<uint32_t>(alt->compress_preset_)) != 0;
+            // Credit what was ACTUALLY applied: a declined shuffle (wrong
+            // size multiple, failed allocation) means the measurement above
+            // belongs to the unshuffled variant.
+            alt_candidate.byte_shuffle = alt_applied_shuffle != 0;
             alt_candidate.library_name = alt_name;
 
             explore_features.push_back(
@@ -1115,6 +1195,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                         static_cast<float>(alt_time_ms),
                                         0.0f);
           }
+
+          for (const auto& scratch : explore_gpu_scratch) {
+            if (!scratch.IsNull()) {
+              CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, scratch);
+            }
+          }
+          explore_gpu_scratch.clear();
 
           if (!explore_features.empty()) {
             bool explore_trained =
@@ -1654,11 +1741,6 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           decompressor->Decompress(output_fullptr.ptr_, decompressed_size,
                                    compressed_data, compressed_size);
 
-      auto decompress_end = std::chrono::high_resolution_clock::now();
-      double decompress_time = std::chrono::duration<double, std::milli>(
-                                   decompress_end - decompress_start)
-                                   .count();
-
       CLIO_IPC->FreeBuffer(temp_buffer);
 
       // Invert the byte-shuffle the write side applied. Must happen before
@@ -1710,6 +1792,18 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           }
         }
       }
+
+      // Stop the clock AFTER the unshuffle, not before it. Upstream's
+      // CUDA-event bracket (H5VLgpucompress.cu:3302-3311) wraps
+      // gpucompress_decompress_gpu(), which performs the byte-unshuffle and
+      // dequantize plus their scratch allocations inside the timed region.
+      // Ending it at the codec call made Clio's decomp-head target
+      // systematically low for every shuffled blob -- and shuffled actions
+      // are the ones the model picks most often.
+      auto decompress_end = std::chrono::high_resolution_clock::now();
+      double decompress_time = std::chrono::duration<double, std::milli>(
+                                   decompress_end - decompress_start)
+                                   .count();
 
       if (success) {
         task->output_size_ = decompressed_size;

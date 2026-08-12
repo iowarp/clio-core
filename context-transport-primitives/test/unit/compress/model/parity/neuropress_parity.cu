@@ -488,6 +488,67 @@ int main(int argc, char **argv) {
                 nat_batch.size(), gn);
   }
 
+  // ---- Phase 3b: decomp head under REPLAYED, growing batches. ----
+  // LearnDecompTime no longer consumes a record once trained: upstream's
+  // gpucompress_batched_decomp_sgd() re-sweeps its whole diagnostics store on
+  // every read and never erases entries, so a chunk read earlier is replayed
+  // into every later batch and the trust region (0.15 * mean|err|) is
+  // computed over that growing population. Drive exactly that shape here --
+  // batches of 2, then 4, then 7 over the same records -- and include
+  // sub-millisecond measurements, which the previous phase never produced.
+  std::printf("\n[phase 3b] decomp head, replayed growing batches\n");
+  for (size_t take : {size_t(2), size_t(4), size_t(7)}) {
+    std::vector<DeferredDecompSample> nat_batch;
+    std::vector<CompressionFeatures> clio_feats;
+    std::vector<double> clio_times;
+    for (size_t i = 0; i < take; ++i) {
+      const auto &c = chunks[i % chunks.size()];
+      const int algo_idx = static_cast<int>(i % 8);
+      // Deliberately spans the sub-millisecond range. Both sides receive the
+      // SAME value here: the 1 ms policy floor lives at the call site (Clio's
+      // LearnDecompTime, upstream's DiagnosticsStore::recordDecompMs), not in
+      // the kernel, so this isolates the kernel's own [0.01, 5000] clamp.
+      const float measured = (i % 2 == 0) ? 0.35f : 6.0f + 3.0f * i;
+
+      DeferredDecompSample s{};
+      s.action = algo_idx;
+      s.entropy = static_cast<float>(c.entropy);
+      s.mad_normalized = static_cast<float>(c.mad);
+      s.deriv_normalized = static_cast<float>(c.deriv);
+      s.error_bound_enc = 0.0f;
+      s.data_size_enc = static_cast<float>(c.size_bytes);
+      s.actual_decomp_ms = measured;
+      nat_batch.push_back(s);
+
+      CompressionFeatures f;
+      f.chunk_size_bytes = static_cast<double>(c.size_bytes);
+      f.shannon_entropy = c.entropy;
+      f.mad = c.mad;
+      f.second_derivative_mean = c.deriv;
+      f.data_type_float = 1.0;
+      f.library_config_id = BaseIdForAlgoIdx(algo_idx) * 10 + 2;
+      f.config_balanced = 1.0;
+      clio_feats.push_back(f);
+      clio_times.push_back(measured);
+    }
+
+    float gn = 0;
+    int rc = gpucompress::runBatchedDecompSGD(
+        nat_batch.data(), static_cast<int>(nat_batch.size()), 0.01f, &gn);
+    cudaDeviceSynchronize();
+    Check(rc == 0, "native batched decomp SGD rc (replay)");
+
+    clio.TrainDecompHead(clio_feats, clio_times);
+
+    NNWeightsGPU nat{}, cl{};
+    SnapshotNative(&nat);
+    FlattenClio(clio.DebugWeights(), clio.DebugBiases(), &cl);
+    CompareWeights(nat, cl, "decomp-head replay n=" + std::to_string(take),
+                   2e-5);
+    std::printf("  replay batch of %zu compared (native grad_norm=%.6g)\n",
+                take, gn);
+  }
+
   cudaFree(d_stats);
   cudaStreamDestroy(stream);
   gpucompress::cleanupNN();

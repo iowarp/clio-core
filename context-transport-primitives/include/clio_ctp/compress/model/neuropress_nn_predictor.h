@@ -34,6 +34,7 @@
 #include "clio_ctp/compress/model/predictor.h"
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -256,6 +257,30 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   std::vector<size_t> bias_offsets_;
 
   bool is_ready_ = false;
+
+  /**
+   * Serializes every writer of the model state against every other.
+   *
+   * NeuroPress takes g_sgd_mutex around each SGD dispatch
+   * (gpucompress_compress.cpp:719 and :1021, gpucompress_learning.cpp:100),
+   * runs all SGD on a dedicated stream, and makes inference wait on a
+   * completion event before reading the weights (nn_gpu.cu:1951-1958).
+   *
+   * Clio needs this for a sharper reason than upstream does. Upstream's
+   * decompression-head update is a device kernel touching only w5[1] and
+   * b5[1]; Clio's TrainDecompHead is a host-side read-modify-write that
+   * downloads ALL parameters, edits two of them, and uploads everything
+   * back. A Train() landing inside that window is silently reverted --
+   * the upload writes a pre-Train snapshot of the entire trunk. Train()
+   * and TrainDecompHead() run from different runtime tasks (DynamicSchedule
+   * and Decompress), so the window is reachable.
+   *
+   * Held by shared_ptr, not by value: this class keeps its defaulted
+   * copy/move constructors (a copy shares the device weight handle), and a
+   * bare std::mutex member would delete them. Sharing the lock alongside
+   * the state it guards is also the correct semantic.
+   */
+  std::shared_ptr<std::mutex> model_mutex_ = std::make_shared<std::mutex>();
 
 #if CTP_ENABLE_NEUROPRESS_GPU
   // Device-resident weights + online-learning state (log_var, EMA gradient,

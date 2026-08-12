@@ -292,26 +292,23 @@ private:
   struct DecompFeatureRecord {
     ctp::compress::model::CompressionFeatures features;
     clio::run::u64 seq;  ///< insertion order, for FIFO eviction
+    /**
+     * Measured decompression time, 0 until a read back-fills it.
+     *
+     * Mirrors gpucompress_chunk_diag_t::decompression_ms, which starts at 0
+     * and is filled in by DiagnosticsStore::recordDecompMs() from the read
+     * path. Records are NOT consumed once trained: upstream's
+     * gpucompress_batched_decomp_sgd() re-sweeps its whole store on every
+     * read, so previously-seen chunks are replayed into each subsequent
+     * batch, and its trust region (0.15 * mean|err|) is computed over that
+     * growing population.
+     */
+    double measured_ms = 0.0;
   };
   static constexpr size_t kMaxDecompFeatureRecords = 4096;
   std::mutex decomp_features_mutex_;
   std::unordered_map<std::string, DecompFeatureRecord> decomp_features_;
   clio::run::u64 decomp_feature_seq_ = 0;
-
-  /**
-   * Pending decomp-head samples, flushed as ONE averaged update.
-   *
-   * Upstream sweeps its whole diagnostics store at the end of a read
-   * operation, so a single update sees many chunks and its trust region
-   * (step = 0.15 * mean|err|) scales to the batch mean. Clio's Decompress is
-   * per-blob with no equivalent end-of-operation hook, so samples are
-   * accumulated here and flushed on a full batch instead -- preserving the
-   * averaged-gradient semantics rather than taking one noisy step per blob.
-   */
-  static constexpr size_t kDecompBatchSize = 8;
-  std::vector<ctp::compress::model::CompressionFeatures>
-      pending_decomp_features_;
-  std::vector<double> pending_decomp_times_;
 
   /** Record the features a Compress predicted from, for a later read. */
   void RecordDecompFeatures(
