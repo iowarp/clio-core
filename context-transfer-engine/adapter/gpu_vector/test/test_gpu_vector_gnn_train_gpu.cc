@@ -53,6 +53,7 @@
 #include <clio_ctp/util/gpu_api.h>
 
 #include "gnn_dataset.h"
+#include "../gnn/gnn_aggregate_impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -578,6 +579,9 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   clio::cte::core::Client core; core.Init(clio::cte::core::kCtePoolId);
   auto tagf = core.AsyncGetOrCreateTag(tag); tagf.Wait(); REQUIRE(tagf->GetReturnCode() == 0);
   auto tag_id = tagf->tag_id_;
+  // The Vector resolves its tag by NAME, so redirecting it after an
+  // in-process aggregation means changing this string, not just tag_id.
+  std::string vec_tag = tag;
   clio::cte::core::Client comp; comp.Init(StoragePool());
   // Pin the codec explicitly. With only dynamic_compress_ set the predictor is
   // free to choose a pass-through, which stores the matrix uncompressed while
@@ -625,6 +629,48 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     pf.Wait(); REQUIRE(pf->GetReturnCode() == 0);
   }
   if (ing != nullptr) std::fclose(ing);
+
+  // IN-PROCESS AGGREGATION. With CLIO_GNN_CSR_FILE the file streamed above is
+  // the RAW feature matrix, and the aggregated matrix the trainer wants is
+  // produced right here, from the CTE into the CTE.
+  //
+  // This exists because the aggregation tool is a daemon client and this test
+  // cannot be one -- a process that faults on the GPU has to host the runtime,
+  // so it has its own CTE. Aggregating externally would mean exporting the
+  // result (53 GiB at papers100M) and re-ingesting it, i.e. exactly the flat
+  // copy the whole pipeline is built to avoid.
+  if (const char *csr_path = std::getenv("CLIO_GNN_CSR_FILE")) {
+    std::vector<char> csr;
+    REQUIRE(gnn_test::ReadFileQuiet(csr_path, csr));
+    const std::int64_t *hdr = reinterpret_cast<const std::int64_t *>(csr.data());
+    REQUIRE((clio::run::u64)hdr[0] == N0);
+    const std::int64_t *ip = hdr + 2;
+    const std::int64_t *ix = hdr + 2 + (N0 + 1);
+    std::fprintf(stderr,
+                 "[TRAIN] aggregating in-process: N=%llu E=%lld (CSR %s)\n",
+                 (unsigned long long)N0, (long long)hdr[1], csr_path);
+
+    // The store above already wrote the RAW matrix under `tag`; aggregation
+    // reads that and writes `tag_agg`, which the vector then opens.
+    auto agg_tf = core.AsyncGetOrCreateTag(std::string(tag) + "_agg");
+    agg_tf.Wait();
+    REQUIRE(agg_tf->GetReturnCode() == 0);
+
+    gnn_agg::Params ap;
+    ap.page_bytes = page_size;
+    ap.dim = F;
+    ap.nodes = (std::int64_t)N0;
+    ap.block_rows = EnvI64("CLIO_GNN_AGG_BLOCK_ROWS", 0);
+    ap.codec = comp_lib;
+    ap.preset = comp_preset;
+    const double agg_t0 = NowSec();
+    REQUIRE(gnn_agg::Aggregate(comp, tag_id, agg_tf->tag_id_, ip, ix, ap));
+    std::fprintf(stderr, "[TRAIN] aggregation done in %.1fs\n",
+                 NowSec() - agg_t0);
+    tag_id = agg_tf->tag_id_;
+    vec_tag = std::string(tag) + "_agg";
+  }
+
   double store_dt = NowSec() - store_t0;
   auto h1s = hbm_bdev.AsyncGetStats(); h1s.Wait(); auto r1s = dram_bdev.AsyncGetStats(); r1s.Wait();
   clio::run::u64 hbm_used = hbm0 >= h1s->remaining_size_ ? hbm0 - h1s->remaining_size_ : 0;
@@ -635,7 +681,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
                (unsigned long long)(dataset_bytes >> 20), (unsigned long long)(stored >> 20), ratio, store_dt);
 
   // One block, a cache of 2*window pages, spilling through the compressor.
-  gv::Vector<float> vec(tag, {0}, page_size, /*nblocks=*/1,
+  gv::Vector<float> vec(vec_tag, {0}, page_size, /*nblocks=*/1,
                         /*pages_per_block=*/2 * window, K * epp, StoragePool(),
                         comp_lib, comp_preset, clio::cte::core::kCtePoolId);
   vec.EnableStats();

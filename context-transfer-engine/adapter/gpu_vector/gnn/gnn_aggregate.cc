@@ -69,6 +69,8 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/gpu_vector/page.h>
 
+#include "gnn_aggregate_impl.h"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -186,119 +188,24 @@ int main(int argc, char **argv) {
   ctx.compress_lib_ = codec;
   ctx.compress_preset_ = preset;
 
-  const std::int64_t rows_per_page = (std::int64_t)(page_bytes / (dim * sizeof(float)));
-  if (rows_per_page <= 0) {
-    std::fprintf(stderr, "[agg] page of %llu B cannot hold one %d-d row\n",
-                 (unsigned long long)page_bytes, dim);
-    return 1;
-  }
-  const std::int64_t npages = (N + rows_per_page - 1) / rows_per_page;
-  if (block_rows <= 0) block_rows = std::min<std::int64_t>(N, 1 << 20);
-  const std::int64_t nblocks = (N + block_rows - 1) / block_rows;
-
-  std::fprintf(stderr,
-               "[agg] N=%lld dim=%d page=%lluB rows/page=%lld pages=%lld\n"
-               "[agg] block=%lld rows -> %lld pass(es) over the features\n",
-               (long long)N, dim, (unsigned long long)page_bytes,
-               (long long)rows_per_page, (long long)npages,
-               (long long)block_rows, (long long)nblocks);
-
-  // Transfer buffers live in SHM so the daemon can resolve them; see header.
-  ctp::ipc::FullPtr<char> inb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
-  ctp::ipc::FullPtr<char> outb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
-  if (inb.IsNull() || outb.IsNull()) {
-    std::fprintf(stderr, "[agg] could not allocate 2 x %llu B of SHM\n",
-                 (unsigned long long)page_bytes);
-    return 1;
-  }
-  float *pagebuf = reinterpret_cast<float *>(inb.ptr_);
-  float *outbuf = reinterpret_cast<float *>(outb.ptr_);
-  std::vector<double> acc((size_t)(block_rows * dim));
+  gnn_agg::Params ap;
+  ap.page_bytes = page_bytes;
+  ap.dim = dim;
+  ap.nodes = N;
+  ap.block_rows = block_rows;
+  ap.codec = codec;
+  ap.preset = preset;
   const double t0 = NowSec();
-
-  auto read_page = [&](std::int64_t pg) -> bool {
-    char name[32];
-    clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
-    ctp::ipc::ShmPtr<> dp = inb.shm_.template Cast<void>();
-    auto gf = comp.AsyncGetBlob(feat_id, name, (clio::run::u64)0,
-                                (clio::run::u64)page_bytes, 0, dp,
-                                clio::run::PoolQuery::Local());
-    gf.Wait();
-    if (gf->GetReturnCode() != 0) {
-      std::fprintf(stderr, "[agg] read page %lld rc=%d\n", (long long)pg,
-                   gf->GetReturnCode());
-      return false;
-    }
-    return true;
-  };
-
-  for (std::int64_t b = 0; b < nblocks; ++b) {
-    const std::int64_t lo = b * block_rows;
-    const std::int64_t hi = std::min(N, lo + block_rows);
-    const std::int64_t nrows = hi - lo;
-    std::fill(acc.begin(), acc.begin() + (size_t)(nrows * dim), 0.0);
-
-    // One sequential pass over every feature page. Each source row contributes
-    // to whichever destinations in [lo,hi) list it as a neighbour, plus to
-    // itself when it falls in this block.
-    for (std::int64_t pg = 0; pg < npages; ++pg) {
-      if (!read_page(pg)) return 1;
-      const std::int64_t u0 = pg * rows_per_page;
-      const std::int64_t u1 = std::min(N, u0 + rows_per_page);
-      for (std::int64_t u = u0; u < u1; ++u) {
-        const float *xu = &pagebuf[(size_t)((u - u0) * dim)];
-        if (u >= lo && u < hi) {  // self term
-          double *a = &acc[(size_t)((u - lo) * dim)];
-          for (int d = 0; d < dim; ++d) a[d] += (double)xu[d];
-        }
-        for (std::int64_t k = indptr[(size_t)u]; k < indptr[(size_t)u + 1]; ++k) {
-          const std::int64_t v = indices[(size_t)k];
-          if (v < lo || v >= hi) continue;
-          double *a = &acc[(size_t)((v - lo) * dim)];
-          for (int d = 0; d < dim; ++d) a[d] += (double)xu[d];
-        }
-      }
-    }
-
-    // Normalise by deg+1 and write this block's rows back out as pages. A block
-    // is a whole number of pages only if block_rows is; otherwise a page may
-    // straddle two blocks, so pages are written when they are complete.
-    for (std::int64_t v = lo; v < hi; ++v) {
-      const double inv =
-          1.0 / (double)(indptr[(size_t)v + 1] - indptr[(size_t)v] + 1);
-      double *a = &acc[(size_t)((v - lo) * dim)];
-      float *o = &outbuf[(size_t)((v % rows_per_page) * dim)];
-      for (int d = 0; d < dim; ++d) o[d] = (float)(a[d] * inv);
-      const bool page_end = ((v + 1) % rows_per_page == 0) || (v + 1 == N);
-      if (page_end) {
-        const std::int64_t pg = v / rows_per_page;
-        if ((v + 1) == N) {
-          const std::int64_t used = (v % rows_per_page) + 1;
-          std::memset(&outbuf[(size_t)(used * dim)], 0,
-                      (size_t)((rows_per_page - used) * dim) * sizeof(float));
-        }
-        char name[32];
-        clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
-        ctp::ipc::ShmPtr<> dp = outb.shm_.template Cast<void>();
-        auto pf = comp.AsyncPutBlob(out_id, name, (clio::run::u64)0,
-                                    (clio::run::u64)page_bytes, dp, 0.5f, ctx, 0,
-                                    clio::run::PoolQuery::Local());
-        pf.Wait();
-        if (pf->GetReturnCode() != 0) {
-          std::fprintf(stderr, "[agg] write page %lld rc=%d\n", (long long)pg,
-                       pf->GetReturnCode());
-          return 1;
-        }
-      }
-    }
-    std::fprintf(stderr, "[agg] block %lld/%lld done (%.1fs)\n",
-                 (long long)(b + 1), (long long)nblocks, NowSec() - t0);
+  if (!gnn_agg::Aggregate(comp, feat_id, out_id, indptr.data(), indices.data(),
+                          ap)) {
+    return 1;
   }
+  const std::int64_t rows_per_page =
+      (std::int64_t)(page_bytes / (dim * sizeof(float)));
+  const std::int64_t npages = (N + rows_per_page - 1) / rows_per_page;
 
   std::fprintf(stderr, "[agg] DONE: %lld pages written to '%s' in %.1fs\n",
                (long long)npages, out_tag.c_str(), NowSec() - t0);
-  CLIO_IPC->FreeBuffer(inb);
-  CLIO_IPC->FreeBuffer(outb);
   std::fprintf(stdout, "%lld\n", (long long)npages);
   return 0;
 }
