@@ -159,6 +159,15 @@ struct clio_dataset_t {
   std::vector<clio::run::Future<clio::cte::compressor::DynamicScheduleTask>>
       pending_compressed_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
+  /* Chunks staged into a client-owned DEVICE backend (AllocateAndRegisterGpuBackend)
+     instead of host SHM, when src was GPU-resident -- see the write loop. Unlike
+     pending_buffers, these need an explicit FreeGpuBackend once drained: a device
+     backend is not released by simply letting the handle go out of scope. */
+  struct PendingGpuBuffer {
+    clio::run::u32 gpu_id;
+    ctp::ipc::AllocatorId alloc_id;
+  };
+  std::vector<PendingGpuBuffer> pending_gpu_buffers;
   /* One staging-failure report per dataset (see drain_dataset_puts). */
   bool put_failure_reported = false;
   /* Telemetry-only storage-layout probe, filled lazily on first traced access
@@ -369,6 +378,15 @@ static bool drain_dataset_puts(clio_dataset_t *dset) {
   dset->pending_puts.clear();
   dset->pending_compressed_puts.clear();
   dset->pending_buffers.clear();
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  /* Safe only now: every future above has been Waited on, so whichever task
+     consumed each device-resident chunk (compress, or raw PutBlob storage)
+     has already read it. */
+  for (auto &gpu_buf : dset->pending_gpu_buffers) {
+    CLIO_IPC->FreeGpuBackend(gpu_buf.gpu_id, gpu_buf.alloc_id);
+  }
+  dset->pending_gpu_buffers.clear();
+#endif
   return ok;
 }
 
@@ -1791,24 +1809,64 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        file then holds data the cache does not, so any previously staged image
        must be invalidated below or a later read would hit pre-write bytes. */
     bool staged_fully = admit_here;
+    /* Checked once, not per chunk -- src is the same buffer for the whole
+       H5Dwrite call. When true (and a compressor pool is configured -- see
+       below), each chunk is staged into a client-owned DEVICE backend
+       instead of host SHM, so the ShmPtr handed to AsyncDynamicSchedule
+       still resolves to a real device pointer on the runtime side
+       (DynamicSchedule's ToFullPtr, the CUDA IPC round trip) -- which is
+       what lets NeuroPress's device-only candidate restriction in
+       EstCompressionStats actually apply, instead of every chunk looking
+       like host data by the time it gets there.
+       Only worth it when routing through the compressor: the raw core
+       client's AsyncPutBlob (the no-compressor branch below) stages any
+       device-resident ShmPtr right back to host itself the moment it's
+       called from a client process (StageDeviceBlobForPut, core_client.h)
+       -- so a device buffer built here would just be copied again and
+       thrown away, doubling the work for nothing. */
+    const bool src_is_device =
+        ctp::IsDevicePointer(src) && dataset->file->compressor_client;
 
     for (size_t i = 0; admit_here && i < num_chunks; ++i) {
       size_t offset = i * chunk_size;
       size_t this_size = std::min(chunk_size, total_size - offset);
 
-      /* Allocate SHM buffer and copy data. The caller's buffer (src) may be a
-       * GPU device pointer (an app writing straight from GPU-resident data);
-       * DeviceAwareMemcpy detects that and routes through the CUDA/ROCm/SYCL
-       * copy path instead of dereferencing device memory from host code.
-       * An allocation failure stops the staging, never the write: the
-       * native path below is always available, and failing H5Dwrite over a
-       * cache buffer is an error the application would not have seen
-       * without CLIO. */
-      auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-      if (buffer.IsNull()) { staged_fully = false; break; }
-      ctp::DeviceAwareMemcpy(buffer.ptr_, src + offset, this_size);
+      ctp::ipc::ShmPtr<> blob_data;
+      bool staged_on_device = false;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+      if (src_is_device) {
+        char *device_ptr = nullptr;
+        ctp::ipc::AllocatorId gpu_alloc_id =
+            CLIO_IPC->AllocateAndRegisterGpuBackend(
+                /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                this_size, &device_ptr);
+        if (!gpu_alloc_id.IsNull()) {
+          ctp::GpuApi::Memcpy(device_ptr, src + offset, this_size);
+          blob_data.alloc_id_ = gpu_alloc_id;
+          blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
+          dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});
+          staged_on_device = true;
+        }
+        /* Falls through to the host buffer below on allocation failure --
+           same graceful-degradation contract the host path already has. */
+      }
+#endif
+      if (!staged_on_device) {
+        /* Host SHM fallback: no device source, or the device backend alloc
+         * failed. DeviceAwareMemcpy still handles src being a device
+         * pointer here (D2H) -- the fallback stages correctly even though
+         * it can no longer keep NeuroPress's candidate set GPU-only.
+         * An allocation failure stops the staging, never the write: the
+         * native path below is always available, and failing H5Dwrite over
+         * a cache buffer is an error the application would not have seen
+         * without CLIO. */
+        auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) { staged_fully = false; break; }
+        ctp::DeviceAwareMemcpy(buffer.ptr_, src + offset, this_size);
+        blob_data = buffer.shm_.template Cast<void>();
+        dataset->pending_buffers.push_back(std::move(buffer));
+      }
 
-      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
 
@@ -1850,7 +1908,6 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
             blob_data, -1.0f, clio::cte::core::Context(), 0);
         dataset->pending_puts.push_back(std::move(future));
       }
-      dataset->pending_buffers.push_back(std::move(buffer));
       staged_bytes += this_size;
     }
 
