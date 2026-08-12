@@ -379,8 +379,17 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // itself never has to be staged through host memory just to feed
   // NeuroPress. Falls through to the existing host path otherwise.
   double entropy = 0.0, mad = 0.0, second_derivative_mean = 0.0;
-  ctp::ComputeCompressionFeatures(chunk, num_elements, data_type, &entropy,
-                                   &mad, &second_derivative_mean);
+  const bool features_ok = ctp::ComputeCompressionFeatures(
+      chunk, num_elements, data_type, &entropy, &mad, &second_derivative_mean);
+  if (!features_ok) {
+    // Device-resident chunk whose on-device stats could not be computed.
+    // Ranking on the zeros left behind would hand NeuroPress a chunk that
+    // looks perfectly compressible and pick accordingly, so skip the
+    // model entirely and let the legacy heuristics below decide.
+    HLOG(kWarning,
+         "EstCompressionStats: device stats unavailable for a device-resident "
+         "chunk; skipping NeuroPress ranking for it");
+  }
 
   // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
   // qtable/dense-NN heuristics below -- it ranks clio_ctp::compress::model's
@@ -390,7 +399,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // GPU-native, so a device-resident chunk_data never forces a host
   // round-trip downstream in Compress() regardless of where this chunk
   // happens to live.
-  if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+  if (features_ok && context.dynamic_compress_ != 1 && neuropress_predictor_ &&
       neuropress_predictor_->IsReady()) {
     bool data_type_float = (context.data_type_ == 1);
     auto neuropress_stats = NeuroPressCandidateStats(
@@ -824,10 +833,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       // from, and the model learns against a different input than it saw.
       size_t feat_num_elements = static_cast<size_t>(chunk_size / feat_type_size);
       if (feat_num_elements == 0) feat_num_elements = 1;
-      ctp::ComputeCompressionFeatures(chunk_data, feat_num_elements, feat_type,
-                                      &neuropress_entropy, &neuropress_mad,
-                                      &neuropress_second_deriv);
-      neuropress_feat_valid = true;
+      // Same guard as EstCompressionStats: on a device-resident chunk whose
+      // stats cannot be computed the values are zeros, and training on them
+      // would teach the model that chunk was trivially compressible.
+      neuropress_feat_valid = ctp::ComputeCompressionFeatures(
+          chunk_data, feat_num_elements, feat_type, &neuropress_entropy,
+          &neuropress_mad, &neuropress_second_deriv);
     }
 
     // Now call Compress to perform compression and PutBlob

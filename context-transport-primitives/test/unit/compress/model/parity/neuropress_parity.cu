@@ -76,6 +76,11 @@ namespace {
 
 int g_failures = 0;
 int g_checks = 0;
+double g_max_rel_pred = 0.0;      // worst relative error, predictions
+std::string g_max_rel_what;
+double g_max_abs_weight = 0.0;    // worst absolute diff, weights
+const char *g_max_abs_layer = "";
+std::string g_max_abs_phase;
 
 void Check(bool cond, const std::string &what) {
   ++g_checks;
@@ -89,6 +94,7 @@ void CheckClose(double a, double b, double rel_tol, const std::string &what) {
   ++g_checks;
   double denom = std::max(1e-9, std::max(std::fabs(a), std::fabs(b)));
   double rel = std::fabs(a - b) / denom;
+  if (rel > g_max_rel_pred) { g_max_rel_pred = rel; g_max_rel_what = what; }
   if (!(rel <= rel_tol)) {
     ++g_failures;
     std::printf("  [FAIL] %s: native=%.9g clio=%.9g rel_err=%.3g\n",
@@ -170,6 +176,10 @@ void CompareWeights(const NNWeightsGPU &nat, const NNWeightsGPU &clio,
       if (d > max_abs) { max_abs = d; worst = i; }
     }
     ++g_checks;
+    if (max_abs > g_max_abs_weight) {
+      g_max_abs_weight = max_abs; g_max_abs_layer = L.name;
+      g_max_abs_phase = phase;
+    }
     if (max_abs > tol) {
       ++g_failures;
       std::printf("  [FAIL] %s %s: max|diff|=%.6g at idx %zu "
@@ -414,6 +424,11 @@ int main(int argc, char **argv) {
   cudaStreamDestroy(stream);
   gpucompress::cleanupNN();
 
+  std::printf("\n----- observed worst-case deviation -----\n");
+  std::printf("  predictions : max rel err = %.6g  (%s)\n", g_max_rel_pred,
+              g_max_rel_what.c_str());
+  std::printf("  weights     : max abs err = %.6g  (%s %s)\n",
+              g_max_abs_weight, g_max_abs_phase.c_str(), g_max_abs_layer);
   std::printf("\n===== %d checks, %d failures =====\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

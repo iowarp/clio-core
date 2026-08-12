@@ -45,20 +45,33 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
  * chimod's task-dispatch machinery (compression/PutBlob are a separate,
  * larger device-memory gap this dispatch does not attempt to close).
  */
-inline void ComputeCompressionFeatures(const void *chunk, size_t num_elements,
+inline bool ComputeCompressionFeatures(const void *chunk, size_t num_elements,
                                         DataType type, double *out_entropy,
                                         double *out_mad,
                                         double *out_second_derivative) {
-  if (IsDevicePointer(chunk) &&
-      ComputeDeviceStats(chunk, num_elements, type, out_entropy, out_mad,
-                          out_second_derivative)) {
-    return;
+  const bool on_device = IsDevicePointer(chunk);
+  if (on_device) {
+    if (ComputeDeviceStats(chunk, num_elements, type, out_entropy, out_mad,
+                            out_second_derivative)) {
+      return true;
+    }
+    // The host routines below dereference `chunk` directly. For a device
+    // pointer that is not a wrong answer, it is a segfault -- so report the
+    // failure instead of falling through to code that cannot run. Reached
+    // when the device-stats path is unavailable or fails; the features are
+    // left untouched and the caller decides (feeding NeuroPress zeros would
+    // silently skew every prediction for the chunk).
+    *out_entropy = 0.0;
+    *out_mad = 0.0;
+    *out_second_derivative = 0.0;
+    return false;
   }
   *out_entropy =
       DataStatisticsFactory::CalculateShannonEntropy(chunk, num_elements, type);
   *out_mad = DataStatisticsFactory::CalculateMAD(chunk, num_elements, type);
   *out_second_derivative =
       DataStatisticsFactory::CalculateSecondDerivative(chunk, num_elements, type);
+  return true;
 }
 
 }  // namespace ctp
