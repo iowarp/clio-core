@@ -81,6 +81,16 @@ bool StageDeviceBlobForPut(clio::run::IpcManager *ipc_manager,
                             ctp::ipc::ShmPtr<> &blob_data,
                             clio::run::u64 size);
 
+/**
+ * TryReadBlobShm's zero-IPC fast path copies straight out of the RAM bdev's
+ * mapped SHM segment (always host memory) into the caller's destination,
+ * which may itself be a device pointer if the caller passed one to
+ * AsyncGetBlob. std::memcpy can't write to device memory; this transparently
+ * handles both (ctp::DeviceAwareMemcpy under the hood), out-of-line in
+ * core_client.cc for the same reason as StageDeviceBlobForPut above.
+ */
+void CopyBlobBytesInto(char *dst, const char *src, size_t n);
+
 class Client : public clio::run::ContainerClient {
  public:
   CTP_CROSS_FUN Client() = default;
@@ -294,7 +304,7 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 intra = want_from;
       size_t avail = static_cast<size_t>(b.size_ - intra);
       size_t chunk = std::min(avail, size - copied);
-      std::memcpy(out + copied, base + b.target_offset_ + intra, chunk);
+      CopyBlobBytesInto(out + copied, base + b.target_offset_ + intra, chunk);
       copied += chunk;
       want_from = 0;
     }

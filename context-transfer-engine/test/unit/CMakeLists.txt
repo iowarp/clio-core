@@ -1491,6 +1491,41 @@ if(CLIO_CORE_ENABLE_CUDA)
   )
   install(TARGETS test_cte_devmem_putget_cross_process RUNTIME DESTINATION bin)
 
+  # Symmetric read-direction twin: GetBlob straight into a device buffer.
+  # Separate binary from the PutBlob test above -- two RuntimeServer +
+  # CLIO_INIT sequences in one process hang.
+  add_executable(test_cte_devmem_getblob_cross_process
+    gpu/test_cte_devmem_getblob_cross_process.cc
+  )
+  target_include_directories(test_cte_devmem_getblob_cross_process PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+  )
+  target_link_libraries(test_cte_devmem_getblob_cross_process
+    clio_run_cxx
+    clio_bdev_client
+    clio_cte_core_client
+    ctp::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  add_dependencies(test_cte_devmem_getblob_cross_process clio_run)
+  target_compile_definitions(test_cte_devmem_getblob_cross_process PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  set_target_properties(test_cte_devmem_getblob_cross_process PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cte_devmem_getblob_cross_process_cuda
+    COMMAND test_cte_devmem_getblob_cross_process
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cte_devmem_getblob_cross_process_cuda PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
+    TIMEOUT 120
+    LABELS "gpu;cuda;cte;devmem;getblob;cross_process;gpu_ipc"
+  )
+  install(TARGETS test_cte_devmem_getblob_cross_process RUNTIME DESTINATION bin)
+
 endif()
 
 if(CLIO_CORE_ENABLE_ROCM)

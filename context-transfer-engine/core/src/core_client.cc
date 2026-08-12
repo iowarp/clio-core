@@ -59,6 +59,10 @@ bool StageDeviceBlobForPut(clio::run::IpcManager *ipc_manager,
   return true;
 }
 
+void CopyBlobBytesInto(char *dst, const char *src, size_t n) {
+  ctp::DeviceAwareMemcpy(dst, src, n);
+}
+
 bool CLIO_CTE_CLIENT_INIT(const std::string &config_path,
                          const clio::run::PoolQuery &pool_query) {
   // Static guard to prevent double initialization

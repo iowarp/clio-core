@@ -21,6 +21,11 @@
  * resolved blob_data) and stages a D2H copy into a fresh SHM buffer before
  * submitting -- the same "daemon can't reach it, stage a copy" idiom the
  * private-memory AsyncPutBlob overload already uses for issue #830.
+ *
+ * See test_cte_devmem_getblob_cross_process.cc for the symmetric read
+ * direction (GetBlob straight into a device buffer) -- kept in a separate
+ * binary because two RuntimeServer+CLIO_INIT sequences in one process hang
+ * (a test-infrastructure limitation, not a GPU-IPC one).
  */
 
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
