@@ -89,6 +89,11 @@ double NowSec() {
              std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+/** Wire ids whose codecs are error-bounded rather than exact. */
+inline bool IsLossyCodec(int wire_id) {
+  return wire_id == 7 || wire_id == 8 || wire_id == 18 || wire_id == 20;
+}
+
 void EnsureInit() {
   // An externally supplied CLIO_SERVER_CONF WINS. This test composes its own
   // tiers (2 GiB HBM + 20 GiB RAM, no NVMe) and used to setenv over whatever
@@ -160,20 +165,31 @@ namespace gy = clio::run::gpu;
  * pair; on-demand faulting through HoldPageYield does the same work without a
  * separate prefetch call (which the rewrite removed).
  *
- * Single block by construction, so yv.Block() is 0; every lane still runs the
- * loop because the fault path is block-collective.
+ * Runs on `nblocks` blocks, each taking a contiguous slice of [lo,hi) keyed on
+ * yv.Block() -- NOT blockIdx.x, which stops matching the logical block once the
+ * driver relaunches a compacted grid. Every lane runs the loop because the
+ * fault path is block-collective, and a block whose slice is empty must still
+ * fall through to CLIO_YEND rather than return early.
  */
 __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> v, clio::run::u64 lo,
                                 clio::run::u64 hi, float *scratch,
-                                gy::YieldableView<> yv, gy::YieldStackView ys) {
+                                clio::run::u32 nblocks, gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
   CLIO_YKERNEL_ENTER(yv, ys);
   CLIO_YFRAME();
   CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
   CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 n = hi - lo;
+  // Slice off yv.Block(), never blockIdx.x: the driver relaunches a COMPACTED
+  // grid, so blockIdx.x stops matching the logical block after the first yield.
+  const clio::run::u64 total = hi - lo;
+  const clio::run::u64 chunk = (total + nblocks - 1) / nblocks;
+  const clio::run::u64 base = yv.Block() * chunk;
+  const clio::run::u64 n = base >= total ? 0 : min(chunk, total - base);
+  lo += base;
+  scratch += base;
 
   CLIO_YBEGIN();
   for (; i < n; i += run) {
@@ -288,8 +304,10 @@ using gnn_test::EnvI64;
 /** Run a yieldable kernel to completion (re-launch until no block is pending). */
 template <typename LaunchT>
 clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
-  gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  const unsigned nthreads =
+      (unsigned)EnvI64("CLIO_GNN_GATHER_THREADS", 256);
+  gy::Yieldable<> drv(nblocks, nthreads);
+  gy::YieldStack stack(nblocks, nthreads, 256);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
@@ -729,9 +747,31 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   std::fprintf(stderr, "[TRAIN] ETERNIA: stored A %lluMiB -> %lluMiB zstd (%.3fx) in %.2fs\n",
                (unsigned long long)(dataset_bytes >> 20), (unsigned long long)(stored >> 20), ratio, store_dt);
 
-  // One block, a cache of 2*window pages, spilling through the compressor.
-  gv::Vector<float> vec(vec_tag, {0}, page_size, /*nblocks=*/1,
-                        /*pages_per_block=*/2 * window, K * epp, StoragePool(),
+  // The gather runs WIDE. It used to be one block of 32 threads, which copied
+  // the whole matrix through a single warp on a single SM and cost 3.2x over
+  // an in-core baseline -- more than paging and compression combined, and the
+  // reason a fully resident run measured SLOWER than a paged one (the copy
+  // dominated; the faults were noise).
+  //
+  // TOTAL cache is held at 2*window pages regardless of the block count, so a
+  // wider gather is not silently also a bigger cache. Page caches are per
+  // block, so blocks are capped at `window`: each block needs >=2 pages (one
+  // held, one in flight) for the fault path to make progress.
+  const clio::run::u32 want_blocks =
+      (clio::run::u32)EnvI64("CLIO_GNN_GATHER_BLOCKS", 32);
+  const clio::run::u32 gather_blocks =
+      std::max<clio::run::u32>(1, std::min<clio::run::u32>(want_blocks, window));
+  const clio::run::u32 ppb =
+      std::max<clio::run::u32>(2, (2 * window) / gather_blocks);
+  std::fprintf(stderr,
+               "[TRAIN] gather: %u blocks x %lld threads, %u pages/block "
+               "(total cache %u pages = %lluMiB)\n",
+               gather_blocks, (long long)EnvI64("CLIO_GNN_GATHER_THREADS", 256),
+               ppb, gather_blocks * ppb,
+               (unsigned long long)((gather_blocks * (clio::run::u64)ppb *
+                                     page_size) >> 20));
+  gv::Vector<float> vec(vec_tag, {0}, page_size, gather_blocks,
+                        /*pages_per_block=*/ppb, K * epp, StoragePool(),
                         comp_lib, comp_preset, clio::cte::core::kCtePoolId);
   vec.EnableStats();
   // Tell the device side how big each stored page is, so an encoded page is
@@ -749,11 +789,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     // d_scratch, then run the same train kernels as the in-core path.
     run_epoch([&](clio::run::u64 wi, clio::run::u64 first, clio::run::u64 nn) {
       (void)wi;  // pages are faulted on demand now; no separate prefetch step
-      RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                          gy::YieldStackView sv) {
+      RunYieldable(gather_blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                      gy::YieldStackView sv) {
         GnnGatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu_info, vec.GetDevice(0), first * (clio::run::u64)F,
-            (first + nn) * (clio::run::u64)F, d_scratch, vw, sv);
+            (first + nn) * (clio::run::u64)F, d_scratch, gather_blocks, vw, sv);
       });
       ctp::GpuApi::Synchronize();
     }, et_loss[e], et_acc[e], cnt, et_vacc[e]);
@@ -799,7 +839,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
         RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                             gy::YieldStackView sv) {
           GnnGatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu_info, vec.GetDevice(0), lo, lo + epp, d_scratch, vw, sv);
+              gpu_info, vec.GetDevice(0), lo, lo + epp, d_scratch, 1, vw, sv);
         });
         REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
         REQUIRE(cudaMemcpy(gpu_rows.data(), d_scratch,
@@ -849,7 +889,23 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     for (int e = 0; e < epochs; ++e)
       std::fprintf(stderr, "   e%02d  loss %.6f acc %.4f  ||  loss %.6f acc %.4f\n",
                    e, base_loss[e], base_acc[e], et_loss[e], et_acc[e]);
-    REQUIRE(exact == "BIT-EXACT");
+    // A LOSSY codec cannot be bit-exact, by construction. Demanding it here
+    // just makes the test unusable with cuSZp, so the bar depends on the
+    // codec: lossless must reproduce the in-core run exactly, lossy must
+    // TRACK it -- the training curve is what matters, not the last bit of a
+    // feature. Tolerance is on the metrics rather than the features because
+    // that is the property anyone actually relies on.
+    if (IsLossyCodec(comp_lib)) {
+      const double tol = EnvI64("CLIO_GNN_LOSSY_TOL_E6", 1000) / 1e6;  // 1e-3
+      std::fprintf(stderr,
+                   "[TRAIN] lossy codec %d: requiring curves to track within "
+                   "%.1e (not bit-exactness)\n", comp_lib, tol);
+      REQUIRE(maxdl < tol);
+      REQUIRE(maxda < tol);
+      REQUIRE(maxdv < tol);
+    } else {
+      REQUIRE(exact == "BIT-EXACT");
+    }
   } else {
     if (ingest_file != nullptr)
       std::fprintf(stderr, "[TRAIN] in-core SKIPPED (stream mode) -> trained the "
