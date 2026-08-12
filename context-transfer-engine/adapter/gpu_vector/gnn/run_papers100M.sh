@@ -182,6 +182,16 @@ networking:
 runtime:
   num_threads: 8
   queue_depth: 65536
+  # Bound the SHM segments. Left at the default (0 = auto) each is sized to
+  # total memory and then clamped to HALF of it -- independently -- so the main
+  # and metadata segments together can claim 100% of RAM. Freed SHM is not
+  # returned to the OS, so RssShmem climbs toward that ceiling as reads cycle
+  # through the arena: measured 9 GiB after ingest, 35.6 GiB mid-epoch and
+  # 60 GiB (all of memory) by the end of one epoch over a 53 GiB store, while
+  # anonymous memory stayed flat at 2.3 GiB. Capping them is what lets more
+  # than one epoch run.
+  main_segment_size: "${MAIN_SEG:-16g}"
+  metadata_segment_size: "${META_SEG:-6g}"
 gpu:
   queue_depth: 8192
 compose:
