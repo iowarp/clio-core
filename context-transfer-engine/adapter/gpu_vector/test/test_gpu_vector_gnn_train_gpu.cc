@@ -90,6 +90,24 @@ double NowSec() {
 }
 
 void EnsureInit() {
+  // An externally supplied CLIO_SERVER_CONF WINS. This test composes its own
+  // tiers (2 GiB HBM + 20 GiB RAM, no NVMe) and used to setenv over whatever
+  // the caller had set, which meant a papers100M run configured with a RAM
+  // tier plus a 128 GiB NVMe tier silently got the test's 22 GiB of RAM tiers
+  // instead -- so nothing ever spilled to disk, the store grew in memory, and
+  // the process was heading for an OOM at ~26% of the matrix. The defaults
+  // below are for standalone ctest runs, not for callers who know better.
+  if (const char *ext = std::getenv("CLIO_SERVER_CONF")) {
+    std::ifstream probe(ext);
+    if (probe.good()) {
+      std::fprintf(stderr, "[TRAIN] using caller's CLIO_SERVER_CONF=%s\n", ext);
+      if (g_initialized) return;
+      REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+      std::this_thread::sleep_for(1s);
+      g_initialized = true;
+      return;
+    }
+  }
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
   const char *port_env = std::getenv("CLIO_PORT");
