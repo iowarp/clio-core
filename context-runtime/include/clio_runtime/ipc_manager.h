@@ -1094,23 +1094,38 @@ class IpcManager {
       if (result.ptr_ != nullptr) return result;
     }
 
-    // Case 4: Check GPU client backends (kPinnedHost / kManagedUvm /
-    // kDeviceMem). The IpcGpu2Cpu producer convention stashes the raw
-    // device-or-host-accessible address in `off_` directly, so resolution
-    // is the same as the null-alloc_id case once we've confirmed the
-    // alloc_id refers to a registered GPU backend. Callers that operate
-    // on the resolved ptr_ via DeviceAwareMemcpy (which dispatches
-    // through cudaMemcpyDefault / hipMemcpyDefault / sycl::queue::memcpy)
-    // can copy from kDeviceMem pointers without first staging through
-    // the host.
+    // Case 4: This process's own PID minted the alloc_id (e.g. a GPU device
+    // backend from AllocateAndRegisterGpuBackend) but it isn't in
+    // alloc_map_ (that's a host SHM segment, and case 3 above would have
+    // caught it). The process that OWNS a GPU allocation can always
+    // dereference its own pointer directly -- no IPC handle needed, that
+    // machinery is only for handing the pointer to a DIFFERENT process.
+    // off_ holds that raw pointer by convention (see
+    // AllocateAndRegisterGpuBackend's out_base).
+    if (shm_ptr.alloc_id_.major_ ==
+        static_cast<u32>(ctp::SystemInfo::GetPid())) {
+      T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
+      if (raw_ptr) return ctp::ipc::FullPtr<T>(raw_ptr);
+    }
+
+    // Case 5: Check GPU client backends (kPinnedHost / kManagedUvm /
+    // kDeviceMem). Resolve through the registered backend's own
+    // device_ptr, NOT shm_ptr.off_ -- off_ is whatever pointer value the
+    // SENDING process put there, which for kDeviceMem is only valid in
+    // that process (a cudaMalloc'd address is not portable). RegisterMemory
+    // (admin_runtime.cc) opens the real cudaIpcMemHandle_t on this
+    // (receiving) process and stores the pointer THAT yields as
+    // backend->device_ptr -- that's the one safe to dereference here. For
+    // kPinnedHost/kManagedUvm, off_ and device_ptr are the same value
+    // (same address space), so this is a no-op change for those.
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL) && CTP_IS_HOST
     if (gpu_ipc_) {
       size_t ngpu = gpu_ipc_->GetGpuQueueCount();
       for (size_t g = 0; g < ngpu; ++g) {
-        if (gpu_ipc_->FindClientBackend(static_cast<u32>(g),
-                                         shm_ptr.alloc_id_)) {
-          T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
-          return ctp::ipc::FullPtr<T>(raw_ptr);
+        if (const auto *backend = gpu_ipc_->FindClientBackend(
+                static_cast<u32>(g), shm_ptr.alloc_id_)) {
+          return ctp::ipc::FullPtr<T>(
+              reinterpret_cast<T *>(backend->device_ptr));
         }
       }
     }

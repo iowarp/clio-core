@@ -1453,6 +1453,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     TIMEOUT 120
     LABELS "gpu;cuda;cte;devmem;putblob"
   )
+
 endif()
 
 if(CLIO_CORE_ENABLE_ROCM)

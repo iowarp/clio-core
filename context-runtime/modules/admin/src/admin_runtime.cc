@@ -49,6 +49,7 @@
 #include <clio_runtime/worker.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 #include <cerrno>
@@ -1249,15 +1250,25 @@ clio::run::TaskResume Runtime::RegisterMemory(clio::run::shared_ptr<RegisterMemo
           memcpy(&b.host_view, task->ipc_handle_bytes_, sizeof(char *));
           b.device_ptr = b.host_view;
           break;
-        case MemoryType::kGpuDeviceMemory:
+        case MemoryType::kGpuDeviceMemory: {
           b.kind = clio::run::gpu::IpcManager::MemKind::kDeviceMem;
-          // ipc_handle_bytes_ holds a cudaIpcMemHandle_t — opening it on the
-          // runtime side is left as a follow-up; for now we record the
-          // handle bytes verbatim and rely on the worker pop path to copy
-          // POD bytes via cudaMemcpy through a runtime-side cudaIpcOpenMemHandle.
           b.host_view = nullptr;
-          memcpy(&b.device_ptr, task->ipc_handle_bytes_, sizeof(char *));
+          // ipc_handle_bytes_ holds a real cudaIpcMemHandle_t (produced by
+          // the client's cudaIpcGetMemHandle() in
+          // IpcManager::AllocateAndRegisterGpuBackend) -- opening it here
+          // via cudaIpcOpenMemHandle() is what actually yields a device
+          // pointer valid in THIS (runtime) process; the raw handle bytes
+          // are opaque to the CUDA driver's IPC export/import protocol, not
+          // a pointer value themselves, so they can't be reinterpreted
+          // directly the way the pinned-host/UVM cases above do.
+          ctp::GpuIpcMemHandle handle;
+          memcpy(&handle, task->ipc_handle_bytes_, sizeof(handle));
+          ctp::GpuApi::SetDevice(static_cast<int>(task->gpu_id_));
+          char *opened_ptr = nullptr;
+          ctp::GpuApi::OpenIpcMemHandle(handle, &opened_ptr);
+          b.device_ptr = opened_ptr;
           break;
+        }
         default: break;
       }
       HLOG(kInfo, "Admin::RegisterMemory: kind={} alloc_id=({}.{}) gpu_id={} "

@@ -627,6 +627,38 @@ if(CLIO_CORE_ENABLE_CUDA)
     TIMEOUT 120
     LABELS "gpu;cuda;stress"
   )
+
+  # CUDA IPC device-memory handle round trip: RegisterMemory must open a
+  # real cudaIpcMemHandle_t (not blindly trust a raw pointer value) for a
+  # foreign alloc_id to resolve correctly via ToFullPtr. Host-only CUDA
+  # runtime calls, no __global__ kernels, so a plain executable suffices.
+  add_executable(test_gpu_ipc_devmem_register
+    gpu/test_gpu_ipc_devmem_register.cc
+  )
+  target_include_directories(test_gpu_ipc_devmem_register PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+  )
+  target_link_libraries(test_gpu_ipc_devmem_register
+    clio_run_cxx
+    clio_admin_client
+    ctp::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_gpu_ipc_devmem_register PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu_ipc_devmem_register_cuda
+    COMMAND test_gpu_ipc_devmem_register
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_ipc_devmem_register_cuda PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
+    TIMEOUT 60
+    LABELS "gpu;cuda;gpu_ipc;register_memory"
+  )
+  install(TARGETS test_gpu_ipc_devmem_register RUNTIME DESTINATION bin)
 endif()
 
 if(CLIO_CORE_ENABLE_ROCM)

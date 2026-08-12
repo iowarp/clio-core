@@ -3751,6 +3751,11 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     if (!gpu_ipc_->RegisterClientBackend(b)) {
       HLOG(kError, "AllocateAndRegisterGpuBackend: in-process register "
            "failed");
+      if (kind == gpu::IpcManager::MemKind::kPinnedHost) {
+        ctp::GpuApi::FreeHost(base);
+      } else {
+        ctp::GpuApi::Free(base);
+      }
       return result;
     }
   } else {
@@ -3769,13 +3774,44 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     }
     ctp::ipc::MemoryBackendId backend_id(alloc_id.major_, alloc_id.minor_);
     char ipc_handle_bytes[64] = {0};
-    std::memcpy(ipc_handle_bytes, &base, sizeof(char *));
+    if (kind == gpu::IpcManager::MemKind::kDeviceMem) {
+      // A cudaMalloc'd pointer VALUE is meaningless in another process's
+      // address space -- cudaIpcGetMemHandle() produces the actual
+      // portable, opaque handle another process can open with
+      // cudaIpcOpenMemHandle() to get a pointer valid in ITS OWN context.
+      // Sending the raw pointer bytes here (as the two host/UVM branches
+      // below correctly do, since those share host address space) would
+      // hand the receiving runtime process garbage.
+      ctp::GpuIpcMemHandle handle;
+      ctp::GpuApi::GetIpcMemHandle(handle, base);
+      static_assert(sizeof(handle) <= sizeof(ipc_handle_bytes),
+                    "GpuIpcMemHandle must fit in RegisterMemoryTask's "
+                    "64-byte ipc_handle_bytes_");
+      std::memcpy(ipc_handle_bytes, &handle, sizeof(handle));
+    } else {
+      // Pinned host / managed UVM: same address space as the runtime
+      // process (or accessible via UVM's unified addressing either way),
+      // so the raw pointer value itself is directly usable there.
+      std::memcpy(ipc_handle_bytes, &base, sizeof(char *));
+    }
 
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         backend_id, admin_kind, gpu_id, static_cast<u64>(bytes),
         ipc_handle_bytes);
-    IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp).Wait();
+    auto reg_future = IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp);
+    reg_future.Wait();
+    if (reg_future->GetReturnCode() != 0 || !reg_future->success_) {
+      HLOG(kError, "AllocateAndRegisterGpuBackend: remote RegisterMemory "
+           "failed (rc={}, success={})", reg_future->GetReturnCode(),
+           reg_future->success_);
+      if (kind == gpu::IpcManager::MemKind::kPinnedHost) {
+        ctp::GpuApi::FreeHost(base);
+      } else {
+        ctp::GpuApi::Free(base);
+      }
+      return result;
+    }
   }
 
   result = alloc_id;
