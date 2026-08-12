@@ -55,6 +55,32 @@
 
 namespace clio::cte::core {
 
+/**
+ * A device-resident blob_data ShmPtr isn't reachable by the client/daemon
+ * network transport (it would read the device pointer directly and crash),
+ * so AsyncPutBlob below stages a D2H copy into a fresh SHM buffer before
+ * submitting -- the same "daemon can't reach it, stage a copy" idiom the
+ * private-memory AsyncPutBlob overload already uses (issue #830). Defined
+ * out-of-line in core_client.cc (a plain host .cc, never compiled by nvcc)
+ * so core_client.h itself stays free of CUDA runtime API usage -- it's
+ * included by GPU kernel test/production files that must not pull in
+ * gpu_api.h's device-callable machinery.
+ *
+ * @param ipc_manager Client's IPC manager (source of AllocateBuffer/ToFullPtr).
+ * @param blob_data In/out: unchanged unless it resolves to a device pointer.
+ *   On successful staging, rewritten to a freshly staged host ShmPtr. If
+ *   staging was needed but the allocation failed, set to null -- the
+ *   caller must check blob_data.IsNull() and return an empty Future.
+ * @param size Bytes to copy if staging.
+ * @return true if `blob_data` was rewritten to a staged buffer (the task
+ *   must be marked TASK_DATA_OWNER after Send so it gets freed); false if
+ *   no staging was needed (blob_data unchanged) or staging failed
+ *   (blob_data is null; see above).
+ */
+bool StageDeviceBlobForPut(clio::run::IpcManager *ipc_manager,
+                            ctp::ipc::ShmPtr<> &blob_data,
+                            clio::run::u64 size);
+
 class Client : public clio::run::ContainerClient {
  public:
   CTP_CROSS_FUN Client() = default;
@@ -563,6 +589,20 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
+    // A device-resident blob_data is only directly reachable when the
+    // daemon is co-located (IsRuntime()==true, e.g. test_cte_devmem_putget.cc)
+    // -- the GPU-aware bdev write path (MemBdevTransport::WriteBlocks)
+    // already handles a device pointer correctly once it has one. Over a
+    // real client/daemon boundary, stage it first -- see StageDeviceBlobForPut.
+    bool staged_from_device = false;
+    if (!CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      staged_from_device = StageDeviceBlobForPut(ipc_manager, blob_data, size);
+      if (blob_data.IsNull()) {
+        // Device pointer detected but staging allocation failed.
+        return clio::run::Future<PutBlobTask>();
+      }
+    }
+
     auto task = ipc_manager->NewTask<PutBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, offset, size, blob_data, score, context, flags);
@@ -577,7 +617,15 @@ class Client : public clio::run::ContainerClient {
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
 
-    return ipc_manager->Send(task);
+    auto fut = ipc_manager->Send(task);
+    if (staged_from_device) {
+      // Unlike a caller-supplied blob_data (which this overload never owns),
+      // the staging buffer above is ours -- mark it AFTER Send so
+      // ~PutBlobTask frees it once the write completes, same ordering
+      // rationale as the private-memory overload below.
+      task.get()->SetFlags(TASK_DATA_OWNER);
+    }
+    return fut;
   }
 
   /** std::string overload */

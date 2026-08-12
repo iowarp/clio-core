@@ -35,11 +35,29 @@
 #include <clio_cte/core/content_transfer_engine.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
+#include <clio_ctp/util/gpu_api.h>
 
 namespace clio::cte::core {
 
 // Define global pointer variable for CTE client in source file
 CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::core::Client, g_cte_client);
+
+bool StageDeviceBlobForPut(clio::run::IpcManager *ipc_manager,
+                            ctp::ipc::ShmPtr<> &blob_data,
+                            clio::run::u64 size) {
+  auto resolved = ipc_manager->ToFullPtr(blob_data).Cast<char>();
+  if (!ctp::IsDevicePointer(resolved.ptr_)) {
+    return false;
+  }
+  ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
+  if (staging.IsNull()) {
+    blob_data = ctp::ipc::ShmPtr<>::GetNull();
+    return false;
+  }
+  ctp::GpuApi::Memcpy(staging.ptr_, resolved.ptr_, size);
+  blob_data = ctp::ipc::ShmPtr<>(staging.shm_);
+  return true;
+}
 
 bool CLIO_CTE_CLIENT_INIT(const std::string &config_path,
                          const clio::run::PoolQuery &pool_query) {

@@ -32,12 +32,17 @@ else()
     message(STATUS "Compressor: XGBoost predictor disabled")
 endif()
 
+# clio::cte::core_client: compressor_runtime.cc's Compress() calls into
+# clio::cte::core::Client::AsyncPutBlob (compressor storing its own output
+# via CTE core), whose device-buffer staging now lives out-of-line in
+# core_client.cc -- must link the library that defines it.
 add_clio_module_runtime(
   SOURCES
     ${COMPRESSOR_SOURCES}
   LINK_LIBRARIES
     ctp::compress
     ctp::compress_model
+    clio::cte::core_client
 )
 
 # Link optional dependencies if available

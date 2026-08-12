@@ -54,6 +54,16 @@ if(TARGET clio_cte_core_client)
   target_compile_definitions(clio_cte_core_client PRIVATE CLIO_CTE_CORE_BUILDING_DLL=1)
 endif()
 
+# core_client.cc's StageDeviceBlobForPut needs CTP_ENABLE_CUDA/ROCM to see
+# ctp::GpuApi::IsDevicePointer -- without it, AsyncPutBlob's device-buffer
+# check is always false even in a CUDA build (the same gap fixed for
+# clio_admin_runtime and clio_cte_compressor_runtime elsewhere).
+if(CLIO_CORE_ENABLE_CUDA)
+  target_link_libraries(clio_cte_core_client PRIVATE ctp::cuda_cxx)
+elseif(CLIO_CORE_ENABLE_ROCM)
+  target_link_libraries(clio_cte_core_client PRIVATE ctp::rocm_cxx)
+endif()
+
 # Note: Cross-namespace dependencies (clio_run admin and bdev) are automatically
 # linked by add_chimod_* functions in ClioCoreCommon.cmake for non-clio_run namespaces
 
