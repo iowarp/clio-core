@@ -36,6 +36,14 @@
  *
  * The runtime must already be composed with the tiers you want (see
  * CLIO_SERVER_CONF); this tool only writes.
+ *
+ * Transfer buffers come from CLIO_IPC->AllocateBuffer, NOT from the heap. The
+ * GNN tests hand the runtime a raw host pointer in a ShmPtr with a null
+ * alloc_id, which is legal only because those tests run the server IN-PROCESS.
+ * Against a real daemon that address means nothing in the runtime's address
+ * space: the read path memcpy'd to it and took the whole daemon down with
+ * SIGSEGV, and the write path "succeeded" while storing whatever happened to
+ * be at that address in the other process.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -159,13 +167,16 @@ int main(int argc, char **argv) {
   // Readback: pull pages back out and write them to stdout, so a load can be
   // verified byte-for-byte against its source without involving a GPU.
   if (read_mode) {
-    std::vector<char> rbuf((size_t)page_bytes);
+    ctp::ipc::FullPtr<char> rb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
+    if (rb.IsNull()) {
+      std::fprintf(stderr, "[ingest] could not allocate %llu B of SHM\n",
+                   (unsigned long long)page_bytes);
+      return 1;
+    }
     for (std::uint64_t p = 0; p < read_pages; ++p) {
       char name[32];
       clio::cte::gpu_vector::PageBlobName(p, name);
-      ctp::ipc::ShmPtr<> dp;
-      dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
-      dp.off_ = reinterpret_cast<clio::run::u64>(rbuf.data());
+      ctp::ipc::ShmPtr<> dp = rb.shm_.template Cast<void>();
       auto gf = comp.AsyncGetBlob(tag_id, name, (clio::run::u64)0,
                                   (clio::run::u64)page_bytes, 0, dp,
                                   clio::run::PoolQuery::Local());
@@ -175,27 +186,34 @@ int main(int argc, char **argv) {
                      (unsigned long long)p, gf->GetReturnCode());
         return 1;
       }
-      std::fwrite(rbuf.data(), 1, (size_t)page_bytes, stdout);
+      std::fwrite(rb.ptr_, 1, (size_t)page_bytes, stdout);
     }
     std::fflush(stdout);
+    CLIO_IPC->FreeBuffer(rb);
     std::fprintf(stderr, "[ingest] read back %llu pages\n",
                  (unsigned long long)read_pages);
     return 0;
   }
 
-  std::vector<char> page((size_t)page_bytes);
+  ctp::ipc::FullPtr<char> pb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
+  if (pb.IsNull()) {
+    std::fprintf(stderr, "[ingest] could not allocate %llu B of SHM\n",
+                 (unsigned long long)page_bytes);
+    return 1;
+  }
+  char *page = pb.ptr_;
   std::uint64_t pg = 0, bytes_in = 0;
   const double t0 = NowSec();
   double last_report = t0;
 
   for (;;) {
-    size_t got = ReadFull(stdin, page.data(), (size_t)page_bytes);
+    size_t got = ReadFull(stdin, page, (size_t)page_bytes);
     if (got == 0) break;
     if (got < page_bytes) {
       // Final short page: zero-fill so every page is the same size. The vector
       // addresses pages by fixed stride, so a ragged last page would make the
       // tail unreadable; the caller knows the true element count.
-      std::memset(page.data() + got, 0, (size_t)page_bytes - got);
+      std::memset(page + got, 0, (size_t)page_bytes - got);
       std::fprintf(stderr, "[ingest] final page %llu short (%zu of %llu B), "
                    "zero-filled\n", (unsigned long long)pg, got,
                    (unsigned long long)page_bytes);
@@ -203,9 +221,7 @@ int main(int argc, char **argv) {
 
     char name[32];
     clio::cte::gpu_vector::PageBlobName(pg, name);
-    ctp::ipc::ShmPtr<> dp;
-    dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
-    dp.off_ = reinterpret_cast<clio::run::u64>(page.data());
+    ctp::ipc::ShmPtr<> dp = pb.shm_.template Cast<void>();
     auto pf = comp.AsyncPutBlob(tag_id, name, (clio::run::u64)0,
                                 (clio::run::u64)page_bytes, dp, 0.5f, ctx, 0,
                                 clio::run::PoolQuery::Local());
@@ -233,6 +249,7 @@ int main(int argc, char **argv) {
                "[ingest] DONE: %llu pages, %.2f GiB in %.1fs (%.1f MiB/s)\n",
                (unsigned long long)pg, bytes_in / 1073741824.0, dt,
                dt > 0 ? (bytes_in / 1048576.0) / dt : 0.0);
+  CLIO_IPC->FreeBuffer(pb);
   std::fprintf(stdout, "%llu %llu\n", (unsigned long long)pg,
                (unsigned long long)bytes_in);
   return 0;

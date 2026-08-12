@@ -191,17 +191,23 @@ int main(int argc, char **argv) {
                (long long)rows_per_page, (long long)npages,
                (long long)block_rows, (long long)nblocks);
 
-  std::vector<float> pagebuf((size_t)(rows_per_page * dim));
+  // Transfer buffers live in SHM so the daemon can resolve them; see header.
+  ctp::ipc::FullPtr<char> inb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
+  ctp::ipc::FullPtr<char> outb = CLIO_IPC->AllocateBuffer((size_t)page_bytes);
+  if (inb.IsNull() || outb.IsNull()) {
+    std::fprintf(stderr, "[agg] could not allocate 2 x %llu B of SHM\n",
+                 (unsigned long long)page_bytes);
+    return 1;
+  }
+  float *pagebuf = reinterpret_cast<float *>(inb.ptr_);
+  float *outbuf = reinterpret_cast<float *>(outb.ptr_);
   std::vector<double> acc((size_t)(block_rows * dim));
-  std::vector<float> outbuf((size_t)(rows_per_page * dim));
   const double t0 = NowSec();
 
   auto read_page = [&](std::int64_t pg) -> bool {
     char name[32];
     clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
-    ctp::ipc::ShmPtr<> dp;
-    dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
-    dp.off_ = reinterpret_cast<clio::run::u64>(pagebuf.data());
+    ctp::ipc::ShmPtr<> dp = inb.shm_.template Cast<void>();
     auto gf = comp.AsyncGetBlob(feat_id, name, (clio::run::u64)0,
                                 (clio::run::u64)page_bytes, 0, dp,
                                 clio::run::PoolQuery::Local());
@@ -261,9 +267,7 @@ int main(int argc, char **argv) {
         }
         char name[32];
         clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
-        ctp::ipc::ShmPtr<> dp;
-        dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
-        dp.off_ = reinterpret_cast<clio::run::u64>(outbuf.data());
+        ctp::ipc::ShmPtr<> dp = outb.shm_.template Cast<void>();
         auto pf = comp.AsyncPutBlob(out_id, name, (clio::run::u64)0,
                                     (clio::run::u64)page_bytes, dp, 0.5f, ctx, 0,
                                     clio::run::PoolQuery::Local());
@@ -281,6 +285,8 @@ int main(int argc, char **argv) {
 
   std::fprintf(stderr, "[agg] DONE: %lld pages written to '%s' in %.1fs\n",
                (long long)npages, out_tag.c_str(), NowSec() - t0);
+  CLIO_IPC->FreeBuffer(inb);
+  CLIO_IPC->FreeBuffer(outb);
   std::fprintf(stdout, "%lld\n", (long long)npages);
   return 0;
 }
