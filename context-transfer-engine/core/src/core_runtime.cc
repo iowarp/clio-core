@@ -31,7 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <x86intrin.h>
+#include "clio_runtime/cycle_counter.h"
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 // Direct-read registry (core runtime lib): a node-local mem-transport bdev
 // publishes a synchronous read entry; ReadData services those blocks inline
@@ -2363,7 +2363,7 @@ clio::run::u64 Runtime::EstimateIoTimeNs(
 template <typename TaskT>
 clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
-  const unsigned long long ev_g0 = __rdtsc();
+  const unsigned long long ev_g0 = clio::run::CycleNow();
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
@@ -2392,7 +2392,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           const auto &seg = task->segments_[i];
           if (seg.size_ == 0 || seg.data_.IsNull()) {
             task->return_code_ = 1;
-            clio_evlat_add(2, __rdtsc() - ev_g0);
+            clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
           }
           if (seg.blob_off_ < lo) lo = seg.blob_off_;
@@ -2406,14 +2406,14 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Validate input parameters
     if (size == 0) {
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
     // Validate that blob_name is provided
     if (blob_name.empty()) {
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
@@ -2423,7 +2423,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // If blob doesn't exist, error
     if (blob_info_ptr == nullptr) {
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
@@ -2440,13 +2440,13 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                                      /*create=*/false);
       if (replica_sel == 0) {
         task->return_code_ = 1;
-        clio_evlat_add(2, __rdtsc() - ev_g0);
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
       }
     } else if (replica_sel < 0) {
       // kAllReplicas and friends: a read needs one concrete source.
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
@@ -2480,7 +2480,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_ ==
             0) {
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
@@ -2549,7 +2549,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
             : blob_info_ptr->GetTotalSize() == 0;
     if (blob_is_gone) {
       task->return_code_ = 1;
-      clio_evlat_add(2, __rdtsc() - ev_g0);
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
 
@@ -2584,22 +2584,22 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                             seg.blob_off_, read_result));
           if (read_result != 0) {
             task->return_code_ = read_result;
-            clio_evlat_add(2, __rdtsc() - ev_g0);
+            clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
           }
         }
       }
     } else {
       clio::run::u32 read_result = 0;
-      clio_evlat_add(5, __rdtsc() - ev_g0);   // metadata phase
-      { const unsigned long long ev_r0 = __rdtsc();
+      clio_evlat_add(5, clio::run::CycleNow() - ev_g0);   // metadata phase
+      { const unsigned long long ev_r0 = clio::run::CycleNow();
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
                         read_result));
-      clio_evlat_add(4, __rdtsc() - ev_r0); }  // ReadData await
+      clio_evlat_add(4, clio::run::CycleNow() - ev_r0); }  // ReadData await
 
       if (read_result != 0) {
         task->return_code_ = read_result;
-        clio_evlat_add(2, __rdtsc() - ev_g0);
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
       }
     }
@@ -2631,7 +2631,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
-  clio_evlat_add(2, __rdtsc() - ev_g0);
+  clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -3425,7 +3425,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
     clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_CPU_IPC;
-  const unsigned long long ev_t0 = __rdtsc();
+  const unsigned long long ev_t0 = clio::run::CycleNow();
   task->num_ok_ = 0;
   int first_rc = 0;
   clio::run::u32 n = task->count_;
@@ -3457,7 +3457,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
     if (task->flags_ & kCtePrefetchHint) inline_max = 0;
     const clio::run::u32 sub_flags = task->flags_ & ~kCtePrefetchHint;
     if (n <= inline_max) {
-      const unsigned long long ev_t1 = __rdtsc();
+      const unsigned long long ev_t1 = clio::run::CycleNow();
       for (clio::run::u32 i = 0; i < n; ++i) {
         auto &req = task->reqs_[i];
         auto sub = ipc_manager->NewTask<PodGetBlobTask>(
@@ -3475,7 +3475,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
           first_rc = rc;
         }
       }
-      clio_evlat_add(1, __rdtsc() - ev_t1);
+      clio_evlat_add(1, clio::run::CycleNow() - ev_t1);
     } else {
       clio::run::Future<PodGetBlobTask> futs[kPodMultiMax];
       for (clio::run::u32 i = 0; i < n; ++i) {
@@ -3487,7 +3487,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
             req.data_, task->context_);
         futs[i] = ipc_manager->Send(sub);
       }
-      const unsigned long long ev_t1 = __rdtsc();
+      const unsigned long long ev_t1 = clio::run::CycleNow();
       for (clio::run::u32 i = 0; i < n; ++i) {
         CLIO_CO_AWAIT(futs[i]);
         int rc = futs[i]->GetReturnCode();
@@ -3498,10 +3498,10 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
           first_rc = rc;
         }
       }
-      clio_evlat_add(1, __rdtsc() - ev_t1);
+      clio_evlat_add(1, clio::run::CycleNow() - ev_t1);
     }
   }
-  clio_evlat_add(0, __rdtsc() - ev_t0);
+  clio_evlat_add(0, clio::run::CycleNow() - ev_t0);
   task->SetReturnCode(first_rc);
   CLIO_CO_RETURN;
 }
@@ -6932,10 +6932,10 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
         auto *ipc_mgr = CLIO_IPC;
         char *dst = ipc_mgr->ToFullPtr(data_ptr).Cast<char>().ptr_;
         if (dst != nullptr) {
-          unsigned long long ev_d0 = __rdtsc();
+          unsigned long long ev_d0 = clio::run::CycleNow();
           if (clio_direct_read(block.bdev_client_.pool_id_.ToU64(),
                                bdev_block.offset_, read_size, dst) == 0) {
-            clio_evlat_add(7, __rdtsc() - ev_d0);  // ch7: direct_read
+            clio_evlat_add(7, clio::run::CycleNow() - ev_d0);  // ch7: direct_read
             remaining_size -= read_size;
             block_offset_in_blob += block.size_;
             continue;

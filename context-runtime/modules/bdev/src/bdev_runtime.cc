@@ -3,7 +3,7 @@
  * All rights reserved.
  */
 
-#include <x86intrin.h>
+#include "clio_runtime/cycle_counter.h"
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 // Direct-read registry (core runtime lib): fault-chain level collapse. The mem
 // transport's reads are synchronously servable, so the CTE read path can skip
@@ -534,7 +534,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  const unsigned long long ev_b0 = __rdtsc();
+  const unsigned long long ev_b0 = clio::run::CycleNow();
 
   // Counted at ENTRY, before the kNoop early-out: that path reports success
   // and claims bytes_read_ = length without touching storage, so counting
@@ -544,7 +544,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   if (bdev_type_ == BdevType::kNoop) {
     task->return_code_ = 0;
     task->bytes_read_ = task->length_;
-    clio_evlat_add(6, __rdtsc() - ev_b0);
+    clio_evlat_add(6, clio::run::CycleNow() - ev_b0);
   CLIO_CO_RETURN;
   }
 
@@ -560,7 +560,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     task->bytes_read_ = 0;
   }
 
-  clio_evlat_add(6, __rdtsc() - ev_b0);
+  clio_evlat_add(6, clio::run::CycleNow() - ev_b0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

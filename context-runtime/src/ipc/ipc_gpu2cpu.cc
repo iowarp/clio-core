@@ -9,35 +9,18 @@
 #include <atomic>
 #include <unordered_map>
 #include <vector>
-#include <x86intrin.h>
+#include "clio_runtime/cycle_counter.h"
 #include <exception>
 #include <mutex>
 #include <csignal>
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
 
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-
-#include "clio_ctp/util/gpu_api.h"
-#include "clio_runtime/gpu/future.h"
-#include "clio_runtime/gpu/gpu_ipc_manager.h"
-#include "clio_runtime/gpu/submit_probe.h"
-#include "clio_runtime/ipc_manager.h"
-#include "clio_runtime/singletons.h"
-#include "clio_runtime/worker.h"
-
+// Diagnostics live OUTSIDE the GPU platform guard: clio_evlat_add is
+// called from CPU-only code too (bdev DirectRead, the CTE get path), and
+// guarding the DEFINITION made every CPU-only build fail to link
+// ("undefined reference to clio_evlat_add" in the deps-cpu CI images).
 namespace clio::run {
-
-/**
- * RecvIn (producer-only gpu2cpu pop): pop one gpu::Future<Task> off `gpu_lane`,
- * D2H-copy the gpu::FutureShm + POD task out of device memory when the kernel
- * allocated in kDeviceMem (the CPU cannot dereference device pointers), wrap the
- * host-resident task in a clio::run::Future<Task>, stash the original device
- * pointers + size on the chi FutureShm (so SendOut can H2D-copy the mutated POD
- * back and flip FUTURE_COMPLETE), then route it. Moved here from the worker so
- * the worker never deserializes tasks/futures. Runs on the worker thread.
- */
-
 // ---------------------------------------------------------------------------
 // Lifecycle event log for the per-slot scratch race (issue #961).
 //
@@ -52,7 +35,7 @@ struct EvRec {
   unsigned long long seq;
   unsigned long long slot;   // device task address
   unsigned long long aux;    // task_id unique / rc
-  unsigned long long tsc;    // __rdtsc(): a plain instruction, NOT a clock
+  unsigned long long tsc;    // clio::run::CycleNow(): a plain instruction, NOT a clock
                              // call -- steady_clock in this hot path shifted
                              // timing enough to hang the runtime (lost-wake).
   unsigned int tid;          // worker id (or 0xFFFF for unknown)
@@ -67,7 +50,7 @@ void EvPush(char kind, unsigned tid, unsigned long long slot,
   const unsigned long long n =
       g_ev_seq.fetch_add(1, std::memory_order_relaxed);
   EvRec &r = g_ev[n % kEvCap];
-  r.tsc = __rdtsc();
+  r.tsc = clio::run::CycleNow();
   r.seq = n; r.slot = slot; r.aux = aux; r.tid = tid; r.kind = kind;
 }
 
@@ -197,6 +180,30 @@ struct EvInit {
   }
 } g_ev_init;
 }  // namespace
+}  // namespace clio::run
+
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+
+#include "clio_ctp/util/gpu_api.h"
+#include "clio_runtime/gpu/future.h"
+#include "clio_runtime/gpu/gpu_ipc_manager.h"
+#include "clio_runtime/gpu/submit_probe.h"
+#include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/singletons.h"
+#include "clio_runtime/worker.h"
+
+namespace clio::run {
+
+/**
+ * RecvIn (producer-only gpu2cpu pop): pop one gpu::Future<Task> off `gpu_lane`,
+ * D2H-copy the gpu::FutureShm + POD task out of device memory when the kernel
+ * allocated in kDeviceMem (the CPU cannot dereference device pointers), wrap the
+ * host-resident task in a clio::run::Future<Task>, stash the original device
+ * pointers + size on the chi FutureShm (so SendOut can H2D-copy the mutated POD
+ * back and flip FUTURE_COMPLETE), then route it. Moved here from the worker so
+ * the worker never deserializes tasks/futures. Runs on the worker thread.
+ */
+
 
 bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) {
   gpu::Future<Task> gpu_future;

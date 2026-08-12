@@ -3,7 +3,7 @@
  * All rights reserved.
  */
 
-#include <x86intrin.h>
+#include "clio_runtime/cycle_counter.h"
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
                                        void *stream);
@@ -797,10 +797,10 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
   if (dev_dst) {
     // Copy-engine work only — safe to block on even with a faulting kernel
     // resident (kernels block later LAUNCHES, not DMA).
-    const unsigned long long ev_s0 = __rdtsc();
+    const unsigned long long ev_s0 = clio::run::CycleNow();
     ctp::GpuApi::PollSync(stream);   // never block in driver sync
     ctp::GpuApi::ReturnStream(stream);
-    clio_evlat_add(3, __rdtsc() - ev_s0);  // ch3: DirectRead sync portion
+    clio_evlat_add(3, clio::run::CycleNow() - ev_s0);  // ch3: DirectRead sync portion
   }
   return 0;
 }
