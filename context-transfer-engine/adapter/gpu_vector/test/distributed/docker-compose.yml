@@ -55,8 +55,9 @@ services:
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
       - GVD_START_DELAY=0
-    command: ["sh", "-c", "sleep ${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
     entrypoint: []
 
   gvd-node2:
@@ -71,15 +72,14 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
-      # Workers do NOT compose: pools are cluster-wide entities created once
-      # by node1; 4-way concurrent compose of the same pool ids wedged init.
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
       - GVD_START_DELAY=6
-    command: ["sh", "-c", "sleep ${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
     entrypoint: []
 
   gvd-node3:
@@ -94,15 +94,14 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
-      # Workers do NOT compose: pools are cluster-wide entities created once
-      # by node1; 4-way concurrent compose of the same pool ids wedged init.
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
       - GVD_START_DELAY=12
-    command: ["sh", "-c", "sleep ${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
     entrypoint: []
 
   gvd-node4:
@@ -117,15 +116,14 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
-      # Workers do NOT compose: pools are cluster-wide entities created once
-      # by node1; 4-way concurrent compose of the same pool ids wedged init.
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
       - GVD_START_DELAY=18
-    command: ["sh", "-c", "sleep ${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
     entrypoint: []
 
 networks:
