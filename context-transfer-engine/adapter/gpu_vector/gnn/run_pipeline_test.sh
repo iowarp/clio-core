@@ -135,3 +135,54 @@ PYEOF
 
 echo "### tier usage (this is where the matrix actually lives)"
 du -h "$WORK"/tier/* 2>/dev/null | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# 5. THE GPU LEG.
+#
+# Everything above is CPU-side: the store, the aggregation, the readback. This
+# step is the one that closes the loop -- a gv::Vector on the GPU faulting the
+# ingested matrix back in, page by page, through the codec.
+#
+# It runs in its OWN process with an in-process runtime rather than against the
+# daemon above, and that is forced, not stylistic: GPU queues are only ever
+# created by ServerInitGpuQueues and there is no client-side attach, so a
+# process that faults on the GPU has to host the runtime itself. That is why
+# the test ingests the raw stream again rather than reading what the daemon
+# already holds.
+# ---------------------------------------------------------------------------
+GPU_TEST="$BIN/test_gpu_vector_gnn_stream"
+if [ ! -x "$GPU_TEST" ]; then
+  echo "### 5. GPU leg SKIPPED (no $GPU_TEST)"
+  exit 0
+fi
+
+echo "### 5. GPU vector faults the ingested matrix"
+kill "$DAEMON" 2>/dev/null || true   # free the GPU/SHM before the in-proc run
+sleep 3
+
+"$PY" "$HERE/gnn_stream_npz.py" --zip "$WORK/data.npz" --member node_feat \
+    --dtype float32 2>/dev/null > "$WORK/feat.f32"
+
+# Page size matters here. The vector needs more pages per block than it has
+# cache slots, or the test's own residency assertion trips -- at this dataset
+# size a 256 KiB page leaves one page per block and it fails for that reason
+# alone, which looks like a paging bug and is not one.
+mkdir -p "$WORK/gputier"
+set +e
+env -u CLIO_SERVER_CONF \
+    CLIO_GNN_INGEST_FILE="$WORK/feat.f32" \
+    CLIO_GNN_SYNTH_N="$N" CLIO_GNN_SYNTH_F="$F" \
+    CLIO_GNN_RAM_MIB=4 \
+    CLIO_GNN_NVME_DIR="$WORK/gputier/nvme" CLIO_GNN_NVME_MIB=4096 \
+    CLIO_GNN_PAGE_KIB=${GPU_PAGE_KIB:-16} CLIO_PORT=$((PORT + 20)) \
+    "$GPU_TEST" > "$WORK/gpu.log" 2>&1
+GPU_RC=$?
+set -e
+grep -E "ingested|cache stats|bit-exact|RESULT|REQUIRE failed" "$WORK/gpu.log" \
+  | sed 's/^/    /' || true
+if [ "$GPU_RC" -ne 0 ]; then
+  echo "    GPU LEG FAIL (rc=$GPU_RC, see $WORK/gpu.log)"
+  exit 1
+fi
+echo "    GPU LEG PASS"
+echo "### ALL STAGES PASS"
