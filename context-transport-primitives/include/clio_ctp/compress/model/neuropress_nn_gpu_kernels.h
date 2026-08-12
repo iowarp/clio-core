@@ -107,10 +107,14 @@ struct NeuroPressGpuSGDSample {
  *   NN_MAX_SGD_SAMPLES), matching upstream's own per-call batch limit.
  * @return true if the weight update was applied; false if not (a
  *   non-finite step/gradient was detected and safely skipped).
+ *
+ * @param learning_rate Online-SGD rate, upstream's g_reinforce_lr. Consumed
+ *   at exactly one place, `lr_out = learning_rate * clip_scale`
+ *   (nn_gpu.cu:1242), matching runNNSGD's own parameter.
  */
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,
-                        int num_samples);
+                        int num_samples, float learning_rate);
 
 }  // namespace ctp::compress::model::gpu
 

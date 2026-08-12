@@ -541,7 +541,8 @@ bool NeuroPressNNPredictor::Train(
       gpu_samples[si].actual_psnr_db = labels[si].psnr_db;
     }
     return gpu::NeuroPressGpuTrain(gpu_weights_.get(), gpu_samples.data(),
-                                   static_cast<int>(num_samples));
+                                   static_cast<int>(num_samples),
+                                   learning_rate_);
   }
 #endif
 
@@ -643,7 +644,6 @@ bool NeuroPressNNPredictor::Train(
   // into a combined (region-0-equivalent) gradient ----
   constexpr float kGradClipThreshold = 0.1f;
   constexpr float kPcgradCosThresh = -0.1f;
-  constexpr float kDefaultLearningRate = 0.01f;  // NeuroPress's g_reinforce_lr default
 
   std::vector<float> combined_dw(weights_.size(), 0.0f);
   std::vector<float> combined_db(biases_.size(), 0.0f);
@@ -777,7 +777,7 @@ bool NeuroPressNNPredictor::Train(
     float out_norm = static_cast<float>(std::sqrt(norm_sq)) + 1e-8f;
     float clip_scale =
         (out_norm > kGradClipThreshold) ? (kGradClipThreshold / out_norm) : 1.0f;
-    float lr_out = kDefaultLearningRate * clip_scale;
+    float lr_out = learning_rate_ * clip_scale;
 
     for (uint32_t layer = 0; layer < 4; ++layer) {
       size_t wsz = (layer == 0) ? size_t{kHiddenDim} * kInputDim

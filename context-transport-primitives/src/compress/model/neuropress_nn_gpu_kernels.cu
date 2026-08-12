@@ -333,7 +333,8 @@ __device__ __forceinline__ void ForwardOneLayer(
 
 __global__ void SGDKernel(NeuroPressGpuWeights *w,
                           const NeuroPressGpuSGDSample *__restrict__ samples,
-                          int num_samples, bool *out_applied) {
+                          int num_samples, float learning_rate,
+                          bool *out_applied) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
@@ -449,7 +450,6 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   // ---- Phase 2: per-output backward passes with PCGrad-lite ----
   constexpr float kGradClipThreshold = 0.1f;
   constexpr float kPcgradCosThresh = -0.1f;
-  constexpr float kDefaultLearningRate = 0.01f;  // NeuroPress's g_reinforce_lr default
 
   for (int i = t; i < kParamCount; i += kHiddenDim) w->combined[i] = 0.0f;
   __syncthreads();
@@ -596,7 +596,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     }
     float out_norm = sqrtf(s_reduce[0]) + 1e-8f;
     float clip_scale = (out_norm > kGradClipThreshold) ? (kGradClipThreshold / out_norm) : 1.0f;
-    float lr_out = kDefaultLearningRate * clip_scale;
+    float lr_out = learning_rate * clip_scale;
 
     for (int i = 0; i < kInputDim; ++i)
       w->combined[kOffW1 + t * kInputDim + i] += lr_out * w->out_grad[kOffW1 + t * kInputDim + i];
@@ -717,7 +717,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
 
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,
-                        int num_samples) {
+                        int num_samples, float learning_rate) {
   if (!w || num_samples <= 0) return false;
   if (num_samples > kMaxSamples) num_samples = kMaxSamples;
 
@@ -729,7 +729,8 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
             sizeof(NeuroPressGpuSGDSample) * static_cast<size_t>(num_samples),
             cudaMemcpyHostToDevice);
 
-  SGDKernel<<<1, kHiddenDim>>>(w, d_samples, num_samples, d_applied);
+  SGDKernel<<<1, kHiddenDim>>>(w, d_samples, num_samples, learning_rate,
+                               d_applied);
 
   bool applied = false;
   cudaMemcpy(&applied, d_applied, sizeof(bool), cudaMemcpyDeviceToHost);

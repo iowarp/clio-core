@@ -81,6 +81,18 @@ struct CompressorConfig {
   // lifetime, matching NeuroPress's own behavior (no runtime API persists a
   // trained model file either).
   float neuropress_mape_threshold_ = 0.30f;
+  /**
+   * Online-SGD learning rate. Mirrors NeuroPress's g_reinforce_lr
+   * (gpucompress_api.cpp:102, default 0.01f), which is settable at runtime
+   * through gpucompress_set_reinforcement(). Only the main SGD kernel
+   * consumes it -- `lr_out = learning_rate * clip_scale` (nn_gpu.cu:1242).
+   * The deferred decompression-head pass takes the value but never uses it:
+   * its step comes entirely from its own trust region.
+   *
+   * Values <= 0 are ignored rather than applied, matching upstream's
+   * `if (learning_rate > 0.0f)` guard (gpucompress_learning.cpp:200).
+   */
+  float neuropress_learning_rate_ = 0.01f;
   // Cycle 4g: K-way exploration. Off by default, matching NeuroPress's own
   // g_exploration_enabled{false} -- an opt-in, not the normal route. When
   // enabled and error_pct (the same metric Phase 1 above uses) crosses this
@@ -117,6 +129,7 @@ struct CompressorConfig {
         neuropress_online_learning_enabled_(
             other.neuropress_online_learning_enabled_),
         neuropress_mape_threshold_(other.neuropress_mape_threshold_),
+        neuropress_learning_rate_(other.neuropress_learning_rate_),
         neuropress_exploration_enabled_(other.neuropress_exploration_enabled_),
         neuropress_exploration_threshold_(
             other.neuropress_exploration_threshold_),
@@ -136,7 +149,8 @@ struct CompressorConfig {
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
        dnn_model_weights_path_, neuropress_model_path_,
        neuropress_online_learning_enabled_,
-       neuropress_mape_threshold_, neuropress_exploration_enabled_,
+       neuropress_mape_threshold_, neuropress_learning_rate_,
+       neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
@@ -170,6 +184,10 @@ struct CompressorConfig {
         if (node["neuropress_mape_threshold"]) {
           neuropress_mape_threshold_ =
               node["neuropress_mape_threshold"].as<float>();
+        }
+        if (node["neuropress_learning_rate"]) {
+          neuropress_learning_rate_ =
+              node["neuropress_learning_rate"].as<float>();
         }
         if (node["neuropress_exploration_enabled"]) {
           neuropress_exploration_enabled_ =

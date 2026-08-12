@@ -318,6 +318,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
            config_.neuropress_model_path_);
       neuropress_predictor_ =
           std::make_unique<ctp::compress::model::NeuroPressNNPredictor>();
+      neuropress_predictor_->SetLearningRate(config_.neuropress_learning_rate_);
       if (neuropress_predictor_->Load(config_.neuropress_model_path_)) {
         HLOG(kDebug, "NeuroPress NN model loaded successfully");
       } else {

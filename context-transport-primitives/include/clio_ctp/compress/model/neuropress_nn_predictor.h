@@ -150,6 +150,21 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    *   inputs are malformed, or the computed gradient/step was non-finite
    *   and the update was safely skipped).
    */
+  /**
+   * @brief Set the online-SGD learning rate.
+   *
+   * Non-positive values are IGNORED, not applied -- upstream guards the
+   * same way (`if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;`,
+   * gpucompress_learning.cpp:200), so a caller passing 0 leaves the default
+   * intact rather than disabling learning.
+   */
+  void SetLearningRate(float learning_rate) {
+    if (learning_rate > 0.0f) learning_rate_ = learning_rate;
+  }
+
+  /** @brief Current online-SGD learning rate. */
+  float GetLearningRate() const { return learning_rate_; }
+
   bool Train(const std::vector<CompressionFeatures>& features,
             const std::vector<TrainingLabels>& labels) override;
 
@@ -257,6 +272,15 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   std::vector<size_t> bias_offsets_;
 
   bool is_ready_ = false;
+
+  /**
+   * Online-SGD learning rate -- Clio's stand-in for NeuroPress's
+   * g_reinforce_lr global (gpucompress_api.cpp:102), which upstream passes
+   * to runNNSGD on every call and exposes via gpucompress_set_reinforcement().
+   * Held per-predictor rather than globally so two predictors cannot fight
+   * over it; set from CompressorConfig at load time.
+   */
+  float learning_rate_ = 0.01f;
 
   /**
    * Serializes every writer of the model state against every other.
