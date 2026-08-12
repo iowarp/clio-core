@@ -325,5 +325,80 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    # GNN training: mini-batch SGD over the compressed feature store, compared
+    # against an in-core run (bit-exact where in-core fits, and where it OOMs
+    # the vector is the only path that trained at all).
+    add_cuda_executable(test_gpu_vector_gnn_train FALSE
+        test_gpu_vector_gnn_train_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_gnn_train PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_gnn_train COMMAND test_gpu_vector_gnn_train
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_gnn_train PROPERTIES
+        TIMEOUT 1800
+        LABELS "cte;gpu;gpu_vector;compress;gnn;zstd;train"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    # GNN capacity: the poster's headline -- an in-core run OOMs where the
+    # vector streams the same matrix and produces the identical readout.
+    add_cuda_executable(test_gpu_vector_gnn_capacity FALSE
+        test_gpu_vector_gnn_capacity_gpu.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/test
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_gpu_vector_gnn_capacity PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(NAME cte_gpu_vector_gnn_capacity COMMAND test_gpu_vector_gnn_capacity
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_gnn_capacity PROPERTIES
+        TIMEOUT 1800
+        LABELS "cte;gpu;gpu_vector;compress;gnn;zstd;capacity"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
     endif()  # TARGET clio_cte_compressor_runtime
 endif()

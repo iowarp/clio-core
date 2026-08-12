@@ -111,7 +111,8 @@ struct Dataset {
  * float32 would be incompressible noise and would make a lossless codec look
  * pointless for reasons that say nothing about real feature matrices.
  */
-inline Dataset LoadOrSynthDataset(const std::string &dir, const char *tag) {
+inline Dataset LoadOrSynthDataset(const std::string &dir, const char *tag,
+                                  const char *feat_file = "features.f32") {
   Dataset d;
   {
     std::ifstream mf(dir + "/meta.txt");
@@ -121,9 +122,12 @@ inline Dataset LoadOrSynthDataset(const std::string &dir, const char *tag) {
     }
   }
   if (d.real) {
-    d.real = ReadFileQuiet(dir + "/features.f32", d.feat) &&
-             ReadFileQuiet(dir + "/graph.csr", d.csr);
+    // The training test wants gnn_agg.py's PRE-AGGREGATED matrix, not the raw
+    // one, so the feature file is a parameter. The graph is optional for the
+    // same reason: once features are aggregated there is nothing to walk.
+    d.real = ReadFileQuiet(dir + "/" + feat_file, d.feat);
     if (d.real) {
+      ReadFileQuiet(dir + "/graph.csr", d.csr);
       ReadFileQuiet(dir + "/labels.i64", d.labels);
       return d;
     }
