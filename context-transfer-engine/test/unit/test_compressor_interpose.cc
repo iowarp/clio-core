@@ -30,6 +30,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <cmath>
 #include <vector>
 
 #include "simple_test.h"
@@ -181,6 +182,58 @@ TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
     get.Wait();
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
+  }
+
+  // B2. QUANTIZED whole-blob put through the interposer (issue #693).
+  //     Exercises CompressIntoShm's host quantizer and DecompressStored's
+  //     inverse, which is the only coverage of that pair -- the GPU example
+  //     drives the device path. Lossy by construction, so the check is the
+  //     error bound rather than an exact match: that is precisely the
+  //     guarantee error-bounded quantization makes, and the guarantee that
+  //     breaks if the header extension, the ordering (quantize before
+  //     shuffle, unshuffle before dequantize) or the width packing is wrong.
+  {
+    const size_t kFloats = kValSize / sizeof(float);
+    std::vector<float> fvals(kFloats);
+    for (size_t i = 0; i < kFloats; ++i) {
+      fvals[i] = static_cast<float>(i % 977) * 0.25f - 100.0f;
+    }
+    const double kBound = 0.05;
+
+    clio::cte::core::Context ctx;
+    ctx.compress_lib_ = 1;
+    ctx.data_type_ = 1;        // float payload
+    ctx.error_bound_ = kBound;  // > 0 makes quantize candidates legal
+    // Quantize bit in the packed preset word (bit 24), the same encoding
+    // the ranking and Runtime::Compress use.
+    ctx.compress_preset_ = static_cast<int>(2u | (1u << 24));
+
+    auto put = comp_io.AsyncPutBlob(
+        tag_id, "quant_blob", 0, kValSize,
+        reinterpret_cast<char *>(fvals.data()), /*score=*/-1.0f, ctx);
+    put.Wait();
+    REQUIRE(put->GetReturnCode() == 0);
+
+    std::vector<float> got(kFloats, 0.0f);
+    auto get = comp_io.AsyncGetBlob(tag_id, "quant_blob", 0, kValSize,
+                                    /*flags=*/0,
+                                    reinterpret_cast<char *>(got.data()));
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+
+    double worst = 0.0;
+    for (size_t i = 0; i < kFloats; ++i) {
+      worst = std::max(worst, std::fabs(static_cast<double>(got[i]) -
+                                        static_cast<double>(fvals[i])));
+    }
+    INFO("worst |orig - dequantized| = " << worst << " (bound " << kBound
+                                          << ")");
+    REQUIRE(worst <= kBound);
+    // Discriminating check: quantization must actually have RUN. A lossless
+    // round trip satisfies any bound trivially, so without this the case
+    // would pass even if the quantize bit were dropped -- which is exactly
+    // the silent downgrade this path had before.
+    REQUIRE(worst > 0.0);
   }
 
   // C. Partial + VECTORED reads of the compressed blob — impossible against

@@ -1313,10 +1313,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             size_t alt_compress_size = chunk_size;
             bool alt_applied_quant = false;
             ctp::compress::preprocess::DeviceQuantizeParams alt_quant_params;
-            if (alt_wants_quant && context.error_bound_ > 0.0 &&
-                context.data_type_ == 1 && chunk_size >= sizeof(float) &&
-                (chunk_size % sizeof(float)) == 0 &&
-                ctp::IsDevicePointer(alt_input)) {
+            // Same gates as the primary: preproc bit + positive bound, with
+            // the buffer treated as float32 unconditionally (upstream's
+            // gpucompress_compress.cpp:434 and :827).
+            const bool alt_want_quant =
+                alt_wants_quant && context.error_bound_ > 0.0 &&
+                chunk_size >= sizeof(float) &&
+                (chunk_size % sizeof(float)) == 0;
+            std::vector<char> alt_quant_staging;
+            if (alt_want_quant && ctp::IsDevicePointer(alt_input)) {
               char* alt_q_buf = nullptr;
               ctp::ipc::AllocatorId alt_q_alloc =
                   CLIO_IPC->AllocateAndRegisterGpuBackend(
@@ -1334,6 +1339,27 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   alt_compress_size = alt_q_bytes;
                   alt_applied_quant = true;
                 }
+              }
+            } else if (alt_want_quant) {
+              // Host-resident alternative: honor the action here too, or the
+              // sample is credited as quantized while measuring unquantized
+              // bytes.
+              auto alt_hq = ctp::compress::preprocess::Quantize<float>(
+                  reinterpret_cast<const float*>(alt_input),
+                  chunk_size / sizeof(float), context.error_bound_);
+              if (!alt_hq.quantized_.empty()) {
+                alt_quant_staging.assign(alt_hq.quantized_.begin(),
+                                         alt_hq.quantized_.end());
+                alt_input = alt_quant_staging.data();
+                alt_compress_size = alt_quant_staging.size();
+                alt_applied_quant = true;
+                alt_quant_params.effective_error_bound =
+                    alt_hq.effective_error_bound_;
+                alt_quant_params.scale = alt_hq.scale_;
+                alt_quant_params.data_min = alt_hq.data_min_;
+                alt_quant_params.data_max = alt_hq.data_max_;
+                alt_quant_params.precision = alt_hq.precision_;
+                alt_quant_params.bound_achievable = alt_hq.bound_achievable_;
               }
             }
 
@@ -1791,6 +1817,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // (compress_input_size vs input_size, gpucompress_compress.cpp:440-452).
     size_t compress_input_size = input_size;
     bool applied_quant = false;
+    std::vector<char> quant_staging;  // host quantize path only
     ctp::compress::preprocess::DeviceQuantizeParams quant_params;
 
     // Releases both on EVERY exit from this scope. The frees used to live
@@ -1825,10 +1852,20 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // under which its ranking stops masking quantize actions. Float32 only,
     // since that is the element type the quantizer is defined for and the
     // one NeuroPress's stats assume.
-    const bool want_quant =
-        quantize_requested && context.error_bound_ > 0.0 &&
-        context.data_type_ == 1 && input_size >= sizeof(float) &&
-        (input_size % sizeof(float)) == 0;
+    // No data_type_ gate. Upstream's only conditions are the preproc bit and
+    // `cfg.error_bound > 0.0` (gpucompress_compress.cpp:434); it then treats
+    // the buffer as float32 unconditionally, `input_size / sizeof(float)`.
+    // That is already how EstCompressionStats interprets a chunk whenever
+    // NeuroPress is the one ranking, so requiring data_type_ == 1 here made
+    // the selector and the executor disagree: with a bound set and a
+    // different declared type, quantize candidates were RANKED and chosen
+    // but never APPLIED, so the chunk compressed losslessly while the
+    // training sample claimed it had been quantized. Non-float bytes
+    // reinterpreted as float32 can produce a non-finite range, which makes
+    // the effective bound non-positive and the quantizer decline cleanly.
+    const bool want_quant = quantize_requested && context.error_bound_ > 0.0 &&
+                            input_size >= sizeof(float) &&
+                            (input_size % sizeof(float)) == 0;
     if (want_quant && ctp::IsDevicePointer(input_ptr)) {
       char *quant_buf = nullptr;
       quant_device_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
@@ -1855,6 +1892,35 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // On failure nothing is recorded and the chunk is compressed
       // losslessly -- the data is still correct, just not the action that
       // was ranked.
+    } else if (want_quant) {
+      // Host-resident chunk. StageInputIfNeeded may have staged a device
+      // buffer down for a CPU codec, and a caller can hand us host memory
+      // directly, so the quantize action has to be honored here too --
+      // otherwise it is ranked and chosen but never applied, exactly the
+      // mismatch the device branch above exists to avoid. The host
+      // quantizer shares its arithmetic with the device kernels and was
+      // shown to produce byte-identical output, so a blob written on either
+      // path decodes on either path.
+      auto host_q = ctp::compress::preprocess::Quantize<float>(
+          reinterpret_cast<const float *>(input_ptr),
+          input_size / sizeof(float), context.error_bound_);
+      if (!host_q.quantized_.empty()) {
+        quant_staging.assign(host_q.quantized_.begin(),
+                             host_q.quantized_.end());
+        input_ptr = quant_staging.data();
+        compress_input_size = quant_staging.size();
+        applied_quant = true;
+        quant_params.effective_error_bound = host_q.effective_error_bound_;
+        quant_params.scale = host_q.scale_;
+        quant_params.data_min = host_q.data_min_;
+        quant_params.data_max = host_q.data_max_;
+        quant_params.precision = host_q.precision_;
+        quant_params.bound_achievable = host_q.bound_achievable_;
+        HLOG(kDebug,
+             "NeuroPress quantize (host): {} -> {} bytes (precision={} eb={})",
+             input_size, compress_input_size, host_q.precision_,
+             context.error_bound_);
+      }
     }
 
     if (applied_quant) {
@@ -2780,8 +2846,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   std::vector<char> quant_staging;
   bool applied_quant = false;
   ctp::compress::preprocess::QuantizationResult quant_result;
-  if (requested_quant && ctx.error_bound_ > 0.0 && ctx.data_type_ == 1 &&
-      size >= sizeof(float) && (size % sizeof(float)) == 0) {
+  if (requested_quant && ctx.error_bound_ > 0.0 && size >= sizeof(float) &&
+      (size % sizeof(float)) == 0) {
     quant_result = ctp::compress::preprocess::Quantize<float>(
         reinterpret_cast<const float *>(src), size / sizeof(float),
         ctx.error_bound_);
