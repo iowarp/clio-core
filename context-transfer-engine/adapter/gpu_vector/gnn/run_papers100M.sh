@@ -141,14 +141,39 @@ if [ "$SKIP_AGG" = "0" ]; then
 fi
 
 echo "### 2. labels"
+# papers100M stores node_label as FLOAT32 with NaN for unlabeled nodes (only
+# ~1.39% carry a class). Streaming it straight to int64 turns every NaN into
+# INT64_MIN, which is not a class -- the first run trained against 111M
+# garbage labels and reported an accuracy that meant nothing. Convert
+# explicitly: NaN becomes -1 (the "no label" sentinel the trainer expects),
+# everything else casts.
 if [ ! -s "$WORK/labels.i64" ]; then
-  "$PY" "$HERE/gnn_stream_npz.py" --zip "$ZIP" --npz node-label --member node_label \
-      --dtype int64 > "$WORK/labels.i64" 2>/dev/null || {
-    echo "    no node_label member; synthesising"
+  "$PY" "$HERE/gnn_stream_npz.py" --zip "$ZIP" --npz node-label \
+      --member node_label > "$WORK/labels.raw" 2> "$WORK/labels.log" || true
+  if [ -s "$WORK/labels.raw" ]; then
+    "$PY" - "$WORK" "$N" <<'PYEOF'
+import sys
+import numpy as np
+work, N = sys.argv[1], int(sys.argv[2])
+raw = np.fromfile(f"{work}/labels.raw", dtype=np.float32)
+lab = np.full(N, -1, dtype=np.int64)
+n = min(N, raw.shape[0])
+v = raw[:n]
+ok = ~np.isnan(v)
+lab[:n][ok] = v[ok].astype(np.int64)
+lab.tofile(f"{work}/labels.i64")
+print(f"    labeled {int(ok.sum())} of {n} nodes "
+      f"({100.0 * ok.sum() / max(n, 1):.2f}%), classes "
+      f"{int(lab[lab >= 0].min()) if (lab >= 0).any() else -1}.."
+      f"{int(lab.max())}")
+PYEOF
+    rm -f "$WORK/labels.raw"
+  else
+    echo "    no node_label member; synthesising (accuracy will be meaningless)"
     "$PY" -c "
-import numpy as np,sys
+import numpy as np
 np.arange($N,dtype=np.int64).__mod__($C).tofile('$WORK/labels.i64')"
-  }
+  fi
 fi
 
 cat > "$WORK/tiered.yaml" <<EOF
