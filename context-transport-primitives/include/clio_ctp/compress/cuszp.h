@@ -228,8 +228,18 @@ class Cuszp : public Compressor {
     do {
       Prefix prefix;
       if (IsDeviceAccessible(input)) {
-        const cudaError_t pe = cudaMemcpy(&prefix, input, sizeof(Prefix),
-                                          cudaMemcpyDeviceToHost);
+        // STREAM-ORDERED, and it must be. The caller stages the compressed
+        // bytes into device memory with an ASYNC H2D on its own slot stream
+        // and then calls us; a plain cudaMemcpy here is ordered against the
+        // default stream, not that one, so it raced the staging copy and read
+        // zeros -- prefix.magic came back 0 and every page failed to decode.
+        // nvcomp never tripped this because it is handed its sizes as
+        // arguments and never reads its own input from the host.
+        cudaError_t pe = cudaMemcpyAsync(&prefix, input, sizeof(Prefix),
+                                         cudaMemcpyDeviceToHost, stream);
+        if (pe == cudaSuccess) {
+          pe = cudaStreamSynchronize(stream);
+        }
         if (pe != cudaSuccess) {
           CUSZP_TRACE("prefix D2H failed: %s", cudaGetErrorString(pe));
           break;

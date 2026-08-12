@@ -2140,6 +2140,82 @@ bool Runtime::LaunchDecompBatch(
   };
   if (stream == nullptr) return fail_all();
 
+  // GPU codecs OUTSIDE the nvcomp family decode here, one request at a time,
+  // instead of going through the chunk-table path below (which is nvcomp's
+  // format and which a cuszp blob can never parse).
+  //
+  // It has to happen on THIS thread. Decoding on the requesting worker was
+  // tried and hangs the runtime: GpuDecompress{To,From}Device wraps the call
+  // in CodecCtxGuard, i.e. the dedicated codec CUcontext, and a context switch
+  // cannot get in while the gather kernel's relaunch loop keeps the primary
+  // context busy -- measured as all 5 compute workers STALLED and zero epochs
+  // completed. The drain thread is the one place allowed to wait, and it runs
+  // in the PRIMARY context on the non-blocking stream pool, which is exactly
+  // why the nvcomp batch path works. Codec-internal synchronization is
+  // therefore fine here and no event is needed.
+  {
+    int gwire = 0;
+    if (!owners[0]->stored_bytes.empty() &&
+        owners[0]->stored_bytes.size() >= sizeof(CompressionHeader)) {
+      std::memcpy(&gwire, owners[0]->stored_bytes.data() + 4, 4);
+    } else if (owners[0]->src_device != nullptr) {
+      CompressionHeader h;
+      if (cudaMemcpyAsync(&h, owners[0]->src_device, sizeof(h),
+                          cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+          cudaStreamSynchronize(stream) == cudaSuccess && h.IsValid()) {
+        gwire = static_cast<int>(h.compress_lib_);
+      }
+    }
+    if (getenv("CLIO_CODEC_TRACE")) {
+      fprintf(stderr, "[GENERIC] gwire=%d gpu=%d nvbatch=%d owners=%zu\n",
+              gwire, (int)IsGpuCodec(gwire), (int)IsNvcompBatchedCodec(gwire),
+              owners.size());
+      fflush(stderr);
+    }
+    if (gwire > 0 && IsGpuCodec(gwire) && !IsNvcompBatchedCodec(gwire)) {
+      const size_t ghdr = sizeof(CompressionHeader);
+      auto codec = ctp::CompressionFactory::GetPreset(
+          ctp::CompressionFactory::NameForWireId(gwire),
+          ctp::CompressionPreset::BALANCED);
+      ctp::CompressionFactory::SetGpuStreamForThread(stream);
+      for (auto &pd : owners) {
+        bool gok = false;
+        if (codec && pd->stored_size > ghdr) {
+          CompressionHeader h;
+          const void *src = nullptr;
+          if (!pd->stored_bytes.empty()) {
+            std::memcpy(&h, pd->stored_bytes.data(), ghdr);
+            src = pd->stored_bytes.data();
+          } else if (cudaMemcpyAsync(&h, pd->src_device, ghdr,
+                                     cudaMemcpyDeviceToHost,
+                                     stream) == cudaSuccess &&
+                     cudaStreamSynchronize(stream) == cudaSuccess) {
+            src = pd->src_device;
+          }
+          if (src != nullptr && h.IsValid()) {
+            const size_t payload =
+                h.compressed_size_ != 0 ? static_cast<size_t>(h.compressed_size_)
+                                        : pd->stored_size - ghdr;
+            size_t out = pd->dst_bytes;
+            gok = codec->Decompress(
+                pd->dst, out,
+                const_cast<char *>(static_cast<const char *>(src)) + ghdr,
+                payload);
+          }
+        }
+        if (getenv("CLIO_CODEC_TRACE")) {
+          fprintf(stderr, "[GENERIC] decode ok=%d stored=%zu dst=%zu\n",
+                  (int)gok, pd->stored_size, pd->dst_bytes);
+          fflush(stderr);
+        }
+        pd->ok = gok;
+        pd->done.store(true, std::memory_order_release);
+      }
+      ctp::CompressionFactory::SetGpuStreamForThread(nullptr);
+      return true;
+    }
+  }
+
   {
     const unsigned long long g =
         tier_write_gen_.load(std::memory_order_acquire);
@@ -3161,8 +3237,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
             // cache, or with ONE batched pinned read for new blobs. A page
             // the compressor stored raw simply fails the parse there and
             // falls back per-record.
-            if (tier != nullptr &&
-                IsNvcompBatchedCodec(task->context_.compress_lib_)) {
+            if (tier != nullptr && IsGpuCodec(task->context_.compress_lib_)) {
               {
                 // Launch OUR OWN decode and yield-poll its event: same shape
                 // as the raw path (worker enqueues its transfer, polls its
@@ -3207,7 +3282,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
           if (dget->GetReturnCode() == 0) {
             // No worker-side snapshot (a sync cudaMemcpy per fault); the
             // drain reads headers batched and pinned, one wait per NEW blob.
-            if (IsNvcompBatchedCodec(task->context_.compress_lib_)) {
+            if (IsGpuCodec(task->context_.compress_lib_)) {
               auto req = std::make_shared<PendingDecomp>();
               req->src_device = dscratch;
               req->stored_size = stored_size;
@@ -3281,8 +3356,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       // retried until the read gave up. Everything else device-executable
       // falls through to GpuDecompressToDevice below, which is codec-agnostic
       // and decodes straight into the page.
-      if (dev_ok && batch_enabled_ &&
-          IsNvcompBatchedCodec(header->compress_lib_)) {
+      if (dev_ok && batch_enabled_ && IsGpuCodec(header->compress_lib_)) {
         // Hand the page to the drainer and wait on our OWN flag only; nothing
         // here is responsible for another request's progress.
         auto req = std::make_shared<PendingDecomp>();
@@ -3469,7 +3543,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       if (tier == nullptr) continue;
       // No snapshot: see the single-page site. The context carries the
       // codec; the drain owns header parsing.
-      if (!IsNvcompBatchedCodec(task->context_.compress_lib_)) continue;
+      if (!IsGpuCodec(task->context_.compress_lib_)) continue;
       auto r = std::make_shared<PendingDecomp>();
       r->src_stable = true;      // the blob's home on the tier
       r->src_device = tier + loff;
@@ -3492,7 +3566,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     char *sp_slab = nullptr;
     std::vector<clio::run::u32> sp_idx;
     std::vector<clio::run::u64> sp_sz;
-    if (IsNvcompBatchedCodec(task->context_.compress_lib_)) {
+    if (IsGpuCodec(task->context_.compress_lib_)) {
       clio::run::u64 slot_b = 0;
       for (clio::run::u32 i = 0; i < n; ++i) {
         if (reqs[i]) continue;
