@@ -103,24 +103,80 @@ struct CompressionHeader {
   uint32_t magic_;            // Magic number to identify compressed data
   uint32_t compress_lib_;     // Compression library ID
   uint32_t compress_preset_;  // Compression preset | shuffle elem size << 8
+  /**
+   * Compressed payload length in bytes, excluding this header. 0 = "not
+   * recorded", for blobs written before this field existed.
+   *
+   * NeuroPress carries the same thing (compression_header.h:64,
+   * `uint64_t compressed_size; // Size of compressed data (after header)`)
+   * and reads it straight out of the blob, bounds-checking it against the
+   * buffer it was handed (gpucompress_compress.cpp:1199-1202) -- a bad value
+   * is GPUCOMPRESS_ERROR_INVALID_HEADER, never a guess. Without it Clio had
+   * to derive the length by subtracting the header from an AsyncGetBlobSize
+   * RPC, and fall back to the caller's LOGICAL size when that query failed
+   * -- which over-reads past the real stream into uninitialized memory and,
+   * for LZ4, surfaces as success with a garbage size (see Decompress()).
+   *
+   * uint32_t, not uint64_t, because it lives in the 4 padding bytes the
+   * struct already wasted between compress_preset_ and original_size_: the
+   * header is the on-disk format and is static_assert-ed at 24 bytes, so
+   * growing it would strand every existing blob. A chunk large enough to
+   * overflow 32 bits is far beyond anything this path compresses (HDF5
+   * chunks here are single-digit MB), and IsValid() rejects the case anyway.
+   */
+  uint32_t compressed_size_;
   uint64_t original_size_;    // Original uncompressed size
 
   CompressionHeader()
       : magic_(kMagic),
         compress_lib_(0),
         compress_preset_(0),
+        compressed_size_(0),
         original_size_(0) {}
 
-  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size)
+  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size,
+                    uint64_t compressed_size)
       : magic_(kMagic),
         compress_lib_(lib),
         compress_preset_(preset),
+        // Anything that does not fit records as "not recorded" rather than
+        // truncating: a wrong length is worse than an absent one, since the
+        // read side would trust it.
+        compressed_size_(compressed_size <= UINT32_MAX
+                             ? static_cast<uint32_t>(compressed_size)
+                             : 0u),
         original_size_(orig_size) {}
 
   bool IsValid() const { return magic_ == kMagic; }
+
+  /**
+   * @brief Payload length to feed the decompressor, or 0 if unusable.
+   *
+   * @param physical_size Total stored bytes (header + payload) as the caller
+   *   knows them, used as the bound.
+   *
+   * Mirrors upstream's two checks: the addition must not wrap, and header +
+   * payload must fit inside the bytes actually available. Returns 0 when the
+   * field is absent (old blob) or fails either check, so the caller can fall
+   * back to its existing size-query path instead of trusting a bad value.
+   * The padding this field occupies was never explicitly zeroed before, so a
+   * pre-existing blob can carry arbitrary bits here -- the bound check is
+   * what makes reading it safe, not an assumption that it is 0.
+   */
+  size_t PayloadSize(size_t physical_size) const {
+    if (compressed_size_ == 0) return 0;
+    const size_t payload = static_cast<size_t>(compressed_size_);
+    const size_t total = sizeof(CompressionHeader) + payload;
+    if (total < payload) return 0;             // wraparound
+    if (total > physical_size) return 0;       // does not fit what we have
+    return payload;
+  }
 };
 static_assert(sizeof(CompressionHeader) == 24,
-              "CompressionHeader must be 24 bytes");
+              "CompressionHeader must be 24 bytes -- it is the on-disk "
+              "format; growing it strands every already-written blob");
+static_assert(offsetof(CompressionHeader, original_size_) == 16,
+              "compressed_size_ must occupy the former padding at offset 12");
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1481,7 +1537,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // read side must not try to invert it.
       CompressionHeader header(context.compress_lib_,
                                PackPreset(preset_id, applied_shuffle),
-                               input_size);
+                               input_size, compressed_size);
       ctp::ipc::ShmPtr<> compressed_shm_ptr;
       ctp::ipc::FullPtr<char> compressed_shm;  // Only used off the device path.
 
@@ -1729,9 +1785,20 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
 
       auto decompress_start = std::chrono::high_resolution_clock::now();
 
-      // Get compressed data (after header)
+      // Get compressed data (after header). Prefer the length the WRITER
+      // recorded in the header over deriving it from expected_size: the
+      // latter came from an AsyncGetBlobSize RPC that silently falls back to
+      // the caller's LOGICAL (uncompressed) size, which is only an upper
+      // bound -- feeding that to the decompressor over-reads past the real
+      // stream into the buffer's uninitialized tail. NeuroPress reads its
+      // own header.compressed_size the same way and bounds-checks it
+      // (gpucompress_compress.cpp:1199-1202); PayloadSize() applies the same
+      // two checks and returns 0 if the field is absent or implausible, in
+      // which case we keep the old derivation.
       char* compressed_data = temp_buffer.ptr_ + header_size;
-      size_t compressed_size = expected_size - header_size;
+      const size_t recorded_size = header->PayloadSize(expected_size);
+      size_t compressed_size =
+          (recorded_size > 0) ? recorded_size : (expected_size - header_size);
 
       // Decompress to output buffer
       auto output_fullptr =
@@ -2131,7 +2198,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   // back as "not shuffled" or the read side inverts a transform that never
   // ran. Same rule Runtime::Compress follows.
   CompressionHeader header(ctx.compress_lib_,
-                           PackPreset(requested_preset, applied_shuffle), size);
+                           PackPreset(requested_preset, applied_shuffle), size,
+                           compressed_size);
   std::memcpy(shm.ptr_, &header, header_size);
   std::memcpy(shm.ptr_ + header_size, compressed.data(), compressed_size);
   double ms = std::chrono::duration<double, std::milli>(
@@ -2179,11 +2247,21 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   if (!decompressor) {
     return 3;
   }
+  // Writer-recorded payload length when present, else the old derivation.
+  // This path already aborts on a failed size query rather than guessing, so
+  // it was never exposed to the over-read Runtime::Decompress could hit --
+  // but reading the same field here keeps the two readers agreeing on what a
+  // blob means, which is the property that broke when only one of them
+  // understood the shuffle bits.
+  const size_t recorded_size = header->PayloadSize(stored_size);
+  const size_t payload_size = (recorded_size > 0)
+                                  ? recorded_size
+                                  : (stored_size - sizeof(CompressionHeader));
   size_t decompressed = header->original_size_;
   if (!decompressor->Decompress(dst, decompressed,
                                 const_cast<char *>(stored) +
                                     sizeof(CompressionHeader),
-                                stored_size - sizeof(CompressionHeader))) {
+                                payload_size)) {
     return 5;
   }
 
