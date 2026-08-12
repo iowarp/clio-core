@@ -293,7 +293,8 @@ bool PrepareLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
                    size_t elem_size, int *blocks, int *threads) {
   if (!in || !out || num_bytes == 0) return false;
   if (elem_size != 2 && elem_size != 4 && elem_size != 8) return false;
-  if (num_bytes < elem_size) return false;
+  // Sub-element buffers are copied verbatim, not rejected -- same as the
+  // host routines and as NeuroPress's byte_shuffle_simple.
   *threads = 256;
   const size_t num_chunks =
       (num_bytes + kShuffleChunkBytes - 1) / kShuffleChunkBytes;

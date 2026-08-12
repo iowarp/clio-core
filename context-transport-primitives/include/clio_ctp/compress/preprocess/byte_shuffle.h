@@ -76,9 +76,12 @@ inline bool ByteShuffle(const uint8_t* input,
     return false;
   }
 
-  if (num_bytes < elem_size) {
-    return false;
-  }
+  // A buffer shorter than one element is NOT an error: NeuroPress's
+  // byte_shuffle_simple handles it as num_elements = 0, leftover = the whole
+  // buffer, and copies it verbatim (byte_shuffle_kernels.cu:33-65). The loop
+  // below does the same, so nothing special is needed -- but the guard that
+  // used to reject it here would have made Compress() decline a shuffle
+  // upstream would have performed and recorded.
 
   // Planes are built WITHIN each kShuffleChunkBytes block, not across the
   // whole buffer -- see the constant's docs. Blocks are independent, so the
@@ -137,9 +140,12 @@ inline bool ByteUnshuffle(const uint8_t* input,
     return false;
   }
 
-  if (num_bytes < elem_size) {
-    return false;
-  }
+  // A buffer shorter than one element is NOT an error: NeuroPress's
+  // byte_shuffle_simple handles it as num_elements = 0, leftover = the whole
+  // buffer, and copies it verbatim (byte_shuffle_kernels.cu:33-65). The loop
+  // below does the same, so nothing special is needed -- but the guard that
+  // used to reject it here would have made Compress() decline a shuffle
+  // upstream would have performed and recorded.
 
   // Exact inverse of ByteShuffle's per-block walk above.
   for (size_t base = 0; base < num_bytes; base += kShuffleChunkBytes) {

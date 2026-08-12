@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <set>
+#include <string>
 
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/model/ranking.h"
@@ -95,6 +96,51 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
                      [](const CandidateConfig &c) {
                        return kNeuroPressTrainedGpuBaseIds.count(
                                  c.base_id) == 0;
+                     }),
+      candidates.end());
+
+  // Drop anything this build cannot actually construct.
+  //
+  // NeuroPress's action space and its buildable algorithms are the same set
+  // by construction -- nvcomp is a hard build dependency there, so all eight
+  // always exist and decodeAction can never name one that is missing. Clio's
+  // nvcomp support is optional (compress_factory.h's Make* helpers return
+  // nullptr under #if !CTP_ENABLE_NVCOMP), so without this the selector
+  // could rank, and pick, an algorithm that cannot be instantiated. That is
+  // not a degraded write but a LOST one: Compress() logs "Failed to create
+  // compressor", sets return_code_ 3 and returns WITHOUT a PutBlob, so on a
+  // build without nvcomp every dynamic put would drop its blob. Upstream's
+  // own primary path also refuses to store when the manager cannot be built
+  // (gpucompress_compress.cpp:485-489 returns GPUCOMPRESS_ERROR_COMPRESSION),
+  // so the fix is to preserve its invariant -- every action in the space is
+  // constructible -- rather than to reproduce an error path it cannot reach.
+  //
+  // ranking.h states this is the caller's job: "callers that only want
+  // available compressors should filter the returned list".
+  //
+  // Availability is fixed at build time, so it is resolved once rather than
+  // per chunk -- GetPreset() constructs a real compressor object, which is
+  // far too expensive to repeat for every candidate on every write.
+  // Probed ONCE for the whole process: availability is decided at build time,
+  // GetPreset() constructs a real compressor object (far too costly to repeat
+  // per candidate per write), and a function-local static's initialization is
+  // thread-safe, leaving the set read-only afterwards -- this runs from
+  // concurrent runtime tasks, so a lazily-mutated cache would race.
+  static const std::set<std::string> kAvailable = [] {
+    std::set<std::string> avail;
+    for (const auto &entry : ctp::compress::model::KnownCompressors()) {
+      if (kNeuroPressTrainedGpuBaseIds.count(entry.base_id) == 0) continue;
+      if (ctp::CompressionFactory::GetPreset(
+              entry.name, ctp::CompressionPreset::BALANCED) != nullptr) {
+        avail.insert(entry.name);
+      }
+    }
+    return avail;
+  }();
+  candidates.erase(
+      std::remove_if(candidates.begin(), candidates.end(),
+                     [](const CandidateConfig &c) {
+                       return kAvailable.count(c.library_name) == 0;
                      }),
       candidates.end());
 

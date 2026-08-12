@@ -1204,8 +1204,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // exploration signal at all.
             std::vector<char> alt_shuffle_staging;
             uint32_t alt_applied_shuffle = 0;
-            if (alt_shuffle != 0 && chunk_size >= alt_shuffle &&
-                (chunk_size % alt_shuffle) == 0) {
+            if (alt_shuffle != 0) {
               if (ctp::IsDevicePointer(alt_input)) {
                 char* alt_shuf_buf = nullptr;
                 ctp::ipc::AllocatorId alt_shuf_alloc =
@@ -1478,8 +1477,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       }
     } device_scratch{{&shuffle_device_alloc, &device_output_alloc_id}};
 
-    if (shuffle_elem != 0 && input_size >= shuffle_elem &&
-        (input_size % shuffle_elem) == 0) {
+    if (shuffle_elem != 0) {
       if (ctp::IsDevicePointer(input_ptr)) {
         // Shuffle ON the device. Staging down to shuffle on the host would
         // also leave input_ptr pointing at host memory, which flips
@@ -1855,8 +1853,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // Invert the byte-shuffle the write side applied. Must happen before
       // the caller ever sees the buffer -- a shuffled image is not the
       // user's data, it just happens to be the same length.
-      if (success && stored_shuffle != 0 && decompressed_size >= stored_shuffle &&
-          (decompressed_size % stored_shuffle) == 0) {
+      if (success && stored_shuffle != 0) {
         if (ctp::IsDevicePointer(output_fullptr.ptr_)) {
           // Unshuffle ON the device, into a scratch device buffer and back.
           // Staging down to the host would work but costs a D2H/H2D round
@@ -2311,8 +2308,7 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   // buffer on this path (the interposer stages through SHM), so the host
   // routines apply. Failing is the only safe outcome: returning shuffled
   // bytes is silent corruption, since they are the right LENGTH.
-  if (stored_shuffle != 0 && decompressed >= stored_shuffle &&
-      (decompressed % stored_shuffle) == 0) {
+  if (stored_shuffle != 0) {
     std::vector<char> unshuffled(decompressed);
     if (!ctp::compress::preprocess::ByteUnshuffle(
             reinterpret_cast<const uint8_t *>(dst), decompressed,
