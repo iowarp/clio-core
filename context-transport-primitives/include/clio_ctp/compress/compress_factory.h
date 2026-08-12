@@ -207,6 +207,12 @@ class CompressionFactory {
    *         same "no codec" value the CTE context uses, so a caller can pass
    *         the result straight through without a special case.
    */
+  /** Does this wire id name a codec that executes on the device? */
+  static bool IsGpuWireId(int wire_id) {
+    const CompressorInfo* info = FindByWireId(wire_id);
+    return info != nullptr && info->gpu;
+  }
+
   static int GetWireId(const std::string& library_name) {
     const CompressorInfo* info = FindByName(library_name);
     return info ? info->wire_id : 0;
@@ -265,16 +271,10 @@ class CompressionFactory {
  private:
   /** Storage for the process-wide GPU codec stream. Function-local static so
    *  the header stays free of a definition. */
-  static void *&GpuStreamSlot() {
-    static void *stream = nullptr;
-    return stream;
-  }
+  static void *&GpuStreamSlot() { return GpuCodecStreamProcess(); }
 
   /** Per-thread stream override; see SetGpuStreamForThread. */
-  static void *&GpuStreamTls() {
-    static thread_local void *stream = nullptr;
-    return stream;
-  }
+  static void *&GpuStreamTls() { return GpuCodecStreamThread(); }
 
   /** Signature of a function that constructs a compressor for a given preset. */
   using MakeFn = std::unique_ptr<Compressor> (*)(CompressionPreset);
@@ -300,6 +300,14 @@ class CompressionFactory {
     int base_id;       // ML scheme base id (frozen, append-only)
     bool single_mode;  // preset ignored; id always uses preset slot 2
     MakeFn make;       // constructor, or nullptr if backend disabled
+    // Does this codec execute on the DEVICE? Declared per codec rather than
+    // sniffed from the name. The compressor runtime gates its whole GPU path
+    // (batched decompress, device codec context, tier-aware fetch -- ten call
+    // sites) on this, and it used to test `name starts with "nvcomp-"`, which
+    // silently drove cuszp/cusz/zfp-sycl -- all GPU compressors -- down the
+    // HOST path: per-page cudaStreamCreate, cudaMalloc, and D2H staging on a
+    // kHBM fault that should never leave the device.
+    bool gpu;
   };
 
   // Construction helpers for single-mode and backend-guarded compressors.
@@ -522,29 +530,29 @@ class CompressionFactory {
    * only once per blob (in the factory setup path), never in the compress loop.
    */
   static const auto& Registry() {
-    //                                          name  wire base single  make
+    //                                          name  wire base single  make            gpu
     static constexpr std::array kRegistry = {
-        CompressorInfo{"brotli",      0,  6, false, &MakeBrotli},
-        CompressorInfo{"bzip2",       1,  1, false, &MakeBzip2},
-        CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc},
-        CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip},
-        CompressorInfo{"lz4",         4,  3, false, &MakeLz4},
-        CompressorInfo{"lzma",        5,  5, false, &MakeLzma},
-        CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy},
-        CompressorInfo{"sz3",         7, 11, false, &MakeSz3},
-        CompressorInfo{"zfp",         8, 10, false, &MakeZfp},
-        CompressorInfo{"zlib",        9,  4, false, &MakeZlib},
-        CompressorInfo{"zstd",       10,  2, false, &MakeZstd},
-        CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4},
-        CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy},
-        CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd},
-        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate},
-        CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
-        CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
-        CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
-        CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
-        CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
-        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
+        CompressorInfo{"brotli",      0,  6, false, &MakeBrotli, false},
+        CompressorInfo{"bzip2",       1,  1, false, &MakeBzip2, false},
+        CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc, false},
+        CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip, false},
+        CompressorInfo{"lz4",         4,  3, false, &MakeLz4, false},
+        CompressorInfo{"lzma",        5,  5, false, &MakeLzma, false},
+        CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy, false},
+        CompressorInfo{"sz3",         7, 11, false, &MakeSz3, false},
+        CompressorInfo{"zfp",         8, 10, false, &MakeZfp, false},
+        CompressorInfo{"zlib",        9,  4, false, &MakeZlib, false},
+        CompressorInfo{"zstd",       10,  2, false, &MakeZstd, false},
+        CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4, true},
+        CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy, true},
+        CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd, true},
+        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate, true},
+        CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate, true},
+        CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns, true},
+        CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp, true},
+        CompressorInfo{"cusz",            18, 20, false, &MakeCusz, true},
+        CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip, false},
+        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp, true},
     };
     return kRegistry;
   }

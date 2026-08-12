@@ -43,6 +43,17 @@
 #include <cstring>
 
 #include "compress.h"
+#include <cstdio>
+#include <cstdlib>
+
+#define CUSZP_TRACE(...)                                                      \
+  do {                                                                        \
+    if (std::getenv("CLIO_CUSZP_TRACE")) {                                    \
+      std::fprintf(stderr, "[CUSZP] " __VA_ARGS__);                           \
+      std::fprintf(stderr, "\n");                                            \
+      std::fflush(stderr);                                                    \
+    }                                                                         \
+  } while (0)
 
 namespace ctp {
 
@@ -108,7 +119,15 @@ class Cuszp : public Compressor {
     const size_t n = input_size / sizeof(float);
 
     cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Use the caller's pooled stream when one is set. Creating a stream per
+    // call is not just overhead: a cudaStreamCreate against a resident
+    // spinning kernel has deadlocked this runtime before, and on the
+    // device-to-device fault path the compressor runtime has already handed
+    // us a slot stream via SetGpuStreamForThread.
+    bool own_stream = false;
+    stream = static_cast<cudaStream_t>(GetGpuCodecStream());
+    if (stream == nullptr && (own_stream = true) &&
+        cudaStreamCreate(&stream) != cudaSuccess) {
       return false;
     }
     float *d_in = nullptr;
@@ -179,7 +198,7 @@ class Cuszp : public Compressor {
 
     if (d_cmp != nullptr) cudaFree(d_cmp);
     if (free_in) cudaFree(d_in);
-    cudaStreamDestroy(stream);
+    if (own_stream) cudaStreamDestroy(stream);
     return ok;
   }
 
@@ -190,7 +209,15 @@ class Cuszp : public Compressor {
     }
 
     cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Use the caller's pooled stream when one is set. Creating a stream per
+    // call is not just overhead: a cudaStreamCreate against a resident
+    // spinning kernel has deadlocked this runtime before, and on the
+    // device-to-device fault path the compressor runtime has already handed
+    // us a slot stream via SetGpuStreamForThread.
+    bool own_stream = false;
+    stream = static_cast<cudaStream_t>(GetGpuCodecStream());
+    if (stream == nullptr && (own_stream = true) &&
+        cudaStreamCreate(&stream) != cudaSuccess) {
       return false;
     }
     float *d_out = nullptr;
@@ -201,17 +228,28 @@ class Cuszp : public Compressor {
     do {
       Prefix prefix;
       if (IsDeviceAccessible(input)) {
-        if (cudaMemcpy(&prefix, input, sizeof(Prefix),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+        const cudaError_t pe = cudaMemcpy(&prefix, input, sizeof(Prefix),
+                                          cudaMemcpyDeviceToHost);
+        if (pe != cudaSuccess) {
+          CUSZP_TRACE("prefix D2H failed: %s", cudaGetErrorString(pe));
           break;
         }
       } else {
         std::memcpy(&prefix, input, sizeof(Prefix));
       }
-      if (prefix.magic != kMagic) break;  // not one of our blobs
+      if (prefix.magic != kMagic) {
+        CUSZP_TRACE("magic mismatch: got %x want %x (input_size=%zu dev=%d)",
+                    prefix.magic, kMagic, input_size,
+                    (int)IsDeviceAccessible(input));
+        break;  // not one of our blobs
+      }
 
       const size_t n = static_cast<size_t>(prefix.elems);
-      if (n * sizeof(float) > output_size) break;  // caller buffer too small
+      if (n * sizeof(float) > output_size) {
+        CUSZP_TRACE("output too small: need %zu have %zu", n * sizeof(float),
+                    output_size);
+        break;
+      }
       // `avail` = compressed bytes physically present in the blob (what Compress
       // retained: cuSZp's cmp_size for multi-block, or the full buffer for the
       // single-block case). `cmp_arg` = the cmp_size value cuSZp itself reported,
@@ -244,8 +282,14 @@ class Cuszp : public Compressor {
       cuSZp_decompress(d_out, d_stream, n, cmp_arg, prefix.eb, CUSZP_DIM_1D,
                        dims, CUSZP_TYPE_FLOAT,
                        static_cast<cuszp_mode_t>(prefix.mode), stream);
-      bool decoded = cudaStreamSynchronize(stream) == cudaSuccess &&
-                     cudaGetLastError() == cudaSuccess;
+      const cudaError_t se = cudaStreamSynchronize(stream);
+      const cudaError_t le = cudaGetLastError();
+      bool decoded = se == cudaSuccess && le == cudaSuccess;
+      if (!decoded) {
+        CUSZP_TRACE("decode failed: sync=%s last=%s n=%zu cmp_arg=%zu avail=%zu",
+                    cudaGetErrorString(se), cudaGetErrorString(le), n, cmp_arg,
+                    avail);
+      }
       if (decoded) {
         if (!out_is_device) {
           decoded = cudaMemcpy(output, d_out, n * sizeof(float),
@@ -260,7 +304,7 @@ class Cuszp : public Compressor {
 
     if (free_stream) cudaFree(d_stream);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+    if (own_stream) cudaStreamDestroy(stream);
     return ok;
   }
 

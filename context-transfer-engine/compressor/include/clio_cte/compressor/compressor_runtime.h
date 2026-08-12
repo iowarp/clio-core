@@ -726,6 +726,10 @@ private:
 #endif
   /** @return the CPU codec of the same family as a GPU codec, or 0 if none.
    *  Used on the device page-fault path, where a GPU codec cannot run. */
+  /** Eligible for nvcomp's BATCHED decompress API (nvcomp family only).
+   *  Distinct from IsGpuCodec, which means "must run on the device". */
+  static bool IsNvcompBatchedCodec(int wire_id);
+
   static int CpuEquivalentCodec(int gpu_wire_id);
 
   // Configuration

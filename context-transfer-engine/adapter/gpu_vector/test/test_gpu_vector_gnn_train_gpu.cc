@@ -131,10 +131,19 @@ void EnsureInit() {
       << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n\n"
       << "  - mod_name: clio_cte_core\n    pool_name: cte_core\n    pool_query: local\n    pool_id: \"512.0\"\n"
       << "    storage:\n"
+      // SCORE IS "PREFER LOWER". MaxBwDpe partitions targets into
+      // low_score (target_score_ <= blob_score) = PREFERRED and high_score =
+      // fallback, so the fast tier needs the LOW number. This was written the
+      // other way round (hbm 1.0, ram 0.5), which put kHBM permanently in the
+      // fallback group: measured "TIER SPLIT: kHBM 0MiB, DRAM 2MiB" -- a
+      // configured, scored, adequately sized HBM tier that received nothing.
+      // That in turn disabled the device-to-device page fault path, because
+      // the batched decoder only takes it for blobs that live on a device
+      // tier, so every fault fell back to host staging.
       << "      - path: \"hbm::cte_hbm_tier\"\n        bdev_type: \"hbm\"\n        capacity_limit: \""
-      << hbm_mib << "MB\"\n        score: 1.0\n"
+      << hbm_mib << "MB\"\n        score: 0.0\n"
       << "      - path: \"ram::cte_dram_tier\"\n        bdev_type: \"ram\"\n        capacity_limit: \""
-      << dram_mib << "MB\"\n        score: 0.5\n"
+      << dram_mib << "MB\"\n        score: 1.0\n"
       << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
@@ -746,6 +755,15 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   double ratio = stored ? (double)dataset_bytes / (double)stored : 0.0;
   std::fprintf(stderr, "[TRAIN] ETERNIA: stored A %lluMiB -> %lluMiB zstd (%.3fx) in %.2fs\n",
                (unsigned long long)(dataset_bytes >> 20), (unsigned long long)(stored >> 20), ratio, store_dt);
+  // WHICH TIER actually holds the bytes. The requirement is kHBM whenever it
+  // fits, and a config that merely DECLARES an HBM tier does not establish
+  // that: the DPE ranks targets by a predicted bandwidth model, so a scored
+  // HBM tier has been measured receiving zero blobs. Print the split so a run
+  // that quietly landed in DRAM cannot be reported as an HBM result.
+  std::fprintf(stderr, "[TRAIN] TIER SPLIT: kHBM %lluMiB, DRAM %lluMiB%s\n",
+               (unsigned long long)(hbm_used >> 20),
+               (unsigned long long)(dram_used >> 20),
+               hbm_used == 0 ? "   <-- VIOLATION: nothing landed in kHBM" : "");
 
   // The gather runs WIDE. It used to be one block of 32 threads, which copied
   // the whole matrix through a single warp on a single SM and cost 3.2x over

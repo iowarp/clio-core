@@ -38,6 +38,34 @@
 
 namespace ctp {
 
+/**
+ * Stream override storage for GPU codecs.
+ *
+ * It lives HERE, in the base header, and not in CompressionFactory, because a
+ * GPU codec header cannot include the factory -- the factory includes every
+ * codec header, so that direction is a cycle. CompressionFactory delegates to
+ * these so there is exactly one copy of the storage.
+ *
+ * A codec must prefer this stream over creating its own. Per-call
+ * cudaStreamCreate is not merely slow: it has deadlocked this runtime against
+ * a resident spinning kernel, and on the device-to-device page-fault path the
+ * compressor runtime has already provided a pooled slot stream.
+ */
+inline void *&GpuCodecStreamProcess() {
+  static void *stream = nullptr;
+  return stream;
+}
+inline void *&GpuCodecStreamThread() {
+  static thread_local void *stream = nullptr;
+  return stream;
+}
+/** @return the thread's stream override, else the process-wide one, else null
+ *  (meaning the default stream). */
+inline void *GetGpuCodecStream() {
+  void *tls = GpuCodecStreamThread();
+  return tls != nullptr ? tls : GpuCodecStreamProcess();
+}
+
 class Compressor {
  public:
   Compressor() = default;

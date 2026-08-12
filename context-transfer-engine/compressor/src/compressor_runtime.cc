@@ -2711,6 +2711,31 @@ bool Runtime::IsGpuCodec(int wire_id) {
   if (wire_id <= 0) {
     return false;
   }
+  // Ask the registry, do NOT sniff the name. This used to be
+  // `name.rfind("nvcomp-", 0) == 0`, which is true only of the nvcomp family
+  // and therefore reported cuszp, cusz and zfp-sycl -- all GPU compressors --
+  // as CPU codecs. Ten call sites gate the entire device path on this, so the
+  // effect was that selecting cuszp silently ran it host-side: no batched
+  // decompress, a cudaStreamCreate and two cudaMallocs per page, and D2H
+  // staging on a kHBM fault that never needed to leave the device.
+  return ctp::CompressionFactory::IsGpuWireId(wire_id);
+}
+
+bool Runtime::IsNvcompBatchedCodec(int wire_id) {
+  // "Executes on the device" and "can be decoded by nvcomp's BATCHED API" are
+  // different properties, and conflating them is what made cuszp unusable.
+  // The batch drain funnels every request into nvcompBatched<Algo>Decompress,
+  // which is keyed on the wire id and only knows the nvcomp family; a cuszp
+  // blob handed to it cannot decode, so every page failed and retried ~20x
+  // (345s for a 10-epoch run, 0/8 pages correct).
+  //
+  // IsGpuCodec keeps its meaning -- must run on the device, never substitute a
+  // CPU codec. THIS predicate says only "eligible for the nvcomp batch"; other
+  // GPU codecs take the codec-agnostic GpuDecompress{To,From}Device path,
+  // which is device-to-device already.
+  if (wire_id <= 0) {
+    return false;
+  }
   const std::string name = ctp::CompressionFactory::NameForWireId(wire_id);
   return name.rfind("nvcomp-", 0) == 0;
 }
@@ -3136,7 +3161,8 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
             // cache, or with ONE batched pinned read for new blobs. A page
             // the compressor stored raw simply fails the parse there and
             // falls back per-record.
-            if (tier != nullptr && IsGpuCodec(task->context_.compress_lib_)) {
+            if (tier != nullptr &&
+                IsNvcompBatchedCodec(task->context_.compress_lib_)) {
               {
                 // Launch OUR OWN decode and yield-poll its event: same shape
                 // as the raw path (worker enqueues its transfer, polls its
@@ -3181,7 +3207,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
           if (dget->GetReturnCode() == 0) {
             // No worker-side snapshot (a sync cudaMemcpy per fault); the
             // drain reads headers batched and pinned, one wait per NEW blob.
-            if (IsGpuCodec(task->context_.compress_lib_)) {
+            if (IsNvcompBatchedCodec(task->context_.compress_lib_)) {
               auto req = std::make_shared<PendingDecomp>();
               req->src_device = dscratch;
               req->stored_size = stored_size;
@@ -3249,7 +3275,14 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       const bool dev_ok =
           dst_dev.ptr_ != nullptr && ctp::IsDeviceAccessible(dst_dev.ptr_);
-      if (dev_ok && batch_enabled_) {
+      // The drainer decodes with nvcompBatched<Algo>Decompress, so only the
+      // nvcomp family may be handed to it. This site had NO codec check at
+      // all, so a cuszp page went to the drainer, failed to decode, and was
+      // retried until the read gave up. Everything else device-executable
+      // falls through to GpuDecompressToDevice below, which is codec-agnostic
+      // and decodes straight into the page.
+      if (dev_ok && batch_enabled_ &&
+          IsNvcompBatchedCodec(header->compress_lib_)) {
         // Hand the page to the drainer and wait on our OWN flag only; nothing
         // here is responsible for another request's progress.
         auto req = std::make_shared<PendingDecomp>();
@@ -3436,7 +3469,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       if (tier == nullptr) continue;
       // No snapshot: see the single-page site. The context carries the
       // codec; the drain owns header parsing.
-      if (!IsGpuCodec(task->context_.compress_lib_)) continue;
+      if (!IsNvcompBatchedCodec(task->context_.compress_lib_)) continue;
       auto r = std::make_shared<PendingDecomp>();
       r->src_stable = true;      // the blob's home on the tier
       r->src_device = tier + loff;
@@ -3459,7 +3492,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     char *sp_slab = nullptr;
     std::vector<clio::run::u32> sp_idx;
     std::vector<clio::run::u64> sp_sz;
-    if (IsGpuCodec(task->context_.compress_lib_)) {
+    if (IsNvcompBatchedCodec(task->context_.compress_lib_)) {
       clio::run::u64 slot_b = 0;
       for (clio::run::u32 i = 0; i < n; ++i) {
         if (reqs[i]) continue;
