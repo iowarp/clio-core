@@ -142,6 +142,21 @@ inline uint32_t UnpackVersion(uint32_t packed) {
  * QuantHeaderExtension. Type is not encoded because LINEAR is the only
  * quantizer either side implements.
  */
+/**
+ * @brief Analytical PSNR for linear quantization, verbatim from upstream.
+ *
+ * gpucompress_compress.cpp:37-41 -- expected MSE for uniform error in
+ * [-eb, eb] is eb^2/3, so PSNR = 10*log10(range^2 / MSE), capped at 120 dB.
+ * Returns -1 for a degenerate range or bound, which is upstream's "PSNR
+ * undefined" sentinel and the value that makes the SGD skip the head.
+ */
+inline double AnalyticalPsnr(double data_range, double error_bound) {
+  if (data_range <= 0.0 || error_bound <= 0.0) return -1.0;
+  const double mse_expected = (error_bound * error_bound) / 3.0;
+  return std::min(10.0 * std::log10((data_range * data_range) / mse_expected),
+                  120.0);
+}
+
 constexpr uint32_t kQuantShift = 24;
 constexpr uint32_t kQuantEnabledBit = 1u;
 constexpr uint32_t kQuantPrecisionShift = 1;
@@ -1255,6 +1270,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           uint32_t winner_shuffle = 0;
           double winner_ratio = 0.0;
           double winner_time_ms = 0.0;
+          bool winner_quant = false;
+          ctp::compress::preprocess::DeviceQuantizeParams winner_quant_params;
 
           for (const auto* alt : alternatives) {
             std::string alt_name =
@@ -1264,6 +1281,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // alternative (1 | 4<<8 = 1025) silently reads as BALANCED.
             const uint32_t alt_preset_id =
                 UnpackPreset(static_cast<uint32_t>(alt->compress_preset_));
+            const bool alt_wants_quant =
+                UnpackQuantEnabled(static_cast<uint32_t>(alt->compress_preset_));
             const uint32_t alt_shuffle =
                 UnpackShuffle(static_cast<uint32_t>(alt->compress_preset_));
             ctp::CompressionPreset alt_preset =
@@ -1284,6 +1303,40 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 static_cast<char*>(chunk_data), chunk_size,
                 alt->compress_lib_, alt_device_staging);
 
+            // Apply the alternative's OWN quantization first, exactly as the
+            // primary does and as upstream does per explored slot
+            // (gpucompress_compress.cpp:826-840: quantize, update
+            // alt_compress_size, THEN shuffle the quantized buffer).
+            // Measuring an unquantized buffer while crediting a quantized
+            // action would mislabel the sample -- the same defect the
+            // shuffle handling below was fixed for.
+            size_t alt_compress_size = chunk_size;
+            bool alt_applied_quant = false;
+            ctp::compress::preprocess::DeviceQuantizeParams alt_quant_params;
+            if (alt_wants_quant && context.error_bound_ > 0.0 &&
+                context.data_type_ == 1 && chunk_size >= sizeof(float) &&
+                (chunk_size % sizeof(float)) == 0 &&
+                ctp::IsDevicePointer(alt_input)) {
+              char* alt_q_buf = nullptr;
+              ctp::ipc::AllocatorId alt_q_alloc =
+                  CLIO_IPC->AllocateAndRegisterGpuBackend(
+                      /*gpu_id=*/0,
+                      clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                      chunk_size, &alt_q_buf);
+              size_t alt_q_bytes = 0;
+              if (!alt_q_alloc.IsNull()) {
+                explore_gpu_scratch.push_back(alt_q_alloc);
+                if (ctp::compress::preprocess::QuantizeDevice(
+                        alt_input, chunk_size / sizeof(float),
+                        context.error_bound_, alt_q_buf, &alt_q_bytes,
+                        &alt_quant_params)) {
+                  alt_input = alt_q_buf;
+                  alt_compress_size = alt_q_bytes;
+                  alt_applied_quant = true;
+                }
+              }
+            }
+
             // Apply the alternative's OWN byte-shuffle before measuring it.
             // Upstream reconstructs the full preprocessing for each explored
             // action -- decodeAction gives it shuf_size, and it shuffles into
@@ -1303,10 +1356,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     CLIO_IPC->AllocateAndRegisterGpuBackend(
                         /*gpu_id=*/0,
                         clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-                        chunk_size, &alt_shuf_buf);
+                        alt_compress_size, &alt_shuf_buf);
                 if (!alt_shuf_alloc.IsNull()) {
                   if (ctp::compress::preprocess::ByteShuffleDevice(
-                          alt_input, alt_shuf_buf, chunk_size, alt_shuffle)) {
+                          alt_input, alt_shuf_buf, alt_compress_size, alt_shuffle)) {
                     alt_input = alt_shuf_buf;
                     alt_applied_shuffle = alt_shuffle;
                   }
@@ -1316,10 +1369,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   explore_gpu_scratch.push_back(alt_shuf_alloc);
                 }
               } else {
-                alt_shuffle_staging.resize(chunk_size);
+                alt_shuffle_staging.resize(alt_compress_size);
                 if (ctp::compress::preprocess::ByteShuffle(
                         reinterpret_cast<const uint8_t*>(alt_input),
-                        chunk_size, alt_shuffle,
+                        alt_compress_size, alt_shuffle,
                         reinterpret_cast<uint8_t*>(
                             alt_shuffle_staging.data()))) {
                   alt_input = alt_shuffle_staging.data();
@@ -1328,14 +1381,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               }
             }
 
-            size_t alt_worst_case = chunk_size + (chunk_size / 20) + 1024;
+            size_t alt_worst_case = alt_compress_size + (alt_compress_size / 20) + 1024;
             std::vector<char> alt_output(alt_worst_case);
             size_t alt_compressed_size = alt_worst_case;
 
             auto alt_start = std::chrono::high_resolution_clock::now();
             bool alt_ok = alt_compressor->Compress(
                 alt_output.data(), alt_compressed_size, alt_input,
-                chunk_size);
+                alt_compress_size);
             double alt_time_ms = std::chrono::duration<double, std::milli>(
                                      std::chrono::high_resolution_clock::now() -
                                      alt_start)
@@ -1376,6 +1429,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 winner_shuffle = alt_applied_shuffle;
                 winner_ratio = alt_ratio;
                 winner_time_ms = alt_time_ms;
+                // Carry the quantization state too. Without it the adopted
+                // blob's header would say "not quantized" while its payload
+                // IS quantized -- unrecoverable on read.
+                winner_quant = alt_applied_quant;
+                winner_quant_params = alt_quant_params;
               }
             }
 
@@ -1406,12 +1464,27 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // size multiple, failed allocation) means the measurement above
             // belongs to the unshuffled variant.
             alt_candidate.byte_shuffle = alt_applied_shuffle != 0;
+            alt_candidate.quantize = alt_applied_quant;
+            alt_candidate.error_bound =
+                alt_applied_quant ? context.error_bound_ : 0.0;
             alt_candidate.library_name = alt_name;
 
             explore_features.push_back(
                 ctp::compress::model::MakeCompressionFeatures(alt_data,
                                                                alt_candidate));
-            explore_labels.emplace_back(static_cast<float>(alt_ratio), 0.0f,
+            // PSNR per explored slot, as upstream computes it
+            // (gpucompress_compress.cpp:900, analytical_psnr from the slot's
+            // own quantization range). -1 for a lossless alternative, which
+            // makes the SGD withhold the PSNR gradient rather than train it
+            // toward 120 dB.
+            const double alt_psnr =
+                alt_applied_quant
+                    ? AnalyticalPsnr(
+                          alt_quant_params.data_max - alt_quant_params.data_min,
+                          alt_quant_params.effective_error_bound)
+                    : -1.0;
+            explore_labels.emplace_back(static_cast<float>(alt_ratio),
+                                        static_cast<float>(alt_psnr),
                                         static_cast<float>(alt_time_ms),
                                         0.0f);
           }
@@ -1438,12 +1511,23 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // Context is updated the same way upstream updates its diagnostics
           // state, so what the blob records matches what it now contains.
           if (have_winner) {
-            const size_t hdr_size = sizeof(CompressionHeader);
+            const size_t hdr_size =
+                sizeof(CompressionHeader) +
+                (winner_quant ? sizeof(QuantHeaderExtension) : 0);
             const size_t winner_total = winner_payload.size() + hdr_size;
             CompressionHeader winner_header(
                 static_cast<uint32_t>(winner_lib),
-                PackPreset(winner_preset_id, winner_shuffle), chunk_size,
-                winner_payload.size());
+                PackPreset(winner_preset_id, winner_shuffle) |
+                    PackQuant(winner_quant, winner_quant_params.precision),
+                chunk_size, winner_payload.size());
+            QuantHeaderExtension winner_ext{};
+            if (winner_quant) {
+              winner_ext.error_bound =
+                  winner_quant_params.effective_error_bound;
+              winner_ext.scale = winner_quant_params.scale;
+              winner_ext.data_min = winner_quant_params.data_min;
+              winner_ext.data_max = winner_quant_params.data_max;
+            }
 
             auto winner_shm = CLIO_IPC->AllocateBuffer(winner_total);
             if (winner_shm.IsNull()) {
@@ -1451,14 +1535,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                    "NeuroPress explore: winner found but SHM allocation "
                    "failed; keeping the primary's stored result");
             } else {
-              std::memcpy(winner_shm.ptr_, &winner_header, hdr_size);
+              std::memcpy(winner_shm.ptr_, &winner_header,
+                          sizeof(CompressionHeader));
+              if (winner_quant) {
+                std::memcpy(winner_shm.ptr_ + sizeof(CompressionHeader),
+                            &winner_ext, sizeof(winner_ext));
+              }
               std::memcpy(winner_shm.ptr_ + hdr_size, winner_payload.data(),
                           winner_payload.size());
 
               Context winner_ctx = context;
               winner_ctx.compress_lib_ = winner_lib;
-              winner_ctx.compress_preset_ =
-                  static_cast<int>(PackPreset(winner_preset_id, winner_shuffle));
+              winner_ctx.compress_preset_ = static_cast<int>(
+                  PackPreset(winner_preset_id, winner_shuffle) |
+                  PackQuant(winner_quant, winner_quant_params.precision));
               winner_ctx.transform_flags_ |=
                   clio::cte::core::kBlobTransformed |
                   clio::cte::core::kBlobTransformCompressed;
@@ -1511,6 +1601,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   win_candidate.base_id = win_base_id;
                   win_candidate.preset_id = static_cast<int>(winner_preset_id);
                   win_candidate.byte_shuffle = winner_shuffle != 0;
+                  win_candidate.quantize = winner_quant;
+                  win_candidate.error_bound =
+                      winner_quant ? context.error_bound_ : 0.0;
                   win_candidate.library_name = win_name;
                   RecordDecompFeatures(
                       task->blob_name_.str(),
@@ -1518,9 +1611,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                           win_data, win_candidate));
                 }
                 HLOG(kDebug,
-                     "NeuroPress explore: adopted {} (ratio={} time={}ms) over "
-                     "the primary",
-                     win_name, winner_ratio, winner_time_ms);
+                     "NeuroPress explore: adopted {} (ratio={} time={}ms "
+                     "quant={} shuffle={}) over the primary",
+                     win_name, winner_ratio, winner_time_ms,
+                     winner_quant ? winner_quant_params.precision : 0,
+                     winner_shuffle);
               }
             }
           }
@@ -1868,6 +1963,22 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           static_cast<double>(input_size) /
           static_cast<double>(compressed_size);
       context.actual_compress_time_ms_ = compress_time;
+
+      // PSNR is DEFINED only when quantization ran. Upstream seeds
+      // primary_actual_psnr = -1.0 ("lossless -> skip PSNR MAPE",
+      // gpucompress_compress.cpp:388) and overwrites it only inside
+      // `if (d_quantized && quant_result.isValid())` (:653-658). A negative
+      // value makes the SGD withhold the PSNR gradient entirely
+      // (nn_gpu.cu:812-814), which is exactly right: a lossless codec has no
+      // reconstruction error to learn from.
+      if (applied_quant) {
+        const double psnr = AnalyticalPsnr(
+            quant_params.data_max - quant_params.data_min,
+            quant_params.effective_error_bound);
+        if (psnr > 0.0) context.actual_psnr_db_ = psnr;
+      } else {
+        context.actual_psnr_db_ = -1.0;
+      }
 
       // Record the shuffle that was ACTUALLY applied, not the one requested:
       // if ByteShuffle declined (unsupported element size, or a size that is

@@ -1602,7 +1602,17 @@ struct Context {
   double actual_compression_ratio_;  // Actual compression ratio
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
-  double actual_psnr_db_;  // Actual PSNR for lossy compression (0 if lossless)
+  // Actual PSNR achieved. Sentinels follow NeuroPress exactly
+  // (gpucompress_compress.cpp:388, nn_gpu.cu:804-815):
+  //   < 0  -> undefined; the PSNR head gets NO gradient. This is what a
+  //           LOSSLESS compress must report -- upstream seeds
+  //           primary_actual_psnr = -1.0f and only overwrites it when
+  //           quantization actually ran.
+  //   == 0 -> "lossless" in the training sense: trains toward 120 dB.
+  //   > 0  -> the measured value.
+  // Defaulting to 0 meant every lossless chunk trained the PSNR head toward
+  // 120 dB, where upstream trains it on none of them.
+  double actual_psnr_db_;
 
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
@@ -1632,7 +1642,7 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0) {
+        actual_psnr_db_(-1.0) {
   }
 
   template <class Archive>
