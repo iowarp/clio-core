@@ -42,7 +42,11 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
   file.read(reinterpret_cast<char*>(&hidden_dim), 4);
   file.read(reinterpret_cast<char*>(&output_dim), 4);
 
-  if (!file || magic != 0x4E4E5754 || version != 2) {
+  // Accept v1 as well as v2. Upstream reads both (`if (version != 1 &&
+  // version != 2)` -- nn_gpu.cu:1674) and differs only in the trailing
+  // feature bounds, which v1 files do not carry. Rejecting v1 meant Clio
+  // could not load a weight file the original project loads fine.
+  if (!file || magic != 0x4E4E5754 || (version != 1 && version != 2)) {
     return false;
   }
 
@@ -113,14 +117,24 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
     }
   }
 
-  // Read feature bounds (v2+): x_mins[8], x_maxs[8]
+  // Feature bounds are a v2 addition. A v1 file simply ends here, and
+  // upstream fills in wide-open defaults rather than failing
+  // (nn_gpu.cu:1745-1750). Nothing consults these at inference on either
+  // side -- they exist for out-of-distribution reporting -- so the defaults
+  // cost nothing beyond making v1 loadable.
   x_mins_.resize(input_dim);
   x_maxs_.resize(input_dim);
-  file.read(reinterpret_cast<char*>(x_mins_.data()), input_dim * 4);
-  file.read(reinterpret_cast<char*>(x_maxs_.data()), input_dim * 4);
-
-  if (!file) {
-    return false;
+  if (version >= 2) {
+    file.read(reinterpret_cast<char*>(x_mins_.data()), input_dim * 4);
+    file.read(reinterpret_cast<char*>(x_maxs_.data()), input_dim * 4);
+    if (!file) {
+      return false;
+    }
+  } else {
+    for (uint32_t i = 0; i < input_dim; ++i) {
+      x_mins_[i] = -1e30f;
+      x_maxs_[i] = 1e30f;
+    }
   }
 
   // Online-learning state: fresh on every Load(), matching upstream's
@@ -254,7 +268,7 @@ int NeuroPressAlgoIdForBaseId(int base_id) {
 }  // namespace
 
 std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
-    const CompressionFeatures& features) const {
+    const CompressionFeatures& features, bool apply_lossless_sentinel) const {
   // NeuroPress expects: [algo_id, quant, shuffle, error_bound, data_size,
   // entropy, mad, second_derivative]
   int base_id = static_cast<int>(features.library_config_id) / 10;
@@ -268,8 +282,12 @@ std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
   // configs." Passing 0.0 put input 3 about 2.4e-6 standard deviations off
   // upstream's value for every lossless candidate, which is every candidate
   // Clio ranks.
+  // Sentinel for INFERENCE only -- see the header. Training feeds the raw
+  // bound on both SGD paths, so a lossless config contributes 0.0 there.
   const float error_bound_enc =
-      features.quantize ? static_cast<float>(features.error_bound) : 1e-7f;
+      (apply_lossless_sentinel && !features.quantize)
+          ? 1e-7f
+          : static_cast<float>(features.error_bound);
 
   return {algo_id,
           static_cast<float>(features.quantize),      // quant preprocessor
@@ -396,6 +414,17 @@ std::vector<float> NeuroPressNNPredictor::InverseTransform(
   // real chunk_size/bandwidth). Output 3 (psnr) is linear/identity; output
   // 7 (ssim_nlog) needs a different, non-expm1 inverse this predictor
   // doesn't currently expose (Predict() never reads index 7).
+  // Output 7 (ssim) is stored as ssim_nlog = -log(1 - ssim), so its inverse
+  // is 1 - exp(-max(0, x)), NOT expm1 (nn_gpu.cu:206, :215). Leaving it
+  // merely denormalized made index 7 a different quantity from what every
+  // other consumer of this vector would assume. Nothing reads it today --
+  // Rank() and the SGD use 0-3 -- but the vector is public, and a decoded
+  // field that silently is not what its name says is worse than an absent
+  // one.
+  if (result.size() > 7) {
+    result[7] = 1.0f - std::exp(-std::max(0.0f, result[7]));
+  }
+
   for (int i : {0, 1, 2, 4, 5, 6}) {
     if (static_cast<size_t>(i) < result.size()) {
       result[i] = std::expm1(result[i]);
@@ -533,7 +562,7 @@ bool NeuroPressNNPredictor::Train(
     // nnSGDKernel exactly rather than the CPU port below.
     std::vector<gpu::NeuroPressGpuSGDSample> gpu_samples(num_samples);
     for (size_t si = 0; si < num_samples; ++si) {
-      auto x = FeaturesTo8Input(features[si]);
+      auto x = FeaturesTo8Input(features[si], /*sentinel=*/false);
       std::copy(x.begin(), x.end(), gpu_samples[si].raw_input);
       gpu_samples[si].actual_ratio = labels[si].compression_ratio;
       gpu_samples[si].actual_comp_time_ms = labels[si].compression_time_ms;
@@ -555,7 +584,7 @@ bool NeuroPressNNPredictor::Train(
   std::vector<std::array<float, kOutputDim>> d5_raw(num_samples);
 
   for (size_t si = 0; si < num_samples; ++si) {
-    auto x = FeaturesTo8Input(features[si]);
+    auto x = FeaturesTo8Input(features[si], /*sentinel=*/false);
     auto x_norm = Standardize(x);
     acts[si] = ForwardWithCache(x_norm);
     const auto& y = acts[si].y;
@@ -965,7 +994,7 @@ bool NeuroPressNNPredictor::TrainDecompHead(
     if (measured <= 0.0) continue;  // not measured -- nothing to learn from
 
     // Forward through the frozen trunk to h4, then output 1's head only.
-    auto x = FeaturesTo8Input(features[si]);
+    auto x = FeaturesTo8Input(features[si], /*sentinel=*/false);
     auto x_norm = Standardize(x);
     SGDActivations a = ForwardWithCache(x_norm);
 

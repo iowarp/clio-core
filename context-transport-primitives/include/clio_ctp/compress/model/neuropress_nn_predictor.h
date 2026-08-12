@@ -224,8 +224,22 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    * @param features Input features.
    * @return 8-element vector in NeuroPress order.
    */
+  /**
+   * @brief Build the 8-element NN input.
+   *
+   * @param apply_lossless_sentinel Substitute 1e-7 for a lossless config's
+   *   error bound. TRUE only for INFERENCE: upstream applies the sentinel in
+   *   nnFusedInferenceKernel (nn_gpu.cu:144, "training used 1e-7 sentinel for
+   *   lossless") and NOWHERE else. Both SGD kernels feed the RAW bound --
+   *   nnSGDKernel's `raw[3] = eb_enc` under the comment "Use raw values for
+   *   error_bound and data_size (no log encoding)" (:85), and
+   *   nnBatchedDecompSGDKernel's `raw[3] = samp.error_bound_enc` -- so every
+   *   training path must pass false or it trains against an input the
+   *   original never builds.
+   */
   std::vector<float> FeaturesTo8Input(
-      const CompressionFeatures& features) const;
+      const CompressionFeatures& features,
+      bool apply_lossless_sentinel = true) const;
 
   /**
    * @brief Standardize input: (x - x_means) / max(x_stds, 1e-8).
