@@ -90,10 +90,43 @@ class NvComp : public Compressor {
  public:
   explicit NvComp(NvCompAlgo algo = NvCompAlgo::LZ4) : algo_(algo) {}
 
+  /** @brief Manager-cache counters, mirroring upstream's hit/miss tallies. */
+  struct ManagerCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+  };
+
+  /** @brief Snapshot this thread's manager-cache counters. */
+  static ManagerCacheStats GetManagerCacheStats() {
+    const auto &c = Cache();
+    return ManagerCacheStats{c.hits, c.misses};
+  }
+
+  /** @brief Drop every cached manager and zero the counters (tests). */
+  static void ResetManagerCache() {
+    auto &c = Cache();
+    for (auto &slot : c.slots) {
+      slot.mgr.reset();
+      slot.algo = -1;
+      slot.tick = 0;
+    }
+    c.clock = 0;
+    c.hits = 0;
+    c.misses = 0;
+  }
+
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Persistent per-thread stream and cached manager. Both used to be built
+    // and torn down on EVERY call, inside the window Runtime::Compress times
+    // to produce the model's comp_time label -- so the label carried a cost
+    // that is large relative to the compress kernels and roughly independent
+    // of chunk size, flattening the time-vs-size relationship the network
+    // learns. NeuroPress pays neither per chunk: a persistent context stream
+    // and an LRU of managers (gpucompress_pool.cpp:236-271), with its
+    // CUDA-event bracket around compress() alone.
+    cudaStream_t stream = CachedStream();
+    if (!stream) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -111,7 +144,8 @@ class NvComp : public Compressor {
         d_in = ToDeviceInput(input, input_size, stream, &free_in);
         if (!d_in) break;
 
-        std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
+        std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
+            GetOrCreateManager(stream);
         if (!mgr) break;
         nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
 
@@ -151,14 +185,19 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+    // The stream is owned by the thread's cache, not by this call.
     return ok;
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Same persistent stream as Compress. The MANAGER cannot be cached here
+    // and upstream does not cache it either: the NVCOMP_NATIVE bitstream is
+    // self-describing, so create_manager derives it from the blob's own bytes
+    // (compression_factory.cpp:157). Only the stream is reusable, and it is
+    // inside the window Runtime::Decompress times for the decomp head.
+    cudaStream_t stream = CachedStream();
+    if (!stream) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -208,7 +247,7 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+    // Stream owned by the thread's cache; do not destroy it here.
     return ok;
   }
 
@@ -258,6 +297,98 @@ class NvComp : public Compressor {
   }
 
   /** Construct the nvcomp manager for the configured algorithm. */
+  /**
+   * Per-thread manager cache and its persistent stream.
+   *
+   * NeuroPress keeps this per CompContext -- an LRU of LRU_DEPTH = 3
+   * managers keyed by algorithm, on the context's own stream, with hit/miss
+   * counters (gpucompress_pool.cpp:236-271, internal.hpp:83-86). Clio has no
+   * per-context object at this layer, so the equivalent scope is the worker
+   * THREAD: it gives each concurrent flow its own managers and stream, which
+   * is the isolation upstream gets from per-context state, without a lock on
+   * the compression path. Sharing one manager across threads would not be
+   * safe -- an nvcomp manager is bound to the stream it was built on.
+   */
+  static constexpr int kLruDepth = 3;  // CompContext::LRU_DEPTH
+
+  struct ManagerCache {
+    struct Slot {
+      std::shared_ptr<nvcomp::nvcompManagerBase> mgr;
+      int algo = -1;
+      uint64_t tick = 0;
+    };
+    Slot slots[kLruDepth];
+    uint64_t clock = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    cudaStream_t stream = nullptr;
+
+    ~ManagerCache() {
+      // Managers must die before the stream they were built on.
+      for (auto &s : slots) s.mgr.reset();
+      if (stream) cudaStreamDestroy(stream);
+    }
+  };
+
+  static ManagerCache &Cache() {
+    static thread_local ManagerCache cache;
+    return cache;
+  }
+
+  /** @brief This thread's persistent stream, created once. */
+  static cudaStream_t CachedStream() {
+    auto &c = Cache();
+    if (!c.stream && cudaStreamCreate(&c.stream) != cudaSuccess) {
+      c.stream = nullptr;
+    }
+    return c.stream;
+  }
+
+  /**
+   * @brief Cached manager for algo_, built on the persistent stream.
+   *
+   * Same walk as getOrCreateCompManager: scan for a live slot with this
+   * algorithm and bump its tick on a hit; otherwise take an empty slot, or
+   * evict the lowest tick, and build there.
+   */
+  std::shared_ptr<nvcomp::nvcompManagerBase> GetOrCreateManager(
+      cudaStream_t stream) {
+    auto &c = Cache();
+    const int idx = static_cast<int>(algo_);
+
+    for (auto &slot : c.slots) {
+      if (slot.mgr && slot.algo == idx) {
+        slot.tick = ++c.clock;
+        ++c.hits;
+        return slot.mgr;
+      }
+    }
+
+    int victim = -1;
+    for (int i = 0; i < kLruDepth; ++i) {
+      if (!c.slots[i].mgr) { victim = i; break; }
+    }
+    if (victim < 0) {
+      uint64_t min_tick = c.slots[0].tick;
+      victim = 0;
+      for (int i = 1; i < kLruDepth; ++i) {
+        if (c.slots[i].tick < min_tick) {
+          min_tick = c.slots[i].tick;
+          victim = i;
+        }
+      }
+      c.slots[victim].mgr.reset();
+    }
+
+    auto mgr = MakeManager(stream);
+    if (!mgr) return nullptr;
+    c.slots[victim].mgr = mgr;
+    c.slots[victim].algo = idx;
+    c.slots[victim].tick = ++c.clock;
+    ++c.misses;
+    return mgr;
+  }
+
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
     switch (algo_) {
       // NOTE: nvcomp >= 5.x split each algorithm's single "DefaultOpts" into
