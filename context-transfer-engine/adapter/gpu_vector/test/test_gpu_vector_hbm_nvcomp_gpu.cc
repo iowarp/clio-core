@@ -219,17 +219,12 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   // used to be SILENT: the page was marked clean and its bytes dropped.
   REQUIRE(vec.ReadStats(0).put_errors == 0);
 
-  // --- the data really is on the GPU tier, and encoded ------------------
-  // BuildDeviceTierMap only maps pages whose blob lives on a pool with a
-  // device base, so kBuilt is itself the assertion that the bytes are in
-  // device memory. decode_in_kernel=true additionally requires every mapped
-  // page to be a chunk-parsed nvcomp stream.
-  // No device tier map for an encoded tag: decompression is launched by the
-  // CPU and batched, so encoded pages take the fetch path rather than being
-  // decoded inside the faulting kernel.
-  const gv::Vector<clio::run::u32>::MapResult mr =
-      vec.BuildDeviceTierMap(/*decode_in_kernel=*/false);
-  REQUIRE(mr == gv::Vector<clio::run::u32>::MapResult::kDisabled);
+  // --- the stored-size table publishes for the encoded tag --------------
+  // (The zero-copy device-tier map is gone: kernels never alias shared CTE
+  // tier memory. The stored-size table is metadata -- the run-fetch's
+  // existence proof -- and publishing it for every page doubles as the
+  // assertion that all pages were actually stored.)
+  REQUIRE(vec.PublishStoredSizes() == n / kPageElems);
 
   // The compressed image has to be SMALLER than the raw one, or the codec did
   // not run and everything above passed for the wrong reason.

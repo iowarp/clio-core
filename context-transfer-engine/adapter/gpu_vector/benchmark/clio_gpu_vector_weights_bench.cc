@@ -618,44 +618,24 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Publish the device tier map. Until this runs, PageEncodedMapped() is false
-  // for every page, so encoded pages can NEVER decode in-kernel no matter how
-  // the binary was compiled -- they silently take the scalar LZ4 fallback and
-  // the run reports "nvcomp" while never calling nvcomp.
-  //
-  // The compressor's puts land asynchronously, so kBlobsNotFound is a retry,
-  // not a failure.
-#if defined(CLIO_GV_NVCOMP_DEVICE)
-  constexpr bool kDecodeInKernel = true;
-#else
-  constexpr bool kDecodeInKernel = false;
-#endif
-  {
-    gv::Vector<clio::run::u32>::MapResult mr =
-        gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound;
+  // Publish the stored-size table (encoded tags only). It is the
+  // run-fetch's existence proof; the compressor's puts land asynchronously,
+  // so retry until every page is covered. The zero-copy device-tier map
+  // that used to be built here is gone: kernels no longer alias shared CTE
+  // tier memory, and the fits-in-VRAM regime is expressed as a PRIVATE
+  // cache that covers the model (--slots >= --pages), seeded by the seed
+  // pass and never faulting afterwards.
+  if (compressed) {
+    const clio::run::u64 npages_all = n / kPageElems;
+    clio::run::u64 found = 0;
     for (int attempt = 0; attempt < 200; ++attempt) {
-      mr = vec.BuildDeviceTierMap(kDecodeInKernel);
-      if (mr != gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound) break;
+      found = vec.PublishStoredSizes();
+      if (found == npages_all) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    const char *mrs =
-        mr == gv::Vector<clio::run::u32>::MapResult::kBuilt ? "built"
-        : mr == gv::Vector<clio::run::u32>::MapResult::kNoDeviceTier
-            ? "no-device-tier"
-        : mr == gv::Vector<clio::run::u32>::MapResult::kBlobsNotFound
-            ? "blobs-not-found"
-            : "disabled";
-    std::fprintf(stderr, "[map] BuildDeviceTierMap(%d) = %s, fully_mapped=%d\n",
-                 (int)kDecodeInKernel, mrs, (int)vec.FullyDeviceMapped());
-    // A COMPRESSED run is expected to report kDisabled: encoded pages are no
-    // longer device-mapped, because decompression is launched by the CPU and
-    // batched rather than run inside the faulting kernel. Only a RAW run maps
-    // (identity, zero-copy).
-    if (!compressed && mr != gv::Vector<clio::run::u32>::MapResult::kBuilt) {
-      std::fprintf(stderr,
-                   "bench: raw run expected a device tier map (got %s)\n", mrs);
-      return 1;
-    }
+    std::fprintf(stderr, "[ssz] stored-size table: %llu/%llu pages\n",
+                 (unsigned long long) found,
+                 (unsigned long long) npages_all);
   }
 
   unsigned long long *d_sum = nullptr;

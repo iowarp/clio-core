@@ -146,28 +146,15 @@ struct VecHeader {
   // same slot (evicted/recycled mid-read).
   unsigned long long *stat_verify_ok_ = nullptr;
   unsigned long long *stat_verify_lost_ = nullptr;
-  // ZERO-COPY DEVICE-TIER MAP: when the tag's pages live on a kHbm bdev,
-  // faults resolve to tier_base_ + tier_off_[page] directly — no slot claim,
-  // no fetch, no DMA (device-memory reads under a resident kernel queue
-  // behind its channel and wedge; a mapped pointer removes the transfer).
-  // tier_off_[p] == ~0ull means page p is not device-resident.
-  char *tier_base_ = nullptr;
-  const unsigned long long *tier_off_ = nullptr;
-  /** Stored (post-codec) size per page — the input length for an in-kernel
-   *  decompressor when the tier holds COMPRESSED pages. */
-  const unsigned long long *tier_csize_ = nullptr;
-  // ENCODED device-tier map (compressed kHbm). A page whose stored blob is a
-  // CTEC + nvcomp-HLIF lz4 stream cannot be served by pointer; instead the
-  // faulting WARP decompresses the tier bytes straight into a claimed slot
-  // (nvcomp device API) — no CPU, no DMA, so nothing can channel-order
-  // behind a resident kernel. Identity-stored pages keep tier_off_;
-  // encoded pages leave tier_off_ = ~0 and populate these tables instead.
-  // tier_chunk_off_[pg*cpp + c] is the ABSOLUTE tier offset of chunk c of
-  // page pg (~0 = page not encoded-mapped); tier_chunk_csz_ its compressed
-  // size. Chunk raw size is fixed at 64 KiB (the compressor's HLIF chunk).
-  const unsigned long long *tier_chunk_off_ = nullptr;
-  const unsigned int *tier_chunk_csz_ = nullptr;
-  unsigned int tier_chunks_per_page_ = 0;
+  // The zero-copy device-tier map that used to live here is GONE, by
+  // decision, not by accident: it aliased SHARED CTE tier memory from GPU
+  // kernels (reads in place, and writes to mapped dirty pages mutated tier
+  // bytes directly), which put every tier mover -- organizer, target
+  // evacuation, eviction -- in a silent race with resident kernels. The
+  // vector's memory is private; bytes cross the CTE boundary only through
+  // orchestrated transfers. The fits-in-VRAM fast path is a private cache
+  // sized to the data (slots >= pages), seeded once -- not a pointer into
+  // somebody else's tier.
 
   // ---- SPILLED encoded pages -------------------------------------------
   // A page the tier map does not cover (its blob is on a host tier) still
@@ -183,6 +170,17 @@ struct VecHeader {
   const unsigned long long *stored_size_ = nullptr;
   /** CTE CORE pool -- bypasses the compressor interposer on the fault. */
   clio::run::PoolId core_pool_id_;
+  /**
+   * Per-BLOCK count of outstanding transfers (puts + gets + one per live
+   * multi). Not a correctness structure: the authoritative answer is always
+   * the slot scan. It exists so the scans can be SKIPPED when nothing is in
+   * flight -- with the private cache sized to the data (slots == pages) the
+   * steady state has zero transfers, and the O(slots) reap/vote scans per
+   * page hold were the entire measured pass (1254 ms of a 1067 ms/215 ms
+   * story; see HoldPageYield). Mutated only under the block lock (or by the
+   * lock-holding thread), read lock-free by the votes.
+   */
+  unsigned int *xfer_cnt_ = nullptr;
   /** nslots * page_bytes_ of device scratch, one slab per cache slot, for
    *  the compressed image while it is being decoded. */
   char *cscratch_ = nullptr;
@@ -234,19 +232,6 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 HoldPage(clio::run::u64 off,
                                       clio::run::u64 count) {
     const clio::run::u64 pn = PageOf(off);
-    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
-        h_->tier_off_[pn] != ~0ull) {
-      // Direct-mapped page: no residency management. operator[] resolves
-      // through GetPagePtr-style holds only for slot pages, so expose the
-      // mapped bytes via last_page_-less run accounting.
-      const clio::run::u64 within = off - pn * h_->elems_per_page_;
-      const clio::run::u64 left = h_->elems_per_page_ - within;
-      map_ptr_ = reinterpret_cast<T *>(h_->tier_base_ + h_->tier_off_[pn]);
-      map_pn_ = pn;
-      last_was_map_ = true;
-      return (count < left) ? count : left;
-    }
-    last_was_map_ = false;
     Page *p = last_page_;
     if (p == nullptr || p->page_num != pn || p->fetching) {
       // Look the page up WITHOUT the block lock. Taking it here is what made
@@ -333,7 +318,6 @@ class DeviceVector {
    * @return the held page's data, or nullptr if no page has been resolved.
    */
   CTP_GPU_FUN T *GetPagePtr() const {
-    if (last_was_map_) return map_ptr_;
     return last_page_ != nullptr ? static_cast<T *>(last_page_->data)
                                  : nullptr;
   }
@@ -349,11 +333,6 @@ class DeviceVector {
    * 12x a raw pointer even when it always hit, and hold-and-iterate is 1.44x.
    */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
-    if (map_ptr_ != nullptr && PageOf(off) == map_pn_) {
-      // Direct-mapped tier page (read-mostly by contract; writes would land
-      // in the TIER, which for weights never happens).
-      return map_ptr_[off - map_pn_ * h_->elems_per_page_];
-    }
     Page *p = last_page_;
     p->dirty = 1u;
     return static_cast<T *>(p->data)[IndexIn(off, p)];
@@ -361,9 +340,6 @@ class DeviceVector {
 
   /** Read-only access through the held page. Does NOT dirty it. */
   CTP_GPU_FUN const T &at(clio::run::u64 off) const {
-    if (map_ptr_ != nullptr && PageOf(off) == map_pn_) {
-      return map_ptr_[off - map_pn_ * h_->elems_per_page_];
-    }
     const Page *p = last_page_;
     return static_cast<const T *>(p->data)[IndexIn(off, p)];
   }
@@ -399,25 +375,6 @@ class DeviceVector {
                                        clio::run::u64 count,
                                        clio::run::u64 *run) {
     const clio::run::u64 pn = PageOf(off);
-    // Device-tier direct map: immutable, lock-free, no slot involved.
-    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
-        h_->tier_off_[pn] != ~0ull) {
-      const clio::run::u64 within = off - pn * h_->elems_per_page_;
-      clio::run::u64 r = h_->elems_per_page_ - within;
-      if (count < r) r = count;
-      *run = r;
-      return reinterpret_cast<const T *>(h_->tier_base_ +
-                                         h_->tier_off_[pn]) + within;
-    }
-    // Device-tier direct map: immutable, lock-free, no slot involved.
-    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
-        h_->tier_off_[pn] != ~0ull) {
-      const clio::run::u64 within = off - pn * h_->elems_per_page_;
-      *run = h_->elems_per_page_ - within;
-      if (count < *run) *run = count;
-      return reinterpret_cast<const T *>(h_->tier_base_ +
-                                         h_->tier_off_[pn]) + within;
-    }
     Page *p = last_page_;
     if (p == nullptr || p->page_num != pn || p->fetching) {
       p = nullptr;
@@ -620,14 +577,7 @@ class DeviceVector {
       // scan, a page touched once per token sustains ~+0.5/token net while
       // an untouched one loses its history in ~50 claims.
       //
-      // NO aging for encoded (chunk-mapped) tags: their eval demotes pages
-      // to ~0 after use (use-once, cyclic reuse), so victims are always
-      // explicit — while an encoded table sees ~40x the claim rate this
-      // constant was tuned for, enough that aging out-ran the +1/token
-      // touch and eroded the pinned residents the demotion exists to keep.
-      if (h_->tier_chunk_off_ == nullptr) {
-        pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
-      }
+      pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
       // `dirty` belongs in this test. This path DROPS its victim outright --
       // it does not write it back -- on the stated assumption that "weights
       // are read-only here, dirty is never set on this path". That holds for
@@ -875,20 +825,6 @@ class DeviceVector {
     return got;
   }
 
-  /** Raw (uncompressed) size of one encoded-tier chunk: the compressor's
-   *  HLIF chunk size. Compile-time because the nvcomp device decompressor
-   *  takes it as a template parameter; BuildDeviceTierMap refuses to map a
-   *  stream whose chunk size differs. */
-  static constexpr clio::run::u32 kNvChunkRaw = 64u * 1024u;
-
-  /** @return true when `pg` can be materialized by in-kernel decompression
-   *  (its chunk-table entry is populated). Safe to call from any thread. */
-  CTP_GPU_FUN bool PageEncodedMapped(clio::run::u64 pg) const {
-    return h_->tier_base_ != nullptr && h_->tier_chunk_off_ != nullptr &&
-           h_->tier_chunks_per_page_ != 0u &&
-           h_->tier_chunk_off_[pg * h_->tier_chunks_per_page_] != ~0ull;
-  }
-
   /** Lock-free residency probe. RACY BY DESIGN: a concurrent claim can
    *  make it misread one page — callers only use it to decide whether a
    *  batched fault phase is worth entering, where either error is safe. */
@@ -896,18 +832,6 @@ class DeviceVector {
     return Find(pg) != nullptr;
   }
 
-  /** @return true when every page of [first, first+n) resolves without the
-   *  CPU: identity-mapped (zero-copy) or encoded-mapped (in-kernel decode). */
-  CTP_GPU_FUN bool RangeFullyMapped(clio::run::u64 first,
-                                    clio::run::u32 n) const {
-    for (clio::run::u32 k = 0; k < n; ++k) {
-      const clio::run::u64 pg = first + k;
-      if (h_->tier_off_ != nullptr && h_->tier_off_[pg] != ~0ull) continue;
-      if (PageEncodedMapped(pg)) continue;
-      return false;
-    }
-    return true;
-  }
   // The single-thread scalar LZ4 decoder that used to live here is gone too.
   //
   // It existed as the "airtight fallback" for sites where the warp decoder
@@ -996,14 +920,6 @@ class DeviceVector {
     //        out. No CPU, no DMA, nothing that can channel-order behind this
     //        kernel, so there is nothing to yield on.
     //
-    // Written as if/else rather than an early return because CLIO_YEND emits
-    // the switch's closing brace: a second one here would unbalance it.
-    // Only IDENTITY-mapped pages take this branch: they resolve to a pointer
-    // into the tier. Encoded pages are never mapped -- the compressor fetches
-    // and decodes them -- so nothing here decodes anything.
-    if (!PageNeedsHostFetch(PageOf(off))) {
-      *run_out = HoldPage(off, count);
-    } else {
 
     // 1. WRITEBACK. Making room can require flushing a dirty victim, and the
     //    blocking path waits for that put in-kernel. On the kHbm tier that
@@ -1071,7 +987,6 @@ class DeviceVector {
     // 3. Resident for the whole block now, so this is the lock-free fast path
     //    and every lane may read the page.
     *run_out = HoldPage(off, count);
-    }  // end host-fetch branch
     CLIO_YEND();
   }
 
@@ -1100,11 +1015,6 @@ class DeviceVector {
       ReapFlushed();
     }
     __syncthreads();
-    // Identity-mapped pages resolve on the device; see HoldPageYield step 0.
-    if (!PageNeedsHostFetch(PageOf(off))) {
-      *run_out = HoldPage(off, count);
-      co_return;
-    }
     // 1. WRITEBACK: submit the victim's put and leave (HoldPageYield step 1).
     if (threadIdx.x == 0) {
       StartEvictionAsync(PageOf(off));
@@ -1166,28 +1076,6 @@ class DeviceVector {
 #endif  // CLIO_YIELD_CORO
 
   /**
-   * @return true when resolving `pn` requires the HOST -- i.e. the tier map
-   *         covers it neither as an identity-mapped page nor as an encoded
-   *         page this build can decode in-kernel.
-   *
-   * Only such a page may enter the evict/fetch/suspend path: a map-backed
-   * page never gets a cache slot through a fetch, so waiting for residency on
-   * one waits forever.
-   */
-  CTP_GPU_FUN bool PageNeedsHostFetch(clio::run::u64 pn) const {
-    if (h_->tier_base_ != nullptr && h_->tier_off_ != nullptr &&
-        h_->tier_off_[pn] != ~0ull) {
-      return false;  // identity-mapped: a pointer into the tier
-    }
-#if defined(CLIO_GV_NVCOMP_DEVICE)
-    if (PageEncodedMapped(pn)) {
-      return false;  // decodes in-kernel, straight out of the tier
-    }
-#endif
-    return true;
-  }
-
-  /**
    * Device address of the completion flag for `page_num`'s in-flight get, or 0
    * if there is nothing specific to wait on (no slot claimed yet, so the block
    * should be relaunched to claim one).
@@ -1230,7 +1118,17 @@ class DeviceVector {
    * answer. Taking the block lock here would have all 32 lanes serialise
    * through an atomicCAS on what is meant to be a cheap test.
    */
+  CTP_GPU_FUN void XferAdd(int d) const {
+    if (h_->xfer_cnt_ != nullptr) {
+      atomicAdd(&h_->xfer_cnt_[BlockIndex()], (unsigned int) d);
+    }
+  }
+  CTP_GPU_FUN bool XferIdle() const {
+    return h_->xfer_cnt_ != nullptr && h_->xfer_cnt_[BlockIndex()] == 0u;
+  }
+
   CTP_GPU_FUN bool AnyTransferInFlight() const {
+    if (XferIdle()) return false;
     const Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       const Page *p = &tbl[i];
@@ -1283,6 +1181,7 @@ class DeviceVector {
    * 200000 rounds and then produced a wrong checksum.
    */
   CTP_GPU_FUN void ReapFetched() {
+    if (XferIdle()) return;
     LockBlock();
     Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -1316,6 +1215,7 @@ class DeviceVector {
    * puts are known complete, so AwaitPut cannot block.
    */
   CTP_GPU_FUN void ReapFlushed() {
+    if (XferIdle()) return;
     LockBlock();
     Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -1451,9 +1351,6 @@ class DeviceVector {
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
   Page *last_page_ = nullptr;
-  T *map_ptr_ = nullptr;              // direct-mapped page (HoldPage path)
-  clio::run::u64 map_pn_ = ~0ull;
-  bool last_was_map_ = false;
   /**
    * Slot index where the lock-free scan STARTS: the last hit.
    *
@@ -1564,7 +1461,16 @@ class DeviceVector {
 
   CTP_GPU_FUN Page *Find(clio::run::u64 page_num) const {
     Page *tbl = BlockPages();
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    const clio::run::u32 ppb = h_->pages_per_block_;
+    // First probe: page p usually sits in slot p %% ppb -- claims walk the
+    // table in order, so a cache sized to the data (the fits-in-VRAM
+    // private-cache regime, slots == pages) settles on exactly that layout.
+    // Without the probe this scan is O(slots) per hold and became the whole
+    // measured pass once the zero-copy map was removed (215 -> 1254 ms at
+    // 1024 slots); with it, a resident hold is one compare again.
+    const clio::run::u32 hint = (clio::run::u32) (page_num % ppb);
+    if (tbl[hint].page_num == page_num) return &tbl[hint];
+    for (clio::run::u32 i = 0; i < ppb; ++i) {
       if (tbl[i].page_num == page_num) return &tbl[i];
     }
     return nullptr;
@@ -1615,6 +1521,7 @@ class DeviceVector {
   /** Issue this page's PodPutBlobTask for the whole page. */
   CTP_GPU_FUN void SubmitPut(Page *p) {
     if (p->flushing) return;             // one outstanding put per page
+    XferAdd(1);
     auto *t = p->put;
     t->task_flags_.Clear();
     t->return_code_.store(0);
@@ -1829,6 +1736,7 @@ class DeviceVector {
       }
     }
     mb->async_pending = 0u;
+    XferAdd(-1);
   }
 
   /**
@@ -1886,7 +1794,6 @@ class DeviceVector {
       // Encoded mapped pages must NEVER ride a CPU-serviced get (it can
       // channel-order behind the resident kernel). This is a prefetch HINT,
       // so dropping the page is always safe; a toucher decodes it in-kernel.
-      if (PageEncodedMapped(pg)) continue;
       const clio::run::u32 slot = ClaimSlotWindowLocked(pg);
       if (slot == ~0u) break;
       Page *np = &tbl[slot];
@@ -1915,6 +1822,7 @@ class DeviceVector {
       if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
     }
     if (filled == 0) return 0;
+    XferAdd(1);
     mb->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
         SlotPtr(mb->get));
     mb->async_pending = 1u;
@@ -2060,6 +1968,7 @@ class DeviceVector {
       if (h_->fault_hist_ != nullptr) atomicAdd(&h_->fault_hist_[pg], 1u);
     }
     if (filled == 0) return 0;
+    XferAdd(1);
     mb[0].async_n = filled;
     mb[0].async_pending = 1u;
     mb[0].get_fut =
@@ -2086,6 +1995,7 @@ class DeviceVector {
       p->dirty = 1u;
     }
     p->flushing = 0u;
+    XferAdd(-1);
   }
 
   /**
@@ -2095,9 +2005,6 @@ class DeviceVector {
   CTP_GPU_FUN bool BeginFetchLocked(clio::run::u64 page_num,
                                     bool is_prefetch = true) {
     if (Find(page_num) != nullptr) return true;   // resident or already coming
-    // Encoded mapped pages never ride a CPU get (wedge class); this is a
-    // prefetch, so simply decline — the demand path decodes in-kernel.
-    if (PageEncodedMapped(page_num)) return false;
     Page *tbl = BlockPages();
     clio::run::u32 free_slot = h_->pages_per_block_;
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -2239,6 +2146,7 @@ class DeviceVector {
     PrepareGet(p, page_num);
     Bump(h_->stat_faults_);
     if (is_prefetch) Bump(h_->stat_prefetches_);
+    XferAdd(1);
     p->fetching = 1u;                     // already set by the claim; keep it
     p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
     if (p->get_fut.IsNull()) {
@@ -2282,6 +2190,7 @@ class DeviceVector {
     p->get_fut.Wait();
     if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
     p->fetching = 0u;
+    XferAdd(-1);
   }
 
   /** Fill in the get task's fields for `page_num`. */
