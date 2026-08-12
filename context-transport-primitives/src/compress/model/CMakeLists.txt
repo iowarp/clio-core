@@ -14,6 +14,9 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
     linreg_table_predictor.cc
     xgboost_predictor.cc
     neuropress_nn_predictor.cc
+    # Provides ByteShuffleDevice/ByteUnshuffleDevice on a CPU-only build;
+    # compiles to nothing when CUDA is on (the .cu below defines them).
+    ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/byte_shuffle_cpu_stub.cc
 )
 
 # NeuroPress GPU backend: when CUDA is available, its inference and online-

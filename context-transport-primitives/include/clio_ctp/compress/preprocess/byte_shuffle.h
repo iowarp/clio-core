@@ -161,6 +161,31 @@ inline std::vector<uint8_t> ByteUnshuffleVector(const uint8_t* input,
   return std::vector<uint8_t>();
 }
 
+/**
+ * @brief Device byte-shuffle: device pointer in, device pointer out.
+ *
+ * Defined in src/compress/preprocess/byte_shuffle_gpu_kernels.cu; declared
+ * unconditionally so callers can branch on IsDevicePointer() without
+ * #if-guarding every call site. Returns false when CUDA support is not
+ * compiled in, so a caller that must not fall back to the host routines
+ * above (they would dereference the device pointer) can fail cleanly.
+ *
+ * Produces byte-for-byte the same layout as ByteShuffle(): plane `b` starts
+ * at `b * (num_bytes / elem_size)`, and a trailing partial element is copied
+ * verbatim. Blobs are interchangeable between the two paths.
+ *
+ * @param device_in  Device buffer to read.
+ * @param device_out Device buffer to write (at least num_bytes, no overlap).
+ * @param num_bytes  Total bytes.
+ * @param elem_size  Bytes per element (2, 4 or 8).
+ */
+bool ByteShuffleDevice(const void *device_in, void *device_out,
+                       size_t num_bytes, size_t elem_size);
+
+/** @brief Device inverse of ByteShuffleDevice(). Same contract. */
+bool ByteUnshuffleDevice(const void *device_in, void *device_out,
+                         size_t num_bytes, size_t elem_size);
+
 }  // namespace ctp::compress::preprocess
 
 #endif  // CLIO_CTP_COMPRESS_PREPROCESS_BYTE_SHUFFLE_H_

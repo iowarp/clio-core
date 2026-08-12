@@ -1217,25 +1217,40 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // any device staging above, since ByteShuffle is host code, and the
     // element size is recorded in the header so Decompress can invert it.
     std::vector<char> shuffle_staging;
+    char *shuffle_device_buf = nullptr;
+    ctp::ipc::AllocatorId shuffle_device_alloc;
     uint32_t applied_shuffle = 0;
     if (shuffle_elem != 0 && input_size >= shuffle_elem &&
         (input_size % shuffle_elem) == 0) {
-      std::vector<char> host_copy;
-      const char *shuffle_src = input_ptr;
       if (ctp::IsDevicePointer(input_ptr)) {
-        // A GPU-native codec left the buffer on the device; shuffling needs
-        // it host-readable. Stage once here rather than silently skipping.
-        host_copy.resize(input_size);
-        ctp::GpuApi::Memcpy(host_copy.data(), input_ptr, input_size);
-        shuffle_src = host_copy.data();
-      }
-      shuffle_staging.resize(input_size);
-      if (ctp::compress::preprocess::ByteShuffle(reinterpret_cast<const uint8_t *>(shuffle_src),
-                           input_size, shuffle_elem,
-                           reinterpret_cast<uint8_t *>(
-                               shuffle_staging.data()))) {
-        input_ptr = shuffle_staging.data();
-        applied_shuffle = shuffle_elem;
+        // Shuffle ON the device. Staging down to shuffle on the host would
+        // also leave input_ptr pointing at host memory, which flips
+        // output_on_device below and sends the compressed output through
+        // host memory too -- a D2H/H2D round trip per chunk that undoes the
+        // whole device-resident path. NeuroPress shuffles on-device for the
+        // same reason (byte_shuffle_kernels.cu).
+        shuffle_device_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+            input_size, &shuffle_device_buf);
+        if (!shuffle_device_alloc.IsNull() &&
+            ctp::compress::preprocess::ByteShuffleDevice(
+                input_ptr, shuffle_device_buf, input_size, shuffle_elem)) {
+          input_ptr = shuffle_device_buf;  // still on the device
+          applied_shuffle = shuffle_elem;
+        } else if (!shuffle_device_alloc.IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, shuffle_device_alloc);
+          shuffle_device_alloc = ctp::ipc::AllocatorId();
+          shuffle_device_buf = nullptr;
+        }
+      } else {
+        shuffle_staging.resize(input_size);
+        if (ctp::compress::preprocess::ByteShuffle(
+                reinterpret_cast<const uint8_t *>(input_ptr), input_size,
+                shuffle_elem,
+                reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
+          input_ptr = shuffle_staging.data();
+          applied_shuffle = shuffle_elem;
+        }
       }
       // On failure input_ptr is untouched and applied_shuffle stays 0, so
       // the header records "not shuffled" and the read side does nothing.
@@ -1355,6 +1370,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, device_output_alloc_id);
       } else {
         CLIO_IPC->FreeBuffer(compressed_shm);
+      }
+      if (!shuffle_device_alloc.IsNull()) {
+        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, shuffle_device_alloc);
+        shuffle_device_alloc = ctp::ipc::AllocatorId();
       }
 
       // Log compression telemetry
@@ -1554,34 +1573,48 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // user's data, it just happens to be the same length.
       if (success && stored_shuffle != 0 && decompressed_size >= stored_shuffle &&
           (decompressed_size % stored_shuffle) == 0) {
-        // ByteUnshuffle is host code. The caller's output buffer may be
-        // device-resident (a GPU consumer decompressing straight into its own
-        // memory), in which case reading it here would segfault rather than
-        // return a wrong answer -- so stage it down first. DeviceAwareMemcpy
-        // handles both directions, and the pure-host case still costs one
-        // extra copy, which is the price of not having a device unshuffle
-        // kernel.
-        std::vector<char> shuffled_host;
-        const char *unshuffle_src = output_fullptr.ptr_;
         if (ctp::IsDevicePointer(output_fullptr.ptr_)) {
-          shuffled_host.resize(decompressed_size);
-          ctp::DeviceAwareMemcpy(shuffled_host.data(), output_fullptr.ptr_,
-                                 decompressed_size);
-          unshuffle_src = shuffled_host.data();
-        }
-        std::vector<char> unshuffled(decompressed_size);
-        if (ctp::compress::preprocess::ByteUnshuffle(
-                reinterpret_cast<const uint8_t *>(unshuffle_src),
-                decompressed_size, stored_shuffle,
-                reinterpret_cast<uint8_t *>(unshuffled.data()))) {
-          ctp::DeviceAwareMemcpy(output_fullptr.ptr_, unshuffled.data(),
-                                 decompressed_size);
+          // Unshuffle ON the device, into a scratch device buffer and back.
+          // Staging down to the host would work but costs a D2H/H2D round
+          // trip per chunk for a GPU consumer decompressing into its own
+          // memory -- exactly the case this path exists to serve.
+          char *scratch = nullptr;
+          ctp::ipc::AllocatorId scratch_alloc =
+              CLIO_IPC->AllocateAndRegisterGpuBackend(
+                  /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                  decompressed_size, &scratch);
+          if (scratch_alloc.IsNull() ||
+              !ctp::compress::preprocess::ByteUnshuffleDevice(
+                  output_fullptr.ptr_, scratch, decompressed_size,
+                  stored_shuffle)) {
+            HLOG(kError,
+                 "Decompress: device byte-unshuffle failed (elem={} size={}) "
+                 "-- the returned buffer would be shuffled garbage, failing "
+                 "instead",
+                 stored_shuffle, decompressed_size);
+            success = false;
+          } else {
+            ctp::GpuApi::Memcpy(output_fullptr.ptr_, scratch,
+                                decompressed_size);
+          }
+          if (!scratch_alloc.IsNull()) {
+            CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, scratch_alloc);
+          }
         } else {
-          HLOG(kError,
-               "Decompress: byte-unshuffle failed (elem={} size={}) -- the "
-               "returned buffer would be shuffled garbage, failing instead",
-               stored_shuffle, decompressed_size);
-          success = false;
+          std::vector<char> unshuffled(decompressed_size);
+          if (ctp::compress::preprocess::ByteUnshuffle(
+                  reinterpret_cast<const uint8_t *>(output_fullptr.ptr_),
+                  decompressed_size, stored_shuffle,
+                  reinterpret_cast<uint8_t *>(unshuffled.data()))) {
+            std::memcpy(output_fullptr.ptr_, unshuffled.data(),
+                        decompressed_size);
+          } else {
+            HLOG(kError,
+                 "Decompress: byte-unshuffle failed (elem={} size={}) -- the "
+                 "returned buffer would be shuffled garbage, failing instead",
+                 stored_shuffle, decompressed_size);
+            success = false;
+          }
         }
       }
 

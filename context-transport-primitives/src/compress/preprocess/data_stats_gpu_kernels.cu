@@ -193,3 +193,134 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
 }
 
 }  // namespace ctp
+
+
+// ===========================================================================
+// Device byte-shuffle / unshuffle (issue #693).
+//
+// Lives in this translation unit rather than its own: adding a second
+// separately-device-linked .cu to this RDC-enabled static library made
+// __cudaRegisterLinkedBinary segfault during static init, before main().
+// Same registration/RDC interaction that broke the demo target earlier.
+// ===========================================================================
+namespace ctp::compress::preprocess {
+
+namespace {
+
+/**
+ * One block-wide pass per byte position. Every thread in the grid
+ * cooperates on each plane, so the access pattern is coalesced on the write
+ * side (dst[elem] is contiguous) at the cost of a strided read -- the same
+ * trade upstream makes.
+ */
+template <unsigned ElemSize>
+__global__ void ShuffleKernel(const uint8_t *__restrict__ in,
+                              uint8_t *__restrict__ out, size_t num_elements) {
+  size_t elem = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (; elem < num_elements; elem += stride) {
+#pragma unroll
+    for (unsigned b = 0; b < ElemSize; ++b) {
+      out[b * num_elements + elem] = in[elem * ElemSize + b];
+    }
+  }
+}
+
+template <unsigned ElemSize>
+__global__ void UnshuffleKernel(const uint8_t *__restrict__ in,
+                                uint8_t *__restrict__ out,
+                                size_t num_elements) {
+  size_t elem = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (; elem < num_elements; elem += stride) {
+#pragma unroll
+    for (unsigned b = 0; b < ElemSize; ++b) {
+      out[elem * ElemSize + b] = in[b * num_elements + elem];
+    }
+  }
+}
+
+/** Trailing bytes that do not form a whole element are copied verbatim,
+ *  matching the host implementation's treatment of a partial tail. */
+__global__ void CopyTailKernel(const uint8_t *__restrict__ in,
+                               uint8_t *__restrict__ out, size_t offset,
+                               size_t count) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) out[offset + i] = in[offset + i];
+}
+
+bool LaunchTail(const uint8_t *in, uint8_t *out, size_t num_bytes,
+                size_t body_bytes, cudaStream_t stream) {
+  const size_t tail = num_bytes - body_bytes;
+  if (tail == 0) return true;
+  const int threads = 128;
+  const int blocks = static_cast<int>((tail + threads - 1) / threads);
+  CopyTailKernel<<<blocks, threads, 0, stream>>>(in, out, body_bytes, tail);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+/** Shared validation + launch geometry for both directions. Returns false
+ *  if the request is not shuffleable; otherwise fills the launch config. */
+bool PrepareLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
+                   size_t elem_size, size_t *num_elements, int *blocks,
+                   int *threads) {
+  if (!in || !out || num_bytes == 0) return false;
+  if (elem_size != 2 && elem_size != 4 && elem_size != 8) return false;
+  *num_elements = num_bytes / elem_size;
+  if (*num_elements == 0) return false;
+  *threads = 256;
+  size_t want = (*num_elements + *threads - 1) / *threads;
+  *blocks = static_cast<int>(want > 65535 ? 65535 : want);
+  return true;
+}
+
+bool FinishLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
+                  size_t body_bytes, cudaStream_t stream) {
+  if (cudaGetLastError() != cudaSuccess) return false;
+  if (!LaunchTail(in, out, num_bytes, body_bytes, stream)) return false;
+  return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+}  // namespace
+
+bool ByteShuffleDevice(const void *device_in, void *device_out,
+                       size_t num_bytes, size_t elem_size) {
+  const uint8_t *in = static_cast<const uint8_t *>(device_in);
+  uint8_t *out = static_cast<uint8_t *>(device_out);
+  size_t n = 0;
+  int blocks = 0, threads = 0;
+  if (!PrepareLaunch(in, out, num_bytes, elem_size, &n, &blocks, &threads)) {
+    return false;
+  }
+  cudaStream_t stream = 0;
+  if (elem_size == 2) {
+    ShuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, n);
+  } else if (elem_size == 4) {
+    ShuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, n);
+  } else {
+    ShuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, n);
+  }
+  return FinishLaunch(in, out, num_bytes, n * elem_size, stream);
+}
+
+bool ByteUnshuffleDevice(const void *device_in, void *device_out,
+                         size_t num_bytes, size_t elem_size) {
+  const uint8_t *in = static_cast<const uint8_t *>(device_in);
+  uint8_t *out = static_cast<uint8_t *>(device_out);
+  size_t n = 0;
+  int blocks = 0, threads = 0;
+  if (!PrepareLaunch(in, out, num_bytes, elem_size, &n, &blocks, &threads)) {
+    return false;
+  }
+  cudaStream_t stream = 0;
+  if (elem_size == 2) {
+    UnshuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, n);
+  } else if (elem_size == 4) {
+    UnshuffleKernel<4><<<blocks, threads, 0, stream>>>(in, out, n);
+  } else {
+    UnshuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, n);
+  }
+  return FinishLaunch(in, out, num_bytes, n * elem_size, stream);
+}
+
+}  // namespace ctp::compress::preprocess
