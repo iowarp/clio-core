@@ -25,6 +25,14 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
 # (Q-table/linreg/XGBoost) stay untouched either way.
 if(CLIO_CORE_ENABLE_CUDA)
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC neuropress_nn_gpu_kernels.cu)
+    # Device-native entropy/MAD/second-derivative computation (issue #693
+    # follow-up): lets a caller resolving a CUDA-IPC device buffer feed
+    # NeuroPress's selection features without staging the buffer through
+    # host memory first. Lives next to its header under compress/preprocess/
+    # but is compiled into this target -- same rationale as the NeuroPress
+    # GPU kernels above: no separate install(EXPORT) entry needed.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -35,6 +43,9 @@ if(CLIO_CORE_ENABLE_CUDA)
             CACHE STRING "CUDA architectures to compile for" FORCE)
     endif()
     set_source_files_properties(neuropress_nn_gpu_kernels.cu PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu
+        PROPERTIES LANGUAGE CUDA)
     set_target_properties(clio_ctp_compress_model PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON
