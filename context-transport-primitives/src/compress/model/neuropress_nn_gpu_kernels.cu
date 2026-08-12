@@ -23,6 +23,8 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace ctp::compress::model::gpu {
 
@@ -66,7 +68,10 @@ struct NeuroPressGpuWeights {
 
   // Online-learning state (never serialized to .nnwt, matches upstream).
   float log_var[kOutputDim];
-  float ema[kParamCount];
+  // NOTE: the EMA gradient does NOT live here. Upstream keeps it per
+  // CompContext (ctx->d_sgd_grad_buffer's EMA_REGION) while the weights and
+  // sgd_call_count are global (nn_gpu.cu:64, :1413) -- so concurrent flows
+  // smooth their gradients independently but share the model. See EmaBuffer().
   int sgd_call_count;
 
   // Persistent scratch for Train() -- avoids per-call cudaMalloc.
@@ -82,6 +87,47 @@ struct NeuroPressGpuWeights {
   float out_grad[kParamCount];
   float dz4_all[kOutputDim][kHiddenDim];
 };
+
+namespace {
+
+/**
+ * Per-flow EMA gradient buffer.
+ *
+ * Upstream allocates one per CompContext (gpucompress_pool.cpp:121-123) and
+ * zeroes it at creation, so each concurrent compression flow has its own
+ * gradient history for the anti-flip damping AND for the update itself --
+ * the weight step is `w -= step * EMA[...]` (nn_gpu.cu:1523-1528), not the
+ * raw gradient. Clio has no CompContext at this layer, so the equivalent
+ * scope is the worker thread. Weights and sgd_call_count stay shared, which
+ * is upstream's split exactly.
+ *
+ * Registered globally so a model reload can zero every live buffer, matching
+ * upstream's resetAllSGDEMABuffers() on reload.
+ */
+std::mutex g_ema_registry_mutex;
+std::vector<float *> g_ema_registry;
+
+float *EmaBuffer() {
+  static thread_local float *buf = [] {
+    float *p = nullptr;
+    if (cudaMalloc(&p, kParamCount * sizeof(float)) != cudaSuccess) return
+        static_cast<float *>(nullptr);
+    cudaMemset(p, 0, kParamCount * sizeof(float));
+    std::lock_guard<std::mutex> lock(g_ema_registry_mutex);
+    g_ema_registry.push_back(p);
+    return p;
+  }();
+  return buf;
+}
+
+void ResetAllEmaBuffers() {
+  std::lock_guard<std::mutex> lock(g_ema_registry_mutex);
+  for (float *p : g_ema_registry) {
+    if (p) cudaMemset(p, 0, kParamCount * sizeof(float));
+  }
+}
+
+}  // namespace
 
 NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len,
                                         const float *biases, size_t biases_len,
@@ -123,6 +169,10 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
     std::memcpy(host_params + dst_b_off[layer], biases + b_off[layer],
                 sizeof(float) * static_cast<size_t>(b_sizes[layer]));
   }
+
+  // A reload restarts learning: zero every flow's gradient history, as
+  // upstream's resetAllSGDEMABuffers() does.
+  ResetAllEmaBuffers();
 
   bool ok = true;
   ok &= cudaMemcpy(&device_w->params, host_params, sizeof(host_params),
@@ -334,7 +384,7 @@ __device__ __forceinline__ void ForwardOneLayer(
 __global__ void SGDKernel(NeuroPressGpuWeights *w,
                           const NeuroPressGpuSGDSample *__restrict__ samples,
                           int num_samples, float learning_rate,
-                          bool *out_applied) {
+                          float *__restrict__ ema, bool *out_applied) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
@@ -671,7 +721,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     // than upstream, precisely in the oscillation regime the damping exists
     // to suppress.
     float local_dot = 0.0f;
-    for (int i = t; i < kOffW5; i += kHiddenDim) local_dot += w->combined[i] * w->ema[i];
+    for (int i = t; i < kOffW5; i += kHiddenDim) local_dot += w->combined[i] * ema[i];
     s_reduce[t] = local_dot;
     __syncthreads();
     for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
@@ -690,7 +740,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
 
   float ema_new = 1.0f - kEmaDecay;
   for (int i = t; i < kParamCount; i += kHiddenDim)
-    w->ema[i] = kEmaDecay * w->ema[i] + ema_new * w->combined[i];
+    ema[i] = kEmaDecay * ema[i] + ema_new * w->combined[i];
   __syncthreads();
 
   if (t == 0) w->sgd_call_count += 1;
@@ -708,7 +758,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     const int skip_b5 = kOffB5 + 1;
     for (int i = t; i < kParamCount; i += kHiddenDim) {
       if ((i >= skip_w5_begin && i < skip_w5_end) || i == skip_b5) continue;
-      float p = w->params[i] - step * w->ema[i];
+      float p = w->params[i] - step * ema[i];
       w->params[i] = fmaxf(-kWClamp, fminf(kWClamp, p));
     }
   }
@@ -729,7 +779,9 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
             sizeof(NeuroPressGpuSGDSample) * static_cast<size_t>(num_samples),
             cudaMemcpyHostToDevice);
 
-  SGDKernel<<<1, kHiddenDim>>>(w, d_samples, num_samples, learning_rate,
+  float *ema = EmaBuffer();
+  if (!ema) return false;
+  SGDKernel<<<1, kHiddenDim>>>(w, d_samples, num_samples, learning_rate, ema,
                                d_applied);
 
   bool applied = false;

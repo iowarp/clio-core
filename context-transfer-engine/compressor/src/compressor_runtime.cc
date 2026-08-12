@@ -1408,12 +1408,40 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             }
 
             size_t alt_worst_case = alt_compress_size + (alt_compress_size / 20) + 1024;
-            std::vector<char> alt_output(alt_worst_case);
+
+            // Compress into DEVICE memory when the input is device-resident,
+            // as upstream does: it brackets only
+            // `s.comp_mgr->compress(d_alt_input, s.d_out, alt_cc)` with CUDA
+            // events, writing to a device buffer
+            // (gpucompress_compress.cpp:868-870). Handing nvcomp a host
+            // destination makes it stage the result back D2H INSIDE the
+            // measured window, so an explored sample's time was not on the
+            // same scale as the primary's -- and the two are compared
+            // directly, both against each other for the winner and as
+            // training labels.
+            std::vector<char> alt_output;
+            char *alt_out_ptr = nullptr;
+            ctp::ipc::AllocatorId alt_out_alloc;
+            if (ctp::IsDevicePointer(alt_input)) {
+              alt_out_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+                  /*gpu_id=*/0,
+                  clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                  alt_worst_case, &alt_out_ptr);
+              if (!alt_out_alloc.IsNull()) {
+                explore_gpu_scratch.push_back(alt_out_alloc);
+              } else {
+                alt_out_ptr = nullptr;
+              }
+            }
+            if (!alt_out_ptr) {
+              alt_output.resize(alt_worst_case);
+              alt_out_ptr = alt_output.data();
+            }
             size_t alt_compressed_size = alt_worst_case;
 
             auto alt_start = std::chrono::high_resolution_clock::now();
             bool alt_ok = alt_compressor->Compress(
-                alt_output.data(), alt_compressed_size, alt_input,
+                alt_out_ptr, alt_compressed_size, alt_input,
                 alt_compress_size);
             double alt_time_ms = std::chrono::duration<double, std::milli>(
                                      std::chrono::high_resolution_clock::now() -
@@ -1446,10 +1474,16 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   alt_compressed_size + sizeof(CompressionHeader);
               if (winner_total < chunk_size) {
                 have_winner = true;
-                winner_payload.assign(
-                    alt_output.begin(),
-                    alt_output.begin() +
-                        static_cast<long>(alt_compressed_size));
+                // Pull the winner's bytes back AFTER the measurement, so the
+                // copy never lands inside the timed window.
+                winner_payload.resize(alt_compressed_size);
+                if (ctp::IsDevicePointer(alt_out_ptr)) {
+                  ctp::DeviceAwareMemcpy(winner_payload.data(), alt_out_ptr,
+                                         alt_compressed_size);
+                } else {
+                  std::memcpy(winner_payload.data(), alt_out_ptr,
+                              alt_compressed_size);
+                }
                 winner_lib = alt->compress_lib_;
                 winner_preset_id = alt_preset_id;
                 winner_shuffle = alt_applied_shuffle;
