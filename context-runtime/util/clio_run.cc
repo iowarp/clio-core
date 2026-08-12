@@ -17,6 +17,9 @@ void PrintUsage() {
             << "  start           Start the Clio runtime server\n"
             << "  restart         Restart the Clio runtime (WAL replay)\n"
             << "  stop            Stop the Clio runtime server\n"
+            << "                  (--force: immediate ungraceful stop;\n"
+            << "                   --grace-period <ms>: drain budget)\n"
+            << "  status          Report runtime state (running/stopped/stale)\n"
             << "  migrate         Migrate a container to a different node\n"
             << "  monitor         Monitor worker statistics\n"
             << "  compose         Manage pools from a compose config:\n"
@@ -67,6 +70,8 @@ int main(int argc, char* argv[]) {
       return RuntimeRestart(new_argc, new_argv);
     } else if (cmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
+    } else if (cmd == "status") {
+      return RuntimeStatus(new_argc, new_argv);
     } else if (cmd == "refresh") {
       return RefreshRepo(new_argc, new_argv);
     } else if (cmd == "migrate") {
@@ -103,6 +108,8 @@ int main(int argc, char* argv[]) {
       return RuntimeRestart(new_argc, new_argv);
     } else if (subcmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
+    } else if (subcmd == "status") {
+      return RuntimeStatus(new_argc, new_argv);
     } else {
       std::cerr << "Unknown runtime subcommand: " << subcmd << "\n";
       std::cerr << "Usage: " << g_progname

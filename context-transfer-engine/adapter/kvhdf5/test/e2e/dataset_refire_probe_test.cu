@@ -39,7 +39,7 @@
 #include <clio_runtime/singletons.h>
 #include <clio_ctp/util/gpu_api.h>
 
-#include <clio_cte/kvhdf5/cpu_dataset.h>      // Layout
+#include <clio_cte/kvhdf5/layout.h>           // Layout
 #include <clio_cte/kvhdf5/gpu_cte_dataset.h>
 #include <clio_cte/kvhdf5/tag_path.h>         // CanonicalTag
 

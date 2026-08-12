@@ -1,7 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <clio_cte/kvhdf5/tag_path.h>
 #include <clio_cte/kvhdf5/chunking.h>
-#include <clio_cte/kvhdf5/cpu_dataset.h>
+#include <clio_cte/kvhdf5/dataset_meta.h>
 #include <string_view>
 #include <array>
 

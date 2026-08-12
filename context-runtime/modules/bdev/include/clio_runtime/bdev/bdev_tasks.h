@@ -39,6 +39,9 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
+#include <string>
+
 #include "autogen/bdev_methods.h"
 // Include admin tasks for BaseCreateTask
 #include <clio_runtime/admin/admin_tasks.h>
@@ -86,6 +89,32 @@ enum class BdevType : clio::run::u32 {
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
   kS3 = 5,      // Amazon S3 object store backend
   kGcs = 6      // Google Cloud Storage object store backend
+};
+
+/**
+ * When a memory-backed bdev (kRam / kPinned) commits its backing pages.
+ *
+ * Lazy allocation inside the I/O path is expensive, and for kPinned it is
+ * pathological: a cudaMallocHost(1 GiB) executed on the first write to a page
+ * costs ~550 ms, paid by whichever I/O happened to touch that page first. Even
+ * for pageable kRam, a never-touched page faults in 4 KiB at a time under the
+ * writer, which pins a GPU device->host copy to the slowest path the driver
+ * offers (~12 GB/s cold vs ~18 GB/s warm vs ~27 GB/s pinned, measured).
+ * kEager moves that cost to Init(), off the I/O path.
+ *
+ * kLazy is the escape hatch in the other direction: a pool may DECLARE a large
+ * RAM capacity it never actually fills, and eagerly committing the declared
+ * size would waste — or on a shared node, exhaust — physical memory. kLazy
+ * keeps the pre-fix behaviour of allocating pages only on first touch.
+ *
+ * kAuto is the default and preserves existing behaviour: preallocate exactly
+ * when the pool was given an explicit size, since a sized pool is one whose
+ * memory footprint the operator has already agreed to.
+ */
+enum class AllocPolicy : clio::run::u32 {
+  kAuto = 0,   // Preallocate iff total_size_ != 0 (default)
+  kEager = 1,  // Always preallocate + pre-fault in Init() (needs a known size)
+  kLazy = 2,   // Allocate pages on first touch, in the I/O path
 };
 
 /**
@@ -160,6 +189,11 @@ struct CreateParams {
 
   // Persistence level for this block device
   PersistenceLevel persistence_level_ = PersistenceLevel::kVolatile;
+
+  // When a memory-backed bdev commits its pages (see AllocPolicy). Defaulted
+  // here rather than in each constructor so every existing caller — and every
+  // ctor below — keeps today's behaviour without being touched.
+  AllocPolicy alloc_policy_ = AllocPolicy::kAuto;
 
   // Path to the persistent allocator-state log (WAL). Empty => logging
   // disabled (no file created), preserving pre-WAL behavior.
@@ -259,7 +293,8 @@ struct CreateParams {
   template <class Archive>
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
-       persistence_level_, alloc_log_path_, growth_unit_, populate_unit_);
+       persistence_level_, alloc_policy_, alloc_log_path_, growth_unit_,
+       populate_unit_);
   }
 
   /**
@@ -294,6 +329,32 @@ struct CreateParams {
     if (config["capacity"]) {
       std::string capacity_str = config["capacity"].as<std::string>();
       total_size_ = ctp::ConfigParse::ParseSize(capacity_str);
+    }
+
+    // Load page allocation policy (optional, defaults to auto). Case-insensitive;
+    // an unrecognized value falls back to kAuto with a warning rather than
+    // failing the pool creation.
+    if (config["alloc"]) {
+      std::string alloc_str = config["alloc"].as<std::string>();
+      std::string alloc_lc;
+      alloc_lc.reserve(alloc_str.size());
+      for (char c : alloc_str) {
+        alloc_lc.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+      }
+      if (alloc_lc == "auto") {
+        alloc_policy_ = AllocPolicy::kAuto;
+      } else if (alloc_lc == "eager") {
+        alloc_policy_ = AllocPolicy::kEager;
+      } else if (alloc_lc == "lazy") {
+        alloc_policy_ = AllocPolicy::kLazy;
+      } else {
+        alloc_policy_ = AllocPolicy::kAuto;
+        HLOG(kWarning,
+             "bdev: unknown alloc policy '{}' (expected auto|eager|lazy); "
+             "falling back to auto",
+             alloc_str);
+      }
     }
 
     // Load io_depth (optional)

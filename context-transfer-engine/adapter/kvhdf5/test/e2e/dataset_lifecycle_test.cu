@@ -33,9 +33,10 @@
 #include <clio_runtime/singletons.h>
 #include <clio_ctp/util/gpu_api.h>
 
-#include <clio_cte/kvhdf5/cpu_dataset.h>      // Layout
+#include <clio_cte/kvhdf5/layout.h>           // Layout
 #include <clio_cte/kvhdf5/gpu_cte_dataset.h>
 #include <clio_cte/kvhdf5/tag_path.h>         // CanonicalTag (verify the same tag FromPath made)
+#include <clio_cte/kvhdf5/meta_blob.h>        // MetaBlob / DecodeMeta (verify FromPath's __meta)
 
 #include <cstdio>
 #include <cstring>
@@ -313,6 +314,83 @@ TEST_CASE("DISC sync-large-2x iterative lifecycle (nt1)",
     (void)kvhdf5::itest::SharedCteEnv();
     RunLifecycle(/*snapshots=*/40, /*chunks=*/4, /*chunk_bytes=*/512u * 1024u,
                  "results/synclarge2x/2026");
+}
+
+// Self-describing-export de-risk: prove that a REAL GPU producer, going through
+// GpuCteDataset::FromPath, publishes a __meta blob into the live CTE store that
+// decodes back to the exact Layout it was built with. This is the one link the
+// CPU tests cannot cover: the format round-trip is unit-tested (meta_blob_test)
+// and the ExportData reader is integration-tested against hand-seeded blobs
+// (cae_export_data), but only a GPU producer run exercises FromPath actually
+// firing WriteDatasetMeta against a running runtime. A 2-D f32 layout so rank>1,
+// the chunk-coordinate names, and the dtype/elem_size fields are all exercised.
+TEST_CASE("GPU producer publishes a decodable __meta blob via FromPath",
+          "[integration][gpu][cte][meta]") {
+    (void)kvhdf5::itest::SharedCteEnv();
+    auto* ipc = CLIO_CPU_IPC;
+    REQUIRE(ipc->GetGpuIpcManager() != nullptr);
+    clio::run::IpcManagerGpuInfo gpu_info =
+        ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
+    REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
+    auto* cte_client = CLIO_CTE_CLIENT;
+
+    // 2-D: 4x6 elements of f32 in 2x3 chunks => 2x2 == 4 chunks.
+    kvhdf5::Layout layout{/*dims=*/{4, 6}, /*chunk_dims=*/{2, 3},
+                          /*elem_size=*/sizeof(float)};
+    layout.dtype = kvhdf5::DType::kF32;
+    REQUIRE(layout.Valid());
+    REQUIRE(layout.ChunkCount() == 4);
+
+    const char* path = "results/export/2026/temperature";
+    {
+        kvhdf5::GpuCteDataset ds = kvhdf5::GpuCteDataset::FromPath(
+            ipc, gpu_info, /*gpu_id=*/0, cte_client, path, layout);
+        REQUIRE(ds.ChunkCount() == 4);
+        LifecycleFillWriteKernel<<<1, 32>>>(ds.Handle(), /*seed=*/0x11u);
+        ctp::GpuApi::Synchronize();
+        ds.ThrowIfIoFailed("meta-publish test");
+    }
+
+    // Read the __meta blob back from the store (after destruct: it persists in
+    // CTE, not in the freed GPU buffer) and decode it.
+    clio::cte::core::TagId tag =
+        MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str());
+
+    auto size_task = cte_client->AsyncGetBlobSize(tag, kvhdf5::kMetaBlobName);
+    size_task.Wait();
+    REQUIRE(size_task->GetReturnCode() == 0);
+    REQUIRE(size_task->size_ == sizeof(kvhdf5::MetaBlob));
+
+    auto raw = HostReadBlob(tag, kvhdf5::kMetaBlobName, sizeof(kvhdf5::MetaBlob));
+    kvhdf5::MetaBlob meta;
+    REQUIRE(kvhdf5::DecodeMeta(raw.data(), raw.size(), &meta));
+
+    // It must describe exactly the layout the producer was built with.
+    CHECK(meta.rank == 2);
+    CHECK(meta.Dtype() == kvhdf5::DType::kF32);
+    CHECK(meta.elem_size == sizeof(float));
+    CHECK(meta.dims[0] == 4);
+    CHECK(meta.dims[1] == 6);
+    CHECK(meta.chunk_dims[0] == 2);
+    CHECK(meta.chunk_dims[1] == 3);
+    CHECK(meta.ChunkCount() == 4);
+
+    // And the chunk blobs must actually be there under their coordinate names,
+    // sized as __meta claims -- exactly what ExportData will pull and write.
+    const uint64_t chunk_bytes = meta.ChunkBytes();
+    CHECK(chunk_bytes == 2u * 3u * sizeof(float));
+    for (uint64_t ci = 0; ci < 2; ++ci)
+        for (uint64_t cj = 0; cj < 2; ++cj) {
+            const std::string name =
+                std::to_string(ci) + "_" + std::to_string(cj);
+            auto cs = cte_client->AsyncGetBlobSize(tag, name);
+            cs.Wait();
+            REQUIRE(cs->GetReturnCode() == 0);
+            CHECK(cs->size_ == chunk_bytes);
+        }
+
+    std::fprintf(stderr,
+                 "[ok] FromPath published a decodable 2-D f32 __meta + 4 chunks\n");
 }
 
 #endif  // !CTP_IS_DEVICE_PASS

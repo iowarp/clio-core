@@ -3,6 +3,8 @@
  * All rights reserved.
  */
 
+#include <cerrno>
+#include <cstring>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_runtime/clio_runtime.h>
@@ -74,7 +76,13 @@ bool FsBdevTransport::Init(const CreateParams& params,
 
   auto setup_io = OpenBackingFile(io_depth_, file_path_);
   if (!setup_io) {
-    HLOG(kError, "Failed to open bdev file: {}", file_path_);
+    // errno from the last open attempt. Without it this message says only
+    // "it did not work", and a permission problem on a leftover file is
+    // indistinguishable from a missing io_uring or a full disk -- which is
+    // exactly the ambiguity that made a stale scratch file look like a broken
+    // driver.
+    HLOG(kError, "Failed to open bdev file: {} ({})", file_path_,
+         strerror(errno));
     return false;
   }
 

@@ -36,6 +36,7 @@
 
 #include "clio_runtime/api.h"
 #include "clio_runtime/types.h"
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -124,6 +125,38 @@ class RuntimeManager {
    */
   bool IsInitializing() const;
 
+  /** How a requested runtime stop should be carried out */
+  enum class StopMode {
+    kGraceful, /**< full teardown (ServerFinalize) guarded by a watchdog */
+    kForce     /**< immediate death: unlink artifacts, then _exit(0) */
+  };
+
+  /**
+   * Request an asynchronous shutdown of this runtime process.
+   *
+   * Safe to call from any thread, including a worker executing a task
+   * (the admin StopRuntime handler): it never tears down state inline.
+   * kGraceful sets a flag the runtime main loop polls (see IsStopRequested)
+   * so the proven normal-exit path (atexit -> ServerFinalize) runs on the
+   * main thread, and spawns a detached watchdog that force-exits the process
+   * (exit code 2, artifacts unlinked) if teardown wedges past
+   * grace_period_ms plus a fixed margin. kForce spawns a detached thread
+   * that briefly waits for the task ack to flush, unlinks this runtime's
+   * filesystem artifacts, and _exit(0)s without running atexit handlers.
+   * Re-entrant calls are ignored; no-op unless in runtime mode.
+   *
+   * @param mode graceful (default stop) or force (stop --force)
+   * @param grace_period_ms budget for draining in-flight tasks
+   */
+  void RequestStop(StopMode mode, u32 grace_period_ms);
+
+  /**
+   * Check whether a graceful stop has been requested via RequestStop.
+   * Polled by the runtime main loop (clio_run start/restart).
+   * @return true if a stop was requested
+   */
+  bool IsStopRequested() const;
+
  public:
   bool is_restart_ = false;  /**< If true, force restart on compose pools and replay WAL */
 
@@ -136,7 +169,9 @@ class RuntimeManager {
   bool client_is_initializing_ = false;
   bool runtime_is_initializing_ = false;
 
-
+  std::atomic<bool> stop_requested_{false};    /**< set once by RequestStop */
+  std::atomic<bool> finalize_complete_{false}; /**< ServerFinalize finished */
+  std::atomic<u32> stop_grace_period_ms_{5000}; /**< drain budget for stop */
 };
 
 }  // namespace clio::run

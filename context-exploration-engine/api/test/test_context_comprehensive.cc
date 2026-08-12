@@ -78,9 +78,73 @@ public:
 
   static constexpr size_t kSmallFileSize = 2048;  // 2KB for quick tests
 
+  static std::string ConfigPath() {
+    return chi_test_data_dir() + "/cee_comprehensive_config.yaml";
+  }
+
+  /**
+   * Hermetic compose: cae_main(400) -> indexer(564) -> cte_main(512).
+   *
+   * The chain CANNOT be established by the AsyncCreate calls below, because
+   * a pool create by id on an already-existing pool returns that pool
+   * untouched — whoever creates first decides the chain. The runtime's
+   * server config composes the CAE pool at boot, so on any machine that has
+   * one (~/.clio/clio.yaml ships a cae_main -> cte_main entry) the creates
+   * here are no-ops and every CAE write bypasses the indexer, leaving the
+   * BM25 test with an empty index. Pinning CLIO_SERVER_CONF to this file
+   * makes the composition the test's own on every machine.
+   */
+  void CreateConfigFile() {
+    std::ofstream f(ConfigPath());
+    if (!f.is_open()) {
+      throw std::runtime_error("Failed to write " + ConfigPath());
+    }
+    f << R"(
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: 512.0
+    storage:
+      - path: "ram::cee_test_ram"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  # SemanticSearch lives here (issue #905); it must sit between CAE and the
+  # core so assimilated content is indexed on the way down.
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: 564.0
+    next_pool_id: "512.0"
+
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: 400.0
+    next_pool_id: "564.0"
+)";
+  }
+
   CEEComprehensiveFixture() {
     if (!g_initialized) {
       INFO("=== Initializing CEE Test Environment ===");
+
+      // Compose THIS test's pool chain, and keep the restart log private so
+      // a developer's ~/.clio/restart_log.bin cannot replay foreign pools
+      // into the runtime this test spawns.
+      CreateConfigFile();
+      ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", ConfigPath().c_str(), 1);
+      ctp::SystemInfo::Setenv(
+          "CLIO_RESTART_LOG",
+          (chi_test_data_dir() + "/cee_comprehensive_restart.bin").c_str(), 1);
 
       // Initialize CLIO Runtime runtime
       bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
@@ -124,7 +188,9 @@ public:
       reg_task.Wait();
 
       // Create the indexer pool over the core (issue #905): it owns
-      // SemanticSearch, so the BM25 query tests need it in the chain.
+      // SemanticSearch, so the BM25 query tests need it in the chain. The
+      // compose above already built it; this is the fallback for a runtime
+      // that came up without our config (and a no-op otherwise).
       {
         clio::cte::indexer::Client indexer_client;
         clio::cte::indexer::IndexerConfig indexer_params;
@@ -148,7 +214,8 @@ public:
       // second create by id just returns the existing pool — so whoever
       // creates first decides the chain. CAE's internal CTE writes
       // (ParseOmni assimilation, labeling) must flow through the indexer
-      // to be searchable.
+      // to be searchable. The compose config is what actually guarantees
+      // that (it runs at server boot, before any client gets here).
       clio::cae::core::Client cae_client;
       clio::cae::core::CreateParams cae_params;
       cae_params.next_pool_id_ = clio::cte::indexer::kIndexerPoolId;

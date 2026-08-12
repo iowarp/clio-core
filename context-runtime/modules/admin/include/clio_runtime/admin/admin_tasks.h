@@ -532,6 +532,10 @@ struct DestroyPoolTask : public clio::run::Task {
  * StopRuntimeTask - Stop the entire CLIO Runtime runtime
  */
 struct StopRuntimeTask : public clio::run::Task {
+  /** shutdown_flags_ bit: skip the graceful teardown — unlink this runtime's
+   *  filesystem artifacts and _exit(0) immediately (clio_run stop --force) */
+  static constexpr clio::run::u32 kForceShutdown = 0x1;
+
   // Runtime shutdown parameters
   IN clio::run::u32 shutdown_flags_;   ///< Flags controlling shutdown behavior
   IN clio::run::u32 grace_period_ms_;  ///< Grace period for clean shutdown

@@ -149,6 +149,11 @@ models/
 
 claude-log.json
 
+# Benchmark output trees (logs/csv/raw/progress.log). The DRIVERS are tracked (e.g.
+# context-transfer-engine/adapter/kvhdf5/test/e2e/scaling_campaign/run_campaign.sh);
+# their multi-hundred-MB results are not. Override per-run with CAMPAIGN_RESULTS=<dir>.
+bench_results/
+
 # Windows firewall allow-rule marker (scripts/windows/allow_firewall.ps1)
 .clio_firewall_allowed
 context-runtime/test/integration/collective_restart/docker-compose.override.yml
@@ -161,3 +166,7 @@ docker-compose.override.yml
 # test containers, never part of the build.
 abrt_bt.c
 abrt_bt.so
+
+# Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
+# Generated output, never source.
+demologs/

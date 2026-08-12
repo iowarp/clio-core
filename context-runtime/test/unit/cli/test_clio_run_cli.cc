@@ -474,11 +474,17 @@ TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
 
 TEST_CASE("CliClientError - commands fail fast without a runtime",
           "[cli][client_error]") {
-  SECTION("stop fails when no runtime is up");
-  REQUIRE(RunCli("stop") == 1);
+  // stop is convergent/idempotent (issue #710): "ensure the runtime is down
+  // and its artifacts are gone". With no runtime and nothing to sweep it
+  // succeeds instead of erroring, so `clio_run stop` can be retried blindly.
+  SECTION("stop succeeds (idempotently) when no runtime is up");
+  REQUIRE(RunCli("stop") == 0);
 
-  SECTION("legacy runtime stop fails the same way");
-  REQUIRE(RunCli("runtime stop") == 1);
+  SECTION("legacy runtime stop behaves the same way");
+  REQUIRE(RunCli("runtime stop") == 0);
+
+  SECTION("status reports not-running when no runtime is up");
+  REQUIRE(RunCli("status") != 0);
 
   SECTION("monitor --once fails after successful arg parse");
   REQUIRE(RunCli("monitor --once --json --verbose --interval 2") == 1);

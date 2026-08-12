@@ -36,6 +36,7 @@
 
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
+#include "clio_runtime/gpu/submit_probe.h"
 
 namespace clio::run {
 
@@ -56,6 +57,13 @@ struct IpcManagerGpuInfo {
 
   /** Ring-buffer depth per lane (informational). */
   u32 gpu_queue_depth = 16;
+
+  /** Submit-path latency probe (measurement builds only; default off).
+   *  Carried by value so the kernel reaches it without another indirection;
+   *  `probe_.recs == nullptr` compiles every stamp down to a null check. Its
+   *  buffers live in DEVICE global memory, so an armed probe adds no PCIe
+   *  traffic to the submit path it measures. */
+  gpu::SubmitProbeDev probe_;
 
   CTP_CROSS_FUN IpcManagerGpuInfo() = default;
 };

@@ -1,0 +1,79 @@
+# Distributed clio_run-stop CI test (issue #710, "Distributed Jarvis Unit Test").
+#
+# Stands up a 2-node cluster wired with SSH, then drives Jarvis on node1 to
+# start the IOWarp runtime on BOTH nodes and stop it via Jarvis's PsshExec
+# fan-out of `clio_run runtime stop` / `stop --force`. The test asserts that
+# after the stop, EVERY node reports a clean shutdown with zero stale runtime
+# artifacts (`clio_run runtime status`).
+#
+# One entrypoint.sh serves both nodes, branching on NODE_ID:
+#   node1 (primary)   : SSH + Jarvis bring-up, runs the stop gate, exit code IS
+#                       the test result.
+#   node2 (secondary) : SSH server only; its runtime is started/stopped remotely
+#                       by Jarvis (pssh from node1).
+#
+# Usage:
+#   ./run_tests.sh
+#   HOST_WORKSPACE=/host/path/to/workspace ./run_tests.sh   # devcontainers
+
+services:
+  chimaera-stop-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: chimaera-stop-node1
+    hostname: iowarp-jarvis-stop-node1
+    networks:
+      chimaera-stop-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.30.0.10
+      - PATH=/workspace/build/bin:/home/iowarp/venv/bin:/home/iowarp/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      # Prefer a workspace jarvis-cd checkout over the older one baked into
+      # iowarp/deps-* images, when one is present. PYTHONPATH is processed
+      # before site-packages; a non-existent path is simply ignored, so this
+      # transparently falls back to the venv's jarvis-cd.
+      - PYTHONPATH=/workspace/external/jarvis-cd
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/chimaera_stop/entrypoint.sh
+
+  chimaera-stop-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: chimaera-stop-node2
+    hostname: iowarp-jarvis-stop-node2
+    networks:
+      chimaera-stop-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.30.0.11
+      - PATH=/workspace/build/bin:/home/iowarp/venv/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      - PYTHONPATH=/workspace/external/jarvis-cd
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/chimaera_stop/entrypoint.sh
+
+networks:
+  chimaera-stop-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

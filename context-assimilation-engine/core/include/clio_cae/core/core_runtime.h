@@ -186,6 +186,14 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ExportData(clio::run::shared_ptr<ExportDataTask> &task);
 
   /**
+   * ImportData - Import an HDF5 dataset from a file into a CTE tag
+   * (Method::kImportData). The inverse of ExportData; reads the dataset at the
+   * in-file path equal to the tag name and stores it in the kvhdf5 form.
+   * @return TaskResume for coroutine suspension/resumption
+   */
+  clio::run::TaskResume ImportData(clio::run::shared_ptr<ImportDataTask> &task);
+
+  /**
    * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
    * Each forwards the inbound task to the configured next CTE pool. No
    * labeling/intelligence yet — just passthrough so a client pointed at

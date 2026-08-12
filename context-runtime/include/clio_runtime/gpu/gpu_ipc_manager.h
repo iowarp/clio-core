@@ -119,11 +119,11 @@ class IpcManager {
    * thread per CUDA block actually performs the enqueue; other threads
    * receive an empty future (mirrors today's threadIdx==0 guard).
    */
-  template <typename TaskT>
+  template <bool Probing = true, typename TaskT>
   CTP_CROSS_FUN gpu::Future<TaskT> Send(
       const ctp::ipc::FullPtr<TaskT> &task_ptr) {
 #if CTP_IS_GPU || CTP_IS_SYCL_DEVICE
-    return IpcGpu2Cpu::SendIn(this, task_ptr);
+    return IpcGpu2Cpu::SendIn<Probing>(this, task_ptr);
 #else
     (void)task_ptr;
     return gpu::Future<TaskT>();
@@ -158,6 +158,12 @@ class IpcManager {
   // ================================================================
 
   IpcManagerGpuInfo gpu_info_;
+
+  /** Submit-probe record the caller claimed for the Send now in flight.
+   *  The IpcManager is __shared__ (per CUDA block) and only thread 0 submits, so
+   *  the producer claims a slot, parks it here, and SendIn stamps into it — no
+   *  signature change to Send()/SendIn(). Meaningless when the probe is off. */
+  u32 probe_slot_ = gpu::kProbeNoSlot;
 
   // ================================================================
   // Host-only: per-device queues + client backend registration

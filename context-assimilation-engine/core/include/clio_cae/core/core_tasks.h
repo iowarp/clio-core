@@ -441,6 +441,78 @@ struct ExportDataTask : public clio::run::Task {
   }
 };
 
+/**
+ * ImportDataTask - Import an HDF5 dataset from a file into a CTE tag.
+ * The inverse of ExportDataTask: reads the dataset at the in-file path equal to
+ * `tag_name_` and writes it into that tag in the kvhdf5 store form (a __meta
+ * blob + one raw chunk blob per coordinate).
+ */
+struct ImportDataTask : public clio::run::Task {
+  IN clio::run::priv::string tag_name_;      // Tag to import into (== in-file path)
+  IN clio::run::priv::string input_path_;    // Source file path
+  IN clio::run::priv::string format_;        // Import format: "hdf5"
+  OUT clio::run::u32 result_code_;           // 0 = success
+  OUT clio::run::priv::string error_message_;
+  OUT clio::run::u64 bytes_imported_;
+
+  // SHM constructor
+  ImportDataTask()
+      : clio::run::Task(),
+        tag_name_(CTP_MALLOC),
+        input_path_(CTP_MALLOC),
+        format_(CTP_MALLOC),
+        result_code_(0),
+        error_message_(CTP_MALLOC),
+        bytes_imported_(0) {}
+
+  // Emplace constructor
+  explicit ImportDataTask(const clio::run::TaskId &task_node,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const std::string &tag_name,
+                          const std::string &input_path,
+                          const std::string &format)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kImportData),
+        tag_name_(CTP_MALLOC, tag_name),
+        input_path_(CTP_MALLOC, input_path),
+        format_(CTP_MALLOC, format),
+        result_code_(0),
+        error_message_(CTP_MALLOC),
+        bytes_imported_(0) {
+    task_id_ = task_node;
+    method_ = Method::kImportData;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_name_, input_path_, format_);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(result_code_, error_message_, bytes_imported_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<ImportDataTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_name_ = other->tag_name_;
+    input_path_ = other->input_path_;
+    format_ = other->format_;
+    result_code_ = other->result_code_;
+    error_message_ = other->error_message_;
+    bytes_imported_ = other->bytes_imported_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<ImportDataTask>());
+  }
+};
+
 // ---------------------------------------------------------------------------
 // CTE interceptor task typedefs. CAE forwards these tasks transparently to
 // the configured `next_pool_id` CTE core. The struct layout AND the

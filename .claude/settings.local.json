@@ -76,7 +76,10 @@
       "Bash(ps -eo pid,cmd)",
       "Bash(pkill -9 -f chi_rss)",
       "Read(//home/iowarp/.clio/**)",
-      "Bash(pkill -9 -f 'clio_run runtime\\\\|clio_run runtime')"
+      "Bash(pkill -9 -f 'clio_run runtime\\\\|clio_run runtime')",
+      "WebFetch(domain:www.pdsw.org)",
+      "Bash(docker exec *)",
+      "Bash(docker start *)"
     ],
     "deny": [],
     "ask": []

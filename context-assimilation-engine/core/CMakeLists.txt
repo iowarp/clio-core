@@ -163,6 +163,16 @@ if(HDF5_ENABLED)
   target_include_directories(clio_cae_core_runtime PRIVATE ${HDF5_INCLUDE_DIRS})
 endif()
 
+# ExportData reads the kvhdf5 __meta blob to reconstruct an N-D dataset, so it
+# needs kvhdf5's include path. We deliberately add the PATH ONLY and do NOT link
+# the clio::cte::kvhdf5 INTERFACE target: that target pulls in clio_run_cxx_gpu,
+# which would give this CPU-only chimod a CUDA dependency. The single header we
+# use (meta_blob.h) is a self-contained leaf with no CUDA and no kvhdf5 includes,
+# specifically so this stays true. If you ever need another kvhdf5 header here,
+# stop -- the rest of them include defines.h, which includes <cuda/std/*>.
+target_include_directories(clio_cae_core_runtime PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/adapter/kvhdf5/include)
+
 #------------------------------------------------------------------------------
 # Utilities
 #------------------------------------------------------------------------------

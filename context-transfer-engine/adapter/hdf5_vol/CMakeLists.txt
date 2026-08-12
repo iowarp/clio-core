@@ -29,6 +29,11 @@ add_library(clio_hdf5_vol SHARED
 
 target_include_directories(clio_hdf5_vol PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # The CTE root, so shared adapter headers resolve as "adapter/<name>.h" --
+    # the same spelling the VFD already uses for adapter/cfs/cfs_io.h. The
+    # config-string grammar is shared between the two connectors and must not be
+    # duplicated: one CLIO config dialect, one parser.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
     ${HDF5_INCLUDE_DIRS}
     ${HDF5_C_INCLUDE_DIRS}
 )

@@ -65,57 +65,70 @@ writes are valid native HDF5 files readable by standard tools.
 | `CLIO_VOL_CHUNK_SIZE` | 1 MiB | Blob chunk size for staging dataset images |
 | `CLIO_VOL_MAX_SERVE_BYTES` | 1 GiB | Datasets larger than this are not served from cache for partial reads (see below) |
 | `CLIO_VOL_TRACE` | unset | Directory for access telemetry (see below) |
+| `CLIO_VOL_STAMP_GRANULARITY_NS` | 10 ms | Bound on filesystem timestamp granularity. A coherence stamp is withheld when the file's mtime is younger than this, because mtime cannot then rule out a later same-granule write (see below) |
 
 `chunk_size` can also be set programmatically through `clio_vol_info_t` via
 `H5Pset_vol`; it is honoured identically on create and open.
+
+Value-initialize that struct — `clio_vol_info_t info = {};` — before filling in
+the fields you care about. It is a plain C struct, so a bare stack instance
+holds garbage. Zeroed fields mean "use the default": `chunk_size = 0` resolves
+to the default chunk size, and `cache_enabled = CLIO_VOL_CACHE_UNSET` leaves the
+tier to the environment. Disabling the cache from code takes an explicit
+`CLIO_VOL_CACHE_OFF`, so you can never switch the tier off by forgetting to set
+a field.
 
 ### Known limitations
 
 - **The under-VOL is always native.** `clio_vol_info_t::under_vol_id` is accepted
   but not used for stacking — the connector cannot currently sit above another
-  pass-through connector. Tracked as W12 in `translation/VOL_AUDIT.md`.
+  pass-through connector. Tracked as W12; see `translation/VFD_VOL_PLAN.md` ("Architectural decisions" §3).
 - **Partial reads materialise the whole dataset.** Serving a hyperslab or point
   selection reassembles the full cached image and gathers out of it, so cost
   scales with the dataset rather than the selection. `CLIO_VOL_MAX_SERVE_BYTES`
   bounds the damage by falling back to native above the ceiling; narrowing the
   fetch to the chunks a selection touches is the real fix (W10).
 - **No capacity limit or eviction.** The tier grows without bound (W11).
-- **Cache staleness across external modification.** The tag is dropped when a
-  file is re-created, but a file modified *without* the connector between
-  sessions is not detected.
+- **Cache staleness during a session** (the between-sessions case is closed).
+  At close the connector records the file's identity and state --
+  `dev:ino:size:mtime` -- as a reserved blob in its own tag, and validates it at
+  open. Anything but an exact match drops the tag, so a file replaced or edited
+  behind HDF5's back between sessions is detected and the cache is not used for
+  it. A missing or unreadable stamp counts as a mismatch: the check is
+  fail-closed, so losing the stamp costs a cache miss and never a wrong answer.
 
-  This is sharper than "you may read slightly old data", and the error-path
-  tests ran into it head-on. A dataset was written, the file was then damaged
-  on disk so its stored bytes no longer matched their checksum, and the dataset
-  was read back: with caching **on**, the read *succeeded* and returned the
-  original values, because it was served from the staged copy. The file was
-  corrupt and the application was told everything was fine.
+  **Timestamp granularity.** For an in-place edit that does not change the
+  file's length, `dev`, `ino` and `size` are unchanged by construction, so
+  `mtime` is the stamp's only signal — and filesystem timestamps are coarse
+  (1 ms on ext4 at HZ=1000; a full second on some NFS mounts and FAT). Two
+  writes inside one granule get byte-identical mtimes, so a stamp taken inside
+  that window would match a file modified immediately afterwards. The stamp is
+  therefore **withheld** when the file's mtime is younger than
+  `CLIO_VOL_STAMP_GRANULARITY_NS` (default 10 ms): any stamp already stored is
+  dropped, and the next open sees no stamp and fails closed. This is the same
+  do-not-trust rule the absent and unreadable cases already follow. The cost is
+  a cache miss when a file is reopened within the window of its last write; the
+  `coherence.ambiguous` counter in the access telemetry reports how often that
+  happens, so a benchmark can attribute the miss rather than guess at it. Raise
+  the bound on a coarse-timestamp filesystem — that is also the setting where
+  storing a content hash at close would start to earn its cost.
 
-  So the cache does not merely go stale — **it can mask the authoritative
-  file's own errors**, which inverts the property the whole design rests on
-  (the native file is the source of truth and the cache is an accelerator).
-  The tests that exercise error propagation therefore run with caching off,
-  because with it on there is no error to observe.
+  What this does **not** cover is modification *while the file is open*. That is
+  the multi-process problem and is explicitly undefined here — see the §1.6
+  concurrency matrix. Do not read the closed between-sessions case as meaning
+  external modification is handled in general.
 
-  The architectural question this raises: **what establishes that a cached
-  image still corresponds to the file, and where does that check live?** These
-  are TWO questions, and running them together makes a cheap fix look gated
-  behind an expensive one:
+  The finding that drove this: a dataset was written, the file was damaged on
+  disk so its stored bytes no longer matched their checksum, and the dataset was
+  read back. With caching on, the read *succeeded* and returned the original
+  values from the staged copy — the file was corrupt and the application was
+  told everything was fine. The cache did not merely go stale, it **masked the
+  authoritative file's own error**, inverting the property the design rests on.
+  That case is now covered: the stamp mismatches, the tag is dropped, and the
+  read fails exactly as native does. It is pinned by
+  `corrupt_checksum_read` in the error-parity axis of the compat suite, in both
+  cache-on and cache-off modes.
 
-  - **Coherence** — does the cached copy still match the file? Only the
-    *adapter* can answer, since only it knows which POSIX file a tag stands
-    for. That is this gap, and a stamp captured at close and validated at open
-    closes the between-sessions case (not the during-a-session one, which is
-    the multi-process problem and is declared undefined).
-  - **Residency** — is a byte range actually present in the tier, or a hole the
-    tier will silently zero-fill? Only the *tier* can answer. This is a
-    different problem that this connector does not currently have; it is what
-    stalls the VFD read tier and what makes the filesystem adapter's
-    shared-memory read path give up whenever any page might be missing, because
-    it cannot tell an absent page from a zero-filled one.
-
-  See `translation/VFD_VOL_PLAN.md` "Architectural decisions" §1: the residency
-  half belongs at the chimod, the coherence half stays with the adapter.
 - **No `HDF5_VOL_CONNECTOR` config string** — `info_cls.from_str` is not
   implemented, so options come from the environment variables above (W14).
 
@@ -136,7 +149,13 @@ artifacts are written to `<dir>`:
   bytes from tier vs native, write mirroring, storage **layout** (chunked? chunk
   dims, aligned vs misaligned read counts — the rechunk signal), **read latency**
   split cache-vs-native, transfer-size min/max/mean, and the count of distinct vs
-  maximally-repeated read selections (the cache/prefetch signal).
+  maximally-repeated read selections (the cache/prefetch signal). Plus a file-level
+  `coherence` block — `{matched, mismatched, absent, ambiguous}` — recording what
+  the stamp said. Every outcome except `matched` shows up in the read counts as
+  plain `native`, so without this a low hit rate cannot be attributed: a cold
+  file, an evicted stamp, a file genuinely changed between sessions, and one the
+  connector declined to trust on timestamp grounds are four different findings.
+  `ambiguous` is the self-inflicted one — see the granularity note above.
 
 Filenames carry the pid so concurrent processes (e.g. MPI ranks) don't clobber
 each other's output.

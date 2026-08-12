@@ -42,7 +42,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(clio_cte_stdio_unit_tests PROPERTIES
         ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-        RESOURCE_LOCK "clio_runtime_port"
+        RESOURCE_LOCK "clio_runtime"
         TIMEOUT 120
         LABELS "msan_skip")
 endif()

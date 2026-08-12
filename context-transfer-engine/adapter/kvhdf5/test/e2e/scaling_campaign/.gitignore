@@ -1,0 +1,9 @@
+# Code lives here; campaign OUTPUT does not. run_campaign.sh writes to $CAMPAIGN_RESULTS
+# (default: /workspace/bench_results/scaling-campaign, gitignored via the root .gitignore),
+# so nothing below should normally appear. This is a guard against a stray `> progress.log`
+# landing in the script's own directory and getting committed.
+*.log
+progress.log
+logs/
+csv/
+raw/

@@ -59,6 +59,20 @@ if(CLIO_CORE_ENABLE_CUDA)
   add_test(NAME test_gpu_async_copy_gpu COMMAND test_gpu_async_copy_gpu)
   set_tests_properties(test_gpu_async_copy_gpu PROPERTIES TIMEOUT 60)
 
+  # Spinning-kernel vs concurrent D2H copy. Guards the invariant the GPU->CPU
+  # submit path relies on: a resident, spinning kernel must NOT starve the CPU's
+  # device->host copy on its own non-blocking stream (see the file header).
+  add_cuda_executable(test_gpu_spin_kernel_copy_gpu TRUE
+    test_gpu_spin_kernel_copy_gpu.cc
+    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS})
+  target_link_libraries(test_gpu_spin_kernel_copy_gpu
+    ctp::cuda_cxx
+    Catch2::Catch2WithMain
+  )
+  add_test(NAME test_gpu_spin_kernel_copy_gpu
+           COMMAND test_gpu_spin_kernel_copy_gpu)
+  set_tests_properties(test_gpu_spin_kernel_copy_gpu PROPERTIES TIMEOUT 120)
+
   # BuddyAllocator GPU test
   add_cuda_executable(test_buddy_alloc_gpu TRUE test_buddy_alloc_gpu.cc
     INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS})

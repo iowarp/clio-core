@@ -16,6 +16,7 @@ kMonitor: 9       # 9 - Monitor container state
 kParseOmni: 10               # Parse OMNI YAML file and schedule assimilation tasks
 kProcessHdf5Dataset: 11      # Process HDF5 dataset
 kExportData: 12              # Export all blobs in a CTE tag to a file
+kImportData: 13              # Import an HDF5 dataset from a file into a CTE tag
 
 # CTE Interceptor Methods (forward to next_pool_id CTE core).
 # These IDs MUST match clio::cte::core::Method::k* (see

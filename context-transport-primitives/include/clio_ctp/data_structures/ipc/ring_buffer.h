@@ -73,8 +73,26 @@ enum RingQueueFlag : uint32_t {
   RING_BUFFER_FIXED_SIZE = 0x20,
   /** Serialize Pop() with a ctp::Mutex (enables multi-consumer / MPMC) */
   RING_BUFFER_LOCK_POP = 0x40,
+  /**
+   * The consumer of this ring is the HOST, and the ring lives in pinned host
+   * memory. Set this on any ring a GPU kernel produces into but a CPU thread
+   * drains (e.g. the gpu2cpu lane).
+   *
+   * It makes the WAIT_FOR_SPACE spin re-read head_ with a system-scope
+   * (volatile) load instead of a device-scope one. This is a correctness
+   * requirement, not a tuning knob: load_device() is implemented as
+   * atomicAdd(&head_, 0), i.e. a read-modify-WRITE. A device-scope RMW against
+   * pinned host memory is not coherent with the host, so a parked GPU producer
+   * spinning on it writes its stale cached head_ straight back over the value
+   * the CPU consumer just stored -- destroying the consumer's progress and
+   * wedging the ring forever. A volatile load only reads, so it cannot clobber.
+   *
+   * Leave this CLEAR when the consumer is a GPU (device memory), where the
+   * device-scope load is both correct and faster.
+   */
+  RING_BUFFER_HOST_CONSUMER = 0x80,
   /** Serialize Push()/Emplace() with the same ctp::Mutex as LOCK_POP */
-  RING_BUFFER_LOCK_PUSH = 0x80
+  RING_BUFFER_LOCK_PUSH = 0x100
 };
 
 /**
@@ -214,6 +232,8 @@ class ring_buffer : public ShmContainer<AllocT> {
       (FLAGS & RING_BUFFER_ERROR_ON_NO_SPACE) != 0;
   static constexpr bool DynamicSize = (FLAGS & RING_BUFFER_DYNAMIC_SIZE) != 0;
   static constexpr bool LockPop = (FLAGS & RING_BUFFER_LOCK_POP) != 0;
+  static constexpr bool HostConsumer =
+      (FLAGS & RING_BUFFER_HOST_CONSUMER) != 0;
   static constexpr bool LockPush = (FLAGS & RING_BUFFER_LOCK_PUSH) != 0;
   static constexpr bool IsAtomic = IsMPSC;
 
@@ -459,6 +479,16 @@ class ring_buffer : public ShmContainer<AllocT> {
   bool Push(const T& val) { return Emplace(val); }
 
   /**
+   * TODO(ring): DEAD CODE -- PushSystem() has zero callers tree-wide, as does
+   * PopDevice() below. Since the gpu2cpu lane became a RING_BUFFER_HOST_CONSUMER
+   * ring (whose Emplace already does the right thing for a host consumer),
+   * PushSystem is largely redundant with it. Either delete both, or fold
+   * PushSystem's behaviour into the HostConsumer branch so there is ONE
+   * producer path per scope rather than two that can drift apart. Note the
+   * stale cross-reference this already caused: Emplace's spin used to cite
+   * "see PopDevice comment" to justify a device-scope load -- pointing at dead
+   * code -- which is how the host-consumer deadlock got in.
+   *
    * Push with system-scope atomics for GPU→CPU visibility.
    *
    * Use this when a GPU thread pushes to a ring buffer that a CPU thread
@@ -602,8 +632,20 @@ class ring_buffer : public ShmContainer<AllocT> {
       unsigned spin_ct = 0;
 #endif
       while (size >= queue.size()) {
-        // Use load_device() for cross-SM L2 visibility (see PopDevice comment)
-        head = head_.load_device();
+        if constexpr (HostConsumer) {
+          // The CPU advances head_ (PopUnlocked's head_.store_system). Re-read
+          // it with a system-scope volatile load: it is a PURE READ. We must
+          // not use load_device() here -- that is atomicAdd(&head_, 0), a
+          // read-modify-WRITE, and a device-scope RMW on pinned host memory is
+          // not coherent with the host. A parked producer spinning on it writes
+          // its stale cached head_ back over the store the CPU consumer just
+          // made, so the consumer's progress is erased and the ring wedges.
+          head = head_.load_system();
+        } else {
+          // GPU consumer (device memory): device-scope load is correct for
+          // cross-SM L2 visibility and is ~10x cheaper than system scope.
+          head = head_.load_device();
+        }
         size = tail - head + 1;
 #if CTP_IS_HOST
         // The ring is FULL. On a CPU this loop must not hard-spin: this producer
@@ -628,6 +670,16 @@ class ring_buffer : public ShmContainer<AllocT> {
         return false;
       }
     }
+    // TODO(ring): a ring with NONE of WaitForSpace / ErrorOnNoSpace /
+    // DynamicSize takes no capacity branch at all -- it silently OVERWRITES a
+    // live, unconsumed entry when full and still returns true.
+    // circular_mpsc_ring_buffer is exactly that shape (MPSC | FIXED_SIZE), and
+    // it is what backs the telemetry logs and admin SystemStats. "Circular" is
+    // doing a lot of unstated work here: the overwrite is silent, so a producer
+    // cannot tell a full ring from an empty one. Likely the same shape as the
+    // known "PutBlob silently succeeds when the bdev is full" bug -- worth
+    // checking whether that queue is one of these. Decide whether overwrite is
+    // genuinely intended and document it, or give this case an explicit branch.
 
     // Emplace into queue at our slot
     size_t idx = tail % queue.size();

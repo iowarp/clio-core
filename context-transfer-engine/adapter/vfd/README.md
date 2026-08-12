@@ -71,15 +71,25 @@ export HDF5_DRIVER=clio_vfd
 **Known gap:** the driver does not yet parse `HDF5_DRIVER_CONFIG`, so
 `cache_enabled` cannot be set on this path (it uses the default, cache on).
 This path is also not yet covered by the test suite. Both are tracked as Q2.1
-work in `translation/VFD_AUDIT.md` (F13).
+work in `translation/VFD_VOL_PLAN.md` ("What Q2.x still has to build").
 
 ## File naming
 
-The driver accepts either a plain path (`/tmp/data.h5`) or a `clio::`-marked one
-(`clio::/tmp/data.h5`). The marker is stripped to locate the authoritative native
-file, so both forms write the same on-disk file; the full name is used as the CTE
-cache key. Plain paths are the normal case — the marker exists for callers that
-also address the file through other CLIO adapters.
+**Pass plain filesystem paths** (`/tmp/data.h5`). A `clio::`-marked name is
+**refused** with an error; the marker is CLIO-internal and the driver adds it
+itself where the CTE tag namespace wants it.
+
+This is a contract, not a preference. The point of this driver is that an
+unmodified application gains CLIO by setting `HDF5_DRIVER=clio_vfd` — and a
+filename that has to be rewritten is a source edit, at every call site. CLIO is
+selected by the driver setting or `H5Pset_fapl_clio`, never by the filename.
+
+Refusing the marker is also what makes two feature flags honest.
+`H5FD_FEAT_POSIX_COMPAT_HANDLE` and `H5FD_FEAT_DEFAULT_VFD_COMPATIBLE` both
+promise HDF5 that the name it holds is a real path it can `stat()`. HDF5 keeps
+whatever name it was given regardless of what the driver does internally, so
+while a marked name could arrive, `H5F__build_actual_name` would `stat()` a
+non-path and `H5Fopen` would abort. Both flags are now advertised.
 
 ## Configuration reference
 
@@ -136,4 +146,4 @@ CI: `.github/workflows/ci-vfd.yml`.
 
 For the current gap list — including what this suite does **not** cover
 (multi-process, crash consistency, >2 GiB transfers, the env-var path) — see
-`translation/VFD_AUDIT.md`.
+`translation/VFD_VOL_PLAN.md` ("What Q2.x still has to build").

@@ -51,6 +51,7 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/boost_stack_allocator.h"
+#include "clio_runtime/gpu/submit_probe.h"
 
 namespace clio::run {
 
@@ -117,6 +118,23 @@ clio::run::detail::FiberHandle Task::MakeTaskFiber(
 void Task::StartCoroutine(clio::run::shared_ptr<Task> &self) {
   // Set the current task for this worker thread
   SetCurrentTask(self);
+
+  // Submit probe: this is the moment the destination worker actually dequeued
+  // the task, so it closes the worker-queue wait and opens execution. probe_rec_
+  // is 0 for every CPU-origin task and for all tasks when the probe is off, so
+  // the cost here is one load and a not-taken branch.
+  if (run_ctx_) {
+    if (auto *prec = reinterpret_cast<gpu::SubmitProbeHostRec *>(
+            run_ctx_->probe_rec_)) {
+      // Guard against a coroutine RESUME re-stamping: only the first dispatch is
+      // the exec start. Later resumes are yields inside the transfer engine and
+      // belong inside the exec segment, not at its edge.
+      if (prec->t_exec_start == 0) {
+        prec->t_exec_start = gpu::SubmitProbe::NowNs();
+        prec->worker_exec = run_ctx_->worker_id_;
+      }
+    }
+  }
 
   // Per-execution initialization (merged from the former BeginOnRuntime). This
   // runs on the worker that first executes the task, so CLIO_CUR_WORKER is

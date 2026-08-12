@@ -36,6 +36,48 @@ class MemBdevTransport : public BdevTransport {
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
+  /**
+   * Whether RAM page `page_idx` has been committed (its backing memory
+   * allocated) yet.
+   *
+   * A pool commits pages either up front, at Init (AllocPolicy::kEager, and
+   * kAuto on a sized pool), or one page at a time on first touch (kLazy, and
+   * any unsized pool). This reports which has happened for a given page without
+   * saying anything about where or how that page is stored. A page_idx past the
+   * end of the pool is simply not committed.
+   *
+   * @param page_idx Index of the page: page i backs pool offsets
+   *                 [i * RamPageSizeBytes(), (i + 1) * RamPageSizeBytes()).
+   * @return true iff that page's memory is currently allocated.
+   */
+  bool IsRamPageCommitted(size_t page_idx) const;
+
+  /**
+   * Host memory this bdev has actually committed so far, in bytes — the sum of
+   * its committed pages.
+   *
+   * This is a pool's true RAM footprint, which the AllocPolicy knob now decides
+   * both the size and the timing of: an eager pool has already taken its whole
+   * declared capacity out of host DRAM by the time Init returns, while a lazy
+   * pool of the identical declared capacity may still be holding nothing and
+   * will grow a page at a time under load. "How much has this pool actually
+   * committed?" is therefore an operational question — the declared capacity no
+   * longer answers it — and this is what answers it.
+   *
+   * Note the value is page-granular: a committed page costs RamPageSizeBytes()
+   * regardless of how much of it is in use, so a sized pool commits its
+   * capacity rounded up to a whole number of pages.
+   *
+   * @return Bytes of host memory currently committed by this bdev.
+   */
+  clio::run::u64 CommittedRamBytes() const;
+
+  /**
+   * Size of one RAM page, in bytes. Pool offset `off` falls in page
+   * `off / RamPageSizeBytes()`.
+   */
+  static constexpr size_t RamPageSizeBytes() { return kRamPageSize; }
+
  private:
   StandardBlockAllocator allocator_;
   clio::run::u64 ram_capacity_{0};
@@ -137,6 +179,11 @@ class MemBdevTransport : public BdevTransport {
   // every other pool — and any build or host without a usable GPU backend —
   // uses ordinary pageable `new char[]`. The `pinned` flag records which
   // allocator owns `data` so it is released through the matching free path.
+  //
+  // A pool created with an explicit total_size_ has every page allocated and
+  // zeroed in Init() (see PreallocateRamPages); a pool created with
+  // total_size_ == 0 falls back to DefaultRamCapacityBytes(), which is too large
+  // to commit eagerly, and allocates lazily in EnsureRamPage instead.
   struct RamPage {
     char* data = nullptr;
     bool pinned = false;
@@ -145,6 +192,18 @@ class MemBdevTransport : public BdevTransport {
   mutable std::mutex ram_pages_mu_;
   std::vector<RamPage> ram_pages_;
 
+  // Allocate every page of a sized pool up front and zero it, so neither the
+  // allocation nor the first-touch page fault lands in the I/O path. For kPinned
+  // this removes a ~550 ms cudaMallocHost stall from the first write to each
+  // 1 GiB page; for kRam it removes the 4 KiB-at-a-time faulting that pins a GPU
+  // D2H to the cold-pageable floor. Zeroing also keeps "never written reads back
+  // as zeros" true now that a live page is no longer distinguishable by a null
+  // pointer. Assumes ram_capacity_ and bdev_type_ are already set.
+  void PreallocateRamPages();
+
+  // Allocate `page` in place if it is empty, choosing pinned vs pageable from
+  // bdev_type_. Caller must hold ram_pages_mu_ (or be Init, pre-publication).
+  char* AllocRamPage(RamPage& page);
   char* EnsureRamPage(size_t page_idx);
   char* GetRamPage(size_t page_idx) const;
   static void FreeRamPage(RamPage& page);

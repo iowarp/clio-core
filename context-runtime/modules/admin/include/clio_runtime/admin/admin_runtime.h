@@ -393,11 +393,6 @@ public:
                  const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
 
 private:
-  /**
-   * Initiate runtime shutdown sequence
-   */
-  void InitiateShutdown(clio::run::u32 grace_period_ms);
-
   // SWIM failure detection state
   struct PendingProbe {
     clio::run::Future<HeartbeatTask> future;

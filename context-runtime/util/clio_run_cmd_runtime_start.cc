@@ -118,6 +118,28 @@ bool InductNode() {
   return true;
 }
 
+/**
+ * Block until the runtime should exit: either a SIGTERM/SIGINT flipped
+ * g_keep_running, or a StopRuntimeTask requested a graceful stop via
+ * RuntimeManager::RequestStop. Returning lets main() exit normally so the
+ * atexit teardown (ServerFinalize) runs on this main thread.
+ */
+void RunUntilStopped() {
+  auto* runtime_manager = CLIO_RUNTIME_MANAGER;
+  while (g_keep_running &&
+         !(runtime_manager && runtime_manager->IsStopRequested())) {
+    CTP_THREAD_MODEL->SleepForUs(100000);
+  }
+  // Signal-triggered exit (SIGTERM/SIGINT): arm the same teardown watchdog
+  // the task-driven stop uses, so a wedged ServerFinalize can never leave a
+  // half-dead daemon behind (`docker stop` / Jarvis Kill rely on SIGTERM).
+  // No-op if the stop was already requested through RequestStop.
+  if (runtime_manager && !runtime_manager->IsStopRequested()) {
+    runtime_manager->RequestStop(
+        clio::run::RuntimeManager::StopMode::kGraceful, 0);
+  }
+}
+
 void PrintRuntimeStartUsage() {
   HIPRINT("Usage: clio runtime start [--induct] [--ephemeral]");
   HIPRINT("  Starts the Clio runtime server");
@@ -185,9 +207,7 @@ int RuntimeStart(int argc, char* argv[]) {
     }
   }
 
-  while (g_keep_running) {
-    CTP_THREAD_MODEL->SleepForUs(100000);
-  }
+  RunUntilStopped();
 
   HLOG(kDebug, "Shutting down Clio runtime...");
   ShutdownAdminChiMod();
@@ -238,9 +258,7 @@ int RuntimeRestart(int argc, char* argv[]) {
     }
   }
 
-  while (g_keep_running) {
-    CTP_THREAD_MODEL->SleepForUs(100000);
-  }
+  RunUntilStopped();
 
   HLOG(kDebug, "Shutting down Clio runtime...");
   ShutdownAdminChiMod();

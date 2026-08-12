@@ -449,9 +449,9 @@ TEST_CASE("AutogenSweep - CAE core all methods full dispatch battery",
   const std::vector<clio::run::u32> methods = {
       ca::Method::kCreate,         ca::Method::kDestroy,
       ca::Method::kMonitor,        ca::Method::kParseOmni,
-      ca::Method::kExportData,     ca::Method::kGetOrCreateTag,
-      ca::Method::kPutBlob,        ca::Method::kGetBlob,
-      ca::Method::kSemanticSearch,
+      ca::Method::kExportData,     ca::Method::kImportData,
+      ca::Method::kGetOrCreateTag, ca::Method::kPutBlob,
+      ca::Method::kGetBlob,        ca::Method::kSemanticSearch,
   };
 
   for (clio::run::u32 method : methods) {

@@ -21,6 +21,7 @@ GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 GLOBAL_CROSS_CONST clio::run::u32 kParseOmni = 10;
 GLOBAL_CROSS_CONST clio::run::u32 kProcessHdf5Dataset = 11;
 GLOBAL_CROSS_CONST clio::run::u32 kExportData = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kImportData = 13;
 
 // CTE interceptor methods. IDs MUST match clio::cte::core::Method::k*
 // so that a CTE-built task (whose constructor stamps the CTE method id)
@@ -42,6 +43,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[10] = "ParseOmni";
     v[11] = "ProcessHdf5Dataset";
     v[12] = "ExportData";
+    v[13] = "ImportData";
     v[14] = "GetOrCreateTag";
     v[15] = "PutBlob";
     v[16] = "GetBlob";

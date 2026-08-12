@@ -65,6 +65,7 @@
 #include "clio_runtime/container.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/pool_manager.h"
+#include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
 
@@ -469,6 +470,17 @@ bool IpcManager::ServerInit() {
     return false;
   }
 
+  // Publish this runtime's pid as soon as its segments exist, and withdraw it
+  // in UnlinkOwnArtifacts when they go: the record's lifetime brackets the
+  // segments' exactly like the /proc/<pid>/fd symlink Linux memfds carry. It
+  // is what `clio_run stop`/`status` fall back to on platforms whose segments
+  // are plain files naming no owner (macOS/BSD) — including against a runtime
+  // that wedges partway through this ServerInit.
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    WriteRuntimePidRecord(config->GetPort(),
+                          static_cast<int>(ctp::SystemInfo::GetPid()));
+  }
+
   // Initialize priority queues
   if (!ServerInitQueues()) {
     return false;
@@ -648,7 +660,11 @@ void IpcManager::ClientFinalize() {
   ClearClientPool();
   zmq_transport_.reset();
 
-  // Clients should not destroy shared resources
+  // Clients must not destroy SHARED resources (the runtime's segments), but
+  // they should remove their OWN memfd-dir entries (per-thread MPSC receive
+  // segments, on-demand data segments) so short-lived clients don't pile up
+  // dead symlinks that only the next runtime start would reap.
+  UnlinkOwnPidEntries();
 }
 
 void IpcManager::RegisterTransportShutdownHook(std::function<void()> hook) {
@@ -733,6 +749,11 @@ void IpcManager::ServerFinalize() {
   // the CLIO_IPC global is intentionally leaked, so ~IpcManager rarely runs.
   // No-op unless built with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
   ReportRuntimeLeaks("ServerFinalize");
+
+  // Remove this runtime's directory entries (main/queue segment symlinks,
+  // control sockets) so a clean stop leaves the per-user memfd dir empty.
+  // Unlink-only: the segments stay mapped for the leaked singletons above.
+  UnlinkOwnArtifacts();
 
   is_initialized_ = false;
 }
@@ -2887,6 +2908,25 @@ size_t IpcManager::ClearUserIpcs() {
       }
     }
 
+    // The runtime pid record (chi_runtime_pid_<user>_<port>) is a plain file,
+    // so the symlink test above cannot see its owner — it names the owner in
+    // its contents instead. Keep it while that runtime is alive: it is the
+    // only handle `clio_run stop` has on a co-resident runtime whose segments
+    // are not /proc symlinks (macOS/BSD).
+    if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
+      std::ifstream pid_file(full_path);
+      std::string pid_line;
+      if (pid_file.is_open() && std::getline(pid_file, pid_line)) {
+        int owner_pid = std::atoi(pid_line.c_str());
+        if (owner_pid > 0 && owner_pid != current_pid &&
+            ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+          HLOG(kDebug, "ClearUserIpcs: keeping {} (runtime pid {} alive)", name,
+               owner_pid);
+          continue;
+        }
+      }
+    }
+
     if (ctp::SystemInfo::RemoveFile(full_path)) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}", name);
       removed_count++;
@@ -2900,6 +2940,91 @@ size_t IpcManager::ClearUserIpcs() {
          removed_count);
   }
 
+  return removed_count;
+}
+
+size_t IpcManager::UnlinkOwnPidEntries() {
+  size_t removed_count = 0;
+  const std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
+  const int current_pid = ctp::SystemInfo::GetPid();
+
+  // Entries owned by THIS process — on-demand data segments
+  // (clio_<pid>_<idx>) and per-thread MPSC receive segments
+  // (clio-<pid>-<tid>) — identified by their symlink target /proc/<pid>/fd/N.
+  // On platforms where the entries are regular files (macOS), fall back to
+  // the name prefixes. Unlink-only: mapped memory stays valid.
+  const std::string own_proc_prefix =
+      "/proc/" + std::to_string(current_pid) + "/";
+  const std::string own_name_prefixes[] = {
+      "clio_" + std::to_string(current_pid) + "_",
+      "clio-" + std::to_string(current_pid) + "-",
+  };
+  for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
+    const std::string full_path = memfd_dir + "/" + name;
+    bool owned = false;
+    std::error_code ec;
+    auto target = std::filesystem::read_symlink(full_path, ec);
+    if (!ec) {
+      owned = target.string().rfind(own_proc_prefix, 0) == 0;
+    } else {
+      for (const auto &prefix : own_name_prefixes) {
+        if (name.rfind(prefix, 0) == 0) {
+          owned = true;
+          break;
+        }
+      }
+    }
+    if (owned && ctp::SystemInfo::RemoveFile(full_path)) {
+      removed_count++;
+    }
+  }
+  return removed_count;
+}
+
+size_t IpcManager::UnlinkOwnArtifacts() {
+  size_t removed_count = 0;
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+
+  // Named segments (main + queue) — unlink by name. The backing memfd stays
+  // alive through this process's fds/mappings; only the directory entry goes.
+  if (config) {
+    for (MemorySegment seg : {kMainSegment, kQueueSegment}) {
+      const std::string name = config->GetSharedMemorySegmentName(seg);
+      if (ctp::SystemInfo::RemoveFile(
+              ctp::SystemInfo::GetMemfdPath(name))) {
+        removed_count++;
+      }
+    }
+  }
+
+  // Everything else this pid owns (on-demand + per-thread MPSC segments).
+  removed_count += UnlinkOwnPidEntries();
+
+  // Local control socket files for this runtime's port. Normally unlinked by
+  // ~SocketTransport during graceful teardown; on the force/watchdog paths the
+  // transports are never destroyed, so remove them here (no-op if gone).
+  if (config) {
+    const u32 port = config->GetPort();
+    const std::string socket_paths[] = {
+        ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) +
+                                      ".ipc"),
+        ctp::SystemInfo::GetMemfdPath("clio_zmq_" + std::to_string(port + 3) +
+                                      ".ipc"),
+    };
+    for (const auto &path : socket_paths) {
+      if (ctp::SystemInfo::RemoveFile(path)) {
+        removed_count++;
+      }
+    }
+    // The pid record published in ServerInit: this runtime no longer owns the
+    // port, so nothing must be able to escalate a kill against it.
+    RemoveRuntimePidRecord(port);
+  }
+
+  if (removed_count > 0) {
+    HLOG(kInfo, "UnlinkOwnArtifacts: Removed {} filesystem entries",
+         removed_count);
+  }
   return removed_count;
 }
 

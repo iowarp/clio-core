@@ -247,6 +247,64 @@ class RuntimeServer {
     return ctp::SystemInfo::IsChildRunning(proc_);
   }
 
+#ifndef _WIN32
+  /** The spawned daemon's pid (-1 if not started or already reaped). */
+  pid_t Pid() const { return proc_.valid ? proc_.pid : -1; }
+
+  /**
+   * Wait for the daemon to exit on its own (e.g. after an external
+   * `clio_run stop`) and capture its exit code. Reaps the process, so the
+   * destructor will not try to kill it again.
+   * @param timeout_ms how long to poll before giving up
+   * @param exit_code out: WEXITSTATUS if the daemon exited normally, or
+   *                  128+signal if it was terminated by a signal
+   * @return true if the daemon exited within the timeout
+   */
+  bool WaitExit(int timeout_ms, int *exit_code) {
+    if (!proc_.valid || proc_.pid <= 0) return false;
+    const int attempts = timeout_ms / 100;
+    for (int i = 0; i <= attempts; ++i) {
+      int status = 0;
+      pid_t ret = waitpid(proc_.pid, &status, WNOHANG);
+      if (ret == proc_.pid) {
+        if (exit_code != nullptr) {
+          if (WIFEXITED(status)) {
+            *exit_code = WEXITSTATUS(status);
+          } else if (WIFSIGNALED(status)) {
+            *exit_code = 128 + WTERMSIG(status);
+          } else {
+            *exit_code = -1;
+          }
+        }
+        proc_.pid = -1;
+        proc_.valid = false;
+        started_ = false;
+        return true;
+      }
+      if (ret < 0) {  // already reaped elsewhere
+        proc_.pid = -1;
+        proc_.valid = false;
+        started_ = false;
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  }
+
+  /**
+   * Abandon ownership of the daemon: the destructor will neither kill nor
+   * reap it. Use after the test dispatched the process by other means (e.g.
+   * an external tool killed and reaped it is impossible — reaping is ours —
+   * so pair with a final waitpid by the caller).
+   */
+  void Disown() {
+    started_ = false;
+    proc_.pid = -1;
+    proc_.valid = false;
+  }
+#endif
+
  private:
   /** Absolute path to the clio_run binary. CMake passes CLIO_RUN_EXE via
    *  $<TARGET_FILE:clio_run>; fall back to CLIO_REPO_PATH/clio_run otherwise. */
