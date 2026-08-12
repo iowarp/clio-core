@@ -140,6 +140,11 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    # Compressed-tier tests link the compressor pool; with
+    # CLIO_CTE_ENABLE_COMPRESS=OFF (the GPU conda job's cuda-release preset)
+    # those targets do not exist and CMake degrades them to bare -l flags
+    # that fail at final link. Same guard as the benchmark side.
+    if(TARGET clio_cte_compressor_runtime)
     add_cuda_executable(test_gpu_vector_compress FALSE
         test_gpu_vector_compress_gpu.cc
         INCLUDE_DIRS
@@ -215,4 +220,5 @@ if(CLIO_CORE_ENABLE_CUDA)
         FIXTURES_REQUIRED clio_test_cleanup_fixture
         RUN_SERIAL TRUE
     )
+    endif()  # TARGET clio_cte_compressor_runtime
 endif()
