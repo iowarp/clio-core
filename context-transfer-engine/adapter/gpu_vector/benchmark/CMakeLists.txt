@@ -3,6 +3,13 @@
 #------------------------------------------------------------------------------
 
 if(CLIO_CORE_ENABLE_CUDA)
+  # The weights and stream benches exercise COMPRESSED tiers, so they link the
+  # compressor pool. With CLIO_CTE_ENABLE_COMPRESS=OFF those targets do not
+  # exist and CMake silently degrades the names to bare -l flags -- the GPU
+  # conda job (cuda-release preset, compress off) then died at final link
+  # ("cannot find -lclio_cte_compressor_client"). No compressor, no
+  # compressed-mode benches; the raw-mode ones below still build.
+  if(TARGET clio_cte_compressor_runtime)
     add_cuda_executable(clio_gpu_vector_weights_bench FALSE
         clio_gpu_vector_weights_bench.cc
         INCLUDE_DIRS
@@ -56,6 +63,7 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_gpu_vector_stream_bench RUNTIME DESTINATION bin)
+  endif()  # TARGET clio_cte_compressor_runtime
 
     add_cuda_executable(clio_gpu_vector_overlap_bench FALSE
         clio_gpu_vector_overlap_bench.cc
