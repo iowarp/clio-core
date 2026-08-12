@@ -1716,9 +1716,16 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // Update context with compression statistics
       context.actual_original_size_ = input_size;
       context.actual_compressed_size_ = total_stored_size;
+      // Ratio is measured against the CODEC's output, not the stored total.
+      // Upstream computes actual_ratio = input_size / compressed_size
+      // (gpucompress_compress.cpp:642-643) with compressed_size being the
+      // payload alone -- its own 64-byte header is excluded. Including
+      // Clio's 24-byte header biased every training label slightly low, and
+      // the bias grows as the chunk shrinks. actual_compressed_size_ below
+      // still reports the true stored size, which is what telemetry wants.
       context.actual_compression_ratio_ =
           static_cast<double>(input_size) /
-          static_cast<double>(total_stored_size);
+          static_cast<double>(compressed_size);
       context.actual_compress_time_ms_ = compress_time;
 
       // Record the shuffle that was ACTUALLY applied, not the one requested:
@@ -1832,7 +1839,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         task->context_.actual_compressed_size_ = total_stored_size;
         task->context_.actual_compression_ratio_ =
             static_cast<double>(input_size) /
-            static_cast<double>(total_stored_size);
+            static_cast<double>(compressed_size);
         task->context_.actual_compress_time_ms_ = compress_time;
       } else {
         task->context_.actual_compression_ratio_ = 0.0;

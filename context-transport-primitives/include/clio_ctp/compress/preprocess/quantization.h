@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #include <limits>
@@ -34,16 +35,56 @@ namespace ctp::compress::preprocess {
  * |original - dequantized| <= error_bound
  */
 struct QuantizationResult {
-  std::vector<int32_t> quantized_;      /**< Quantized integer values */
-  double error_bound_;                  /**< Absolute error bound */
-  double data_min_;                     /**< Minimum of original data */
-  double data_max_;                     /**< Maximum of original data */
-  double offset_;                       /**< Offset for requantization */
-  int precision_;                       /**< Bits used (8, 16, or 32) */
-  size_t num_elements_;                 /**< Number of elements */
+  /**
+   * Quantized values, PACKED at the selected width (int8/int16/int32).
+   *
+   * Held as raw bytes rather than int32 because narrowing is the entire
+   * point: NeuroPress sizes its output `num_elements * precision_to_bytes
+   * (precision)` (quantization_kernels.cu:488), which is what turns float32
+   * into a 4:1 or 2:1 smaller buffer BEFORE the codec runs. Storing every
+   * value as int32 made the "quantizer" produce no size reduction at all
+   * for float32 input, which is the only input the selection path has.
+   */
+  std::vector<uint8_t> quantized_;
+  double error_bound_ = 0.0;            /**< Absolute error bound requested */
+  /**
+   * Bound actually used for the scale, after reserving float32
+   * representation error and safety margin -- upstream's effective_eb
+   * (quantization_kernels.cu:418-473). Always <= error_bound_.
+   */
+  double effective_error_bound_ = 0.0;
+  /**
+   * False when error_bound_ was below what float32 can represent over this
+   * data range, so the round trip may EXCEED it.
+   *
+   * This regime is upstream's too -- it falls back to the tightest safe
+   * bound and prints "Using maximum precision quantization (error may exceed
+   * bound)" (quantization_kernels.cu:444-456). A header-only utility has
+   * nowhere to warn, so the condition is reported here instead: silently
+   * violating the guarantee this header documents would be worse than
+   * either.
+   */
+  bool bound_achievable_ = true;
+  double data_min_ = 0.0;               /**< Minimum of original data */
+  double data_max_ = 0.0;               /**< Maximum of original data */
+  double scale_ = 0.0;                  /**< 1 / (2 * effective_error_bound_) */
+  int precision_ = 0;                   /**< Bits used (8, 16, or 32) */
+  size_t num_elements_ = 0;             /**< Number of elements */
 
   QuantizationResult() = default;
+
+  /** @brief Packed output size in bytes -- what the codec would see. */
+  size_t SizeBytes() const { return quantized_.size(); }
 };
+
+/** @brief Bytes per quantized value, mirroring precision_to_bytes(). */
+inline size_t PrecisionToBytes(int precision) {
+  switch (precision) {
+    case 8: return 1;
+    case 16: return 2;
+    default: return 4;
+  }
+}
 
 /**
  * @brief Compute required precision for given range and error bound.
@@ -97,26 +138,70 @@ QuantizationResult Quantize(const T* data,
     if (data[i] > max_val) max_val = data[i];
   }
 
-  double data_min = static_cast<double>(min_val);
-  double data_max = static_cast<double>(max_val);
-  double data_range = data_max - data_min;
+  const double data_min = static_cast<double>(min_val);
+  const double data_max = static_cast<double>(max_val);
+  const double data_range = data_max - data_min;
 
-  // Select precision and compute scale
-  int precision = ComputeRequiredPrecision(data_range, error_bound);
-  double scale = 1.0 / (2.0 * error_bound);
+  // ---- Effective error bound (quantization_kernels.cu:418-473) ----
+  // The user's bound has to cover BOTH the quantization step and the error
+  // of representing the reconstructed value back in float. Spending all of
+  // it on quantization means the round trip can exceed the bound this
+  // header promises. Upstream reserves the float32 representation error and
+  // a 5% margin, then floors the result so the quantized values cannot
+  // overflow int32.
+  const double max_abs_value = std::max(std::fabs(data_min), std::fabs(data_max));
+  const double float_repr_error = max_abs_value * 2.4e-7;
+  const double safety_margin = error_bound * 0.05;
+  const double available_for_quant = error_bound - float_repr_error - safety_margin;
+  const double min_eb_for_int32 = data_range / 4.0e9;
 
-  // Quantize: q = round((value - min) * scale)
-  result.quantized_.reserve(num_elements);
+  double effective_eb;
+  if (available_for_quant <= 0.0) {
+    // Bound is below what float32 can represent over this range: fall back
+    // to the tightest still-safe value rather than producing garbage.
+    effective_eb = std::max(min_eb_for_int32, float_repr_error * 0.1);
+    result.bound_achievable_ = false;
+  } else {
+    effective_eb = available_for_quant;
+  }
+  effective_eb = std::max(effective_eb, min_eb_for_int32);
+  if (effective_eb <= 0.0) return QuantizationResult();
+
+  // Precision is chosen from the EFFECTIVE bound, so the width can actually
+  // hold every quantized value.
+  const int precision = ComputeRequiredPrecision(data_range, effective_eb);
+  const double scale = 1.0 / (2.0 * effective_eb);
+  const size_t width = PrecisionToBytes(precision);
+
+  // Quantize: q = round((value - min) * scale), clamped to the width.
+  // Upstream clamps in-kernel (quantization_kernels.cu:70-77); without it a
+  // value outside the type's range is an out-of-range float->int conversion,
+  // which is undefined behavior rather than a saturated result.
+  result.quantized_.resize(num_elements * width);
   for (size_t i = 0; i < num_elements; ++i) {
-    double normalized = (static_cast<double>(data[i]) - data_min) * scale;
-    int32_t q = static_cast<int32_t>(std::round(normalized));
-    result.quantized_.push_back(q);
+    const double centered = static_cast<double>(data[i]) - data_min;
+    double q = std::round(centered * scale);
+    uint8_t* slot = result.quantized_.data() + i * width;
+    if (width == 1) {
+      q = std::max(-128.0, std::min(127.0, q));
+      const int8_t v = static_cast<int8_t>(q);
+      std::memcpy(slot, &v, sizeof(v));
+    } else if (width == 2) {
+      q = std::max(-32768.0, std::min(32767.0, q));
+      const int16_t v = static_cast<int16_t>(q);
+      std::memcpy(slot, &v, sizeof(v));
+    } else {
+      q = std::max(-2147483648.0, std::min(2147483647.0, q));
+      const int32_t v = static_cast<int32_t>(q);
+      std::memcpy(slot, &v, sizeof(v));
+    }
   }
 
   result.error_bound_ = error_bound;
+  result.effective_error_bound_ = effective_eb;
   result.data_min_ = data_min;
   result.data_max_ = data_max;
-  result.offset_ = scale;
+  result.scale_ = scale;
   result.precision_ = precision;
   result.num_elements_ = num_elements;
 
@@ -138,18 +223,39 @@ template <typename T>
 std::vector<T> Dequantize(const QuantizationResult& result) {
   std::vector<T> output;
 
-  if (result.quantized_.empty() || result.offset_ <= 0.0) {
+  if (result.quantized_.empty() || result.scale_ <= 0.0 ||
+      result.num_elements_ == 0) {
+    return output;
+  }
+
+  // restored = q * (2 * effective_eb) + data_min -- the exact inverse of the
+  // forward pass, and identical to upstream's dequantize_linear_kernel
+  // (quantization_kernels.cu:83-99), which takes inv_scale = 2*effective_eb
+  // and offset = data_min.
+  const double inv_scale = 1.0 / result.scale_;
+  const size_t width = PrecisionToBytes(result.precision_);
+  if (result.quantized_.size() < result.num_elements_ * width) {
     return output;
   }
 
   output.reserve(result.num_elements_);
-  double scale_inv = 1.0 / result.offset_;
-
-  for (size_t i = 0; i < result.quantized_.size(); ++i) {
-    double normalized =
-        static_cast<double>(result.quantized_[i]) * scale_inv;
-    double reconstructed = normalized + result.data_min_;
-    output.push_back(static_cast<T>(reconstructed));
+  for (size_t i = 0; i < result.num_elements_; ++i) {
+    const uint8_t* slot = result.quantized_.data() + i * width;
+    double q = 0.0;
+    if (width == 1) {
+      int8_t v = 0;
+      std::memcpy(&v, slot, sizeof(v));
+      q = static_cast<double>(v);
+    } else if (width == 2) {
+      int16_t v = 0;
+      std::memcpy(&v, slot, sizeof(v));
+      q = static_cast<double>(v);
+    } else {
+      int32_t v = 0;
+      std::memcpy(&v, slot, sizeof(v));
+      q = static_cast<double>(v);
+    }
+    output.push_back(static_cast<T>(q * inv_scale + result.data_min_));
   }
 
   return output;
