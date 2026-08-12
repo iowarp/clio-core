@@ -152,12 +152,29 @@ class MemberStream:
         self._buf = self._buf[len(out):]
         return out
 
-    def drain(self):
-        while not self._eof or self._buf:
+    def release(self):
+        """Hand back bytes read past the end of a STORED member.
+
+        _pump reads the source a megabyte at a time, so a stored member always
+        over-reads into _buf. Those are raw source bytes belonging to the next
+        local header; without returning them the walk desynchronises and the
+        following member is never found.
+        """
+        if self._d is None and self._buf:
+            self._src.unread(self._buf)
             self._buf = b""
-            if self._eof:
-                break
+
+    def finish(self):
+        """Consume whatever remains of a DEFLATED member so unused_data is
+        pushed back. A stored member has no end marker, so its length must be
+        known by the caller -- draining one would swallow the rest of the
+        archive, which is exactly how skipping node_feat lost the stream."""
+        if self._d is None:
+            return
+        while not self._eof:
+            self._buf = b""
             self._pump()
+        self._buf = b""
 
 
 def open_inner_sequential(path, npz_hint, member):
@@ -203,14 +220,33 @@ def open_inner_sequential(path, npz_hint, member):
             return ms, stack, shape, dtype
 
         log(f"  skipping member {name}")
-        ms.drain()
-        # A writer that used a data descriptor leaves 12 or 16 bytes after the
-        # payload; peek and consume only if the optional signature is there.
-        tail = src.read(4)
-        if tail and struct.unpack("<I", tail)[0] == 0x08074b50:
-            src.read(12)
+        if name.endswith(".npy"):
+            # Read the numpy header for the exact payload length, then consume
+            # precisely that much. Never drain a stored member.
+            _, _, payload = _npy_payload_len(ms)
+            left = payload
+            while left > 0:
+                chunk = ms.read(min(1 << 22, left))
+                if not chunk:
+                    raise SystemExit(f"EOF while skipping {name}")
+                left -= len(chunk)
+            ms.finish()
+            ms.release()
+        elif csz:
+            _skip(src, csz)
         else:
-            src.unread(tail)
+            raise SystemExit(f"cannot skip non-npy member {name} of unknown size")
+        # If the writer used a data descriptor (general-purpose bit 3), the
+        # payload is followed by crc/csize/usize -- 12 bytes, or 16 when the
+        # optional 0x08074b50 signature is present. Both forms must be consumed
+        # in full; putting back only the 4 peeked bytes leaves 8 stray bytes
+        # that make the next local header unrecognisable.
+        if flags & 0x08:  # only when the writer actually wrote a descriptor
+            tail = src.read(4)
+            if tail and struct.unpack("<I", tail)[0] == 0x08074b50:
+                src.read(12)      # signature form: 4 + 12
+            else:
+                src.read(8)       # bare form: the 4 peeked + 8 more
 
 
 class SubFile(io.RawIOBase):
