@@ -98,6 +98,23 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
                      }),
       candidates.end());
 
+  // Byte-shuffle variants. NeuroPress's action space is
+  // algorithm x quantize x byte-shuffle (decodeAction, internal.hpp) and its
+  // ranking masks every quantize action to -INFINITY when error_bound <= 0
+  // (nn_gpu.cu), which is the lossless case Clio runs in. Byte-shuffle is
+  // therefore the one remaining dimension upstream can reach and, without
+  // this, Clio could not: the parity harness shows native repeatedly
+  // selecting actions 20/21/23, all of which have the shuffle bit set.
+  // quantize is deliberately still absent -- it is lossy, needs an error
+  // bound Clio does not plumb, and upstream masks it here anyway.
+  const size_t base_count = candidates.size();
+  candidates.reserve(base_count * 2);
+  for (size_t i = 0; i < base_count; ++i) {
+    CandidateConfig shuffled = candidates[i];
+    shuffled.byte_shuffle = true;
+    candidates.push_back(shuffled);
+  }
+
   // Rank by NeuroPress's own cost model rather than the library default
   // (ratio only): cost = w0*ct + w1*dt + w2*size/(ratio*bw), minimized.
   // Selecting on ratio alone picks a codec that squeezes marginally harder
@@ -121,7 +138,18 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
     // decompress_time_ms_ takes the NN's OWN decompression-time output, not
     // a copy of the compression time -- they are separate predictions and
     // the cost model ranks on both.
-    results.emplace_back(wire_id, r.candidate.preset_id,
+    //
+    // Byte-shuffle rides in the free high bits of compress_preset_ (see
+    // PackPreset in compressor_runtime.cc): CompressionStats has no field
+    // for it, and this is the same encoding the on-disk header uses, so the
+    // selection survives all the way to Compress() without a wire change.
+    // Element size 4 matches NeuroPress's own shuffle_size (internal.hpp:
+    // `shuffle_size > 0 ? 4 : 0`).
+    const int preset_field =
+        r.candidate.byte_shuffle
+            ? static_cast<int>((r.candidate.preset_id & 0xFF) | (4u << 8))
+            : r.candidate.preset_id;
+    results.emplace_back(wire_id, preset_field,
                           r.prediction.compression_ratio,
                           r.prediction.compression_time_ms,
                           r.prediction.decompression_time_ms,

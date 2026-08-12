@@ -854,6 +854,26 @@ bool NeuroPressNNPredictor::Train(
   return true;
 }
 
+const std::vector<float>& NeuroPressNNPredictor::DebugWeights() {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    gpu::NeuroPressGpuDownloadWeights(gpu_weights_.get(), weights_.data(),
+                                      biases_.data());
+  }
+#endif
+  return weights_;
+}
+
+const std::vector<float>& NeuroPressNNPredictor::DebugBiases() {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    gpu::NeuroPressGpuDownloadWeights(gpu_weights_.get(), weights_.data(),
+                                      biases_.data());
+  }
+#endif
+  return biases_;
+}
+
 bool NeuroPressNNPredictor::TrainDecompHead(
     const std::vector<CompressionFeatures>& features,
     const std::vector<double>& decompression_times_ms) {
@@ -933,10 +953,25 @@ bool NeuroPressNNPredictor::TrainDecompHead(
   for (float& g : acc_gw) g *= inv_n;
   acc_gb *= inv_n;
 
-  double norm_sq = 0.0;
-  for (float g : acc_gw) norm_sq += static_cast<double>(g) * g;
-  norm_sq += static_cast<double>(acc_gb) * acc_gb;
-  float g_norm = static_cast<float>(std::sqrt(norm_sq)) + 1e-8f;
+  // TWO norms, mirroring an upstream quirk that is easy to miss and that a
+  // differential test caught immediately (nn_gpu.cu):
+  //
+  //   float g_norm = sqrtf(s_reduce[0] + (t == 0 ? acc_gb*acc_gb : 0.0f)) + 1e-8f;
+  //
+  // g_norm is computed PER THREAD, so the bias term is only present on
+  // thread 0. Thread 0 owns w5[row1][0] and b5[1]; threads 1..63 own
+  // w5[row1][1..63] and normalize WITHOUT the bias term. Collapsing this to
+  // one norm shifts most of the row by ~0.25%, which is exactly what the
+  // parity harness reported before this was replicated.
+  double norm_sq_w = 0.0;
+  for (float g : acc_gw) norm_sq_w += static_cast<double>(g) * g;
+  const float g_norm_w_only =
+      static_cast<float>(std::sqrt(norm_sq_w)) + 1e-8f;
+  const float g_norm_with_bias =
+      static_cast<float>(
+          std::sqrt(norm_sq_w + static_cast<double>(acc_gb) * acc_gb)) +
+      1e-8f;
+  const float g_norm = g_norm_with_bias;  // used for the finiteness guard
 
   // Trust region proportional to the error: a well-calibrated head takes
   // small steps, which is what stops it oscillating.
@@ -947,13 +982,14 @@ bool NeuroPressNNPredictor::TrainDecompHead(
   if (!std::isfinite(step) || !std::isfinite(g_norm)) return false;
 
   for (uint32_t t = 0; t < kHiddenDim; ++t) {
-    float gw_normed = acc_gw[t] / g_norm;
+    // Thread 0's norm carries the bias term; every other thread's does not.
+    float gw_normed = acc_gw[t] / ((t == 0) ? g_norm_with_bias : g_norm_w_only);
     if (!std::isfinite(gw_normed)) continue;
     float w = weights_[w5_row1 + t] - step * gw_normed;
     weights_[w5_row1 + t] =
         std::max(-kDecompWClamp, std::min(kDecompWClamp, w));
   }
-  float gb_normed = acc_gb / g_norm;
+  float gb_normed = acc_gb / g_norm_with_bias;  // thread 0
   if (std::isfinite(gb_normed)) {
     float b = biases_[b5_idx1] - step * gb_normed;
     biases_[b5_idx1] = std::max(-kDecompWClamp, std::min(kDecompWClamp, b));

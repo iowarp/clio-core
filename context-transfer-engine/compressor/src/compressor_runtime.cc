@@ -52,6 +52,7 @@
 #include "clio_runtime/worker.h"
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
+#include "clio_ctp/compress/preprocess/byte_shuffle.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 #include "clio_ctp/compress/model/ranking.h"
 #include "clio_ctp/util/logging.h"
@@ -67,11 +68,41 @@ using clio::run::Worker;
  * Compression header prepended to compressed data for self-describing format.
  * This allows decompression without external metadata.
  */
+/**
+ * Byte-shuffle element size packed into the free high bits of
+ * compress_preset_.
+ *
+ * NeuroPress's action space is algorithm x quantize x byte-shuffle
+ * (internal.hpp's decodeAction), and with error_bound=0 its own ranking masks
+ * every quantize action to -INFINITY -- so byte-shuffle is the ONLY extra
+ * dimension a lossless deployment can reach, and Clio not applying it made
+ * half of upstream's reachable actions unreachable here (the parity harness
+ * shows native selecting actions 20/21/23, all shuffle=1).
+ *
+ * Packed rather than added as a field because CompressionHeader is a fixed
+ * 24 bytes by static_assert and is the on-disk format: growing it would make
+ * every already-compressed blob unreadable. compress_preset_ only ever holds
+ * 0-3, so the upper bits are free, and a blob written before this change
+ * decodes to elem_size 0 -- "not shuffled" -- which is exactly right.
+ */
+constexpr uint32_t kPresetMask = 0xFFu;
+constexpr uint32_t kShuffleShift = 8;
+constexpr uint32_t kShuffleMask = 0xFFu;
+
+inline uint32_t PackPreset(uint32_t preset, uint32_t shuffle_elem_size) {
+  return (preset & kPresetMask) |
+         ((shuffle_elem_size & kShuffleMask) << kShuffleShift);
+}
+inline uint32_t UnpackPreset(uint32_t packed) { return packed & kPresetMask; }
+inline uint32_t UnpackShuffle(uint32_t packed) {
+  return (packed >> kShuffleShift) & kShuffleMask;
+}
+
 struct CompressionHeader {
   static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
   uint32_t magic_;            // Magic number to identify compressed data
   uint32_t compress_lib_;     // Compression library ID
-  uint32_t compress_preset_;  // Compression preset
+  uint32_t compress_preset_;  // Compression preset | shuffle elem size << 8
   uint64_t original_size_;    // Original uncompressed size
 
   CompressionHeader()
@@ -1123,10 +1154,18 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         ctp::CompressionFactory::NameForWireId(context.compress_lib_);
 
     // Map preset integer to enum
+    // compress_preset_ carries the byte-shuffle element size in its high
+    // bits (see PackPreset) -- unpack before mapping to the preset enum, or
+    // a shuffled candidate reads as a bogus preset.
+    const uint32_t packed_preset =
+        static_cast<uint32_t>(context.compress_preset_);
+    const uint32_t preset_id = UnpackPreset(packed_preset);
+    const uint32_t shuffle_elem = UnpackShuffle(packed_preset);
+
     ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-    if (context.compress_preset_ == 1) {
+    if (preset_id == 1) {
       preset = ctp::CompressionPreset::FAST;
-    } else if (context.compress_preset_ == 3) {
+    } else if (preset_id == 3) {
       preset = ctp::CompressionPreset::BEST;
     }
 
@@ -1160,6 +1199,36 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     std::vector<char> device_staging;
     input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
         input_ptr, input_size, context.compress_lib_, device_staging);
+
+    // Byte-shuffle preprocessing, when the ranked candidate asked for it.
+    // Groups each element's Nth byte together so a codec sees runs of
+    // similar magnitude -- NeuroPress's own shuffle dimension. Applied AFTER
+    // any device staging above, since ByteShuffle is host code, and the
+    // element size is recorded in the header so Decompress can invert it.
+    std::vector<char> shuffle_staging;
+    uint32_t applied_shuffle = 0;
+    if (shuffle_elem != 0 && input_size >= shuffle_elem &&
+        (input_size % shuffle_elem) == 0) {
+      std::vector<char> host_copy;
+      const char *shuffle_src = input_ptr;
+      if (ctp::IsDevicePointer(input_ptr)) {
+        // A GPU-native codec left the buffer on the device; shuffling needs
+        // it host-readable. Stage once here rather than silently skipping.
+        host_copy.resize(input_size);
+        ctp::GpuApi::Memcpy(host_copy.data(), input_ptr, input_size);
+        shuffle_src = host_copy.data();
+      }
+      shuffle_staging.resize(input_size);
+      if (ctp::compress::preprocess::ByteShuffle(reinterpret_cast<const uint8_t *>(shuffle_src),
+                           input_size, shuffle_elem,
+                           reinterpret_cast<uint8_t *>(
+                               shuffle_staging.data()))) {
+        input_ptr = shuffle_staging.data();
+        applied_shuffle = shuffle_elem;
+      }
+      // On failure input_ptr is untouched and applied_shuffle stays 0, so
+      // the header records "not shuffled" and the read side does nothing.
+    }
 
     // input_ptr is still device-resident only when StageInputIfNeeded left
     // it alone, i.e. the codec is GPU-native. Runtime::Compress always runs
@@ -1221,7 +1290,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           static_cast<double>(total_stored_size);
       context.actual_compress_time_ms_ = compress_time;
 
-      CompressionHeader header(context.compress_lib_, context.compress_preset_,
+      // Record the shuffle that was ACTUALLY applied, not the one requested:
+      // if ByteShuffle declined (unsupported element size, or a size that is
+      // not a whole number of elements) the bytes are unshuffled and the
+      // read side must not try to invert it.
+      CompressionHeader header(context.compress_lib_,
+                               PackPreset(preset_id, applied_shuffle),
                                input_size);
       ctp::ipc::ShmPtr<> compressed_shm_ptr;
       ctp::ipc::FullPtr<char> compressed_shm;  // Only used off the device path.
@@ -1410,7 +1484,12 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     if (header->IsValid()) {
       // Data is compressed - decompress it
       int compress_lib = static_cast<int>(header->compress_lib_);
-      int compress_preset = static_cast<int>(header->compress_preset_);
+      // High bits carry the byte-shuffle element size (see PackPreset). A
+      // blob written before shuffling existed has zeros there, so it decodes
+      // as "not shuffled" and this stays backward compatible.
+      const uint32_t packed_preset = header->compress_preset_;
+      int compress_preset = static_cast<int>(UnpackPreset(packed_preset));
+      const uint32_t stored_shuffle = UnpackShuffle(packed_preset);
       clio::run::u64 original_size = header->original_size_;
 
       // Map the wire ID to a library name via the shared registry (single
@@ -1458,6 +1537,27 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
                                    .count();
 
       CLIO_IPC->FreeBuffer(temp_buffer);
+
+      // Invert the byte-shuffle the write side applied. Must happen before
+      // the caller ever sees the buffer -- a shuffled image is not the
+      // user's data, it just happens to be the same length.
+      if (success && stored_shuffle != 0 && decompressed_size >= stored_shuffle &&
+          (decompressed_size % stored_shuffle) == 0) {
+        std::vector<char> unshuffled(decompressed_size);
+        if (ctp::compress::preprocess::ByteUnshuffle(
+                reinterpret_cast<const uint8_t *>(output_fullptr.ptr_),
+                decompressed_size, stored_shuffle,
+                reinterpret_cast<uint8_t *>(unshuffled.data()))) {
+          ctp::DeviceAwareMemcpy(output_fullptr.ptr_, unshuffled.data(),
+                                 decompressed_size);
+        } else {
+          HLOG(kError,
+               "Decompress: byte-unshuffle failed (elem={} size={}) -- the "
+               "returned buffer would be shuffled garbage, failing instead",
+               stored_shuffle, decompressed_size);
+          success = false;
+        }
+      }
 
       if (success) {
         task->output_size_ = decompressed_size;

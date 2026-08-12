@@ -182,6 +182,20 @@ class NeuroPressNNPredictor : public CompressionPredictor {
       const std::vector<CompressionFeatures>& features,
       const std::vector<double>& decompression_times_ms);
 
+  /**
+   * @brief Current weights/biases, in per-layer order (L0..L4).
+   *
+   * For differential testing against the upstream NeuroPress implementation
+   * (see test/unit/compress/model/parity/) -- comparing two implementations
+   * by reading their source is not the same as diffing their weights after
+   * running both on identical inputs.
+   *
+   * Syncs from the device copy first when GPU inference is active, so the
+   * caller always sees the weights inference would actually use.
+   */
+  const std::vector<float>& DebugWeights();
+  const std::vector<float>& DebugBiases();
+
  private:
   /**
    * @brief Build the 8-input NeuroPress vector from CompressionFeatures.
