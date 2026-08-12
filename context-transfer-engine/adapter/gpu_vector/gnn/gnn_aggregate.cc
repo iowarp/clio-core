@@ -38,6 +38,18 @@
  * "v in N(u)" and "u in N(v)" are the same statement and walking u's adjacency
  * to find destinations is correct.
  *
+ * MEASURED (4M nodes x 128-d = 1.91 GiB, 50M undirected edges, zstd, one NVMe
+ * tier): reads run ~217 MiB/s per pass, so a pass over the features costs
+ * roughly (bytes / 217 MiB/s) and the total is that times ceil(N/block_rows).
+ * Extrapolating to papers100M (53 GiB, 111M nodes): ~4.2 min per pass, so
+ * block_rows=24e6 (accumulator 24.6 GB) gives 5 passes, ~21 min. Sizing the
+ * block down to save memory costs a whole pass each time, so prefer the
+ * largest accumulator that fits alongside the CSR.
+ *
+ * Note the memory interaction when piped from gnn_build_csr: the builder peaks
+ * around 26 GiB while sorting, and this process holds the CSR (13 GiB at
+ * papers100M) plus the accumulator. The handoff overlaps, so budget for both.
+ *
  * The CSR arrives on stdin in graph.csr layout -- int64 N, int64 E,
  * indptr[N+1], indices[E] -- so it can be piped from a producer instead of
  * staged as a 13 GiB file. It is held in RAM (papers100M: ~13 GiB, which fits
