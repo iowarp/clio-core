@@ -53,6 +53,7 @@
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
+#include "clio_ctp/compress/model/ranking.h"
 #include "clio_ctp/util/logging.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 
@@ -341,23 +342,19 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
                                    &mad, &second_derivative_mean);
 
   // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
-  // qtable/dense-NN heuristics below -- it ranks the full
-  // clio_ctp::compress::model candidate set (11 CPU compressors x 3 presets,
-  // plus the 8-algorithm nvcomp GPU action space), not just this function's
-  // old 5-candidate hardcoded list.
+  // qtable/dense-NN heuristics below -- it ranks clio_ctp::compress::model's
+  // candidate set restricted to its own trained 8-algorithm nvcomp GPU
+  // action space (see NeuroPressCandidateStats), not just this function's
+  // old 5-candidate hardcoded list. Every candidate it can return is
+  // GPU-native, so a device-resident chunk_data never forces a host
+  // round-trip downstream in Compress() regardless of where this chunk
+  // happens to live.
   if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
       neuropress_predictor_->IsReady()) {
     bool data_type_float = (context.data_type_ == 1);
-    // A device-resident chunk restricts the candidate set to GPU-native
-    // compressors, matching the original NeuroPress project's action space
-    // (entirely GPU-only -- see DefaultCandidates/NeuroPressCandidateStats):
-    // no CPU codec ever gets ranked for it, so none can be selected and
-    // force a host round-trip of the buffer downstream in Compress().
-    bool chunk_is_device = ctp::IsDevicePointer(chunk);
     auto neuropress_stats = NeuroPressCandidateStats(
         *neuropress_predictor_, chunk_size, entropy, mad,
-        second_derivative_mean, data_type_float, /*include_gpu=*/true,
-        /*include_cpu=*/!chunk_is_device);
+        second_derivative_mean, data_type_float);
     // Apply the same PSNR filter the legacy per-candidate loop below uses,
     // since NeuroPressCandidateStats itself is PSNR-agnostic (issue #693).
     if (context.target_psnr_ > 0) {
@@ -690,6 +687,30 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     pool_id_.major_, log_entry.str());
     }
 
+    // Cycle 4f: snapshot the intrinsic data features NeuroPress's own
+    // prediction was based on, for a possible SGD update below. Computed here
+    // (chunk_data is certainly still valid -- the same pointer
+    // EstCompressionStats just read) rather than after the await, since
+    // nothing downstream guarantees the input blob outlives Compress().
+    bool neuropress_feat_valid = false;
+    double neuropress_entropy = 0.0, neuropress_mad = 0.0,
+           neuropress_second_deriv = 0.0;
+    if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+        neuropress_predictor_->IsReady()) {
+      ctp::DataType feat_type = (context.data_type_ == 1)
+                                    ? ctp::DataType::FLOAT32
+                                    : ctp::DataType::UINT8;
+      size_t feat_type_size = ctp::DataStatisticsFactory::GetTypeSize(feat_type);
+      clio::run::u64 feat_sample_bytes =
+          std::min(chunk_size, static_cast<clio::run::u64>(65536));
+      size_t feat_num_elements = feat_sample_bytes / feat_type_size;
+      if (feat_num_elements == 0) feat_num_elements = 1;
+      ctp::ComputeCompressionFeatures(chunk_data, feat_num_elements, feat_type,
+                                      &neuropress_entropy, &neuropress_mad,
+                                      &neuropress_second_deriv);
+      neuropress_feat_valid = true;
+    }
+
     // Now call Compress to perform compression and PutBlob
     auto compress_task = client_.AsyncCompress(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
@@ -701,6 +722,230 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     task->context_ = compress_task->context_;
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
+
+    // Cycle 4f/4g: NeuroPress's own online-learning loop
+    // (gpucompress_compress.cpp), ported faithfully. Both phases below share
+    // one error_pct (weighted-cost MAPE between what was predicted for the
+    // algorithm actually used and what really happened) and only differ in
+    // which threshold gates them -- exactly mirroring
+    // g_reinforce_mape_threshold vs g_exploration_threshold.
+    if (neuropress_feat_valid && task->return_code_ == 0) {
+      const CompressionStats* predicted = nullptr;
+      for (const auto& stat : stats) {
+        if (stat.compress_lib_ == best_lib &&
+            stat.compress_preset_ == best_preset) {
+          predicted = &stat;
+          break;
+        }
+      }
+      if (predicted) {
+        // cost = w0*compress_time + w1*decompress_time +
+        //        w2*chunk_size/(ratio*bandwidth) -- same formula and default
+        // weights/bandwidth as NeuroPress's own g_rank_w0/w1/w2 (all 1.0) and
+        // g_measured_bw_bytes_per_ms (5e6 = 5 GB/s).
+        constexpr double kCostW0 = 1.0, kCostW1 = 1.0, kCostW2 = 1.0;
+        constexpr double kCostBandwidthBytesPerMs = 5e6;
+        auto cost = [&](double compress_ms, double decompress_ms,
+                        double ratio) -> double {
+          double ct = std::max(1.0, compress_ms);
+          double dt = std::max(1.0, decompress_ms);
+          double rc = std::min(100.0, ratio);
+          return kCostW0 * ct + kCostW1 * dt +
+                 ((rc > 0.0) ? kCostW2 * static_cast<double>(chunk_size) /
+                                   (rc * kCostBandwidthBytesPerMs)
+                             : 1e30);
+        };
+        // Decompress time is not measured at write time (only a later read
+        // decompresses it) -- use the prediction for both sides, same as
+        // NeuroPress's own primary_decomp_time_ms fallback, so this term
+        // contributes ~0 error rather than penalizing an unmeasured value.
+        double predicted_cost = cost(predicted->compress_time_ms_,
+                                     predicted->decompress_time_ms_,
+                                     predicted->compression_ratio_);
+        double actual_cost = cost(context.actual_compress_time_ms_,
+                                  predicted->decompress_time_ms_,
+                                  context.actual_compression_ratio_);
+        double error_pct = (actual_cost > 0.0)
+            ? std::fabs(actual_cost - predicted_cost) / actual_cost
+            : 0.0;
+
+        // ---- Phase 1: "learn from PRIMARY result immediately" -- online
+        // SGD on the real, just-measured outcome for the algorithm that was
+        // ACTUALLY used, gated by g_reinforce_mape_threshold / default 30%.
+        // In-memory only: Train() adjusts neuropress_predictor_'s live
+        // weights for this process's lifetime and never calls Save() -- the
+        // .nnwt file on disk stays untouched, exactly like every NeuroPress
+        // runtime API (only gpucompress_load_nn/_reload_nn touch the file,
+        // and both are read-only).
+        if (error_pct >
+            static_cast<double>(config_.neuropress_mape_threshold_)) {
+          std::string lib_name =
+              ctp::CompressionFactory::NameForWireId(best_lib);
+          int base_id = -1;
+          for (const auto& entry : ctp::compress::model::KnownCompressors()) {
+            if (lib_name == entry.name) {
+              base_id = entry.base_id;
+              break;
+            }
+          }
+          if (base_id >= 0) {
+            ctp::compress::model::DataFeatures data;
+            data.chunk_size_bytes = static_cast<double>(chunk_size);
+            data.shannon_entropy = neuropress_entropy;
+            data.mad = neuropress_mad;
+            data.second_derivative_mean = neuropress_second_deriv;
+            data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
+            data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
+
+            ctp::compress::model::CandidateConfig candidate;
+            candidate.base_id = base_id;
+            candidate.preset_id = best_preset;
+            candidate.library_name = lib_name;
+
+            std::vector<ctp::compress::model::CompressionFeatures> features = {
+                ctp::compress::model::MakeCompressionFeatures(data,
+                                                               candidate)};
+            std::vector<ctp::compress::model::TrainingLabels> labels = {
+                ctp::compress::model::TrainingLabels(
+                    static_cast<float>(context.actual_compression_ratio_),
+                    static_cast<float>(context.actual_psnr_db_),
+                    static_cast<float>(context.actual_compress_time_ms_),
+                    /*decompress_time=*/0.0f)};
+
+            bool trained = neuropress_predictor_->Train(features, labels);
+            HLOG(kDebug,
+                 "NeuroPress SGD: lib={} preset={} error_pct={} "
+                 "threshold={} trained={}",
+                 lib_name, best_preset, error_pct,
+                 config_.neuropress_mape_threshold_, trained);
+          }
+        }
+
+        // ---- Phase 2 (Cycle 4g): "learn from EXPLORATION results
+        // separately" -- when error crossed the HIGHER exploration
+        // threshold (default 50%, g_exploration_threshold), actually
+        // compress the SAME chunk with up to K alternative candidates (the
+        // next-best predicted ones, skipping whichever was used for the
+        // real, stored compress) purely to generate more real-outcome
+        // training samples. Never stored or returned -- the primary's
+        // already-persisted result stays authoritative. Simplified from the
+        // original's parallel-CUDA-stream implementation to Clio's own
+        // synchronous per-candidate Compress() call: same data flow and
+        // training outcome, sequential rather than stream-parallel --
+        // exploration is opt-in (off by default, matching
+        // g_exploration_enabled's own default) and off the storage
+        // critical path either way.
+        if (config_.neuropress_exploration_enabled_ &&
+            error_pct >
+                static_cast<double>(config_.neuropress_exploration_threshold_)) {
+          std::vector<const CompressionStats*> alternatives;
+          for (const auto& stat : stats) {
+            if (stat.compress_lib_ == best_lib &&
+                stat.compress_preset_ == best_preset) {
+              continue;
+            }
+            alternatives.push_back(&stat);
+            if (static_cast<int>(alternatives.size()) >=
+                config_.neuropress_exploration_k_) {
+              break;
+            }
+          }
+
+          std::vector<ctp::compress::model::CompressionFeatures>
+              explore_features;
+          std::vector<ctp::compress::model::TrainingLabels> explore_labels;
+          double best_cost = actual_cost;  // seeded with the primary's own
+
+          for (const auto* alt : alternatives) {
+            std::string alt_name =
+                ctp::CompressionFactory::NameForWireId(alt->compress_lib_);
+            ctp::CompressionPreset alt_preset =
+                ctp::CompressionPreset::BALANCED;
+            if (alt->compress_preset_ == 1) {
+              alt_preset = ctp::CompressionPreset::FAST;
+            } else if (alt->compress_preset_ == 3) {
+              alt_preset = ctp::CompressionPreset::BEST;
+            }
+            auto alt_compressor =
+                ctp::CompressionFactory::GetPreset(alt_name, alt_preset);
+            if (!alt_compressor) continue;
+
+            // Same device-pointer safety net Runtime::Compress() uses: a
+            // CPU-only alternative can't read a device pointer directly.
+            std::vector<char> alt_device_staging;
+            char* alt_input = ctp::CompressionFactory::StageInputIfNeeded(
+                static_cast<char*>(chunk_data), chunk_size,
+                alt->compress_lib_, alt_device_staging);
+
+            size_t alt_worst_case = chunk_size + (chunk_size / 20) + 1024;
+            std::vector<char> alt_output(alt_worst_case);
+            size_t alt_compressed_size = alt_worst_case;
+
+            auto alt_start = std::chrono::high_resolution_clock::now();
+            bool alt_ok = alt_compressor->Compress(
+                alt_output.data(), alt_compressed_size, alt_input,
+                chunk_size);
+            double alt_time_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::high_resolution_clock::now() -
+                                     alt_start)
+                                     .count();
+            if (!alt_ok || alt_compressed_size == 0) continue;
+
+            double alt_ratio = static_cast<double>(chunk_size) /
+                               static_cast<double>(alt_compressed_size);
+            double alt_cost =
+                cost(alt_time_ms, alt->decompress_time_ms_, alt_ratio);
+            if (alt_cost < best_cost) best_cost = alt_cost;
+
+            int alt_base_id = -1;
+            for (const auto& entry :
+                ctp::compress::model::KnownCompressors()) {
+              if (alt_name == entry.name) {
+                alt_base_id = entry.base_id;
+                break;
+              }
+            }
+            if (alt_base_id < 0) continue;
+
+            ctp::compress::model::DataFeatures alt_data;
+            alt_data.chunk_size_bytes = static_cast<double>(chunk_size);
+            alt_data.shannon_entropy = neuropress_entropy;
+            alt_data.mad = neuropress_mad;
+            alt_data.second_derivative_mean = neuropress_second_deriv;
+            alt_data.data_type_char = (context.data_type_ == 1) ? 0.0 : 1.0;
+            alt_data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
+
+            ctp::compress::model::CandidateConfig alt_candidate;
+            alt_candidate.base_id = alt_base_id;
+            alt_candidate.preset_id = alt->compress_preset_;
+            alt_candidate.library_name = alt_name;
+
+            explore_features.push_back(
+                ctp::compress::model::MakeCompressionFeatures(alt_data,
+                                                               alt_candidate));
+            explore_labels.emplace_back(static_cast<float>(alt_ratio), 0.0f,
+                                        static_cast<float>(alt_time_ms),
+                                        0.0f);
+          }
+
+          if (!explore_features.empty()) {
+            bool explore_trained =
+                neuropress_predictor_->Train(explore_features, explore_labels);
+            // Regret: how much worse the primary's real cost was than the
+            // best alternative found. 0 if the primary was already best.
+            double regret = (best_cost > 0.0)
+                ? (actual_cost - best_cost) / best_cost
+                : 0.0;
+            HLOG(kDebug,
+                 "NeuroPress explore: k={} error_pct={} threshold={} "
+                 "trained={} regret={}",
+                 explore_features.size(), error_pct,
+                 config_.neuropress_exploration_threshold_, explore_trained,
+                 regret);
+          }
+        }
+      }
+    }
 
   } catch (const std::exception& e) {
     HLOG(kError, "Exception in DynamicSchedule: {}", e.what());

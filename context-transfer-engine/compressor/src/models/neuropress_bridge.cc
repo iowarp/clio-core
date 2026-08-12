@@ -33,6 +33,9 @@
 
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 
+#include <algorithm>
+#include <set>
+
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/model/ranking.h"
 
@@ -41,8 +44,7 @@ namespace clio::cte::compressor {
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float, bool include_gpu,
-    bool include_cpu) {
+    double second_derivative_mean, bool data_type_float) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -56,8 +58,37 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   data.data_type_char = data_type_float ? 0.0 : 1.0;
   data.data_type_float = data_type_float ? 1.0 : 0.0;
 
+  // Request the broadest possible set; the filter below is the sole gate
+  // on what NeuroPress is actually allowed to rank.
   std::vector<CandidateConfig> candidates =
-      DefaultCandidates(include_gpu, {1, 2, 3}, false, 1e-3, include_cpu);
+      DefaultCandidates(/*include_gpu=*/true, {1, 2, 3}, false, 1e-3,
+                        /*include_cpu=*/true);
+
+  // Restrict to NeuroPress's actual trained action space: the network's
+  // action-decoding scheme (nn_gpu.cu's decodeAction, "algorithm index 0-7")
+  // hard-codes exactly 8 GPU-lossless nvcomp algorithms -- LZ4/Snappy/
+  // Deflate/GDeflate/Zstd/ANS/Cascaded/Bitcomp (base_ids 13-18, 23-24 in
+  // ranking.h's KnownCompressors) -- and NOTHING else: no CPU library, no
+  // zfp-sycl/cuSZ/nDzip/cuSZp. None of those were ever part of the trained
+  // action space in the original project either -- CPU libraries and the
+  // four extra GPU algorithms all fall outside decodeAction's 0-7 range and
+  // are reachable only via explicit/static selection there, never as
+  // something the trained network can output as its own choice. Without
+  // this filter, NeuroPressNNPredictor::FeaturesTo8Input's own fallback
+  // (base_id % 8) aliased any of them onto whichever real trained algorithm
+  // happens to share that remainder and returned ITS prediction as if it
+  // were a genuine, learned opinion about the untrained one -- not
+  // something dynamic selection was ever supposed to reach.
+  static const std::set<int> kNeuroPressTrainedGpuBaseIds = {
+      13, 14, 15, 16, 17, 18, 23, 24};
+  candidates.erase(
+      std::remove_if(candidates.begin(), candidates.end(),
+                     [](const CandidateConfig &c) {
+                       return kNeuroPressTrainedGpuBaseIds.count(
+                                 c.base_id) == 0;
+                     }),
+      candidates.end());
+
   std::vector<RankedPrediction> ranked = predictor.Rank(data, candidates);
 
   std::vector<CompressionStats> results;

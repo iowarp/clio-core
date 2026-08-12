@@ -39,6 +39,8 @@
  * candidates instead of only the fixed CPU-only list.
  */
 #include <cmath>
+#include <set>
+#include <string>
 
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 #include "clio_ctp/compress/compress_factory.h"
@@ -61,8 +63,7 @@ TEST_CASE("NeuroPressCandidateStats ranks GPU candidates for compressible data",
   // Highly compressible: near-zero entropy/MAD/curvature.
   auto stats = NeuroPressCandidateStats(
       nn, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/0.5, /*mad=*/0.02,
-      /*second_derivative_mean=*/0.01, /*data_type_float=*/true,
-      /*include_gpu=*/true);
+      /*second_derivative_mean=*/0.01, /*data_type_float=*/true);
 
   REQUIRE_FALSE(stats.empty());
 
@@ -103,10 +104,10 @@ TEST_CASE("NeuroPressCandidateStats is entropy-sensitive",
 
   auto compressible = NeuroPressCandidateStats(
       nn, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/0.5, /*mad=*/0.02,
-      /*second_derivative_mean=*/0.01, /*data_type_float=*/true, true);
+      /*second_derivative_mean=*/0.01, /*data_type_float=*/true);
   auto noisy = NeuroPressCandidateStats(
       nn, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/7.8, /*mad=*/0.9,
-      /*second_derivative_mean=*/0.8, /*data_type_float=*/true, true);
+      /*second_derivative_mean=*/0.8, /*data_type_float=*/true);
 
   REQUIRE_FALSE(compressible.empty());
   REQUIRE_FALSE(noisy.empty());
@@ -117,46 +118,33 @@ TEST_CASE("NeuroPressCandidateStats is entropy-sensitive",
           noisy.front().compression_ratio_);
 }
 
-TEST_CASE("NeuroPressCandidateStats respects include_gpu=false",
+TEST_CASE("NeuroPressCandidateStats never ranks outside its trained "
+          "8-algorithm nvcomp action space",
           "[compressor][neuropress][dynamic][693]") {
+  // No CPU library, and none of zfp-sycl/cuSZ/nDzip/cuSZp either -- none of
+  // those were ever part of NeuroPress's trained action space (see
+  // neuropress_bridge.cc), so a "prediction" for one would just be some
+  // other algorithm's real prediction under an alias. Unconditional now,
+  // not caller-configurable: this must hold regardless of whether the
+  // source buffer happens to be device-resident.
   NeuroPressNNPredictor nn;
   REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
   REQUIRE(nn.IsReady());
 
   auto stats = NeuroPressCandidateStats(
       nn, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/3.0, /*mad=*/0.3,
-      /*second_derivative_mean=*/0.03, /*data_type_float=*/true,
-      /*include_gpu=*/false);
+      /*second_derivative_mean=*/0.03, /*data_type_float=*/true);
 
   REQUIRE_FALSE(stats.empty());
+  static const std::set<std::string> kTrainedNames = {
+      "nvcomp-lz4",   "nvcomp-snappy",   "nvcomp-zstd", "nvcomp-gdeflate",
+      "nvcomp-deflate", "nvcomp-ans",    "nvcomp-cascaded",
+      "nvcomp-bitcomp"};
   for (const auto &s : stats) {
-    REQUIRE_FALSE(s.compress_lib_ >= 11 && s.compress_lib_ <= 24);
-  }
-}
-
-TEST_CASE("NeuroPressCandidateStats respects include_cpu=false, matching "
-          "the original NeuroPress project's GPU-only action space",
-          "[compressor][neuropress][dynamic][693]") {
-  // A device-resident chunk (compressor_runtime.cc's EstCompressionStats
-  // passes include_cpu=false for one) must never rank a CPU library --
-  // Compress() would otherwise have to read the device pointer directly
-  // on the host to try it, or stage a needless host copy to avoid that.
-  NeuroPressNNPredictor nn;
-  REQUIRE(nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR));
-  REQUIRE(nn.IsReady());
-
-  auto stats = NeuroPressCandidateStats(
-      nn, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/3.0, /*mad=*/0.3,
-      /*second_derivative_mean=*/0.03, /*data_type_float=*/true,
-      /*include_gpu=*/true, /*include_cpu=*/false);
-
-  REQUIRE_FALSE(stats.empty());
-  for (const auto &s : stats) {
-    // wire ids 11-24 are the GPU registry range (nvcomp/cusz/cuszp/ndzip);
-    // every result must fall in it -- none of the CPU wire ids 0-10.
-    INFO("unexpected non-GPU wire id in GPU-only ranking: " << s.compress_lib_);
-    REQUIRE(s.compress_lib_ >= 11);
-    REQUIRE(s.compress_lib_ <= 24);
+    std::string name = ctp::CompressionFactory::NameForWireId(s.compress_lib_);
+    INFO("unexpected library outside NeuroPress's trained action space: "
+        << name);
+    REQUIRE(kTrainedNames.count(name) == 1);
   }
 }
 

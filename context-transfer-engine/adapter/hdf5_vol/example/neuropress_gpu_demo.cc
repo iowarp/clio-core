@@ -106,6 +106,10 @@ hid_t SetupVolEnvironment(clio::run::PoolId *compressor_pool_id) {
   *compressor_pool_id = clio::run::PoolId(801, 1);
   clio::cte::compressor::CompressorConfig compressor_config;
   compressor_config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;
+  // Off by default in the library (matches NeuroPress's own conservative
+  // default); this demo opts in so the K-way exploration path (Cycle 4g)
+  // actually runs and is visible in the log.
+  compressor_config.neuropress_exploration_enabled_ = true;
   clio::cte::compressor::Client compressor_client;
   auto create_task = compressor_client.AsyncCreateCompressor(
       clio::run::PoolQuery::Local(), "neuropress_gpu_demo_pool",

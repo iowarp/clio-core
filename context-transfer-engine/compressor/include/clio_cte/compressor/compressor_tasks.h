@@ -59,10 +59,29 @@ struct CompressorConfig {
   std::string distribution_model_path_;
   std::string dnn_model_weights_path_;
   // Directory of a trained NeuroPress NN's .nnwt weights (issue #693 Cycle
-  // 3). Not yet consulted by Runtime -- wiring EstCompressionStats() to load
-  // and rank against this predictor is still pending; this field only
-  // carries the path through CreateParams for now.
+  // 3). Loaded once at Create() time and consulted by EstCompressionStats()'s
+  // dynamic-selection path (compressor_runtime.cc) whenever set.
   std::string neuropress_model_path_;
+  // MAPE (mean absolute percentage error, weighted-cost) threshold that
+  // gates online SGD after a real compress (issue #693 Cycle 4f). Mirrors
+  // NeuroPress's own g_reinforce_mape_threshold / GPUCOMPRESS_MAPE_LOW_THRESH
+  // (default 0.30 = 30%, gpucompress_api.cpp): training only fires when the
+  // model's prediction for the chunk actually compressed was wrong by more
+  // than this fraction, not on every chunk. This never writes .nnwt back to
+  // disk -- it only adjusts the in-memory weights for this process's
+  // lifetime, matching NeuroPress's own behavior (no runtime API persists a
+  // trained model file either).
+  float neuropress_mape_threshold_ = 0.30f;
+  // Cycle 4g: K-way exploration. Off by default, matching NeuroPress's own
+  // g_exploration_enabled{false} -- an opt-in, not the normal route. When
+  // enabled and error_pct (the same metric Phase 1 above uses) crosses this
+  // HIGHER threshold (default 0.50, mirrors g_exploration_threshold /
+  // GPUCOMPRESS_MAPE_HIGH_THRESH), up to neuropress_exploration_k_
+  // alternative candidates are actually compressed (never stored) purely to
+  // generate more real-outcome training samples.
+  bool neuropress_exploration_enabled_ = false;
+  float neuropress_exploration_threshold_ = 0.50f;
+  int neuropress_exploration_k_ = 3;  // NeuroPress's own default K
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -86,6 +105,11 @@ struct CompressorConfig {
         distribution_model_path_(other.distribution_model_path_),
         dnn_model_weights_path_(other.dnn_model_weights_path_),
         neuropress_model_path_(other.neuropress_model_path_),
+        neuropress_mape_threshold_(other.neuropress_mape_threshold_),
+        neuropress_exploration_enabled_(other.neuropress_exploration_enabled_),
+        neuropress_exploration_threshold_(
+            other.neuropress_exploration_threshold_),
+        neuropress_exploration_k_(other.neuropress_exploration_k_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -99,8 +123,10 @@ struct CompressorConfig {
     // created compressor pool straight to the default core, bypassing any
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, neuropress_model_path_, trace_folder_path_,
-       next_pool_id_, tracking_enabled_);
+       dnn_model_weights_path_, neuropress_model_path_,
+       neuropress_mape_threshold_, neuropress_exploration_enabled_,
+       neuropress_exploration_threshold_, neuropress_exploration_k_,
+       trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 
   /**
@@ -124,6 +150,22 @@ struct CompressorConfig {
         }
         if (node["tracking_enabled"]) {
           tracking_enabled_ = node["tracking_enabled"].as<bool>();
+        }
+        if (node["neuropress_mape_threshold"]) {
+          neuropress_mape_threshold_ =
+              node["neuropress_mape_threshold"].as<float>();
+        }
+        if (node["neuropress_exploration_enabled"]) {
+          neuropress_exploration_enabled_ =
+              node["neuropress_exploration_enabled"].as<bool>();
+        }
+        if (node["neuropress_exploration_threshold"]) {
+          neuropress_exploration_threshold_ =
+              node["neuropress_exploration_threshold"].as<float>();
+        }
+        if (node["neuropress_exploration_k"]) {
+          neuropress_exploration_k_ =
+              node["neuropress_exploration_k"].as<int>();
         }
       } catch (...) {
         // Config parsing is best-effort

@@ -483,9 +483,11 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
   };
 
   // Wire ids only reachable through the wider action space
-  // NeuroPressCandidateStats draws from (11 CPU compressors + the full GPU
-  // action space -- nvcomp's 8 algorithms, cuSZ, ndzip, cuSZp, zfp-sycl) --
-  // the old hardcoded candidate_lib_configs list in EstCompressionStats()
+  // NeuroPressCandidateStats draws from (11 CPU compressors + NeuroPress's
+  // actual trained 8-algorithm nvcomp GPU action space -- cuSZ/nDzip/cuSZp/
+  // zfp-sycl are deliberately excluded from dynamic selection: the network
+  // was never trained on them, see neuropress_bridge.cc) -- the old
+  // hardcoded candidate_lib_configs list in EstCompressionStats()
   // only ever emits {1 bzip2, 4 lz4, 9 zlib, 10 zstd} (wire id 0 excluded:
   // it's BestCompressRatio's "nothing beat ratio 1.0" fallback sentinel as
   // well as brotli's real wire id, so seeing it alone wouldn't prove

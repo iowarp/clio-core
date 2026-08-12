@@ -35,8 +35,7 @@
  * @file neuropress_bridge.h
  * @brief Bridges the ported clio_ctp::compress::model predictors (issue #693,
  * the NeuroPress NN in particular) into this chimod's own CompressionStats,
- * so EstCompressionStats() can source dynamic-selection candidates -- GPU
- * ones (nvcomp/cusz/ndzip, incl. Cascaded/Bitcomp) included -- from the
+ * so EstCompressionStats() can source dynamic-selection candidates from the
  * ranked model instead of only the fixed CPU-only candidate list.
  */
 #ifndef CLIO_CTE_COMPRESSOR_MODELS_NEUROPRESS_BRIDGE_H_
@@ -70,23 +69,21 @@ namespace clio::cte::compressor {
  * @param mad Mean absolute deviation of the chunk.
  * @param second_derivative_mean Mean second derivative (curvature).
  * @param data_type_float True if the chunk is floating-point data.
- * @param include_gpu Include GPU-backed compressors (nvcomp/cusz/ndzip) in
- *   the candidate set. Candidates whose backend isn't compiled into this
- *   build still rank (the registry is build-independent) but can't
- *   actually execute -- callers driving real compression should filter on
- *   backend availability.
- * @param include_cpu Include CPU-backed compressors. Pass false when the
- *   chunk is a device-resident buffer: the original NeuroPress project's
- *   action space is GPU-native only (see DefaultCandidates), and a CPU
- *   codec would otherwise have to read the device pointer directly on the
- *   host to run at all.
- * @return Candidate stats, best-first (mirrors Rank()'s ordering).
+ * @return Candidate stats, best-first (mirrors Rank()'s ordering). Always
+ *   restricted to NeuroPress's actual trained action space -- the 8
+ *   GPU-lossless nvcomp algorithms (LZ4/Snappy/Deflate/GDeflate/Zstd/ANS/
+ *   Cascaded/Bitcomp). No CPU library and none of zfp-sycl/cuSZ/nDzip/cuSZp
+ *   are ever included: none of those were part of the trained action space
+ *   in the original NeuroPress project either (see the .cc for the
+ *   decodeAction cross-reference), so a "prediction" for one of them would
+ *   only ever be an alias of some other algorithm's real prediction, not a
+ *   genuine learned opinion. They remain reachable through explicit/static
+ *   selection, just not through this ranked, dynamic path.
  */
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float,
-    bool include_gpu = true, bool include_cpu = true);
+    double second_derivative_mean, bool data_type_float);
 
 }  // namespace clio::cte::compressor
 
