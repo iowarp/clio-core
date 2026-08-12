@@ -1941,11 +1941,45 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       CLIO_CO_RETURN;
     }
 
-    // Check for compression header
+    // Is this blob compressed? Ask the CORE, do not guess from the bytes.
+    //
+    // Clio stores incompressible data raw with no header (Compress()'s "not
+    // beneficial" branch), so this used to decide by testing the first four
+    // bytes against the magic -- meaning any user payload beginning
+    // 43 45 54 43 was parsed as a header, and compress_lib_/original_size_
+    // were then read out of the user's own data. Upstream cannot have that
+    // failure: it never stores raw, so a bad magic is always a hard
+    // GPUCOMPRESS_ERROR_INVALID_HEADER (gpucompress_compress.cpp:1192),
+    // never "treat it as plaintext".
+    //
+    // GetBlob reports the blob's authoritative transform state OUT through
+    // the context (issue #818), which is the same signal GetBlobSize and the
+    // interposer GetBlob already use. With that, the magic stops being a
+    // discriminator and becomes what it is upstream: an integrity check on a
+    // blob that is SUPPOSED to carry a header.
+    const bool blob_is_compressed =
+        (get_task->context_.transform_flags_ &
+         clio::cte::core::kBlobTransformCompressed) != 0;
+
     auto* header = reinterpret_cast<CompressionHeader*>(temp_buffer.ptr_);
     size_t header_size = sizeof(CompressionHeader);
 
-    if (header->IsValid()) {
+    if (blob_is_compressed && expected_size >= header_size &&
+        !header->IsValid()) {
+      // Marked compressed but the header does not check out: the blob is
+      // damaged, or was written by a build whose format this one does not
+      // understand (IsValid() also gates on the format version). Failing is
+      // the only safe answer -- upstream returns INVALID_HEADER here.
+      HLOG(kError,
+           "Decompress: blob '{}' is marked compressed but its header is not "
+           "valid (magic/version mismatch) -- refusing to guess",
+           task->blob_name_.str());
+      CLIO_IPC->FreeBuffer(temp_buffer);
+      task->return_code_ = 6;  // Invalid/unreadable header
+      CLIO_CO_RETURN;
+    }
+
+    if (blob_is_compressed) {
       // Data is compressed - decompress it
       int compress_lib = static_cast<int>(header->compress_lib_);
       // High bits carry the byte-shuffle element size (see PackPreset). A
@@ -2100,7 +2134,14 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // Copy directly to output buffer
       auto output_fullptr =
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-      std::memcpy(output_fullptr.ptr_, temp_buffer.ptr_, expected_size);
+      // Device-aware, not std::memcpy: the caller's destination is a CUDA-IPC
+      // device buffer whenever a GPU consumer reads into its own memory, and
+      // a host memcpy into it segfaults. The compressed branch above already
+      // routes through the device-aware helpers; this one did not, so every
+      // raw-stored blob read into device memory crashed. Same class of bug as
+      // the earlier host-preprocessing-on-a-device-pointer faults.
+      ctp::DeviceAwareMemcpy(output_fullptr.ptr_, temp_buffer.ptr_,
+                             expected_size);
       CLIO_IPC->FreeBuffer(temp_buffer);
 
       task->output_size_ = expected_size;
@@ -2422,6 +2463,12 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   if (stored_size < sizeof(CompressionHeader)) {
     return 6;
   }
+  // NOT a sniff: the only caller (Runtime::GetBlob) has already confirmed
+  // kBlobTransformCompressed on the blob before getting here, so this is an
+  // integrity check on something that is supposed to carry a header --
+  // exactly what upstream's header.isValid() is
+  // (gpucompress_compress.cpp:1192). A failure means damage or an unknown
+  // format version, and refusing is the only safe answer.
   const auto *header = reinterpret_cast<const CompressionHeader *>(stored);
   if (!header->IsValid() || header->original_size_ > dst_cap) {
     return 6;
