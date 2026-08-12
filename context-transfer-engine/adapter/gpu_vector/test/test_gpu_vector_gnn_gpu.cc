@@ -26,8 +26,12 @@
  * Single-node/single-process (CLIO_INIT server in-proc) => raw host pointers are
  * valid across the client->runtime boundary.
  *
- * Pin the codec with env CLIO_CTE_COMPRESS_LIB=zstd (+ optional
- * CLIO_CTE_COMPRESS_PRESET=fast|balanced|best). The env overrides the predictor.
+ * The codec is pinned ON THE BLOB CONTEXT (compress_lib_/compress_preset_).
+ * It used to be pinned with CLIO_CTE_COMPRESS_LIB, but nothing reads that env
+ * any more: with only dynamic_compress_ set the predictor picked a
+ * pass-through, every component reported 1.000x, and the test still passed --
+ * because bit-exactness is exactly what a pass-through gives you. Hence the
+ * ratio assert at the end. Override with CLIO_GNN_COMPRESS_LIB/_PRESET.
  *
  * Workload (2-layer GraphSAGE-mean, fixed seeded random weights):
  *   agg1  = mean_{j in N(i)} x[j]
@@ -56,6 +60,8 @@
 #endif
 
 #include <clio_ctp/util/gpu_api.h>
+
+#include "gnn_dataset.h"
 
 #include <algorithm>
 #include <chrono>
@@ -126,32 +132,18 @@ void EnsureInit() {
 #endif
 }
 
-const char *CodecName(int lib) {
-  switch (lib) {
-    case 3: return "lz4";
-    case 9: return "zlib";
-    case 10: return "zstd";
-    case 11: return "nvcomp_lz4";
-    default: return "other";
-  }
-}
+#if !CTP_IS_DEVICE_PASS
+using gnn_test::CodecName;
+using gnn_test::EnvI64;
 
-std::int64_t EnvI64(const char *name, std::int64_t dflt) {
-  const char *e = std::getenv(name);
-  return e != nullptr ? (std::int64_t)std::atoll(e) : dflt;
-}
-
-// Read the whole of a flat binary file into a byte vector. Returns false if the
-// file is missing.
+// Kept as a named wrapper: the per-component section below reports which file
+// it could not open, which the quiet shared loader deliberately does not.
 bool ReadFile(const std::string &path, std::vector<char> &out) {
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f) { std::fprintf(stderr, "[GNN] cannot open %s\n", path.c_str()); return false; }
-  std::streamoff n = f.tellg();
-  f.seekg(0);
-  out.resize((size_t)n);
-  f.read(out.data(), n);
-  return (bool)f;
+  if (gnn_test::ReadFileQuiet(path, out)) return true;
+  std::fprintf(stderr, "[GNN] cannot open %s\n", path.c_str());
+  return false;
 }
+#endif  // !CTP_IS_DEVICE_PASS
 
 }  // namespace
 
@@ -244,112 +236,26 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
                lib_env ? lib_env : "(none)", preset_env ? preset_env : "balanced",
                data_dir.c_str());
 
-  // ---- dataset: real ogbn-arxiv if prepared, else a synthetic graph ----
-  //
-  // The property under test is that a LOSSLESS codec hands back exactly the
-  // bytes it was given, so the forward pass over the compressed feature store
-  // is bit-identical to the in-core one. That does not depend on the data
-  // being real. Requiring a ~100MB download before the test could do anything
-  // meant it simply never ran -- it failed on the missing meta.txt.
-  //
-  // So: use the prepared binaries when gnn_prep.py has been run (that is the
-  // path whose compression ratio and forward times are worth quoting), and
-  // otherwise synthesise a graph of the same SHAPE and assert the same
-  // equality. Both modes announce which one they are, because a bit-exactness
-  // pass on synthetic data must never be read as a result about ogbn-arxiv.
-  std::int64_t N = 0, E = 0;
-  int F = 0, C = 0;
-  bool real_data = false;
-  {
-    std::ifstream mf(data_dir + "/meta.txt");
-    if (mf) {
-      mf >> N >> F >> E >> C;
-      real_data = (N > 0 && F > 0 && C > 0);
-    }
-  }
-
-  std::vector<char> feat_bytes;
-  std::vector<char> csr_bytes;
-
-  if (real_data) {
-    REQUIRE(ReadFile(data_dir + "/features.f32", feat_bytes));
-    REQUIRE(ReadFile(data_dir + "/graph.csr", csr_bytes));
-  } else {
-    N = EnvI64("CLIO_GNN_SYNTH_N", 20000);
-    F = (int)EnvI64("CLIO_GNN_SYNTH_F", 128);
-    C = (int)EnvI64("CLIO_GNN_SYNTH_C", 40);
-    const std::int64_t deg = EnvI64("CLIO_GNN_SYNTH_DEG", 10);
-    std::fprintf(stderr,
-                 "[GNN] %s/meta.txt not found -- SYNTHETIC dataset "
-                 "(run gnn/gnn_prep.py for the real ogbn-arxiv numbers)\n",
-                 data_dir.c_str());
-
-    // Features: quantised to a small set of levels per column so the bytes are
-    // genuinely compressible. Random float32 is incompressible noise, which
-    // would make the codec look useless for reasons that say nothing about
-    // real feature matrices.
-    feat_bytes.resize((size_t)(N * (std::int64_t)F * (std::int64_t)sizeof(float)));
-    float *fw = reinterpret_cast<float *>(feat_bytes.data());
-    std::mt19937 frng(12345);
-    std::uniform_int_distribution<int> lvl(0, 15);
-    for (std::int64_t i = 0; i < N * (std::int64_t)F; ++i) {
-      fw[i] = (float)lvl(frng) * 0.0625f - 0.5f;
-    }
-
-    // Graph: a ring (guarantees every node has neighbours, so no empty
-    // aggregation rows) plus deg-2 seeded random edges per node. Sorted and
-    // deduped per row, which is the layout gnn_prep.py emits.
-    std::vector<std::vector<std::int64_t>> adj((size_t)N);
-    std::mt19937_64 grng(6789);
-    for (std::int64_t v = 0; v < N; ++v) {
-      adj[(size_t)v].push_back((v + 1) % N);
-      adj[(size_t)((v + 1) % N)].push_back(v);
-      for (std::int64_t k = 0; k + 2 < deg; ++k) {
-        std::int64_t u = (std::int64_t)(grng() % (unsigned long long)N);
-        if (u == v) continue;
-        adj[(size_t)v].push_back(u);
-        adj[(size_t)u].push_back(v);
-      }
-    }
-    std::int64_t tot = 0;
-    for (auto &row : adj) {
-      std::sort(row.begin(), row.end());
-      row.erase(std::unique(row.begin(), row.end()), row.end());
-      tot += (std::int64_t)row.size();
-    }
-    E = tot;
-    csr_bytes.resize((size_t)((2 + (N + 1) + tot) * (std::int64_t)sizeof(std::int64_t)));
-    std::int64_t *cw = reinterpret_cast<std::int64_t *>(csr_bytes.data());
-    cw[0] = N;
-    cw[1] = tot;
-    std::int64_t *ip = cw + 2;
-    std::int64_t *ix = cw + 2 + (N + 1);
-    std::int64_t at = 0;
-    for (std::int64_t v = 0; v < N; ++v) {
-      ip[v] = at;
-      for (std::int64_t u : adj[(size_t)v]) ix[at++] = u;
-    }
-    ip[N] = at;
-  }
-
+  // Real ogbn-arxiv when gnn_prep.py has been run, else a synthetic graph of
+  // the same shape -- see gnn_dataset.h for why that substitution is sound.
+  gnn_test::Dataset ds = gnn_test::LoadOrSynthDataset(data_dir, "GNN");
+  const std::int64_t N = ds.N, E = ds.E;
+  const int F = ds.F, C = ds.C;
+  const bool real_data = ds.real;
   REQUIRE(N > 0); REQUIRE(F > 0); REQUIRE(C > 0);
+
   const int H = std::getenv("CLIO_GNN_HIDDEN") ? std::atoi(std::getenv("CLIO_GNN_HIDDEN"))
                                                : kHidden;
   std::fprintf(stderr, "[GNN] source=%s N=%lld F=%d E=%lld C=%d H=%d\n",
-               real_data ? "ogbn-arxiv" : "synthetic",
-               (long long)N, F, (long long)E, (long long)C, H);
+               ds.SourceName(), (long long)N, F, (long long)E, C, H);
 
-  const std::int64_t feat_elems = N * (std::int64_t)F;
-  REQUIRE((std::int64_t)feat_bytes.size() == feat_elems * (std::int64_t)sizeof(float));
-  const float *h_feat = reinterpret_cast<const float *>(feat_bytes.data());
-  const std::int64_t logical_bytes = feat_elems * (std::int64_t)sizeof(float);
-
-  // CSR layout (both modes): int64 N, int64 E, indptr[N+1], indices[E]
-  const std::int64_t *csr = reinterpret_cast<const std::int64_t *>(csr_bytes.data());
-  REQUIRE(csr[0] == N);
-  const std::int64_t csrE = csr[1];
-  const std::int64_t *h_indptr = csr + 2;
-  const std::int64_t *h_indices = csr + 2 + (N + 1);
+  const std::int64_t feat_elems = ds.FeatElems();
+  const float *h_feat = ds.Feat();
+  const std::int64_t logical_bytes = ds.FeatBytes();
+  const std::int64_t csrE = ds.Csr()[1];
+  const std::int64_t *h_indptr = ds.Indptr();
+  const std::int64_t *h_indices = ds.Indices();
+  REQUIRE(ds.Csr()[0] == N);
   REQUIRE(h_indptr[N] == csrE);
 
   // ---- CSR to device (shared by both runs) ----
@@ -591,15 +497,8 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
     std::fprintf(stderr, "[GNN]   indptr stored (%.2fs elapsed)\n", NowSec() - comp_t0);
     s_indices = store_one("comp_indices", h_indices, indices_bytes);
     std::fprintf(stderr, "[GNN]   indices stored (%.2fs elapsed)\n", NowSec() - comp_t0);
-    if (!real_data) {
-      // Synthetic mode has no labels.i64; make one so the per-component
-      // ratio table is complete rather than silently short a row.
-      label_bytes.resize((size_t)(N * (std::int64_t)sizeof(std::int64_t)));
-      std::int64_t *lw = reinterpret_cast<std::int64_t *>(label_bytes.data());
-      for (std::int64_t i = 0; i < N; ++i) lw[i] = i % C;
-    }
-    if (real_data ? ReadFile(data_dir + "/labels.i64", label_bytes)
-                  : !label_bytes.empty()) {
+    label_bytes = ds.labels;  // synthesised too, so the table is never short a row
+    if (!label_bytes.empty()) {
       label_sz = (std::int64_t)label_bytes.size();
       s_labels = store_one("comp_labels", label_bytes.data(), label_sz);
     }
