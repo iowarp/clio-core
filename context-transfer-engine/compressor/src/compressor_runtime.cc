@@ -79,7 +79,6 @@ extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
 #include <nvcomp/zstd.h>
 #endif
 #endif
-#include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
 
 namespace clio::cte::compressor {
@@ -223,95 +222,9 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Initialize atomic counters
   compression_logical_time_ = 0;
 
-  // tag_consumers_ is lazily populated by RegisterConsumer; nothing to
-  // preallocate here. The map is empty when tracking_enabled_=false.
-
-  // Seed previous CPU times so PollNodeLoad's first delta is well-defined.
-  prev_cpu_times_ = ctp::SystemInfo::GetCpuTimes();
-
-  // Load Q-table model if configured (primary prediction method)
-  if (!config_.qtable_model_path_.empty()) {
-    try {
-      HLOG(kDebug, "Loading Q-table model from: {}",
-           config_.qtable_model_path_);
-      qtable_predictor_ = std::make_unique<QTablePredictor>();
-      if (qtable_predictor_->Load(config_.qtable_model_path_)) {
-        HLOG(kDebug, "Q-table model loaded successfully with {} states",
-             qtable_predictor_->GetNumStates());
-      } else {
-        HLOG(kWarning, "Failed to load Q-table model from: {}",
-             config_.qtable_model_path_);
-        qtable_predictor_.reset();
-      }
-    } catch (const std::exception& e) {
-      HLOG(kError, "Exception while loading Q-table model: {}", e.what());
-      qtable_predictor_.reset();
-    }
-  }
-
-  // Load LinReg table model if configured
-  if (!config_.linreg_model_path_.empty()) {
-    try {
-      HLOG(kDebug, "Loading LinReg table model from: {}",
-           config_.linreg_model_path_);
-      linreg_predictor_ = std::make_unique<LinRegTablePredictor>();
-      if (linreg_predictor_->Load(config_.linreg_model_path_)) {
-        HLOG(kDebug, "LinReg table model loaded successfully");
-      } else {
-        HLOG(kWarning, "Failed to load LinReg table model from: {}",
-             config_.linreg_model_path_);
-        linreg_predictor_.reset();
-      }
-    } catch (const std::exception& e) {
-      HLOG(kError, "Exception while loading LinReg table model: {}", e.what());
-      linreg_predictor_.reset();
-    }
-  }
-
-  // Load distribution classifier if configured
-  if (!config_.distribution_model_path_.empty()) {
-    // Note: DistributionClassifier is template-based - use
-    // DistributionClassifierFactory::Classify() directly No model loading
-    // needed - the factory uses built-in mathematical classification
-    HLOG(kDebug,
-         "Distribution classifier available via factory (no model loading "
-         "required)");
-  }
-
-#ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
-  // Load DNN model weights as fallback if Q-table not available
-  if (!qtable_predictor_ && !config_.dnn_model_weights_path_.empty()) {
-    try {
-      HLOG(kDebug, "Loading DNN model weights from: {}",
-           config_.dnn_model_weights_path_);
-      nn_predictor_ = std::make_unique<DenseNNPredictor>();
-      if (nn_predictor_->LoadWeights(config_.dnn_model_weights_path_)) {
-        HLOG(kDebug, "DNN model loaded successfully");
-      } else {
-        HLOG(kWarning, "Failed to load DNN model weights from: {}",
-             config_.dnn_model_weights_path_);
-        nn_predictor_.reset();
-      }
-    } catch (const std::exception& e) {
-      HLOG(kError, "Exception while loading DNN model: {}", e.what());
-      nn_predictor_.reset();
-    }
-  }
-#endif  // CLIO_COMPRESSOR_ENABLE_DENSE_NN
-
-  if (!qtable_predictor_ && !linreg_predictor_) {
-    HLOG(kDebug,
-         "No compression predictor configured, dynamic compression prediction "
-         "disabled");
-  }
-
   HLOG(kDebug,
        "CTE Compressor container created and initialized for pool: {} (ID: {})",
        pool_name_, pool_id_);
-
-  // Spawn the periodic consumer-poll task (5s period). It iterates this
-  // container's consumer list and dispatches PollNodeLoad to each node.
-  client_.AsyncPollConsumers(clio::run::PoolQuery::Local(), 5000000);
 
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -320,14 +233,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
-    // Reset predictors
-    qtable_predictor_.reset();
-    linreg_predictor_.reset();
-    // No distribution_classifier_ to reset
-
-#ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
-    nn_predictor_.reset();
-#endif
 
     // Clear compression telemetry log if allocated
     // ShmPtr cleanup handled automatically
@@ -354,19 +259,14 @@ Runtime::~Runtime() {
 }
 
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
-  // Compress placement: consult per-tag consumer tracking (when enabled)
-  // so the compressed copy lands on the node that most recently read
-  // the tag. Falls through to DirectHash(tag_id) when tracking is off
-  // or the tag has no known consumers yet — keeps placement
-  // deterministic per tag without the tracking overhead.
+  // Compress placement hashes on tag_id, so every blob of a tag converges
+  // on the same container regardless of which node submits it. This used to
+  // first consult a per-tag consumer-tracking map and steer the compressed
+  // copy toward the most recent reader; that tracking was part of the
+  // autoselection layer and has been removed, leaving the deterministic
+  // hash it always fell back to.
   if (task->method_ == Method::kCompress) {
     auto& compress_task = task.template Cast<CompressTask>();
-    clio::run::u32 consumer_node = 0;
-    if (PickConsumerForTag(compress_task->tag_id_, consumer_node)) {
-      return clio::run::PoolQuery::Physical(consumer_node);
-    }
-    // No consumer info — hash on tag_id so all blobs of the same tag
-    // converge on the same container regardless of which node submits.
     clio::run::u32 hash = static_cast<clio::run::u32>(
         std::hash<clio::cte::core::TagId>{}(compress_task->tag_id_));
     return clio::run::PoolQuery::DirectHash(hash);
@@ -424,240 +324,10 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 // Compression Statistics Estimation
 // ==============================================================================
 
-std::vector<CompressionStats> Runtime::EstCompressionStats(
-    const void* chunk, clio::run::u64 chunk_size, const Context& context) {
-  std::vector<CompressionStats> results;
 
-  // Determine data type from context
-  // context.data_type_: 0 = char/uint8, 1 = float
-  ctp::DataType data_type = (context.data_type_ == 1) ? ctp::DataType::FLOAT32
-                                                       : ctp::DataType::UINT8;
-  size_t type_size = ctp::DataStatisticsFactory::GetTypeSize(data_type);
 
-  // Calculate number of elements (sample up to 64KB for efficiency)
-  clio::run::u64 sample_bytes = std::min(chunk_size, static_cast<clio::run::u64>(65536));
-  size_t num_elements = sample_bytes / type_size;
-  if (num_elements == 0) {
-    num_elements = 1;
-  }
 
-  // Calculate compression features using DataStatisticsFactory
-  double entropy = ctp::DataStatisticsFactory::CalculateShannonEntropy(
-      chunk, num_elements, data_type);
-  double mad =
-      ctp::DataStatisticsFactory::CalculateMAD(chunk, num_elements, data_type);
-  double second_derivative_mean =
-      ctp::DataStatisticsFactory::CalculateSecondDerivative(
-          chunk, num_elements, data_type);
 
-  // Determine candidate compression libraries and configs
-  // Library IDs: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,
-  //              SNAPPY=6, SZ3=7, ZFP=8, ZLIB=9, ZSTD=10
-  // Config IDs: balanced=0, best=1, default=2, fast=3
-  std::vector<std::pair<int, int>> candidate_lib_configs;
-  if (context.dynamic_compress_ == 1) {
-    // Static mode: use specified library with default config
-    candidate_lib_configs.push_back({context.compress_lib_, 2});
-  } else {
-    // Dynamic mode: test common library/config combinations
-    candidate_lib_configs = {
-        {10, 0},  // ZSTD balanced
-        {10, 3},  // ZSTD fast
-        {4, 3},   // LZ4 fast
-        {1, 1},   // BZIP2 best
-        {9, 0},   // ZLIB balanced
-    };
-  }
-
-  // Run predictions for each candidate library/config
-  for (const auto& [lib_id, config_id] : candidate_lib_configs) {
-    CompressionPrediction pred;
-
-    // Use Q-table predictor if available (primary method)
-    if (qtable_predictor_ && qtable_predictor_->IsReady()) {
-      CompressionFeatures features;
-      features.library_config_id = static_cast<double>(lib_id);
-      features.chunk_size_bytes = static_cast<double>(chunk_size);
-      features.shannon_entropy = entropy;
-      features.mad = mad;
-      features.second_derivative_mean = second_derivative_mean;
-      // Set config encoding
-      features.config_fast = (config_id == 3) ? 1 : 0;
-      features.config_balanced = (config_id == 0) ? 1 : 0;
-      features.config_best = (config_id == 1) ? 1 : 0;
-      // Set data type encoding
-      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
-      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
-
-      pred = qtable_predictor_->Predict(features);
-    }
-#ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
-    // Fallback to DNN if Q-table not available
-    else if (nn_predictor_ && nn_predictor_->IsReady()) {
-      CompressionFeatures features;
-      features.library_config_id = static_cast<double>(lib_id);
-      features.chunk_size_bytes = static_cast<double>(chunk_size);
-      features.shannon_entropy = entropy;
-      features.mad = mad;
-      features.second_derivative_mean = second_derivative_mean;
-      features.config_fast = (config_id == 3) ? 1 : 0;
-      features.config_balanced = (config_id == 0) ? 1 : 0;
-      features.config_best = (config_id == 1) ? 1 : 0;
-      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
-      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
-      pred = nn_predictor_->Predict(features);
-    }
-#endif  // CLIO_COMPRESSOR_ENABLE_DENSE_NN
-    else {
-      // Heuristic fallback if no predictor available
-      pred.compression_ratio = 2.0;
-      pred.psnr_db = 0.0;
-      pred.compression_time_ms = static_cast<double>(chunk_size) / 100000.0;
-    }
-
-    // Filter out compressions below PSNR threshold
-    if (context.target_psnr_ > 0 && pred.psnr_db > 0 &&
-        pred.psnr_db < context.target_psnr_) {
-      continue;
-    }
-
-    // Add to results with library and preset
-    results.emplace_back(lib_id, config_id, pred.compression_ratio,
-                         pred.compression_time_ms, pred.compression_time_ms,
-                         pred.psnr_db);
-  }
-
-  return results;
-}
-
-double Runtime::EstWorkflowCompressTime(clio::run::u64 chunk_size, double tier_bw,
-                                        const CompressionStats& stats,
-                                        const Context& context) {
-  double compressed_size = chunk_size / stats.compression_ratio_;
-  double transfer_time_ms = (compressed_size / tier_bw) * 1000.0;
-
-  if (stats.psnr_db_ == 0.0) {
-    // Lossless compression
-    return stats.compress_time_ms_ + stats.decompress_time_ms_ +
-           transfer_time_ms;
-  } else {
-    // Lossy compression - may need verification decompression
-    double psnr_check_prob = static_cast<double>(context.psnr_chance_) / 100.0;
-    return stats.compress_time_ms_ +
-           (1.0 + psnr_check_prob) * stats.decompress_time_ms_ +
-           transfer_time_ms;
-  }
-}
-
-std::tuple<int, int, int, double, float> Runtime::BestCompressRatio(
-    const void* chunk, clio::run::u64 chunk_size, int container_id,
-    const std::vector<CompressionStats>& stats, const Context& context) {
-  int best_tier = 0;
-  int best_lib = 0;
-  int best_preset = 2;  // Default: BALANCED
-  double best_time = std::numeric_limits<double>::max();
-  double best_ratio = 1.0;
-  float best_tier_score = 0.0F;
-
-  // Get target bandwidth from cached target states
-  double tier_bw = 1e9;  // Default: 1 GB/s
-  {
-    std::lock_guard<std::mutex> lock(target_states_mutex_);
-    if (!target_states_.empty()) {
-      // Find target with highest score (best performance)
-      float max_score = 0.0F;
-      for (const auto& [name, state] : target_states_) {
-        if (state.target_score_ > max_score) {
-          max_score = state.target_score_;
-          best_tier_score = max_score;
-          // Estimate bandwidth from normalized log score
-          // score = log(bw+1) / log(1000+1), solve for bw
-          tier_bw = std::pow(1001.0, max_score) - 1.0;
-          tier_bw = std::max(tier_bw, 1e6);   // At least 1 MB/s
-          tier_bw = std::min(tier_bw, 1e10);  // Cap at 10 GB/s
-        }
-      }
-    }
-  }
-
-  for (const auto& stat : stats) {
-    // Calculate workflow time for this compression
-    double est_time =
-        EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
-
-    // Choose compression with best ratio that meets time constraints
-    if (stat.compression_ratio_ > best_ratio) {
-      best_ratio = stat.compression_ratio_;
-      best_lib = stat.compress_lib_;
-      best_preset = stat.compress_preset_;
-      best_time = est_time;
-      best_tier = 0;
-    }
-  }
-
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time,
-                         best_tier_score);
-}
-
-std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
-    const void* chunk, clio::run::u64 chunk_size, int container_id,
-    const std::vector<CompressionStats>& stats, const Context& context) {
-  int best_tier = 0;
-  int best_lib = 0;
-  int best_preset = 2;  // Default: BALANCED
-  double best_time = std::numeric_limits<double>::max();
-  float best_tier_score = 0.0F;
-
-  // Get target bandwidth from cached target states
-  double tier_bw = 1e9;  // Default: 1 GB/s
-  {
-    std::lock_guard<std::mutex> lock(target_states_mutex_);
-    if (!target_states_.empty()) {
-      // Find target with highest score (best performance)
-      float max_score = 0.0F;
-      for (const auto& [name, state] : target_states_) {
-        if (state.target_score_ > max_score) {
-          max_score = state.target_score_;
-          best_tier_score = max_score;
-          // Estimate bandwidth from normalized log score
-          // score = log(bw+1) / log(1000+1), solve for bw
-          tier_bw = std::pow(1001.0, max_score) - 1.0;
-          tier_bw = std::max(tier_bw, 1e6);   // At least 1 MB/s
-          tier_bw = std::min(tier_bw, 1e10);  // Cap at 10 GB/s
-        }
-      }
-    }
-  }
-
-  // For each compression library and tier, calculate workflow time
-  for (const auto& stat : stats) {
-    double est_time =
-        EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
-
-    // Choose combination with best performance
-    if (est_time < best_time) {
-      best_time = est_time;
-      best_lib = stat.compress_lib_;
-      best_preset = stat.compress_preset_;
-      best_tier = 0;
-    }
-  }
-
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time,
-                         best_tier_score);
-}
-
-std::tuple<int, int, int, double, float> Runtime::BestCompressForNode(
-    const Context& context, const void* chunk, clio::run::u64 chunk_size,
-    int container_id, const std::vector<CompressionStats>& stats) {
-  // Choose strategy based on context objective
-  if (context.max_performance_) {
-    // Objective: minimize time
-    return BestCompressTime(chunk, chunk_size, container_id, stats, context);
-  }
-  // Objective: maximize compression ratio
-  return BestCompressRatio(chunk, chunk_size, container_id, stats, context);
-}
 
 // ==============================================================================
 // Task Execution Methods
@@ -685,97 +355,39 @@ static void WriteTraceLog(const std::string& trace_folder,
   }
 }
 
+
+/**
+ * The put entry point (Method::kDynamicSchedule).
+ *
+ * It no longer schedules anything. It used to run EstCompressionStats and
+ * BestCompressForNode -- feature extraction, a Q-table/LinReg/DNN predictor
+ * and a tier model -- and OVERWRITE the caller's context.compress_lib_ with
+ * whatever the model liked. That whole layer is gone; the caller states the
+ * codec and this honours it.
+ *
+ * The method keeps its name and id because it is what Client::AsyncPutBlob
+ * builds: this is the compressor's put path, not an optional optimisation.
+ */
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
-    // Extract task parameters (same as PutBlobTask)
-    clio::run::u64 chunk_size = task->size_;
-    // Convert ShmPtr to raw pointer via FullPtr
-    auto blob_fullptr =
-        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-    void* chunk_data = blob_fullptr.ptr_;
-    Context& context = task->context_;
-
-    // Initialize tracing if enabled
-    auto start_time = std::chrono::high_resolution_clock::now();
-    if (context.trace_) {
-      context.trace_key_ = g_trace_key_counter.fetch_add(1);
-      context.trace_node_ = static_cast<int>(CLIO_IPC->GetNodeId());
-    }
-
-    // Check if we have valid chunk data
-    if (chunk_data == nullptr || chunk_size == 0) {
-      HLOG(kWarning, "Invalid chunk data for dynamic scheduling");
-      context.compress_lib_ = 0;
-      context.dynamic_compress_ = 0;
-      task->return_code_ = 1;
-      CLIO_CO_RETURN;
-    }
-
-    // Get compression stats
-    auto stats = EstCompressionStats(chunk_data, chunk_size, context);
-
-    if (stats.empty()) {
-      // No valid compression available, disable compression
-      context.compress_lib_ = 0;
-      context.dynamic_compress_ = 0;
-      task->return_code_ = 0;
-      CLIO_CO_RETURN;
-    }
-
-    // Log predicted compression stats if tracing enabled
-    if (context.trace_ && !stats.empty()) {
-      for (const auto& stat : stats) {
-        std::ostringstream log_entry;
-        log_entry << context.trace_key_ << "," << stat.compress_lib_ << ","
-                  << stat.compression_ratio_ << "," << stat.compress_time_ms_
-                  << "," << stat.decompress_time_ms_ << "," << stat.psnr_db_;
-        WriteTraceLog(config_.trace_folder_path_, "predicted_stats.log",
-                      pool_id_.major_, log_entry.str());
-      }
-    }
-
-    // Choose best compression strategy
-    auto [best_tier, best_lib, best_preset, best_time, tier_score] =
-        BestCompressForNode(context, chunk_data, chunk_size, container_id_,
-                            stats);
-
-    // Update context with selected compression library and preset
-    context.compress_lib_ = best_lib;
-    context.compress_preset_ = best_preset;
-    task->tier_score_ = tier_score;
-
-    // Log scheduling decision time if tracing enabled
-    if (context.trace_) {
-      auto end_time = std::chrono::high_resolution_clock::now();
-      auto duration_ms =
-          std::chrono::duration<double, std::milli>(end_time - start_time)
-              .count();
-
-      std::ostringstream log_entry;
-      log_entry << context.trace_key_ << "," << duration_ms;
-      WriteTraceLog(config_.trace_folder_path_, "sched_decision.log",
-                    pool_id_.major_, log_entry.str());
-    }
-
-    // Now call Compress to perform compression and PutBlob
-    auto compress_task = client_.AsyncCompress(
-        clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
-        task->offset_, task->size_, task->blob_data_, task->score_, context,
-        task->flags_, task->core_pool_id_);
-    CLIO_CO_AWAIT(compress_task);
-
-    // Copy results back
-    task->context_ = compress_task->context_;
-    task->tier_score_ = compress_task->tier_score_;
-    task->return_code_ = compress_task->return_code_;
-
-  } catch (const std::exception& e) {
-    HLOG(kError, "Exception in DynamicSchedule: {}", e.what());
+  auto blob_fullptr =
+      CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+  if (blob_fullptr.ptr_ == nullptr || task->size_ == 0) {
+    HLOG(kWarning, "compressor: put with no data; storing raw");
+    task->context_.compress_lib_ = 0;
+    task->context_.dynamic_compress_ = 0;
     task->return_code_ = 1;
+    CLIO_CO_RETURN;
   }
-
+  auto compress_task = client_.AsyncCompress(
+      clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
+      task->offset_, task->size_, task->blob_data_, task->score_,
+      task->context_, task->flags_, task->core_pool_id_);
+  CLIO_CO_AWAIT(compress_task);
+  task->context_ = compress_task->context_;
+  task->tier_score_ = compress_task->tier_score_;
+  task->return_code_ = compress_task->return_code_;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -976,13 +588,6 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
-    // Record the originating node (the consumer that issued this Decompress)
-    // against this specific tag. pool_query_.ret_node_ was stamped by the
-    // sender's IpcManager when the task was first resolved, so it carries
-    // the original sender's node id even after a network hop. Per-tag
-    // tracking lets ScheduleTask later route Compress for the same tag
-    // toward this reader. No-op when tracking_enabled_=false.
-    RegisterConsumer(task->tag_id_, task->pool_query_.GetReturnNode());
 
     // Extract task parameters (same as GetBlobTask)
     clio::run::u64 expected_size = task->size_;
@@ -1169,171 +774,13 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
 // Consumer Tracking
 // ==============================================================================
 
-void Runtime::RegisterConsumer(const clio::cte::core::TagId &tag_id,
-                               clio::run::u32 node_id) {
-  // Tracking knob: when off, no per-tag bookkeeping happens and
-  // ScheduleTask falls through to DirectHash on the tag_id. Use this to
-  // measure the overhead of the tracking mechanism itself, or for
-  // workloads with no producer-consumer locality.
-  if (!config_.tracking_enabled_) {
-    return;
-  }
 
-  // Fast path: lookup under reader lock. The per-tag vector grows only
-  // (entries are never removed), so a stale read at worst sends one
-  // duplicate registration through the writer path — which the writer
-  // re-check absorbs.
-  {
-    clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
-    auto it = tag_consumers_.find(tag_id);
-    if (it != tag_consumers_.end()) {
-      for (clio::run::u32 existing : it->second) {
-        if (existing == node_id) {
-          return;  // Already registered for this tag.
-        }
-      }
-    }
-  }
-
-  // Writer path: insert/grow under exclusive lock. Re-check first (another
-  // writer may have raced us); cap at kMaxConsumersPerTag.
-  clio::run::ScopedCoRwWriteLock write_lock(tag_consumers_lock_);
-  auto &slots = tag_consumers_[tag_id];
-  for (clio::run::u32 existing : slots) {
-    if (existing == node_id) {
-      return;
-    }
-  }
-  if (slots.size() >= kMaxConsumersPerTag) {
-    HLOG(kDebug,
-         "Compressor: consumer slot full for tag ({} entries), dropping node {}",
-         slots.size(), node_id);
-    return;
-  }
-  slots.push_back(node_id);
-  HLOG(kDebug,
-       "Compressor: registered consumer node {} for tag (slot {}/{})",
-       node_id, slots.size(), kMaxConsumersPerTag);
-}
-
-bool Runtime::PickConsumerForTag(const clio::cte::core::TagId &tag_id,
-                                 clio::run::u32 &node_id_out) {
-  if (!config_.tracking_enabled_) {
-    return false;
-  }
-  clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
-  auto it = tag_consumers_.find(tag_id);
-  if (it == tag_consumers_.end() || it->second.empty()) {
-    return false;
-  }
-  // Most-recent reader heuristic: the latest pushed entry is the most
-  // recent reader of the tag. A future improvement is to fold in the
-  // PollConsumers load samples and pick the least-loaded known reader,
-  // but the most-recent heuristic is cheap and exploits temporal
-  // locality (read-then-recompute patterns).
-  node_id_out = it->second.back();
-  return true;
-}
 
 // ==============================================================================
 // Node Load Sampling
 // ==============================================================================
 
-clio::run::TaskResume Runtime::PollNodeLoad(clio::run::shared_ptr<PollNodeLoadTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  NodeLoadSample sample;
-  auto* ipc_manager = CLIO_IPC;
-  sample.node_id_ = ipc_manager ? static_cast<clio::run::u32>(ipc_manager->GetNodeId())
-                                : 0;
 
-  // CPU utilization since the last sample. Mutex protects prev_cpu_times_
-  // because PollNodeLoad may run concurrently across workers.
-  ctp::CpuTimes cur = ctp::SystemInfo::GetCpuTimes();
-  {
-    std::lock_guard<std::mutex> lk(cpu_times_mutex_);
-    sample.cpu_usage_pct_ =
-        ctp::SystemInfo::ComputeCpuUtilization(prev_cpu_times_, cur);
-    prev_cpu_times_ = cur;
-  }
-
-  // AggregateOut worker load across all workers on this node.
-  auto* orchestrator = CLIO_WORK_ORCHESTRATOR;
-  if (orchestrator) {
-    std::size_t num_workers = orchestrator->GetWorkerCount();
-    sample.num_workers_ = static_cast<clio::run::u32>(num_workers);
-    for (std::size_t i = 0; i < num_workers; ++i) {
-      clio::run::Worker* worker = orchestrator->GetWorker(static_cast<clio::run::u32>(i));
-      if (!worker) {
-        continue;
-      }
-      clio::run::WorkerStats stats = worker->GetWorkerStats();
-      sample.worker_load_us_ += stats.load_;
-      sample.num_queued_tasks_ += stats.num_queued_tasks_;
-      sample.num_blocked_tasks_ += stats.num_blocked_tasks_;
-    }
-  }
-
-  task->sample_ = sample;
-  task->SetReturnCode(0);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumersTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  (void)task;
-  // No-op when tracking is disabled.
-  if (!config_.tracking_enabled_) {
-    CLIO_CO_RETURN;
-  }
-  // Snapshot the union of consumers across all tags under the reader
-  // lock so the periodic poll does not hold the lock while issuing
-  // remote tasks. We dedupe to a single PollNodeLoad per node — readers
-  // may appear in multiple tags' lists.
-  std::vector<clio::run::u32> snapshot;
-  {
-    clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
-    std::unordered_set<clio::run::u32> dedup;
-    for (const auto &kv : tag_consumers_) {
-      for (clio::run::u32 node : kv.second) {
-        if (dedup.insert(node).second) {
-          snapshot.push_back(node);
-        }
-      }
-    }
-  }
-
-  if (snapshot.empty()) {
-    CLIO_CO_RETURN;
-  }
-
-  // Fan out one PollNodeLoad task per consumer node, then await each.
-  std::vector<clio::run::Future<PollNodeLoadTask>> futures;
-  futures.reserve(snapshot.size());
-  for (clio::run::u32 node_id : snapshot) {
-    futures.emplace_back(
-        client_.AsyncPollNodeLoad(clio::run::PoolQuery::Physical(node_id)));
-  }
-
-  for (std::size_t i = 0; i < futures.size(); ++i) {
-    auto& fut = futures[i];
-    CLIO_CO_AWAIT(fut);
-    if (fut->GetReturnCode() == 0) {
-      const NodeLoadSample& s = fut->sample_;
-      HLOG(kDebug,
-           "Compressor: consumer node {} cpu={:.1f}% worker_load={:.1f}us "
-           "queued={} blocked={} workers={}",
-           snapshot[i], s.cpu_usage_pct_, s.worker_load_us_,
-           s.num_queued_tasks_, s.num_blocked_tasks_, s.num_workers_);
-    } else {
-      HLOG(kDebug, "Compressor: PollNodeLoad to node {} failed (rc={})",
-           snapshot[i], fut->GetReturnCode());
-    }
-  }
-
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
 
 // ============================================================================

@@ -4,39 +4,6 @@ cmake_minimum_required(VERSION 3.10)
 # Compressor unit tests
 #------------------------------------------------------------------------------
 
-# Test distribution classifier
-add_executable(test_distribution_classifier_exec
-  test_distribution_classifier.cc
-)
-target_link_libraries(test_distribution_classifier_exec
-  clio::cte::compressor_runtime
-  ctp::compress
-  Catch2::Catch2WithMain
-)
-add_test(NAME test_distribution_classifier COMMAND test_distribution_classifier_exec)
-
-# Test linear regression table predictor
-add_executable(test_linreg_table_predictor_exec
-  test_linreg_table_predictor.cc
-)
-target_link_libraries(test_linreg_table_predictor_exec
-  clio::cte::compressor_runtime
-  ctp::compress
-  Catch2::Catch2WithMain
-)
-add_test(NAME test_linreg_table_predictor COMMAND test_linreg_table_predictor_exec)
-
-# Test Q-table predictor
-add_executable(test_qtable_predictor_exec
-  test_qtable_predictor.cc
-)
-target_link_libraries(test_qtable_predictor_exec
-  clio::cte::compressor_runtime
-  ctp::compress
-  Catch2::Catch2WithMain
-)
-add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
-
 # NOTE: test_compression_contention has been moved to the end of this file
 # as a standalone benchmark without ChiMod runtime dependency
 
@@ -247,29 +214,6 @@ install(TARGETS test_compression_contention_exec
 )
 
 #------------------------------------------------------------------------------
-# Compression Benchmark (unified benchmark for all compression libraries)
-#------------------------------------------------------------------------------
-
-add_executable(test_compression_benchmark_exec
-    test_compression_benchmark.cc
-)
-target_include_directories(test_compression_benchmark_exec PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-transport-primitives/test/unit  # For basic_test.h
-)
-target_link_libraries(test_compression_benchmark_exec
-    clio::cte::compressor_runtime
-    ctp::compress
-    ctp::cxx
-    Catch2::Catch2WithMain
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_compile_features(test_compression_benchmark_exec PRIVATE cxx_std_17)
-add_test(NAME test_compression_benchmark COMMAND test_compression_benchmark_exec)
-install(TARGETS test_compression_benchmark_exec
-    RUNTIME DESTINATION bin
-)
-
-#------------------------------------------------------------------------------
 # Feature-Targeted Data Generator (standalone test)
 #------------------------------------------------------------------------------
 
@@ -286,52 +230,3 @@ install(TARGETS test_compression_benchmark_exec
 
 # message(STATUS "Feature-targeted data generator enabled")
 
-#------------------------------------------------------------------------------
-# Synthetic Workload Generator (MPI-based benchmark)
-#------------------------------------------------------------------------------
-
-# Only build if MPI is available
-find_package(MPI QUIET)
-if(MPI_FOUND)
-    add_executable(synthetic_workload_exec
-        synthetic_workload.cc
-    )
-
-    target_include_directories(synthetic_workload_exec PRIVATE
-        ${MPI_CXX_INCLUDE_PATH}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../generator
-    )
-
-    target_link_libraries(synthetic_workload_exec
-        clio::cte::compressor_client
-        clio::cte::core_client
-        clio::cte::core_runtime
-        clio::run::cxx
-        ctp::compress
-        ctp::cxx
-        ${MPI_CXX_LIBRARIES}
-        ${CMAKE_THREAD_LIBS_INIT}
-    )
-
-    target_compile_features(synthetic_workload_exec PRIVATE cxx_std_17)
-
-    # Add MPI compile flags
-    if(MPI_CXX_COMPILE_FLAGS)
-        target_compile_options(synthetic_workload_exec PRIVATE ${MPI_CXX_COMPILE_FLAGS})
-    endif()
-
-    # Add MPI link flags
-    if(MPI_CXX_LINK_FLAGS)
-        set_target_properties(synthetic_workload_exec PROPERTIES
-            LINK_FLAGS "${MPI_CXX_LINK_FLAGS}"
-        )
-    endif()
-
-    install(TARGETS synthetic_workload_exec
-        RUNTIME DESTINATION bin
-    )
-
-    message(STATUS "Synthetic workload generator enabled (MPI found)")
-else()
-    message(STATUS "Synthetic workload generator disabled (MPI not found)")
-endif()

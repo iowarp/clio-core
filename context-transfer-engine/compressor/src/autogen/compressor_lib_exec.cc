@@ -28,8 +28,6 @@ namespace clio::cte::compressor {
   X(kDynamicSchedule, DynamicScheduleTask, DynamicSchedule) \
   X(kCompress, CompressTask, Compress)             \
   X(kDecompress, DecompressTask, Decompress)       \
-  X(kPollNodeLoad, PollNodeLoadTask, PollNodeLoad) \
-  X(kPollConsumers, PollConsumersTask, PollConsumers) \
   X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
   X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
   X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \

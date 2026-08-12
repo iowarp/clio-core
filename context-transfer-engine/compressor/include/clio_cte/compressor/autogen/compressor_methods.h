@@ -47,8 +47,6 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob =
 GLOBAL_CROSS_CONST clio::run::u32 kDynamicSchedule = 100;
 GLOBAL_CROSS_CONST clio::run::u32 kCompress = 101;
 GLOBAL_CROSS_CONST clio::run::u32 kDecompress = 102;
-GLOBAL_CROSS_CONST clio::run::u32 kPollNodeLoad = 103;
-GLOBAL_CROSS_CONST clio::run::u32 kPollConsumers = 104;
 
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 105;
 
@@ -69,8 +67,6 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[100] = "DynamicSchedule";
     v[101] = "Compress";
     v[102] = "Decompress";
-    v[103] = "PollNodeLoad";
-    v[104] = "PollConsumers";
     return v;
   }();
   return names;
