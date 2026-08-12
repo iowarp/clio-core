@@ -44,6 +44,10 @@ AGG_BLOCK=${AGG_BLOCK:-16000000}
 EPOCHS=${EPOCHS:-3}
 HIDDEN=${HIDDEN:-64}
 SKIP_AGG=${SKIP_AGG:-0}     # 1 = train on raw features, no aggregation
+# 1 = if the full matrix will not fit, run on the largest leading subset that
+# does, rather than refusing. Real papers100M rows either way -- just fewer of
+# them -- which still puts a matrix far beyond GPU memory through the vector.
+AUTOFIT=${AUTOFIT:-0}
 
 [ -f "$ZIP" ] || { echo "no archive at $ZIP (set ZIP=)"; exit 1; }
 command -v "$PY" >/dev/null || { echo "no python at $PY (set PY=)"; exit 1; }
@@ -57,10 +61,17 @@ mkdir -p "$WORK/tier"
 # way in. Everything below is arithmetic on known sizes, not guesswork.
 # ---------------------------------------------------------------------------
 avail_gib=$(( $(df --output=avail "$WORK" | tail -1) / 1048576 ))
-"$PY" - "$N" "$F" "$E" "$ZIP" "$avail_gib" "$SKIP_AGG" <<'PYEOF'
+# set +e: the preflight signals "cannot run" with a non-zero exit, and under
+# set -e a failing command substitution would kill the script before PF_RC
+# could be read, losing the explanation it just printed.
+set +e
+FIT_N=$("$PY" - "$N" "$F" "$E" "$ZIP" "$avail_gib" "$SKIP_AGG" "$AUTOFIT" <<'PYEOF'
 import os, sys
 N, F, E = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-zip_path, avail, skip_agg = sys.argv[4], int(sys.argv[5]), int(sys.argv[6])
+zip_path, avail = sys.argv[4], int(sys.argv[5])
+skip_agg, autofit = int(sys.argv[6]), int(sys.argv[7])
+def emit(msg):
+    print(msg, file=sys.stderr)
 GiB = 2**30
 feat = N * F * 4 / GiB
 stored = feat / 1.078            # measured zstd ratio on real float features
@@ -71,16 +82,44 @@ agg_needed = 0.0 if skip_agg else stored
 peak_ingest = zsz + csr_needed + stored
 peak_agg = csr_needed + stored + agg_needed
 peak = max(peak_ingest, peak_agg)
-print(f"[preflight] features {feat:.1f} GiB logical, ~{stored:.1f} GiB stored")
-print(f"[preflight] csr {csr_needed:.1f} GiB, archive {zsz:.1f} GiB")
-print(f"[preflight] peak disk needed ~{peak:.1f} GiB; available {avail} GiB")
+emit(f"[preflight] features {feat:.1f} GiB logical, ~{stored:.1f} GiB stored")
+emit(f"[preflight] csr {csr_needed:.1f} GiB, archive {zsz:.1f} GiB")
+emit(f"[preflight] peak disk needed ~{peak:.1f} GiB; available {avail} GiB")
 if peak > avail:
-    print(f"[preflight] SHORT BY ~{peak - avail:.0f} GiB -- refusing to start.")
-    print("[preflight] Options: free that much, set SKIP_AGG=1 to train on raw")
-    print("[preflight] features (drops the CSR and the second copy), or reduce N.")
-    raise SystemExit(2)
-print("[preflight] OK")
+    if not autofit:
+        emit(f"[preflight] SHORT BY ~{peak - avail:.0f} GiB -- refusing to start.")
+        emit("[preflight] Options: free that much, set SKIP_AGG=1 to train on")
+        emit("[preflight] raw features, or AUTOFIT=1 to run the largest subset")
+        emit("[preflight] of real rows that does fit.")
+        raise SystemExit(2)
+    # Largest N whose stored copies plus the fixed costs fit, with 3 GiB spare.
+    copies = 1 if skip_agg else 2
+    fixed = zsz + csr_needed
+    room = avail - fixed - 3.0
+    if room <= 0:
+        emit(f"[preflight] even zero rows will not fit ({fixed:.1f} GiB fixed "
+             f"vs {avail} GiB) -- refusing.")
+        raise SystemExit(2)
+    per_row = (F * 4 / 1.078) * copies / GiB
+    fit = int(room / per_row)
+    if fit < 1_000_000:
+        emit(f"[preflight] only {fit} rows would fit -- not worth running.")
+        raise SystemExit(2)
+    emit(f"[preflight] AUTOFIT: {fit} of {N} rows ({100.0*fit/N:.0f}%), "
+         f"~{fit*F*4/GiB:.1f} GiB logical")
+    print(fit)
+    raise SystemExit(0)
+emit("[preflight] OK")
+print(N)
 PYEOF
+)
+PF_RC=$?
+set -e
+[ "$PF_RC" -eq 0 ] || exit "$PF_RC"
+if [ -n "$FIT_N" ] && [ "$FIT_N" -lt "$N" ]; then
+  echo "### running on the first $FIT_N of $N rows (AUTOFIT)"
+  N="$FIT_N"
+fi
 
 echo "### shapes"
 "$PY" "$HERE/gnn_stream_npz.py" --zip "$ZIP" --member node_feat --info
@@ -148,7 +187,7 @@ echo "### 3. features -> FIFO -> trainer (ingest, aggregate, verify, train)"
 FIFO="$WORK/feat.fifo"
 rm -f "$FIFO"; mkfifo "$FIFO"
 "$PY" "$HERE/gnn_stream_npz.py" --zip "$ZIP" --member node_feat --dtype float32 \
-    > "$FIFO" 2> "$WORK/stream.log" &
+    --max-rows "$N" > "$FIFO" 2> "$WORK/stream.log" &
 STREAM=$!
 trap 'kill $STREAM 2>/dev/null || true; rm -f "$FIFO"' EXIT
 

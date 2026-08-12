@@ -130,6 +130,10 @@ def main():
     ap.add_argument("--dtype", default=None,
                     help="cast to this dtype (e.g. float32); default = as-is")
     ap.add_argument("--rows-per-chunk", type=int, default=1 << 16)
+    ap.add_argument("--max-rows", type=int, default=0,
+                    help="emit only the first N rows (0 = all). Lets a machine "
+                         "that cannot hold the whole matrix still run on real "
+                         "data rather than falling back to synthetic.")
     ap.add_argument("--info", action="store_true",
                     help="print shape/dtype and exit without streaming")
     args = ap.parse_args()
@@ -154,9 +158,12 @@ def main():
             raise SystemExit("fortran-order arrays not supported")
         out_dtype = np.dtype(args.dtype) if args.dtype else dtype
         rows = shape[0]
+        if args.max_rows > 0:
+            rows = min(rows, args.max_rows)
         cols = int(np.prod(shape[1:])) if len(shape) > 1 else 1
         total_out = rows * cols * out_dtype.itemsize
-        log(f"member={target} shape={shape} dtype={dtype} -> {out_dtype}")
+        log(f"member={target} shape={shape} dtype={dtype} -> {out_dtype}"
+            + (f"  (limited to first {rows} rows)" if args.max_rows else ""))
         log(f"streaming {total_out} bytes ({total_out / 2**30:.2f} GiB)")
         if args.info:
             print(f"{rows} {cols} {dtype} {out_dtype} {total_out}")
