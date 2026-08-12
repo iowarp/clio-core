@@ -58,7 +58,15 @@ design.**
 the matrix exists to upload, so there is nothing to compare against. The test
 says so explicitly rather than reporting a fabricated out-of-memory result.
 
-**Getting two epochs took a fix, not tuning.** The gather kernels read through
+**RETRACTED: the two-epoch numbers above were produced with a read path that
+is not correct.** The at() change described below passes bit-exactness only
+2 runs in 3 (measured; operator[] passes 3 in 3), and the papers100M run could
+not detect that because its in-core baseline is SKIPPED -- nothing compared the
+bytes. The timings and memory figures are real; **the loss and accuracy may
+have been computed on corrupted reads** and should not be quoted until the run
+is repeated on the reverted code.
+
+**The at() story, and why it is reverted.** The gather kernels read through
 DeviceVector's non-const operator[], which marks pages dirty. A read-only sweep
 therefore left every page it touched needing a writeback; eviction re-put and
 re-compressed each one, and that compress allocated a buffer the SHM allocator
@@ -66,6 +74,14 @@ would not reuse, growing a 120 MB segment per call — 497 segments and 57 GiB
 during a single epoch, which exhausted the machine twice. Reading through
 `at()` instead removed it: epoch time fell 32% (409 s -> 279 s) and segment
 growth went to zero.
+
+That change is REVERTED, because it is unsafe today. A dirty page is skipped as
+an eviction victim (the !pgi.dirty test in ClaimSlot), so marking every page
+dirty incidentally made pages non-evictable while lanes still held them. With
+clean pages the slot can be claimed and refilled underneath a lane that is
+still reading, and the sweep returns wrong bytes. The writeback traffic was
+paying for correctness without anyone realising. Restoring at() requires making
+eviction safe against concurrent readers first.
 
 A residual remains: on compressible data the read path still decompresses, and
 those allocations grow ~2.5 segments per epoch at 10M rows. It does not appear
