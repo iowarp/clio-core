@@ -38,6 +38,11 @@ F=${F:-128}
 E=${E:-1615685872}
 C=${C:-172}
 PAGE_KIB=${PAGE_KIB:-1024}
+# The trainer sizes pages by ROWS, not KiB (CLIO_GNN_PAGE_ROWS, default 512 =
+# 256 KiB at F=128). Setting only CLIO_GNN_PAGE_KIB silently leaves it at the
+# default, which is a quarter of the 1 MiB page the throughput numbers were
+# measured with -- four times as many blobs and round trips for the same bytes.
+PAGE_ROWS=${PAGE_ROWS:-$(( PAGE_KIB * 1024 / (F * 4) ))}
 # Accumulator rows per aggregation pass. Bigger = fewer passes over the 53 GiB
 # of features (measured ~4.2 min each) but more RAM: rows * F * 8 bytes.
 AGG_BLOCK=${AGG_BLOCK:-16000000}
@@ -200,7 +205,7 @@ env -u CLIO_SERVER_CONF \
     CLIO_GNN_LABELS_FILE="$WORK/labels.i64" \
     "${CSR_ENV[@]}" \
     CLIO_GNN_NODES="$N" CLIO_GNN_DIM="$F" CLIO_GNN_CLASSES="$C" \
-    CLIO_GNN_PAGE_KIB="$PAGE_KIB" \
+    CLIO_GNN_PAGE_ROWS="$PAGE_ROWS" \
     CLIO_GNN_AGG_BLOCK_ROWS="$AGG_BLOCK" \
     CLIO_GNN_EPOCHS="$EPOCHS" CLIO_GNN_HIDDEN="$HIDDEN" \
     CLIO_PORT="$PORT" \
