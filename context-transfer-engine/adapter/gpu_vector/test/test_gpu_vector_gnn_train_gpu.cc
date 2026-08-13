@@ -306,7 +306,14 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   //   dz2: derived from p, and the loss is read BEFORE it, so it aliases z2
   //        too.
   // 1088 floats -> 448.
+  // h1 and z2 stay as per-thread arrays. Moving them to dynamic shared memory
+  // was tried: it does remove the 1792 bytes of STACK that cuobjdump reports,
+  // but it is SLOWER (0.45s -> 0.49s). Shared memory plus the smaller block it
+  // forces (64 threads, to stay under the 48 KB limit) costs more occupancy
+  // than the local arrays were costing in L1 misses, and registers rose 62 ->
+  // 77. So the STACK figure is real but is not what limits this kernel.
   float h1[kMaxH];
+  float z2[kMaxC];
   // LAYER 1, TILED OVER h INTO REGISTERS.
   //
   // Two wrong shapes preceded this one:
@@ -341,11 +348,28 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
       if (k < hn) h1[h0 + k] = acc[k] > 0.f ? acc[k] : 0.f;
     }
   }
-  float z2[kMaxC], maxz = -1e30f;
-  for (int c = 0; c < C; ++c) {
-    float s = b2[c];
-    for (int h = 0; h < H; ++h) s += W2[c * H + h] * h1[h];
-    z2[c] = s; if (s > maxz) maxz = s;
+  // LAYER 2, tiled over c for the same reason layer 1 is tiled over h: the
+  // scalar form re-reads h1[0..H) once per c, and h1 lives in local memory,
+  // so that is C*H = 2560 local reads per node. Tiling reads it C/kCT times.
+  // Order unchanged: acc[k] accumulates over ascending h.
+  constexpr int kCT = 8;
+  float maxz = -1e30f;
+  for (int c0 = 0; c0 < C; c0 += kCT) {
+    const int cn = min(kCT, C - c0);
+    float acc[kCT];
+#pragma unroll
+    for (int k = 0; k < kCT; ++k) acc[k] = (k < cn) ? b2[c0 + k] : 0.f;
+    for (int h = 0; h < H; ++h) {
+      const float hv = h1[h];
+#pragma unroll
+      for (int k = 0; k < kCT; ++k) {
+        if (k < cn) acc[k] += W2[(c0 + k) * H + h] * hv;
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < kCT; ++k) {
+      if (k < cn) { z2[c0 + k] = acc[k]; if (acc[k] > maxz) maxz = acc[k]; }
+    }
   }
   float sum = 0.f;
   for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
@@ -363,11 +387,29 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   atomicAdd(count, 1);
   // dz2 aliases z2 (which currently holds p); the loss above already read it.
   for (int c = 0; c < C; ++c) { z2[c] = z2[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = z2[c]; }
-  for (int h = 0; h < H; ++h) {
-    float s = 0.f;
-    for (int c = 0; c < C; ++c) s += W2[c * H + h] * z2[c];
-    dz1_out[n * H + h] = (h1[h] > 0.f) ? s : 0.f;   // h1>0 iff z1>0
-    h1_out[n * H + h] = h1[h];
+  // BACKWARD, tiled over h: the scalar form re-reads z2[0..C) once per h,
+  // which is H*C = 2560 local reads per node. Order unchanged: acc[k]
+  // accumulates over ascending c.
+  for (int h0 = 0; h0 < H; h0 += kHT) {
+    const int hn = min(kHT, H - h0);
+    float acc[kHT];
+#pragma unroll
+    for (int k = 0; k < kHT; ++k) acc[k] = 0.f;
+    for (int c = 0; c < C; ++c) {
+      const float zv = z2[c];
+#pragma unroll
+      for (int k = 0; k < kHT; ++k) {
+        if (k < hn) acc[k] += W2[c * H + h0 + k] * zv;
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < kHT; ++k) {
+      if (k < hn) {
+        const float hv = h1[h0 + k];
+        dz1_out[n * H + h0 + k] = (hv > 0.f) ? acc[k] : 0.f;  // hv>0 iff z1>0
+        h1_out[n * H + h0 + k] = hv;
+      }
+    }
   }
 }
 
