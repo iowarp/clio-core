@@ -307,23 +307,40 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   //        too.
   // 1088 floats -> 448.
   float h1[kMaxH];
-  // LOOP ORDER: f OUTSIDE, h inside. Written the natural way -- h outer,
-  // accumulating one h at a time -- this re-reads the node's whole feature row
-  // a[0..F) once PER h, so each 512-byte row is fetched H=64 times: 16 GiB per
-  // window, measured at ~170 GB/s, i.e. saturating HBM to move the same bytes
-  // over and over. Hoisting f outside reads each element ONCE and updates all
-  // H accumulators from it.
+  // LAYER 1, TILED OVER h INTO REGISTERS.
   //
-  // The arithmetic is IDENTICAL, not merely equivalent: h1[h] still accumulates
-  // W1[h*F+f]*a[f] over f in ascending order, exactly as before, so every sum
-  // is formed from the same terms in the same sequence. W1 is only H*F floats
-  // and stays in cache across the f loop.
-  for (int h = 0; h < H; ++h) h1[h] = b1[h];
-  for (int f = 0; f < F; ++f) {
-    const float av = a[f];
-    for (int h = 0; h < H; ++h) h1[h] += W1[h * F + f] * av;
+  // Two wrong shapes preceded this one:
+  //   h outer, scalar accumulator: the accumulator is a register, but the
+  //     node's feature row a[0..F) is re-read once per h -- 64 passes.
+  //   f outer, accumulating into h1[]: reads a[] once, but h1 is a 1 KB
+  //     dynamically-indexed LOCAL array, so it turns into F*H = 8192
+  //     read-modify-writes of local memory per node. That is 1 KB per thread
+  //     of working set, 128 KB per block, which does not fit L1.
+  //
+  // Tiling h by a COMPILE-TIME kHT keeps the accumulators in registers (the
+  // inner loop unrolls) while reading a[f] only H/kHT times. Neither penalty.
+  //
+  // The order of each sum is unchanged: acc[k] accumulates
+  // W1[(h0+k)*F+f]*a[f] over ascending f, exactly as the scalar version did,
+  // so this is bit-identical to both predecessors.
+  constexpr int kHT = 32;
+  for (int h0 = 0; h0 < H; h0 += kHT) {
+    float acc[kHT];
+    const int hn = min(kHT, H - h0);
+#pragma unroll
+    for (int k = 0; k < kHT; ++k) acc[k] = (k < hn) ? b1[h0 + k] : 0.f;
+    for (int f = 0; f < F; ++f) {
+      const float av = a[f];
+#pragma unroll
+      for (int k = 0; k < kHT; ++k) {
+        if (k < hn) acc[k] += W1[(h0 + k) * F + f] * av;
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < kHT; ++k) {
+      if (k < hn) h1[h0 + k] = acc[k] > 0.f ? acc[k] : 0.f;
+    }
   }
-  for (int h = 0; h < H; ++h) h1[h] = h1[h] > 0.f ? h1[h] : 0.f;
   float z2[kMaxC], maxz = -1e30f;
   for (int c = 0; c < C; ++c) {
     float s = b2[c];
