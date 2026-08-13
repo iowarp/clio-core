@@ -984,7 +984,38 @@ namespace {
  * updated in. A replay that wants to reproduce this run's learning has to
  * follow seq, not the chunk index.
  */
-std::mutex g_selection_log_mutex;
+struct SelectionLog {
+  std::mutex mutex;
+  std::FILE *fp = nullptr;
+  long seq = 0;
+};
+
+/**
+ * Leaked on purpose, for the reason documented on
+ * neuropress_nn_gpu_kernels.cu's Registry(): worker threads can still reach
+ * this while static destructors are running, and tearing down a mutex (or
+ * closing the stream) underneath a thread that is mid-write is a crash with
+ * no upside. Nothing here needs releasing at exit -- the process is going
+ * away and the stream is flushed on every row.
+ */
+SelectionLog *SelectionLogInstance() {
+  static SelectionLog *log = [] {
+    auto *l = new SelectionLog();
+    const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+    if (path && *path) {
+      l->fp = std::fopen(path, "w");
+      if (l->fp) {
+        std::fprintf(l->fp,
+                     "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
+                     "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
+                     "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
+                     "actual_ct_ms,actual_psnr\n");
+      }
+    }
+    return l;
+  }();
+  return log;
+}
 
 void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             double entropy, double mad, double second_deriv,
@@ -992,23 +1023,11 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             const CompressionStats *predicted,
                             double actual_ratio, double actual_ct_ms,
                             double actual_psnr) {
-  static const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
-  if (!path || !*path) return;
+  SelectionLog *log = SelectionLogInstance();
+  if (!log->fp) return;
 
-  std::lock_guard<std::mutex> lock(g_selection_log_mutex);
-  static long seq = 0;
-  static std::FILE *fp = [] {
-    std::FILE *f = std::fopen(path, "w");
-    if (f) {
-      std::fprintf(f,
-                   "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
-                   "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
-                   "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
-                   "actual_ct_ms,actual_psnr\n");
-    }
-    return f;
-  }();
-  if (!fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  std::FILE *fp = log->fp;
 
   const std::string lib_name =
       ctp::CompressionFactory::NameForWireId(wire_lib);
@@ -1039,7 +1058,7 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
   std::fprintf(fp,
                "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
                "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
-               seq++, blob_name.c_str(), chunk_size, entropy, mad,
+               log->seq++, blob_name.c_str(), chunk_size, entropy, mad,
                second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
                shuffle, preset,
                predicted ? predicted->compression_ratio_ : 0.0,

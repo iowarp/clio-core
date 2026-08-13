@@ -136,10 +136,40 @@ namespace {
  * bucketing-policy difference.
  *
  * Registered globally so a model reload can zero every live buffer, matching
- * upstream's resetAllSGDEMABuffers() on reload.
+ * upstream's resetAllSGDEMABuffers() on reload. See Registry() for why that
+ * registry is never torn down.
  */
-std::mutex g_ema_registry_mutex;
-std::vector<float *> g_ema_registry;
+struct EmaRegistry {
+  std::mutex mutex;
+  std::vector<float *> buffers;
+};
+
+/**
+ * The registry is allocated on first use and DELIBERATELY NEVER DESTROYED.
+ *
+ * It used to be a pair of namespace-scope globals, which aborted the process
+ * at exit with "double free or corruption (fasttop)" whenever online
+ * learning had run (so the registry was non-empty; an inference-only run has
+ * nothing registered and shut down cleanly, which is what localized it).
+ *
+ * The mutex here serializes push_back against ResetAllEmaBuffers, but a
+ * DESTRUCTOR takes no lock. At static-destruction time ~vector() frees the
+ * element storage while a runtime worker thread can still be inside
+ * EmaBuffer()'s push_back -- and a push_back that grows frees the old block
+ * itself, so the two free the same pointer. Leaking the registry removes the
+ * destructor entirely, which is the only way to be sure: there is no point
+ * during teardown at which this can be safely torn down while any thread
+ * might still reach it.
+ *
+ * Leaking costs nothing beyond what is already leaked on purpose -- the EMA
+ * buffers it tracks are themselves never freed (see above) -- and the
+ * function-local static gives thread-safe initialization without adding an
+ * ordering dependency on any other global.
+ */
+EmaRegistry &Registry() {
+  static EmaRegistry *r = new EmaRegistry();
+  return *r;
+}
 
 float *EmaBuffer() {
   static thread_local float *buf = [] {
@@ -147,16 +177,18 @@ float *EmaBuffer() {
     if (cudaMalloc(&p, kParamCount * sizeof(float)) != cudaSuccess) return
         static_cast<float *>(nullptr);
     cudaMemset(p, 0, kParamCount * sizeof(float));
-    std::lock_guard<std::mutex> lock(g_ema_registry_mutex);
-    g_ema_registry.push_back(p);
+    EmaRegistry &reg = Registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    reg.buffers.push_back(p);
     return p;
   }();
   return buf;
 }
 
 void ResetAllEmaBuffers() {
-  std::lock_guard<std::mutex> lock(g_ema_registry_mutex);
-  for (float *p : g_ema_registry) {
+  EmaRegistry &reg = Registry();
+  std::lock_guard<std::mutex> lock(reg.mutex);
+  for (float *p : reg.buffers) {
     if (p) cudaMemset(p, 0, kParamCount * sizeof(float));
   }
 }
