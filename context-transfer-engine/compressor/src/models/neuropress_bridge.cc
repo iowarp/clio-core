@@ -64,7 +64,8 @@ std::vector<CompressionStats> RankIntoStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
     double second_derivative_mean, bool data_type_float, double error_bound,
-    const void *device_stats, void *stream, double min_psnr) {
+    const void *device_stats, void *stream, double min_psnr,
+    bool *out_inference_failed) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -293,6 +294,13 @@ std::vector<CompressionStats> RankIntoStats(
     auto preds = np->PredictBatchDeviceStats(device_stats, feats, stream,
                                              &weights, &order, min_psnr,
                                              &scores);
+    if (preds.empty() && !candidates.empty()) {
+      // Inference FAILED, as distinct from there being nothing to rank. Only
+      // the former is upstream's error case; an empty candidate set means this
+      // build cannot construct any of the eight algorithms, which is a
+      // configuration state and must not fail a write.
+      if (out_inference_failed) *out_inference_failed = true;
+    }
     if (preds.empty()) {
       // FAIL, do not substitute. Re-ranking on the host here would run
       // NeuroPress's own inference somewhere upstream never runs it, and
@@ -376,20 +384,22 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   return RankIntoStats(predictor, chunk_size, entropy, mad,
                        second_derivative_mean, data_type_float, error_bound,
                        /*device_stats=*/nullptr, /*stream=*/nullptr,
-                       /*min_psnr=*/0.0);
+                       /*min_psnr=*/0.0, /*out_inference_failed=*/nullptr);
 }
 
 std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
-    bool data_type_float, double error_bound, double min_psnr) {
+    bool data_type_float, double error_bound, double min_psnr,
+    bool *out_inference_failed) {
   // Zeros for the three data statistics: on this path they reach neither the
   // network (which reads device_stats) nor the score (which reads only the
   // prediction and the chunk size). See the header for why they are not
   // parameters -- fetching them here would mean synchronizing before the
   // inference rather than after it.
   return RankIntoStats(predictor, chunk_size, 0.0, 0.0, 0.0, data_type_float,
-                       error_bound, device_stats, stream, min_psnr);
+                       error_bound, device_stats, stream, min_psnr,
+                       out_inference_failed);
 }
 
 }  // namespace clio::cte::compressor

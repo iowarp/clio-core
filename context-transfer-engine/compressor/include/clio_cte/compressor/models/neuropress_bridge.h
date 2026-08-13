@@ -121,7 +121,8 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
 std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
-    bool data_type_float, double error_bound = 0.0, double min_psnr = 0.0);
+    bool data_type_float, double error_bound = 0.0, double min_psnr = 0.0,
+    bool *out_inference_failed = nullptr);
 
 }  // namespace clio::cte::compressor
 

@@ -568,9 +568,10 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
-    double* out_second_deriv) {
+    double* out_second_deriv, bool* out_neuropress_gpu_failed) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
+  if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
 
   // NeuroPress takes priority over the legacy heuristics below whenever it
   // is ready, so decide that first -- it determines how the chunk must be
@@ -664,9 +665,9 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   if (np_device_path && device_stats == nullptr) {
     HLOG(kError,
          "EstCompressionStats: device-resident statistics failed for a "
-         "NeuroPress chunk (size={}); NOT recomputing them on the host -- "
-         "skipping NeuroPress ranking for this chunk",
+         "NeuroPress chunk (size={}); NOT recomputing them on the host",
          chunk_size);
+    if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = true;
   }
   if (features_ok && device_stats == nullptr) {
     // Report the statistics the ranking below is about to use, so a caller
@@ -699,9 +700,14 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     bool data_type_float = (context.data_type_ == 1);
     std::vector<CompressionStats> neuropress_stats;
     if (device_stats != nullptr) {
+      bool np_infer_failed = false;
       neuropress_stats = NeuroPressCandidateStatsDevice(
           *neuropress_predictor_, chunk_size, device_stats, np_stream,
-          data_type_float, context.error_bound_, context.target_psnr_);
+          data_type_float, context.error_bound_, context.target_psnr_,
+          &np_infer_failed);
+      if (np_infer_failed && out_neuropress_gpu_failed) {
+        *out_neuropress_gpu_failed = true;
+      }
       // The stream is idle now -- the ranking waited on it once. Pulling the
       // three numbers out for the selection log and for Train()'s samples
       // therefore costs a 24-byte copy and no additional stall.
@@ -756,9 +762,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     // indistinguishable downstream from one NeuroPress made.
     if (device_stats != nullptr && neuropress_stats.empty()) {
       HLOG(kError,
-           "EstCompressionStats: NeuroPress GPU inference produced no "
-           "candidates for a device-resident chunk (size={}); NOT re-ranking "
-           "it on the host -- falling back to the legacy heuristics",
+           "EstCompressionStats: NeuroPress produced no candidates for a "
+           "device-resident chunk (size={}); NOT re-ranking it on the host",
            chunk_size);
     }
   }
@@ -1310,9 +1315,27 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // on, in every mode.
     bool ranked_by_cost = false;
     double sel_entropy = 0.0, sel_mad = 0.0, sel_second_deriv = 0.0;
+    bool neuropress_gpu_failed = false;
     auto stats =
         EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
-                            &sel_entropy, &sel_mad, &sel_second_deriv);
+                            &sel_entropy, &sel_mad, &sel_second_deriv,
+                            &neuropress_gpu_failed);
+
+    if (neuropress_gpu_failed) {
+      // NeuroPress was asked for, the chunk was on the device, and its GPU
+      // path could not decide. Upstream FAILS the write here -- a compress
+      // error becomes worker_err = -1 and propagates out through H5Dwrite
+      // (H5VLgpucompress.cu:2057, :2463, :3542) -- it does not store the
+      // chunk by some other route. Storing it uncompressed, as the branch
+      // below does, would be a silent substitution of a different outcome
+      // for the one that was requested.
+      HLOG(kError,
+           "Compress: NeuroPress GPU selection failed for chunk of {} bytes; "
+           "failing the write rather than storing it uncompressed",
+           chunk_size);
+      task->return_code_ = 4;
+      CLIO_CO_RETURN;
+    }
 
     if (stats.empty()) {
       // No valid compression available, disable compression

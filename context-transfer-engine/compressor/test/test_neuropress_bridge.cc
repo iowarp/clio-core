@@ -322,3 +322,31 @@ TEST_CASE("NeuroPressCandidateStats breaks ties by lowest action index",
 }
 
 SIMPLE_TEST_MAIN()
+
+TEST_CASE("device selection reports failure instead of degrading",
+          "[cte][compressor][neuropress][693]") {
+  // Upstream does not degrade when its GPU selection cannot decide: a null
+  // d_stats_ptr or a failed inference gives GPUCOMPRESS_ERROR_NN_NOT_LOADED
+  // (gpucompress_compress.cpp:285, :208-212), which the VOL turns into
+  // worker_err = -1 and propagates out through H5Dwrite
+  // (H5VLgpucompress.cu:2057, :2463, :3542). It never stores the chunk by
+  // another route. Clio therefore has to be able to SAY that it failed --
+  // returning an empty list is indistinguishable from "nothing to rank", and
+  // the caller turned that into an uncompressed store.
+  ctp::compress::model::NeuroPressNNPredictor unloaded;
+  REQUIRE_FALSE(unloaded.IsReady());
+
+  // A non-null device_stats selects the device branch; the predictor being
+  // not-ready makes inference decline before any CUDA work happens, which is
+  // the failure shape without needing a real device fault to provoke it.
+  const void *fake_device_stats = reinterpret_cast<const void *>(0x1);
+  bool inference_failed = false;
+  auto stats = clio::cte::compressor::NeuroPressCandidateStatsDevice(
+      unloaded, /*chunk_size=*/4u << 20, fake_device_stats, /*stream=*/nullptr,
+      /*data_type_float=*/true, /*error_bound=*/0.0, /*min_psnr=*/0.0,
+      &inference_failed);
+
+  REQUIRE(stats.empty());
+  INFO("an empty result must be distinguishable from a failed one");
+  REQUIRE(inference_failed);
+}

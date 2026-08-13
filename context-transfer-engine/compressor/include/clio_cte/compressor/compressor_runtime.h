@@ -399,10 +399,20 @@ private:
   // online learning is on -- the separate snapshot in DynamicSchedule is
   // taken only for SGD -- so this is the one place a caller can observe the
   // statistics behind a selection in an inference-only run.
+  // out_neuropress_gpu_failed: set when NeuroPress was the selected model, the
+  // chunk was device-resident, and its GPU path could not produce a selection.
+  // That case is NOT "no compression available" -- upstream treats it as a
+  // failed write. gpucompress_compress_gpu returns
+  // GPUCOMPRESS_ERROR_NN_NOT_LOADED on a null d_stats_ptr or a failed inference
+  // (gpucompress_compress.cpp:285, :208-212); the VOL turns that into
+  // worker_err = -1 (H5VLgpucompress.cu:2057), which becomes the function's
+  // return value (:2463) and then H5Dwrite's (:3542). It never stores the chunk
+  // by another route. Callers should propagate rather than degrade.
   std::vector<CompressionStats> EstCompressionStats(
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
       bool* out_ranked_by_cost = nullptr, double* out_entropy = nullptr,
-      double* out_mad = nullptr, double* out_second_deriv = nullptr);
+      double* out_mad = nullptr, double* out_second_deriv = nullptr,
+      bool* out_neuropress_gpu_failed = nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier
