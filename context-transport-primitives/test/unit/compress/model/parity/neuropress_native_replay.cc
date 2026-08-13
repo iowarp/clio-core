@@ -117,11 +117,28 @@ int main(int argc, char **argv) {
   const char *out_csv = "/tmp/neuropress_e2e_native.csv";
   const char *weights = nullptr;
   bool inference_only = false;
+  bool zero_output = false;
+  long dump_chunk = -1;
+  bool flush_cache = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--inference-only") {
       inference_only = true;
+    } else if (a == "--dump-chunk" && i + 1 < argc) {
+      dump_chunk = std::atol(argv[++i]);
+    } else if (a == "--flush-cache") {
+      // Diagnostic: evict the cached nvcomp managers before every chunk, so
+      // each compress starts from a fresh manager instead of one that has
+      // already processed other chunks.
+      flush_cache = true;
+    } else if (a == "--zero-output") {
+      // Diagnostic: clear the output buffer before every compress. If the
+      // payload hashes change when this is on, the codec is leaving bytes
+      // in its output untouched and the "difference" against another
+      // implementation is stale allocation content, not a different
+      // encoding.
+      zero_output = true;
     } else if (a == "--data" && i + 1 < argc) {
       data_path = argv[++i];
     } else if (a == "--clio-csv" && i + 1 < argc) {
@@ -242,6 +259,8 @@ int main(int argc, char **argv) {
       ++failed;
       continue;
     }
+    if (flush_cache) gpucompress_flush_manager_cache();
+    if (zero_output) cudaMemset(d_out, 0, max_out);
     size_t out_size = max_out;
     gpucompress_stats_t st;
     std::memset(&st, 0, sizeof(st));
@@ -288,6 +307,27 @@ int main(int argc, char **argv) {
         for (size_t k = 0; k < payload_size; ++k) {
           payload_hash ^= static_cast<unsigned char>(payload[k]);
           payload_hash *= 1099511628211ull;
+        }
+        // Same diagnostic as the Clio side: dump one chunk for a byte diff.
+        if (dump_chunk >= 0 && r.chunk == dump_chunk) {
+          char dp[512];
+          std::snprintf(dp, sizeof(dp), "%s.chunk%ld.bin", out_csv, r.chunk);
+          if (std::FILE *df = std::fopen(dp, "wb")) {
+            std::fwrite(payload.data(), 1, payload_size, df);
+            std::fclose(df);
+          }
+          // Also dump the FULL framed buffer, so the header can be located
+          // rather than assumed to be 64 bytes.
+          std::vector<char> full(out_size);
+          if (cudaMemcpy(full.data(), d_out, out_size,
+                         cudaMemcpyDeviceToHost) == cudaSuccess) {
+            std::snprintf(dp, sizeof(dp), "%s.chunk%ld.full.bin", out_csv,
+                          r.chunk);
+            if (std::FILE *df = std::fopen(dp, "wb")) {
+              std::fwrite(full.data(), 1, out_size, df);
+              std::fclose(df);
+            }
+          }
         }
       }
     }

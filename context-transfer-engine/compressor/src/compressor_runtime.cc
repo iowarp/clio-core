@@ -1061,6 +1061,25 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
   std::fprintf(log->fp, "%s,%zu,%llu,%d\n", blob_name.c_str(), payload_size, h,
                beneficial ? 1 : 0);
   std::fflush(log->fp);
+
+  // Diagnostic: dump one chunk's raw payload so it can be diffed against
+  // another implementation's byte for byte. Whole-payload hashes say THAT
+  // two encoders disagree; only the bytes say where and how.
+  const char *want = std::getenv("CLIO_NEUROPRESS_DUMP_CHUNK");
+  if (want && *want) {
+    const std::string suffix = std::string("/chunk_") + want;
+    if (blob_name.size() >= suffix.size() &&
+        blob_name.compare(blob_name.size() - suffix.size(), suffix.size(),
+                          suffix) == 0) {
+      const char *base = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+      std::string dp = std::string(base ? base : "/tmp/clio") + ".chunk" +
+                       want + ".bin";
+      if (std::FILE *df = std::fopen(dp.c_str(), "wb")) {
+        std::fwrite(p, 1, payload_size, df);
+        std::fclose(df);
+      }
+    }
+  }
 }
 
 bool SelectionLogEnabled() {
