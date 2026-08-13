@@ -54,6 +54,10 @@ namespace {
 
 constexpr size_t kChunkBytes = 4ull * 1024 * 1024;
 
+// NeuroPress prepends this much metadata to every compressed buffer
+// ("Output includes 64-byte header with metadata", gpucompress.h).
+constexpr size_t kNativeHeaderBytes = 64;
+
 struct Row {
   long seq = -1;
   long chunk = -1;
@@ -198,7 +202,8 @@ int main(int argc, char **argv) {
   std::fprintf(of,
                "seq,chunk,action,algo_idx,quantize,shuffle,entropy,mad,"
                "second_deriv,compressed_size,ratio,pred_ratio,pred_ct_ms,"
-               "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum\n");
+               "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum,"
+               "payload_hash,payload_size,mse,mean,variance,kurtosis\n");
 
   std::vector<char> in(kChunkBytes);
   const size_t max_out = gpucompress_max_compressed_size(kChunkBytes);
@@ -206,9 +211,10 @@ int main(int argc, char **argv) {
   // Device buffers: gpucompress_compress() is a host-path stub in this
   // build, and the GPU entry point is the one the VOL uses anyway, so the
   // comparison runs through the same code path Clio's chunks take.
-  void *d_in = nullptr, *d_out = nullptr;
+  void *d_in = nullptr, *d_out = nullptr, *d_dec = nullptr;
   if (cudaMalloc(&d_in, kChunkBytes) != cudaSuccess ||
-      cudaMalloc(&d_out, max_out) != cudaSuccess) {
+      cudaMalloc(&d_out, max_out) != cudaSuccess ||
+      cudaMalloc(&d_dec, kChunkBytes) != cudaSuccess) {
     std::fprintf(stderr, "cudaMalloc failed\n");
     return 1;
   }
@@ -266,6 +272,62 @@ int main(int argc, char **argv) {
       checksum *= 1099511628211ull;
     }
 
+    // Hash the codec payload only: NeuroPress prepends a 64-byte metadata
+    // header (gpucompress.h), Clio writes its own 24-byte one separately, so
+    // hashing the framed buffers would compare two different envelopes
+    // around what may well be identical bytes.
+    unsigned long long payload_hash = 0;
+    size_t payload_size = 0;
+    if (out_size > kNativeHeaderBytes) {
+      payload_size = out_size - kNativeHeaderBytes;
+      std::vector<char> payload(payload_size);
+      if (cudaMemcpy(payload.data(),
+                     static_cast<const char *>(d_out) + kNativeHeaderBytes,
+                     payload_size, cudaMemcpyDeviceToHost) == cudaSuccess) {
+        payload_hash = 1469598103934665603ull;
+        for (size_t k = 0; k < payload_size; ++k) {
+          payload_hash ^= static_cast<unsigned char>(payload[k]);
+          payload_hash *= 1099511628211ull;
+        }
+      }
+    }
+
+    // Round trip this chunk and measure the reconstruction directly rather
+    // than asserting losslessness from the configuration.
+    double mse = -1.0, mean = 0.0, variance = 0.0, kurtosis = 0.0;
+    {
+      size_t dec_size = kChunkBytes;
+      if (gpucompress_decompress_gpu(d_out, out_size, d_dec, &dec_size,
+                                     nullptr) == GPUCOMPRESS_SUCCESS &&
+          dec_size == kChunkBytes) {
+        std::vector<char> dec(kChunkBytes);
+        if (cudaMemcpy(dec.data(), d_dec, kChunkBytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+          const float *a = reinterpret_cast<const float *>(in.data());
+          const float *b = reinterpret_cast<const float *>(dec.data());
+          const size_t n = kChunkBytes / sizeof(float);
+          double se = 0.0, sum = 0.0;
+          for (size_t k = 0; k < n; ++k) {
+            const double d = static_cast<double>(a[k]) - b[k];
+            se += d * d;
+            sum += b[k];
+          }
+          mse = se / static_cast<double>(n);
+          mean = sum / static_cast<double>(n);
+          double m2 = 0.0, m4 = 0.0;
+          for (size_t k = 0; k < n; ++k) {
+            const double d = b[k] - mean;
+            m2 += d * d;
+            m4 += d * d * d * d;
+          }
+          m2 /= static_cast<double>(n);
+          m4 /= static_cast<double>(n);
+          variance = m2;
+          kurtosis = (m2 > 0.0) ? (m4 / (m2 * m2)) : 0.0;  // raw, 3 = normal
+        }
+      }
+    }
+
     // nn_final_action is the action actually used; with exploration off it
     // equals nn_original_action. Decode it the way decodeAction does.
     const int action = st.nn_final_action;
@@ -275,18 +337,21 @@ int main(int argc, char **argv) {
 
     std::fprintf(of,
                  "%ld,%ld,%d,%d,%d,%d,%.10g,%.10g,%.10g,%zu,%.10g,%.10g,"
-                 "%.10g,%.10g,%.10g,%.10g,%d,%llu\n",
+                 "%.10g,%.10g,%.10g,%.10g,%d,%llu,%llu,%zu,%.10g,%.10g,"
+                 "%.10g,%.10g\n",
                  r.seq, r.chunk, action, algo_idx, quantize, shuffle,
                  n_entropy, n_mad, n_deriv,
                  st.compressed_size, st.compression_ratio,
                  st.predicted_ratio, st.predicted_comp_time_ms,
                  st.predicted_decomp_time_ms, st.predicted_psnr_db,
-                 st.actual_comp_time_ms, st.sgd_fired, checksum);
+                 st.actual_comp_time_ms, st.sgd_fired, checksum,
+                 payload_hash, payload_size, mse, mean, variance, kurtosis);
     ++done;
   }
   std::fclose(of);
   cudaFree(d_in);
   cudaFree(d_out);
+  cudaFree(d_dec);
   std::fclose(df);
 
   std::printf("replayed %ld chunks (%ld failed) -> %s\n", done, failed,

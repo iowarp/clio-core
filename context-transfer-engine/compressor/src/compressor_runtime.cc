@@ -1006,6 +1006,63 @@ struct SelectionLog {
  * no upside. Nothing here needs releasing at exit -- the process is going
  * away and the stream is flushed on every row.
  */
+/**
+ * Companion to the selection log: a hash of the COMPRESSED payload each
+ * chunk produced, written from Compress() where those bytes actually exist.
+ *
+ * Logged here rather than passed up to DynamicSchedule because the two run
+ * as separate tasks and need not share a thread; keying on the blob name
+ * lets a comparison join them afterwards without any cross-task plumbing.
+ *
+ * The hash covers the codec's own output only -- not Clio's 24-byte header
+ * -- so it is directly comparable with NeuroPress's payload, whose 64-byte
+ * header is likewise excluded.
+ */
+struct PayloadLog {
+  std::mutex mutex;
+  std::FILE *fp = nullptr;
+};
+
+PayloadLog *PayloadLogInstance() {
+  static PayloadLog *log = [] {
+    auto *l = new PayloadLog();  // leaked on purpose, see SelectionLogInstance
+    const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+    if (path && *path) {
+      std::string p = std::string(path) + ".payload";
+      l->fp = std::fopen(p.c_str(), "w");
+      if (l->fp) {
+        std::fprintf(l->fp, "blob,compressed_size,payload_hash,beneficial\n");
+      }
+    }
+    return l;
+  }();
+  return log;
+}
+
+void LogCompressedPayload(const std::string &blob_name, const char *payload,
+                          size_t payload_size, bool on_device,
+                          bool beneficial) {
+  PayloadLog *log = PayloadLogInstance();
+  if (!log->fp || !payload || payload_size == 0) return;
+
+  std::vector<char> staged;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(payload);
+  if (on_device) {
+    staged.resize(payload_size);
+    ctp::DeviceAwareMemcpy(staged.data(), payload, payload_size);
+    p = reinterpret_cast<const unsigned char *>(staged.data());
+  }
+  unsigned long long h = 1469598103934665603ull;
+  for (size_t i = 0; i < payload_size; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ull;
+  }
+  std::lock_guard<std::mutex> lock(log->mutex);
+  std::fprintf(log->fp, "%s,%zu,%llu,%d\n", blob_name.c_str(), payload_size, h,
+               beneficial ? 1 : 0);
+  std::fflush(log->fp);
+}
+
 bool SelectionLogEnabled() {
   static const bool on = [] {
     const char *p = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
@@ -2230,6 +2287,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // Check if compression succeeded and is beneficial (include header size
     // in the total stored size)
     size_t total_stored_size = compressed_size + header_size;
+
+    if (success && SelectionLogEnabled()) {
+      LogCompressedPayload(task->blob_name_.str(), compress_dst,
+                           compressed_size, output_on_device,
+                           total_stored_size < input_size);
+    }
 
     if (success && total_stored_size < input_size) {
       // Update context with compression statistics
