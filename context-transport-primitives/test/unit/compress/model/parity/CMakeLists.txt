@@ -134,3 +134,63 @@ clio_add_neuropress_parity_test(neuropress_tiebreak_parity_exec
 
 # The dataset harness sweeps 1 GiB in 4 MiB chunks on both sides.
 set_tests_properties(ctp_neuropress_dataset_parity PROPERTIES TIMEOUT 900)
+
+# ---------------------------------------------------------------------------
+# Preprocessor parity: byte shuffle and error-bound quantization.
+#
+# Built separately from the model harnesses above because it needs a DIFFERENT
+# set of upstream sources -- byte_shuffle_kernels.cu and quantization_kernels.cu
+# rather than nn_gpu.cu -- and correspondingly does NOT need the globals stub,
+# since none of the nn_gpu.cu externs are referenced. quantization_kernels.cu
+# pulls in CUB, so this target gets its own include path for it.
+# ---------------------------------------------------------------------------
+set(_np_preproc
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/preprocessing/byte_shuffle_kernels.cu
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/preprocessing/quantization_kernels.cu)
+
+set(_np_preproc_available TRUE)
+foreach(_f IN LISTS _np_preproc)
+    if(NOT EXISTS ${_f})
+        set(_np_preproc_available FALSE)
+    endif()
+endforeach()
+
+if(_np_preproc_available)
+    add_executable(neuropress_preprocess_parity_exec
+        ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_preprocess_parity.cu
+        ${_np_preproc})
+
+    set_target_properties(neuropress_preprocess_parity_exec PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(neuropress_preprocess_parity_exec PRIVATE
+        ${CLIO_NEUROPRESS_SRC_DIR}/src
+        ${CLIO_NEUROPRESS_SRC_DIR}/include
+        ${CLIO_NVCOMP_INCLUDE_DIR}
+        ${CLIO_NVCOMP_INCLUDE_DIR}/..)
+
+    target_compile_definitions(neuropress_preprocess_parity_exec PRIVATE
+        CTP_ENABLE_NEUROPRESS_GPU=1
+        CTP_ENABLE_CUDA=1)
+
+    target_link_libraries(neuropress_preprocess_parity_exec
+        clio_ctp_compress_model)
+    if(TARGET ctp::cuda_cxx)
+        target_link_libraries(neuropress_preprocess_parity_exec ctp::cuda_cxx)
+    endif()
+    if(CLIO_CORE_CUDA_NEEDS_GCOV)
+        set_property(TARGET neuropress_preprocess_parity_exec
+                     APPEND PROPERTY LINK_LIBRARIES gcov)
+    endif()
+
+    add_test(NAME ctp_neuropress_preprocess_parity
+             COMMAND ${CMAKE_BINARY_DIR}/bin/neuropress_preprocess_parity_exec)
+    set_tests_properties(ctp_neuropress_preprocess_parity PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600
+        LABELS "693;parity;gpu")
+else()
+    message(STATUS
+        "NeuroPress preprocess parity: skipped (no preprocessing sources)")
+endif()

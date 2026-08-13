@@ -501,7 +501,18 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
 
   double data_min = 0.0, data_max = 0.0;
   if (!DeviceMinMax(in, num_elements, &data_min, &data_max)) return false;
-  const double data_range = data_max - data_min;
+  double data_range = data_max - data_min;
+  // Constant data: upstream substitutes 1.0 for the degenerate range
+  // (quantization_kernels.cu:408-411, "Handle constant data") and this must
+  // match, because data_range is what ComputeRequiredPrecision divides into
+  // bins. Left raw, a zero range makes num_bins 0 and the precision always
+  // INT8, where upstream selects INT16 at eb=1e-3 and INT32 below it -- a
+  // different packed width, and so a different quantized blob, for exactly
+  // the constant chunks scientific data is full of. It also makes
+  // min_eb_for_int32 zero, so an all-zero chunk with a bound below float32
+  // resolution left effective_eb at 0 and QuantizeDevice refused a chunk
+  // upstream quantizes. Caught by ctp_neuropress_preprocess_parity.
+  if (data_range <= 0.0) data_range = 1.0;
 
   // Effective bound, precision and scale are computed with the SAME
   // arithmetic as the host Quantize() above, which is upstream's

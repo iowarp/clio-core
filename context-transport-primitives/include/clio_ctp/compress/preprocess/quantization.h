@@ -140,7 +140,13 @@ QuantizationResult Quantize(const T* data,
 
   const double data_min = static_cast<double>(min_val);
   const double data_max = static_cast<double>(max_val);
-  const double data_range = data_max - data_min;
+  // Constant data gets upstream's substituted range, not the degenerate 0
+  // (quantization_kernels.cu:408-411) -- see the same clamp, and why it
+  // changes the selected precision, in QuantizeDevice
+  // (data_stats_gpu_kernels.cu). This path has to agree with that one about
+  // how a blob is encoded, so the derivation stays shared.
+  double data_range = data_max - data_min;
+  if (data_range <= 0.0) data_range = 1.0;
 
   // ---- Effective error bound (quantization_kernels.cu:418-473) ----
   // The user's bound has to cover BOTH the quantization step and the error
