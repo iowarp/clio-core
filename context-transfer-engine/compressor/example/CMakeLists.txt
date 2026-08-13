@@ -40,4 +40,9 @@ if(CLIO_CORE_ENABLE_CUDA)
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
   )
+
+  # Cross-project callback-trace equivalence harness. Skips itself when the
+  # native NeuroPress build or CUPTI is absent, since neither is a Clio build
+  # dependency.
+  add_subdirectory(neuropress_gpu_chunk_equivalence)
 endif()
