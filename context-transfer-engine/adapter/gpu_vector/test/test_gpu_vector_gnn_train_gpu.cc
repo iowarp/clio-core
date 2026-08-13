@@ -358,10 +358,18 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
     if (live[j]) {
       y[j] = labels[node_lo + nid[j]];
       loss_buf[nid[j]] = 0.0;
-      for (int c = 0; c < C; ++c) dz2_out[nid[j] * C + c] = 0.0f;
-      for (int h = 0; h < H; ++h) {
-        h1_out[nid[j] * H + h] = 0.0f;
-        dz1_out[nid[j] * H + h] = 0.0f;
+      // ZERO ONLY WHAT WILL NOT BE WRITTEN. This used to clear dz2_out, h1_out
+      // and dz1_out for EVERY node and then overwrite all three for the ones
+      // that train, i.e. 2H+C wasted stores per live node. A node that trains
+      // writes all of them; only the two early-out paths (unlabelled, and the
+      // held-out validation stride) need the zeros, and those clear their own.
+      const bool val = ((node_lo + nid[j]) % kValStride) == (kValStride - 1);
+      if (y[j] < 0 || val) {
+        for (int c = 0; c < C; ++c) dz2_out[nid[j] * C + c] = 0.0f;
+        for (int h = 0; h < H; ++h) {
+          h1_out[nid[j] * H + h] = 0.0f;
+          dz1_out[nid[j] * H + h] = 0.0f;
+        }
       }
       if (y[j] < 0) live[j] = false;
     }
@@ -805,6 +813,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   // Per-split partials for the dW1 reduction (kGradSplits ways).
   double *gw1_part = nullptr, *gb1_part = nullptr;
   double *gw2_part = nullptr, *gb2_part = nullptr;
+
   float *h1_buf, *dz1_buf, *dz2_buf, *d_scratch;
   REQUIRE(cudaMalloc(&dW1, H * F * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&db1, H * sizeof(float)) == cudaSuccess);
