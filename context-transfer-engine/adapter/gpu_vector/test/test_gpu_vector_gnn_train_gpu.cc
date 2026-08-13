@@ -204,17 +204,16 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
   for (; i < n; i += run) {
     CLIO_YCALL(v.HoldPageYield(lo + i, n - i, &run));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // operator[], NOT at(), and that costs real performance -- see below.
-      // at() is the read-only accessor and does not dirty the page, which is what a
-      // read-only sweep wants: no writeback, 32% faster epochs, and no SHM growth.
-      // It is also WRONG here today. A dirty page is skipped as an eviction victim
-      // (see the !pgi.dirty test in device_vector.h ClaimSlot); marking every page
-      // dirty therefore makes it non-evictable while any lane still holds it. With
-      // clean pages the slot can be claimed and refilled underneath a lane that is
-      // still reading, and the sweep returns wrong bytes -- measured 2 of 3 runs
-      // failing bit-exactness with at() versus 3 of 3 passing with operator[].
-      // Restore at() once eviction is safe against concurrent readers.
-      scratch[i + k] = v[lo + i + k];
+      // READ-ONLY ACCESS. at() does not dirty the page; operator[] does, and
+      // dirtying a page the workload only ever READS breaks three things at
+      // once. ClaimSlot refuses a dirty victim (it drops victims rather than
+      // writing them back, so taking a dirty one would lose writes), so once
+      // every cached page is dirty there is no clean victim, the run-fetch
+      // BeginFetchRunLocked cannot claim slots, and every fault degrades to a
+      // SINGLE page -- measured batch n=1 with 4608 round trips at ~7ms each.
+      // It also forced 1791 writebacks on a workload that never writes, each
+      // of which is a compress and a store on the compressed path.
+      scratch[i + k] = v.at(lo + i + k);
     }
   }
   CLIO_YEND();
@@ -825,6 +824,26 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     }, et_loss[e], et_acc[e], cnt, et_vacc[e]);
     std::fprintf(stderr, "[TRAIN]   eternia e%02d loss=%.6f acc=%.4f val_acc=%.4f (%.1fs elapsed)\n",
                  e, et_loss[e], et_acc[e], et_vacc[e], NowSec() - et_t0);
+  }
+  {
+    // The vector's own paging counters. `faults` against the number of pages
+    // the workload actually reads is the honest measure of whether the page
+    // stream is relevant; prefetch_late says whether a run-fetch landed before
+    // the block walked onto it, which is the difference between prefetching
+    // and re-fetching.
+    auto vs = vec.ReadStats(0);
+    const unsigned long long need = (unsigned long long)K * (unsigned long long)epochs;
+    std::fprintf(stderr,
+        "[TRAIN] PAGING: faults=%llu (workload needs %llu -> %.2fx) evicts=%llu puts=%llu "
+        "prefetches=%llu pf_hits=%llu pf_late=%llu pf_dropped=%llu "
+        "verify_lost=%llu get_err=%llu put_err=%llu\n",
+        (unsigned long long)vs.faults, need,
+        need ? (double)vs.faults / (double)need : 0.0,
+        (unsigned long long)vs.evicts, (unsigned long long)vs.puts,
+        (unsigned long long)vs.prefetches,
+        (unsigned long long)vs.prefetch_hits, (unsigned long long)vs.prefetch_late,
+        (unsigned long long)vs.pf_dropped, (unsigned long long)vs.verify_lost,
+        (unsigned long long)vs.get_errors, (unsigned long long)vs.put_errors);
   }
   double et_time = NowSec() - et_t0;
   const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
