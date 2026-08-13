@@ -385,7 +385,9 @@ class Cuszp : public Compressor {
         std::memcpy(&pre[i], jobs[i].src, sizeof(Prefix));
       }
     }
+    CUSZP_TRACE("batch n=%zu: prefixes issued", n);
     if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    CUSZP_TRACE("batch: prefixes landed");
 
     // Size a scratch slab for the HOST-side jobs only; all-device batches get
     // no slab at all.
@@ -400,6 +402,7 @@ class Cuszp : public Compressor {
       if (!IsDeviceAccessible(jobs[i].dst)) slab_need += nb;
     }
     char *slab = nullptr;
+    CUSZP_TRACE("batch: slab_need=%zu", slab_need);
     if (slab_need > 0 && cudaMalloc(&slab, slab_need) != cudaSuccess) {
       return false;
     }
@@ -407,7 +410,22 @@ class Cuszp : public Compressor {
     std::vector<void *> host_dst(n, nullptr);
     std::vector<size_t> host_dst_bytes(n, 0);
 
-    // Phase 1 -- launch every decode, then ONE wait.
+    // Phase 1 -- launch the decodes, then wait.
+    //
+    // ISSUED IN CHUNKS, and that is not a tuning choice. cuSZp has no batched
+    // entry point, so this is one kernel launch per page. The consumer that is
+    // waiting on these pages is itself a kernel being relaunched in a tight
+    // loop by its host driver, so the launch queue is already busy; pushing an
+    // unbounded number of decodes into it blocks the launch call itself, and
+    // the consumer cannot retire because it is waiting for exactly these
+    // decodes. Measured: a batch of 8 completes, the next batch of 56 hangs
+    // partway through issuing, with every worker stalled.
+    //
+    // Draining every kChunk launches bounds what is in flight and breaks the
+    // cycle. nvcomp does not need this because its batched API is ONE launch
+    // for the whole group.
+    constexpr size_t kChunk = 8;
+    size_t issued_since_drain = 0;
     for (size_t i = 0; i < n; ++i) {
       if (pre[i].magic != kMagic) continue;
       const size_t elems = static_cast<size_t>(pre[i].elems);
@@ -447,9 +465,30 @@ class Cuszp : public Compressor {
       if (host_dst[i] != nullptr) {
         cudaMemcpyAsync(host_dst[i], d_out, nb, cudaMemcpyDeviceToHost, stream);
       }
+      if (++issued_since_drain >= kChunk) {
+        issued_since_drain = 0;
+        // POLL rather than block, so a decode that never completes is
+        // distinguishable from one that is merely slow.
+        int spins = 0;
+        cudaError_t q;
+        while ((q = cudaStreamQuery(stream)) == cudaErrorNotReady) {
+          if (++spins > 200000) {
+            CUSZP_TRACE("chunk drain STUCK after %d polls at job %zu/%zu",
+                        spins, i, n);
+            break;
+          }
+        }
+        if (q != cudaSuccess && q != cudaErrorNotReady) {
+          CUSZP_TRACE("chunk drain error: %s", cudaGetErrorString(q));
+          break;
+        }
+        if (spins > 200000) break;
+      }
     }
+    CUSZP_TRACE("batch: decodes issued, waiting");
     const bool synced = cudaStreamSynchronize(stream) == cudaSuccess &&
                         cudaGetLastError() == cudaSuccess;
+    CUSZP_TRACE("batch: decodes done synced=%d", (int)synced);
     if (slab != nullptr) cudaFree(slab);
     bool all = true;
     for (size_t i = 0; i < n; ++i) {
