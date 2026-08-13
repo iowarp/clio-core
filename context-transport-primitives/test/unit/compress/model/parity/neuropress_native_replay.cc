@@ -220,7 +220,8 @@ int main(int argc, char **argv) {
                "seq,chunk,action,algo_idx,quantize,shuffle,entropy,mad,"
                "second_deriv,compressed_size,ratio,pred_ratio,pred_ct_ms,"
                "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum,"
-               "payload_hash,payload_size,mse,mean,variance,kurtosis\n");
+               "payload_hash,payload_size,mse,mean,variance,kurtosis,"
+               "restored_hash,bytes_differ\n");
 
   std::vector<char> in(kChunkBytes);
   const size_t max_out = gpucompress_max_compressed_size(kChunkBytes);
@@ -335,6 +336,8 @@ int main(int argc, char **argv) {
     // Round trip this chunk and measure the reconstruction directly rather
     // than asserting losslessness from the configuration.
     double mse = -1.0, mean = 0.0, variance = 0.0, kurtosis = 0.0;
+    unsigned long long restored_hash = 0;
+    size_t bytes_differ = kChunkBytes;  // until proven otherwise
     {
       size_t dec_size = kChunkBytes;
       if (gpucompress_decompress_gpu(d_out, out_size, d_dec, &dec_size,
@@ -343,6 +346,23 @@ int main(int argc, char **argv) {
         std::vector<char> dec(kChunkBytes);
         if (cudaMemcpy(dec.data(), d_dec, kChunkBytes,
                        cudaMemcpyDeviceToHost) == cudaSuccess) {
+          // Byte-by-byte against the source, and a hash of the restored
+          // bytes so this chunk can be matched against Clio's restored
+          // chunk directly -- not just each side against the source.
+          // MSE below is kept as a separate, weaker numeric view; it can
+          // read 0 for buffers that are not bit-identical (-0.0 vs +0.0),
+          // which is exactly why the byte compare is the one that counts.
+          bytes_differ = 0;
+          if (std::memcmp(dec.data(), in.data(), kChunkBytes) != 0) {
+            for (size_t k = 0; k < kChunkBytes; ++k) {
+              if (dec[k] != in[k]) ++bytes_differ;
+            }
+          }
+          restored_hash = 1469598103934665603ull;
+          for (size_t k = 0; k < kChunkBytes; ++k) {
+            restored_hash ^= static_cast<unsigned char>(dec[k]);
+            restored_hash *= 1099511628211ull;
+          }
           const float *a = reinterpret_cast<const float *>(in.data());
           const float *b = reinterpret_cast<const float *>(dec.data());
           const size_t n = kChunkBytes / sizeof(float);
@@ -378,14 +398,15 @@ int main(int argc, char **argv) {
     std::fprintf(of,
                  "%ld,%ld,%d,%d,%d,%d,%.10g,%.10g,%.10g,%zu,%.10g,%.10g,"
                  "%.10g,%.10g,%.10g,%.10g,%d,%llu,%llu,%zu,%.10g,%.10g,"
-                 "%.10g,%.10g\n",
+                 "%.10g,%.10g,%llu,%zu\n",
                  r.seq, r.chunk, action, algo_idx, quantize, shuffle,
                  n_entropy, n_mad, n_deriv,
                  st.compressed_size, st.compression_ratio,
                  st.predicted_ratio, st.predicted_comp_time_ms,
                  st.predicted_decomp_time_ms, st.predicted_psnr_db,
                  st.actual_comp_time_ms, st.sgd_fired, checksum,
-                 payload_hash, payload_size, mse, mean, variance, kurtosis);
+                 payload_hash, payload_size, mse, mean, variance, kurtosis,
+                 restored_hash, bytes_differ);
     ++done;
   }
   std::fclose(of);

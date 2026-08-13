@@ -51,6 +51,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -296,23 +297,76 @@ int main() {
             << (kDatasetBytes / (1024.0 * 1024.0)) / read_elapsed << " MiB/s)"
             << std::endl;
 
-  // The dataset is lossless here (no error bound is set on the pool), so the
-  // round trip must be exact. A near-miss would mean a lossy config was
-  // applied without one being asked for.
-  std::vector<float> wbuf(kNumElems), rbuf(kNumElems);
+  // INTEGRITY: byte-by-byte, not element-by-element.
+  //
+  // This used to compare floats. Float equality is not bit equality -- it
+  // calls +0.0 and -0.0 equal and calls NaN unequal to itself -- so a
+  // codec that perturbed a sign bit or produced a NaN would have been
+  // reported as either a false pass or a false failure. The dataset is
+  // lossless (no error bound is set on the pool), so the correct assertion
+  // is that the bytes come back identical.
+  //
+  // Per-chunk hashes are written alongside, so this run's restored data can
+  // be compared against native NeuroPress's chunk for chunk rather than
+  // each side only being checked against the source separately.
+  std::vector<char> wbuf(kDatasetBytes), rbuf(kDatasetBytes);
   CUDA_CHECK(cudaMemcpy(wbuf.data(), d_wbuf, kDatasetBytes,
                         cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(rbuf.data(), d_rbuf, kDatasetBytes,
                         cudaMemcpyDeviceToHost));
-  size_t mismatches = 0;
-  for (size_t i = 0; i < kNumElems; ++i) {
-    if (wbuf[i] != rbuf[i]) ++mismatches;
+
+  const size_t mismatches = 
+      (std::memcmp(wbuf.data(), rbuf.data(), kDatasetBytes) == 0)
+          ? 0
+          : [&] {
+              size_t bad = 0;
+              for (size_t i = 0; i < kDatasetBytes; ++i) {
+                if (wbuf[i] != rbuf[i]) ++bad;
+              }
+              return bad;
+            }();
+
+  size_t first_bad = kDatasetBytes;
+  if (mismatches) {
+    for (size_t i = 0; i < kDatasetBytes; ++i) {
+      if (wbuf[i] != rbuf[i]) { first_bad = i; break; }
+    }
   }
+
+  auto Fnv = [](const char *p, size_t n) {
+    unsigned long long h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+      h ^= static_cast<unsigned char>(p[i]);
+      h *= 1099511628211ull;
+    }
+    return h;
+  };
+
+  const std::string integrity_path = selection_log + ".integrity";
+  if (std::FILE *f = std::fopen(integrity_path.c_str(), "w")) {
+    std::fprintf(f, "chunk,source_hash,restored_hash,bytes_differ\n");
+    for (size_t c = 0; c < kNumChunks; ++c) {
+      const size_t off = c * kChunkBytes;
+      unsigned long long sh = Fnv(wbuf.data() + off, kChunkBytes);
+      unsigned long long rh = Fnv(rbuf.data() + off, kChunkBytes);
+      size_t bad = 0;
+      if (sh != rh) {
+        for (size_t i = 0; i < kChunkBytes; ++i) {
+          if (wbuf[off + i] != rbuf[off + i]) ++bad;
+        }
+      }
+      std::fprintf(f, "%zu,%llu,%llu,%zu\n", c, sh, rh, bad);
+    }
+    std::fclose(f);
+    std::cout << "Per-chunk integrity hashes: " << integrity_path << std::endl;
+  }
+
   std::cout << (mismatches == 0
-                    ? "VERIFIED: round trip matches exactly."
-                    : "MISMATCH: round trip corrupted data.")
-            << " (" << mismatches << " / " << kNumElems << " differ)"
-            << std::endl;
+                    ? "INTEGRITY VERIFIED: restored bytes identical to source."
+                    : "INTEGRITY FAILED: restored bytes differ from source.")
+            << " (" << mismatches << " / " << kDatasetBytes << " bytes differ";
+  if (mismatches) std::cout << ", first at offset " << first_bad;
+  std::cout << ")" << std::endl;
 
   cudaFree(d_wbuf);
   cudaFree(d_rbuf);
