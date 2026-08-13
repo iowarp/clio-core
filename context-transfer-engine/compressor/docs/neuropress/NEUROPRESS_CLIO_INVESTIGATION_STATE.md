@@ -9,11 +9,13 @@ anything else (Protocol §10).
 ## Header
 
 ```
-Current Phase:        ALL 28 PHASES CLOSED (Phases 21/25 PARTIAL; Phase 18 now COMPLETE)
-Current Subtask:      none — see "Next required action" for the 4 carried-forward experiments
+Current Phase:        ALL 28 PHASES CLOSED. All divergences dispositioned.
+                      Final report: NEUROPRESS_CLIO_EQUIVALENCE_REPORT.md
+Current Subtask:      none — 2 measurement items remain open (Phase 21 attribution,
+                      task 27 MAPE on 2-D/3-D data); neither can change the verdict
 Last updated:         2026-08-13
 Native baseline:      /home/cc/NeuroPress @ b23b8f6 (worktree: src/H5Zshuffle.c deleted)
-Port baseline:        /home/cc/clio-core @ branch neuropress-693-continued, HEAD fa485166
+Port baseline:        /home/cc/clio-core @ branch neuropress-693-continued, HEAD 9bcba093
 Build dir:            /home/cc/clio-core/build
 ```
 
@@ -2989,22 +2991,22 @@ COMPLETE
 | 3 | GPU quantization | **PASS — BYTE-IDENTICAL** | packed bytes + `scale`/`min`/`max` exact, 5 regimes × 5 bounds |
 | 4 | GPU dequantization | **PASS — BYTE-IDENTICAL** | restored floats byte-equal |
 | 5 | Statistics (entropy/MAD/2nd deriv) | **PASS — NUMERICALLY EQUIVALENT** | ≤ 5.4e-15 rel, 256 × 4 MiB chunks. Bit-exactness is impossible in principle — native uses `atomicAdd(double)` |
-| 6 | Byte-identical static selection | **device PASS / host DIFFERENCE (D7-1)** | 0/256 divergent on device; host-resident chunks use a different model entirely |
+| 6 | Byte-identical static selection | **PASS** *(revised — D7-1 was overstated)* | 0/256 divergent on device. Host-resident chunks are ranked by NeuroPress too; `compressor_residency_invariance` proves host and device copies of identical bytes select identically |
 | 7 | Byte-identical inference | **PASS — BIT-IDENTICAL** | max rel err **= 0** |
-| 8 | Byte-identical exploration | **DIFFERENCE FOUND (D8-1)** | cost formula matches term-for-term; the clock does not. Untested path |
+| 8 | Byte-identical exploration | **PASS — FIXED `66c86af5`** | cost formula matched term-for-term; the clock did not. Now CUDA-event kernel time on both sides. Path covered by `compressor_exploration` (gap G3 closed) |
 | 9 | Byte-identical inference-learning | **PASS** | weights diffed every step, worst 2.98e-08 (~1 ULP) |
 | 10 | Runtime SGD | **PASS** | multi-flow EMA scoping reproduces native's divergence exactly (0.00198627 both sides) |
 | 11 | Ranking / tie-break | **PASS** | 1530 + 251 checks; D9-1 float↔double bounded by measurement |
-| 12 | Diagnostics | **DIFFERENCE FOUND (D6-1)** | not ported; native's only consumers are its own tests |
+| 12 | Diagnostics | **DIFFERENCE (D6-1) — WONTFIX, accepted** | not ported; native's only consumers are its own tests |
 | 13 | `.nnwt` unchanged | **PASS — BYTE-IDENTICAL FILE** | md5 `df52a926af026fc617e172dcc990a395` |
 | 14 | Lossless decompression | **PASS** | 256/256 exact, 0 of 1,073,741,824 bytes differ |
-| 15 | Quantized error bound | **linear PASS / cuSZ DIFFERENCE (D16-1)** | linear quantizer within bound; cuSZ uses relative where native uses absolute — but unreachable from NeuroPress |
+| 15 | Quantized error bound | **PASS — FIXED `66c86af5`** | linear quantizer within bound; cuSZ default changed `Rel`→`Abs` to match native. Test tightened (gap G5 closed) and proven to fail under `Rel` |
 | 16 | Read-path equivalence | **PASS (structure)** | same inversion order, same metadata-from-header rule, loud failure |
 | 17 | Blob interchange | **NOT APPLICABLE (D15-1)** | containers disjoint by design; neither parses the other |
-| 18 | Payload bytes vs native | **DIFFERENCE FOUND (D18-1)** | 256/256 selections identical; **209/256 payloads differ** at identical payload size. ANS diverges unconditionally; cascaded only with shuffle; LZ4+shuffle identical |
-| 19 | No D→H→D | **PARTIAL** | counts measured, not normalized or attributed |
-| 20 | No CPU fallback | **DIFFERENCE FOUND (D20-1)** | default functional test takes the host path (1 CLIO kernel); device path complete and correct (8 kernels) |
-| 21 | CUDA IPC device pointer | **DIFFERENCE FOUND (D19-1)** | scratch never freed: 379 `cudaMalloc` vs 73 `cudaFree` |
+| 18 | Payload bytes vs native | **DIFFERENCE — INTRINSIC, NOT FIXABLE (D18-1/D18-2)** | 256/256 selections identical; **209/256 payloads differ** at identical payload size. Root cause: nvcomp ANS is history-dependent (`--flush-cache` changed 189/191 ANS hashes; `--zero-output` changed 0; native vs native 256/256 identical). Byte-identical payloads were never achievable |
+| 19 | No D→H→D | **PARTIAL** | counts measured, not normalized or attributed. Remaining work sharpens VOL-1, which D21-1 already accepted |
+| 20 | No CPU fallback | **DIFFERENCE FOUND (D20-1) — severity MEDIUM** *(re-graded)* | default functional test takes the host path (1 CLIO kernel); device path complete and correct (8 kernels). The HIGH grade rested on D7-1's reachability, and **D7-1 was corrected as overstated** — `compressor_residency_invariance` proves host and device selections agree. Performance/coverage concern, not correctness |
+| 21 | CUDA IPC device pointer | **PASS — FIXED `66c86af5`** | scratch was never freed (379 `cudaMalloc` vs 73 `cudaFree`); added `kDeregisterMemory = 36` admin method, IPC handle closed before free, `in_process` gate prevents cross-process use-after-free |
 
 ### Phase 28 — Final verdict
 
@@ -3038,30 +3040,44 @@ those results was produced by binaries that link upstream's own `.cu` sources
 and diff against them, re-run in this session.
 
 **The divergences are not in the arithmetic. They are in the plumbing.**
-Ranked by what I would act on first:
 
- 1. **D7-1 / D20-1 (HIGH).** A host-resident chunk with NeuroPress configured
-    is selected by CLIO's own legacy model and reported as success, where
-    native cannot proceed at all — its host entry point is a hard-failing
-    stub. Phase 20 proved this is not hypothetical: the **default shipped
-    functional test takes exactly that path**. The device path is complete and
-    correct; this is about which memory callers hand in. No test covers it.
- 2. **D19-1 (HIGH, resource).** Device scratch is never freed. Confirmed by
-    the allocator's own documented contract, by the absence of any
-    `GpuApi::Free` in the compressor, and by 379 `cudaMalloc` against 73
-    `cudaFree`. Native's discipline here is complete; this is CLIO's own bug.
- 3. **D8-1 (MEDIUM-HIGH).** Exploration and SGD are gated on a cost computed
-    from a different clock than native's. Internally consistent, already
-    acknowledged upstream, but it feeds selection and learning — and the whole
-    path is untested.
- 4. **D16-1, D15-1, D6-1** — real, bounded, and each unreachable or benign in
-    the way the checkpoints record.
+*This list was written before the fix pass and is superseded — see the
+disposition table below and `NEUROPRESS_CLIO_EQUIVALENCE_REPORT.md`. It is
+kept because it records what was believed at the time, including two
+gradings that later proved wrong.*
 
-**What I could not settle.** Payload bytes have never been compared against
-native. Phases 3, 4 and 15 prove the codec's inputs and configuration are
-identical, which makes identical payloads very likely — but likely is a
-hypothesis and it is recorded as one, not as a pass. Closing it needs one
-out-of-tree build; both halves of the input now exist.
+ 1. ~~**D7-1 / D20-1 (HIGH).**~~ **D7-1 CORRECTED — the claim was overstated.**
+    Host-resident chunks *are* ranked by NeuroPress, through the same
+    `RankIntoStats` → `predictor.Rank()` path as device chunks. What survives
+    is the `!features_ok` hand-off, silent on the host path only → fixed with
+    a log line. D20-1's HIGH grade rested entirely on D7-1's reachability and
+    is **re-graded MEDIUM**; `compressor_residency_invariance` (gap G2) now
+    proves host and device selections agree.
+ 2. ~~**D19-1 (HIGH, resource).**~~ **FIXED `66c86af5`** — `kDeregisterMemory`
+    admin method; IPC handle closed before free, `in_process` gate prevents a
+    cross-process use-after-free.
+ 3. ~~**D8-1 (MEDIUM-HIGH).**~~ **FIXED `66c86af5`** — CUDA-event kernel time
+    on both sides. Path now covered by `compressor_exploration` (gap G3).
+ 4. **D16-1 FIXED** (`Rel`→`Abs`, gap G5 closed). **D15-1, D6-1 WONTFIX** —
+    accepted architectural differences, CLIO does not link native NeuroPress.
+
+**Final disposition of every divergence:**
+
+| Outcome | Items |
+|---|---|
+| Fixed and verified | D19-1, VOL-5, VOL-2, D16-1, D8-1, D23-2 |
+| WONTFIX — CLIO architecture preserved | D21-1, D21-2, D15-1, D6-1, D22-1, D23-1, VOL-1 |
+| Explained by root cause | D18-1 ← D18-2 (nvcomp ANS is history-dependent), VOL-3 (fail-closed stamp guard) |
+| Corrected — my own earlier findings | D7-1 (overstated), D22-1 (severity), D23-1 (claim wrong), VOL-3 (mechanism), D20-1 (severity) |
+| Open, cannot change the verdict | D20-1 (MEDIUM), D22-2 (LOW), Phase 21 attribution, task 27 MAPE |
+
+**What I could not settle.** *(Superseded — Phase 18 subsequently ran.)*
+~~Payload bytes have never been compared against native.~~ They were compared:
+**209/256 differ** at identical payload size with 256/256 identical selections.
+The hypothesis that identical inputs and configuration imply identical payloads
+was **REFUTED**, and Phase 26 found why — nvcomp's ANS encoder is
+history-dependent (D18-2), so byte-identical payloads were never achievable
+against it. Decompression is exact on both sides regardless.
 
 **On the prior audit.** Its central empirical claim reproduces exactly on the
 test it profiled, and does not generalize: it measured the host-resident
@@ -3087,3 +3103,19 @@ confirmed and are among the most actionable results here.
 The port reproduces NeuroPress's decisions and its bytes. It differs in where
 work runs when the caller supplies host memory, in what happens when
 NeuroPress cannot decide, and in whether device memory comes back.
+
+---
+
+**FINAL VERDICT (2026-08-13, after the fix pass — supersedes both above):**
+
+**EQUIVALENT IN DECISIONS AND IN RECONSTRUCTED DATA. NOT BYTE-IDENTICAL IN
+COMPRESSED PAYLOAD. DIVERGENT — BY DESIGN — IN INTEGRATION ARCHITECTURE.**
+
+Two of the three things the earlier verdict called divergent were fixed: device
+memory now comes back (D19-1), and NeuroPress failing to decide already failed
+the write (`fa485166`). The third — where work runs on host memory (D20-1) — is
+real but does not change selections, proven by `compressor_residency_invariance`.
+Payload bytes differ for a reason outside either codebase: nvcomp's ANS encoder
+carries state across calls.
+
+Full answers to the protocol's 31 questions: `NEUROPRESS_CLIO_EQUIVALENCE_REPORT.md`.
