@@ -109,4 +109,34 @@ if(CLIO_CORE_ENABLE_CUDA)
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
   )
+  # ----------------------------------------------------------------------
+  # Compress a dataset to a directory: 256 MiB in 4 MiB chunks, NeuroPress
+  # inference picking per chunk, each compressed blob written out as a file
+  # with a manifest. No HDF5 -- it drives the compressor client directly.
+  # ----------------------------------------------------------------------
+  add_executable(neuropress_compress_dir
+    neuropress_compress_dir.cc
+  )
+
+  target_compile_definitions(neuropress_compress_dir PRIVATE
+    CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+  target_link_libraries(neuropress_compress_dir
+    neuropress_e2e_kernel
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ctp::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  install(TARGETS neuropress_compress_dir
+    RUNTIME DESTINATION bin
+  )
 endif()

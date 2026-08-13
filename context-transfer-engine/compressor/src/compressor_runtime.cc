@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <fstream>
 #include <limits>
@@ -2756,6 +2757,31 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           decompressor->Decompress(codec_dst, decompressed_size,
                                    compressed_data, compressed_size);
 
+      // Proof-of-execution trace, off unless
+      // CLIO_NEUROPRESS_DECOMPRESS_TRACE is set. A caller only ever sees a
+      // return code, and a path that served the bytes from somewhere else
+      // returns 0 just as happily -- which is precisely what the HDF5 VOL
+      // does when a dropped cache tag sends the read to the uncompressed
+      // copy. This reports from the codec call itself.
+      {
+        static const bool trace = [] {
+          const char *e = std::getenv("CLIO_NEUROPRESS_DECOMPRESS_TRACE");
+          return e && *e;
+        }();
+        if (trace) {
+          static std::atomic<long> calls{0};
+          std::fprintf(stderr,
+                       "[clio-decompress] call #%ld blob=%s lib=%s "
+                       "compressed=%zu -> %zu ok=%d\n",
+                       calls.fetch_add(1) + 1, task->blob_name_.str().c_str(),
+                       library_name.c_str(),
+                       static_cast<size_t>(compressed_size),
+                       static_cast<size_t>(decompressed_size),
+                       success ? 1 : 0);
+          std::fflush(stderr);
+        }
+      }
+
       CLIO_IPC->FreeBuffer(temp_buffer);
 
       // Invert the byte-shuffle the write side applied. Must happen before
@@ -3265,6 +3291,31 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   }
   std::string library_name = ctp::CompressionFactory::NameForWireId(
       static_cast<int>(header->compress_lib_));
+
+  // Proof-of-execution trace, off unless CLIO_NEUROPRESS_DECOMPRESS_TRACE is
+  // set. A caller can only see a return code, which a path that quietly
+  // served the data from somewhere else would also produce -- and in the
+  // HDF5 VOL flow that is exactly what happens, because a dropped cache tag
+  // sends reads to the uncompressed copy without decompressing anything.
+  // This says, from inside the codec path, that it really ran.
+  {
+    static const bool trace = [] {
+      const char *e = std::getenv("CLIO_NEUROPRESS_DECOMPRESS_TRACE");
+      return e && *e;
+    }();
+    if (trace) {
+      static std::atomic<long> calls{0};
+      std::fprintf(stderr,
+                   "[clio-decompress] call #%ld lib=%s(%d) preset=%u "
+                   "stored=%llu -> original=%llu\n",
+                   calls.fetch_add(1) + 1, library_name.c_str(),
+                   static_cast<int>(header->compress_lib_),
+                   static_cast<unsigned>(header->compress_preset_),
+                   static_cast<unsigned long long>(stored_size),
+                   static_cast<unsigned long long>(header->original_size_));
+      std::fflush(stderr);
+    }
+  }
   // Same packed layout Runtime::Compress writes -- unpack both halves. This
   // path used to compare the raw field, so a shuffled blob matched neither
   // 1 nor 3 and silently used BALANCED, and the shuffle was never inverted:
