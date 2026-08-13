@@ -107,6 +107,25 @@ jobs:
             --no-anaconda-upload \
             --output-folder build/conda-output
 
+      # Guard for #973. Nothing in `conda build` verifies that the binaries
+      # it produced can actually run on the glibc floor the recipe declares
+      # (c_stdlib_version), and the failure mode is silent: 2.2.0 shipped
+      # linking GLIBC_2.38 -- the runner host glibc -- so it installed fine
+      # on Rocky 8 and then died at import. Check the built package before
+      # it can be uploaded.
+      - name: Verify package glibc floor
+        shell: bash -l {0}
+        run: |
+          set -e
+          shopt -s nullglob
+          PKGS=(build/conda-output/linux-64/*.conda build/conda-output/linux-64/*.tar.bz2)
+          if [ ${#PKGS[@]} -eq 0 ]; then
+            echo "::error::conda build produced no linux-64 package to verify"
+            exit 1
+          fi
+          # Must match c_stdlib_version in installers/conda/conda_build_config.yaml
+          python3 installers/pip/check_wheel_glibc.py --max-glibc 2.28 "${PKGS[@]}"
+
       - name: Upload to Anaconda.org
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash -l {0}

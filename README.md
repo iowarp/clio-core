@@ -72,7 +72,8 @@ It provides:
 
 The pip wheel ships a **portable, self-contained build** with all
 dependencies statically linked. No system installs are required beyond
-glibc and Python 3.10+.
+glibc 2.28+ (`manylinux_2_28`: RHEL/Rocky/AlmaLinux 8 and newer, Ubuntu
+20.04+, Debian 11+) and Python 3.10+.
 
 ```bash
 pip install iowarp-core

@@ -6,6 +6,20 @@
 python:
   - 3.12
 
+# glibc floor for the Linux package (#973).
+#
+# 2.28 == RHEL/Rocky/AlmaLinux 8, still the standard HPC login-node OS, and
+# the same floor the pip wheels use (manylinux_2_28, see
+# .github/workflows/build-pip.yml). Together with {{ stdlib("c") }} in
+# meta.yaml this makes conda-build compile against sysroot_linux-64 2.28
+# instead of whatever glibc the CI runner happens to ship, and records a
+# __glibc>=2.28 constraint so older hosts get a clean solver error rather
+# than a package that installs and then fails to load.
+c_stdlib:
+  - sysroot                 # [linux]
+c_stdlib_version:
+  - '2.28'                  # [linux]
+
 # Bump the macOS x86_64 deployment target. conda-forge's osx-64 default is
 # 10.9, but nanobind uses C++17 aligned new/delete which is only available on
 # macOS 10.13+, so the Intel-mac build fails to compile nanobind. osx-arm64
