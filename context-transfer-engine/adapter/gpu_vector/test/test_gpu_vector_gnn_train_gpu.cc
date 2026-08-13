@@ -74,6 +74,9 @@ using namespace std::chrono_literals;
 namespace {
 
 bool g_initialized = false;
+// Phase timers for CLIO_GNN_KTIME (see the epoch loop).
+bool g_ktime = false;
+double t_gather = 0, t_fwd = 0, t_gw1 = 0, t_gw2 = 0;
 inline clio::run::PoolId StoragePool() { return clio::run::PoolId(600, 0); }
 
 constexpr int kMaxH = 256;
@@ -136,7 +139,16 @@ void EnsureInit() {
       << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n\n"
       << "  - mod_name: clio_cte_core\n    pool_name: cte_core\n    pool_query: local\n    pool_id: \"512.0\"\n"
       << "    storage:\n"
-      // SCORE IS "PREFER LOWER". MaxBwDpe partitions targets into
+      // SCORE IS "PREFER LOWER", AND THE COMPARISON IS <= THE BLOB SCORE.
+      // MaxBwDpe splits targets into low_score (target_score_ <= blob_score)
+      // = preferred and the rest = fallback, then ranks WITHIN a group by
+      // bandwidth. Pages are put with score 0.5f, so a tier scored exactly
+      // 0.5 lands in the SAME preferred group as kHBM and can outrank it on
+      // bandwidth -- measured as "TIER SPLIT: kHBM 0MiB, DRAM 8192MiB" with a
+      // healthy 5120 MiB HBM tier sitting empty. Every tier below kHBM must
+      // therefore be STRICTLY above the blob score.
+      //
+      // MaxBwDpe partitions targets into
       // low_score (target_score_ <= blob_score) = PREFERRED and high_score =
       // fallback, so the fast tier needs the LOW number. This was written the
       // other way round (hbm 1.0, ram 0.5), which put kHBM permanently in the
@@ -148,7 +160,7 @@ void EnsureInit() {
       << "      - path: \"hbm::cte_hbm_tier\"\n        bdev_type: \"hbm\"\n        capacity_limit: \""
       << hbm_mib << "MB\"\n        score: 0.0\n"
       << "      - path: \"ram::cte_dram_tier\"\n        bdev_type: \"ram\"\n        capacity_limit: \""
-      << dram_mib << "MB\"\n        score: 0.5\n";
+      << dram_mib << "MB\"\n        score: 0.6\n";
     // OPTIONAL NVMe TIER, identical in both the raw and the compressed run.
     // Without it, overflow lands in host DRAM, and on this machine that is
     // FREE: spilling 3 GiB of a 4 GiB matrix cost 4.4% (12.25s resident vs
@@ -553,16 +565,27 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     for (clio::run::u64 w = 0; w < K; w += window) {
       clio::run::u64 first = w * page_rows;
       clio::run::u64 nn = (clio::run::u64)window * page_rows;
+      // PHASE TIMING (CLIO_GNN_KTIME=1): synchronize around each phase so
+      // wall clock is attributed to gather / forward / gradient rather than
+      // inferred from totals. Off by default -- the syncs serialize the
+      // pipeline and would distort the number being measured.
+      const bool ktime = g_ktime;
+      double tp0 = 0.0;
+      if (ktime) { ctp::GpuApi::Synchronize(); tp0 = NowSec(); }
       gather(w, first, nn);   // fills d_scratch with nn*F floats
+      if (ktime) { ctp::GpuApi::Synchronize(); t_gather += NowSec() - tp0; tp0 = NowSec(); }
       int tpb = 128;
       TrainNodeKernel<<<(int)((nn + tpb - 1) / tpb), tpb>>>(
           d_scratch, nn, first, d_lab, F, H, C, dW1, db1, dW2, db2,
           h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count,
           d_vcorrect, d_vcount);
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
+      if (ktime) { ctp::GpuApi::Synchronize(); t_fwd += NowSec() - tp0; tp0 = NowSec(); }
       track_peak();
       GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
+      if (ktime) { ctp::GpuApi::Synchronize(); t_gw1 += NowSec() - tp0; tp0 = NowSec(); }
       GradW2Kernel<<<(C * H + tpb - 1) / tpb, tpb>>>(h1_buf, dz2_buf, nn, H, C, gW2, gb2);
+      if (ktime) { ctp::GpuApi::Synchronize(); t_gw2 += NowSec() - tp0; }
       if (kMinibatch) {
         // Mini-batch SGD: one weight update per window instead of one per epoch,
         // so an epoch performs ceil(K/window) updates rather than 1. Normalise by
@@ -868,6 +891,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   }
   std::vector<double> et_loss(epochs), et_acc(epochs), et_vacc(epochs);
   reset_weights();
+  g_ktime = EnvI64("CLIO_GNN_KTIME", 0) != 0;
+  t_gather = t_fwd = t_gw1 = t_gw2 = 0;
   double et_t0 = NowSec();
   for (int e = 0; e < epochs; ++e) {
     clio::run::u64 cnt;
@@ -927,6 +952,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
           tot ? 100.0 * (double)over / (double)tot : 0.0, mx,
           (unsigned long long)fh.size() * (unsigned long long)epochs);
     }
+  }
+  if (g_ktime) {
+    std::fprintf(stderr,
+        "[TRAIN] KTIME: gather=%.2fs forward=%.2fs gradW1=%.2fs gradW2=%.2fs\n",
+        t_gather, t_fwd, t_gw1, t_gw2);
   }
   double et_time = NowSec() - et_t0;
   const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
