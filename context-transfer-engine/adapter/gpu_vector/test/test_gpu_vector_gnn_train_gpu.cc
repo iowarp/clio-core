@@ -779,8 +779,16 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       (clio::run::u32)EnvI64("CLIO_GNN_GATHER_BLOCKS", 32);
   const clio::run::u32 gather_blocks =
       std::max<clio::run::u32>(1, std::min<clio::run::u32>(want_blocks, window));
-  const clio::run::u32 ppb =
-      std::max<clio::run::u32>(2, (2 * window) / gather_blocks);
+  // PAGES PER BLOCK IS WHAT MAKES PAGING BATCHED. For an encoded tag the
+  // fault path claims a RUN of pages with one multi-get
+  // (BeginFetchRunLocked), and the run can never be longer than the slots the
+  // block owns. Sizing this at 2 -- which is what holding the TOTAL cache
+  // fixed while widening the gather produced -- caps every request at one
+  // page, and one page per request is the whole cost of a compressed run:
+  // 30.5ms of task round trip for a 0.159ms decode.
+  const clio::run::u32 ppb = (clio::run::u32)EnvI64(
+      "CLIO_GNN_PAGES_PER_BLOCK",
+      std::max<clio::run::u32>(2, (2 * window) / gather_blocks));
   std::fprintf(stderr,
                "[TRAIN] gather: %u blocks x %lld threads, %u pages/block "
                "(total cache %u pages = %lluMiB)\n",
