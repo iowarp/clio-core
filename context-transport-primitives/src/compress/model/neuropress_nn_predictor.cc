@@ -147,16 +147,37 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
 
 #if CTP_ENABLE_NEUROPRESS_GPU
   // Upload to device -- this is what actually makes Predict()/Train() run
-  // as CUDA kernels below, matching NeuroPress's own device-resident
-  // design. gpu_weights_ stays null (falls back to the CPU path this class
-  // already has) if CUDA is compiled in but no device is available at
-  // runtime -- e.g. a CUDA-built binary running on a CPU-only host.
+  // as CUDA kernels below, matching NeuroPress's own device-resident design.
   gpu::NeuroPressGpuWeights* raw = gpu::NeuroPressGpuLoad(
       weights_.data(), weights_.size(), biases_.data(), biases_.size(),
       x_means_.data(), x_stds_.data(), y_means_.data(), y_stds_.data());
   gpu_weights_.reset(raw, [](gpu::NeuroPressGpuWeights* p) {
     gpu::NeuroPressGpuFree(p);
   });
+  if (!raw) {
+    // HALT, do not degrade. This is a build with GPU support whose device was
+    // unavailable at load time. Upstream has no CPU implementation of this
+    // network at all and ends the call on any such failure
+    // (GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:208-212 and
+    // :285), so answering from the host port instead would be NeuroPress
+    // running somewhere NeuroPress never runs.
+    //
+    // Failing the load is what makes that impossible rather than merely
+    // discouraged: IsReady() stays false, so the runtime's
+    // `neuropress_predictor_->IsReady()` gate (compressor_runtime.cc) never
+    // opens and the model is simply unavailable -- the same outcome as
+    // upstream's gpucompress_init() failing on a host with no device. What
+    // the runtime does next (legacy heuristics) is a different MODEL, chosen
+    // visibly, not this model relocated to the CPU.
+    std::fprintf(stderr,
+                 "clio ERROR: NeuroPress GPU weights could not be created on a "
+                 "CUDA-enabled build; refusing to load. NeuroPress has no CPU "
+                 "path -- it will not be used rather than run on the host.\n");
+    weights_.clear();
+    biases_.clear();
+    is_ready_ = false;
+    return false;
+  }
 #endif
 
   is_ready_ = true;
@@ -234,8 +255,6 @@ bool NeuroPressNNPredictor::Save(const std::string& model_dir) {
 
 bool NeuroPressNNPredictor::IsReady() const { return is_ready_; }
 
-namespace {
-
 // Maps a CompressionFactory base_id to NeuroPress's trained one-hot algo_id
 // (0-7), matching neural_net/core/configs.py's ALGORITHM_NAMES order
 // exactly: ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans',
@@ -264,8 +283,6 @@ int NeuroPressAlgoIdForBaseId(int base_id) {
       return ((base_id % 8) + 8) % 8;
   }
 }
-
-}  // namespace
 
 std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
     const CompressionFeatures& features, bool apply_lossless_sentinel) const {
@@ -506,9 +523,20 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
     }
     return results;
   }
-#endif
+  // Unreachable: Load() refuses on this build when the device weights could
+  // not be created, so a ready predictor always has them. Kept as a hard stop
+  // rather than a comment, because falling through to the host loop below is
+  // exactly the behaviour that must not exist -- upstream has no CPU network
+  // and ends the call instead (gpucompress_compress.cpp:208-212).
+  return {};
+#else
 
-  // CPU fallback: same per-candidate math as before, looped.
+  // The host implementation. Reachable ONLY on a build compiled without GPU
+  // support at all (CTP_ENABLE_NEUROPRESS_GPU=0), where there is no device
+  // for anything to fall back FROM and upstream could not be built either.
+  // On a GPU-capable build it is not merely unused, it is not compiled --
+  // which is what makes "no silent CPU execution" a property of the binary
+  // rather than a promise about control flow.
   for (const auto& features : batch) {
     auto x = FeaturesTo8Input(features);
     auto x_norm = Standardize(x);
@@ -541,6 +569,145 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
                     static_cast<double>(batch.size());
   for (auto& r : results) r.inference_time_ms = infer_ms;
   return results;
+#endif  // !CTP_ENABLE_NEUROPRESS_GPU
+}
+
+std::vector<CompressionPrediction>
+NeuroPressNNPredictor::PredictBatchDeviceStats(
+    const void* device_stats, const std::vector<CompressionFeatures>& batch,
+    void* stream, const RankingWeights* weights, std::vector<int>* out_order,
+    double min_psnr, std::vector<double>* out_scores) {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  // Same lock PredictBatch takes, for the same reason: TrainDecompHead()
+  // downloads every parameter, edits two and uploads them all back, so an
+  // inference reading the device weights mid-update would see a torn model.
+  // Upstream serializes the same hazard with cudaStreamWaitEvent on
+  // g_sgd_done (nn_gpu.cu:2187-2188). Omitting it here would have left this
+  // path unprotected while the one beside it was guarded -- learning is off
+  // in the configuration this path was built for, which is exactly what
+  // would have kept the gap invisible.
+  std::lock_guard<std::mutex> model_lock(*model_mutex_);
+  if (!is_ready_ || !gpu_weights_ || !device_stats || batch.empty()) return {};
+
+  auto start_time = std::chrono::high_resolution_clock::now();
+
+  // Only the four genuinely host-side inputs are assembled here. Inputs 5-7
+  // (entropy, MAD, second derivative) are deliberately NOT read off `batch`
+  // -- they live on the device and the kernel reads them there. Input 4 is
+  // the chunk size, identical for every candidate, so it rides as a scalar.
+  std::vector<float> desc(batch.size() * 4);
+  for (size_t i = 0; i < batch.size(); ++i) {
+    // RAW error bound, sentinel NOT applied. Upstream substitutes the 1e-7
+    // lossless sentinel inside its inference kernel
+    // (`input_raw[3] = (quant == 0) ? 1e-7f : eb_enc`, nn_gpu.cu:144) rather
+    // than in whatever assembled the inputs, so InferKernelDeviceStats does
+    // it there too -- the descriptor now carries what the caller actually
+    // configured and the substitution is the model's own, as it is upstream.
+    const auto x = FeaturesTo8Input(batch[i], /*apply_lossless_sentinel=*/false);
+    desc[i * 4 + 0] = x[0];  // algo_id
+    desc[i * 4 + 1] = x[1];  // quantize
+    desc[i * 4 + 2] = x[2];  // byte_shuffle
+    desc[i * 4 + 3] = x[3];  // error bound, raw
+  }
+
+  std::vector<float> comp_time(batch.size()), decomp_time(batch.size()),
+      ratio(batch.size()), psnr(batch.size());
+
+  // When the caller wants the ordering too, it is computed by the same kernel
+  // launch sequence rather than on the host -- see RankKernel. `out_order`
+  // being null keeps this a pure inference call.
+  // Upstream's ACTION INDICES, one per candidate. That is all the kernel
+  // needs: it decodes each one back into algo/quantize/shuffle itself, the
+  // way upstream decodes its thread index (nn_gpu.cu:133-135), so nothing
+  // about a configuration is assembled here any more. The error bound rides
+  // in as a scalar and the lossless sentinel is applied in-kernel.
+  std::vector<int> action_ids(batch.size());
+  for (size_t i = 0; i < batch.size(); ++i) {
+    const int base_id = static_cast<int>(batch[i].library_config_id) / 10;
+    action_ids[i] = NeuroPressActionId(base_id, batch[i].quantize != 0,
+                                       batch[i].byte_shuffle != 0);
+  }
+
+  // The chunk's bound: candidates carry it only when they quantize, so the
+  // maximum recovers it (see the mask note below).
+  double chunk_error_bound_for_kernel = 0.0;
+  for (const auto& f : batch) {
+    chunk_error_bound_for_kernel =
+        std::max(chunk_error_bound_for_kernel, f.error_bound);
+  }
+
+  gpu::GpuRankParams rank;
+  const gpu::GpuRankParams *rank_ptr = nullptr;
+  int *order_ptr = nullptr;
+  double *scores_ptr = nullptr;
+  if (out_order != nullptr && weights != nullptr && weights->use_cost_model) {
+    rank.data_size_bytes = batch[0].chunk_size_bytes;
+    rank.w_compress_time = weights->w_cost_compress_time;
+    rank.w_decompress_time = weights->w_cost_decompress_time;
+    rank.w_io = weights->w_cost_io;
+    rank.bandwidth_bytes_per_ms = weights->bandwidth_bytes_per_ms;
+    // The two mask inputs.
+    //
+    // The bound is the CHUNK's, i.e. upstream's cfg.error_bound -- NOT
+    // batch[0]'s. Candidates carry the bound only when they quantize
+    // (`c.error_bound = quant ? error_bound : 0.0`, neuropress_bridge.cc), and
+    // candidate 0 is always the unquantized one, so reading it there reported
+    // 0 on every run and masked the quantize half even when the caller had
+    // asked for a lossy write. Taking the maximum recovers the configured
+    // bound whenever any quantize candidate exists, and yields 0 when none
+    // does -- in which case the mask is moot, since nothing is quantized.
+    rank.error_bound = chunk_error_bound_for_kernel;
+    rank.min_psnr = min_psnr;
+    out_order->assign(batch.size(), 0);
+    rank_ptr = &rank;
+    order_ptr = out_order->data();
+    if (out_scores != nullptr) {
+      out_scores->assign(batch.size(), 0.0);
+      scores_ptr = out_scores->data();
+    }
+  }
+
+  if (!gpu::NeuroPressGpuInferBatchDeviceStats(
+          gpu_weights_.get(), device_stats, action_ids.data(),
+          static_cast<int>(batch.size()),
+          static_cast<float>(batch[0].chunk_size_bytes),
+          static_cast<float>(chunk_error_bound_for_kernel), stream,
+          comp_time.data(), decomp_time.data(), ratio.data(), psnr.data(),
+          rank_ptr, order_ptr, scores_ptr)) {
+    if (out_order != nullptr) out_order->clear();
+    if (out_scores != nullptr) out_scores->clear();
+    // Same contract as PredictBatch: an empty vector, never a zero-filled
+    // one that would read as a complete and pessimistic ranking.
+    return {};
+  }
+
+  auto end_time = std::chrono::high_resolution_clock::now();
+  const double infer_ms =
+      std::chrono::duration<double, std::milli>(end_time - start_time).count() /
+      static_cast<double>(batch.size());
+
+  std::vector<CompressionPrediction> results;
+  results.reserve(batch.size());
+  for (size_t i = 0; i < batch.size(); ++i) {
+    // Identical post-clamps to PredictBatch's GPU branch, so a chunk routed
+    // through either path lands on the same numbers.
+    results.emplace_back(
+        std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
+        std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
+        std::max(1.0, static_cast<double>(comp_time[i])),
+        std::max(1.0, static_cast<double>(decomp_time[i])), infer_ms);
+  }
+  return results;
+#else
+  (void)device_stats;
+  (void)batch;
+  (void)stream;
+  (void)weights;
+  (void)min_psnr;
+  if (out_order != nullptr) out_order->clear();
+  if (out_scores != nullptr) out_scores->clear();
+  return {};
+#endif
 }
 
 bool NeuroPressNNPredictor::Train(
@@ -573,10 +740,14 @@ bool NeuroPressNNPredictor::Train(
                                    static_cast<int>(num_samples),
                                    learning_rate_);
   }
-#endif
+  // Unreachable for the same reason as PredictBatch's: Load() refuses without
+  // device weights. Refuse the update rather than running SGD on the host --
+  // upstream's online learning is a device kernel and nothing else.
+  return false;
+#else
 
-  // ---- CPU fallback (used when CUDA is unavailable or no device was
-  // present at Load() time) ----
+  // ---- Host implementation. Compiled ONLY on a build without GPU support
+  // (CTP_ENABLE_NEUROPRESS_GPU=0); see the note in PredictBatch. ----
   // Per-sample forward pass + target/error computation (nn_gpu.cu's
   // per-sample loop, lines ~690-853) ----
   std::vector<SGDActivations> acts(num_samples);
@@ -922,6 +1093,7 @@ bool NeuroPressNNPredictor::Train(
     biases_[i] = std::max(-kWClamp, std::min(kWClamp, b));
   }
   return true;
+#endif  // !CTP_ENABLE_NEUROPRESS_GPU
 }
 
 const std::vector<float>& NeuroPressNNPredictor::DebugWeights() {

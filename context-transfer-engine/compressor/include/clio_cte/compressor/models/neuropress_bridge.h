@@ -86,6 +86,43 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
     double second_derivative_mean, bool data_type_float,
     double error_bound = 0.0);
 
+/**
+ * @brief Same ranking, with the network reading the data statistics out of
+ * DEVICE memory instead of receiving them as host doubles.
+ *
+ * Identical candidate set, cost model and tie-breaking -- it shares one body
+ * with the function above, and the scoring/sort step is literally the same
+ * code. The only difference is where inputs 5-7 of the feature vector come
+ * from, and therefore whether the chunk's statistics have to make a round trip
+ * through host memory to reach the model.
+ *
+ * That round trip is what upstream does not have: gpucompress_infer_gpu keeps
+ * an AutoStatsGPU on the device and hands the pointer to its inference kernel
+ * ("Stats remain on GPU -- NN inference reads d_stats_ptr directly on device",
+ * gpucompress_compress.cpp:281). Use this whenever the chunk is
+ * device-resident, which is the only situation upstream ever operates in.
+ *
+ * Falls back to the host ranking internally if device inference fails, so the
+ * caller never has to handle a half-finished selection.
+ *
+ * Deliberately takes no entropy/MAD/second-derivative arguments. They would
+ * have to be read back before this call to be passed, and that read is a
+ * stream synchronization -- placing it BEFORE the inference would reinstate
+ * exactly the stall this path exists to remove. They are also provably
+ * unnecessary: RankingWeights::Score consumes only the prediction and the
+ * chunk size, and the network takes its copies from `device_stats`. Callers
+ * wanting the numbers for a log should call ctp::ReadDeviceFeatureStats()
+ * AFTER this returns, when the stream is already idle and the read is free.
+ *
+ * @param device_stats Device pointer from ctp::ComputeDeviceStatsResident().
+ * @param stream The stream those statistics were enqueued on
+ *   (ctp::DeviceStatsStream()); the inference chains onto it.
+ */
+std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
+    ctp::compress::model::CompressionPredictor &predictor,
+    clio::run::u64 chunk_size, const void *device_stats, void *stream,
+    bool data_type_float, double error_bound = 0.0, double min_psnr = 0.0);
+
 }  // namespace clio::cte::compressor
 
 #endif  // CLIO_CTE_COMPRESSOR_MODELS_NEUROPRESS_BRIDGE_H_

@@ -415,13 +415,40 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       if (neuropress_predictor_->Load(config_.neuropress_model_path_)) {
         HLOG(kDebug, "NeuroPress NN model loaded successfully");
       } else {
-        HLOG(kWarning, "Failed to load NeuroPress NN model from: {}",
+        // A non-empty neuropress_model_path_ IS the user asking for
+        // NeuroPress. It has no CPU path -- upstream's network exists only as
+        // CUDA kernels and any failure there ends the call
+        // (GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:208-212)
+        // -- so a load failure means the thing that was asked for cannot run.
+        //
+        // Fail the pool rather than continue. Resetting the pointer and
+        // carrying on (what this used to do) left every subsequent write
+        // silently selected by the legacy heuristics: a different model,
+        // reached without anyone asking, and indistinguishable downstream
+        // from a NeuroPress decision.
+        //
+        // This is scoped to the case where NeuroPress was REQUESTED. A
+        // deployment that does not configure it is untouched, and every other
+        // compressor Clio offers -- including all the CPU ones -- keeps
+        // working exactly as before.
+        HLOG(kError,
+             "NeuroPress was requested (model path '{}') but could not be "
+             "loaded. It has no CPU implementation, so it will not be "
+             "silently replaced by another model -- failing CreateCompressor. "
+             "Unset neuropress_model_path_ to run without it.",
              config_.neuropress_model_path_);
         neuropress_predictor_.reset();
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
       }
     } catch (const std::exception& e) {
-      HLOG(kError, "Exception while loading NeuroPress NN model: {}", e.what());
+      HLOG(kError,
+           "Exception while loading the requested NeuroPress NN model: {} -- "
+           "failing rather than falling back to another model",
+           e.what());
       neuropress_predictor_.reset();
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
     }
   }
 
@@ -598,11 +625,50 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // outright -- `if (num_elements == 0 ...) return GPUCOMPRESS_ERROR_NN_
   // NOT_LOADED` (gpucompress_compress.cpp:274), guarded again at
   // stats_kernel.cu:307 -- so fall through to the legacy heuristics instead.
+
+  // Device-resident chunk with NeuroPress ranking: keep the statistics ON the
+  // GPU and let the network read them there, which is what upstream does --
+  // runStatsKernelsNoSync returns an AutoStatsGPU* and gpucompress_infer_gpu
+  // hands that pointer straight to the inference kernel ("Stats remain on
+  // GPU", gpucompress_compress.cpp:281).
+  //
+  // Nothing is synchronized here on purpose. The statistics kernels are
+  // enqueued and the ranking below chains its inference onto the SAME stream,
+  // so the whole decision runs as one asynchronous chain with a single wait at
+  // the end, exactly as gpucompress_infer_gpu does. The host copies for the
+  // selection log are taken afterwards, once that wait has already happened.
+  const void *device_stats = nullptr;
+  void *np_stream = nullptr;
+  const bool np_device_path =
+      num_elements > 0 && neuropress_active && ctp::IsDevicePointer(chunk);
+  if (np_device_path) {
+    np_stream = ctp::DeviceStatsStream();
+    device_stats = ctp::ComputeDeviceStatsResident(chunk, num_elements,
+                                                   data_type, np_stream);
+  }
+
+  // When the device path was the right one, it is the ONLY one. Computing the
+  // same three features on the host instead would run stages upstream only
+  // ever runs on the GPU, and would do it invisibly -- the selection would
+  // come out looking entirely normal. Upstream propagates the failure rather
+  // than substituting anything (a null d_stats_ptr gives
+  // GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:285), so this
+  // reports it and declines NeuroPress for the chunk.
   const bool features_ok =
-      num_elements > 0 &&
-      ctp::ComputeCompressionFeatures(chunk, num_elements, data_type, &entropy,
-                                      &mad, &second_derivative_mean);
-  if (features_ok) {
+      np_device_path
+          ? device_stats != nullptr
+          : (num_elements > 0 &&
+             ctp::ComputeCompressionFeatures(chunk, num_elements, data_type,
+                                             &entropy, &mad,
+                                             &second_derivative_mean));
+  if (np_device_path && device_stats == nullptr) {
+    HLOG(kError,
+         "EstCompressionStats: device-resident statistics failed for a "
+         "NeuroPress chunk (size={}); NOT recomputing them on the host -- "
+         "skipping NeuroPress ranking for this chunk",
+         chunk_size);
+  }
+  if (features_ok && device_stats == nullptr) {
     // Report the statistics the ranking below is about to use, so a caller
     // can record what a selection was actually based on.
     if (out_entropy) *out_entropy = entropy;
@@ -631,12 +697,34 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   if (features_ok && context.dynamic_compress_ != 1 && neuropress_predictor_ &&
       neuropress_predictor_->IsReady()) {
     bool data_type_float = (context.data_type_ == 1);
-    auto neuropress_stats = NeuroPressCandidateStats(
-        *neuropress_predictor_, chunk_size, entropy, mad,
-        second_derivative_mean, data_type_float, context.error_bound_);
-    // Apply the same PSNR filter the legacy per-candidate loop below uses,
-    // since NeuroPressCandidateStats itself is PSNR-agnostic (issue #693).
-    if (context.target_psnr_ > 0) {
+    std::vector<CompressionStats> neuropress_stats;
+    if (device_stats != nullptr) {
+      neuropress_stats = NeuroPressCandidateStatsDevice(
+          *neuropress_predictor_, chunk_size, device_stats, np_stream,
+          data_type_float, context.error_bound_, context.target_psnr_);
+      // The stream is idle now -- the ranking waited on it once. Pulling the
+      // three numbers out for the selection log and for Train()'s samples
+      // therefore costs a 24-byte copy and no additional stall.
+      if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
+                                       &second_derivative_mean, np_stream)) {
+        entropy = mad = second_derivative_mean = 0.0;
+      }
+      if (out_entropy) *out_entropy = entropy;
+      if (out_mad) *out_mad = mad;
+      if (out_second_deriv) *out_second_deriv = second_derivative_mean;
+    } else {
+      neuropress_stats = NeuroPressCandidateStats(
+          *neuropress_predictor_, chunk_size, entropy, mad,
+          second_derivative_mean, data_type_float, context.error_bound_);
+    }
+    // PSNR filtering, for the HOST path only. The device path applies the
+    // floor inside RankKernel where upstream applies it (nn_gpu.cu:239), and
+    // the two are not interchangeable: masking to -INFINITY leaves the
+    // candidate ranked last but still selectable, whereas removing it here
+    // can empty the list. Upstream always returns an action even when every
+    // action is masked, so re-filtering the device result would reintroduce
+    // exactly the divergence the in-kernel mask removes.
+    if (device_stats == nullptr && context.target_psnr_ > 0) {
       std::vector<CompressionStats> filtered;
       filtered.reserve(neuropress_stats.size());
       for (const auto& stat : neuropress_stats) {
@@ -660,7 +748,19 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       return neuropress_stats;
     }
     // Fall through to the legacy heuristics below if NeuroPress produced no
-    // usable candidates.
+    // usable candidates. That is a change of MODEL, not a relocation of
+    // NeuroPress's own work to the host -- the legacy heuristics are Clio's
+    // and have always been host code. It still gets said out loud on the
+    // device path, because there the empty result means GPU inference
+    // declined, and a selection silently made by a different model is
+    // indistinguishable downstream from one NeuroPress made.
+    if (device_stats != nullptr && neuropress_stats.empty()) {
+      HLOG(kError,
+           "EstCompressionStats: NeuroPress GPU inference produced no "
+           "candidates for a device-resident chunk (size={}); NOT re-ranking "
+           "it on the host -- falling back to the legacy heuristics",
+           chunk_size);
+    }
   }
 
   // Determine candidate compression libraries and configs

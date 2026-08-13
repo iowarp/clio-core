@@ -32,8 +32,24 @@ template <typename T>
 __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
                                   unsigned int *histogram, double *sum_out,
                                   double *sum_abs_d2_out) {
-  __shared__ unsigned int local_hist[kHistBins];
-  for (int i = threadIdx.x; i < kHistBins; i += blockDim.x) local_hist[i] = 0;
+  // Per-WARP privatized histograms, and a 4-bytes-at-a-time read, both taken
+  // from histogramKernelVec4 (entropy_kernel.cu:99-140). That variant is not
+  // an upstream curiosity: launchEntropyKernelsAsync PICKS it whenever
+  // `num_bytes >= 1024 && (ptr % 4) == 0` (:238), which is every chunk this
+  // path sees -- a 4 MiB float buffer is both. A single shared histogram read
+  // byte-at-a-time, as this did, issues four times the memory transactions
+  // and puts every thread in the block on one set of 256 shared counters.
+  //
+  // The COUNTS are unaffected: each byte is still counted exactly once, so
+  // entropy is bit-identical either way. That is why the dataset parity
+  // harness could not have caught this -- it compares numbers, and the
+  // numbers were always right.
+  constexpr int kWarpsPerBlock = kBlockSize / 32;
+  __shared__ unsigned int s_hist[kWarpsPerBlock][kHistBins];
+  const int warp_id = static_cast<int>(threadIdx.x) / 32;
+  const int lane_id = static_cast<int>(threadIdx.x) % 32;
+  for (int b = lane_id; b < kHistBins; b += 32) s_hist[warp_id][b] = 0;
+
   __shared__ double block_sum[kBlockSize];
   __shared__ double block_d2[kBlockSize];
   double thread_sum = 0.0;
@@ -43,10 +59,33 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(data);
   size_t num_bytes = num_elements * sizeof(T);
   size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
 
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_bytes;
-       i += stride) {
-    atomicAdd(&local_hist[bytes[i]], 1u);
+  // Same dispatch condition upstream uses, evaluated per block. It depends
+  // only on the base pointer and the length, so it is uniform -- no divergence.
+  if (num_bytes >= 1024 &&
+      (reinterpret_cast<uintptr_t>(bytes) % 4) == 0) {
+    const size_t num_words = num_bytes / 4;
+    const uint32_t *data32 = reinterpret_cast<const uint32_t *>(bytes);
+    for (size_t i = gid; i < num_words; i += stride) {
+      const uint32_t w = data32[i];
+      atomicAdd(&s_hist[warp_id][(w >> 0) & 0xFFu], 1u);
+      atomicAdd(&s_hist[warp_id][(w >> 8) & 0xFFu], 1u);
+      atomicAdd(&s_hist[warp_id][(w >> 16) & 0xFFu], 1u);
+      atomicAdd(&s_hist[warp_id][(w >> 24) & 0xFFu], 1u);
+    }
+    // Trailing bytes, counted by ONE block so they are not counted per block
+    // (entropy_kernel.cu:132-138).
+    if (blockIdx.x == 0) {
+      for (size_t i = num_words * 4 + threadIdx.x; i < num_bytes;
+           i += blockDim.x) {
+        atomicAdd(&s_hist[warp_id][bytes[i]], 1u);
+      }
+    }
+  } else {
+    for (size_t i = gid; i < num_bytes; i += stride) {
+      atomicAdd(&s_hist[warp_id][bytes[i]], 1u);
+    }
   }
 
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elements;
@@ -78,8 +117,12 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
     __syncthreads();
   }
 
-  for (int i = threadIdx.x; i < kHistBins; i += blockDim.x) {
-    if (local_hist[i]) atomicAdd(&histogram[i], local_hist[i]);
+  // Fold the per-warp histograms together before the global atomic, so each
+  // bin costs one global atomic per block rather than one per warp.
+  for (int b = threadIdx.x; b < kHistBins; b += blockDim.x) {
+    unsigned int total = 0;
+    for (int w = 0; w < kWarpsPerBlock; ++w) total += s_hist[w][b];
+    if (total) atomicAdd(&histogram[b], total);
   }
   if (threadIdx.x == 0) {
     atomicAdd(sum_out, block_sum[0]);
@@ -105,6 +148,159 @@ __global__ void StatsPass2Kernel(const T *data, size_t num_elements,
     __syncthreads();
   }
   if (threadIdx.x == 0) atomicAdd(sum_abs_dev_out, block_sum[0]);
+}
+
+/**
+ * Pass 2, device-mean variant: reads the mean out of the scalar buffer on the
+ * GPU instead of taking it as a host argument.
+ *
+ * Mirrors madPass2Kernel (stats_kernel.cu:201-213), which computes
+ * `stats->sum / stats->num_elements` into a __shared__ slot once per block.
+ * That one line is what lets upstream keep both passes on one stream: the
+ * host-argument form forces a D2H, a host divide and a relaunch between them.
+ */
+template <typename T>
+__global__ void StatsPass2DevKernel(const T *data, size_t num_elements,
+                                     const double *__restrict__ sum_in,
+                                     double *sum_abs_dev_out) {
+  __shared__ double s_mean;
+  if (threadIdx.x == 0) {
+    s_mean = *sum_in / static_cast<double>(num_elements);
+  }
+  __syncthreads();
+  const double mean = s_mean;
+
+  __shared__ double block_sum[kBlockSize];
+  double thread_sum = 0.0;
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elements;
+       i += stride) {
+    thread_sum += fabs(static_cast<double>(data[i]) - mean);
+  }
+  block_sum[threadIdx.x] = thread_sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) block_sum[threadIdx.x] += block_sum[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) atomicAdd(sum_abs_dev_out, block_sum[0]);
+}
+
+/**
+ * Shannon entropy from the byte histogram, on the GPU.
+ *
+ * Structure copied from entropyFromHistogramKernel (entropy_kernel.cu:167):
+ * one block, one bin per thread, then a shared-memory tree reduction. The
+ * reduction ORDER is part of the port -- a serial host loop and a tree sum
+ * over 256 doubles need not agree in the last ulp, and the whole point is to
+ * land on the value upstream's kernel produces, not merely a correct one.
+ */
+__global__ void EntropyFromHistKernel(const unsigned int *__restrict__ histogram,
+                                       size_t total_count,
+                                       double *__restrict__ entropy_out) {
+  __shared__ double s_partial[kBlockSize];
+  const int tid = threadIdx.x;
+  double partial = 0.0;
+  for (int bin = tid; bin < kHistBins; bin += blockDim.x) {
+    unsigned int count = histogram[bin];
+    if (count > 0) {
+      double p = static_cast<double>(count) / static_cast<double>(total_count);
+      partial -= p * log2(p);
+    }
+  }
+  s_partial[tid] = partial;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) s_partial[tid] += s_partial[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) *entropy_out = s_partial[0];
+}
+
+/**
+ * Normalize the accumulated sums into the two remaining features.
+ * Mirrors finalizeStatsOnlyKernel (stats_kernel.cu:260), including its
+ * `n > 2` guard on the second derivative. Entropy is not touched here --
+ * EntropyFromHistKernel writes it straight into the struct, the same way
+ * upstream's entropy kernel writes into `&d_stats->entropy`.
+ */
+__global__ void FinalizeFeatureStatsKernel(const double *__restrict__ scalars,
+                                            size_t num_elements,
+                                            DeviceFeatureStats *__restrict__ out) {
+  if (threadIdx.x != 0) return;
+  out->mad = (num_elements > 0)
+                 ? scalars[2] / static_cast<double>(num_elements)
+                 : 0.0;
+  out->second_derivative =
+      (num_elements > 2) ? scalars[1] / static_cast<double>(num_elements - 2)
+                         : 0.0;
+}
+
+/**
+ * Per-thread device scratch, allocated once and reused.
+ *
+ * Upstream preallocates the equivalent in its CompContext (ctx->d_stats,
+ * ctx->d_histogram, ctx->d_stats_workspace) precisely so the per-chunk path
+ * contains no allocator traffic; ComputeDeviceStatsTyped below still does
+ * four cudaMalloc/cudaFree per chunk, which is the other half of what made
+ * the two pipelines different shapes.
+ *
+ * Leaked on purpose, like EmaBuffer() in neuropress_nn_gpu_kernels.cu: freeing
+ * a device allocation from a thread-exit or static destructor races the CUDA
+ * runtime's own teardown.
+ */
+struct DeviceStatsScratch {
+  cudaStream_t stream = nullptr;
+  unsigned int *d_hist = nullptr;
+  double *d_scalars = nullptr;  // [sum, sum_abs_d2, sum_abs_dev]
+  DeviceFeatureStats *d_stats = nullptr;
+  bool ok = false;
+};
+
+DeviceStatsScratch &Scratch() {
+  static thread_local DeviceStatsScratch *s = [] {
+    auto *p = new DeviceStatsScratch();
+    p->ok = cudaStreamCreate(&p->stream) == cudaSuccess &&
+            cudaMalloc(&p->d_hist, kHistBins * sizeof(unsigned int)) ==
+                cudaSuccess &&
+            cudaMalloc(&p->d_scalars, 3 * sizeof(double)) == cudaSuccess &&
+            cudaMalloc(&p->d_stats, sizeof(DeviceFeatureStats)) == cudaSuccess;
+    return p;
+  }();
+  return *s;
+}
+
+/** Device-resident stats for one element type. No host round trip. */
+template <typename T>
+bool ComputeDeviceStatsResidentTyped(const T *data, size_t num_elements,
+                                      DeviceStatsScratch &s,
+                                      cudaStream_t stream) {
+  const size_t num_bytes = num_elements * sizeof(T);
+  if (cudaMemsetAsync(s.d_hist, 0, kHistBins * sizeof(unsigned int), stream) !=
+          cudaSuccess ||
+      cudaMemsetAsync(s.d_scalars, 0, 3 * sizeof(double), stream) !=
+          cudaSuccess ||
+      cudaMemsetAsync(s.d_stats, 0, sizeof(DeviceFeatureStats), stream) !=
+          cudaSuccess) {
+    return false;
+  }
+
+  int grid = static_cast<int>(std::min<size_t>(
+      (num_elements + kBlockSize - 1) / kBlockSize, 1024));
+  if (grid < 1) grid = 1;
+
+  // Same four stages upstream runs, in the same order, all on one stream:
+  // pass 1 (histogram + sum + second derivative), entropy from the histogram,
+  // pass 2 (MAD, mean read on-device), finalize.
+  StatsPass1Kernel<T><<<grid, kBlockSize, 0, stream>>>(
+      data, num_elements, s.d_hist, s.d_scalars, s.d_scalars + 1);
+  EntropyFromHistKernel<<<1, kBlockSize, 0, stream>>>(s.d_hist, num_bytes,
+                                                      &s.d_stats->entropy);
+  StatsPass2DevKernel<T><<<grid, kBlockSize, 0, stream>>>(
+      data, num_elements, s.d_scalars, s.d_scalars + 2);
+  FinalizeFeatureStatsKernel<<<1, 1, 0, stream>>>(s.d_scalars, num_elements,
+                                                  s.d_stats);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 template <typename T>
@@ -208,6 +404,71 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
     default:
       return false;
   }
+}
+
+void *DeviceStatsStream() {
+  DeviceStatsScratch &s = Scratch();
+  return s.ok ? static_cast<void *>(s.stream) : nullptr;
+}
+
+const void *ComputeDeviceStatsResident(const void *device_data,
+                                        size_t num_elements, DataType type,
+                                        void *stream) {
+  DeviceStatsScratch &s = Scratch();
+  if (!s.ok || device_data == nullptr) return nullptr;
+  cudaStream_t st = stream ? static_cast<cudaStream_t>(stream) : s.stream;
+
+  // A chunk with no elements has no statistics. The zeroing memset in the
+  // typed helper would leave the struct at all zeros, which is a real point
+  // in the feature space ("perfectly compressible"), so refuse instead --
+  // upstream refuses the same case outright (gpucompress_compress.cpp:274).
+  if (num_elements == 0) return nullptr;
+
+  bool ok = false;
+  switch (type) {
+    case DataType::UINT8:
+      ok = ComputeDeviceStatsResidentTyped<uint8_t>(
+          static_cast<const uint8_t *>(device_data), num_elements, s, st);
+      break;
+    case DataType::INT32:
+      ok = ComputeDeviceStatsResidentTyped<int32_t>(
+          static_cast<const int32_t *>(device_data), num_elements, s, st);
+      break;
+    case DataType::FLOAT32:
+      ok = ComputeDeviceStatsResidentTyped<float>(
+          static_cast<const float *>(device_data), num_elements, s, st);
+      break;
+    case DataType::DOUBLE64:
+      ok = ComputeDeviceStatsResidentTyped<double>(
+          static_cast<const double *>(device_data), num_elements, s, st);
+      break;
+    default:
+      return nullptr;
+  }
+  return ok ? static_cast<const void *>(s.d_stats) : nullptr;
+}
+
+bool ReadDeviceFeatureStats(const void *device_stats, double *out_entropy,
+                            double *out_mad, double *out_second_derivative,
+                            void *stream) {
+  if (!device_stats || !out_entropy || !out_mad || !out_second_derivative) {
+    return false;
+  }
+  cudaStream_t st = static_cast<cudaStream_t>(stream);
+  DeviceFeatureStats h{};
+  if (cudaMemcpyAsync(&h, device_stats, sizeof(h), cudaMemcpyDeviceToHost,
+                      st) != cudaSuccess) {
+    return false;
+  }
+  // Stream-scoped, not device-wide: this runs concurrently with other
+  // workers' compressions and must not serialize them. Upstream likewise
+  // ends its inference phase with cudaStreamSynchronize(stream)
+  // (nn_gpu.cu:2236), never cudaDeviceSynchronize.
+  if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+  *out_entropy = h.entropy;
+  *out_mad = h.mad;
+  *out_second_derivative = h.second_derivative;
+  return true;
 }
 
 }  // namespace ctp
@@ -318,7 +579,7 @@ bool ByteShuffleDevice(const void *device_in, void *device_out,
   if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
-  cudaStream_t stream = 0;
+  cudaStream_t stream = static_cast<cudaStream_t>(DeviceStatsStream());
   const size_t cb = kShuffleChunkBytes;
   if (elem_size == 2) {
     ShuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
@@ -338,7 +599,7 @@ bool ByteUnshuffleDevice(const void *device_in, void *device_out,
   if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
-  cudaStream_t stream = 0;
+  cudaStream_t stream = static_cast<cudaStream_t>(DeviceStatsStream());
   const size_t cb = kShuffleChunkBytes;
   if (elem_size == 2) {
     UnshuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
@@ -456,6 +717,12 @@ __global__ void MinMaxKernel(const float *__restrict__ in, size_t n,
  */
 bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
                   double *out_max) {
+  // The per-thread stream, not the null stream. Upstream runs every stage of
+  // a compression on its CompContext's own stream and waits only on that
+  // (gpucompress_pool.cpp); the null stream plus cudaDeviceSynchronize below
+  // stalled every other worker's kernels as well as this one, which on a
+  // runtime with a worker pool is a throughput bug, not a style point.
+  cudaStream_t stream = static_cast<cudaStream_t>(DeviceStatsStream());
   // Clear any sticky error left by an EARLIER, unrelated CUDA call --
   // cudaPointerGetAttributes on a host pointer (which IsDevicePointer does
   // routinely on this path) leaves cudaErrorInvalidValue behind, and the
@@ -465,20 +732,23 @@ bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
   unsigned int *d_res = nullptr;
   if (cudaMalloc(&d_res, 2 * sizeof(unsigned int)) != cudaSuccess) return false;
   unsigned int init[2] = {0xFFFFFFFFu, 0u};
-  bool ok = cudaMemcpy(d_res, init, sizeof(init), cudaMemcpyHostToDevice) ==
-            cudaSuccess;
+  bool ok = cudaMemcpyAsync(d_res, init, sizeof(init), cudaMemcpyHostToDevice,
+                            stream) == cudaSuccess;
 
   if (ok) {
     int grid = static_cast<int>(
         std::min<size_t>((n + kBlockSize - 1) / kBlockSize, 1024));
     if (grid < 1) grid = 1;
-    MinMaxKernel<<<grid, kBlockSize>>>(d_in, n, d_res, d_res + 1);
-    ok = cudaGetLastError() == cudaSuccess &&
-         cudaDeviceSynchronize() == cudaSuccess;
+    MinMaxKernel<<<grid, kBlockSize, 0, stream>>>(d_in, n, d_res, d_res + 1);
+    ok = cudaGetLastError() == cudaSuccess;
   }
   unsigned int h[2] = {0u, 0u};
   if (ok) {
-    ok = cudaMemcpy(h, d_res, sizeof(h), cudaMemcpyDeviceToHost) == cudaSuccess;
+    // One stream-scoped wait for the whole sequence, after the read is
+    // enqueued -- rather than a device-wide barrier before it.
+    ok = cudaMemcpyAsync(h, d_res, sizeof(h), cudaMemcpyDeviceToHost, stream) ==
+             cudaSuccess &&
+         cudaStreamSynchronize(stream) == cudaSuccess;
   }
   cudaFree(d_res);
   if (!ok) return false;
@@ -498,6 +768,9 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     return false;
   }
   const float *in = static_cast<const float *>(device_in);
+  // Same per-thread stream the rest of this path uses; upstream's
+  // quantize_simple likewise takes a stream and waits only on it.
+  cudaStream_t qstream = static_cast<cudaStream_t>(DeviceStatsStream());
 
   double data_min = 0.0, data_max = 0.0;
   if (!DeviceMinMax(in, num_elements, &data_min, &data_max)) return false;
@@ -545,20 +818,22 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   if (blocks < 1) blocks = 1;
 
   if (width == 1) {
-    QuantizeKernel<int8_t><<<blocks, threads>>>(
+    QuantizeKernel<int8_t><<<blocks, threads, 0, qstream>>>(
         in, static_cast<int8_t *>(device_out), num_elements, scale, data_min,
         -128.0, 127.0);
   } else if (width == 2) {
-    QuantizeKernel<int16_t><<<blocks, threads>>>(
+    QuantizeKernel<int16_t><<<blocks, threads, 0, qstream>>>(
         in, static_cast<int16_t *>(device_out), num_elements, scale, data_min,
         -32768.0, 32767.0);
   } else {
-    QuantizeKernel<int32_t><<<blocks, threads>>>(
+    QuantizeKernel<int32_t><<<blocks, threads, 0, qstream>>>(
         in, static_cast<int32_t *>(device_out), num_elements, scale, data_min,
         -2147483648.0, 2147483647.0);
   }
   if (cudaGetLastError() != cudaSuccess) return false;
-  if (cudaDeviceSynchronize() != cudaSuccess) return false;
+  // Stream-scoped, matching upstream's quantize_simple, which takes a stream
+  // and synchronizes only it (quantization_kernels.cu).
+  if (cudaStreamSynchronize(qstream) != cudaSuccess) return false;
 
   *out_bytes = num_elements * width;
   out_params->error_bound = error_bound;
@@ -573,6 +848,7 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
 
 bool DequantizeDevice(const void *device_in, size_t num_elements,
                       const DeviceQuantizeParams &params, void *device_out) {
+  cudaStream_t dstream = static_cast<cudaStream_t>(DeviceStatsStream());
   if (!device_in || !device_out || num_elements == 0 || params.scale <= 0.0) {
     return false;
   }
@@ -586,20 +862,20 @@ bool DequantizeDevice(const void *device_in, size_t num_elements,
 
   float *out = static_cast<float *>(device_out);
   if (width == 1) {
-    DequantizeKernel<int8_t><<<blocks, threads>>>(
+    DequantizeKernel<int8_t><<<blocks, threads, 0, dstream>>>(
         static_cast<const int8_t *>(device_in), out, num_elements, inv_scale,
         params.data_min);
   } else if (width == 2) {
-    DequantizeKernel<int16_t><<<blocks, threads>>>(
+    DequantizeKernel<int16_t><<<blocks, threads, 0, dstream>>>(
         static_cast<const int16_t *>(device_in), out, num_elements, inv_scale,
         params.data_min);
   } else {
-    DequantizeKernel<int32_t><<<blocks, threads>>>(
+    DequantizeKernel<int32_t><<<blocks, threads, 0, dstream>>>(
         static_cast<const int32_t *>(device_in), out, num_elements, inv_scale,
         params.data_min);
   }
   if (cudaGetLastError() != cudaSuccess) return false;
-  return cudaDeviceSynchronize() == cudaSuccess;
+  return cudaStreamSynchronize(dstream) == cudaSuccess;
 }
 
 }  // namespace ctp::compress::preprocess

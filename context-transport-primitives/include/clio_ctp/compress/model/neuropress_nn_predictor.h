@@ -45,6 +45,36 @@
 namespace ctp::compress::model {
 
 /**
+ * @brief CompressionFactory base_id -> NeuroPress's trained algo index (0-7).
+ *
+ * The order is ALGORITHM_NAMES from the training code
+ * (neural_net/core/configs.py): lz4, snappy, deflate, gdeflate, zstd, ans,
+ * cascaded, bitcomp. Exposed because it is not merely an input encoding: it
+ * is half of upstream's ACTION index, and therefore decides tie-breaks. A
+ * candidate list built in any other order resolves ties differently from
+ * upstream even when every prediction agrees.
+ *
+ * Anything outside the trained action space returns a deterministic in-range
+ * value; such candidates are filtered out before ranking (see
+ * neuropress_bridge.cc) and never reach the model.
+ */
+int NeuroPressAlgoIdForBaseId(int base_id);
+
+/**
+ * @brief The action index upstream would give this configuration.
+ *
+ * `action = algo + 8*quantize + 16*shuffle` -- decodeAction's encoding
+ * (internal.hpp:167-172), which the inference kernel inverts to rebuild the
+ * per-config inputs. Ordering a candidate list by this makes slot order and
+ * action order the same thing, so "first enumerated wins" and upstream's
+ * "lowest action index wins" become the same rule.
+ */
+inline int NeuroPressActionId(int base_id, bool quantize, bool byte_shuffle) {
+  return NeuroPressAlgoIdForBaseId(base_id) + (quantize ? 8 : 0) +
+         (byte_shuffle ? 16 : 0);
+}
+
+/**
  * @brief NeuroPress dense multi-output neural network predictor.
  *
  * 5-layer feedforward: 8 → 64 → 64 → 64 → 64 → 8 with ReLU on hidden.
@@ -102,6 +132,34 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   }
 
   /**
+   * @brief True when inference and SGD actually run as CUDA kernels.
+   *
+   * On a GPU build this is EQUIVALENT to IsReady(), and deliberately so:
+   * Load() refuses rather than returning a predictor backed by the host port,
+   * so there is no ready-but-host-only state for the two to disagree about.
+   * That equivalence is the invariant "NeuroPress never runs on the CPU"
+   * reduced to something a test can assert, and
+   * ctp_neuropress_device_path_parity asserts exactly it.
+   *
+   * It is therefore NOT a guard callers should branch on -- IsReady() already
+   * carries the meaning, and upstream likewise exposes a single predicate
+   * (gpucompress_nn_is_loaded, gpucompress.h:365, set only once the weights
+   * reach the device at nn_gpu.cu:1790) rather than one for "loaded" and
+   * another for "on the GPU". Adding a second gate here would be a second
+   * gate upstream does not have and, on a GPU build, one that can never fire.
+   *
+   * The two differ only under CTP_ENABLE_NEUROPRESS_GPU=0, a build upstream
+   * cannot be compiled for at all.
+   */
+  bool GpuInferenceActive() const {
+#if CTP_ENABLE_NEUROPRESS_GPU
+    return gpu_weights_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  /**
    * @brief Predict compression metrics for one feature vector.
    *
    * Maps features → standardized input → 5-layer forward → outputs →
@@ -127,6 +185,52 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    */
   std::vector<CompressionPrediction> PredictBatch(
       const std::vector<CompressionFeatures>& batch) override;
+
+  /**
+   * @brief PredictBatch, with the data features read from DEVICE memory.
+   *
+   * Not an override: the CompressionPredictor interface is shared with the
+   * Q-table, linreg and XGBoost models, none of which has a device path, and
+   * widening it for one model would put a CUDA concept in everyone's way.
+   * This is the NeuroPress-specific entry the bridge reaches for when the
+   * chunk is device-resident.
+   *
+   * Why it exists: PredictBatch takes a host-built [n][8] matrix, so the
+   * chunk's entropy/MAD/second-derivative must already have been copied down
+   * from the GPU -- and computing them meant a further host round trip in the
+   * middle of the statistics pipeline. Upstream has neither: it keeps an
+   * AutoStatsGPU on the device and its inference kernel reads it there
+   * ("Stats remain on GPU", gpucompress_compress.cpp:281). This restores that.
+   *
+   * Inputs 5-7 are taken from `device_stats`, NOT from `batch` -- the entropy,
+   * MAD and second-derivative fields of the passed features are ignored, and
+   * callers need not populate them. Everything else (algorithm, the two
+   * preprocessor bits, the error bound, the chunk size) is host knowledge and
+   * still comes from `batch`.
+   *
+   * @param device_stats Device pointer from ctp::ComputeDeviceStatsResident().
+   * @param batch Candidates, as for PredictBatch. Must be non-empty; every
+   *   entry's chunk_size_bytes must agree (they describe one chunk).
+   * @param stream The stream the statistics were enqueued on --
+   *   ctp::DeviceStatsStream(). Passing another breaks the GPU-side chaining.
+   * @return Predictions, or EMPTY on failure. Never a zero-filled vector.
+   */
+  /**
+   * @param weights,out_order Optional. When both are given and the cost model
+   *   is on, the cost, the argmax and the ORDERING are computed on the GPU too
+   *   -- one warp, upstream's own bitonic network (nn_gpu.cu:499-532) -- and
+   *   out_order comes back holding candidate slots best-first. Upstream ranks
+   *   inside its inference kernel and never returns an unranked candidate set,
+   *   so leaving this to the host was the last stage of the decision that
+   *   crossed back. Omit them for a pure inference call; the ordering is then
+   *   the caller's problem, as before.
+   */
+  std::vector<CompressionPrediction> PredictBatchDeviceStats(
+      const void* device_stats,
+      const std::vector<CompressionFeatures>& batch, void* stream,
+      const RankingWeights* weights = nullptr,
+      std::vector<int>* out_order = nullptr, double min_psnr = 0.0,
+      std::vector<double>* out_scores = nullptr);
 
   /**
    * @brief Online SGD update from real (predicted vs. actual) outcomes.

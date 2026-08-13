@@ -38,14 +38,33 @@
 #include <string>
 
 #include "clio_ctp/compress/compress_factory.h"
+#include "clio_ctp/compress/model/neuropress_nn_predictor.h"
 #include "clio_ctp/compress/model/ranking.h"
 
 namespace clio::cte::compressor {
 
-std::vector<CompressionStats> NeuroPressCandidateStats(
+namespace {
+
+/**
+ * Shared body of both entry points.
+ *
+ * The device path differs from the host one in exactly one respect -- where
+ * the three data statistics come from -- so it shares this function rather
+ * than copying it. Everything the two must agree on (which algorithms are in
+ * the trained action space, which are buildable, and above all the action
+ * ORDER that decides ties) is therefore written once.
+ *
+ * @param device_stats Device pointer from ComputeDeviceStatsResident(), or
+ *   nullptr for the host path. When set, the entropy/mad/second-derivative
+ *   arguments are used ONLY to populate DataFeatures for the cost model's
+ *   size term and are never fed to the network -- the kernel reads the real
+ *   values out of device memory.
+ */
+std::vector<CompressionStats> RankIntoStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float, double error_bound) {
+    double second_derivative_mean, bool data_type_float, double error_bound,
+    const void *device_stats, void *stream, double min_psnr) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -180,12 +199,59 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   // quantized configs and a 1e-7 sentinel for lossless ones
   // (neural_net/core/configs.py:44).
   {
-    const std::vector<CandidateConfig> plain = candidates;
+    // Order the algorithms by NeuroPress's OWN algo index before expanding.
+    //
+    // KnownCompressors() lists the eight nvcomp entries by base_id
+    // (13,14,15,16,17,18,23,24), which maps to algo indices 0,1,4,3,2,5,6,7 --
+    // zstd, gdeflate and deflate out of order. The group order below was
+    // already upstream's, but WITHIN a group the slots did not follow the
+    // action index, and the action index is what decides a tie: upstream's
+    // ranking network keeps the lowest action, while first-enumerated-wins
+    // kept whatever this list happened to put first. On a tie between zstd
+    // (algo 4) and deflate (algo 2) upstream picks deflate and Clio picked
+    // zstd. Ties are not rare -- ratio saturates at the 100x cap on
+    // compressible data, and one parity run counts 32 of them.
+    //
+    // Sorting here makes slot order and action order the same thing, which is
+    // also what lets the kernel decode a slot back into a configuration.
+    // Sorted ONCE for the process, not per chunk. The list depends only on
+    // which algorithms this build can construct, which is fixed at build time
+    // and already probed once above -- and upstream assembles no per-chunk
+    // configuration at all, its lanes simply ARE the actions. Re-sorting eight
+    // entries on every write would be cheap but it would also be host work
+    // upstream does not do.
+    static const std::vector<CandidateConfig> kPlainInActionOrder = [&] {
+      std::vector<CandidateConfig> p = candidates;
+      std::stable_sort(p.begin(), p.end(),
+                       [](const CandidateConfig &a, const CandidateConfig &b) {
+                         return ctp::compress::model::NeuroPressAlgoIdForBaseId(
+                                    a.base_id) <
+                                ctp::compress::model::NeuroPressAlgoIdForBaseId(
+                                    b.base_id);
+                       });
+      return p;
+    }();
+    const std::vector<CandidateConfig> &plain = kPlainInActionOrder;
     candidates.clear();
-    candidates.reserve(plain.size() * (error_bound > 0.0 ? 4 : 2));
+    candidates.reserve(plain.size() * 4);
+    // Enumerate the quantize half only when something will actually MASK it.
+    //
+    // Upstream evaluates all 32 configs every time and masks the quantize ones
+    // to -INFINITY when the bound is non-positive (nn_gpu.cu:238). RankKernel
+    // now does the same -- but only the device path runs it. On the host path
+    // there is no masker, so enumerating them there leaves them ranked on
+    // their real scores, and they win: a lossless run then selects a quantize
+    // action that Compress() will not execute (`want_quant` requires
+    // error_bound > 0), throwing away the model's choice. That regression is
+    // exactly what showed up on the first real run after the masks moved.
+    //
+    // Eliding and masking pick the same winner whenever an unmasked candidate
+    // exists, which on a lossless run is always -- so the host path loses
+    // nothing by not enumerating them.
+    const bool kernel_will_mask = (device_stats != nullptr);
     for (int shuffle = 0; shuffle <= 1; ++shuffle) {
       for (int quant = 0; quant <= 1; ++quant) {
-        if (quant == 1 && !(error_bound > 0.0)) continue;
+        if (quant == 1 && !(error_bound > 0.0) && !kernel_will_mask) continue;
         for (const auto &base : plain) {
           CandidateConfig c = base;
           c.byte_shuffle = (shuffle != 0);
@@ -204,8 +270,64 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   // wants, and not what NeuroPress does.
   ctp::compress::model::RankingWeights weights;
   weights.use_cost_model = true;
-  std::vector<RankedPrediction> ranked =
-      predictor.Rank(data, candidates, weights);
+
+  std::vector<RankedPrediction> ranked;
+  auto *np = dynamic_cast<ctp::compress::model::NeuroPressNNPredictor *>(
+      &predictor);
+  if (device_stats != nullptr && np != nullptr) {
+    // Device path: the network reads entropy/MAD/second-derivative straight
+    // out of GPU memory, so nothing about this chunk's statistics has to come
+    // to the host to make the decision -- upstream's arrangement
+    // (gpucompress_infer_gpu passes runNNFusedInferenceCtx an AutoStatsGPU*).
+    // Scoring and sorting are then the SAME code the host path uses, so the
+    // tie-breaking behaviour pinned by ctp_neuropress_tiebreak_parity is
+    // unchanged.
+    std::vector<ctp::compress::model::CompressionFeatures> feats;
+    feats.reserve(candidates.size());
+    for (const auto &c : candidates) {
+      feats.push_back(
+          ctp::compress::model::MakeCompressionFeatures(data, c));
+    }
+    std::vector<int> order;
+    std::vector<double> scores;
+    auto preds = np->PredictBatchDeviceStats(device_stats, feats, stream,
+                                             &weights, &order, min_psnr,
+                                             &scores);
+    if (preds.empty()) {
+      // FAIL, do not substitute. Re-ranking on the host here would run
+      // NeuroPress's own inference somewhere upstream never runs it, and
+      // silently: the caller would receive a complete, plausible ranking with
+      // no indication the GPU path had dropped out. Upstream refuses in the
+      // same situation rather than degrading -- a failed inference gives
+      // "ALGO_AUTO requested but NN inference failed" and
+      // GPUCOMPRESS_ERROR_NN_NOT_LOADED (gpucompress_compress.cpp:208-212),
+      // and there is no CPU implementation of the network in that project to
+      // fall back TO. An empty result here makes the caller's own
+      // no-selection path run, which is visible and logged.
+      return {};
+    }
+    // Gather in the order the kernel produced, carrying the scores it also
+    // produced. Nothing here re-derives the ranking: no comparison, no
+    // Score() call, no sort. That is the point of the kernel having done it.
+    if (order.size() != candidates.size() ||
+        scores.size() != candidates.size()) {
+      return {};
+    }
+    ranked.reserve(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+      const int slot = order[i];
+      if (slot < 0 || static_cast<size_t>(slot) >= candidates.size()) {
+        // A malformed permutation. Re-ranking on the host would be a silent
+        // fallback for a stage that just ran on the GPU, so refuse instead --
+        // upstream ends the call on an inference failure rather than
+        // substituting anything (gpucompress_compress.cpp:208-212).
+        return {};
+      }
+      ranked.push_back({candidates[slot], preds[slot], scores[i]});
+    }
+  } else {
+    ranked = predictor.Rank(data, candidates, weights);
+  }
 
   std::vector<CompressionStats> results;
   results.reserve(ranked.size());
@@ -243,6 +365,31 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
                           r.prediction.psnr_db);
   }
   return results;
+}
+
+}  // namespace
+
+std::vector<CompressionStats> NeuroPressCandidateStats(
+    ctp::compress::model::CompressionPredictor &predictor,
+    clio::run::u64 chunk_size, double entropy, double mad,
+    double second_derivative_mean, bool data_type_float, double error_bound) {
+  return RankIntoStats(predictor, chunk_size, entropy, mad,
+                       second_derivative_mean, data_type_float, error_bound,
+                       /*device_stats=*/nullptr, /*stream=*/nullptr,
+                       /*min_psnr=*/0.0);
+}
+
+std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
+    ctp::compress::model::CompressionPredictor &predictor,
+    clio::run::u64 chunk_size, const void *device_stats, void *stream,
+    bool data_type_float, double error_bound, double min_psnr) {
+  // Zeros for the three data statistics: on this path they reach neither the
+  // network (which reads device_stats) nor the score (which reads only the
+  // prediction and the chunk size). See the header for why they are not
+  // parameters -- fetching them here would mean synchronizing before the
+  // inference rather than after it.
+  return RankIntoStats(predictor, chunk_size, 0.0, 0.0, 0.0, data_type_float,
+                       error_bound, device_stats, stream, min_psnr);
 }
 
 }  // namespace clio::cte::compressor

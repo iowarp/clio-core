@@ -135,6 +135,48 @@ clio_add_neuropress_parity_test(neuropress_tiebreak_parity_exec
 # The dataset harness sweeps 1 GiB in 4 MiB chunks on both sides.
 set_tests_properties(ctp_neuropress_dataset_parity PROPERTIES TIMEOUT 900)
 
+# Device-resident selection path: Clio's GPU stats + GPU inference chain,
+# cross-examined against the upstream kernels it mirrors. Needs stats_kernel.cu
+# and entropy_kernel.cu (already in _np_required) but not nn_gpu.cu -- it drives
+# Clio's predictor, not upstream's, so the globals stub is unnecessary and the
+# upstream sources are listed directly.
+add_executable(neuropress_device_path_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_device_path_parity.cu
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/stats/stats_kernel.cu
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/stats/entropy_kernel.cu)
+
+set_target_properties(neuropress_device_path_parity_exec PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON)
+
+target_include_directories(neuropress_device_path_parity_exec PRIVATE
+    ${CLIO_NEUROPRESS_SRC_DIR}/src
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/stats
+    ${CLIO_NEUROPRESS_SRC_DIR}/include
+    ${CLIO_NVCOMP_INCLUDE_DIR}
+    ${CLIO_NVCOMP_INCLUDE_DIR}/..)
+
+target_compile_definitions(neuropress_device_path_parity_exec PRIVATE
+    CTP_ENABLE_NEUROPRESS_GPU=1
+    CTP_ENABLE_CUDA=1
+    CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CLIO_CTP_ROOT}/src/compress/model/weights")
+
+target_link_libraries(neuropress_device_path_parity_exec clio_ctp_compress_model)
+if(TARGET ctp::cuda_cxx)
+    target_link_libraries(neuropress_device_path_parity_exec ctp::cuda_cxx)
+endif()
+if(CLIO_CORE_CUDA_NEEDS_GCOV)
+    set_property(TARGET neuropress_device_path_parity_exec
+                 APPEND PROPERTY LINK_LIBRARIES gcov)
+endif()
+
+add_test(NAME ctp_neuropress_device_path_parity
+         COMMAND ${CMAKE_BINARY_DIR}/bin/neuropress_device_path_parity_exec)
+set_tests_properties(ctp_neuropress_device_path_parity PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 600
+    LABELS "693;parity;gpu")
+
 # ---------------------------------------------------------------------------
 # Preprocessor parity: byte shuffle and error-bound quantization.
 #

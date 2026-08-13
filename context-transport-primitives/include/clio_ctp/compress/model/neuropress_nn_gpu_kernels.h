@@ -86,6 +86,71 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              float *out_decomp_time_ms, float *out_ratio,
                              float *out_psnr_db);
 
+/**
+ * @brief Same inference, reading the data features from DEVICE memory.
+ *
+ * The variant above takes a fully host-built [num_candidates][8] matrix, which
+ * means the chunk's entropy/MAD/second-derivative must already have been
+ * brought to the host. Upstream never does that: gpucompress_infer_gpu hands
+ * runNNFusedInferenceCtx an `AutoStatsGPU*` and the kernel reads it on-device
+ * ("Stats remain on GPU", gpucompress_compress.cpp:281).
+ *
+ * This entry point restores that shape. It is the one to use whenever the
+ * chunk itself is device-resident, which is exactly the situation upstream is
+ * always in.
+ *
+ * @param device_stats Device pointer from ctp::ComputeDeviceStatsResident().
+ * @param action_ids Host array [num_candidates] of UPSTREAM ACTION INDICES
+ *   (`algo + 8*quantize + 16*shuffle`, decodeAction's encoding). The kernel
+ *   decodes each one to rebuild inputs 0-2 exactly as upstream rebuilds them
+ *   from its thread index (nn_gpu.cu:133-135) -- nothing about the
+ *   configuration is assembled on the host. Uploaded asynchronously on
+ *   `stream`; never waited on.
+ * @param error_bound The chunk's RAW bound, as a scalar. The 1e-7 lossless
+ *   sentinel is applied in-kernel for unquantized actions, where upstream
+ *   applies it (nn_gpu.cu:144).
+ * @param chunk_size_bytes Input 4, passed as a scalar kernel argument.
+ * @param stream The stream the statistics were enqueued on -- passing a
+ *   different one breaks the chaining and reads the stats before they exist.
+ *   Use ctp::DeviceStatsStream().
+ *
+ * @return false if any CUDA step failed; same contract as the variant above,
+ *   the out_* buffers must not be ranked on.
+ */
+/**
+ * @brief Cost-model weights for on-device ranking.
+ *
+ * Mirrors the fields of RankingWeights that the cost model actually reads
+ * (predictor.h:193-197). Passed as a struct so the kernel launch does not grow
+ * a parameter list nobody can read.
+ */
+struct GpuRankParams {
+  double data_size_bytes = 0.0;
+  double w_compress_time = 1.0;
+  double w_decompress_time = 1.0;
+  double w_io = 1.0;
+  double bandwidth_bytes_per_ms = 5e6;
+
+  /**
+   * The two mask inputs, applied in-kernel exactly as nn_gpu.cu:238-239 does:
+   *   quantize actions are masked when error_bound <= 0
+   *   any action is masked when min_psnr > 0 and its predicted PSNR is below it
+   * A masked action scores -INFINITY, so it loses to every unmasked one but is
+   * still ranked -- upstream always returns an action, even when every action
+   * is masked. Leave min_psnr at 0 to disable the PSNR mask, which is
+   * upstream's own default (g_min_psnr_db, gpucompress_api.cpp:70).
+   */
+  double error_bound = 0.0;
+  double min_psnr = 0.0;
+};
+
+bool NeuroPressGpuInferBatchDeviceStats(
+    NeuroPressGpuWeights *w, const void *device_stats, const int *action_ids,
+    int num_candidates, float chunk_size_bytes, float error_bound,
+    void *stream, float *out_comp_time_ms, float *out_decomp_time_ms,
+    float *out_ratio, float *out_psnr_db, const GpuRankParams *rank = nullptr,
+    int *out_order = nullptr, double *out_scores = nullptr);
+
 /** @brief One real observed outcome to train on (device-uploaded per call). */
 struct NeuroPressGpuSGDSample {
   float raw_input[8];  // same 8-dim layout as NeuroPressGpuInferBatch's rows

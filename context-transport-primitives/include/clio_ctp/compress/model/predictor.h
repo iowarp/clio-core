@@ -364,8 +364,25 @@ class CompressionPredictor {
     for (const auto &c : candidates) {
       feats.push_back(MakeCompressionFeatures(data, c));
     }
-    std::vector<CompressionPrediction> preds = PredictBatch(feats);
+    return ScoreAndSort(data, candidates, PredictBatch(feats), weights);
+  }
+
+  /**
+   * @brief Score a prediction set against its candidates and sort best-first.
+   *
+   * Split out of Rank() so a model with an alternative way of OBTAINING the
+   * predictions -- NeuroPress's device-stats path, which reads the data
+   * features straight out of GPU memory -- reuses this ordering rather than
+   * carrying a second copy of it. The tie-breaking rule below is the part
+   * that must not be duplicated: it is the thing ctp_neuropress_tiebreak_parity
+   * pins against upstream, and two copies would be free to drift.
+   */
+  static std::vector<RankedPrediction> ScoreAndSort(
+      const DataFeatures &data, const std::vector<CandidateConfig> &candidates,
+      const std::vector<CompressionPrediction> &preds,
+      const RankingWeights &weights) {
     std::vector<RankedPrediction> ranked;
+    if (preds.size() != candidates.size()) return ranked;
     ranked.reserve(candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i) {
       ranked.push_back({candidates[i], preds[i],

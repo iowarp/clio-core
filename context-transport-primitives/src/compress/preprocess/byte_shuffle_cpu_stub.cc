@@ -59,6 +59,23 @@ bool ComputeDeviceStats(const void *, size_t, DataType, double *out_entropy,
   return false;
 }
 
+/**
+ * Device-resident stats path: same contract as the shuffle stubs above. With
+ * no device there is no stream and nothing to compute on it, so the null
+ * return sends callers down the host feature path rather than leaving them
+ * holding a pointer they cannot dereference.
+ */
+void *DeviceStatsStream() { return nullptr; }
+
+const void *ComputeDeviceStatsResident(const void *, size_t, DataType, void *) {
+  return nullptr;
+}
+
+bool ReadDeviceFeatureStats(const void *, double *, double *, double *,
+                            void *) {
+  return false;
+}
+
 }  // namespace ctp
 
 #endif

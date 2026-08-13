@@ -19,8 +19,12 @@
  */
 
 #include "clio_ctp/compress/model/neuropress_nn_gpu_kernels.h"
+// For ctp::DeviceFeatureStats -- the device-resident feature triple the
+// device-stats inference kernel reads instead of a host-built matrix.
+#include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -314,27 +318,49 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
 // ============================================================================
 // Inference: one block per candidate, thread t owns hidden neuron t.
 // ============================================================================
-__global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
-                            const float *__restrict__ raw_inputs,
-                            float *__restrict__ out_comp_time,
-                            float *__restrict__ out_decomp_time,
-                            float *__restrict__ out_ratio,
-                            float *__restrict__ out_psnr) {
-  int cand = blockIdx.x;
-  int t = threadIdx.x;
+constexpr int kMaxCandidates = 32;
 
-  __shared__ float s_x[kInputDim];
-  __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
-      s_h4[kHiddenDim];
-  __shared__ float s_y[kOutputDim];
+/**
+ * decodeAction, in the kernel.
+ *
+ * `action = algo + 8*quant + 16*shuffle` (internal.hpp:167-172). Upstream's
+ * inference kernel inverts it straight off the thread index
+ * (`algo_idx = tid % 8; quant = (tid/8) % 2; shuffle = (tid/16) % 2`,
+ * nn_gpu.cu:133-135) and builds each config's inputs from that -- no host
+ * array of per-candidate settings exists there at all. Clio passes the action
+ * ids because its candidate set can be a subset (an algorithm this build
+ * cannot construct is never enumerated), but the DECODE now happens here,
+ * where upstream does it.
+ *
+ * shuffle is fed to the network as 0/1, not as the 4-byte element size:
+ * `input_raw[2] = static_cast<float>(shuffle)` with shuffle = (tid/16)%2
+ * (nn_gpu.cu:135, :142).
+ */
+__device__ __forceinline__ void DecodeAction(int action, int *algo, int *quant,
+                                             int *shuffle) {
+  *algo = action % 8;
+  *quant = (action / 8) % 2;
+  *shuffle = (action / 16) % 2;
+}
 
-  if (t < kInputDim) {
-    float std_val = w->x_stds[t];
-    if (std_val < 1e-8f) std_val = 1e-8f;
-    s_x[t] = (raw_inputs[cand * kInputDim + t] - w->x_means[t]) / std_val;
-  }
-  __syncthreads();
-
+/**
+ * Layers, inverse transform and clamps, shared by both inference entry points.
+ *
+ * Factored out rather than duplicated: the two kernels differ ONLY in where
+ * the eight raw inputs come from (a host-built matrix, or the device stats
+ * struct plus a candidate descriptor). Everything after standardization is
+ * the model, and two copies of it would be free to drift -- which is exactly
+ * the class of divergence this whole line of work exists to catch.
+ *
+ * `s_x` must already hold the STANDARDIZED inputs and the block must have
+ * synchronized on them before calling.
+ */
+__device__ __forceinline__ void NeuroPressForwardShared(
+    const NeuroPressGpuWeights *__restrict__ w, const float *__restrict__ s_x,
+    float *s_h1, float *s_h2, float *s_h3, float *s_h4, float *s_y, int t,
+    int cand, float *__restrict__ out_comp_time,
+    float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
+    float *__restrict__ out_psnr) {
   float sum = w->params[kOffB1 + t];
   for (int i = 0; i < kInputDim; ++i) sum += w->params[kOffW1 + t * kInputDim + i] * s_x[i];
   s_h1[t] = fmaxf(0.0f, sum);
@@ -385,53 +411,431 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
   }
 }
 
+/** Host-matrix entry point: unchanged behaviour, now sharing the forward pass. */
+__global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
+                            const float *__restrict__ raw_inputs,
+                            float *__restrict__ out_comp_time,
+                            float *__restrict__ out_decomp_time,
+                            float *__restrict__ out_ratio,
+                            float *__restrict__ out_psnr) {
+  int cand = blockIdx.x;
+  int t = threadIdx.x;
+
+  __shared__ float s_x[kInputDim];
+  __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
+      s_h4[kHiddenDim];
+  __shared__ float s_y[kOutputDim];
+
+  if (t < kInputDim) {
+    float std_val = w->x_stds[t];
+    if (std_val < 1e-8f) std_val = 1e-8f;
+    s_x[t] = (raw_inputs[cand * kInputDim + t] - w->x_means[t]) / std_val;
+  }
+  __syncthreads();
+
+  NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
+                          out_comp_time, out_decomp_time, out_ratio, out_psnr);
+}
+
+/**
+ * Device-stats entry point: reads the three data features straight out of
+ * device memory instead of receiving them in a host-built matrix.
+ *
+ * This is the shape of upstream's nnFusedInferenceKernel, which takes an
+ * `AutoStatsGPU*` and constructs each config's input vector in-kernel
+ * (nn_gpu.cu:138-160) -- nothing about the chunk's statistics ever reaches
+ * the host to get there. The five inputs that ARE host knowledge stay host
+ * knowledge: four per-candidate values arrive in `cand_desc`
+ * (algo_id, quant, shuffle, error-bound encoding, matching
+ * FeaturesTo8Input's order) and the chunk size rides in as a scalar argument,
+ * exactly as upstream passes `input_size` to its kernel.
+ */
+__global__ void InferKernelDeviceStats(
+    const NeuroPressGpuWeights *__restrict__ w,
+    const int *__restrict__ action_ids,
+    const ctp::DeviceFeatureStats *__restrict__ stats, float chunk_size_bytes,
+    float error_bound, float *__restrict__ out_comp_time,
+    float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
+    float *__restrict__ out_psnr) {
+  int cand = blockIdx.x;
+  int t = threadIdx.x;
+
+  __shared__ float s_x[kInputDim];
+  __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
+      s_h4[kHiddenDim];
+  __shared__ float s_y[kOutputDim];
+
+  if (t < kInputDim) {
+    // The same eight inputs, in the same order, built the same way upstream
+    // builds them (nn_gpu.cu:137-148): the first three come from decoding the
+    // action, not from anything the host assembled.
+    int algo, quant, shuffle;
+    DecodeAction(action_ids[cand], &algo, &quant, &shuffle);
+    float raw;
+    if (t == 0) {
+      raw = static_cast<float>(algo);
+    } else if (t == 1) {
+      raw = static_cast<float>(quant);
+    } else if (t == 2) {
+      raw = static_cast<float>(shuffle);
+    } else if (t == 3) {
+      raw = error_bound;
+      if (quant == 0) {
+        // Lossless configs were TRAINED against a 1e-7 sentinel, not a raw 0
+        // (neural_net/core/configs.py: `eb_val = eb if quant else 1e-7`), and
+        // upstream re-applies it here rather than upstream of here:
+        // `input_raw[3] = (quant == 0) ? 1e-7f : eb_enc` with the comment
+        // "Inference must match -- do not pass raw 0.0 for lossless configs"
+        // (nn_gpu.cu:144). Slot 1 is the quantize bit, so the kernel decides
+        // this from the same descriptor the rest of the vector comes from.
+        //
+        // Applies to INFERENCE only. Both SGD paths feed the raw bound
+        // upstream, which is why FeaturesTo8Input still takes a flag and why
+        // the substitution lives here and not in it.
+        raw = 1e-7f;
+      }
+    } else if (t == 4) {
+      raw = chunk_size_bytes;
+    } else if (t == 5) {
+      raw = static_cast<float>(stats->entropy);
+    } else if (t == 6) {
+      raw = static_cast<float>(stats->mad);
+    } else {
+      raw = static_cast<float>(stats->second_derivative);
+    }
+    float std_val = w->x_stds[t];
+    if (std_val < 1e-8f) std_val = 1e-8f;
+    s_x[t] = (raw - w->x_means[t]) / std_val;
+  }
+  __syncthreads();
+
+  NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
+                          out_comp_time, out_decomp_time, out_ratio, out_psnr);
+}
+
+/**
+ * Widest candidate set the ranking warp can hold, and the reason it is 32:
+ * that is upstream's NN_NUM_CONFIGS (8 algorithms x quantize x byte-shuffle)
+ * and therefore the most the bridge can ever enumerate.
+ */
+
+
+/**
+ * Cost model + ranking, on the GPU.
+ *
+ * Upstream never ranks on the host: nnFusedInferenceKernel computes the cost
+ * (nn_gpu.cu:232-237), applies its masks (:238-239) and runs a 32-lane bitonic
+ * sort (:499-518) all inside the same kernel, with thread 0 writing the winner
+ * (:521-532). Clio computed the four metrics on the GPU and then did the cost,
+ * the argmax and the sort in ScoreAndSort on the host.
+ *
+ * One warp, lane == candidate slot, which is why kMaxCandidates is 32: that is
+ * both upstream's NN_NUM_CONFIGS and the widest set the bridge can enumerate.
+ * Lanes past `n` take -infinity and sort to the end.
+ *
+ * The arithmetic is RankingWeights::Score (predictor.h:209-232) transcribed,
+ * in double, deliberately: this changes WHERE the ranking happens, not what it
+ * decides, so it has to reproduce the host result exactly rather than merely
+ * closely. Upstream computes the same cost in float; matching Clio's host path
+ * bit-for-bit is what makes the move safe to land, and the float/double
+ * difference against upstream is unchanged from before.
+ *
+ * The two -INFINITY masks are applied here, where upstream applies them
+ * (nn_gpu.cu:238-239), rather than by eliding candidates before ranking and
+ * filtering them after. The difference is not only cosmetic: a masked action
+ * still PARTICIPATES, so when every action is masked upstream still returns
+ * one -- the lowest-indexed -- instead of returning nothing.
+ */
+__global__ void RankKernel(const float *__restrict__ ct_in,
+                           const float *__restrict__ dt_in,
+                           const float *__restrict__ ratio_in,
+                           const float *__restrict__ psnr_in,
+                           const int *__restrict__ action_ids, int n,
+                           double data_size_bytes, double w_ct, double w_dt,
+                           double w_io, double bw, double error_bound,
+                           double min_psnr, int *__restrict__ out_order,
+                           double *__restrict__ out_scores) {
+  const int tid = static_cast<int>(threadIdx.x);
+  double score = -CUDART_INF;
+  int idx = tid;
+  // The tie key is the ACTION index, which is what upstream's network orders
+  // by -- its lanes ARE actions, so its strict comparators resolve a tie to
+  // the lowest action. Clio's lanes are candidate slots, and slot order only
+  // equals action order when the caller enumerated it that way. Keying on the
+  // action directly makes the rule hold regardless, instead of depending on
+  // an enumeration convention two files away.
+  // Composite so the key is ALWAYS unique: action index first (upstream's
+  // rule), slot second. Action ids are unique across a well-formed candidate
+  // set, but nothing in this kernel can enforce that -- a caller passing a set
+  // that includes algorithms outside the trained eight gets colliding ids from
+  // the fallback mapping, and a bitonic sort on a non-unique key stops being a
+  // permutation, silently dropping and duplicating candidates. The slot
+  // tiebreak costs nothing and makes that impossible.
+  int key = (tid < n) ? (action_ids[tid] * kMaxCandidates + tid)
+                      : ((kMaxCandidates + tid) * kMaxCandidates + tid);
+
+  if (tid < n) {
+    // predictor.h:213-229, clamp for clamp.
+    const double ct = fmax(1.0, static_cast<double>(ct_in[tid]));
+    const double dt_raw = static_cast<double>(dt_in[tid]);
+    const double dt = (dt_raw > 0.0) ? fmax(1.0, dt_raw) : ct;
+    const double ratio =
+        fmax(0.1, fmin(100.0, static_cast<double>(ratio_in[tid])));
+    const double io = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
+    score = -(w_ct * ct + w_dt * dt + w_io * io);
+
+    // nn_gpu.cu:238-239, in that order. cand_desc slot 1 is the quantize bit
+    // (FeaturesTo8Input's input 1), so the kernel reads the same flag the
+    // network was fed rather than being told separately.
+    int algo, quant, shuffle;
+    DecodeAction(action_ids[tid], &algo, &quant, &shuffle);
+    const bool is_quant = (quant != 0);
+    if (is_quant && error_bound <= 0.0) score = -CUDART_INF;
+    if (min_psnr > 0.0 && static_cast<double>(psnr_in[tid]) < min_psnr) {
+      score = -CUDART_INF;
+    }
+  }
+
+  // Total order: score descending, then slot ascending. The second key is not
+  // decoration -- it is what reproduces std::stable_sort's "first enumerated
+  // wins" on the ties this cost model genuinely produces (ratio saturates at
+  // the 100x cap, times floor at 1 ms). Upstream relies on its network never
+  // swapping equal keys to the same end; making the tie an explicit part of
+  // the comparator gets there without depending on that property.
+  auto better = [](double a_s, int a_key, double b_s, int b_key) {
+    return (a_s > b_s) || (a_s == b_s && a_key < b_key);
+  };
+
+  // Same bitonic network as nn_gpu.cu:499-518.
+  for (int k = 2; k <= kMaxCandidates; k <<= 1) {
+    for (int j = k >> 1; j >= 1; j >>= 1) {
+      const double other_score = __shfl_xor_sync(0xFFFFFFFFu, score, j);
+      const int other_idx = __shfl_xor_sync(0xFFFFFFFFu, idx, j);
+      const int other_key = __shfl_xor_sync(0xFFFFFFFFu, key, j);
+      const bool is_lower = ((tid ^ j) > tid);
+      const bool ascending = ((tid & k) == 0);
+      const bool mine_better = better(score, key, other_score, other_key);
+      bool swap;
+      if (is_lower) {
+        swap = ascending ? !mine_better : mine_better;
+      } else {
+        swap = ascending ? mine_better : !mine_better;
+      }
+      if (swap) {
+        score = other_score;
+        idx = other_idx;
+        key = other_key;
+      }
+    }
+  }
+
+  if (tid < n) {
+    out_order[tid] = idx;
+    // The sorted score travels with the slot. Recomputing it on the host to
+    // fill in RankedPrediction::score would put the cost model back on the CPU
+    // for no reason -- the kernel has just computed it.
+    out_scores[tid] = score;
+  }
+}
+
+namespace {
+
+/**
+ * Per-thread inference scratch, allocated once.
+ *
+ * NeuroPressGpuInferBatch below does five cudaMalloc and five cudaFree on
+ * every call, i.e. per chunk. Upstream has none on that path: the equivalent
+ * buffers are fields of the CompContext it acquired
+ * (ctx->d_fused_infer_output, ctx->d_fused_top_actions, ctx->d_fused_costs).
+ * Sized for the full 32-action space so the candidate set can never outgrow
+ * it -- that is upstream's NN_NUM_CONFIGS and the hard ceiling on what the
+ * bridge can enumerate.
+ *
+ * Leaked deliberately, for the reason given at Registry(): releasing device
+ * memory from a static destructor races the CUDA runtime's teardown.
+ */
+struct InferScratch {
+  // Sized for the ACTION SPACE. The device-stats path ranks in a single warp,
+  // so its candidate set can never exceed NN_NUM_CONFIGS.
+  int *d_actions = nullptr;    // [kMaxCandidates] upstream action indices
+  int *d_order = nullptr;      // [kMaxCandidates] ranked slots, best first
+  double *d_scores = nullptr;  // [kMaxCandidates] their scores, same order
+
+  // Sized for the BATCH, grown on demand. The host-matrix entry point has no
+  // warp-wide step, and Rank() calls it with whatever candidate set the caller
+  // built -- the model's own action space is 32, but a caller ranking the full
+  // compressor registry passes far more. Capping these at 32 made that case
+  // return an empty prediction set, which Rank() then turned into an empty
+  // ranking: caught by ctp_compress_model, not by anything on the NeuroPress
+  // path, because only the wider callers reach it.
+  float *d_raw = nullptr;  // [cap][8]
+  float *d_ct = nullptr;   // [cap]
+  float *d_dt = nullptr;
+  float *d_r = nullptr;
+  float *d_p = nullptr;
+  int cap = 0;
+  bool ok = false;
+};
+
+/** Grow the per-batch buffers when a call needs more than the last one did. */
+bool EnsureInferCapacity(InferScratch &s, int n) {
+  if (n <= s.cap) return true;
+  cudaFree(s.d_raw);
+  cudaFree(s.d_ct);
+  cudaFree(s.d_dt);
+  cudaFree(s.d_r);
+  cudaFree(s.d_p);
+  s.d_raw = s.d_ct = s.d_dt = s.d_r = s.d_p = nullptr;
+  s.cap = 0;
+  const size_t out_bytes = sizeof(float) * static_cast<size_t>(n);
+  if (cudaMalloc(&s.d_raw, out_bytes * kInputDim) != cudaSuccess ||
+      cudaMalloc(&s.d_ct, out_bytes) != cudaSuccess ||
+      cudaMalloc(&s.d_dt, out_bytes) != cudaSuccess ||
+      cudaMalloc(&s.d_r, out_bytes) != cudaSuccess ||
+      cudaMalloc(&s.d_p, out_bytes) != cudaSuccess) {
+    return false;
+  }
+  s.cap = n;
+  return true;
+}
+
+InferScratch &Infer() {
+  static thread_local InferScratch *s = [] {
+    auto *p = new InferScratch();
+    p->ok = cudaMalloc(&p->d_actions, sizeof(int) * kMaxCandidates) ==
+                cudaSuccess &&
+            cudaMalloc(&p->d_order, sizeof(int) * kMaxCandidates) ==
+                cudaSuccess &&
+            cudaMalloc(&p->d_scores, sizeof(double) * kMaxCandidates) ==
+                cudaSuccess &&
+            EnsureInferCapacity(*p, kMaxCandidates);
+    return p;
+  }();
+  return *s;
+}
+
+}  // namespace
+
+bool NeuroPressGpuInferBatchDeviceStats(
+    NeuroPressGpuWeights *w, const void *device_stats,
+    const int *action_ids, int num_candidates, float chunk_size_bytes,
+    float error_bound, void *stream, float *out_comp_time_ms,
+    float *out_decomp_time_ms, float *out_ratio, float *out_psnr_db,
+    const GpuRankParams *rank, int *out_order, double *out_scores) {
+  if (!w || !device_stats || !action_ids || num_candidates <= 0 ||
+      num_candidates > kMaxCandidates) {
+    return false;
+  }
+  InferScratch &s = Infer();
+  if (!s.ok) return false;
+
+  cudaStream_t st = static_cast<cudaStream_t>(stream);
+  const size_t out_bytes = sizeof(float) * static_cast<size_t>(num_candidates);
+  const size_t act_bytes = sizeof(int) * static_cast<size_t>(num_candidates);
+
+  // Everything below is enqueued on the SAME stream the statistics were
+  // computed on, so the kernels chain on the GPU with no host involvement --
+  // this is the property that was missing. The descriptor upload is host
+  // knowledge that upstream does not need at all: its lanes ARE the actions,
+  // so it decodes them from the thread index. Clio's candidate set can be a
+  // subset -- an algorithm this build cannot construct is never enumerated --
+  // so the action indices have to come from somewhere. At 128 bytes, async,
+  // and never waited on, this does not reintroduce a synchronization point;
+  // what mattered was never the byte count but that the old path had to STOP
+  // and wait twice.
+  bool ok = cudaMemcpyAsync(s.d_actions, action_ids, act_bytes,
+                            cudaMemcpyHostToDevice, st) == cudaSuccess;
+  if (ok) {
+    InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
+        w, s.d_actions,
+        static_cast<const ctp::DeviceFeatureStats *>(device_stats),
+        chunk_size_bytes, error_bound, s.d_ct, s.d_dt, s.d_r, s.d_p);
+    ok = cudaGetLastError() == cudaSuccess;
+  }
+  // Cost model and ordering, still on the device and still on this stream --
+  // upstream does both inside its inference kernel (nn_gpu.cu:232-237,
+  // :499-532), so leaving them to the host was the last place the decision
+  // came back across. One warp is enough: the candidate set can never exceed
+  // NN_NUM_CONFIGS.
+  if (ok && rank != nullptr && out_order != nullptr) {
+    RankKernel<<<1, kMaxCandidates, 0, st>>>(
+        s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_actions, num_candidates,
+        rank->data_size_bytes, rank->w_compress_time, rank->w_decompress_time,
+        rank->w_io, rank->bandwidth_bytes_per_ms, rank->error_bound,
+        rank->min_psnr, s.d_order, s.d_scores);
+    ok = cudaGetLastError() == cudaSuccess;
+    if (ok) {
+      ok = cudaMemcpyAsync(out_order, s.d_order,
+                           sizeof(int) * static_cast<size_t>(num_candidates),
+                           cudaMemcpyDeviceToHost, st) == cudaSuccess;
+      if (ok && out_scores != nullptr) {
+        ok = cudaMemcpyAsync(
+                 out_scores, s.d_scores,
+                 sizeof(double) * static_cast<size_t>(num_candidates),
+                 cudaMemcpyDeviceToHost, st) == cudaSuccess;
+      }
+    }
+  }
+
+  if (ok) {
+    ok = cudaMemcpyAsync(out_comp_time_ms, s.d_ct, out_bytes,
+                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+         cudaMemcpyAsync(out_decomp_time_ms, s.d_dt, out_bytes,
+                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+         cudaMemcpyAsync(out_ratio, s.d_r, out_bytes, cudaMemcpyDeviceToHost,
+                         st) == cudaSuccess &&
+         cudaMemcpyAsync(out_psnr_db, s.d_p, out_bytes, cudaMemcpyDeviceToHost,
+                         st) == cudaSuccess;
+  }
+  // ONE stream-scoped wait for the whole phase, matching
+  // runNNFusedInferenceCtx's single cudaStreamSynchronize(stream)
+  // (nn_gpu.cu:2236). The old path called cudaDeviceSynchronize, which stalls
+  // every other worker's compression as well as this one.
+  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
+  return ok;
+}
+
 bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              int num_candidates, float *out_comp_time_ms,
                              float *out_decomp_time_ms, float *out_ratio,
                              float *out_psnr_db) {
   if (!w || num_candidates <= 0) return false;
+  InferScratch &s = Infer();
+  if (!s.ok || !EnsureInferCapacity(s, num_candidates)) return false;
 
-  float *d_in = nullptr, *d_ct = nullptr, *d_dt = nullptr, *d_r = nullptr,
-        *d_p = nullptr;
-  size_t in_bytes = sizeof(float) * static_cast<size_t>(num_candidates) * kInputDim;
-  size_t out_bytes = sizeof(float) * static_cast<size_t>(num_candidates);
+  // Same per-thread stream and same persistent scratch as the device-stats
+  // entry point. This path takes a host-built input matrix, so it is not the
+  // one upstream corresponds to -- but it used five cudaMalloc/cudaFree per
+  // call and a cudaDeviceSynchronize, and the latter stalls every other
+  // worker's kernels, not just this call's. Nothing about being the
+  // host-buffer path makes that desirable.
+  cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
+  const size_t out_bytes = sizeof(float) * static_cast<size_t>(num_candidates);
+  const size_t in_bytes = out_bytes * kInputDim;
 
   // Every step is checked: a silent failure here leaves the caller's output
   // vectors zero-filled, which survives the policy clamps as a complete and
   // plausible-looking ranking (ratio 0.1, 1 ms, everywhere) rather than an
   // error. NeuroPress checks cudaGetLastError and returns -1 (nn_gpu.cu:
   // 1944-1971); this is the equivalent.
-  bool ok = cudaMalloc(&d_in, in_bytes) == cudaSuccess &&
-            cudaMalloc(&d_ct, out_bytes) == cudaSuccess &&
-            cudaMalloc(&d_dt, out_bytes) == cudaSuccess &&
-            cudaMalloc(&d_r, out_bytes) == cudaSuccess &&
-            cudaMalloc(&d_p, out_bytes) == cudaSuccess;
-
+  bool ok = cudaMemcpyAsync(s.d_raw, raw_inputs, in_bytes,
+                            cudaMemcpyHostToDevice, st) == cudaSuccess;
   if (ok) {
-    ok = cudaMemcpy(d_in, raw_inputs, in_bytes, cudaMemcpyHostToDevice) ==
-         cudaSuccess;
+    InferKernel<<<num_candidates, kHiddenDim, 0, st>>>(w, s.d_raw, s.d_ct,
+                                                       s.d_dt, s.d_r, s.d_p);
+    ok = cudaGetLastError() == cudaSuccess;
   }
   if (ok) {
-    InferKernel<<<num_candidates, kHiddenDim>>>(w, d_in, d_ct, d_dt, d_r, d_p);
-    ok = cudaGetLastError() == cudaSuccess &&
-         cudaDeviceSynchronize() == cudaSuccess;
+    ok = cudaMemcpyAsync(out_comp_time_ms, s.d_ct, out_bytes,
+                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+         cudaMemcpyAsync(out_decomp_time_ms, s.d_dt, out_bytes,
+                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+         cudaMemcpyAsync(out_ratio, s.d_r, out_bytes, cudaMemcpyDeviceToHost,
+                         st) == cudaSuccess &&
+         cudaMemcpyAsync(out_psnr_db, s.d_p, out_bytes, cudaMemcpyDeviceToHost,
+                         st) == cudaSuccess;
   }
-  if (ok) {
-    ok = cudaMemcpy(out_comp_time_ms, d_ct, out_bytes,
-                    cudaMemcpyDeviceToHost) == cudaSuccess &&
-         cudaMemcpy(out_decomp_time_ms, d_dt, out_bytes,
-                    cudaMemcpyDeviceToHost) == cudaSuccess &&
-         cudaMemcpy(out_ratio, d_r, out_bytes, cudaMemcpyDeviceToHost) ==
-             cudaSuccess &&
-         cudaMemcpy(out_psnr_db, d_p, out_bytes, cudaMemcpyDeviceToHost) ==
-             cudaSuccess;
-  }
-
-  cudaFree(d_in);
-  cudaFree(d_ct);
-  cudaFree(d_dt);
-  cudaFree(d_r);
-  cudaFree(d_p);
+  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
   return ok;
 }
 
