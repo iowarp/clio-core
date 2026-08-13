@@ -303,132 +303,156 @@ __device__ __forceinline__ void WarpAddOne(int *addr) {
   if ((threadIdx.x & 31) == leader) atomicAdd(addr, cnt);
 }
 
+/**
+ * Nodes handled per thread.
+ *
+ * ONE, measured. The kernel is written to block over kNB nodes so that W1 is
+ * loaded once per (f, h-tile) and reused, which is the obvious remaining lever
+ * once occupancy, local memory, feature re-reads and atomics have each been
+ * ruled out. It does not pay -- kNB>1 costs more in registers and in the
+ * per-node h1 storage than the W1 reuse returns:
+ *
+ *   kNB=1 kHT=32  0.44 s  REG:83  STACK:1792
+ *   kNB=2 kHT=32  0.47 s  REG:128 STACK:2864
+ *   kNB=2 kHT=16  0.48 s  REG:79  STACK:2864
+ *   kNB=4 kHT=16  0.49 s  REG:98  STACK:4944
+ *   kNB=4 kHT=8   0.54 s  REG:72  STACK:4944
+ *
+ * The blocking is left in and set to 1: it costs nothing at kNB=1 and the
+ * numbers above are the reason not to raise it.
+ */
+constexpr int kNB = 1;
+
 __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u64 node_lo,
                                 const long long *labels, int F, int H, int C,
                                 const float *W1, const float *b1, const float *W2,
                                 const float *b2, float *h1_out, float *dz1_out,
                                 float *dz2_out, double *loss_buf, int *correct, int *count,
                                 int *val_correct, int *val_count) {
-  clio::run::u64 n = blockIdx.x * (clio::run::u64)blockDim.x + threadIdx.x;
-  if (n >= nn) return;
-  long long y = labels[node_lo + n];
-  loss_buf[n] = 0.0;
-  for (int c = 0; c < C; ++c) dz2_out[n * C + c] = 0.0f;
-  for (int h = 0; h < H; ++h) { h1_out[n * H + h] = 0.0f; dz1_out[n * H + h] = 0.0f; }
-  if (y < 0) return;
-  const float *a = A + n * (clio::run::u64)F;
-  // PER-THREAD SCRATCH IS THE COST HERE. This kernel had five arrays --
-  // z1, h1, z2, p, dz2 -- at kMaxH/kMaxC, which is 1088 floats (4352 B) of
-  // LOCAL memory per thread whatever H and C are. Three of them are
-  // redundant, and removing them changes no arithmetic:
-  //   z1 : only ever used as (z1[h] > 0), and h1 = max(z1,0), so h1[h] > 0
-  //        is the same predicate exactly.
-  //   p  : derived from z2 and z2 is dead afterwards, so p aliases z2.
-  //   dz2: derived from p, and the loss is read BEFORE it, so it aliases z2
-  //        too.
-  // 1088 floats -> 448.
-  // h1 and z2 stay as per-thread arrays. Moving them to dynamic shared memory
-  // was tried: it does remove the 1792 bytes of STACK that cuobjdump reports,
-  // but it is SLOWER (0.45s -> 0.49s). Shared memory plus the smaller block it
-  // forces (64 threads, to stay under the 48 KB limit) costs more occupancy
-  // than the local arrays were costing in L1 misses, and registers rose 62 ->
-  // 77. So the STACK figure is real but is not what limits this kernel.
-  float h1[kMaxH];
-  float z2[kMaxC];
-  // LAYER 1, TILED OVER h INTO REGISTERS.
+  // REGISTER BLOCKING OVER NODES.
   //
-  // Two wrong shapes preceded this one:
-  //   h outer, scalar accumulator: the accumulator is a register, but the
-  //     node's feature row a[0..F) is re-read once per h -- 64 passes.
-  //   f outer, accumulating into h1[]: reads a[] once, but h1 is a 1 KB
-  //     dynamically-indexed LOCAL array, so it turns into F*H = 8192
-  //     read-modify-writes of local memory per node. That is 1 KB per thread
-  //     of working set, 128 KB per block, which does not fit L1.
+  // With one node per thread, every thread streams all H*F of W1 for its own
+  // node. Lanes in a warp read the same W1 element at the same time, so it
+  // costs one broadcast per warp rather than per thread -- but still H*F per
+  // 32 nodes, and that traffic is what forward is left standing on after
+  // occupancy, local memory, feature re-reads and atomics were each tested and
+  // ruled out.
   //
-  // Tiling h by a COMPILE-TIME kHT keeps the accumulators in registers (the
-  // inner loop unrolls) while reading a[f] only H/kHT times. Neither penalty.
+  // Giving each thread kNB nodes loads W1 once per (f, h-tile) and applies it
+  // to all of them, so the same traffic serves kNB*32 nodes. The nodes a
+  // thread owns are strided by blockDim, so for a given f the warp still reads
+  // A at the same addresses it did before -- the access pattern is unchanged,
+  // only the reuse is new.
   //
-  // The order of each sum is unchanged: acc[k] accumulates
-  // W1[(h0+k)*F+f]*a[f] over ascending f, exactly as the scalar version did,
-  // so this is bit-identical to both predecessors.
+  // Arithmetic is untouched: acc[j][k] accumulates W1[(h0+k)*F+f]*a_j[f] over
+  // ascending f exactly as the single-node form did.
+  const clio::run::u64 base =
+      (clio::run::u64)blockIdx.x * blockDim.x * kNB + threadIdx.x;
+  clio::run::u64 nid[kNB];
+  bool live[kNB];
+  long long y[kNB];
+#pragma unroll
+  for (int j = 0; j < kNB; ++j) {
+    nid[j] = base + (clio::run::u64)j * blockDim.x;
+    live[j] = nid[j] < nn;
+    if (live[j]) {
+      y[j] = labels[node_lo + nid[j]];
+      loss_buf[nid[j]] = 0.0;
+      for (int c = 0; c < C; ++c) dz2_out[nid[j] * C + c] = 0.0f;
+      for (int h = 0; h < H; ++h) {
+        h1_out[nid[j] * H + h] = 0.0f;
+        dz1_out[nid[j] * H + h] = 0.0f;
+      }
+      if (y[j] < 0) live[j] = false;
+    }
+  }
+
+  float h1[kNB][kMaxH];
   constexpr int kHT = 32;
   for (int h0 = 0; h0 < H; h0 += kHT) {
-    float acc[kHT];
     const int hn = min(kHT, H - h0);
+    float acc[kNB][kHT];
 #pragma unroll
-    for (int k = 0; k < kHT; ++k) acc[k] = (k < hn) ? b1[h0 + k] : 0.f;
+    for (int j = 0; j < kNB; ++j)
+#pragma unroll
+      for (int k = 0; k < kHT; ++k) acc[j][k] = (k < hn) ? b1[h0 + k] : 0.f;
     for (int f = 0; f < F; ++f) {
-      const float av = a[f];
+      float w[kHT];
 #pragma unroll
-      for (int k = 0; k < kHT; ++k) {
-        if (k < hn) acc[k] += W1[(h0 + k) * F + f] * av;
+      for (int k = 0; k < kHT; ++k) w[k] = (k < hn) ? W1[(h0 + k) * F + f] : 0.f;
+#pragma unroll
+      for (int j = 0; j < kNB; ++j) {
+        if (!live[j]) continue;
+        const float av = A[nid[j] * (clio::run::u64)F + f];
+#pragma unroll
+        for (int k = 0; k < kHT; ++k) acc[j][k] += w[k] * av;
       }
     }
 #pragma unroll
-    for (int k = 0; k < kHT; ++k) {
-      if (k < hn) h1[h0 + k] = acc[k] > 0.f ? acc[k] : 0.f;
-    }
-  }
-  // LAYER 2, tiled over c for the same reason layer 1 is tiled over h: the
-  // scalar form re-reads h1[0..H) once per c, and h1 lives in local memory,
-  // so that is C*H = 2560 local reads per node. Tiling reads it C/kCT times.
-  // Order unchanged: acc[k] accumulates over ascending h.
-  constexpr int kCT = 8;
-  float maxz = -1e30f;
-  for (int c0 = 0; c0 < C; c0 += kCT) {
-    const int cn = min(kCT, C - c0);
-    float acc[kCT];
+    for (int j = 0; j < kNB; ++j)
 #pragma unroll
-    for (int k = 0; k < kCT; ++k) acc[k] = (k < cn) ? b2[c0 + k] : 0.f;
-    for (int h = 0; h < H; ++h) {
-      const float hv = h1[h];
+      for (int k = 0; k < kHT; ++k) {
+        if (k < hn) h1[j][h0 + k] = acc[j][k] > 0.f ? acc[j][k] : 0.f;
+      }
+  }
+
+  // The rest is per node: layer 2, softmax, loss and the backward pass. W2 is
+  // only C*H floats, so there is nothing to gain from blocking it.
+#pragma unroll 1
+  for (int j = 0; j < kNB; ++j) {
+    if (!live[j]) continue;
+    const clio::run::u64 n = nid[j];
+    float z2[kMaxC], maxz = -1e30f;
+    constexpr int kCT = 8;
+    for (int c0 = 0; c0 < C; c0 += kCT) {
+      const int cn = min(kCT, C - c0);
+      float acc[kCT];
+#pragma unroll
+      for (int k = 0; k < kCT; ++k) acc[k] = (k < cn) ? b2[c0 + k] : 0.f;
+      for (int h = 0; h < H; ++h) {
+        const float hv = h1[j][h];
+#pragma unroll
+        for (int k = 0; k < kCT; ++k) {
+          if (k < cn) acc[k] += W2[(c0 + k) * H + h] * hv;
+        }
+      }
 #pragma unroll
       for (int k = 0; k < kCT; ++k) {
-        if (k < cn) acc[k] += W2[(c0 + k) * H + h] * hv;
+        if (k < cn) { z2[c0 + k] = acc[k]; if (acc[k] > maxz) maxz = acc[k]; }
       }
     }
-#pragma unroll
-    for (int k = 0; k < kCT; ++k) {
-      if (k < cn) { z2[c0 + k] = acc[k]; if (acc[k] > maxz) maxz = acc[k]; }
+    float sum = 0.f;
+    for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
+    int pred = 0; float pmax = -1.f;   // p aliases z2
+    for (int c = 0; c < C; ++c) { z2[c] = z2[c] / sum; if (z2[c] > pmax) { pmax = z2[c]; pred = c; } }
+    if (((node_lo + n) % kValStride) == (kValStride - 1)) {
+      if (pred == (int)y[j]) WarpAddOne(val_correct);
+      WarpAddOne(val_count);
+      continue;
     }
-  }
-  float sum = 0.f;
-  for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
-  int pred = 0; float pmax = -1.f;   // p aliases z2
-  for (int c = 0; c < C; ++c) { z2[c] = z2[c] / sum; if (z2[c] > pmax) { pmax = z2[c]; pred = c; } }
-  // Held-out validation node: score it, but contribute neither loss nor gradient.
-  // dz1_out/dz2_out/h1_out were zeroed above, so returning here keeps its grad at 0.
-  if (((node_lo + n) % kValStride) == (kValStride - 1)) {
-    if (pred == (int)y) WarpAddOne(val_correct);
-    WarpAddOne(val_count);
-    return;
-  }
-  loss_buf[n] = -log((double)fmaxf(z2[y], 1e-30f));
-  if (pred == (int)y) WarpAddOne(correct);
-  WarpAddOne(count);
-  // dz2 aliases z2 (which currently holds p); the loss above already read it.
-  for (int c = 0; c < C; ++c) { z2[c] = z2[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = z2[c]; }
-  // BACKWARD, tiled over h: the scalar form re-reads z2[0..C) once per h,
-  // which is H*C = 2560 local reads per node. Order unchanged: acc[k]
-  // accumulates over ascending c.
-  for (int h0 = 0; h0 < H; h0 += kHT) {
-    const int hn = min(kHT, H - h0);
-    float acc[kHT];
+    loss_buf[n] = -log((double)fmaxf(z2[y[j]], 1e-30f));
+    if (pred == (int)y[j]) WarpAddOne(correct);
+    WarpAddOne(count);
+    for (int c = 0; c < C; ++c) { z2[c] = z2[c] - (c == (int)y[j] ? 1.f : 0.f); dz2_out[n * C + c] = z2[c]; }
+    for (int h0 = 0; h0 < H; h0 += kHT) {
+      const int hn = min(kHT, H - h0);
+      float acc[kHT];
 #pragma unroll
-    for (int k = 0; k < kHT; ++k) acc[k] = 0.f;
-    for (int c = 0; c < C; ++c) {
-      const float zv = z2[c];
+      for (int k = 0; k < kHT; ++k) acc[k] = 0.f;
+      for (int c = 0; c < C; ++c) {
+        const float zv = z2[c];
+#pragma unroll
+        for (int k = 0; k < kHT; ++k) {
+          if (k < hn) acc[k] += W2[c * H + h0 + k] * zv;
+        }
+      }
 #pragma unroll
       for (int k = 0; k < kHT; ++k) {
-        if (k < hn) acc[k] += W2[c * H + h0 + k] * zv;
-      }
-    }
-#pragma unroll
-    for (int k = 0; k < kHT; ++k) {
-      if (k < hn) {
-        const float hv = h1[h0 + k];
-        dz1_out[n * H + h0 + k] = (hv > 0.f) ? acc[k] : 0.f;  // hv>0 iff z1>0
-        h1_out[n * H + h0 + k] = hv;
+        if (k < hn) {
+          const float hv = h1[j][h0 + k];
+          dz1_out[n * H + h0 + k] = (hv > 0.f) ? acc[k] : 0.f;
+          h1_out[n * H + h0 + k] = hv;
+        }
       }
     }
   }
@@ -871,7 +895,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       // local scratch. The instantiation does not survive this build's device
       // linking -- the launch fails with "invalid device function" -- and the
       // failure is silent unless the error below is checked.
-      TrainNodeKernel<<<(int)((nn + tpb - 1) / tpb), tpb>>>(
+      TrainNodeKernel<<<(int)((nn + (clio::run::u64)tpb * kNB - 1) / (tpb * kNB)), tpb>>>(
           d_scratch, nn, first, d_lab, F, H, C, dW1, db1, dW2, db2,
           h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count,
           d_vcorrect, d_vcount);
