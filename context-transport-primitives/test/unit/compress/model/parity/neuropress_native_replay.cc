@@ -120,6 +120,7 @@ int main(int argc, char **argv) {
   bool zero_output = false;
   long dump_chunk = -1;
   bool flush_cache = false;
+  const char *clio_payload_dir = nullptr;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -127,6 +128,13 @@ int main(int argc, char **argv) {
       inference_only = true;
     } else if (a == "--dump-chunk" && i + 1 < argc) {
       dump_chunk = std::atol(argv[++i]);
+    } else if (a == "--clio-payloads" && i + 1 < argc) {
+      // Directory of <prefix>chunkN.bin payloads dumped by the Clio run.
+      // Each is grafted behind the header native just produced for the same
+      // chunk and decoded, which is the only way to establish that CLIO's
+      // compressed artifact restores the original -- Clio's own read path
+      // can be served by the uncompressed HDF5 copy and never decompress.
+      clio_payload_dir = argv[++i];
     } else if (a == "--flush-cache") {
       // Diagnostic: evict the cached nvcomp managers before every chunk, so
       // each compress starts from a fresh manager instead of one that has
@@ -221,7 +229,7 @@ int main(int argc, char **argv) {
                "second_deriv,compressed_size,ratio,pred_ratio,pred_ct_ms,"
                "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum,"
                "payload_hash,payload_size,mse,mean,variance,kurtosis,"
-               "restored_hash,bytes_differ\n");
+               "restored_hash,bytes_differ,clio_decode_differ\n");
 
   std::vector<char> in(kChunkBytes);
   const size_t max_out = gpucompress_max_compressed_size(kChunkBytes);
@@ -229,10 +237,11 @@ int main(int argc, char **argv) {
   // Device buffers: gpucompress_compress() is a host-path stub in this
   // build, and the GPU entry point is the one the VOL uses anyway, so the
   // comparison runs through the same code path Clio's chunks take.
-  void *d_in = nullptr, *d_out = nullptr, *d_dec = nullptr;
+  void *d_in = nullptr, *d_out = nullptr, *d_dec = nullptr, *d_in2 = nullptr;
   if (cudaMalloc(&d_in, kChunkBytes) != cudaSuccess ||
       cudaMalloc(&d_out, max_out) != cudaSuccess ||
-      cudaMalloc(&d_dec, kChunkBytes) != cudaSuccess) {
+      cudaMalloc(&d_dec, kChunkBytes) != cudaSuccess ||
+      cudaMalloc(&d_in2, max_out + 4096) != cudaSuccess) {
     std::fprintf(stderr, "cudaMalloc failed\n");
     return 1;
   }
@@ -388,6 +397,47 @@ int main(int argc, char **argv) {
       }
     }
 
+    // Cross-decode: does CLIO's compressed payload for this chunk restore
+    // the source exactly, using native's decoder?
+    long clio_decode_differ = -1;  // -1 = not attempted
+    if (clio_payload_dir && out_size > kNativeHeaderBytes) {
+      char pp[1024];
+      std::snprintf(pp, sizeof(pp), "%s%ld.bin", clio_payload_dir, r.chunk);
+      if (std::FILE *pf = std::fopen(pp, "rb")) {
+        std::fseek(pf, 0, SEEK_END);
+        const long plen = std::ftell(pf);
+        std::fseek(pf, 0, SEEK_SET);
+        std::vector<char> cp(plen);
+        if (std::fread(cp.data(), 1, plen, pf) == (size_t)plen) {
+          std::vector<char> framed(kNativeHeaderBytes + plen);
+          std::vector<char> hdr(kNativeHeaderBytes);
+          cudaMemcpy(hdr.data(), d_out, kNativeHeaderBytes,
+                     cudaMemcpyDeviceToHost);
+          std::memcpy(framed.data(), hdr.data(), kNativeHeaderBytes);
+          std::memcpy(framed.data() + kNativeHeaderBytes, cp.data(), plen);
+          cudaMemcpy(d_in2, framed.data(), framed.size(),
+                     cudaMemcpyHostToDevice);
+          size_t ds = kChunkBytes;
+          if (gpucompress_decompress_gpu(d_in2, framed.size(), d_dec, &ds,
+                                         nullptr) == GPUCOMPRESS_SUCCESS &&
+              ds == kChunkBytes) {
+            std::vector<char> dec2(kChunkBytes);
+            cudaMemcpy(dec2.data(), d_dec, kChunkBytes,
+                       cudaMemcpyDeviceToHost);
+            clio_decode_differ = 0;
+            if (std::memcmp(dec2.data(), in.data(), kChunkBytes) != 0) {
+              for (size_t k = 0; k < kChunkBytes; ++k) {
+                if (dec2[k] != in[k]) ++clio_decode_differ;
+              }
+            }
+          } else {
+            clio_decode_differ = -2;  // decode failed outright
+          }
+        }
+        std::fclose(pf);
+      }
+    }
+
     // nn_final_action is the action actually used; with exploration off it
     // equals nn_original_action. Decode it the way decodeAction does.
     const int action = st.nn_final_action;
@@ -398,7 +448,7 @@ int main(int argc, char **argv) {
     std::fprintf(of,
                  "%ld,%ld,%d,%d,%d,%d,%.10g,%.10g,%.10g,%zu,%.10g,%.10g,"
                  "%.10g,%.10g,%.10g,%.10g,%d,%llu,%llu,%zu,%.10g,%.10g,"
-                 "%.10g,%.10g,%llu,%zu\n",
+                 "%.10g,%.10g,%llu,%zu,%ld\n",
                  r.seq, r.chunk, action, algo_idx, quantize, shuffle,
                  n_entropy, n_mad, n_deriv,
                  st.compressed_size, st.compression_ratio,
@@ -406,7 +456,7 @@ int main(int argc, char **argv) {
                  st.predicted_decomp_time_ms, st.predicted_psnr_db,
                  st.actual_comp_time_ms, st.sgd_fired, checksum,
                  payload_hash, payload_size, mse, mean, variance, kurtosis,
-                 restored_hash, bytes_differ);
+                 restored_hash, bytes_differ, clio_decode_differ);
     ++done;
   }
   std::fclose(of);

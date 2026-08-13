@@ -1067,13 +1067,22 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
   // two encoders disagree; only the bytes say where and how.
   const char *want = std::getenv("CLIO_NEUROPRESS_DUMP_CHUNK");
   if (want && *want) {
+    // "all" dumps every chunk, which is what a whole-dataset cross-decode
+    // needs; a bare index dumps just that one for a byte diff.
     const std::string suffix = std::string("/chunk_") + want;
-    if (blob_name.size() >= suffix.size() &&
+    const bool all = (std::strcmp(want, "all") == 0);
+    if (all || (blob_name.size() >= suffix.size() &&
         blob_name.compare(blob_name.size() - suffix.size(), suffix.size(),
-                          suffix) == 0) {
+                          suffix) == 0)) {
       const char *base = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+      std::string idx = want;
+      if (all) {
+        const size_t pos = blob_name.rfind("/chunk_");
+        idx = (pos == std::string::npos) ? "x"
+                                         : blob_name.substr(pos + 7);
+      }
       std::string dp = std::string(base ? base : "/tmp/clio") + ".chunk" +
-                       want + ".bin";
+                       idx + ".bin";
       if (std::FILE *df = std::fopen(dp.c_str(), "wb")) {
         std::fwrite(p, 1, payload_size, df);
         std::fclose(df);
