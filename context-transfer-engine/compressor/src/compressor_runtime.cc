@@ -36,6 +36,7 @@
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -65,6 +66,20 @@ extern "C" int clio_cte_locate(const void *tag_id, const char *name,
                                unsigned long long *target_off,
                                unsigned long long *stored_size);
 extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
+
+// Fault-path accounting: which route does a compressed page actually take?
+static std::atomic<long long> g_path_tier_d2d{0};    // device tier, decoded in place
+static std::atomic<long long> g_path_spill_stage{0}; // host tier, staged to device
+static std::atomic<long long> g_path_single_host{0}; // single-page host round trip
+static void PathTrace(const char *what) {
+  if (getenv("CLIO_PATH_TRACE") == nullptr) return;
+  static std::atomic<long long> tick{0};
+  if ((tick.fetch_add(1) % 512) != 0) return;
+  fprintf(stderr, "[PATH] tier_d2d=%lld spill_stage=%lld single_host=%lld (%s)\n",
+          g_path_tier_d2d.load(), g_path_spill_stage.load(),
+          g_path_single_host.load(), what);
+  fflush(stderr);
+}
 #if CTP_ENABLE_NVCOMP
 // The C batched entry points, from the ORDINARY host library. Every algorithm
 // exposes the same eleven-parameter signature, which is what lets one dispatch
@@ -2819,6 +2834,8 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         auto req = std::make_shared<PendingDecomp>();
         // Own the bytes: the waiter may time out and free buf while the
         // drainer is still working (see PendingDecomp).
+        g_path_single_host.fetch_add(1);
+        PathTrace("single-host");
         req->stored_bytes.assign(buf.ptr_, buf.ptr_ + stored_size);
         req->stored_size = stored_size;
         req->dst = dst_dev.ptr_;
@@ -3001,6 +3018,8 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       // No snapshot: see the single-page site. The context carries the
       // codec; the drain owns header parsing.
       if (!IsGpuCodec(task->context_.compress_lib_)) continue;
+      g_path_tier_d2d.fetch_add(1);
+      PathTrace("tier");
       auto r = std::make_shared<PendingDecomp>();
       r->src_stable = true;      // the blob's home on the tier
       r->src_device = tier + loff;
@@ -3041,6 +3060,8 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         }
         if (clio_direct_dev_base(lpool) != nullptr) continue;  // tier path
         if (req.size_ > slot_b) slot_b = req.size_;
+        g_path_spill_stage.fetch_add(1);
+        PathTrace("spill");
         sp_idx.push_back(i);
         sp_sz.push_back(lsz);
       }
@@ -3090,13 +3111,13 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     }
 
     if (batched != 0) {
-      {
-        std::lock_guard<std::mutex> g(batch_mu_);
+      {        std::lock_guard<std::mutex> g(batch_mu_);
         for (clio::run::u32 i = 0; i < n; ++i) {
           if (reqs[i]) batch_.push_back(reqs[i]);
         }
       }
       // ONE wait for the whole group, not one per page.
+      const auto t_wait0 = std::chrono::steady_clock::now();
       for (int spins = 0; spins < kDecompWaitMaxSpins; ++spins) {
         bool all = true;
         for (clio::run::u32 i = 0; i < n; ++i) {
@@ -3107,6 +3128,18 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         }
         if (all) break;
         CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+      }
+      if (getenv("CLIO_WAIT_TRACE")) {
+        static std::atomic<long long> nw{0}, tot_us{0};
+        const double us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t_wait0).count();
+        const long long k = nw.fetch_add(1) + 1;
+        const long long t = tot_us.fetch_add((long long)us) + (long long)us;
+        if (k % 256 == 0) {
+          fprintf(stderr, "[WAIT] multiget waits=%lld avg=%.0f us (batch n=%u)\n",
+                  k, (double)t / (double)k, n);
+          fflush(stderr);
+        }
       }
       for (clio::run::u32 i = 0; i < n; ++i) {
         if (!reqs[i]) continue;
