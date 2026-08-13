@@ -482,6 +482,29 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
 constexpr int kGradSplits = 32;
 
 /**
+ * Accumulator type for the weight gradients.
+ *
+ * DOUBLE by default, which is what the gradient kernels have always used and
+ * is the only reason they cost what they do: GradW1Kernel runs at 247 GFLOP/s
+ * against this GPU's MEASURED FP64 ceiling of 240 GFLOP/s (a pure register-FMA
+ * benchmark on an RTX 4070 Laptop, 36 SMs), so it is AT the hardware limit and
+ * cannot be made faster while it stays FP64.
+ *
+ * -DCLIO_GNN_GRAD_FP32 switches the accumulators to float. That is a numerical
+ * change to the model, not a tuning knob, which is why it is off by default:
+ * with kGradSplits=32 each thread sums nn/32 terms, so the accumulation depth
+ * is ~16k and the expected relative error is around 8e-6 -- immaterial for SGD
+ * but a hundred times the float representation error, and it is not my call to
+ * make on someone else's training run. Both the in-core and the streamed path
+ * use whichever is selected, so the bit-exactness assertion holds either way.
+ */
+#if defined(CLIO_GNN_GRAD_FP32)
+using GradAcc = float;
+#else
+using GradAcc = double;
+#endif
+
+/**
  * dW1[h][f] += sum_n dz1[n][h] * A[n][f]: TILED and SPLIT over n.
  *
  * Two separate problems, and each fix alone made things worse:
@@ -518,8 +541,8 @@ __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn
   // Exact, not approximate: a float-to-double conversion is lossless, and the
   // product of two floats needs 48 mantissa bits so the double multiply was
   // already exact. Same values, same order, same result.
-  __shared__ double sA[kTN][kTF];
-  __shared__ double sD[kTN][kTH];
+  __shared__ GradAcc sA[kTN][kTF];
+  __shared__ GradAcc sD[kTN][kTH];
   const int f0 = blockIdx.x * kTF;
   const int h0 = blockIdx.y * kTH;
   const int sp = blockIdx.z;
@@ -541,18 +564,18 @@ __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn
   // sequential sum into four shorter ones then combining pairwise is if
   // anything better conditioned. It stays deterministic, and both the in-core
   // and the streamed path run this same kernel, so they still agree exactly.
-  double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, sb = 0.0;
+  GradAcc s0 = 0, s1 = 0, s2 = 0, s3 = 0, sb = 0;
   for (clio::run::u64 n0 = lo; n0 < hi; n0 += kTN) {
     const int lim = (int)min((clio::run::u64)kTN, hi - n0);
     for (int i = threadIdx.x; i < kTN * kTF; i += blockDim.x) {
       const int r = i / kTF, c = i % kTF;
       sA[r][c] = (r < lim && f0 + c < F)
-                     ? (double)A[(n0 + r) * (clio::run::u64)F + f0 + c] : 0.0;
+                     ? (GradAcc)A[(n0 + r) * (clio::run::u64)F + f0 + c] : (GradAcc)0;
     }
     for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
       const int r = i / kTH, c = i % kTH;
       sD[r][c] = (r < lim && h0 + c < H)
-                     ? (double)dz1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.0;
+                     ? (GradAcc)dz1[(n0 + r) * (clio::run::u64)H + h0 + c] : (GradAcc)0;
     }
     __syncthreads();
     int r = 0;
@@ -570,7 +593,7 @@ __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn
     }
     __syncthreads();
   }
-  const double s = (s0 + s1) + (s2 + s3);
+  const GradAcc s = (s0 + s1) + (s2 + s3);
   if (h0 + th < H && f0 + tf < F) {
     part[(clio::run::u64)sp * H * F + (h0 + th) * F + f0 + tf] = s;
   }
@@ -606,8 +629,8 @@ __global__ void GradW1ReduceKernel(const double *part, const double *partb,
 __global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
                              int H, int C, double *part, double *partb) {
   constexpr int kTH = 16, kTC = 8, kTN = 64;
-  __shared__ double sH[kTN][kTH];
-  __shared__ double sD[kTN][kTC];
+  __shared__ GradAcc sH[kTN][kTH];
+  __shared__ GradAcc sD[kTN][kTC];
   const int h0 = blockIdx.x * kTH;
   const int c0 = blockIdx.y * kTC;
   const int sp = blockIdx.z;
@@ -616,18 +639,18 @@ __global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 n
   const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
   const clio::run::u64 lo = (clio::run::u64)sp * chunk;
   const clio::run::u64 hi = min(lo + chunk, nn);
-  double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, sb = 0.0;
+  GradAcc s0 = 0, s1 = 0, s2 = 0, s3 = 0, sb = 0;
   for (clio::run::u64 n0 = lo; n0 < hi; n0 += kTN) {
     const int lim = (int)min((clio::run::u64)kTN, hi - n0);
     for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
       const int r = i / kTH, c = i % kTH;
       sH[r][c] = (r < lim && h0 + c < H)
-                     ? (double)h1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.0;
+                     ? (GradAcc)h1[(n0 + r) * (clio::run::u64)H + h0 + c] : (GradAcc)0;
     }
     for (int i = threadIdx.x; i < kTN * kTC; i += blockDim.x) {
       const int r = i / kTC, c = i % kTC;
       sD[r][c] = (r < lim && c0 + c < C)
-                     ? (double)dz2[(n0 + r) * (clio::run::u64)C + c0 + c] : 0.0;
+                     ? (GradAcc)dz2[(n0 + r) * (clio::run::u64)C + c0 + c] : (GradAcc)0;
     }
     __syncthreads();
     int r = 0;
@@ -643,7 +666,7 @@ __global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 n
     }
     __syncthreads();
   }
-  const double s = (s0 + s1) + (s2 + s3);
+  const GradAcc s = (s0 + s1) + (s2 + s3);
   if (c0 + tc < C && h0 + th < H) {
     part[(clio::run::u64)sp * C * H + (c0 + tc) * H + h0 + th] = s;
   }
