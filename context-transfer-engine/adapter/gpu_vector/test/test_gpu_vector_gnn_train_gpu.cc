@@ -326,6 +326,24 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
 /** Grad accumulation (one thread per weight element; sums the window's nodes in
  *  order and += into the global double grad -- deterministic across windows because
  *  the launches serialize on one stream). */
+/**
+ * dW1[h][f] += sum_n dz1[n][h] * A[n][f].
+ *
+ * DELIBERATELY UNTILED. Tiling this through shared memory was tried and is
+ * SLOWER (1.37s against 1.12s), because the kernel is not bandwidth-bound:
+ * it is H*F*nn = 4.3e9 DOUBLE fused multiply-adds per window, and this GPU
+ * runs FP64 at 1/64 of FP32, so the arithmetic dominates and staging just
+ * adds overhead. Widening the node chunk to cut __syncthreads() made no
+ * difference either (1.38s -> 1.37s), which is what confirmed it.
+ *
+ * The reads are already coalesced: consecutive idx give consecutive f, so a
+ * warp reads 32 contiguous floats of A, and dz1[n*H+h] is a broadcast.
+ *
+ * Making this materially faster means accumulating in float and only
+ * periodically folding into the double, which changes the rounding of the
+ * gradient. That is an accuracy decision, not a performance one, so it is
+ * not taken here.
+ */
 __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn,
                              int F, int H, double *dW1, double *db1) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -336,15 +354,43 @@ __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn
   dW1[idx] += s;
   if (f == 0) { double sb = 0.0; for (clio::run::u64 n = 0; n < nn; ++n) sb += (double)dz1[n * H + h]; db1[h] += sb; }
 }
+
+/** dW2[c][h] += sum_n dz2[n][c] * h1[n][h], tiled. See GradW1Kernel -- same
+ *  shape, same reason, same preserved accumulation order (h1 was being read C
+ *  times per window). */
 __global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
                              int H, int C, double *dW2, double *db2) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= C * H) return;
-  int c = idx / H, h = idx % H;
-  double s = 0.0;
-  for (clio::run::u64 n = 0; n < nn; ++n) s += (double)dz2[n * C + c] * (double)h1[n * H + h];
-  dW2[idx] += s;
-  if (h == 0) { double sb = 0.0; for (clio::run::u64 n = 0; n < nn; ++n) sb += (double)dz2[n * C + c]; db2[c] += sb; }
+  constexpr int kTC = 8, kTH = 16, kTN = 256;
+  __shared__ float sH[kTN][kTH];
+  __shared__ float sD[kTN][kTC];
+  const int h0 = blockIdx.x * kTH;
+  const int c0 = blockIdx.y * kTC;
+  const int th = threadIdx.x % kTH;
+  const int tc = threadIdx.x / kTH;
+  double s = 0.0, sb = 0.0;
+  for (clio::run::u64 n0 = 0; n0 < nn; n0 += kTN) {
+    for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
+      const int r = i / kTH, c = i % kTH;
+      const clio::run::u64 n = n0 + r;
+      sH[r][c] = (n < nn && h0 + c < H) ? h1[n * (clio::run::u64)H + h0 + c] : 0.f;
+    }
+    for (int i = threadIdx.x; i < kTN * kTC; i += blockDim.x) {
+      const int r = i / kTC, c = i % kTC;
+      const clio::run::u64 n = n0 + r;
+      sD[r][c] = (n < nn && c0 + c < C) ? dz2[n * (clio::run::u64)C + c0 + c] : 0.f;
+    }
+    __syncthreads();
+    const int lim = (int)min((clio::run::u64)kTN, nn - n0);
+    for (int r = 0; r < lim; ++r) {
+      s += (double)sD[r][tc] * (double)sH[r][th];
+    }
+    if (blockIdx.x == 0 && th == 0) {
+      for (int r = 0; r < lim; ++r) sb += (double)sD[r][tc];
+    }
+    __syncthreads();
+  }
+  if (c0 + tc < C && h0 + th < H) dW2[(c0 + tc) * H + h0 + th] += s;
+  if (blockIdx.x == 0 && th == 0 && c0 + tc < C) db2[c0 + tc] += sb;
 }
 /** Deterministic loss reduction: one thread sums the window's per-node losses in
  *  order and adds to the global loss (windows serialize on the stream -> the total
@@ -584,7 +630,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       track_peak();
       GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
       if (ktime) { ctp::GpuApi::Synchronize(); t_gw1 += NowSec() - tp0; tp0 = NowSec(); }
-      GradW2Kernel<<<(C * H + tpb - 1) / tpb, tpb>>>(h1_buf, dz2_buf, nn, H, C, gW2, gb2);
+      GradW2Kernel<<<dim3((H + 15) / 16, (C + 7) / 8), 128>>>(
+          h1_buf, dz2_buf, nn, H, C, gW2, gb2);
       if (ktime) { ctp::GpuApi::Synchronize(); t_gw2 += NowSec() - tp0; }
       if (kMinibatch) {
         // Mini-batch SGD: one weight update per window instead of one per epoch,
