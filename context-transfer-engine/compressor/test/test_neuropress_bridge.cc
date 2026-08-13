@@ -182,4 +182,143 @@ TEST_CASE("NeuroPressCandidateStats never ranks outside its trained "
   }
 }
 
+namespace {
+
+/** NeuroPress action index (0-7) -> the library name the bridge reports. */
+const char *NameForAlgoIdx(int algo_idx) {
+  switch (algo_idx) {
+    case 0: return "nvcomp-lz4";
+    case 1: return "nvcomp-snappy";
+    case 2: return "nvcomp-deflate";
+    case 3: return "nvcomp-gdeflate";
+    case 4: return "nvcomp-zstd";
+    case 5: return "nvcomp-ans";
+    case 6: return "nvcomp-cascaded";
+    default: return "nvcomp-bitcomp";
+  }
+}
+
+/** Recover decodeAction's index (algo + 8*quant + 16*shuffle) from what the
+ *  bridge actually returned. Quantize and byte-shuffle ride in the packed
+ *  preset word (see PackPreset in compressor_runtime.cc): bits 0-7 preset,
+ *  8-15 shuffle element size, bit 24 quantize-enabled. */
+int ActionOfStats(const CompressionStats &s) {
+  std::string name = ctp::CompressionFactory::NameForWireId(s.compress_lib_);
+  int algo = -1;
+  for (int i = 0; i < 8; ++i) {
+    if (name == NameForAlgoIdx(i)) { algo = i; break; }
+  }
+  const uint32_t bits = static_cast<uint32_t>(s.compress_preset_);
+  const int quant = ((bits >> 24) & 1u) ? 1 : 0;
+  const int shuffle = (((bits >> 8) & 0xFFu) != 0u) ? 1 : 0;
+  return (algo < 0) ? -1 : algo + 8 * quant + 16 * shuffle;
+}
+
+/**
+ * Predictor that saturates a chosen set of actions to an identical score and
+ * leaves every other candidate strictly worse, so the bridge's ranking is
+ * decided purely by the order it enumerates candidates in.
+ *
+ * Winners return the clamped extremes (1 ms times, 100x ratio), which is how
+ * the real model produces ties: the policy clamps collapse a whole group of
+ * candidates onto one cost.
+ */
+class TieStubPredictor : public ctp::compress::model::CompressionPredictor {
+ public:
+  explicit TieStubPredictor(std::set<int> winners)
+      : winners_(std::move(winners)) {}
+
+  bool Load(const std::string &) override { return true; }
+  bool Save(const std::string &) override { return true; }
+  bool IsReady() const override { return true; }
+  ctp::compress::model::ModelType Type() const override {
+    return ctp::compress::model::ModelType::kQTable;
+  }
+
+  ctp::compress::model::CompressionPrediction Predict(
+      const ctp::compress::model::CompressionFeatures &f) override {
+    const int base_id = static_cast<int>(f.library_config_id) / 10;
+    int algo = -1;
+    static const int kBaseIds[8] = {13, 14, 17, 16, 15, 18, 23, 24};
+    for (int i = 0; i < 8; ++i) {
+      if (kBaseIds[i] == base_id) { algo = i; break; }
+    }
+    const int action = algo + 8 * (f.quantize > 0.5 ? 1 : 0) +
+                       16 * (f.byte_shuffle > 0.5 ? 1 : 0);
+    ctp::compress::model::CompressionPrediction p;
+    if (algo >= 0 && winners_.count(action)) {
+      p.compression_ratio = 100.0;    // at the cap
+      p.compression_time_ms = 1.0;    // at the floor
+      p.decompression_time_ms = 1.0;  // at the floor
+    } else {
+      p.compression_ratio = 2.0;
+      p.compression_time_ms = 50.0;
+      p.decompression_time_ms = 50.0;
+    }
+    p.psnr_db = 0.0;
+    return p;
+  }
+
+ private:
+  std::set<int> winners_;
+};
+
+}  // namespace
+
+TEST_CASE("NeuroPressCandidateStats breaks ties by lowest action index",
+          "[compressor][neuropress][dynamic][693]") {
+  // Ties are routine, not exotic: both sides clamp times to a 1 ms floor and
+  // the ratio to a 100x cap before ranking (nn_gpu.cu:227-230), so on
+  // compressible data a group of candidates lands on a bit-identical cost.
+  // Position then decides the winner. Upstream ranks with a bitonic network
+  // built from strict comparators, so it never swaps equal keys and the
+  // LOWEST action index wins (decodeAction, internal.hpp:167-172, numbers an
+  // action algo + 8*quant + 16*shuffle); Rank() here uses std::stable_sort,
+  // so the FIRST ENUMERATED wins. The two agree only while this bridge
+  // enumerates shuffle-outermost, quant, then algo.
+  //
+  // That ordering was previously argued from decodeAction rather than
+  // measured, and it is not cheap to measure by accident: the real model's
+  // ties all fall within a single algorithm's column, where both the correct
+  // and an algo-outermost enumeration pick the same winner
+  // (neuropress_tiebreak_parity.cu finds 32 real ties and not one of them
+  // distinguishes the two). Only a tie whose lowest ACTION sits at a high
+  // ALGORITHM index can, so the stub below manufactures exactly those.
+  struct Case {
+    std::set<int> tied;
+    double error_bound;
+    int expected;  // lowest action index in the set
+    bool discriminating;
+  };
+  const std::vector<Case> cases = {
+      // Lossless: only the 16 unquantized configs exist (0-7, 16-23).
+      {{7, 16}, 0.0, 7, true},       // algo7 plain vs algo0 shuffled
+      {{6, 16, 22}, 0.0, 6, true},
+      {{3, 19}, 0.0, 3, false},      // control: same algo either way
+      // With a bound, all 32 are reachable.
+      {{1, 8}, 1e-3, 1, true},       // algo1 plain vs algo0 quantized
+      {{15, 16}, 1e-3, 15, true},    // algo7 quantized vs algo0 shuffled
+      {{7, 24}, 1e-3, 7, true},
+      {{5, 13, 21, 29}, 1e-3, 5, false},  // control: one algo's whole column
+  };
+
+  int discriminating_cases = 0;
+  for (const auto &c : cases) {
+    TieStubPredictor stub(c.tied);
+    auto stats = NeuroPressCandidateStats(
+        stub, /*chunk_size=*/4 * 1024 * 1024, /*entropy=*/1.0, /*mad=*/0.1,
+        /*second_derivative_mean=*/0.05, /*data_type_float=*/true,
+        c.error_bound);
+    REQUIRE_FALSE(stats.empty());
+    if (c.discriminating) ++discriminating_cases;
+    INFO("tie set winner mismatch at error_bound " << c.error_bound);
+    REQUIRE(ActionOfStats(stats.front()) == c.expected);
+  }
+
+  // The cases marked discriminating are the ones that would resolve
+  // differently under an algo-outermost enumeration. Without at least one,
+  // this test would pass against either order and assert nothing.
+  REQUIRE(discriminating_cases > 0);
+}
+
 SIMPLE_TEST_MAIN()

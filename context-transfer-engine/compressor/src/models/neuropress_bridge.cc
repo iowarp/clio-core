@@ -64,12 +64,17 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
   // (nn_weights.h's NN_NUM_CONFIGS = 32, internal.hpp's decodeAction) -- and
   // preset is not one of the 8 NN inputs (FeaturesTo8Input). Enumerating
   // {1,2,3} therefore produced three candidates with a bit-identical feature
-  // vector, hence an identical prediction and an identical score; since
-  // Rank() finishes with std::sort (not stable_sort), which of FAST/BALANCED/
-  // BEST actually got applied to the data was decided by sort tie-breaking
-  // rather than by the model -- and preset genuinely changes codec settings
-  // downstream. Pin BALANCED so the choice is deterministic and the ranked
-  // list has one entry per algorithm, matching the model's real resolution.
+  // vector, hence an identical prediction and an identical score, leaving
+  // which of FAST/BALANCED/BEST got applied to the data to be settled by
+  // where they happened to sit in the candidate list rather than by the
+  // model -- and preset genuinely changes codec settings downstream. Pin
+  // BALANCED so the choice is deterministic and the ranked list has one
+  // entry per algorithm, matching the model's real resolution.
+  //
+  // (Rank() sorts with std::stable_sort, so such a tie resolves to the
+  // first enumerated rather than arbitrarily -- but "first enumerated" is
+  // still an accident of list construction here, not a decision the model
+  // made, so pinning remains the right fix.)
   std::vector<CandidateConfig> candidates =
       DefaultCandidates(/*include_gpu=*/true, {2}, false, 1e-3,
                         /*include_cpu=*/true);

@@ -93,13 +93,47 @@ namespace {
 /**
  * Per-flow EMA gradient buffer.
  *
- * Upstream allocates one per CompContext (gpucompress_pool.cpp:121-123) and
- * zeroes it at creation, so each concurrent compression flow has its own
- * gradient history for the anti-flip damping AND for the update itself --
- * the weight step is `w -= step * EMA[...]` (nn_gpu.cu:1523-1528), not the
- * raw gradient. Clio has no CompContext at this layer, so the equivalent
- * scope is the worker thread. Weights and sgd_call_count stay shared, which
- * is upstream's split exactly.
+ * Upstream splits its online-learning state: the weights and sgd_call_count
+ * are global (nn_gpu.cu:64, :1413), but the EMA gradient lives in its own
+ * buffer (gpucompress_pool.cpp:121-123, zeroed at creation). That buffer is
+ * not an optimization detail -- the weight step is `w -= step * EMA[...]`
+ * (nn_gpu.cu:1523-1528), not the raw gradient -- so whatever it is scoped to
+ * is what learning is smoothed over. Clio reproduces the split exactly:
+ * shared weights and call count, separate EMA.
+ *
+ * The SCOPE is an approximation, not a match, and the difference is worth
+ * being explicit about:
+ *
+ *   upstream  the buffer belongs to a CompContext, taken as the first free
+ *             slot of a fixed pool (acquireCompContext, gpucompress_pool.cpp:
+ *             184; N_COMP_CTX = 9, capped by GPUCOMPRESS_POOL_SLOTS) and
+ *             released at the end of ONE compression call. Gradient history
+ *             therefore follows the slot: a thread's successive operations
+ *             may land on different slots, and one slot accumulates history
+ *             from unrelated flows.
+ *   here      the buffer belongs to the thread, for the thread's lifetime.
+ *             History is continuous per worker and never mixes across them.
+ *
+ * So the two agree on the math and on the split, but bucket samples into
+ * buffers differently, and on the same concurrent workload can reach
+ * different weights. Neither is more correct: upstream's own bucketing
+ * depends on which slot happens to be free, so it does not define a
+ * deterministic per-flow EMA either -- the online learning is stochastic by
+ * construction on both sides. Thread scope is the closest stable analogue
+ * available at this layer, where there is no CompContext to attach to.
+ *
+ * Two consequences of the wider scope, neither load-bearing today:
+ *   - the buffer count is unbounded (one per training thread) where
+ *     upstream's is capped at 9;
+ *   - each is cudaMalloc'd on first use and never freed, not on thread exit
+ *     and not at shutdown, so thread churn would leak 54 KB a time. Train()
+ *     is reached only from the runtime's fixed worker pool
+ *     (compressor_runtime.cc:1208, :1685), which bounds this in practice.
+ *
+ * neuropress_flow_parity.cu measures the split against upstream's own
+ * runNNSGDCtx, but it pins flow i to context i and thread i for the whole
+ * run -- it validates this mechanism under a fixed mapping and cannot see a
+ * bucketing-policy difference.
  *
  * Registered globally so a model reload can zero every live buffer, matching
  * upstream's resetAllSGDEMABuffers() on reload.

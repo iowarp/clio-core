@@ -125,5 +125,12 @@ clio_add_neuropress_parity_test(neuropress_flow_parity_exec
 find_package(Threads REQUIRED)
 target_link_libraries(neuropress_flow_parity_exec Threads::Threads)
 
+# Tie-breaking / candidate enumeration order. Reads the ranking kernel's
+# per-config costs to find real ties, then checks both sides resolve them
+# the same way.
+clio_add_neuropress_parity_test(neuropress_tiebreak_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_tiebreak_parity.cu
+    ctp_neuropress_tiebreak_parity)
+
 # The dataset harness sweeps 1 GiB in 4 MiB chunks on both sides.
 set_tests_properties(ctp_neuropress_dataset_parity PROPERTIES TIMEOUT 900)
