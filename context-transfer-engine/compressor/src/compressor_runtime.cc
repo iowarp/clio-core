@@ -199,7 +199,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 #elif CTP_ENABLE_GPU
   if (gpu_stream_ == nullptr) {
     gpu_stream_ = ctp::GpuApi::CreateStream();
-    ctp::CompressionFactory::SetGpuStream(gpu_stream_);
   }
 #endif
 
@@ -912,7 +911,6 @@ bool Runtime::InitCodecContext() {
   codec_buf_bytes_ = buf;
   // The factory's stream is only a default for codecs built outside this pool.
   gpu_stream_ = codec_slots_[0].stream;
-  ctp::CompressionFactory::SetGpuStream(gpu_stream_);
   // Batched decompression is opt-in while it is brought up; the synchronous
   // per-fault path stays the default.
   // ON by default. Batching is not an experiment any more: it is the only

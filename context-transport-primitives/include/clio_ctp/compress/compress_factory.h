@@ -282,21 +282,6 @@ class CompressionFactory {
     }
   }
 
-  /**
-   * Set the stream every GPU codec runs on.
-   *
-   * Called ONCE by the module that owns GPU compression, when that module is
-   * created -- not per operation. A GPU codec must never create its own
-   * stream: cudaStreamCreate blocks while a kernel is resident, and the
-   * kernels these codecs serve are the ones waiting on the very operation
-   * being set up, so creating a stream inside a page fault deadlocks the
-   * device against itself.
-   *
-   * The stream is owned by the caller and must outlive every compressor this
-   * factory hands out. A null stream (nothing ever set it) means the default
-   * stream, which always exists.
-   */
-  static void SetGpuStream(void *stream) { GpuStreamSlot() = stream; }
 
   /**
    * Override the stream for GPU codecs built on THIS thread only.
@@ -305,21 +290,17 @@ class CompressionFactory {
    * its own stream, or they serialize against each other and its per-operation
    * buffers buy nothing. The override is thread-local because a codec is
    * constructed and used within one operation on one thread; pass null to go
-   * back to the process-wide stream.
+   * back to the current context's default stream.
+   *
+   * This is the ONLY stream override. A process-wide one existed and has been
+   * deleted: it held a stream created inside the compressor's dedicated codec
+   * CUcontext, so any codec that adopted it while running in the primary
+   * context received a stream from a context it was not in. See compress.h.
    */
   static void SetGpuStreamForThread(void *stream) { GpuStreamTls() = stream; }
 
-  /** @return the thread's stream override if set, else the process-wide one,
-   *  else null (meaning the default stream). */
-  static void *GetGpuStream() {
-    void *tls = GpuStreamTls();
-    return tls != nullptr ? tls : GpuStreamSlot();
-  }
 
  private:
-  /** Storage for the process-wide GPU codec stream. Function-local static so
-   *  the header stays free of a definition. */
-  static void *&GpuStreamSlot() { return GpuCodecStreamProcess(); }
 
   /** Per-thread stream override; see SetGpuStreamForThread. */
   static void *&GpuStreamTls() { return GpuCodecStreamThread(); }
@@ -456,7 +437,7 @@ class CompressionFactory {
   // GPU compressors (nvcomp). Each helper is always defined so its registry row
   // is valid in every build; it returns nullptr when nvcomp is disabled (the
   // name/ids still resolve, but GetPreset yields nullptr). All are single-mode.
-  // GetGpuCodecStreamThreadOnly, NOT GetGpuStream. The process-wide fallback
+  // GetGpuCodecStreamThreadOnly is the only stream source. The process-wide
   // is codec_slots_[0].stream, created inside the compressor's dedicated codec
   // CUcontext. Handing it to nvcomp while running in the PRIMARY context (which
   // is where CompressIntoShm runs) makes nvcomp's own internal cudaEventRecord

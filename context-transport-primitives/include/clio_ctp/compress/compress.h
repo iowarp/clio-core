@@ -41,50 +41,32 @@
 namespace ctp {
 
 /**
- * Stream override storage for GPU codecs.
+ * Stream override for GPU codecs, per thread.
  *
- * It lives HERE, in the base header, and not in CompressionFactory, because a
- * GPU codec header cannot include the factory -- the factory includes every
- * codec header, so that direction is a cycle. CompressionFactory delegates to
- * these so there is exactly one copy of the storage.
+ * A codec must NEVER create its own stream: cudaStreamCreate has deadlocked
+ * this runtime against a resident consumer kernel, and it is pure overhead on
+ * a path that already has a stream. The caller installs one here immediately
+ * before the call, inside the guard for the CUDA context that stream belongs
+ * to; a codec with no override runs on the current context's default stream,
+ * which is always valid.
  *
- * A codec must prefer this stream over creating its own. Per-call
- * cudaStreamCreate is not merely slow: it has deadlocked this runtime against
- * a resident spinning kernel, and on the device-to-device page-fault path the
- * compressor runtime has already provided a pooled slot stream.
+ * There was also a PROCESS-WIDE override. It is deleted, not deprecated. It
+ * held codec_slots_[0].stream -- created inside the compressor's dedicated
+ * codec CUcontext -- so any codec that picked it up while running in the
+ * primary context got a stream from a context it was not in. That produced two
+ * separate bugs before it was understood: cuszp silently compressed ZEROS (its
+ * H2D never landed, giving a compression ratio identical at every error
+ * bound), and nvcomp's internal cudaEventRecord failed 1016 times in one short
+ * run and escalated to an illegal memory access that aborted the process. By
+ * the end nothing read it and two places still wrote it, so it was a pure
+ * footgun.
  */
-inline void *&GpuCodecStreamProcess() {
-  static void *stream = nullptr;
-  return stream;
-}
 inline void *&GpuCodecStreamThread() {
   static thread_local void *stream = nullptr;
   return stream;
 }
-/** @return the thread's stream override, else the process-wide one, else null
- *  (meaning the default stream). */
-inline void *GetGpuCodecStream() {
-  void *tls = GpuCodecStreamThread();
-  return tls != nullptr ? tls : GpuCodecStreamProcess();
-}
 
-/**
- * The thread override ONLY -- never the process-wide default.
- *
- * A codec may adopt the thread override safely: the runtime sets it
- * immediately before the call and inside the same CUDA context the stream was
- * created in. The PROCESS-WIDE stream is not safe to adopt, because it is
- * codec_slots_[0].stream, created inside the compressor's dedicated codec
- * CUcontext. Using it from a caller running in the primary context (which is
- * where CompressIntoShm runs) silently breaks the transfers issued on it: the
- * H2D of the input never lands, the codec compresses ZEROS, and the result is
- * a compression ratio that is IDENTICAL for every error bound -- 120.471x at
- * both eb 1e-2 and 1e-3, which is how this was caught, since no lossy codec's
- * ratio can be invariant to a 10x change in bound.
- *
- * A codec with no thread override must create its own stream in whatever
- * context it was called from.
- */
+/** @return the thread's stream override, or null for the default stream. */
 inline void *GetGpuCodecStreamThreadOnly() { return GpuCodecStreamThread(); }
 
 /**
