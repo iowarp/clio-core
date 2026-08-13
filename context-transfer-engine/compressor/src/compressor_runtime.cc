@@ -539,7 +539,8 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
-    bool* out_ranked_by_cost) {
+    bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
+    double* out_second_deriv) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
 
@@ -600,6 +601,13 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       num_elements > 0 &&
       ctp::ComputeCompressionFeatures(chunk, num_elements, data_type, &entropy,
                                       &mad, &second_derivative_mean);
+  if (features_ok) {
+    // Report the statistics the ranking below is about to use, so a caller
+    // can record what a selection was actually based on.
+    if (out_entropy) *out_entropy = entropy;
+    if (out_mad) *out_mad = mad;
+    if (out_second_deriv) *out_second_deriv = second_derivative_mean;
+  }
   if (!features_ok) {
     // Device-resident chunk whose on-device stats could not be computed.
     // Ranking on the zeros left behind would hand NeuroPress a chunk that
@@ -998,6 +1006,14 @@ struct SelectionLog {
  * no upside. Nothing here needs releasing at exit -- the process is going
  * away and the stream is flushed on every row.
  */
+bool SelectionLogEnabled() {
+  static const bool on = [] {
+    const char *p = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+    return p && *p;
+  }();
+  return on;
+}
+
 SelectionLog *SelectionLogInstance() {
   static SelectionLog *log = [] {
     auto *l = new SelectionLog();
@@ -1009,7 +1025,7 @@ SelectionLog *SelectionLogInstance() {
                      "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
                      "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
                      "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
-                     "actual_ct_ms,actual_psnr\n");
+                     "actual_ct_ms,actual_psnr,checksum\n");
       }
     }
     return l;
@@ -1022,7 +1038,8 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             int wire_lib, int packed_preset,
                             const CompressionStats *predicted,
                             double actual_ratio, double actual_ct_ms,
-                            double actual_psnr) {
+                            double actual_psnr,
+                            unsigned long long checksum) {
   SelectionLog *log = SelectionLogInstance();
   if (!log->fp) return;
 
@@ -1057,7 +1074,7 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 
   std::fprintf(fp,
                "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
-               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu\n",
                log->seq++, blob_name.c_str(), chunk_size, entropy, mad,
                second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
                shuffle, preset,
@@ -1065,7 +1082,7 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                predicted ? predicted->compress_time_ms_ : 0.0,
                predicted ? predicted->decompress_time_ms_ : 0.0,
                predicted ? predicted->psnr_db_ : 0.0,
-               actual_ratio, actual_ct_ms, actual_psnr);
+               actual_ratio, actual_ct_ms, actual_psnr, checksum);
   std::fflush(fp);
 }
 
@@ -1099,10 +1116,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       CLIO_CO_RETURN;
     }
 
-    // Get compression stats
+    // Get compression stats. The three statistics are captured here rather
+    // than from the SGD snapshot further down, which is only taken when
+    // online learning is on -- these are what the selection actually ranked
+    // on, in every mode.
     bool ranked_by_cost = false;
+    double sel_entropy = 0.0, sel_mad = 0.0, sel_second_deriv = 0.0;
     auto stats =
-        EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost);
+        EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
+                            &sel_entropy, &sel_mad, &sel_second_deriv);
 
     if (stats.empty()) {
       // No valid compression available, disable compression
@@ -1222,12 +1244,34 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           break;
         }
       }
-      LogNeuroPressSelection(task->blob_name_.str(), chunk_size,
-                             neuropress_entropy, neuropress_mad,
-                             neuropress_second_deriv, best_lib, best_preset,
+      // FNV-1a over the chunk this selection was made for, so a comparison
+      // against another implementation can prove the two saw the same bytes
+      // rather than assume it. A device-resident chunk is staged to host
+      // first: that copy is pure diagnostic cost, but it only happens when
+      // the log is switched on, and without it the interesting case -- a
+      // GPU-resident write, which is the whole point of this path -- is
+      // exactly the one that goes unverified.
+      unsigned long long checksum = 0;
+      if (SelectionLogEnabled() && chunk_data && chunk_size > 0) {
+        std::vector<char> staged;
+        const unsigned char *p =
+            static_cast<const unsigned char *>(chunk_data);
+        if (ctp::IsDevicePointer(chunk_data)) {
+          staged.resize(chunk_size);
+          ctp::DeviceAwareMemcpy(staged.data(), chunk_data, chunk_size);
+          p = reinterpret_cast<const unsigned char *>(staged.data());
+        }
+        checksum = 1469598103934665603ull;
+        for (size_t k = 0; k < chunk_size; ++k) {
+          checksum ^= p[k];
+          checksum *= 1099511628211ull;
+        }
+      }
+      LogNeuroPressSelection(task->blob_name_.str(), chunk_size, sel_entropy,
+                             sel_mad, sel_second_deriv, best_lib, best_preset,
                              logged_pred, context.actual_compression_ratio_,
                              context.actual_compress_time_ms_,
-                             context.actual_psnr_db_);
+                             context.actual_psnr_db_, checksum);
     }
 
     // Cycle 4f/4g: NeuroPress's own online-learning loop

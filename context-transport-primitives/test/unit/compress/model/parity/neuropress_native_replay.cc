@@ -191,10 +191,14 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "cannot open %s for writing\n", out_csv);
     return 1;
   }
+  // `checksum` makes the shared-input claim measurable instead of assumed:
+  // both sides hash the chunk they actually compressed, so a comparison can
+  // prove the two consumed the same bytes rather than trusting that the
+  // dump and the write path saw the same buffer.
   std::fprintf(of,
                "seq,chunk,action,algo_idx,quantize,shuffle,entropy,mad,"
                "second_deriv,compressed_size,ratio,pred_ratio,pred_ct_ms,"
-               "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired\n");
+               "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum\n");
 
   std::vector<char> in(kChunkBytes);
   const size_t max_out = gpucompress_max_compressed_size(kChunkBytes);
@@ -245,6 +249,23 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    // gpucompress_compress_gpu() leaves entropy/mad/second_derivative zeroed
+    // in gpucompress_stats_t, so ask for them explicitly. They are pure
+    // properties of the data, independent of the configuration chosen, which
+    // is exactly what makes them comparable against Clio's.
+    double n_entropy = 0.0, n_mad = 0.0, n_deriv = 0.0;
+    if (gpucompress_compute_stats_gpu(d_in, kChunkBytes, &n_entropy, &n_mad,
+                                      &n_deriv) != GPUCOMPRESS_SUCCESS) {
+      n_entropy = n_mad = n_deriv = 0.0;
+    }
+
+    // FNV-1a over the chunk actually fed to the compressor.
+    unsigned long long checksum = 1469598103934665603ull;
+    for (size_t k = 0; k < kChunkBytes; ++k) {
+      checksum ^= static_cast<unsigned char>(in[k]);
+      checksum *= 1099511628211ull;
+    }
+
     // nn_final_action is the action actually used; with exploration off it
     // equals nn_original_action. Decode it the way decodeAction does.
     const int action = st.nn_final_action;
@@ -254,13 +275,13 @@ int main(int argc, char **argv) {
 
     std::fprintf(of,
                  "%ld,%ld,%d,%d,%d,%d,%.10g,%.10g,%.10g,%zu,%.10g,%.10g,"
-                 "%.10g,%.10g,%.10g,%.10g,%d\n",
+                 "%.10g,%.10g,%.10g,%.10g,%d,%llu\n",
                  r.seq, r.chunk, action, algo_idx, quantize, shuffle,
-                 st.entropy_bits, st.mad, st.second_derivative,
+                 n_entropy, n_mad, n_deriv,
                  st.compressed_size, st.compression_ratio,
                  st.predicted_ratio, st.predicted_comp_time_ms,
                  st.predicted_decomp_time_ms, st.predicted_psnr_db,
-                 st.actual_comp_time_ms, st.sgd_fired);
+                 st.actual_comp_time_ms, st.sgd_fired, checksum);
     ++done;
   }
   std::fclose(of);

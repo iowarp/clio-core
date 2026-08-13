@@ -394,9 +394,15 @@ private:
    *   discard the cost ordering, which is the whole point of it).
    * @return Vector of compression statistics for candidate libraries
    */
+  // out_entropy/out_mad/out_second_deriv report the data statistics this
+  // call actually ranked on. They are computed here regardless of whether
+  // online learning is on -- the separate snapshot in DynamicSchedule is
+  // taken only for SGD -- so this is the one place a caller can observe the
+  // statistics behind a selection in an inference-only run.
   std::vector<CompressionStats> EstCompressionStats(
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
-      bool* out_ranked_by_cost = nullptr);
+      bool* out_ranked_by_cost = nullptr, double* out_entropy = nullptr,
+      double* out_mad = nullptr, double* out_second_deriv = nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier
