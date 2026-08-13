@@ -1032,7 +1032,9 @@ PayloadLog *PayloadLogInstance() {
       std::string p = std::string(path) + ".payload";
       l->fp = std::fopen(p.c_str(), "w");
       if (l->fp) {
-        std::fprintf(l->fp, "blob,compressed_size,payload_hash,beneficial\n");
+        std::fprintf(l->fp,
+                     "blob,compressed_size,payload_hash,beneficial,"
+                     "compress_kernel_ms\n");
       }
     }
     return l;
@@ -1041,8 +1043,8 @@ PayloadLog *PayloadLogInstance() {
 }
 
 void LogCompressedPayload(const std::string &blob_name, const char *payload,
-                          size_t payload_size, bool on_device,
-                          bool beneficial) {
+                          size_t payload_size, bool on_device, bool beneficial,
+                          double compress_kernel_ms) {
   PayloadLog *log = PayloadLogInstance();
   if (!log->fp || !payload || payload_size == 0) return;
 
@@ -1059,8 +1061,8 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
     h *= 1099511628211ull;
   }
   std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(log->fp, "%s,%zu,%llu,%d\n", blob_name.c_str(), payload_size, h,
-               beneficial ? 1 : 0);
+  std::fprintf(log->fp, "%s,%zu,%llu,%d,%.10g\n", blob_name.c_str(),
+               payload_size, h, beneficial ? 1 : 0, compress_kernel_ms);
   std::fflush(log->fp);
 
   // Diagnostic: dump one chunk's raw payload so it can be diffed against
@@ -2312,6 +2314,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     double compress_time =
         std::chrono::duration<double, std::milli>(compress_end - compress_start)
             .count();
+    // Device time for the codec launch alone, when CLIO_CODEC_KERNEL_TIMING
+    // is on. compress_time above is host wall clock around the whole
+    // Compress() call and also covers staging, allocation and the output
+    // copy, so it is not comparable with another implementation's kernel
+    // time; this is.
+    const double compress_kernel_ms = ctp::LastCodecKernelMs();
 
     // Check if compression succeeded and is beneficial (include header size
     // in the total stored size)
@@ -2320,7 +2328,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     if (success && SelectionLogEnabled()) {
       LogCompressedPayload(task->blob_name_.str(), compress_dst,
                            compressed_size, output_on_device,
-                           total_stored_size < input_size);
+                           total_stored_size < input_size,
+                           compress_kernel_ms);
     }
 
     if (success && total_stored_size < input_size) {
@@ -2772,12 +2781,12 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           static std::atomic<long> calls{0};
           std::fprintf(stderr,
                        "[clio-decompress] call #%ld blob=%s lib=%s "
-                       "compressed=%zu -> %zu ok=%d\n",
+                       "compressed=%zu -> %zu ok=%d kernel_ms=%.6f\n",
                        calls.fetch_add(1) + 1, task->blob_name_.str().c_str(),
                        library_name.c_str(),
                        static_cast<size_t>(compressed_size),
                        static_cast<size_t>(decompressed_size),
-                       success ? 1 : 0);
+                       success ? 1 : 0, ctp::LastCodecKernelMs());
           std::fflush(stderr);
         }
       }

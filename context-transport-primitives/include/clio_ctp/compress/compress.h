@@ -56,6 +56,27 @@ class Compressor {
                           size_t input_size) = 0;
 };
 
+/**
+ * @brief Time of the last codec kernel, in ms, or < 0 if not measured.
+ *
+ * Set by the GPU-backed compressors (see nvcomp.h) using CUDA events placed
+ * immediately around the codec launch and nothing else. A caller that times
+ * Compress()/Decompress() from the host is measuring staging copies, a
+ * possible cudaMalloc, configure_compression, the stream sync and the output
+ * copy along with the kernel -- fine for accounting wall time, useless for
+ * comparing against another implementation's kernel time. NeuroPress
+ * brackets exactly its `compressor->compress(...)` call
+ * (gpucompress_compress.cpp:530-551), so this brackets exactly the
+ * equivalent one and the two numbers mean the same thing.
+ *
+ * Thread-local: each worker times its own call, and the value is only valid
+ * immediately after that call returns on the same thread.
+ */
+inline double &LastCodecKernelMs() {
+  static thread_local double ms = -1.0;
+  return ms;
+}
+
 }  // namespace ctp
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_COMPRESS_H_

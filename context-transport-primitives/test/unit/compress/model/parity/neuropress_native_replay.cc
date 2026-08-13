@@ -43,6 +43,16 @@
 
 #include <cuda_runtime.h>
 
+// Measured directly against nvcomp rather than through
+// gpucompress_decompress_gpu. That API call also does
+// createDecompressionManager, configure_decompression and a cudaMalloc
+// before it launches anything (gpucompress_compress.cpp:1234-1246), so
+// bracketing it measures setup, not the codec -- which is why an earlier
+// attempt showed a 270 ms outlier and made native look four times slower
+// than Clio. Clio brackets exactly its mgr->decompress() call, so this
+// brackets exactly the same nvcomp call on the same bitstream.
+#include <nvcomp/nvcompManagerFactory.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -229,7 +239,7 @@ int main(int argc, char **argv) {
                "second_deriv,compressed_size,ratio,pred_ratio,pred_ct_ms,"
                "pred_dt_ms,pred_psnr,actual_ct_ms,sgd_fired,checksum,"
                "payload_hash,payload_size,mse,mean,variance,kurtosis,"
-               "restored_hash,bytes_differ,clio_decode_differ\n");
+               "restored_hash,bytes_differ,clio_decode_differ,decomp_kernel_ms\n");
 
   std::vector<char> in(kChunkBytes);
   const size_t max_out = gpucompress_max_compressed_size(kChunkBytes);
@@ -346,11 +356,45 @@ int main(int argc, char **argv) {
     // than asserting losslessness from the configuration.
     double mse = -1.0, mean = 0.0, variance = 0.0, kurtosis = 0.0;
     unsigned long long restored_hash = 0;
+    float decomp_kernel_ms = -1.0f;
     size_t bytes_differ = kChunkBytes;  // until proven otherwise
     {
       size_t dec_size = kChunkBytes;
-      if (gpucompress_decompress_gpu(d_out, out_size, d_dec, &dec_size,
-                                     nullptr) == GPUCOMPRESS_SUCCESS &&
+      // CUDA-event bracket around the decompress call, the same shape
+      // NeuroPress uses for its own compress timing
+      // (gpucompress_compress.cpp:530-551) and the same shape Clio's
+      // KernelTimer uses, so the two decompress numbers mean the same thing.
+      cudaEvent_t dstart = nullptr, dstop = nullptr;
+      cudaEventCreate(&dstart);
+      cudaEventCreate(&dstop);
+      // Kernel-only decompress timing, on the payload past the 64-byte
+      // header, with the manager built OUTSIDE the bracket.
+      {
+        uint8_t *pl = static_cast<uint8_t *>(d_out) + kNativeHeaderBytes;
+        try {
+          auto mgr = nvcomp::create_manager(pl, nullptr);
+          if (mgr) {
+            auto dcfg = mgr->configure_decompression(pl);
+            void *scratch = nullptr;
+            if (cudaMalloc(&scratch, dcfg.decomp_data_size) == cudaSuccess) {
+              cudaEventRecord(dstart, nullptr);
+              mgr->decompress(static_cast<uint8_t *>(scratch), pl, dcfg);
+              cudaEventRecord(dstop, nullptr);
+              cudaEventSynchronize(dstop);
+              cudaEventElapsedTime(&decomp_kernel_ms, dstart, dstop);
+              cudaFree(scratch);
+            }
+          }
+        } catch (...) {
+          decomp_kernel_ms = -1.0f;
+        }
+      }
+      const gpucompress_error_t drc =
+          gpucompress_decompress_gpu(d_out, out_size, d_dec, &dec_size,
+                                     nullptr);
+      cudaEventDestroy(dstart);
+      cudaEventDestroy(dstop);
+      if (drc == GPUCOMPRESS_SUCCESS &&
           dec_size == kChunkBytes) {
         std::vector<char> dec(kChunkBytes);
         if (cudaMemcpy(dec.data(), d_dec, kChunkBytes,
@@ -448,7 +492,7 @@ int main(int argc, char **argv) {
     std::fprintf(of,
                  "%ld,%ld,%d,%d,%d,%d,%.10g,%.10g,%.10g,%zu,%.10g,%.10g,"
                  "%.10g,%.10g,%.10g,%.10g,%d,%llu,%llu,%zu,%.10g,%.10g,"
-                 "%.10g,%.10g,%llu,%zu,%ld\n",
+                 "%.10g,%.10g,%llu,%zu,%ld,%.10g\n",
                  r.seq, r.chunk, action, algo_idx, quantize, shuffle,
                  n_entropy, n_mad, n_deriv,
                  st.compressed_size, st.compression_ratio,
@@ -456,7 +500,8 @@ int main(int argc, char **argv) {
                  st.predicted_decomp_time_ms, st.predicted_psnr_db,
                  st.actual_comp_time_ms, st.sgd_fired, checksum,
                  payload_hash, payload_size, mse, mean, variance, kurtosis,
-                 restored_hash, bytes_differ, clio_decode_differ);
+                 restored_hash, bytes_differ, clio_decode_differ,
+                 static_cast<double>(decomp_kernel_ms));
     ++done;
   }
   std::fclose(of);

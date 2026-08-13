@@ -44,6 +44,8 @@
 #include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
+
+#include <cstdlib>
 #include <nvcomp/snappy.hpp>
 #include <nvcomp/zstd.hpp>
 
@@ -115,6 +117,59 @@ class NvComp : public Compressor {
     c.misses = 0;
   }
 
+
+  /**
+   * CUDA-event bracket around a codec launch, and nothing else.
+   *
+   * Enabled only when CLIO_CODEC_KERNEL_TIMING is set: creating and
+   * recording two events per call is real overhead, and the number is only
+   * wanted when something is being compared. Records on the SAME stream the
+   * codec runs on, so the interval covers device work rather than host
+   * launch latency. NeuroPress times its equivalent call the same way
+   * (gpucompress_compress.cpp:530-551).
+   */
+  struct KernelTimer {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t start = nullptr, stop = nullptr;
+    bool on = false;
+
+    static bool Enabled() {
+      static const bool e = [] {
+        const char *v = std::getenv("CLIO_CODEC_KERNEL_TIMING");
+        return v && *v;
+      }();
+      return e;
+    }
+
+    explicit KernelTimer(cudaStream_t s) : stream(s) {
+      LastCodecKernelMs() = -1.0;
+      if (!Enabled() || !s) return;
+      if (cudaEventCreate(&start) != cudaSuccess) return;
+      if (cudaEventCreate(&stop) != cudaSuccess) {
+        cudaEventDestroy(start);
+        start = nullptr;
+        return;
+      }
+      on = (cudaEventRecord(start, stream) == cudaSuccess);
+    }
+
+    /** Call after the launch; the elapsed time lands in LastCodecKernelMs(). */
+    void Stop() {
+      if (!on) return;
+      if (cudaEventRecord(stop, stream) != cudaSuccess) return;
+      if (cudaEventSynchronize(stop) != cudaSuccess) return;
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, start, stop) == cudaSuccess) {
+        LastCodecKernelMs() = static_cast<double>(ms);
+      }
+    }
+
+    ~KernelTimer() {
+      if (start) cudaEventDestroy(start);
+      if (stop) cudaEventDestroy(stop);
+    }
+  };
+
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
     // Persistent per-thread stream and cached manager. Both used to be built
@@ -165,7 +220,9 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        KernelTimer timer(stream);
         mgr->compress(d_in, d_out, cfg);
+        timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
         size_t comp_size = mgr->get_compressed_output_size(d_out);
         if (comp_size > output_size) break;  // caller buffer too small
@@ -229,7 +286,9 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        KernelTimer timer(stream);
         mgr->decompress(d_out, d_in, cfg);
+        timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
 
         if (d_out != static_cast<uint8_t *>(output)) {
