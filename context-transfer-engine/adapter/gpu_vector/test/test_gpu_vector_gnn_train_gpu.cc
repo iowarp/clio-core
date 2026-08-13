@@ -670,10 +670,47 @@ __global__ void GradW2ReduceKernel(const double *part, const double *partb,
 /** Deterministic loss reduction: one thread sums the window's per-node losses in
  *  order and adds to the global loss (windows serialize on the stream -> the total
  *  is order-deterministic -> bit-identical across the in-core and streamed runs). */
-__global__ void LossReduceKernel(const double *loss_buf, clio::run::u64 nn, double *d_loss) {
+/** Blocks for the loss reduction. */
+constexpr int kLossBlocks = 256;
+
+/**
+ * Per-block partial sums of the per-node loss.
+ *
+ * This replaces a <<<1,1>>> kernel that summed all nn doubles on a SINGLE
+ * THREAD -- a dependent chain of 524288 global loads with nothing to hide the
+ * latency behind. It sat inside the forward phase timer, which is why forward
+ * appeared immovable at ~0.41s no matter what was done to TrainNodeKernel:
+ * bisecting the training kernel in isolation showed it costs 11.0 ms/window
+ * against the 51 ms/window the phase was reporting, and this is the other 40.
+ *
+ * Deterministic: each thread sums a contiguous ascending range, the block
+ * folds those with a fixed-shape tree, and LossFinalKernel folds the blocks in
+ * index order. No atomics.
+ */
+__global__ void LossPartialKernel(const double *loss_buf, clio::run::u64 nn,
+                                  double *part) {
+  __shared__ double sm[256];
+  const clio::run::u64 nthreads = (clio::run::u64)gridDim.x * blockDim.x;
+  const clio::run::u64 chunk = (nn + nthreads - 1) / nthreads;
+  const clio::run::u64 idx = blockIdx.x * (clio::run::u64)blockDim.x + threadIdx.x;
+  const clio::run::u64 lo = idx * chunk;
+  const clio::run::u64 hi = min(lo + chunk, nn);
+  double s = 0.0;
+  for (clio::run::u64 n = lo; n < hi; ++n) s += loss_buf[n];
+  sm[threadIdx.x] = s;
+  __syncthreads();
+  for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+    if ((int)threadIdx.x < st) sm[threadIdx.x] += sm[threadIdx.x + st];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) part[blockIdx.x] = sm[0];
+}
+
+/** Fold the per-block partials in index order. */
+__global__ void LossFinalKernel(const double *part, int nblocks, double *d_loss) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   double s = 0.0;
-  for (clio::run::u64 n = 0; n < nn; ++n) s += loss_buf[n];
+  for (int i = 0; i < nblocks; ++i) s += part[i];
   d_loss[0] += s;
 }
 
@@ -822,6 +859,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   // Per-split partials for the dW1 reduction (kGradSplits ways).
   double *gw1_part = nullptr, *gb1_part = nullptr;
   double *gw2_part = nullptr, *gb2_part = nullptr;
+  double *loss_part = nullptr;
 
   float *h1_buf, *dz1_buf, *dz2_buf, *d_scratch;
   REQUIRE(cudaMalloc(&dW1, H * F * sizeof(float)) == cudaSuccess);
@@ -837,6 +875,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
                      (size_t)kGradSplits * C * H * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gb2_part,
                      (size_t)kGradSplits * C * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&loss_part, kLossBlocks * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gb1, H * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gW2, C * H * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gb2, C * sizeof(double)) == cudaSuccess);
@@ -927,7 +966,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
           REQUIRE(le == cudaSuccess);
         }
       }
-      LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
+      LossPartialKernel<<<kLossBlocks, 256>>>(loss_buf, nn, loss_part);
+      LossFinalKernel<<<1, 1>>>(loss_part, kLossBlocks, d_loss);
       if (ktime) { ctp::GpuApi::Synchronize(); t_fwd += NowSec() - tp0; tp0 = NowSec(); }
       track_peak();
       GradW1Kernel<<<dim3((F + 15) / 16, (H + 15) / 16, kGradSplits), 256>>>(
