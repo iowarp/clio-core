@@ -120,6 +120,11 @@ void EnsureInit() {
   std::string cfg = "/tmp/gpu_vec_gnn_train_" + std::to_string(port) + ".yaml";
   int hbm_mib = std::getenv("CLIO_GNN_HBM_MIB") ? std::atoi(std::getenv("CLIO_GNN_HBM_MIB")) : 2048;
   int dram_mib = std::getenv("CLIO_GNN_DRAM_MIB") ? std::atoi(std::getenv("CLIO_GNN_DRAM_MIB")) : 20480;
+  int nvme_mib = std::getenv("CLIO_GNN_NVME_MIB") ? std::atoi(std::getenv("CLIO_GNN_NVME_MIB")) : 0;
+  std::string nvme_path = std::getenv("CLIO_GNN_NVME_PATH")
+                              ? std::getenv("CLIO_GNN_NVME_PATH")
+                              : std::string("/tmp/gnn_nvme_tier_") +
+                                    std::to_string(port) + ".dat";
   {
     std::ofstream f(cfg);
     f << "networking:\n  port: " << port << "\n\n"
@@ -143,7 +148,19 @@ void EnsureInit() {
       << "      - path: \"hbm::cte_hbm_tier\"\n        bdev_type: \"hbm\"\n        capacity_limit: \""
       << hbm_mib << "MB\"\n        score: 0.0\n"
       << "      - path: \"ram::cte_dram_tier\"\n        bdev_type: \"ram\"\n        capacity_limit: \""
-      << dram_mib << "MB\"\n        score: 1.0\n"
+      << dram_mib << "MB\"\n        score: 0.5\n";
+    // OPTIONAL NVMe TIER, identical in both the raw and the compressed run.
+    // Without it, overflow lands in host DRAM, and on this machine that is
+    // FREE: spilling 3 GiB of a 4 GiB matrix cost 4.4% (12.25s resident vs
+    // 12.79s at 75% spilled), because the fetch hides behind the gather. A
+    // compressed run cannot beat a free spill -- it pays real decode work to
+    // avoid a cost that is not there. Compression only pays when the overflow
+    // goes somewhere genuinely slower, which is also the realistic case.
+    if (nvme_mib > 0) {
+      f << "      - path: \"" << nvme_path << "\"\n        bdev_type: \"file\"\n"
+        << "        capacity_limit: \"" << nvme_mib << "MB\"\n        score: 1.0\n";
+    }
+    f
       << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
@@ -203,17 +220,40 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YBEGIN();
   for (; i < n; i += run) {
     CLIO_YCALL(v.HoldPageYield(lo + i, n - i, &run));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // READ-ONLY ACCESS. at() does not dirty the page; operator[] does, and
-      // dirtying a page the workload only ever READS breaks three things at
-      // once. ClaimSlot refuses a dirty victim (it drops victims rather than
-      // writing them back, so taking a dirty one would lose writes), so once
-      // every cached page is dirty there is no clean victim, the run-fetch
-      // BeginFetchRunLocked cannot claim slots, and every fault degrades to a
-      // SINGLE page -- measured batch n=1 with 4608 round trips at ~7ms each.
-      // It also forced 1791 writebacks on a workload that never writes, each
-      // of which is a compress and a store on the compressed path.
-      scratch[i + k] = v.at(lo + i + k);
+    // BULK COPY off the page pointer, not element-by-element.
+    //
+    // at() re-derives the page base and the in-page index on EVERY element.
+    // The page is already resolved and pinned by the HoldPageYield above, so
+    // TryHoldRawConst hands back the base directly (read-only, so it does not
+    // dirty the page the way HoldRaw would) and the run becomes a flat memcpy.
+    // Copying 4 floats per thread lets the compiler emit 128-bit loads and
+    // stores, which is what turns this from pointer-chasing into bandwidth.
+    {
+      clio::run::u64 probe = 0;
+      const float *src = v.TryHoldRawConst(lo + i, n - i, &probe);
+      if (src != nullptr && probe >= run) {
+        float *dst = scratch + i;
+        const clio::run::u64 quads = run >> 2;
+        for (clio::run::u64 q = threadIdx.x; q < quads; q += blockDim.x) {
+          float4 val;
+          val.x = src[q * 4 + 0];
+          val.y = src[q * 4 + 1];
+          val.z = src[q * 4 + 2];
+          val.w = src[q * 4 + 3];
+          reinterpret_cast<float4 *>(dst)[q] = val;
+        }
+        for (clio::run::u64 k = (quads << 2) + threadIdx.x; k < run;
+             k += blockDim.x) {
+          dst[k] = src[k];
+        }
+      } else {
+        // Miss on the probe: fall back to the scalar accessor. at() is
+        // read-only; operator[] would mark the page dirty, which blocks the
+        // run-fetch from claiming slots and forces single-page paging.
+        for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+          scratch[i + k] = v.at(lo + i + k);
+        }
+      }
     }
   }
   CLIO_YEND();
