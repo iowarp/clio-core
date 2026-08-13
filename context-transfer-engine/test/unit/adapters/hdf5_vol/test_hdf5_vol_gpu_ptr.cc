@@ -242,4 +242,95 @@ TEST_CASE("HDF5 VOL IO - Partial (hyperslab) write survives a real GPU "
   REQUIRE(H5Pclose(fapl) >= 0);
 }
 
+/**
+ * Hyperslab READ into a device pointer, served from the live write cache.
+ *
+ * The two cases above cover whole read/write and hyperslab WRITE. The read
+ * counterpart is a different code path and was never exercised: a partial
+ * file-space selection with mem_space_id == H5S_ALL routes to
+ * clio_serve_selection(), which gathers with H5Dgather and then places the
+ * result with a raw `std::memcpy(buf, ...)` (clio_vol.cc:2232). Every sibling
+ * that writes to a user destination uses ctp::DeviceAwareMemcpy (:2055, :2102,
+ * :2288, :2509); that one line does not, and nothing between the entry point
+ * and it checks whether `buf` is device memory.
+ *
+ * H5Dflush rather than H5Dclose is deliberate and load-bearing: it keeps the
+ * write cache live so the read is served from it. After a close/reopen the
+ * coherence check drops the tag and the read comes from the uncompressed HDF5
+ * copy instead, which never reaches this path at all.
+ */
+TEST_CASE("HDF5 VOL IO - Partial (hyperslab) read survives a real GPU "
+          "device pointer",
+          "[hdf5_vol][io][gpu][partial]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    return;
+  }
+
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string kReadH5File = "/tmp/clio_vol_gpu_ptr_partial_read_test.h5";
+  std::remove(kReadH5File.c_str());
+
+  hid_t file = H5Fcreate(kReadH5File.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+
+  hsize_t dims[1] = {kNumElems};
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  REQUIRE(space >= 0);
+
+  hid_t dset = H5Dcreate2(file, "data_partial_read", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  std::vector<int> wbuf(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) {
+    wbuf[i] = static_cast<int>(i * 7 + 5);
+  }
+  int *d_wbuf = nullptr;
+  REQUIRE(cudaMalloc(&d_wbuf, kNumElems * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_wbuf, wbuf.data(), kNumElems * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   d_wbuf) >= 0);
+
+  // Flush, do NOT close -- the cache must still hold the image.
+  REQUIRE(H5Dflush(dset) >= 0);
+
+  // THE ACTUAL CHECK: read only the second quarter through a file-space
+  // hyperslab, with mem_space_id = H5S_ALL, into device memory.
+  const size_t kQuarter = kNumElems / 4;
+  hsize_t r_start[1] = {kQuarter};
+  hsize_t r_count[1] = {kQuarter};
+  REQUIRE(H5Sselect_hyperslab(space, H5S_SELECT_SET, r_start, nullptr,
+                              r_count, nullptr) >= 0);
+
+  int *d_rbuf = nullptr;
+  REQUIRE(cudaMalloc(&d_rbuf, kQuarter * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_rbuf, 0, kQuarter * sizeof(int)) == cudaSuccess);
+
+  REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, space, H5P_DEFAULT,
+                  d_rbuf) >= 0);
+  REQUIRE(H5Sselect_all(space) >= 0);
+
+  std::vector<int> rbuf(kQuarter, 0);
+  REQUIRE(cudaMemcpy(rbuf.data(), d_rbuf, kQuarter * sizeof(int),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  bool match = true;
+  for (size_t i = 0; i < kQuarter; ++i) {
+    if (rbuf[i] != wbuf[kQuarter + i]) { match = false; break; }
+  }
+  REQUIRE(match);
+
+  cudaFree(d_wbuf);
+  cudaFree(d_rbuf);
+
+  REQUIRE(H5Dclose(dset) >= 0);
+  REQUIRE(H5Sclose(space) >= 0);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
 SIMPLE_TEST_MAIN()

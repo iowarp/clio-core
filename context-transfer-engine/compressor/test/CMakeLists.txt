@@ -135,6 +135,23 @@ add_test(NAME compressor_dynamic_schedule
 add_test(NAME compressor_dynamic_neuropress
     COMMAND test_compressor_functional "[neuropress][693]")
 
+# Exploration gets its own entry as well as being swept up by the tag filter
+# above: it is the only case that exercises the K-way search, the
+# winner-adoption path that RE-STORES a blob with a different codec's bytes,
+# and the Train() samples exploration produces. Worth failing under its own
+# name rather than inside a broader bucket.
+add_test(NAME compressor_exploration
+    COMMAND test_compressor_functional "[exploration]")
+
+# Residency invariance: the same bytes must select the same algorithm whether
+# they arrive in CPU shared memory or a registered device backend. The two
+# routes compute the three selection features with DIFFERENT code (host
+# DataStatisticsFactory vs the device stats kernels), and the parity suite
+# cannot catch a divergence between them because it feeds both sides the same
+# bytes rather than driving the two residencies.
+add_test(NAME compressor_residency_invariance
+    COMMAND test_compressor_functional "[residency]")
+
 add_test(NAME compressor_nvcomp_gpu_roundtrip
     COMMAND test_compressor_functional "[nvcomp][gpu]")
 

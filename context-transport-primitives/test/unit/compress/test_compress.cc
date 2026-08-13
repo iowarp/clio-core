@@ -574,14 +574,25 @@ TEST_CASE("TestCuszGpu") {
 
     REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
                        cudaMemcpyDeviceToHost) == cudaSuccess);
-    // Lossy within the BALANCED relative error bound (1e-3) on a [-100,100]
-    // signal -> generous absolute slack.
+    // Lossy within the BALANCED error bound, which is ABSOLUTE -- Cusz now
+    // defaults to psz_mode Abs, matching NeuroPress's unconditional
+    // `rc.mode = Abs` (external_compressors.cu:118).
+    //
+    // This assertion used to be `max_err < 1.0`, a thousand times looser than
+    // the nominal bound, with a comment explaining it as slack for RELATIVE
+    // mode on a [-100,100] signal. That is why it passed in either mode and
+    // never caught the divergence: it was written around the behaviour
+    // instead of against the specification. Asserting the bound the caller
+    // actually asked for is the whole point of an error-bounded codec.
+    constexpr double kBalancedEb = 1e-3;
     double max_err = 0.0;
     for (size_t i = 0; i < n; ++i) {
       max_err = std::max(max_err,
                          std::abs(static_cast<double>(orig[i] - deco[i])));
     }
-    REQUIRE(max_err < 1.0);
+    // A small multiple, not 1000x: cuSZ's quantiser reports its own bound
+    // per stream and can land marginally outside it at the extremes.
+    REQUIRE(max_err <= kBalancedEb * 2.0);
 
     cudaFree(d_in);
     cudaFree(d_comp);

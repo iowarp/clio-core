@@ -24,6 +24,7 @@
 #include "clio_vol.h"
 
 #include <hdf5.h>
+#include <cuda_runtime.h>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/bdev/bdev_client.h>
@@ -168,6 +169,88 @@ TEST_CASE("HDF5 VOL IO - H5Dwrite routes through the compressor and "
   REQUIRE(H5Dclose(dset2) >= 0);
   REQUIRE(H5Fclose(file2) >= 0);
   REQUIRE(H5Pclose(fapl2) >= 0);
+}
+
+/**
+ * Compressor-backed read INTO A DEVICE POINTER, served from the live cache.
+ *
+ * This is the pairing no test previously covered: the compressor-pool test
+ * above uses host buffers, and test_hdf5_vol_gpu_ptr.cc uses device pointers
+ * but configures no compressor pool. The decompress path's device branch --
+ * where the VOL allocates a device backend and hands it to the decompressor
+ * instead of CPU shared memory -- therefore had no coverage at all.
+ *
+ * H5Dflush rather than H5Dclose is load-bearing. After a close/reopen the
+ * coherence check finds no stamp blob, drops the tag and serves the read from
+ * the uncompressed HDF5 copy, so nothing decompresses and the device branch is
+ * never entered (that is the separately-recorded VOL-3 behaviour, and it is
+ * exactly what the reopen-based case above exercises). Flushing keeps the
+ * cache live so the read is actually served by the compressor.
+ */
+TEST_CASE("HDF5 VOL IO - compressor-backed read into a GPU device pointer",
+          "[hdf5_vol][io][compressor][gpu][693]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    return;
+  }
+
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeCompressedFapl(vol_id);
+
+  const std::string kDevH5File = "/tmp/clio_vol_compressor_devread_test.h5";
+  std::remove(kDevH5File.c_str());
+
+  hid_t file = H5Fcreate(kDevH5File.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+
+  hsize_t dims[1] = {kNumElems};
+  hid_t space = H5Screate_simple(1, dims, nullptr);
+  REQUIRE(space >= 0);
+
+  hid_t dset = H5Dcreate2(file, "data_devread", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  // Compressible, like the case above: a pattern the codec can actually work
+  // on, so the read is genuinely a decompression rather than a pass-through.
+  std::vector<int> wbuf(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) {
+    wbuf[i] = static_cast<int>((i / 64) * 11 + 5);
+  }
+  REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                   wbuf.data()) >= 0);
+
+  // Flush, do NOT close -- keep the cache live (see the comment above).
+  REQUIRE(H5Dflush(dset) >= 0);
+
+  // THE ACTUAL CHECK: read the compressor-backed dataset straight into device
+  // memory. Before the fix the VOL always allocated a host SHM destination for
+  // the decompressor and staged it back, so this exercised no device path; a
+  // wrong device destination shows up here as corrupted values rather than a
+  // crash, because DeviceAwareMemcpy still moves the (wrong) bytes.
+  int *d_rbuf = nullptr;
+  REQUIRE(cudaMalloc(&d_rbuf, kNumElems * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_rbuf, 0, kNumElems * sizeof(int)) == cudaSuccess);
+
+  REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  d_rbuf) >= 0);
+
+  std::vector<int> rbuf(kNumElems, -1);
+  REQUIRE(cudaMemcpy(rbuf.data(), d_rbuf, kNumElems * sizeof(int),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+
+  bool match = true;
+  for (size_t i = 0; i < kNumElems; ++i) {
+    if (rbuf[i] != wbuf[i]) { match = false; break; }
+  }
+  REQUIRE(match);
+
+  cudaFree(d_rbuf);
+
+  REQUIRE(H5Dclose(dset) >= 0);
+  REQUIRE(H5Sclose(space) >= 0);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
 }
 
 SIMPLE_TEST_MAIN()

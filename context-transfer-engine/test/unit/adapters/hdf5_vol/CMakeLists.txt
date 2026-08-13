@@ -188,10 +188,24 @@ if(NOT WIN32 AND CLIO_CORE_ENABLE_CUDA)
       ${CMAKE_THREAD_LIBS_INIT}
   )
 
+  # One ctest entry per case. The single filtered entry that used to live here
+  # ran only the whole-dataset case, so the hyperslab cases in the same source
+  # file were compiled and never executed -- which is how the hyperslab-read
+  # device-pointer crash (a raw memcpy into the caller's buffer at
+  # clio_vol.cc's clio_serve_selection) survived in a file written expressly
+  # to catch that bug class.
   add_test(NAME cte_hdf5_vol_gpu_ptr
       COMMAND test_hdf5_vol_gpu_ptr "Write/read survives a real GPU device pointer")
 
-  set_tests_properties(cte_hdf5_vol_gpu_ptr PROPERTIES
+  add_test(NAME cte_hdf5_vol_gpu_ptr_partial_write
+      COMMAND test_hdf5_vol_gpu_ptr "Partial (hyperslab) write survives a real GPU device pointer")
+
+  add_test(NAME cte_hdf5_vol_gpu_ptr_partial_read
+      COMMAND test_hdf5_vol_gpu_ptr "Partial (hyperslab) read survives a real GPU device pointer")
+
+  set_tests_properties(cte_hdf5_vol_gpu_ptr
+                       cte_hdf5_vol_gpu_ptr_partial_write
+                       cte_hdf5_vol_gpu_ptr_partial_read PROPERTIES
       TIMEOUT 300
       LABELS "unit;adapter;hdf5_vol;cte;gpu"
       ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
@@ -237,7 +251,16 @@ add_test(NAME cte_hdf5_vol_compressor_write
     COMMAND test_hdf5_vol_compressor_write
             "H5Dwrite routes through the compressor and H5Dread decompresses correctly")
 
-set_tests_properties(cte_hdf5_vol_compressor_write PROPERTIES
+# Second case in the same binary: compressor pool AND a device read buffer.
+# Neither existing test covered that pairing (this file's other case is
+# host-only; test_hdf5_vol_gpu_ptr.cc has no compressor pool), so the VOL's
+# device decompress destination had no coverage.
+add_test(NAME cte_hdf5_vol_compressor_devread
+    COMMAND test_hdf5_vol_compressor_write
+            "compressor-backed read into a GPU device pointer")
+
+set_tests_properties(cte_hdf5_vol_compressor_write
+                     cte_hdf5_vol_compressor_devread PROPERTIES
     TIMEOUT 300
     LABELS "unit;adapter;hdf5_vol;cte;compressor;693"
     RESOURCE_LOCK "clio_runtime"

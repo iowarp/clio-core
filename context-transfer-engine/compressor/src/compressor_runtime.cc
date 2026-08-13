@@ -760,11 +760,28 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     // device path, because there the empty result means GPU inference
     // declined, and a selection silently made by a different model is
     // indistinguishable downstream from one NeuroPress made.
-    if (device_stats != nullptr && neuropress_stats.empty()) {
-      HLOG(kError,
-           "EstCompressionStats: NeuroPress produced no candidates for a "
-           "device-resident chunk (size={}); NOT re-ranking it on the host",
-           chunk_size);
+    if (neuropress_stats.empty()) {
+      if (device_stats != nullptr) {
+        HLOG(kError,
+             "EstCompressionStats: NeuroPress produced no candidates for a "
+             "device-resident chunk (size={}); NOT re-ranking it on the host",
+             chunk_size);
+      } else {
+        // Host-resident chunks rank through NeuroPress too -- same gate, same
+        // RankIntoStats -- so an empty list here is the same model hand-off
+        // the device branch above reports, and was previously the only one
+        // that happened silently. It is a warning rather than an error
+        // because nothing failed: the legacy heuristics are Clio's own and
+        // will produce a valid selection. What must not stay invisible is
+        // WHICH model chose it, since downstream a legacy pick is
+        // indistinguishable from a NeuroPress one.
+        HLOG(kWarning,
+             "EstCompressionStats: NeuroPress produced no candidates for a "
+             "host-resident chunk (size={} entropy={} mad={}); falling back "
+             "to Clio's legacy heuristics -- this selection is NOT "
+             "NeuroPress's",
+             chunk_size, entropy, mad);
+      }
     }
   }
 
@@ -1642,6 +1659,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           std::vector<ctp::compress::model::CompressionFeatures>
               explore_features;
           std::vector<ctp::compress::model::TrainingLabels> explore_labels;
+          // Per-sample cost, kept parallel to the two vectors above purely so
+          // the batch can be ordered and truncated the way upstream's SGD
+          // phase 2 does before training. See the sort below.
+          std::vector<double> explore_costs;
           double best_cost = actual_cost;  // seeded with the primary's own
 
           // Device shuffle scratch for the explored candidates; released
@@ -1837,10 +1858,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             bool alt_ok = alt_compressor->Compress(
                 alt_out_ptr, alt_compressed_size, alt_input,
                 alt_compress_size);
-            double alt_time_ms = std::chrono::duration<double, std::milli>(
+            double alt_wall_ms = std::chrono::duration<double, std::milli>(
                                      std::chrono::high_resolution_clock::now() -
                                      alt_start)
                                      .count();
+            // Same clock as the primary, or the comparison below is between
+            // two different quantities. Upstream times every explored slot
+            // with per-slot CUDA events around the codec launch alone
+            // (gpucompress_compress.cpp:868-891) and scores on that; using
+            // wall clock here charged each candidate for staging and copies
+            // the primary's measurement excluded once this path started
+            // reporting kernel time.
+            const double alt_kernel_ms = ctp::LastCodecKernelMs();
+            double alt_time_ms =
+                (alt_kernel_ms >= 0.0) ? alt_kernel_ms : alt_wall_ms;
             if (!alt_ok || alt_compressed_size == 0) continue;
 
             double alt_ratio = static_cast<double>(chunk_size) /
@@ -1941,6 +1972,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                         static_cast<float>(alt_psnr),
                                         static_cast<float>(alt_time_ms),
                                         0.0f);
+            explore_costs.push_back(alt_cost);
           }
 
           for (const auto& scratch : explore_gpu_scratch) {
@@ -2075,6 +2107,48 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           }
 
           if (!explore_features.empty()) {
+            // Order by ascending cost and keep at most the cheapest 7, which
+            // is what upstream's SGD phase 2 trains on:
+            //
+            //   std::sort(explored_samples.begin() + 1, ..., a.cost < b.cost)
+            //   emax = min(explored_samples.size(), NN_MAX_SGD_SAMPLES)
+            //   for (ei = 1; ei < emax; ei++) ...
+            //   (gpucompress_compress.cpp:1004-1020)
+            //
+            // Index 0 there is the primary, which phase 1 already learned
+            // from, so the alternatives are capped at NN_MAX_SGD_SAMPLES - 1
+            // = 7. The cap is architectural, not a tuning choice:
+            // `SGDSample explore_sgd[NN_MAX_SGD_SAMPLES]` is a fixed array
+            // and the kernel accepts no more than that. Clio's alternatives
+            // are already primary-free (the loop skips the chosen lib/preset)
+            // so the whole vector is eligible.
+            //
+            // This used to train on every candidate in enumeration order. At
+            // the shared default K=3 neither the sort nor the cap binds, but
+            // SGD accumulates over the batch, so order can move the result --
+            // and above K=7 the two implementations were learning from
+            // genuinely different sample sets.
+            constexpr size_t kMaxExploreSgdSamples = 7;  // NN_MAX_SGD_SAMPLES-1
+            std::vector<size_t> order(explore_features.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::stable_sort(order.begin(), order.end(),
+                             [&](size_t a, size_t b) {
+                               return explore_costs[a] < explore_costs[b];
+                             });
+            if (order.size() > kMaxExploreSgdSamples) {
+              order.resize(kMaxExploreSgdSamples);
+            }
+            std::vector<ctp::compress::model::CompressionFeatures> sorted_feats;
+            std::vector<ctp::compress::model::TrainingLabels> sorted_labels;
+            sorted_feats.reserve(order.size());
+            sorted_labels.reserve(order.size());
+            for (size_t i : order) {
+              sorted_feats.push_back(explore_features[i]);
+              sorted_labels.push_back(explore_labels[i]);
+            }
+            explore_features.swap(sorted_feats);
+            explore_labels.swap(sorted_labels);
+
             bool explore_trained =
                 neuropress_predictor_->Train(explore_features, explore_labels);
             // Regret: how much worse the primary's real cost was than the
@@ -2469,7 +2543,20 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       context.actual_compression_ratio_ =
           static_cast<double>(input_size) /
           static_cast<double>(compressed_size);
-      context.actual_compress_time_ms_ = compress_time;
+      // Prefer the CODEC KERNEL time over host wall clock. This is what the
+      // model was trained against and what upstream ranks on: NeuroPress
+      // brackets exactly its `compressor->compress(...)` launch with CUDA
+      // events (gpucompress_compress.cpp:530-551) and feeds THAT into
+      // compute_cost. compress_time here is wall clock around the whole
+      // Compress() call, which also covers ToDeviceInput staging, a possible
+      // cudaMalloc, configure_compression, the stream sync and the output
+      // copy -- systematically larger, and it propagates into three
+      // decisions: the exploration winner, the SGD comp-time target, and the
+      // error_pct that gates whether SGD or exploration fire at all.
+      // Falls back to wall clock if the event bracket did not produce a
+      // reading (LastCodecKernelMs() returns -1 when it could not run).
+      context.actual_compress_time_ms_ =
+          (compress_kernel_ms >= 0.0) ? compress_kernel_ms : compress_time;
 
       // PSNR is DEFINED only when quantization ran. Upstream seeds
       // primary_actual_psnr = -1.0 ("lossless -> skip PSNR MAPE",

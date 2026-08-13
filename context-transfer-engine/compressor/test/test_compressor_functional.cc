@@ -530,6 +530,228 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
 }
 
 /**
+ * Exploration: the K-way search, its winner-adoption path, and the training
+ * samples it produces.
+ *
+ * Exploration is off by default in BOTH trees, which is exactly why nothing
+ * exercised it -- recorded as coverage gap G3 during the NeuroPress parity
+ * investigation. It is not a side path: when an explored alternative beats
+ * the primary on cost, Clio RE-STORES the blob with that alternative's bytes
+ * (the adoption block in Runtime::Compress), so a bug there silently replaces
+ * stored data with something produced by a different codec and different
+ * preprocessing. It also feeds Train() with real-outcome samples.
+ *
+ * Gating, from CompressorConfig: exploration needs online learning on (that
+ * block is what computes error_pct) AND exploration_enabled_, and then fires
+ * when error_pct > exploration_threshold_. The threshold is dropped to 0 so
+ * it fires on every chunk rather than only when the predictor happens to be
+ * badly wrong.
+ *
+ * The assertion is round-trip integrity per pattern: whatever exploration
+ * adopts, decompressing the stored blob must reproduce the original bytes.
+ * That covers the case the adoption path gets wrong most plausibly --
+ * swapping the payload while leaving the header describing the primary's
+ * codec, preset, shuffle or quantization state.
+ */
+TEST_CASE("Exploration - adopted winners still round-trip",
+          "[compressor][functional][dynamic][neuropress][exploration][693]") {
+#ifndef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+#error "CLIO_CTP_NEUROPRESS_WEIGHTS_DIR must be set by CMake"
+#endif
+
+  CTETestFixture fixture;
+
+  CompressorConfig config;
+  config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;
+  config.neuropress_online_learning_enabled_ = true;   // computes error_pct
+  config.neuropress_exploration_enabled_ = true;       // the path under test
+  config.neuropress_exploration_threshold_ = 0.0f;     // fire every chunk
+  config.neuropress_exploration_k_ = 3;                // NeuroPress's default
+
+  clio::run::PoolId explore_pool_id =
+      CreateCompressorPoolWithConfig(clio::run::PoolId(2, 43),
+                                     "test_compressor_pool_explore", config);
+  Client explore_client;
+  explore_client.Init(explore_pool_id);
+
+  struct Trial { std::string pattern; size_t size; };
+  const std::vector<Trial> trials = {
+      {"zeros", 64 * 1024},     {"repeating", 64 * 1024},
+      {"text", 256 * 1024},     {"random", 64 * 1024},
+      {"repeating", 1024 * 1024},
+  };
+
+  for (const auto &trial : trials) {
+    const auto original = GenerateTestData(trial.size, trial.pattern);
+    auto put_buffer = fixture.AllocateAndCopyData(original);
+    REQUIRE(!put_buffer.IsNull());
+    ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+
+    const std::string blob_name = "explore_blob_" + trial.pattern + "_" +
+                                  std::to_string(trial.size);
+
+    Context context;
+    context.dynamic_compress_ = 0;     // dynamic mode -> NeuroPress ranks
+    context.max_performance_ = false;  // optimize for ratio
+
+    auto task = explore_client.AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+        original.size(), put_blob_data, 0.5f, context, 0,
+        fixture.core_pool_id_);
+    task.Wait();
+    REQUIRE(task->return_code_ == 0);
+    CLIO_IPC->FreeBuffer(put_buffer);
+
+    // THE ACTUAL CHECK: read the stored blob back. If exploration adopted an
+    // alternative, these are that alternative's bytes under a header it also
+    // had to rewrite -- codec id, preset, shuffle element size and any
+    // quantization parameters. Getting any of those wrong yields either a
+    // decode failure or a buffer of the right LENGTH holding wrong data,
+    // which is why the comparison is byte-for-byte and not just on size.
+    auto get_buffer = CLIO_IPC->AllocateBuffer(original.size());
+    REQUIRE(!get_buffer.IsNull());
+    ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+    auto decompress_task = explore_client.AsyncDecompressExplicit(
+        clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+        original.size(), 0, get_blob_data, fixture.core_pool_id_);
+    decompress_task.Wait();
+
+    REQUIRE(decompress_task->return_code_ == 0);
+    REQUIRE(decompress_task->output_size_ == original.size());
+
+    std::vector<char> retrieved(original.size());
+    std::memcpy(retrieved.data(), get_buffer.ptr_, original.size());
+    REQUIRE(std::memcmp(original.data(), retrieved.data(),
+                        original.size()) == 0);
+
+    CLIO_IPC->FreeBuffer(get_buffer);
+  }
+}
+
+/**
+ * Selection must not depend on WHERE the chunk lives.
+ *
+ * Recorded as coverage gap G2. Profiling during the NeuroPress parity
+ * investigation showed the default functional path runs host-resident: only
+ * InferKernel launches, so statistics come from DataStatisticsFactory on the
+ * host rather than the device stats kernels, and the ranking consumes those
+ * host numbers. The device path computes the same three features with
+ * StatsPass1Kernel/StatsPass2DevKernel/EntropyFromHistKernel instead, and
+ * feeds InferKernelDeviceStats.
+ *
+ * Two different implementations of the features, therefore two chances to
+ * diverge -- and nothing asserted they agree END TO END. The parity suite
+ * compares the feature values themselves, but it hands both sides the SAME
+ * bytes; it cannot catch a selection that changes because the chunk happened
+ * to arrive in device memory.
+ *
+ * This drives identical bytes through DynamicSchedule twice, once from host
+ * SHM and once from a registered device backend, and requires the same
+ * algorithm out of both. It also round-trips each, since a device-resident
+ * chunk takes a different preprocessing and storage path.
+ */
+TEST_CASE("DynamicSchedule - selection is the same for host- and "
+          "device-resident chunks",
+          "[compressor][functional][dynamic][neuropress][residency][693]") {
+#ifndef CLIO_CTP_NEUROPRESS_WEIGHTS_DIR
+#error "CLIO_CTP_NEUROPRESS_WEIGHTS_DIR must be set by CMake"
+#endif
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    return;  // no GPU: the device half of the comparison cannot run
+  }
+
+  CTETestFixture fixture;
+
+  CompressorConfig config;
+  config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;
+  clio::run::PoolId pool_id = CreateCompressorPoolWithConfig(
+      clio::run::PoolId(2, 44), "test_compressor_pool_residency", config);
+  Client client;
+  client.Init(pool_id);
+
+  // Patterns spanning the entropy range the selector actually discriminates
+  // on -- a single operating point could agree by luck.
+  const std::vector<std::string> patterns = {"zeros", "repeating", "text",
+                                             "random"};
+  constexpr size_t kSize = 256 * 1024;
+
+  for (const auto &pattern : patterns) {
+    const auto data = GenerateTestData(kSize, pattern);
+
+    // ---- Host-resident: the chunk lives in CPU shared memory. ----
+    auto host_buf = fixture.AllocateAndCopyData(data);
+    REQUIRE(!host_buf.IsNull());
+    ctp::ipc::ShmPtr<> host_blob = host_buf.shm_.template Cast<void>();
+
+    Context host_ctx;
+    host_ctx.dynamic_compress_ = 0;
+    host_ctx.max_performance_ = false;
+    auto host_task = client.AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), fixture.tag_id_,
+        "residency_host_" + pattern, 0, data.size(), host_blob, 0.5f,
+        host_ctx, 0, fixture.core_pool_id_);
+    host_task.Wait();
+    REQUIRE(host_task->return_code_ == 0);
+    const int host_lib = host_task->context_.compress_lib_;
+    const int host_preset = host_task->context_.compress_preset_;
+    CLIO_IPC->FreeBuffer(host_buf);
+
+    // ---- Device-resident: register a real device backend so the ShmPtr
+    //      resolves to device memory instead of being staged to the host.
+    char *registered = nullptr;
+    ctp::ipc::AllocatorId alloc_id = CLIO_IPC->AllocateAndRegisterGpuBackend(
+        /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+        kSize, &registered);
+    if (alloc_id.IsNull() || registered == nullptr) {
+      continue;  // device backend unavailable here; host half already checked
+    }
+    REQUIRE(cudaMemcpy(registered, data.data(), kSize,
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(ctp::IsDevicePointer(registered));
+
+    ctp::ipc::ShmPtr<> dev_blob;
+    dev_blob.alloc_id_ = alloc_id;
+    dev_blob.off_ = reinterpret_cast<clio::run::u64>(registered);
+
+    Context dev_ctx;
+    dev_ctx.dynamic_compress_ = 0;
+    dev_ctx.max_performance_ = false;
+    auto dev_task = client.AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), fixture.tag_id_,
+        "residency_dev_" + pattern, 0, data.size(), dev_blob, 0.5f, dev_ctx,
+        0, fixture.core_pool_id_);
+    dev_task.Wait();
+    REQUIRE(dev_task->return_code_ == 0);
+    const int dev_lib = dev_task->context_.compress_lib_;
+    const int dev_preset = dev_task->context_.compress_preset_;
+
+    // THE ACTUAL CHECK: same bytes in, same selection out, regardless of
+    // which side of the PCIe bus they arrived on.
+    REQUIRE(dev_lib == host_lib);
+    REQUIRE(dev_preset == host_preset);
+
+    // And the device-resident blob must still round-trip: it took a
+    // different preprocessing and storage path to get here.
+    auto get_buf = CLIO_IPC->AllocateBuffer(data.size());
+    REQUIRE(!get_buf.IsNull());
+    ctp::ipc::ShmPtr<> get_blob = get_buf.shm_.template Cast<void>();
+    auto dec = client.AsyncDecompressExplicit(
+        clio::run::PoolQuery::Local(), fixture.tag_id_,
+        "residency_dev_" + pattern, 0, data.size(), 0, get_blob,
+        fixture.core_pool_id_);
+    dec.Wait();
+    REQUIRE(dec->return_code_ == 0);
+    REQUIRE(dec->output_size_ == data.size());
+    REQUIRE(std::memcmp(data.data(), get_buf.ptr_, data.size()) == 0);
+
+    CLIO_IPC->FreeBuffer(get_buf);
+    CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, alloc_id);
+  }
+}
+
+/**
  * Test Case 4: Multiple Compression Libraries
  * Tests compression with various libraries
  */

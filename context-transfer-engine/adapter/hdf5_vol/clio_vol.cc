@@ -2030,12 +2030,57 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
     futures.reserve(last - first + 1);
     buffers.reserve(last - first + 1);
     offsets.reserve(last - first + 1);
+    /* Decompress into GPU-SHARED memory when the caller's buffer is device
+       memory, so the decompressor can land bytes somewhere the GPU can reach.
+       NeuroPress decompresses straight into the caller's device buffer
+       (`dst_ptr = static_cast<uint8_t*>(d_buf) + off`, gpu_aware_chunked_read);
+       handing this path a CPU SHM buffer instead cost a full-size staging copy
+       per chunk and left the compressor's device unshuffle/dequantize
+       unreachable from the VOL, because codec_dst was always host.
+
+       kManagedUvm, NOT kDeviceMem. Both are "GPU memory", but only managed
+       memory is addressable from both sides: ToFullPtr's own comment
+       (ipc_manager.h:1119) notes that for kPinnedHost/kManagedUvm `off_` and
+       `device_ptr` are the same value because they share an address space,
+       so the runtime resolves it without needing a portable
+       cudaIpcMemHandle. A kDeviceMem backend allocated by a CLIENT is not
+       resolvable that way -- the runtime falls through to
+       TryLazyRegisterClientSegment, which shm_open()s "clio_<pid>_<n>" and
+       fails, and a CPU codec handed the result segfaults. Both were observed
+       before switching to managed memory.
+
+       Falls back to CPU SHM on allocation failure, matching the write path's
+       graceful-degradation contract. */
+    const bool dst_is_device = ctp::IsDevicePointer(dst);
+    std::vector<ctp::ipc::AllocatorId> gpu_allocs;
+    std::vector<char *> gpu_ptrs;
+    gpu_allocs.reserve(last - first + 1);
+    gpu_ptrs.reserve(last - first + 1);
+
     for (size_t i = first; i <= last && i < num_chunks; ++i) {
       size_t offset = i * chunk_size;
       size_t this_size = std::min(chunk_size, total_size - offset);
-      auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-      if (buffer.IsNull()) return false;
-      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+      ctp::ipc::FullPtr<char> buffer;
+      ctp::ipc::ShmPtr<> blob_data;
+      ctp::ipc::AllocatorId gpu_alloc;
+      char *gpu_ptr = nullptr;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+      if (dst_is_device) {
+        gpu_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kManagedUvm,
+            this_size, &gpu_ptr);
+        if (gpu_alloc.IsNull()) gpu_ptr = nullptr;
+        if (gpu_ptr) {
+          blob_data.alloc_id_ = gpu_alloc;
+          blob_data.off_ = reinterpret_cast<clio::run::u64>(gpu_ptr);
+        }
+      }
+#endif
+      if (gpu_ptr == nullptr) {
+        buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) return false;
+        blob_data = buffer.shm_.template Cast<void>();
+      }
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
       /* Blob-internal offset 0, same convention as the raw-blob path below
@@ -2044,6 +2089,8 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
           clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
           0, this_size, 0, blob_data, cte_client->pool_id_));
       buffers.push_back(std::move(buffer));
+      gpu_allocs.push_back(gpu_alloc);
+      gpu_ptrs.push_back(gpu_ptr);
       offsets.push_back(offset);
     }
     size_t fetched = 0;
@@ -2052,9 +2099,15 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
       if (futures[i]->GetReturnCode() != 0) return false;
       size_t offset = offsets[i];
       size_t this_size = std::min(chunk_size, total_size - offset);
-      ctp::DeviceAwareMemcpy(dst + offset, buffers[i].ptr_, this_size);
+      const char *src_ptr = gpu_ptrs[i] ? gpu_ptrs[i] : buffers[i].ptr_;
+      ctp::DeviceAwareMemcpy(dst + offset, src_ptr, this_size);
       fetched += this_size;
     }
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    for (auto &a : gpu_allocs) {
+      if (!a.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, a);
+    }
+#endif
     if (dataset->file && dataset->file->trace)
       clio::trace::record_fetch(dataset->file->trace, dataset->dataset_path,
                                 fetched);
@@ -2228,13 +2281,40 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     /* Place the gathered elements into the user buffer. H5S_ALL mem space means
        a contiguous buffer of the selected elements; otherwise scatter per the
        mem-space selection. */
+    /* `buf` is the CALLER's buffer and may be a raw cudaMalloc'd device
+       pointer -- H5Dwrite/H5Dread accept whatever the caller passes, and the
+       GPU paths in this file exist precisely to serve that case. Neither
+       placement below may touch it with host code: a plain std::memcpy
+       dereferences device memory from the host (a SIGSEGV, not a wrong
+       answer), and H5Dscatter writes through the same host pointer
+       internally. Every sibling that lands bytes in a user destination
+       already goes through DeviceAwareMemcpy (:2055, :2102, :2288, :2509);
+       these two were the exceptions. */
+    const bool buf_on_device = ctp::IsDevicePointer(buf);
     if (mem_space_id == H5S_ALL) {
-      std::memcpy(buf, sel.data(), sel_size);
+      ctp::DeviceAwareMemcpy(buf, sel.data(), sel_size);
       ok = true;
-    } else {
+    } else if (!buf_on_device) {
       clio_scatter_ctx ctx{sel.data(), sel_size};
       ok = (H5Dscatter(clio_scatter_cb, &ctx, mem_type_id, mem_space_id,
                        buf) >= 0);
+    } else {
+      /* Scatter cannot write to device memory, so stage it. The mem-space
+         selection may be sparse, so the staging buffer is seeded with the
+         destination's CURRENT contents first: scatter only fills the selected
+         positions, and copying an unseeded buffer back would overwrite the
+         elements the selection deliberately left alone. */
+      hssize_t mem_nelem = H5Sget_simple_extent_npoints(mem_space_id);
+      if (mem_nelem <= 0) break;
+      size_t mem_size = static_cast<size_t>(mem_nelem) * type_size;
+      std::vector<char> scatter_staging(mem_size);
+      ctp::DeviceAwareMemcpy(scatter_staging.data(), buf, mem_size);
+      clio_scatter_ctx ctx{sel.data(), sel_size};
+      ok = (H5Dscatter(clio_scatter_cb, &ctx, mem_type_id, mem_space_id,
+                       scatter_staging.data()) >= 0);
+      if (ok) {
+        ctp::DeviceAwareMemcpy(buf, scatter_staging.data(), mem_size);
+      }
     }
   } while (false);
 

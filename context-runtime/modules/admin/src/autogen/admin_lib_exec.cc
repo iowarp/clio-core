@@ -124,6 +124,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(RegisterMemory(typed_task));
       break;
     }
+    case Method::kDeregisterMemory: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<DeregisterMemoryTask>();
+      CLIO_CO_AWAIT(DeregisterMemory(typed_task));
+      break;
+    }
     case Method::kRestartContainers: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
@@ -288,6 +294,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kDeregisterMemory: {
+      auto& typed_task = task_ptr.template Cast<DeregisterMemoryTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kRestartContainers: {
       auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
       archive << *typed_task;
@@ -435,6 +446,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kRegisterMemory: {
       auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kDeregisterMemory: {
+      auto& typed_task = task_ptr.template Cast<DeregisterMemoryTask>();
       archive >> *typed_task;
       break;
     }
@@ -607,6 +623,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kRegisterMemory: {
       auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kDeregisterMemory: {
+      auto& typed_task = task_ptr.template Cast<DeregisterMemoryTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -793,6 +815,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kRegisterMemory: {
       auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kDeregisterMemory: {
+      auto& typed_task = task_ptr.template Cast<DeregisterMemoryTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1054,6 +1082,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kDeregisterMemory: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<DeregisterMemoryTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<DeregisterMemoryTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DeregisterMemoryTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kRestartContainers: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<RestartContainersTask>();
@@ -1277,6 +1316,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<RegisterMemoryTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kDeregisterMemory: {
+      auto new_task_ptr = ipc_manager->NewTask<DeregisterMemoryTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kRestartContainers: {
       auto new_task_ptr = ipc_manager->NewTask<RestartContainersTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -1411,6 +1454,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kRegisterMemory: {
       auto& typed_task = orig_task.template Cast<RegisterMemoryTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kDeregisterMemory: {
+      auto& typed_task = orig_task.template Cast<DeregisterMemoryTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

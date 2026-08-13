@@ -245,6 +245,11 @@ public:
    */
   clio::run::TaskResume RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task);
 
+  /** Release a client-registered memory backend (closes an imported GPU
+   *  IPC mapping so the owner can free). */
+  clio::run::TaskResume DeregisterMemory(
+      clio::run::shared_ptr<DeregisterMemoryTask> &task);
+
   /**
    * Handle RestartContainers - Re-create pools from the restart registry.
    * Reads the RestartLog write-ahead log (~/.clio/restart_log.bin), the same

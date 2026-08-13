@@ -1271,6 +1271,38 @@ clio::run::TaskResume Runtime::RegisterMemory(clio::run::shared_ptr<RegisterMemo
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::DeregisterMemory(
+    clio::run::shared_ptr<DeregisterMemoryTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->success_ = false;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  auto *ipc_manager = CLIO_IPC;
+  auto *gpu_ipc = ipc_manager ? ipc_manager->GetGpuIpcManager() : nullptr;
+  if (gpu_ipc) {
+    ctp::ipc::AllocatorId alloc_id(task->alloc_major_, task->alloc_minor_);
+    // Close the IMPORTED mapping before replying. RegisterMemory opened this
+    // allocation with cudaIpcOpenMemHandle and stored the resulting pointer as
+    // the backend's device_ptr; that pointer belongs to THIS process and must
+    // be released here. The owning process is only safe to free its own
+    // allocation once this has happened -- freeing under a live import is a
+    // cross-process use-after-free, which is exactly why FreeGpuBackend used
+    // to skip remotely-registered backends and leak them instead.
+    if (const auto *backend =
+            gpu_ipc->FindClientBackend(task->gpu_id_, alloc_id)) {
+      if (backend->kind == clio::run::gpu::IpcManager::MemKind::kDeviceMem &&
+          backend->device_ptr != nullptr) {
+        ctp::GpuApi::CloseIpcMemHandle(backend->device_ptr);
+      }
+    }
+    gpu_ipc->UnregisterClientBackend(task->gpu_id_, alloc_id);
+    task->success_ = true;
+  }
+#endif
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+
 clio::run::TaskResume Runtime::RestartContainers(
     clio::run::shared_ptr<RestartContainersTask> &task) {
   CLIO_TASK_BODY_BEGIN

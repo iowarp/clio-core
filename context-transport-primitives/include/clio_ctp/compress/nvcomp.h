@@ -129,27 +129,39 @@ class NvComp : public Compressor {
    * (gpucompress_compress.cpp:530-551).
    */
   struct KernelTimer {
-    cudaStream_t stream = nullptr;
     cudaEvent_t start = nullptr, stop = nullptr;
+    cudaStream_t stream = nullptr;
     bool on = false;
 
-    static bool Enabled() {
-      static const bool e = [] {
-        const char *v = std::getenv("CLIO_CODEC_KERNEL_TIMING");
-        return v && *v;
-      }();
-      return e;
-    }
-
+    /**
+     * Always on now, and no longer gated by CLIO_CODEC_KERNEL_TIMING.
+     *
+     * The gate existed because each timer created and destroyed its own event
+     * pair, which is real per-call overhead. The events are now persistent
+     * per thread (ManagerCache::ev_start/ev_stop, created once), so the cost
+     * of a bracket is two cudaEventRecords -- the same thing NeuroPress does
+     * unconditionally with its per-CompContext events.
+     *
+     * It has to be unconditional because the number is no longer just a
+     * report: the exploration cost model consumes it. Leaving it opt-in meant
+     * cost was computed from a host wall-clock that also covered staging, a
+     * possible cudaMalloc, configure_compression, the stream sync and the
+     * output copy -- so CLIO's costs were systematically larger than the
+     * kernel times NeuroPress ranks on, and cost decides the exploration
+     * winner, the SGD compression-time target, and the error_pct gate that
+     * fires either of them.
+     *
+     * CLIO_CODEC_KERNEL_TIMING is retained as a no-op for compatibility with
+     * existing scripts; the measurement it used to switch on is now default.
+     */
     explicit KernelTimer(cudaStream_t s) : stream(s) {
       LastCodecKernelMs() = -1.0;
-      if (!Enabled() || !s) return;
-      if (cudaEventCreate(&start) != cudaSuccess) return;
-      if (cudaEventCreate(&stop) != cudaSuccess) {
-        cudaEventDestroy(start);
-        start = nullptr;
-        return;
-      }
+      if (!s) return;
+      auto &c = Cache();
+      if (!c.ev_start && cudaEventCreate(&c.ev_start) != cudaSuccess) return;
+      if (!c.ev_stop && cudaEventCreate(&c.ev_stop) != cudaSuccess) return;
+      start = c.ev_start;
+      stop = c.ev_stop;
       on = (cudaEventRecord(start, stream) == cudaSuccess);
     }
 
@@ -164,10 +176,8 @@ class NvComp : public Compressor {
       }
     }
 
-    ~KernelTimer() {
-      if (start) cudaEventDestroy(start);
-      if (stop) cudaEventDestroy(stop);
-    }
+    // No destructor work: the events belong to the thread's ManagerCache and
+    // outlive every individual timer.
   };
 
   bool Compress(void *output, size_t &output_size, void *input,
@@ -382,9 +392,19 @@ class NvComp : public Compressor {
     uint64_t misses = 0;
     cudaStream_t stream = nullptr;
 
+    // Codec-timing events, created once and reused for every launch on this
+    // thread. NeuroPress does exactly this: t_start/t_stop are allocated per
+    // CompContext when the pool is built (gpucompress_pool.cpp) and reused for
+    // every chunk, which is what makes always-on event timing free. Creating
+    // and destroying a pair per call -- as this used to -- was the whole
+    // reason the measurement had to be opt-in.
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+
     ~ManagerCache() {
       // Managers must die before the stream they were built on.
       for (auto &s : slots) s.mgr.reset();
+      if (ev_start) cudaEventDestroy(ev_start);
+      if (ev_stop) cudaEventDestroy(ev_stop);
       if (stream) cudaStreamDestroy(stream);
     }
   };

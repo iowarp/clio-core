@@ -44,7 +44,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kRegisterGpuContainer = 33;
 GLOBAL_CROSS_CONST clio::run::u32 kListContainers = 34;
 GLOBAL_CROSS_CONST clio::run::u32 kQueryTaskProgress = 35;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 36;
+GLOBAL_CROSS_CONST clio::run::u32 kDeregisterMemory = 36;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 37;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -77,6 +78,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[33] = "RegisterGpuContainer";
     v[34] = "ListContainers";
     v[35] = "QueryTaskProgress";
+    v[36] = "DeregisterMemory";
     return v;
   }();
   return names;

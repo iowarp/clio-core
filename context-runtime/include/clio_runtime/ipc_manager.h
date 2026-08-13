@@ -1765,6 +1765,36 @@ class IpcManager {
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
 
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  // What AllocateAndRegisterGpuBackend actually handed out, so FreeGpuBackend
+  // can release it.
+  //
+  // This cannot live in gpu::IpcManager::ClientBackend, which is the obvious
+  // place for it: that map is only populated on the RUNTIME side. A client
+  // registers its backend remotely through RegisterMemoryTask and has no local
+  // ClientBackend record at all, so a FindClientBackend-based free would still
+  // leak every client allocation. The allocation happens here, so the
+  // bookkeeping does too, and both modes are covered by one map.
+  //
+  // Keyed exactly like gpu::IpcManager::FindClientBackend so the two agree:
+  // (major << 32) | minor.
+  // `in_process` records WHICH registration branch ran, and it is a safety
+  // gate, not bookkeeping. When the backend was registered remotely, the
+  // runtime process opened our device memory with cudaIpcOpenMemHandle
+  // (admin_runtime.cc's kGpuDeviceMemory case) and holds a mapping into it.
+  // Freeing here would invalidate that mapping under it. There is currently
+  // no DeregisterMemory task and no CloseIpcMemHandle call anywhere in the
+  // tree, so nothing can tell the importer to let go first — which is exactly
+  // why the remote case must NOT be freed here. See FreeGpuBackend.
+  struct OwnedGpuBackend {
+    char *base = nullptr;
+    gpu::IpcManager::MemKind kind = gpu::IpcManager::MemKind::kPinnedHost;
+    bool in_process = false;
+  };
+  std::unordered_map<u64, OwnedGpuBackend> owned_gpu_backends_;
+  std::mutex owned_gpu_backends_mutex_;
+#endif
+
   // Pending response archives (client-side, keyed by net_key)
   // Archives stay alive after Recv() deserialization so that zmq zero-copy
   // buffers (stored in recv[].desc) remain valid until Future::Destroy().
