@@ -45,4 +45,8 @@ if(CLIO_CORE_ENABLE_CUDA)
   # native NeuroPress build or CUPTI is absent, since neither is a Clio build
   # dependency.
   add_subdirectory(neuropress_gpu_chunk_equivalence)
+
+  # Where do the bytes actually go? Traces one GPU-generated chunk through
+  # Clio's real store path. Needs CUPTI but not native NeuroPress.
+  add_subdirectory(neuropress_data_path_trace)
 endif()
