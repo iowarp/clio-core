@@ -361,45 +361,67 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
 constexpr int kGradSplits = 32;
 
 /**
- * dW1[h][f] += sum_n dz1[n][h] * A[n][f], split over n.
+ * dW1[h][f] += sum_n dz1[n][h] * A[n][f]: TILED and SPLIT over n.
  *
- * The natural form gives one thread the whole reduction for its (h,f), which
- * is only H*F = 8192 threads -- far too few to fill this GPU, and it measured
- * ~11% of FP64 peak while being 9.0s of a 22.6s run. Splitting the node range
- * kGradSplits ways multiplies the thread count by 32 without changing the
- * arithmetic each thread does.
+ * Two separate problems, and each fix alone made things worse:
  *
- * STILL FP64 and STILL DETERMINISTIC. Each thread sums a contiguous ascending
- * n-range in double, and GradW1ReduceKernel folds the partials in fixed split
- * order. No atomics: an atomicAdd over doubles would make the order
- * run-dependent, and the test asserts the streamed run reproduces the in-core
- * run exactly. The order differs from the unsplit version, but both the
- * in-core and the vector path run this same kernel, so they still agree
- * bit-for-bit.
+ *  - One thread per (h,f) is only H*F = 8192 threads. Splitting the node
+ *    range kGradSplits ways fixes the occupancy.
+ *  - Each thread reads A[n*F+f] for its own f, so A is fetched once per h --
+ *    64 passes over the feature matrix, the same defect fixed in the forward
+ *    pass. Staging A and dz1 in shared memory cuts that to H/kTH passes.
  *
- * Tiling this through shared memory was tried instead and is SLOWER (1.37s vs
- * 1.12s at 1 GiB): the kernel is arithmetic-bound, not bandwidth-bound, so
- * staging buys nothing. Its global reads are already coalesced -- consecutive
- * idx give consecutive f, so a warp reads 32 contiguous floats of A.
+ * Tiling WITHOUT the split was measured SLOWER than neither (1.37s vs 1.12s)
+ * because it launched 32 blocks; that is why it was reverted earlier. With
+ * the split the grid is (F/kTF, H/kTH, kGradSplits) = 1024 blocks, so the
+ * traffic reduction finally has the threads to pay for it.
+ *
+ * ORDER IS PRESERVED EXACTLY: each thread still walks its split's n-range in
+ * ascending order (chunks ascend, and r ascends within a chunk), and the
+ * reduce folds splits in fixed order. No atomics. So this produces the same
+ * doubles as the untiled split version, which produced the same values as the
+ * unsplit one.
  */
 __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn,
                              int F, int H, double *part, double *partb) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= H * F) return;
-  const int sp = blockIdx.y;
-  const int h = idx / F, f = idx % F;
+  constexpr int kTH = 16, kTF = 16, kTN = 64;
+  __shared__ float sA[kTN][kTF];
+  __shared__ float sD[kTN][kTH];
+  const int f0 = blockIdx.x * kTF;
+  const int h0 = blockIdx.y * kTH;
+  const int sp = blockIdx.z;
+  const int tf = threadIdx.x % kTF;
+  const int th = threadIdx.x / kTF;
   const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
   const clio::run::u64 lo = (clio::run::u64)sp * chunk;
   const clio::run::u64 hi = min(lo + chunk, nn);
-  double s = 0.0;
-  for (clio::run::u64 n = lo; n < hi; ++n) {
-    s += (double)dz1[n * H + h] * (double)A[n * F + f];
+  double s = 0.0, sb = 0.0;
+  for (clio::run::u64 n0 = lo; n0 < hi; n0 += kTN) {
+    const int lim = (int)min((clio::run::u64)kTN, hi - n0);
+    for (int i = threadIdx.x; i < kTN * kTF; i += blockDim.x) {
+      const int r = i / kTF, c = i % kTF;
+      sA[r][c] = (r < lim && f0 + c < F)
+                     ? A[(n0 + r) * (clio::run::u64)F + f0 + c] : 0.f;
+    }
+    for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
+      const int r = i / kTH, c = i % kTH;
+      sD[r][c] = (r < lim && h0 + c < H)
+                     ? dz1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.f;
+    }
+    __syncthreads();
+    for (int r = 0; r < lim; ++r) s += (double)sD[r][th] * (double)sA[r][tf];
+    // db1 sums dz1 alone: only the first f-tile accumulates it, or every
+    // f-tile would contribute its own copy.
+    if (blockIdx.x == 0 && tf == 0) {
+      for (int r = 0; r < lim; ++r) sb += (double)sD[r][th];
+    }
+    __syncthreads();
   }
-  part[(clio::run::u64)sp * H * F + idx] = s;
-  if (f == 0) {
-    double sb = 0.0;
-    for (clio::run::u64 n = lo; n < hi; ++n) sb += (double)dz1[n * H + h];
-    partb[(clio::run::u64)sp * H + h] = sb;
+  if (h0 + th < H && f0 + tf < F) {
+    part[(clio::run::u64)sp * H * F + (h0 + th) * F + f0 + tf] = s;
+  }
+  if (blockIdx.x == 0 && tf == 0 && h0 + th < H) {
+    partb[(clio::run::u64)sp * H + h0 + th] = sb;
   }
 }
 
@@ -726,7 +748,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
       if (ktime) { ctp::GpuApi::Synchronize(); t_fwd += NowSec() - tp0; tp0 = NowSec(); }
       track_peak();
-      GradW1Kernel<<<dim3((H * F + tpb - 1) / tpb, kGradSplits), tpb>>>(
+      GradW1Kernel<<<dim3((F + 15) / 16, (H + 15) / 16, kGradSplits), 256>>>(
           d_scratch, dz1_buf, nn, F, H, gw1_part, gb1_part);
       GradW1ReduceKernel<<<(H * F + tpb - 1) / tpb, tpb>>>(
           gw1_part, gb1_part, F, H, gW1, gb1);
