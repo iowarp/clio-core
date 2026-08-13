@@ -456,6 +456,16 @@ class CompressionFactory {
   // GPU compressors (nvcomp). Each helper is always defined so its registry row
   // is valid in every build; it returns nullptr when nvcomp is disabled (the
   // name/ids still resolve, but GetPreset yields nullptr). All are single-mode.
+  // GetGpuCodecStreamThreadOnly, NOT GetGpuStream. The process-wide fallback
+  // is codec_slots_[0].stream, created inside the compressor's dedicated codec
+  // CUcontext. Handing it to nvcomp while running in the PRIMARY context (which
+  // is where CompressIntoShm runs) makes nvcomp's own internal cudaEventRecord
+  // fail with "invalid resource handle" -- compute-sanitizer counted 1016 of
+  // them in a single short run -- and it escalates intermittently to an illegal
+  // memory access that aborts the process (seen in 1 of 13 nvcomp-ans runs).
+  // The thread override is safe: the runtime installs it inside the guard for
+  // the matching context. With no override the codec gets null, i.e. the
+  // current context's default stream, which is always valid.
   static std::unique_ptr<Compressor> MakeNvCompLz4(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
     return std::make_unique<NvComp>(NvCompAlgo::LZ4);
@@ -465,35 +475,35 @@ class CompressionFactory {
   }
   static std::unique_ptr<Compressor> MakeNvCompSnappy(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY, GetGpuStream());
+    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY, GetGpuCodecStreamThreadOnly());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompZstd(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::ZSTD, GetGpuStream());
+    return std::make_unique<NvComp>(NvCompAlgo::ZSTD, GetGpuCodecStreamThreadOnly());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompGdeflate(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE, GetGpuStream());
+    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE, GetGpuCodecStreamThreadOnly());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompDeflate(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE, GetGpuStream());
+    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE, GetGpuCodecStreamThreadOnly());
 #else
     return nullptr;
 #endif
   }
   static std::unique_ptr<Compressor> MakeNvCompAns(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
-    return std::make_unique<NvComp>(NvCompAlgo::ANS, GetGpuStream());
+    return std::make_unique<NvComp>(NvCompAlgo::ANS, GetGpuCodecStreamThreadOnly());
 #else
     return nullptr;
 #endif
