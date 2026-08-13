@@ -282,6 +282,27 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
 
 /** Forward + backward for the window's nodes (one thread per node). Writes per-node
  *  h1, dz1, dz2 to window buffers; accumulates loss/correct/count. */
+/**
+ * Warp-aggregated counter increment.
+ *
+ * The training kernel counts labelled nodes, correct predictions and the two
+ * validation tallies, and it was doing one atomicAdd PER NODE to each -- four
+ * global atomics on four fixed addresses from every one of ~33M threads. Every
+ * lane in a warp contends for the same cache line, so the hardware serialises
+ * them.
+ *
+ * __ballot_sync gives the warp's participating lanes in one instruction; lane
+ * 0 adds their population count once. Same totals, 32x fewer atomics, and the
+ * ORDER of an integer counter's increments does not affect its value, so this
+ * is exactly equivalent rather than approximately so.
+ */
+__device__ __forceinline__ void WarpAddOne(int *addr) {
+  const unsigned mask = __activemask();
+  const int leader = __ffs(mask) - 1;
+  const int cnt = __popc(mask);
+  if ((threadIdx.x & 31) == leader) atomicAdd(addr, cnt);
+}
+
 __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u64 node_lo,
                                 const long long *labels, int F, int H, int C,
                                 const float *W1, const float *b1, const float *W2,
@@ -378,13 +399,13 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   // Held-out validation node: score it, but contribute neither loss nor gradient.
   // dz1_out/dz2_out/h1_out were zeroed above, so returning here keeps its grad at 0.
   if (((node_lo + n) % kValStride) == (kValStride - 1)) {
-    if (pred == (int)y) atomicAdd(val_correct, 1);
-    atomicAdd(val_count, 1);
+    if (pred == (int)y) WarpAddOne(val_correct);
+    WarpAddOne(val_count);
     return;
   }
   loss_buf[n] = -log((double)fmaxf(z2[y], 1e-30f));
-  if (pred == (int)y) atomicAdd(correct, 1);
-  atomicAdd(count, 1);
+  if (pred == (int)y) WarpAddOne(correct);
+  WarpAddOne(count);
   // dz2 aliases z2 (which currently holds p); the loss above already read it.
   for (int c = 0; c < C; ++c) { z2[c] = z2[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = z2[c]; }
   // BACKWARD, tiled over h: the scalar form re-reads z2[0..C) once per h,
