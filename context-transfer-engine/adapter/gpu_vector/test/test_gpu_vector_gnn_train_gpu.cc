@@ -788,6 +788,28 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u32 ppb = (clio::run::u32)EnvI64(
       "CLIO_GNN_PAGES_PER_BLOCK",
       std::max<clio::run::u32>(2, (2 * window) / gather_blocks));
+  // WINDOW MUST COVER blocks x run_length PAGES, or the run-fetch over-reads.
+  //
+  // For an encoded tag a fault fetches a RUN of consecutive pages
+  // (BeginFetchRunLocked, min(kPodMultiMax, pages_per_block) long). The gather
+  // splits a window across the blocks, so a block owns window/blocks
+  // consecutive pages. If the run is longer than that slice, the tail of every
+  // run belongs to OTHER blocks -- they never read it, and those blocks fetch
+  // the same pages again into their own tables. Measured at window=32 with 8
+  // blocks: each page fetched 16 times (8 blocks x 2 epochs), 87.3% of all
+  // fetches wasted. Sizing window >= blocks * run takes it to 0.0%.
+  {
+    const clio::run::u32 run_len =
+        std::min<clio::run::u32>(clio::cte::core::kPodMultiMax, ppb);
+    const clio::run::u32 need = gather_blocks * run_len;
+    if (comp_lib != 0 && (clio::run::u32)window < need) {
+      std::fprintf(stderr,
+                   "[TRAIN] WARNING: window=%d pages < blocks*run=%u -- the "
+                   "run-fetch will over-read and other blocks will re-fetch "
+                   "the same pages. Set CLIO_GNN_WINDOW >= %u.\n",
+                   window, need, need);
+    }
+  }
   std::fprintf(stderr,
                "[TRAIN] gather: %u blocks x %lld threads, %u pages/block "
                "(total cache %u pages = %lluMiB)\n",
@@ -844,6 +866,27 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
         (unsigned long long)vs.prefetch_hits, (unsigned long long)vs.prefetch_late,
         (unsigned long long)vs.pf_dropped, (unsigned long long)vs.verify_lost,
         (unsigned long long)vs.get_errors, (unsigned long long)vs.put_errors);
+  }
+  {
+    // Per-page fetch counts (CLIO_FAULT_HIST=1). The workload reads each page
+    // exactly `epochs` times, so any page fetched more than that was evicted
+    // before it was used -- this says WHICH pages churn, not just how many.
+    auto fh = vec.ReadFaultHist(0);
+    if (!fh.empty()) {
+      unsigned long long tot = 0, over = 0, zero = 0, mx = 0;
+      for (auto v : fh) {
+        tot += v;
+        if (v == 0) ++zero;
+        if (v > (unsigned)epochs) over += (v - (unsigned)epochs);
+        if (v > mx) mx = v;
+      }
+      std::fprintf(stderr,
+          "[TRAIN] FAULT HIST: pages=%zu never_fetched=%llu total_fetches=%llu "
+          "wasted=%llu (%.1f%%) max_per_page=%llu ideal=%llu\n",
+          fh.size(), zero, tot, over,
+          tot ? 100.0 * (double)over / (double)tot : 0.0, mx,
+          (unsigned long long)fh.size() * (unsigned long long)epochs);
+    }
   }
   double et_time = NowSec() - et_t0;
   const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
