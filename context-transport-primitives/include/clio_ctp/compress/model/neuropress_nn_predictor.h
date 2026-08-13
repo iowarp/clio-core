@@ -241,9 +241,9 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    * per-output backward passes with PCGrad-lite gradient-conflict
    * projection and per-output gradient clipping, trust-region step sizing,
    * EMA-smoothed updates with anti-flip damping, and weight clamping.
-   * State (log_var_, ema_weights_/ema_biases_, sgd_call_count_) persists
-   * across calls, exactly as the original's device-resident NNWeightsGPU
-   * does across kernel launches.
+   * All of that state (log-variance, EMA gradient, call count) lives in
+   * device memory for the handle's lifetime, exactly as the original's
+   * NNWeightsGPU does across kernel launches.
    *
    * @param features Per-sample candidate features (up to 8 per call,
    *   matching NeuroPress's NN_MAX_SGD_SAMPLES batch size -- extra
@@ -345,28 +345,14 @@ class NeuroPressNNPredictor : public CompressionPredictor {
       const CompressionFeatures& features,
       bool apply_lossless_sentinel = true) const;
 
-  /**
-   * @brief Standardize input: (x - x_means) / max(x_stds, 1e-8).
-   */
-  std::vector<float> Standardize(const std::vector<float>& x) const;
-
-  /**
-   * @brief Forward pass through 5 layers (4 hidden with ReLU, 1 output).
-   */
-  std::vector<float> ForwardPass(
-      const std::vector<float>& x_norm) const;
-
-  /**
-   * @brief Inverse-transform outputs: y = x * y_stds + y_means.
-   */
-  std::vector<float> InverseTransform(
-      const std::vector<float>& y_norm) const;
-
   // Architecture parameters.
   static constexpr uint32_t kInputDim = 8;
   static constexpr uint32_t kHiddenDim = 64;
   static constexpr uint32_t kOutputDim = 8;
   static constexpr uint32_t kNumLayers = 5;  // 4 hidden + 1 output
+  /** Upstream's NN_MAX_SGD_SAMPLES: samples past the first 8 are dropped,
+   *  matching its own truncation (nn_weights.h:17). */
+  static constexpr int kMaxSGDSamples = 8;
 
   // Normalization parameters.
   std::vector<float> x_means_;  // [8]
@@ -435,27 +421,6 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   std::shared_ptr<gpu::NeuroPressGpuWeights> gpu_weights_;
 #endif
 
-  // ---- Online-learning (SGD) state -- ported from NeuroPress's
-  // nnSGDKernel (src/nn/nn_gpu.cu). Persists across Train() calls, mirroring
-  // the original's device-resident NNWeightsGPU fields. Sized/zeroed in
-  // Load() once weights_/biases_ are known. Not part of the .nnwt file
-  // format (matches upstream: log_var/EMA/call_count are runtime-only
-  // learning state, never serialized to the weight file either).
-  static constexpr int kMaxSGDSamples = 8;  // NeuroPress's NN_MAX_SGD_SAMPLES
-  std::vector<float> log_var_;       // [kOutputDim] uncertainty log-variance
-  std::vector<float> ema_weights_;   // same layout as weights_, grad EMA
-  std::vector<float> ema_biases_;    // same layout as biases_, grad EMA
-  int sgd_call_count_ = 0;
-
-  /** @brief Cached forward-pass activations for one sample (SGD backprop). */
-  struct SGDActivations {
-    std::vector<float> x;                        // [kInputDim] standardized
-    std::vector<float> z1, h1, z2, h2, z3, h3, z4, h4;  // [kHiddenDim] each
-    std::vector<float> y;                         // [kOutputDim] raw output
-  };
-
-  /** @brief Forward pass that additionally caches per-layer activations. */
-  SGDActivations ForwardWithCache(const std::vector<float>& x_norm) const;
 };
 
 }  // namespace ctp::compress::model

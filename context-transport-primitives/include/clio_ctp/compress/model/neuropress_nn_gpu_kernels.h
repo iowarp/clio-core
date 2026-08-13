@@ -151,6 +151,41 @@ bool NeuroPressGpuInferBatchDeviceStats(
     float *out_ratio, float *out_psnr_db, const GpuRankParams *rank = nullptr,
     int *out_order = nullptr, double *out_scores = nullptr);
 
+/**
+ * @brief One deferred decompression-time observation.
+ *
+ * Mirrors upstream's DeferredDecompSample: the CONFIGURATION travels as an
+ * action index and is decoded in-kernel, not spelled out field by field, so
+ * the SGD kernel rebuilds its inputs exactly as the inference kernel does.
+ * error_bound_enc is the RAW bound -- the 1e-7 lossless sentinel is applied at
+ * inference only, and both of upstream's SGD paths feed the raw value
+ * (nn_gpu.cu:2416).
+ */
+struct NeuroPressGpuDecompSample {
+  int action;
+  float error_bound_enc;
+  float data_size_enc;
+  float entropy;
+  float mad;
+  float second_derivative;
+  float actual_decomp_ms;
+};
+
+/**
+ * @brief Deferred head-only SGD for the decompression-time output, on-device.
+ *
+ * Updates ONLY w5 row 1 and b5[1]; the trunk is read-only. One block of 64
+ * threads, as upstream launches it (nn_gpu.cu:2591). Replaces a host-side
+ * read-modify-write that downloaded every parameter, edited two, and uploaded
+ * them all back.
+ *
+ * @return false if the handle is null, there are no samples, or every sample
+ *   was gated out as noise -- in which case no weight was touched.
+ */
+bool NeuroPressGpuTrainDecompHead(NeuroPressGpuWeights *w,
+                                  const NeuroPressGpuDecompSample *samples,
+                                  int num_samples);
+
 /** @brief One real observed outcome to train on (device-uploaded per call). */
 struct NeuroPressGpuSGDSample {
   float raw_input[8];  // same 8-dim layout as NeuroPressGpuInferBatch's rows

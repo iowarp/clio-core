@@ -638,6 +638,161 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
   }
 }
 
+/**
+ * Deferred, head-only SGD for the DEcOMPRESSION-time output, on the GPU.
+ *
+ * Port of nnBatchedDecompSGDKernel (nn_gpu.cu:2382-2560), launched the way
+ * upstream launches it: ONE block of NN_HIDDEN_DIM threads (:2591), lane t
+ * owning w5 row 1's column t.
+ *
+ * Clio did this arithmetic on the host -- download every parameter, edit two,
+ * upload everything back. That was a deliberate choice (one implementation of
+ * the ported math to audit) but it put a device kernel's work on the CPU, and
+ * it is why TrainDecompHead needed the model mutex: a Train() landing inside
+ * the download/upload window was silently reverted.
+ *
+ * Inputs 0-2 are rebuilt from the action here, exactly as upstream rebuilds
+ * them (:2409-2412), and input 3 is the RAW bound -- the 1e-7 lossless
+ * sentinel is an INFERENCE-only substitution and both SGD paths upstream feed
+ * the raw value (:2416, "raw error_bound").
+ *
+ * The trunk W1-W4 is read-only: a decompression-time miss must not perturb the
+ * representation the other three heads share.
+ */
+__global__ void DecompHeadSGDKernel(
+    NeuroPressGpuWeights *__restrict__ w,
+    const NeuroPressGpuDecompSample *__restrict__ samples, int num_samples) {
+  const int t = static_cast<int>(threadIdx.x);  // 0..kHiddenDim-1
+
+  __shared__ float s_x[kInputDim];
+  __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
+      s_h4[kHiddenDim];
+  __shared__ float s_reduce[kHiddenDim];
+  __shared__ float s_err;
+  __shared__ float s_mean_abs_err;
+
+  float acc_gw = 0.0f;       // this lane's dw5[1][t], summed over samples
+  float acc_gb = 0.0f;       // db5[1], lane 0 only
+  float acc_abs_err = 0.0f;  // for the trust region, lane 0 only
+  int valid = 0;
+
+  for (int si = 0; si < num_samples; ++si) {
+    if (t == 0) {
+      int algo, quant, shuffle;
+      DecodeAction(samples[si].action, &algo, &quant, &shuffle);
+      float raw[kInputDim];
+      raw[0] = static_cast<float>(algo);
+      raw[1] = static_cast<float>(quant);
+      raw[2] = static_cast<float>(shuffle);
+      raw[3] = samples[si].error_bound_enc;  // RAW, no sentinel
+      raw[4] = samples[si].data_size_enc;
+      raw[5] = samples[si].entropy;
+      raw[6] = samples[si].mad;
+      raw[7] = samples[si].second_derivative;
+      for (int i = 0; i < kInputDim; ++i) {
+        float sd = w->x_stds[i];
+        if (sd < 1e-8f) sd = 1e-8f;
+        s_x[i] = (raw[i] - w->x_means[i]) / sd;
+      }
+    }
+    __syncthreads();
+
+    float sum = w->params[kOffB1 + t];
+    for (int i = 0; i < kInputDim; ++i)
+      sum += w->params[kOffW1 + t * kInputDim + i] * s_x[i];
+    s_h1[t] = fmaxf(0.0f, sum);
+    __syncthreads();
+
+    sum = w->params[kOffB2 + t];
+    for (int i = 0; i < kHiddenDim; ++i)
+      sum += w->params[kOffW2 + t * kHiddenDim + i] * s_h1[i];
+    s_h2[t] = fmaxf(0.0f, sum);
+    __syncthreads();
+
+    sum = w->params[kOffB3 + t];
+    for (int i = 0; i < kHiddenDim; ++i)
+      sum += w->params[kOffW3 + t * kHiddenDim + i] * s_h2[i];
+    s_h3[t] = fmaxf(0.0f, sum);
+    __syncthreads();
+
+    sum = w->params[kOffB4 + t];
+    for (int i = 0; i < kHiddenDim; ++i)
+      sum += w->params[kOffW4 + t * kHiddenDim + i] * s_h3[i];
+    s_h4[t] = fmaxf(0.0f, sum);
+    __syncthreads();
+
+    // Output 1's head only, error taken in log space (:2470-2488).
+    if (t == 0) {
+      float y_norm = w->params[kOffB5 + 1];
+      for (int i = 0; i < kHiddenDim; ++i)
+        y_norm += w->params[kOffW5 + 1 * kHiddenDim + i] * s_h4[i];
+      float y_std1 = w->y_stds[1];
+      if (y_std1 < 1e-8f) y_std1 = 1e-8f;
+      const float pred_log = y_norm * y_std1 + w->y_means[1];
+      const float clamped =
+          fmaxf(0.01f, fminf(samples[si].actual_decomp_ms, 5000.0f));
+      float err_log = pred_log - log1pf(clamped);
+      err_log = fmaxf(-2.0f, fminf(2.0f, err_log));
+      s_err = err_log / y_std1;
+    }
+    __syncthreads();
+
+    if (fabsf(s_err) < 0.05f) {  // noise gate (:2492)
+      __syncthreads();
+      continue;
+    }
+    acc_gw += s_err * s_h4[t];
+    if (t == 0) {
+      acc_gb += s_err;
+      acc_abs_err += fabsf(s_err);
+    }
+    ++valid;
+    __syncthreads();
+  }
+
+  if (valid == 0) return;
+
+  const float inv_n = 1.0f / static_cast<float>(valid);
+  acc_gw *= inv_n;
+  if (t == 0) acc_gb *= inv_n;
+
+  s_reduce[t] = acc_gw * acc_gw;
+  __syncthreads();
+  for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
+    if (t < s) s_reduce[t] += s_reduce[t + s];
+    __syncthreads();
+  }
+
+  // PER-THREAD g_norm, and deliberately so: upstream writes
+  //   sqrtf(s_reduce[0] + (t == 0 ? acc_gb*acc_gb : 0.0f)) + 1e-8f
+  // (:2519), so lane 0 normalizes by a norm that includes the bias term and
+  // every other lane does not. That is upstream's behaviour, quirk and all --
+  // the host port had to reproduce it with a pair of separately computed
+  // norms, and here it simply falls out.
+  const float g_norm =
+      sqrtf(s_reduce[0] + ((t == 0) ? acc_gb * acc_gb : 0.0f)) + 1e-8f;
+
+  if (t == 0) s_mean_abs_err = acc_abs_err * inv_n;
+  __syncthreads();
+
+  // Trust region, deliberately not Train()'s (:2538-2543).
+  constexpr float kTrustK = 0.15f;
+  constexpr float kMaxStep = 0.05f;
+  constexpr float kMinStep = 1e-4f;
+  constexpr float kWClamp = 5.0f;
+  const float step =
+      fmaxf(kMinStep, fminf(kMaxStep, kTrustK * s_mean_abs_err));
+
+  const float new_w =
+      w->params[kOffW5 + 1 * kHiddenDim + t] - step * (acc_gw / g_norm);
+  w->params[kOffW5 + 1 * kHiddenDim + t] =
+      fmaxf(-kWClamp, fminf(kWClamp, new_w));
+  if (t == 0) {
+    const float new_b = w->params[kOffB5 + 1] - step * (acc_gb / g_norm);
+    w->params[kOffB5 + 1] = fmaxf(-kWClamp, fminf(kWClamp, new_b));
+  }
+}
+
 namespace {
 
 /**
@@ -715,6 +870,32 @@ InferScratch &Infer() {
 }
 
 }  // namespace
+
+bool NeuroPressGpuTrainDecompHead(NeuroPressGpuWeights *w,
+                                  const NeuroPressGpuDecompSample *samples,
+                                  int num_samples) {
+  if (!w || !samples || num_samples <= 0) return false;
+
+  // Per-thread stream and a stream-scoped wait, as everywhere else on this
+  // path. Upstream runs this on its dedicated g_sgd_stream (nn_gpu.cu:2591);
+  // the point either way is that it is not a device-wide barrier.
+  cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
+
+  NeuroPressGpuDecompSample *d_samples = nullptr;
+  const size_t bytes =
+      sizeof(NeuroPressGpuDecompSample) * static_cast<size_t>(num_samples);
+  if (cudaMalloc(&d_samples, bytes) != cudaSuccess) return false;
+
+  bool ok = cudaMemcpyAsync(d_samples, samples, bytes, cudaMemcpyHostToDevice,
+                            st) == cudaSuccess;
+  if (ok) {
+    DecompHeadSGDKernel<<<1, kHiddenDim, 0, st>>>(w, d_samples, num_samples);
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaStreamSynchronize(st) == cudaSuccess;
+  }
+  cudaFree(d_samples);
+  return ok;
+}
 
 bool NeuroPressGpuInferBatchDeviceStats(
     NeuroPressGpuWeights *w, const void *device_stats,
