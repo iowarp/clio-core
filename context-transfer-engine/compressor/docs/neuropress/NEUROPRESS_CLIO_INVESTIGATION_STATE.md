@@ -3337,3 +3337,61 @@ would be the way to extend coverage, and is not yet written.
 Runs on record: `--error-bound` unset (mixed plan), `--error-bound 0.01`,
 `--error-bound-rel 0.005`. All three **8/8 PASS**; the first two also confirmed
 8/8 selection agreement against the real `AsyncDynamicSchedule` path.
+
+#### Phase 29 addendum 2 — WHY quantization is rarely selected (mechanism, measured)
+
+The first addendum recorded that 5 of 8 chunks declined quantization and called it
+"a property of the trained cost model". That is a restatement, not an explanation.
+Computing the actual per-action costs out of `native_trace.json` gives the mechanism,
+and it is not that quantization loses on merit — on most chunks the model emits no
+usable signal at all.
+
+Distinct cost values across all 32 actions, `--error-bound-rel 0.005`:
+
+| chunk | regime | eb | winner | distinct costs | what happened |
+|---|---|---|---|---|---|
+| 0 | constant | 5e-3 | **11 (quant)** | 29 | genuine discrimination |
+| 1 | smooth-wave | 1.0 | 0 | **1** | total tie |
+| 2 | high-entropy | 1e4 | 0 | 2 | quantize at clamp ceiling |
+| 3 | smooth-wave | 1.0 | 0 | **1** | total tie |
+| 4 | noisy-wave | 1.0025 | 0 | **1** | total tie |
+| 5 | small-magnitude | 1e-8 | **31 (quant+shuffle)** | 32 | genuine discrimination |
+| 6 | stepped | 0.0375 | 7 | 16 | genuine discrimination |
+| 7 | mixed-bands | 1e4 | 0 | 2 | quantize at clamp ceiling |
+
+**Three distinct causes.**
+
+**(1) Saturation ties — chunks 1, 3, 4.** All 32 actions carry the *identical* cost
+2.008389. Upstream clamps the network's outputs before ranking: times to
+`[1e-6, 1e6]` then floored at 1.0 ms (`nn_gpu.cu:219-220, :229-230`), ratio capped at
+100.0 (`:231`). On a compressible chunk every action saturates to ratio 100 /
+ct 1.0 / dt 1.0, so `cost = 1 + 1 + 0.008` for all of them. The winner is then decided
+entirely by the tie rule — lowest action index — and action 0 is plain LZ4 with no
+quantize and no shuffle. Quantization did not lose; **nothing distinguished it.** This
+is the same degeneracy the ranking tie-block check reports, seen from the cost side.
+
+**(2) The ratio-sensitive term is ~0.4% of the cost.** Quantization can only influence
+this cost model through the I/O term, `w2 * data_size / (ratio * bandwidth)`. For a
+4 MiB chunk at ratio 100 and the default 5e6 B/ms that is
+`4194304 / (100 * 5e6) = 0.0084 ms`, against `ct + dt = 2.0 ms`. So a genuine 4x
+improvement in ratio moves the cost by ~0.006 ms — three orders of magnitude below the
+time terms. **Under the default weights `w0 = w1 = w2 = 1`, this cost model is
+effectively a LATENCY model, not a ratio model.** Making ratio actually matter means
+raising `w2`, which native exposes as `gpucompress_set_ranking_weights` and Clio
+hardcodes — that is D22-2, and this is the concrete consequence of it.
+
+**(3) Out-of-distribution error bounds — chunks 2, 7, and this one is a flaw in the
+EXPERIMENT, not a finding about the port.** Scaling the bound by a wide data range
+(~2e6) produced eb ≈ 1e4. At that input the network predicts comp_time = 1e6 ms — the
+clamp CEILING, i.e. a blown-up prediction caught by the guard — and for quantize
+actions decomp_time = 1e6 as well, so quantize costs 2e6 against 1e6. The model was
+never trained near such bounds, so its opinion there is meaningless and **those two
+chunks say nothing about quantization's merit.** `--error-bound-rel` must be used with
+a bound that stays in distribution; on wide-range data it does not.
+
+**The honest summary: on the 3 chunks where the model discriminated at all, quantization
+won 2 of 3.** Everywhere else the ranking was degenerate or out of distribution. Both
+implementations reproduced all of this identically (8/8), so none of it is a port
+divergence — but it does mean **quantization coverage in this harness rests on chunks 0
+and 5**, and that widening it needs a data regime and a bound chosen to keep the network
+in distribution while leaving ratio room to matter, not simply a larger bound.
