@@ -16,12 +16,17 @@
  * ranking weights and bandwidth feed the cost model the comparison is
  * checking, so a wrong default here would silently invalidate the test.
  *
- * The two pool functions are no-ops on purpose: they walk the CompContext
- * pool, and the harness creates none.
+ * syncAllCompContextStreams() is a no-op on purpose: it walks the CompContext
+ * pool, and no harness builds one. resetAllSGDEMABuffers() cannot be, because
+ * the flow harness DOES create contexts and the reset-on-reload behavior is
+ * one of the things it checks -- see g_harness_ctx_grad_buffers below.
  */
 
 #include <cuda_runtime.h>
 #include <atomic>
+#include <vector>
+
+#include "nn/nn_weights.h"  // NN_SGD_GRAD_REGION
 
 // gpucompress_api.cpp:62-71 -- verbatim defaults.
 cudaEvent_t g_sgd_done = nullptr;
@@ -36,10 +41,27 @@ bool g_debug_nn = false;                  // stderr ranking dump, off
 
 struct NNDebugPerConfig;
 
+// Stands in for gpucompress_pool.cpp's g_comp_pool: a harness that creates
+// CompContexts registers each one's d_sgd_grad_buffer here. Harnesses that
+// create none leave it empty, and the reset below stays the no-op it was.
+std::vector<float *> g_harness_ctx_grad_buffers;
+
 namespace gpucompress {
 // gpucompress_pool.cpp -- no CompContext pool exists in this harness.
 void syncAllCompContextStreams() {}
-void resetAllSGDEMABuffers() {}
+
+// Mirrors gpucompress_pool.cpp:215-227: zero region 2 (the EMA gradient) of
+// every live context's buffer, leaving regions 0 and 1 alone. Called from
+// loadNNFromBinary (nn_gpu.cu:1808), so a reload restarts every flow's
+// gradient history, not just the reloading thread's.
+void resetAllSGDEMABuffers() {
+  for (float *p : g_harness_ctx_grad_buffers) {
+    if (p) {
+      cudaMemset(p + 2 * NN_SGD_GRAD_REGION, 0,
+                 NN_SGD_GRAD_REGION * sizeof(float));
+    }
+  }
+}
 // gpucompress_diagnostics.cpp -- only reachable when g_debug_nn is on.
 void printNNDebugRanking(const NNDebugPerConfig *, int, float, float, float) {}
 }  // namespace gpucompress

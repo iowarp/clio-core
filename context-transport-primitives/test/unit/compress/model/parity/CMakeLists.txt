@@ -116,5 +116,14 @@ clio_add_neuropress_parity_test(neuropress_dataset_parity_exec
     ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_dataset_parity.cu
     ctp_neuropress_dataset_parity)
 
+# Per-flow SGD state: drives upstream's runNNSGDCtx on two CompContexts
+# against two Clio worker threads. Needs src/api on the include path for the
+# real CompContext layout, and a thread library for the Clio-side flows.
+clio_add_neuropress_parity_test(neuropress_flow_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_flow_parity.cu
+    ctp_neuropress_flow_parity)
+find_package(Threads REQUIRED)
+target_link_libraries(neuropress_flow_parity_exec Threads::Threads)
+
 # The dataset harness sweeps 1 GiB in 4 MiB chunks on both sides.
 set_tests_properties(ctp_neuropress_dataset_parity PROPERTIES TIMEOUT 900)
