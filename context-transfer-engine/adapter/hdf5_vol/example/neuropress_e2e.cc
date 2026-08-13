@@ -169,6 +169,9 @@ hid_t MakeCompressedFapl(hid_t vol_id, const clio::run::PoolId &pool_id) {
 
 }  // namespace
 
+// Host copy of the generated dataset, kept for the verification passes.
+static std::vector<char> wbuf_src;
+
 int main() {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -217,7 +220,8 @@ int main() {
   // Dump the exact bytes for the native replay. Done once, here, so both
   // sides provably compress the same input.
   {
-    std::vector<char> host(kDatasetBytes);
+    std::vector<char> &host = wbuf_src;
+    host.resize(kDatasetBytes);
     CUDA_CHECK(cudaMemcpy(host.data(), d_wbuf, kDatasetBytes,
                           cudaMemcpyDeviceToHost));
     std::FILE *f = std::fopen(data_dump.c_str(), "wb");
@@ -271,6 +275,67 @@ int main() {
                "compress -> store): "
             << write_elapsed * 1000.0 << " ms (" << write_mb_s << " MiB/s)"
             << std::endl;
+
+  // ---- Clio decompresses its OWN compressed blobs, verified against the
+  // source.
+  //
+  // Going through H5Dread does not test this. The VOL writes the plain data
+  // to native HDF5 as well as staging compressed chunks into the tier, and
+  // on reopen its coherence check finds no stamp blob, drops the tag, and
+  // serves the read from the uncompressed HDF5 copy instead
+  // (clio_vol.cc:1126, :2409). The bytes match, but nothing decompresses.
+  //
+  // The compressed blobs are still live between this close and that reopen,
+  // so ask the compressor for them directly -- the same
+  // AsyncDecompressExplicit call the VOL's cache-hit path uses
+  // (clio_vol.cc:2043) -- and compare each chunk to the source.
+  {
+    auto *cte = CLIO_CTE_CLIENT;
+    auto tag = cte->AsyncGetOrCreateTag(std::string("hdf5:") + kH5File);
+    tag.Wait();
+    clio::cte::compressor::Client dec_client;
+    dec_client.Init(compressor_pool_id);
+
+    size_t decompressed_ok = 0, decompressed_bad = 0, failed = 0;
+    size_t total_bad_bytes = 0;
+    for (size_t c = 0; c < kNumChunks; ++c) {
+      auto buffer = CLIO_IPC->AllocateBuffer(kChunkBytes);
+      if (buffer.IsNull()) { ++failed; continue; }
+      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+      const std::string blob_name =
+          std::string("neuropress_e2e_data/chunk_") + std::to_string(c);
+      auto fut = dec_client.AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), tag->tag_id_, blob_name, 0,
+          kChunkBytes, 0, blob_data, cte->pool_id_);
+      fut.Wait();
+      if (fut->GetReturnCode() != 0) {
+        ++failed;
+        CLIO_IPC->FreeBuffer(buffer);
+        continue;
+      }
+      const char *got = static_cast<const char *>(buffer.ptr_);
+      const char *want = wbuf_src.data() + c * kChunkBytes;
+      if (std::memcmp(got, want, kChunkBytes) == 0) {
+        ++decompressed_ok;
+      } else {
+        ++decompressed_bad;
+        for (size_t i = 0; i < kChunkBytes; ++i) {
+          if (got[i] != want[i]) ++total_bad_bytes;
+        }
+      }
+      CLIO_IPC->FreeBuffer(buffer);
+    }
+    std::cout << "\nClio decompress of its own compressed blobs:\n"
+              << "  exact       : " << decompressed_ok << " / " << kNumChunks
+              << "\n  differing   : " << decompressed_bad
+              << " (" << total_bad_bytes << " bytes)"
+              << "\n  unavailable : " << failed << std::endl;
+    if (decompressed_ok == kNumChunks) {
+      std::cout << "CLIO DECOMPRESSION VERIFIED: every chunk restored from "
+                   "its compressed blob matches the source exactly."
+                << std::endl;
+    }
+  }
 
   // Reopen fresh so the read genuinely decompresses rather than reusing an
   // in-process handle from the write above.

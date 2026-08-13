@@ -131,6 +131,7 @@ footer{margin-top:72px;padding-top:26px;border-top:1px solid var(--rule);
 <div class="verdict">
   <div class="v is-ok"><div class="k">Routing</div><div class="n">256/256</div><div class="s">identical selections, 0 divergent</div></div>
   <div class="v is-ok"><div class="k">Input bytes</div><div class="n">256/256</div><div class="s">FNV-1a, hashed on both sides</div></div>
+  <div class="v is-ok"><div class="k">Restored bytes</div><div class="n">256/256</div><div class="s">compress &rarr; decompress exact</div></div>
   <div class="v is-ok"><div class="k">Payload size</div><div class="n">256/256</div><div class="s">codec output, headers excluded</div></div>
   <div class="v is-warn"><div class="k">Payload bytes</div><div class="n">47/256</div><div class="s">codec is order-dependent</div></div>
 </div>
@@ -164,6 +165,34 @@ footer{margin-top:72px;padding-top:26px;border-top:1px solid var(--rule);
 <p class="caption">The ratio gap is entirely NeuroPress's 64-byte metadata header, which its reported size includes and Clio's does not &mdash; a constant &minus;64 bytes on every one of the 256 chunks.</p>
 
 <div class="col">
+<h2>Integrity: is the data actually restored?</h2>
+<p>Yes. Clio decompresses its own 256 compressed blobs back to the source byte for byte, and NeuroPress decodes those same payloads to the same result. Establishing it took more than the obvious check, because the obvious check was measuring the wrong thing.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Check</th><th class="num">Result</th><th>What it proves</th></tr></thead>
+<tbody>
+<tr><td><strong>Clio decompresses its own blobs &rarr; source</strong></td><td class="num">256/256</td><td>Clio&rsquo;s own decompress path, verified</td></tr>
+<tr><td>Clio payload decoded by native &rarr; source</td><td class="num">256/256</td><td>the two formats are interchangeable</td></tr>
+<tr><td>&nbsp;&nbsp;&nbsp;of which ANS</td><td class="num">191/191</td><td>exact despite differing from native&rsquo;s bytes</td></tr>
+<tr><td>&nbsp;&nbsp;&nbsp;of which Cascaded / LZ4</td><td class="num">57 / 8</td><td>&nbsp;</td></tr>
+<tr><td>Native payload decoded &rarr; source</td><td class="num">256/256</td><td>native round trip</td></tr>
+<tr><td>Total differing bytes</td><td class="num">0</td><td>of 1,073,741,824</td></tr>
+<tr><td>Clio source hash = file on disk</td><td class="num">256/256</td><td>the source is the real dataset</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="col">
+<div class="note">
+  <div class="t">What the H5Dread round trip did not show</div>
+  <p>Clio&rsquo;s own read reported the dataset restored exactly, and the bytes did match &mdash; but <strong>it never decompressed anything</strong>. On reopen the VOL&rsquo;s coherence check finds no stamp blob, drops the cache tag, and the read falls through to <em>&ldquo;native read is the source of truth&rdquo;</em>: the uncompressed HDF5 copy the VOL also writes.</p>
+  <p>The run log says so plainly &mdash; <code>DelTag successful &hellip; removed 1 tags, 256 blobs</code> some 5,000 lines before the read, zero Decompress tasks for the whole run, and every chunk appearing twice in the selection log because a miss re-stages what it just read.</p>
+  <p>So that check verified HDF5 fidelity, not the compressor. The rows above replace it: the compressed blobs are still live between that close and the reopen, so they are handed straight to <code>AsyncDecompressExplicit</code> &mdash; the same call the VOL&rsquo;s own cache-hit path makes &mdash; and separately to NeuroPress&rsquo;s decoder.</p>
+</div>
+<p>A consequence worth separating from the port&rsquo;s correctness: because no stamp is written at close, the tier is dropped on <em>every</em> reopen, so a compressed read is never served and each read re-compresses all 256 chunks to re-stage. That is also why reads take 25&ndash;40 s against 1.9 s for the write.</p>
+
 <h2>What did not: the compressed byte stream</h2>
 <p>The two produce compressed payloads of <strong>identical length</strong> that decompress to <strong>identical data</strong>, but the bytes themselves differ for most chunks. This is not a difference between the two implementations &mdash; it is a property of the codec both of them call.</p>
 </div>
