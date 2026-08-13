@@ -335,71 +335,112 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
 /** Grad accumulation (one thread per weight element; sums the window's nodes in
  *  order and += into the global double grad -- deterministic across windows because
  *  the launches serialize on one stream). */
+/** Number of node-range splits for the dW1 reduction. See GradW1Kernel. */
+constexpr int kGradSplits = 32;
+
 /**
- * dW1[h][f] += sum_n dz1[n][h] * A[n][f].
+ * dW1[h][f] += sum_n dz1[n][h] * A[n][f], split over n.
  *
- * DELIBERATELY UNTILED. Tiling this through shared memory was tried and is
- * SLOWER (1.37s against 1.12s), because the kernel is not bandwidth-bound:
- * it is H*F*nn = 4.3e9 DOUBLE fused multiply-adds per window, and this GPU
- * runs FP64 at 1/64 of FP32, so the arithmetic dominates and staging just
- * adds overhead. Widening the node chunk to cut __syncthreads() made no
- * difference either (1.38s -> 1.37s), which is what confirmed it.
+ * The natural form gives one thread the whole reduction for its (h,f), which
+ * is only H*F = 8192 threads -- far too few to fill this GPU, and it measured
+ * ~11% of FP64 peak while being 9.0s of a 22.6s run. Splitting the node range
+ * kGradSplits ways multiplies the thread count by 32 without changing the
+ * arithmetic each thread does.
  *
- * The reads are already coalesced: consecutive idx give consecutive f, so a
- * warp reads 32 contiguous floats of A, and dz1[n*H+h] is a broadcast.
+ * STILL FP64 and STILL DETERMINISTIC. Each thread sums a contiguous ascending
+ * n-range in double, and GradW1ReduceKernel folds the partials in fixed split
+ * order. No atomics: an atomicAdd over doubles would make the order
+ * run-dependent, and the test asserts the streamed run reproduces the in-core
+ * run exactly. The order differs from the unsplit version, but both the
+ * in-core and the vector path run this same kernel, so they still agree
+ * bit-for-bit.
  *
- * Making this materially faster means accumulating in float and only
- * periodically folding into the double, which changes the rounding of the
- * gradient. That is an accuracy decision, not a performance one, so it is
- * not taken here.
+ * Tiling this through shared memory was tried instead and is SLOWER (1.37s vs
+ * 1.12s at 1 GiB): the kernel is arithmetic-bound, not bandwidth-bound, so
+ * staging buys nothing. Its global reads are already coalesced -- consecutive
+ * idx give consecutive f, so a warp reads 32 contiguous floats of A.
  */
 __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn,
-                             int F, int H, double *dW1, double *db1) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+                             int F, int H, double *part, double *partb) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= H * F) return;
-  int h = idx / F, f = idx % F;
+  const int sp = blockIdx.y;
+  const int h = idx / F, f = idx % F;
+  const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
+  const clio::run::u64 lo = (clio::run::u64)sp * chunk;
+  const clio::run::u64 hi = min(lo + chunk, nn);
   double s = 0.0;
-  for (clio::run::u64 n = 0; n < nn; ++n) s += (double)dz1[n * H + h] * (double)A[n * F + f];
-  dW1[idx] += s;
-  if (f == 0) { double sb = 0.0; for (clio::run::u64 n = 0; n < nn; ++n) sb += (double)dz1[n * H + h]; db1[h] += sb; }
+  for (clio::run::u64 n = lo; n < hi; ++n) {
+    s += (double)dz1[n * H + h] * (double)A[n * F + f];
+  }
+  part[(clio::run::u64)sp * H * F + idx] = s;
+  if (f == 0) {
+    double sb = 0.0;
+    for (clio::run::u64 n = lo; n < hi; ++n) sb += (double)dz1[n * H + h];
+    partb[(clio::run::u64)sp * H + h] = sb;
+  }
 }
 
-/** dW2[c][h] += sum_n dz2[n][c] * h1[n][h], tiled. See GradW1Kernel -- same
- *  shape, same reason, same preserved accumulation order (h1 was being read C
- *  times per window). */
-__global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
-                             int H, int C, double *dW2, double *db2) {
-  constexpr int kTC = 8, kTH = 16, kTN = 256;
-  __shared__ float sH[kTN][kTH];
-  __shared__ float sD[kTN][kTC];
-  const int h0 = blockIdx.x * kTH;
-  const int c0 = blockIdx.y * kTC;
-  const int th = threadIdx.x % kTH;
-  const int tc = threadIdx.x / kTH;
-  double s = 0.0, sb = 0.0;
-  for (clio::run::u64 n0 = 0; n0 < nn; n0 += kTN) {
-    for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
-      const int r = i / kTH, c = i % kTH;
-      const clio::run::u64 n = n0 + r;
-      sH[r][c] = (n < nn && h0 + c < H) ? h1[n * (clio::run::u64)H + h0 + c] : 0.f;
-    }
-    for (int i = threadIdx.x; i < kTN * kTC; i += blockDim.x) {
-      const int r = i / kTC, c = i % kTC;
-      const clio::run::u64 n = n0 + r;
-      sD[r][c] = (n < nn && c0 + c < C) ? dz2[n * (clio::run::u64)C + c0 + c] : 0.f;
-    }
-    __syncthreads();
-    const int lim = (int)min((clio::run::u64)kTN, nn - n0);
-    for (int r = 0; r < lim; ++r) {
-      s += (double)sD[r][tc] * (double)sH[r][th];
-    }
-    if (blockIdx.x == 0 && th == 0) {
-      for (int r = 0; r < lim; ++r) sb += (double)sD[r][tc];
-    }
-    __syncthreads();
+/** Fold GradW1Kernel's per-split partials in fixed order. */
+__global__ void GradW1ReduceKernel(const double *part, const double *partb,
+                                   int F, int H, double *dW1, double *db1) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < H * F) {
+    double s = 0.0;
+    for (int sp = 0; sp < kGradSplits; ++sp) s += part[(clio::run::u64)sp * H * F + idx];
+    dW1[idx] += s;
   }
-  if (c0 + tc < C && h0 + th < H) dW2[(c0 + tc) * H + h0 + th] += s;
-  if (blockIdx.x == 0 && th == 0 && c0 + tc < C) db2[c0 + tc] += sb;
+  if (idx < H) {
+    double sb = 0.0;
+    for (int sp = 0; sp < kGradSplits; ++sp) sb += partb[(clio::run::u64)sp * H + idx];
+    db1[idx] += sb;
+  }
+}
+
+/**
+ * dW2[c][h] += sum_n dz2[n][c] * h1[n][h], split over n like GradW1Kernel.
+ *
+ * C*H is only 2560 threads here, and a shared-memory tiled version launched
+ * just 20 blocks. Splitting the node range gives 32x the threads for the same
+ * per-thread arithmetic, and beats the tiled form (which was itself an
+ * improvement on the naive one). Same determinism argument: contiguous
+ * ascending n-ranges in double, folded in fixed split order, no atomics.
+ */
+__global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
+                             int H, int C, double *part, double *partb) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= C * H) return;
+  const int sp = blockIdx.y;
+  const int c = idx / H, h = idx % H;
+  const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
+  const clio::run::u64 lo = (clio::run::u64)sp * chunk;
+  const clio::run::u64 hi = min(lo + chunk, nn);
+  double s = 0.0;
+  for (clio::run::u64 n = lo; n < hi; ++n) {
+    s += (double)dz2[n * C + c] * (double)h1[n * H + h];
+  }
+  part[(clio::run::u64)sp * C * H + idx] = s;
+  if (h == 0) {
+    double sb = 0.0;
+    for (clio::run::u64 n = lo; n < hi; ++n) sb += (double)dz2[n * C + c];
+    partb[(clio::run::u64)sp * C + c] = sb;
+  }
+}
+
+/** Fold GradW2Kernel's per-split partials in fixed order. */
+__global__ void GradW2ReduceKernel(const double *part, const double *partb,
+                                   int H, int C, double *dW2, double *db2) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < C * H) {
+    double s = 0.0;
+    for (int sp = 0; sp < kGradSplits; ++sp) s += part[(clio::run::u64)sp * C * H + idx];
+    dW2[idx] += s;
+  }
+  if (idx < C) {
+    double sb = 0.0;
+    for (int sp = 0; sp < kGradSplits; ++sp) sb += partb[(clio::run::u64)sp * C + idx];
+    db2[idx] += sb;
+  }
 }
 /** Deterministic loss reduction: one thread sums the window's per-node losses in
  *  order and adds to the global loss (windows serialize on the stream -> the total
@@ -553,12 +594,23 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   // Device weights + grads + window buffers.
   const clio::run::u64 max_nn = (clio::run::u64)window * page_rows;
   float *dW1, *db1, *dW2, *db2; double *gW1, *gb1, *gW2, *gb2;
+  // Per-split partials for the dW1 reduction (kGradSplits ways).
+  double *gw1_part = nullptr, *gb1_part = nullptr;
+  double *gw2_part = nullptr, *gb2_part = nullptr;
   float *h1_buf, *dz1_buf, *dz2_buf, *d_scratch;
   REQUIRE(cudaMalloc(&dW1, H * F * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&db1, H * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&dW2, C * H * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&db2, C * sizeof(float)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gW1, H * F * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gw1_part,
+                     (size_t)kGradSplits * H * F * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gb1_part,
+                     (size_t)kGradSplits * H * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gw2_part,
+                     (size_t)kGradSplits * C * H * sizeof(double)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&gb2_part,
+                     (size_t)kGradSplits * C * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gb1, H * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gW2, C * H * sizeof(double)) == cudaSuccess);
   REQUIRE(cudaMalloc(&gb2, C * sizeof(double)) == cudaSuccess);
@@ -652,10 +704,15 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
       if (ktime) { ctp::GpuApi::Synchronize(); t_fwd += NowSec() - tp0; tp0 = NowSec(); }
       track_peak();
-      GradW1Kernel<<<(H * F + tpb - 1) / tpb, tpb>>>(d_scratch, dz1_buf, nn, F, H, gW1, gb1);
+      GradW1Kernel<<<dim3((H * F + tpb - 1) / tpb, kGradSplits), tpb>>>(
+          d_scratch, dz1_buf, nn, F, H, gw1_part, gb1_part);
+      GradW1ReduceKernel<<<(H * F + tpb - 1) / tpb, tpb>>>(
+          gw1_part, gb1_part, F, H, gW1, gb1);
       if (ktime) { ctp::GpuApi::Synchronize(); t_gw1 += NowSec() - tp0; tp0 = NowSec(); }
-      GradW2Kernel<<<dim3((H + 15) / 16, (C + 7) / 8), 128>>>(
-          h1_buf, dz2_buf, nn, H, C, gW2, gb2);
+      GradW2Kernel<<<dim3((C * H + tpb - 1) / tpb, kGradSplits), tpb>>>(
+          h1_buf, dz2_buf, nn, H, C, gw2_part, gb2_part);
+      GradW2ReduceKernel<<<(C * H + tpb - 1) / tpb, tpb>>>(
+          gw2_part, gb2_part, H, C, gW2, gb2);
       if (ktime) { ctp::GpuApi::Synchronize(); t_gw2 += NowSec() - tp0; }
       if (kMinibatch) {
         // Mini-batch SGD: one weight update per window instead of one per epoch,
