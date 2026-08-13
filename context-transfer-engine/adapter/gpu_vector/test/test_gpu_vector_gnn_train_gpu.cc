@@ -621,10 +621,25 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       gather(w, first, nn);   // fills d_scratch with nn*F floats
       if (ktime) { ctp::GpuApi::Synchronize(); t_gather += NowSec() - tp0; tp0 = NowSec(); }
       int tpb = 128;
+      // TRIED AND REVERTED: templating this kernel on the per-thread array
+      // bounds so a 64/40 run would not carry kMaxH/kMaxC (256/192) worth of
+      // local scratch. The instantiation does not survive this build's device
+      // linking -- the launch fails with "invalid device function" -- and the
+      // failure is silent unless the error below is checked.
       TrainNodeKernel<<<(int)((nn + tpb - 1) / tpb), tpb>>>(
           d_scratch, nn, first, d_lab, F, H, C, dW1, db1, dW2, db2,
           h1_buf, dz1_buf, dz2_buf, loss_buf, d_correct, d_count,
           d_vcorrect, d_vcount);
+      // A launch that fails leaves loss_buf untouched, and the test then
+      // compares two runs of zeros and calls them BIT-EXACT. Check it.
+      {
+        const cudaError_t le = cudaGetLastError();
+        if (le != cudaSuccess) {
+          std::fprintf(stderr, "[TRAIN] TrainNodeKernel launch FAILED: %s\n",
+                       cudaGetErrorString(le));
+          REQUIRE(le == cudaSuccess);
+        }
+      }
       LossReduceKernel<<<1, 1>>>(loss_buf, nn, d_loss);
       if (ktime) { ctp::GpuApi::Synchronize(); t_fwd += NowSec() - tp0; tp0 = NowSec(); }
       track_peak();
