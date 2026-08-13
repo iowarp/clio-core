@@ -582,9 +582,24 @@ TEST_CASE("gpu_vector: k-means capacity comparison (traditional in-core vs "
     }
     }  // end UVM size gate
     // ---- METHOD 4: STAGED (host->device window streaming, uncompressed) ----
+    // A staged out-of-core pipeline must hold the (uncompressed) dataset host-
+    // resident, so its capacity ceiling is host RAM. We measure runtime via
+    // windowed H2D streaming, but gate capacity at the host-RAM budget
+    // (CLIO_KM_HOST_GIB, else /proc/meminfo MemAvailable) so staged OOMs past
+    // host RAM -- exactly where Eternia keeps going by compressing + tiering to
+    // NVMe/PFS. This is the crossover that shows compression+tiering is required.
+    long long host_gib = 0;
+    if (const char *hg = std::getenv("CLIO_KM_HOST_GIB")) host_gib = std::atoll(hg);
+    else { std::ifstream mi("/proc/meminfo"); std::string k; long kb=0; std::string unit;
+           while (mi >> k >> kb >> unit) { if (k=="MemAvailable:") { host_gib = kb/1024/1024; break; } } }
     const clio::run::u64 win_e = (clio::run::u64)window * epp;
     float *d_win = nullptr; float *h_win = nullptr;
-    if (cudaMalloc(&d_win, win_e * sizeof(float)) == cudaSuccess &&
+    if (host_gib > 0 && (long long)(dataset_bytes >> 30) > host_gib) {
+      stg_status = "OOM_HOSTRAM";
+      std::fprintf(stderr, "[CAP] STAGED: *** OOM *** cannot hold %lluGiB uncompressed "
+                   "dataset in %lldGiB host RAM (staged must be host-resident)\n",
+                   (unsigned long long)(dataset_bytes >> 30), host_gib);
+    } else if (cudaMalloc(&d_win, win_e * sizeof(float)) == cudaSuccess &&
         cudaHostAlloc((void**)&h_win, win_e * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
       g_free_min = SIZE_MAX; sample_peak();
       std::vector<float> scen(init); double sprev = 0.0, st0 = NowSec();

@@ -1,0 +1,13 @@
+method,size_gib,ran,peak_gpu_mib,throughput_mibps,time_per_iter_s,inertia,notes
+incore,32,ran,33196,30100.1,1.089,98616773.0,fits HBM
+incore,48,OOM,-1,0,-1,0,cudaMalloc>40GiB
+zerocopy,32,ran,492,10054.4,3.259,98616773.0,mapped host RAM; PCIe-bound
+zerocopy,64,ran,556,10051.9,6.520,197238977.2,
+zerocopy,96,ran,620,10032.4,9.799,295853385.3,ceiling=pinned host RAM
+gds,32,BROKEN,432,0,0.003,0.0,cuFileRead compat failed (inertia=0) -> refit with pread
+gds_compat,32,ran,432,6471.8,5.063,98616773.0,file-streaming from disk (real GDS N/A: no nvidia-fs)
+gds_compat,96,ran,432,5602.5,17.546,295853385.3,
+gds_compat,256,ran,432,3172.7,82.624,788943048.3,runs past host RAM (disk-backed)
+gds_compat,320,ran,432,2522.1,129.922,986180952.6,320GB from disk; peak 432MiB
+zerocopy,256,OOM_PINNED,-1,0,-1,0,pinnable host RAM < 256GiB
+zerocopy,320,OOM_PINNED,-1,0,-1,0,pinnable host RAM < 320GiB
