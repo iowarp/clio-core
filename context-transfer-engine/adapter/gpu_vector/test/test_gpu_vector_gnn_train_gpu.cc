@@ -385,8 +385,20 @@ constexpr int kGradSplits = 32;
 __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn,
                              int F, int H, double *part, double *partb) {
   constexpr int kTH = 16, kTF = 16, kTN = 64;
-  __shared__ float sA[kTN][kTF];
-  __shared__ float sD[kTN][kTH];
+  // The shared tiles hold DOUBLE, not float. The inner loop is
+  // s += (double)sD * (double)sA, and on this GPU cvt.f64.f32 issues to the
+  // same FP64 unit as the FMA, at the same 1/64 rate -- so a float tile costs
+  // TWO conversions per useful multiply-add, i.e. three FP64-unit ops to do
+  // one, which is what pinned the kernel near 20% of the FP64 ceiling after
+  // occupancy, traffic and ILP had each been fixed and each moved it a few
+  // percent. Converting once at load time instead makes it 0.125 conversions
+  // per FMA rather than 2.
+  //
+  // Exact, not approximate: a float-to-double conversion is lossless, and the
+  // product of two floats needs 48 mantissa bits so the double multiply was
+  // already exact. Same values, same order, same result.
+  __shared__ double sA[kTN][kTF];
+  __shared__ double sD[kTN][kTH];
   const int f0 = blockIdx.x * kTF;
   const int h0 = blockIdx.y * kTH;
   const int sp = blockIdx.z;
@@ -395,28 +407,49 @@ __global__ void GradW1Kernel(const float *A, const float *dz1, clio::run::u64 nn
   const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
   const clio::run::u64 lo = (clio::run::u64)sp * chunk;
   const clio::run::u64 hi = min(lo + chunk, nn);
-  double s = 0.0, sb = 0.0;
+  // FOUR ACCUMULATORS, not one. A single `s` makes every FP64 FMA depend on
+  // the previous one, so the loop runs at the latency of the FMA pipeline
+  // rather than its throughput -- which is why this kernel sat at ~20% of the
+  // FP64 ceiling even after it had enough threads and its traffic cut. Four
+  // independent chains give the scheduler four FMAs to keep in flight.
+  //
+  // This DOES change the summation order (s0 takes r=0,4,8..., s1 takes
+  // r=1,5,9..., combined pairwise at the end) and so the last bits of the
+  // gradient can differ from the single-accumulator form. It is not a
+  // precision downgrade: everything stays FP64, and splitting one long
+  // sequential sum into four shorter ones then combining pairwise is if
+  // anything better conditioned. It stays deterministic, and both the in-core
+  // and the streamed path run this same kernel, so they still agree exactly.
+  double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, sb = 0.0;
   for (clio::run::u64 n0 = lo; n0 < hi; n0 += kTN) {
     const int lim = (int)min((clio::run::u64)kTN, hi - n0);
     for (int i = threadIdx.x; i < kTN * kTF; i += blockDim.x) {
       const int r = i / kTF, c = i % kTF;
       sA[r][c] = (r < lim && f0 + c < F)
-                     ? A[(n0 + r) * (clio::run::u64)F + f0 + c] : 0.f;
+                     ? (double)A[(n0 + r) * (clio::run::u64)F + f0 + c] : 0.0;
     }
     for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
       const int r = i / kTH, c = i % kTH;
       sD[r][c] = (r < lim && h0 + c < H)
-                     ? dz1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.f;
+                     ? (double)dz1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.0;
     }
     __syncthreads();
-    for (int r = 0; r < lim; ++r) s += (double)sD[r][th] * (double)sA[r][tf];
+    int r = 0;
+    for (; r + 3 < lim; r += 4) {
+      s0 += sD[r][th] * sA[r][tf];
+      s1 += sD[r + 1][th] * sA[r + 1][tf];
+      s2 += sD[r + 2][th] * sA[r + 2][tf];
+      s3 += sD[r + 3][th] * sA[r + 3][tf];
+    }
+    for (; r < lim; ++r) s0 += sD[r][th] * sA[r][tf];
     // db1 sums dz1 alone: only the first f-tile accumulates it, or every
     // f-tile would contribute its own copy.
     if (blockIdx.x == 0 && tf == 0) {
-      for (int r = 0; r < lim; ++r) sb += (double)sD[r][th];
+      for (int r = 0; r < lim; ++r) sb += sD[r][th];
     }
     __syncthreads();
   }
+  const double s = (s0 + s1) + (s2 + s3);
   if (h0 + th < H && f0 + tf < F) {
     part[(clio::run::u64)sp * H * F + (h0 + th) * F + f0 + tf] = s;
   }
@@ -442,32 +475,59 @@ __global__ void GradW1ReduceKernel(const double *part, const double *partb,
 }
 
 /**
- * dW2[c][h] += sum_n dz2[n][c] * h1[n][h], split over n like GradW1Kernel.
+ * dW2[c][h] += sum_n dz2[n][c] * h1[n][h]: tiled, split over n, DOUBLE tiles.
  *
- * C*H is only 2560 threads here, and a shared-memory tiled version launched
- * just 20 blocks. Splitting the node range gives 32x the threads for the same
- * per-thread arithmetic, and beats the tiled form (which was itself an
- * improvement on the naive one). Same determinism argument: contiguous
- * ascending n-ranges in double, folded in fixed split order, no atomics.
+ * Same three fixes as GradW1Kernel and for the same reasons -- see there. The
+ * one that mattered was staging the tiles as double: cvt.f64.f32 issues to the
+ * FP64 unit at 1/64 rate on this GPU, so converting inside the inner loop
+ * costs two such ops per useful multiply-add.
  */
 __global__ void GradW2Kernel(const float *h1, const float *dz2, clio::run::u64 nn,
                              int H, int C, double *part, double *partb) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= C * H) return;
-  const int sp = blockIdx.y;
-  const int c = idx / H, h = idx % H;
+  constexpr int kTH = 16, kTC = 8, kTN = 64;
+  __shared__ double sH[kTN][kTH];
+  __shared__ double sD[kTN][kTC];
+  const int h0 = blockIdx.x * kTH;
+  const int c0 = blockIdx.y * kTC;
+  const int sp = blockIdx.z;
+  const int th = threadIdx.x % kTH;
+  const int tc = threadIdx.x / kTH;
   const clio::run::u64 chunk = (nn + kGradSplits - 1) / kGradSplits;
   const clio::run::u64 lo = (clio::run::u64)sp * chunk;
   const clio::run::u64 hi = min(lo + chunk, nn);
-  double s = 0.0;
-  for (clio::run::u64 n = lo; n < hi; ++n) {
-    s += (double)dz2[n * C + c] * (double)h1[n * H + h];
+  double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, sb = 0.0;
+  for (clio::run::u64 n0 = lo; n0 < hi; n0 += kTN) {
+    const int lim = (int)min((clio::run::u64)kTN, hi - n0);
+    for (int i = threadIdx.x; i < kTN * kTH; i += blockDim.x) {
+      const int r = i / kTH, c = i % kTH;
+      sH[r][c] = (r < lim && h0 + c < H)
+                     ? (double)h1[(n0 + r) * (clio::run::u64)H + h0 + c] : 0.0;
+    }
+    for (int i = threadIdx.x; i < kTN * kTC; i += blockDim.x) {
+      const int r = i / kTC, c = i % kTC;
+      sD[r][c] = (r < lim && c0 + c < C)
+                     ? (double)dz2[(n0 + r) * (clio::run::u64)C + c0 + c] : 0.0;
+    }
+    __syncthreads();
+    int r = 0;
+    for (; r + 3 < lim; r += 4) {
+      s0 += sD[r][tc] * sH[r][th];
+      s1 += sD[r + 1][tc] * sH[r + 1][th];
+      s2 += sD[r + 2][tc] * sH[r + 2][th];
+      s3 += sD[r + 3][tc] * sH[r + 3][th];
+    }
+    for (; r < lim; ++r) s0 += sD[r][tc] * sH[r][th];
+    if (blockIdx.x == 0 && th == 0) {
+      for (int k = 0; k < lim; ++k) sb += sD[k][tc];
+    }
+    __syncthreads();
   }
-  part[(clio::run::u64)sp * C * H + idx] = s;
-  if (h == 0) {
-    double sb = 0.0;
-    for (clio::run::u64 n = lo; n < hi; ++n) sb += (double)dz2[n * C + c];
-    partb[(clio::run::u64)sp * C + c] = sb;
+  const double s = (s0 + s1) + (s2 + s3);
+  if (c0 + tc < C && h0 + th < H) {
+    part[(clio::run::u64)sp * C * H + (c0 + tc) * H + h0 + th] = s;
+  }
+  if (blockIdx.x == 0 && th == 0 && c0 + tc < C) {
+    partb[(clio::run::u64)sp * C + c0 + tc] = sb;
   }
 }
 
@@ -753,7 +813,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       GradW1ReduceKernel<<<(H * F + tpb - 1) / tpb, tpb>>>(
           gw1_part, gb1_part, F, H, gW1, gb1);
       if (ktime) { ctp::GpuApi::Synchronize(); t_gw1 += NowSec() - tp0; tp0 = NowSec(); }
-      GradW2Kernel<<<dim3((C * H + tpb - 1) / tpb, kGradSplits), tpb>>>(
+      GradW2Kernel<<<dim3((H + 15) / 16, (C + 7) / 8, kGradSplits), 128>>>(
           h1_buf, dz2_buf, nn, H, C, gw2_part, gb2_part);
       GradW2ReduceKernel<<<(C * H + tpb - 1) / tpb, tpb>>>(
           gw2_part, gb2_part, H, C, gW2, gb2);
