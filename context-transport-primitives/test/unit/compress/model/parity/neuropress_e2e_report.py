@@ -101,6 +101,22 @@ def line(label, a, b, note=""):
     print(f"  {label:<26} {a:>22}  {b:>22}  {note}")
 
 
+def cmp_line(label, key_c, key_n):
+    """Row for a value both sides report.
+
+    Shows each side's OWN range and puts the agreement in the note. An
+    earlier version printed only the max relative difference, in the NATIVE
+    column -- which reads as though native had measured zero when the two
+    agree exactly. The value and the agreement are different things and the
+    table has to keep them apart.
+    """
+    cv = [float(clio[c][key_c]) for c in common]
+    nv = [float(nat[c][key_n]) for c in common]
+    rel = max(abs(x - y) / max(1e-12, abs(x), abs(y)) for x, y in zip(cv, nv))
+    line(label, f"{min(cv):.4g}..{max(cv):.4g}",
+         f"{min(nv):.4g}..{max(nv):.4g}", f"max rel diff {rel:.3e}")
+
+
 print("=" * 96)
 print("E2E COMPARISON  --  Clio-NeuroPress vs native NeuroPress")
 print(f"chunks compared: {n}   chunk size: {CHUNK // (1024*1024)} MiB   "
@@ -140,13 +156,13 @@ line("NN routing decisions",
      f"{n - len(route_mismatch)}/{n} agree", f"{len(route_mismatch)} divergent",
      f"mismatch rate {100.0*len(route_mismatch)/n:.2f}%")
 
+# --- statistics the selection ranked on (values, not just agreement)
+for k in ("entropy", "mad", "second_deriv"):
+    cmp_line(f"input stat: {k}", k, k)
+
 # --- predictions
 for k in ("pred_ratio", "pred_ct_ms", "pred_dt_ms", "pred_psnr"):
-    line(f"NN {k}", "—", f"{maxrel(k, k):.3e}", "max rel. diff")
-
-# --- statistics the selection ranked on
-for k in ("entropy", "mad", "second_deriv"):
-    line(f"input stat: {k}", "—", f"{maxrel(k, k):.3e}", "max rel. diff")
+    cmp_line(f"NN {k}", k, k)
 
 # --- compression
 cr = [float(clio[c]["actual_ratio"]) for c in common]
