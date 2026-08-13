@@ -338,6 +338,7 @@ int main(int argc, char **argv) {
    */
   double error_bound_rel =
       std::atof(EnvOr("NPEQ_ERROR_BOUND_REL", "-1").c_str());
+  std::string weights_dir_override = EnvOr("NPEQ_WEIGHTS", "");
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--out" && i + 1 < argc) {
@@ -346,6 +347,12 @@ int main(int argc, char **argv) {
       error_bound_override = std::atof(argv[++i]);
     } else if (arg == "--error-bound-rel" && i + 1 < argc) {
       error_bound_rel = std::atof(argv[++i]);
+    } else if (arg == "--weights" && i + 1 < argc) {
+      // Point BOTH sides at a different model directory. Exists so the claim
+      // "the network's weights are actually being used" can be tested by
+      // perturbing them and observing the predictions move, rather than
+      // assumed because a loader was called.
+      weights_dir_override = argv[++i];
     } else if (arg == "--no-e2e") {
       run_e2e = false;
     } else if (arg == "--no-self-check") {
@@ -365,7 +372,9 @@ int main(int argc, char **argv) {
     return 77;  // ctest SKIP_RETURN_CODE
   }
 
-  const std::string weights_dir = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;
+  const std::string weights_dir = weights_dir_override.empty()
+                                      ? std::string(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR)
+                                      : weights_dir_override;
   std::string weights_file = weights_dir;
   if (!weights_file.empty() && weights_file.back() != '/') weights_file += '/';
   weights_file += "model.nnwt";

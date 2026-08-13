@@ -3395,3 +3395,60 @@ implementations reproduced all of this identically (8/8), so none of it is a por
 divergence — but it does mean **quantization coverage in this harness rests on chunks 0
 and 5**, and that widening it needs a data regime and a bound chosen to keep the network
 in distribution while leaving ratio room to matter, not simply a larger bound.
+
+#### Phase 29 addendum 3 — are the model weights genuinely used? (weight-sensitivity test)
+
+A fair challenge, and one the earlier results invite: on 3 of 8 chunks every action
+produced an identical cost, which is exactly the signature a stub returning constants
+would leave. "The loader was called" is not evidence. So it was measured.
+
+`--weights DIR` / `NPEQ_WEIGHTS` was added to point BOTH sides at a different model
+directory. Two perturbed copies of `model.nnwt` were made by keeping the 24-byte header
+(magic, version, n_layers=5, 8->64->8) and transforming the 13624 float32 payload:
+one scaled by 0.5, one zeroed.
+
+**Selected action per chunk, `--error-bound-rel 0.005`:**
+
+| weights | ch0 | ch1 | ch2 | ch3 | ch4 | ch5 | ch6 | ch7 |
+|---|---|---|---|---|---|---|---|---|
+| baseline | 11 | 0 | 0 | 0 | 0 | 31 | 7 | 0 |
+| x 0.5 | 15 | 8 | 0 | 8 | 8 | 15 | 8 | 0 |
+| zeroed | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**Per-action predictions, chunk 5, native:**
+
+| action | baseline | weights x0.5 | zeroed |
+|---|---|---|---|
+| 0 | ratio 26.524 ct 1.000 | ratio 1.851 | ratio **0.100** |
+| 7 | ratio 1.253 ct **2.717** | ratio 1.941 ct 1.028 | ratio **0.100** ct 1.000 |
+| 8 | ratio **100.000** ct 1.050 | ratio 1.942 | ratio **0.100** |
+| 15 | ratio 11.049 | ratio 2.009 | ratio **0.100** |
+| 24 | ratio **100.000** ct 1.185 | ratio 1.967 | ratio **0.100** |
+| 31 | ratio 81.900 | ratio 1.979 | ratio **0.100** |
+
+**Conclusion: the weights are genuinely used, on both sides.**
+
+- Baseline predictions span ratio 1.25 -> 100 and comp time 1.000 -> 2.717 across
+  actions -- rich, action-dependent structure.
+- Halving every weight moves every prediction and changes the SELECTED action on 6 of 8
+  chunks. A constant stub or a hardcoded formula could not do that.
+- Zeroing every weight collapses ratio to **0.100 for all 32 actions** -- which is
+  exactly the lower clamp `fmaxf(0.1f, ...)` (`nn_gpu.cu:221`) -- and times to the 1.0 ms
+  floor. Total loss of discrimination, so the tie rule picks action 0 everywhere. This is
+  the behaviour of a real forward pass whose weights were removed.
+
+**And the two implementations agreed 8/8 in ALL THREE weight configurations**, not just
+on the shipped file. That is materially stronger than the baseline agreement alone: it
+shows both sides read the same weights and compute the same forward pass, rather than
+coinciding on one particular input.
+
+**Side result that qualifies addendum 2:** under `x 0.5` weights, quantization is selected
+on **6 of 8** chunks rather than 2. So "NeuroPress rarely selects quantization" is a
+property of *these particular trained weights* interacting with the clamps, not of the
+architecture, the cost model's shape, or the port.
+
+**Incidental confirmation of D29-1:** these runs used `--no-self-check`, and the baseline
+and zeroed runs exited 2 while the scaled run exited 0. The failing chunk is 6 in both
+cases -- the bitcomp chunk -- and under `x 0.5` weights chunk 6 selects action 8 (LZ4 +
+quantize) instead of bitcomp and the failure disappears. The failure follows the CODEC,
+not the port, and the self-check is what normally classifies it correctly.
