@@ -55,9 +55,28 @@ unsigned long long CountMismatchesOnDevice(const float *d_a, const float *d_b,
 
 namespace {
 
-constexpr size_t kChunkBytes = 4ull << 20;    // 4 MiB
-constexpr size_t kTotalBytes = 256ull << 20;  // 256 MiB
-constexpr size_t kNumChunks = kTotalBytes / kChunkBytes;
+/**
+ * Dataset and chunk size, in MiB. Overridable so the same example can be run
+ * at whatever shape a measurement calls for -- the interesting property here
+ * is the device-resident path, not one particular size, and hardcoding meant
+ * a second near-identical example every time the shape changed.
+ *
+ * Device memory needed is roughly 2x the dataset (source + readback
+ * destination) plus one registered buffer per chunk, so 1 GiB of data wants
+ * about 3 GiB free.
+ */
+size_t EnvMiB(const char *name, size_t fallback_mib) {
+  const char *e = std::getenv(name);
+  if (!e) return fallback_mib;
+  const long v = std::atol(e);
+  return v > 0 ? static_cast<size_t>(v) : fallback_mib;
+}
+
+const size_t kChunkBytes =
+    EnvMiB("CLIO_NEUROPRESS_CHUNK_MIB", 4) << 20;
+const size_t kTotalBytes =
+    EnvMiB("CLIO_NEUROPRESS_TOTAL_MIB", 256) << 20;
+const size_t kNumChunks = kTotalBytes / kChunkBytes;
 
 const std::string kBackendFile = "/tmp/neuropress_gpu_direct_backend.dat";
 
