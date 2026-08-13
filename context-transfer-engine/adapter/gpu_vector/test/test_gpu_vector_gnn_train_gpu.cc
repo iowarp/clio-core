@@ -377,6 +377,15 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
 
   float h1[kNB][kMaxH];
   constexpr int kHT = 32;
+  // Layer 1, h tiled into registers. See kNB above for why the node blocking
+  // is 1, and the notes below for what has been ruled out.
+  //
+  // TRIED: staging the feature rows through shared memory so the global reads
+  // coalesce. A is [node][f], so a[f] is F*4 = 512 bytes apart across the warp
+  // -- 32 transactions per instruction with four useful bytes each -- which
+  // looks like an obvious 8x waste. Loading an f-chunk for the block first
+  // (padded to avoid bank conflicts) makes no difference at all: 0.41 s either
+  // way. The rows are re-read only H/kHT = 2 times and the cache absorbs them.
   for (int h0 = 0; h0 < H; h0 += kHT) {
     const int hn = min(kHT, H - h0);
     float acc[kNB][kHT];
