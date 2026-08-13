@@ -742,7 +742,30 @@ __global__ void LossFinalKernel(const double *part, int nblocks, double *d_loss)
 namespace {
 using gnn_test::EnvI64;
 
-/** Run a yieldable kernel to completion (re-launch until no block is pending). */
+/**
+ * Run a yieldable kernel to completion.
+ *
+ * The driver and its lane stack are built PER CALL, and that is not free:
+ * YieldStack cudaMallocs nblocks*lanes*bytes_per_lane (2 MiB at 32x256x256),
+ * Yieldable allocates its own block state, and cudaFree synchronizes the
+ * device, so every window pays an allocate/free/sync cycle inside the gather
+ * phase.
+ *
+ * HOISTING THEM OUT OF THE LOOP IS 45% OF THE GATHER (0.11 s -> 0.06 s at
+ * 1 GiB) AND IS WRONG. Reusing the objects across runs -- calling
+ * YieldStack::Reset() and letting RunToCompletion call Yieldable::Reset() --
+ * makes the streamed run stop matching the in-core one: max|dloss| 5.6e-05,
+ * CLOSE instead of BIT-EXACT. Isolating the two shows it is the DRIVER, not
+ * the stack: rebuilding the stack per call and reusing only Yieldable still
+ * fails, and still shows the 0.06 s gather, so the cost and the bug are the
+ * same object.
+ *
+ * Yieldable::Reset() zeroes resume_point_, status_, wait_tag_ and the pending
+ * list and uploads them, which looks complete, so something else survives a
+ * run. That is core-runtime state, not the vector's and not this test's, so it
+ * is reported rather than worked around here. Until it is fixed the objects
+ * have to be rebuilt each call.
+ */
 template <typename LaunchT>
 clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   const unsigned nthreads =
@@ -1308,6 +1331,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   }
   std::vector<double> et_loss(epochs), et_acc(epochs), et_vacc(epochs);
   reset_weights();
+
   g_ktime = EnvI64("CLIO_GNN_KTIME", 0) != 0;
   t_gather = t_fwd = t_gw1 = t_gw2 = 0;
   double et_t0 = NowSec();
