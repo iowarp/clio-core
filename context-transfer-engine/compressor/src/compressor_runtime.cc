@@ -38,7 +38,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -962,6 +965,93 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
        batch_features.size(), trained);
 }
 
+namespace {
+
+/**
+ * Per-chunk NeuroPress selection trace.
+ *
+ * Off unless CLIO_NEUROPRESS_SELECTION_LOG names a file, so this costs a
+ * single relaxed load on the normal path. It exists because a selection is
+ * otherwise invisible: dynamic selection happens inside the compressor
+ * runtime, several layers below whatever issued the write, and the caller
+ * only ever learns that the write succeeded. Comparing Clio's per-chunk
+ * choices against NeuroPress's own needs them written down as they are made.
+ *
+ * The `seq` column is a COMPLETION order, not a chunk order. The HDF5 VOL
+ * queues every chunk's DynamicSchedule asynchronously and drains on close
+ * (clio_vol.cc:1899-1904), so chunks can complete out of order and, with
+ * online learning on, the order they complete in is the order the model is
+ * updated in. A replay that wants to reproduce this run's learning has to
+ * follow seq, not the chunk index.
+ */
+std::mutex g_selection_log_mutex;
+
+void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
+                            double entropy, double mad, double second_deriv,
+                            int wire_lib, int packed_preset,
+                            const CompressionStats *predicted,
+                            double actual_ratio, double actual_ct_ms,
+                            double actual_psnr) {
+  static const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+  if (!path || !*path) return;
+
+  std::lock_guard<std::mutex> lock(g_selection_log_mutex);
+  static long seq = 0;
+  static std::FILE *fp = [] {
+    std::FILE *f = std::fopen(path, "w");
+    if (f) {
+      std::fprintf(f,
+                   "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
+                   "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
+                   "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
+                   "actual_ct_ms,actual_psnr\n");
+    }
+    return f;
+  }();
+  if (!fp) return;
+
+  const std::string lib_name =
+      ctp::CompressionFactory::NameForWireId(wire_lib);
+  // The 0-7 index NeuroPress's decodeAction uses, recovered through the ML
+  // base id so the two sides' logs are directly comparable.
+  int algo_idx = -1;
+  for (const auto &entry : ctp::compress::model::KnownCompressors()) {
+    if (lib_name == entry.name) {
+      switch (entry.base_id) {
+        case 13: algo_idx = 0; break;
+        case 14: algo_idx = 1; break;
+        case 17: algo_idx = 2; break;
+        case 16: algo_idx = 3; break;
+        case 15: algo_idx = 4; break;
+        case 18: algo_idx = 5; break;
+        case 23: algo_idx = 6; break;
+        case 24: algo_idx = 7; break;
+        default: algo_idx = -1; break;
+      }
+      break;
+    }
+  }
+  const uint32_t bits = static_cast<uint32_t>(packed_preset);
+  const int quantize = ((bits >> 24) & 1u) ? 1 : 0;
+  const int shuffle = (((bits >> 8) & 0xFFu) != 0u) ? 1 : 0;
+  const int preset = static_cast<int>(bits & 0xFFu);
+
+  std::fprintf(fp,
+               "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+               seq++, blob_name.c_str(), chunk_size, entropy, mad,
+               second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
+               shuffle, preset,
+               predicted ? predicted->compression_ratio_ : 0.0,
+               predicted ? predicted->compress_time_ms_ : 0.0,
+               predicted ? predicted->decompress_time_ms_ : 0.0,
+               predicted ? predicted->psnr_db_ : 0.0,
+               actual_ratio, actual_ct_ms, actual_psnr);
+  std::fflush(fp);
+}
+
+}  // namespace
+
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1090,6 +1180,36 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     task->context_ = compress_task->context_;
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
+
+    // Record what was chosen for this chunk, before the online-learning and
+    // exploration blocks below can adopt an alternative -- this is the
+    // selection the model made, which is what a cross-check against
+    // NeuroPress's own choice is about. (Exploration is off by default; when
+    // it is on, an adopted alternative is a separate event.)
+    //
+    // Deliberately NOT gated on neuropress_feat_valid: that flag is only set
+    // when online learning is on (it exists to snapshot features for SGD),
+    // and a selection is worth recording either way -- an inference-only run
+    // is exactly the configuration in which selections are deterministic and
+    // therefore the one most worth comparing against upstream. The
+    // entropy/mad/curvature columns are zero when that snapshot was not
+    // taken; the chosen configuration, which is the point, is always real.
+    {
+      const CompressionStats *logged_pred = nullptr;
+      for (const auto &stat : stats) {
+        if (stat.compress_lib_ == best_lib &&
+            stat.compress_preset_ == best_preset) {
+          logged_pred = &stat;
+          break;
+        }
+      }
+      LogNeuroPressSelection(task->blob_name_.str(), chunk_size,
+                             neuropress_entropy, neuropress_mad,
+                             neuropress_second_deriv, best_lib, best_preset,
+                             logged_pred, context.actual_compression_ratio_,
+                             context.actual_compress_time_ms_,
+                             context.actual_psnr_db_);
+    }
 
     // Cycle 4f/4g: NeuroPress's own online-learning loop
     // (gpucompress_compress.cpp), ported faithfully. Both phases below share

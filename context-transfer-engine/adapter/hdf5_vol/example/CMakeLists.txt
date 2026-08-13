@@ -66,4 +66,47 @@ if(CLIO_CORE_ENABLE_CUDA)
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
   )
+
+  # ----------------------------------------------------------------------
+  # NeuroPress GPU -> HDF5 end-to-end run: 1 GiB in 4 MiB chunks, inference
+  # + online learning, every selection logged. Split into the same two
+  # translation units and for the same reason as the demo above.
+  # ----------------------------------------------------------------------
+  add_cuda_library(neuropress_e2e_kernel SHARED FALSE
+    neuropress_e2e_kernel.cu
+  )
+
+  add_executable(neuropress_e2e
+    neuropress_e2e.cc
+  )
+
+  target_include_directories(neuropress_e2e PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    ${HDF5_INCLUDE_DIRS}
+  )
+
+  target_compile_definitions(neuropress_e2e PRIVATE
+    CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+  target_link_libraries(neuropress_e2e
+    neuropress_e2e_kernel
+    clio_hdf5_vol
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ctp::cuda_cxx
+    ${HDF5_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  install(TARGETS neuropress_e2e neuropress_e2e_kernel
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+  )
 endif()
