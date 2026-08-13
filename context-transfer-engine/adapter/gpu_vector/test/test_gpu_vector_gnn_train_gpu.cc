@@ -296,12 +296,34 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   for (int h = 0; h < H; ++h) { h1_out[n * H + h] = 0.0f; dz1_out[n * H + h] = 0.0f; }
   if (y < 0) return;
   const float *a = A + n * (clio::run::u64)F;
-  float z1[kMaxH], h1[kMaxH];
-  for (int h = 0; h < H; ++h) {
-    float s = b1[h];
-    for (int f = 0; f < F; ++f) s += W1[h * F + f] * a[f];
-    z1[h] = s; h1[h] = s > 0.f ? s : 0.f;
+  // PER-THREAD SCRATCH IS THE COST HERE. This kernel had five arrays --
+  // z1, h1, z2, p, dz2 -- at kMaxH/kMaxC, which is 1088 floats (4352 B) of
+  // LOCAL memory per thread whatever H and C are. Three of them are
+  // redundant, and removing them changes no arithmetic:
+  //   z1 : only ever used as (z1[h] > 0), and h1 = max(z1,0), so h1[h] > 0
+  //        is the same predicate exactly.
+  //   p  : derived from z2 and z2 is dead afterwards, so p aliases z2.
+  //   dz2: derived from p, and the loss is read BEFORE it, so it aliases z2
+  //        too.
+  // 1088 floats -> 448.
+  float h1[kMaxH];
+  // LOOP ORDER: f OUTSIDE, h inside. Written the natural way -- h outer,
+  // accumulating one h at a time -- this re-reads the node's whole feature row
+  // a[0..F) once PER h, so each 512-byte row is fetched H=64 times: 16 GiB per
+  // window, measured at ~170 GB/s, i.e. saturating HBM to move the same bytes
+  // over and over. Hoisting f outside reads each element ONCE and updates all
+  // H accumulators from it.
+  //
+  // The arithmetic is IDENTICAL, not merely equivalent: h1[h] still accumulates
+  // W1[h*F+f]*a[f] over f in ascending order, exactly as before, so every sum
+  // is formed from the same terms in the same sequence. W1 is only H*F floats
+  // and stays in cache across the f loop.
+  for (int h = 0; h < H; ++h) h1[h] = b1[h];
+  for (int f = 0; f < F; ++f) {
+    const float av = a[f];
+    for (int h = 0; h < H; ++h) h1[h] += W1[h * F + f] * av;
   }
+  for (int h = 0; h < H; ++h) h1[h] = h1[h] > 0.f ? h1[h] : 0.f;
   float z2[kMaxC], maxz = -1e30f;
   for (int c = 0; c < C; ++c) {
     float s = b2[c];
@@ -310,8 +332,8 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
   }
   float sum = 0.f;
   for (int c = 0; c < C; ++c) { z2[c] = expf(z2[c] - maxz); sum += z2[c]; }
-  int pred = 0; float pmax = -1.f; float p[kMaxC];
-  for (int c = 0; c < C; ++c) { p[c] = z2[c] / sum; if (p[c] > pmax) { pmax = p[c]; pred = c; } }
+  int pred = 0; float pmax = -1.f;   // p aliases z2
+  for (int c = 0; c < C; ++c) { z2[c] = z2[c] / sum; if (z2[c] > pmax) { pmax = z2[c]; pred = c; } }
   // Held-out validation node: score it, but contribute neither loss nor gradient.
   // dz1_out/dz2_out/h1_out were zeroed above, so returning here keeps its grad at 0.
   if (((node_lo + n) % kValStride) == (kValStride - 1)) {
@@ -319,15 +341,15 @@ __global__ void TrainNodeKernel(const float *A, clio::run::u64 nn, clio::run::u6
     atomicAdd(val_count, 1);
     return;
   }
-  loss_buf[n] = -log((double)fmaxf(p[y], 1e-30f));
+  loss_buf[n] = -log((double)fmaxf(z2[y], 1e-30f));
   if (pred == (int)y) atomicAdd(correct, 1);
   atomicAdd(count, 1);
-  float dz2[kMaxC];
-  for (int c = 0; c < C; ++c) { dz2[c] = p[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = dz2[c]; }
+  // dz2 aliases z2 (which currently holds p); the loss above already read it.
+  for (int c = 0; c < C; ++c) { z2[c] = z2[c] - (c == (int)y ? 1.f : 0.f); dz2_out[n * C + c] = z2[c]; }
   for (int h = 0; h < H; ++h) {
     float s = 0.f;
-    for (int c = 0; c < C; ++c) s += W2[c * H + h] * dz2[c];
-    dz1_out[n * H + h] = (z1[h] > 0.f) ? s : 0.f;
+    for (int c = 0; c < C; ++c) s += W2[c * H + h] * z2[c];
+    dz1_out[n * H + h] = (h1[h] > 0.f) ? s : 0.f;   // h1>0 iff z1>0
     h1_out[n * H + h] = h1[h];
   }
 }
