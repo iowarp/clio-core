@@ -123,6 +123,9 @@ void EnsureInit() {
   std::string cfg = "/tmp/gpu_vec_gnn_train_" + std::to_string(port) + ".yaml";
   int hbm_mib = std::getenv("CLIO_GNN_HBM_MIB") ? std::atoi(std::getenv("CLIO_GNN_HBM_MIB")) : 2048;
   int dram_mib = std::getenv("CLIO_GNN_DRAM_MIB") ? std::atoi(std::getenv("CLIO_GNN_DRAM_MIB")) : 20480;
+  std::string dram_kind = std::getenv("CLIO_GNN_DRAM_TYPE")
+                              ? std::getenv("CLIO_GNN_DRAM_TYPE")
+                              : std::string("ram");
   int nvme_mib = std::getenv("CLIO_GNN_NVME_MIB") ? std::atoi(std::getenv("CLIO_GNN_NVME_MIB")) : 0;
   std::string nvme_path = std::getenv("CLIO_GNN_NVME_PATH")
                               ? std::getenv("CLIO_GNN_NVME_PATH")
@@ -159,7 +162,13 @@ void EnsureInit() {
       // tier, so every fault fell back to host staging.
       << "      - path: \"hbm::cte_hbm_tier\"\n        bdev_type: \"hbm\"\n        capacity_limit: \""
       << hbm_mib << "MB\"\n        score: 0.0\n"
-      << "      - path: \"ram::cte_dram_tier\"\n        bdev_type: \"ram\"\n        capacity_limit: \""
+      // The host tier's TYPE matters for a fair comparison. "ram" is pageable
+      // host memory and the spill path measured 8.9 GB/s on it, against ~25
+      // GB/s for PCIe 4.0 x16 -- so an uncompressed run that overflows to it
+      // is penalised by the allocation type, not only by not fitting. "pinned"
+      // (cudaMallocHost) is the honest opponent; CLIO_GNN_DRAM_TYPE selects it.
+      << "      - path: \"" << dram_kind << "::cte_dram_tier\"\n        bdev_type: \""
+      << dram_kind << "\"\n        capacity_limit: \""
       << dram_mib << "MB\"\n        score: 0.6\n";
     // OPTIONAL NVMe TIER, identical in both the raw and the compressed run.
     // Without it, overflow lands in host DRAM, and on this machine that is
