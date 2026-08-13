@@ -251,6 +251,15 @@ class Yieldable {
       host_pending_[i] = i;
     }
     num_pending_ = nblocks_;
+    // Restore the per-block user state too. The constructor zeroes d_user_ and
+    // Reset did not, so a REUSED driver started its next run with whatever the
+    // previous one left there -- Reset has to leave the object in the state
+    // construction leaves it in, or it is not a reset.
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    if (d_user_ != nullptr) {
+      ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+    }
+#endif
     Upload();
   }
 

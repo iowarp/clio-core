@@ -778,6 +778,41 @@ clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
       },
       [] {}, /*max_rounds=*/200000);
 }
+
+/**
+ * Driver and lane stack built ONCE and reused across every window.
+ *
+ * Building them per call costs an allocate/free pair each time -- YieldStack
+ * cudaMallocs nblocks*lanes*bytes_per_lane (2 MiB at 32x256x256), Yieldable
+ * allocates its own block state, and cudaFree SYNCHRONIZES THE DEVICE -- so a
+ * 64-window run paid 64 of those inside the gather. Reusing them is worth 45%
+ * of the gather.
+ *
+ * BOTH Resets are mandatory, and forgetting the driver's is silent. Yieldable
+ * calls Reset() from its CONSTRUCTOR, not from RunToCompletion, so a reused
+ * driver still has num_pending_ == 0 from the previous run: Round() returns
+ * false immediately, the kernel never launches, and the gather quietly returns
+ * whatever was already in the scratch buffer. It shows up as a fast run whose
+ * loss is merely CLOSE (max|dloss| 5.6e-05) rather than BIT-EXACT.
+ */
+class YieldRunner {
+ public:
+  YieldRunner(unsigned nblocks, unsigned nthreads)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, 256) {}
+  template <typename LaunchT>
+  clio::run::u32 Run(LaunchT &&launch) {
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          launch(g, b, view, stack_.View());
+        },
+        [] {}, /*max_rounds=*/200000);
+  }
+ private:
+  gy::Yieldable<> drv_;
+  gy::YieldStack stack_;
+};
 }  // namespace
 
 TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
@@ -1331,6 +1366,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   }
   std::vector<double> et_loss(epochs), et_acc(epochs), et_vacc(epochs);
   reset_weights();
+  YieldRunner gather_runner(gather_blocks,
+                            (unsigned)EnvI64("CLIO_GNN_GATHER_THREADS", 256));
 
   g_ktime = EnvI64("CLIO_GNN_KTIME", 0) != 0;
   t_gather = t_fwd = t_gw1 = t_gw2 = 0;
@@ -1342,8 +1379,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     // d_scratch, then run the same train kernels as the in-core path.
     run_epoch([&](clio::run::u64 wi, clio::run::u64 first, clio::run::u64 nn) {
       (void)wi;  // pages are faulted on demand now; no separate prefetch step
-      RunYieldable(gather_blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                                      gy::YieldStackView sv) {
+      gather_runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                            gy::YieldStackView sv) {
         GnnGatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu_info, vec.GetDevice(0), first * (clio::run::u64)F,
             (first + nn) * (clio::run::u64)F, d_scratch, gather_blocks, vw, sv);
