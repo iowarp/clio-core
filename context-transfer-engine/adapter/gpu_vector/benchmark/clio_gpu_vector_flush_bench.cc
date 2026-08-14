@@ -25,6 +25,9 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_runtime/bdev/bdev_client.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
 
 #include <chrono>
 #include <cstdio>
@@ -35,8 +38,22 @@
 #include <vector>
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
+
+/** Per-lane yield frame; coroutine frames are compiler-laid-out and far
+ *  larger than the hand-packed macro ones. */
+#if defined(CLIO_YIELD_CORO)
+static constexpr u32 kYieldLaneBytes = 4096;
+#else
+static constexpr u32 kYieldLaneBytes = 256;
+#endif
+
+/** True when the kernels below are the yieldable coroutine forms. */
+#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
+#define GV_FLUSH_CORO 1
+#endif
 
 /** Value written at index i on pass `pass`. */
 CTP_INLINE_CROSS_FUN u32 Val(u64 i, u32 pass) {
@@ -56,13 +73,77 @@ CTP_GPU_FUN void Spin(u32 us, u64 clock_khz) {
   }
 }
 
+#if defined(GV_FLUSH_CORO)
+/**
+ * Wait for this block's outstanding transfers by PARKING, not spinning.
+ *
+ * DeviceVector::WaitFlush spins on the device (AwaitPut in a loop). That
+ * deadlocks: the kernel stays resident spinning while the completion it is
+ * waiting for needs the host side to make progress, and the host is inside
+ * cuCtxSynchronize waiting for the kernel. Every kernel in this benchmark
+ * used to do exactly that, and every configuration hung in the warm pass --
+ * including the stock defaults -- with the main thread parked in
+ * cuCtxSynchronize forever.
+ *
+ * The yieldable form suspends the block back to the host driver instead, so
+ * the runtime gets to run, complete the put, and resume us. Waiting on
+ * AnyTransferInFlight rather than a range is deliberate: it is the same
+ * condition HoldPageCoro's writeback step uses, and it cannot miss a put
+ * that a concurrent eviction started.
+ */
+__device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<u32> &v) {
+  CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
+                     v.AnyTransferInFlight(), v.FlushWaitTag());
+}
+
+/** Write one page of a region. Shared by the warm and timed coroutines. */
+__device__ void WritePage(gv::DeviceVector<u32> &v, u64 poff, u32 pass) {
+  for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
+    v[poff + i] = Val(poff + i, pass);
+  }
+  __syncthreads();
+}
+
+/** Touch and flush every page, so the timed loop starts from a known state. */
+__device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
+                                  u64 pages_per_region, u32 block) {
+  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
+  const u64 block_base = static_cast<u64>(block) * iters * region_elems;
+  for (u64 it = 0; it < iters; ++it) {
+    const u64 off = block_base + it * region_elems;
+    for (u64 pg = 0; pg < pages_per_region; ++pg) {
+      const u64 poff = off + pg * v.h_->elems_per_page_;
+      u64 run = 0;
+      co_await v.HoldPageCoro(poff, v.h_->elems_per_page_, &run);
+      WritePage(v, poff, 0u);
+    }
+    if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
+    __syncthreads();
+    co_await FlushWaitCoro(v);
+  }
+}
+
+__global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
+                           gv::DeviceVector<u32> v, u64 iters,
+                           u64 pages_per_region, gy::YieldableView<> yv,
+                           gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WarmCoro(v, iters, pages_per_region, yv.Block()));
+}
+#else
 /** Touch and flush every page, so the timed loop faults nothing. */
 __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 iters,
-                           u64 pages_per_region) {
+                           u64 pages_per_region, gy::YieldableView<> yv,
+                           gy::YieldStackView ys) {
+  (void) ys;
   CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
   const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
-  const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
+  const u64 block_base = static_cast<u64>(yv.Block()) * iters * region_elems;
   for (u64 it = 0; it < iters; ++it) {
     {
       const u64 off = block_base + it * region_elems;
@@ -82,6 +163,7 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
       }
   }
 }
+#endif  // GV_FLUSH_CORO
 
 /**
  * spin -> write region -> flush region, `iters` times.
@@ -90,14 +172,79 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
  *              1: BeginFlush and collect it on the NEXT iteration, after that
  *                 iteration's spin, so the transfer runs under the spin.
  */
+#if defined(GV_FLUSH_CORO)
+__device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
+                                            u64 pages_per_region, u32 spin_us,
+                                            u64 clock_khz, int do_write,
+                                            u32 pass, int async, u32 block) {
+  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
+  const u64 block_base = static_cast<u64>(block) * iters * region_elems;
+  bool pending = false;
+
+  for (u64 it = 0; it < iters; ++it) {
+    // ---- compute ----
+    Spin(spin_us, clock_khz);
+    __syncthreads();
+
+    // ---- async: collect the previous flush, which has been running under
+    //      the spin above. Sync collects it below, before the next spin --
+    //      that placement is the entire difference the benchmark measures.
+    if (async && pending) {
+      co_await FlushWaitCoro(v);
+      pending = false;
+    }
+
+    if (do_write) {
+      const u64 off = block_base + it * region_elems;
+      // Page at a time, so the whole block is inside one page at any moment --
+      // the granularity the vector's paging contract assumes.
+      for (u64 pg = 0; pg < pages_per_region; ++pg) {
+        const u64 poff = off + pg * v.h_->elems_per_page_;
+        // Required: operator[] indexes the HELD page and does no resolution,
+        // so without this last_page_ is null and the write dereferences it.
+        u64 run = 0;
+        co_await v.HoldPageCoro(poff, v.h_->elems_per_page_, &run);
+        WritePage(v, poff, pass);
+      }
+      // ---- block-level flush: ONE call covering the whole region ----
+      if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
+      __syncthreads();
+      if (async) {
+        pending = true;
+      } else {
+        co_await FlushWaitCoro(v);
+      }
+    }
+  }
+  if (pending) co_await FlushWaitCoro(v);
+}
+
 __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceVector<u32> v, u64 iters,
                                      u64 pages_per_region, u32 spin_us,
                                      u64 clock_khz, int do_write, u32 pass,
-                                     int async) {
+                                     int async, gy::YieldableView<> yv,
+                                     gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SpinWriteFlushCoro(v, iters, pages_per_region, spin_us,
+                                    clock_khz, do_write, pass, async,
+                                    yv.Block()));
+}
+#else
+__global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
+                                     gv::DeviceVector<u32> v, u64 iters,
+                                     u64 pages_per_region, u32 spin_us,
+                                     u64 clock_khz, int do_write, u32 pass,
+                                     int async, gy::YieldableView<> yv,
+                                     gy::YieldStackView ys) {
+  (void) ys;
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
   const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
-  const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
+  const u64 block_base = static_cast<u64>(yv.Block()) * iters * region_elems;
   long long prev = -1;
 
   for (u64 it = 0; it < iters; ++it) {
@@ -146,6 +293,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                 region_elems);
   }
 }
+#endif  // GV_FLUSH_CORO
 
 /**
  * The READ mirror of SpinWriteFlushKernel: spin, then read a region.
@@ -255,6 +403,40 @@ struct Args {
   u32 threads = 256;
   u32 repeat = 3;
   bool read = false;     // read+prefetch benchmark instead of write+flush
+  // Per-block page-cache slots. 0 = the historical behaviour: write mode sizes
+  // the cache to the WHOLE working set so nothing is ever evicted and the
+  // explicit flush is the only I/O. Setting it smaller makes the cache a real
+  // cache -- the block must evict to make room, which is the only way the
+  // lower tiers (host DRAM, NVMe) ever get exercised.
+  u32 pages_per_block = 0;
+};
+
+/**
+ * Runs a yieldable kernel to completion, relaunching it as blocks suspend.
+ *
+ * Both Reset() calls are required. RunToCompletion does NOT reset -- only the
+ * constructor does -- so a reused runner whose driver still reads "done" from
+ * the previous call skips the launch entirely and reports an instant, empty
+ * success.
+ */
+class YieldRunner {
+ public:
+  YieldRunner(unsigned nblocks, unsigned nthreads)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+  template <typename LaunchT>
+  u32 Run(LaunchT &&launch) {
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          launch(g, b, view, stack_.View());
+        },
+        [] {}, /*max_rounds=*/2000000);
+  }
+
+ private:
+  gy::Yieldable<> drv_;
+  gy::YieldStack stack_;
 };
 
 double NowMs() {
@@ -289,13 +471,32 @@ int main(int argc, char **argv) {
     else if (f == "--flush-mb") a.flush_mb = std::atoll(next());
     else if (f == "--threads") a.threads = std::atoi(next());
     else if (f == "--repeat") a.repeat = std::atoi(next());
+    else if (f == "--pages-per-block") a.pages_per_block = std::atoi(next());
     else if (f == "--read") a.read = true;
     else if (f == "--help") {
       std::printf(
           "usage: %s [--blocks N] [--iters N] [--spin-us N] [--page-kb N] "
-          "[--flush-mb N] [--threads N] [--repeat N]\n", argv[0]);
+          "[--flush-mb N] [--threads N] [--repeat N] "
+          "[--pages-per-block N]\n"
+          "tiers (MB, 0 = omit): GV_HBM_MB GV_DRAM_MB GV_NVME_MB "
+          "GV_NVME_PATH\n", argv[0]);
       return 0;
     }
+  }
+
+  // The read+prefetch path has NOT been converted to the yieldable form: its
+  // kernel still calls the blocking HoldPage/AwaitFetch, which spins on the
+  // device while the completion it waits for needs the host to run -- the
+  // deadlock that hung every configuration of this benchmark, including the
+  // stock defaults. Refusing is better than reproducing that hang; the fix is
+  // the same conversion the write path just got.
+  if (a.read) {
+    std::fprintf(stderr,
+                 "--read is unavailable: SpinReadPrefetchKernel still uses the "
+                 "blocking HoldPage path and deadlocks a resident kernel. Only "
+                 "the write+flush path has been converted to the yieldable "
+                 "coroutine form.\n");
+    return 1;
   }
 
   const u64 page_bytes = a.page_kb * 1024;
@@ -314,7 +515,13 @@ int main(int argc, char **argv) {
   // These were conflated (n was derived from the cache size), which left the
   // vector claiming a size of 2 regions while the kernel read 8.
   const u64 pages_per_block_total = pages_per_region * a.iters;
-  const u64 slots = a.read ? (pages_per_region * 2) : pages_per_block_total;
+  u64 slots = a.read ? (pages_per_region * 2) : pages_per_block_total;
+  // An explicit cache size wins over both defaults. Capping at the working set
+  // keeps a too-large request from allocating slots that can never be filled.
+  if (a.pages_per_block > 0) {
+    slots = a.pages_per_block;
+    if (slots > pages_per_block_total) slots = pages_per_block_total;
+  }
   const u64 n = page_elems * pages_per_block_total * a.blocks;
   const double resident_mb =
       static_cast<double>(slots * page_bytes * a.blocks) / (1024.0 * 1024.0);
@@ -322,6 +529,40 @@ int main(int argc, char **argv) {
                                                 page_bytes * a.blocks) /
                             (1024.0 * 1024.0);
 
+  // ---- tier ladder -------------------------------------------------------
+  // VRAM / host DRAM / NVMe, each optional so the historical single-host-tier
+  // invocation still works (GV_DRAM_MB alone reproduces it).
+  //
+  // SCORE DIRECTION DEPENDS ON THE BLOB SCORE, AND THIS PATH IS NOT THE GNN
+  // PATH. MaxBwDpe splits targets into preferred (target_score_ <= blob_score)
+  // and fallback, then sorts the PREFERRED group by target_score_ DESCENDING
+  // -- highest score wins -- with bandwidth breaking ties only.
+  //
+  // The gpu_vector flushes a touched page at score 1.0 (SubmitPut clamps the
+  // page's accumulated access score into [0,1], and any written page has
+  // accumulated at least 1.0). At blob_score 1.0 EVERY tier is preferred, so
+  // the ladder is decided purely by descending score. A 0.0/0.6/1.0 ladder --
+  // correct for the GNN path, which puts at 0.5 and relies on kHBM being the
+  // only target at or below it -- is therefore exactly BACKWARDS here: it was
+  // measured putting all 128MB on NVMe with a 512MB VRAM tier sitting empty.
+  //
+  // Hence VRAM 1.0 / DRAM 0.6 / NVMe 0.0: descending order walks the ladder
+  // top-down and spills to the next tier only when one fills.
+  const double kVramScore = 1.0, kDramScore = 0.6, kNvmeScore = 0.0;
+  auto env_mb = [](const char *k, long dflt) -> long {
+    const char *e = getenv(k);
+    return e ? std::atol(e) : dflt;
+  };
+  const long hbm_mb = env_mb("GV_HBM_MB", 0);
+  const long dram_mb = env_mb("GV_DRAM_MB", 12288);
+  const long nvme_mb = env_mb("GV_NVME_MB", 0);
+  const char *nvme_path_env = getenv("GV_NVME_PATH");
+  const std::string nvme_path =
+      nvme_path_env ? nvme_path_env : std::string("/tmp/gv_flush_nvme.dat");
+  if (hbm_mb <= 0 && dram_mb <= 0 && nvme_mb <= 0) {
+    std::fprintf(stderr, "no tiers configured (GV_HBM_MB/GV_DRAM_MB/GV_NVME_MB)\n");
+    return 1;
+  }
   {
     std::ofstream cfg("gpu_vector_flush.yaml");
     cfg << "networking:\n  port: 9437\n\n"
@@ -332,16 +573,30 @@ int main(int argc, char **argv) {
         << "  - mod_name: clio_bdev\n"
         << "    pool_name: \"ram::chi_default_bdev\"\n"
         << "    pool_query: local\n    pool_id: \"301.0\"\n"
-        << "    bdev_type: ram\n    capacity: \"16GB\"\n\n"
+        << "    bdev_type: ram\n    capacity: \"1GB\"\n\n"
         << "  - mod_name: clio_cte_core\n"
         << "    pool_name: cte_core\n    pool_query: local\n"
         << "    pool_id: \"512.0\"\n"
-        << "    storage:\n"
-        << "      - path: \"ram::gv_flush_tier\"\n"
-        << "        bdev_type: \"" << tier_type << "\"\n"
-        << "        capacity_limit: \"12GB\"\n"
-        << "        score: 1.0\n"
-        << "    dpe:\n      dpe_type: \"max_bw\"\n";
+        << "    storage:\n";
+    if (hbm_mb > 0) {
+      cfg << "      - path: \"hbm::gv_flush_hbm\"\n"
+          << "        bdev_type: \"hbm\"\n"
+          << "        capacity_limit: \"" << hbm_mb << "MB\"\n"
+          << "        score: " << kVramScore << "\n";
+    }
+    if (dram_mb > 0) {
+      cfg << "      - path: \"" << tier_type << "::gv_flush_tier\"\n"
+          << "        bdev_type: \"" << tier_type << "\"\n"
+          << "        capacity_limit: \"" << dram_mb << "MB\"\n"
+          << "        score: " << kDramScore << "\n";
+    }
+    if (nvme_mb > 0) {
+      cfg << "      - path: \"" << nvme_path << "\"\n"
+          << "        bdev_type: \"file\"\n"
+          << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
+          << "        score: " << kNvmeScore << "\n";
+    }
+    cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_flush.yaml", 1);
   }
@@ -357,6 +612,41 @@ int main(int argc, char **argv) {
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
+  // Which tier actually holds the bytes. Storage targets take PoolId(512+i, 1)
+  // in DECLARATION order, so the index depends on which tiers were enabled.
+  // Declaring a tier is not evidence it received anything -- the DPE ranks by
+  // a predicted bandwidth model and has been measured leaving a correctly
+  // sized HBM tier empty -- so the split is read from the bdevs themselves.
+  struct TierProbe {
+    const char *name;
+    clio::run::bdev::Client cli;
+    clio::run::u64 free0 = 0;
+  };
+  std::vector<TierProbe> tiers;
+  {
+    clio::run::u32 idx = 512;
+    if (hbm_mb > 0) tiers.push_back({"VRAM", clio::run::bdev::Client(clio::run::PoolId(idx++, 1))});
+    if (dram_mb > 0) tiers.push_back({"DRAM", clio::run::bdev::Client(clio::run::PoolId(idx++, 1))});
+    if (nvme_mb > 0) tiers.push_back({"NVMe", clio::run::bdev::Client(clio::run::PoolId(idx++, 1))});
+    for (auto &t : tiers) {
+      auto s = t.cli.AsyncGetStats();
+      s.Wait();
+      t.free0 = s->remaining_size_;
+    }
+  }
+  auto report_tiers = [&]() {
+    std::printf("  TIER SPLIT:");
+    u64 total_used = 0;
+    for (auto &t : tiers) {
+      auto s = t.cli.AsyncGetStats();
+      s.Wait();
+      const u64 used = t.free0 >= s->remaining_size_ ? t.free0 - s->remaining_size_ : 0;
+      total_used += used;
+      std::printf("  %s %lluMB", t.name, (unsigned long long) (used >> 20));
+    }
+    std::printf("   (total %lluMB)\n", (unsigned long long) (total_used >> 20));
+  };
+
   // cudaDeviceProp::clockRate was removed in CUDA 13; the attribute query is
   // the supported way to ask and works on every version.
   int clock_khz_i = 0;
@@ -367,24 +657,46 @@ int main(int argc, char **argv) {
       "gpu_vector block-level flush benchmark\n"
       "  blocks=%u threads=%u iters=%llu spin=%u us/iter\n"
       "  page=%lluKB  flush region=%lluMB (%llu pages/flush)\n"
-      "  resident=%.0fMB  total written=%.0fMB per pass\n"
-      "  (all regions resident: no faults, no evictions -- flush is the only "
-      "I/O)\n",
+      // Spell out BOTH scopes. "cache=1 pages/block (64MB)" was read as a
+      // 64MB page; it is 1MB per block across 64 blocks. Same for the working
+      // set, which is per-block x blocks.
+      "  cache=%llu pages/block = %.0fMB per block, %.0fMB over %u blocks%s\n"
+      "  each block walks %llu pages, so a 1-page cache faults %llu times "
+      "per block (%llu total)\n"
+      "  working set=%.0fMB\n"
+      "  tiers: VRAM %ldMB / DRAM %ldMB / NVMe %ldMB\n",
       a.blocks, a.threads, (unsigned long long) a.iters, a.spin_us,
       (unsigned long long) a.page_kb, (unsigned long long) a.flush_mb,
-      (unsigned long long) pages_per_region, resident_mb, resident_mb);
+      (unsigned long long) pages_per_region, (unsigned long long) slots,
+      static_cast<double>(slots * page_bytes) / (1024.0 * 1024.0), resident_mb,
+      a.blocks,
+      (slots < pages_per_block_total)
+          ? "  (cache < working set: blocks must EVICT)"
+          : "  (fully resident: flush is the only I/O)",
+      (unsigned long long) pages_per_block_total,
+      (unsigned long long) pages_per_block_total,
+      (unsigned long long) (pages_per_block_total * a.blocks), working_mb,
+      hbm_mb, dram_mb, nvme_mb);
 
   gv::Vector<u32> vec("gv_flush", {0}, page_bytes, a.blocks,
                       static_cast<u32>(slots), n);
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
 
-  WarmKernel<<<a.blocks, a.threads>>>(gpu, dev, a.iters, pages_per_region);
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "warm failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  YieldRunner runner(a.blocks, a.threads);
+  auto warm = [&]() {
+    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      WarmKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, a.iters,
+                                                  pages_per_region, vw, sv);
+    });
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      std::fprintf(stderr, "warm failed: %s\n",
+                   cudaGetErrorString(cudaGetLastError()));
+      std::exit(1);
+    }
+  };
+  warm();
 
   // GV_PROBE_GET: time HOST-side GetBlob directly -- no GPU queue, no page
   // table, no kernel. Separates "GetBlob is slow" from "the GPU round trip or
@@ -522,8 +834,7 @@ int main(int argc, char **argv) {
       }
       cudaFree(d_dump);
       // Probe consumed region 0's warm state; restore it for the real runs.
-      WarmKernel<<<a.blocks, a.threads>>>(gpu, dev, a.iters, pages_per_region);
-      cudaDeviceSynchronize();
+      warm();
     }
 
     // The warm pass wrote Val(idx, 0) everywhere; that is what must come back.
@@ -566,7 +877,7 @@ int main(int argc, char **argv) {
         "  read hidden      %8.1f %%\n",
         (unsigned long long) a.iters, spin_only, io_only,
         (unsigned long long) io_st.faults,
-        (io_only > 0.0) ? (resident_mb * a.iters / 2.0) / (io_only / 1000.0) : 0.0,
+        (io_only > 0.0) ? working_mb / (io_only / 1000.0) : 0.0,
         sync_ms, (unsigned long long) sync_st.faults,
         async_ms, (unsigned long long) async_st.faults,
         (unsigned long long) async_st.prefetches,
@@ -575,6 +886,7 @@ int main(int argc, char **argv) {
         ok ? "data=OK" : "data=MISMATCH",
         spin_only + io_only, mx, sync_ms / async_ms,
         (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0);
+    report_tiers();
     if (!ok) {
       std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");
       return 1;
@@ -590,9 +902,13 @@ int main(int argc, char **argv) {
       vec.ResetStats();
       cudaDeviceSynchronize();
       const double t0 = NowMs();
-      SpinWriteFlushKernel<<<a.blocks, a.threads>>>(
-          gpu, dev, a.iters, pages_per_region, spin, clock_khz, do_write,
-          pass++, async);
+      const u32 this_pass = pass++;
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        SpinWriteFlushKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dev, a.iters, pages_per_region, spin, clock_khz, do_write,
+            this_pass, async, vw, sv);
+      });
       if (cudaDeviceSynchronize() != cudaSuccess) {
         std::fprintf(stderr, "kernel failed: %s\n",
                      cudaGetErrorString(cudaGetLastError()));
@@ -655,8 +971,12 @@ int main(int argc, char **argv) {
 
   const double per_iter = static_cast<double>(a.iters);
   const double mx = (spin_only > io_only) ? spin_only : io_only;
+  // Bytes moved per pass are the WORKING SET (every iteration writes a full
+  // region), not the cache size. Those were the same number until the cache
+  // became independently sizeable; using resident_mb here would silently
+  // divide the reported bandwidth by the cache ratio.
   const double flush_mbps =
-      (io_only > 0.0) ? (resident_mb / (io_only / 1000.0)) : 0.0;
+      (io_only > 0.0) ? (working_mb / (io_only / 1000.0)) : 0.0;
   std::printf(
       "\n  spin only        %8.2f ms   (%.0f us/iter)\n"
       "  flush only       %8.2f ms   (%.0f us/iter, puts=%llu, %.0f MB/s)\n"
@@ -667,7 +987,17 @@ int main(int argc, char **argv) {
       "  sum  spin+flush  %8.2f ms   <- what NO overlap costs\n"
       "  max  spin,flush  %8.2f ms   <- what FULL overlap costs\n"
       "  speedup async    %8.2fx\n"
-      "  flush hidden     %8.1f %%\n",
+      "  flush hidden     %8.1f %%\n"
+      // WHY cache size may or may not matter. A page cache can only pay for
+      // itself through REUSE: a hit avoids a fault. This kernel writes each
+      // page once and flushes it, so `faults` is the number of reads the cache
+      // could have served. If faults is 0 at every cache size, then the bytes
+      // moved are identical (the same `puts`) no matter how big the cache is,
+      // and a flat curve is the CORRECT answer rather than a suspicious one --
+      // the cache has nothing to hit. Evicts vs puts says whether writebacks
+      // came from reclaiming slots or from the explicit flush.
+      "  faults           %8llu     (cache hits are impossible when this is 0)\n"
+      "  evicts / puts    %8llu / %llu\n",
       spin_only, spin_only * 1000.0 / per_iter,
       io_only, io_only * 1000.0 / per_iter,
       (unsigned long long) io_stats.puts, flush_mbps,
@@ -675,7 +1005,10 @@ int main(int argc, char **argv) {
       async_ms, (unsigned long long) async_stats.puts,
       ok ? "data=OK" : "data=MISMATCH",
       spin_only + io_only, mx, sync_ms / async_ms,
-      (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0);
+      (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0,
+      (unsigned long long) io_stats.faults,
+      (unsigned long long) io_stats.evicts, (unsigned long long) io_stats.puts);
+  report_tiers();
 
   if (!ok) {
     std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");

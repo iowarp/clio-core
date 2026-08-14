@@ -70,25 +70,36 @@ avail_gib=$(( $(df --output=avail "$WORK" | tail -1) / 1048576 ))
 # set -e a failing command substitution would kill the script before PF_RC
 # could be read, losing the explanation it just printed.
 set +e
-FIT_N=$("$PY" - "$N" "$F" "$E" "$ZIP" "$avail_gib" "$SKIP_AGG" "$AUTOFIT" <<'PYEOF'
+FIT_N=$("$PY" - "$N" "$F" "$E" "$ZIP" "$avail_gib" "$SKIP_AGG" "$AUTOFIT" "$(( ${HBM_TIER_MB:-4096} + ${RAM_TIER_MB:-8192} ))" "${STORE_RATIO:-1.078}" <<'PYEOF'
 import os, sys
 N, F, E = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 zip_path, avail = sys.argv[4], int(sys.argv[5])
 skip_agg, autofit = int(sys.argv[6]), int(sys.argv[7])
+# Capacity of the tiers that are NOT disk (kHBM + RAM), and the ratio the
+# configured codec actually achieves. Both were previously ignored: the
+# estimate assumed every stored byte lands on disk at zstd's 1.078x.
+mem_tier = int(sys.argv[8]) / 1024.0
+ratio = float(sys.argv[9])
 def emit(msg):
     print(msg, file=sys.stderr)
 GiB = 2**30
 feat = N * F * 4 / GiB
-stored = feat / 1.078            # measured zstd ratio on real float features
+stored = feat / ratio
 csr = (2 + (N + 1) + E) * 8 / GiB
 zsz = os.path.getsize(zip_path) / GiB
 csr_needed = 0.0 if skip_agg else csr
 agg_needed = 0.0 if skip_agg else stored
-peak_ingest = zsz + csr_needed + stored
-peak_agg = csr_needed + stored + agg_needed
+# Only what the memory tiers cannot hold reaches disk. And the archive is
+# ALREADY on disk -- `avail` is free space with it in place -- so counting it
+# again was pure double-counting and is what made a run that fits comfortably
+# look 63 GiB short.
+on_disk = max(0.0, stored - mem_tier)
+peak_ingest = csr_needed + on_disk
+peak_agg = csr_needed + on_disk + agg_needed
 peak = max(peak_ingest, peak_agg)
 emit(f"[preflight] features {feat:.1f} GiB logical, ~{stored:.1f} GiB stored")
-emit(f"[preflight] csr {csr_needed:.1f} GiB, archive {zsz:.1f} GiB")
+emit(f"[preflight] csr {csr_needed:.1f} GiB, archive {zsz:.1f} GiB (already on disk)")
+emit(f"[preflight] memory tiers hold {mem_tier:.1f} GiB -> {on_disk:.1f} GiB to disk")
 emit(f"[preflight] peak disk needed ~{peak:.1f} GiB; available {avail} GiB")
 if peak > avail:
     if not autofit:
@@ -218,14 +229,24 @@ compose:
     pool_query: local
     pool_id: "512.0"
     storage:
+      # SCORE IS "PREFER LOWER", AND MaxBwDpe COMPARES target_score_ <=
+      # blob_score. Pages are put with score 0.5, so every tier below kHBM must
+      # be STRICTLY above 0.5 or it joins kHBM in the preferred group and can
+      # outrank it on bandwidth. This config previously had ram 1.0 and nvme
+      # 0.5 with no HBM tier at all, which put the feature matrix on DISK
+      # first -- the exact inverse of what is wanted.
+      - path: "hbm::papers_hbm"
+        bdev_type: "hbm"
+        capacity_limit: "${HBM_TIER_MB:-4096}MB"
+        score: 0.0
       - path: "ram::papers_ram"
         bdev_type: "ram"
         capacity_limit: "${RAM_TIER_MB:-8192}MB"
-        score: 1.0
+        score: 0.6
       - path: "$WORK/tier/nvme"
         bdev_type: "file"
         capacity_limit: "${NVME_TIER_MB:-131072}MB"
-        score: 0.5
+        score: 1.0
     dpe:
       dpe_type: "max_bw"
 EOF
