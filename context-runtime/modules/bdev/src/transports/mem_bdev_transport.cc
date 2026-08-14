@@ -566,7 +566,25 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   // Borrowed from the pre-created pool -- see GpuApi::BorrowStream and the
   // matching comment in ReadBlocks below.
   void *stream = ctp::GpuApi::BorrowStream();
-  while (stream == nullptr) {
+  // Unbounded, but NOT a thread-blocker: this is a coroutine, so the yield
+  // hands the worker back and other tasks keep running. That distinction is
+  // the whole reason the stream-pool deadlock was on the OTHER path --
+  // DeviceAwareMemcpy waits from a non-coroutine context and blocks a worker,
+  // which then cannot resume the very tasks holding the streams. The error
+  // semantics are deliberately left alone here (a bounded wait would have to
+  // surface as an I/O failure); what was missing was any way to SEE a task
+  // stuck in this loop, since it produces no stack a `pgrep`/gdb sweep can
+  // spot and the scheduler counts the worker as healthy.
+  for (int waits = 0; stream == nullptr; ++waits) {
+    if (waits == 1000) {   // ~10s of 10ms yields
+      HLOG(kWarning,
+           "[stream-pool] bdev write has waited ~10s for a stream "
+           "(outstanding={}). Tasks keep running -- this is a stalled task, "
+           "not a wedged worker -- but a pool that never refills means "
+           "something is holding streams.",
+           ctp::GpuApi::StreamBorrows().load() -
+               ctp::GpuApi::StreamReturns().load());
+    }
     CLIO_CO_AWAIT(clio::run::yield(10.0));
     stream = ctp::GpuApi::BorrowStream();
   }
@@ -723,7 +741,25 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
   // kernels this serves spin until this very read completes. Yield until one
   // frees up rather than making a new one. See GpuApi::BorrowStream.
   void *stream = ctp::GpuApi::BorrowStream();
-  while (stream == nullptr) {
+  // Unbounded, but NOT a thread-blocker: this is a coroutine, so the yield
+  // hands the worker back and other tasks keep running. That distinction is
+  // the whole reason the stream-pool deadlock was on the OTHER path --
+  // DeviceAwareMemcpy waits from a non-coroutine context and blocks a worker,
+  // which then cannot resume the very tasks holding the streams. The error
+  // semantics are deliberately left alone here (a bounded wait would have to
+  // surface as an I/O failure); what was missing was any way to SEE a task
+  // stuck in this loop, since it produces no stack a `pgrep`/gdb sweep can
+  // spot and the scheduler counts the worker as healthy.
+  for (int waits = 0; stream == nullptr; ++waits) {
+    if (waits == 1000) {   // ~10s of 10ms yields
+      HLOG(kWarning,
+           "[stream-pool] bdev read has waited ~10s for a stream "
+           "(outstanding={}). Tasks keep running -- this is a stalled task, "
+           "not a wedged worker -- but a pool that never refills means "
+           "something is holding streams.",
+           ctp::GpuApi::StreamBorrows().load() -
+               ctp::GpuApi::StreamReturns().load());
+    }
     CLIO_CO_AWAIT(clio::run::yield(10.0));
     stream = ctp::GpuApi::BorrowStream();
   }
