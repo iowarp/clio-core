@@ -55,6 +55,11 @@ class Worker;
  *   SendOut -> set FUTURE_COMPLETE or enqueue to parent event queue
  *   RecvOut -> poll FUTURE_COMPLETE in shared memory
  */
+/** How long a runtime-internal wait may go without completing before it is
+ *  reported. Far above any healthy task (milliseconds), so this only ever
+ *  fires on a genuinely stranded one. */
+static constexpr float kStuckWaitWarnSec = 60.0f;
+
 struct IpcCpu2Self {
   /**
    * Client sends a task to the runtime (from within the runtime process).
@@ -114,7 +119,33 @@ struct IpcCpu2Self {
     TaskT *task_ptr = future.get();
     auto start = std::chrono::steady_clock::now();
     size_t spins = 0;
+    // A wait that never ends is currently INVISIBLE. The scheduler's stall
+    // detector only fires for a worker stuck inside ExecTask
+    // (default_sched.cc: `if (!w->IsExecuting()) return false`), so the
+    // opposite failure -- a client blocked on a task while every worker sits
+    // idle in SuspendMe -- is never detected, never rescued, and logs
+    // `stalls_detected=0` while the process is wedged. Observed hanging a
+    // GetBlobTask with 48 threads idle and the GPU at 0%.
+    //
+    // This does not fix the loss; it makes it reportable. Without it the only
+    // evidence is a stack trace from a live attach, and Release builds carry
+    // no DWARF, so the stranded task's identity was unrecoverable.
+    bool warned = false;
     while (!task_ptr->IsComplete()) {
+      if (!warned) {
+        float waited = std::chrono::duration<float>(
+                           std::chrono::steady_clock::now() - start).count();
+        if (waited >= kStuckWaitWarnSec) {
+          warned = true;
+          HLOG(kWarning,
+               "[stuck-wait] no completion after {}s: pool={}.{} method={} "
+               "lane={} event_queue={}. The scheduler cannot see this: its "
+               "stall detector only covers workers INSIDE ExecTask.",
+               waited, task_ptr->pool_id_.major_, task_ptr->pool_id_.minor_,
+               (u32)task_ptr->method_, (void *)task_ptr->Lane(),
+               task_ptr->EventQueue());
+        }
+      }
       // Adaptive backoff. Busy-yield for the first burst so the common case (the
       // worker completes our task in microseconds) stays low-latency, then sleep
       // so we CEDE the CPU to the runtime workers. Without the sleep, many

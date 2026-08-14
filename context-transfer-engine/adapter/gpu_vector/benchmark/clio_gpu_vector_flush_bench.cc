@@ -50,6 +50,11 @@ static constexpr u32 kYieldLaneBytes = 4096;
 static constexpr u32 kYieldLaneBytes = 256;
 #endif
 
+/** Cap on a single host-side verification read. Generous next to a normal
+ *  read (sub-millisecond even from the NVMe tier) so it only ever fires on a
+ *  genuinely stuck task, never on a slow one. */
+static constexpr float kVerifyTimeoutSec = 120.0f;
+
 /** True when the kernels below are the yieldable coroutine forms. */
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_FLUSH_CORO 1
@@ -634,6 +639,23 @@ int main(int argc, char **argv) {
       t.free0 = s->remaining_size_;
     }
   }
+  // STREAM POOL ACCOUNTING. The runtime deadlocks when DeviceAwareMemcpy's
+  // 64-stream pool empties: BorrowStream then returns null forever (it must
+  // not create a stream while a kernel is resident) and the worker spins,
+  // stops draining its lane, and the faulting kernel waits on tasks that
+  // never run. Printing the accounting at the END of a HEALTHY run is what
+  // separates the two possible causes: outstanding must return to 0 when the
+  // workload is idle. A non-zero value here means streams LEAK, and the pool
+  // is simply running down until it hits zero -- which would make the hang a
+  // matter of run length, not of concurrency.
+  auto report_streams = []() {
+    const long b = ctp::GpuApi::StreamBorrows().load();
+    const long r = ctp::GpuApi::StreamReturns().load();
+    const long w = ctp::GpuApi::StreamWarmed().load();
+    std::printf("  STREAM POOL: warmed=%ld borrows=%ld returns=%ld "
+                "outstanding=%ld%s\n", w, b, r, b - r,
+                (b - r) > 0 ? "   <-- LEAK: not returned at idle" : "");
+  };
   auto report_tiers = [&]() {
     std::printf("  TIER SPLIT:");
     u64 total_used = 0;
@@ -887,6 +909,7 @@ int main(int argc, char **argv) {
         spin_only + io_only, mx, sync_ms / async_ms,
         (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0);
     report_tiers();
+    report_streams();
     if (!ok) {
       std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");
       return 1;
@@ -946,7 +969,27 @@ int main(int argc, char **argv) {
           auto f = core.AsyncGetBlob(vec.TagId(), std::string(name), 0,
                                      page_bytes, 0,
                                      reinterpret_cast<char *>(buf.data()));
-          f.Wait();
+          // BOUNDED. An unbounded Wait() here is how this benchmark hangs:
+          // IpcCpu2Self::RecvOut polls task->IsComplete() forever when
+          // max_sec is 0, so a GetBlobTask whose completion is never set
+          // parks the process indefinitely -- observed with every worker
+          // idle in SuspendMe, no worker executing, and the GPU at 0%.
+          // A missed lane wakeup cannot explain it (the worker's epoll is
+          // capped at max_sleep and re-polls unconditionally), so the task
+          // is either lost at submission or completed without IsComplete()
+          // being set. Either way, report WHICH blob and stop rather than
+          // stalling a whole sweep on one unresolvable read.
+          if (!f.Wait(kVerifyTimeoutSec)) {
+            std::fprintf(stderr,
+                         "\n  *** HANG: GetBlob(%s) did not complete within "
+                         "%.0fs (block %u, iter %llu, page %llu). The task "
+                         "never signalled completion.\n",
+                         name, (double) kVerifyTimeoutSec, b,
+                         (unsigned long long) it,
+                         (unsigned long long) probe[k]);
+            ok = false;
+            break;
+          }
           if (f->GetReturnCode() != 0) {
             std::fprintf(stderr, "  read of %s failed rc=%d\n", name,
                          f->GetReturnCode());
@@ -1009,6 +1052,7 @@ int main(int argc, char **argv) {
       (unsigned long long) io_stats.faults,
       (unsigned long long) io_stats.evicts, (unsigned long long) io_stats.puts);
   report_tiers();
+  report_streams();
 
   if (!ok) {
     std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");

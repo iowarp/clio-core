@@ -80,8 +80,19 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     // vector: every compute worker parked in pthread_rwlock_wrlock under
     // cuStreamCreate/cuStreamDestroy and the runtime reported "ALL compute
     // workers stalled". See ctp::GpuApi::BorrowStream.
-    constexpr int kIoStreamPoolSize = 64;
-    ctp::GpuApi::WarmStreamPool(kIoStreamPoolSize);
+    // Sized by env so the exhaustion deadlock can be measured against pool
+    // size. 64 was measured EXHAUSTED (outstanding=64 of warmed=64) at the
+    // moment of a wedge: every stream in flight, three worker threads spinning
+    // in BorrowStream's unbounded retry, lanes undrained (one worker held 45
+    // queued tasks), and the faulting kernel waiting on those very tasks.
+    int io_pool = 64;
+    if (const char *e = std::getenv("CLIO_GPU_STREAM_POOL")) {
+      const int v = std::atoi(e);
+      if (v > 0) io_pool = v;
+    }
+    ctp::GpuApi::WarmStreamPool(io_pool);
+    HLOG(kInfo, "GPU I/O stream pool: {} streams (CLIO_GPU_STREAM_POOL)",
+         io_pool);
 
     // Device-memory submission ring (CLIO_GPU_DEVRING=1).
     //

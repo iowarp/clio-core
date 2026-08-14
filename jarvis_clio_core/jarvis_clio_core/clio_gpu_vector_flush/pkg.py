@@ -105,6 +105,11 @@ class ClioGpuVectorFlush(Application):
             {'name': 'output_dir',
              'msg': 'Output directory for benchmark results',
              'type': str, 'default': '/tmp/clio_gpu_vector_flush'},
+            {'name': 'timeout_sec',
+             'msg': 'Kill a run after this many seconds (0 = no limit). The '
+                    'kernel can wedge at 0%% GPU and never return, which '
+                    'without a limit stalls every remaining cell of a sweep',
+             'type': int, 'default': 900},
         ]
 
     def _flush_mb(self):
@@ -208,6 +213,15 @@ class ClioGpuVectorFlush(Application):
             cmd.append(f'--pages-per-block {self.config["pages_per_block"]}')
         if self.config['read_mode']:
             cmd.append('--read')
+
+        # A wedged run is not hypothetical: the kernel has been observed
+        # allocating, printing its header, then sitting at 0% GPU forever.
+        # Reliably above ~2 GiB of total cache, but ALSO intermittently at
+        # 1 GiB -- a 16 pages/block cell hung for 19 minutes mid-sweep at a
+        # size that had run fine repeatedly. Without a bound, one such cell
+        # stalls every remaining cell in the matrix.
+        if self.config['timeout_sec'] > 0:
+            cmd.insert(0, f'timeout {self.config["timeout_sec"]}')
 
         self.log(f'Running: {" ".join(cmd)}')
         # Run from the output directory: the binary drops its generated

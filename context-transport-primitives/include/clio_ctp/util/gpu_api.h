@@ -37,6 +37,8 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -234,6 +236,45 @@ class GpuApi {
     return mtx;
   }
 
+  /** Borrow/return accounting. Exhaustion with (borrows - returns) far below
+   *  the warmed count means streams are LEAKING; equal to it means they are
+   *  legitimately all in flight. Those need opposite fixes, and the stacks
+   *  alone could not tell them apart. */
+  static std::atomic<long> &StreamBorrows() {
+    static std::atomic<long> n{0};
+    return n;
+  }
+  static std::atomic<long> &StreamReturns() {
+    static std::atomic<long> n{0};
+    return n;
+  }
+  /** Streams handed out by WarmStreamPool, for comparison against the above. */
+  static std::atomic<long> &StreamWarmed() {
+    static std::atomic<long> n{0};
+    return n;
+  }
+
+  /**
+   * Per-device free-list sizes, e.g. "dev0=0 dev1=64".
+   *
+   * Borrow and return BOTH index StreamPool() by CurrentDevice(). If a thread
+   * ever returns a stream while bound to a different device than it borrowed
+   * from, the stream migrates buckets: the borrowing bucket drains to zero
+   * while another fills, and the borrow/return COUNTS stay perfectly balanced
+   * the whole time. That is exactly the state observed -- balanced counters
+   * (290484/290484, outstanding=0 at idle) yet a bucket that hits zero -- so
+   * the distribution, not the total, is what has to be printed.
+   * Caller must hold StreamPoolMutex().
+   */
+  static std::string PoolSizesLocked() {
+    std::string out;
+    for (auto &kv : StreamPool()) {
+      out += "dev" + std::to_string(kv.first) + "=" +
+             std::to_string(kv.second.size()) + " ";
+    }
+    return out.empty() ? std::string("(no buckets)") : out;
+  }
+
   /** Whether a device's pool has been pre-created. */
   static std::unordered_map<int, bool> &PoolWarmed() {
     static std::unordered_map<int, bool> warmed;
@@ -261,6 +302,67 @@ class GpuApi {
    * why this is a pool rather than one shared stream per thread. Pooled
    * streams are never destroyed; they are process-lifetime objects.
    */
+  /**
+   * Streams RESERVED for callers that cannot yield, one per thread.
+   *
+   * The shared pool is safe only for callers that release the worker while
+   * they wait. Path A (bdev writes) is a coroutine: it CO_AWAITs while HOLDING
+   * a stream, so a single worker can carry many suspended stream-holding
+   * tasks. Path B (IpcGpu2Cpu::SendOut -> DeviceAwareMemcpy) runs directly
+   * under Worker::ExecTask and cannot yield, so its retry loop BLOCKS the
+   * worker thread.
+   *
+   * Those two combine into a resource inversion: path A's suspended
+   * coroutines can only be resumed BY A WORKER, and path B blocks a worker
+   * waiting for the stream that only that resumption would release. Measured
+   * at a live wedge: outstanding == warmed == 64, three workers spinning in
+   * BorrowStream, one worker holding 45 undrained tasks, live=0, and the
+   * faulting kernel stuck in cuCtxSynchronize forever.
+   *
+   * A reserved stream removes path B from the pool entirely, so it can never
+   * be starved. Exclusive per-thread ownership is sound because
+   * DeviceAwareMemcpy is synchronous end to end (launch, PollSync, done) and
+   * never yields, so a thread cannot re-enter it and cannot overlap two uses
+   * of its own stream.
+   */
+  static std::vector<void *> &ReservedStreams() {
+    static std::vector<void *> v;
+    return v;
+  }
+  static std::atomic<int> &ReservedNext() {
+    static std::atomic<int> n{0};
+    return n;
+  }
+
+  /**
+   * This thread's reserved stream, or nullptr when the reserve is used up
+   * (then the caller falls back to the shared pool).
+   *
+   * Assignment is sticky per thread and happens on first use. Streams are
+   * NEVER created here: creating one takes the CUDA context write lock, which
+   * blocks while a kernel is resident -- the very deadlock the pool exists to
+   * avoid. The reserve is pre-created in WarmStreamPool.
+   */
+  static void *ThreadReservedStream() {
+    static thread_local void *mine = nullptr;
+    static thread_local bool tried = false;
+    if (!tried) {
+      tried = true;
+      std::lock_guard<std::mutex> lock(StreamPoolMutex());
+      const int idx = ReservedNext().fetch_add(1, std::memory_order_relaxed);
+      if (idx >= 0 && idx < static_cast<int>(ReservedStreams().size())) {
+        mine = ReservedStreams()[idx];
+      }
+    }
+    return mine;
+  }
+
+  /** Lock-taking wrapper for PoolSizesLocked. */
+  static std::string PoolSizes() {
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    return PoolSizesLocked();
+  }
+
   static void *BorrowStream() {
     const int dev = CurrentDevice();
     std::lock_guard<std::mutex> lock(StreamPoolMutex());
@@ -268,6 +370,7 @@ class GpuApi {
     if (!free_list.empty()) {
       void *s = free_list.back();
       free_list.pop_back();
+      StreamBorrows().fetch_add(1, std::memory_order_relaxed);
       return s;
     }
     // Exhausted. Do NOT create one here: creating a stream while a kernel is
@@ -282,6 +385,8 @@ class GpuApi {
       // Never warmed (no GPU init in this process): bootstrap exactly one so
       // an un-warmed process still makes progress.
       PoolWarmed()[dev] = true;
+      StreamBorrows().fetch_add(1, std::memory_order_relaxed);
+      StreamWarmed().fetch_add(1, std::memory_order_relaxed);
       return CreateStream();
     }
     return nullptr;
@@ -300,6 +405,18 @@ class GpuApi {
     for (int i = 0; i < count; ++i) {
       free_list.push_back(CreateStream());
     }
+    StreamWarmed().fetch_add(count, std::memory_order_relaxed);
+    // Reserve for non-yieldable callers. Sized well above the worker count so
+    // every thread that can reach DeviceAwareMemcpy gets one; these are never
+    // handed to the shared pool, so no coroutine can hold them.
+    int reserved = 128;
+    if (const char *e = std::getenv("CLIO_GPU_RESERVED_STREAMS")) {
+      const int v = std::atoi(e);
+      if (v >= 0) reserved = v;
+    }
+    for (int i = 0; i < reserved; ++i) {
+      ReservedStreams().push_back(CreateStream());
+    }
     PoolWarmed()[dev] = true;
   }
 
@@ -307,6 +424,7 @@ class GpuApi {
   static void ReturnStream(void *stream) {
     if (stream == nullptr) return;
     std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    StreamReturns().fetch_add(1, std::memory_order_relaxed);
     StreamPool()[CurrentDevice()].push_back(stream);
   }
 
@@ -721,11 +839,59 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // and wedging the process (intermittent by thread-to-task lottery;
   // copy engines measured healthy from a separate process throughout).
   // Borrow from the pool pre-warmed at init instead.
-  void *ps = GpuApi::BorrowStream();
-  while (ps == nullptr) {   // pool momentarily exhausted: brief CPU spin
-    std::this_thread::yield();
-    ps = GpuApi::BorrowStream();
+  // Use this thread's RESERVED stream when it has one. This path cannot
+  // yield, so taking from the shared pool lets suspended coroutines starve it
+  // and deadlock the runtime (see ThreadReservedStream). With a reserved
+  // stream there is nothing to wait for and the spin below is unreachable.
+  void *ps = GpuApi::ThreadReservedStream();
+  const bool reserved = (ps != nullptr);
+  if (ps == nullptr) ps = GpuApi::BorrowStream();
+  // THIS SPIN IS UNBOUNDED AND HAS BEEN CAUGHT WEDGING THE RUNTIME. Captured
+  // live: two worker threads parked here in sched_yield under
+  // Worker::ExecTask -> IpcGpu2Cpu::SendOut, while 8 tasks sat queued in the
+  // lanes of two OTHER idle workers and the GPU kernel waited in
+  // cuCtxSynchronize for exactly those tasks. Workers consumed by this loop
+  // stop draining their lanes, so the fault service the resident kernel is
+  // waiting on never runs -- a circular wait no watchdog can see (the
+  // scheduler's stall detector only covers workers INSIDE a long ExecTask,
+  // and these are "executing" by its definition).
+  //
+  // The pool is 64 streams against ~9 workers, so ordinary concurrency cannot
+  // empty it; reaching nullptr at all means streams are outstanding far longer
+  // than expected or are not coming back. Report it instead of spinning
+  // silently -- a silent unbounded spin is why this took a live gdb attach to
+  // find.
+  // BOUNDED, WITH A GUARANTEED WAY OUT. This is the fallback for threads that
+  // did not get a reserved stream (more callers than the reserve). It is the
+  // path that used to spin forever: captured live with worker threads parked
+  // here in sched_yield under Worker::ExecTask -> IpcGpu2Cpu::SendOut, lanes
+  // undrained, live=0, and the process wedged. A blocking wait on this path
+  // can never be safe -- the streams it waits for are released by coroutines
+  // that only a worker can resume, and this IS a worker.
+  //
+  // So: wait briefly, then fall back to the DEFAULT stream rather than keep
+  // waiting. The default stream always exists, so there is no creation (it is
+  // cuStreamCreate, not stream use, that takes the context write lock and
+  // deadlocks against a resident kernel). Pool streams are created with
+  // cudaStreamNonBlocking, so they do not implicitly synchronise against it.
+  // Serialising a few service copies is strictly better than a hang.
+  if (ps == nullptr) {
+    for (int spins = 0; spins < 20000 && ps == nullptr; ++spins) {
+      std::this_thread::yield();
+      ps = GpuApi::BorrowStream();
+    }
+    if (ps == nullptr) {
+      HLOG(kWarning,
+           "[stream-pool] exhausted in DeviceAwareMemcpy(n={}); warmed={} "
+           "outstanding={} buckets=[{}]. Falling back to the default stream "
+           "so this worker keeps making progress instead of blocking on a "
+           "stream only it could release.",
+           n, GpuApi::StreamWarmed().load(),
+           GpuApi::StreamBorrows().load() - GpuApi::StreamReturns().load(),
+           GpuApi::PoolSizes());
+    }
   }
+  const bool pooled = (!reserved && ps != nullptr);
   cudaStream_t s = static_cast<cudaStream_t>(ps);
   // COPY VIA KERNEL WHEN LEGAL, ENGINE OTHERWISE. Engine copies that read
   // device memory are channel-ordered and stall behind a resident faulting
@@ -752,7 +918,9 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
     CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, s));
   }
   GpuApi::PollSync(ps);   // never block in driver sync on a service path
-  GpuApi::ReturnStream(ps);
+  // A reserved stream stays with its thread; the default-stream fallback was
+  // never borrowed. Only genuinely pooled streams go back.
+  if (pooled) GpuApi::ReturnStream(ps);
 #elif CTP_ENABLE_ROCM
   auto is_host_kind = [](const void *p) {
     hipPointerAttribute_t a{};
