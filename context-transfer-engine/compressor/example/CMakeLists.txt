@@ -49,4 +49,9 @@ if(CLIO_CORE_ENABLE_CUDA)
   # Where do the bytes actually go? Traces one GPU-generated chunk through
   # Clio's real store path. Needs CUPTI but not native NeuroPress.
   add_subdirectory(neuropress_data_path_trace)
+
+  # Which transfers are REDUNDANT? Same real store path at 2 x 256 MiB, with
+  # NVTX ranges so nsys can attribute each copy to a phase. Needs NVTX, not
+  # CUPTI -- the profiler here is external.
+  add_subdirectory(neuropress_transfer_audit)
 endif()

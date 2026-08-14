@@ -34,6 +34,7 @@
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <string>
 
@@ -271,6 +272,48 @@ std::vector<CompressionStats> RankIntoStats(
   // wants, and not what NeuroPress does.
   ctp::compress::model::RankingWeights weights;
   weights.use_cost_model = true;
+
+  // Cost-model weights are overridable for experiments, and ONLY for
+  // experiments: the defaults above are upstream's (all 1.0, bw 5e6) and are
+  // what every normal write uses. Read once -- this runs per chunk on runtime
+  // worker threads, so a getenv per call would be both a syscall and a data
+  // race against anything that sets the environment.
+  //
+  // The motivating case is a "ratio cost model": CLIO_NEUROPRESS_COST_W_CT=0
+  // CLIO_NEUROPRESS_COST_W_DT=0 leaves cost = w_io*size/(ratio*bw), i.e. pure
+  // compression ratio, which is what the library default would have been.
+  // That is a genuinely different selector, not a tuning knob -- with equal
+  // weights the I/O term is ~0.4% of the cost at 4 MiB, so the shipped model
+  // is effectively a latency model and the ratio one picks quite differently.
+  struct CostWeightOverride {
+    double ct, dt, io, bw;
+    bool any;
+  };
+  static const CostWeightOverride kOverride = [] {
+    auto read = [](const char *name, double fallback, bool *seen) {
+      const char *v = std::getenv(name);
+      if (v == nullptr || *v == '\0') return fallback;
+      char *end = nullptr;
+      const double parsed = std::strtod(v, &end);
+      if (end == v) return fallback;
+      *seen = true;
+      return parsed;
+    };
+    bool seen = false;
+    CostWeightOverride o{};
+    o.ct = read("CLIO_NEUROPRESS_COST_W_CT", 1.0, &seen);
+    o.dt = read("CLIO_NEUROPRESS_COST_W_DT", 1.0, &seen);
+    o.io = read("CLIO_NEUROPRESS_COST_W_IO", 1.0, &seen);
+    o.bw = read("CLIO_NEUROPRESS_COST_BW", 5e6, &seen);
+    o.any = seen;
+    return o;
+  }();
+  if (kOverride.any) {
+    weights.w_cost_compress_time = kOverride.ct;
+    weights.w_cost_decompress_time = kOverride.dt;
+    weights.w_cost_io = kOverride.io;
+    weights.bandwidth_bytes_per_ms = kOverride.bw;
+  }
 
   std::vector<RankedPrediction> ranked;
   auto *np = dynamic_cast<ctp::compress::model::NeuroPressNNPredictor *>(
