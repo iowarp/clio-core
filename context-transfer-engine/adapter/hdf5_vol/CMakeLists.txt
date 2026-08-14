@@ -80,5 +80,3 @@ install(TARGETS clio_hdf5_vol
 )
 
 message(STATUS "HDF5 VOL adapter configured successfully")
-
-add_subdirectory(example)
