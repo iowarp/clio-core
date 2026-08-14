@@ -565,6 +565,13 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 // Compression Statistics Estimation
 // ==============================================================================
 
+/** Defined with the selection log below; used here to skip work it alone reads.
+ *  Declared in the same anonymous namespace as the definition, or this would
+ *  be a different function and the call would be ambiguous. */
+namespace {
+bool SelectionLogEnabled();
+}  // namespace
+
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
@@ -708,11 +715,24 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
-      // The stream is idle now -- the ranking waited on it once. Pulling the
-      // three numbers out for the selection log and for Train()'s samples
-      // therefore costs a 24-byte copy and no additional stall.
-      if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
-                                       &second_derivative_mean, np_stream)) {
+      // The stream is idle now -- the ranking waited on it once -- so pulling
+      // the three numbers out costs a 24-byte copy and no additional stall.
+      //
+      // Gated on the log, because the log is now its ONLY consumer. The comment
+      // here used to say "and for Train()'s samples", and that stopped being
+      // true: the online-learning block recomputes its own features with
+      // ComputeCompressionFeatures so that SGD trains on exactly the scope
+      // inference predicted from. With the log off, this copy's result was
+      // written to locals that nothing read.
+      //
+      // The stats themselves stay on the device either way -- the network
+      // reads them there. This only decides whether a copy of them also comes
+      // back to the host.
+      if (!SelectionLogEnabled()) {
+        entropy = mad = second_derivative_mean = 0.0;
+      } else if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
+                                              &second_derivative_mean,
+                                              np_stream)) {
         entropy = mad = second_derivative_mean = 0.0;
       }
       if (out_entropy) *out_entropy = entropy;

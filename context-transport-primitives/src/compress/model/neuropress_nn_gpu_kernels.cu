@@ -26,6 +26,9 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cmath>
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -225,7 +228,40 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   // single flat params[] buffer (w1,b1,w2,b2,...), matching the offsets
   // above. weights_len/biases_len callers pass the FULL flattened arrays;
   // per-layer sizes are fixed by the architecture (8->64->64->64->64->8).
-  float host_params[kParamCount];
+  // Staging for a SINGLE upload. params, x_means, x_stds, y_means and y_stds
+  // are contiguous at the front of NeuroPressGpuWeights, so the whole prefix
+  // ships in one cudaMemcpy instead of five -- which is what upstream does
+  // (nn_gpu.cu:1774 copies the entire NNWeightsGPU in one call).
+  //
+  // Clio cannot copy the WHOLE struct the way upstream does: ours also carries
+  // the persistent Train() scratch (act_x, act_z1..., d5_clamped), which is
+  // device-only and must not be uploaded. Upstream keeps its SGD scratch per
+  // CompContext instead, which is why its struct is copyable wholesale. The
+  // prefix is exactly the part that is model data.
+  constexpr size_t kOffXMeans = kParamCount;
+  constexpr size_t kOffXStds = kOffXMeans + kInputDim;
+  constexpr size_t kOffYMeans = kOffXStds + kInputDim;
+  constexpr size_t kOffYStds = kOffYMeans + kOutputDim;
+  constexpr size_t kPrefixFloats = kOffYStds + kOutputDim;
+  // The single copy is only correct if the device struct really is laid out
+  // the way this staging buffer assumes. All five members are float arrays so
+  // no padding can appear between them, but assert it rather than trust it:
+  // inserting a member into the struct above would otherwise silently corrupt
+  // the normalization constants instead of failing to build.
+  static_assert(offsetof(NeuroPressGpuWeights, x_means) ==
+                    sizeof(float) * kOffXMeans,
+                "x_means must directly follow params");
+  static_assert(offsetof(NeuroPressGpuWeights, x_stds) ==
+                    sizeof(float) * kOffXStds,
+                "x_stds must directly follow x_means");
+  static_assert(offsetof(NeuroPressGpuWeights, y_means) ==
+                    sizeof(float) * kOffYMeans,
+                "y_means must directly follow x_stds");
+  static_assert(offsetof(NeuroPressGpuWeights, y_stds) ==
+                    sizeof(float) * kOffYStds,
+                "y_stds must directly follow y_means");
+
+  float host_params[kPrefixFloats];
   size_t w_off[5] = {0, kW1, kW1 + kW234, kW1 + 2 * kW234, kW1 + 3 * kW234};
   size_t b_off[5] = {0, kHiddenDim, 2 * kHiddenDim, 3 * kHiddenDim,
                      4 * kHiddenDim};
@@ -244,17 +280,13 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   // upstream's resetAllSGDEMABuffers() does.
   ResetAllEmaBuffers();
 
-  bool ok = true;
-  ok &= cudaMemcpy(&device_w->params, host_params, sizeof(host_params),
-                   cudaMemcpyHostToDevice) == cudaSuccess;
-  ok &= cudaMemcpy(&device_w->x_means, x_means, sizeof(float) * kInputDim,
-                   cudaMemcpyHostToDevice) == cudaSuccess;
-  ok &= cudaMemcpy(&device_w->x_stds, x_stds, sizeof(float) * kInputDim,
-                   cudaMemcpyHostToDevice) == cudaSuccess;
-  ok &= cudaMemcpy(&device_w->y_means, y_means, sizeof(float) * kOutputDim,
-                   cudaMemcpyHostToDevice) == cudaSuccess;
-  ok &= cudaMemcpy(&device_w->y_stds, y_stds, sizeof(float) * kOutputDim,
-                   cudaMemcpyHostToDevice) == cudaSuccess;
+  std::memcpy(host_params + kOffXMeans, x_means, sizeof(float) * kInputDim);
+  std::memcpy(host_params + kOffXStds, x_stds, sizeof(float) * kInputDim);
+  std::memcpy(host_params + kOffYMeans, y_means, sizeof(float) * kOutputDim);
+  std::memcpy(host_params + kOffYStds, y_stds, sizeof(float) * kOutputDim);
+
+  bool ok = cudaMemcpy(&device_w->params, host_params, sizeof(host_params),
+                       cudaMemcpyHostToDevice) == cudaSuccess;
   if (!ok) {
     cudaFree(device_w);
     return nullptr;
@@ -319,6 +351,9 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
 // Inference: one block per candidate, thread t owns hidden neuron t.
 // ============================================================================
 constexpr int kMaxCandidates = 32;
+
+/** ct, dt, ratio, psnr -- the four per-candidate outputs, packed in one buffer. */
+constexpr int kPredOutputs = 4;
 
 /**
  * decodeAction, in the kernel.
@@ -812,9 +847,30 @@ namespace {
 struct InferScratch {
   // Sized for the ACTION SPACE. The device-stats path ranks in a single warp,
   // so its candidate set can never exceed NN_NUM_CONFIGS.
-  int *d_actions = nullptr;    // [kMaxCandidates] upstream action indices
-  int *d_order = nullptr;      // [kMaxCandidates] ranked slots, best first
-  double *d_scores = nullptr;  // [kMaxCandidates] their scores, same order
+  int *d_actions = nullptr;  // [kMaxCandidates] upstream action indices
+
+  // The candidate action list is uploaded ONCE per thread, not per chunk.
+  //
+  // It is a pure function of which algorithms this build can construct:
+  // neuropress_bridge.cc resolves availability into a function-local
+  // `static const std::set` precisely because GetPreset() builds a real
+  // compressor and is far too costly to repeat per write. The eight trained
+  // base_ids are a static set, and the quantize/shuffle expansion is fixed
+  // order. Nothing about a chunk can change it -- not even the error bound,
+  // which varies per write but only sets each candidate's `error_bound`
+  // FIELD; the action index itself is algo + 8*quantize + 16*shuffle and
+  // carries no bound.
+  //
+  // So re-sending 128 identical bytes on every write was pure overhead.
+  bool actions_installed = false;
+  int installed_n = 0;
+#ifndef NDEBUG
+  // Debug-only witness for the invariant above. If a caller ever does vary the
+  // list, the stale upload would silently score the WRONG configurations and
+  // still return a plausible-looking ranking -- the failure mode that must not
+  // be discovered in production. Costs nothing in release.
+  std::vector<int> installed_actions;
+#endif
 
   // Sized for the BATCH, grown on demand. The host-matrix entry point has no
   // warp-wide step, and Rank() calls it with whatever candidate set the caller
@@ -824,44 +880,152 @@ struct InferScratch {
   // ranking: caught by ctp_compress_model, not by anything on the NeuroPress
   // path, because only the wider callers reach it.
   float *d_raw = nullptr;  // [cap][8]
-  float *d_ct = nullptr;   // [cap]
-  float *d_dt = nullptr;
-  float *d_r = nullptr;
-  float *d_p = nullptr;
+
+  // EVERY value this path reads back lives in ONE allocation, so the whole
+  // ranking result returns in ONE cudaMemcpyAsync. These copies are
+  // latency-bound -- ~2.8 us apiece at 128-512 bytes -- so the COUNT is the
+  // cost and the volume is not. Six copies became one.
+  //
+  // Upstream does the same thing for the same reason: NNInferenceOutput packs
+  // the action and eight predictions into a single 36-byte struct rather than
+  // returning them separately (nn_gpu.cu:1975, "Single D->H copy ... replaces
+  // 3 separate transfers").
+  //
+  // Layout, by BYTE offset, sized by cap:
+  //     [        0, 8*cap )  scores  double[cap]   -- 8-aligned, so first
+  //     [    8*cap, 12*cap)  order   int[cap]
+  //     [   12*cap, 28*cap)  pred    float[4][cap] -- ct | dt | ratio | psnr
+  // Predictions sit LAST so a caller that wants no ranking can fetch them as a
+  // contiguous suffix, still in one copy.
+  //
+  // The pointers below are non-owning views, which keeps every kernel call
+  // site unchanged.
+  void *d_out = nullptr;
+  double *d_scores = nullptr;  // [cap] ranked scores, best first
+  int *d_order = nullptr;      // [cap] ranked slots, same order
+  float *d_pred = nullptr;     // [4][cap]
+  float *d_ct = nullptr;       // = d_pred + 0*cap
+  float *d_dt = nullptr;       // = d_pred + 1*cap
+  float *d_r = nullptr;        // = d_pred + 2*cap
+  float *d_p = nullptr;        // = d_pred + 3*cap
+
+  // Host landing buffer for that single copy, scattered to the caller's
+  // separate arrays after the stream wait. Per-thread and grown with cap, so a
+  // steady state does no allocation.
+  std::vector<unsigned char> host_out;
+
   int cap = 0;
   bool ok = false;
 };
+
+/** Byte size of the packed readback block for n candidates. */
+constexpr size_t PackedOutBytes(size_t n) {
+  return n * (sizeof(double) + sizeof(int) + sizeof(float) * kPredOutputs);
+}
 
 /** Grow the per-batch buffers when a call needs more than the last one did. */
 bool EnsureInferCapacity(InferScratch &s, int n) {
   if (n <= s.cap) return true;
   cudaFree(s.d_raw);
-  cudaFree(s.d_ct);
-  cudaFree(s.d_dt);
-  cudaFree(s.d_r);
-  cudaFree(s.d_p);
-  s.d_raw = s.d_ct = s.d_dt = s.d_r = s.d_p = nullptr;
+  cudaFree(s.d_out);
+  s.d_raw = nullptr;
+  s.d_out = nullptr;
+  s.d_scores = nullptr;
+  s.d_order = nullptr;
+  s.d_pred = s.d_ct = s.d_dt = s.d_r = s.d_p = nullptr;
   s.cap = 0;
-  const size_t out_bytes = sizeof(float) * static_cast<size_t>(n);
-  if (cudaMalloc(&s.d_raw, out_bytes * kInputDim) != cudaSuccess ||
-      cudaMalloc(&s.d_ct, out_bytes) != cudaSuccess ||
-      cudaMalloc(&s.d_dt, out_bytes) != cudaSuccess ||
-      cudaMalloc(&s.d_r, out_bytes) != cudaSuccess ||
-      cudaMalloc(&s.d_p, out_bytes) != cudaSuccess) {
+  const size_t nn = static_cast<size_t>(n);
+  if (cudaMalloc(&s.d_raw, sizeof(float) * nn * kInputDim) != cudaSuccess ||
+      cudaMalloc(&s.d_out, PackedOutBytes(nn)) != cudaSuccess) {
     return false;
   }
+  // Views into d_out, in the layout documented on InferScratch. cudaMalloc
+  // returns 256-byte-aligned memory and every offset below is a multiple of
+  // its element size, so each view is naturally aligned.
+  auto *base = static_cast<unsigned char *>(s.d_out);
+  s.d_scores = reinterpret_cast<double *>(base);
+  s.d_order = reinterpret_cast<int *>(base + sizeof(double) * nn);
+  s.d_pred = reinterpret_cast<float *>(
+      base + (sizeof(double) + sizeof(int)) * nn);
+  s.d_ct = s.d_pred;
+  s.d_dt = s.d_pred + n;
+  s.d_r = s.d_pred + 2 * n;
+  s.d_p = s.d_pred + 3 * n;
+  s.host_out.resize(PackedOutBytes(nn));
   s.cap = n;
+  return true;
+}
+
+/**
+ * Pull the four prediction arrays back in a single copy, wait once, then
+ * scatter to the caller's separate arrays.
+ *
+ * The scatter is host-side memcpy of a few hundred bytes, which is free next to
+ * the ~2.8 us floor of a device copy -- so trading four device copies for one
+ * plus four memcpys is a straight win. Both inference entry points end in the
+ * same "copy, sync, return" shape, so both use this.
+ *
+ * The stream wait matches runNNFusedInferenceCtx's single
+ * cudaStreamSynchronize(stream) (nn_gpu.cu:2236). Calling cudaDeviceSynchronize
+ * here instead would stall every other worker's compression, not just this one.
+ */
+bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
+                          float *out_ct, float *out_dt, float *out_r,
+                          float *out_p, int *out_order = nullptr,
+                          double *out_scores = nullptr) {
+  // STRIDES ARE THE ALLOCATION'S, NOT THE CALL'S.
+  //
+  // EnsureInferCapacity lays d_out out by `cap`, and cap can exceed this
+  // call's n (it only ever grows, and the host-matrix path ranks far more
+  // candidates than the 32-wide device path). Computing these offsets from n
+  // instead put every region in the wrong place whenever n < cap: ct and dt
+  // then read from overlapping addresses, which is precisely the aliasing the
+  // cost model must not see -- it would rank on a duplicated term. Caught by
+  // test_neuropress_bridge's saw_distinct_decomp_time assertion.
+  const size_t cap = static_cast<size_t>(s.cap);
+  const size_t nn = static_cast<size_t>(n);
+  const size_t stride = sizeof(float) * cap;   // between prediction arrays
+  const size_t want = sizeof(float) * nn;      // what the caller asked for
+  const size_t pred_off = (sizeof(double) + sizeof(int)) * cap;
+
+  // Whether the ranking came back decides only WHERE the single copy starts.
+  // Predictions are the last region, so "predictions only" is a contiguous
+  // suffix and stays one transfer either way. The copy spans the whole
+  // capacity because the regions are cap-strided; it is still ONE transfer,
+  // which is the property being bought here.
+  const bool want_rank = (out_order != nullptr);
+  const size_t off = want_rank ? 0 : pred_off;
+  const size_t len = PackedOutBytes(cap) - off;
+  auto *dst = s.host_out.data() + off;
+  auto *src = static_cast<const unsigned char *>(s.d_out) + off;
+
+  if (cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToHost, st) !=
+      cudaSuccess) {
+    return false;
+  }
+  if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+
+  const unsigned char *base = s.host_out.data();
+  if (want_rank) {
+    std::memcpy(out_order, base + sizeof(double) * cap, sizeof(int) * nn);
+    if (out_scores != nullptr) {
+      std::memcpy(out_scores, base, sizeof(double) * nn);
+    }
+  }
+  const unsigned char *p = base + pred_off;
+  std::memcpy(out_ct, p, want);
+  std::memcpy(out_dt, p + stride, want);
+  std::memcpy(out_r, p + 2 * stride, want);
+  std::memcpy(out_p, p + 3 * stride, want);
   return true;
 }
 
 InferScratch &Infer() {
   static thread_local InferScratch *s = [] {
     auto *p = new InferScratch();
+    // d_order and d_scores are no longer allocated here: they are views into
+    // the one packed d_out block that EnsureInferCapacity owns.
     p->ok = cudaMalloc(&p->d_actions, sizeof(int) * kMaxCandidates) ==
-                cudaSuccess &&
-            cudaMalloc(&p->d_order, sizeof(int) * kMaxCandidates) ==
-                cudaSuccess &&
-            cudaMalloc(&p->d_scores, sizeof(double) * kMaxCandidates) ==
                 cudaSuccess &&
             EnsureInferCapacity(*p, kMaxCandidates);
     return p;
@@ -924,8 +1088,30 @@ bool NeuroPressGpuInferBatchDeviceStats(
   // and never waited on, this does not reintroduce a synchronization point;
   // what mattered was never the byte count but that the old path had to STOP
   // and wait twice.
-  bool ok = cudaMemcpyAsync(s.d_actions, action_ids, act_bytes,
-                            cudaMemcpyHostToDevice, st) == cudaSuccess;
+  // Install-once: see InferScratch::actions_installed. After the first write on
+  // this thread there is no host-to-device transfer left on the decision path
+  // at all.
+  bool ok = true;
+  if (!s.actions_installed || s.installed_n != num_candidates) {
+    ok = cudaMemcpyAsync(s.d_actions, action_ids, act_bytes,
+                         cudaMemcpyHostToDevice, st) == cudaSuccess;
+    if (ok) {
+      s.actions_installed = true;
+      s.installed_n = num_candidates;
+#ifndef NDEBUG
+      s.installed_actions.assign(action_ids, action_ids + num_candidates);
+#endif
+    }
+  }
+#ifndef NDEBUG
+  else {
+    assert(std::equal(action_ids, action_ids + num_candidates,
+                      s.installed_actions.begin()) &&
+           "candidate action list changed between chunks; the install-once "
+           "upload in InferScratch is no longer valid");
+  }
+#endif
+  bool ranked = false;
   if (ok) {
     InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_actions,
@@ -945,34 +1131,17 @@ bool NeuroPressGpuInferBatchDeviceStats(
         rank->w_io, rank->bandwidth_bytes_per_ms, rank->error_bound,
         rank->min_psnr, s.d_order, s.d_scores);
     ok = cudaGetLastError() == cudaSuccess;
-    if (ok) {
-      ok = cudaMemcpyAsync(out_order, s.d_order,
-                           sizeof(int) * static_cast<size_t>(num_candidates),
-                           cudaMemcpyDeviceToHost, st) == cudaSuccess;
-      if (ok && out_scores != nullptr) {
-        ok = cudaMemcpyAsync(
-                 out_scores, s.d_scores,
-                 sizeof(double) * static_cast<size_t>(num_candidates),
-                 cudaMemcpyDeviceToHost, st) == cudaSuccess;
-      }
-    }
+    // The ranking is NOT fetched here: it shares one allocation with the
+    // predictions, so FetchPredictionsSync below brings back scores, order and
+    // all four prediction arrays in a single transfer.
+    ranked = ok;
   }
 
   if (ok) {
-    ok = cudaMemcpyAsync(out_comp_time_ms, s.d_ct, out_bytes,
-                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
-         cudaMemcpyAsync(out_decomp_time_ms, s.d_dt, out_bytes,
-                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
-         cudaMemcpyAsync(out_ratio, s.d_r, out_bytes, cudaMemcpyDeviceToHost,
-                         st) == cudaSuccess &&
-         cudaMemcpyAsync(out_psnr_db, s.d_p, out_bytes, cudaMemcpyDeviceToHost,
-                         st) == cudaSuccess;
+    ok = FetchPredictionsSync(s, num_candidates, st, out_comp_time_ms,
+                              out_decomp_time_ms, out_ratio, out_psnr_db,
+                              ranked ? out_order : nullptr, out_scores);
   }
-  // ONE stream-scoped wait for the whole phase, matching
-  // runNNFusedInferenceCtx's single cudaStreamSynchronize(stream)
-  // (nn_gpu.cu:2236). The old path called cudaDeviceSynchronize, which stalls
-  // every other worker's compression as well as this one.
-  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
   return ok;
 }
 
@@ -1007,16 +1176,9 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
     ok = cudaGetLastError() == cudaSuccess;
   }
   if (ok) {
-    ok = cudaMemcpyAsync(out_comp_time_ms, s.d_ct, out_bytes,
-                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
-         cudaMemcpyAsync(out_decomp_time_ms, s.d_dt, out_bytes,
-                         cudaMemcpyDeviceToHost, st) == cudaSuccess &&
-         cudaMemcpyAsync(out_ratio, s.d_r, out_bytes, cudaMemcpyDeviceToHost,
-                         st) == cudaSuccess &&
-         cudaMemcpyAsync(out_psnr_db, s.d_p, out_bytes, cudaMemcpyDeviceToHost,
-                         st) == cudaSuccess;
+    ok = FetchPredictionsSync(s, num_candidates, st, out_comp_time_ms,
+                              out_decomp_time_ms, out_ratio, out_psnr_db);
   }
-  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
   return ok;
 }
 
