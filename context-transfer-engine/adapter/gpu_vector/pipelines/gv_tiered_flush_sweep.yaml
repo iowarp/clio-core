@@ -1,0 +1,128 @@
+# GPU vector tiered flush study: data far outside device memory.
+#
+# A 4 GiB working set (64 blocks x 64MB) is driven through a three-tier CTE
+# ladder -- 1 GiB VRAM, 256 MB host DRAM, 16 GiB NVMe -- so the great majority
+# of it can only live on disk.  The sweep varies the ONE thing that decides how
+# much of the ladder gets used: the per-block page cache.
+#
+#   64 blocks x 1 page  =   64 MB device cache  -> every page turns over
+#   64 blocks x 32 pages = 2048 MB device cache -> half the working set resident
+#
+# The question this answers is how LOW the cache can go before overall
+# performance suffers. The cache is device memory, and device memory is the
+# scarce resource -- every page/block costs 64 MB of VRAM here that the kHBM
+# tier could otherwise hold. A flat curve means the page cache can be given
+# up almost entirely and the tier keeps the data instead.
+#
+# Everything else is pinned so the cache size is the only moving part:
+#   spin wait            100 us per iteration
+#   blocks               64
+#   iterations           16
+#   total I/O per block  64 MB  (=> 4 MB flushed per iteration)
+#   page size            1 MB   (=> 4 pages per flush region)
+#
+# The benchmark is self-contained -- it writes its own CLIO_SERVER_CONF and
+# starts the runtime itself -- so this pipeline deliberately has NO
+# clio_runtime or clio_cte package.  Adding one would start a second runtime
+# that the binary never connects to.
+#
+# What to read in the output:
+#   "TIER SPLIT"   which tier actually holds the bytes.  A declared VRAM tier
+#                  receiving 0MB is a misconfiguration, not a result: the DPE
+#                  ranks by a predicted bandwidth model and has been measured
+#                  leaving a correctly sized HBM tier empty.
+#   "flush hidden" how much of the flush the async path overlapped with compute.
+#   "data=OK"      timings are void without it.
+#
+# Requires: clio_gpu_vector_flush_bench in PATH, a CUDA device, and ~16 GB free
+#           under nvme_path.
+#
+# Usage (from the repo root, with clio_gpu_vector_flush_bench on PATH):
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_tiered_flush_sweep.yaml
+#
+# `ppl run yaml <file>` is the whole invocation -- `ppl load` followed by a
+# bare `ppl run` does NOT work: load registers the test but leaves the current
+# pipeline unchanged, so `ppl run` silently runs whatever pipeline was current
+# before (observed running an unrelated redis sweep instead of this file).
+
+config:
+  name: gv_tiered_flush_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_flush
+      pkg_name: gv_flush
+
+      # --- fixed by the study design ---
+      # page_kb 1024 and total_io_per_block_mb 64 mean each block walks
+      # 64 pages of 1 MB. pages_per_block below is how many of those 64 the
+      # block can hold at once.
+      blocks: 64
+      threads: 256
+      iters: 16
+      page_kb: 1024
+      total_io_per_block_mb: 64
+
+      # Both of these are overwritten by the sweep. The defaults matter only
+      # if someone runs the package standalone; pages_per_block: 0 would size
+      # the cache to the whole working set and evict nothing.
+      spin_us: 100
+      pages_per_block: 1
+
+      # --- the ladder: VRAM -> DRAM -> NVMe ---
+      # 4096 MB of data against 1024 MB of VRAM and 256 MB of DRAM means at
+      # least 2816 MB has nowhere to go but the NVMe tier.
+      vram_mb: 1024
+      dram_mb: 256
+      nvme_mb: 16384
+      nvme_path: "/tmp/gv_flush_nvme.dat"
+      # Pinned host memory is the honest host tier: pageable ("ram") makes
+      # every device transfer stage through an internal driver buffer, which
+      # penalises the DRAM tier for its allocation type rather than its speed.
+      tier_type: "pinned"
+
+      repeat: 3
+      read_mode: false
+      output_dir: "/tmp/clio_gpu_vector_flush"
+
+vars:
+  # --- cache size (1 MB pages, so N pages/block = N MB per block) ---
+  # Each block walks 64 pages, so a 1-page cache faults 64 times per block
+  # (4096 total over 64 blocks) and a 64-page cache faults 0 times.
+  #
+  # The sweep stops at 32. Full residency (64) needs 64 blocks x 64 pages x
+  # 1 MB = 4096 MB of cache and WEDGES: the kernel allocates, then sits at 0%
+  # GPU forever. The ceiling is total cache bytes (2048 MB runs, 2560 MB does
+  # not -- 2048 MiB is exactly 2^31), not slots per block, so 64 pages/block
+  # is reachable at 16 blocks but not at 64. That is a bug to fix, not a
+  # property to sweep around: full residency is the OPTIMUM (measured 186 ms
+  # vs 260-314 for every partial cache at 16 blocks), so the most interesting
+  # point on this axis is currently unreachable at this block count.
+  gv_flush.pages_per_block: [1, 2, 4, 8, 16, 32]
+
+  # --- compute per iteration ---
+  # Spans four orders of magnitude, from far below the flush to far above it.
+  # At 64 blocks the flush costs ~42 ms/iter, so 1-200 us is compute-trivial
+  # (nothing to hide behind -- this is why the original 100 us run showed
+  # 0.97-1.01x for async) and 10 ms is the first point where compute is a
+  # comparable fraction. "flush hidden" only becomes a meaningful number in
+  # the upper half of this range.
+  gv_flush.spin_us: [1, 20, 50, 200, 1000, 10000]
+
+# Separate groups => CROSS PRODUCT: 6 cache sizes x 6 compute levels = 36
+# combinations. (Vars listed inside ONE group are zipped instead.)
+loop:
+  - [gv_flush.pages_per_block]
+  - [gv_flush.spin_us]
+
+# 36 combinations x 1 = 36 runs, roughly 75 minutes.
+#
+# ONE round, so every number here is a single sample. Run-to-run spread on
+# this workload was measured at ~1.8% (sd 13 ms on 750 ms), which is the same
+# size as the gaps between neighbouring cache sizes -- a single round already
+# ranked ppb=1 ahead of ppb=4, 6 and 12, an ordering that three rounds showed
+# was noise. Read the compute axis (which spans 4 orders of magnitude) as
+# real; treat small differences ALONG the cache axis as unresolved and raise
+# this to 3 before drawing a conclusion from them.
+repeat: 1
+output: "${HOME}/gv_tiered_flush_results"
