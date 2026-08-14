@@ -27,7 +27,6 @@
 #include <math_constants.h>
 #include <cmath>
 #include <algorithm>
-#include <cassert>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
@@ -77,7 +76,7 @@ struct NeuroPressGpuWeights {
   float log_var[kOutputDim];
   // NOTE: the EMA gradient does NOT live here. Upstream keeps it per
   // CompContext (ctx->d_sgd_grad_buffer's EMA_REGION) while the weights and
-  // sgd_call_count are global (nn_gpu.cu:64, :1413) -- so concurrent flows
+  // sgd_call_count are global (nn_gpu.cu, :1413) -- so concurrent flows
   // smooth their gradients independently but share the model. See EmaBuffer().
   int sgd_call_count;
 
@@ -100,51 +99,30 @@ namespace {
 /**
  * Per-flow EMA gradient buffer.
  *
- * Upstream splits its online-learning state: the weights and sgd_call_count
- * are global (nn_gpu.cu:64, :1413), but the EMA gradient lives in its own
- * buffer (gpucompress_pool.cpp:121-123, zeroed at creation). That buffer is
- * not an optimization detail -- the weight step is `w -= step * EMA[...]`
- * (nn_gpu.cu:1523-1528), not the raw gradient -- so whatever it is scoped to
- * is what learning is smoothed over. Clio reproduces the split exactly:
- * shared weights and call count, separate EMA.
+ * Upstream splits its online-learning state: weights and sgd_call_count are
+ * global, but the EMA gradient lives in a per-CompContext buffer. That split is
+ * load-bearing -- the weight step is `w -= step * EMA[...]`, not the raw
+ * gradient -- so whatever the buffer is scoped to is what learning is smoothed
+ * over. Clio reproduces the split: shared weights and call count, separate EMA.
  *
- * The SCOPE is an approximation, not a match, and the difference is worth
- * being explicit about:
+ * The SCOPE is an approximation. Upstream's buffer belongs to a pool slot taken
+ * per compression call, so gradient history follows the slot and one slot mixes
+ * unrelated flows; here it belongs to the thread for its lifetime, so history
+ * is continuous per worker. The two agree on the math and the split but bucket
+ * samples differently, and can reach different weights on the same concurrent
+ * workload. Neither is more correct -- upstream's bucketing depends on which
+ * slot happens to be free, so it does not define a deterministic per-flow EMA
+ * either. Thread scope is the closest stable analogue at this layer, where
+ * there is no CompContext to attach to.
  *
- *   upstream  the buffer belongs to a CompContext, taken as the first free
- *             slot of a fixed pool (acquireCompContext, gpucompress_pool.cpp:
- *             184; N_COMP_CTX = 9, capped by GPUCOMPRESS_POOL_SLOTS) and
- *             released at the end of ONE compression call. Gradient history
- *             therefore follows the slot: a thread's successive operations
- *             may land on different slots, and one slot accumulates history
- *             from unrelated flows.
- *   here      the buffer belongs to the thread, for the thread's lifetime.
- *             History is continuous per worker and never mixes across them.
- *
- * So the two agree on the math and on the split, but bucket samples into
- * buffers differently, and on the same concurrent workload can reach
- * different weights. Neither is more correct: upstream's own bucketing
- * depends on which slot happens to be free, so it does not define a
- * deterministic per-flow EMA either -- the online learning is stochastic by
- * construction on both sides. Thread scope is the closest stable analogue
- * available at this layer, where there is no CompContext to attach to.
- *
- * Two consequences of the wider scope, neither load-bearing today:
- *   - the buffer count is unbounded (one per training thread) where
- *     upstream's is capped at 9;
- *   - each is cudaMalloc'd on first use and never freed, not on thread exit
- *     and not at shutdown, so thread churn would leak 54 KB a time. Train()
- *     is reached only from the runtime's fixed worker pool
- *     (compressor_runtime.cc:1208, :1685), which bounds this in practice.
- *
- * neuropress_flow_parity.cu measures the split against upstream's own
- * runNNSGDCtx, but it pins flow i to context i and thread i for the whole
- * run -- it validates this mechanism under a fixed mapping and cannot see a
- * bucketing-policy difference.
+ * Two consequences of the wider scope, neither load-bearing today: the buffer
+ * count is unbounded where upstream's is capped at 9, and each is cudaMalloc'd
+ * on first use and never freed, so thread churn would leak 54 KB a time.
+ * Train() is reached only from the runtime's fixed worker pool.
  *
  * Registered globally so a model reload can zero every live buffer, matching
- * upstream's resetAllSGDEMABuffers() on reload. See Registry() for why that
- * registry is never torn down.
+ * upstream's resetAllSGDEMABuffers(). See Registry() for why it is never torn
+ * down.
  */
 struct EmaRegistry {
   std::mutex mutex;
@@ -154,24 +132,17 @@ struct EmaRegistry {
 /**
  * The registry is allocated on first use and DELIBERATELY NEVER DESTROYED.
  *
- * It used to be a pair of namespace-scope globals, which aborted the process
- * at exit with "double free or corruption (fasttop)" whenever online
- * learning had run (so the registry was non-empty; an inference-only run has
- * nothing registered and shut down cleanly, which is what localized it).
+ * The mutex serializes push_back against ResetAllEmaBuffers, but a destructor
+ * takes no lock: at static-destruction time ~vector() would free the element
+ * storage while a runtime worker can still be inside EmaBuffer()'s push_back --
+ * and a growing push_back frees the old block itself, so both free the same
+ * pointer. Leaking removes the destructor entirely, which is the only way to be
+ * sure; there is no point in teardown at which this is safe to destroy while
+ * any thread might still reach it.
  *
- * The mutex here serializes push_back against ResetAllEmaBuffers, but a
- * DESTRUCTOR takes no lock. At static-destruction time ~vector() frees the
- * element storage while a runtime worker thread can still be inside
- * EmaBuffer()'s push_back -- and a push_back that grows frees the old block
- * itself, so the two free the same pointer. Leaking the registry removes the
- * destructor entirely, which is the only way to be sure: there is no point
- * during teardown at which this can be safely torn down while any thread
- * might still reach it.
- *
- * Leaking costs nothing beyond what is already leaked on purpose -- the EMA
- * buffers it tracks are themselves never freed (see above) -- and the
- * function-local static gives thread-safe initialization without adding an
- * ordering dependency on any other global.
+ * Costs nothing beyond what is already leaked on purpose -- the EMA buffers it
+ * tracks are themselves never freed -- and the function-local static gives
+ * thread-safe initialization with no ordering dependency on another global.
  */
 EmaRegistry &Registry() {
   static EmaRegistry *r = new EmaRegistry();
@@ -231,7 +202,7 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   // Staging for a SINGLE upload. params, x_means, x_stds, y_means and y_stds
   // are contiguous at the front of NeuroPressGpuWeights, so the whole prefix
   // ships in one cudaMemcpy instead of five -- which is what upstream does
-  // (nn_gpu.cu:1774 copies the entire NNWeightsGPU in one call).
+  // (nn_gpu.cu copies the entire NNWeightsGPU in one call).
   //
   // Clio cannot copy the WHOLE struct the way upstream does: ours also carries
   // the persistent Train() scratch (act_x, act_z1..., d5_clamped), which is
@@ -358,10 +329,10 @@ constexpr int kPredOutputs = 4;
 /**
  * decodeAction, in the kernel.
  *
- * `action = algo + 8*quant + 16*shuffle` (internal.hpp:167-172). Upstream's
+ * `action = algo + 8*quant + 16*shuffle` (internal.hpp). Upstream's
  * inference kernel inverts it straight off the thread index
  * (`algo_idx = tid % 8; quant = (tid/8) % 2; shuffle = (tid/16) % 2`,
- * nn_gpu.cu:133-135) and builds each config's inputs from that -- no host
+ * nn_gpu.cu) and builds each config's inputs from that -- no host
  * array of per-candidate settings exists there at all. Clio passes the action
  * ids because its candidate set can be a subset (an algorithm this build
  * cannot construct is never enumerated), but the DECODE now happens here,
@@ -369,7 +340,7 @@ constexpr int kPredOutputs = 4;
  *
  * shuffle is fed to the network as 0/1, not as the 4-byte element size:
  * `input_raw[2] = static_cast<float>(shuffle)` with shuffle = (tid/16)%2
- * (nn_gpu.cu:135, :142).
+ * (nn_gpu.cu, :142).
  */
 __device__ __forceinline__ void DecodeAction(int action, int *algo, int *quant,
                                              int *shuffle) {
@@ -428,7 +399,7 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     float decomp_time = expm1f(s_y[1] * w->y_stds[1] + w->y_means[1]);
     float ratio = expm1f(s_y[2] * w->y_stds[2] + w->y_means[2]);
     float psnr = s_y[3] * w->y_stds[3] + w->y_means[3];
-    // Sanity clamps BEFORE the policy clamps, exactly as nn_gpu.cu:217-231
+    // Sanity clamps BEFORE the policy clamps, exactly as nn_gpu.cu
     // orders them. The 1e6 ceiling is what makes a non-finite prediction
     // safe: fminf(NaN, 1e6) returns 1e6, so a head that SGD has drifted
     // into NaN ranks WORST. Without it, fmaxf(1.0f, NaN) yields 1.0 and the
@@ -478,7 +449,7 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
  *
  * This is the shape of upstream's nnFusedInferenceKernel, which takes an
  * `AutoStatsGPU*` and constructs each config's input vector in-kernel
- * (nn_gpu.cu:138-160) -- nothing about the chunk's statistics ever reaches
+ * (nn_gpu.cu) -- nothing about the chunk's statistics ever reaches
  * the host to get there. The five inputs that ARE host knowledge stay host
  * knowledge: four per-candidate values arrive in `cand_desc`
  * (algo_id, quant, shuffle, error-bound encoding, matching
@@ -502,7 +473,7 @@ __global__ void InferKernelDeviceStats(
 
   if (t < kInputDim) {
     // The same eight inputs, in the same order, built the same way upstream
-    // builds them (nn_gpu.cu:137-148): the first three come from decoding the
+    // builds them (nn_gpu.cu): the first three come from decoding the
     // action, not from anything the host assembled.
     int algo, quant, shuffle;
     DecodeAction(action_ids[cand], &algo, &quant, &shuffle);
@@ -521,7 +492,7 @@ __global__ void InferKernelDeviceStats(
         // upstream re-applies it here rather than upstream of here:
         // `input_raw[3] = (quant == 0) ? 1e-7f : eb_enc` with the comment
         // "Inference must match -- do not pass raw 0.0 for lossless configs"
-        // (nn_gpu.cu:144). Slot 1 is the quantize bit, so the kernel decides
+        // (nn_gpu.cu). Slot 1 is the quantize bit, so the kernel decides
         // this from the same descriptor the rest of the vector comes from.
         //
         // Applies to INFERENCE only. Both SGD paths feed the raw bound
@@ -558,28 +529,23 @@ __global__ void InferKernelDeviceStats(
 /**
  * Cost model + ranking, on the GPU.
  *
- * Upstream never ranks on the host: nnFusedInferenceKernel computes the cost
- * (nn_gpu.cu:232-237), applies its masks (:238-239) and runs a 32-lane bitonic
- * sort (:499-518) all inside the same kernel, with thread 0 writing the winner
- * (:521-532). Clio computed the four metrics on the GPU and then did the cost,
- * the argmax and the sort in ScoreAndSort on the host.
+ * Upstream never ranks on the host: its fused inference kernel computes the
+ * cost, applies its masks and runs a 32-lane bitonic sort in the same kernel,
+ * with thread 0 writing the winner.
  *
- * One warp, lane == candidate slot, which is why kMaxCandidates is 32: that is
- * both upstream's NN_NUM_CONFIGS and the widest set the bridge can enumerate.
- * Lanes past `n` take -infinity and sort to the end.
+ * One warp, lane == candidate slot, which is why kMaxCandidates is 32: both
+ * upstream's NN_NUM_CONFIGS and the widest set the bridge can enumerate. Lanes
+ * past `n` take -infinity and sort to the end.
  *
- * The arithmetic is RankingWeights::Score (predictor.h:209-232) transcribed,
- * in double, deliberately: this changes WHERE the ranking happens, not what it
- * decides, so it has to reproduce the host result exactly rather than merely
- * closely. Upstream computes the same cost in float; matching Clio's host path
- * bit-for-bit is what makes the move safe to land, and the float/double
- * difference against upstream is unchanged from before.
+ * The arithmetic is RankingWeights::Score transcribed, in double, deliberately:
+ * this changes WHERE the ranking happens, not what it decides, so it must
+ * reproduce the host result exactly rather than closely. Upstream computes the
+ * same cost in float; that difference is unchanged from before.
  *
- * The two -INFINITY masks are applied here, where upstream applies them
- * (nn_gpu.cu:238-239), rather than by eliding candidates before ranking and
- * filtering them after. The difference is not only cosmetic: a masked action
- * still PARTICIPATES, so when every action is masked upstream still returns
- * one -- the lowest-indexed -- instead of returning nothing.
+ * The two -INFINITY masks are applied here, where upstream applies them, rather
+ * than by eliding candidates before ranking and filtering after. A masked
+ * action still PARTICIPATES, so when every action is masked upstream still
+ * returns one -- the lowest-indexed -- instead of returning nothing.
  */
 __global__ void RankKernel(const float *__restrict__ ct_in,
                            const float *__restrict__ dt_in,
@@ -619,7 +585,7 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
     const double io = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
     score = -(w_ct * ct + w_dt * dt + w_io * io);
 
-    // nn_gpu.cu:238-239, in that order. cand_desc slot 1 is the quantize bit
+    // nn_gpu.cu, in that order. cand_desc slot 1 is the quantize bit
     // (FeaturesTo8Input's input 1), so the kernel reads the same flag the
     // network was fed rather than being told separately.
     int algo, quant, shuffle;
@@ -641,7 +607,7 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
     return (a_s > b_s) || (a_s == b_s && a_key < b_key);
   };
 
-  // Same bitonic network as nn_gpu.cu:499-518.
+  // Same bitonic network as nn_gpu.cu.
   for (int k = 2; k <= kMaxCandidates; k <<= 1) {
     for (int j = k >> 1; j >= 1; j >>= 1) {
       const double other_score = __shfl_xor_sync(0xFFFFFFFFu, score, j);
@@ -676,20 +642,12 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
 /**
  * Deferred, head-only SGD for the DEcOMPRESSION-time output, on the GPU.
  *
- * Port of nnBatchedDecompSGDKernel (nn_gpu.cu:2382-2560), launched the way
- * upstream launches it: ONE block of NN_HIDDEN_DIM threads (:2591), lane t
- * owning w5 row 1's column t.
+ * Port of nnBatchedDecompSGDKernel, launched the way upstream launches it: ONE
+ * block of NN_HIDDEN_DIM threads, lane t owning w5 row 1's column t.
  *
- * Clio did this arithmetic on the host -- download every parameter, edit two,
- * upload everything back. That was a deliberate choice (one implementation of
- * the ported math to audit) but it put a device kernel's work on the CPU, and
- * it is why TrainDecompHead needed the model mutex: a Train() landing inside
- * the download/upload window was silently reverted.
- *
- * Inputs 0-2 are rebuilt from the action here, exactly as upstream rebuilds
- * them (:2409-2412), and input 3 is the RAW bound -- the 1e-7 lossless
- * sentinel is an INFERENCE-only substitution and both SGD paths upstream feed
- * the raw value (:2416, "raw error_bound").
+ * Inputs 0-2 are rebuilt from the action here, as upstream rebuilds them, and
+ * input 3 is the RAW bound -- the 1e-7 lossless sentinel is an inference-only
+ * substitution and both SGD paths feed the raw value.
  *
  * The trunk W1-W4 is read-only: a decompression-time miss must not perturb the
  * representation the other three heads share.
@@ -849,28 +807,23 @@ struct InferScratch {
   // so its candidate set can never exceed NN_NUM_CONFIGS.
   int *d_actions = nullptr;  // [kMaxCandidates] upstream action indices
 
-  // The candidate action list is uploaded ONCE per thread, not per chunk.
+  // The candidate action list is uploaded only when it CHANGES, not per chunk.
   //
-  // It is a pure function of which algorithms this build can construct:
-  // neuropress_bridge.cc resolves availability into a function-local
-  // `static const std::set` precisely because GetPreset() builds a real
-  // compressor and is far too costly to repeat per write. The eight trained
-  // base_ids are a static set, and the quantize/shuffle expansion is fixed
-  // order. Nothing about a chunk can change it -- not even the error bound,
-  // which varies per write but only sets each candidate's `error_bound`
-  // FIELD; the action index itself is algo + 8*quantize + 16*shuffle and
-  // carries no bound.
+  // For the production caller it changes once: neuropress_bridge.cc resolves
+  // algorithm availability into a function-local `static const std::set`, the
+  // eight trained base_ids are a static set, and the quantize/shuffle expansion
+  // is fixed order. Not even the error bound moves it -- that sets each
+  // candidate's `error_bound` field, while the action index is
+  // algo + 8*quantize + 16*shuffle and carries no bound. So the steady state is
+  // zero host-to-device transfers on the decision path.
   //
-  // So re-sending 128 identical bytes on every write was pure overhead.
+  // Other callers may legitimately vary the list (the parity harnesses do), so
+  // the installed copy is compared rather than assumed. At 32 ints the compare
+  // is far cheaper than the ~2.8 us latency-bound copy it avoids, and a stale
+  // upload would silently score the WRONG configurations while still returning
+  // a plausible ranking.
   bool actions_installed = false;
-  int installed_n = 0;
-#ifndef NDEBUG
-  // Debug-only witness for the invariant above. If a caller ever does vary the
-  // list, the stale upload would silently score the WRONG configurations and
-  // still return a plausible-looking ranking -- the failure mode that must not
-  // be discovered in production. Costs nothing in release.
   std::vector<int> installed_actions;
-#endif
 
   // Sized for the BATCH, grown on demand. The host-matrix entry point has no
   // warp-wide step, and Rank() calls it with whatever candidate set the caller
@@ -884,12 +837,8 @@ struct InferScratch {
   // EVERY value this path reads back lives in ONE allocation, so the whole
   // ranking result returns in ONE cudaMemcpyAsync. These copies are
   // latency-bound -- ~2.8 us apiece at 128-512 bytes -- so the COUNT is the
-  // cost and the volume is not. Six copies became one.
-  //
-  // Upstream does the same thing for the same reason: NNInferenceOutput packs
-  // the action and eight predictions into a single 36-byte struct rather than
-  // returning them separately (nn_gpu.cu:1975, "Single D->H copy ... replaces
-  // 3 separate transfers").
+  // cost, not the volume. Upstream packs its own output the same way and for
+  // the same reason.
   //
   // Layout, by BYTE offset, sized by cap:
   //     [        0, 8*cap )  scores  double[cap]   -- 8-aligned, so first
@@ -966,7 +915,7 @@ bool EnsureInferCapacity(InferScratch &s, int n) {
  * same "copy, sync, return" shape, so both use this.
  *
  * The stream wait matches runNNFusedInferenceCtx's single
- * cudaStreamSynchronize(stream) (nn_gpu.cu:2236). Calling cudaDeviceSynchronize
+ * cudaStreamSynchronize(stream) (nn_gpu.cu). Calling cudaDeviceSynchronize
  * here instead would stall every other worker's compression, not just this one.
  */
 bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
@@ -1041,7 +990,7 @@ bool NeuroPressGpuTrainDecompHead(NeuroPressGpuWeights *w,
   if (!w || !samples || num_samples <= 0) return false;
 
   // Per-thread stream and a stream-scoped wait, as everywhere else on this
-  // path. Upstream runs this on its dedicated g_sgd_stream (nn_gpu.cu:2591);
+  // path. Upstream runs this on its dedicated g_sgd_stream (nn_gpu.cu);
   // the point either way is that it is not a device-wide barrier.
   cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
 
@@ -1088,29 +1037,27 @@ bool NeuroPressGpuInferBatchDeviceStats(
   // and never waited on, this does not reintroduce a synchronization point;
   // what mattered was never the byte count but that the old path had to STOP
   // and wait twice.
-  // Install-once: see InferScratch::actions_installed. After the first write on
-  // this thread there is no host-to-device transfer left on the decision path
-  // at all.
+  // Upload only when the list actually differs from what is on the device --
+  // see InferScratch::actions_installed. For the production caller that is once
+  // per thread, leaving no host-to-device transfer on the decision path.
   bool ok = true;
-  if (!s.actions_installed || s.installed_n != num_candidates) {
+  const bool actions_match =
+      s.actions_installed &&
+      s.installed_actions.size() == static_cast<size_t>(num_candidates) &&
+      std::equal(s.installed_actions.begin(), s.installed_actions.end(),
+                 action_ids);
+  if (!actions_match) {
     ok = cudaMemcpyAsync(s.d_actions, action_ids, act_bytes,
                          cudaMemcpyHostToDevice, st) == cudaSuccess;
     if (ok) {
       s.actions_installed = true;
-      s.installed_n = num_candidates;
-#ifndef NDEBUG
       s.installed_actions.assign(action_ids, action_ids + num_candidates);
-#endif
+    } else {
+      // Leave no half-installed state: the device buffer is now indeterminate.
+      s.actions_installed = false;
+      s.installed_actions.clear();
     }
   }
-#ifndef NDEBUG
-  else {
-    assert(std::equal(action_ids, action_ids + num_candidates,
-                      s.installed_actions.begin()) &&
-           "candidate action list changed between chunks; the install-once "
-           "upload in InferScratch is no longer valid");
-  }
-#endif
   bool ranked = false;
   if (ok) {
     InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
@@ -1120,7 +1067,7 @@ bool NeuroPressGpuInferBatchDeviceStats(
     ok = cudaGetLastError() == cudaSuccess;
   }
   // Cost model and ordering, still on the device and still on this stream --
-  // upstream does both inside its inference kernel (nn_gpu.cu:232-237,
+  // upstream does both inside its inference kernel (nn_gpu.cu,
   // :499-532), so leaving them to the host was the last place the decision
   // came back across. One warp is enough: the candidate set can never exceed
   // NN_NUM_CONFIGS.
@@ -1525,7 +1472,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   bool warmed_up = (w->sgd_call_count > 3);
   if (warmed_up) {
     // TRUNK ONLY (params before the W5 block). NeuroPress accumulates this
-    // dot over DW1..DB4 and stops -- nn_gpu.cu:1380-1402 has no DW5/DB5
+    // dot over DW1..DB4 and stops -- nn_gpu.cu has no DW5/DB5
     // term, and the omission is deliberate: the trust-region norm 60 lines
     // earlier (:1319-1326) explicitly DOES include both. Including them
     // biases the dot positive, because the W5 gradient (error * h4, with h4
