@@ -90,15 +90,13 @@ vars:
   # Each block walks 64 pages, so a 1-page cache faults 64 times per block
   # (4096 total over 64 blocks) and a 64-page cache faults 0 times.
   #
-  # The sweep stops at 32. Full residency (64) needs 64 blocks x 64 pages x
-  # 1 MB = 4096 MB of cache and WEDGES: the kernel allocates, then sits at 0%
-  # GPU forever. The ceiling is total cache bytes (2048 MB runs, 2560 MB does
-  # not -- 2048 MiB is exactly 2^31), not slots per block, so 64 pages/block
-  # is reachable at 16 blocks but not at 64. That is a bug to fix, not a
-  # property to sweep around: full residency is the OPTIMUM (measured 186 ms
-  # vs 260-314 for every partial cache at 16 blocks), so the most interesting
-  # point on this axis is currently unreachable at this block count.
-  gv_flush.pages_per_block: [1, 2, 4, 8, 16, 32]
+  # 64 = FULL RESIDENCY, and it is included deliberately: it measured fastest
+  # by a wide margin (186 ms vs 260-314 ms for every partial cache at 16
+  # blocks, faults=0). It used to wedge the runtime 100% of the time, which
+  # looked like a hard "cache > 2 GiB" ceiling; that was the GPU stream-pool
+  # inversion deadlock, now fixed, and ppb=40/48/64 all pass. There is no
+  # cache-size ceiling to sweep around.
+  gv_flush.pages_per_block: [1, 2, 4, 8, 16, 32, 64]
 
   # --- compute per iteration ---
   # Spans four orders of magnitude, from far below the flush to far above it.
@@ -109,13 +107,13 @@ vars:
   # the upper half of this range.
   gv_flush.spin_us: [1, 20, 50, 200, 1000, 10000]
 
-# Separate groups => CROSS PRODUCT: 6 cache sizes x 6 compute levels = 36
+# Separate groups => CROSS PRODUCT: 7 cache sizes x 6 compute levels = 42
 # combinations. (Vars listed inside ONE group are zipped instead.)
 loop:
   - [gv_flush.pages_per_block]
   - [gv_flush.spin_us]
 
-# 36 combinations x 1 = 36 runs, roughly 75 minutes.
+# 42 combinations x 1 = 42 runs, roughly 90 minutes.
 #
 # ONE round, so every number here is a single sample. Run-to-run spread on
 # this workload was measured at ~1.8% (sd 13 ms on 750 ms), which is the same
