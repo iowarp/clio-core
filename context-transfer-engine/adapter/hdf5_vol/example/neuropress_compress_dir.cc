@@ -46,6 +46,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/compressor/compressor_client.h>
+#include <clio_ctp/compress/compress_factory.h>  // CompressionFactory
 
 #include <sys/stat.h>
 

@@ -66,11 +66,18 @@
 #include "util/type_switch.h"
 
 // Compression utilities (guarded by CTP_ENABLE_COMPRESS)
+//
+// compress_factory.h is deliberately NOT here. It includes every enabled
+// codec's own header, and the GPU ones pull in third-party headers that declare
+// unqualified names at global scope -- cuSZ's `typedef uint8_t byte_t` being the
+// one that bites. Re-exporting it from this umbrella put those names in every
+// translation unit that touches the runtime, since clio_runtime/types.h
+// includes this file. Include "clio_ctp/compress/compress_factory.h" directly
+// where the factory is actually used.
 #include "compress/blosc.h"
 #include "compress/brotli.h"
 #include "compress/bzip2.h"
 #include "compress/compress.h"
-#include "compress/compress_factory.h"
 #include "compress/lz4.h"
 #include "compress/lzma.h"
 #include "compress/lzo.h"
