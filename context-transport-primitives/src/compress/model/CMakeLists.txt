@@ -49,9 +49,26 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
+    # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
+    # here, instead of once per consumer.
+    #
+    # ctp::compress INTERFACE-links this static library, and clio_ctp_cuda
+    # (shared) links it too -- so its device code ends up inside that .so AND on
+    # the link line of every executable that uses ctp::compress. With separable
+    # compilation and no resolve step, each of those executables device-links
+    # the same objects again and emits its own __cudaRegisterLinkedBinary for
+    # them. The fatbin then gets registered twice at static-init: once by the
+    # .so's __sti____cudaRegisterAll, once by the executable's own
+    # cmake_device_link. The second registration writes through a stale
+    # descriptor and corrupts unrelated .bss -- observed as Catch2's
+    # `alreadyInstantiated` flag coming up 127 instead of 0, which made
+    # test_distribution_classifier / test_linreg_table_predictor /
+    # test_compression_benchmark abort at startup with "Only one instance of
+    # Catch::Session can ever be used" before running a single assertion.
     set_target_properties(clio_ctp_compress_model PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_RUNTIME_LIBRARY Static
     )
     # Plain CUDA runtime only -- NOT ctp::cuda_cxx/clio_ctp_cuda, which
