@@ -1765,9 +1765,14 @@ class IpcManager {
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
 
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+#if CTP_IS_HOST && (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL)
   // What AllocateAndRegisterGpuBackend actually handed out, so FreeGpuBackend
   // can release it.
+  //
+  // Guarded on CTP_IS_HOST as well as the backend switch, matching every other
+  // GPU member and method in this class: std::unordered_map and std::mutex are
+  // host-only types, and nvcc's device pass must not see them (same reason
+  // client_conn_cache_ below is host-gated).
   //
   // This cannot live in gpu::IpcManager::ClientBackend, which is the obvious
   // place for it: that map is only populated on the RUNTIME side. A client
@@ -1793,6 +1798,25 @@ class IpcManager {
   };
   std::unordered_map<u64, OwnedGpuBackend> owned_gpu_backends_;
   std::mutex owned_gpu_backends_mutex_;
+#elif CTP_IS_HOST
+  /** Layout placeholders — same rule as gpu_ipc_placeholder_ below, and the
+   *  same reason. These members sit BEFORE hostfile_map_, so omitting them in
+   *  a non-GPU translation unit shifts every member after this point. Test
+   *  binaries link clio_run_cxx (built with CTP_ENABLE_CUDA=1) without
+   *  defining it themselves, so the two HOST views of IpcManager must agree.
+   *
+   *  Host-only, like the real members above: the device pass gets neither
+   *  branch, so no host-only type reaches nvcc. Host/device layout already
+   *  differs for client_conn_cache_ and is not required to match; host/host
+   *  layout is, and that is what this branch preserves.
+   *
+   *  Both stand-ins are size- and alignment-exact by construction rather than
+   *  by hand-counted bytes: libstdc++'s unordered_map layout does not depend
+   *  on its mapped_type, and the mutex is the same type. OwnedGpuBackend
+   *  itself cannot be declared here because gpu::IpcManager::MemKind lives in
+   *  gpu_ipc_manager.h, whose include is guarded the same way. */
+  std::unordered_map<u64, void *> owned_gpu_backends_placeholder_;
+  std::mutex owned_gpu_backends_mutex_placeholder_;
 #endif
 
   // Pending response archives (client-side, keyed by net_key)
