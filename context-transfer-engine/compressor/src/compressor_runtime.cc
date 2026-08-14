@@ -1190,6 +1190,100 @@ bool SelectionLogEnabled() {
   return on;
 }
 
+/**
+ * Per-candidate record of an exploration sweep.
+ *
+ * The selection log above records ONE row per chunk: the configuration the
+ * model chose. That is the right shape for auditing selection, and the wrong
+ * shape for auditing exploration -- a sweep measures up to 31 alternatives per
+ * chunk and the interesting question is what the other 30 actually cost, which
+ * the selection log cannot express because by the time it is written the sweep
+ * has not run.
+ *
+ * Enabled by CLIO_NEUROPRESS_EXPLORE_LOG (a path). Off otherwise, and the
+ * measurement is not taken at all -- the sweep already runs only when the
+ * error gate trips, and this must not add work to a path that does.
+ */
+struct ExploreLog {
+  std::mutex mutex;
+  std::FILE *fp = nullptr;
+  long seq = 0;
+};
+
+bool ExploreLogEnabled() {
+  static const bool on = [] {
+    const char *p = std::getenv("CLIO_NEUROPRESS_EXPLORE_LOG");
+    return p && *p;
+  }();
+  return on;
+}
+
+/** Leaked on purpose, same reason as SelectionLogInstance below. */
+ExploreLog *ExploreLogInstance() {
+  static ExploreLog *log = [] {
+    auto *l = new ExploreLog();
+    const char *path = std::getenv("CLIO_NEUROPRESS_EXPLORE_LOG");
+    if (path && *path) {
+      l->fp = std::fopen(path, "w");
+      if (l->fp) {
+        // `rank` is the candidate's position in the model's own ranking, so a
+        // reader can tell an alternative the model rated highly from one it
+        // buried. `adopted` marks the row whose bytes actually replaced the
+        // primary's, which is at most one per chunk and may be none.
+        std::fprintf(l->fp,
+                     "seq,blob,chunk_bytes,rank,lib_name,algo_idx,preset,"
+                     "quantize,shuffle,pred_ratio,pred_ct_ms,ratio,ct_ms,"
+                     "psnr_db,cost,primary_cost,adopted\n");
+      }
+    }
+    return l;
+  }();
+  return log;
+}
+
+/**
+ * @brief One explored candidate. `primary_cost` is repeated on every row so a
+ * row is self-contained: the whole point of a sweep row is the comparison
+ * against what the model actually chose.
+ */
+void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
+                          int rank, const std::string &lib_name,
+                          uint32_t preset_id, bool quantize, uint32_t shuffle,
+                          double pred_ratio, double pred_ct_ms, double ratio,
+                          double ct_ms, double psnr_db, double cost,
+                          double primary_cost, bool adopted) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp) return;
+
+  int algo_idx = -1;
+  for (const auto &entry : ctp::compress::model::KnownCompressors()) {
+    if (lib_name == entry.name) {
+      switch (entry.base_id) {
+        case 13: algo_idx = 0; break;
+        case 14: algo_idx = 1; break;
+        case 17: algo_idx = 2; break;
+        case 16: algo_idx = 3; break;
+        case 15: algo_idx = 4; break;
+        case 18: algo_idx = 5; break;
+        case 23: algo_idx = 6; break;
+        case 24: algo_idx = 7; break;
+        default: algo_idx = -1; break;
+      }
+      break;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(log->mutex);
+  std::fprintf(log->fp,
+               "%ld,%s,%zu,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
+               "%.10g,%.10g,%.10g,%d\n",
+               log->seq++, blob_name.c_str(), chunk_size, rank,
+               lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
+               shuffle, pred_ratio, pred_ct_ms, ratio, ct_ms, psnr_db, cost,
+               primary_cost, adopted ? 1 : 0);
+  std::fflush(log->fp);
+}
+
 SelectionLog *SelectionLogInstance() {
   static SelectionLog *log = [] {
     auto *l = new SelectionLog();
@@ -1965,6 +2059,22 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           }
 #endif
 
+          // Sweep rows, held until the loop ends because `adopted` is only
+          // settled by the LAST candidate to beat the running best -- a row
+          // written the moment it was measured would claim adoption for every
+          // successive winner.
+          struct ExploreRow {
+            std::string lib;
+            uint32_t preset_id;
+            bool quant;
+            uint32_t shuffle;
+            double pred_ratio, pred_ct, ratio, ct_ms, psnr, cost;
+            int rank;
+          };
+          std::vector<ExploreRow> explore_rows;
+          int winner_row = -1;
+          int explore_rank = 0;
+
           // ---- Phase 3: score the slots in rank order (serial) ----
           for (auto& sp : slots) {
             ExploreSlot& slot_ref = *sp;
@@ -2006,6 +2116,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   alt_compressed_size + sizeof(CompressionHeader);
               if (winner_total < chunk_size) {
                 have_winner = true;
+                // The row for THIS candidate has not been pushed yet, so its
+                // index is the current size. A later winner overwrites this,
+                // which is what makes only the final one carry the flag.
+                winner_row = static_cast<int>(explore_rows.size());
                 // Pull the winner's bytes back AFTER the measurement, so the
                 // copy never lands inside the timed window.
                 winner_payload.resize(alt_compressed_size);
@@ -2028,6 +2142,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 winner_quant_params = alt_quant_params;
               }
             }
+
+            if (ExploreLogEnabled()) {
+              explore_rows.push_back(ExploreRow{
+                  alt_name, alt_preset_id, alt_applied_quant,
+                  alt_applied_shuffle, alt->compression_ratio_,
+                  alt->compress_time_ms_, alt_ratio, alt_time_ms,
+                  alt_applied_quant
+                      ? AnalyticalPsnr(alt_quant_params.data_max -
+                                           alt_quant_params.data_min,
+                                       alt_quant_params.effective_error_bound)
+                      : -1.0,
+                  alt_cost, explore_rank});
+            }
+            ++explore_rank;
 
             int alt_base_id = -1;
             for (const auto& entry :
@@ -2080,6 +2208,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                         static_cast<float>(alt_time_ms),
                                         0.0f);
             explore_costs.push_back(alt_cost);
+          }
+
+          for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
+            const ExploreRow& row = explore_rows[ri];
+            LogNeuroPressExplore(
+                task->blob_name_.str(), chunk_size, row.rank, row.lib,
+                row.preset_id, row.quant, row.shuffle, row.pred_ratio,
+                row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
+                actual_cost, static_cast<int>(ri) == winner_row);
           }
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP

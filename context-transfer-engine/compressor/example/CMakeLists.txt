@@ -41,6 +41,33 @@ if(CLIO_CORE_ENABLE_CUDA)
     LIBRARY DESTINATION lib
   )
 
+  # The K-way exploration sweep, with the lossy half of the action space
+  # enabled. Reuses neuropress_gpu_direct_kernel for its data generation and
+  # bound check rather than carrying a near-identical .cu of its own.
+  add_executable(neuropress_explore_sweep neuropress_explore_sweep.cc)
+
+  target_compile_definitions(neuropress_explore_sweep PRIVATE
+    CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+  target_link_libraries(neuropress_explore_sweep
+    neuropress_gpu_direct_kernel
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ctp::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  install(TARGETS neuropress_explore_sweep
+    RUNTIME DESTINATION bin
+  )
+
   # Cross-project callback-trace equivalence harness. Skips itself when the
   # native NeuroPress build or CUPTI is absent, since neither is a Clio build
   # dependency.
