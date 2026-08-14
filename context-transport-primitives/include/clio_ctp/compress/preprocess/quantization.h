@@ -301,11 +301,24 @@ struct DeviceQuantizeParams {
  * @param device_out  Device output, at least num_elements * 4 bytes.
  * @param out_bytes   Receives the packed output size.
  * @param out_params  Receives everything the read side needs to invert this.
+ * @param stream      cudaStream_t to launch on, as an opaque pointer, or
+ *                    nullptr for the shared per-thread stream. Supplying one
+ *                    keeps this slot's work off every other slot's stream, so
+ *                    a sweep quantizing K candidates overlaps them the way
+ *                    upstream's quantize_simple(..., s.stream) does.
+ *
+ *                    Unlike ByteShuffleDevice, this still synchronizes the
+ *                    given stream once, internally: the packed width is chosen
+ *                    from the data's min/max, so those have to reach the host
+ *                    before the quantize kernel can be launched or *out_bytes
+ *                    computed. The wait is scoped to `stream`, so it blocks
+ *                    only this candidate -- slots already launched keep
+ *                    running.
  * @return false if unsupported, if CUDA failed, or if CUDA is not compiled in.
  */
 bool QuantizeDevice(const void *device_in, size_t num_elements,
                     double error_bound, void *device_out, size_t *out_bytes,
-                    DeviceQuantizeParams *out_params);
+                    DeviceQuantizeParams *out_params, void *stream = nullptr);
 
 /**
  * @brief Inverse of QuantizeDevice(): packed integers back to float32.

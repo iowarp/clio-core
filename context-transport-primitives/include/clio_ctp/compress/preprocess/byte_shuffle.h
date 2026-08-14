@@ -228,9 +228,21 @@ inline std::vector<uint8_t> ByteUnshuffleVector(const uint8_t* input,
  * @param device_out Device buffer to write (at least num_bytes, no overlap).
  * @param num_bytes  Total bytes.
  * @param elem_size  Bytes per element (2, 4 or 8).
+ * @param stream     cudaStream_t to launch on, as an opaque pointer, or
+ *                   nullptr for the shared per-thread stream.
+ *
+ * When a stream is supplied the launch is ASYNCHRONOUS -- the caller is
+ * responsible for ordering, which it gets for free by issuing the work that
+ * consumes the output on the same stream. That is how upstream shuffles an
+ * explored slot: byte_shuffle_simple(..., s.stream) followed immediately by
+ * the codec launch on s.stream, with the only wait happening once, later,
+ * when every slot is collected (gpucompress_compress.cpp). With nullptr the
+ * call synchronizes before returning, which is what every non-sweep caller
+ * expects.
  */
 bool ByteShuffleDevice(const void *device_in, void *device_out,
-                       size_t num_bytes, size_t elem_size);
+                       size_t num_bytes, size_t elem_size,
+                       void *stream = nullptr);
 
 /** @brief Device inverse of ByteShuffleDevice(). Same contract. */
 bool ByteUnshuffleDevice(const void *device_in, void *device_out,

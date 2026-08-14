@@ -572,14 +572,20 @@ bool FinishLaunch(cudaStream_t stream) {
 }  // namespace
 
 bool ByteShuffleDevice(const void *device_in, void *device_out,
-                       size_t num_bytes, size_t elem_size) {
+                       size_t num_bytes, size_t elem_size, void *stream_in) {
   const uint8_t *in = static_cast<const uint8_t *>(device_in);
   uint8_t *out = static_cast<uint8_t *>(device_out);
   int blocks = 0, threads = 0;
   if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
-  cudaStream_t stream = static_cast<cudaStream_t>(DeviceStatsStream());
+  // A caller-supplied stream also means "do not wait": whatever consumes the
+  // shuffled bytes is queued behind this on the same stream, so the ordering
+  // is already guaranteed and a sync here would only serialize the sweep.
+  const bool caller_stream = (stream_in != nullptr);
+  cudaStream_t stream =
+      caller_stream ? static_cast<cudaStream_t>(stream_in)
+                    : static_cast<cudaStream_t>(DeviceStatsStream());
   const size_t cb = kShuffleChunkBytes;
   if (elem_size == 2) {
     ShuffleKernel<2><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
@@ -588,6 +594,7 @@ bool ByteShuffleDevice(const void *device_in, void *device_out,
   } else {
     ShuffleKernel<8><<<blocks, threads, 0, stream>>>(in, out, num_bytes, cb);
   }
+  if (caller_stream) return cudaGetLastError() == cudaSuccess;
   return FinishLaunch(stream);
 }
 
@@ -716,13 +723,15 @@ __global__ void MinMaxKernel(const float *__restrict__ in, size_t n,
  * CUB's, unlike a sum would be.
  */
 bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
-                  double *out_max) {
+                  double *out_max, cudaStream_t stream_in = nullptr) {
   // The per-thread stream, not the null stream. Upstream runs every stage of
   // a compression on its CompContext's own stream and waits only on that
   // (gpucompress_pool.cpp); the null stream plus cudaDeviceSynchronize below
   // stalled every other worker's kernels as well as this one, which on a
   // runtime with a worker pool is a throughput bug, not a style point.
-  cudaStream_t stream = static_cast<cudaStream_t>(DeviceStatsStream());
+  cudaStream_t stream = (stream_in != nullptr)
+                            ? stream_in
+                            : static_cast<cudaStream_t>(DeviceStatsStream());
   // Clear any sticky error left by an EARLIER, unrelated CUDA call --
   // cudaPointerGetAttributes on a host pointer (which IsDevicePointer does
   // routinely on this path) leaves cudaErrorInvalidValue behind, and the
@@ -762,7 +771,7 @@ bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
 
 bool QuantizeDevice(const void *device_in, size_t num_elements,
                     double error_bound, void *device_out, size_t *out_bytes,
-                    DeviceQuantizeParams *out_params) {
+                    DeviceQuantizeParams *out_params, void *stream_in) {
   if (!device_in || !device_out || !out_bytes || !out_params ||
       num_elements == 0 || error_bound <= 0.0) {
     return false;
@@ -770,10 +779,16 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   const float *in = static_cast<const float *>(device_in);
   // Same per-thread stream the rest of this path uses; upstream's
   // quantize_simple likewise takes a stream and waits only on it.
-  cudaStream_t qstream = static_cast<cudaStream_t>(DeviceStatsStream());
+  cudaStream_t qstream = (stream_in != nullptr)
+                             ? static_cast<cudaStream_t>(stream_in)
+                             : static_cast<cudaStream_t>(DeviceStatsStream());
 
   double data_min = 0.0, data_max = 0.0;
-  if (!DeviceMinMax(in, num_elements, &data_min, &data_max)) return false;
+  // On the caller's stream too, so a sweep's reductions do not all queue up
+  // behind one another on the shared per-thread stream.
+  if (!DeviceMinMax(in, num_elements, &data_min, &data_max, qstream)) {
+    return false;
+  }
   double data_range = data_max - data_min;
   // Constant data: upstream substitutes 1.0 for the degenerate range
   // (quantization_kernels.cu:408-411, "Handle constant data") and this must

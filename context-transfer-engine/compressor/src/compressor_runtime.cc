@@ -55,6 +55,9 @@
 #include "clio_runtime/work_orchestrator.h"
 #include "clio_runtime/worker.h"
 #include "clio_ctp/compress/compress_factory.h"
+// Direct, for the exploration sweep's CompressLaunch/CompressFinish. The
+// factory returns a base Compressor, which has no async path by design.
+#include "clio_ctp/compress/nvcomp.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"
 #include "clio_ctp/compress/preprocess/quantization.h"
@@ -419,6 +422,22 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
   }
 
+  // Best mode brings its own exploration settings rather than requiring the
+  // caller to assemble them, the same way gpucompress_set_best_mode() turns
+  // exploration on and pins the K override to 31 rather than leaving either
+  // to the caller. Applied once here so the per-chunk path reads plain
+  // config, and so the effective settings are what a config dump reports.
+  if (config_.neuropress_best_mode_) {
+    config_.neuropress_exploration_enabled_ = true;
+    config_.neuropress_exploration_k_ = 31;
+    HLOG(kWarning,
+         "NeuroPress best mode is ON for pool '{}': every chunk is compressed "
+         "with all {} remaining configurations and stored as the smallest "
+         "result. Selection is ratio-only and both SGD phases are off. This "
+         "is a measurement mode and is roughly 32x slower than normal.",
+         pool_name_, config_.neuropress_exploration_k_);
+  }
+
   if (!qtable_predictor_ && !linreg_predictor_ && !neuropress_predictor_) {
     HLOG(kDebug,
          "No compression predictor configured, dynamic compression prediction "
@@ -651,7 +670,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       neuropress_stats = NeuroPressCandidateStatsDevice(
           *neuropress_predictor_, chunk_size, device_stats, np_stream,
           data_type_float, context.error_bound_, context.target_psnr_,
-          &np_infer_failed);
+          &np_infer_failed, config_.neuropress_best_mode_);
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
@@ -673,7 +692,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     } else {
       neuropress_stats = NeuroPressCandidateStats(
           *neuropress_predictor_, chunk_size, entropy, mad,
-          second_derivative_mean, data_type_float, context.error_bound_);
+          second_derivative_mean, data_type_float, context.error_bound_,
+          config_.neuropress_best_mode_);
     }
     // PSNR filtering, HOST path only. The device path applies the floor inside
     // RankKernel where upstream applies it, and the two are not interchangeable:
@@ -1462,7 +1482,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         //        w2*chunk_size/(ratio*bandwidth) -- same formula and default
         // weights/bandwidth as NeuroPress's own g_rank_w0/w1/w2 (all 1.0) and
         // g_measured_bw_bytes_per_ms (5e6 = 5 GB/s).
-        constexpr double kCostW0 = 1.0, kCostW1 = 1.0, kCostW2 = 1.0;
+        // Best mode ranks on RATIO ALONE. gpucompress_set_best_mode() zeroes
+        // g_rank_w0/w1 and leaves w2 at 1.0 (gpucompress_learning.cpp), which
+        // collapses the cost to size/(ratio*bw) -- so "best" means the
+        // smallest output, not the fastest path to it. Leaving the latency
+        // weights in would make the exhaustive search report a ceiling for a
+        // different objective than the one it claims to measure.
+        const double kCostW0 = config_.neuropress_best_mode_ ? 0.0 : 1.0;
+        const double kCostW1 = config_.neuropress_best_mode_ ? 0.0 : 1.0;
+        constexpr double kCostW2 = 1.0;
         constexpr double kCostBandwidthBytesPerMs = 5e6;
         auto cost = [&](double compress_ms, double decompress_ms,
                         double ratio) -> double {
@@ -1540,8 +1568,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // decompression time ever becomes available.
           RecordDecompFeatures(task->blob_name_.str(), chunk_features);
 
+          // Withheld under best mode: that mode replaces the model's choice on
+          // every chunk, so training on the outcome would teach the network
+          // from a decision it did not make (upstream's
+          // `&& !g_best_mode.load()`, gpucompress_compress.cpp).
           if (error_pct >
-              static_cast<double>(config_.neuropress_mape_threshold_)) {
+                  static_cast<double>(config_.neuropress_mape_threshold_) &&
+              !config_.neuropress_best_mode_) {
             std::vector<ctp::compress::model::CompressionFeatures> features = {
                 chunk_features};
             std::vector<ctp::compress::model::TrainingLabels> labels = {
@@ -1568,19 +1601,45 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // result (see the adoption block after the loop). Upstream runs these
         // on parallel CUDA streams; this is sequential, and off by default.
         if (config_.neuropress_exploration_enabled_ &&
-            error_pct >
-                static_cast<double>(config_.neuropress_exploration_threshold_)) {
+            (config_.neuropress_best_mode_ ||
+             error_pct > static_cast<double>(
+                             config_.neuropress_exploration_threshold_))) {
+          // K bounds the RANKED WINDOW scanned, not the number measured, and
+          // an ineligible slot inside that window is dropped rather than
+          // replaced from further down. Both are upstream's
+          // (gpucompress_compress.cpp): it walks top_actions[1..K] and
+          // `continue`s past a slot it cannot run, so exploring K slots can
+          // yield fewer than K samples. Collecting K ELIGIBLE alternatives
+          // instead would explore configurations the model ranked below the
+          // window upstream looks at.
+          //
+          // The quantize skip is what makes that matter here. On the device
+          // path all 32 candidates reach `stats` -- RankKernel masks the
+          // quantize ones to -INFINITY on a lossless run, which sinks them to
+          // the bottom but leaves them selectable -- so without this skip a
+          // lossless run explores each masked action as its plain lossless
+          // twin, measuring all 16 real configurations TWICE and feeding the
+          // duplicates to the phase-2 SGD batch as if they were independent
+          // samples.
+          // Positions are counted rather than indexed from 1: upstream can
+          // assume top_actions[0] is the primary, but here the primary is
+          // stats.front() only on the cost-ranked path -- the legacy
+          // heuristics can pick from anywhere in the list.
           std::vector<const CompressionStats*> alternatives;
+          int examined = 0;
           for (const auto& stat : stats) {
             if (stat.compress_lib_ == best_lib &&
                 stat.compress_preset_ == best_preset) {
               continue;
             }
-            alternatives.push_back(&stat);
-            if (static_cast<int>(alternatives.size()) >=
-                config_.neuropress_exploration_k_) {
-              break;
+            if (examined >= config_.neuropress_exploration_k_) break;
+            ++examined;
+            if (UnpackQuantEnabled(
+                    static_cast<uint32_t>(stat.compress_preset_)) &&
+                !(context.error_bound_ > 0.0)) {
+              continue;
             }
+            alternatives.push_back(&stat);
           }
 
           std::vector<ctp::compress::model::CompressionFeatures>
@@ -1615,6 +1674,48 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           bool winner_quant = false;
           ctp::compress::preprocess::DeviceQuantizeParams winner_quant_params;
 
+          // Upstream launches its K alternatives on K separate CUDA streams and
+          // only then syncs and scores them ("Parallel exploration: K
+          // alternatives on K separate streams", gpucompress_compress.cpp).
+          // The same three phases are kept here, with one deliberate
+          // narrowing: only the CODEC CALL is parallel. Preparation stays on
+          // this thread because it allocates and registers GPU backends
+          // through the runtime, and scoring stays on it because the winner
+          // comparison has to be order-deterministic -- a tie decided by which
+          // worker happened to finish first would make the stored blob vary
+          // run to run.
+          struct ExploreSlot {
+            const CompressionStats* alt = nullptr;
+            std::string name;
+            uint32_t preset_id = 0;
+            uint32_t applied_shuffle = 0;
+            bool applied_quant = false;
+            ctp::compress::preprocess::DeviceQuantizeParams quant_params;
+            std::unique_ptr<ctp::Compressor> compressor;
+            // Buffers the codec call reads or writes. They are MOVED in from
+            // the prep loop's locals; moving a std::vector transfers the heap
+            // block rather than copying it, so `input`/`out_ptr` keep pointing
+            // at the right bytes without any fixup.
+            std::vector<char> device_staging, quant_staging, shuffle_staging,
+                output;
+            char* input = nullptr;
+            size_t compress_size = 0;
+            char* out_ptr = nullptr;
+            size_t capacity = 0;
+            // Filled by the launch/collect phases below.
+            bool ok = false;
+            bool launched = false;
+            size_t compressed_size = 0;
+            double time_ms = 0.0;
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+            ctp::NvComp* gpu = nullptr;   ///< non-null when the async path ran
+            ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
+#endif
+          };
+          std::vector<std::unique_ptr<ExploreSlot>> slots;
+          slots.reserve(alternatives.size());
+
+          // ---- Phase 1: prepare every slot (serial) ----
           for (const auto* alt : alternatives) {
             std::string alt_name =
                 ctp::CompressionFactory::NameForWireId(alt->compress_lib_);
@@ -1637,6 +1738,24 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             auto alt_compressor =
                 ctp::CompressionFactory::GetPreset(alt_name, alt_preset);
             if (!alt_compressor) continue;
+
+            // The slot -- and therefore its stream -- has to exist BEFORE the
+            // preprocessing below, because quantize and shuffle are queued on
+            // that same stream so the whole per-slot chain (quantize ->
+            // shuffle -> compress) runs without waiting on anything, exactly
+            // as upstream queues it (gpucompress_compress.cpp).
+            auto slot = std::make_unique<ExploreSlot>();
+            void* alt_stream = nullptr;
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+            slot->gpu = dynamic_cast<ctp::NvComp*>(alt_compressor.get());
+            if (slot->gpu != nullptr && ctp::NvComp::OpenSlot(&slot->async)) {
+              alt_stream = slot->async.stream;
+            } else {
+              // No stream means the synchronous fallback below, so the
+              // preprocessing must keep its own waiting behaviour.
+              slot->gpu = nullptr;
+            }
+#endif
 
             // Same device-pointer safety net Runtime::Compress() uses: a
             // CPU-only alternative can't read a device pointer directly.
@@ -1676,7 +1795,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 if (ctp::compress::preprocess::QuantizeDevice(
                         alt_input, chunk_size / sizeof(float),
                         context.error_bound_, alt_q_buf, &alt_q_bytes,
-                        &alt_quant_params)) {
+                        &alt_quant_params, alt_stream)) {
                   alt_input = alt_q_buf;
                   alt_compress_size = alt_q_bytes;
                   alt_applied_quant = true;
@@ -1722,7 +1841,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                         alt_compress_size, &alt_shuf_buf);
                 if (!alt_shuf_alloc.IsNull()) {
                   if (ctp::compress::preprocess::ByteShuffleDevice(
-                          alt_input, alt_shuf_buf, alt_compress_size, alt_shuffle)) {
+                          alt_input, alt_shuf_buf, alt_compress_size,
+                          alt_shuffle, alt_stream)) {
                     alt_input = alt_shuf_buf;
                     alt_applied_shuffle = alt_shuffle;
                   }
@@ -1769,26 +1889,96 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               alt_output.resize(alt_worst_case);
               alt_out_ptr = alt_output.data();
             }
-            size_t alt_compressed_size = alt_worst_case;
+            slot->alt = alt;
+            slot->name = alt_name;
+            slot->preset_id = alt_preset_id;
+            slot->applied_shuffle = alt_applied_shuffle;
+            slot->applied_quant = alt_applied_quant;
+            slot->quant_params = alt_quant_params;
+            slot->compressor = std::move(alt_compressor);
+            slot->device_staging = std::move(alt_device_staging);
+            slot->quant_staging = std::move(alt_quant_staging);
+            slot->shuffle_staging = std::move(alt_shuffle_staging);
+            slot->output = std::move(alt_output);
+            slot->input = alt_input;
+            slot->compress_size = alt_compress_size;
+            slot->out_ptr = alt_out_ptr;
+            slot->capacity = alt_worst_case;
 
-            auto alt_start = std::chrono::high_resolution_clock::now();
-            bool alt_ok = alt_compressor->Compress(
-                alt_out_ptr, alt_compressed_size, alt_input,
-                alt_compress_size);
-            double alt_wall_ms = std::chrono::duration<double, std::milli>(
-                                     std::chrono::high_resolution_clock::now() -
-                                     alt_start)
-                                     .count();
-            // Same clock as the primary, or the comparison below is between
-            // two different quantities. Upstream times every explored slot
-            // with per-slot CUDA events around the codec launch alone
-            // (gpucompress_compress.cpp) and scores on that; using
-            // wall clock here charged each candidate for staging and copies
-            // the primary's measurement excluded once this path started
-            // reporting kernel time.
-            const double alt_kernel_ms = ctp::LastCodecKernelMs();
-            double alt_time_ms =
-                (alt_kernel_ms >= 0.0) ? alt_kernel_ms : alt_wall_ms;
+            // Launch on the slot's stream, behind its own preprocessing. This
+            // returns as soon as the work is queued, so the next iteration's
+            // quantize/shuffle overlaps this candidate's codec kernels.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+            if (slot->gpu != nullptr) {
+              slot->launched = slot->gpu->CompressLaunch(
+                  slot->out_ptr, slot->capacity, slot->input,
+                  slot->compress_size, &slot->async);
+              if (!slot->launched) slot->gpu = nullptr;
+            }
+#endif
+            slots.push_back(std::move(slot));
+          }
+
+          // ---- Phase 2: every slot is already in flight; collect them ----
+          // Upstream's split, on one thread: each candidate's quantize,
+          // shuffle and codec launch were queued above on that candidate's own
+          // CUDA stream and none of them waited, so by the time the prep loop
+          // ends all K are running together. Nothing here is parallelized with
+          // OS threads -- the concurrency is the device's, and it costs one
+          // stream plus two events per slot.
+          //
+          // Compressor::Compress() cannot be used for that: it takes the
+          // thread's single cached stream and synchronizes before returning,
+          // so two calls on one thread serialize by construction. NvComp's
+          // OpenSlot/CompressLaunch/CompressFinish split it at exactly the
+          // points upstream splits it.
+          //
+          // A codec with no async path (any CPU compressor) is compressed
+          // synchronously here instead. NeuroPress's action space is entirely
+          // GPU codecs, so on the path that matters this branch is not taken.
+          for (auto& sp : slots) {
+            ExploreSlot* s = sp.get();
+            if (s->gpu != nullptr) continue;
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            size_t sz = s->capacity;
+            s->ok = s->compressor->Compress(s->out_ptr, sz, s->input,
+                                            s->compress_size);
+            const double wall_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::high_resolution_clock::now() - t0)
+                                       .count();
+            const double kernel_ms = ctp::LastCodecKernelMs();
+            s->time_ms = (kernel_ms >= 0.0) ? kernel_ms : wall_ms;
+            s->compressed_size = s->ok ? sz : 0;
+          }
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+          for (auto& sp : slots) {
+            ExploreSlot* s = sp.get();
+            if (!s->launched || s->gpu == nullptr) continue;
+            s->ok = s->gpu->CompressFinish(&s->async);
+            // Kernel time from this slot's OWN events, bracketing its codec
+            // launch alone -- the same quantity the primary is measured with,
+            // and the same one upstream scores its slots on. There is no
+            // host-clock fallback here: the events are created with the slot,
+            // so a missing reading means the launch did not happen.
+            s->time_ms = (s->async.kernel_ms >= 0.0) ? s->async.kernel_ms : 0.0;
+            s->compressed_size = s->ok ? s->async.compressed_size : 0;
+          }
+#endif
+
+          // ---- Phase 3: score the slots in rank order (serial) ----
+          for (auto& sp : slots) {
+            ExploreSlot& slot_ref = *sp;
+            const CompressionStats* alt = slot_ref.alt;
+            const std::string& alt_name = slot_ref.name;
+            const uint32_t alt_preset_id = slot_ref.preset_id;
+            const uint32_t alt_applied_shuffle = slot_ref.applied_shuffle;
+            const bool alt_applied_quant = slot_ref.applied_quant;
+            const ctp::compress::preprocess::DeviceQuantizeParams&
+                alt_quant_params = slot_ref.quant_params;
+            char* alt_out_ptr = slot_ref.out_ptr;
+            const bool alt_ok = slot_ref.ok;
+            const size_t alt_compressed_size = slot_ref.compressed_size;
+            const double alt_time_ms = slot_ref.time_ms;
             if (!alt_ok || alt_compressed_size == 0) continue;
 
             double alt_ratio = static_cast<double>(chunk_size) /
@@ -1891,6 +2081,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                         0.0f);
             explore_costs.push_back(alt_cost);
           }
+
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+          // Release each slot's stream, events and any temporary output. Done
+          // AFTER scoring, because the winner's payload is copied out of
+          // out_ptr up there and a slot that wrote into its own temporary
+          // still owns those bytes until CompressFinish has delivered them.
+          for (auto& sp : slots) {
+            if (sp->gpu != nullptr) ctp::NvComp::ReleaseSlot(&sp->async);
+          }
+#endif
+          slots.clear();
 
           for (const auto& scratch : explore_gpu_scratch) {
             if (!scratch.IsNull()) {
@@ -2023,7 +2224,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             }
           }
 
-          if (!explore_features.empty()) {
+          // Withheld under best mode, same reason phase 1 is: these samples
+          // come from a sweep the model did not choose, so training on them
+          // contaminates the weights with outcomes it never predicted
+          // (upstream's `&& !g_best_mode.load()`).
+          if (!explore_features.empty() && !config_.neuropress_best_mode_) {
             // Order by ascending cost and keep at most the cheapest 7, matching
             // upstream's SGD phase 2. Its index 0 is the primary, which phase 1
             // already learned from, so alternatives cap at NN_MAX_SGD_SAMPLES-1.

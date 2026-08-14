@@ -103,6 +103,27 @@ struct CompressorConfig {
   bool neuropress_exploration_enabled_ = false;
   float neuropress_exploration_threshold_ = 0.50f;
   int neuropress_exploration_k_ = 3;  // NeuroPress's own default K
+  /**
+   * Exhaustive-search ("best") mode, mirroring NeuroPress's g_best_mode /
+   * gpucompress_set_best_mode(). Every chunk is explored with the full
+   * remaining action space regardless of prediction error, and the cheapest
+   * measured configuration is stored.
+   *
+   * This is a MEASUREMENT mode, not a faster one: it compresses each chunk
+   * ~32 times and is correspondingly slower. Its purpose is to establish the
+   * ceiling on selection quality reachable inside the action space, so a
+   * model's real selections can be scored against the best available one.
+   *
+   * Both SGD phases are suppressed while it is on, exactly as upstream
+   * suppresses them (`&& !g_best_mode.load()` on each): the training signal
+   * is derived from the model's own prediction error, and a mode that
+   * overrides the model's choice on every chunk would teach it from outcomes
+   * it did not choose. Upstream calls that weight contamination.
+   *
+   * Requires neuropress_exploration_enabled_ -- this widens the exploration
+   * gate, it does not open it.
+   */
+  bool neuropress_best_mode_ = false;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -134,6 +155,7 @@ struct CompressorConfig {
         neuropress_exploration_threshold_(
             other.neuropress_exploration_threshold_),
         neuropress_exploration_k_(other.neuropress_exploration_k_),
+        neuropress_best_mode_(other.neuropress_best_mode_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -152,6 +174,7 @@ struct CompressorConfig {
        neuropress_mape_threshold_, neuropress_learning_rate_,
        neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
+       neuropress_best_mode_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 

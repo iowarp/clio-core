@@ -256,6 +256,186 @@ class NvComp : public Compressor {
     return ok;
   }
 
+  /**
+   * @brief One slot of a stream-parallel compression sweep.
+   *
+   * Mirrors upstream's ExploreSlot (gpucompress_compress.cpp): its own stream,
+   * its own timing events, its own manager, and its own device buffers, so K
+   * of these can be in flight at once. Everything the slot owns is released by
+   * ReleaseSlot().
+   */
+  struct AsyncSlot {
+    cudaStream_t stream = nullptr;  ///< owned by the slot
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;  ///< owned by the slot
+    std::shared_ptr<nvcomp::nvcompManagerBase> mgr;
+    uint8_t *d_in = nullptr;
+    uint8_t *d_out = nullptr;
+    bool free_in = false;
+    bool free_out = false;
+    void *out = nullptr;  ///< caller's destination, not owned
+    size_t out_capacity = 0;
+    bool out_is_device = false;
+    bool launched = false;
+    size_t compressed_size = 0;  ///< valid after CompressFinish
+    double kernel_ms = -1.0;     ///< valid after CompressFinish
+
+    AsyncSlot() = default;
+    // The slot owns a stream, two events and possibly two device buffers, so
+    // releasing is not optional and must not depend on the caller reaching a
+    // cleanup path. Destroying here makes an early `continue` between
+    // OpenSlot() and CompressLaunch() safe, which is exactly the shape the
+    // preprocessing steps in between need.
+    ~AsyncSlot() { ReleaseSlot(this); }
+    AsyncSlot(const AsyncSlot &) = delete;
+    AsyncSlot &operator=(const AsyncSlot &) = delete;
+  };
+
+  /**
+   * @brief Create the slot's stream and timing events, without launching.
+   *
+   * Split out of CompressLaunch so a caller can run its OWN preprocessing on
+   * the slot's stream first. Upstream needs exactly this: it quantizes and
+   * byte-shuffles each explored candidate on s.stream and then compresses on
+   * s.stream, so the whole per-slot pipeline is queued as one dependent chain
+   * and nothing waits until every slot is collected
+   * (gpucompress_compress.cpp). Idempotent, so CompressLaunch can call it for
+   * a caller that has no preprocessing to do.
+   */
+  static bool OpenSlot(AsyncSlot *slot) {
+    if (!slot) return false;
+    if (slot->stream) return true;  // already open
+    if (cudaStreamCreate(&slot->stream) != cudaSuccess) {
+      slot->stream = nullptr;
+      return false;
+    }
+    if (cudaEventCreate(&slot->ev_start) != cudaSuccess ||
+        cudaEventCreate(&slot->ev_stop) != cudaSuccess) {
+      ReleaseSlot(slot);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief Launch a compression on the slot's own stream and RETURN, without
+   * synchronizing.
+   *
+   * This is the half of Compress() that can overlap. Compress() takes the
+   * thread's one cached stream and blocks on it, so two codec calls on a
+   * thread can never be in flight together; a caller that wants K running at
+   * once pairs this with CompressFinish() instead, which is exactly how
+   * upstream drives its exploration sweep -- launch all K, then sync all K.
+   *
+   * The manager is built fresh on this slot's stream rather than taken from
+   * the thread's LRU: a manager is bound to the stream it was constructed on,
+   * so a cache keyed by algorithm alone cannot serve K slots that share an
+   * algorithm but not a stream. Upstream constructs its per-slot comp_mgr the
+   * same way and for the same reason.
+   *
+   * @return true if the launch was issued; false leaves the slot released.
+   */
+  bool CompressLaunch(void *output, size_t output_capacity, void *input,
+                      size_t input_size, AsyncSlot *slot) {
+    if (!OpenSlot(slot)) return false;
+    slot->out = output;
+    slot->out_capacity = output_capacity;
+    try {
+      slot->d_in = ToDeviceInput(input, input_size, slot->stream,
+                                 &slot->free_in);
+      if (!slot->d_in) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->mgr = MakeManager(slot->stream);
+      if (!slot->mgr) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      nvcomp::CompressionConfig cfg = slot->mgr->configure_compression(input_size);
+      slot->out_is_device = IsDeviceAccessible(output);
+      if (slot->out_is_device &&
+          output_capacity >= cfg.max_compressed_buffer_size) {
+        slot->d_out = static_cast<uint8_t *>(output);
+      } else {
+        if (cudaMalloc(&slot->d_out, cfg.max_compressed_buffer_size) !=
+            cudaSuccess) {
+          ReleaseSlot(slot);
+          return false;
+        }
+        slot->free_out = true;
+      }
+      // Events bracket the codec launch alone, same as Compress()'s
+      // KernelTimer and same as upstream's per-slot ev_start/ev_stop.
+      if (cudaEventRecord(slot->ev_start, slot->stream) != cudaSuccess) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->mgr->compress(slot->d_in, slot->d_out, cfg);
+      if (cudaEventRecord(slot->ev_stop, slot->stream) != cudaSuccess) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->launched = true;
+      return true;
+    } catch (...) {
+      // The nvcomp Manager API reports errors by throwing, and compress() is
+      // void, so a throw is its only failure signal -- same contract Compress()
+      // handles.
+      ReleaseSlot(slot);
+      return false;
+    }
+  }
+
+  /**
+   * @brief Wait for a launched slot, then read its size and kernel time.
+   *
+   * Delivers into the caller's buffer if the codec wrote to a temporary.
+   * Leaves the slot's resources intact; call ReleaseSlot() when the output has
+   * been consumed.
+   */
+  bool CompressFinish(AsyncSlot *slot) {
+    if (!slot || !slot->launched) return false;
+    if (cudaStreamSynchronize(slot->stream) != cudaSuccess) return false;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, slot->ev_start, slot->ev_stop) ==
+        cudaSuccess) {
+      slot->kernel_ms = static_cast<double>(ms);
+    }
+    try {
+      const size_t comp_size = slot->mgr->get_compressed_output_size(slot->d_out);
+      if (comp_size > slot->out_capacity) return false;
+      if (slot->d_out != static_cast<uint8_t *>(slot->out)) {
+        const cudaMemcpyKind kind = slot->out_is_device
+                                        ? cudaMemcpyDeviceToDevice
+                                        : cudaMemcpyDeviceToHost;
+        if (cudaMemcpy(slot->out, slot->d_out, comp_size, kind) != cudaSuccess) {
+          return false;
+        }
+      }
+      slot->compressed_size = comp_size;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  /** @brief Release everything the slot owns. Safe to call more than once. */
+  static void ReleaseSlot(AsyncSlot *slot) {
+    if (!slot) return;
+    // The manager must die before the stream it was built on.
+    slot->mgr.reset();
+    if (slot->free_in && slot->d_in) cudaFree(slot->d_in);
+    if (slot->free_out && slot->d_out) cudaFree(slot->d_out);
+    slot->d_in = slot->d_out = nullptr;
+    slot->free_in = slot->free_out = false;
+    if (slot->ev_start) cudaEventDestroy(slot->ev_start);
+    if (slot->ev_stop) cudaEventDestroy(slot->ev_stop);
+    slot->ev_start = slot->ev_stop = nullptr;
+    if (slot->stream) cudaStreamDestroy(slot->stream);
+    slot->stream = nullptr;
+    slot->launched = false;
+  }
+
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
     // Same persistent stream as Compress. The MANAGER cannot be cached here

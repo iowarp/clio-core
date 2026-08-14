@@ -80,7 +80,7 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
     double second_derivative_mean, bool data_type_float,
-    double error_bound = 0.0);
+    double error_bound = 0.0, bool ratio_only = false);
 
 /**
  * @brief Same ranking, with the network reading the data statistics out of
@@ -110,7 +110,7 @@ std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
     bool data_type_float, double error_bound = 0.0, double min_psnr = 0.0,
-    bool *out_inference_failed = nullptr);
+    bool *out_inference_failed = nullptr, bool ratio_only = false);
 
 }  // namespace clio::cte::compressor
 

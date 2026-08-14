@@ -23,12 +23,14 @@
 
 namespace ctp::compress::preprocess {
 
-bool ByteShuffleDevice(const void *, void *, size_t, size_t) { return false; }
+bool ByteShuffleDevice(const void *, void *, size_t, size_t, void *) {
+  return false;
+}
 bool ByteUnshuffleDevice(const void *, void *, size_t, size_t) { return false; }
 
 /** Same contract: no device, so no device quantization. */
 bool QuantizeDevice(const void *, size_t, double, void *, size_t *,
-                    DeviceQuantizeParams *) {
+                    DeviceQuantizeParams *, void *) {
   return false;
 }
 bool DequantizeDevice(const void *, size_t, const DeviceQuantizeParams &,

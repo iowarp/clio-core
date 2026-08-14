@@ -66,7 +66,7 @@ std::vector<CompressionStats> RankIntoStats(
     clio::run::u64 chunk_size, double entropy, double mad,
     double second_derivative_mean, bool data_type_float, double error_bound,
     const void *device_stats, void *stream, double min_psnr,
-    bool *out_inference_failed) {
+    bool *out_inference_failed, bool ratio_only) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -212,6 +212,16 @@ std::vector<CompressionStats> RankIntoStats(
   // wants, and not what NeuroPress does.
   ctp::compress::model::RankingWeights weights;
   weights.use_cost_model = true;
+  // Best mode's ratio-only objective. Upstream reaches it by zeroing
+  // g_rank_w0/w1 (gpucompress_learning.cpp), which leaves
+  // cost = size/(ratio*bw) -- a monotone function of ratio alone, so the
+  // ranking becomes "smallest output first". This has to apply to the NN
+  // RANKING too, not just to the exploration winner: the ranking is what
+  // decides which slots the exhaustive sweep visits.
+  if (ratio_only) {
+    weights.w_cost_compress_time = 0.0;
+    weights.w_cost_decompress_time = 0.0;
+  }
 
   // Cost-model weights are overridable for experiments, and ONLY for
   // experiments: the defaults above are upstream's (all 1.0, bw 5e6) and are
@@ -363,18 +373,20 @@ std::vector<CompressionStats> RankIntoStats(
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,
-    double second_derivative_mean, bool data_type_float, double error_bound) {
+    double second_derivative_mean, bool data_type_float, double error_bound,
+    bool ratio_only) {
   return RankIntoStats(predictor, chunk_size, entropy, mad,
                        second_derivative_mean, data_type_float, error_bound,
                        /*device_stats=*/nullptr, /*stream=*/nullptr,
-                       /*min_psnr=*/0.0, /*out_inference_failed=*/nullptr);
+                       /*min_psnr=*/0.0, /*out_inference_failed=*/nullptr,
+                       ratio_only);
 }
 
 std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
     bool data_type_float, double error_bound, double min_psnr,
-    bool *out_inference_failed) {
+    bool *out_inference_failed, bool ratio_only) {
   // Zeros for the three data statistics: on this path they reach neither the
   // network (which reads device_stats) nor the score (which reads only the
   // prediction and the chunk size). See the header for why they are not
@@ -382,7 +394,7 @@ std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
   // inference rather than after it.
   return RankIntoStats(predictor, chunk_size, 0.0, 0.0, 0.0, data_type_float,
                        error_bound, device_stats, stream, min_psnr,
-                       out_inference_failed);
+                       out_inference_failed, ratio_only);
 }
 
 }  // namespace clio::cte::compressor
