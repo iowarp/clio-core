@@ -33,7 +33,7 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
                                   unsigned int *histogram, double *sum_out,
                                   double *sum_abs_d2_out) {
   // Per-WARP privatized histograms, and a 4-bytes-at-a-time read, both taken
-  // from histogramKernelVec4 (entropy_kernel.cu:99-140). That variant is not
+  // from histogramKernelVec4 (entropy_kernel.cu). That variant is not
   // an upstream curiosity: launchEntropyKernelsAsync PICKS it whenever
   // `num_bytes >= 1024 && (ptr % 4) == 0` (:238), which is every chunk this
   // path sees -- a 4 MiB float buffer is both. A single shared histogram read
@@ -75,7 +75,7 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
       atomicAdd(&s_hist[warp_id][(w >> 24) & 0xFFu], 1u);
     }
     // Trailing bytes, counted by ONE block so they are not counted per block
-    // (entropy_kernel.cu:132-138).
+    // (entropy_kernel.cu).
     if (blockIdx.x == 0) {
       for (size_t i = num_words * 4 + threadIdx.x; i < num_bytes;
            i += blockDim.x) {
@@ -154,7 +154,7 @@ __global__ void StatsPass2Kernel(const T *data, size_t num_elements,
  * Pass 2, device-mean variant: reads the mean out of the scalar buffer on the
  * GPU instead of taking it as a host argument.
  *
- * Mirrors madPass2Kernel (stats_kernel.cu:201-213), which computes
+ * Mirrors madPass2Kernel (stats_kernel.cu), which computes
  * `stats->sum / stats->num_elements` into a __shared__ slot once per block.
  * That one line is what lets upstream keep both passes on one stream: the
  * host-argument form forces a D2H, a host divide and a relaunch between them.
@@ -189,7 +189,7 @@ __global__ void StatsPass2DevKernel(const T *data, size_t num_elements,
 /**
  * Shannon entropy from the byte histogram, on the GPU.
  *
- * Structure copied from entropyFromHistogramKernel (entropy_kernel.cu:167):
+ * Structure copied from entropyFromHistogramKernel (entropy_kernel.cu):
  * one block, one bin per thread, then a shared-memory tree reduction. The
  * reduction ORDER is part of the port -- a serial host loop and a tree sum
  * over 256 doubles need not agree in the last ulp, and the whole point is to
@@ -219,7 +219,7 @@ __global__ void EntropyFromHistKernel(const unsigned int *__restrict__ histogram
 
 /**
  * Normalize the accumulated sums into the two remaining features.
- * Mirrors finalizeStatsOnlyKernel (stats_kernel.cu:260), including its
+ * Mirrors finalizeStatsOnlyKernel (stats_kernel.cu), including its
  * `n > 2` guard on the second derivative. Entropy is not touched here --
  * EntropyFromHistKernel writes it straight into the struct, the same way
  * upstream's entropy kernel writes into `&d_stats->entropy`.
@@ -321,8 +321,8 @@ bool ComputeDeviceStatsTyped(const T *data, size_t num_elements,
   // caller an entropy computed from an UNINITIALIZED stack histogram with
   // mad = 0 -- i.e. the "perfectly compressible" corner of the feature
   // space -- for a chunk nothing is known about. NeuroPress propagates the
-  // failure at every stage (stats_kernel.cu:307-354 returns nullptr, and
-  // gpucompress_compress.cpp:285 bails on it); ComputeCompressionFeatures's
+  // failure at every stage (stats_kernel.cu returns nullptr, and
+  // gpucompress_compress.cpp bails on it); ComputeCompressionFeatures's
   // contract already promises the same, so it must actually be able to fail.
   bool ok = cudaMalloc(&d_hist, kHistBins * sizeof(unsigned int)) ==
                 cudaSuccess &&
@@ -421,7 +421,7 @@ const void *ComputeDeviceStatsResident(const void *device_data,
   // A chunk with no elements has no statistics. The zeroing memset in the
   // typed helper would leave the struct at all zeros, which is a real point
   // in the feature space ("perfectly compressible"), so refuse instead --
-  // upstream refuses the same case outright (gpucompress_compress.cpp:274).
+  // upstream refuses the same case outright (gpucompress_compress.cpp).
   if (num_elements == 0) return nullptr;
 
   bool ok = false;
@@ -463,7 +463,7 @@ bool ReadDeviceFeatureStats(const void *device_stats, double *out_entropy,
   // Stream-scoped, not device-wide: this runs concurrently with other
   // workers' compressions and must not serialize them. Upstream likewise
   // ends its inference phase with cudaStreamSynchronize(stream)
-  // (nn_gpu.cu:2236), never cudaDeviceSynchronize.
+  // (nn_gpu.cu), never cudaDeviceSynchronize.
   if (cudaStreamSynchronize(st) != cudaSuccess) return false;
   *out_entropy = h.entropy;
   *out_mad = h.mad;

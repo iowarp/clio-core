@@ -1582,9 +1582,9 @@ struct Context {
   // (include/gpucompress.h:124, "Quantization error bound (0 = lossless)").
   // It is what makes the quantize half of NeuroPress's 32-config action
   // space reachable: its ranking masks every quantize action to -INFINITY
-  // when error_bound <= 0 (nn_gpu.cu:238), and its compress path refuses to
+  // when error_bound <= 0 (nn_gpu.cu), and its compress path refuses to
   // run the quantizer without a positive bound
-  // (gpucompress_compress.cpp:434).
+  // (gpucompress_compress.cpp).
   double error_bound_;
   int psnr_chance_;       // The chance PSNR will be validated (default 100%)
   bool max_performance_;  // Compression objective (performance vs ratio)
@@ -1603,7 +1603,7 @@ struct Context {
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
   // Actual PSNR achieved. Sentinels follow NeuroPress exactly
-  // (gpucompress_compress.cpp:388, nn_gpu.cu:804-815):
+  // (gpucompress_compress.cpp, nn_gpu.cu):
   //   < 0  -> undefined; the PSNR head gets NO gradient. This is what a
   //           LOSSLESS compress must report -- upstream seeds
   //           primary_actual_psnr = -1.0f and only overwrites it when

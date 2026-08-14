@@ -33,7 +33,7 @@
 
 /**
  * @file test_neuropress_bridge.cc
- * @brief Cycle 3 (issue #693): NeuroPressCandidateStats bridges the ported
+ * @brief issue #693: NeuroPressCandidateStats bridges the ported
  * clio_ctp::compress::model predictors into the compressor chimod's own
  * CompressionStats, so dynamic selection can source GPU/NeuroPress
  * candidates instead of only the fixed CPU-only list.
@@ -119,7 +119,7 @@ TEST_CASE("NeuroPressCandidateStats ranks GPU candidates for compressible data",
 
   // The GPU action space (nvcomp/cusz/ndzip, wire ids 11-24) must actually
   // be reachable through this bridge, not just through DefaultCandidates()
-  // directly -- that's the whole point of Cycle 3.
+  // directly -- that is the point of the bridge.
   bool saw_gpu_candidate = false;
   for (const auto &s : stats) {
     if (s.compress_lib_ >= 11 && s.compress_lib_ <= 24) {
@@ -268,11 +268,11 @@ class TieStubPredictor : public ctp::compress::model::CompressionPredictor {
 TEST_CASE("NeuroPressCandidateStats breaks ties by lowest action index",
           "[compressor][neuropress][dynamic][693]") {
   // Ties are routine, not exotic: both sides clamp times to a 1 ms floor and
-  // the ratio to a 100x cap before ranking (nn_gpu.cu:227-230), so on
+  // the ratio to a 100x cap before ranking (nn_gpu.cu), so on
   // compressible data a group of candidates lands on a bit-identical cost.
   // Position then decides the winner. Upstream ranks with a bitonic network
   // built from strict comparators, so it never swaps equal keys and the
-  // LOWEST action index wins (decodeAction, internal.hpp:167-172, numbers an
+  // LOWEST action index wins (decodeAction, internal.hpp, numbers an
   // action algo + 8*quant + 16*shuffle); Rank() here uses std::stable_sort,
   // so the FIRST ENUMERATED wins. The two agree only while this bridge
   // enumerates shuffle-outermost, quant, then algo.
@@ -327,7 +327,7 @@ TEST_CASE("device selection reports failure instead of degrading",
           "[cte][compressor][neuropress][693]") {
   // Upstream does not degrade when its GPU selection cannot decide: a null
   // d_stats_ptr or a failed inference gives GPUCOMPRESS_ERROR_NN_NOT_LOADED
-  // (gpucompress_compress.cpp:285, :208-212), which the VOL turns into
+  // (gpucompress_compress.cpp, :208-212), which the VOL turns into
   // worker_err = -1 and propagates out through H5Dwrite
   // (H5VLgpucompress.cu:2057, :2463, :3542). It never stores the chunk by
   // another route. Clio therefore has to be able to SAY that it failed --

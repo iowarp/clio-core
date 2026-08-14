@@ -22,7 +22,7 @@
  *
  * Both sides are driven through their REAL production entry points:
  *   - upstream: byte_shuffle_simple / byte_unshuffle_simple at
- *     SHUFFLE_CHUNK_SIZE, the same call gpucompress_compress.cpp:459 and
+ *     SHUFFLE_CHUNK_SIZE, the same call gpucompress_compress.cpp and
  *     :1257 make, and quantize_simple / dequantize_simple as called at :434.
  *   - Clio: ByteShuffleDevice / ByteUnshuffleDevice and QuantizeDevice /
  *     DequantizeDevice, the same calls compressor_runtime.cc:1658, :2247,

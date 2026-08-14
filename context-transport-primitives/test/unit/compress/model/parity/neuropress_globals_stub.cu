@@ -28,7 +28,7 @@
 
 #include "nn/nn_weights.h"  // NN_SGD_GRAD_REGION
 
-// gpucompress_api.cpp:62-71 -- verbatim defaults.
+// gpucompress_api.cpp -- verbatim defaults.
 cudaEvent_t g_sgd_done = nullptr;
 std::atomic<bool> g_sgd_ever_fired{false};
 float g_rank_w0 = 1.0f;                  // weight on compression time
@@ -50,9 +50,9 @@ namespace gpucompress {
 // gpucompress_pool.cpp -- no CompContext pool exists in this harness.
 void syncAllCompContextStreams() {}
 
-// Mirrors gpucompress_pool.cpp:215-227: zero region 2 (the EMA gradient) of
+// Mirrors gpucompress_pool.cpp: zero region 2 (the EMA gradient) of
 // every live context's buffer, leaving regions 0 and 1 alone. Called from
-// loadNNFromBinary (nn_gpu.cu:1808), so a reload restarts every flow's
+// loadNNFromBinary (nn_gpu.cu), so a reload restarts every flow's
 // gradient history, not just the reloading thread's.
 void resetAllSGDEMABuffers() {
   for (float *p : g_harness_ctx_grad_buffers) {

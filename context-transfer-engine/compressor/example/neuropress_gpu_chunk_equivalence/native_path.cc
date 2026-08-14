@@ -17,7 +17,7 @@
  *
  * 1. WHY THE STAGES ARE CALLED SEPARATELY. Upstream's AUTO path is two public
  *    phases -- `gpucompress_infer_gpu` then
- *    `gpucompress_compress_with_action_gpu` (gpucompress_compress.cpp:154-233)
+ *    `gpucompress_compress_with_action_gpu` (gpucompress_compress.cpp)
  *    -- and the second phase runs quantize, shuffle and the codec internally
  *    without handing back the intermediate device buffers. There is no way to
  *    observe the shuffled bytes through the public API. So the harness runs the
@@ -74,7 +74,7 @@ const char *AlgoName(int algo) {
  *
  * Upstream lays entropy / mad_normalized / deriv_normalized out contiguously
  * precisely so they can be fetched in ONE 24-byte D->H copy
- * (stats_kernel.cu:441-446); this does the same rather than three copies. It
+ * (stats_kernel.cu); this does the same rather than three copies. It
  * is a harness read -- upstream's AUTO path never brings these to the host,
  * and deliberately zeroes them in the reported stats (gpucompress_compress.cpp
  * :323-325) -- so it is bracketed as such by the caller.
@@ -266,7 +266,7 @@ NativeChunkResult NativeRunChunk(const void *device_input, size_t bytes,
   // the equivalent, because native produces no such thing at this point in the
   // pipeline: its AUTO path never brings the features to the host at all and
   // deliberately zeroes them in the stats it reports
-  // (gpucompress_compress.cpp:323-325). That asymmetry is a REAL and already
+  // (gpucompress_compress.cpp). That asymmetry is a REAL and already
   // recorded observability difference, and the comparison says so explicitly
   // rather than this position implying the two are equivalent.
   //
@@ -296,7 +296,7 @@ NativeChunkResult NativeRunChunk(const void *device_input, size_t bytes,
   // ---------------- quantization (stage probe) ----------------
   //
   // Gate copied from the compress path verbatim: PREPROC bit from the action
-  // AND cfg.error_bound > 0.0 (gpucompress_compress.cpp:434). A selected
+  // AND cfg.error_bound > 0.0 (gpucompress_compress.cpp). A selected
   // quantize action with a zero bound does NOT quantize, on either side.
   const void *pipeline_buffer = device_input;
   size_t pipeline_bytes = bytes;

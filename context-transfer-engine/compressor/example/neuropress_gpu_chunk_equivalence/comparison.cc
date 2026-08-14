@@ -29,7 +29,7 @@ namespace {
  *
  * Byte equality is the WRONG criterion here and would fail against native
  * itself: upstream accumulates sum, abs_diff_sum and mad_sum with
- * atomicAdd(double*) (stats_kernel.cu:185-186, :246), whose summation order
+ * atomicAdd(double*) (stats_kernel.cu, :246), whose summation order
  * varies with block scheduling, so two runs of NATIVE on identical input can
  * differ in the low bits. A relative tolerance near double epsilon is the
  * correct criterion. The largest deviation measured across a 1 GiB / 256-chunk
@@ -171,7 +171,7 @@ std::string CanonicalCodec(const std::string &name) {
 /**
  * Is this action one upstream's ranking kernel masks to -INFINITY?
  *
- * nn_gpu.cu:238: quantize actions are masked when the error bound is not
+ * nn_gpu.cu: quantize actions are masked when the error bound is not
  * positive. Every masked action therefore carries the SAME score, so their
  * relative order is not a decision either implementation made -- it is
  * whatever each one's sort did with a block of equal keys.
@@ -405,7 +405,7 @@ ChunkComparison CompareChunk(const ChunkTrace &native, const ChunkTrace &clio,
         // The asymmetry that matters, stated rather than smoothed over: Clio
         // makes a REAL production 24-byte D->H of the features here; upstream's
         // AUTO path makes none at all and zeroes those fields in the stats it
-        // reports (gpucompress_compress.cpp:323-325). The VALUES agree, which is
+        // reports (gpucompress_compress.cpp). The VALUES agree, which is
         // what the checks above establish. The READ does not exist on both
         // sides, and that is a genuine (observability-only, already recorded)
         // difference rather than something this harness discovered.
@@ -515,7 +515,7 @@ ChunkComparison CompareChunk(const ChunkTrace &native, const ChunkTrace &clio,
         //
         // A positional difference is tie-explained when the two actions sitting
         // at that rank carry the same score. Two sources of exact ties exist and
-        // both are upstream's own: actions masked to -INFINITY (nn_gpu.cu:238),
+        // both are upstream's own: actions masked to -INFINITY (nn_gpu.cu),
         // and actions whose predicted cost is bit-identical -- which is common,
         // because the predicted ratio saturates at the 100x cap on compressible
         // data. Native's costs are used as the oracle because native is the

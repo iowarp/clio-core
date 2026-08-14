@@ -44,7 +44,7 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
  * the statistics to the host at all. runStatsKernelsNoSync returns an
  * AutoStatsGPU* and gpucompress_infer_gpu hands that device pointer straight
  * to the NN -- "Stats remain on GPU -- NN inference reads d_stats_ptr directly
- * on device" (gpucompress_compress.cpp:281).
+ * on device" (gpucompress_compress.cpp).
  *
  * ComputeDeviceStats() above cannot express that: it returns host doubles, so
  * feeding NeuroPress meant copying the histogram and scalars down, computing
@@ -76,16 +76,16 @@ void *DeviceStatsStream();
 /**
  * Compute the three features into device memory, launching asynchronously.
  *
- * Direct counterpart of NeuroPress's runStatsKernelsNoSync (stats_kernel.cu:363)
+ * Direct counterpart of NeuroPress's runStatsKernelsNoSync (stats_kernel.cu)
  * including its lifetime contract: the returned buffer is reused by the next
  * call on the same thread, exactly as upstream's belongs to a pool slot and
  * stays valid only until that slot is reused.
  *
  * NOTHING is copied to the host, and the kernels are not synchronized -- the
  * mean needed between the two passes is read on-device (mirroring
- * madPass2Kernel's `stats->sum / stats->num_elements`, stats_kernel.cu:209)
+ * madPass2Kernel's `stats->sum / stats->num_elements`, stats_kernel.cu)
  * and the entropy sum is reduced on-device (mirroring
- * entropyFromHistogramKernel, entropy_kernel.cu:167). The caller is expected
+ * entropyFromHistogramKernel, entropy_kernel.cu). The caller is expected
  * to enqueue its inference on the SAME stream and synchronize once, at the
  * end, as gpucompress_infer_gpu does.
  *

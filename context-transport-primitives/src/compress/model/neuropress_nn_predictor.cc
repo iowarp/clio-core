@@ -43,7 +43,7 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
   file.read(reinterpret_cast<char*>(&output_dim), 4);
 
   // Accept v1 as well as v2. Upstream reads both (`if (version != 1 &&
-  // version != 2)` -- nn_gpu.cu:1674) and differs only in the trailing
+  // version != 2)` -- nn_gpu.cu) and differs only in the trailing
   // feature bounds, which v1 files do not carry. Rejecting v1 meant Clio
   // could not load a weight file the original project loads fine.
   if (!file || magic != 0x4E4E5754 || (version != 1 && version != 2)) {
@@ -119,7 +119,7 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
 
   // Feature bounds are a v2 addition. A v1 file simply ends here, and
   // upstream fills in wide-open defaults rather than failing
-  // (nn_gpu.cu:1745-1750). Nothing consults these at inference on either
+  // (nn_gpu.cu). Nothing consults these at inference on either
   // side -- they exist for out-of-distribution reporting -- so the defaults
   // cost nothing beyond making v1 loadable.
   x_mins_.resize(input_dim);
@@ -154,7 +154,7 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
     // HALT, do not degrade. This is a build with GPU support whose device was
     // unavailable at load time. Upstream has no CPU implementation of this
     // network at all and ends the call on any such failure
-    // (GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:208-212 and
+    // (GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp and
     // :285), so answering from the host port instead would be NeuroPress
     // running somewhere NeuroPress never runs.
     //
@@ -289,7 +289,7 @@ std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
 
   // Lossless configs carry a SENTINEL error bound of 1e-7, not 0. That is
   // how the model was trained -- neural_net/core/configs.py:44,
-  // `eb_val = eb if quant else 1e-7` -- and nn_gpu.cu:138-144 repeats it at
+  // `eb_val = eb if quant else 1e-7` -- and nn_gpu.cu repeats it at
   // inference with the comment "training used 1e-7 sentinel for lossless
   // (quant==0). Inference must match -- do not pass raw 0.0 for lossless
   // configs." Passing 0.0 put input 3 about 2.4e-6 standard deviations off
@@ -329,7 +329,7 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
   }
   // Readers take the same lock as the writers below. Upstream serializes
   // this with a completion event instead (cudaStreamWaitEvent on g_sgd_done,
-  // nn_gpu.cu:1957), which Clio cannot use because TrainDecompHead's update
+  // nn_gpu.cu), which Clio cannot use because TrainDecompHead's update
   // is host-side, not a kernel on the SGD stream.
   std::lock_guard<std::mutex> model_lock(*model_mutex_);
   if (!is_ready_) {
@@ -375,7 +375,7 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
                           .count() /
                       static_cast<double>(batch.size());
     for (size_t i = 0; i < batch.size(); ++i) {
-      // Already clamped inside the kernel (nn_gpu.cu:217-231 order: sanity
+      // Already clamped inside the kernel (nn_gpu.cu order: sanity
       // ceiling first, then the policy floors/caps). Repeat the policy half
       // here so the CPU and GPU paths read identically.
       results.emplace_back(
@@ -390,7 +390,7 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
   // not be created, so a ready predictor always has them. Kept as a hard stop
   // rather than a comment, because falling through to the host loop below is
   // exactly the behaviour that must not exist -- upstream has no CPU network
-  // and ends the call instead (gpucompress_compress.cpp:208-212).
+  // and ends the call instead (gpucompress_compress.cpp).
   return {};
 #else
   // No CPU path -- see TrainDecompHead.
@@ -409,7 +409,7 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
   // downloads every parameter, edits two and uploads them all back, so an
   // inference reading the device weights mid-update would see a torn model.
   // Upstream serializes the same hazard with cudaStreamWaitEvent on
-  // g_sgd_done (nn_gpu.cu:2187-2188). Omitting it here would have left this
+  // g_sgd_done (nn_gpu.cu). Omitting it here would have left this
   // path unprotected while the one beside it was guarded -- learning is off
   // in the configuration this path was built for, which is exactly what
   // would have kept the gap invisible.
@@ -426,7 +426,7 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
   for (size_t i = 0; i < batch.size(); ++i) {
     // RAW error bound, sentinel NOT applied. Upstream substitutes the 1e-7
     // lossless sentinel inside its inference kernel
-    // (`input_raw[3] = (quant == 0) ? 1e-7f : eb_enc`, nn_gpu.cu:144) rather
+    // (`input_raw[3] = (quant == 0) ? 1e-7f : eb_enc`, nn_gpu.cu) rather
     // than in whatever assembled the inputs, so InferKernelDeviceStats does
     // it there too -- the descriptor now carries what the caller actually
     // configured and the substitution is the model's own, as it is upstream.
@@ -445,7 +445,7 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
   // being null keeps this a pure inference call.
   // Upstream's ACTION INDICES, one per candidate. That is all the kernel
   // needs: it decodes each one back into algo/quantize/shuffle itself, the
-  // way upstream decodes its thread index (nn_gpu.cu:133-135), so nothing
+  // way upstream decodes its thread index (nn_gpu.cu), so nothing
   // about a configuration is assembled here any more. The error bound rides
   // in as a scalar and the lossless sentinel is applied in-kernel.
   std::vector<int> action_ids(batch.size());
@@ -544,7 +544,7 @@ bool NeuroPressNNPredictor::Train(
     return false;
   }
   // Matches NeuroPress's g_sgd_mutex around every SGD dispatch
-  // (gpucompress_compress.cpp:719, :1021, gpucompress_learning.cpp:100).
+  // (gpucompress_compress.cpp, :1021, gpucompress_learning.cpp).
   std::lock_guard<std::mutex> model_lock(*model_mutex_);
   const size_t num_samples =
       std::min(features.size(), static_cast<size_t>(kMaxSGDSamples));
@@ -612,7 +612,7 @@ bool NeuroPressNNPredictor::TrainDecompHead(
   // is silently reverted, because the upload carries a pre-Train snapshot of
   // the whole trunk. Upstream cannot lose an update this way -- its decomp
   // update is a device kernel that writes only those two slots
-  // (nn_gpu.cu:2551-2558).
+  // (nn_gpu.cu).
   std::lock_guard<std::mutex> model_lock(*model_mutex_);
 
   // Head-only constants, distinct from Train()'s -- see nn_gpu.cu's
@@ -629,7 +629,7 @@ bool NeuroPressNNPredictor::TrainDecompHead(
 
 #if CTP_ENABLE_NEUROPRESS_GPU
   // Device path: one kernel that touches only w5 row 1 and b5[1], as upstream
-  // does (nnBatchedDecompSGDKernel, nn_gpu.cu:2382). What this replaces is a
+  // does (nnBatchedDecompSGDKernel, nn_gpu.cu). What this replaces is a
   // host read-modify-write of the WHOLE parameter set -- download all, edit
   // two, upload all -- which is both a device kernel's work done on the CPU
   // and the reason a concurrent Train() could be silently reverted: the upload
@@ -641,7 +641,7 @@ bool NeuroPressNNPredictor::TrainDecompHead(
     for (size_t si = 0; si < features.size(); ++si) {
       const double measured = decompression_times_ms[si];
       if (measured <= 0.0) continue;  // not measured -- nothing to learn from
-      // RAW bound: the sentinel is inference-only (nn_gpu.cu:2416).
+      // RAW bound: the sentinel is inference-only (nn_gpu.cu).
       const auto x = FeaturesTo8Input(features[si],
                                       /*apply_lossless_sentinel=*/false);
       const int base_id =

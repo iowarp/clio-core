@@ -410,7 +410,7 @@ TEST_CASE("NeuroPressNNPredictor's algo_id encoding does not collide "
 }
 
 TEST_CASE("NeuroPressNNPredictor::Train() moves predictions toward "
-          "real observed outcomes (issue #693 Cycle 4)") {
+          "real observed outcomes (issue #693)") {
   NeuroPressNNPredictor nn;
   if (!nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR)) {
     // Not a failure: on a GPU-capable build Load() REFUSES when no

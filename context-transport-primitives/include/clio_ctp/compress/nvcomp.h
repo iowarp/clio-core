@@ -126,7 +126,7 @@ class NvComp : public Compressor {
    * wanted when something is being compared. Records on the SAME stream the
    * codec runs on, so the interval covers device work rather than host
    * launch latency. NeuroPress times its equivalent call the same way
-   * (gpucompress_compress.cpp:530-551).
+   * (gpucompress_compress.cpp).
    */
   struct KernelTimer {
     cudaEvent_t start = nullptr, stop = nullptr;
@@ -188,7 +188,7 @@ class NvComp : public Compressor {
     // that is large relative to the compress kernels and roughly independent
     // of chunk size, flattening the time-vs-size relationship the network
     // learns. NeuroPress pays neither per chunk: a persistent context stream
-    // and an LRU of managers (gpucompress_pool.cpp:236-271), with its
+    // and an LRU of managers (gpucompress_pool.cpp), with its
     // CUDA-event bracket around compress() alone.
     cudaStream_t stream = CachedStream();
     if (!stream) {
@@ -371,7 +371,7 @@ class NvComp : public Compressor {
    *
    * NeuroPress keeps this per CompContext -- an LRU of LRU_DEPTH = 3
    * managers keyed by algorithm, on the context's own stream, with hit/miss
-   * counters (gpucompress_pool.cpp:236-271, internal.hpp:83-86). Clio has no
+   * counters (gpucompress_pool.cpp, internal.hpp). Clio has no
    * per-context object at this layer, so the equivalent scope is the worker
    * THREAD: it gives each concurrent flow its own managers and stream, which
    * is the isolation upstream gets from per-context state, without a lock on

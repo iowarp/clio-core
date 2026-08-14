@@ -64,7 +64,7 @@ int NeuroPressAlgoIdForBaseId(int base_id);
  * @brief The action index upstream would give this configuration.
  *
  * `action = algo + 8*quantize + 16*shuffle` -- decodeAction's encoding
- * (internal.hpp:167-172), which the inference kernel inverts to rebuild the
+ * (internal.hpp), which the inference kernel inverts to rebuild the
  * per-config inputs. Ordering a candidate list by this makes slot order and
  * action order the same thing, so "first enumerated wins" and upstream's
  * "lowest action index wins" become the same rule.
@@ -134,22 +134,15 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   /**
    * @brief True when inference and SGD actually run as CUDA kernels.
    *
-   * On a GPU build this is EQUIVALENT to IsReady(), and deliberately so:
-   * Load() refuses rather than returning a predictor backed by the host port,
-   * so there is no ready-but-host-only state for the two to disagree about.
-   * That equivalence is the invariant "NeuroPress never runs on the CPU"
-   * reduced to something a test can assert, and
-   * ctp_neuropress_device_path_parity asserts exactly it.
+   * On a GPU build this is EQUIVALENT to IsReady(), deliberately: Load()
+   * refuses rather than returning a predictor backed by the host port, so there
+   * is no ready-but-host-only state. That equivalence is the invariant
+   * "NeuroPress never runs on the CPU" reduced to something a test can assert,
+   * and ctp_neuropress_device_path_parity asserts exactly it.
    *
-   * It is therefore NOT a guard callers should branch on -- IsReady() already
-   * carries the meaning, and upstream likewise exposes a single predicate
-   * (gpucompress_nn_is_loaded, gpucompress.h:365, set only once the weights
-   * reach the device at nn_gpu.cu:1790) rather than one for "loaded" and
-   * another for "on the GPU". Adding a second gate here would be a second
-   * gate upstream does not have and, on a GPU build, one that can never fire.
-   *
-   * The two differ only under CTP_ENABLE_NEUROPRESS_GPU=0, a build upstream
-   * cannot be compiled for at all.
+   * Not a guard to branch on -- IsReady() already carries the meaning, and
+   * upstream likewise exposes a single predicate. The two differ only under
+   * CTP_ENABLE_NEUROPRESS_GPU=0, a build upstream has no equivalent of.
    */
   bool GpuInferenceActive() const {
 #if CTP_ENABLE_NEUROPRESS_GPU
@@ -189,41 +182,27 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   /**
    * @brief PredictBatch, with the data features read from DEVICE memory.
    *
-   * Not an override: the CompressionPredictor interface is shared with the
-   * Q-table, linreg and XGBoost models, none of which has a device path, and
-   * widening it for one model would put a CUDA concept in everyone's way.
-   * This is the NeuroPress-specific entry the bridge reaches for when the
-   * chunk is device-resident.
-   *
-   * Why it exists: PredictBatch takes a host-built [n][8] matrix, so the
-   * chunk's entropy/MAD/second-derivative must already have been copied down
-   * from the GPU -- and computing them meant a further host round trip in the
-   * middle of the statistics pipeline. Upstream has neither: it keeps an
-   * AutoStatsGPU on the device and its inference kernel reads it there
-   * ("Stats remain on GPU", gpucompress_compress.cpp:281). This restores that.
+   * Not an override: the CompressionPredictor interface is shared with models
+   * that have no device path, and widening it for one would put a CUDA concept
+   * in everyone's way. PredictBatch takes a host-built [n][8] matrix, so the
+   * chunk's statistics would have to be copied down first; upstream instead
+   * keeps them on the device and reads them there, which this restores.
    *
    * Inputs 5-7 are taken from `device_stats`, NOT from `batch` -- the entropy,
-   * MAD and second-derivative fields of the passed features are ignored, and
-   * callers need not populate them. Everything else (algorithm, the two
-   * preprocessor bits, the error bound, the chunk size) is host knowledge and
-   * still comes from `batch`.
+   * MAD and second-derivative fields of the passed features are ignored.
+   * Everything else (algorithm, the two preprocessor bits, the error bound, the
+   * chunk size) is host knowledge and still comes from `batch`.
    *
    * @param device_stats Device pointer from ctp::ComputeDeviceStatsResident().
    * @param batch Candidates, as for PredictBatch. Must be non-empty; every
    *   entry's chunk_size_bytes must agree (they describe one chunk).
    * @param stream The stream the statistics were enqueued on --
    *   ctp::DeviceStatsStream(). Passing another breaks the GPU-side chaining.
-   * @return Predictions, or EMPTY on failure. Never a zero-filled vector.
-   */
-  /**
    * @param weights,out_order Optional. When both are given and the cost model
-   *   is on, the cost, the argmax and the ORDERING are computed on the GPU too
-   *   -- one warp, upstream's own bitonic network (nn_gpu.cu:499-532) -- and
-   *   out_order comes back holding candidate slots best-first. Upstream ranks
-   *   inside its inference kernel and never returns an unranked candidate set,
-   *   so leaving this to the host was the last stage of the decision that
-   *   crossed back. Omit them for a pure inference call; the ordering is then
-   *   the caller's problem, as before.
+   *   is on, the cost, the argmax and the ordering are computed on the GPU too
+   *   -- upstream's own bitonic network -- and out_order comes back holding
+   *   candidate slots best-first. Omit them for a pure inference call.
+   * @return Predictions, or EMPTY on failure. Never a zero-filled vector.
    */
   std::vector<CompressionPrediction> PredictBatchDeviceStats(
       const void* device_stats,
@@ -233,33 +212,11 @@ class NeuroPressNNPredictor : public CompressionPredictor {
       std::vector<double>* out_scores = nullptr);
 
   /**
-   * @brief Online SGD update from real (predicted vs. actual) outcomes.
-   *
-   * Ports NeuroPress's nnSGDKernel (src/nn/nn_gpu.cu) to plain scalar CPU
-   * code: per-sample forward pass, log1p-encoded clamped targets, noise
-   * gating, uncertainty weighting (Kendall et al. 2018 log-variance),
-   * per-output backward passes with PCGrad-lite gradient-conflict
-   * projection and per-output gradient clipping, trust-region step sizing,
-   * EMA-smoothed updates with anti-flip damping, and weight clamping.
-   * All of that state (log-variance, EMA gradient, call count) lives in
-   * device memory for the handle's lifetime, exactly as the original's
-   * NNWeightsGPU does across kernel launches.
-   *
-   * @param features Per-sample candidate features (up to 8 per call,
-   *   matching NeuroPress's NN_MAX_SGD_SAMPLES batch size -- extra
-   *   samples beyond the first 8 are ignored, matching upstream's own
-   *   truncation).
-   * @param labels Per-sample real outcomes, same length as features.
-   * @return true if the weight update was applied (false if not ready,
-   *   inputs are malformed, or the computed gradient/step was non-finite
-   *   and the update was safely skipped).
-   */
-  /**
    * @brief Set the online-SGD learning rate.
    *
    * Non-positive values are IGNORED, not applied -- upstream guards the
    * same way (`if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;`,
-   * gpucompress_learning.cpp:200), so a caller passing 0 leaves the default
+   * gpucompress_learning.cpp), so a caller passing 0 leaves the default
    * intact rather than disabling learning.
    */
   void SetLearningRate(float learning_rate) {
@@ -269,27 +226,41 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   /** @brief Current online-SGD learning rate. */
   float GetLearningRate() const { return learning_rate_; }
 
+  /**
+   * @brief Online SGD update from real (predicted vs. actual) outcomes.
+   *
+   * Ports NeuroPress's nnSGDKernel: per-sample forward pass, log1p-encoded
+   * clamped targets, noise gating, uncertainty weighting (Kendall et al. 2018
+   * log-variance), per-output backward passes with PCGrad-lite gradient
+   * projection and per-output clipping, trust-region step sizing, EMA-smoothed
+   * updates with anti-flip damping, and weight clamping. That state lives in
+   * device memory for the handle's lifetime, as upstream's NNWeightsGPU does.
+   *
+   * Leaves output 1's head weights alone -- see TrainDecompHead().
+   *
+   * @param features Per-sample candidate features. Up to NN_MAX_SGD_SAMPLES (8)
+   *   per call; extras are ignored, matching upstream's own truncation.
+   * @param labels Per-sample real outcomes, same length as features.
+   * @return true if the update was applied; false if not ready, inputs are
+   *   malformed, or the computed gradient was non-finite and safely skipped.
+   */
   bool Train(const std::vector<CompressionFeatures>& features,
             const std::vector<TrainingLabels>& labels) override;
 
   /**
    * @brief Deferred, head-only SGD for the DEcompression-time output.
    *
-   * Port of NeuroPress's nnBatchedDecompSGDKernel (src/nn/nn_gpu.cu) and its
-   * driver gpucompress_batched_decomp_sgd() (src/api/gpucompress_learning.cpp).
+   * Port of NeuroPress's nnBatchedDecompSGDKernel and its driver.
    *
-   * Decompression time is the one label that cannot be known when the data is
-   * compressed -- only a later read reveals it, possibly much later, possibly
-   * never. So upstream splits it out: Train() above deliberately leaves output
-   * 1's head weights alone (`if (out == 1) continue;`), and this batched pass
-   * owns them, fed by real measured times joined back to the features the
-   * prediction was originally made from.
+   * Decompression time is the one label unknowable at compress time -- only a
+   * later read reveals it, possibly never. Upstream therefore splits it out:
+   * Train() leaves output 1's head weights alone, and this batched pass owns
+   * them, fed by measured times joined back to the features the prediction was
+   * originally made from.
    *
-   * Updates ONLY w5 row 1 and b5[1]. The trunk (W1-W4) is read-only here --
-   * a decompression-time miss must not perturb the shared representation the
-   * other three heads depend on.
-   *
-   * Uses its own trust region, deliberately different from Train()'s:
+   * Updates ONLY w5 row 1 and b5[1]; the trunk is read-only here, so a
+   * decompression-time miss cannot perturb the representation the other three
+   * heads depend on. Uses its own trust region, deliberately unlike Train()'s:
    * step = clamp(0.15 * mean|err|, 1e-4, 0.05), weights clamped to +-5.
    *
    * @param features Per-sample features, as originally predicted from.
@@ -318,28 +289,20 @@ class NeuroPressNNPredictor : public CompressionPredictor {
 
  private:
   /**
-   * @brief Build the 8-input NeuroPress vector from CompressionFeatures.
+   * @brief Build the 8-element NN input from CompressionFeatures.
    *
-   * Maps: library_config_id → algo_id (0-7, exact for NeuroPress's 8 trained
-   * nvcomp algorithms, best-effort fallback otherwise -- see
-   * NeuroPressAlgoIdForBaseId() in the .cc); quant/shuffle/error_bound
-   * passed through; data_size, entropy, mad, second_derivative as-is.
+   * Maps library_config_id to an algo_id (0-7, exact for the 8 trained nvcomp
+   * algorithms -- see NeuroPressAlgoIdForBaseId()); quantize, byte_shuffle and
+   * error_bound pass through; data_size, entropy, mad and second_derivative are
+   * used as-is.
    *
    * @param features Input features.
-   * @return 8-element vector in NeuroPress order.
-   */
-  /**
-   * @brief Build the 8-element NN input.
-   *
    * @param apply_lossless_sentinel Substitute 1e-7 for a lossless config's
-   *   error bound. TRUE only for INFERENCE: upstream applies the sentinel in
-   *   nnFusedInferenceKernel (nn_gpu.cu:144, "training used 1e-7 sentinel for
-   *   lossless") and NOWHERE else. Both SGD kernels feed the RAW bound --
-   *   nnSGDKernel's `raw[3] = eb_enc` under the comment "Use raw values for
-   *   error_bound and data_size (no log encoding)" (:85), and
-   *   nnBatchedDecompSGDKernel's `raw[3] = samp.error_bound_enc` -- so every
-   *   training path must pass false or it trains against an input the
-   *   original never builds.
+   *   error bound. TRUE only for INFERENCE -- upstream applies the sentinel in
+   *   its inference kernel and nowhere else; both SGD kernels feed the RAW
+   *   bound, so every training path must pass false or it trains against an
+   *   input upstream never builds.
+   * @return 8-element vector in NeuroPress order.
    */
   std::vector<float> FeaturesTo8Input(
       const CompressionFeatures& features,
@@ -351,7 +314,7 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   static constexpr uint32_t kOutputDim = 8;
   static constexpr uint32_t kNumLayers = 5;  // 4 hidden + 1 output
   /** Upstream's NN_MAX_SGD_SAMPLES: samples past the first 8 are dropped,
-   *  matching its own truncation (nn_weights.h:17). */
+   *  matching its own truncation (nn_weights.h). */
   static constexpr int kMaxSGDSamples = 8;
 
   // Normalization parameters.
@@ -379,7 +342,7 @@ class NeuroPressNNPredictor : public CompressionPredictor {
 
   /**
    * Online-SGD learning rate -- Clio's stand-in for NeuroPress's
-   * g_reinforce_lr global (gpucompress_api.cpp:102), which upstream passes
+   * g_reinforce_lr global (gpucompress_api.cpp), which upstream passes
    * to runNNSGD on every call and exposes via gpucompress_set_reinforcement().
    * Held per-predictor rather than globally so two predictors cannot fight
    * over it; set from CompressorConfig at load time.
@@ -389,19 +352,15 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   /**
    * Serializes every writer of the model state against every other.
    *
-   * NeuroPress takes g_sgd_mutex around each SGD dispatch
-   * (gpucompress_compress.cpp:719 and :1021, gpucompress_learning.cpp:100),
-   * runs all SGD on a dedicated stream, and makes inference wait on a
-   * completion event before reading the weights (nn_gpu.cu:1951-1958).
+   * Upstream takes a mutex around each SGD dispatch, runs all SGD on a
+   * dedicated stream, and makes inference wait on a completion event.
    *
-   * Clio needs this for a sharper reason than upstream does. Upstream's
-   * decompression-head update is a device kernel touching only w5[1] and
-   * b5[1]; Clio's TrainDecompHead is a host-side read-modify-write that
-   * downloads ALL parameters, edits two of them, and uploads everything
-   * back. A Train() landing inside that window is silently reverted --
-   * the upload writes a pre-Train snapshot of the entire trunk. Train()
-   * and TrainDecompHead() run from different runtime tasks (DynamicSchedule
-   * and Decompress), so the window is reachable.
+   * Clio needs this more sharply: upstream's decompression-head update is a
+   * device kernel touching only w5[1] and b5[1], while TrainDecompHead is a
+   * host-side read-modify-write that downloads ALL parameters, edits two, and
+   * uploads everything back. A Train() landing in that window is silently
+   * reverted. The two run from different runtime tasks (DynamicSchedule and
+   * Decompress), so the window is reachable.
    *
    * Held by shared_ptr, not by value: this class keeps its defaulted
    * copy/move constructors (a copy shares the device weight handle), and a

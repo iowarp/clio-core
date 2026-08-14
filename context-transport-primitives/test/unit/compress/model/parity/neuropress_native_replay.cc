@@ -46,7 +46,7 @@
 // Measured directly against nvcomp rather than through
 // gpucompress_decompress_gpu. That API call also does
 // createDecompressionManager, configure_decompression and a cudaMalloc
-// before it launches anything (gpucompress_compress.cpp:1234-1246), so
+// before it launches anything (gpucompress_compress.cpp), so
 // bracketing it measures setup, not the codec -- which is why an earlier
 // attempt showed a 270 ms outlier and made native look four times slower
 // than Clio. Clio brackets exactly its mgr->decompress() call, so this
@@ -362,7 +362,7 @@ int main(int argc, char **argv) {
       size_t dec_size = kChunkBytes;
       // CUDA-event bracket around the decompress call, the same shape
       // NeuroPress uses for its own compress timing
-      // (gpucompress_compress.cpp:530-551) and the same shape Clio's
+      // (gpucompress_compress.cpp) and the same shape Clio's
       // KernelTimer uses, so the two decompress numbers mean the same thing.
       cudaEvent_t dstart = nullptr, dstop = nullptr;
       cudaEventCreate(&dstart);

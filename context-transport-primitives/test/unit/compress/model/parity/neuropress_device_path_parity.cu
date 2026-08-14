@@ -16,7 +16,7 @@
  * runStatsKernelsNoSync returns an AutoStatsGPU* and gpucompress_infer_gpu
  * passes that device pointer to the network ("Stats remain on GPU -- NN
  * inference reads d_stats_ptr directly on device",
- * gpucompress_compress.cpp:281). Clio's original path returned host doubles,
+ * gpucompress_compress.cpp). Clio's original path returned host doubles,
  * so it copied the histogram and scalars down, summed the entropy in a host
  * loop, and uploaded a feature matrix back.
  *
@@ -294,7 +294,7 @@ int main() {
     // ---- Ranking: the GPU order must equal the host ScoreAndSort order.
     //
     // This moved from the host to a kernel, so the thing to prove is that it
-    // decides the SAME thing -- upstream ranks in-kernel (nn_gpu.cu:499-532)
+    // decides the SAME thing -- upstream ranks in-kernel (nn_gpu.cu)
     // and Clio now does too, but a reordering here would silently change which
     // algorithm every chunk is compressed with.
     {
@@ -428,7 +428,7 @@ int main() {
     cudaFree(d_data);
   }
 
-  // ---- The two -INFINITY masks, applied in-kernel as nn_gpu.cu:238-239 does.
+  // ---- The two -INFINITY masks, applied in-kernel as nn_gpu.cu does.
   //
   // Upstream evaluates all 32 configs every time and masks rather than
   // omitting, so the properties to check are: a masked action never outranks
@@ -550,7 +550,7 @@ int main() {
   //
   // Upstream never answers from the host: a null d_stats_ptr or a failed
   // inference both end the call with GPUCOMPRESS_ERROR_NN_NOT_LOADED
-  // (gpucompress_compress.cpp:285 and :208-212), and there is no CPU
+  // (gpucompress_compress.cpp and :208-212), and there is no CPU
   // implementation of the network in that project to fall back to. The device
   // entry points here must therefore REFUSE rather than quietly produce an
   // answer some other way -- a host-computed ranking would be indistinguishable
@@ -576,7 +576,7 @@ int main() {
           "empty candidate set -> empty");
 
     // A zero-element chunk: upstream refuses it outright rather than
-    // producing statistics for it (gpucompress_compress.cpp:274).
+    // producing statistics for it (gpucompress_compress.cpp).
     float *d_tiny = nullptr;
     cudaMalloc(&d_tiny, sizeof(float));
     Check(ctp::ComputeDeviceStatsResident(d_tiny, 0, ctp::DataType::FLOAT32,

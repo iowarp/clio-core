@@ -66,7 +66,7 @@ class Compressor {
  * copy along with the kernel -- fine for accounting wall time, useless for
  * comparing against another implementation's kernel time. NeuroPress
  * brackets exactly its `compressor->compress(...)` call
- * (gpucompress_compress.cpp:530-551), so this brackets exactly the
+ * (gpucompress_compress.cpp), so this brackets exactly the
  * equivalent one and the two numbers mean the same thing.
  *
  * Thread-local: each worker times its own call, and the value is only valid

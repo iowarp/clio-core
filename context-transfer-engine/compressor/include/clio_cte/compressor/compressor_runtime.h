@@ -269,7 +269,7 @@ private:
   std::unique_ptr<DenseNNPredictor> nn_predictor_;
 #endif
 
-  // NeuroPress NN predictor (issue #693 Cycle 3). Consulted first in
+  // NeuroPress NN predictor (issue #693). Consulted first in
   // EstCompressionStats()'s dynamic-selection path when loaded/ready --
   // it ranks the full clio_ctp::compress::model candidate set (CPU + GPU),
   // not just the legacy 5-candidate hardcoded list qtable/nn_predictor
@@ -404,7 +404,7 @@ private:
   // That case is NOT "no compression available" -- upstream treats it as a
   // failed write. gpucompress_compress_gpu returns
   // GPUCOMPRESS_ERROR_NN_NOT_LOADED on a null d_stats_ptr or a failed inference
-  // (gpucompress_compress.cpp:285, :208-212); the VOL turns that into
+  // (gpucompress_compress.cpp, :208-212); the VOL turns that into
   // worker_err = -1 (H5VLgpucompress.cu:2057), which becomes the function's
   // return value (:2463) and then H5Dwrite's (:3542). It never stores the chunk
   // by another route. Callers should propagate rather than degrade.

@@ -85,7 +85,7 @@ TEST_CASE("StageInputIfNeeded copies for a CPU library, "
 //
 // NeuroPress does NOT build an nvcomp manager per compression. It keeps a
 // small LRU of them per context, keyed by algorithm
-// (gpucompress_pool.cpp:236-271, CompContext::LRU_DEPTH = 3), on a persistent
+// (gpucompress_pool.cpp, CompContext::LRU_DEPTH = 3), on a persistent
 // stream, and counts hits and misses. That matters for two reasons: manager
 // construction is typically hundreds of microseconds against compress kernels
 // of tens, and -- because Runtime::Compress times the codec call to produce

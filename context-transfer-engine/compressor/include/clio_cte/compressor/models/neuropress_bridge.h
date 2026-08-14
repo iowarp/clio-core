@@ -70,15 +70,11 @@ namespace clio::cte::compressor {
  * @param second_derivative_mean Mean second derivative (curvature).
  * @param data_type_float True if the chunk is floating-point data.
  * @return Candidate stats, best-first (mirrors Rank()'s ordering). Always
- *   restricted to NeuroPress's actual trained action space -- the 8
- *   GPU-lossless nvcomp algorithms (LZ4/Snappy/Deflate/GDeflate/Zstd/ANS/
- *   Cascaded/Bitcomp). No CPU library and none of zfp-sycl/cuSZ/nDzip/cuSZp
- *   are ever included: none of those were part of the trained action space
- *   in the original NeuroPress project either (see the .cc for the
- *   decodeAction cross-reference), so a "prediction" for one of them would
- *   only ever be an alias of some other algorithm's real prediction, not a
- *   genuine learned opinion. They remain reachable through explicit/static
- *   selection, just not through this ranked, dynamic path.
+ *   restricted to NeuroPress's trained action space -- the 8 GPU-lossless
+ *   nvcomp algorithms. A CPU library or one of the extra GPU codecs was never
+ *   in that space upstream either, so a "prediction" for one would be an alias
+ *   of another algorithm's. They stay reachable through explicit selection,
+ *   just not through this dynamic path.
  */
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
@@ -91,28 +87,20 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
  * DEVICE memory instead of receiving them as host doubles.
  *
  * Identical candidate set, cost model and tie-breaking -- it shares one body
- * with the function above, and the scoring/sort step is literally the same
- * code. The only difference is where inputs 5-7 of the feature vector come
- * from, and therefore whether the chunk's statistics have to make a round trip
- * through host memory to reach the model.
- *
- * That round trip is what upstream does not have: gpucompress_infer_gpu keeps
- * an AutoStatsGPU on the device and hands the pointer to its inference kernel
- * ("Stats remain on GPU -- NN inference reads d_stats_ptr directly on device",
- * gpucompress_compress.cpp:281). Use this whenever the chunk is
- * device-resident, which is the only situation upstream ever operates in.
+ * with the function above. The only difference is where inputs 5-7 of the
+ * feature vector come from, and therefore whether the chunk's statistics have
+ * to round-trip through host memory to reach the model. Upstream has no such
+ * round trip, so use this whenever the chunk is device-resident.
  *
  * Falls back to the host ranking internally if device inference fails, so the
  * caller never has to handle a half-finished selection.
  *
- * Deliberately takes no entropy/MAD/second-derivative arguments. They would
- * have to be read back before this call to be passed, and that read is a
- * stream synchronization -- placing it BEFORE the inference would reinstate
- * exactly the stall this path exists to remove. They are also provably
- * unnecessary: RankingWeights::Score consumes only the prediction and the
- * chunk size, and the network takes its copies from `device_stats`. Callers
- * wanting the numbers for a log should call ctp::ReadDeviceFeatureStats()
- * AFTER this returns, when the stream is already idle and the read is free.
+ * Deliberately takes no entropy/MAD/second-derivative arguments: reading them
+ * back to pass them is a stream synchronization, and doing that BEFORE the
+ * inference would reinstate the stall this path exists to remove. They are
+ * also unnecessary -- Score() consumes only the prediction and the chunk size,
+ * and the network reads its own copies from `device_stats`. For a log, call
+ * ctp::ReadDeviceFeatureStats() AFTER this returns, when the stream is idle.
  *
  * @param device_stats Device pointer from ctp::ComputeDeviceStatsResident().
  * @param stream The stream those statistics were enqueued on

@@ -58,7 +58,7 @@ struct CompressorConfig {
   std::string linreg_model_path_;
   std::string distribution_model_path_;
   std::string dnn_model_weights_path_;
-  // Directory of a trained NeuroPress NN's .nnwt weights (issue #693 Cycle
+  // Directory of a trained NeuroPress NN's .nnwt weights (issue #693
   // 3). Loaded once at Create() time and consulted by EstCompressionStats()'s
   // dynamic-selection path (compressor_runtime.cc) whenever set.
   std::string neuropress_model_path_;
@@ -72,7 +72,7 @@ struct CompressorConfig {
   // weights drift out from under it.
   bool neuropress_online_learning_enabled_ = false;
   // MAPE (mean absolute percentage error, weighted-cost) threshold that
-  // gates online SGD after a real compress (issue #693 Cycle 4f). Mirrors
+  // gates online SGD after a real compress (issue #693). Mirrors
   // NeuroPress's own g_reinforce_mape_threshold / GPUCOMPRESS_MAPE_LOW_THRESH
   // (default 0.30 = 30%, gpucompress_api.cpp): training only fires when the
   // model's prediction for the chunk actually compressed was wrong by more
@@ -83,17 +83,17 @@ struct CompressorConfig {
   float neuropress_mape_threshold_ = 0.30f;
   /**
    * Online-SGD learning rate. Mirrors NeuroPress's g_reinforce_lr
-   * (gpucompress_api.cpp:102, default 0.01f), which is settable at runtime
+   * (gpucompress_api.cpp, default 0.01f), which is settable at runtime
    * through gpucompress_set_reinforcement(). Only the main SGD kernel
-   * consumes it -- `lr_out = learning_rate * clip_scale` (nn_gpu.cu:1242).
+   * consumes it -- `lr_out = learning_rate * clip_scale` (nn_gpu.cu).
    * The deferred decompression-head pass takes the value but never uses it:
    * its step comes entirely from its own trust region.
    *
    * Values <= 0 are ignored rather than applied, matching upstream's
-   * `if (learning_rate > 0.0f)` guard (gpucompress_learning.cpp:200).
+   * `if (learning_rate > 0.0f)` guard (gpucompress_learning.cpp).
    */
   float neuropress_learning_rate_ = 0.01f;
-  // Cycle 4g: K-way exploration. Off by default, matching NeuroPress's own
+  // K-way exploration. Off by default, matching NeuroPress's own
   // g_exploration_enabled{false} -- an opt-in, not the normal route. When
   // enabled and error_pct (the same metric Phase 1 above uses) crosses this
   // HIGHER threshold (default 0.50, mirrors g_exploration_threshold /

@@ -442,7 +442,7 @@ TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
 }
 
 /**
- * Test Case 3b (issue #693 Cycle 3): with a NeuroPress model configured,
+ * Test Case 3b (issue #693): with a NeuroPress model configured,
  * DynamicSchedule must actually consult clio_ctp::compress::model's wider
  * candidate set (11 CPU compressors x 3 presets via NeuroPressCandidateStats)
  * instead of silently continuing to use the old 4-library hardcoded
@@ -463,7 +463,7 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
   CTETestFixture fixture;
 
   // Point a second, separately-configured compressor pool at the same
-  // trained NeuroPress weights Cycle 1/3's other tests already validated,
+  // trained NeuroPress weights the other tests already validate,
   // instead of the fixture's default (unconfigured) compressor pool.
   CompressorConfig config;
   config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_WEIGHTS_DIR;

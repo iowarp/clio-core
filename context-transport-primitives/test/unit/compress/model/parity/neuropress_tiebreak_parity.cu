@@ -11,19 +11,19 @@
  *
  * Ties are not a corner case here, they are routine. Both sides clamp hard
  * before ranking -- compression and decompression times floor at 1 ms and
- * the ratio caps at 100x (nn_gpu.cu:227-230) -- so on compressible data a
+ * the ratio caps at 100x (nn_gpu.cu) -- so on compressible data a
  * whole group of candidates saturates to a bit-identical cost. Which one
  * then wins is decided purely by position, and the two sides arrive at
  * position differently:
  *
- *   upstream  a bitonic ranking network over the 32 configs (nn_gpu.cu:344,
+ *   upstream  a bitonic ranking network over the 32 configs (nn_gpu.cu,
  *             :497) built from strict comparators, so it never swaps equal
  *             keys and the LOWEST action index survives.
  *   here      std::stable_sort over the candidate vector (predictor.h:382),
  *             so the FIRST ENUMERATED survives.
  *
  * Those agree only if Clio enumerates in ascending action-index order.
- * decodeAction (internal.hpp:167-172) numbers an action
+ * decodeAction (internal.hpp) numbers an action
  *
  *     algo + 8*quant + 16*shuffle
  *
@@ -320,7 +320,7 @@ struct NativeInfer {
     int rc = gpucompress::runNNFusedInferenceCtx(
         d_stats, c.size_bytes, error_bound, stream, &ctx, &action, &ratio,
         &ct, &dt, &psnr, top, costs);
-    // runNNFusedInferenceCtx RETURNS the action (nn_gpu.cu:2265), so a
+    // runNNFusedInferenceCtx RETURNS the action (nn_gpu.cu), so a
     // negative return is the only failure signal; a zero return is action 0.
     return (rc < 0) ? -1 : action;
   }

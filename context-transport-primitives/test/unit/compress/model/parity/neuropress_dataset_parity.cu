@@ -27,7 +27,7 @@
  *   compared directly.
  *
  * Every chunk is run at several error bounds. At error_bound = 0 upstream
- * masks every quantize action to -INFINITY (nn_gpu.cu:238) and the two
+ * masks every quantize action to -INFINITY (nn_gpu.cu) and the two
  * sides range over algorithm x byte-shuffle; at a nonzero bound the
  * quantize half becomes selectable and both sides range over the full
  * algorithm x quantize x byte-shuffle space. Statistics do not depend on
@@ -225,7 +225,7 @@ int main(int argc, char **argv) {
   // Clio's candidate set, built exactly as neuropress_bridge.cc builds it.
   //
   // Order matters. NeuroPress's action space is algo + 8*quant + 16*shuffle
-  // (decodeAction, internal.hpp:167-172) and its bitonic ranking network
+  // (decodeAction, internal.hpp) and its bitonic ranking network
   // uses strict comparators, so it never swaps equal keys and returns the
   // LOWEST action index on a tie. Clio reproduces that with stable_sort --
   // first enumerated wins -- which only holds if enumeration runs in
@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
   //
   // The quant skip is Clio's form of upstream's mask
   // "quant == 1 && error_bound <= 0.0 -> rank_val = -INFINITY"
-  // (nn_gpu.cu:238); the bridge applies the same rule at
+  // (nn_gpu.cu); the bridge applies the same rule at
   // neuropress_bridge.cc:183.
   auto BuildCandidates = [](double eb) {
     std::vector<CandidateConfig> cands;
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
       chosen.byte_shuffle = (n_shuf != 0);
       // Mirrors BuildCandidates: a lossless config carries no bound, and
       // FeaturesTo8Input substitutes the 1e-7 sentinel for it, exactly as
-      // nnInferenceKernel does at nn_gpu.cu:144.
+      // nnInferenceKernel does at nn_gpu.cu.
       chosen.error_bound = (n_quant != 0) ? eb : 0.0;
       CompressionFeatures f = MakeCompressionFeatures(data, chosen);
       auto p = clio.Predict(f);

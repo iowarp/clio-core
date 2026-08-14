@@ -77,18 +77,13 @@ using clio::run::Worker;
  * Byte-shuffle element size packed into the free high bits of
  * compress_preset_.
  *
- * NeuroPress's action space is algorithm x quantize x byte-shuffle
- * (internal.hpp's decodeAction), and with error_bound=0 its own ranking masks
- * every quantize action to -INFINITY -- so byte-shuffle is the ONLY extra
- * dimension a lossless deployment can reach, and Clio not applying it made
- * half of upstream's reachable actions unreachable here (the parity harness
- * shows native selecting actions 20/21/23, all shuffle=1).
+ * With error_bound=0 upstream's ranking masks every quantize action, so
+ * byte-shuffle is the only extra dimension a lossless deployment can reach.
  *
- * Packed rather than added as a field because CompressionHeader is a fixed
- * 24 bytes by static_assert and is the on-disk format: growing it would make
- * every already-compressed blob unreadable. compress_preset_ only ever holds
- * 0-3, so the upper bits are free, and a blob written before this change
- * decodes to elem_size 0 -- "not shuffled" -- which is exactly right.
+ * Packed rather than added as a field: CompressionHeader is a fixed 24 bytes by
+ * static_assert and is the on-disk format, so growing it would strand every
+ * existing blob. compress_preset_ only ever holds 0-3, leaving the upper bits
+ * free, and an older blob decodes to elem_size 0 -- "not shuffled".
  */
 constexpr uint32_t kPresetMask = 0xFFu;
 constexpr uint32_t kShuffleShift = 8;
@@ -97,22 +92,14 @@ constexpr uint32_t kShuffleMask = 0xFFu;
 /**
  * Format version, in bits 16-23 of the same word.
  *
- * NeuroPress carries an explicit `uint32_t version` and gates acceptance on
- * it (compression_header.h:57, isValid() requires `version >= 1 && version
- * <= COMPRESSION_HEADER_VERSION`), so a reader refuses a layout it does not
- * understand instead of misparsing it. Clio's header had no such field and
- * IsValid() checked only the magic -- meaning any future change to what the
- * bytes mean would be read by an older binary as if nothing had changed.
+ * Upstream gates acceptance on an explicit version so a reader refuses a
+ * layout it does not understand instead of misparsing it. There is no room for
+ * a dedicated field here (24 bytes, on-disk format), but compress_preset_ uses
+ * only bits 0-15, so bits 16-23 are free. An older blob decodes to version 0,
+ * which is exactly right: it IS the original format.
  *
- * There is no room left for a dedicated field (the struct is a full 24 bytes
- * and is the on-disk format), but compress_preset_ only ever uses bits 0-7
- * for the preset and 8-15 for the shuffle element size, so bits 16-23 are
- * free. A blob written before this existed decodes to version 0, which is
- * exactly right: it IS the original format.
- *
- * Bump kFormatVersion whenever the meaning of any header field or of the
- * bytes that follow changes. Readers accept anything up to their own
- * version and reject what is newer.
+ * Bump kFormatVersion whenever the meaning of any header field, or of the bytes
+ * that follow, changes. Readers accept up to their own version and reject newer.
  */
 constexpr uint32_t kVersionShift = 16;
 constexpr uint32_t kVersionMask = 0xFFu;
@@ -137,19 +124,16 @@ inline uint32_t UnpackVersion(uint32_t packed) {
  * bit 24    : quantize applied
  * bits 25-26: precision code (0 = int8, 1 = int16, 2 = int32)
  *
- * Upstream keeps the equivalent in its own quant_flags field
- * (compression_header.h:58, "bits [0-3]=type, [4-7]=precision, [8]=enabled")
- * and has room for it because its header is 64 bytes. Clio's is 24 and
- * fixed, so the flags ride here and the four doubles upstream stores
- * (quant_error_bound, quant_scale, data_min, data_max) go in a header
- * EXTENSION appended only when quantization actually ran -- see
- * QuantHeaderExtension. Type is not encoded because LINEAR is the only
- * quantizer either side implements.
+ * Upstream keeps the equivalent in a quant_flags field, with room for it
+ * because its header is 64 bytes. Clio's is 24 and fixed, so the flags ride
+ * here and the four doubles that make the transform invertible go in a header
+ * EXTENSION appended only when quantization ran -- see QuantHeaderExtension.
+ * Type is not encoded because LINEAR is the only quantizer either side has.
  */
 /**
  * @brief Analytical PSNR for linear quantization, verbatim from upstream.
  *
- * gpucompress_compress.cpp:37-41 -- expected MSE for uniform error in
+ * gpucompress_compress.cpp -- expected MSE for uniform error in
  * [-eb, eb] is eb^2/3, so PSNR = 10*log10(range^2 / MSE), capped at 120 dB.
  * Returns -1 for a degenerate range or bound, which is upstream's "PSNR
  * undefined" sentinel and the value that makes the SGD skip the head.
@@ -209,22 +193,16 @@ struct CompressionHeader {
    * Compressed payload length in bytes, excluding this header. 0 = "not
    * recorded", for blobs written before this field existed.
    *
-   * NeuroPress carries the same thing (compression_header.h:64,
-   * `uint64_t compressed_size; // Size of compressed data (after header)`)
-   * and reads it straight out of the blob, bounds-checking it against the
-   * buffer it was handed (gpucompress_compress.cpp:1199-1202) -- a bad value
-   * is GPUCOMPRESS_ERROR_INVALID_HEADER, never a guess. Without it Clio had
-   * to derive the length by subtracting the header from an AsyncGetBlobSize
-   * RPC, and fall back to the caller's LOGICAL size when that query failed
-   * -- which over-reads past the real stream into uninitialized memory and,
-   * for LZ4, surfaces as success with a garbage size (see Decompress()).
+   * Upstream carries the same field and bounds-checks it against the buffer it
+   * was handed -- a bad value is an invalid header, never a guess. Without it
+   * the length has to be derived from a blob-size RPC, falling back to the
+   * caller's LOGICAL size when that fails, which over-reads past the real
+   * stream into uninitialized memory (see Decompress()).
    *
-   * uint32_t, not uint64_t, because it lives in the 4 padding bytes the
-   * struct already wasted between compress_preset_ and original_size_: the
-   * header is the on-disk format and is static_assert-ed at 24 bytes, so
-   * growing it would strand every existing blob. A chunk large enough to
-   * overflow 32 bits is far beyond anything this path compresses (HDF5
-   * chunks here are single-digit MB), and IsValid() rejects the case anyway.
+   * uint32_t because it lives in the 4 padding bytes already wasted between
+   * compress_preset_ and original_size_: the header is the on-disk format,
+   * static_assert-ed at 24 bytes. A chunk large enough to overflow 32 bits is
+   * far beyond this path, and IsValid() rejects that case anyway.
    */
   uint32_t compressed_size_;
   uint64_t original_size_;    // Original uncompressed size
@@ -403,7 +381,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
 #endif  // CLIO_COMPRESSOR_ENABLE_DENSE_NN
 
-  // Load NeuroPress NN model if configured (issue #693 Cycle 3). Consulted
+  // Load NeuroPress NN model if configured (issue #693). Consulted
   // first in EstCompressionStats()'s dynamic-selection path -- see there.
   if (!config_.neuropress_model_path_.empty()) {
     try {
@@ -415,22 +393,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       if (neuropress_predictor_->Load(config_.neuropress_model_path_)) {
         HLOG(kDebug, "NeuroPress NN model loaded successfully");
       } else {
-        // A non-empty neuropress_model_path_ IS the user asking for
-        // NeuroPress. It has no CPU path -- upstream's network exists only as
-        // CUDA kernels and any failure there ends the call
-        // (GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:208-212)
-        // -- so a load failure means the thing that was asked for cannot run.
-        //
-        // Fail the pool rather than continue. Resetting the pointer and
-        // carrying on (what this used to do) left every subsequent write
-        // silently selected by the legacy heuristics: a different model,
-        // reached without anyone asking, and indistinguishable downstream
-        // from a NeuroPress decision.
-        //
-        // This is scoped to the case where NeuroPress was REQUESTED. A
-        // deployment that does not configure it is untouched, and every other
-        // compressor Clio offers -- including all the CPU ones -- keeps
-        // working exactly as before.
+        // NeuroPress has no CPU path -- upstream's network exists only as CUDA
+        // kernels -- so a load failure means the requested model cannot run.
+        // Fail the pool rather than fall back: a legacy-heuristic selection is
+        // indistinguishable downstream from a NeuroPress one. Deployments that
+        // do not configure NeuroPress are unaffected.
         HLOG(kError,
              "NeuroPress was requested (model path '{}') but could not be "
              "loaded. It has no CPU implementation, so it will not be "
@@ -587,20 +554,12 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
                                  neuropress_predictor_ &&
                                  neuropress_predictor_->IsReady();
 
-  // Element type for the statistics. NeuroPress has exactly ONE
-  // interpretation -- `num_elements = input_size / sizeof(float)`, hardcoded
-  // at stats_kernel.cu:306 and gpucompress_compress.cpp:273, with the
-  // reduction kernel typed `const float*` and no data-type parameter
-  // anywhere in its stats or NN path. The shipped model.nnwt was normalized
-  // against float32 statistics (x_means[6]=0.189, x_maxs[6]=0.500 for MAD).
-  //
-  // Reading the same bytes as uint8 puts MAD 300-750 sigma outside the
-  // training range and reduces the second derivative to a near-uniform walk
-  // over mantissa bytes, i.e. no signal at all -- and context.data_type_
-  // defaults to 0, so that was the DEFAULT behavior. Match NeuroPress
-  // unconditionally when it is the one ranking. The legacy qtable/dense-NN
-  // path keeps the old context-driven mapping: those models were fit on
-  // Clio's own features, not NeuroPress's.
+  // NeuroPress reads every chunk as float32: its statistics kernel is typed
+  // `const float*` with no data-type parameter, and the shipped model.nnwt was
+  // normalized against float32 statistics. Reading the same bytes as uint8 puts
+  // MAD hundreds of sigma outside the training range. The legacy qtable/dense-NN
+  // path keeps the context-driven mapping -- those models were fit on Clio's own
+  // features, not NeuroPress's.
   ctp::DataType data_type =
       neuropress_active
           ? ctp::DataType::FLOAT32
@@ -608,16 +567,10 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
                                        : ctp::DataType::UINT8);
   size_t type_size = ctp::DataStatisticsFactory::GetTypeSize(data_type);
 
-  // Whole chunk, not a prefix. NeuroPress computes entropy/MAD/second-
-  // derivative by grid-striding the ENTIRE buffer (stats_kernel.cu,
-  // entropy_kernel.cu), and the shipped model was normalized against
-  // whole-chunk statistics (x_means[4] ~ 1.4 MB). Sampling only the first
-  // 64 KB fed the model prefix statistics paired with the FULL chunk_size
-  // as the size feature -- a combination that never occurs in training, and
-  // badly wrong for any chunk with a header, a zero-padded prologue, or
-  // spatially varying structure. Since every candidate is scored from these
-  // same three numbers, an error here shifts the whole ranking, not one
-  // entry.
+  // Whole chunk, not a prefix: NeuroPress grid-strides the entire buffer and
+  // the model was normalized against whole-chunk statistics. Prefix statistics
+  // paired with the full chunk_size never occur in training, and every
+  // candidate is scored from these same three numbers.
   size_t num_elements = static_cast<size_t>(chunk_size / type_size);
 
   // Calculate compression features. A chunk resolved from a CUDA-IPC device
@@ -626,25 +579,15 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // itself never has to be staged through host memory just to feed
   // NeuroPress. Falls through to the existing host path otherwise.
   double entropy = 0.0, mad = 0.0, second_derivative_mean = 0.0;
-  // A chunk smaller than one element has no statistics. This used to clamp
-  // num_elements up to 1, which made the stats routines read a whole element
-  // out of a 1-3 byte allocation (a heap over-read on the host, a possible
-  // fault on the device) and then rank on the garbage. NeuroPress refuses
-  // outright -- `if (num_elements == 0 ...) return GPUCOMPRESS_ERROR_NN_
-  // NOT_LOADED` (gpucompress_compress.cpp:274), guarded again at
-  // stats_kernel.cu:307 -- so fall through to the legacy heuristics instead.
+  // A chunk smaller than one element has no statistics; NeuroPress refuses
+  // outright, so fall through to the legacy heuristics rather than reading
+  // past the allocation.
 
   // Device-resident chunk with NeuroPress ranking: keep the statistics ON the
-  // GPU and let the network read them there, which is what upstream does --
-  // runStatsKernelsNoSync returns an AutoStatsGPU* and gpucompress_infer_gpu
-  // hands that pointer straight to the inference kernel ("Stats remain on
-  // GPU", gpucompress_compress.cpp:281).
-  //
-  // Nothing is synchronized here on purpose. The statistics kernels are
-  // enqueued and the ranking below chains its inference onto the SAME stream,
-  // so the whole decision runs as one asynchronous chain with a single wait at
-  // the end, exactly as gpucompress_infer_gpu does. The host copies for the
-  // selection log are taken afterwards, once that wait has already happened.
+  // GPU and let the network read them there, as upstream does. Nothing is
+  // synchronized here on purpose: the statistics kernels are enqueued and the
+  // ranking below chains its inference onto the SAME stream, so the decision
+  // runs as one asynchronous chain with a single wait at the end.
   const void *device_stats = nullptr;
   void *np_stream = nullptr;
   const bool np_device_path =
@@ -660,7 +603,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // ever runs on the GPU, and would do it invisibly -- the selection would
   // come out looking entirely normal. Upstream propagates the failure rather
   // than substituting anything (a null d_stats_ptr gives
-  // GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp:285), so this
+  // GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp), so this
   // reports it and declines NeuroPress for the chunk.
   const bool features_ok =
       np_device_path
@@ -694,14 +637,11 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
          chunk_size, type_size);
   }
 
-  // Dynamic mode: NeuroPress (if configured) takes priority over the legacy
-  // qtable/dense-NN heuristics below -- it ranks clio_ctp::compress::model's
-  // candidate set restricted to its own trained 8-algorithm nvcomp GPU
-  // action space (see NeuroPressCandidateStats), not just this function's
-  // old 5-candidate hardcoded list. Every candidate it can return is
-  // GPU-native, so a device-resident chunk_data never forces a host
-  // round-trip downstream in Compress() regardless of where this chunk
-  // happens to live.
+  // Dynamic mode: NeuroPress takes priority over the legacy qtable/dense-NN
+  // heuristics below. It ranks the model candidate set restricted to its own
+  // trained 8-algorithm nvcomp action space (see NeuroPressCandidateStats);
+  // every candidate is GPU-native, so a device-resident chunk never forces a
+  // host round-trip downstream in Compress().
   if (features_ok && context.dynamic_compress_ != 1 && neuropress_predictor_ &&
       neuropress_predictor_->IsReady()) {
     bool data_type_float = (context.data_type_ == 1);
@@ -715,19 +655,11 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
-      // The stream is idle now -- the ranking waited on it once -- so pulling
-      // the three numbers out costs a 24-byte copy and no additional stall.
-      //
-      // Gated on the log, because the log is now its ONLY consumer. The comment
-      // here used to say "and for Train()'s samples", and that stopped being
-      // true: the online-learning block recomputes its own features with
-      // ComputeCompressionFeatures so that SGD trains on exactly the scope
-      // inference predicted from. With the log off, this copy's result was
-      // written to locals that nothing read.
-      //
-      // The stats themselves stay on the device either way -- the network
-      // reads them there. This only decides whether a copy of them also comes
-      // back to the host.
+      // The stream is idle now -- the ranking waited on it once -- so this is a
+      // 24-byte copy and no additional stall. Gated because the selection log is
+      // its only consumer: the online-learning block recomputes its own features
+      // with ComputeCompressionFeatures. The statistics themselves stay on the
+      // device either way.
       if (!SelectionLogEnabled()) {
         entropy = mad = second_derivative_mean = 0.0;
       } else if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
@@ -743,19 +675,17 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
           *neuropress_predictor_, chunk_size, entropy, mad,
           second_derivative_mean, data_type_float, context.error_bound_);
     }
-    // PSNR filtering, for the HOST path only. The device path applies the
-    // floor inside RankKernel where upstream applies it (nn_gpu.cu:239), and
-    // the two are not interchangeable: masking to -INFINITY leaves the
-    // candidate ranked last but still selectable, whereas removing it here
-    // can empty the list. Upstream always returns an action even when every
-    // action is masked, so re-filtering the device result would reintroduce
-    // exactly the divergence the in-kernel mask removes.
+    // PSNR filtering, HOST path only. The device path applies the floor inside
+    // RankKernel where upstream applies it, and the two are not interchangeable:
+    // masking to -INFINITY leaves the candidate ranked last but still
+    // selectable, whereas removing it here can empty the list. Upstream always
+    // returns an action even when every action is masked.
     if (device_stats == nullptr && context.target_psnr_ > 0) {
       std::vector<CompressionStats> filtered;
       filtered.reserve(neuropress_stats.size());
       for (const auto& stat : neuropress_stats) {
         // No `psnr_db_ > 0 &&` guard: upstream masks purely on
-        // `psnr < min_psnr` (nn_gpu.cu:239), and its psnr is already clamped
+        // `psnr < min_psnr` (nn_gpu.cu), and its psnr is already clamped
         // to [0, 120], so a candidate predicted at exactly 0 dB is rejected.
         // The extra guard kept those -- and 0.0 is precisely what a failed
         // inference leaves behind.
@@ -1121,19 +1051,15 @@ namespace {
 /**
  * Per-chunk NeuroPress selection trace.
  *
- * Off unless CLIO_NEUROPRESS_SELECTION_LOG names a file, so this costs a
- * single relaxed load on the normal path. It exists because a selection is
- * otherwise invisible: dynamic selection happens inside the compressor
- * runtime, several layers below whatever issued the write, and the caller
- * only ever learns that the write succeeded. Comparing Clio's per-chunk
- * choices against NeuroPress's own needs them written down as they are made.
+ * Off unless CLIO_NEUROPRESS_SELECTION_LOG names a file, so this costs a single
+ * relaxed load on the normal path. A selection is otherwise invisible: it
+ * happens inside the compressor runtime, several layers below whatever issued
+ * the write, and the caller only learns that the write succeeded.
  *
- * The `seq` column is a COMPLETION order, not a chunk order. The HDF5 VOL
- * queues every chunk's DynamicSchedule asynchronously and drains on close
- * (clio_vol.cc:1899-1904), so chunks can complete out of order and, with
- * online learning on, the order they complete in is the order the model is
- * updated in. A replay that wants to reproduce this run's learning has to
- * follow seq, not the chunk index.
+ * The `seq` column is a COMPLETION order, not a chunk order -- the HDF5 VOL
+ * queues each chunk's DynamicSchedule asynchronously and drains on close, so
+ * with online learning on, completion order IS the order the model is updated
+ * in. A replay reproducing this run's learning must follow seq.
  */
 struct SelectionLog {
   std::mutex mutex;
@@ -1430,7 +1356,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     pool_id_.major_, log_entry.str());
     }
 
-    // Cycle 4f: snapshot the intrinsic data features NeuroPress's own
+    // Snapshot the intrinsic data features NeuroPress's own
     // prediction was based on, for a possible SGD update below. Computed here
     // (chunk_data is certainly still valid -- the same pointer
     // EstCompressionStats just read) rather than after the await, since
@@ -1470,19 +1396,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
 
-    // Record what was chosen for this chunk, before the online-learning and
-    // exploration blocks below can adopt an alternative -- this is the
-    // selection the model made, which is what a cross-check against
-    // NeuroPress's own choice is about. (Exploration is off by default; when
-    // it is on, an adopted alternative is a separate event.)
-    //
-    // Deliberately NOT gated on neuropress_feat_valid: that flag is only set
-    // when online learning is on (it exists to snapshot features for SGD),
-    // and a selection is worth recording either way -- an inference-only run
-    // is exactly the configuration in which selections are deterministic and
-    // therefore the one most worth comparing against upstream. The
-    // entropy/mad/curvature columns are zero when that snapshot was not
-    // taken; the chosen configuration, which is the point, is always real.
+    // Record what the model chose for this chunk, before the online-learning
+    // and exploration blocks below can adopt an alternative. Not gated on
+    // neuropress_feat_valid: that flag is only set when online learning is on,
+    // and a selection is worth recording either way -- the entropy/mad/curvature
+    // columns are zero without that snapshot, but the chosen configuration is
+    // always real.
     {
       const CompressionStats *logged_pred = nullptr;
       for (const auto &stat : stats) {
@@ -1522,16 +1441,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                              context.actual_psnr_db_, checksum);
     }
 
-    // Cycle 4f/4g: NeuroPress's own online-learning loop
-    // (gpucompress_compress.cpp), ported faithfully. Both phases below share
-    // one error_pct (weighted-cost MAPE between what was predicted for the
-    // algorithm actually used and what really happened) and only differ in
-    // which threshold gates them -- exactly mirroring
-    // g_reinforce_mape_threshold vs g_exploration_threshold.
-    // actual_compression_ratio_ <= 0 means the codec never produced a
-    // measurable result (Compress() zeroes it on outright failure), so
-    // there is no ground truth to train on. NeuroPress cannot reach this
-    // state -- it always has a real compressed size by the time it learns.
+    // NeuroPress's online-learning loop, ported. Both phases below share one
+    // error_pct (weighted-cost MAPE between what was predicted for the
+    // algorithm actually used and what really happened) and differ only in
+    // which threshold gates them. actual_compression_ratio_ <= 0 means the
+    // codec produced no measurable result, so there is no ground truth to
+    // train on.
     if (config_.neuropress_online_learning_enabled_ && neuropress_feat_valid &&
         task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
       const CompressionStats* predicted = nullptr;
@@ -1645,21 +1560,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           }
         }
 
-        // ---- Phase 2 (Cycle 4g): "learn from EXPLORATION results
-        // separately" -- when error crossed the HIGHER exploration
-        // threshold (default 50%, g_exploration_threshold), actually
-        // compress the SAME chunk with up to K alternative candidates (the
-        // next-best predicted ones, skipping whichever was used for the
-        // real, stored compress). This serves two purposes upstream, and now
-        // both here: it generates real-outcome training samples, AND any
-        // alternative that turns out cheaper than the primary REPLACES the
-        // stored result (see the adoption block after the loop). Simplified from the
-        // original's parallel-CUDA-stream implementation to Clio's own
-        // synchronous per-candidate Compress() call: same data flow and
-        // training outcome, sequential rather than stream-parallel --
-        // exploration is opt-in (off by default, matching
-        // g_exploration_enabled's own default) and off the storage
-        // critical path either way.
+        // ---- Phase 2: learn from exploration results separately. When error
+        // crosses the higher exploration threshold, compress the SAME chunk
+        // with up to K alternative candidates (next-best predicted, skipping
+        // the one already used). This generates real-outcome training samples,
+        // and any alternative cheaper than the primary REPLACES the stored
+        // result (see the adoption block after the loop). Upstream runs these
+        // on parallel CUDA streams; this is sequential, and off by default.
         if (config_.neuropress_exploration_enabled_ &&
             error_pct >
                 static_cast<double>(config_.neuropress_exploration_threshold_)) {
@@ -1691,7 +1598,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
           // Best explored alternative so far, if any beat the primary.
           // Upstream rewrites the output buffer in place each time it finds
-          // a cheaper action (gpucompress_compress.cpp:912+ "Write winner to
+          // a cheaper action (gpucompress_compress.cpp+ "Write winner to
           // output"), so successive winners simply overwrite one another and
           // the final buffer holds the cheapest. Clio's blob is already
           // persisted by AsyncCompress before exploration runs, so the same
@@ -1740,7 +1647,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
             // Apply the alternative's OWN quantization first, exactly as the
             // primary does and as upstream does per explored slot
-            // (gpucompress_compress.cpp:826-840: quantize, update
+            // (gpucompress_compress.cpp: quantize, update
             // alt_compress_size, THEN shuffle the quantized buffer).
             // Measuring an unquantized buffer while crediting a quantized
             // action would mislabel the sample -- the same defect the
@@ -1750,7 +1657,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             ctp::compress::preprocess::DeviceQuantizeParams alt_quant_params;
             // Same gates as the primary: preproc bit + positive bound, with
             // the buffer treated as float32 unconditionally (upstream's
-            // gpucompress_compress.cpp:434 and :827).
+            // gpucompress_compress.cpp and :827).
             const bool alt_want_quant =
                 alt_wants_quant && context.error_bound_ > 0.0 &&
                 chunk_size >= sizeof(float) &&
@@ -1800,14 +1707,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
             // Apply the alternative's OWN byte-shuffle before measuring it.
             // Upstream reconstructs the full preprocessing for each explored
-            // action -- decodeAction gives it shuf_size, and it shuffles into
-            // a per-slot buffer before compressing
-            // (gpucompress_compress.cpp:782-855). Compressing unshuffled
-            // bytes here measured a DIFFERENT action than the one being
-            // credited: shuffle usually improves the ratio on float data, so
-            // shuffled candidates looked worse than they are and got
-            // suppressed, and the shuffle dimension never received any
-            // exploration signal at all.
+            // action. Compressing unshuffled bytes would measure a different
+            // action than the one being credited, and the shuffle dimension
+            // would never receive any exploration signal.
             std::vector<char> alt_shuffle_staging;
             uint32_t alt_applied_shuffle = 0;
             if (alt_shuffle != 0) {
@@ -1844,16 +1746,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
             size_t alt_worst_case = alt_compress_size + (alt_compress_size / 20) + 1024;
 
-            // Compress into DEVICE memory when the input is device-resident,
-            // as upstream does: it brackets only
-            // `s.comp_mgr->compress(d_alt_input, s.d_out, alt_cc)` with CUDA
-            // events, writing to a device buffer
-            // (gpucompress_compress.cpp:868-870). Handing nvcomp a host
-            // destination makes it stage the result back D2H INSIDE the
-            // measured window, so an explored sample's time was not on the
-            // same scale as the primary's -- and the two are compared
-            // directly, both against each other for the winner and as
-            // training labels.
+            // Compress into DEVICE memory when the input is device-resident, as
+            // upstream does. A host destination makes nvcomp stage the result
+            // D2H inside the measured window, putting an explored sample's time
+            // on a different scale from the primary's -- and the two are
+            // compared directly, both for the winner and as training labels.
             std::vector<char> alt_output;
             char *alt_out_ptr = nullptr;
             ctp::ipc::AllocatorId alt_out_alloc;
@@ -1885,7 +1782,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // Same clock as the primary, or the comparison below is between
             // two different quantities. Upstream times every explored slot
             // with per-slot CUDA events around the codec launch alone
-            // (gpucompress_compress.cpp:868-891) and scores on that; using
+            // (gpucompress_compress.cpp) and scores on that; using
             // wall clock here charged each candidate for staging and copies
             // the primary's measurement excluded once this path started
             // reporting kernel time.
@@ -1899,7 +1796,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // Decompression time is the PRIMARY's prediction, held constant
             // across every alternative -- upstream passes the same pred_dt
             // to compute_cost for each explored slot
-            // (gpucompress_compress.cpp:904-905, "decomp_time uses NN
+            // (gpucompress_compress.cpp, "decomp_time uses NN
             // prediction (no decomp at write)"), because nothing is
             // decompressed at write time so no alternative has a measured
             // value either. Using each candidate's OWN predicted dt instead
@@ -1978,7 +1875,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 ctp::compress::model::MakeCompressionFeatures(alt_data,
                                                                alt_candidate));
             // PSNR per explored slot, as upstream computes it
-            // (gpucompress_compress.cpp:900, analytical_psnr from the slot's
+            // (gpucompress_compress.cpp, analytical_psnr from the slot's
             // own quantization range). -1 for a lossless alternative, which
             // makes the SGD withhold the PSNR gradient rather than train it
             // toward 120 dB.
@@ -2008,7 +1905,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // replaces the stored result, rewriting the header (algorithm,
           // shuffle size, original and compressed sizes), the payload, the
           // reported output size, actual_ratio, algo_to_use and preproc_to_use
-          // (gpucompress_compress.cpp:912-966). The exploration is a real
+          // (gpucompress_compress.cpp). The exploration is a real
           // second chance at the write, not just a source of training data.
           //
           // Clio's primary blob is already persisted by the time we get here,
@@ -2127,27 +2024,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           }
 
           if (!explore_features.empty()) {
-            // Order by ascending cost and keep at most the cheapest 7, which
-            // is what upstream's SGD phase 2 trains on:
-            //
-            //   std::sort(explored_samples.begin() + 1, ..., a.cost < b.cost)
-            //   emax = min(explored_samples.size(), NN_MAX_SGD_SAMPLES)
-            //   for (ei = 1; ei < emax; ei++) ...
-            //   (gpucompress_compress.cpp:1004-1020)
-            //
-            // Index 0 there is the primary, which phase 1 already learned
-            // from, so the alternatives are capped at NN_MAX_SGD_SAMPLES - 1
-            // = 7. The cap is architectural, not a tuning choice:
-            // `SGDSample explore_sgd[NN_MAX_SGD_SAMPLES]` is a fixed array
-            // and the kernel accepts no more than that. Clio's alternatives
-            // are already primary-free (the loop skips the chosen lib/preset)
-            // so the whole vector is eligible.
-            //
-            // This used to train on every candidate in enumeration order. At
-            // the shared default K=3 neither the sort nor the cap binds, but
-            // SGD accumulates over the batch, so order can move the result --
-            // and above K=7 the two implementations were learning from
-            // genuinely different sample sets.
+            // Order by ascending cost and keep at most the cheapest 7, matching
+            // upstream's SGD phase 2. Its index 0 is the primary, which phase 1
+            // already learned from, so alternatives cap at NN_MAX_SGD_SAMPLES-1.
+            // The cap is architectural: upstream's sample array is fixed-size
+            // and its kernel accepts no more. Clio's alternatives are already
+            // primary-free, so the whole vector is eligible. SGD accumulates
+            // over the batch, so this ordering is part of the result.
             constexpr size_t kMaxExploreSgdSamples = 7;  // NN_MAX_SGD_SAMPLES-1
             std::vector<size_t> order(explore_features.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -2336,7 +2219,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // Bytes the CODEC sees. Diverges from input_size the moment quantization
     // runs, because quantizing float32 to int8/int16 shrinks the buffer
     // before the codec ever looks at it. Upstream keeps the same distinction
-    // (compress_input_size vs input_size, gpucompress_compress.cpp:440-452).
+    // (compress_input_size vs input_size, gpucompress_compress.cpp).
     size_t compress_input_size = input_size;
     bool applied_quant = false;
     std::vector<char> quant_staging;  // host quantize path only
@@ -2348,7 +2231,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // each leaked input_size bytes of device memory plus the compressed
     // output buffer -- and incompressible chunks are exactly the workload
     // that takes that branch repeatedly, so it drained the GPU. NeuroPress
-    // frees on every exit path too (gpucompress_compress.cpp:536-545 and
+    // frees on every exit path too (gpucompress_compress.cpp and
     // the sibling checks at :486-519).
     struct DeviceScratchGuard {
       ctp::ipc::AllocatorId *ids[3];
@@ -2364,27 +2247,17 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
                      &quant_device_alloc}};
 
     // ---- Quantization, BEFORE the shuffle ----
-    // Upstream's order is quantize then shuffle (gpucompress_compress.cpp:
-    // 433-470), and the read side inverts it in reverse -- unshuffle, then
-    // dequantize (:1253-1296). Getting the order wrong round-trips to
-    // garbage, so both sides here are written against that pairing.
+    // Upstream's order is quantize then shuffle, and the read side inverts it
+    // in reverse -- unshuffle, then dequantize. Getting the order wrong
+    // round-trips to garbage, so both sides are written against that pairing.
     //
-    // Gated exactly as upstream gates it: a positive error bound is
-    // required (`cfg.error_bound > 0.0`, :434), which is also the condition
-    // under which its ranking stops masking quantize actions. Float32 only,
-    // since that is the element type the quantizer is defined for and the
-    // one NeuroPress's stats assume.
-    // No data_type_ gate. Upstream's only conditions are the preproc bit and
-    // `cfg.error_bound > 0.0` (gpucompress_compress.cpp:434); it then treats
-    // the buffer as float32 unconditionally, `input_size / sizeof(float)`.
-    // That is already how EstCompressionStats interprets a chunk whenever
-    // NeuroPress is the one ranking, so requiring data_type_ == 1 here made
-    // the selector and the executor disagree: with a bound set and a
-    // different declared type, quantize candidates were RANKED and chosen
-    // but never APPLIED, so the chunk compressed losslessly while the
-    // training sample claimed it had been quantized. Non-float bytes
-    // reinterpreted as float32 can produce a non-finite range, which makes
-    // the effective bound non-positive and the quantizer decline cleanly.
+    // Gated as upstream gates it: a positive error bound, which is also the
+    // condition under which its ranking stops masking quantize actions. No
+    // data_type_ gate -- upstream treats the buffer as float32 unconditionally,
+    // and so does EstCompressionStats whenever NeuroPress is ranking. Requiring
+    // a declared float type here would let quantize candidates be ranked and
+    // chosen but never applied. Non-float bytes read as float32 can produce a
+    // non-finite range, which makes the quantizer decline cleanly.
     const bool want_quant = quantize_requested && context.error_bound_ > 0.0 &&
                             input_size >= sizeof(float) &&
                             (input_size % sizeof(float)) == 0;
@@ -2555,7 +2428,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       context.actual_compressed_size_ = total_stored_size;
       // Ratio is measured against the CODEC's output, not the stored total.
       // Upstream computes actual_ratio = input_size / compressed_size
-      // (gpucompress_compress.cpp:642-643) with compressed_size being the
+      // (gpucompress_compress.cpp) with compressed_size being the
       // payload alone -- its own 64-byte header is excluded. Including
       // Clio's 24-byte header biased every training label slightly low, and
       // the bias grows as the chunk shrinks. actual_compressed_size_ below
@@ -2566,7 +2439,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // Prefer the CODEC KERNEL time over host wall clock. This is what the
       // model was trained against and what upstream ranks on: NeuroPress
       // brackets exactly its `compressor->compress(...)` launch with CUDA
-      // events (gpucompress_compress.cpp:530-551) and feeds THAT into
+      // events (gpucompress_compress.cpp) and feeds THAT into
       // compute_cost. compress_time here is wall clock around the whole
       // Compress() call, which also covers ToDeviceInput staging, a possible
       // cudaMalloc, configure_compression, the stream sync and the output
@@ -2580,10 +2453,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
       // PSNR is DEFINED only when quantization ran. Upstream seeds
       // primary_actual_psnr = -1.0 ("lossless -> skip PSNR MAPE",
-      // gpucompress_compress.cpp:388) and overwrites it only inside
+      // gpucompress_compress.cpp) and overwrites it only inside
       // `if (d_quantized && quant_result.isValid())` (:653-658). A negative
       // value makes the SGD withhold the PSNR gradient entirely
-      // (nn_gpu.cu:812-814), which is exactly right: a lossless codec has no
+      // (nn_gpu.cu), which is exactly right: a lossless codec has no
       // reconstruction error to learn from.
       if (applied_quant) {
         const double psnr = AnalyticalPsnr(
@@ -2722,7 +2595,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // because cost() maps a 0 ratio to 1e30 the MAPE gate then fired on
       // essentially every such chunk. NeuroPress always has real numbers
       // here: it computes actual_ratio = input_size / compressed_size
-      // unconditionally (gpucompress_compress.cpp:642-643) and has no
+      // unconditionally (gpucompress_compress.cpp) and has no
       // not-beneficial branch at all.
       //
       // A genuine codec FAILURE is different -- there is no measurement, so
@@ -2836,19 +2709,13 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     // Is this blob compressed? Ask the CORE, do not guess from the bytes.
     //
     // Clio stores incompressible data raw with no header (Compress()'s "not
-    // beneficial" branch), so this used to decide by testing the first four
-    // bytes against the magic -- meaning any user payload beginning
-    // 43 45 54 43 was parsed as a header, and compress_lib_/original_size_
-    // were then read out of the user's own data. Upstream cannot have that
-    // failure: it never stores raw, so a bad magic is always a hard
-    // GPUCOMPRESS_ERROR_INVALID_HEADER (gpucompress_compress.cpp:1192),
-    // never "treat it as plaintext".
-    //
-    // GetBlob reports the blob's authoritative transform state OUT through
-    // the context (issue #818), which is the same signal GetBlobSize and the
-    // interposer GetBlob already use. With that, the magic stops being a
-    // discriminator and becomes what it is upstream: an integrity check on a
-    // blob that is SUPPOSED to carry a header.
+    // beneficial" branch), so this cannot be decided by testing the first four
+    // bytes against the magic -- a user payload that happens to begin with it
+    // would be parsed as a header. GetBlob reports the blob's authoritative
+    // transform state through the context (issue #818), the same signal
+    // GetBlobSize and the interposer already use. The magic is then an
+    // integrity check on a blob that is supposed to carry a header, which is
+    // what it is upstream.
     const bool blob_is_compressed =
         (get_task->context_.transform_flags_ &
          clio::cte::core::kBlobTransformCompressed) != 0;
@@ -2943,7 +2810,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // bound -- feeding that to the decompressor over-reads past the real
       // stream into the buffer's uninitialized tail. NeuroPress reads its
       // own header.compressed_size the same way and bounds-checks it
-      // (gpucompress_compress.cpp:1199-1202); PayloadSize() applies the same
+      // (gpucompress_compress.cpp); PayloadSize() applies the same
       // two checks and returns 0 if the field is absent or implausible, in
       // which case we keep the old derivation.
       char* compressed_data = temp_buffer.ptr_ + header_size;
@@ -2960,7 +2827,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // only become float32 again after dequantization. So the codec writes
       // into a scratch of the quantized size, the unshuffle inverts on that
       // scratch, and dequantize is what finally fills the caller's buffer.
-      // Upstream is shaped the same way (gpucompress_compress.cpp:1253-1296:
+      // Upstream is shaped the same way (gpucompress_compress.cpp:
       // decompress, then unshuffle, then dequantize, each into its own
       // buffer).
       const size_t quant_elems =
@@ -3410,7 +3277,7 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   size_t compress_size = size;
 
   // Quantize FIRST, then shuffle -- the same order Runtime::Compress and
-  // upstream use (gpucompress_compress.cpp:433-470). This path is host-side
+  // upstream use (gpucompress_compress.cpp). This path is host-side
   // (src is a host SHM buffer), so the host quantizer applies; it shares its
   // arithmetic with the device kernels, so a blob written here decodes
   // identically to one written by the device path. Without this the quantize
@@ -3522,7 +3389,7 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   // kBlobTransformCompressed on the blob before getting here, so this is an
   // integrity check on something that is supposed to carry a header --
   // exactly what upstream's header.isValid() is
-  // (gpucompress_compress.cpp:1192). A failure means damage or an unknown
+  // (gpucompress_compress.cpp). A failure means damage or an unknown
   // format version, and refusing is the only safe answer.
   const auto *header = reinterpret_cast<const CompressionHeader *>(stored);
   if (!header->IsValid() || header->original_size_ > dst_cap) {
@@ -3596,7 +3463,7 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   // A quantized blob decompresses to the NARROWED integers, so the codec
   // writes into a staging buffer and dequantization is what finally fills
   // the caller's dst. Same shape as Runtime::Decompress and as upstream
-  // (gpucompress_compress.cpp:1253-1296).
+  // (gpucompress_compress.cpp).
   const size_t quant_elems =
       stored_quant ? (header->original_size_ / sizeof(float)) : 0;
   const size_t quant_bytes =

@@ -33,8 +33,8 @@ namespace ctp::compress::preprocess {
  *
  * NeuroPress does NOT shuffle a buffer as one set of byte planes: it splits
  * the input into SHUFFLE_CHUNK_SIZE pieces and builds planes within each
- * piece (src/api/internal.hpp:100 `constexpr size_t SHUFFLE_CHUNK_SIZE =
- * 256 * 1024`, passed at gpucompress_compress.cpp:461 and :1260, applied per
+ * piece (src/api/internal.hpp `constexpr size_t SHUFFLE_CHUNK_SIZE =
+ * 256 * 1024`, passed at gpucompress_compress.cpp and :1260, applied per
  * chunk in byte_shuffle_kernels.cu where `num_elements = chunk_size /
  * ElementSize` is the CHUNK's element count).
  *

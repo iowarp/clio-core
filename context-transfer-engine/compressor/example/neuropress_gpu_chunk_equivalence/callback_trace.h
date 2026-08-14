@@ -26,7 +26,7 @@
  *
  *   1. NATIVE'S OWN STAGE ENTRY POINTS as the callback boundaries. The stages
  *      below are exactly the functions upstream's own AUTO path calls, in the
- *      order it calls them (gpucompress_compress.cpp:238-1173).
+ *      order it calls them (gpucompress_compress.cpp).
  *   2. NATIVE'S OWN DIAGNOSTICS RECORD for the diagnostics stage, read through
  *      the public `gpucompress_get_chunk_diag`, and NATIVE'S OWN ranking
  *      outputs (`out_top_actions`, `out_predicted_costs`, `NNDebugPerConfig`)
@@ -75,7 +75,7 @@ enum class StageKind { kNeuroPressFunctional, kClioArchitectural };
  *
  * Order of the enumerators is the order the pipeline runs in. Note QUANTIZE
  * BEFORE SHUFFLE: that is the real order on both sides
- * (gpucompress_compress.cpp:434-470 and compressor_runtime.cc:2346-2465), and
+ * (gpucompress_compress.cpp and compressor_runtime.cc:2346-2465), and
  * writing the taxonomy in the order the code actually executes is the whole
  * point -- an idealized order would hide an ordering divergence rather than
  * detect one.

@@ -10,14 +10,14 @@
  * @brief Differential test: NeuroPress's per-flow SGD state vs Clio's.
  *
  * NeuroPress splits its online-learning state in two. The weights and
- * sgd_call_count are GLOBAL (nn_gpu.cu:64, :1413), but the EMA gradient the
+ * sgd_call_count are GLOBAL (nn_gpu.cu, :1413), but the EMA gradient the
  * weight update actually consumes -- `w -= step * EMA[...]`
- * (nn_gpu.cu:1523-1528) -- lives PER CompContext
- * (internal.hpp:50, gpucompress_pool.cpp:121-123). Every production SGD call
+ * (nn_gpu.cu) -- lives PER CompContext
+ * (internal.hpp, gpucompress_pool.cpp). Every production SGD call
  * goes through runNNSGDCtx and therefore through its own context's buffer
- * (gpucompress_compress.cpp:721, :1023; H5VLgpucompress.cu:1719, :1753); the
+ * (gpucompress_compress.cpp, :1023; H5VLgpucompress.cu:1719, :1753); the
  * context-free runNNSGD, which the other two parity harnesses drive, uses a
- * single file-scope buffer instead (nn_gpu.cu:1590) and so cannot see this
+ * single file-scope buffer instead (nn_gpu.cu) and so cannot see this
  * split at all.
  *
  * Clio has no CompContext at this layer, so the equivalent flow scope is the
@@ -39,7 +39,7 @@
  *
  *  2. RELOAD. Reloading the model must zero EVERY live flow's gradient
  *     history, not just the reloading thread's (upstream:
- *     resetAllSGDEMABuffers, nn_gpu.cu:1808; Clio: ResetAllEmaBuffers via the
+ *     resetAllSGDEMABuffers, nn_gpu.cu; Clio: ResetAllEmaBuffers via the
  *     registry). Both reloads are issued from the main thread, which is
  *     neither flow, so a reset that only reached the caller shows up here.
  *
@@ -233,7 +233,7 @@ struct NativeFlow {
   AutoStatsGPU *d_stats = nullptr;
 
   bool Init() {
-    // Same three allocations gpucompress_pool.cpp:118-130 makes per slot,
+    // Same three allocations gpucompress_pool.cpp makes per slot,
     // and the same zero-fill -- region 2 must start clean or the first
     // update consumes uninitialized momentum.
     if (cudaMalloc(&ctx.d_sgd_grad_buffer,
@@ -282,7 +282,7 @@ struct NativeFlow {
     int rc = gpucompress::runNNSGDCtx(d_stats, &s, 1, st.chunk.size_bytes,
                                       /*error_bound=*/0.0, /*lr=*/0.01f, &ctx,
                                       &gn, &clipped, &cnt);
-    // runNNSGDCtx is deliberately fire-and-forget (nn_gpu.cu:2329-2333): it
+    // runNNSGDCtx is deliberately fire-and-forget (nn_gpu.cu): it
     // records g_sgd_done and returns without syncing. The weight snapshot
     // below reads the result, so the sync upstream leaves to the next
     // inference has to happen here instead.

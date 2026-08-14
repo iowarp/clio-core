@@ -109,7 +109,7 @@ hid_t SetupVolEnvironment(clio::run::PoolId *compressor_pool_id) {
   // Both are off by default in the library, matching NeuroPress's own
   // g_online_learning_enabled{false} / g_exploration_enabled{false}: a pool
   // configured with just a model path does inference only. This demo opts
-  // into both so the SGD (Cycle 4f) and K-way exploration (Cycle 4g) paths
+  // into both so the SGD and K-way exploration paths
   // actually run and are visible in the log.
   compressor_config.neuropress_online_learning_enabled_ = true;
   compressor_config.neuropress_exploration_enabled_ = true;

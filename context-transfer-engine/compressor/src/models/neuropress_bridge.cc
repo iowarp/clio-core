@@ -80,41 +80,24 @@ std::vector<CompressionStats> RankIntoStats(
   data.data_type_char = data_type_float ? 0.0 : 1.0;
   data.data_type_float = data_type_float ? 1.0 : 0.0;
 
-  // ONE preset per algorithm, not three. NeuroPress has no preset concept at
-  // all -- its config space is algorithm x quantize x byte-shuffle
-  // (nn_weights.h's NN_NUM_CONFIGS = 32, internal.hpp's decodeAction) -- and
-  // preset is not one of the 8 NN inputs (FeaturesTo8Input). Enumerating
-  // {1,2,3} therefore produced three candidates with a bit-identical feature
-  // vector, hence an identical prediction and an identical score, leaving
-  // which of FAST/BALANCED/BEST got applied to the data to be settled by
-  // where they happened to sit in the candidate list rather than by the
-  // model -- and preset genuinely changes codec settings downstream. Pin
-  // BALANCED so the choice is deterministic and the ranked list has one
-  // entry per algorithm, matching the model's real resolution.
-  //
-  // (Rank() sorts with std::stable_sort, so such a tie resolves to the
-  // first enumerated rather than arbitrarily -- but "first enumerated" is
-  // still an accident of list construction here, not a decision the model
-  // made, so pinning remains the right fix.)
+  // ONE preset per algorithm, not three. NeuroPress has no preset concept --
+  // its config space is algorithm x quantize x byte-shuffle, and preset is not
+  // one of the 8 NN inputs. Enumerating {1,2,3} produces three candidates with
+  // a bit-identical feature vector and therefore an identical score, leaving
+  // which of FAST/BALANCED/BEST reaches the data to list order rather than to
+  // the model -- and preset does change codec settings downstream. Pin BALANCED
+  // so the ranked list has one entry per algorithm.
   std::vector<CandidateConfig> candidates =
       DefaultCandidates(/*include_gpu=*/true, {2}, false, 1e-3,
                         /*include_cpu=*/true);
 
-  // Restrict to NeuroPress's actual trained action space: the network's
-  // action-decoding scheme (nn_gpu.cu's decodeAction, "algorithm index 0-7")
-  // hard-codes exactly 8 GPU-lossless nvcomp algorithms -- LZ4/Snappy/
-  // Deflate/GDeflate/Zstd/ANS/Cascaded/Bitcomp (base_ids 13-18, 23-24 in
-  // ranking.h's KnownCompressors) -- and NOTHING else: no CPU library, no
-  // zfp-sycl/cuSZ/nDzip/cuSZp. None of those were ever part of the trained
-  // action space in the original project either -- CPU libraries and the
-  // four extra GPU algorithms all fall outside decodeAction's 0-7 range and
-  // are reachable only via explicit/static selection there, never as
-  // something the trained network can output as its own choice. Without
-  // this filter, NeuroPressNNPredictor::FeaturesTo8Input's own fallback
-  // (base_id % 8) aliased any of them onto whichever real trained algorithm
-  // happens to share that remainder and returned ITS prediction as if it
-  // were a genuine, learned opinion about the untrained one -- not
-  // something dynamic selection was ever supposed to reach.
+  // Restrict to NeuroPress's trained action space: decodeAction encodes exactly
+  // 8 GPU-lossless nvcomp algorithms -- LZ4/Snappy/Deflate/GDeflate/Zstd/ANS/
+  // Cascaded/Bitcomp (base_ids 13-18, 23-24) -- and nothing else. CPU libraries
+  // and the four extra GPU algorithms fall outside its 0-7 range and are
+  // reachable only by explicit selection upstream. Without this filter,
+  // FeaturesTo8Input's base_id % 8 fallback would alias one onto a trained
+  // algorithm and return its prediction as if it were about the untrained one.
   static const std::set<int> kNeuroPressTrainedGpuBaseIds = {
       13, 14, 15, 16, 17, 18, 23, 24};
   candidates.erase(
@@ -127,31 +110,17 @@ std::vector<CompressionStats> RankIntoStats(
 
   // Drop anything this build cannot actually construct.
   //
-  // NeuroPress's action space and its buildable algorithms are the same set
-  // by construction -- nvcomp is a hard build dependency there, so all eight
-  // always exist and decodeAction can never name one that is missing. Clio's
-  // nvcomp support is optional (compress_factory.h's Make* helpers return
-  // nullptr under #if !CTP_ENABLE_NVCOMP), so without this the selector
-  // could rank, and pick, an algorithm that cannot be instantiated. That is
-  // not a degraded write but a LOST one: Compress() logs "Failed to create
-  // compressor", sets return_code_ 3 and returns WITHOUT a PutBlob, so on a
-  // build without nvcomp every dynamic put would drop its blob. Upstream's
-  // own primary path also refuses to store when the manager cannot be built
-  // (gpucompress_compress.cpp:485-489 returns GPUCOMPRESS_ERROR_COMPRESSION),
-  // so the fix is to preserve its invariant -- every action in the space is
-  // constructible -- rather than to reproduce an error path it cannot reach.
+  // Upstream's action space and its buildable algorithms are the same set:
+  // nvcomp is a hard build dependency there, so decodeAction can never name a
+  // missing one. Clio's nvcomp support is optional, so without this the
+  // selector could pick an algorithm that cannot be instantiated -- not a
+  // degraded write but a lost one, since Compress() returns without a PutBlob.
+  // ranking.h states the filtering is the caller's job.
   //
-  // ranking.h states this is the caller's job: "callers that only want
-  // available compressors should filter the returned list".
-  //
-  // Availability is fixed at build time, so it is resolved once rather than
-  // per chunk -- GetPreset() constructs a real compressor object, which is
-  // far too expensive to repeat for every candidate on every write.
-  // Probed ONCE for the whole process: availability is decided at build time,
-  // GetPreset() constructs a real compressor object (far too costly to repeat
-  // per candidate per write), and a function-local static's initialization is
-  // thread-safe, leaving the set read-only afterwards -- this runs from
-  // concurrent runtime tasks, so a lazily-mutated cache would race.
+  // Probed ONCE per process: availability is fixed at build time, GetPreset()
+  // constructs a real compressor object (far too costly per candidate per
+  // write), and a function-local static initializes thread-safely, leaving the
+  // set read-only -- this runs from concurrent runtime tasks.
   static const std::set<std::string> kAvailable = [] {
     std::set<std::string> avail;
     for (const auto &entry : ctp::compress::model::KnownCompressors()) {
@@ -170,58 +139,29 @@ std::vector<CompressionStats> RankIntoStats(
                      }),
       candidates.end());
 
-  // Byte-shuffle variants. NeuroPress's action space is
-  // algorithm x quantize x byte-shuffle (decodeAction, internal.hpp) and its
-  // ranking masks every quantize action to -INFINITY when error_bound <= 0
-  // (nn_gpu.cu), which is the lossless case Clio runs in. Byte-shuffle is
-  // therefore the one remaining dimension upstream can reach and, without
-  // this, Clio could not: the parity harness shows native repeatedly
-  // selecting actions 20/21/23, all of which have the shuffle bit set.
-  // Expand to the full action space IN UPSTREAM'S ORDER.
+  // Expand to the full action space, in upstream's order. decodeAction numbers
+  // an action `algo + 8*quantize + 16*shuffle`, so the space enumerates as 0-7
+  // plain, 8-15 quantized, 16-23 shuffled, 24-31 both. Order matters because
+  // ties are common -- ratio saturates at the 100x cap on compressible data --
+  // and upstream's ranking network uses strict comparators, so the LOWEST
+  // action index survives a tie. Enumerating shuffle-major would let a lossless
+  // shuffled config beat a quantized unshuffled one that upstream prefers.
   //
-  // decodeAction (internal.hpp:167-172) numbers an action
-  //     algo + 8*quant + 16*shuffle
-  // so the space enumerates as: 0-7 plain, 8-15 quantized, 16-23 shuffled,
-  // 24-31 quantized+shuffled. Order matters because ties are common and
-  // resolved by position -- ratio saturates at the 100x cap for many
-  // candidates on compressible data, and upstream's bitonic ranking network
-  // uses strict comparators, so the LOWEST action index survives a tie.
-  // Building shuffle-major (as this did) made a lossless shuffled config
-  // beat a quantized unshuffled one on equal cost, where upstream picks the
-  // quantized one.
-  //
-  // Quantized variants exist only with a positive error bound: upstream's
-  // ranking masks them to -INFINITY otherwise (nn_gpu.cu:238) and its
-  // compress path will not run the quantizer (gpucompress_compress.cpp:434),
-  // so a lossless run still ranks exactly the 16 configs it did before and
-  // no existing selection can change.
-  //
-  // The bound rides on the candidate because it is NN input 3, not merely an
-  // execution parameter -- the model was trained with the real bound for
-  // quantized configs and a 1e-7 sentinel for lossless ones
-  // (neural_net/core/configs.py:44).
+  // Quantized variants exist only with a positive error bound, since upstream
+  // masks them otherwise and its compress path will not run the quantizer. The
+  // bound rides on the candidate because it is NN input 3, not merely an
+  // execution parameter: the model was trained with the real bound for
+  // quantized configs and a 1e-7 sentinel for lossless ones.
   {
-    // Order the algorithms by NeuroPress's OWN algo index before expanding.
+    // Order the algorithms by NeuroPress's own algo index before expanding.
+    // KnownCompressors() lists the eight nvcomp entries by base_id, which maps
+    // to algo indices 0,1,4,3,2,5,6,7 -- zstd, gdeflate and deflate out of
+    // order. The action index is what decides a tie, so sorting here makes slot
+    // order and action order the same thing, which is also what lets the kernel
+    // decode a slot back into a configuration.
     //
-    // KnownCompressors() lists the eight nvcomp entries by base_id
-    // (13,14,15,16,17,18,23,24), which maps to algo indices 0,1,4,3,2,5,6,7 --
-    // zstd, gdeflate and deflate out of order. The group order below was
-    // already upstream's, but WITHIN a group the slots did not follow the
-    // action index, and the action index is what decides a tie: upstream's
-    // ranking network keeps the lowest action, while first-enumerated-wins
-    // kept whatever this list happened to put first. On a tie between zstd
-    // (algo 4) and deflate (algo 2) upstream picks deflate and Clio picked
-    // zstd. Ties are not rare -- ratio saturates at the 100x cap on
-    // compressible data, and one parity run counts 32 of them.
-    //
-    // Sorting here makes slot order and action order the same thing, which is
-    // also what lets the kernel decode a slot back into a configuration.
-    // Sorted ONCE for the process, not per chunk. The list depends only on
-    // which algorithms this build can construct, which is fixed at build time
-    // and already probed once above -- and upstream assembles no per-chunk
-    // configuration at all, its lanes simply ARE the actions. Re-sorting eight
-    // entries on every write would be cheap but it would also be host work
-    // upstream does not do.
+    // Sorted ONCE per process: the list depends only on which algorithms this
+    // build can construct, already probed above.
     static const std::vector<CandidateConfig> kPlainInActionOrder = [&] {
       std::vector<CandidateConfig> p = candidates;
       std::stable_sort(p.begin(), p.end(),
@@ -239,7 +179,7 @@ std::vector<CompressionStats> RankIntoStats(
     // Enumerate the quantize half only when something will actually MASK it.
     //
     // Upstream evaluates all 32 configs every time and masks the quantize ones
-    // to -INFINITY when the bound is non-positive (nn_gpu.cu:238). RankKernel
+    // to -INFINITY when the bound is non-positive (nn_gpu.cu). RankKernel
     // now does the same -- but only the device path runs it. On the host path
     // there is no masker, so enumerating them there leaves them ranked on
     // their real scores, and they win: a lossless run then selects a quantize
@@ -351,7 +291,7 @@ std::vector<CompressionStats> RankIntoStats(
       // no indication the GPU path had dropped out. Upstream refuses in the
       // same situation rather than degrading -- a failed inference gives
       // "ALGO_AUTO requested but NN inference failed" and
-      // GPUCOMPRESS_ERROR_NN_NOT_LOADED (gpucompress_compress.cpp:208-212),
+      // GPUCOMPRESS_ERROR_NN_NOT_LOADED (gpucompress_compress.cpp),
       // and there is no CPU implementation of the network in that project to
       // fall back TO. An empty result here makes the caller's own
       // no-selection path run, which is visible and logged.
@@ -371,7 +311,7 @@ std::vector<CompressionStats> RankIntoStats(
         // A malformed permutation. Re-ranking on the host would be a silent
         // fallback for a stage that just ran on the GPU, so refuse instead --
         // upstream ends the call on an inference failure rather than
-        // substituting anything (gpucompress_compress.cpp:208-212).
+        // substituting anything (gpucompress_compress.cpp).
         return {};
       }
       ranked.push_back({candidates[slot], preds[slot], scores[i]});

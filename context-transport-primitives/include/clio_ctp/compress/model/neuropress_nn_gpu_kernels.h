@@ -79,7 +79,7 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
  *   outputs clamp to ratio 0.1 / 1 ms for every candidate, which looks like
  *   a real (if pessimistic) opinion and leaves the winner to sort order.
  *   NeuroPress returns -1 here and its caller reports
- *   GPUCOMPRESS_ERROR_NN_NOT_LOADED (nn_gpu.cu:1944-1971).
+ *   GPUCOMPRESS_ERROR_NN_NOT_LOADED (nn_gpu.cu).
  */
 bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              int num_candidates, float *out_comp_time_ms,
@@ -93,7 +93,7 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
  * means the chunk's entropy/MAD/second-derivative must already have been
  * brought to the host. Upstream never does that: gpucompress_infer_gpu hands
  * runNNFusedInferenceCtx an `AutoStatsGPU*` and the kernel reads it on-device
- * ("Stats remain on GPU", gpucompress_compress.cpp:281).
+ * ("Stats remain on GPU", gpucompress_compress.cpp).
  *
  * This entry point restores that shape. It is the one to use whenever the
  * chunk itself is device-resident, which is exactly the situation upstream is
@@ -103,12 +103,12 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
  * @param action_ids Host array [num_candidates] of UPSTREAM ACTION INDICES
  *   (`algo + 8*quantize + 16*shuffle`, decodeAction's encoding). The kernel
  *   decodes each one to rebuild inputs 0-2 exactly as upstream rebuilds them
- *   from its thread index (nn_gpu.cu:133-135) -- nothing about the
+ *   from its thread index (nn_gpu.cu) -- nothing about the
  *   configuration is assembled on the host. Uploaded asynchronously on
  *   `stream`; never waited on.
  * @param error_bound The chunk's RAW bound, as a scalar. The 1e-7 lossless
  *   sentinel is applied in-kernel for unquantized actions, where upstream
- *   applies it (nn_gpu.cu:144).
+ *   applies it (nn_gpu.cu).
  * @param chunk_size_bytes Input 4, passed as a scalar kernel argument.
  * @param stream The stream the statistics were enqueued on -- passing a
  *   different one breaks the chaining and reads the stats before they exist.
@@ -132,13 +132,13 @@ struct GpuRankParams {
   double bandwidth_bytes_per_ms = 5e6;
 
   /**
-   * The two mask inputs, applied in-kernel exactly as nn_gpu.cu:238-239 does:
+   * The two mask inputs, applied in-kernel exactly as nn_gpu.cu does:
    *   quantize actions are masked when error_bound <= 0
    *   any action is masked when min_psnr > 0 and its predicted PSNR is below it
    * A masked action scores -INFINITY, so it loses to every unmasked one but is
    * still ranked -- upstream always returns an action, even when every action
    * is masked. Leave min_psnr at 0 to disable the PSNR mask, which is
-   * upstream's own default (g_min_psnr_db, gpucompress_api.cpp:70).
+   * upstream's own default (g_min_psnr_db, gpucompress_api.cpp).
    */
   double error_bound = 0.0;
   double min_psnr = 0.0;
@@ -159,7 +159,7 @@ bool NeuroPressGpuInferBatchDeviceStats(
  * the SGD kernel rebuilds its inputs exactly as the inference kernel does.
  * error_bound_enc is the RAW bound -- the 1e-7 lossless sentinel is applied at
  * inference only, and both of upstream's SGD paths feed the raw value
- * (nn_gpu.cu:2416).
+ * (nn_gpu.cu).
  */
 struct NeuroPressGpuDecompSample {
   int action;
@@ -175,7 +175,7 @@ struct NeuroPressGpuDecompSample {
  * @brief Deferred head-only SGD for the decompression-time output, on-device.
  *
  * Updates ONLY w5 row 1 and b5[1]; the trunk is read-only. One block of 64
- * threads, as upstream launches it (nn_gpu.cu:2591). Replaces a host-side
+ * threads, as upstream launches it (nn_gpu.cu). Replaces a host-side
  * read-modify-write that downloaded every parameter, edited two, and uploaded
  * them all back.
  *
@@ -210,7 +210,7 @@ struct NeuroPressGpuSGDSample {
  *
  * @param learning_rate Online-SGD rate, upstream's g_reinforce_lr. Consumed
  *   at exactly one place, `lr_out = learning_rate * clip_scale`
- *   (nn_gpu.cu:1242), matching runNNSGD's own parameter.
+ *   (nn_gpu.cu), matching runNNSGD's own parameter.
  */
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,

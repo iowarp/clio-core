@@ -306,9 +306,9 @@ int main(int argc, char **argv) {
   // Phase 1 runs entirely at error_bound = 0, which leaves two things
   // untested. First, nnInferenceKernel masks every quantize config when the
   // bound is zero -- "if (quant == 1 && error_bound <= 0.0) rank_val =
-  // -INFINITY" (nn_gpu.cu:238) -- so the winner is always quant=0 and half
+  // -INFINITY" (nn_gpu.cu) -- so the winner is always quant=0 and half
   // the 32-config space is unreachable. Second, input 3 is
-  // "(quant == 0) ? 1e-7f : eb_enc" (nn_gpu.cu:144), so at a zero bound the
+  // "(quant == 0) ? 1e-7f : eb_enc" (nn_gpu.cu), so at a zero bound the
   // sentinel branch is taken for every candidate and the raw-bound branch
   // never runs. A port that fed the sentinel unconditionally, or fed the raw
   // bound unconditionally, would agree with upstream on every phase-1 case.
@@ -452,7 +452,7 @@ int main(int argc, char **argv) {
   // stable sign, dot_ema stays positive on both sides, and the anti-flip
   // damping branch is never taken asymmetrically -- it agrees by never
   // firing. That hid a real divergence: NeuroPress accumulates the
-  // current-vs-EMA dot over the TRUNK ONLY (nn_gpu.cu:1380-1402 stops at
+  // current-vs-EMA dot over the TRUNK ONLY (nn_gpu.cu stops at
   // DB4), while the port summed all 13576 parameters including the
   // unprojected, sign-stable W5 block, biasing the dot positive and damping
   // less often than upstream.
@@ -518,8 +518,8 @@ int main(int argc, char **argv) {
   // ---- Phase 2c: SGD parity at NONZERO error bounds. ----
   // Both SGD kernels feed the RAW bound into input 3 -- nnSGDKernel under
   // "Use raw values for error_bound and data_size (no log encoding)"
-  // (nn_gpu.cu:660-661) and nnBatchedDecompSGDKernel via
-  // "raw[3] = samp.error_bound_enc" (nn_gpu.cu:2418). Neither applies the
+  // (nn_gpu.cu) and nnBatchedDecompSGDKernel via
+  // "raw[3] = samp.error_bound_enc" (nn_gpu.cu). Neither applies the
   // 1e-7 inference sentinel.
   //
   // Every other SGD phase trains at error_bound = 0, where the raw bound and
@@ -722,7 +722,7 @@ int main(int argc, char **argv) {
 
   // ---- Phase 3c: decomp head at NONZERO error bounds. ----
   // DeferredDecompSample carries its own error_bound_enc, which
-  // nnBatchedDecompSGDKernel copies straight into raw[3] (nn_gpu.cu:2418).
+  // nnBatchedDecompSGDKernel copies straight into raw[3] (nn_gpu.cu).
   // Both earlier decomp phases pin it to 0.0f, so the value Clio derives for
   // that slot has never actually been varied against upstream's.
   // As in phase 2c, quant=0 at a nonzero bound is the discriminating case:

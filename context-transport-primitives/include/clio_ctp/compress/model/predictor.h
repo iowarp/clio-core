@@ -218,7 +218,7 @@ struct RankingWeights {
     double dt = (p.decompression_time_ms > 0.0)
                     ? std::max(1.0, p.decompression_time_ms)
                     : ct;
-    // Floor at 0.1 as well as capping at 100: nn_gpu.cu:221 clamps ratio to
+    // Floor at 0.1 as well as capping at 100: nn_gpu.cu clamps ratio to
     // [0.1, 1e5] before the policy cap, so io_cost can never be divided by a
     // vanishing or negative ratio. Callers whose predictor already floors
     // (NeuroPressNNPredictor does) are unaffected; this protects the ones
