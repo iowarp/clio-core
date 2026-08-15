@@ -123,7 +123,7 @@ loop:
 # real; treat small differences ALONG the cache axis as unresolved and raise
 # this to 3 before drawing a conclusion from them.
 repeat: 1
-output: "${HOME}/gv_tiered_flush_results"
+output: "${PWD}/results/gv_tiered_flush_results"
 
 # A wall-clock budget per combination. Set deliberately: a cell of this sweep
 # CAN wedge (the GPU stream-pool inversion did exactly that, twice in one
@@ -158,10 +158,26 @@ post: |
       st = r.get('stats') or {}
       if r['status'] != 'success':
           bad.append((r['variables'], f"status={r['status']}"))
-      elif st.get('data_ok') != 1:
-          bad.append((r['variables'], 'data MISMATCH'))
+      elif 'flush_only_ms' not in st:
+          # No PARSED metric. `st` is never empty -- data_ok/completed/
+          # stream_pool_exhausted are emitted unconditionally -- so emptiness
+          # cannot be the test; the absence of a parsed number is.
+          # The benchmark never produced a log -- almost
+          # always because clio_gpu_vector_flush_bench is not on PATH (it
+          # lives in build-coro/bin), which exits in ~8ms per cell while
+          # jarvis still records `success`. Reporting this as "data MISMATCH"
+          # would accuse the data path of corruption when nothing ever ran.
+          bad.append((r['variables'],
+                      'NO STATS: benchmark produced no output -- is '
+                      'clio_gpu_vector_flush_bench on PATH?'))
       elif not st.get('completed'):
-          bad.append((r['variables'], 'no benchmark output (wedged?)'))
+          bad.append((r['variables'],
+                      'started but did not finish (wedged, or killed by '
+                      'run_timeout)'))
+      elif st.get('data_ok') != 1:
+          bad.append((r['variables'],
+                      'DATA MISMATCH: the run verified its writes and they '
+                      'did not match -- timings are void'))
       elif st.get('stream_pool_exhausted'):
           bad.append((r['variables'],
                       f"stream pool exhausted x{st['stream_pool_exhausted']}"))
