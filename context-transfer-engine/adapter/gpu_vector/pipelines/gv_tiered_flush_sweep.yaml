@@ -1,6 +1,7 @@
 # GPU vector tiered flush study: data far outside device memory.
 #
-# A 4 GiB working set (64 blocks x 64MB) is driven through a three-tier CTE
+# A 16 GiB working set (64 blocks x 256MB) -- 2x VRAM -- is driven through a
+# three-tier CTE
 # ladder -- 1 GiB VRAM, 256 MB host DRAM, 16 GiB NVMe -- so the great majority
 # of it can only live on disk.  The sweep varies the ONE thing that decides how
 # much of the ladder gets used: the per-block page cache.
@@ -61,7 +62,9 @@ config:
       threads: 256
       iters: 16
       page_kb: 1024
-      total_io_per_block_mb: 64
+      # 64 blocks x 256 MB = 16 GB = 2x VRAM (8188 MB). Was 64 MB/block =
+      # 4 GB, which is under VRAM and so not an out-of-core measurement at all.
+      total_io_per_block_mb: 256
 
       # Both of these are overwritten by the sweep. The defaults matter only
       # if someone runs the package standalone; pages_per_block: 0 would size
@@ -105,15 +108,19 @@ vars:
   # 0.97-1.01x for async) and 10 ms is the first point where compute is a
   # comparable fraction. "flush hidden" only becomes a meaningful number in
   # the upper half of this range.
-  gv_flush.spin_us: [1, 20, 50, 200, 1000, 10000]
+  # Trimmed from six values to three. At 16 GB a cell costs ~4x what it did
+  # at 4 GB, and the compute axis was already shown to be flat: `flush only`
+  # runs with spin=0 by construction, and async never beat sync at any compute
+  # level (0.73-1.03x). Three points still span four orders of magnitude.
+  gv_flush.spin_us: [1, 200, 10000]
 
-# Separate groups => CROSS PRODUCT: 7 cache sizes x 6 compute levels = 42
+# Separate groups => CROSS PRODUCT: 7 cache sizes x 3 compute levels = 21
 # combinations. (Vars listed inside ONE group are zipped instead.)
 loop:
   - [gv_flush.pages_per_block]
   - [gv_flush.spin_us]
 
-# 42 combinations x 1 = 42 runs, roughly 90 minutes.
+# 7 cache sizes x 3 compute levels = 21 runs at 16 GB.
 #
 # ONE round, so every number here is a single sample. Run-to-run spread on
 # this workload was measured at ~1.8% (sd 13 ms on 750 ms), which is the same
