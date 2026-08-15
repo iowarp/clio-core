@@ -85,8 +85,14 @@ class ClioGnnTrain(Application):
              'type': int, 'default': 32},
             {'name': 'pages_per_block', 'msg': 'Per-block page cache slots',
              'type': int, 'default': 8},
-            {'name': 'window', 'msg': 'Training window in pages', 'type': int,
-             'default': 256},
+            {'name': 'window_mb',
+             'msg': 'Training window in MEGABYTES, converted to pages as '
+                    'window_mb*1024/page_kb. Sized in bytes, not pages, '
+                    'because a fixed page COUNT makes the staging scratch '
+                    'scale with page size: 256 pages is 4 MiB at 16 KB pages '
+                    'but 1024 MiB at 4 MB pages (peak 2048 MiB), which '
+                    'exhausted the card and lost both 4 MB cells of a sweep',
+             'type': int, 'default': 256},
             {'name': 'hbm_mib', 'msg': 'kHBM tier capacity in MiB',
              'type': int, 'default': 4096},
             {'name': 'dram_mib', 'msg': 'Host DRAM tier capacity in MiB',
@@ -250,6 +256,7 @@ class ClioGnnTrain(Application):
     def start(self):
         Which('test_gpu_vector_gnn_train', LocalExecInfo(env=self.mod_env)).run()
         _wait_for_free_vram(self.log,
+                            2 * self.config['window_mb'] / 1024.0 +
                             self.config['hbm_mib'] / 1024.0 +
                             (self.config['gather_blocks'] *
                              self.config['pages_per_block'] *
@@ -269,7 +276,9 @@ class ClioGnnTrain(Application):
             'CLIO_GNN_PAGE_ROWS': str(rows),
             'CLIO_GNN_GATHER_BLOCKS': str(c['gather_blocks']),
             'CLIO_GNN_PAGES_PER_BLOCK': str(c['pages_per_block']),
-            'CLIO_GNN_WINDOW': str(c['window']),
+            # Pages, derived from the byte budget so the scratch footprint is
+            # constant across the page-size axis.
+            'CLIO_GNN_WINDOW': str(max(1, c['window_mb'] * 1024 // c['page_kb'])),
             'CLIO_GNN_HBM_MIB': str(c['hbm_mib']),
             'CLIO_GNN_DRAM_MIB': str(c['dram_mib']),
             'CLIO_GNN_DRAM_TYPE': c['dram_type'],

@@ -89,7 +89,7 @@ config:
       compress_lib: 0
 
       pages_per_block: 8
-      window: 256
+      window_mb: 256
       vram_budget_gb: 7.0
       timeout_sec: 3600
       output_dir: "/tmp/clio_gnn_train"
