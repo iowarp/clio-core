@@ -34,13 +34,26 @@
  * with a RELATIVE TOLERANCE and only WITHIN one page size (page size sets the
  * grid geometry here, so a different page size solves a different problem).
  *
- * KNOWN OPEN ISSUE. The checksum still depends slightly on the BLOCK COUNT on
- * an identical grid: 1.08e-04 relative between 16 and 64 blocks, where the
- * double-precision reduction itself reassociates at ~1e-12. Adding the
- * cross-step flush wait cut this from 7.71e-03, so stale reads across
- * per-block caches were one cause but are not the whole story. Until this is
- * understood, treat the timings as indicative and the field as not
- * bit-reproducible across decompositions.
+ * KNOWN OPEN ISSUE: THE RESULT IS NOT REPRODUCIBLE RUN TO RUN.
+ *
+ * The SAME configuration, run three times, gives checksums spread over
+ * 3.37e-04 (1239598.10 / 1239180.61 / 1239424.31 at 16 blocks, 64KB pages).
+ * A deterministic stencil should be bit-identical, and the double-precision
+ * reduction over 1.34e8 values only reassociates at ~1e-12, so this is a
+ * genuine data race or stale read that remains in this benchmark.
+ *
+ * This supersedes an earlier reading of the same evidence. The difference
+ * BETWEEN block counts (8.39e-04) is the same order as the run-to-run spread,
+ * so it was never established as a decomposition effect -- it was mostly
+ * nondeterminism, and a fixed-configuration control should have been run
+ * before attributing it to the block count.
+ *
+ * Two real defects were found and fixed along the way and did reduce it
+ * (7.71e-03 -> 1.70e-03 -> 8.39e-04): missing cross-step flush waits, and a
+ * per-block cache that carried stale copies of neighbouring blocks' planes
+ * across a region swap. Neither closed it.
+ *
+ * TREAT THE TIMINGS AS INDICATIVE ONLY until this is resolved.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -216,6 +229,19 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
   // rather than once per plane, keeps the puts pipelined while still making
   // them durable at the step boundary.
   co_await FlushWaitCoro(vec);
+  // ...and then DROP THE CACHE. Durability alone is not enough. A block reads
+  // planes owned by its NEIGHBOURS (z-1 at the bottom of its slab, z+1 at the
+  // top), and those pages stay resident in this block's cache. The regions
+  // swap every step, so an address read in step N is read again in step N+2 --
+  // and a resident stale copy would be served instead of the value another
+  // block has since written. Nothing invalidates one block's cache when
+  // another block writes, because the caches are per block by design.
+  //
+  // The residual scaled with the PLANE COUNT, which is the signature: 1.70e-03
+  // at 64KB pages (65536 planes) down to nothing measurable at 4MB (1024
+  // planes) -- more planes, more block-boundary sharing, more stale hits.
+  if (threadIdx.x == 0) vec.DropAll();
+  __syncthreads();
 }
 
 __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
