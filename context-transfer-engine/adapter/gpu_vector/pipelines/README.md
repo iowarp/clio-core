@@ -32,12 +32,24 @@ worth having — the page-size result below is entirely explained by them.
 All measured at **2× VRAM** (16 GB/GiB datasets against an 8188 MB card),
 uncompressed, with the dataset held constant across the page axis.
 
-| workload | pattern | page-size effect | block-count effect |
-|---|---|---|---|
-| weights | re-read | **33.6×** (35288 → 1050 ms) | see cache sweep |
-| k-means | stream | **16.9×** (65501 → 3880 ms) | 2–3× |
-| Gray-Scott | sliding window | 5.5× *(indicative only)* | ~2.8× |
-| GNN | gather | 4.8× (48.90 → 10.15 s) | **~1.0×** |
+| workload | pattern | page-size effect | block-count effect | cache effect |
+|---|---|---|---|---|
+| weights | re-read | **33.6×** (35288 → 1050 ms) | ~1.9× | inert |
+| k-means | stream | **16.9×** (65501 → 3880 ms) | 2–3× | — |
+| Gray-Scott | sliding window | 5.5× *(indicative only)* | ~2.8× | — |
+| GNN | gather | 4.8× (48.90 → 10.15 s) | **~1.0×** | — |
+| flush | write | — | — | 1.6×, noise-limited |
+
+Block count is a secondary axis with clear diminishing returns: on weights at
+16 GB the gain per doubling runs +42%, +14%, +19%, −11%, +7%, so only 8→64
+clears the noise.
+
+The page CACHE is close to irrelevant at these sizes, which is worth stating
+because it is counter-intuitive. The largest cache the device budget allows
+(512 MB against a 16 GB dataset, 3%) removes only **2%** of faults
+(1,048,576 → 1,027,680). With no leverage on the fault count, the cache's
+lookup cost can dominate its benefit: at 8 blocks, going from 1 to 32
+pages/block made the run 20% SLOWER.
 
 Page size pays most where every fetched byte is eventually used (weights) and
 least where rows are scattered so a large page over-fetches (GNN). Faults
