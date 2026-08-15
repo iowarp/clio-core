@@ -173,3 +173,8 @@ demologs/
 # artifacts (grids, summaries, .png) in here. Generated data, never source --
 # and easy to commit by accident because it appears at the repo root.
 results/
+
+# The upstream LLVM apt installer, fetched into the repo root by hand
+# (llvm.sh, plus llvm.sh.1/.2 from repeated downloads). Third-party tooling
+# pulled down on demand, never source -- it was committed by accident once.
+llvm.sh*
