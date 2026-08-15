@@ -1,0 +1,230 @@
+# Gray-Scott stencil over a GPU vector: page size x block count, out-of-core.
+#
+# 16 GB grid against an 8188 MB GPU -- 2x VRAM, so the run is genuinely
+# out-of-core. The 16 GB is split across four fields (u, v, u_next, v_next),
+# because a stencil cannot be computed in place.
+#
+# This is the SLIDING-WINDOW pattern: computing plane z holds z-1, z, z+1 of
+# both fields plus both outputs (8 planes), and computing z+1 then needs z,
+# z+1, z+2 -- so two of every three input planes are immediately reused. That
+# reuse distance is what separates this from the other three benchmarks, and
+# it is what the cache can capture or miss.
+#
+# slots=16, NOT 8, and that is the point. Measured at slots=8: faults=17019
+# against nz*steps*8 = 16384 holds, i.e. essentially every hold was a fault
+# and the cache captured NONE of the reuse -- with exactly 8 slots for 8
+# simultaneous holds there is no headroom for a plane to survive to the next
+# z. 16 leaves room for the window to slide. faults_per_plane_step in the
+# results makes this explicit: ~8 means no reuse captured, ~4 means the
+# window is being reused.
+#
+# The two axes:
+#   page_kb  64 KB to 4 MB. One page IS one XY plane, so this also sets the
+#            plane dimensions (64KB -> 128x128x65536, 4MB -> 1024x1024x1024).
+#            CONFOUND, STATED PLAINLY: this axis therefore changes the GRID
+#            GEOMETRY as well as the page size, so a page-size comparison here
+#            is not a pure paging comparison the way it is in k-means (whose
+#            dataset shape is independent of page size). The field checksums
+#            differ 2-9% across this axis for exactly that reason -- different
+#            grids, different physics -- so they are only compared WITHIN a
+#            page size. Decoupling them would need a plane to span multiple
+#            pages, which the kernel does not currently do.
+#   blocks   16 / 64 z-slabs worked in parallel.
+#
+# WHY THE AXES STOP WHERE THEY DO. The page cache costs
+# blocks * slots * page_kb of DEVICE memory, on top of the kHBM tier. At
+# 4 MB x 64 blocks x 16 slots that is 4 GB, which with a 2 GB tier is already
+# at the edge of an 8 GB card. A 16 GB k-means sweep lost three cells to
+# exactly this before the package learned to refuse them: they printed a
+# header and died, and only the post-processing trust check noticed. The
+# package now fails such a cell up front with the arithmetic in the message.
+#
+# What to read in the output:
+#   step_ms                 measured step time (best of `repeat`), EXCLUDES
+#                           seeding and setup
+#   faults_per_plane_step   ~8 = the cache captured no reuse; ~4 = it did
+#   v_checksum              compare ACROSS cells with a RELATIVE TOLERANCE,
+#                           never for equality -- the reduction uses atomicAdd
+#                           so summation order follows the page/block layout
+#
+# Requires: clio_gpu_vector_grayscott_bench on PATH (<build>/bin), a CUDA
+#           device, ~17 GB host RAM for the spill tier (/dev/shm backed).
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-coro/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_grayscott_page_block_sweep.yaml
+
+config:
+  name: gv_grayscott_page_block_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_grayscott
+      pkg_name: gs
+
+      # 16384 MB = 2x this GPU's 8188 MB VRAM, across the four fields.
+      data_mb: 16384
+      # Deliberately modest: the page cache is the expensive resident thing
+      # here, and the tier competes with it for the same VRAM.
+      hbm_mb: 2048
+      hbm_only: false
+
+      threads: 256
+      # Headroom over the 8 simultaneous holds, so the sliding window can
+      # actually be reused. See the note above.
+      slots: 16
+      steps: 2
+      repeat: 3
+
+      Du: 0.2
+      Dv: 0.1
+      F: 0.02
+      K: 0.048
+      dt: 1.0
+
+      vram_budget_gb: 7.0
+      timeout_sec: 1800
+      output_dir: "/tmp/clio_gpu_vector_grayscott"
+
+      # Overwritten by the sweep.
+      page_kb: 1024
+      blocks: 64
+
+vars:
+  gs.page_kb: [64, 256, 1024, 4096]
+  gs.blocks: [16, 64]
+
+# Separate groups => CROSS PRODUCT: 4 page sizes x 2 block counts = 8.
+loop:
+  - [gs.page_kb]
+  - [gs.blocks]
+
+repeat: 1
+
+run_timeout: 1800
+
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_grayscott_page_block_sweep"
+
+post: |
+  runs = results['results']
+  ok = [r for r in runs if r['status'] == 'success']
+  logger.info(f"post: {len(ok)}/{len(runs)} combinations succeeded")
+
+  bad = []
+  # Checksums are comparable only WITHIN a page size. Because one page is one
+  # plane, page_kb sets the grid geometry (64KB -> 128x128x65536, 4MB ->
+  # 1024x1024x1024), so a different page size solves a DIFFERENT problem and
+  # its field sum legitimately differs -- measured 2-9% apart across the axis,
+  # against ~1e-8 for pure float reassociation. Comparing across page sizes
+  # flagged every healthy cell. Within a page size the grid is identical and
+  # only the block decomposition changes, so a drift there is real.
+  by_page = {}
+  for r in ok:
+      st = r.get('stats') or {}
+      if st.get('v_checksum'):
+          by_page.setdefault(r['variables']['gs.page_kb'],
+                             []).append(st['v_checksum'])
+  ref_of = {p: sorted(v)[len(v) // 2] for p, v in by_page.items()}
+  for r in runs:
+      st = r.get('stats') or {}
+      if r['status'] != 'success':
+          bad.append((r['variables'], f"status={r['status']}"))
+      elif 'step_ms' not in st:
+          bad.append((r['variables'],
+                      'NO STATS: no benchmark output -- either the binary is '
+                      'not on PATH, or the cell exceeded device memory '
+                      '(blocks*slots*page_kb + tier)'))
+      elif st.get('put_errors'):
+          # Only WRITEBACK failures are errors. A failed GET is normal and
+          # expected here: u_next and v_next are never seeded, so the first
+          # touch of an output plane misses in the CTE by design and the
+          # claimed slot turns that miss into a write-allocate. Measured
+          # 261727 against 262144 expected output-plane holds -- flagging it
+          # marked all 8 healthy cells as suspect.
+          bad.append((r['variables'],
+                      f"put_errors={st.get('put_errors')} -- writebacks failed, "
+                      f"so those planes were never stored"))
+      elif st.get('v_checksum') and r['variables']['gs.page_kb'] in ref_of:
+          ref = ref_of[r['variables']['gs.page_kb']]
+          # RELATIVE tolerance: atomicAdd ordering follows the page/block
+          # layout and float addition is not associative, so bit-equality is
+          # not expected even when the run is correct.
+          rel = abs(st['v_checksum'] - ref) / abs(ref)
+          if rel > 1e-4:
+              bad.append((r['variables'],
+                          f"CHECKSUM DRIFT {rel:.2e} vs the median for this "
+                          f"page size ({ref:.3f}) -- same grid, so this is a "
+                          f"real difference"))
+  for v, why in bad:
+      logger.warning(f"post: SUSPECT {v}: {why}")
+
+  pages = sorted({r['variables']['gs.page_kb'] for r in ok})
+  blocks = sorted({r['variables']['gs.blocks'] for r in ok})
+  cell = {(r['variables']['gs.page_kb'], r['variables']['gs.blocks']):
+          (r.get('stats') or {}) for r in ok}
+
+  def grid(metric, fmt='{:.0f}'):
+      out = ['page_kb\\blocks,' + ','.join(str(b) for b in blocks)]
+      for p in pages:
+          row = [str(p)]
+          for b in blocks:
+              v = cell.get((p, b), {}).get(metric)
+              row.append(fmt.format(v) if isinstance(v, (int, float)) else '')
+          out.append(','.join(row))
+      return out
+
+  lines = [f"cells: {len(ok)}/{len(runs)} succeeded, {len(bad)} suspect",
+           "16384 MB grid = 2x VRAM (8188 MB) over 4 fields, kHBM 2048 MB",
+           '', 'step_ms:'] + grid('step_ms')
+  lines += ['', 'GB/s:'] + grid('gbps', '{:.2f}')
+  lines += ['', 'faults:'] + grid('faults')
+  lines += ['', 'write-allocate first touches (get_errors; expected, '
+            'not failures):'] + grid('get_errors')
+  lines += ['', 'faults per plane per step '
+            '(8 = no reuse captured, 4 = window reused):'] \
+           + grid('faults_per_plane_step', '{:.2f}')
+  lines += ['', 'grid shape (nx x ny x nz):']
+  for p in pages:
+      s = cell.get((p, blocks[0]), {})
+      if s.get('nx'):
+          lines.append(f'  page={p:<5}KB -> {s["nx"]:.0f} x {s["ny"]:.0f} '
+                       f'x {s["nz"]:.0f}')
+
+  lines += ['', 'page-size effect at each block count (slowest/fastest):']
+  for b in blocks:
+      col = [(p, cell.get((p, b), {}).get('step_ms')) for p in pages]
+      col = [(p, v) for p, v in col if v]
+      if col:
+          bp, bv = min(col, key=lambda kv: kv[1])
+          wp, wv = max(col, key=lambda kv: kv[1])
+          lines.append(f'  blocks={b:<4} best={bv:.0f}ms at {bp}KB, '
+                       f'worst={wv:.0f}ms at {wp}KB, ratio={wv / bv:.2f}x')
+
+  open('grayscott_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote grayscott_summary.txt')
+
+  try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+      fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+      for b in blocks:
+          ax1.plot(pages, [cell.get((p, b), {}).get('step_ms') for p in pages],
+                   marker='o', label=f'{b} blocks')
+      ax1.set_xscale('log', base=2); ax1.set_xlabel('page size (KB)')
+      ax1.set_ylabel('step time (ms)'); ax1.set_title('page size')
+      ax1.legend(fontsize=8)
+      for b in blocks:
+          ax2.plot(pages,
+                   [cell.get((p, b), {}).get('faults_per_plane_step')
+                    for p in pages], marker='o', label=f'{b} blocks')
+      ax2.axhline(8, ls='--', c='grey', lw=1)
+      ax2.set_xscale('log', base=2); ax2.set_xlabel('page size (KB)')
+      ax2.set_ylabel('faults per plane per step')
+      ax2.set_title('reuse captured (8 = none)'); ax2.legend(fontsize=8)
+      fig.suptitle('Gray-Scott, 16 GB grid (2x VRAM) over a GPU vector')
+      fig.tight_layout(); fig.savefig('grayscott_page_block.png', dpi=130)
+      logger.info('post: wrote grayscott_page_block.png')
+  except ImportError:
+      logger.warning('post: matplotlib unavailable, skipping the plot '
+                     '(grayscott_summary.txt has the same numbers)')

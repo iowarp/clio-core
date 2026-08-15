@@ -66,6 +66,12 @@ class ClioGpuVectorKmeans(Application):
                     'kernel can wedge and never return; without a limit one '
                     'stuck cell stalls the rest of a sweep',
              'type': int, 'default': 1800},
+            {'name': 'vram_budget_gb',
+             'msg': 'Device-memory budget in GB for the page cache '
+                    'plus the kHBM tier. A cell that exceeds it is '
+                    'refused rather than left to die after printing '
+                    'its header',
+             'type': float, 'default': 7.0},
             {'name': 'output_dir', 'msg': 'Output directory', 'type': str,
              'default': '/tmp/clio_gpu_vector_kmeans'},
         ]
@@ -81,6 +87,20 @@ class ClioGpuVectorKmeans(Application):
                 f"page_kb={c['page_kb']} gives {page_floats} floats per page, "
                 f"which is not a multiple of dims={c['dims']}. A point would "
                 f"straddle a page boundary.")
+        # DEVICE-MEMORY GUARD. The page cache costs blocks * slots *
+        # page_kb of VRAM, which explodes on the large-page/many-block corner:
+        # a 16 GB k-means sweep lost three cells to this (8192KB x 256 slots=8
+        # wants 16 GB of cache on an 8 GB GPU). They printed a header and died,
+        # and only the post-processing trust check caught them. Fail here with
+        # the arithmetic instead.
+        cache_gb = (c['blocks'] * c['slots'] * c['page_kb']) / (1024.0 * 1024.0)
+        budget_gb = c.get('vram_budget_gb', 7.0)
+        if cache_gb + c['hbm_mb'] / 1024.0 > budget_gb:
+            raise Exception(
+                f"page cache needs {cache_gb:.1f} GB (blocks={c['blocks']} x "
+                f"slots={c['slots']} x {c['page_kb']}KB) plus a "
+                f"{c['hbm_mb'] / 1024.0:.1f} GB kHBM tier, over the "
+                f"{budget_gb:.1f} GB budget. Reduce blocks, slots or page_kb.")
         self.log('GPU vector k-means configured')
         self.log(f'  dataset:   {c["data_mb"]}MB, dims={c["dims"]}, '
                  f'k={c["clusters"]}, iters={c["iters"]}')
