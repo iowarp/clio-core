@@ -112,6 +112,26 @@ class ClioGnnTrain(Application):
                 f"{c['gather_blocks']} x slots={c['pages_per_block']} x "
                 f"{c['page_kb']}KB) plus a {c['hbm_mib'] / 1024.0:.1f} GB kHBM "
                 f"tier, over the {budget:.1f} GB budget.")
+        # HOST-MEMORY GUARD. The trainer materialises the whole feature
+        # matrix in host RAM before storing it, and the DRAM tier is pinned
+        # (unswappable), so the two add. A 16 GiB matrix with a 20 GiB tier
+        # was OOM-killed (exit 137) on a 60 GiB machine -- a SIGKILL with no
+        # message in the log, which reads exactly like a hang. Fail here with
+        # the arithmetic instead.
+        try:
+            with open('/proc/meminfo') as f:
+                avail_gib = next(int(l.split()[1]) for l in f
+                                 if l.startswith('MemAvailable')) / (1024.0 ** 2)
+        except (OSError, StopIteration):
+            avail_gib = None
+        need_gib = data_mb / 1024.0 + c['dram_mib'] / 1024.0
+        if avail_gib is not None and need_gib > 0.85 * avail_gib:
+            raise Exception(
+                f"needs ~{need_gib:.0f} GiB of host RAM ({data_mb / 1024.0:.0f} "
+                f"GiB matrix + {c['dram_mib'] / 1024.0:.0f} GiB pinned tier) "
+                f"against {avail_gib:.0f} GiB available. Reduce dram_mib to "
+                f"just above the spill ({(data_mb - c['hbm_mib']) / 1024.0:.0f} "
+                f"GiB) or shrink the matrix.")
         self.log('GNN training over a paged feature matrix')
         self.log(f'  matrix:  {data_mb:.0f}MB ({c["nodes"]} nodes x '
                  f'{c["dim"]}-d)')

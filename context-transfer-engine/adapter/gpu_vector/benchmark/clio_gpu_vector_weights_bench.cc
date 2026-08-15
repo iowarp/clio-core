@@ -488,9 +488,18 @@ int main(int argc, char **argv) {
     // page that does not fit in HBM has nowhere to go and the put fails
     // loudly instead of quietly relocating to the host.
     if (!hbm_only) {
+      // SIZED FROM THE WORKLOAD, not a constant. This was hardcoded at 2GB,
+      // which silently capped how large a model could be benchmarked: a
+      // dataset bigger than the kHBM tier plus 2GB had nowhere to put the
+      // remainder and the writebacks failed. An out-of-core run at 2x VRAM
+      // (16GB of weights against a 4GB tier) needs 12GB of spill, so the host
+      // tier is derived from the actual logical size with a 1GB margin.
+      const clio::run::u64 logical_mb_cfg =
+          (pages_per_block * blocks * kPageBytes) / (1024ull * 1024ull);
       cfg << "      - path: \"ram::gv_bench_ram\"\n"
           << "        bdev_type: \"ram\"\n"
-          << "        capacity_limit: \"2GB\"\n"
+          << "        capacity_limit: \"" << (logical_mb_cfg + 1024)
+          << "MB\"\n"
           << "        score: 0.2\n";
     }
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
