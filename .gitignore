@@ -166,3 +166,10 @@ abrt_bt.so
 # Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
 # Generated output, never source.
 demologs/
+
+# Jarvis pipeline-test output. `jarvis ppl run` resolves a test's `output:`
+# to <cwd>/results/<test_name> when it is not an absolute path, so sweeps run
+# from the repo root drop results.csv/results.yaml and their post-processing
+# artifacts (grids, summaries, .png) in here. Generated data, never source --
+# and easy to commit by accident because it appears at the repo root.
+results/
