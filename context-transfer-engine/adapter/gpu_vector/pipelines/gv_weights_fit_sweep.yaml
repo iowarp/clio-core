@@ -1,0 +1,177 @@
+# Model-weight paging: does the model fit on the GPU, and does compression
+# rescue it when it does not?
+#
+# Weights are the read-mostly counterpart to gv_tiered_flush_sweep's write-back
+# pattern: every forward pass re-reads the whole matrix, so the cost is faults,
+# not writebacks. A 256 MB weight matrix (64 blocks x 64 pages x 64 KB) is
+# driven against a kHBM tier that is swept from comfortably larger than the
+# model down to a quarter of it.
+#
+# The three axes:
+#   hbm_mb      512 fits the model, 256 is exactly tight, 128/64 cannot.
+#               MEASURED RESULT: this axis is nearly FLAT -- raw runs 104-118ms
+#               whether the model fits or not, and the fault count is ~15150
+#               in every case. Tier residency does not drive this benchmark;
+#               the per-block page cache (slots) does. Kept in the sweep
+#               because "tier size barely matters here" is the finding, but do
+#               not expect a cliff at the fit boundary.
+#   compressed  raw vs a GPU codec. The expectation that it only pays when
+#               the model does not fit is WRONG here: compression wins
+#               1.5-1.8x at EVERY tier size, including when the model fits
+#               comfortably. It takes MORE faults (16.7k vs 15.2k) yet runs
+#               faster, so the win is fewer bytes moved per fault (64.5MB
+#               stored vs 256MB), not fitting.
+#   flat_pct    how much of the matrix is low-entropy. MEASURED, not assumed:
+#               flat_pct=0 is NOT incompressible -- the synthetic weights still
+#               compress 3.97x there, rising to 7.69x at 50% and 31.2x at 90%.
+#               So this axis calibrates the ratio; it does not provide an
+#               incompressible floor. A ratio quoted from this benchmark is a
+#               property of its synthetic data, NOT of real model weights
+#               (real k-quant weights measure ~0.95x, i.e. barely compressible).
+#
+# What to read in the output:
+#   fits_in_hbm     1/0, straight from the binary -- the premise of the row
+#   checksum_ok     0 means the run corrupted data and its timings are void
+#   kernel_ms       measured kernel time (best of `repeat`), EXCLUDES setup;
+#                   jarvis's own `runtime` column is whole-process wall clock
+#   compress_ratio  logical/stored, so a "compressed" row that achieved 1.0x
+#                   is visible as such instead of being read as a codec win
+#
+# The benchmark is self-contained (writes its own CLIO_SERVER_CONF and starts
+# the runtime), so this pipeline deliberately has NO clio_runtime or clio_cte
+# package -- adding one would start a second runtime the binary never uses.
+#
+# Requires: clio_gpu_vector_weights_bench on PATH (it lives in <build>/bin) and
+#           a CUDA device.
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-coro/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_weights_fit_sweep.yaml
+
+config:
+  name: gv_weights_fit_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_weights
+      pkg_name: gvw
+
+      # --- fixed by the study design ---
+      # 64 blocks x 64 pages = 4096 pages of 64 KB = 256 MB of weights.
+      blocks: 64
+      threads: 256
+      rt_threads: 8
+      pages: 64
+      slots: 8
+      repeat: 3
+      # The coroutine kernel form. The macro form is the older mechanism and
+      # is not what the GPU vector is meant to run.
+      yieldable: true
+      # A CPU codec on the fault path is what the GPU vector exists to avoid;
+      # it stays off, and is only ever a deliberate comparison point.
+      cpu_codec: false
+      no_prefetch: false
+      # Let the run spill to a host tier rather than fail outright, so a
+      # does-not-fit row still produces a number to compare against.
+      hbm_only: false
+
+      output_dir: "/tmp/clio_gpu_vector_weights"
+
+      # Overwritten by the sweep.
+      hbm_mb: 512
+      compressed: false
+      flat_pct: 50
+
+vars:
+  # 256 MB of weights against a tier that fits it, exactly matches it, and
+  # then cannot hold it.
+  gvw.hbm_mb: [512, 256, 128, 64]
+  gvw.compressed: [false, true]
+  # flat_pct=0 is NOT incompressible here -- it still measures 3.97x. It is
+  # the low end of the ratio range, not a floor.
+  gvw.flat_pct: [0, 50, 90]
+
+# Separate groups => CROSS PRODUCT: 4 tier sizes x 2 codecs x 3 entropies
+# = 24 combinations.
+loop:
+  - [gvw.hbm_mb]
+  - [gvw.compressed]
+  - [gvw.flat_pct]
+
+repeat: 1
+
+# Deadlock backstop, not a performance bound: the slowest healthy cell is
+# well under a minute. A GPU cell CAN wedge, and a hang is not an exception --
+# without a budget one stuck cell blocks every remaining combination.
+run_timeout: 900
+
+output: "${HOME}/gv_weights_results"
+
+post: |
+  # Two questions, in order: is any row untrustworthy, and does compression
+  # actually pay once the model stops fitting?
+  runs = results['results']
+  ok = [r for r in runs if r['status'] == 'success']
+  logger.info(f"post: {len(ok)}/{len(runs)} combinations succeeded")
+
+  bad = []
+  for r in runs:
+      st = r.get('stats') or {}
+      if r['status'] != 'success':
+          bad.append((r['variables'], f"status={r['status']}"))
+      elif 'kernel_ms' not in st:
+          bad.append((r['variables'],
+                      'NO STATS: benchmark produced no output -- is '
+                      'clio_gpu_vector_weights_bench on PATH?'))
+      elif not st.get('checksum_ok'):
+          bad.append((r['variables'],
+                      'CHECKSUM MISMATCH: the run corrupted data, timings void'))
+      elif st.get('put_errors'):
+          bad.append((r['variables'],
+                      f"{st['put_errors']} writeback(s) failed -- the tier "
+                      f"could not hold the data"))
+  for v, why in bad:
+      logger.warning(f"post: SUSPECT {v}: {why}")
+
+  hbms = sorted({r['variables']['gvw.hbm_mb'] for r in ok}, reverse=True)
+  flats = sorted({r['variables']['gvw.flat_pct'] for r in ok})
+  cell = {(r['variables']['gvw.hbm_mb'], r['variables']['gvw.compressed'],
+           r['variables']['gvw.flat_pct']): (r.get('stats') or {}) for r in ok}
+
+  lines = [f"cells: {len(ok)}/{len(runs)} succeeded, {len(bad)} suspect", '']
+  for flat in flats:
+      lines.append(f"--- flat_pct={flat} (raw vs compressed, kernel ms) ---")
+      lines.append('hbm_mb,fits,raw_ms,cmp_ms,cmp_ratio,speedup')
+      for h in hbms:
+          raw = cell.get((h, False, flat), {})
+          cmp_ = cell.get((h, True, flat), {})
+          rm, cm = raw.get('kernel_ms'), cmp_.get('kernel_ms')
+          sp = f"{rm / cm:.2f}x" if rm and cm else ''
+          lines.append(f"{h},{raw.get('fits_in_hbm', '')},{rm or ''},"
+                       f"{cm or ''},{cmp_.get('compress_ratio', '')},{sp}")
+      lines.append('')
+  open('weights_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote weights_summary.txt')
+
+  try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+      fig, axes = plt.subplots(1, len(flats), figsize=(4.5 * len(flats), 4),
+                               sharey=True, squeeze=False)
+      for ax, flat in zip(axes[0], flats):
+          for comp, label in ((False, 'raw'), (True, 'compressed')):
+              ys = [cell.get((h, comp, flat), {}).get('kernel_ms') for h in hbms]
+              ax.plot([str(h) for h in hbms], ys, marker='o', label=label)
+          ax.set_title(f'flat_pct={flat}')
+          ax.set_xlabel('kHBM tier (MB)')
+          ax.invert_xaxis()
+      axes[0][0].set_ylabel('kernel time (ms)')
+      axes[0][0].legend(fontsize=8)
+      fig.suptitle('Model weights: 256 MB matrix vs kHBM tier size')
+      fig.tight_layout()
+      fig.savefig('weights_fit.png', dpi=130)
+      logger.info('post: wrote weights_fit.png')
+  except ImportError:
+      logger.warning('post: matplotlib unavailable, skipping the plot '
+                     '(weights_summary.txt has the same numbers)')
