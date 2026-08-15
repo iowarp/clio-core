@@ -105,7 +105,7 @@ repeat: 1
 # without a budget one stuck cell blocks every remaining combination.
 run_timeout: 900
 
-output: "${HOME}/gv_weights_results"
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_weights_fit_sweep"
 
 post: |
   # Two questions, in order: is any row untrustworthy, and does compression

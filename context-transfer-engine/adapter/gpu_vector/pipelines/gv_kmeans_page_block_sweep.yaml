@@ -1,0 +1,202 @@
+# K-means over a GPU vector: page size x block count, out-of-core.
+#
+# 16 GB point set against an 8188 MB GPU -- 2x VRAM, so the run is genuinely
+# out-of-core and NOT a resident-data measurement. The kHBM tier holds 4 GB of
+# it; the remaining 12 GB lives in a host tier.
+#
+# K-means is a STREAMING READ: each Lloyd iteration walks the whole point set
+# once, so a page is touched once per pass and never revisited within it. The
+# cache cannot produce an intra-iteration hit, which makes this the cleanest
+# workload for isolating PAGE SIZE from cache policy.
+#
+# The two axes:
+#
+#   page_kb   16 KB to 8 MB, the range that spans a small-random-read regime
+#             and a bulk-transfer regime. Preliminary numbers on a smaller
+#             problem: 612.9 / 219.8 / 151.9 ms at 16 / 64 / 1024 KB with
+#             32615 / 8045 / 360 faults -- a 4x span, the largest effect of
+#             any axis measured so far on any of these benchmarks.
+#
+#   blocks    16 / 64 / 256 concurrent fault streams. Expected to help up to
+#             a point and then flatten; on the weights benchmark the gains
+#             past ~32-64 blocks fell inside the noise band.
+#
+# dims=32 (128 B per point) divides every page size in the sweep, so no point
+# straddles a page boundary -- the benchmark REFUSES an indivisible
+# page_kb/dims pair rather than rounding it, which would make this axis report
+# something other than what it swept.
+#
+# What to read in the output:
+#   kernel_ms          measured Lloyd time (best of `repeat`), EXCLUDES seeding
+#                      and setup; jarvis's `runtime` column is whole-process
+#   faults / paged_mb  the paging work the page-size axis actually moves
+#   centroid_checksum  compare ACROSS cells with a RELATIVE TOLERANCE, never
+#                      for equality: atomicAdd makes the float summation order
+#                      follow the page and block layout, so bit-equality is not
+#                      expected even when the run is perfectly correct
+#
+# Requires: clio_gpu_vector_kmeans_bench on PATH (<build>/bin), a CUDA device,
+#           ~17 GB of host RAM for the spill tier (/dev/shm backed).
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-coro/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_kmeans_page_block_sweep.yaml
+
+config:
+  name: gv_kmeans_page_block_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_kmeans
+      pkg_name: km
+
+      # --- fixed: the problem itself ---
+      # 16384 MB = 2x this GPU's 8188 MB VRAM.
+      data_mb: 16384
+      hbm_mb: 4096
+      dims: 32
+      clusters: 16
+      iters: 2
+      threads: 256
+      slots: 8
+      repeat: 3
+      # A host tier is required: 12 GB of the dataset cannot live on the
+      # device, and with hbm_only the writebacks would simply fail.
+      hbm_only: false
+      timeout_sec: 1800
+      output_dir: "/tmp/clio_gpu_vector_kmeans"
+
+      # Overwritten by the sweep.
+      page_kb: 1024
+      blocks: 64
+
+vars:
+  # 16 KB to 8 MB. All are multiples of dims*4 = 128 B, so every point fits
+  # wholly within a page.
+  km.page_kb: [16, 64, 256, 1024, 4096, 8192]
+  km.blocks: [16, 64, 256]
+
+# Separate groups => CROSS PRODUCT: 6 page sizes x 3 block counts = 18.
+loop:
+  - [km.page_kb]
+  - [km.blocks]
+
+# One sample per cell to start. The page-size effect measured ~4x, far above
+# the ~26% run-to-run noise seen on the weights benchmark, so it resolves at
+# repeat 1; the blocks axis may not, and the post script reports which
+# differences are too small to call.
+repeat: 1
+
+# Deadlock backstop, not a performance bound: a healthy 16 GB cell is ~20s.
+# A GPU cell CAN wedge, and a hang is not an exception -- without a budget one
+# stuck cell blocks every remaining combination.
+run_timeout: 1800
+
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_kmeans_page_block_sweep"
+
+post: |
+  runs = results['results']
+  ok = [r for r in runs if r['status'] == 'success']
+  logger.info(f"post: {len(ok)}/{len(runs)} combinations succeeded")
+
+  # Trust checks first. A timing from a run that never produced output, or
+  # whose arithmetic drifted, is not a slow result -- it is an invalid one.
+  bad = []
+  ck = [(r.get('stats') or {}).get('centroid_checksum') for r in ok]
+  ck = [c for c in ck if c]
+  ref = sorted(ck)[len(ck) // 2] if ck else None      # median as reference
+  for r in runs:
+      st = r.get('stats') or {}
+      if r['status'] != 'success':
+          bad.append((r['variables'], f"status={r['status']}"))
+      elif 'kernel_ms' not in st:
+          bad.append((r['variables'],
+                      'NO STATS: no benchmark output -- is '
+                      'clio_gpu_vector_kmeans_bench on PATH?'))
+      elif st.get('put_errors') or st.get('get_errors'):
+          bad.append((r['variables'],
+                      f"put_errors={st.get('put_errors')} "
+                      f"get_errors={st.get('get_errors')}"))
+      elif ref and st.get('centroid_checksum'):
+          # RELATIVE tolerance, not equality: atomicAdd ordering follows the
+          # page/block layout and float addition is not associative. 1e-4 is
+          # generous next to the ~1e-8 drift actually observed, so anything
+          # this catches is real corruption rather than reassociation.
+          rel = abs(st['centroid_checksum'] - ref) / abs(ref)
+          if rel > 1e-4:
+              bad.append((r['variables'],
+                          f"CHECKSUM DRIFT {rel:.2e} vs median {ref:.3f} -- "
+                          f"paging may have corrupted the data"))
+  for v, why in bad:
+      logger.warning(f"post: SUSPECT {v}: {why}")
+
+  pages = sorted({r['variables']['km.page_kb'] for r in ok})
+  blocks = sorted({r['variables']['km.blocks'] for r in ok})
+  cell = {(r['variables']['km.page_kb'], r['variables']['km.blocks']):
+          (r.get('stats') or {}) for r in ok}
+
+  def grid(metric, fmt='{:.0f}'):
+      out = ['page_kb\\blocks,' + ','.join(str(b) for b in blocks)]
+      for p in pages:
+          row = [str(p)]
+          for b in blocks:
+              v = cell.get((p, b), {}).get(metric)
+              row.append(fmt.format(v) if isinstance(v, (int, float)) else '')
+          out.append(','.join(row))
+      return out
+
+  lines = [f"cells: {len(ok)}/{len(runs)} succeeded, {len(bad)} suspect",
+           "16384 MB dataset = 2x VRAM (8188 MB), kHBM tier 4096 MB", '',
+           'kernel_ms:'] + grid('kernel_ms')
+  lines += ['', 'faults:'] + grid('faults')
+  lines += ['', 'GB/s:'] + grid('gbps', '{:.2f}')
+
+  # The page-size axis, stated as a ratio so the effect size is explicit.
+  lines += ['', 'page-size effect at each block count (slowest/fastest):']
+  for b in blocks:
+      col = [(p, cell.get((p, b), {}).get('kernel_ms')) for p in pages]
+      col = [(p, v) for p, v in col if v]
+      if not col:
+          continue
+      bp, bv = min(col, key=lambda kv: kv[1])
+      wp, wv = max(col, key=lambda kv: kv[1])
+      lines.append(f'  blocks={b:<4} best={bv:.0f}ms at {bp}KB, '
+                   f'worst={wv:.0f}ms at {wp}KB, ratio={wv / bv:.2f}x')
+
+  lines += ['', 'blocks effect at each page size (slowest/fastest):']
+  for p in pages:
+      row = [(b, cell.get((p, b), {}).get('kernel_ms')) for b in blocks]
+      row = [(b, v) for b, v in row if v]
+      if not row:
+          continue
+      bb, bv = min(row, key=lambda kv: kv[1])
+      wb, wv = max(row, key=lambda kv: kv[1])
+      lines.append(f'  page={p:<5}KB best={bv:.0f}ms at {bb} blocks, '
+                   f'worst={wv:.0f}ms at {wb} blocks, ratio={wv / bv:.2f}x')
+
+  open('kmeans_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote kmeans_summary.txt')
+
+  try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+      fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+      for b in blocks:
+          ax1.plot(pages, [cell.get((p, b), {}).get('kernel_ms') for p in pages],
+                   marker='o', label=f'{b} blocks')
+      ax1.set_xscale('log', base=2); ax1.set_yscale('log')
+      ax1.set_xlabel('page size (KB)'); ax1.set_ylabel('Lloyd time (ms)')
+      ax1.set_title('page size'); ax1.legend(fontsize=8)
+      for p in pages:
+          ax2.plot(blocks, [cell.get((p, b), {}).get('faults') for b in blocks],
+                   marker='o', label=f'{p} KB')
+      ax2.set_xscale('log', base=2); ax2.set_yscale('log')
+      ax2.set_xlabel('blocks'); ax2.set_ylabel('faults')
+      ax2.set_title('paging work'); ax2.legend(fontsize=7)
+      fig.suptitle('K-means, 16 GB point set (2x VRAM) over a GPU vector')
+      fig.tight_layout(); fig.savefig('kmeans_page_block.png', dpi=130)
+      logger.info('post: wrote kmeans_page_block.png')
+  except ImportError:
+      logger.warning('post: matplotlib unavailable, skipping the plot '
+                     '(kmeans_summary.txt has the same numbers)')

@@ -123,7 +123,7 @@ loop:
 # real; treat small differences ALONG the cache axis as unresolved and raise
 # this to 3 before drawing a conclusion from them.
 repeat: 1
-output: "${PWD}/results/gv_tiered_flush_results"
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_tiered_flush_sweep"
 
 # A wall-clock budget per combination. Set deliberately: a cell of this sweep
 # CAN wedge (the GPU stream-pool inversion did exactly that, twice in one
