@@ -30,9 +30,17 @@
  * can be evicted under it, which would not crash but would silently read
  * whatever replaced it.
  *
- * Correctness is a checksum of the final field, to be compared across
- * configurations with a RELATIVE TOLERANCE -- the reduction is order-dependent
- * in the same way k-means' centroid sums are.
+ * Correctness is a checksum of the final field, compared across configurations
+ * with a RELATIVE TOLERANCE and only WITHIN one page size (page size sets the
+ * grid geometry here, so a different page size solves a different problem).
+ *
+ * KNOWN OPEN ISSUE. The checksum still depends slightly on the BLOCK COUNT on
+ * an identical grid: 1.08e-04 relative between 16 and 64 blocks, where the
+ * double-precision reduction itself reassociates at ~1e-12. Adding the
+ * cross-step flush wait cut this from 7.71e-03, so stale reads across
+ * per-block caches were one cause but are not the whole story. Until this is
+ * understood, treat the timings as indicative and the field as not
+ * bit-reproducible across decompositions.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -80,6 +88,26 @@ CTP_INLINE_CROSS_FUN float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
 }
 
 #if defined(GV_GS_CORO)
+/**
+ * Wait for this block's outstanding writebacks by PARKING, not spinning.
+ *
+ * REQUIRED FOR CORRECTNESS ACROSS STEPS, not just for timing. Page caches are
+ * PER BLOCK: block A writes plane z into its own cache and BeginFlush only
+ * *issues* the put. On the next step those regions swap, and block B -- which
+ * owns a neighbouring z-slab -- faults on plane z, misses its own cache, and
+ * fetches from the tier. If A's put has not landed, B reads a STALE plane.
+ * Nothing crashes; the field is quietly wrong.
+ *
+ * Measured before this wait existed: the same grid gave field checksums
+ * differing by 7.7e-03 between 16 and 64 blocks, where a double-precision
+ * reduction reassociates at ~1e-12. The block count changed which planes
+ * crossed a cache boundary, so it changed the answer.
+ */
+__device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
+  CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
+                     v.AnyTransferInFlight(), v.FlushWaitTag());
+}
+
 /** Seed u and v for this block's z-range, one plane (= one page) at a time. */
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
@@ -102,6 +130,9 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
     if (threadIdx.x == 0) vec.BeginFlush(vbase + z * plane, plane);
     __syncthreads();
   }
+  // The first step reads planes seeded by OTHER blocks, so the seed must be
+  // durable before this kernel returns.
+  co_await FlushWaitCoro(vec);
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -180,6 +211,11 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     }
     __syncthreads();
   }
+  // Drain before returning: the next step swaps the regions and other blocks
+  // will fault on the planes written here. Waiting once per block per step,
+  // rather than once per plane, keeps the puts pipelined while still making
+  // them durable at the step boundary.
+  co_await FlushWaitCoro(vec);
 }
 
 __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
@@ -424,6 +460,22 @@ int main(int argc, char **argv) {
 
   double best_ms = 1e30, checksum = 0.0;
   for (int r = 0; r < repeat; ++r) {
+    // RE-SEED between repeats. Without this, repeat 2 continues evolving the
+    // field left by repeat 1, so each timed run measures a different physical
+    // state and the reported checksum depends on `repeat` -- which makes it
+    // useless as a correctness check and makes the repeats non-comparable.
+    if (r > 0) {
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nx, ny, nz,
+                                                    zper, ubase, vbase, vw, sv);
+      });
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::fprintf(stderr, "GRAYSCOTT ERROR: re-seed failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return 1;
+      }
+    }
     vec.ResetStats();
     cudaDeviceSynchronize();
     const double t0 = NowMs();
