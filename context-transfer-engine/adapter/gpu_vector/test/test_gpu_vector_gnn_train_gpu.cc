@@ -1505,8 +1505,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   // Checked directly: with the known-bad at() read path it still reports 32/32
   // agreeing, because that bug needs a full sweep to surface. This catches
   // wrong page mapping, a page never stored, and gross corruption -- not
-  // concurrency. The bit-exactness assertion in run_pipeline_test.sh is what
-  // covers the sweep, and it is the check that actually found at().
+  // concurrency. The bit-exactness assertion against the in-core baseline is
+  // what covers the sweep, and it is the check that actually found at().
   {
     const int nver = (int)EnvI64("CLIO_GNN_VERIFY_PAGES", 8);
     if (nver > 0 && K > 0) {
