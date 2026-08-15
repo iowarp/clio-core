@@ -124,3 +124,107 @@ loop:
 # this to 3 before drawing a conclusion from them.
 repeat: 1
 output: "${HOME}/gv_tiered_flush_results"
+
+# A wall-clock budget per combination. Set deliberately: a cell of this sweep
+# CAN wedge (the GPU stream-pool inversion did exactly that, twice in one
+# 36-cell run), and a hang is not an exception -- without a budget one stuck
+# cell blocks every remaining combination and the whole sweep is lost. On
+# expiry the run is torn down, recorded as `failed` with the reason in the
+# `error` column, and the next combination starts. 900s is far above the
+# slowest healthy cell (~15s), so it is a deadlock backstop, not a perf bound.
+run_timeout: 900
+
+post: |
+  # Turn results.csv into the two things this study is actually read for:
+  # a cache x compute grid of flush time, and a verdict on whether the run
+  # is trustworthy at all. Runs after every combination, cwd = output:.
+  #
+  # matplotlib is NOT assumed -- it is absent on this host, and a post script
+  # that crashes costs the figure and exits non-zero. The text artifacts are
+  # written first and unconditionally; the plot is best-effort.
+  import csv
+
+  runs = results['results']
+  ok = [r for r in runs if r['status'] == 'success']
+  logger.info(f"post: {len(ok)}/{len(runs)} combinations succeeded")
+
+  # ---- trust checks BEFORE any timing is reported ---------------------
+  # A timing from a run that lost data or exhausted the stream pool is not a
+  # slow result, it is an invalid one. jarvis's own `status` cannot see this:
+  # it reported "36 successful, 0 failed" for a sweep in which two cells had
+  # hung and been killed.
+  bad = []
+  for r in runs:
+      st = r.get('stats') or {}
+      if r['status'] != 'success':
+          bad.append((r['variables'], f"status={r['status']}"))
+      elif st.get('data_ok') != 1:
+          bad.append((r['variables'], 'data MISMATCH'))
+      elif not st.get('completed'):
+          bad.append((r['variables'], 'no benchmark output (wedged?)'))
+      elif st.get('stream_pool_exhausted'):
+          bad.append((r['variables'],
+                      f"stream pool exhausted x{st['stream_pool_exhausted']}"))
+  for v, why in bad:
+      logger.warning(f"post: SUSPECT {v}: {why}")
+
+  ppbs = sorted({r['variables']['gv_flush.pages_per_block'] for r in ok})
+  spins = sorted({r['variables']['gv_flush.spin_us'] for r in ok})
+  cell = {(r['variables']['gv_flush.pages_per_block'],
+           r['variables']['gv_flush.spin_us']): (r.get('stats') or {})
+          for r in ok}
+
+  def grid(metric, fmt='{:.1f}'):
+      out = ['ppb\\spin,' + ','.join(f'{s}us' for s in spins)]
+      for p in ppbs:
+          row = [str(p)]
+          for s in spins:
+              v = cell.get((p, s), {}).get(metric)
+              row.append(fmt.format(v) if isinstance(v, (int, float)) else '')
+          out.append(','.join(row))
+      return out
+
+  with open('flush_grid.csv', 'w') as f:
+      for name, fmt in (('flush_only_ms', '{:.1f}'), ('faults', '{:.0f}'),
+                        ('speedup_async', '{:.2f}')):
+          f.write(f'# {name}\n')
+          f.write('\n'.join(grid(name, fmt)) + '\n\n')
+
+  lines = [f"cells: {len(ok)}/{len(runs)} succeeded, {len(bad)} suspect", '']
+  lines += ['flush_only_ms (I/O phase, no compute):'] + grid('flush_only_ms')
+  # The headline comparison: full residency (no faults) against the best
+  # partial cache. Measured 554 ms vs 661 ms, i.e. the cache is worth having
+  # only if it holds EVERYTHING -- partial caches barely dent the fault count.
+  full = [v.get('flush_only_ms') for (p, _), v in cell.items()
+          if v.get('faults') == 0 and v.get('flush_only_ms')]
+  part = [v.get('flush_only_ms') for (p, _), v in cell.items()
+          if v.get('faults') and v.get('flush_only_ms')]
+  if full and part:
+      fm, pm = sum(full)/len(full), min(part)
+      lines += ['', f"fully resident (faults=0): {fm:.1f} ms mean over "
+                    f"{len(full)} cells",
+                f"best partial cache:        {pm:.1f} ms",
+                f"full residency is {(pm/fm - 1) * 100:.1f}% faster"]
+  open('flush_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote flush_grid.csv and flush_summary.txt')
+
+  try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+      fig, ax = plt.subplots(figsize=(7, 4.5))
+      for s in spins:
+          ys = [cell.get((p, s), {}).get('flush_only_ms') for p in ppbs]
+          ax.plot(ppbs, ys, marker='o', label=f'{s} us compute')
+      ax.set_xscale('log', base=2)
+      ax.set_xlabel('page cache (pages/block, 1 MB pages)')
+      ax.set_ylabel('flush-only time (ms)')
+      ax.set_title('GPU vector flush over VRAM -> DRAM -> NVMe')
+      ax.legend(fontsize=8)
+      fig.tight_layout()
+      fig.savefig('flush_time_vs_cache.png', dpi=130)
+      logger.info('post: wrote flush_time_vs_cache.png')
+  except ImportError:
+      logger.warning('post: matplotlib unavailable, skipping the plot '
+                     '(flush_grid.csv has the same numbers)')
+
