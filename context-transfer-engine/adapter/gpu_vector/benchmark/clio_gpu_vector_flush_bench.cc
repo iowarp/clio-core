@@ -943,6 +943,15 @@ int main(int argc, char **argv) {
     return best;
   };
 
+  // TOTAL MEASURED TIME, EXCLUDING INITIALIZATION. The only end-to-end number
+  // available until now was the pipeline's process wall clock, and 44-55% of
+  // that is startup, tier creation, the vector's page-cache allocation, the
+  // warm pass, and the 2048 verification reads -- none of which is the thing
+  // under test. Reporting it as "the time" would have compressed the
+  // full-residency win from 18.4% to about 9% and buried the cache-axis trend
+  // under a ~6 s constant. This clock spans every timed phase (all `repeat`
+  // executions, not just the best of each) and nothing else.
+  const double measured_t0 = NowMs();
   const double spin_only = run(a.spin_us, 0, 0);   // compute, no I/O
   const double io_only = run(0, 1, 0);             // I/O, no compute
   const auto io_stats = vec.ReadStats(0);
@@ -950,6 +959,7 @@ int main(int argc, char **argv) {
   const auto sync_stats = vec.ReadStats(0);
   const double async_ms = run(a.spin_us, 1, 1);
   const auto async_stats = vec.ReadStats(0);
+  const double measured_total = NowMs() - measured_t0;
   const u32 last_pass = pass - 1;
 
   // Verify the async pass reached the CTE. Sampled: first and last page of
@@ -1039,6 +1049,8 @@ int main(int argc, char **argv) {
       // and a flat curve is the CORRECT answer rather than a suspicious one --
       // the cache has nothing to hit. Evicts vs puts says whether writebacks
       // came from reclaiming slots or from the explicit flush.
+      "  measured total   %8.2f ms   (all timed phases; EXCLUDES init, warm, "
+      "and verification)\n"
       "  faults           %8llu     (cache hits are impossible when this is 0)\n"
       "  evicts / puts    %8llu / %llu\n",
       spin_only, spin_only * 1000.0 / per_iter,
@@ -1049,7 +1061,7 @@ int main(int argc, char **argv) {
       ok ? "data=OK" : "data=MISMATCH",
       spin_only + io_only, mx, sync_ms / async_ms,
       (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0,
-      (unsigned long long) io_stats.faults,
+      measured_total, (unsigned long long) io_stats.faults,
       (unsigned long long) io_stats.evicts, (unsigned long long) io_stats.puts);
   report_tiers();
   report_streams();

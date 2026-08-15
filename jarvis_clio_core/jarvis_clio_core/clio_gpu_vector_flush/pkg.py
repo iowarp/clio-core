@@ -234,6 +234,11 @@ class ClioGpuVectorFlush(Application):
                 return None
 
         found = {
+            # End-to-end measured time with initialization excluded. jarvis's
+            # own `runtime` column is whole-process wall clock and is 44-55%
+            # startup + warm + verification on this workload, so it must not
+            # be used as the benchmark's time.
+            'measured_total_ms': first(r'measured total\s+([0-9.]+) ms'),
             'spin_only_ms': first(r'spin only\s+([0-9.]+) ms'),
             'flush_only_ms': first(r'flush only\s+([0-9.]+) ms'),
             'sync_ms': first(r'sync  measured\s+([0-9.]+) ms'),
