@@ -1,5 +1,0 @@
-features_mib,nodes,page_rows,window_pages,traditional_status,traditional_s,eternia_store_s,eternia_readout_s,eternia_stored_mib,eternia_ratio,hbm_used_mib,dram_used_mib,eternia_peak_gpu_mib,bit_exact
-4101,10752000,51200,2,OK,2.441,19.525,14.640,3795,1.081,0,3795,39,BIT-EXACT
-10234,26828800,51200,2,OOM,-1.000,62.054,66.148,9470,1.081,0,9470,39,n/a(OOM)
-6132,16076800,51200,2,OK,2.545,23.619,20.027,5675,1.081,0,5675,39,BIT-EXACT
-8203,21504000,51200,2,OOM,-1.000,32.376,27.469,7591,1.081,0,7591,39,n/a(OOM)

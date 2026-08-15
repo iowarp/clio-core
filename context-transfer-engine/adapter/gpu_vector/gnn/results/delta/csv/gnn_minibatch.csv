@@ -1,5 +1,0 @@
-data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,base_final_vacc,eternia_final_acc,eternia_final_vacc,stored_mib,ratio,peak_gpu_mib,store_s,base_epoch_s,eternia_epoch_s,bit_exact
-/u/rpawar/gnnbench/data/arxiv,zstd,balanced,96,196608,64,30,OK,0.188185,0.188657,0.188185,0.188657,89,1.07775,32,0.276521,0.139354,0.525518,BIT-EXACT
-/u/rpawar/gnnbench/data/arxiv,zstd,balanced,84,172032,64,30,OK,0.585898,0.588618,0.585898,0.588618,78,1.0759,2,0.213424,0.115718,0.384271,BIT-EXACT
-/u/rpawar/gnnbench/data/arxiv,zstd,balanced,84,172032,64,5,OK,0.34905,0.348602,0.34905,0.348602,78,1.0759,2,0.213916,0.124083,0.384928,BIT-EXACT
-/u/rpawar/gnnbench/data/arxiv,zstd,balanced,88,180224,64,30,OK,0.451505,0.451948,0.451505,0.451948,81,1.07738,8,0.233293,0.107115,0.387495,BIT-EXACT

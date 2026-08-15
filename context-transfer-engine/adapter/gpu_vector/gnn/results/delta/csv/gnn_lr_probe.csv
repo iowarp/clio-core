@@ -1,6 +1,0 @@
-data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,base_final_vacc,eternia_final_acc,eternia_final_vacc,stored_mib,ratio,peak_gpu_mib,store_s,base_epoch_s,eternia_epoch_s,bit_exact
-/tmp/gnn/data/papers100M,zstd,balanced,960,1966080,64,30,OK,0.125498,0.120721,0.125498,0.120721,890,1.07818,64,3.29221,1.37018,4.97341,BIT-EXACT
-/tmp/gnn/data/papers100M,zstd,balanced,960,1966080,64,300,OK,0.293081,0.281081,0.293081,0.281081,890,1.07818,64,2.74449,1.36967,4.87918,BIT-EXACT
-/tmp/gnn/data/papers100M,zstd,balanced,960,1966080,64,30,OK,0.0709005,0.0774775,0.0709005,0.0774775,890,1.07818,64,2.81659,1.3697,5.19149,BIT-EXACT
-/tmp/gnn/data/papers100M,zstd,balanced,960,1966080,64,30,OK,0.0709005,0.0774775,0.0709005,0.0774775,890,1.07818,64,3.3885,1.36977,4.94837,BIT-EXACT
-/tmp/gnn/data/papers100M,zstd,balanced,960,1966080,64,300,OK,0.125498,0.120721,0.125498,0.120721,890,1.07818,64,2.74324,1.36967,4.87903,BIT-EXACT

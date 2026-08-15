@@ -1,3 +1,0 @@
-A_mib,nodes,H,epochs,base_status,base_final_acc,eternia_final_acc,stored_mib,ratio,peak_gpu_mib,bit_exact
-82,167936,64,20,OK,0.164932,0.164932,76,1.06667,1,BIT-EXACT
-10240,20971520,64,5,OOM,-1,0.165475,9508,1.0769,32,n/a(OOM)

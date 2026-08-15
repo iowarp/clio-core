@@ -1,3 +1,0 @@
-data,lib,preset,A_mib,nodes,H,epochs,base_status,base_final_acc,base_final_vacc,eternia_final_acc,eternia_final_vacc,stored_mib,ratio,peak_gpu_mib,store_s,base_epoch_s,eternia_epoch_s,bit_exact
-/tmp/gnn/data/papers100M,zstd,balanced,54208,111017984,64,10,OOM,-1,-1,0.578578,0.578886,50257,1.07861,64,190.13,-1,358.517,n/a(OOM)
-/tmp/gnn/data/papers100M,zstd,balanced,54208,111017984,64,30,OOM,-1,-1,0.611316,0.611814,50257,1.07861,64,185.98,-1,357.735,n/a(OOM)
