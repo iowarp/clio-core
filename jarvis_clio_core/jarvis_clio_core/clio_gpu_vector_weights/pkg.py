@@ -151,7 +151,13 @@ class ClioGpuVectorWeights(Application):
                'put_errors': 'put_errors', 'get_errors': 'get_errors',
                'rounds': 'rounds', 'slots': 'slots', 'pages': 'pages'}
         for key, out in num.items():
-            m = re.search(re.escape(key) + r'=([0-9.]+)', line)
+            # The key must start at a WORD BOUNDARY. Without it,
+            # searching for 'ms=' matches the 'ms=' inside 'dims=32'
+            # and silently reports 32 instead of 5044.1 -- a wrong
+            # number, not a missing one, which no downstream check
+            # would catch.
+            m = re.search(r'(?:^|\s)' + re.escape(key) + r'=([0-9.]+)',
+                          line)
             if m:
                 v = float(m.group(1))
                 stats[out] = int(v) if v.is_integer() else v
