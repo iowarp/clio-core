@@ -43,6 +43,7 @@ from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, LocalExecInfo
 from jarvis_cd.shell.process import Which
 import os
+import re
 
 
 class ClioGpuVectorFlush(Application):
@@ -183,21 +184,90 @@ class ClioGpuVectorFlush(Application):
             self.log(f'  WARNING: working set {working_mb}MB exceeds total '
                      f'tier capacity {tier_mb}MB -- puts will fail')
 
+    def _output_file(self):
+        """Path of this configuration's log.
+
+        EVERY swept parameter must appear in the name. With only the cache
+        size in it, a sweep that also varies spin_us writes all six compute
+        levels to the same file and leaves one survivor per cache size --
+        silent data loss that still reports a completed sweep. _get_stat
+        resolves the same path, so the two cannot drift apart.
+        """
+        tag = (f'ppb{self.config["pages_per_block"]}'
+               f'_spin{self.config["spin_us"]}us'
+               f'_b{self.config["blocks"]}'
+               f'_io{self.config["total_io_per_block_mb"]}mb')
+        return os.path.join(self.config['output_dir'], f'gv_flush_{tag}.log')
+
+    def _get_stat(self, stats):
+        """Harvest the benchmark's own numbers into the pipeline results.
+
+        Jarvis calls this on a FRESHLY LOADED package instance after the run,
+        so nothing may be carried over from start() -- the log is re-read from
+        disk and the path is rebuilt from self.config.
+
+        Without this the pipeline reproduced the experiment but harvested
+        nothing: every row of results.csv carried `stats: {}` and only
+        wall-clock runtime, so the actual measurements had to be scraped out
+        of the logs by hand. The headline number is flush_only_ms (the I/O
+        phase with no compute); data_ok is included because a timing from a
+        run that lost data is worthless and the CSV should say so.
+        """
+        path = self._output_file()
+        if not os.path.exists(path):
+            return
+        # The binary writes ANSI colour through tee; strip it before matching.
+        ansi = re.compile(r'\x1b\[[0-9;]*m')
+        try:
+            with open(path, 'r', errors='replace') as f:
+                text = ansi.sub('', f.read())
+        except OSError:
+            return
+
+        def first(pattern, cast=float):
+            m = re.search(pattern, text)
+            if m is None:
+                return None
+            try:
+                return cast(m.group(1))
+            except ValueError:
+                return None
+
+        found = {
+            'spin_only_ms': first(r'spin only\s+([0-9.]+) ms'),
+            'flush_only_ms': first(r'flush only\s+([0-9.]+) ms'),
+            'sync_ms': first(r'sync  measured\s+([0-9.]+) ms'),
+            'async_ms': first(r'async measured\s+([0-9.]+) ms'),
+            'flush_mbps': first(r'flush only.*?([0-9]+) MB/s', int),
+            'speedup_async': first(r'speedup async\s+([0-9.]+)x'),
+            'flush_hidden_pct': first(r'flush hidden\s+(-?[0-9.]+)'),
+            # No ^ anchor: re.search is not MULTILINE, so '^' would only
+            # match the start of the whole file and faults silently vanished
+            # from the CSV (verified against a real log before trusting it).
+            'faults': first(r'\n  faults\s+([0-9]+)', int),
+            'puts': first(r'evicts / puts\s+[0-9]+ / ([0-9]+)', int),
+            'evicts': first(r'evicts / puts\s+([0-9]+) /', int),
+            'vram_used_mb': first(r'TIER SPLIT:\s+VRAM ([0-9]+)MB', int),
+            'dram_used_mb': first(r'TIER SPLIT:.*?DRAM ([0-9]+)MB', int),
+            'nvme_used_mb': first(r'TIER SPLIT:.*?NVMe ([0-9]+)MB', int),
+            'streams_outstanding': first(r'STREAM POOL:.*?outstanding=(-?[0-9]+)',
+                                         int),
+        }
+        for k, v in found.items():
+            if v is not None:
+                stats[k] = v
+        # Correctness and liveness flags, always emitted so a missing value in
+        # the CSV means "the run produced no output", not "it passed".
+        stats['data_ok'] = 1 if 'data=OK' in text else 0
+        stats['completed'] = 1 if 'flush hidden' in text else 0
+        stats['stream_pool_exhausted'] = text.count('[stream-pool] exhausted')
+
     def start(self):
         Which('clio_gpu_vector_flush_bench',
               LocalExecInfo(env=self.mod_env)).run()
 
         os.makedirs(self.config['output_dir'], exist_ok=True)
-        # EVERY swept parameter must appear in the name. With only the cache
-        # size in it, a sweep that also varies spin_us writes all six compute
-        # levels to the same file and leaves one survivor per cache size --
-        # silent data loss that looks like a completed sweep.
-        tag = (f'ppb{self.config["pages_per_block"]}'
-               f'_spin{self.config["spin_us"]}us'
-               f'_b{self.config["blocks"]}'
-               f'_io{self.config["total_io_per_block_mb"]}mb')
-        output_file = os.path.join(self.config['output_dir'],
-                                   f'gv_flush_{tag}.log')
+        output_file = self._output_file()
 
         cmd = [
             'clio_gpu_vector_flush_bench',
