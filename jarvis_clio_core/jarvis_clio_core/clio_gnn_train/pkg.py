@@ -27,6 +27,35 @@ from jarvis_cd.shell.process import Which
 import os
 import re
 
+def _wait_for_free_vram(log, need_gb, timeout_s=180):
+    """Block until the GPU actually has `need_gb` free.
+
+    jarvis starts cells back to back and a finished process releases its VRAM
+    LAZILY, so the next cell can begin while the previous one still holds
+    memory. Measured: a cell that needs 4 GB of tier saw "GPU free=2908MiB"
+    and died -- three cells of a 10-cell GNN sweep were lost this way, and the
+    failures did NOT correlate with their own footprint (one needed only 32
+    MiB of cache). Without this the sweep silently loses whichever cells
+    happen to land in the teardown window.
+    """
+    import subprocess, time
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.free',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=15)
+            free_gb = int(out.stdout.strip().splitlines()[0]) / 1024.0
+        except Exception:
+            return  # no nvidia-smi: nothing to wait on
+        if free_gb >= need_gb:
+            return
+        log(f'  waiting for GPU: {free_gb:.1f} GB free, need {need_gb:.1f} GB')
+        time.sleep(10)
+    log(f'  WARNING: proceeding with less than {need_gb:.1f} GB free after '
+        f'{timeout_s}s -- the cell may fail for lack of device memory')
+
 
 class ClioGnnTrain(Application):
     """GNN training over a paged feature matrix."""
@@ -220,6 +249,11 @@ class ClioGnnTrain(Application):
 
     def start(self):
         Which('test_gpu_vector_gnn_train', LocalExecInfo(env=self.mod_env)).run()
+        _wait_for_free_vram(self.log,
+                            self.config['hbm_mib'] / 1024.0 +
+                            (self.config['gather_blocks'] *
+                             self.config['pages_per_block'] *
+                             self.config['page_kb']) / (1024.0 * 1024.0) + 1.0)
         c = self.config
         os.makedirs(c['output_dir'], exist_ok=True)
         out = self._output_file()

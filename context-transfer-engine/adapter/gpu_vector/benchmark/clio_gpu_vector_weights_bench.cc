@@ -59,8 +59,14 @@ namespace gy = clio::run::gpu;
 
 namespace {
 
-constexpr clio::run::u64 kPageBytes = 64 * 1024;
-constexpr clio::run::u64 kPageElems = kPageBytes / sizeof(clio::run::u32);
+// The DATA's flat-block granularity, deliberately FIXED and independent of
+// the vector's page size. PageIsFlat/Weight decide compressibility on this
+// granule, so tying it to the runtime page size would change the generated
+// bytes whenever the page size changed -- and a page-size sweep would then be
+// comparing different datasets, not different paging.
+constexpr clio::run::u64 kFlatGranuleBytes = 64 * 1024;
+constexpr clio::run::u64 kFlatGranuleElems =
+    kFlatGranuleBytes / sizeof(clio::run::u32);
 const clio::run::PoolId kCompressorPool(512, 0);
 const clio::run::PoolId kCorePool(513, 0);
 constexpr int kLz4WireId = 4;      // registry: {"lz4", 4, ...}   CPU codec
@@ -100,7 +106,7 @@ CTP_INLINE_CROSS_FUN bool PageIsFlat(clio::run::u64 page, clio::run::u32 pct) {
 CTP_INLINE_CROSS_FUN clio::run::u32 Weight(clio::run::u64 i,
                                            clio::run::u32 flat_pct) {
   // A flat page is a single repeated value: what a byte codec collapses.
-  if (PageIsFlat(i / kPageElems, flat_pct)) {
+  if (PageIsFlat(i / kFlatGranuleElems, flat_pct)) {
     return 0x01010101u;
   }
   return Weight(i);
@@ -411,6 +417,7 @@ int main(int argc, char **argv) {
   unsigned blocks = 16;
   clio::run::u64 hbm_mb = 64;
   bool hbm_only = false;   // omit the host spill tier entirely
+  clio::run::u64 page_kb = 64;  // vector page size; the DATA granule is fixed
   // Threads per block. 32 = ONE warp, which means one warp is all there is to
   // decode with; the in-kernel nvcomp decoder is warp-cooperative, so a wider
   // block is what lets several pages decode at once.
@@ -440,6 +447,7 @@ int main(int argc, char **argv) {
     else if (a == "--no-prefetch") prefetch = 0;
     else if (a == "--yieldable") yieldable = true;
     else if (a == "--flat-pct") flat_pct = static_cast<clio::run::u32>(next());
+    else if (a == "--page-kb") page_kb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
@@ -454,6 +462,9 @@ int main(int argc, char **argv) {
   // The GPU tier is the whole point: pages live there in their STORED form, so
   // its capacity decides how much of the model is device-resident. Everything
   // beyond it spills to the host RAM tier below.
+  const clio::run::u64 page_bytes = page_kb * 1024;
+  const clio::run::u64 page_elems = page_bytes / sizeof(clio::run::u32);
+
   {
     std::ofstream cfg("gv_weights_bench.yaml");
     cfg << "networking:\n  port: 9435\n\n"
@@ -495,7 +506,7 @@ int main(int argc, char **argv) {
       // (16GB of weights against a 4GB tier) needs 12GB of spill, so the host
       // tier is derived from the actual logical size with a 1GB margin.
       const clio::run::u64 logical_mb_cfg =
-          (pages_per_block * blocks * kPageBytes) / (1024ull * 1024ull);
+          (pages_per_block * blocks * page_bytes) / (1024ull * 1024ull);
       cfg << "      - path: \"ram::gv_bench_ram\"\n"
           << "        bdev_type: \"ram\"\n"
           << "        capacity_limit: \"" << (logical_mb_cfg + 1024)
@@ -518,7 +529,7 @@ int main(int argc, char **argv) {
   clio::run::IpcManagerGpuInfo gpu_info =
       CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
-  const clio::run::u64 per = pages_per_block * kPageElems;
+  const clio::run::u64 per = pages_per_block * page_elems;
   const clio::run::u64 n = per * blocks;
   const clio::run::u64 logical = n * sizeof(clio::run::u32);
   const std::string tag =
@@ -526,7 +537,7 @@ int main(int argc, char **argv) {
       std::to_string(blocks) + "_" + std::to_string(hbm_mb) + "_" +
       std::to_string(pages_per_block);
 
-  gv::Vector<clio::run::u32> vec(tag, {0}, kPageBytes, blocks, slots, n,
+  gv::Vector<clio::run::u32> vec(tag, {0}, page_bytes, blocks, slots, n,
                                  kCompressorPool,
                                  compressed ? (gpu_codec ? kNvcompLz4WireId
                                                         : kLz4WireId)
@@ -543,7 +554,7 @@ int main(int argc, char **argv) {
     const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           SeedKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu_info, vec.GetDevice(0), per, kPageElems, flat_pct, view,
+              gpu_info, vec.GetDevice(0), per, page_elems, flat_pct, view,
               sstack.View());
         },
         // Abort the moment a writeback FAILS, rather than waiting out a
@@ -585,14 +596,14 @@ int main(int argc, char **argv) {
         // for 256 pages, ~6.8/page), so a fixed cap that suits a 16MB run
         // false-trips a 2GB one. 200/page is ~30x headroom.
         /*max_rounds=*/static_cast<clio::run::u32>(
-            (n / kPageElems) * 200ull + 50000ull));
+            (n / page_elems) * 200ull + 50000ull));
     const bool sdrv_aborted = sdrv.Aborted();
     std::fprintf(stderr, "[seed] yieldable, rounds=%u%s\n", seed_rounds,
                  sdrv_aborted ? " ABORTED (writeback failed)" : "");
     {
       const auto seed_stats = vec.ReadStats(0);
       const clio::run::u32 seed_cap =
-          static_cast<clio::run::u32>((n / kPageElems) * 200ull + 50000ull);
+          static_cast<clio::run::u32>((n / page_elems) * 200ull + 50000ull);
       if (sdrv_aborted || seed_rounds >= seed_cap ||
           seed_stats.put_errors != 0) {
         std::fprintf(stderr,
@@ -618,7 +629,7 @@ int main(int argc, char **argv) {
   clio::run::u64 stored = 0;
   {
     clio::cte::core::Client core(kCorePool);
-    for (clio::run::u64 p = 0; p < n / kPageElems; ++p) {
+    for (clio::run::u64 p = 0; p < n / page_elems; ++p) {
       char name[32];
       gv::PageBlobName(p, name);
       auto sz = core.AsyncGetBlobSize(vec.TagId(), name);
@@ -635,7 +646,7 @@ int main(int argc, char **argv) {
   // cache that covers the model (--slots >= --pages), seeded by the seed
   // pass and never faulting afterwards.
   if (compressed) {
-    const clio::run::u64 npages_all = n / kPageElems;
+    const clio::run::u64 npages_all = n / page_elems;
     clio::run::u64 found = 0;
     for (int attempt = 0; attempt < 200; ++attempt) {
       found = vec.PublishStoredSizes();
@@ -649,7 +660,7 @@ int main(int argc, char **argv) {
 
   unsigned long long *d_sum = nullptr;
   cudaMalloc(&d_sum, sizeof(unsigned long long));
-  const clio::run::u64 total_pages = n / kPageElems;
+  const clio::run::u64 total_pages = n / page_elems;
   unsigned long long *d_page_sum = nullptr;
   unsigned *d_page_visits = nullptr;
   cudaMalloc(&d_page_sum, total_pages * sizeof(unsigned long long));
@@ -674,7 +685,7 @@ int main(int argc, char **argv) {
       rounds = drv.RunToCompletion(
           [&](dim3 g, dim3 b, gy::YieldableView<> view) {
             WeightsKernelYield<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-                gpu_info, vec.GetDevice(0), per, kPageElems, d_sum, d_page_sum,
+                gpu_info, vec.GetDevice(0), per, page_elems, d_sum, d_page_sum,
                 d_page_visits, view, ystack.View());
           },
           []{},
@@ -688,7 +699,7 @@ int main(int argc, char **argv) {
             return flag != 0;
           });
     } else {
-      WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, kPageElems,
+      WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, page_elems,
                                     prefetch, d_sum);
     }
     if (cudaDeviceSynchronize() != cudaSuccess) {
@@ -713,8 +724,8 @@ int main(int argc, char **argv) {
       int shown = 0;
       for (clio::run::u64 p = 0; p < total_pages && shown < 6; ++p) {
         unsigned long long w = 0;
-        for (clio::run::u64 e = 0; e < kPageElems; ++e) {
-          const clio::run::u64 i = p * kPageElems + e;
+        for (clio::run::u64 e = 0; e < page_elems; ++e) {
+          const clio::run::u64 i = p * page_elems + e;
           w += (unsigned long long) Weight(i, flat_pct) * Activation(i);
         }
         if (ps[p] != w) {
@@ -762,7 +773,7 @@ int main(int argc, char **argv) {
                compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
                yieldable ? "+yield" : "", blocks, nthreads,
                (unsigned long long) hbm_mb, slots,
-               (unsigned long long) (n / kPageElems), flat_pct,
+               (unsigned long long) (n / page_elems), flat_pct,
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
                (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
