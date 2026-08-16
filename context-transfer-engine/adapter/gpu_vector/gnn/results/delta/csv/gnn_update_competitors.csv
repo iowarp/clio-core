@@ -1,0 +1,8 @@
+method,gpus,ran,peak_gpu_mib,throughput_mibps,checksum,data
+incore,1,OOM,-1,-1,n/a,real_papers100M_agg
+zerocopy,1,ran,536,2131.2,-1.241293e+07,real_papers100M_agg
+staged,1,ran,432,1342.3,-1.241293e+07,real_papers100M_agg
+gds_compat,1,ran,432,3685.0,-1.241293e+07,real_papers100M_agg
+nccl,2,ran,28246,15638.0,-1.241293e+07,real_papers100M_agg
+mpi,2,ran,28072,15630.9,-1.241293e+07,real_papers100M_agg
+nvshmem,2,ran,29694,28745.7,-1.241293e+07,real_papers100M_agg

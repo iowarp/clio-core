@@ -1,0 +1,6 @@
+features_mib,nodes,readout_s,readout_mibps,peak_window_mib,ratio,bit_exact,note
+960,1966080,7.642,125.6,64,1.000,BIT-EXACT,neighbor-agg (not comparable to old sum-pool)
+3904,7995392,31.426,124.2,64,1.000,BIT-EXACT,
+9792,20054016,79.027,123.9,64,1.000,BIT-EXACT,
+29312,60030976,238.664,122.8,64,1.000,BIT-EXACT,
+54208,111017984,OOM_HOST,-,64,-,-,54GB readout OOMs host; training at 54GB works via minibatch (27.9s/epoch)

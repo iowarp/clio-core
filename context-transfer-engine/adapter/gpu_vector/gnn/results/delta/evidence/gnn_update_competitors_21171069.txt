@@ -1,0 +1,94 @@
++ source /etc/profile.d/modules.sh
++ module load nvhpc-hpcx-cuda12/25.3
++ tail -1
+++ export _ModuleTable_Sz_
++ SDK=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3
++ NVCC=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/bin/nvcc
++ NCCL=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nccl
++ MPI=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi
++ NV=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nvshmem
++ CU6=/usr/local/cuda-12.6/targets/x86_64-linux
++ cd /u/rpawar/gsbench
++ SC=/tmp/rpawar/gnnreal_21171069
++ mkdir -p /tmp/rpawar/gnnreal_21171069
++ DATA=/scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
++ ls -la /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+-rw-------+ 1 rpawar delta_bekn 56862697472 Aug 13 01:02 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
++ echo '### build ###'
+### build ###
++ apptainer exec --nv --bind /u/rpawar /u/rpawar/containers/deps-nvidia.sif bash -lc 'nvcc -std=c++17 -arch=sm_80 -O2 -I/usr/local/cuda-12.6/targets/x86_64-linux/include /u/rpawar/gsbench/expand_gnn.cu -o /u/rpawar/gsbench/expand_gnn -L/usr/local/cuda-12.6/targets/x86_64-linux/lib -lcudart'
++ echo EXPAND_OK
+EXPAND_OK
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/bin/nvcc -std=c++17 -arch=sm_80 -O2 -allow-unsupported-compiler -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nccl/include -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/include mgpu_gnn.cu -o mgpu_gnn -L/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nccl/lib -lnccl -L/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/lib -lmpi -lcudart
++ echo MGPU_OK
+MGPU_OK
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/bin/nvcc -std=c++17 -arch=sm_80 -O2 -allow-unsupported-compiler -rdc=true -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nvshmem/include -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/include nvshmem_gnn.cu -o nvshmem_gnn -L/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nvshmem/lib -lnvshmem_host -lnvshmem_device -L/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/lib -lcuda -lmpi
++ echo NVK_OK
+NVK_OK
++ export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nccl/lib:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nvshmem/lib:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/lib:/opt/cray/pe/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/math_libs/12.8/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/extras/CUPTI/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/nvvm/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/lib64:/opt/cray/libfabric/1.22.0/lib64
++ LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nccl/lib:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/nvshmem/lib:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/lib:/opt/cray/pe/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/math_libs/12.8/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/extras/CUPTI/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/nvvm/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/lib64:/opt/cray/libfabric/1.22.0/lib64
++ export CLIO_HOST_GIB=257
++ CLIO_HOST_GIB=257
++ echo '### REAL papers100M (54 GiB agg features) single-GPU ###'
+### REAL papers100M (54 GiB agg features) single-GPU ###
++ for bk in incore zerocopy staged gds
++ apptainer exec --nv --bind /u/rpawar --bind /tmp --bind /scratch /u/rpawar/containers/deps-nvidia.sif bash -lc 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/x86_64-linux/lib:$LD_LIBRARY_PATH CLIO_HOST_GIB=257; /u/rpawar/gsbench/expand_gnn incore 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32 /tmp/rpawar/gnnreal_21171069'
+[EX][RESULT] backend=incore gib=54 ran=OOM
++ for bk in incore zerocopy staged gds
++ apptainer exec --nv --bind /u/rpawar --bind /tmp --bind /scratch /u/rpawar/containers/deps-nvidia.sif bash -lc 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/x86_64-linux/lib:$LD_LIBRARY_PATH CLIO_HOST_GIB=257; /u/rpawar/gsbench/expand_gnn zerocopy 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32 /tmp/rpawar/gnnreal_21171069'
+[EX][RESULT] backend=zerocopy gib=54 ran=ran peak_gpu_mib=536 throughput_mibps=2131.2 time_per_iter_s=25.946 checksum=-1.241293e+07 iters=3
++ for bk in incore zerocopy staged gds
++ apptainer exec --nv --bind /u/rpawar --bind /tmp --bind /scratch /u/rpawar/containers/deps-nvidia.sif bash -lc 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/x86_64-linux/lib:$LD_LIBRARY_PATH CLIO_HOST_GIB=257; /u/rpawar/gsbench/expand_gnn staged 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32 /tmp/rpawar/gnnreal_21171069'
+[EX][RESULT] backend=staged gib=54 ran=ran peak_gpu_mib=432 throughput_mibps=1342.3 time_per_iter_s=41.196 checksum=-1.241293e+07 iters=3
++ for bk in incore zerocopy staged gds
++ apptainer exec --nv --bind /u/rpawar --bind /tmp --bind /scratch /u/rpawar/containers/deps-nvidia.sif bash -lc 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/x86_64-linux/lib:$LD_LIBRARY_PATH CLIO_HOST_GIB=257; /u/rpawar/gsbench/expand_gnn gds 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32 /tmp/rpawar/gnnreal_21171069'
+[EX][RESULT] backend=gds gib=54 ran=ran peak_gpu_mib=432 throughput_mibps=3685.0 time_per_iter_s=15.006 checksum=-1.241293e+07 iters=3
++ echo '### REAL papers100M multi-GPU pooling (1 GPU OOM, 2 GPU fits) ###'
+### REAL papers100M multi-GPU pooling (1 GPU OOM, 2 GPU fits) ###
++ for bk in nccl mpi
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 1 --bind-to none -x LD_LIBRARY_PATH ./mgpu_gnn nccl 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[MG][RESULT] backend=nccl ngpu=1 gib_per_gpu=54.0 pooled_gib=54.0 ran=OOM (shard>40GiB HBM)
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 2 --bind-to none -x LD_LIBRARY_PATH ./mgpu_gnn nccl 27 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[gpua070.delta.ncsa.illinois.edu:1768220] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[gpua070.delta.ncsa.illinois.edu:1768219] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[MG][RESULT] backend=nccl ngpu=2 gib_per_gpu=27.0 pooled_gib=54.0 ran=ran iters=3 time_s=10.608 agg_mibps=15638.0 peak_gpu_mib_per_gpu=28246 checksum=-1.241293e+07
++ for bk in nccl mpi
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 1 --bind-to none -x LD_LIBRARY_PATH ./mgpu_gnn mpi 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[MG][RESULT] backend=mpi ngpu=1 gib_per_gpu=54.0 pooled_gib=54.0 ran=OOM (shard>40GiB HBM)
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 2 --bind-to none -x LD_LIBRARY_PATH ./mgpu_gnn mpi 27 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[gpua070.delta.ncsa.illinois.edu:1771457] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[gpua070.delta.ncsa.illinois.edu:1771456] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[MG][RESULT] backend=mpi ngpu=2 gib_per_gpu=27.0 pooled_gib=54.0 ran=ran iters=3 time_s=10.613 agg_mibps=15630.9 peak_gpu_mib_per_gpu=28072 checksum=-1.241293e+07
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 1 -x LD_LIBRARY_PATH ./nvshmem_gnn 54 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[NVK][RESULT] backend=nvshmem ngpu=1 gib_per_gpu=54.0 pooled_gib=54.0 ran=OOM
++ /opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/12.8/hpcx/hpcx-2.22.1/ompi/bin/mpirun -np 2 -x LD_LIBRARY_PATH ./nvshmem_gnn 27 3 /scratch/bekn/rpawar/papers100M_prepped/agg_features.f32
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[LOG_CAT_ML] You must specify a valid HCA device by setting:
+-x HCOLL_MAIN_IB=<dev_name:port> or -x UCX_NET_DEVICES=<dev_name:port>.
+If no device was specified for HCOLL (or the calling library), automatic device detection will be run.
+In case of unfounded HCA device please contact your system administrator.
+[gpua070.delta.ncsa.illinois.edu:1774707] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[gpua070.delta.ncsa.illinois.edu:1774708] Error: ../../../../../ompi/mca/coll/hcoll/coll_hcoll_module.c:310 - mca_coll_hcoll_comm_query() Hcol library init failed
+[NVK][RESULT] backend=nvshmem ngpu=2 gib_per_gpu=27.0 pooled_gib=54.0 ran=ran iters=3 time_s=5.771 agg_mibps=28745.7 peak_gpu_mib_per_gpu=29694 checksum=-1.241293e+07
++ echo '=== GNN_REAL_DONE ==='
+=== GNN_REAL_DONE ===
++ rm -rf /tmp/rpawar/gnnreal_21171069
