@@ -162,6 +162,19 @@ class ClioEterniaLbann(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'checkpoint_epochs',
+             'msg': 'Dump the weights every N epochs (0 = never). This is the '
+                    'cost the paged path exists to avoid: the stock path must '
+                    'serialise W to disk, while under own_weights the CTE copy '
+                    'IS the current W and is already durable if the tier is '
+                    'file-backed',
+             'type': int, 'default': 0},
+            {'name': 'ckpt_via_cte',
+             'msg': 'When own_weights is on, treat the CTE copy as the '
+                    'checkpoint and skip the file dump. Set false to make both '
+                    'paths write the same files, which measures paging '
+                    'overhead against an unchanged I/O cost',
+             'type': bool, 'default': True},
             {'name': 'baseline',
              'msg': 'Run the application STOCK kernel instead of the paged '
                     'one, via ETERNIA_BASELINE. Same binary, same input, one '
@@ -201,6 +214,17 @@ class ClioEterniaLbann(Application):
         w = float(self.config['width'])
         return w * w * 4.0 / (1024.0 * 1024.0)
 
+    def _ckpt_is_free(self):
+        """True when this configuration's checkpoint costs nothing extra.
+
+        Only the paged path with own_weights qualifies: there the CTE holds the
+        current W, so a file dump would be a second copy of something already
+        written. Everything else -- the stock path, and the paged path that
+        still lets LBANN own the weights -- has to serialise.
+        """
+        c = self.config
+        return (not c['baseline']) and c['own_weights'] and c['ckpt_via_cte']
+
     def _prototext(self):
         return os.path.join(self.config['output_dir'], 'model.prototext')
 
@@ -221,6 +245,16 @@ class ClioEterniaLbann(Application):
         # `#`, and a `//` line fails the whole parse with "Unable to parse
         # prototext from stream", which looks like a model error rather than a
         # comment syntax error.
+        # The weights dump is skipped only when the CTE copy really is the
+        # live W -- that is own_weights, paged, with ckpt_via_cte left on.
+        # Any other combination writes the files, because claiming a
+        # checkpoint that nothing persisted would be the whole result invented.
+        ckpt = ''
+        if c['checkpoint_epochs'] > 0 and not self._ckpt_is_free():
+            ckpt = ('\n  callback { dump_weights { directory: "%s" '
+                    'epoch_interval: %d } }'
+                    % (os.path.join(c['output_dir'], 'ckpt'),
+                       c['checkpoint_epochs']))
         with open(self._prototext(), 'w') as f:
             f.write(f'''trainer {{ mini_batch_size: {c["mini_batch"]} }}
 data_reader {{
@@ -252,7 +286,7 @@ model {{
   layer {{ parents: "fc2" name: "prob" data_layout: "data_parallel" softmax {{}} }}
   layer {{ parents: "prob" parents: "lbl" name: "ce" data_layout: "data_parallel" cross_entropy {{}} }}
   objective_function {{ layer_term {{ layer: "ce" }} }}
-  callback {{ print {{ interval: 1 }} }}
+  callback {{ print {{ interval: 1 }} }}{ckpt}
 }}
 optimizer {{ sgd {{ learn_rate: 0.01 momentum: 0.0 }} }}
 ''')
@@ -324,6 +358,17 @@ optimizer {{ sgd {{ learn_rate: 0.01 momentum: 0.0 }} }}
                             pass
         if P + 'fwd_s' in stats and P + 'bwd_s' in stats:
             stats[P + 'gemm_s'] = round(stats[P + 'fwd_s'] + stats[P + 'bwd_s'], 4)
+        # How much this cell actually wrote, and whether it paid for it.
+        ck = os.path.join(self.config['output_dir'], 'ckpt')
+        total = 0
+        for root, _dirs, files in os.walk(ck):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+        stats[P + 'ckpt_gb'] = round(total / (1024.0 ** 3), 3)
+        stats[P + 'ckpt_free'] = int(self._ckpt_is_free())
         stats[P + 'objective_first'] = float(objs[0])
         stats[P + 'objective_last'] = float(objs[-1])
         stats[P + 'epochs_seen'] = len(objs)

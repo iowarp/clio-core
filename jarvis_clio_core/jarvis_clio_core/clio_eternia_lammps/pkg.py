@@ -172,6 +172,12 @@ class ClioEterniaLammps(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'restart_steps',
+             'msg': 'Write a binary restart every N steps (0 = never). Both '
+                    'paths pay this: LAMMPS owns the atom arrays, so the paged '
+                    'vectors are a copy and a restart still has to be '
+                    'serialised. Measured at ~71 MB/s, far below this disk',
+             'type': int, 'default': 0},
             {'name': 'baseline',
              'msg': 'Run the application STOCK kernel instead of the paged '
                     'one, via ETERNIA_BASELINE. Same binary, same input, one '
@@ -250,6 +256,11 @@ class ClioEterniaLammps(Application):
         index locality agree.
         """
         c = self.config
+        restart = ('\nrestart         %d %s %s'
+                   % (c['restart_steps'],
+                      os.path.join(c['output_dir'], 'rst_a.bin'),
+                      os.path.join(c['output_dir'], 'rst_b.bin'))
+                   ) if c['restart_steps'] > 0 else ''
         with open(self._input_file(), 'w') as f:
             f.write(f'''units           lj
 atom_style      atomic
@@ -263,7 +274,7 @@ velocity        all create 3.0 87287 loop geom
 atom_modify     sort 1000 2.0
 pair_style      lj/cut/eternia {c["cutoff"]} page {c["page_kb"]} blocks {c["blocks"]} threads {c["threads"]} slots {self._slots()} stats on
 pair_coeff      1 1 1.0 1.0 {c["cutoff"]}
-neighbor        0.3 bin
+neighbor        0.3 bin{restart}
 neigh_modify    every 20 delay 0 check no
 fix             1 all nve
 thermo          {c["steps"]}
@@ -313,6 +324,17 @@ run             {c["steps"]}
             return
         stats[P + 'completed'] = 1
         stats[P + 'e_pair'] = e_pair
+        # LAMMPS alternates two restart files, so bytes on disk understate the
+        # I/O: what was written is size x number of restarts.
+        if self.config['restart_steps'] > 0:
+            one = 0
+            for nm in ('rst_a.bin', 'rst_b.bin'):
+                fp = os.path.join(self.config['output_dir'], nm)
+                if os.path.exists(fp):
+                    one = max(one, os.path.getsize(fp))
+            n = self.config['steps'] // self.config['restart_steps']
+            stats[P + 'ckpt_gb'] = round(one * n / (1024.0 ** 3), 3)
+            stats[P + 'ckpt_free'] = 0
         stats[P + 'mode'] = 'base' if self.config['baseline'] else 'paged'
         # LAMMPS prints the same timing breakdown for both kernels, so the
         # Pair row is directly comparable between the paged and stock runs --

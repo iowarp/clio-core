@@ -164,6 +164,12 @@ class ClioEterniaGromacs(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'nstxout',
+             'msg': 'Write a trajectory frame every N steps (0 = never). Both '
+                    'paths pay this: GROMACS owns the coordinates. Its writer '
+                    'is binary and buffered and costs far less per byte than '
+                    "LAMMPS's restart or LBANN's text dump",
+             'type': int, 'default': 0},
             {'name': 'baseline',
              'msg': 'Run the application STOCK kernel instead of the paged '
                     'one, via ETERNIA_BASELINE. Same binary, same input, one '
@@ -299,17 +305,25 @@ class ClioEterniaGromacs(Application):
                     '[ molecules ]\nAr   %d\n'
                     % (c['sigma'], c['epsilon'], n))
         with open(os.path.join(d, 'md.mdp'), 'w') as f:
-            f.write('integrator      = md\ndt              = 0.001\n'
-                    'nsteps          = %d\nnstlog          = 1\n'
-                    'nstcalcenergy   = 1\ncutoff-scheme   = Verlet\n'
-                    'nstlist         = 10\nverlet-buffer-tolerance = -1\n'
-                    'rlist           = %g\ncoulombtype     = cut-off\n'
-                    'rcoulomb        = %g\nvdwtype         = cut-off\n'
-                    'vdw-modifier    = none\nrvdw            = %g\n'
-                    'DispCorr        = no\npbc             = xyz\n'
-                    'gen-vel         = yes\ngen-temp        = 100\n'
-                    'gen-seed        = 12345\n'
-                    % (c['steps'], c['rcut'], c['rcut'], c['rcut']))
+            # Substitute FIRST, then append. Concatenating the optional
+            # nstxout line before applying % put an extra %d into the format
+            # string and grompp never ran: "not all arguments converted during
+            # string formatting", which reads as a bad mdp rather than a
+            # precedence mistake.
+            mdp = ('integrator      = md\ndt              = 0.001\n'
+                   'nsteps          = %d\nnstlog          = 1\n'
+                   'nstcalcenergy   = 1\ncutoff-scheme   = Verlet\n'
+                   'nstlist         = 10\nverlet-buffer-tolerance = -1\n'
+                   'rlist           = %g\ncoulombtype     = cut-off\n'
+                   'rcoulomb        = %g\nvdwtype         = cut-off\n'
+                   'vdw-modifier    = none\nrvdw            = %g\n'
+                   'DispCorr        = no\npbc             = xyz\n'
+                   'gen-vel         = yes\ngen-temp        = 100\n'
+                   'gen-seed        = 12345\n'
+                   % (c['steps'], c['rcut'], c['rcut'], c['rcut']))
+            if c['nstxout'] > 0:
+                mdp += 'nstxout         = %d\n' % c['nstxout']
+            f.write(mdp)
         Exec(f'{gmx} grompp -f md.mdp -c conf.gro -p topol.top '
              f'-o {self._tpr()} -maxwarn 5 > grompp.log 2>&1',
              LocalExecInfo(env=self.mod_env, cwd=d)).run()
@@ -364,6 +378,10 @@ class ClioEterniaGromacs(Application):
         stats[P + 'completed'] = 1
         first = float(es[0])
         stats[P + 'lj_sr_step0'] = first
+        trr = os.path.join(self.config['output_dir'], 'run.trr')
+        if os.path.exists(trr):
+            stats[P + 'ckpt_gb'] = round(os.path.getsize(trr) / (1024.0 ** 3), 3)
+            stats[P + 'ckpt_free'] = 0
         stats[P + 'per_atom'] = round(first / self._atoms(), 6)
         exact = self._exact_per_atom()
         stats[P + 'per_atom_exact'] = round(exact, 6)
