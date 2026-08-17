@@ -54,6 +54,10 @@ that silently degrades to single-node is the exact failure this exists to catch.
 | GROMACS | LJ(SR) = -8491.7693 (exact lattice sum) | -8491.76907 |
 | LBANN   | objective 1.93652 / 1.87546 / 1.87988 (stock `El::Gemm`) | identical |
 
+All three pass in one `./run_workload_cluster.sh all` invocation with the
+defaults -- `3 passed, 0 failed` -- rather than only individually, which is the
+claim that matters for reproducing it.
+
 ## The settle between runs is load-bearing
 
 `ETERNIA_SETTLE` (default 45s) is not cosmetic. At 20s, cluster formation
