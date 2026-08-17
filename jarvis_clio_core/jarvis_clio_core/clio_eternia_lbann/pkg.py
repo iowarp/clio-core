@@ -162,6 +162,11 @@ class ClioEterniaLbann(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'baseline',
+             'msg': 'Run the application STOCK kernel instead of the paged '
+                    'one, via ETERNIA_BASELINE. Same binary, same input, one '
+                    'variable -- so a comparison changes only the kernel',
+             'type': bool, 'default': False},
             {'name': 'clio_conf',
              'msg': 'Clio server config for the in-process runtime. Each fork '
                     'ships one next to its test harness; the hbm tier size in '
@@ -279,7 +284,8 @@ optimizer {{ sgd {{ learn_rate: 0.01 momentum: 0.0 }} }}
         c = self.config
         tag = (f'b{c["blocks"]}_pg{c["page_kb"]}kb_sl{self._slots()}'
                f'_w{c["width"]}_ep{c["epochs"]}')
-        return os.path.join(c['output_dir'], f'lbann_{tag}.log')
+        mode = 'base' if c['baseline'] else 'paged'
+        return os.path.join(c['output_dir'], f'lbann_{mode}_{tag}.log')
 
     def _get_stat(self, stats):
         # Stats are NAMESPACED. The three eternia packages share a
@@ -302,6 +308,22 @@ optimizer {{ sgd {{ learn_rate: 0.01 momentum: 0.0 }} }}
             stats[P + 'completed'] = 0
             return
         stats[P + 'completed'] = 1
+        stats[P + 'mode'] = 'base' if self.config['baseline'] else 'paged'
+        # LBANN's own timing table, printed by both paths. Column 3 is the
+        # total over the run; whole-process wall clock would also include
+        # data-reader setup and the Clio runtime start, which only the paged
+        # path pays for.
+        for ln in text.splitlines():
+            for tag, out in (('forward prop', 'fwd_s'), ('back prop', 'bwd_s')):
+                if ln.strip().startswith(tag):
+                    parts = [x.strip() for x in ln.split('|')]
+                    if len(parts) >= 3:
+                        try:
+                            stats[P + out] = float(parts[2])
+                        except ValueError:
+                            pass
+        if P + 'fwd_s' in stats and P + 'bwd_s' in stats:
+            stats[P + 'gemm_s'] = round(stats[P + 'fwd_s'] + stats[P + 'bwd_s'], 4)
         stats[P + 'objective_first'] = float(objs[0])
         stats[P + 'objective_last'] = float(objs[-1])
         stats[P + 'epochs_seen'] = len(objs)
@@ -339,15 +361,24 @@ optimizer {{ sgd {{ learn_rate: 0.01 momentum: 0.0 }} }}
         env = dict(self.mod_env)
         if c['clio_conf']:
             env['CLIO_SERVER_CONF'] = c['clio_conf']
+        if c['baseline']:
+            env['ETERNIA_BASELINE'] = '1'
         env['LBANN_ETERNIA_FC'] = '1'
         env['LBANN_ETERNIA_STATS'] = '1'
         env['LBANN_ETERNIA_PAGE_KB'] = str(c['page_kb'])
         env['LBANN_ETERNIA_BLOCKS'] = str(c['blocks'])
         env['LBANN_ETERNIA_SLOTS'] = str(self._slots())
-        if c['host_weights']:
-            env['LBANN_ETERNIA_FC_HOST_WEIGHTS'] = '1'
-        if c['own_weights']:
-            env['LBANN_ETERNIA_FC_OWN_WEIGHTS'] = '1'
+        # host_weights and own_weights describe the PAGED path and are
+        # meaningless without it. Passing them under ETERNIA_BASELINE puts the
+        # linearity on the host while the activations stay on the GPU, and
+        # El::Gemm then aborts with "Must call gemm with matrices on same
+        # device" -- a baseline that fails outright, which reads as the stock
+        # path being broken rather than as a bad flag combination.
+        if not c['baseline']:
+            if c['host_weights']:
+                env['LBANN_ETERNIA_FC_HOST_WEIGHTS'] = '1'
+            if c['own_weights']:
+                env['LBANN_ETERNIA_FC_OWN_WEIGHTS'] = '1'
         cmd = [binary, f'--prototext={self._prototext()}']
         if c['timeout_sec'] > 0:
             cmd.insert(0, f'timeout {c["timeout_sec"]}')

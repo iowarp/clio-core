@@ -164,6 +164,11 @@ class ClioEterniaGromacs(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'baseline',
+             'msg': 'Run the application STOCK kernel instead of the paged '
+                    'one, via ETERNIA_BASELINE. Same binary, same input, one '
+                    'variable -- so a comparison changes only the kernel',
+             'type': bool, 'default': False},
             {'name': 'clio_conf',
              'msg': 'Clio server config for the in-process runtime. Each fork '
                     'ships one next to its test harness; the hbm tier size in '
@@ -257,7 +262,8 @@ class ClioEterniaGromacs(Application):
         c = self.config
         tag = (f'b{c["blocks"]}_pg{c["page_kb"]}kb_sl{self._slots()}'
                f'_n{self._atoms()}_st{c["steps"]}')
-        return os.path.join(c['output_dir'], f'gromacs_{tag}.log')
+        mode = 'base' if c['baseline'] else 'paged'
+        return os.path.join(c['output_dir'], f'gromacs_{mode}_{tag}.log')
 
     def _prepare_inputs(self, gmx):
         """Generate the lattice and run grompp.
@@ -327,7 +333,29 @@ class ClioEterniaGromacs(Application):
             return
         # INVALID_E= rather than E= means failed page reads; it must not parse
         # as an energy, which is why the hook spells it differently.
+        stats[P + 'mode'] = 'base' if self.config['baseline'] else 'paged'
+        # Whole-run wall clock, reported by mdrun for both modes.
+        m = re.search(r'Time:\s+([0-9.]+)\s+([0-9.]+)', text)
+        if m:
+            stats[P + 'wall_s'] = float(m.group(2))
+        # The paged kernel times itself; the baseline has no such kernel.
+        ms = re.findall(r'\bms=([0-9.]+)', text)
+        if ms:
+            # First call includes context creation and the upload, so the
+            # steady-state figure is the later one.
+            stats[P + 'kernel_ms_first'] = float(ms[0])
+            stats[P + 'kernel_ms'] = float(ms[-1])
         es = re.findall(r'(?:^|[^_])E=(-[0-9.]+)', text)
+        if not es and self.config['baseline']:
+            # Under ETERNIA_BASELINE the hook is off entirely, so the energy
+            # comes from mdrun's own log rather than from a summary line that
+            # is never printed. Without this the baseline reads as a failed
+            # run in every cell.
+            run_log = os.path.join(self.config['output_dir'], 'run.log')
+            body = self._read_log(run_log) or ''
+            rows = re.findall(r'^\s+(-?[0-9.]+e[+-][0-9]+)', body, re.M)
+            if rows:
+                es = [rows[0]]
         if not es:
             stats[P + 'completed'] = 0
             if 'RESULT INVALID' in text:
@@ -369,6 +397,8 @@ class ClioEterniaGromacs(Application):
         env = dict(self.mod_env)
         if c['clio_conf']:
             env['CLIO_SERVER_CONF'] = c['clio_conf']
+        if c['baseline']:
+            env['ETERNIA_BASELINE'] = '1'
         s6 = (c['sigma'] ** 6)
         env['GMX_ETERNIA_NB'] = '1'
         env['GMX_ETERNIA_C6'] = repr(4.0 * c['epsilon'] * s6)

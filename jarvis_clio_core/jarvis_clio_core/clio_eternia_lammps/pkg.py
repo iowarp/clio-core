@@ -172,6 +172,11 @@ class ClioEterniaLammps(Application):
                     'that exceeds it is refused rather than left to die after '
                     'printing its header',
              'type': float, 'default': 7.0},
+            {'name': 'baseline',
+             'msg': 'Run the application STOCK kernel instead of the paged '
+                    'one, via ETERNIA_BASELINE. Same binary, same input, one '
+                    'variable -- so a comparison changes only the kernel',
+             'type': bool, 'default': False},
             {'name': 'clio_conf',
              'msg': 'Clio server config for the in-process runtime. Each fork '
                     'ships one next to its test harness; the hbm tier size in '
@@ -269,7 +274,8 @@ run             {c["steps"]}
         c = self.config
         tag = (f'b{c["blocks"]}_pg{c["page_kb"]}kb_sl{self._slots()}'
                f'_n{self._atoms()}_st{c["steps"]}')
-        return os.path.join(c['output_dir'], f'lammps_{tag}.log')
+        mode = 'base' if c['baseline'] else 'paged'
+        return os.path.join(c['output_dir'], f'lammps_{mode}_{tag}.log')
 
     def _get_stat(self, stats):
         # Stats are NAMESPACED. The three eternia packages share a
@@ -307,6 +313,20 @@ run             {c["steps"]}
             return
         stats[P + 'completed'] = 1
         stats[P + 'e_pair'] = e_pair
+        stats[P + 'mode'] = 'base' if self.config['baseline'] else 'paged'
+        # LAMMPS prints the same timing breakdown for both kernels, so the
+        # Pair row is directly comparable between the paged and stock runs --
+        # which whole-process wall clock is not, since it also carries runtime
+        # startup that only the paged path pays.
+        for ln in text.splitlines():
+            if ln.startswith('Pair') and '|' in ln:
+                parts = [x.strip() for x in ln.split('|')]
+                if len(parts) >= 4:
+                    try:
+                        stats[P + 'pair_time_s'] = float(parts[2])
+                    except ValueError:
+                        pass
+                break
         stats[P + 'e_pair_per_atom'] = round(e_pair, 6)
         # Paging counters from the last per-step line the pair style prints.
         last = None
@@ -344,6 +364,8 @@ run             {c["steps"]}
         env = dict(self.mod_env)
         if c['clio_conf']:
             env['CLIO_SERVER_CONF'] = c['clio_conf']
+        if c['baseline']:
+            env['ETERNIA_BASELINE'] = '1'
         cmd = [binary, '-in', self._input_file()]
         if c['timeout_sec'] > 0:
             cmd.insert(0, f'timeout {c["timeout_sec"]}')

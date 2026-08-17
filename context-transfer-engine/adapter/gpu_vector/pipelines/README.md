@@ -29,6 +29,7 @@ worth having — the page-size result below is entirely explained by them.
 | `gv_tiered_flush_sweep` | block flush | write a region and flush it | none |
 | `gv_cache_page_block_sweep` | all four + the 3 apps | page size × block count; the four benchmarks at 2× VRAM with cache pinned at half of VRAM, the apps at their own scale | all patterns |
 | `gv_grayscott_pressure` | Gray-Scott + the 3 apps | cache driven from full residency to the floor | pressure |
+| `gv_eternia_baseline` | the 3 apps | paged path vs the application's own kernel, one env var | overhead |
 
 ## The three application workloads
 
@@ -53,6 +54,33 @@ cell that computes the wrong one is visible in the table rather than being
 ranked on its speed. GROMACS is checked against a double-precision lattice sum
 computed at configure time; LAMMPS against an E_pair that must not move with
 the paging geometry; LBANN against its objective.
+
+### Paged vs stock: `ETERNIA_BASELINE`
+
+All three applications take `ETERNIA_BASELINE=1`, which switches them to their
+own stock kernel and changes nothing else — same binary, same input, one
+variable. `gv_eternia_baseline` runs both paths and compares.
+
+At sizes that FIT, the stock path wins by one to two orders of magnitude, and
+should: it holds its data resident and pays nothing for capacity, while the
+paged path pays for out-of-core machinery it does not need there.
+
+| workload | paged | stock | ratio |
+|---|---|---|---|
+| LAMMPS pair kernel | 2.38 s | 0.31 s *(CPU)* | 7.6× |
+| LBANN fwd+bwd GEMM | 20.67 s | 0.088 s | 234× |
+| GROMACS paged kernel | 241 ms | runs alongside, see below | — |
+
+Correctness is identical on both paths in all three.
+
+Read those with the caveats attached: LAMMPS's baseline is its **CPU** kernel
+because this build has no GPU package; GROMACS's paged kernel runs *alongside*
+nbnxm rather than instead of it, so compare `kernel_ms` and not run wall clock;
+and LBANN's 234× is measured where the weights fit, which is precisely where
+the paged path has nothing to offer. Where they do not fit — a 1 GiB weight
+matrix — the paged path peaks at 366 MiB of VRAM against 4298 MiB resident.
+
+A ratio taken where the baseline still runs measures overhead, not value.
 
 ### LBANN's cache axis is inert, and that is the result
 
