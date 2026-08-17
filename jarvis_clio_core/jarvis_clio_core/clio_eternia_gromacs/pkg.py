@@ -353,7 +353,12 @@ class ClioEterniaGromacs(Application):
         if m:
             stats[P + 'wall_s'] = float(m.group(2))
         # The paged kernel times itself; the baseline has no such kernel.
-        ms = re.findall(r'\bms=([0-9.]+)', text)
+        # ANCHORED to the eternia summary line. A bare ms= also matches Clio's
+        # own log lines, which carry unrelated ms= fields -- a sweep read
+        # medians of 5000 and 28672 "milliseconds" that were queue depths and
+        # timeouts, and the resulting per-atom costs were nonsense in a way
+        # that still looked like data.
+        ms = re.findall(r'\[eternia\][^\n]*?\bms=([0-9.]+)', text)
         if ms:
             # First call includes context creation and the upload, so the
             # steady-state figure is the later one.

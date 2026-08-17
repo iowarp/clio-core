@@ -184,3 +184,44 @@ on a fraction of the card.
   others'.
 - Two GNN cells at 64 blocks fail sporadically to the VRAM teardown window;
   the same cells pass on other runs.
+
+## Reaching a checkpoint target faster: capacity, not timesteps
+
+Checkpoint bytes scale with the workload's MEMORY FOOTPRINT, so a fixed I/O
+target can be reached with few large checkpoints instead of many small ones.
+Whether that is *faster* depends on how each paged kernel scales, which is not
+the same across the three.
+
+Measured paged efficiency against problem size:
+
+| workload | small | large | change |
+|---|---|---|---|
+| LAMMPS | 19.6 us/atom-step @ 13.5k | 1.73 @ 665k | **11x better** |
+| LBANN | 55738 us/MiB-epoch @ 64 MiB | 37483 @ 1 GiB | 1.5x better |
+| GROMACS | 0.78 us/atom-step @ 27k | 1.12 @ 216k | slightly **worse** |
+
+Time to generate 50 GB of checkpoints on the paged path:
+
+| workload | small config | large config |
+|---|---|---|
+| LAMMPS | 206 min @ 13.5k atoms | **18 min @ 665k atoms** |
+| LBANN | 15 min @ width 4096 | **10 min @ width 16384** |
+| GROMACS | 58 min @ 27k atoms | 83 min @ 216k atoms |
+
+**LAMMPS: scale up.** It carries a large fixed per-step cost — kernel launch,
+cache drop, list re-upload — that amortizes over a bigger system, so the same
+50 GB costs 18 minutes instead of 206.
+
+**LBANN: scale up modestly.** Its paged cost is mostly per-page fault work, so
+efficiency improves only 1.5x, and most of the win is simply needing 15 epochs
+instead of 248.
+
+**GROMACS: do not.** Its paged kernel is pair work with almost no fixed
+overhead, so per-atom cost is flat and the largest configuration is the
+slowest. Reach the target with more steps at a small size, not fewer at a
+large one.
+
+For the STOCK path none of this matters: compute scales with atoms x steps
+while steps scale as 1/atoms, so compute to a fixed I/O target is invariant
+(~220 s for LAMMPS across a 50x size range) and the I/O itself is a flat
+~76 MB/s regardless of checkpoint size.
