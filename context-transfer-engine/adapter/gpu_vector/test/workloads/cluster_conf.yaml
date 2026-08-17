@@ -1,0 +1,48 @@
+# Cluster config for the workload cluster tests. Every node loads this one
+# file; the hostfile makes the four containers a single cluster.
+#
+# Why the peers matter: a vector's pages are CTE blobs, and blobs hash across
+# the cluster at the blob level. With four nodes composed, roughly three
+# quarters of the workload's page faults are served from ANOTHER node's memory.
+# That is the property under test -- the single-node runs already showed the
+# paging path is correct, and this shows it stays correct when the page is on a
+# different machine.
+#
+# The hbm tier is small on purpose. It is a GPU allocation taken at startup on
+# every node, and four nodes share one physical GPU here, so a generous value
+# would multiply by four and crowd out the workload itself.
+networking:
+  port: 9423
+  hostfile: "/workspace/context-transfer-engine/adapter/gpu_vector/test/workloads/hostfile"
+
+runtime:
+  num_threads: 4
+  queue_depth: 8192
+  first_busy_wait: 2000000000
+
+gpu:
+  queue_depth: 8192
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::wl_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "1GB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "hbm::wl_hbm"
+        bdev_type: "hbm"
+        capacity_limit: "64MB"
+        score: 1.0
+      - path: "ram::wl_ram"
+        bdev_type: "ram"
+        capacity_limit: "1024MB"
+        score: 0.2
+    dpe:
+      dpe_type: "max_bw"

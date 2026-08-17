@@ -167,6 +167,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS test_gpu_vector_distributed RUNTIME DESTINATION bin)
 
+
     # Compressed-tier tests link the compressor pool; with
     # CLIO_CTE_ENABLE_COMPRESS=OFF (the GPU conda job's cuda-release preset)
     # those targets do not exist and CMake degrades them to bare -l flags
@@ -402,3 +403,33 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     endif()  # TARGET clio_cte_compressor_runtime
 endif()
+
+# Peer node for the workload cluster tests (workloads/). Node 1 runs
+# LAMMPS/GROMACS/LBANN against the paged path; nodes 2..N run this so their
+# RAM tiers join the cluster and the workload's pages hash onto other
+# machines.
+#
+# Deliberately OUTSIDE the CLIO_CORE_ENABLE_CUDA guard above. It contains no
+# device code, and a peer's job is to hold blobs, not to run kernels -- so it
+# must build in a CPU-only image, which is exactly what the cluster harness
+# runs the peers in. Putting it inside the guard silently produced no target
+# at all in a CPU build.
+add_executable(eternia_cluster_node workloads/eternia_cluster_node.cc)
+target_include_directories(eternia_cluster_node PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+)
+target_link_libraries(eternia_cluster_node PRIVATE
+    clio_run_cxx
+    clio_admin_client
+    clio_bdev_client
+    clio_cte_core_client
+    clio_cte_core_runtime
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(eternia_cluster_node PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+install(TARGETS eternia_cluster_node RUNTIME DESTINATION bin)
