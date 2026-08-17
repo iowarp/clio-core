@@ -1,7 +1,9 @@
 # GPU vector benchmark pipelines
 
-Six jarvis pipelines over five workloads, each driving a GPU vector whose data
-does not fit on the device. All of them write to
+Jarvis pipelines over eight workloads, each driving a GPU vector whose data
+does not fit on the device: five gpu_vector benchmarks, and the three eternia
+application workloads (LAMMPS, GROMACS, LBANN) that run the same paging path
+inside a real application. All of them write to
 `/home/llogan/Documents/Projects/iowarp/core/results/<pipeline>/`, which is
 gitignored — results are data, not source.
 
@@ -25,7 +27,42 @@ worth having — the page-size result below is entirely explained by them.
 | `gv_gnn_page_block_sweep` | GNN training | gather scattered node rows | scattered |
 | `gv_grayscott_page_block_sweep` | Gray-Scott | sliding 3-plane stencil window | partial (2 of 3) |
 | `gv_tiered_flush_sweep` | block flush | write a region and flush it | none |
-| `gv_weights_cache_sweep` | model weights | block count vs cache size | full |
+| `gv_cache_page_block_sweep` | all four + the 3 apps | page size × block count; the four benchmarks at 2× VRAM with cache pinned at half of VRAM, the apps at their own scale | all patterns |
+| `gv_grayscott_pressure` | Gray-Scott + the 3 apps | cache driven from full residency to the floor | pressure |
+
+## The three application workloads
+
+`gv_cache_page_block_sweep` and `gv_grayscott_pressure` also run the eternia
+application workloads — LAMMPS, GROMACS and LBANN — through the jarvis packages
+`clio_eternia_{lammps,gromacs,lbann}`. They need the forked builds, which are
+not in this repo:
+
+    export ETERNIA_BIN_DIR=<root holding lmp-build/, gmx-build/, lbann-build/, clio-inst/>
+
+Two things to know before reading their numbers.
+
+**They are not at 2× VRAM and cannot be.** Their paged datasets are whatever
+the application's data structures come to — LBANN's W is `width² × 4B`, LAMMPS
+is ~745 B/atom, GROMACS ~21 B/atom — and GROMACS would need 818 million atoms
+to reach 16 GB. They are sized to what runs in a 20-cell sweep and carry a
+cache set as a fraction of their own dataset. Compare them to each other and to
+themselves across the axes, not to the four benchmarks.
+
+**Every cell reports `correct`.** These three have a known exact answer, so a
+cell that computes the wrong one is visible in the table rather than being
+ranked on its speed. GROMACS is checked against a double-precision lattice sum
+computed at configure time; LAMMPS against an E_pair that must not move with
+the paging geometry; LBANN against its objective.
+
+### LBANN's cache axis is inert, and that is the result
+
+Measured flat at 4100 faults from 64 slots per block down to 2. Every LBANN
+kernel calls `DropAll()` on entry — the host may have rewritten the backing
+store between launches, so a resident page could be stale — and each kernel
+then makes a single pass over W. There is no reuse for a cache to capture,
+within a call or across them. Included because "this workload cannot benefit
+from a larger cache" is worth knowing, and is the opposite of what a reader
+would assume.
 
 ## Headline result: page size dominates, and locality explains the ordering
 
