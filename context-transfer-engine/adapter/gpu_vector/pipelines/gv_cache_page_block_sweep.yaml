@@ -1,0 +1,669 @@
+# PAGE SIZE x BLOCK COUNT, on SEVEN WORKLOADS: the four gpu_vector benchmarks
+# at 2x VRAM with the page cache PINNED at half of VRAM, plus the three eternia
+# APPLICATION workloads (LAMMPS, GROMACS, LBANN) at their own scale.
+#
+# The applications are not at 2x VRAM and cannot be -- their paged datasets are
+# whatever the application's data structures come to, and GROMACS would need
+# 818 million atoms to reach 16 GB. They carry a cache set as a fraction of
+# their own dataset instead, so the sweep still applies pressure to them. Read
+# the two groups separately: the four benchmarks are comparable to each other
+# at a common size, the three applications are not comparable to them.
+#
+# THE CACHE IS NOT AN AXIS HERE. gv_cache_trend and gv_grayscott_pressure
+# already sweep it; this pipeline holds it fixed at 4096 MB -- half of the
+# 8188 MB card, rounded to a power of two so the per-block slot count comes out
+# integral at every point -- and sweeps the two axes that were measured to
+# matter far more:
+#
+#   page_kb    16, 64, 256, 1024, 4096 KB. THE DOMINANT AXIS. Measured at 2x
+#              VRAM: weights 33.6x (35288 -> 1050 ms), k-means 16.9x, GNN 4.8x.
+#              Faults scale almost exactly inversely with page size (weights
+#              4,193,065 -> 15,175 across the 256x range), so this axis is
+#              really "how much work does one fault do".
+#
+#   blocks     16, 32, 64, 128. More blocks = more concurrent fault streams,
+#              with clear diminishing returns: on weights at 16 GB the gain per
+#              doubling ran +42%, +14%, +19%, -11%, +7%, so only 8 -> 64 cleared
+#              the noise, and on the GNN gather the axis is worth ~1.0x.
+#
+# 5 x 4 = 20 combinations, each running all four workloads = 80 runs.
+#
+# FOUR WORKLOADS, because the page-size result is entirely explained by ACCESS
+# PATTERN and one pattern cannot show that:
+#
+#   weights     re-read the whole matrix each pass    every fetched byte used
+#   k-means     stream the point set once per pass    every fetched byte used
+#   Gray-Scott  sliding 3-plane stencil window        short reuse distance
+#   GNN         gather scattered node rows            a large page over-fetches
+#
+# Page size pays most where every fetched byte is eventually used and least
+# where rows are scattered, which is why weights gains 33.6x and the GNN gather
+# only 4.8x over the same range.
+#
+# 2x VRAM EVERYWHERE. The card is 8188 MB, so every workload is sized to
+# 16384 MB against a 1024 MB kHBM tier: 2.0x the device and 16x the tier, so
+# every run pages for its whole duration. GNN reaches the same size through
+# 33554432 nodes x 128 dims x 4 B = 16384 MiB.
+#
+# THE DATASET MUST BE HELD CONSTANT, and this is the trap that has already
+# produced a false result here. The benchmarks size themselves as
+# blocks x pages_per_block x page_kb, so a fixed pages_per_block would change
+# the DATASET along BOTH axes: one earlier sweep failed to pass --page-kb at
+# all, shrank the matrix from 16 GB to 256 MB across the page axis, and
+# reported a spurious 92x "page-size effect" that was really a dataset-size
+# effect. Every package here is therefore given `data_mb` (`nodes` for GNN) and
+# DERIVES pages_per_block = data_mb / blocks / page_kb, and the post block
+# refuses to report a grid whose cells did not all run the same dataset.
+#
+# THE CACHE, held constant in BYTES and therefore varying in slots:
+#
+#     slots/block = 4096 MB / (blocks x page_kb)
+#
+#     blocks\page_kb    16     64    256   1024   4096
+#          16        16384   4096   1024    256     64
+#          32         8192   2048    512    128     32
+#          64         4096   1024    256     64     16
+#         128         2048    512    128     32      8
+#
+# Coverage is 25% of the dataset at every cell -- that is what "held constant"
+# means, and it is the reason the grid reads as a page/block result rather than
+# a cache one. The bottom-right cell is exactly 8 slots/block, which is
+# Gray-Scott's stencil floor (z-1, z, z+1 of u and v, plus two outputs); its
+# package REFUSES fewer, because below that a plane still being read could be
+# evicted and the run would return WRONG DATA rather than fail. That floor is
+# what caps the grid at 128 blocks and 4 MB pages.
+#
+# DEVICE BUDGET: 4096 MB of cache + a 1024 MB kHBM tier = 5.0 GB at every cell,
+# inside the 7.0 GB guard and inside the card. The budget is checked per cell
+# anyway -- a k-means sweep once lost three cells to a 16 GB cache request on
+# an 8 GB card, and they printed a header and died, which reads as a hang.
+#
+# UNCOMPRESSED THROUGHOUT. A codec changes how many bytes each fault moves,
+# which is precisely what the page axis is measuring.
+#
+# READING THE RESULT
+#   faults        the paging work actually done, and the trustworthy number:
+#                 it moves ~0.03% run to run while timings move ~26%. Expect it
+#                 to fall roughly as 1/page_kb; a flat fault count across the
+#                 page axis means --page-kb did not reach the binary.
+#   ms / epoch_s  the benchmark's OWN measured time (best of 3 in-process),
+#                 excluding setup. jarvis's `runtime` column is whole-process
+#                 wall clock, is 44-55% setup here, and must not be used.
+#   checksum      Gray-Scott's field checksum is not reproducible run to run
+#                 (3.37e-04 on identical settings) AND its page axis is
+#                 confounded -- one page is one XY plane, so page size also
+#                 changes the grid geometry. Its numbers are indicative only.
+#                 GNN's final_loss, by contrast, is bit-identical across every
+#                 page size and block count (3.703790, spread 0.0000%) and is
+#                 the strongest correctness evidence in the set.
+#
+# ONE SAMPLE PER CELL (repeat: 1). Stats are read from each benchmark's own log
+# rather than from jarvis's merged results -- four packages in one pipeline
+# COLLIDE on `kernel_ms` and `faults`, last writer wins, silently -- and a
+# jarvis-level repeat would OVERWRITE that log rather than add a sample. The
+# measured between-process spread is 26%, so a time difference smaller than
+# that is not a result; the fault grids are the stable signal. The page axis
+# spans 33.6x, far outside that band.
+#
+# COST: 80 runs of a 16 GB workload, and the 16 KB column is the slow one
+# (weights alone was 35 s of kernel time per run there, before setup). Sweeps
+# must not run concurrently -- a second runtime does not error, it stalls on a
+# fraction of the card.
+#
+# Requires: clio_gpu_vector_{weights,kmeans,grayscott}_bench and
+#           test_gpu_vector_gnn_train on PATH (<build>/bin), a CUDA device with
+#           >= 6 GB free, and ~35 GB of host RAM (GNN holds the 16 GiB matrix
+#           plus its 16 GiB host tier).
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-coro/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_cache_page_block_sweep.yaml
+
+config:
+  name: gv_cache_page_block_sweep
+  # ENVIRONMENT -- MUST LIVE INSIDE `config:`, NOT AT THE TOP LEVEL.
+  #
+  # `jarvis ppl run yaml` is a pipeline TEST: it dumps test_def['config'] to a
+  # temp yaml and loads THAT as the pipeline, so only what is inside `config:`
+  # survives. A top-level `env:` is silently dropped -- jarvis logs "no 'env'
+  # field in pipeline", auto-builds the environment, and the run proceeds
+  # looking entirely normal with the variable never set.
+  #
+  # 2GB pre-faults a bounded PREFIX of each shm-backed RAM tier at compose,
+  # rather than taking a minor fault and a zeroed page on the first write
+  # inside the measured window. "0" is special-cased to the WHOLE mapping,
+  # which is not what is wanted here.
+  env:
+    CLIO_PREFAULT: "2GB"
+  pkgs:
+    # ---- 1. WEIGHTS: full re-read, every fetched byte is used ----
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_weights
+      pkg_name: gvw
+
+      # 16384 MB = 2.0x the 8188 MB card. data_mb DERIVES pages-per-block as
+      # data_mb/blocks/page_kb, which is what holds the dataset constant across
+      # BOTH swept axes; the `pages` value below is inert while it is set.
+      data_mb: 16384
+      page_kb: 1024
+      pages: 1024
+
+      blocks: 32
+      threads: 256
+      rt_threads: 8
+
+      hbm_mb: 1024
+      # A host tier must exist to hold the 15360 MB the kHBM tier cannot. With
+      # hbm_only the writebacks would simply fail and there would be no
+      # measurement at all.
+      hbm_only: false
+
+      # THE PAGE CACHE, PINNED. 4096 MB total across all blocks = half the
+      # card. Given as a TOTAL, never as per-block `slots`: `slots` is per
+      # block, so a fixed slot count would scale the cache with the block count
+      # and turn the blocks axis into a cache axis. slots is ignored while this
+      # is set.
+      cache_mb: 4096
+      cache_frac: 0.0
+      slots: 8
+
+      # UNCOMPRESSED -- a codec changes the bytes per fault, which is the axis.
+      compressed: false
+      cpu_codec: false
+      flat_pct: 0
+
+      no_prefetch: false
+      # THE COROUTINE KERNEL. Without it the binary picks a path its own source
+      # calls "single-threaded per block on purpose" -- a cell that runs in 53s
+      # took over 600s, and it was nearly recorded as a code regression.
+      yieldable: true
+      repeat: 3
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_pb_weights"
+
+    # ---- 2. K-MEANS: streaming read, no intra-pass reuse ----
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_kmeans
+      pkg_name: km
+
+      data_mb: 16384
+      page_kb: 1024
+      blocks: 32
+      threads: 256
+
+      hbm_mb: 1024
+      hbm_only: false
+
+      cache_mb: 4096
+      cache_frac: 0.0
+      slots: 8
+
+      # dims=32 divides the floats per page at every size on the axis (16 KB is
+      # 4096 floats), so no point ever straddles a page boundary.
+      dims: 32
+      clusters: 16
+      iters: 2
+      repeat: 3
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_pb_kmeans"
+
+    # ---- 3. GRAY-SCOTT: sliding window; its page axis is CONFOUNDED ----
+    #
+    # One page is one XY plane, so page size also changes the grid geometry:
+    # 4 fields x nz planes where nz = 4 GiB of floats / plane. Unlike the other
+    # three this is not a pure paging comparison, and its row is reported with
+    # that caveat rather than dropped.
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_grayscott
+      pkg_name: gs
+
+      data_mb: 16384
+      page_kb: 1024
+      blocks: 32
+      threads: 256
+
+      hbm_mb: 1024
+      hbm_only: false
+
+      cache_mb: 4096
+      cache_frac: 0.0
+      slots: 8
+
+      steps: 2
+      repeat: 3
+
+      Du: 0.2
+      Dv: 0.1
+      F: 0.02
+      K: 0.048
+      dt: 1.0
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_pb_grayscott"
+
+    # ---- 4. GNN: gather over scattered rows, where big pages over-fetch ----
+    - pkg_type: jarvis_clio_core.clio_gnn_train
+      pkg_name: gnn
+
+      # 33554432 x 128 x 4 B = 16384 MiB, matching the others at 2x VRAM.
+      nodes: 33554432
+      dim: 128
+      classes: 40
+      hidden: 64
+      epochs: 2
+
+      page_kb: 1024
+      gather_blocks: 32
+
+      cache_mb: 4096
+      cache_frac: 0.0
+      pages_per_block: 8
+
+      hbm_mib: 1024
+      # Sized to hold the 15360 MiB the kHBM tier cannot, with headroom.
+      # "ram" not "pinned": the trainer transiently holds two host copies of
+      # the matrix and pinned pages are unswappable, which OOM-killed the run
+      # (exit 137, no message, reads exactly like a hang). This penalises the
+      # host tier for its allocation type rather than its speed, so GNN's
+      # absolute host-tier numbers are not comparable with the others'.
+      dram_mib: 16384
+      dram_type: "ram"
+
+      compress_lib: 0
+      # The training window in MEGABYTES, not pages. A fixed page COUNT makes
+      # the staging scratch scale with page size -- 256 pages is 4 MiB at 16 KB
+      # but 1024 MiB at 4 MB (peak 2048 MiB) -- and that lost both 4 MB cells
+      # of an earlier sweep. This axis is exactly where that bites.
+      window_mb: 256
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_pb_gnn"
+    # ---- the three eternia application workloads -------------------------
+    #
+    # NOT at 2x VRAM, and they cannot be. Their paged datasets are set by the
+    # application's own data structures, not by a `data_mb` knob:
+    #
+    #   LBANN    W = width^2 x 4B      8192 -> 256 MB, 16384 -> 1 GiB
+    #   LAMMPS   ~745 B/atom           62500 atoms -> 44 MB
+    #   GROMACS  ~21 B/atom            216000 atoms -> 4.3 MB
+    #
+    # GROMACS would need 818 MILLION atoms to reach 16 GB, so a common dataset
+    # size across all seven workloads is not available. These three are sized
+    # to what runs in a 20-cell sweep, and their cache is a FRACTION of their
+    # own dataset rather than pinned at 4096 MB -- a pinned 4 GB cache exceeds
+    # every one of these datasets and would remove the pressure entirely.
+    - pkg_type: jarvis_clio_core.clio_eternia_lammps
+      pkg_name: lmp
+      lattice_cells: 25
+      steps: 20
+      page_kb: 256
+      blocks: 32
+      threads: 256
+      cache_frac: 0.125
+      timeout_sec: 1800
+      vram_budget_gb: 7.0
+      output_dir: "/tmp/gv_pb_lammps"
+    - pkg_type: jarvis_clio_core.clio_eternia_gromacs
+      pkg_name: gmx
+      cells: 60
+      steps: 2
+      page_kb: 64
+      blocks: 32
+      cache_frac: 0.125
+      timeout_sec: 1800
+      vram_budget_gb: 7.0
+      output_dir: "/tmp/gv_pb_gromacs"
+    - pkg_type: jarvis_clio_core.clio_eternia_lbann
+      pkg_name: lb
+      width: 8192
+      epochs: 2
+      page_kb: 256
+      blocks: 32
+      cache_frac: 0.125
+      host_weights: true
+      own_weights: false
+      timeout_sec: 1800
+      vram_budget_gb: 7.0
+      output_dir: "/tmp/gv_pb_lbann"
+
+vars:
+  # ZIPPED across the seven packages so all of them advance together: jarvis
+  # starts Application packages in order, so a cell runs weights, k-means,
+  # Gray-Scott, GNN, then LAMMPS, GROMACS and LBANN at the SAME point on both
+  # axes. The three applications carry their own page LISTS, scaled to their
+  # own datasets, but the same number of points so the zip still lines up.
+  # Listing them in separate groups would take their cross product and ask for
+  # 5^4 x 4^4 cells of mismatched settings instead of 20 aligned ones.
+  gvw.page_kb: [16, 64, 256, 1024, 4096]
+  km.page_kb:  [16, 64, 256, 1024, 4096]
+  gs.page_kb:  [16, 64, 256, 1024, 4096]
+  gnn.page_kb: [16, 64, 256, 1024, 4096]
+  # Scaled to each application's own dataset: five points, same axis, but a
+  # 4096 KB page against GROMACS's 4.3 MB is a single page and measures
+  # nothing.
+  lmp.page_kb: [4, 16, 64, 256, 1024]
+  gmx.page_kb: [1, 4, 16, 64, 256]
+  lb.page_kb:  [16, 64, 256, 1024, 4096]
+
+  # Capped at 128: with the cache fixed at 4096 MB, 128 blocks x 4 MB pages is
+  # 8 slots/block, exactly Gray-Scott's stencil floor. 256 blocks would fall
+  # under it and that workload's package would refuse the cell.
+  gvw.blocks: [16, 32, 64, 128]
+  km.blocks:  [16, 32, 64, 128]
+  gs.blocks:  [16, 32, 64, 128]
+  gnn.gather_blocks: [16, 32, 64, 128]
+  lmp.blocks: [16, 32, 64, 128]
+  gmx.blocks: [16, 32, 64, 128]
+  lb.blocks:  [16, 32, 64, 128]
+
+loop:
+  - [gvw.page_kb, km.page_kb, gs.page_kb, gnn.page_kb,
+     lmp.page_kb, gmx.page_kb, lb.page_kb]                  # 5 points
+  - [gvw.blocks, km.blocks, gs.blocks, gnn.gather_blocks,
+     lmp.blocks, gmx.blocks, lb.blocks]                     # 4 points
+                                                            # => 20 cells
+
+# ONE sample per cell. The post block reads each benchmark's own log, and a
+# repeat rewrites that log rather than adding a sample -- see the header.
+repeat: 1
+
+# Deadlock backstop, not a performance bound: four 16 GB workloads run inside
+# one cell, each with its own 3600s kill. A GPU cell can wedge, and without a
+# budget one stuck cell blocks the rest of the sweep.
+run_timeout: 14400
+
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_cache_page_block_sweep"
+
+post: |
+  # STATS ARE READ FROM EACH BENCHMARK'S OWN LOG, NOT FROM `results`.
+  #
+  # jarvis merges every package's stats into ONE flat dict per cell, so four
+  # workloads in one pipeline COLLIDE on shared key names: weights and k-means
+  # both emit `kernel_ms`, and all four emit `faults`/`evicts`/`gbps`. Last
+  # writer wins, silently. An earlier version of this script reported k-means'
+  # time in the weights row and one workload's faults for all four -- the
+  # numbers looked entirely plausible, which is what made it dangerous.
+  #
+  # Every package puts the swept values in its LOG FILENAME (`_b<blocks>_` and
+  # a page-size field), so each cell is keyed by what the run actually used
+  # rather than by ordering.
+  import glob, os, re
+
+  DATASET_MB = 16384.0
+  VRAM_MB = 8188.0
+  CACHE_MB = 4096
+  PAGES = [16, 64, 256, 1024, 4096]
+  BLOCKS = [16, 32, 64, 128]
+  ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+  def field(line, key):
+      # Anchored at a word boundary: an unanchored 'ms=' also matches the 'ms='
+      # inside 'dims=32' and reports 32 instead of 5044.1 -- a wrong number
+      # rather than a missing one, which no downstream check would catch.
+      m = re.search(r'(?:^|\s)' + re.escape(key) + r'=(-?[0-9.eE+-]+)', line)
+      if not m:
+          return None
+      try:
+          return float(m.group(1))
+      except ValueError:
+          return None
+
+  def key_from_name(path):
+      """(page_kb, blocks) from the log filename, or None.
+
+      The four packages spell the page field differently -- `pgkb1024`
+      (weights), `pg1024kb` (k-means, Gray-Scott, GNN) -- so both forms are
+      accepted rather than one being assumed.
+      """
+      name = os.path.basename(path)
+      b = re.search(r'(?:^|_)b(\d+)[_.]', name)
+      p = (re.search(r'_pgkb(\d+)[_.]', name) or
+           re.search(r'_pg(\d+)kb[_.]', name))
+      if not b or not p:
+          return None
+      return int(p.group(1)), int(b.group(1))
+
+  def read(path):
+      try:
+          with open(path, errors='replace') as f:
+              return ANSI.sub('', f.read())
+      except OSError:
+          return None
+
+  def scan(d, marker):
+      """(page_kb, blocks) -> last summary line."""
+      out = {}
+      for fn in sorted(glob.glob(os.path.join(d, '*.log'))):
+          k = key_from_name(fn)
+          txt = read(fn)
+          if k is None or txt is None:
+              continue
+          last = None
+          for ln in txt.splitlines():
+              # Tolerant marker: the summary line gained a `mode=` field when
+              # the baseline kernel was added, so anything that pins the token
+              # AFTER the workload name breaks silently on the next such
+              # change. Requiring `ms=` is what makes it a summary line.
+              if marker in ln and 'ms=' in ln and 'ERROR' not in ln:
+                  last = ln
+          if last is not None:
+              out[k] = last
+      return out
+
+  def scan_gnn(d):
+      """(page_kb, blocks) -> (epoch_s, faults, loss)."""
+      out = {}
+      for fn in sorted(glob.glob(os.path.join(d, '*.log'))):
+          k = key_from_name(fn)
+          txt = read(fn)
+          if k is None or txt is None:
+              continue
+          e = re.findall(r'ETERNIA: epoch0 .*?\(([0-9.]+)s\)', txt)
+          f = re.findall(r'PAGING: faults=(\d+)', txt)
+          l = re.findall(r'-> epoch\d+ loss=([0-9.]+)', txt)
+          if e:
+              out[k] = (float(e[-1]), int(f[-1]) if f else None,
+                        float(l[-1]) if l else None)
+      return out
+
+  W = scan('/tmp/gv_pb_weights', 'GVW ')
+  K = scan('/tmp/gv_pb_kmeans', 'KMEANS ')
+  G = scan('/tmp/gv_pb_grayscott', 'GRAYSCOTT ')
+  N = scan_gnn('/tmp/gv_pb_gnn')
+
+  runs = results['results']
+  ok = [r for r in runs if r['status'] == 'success']
+  logger.info(f"post: {len(ok)}/{len(runs)} cells reported success")
+
+  lines = [f'page size x block count, four workloads, dataset '
+           f'{DATASET_MB:.0f} MB = {DATASET_MB / VRAM_MB:.2f}x VRAM',
+           f'page cache PINNED at {CACHE_MB} MB (half the card, 25% of the '
+           f'dataset) at every cell; kHBM tier 1024 MB; uncompressed',
+           f'cells reported by jarvis: {len(ok)}/{len(runs)} '
+           f'(its status is not trustworthy on a wedged cell -- the empty '
+           f'entries below are the real check)',
+           '',
+           'slots/block = 4096 MB / (blocks x page_kb), so the cache is '
+           'constant in BYTES and varies in slots',
+           '']
+
+  # TRUST CHECKS FIRST. Several failure modes here produce plausible numbers
+  # rather than errors, so nothing is reported until they have run.
+  bad = []
+  for name, data, cs in (('weights', W, 'checksum'),
+                         ('kmeans', K, None),
+                         ('grayscott', G, None)):
+      for p in PAGES:
+          for b in BLOCKS:
+              ln = data.get((p, b))
+              if ln is None:
+                  bad.append(f'{name} page={p}KB blocks={b}: NO SUMMARY LINE '
+                             f'-- the run produced no output (wedged, killed, '
+                             f'or the binary is not on PATH)')
+                  continue
+              # THE PAGE-SWEEP TRAP: a cell whose dataset moved is measuring
+              # dataset size, not page size. This check is why the earlier
+              # spurious 92x was caught.
+              mb = field(ln, 'data_mb') or field(ln, 'logical')
+              if mb and abs(mb - DATASET_MB) > 1.0:
+                  bad.append(f'{name} page={p}KB blocks={b}: dataset is '
+                             f'{mb:.0f}MB, not {DATASET_MB:.0f} -- this cell '
+                             f'is measuring a dataset-size effect')
+              # The page size the BINARY reports, not the one requested.
+              got = field(ln, 'page_kb')
+              if got and int(got) != p:
+                  bad.append(f'{name} page={p}KB blocks={b}: the binary ran '
+                             f'page_kb={got:.0f} -- --page-kb did not take')
+              if field(ln, 'put_errors'):
+                  bad.append(f'{name} page={p}KB blocks={b}: '
+                             f'{field(ln, "put_errors"):.0f} writeback(s) '
+                             f'FAILED -- data was lost, the timings are void')
+              if field(ln, 'get_errors'):
+                  bad.append(f'{name} page={p}KB blocks={b}: '
+                             f'{field(ln, "get_errors"):.0f} read(s) FAILED')
+              if 'fits=yes' in ln:
+                  bad.append(f'{name} page={p}KB blocks={b}: fits=yes -- NOT '
+                             f'in the beyond-memory regime this study is about')
+              if cs and 'checksum=OK' not in ln:
+                  bad.append(f'{name} page={p}KB blocks={b}: CHECKSUM MISMATCH '
+                             f'-- the run corrupted data, its timings are void')
+  for p in PAGES:
+      for b in BLOCKS:
+          if (p, b) not in N:
+              bad.append(f'gnn page={p}KB blocks={b}: no ETERNIA epoch line')
+  # GNN's final loss is bit-identical across settings when the read path is
+  # correct (3.703790, spread 0.0000% over every page size and block count in
+  # the earlier page sweep), so a moved loss means the gather read different
+  # bytes -- the one correctness signal in this set that is exact.
+  losses = {v[2] for v in N.values() if v[2] is not None}
+  if len(losses) > 1:
+      bad.append(f'gnn: final_loss is NOT identical across cells '
+                 f'({sorted(losses)}) -- the gather read different bytes')
+
+  lines += [f'TRUST CHECKS: {len(bad)} problem(s)']
+  lines += ['  ' + x for x in bad] if bad else ['  none']
+  lines += ['']
+
+  def grid(title, get, fmt='{:.0f}'):
+      out = [title, '  page_kb\\blocks,' + ','.join(str(b) for b in BLOCKS)]
+      for p in PAGES:
+          row = [f'  {p}']
+          for b in BLOCKS:
+              v = get(p, b)
+              row.append(fmt.format(v) if isinstance(v, (int, float)) else '-')
+          out.append(','.join(row))
+      return out + ['']
+
+  def axes(name, get, getf, unit):
+      """Both axes as numbers rather than as a shape to be eyeballed."""
+      out = []
+      # THE PAGE AXIS, read at each block count so a block-count interaction
+      # cannot hide inside a single row.
+      out.append(f'  {name}: page axis, {PAGES[0]}KB vs {PAGES[-1]}KB '
+                 f'({PAGES[-1] // PAGES[0]}x the page):')
+      for b in BLOCKS:
+          lo, hi = get(PAGES[0], b), get(PAGES[-1], b)
+          if lo and hi:
+              out.append(f'    blocks={b:<4} {lo:.1f} -> {hi:.1f} {unit} '
+                         f'= {lo / hi:.1f}x faster')
+      # Faults should fall as 1/page_kb. Reporting the RATIO of the two makes a
+      # cell where --page-kb did not reach the binary obvious: it stays at 1.0.
+      out.append(f'  {name}: faults per page-size step (expected ~4x per step, '
+                 f'since each step is 4x the page):')
+      for b in BLOCKS:
+          row = []
+          prev = None
+          for p in PAGES:
+              f = getf(p, b)
+              if f and prev:
+                  row.append(f'{prev / f:.1f}x')
+              prev = f if f else prev
+          if row:
+              out.append(f'    blocks={b:<4} ' + ' '.join(row))
+      out.append(f'  {name}: blocks axis at {PAGES[-2]}KB pages, '
+                 f'gain per doubling:')
+      prev = None
+      for b in BLOCKS:
+          v = get(PAGES[-2], b)
+          if v and prev:
+              out.append(f'    {prev[0]:>4} -> {b:<4} blocks: '
+                         f'{prev[1]:.1f} -> {v:.1f} {unit} '
+                         f'= {(prev[1] / v - 1) * 100:+.0f}%')
+          if v:
+              prev = (b, v)
+      return out + ['']
+
+  for name, data, tkey, unit in (('weights', W, 'ms', 'ms'),
+                                 ('kmeans', K, 'ms', 'ms'),
+                                 ('grayscott', G, 'ms', 'ms')):
+      t = lambda p, b, d=data, k=tkey: (field(d[(p, b)], k)
+                                        if (p, b) in d else None)
+      f = lambda p, b, d=data: (field(d[(p, b)], 'faults')
+                                if (p, b) in d else None)
+      lines += [f'=== {name}'
+                + ('   (PAGE AXIS CONFOUNDED: one page is one XY plane, so '
+                   'page size also changes the grid geometry)'
+                   if name == 'grayscott' else '')]
+      lines += grid(f'  time ({unit}):', t, '{:.0f}')
+      lines += grid('  faults:', f, '{:.0f}')
+      lines += axes(name, t, f, unit)
+
+  lines += ['=== gnn']
+  gt = lambda p, b: (N[(p, b)][0] if (p, b) in N else None)
+  gf = lambda p, b: (N[(p, b)][1] if (p, b) in N else None)
+  lines += grid('  epoch time (s):', gt, '{:.2f}')
+  lines += grid('  faults:', gf, '{:.0f}')
+  lines += axes('gnn', gt, gf, 's')
+
+  lines += ['NOTE: the measured between-process spread on these workloads is '
+            '26%, and this sweep',
+            'takes ONE sample per cell. A time difference smaller than that '
+            'is not a result -- the',
+            'page axis (measured 4.8x to 33.6x) clears it easily, the blocks '
+            'axis largely does not.',
+            'Read the fault grids, which move ~0.03% run to run.']
+
+  open('page_block_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote page_block_summary.txt')
+  for x in bad:
+      logger.warning('post: SUSPECT ' + x)
+
+  try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+      fig, axs = plt.subplots(1, 4, figsize=(18, 4.2))
+      series = [('weights', W, 'ms'), ('kmeans', K, 'ms'),
+                ('grayscott', G, 'ms')]
+      for ax, (name, data, k) in zip(axs, series):
+          for b in BLOCKS:
+              ax.plot(PAGES, [field(data[(p, b)], k) if (p, b) in data else None
+                              for p in PAGES], marker='o', label=f'{b} blocks')
+          ax.set_xscale('log', base=2)
+          ax.set_yscale('log')
+          ax.set_xlabel('page size (KB)')
+          ax.set_title(name + (' (confounded)' if name == 'grayscott' else ''))
+          ax.legend(fontsize=7)
+      axs[0].set_ylabel('kernel time (ms, log)')
+      for b in BLOCKS:
+          axs[3].plot(PAGES, [N[(p, b)][0] if (p, b) in N else None
+                              for p in PAGES], marker='o', label=f'{b} blocks')
+      axs[3].set_xscale('log', base=2)
+      axs[3].set_yscale('log')
+      axs[3].set_xlabel('page size (KB)')
+      axs[3].set_ylabel('epoch time (s, log)')
+      axs[3].set_title('gnn')
+      axs[3].legend(fontsize=7)
+      fig.suptitle('Page size x block count, 16384 MB (2x VRAM) per workload, '
+                   'cache pinned at 4096 MB, 1024 MB kHBM tier')
+      fig.tight_layout()
+      fig.savefig('page_block.png', dpi=130)
+      logger.info('post: wrote page_block.png')
+  except ImportError:
+      logger.warning('post: matplotlib unavailable, skipping the plot '
+                     '(page_block_summary.txt has the same numbers)')
