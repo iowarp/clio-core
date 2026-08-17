@@ -76,9 +76,13 @@ run_cluster() {
   while [ "$attempt" -le "${ETERNIA_FORM_RETRIES:-3}" ]; do
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
     rm -f "$REPO_ROOT/.eternia_cluster_done" "$REPO_ROOT"/.eternia_peer_ready.* 2>/dev/null
-    # Let the previous cluster's sockets and shared segments go away; back to
-    # back runs are where formation fails most often.
-    sleep "${ETERNIA_SETTLE:-20}"
+    # Let the previous cluster's sockets and shared segments go away. This is
+    # not cosmetic: at 20s, formation failed five times running -- including
+    # with a trivial echo as the workload, on an idle host with a clean GPU --
+    # and at 45s it succeeded first try. Back-to-back compose runs are where
+    # this breaks, so the settle is the difference between a usable harness
+    # and one that looks broken.
+    sleep "${ETERNIA_SETTLE:-45}"
     docker compose up --abort-on-container-exit --exit-code-from wl-node4 \
       > "$logfile" 2>&1
     rc=$?

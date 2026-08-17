@@ -52,6 +52,25 @@ that silently degrades to single-node is the exact failure this exists to catch.
 |----------|-----------|----------------|
 | LAMMPS  | E_pair = -4.785579 (stock `lj/cut`) | -4.7855792 |
 | GROMACS | LJ(SR) = -8491.7693 (exact lattice sum) | -8491.76907 |
+| LBANN   | objective 1.93652 / 1.87546 / 1.87988 (stock `El::Gemm`) | identical |
+
+## The settle between runs is load-bearing
+
+`ETERNIA_SETTLE` (default 45s) is not cosmetic. At 20s, cluster formation
+failed five times in a row -- including with a trivial `echo` as the workload,
+on an idle host with a clean GPU and no stale containers, networks or
+processes. At 45s it formed first try. Back-to-back `docker compose` cycles are
+where this breaks, so the settle is the difference between a working harness
+and one that looks broken.
+
+Formation is still retried (`ETERNIA_FORM_RETRIES`, default 3) because it
+remains intermittent. Only FORMATION is retried: a workload that ran and
+produced a wrong answer is reported as it stands, since retrying a bad result
+until it passes is how a test suite becomes decorative.
+
+A hypothesis that did NOT hold, recorded so it is not retried: that four nodes
+composing an `hbm` tier -- four GPU contexts on one physical device -- was
+causing the stalls. Removing the tier changed nothing, and the tier is back.
 
 ## Are all operations on eternia primitives?
 
