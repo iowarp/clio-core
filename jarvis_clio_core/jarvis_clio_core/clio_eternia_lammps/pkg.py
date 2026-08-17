@@ -178,6 +178,17 @@ class ClioEterniaLammps(Application):
                     'vectors are a copy and a restart still has to be '
                     'serialised. Measured at ~71 MB/s, far below this disk',
              'type': int, 'default': 0},
+            {'name': 'binary_rel',
+             'msg': 'Path to the lmp binary under bin_dir. Defaults to the '
+                    'KOKKOS+CUDA build, which is the one that has a GPU '
+                    'baseline; the plain build has no GPU package at all and '
+                    'its "stock" kernel is a single CPU core',
+             'type': str, 'default': 'lmp-kk/lmp'},
+            {'name': 'baseline_kokkos',
+             'msg': 'Use lj/cut/kk on the GPU for the baseline instead of the '
+                    'serial CPU lj/cut. Comparing a paged GPU kernel against '
+                    'one CPU core is not a like-for-like measurement',
+             'type': bool, 'default': True},
             {'name': 'baseline',
              'msg': 'Run the application STOCK kernel instead of the paged '
                     'one, via ETERNIA_BASELINE. Same binary, same input, one '
@@ -256,6 +267,12 @@ class ClioEterniaLammps(Application):
         index locality agree.
         """
         c = self.config
+        # The BASELINE input uses lj/cut/kk, which runs on the GPU, and drops
+        # the two settings that exist only for the paged kernel: `newton off`
+        # (the paged kernel needs a full neighbour list) and the atom sort.
+        # Getting this wrong is not subtle -- delegating to the stock kernel
+        # while still requesting a full list double-counts every pair.
+        kk = c['baseline'] and c['baseline_kokkos']
         restart = ('\nrestart         %d %s %s'
                    % (c['restart_steps'],
                       os.path.join(c['output_dir'], 'rst_a.bin'),
@@ -264,15 +281,15 @@ class ClioEterniaLammps(Application):
         with open(self._input_file(), 'w') as f:
             f.write(f'''units           lj
 atom_style      atomic
-newton          off
+{'' if kk else 'newton          off'}
 lattice         fcc 0.8442
 region          box block 0 {c["lattice_cells"]} 0 {c["lattice_cells"]} 0 {c["lattice_cells"]}
 create_box      1 box
 create_atoms    1 box
 mass            1 1.0
 velocity        all create 3.0 87287 loop geom
-atom_modify     sort 1000 2.0
-pair_style      lj/cut/eternia {c["cutoff"]} page {c["page_kb"]} blocks {c["blocks"]} threads {c["threads"]} slots {self._slots()} stats on
+{'' if kk else 'atom_modify     sort 1000 2.0'}
+pair_style      {f'lj/cut/kk {c["cutoff"]}' if kk else f'lj/cut/eternia {c["cutoff"]} page {c["page_kb"]} blocks {c["blocks"]} threads {c["threads"]} slots {self._slots()} stats on'}
 pair_coeff      1 1 1.0 1.0 {c["cutoff"]}
 neighbor        0.3 bin{restart}
 neigh_modify    every 20 delay 0 check no
@@ -378,7 +395,7 @@ run             {c["steps"]}
     def start(self):
         c = self.config
         b = self._bin_dir()
-        binary = os.path.join(b, 'lmp-build', 'lmp')
+        binary = os.path.join(b, *c['binary_rel'].split('/'))
         _reap_stale_runtime(self.log, 'lmp')
         _wait_for_free_vram(self.log, self._actual_cache_mb() / 1024.0 + 1.0)
         os.makedirs(c['output_dir'], exist_ok=True)
@@ -388,7 +405,13 @@ run             {c["steps"]}
             env['CLIO_SERVER_CONF'] = c['clio_conf']
         if c['baseline']:
             env['ETERNIA_BASELINE'] = '1'
-        cmd = [binary, '-in', self._input_file()]
+        cmd = [binary]
+        if c['baseline'] and c['baseline_kokkos']:
+            # -k on g 1 selects one GPU; -sf kk routes styles to the KOKKOS
+            # variants. Without these the kk style is not used and the run
+            # silently falls back to the CPU kernel.
+            cmd += ['-k', 'on', 'g', '1', '-sf', 'kk']
+        cmd += ['-in', self._input_file()]
         if c['timeout_sec'] > 0:
             cmd.insert(0, f'timeout {c["timeout_sec"]}')
         self.log(f'Running: {" ".join(cmd)}')
