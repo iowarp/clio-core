@@ -270,16 +270,18 @@ class DeviceVector {
       // correctness preserved at streaming-mode cost; when nothing evicts,
       // chains have no holes.
       {
-        const clio::run::u32 d = (clio::run::u32) (pn % ppb);
-        const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
-        for (clio::run::u32 k = 0; k < w; ++k) {
-          clio::run::u32 i = d + k;
-          if (i >= ppb) i -= ppb;
+        // The d candidates, same set the claim uses. NOTE: there is no
+        // empty-slot early-out any more. Under open addressing an empty slot
+        // proved absence because a chain has no holes; with d-left hashing the
+        // ways are INDEPENDENT, so an empty way says nothing about the others
+        // and breaking there would report false misses.
+        const clio::run::u32 nw = Ways();
+        for (clio::run::u32 w = 0; w < nw; ++w) {
+          const clio::run::u32 i = WaySlot(pn, w);
           if (tbl[i].page_num == pn && !tbl[i].fetching) {
             p = &tbl[i];
             break;
           }
-          if (tbl[i].page_num == kNoPage) break;   // absence proven
         }
       }
       if (p == nullptr) {
@@ -379,12 +381,9 @@ class DeviceVector {
     if (p == nullptr || p->page_num != pn || p->fetching) {
       p = nullptr;
       Page *tbl = BlockPages();
-      const clio::run::u32 ppb = h_->pages_per_block_;
-      const clio::run::u32 d = (clio::run::u32) (pn % ppb);
-      const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
-      for (clio::run::u32 k = 0; k < w; ++k) {
-        clio::run::u32 i = d + k;
-        if (i >= ppb) i -= ppb;
+      const clio::run::u32 nw = Ways();
+      for (clio::run::u32 w = 0; w < nw; ++w) {
+        const clio::run::u32 i = WaySlot(pn, w);
         if (tbl[i].page_num == pn) {
           // Re-read fetching AFTER the page_num match through volatile: the
           // claim stores fetching first (device fence between), so a probe
@@ -510,6 +509,8 @@ class DeviceVector {
     Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       tbl[i].score = 0.0f;
+      tbl[i].user_score = 0.0f;
+      tbl[i].has_user = 0u;
     }
     EvictLocked(h_->pages_per_block_);
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -520,30 +521,161 @@ class DeviceVector {
   }
 
   /**
-   * Claim a slot for `pn` within a BOUNDED probe window of its home slot.
+   * D-LEFT HASH INDEX. A page lives in exactly one of `Ways()` candidate
+   * slots, so both lookup and claim are O(d) -- INDEPENDENT of the cache size.
    *
-   * Open addressing degrades catastrophically at full load: with the table
-   * 100% occupied (an out-of-core working set churning through LRU, the MoE
-   * case), an unsuccessful probe scanned every slot (~743 dependent global
-   * loads) and successful chains grew to hundreds -- measured as ~3 ms of
-   * per-launch dwell that no compute optimization touched. Bounding the
-   * probe to kProbeWindow slots and EVICTING THE WINDOW'S LRU when no slot
-   * is free keeps every chain shorter than the window, permanently, at the
-   * cost of approximating global LRU by window-local LRU.
+   * This replaces a bounded-window open-addressing scheme. That scheme made a
+   * HIT cheap (one probe at pn % ppb) but left a MISS scanning the whole
+   * table, and in the out-of-core regime a miss is the common case: measured
+   * 99.98% of accesses at 1/16 coverage. Since a Page is ~200 bytes, each
+   * probed slot is its own cache line, so a miss cost ppb cache-line reads --
+   * 12288 of them at the top of a coverage sweep. Time therefore grew with the
+   * cache size while the cache bought almost nothing (128x more slots removed
+   * 2.3% of faults, and runtime rose 165%).
+   *
+   * D-LEFT, not d independent hashes over the whole table: way `w` owns its
+   * own disjoint segment, so the d candidates are ALWAYS distinct slots.
+   * Independent hashes can collide with each other, silently reducing
+   * associativity -- worst exactly where the table is small.
+   *
+   * Segments are [ppb*w/d, ppb*(w+1)/d), which tile [0, ppb) exactly and
+   * differ in size by at most one, so every slot is reachable and none is
+   * stranded.
+   */
+  static constexpr clio::run::u32 kMaxWays = 8;
+
+  /**
+   * Victim selection among the d candidates.
+   *
+   *   kEvictLru   least-recently-used. PATHOLOGICAL ON CYCLIC SCANS: a page
+   *               must survive a whole pass to be reused, so it is always the
+   *               least-recently-used one and is always the one evicted.
+   *               MEASURED on weights (4096MB, cyclic re-read), hit rate at
+   *               1/16, 1/4, 1/2, 3/4 coverage: 0.0%, 0.0%, 0.1%, 7.2% --
+   *               against ~75% that 3/4 coverage should allow.
+   *   kEvictFreq  touch-count score with linear aging. The original policy,
+   *               chosen precisely because "with the working set larger than
+   *               the cache, LRU converges to ~0% hit rate".
+   *   kEvictRand  uniform among the candidates (reservoir sampling). The
+   *               textbook answer for scans: expected hit rate tracks coverage
+   *               rather than collapsing to zero.
+   *
+   * Selected at compile time so the comparison costs a rebuild, not a
+   * re-plumb. `score` is aged under every policy so the frequency history
+   * stays live and switching is a one-line change.
+   */
+  static constexpr int kEvictLru = 0;
+  static constexpr int kEvictFreq = 1;
+  static constexpr int kEvictRand = 2;
+  /**
+   * kEvictUser -- evict by the score the KERNEL set through RescorePage.
+   *
+   * The caller usually knows the reuse distance the cache cannot infer: a
+   * stencil knows which planes its window still needs, a streaming pass knows
+   * a page is dead the moment it has been consumed. This policy makes that
+   * knowledge authoritative instead of advisory.
+   *
+   * Ranking, worst victim first:
+   *   1. pages with NO user score          (nobody vouched for them)
+   *   2. pages with a LOWER user score
+   *   3. LRU as the tie-break within each group
+   *
+   * Un-hinted pages go first ON PURPOSE. The alternative -- treating "no
+   * hint" as a middling score -- lets an un-hinted page outrank one the caller
+   * explicitly released, which is the opposite of what a release means. It
+   * does mean a workload that hints NOTHING degenerates to LRU, so this policy
+   * is only meaningful where the benchmark actually calls RescorePage.
+   */
+  static constexpr int kEvictUser = 3;
+#ifndef CLIO_GV_EVICT_POLICY
+#define CLIO_GV_EVICT_POLICY 0
+#endif
+  static constexpr int kEvictPolicy = CLIO_GV_EVICT_POLICY;
+
+  /** Cheap in-kernel LCG, for kEvictRand only. */
+  CTP_GPU_FUN clio::run::u32 Rand32(clio::run::u64 seed) const {
+    clio::run::u64 x = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    x ^= x >> 33;
+    return (clio::run::u32) (x >> 16);
+  }
+
+  /**
+   * Should candidate `cand` replace the current best victim `cur`?
+   *
+   * `k` is the candidate's index in the probe order, which kEvictRand needs
+   * for reservoir sampling (pick each new candidate with probability 1/(k+1),
+   * giving a uniform choice in a single pass).
+   */
+  CTP_GPU_FUN bool PreferVictim(const Page &cand, const Page &cur,
+                                bool have_cur, clio::run::u32 k,
+                                clio::run::u64 pn) const {
+    if (!have_cur) return true;
+    if (kEvictPolicy == kEvictFreq) {
+      return cand.score < cur.score ||
+             (cand.score == cur.score && cand.last_access < cur.last_access);
+    }
+    if (kEvictPolicy == kEvictRand) {
+      return (Rand32(pn + k * 0x9E3779B9ULL) % (k + 1u)) == 0u;
+    }
+    if (kEvictPolicy == kEvictUser) {
+      // Un-hinted before hinted; then lower user score; then LRU.
+      if (cand.has_user != cur.has_user) return cand.has_user < cur.has_user;
+      if (cand.has_user && cand.user_score != cur.user_score) {
+        return cand.user_score < cur.user_score;
+      }
+      return cand.last_access < cur.last_access;
+    }
+    return cand.last_access < cur.last_access;   // kEvictLru
+  }
+
+  /** Number of hash ways: min(kMaxWays, pages_per_block). */
+  CTP_GPU_FUN clio::run::u32 Ways() const {
+    const clio::run::u32 ppb = h_->pages_per_block_;
+    return ppb < kMaxWays ? ppb : kMaxWays;
+  }
+
+  /**
+   * The slot page `pn` occupies in way `w`.
+   *
+   * MUST be a pure function of (pn, w, ppb): lookup and claim both derive the
+   * candidate set from it, and any disagreement makes a resident page
+   * invisible -- which does not fail loudly, it re-fetches the page into a
+   * second slot and leaves two slots holding it.
+   */
+  CTP_GPU_FUN clio::run::u32 WaySlot(clio::run::u64 pn,
+                                     clio::run::u32 w) const {
+    const clio::run::u64 ppb = (clio::run::u64) h_->pages_per_block_;
+    const clio::run::u64 d = (clio::run::u64) Ways();
+    const clio::run::u32 base = (clio::run::u32) ((ppb * w) / d);
+    const clio::run::u32 end = (clio::run::u32) ((ppb * (w + 1)) / d);
+    const clio::run::u32 span = end - base;   // >= 1, since d <= ppb
+    // splitmix64 finalizer, seeded per way. The seed must differ per way or
+    // every way maps to the same offset within its segment and the index
+    // degenerates to 1-way.
+    clio::run::u64 x = pn + 0x9E3779B97F4A7C15ULL * (clio::run::u64) (w + 1);
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return base + (clio::run::u32) (x % (clio::run::u64) span);
+  }
+
+  /**
+   * Claim one of `pn`'s d candidate slots.
    *
    * Caller must hold the block lock. Returns the claimed slot, its entry
-   * reset and NOT yet marked fetching; ~0u if every window slot is pinned by
-   * an in-flight transfer.
+   * reset and NOT yet marked fetching; ~0u if no candidate can be taken.
    */
-  static constexpr clio::run::u32 kProbeWindow = 64;
   CTP_GPU_FUN clio::run::u32 ClaimSlotWindowLocked(clio::run::u64 pn) {
     clio::run::u32 s = ClaimSlotWindowOnceLocked(pn);
     if (s == ~0u) {
       // Every candidate is mid-transfer. If any are fetching=2 their batch
       // may long since have LANDED — nothing settles an async batch until a
-      // toucher hits one of ITS pages, so a window can fill with landed-but-
-      // unsettled pages and starve every claimer whose page is not among
-      // them (observed: kernel spun forever, CPU idle). Settle and rescan.
+      // toucher hits one of ITS pages, so the candidate set can fill with
+      // landed-but-unsettled pages and starve every claimer whose page is not
+      // among them (observed: kernel spun forever, CPU idle). Settle and
+      // rescan.
       SettleBatchLocked();
       s = ClaimSlotWindowOnceLocked(pn);
     }
@@ -552,31 +684,29 @@ class DeviceVector {
 
   CTP_GPU_FUN clio::run::u32 ClaimSlotWindowOnceLocked(clio::run::u64 pn) {
     Page *tbl = BlockPages();
-    const clio::run::u32 ppb = h_->pages_per_block_;
-    const clio::run::u32 d = (clio::run::u32) (pn % ppb);
-    const clio::run::u32 w = ppb < kProbeWindow ? ppb : kProbeWindow;
+    const clio::run::u32 nw = Ways();
     clio::run::u32 victim = ~0u;
-    float best = 3.4e38f;
-    for (clio::run::u32 k = 0; k < w; ++k) {
-      clio::run::u32 i = d + k;
-      if (i >= ppb) i -= ppb;
+    for (clio::run::u32 w = 0; w < nw; ++w) {
+      const clio::run::u32 i = WaySlot(pn, w);
       Page &pgi = tbl[i];
       if (pgi.page_num == kNoPage) {
         return i;
       }
-      // FREQUENCY, not recency. With the working set larger than the cache,
-      // LRU converges to ~0% hit rate: every page's reuse distance exceeds
-      // capacity, so everything is evicted before its next use. Routed-expert
-      // traffic is SKEWED -- hot experts recur -- and a touch-count score
-      // keeps them resident while cold ones churn.
+      // Score is still AGED here so the frequency history stays live and the
+      // policy can be switched back without re-plumbing. The victim choice
+      // below is LRU by request; the previous policy was frequency-based, for
+      // this reason, which is worth keeping in view:
+      //
+      //   "FREQUENCY, not recency. With the working set larger than the cache,
+      //    LRU converges to ~0% hit rate: every page's reuse distance exceeds
+      //    capacity, so everything is evicted before its next use.
+      //    Routed-expert traffic is SKEWED -- hot experts recur -- and a
+      //    touch-count score keeps them resident while cold ones churn."
       //
       // Aging must be LINEAR and slow. Halving per claim scan was ~0.5^23
       // per token (a table sees ~23 claims/token): every score decayed to
       // zero between touches, eviction degenerated to random, and a batch's
-      // own just-fetched pages self-evicted at score ~0.004. At -0.02 per
-      // scan, a page touched once per token sustains ~+0.5/token net while
-      // an untouched one loses its history in ~50 claims.
-      //
+      // own just-fetched pages self-evicted at score ~0.004.
       pgi.score = fmaxf(pgi.score - 0.02f, 0.0f);
       // `dirty` belongs in this test. This path DROPS its victim outright --
       // it does not write it back -- on the stated assumption that "weights
@@ -587,8 +717,8 @@ class DeviceVector {
       // its writes. Skipping dirty victims costs at worst a declined claim,
       // which the caller already handles; the alternative is silent loss.
       if (!pgi.fetching && !pgi.flushing && !pgi.rescoring && !pgi.dirty &&
-          pgi.score < best) {
-        best = pgi.score;
+          PreferVictim(pgi, tbl[victim == ~0u ? i : victim],
+                       victim != ~0u, w, pn)) {
         victim = i;
       }
     }
@@ -702,6 +832,63 @@ class DeviceVector {
       __syncthreads();
     }
     CLIO_YEND();
+  }
+
+  /**
+   * Free one of `page_num`'s d CANDIDATE SLOTS, for the blocking path.
+   *
+   * EvictLocked cannot serve that caller: it scans the whole table, so it
+   * frees slots the claim will never probe and the claim/evict pair can miss
+   * each other forever. Both must work on the SAME candidate set -- that
+   * agreement is the invariant, and violating it is what deadlocked the
+   * kernel before.
+   *
+   * Returns false only when every candidate is mid-FETCH and so cannot be
+   * taken; the caller must then wait rather than retry immediately.
+   */
+  CTP_GPU_FUN bool EvictWindowLocked(clio::run::u64 page_num) {
+    Page *tbl = BlockPages();
+    const clio::run::u32 ppb = h_->pages_per_block_;
+    const clio::run::u32 nw = Ways();
+    clio::run::u32 victim = ppb;
+    clio::run::u32 fetching_slot = ppb;
+    for (clio::run::u32 w = 0; w < nw; ++w) {
+      const clio::run::u32 i = WaySlot(page_num, w);
+      if (tbl[i].page_num == kNoPage) return true;   // room already
+      // A page mid-fetch is promised to that transfer: taking its slot would
+      // let the copy land under a different page.
+      if (tbl[i].fetching) {
+        if (fetching_slot == ppb) fetching_slot = i;
+        continue;
+      }
+      // `rescoring` is NOT skipped, for the reason spelled out in
+      // StartEvictionAsync: the flag is sticky, so skipping it here would make
+      // rescored pages permanently unevictable and starve this path.
+      if (PreferVictim(tbl[i], tbl[victim == ppb ? i : victim],
+                       victim != ppb, w, page_num)) {
+        victim = i;
+      }
+    }
+    if (victim == ppb) {
+      // Nothing but in-flight fetches. Waiting on one IN HERE is the only way
+      // forward: the caller holds the block lock, so ReapFetched cannot run
+      // and the flag would never clear on its own.
+      if (fetching_slot != ppb) {
+        AwaitFetch(&tbl[fetching_slot]);
+        return true;                  // now resident, hence evictable
+      }
+      return false;
+    }
+    Page *p = &tbl[victim];
+    if (p->dirty || p->flushing) {
+      SubmitPut(p);
+      AwaitPut(p);
+    }
+    p->page_num = kNoPage;
+    p->dirty = 0u;
+    p->flushing = 0u;
+    Bump(h_->stat_evicts_);
+    return true;
   }
 
   /** EvictPages' body, for callers that already hold the block lock. */
@@ -1006,10 +1193,44 @@ class DeviceVector {
    *
    * Callers must be coroutines and must invoke this through `co_await`.
    */
+  /**
+   * Block-collective hold that CANNOT suspend: returns 0 if the page is not
+   * already resident, so the caller can fall back to the coroutine.
+   *
+   * Exists because `co_await HoldPageCoro(...)` costs ~31,000 cycles even when
+   * the page is resident and it returns without ever suspending. The work is
+   * not the lookup -- that is a handful of probes -- it is CONSTRUCTING THE
+   * COROUTINE: every one of the block's threads builds a frame in the 4 KB
+   * per-thread yield stack, runs the promise machinery and tears it down, and
+   * a LAMMPS step does 772 of these. That was ~16 ms of a 65 ms kernel.
+   *
+   * This is a plain device function, so a hit costs a residency probe and the
+   * existing lock-free lookup, and nothing else.
+   *
+   * Block-uniform: IsResident depends only on the page number and this block's
+   * table, so every thread returns the same answer and the caller's branch
+   * cannot split the block across a barrier.
+   */
+  CTP_GPU_FUN clio::run::u64 TryHoldFast(clio::run::u64 off,
+                                         clio::run::u64 count) {
+    // The barrier is NOT optional. HoldPageCoro opens with one, and the block
+    // relies on it: a thread must not inspect the page table while another is
+    // still writing to the page the previous hold covered. Dropping it here
+    // produced 8 force writebacks instead of 123 and an energy of -4.6731464
+    // against the correct -4.7638693 -- wrong, and plausible enough to pass
+    // an eyeball.
+    __syncthreads();
+    if (!IsResident(PageOf(off))) {
+      return 0;
+    }
+    const clio::run::u64 r = HoldPage(off, count);
+    __syncthreads();
+    return r;
+  }
+
   __device__ clio::run::gpu::YCoroTask HoldPageCoro(clio::run::u64 off,
                                                     clio::run::u64 count,
                                                     clio::run::u64 *run_out) {
-    __syncthreads();
     if (threadIdx.x == 0) {
       ReapFetched();
       ReapFlushed();
@@ -1142,31 +1363,64 @@ class DeviceVector {
    * Free a slot for `page_num` WITHOUT waiting: if the victim is dirty its
    * put is submitted and the slot is left in flight for the caller to yield
    * on. Clean victims are dropped immediately.
+   *
+   * SCANS THE SAME WINDOW ClaimSlotWindowOnceLocked WILL PROBE, and that is
+   * load-bearing rather than an optimization. This is the demand path that
+   * makes room when the claim declines, so the two must agree on WHICH slots
+   * are candidates. They did not: the claim is bounded to kProbeWindow slots
+   * from the page's home slot, while this scanned the whole table and freed a
+   * globally-chosen victim.
+   *
+   * With pages_per_block <= kProbeWindow the window IS the whole table and the
+   * disagreement is invisible. Above it the two can miss each other
+   * permanently: the claim declines because its window is full, this frees a
+   * slot outside that window (or, worse, sees a free slot outside it at the
+   * old early-return and did nothing at all), and the next round probes the
+   * same full window. The kernel spins forever with the CPU idle.
+   *
+   * MEASURED: Gray-Scott at 16 GB hung at 256 pages/block and passed at 64,
+   * with the hang tracking pages_per_block and NOT total cache bytes -- 128 MB
+   * at 256 slots/block hung while 256 MB at 16 and at 64 slots/block both
+   * passed. 64 is exactly kProbeWindow.
    */
   CTP_GPU_FUN void StartEvictionAsync(clio::run::u64 page_num) {
     if (Find(page_num) != nullptr) return;          // already here or coming
     LockBlock();
     Page *tbl = BlockPages();
-    clio::run::u32 victim = h_->pages_per_block_;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    const clio::run::u32 ppb = h_->pages_per_block_;
+    const clio::run::u32 nw = Ways();
+    clio::run::u32 victim = ppb;
+    for (clio::run::u32 w = 0; w < nw; ++w) {
+      const clio::run::u32 i = WaySlot(page_num, w);
       if (tbl[i].page_num == kNoPage) { UnlockBlock(); return; }  // free slot
+      // `rescoring` is deliberately NOT skipped here, though the claim does
+      // skip it. That asymmetry is the escape hatch: `rescoring` is STICKY --
+      // Rescore sets it and only a LATER rescore of the SAME slot clears it,
+      // so a rescored page stays flagged indefinitely. If this path skipped
+      // them too, every rescored page would become permanently unevictable,
+      // no victim would ever be found, and the fault path would retry
+      // forever. MEASURED: adding the skip here for "consistency" took a
+      // weights cell that runs in ~70s to a 600s timeout at 8 slots/block.
       if (tbl[i].fetching || tbl[i].flushing) continue;
-      if (victim == h_->pages_per_block_ ||
-          tbl[i].score < tbl[victim].score ||
-          (tbl[i].score == tbl[victim].score &&
-           tbl[i].last_access < tbl[victim].last_access)) {
+      if (PreferVictim(tbl[i], tbl[victim == ppb ? i : victim],
+                       victim != ppb, w, page_num)) {
         victim = i;
       }
     }
-    if (victim != h_->pages_per_block_) {
-      Page *p = &tbl[victim];
-      if (p->dirty || p->flushing) {
-        p->evicting = 1u;      // tells ReapFlushed to release the slot
-        SubmitPut(p);          // async; the caller yields on AnyTransferInFlight
-      } else {
-        p->page_num = kNoPage;
-        Bump(h_->stat_evicts_);
-      }
+    if (victim == ppb) {
+      // Nothing evictable in the window -- every slot is mid-transfer. The
+      // caller yields on AnyTransferInFlight and retries; the reaps then free
+      // one of these, IN THIS WINDOW, so the next claim succeeds.
+      UnlockBlock();
+      return;
+    }
+    Page *p = &tbl[victim];
+    if (p->dirty || p->flushing) {
+      p->evicting = 1u;        // tells ReapFlushed to release the slot
+      SubmitPut(p);            // async; the caller yields on AnyTransferInFlight
+    } else {
+      p->page_num = kNoPage;
+      Bump(h_->stat_evicts_);
     }
     UnlockBlock();
   }
@@ -1299,6 +1553,12 @@ class DeviceVector {
     Page *p = Find(page_id);
     if (p != nullptr) {
       p->score = score;
+      // Durable copy for kEvictUser. `score` above is left as-is so the
+      // frequency policy still sees the hint the way it always did; this one
+      // survives the touch bumps, the -0.02 aging and the refill resets that
+      // erase `score` within ~50 claims.
+      p->user_score = score;
+      p->has_user = 1u;
     }
     Page *slot = (p != nullptr) ? p : &BlockPages()[page_id % h_->pages_per_block_];
     if (slot->rescore == nullptr) return;
@@ -1461,17 +1721,21 @@ class DeviceVector {
 
   CTP_GPU_FUN Page *Find(clio::run::u64 page_num) const {
     Page *tbl = BlockPages();
-    const clio::run::u32 ppb = h_->pages_per_block_;
-    // First probe: page p usually sits in slot p %% ppb -- claims walk the
-    // table in order, so a cache sized to the data (the fits-in-VRAM
-    // private-cache regime, slots == pages) settles on exactly that layout.
-    // Without the probe this scan is O(slots) per hold and became the whole
-    // measured pass once the zero-copy map was removed (215 -> 1254 ms at
-    // 1024 slots); with it, a resident hold is one compare again.
-    const clio::run::u32 hint = (clio::run::u32) (page_num % ppb);
-    if (tbl[hint].page_num == page_num) return &tbl[hint];
-    for (clio::run::u32 i = 0; i < ppb; ++i) {
-      if (tbl[i].page_num == page_num) return &tbl[i];
+    // O(d), independent of the cache size. This was a hint probe plus a FULL
+    // TABLE SCAN on miss: the hint made a hit one compare, but a miss -- the
+    // common case out of core, 99.98% of accesses at 1/16 coverage -- read
+    // every slot, and a Page is ~200 bytes so each is its own cache line.
+    // That single scan is why runtime grew with the cache size.
+    //
+    // Correct ONLY while every placement goes through WaySlot(). Any path that
+    // parks a page outside its d candidates makes it invisible here, and the
+    // caller then fetches it AGAIN into a second slot -- two slots holding one
+    // page, silently. BeginFetchLocked's first-free-slot scan did exactly that
+    // and was removed.
+    const clio::run::u32 nw = Ways();
+    for (clio::run::u32 w = 0; w < nw; ++w) {
+      Page *p = &tbl[WaySlot(page_num, w)];
+      if (p->page_num == page_num) return p;
     }
     return nullptr;
   }
@@ -1811,6 +2075,8 @@ class DeviceVector {
       // Same as the sync claim. 4.0 (protect prefetches) and 1.0 (steep
       // reuse gradient) were both measured worse — see the eviction note.
       np->score = 2.0f;
+      np->user_score = 0.0f;
+      np->has_user = 0u;   // hint belonged to the displaced page
       np->last_access = Now();
       char name[32];
       PageBlobName(pg, name);
@@ -1877,6 +2143,8 @@ class DeviceVector {
       // score 0 and stale last_access it was FIRST in line for eviction --
       // measured as more faults per token than routed pages.
       np->score = 2.0f;
+      np->user_score = 0.0f;
+      np->has_user = 0u;   // hint belonged to the displaced page
       np->last_access = Now();
       char name[32];
       PageBlobName(pg, name);
@@ -1958,6 +2226,8 @@ class DeviceVector {
       np->flushing = 0u;
       np->evicting = 0u;
       np->score = 2.0f;
+      np->user_score = 0.0f;
+      np->has_user = 0u;   // hint belonged to the displaced page
       np->last_access = Now();
       char name[32];
       PageBlobName(pg, name);
@@ -2006,20 +2276,19 @@ class DeviceVector {
                                     bool is_prefetch = true) {
     if (Find(page_num) != nullptr) return true;   // resident or already coming
     Page *tbl = BlockPages();
-    clio::run::u32 free_slot = h_->pages_per_block_;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-      if (tbl[i].page_num == kNoPage) {
-        free_slot = i;
-        break;
-      }
-    }
-    if (free_slot == h_->pages_per_block_) {
-      const clio::run::u32 wslot = ClaimSlotWindowLocked(page_num);
-      // Everything in the window is mid-transfer: report failure rather than
-      // stalling, so the caller simply falls back to a demand fault later.
-      if (wslot == ~0u) return false;
-      free_slot = wslot;
-    }
+    // NO FIRST-FREE-SLOT SCAN. This used to take the lowest-indexed free slot
+    // anywhere in the table, which broke the hash index two ways: the page
+    // became invisible to Find (which only probes the d ways), so it would be
+    // fetched AGAIN into a second slot; and in the steady state -- a full
+    // cache, which is every out-of-core run -- the scan found nothing and fell
+    // through here anyway, so it was a guaranteed-futile O(pages_per_block)
+    // read of every slot on every fault.
+    //
+    // ClaimSlotWindowLocked already returns a free candidate when one exists.
+    const clio::run::u32 free_slot = ClaimSlotWindowLocked(page_num);
+    // Every candidate mid-transfer: report failure rather than stalling, so
+    // the caller simply falls back to a demand fault later.
+    if (free_slot == ~0u) return false;
     Page *p = &tbl[free_slot];
     // Same ordering as the synchronous claim: busy first, then the page
     // number. Reversed, HoldPage's lock-free scan can see a slot that looks
@@ -2031,6 +2300,8 @@ class DeviceVector {
     p->dirty = 0u;
     p->flushing = 0u;
     p->score = 0.0f;
+    p->user_score = 0.0f;
+    p->has_user = 0u;   // hint belonged to the displaced page
     SubmitGetAsync(p, page_num, is_prefetch);
     return true;
   }
@@ -2091,6 +2362,8 @@ class DeviceVector {
     p->flushing = 0u;
     p->evicting = 0u;
     p->score = 0.0f;
+    p->user_score = 0.0f;
+    p->has_user = 0u;   // hint belonged to the displaced page
 
     auto *t = p->get;
     t->task_flags_.Clear();
@@ -2313,15 +2586,28 @@ class DeviceVector {
           p->dirty = 0u;
           p->flushing = 0u;
           p->score = 0.0f;
+    p->user_score = 0.0f;
+    p->has_user = 0u;   // hint belonged to the displaced page
           SubmitGet(p, page_num);
           break;
         }
-        // Whole window pinned by in-flight transfers: brief wait, retry.
+        // The claim declined: no CLEAN victim among the probe slots. Free one
+        // HERE, in THAT SAME WINDOW, or this loop cannot terminate -- it runs
+        // with the block lock held, so no reap and no other thread can free a
+        // slot underneath it.
+        //
+        // This previously read `continue;` followed by an unreachable
+        // EvictLocked(1). Nothing ever freed a slot, so the loop spun forever
+        // holding the lock. EvictLocked would not have been correct either:
+        // it scans the whole table and above kProbeWindow pages per block it
+        // frees slots this claim never probes.
+        if (!EvictWindowLocked(page_num)) {
+          // Every window slot is mid-fetch and none could be waited on:
+          // back off briefly and re-probe.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(200);
+          __nanosleep(200);
 #endif
-        continue;
-        EvictLocked(1);   // already holding the lock
+        }
       }
     }
     if (p != nullptr) p->last_access = Now();
