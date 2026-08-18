@@ -935,6 +935,22 @@ class DeviceVector {
    * Pages are marked clean immediately -- the put carries the bytes as they
    * are now, and a later write re-dirties the page for the next flush.
    */
+  /**
+   * Mark every RESIDENT page of [off, off+count) dirty, so a later
+   * BeginFlush/FlushBlockBatched writes it back.
+   *
+   * Exists for callers that fill a page's bytes OUTSIDE this view -- the
+   * two-phase pair kernel writes forces through raw pinned-page pointers in
+   * a plain (non-coroutine) kernel, where operator[]'s dirty marking never
+   * runs. Marking is separated from flushing so the write and the flush can
+   * live in different kernel launches.
+   */
+  CTP_GPU_FUN void MarkResidentDirty(clio::run::u64 off, clio::run::u64 count) {
+    LockBlock();
+    ForEachResident(off, count, [](Page *p) { p->dirty = 1u; });
+    UnlockBlock();
+  }
+
   CTP_GPU_FUN void BeginFlush(clio::run::u64 off, clio::run::u64 count) {
     LockBlock();
     ForEachResident(off, count, [this](Page *p) {
@@ -1358,12 +1374,30 @@ class DeviceVector {
 #endif
       }
     }
-    CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched()),
+    // RE-ISSUE THE FETCH ON EVERY RESUME IF IT WAS LOST. BeginFetch above
+    // runs ONCE, and it FAILS -- returns false with nothing in flight --
+    // whenever ClaimSlotWindowLocked finds every candidate slot mid-transfer
+    // or pinned. The park below then waits on !IsResident with a null wait
+    // tag, which nothing will ever satisfy: observed as four blocks spinning
+    // a reneighbour step to the 2,000,000-round cap, each on the second page
+    // of a chunk-straddling fetch whose candidate slots were pinned by its
+    // neighbours. Retrying inside the yield's reap step turns a transient
+    // claim failure into one extra round instead of a livelock.
+    CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched(),
+                        RetryLostFetch(PageOf(off))),
                        !IsResident(PageOf(off)), FetchWaitTag(PageOf(off)));
     // 3. Resident for the whole block: the lock-free fast path.
     *run_out = HoldPage(off, count);
   }
 #endif  // CLIO_YIELD_CORO
+
+  /** One lane re-issues a page's fetch if no slot carries it (see the
+   *  HoldPageCoro comment: a failed claim must not become a silent park). */
+  CTP_GPU_FUN void RetryLostFetch(clio::run::u64 page_num) {
+    if (threadIdx.x == 0 && Find(page_num) == nullptr) {
+      BeginFetch(page_num, /*is_prefetch=*/false);
+    }
+  }
 
   /**
    * Device address of the completion flag for `page_num`'s in-flight get, or 0
