@@ -788,13 +788,34 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
       off + size > ram_capacity_) {
     return -1;
   }
-  // A device-backed tier's pages are device memory; that path keeps the task
-  // route (its D2D copies have their own scheduling constraints).
-  if (device_backed_) return -1;
+  // Device-backed tiers used to refuse this path unconditionally ("its D2D
+  // copies have their own scheduling constraints") and that refusal was,
+  // measured, the single largest cost in the eternia fault path: with every
+  // page resident in the hbm tier, EVERY get fell through to the dispatched
+  // task route at ~264 us avg (evchan get_total; read_await 263 us of it),
+  // while the direct-read channel stayed at n=0. The constraint the old
+  // comment gestured at is real but belongs to a different design: an
+  // intra-device D2D memcpy may be scheduled like a kernel, so a workload
+  // that faults FROM A RESIDENT SPINNING KERNEL could see the copy never
+  // schedule and PollSync spin its worker. The yieldable fault path -- the
+  // only one that does not already deadlock for other reasons (see
+  // HoldPageYield) -- services faults BETWEEN rounds with no kernel
+  // resident, where a D2D is as safe as the H2D below. CLIO_DIRECT_READ_DEV=0
+  // restores the old refusal for anything still faulting from a resident
+  // kernel.
+  static const bool dev_direct = [] {
+    const char *e = getenv("CLIO_DIRECT_READ_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (device_backed_ && !dev_direct) return -1;
 
   const bool dev_dst = ctp::IsDeviceAccessible(dst);
+  // The stream serves any copy with a device side: device destination, or a
+  // device-backed SOURCE page (GetRamPage returns raw device pointers then,
+  // and memcpy from device memory is invalid however dst is allocated).
+  const bool use_stream = dev_dst || device_backed_;
   void* stream = nullptr;
-  if (dev_dst) {
+  if (use_stream) {
     // Borrowed, never created (creating a stream needs the context write lock
     // a resident faulting kernel holds — see ReadBlocks). If none is free
     // RIGHT NOW, fall back to the task path rather than spin on the caller's
@@ -812,25 +833,23 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
     clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
     char* page = GetRamPage(page_idx);
     char* d = dst + data_offset;
-    if (dev_dst) {
-      if (page != nullptr) {
-        ctp::GpuApi::MemcpyAsync(d, page + intra, chunk, stream);
-      } else {
-        ctp::GpuApi::MemsetAsync(d, 0, chunk, stream);
-      }
+    if (page != nullptr && use_stream) {
+      // Direction inferred (cudaMemcpyDefault): covers H2D, D2H and the
+      // device-backed tier's D2D with the same call.
+      ctp::GpuApi::MemcpyAsync(d, page + intra, chunk, stream);
+    } else if (page != nullptr) {
+      std::memcpy(d, page + intra, chunk);
+    } else if (dev_dst) {
+      ctp::GpuApi::MemsetAsync(d, 0, chunk, stream);
     } else {
-      if (page != nullptr) {
-        std::memcpy(d, page + intra, chunk);
-      } else {
-        std::memset(d, 0, chunk);
-      }
+      std::memset(d, 0, chunk);
     }
     cur_off += chunk;
     data_offset += chunk;
     left -= chunk;
   }
 
-  if (dev_dst) {
+  if (use_stream) {
     // Copy-engine work only — safe to block on even with a faulting kernel
     // resident (kernels block later LAUNCHES, not DMA).
     const unsigned long long ev_s0 = clio::run::CycleNow();

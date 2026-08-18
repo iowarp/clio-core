@@ -312,12 +312,23 @@ class Yieldable {
   double t_kernel_ms_ = 0.0;
   double t_copy_ms_ = 0.0;
   double t_upload_ms_ = 0.0;
+  /** Per-round (gpu_ms, blocks launched). Aggregate round counts told us
+   *  kernel time tracks rounds at a near-constant cost each, which is only
+   *  actionable once we know whether a round is expensive because it does
+   *  work or expensive regardless of how few blocks are left in it. */
+  std::vector<std::pair<double, clio::run::u32>> round_log_;
 
  public:
   double KernelMs() const { return t_kernel_ms_; }
   double CopyMs() const { return t_copy_ms_; }
   double UploadMs() const { return t_upload_ms_; }
-  void ResetTimers() { t_kernel_ms_ = t_copy_ms_ = t_upload_ms_ = 0.0; }
+  void ResetTimers() {
+    t_kernel_ms_ = t_copy_ms_ = t_upload_ms_ = 0.0;
+    round_log_.clear();
+  }
+  const std::vector<std::pair<double, clio::run::u32>> &RoundLog() const {
+    return round_log_;
+  }
 
   template <typename LaunchFn>
   bool Round(LaunchFn &&launch) {
@@ -325,6 +336,7 @@ class Yieldable {
       return false;
     }
     const auto _t0 = std::chrono::steady_clock::now();
+    const clio::run::u32 launched_this_round = num_pending_;
     launch(dim3(num_pending_), dim3(nthreads_), View());
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     // GpuApi checks its own errors and aborts on failure, so the previous
@@ -350,7 +362,10 @@ class Yieldable {
     ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
                         nblocks_ * sizeof(YieldBlockState));
     const auto _t2 = std::chrono::steady_clock::now();
-    t_kernel_ms_ += std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+    const double _rms =
+        std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+    round_log_.emplace_back(_rms, launched_this_round);
+    t_kernel_ms_ += _rms;
     t_copy_ms_ += std::chrono::duration<double, std::milli>(_t2 - _t1).count();
 #endif
     // Compact the still-suspended blocks. Order is preserved so that a block's
