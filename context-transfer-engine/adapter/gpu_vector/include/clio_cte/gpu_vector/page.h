@@ -78,8 +78,37 @@ struct Page {
   void *data;
   /** Set by RescorePage; EvictPages takes the lowest. */
   float score;
+  /**
+   * The score the KERNEL set through RescorePage, kept apart from `score`.
+   *
+   * `score` cannot carry a user hint. It is bumped +1.0 on every touch, aged
+   * -0.02 on every claim scan, and reset to 2.0/0.0 whenever the slot is
+   * refilled, so a value written into it is eroded within ~50 claims and
+   * clobbered by the next touch. An eviction policy reading it would rank the
+   * access pattern, not the caller's intent.
+   *
+   * `has_user` separates "the user asked for 0.0" from "the user never said
+   * anything", which no sentinel float could. Both are cleared when the slot
+   * is refilled with a DIFFERENT page: a hint belongs to a page, not a slot.
+   */
+  float user_score;
+  clio::run::u32 has_user;
   /** clock64() at last access; breaks score ties (LRU). */
   clio::run::u64 last_access;
+  /**
+   * Readers currently holding a RAW pointer into this page.
+   *
+   * A claim must not recycle a pinned slot. Without this, a kernel that
+   * records page pointers and then reads through them has no protection at
+   * all: an eviction mid-read leaves the pointers addressing another page's
+   * bytes, every element still gets read, and the results are quietly wrong.
+   * That is not hypothetical -- it is how the LJ pair kernel returned E_pair
+   * -5.7229688 against -6.7733681 at 256,000 atoms with a PERFECT pair count.
+   *
+   * Counted rather than a flag because shared tables let several blocks hold
+   * the same page at once.
+   */
+  clio::run::u32 pins;
   /** 1 when the page has been written since it was faulted or flushed. */
   clio::run::u32 dirty;
   /** 1 while a put issued by BeginFlush is still outstanding. */

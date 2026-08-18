@@ -477,7 +477,10 @@ class Vector {
       p.page_num = kNoPage;
       p.data = pages_bytes + i * page_bytes_;
       p.score = 0.0f;
+      p.user_score = 0.0f;
+      p.has_user = 0;      // no RescorePage hint until the kernel sets one
       p.last_access = 0;
+      p.pins = 0;
       p.dirty = 0;
       p.flushing = 0;
       p.fetching = 0;

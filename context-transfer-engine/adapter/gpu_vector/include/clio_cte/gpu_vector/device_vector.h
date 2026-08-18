@@ -689,6 +689,9 @@ class DeviceVector {
     for (clio::run::u32 w = 0; w < nw; ++w) {
       const clio::run::u32 i = WaySlot(pn, w);
       Page &pgi = tbl[i];
+      // A pinned page is being read through a raw pointer right now. Recycling
+      // it is silent corruption, so it is not a candidate at any score.
+      if (pgi.pins != 0u) continue;
       if (pgi.page_num == kNoPage) {
         return i;
       }
@@ -783,7 +786,8 @@ class DeviceVector {
         Page *tbl = BlockPages();
         victim = h_->pages_per_block_;
         for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-          if (tbl[i].page_num == kNoPage) continue;
+          if (tbl[i].pins != 0u) continue;   // in use through a raw pointer
+        if (tbl[i].page_num == kNoPage) continue;
           if (tbl[i].fetching || tbl[i].flushing) continue;
           if (victim == h_->pages_per_block_ ||
               tbl[i].score < tbl[victim].score ||
@@ -854,6 +858,7 @@ class DeviceVector {
     clio::run::u32 fetching_slot = ppb;
     for (clio::run::u32 w = 0; w < nw; ++w) {
       const clio::run::u32 i = WaySlot(page_num, w);
+      if (tbl[i].pins != 0u) continue;   // in use through a raw pointer
       if (tbl[i].page_num == kNoPage) return true;   // room already
       // A page mid-fetch is promised to that transfer: taking its slot would
       // let the copy land under a different page.
@@ -1010,6 +1015,40 @@ class DeviceVector {
     const clio::run::u32 got = FetchPagesBatchedAsyncLocked(first_page, n);
     UnlockBlock();
     return got;
+  }
+
+  /**
+   * Pin every resident page of [p0, p0+n) so a claim cannot recycle it.
+   *
+   * Call from ONE thread, pair with UnpinRange, and keep the pinned span
+   * smaller than the table or claims will find no candidate. This is what
+   * makes it safe to record raw page pointers and read through them, which is
+   * the whole point of a page-pointer table.
+   *
+   * @return pages actually pinned.
+   */
+  CTP_GPU_FUN clio::run::u32 PinRange(clio::run::u64 p0, clio::run::u32 n) {
+    LockBlock();
+    clio::run::u32 got = 0;
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      Page *p = Find(p0 + k);
+      if (p != nullptr) {
+        p->pins += 1u;
+        ++got;
+      }
+    }
+    UnlockBlock();
+    return got;
+  }
+
+  /** Release pins taken by PinRange. */
+  CTP_GPU_FUN void UnpinRange(clio::run::u64 p0, clio::run::u32 n) {
+    LockBlock();
+    for (clio::run::u32 k = 0; k < n; ++k) {
+      Page *p = Find(p0 + k);
+      if (p != nullptr && p->pins != 0u) p->pins -= 1u;
+    }
+    UnlockBlock();
   }
 
   /** Lock-free residency probe. RACY BY DESIGN: a concurrent claim can
@@ -1392,6 +1431,7 @@ class DeviceVector {
     clio::run::u32 victim = ppb;
     for (clio::run::u32 w = 0; w < nw; ++w) {
       const clio::run::u32 i = WaySlot(page_num, w);
+      if (tbl[i].pins != 0u) continue;   // in use through a raw pointer
       if (tbl[i].page_num == kNoPage) { UnlockBlock(); return; }  // free slot
       // `rescoring` is deliberately NOT skipped here, though the claim does
       // skip it. That asymmetry is the escape hatch: `rescoring` is STICKY --
@@ -2079,6 +2119,7 @@ class DeviceVector {
       if (slot == ~0u) break;
       Page *np = &tbl[slot];
       np->gen += 1u;
+      np->pins = 0u;
       np->fetching = 2u;  // batch-async: settled via SettleBatchLocked
       // DEVICE-wide: the readers that must observe fetching before the new
       // page_num are lock-free probes in OTHER blocks. A block fence let
