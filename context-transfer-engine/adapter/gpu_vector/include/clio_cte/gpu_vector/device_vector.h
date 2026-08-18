@@ -1451,6 +1451,23 @@ class DeviceVector {
         if (mb[0].async_pending != 0u && MultiGetDone(&mb[0])) {
           SettleOneLocked(&mb[0]);
         }
+        // ALSO the async slots, which live at the OTHER END of the array
+        // (AsyncBatchSlot counts down from multi_per_block-1) and which this
+        // loop used to ignore entirely. A page claimed by
+        // FetchPagesBatchedAsync is marked fetching=2 exactly like a run-fetch,
+        // but nothing here settled its batch, so on the yieldable path it
+        // deadlocked: HoldPageCoro parks until the page is resident, only
+        // AwaitFetch settles the batch, and AwaitFetch is reached only AFTER
+        // the page is resident. Observed as a live-lock -- 2,000,000 rounds and
+        // 32M holds for zero pairs -- the moment a cache was large enough for
+        // AsyncSlotCount() to be non-zero, which is why it hid below 65 slots.
+        const clio::run::u32 acnt = AsyncSlotCount();
+        for (clio::run::u32 k = 0; k < acnt; ++k) {
+          MultiBatch *am = AsyncBatchSlot(k);
+          if (am->async_pending != 0u && MultiGetDone(am)) {
+            SettleOneLocked(am);
+          }
+        }
         continue;
       }
       if (p->fetching && p->get->fut_.is_complete_.load() != 0) {
