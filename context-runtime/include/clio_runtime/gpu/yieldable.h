@@ -64,6 +64,7 @@
 #include <clio_runtime/types.h>
 
 #include <type_traits>
+#include <chrono>
 #include <vector>
 
 namespace clio::run::gpu {
@@ -305,20 +306,52 @@ class Yieldable {
     return more;
   }
 
+  /** Where a round's time goes. Split because "the driver is slow" was not
+   *  actionable: launch+sync, the D2H state copy, and the H2D pending upload
+   *  are three different problems with three different fixes. */
+  double t_kernel_ms_ = 0.0;
+  double t_copy_ms_ = 0.0;
+  double t_upload_ms_ = 0.0;
+
+ public:
+  double KernelMs() const { return t_kernel_ms_; }
+  double CopyMs() const { return t_copy_ms_; }
+  double UploadMs() const { return t_upload_ms_; }
+  void ResetTimers() { t_kernel_ms_ = t_copy_ms_ = t_upload_ms_ = 0.0; }
+
   template <typename LaunchFn>
   bool Round(LaunchFn &&launch) {
     if (num_pending_ == 0) {
       return false;
     }
+    const auto _t0 = std::chrono::steady_clock::now();
     launch(dim3(num_pending_), dim3(nthreads_), View());
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     // GpuApi checks its own errors and aborts on failure, so the previous
     // "return false on a bad status" branches no longer exist. That is a
     // behaviour change worth naming: a launch failure used to end the round
     // quietly and look like completion.
-    ctp::GpuApi::Synchronize();
+    // Wait for THIS KERNEL, not for the whole device. cudaDeviceSynchronize
+    // blocks until every stream drains, and the Clio runtime is concurrently
+    // servicing page faults on its own (non-blocking) streams -- so every
+    // round waited for unrelated page transfers to finish before the host
+    // could even look at which blocks had suspended.
+    //
+    // That is the difference between a round costing tens of microseconds and
+    // costing the better part of a millisecond, and rounds are the whole cost
+    // of this driver: measured 30 rounds per step at 13,500 atoms, 0.77 ms
+    // each, for a step whose arithmetic a GPU finishes in well under 1 ms.
+    //
+    // The kernels launch on the legacy default stream, so that is what has to
+    // be waited on. Clio's streams are created cudaStreamNonBlocking, so they
+    // do not implicitly join it and are correctly excluded here.
+    ctp::GpuApi::Synchronize(/*stream=*/nullptr);
+    const auto _t1 = std::chrono::steady_clock::now();
     ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
                         nblocks_ * sizeof(YieldBlockState));
+    const auto _t2 = std::chrono::steady_clock::now();
+    t_kernel_ms_ += std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+    t_copy_ms_ += std::chrono::duration<double, std::milli>(_t2 - _t1).count();
 #endif
     // Compact the still-suspended blocks. Order is preserved so that a block's
     // work stays as sequential as the caller wrote it.
@@ -329,7 +362,10 @@ class Yieldable {
       }
     }
     num_pending_ = n;
+    const auto _t3 = std::chrono::steady_clock::now();
     UploadPending();
+    t_upload_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - _t3).count();
     return num_pending_ > 0;
   }
 
