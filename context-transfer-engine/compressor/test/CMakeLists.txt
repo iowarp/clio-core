@@ -37,6 +37,24 @@ target_link_libraries(test_qtable_predictor_exec
 )
 add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
 
+# Compose-YAML configuration (issue #693). Pure parse test: no runtime, no
+# GPU, no pool -- CompressorConfig::LoadConfig against the entries a pipeline
+# actually writes. Guards the invariant that every serialized field stays
+# reachable from YAML, which is how five model paths came to be silently
+# discarded.
+add_executable(test_compressor_compose_config_exec
+  test_compressor_compose_config.cc
+)
+target_link_libraries(test_compressor_compose_config_exec
+  clio::cte::compressor_runtime
+  ctp::compress
+  Catch2::Catch2WithMain
+)
+add_test(NAME test_compressor_compose_config
+         COMMAND test_compressor_compose_config_exec)
+set_tests_properties(test_compressor_compose_config PROPERTIES
+  LABELS "693;compressor;config;unit")
+
 # Test NeuroPress bridge (issue #693 cycle 3): NeuroPressCandidateStats
 # ranking GPU/NeuroPress candidates for dynamic selection.
 add_executable(test_neuropress_bridge_exec
@@ -257,6 +275,54 @@ set_tests_properties(
 )
 
 install(TARGETS test_transparent_compress RUNTIME DESTINATION bin)
+
+#------------------------------------------------------------------------------
+# NeuroPress-via-compose integration test (issue #693)
+#------------------------------------------------------------------------------
+# Proves a compressor composed from YAML actually loads the NeuroPress model
+# and selects with it. Every other NeuroPress test and example sets
+# neuropress_model_path_ programmatically, so nothing covered the config-file
+# route -- the one a deployment uses, and the one that was broken.
+add_executable(test_neuropress_compose
+  test_neuropress_compose.cc
+)
+
+target_link_libraries(test_neuropress_compose
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_compile_definitions(test_neuropress_compose PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+# One entry, both cases in declaration order: the round-trip case reads the
+# blob the selection case writes, so separate ctest entries would run in
+# separate processes against a wiped runtime and the read could never find it.
+#
+# A SINGLE filter, matching both by tag. simple_test.h's SIMPLE_TEST_MAIN
+# reads argv[1] only, so passing one spec per case silently runs just the
+# first -- which is what compressor_transparent_roundtrip above does today,
+# leaving its GetBlob half dead. Filtering on the shared [compose] tag keeps
+# both in one process and in declaration order.
+add_test(NAME compressor_neuropress_compose
+    COMMAND test_neuropress_compose "[compose]")
+
+set_tests_properties(
+    compressor_neuropress_compose
+    PROPERTIES
+        TIMEOUT 180
+        LABELS "693;compressor;neuropress;compose;integration;gpu;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
 
 #------------------------------------------------------------------------------
 # ADIOS2-style Transparent Compression Test (direct CTE client API, no Tag)

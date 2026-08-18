@@ -200,6 +200,41 @@ struct CompressorConfig {
         if (node["tracking_enabled"]) {
           tracking_enabled_ = node["tracking_enabled"].as<bool>();
         }
+        // Predictor and trace paths. These are written into the compose file
+        // by jarvis_clio_core.clio_compress and were, until now, read by
+        // nobody: config_manager.cc hands the whole pool node over for
+        // "module-specific parsing" and this is the only place that parsing
+        // happens, so every model path configured through a pipeline was
+        // silently dropped and the compressor ran with its defaults. Each is
+        // empty by default and every consumer short-circuits on empty, so
+        // parsing them changes nothing for a config that does not set them.
+        if (node["qtable_model_path"]) {
+          qtable_model_path_ = node["qtable_model_path"].as<std::string>();
+        }
+        if (node["linreg_model_path"]) {
+          linreg_model_path_ = node["linreg_model_path"].as<std::string>();
+        }
+        if (node["distribution_model_path"]) {
+          distribution_model_path_ =
+              node["distribution_model_path"].as<std::string>();
+        }
+        if (node["dnn_model_weights_path"]) {
+          dnn_model_weights_path_ =
+              node["dnn_model_weights_path"].as<std::string>();
+        }
+        if (node["trace_folder_path"]) {
+          trace_folder_path_ = node["trace_folder_path"].as<std::string>();
+        }
+        // The NeuroPress master switch (issue #693): the directory holding the
+        // trained .nnwt weights. Everything else in this block is inert
+        // without it -- compressor_runtime.cc only builds the predictor when
+        // this is non-empty, so a compose file that set, say, an exploration
+        // threshold but could not set this got a compressor with no model and
+        // no indication of why.
+        if (node["neuropress_model_path"]) {
+          neuropress_model_path_ =
+              node["neuropress_model_path"].as<std::string>();
+        }
         if (node["neuropress_online_learning_enabled"]) {
           neuropress_online_learning_enabled_ =
               node["neuropress_online_learning_enabled"].as<bool>();
@@ -223,6 +258,13 @@ struct CompressorConfig {
         if (node["neuropress_exploration_k"]) {
           neuropress_exploration_k_ =
               node["neuropress_exploration_k"].as<int>();
+        }
+        // Exhaustive-search measurement mode. Widens the exploration gate
+        // rather than opening it, so the runtime forces exploration on and K
+        // to the full action space when this is set -- see Create() in
+        // compressor_runtime.cc; no coupling is enforced here.
+        if (node["neuropress_best_mode"]) {
+          neuropress_best_mode_ = node["neuropress_best_mode"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort
