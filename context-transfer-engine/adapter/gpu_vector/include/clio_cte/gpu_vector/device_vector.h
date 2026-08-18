@@ -1018,6 +1018,36 @@ class DeviceVector {
   }
 
   /**
+   * Pin the page THIS THREAD is holding, and hand back the slot so it can be
+   * released exactly.
+   *
+   * Prefer this to PinRange when the page has just been held. PinRange finds
+   * the page with the lock-free Find, which is racy by design and can MISS a
+   * page that is present -- leaving it unpinned and evictable while a raw
+   * pointer to it is already in use. That is not theoretical: it slipped one
+   * window past pinning after ~80 steps, and the stale-page guard caught it.
+   *
+   * @return the pinned slot, or nullptr if nothing is held.
+   */
+  CTP_GPU_FUN Page *PinHeld() {
+    Page *p = last_page_;
+    if (p != nullptr) {
+      LockBlock();
+      p->pins += 1u;
+      UnlockBlock();
+    }
+    return p;
+  }
+
+  /** Release a pin taken by PinHeld, by slot rather than by lookup. */
+  CTP_GPU_FUN void UnpinPage(Page *p) {
+    if (p == nullptr) return;
+    LockBlock();
+    if (p->pins != 0u) p->pins -= 1u;
+    UnlockBlock();
+  }
+
+  /**
    * Pin every resident page of [p0, p0+n) so a claim cannot recycle it.
    *
    * Call from ONE thread, pair with UnpinRange, and keep the pinned span
