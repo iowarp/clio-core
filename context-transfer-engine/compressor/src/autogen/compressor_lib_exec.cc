@@ -33,7 +33,11 @@ namespace clio::cte::compressor {
   X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
   X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
   X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \
-  X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob)
+  X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob) \
+  X(kPodPutBlob, clio::cte::core::PodPutBlobTask, CompressPodPutBlob) \
+  X(kPodGetBlob, clio::cte::core::PodGetBlobTask, DecompressPodGetBlob) \
+  X(kPodMultiPutBlob, clio::cte::core::PodMultiPutBlobTask, CompressPodMultiPutBlob) \
+  X(kPodMultiGetBlob, clio::cte::core::PodMultiGetBlobTask, DecompressPodMultiGetBlob)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

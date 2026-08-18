@@ -71,11 +71,24 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
 // registered node's copy (write-invalidate) before completing.
 GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 50;
+// Batched POD paging: one task carries many page requests. A page fault costs
+// ~110 us of round trip -- GPU->CPU submission, worker pickup, CTE and bdev
+// traversal, completion -- against ~6 us for the 256 KB device-to-device copy
+// it performs, so data movement is about 5% of a read and the trip is the
+// rest. These amortize the trip across a batch, which is the only change that
+// touches the dominant term.
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob = 50;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob = 51;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 52;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 53;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
     std::vector<std::string> v(kMaxMethodId);
+    v[50] = "PodMultiPutBlob";
+    v[51] = "PodMultiGetBlob";
+    v[52] = "PodMultiScore";
     v[0] = "Create";
     v[1] = "Destroy";
     v[9] = "Monitor";

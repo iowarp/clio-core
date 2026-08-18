@@ -1,0 +1,10 @@
+The llama.cpp integration lives out of tree (a gitlink here, without a
+.gitmodules entry, broke every CI workflow at checkout: "No url found for
+submodule path 'external/llama.cpp'").
+
+Tested revision for the gpu-vector work on this branch:
+  repo:   https://github.com/lukemartinlogan/llama.cpp
+  branch: clio-vector-integration
+  commit: dd00565e6  (clang-clean bridge, RESIDENT mode, stored-size publish)
+
+Clone it here to build with CLIO_CORE_ENABLE_LLAMA_SERVER=ON.

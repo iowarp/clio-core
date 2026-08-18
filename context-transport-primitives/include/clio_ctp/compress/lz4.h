@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZ4
 
 #include <lz4.h>
 
@@ -56,14 +57,23 @@ class Lz4 : public Compressor {
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    output_size = LZ4_decompress_safe((char *)input, (char *)output,
-                                      (int)input_size, (int)output_size);
-    return output_size != 0;
+    // LZ4_decompress_safe returns a NEGATIVE value on failure. Assigning it
+    // straight into a size_t made it enormous, and `!= 0` then reported
+    // SUCCESS -- so a failed decompression was handed back as valid data with
+    // a garbage length. Check the signed result before converting.
+    int rc = LZ4_decompress_safe((char *)input, (char *)output,
+                                 (int)input_size, (int)output_size);
+    if (rc <= 0) {
+      output_size = 0;
+      return false;
+    }
+    output_size = static_cast<size_t>(rc);
+    return true;
   }
 };
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_LZ4
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lz4_H_

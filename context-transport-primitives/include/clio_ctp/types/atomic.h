@@ -874,10 +874,18 @@ struct std_atomic {
     return x.fetch_sub(count, order);
   }
 
-  /** Atomic load wrapper */
-  CTP_INLINE T
+  /** Atomic load wrapper. Device-callable: nvcc always accepted the device
+   * call here (the cross-call diagnostic is suppressed project-wide) and
+   * emitted a plain load; clang makes it a hard error, so spell out what the
+   * device side actually is -- a volatile poll of a host-written flag. */
+  CTP_INLINE_CROSS_FUN T
   load(std::memory_order order = std::memory_order_seq_cst) const {
+#if CTP_IS_HOST
     return x.load(order);
+#else
+    (void)order;
+    return *reinterpret_cast<const volatile T *>(&x);
+#endif
   }
 
   /** Atomic store wrapper */

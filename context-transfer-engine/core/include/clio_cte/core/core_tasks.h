@@ -1680,6 +1680,15 @@ enum class CteOp : clio::run::u32 {
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutReplace = 0x1u;
 
 /**
+ * PodMultiGetBlob hint: this batch is a PREFETCH — its completion latency is
+ * off the caller's critical path. The handler dispatches such batches across
+ * workers instead of servicing them inline, so a concurrent DEMAND fault
+ * (which IS latency-critical) never queues behind them. Stripped before the
+ * flag word is forwarded to the per-blob subtasks.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePrefetchHint = 0x80000000u;
+
+/**
  * CTE Telemetry data structure for performance monitoring
  */
 struct CteTelemetry {
@@ -2892,6 +2901,172 @@ struct PodReorganizeBlobTask : public clio::run::Task {
     Copy(other_base.template Cast<PodReorganizeBlobTask>());
   }
 };
+
+/**
+ * One page request inside a batched POD blob task.
+ *
+ * Fixed layout on purpose: these are filled by a CUDA kernel, so there is no
+ * allocator, no serialization, and no indirection -- the same reason the
+ * scalar Pod* tasks exist. Names are fixed_string<32>, which is what
+ * gpu_vector's PageBlobName already produces.
+ */
+struct PodBlobReq {
+  IN PodBlobName blob_name_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 size_;
+  IN ctp::ipc::ShmPtr<> data_;
+  IN float score_;        // puts and score updates; ignored by gets
+  OUT clio::run::u32 rc_; // per-record result, so one bad page cannot hide
+
+  CTP_CROSS_FUN PodBlobReq()
+      : blob_name_(),
+        offset_(0),
+        size_(0),
+        data_(ctp::ipc::ShmPtr<>::GetNull()),
+        score_(0.0f),
+        rc_(0) {}
+};
+
+/**
+ * How many requests one batched POD task carries.
+ *
+ * A page fault costs ~110 us of round trip against ~6 us for the 256 KB
+ * device-to-device copy it exists to perform -- data movement is roughly 5% of
+ * a read and the trip is the rest. Batching is therefore the only change that
+ * touches the dominant term. 64 is the default batch; a caller that needs to
+ * move more (a full block cache flush of 256 pages) uses several of these
+ * tasks rather than a bigger one, so the task stays a fixed, kernel-fillable
+ * size instead of scaling with someone's cache geometry.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
+
+/** Common body of the batched POD tasks: a tag, N records, and a tally. */
+#define CLIO_POD_MULTI_BODY(TaskName, MethodId)                               \
+  IN TagId tag_id_;                                                           \
+  IN clio::run::u32 count_;                                                   \
+  IN clio::run::u32 flags_;                                                   \
+  INOUT Context context_;                                                     \
+  INOUT PodBlobReq reqs_[kPodMultiMax];                                       \
+  OUT clio::run::u32 num_ok_;                                                 \
+                                                                              \
+  CTP_CROSS_FUN TaskName()                                                    \
+      : clio::run::Task(),                                                    \
+        tag_id_(TagId::GetNull()),                                            \
+        count_(0),                                                            \
+        flags_(0),                                                            \
+        context_(),                                                           \
+        num_ok_(0) {}                                                         \
+                                                                              \
+  CTP_CROSS_FUN explicit TaskName(const clio::run::TaskId &task_id,           \
+                                  const clio::run::PoolId &pool_id,           \
+                                  const clio::run::PoolQuery &pool_query,     \
+                                  const TagId &tag_id)                        \
+      : clio::run::Task(task_id, pool_id, pool_query, MethodId),              \
+        tag_id_(tag_id),                                                      \
+        count_(0),                                                            \
+        flags_(0),                                                            \
+        context_(),                                                           \
+        num_ok_(0) {                                                          \
+    task_flags_.Clear();                                                      \
+  }                                                                           \
+                                                                              \
+  /** Append a record. Returns false when the batch is full, which is the      \
+   *  caller's signal to submit and start another. */                         \
+  CTP_CROSS_FUN bool Add(const char *blob_name, clio::run::u64 offset,        \
+                         clio::run::u64 size, ctp::ipc::ShmPtr<> data,        \
+                         float score = 0.0f) {                                \
+    if (count_ >= kPodMultiMax) {                                             \
+      return false;                                                           \
+    }                                                                         \
+    PodBlobReq &r = reqs_[count_];                                            \
+    r.blob_name_ = blob_name;                                                 \
+    r.offset_ = offset;                                                       \
+    r.size_ = size;                                                           \
+    r.data_ = data;                                                           \
+    r.score_ = score;                                                         \
+    r.rc_ = 0;                                                                \
+    ++count_;                                                                 \
+    return true;                                                              \
+  }                                                                           \
+                                                                              \
+  /** Only `count_` records are live; serializing the whole fixed array would \
+   *  put 64 records on the wire to move one. Each record's payload is bulked  \
+   *  separately because they are separate buffers. */                        \
+  template <typename Archive>                                                 \
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {                               \
+    Task::SerializeIn(ar);                                                    \
+    ar(tag_id_, count_, flags_, context_);                                    \
+    for (clio::run::u32 i = 0; i < count_ && i < kPodMultiMax; ++i) {         \
+      ar(reqs_[i].blob_name_, reqs_[i].offset_, reqs_[i].size_,               \
+         reqs_[i].data_, reqs_[i].score_, reqs_[i].rc_);                      \
+      ar.bulk(reqs_[i].data_, reqs_[i].size_, BULK_EXPOSE);                   \
+    }                                                                         \
+  }                                                                           \
+                                                                              \
+  template <typename Archive>                                                 \
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {                              \
+    Task::SerializeOut(ar);                                                   \
+    ar(context_, num_ok_);                                                    \
+    for (clio::run::u32 i = 0; i < count_ && i < kPodMultiMax; ++i) {         \
+      ar(reqs_[i].rc_);                                                       \
+      ar.bulk(reqs_[i].data_, reqs_[i].size_, BULK_XFER);                     \
+    }                                                                         \
+  }
+
+/** Many POD gets in one task: a batched page fault. */
+struct PodMultiGetBlobTask : public clio::run::Task {
+  static constexpr bool kSupportsVectored = false;
+  CLIO_POD_MULTI_BODY(PodMultiGetBlobTask, Method::kPodMultiGetBlob)
+
+  CTP_CROSS_FUN void Copy(const ctp::ipc::FullPtr<PodMultiGetBlobTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_id_ = other->tag_id_;
+    count_ = other->count_;
+    flags_ = other->flags_;
+    context_ = other->context_;
+    num_ok_ = other->num_ok_;
+    for (clio::run::u32 i = 0; i < other->count_; ++i) {
+      reqs_[i] = other->reqs_[i];
+    }
+  }
+};
+
+/** Many POD puts in one task: a batched page flush. */
+struct PodMultiPutBlobTask : public clio::run::Task {
+  static constexpr bool kSupportsVectored = false;
+  CLIO_POD_MULTI_BODY(PodMultiPutBlobTask, Method::kPodMultiPutBlob)
+
+  CTP_CROSS_FUN void Copy(const ctp::ipc::FullPtr<PodMultiPutBlobTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_id_ = other->tag_id_;
+    count_ = other->count_;
+    flags_ = other->flags_;
+    context_ = other->context_;
+    num_ok_ = other->num_ok_;
+    for (clio::run::u32 i = 0; i < other->count_; ++i) {
+      reqs_[i] = other->reqs_[i];
+    }
+  }
+};
+
+/** Many POD score updates in one task: batched reorganize hints. */
+struct PodMultiScoreTask : public clio::run::Task {
+  static constexpr bool kSupportsVectored = false;
+  CLIO_POD_MULTI_BODY(PodMultiScoreTask, Method::kPodMultiScore)
+
+  CTP_CROSS_FUN void Copy(const ctp::ipc::FullPtr<PodMultiScoreTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_id_ = other->tag_id_;
+    count_ = other->count_;
+    flags_ = other->flags_;
+    context_ = other->context_;
+    num_ok_ = other->num_ok_;
+    for (clio::run::u32 i = 0; i < other->count_; ++i) {
+      reqs_[i] = other->reqs_[i];
+    }
+  }
+};
+
 
 /**
  * DelBlob task - Remove blob and decrement tag size

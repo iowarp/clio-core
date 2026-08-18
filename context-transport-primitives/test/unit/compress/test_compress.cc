@@ -59,6 +59,7 @@ TEST_CASE("TestCompress") {
   std::vector<char> compressed(1024);
   std::vector<char> decompressed(1024);
 
+#if CTP_ENABLE_BZIP2
   PAGE_DIVIDE("BZIP2") {
     ctp::Bzip2 bzip;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -68,7 +69,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BZIP2
 
+#if CTP_ENABLE_LZO
   PAGE_DIVIDE("LZO") {
     ctp::Lzo lzo;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -78,7 +81,9 @@ TEST_CASE("TestCompress") {
                    compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZO
 
+#if CTP_ENABLE_ZSTD
   PAGE_DIVIDE("Zstd") {
     ctp::Zstd zstd;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -88,7 +93,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_ZSTD
 
+#if CTP_ENABLE_LZ4
   PAGE_DIVIDE("LZ4") {
     ctp::Lz4 lz4;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -98,7 +105,9 @@ TEST_CASE("TestCompress") {
                    compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZ4
 
+#if CTP_ENABLE_ZLIB
   PAGE_DIVIDE("Zlib") {
     ctp::Zlib zlib;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -108,7 +117,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_ZLIB
 
+#if CTP_ENABLE_LZMA
   PAGE_DIVIDE("Lzma") {
     ctp::Lzma lzma;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -118,7 +129,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZMA
 
+#if CTP_ENABLE_BROTLI
   PAGE_DIVIDE("Brotli") {
     ctp::Brotli brotli;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -128,7 +141,9 @@ TEST_CASE("TestCompress") {
                       compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BROTLI
 
+#if CTP_ENABLE_SNAPPY
   PAGE_DIVIDE("Snappy") {
     ctp::Snappy snappy;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -138,7 +153,9 @@ TEST_CASE("TestCompress") {
                       compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_SNAPPY
 
+#if CTP_ENABLE_BLOSC2
   PAGE_DIVIDE("Blosc2") {
     ctp::Blosc blosc;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -148,6 +165,7 @@ TEST_CASE("TestCompress") {
                      compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BLOSC2
 }
 
 #if CTP_ENABLE_ZFP_SYCL
@@ -327,16 +345,55 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(212).first == "ndzip");
   }
 
-  PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
+  PAGE_DIVIDE("GetPreset constructs the CPU compressors this build HAS") {
+    // Each codec is optional (its dev library may not be installed), so the
+    // expectation is conditional on the same switch that compiles it in.
+    // A codec that is compiled out must return nullptr rather than crash --
+    // that is the contract callers rely on, so assert it in both directions.
+#if CTP_ENABLE_BZIP2
     REQUIRE(CompressionFactory::GetPreset("bzip2") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("bzip2") == nullptr);
+#endif
+#if CTP_ENABLE_ZSTD
     REQUIRE(CompressionFactory::GetPreset("zstd") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("zstd") == nullptr);
+#endif
+#if CTP_ENABLE_LZ4
     REQUIRE(CompressionFactory::GetPreset("lz4") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("lz4") == nullptr);
+#endif
+#if CTP_ENABLE_ZLIB
     REQUIRE(CompressionFactory::GetPreset("zlib") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("zlib") == nullptr);
+#endif
+#if CTP_ENABLE_LZMA
     REQUIRE(CompressionFactory::GetPreset("lzma") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("lzma") == nullptr);
+#endif
+#if CTP_ENABLE_BROTLI
     REQUIRE(CompressionFactory::GetPreset("brotli") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("brotli") == nullptr);
+#endif
+#if CTP_ENABLE_SNAPPY
     REQUIRE(CompressionFactory::GetPreset("snappy") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("snappy") == nullptr);
+#endif
+#if CTP_ENABLE_BLOSC2
     REQUIRE(CompressionFactory::GetPreset("blosc2") != nullptr);
     REQUIRE(CompressionFactory::GetPreset("blosc") != nullptr);  // alias
+#else
+    REQUIRE(CompressionFactory::GetPreset("blosc2") == nullptr);
+    REQUIRE(CompressionFactory::GetPreset("blosc") == nullptr);  // alias
+#endif
+    // Names stay resolvable regardless: wire ids are frozen protocol values.
+    REQUIRE(CompressionFactory::NameForWireId(4) == "lz4");
     REQUIRE(CompressionFactory::GetPreset("does-not-exist") == nullptr);
   }
 
@@ -350,8 +407,33 @@ TEST_CASE("CompressorRegistryMappings") {
     for (int i = 0; i < 256; ++i) {
       payload += "registry round-trip payload 0123456789 ";
     }
-    const char *cpu_libs[] = {"bzip2", "zstd",   "lz4",    "zlib",
-                              "lzma",  "brotli", "snappy", "blosc2"};
+    // Only the codecs this build compiled in: an absent one legitimately
+    // yields nullptr from the factory (see the optional-codec note above).
+    std::vector<const char *> cpu_libs;
+#if CTP_ENABLE_BZIP2
+    cpu_libs.push_back("bzip2");
+#endif
+#if CTP_ENABLE_ZSTD
+    cpu_libs.push_back("zstd");
+#endif
+#if CTP_ENABLE_LZ4
+    cpu_libs.push_back("lz4");
+#endif
+#if CTP_ENABLE_ZLIB
+    cpu_libs.push_back("zlib");
+#endif
+#if CTP_ENABLE_LZMA
+    cpu_libs.push_back("lzma");
+#endif
+#if CTP_ENABLE_BROTLI
+    cpu_libs.push_back("brotli");
+#endif
+#if CTP_ENABLE_SNAPPY
+    cpu_libs.push_back("snappy");
+#endif
+#if CTP_ENABLE_BLOSC2
+    cpu_libs.push_back("blosc2");
+#endif
     for (const char *lib : cpu_libs) {
       auto comp = CompressionFactory::GetPreset(lib);
       REQUIRE(comp != nullptr);

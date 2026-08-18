@@ -35,6 +35,7 @@
 #define CLIO_CAE_CORE_BASE_ASSIMILATOR_H_
 
 #include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cae/core/factory/page_map.h>
 #include <clio_runtime/task.h>
 
 namespace clio::cae::core {
@@ -58,6 +59,40 @@ class BaseAssimilator {
    * @return TaskResume for coroutine suspension/resumption
    */
   virtual clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) = 0;
+
+  /**
+   * PAGIFY: the assimilator's page-space layout for `ctx`.
+   *
+   * A consumer (the gpu_vector) addresses data as page 0, 1, 2, ... and
+   * knows nothing about blob names or how the source was chopped up.
+   * Only the assimilator knows that mapping, so it publishes it here as a
+   * PageMap, from which ToPage/FromPage follow mechanically -- including
+   * PARTIAL pages (a blob covering part of one) and MIXED pages (several
+   * blobs sharing one).
+   *
+   * Default: an empty map, meaning "this assimilator does not support
+   * paged access" -- the pagify interposer then declines and the caller
+   * keeps whatever addressing it used before.
+   */
+  virtual PageMap BuildPageMap(const AssimilationCtx& ctx,
+                               clio::run::u64 page_size) {
+    (void)ctx;
+    (void)page_size;
+    return PageMap();
+  }
+
+  /** Slices composing `page_id`, per the map above. */
+  std::vector<PageSlice> ToPage(const PageMap& map,
+                                clio::run::u64 page_id) const {
+    return map.ToPage(page_id);
+  }
+
+  /** Pages holding [off, off+size) of `blob`, per the map above. */
+  std::vector<PageRef> FromPage(const PageMap& map, const std::string& blob,
+                                clio::run::u64 off,
+                                clio::run::u64 size) const {
+    return map.FromPage(blob, off, size);
+  }
 };
 
 }  // namespace clio::cae::core

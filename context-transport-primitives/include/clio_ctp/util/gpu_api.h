@@ -35,9 +35,17 @@
 #define CTP_UTIL_GPU_API_H
 
 #include <cstring>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/util/logging.h"
+
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream);
 
 namespace ctp {
 
@@ -52,6 +60,34 @@ struct GpuIpcMemHandle {
   void *sycl_ptr_;  // SYCL USM pointers are directly shareable; store base ptr
 #endif
 };
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+/** Grid-stride copy kernel: the CPU-launched alternative to cudaMemcpyAsync
+ *  for device reads that stall in channel order behind a resident kernel.
+ *  Kernels are SM-scheduled, so with SM headroom this executes where the
+ *  engine copy cannot. */
+template <typename T4>
+__global__ void CtpCopyKernel(char *dst, const char *src, size_t n) {
+  const size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t nthreads = (size_t) gridDim.x * blockDim.x;
+  // Vector width only when BOTH pointers carry the alignment — task PODs
+  // and scratch offsets are frequently unaligned (CUDA error 716 otherwise).
+  if (((reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src)) & (sizeof(T4) - 1)) == 0) {
+    const size_t i0 = tid * sizeof(T4);
+    const size_t stride = nthreads * sizeof(T4);
+    for (size_t i = i0; i + sizeof(T4) <= n; i += stride) {
+      *reinterpret_cast<T4 *>(dst + i) =
+          *reinterpret_cast<const T4 *>(src + i);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      for (size_t i = n - (n % sizeof(T4)); i < n; ++i) dst[i] = src[i];
+    }
+  } else {
+    for (size_t i = tid; i < n; i += nthreads) dst[i] = src[i];
+  }
+}
+#endif
 
 class GpuApi {
  public:
@@ -95,6 +131,25 @@ class GpuApi {
 #elif CTP_ENABLE_SYCL
     SyclQueue().wait_and_throw();
 #endif
+  }
+
+  /**
+   * Completion wait that NEVER enters a blocking driver sync. Threads parked
+   * inside cuStreamSynchronize can hold driver submission resources that
+   * every other stream's enqueued work needs — captured as a process-wide
+   * async-op stall (0%% DMA on healthy copy engines, fresh processes
+   * unaffected). Service paths must poll instead.
+   */
+  static inline void PollSync(void *stream) {
+    // Busy-spin first: most service copies land in <100 us, and a 20 us
+    // sleep quantum tripled the fetch path (848 -> 3090 ms/tok measured).
+    // Sleep only once the copy is provably long.
+    for (int i = 0; i < 4000; ++i) {          // ~150-300 us of spin
+      if (StreamQuery(stream)) return;
+    }
+    while (!StreamQuery(stream)) {
+      std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
   }
 
   /** Synchronize a specific GPU stream instead of the whole device.
@@ -154,6 +209,105 @@ class GpuApi {
 #if CTP_ENABLE_SYCL
     delete static_cast<sycl::queue *>(stream);
 #endif
+  }
+
+  /** Device the calling thread is currently bound to (0 when not applicable). */
+  static int CurrentDevice() {
+    int dev = 0;
+#if CTP_ENABLE_ROCM
+    hipGetDevice(&dev);
+#endif
+#if CTP_ENABLE_CUDA
+    cudaGetDevice(&dev);
+#endif
+    return dev;
+  }
+
+  /** Free streams per device. Function-local so the header stays standalone. */
+  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
+    static std::unordered_map<int, std::vector<void *>> pool;
+    return pool;
+  }
+
+  static std::mutex &StreamPoolMutex() {
+    static std::mutex mtx;
+    return mtx;
+  }
+
+  /** Whether a device's pool has been pre-created. */
+  static std::unordered_map<int, bool> &PoolWarmed() {
+    static std::unordered_map<int, bool> warmed;
+    return warmed;
+  }
+
+  /**
+   * Borrow a stream from a process-wide pool, creating one only if the pool
+   * is empty. Return it with ReturnStream when the task's work has completed.
+   *
+   * Creating and destroying a stream PER I/O deadlocks the runtime under
+   * concurrency. cuStreamCreate and cuStreamDestroy both take a write lock on
+   * the CUDA context, so every worker doing device I/O serialises on one
+   * rwlock inside libcuda; worse, cuStreamDestroy waits for the device. When
+   * the device work in question is a kernel that is itself SPINNING on those
+   * very I/Os to complete (a demand-paged GPU vector), the two wait on each
+   * other and neither ever finishes. Observed with a paged vector at 96 CUDA
+   * blocks: every compute worker parked in pthread_rwlock_wrlock under
+   * cuStreamCreate/cuStreamDestroy, the runtime reporting "ALL compute workers
+   * stalled", and the kernel never returning. 64 blocks happened to stay under
+   * the contention threshold, which is why this looked like a block-count bug.
+   *
+   * A borrowed stream is owned EXCLUSIVELY by its task, so StreamQuery on it
+   * still means "my copies are done" and not "the pool is idle" -- which is
+   * why this is a pool rather than one shared stream per thread. Pooled
+   * streams are never destroyed; they are process-lifetime objects.
+   */
+  static void *BorrowStream() {
+    const int dev = CurrentDevice();
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    auto &free_list = StreamPool()[dev];
+    if (!free_list.empty()) {
+      void *s = free_list.back();
+      free_list.pop_back();
+      return s;
+    }
+    // Exhausted. Do NOT create one here: creating a stream while a kernel is
+    // resident blocks for as long as that kernel runs, and the kernels this
+    // serves are demand-paged ones that spin until THIS I/O completes. Two
+    // shapes of that were measured and both deadlocked -- creating per cold
+    // task (hung at 128 blocks) and creating a batch under this mutex (hung at
+    // 96, because the holder blocked inside libcuda with everyone queued
+    // behind it). The caller yields and retries instead; a stream comes back
+    // as soon as any in-flight copy finishes.
+    if (!PoolWarmed()[dev]) {
+      // Never warmed (no GPU init in this process): bootstrap exactly one so
+      // an un-warmed process still makes progress.
+      PoolWarmed()[dev] = true;
+      return CreateStream();
+    }
+    return nullptr;
+  }
+
+  /**
+   * Pre-create the stream pool for the current device.
+   *
+   * MUST be called during initialization, before any long-running kernel can
+   * be resident -- that is the entire point. See BorrowStream.
+   */
+  static void WarmStreamPool(int count) {
+    const int dev = CurrentDevice();
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    auto &free_list = StreamPool()[dev];
+    for (int i = 0; i < count; ++i) {
+      free_list.push_back(CreateStream());
+    }
+    PoolWarmed()[dev] = true;
+  }
+
+  /** Give a borrowed stream back. The stream is NOT destroyed. */
+  static void ReturnStream(void *stream) {
+    if (stream == nullptr) return;
+    std::lock_guard<std::mutex> lock(StreamPoolMutex());
+    StreamPool()[CurrentDevice()].push_back(stream);
   }
 
   static void GetIpcMemHandle(GpuIpcMemHandle &ipc, void *data) {
@@ -298,6 +452,48 @@ class GpuApi {
                                         SyclQueue().get_context());
     return kind == sycl::usm::alloc::device;
 #else
+    return false;
+#endif
+  }
+
+  /**
+   * Like IsDevicePointer, but TRUE for managed (UVM) memory too.
+   *
+   * Managed memory is addressable by both the host and every context on the
+   * device, so for the question "may a GPU touch this?" it is a yes -- while
+   * cudaPointerGetAttributes reports it as cudaMemoryTypeManaged, not
+   * ...TypeDevice, so the stricter check says no. Use THIS one to decide
+   * whether to take a GPU path; use IsDevicePointer only when the memory must
+   * be device-resident specifically.
+   *
+   * gpu_vector's page cache is managed precisely so a codec running in another
+   * CUDA context can write into a faulting page. With the strict check those
+   * pages read as host memory and every GPU path silently declines.
+   */
+  template <typename T>
+  static bool IsDeviceAccessiblePointer(T *ptr) {
+    if (ptr == nullptr) return false;
+#if CTP_ENABLE_ROCM
+    hipPointerAttribute_t a{};
+    if (hipPointerGetAttributes(&a, (void *)ptr) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+#if defined(HIP_VERSION) && HIP_VERSION >= 60000000
+    return a.type == hipMemoryTypeDevice || a.type == hipMemoryTypeManaged;
+#else
+    return a.memoryType == hipMemoryTypeDevice ||
+           a.memoryType == hipMemoryTypeManaged;
+#endif
+#elif CTP_ENABLE_CUDA
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, (void *)ptr) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+#else
+    (void)ptr;
     return false;
 #endif
   }
@@ -517,12 +713,46 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
     std::memcpy(dst, src, n);
     return;
   }
-  thread_local cudaStream_t s = nullptr;
-  if (!s) {
-    CUDA_ERROR_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+  // NEVER create a stream here. Stream creation takes the context write
+  // lock, which BLOCKS while any kernel is resident — and this function
+  // runs on the fault-service path while a faulting kernel spins for the
+  // very copy being made. A worker thread whose FIRST device copy landed
+  // mid-decode froze in cudaStreamCreateWithFlags, killing fault service
+  // and wedging the process (intermittent by thread-to-task lottery;
+  // copy engines measured healthy from a separate process throughout).
+  // Borrow from the pool pre-warmed at init instead.
+  void *ps = GpuApi::BorrowStream();
+  while (ps == nullptr) {   // pool momentarily exhausted: brief CPU spin
+    std::this_thread::yield();
+    ps = GpuApi::BorrowStream();
   }
-  CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, s));
-  CUDA_ERROR_CHECK(cudaStreamSynchronize(s));
+  cudaStream_t s = static_cast<cudaStream_t>(ps);
+  // COPY VIA KERNEL WHEN LEGAL, ENGINE OTHERWISE. Engine copies that read
+  // device memory are channel-ordered and stall behind a resident faulting
+  // kernel — captured live: the gpu2cpu drain's task-POD D2H froze in
+  // exactly this call, wedging fault service. A copy KERNEL is
+  // SM-scheduled and immune. But a kernel can only touch device-accessible
+  // memory: device, managed, or PINNED host — a pageable pointer (ingest
+  // buffers) must stay on the engine path (those copies never run under a
+  // resident kernel; converting them crashed ingest outright).
+  auto dev_ok = [](const void *p) {
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    return a.type == cudaMemoryTypeDevice ||
+           a.type == cudaMemoryTypeManaged ||
+           (a.type == cudaMemoryTypeHost && a.devicePointer != nullptr);
+  };
+  if (dev_ok(dst) && dev_ok(src)) {
+    ctp_copy_kernel_launch(static_cast<char *>(dst),
+                           static_cast<const char *>(src), n, ps);
+  } else {
+    CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, s));
+  }
+  GpuApi::PollSync(ps);   // never block in driver sync on a service path
+  GpuApi::ReturnStream(ps);
 #elif CTP_ENABLE_ROCM
   auto is_host_kind = [](const void *p) {
     hipPointerAttribute_t a{};
@@ -561,6 +791,12 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
 /** True if ptr is device (USM) memory the host cannot dereference; false on a
  *  non-GPU build. Header-only replacement for the old g_is_device_pointer
  *  hook. */
+/** True if a GPU may touch `ptr`: device OR managed memory. Prefer this over
+ *  IsDevicePointer when deciding whether to take a GPU path. */
+inline bool IsDeviceAccessible(const void *ptr) {
+  return GpuApi::IsDeviceAccessiblePointer(const_cast<void *>(ptr));
+}
+
 inline bool IsDevicePointer(const void *ptr) {
   return GpuApi::IsDevicePointer(const_cast<void *>(ptr));
 }

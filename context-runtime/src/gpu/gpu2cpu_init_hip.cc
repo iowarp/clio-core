@@ -20,11 +20,14 @@
 
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/singletons.h"
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -35,7 +38,7 @@ namespace clio::run {
 // We previously launched a single-thread kernel to construct the
 // BuddyAllocator + GpuTaskQueue in device memory, but the kernel had no
 // host/device asymmetry that required device-side construction (the
-// queue_backend is pinned host memory mapped 1:1 into device address
+// queue_backend is MANAGED memory, addressable 1:1 from host and device
 // space) and the cross-shared-library kernel registration was unreliable
 // under HIP-NVCC ("cudaErrorInvalidDeviceFunction" on launch).
 
@@ -69,17 +72,159 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
 
     ctp::GpuApi::SetDevice(gpu_id);
 
-    dev.queue_backend = ctp::GpuApi::MallocHost<char>(kQueueBackendBytes);
+    // Pre-create the device-I/O stream pool HERE, while no user kernel can be
+    // resident. Creating a stream later, from the bdev's GPU read/write path,
+    // takes the CUDA context write lock and blocks until the device is free --
+    // and the kernels that path serves are demand-paged ones spinning until
+    // that very I/O completes, so the two deadlock. Measured with a paged GPU
+    // vector: every compute worker parked in pthread_rwlock_wrlock under
+    // cuStreamCreate/cuStreamDestroy and the runtime reported "ALL compute
+    // workers stalled". See ctp::GpuApi::BorrowStream.
+    constexpr int kIoStreamPoolSize = 64;
+    ctp::GpuApi::WarmStreamPool(kIoStreamPoolSize);
+
+    // Device-memory submission ring (CLIO_GPU_DEVRING=1).
+    //
+    // Its copy stream is created HERE, at init, and is NEVER the bdev I/O
+    // pool's. Two reasons, both already paid for once: creating a stream while
+    // a kernel is resident blocks until that kernel finishes (see
+    // GpuApi::BorrowStream), and a queue copy queued behind a multi-megabyte
+    // data copy would add that copy's latency to every task on the GPU.
+    // ON BY DEFAULT. It cleared the gate the design set: 23/23 tests,
+    // compute-sanitizer 0 errors, correct through 64 blocks and
+    // multi-oversub-64, and faster on every workload measured (sync demand
+    // faults 493 -> 801 MB/s). CLIO_GPU_DEVRING=0 falls back to the managed
+    // queue for bisecting a regression to this transport.
+    {
+      const char *dr = std::getenv("CLIO_GPU_DEVRING");
+      const bool use_ring =
+          (dr == nullptr) || (*dr != '\0' && std::string(dr) != "0" &&
+                              std::string(dr) != "false");
+      if (use_ring) {
+        void *ring_mem = nullptr;
+#if CTP_ENABLE_CUDA
+        if (cudaMalloc(&ring_mem, sizeof(clio::run::GpuDeviceRing)) !=
+            cudaSuccess) {
+          ring_mem = nullptr;
+        }
+#endif
+        if (ring_mem == nullptr) {
+          HLOG(kError, "ServerInitGpuQueues: device ring alloc failed "
+               "(gpu_id={})", gpu_id);
+          FinalizeGpuQueues();
+          return false;
+        }
+        // The PAYLOAD lives in mapped, pinned host memory so the consumer can
+        // read submissions with plain loads. cudaHostAllocMapped is what makes
+        // the same bytes addressable from a kernel; cudaHostGetDevicePointer
+        // yields the address the device must use.
+#if CTP_ENABLE_CUDA
+        void *h_ents = nullptr, *h_rdy = nullptr;
+        void *d_ents = nullptr, *d_rdy = nullptr;
+        bool host_ok =
+            cudaHostAlloc(&h_ents,
+                          clio::run::kGpuRingCapacity *
+                              sizeof(clio::run::GpuRingEntry),
+                          cudaHostAllocMapped) == cudaSuccess &&
+            cudaHostAlloc(&h_rdy,
+                          clio::run::kGpuRingCapacity * sizeof(unsigned int),
+                          cudaHostAllocMapped) == cudaSuccess;
+        if (host_ok) {
+          // Stamps must read "not ready" before any producer runs, or the
+          // consumer would accept whatever the allocation happened to contain.
+          std::memset(h_rdy, 0,
+                      clio::run::kGpuRingCapacity * sizeof(unsigned int));
+          std::memset(h_ents, 0,
+                      clio::run::kGpuRingCapacity *
+                          sizeof(clio::run::GpuRingEntry));
+          host_ok = cudaHostGetDevicePointer(&d_ents, h_ents, 0) == cudaSuccess &&
+                    cudaHostGetDevicePointer(&d_rdy, h_rdy, 0) == cudaSuccess;
+        }
+        if (!host_ok) {
+          HLOG(kError, "ServerInitGpuQueues: mapped host ring alloc failed "
+               "(gpu_id={})", gpu_id);
+          FinalizeGpuQueues();
+          return false;
+        }
+        dev.ring.host_entries = static_cast<clio::run::GpuRingEntry *>(h_ents);
+        dev.ring.host_ready = static_cast<unsigned int *>(h_rdy);
+#endif
+        // Construct on the host, then upload once: head_/tail_ zeroed and the
+        // payload pointers set to the DEVICE-side addresses of the pinned
+        // allocations above.
+        {
+          auto *init = new clio::run::GpuDeviceRing();
+#if CTP_ENABLE_CUDA
+          init->entries_ = static_cast<clio::run::GpuRingEntry *>(d_ents);
+          init->ready_ = static_cast<unsigned int *>(d_rdy);
+          cudaMemcpy(ring_mem, init, sizeof(*init), cudaMemcpyHostToDevice);
+#endif
+          delete init;
+        }
+        dev.ring.dev_ring = static_cast<clio::run::GpuDeviceRing *>(ring_mem);
+        dev.ring.stream = ctp::GpuApi::CreateStream();
+        dev.ring.tail = 0;
+        HLOG(kInfo, "ServerInitGpuQueues: gpu_id={} DEVICE ring at {} "
+             "(capacity {})", gpu_id, ring_mem,
+             clio::run::kGpuRingCapacity);
+      }
+    }
+
+    // MANAGED, not pinned host memory. The device pushes to this queue with a
+    // SYSTEM-SCOPED atomic (the ring head), and this GPU reports
+    // cudaDevAttrHostNativeAtomicSupported = 0 -- it cannot perform atomics on
+    // host memory at all, so that atomic was invalid on every single device
+    // task submission: every page fault, every flush, every prefetch.
+    // compute-sanitizer flagged it in EVERY gpu_vector binary, including tests
+    // that pass, which were relying on undefined behaviour that usually
+    // happened to work. No cudaHostAlloc flag can fix that; the memory simply
+    // must not be host memory. Managed memory does support system-wide atomics
+    // here (cudaDevAttrConcurrentManagedAccess = 1) and keeps the single
+    // address space the queue's construction relies on.
+    dev.queue_backend = ctp::GpuApi::MallocManaged<char>(kQueueBackendBytes);
     if (!dev.queue_backend) {
-      HLOG(kError, "ServerInitGpuQueues: MallocHost for queue backend "
+      HLOG(kError, "ServerInitGpuQueues: MallocManaged for queue backend "
            "failed (gpu_id={})", gpu_id);
       FinalizeGpuQueues();
       return false;
     }
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
+#if CTP_ENABLE_CUDA
+    // Pin the managed queue's RESIDENCE to the host and give the GPU a fixed
+    // remote mapping instead of migration rights. Concurrent CPU drain +
+    // device atomics on migratable managed pages under a RESIDENT kernel
+    // stalls UVM migrations, and migrations share the copy engines — one
+    // stalled migration froze every CE transfer on the device (captured:
+    // cuStreamSynchronize wedged, 0% MEM util, free SMs irrelevant). With
+    // AccessedBy there is nothing to migrate, ever.
+    {
+      int dev_id = 0;
+      cudaGetDevice(&dev_id);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+      // CUDA 13 retired the (advice, int device) overload: the location is now
+      // a cudaMemLocation, so passing a device id straight through no longer
+      // compiles. Same advice, spelled for the current toolkit.
+      cudaMemLocation host_loc{};
+      host_loc.type = cudaMemLocationTypeHost;
+      host_loc.id = 0;
+      cudaMemLocation dev_loc{};
+      dev_loc.type = cudaMemLocationTypeDevice;
+      dev_loc.id = dev_id;
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, host_loc);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_loc);
+#else
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+      cudaMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                    cudaMemAdviseSetAccessedBy, dev_id);
+#endif
+    }
+#endif
 
-    // Host-side construction. queue_backend is pinned host memory mapped
+    // Host-side construction. queue_backend is managed memory mapped
     // into device address space at the same virtual address, so the
     // BuddyAllocator's internal offset-based bookkeeping is safe to set
     // up from the host. We previously constructed inside a single-thread
@@ -123,12 +268,108 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
   return true;
 }
 
+/**
+ * Hand back the next device-ring submission, refilling from the GPU in a
+ * BATCH when the local buffer runs dry.
+ *
+ * One D2H copy brings back every submission that arrived since the last
+ * refill; the worker then consumes them one per poll. That split is
+ * deliberate: batching the transport is the win, while batching the WORKER's
+ * dequeue is what deadlocked the runtime in d265bdb3 (one lane serves the
+ * whole GPU, so a batch piles onto a single worker and every compute worker
+ * ends up parked on a device task).
+ */
+bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
+#if CTP_ENABLE_CUDA
+  if (gpu_id >= per_gpu_devices_.size()) return false;
+  auto &m = per_gpu_devices_[gpu_id].ring;
+  if (m.dev_ring == nullptr || m.host_ready == nullptr) return false;
+
+  // Serve from the already-drained batch first.
+  if (m.pending_pos < m.pending.size()) {
+    *out = m.pending[m.pending_pos++];
+    return true;
+  }
+  m.pending.clear();
+  m.pending_pos = 0;
+
+  // THE STAMP IS THE ARRIVAL SIGNAL. head_ is never probed: it lives in device
+  // memory and reading it cost a copy plus a synchronize on EVERY poll,
+  // including the overwhelming majority that find nothing. A stamp carrying
+  // the generation this slot is due is proof both that a producer claimed it
+  // and that it finished writing, which is strictly more than head_ told us.
+  //
+  // Reading the stamp before the entry is still what makes this safe, and it
+  // is now free: the producer's __threadfence_system() orders its entry write
+  // ahead of its stamp write, so a stamp we observe as ready guarantees the
+  // entry beside it is complete.
+  auto *rdy = static_cast<volatile unsigned int *>(
+      static_cast<void *>(m.host_ready));
+  u32 accepted = 0;
+  while (accepted < clio::run::kGpuRingCapacity) {
+    const unsigned long long slot = m.tail + accepted;
+    const u32 idx = static_cast<u32>(slot) & clio::run::kGpuRingMask;
+    const unsigned int want =
+        static_cast<unsigned int>(slot / clio::run::kGpuRingCapacity) + 1u;
+    if (rdy[idx] != want) break;   // nothing there, or not finished yet
+    // ACQUIRE between the stamp and the entry. The stamp is volatile but the
+    // entry is not, and nothing here stopped the COMPILER from hoisting the
+    // entry load above the stamp check -- accepting a stale entry whose stamp
+    // lands just in time. A stale entry is the PREVIOUS generation's task
+    // address: a completed task whose device POD carries the freed RunContext
+    // pointer SendOut wrote back, which the staged copy then presents as live
+    // ("SetAwaitedFshm: null RunContext" mid-execution under the
+    // CLIO_FUSE_SCALE reproducer). The old device-memory ring had this
+    // ordering physically, as two separate copy batches; the pinned rewrite
+    // must state it.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    GpuRingEntry e = m.host_entries[idx];
+    // Seqlock-style recheck: if the stamp no longer matches, the entry bytes
+    // we read may be torn; leave the slot for the next poll.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (rdy[idx] != want) break;
+    m.pending.push_back(e);
+    ++accepted;
+  }
+  if (accepted == 0) return false;
+
+  // Publish the new tail so producers blocked on a full ring advance. This is
+  // the only CUDA call left on this path, and it is paid per BATCH of real
+  // work rather than per poll.
+  m.tail += accepted;
+  auto *stream = static_cast<cudaStream_t>(m.stream);
+  cudaMemcpyAsync(&m.dev_ring->tail_, &m.tail, sizeof(m.tail),
+                  cudaMemcpyHostToDevice, stream);
+  cudaStreamSynchronize(stream);
+
+  *out = m.pending[m.pending_pos++];
+  return true;
+#else
+  (void)gpu_id; (void)out;
+  return false;
+#endif
+}
+
 void gpu::IpcManager::FinalizeGpuQueues() {
   for (auto &dev : per_gpu_devices_) {
     if (dev.queue_backend) {
-      ctp::GpuApi::FreeHost(dev.queue_backend);
+      ctp::GpuApi::Free(dev.queue_backend);
       dev.queue_backend = nullptr;
     }
+    if (dev.ring.dev_ring) {
+      ctp::GpuApi::Free(reinterpret_cast<char *>(dev.ring.dev_ring));
+      dev.ring.dev_ring = nullptr;
+    }
+#if CTP_ENABLE_CUDA
+    if (dev.ring.host_entries) {
+      cudaFreeHost(dev.ring.host_entries);
+      dev.ring.host_entries = nullptr;
+    }
+    if (dev.ring.host_ready) {
+      cudaFreeHost(dev.ring.host_ready);
+      dev.ring.host_ready = nullptr;
+    }
+#endif
     dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();
     dev.client_backends.clear();
   }
@@ -171,3 +412,16 @@ CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
 }  // namespace clio::run
 
 #endif  // (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
+
+
+// CPU-launched copy KERNEL service (see mem_bdev_transport bounce): engine
+// copies of device memory stall in channel order behind a resident kernel;
+// kernels are SM-scheduled and run on free SMs. C linkage so the plain-C++
+// transport TU can call it.
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream) {
+#if CTP_ENABLE_CUDA
+  ctp::CtpCopyKernel<uint4><<<64, 256, 0, (cudaStream_t) stream>>>(dst, src,
+                                                                   n);
+#endif
+}

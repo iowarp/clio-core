@@ -105,6 +105,43 @@ jobs:
         test -f "$CONDA_PREFIX/lib/libclio_run_cxx_gpu.so"
         echo "CUDA conda package installed successfully"
 
+    # ── Compile the GPU tests (no GPU needed) ────────────────────────
+    # nvcc compiles CUDA without a device, so the GPU TESTS can at least be
+    # BUILT on a normal runner even while they cannot be RUN. That matters
+    # here: the conda recipe above does not build tests, so until this step
+    # existed nothing in CI ever compiled the gpu_vector tests or the
+    # yieldable kernels, and a change that broke them was invisible.
+    #
+    # The in-kernel nvcomp decoder needs the device API, which the distro
+    # nvcomp package does not ship (host/manager API only). cmake FETCHES the
+    # standalone archive, pinned by SHA256, so this needs no runner setup and
+    # no hand-placed directory. If the download is unavailable the build still
+    # succeeds and cte_gpu_vector_hbm_nvcomp SKIPS, rather than silently
+    # measuring the scalar LZ4 fallback and calling it nvcomp.
+    - name: Compile GPU tests (compile-only, no device)
+      shell: bash -el {0}
+      run: |
+        # CLIO_CORE_ENABLE_TESTS, not BUILD_TESTING: this tree's test
+        # targets are gated on the former, so the old flag configured a
+        # build with NO test targets and the --target list died on
+        # "No rule to make target 'test_yieldable'". CTE + the compressor
+        # must be on too: the compressed-tier tests and the weights bench
+        # only exist when clio_cte_compressor_runtime does.
+        cmake -S . -B build-gpu-compile \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCLIO_CORE_ENABLE_RUNTIME=ON \
+          -DCLIO_CORE_ENABLE_CTE=ON \
+          -DCLIO_CORE_ENABLE_TESTS=ON \
+          -DCLIO_CTE_ENABLE_COMPRESS=ON \
+          -DCLIO_CORE_ENABLE_CUDA=ON \
+          -DCMAKE_CUDA_ARCHITECTURES=89-real
+        cmake --build build-gpu-compile -j "$(nproc)" \
+          --target test_yieldable test_yield_stack \
+                   test_gpu_vector_smoke test_gpu_vector_semantics \
+                   test_gpu_vector_workloads test_gpu_vector_compress \
+                   test_gpu_vector_race test_gpu_vector_hbm_nvcomp \
+                   clio_gpu_vector_weights_bench
+
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
     # To re-enable, change runs-on to [self-hosted, gpu], add nvidia-smi
     # verification step, and uncomment the test steps below.
@@ -129,6 +166,17 @@ jobs:
     #   run: |
     #     ctest -R "test_gpu_shm_mmap|test_local_serialize_gpu|test_local_transfer_gpu|test_buddy_alloc_gpu|test_buddy_alloc_stack_gpu|test_thread_alloc_gpu|test_round_robin_alloc_gpu|test_ipc_allocate_buffer_gpu|test_buddy_benchmark_gpu" \
     #       --output-on-failure --timeout 120
+    #
+    # - name: Run gpu_vector paging tests
+    #   shell: bash -el {0}
+    #   working-directory: build
+    #   run: |
+    #     # RUN_SERIAL: these share a runtime port and SHM; -j gives false
+    #     # failures. cte_gpu_vector_hbm_nvcomp is the one that asserts the
+    #     # GPU-only contract (kHBM-only tier, nvcomp, device-to-device,
+    #     # yielding faults). It SKIPS only if the nvcomp device archive could
+    #     # not be fetched at configure time.
+    #     ctest -R "cte_gpu_vector" --output-on-failure --timeout 900
     #
     # - name: Run GPU benchmarks (regression)
     #   shell: bash -el {0}

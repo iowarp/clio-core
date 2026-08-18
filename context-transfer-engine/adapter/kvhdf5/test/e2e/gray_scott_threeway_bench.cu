@@ -86,7 +86,13 @@
 #endif
 #endif
 
-using kvhdf5::byte_t;
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kvhdf5::byte_t;` here is a conflicting redeclaration and this TU
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 namespace {
 struct GsParams { float Du, Dv, F, k, dt; };
@@ -124,7 +130,7 @@ __global__ void GsStepKernel(const float* u, const float* v, float* un, float* v
 // multiples). Being its OWN completed kernel gives kernel-boundary ordering, so the staged
 // writes are visible to the subsequent submit kernel and the server's readback — no
 // __threadfence_system needed (that fence was only for the old same-kernel copy+enqueue).
-__global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const byte_t* src) {
+__global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const kv_byte_t* src) {
     uint32_t c = blockIdx.y;
     uint64_t n = h.Size(c);
     const uint32_t* s = reinterpret_cast<const uint32_t*>(src + uint64_t(c) * n);
@@ -477,10 +483,10 @@ __global__ void GsPersistentComputeOnlyKernel(
 // snapshot dataset, precisely as the async arm does. Safe because each launch owns its own
 // snapshot dataset — nothing refills those buffers before the drain.
 struct TwPooledFill {
-    const byte_t* src;   // masked snapshot grid; chunk c is src[c*n .. c*n+n)
+    const kv_byte_t* src;   // masked snapshot grid; chunk c is src[c*n .. c*n+n)
     // BLOCK-WIDE (every thread), word-wise, block-strided — the same copy TwCopyKernel does
     // for one chunk, minus the extra gridDim.x blocks. Uniform across the block.
-    __device__ void operator()(uint32_t c, byte_t* dst, uint64_t n) const {
+    __device__ void operator()(uint32_t c, kv_byte_t* dst, uint64_t n) const {
         const uint32_t* s = reinterpret_cast<const uint32_t*>(src + uint64_t(c) * n);
         uint32_t* d = reinterpret_cast<uint32_t*>(dst);
         const uint64_t words = n >> 2;
@@ -500,13 +506,13 @@ struct TwPooledFill {
 // on a prototype and is superseded by the numbers above.)
 template <bool kProbing>
 __global__ __launch_bounds__(256) void TwSnapPooledKernel(kvhdf5::GpuDatasetHandle h,
-                                                          const byte_t* src) {
+                                                          const kv_byte_t* src) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     h.WritePipelined<kProbing, /*TailDrain=*/false>(TwPooledFill{src});
 }
-template __global__ void TwSnapPooledKernel<false>(kvhdf5::GpuDatasetHandle, const byte_t*);
-template __global__ void TwSnapPooledKernel<true>(kvhdf5::GpuDatasetHandle, const byte_t*);
+template __global__ void TwSnapPooledKernel<false>(kvhdf5::GpuDatasetHandle, const kv_byte_t*);
+template __global__ void TwSnapPooledKernel<true>(kvhdf5::GpuDatasetHandle, const kv_byte_t*);
 
 // XOR the snapshot with a fixed random mask (word-wise) into a scratch buffer, so the
 // PERSISTED bytes are high-entropy / incompressible — otherwise the Gray-Scott field is
@@ -1438,7 +1444,7 @@ clio::cte::core::TagId MakeTag(const char* name) {
     return t->tag_id_;
 }
 
-std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
+std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
                                  uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -1448,7 +1454,7 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& 
                                            clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }
@@ -1606,7 +1612,7 @@ double GpuReadPdfAsync(const Cfg& cfg, std::vector<kvhdf5::GpuCteDataset>& group
 // scratch so the PDF is computed on the GPU for EVERY arm. That keeps the analysis identical
 // across arms and mirrors the write side, where those same arms D2H before writing.
 struct HostReadStage {
-    byte_t* d_ = nullptr;
+    kv_byte_t* d_ = nullptr;
     uint64_t bytes_ = 0;
     explicit HostReadStage(uint64_t bytes) : bytes_(bytes) {
         REQUIRE(cudaMalloc(&d_, bytes) == cudaSuccess);
@@ -1824,7 +1830,7 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
 
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
-        const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
+        const kv_byte_t* bsrc = reinterpret_cast<const kv_byte_t*>(src);
         if (pooled) {
             // ONE fused kernel: fill + fire + bounded intra-snapshot drain over M buffers.
             // Now reuses a SINGLE dataset (M chunk buffers), re-tagged per snapshot and
@@ -2045,7 +2051,7 @@ double RunReuseArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
     auto snap = [&](unsigned si, float* v_curr) {
         const unsigned gi = si % ngroups;
         float* src = masker.Apply(v_curr);
-        const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
+        const kv_byte_t* bsrc = reinterpret_cast<const kv_byte_t*>(src);
         // DRAIN-BEFORE-REFILL: reclaim this group's buffers from snapshot si-ngroups,
         // in-stream (the WriteWait completes before the copy below refills). Without it
         // the copy races the server's read of the prior snapshot => corruption.

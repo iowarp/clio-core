@@ -121,7 +121,8 @@ if(CLIO_CORE_ENABLE_CUDA)
     Catch2::Catch2WithMain
   )
   target_compile_options(test_round_robin_alloc_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -rdc=true>)
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:--extended-lambda -rdc=true>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:Clang>>:-fgpu-rdc>)
   add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
   set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
     TIMEOUT 60 LABELS "gpu;allocator")

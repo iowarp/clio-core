@@ -31,6 +31,21 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "clio_runtime/cycle_counter.h"
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+// Direct-read registry (core runtime lib): a node-local mem-transport bdev
+// publishes a synchronous read entry; ReadData services those blocks inline
+// on its own fiber, skipping the dispatched ReadTask and its per-level
+// await-resume latency. Returns 0 on success; nonzero → task path.
+extern "C" int clio_direct_read(unsigned long long pool_id,
+                                unsigned long long off, unsigned long long size,
+                                char *dst);
+// Zero-copy device-tier mapping: register an in-process blob locator so the
+// gpu_vector can resolve page blobs to (pool, target offset) at init.
+extern "C" void clio_cte_locate_register(
+    int (*fn)(void *, const void *, const char *, unsigned long long *,
+              unsigned long long *, unsigned long long *),
+    void *ctx);
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
@@ -493,8 +508,38 @@ void Runtime::MirrorBlobToShm(const std::string &composite_key,
   shm_cache_.PutBlob(composite_key, rec);
 }
 
+namespace {
+// In-process blob locator (see clio_cte_locate in the core lib). Returns the
+// FIRST block's (pool, target offset) — page blobs are single-block.
+int CteLocateTrampoline(void *ctx, const void *tag_id_p, const char *name,
+                        unsigned long long *pool_u64,
+                        unsigned long long *target_off,
+                        unsigned long long *stored_size) {
+  auto *rt = static_cast<Runtime *>(ctx);
+  const auto *tag_id = static_cast<const TagId *>(tag_id_p);
+  const std::string key = std::to_string(tag_id->major_) + "." +
+                          std::to_string(tag_id->minor_) + "." + name;
+  std::shared_ptr<BlobInfo> bi = rt->LocateBlobShared(key);
+  if (!bi || bi->blocks_.empty()) return -1;
+  // A multi-extent blob has no single (offset, size) — mapping its first
+  // block would serve a truncated page. Report it distinctly so the mapper
+  // leaves the page on the fetch path.
+  if (bi->blocks_.size() != 1) return -2;
+  *pool_u64 = bi->blocks_[0].bdev_client_.pool_id_.ToU64();
+  *target_off = bi->blocks_[0].target_offset_;
+  // STORED size (post-codec): what an in-kernel decompressor must read.
+  *stored_size = bi->blocks_[0].size_;
+  return 0;
+}
+}  // namespace
+
+std::shared_ptr<BlobInfo> Runtime::LocateBlobShared(const std::string &key) {
+  return tag_blob_name_to_info_.get(key);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio_cte_locate_register(&CteLocateTrampoline, this);
   // Initialize unordered_map_ll instances with appropriately sized bucket
   // counts. Tag/blob maps are large to avoid excessive collisions at scale.
   // Target maps stay small — target counts are O(1–10), not O(100K) — so
@@ -2318,6 +2363,7 @@ clio::run::u64 Runtime::EstimateIoTimeNs(
 template <typename TaskT>
 clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_g0 = clio::run::CycleNow();
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
@@ -2346,7 +2392,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           const auto &seg = task->segments_[i];
           if (seg.size_ == 0 || seg.data_.IsNull()) {
             task->return_code_ = 1;
-            CLIO_CO_RETURN;
+            clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
           }
           if (seg.blob_off_ < lo) lo = seg.blob_off_;
           if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
@@ -2359,13 +2406,15 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Validate input parameters
     if (size == 0) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Validate that blob_name is provided
     if (blob_name.empty()) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Step 1: Check if blob exists
@@ -2374,7 +2423,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // If blob doesn't exist, error
     if (blob_info_ptr == nullptr) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Replica-targeted read (issue #886): Context::replica_ == N > 0 serves
@@ -2390,12 +2440,14 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                                      /*create=*/false);
       if (replica_sel == 0) {
         task->return_code_ = 1;
-        CLIO_CO_RETURN;
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
       }
     } else if (replica_sel < 0) {
       // kAllReplicas and friends: a read needs one concrete source.
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Torn-layout guard (issue #753): a reorganize holds this blob's write
@@ -2428,7 +2480,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_ ==
             0) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // OUT: report the blob's transform state so every Get caller -- scalar,
@@ -2496,7 +2549,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
             : blob_info_ptr->GetTotalSize() == 0;
     if (blob_is_gone) {
       task->return_code_ = 1;
-      CLIO_CO_RETURN;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
     }
 
     // Snapshot the block layout BEFORE the read I/O. ReadData co_awaits a bdev
@@ -2530,17 +2584,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                             seg.blob_off_, read_result));
           if (read_result != 0) {
             task->return_code_ = read_result;
-            CLIO_CO_RETURN;
+            clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
           }
         }
       }
     } else {
       clio::run::u32 read_result = 0;
+      clio_evlat_add(5, clio::run::CycleNow() - ev_g0);   // metadata phase
+      { const unsigned long long ev_r0 = clio::run::CycleNow();
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
                         read_result));
+      clio_evlat_add(4, clio::run::CycleNow() - ev_r0); }  // ReadData await
+
       if (read_result != 0) {
         task->return_code_ = read_result;
-        CLIO_CO_RETURN;
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+  CLIO_CO_RETURN;
       }
     }
 
@@ -2571,6 +2631,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -3301,16 +3362,94 @@ clio::run::TaskResume Runtime::ReorganizeBlobImpl(
 clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
   return PutBlobImpl(task);
 }
+// ---------------------------------------------------------------------------
+// Cross-node forwarding for device-originated (Pod) blob ops.
+//
+// A Pod task's data pointer targets memory only the ORIGIN node can touch (a
+// GPU page or a device task slot), so the task itself must execute on the
+// node that popped it -- ToLocalCpu is a physical constraint, not a routing
+// choice. In a multi-node pool, though, blob metadata lives on the blob's
+// HASHED owner (HashBlobToContainer), so a local Impl for a remote-owned
+// blob would simply miss.
+//
+// The forward closes that gap CPU-side, which is exactly the architecture:
+// the fault handler orchestrates a normal hashed client op (bytes cross the
+// wire in an ordinary Put/GetBlob), and the device-visible copy happens
+// locally with the same device-aware primitive the local path uses. The GPU
+// never knows the page was remote. Single-node pools take the fast path
+// unchanged (TargetIsNodeLocal is true for every blob).
+// ---------------------------------------------------------------------------
+
 clio::run::TaskResume Runtime::PodPutBlob(
     clio::run::shared_ptr<PodPutBlobTask> &task) {
-  return PutBlobImpl(task);
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::string eff_name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
+      eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    }
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(task->tag_id_, eff_name);
+    if (!TargetIsNodeLocal(owner, task->pool_id_)) {
+      // Stage the device bytes into a host bounce, then hand the bytes to
+      // the owning node through the ordinary put path (score and context --
+      // including any compression request -- ride along).
+      char *src = CLIO_IPC->ToFullPtr(task->blob_data_)
+                      .template Cast<char>().ptr_;
+      if (src == nullptr) {
+        task->SetReturnCode(22);  // unmappable source
+        CLIO_CO_RETURN;
+      }
+      std::vector<char> bounce(task->size_);
+      ctp::DeviceAwareMemcpy(bounce.data(), src, task->size_);
+      auto fut = client_.AsyncPutBlob(task->tag_id_, eff_name, task->offset_,
+                                      task->size_, bounce.data(),
+                                      task->score_, task->context_,
+                                      task->flags_, owner);
+      CLIO_CO_AWAIT(fut);
+      task->SetReturnCode(fut->GetReturnCode());
+      CLIO_CO_RETURN;
+    }
+  }
+  CLIO_CO_AWAIT(PutBlobImpl(task));
+  CLIO_CO_RETURN;
 }
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   return GetBlobImpl(task);
 }
 clio::run::TaskResume Runtime::PodGetBlob(
     clio::run::shared_ptr<PodGetBlobTask> &task) {
-  return GetBlobImpl(task);
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::string eff_name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != PodGetBlobTask::kNoPageIdx) {
+      eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
+    }
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(task->tag_id_, eff_name);
+    if (!TargetIsNodeLocal(owner, task->pool_id_)) {
+      // Fetch the remote-owned bytes into a host bounce through the ordinary
+      // hashed get, then serve the device-visible destination locally.
+      std::vector<char> bounce(task->size_);
+      auto fut = client_.AsyncGetBlob(task->tag_id_, eff_name, task->offset_,
+                                      task->size_, task->flags_,
+                                      bounce.data(), owner);
+      CLIO_CO_AWAIT(fut);
+      task->SetReturnCode(fut->GetReturnCode());
+      if (task->GetReturnCode() == 0) {
+        char *dst = CLIO_IPC->ToFullPtr(task->blob_data_)
+                        .template Cast<char>().ptr_;
+        if (dst != nullptr) {
+          ctp::DeviceAwareMemcpy(dst, bounce.data(), task->size_);
+        } else {
+          task->SetReturnCode(22);  // unmappable destination
+        }
+      }
+      CLIO_CO_RETURN;
+    }
+  }
+  CLIO_CO_AWAIT(GetBlobImpl(task));
+  CLIO_CO_RETURN;
 }
 clio::run::TaskResume Runtime::ReorganizeBlob(
     clio::run::shared_ptr<ReorganizeBlobTask> &task) {
@@ -3319,6 +3458,160 @@ clio::run::TaskResume Runtime::ReorganizeBlob(
 clio::run::TaskResume Runtime::PodReorganizeBlob(
     clio::run::shared_ptr<PodReorganizeBlobTask> &task) {
   return ReorganizeBlobImpl(task);
+}
+
+// Batched POD paging (gpu_vector flush/fault batching). A block's page cache
+// flush is one queue entry per kPodMultiMax pages instead of one per page,
+// which is what makes the GPU fault path affordable: the device-side cost is
+// dominated by per-task submission, not by the bytes moved.
+//
+// Each record executes as a NESTED scalar call on this fiber, exactly like
+// MultiPutBlob does — so a batched page keeps scalar-identical semantics
+// (interposition, replica addressing, scoring) and no code path is duplicated.
+// Per-record rc lands in reqs_[i].rc_; the task rc is the first failure so a
+// caller that ignores the detail still sees the batch fail.
+clio::run::TaskResume Runtime::PodMultiPutBlob(
+    clio::run::shared_ptr<PodMultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    auto &req = task->reqs_[i];
+    auto sub = ipc_manager->NewTask<PodPutBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        req.offset_, req.size_, req.data_, req.score_, task->context_,
+        task->flags_);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PodPutBlob(sub));
+    int rc = sub->GetReturnCode();
+    req.rc_ = static_cast<clio::run::u32>(rc);
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (first_rc == 0) {
+      first_rc = rc;
+    }
+  }
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
+}
+
+clio::run::TaskResume Runtime::PodMultiGetBlob(
+    clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  const unsigned long long ev_t0 = clio::run::CycleNow();
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  // Two regimes, picked by batch size — the tradeoff INVERTED when ReadData
+  // grew its direct-read path (clio_direct_read):
+  //  - Dispatch (issue-all/await-all): overlaps reads across workers, but
+  //    every subtask await pays the blocked-queue resume cadence (~560 µs
+  //    measured ON TOP of an 80 µs direct-read child).
+  //  - Inline (CLIO_CO_AWAIT(PodGetBlob(sub)) on this fiber): serial, but a
+  //    tier-resident record now completes synchronously in ~80 µs with no
+  //    dispatch and no resume. For the MoE fault path (2-3 records/batch)
+  //    serial-inline beats parallel-dispatch ~4×.
+  // Small batches inline; large batches keep the dispatch overlap.
+  // CLIO_MULTI_INLINE=0 forces dispatch-always, =1 inline-always.
+  {
+    clio::run::u32 inline_max = 8;
+    {
+      static const int env_inline = [] {
+        const char *e = getenv("CLIO_MULTI_INLINE");
+        return e == nullptr ? -1 : atoi(e);
+      }();
+      if (env_inline == 0) inline_max = 0;
+      if (env_inline == 1) inline_max = kPodMultiMax;
+    }
+    // A PREFETCH batch's completion latency is off the caller's critical
+    // path — dispatch it across workers so a concurrent DEMAND fault (which
+    // is latency-critical and served inline) never queues behind it.
+    if (task->flags_ & kCtePrefetchHint) inline_max = 0;
+    const clio::run::u32 sub_flags = task->flags_ & ~kCtePrefetchHint;
+    if (n <= inline_max) {
+      const unsigned long long ev_t1 = clio::run::CycleNow();
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        auto &req = task->reqs_[i];
+        auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+            clio::run::CreateTaskId(), task->pool_id_,
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
+            req.data_, task->context_);
+        sub.get()->BeginRunContext();
+        CLIO_CO_AWAIT(PodGetBlob(sub));
+        int rc = sub->GetReturnCode();
+        req.rc_ = static_cast<clio::run::u32>(rc);
+        if (rc == 0) {
+          task->num_ok_++;
+        } else if (first_rc == 0) {
+          first_rc = rc;
+        }
+      }
+      clio_evlat_add(1, clio::run::CycleNow() - ev_t1);
+    } else {
+      clio::run::Future<PodGetBlobTask> futs[kPodMultiMax];
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        auto &req = task->reqs_[i];
+        auto sub = ipc_manager->NewTask<PodGetBlobTask>(
+            clio::run::CreateTaskId(), task->pool_id_,
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
+            req.data_, task->context_);
+        futs[i] = ipc_manager->Send(sub);
+      }
+      const unsigned long long ev_t1 = clio::run::CycleNow();
+      for (clio::run::u32 i = 0; i < n; ++i) {
+        CLIO_CO_AWAIT(futs[i]);
+        int rc = futs[i]->GetReturnCode();
+        task->reqs_[i].rc_ = static_cast<clio::run::u32>(rc);
+        if (rc == 0) {
+          task->num_ok_++;
+        } else if (first_rc == 0) {
+          first_rc = rc;
+        }
+      }
+      clio_evlat_add(1, clio::run::CycleNow() - ev_t1);
+    }
+  }
+  clio_evlat_add(0, clio::run::CycleNow() - ev_t0);
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
+}
+
+// Batched rescore. `size_`/`data_` are unused here; only blob_name_ and score_
+// carry meaning, which keeps one record type across all three batched ops.
+clio::run::TaskResume Runtime::PodMultiScore(
+    clio::run::shared_ptr<PodMultiScoreTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  auto *ipc_manager = CLIO_CPU_IPC;
+  task->num_ok_ = 0;
+  int first_rc = 0;
+  clio::run::u32 n = task->count_;
+  if (n > kPodMultiMax) n = kPodMultiMax;
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    auto &req = task->reqs_[i];
+    auto sub = ipc_manager->NewTask<PodReorganizeBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        req.score_);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PodReorganizeBlob(sub));
+    int rc = sub->GetReturnCode();
+    req.rc_ = static_cast<clio::run::u32>(rc);
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (first_rc == 0) {
+      first_rc = rc;
+    }
+  }
+  task->SetReturnCode(first_rc);
+  CLIO_CO_RETURN;
 }
 
 // Periodic internal data-organizer driver (issue #738). All organization
@@ -6701,6 +6994,32 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
       clio::run::bdev::Block bdev_block(
           block.target_offset_ + read_start_in_block, read_size, 0);
       ctp::ipc::ShmPtr<> data_ptr = data + data_buffer_offset;
+
+      // Level collapse (fault-chain): if the target bdev is node-local and
+      // registered a direct-read entry (mem transport, unthrottled), read it
+      // RIGHT HERE on this fiber. No dispatched task, no await, and — the
+      // measured point — no per-level await-RESUME latency (~240 µs each,
+      // stacked 2-3 deep on the task path). Any failure falls through to the
+      // task path unchanged.
+      static const bool direct_read_enabled = [] {
+        const char *e = getenv("CLIO_DIRECT_READ");
+        return e == nullptr || e[0] != '0';
+      }();
+      if (direct_read_enabled &&
+          TargetIsNodeLocal(block.target_query_, block.bdev_client_.pool_id_)) {
+        auto *ipc_mgr = CLIO_IPC;
+        char *dst = ipc_mgr->ToFullPtr(data_ptr).Cast<char>().ptr_;
+        if (dst != nullptr) {
+          unsigned long long ev_d0 = clio::run::CycleNow();
+          if (clio_direct_read(block.bdev_client_.pool_id_.ToU64(),
+                               bdev_block.offset_, read_size, dst) == 0) {
+            clio_evlat_add(7, clio::run::CycleNow() - ev_d0);  // ch7: direct_read
+            remaining_size -= read_size;
+            block_offset_in_blob += block.size_;
+            continue;
+          }
+        }
+      }
 
       // Wrap single block in clio::run::priv::vector for AsyncRead
       clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);

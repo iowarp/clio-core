@@ -311,10 +311,107 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/**
+ * "page:<id>" -> id. The prefix is what makes pagify OPT-IN per request:
+ * a deployment that does not use it never sees a behaviour change, and a
+ * blob legitimately named like a page is not something the assimilators
+ * produce (their names are "<tag>_b<fam>_pi<page>" or "w").
+ */
+bool ParsePageName(const std::string &name, clio::run::u64 *page_id) {
+  static constexpr char kPrefix[] = "page:";
+  static constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+  if (name.size() <= kPrefixLen || name.compare(0, kPrefixLen, kPrefix) != 0) {
+    return false;
+  }
+  clio::run::u64 v = 0;
+  for (size_t i = kPrefixLen; i < name.size(); ++i) {
+    const char c = name[i];
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + (clio::run::u64) (c - '0');
+  }
+  *page_id = v;
+  return true;
+}
+}  // namespace
+
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  // pagify: a request named "page:<id>" asks for a UNIFIED PAGE NUMBER, not
+  // a blob. The caller (e.g. the gpu_vector) knows only page 0, page 1, ...
+  // and it is this layer's job to turn that into the specific blobs that
+  // compose the page and to construct it -- including pages made of several
+  // blobs, pages holding only part of one, and gaps that must read as zero.
+  //
+  // Anything not named that way forwards unchanged, so pagify is opt-in per
+  // request and costs an unpagified deployment one string comparison.
+  {
+    clio::run::u64 page_id = 0;
+    if (ParsePageName(task->blob_name_.str(), &page_id)) {
+      // Load the map once per tag. It is published as a plain blob by the
+      // assimilator that wrote the data, so the mapping travels WITH the
+      // data instead of being configured separately and drifting from it.
+      if (page_maps_.find(task->tag_id_) == page_maps_.end()) {
+        auto sz = cte_client_->AsyncGetBlobSize(task->tag_id_, "pagemap");
+        CLIO_CO_AWAIT(sz);
+        const clio::run::u64 msz = sz->size_;
+        if (sz->GetReturnCode() != 0 || msz == 0) {
+          HLOG(kWarning, "pagify: tag has no 'pagemap' blob; page read fails");
+          task->SetReturnCode(1);
+          CLIO_CO_RETURN;
+        }
+        auto mbuf = CLIO_IPC->AllocateBuffer(msz);
+        if (mbuf.IsNull()) {
+          task->SetReturnCode(4);
+          CLIO_CO_RETURN;
+        }
+        ctp::ipc::ShmPtr<> mshm(mbuf.shm_);
+        auto mget = cte_client_->AsyncGetBlob(task->tag_id_, "pagemap", 0, msz,
+                                              0, mshm);
+        CLIO_CO_AWAIT(mget);
+        if (mget->GetReturnCode() != 0) {
+          task->SetReturnCode(mget->GetReturnCode());
+          CLIO_CO_RETURN;
+        }
+        page_maps_[task->tag_id_] = clio::cae::core::Pagify(
+            clio::cae::core::PageMap::Parse(
+                std::string(mbuf.ptr_, (size_t) msz)));
+      }
+      const clio::cae::core::Pagify &pg = page_maps_[task->tag_id_];
+
+      auto dst = CLIO_IPC->ToFullPtr<char>(task->blob_data_.Cast<char>());
+      const clio::run::u64 psz = pg.PageSize();
+      const clio::run::u64 want = task->size_ ? task->size_ : psz;
+      if (dst.ptr_ == nullptr || psz == 0 || want > psz) {
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      // Zero first: a region no extent maps to must read as zero, not as
+      // whatever the caller's buffer happened to hold.
+      std::memset(dst.ptr_, 0, (size_t) want);
+
+      int rc = 0;
+      for (const clio::cae::core::PageSlice &s : pg.Map().ToPage(page_id)) {
+        if (s.dst_off >= want) continue;
+        const clio::run::u64 n = std::min(s.size, want - s.dst_off);
+        // Point the slice read directly at its place in the caller's
+        // buffer, so the page is assembled in place with no staging copy.
+        ctp::ipc::ShmPtr<> sub(task->blob_data_.alloc_id_,
+                               task->blob_data_.off_.load() + s.dst_off);
+        auto g = cte_client_->AsyncGetBlob(task->tag_id_, s.blob_name,
+                                           s.blob_off, n, 0, sub);
+        CLIO_CO_AWAIT(g);
+        if (g->GetReturnCode() != 0) {
+          rc = g->GetReturnCode();
+          break;
+        }
+      }
+      task->SetReturnCode(rc);
+      CLIO_CO_RETURN;
+    }
   }
   auto fwd = cte_client_->AsyncGetBlob(
       task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,

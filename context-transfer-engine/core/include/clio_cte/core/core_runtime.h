@@ -263,8 +263,21 @@ public:
    *  the *Impl<TaskT> templates above. */
   clio::run::TaskResume PodPutBlob(clio::run::shared_ptr<PodPutBlobTask> &task);
   clio::run::TaskResume PodGetBlob(clio::run::shared_ptr<PodGetBlobTask> &task);
+
+  /** In-process blob lookup for the zero-copy device-tier mapping. */
+  std::shared_ptr<BlobInfo> LocateBlobShared(const std::string &key);
   clio::run::TaskResume PodReorganizeBlob(
       clio::run::shared_ptr<PodReorganizeBlobTask> &task);
+
+  /** Batched POD paging (one scheduled task carries up to kPodMultiMax page
+   *  requests). Each record runs as a nested scalar call on this fiber, so the
+   *  batch amortizes task machinery without changing per-page semantics. */
+  clio::run::TaskResume PodMultiPutBlob(
+      clio::run::shared_ptr<PodMultiPutBlobTask> &task);
+  clio::run::TaskResume PodMultiGetBlob(
+      clio::run::shared_ptr<PodMultiGetBlobTask> &task);
+  clio::run::TaskResume PodMultiScore(
+      clio::run::shared_ptr<PodMultiScoreTask> &task);
 
   /**
    * Delete blob operation - removes blob and decrements tag size
@@ -748,6 +761,7 @@ private:
    * @param error_code Output: 0 for success, 1 for failure
    * Returns TaskResume for coroutine-based async operations
    */
+
   clio::run::TaskResume ReadData(const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data,
                            size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code);
 

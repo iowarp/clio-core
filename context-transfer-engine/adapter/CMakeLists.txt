@@ -51,7 +51,7 @@ if (CLIO_CTE_ENABLE_HDF5_VOL)
     add_subdirectory(hdf5_vol)
 endif()
 
-# GPU Vector adapter (CUDA/ROCm only; producer-only kernel API)
+# GPU Vector adapter (CUDA/ROCm only; device-paged vector over the CTE)
 if (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     add_subdirectory(gpu_vector)
 endif()

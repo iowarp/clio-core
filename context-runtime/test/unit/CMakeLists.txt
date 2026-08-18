@@ -1505,3 +1505,56 @@ message(STATUS "  - modules/MOD_NAME/test/")
 add_subdirectory(cli)
 add_subdirectory(autogen_more)
 add_subdirectory(internals)
+
+#------------------------------------------------------------------------------
+# Yieldable (cooperative) CUDA kernels. Pure CUDA + the header -- no runtime,
+# no SHM, no ports, so it needs none of the cleanup fixtures the other GPU
+# tests do and runs in well under a second.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA)
+  add_cuda_executable(test_yieldable FALSE
+    gpu/test_yieldable_gpu.cc
+    INCLUDE_DIRS
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    LINK_LIBS
+      clio_run_cxx
+      ctp::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_yieldable PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_yieldable COMMAND test_yieldable
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_yieldable PROPERTIES
+    TIMEOUT 120
+    LABELS "gpu;cuda;yieldable"
+    RUN_SERIAL TRUE
+  )
+endif()
+
+if(CLIO_CORE_ENABLE_CUDA)
+  add_cuda_executable(test_yield_stack FALSE
+    gpu/test_yield_stack_gpu.cc
+    INCLUDE_DIRS
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    LINK_LIBS
+      clio_run_cxx
+      ctp::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_yield_stack PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_yield_stack COMMAND test_yield_stack
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_yield_stack PROPERTIES
+    TIMEOUT 120
+    LABELS "gpu;cuda;yieldable"
+    RUN_SERIAL TRUE
+  )
+endif()

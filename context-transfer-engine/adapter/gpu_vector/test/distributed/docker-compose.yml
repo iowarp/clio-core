@@ -1,0 +1,134 @@
+# 4-node distributed gpu_vector test.
+#
+# Every node runs the SAME binary (test_gpu_vector_distributed): an in-process
+# runtime joins the cluster via the hostfile, then the GPU writes this node's
+# page range, barriers, and reads the NEXT node's range -- every page a
+# cross-node fault served CPU-side. See test_gpu_vector_distributed_gpu.cc.
+#
+#   HOST_WORKSPACE=$(pwd) docker compose up --abort-on-container-failure
+#
+# All four containers share the host GPU through the nvidia runtime. The
+# CUDA toolkit comes from the HOST mount (deps-cpu has none); driver libs are
+# injected by the nvidia container runtime.
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:rw
+    - ${CUDA_HOME:-/usr/local/cuda-13.3}:/usr/local/cuda:ro
+    # nvcomp lives outside the CUDA toolkit on deb systems; the runtime libs
+    # link it (compressed-tier support), so mount it read-only too.
+    - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+  working_dir: /workspace
+  mem_limit: 8g
+  environment: &node-env
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - CLIO_NUM_CONTAINERS=4
+    - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
+    - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    - GVD_PAGES=${GVD_PAGES:-64}
+    - GVD_ROUNDS=${GVD_ROUNDS:-3}
+    - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+
+services:
+  gvd-node1:
+    <<: *node
+    container_name: gvd-node1
+    hostname: gvd-node1
+    networks:
+      gvd-cluster: { ipv4_address: 172.22.0.10 }
+    environment:
+      - NODE_ID=1
+      - GVD_START_DELAY=0
+      - NODE_IP=172.22.0.10
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=4
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - GVD_PAGES=${GVD_PAGES:-64}
+      - GVD_ROUNDS=${GVD_ROUNDS:-3}
+      - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
+      - GVD_START_DELAY=0
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    entrypoint: []
+
+  gvd-node2:
+    <<: *node
+    container_name: gvd-node2
+    hostname: gvd-node2
+    networks:
+      gvd-cluster: { ipv4_address: 172.22.0.11 }
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.22.0.11
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=4
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - GVD_PAGES=${GVD_PAGES:-64}
+      - GVD_ROUNDS=${GVD_ROUNDS:-3}
+      - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
+      - GVD_START_DELAY=6
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    entrypoint: []
+
+  gvd-node3:
+    <<: *node
+    container_name: gvd-node3
+    hostname: gvd-node3
+    networks:
+      gvd-cluster: { ipv4_address: 172.22.0.12 }
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.22.0.12
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=4
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - GVD_PAGES=${GVD_PAGES:-64}
+      - GVD_ROUNDS=${GVD_ROUNDS:-3}
+      - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
+      - GVD_START_DELAY=12
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    entrypoint: []
+
+  gvd-node4:
+    <<: *node
+    container_name: gvd-node4
+    hostname: gvd-node4
+    networks:
+      gvd-cluster: { ipv4_address: 172.22.0.13 }
+    environment:
+      - NODE_ID=4
+      - NODE_IP=172.22.0.13
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=4
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - GVD_PAGES=${GVD_PAGES:-64}
+      - GVD_ROUNDS=${GVD_ROUNDS:-3}
+      - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
+      - GVD_REGISTER_TARGET=${GVD_REGISTER_TARGET:-0}
+      - GVD_START_DELAY=18
+    command: ["sh", "-c", "sleep $${GVD_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_gpu_vector_distributed"]
+    entrypoint: []
+
+networks:
+  gvd-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24
