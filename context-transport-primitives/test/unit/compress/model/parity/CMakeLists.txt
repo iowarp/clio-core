@@ -236,3 +236,50 @@ else()
     message(STATUS
         "NeuroPress preprocess parity: skipped (no preprocessing sources)")
 endif()
+
+# ---------------------------------------------------------------------------
+# Gray-Scott workload parity (issue #693)
+#
+# The 3D Gray-Scott simulation is the data GENERATOR behind NeuroPress's
+# grayscott_benchmark, ported into
+# context-transfer-engine/compressor/generator/grayscott/. Porting a
+# simulation is only defensible if its output is identical to the original's
+# -- a workload that produces a slightly different field is not the same
+# workload, and every ratio measured on it is incomparable.
+#
+# Standalone on purpose: upstream's gray_scott_gpu.cu includes nothing beyond
+# cuda_runtime, so this target needs neither the globals stub, nor nvcomp, nor
+# clio_ctp_compress_model, and it stays buildable when those are not.
+set(_np_grayscott ${CLIO_NEUROPRESS_SRC_DIR}/src/gray-scott/gray_scott_gpu.cu)
+set(_clio_grayscott_dir
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/generator/grayscott)
+
+if(EXISTS ${_np_grayscott} AND EXISTS ${_clio_grayscott_dir}/grayscott_sim.cu)
+    add_executable(neuropress_grayscott_parity_exec
+        ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_grayscott_parity.cu
+        ${_clio_grayscott_dir}/grayscott_sim.cu
+        ${_np_grayscott})
+
+    set_target_properties(neuropress_grayscott_parity_exec PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(neuropress_grayscott_parity_exec PRIVATE
+        ${CLIO_NEUROPRESS_SRC_DIR}/src
+        ${_clio_grayscott_dir})
+
+    if(CLIO_CORE_CUDA_NEEDS_GCOV)
+        set_property(TARGET neuropress_grayscott_parity_exec
+                     APPEND PROPERTY LINK_LIBRARIES gcov)
+    endif()
+
+    add_test(NAME ctp_neuropress_grayscott_parity
+             COMMAND ${CMAKE_BINARY_DIR}/bin/neuropress_grayscott_parity_exec)
+    set_tests_properties(ctp_neuropress_grayscott_parity PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600
+        LABELS "693;parity;gpu;workload")
+else()
+    message(STATUS
+        "NeuroPress Gray-Scott parity: skipped (no gray-scott sources)")
+endif()
