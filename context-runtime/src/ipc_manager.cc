@@ -2654,6 +2654,26 @@ bool IpcManager::TryLazyRegisterClientSegment(
   if (alloc_id == ctp::ipc::AllocatorId::GetNull()) {
     return false;
   }
+  // Never our OWN process's id. #807 is about a segment another process
+  // created whose registration has not landed here yet; an id this process
+  // minted is a different animal entirely:
+  //
+  //   - a host SHM segment from IncreaseClientShm is inserted into alloc_map_
+  //     under the write lock BEFORE that call returns, so ToFullPtr's alloc_map_
+  //     lookup has already resolved it and we are never reached for one;
+  //   - which leaves GPU backends. AllocateAndRegisterGpuBackend draws its
+  //     index from the same shm_count_ counter, so its ids are shaped exactly
+  //     like "clio_<pid>_<n>" -- but it creates no POSIX shm object, and the
+  //     shm_open below is guaranteed to fail with ENOENT.
+  //
+  // Attempting it anyway logged two ERROR lines per resolution and took both
+  // shm_mutex_ and an exclusive allocator_map_lock_ on the pointer-resolution
+  // hot path, three times per GPU chunk. ToFullPtr's next case resolves these
+  // correctly (the owner can always dereference its own GPU pointer), so this
+  // is pure cost. Bail out and let it.
+  if (alloc_id.major_ == static_cast<u32>(ctp::SystemInfo::GetPid())) {
+    return false;
+  }
   HLOG(kWarning,
        "IpcManager::TryLazyRegisterClientSegment: resolving ({}.{}) before "
        "its RegisterMemory round-trip landed — attaching on demand (#807)",
