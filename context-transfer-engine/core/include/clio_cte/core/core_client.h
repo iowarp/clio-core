@@ -224,6 +224,14 @@ class Client : public clio::run::ContainerClient {
     if (shm_root_ == nullptr || out == nullptr || size == 0) {
       return false;
     }
+    // DEVICE destinations take the RPC path: this fast path is a plain host
+    // std::memcpy, and a gpu_vector page fault hands us a cudaMalloc'd
+    // pointer a CPU store cannot touch (observed as a straight SIGSEGV when
+    // the compressor's get for a raw-stored device blob landed here). The
+    // RPC path dispatches on IsDevicePointer and copies device-side.
+    if (ctp::IsDevicePointer(out)) {
+      return false;
+    }
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;

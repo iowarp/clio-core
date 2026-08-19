@@ -2534,7 +2534,10 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
         CLIO_CO_AWAIT(clio::run::yield(50.0));
       }
       if (getenv("CLIO_CODEC_TRACE")) fprintf(stderr, "[TRACE] gpu_comp ok=%d csize=%zu sz=%zu\n", (int)_gc, csize, sz);
-      if (_gc && csize + hdr_sz < sz) {
+      // Same MEANINGFUL-gain bar as CompressIntoShm: every reader of a
+      // compressed device blob pays an in-kernel decode, so marginal
+      // shrinkage is a straight loss and the page stays raw instead.
+      if (_gc && csize + hdr_sz < sz - sz / 8) {
         // The header goes to the device too -- it is the first bytes of the
         // stored blob, and BuildDeviceTierMap parses it out of the tier.
         CompressionHeader header(ctx.compress_lib_, ctx.compress_preset_,
@@ -2563,6 +2566,25 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
         CLIO_CO_RETURN;
       }
       ReleaseGpuScratch(scratch);
+      // The codec RAN but the page is not worth compressing (full-entropy
+      // data is the normal case, not an error), or -- rarely -- no codec
+      // slot freed up across the whole bounded wait. Either way the correct
+      // store is the caller's RAW device bytes with NO codec recorded: the
+      // reader detects the stored form from the header magic, so a raw blob
+      // reads back through the same path. This is NOT the CPU-substitution
+      // the guard below exists to prevent -- no bitstream is produced at
+      // all. Failing the put here (as this once did) turned every
+      // incompressible page into data loss.
+      if (!_gc) {
+        HLOG(kError,
+             "compressor: GPU codec '{}' never got a codec slot for a {}B "
+             "put; storing the page raw instead of losing it.",
+             ctp::CompressionFactory::NameForWireId(ctx.compress_lib_), sz);
+      }
+      ctx.compress_lib_ = 0;
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
     }
 #endif
     if (IsGpuCodec(ctx.compress_lib_)) {
@@ -2574,6 +2596,9 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
       // back would produce a CPU-lz4 bitstream that the in-kernel decoder
       // cannot read, quietly forcing every later read onto the host path --
       // i.e. it would report a GPU codec while delivering a CPU one.
+      // Reaching here means the device path could not even START (no codec
+      // context, or a host-side source): a configuration problem, failed
+      // loudly.
       HLOG(kError,
            "compressor: GPU codec '{}' requested but the device codec path "
            "did not run (codec context: {}, device src: {}). Failing the put "
