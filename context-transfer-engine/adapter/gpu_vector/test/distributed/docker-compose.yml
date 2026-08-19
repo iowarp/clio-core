@@ -24,6 +24,10 @@ x-node: &node
     # nvcomp lives outside the CUDA toolkit on deb systems; the runtime libs
     # link it (compressed-tier support), so mount it read-only too.
     - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+    # cuSZp (lossy tensor codec) is a from-source install outside the repo;
+    # run_distributed.sh resolves its host dir off the binary with ldd. The
+    # default is a harmless directory for builds that do not link it.
+    - ${CUSZP_LIB_DIR:-/tmp}:/opt/cuszp-lib:ro
   working_dir: /workspace
   mem_limit: 8g
   environment: &node-env
@@ -31,7 +35,7 @@ x-node: &node
     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     - CLIO_NUM_CONTAINERS=4
     - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
-    - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
     - GVD_PAGES=${GVD_PAGES:-64}
     - GVD_ROUNDS=${GVD_ROUNDS:-3}
     - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
@@ -51,7 +55,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
@@ -73,7 +77,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
@@ -95,7 +99,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
@@ -117,7 +121,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CLIO_NUM_CONTAINERS=4
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed/gvd_conf.yaml
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
       - GVD_PAGES=${GVD_PAGES:-64}
       - GVD_ROUNDS=${GVD_ROUNDS:-3}
       - GVD_BARRIER_TIMEOUT=${GVD_BARRIER_TIMEOUT:-180}
