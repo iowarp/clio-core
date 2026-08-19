@@ -148,8 +148,12 @@ bool RunOverrun(clio::run::u32 num_tasks) {
     handles.push_back(fp);
   }
 
-  auto *task_handle_dev =
-      ctp::GpuApi::MallocHost<ctp::ipc::FullPtr<TaskT>>(num_tasks);
+  // BYTES, not a count: MallocHost passes its argument straight to
+  // cudaMallocHost. Passing num_tasks alone under-allocated 24x, and the
+  // hard-overrun subtest's handle staging wrote past the mapping -- the
+  // SEGV this test "found" was its own.
+  auto *task_handle_dev = ctp::GpuApi::MallocHost<ctp::ipc::FullPtr<TaskT>>(
+      static_cast<size_t>(num_tasks) * sizeof(ctp::ipc::FullPtr<TaskT>));
   REQUIRE(task_handle_dev != nullptr);
   for (clio::run::u32 i = 0; i < num_tasks; ++i) task_handle_dev[i] = handles[i];
 
