@@ -31,6 +31,44 @@ target_link_libraries(test_hdf5_vol_adapter
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
+# ---------------------------------------------------------------------------
+# "Application never closed its file" regression (two processes).
+#
+# The behaviour only exists at process exit -- HDF5 closes leftover files from
+# its own atexit handler, and whether the connector can still reach the runtime
+# there depends on handler registration order. That cannot be reached from
+# inside a test case, and fork() does not reproduce it either (a forked child
+# of a runtime host has no worker threads), so the writer and the reader are
+# real separate processes driven by the helper below.
+add_executable(exit_stamp_child exit_stamp_child.cc)
+
+target_include_directories(exit_stamp_child PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    ${HDF5_INCLUDE_DIRS}
+)
+
+target_link_libraries(exit_stamp_child
+    clio_cte_core_client
+    ctp::cxx
+    ${HDF5_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_executable(test_hdf5_vol_exit_stamp test_hdf5_vol_exit_stamp.cc)
+
+target_include_directories(test_hdf5_vol_exit_stamp PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_hdf5_vol_exit_stamp
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# The driver execs the helper, which dlopens the connector: both must exist
+# before the test runs.
+add_dependencies(test_hdf5_vol_exit_stamp exit_stamp_child clio_hdf5_vol)
+
 # simple_test.h filters by substring of the registered test name
 add_test(NAME cte_hdf5_vol_plugin_entry
     COMMAND test_hdf5_vol_adapter "HDF5 VOL - Plugin Entry Points")
@@ -118,12 +156,19 @@ if(NOT WIN32)
   add_test(NAME cte_hdf5_vol_io_keying
       COMMAND test_hdf5_vol_io "HDF5 VOL IO - Same dataset name in two groups stays distinct")
 
+  # Two real processes: a writer that never closes its file and a reader that
+  # restarts. See the header of test_hdf5_vol_exit_stamp.cc for what this does
+  # NOT cover -- it does not reproduce the atexit ordering itself.
+  add_test(NAME cte_hdf5_vol_exit_stamp
+      COMMAND test_hdf5_vol_exit_stamp)
+
   set_tests_properties(
       cte_hdf5_vol_io_dataset
       cte_hdf5_vol_io_groups_attrs
       cte_hdf5_vol_io_passthrough
       cte_hdf5_vol_io_append
       cte_hdf5_vol_io_keying
+      cte_hdf5_vol_exit_stamp
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"

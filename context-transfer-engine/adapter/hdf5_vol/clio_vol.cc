@@ -201,6 +201,13 @@ struct clio_dataset_t {
      hid_t (the caller's type id is long gone by then). */
   size_t append_total_size = 0;
   int append_data_type = 0;
+  /* Highest image offset staged so far. A write starting at or beyond this is
+     extending the image and its chunks cannot collide with anything still in
+     flight. A write starting BELOW it is rewriting chunks that may already
+     have an unfinished put, and two puts for one chunk complete in no
+     guaranteed order -- the older one landing last leaves the tier holding
+     pre-write bytes under a key the reader trusts. */
+  size_t append_high_water = 0;
   /* One staging-failure report per dataset (see drain_dataset_puts). */
   bool put_failure_reported = false;
   /* Telemetry-only storage-layout probe, filled lazily on first traced access
@@ -474,6 +481,40 @@ static bool clio_vol_process_exiting() {
   return g_vol_process_exiting.load(std::memory_order_acquire);
 }
 
+/* Files currently open through this connector that still owe a coherence
+   stamp. Needed because an application is not required to close its files:
+   HDF5 closes them from its own atexit handler instead, by which point the
+   runtime is gone and the stamp can no longer be written -- see
+   clio_flush_stamps_at_exit(). */
+static std::mutex g_open_files_mtx;
+static std::unordered_set<clio_file_t *> g_open_files;
+
+/* The runtime manager as it was when this connector attached.
+   Captured rather than looked up on demand: CLIO_RUNTIME_MANAGER publishes a
+   LAZILY CONSTRUCTED singleton, so asking it during teardown hands back a
+   brand-new manager that reports itself perfectly healthy -- observed as two
+   distinct manager pointers, the real one finalizing while a second was
+   created by the very check meant to detect that. Holding the pointer we saw
+   at attach keeps the question answerable. */
+static std::atomic<clio::run::RuntimeManager *> g_rt_manager{nullptr};
+
+static void clio_register_open_file(clio_file_t *file) {
+  if (file == nullptr) return;
+  std::lock_guard<std::mutex> lk(g_open_files_mtx);
+  g_open_files.insert(file);
+}
+
+static void clio_unregister_open_file(clio_file_t *file) {
+  if (file == nullptr) return;
+  std::lock_guard<std::mutex> lk(g_open_files_mtx);
+  g_open_files.erase(file);
+}
+
+/* Defined below, next to clio_write_stamp: writes the coherence stamp for
+   every still-open file while the runtime can still be reached. Registered
+   with atexit() from get_cte_client(). */
+static void clio_flush_stamps_at_exit();
+
 static clio::cte::core::Client *get_cte_client() {
   /* Lazily attach this process to the running clio/CTE runtime on first
      use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
@@ -516,10 +557,19 @@ static clio::cte::core::Client *get_cte_client() {
   static std::once_flag once;
   static bool attached = false;
   std::call_once(once, []() {
+    attached = clio::cte::core::CLIO_CTE_CLIENT_INIT();
+    if (attached) {
+      g_rt_manager.store(CLIO_RUNTIME_MANAGER, std::memory_order_release);
+    }
+    /* Registered AFTER the attach above, deliberately: atexit is LIFO, so a
+       handler registered here runs BEFORE the runtime's own teardown and can
+       still reach it. Flushing the stamps first and only then declaring the
+       process to be exiting is the whole point -- reversing these two lines
+       reinstates the silent cache loss this exists to prevent. */
     std::atexit([]() {
+      clio_flush_stamps_at_exit();
       g_vol_process_exiting.store(true, std::memory_order_release);
     });
-    attached = clio::cte::core::CLIO_CTE_CLIENT_INIT();
     if (!attached) {
       fprintf(stderr,
               "[clio-vol] CLIO runtime unavailable; running as a pure "
@@ -1056,6 +1106,58 @@ static uint64_t clio_stamp_granularity_ns() {
  * open fails closed. This is the same rule the rest of the stamp path already
  * follows -- absent, unreadable and unstattable all mean do-not-trust -- with
  * one more case that used to take the confident-yes path by omission. */
+/* Write the coherence stamp for every file still open, while the runtime can
+   still be reached.
+
+   An application is under no obligation to close its HDF5 files: HDF5
+   registers H5_term_library() with atexit and closes them there. LAMMPS' h5md
+   dump is one such writer, and a stock binary cannot be changed. That close
+   runs after CLIO has finalized, so the stamp it would have written is
+   skipped -- and a missing stamp is not a small loss. The next open reads
+   "stamp absent", concludes the tier may not describe the file, DELETES the
+   tag and re-creates it under a fresh id. Every blob the writer stored is
+   then keyed to a tag nothing asks about: measured as a writer storing under
+   tag (0.1) and the reader probing (0.2), rc=1, on a cache that was complete
+   and correct.
+
+   Registration order is what makes this work, and it is the opposite of the
+   flag's. atexit runs handlers in reverse, so this must be registered AFTER
+   the runtime is attached in order to run BEFORE the runtime tears down;
+   HDF5 registered its own handler earlier still, so it closes the files after
+   both -- finding the flag set, taking the cheap path, and not faulting. */
+static void clio_flush_stamps_at_exit() {
+  bool any;
+  {
+    std::lock_guard<std::mutex> lk(g_open_files_mtx);
+    any = !g_open_files.empty();
+  }
+  if (!any) return;
+
+  /* An application may have finalized the runtime itself before returning
+     from main -- the unit-test harness does exactly that. Driving H5close()
+     into a dead runtime faults in Transport::Send the same way the unguarded
+     close did, so the flush is skipped and only the flag is set, which is the
+     pre-existing behaviour and still safe: there is nothing left to stamp
+     into. */
+  auto *rt = g_rt_manager.load(std::memory_order_acquire);
+  if (rt == nullptr || !rt->IsInitialized()) return;
+
+  /* Close through HDF5 rather than stamping in place. Stamping here was tried
+     and does not work: the stamp records the file's size and mtime at this
+     instant, HDF5 then closes the file and flushes its remaining metadata,
+     and the next open compares against a file that has since changed --
+     trading "stamp absent" for "stamp mismatched", which drops the tag just
+     the same.
+
+     H5close() terminates the library NOW: it flushes and closes every open
+     file, which re-enters this connector's own file_close for each one and
+     takes the ordinary stamp-after-native-close path with the runtime still
+     up. HDF5's own atexit handler runs later and finds the library already
+     terminated, so this only moves the work earlier -- it does not duplicate
+     it. */
+  H5close();
+}
+
 static bool clio_stamp_ambiguous(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return true;
@@ -1153,6 +1255,7 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->chunk_size = chunk_size;
   file->cache_enabled = cache_enabled;
   file->trace = clio::trace::open_file(name);
+  clio_register_open_file(file);
   if (!compressor_pool_id.IsNull()) {
     /* Runtime-internal one-arg ctor: only the compressor pool is known here,
        exactly the situation its doc comment describes. Its own chimod config
@@ -1181,6 +1284,7 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
      empty summary); a bare delete leaked it and its open jsonl handle. */
   auto refuse = [&]() {
     clio::trace::close_file(file->trace);
+    clio_unregister_open_file(file);
     delete file;
   };
 
@@ -1375,6 +1479,7 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
       }
     }
   }
+  clio_unregister_open_file(file);
   herr_t ret = H5VLfile_close(file->obj.under_object, file->obj.under_vol_id,
                                dxpl_id, req);
 
@@ -2016,6 +2121,19 @@ static size_t clio_stage_append(clio_dataset_t *dataset, const void *src_raw,
   const size_t chunk_size = dataset->file->chunk_size;
   if (hi <= lo) return 0;
 
+  /* Rewriting a region that has already been staged: settle the outstanding
+     puts before issuing new ones for the same chunks, or the two orderings
+     race and the older bytes can win. Pure appends never take this branch --
+     they start at the high-water mark, not below it -- so the cost falls only
+     on the overwrite case that needs it. */
+  if (lo < dataset->append_high_water) {
+    if (!drain_dataset_puts(dataset)) {
+      clio_invalidate_dataset(dataset);
+      *ok = false;
+      return 0;
+    }
+  }
+
   /* Bring the write's bytes to host memory once. DeviceAwareMemcpy handles a
      device src (D2H); for a host src this is a plain copy. */
   const size_t nbytes = hi - lo;
@@ -2068,6 +2186,7 @@ static size_t clio_stage_append(clio_dataset_t *dataset, const void *src_raw,
   /* Carry the remainder. It starts on a chunk boundary by construction. */
   dataset->append_total_size = total_size;
   dataset->append_data_type = np_data_type;
+  if (hi > dataset->append_high_water) dataset->append_high_water = hi;
   dataset->append_tail_off = run_off + pos;
   dataset->append_tail.assign(run.begin() + pos, run.end());
 
@@ -2303,6 +2422,7 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
     /* A whole write republishes the entire image, so nothing may still be
        buffered from an earlier append run. */
     clio_append_reset(dataset);
+    dataset->append_high_water = total_size;
 
     /* Write to the native VOL -- the authoritative store. Its status is this
        call's status; if it failed, the bytes we just staged into CTE describe
