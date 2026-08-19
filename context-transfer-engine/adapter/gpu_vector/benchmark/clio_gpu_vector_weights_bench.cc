@@ -466,7 +466,13 @@ int main(int argc, char **argv) {
   bool gpu_codec = true;   // nvcomp by default; --cpu-codec for lz4
   int prefetch = 1;
   int repeat = 3;
-  bool yieldable = false;
+  // Coroutine faulting is the DEFAULT. The blocking kernels spin in-kernel
+  // on every fault, and this bench always routes through the compressor
+  // pool, which services faults by LAUNCHING KERNELS -- so the blocking
+  // path is a guaranteed wedge (GPU pegged at 100% in SeedKernel, main
+  // stuck in cudaDeviceSynchronize forever), not a slower mode. It is
+  // reachable only by explicit opt-in for deadlock-repro work.
+  bool yieldable = true;
   // The out-of-core model WITHOUT in-kernel faulting: sync storage I/O,
   // sync HBM<->DRAM copy, and the kernel torn down for every transfer.
   bool baseline = false;
@@ -489,6 +495,7 @@ int main(int argc, char **argv) {
     else if (a == "--cpu-codec") gpu_codec = false;
     else if (a == "--no-prefetch") prefetch = 0;
     else if (a == "--yieldable") yieldable = true;
+    else if (a == "--blocking-unsafe") yieldable = false;  // wedges; repro only
     // --baseline REPLACES THE TIMED LOOP ONLY; the seed still runs through
     // the vector, so it must use the coroutine kernel. Without this, passing
     // --baseline alone silently left yieldable=false and seeding fell into the

@@ -44,6 +44,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cstdio>
@@ -54,7 +55,11 @@
 #include <thread>
 #include <vector>
 
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/gpu/yield_stack.h>
+
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
 
@@ -124,35 +129,37 @@ CTP_INLINE_CROSS_FUN u32 Value(u64 p, u64 i, u32 zero_pct) {
  * wait, and the resident-slot budget (--pages) is what bounds how far ahead it
  * may run.
  */
-__global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
-                                  gv::DeviceVector<u32> v, u64 pages_per_block,
-                                  u32 zero_pct) {
-  CLIO_GPU_INIT(info, nullptr);
+__device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
+                                         u64 pages_per_block, u32 zero_pct,
+                                         u32 block) {
   const u64 pe = v.h_->elems_per_page_;
-  const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
-  long long prev = -1;
+  const u64 base_page = static_cast<u64>(block) * pages_per_block;
+  u64 run = 0;
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-    v.HoldPage(off, pe);
+    co_await v.HoldPage(off, pe, &run);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       v[off + i] = Value(p, off + i, zero_pct);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-      // Collect the PREVIOUS page's store, then start this one: the store of
-      // page k-1 has been in flight for the whole fill of page k.
-      if (prev >= 0) {
-        v.WaitFlush(static_cast<u64>(prev) * pe, pe);
-      }
-      v.BeginFlush(off, pe);
-      prev = static_cast<long long>(p);
-    }
-    __syncthreads();
+    // Fire-and-forget: the store of page k stays in flight through the fill
+    // of page k+1; the claim path settles finished flushes when it needs a
+    // slot, and the AwaitFlush at the end collects the stragglers.
+    v.FlushAsync(off, pe);
   }
-  if (threadIdx.x == 0 && prev >= 0) {
-    v.WaitFlush(static_cast<u64>(prev) * pe, pe);
-  }
+  co_await v.AwaitFlush();
+}
+
+__global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
+                                  gv::DeviceVector<u32> v, u64 pages_per_block,
+                                  u32 zero_pct, gy::YieldableView<> yv,
+                                  gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(StreamWriteCoro(v, pages_per_block, zero_pct, yv.Block()));
 }
 
 /**
@@ -166,29 +173,30 @@ __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
  * latency to be overlapped, not bandwidth to be saved. depth=0 keeps the old
  * strictly-synchronous behaviour for comparison.
  */
-__global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
-                                 gv::DeviceVector<u32> v, u64 pages_per_block,
-                                 u32 depth, unsigned long long *sum) {
-  CLIO_GPU_INIT(info, nullptr);
+__device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
+                                        u64 pages_per_block, u32 depth,
+                                        unsigned long long *sum, u32 block) {
   const u64 pe = v.h_->elems_per_page_;
-  const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
+  const u64 base_page = static_cast<u64>(block) * pages_per_block;
   unsigned long long acc = 0;
-  // Prime the pipeline.
-  if (threadIdx.x == 0) {
-    for (u64 d = 0; d < depth && d < pages_per_block; ++d) {
-      v.BeginFetch(base_page + d);
-    }
+  u64 run = 0;
+  // Prime the pipeline: score 1.0 == make resident, the batched prefetch.
+  if (depth > 0) {
+    u32 prime = depth;
+    if (prime > pages_per_block) prime = static_cast<u32>(pages_per_block);
+    v.RescorePagesBatchedAsync(
+        prime, [base_page](u32 d) { return gv::PageScore{base_page + d, 1.0f}; });
   }
-  __syncthreads();
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 off = (base_page + k) * pe;
     // Start the page `depth` ahead before touching this one, so the fault for
     // it is already in flight by the time we get there.
-    if (threadIdx.x == 0 && depth > 0 && k + depth < pages_per_block) {
-      v.BeginFetch(base_page + k + depth);
+    if (depth > 0 && k + depth < pages_per_block) {
+      const u64 want = base_page + k + depth;
+      v.RescorePagesBatchedAsync(
+          1u, [want](u32) { return gv::PageScore{want, 1.0f}; });
     }
-    __syncthreads();
-    v.HoldPage(off, pe);
+    co_await v.HoldPage(off, pe, &run);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       acc += static_cast<unsigned long long>(v.at(off + i)) *
              PosWeight(off + i);
@@ -196,6 +204,18 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
     __syncthreads();
   }
   atomicAdd(sum, acc);
+}
+
+__global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u64 pages_per_block,
+                                 u32 depth, unsigned long long *sum,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(StreamReadCoro(v, pages_per_block, depth, sum, yv.Block()));
 }
 
 /**
@@ -209,25 +229,26 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
  * save. Amortizing the submission over `chunk` pages is what lets a smaller
  * stored size turn into a shorter read.
  */
-__global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
-                                        gv::DeviceVector<u32> v,
-                                        u64 pages_per_block, u32 chunk,
-                                        unsigned long long *sum) {
-  CLIO_GPU_INIT(info, nullptr);
+__device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
+                                               u64 pages_per_block, u32 chunk,
+                                               unsigned long long *sum,
+                                               u32 block) {
   const u64 pe = v.h_->elems_per_page_;
-  const u64 base_page = static_cast<u64>(blockIdx.x) * pages_per_block;
+  const u64 base_page = static_cast<u64>(block) * pages_per_block;
   unsigned long long acc = 0;
+  u64 run = 0;
   for (u64 k = 0; k < pages_per_block; k += chunk) {
     u64 n = pages_per_block - k;
     if (n > chunk) n = chunk;
-    if (threadIdx.x == 0) {
-      gv::DeviceVectorTestAccess::FetchPagesBatched(v, base_page + k, static_cast<u32>(n));
-    }
-    __syncthreads();
-    // The chunk is resident now, so this walk faults on nothing.
+    // One batched get for the whole chunk (score 1.0 == make resident); the
+    // holds below wait on arrivals rather than issuing per-page faults.
+    const u64 c0 = base_page + k;
+    v.RescorePagesBatchedAsync(
+        static_cast<u32>(n),
+        [c0](u32 j) { return gv::PageScore{c0 + j, 1.0f}; });
     for (u64 j = 0; j < n; ++j) {
       const u64 off = (base_page + k + j) * pe;
-      v.HoldPage(off, pe);
+      co_await v.HoldPage(off, pe, &run);
       for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
         acc += static_cast<unsigned long long>(v.at(off + i)) *
                PosWeight(off + i);
@@ -238,9 +259,37 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
   atomicAdd(sum, acc);
 }
 
+__global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
+                                        gv::DeviceVector<u32> v,
+                                        u64 pages_per_block, u32 chunk,
+                                        unsigned long long *sum,
+                                        gy::YieldableView<> yv,
+                                        gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(
+      StreamReadBatchedCoro(v, pages_per_block, chunk, sum, yv.Block()));
+}
+
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
+
+constexpr unsigned kYieldLaneBytes = 8192;
+
+/** Drive a coroutine kernel to completion: launch, service, relaunch. */
+template <typename LaunchT>
+clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/2000000);
+}
 
 double NowMs() {
   using clock = std::chrono::high_resolution_clock;
@@ -297,7 +346,10 @@ int main(int argc, char **argv) {
     else if (f == "--prefetch") prefetch_depth = static_cast<u32>(std::atoll(next()));
     else if (f == "--read-batch") read_batch = static_cast<u32>(std::atoll(next()));
     else if (f == "--rt-threads") rt_threads = static_cast<u32>(std::atoll(next()));
-    else if (f == "--compressed") compressed = true;
+    // Both compression flags mean the GPU codec: this build carries no CPU
+    // lz4 (CTP_ENABLE_LZ4=OFF renders wire id 4 a silent pass-through), and
+    // the vector's rule is GPU codecs only regardless.
+    else if (f == "--compressed") { compressed = true; gpu_codec = true; }
     else if (f == "--gpu-codec") { compressed = true; gpu_codec = true; }
     else if (f == "--tier-type") tier_type = next();
     else if (f == "--spill-type") spill_type = next();
@@ -426,12 +478,12 @@ int main(int argc, char **argv) {
 
   // ---- write stream --------------------------------------------------------
   const double w0 = NowMs();
-  StreamWriteKernel<<<blocks, threads>>>(gpu, dev, pages_per_block, zero_pct);
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "stream: write kernel failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  RunYieldable(blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                           gy::YieldStackView sv) {
+    StreamWriteKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu, dev, pages_per_block, zero_pct, vw, sv);
+  });
+  ctp::GpuApi::Synchronize();
   const double write_ms = NowMs() - w0;
   {
     // Counters at the PHASE BOUNDARY. Totals alone cannot say whether a
@@ -482,9 +534,9 @@ int main(int argc, char **argv) {
   }
 
   // ---- read stream ---------------------------------------------------------
-  unsigned long long *d_sum = nullptr;
-  cudaMalloc(&d_sum, sizeof(unsigned long long));
-  cudaMemset(d_sum, 0, sizeof(unsigned long long));
+  unsigned long long *d_sum =
+      ctp::GpuApi::Malloc<unsigned long long>(sizeof(unsigned long long));
+  ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
   const double r0 = NowMs();
   if (read_batch > 0) {
     // The chunk has to fit the cache -- a batch larger than the block's slots
@@ -496,21 +548,23 @@ int main(int argc, char **argv) {
     if (read_batch > clio::cte::core::kPodMultiMax) {
       read_batch = clio::cte::core::kPodMultiMax;
     }
-    StreamReadBatchedKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
-                                                 read_batch, d_sum);
+    RunYieldable(blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                             gy::YieldStackView sv) {
+      StreamReadBatchedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, dev, pages_per_block, read_batch, d_sum, vw, sv);
+    });
   } else {
-    StreamReadKernel<<<blocks, threads>>>(gpu, dev, pages_per_block,
-                                          prefetch_depth, d_sum);
+    RunYieldable(blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                             gy::YieldStackView sv) {
+      StreamReadKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, dev, pages_per_block, prefetch_depth, d_sum, vw, sv);
+    });
   }
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "stream: read kernel failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  ctp::GpuApi::Synchronize();
   const double read_ms = NowMs() - r0;
   unsigned long long got = 0;
-  cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost);
-  cudaFree(d_sum);
+  ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
+  ctp::GpuApi::Free(d_sum);
 
   unsigned long long want = 0;
   for (u64 p = 0; p < total_pages; ++p) {

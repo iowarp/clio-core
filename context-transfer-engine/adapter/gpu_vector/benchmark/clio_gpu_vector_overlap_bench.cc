@@ -33,6 +33,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cstdio>
@@ -43,7 +44,11 @@
 #include <thread>
 #include <vector>
 
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/gpu/yield_stack.h>
+
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
 
@@ -57,27 +62,36 @@ CTP_INLINE_CROSS_FUN u32 Elem(u64 i) { return static_cast<u32>(i % 251); }
 
 }  // namespace
 
-/** Fill the vector and flush it, so every page exists as a blob. */
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<u32> v, u64 per) {
-  CLIO_GPU_INIT(info, nullptr);
-  const u64 base = static_cast<u64>(blockIdx.x) * per;
-  const u64 pages = per / v.h_->elems_per_page_;
-  for (u64 p = 0; p < pages; ++p) {
-    {
-      const u64 off = base + p * v.h_->elems_per_page_;
-      v.HoldPage(off, v.h_->elems_per_page_);
-      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-        v[off + i] = Elem(off + i);
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        v.BeginFlush(off, v.h_->elems_per_page_);
-        v.WaitFlush(off, v.h_->elems_per_page_);
-      }
-      __syncthreads();
-      }
+/** Fill the vector and flush it, so every page exists as a blob.
+ *
+ * A COROUTINE: the blocking HoldPage spun in-kernel on every fault, which is
+ * the in-kernel-wait pattern that wedges the moment anything on the service
+ * path needs a kernel launch, and the reason this benchmark timed out. Each
+ * fault suspends instead; the block's flush is one batched FlushAsync at the
+ * end rather than a put-and-wait per page. */
+__device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
+                                  u32 block) {
+  const u64 base = static_cast<u64>(block) * per;
+  u64 run = 0;
+  for (u64 i = 0; i < per; i += run) {
+    co_await v.HoldPage(base + i, per - i, &run);
+    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+      v[base + i + k] = Elem(base + i + k);
+    }
+    __syncthreads();
   }
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
+__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
+                           gv::DeviceVector<u32> v, u64 per,
+                           gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SeedCoro(v, per, yv.Block()));
 }
 
 /**
@@ -105,64 +119,69 @@ CTP_GPU_FUN float DoWork(u32 iters, float seed) {
  * Lane 0 drives paging; the whole block participates in the summation, so the
  * page is read the way a real kernel would read it.
  */
-__global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
-                                 gv::DeviceVector<u32> v, u64 per,
-                                 u32 compute_iters, int prefetch, u32 depth,
-                                 unsigned long long *total) {
-  CLIO_GPU_INIT(info, nullptr);
-  const u64 base = static_cast<u64>(blockIdx.x) * per;
+__device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
+                                        u32 compute_iters, int prefetch,
+                                        u32 depth, unsigned long long *total,
+                                        u32 block) {
+  const u64 base = static_cast<u64>(block) * per;
   const u64 first_page = base / v.h_->elems_per_page_;
   const u64 pages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
+  u64 run = 0;
 
   for (u64 p = 0; p < pages; ++p) {
-    {
-      if (prefetch && threadIdx.x == 0) {
-        // Pin the page about to be used, so a prefetch's slot claim evicts a
-        // page we have already finished with rather than the one in use.
-        v.RescorePage(first_page + p, 1000.0f);
-        // Keep `depth` pages in flight, not one. A page fault here costs about
-        // 370 us, almost all of it gpu2cpu round trip rather than transfer (the
-        // page is 64 KB -- microseconds of copy). One page of lookahead cannot
-        // cover that unless a page's compute exceeds the whole round trip, which
-        // is why the single-page version waited on EVERY prefetch it issued.
-        for (u32 d = 1; d <= depth; ++d) {
-          const u64 want = p + d;
-          if (want < pages) v.BeginFetch(first_page + want);
-        }
+    if (prefetch) {
+      // Keep `depth` pages in flight, not one: one page of lookahead cannot
+      // cover a whole fault round trip unless a page's compute exceeds it.
+      // Score 1.0 == make resident, batched; already-resident/in-flight
+      // entries are skipped inside, so re-hinting each iteration is cheap.
+      // The page in use needs no pin hint -- HoldPage's pin protects it.
+      u32 nwant = depth;
+      if (p + nwant >= pages) nwant = static_cast<u32>(pages - 1 - p);
+      if (nwant > 0) {
+        const u64 p1 = first_page + p + 1;
+        v.RescorePagesBatchedAsync(
+            nwant, [p1](u32 d) { return gv::PageScore{p1 + d, 1.0f}; });
       }
-      __syncthreads();
+    }
 
-      const u64 off = base + p * v.h_->elems_per_page_;
-      unsigned long long local = 0;
-      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-        local += v[off + i];
-      }
-      acc += local;
-      __syncthreads();
+    const u64 off = base + p * v.h_->elems_per_page_;
+    co_await v.HoldPage(off, v.h_->elems_per_page_, &run);
+    unsigned long long local = 0;
+    for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
+      local += v.at(off + i);
+    }
+    acc += local;
+    __syncthreads();
 
-      // The compute half of the mix. Every lane works, like real compute.
-      // Seed from the PAGE and the data just read, so the chain is not
-      // loop-invariant. Seeding it from threadIdx alone lets the compiler hoist
-      // the whole chain out of the page loop and compute it once -- the
-      // "compute" would then cost 1/pages of what it claims to.
-      acc += static_cast<unsigned long long>(
-          DoWork(compute_iters, 1.0f + static_cast<float>(threadIdx.x) +
-                                    static_cast<float>(p) +
-                                    static_cast<float>(local & 0xff)) *
-          1.0e-9f);
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        if (prefetch) {
-          // Release the page we just finished: lowest score makes it the next
-          // eviction victim, which is what frees a slot for the prefetch after.
-          v.RescorePage(first_page + p, -1000.0f);
-        }
-      }
-      __syncthreads();
-      }
+    // The compute half of the mix. Every lane works, like real compute.
+    // Seed from the PAGE and the data just read, so the chain is not
+    // loop-invariant. Seeding it from threadIdx alone lets the compiler hoist
+    // the whole chain out of the page loop and compute it once -- the
+    // "compute" would then cost 1/pages of what it claims to.
+    acc += static_cast<unsigned long long>(
+        DoWork(compute_iters, 1.0f + static_cast<float>(threadIdx.x) +
+                                  static_cast<float>(p) +
+                                  static_cast<float>(local & 0xff)) *
+        1.0e-9f);
+    __syncthreads();
   }
   atomicAdd(total, acc);
+}
+
+__global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u64 per,
+                                 u32 compute_iters, int prefetch, u32 depth,
+                                 unsigned long long *total,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(
+      SumComputeCoro(v, per, compute_iters, prefetch, depth, total,
+                     yv.Block()));
 }
 
 /** Drop every resident page, so a timed run always starts cold. */
@@ -176,6 +195,20 @@ __global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
+
+constexpr unsigned kYieldLaneBytes = 8192;
+
+/** Drive a coroutine kernel to completion: launch, service, relaunch. */
+template <typename LaunchT>
+clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+}
 
 struct Args {
   u32 blocks = 8;
@@ -204,7 +237,7 @@ double RunOnce(const gv::DeviceVector<u32> &dev,
                const clio::run::IpcManagerGpuInfo &gpu, u32 blocks, u64 per,
                u32 compute_iters, int prefetch, u32 depth, bool cold,
                unsigned long long *d_sum, unsigned long long *out_sum) {
-  cudaMemset(d_sum, 0, sizeof(unsigned long long));
+  ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
   // Cold start, OUTSIDE the timed region: otherwise whichever mode runs
   // second inherits the other's warm cache. The first version of this
   // benchmark did exactly that and gave prefetch 152 faults against
@@ -215,14 +248,17 @@ double RunOnce(const gv::DeviceVector<u32> &dev,
   // nothing left for a prefetch to hide and every mode measured the same.
   if (cold) {
     DropAllKernel<<<blocks, 32>>>(gpu, dev);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
   }
   const double t0 = NowMs();
-  SumComputeKernel<<<blocks, 32>>>(gpu, dev, per, compute_iters, prefetch,
-                                   depth, d_sum);
-  cudaDeviceSynchronize();
+  RunYieldable(blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                           gy::YieldStackView sv) {
+    SumComputeKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu, dev, per, compute_iters, prefetch, depth, d_sum, vw, sv);
+  });
+  ctp::GpuApi::Synchronize();
   const double ms = NowMs() - t0;
-  cudaMemcpy(out_sum, d_sum, sizeof(*out_sum), cudaMemcpyDeviceToHost);
+  ctp::GpuApi::Memcpy(out_sum, d_sum, sizeof(*out_sum));
   return ms;
 }
 
@@ -309,15 +345,14 @@ int main(int argc, char **argv) {
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
 
-  SeedKernel<<<a.blocks, 32>>>(gpu, dev, per);
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "seed failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  RunYieldable(a.blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                             gy::YieldStackView sv) {
+    SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, per, vw, sv);
+  });
+  ctp::GpuApi::Synchronize();
 
-  unsigned long long *d_sum = nullptr;
-  cudaMalloc(&d_sum, sizeof(unsigned long long));
+  unsigned long long *d_sum =
+      ctp::GpuApi::Malloc<unsigned long long>(sizeof(unsigned long long));
   const unsigned long long want = ExpectedSum(n);
 
   // ---- Step 0: the SCAN BASELINE, present in every mode -----------------
@@ -339,8 +374,11 @@ int main(int argc, char **argv) {
     gv::Vector<u32> warm("gv_overlap_scan", {0}, kPageBytes, a.blocks,
                          static_cast<u32>(a.pages_per_block), n);
     auto wdev = warm.GetDevice(0);
-    SeedKernel<<<a.blocks, 32>>>(gpu, wdev, per);
-    cudaDeviceSynchronize();
+    RunYieldable(a.blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                               gy::YieldStackView sv) {
+      SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, wdev, per, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
     for (u32 r = 0; r < a.repeat; ++r) {
       const double ms =
           RunOnce(wdev, gpu, a.blocks, per, 0, 0, 0, false, d_sum, &got);
@@ -396,8 +434,11 @@ int main(int argc, char **argv) {
     gv::Vector<u32> hot("gv_overlap_hot", {0}, kPageBytes, a.blocks,
                         static_cast<u32>(a.pages_per_block), n);
     auto hotdev = hot.GetDevice(0);
-    SeedKernel<<<a.blocks, 32>>>(gpu, hotdev, per);
-    cudaDeviceSynchronize();
+    RunYieldable(a.blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                               gy::YieldStackView sv) {
+      SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, hotdev, per, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
 
     auto measure = [&](u32 cu) {
       double best = 1e30;
@@ -524,7 +565,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "\nCHECKSUM MISMATCH -- results above are void\n");
     return 1;
   }
-  cudaFree(d_sum);
+  ctp::GpuApi::Free(d_sum);
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 }

@@ -23,6 +23,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cmath>
@@ -33,7 +34,11 @@
 #include <thread>
 #include <vector>
 
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/gpu/yield_stack.h>
+
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
 
@@ -128,26 +133,50 @@ __global__ void InitRaw(float *u, float *v, u32 dim) {
   }
 }
 
-/** Initialise the vectors AND make every page resident (no faults later). */
+/** Initialise the vectors AND make every page resident (no faults later).
+ *
+ * A COROUTINE: this is the only kernel here that actually pages anything in,
+ * and the blocking HoldPage it used to spin in is the in-kernel-wait pattern
+ * that wedges the whole benchmark. Every block writes EVERY page -- the
+ * caches are per block, and the timed stencil grid-strides the whole grid
+ * from every block, so every block needs every page resident in its own
+ * cache. The duplicate writes store identical values and are harmless. */
+__device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
+                                     gv::DeviceVector<float> v,
+                                     gv::DeviceVector<float> uo,
+                                     gv::DeviceVector<float> vo, u32 dim) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  u64 run = 0;
+  for (u64 i = 0; i < cells; i += run) {
+    co_await u.HoldPage(i, cells - i, &run);
+    co_await v.HoldPage(i, cells - i, &run);
+    co_await uo.HoldPage(i, cells - i, &run);
+    co_await vo.HoldPage(i, cells - i, &run);
+    for (u64 k = i + threadIdx.x; k < i + run; k += blockDim.x) {
+      float a, b;
+      InitCell(k, dim, &a, &b);
+      u[k] = a;
+      v[k] = b;
+      uo[k] = a;
+      vo[k] = b;
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
                         gv::DeviceVector<float> u, gv::DeviceVector<float> v,
                         gv::DeviceVector<float> uo, gv::DeviceVector<float> vo,
-                        u32 dim) {
+                        u32 dim, gy::YieldableView<> yv,
+                        gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  const u64 cells = static_cast<u64>(dim) * dim;
-  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
-       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    float a, b;
-    InitCell(idx, dim, &a, &b);
-    u.HoldPage(idx, 1);
-    v.HoldPage(idx, 1);
-    uo.HoldPage(idx, 1);
-    vo.HoldPage(idx, 1);
-    u[idx] = a;
-    v[idx] = b;
-    uo[idx] = a;
-    vo[idx] = b;
-  }
+  u.block_override_ = yv.Block();
+  v.block_override_ = yv.Block();
+  uo.block_override_ = yv.Block();
+  vo.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(InitVecCoro(u, v, uo, vo, dim));
 }
 
 /** Copy a vector's contents out to a raw buffer, for comparison. */
@@ -170,6 +199,20 @@ double NowMs() {
   using clock = std::chrono::high_resolution_clock;
   return std::chrono::duration<double, std::milli>(
              clock::now().time_since_epoch()).count();
+}
+
+constexpr unsigned kYieldLaneBytes = 8192;
+
+/** Drive a coroutine kernel to completion: launch, service, relaunch. */
+template <typename LaunchT>
+clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
 }
 
 }  // namespace
@@ -245,16 +288,15 @@ int main(int argc, char **argv) {
       (unsigned long long) pages);
 
   // ---- raw ----
-  float *ru = nullptr, *rv = nullptr, *ru2 = nullptr, *rv2 = nullptr;
-  cudaMalloc(&ru, cells * sizeof(float));
-  cudaMalloc(&rv, cells * sizeof(float));
-  cudaMalloc(&ru2, cells * sizeof(float));
-  cudaMalloc(&rv2, cells * sizeof(float));
+  float *ru = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *rv = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *ru2 = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *rv2 = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
 
   double raw_ms = 1e30;
   for (u32 r = 0; r < repeat; ++r) {
     InitRaw<<<blocks, threads>>>(ru, rv, dim);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
     float *a = ru, *b = rv, *c = ru2, *d = rv2;
     for (u32 s = 0; s < steps; ++s) {
@@ -262,13 +304,35 @@ int main(int argc, char **argv) {
       float *ta = a; a = c; c = ta;
       float *tb = b; b = d; d = tb;
     }
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < raw_ms) raw_ms = ms;
   }
+  // The SAME stencil on ONE block: the vector run below must be single-block
+  // (its page caches are private per block, so several blocks writing
+  // interleaved cells of a shared page hold incoherent copies -- reads of
+  // cross-block neighbours then see stale values). The fair pointer baseline
+  // for it is therefore a 1-block launch, timed here; the multi-block number
+  // above stays as throughput context.
+  double raw1_ms = 1e30;
+  for (u32 r = 0; r < repeat; ++r) {
+    InitRaw<<<blocks, threads>>>(ru, rv, dim);
+    ctp::GpuApi::Synchronize();
+    const double t0 = NowMs();
+    float *a = ru, *b = rv, *c = ru2, *d = rv2;
+    for (u32 s = 0; s < steps; ++s) {
+      GrayScottRaw<<<1, threads>>>(a, b, c, d, dim);
+      float *ta = a; a = c; c = ta;
+      float *tb = b; b = d; d = tb;
+    }
+    ctp::GpuApi::Synchronize();
+    const double ms = NowMs() - t0;
+    if (ms < raw1_ms) raw1_ms = ms;
+  }
+
   // Re-run once to leave the final state in a known buffer for comparison.
   InitRaw<<<blocks, threads>>>(ru, rv, dim);
-  cudaDeviceSynchronize();
+  ctp::GpuApi::Synchronize();
   {
     float *a = ru, *b = rv, *c = ru2, *d = rv2;
     for (u32 s = 0; s < steps; ++s) {
@@ -276,7 +340,7 @@ int main(int argc, char **argv) {
       float *ta = a; a = c; c = ta;
       float *tb = b; b = d; d = tb;
     }
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     ru = a; rv = b;   // final results live here
   }
 
@@ -296,42 +360,35 @@ int main(int argc, char **argv) {
     auto du2 = vu2.GetDevice(0), dv2 = vv2.GetDevice(0);
 
     for (u32 r = 0; r < repeat; ++r) {
-      InitVec<<<blocks, threads>>>(gpu, du, dv, du2, dv2, dim);
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::fprintf(stderr, "init failed: %s\n",
-                     cudaGetErrorString(cudaGetLastError()));
-        return 1;
-      }
+      RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+        InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
+                                                 vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
       vu.ResetStats();
       const double t0 = NowMs();
       auto a = du, b = dv, c = du2, d = dv2;
       for (u32 s = 0; s < steps; ++s) {
-        GrayScottHold<<<blocks, threads>>>(gpu, a, b, c, d, dim);
+        GrayScottHold<<<1, threads>>>(gpu, a, b, c, d, dim);
         auto ta = a; a = c; c = ta;
         auto tb = b; b = d; d = tb;
       }
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::fprintf(stderr, "vec step failed: %s\n",
-                     cudaGetErrorString(cudaGetLastError()));
-        return 1;
-      }
+      ctp::GpuApi::Synchronize();
       const double ms = NowMs() - t0;
       if (ms < vec_ms) vec_ms = ms;
       if (r + 1 == repeat) {
         // Compare the vector's final state against the raw run's.
-        float *cu = nullptr, *cv = nullptr;
-        cudaMalloc(&cu, cells * sizeof(float));
-        cudaMalloc(&cv, cells * sizeof(float));
-        VecToRaw<<<blocks, threads>>>(gpu, a, cu, dim);
-        VecToRaw<<<blocks, threads>>>(gpu, b, cv, dim);
-        cudaDeviceSynchronize();
+        float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+        float *cv = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+        VecToRaw<<<1, threads>>>(gpu, a, cu, dim);
+        VecToRaw<<<1, threads>>>(gpu, b, cv, dim);
+        ctp::GpuApi::Synchronize();
         std::vector<float> hu(cells), hv(cells), hru(cells), hrv(cells);
-        cudaMemcpy(hu.data(), cu, cells * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(hv.data(), cv, cells * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(hru.data(), ru, cells * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        cudaMemcpy(hrv.data(), rv, cells * sizeof(float),
-                   cudaMemcpyDeviceToHost);
+        ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hv.data(), cv, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hru.data(), ru, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hrv.data(), rv, cells * sizeof(float));
         u64 bad = 0;
         double worst = 0.0;
         for (u64 i = 0; i < cells; ++i) {
@@ -348,39 +405,36 @@ int main(int argc, char **argv) {
           std::fprintf(stderr, "RESULTS DISAGREE -- timings are void\n");
           return 1;
         }
-        cudaFree(cu);
-        cudaFree(cv);
+        ctp::GpuApi::Free(cu);
+        ctp::GpuApi::Free(cv);
       }
     }
     // ---- fast path, when each field is a single page ----
     if (pages == 1) {
       for (u32 r = 0; r < repeat; ++r) {
-        InitVec<<<blocks, threads>>>(gpu, du, dv, du2, dv2, dim);
-        cudaDeviceSynchronize();
+        RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                            gy::YieldStackView sv) {
+          InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
+                                                   vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
         const double t0 = NowMs();
         auto a = du, b = dv, c = du2, d = dv2;
         for (u32 s2 = 0; s2 < steps; ++s2) {
-          GrayScottHold<<<blocks, threads>>>(gpu, a, b, c, d, dim);
+          GrayScottHold<<<1, threads>>>(gpu, a, b, c, d, dim);
           auto ta = a; a = c; c = ta;
           auto tb = b; b = d; d = tb;
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-          std::fprintf(stderr, "hold step failed: %s\n",
-                       cudaGetErrorString(cudaGetLastError()));
-          return 1;
-        }
+        ctp::GpuApi::Synchronize();
         const double ms = NowMs() - t0;
         if (ms < hold_ms) hold_ms = ms;
         if (r + 1 == repeat) {
-          float *cu = nullptr;
-          cudaMalloc(&cu, cells * sizeof(float));
-          VecToRaw<<<blocks, threads>>>(gpu, a, cu, dim);
-          cudaDeviceSynchronize();
+          float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+          VecToRaw<<<1, threads>>>(gpu, a, cu, dim);
+          ctp::GpuApi::Synchronize();
           std::vector<float> hu(cells), hru(cells);
-          cudaMemcpy(hu.data(), cu, cells * sizeof(float),
-                     cudaMemcpyDeviceToHost);
-          cudaMemcpy(hru.data(), ru, cells * sizeof(float),
-                     cudaMemcpyDeviceToHost);
+          ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));
+          ctp::GpuApi::Memcpy(hru.data(), ru, cells * sizeof(float));
           u64 bad = 0;
           for (u64 i = 0; i < cells; ++i) {
             if (std::fabs(hu[i] - hru[i]) > 1e-5) ++bad;
@@ -391,7 +445,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "HOLD RESULTS DISAGREE -- timings void\n");
             return 1;
           }
-          cudaFree(cu);
+          ctp::GpuApi::Free(cu);
         }
       }
     }
@@ -406,18 +460,22 @@ int main(int argc, char **argv) {
   const double accesses =
       static_cast<double>(cells) * static_cast<double>(steps) * 12.0;
   std::printf(
-      "\n  raw pointer      %8.2f ms   (%.2f ns/access)\n"
-      "  gpu_vector       %8.2f ms   (%.2f ns/access)\n"
-      "  slowdown         %8.2fx\n"
+      "\n  raw pointer      %8.2f ms   (%.2f ns/access, %u blocks)\n"
+      "  raw 1-block      %8.2f ms   (%.2f ns/access)\n"
+      "  gpu_vector       %8.2f ms   (%.2f ns/access, 1 block: per-block "
+      "caches)\n"
+      "  slowdown         %8.2fx   (vs raw 1-block, same launch)\n"
       "  added cost       %8.2f ns/access\n",
-      raw_ms, raw_ms * 1e6 / accesses, vec_ms, vec_ms * 1e6 / accesses,
-      vec_ms / raw_ms, (vec_ms - raw_ms) * 1e6 / accesses);
+      raw_ms, raw_ms * 1e6 / accesses, blocks, raw1_ms,
+      raw1_ms * 1e6 / accesses, vec_ms, vec_ms * 1e6 / accesses,
+      vec_ms / raw1_ms, (vec_ms - raw1_ms) * 1e6 / accesses);
   if (hold_ms < 1e29) {
     std::printf(
         "  gpu_vector+Hold  %8.2f ms   (%.2f ns/access)\n"
         "  slowdown vs raw  %8.2fx\n"
         "  speedup vs fault %8.2fx\n",
-        hold_ms, hold_ms * 1e6 / accesses, hold_ms / raw_ms, vec_ms / hold_ms);
+        hold_ms, hold_ms * 1e6 / accesses, hold_ms / raw1_ms,
+        vec_ms / hold_ms);
   } else {
     std::printf("  gpu_vector+Hold      n/a   (needs 1 page/field; use "
                 "--page-kb >= field size)\n");
