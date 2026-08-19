@@ -42,7 +42,11 @@ namespace gy = clio::run::gpu;
 template <typename LaunchT>
 static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  // 8 KB lanes, not 256 B: the stress kernel is a C++20 COROUTINE now and
+  // its frame lives on this lane -- a macro-era 256-byte lane overflows on
+  // the first co_await and traps. The macro seed kernel shares the driver
+  // and simply leaves the extra room unused.
+  gy::YieldStack stack(nblocks, 32, 8192);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
@@ -101,98 +105,93 @@ __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
 }
 
 /**
- * err[0]  mismatch count
- * err[1]  first bad page
- * err[2]  got (element 0 of the bad read)
- * err[3]  want
+ * The concurrency stressor, as a COROUTINE. The original was a plain
+ * kernel that camped idle warps on a shared flag to saturate the SMs and
+ * then took BLOCKING in-kernel waits (HoldRawConst after a miss, the
+ * synchronous batched fetch) -- a deliberate recreation of the llama
+ * wedge. That design is the exact anti-pattern the coroutine machinery
+ * abolishes: a resident kernel must never wait on work the host (or the
+ * GPU's own copy/launch path) still has to do. What the test PROTECTS is
+ * still fully exercised here -- concurrent demand faults, fire-and-forget
+ * prefetches of unrelated ranges, evictions recycling slots mid-read, and
+ * generation-validated long raw reads that catch a slot being re-tenanted
+ * under a reader -- but every wait is a suspension.
+ *
+ * err[0] mismatches, err[1] first bad page, err[2] got, err[3] want.
  */
-__global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
-                                 gv::DeviceVector<clio::run::u32> v,
-                                 clio::run::u64 total_pages, int iters,
-                                 unsigned long long *err) {
-  CLIO_GPU_INIT(info, nullptr);
-  // SM SATURATION: idle warps stay RESIDENT (camped on a shared flag) for
-  // the kernel's whole life — the llama wedge ingredient a thread0-only
-  // grid lacks. With SMs empty, UVM migrations of the managed gpu2cpu
-  // queue schedule freely and the wedge never fires; saturated, a stalled
-  // migration freezes the copy engines (the captured mechanism).
-  __shared__ volatile int s_done;
-  if (threadIdx.x == 0) s_done = 0;
-  __syncthreads();
-  if (threadIdx.x != 0) {
-    while (!s_done) {
-    }
-    return;
-  }
-
-  // Raw storage: VecHeader has default member initializers, and clang
-  // (unlike nvcc) rejects any __shared__ variable whose type requires
-  // construction. The word-copy below fills it before first use.
-  __shared__ alignas(gv::VecHeader) unsigned char
-      s_hdr_raw[sizeof(gv::VecHeader)];
-  gv::VecHeader &s_hdr = *reinterpret_cast<gv::VecHeader *>(s_hdr_raw);
-  {
-    const unsigned long long *hsrc = (const unsigned long long *) v.h_;
-    unsigned long long *hdst = (unsigned long long *) &s_hdr;
-    constexpr unsigned kWords =
-        (unsigned) (sizeof(gv::VecHeader) / sizeof(unsigned long long));
-    for (unsigned w = 0; w < kWords; ++w) hdst[w] = hsrc[w];
-    for (unsigned b = kWords * 8u; b < sizeof(gv::VecHeader); ++b)
-      ((char *) &s_hdr)[b] = ((const char *) v.h_)[b];
-  }
-  v.h_ = &s_hdr;
-
-  // Per-block LCG stream so blocks collide on pages but not in lockstep.
-  unsigned int rng = 1234567u + 97u * blockIdx.x;
+__device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
+                                        clio::run::u64 total_pages, int iters,
+                                        unsigned long long *err,
+                                        clio::run::u32 block) {
+  unsigned int rng = 1234567u + 97u * block;
   for (int it = 0; it < iters; ++it) {
     rng = rng * 1664525u + 1013904223u;
     const clio::run::u64 pn = rng % total_pages;
-    v.block_override_ = (clio::run::u32) (pn % s_hdr.nblocks_);
+    v.block_override_ = (clio::run::u32) (pn % v.h_->nblocks_);
 
-    // Async prefetch of an unrelated page range every few iterations —
-    // the long in-flight window is what widens claim races enough to fire.
+    // Fire-and-forget prefetch of an unrelated range every iteration --
+    // the long in-flight window is what widens claim races enough to
+    // fire. Score 1.0 == make resident; block-collective.
     {
       rng = rng * 1664525u + 1013904223u;
       const clio::run::u64 pf = rng % total_pages;
-      v.block_override_ = (clio::run::u32) (pf % s_hdr.nblocks_);
-      gv::DeviceVectorTestAccess::FetchPagesBatchedAsync(v, pf, 4);
-      v.block_override_ = (clio::run::u32) (pn % s_hdr.nblocks_);
+      v.block_override_ = (clio::run::u32) (pf % v.h_->nblocks_);
+      v.RescorePagesBatchedAsync(4u, [pf, total_pages](clio::run::u32 i) {
+        return gv::PageScore{(pf + i) % total_pages, 1.0f};
+      });
+      v.block_override_ = (clio::run::u32) (pn % v.h_->nblocks_);
     }
 
+    // Demand access: suspend until resident, then take a RAW pointer with
+    // its claim generation and read across a long window. Nothing pins a
+    // held page, so a sibling's claim can re-tenant the slot mid-read --
+    // the generation check below is what must catch that.
     clio::run::u64 run = 0;
-    const clio::run::u32 *q =
-        v.TryHoldRawConst(pn * kPageElems, kPageElems, &run);
-    if (q == nullptr) {
-      gv::DeviceVectorTestAccess::FetchPagesBatched(v, pn, 1);
-      q = v.HoldRawConst(pn * kPageElems, kPageElems, &run);
-    }
-    if (q == nullptr) continue;  // window pinned; not a data error
-    // LONG READ: hold the raw pointer across ~50 us of "compute" before
-    // verifying — the MoE row loop's shape. Nothing pins a held page, so
-    // another block's claim (sync fault or async prefetch) can evict and
-    // recycle this slot mid-read; the verify below then sees another
-    // page's bytes.
-    {
-      const long long t0 = clock64();
-      while (clock64() - t0 < 100000) {
-      }
-    }
-    // Verify a sample of the page (first, middle, last of the run).
-    const clio::run::u64 idx[3] = {0, run / 2, run - 1};
-    for (int k = 0; k < 3; ++k) {
-      const clio::run::u64 el = pn * kPageElems + idx[k];
-      const clio::run::u32 want = Seed(el);
-      const clio::run::u32 got = q[idx[k]];
-      if (got != want) {
-        if (atomicAdd(err, 1ull) == 0) {
-          err[1] = pn;
-          err[2] = got;
-          err[3] = want;
+    co_await v.HoldPage(pn * kPageElems, kPageElems, &run);
+    if (threadIdx.x == 0 && run != 0) {
+      clio::run::u32 gen = 0;
+      gv::Page *slot = nullptr;
+      const clio::run::u32 *q = v.TryHoldRawConstG(pn * kPageElems, kPageElems,
+                                                   &run, &gen, &slot);
+      if (q != nullptr && run != 0) {
+        // LONG READ: ~50 us of "compute" while holding the raw pointer.
+        const long long t0 = clock64();
+        while (clock64() - t0 < 100000) {
+        }
+        const clio::run::u64 idx[3] = {0, run / 2, run - 1};
+        clio::run::u32 got[3];
+        for (int k = 0; k < 3; ++k) got[k] = q[idx[k]];
+        // Only a read that SURVIVED its claim generation may be judged:
+        // a recycled slot is the expected hazard, not a data error.
+        if (v.HoldStillValid(slot, gen)) {
+          for (int k = 0; k < 3; ++k) {
+            const clio::run::u64 el = pn * kPageElems + idx[k];
+            const clio::run::u32 want = Seed(el);
+            if (got[k] != want) {
+              if (atomicAdd(err, 1ull) == 0) {
+                err[1] = pn;
+                err[2] = got[k];
+                err[3] = want;
+              }
+            }
+          }
         }
       }
     }
+    __syncthreads();
   }
-  s_done = 1;   // release the camped warps
+}
+
+__global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<clio::run::u32> v,
+                                 clio::run::u64 total_pages, int iters,
+                                 unsigned long long *err,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RaceStressCoro(v, total_pages, iters, err, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -334,9 +333,19 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   REQUIRE(cudaMalloc(&err, 4 * sizeof(unsigned long long)) == cudaSuccess);
   REQUIRE(cudaMemset(err, 0, 4 * sizeof(unsigned long long)) == cudaSuccess);
 
-  RaceStressKernel<<<kBlocks, 256>>>(gpu_info, vec.GetDevice(0), kTotalPages,
-                                     kIters, err);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                            gy::YieldStackView sv) {
+    RaceStressKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu_info, vec.GetDevice(0), kTotalPages, kIters, err, vw, sv);
+  });
+  {
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+      std::fprintf(stderr, "[race] CUDA ERROR after stress: %s\n",
+                   cudaGetErrorString(e));
+    }
+    REQUIRE(e == cudaSuccess);
+  }
 
   unsigned long long h[4] = {0};
   REQUIRE(cudaMemcpy(h, err, sizeof(h), cudaMemcpyDeviceToHost) ==

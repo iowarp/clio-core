@@ -43,7 +43,9 @@ namespace gy = clio::run::gpu;
 template <typename LaunchT>
 static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  // 8192, not the macro-era 256: real coroutine frames (PrefetchWalkCoro)
+  // spill into the lane and overflow anything page-thin.
+  gy::YieldStack stack(nblocks, 32, 8192);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
@@ -118,7 +120,7 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
     CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run));
     unsigned long long local = 0;
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      if (v[off + i + k] != Val(off + i + k, salt)) ++local;
+      if (v.at(off + i + k) != Val(off + i + k, salt)) ++local;
     }
     if (local != 0) atomicAdd(bad, local);
   }
@@ -259,8 +261,9 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
     n = npages - k;
     if (n > chunk) n = chunk;
     if (threadIdx.x == 0) {
-      atomicAdd(got, static_cast<unsigned long long>(
-                         gv::DeviceVectorTestAccess::FetchPagesBatched(v, k, static_cast<u32>(n))));
+      const u32 g = gv::DeviceVectorTestAccess::FetchPagesBatched(
+          v, k, static_cast<u32>(n));
+      atomicAdd(got, static_cast<unsigned long long>(g));
     }
     __syncthreads();
     for (j = 0; j < n; ++j) {
@@ -270,7 +273,7 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
         const u64 off = (k + j) * v.h_->elems_per_page_;
         unsigned long long local = 0;
         for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
-          if (v[off + i] != Val(off + i, salt)) ++local;
+          if (v.at(off + i) != Val(off + i, salt)) ++local;
         }
         if (local != 0) atomicAdd(bad, local);
       }
@@ -398,6 +401,33 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
  * prefetch that lands in the wrong slot, or that a demand fault re-issues on
  * top of, produces wrong data rather than a slow run.
  */
+__device__ gy::YCoroMain PrefetchWalkCoro(gv::DeviceVector<u32> v, u64 count,
+                                          u32 salt, unsigned long long *bad,
+                                          u32 block) {
+  const u64 slice = static_cast<u64>(block) * count;
+  const u64 pages = count / v.h_->elems_per_page_;
+  const u64 first = slice / v.h_->elems_per_page_;
+  u64 run = 0;
+  for (u64 p = 0; p < pages; ++p) {
+    // Hint the NEXT page before touching this one -- score 1.0 means "make
+    // resident", which is the batched prefetch. HoldPage's pin is what
+    // protects the page being read; no explicit rescore needed.
+    if (p + 1 < pages) {
+      const u64 np = first + p + 1;
+      v.RescorePagesBatchedAsync(
+          1u, [np](u32) { return gv::PageScore{np, 1.0f}; });
+    }
+    const u64 off = slice + p * v.h_->elems_per_page_;
+    co_await v.HoldPage(off, v.h_->elems_per_page_, &run);
+    unsigned long long local = 0;
+    for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
+      if (v.at(off + i) != Val(off + i, salt)) ++local;
+    }
+    if (local != 0) atomicAdd(bad, local);
+    __syncthreads();
+  }
+}
+
 __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 count,
                                    u32 salt, unsigned long long *bad,
@@ -405,40 +435,9 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
                                    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, p, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const u64 slice = static_cast<u64>(yv.Block()) * count;
-  const u64 pages = count / v.h_->elems_per_page_;
-  const u64 first = slice / v.h_->elems_per_page_;
-
-  CLIO_YBEGIN();
-  for (; p < pages; ++p) {
-    // Prefetch + pin the page about to be read, from ONE lane: both are
-    // metadata hints and every lane sending them is pure duplication.
-    if (threadIdx.x == 0) {
-      if (p + 1 < pages) v.BeginFetch(first + p + 1);
-      v.RescorePage(first + p, 1000.0f);
-    }
-    __syncthreads();
-    CLIO_YCALL(v.HoldPageYield(slice + p * v.h_->elems_per_page_,
-                               v.h_->elems_per_page_, &run));
-    {
-      const u64 off = slice + p * v.h_->elems_per_page_;
-      unsigned long long local = 0;
-      for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
-        if (v[off + i] != Val(off + i, salt)) ++local;
-      }
-      if (local != 0) atomicAdd(bad, local);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      v.RescorePage(first + p, -1000.0f);
-    }
-    __syncthreads();
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(PrefetchWalkCoro(v, count, salt, bad, yv.Block()));
 }
 
 /** Rescore the same page repeatedly, hammering the fire-and-forget slot. */
@@ -618,6 +617,14 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1, vw_, sv_);
     });
     Sync();
+    // FLUSH before dropping. The claim path stopped dropping dirty victims
+    // long after this test was written, and DropAll discards dirty pages
+    // WITHOUT writeback by design -- so without this flush the last
+    // cache-full of pages never reaches its blobs, their batch records
+    // fail rc, and the fetched-count assertion below reads short even
+    // though the (demand-faulted) content checks still pass.
+    FlushKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems);
+    cudaDeviceSynchronize();
     DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
     Sync();
 

@@ -33,9 +33,13 @@
 #include <thread>
 #include <vector>
 
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/gpu/yield_stack.h>
+
 #include "simple_test.h"
 
 namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
 
 namespace {
 
@@ -46,8 +50,11 @@ constexpr clio::run::u64 kPageElems = kPageBytes / sizeof(clio::run::u32);
 const clio::run::PoolId kCompressorPool(512, 0);
 const clio::run::PoolId kCorePool(513, 0);
 
-/** lz4's CTE wire id (CompressionFactory's registry: {"lz4", 4, ...}). */
-constexpr int kLz4WireId = 4;
+/** nvcomp-lz4's CTE wire id (CompressionFactory: {"nvcomp-lz4", 11, ...}).
+ * The GPU codec, not CPU lz4 (id 4): this build has CTP_ENABLE_LZ4=OFF, so
+ * id 4 constructs a null compressor and silently stores pass-through -- and
+ * the gpu_vector requirement is GPU codecs anyway. */
+constexpr int kLz4WireId = 11;
 
 /**
  * A model weight at index i.
@@ -68,90 +75,157 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Activation(clio::run::u64 i) {
 
 }  // namespace
 
-/** Write the weights, then flush them so they land in the CTE. */
+/** Write the weights, then flush them so they land in the CTE.
+ *
+ * A COROUTINE, not a blocking kernel. The original spun in-kernel inside
+ * the blocking HoldPage until each fault was served -- but the compressor
+ * services faults by LAUNCHING KERNELS (nvcomp), and an indefinitely
+ * resident spinning kernel blocks every later launch in the context: the
+ * classic in-kernel-wait deadlock, and the reason this test hung for as
+ * long as it existed. The coroutine suspends instead -- the kernel EXITS,
+ * the compressor runs, the driver relaunches -- so there is nothing left
+ * to deadlock against. */
+__device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
+                                         clio::run::u64 per,
+                                         clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  clio::run::u64 run = 0;
+  for (clio::run::u64 i = 0; i < per; i += run) {
+    co_await v.HoldPage(base + i, per - i, &run);
+    if (threadIdx.x == 0) {
+      for (clio::run::u64 k = 0; k < run; ++k) {
+        v[base + i + k] = Weight(base + i + k);
+      }
+    }
+    __syncthreads();
+  }
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void SeedWeightsKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceVector<clio::run::u32> v,
-                                  clio::run::u64 per) {
+                                  clio::run::u64 per, gy::YieldableView<> yv,
+                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[base + i] = Weight(base + i);
-      }
-  }
-  v.BeginFlush(base, per);
-  v.WaitFlush(base, per);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SeedWeightsCoro(v, per, yv.Block()));
 }
 
 /**
  * The weights calculation: sum(w[i] * activation(i)) over this block's slice,
  * read back through the vector. With a cache smaller than the slice this
  * faults every page, which is where the codec gets exercised repeatedly.
+ * Coroutine form: every fault suspends instead of spinning (see
+ * SeedWeightsCoro for why that is the difference between running and
+ * deadlocking against the compressor's own kernel launches).
  */
+__device__ gy::YCoroMain WeightsDotCoro(gv::DeviceVector<clio::run::u32> v,
+                                        clio::run::u64 per,
+                                        unsigned long long *sum,
+                                        clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  unsigned long long acc = 0;
+  clio::run::u64 run = 0;
+  for (clio::run::u64 i = 0; i < per; i += run) {
+    co_await v.HoldPage(base + i, per - i, &run);
+    if (threadIdx.x == 0) {
+      for (clio::run::u64 k = 0; k < run; ++k) {
+        acc += static_cast<unsigned long long>(v.at(base + i + k)) *
+               Activation(base + i + k);
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) atomicAdd(sum, acc);
+}
+
 __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<clio::run::u32> v,
-                                 clio::run::u64 per,
-                                 unsigned long long *sum) {
+                                 clio::run::u64 per, unsigned long long *sum,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  unsigned long long acc = 0;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      acc += static_cast<unsigned long long>(v.at(base + i)) *
-             Activation(base + i);
-      }
-  }
-  atomicAdd(sum, acc);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WeightsDotCoro(v, per, sum, yv.Block()));
 }
 
 /**
  * Same dot product, but the pages are faulted in CHUNKS via the batched get
- * rather than one at a time.
- *
- * The batched path is now the fault path, and it reaches the compressor as a
- * PodMultiGetBlob rather than N PodGetBlobs -- a different task, a different
- * handler, and a different record-to-page mapping. A codec that decompressed
- * into the wrong record's page would still return plausible page-sized data,
- * so the check has to be an exact whole-vector calculation, not a per-page
- * checksum.
+ * rather than one at a time -- issued through RescorePagesBatchedAsync
+ * (score 1.0 == make resident), which reaches the compressor as a
+ * PodMultiGetBlob rather than N PodGetBlobs: a different task, a different
+ * handler, and a different record-to-page mapping. A codec that
+ * decompressed into the wrong record's page would still return plausible
+ * page-sized data, so the check has to be an exact whole-vector
+ * calculation, not a per-page checksum. The old form waited INSIDE the
+ * kernel on the synchronous batched fetch; this one never waits anywhere
+ * but a coroutine suspension.
  */
-__global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
-                                        gv::DeviceVector<clio::run::u32> v,
-                                        clio::run::u64 per, clio::run::u32 chunk,
-                                        unsigned long long *sum) {
-  CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
+__device__ gy::YCoroMain WeightsDotBatchedCoro(
+    gv::DeviceVector<clio::run::u32> v, clio::run::u64 per,
+    clio::run::u32 chunk, unsigned long long *sum, clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   const clio::run::u64 first_page = base / v.h_->elems_per_page_;
   const clio::run::u64 npages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
-  // HoldPage before indexing: operator[] deliberately does NO resolution (that
-  // is the whole point of the hold), so indexing straight after a batched
-  // fetch dereferences this thread's stale page cache. Costs an illegal
-  // access, not a wrong answer, which is at least loud.
-  for (clio::run::u64 p = 0; p < npages; p += chunk) {
-    clio::run::u64 n = npages - p;
+  clio::run::u64 run = 0;
+  for (clio::run::u64 p0 = 0; p0 < npages; p0 += chunk) {
+    clio::run::u64 n = npages - p0;
     if (n > chunk) n = chunk;
-    gv::DeviceVectorTestAccess::FetchPagesBatched(v, first_page + p, static_cast<clio::run::u32>(n));
+    const clio::run::u64 fp = first_page + p0;
+    v.RescorePagesBatchedAsync(
+        static_cast<clio::run::u32>(n),
+        [fp](clio::run::u32 i) { return gv::PageScore{fp + i, 1.0f}; });
     for (clio::run::u64 j = 0; j < n; ++j) {
-      const clio::run::u64 off = base + (p + j) * v.h_->elems_per_page_;
-      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {
-        const clio::run::u64 run_i = v.HoldPage(off + i, v.h_->elems_per_page_ - i);
-        for (clio::run::u64 k = 0; k < run_i; ++k, ++i) {
-          acc += static_cast<unsigned long long>(v.at(off + i)) *
-                 Activation(off + i);
+      const clio::run::u64 off = base + (p0 + j) * v.h_->elems_per_page_;
+      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_; i += run) {
+        co_await v.HoldPage(off + i, v.h_->elems_per_page_ - i, &run);
+        if (threadIdx.x == 0) {
+          for (clio::run::u64 k = 0; k < run; ++k) {
+            acc += static_cast<unsigned long long>(v.at(off + i + k)) *
+                   Activation(off + i + k);
+          }
         }
+        __syncthreads();
       }
     }
   }
-  atomicAdd(sum, acc);
+  if (threadIdx.x == 0) atomicAdd(sum, acc);
+}
+
+__global__ void WeightsDotBatchedKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<clio::run::u32> v,
+    clio::run::u64 per, clio::run::u32 chunk, unsigned long long *sum,
+    gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WeightsDotBatchedCoro(v, per, chunk, sum, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
+
+namespace {
+constexpr unsigned kYieldLaneBytes = 8192;
+
+/** Drive a coroutine kernel to completion: launch, service, relaunch. */
+template <typename LaunchT>
+clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000);
+}
+}  // namespace
 
 namespace {
 
@@ -221,7 +295,7 @@ TEST_CASE("gpu_vector: model weights through the compression path",
 
   struct Config {
     const char *name;
-    int codec;                       // 0 = store raw, 4 = lz4
+    int codec;                       // 0 = store raw, 11 = nvcomp-lz4
     clio::run::u32 pages_per_block;  // device cache slots
     clio::run::u64 pages;            // pages the block walks
     unsigned nblocks;
@@ -256,18 +330,28 @@ TEST_CASE("gpu_vector: model weights through the compression path",
                                    c.pages_per_block, n, kCompressorPool,
                                    c.codec);
 
-    SeedWeightsKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0), per);
+    RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+      SeedWeightsKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu_info, vec.GetDevice(0), per, vw, sv);
+    });
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
     unsigned long long *d_sum = nullptr;
     REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
     REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
     if (c.chunk > 0) {
-      WeightsDotBatchedKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0),
-                                                 per, c.chunk, d_sum);
+      RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+        WeightsDotBatchedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu_info, vec.GetDevice(0), per, c.chunk, d_sum, vw, sv);
+      });
     } else {
-      WeightsDotKernel<<<c.nblocks, 32>>>(gpu_info, vec.GetDevice(0), per,
-                                          d_sum);
+      RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+        WeightsDotKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu_info, vec.GetDevice(0), per, d_sum, vw, sv);
+      });
     }
     {
       const cudaError_t e = cudaDeviceSynchronize();

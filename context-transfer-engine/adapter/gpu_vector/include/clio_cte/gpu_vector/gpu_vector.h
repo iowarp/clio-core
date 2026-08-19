@@ -16,6 +16,7 @@
 #define CLIO_CTE_GPU_VECTOR_GPU_VECTOR_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
@@ -188,10 +189,11 @@ class Vector {
   void PublishHeader(DevState &st) {
 #if CTP_ENABLE_CUDA
     if (st.d_hdr == nullptr &&
-        cudaMalloc(&st.d_hdr, sizeof(VecHeader)) != cudaSuccess) {
+        (st.d_hdr = ctp::GpuApi::Malloc<VecHeader>(sizeof(VecHeader))) ==
+            nullptr) {
       throw std::runtime_error("gpu_vector: header allocation failed");
     }
-    cudaMemcpy(st.d_hdr, &st.hdr, sizeof(VecHeader), cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(st.d_hdr, &st.hdr, sizeof(VecHeader));
     st.view.h_ = st.d_hdr;
 #endif
   }
@@ -202,10 +204,10 @@ class Vector {
       if (kv.second.stats != nullptr) continue;
       void *mem = nullptr;
       const size_t bytes = kNumStats * sizeof(unsigned long long);
-      if (cudaMalloc(&mem, bytes) != cudaSuccess) {
+      if ((mem = ctp::GpuApi::Malloc<char>(bytes)) == nullptr) {
         throw std::runtime_error("gpu_vector: stats allocation failed");
       }
-      cudaMemset(mem, 0, bytes);
+      ctp::GpuApi::Memset(mem, 0, bytes);
       auto *c = static_cast<unsigned long long *>(mem);
       kv.second.stats = c;
       kv.second.hdr.stat_faults_ = c;
@@ -225,8 +227,9 @@ class Vector {
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
         const clio::run::u64 npg = NumPagesOf(kv.second.hdr);
         void *hm = nullptr;
-        if (cudaMalloc(&hm, npg * sizeof(unsigned int)) == cudaSuccess) {
-          cudaMemset(hm, 0, npg * sizeof(unsigned int));
+        hm = ctp::GpuApi::Malloc<unsigned int>(npg * sizeof(unsigned int));
+        if (hm != nullptr) {
+          ctp::GpuApi::Memset(hm, 0, npg * sizeof(unsigned int));
           kv.second.hdr.fault_hist_ = static_cast<unsigned int *>(hm);
         }
       }
@@ -281,13 +284,13 @@ class Vector {
         ++found;
       }
     }
-    void *dev_esz = nullptr;
-    if (cudaMalloc(&dev_esz, enp * sizeof(unsigned long long)) !=
-        cudaSuccess) {
+    unsigned long long *dev_esz = ctp::GpuApi::Malloc<unsigned long long>(
+        enp * sizeof(unsigned long long));
+    if (dev_esz == nullptr) {
       return 0;
     }
-    cudaMemcpy(dev_esz, esz.data(), enp * sizeof(unsigned long long),
-               cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy<unsigned long long>(dev_esz, esz.data(),
+                                            enp * sizeof(unsigned long long));
     for (auto &kv : devs_) {
       // Successive retries leak the previous table (enp * 8 bytes); accepted
       // until the retry loop moves inside (issue #966 cleanup).
@@ -305,7 +308,8 @@ class Vector {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) {
-        cudaMemset(kv.second.stats, 0, kNumStats * sizeof(unsigned long long));
+        ctp::GpuApi::Memset(kv.second.stats, 0,
+                            kNumStats * sizeof(unsigned long long));
       }
     }
 #endif
@@ -319,8 +323,8 @@ class Vector {
     if (it == devs_.end() || it->second.hdr.fault_hist_ == nullptr) return h;
     const clio::run::u64 npg = NumPagesOf(it->second.hdr);
     h.resize(npg);
-    cudaMemcpy(h.data(), it->second.hdr.fault_hist_,
-               npg * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(h.data(), it->second.hdr.fault_hist_,
+                        npg * sizeof(unsigned int));
 #endif
     return h;
   }
@@ -331,7 +335,7 @@ class Vector {
     auto it = devs_.find(dev_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
     unsigned long long h[kNumStats] = {0};
-    cudaMemcpy(h, it->second.stats, sizeof(h), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.faults = h[0];
     s.puts = h[1];
     s.evicts = h[2];
@@ -598,8 +602,9 @@ class Vector {
     // One device-global counter per vector, feeding unique task ids.
     void *seq = nullptr;
 #if CTP_ENABLE_CUDA
-    if (cudaMalloc(&seq, sizeof(unsigned long long)) == cudaSuccess) {
-      cudaMemset(seq, 0, sizeof(unsigned long long));
+    seq = ctp::GpuApi::Malloc<void>(sizeof(unsigned long long));
+    if (seq != nullptr) {
+      ctp::GpuApi::Memset(seq, 0, sizeof(unsigned long long));
     } else {
       seq = nullptr;
     }
@@ -608,8 +613,9 @@ class Vector {
     // One page-table lock per block, zeroed (0 == free).
     void *locks = nullptr;
 #if CTP_ENABLE_CUDA
-    if (cudaMalloc(&locks, nblocks_ * sizeof(int)) == cudaSuccess) {
-      cudaMemset(locks, 0, nblocks_ * sizeof(int));
+    locks = ctp::GpuApi::Malloc<void>(nblocks_ * sizeof(int));
+    if (locks != nullptr) {
+      ctp::GpuApi::Memset(locks, 0, nblocks_ * sizeof(int));
     } else {
       throw std::runtime_error("gpu_vector: page-table lock allocation failed");
     }
@@ -622,8 +628,9 @@ class Vector {
     if (std::getenv("CLIO_GV_NO_XFERCNT") != nullptr) {
       // Bisect switch: null counter -> XferIdle() always false -> the scans
       // run unconditionally, exactly the pre-counter behavior.
-    } else if (cudaMalloc(&xfers, nblocks_ * sizeof(unsigned int)) == cudaSuccess) {
-      cudaMemset(xfers, 0, nblocks_ * sizeof(unsigned int));
+    } else if ((xfers = ctp::GpuApi::Malloc<void>(
+                    nblocks_ * sizeof(unsigned int))) != nullptr) {
+      ctp::GpuApi::Memset(xfers, 0, nblocks_ * sizeof(unsigned int));
     } else {
       throw std::runtime_error("gpu_vector: xfer counter allocation failed");
     }
@@ -667,8 +674,9 @@ class Vector {
 
   static void UploadTable(const std::vector<Page> &table, void *dst) {
 #if CTP_ENABLE_CUDA
-    cudaMemcpy(dst, table.data(), table.size() * sizeof(Page),
-               cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy<char>(static_cast<char *>(dst),
+                              reinterpret_cast<const char *>(table.data()),
+                              table.size() * sizeof(Page));
 #else
     (void) table;
     (void) dst;
@@ -677,7 +685,7 @@ class Vector {
 
   static void UploadBytes(const void *src, void *dst, clio::run::u64 bytes) {
 #if CTP_ENABLE_CUDA
-    cudaMemcpy(dst, src, static_cast<size_t>(bytes), cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(dst, src, static_cast<size_t>(bytes));
 #else
     (void) src;
     (void) dst;
@@ -713,17 +721,17 @@ class Vector {
     st.multi_tbl_alloc = ctp::ipc::AllocatorId::GetNull();
 #if CTP_ENABLE_CUDA
     if (st.stats != nullptr) {
-      cudaFree(st.stats);
+      ctp::GpuApi::Free(st.stats);
       st.stats = nullptr;
     }
     if (st.hdr.task_seq_ != nullptr) {
-      cudaFree(st.hdr.task_seq_);
+      ctp::GpuApi::Free(st.hdr.task_seq_);
     }
     if (st.hdr.block_locks_ != nullptr) {
-      cudaFree(st.hdr.block_locks_);
+      ctp::GpuApi::Free(st.hdr.block_locks_);
     }
     if (st.hdr.xfer_cnt_ != nullptr) {
-      cudaFree(st.hdr.xfer_cnt_);
+      ctp::GpuApi::Free(st.hdr.xfer_cnt_);
     }
 #endif
     st.hdr.block_locks_ = nullptr;
