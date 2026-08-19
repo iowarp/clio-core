@@ -32,21 +32,20 @@
  */
 
 /**
- * RoundRobinAllocator GPU unit test with CDP child kernels.
+ * RoundRobinAllocator GPU unit test: concurrent device-side alloc/free.
  *
- * Tests the exact pattern used by the GPU orchestrator:
- *   1. Parent kernel initializes the RoundRobinAllocator
- *   2. Parent launches N CDP child kernels concurrently
- *   3. Each child claims a partition, allocates, writes, reads, frees
- *   4. Verify no corruption across concurrent child kernels
+ * N child blocks run CONCURRENTLY in one grid; each claims a partition,
+ * allocates, writes a unique pattern, reads it back, and frees. Cross-block
+ * corruption is what the test exists to catch.
  *
- * CDP flavor: CUDA 12 removed the device-side cudaDeviceSynchronize() that CDP1
- * used to join child grids (it is not even declared for __CUDA_ARCH__ >= 900,
- * so forcing CDP1 cannot bring it back on Hopper). The parent therefore uses
- * CDP2: children go to the fire-and-forget stream and the completion work is
- * tail-launched, which the runtime schedules only after the parent grid and all
- * of its fire-and-forget children have finished. Pre-CDP2 toolkits (CUDA < 12,
- * where cudaStreamFireAndForget is not defined) keep the old CDP1 path.
+ * HOST-launched children, not CDP. This used a CDP parent (fire-and-forget
+ * children + tail launch), but the concurrency under test is the same either
+ * way -- what matters is that the child blocks contend for the allocator at
+ * the same time -- and nothing in production launches device-side (no
+ * cudaStreamFireAndForget outside this file). CDP was also unbuildable under
+ * clang-CUDA: CMake's clang device-link step is broken against CUDA 13's
+ * fatbinary, and even a hand-driven RDC link produced a binary whose
+ * device-side launches were silently dropped. A plain grid needs none of it.
  */
 
 #include <catch2/catch_all.hpp>
@@ -72,8 +71,8 @@ using ctp::ipc::RoundRobinAllocator;
 __global__ void RrChildKernel(
     RoundRobinAllocator *alloc,
     size_t alloc_size,
-    int *results,
-    int child_id) {
+    int *results) {
+  const int child_id = blockIdx.x;
   // Claim a partition (thread 0 only, broadcast via __shared__)
   __shared__ int s_partition;
   if (threadIdx.x == 0) {
@@ -152,56 +151,12 @@ __global__ void RrChildKernel(
 }
 
 // ============================================================================
-// Parent kernel: init allocator, launch N CDP children, wait
+// Init kernel: construct the allocator in device memory
 // ============================================================================
 
-#if defined(cudaStreamFireAndForget)
-#define CTP_TEST_CDP2 1
-#endif
-
-#ifdef CTP_TEST_CDP2
-/**
- * Completion kernel, tail-launched by the parent. A tail launch runs only once
- * the parent grid AND every one of its fire-and-forget children have completed,
- * so this is the CDP2 replacement for the parent's old cudaDeviceSynchronize().
- *
- * @param num_children Number of children that were launched (for the log line)
- * @param done Completion flag (pinned host memory)
- */
-__global__ void RrDoneKernel(int num_children, int *done) {
+__global__ void RrInitKernel(char *alloc_base, size_t alloc_capacity,
+                             int num_partitions) {
   if (threadIdx.x != 0) return;
-  printf("[PARENT] All %d children completed\n", num_children);
-  *done = 1;
-  __threadfence_system();
-}
-#endif
-
-/**
- * Parent persistent kernel that:
- *   1. Initializes the RoundRobinAllocator
- *   2. Launches num_children CDP child kernels (fire-and-forget)
- *   3. Joins them — tail launch under CDP2, cudaDeviceSynchronize under CDP1
- *   4. Writes completion flag
- *
- * @param alloc_base Device memory for the allocator
- * @param alloc_capacity Total bytes for the allocator
- * @param num_partitions Number of RR partitions
- * @param num_children Number of CDP child kernels to launch
- * @param alloc_size Bytes each child allocates
- * @param results Per-child results (pinned host memory)
- * @param done Completion flag (pinned host memory)
- */
-__global__ void RrParentKernel(
-    char *alloc_base,
-    size_t alloc_capacity,
-    int num_partitions,
-    int num_children,
-    size_t alloc_size,
-    int *results,
-    int *done) {
-  if (threadIdx.x != 0) return;
-
-  // Initialize the RoundRobinAllocator at the base of device memory
   auto *alloc = reinterpret_cast<RoundRobinAllocator *>(alloc_base);
   new (alloc) RoundRobinAllocator();
 
@@ -212,84 +167,37 @@ __global__ void RrParentKernel(
 
   alloc->shm_init(backend, 0, num_partitions, 0);
   alloc->MarkReady();
-
-  printf("[PARENT] RoundRobinAllocator initialized: %d partitions, %zu bytes\n",
-         num_partitions, alloc_capacity);
-
-#ifdef CTP_TEST_CDP2
-  // Launch CDP child kernels (fire-and-forget)
-  for (int i = 0; i < num_children; ++i) {
-    RrChildKernel<<<1, 32, 0, cudaStreamFireAndForget>>>(
-        alloc, alloc_size, results, i);
-  }
-
-  // Join: the tail launch is deferred until every child above has completed.
-  RrDoneKernel<<<1, 1, 0, cudaStreamTailLaunch>>>(num_children, done);
-#else
-  // Launch CDP child kernels (fire-and-forget)
-  for (int i = 0; i < num_children; ++i) {
-    RrChildKernel<<<1, 32>>>(alloc, alloc_size, results, i);
-  }
-
-  // Wait for all children to complete
-  cudaDeviceSynchronize();
-
-  printf("[PARENT] All %d children completed\n", num_children);
-  *done = 1;
-  __threadfence_system();
-#endif
+  printf("[INIT] RoundRobinAllocator ready: %d partitions, %llu bytes\n",
+         num_partitions, (unsigned long long)alloc_capacity);
 }
 
-// ============================================================================
-// Host test
-// ============================================================================
+namespace {
 
-TEST_CASE("RoundRobinAllocator - CDP concurrent alloc/free", "[gpu][allocator]") {
-  constexpr int kNumPartitions = 16;
-  constexpr int kNumChildren = 8;
-  constexpr size_t kAllocSize = 256;  // bytes per child allocation
-  constexpr size_t kAllocatorCapacity = 4 * 1024 * 1024;  // 4 MB
-
-  // Set CDP limits
-  cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 256);
-  cudaDeviceSetLimit(cudaLimitStackSize, 16384);
-  // CDP2 does not use the pending-launch-count limit and rejects it with
-  // cudaErrorUnsupportedLimit. That is harmless here, but it would otherwise be
-  // picked up by the cudaGetLastError() check on the kernel launch below.
-  cudaGetLastError();
-
-  // Allocate device memory for the allocator
-  char *d_alloc = ctp::GpuApi::Malloc<char>(kAllocatorCapacity);
+/** Init the allocator, run `num_children` concurrent child blocks, verify. */
+void RunConcurrentChildren(int num_partitions, int num_children,
+                           size_t alloc_size, size_t alloc_capacity) {
+  char *d_alloc = ctp::GpuApi::Malloc<char>(alloc_capacity);
   REQUIRE(d_alloc != nullptr);
 
-  // Allocate pinned host memory for results + done flag
-  int *h_results;
-  int *h_done;
-  cudaMallocHost(&h_results, kNumChildren * sizeof(int));
-  cudaMallocHost(&h_done, sizeof(int));
-  memset(h_results, 0, kNumChildren * sizeof(int));
-  *h_done = 0;
+  int *h_results = ctp::GpuApi::MallocHost<int>(
+      static_cast<size_t>(num_children) * sizeof(int));
+  REQUIRE(h_results != nullptr);
+  memset(h_results, 0, static_cast<size_t>(num_children) * sizeof(int));
 
-  // Launch parent kernel
-  void *stream = ctp::GpuApi::CreateStream();
-  RrParentKernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
-      d_alloc, kAllocatorCapacity, kNumPartitions, kNumChildren,
-      kAllocSize, h_results, h_done);
+  RrInitKernel<<<1, 1>>>(d_alloc, alloc_capacity, num_partitions);
+  ctp::GpuApi::Synchronize();
 
-  cudaError_t launch_err = cudaGetLastError();
-  REQUIRE(launch_err == cudaSuccess);
+  // One grid, one block per child: every child contends for the allocator
+  // at the same time, which is the concurrency under test.
+  RrChildKernel<<<num_children, 32>>>(
+      reinterpret_cast<RoundRobinAllocator *>(d_alloc), alloc_size,
+      h_results);
+  REQUIRE(cudaGetLastError() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
 
-  // Wait for the parent to complete. A grid is not complete until all of its
-  // descendants are, so this covers the children and the tail launch too.
-  ctp::GpuApi::Synchronize(stream);
-  ctp::GpuApi::DestroyStream(stream);
-
-  REQUIRE(*h_done == 1);
-
-  // Check all children passed
   int pass_count = 0;
   int fail_count = 0;
-  for (int i = 0; i < kNumChildren; ++i) {
+  for (int i = 0; i < num_children; ++i) {
     if (h_results[i] == 1) {
       ++pass_count;
     } else {
@@ -297,58 +205,28 @@ TEST_CASE("RoundRobinAllocator - CDP concurrent alloc/free", "[gpu][allocator]")
       WARN("Child " << i << " failed with code " << h_results[i]);
     }
   }
-  INFO("Passed: " << pass_count << " / " << kNumChildren);
+  INFO("Passed: " << pass_count << " / " << num_children);
   REQUIRE(fail_count == 0);
 
-  // Cleanup
   ctp::GpuApi::Free(d_alloc);
-  cudaFreeHost(h_results);
-  cudaFreeHost(h_done);
+  ctp::GpuApi::FreeHost(h_results);
 }
 
-TEST_CASE("RoundRobinAllocator - CDP many children stress", "[gpu][allocator][stress]") {
-  constexpr int kNumPartitions = 32;
-  constexpr int kNumChildren = 64;
-  constexpr size_t kAllocSize = 512;
-  constexpr size_t kAllocatorCapacity = 16 * 1024 * 1024;  // 16 MB
+}  // namespace
 
-  cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 256);
-  cudaDeviceSetLimit(cudaLimitStackSize, 16384);
-  // CDP2 does not use the pending-launch-count limit and rejects it with
-  // cudaErrorUnsupportedLimit. That is harmless here, but it would otherwise be
-  // picked up by the cudaGetLastError() check on the kernel launch below.
-  cudaGetLastError();
+// ============================================================================
+// Host test
+// ============================================================================
 
-  char *d_alloc = ctp::GpuApi::Malloc<char>(kAllocatorCapacity);
-  REQUIRE(d_alloc != nullptr);
+TEST_CASE("RoundRobinAllocator - concurrent alloc/free",
+          "[gpu][allocator]") {
+  RunConcurrentChildren(/*num_partitions=*/16, /*num_children=*/8,
+                        /*alloc_size=*/256, /*alloc_capacity=*/4 * 1024 * 1024);
+}
 
-  int *h_results;
-  int *h_done;
-  cudaMallocHost(&h_results, kNumChildren * sizeof(int));
-  cudaMallocHost(&h_done, sizeof(int));
-  memset(h_results, 0, kNumChildren * sizeof(int));
-  *h_done = 0;
-
-  void *stream = ctp::GpuApi::CreateStream();
-  RrParentKernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
-      d_alloc, kAllocatorCapacity, kNumPartitions, kNumChildren,
-      kAllocSize, h_results, h_done);
-
-  REQUIRE(cudaGetLastError() == cudaSuccess);
-  ctp::GpuApi::Synchronize(stream);
-  ctp::GpuApi::DestroyStream(stream);
-
-  REQUIRE(*h_done == 1);
-
-  int pass_count = 0;
-  for (int i = 0; i < kNumChildren; ++i) {
-    if (h_results[i] == 1) ++pass_count;
-    else WARN("Child " << i << " failed: " << h_results[i]);
-  }
-  INFO("Passed: " << pass_count << " / " << kNumChildren);
-  REQUIRE(pass_count == kNumChildren);
-
-  ctp::GpuApi::Free(d_alloc);
-  cudaFreeHost(h_results);
-  cudaFreeHost(h_done);
+TEST_CASE("RoundRobinAllocator - many children stress",
+          "[gpu][allocator][stress]") {
+  RunConcurrentChildren(/*num_partitions=*/32, /*num_children=*/64,
+                        /*alloc_size=*/512,
+                        /*alloc_capacity=*/16 * 1024 * 1024);
 }

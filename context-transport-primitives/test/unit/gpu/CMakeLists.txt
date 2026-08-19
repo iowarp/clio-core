@@ -108,21 +108,14 @@ if(CLIO_CORE_ENABLE_CUDA)
   # device-side cudaDeviceSynchronize, which CUDA 12 does not declare at all for
   # sm_90+ (see issue #828). On CUDA < 12 only CDP1 exists; silence its
   # 11.6-onwards deprecation warning.
-  find_package(CUDAToolkit QUIET)
-  set(CLIO_RR_CDP_DEFS "")
-  if(CUDAToolkit_VERSION VERSION_LESS 12)
-    set(CLIO_RR_CDP_DEFS __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
-  endif()
   add_cuda_executable(test_round_robin_alloc_gpu TRUE test_round_robin_alloc_gpu.cc
-    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS}
-    DEFS ${CLIO_RR_CDP_DEFS})
+    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS})
   target_link_libraries(test_round_robin_alloc_gpu
     ctp::cuda_cxx
     Catch2::Catch2WithMain
   )
   target_compile_options(test_round_robin_alloc_gpu PRIVATE
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:--extended-lambda -rdc=true>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:Clang>>:-fgpu-rdc>)
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:--extended-lambda>)
   add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
   set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
     TIMEOUT 60 LABELS "gpu;allocator")
