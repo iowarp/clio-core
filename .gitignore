@@ -109,7 +109,14 @@ example.dir
 # integration. Their CMake entry points were removed with them, so a checkout
 # without these directories still configures.
 context-transfer-engine/adapter/hdf5_vol/example/
-context-transfer-engine/compressor/example/
+# Everything under compressor/example/ EXCEPT the Gray-Scott HDF5 demo, which
+# is the deployment-shaped example (no Clio code in the application) and the
+# one people are pointed at -- it should not live only on one machine. The
+# example CMakeLists guards each entry point on the files it needs, so a
+# checkout with just the demo still configures.
+context-transfer-engine/compressor/example/*
+!context-transfer-engine/compressor/example/CMakeLists.txt
+!context-transfer-engine/compressor/example/neuropress_grayscott_h5/
 Win32/
 x64/
 Release/
