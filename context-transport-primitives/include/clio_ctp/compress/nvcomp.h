@@ -581,8 +581,33 @@ class NvComp : public Compressor {
     cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
 
     ~ManagerCache() {
-      // Managers must die before the stream they were built on.
-      for (auto &s : slots) s.mgr.reset();
+      // Leak the managers, deliberately. This is a thread_local destructor, so
+      // it runs at THREAD exit, and on a thread that exits during process
+      // shutdown nvcomp's manager destructors reproducibly segfault inside
+      // libnvcomp (seen in both GPU round-trip tests: every assertion passes,
+      // then the process dies in __call_tls_dtors).
+      //
+      // It is NOT a dead CUDA context -- cudaFree(nullptr) still returns
+      // cudaSuccess right here, and destroying a manager while the process is
+      // running is safe and heavily exercised, since the LRU evicts and
+      // rebuilds managers mid-run constantly. What has already gone is some
+      // state inside libnvcomp itself, which tears down independently of the
+      // CUDA runtime and cannot be probed for from the outside. So there is no
+      // condition to test: the only reliable move is not to call into nvcomp
+      // from here.
+      //
+      // The cost is bounded and does not accumulate -- at most kLruDepth
+      // managers, once, on a thread that is exiting anyway, and the driver
+      // reclaims all of it at process exit. Threads that want the memory back
+      // sooner can call ResetManagerCache() while they are still running,
+      // which takes the normal destruction path.
+      for (auto &s : slots) {
+        auto *leaked =
+            new std::shared_ptr<nvcomp::nvcompManagerBase>(std::move(s.mgr));
+        (void)leaked;
+      }
+      // Events and streams are plain CUDA objects, not nvcomp state, and the
+      // runtime is demonstrably still alive here -- these are safe to release.
       if (ev_start) cudaEventDestroy(ev_start);
       if (ev_stop) cudaEventDestroy(ev_stop);
       if (stream) cudaStreamDestroy(stream);
