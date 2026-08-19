@@ -1510,9 +1510,16 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     if (config_.neuropress_online_learning_enabled_ &&
         context.dynamic_compress_ != 1 && neuropress_predictor_ &&
         neuropress_predictor_->IsReady()) {
-      ctp::DataType feat_type = (context.data_type_ == 1)
-                                    ? ctp::DataType::FLOAT32
-                                    : ctp::DataType::UINT8;
+      // FLOAT32 unconditionally, and NOT context.data_type_. Reaching here
+      // means the enclosing guard already matched `neuropress_active` above
+      // exactly, so inference computed these same three statistics as float32
+      // -- see the comment there. Deriving the type from context.data_type_
+      // instead made a caller that leaves it 0 (the default, e.g. the HDF5
+      // VOL) train on uint8 statistics against features inference had read as
+      // float32: MAD and entropy land hundreds of sigma apart, so every SGD
+      // step corrected the model toward an input it never saw at inference.
+      // That is precisely the failure the scope comment below warns about.
+      ctp::DataType feat_type = ctp::DataType::FLOAT32;
       size_t feat_type_size = ctp::DataStatisticsFactory::GetTypeSize(feat_type);
       // Whole chunk -- MUST match EstCompressionStats' scope above, or the
       // features SGD trains on are not the features inference predicted

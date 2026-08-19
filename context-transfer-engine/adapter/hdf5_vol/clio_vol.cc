@@ -1404,6 +1404,26 @@ static bool clio_is_collective(hid_t dxpl_id) {
  * semantics), which would let a cached read return bytes native never wrote.
  * Excluded types still reach the native VOL; they are simply not mirrored.
  */
+/**
+ * Map an HDF5 datatype to the Context::data_type_ code the compressor reads.
+ *
+ * 1 = float32, 0 = "everything else" (the model's one-hot calls this bucket
+ * char). Only a 4-byte H5T_FLOAT earns the 1: that is what NeuroPress's model
+ * was trained on. float64 is deliberately NOT claimed as float -- the model
+ * has no third category, and its statistics kernel is typed `const float*`,
+ * so calling an 8-byte float float32 would describe the data no better than
+ * the default while asserting a precision the model cannot act on.
+ *
+ * Passing the default 0 for genuine float32 was a real defect, not a cosmetic
+ * one: it fed the selection model a char one-hot for every float chunk the
+ * VOL wrote.
+ */
+static int clio_context_data_type(hid_t type_id) {
+  if (type_id < 0) return 0;
+  if (H5Tget_class(type_id) != H5T_FLOAT) return 0;
+  return (H5Tget_size(type_id) == 4) ? 1 : 0;
+}
+
 static bool clio_type_is_cacheable(hid_t type_id) {
   if (type_id < 0) return false;
   if (H5Tis_variable_str(type_id) > 0) return false;
@@ -1934,9 +1954,13 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          connector's own CTE core client is already bound to, so compressed
          chunks land in the same core pool uncompressed chunks would have. */
       if (dataset->file->compressor_client) {
+        clio::cte::core::Context np_ctx;
+        np_ctx.data_type_ = clio_context_data_type(mem_type_id[d]);
+        CLIO_PATH_TRACE("WRITE  ctx data_type_=%d (%s)", np_ctx.data_type_,
+                        np_ctx.data_type_ == 1 ? "float32" : "other");
         auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
             clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
-            0, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+            0, this_size, blob_data, -1.0f, np_ctx,
             0, cte_client->pool_id_);
         dataset->pending_compressed_puts.push_back(std::move(future));
       } else {
@@ -2601,9 +2625,15 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         if (dataset->file->compressor_client) {
           /* Explicit core_pool_id, same reason as clio_dataset_write()'s
              write-side branch. */
+          /* file_type, not a memory type: no mem_type_id reaches this far,
+             and the refill re-stages the dataset's stored image. Resolved
+             lazily by clio_type_matches_file; still invalid means unprobed,
+             and the helper yields 0 -- the previous behaviour exactly. */
+          clio::cte::core::Context np_ctx;
+          np_ctx.data_type_ = clio_context_data_type(dataset->file_type);
           auto fut = dataset->file->compressor_client->AsyncDynamicSchedule(
               clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
-              0, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+              0, this_size, blob_data, -1.0f, np_ctx,
               0, cte_client->pool_id_);
           fut.Wait();
           rc_code = fut->GetReturnCode();
