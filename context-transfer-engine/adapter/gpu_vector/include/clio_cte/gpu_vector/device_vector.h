@@ -2196,11 +2196,23 @@ class DeviceVector {
    * whole round trip, which is exactly the point -- lanes that wanted the same
    * page are held until it is resident, then find it with no fault of their own.
    */
+  /** Bounded spin backoff. __nanosleep is CUDA Volta+ only; ROCm (and
+   *  pre-Volta) callers just spin -- the same convention as
+   *  ipc_gpu2cpu_impl.h, and the reason no raw __nanosleep may appear in
+   *  this header. */
+  CTP_GPU_FUN static void Backoff(unsigned ns) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __nanosleep(ns);
+#else
+    (void)ns;
+#endif
+  }
+
   CTP_GPU_FUN void LockBlock() {
     if (h_->block_locks_ == nullptr) return;
     int *lk = h_->block_locks_ + BlockIndex();
     while (atomicCAS(lk, 0, 1) != 0) {
-      __nanosleep(32);
+      Backoff(32);
     }
     __threadfence();
   }
@@ -3021,7 +3033,7 @@ class DeviceVector {
       volatile clio::run::u32 *f =
           reinterpret_cast<volatile clio::run::u32 *>(&p->fetching);
       while (*f == 3u) {
-        __nanosleep(64);
+        Backoff(64);
       }
       return;
     }
@@ -3169,9 +3181,7 @@ class DeviceVector {
         if (!EvictWindowLocked(page_num)) {
           // Every window slot is mid-fetch and none could be waited on:
           // back off briefly and re-probe.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-          __nanosleep(200);
-#endif
+          Backoff(200);
         }
       }
     }
