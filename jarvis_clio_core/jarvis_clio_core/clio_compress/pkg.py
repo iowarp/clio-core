@@ -293,6 +293,27 @@ class ClioCompress(Service):
             self.setenv('CLIO_CTE_COMPRESS_DEFAULT_PRESET_ID',
                         str(self._COMPRESS_PRESET_IDS[compress_preset]))
 
+        # Point the HDF5 VOL connector at this compressor pool.
+        #
+        # This is what makes transparent compression reachable at all for an
+        # HDF5 application. clio_adapters sets HDF5_VOL_CONNECTOR=clio and
+        # LD_PRELOADs the connector, but the connector only builds a
+        # compressor client when it knows which pool to talk to
+        # (clio_vol.cc's clio_resolve_compressor_pool reads
+        # CLIO_VOL_COMPRESSOR_POOL); with it unset, clio_make_file leaves
+        # file->compressor_client null and every write skips
+        # AsyncDynamicSchedule -- so the pool is composed, the model is
+        # loaded, and nothing is ever compressed.
+        #
+        # It belongs here rather than in clio_adapters because the pool id is
+        # this package's own configuration; the adapter has no way to know it.
+        #
+        # The VOL is currently the ONLY adapter that calls DynamicSchedule.
+        # The PutBlob path the other adapters use (ADIOS2, FUSE, POSIX,
+        # MPI-IO) has no dynamic-selection branch, so it reaches static
+        # compression at best and never the NeuroPress model.
+        self.setenv('CLIO_VOL_COMPRESSOR_POOL', compose_entry['pool_id'])
+
         self.log(f"clio_compress: compose written to {self.compose_config_path} "
                  f"(pool {compose_entry['pool_id']} -> "
                  f"next {compose_entry['next_pool_id']}, "

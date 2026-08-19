@@ -80,3 +80,12 @@ install(TARGETS clio_hdf5_vol
 )
 
 message(STATUS "HDF5 VOL adapter configured successfully")
+
+#------------------------------------------------------------------------------
+# Examples
+#------------------------------------------------------------------------------
+# The NeuroPress examples are kept out of the repository (see .gitignore), so
+# this is guarded: present in a working tree that has them, a no-op elsewhere.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/example/CMakeLists.txt)
+  add_subdirectory(example)
+endif()
