@@ -1046,6 +1046,33 @@ class DeviceVector {
   }
 
   /**
+   * Batched prefetch through the SYNC multi slot: issue one multi-get for
+   * the run and return WITHOUT waiting for its data. Unlike
+   * FetchPagesBatchedAsync this uses mb[0] -- shared with the demand path's
+   * run-fetch -- so a still-pending previous batch is SETTLED here first
+   * (a wait, but on the previous batch's tail, not this one's data). One
+   * multi task per call instead of one scalar task per page: a prefetch
+   * pass over ~78 pages costs 2 submissions instead of 78, which keeps the
+   * host workers off the cores the caller's own packing threads need.
+   * Claimed pages are fetching=2; the demand path's reap settles them.
+   */
+  CTP_GPU_FUN clio::run::u32 PrefetchRun(clio::run::u64 first_page,
+                                         clio::run::u32 n) {
+    LockBlock();
+    MultiBatch *mb = (h_->multi_ != nullptr) ? BlockBatches() : nullptr;
+    if (mb == nullptr) {
+      UnlockBlock();
+      return 0;
+    }
+    if (mb[0].async_pending != 0u) {
+      SettleOneLocked(&mb[0]);
+    }
+    const clio::run::u32 got = BeginFetchRunLocked(first_page, n);
+    UnlockBlock();
+    return got;
+  }
+
+  /**
    * Pin the page THIS THREAD is holding, and hand back the slot so it can be
    * released exactly.
    *
