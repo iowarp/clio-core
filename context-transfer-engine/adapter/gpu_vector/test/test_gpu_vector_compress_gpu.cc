@@ -136,7 +136,7 @@ __global__ void WeightsDotBatchedKernel(clio::run::IpcManagerGpuInfo info,
   for (clio::run::u64 p = 0; p < npages; p += chunk) {
     clio::run::u64 n = npages - p;
     if (n > chunk) n = chunk;
-    v.FetchPagesBatched(first_page + p, static_cast<clio::run::u32>(n));
+    gv::DeviceVectorTestAccess::FetchPagesBatched(v, first_page + p, static_cast<clio::run::u32>(n));
     for (clio::run::u64 j = 0; j < n; ++j) {
       const clio::run::u64 off = base + (p + j) * v.h_->elems_per_page_;
       for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {

@@ -92,11 +92,8 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when
   // thread 0 flushes would lose its writes AND leave the page looking clean.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(0, n);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(0, n);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }
@@ -155,11 +152,8 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
       v[base + i + k] = static_cast<clio::run::u32>((base + i + k) * 7 + 1);
     }
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }

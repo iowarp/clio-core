@@ -199,7 +199,7 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   clio::run::u64 run = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.HoldPageCoro(
+    co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off),
         &run);
     const clio::run::u64 n =
@@ -209,11 +209,8 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
     }
   }
   // Final writeback; the barrier is load-bearing (see the macro version).
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_CO_YIELD_WHEN((void)0, v.AnyTransferInFlight(), 0);
 }
 
@@ -265,11 +262,8 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
   // The barrier is load-bearing: SubmitPut clears `dirty` as it submits, so a
   // lane still writing the last page when thread 0 flushes loses its writes
   // AND leaves the page looking clean. That cost ~1% of the checksum.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }
@@ -359,7 +353,7 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
   unsigned long long acc = 0;
   clio::run::u64 run = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.HoldPageCoro(
+    co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off),
         &run);
     const clio::run::u64 n =

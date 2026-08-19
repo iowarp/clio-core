@@ -37,6 +37,7 @@ using RescoreSlot = clio::cte::core::PodReorganizeBlobTask;
 
 using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
+using MultiScoreSlot = clio::cte::core::PodMultiScoreTask;
 
 /**
  * One batched-paging slot: a put task and a get task, their futures, and the
@@ -55,8 +56,10 @@ using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
 struct MultiBatch {
   MultiPutSlot *put;
   MultiGetSlot *get;
+  MultiScoreSlot *score;
   clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> put_fut;
   clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask> get_fut;
+  clio::run::gpu::Future<clio::cte::core::PodMultiScoreTask> score_fut;
   clio::run::u32 page_slot[clio::cte::core::kPodMultiMax];
   /** Nonzero: get_fut carries an ASYNC batch that has not been settled.
    *  Its pages are marked fetching=2; AwaitFetch on any of them settles the
@@ -64,6 +67,12 @@ struct MultiBatch {
   clio::run::u32 async_pending;
   /** Number of records in the un-settled async batch. */
   clio::run::u32 async_n;
+  /** Nonzero: score_fut carries an un-settled batched rescore. */
+  clio::run::u32 score_pending;
+  /** Nonzero: put_fut carries an un-settled ASYNC batched flush; its pages
+   *  are marked flushing=3 and page_slot[0..put_n) names them. */
+  clio::run::u32 put_pending;
+  clio::run::u32 put_n;
 };
 
 /** One resident page. */

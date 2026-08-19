@@ -97,11 +97,8 @@ __global__ void HbmSeedKernel(clio::run::IpcManagerGpuInfo info,
   // SubmitPut clears `dirty` as it submits, so a lane still writing the last
   // page when thread 0 flushes would lose its writes AND leave the page
   // looking clean.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }

@@ -94,11 +94,8 @@ __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
       v[base + i + k] = Seed(base + i + k);
     }
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }
@@ -128,7 +125,12 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
     return;
   }
 
-  __shared__ gv::VecHeader s_hdr;
+  // Raw storage: VecHeader has default member initializers, and clang
+  // (unlike nvcc) rejects any __shared__ variable whose type requires
+  // construction. The word-copy below fills it before first use.
+  __shared__ alignas(gv::VecHeader) unsigned char
+      s_hdr_raw[sizeof(gv::VecHeader)];
+  gv::VecHeader &s_hdr = *reinterpret_cast<gv::VecHeader *>(s_hdr_raw);
   {
     const unsigned long long *hsrc = (const unsigned long long *) v.h_;
     unsigned long long *hdst = (unsigned long long *) &s_hdr;
@@ -153,7 +155,7 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
       rng = rng * 1664525u + 1013904223u;
       const clio::run::u64 pf = rng % total_pages;
       v.block_override_ = (clio::run::u32) (pf % s_hdr.nblocks_);
-      v.FetchPagesBatchedAsync(pf, 4);
+      gv::DeviceVectorTestAccess::FetchPagesBatchedAsync(v, pf, 4);
       v.block_override_ = (clio::run::u32) (pn % s_hdr.nblocks_);
     }
 
@@ -161,7 +163,7 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
     const clio::run::u32 *q =
         v.TryHoldRawConst(pn * kPageElems, kPageElems, &run);
     if (q == nullptr) {
-      v.FetchPagesBatched(pn, 1);
+      gv::DeviceVectorTestAccess::FetchPagesBatched(v, pn, 1);
       q = v.HoldRawConst(pn * kPageElems, kPageElems, &run);
     }
     if (q == nullptr) continue;  // window pinned; not a data error

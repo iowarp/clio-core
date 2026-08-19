@@ -188,8 +188,42 @@ struct VecHeader {
   unsigned int decode_trace_ = 0;
 };
 
+/** One entry of a batched rescore: WHICH page, and how much it matters.
+ *  score == 1.0f is the maximum preference and means "make it RESIDENT":
+ *  the entry rides the batched fetch. Any other score is a CTE placement
+ *  hint for the page's blob (tier steering), batched through one
+ *  PodMultiScoreTask. */
+struct PageScore {
+  clio::run::u64 page;
+  float score;
+};
+
+/** White-box accessor for the machinery tests and benches; production code
+ *  must use the public tiers. */
+struct DeviceVectorTestAccess;
+
+/*
+ * ============================ API TIERS =================================
+ * BASIC (use these):
+ *   size()
+ *   co_await HoldPage(off, count, &run)      access, faulting as needed
+ *   FlushAsync(off, count)                   start writeback, no wait
+ *   co_await AwaitFlush()                    all started flushes durable
+ *   RescorePagesBatchedAsync(n, gen)         score==1 -> prefetch batch,
+ *                                            else -> batched CTE rescore
+ *   co_await AwaitRescore()                  both batches settled
+ * ADVANCED (pointer-publishing designs; contracts in each doc comment):
+ *   operator[]/at, TryHoldFast, raw holds, PinHeld (MAY REFUSE -- retry
+ *   the hold), UnpinPage, GetPagePtr, MarkResidentDirty, DropAll,
+ *   block_override_, ...
+ * Everything else is machinery: private, reachable in tests only through
+ * DeviceVectorTestAccess.
+ * ========================================================================
+ */
 template <typename T>
 class DeviceVector {
+  friend struct DeviceVectorTestAccess;
+
  public:
   DeviceVector() = default;
 
@@ -963,6 +997,133 @@ class DeviceVector {
     UnlockBlock();
   }
 
+  /**
+   * BASIC: block-collective. Starts writeback of the dirty pages covering
+   * [off, off+count) as BATCHED multi-puts -- one task per 64 pages, not
+   * one per page -- and returns without waiting for the data to land.
+   * Pair with `co_await AwaitFlush()`. Every thread of the block must call
+   * this together (it synchronizes internally); thread 0 does the work.
+   */
+  CTP_GPU_FUN void FlushAsync(clio::run::u64 off, clio::run::u64 count) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      LockBlock();
+      FlushRangeBatchedAsyncLocked(off, count);
+      UnlockBlock();
+    }
+    __syncthreads();
+  }
+
+ private:
+  /** Batched, ASYNC form of the flush walk: fills multi-put batches for the
+   *  dirty resident pages of [off, off+count) and SENDS them without
+   *  waiting. Pages ride with flushing=3 (batch marker); AwaitFlush's reap
+   *  settles them (SettlePutLocked) and clears dirty per record rc.
+   *  Falls back to scalar SubmitPut when batching is not provisioned. */
+  CTP_GPU_FUN void FlushRangeBatchedAsyncLocked(clio::run::u64 off,
+                                                clio::run::u64 count) {
+    Page *tbl = BlockPages();
+    const clio::run::u64 p0 = PageOf(off);
+    const clio::run::u64 p1 = PageOf(off + (count == 0 ? 0 : count - 1));
+    if (h_->multi_ == nullptr || h_->multi_per_block_ == 0) {
+      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+        Page *p = &tbl[i];
+        if (p->page_num == kNoPage || p->page_num < p0 || p->page_num > p1) {
+          continue;
+        }
+        if (p->dirty && !p->flushing) SubmitPut(p);
+      }
+      return;
+    }
+    MultiBatch *mb = BlockBatches();
+    clio::run::u32 nb = 0;
+    clio::run::u32 filled = 0;
+    bool open = false;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      Page *p = &tbl[i];
+      if (p->page_num == kNoPage || !p->dirty || p->flushing) continue;
+      if (p->page_num < p0 || p->page_num > p1) continue;
+      if (!open) {
+        // POD-reuse rule: settle whatever this slot still carries before
+        // rewriting its task (get batch, score batch, or a previous async
+        // flush) -- a bounded wait on the PREVIOUS work's tail.
+        if (nb == 0) {
+          if (mb[0].async_pending != 0u) SettleOneLocked(&mb[0]);
+          if (mb[0].score_pending != 0u) SettleScoreLocked(&mb[0]);
+        }
+        if (mb[nb].put_pending != 0u) SettlePutLocked(&mb[nb]);
+        PrepareMultiPut(mb[nb].put);
+        open = true;
+      }
+      char name[32];
+      PageBlobName(p->page_num, name);
+      mb[nb].put->Add(name, 0, h_->page_bytes_, RawPtr(p->data),
+                      (p->score > 0.0f) ? p->score : -1.0f);
+      mb[nb].page_slot[filled] = i;
+      p->flushing = 3u;   // batch-flushed; settled via SettlePutLocked
+      ++filled;
+      Bump(h_->stat_puts_);
+      if (filled == clio::cte::core::kPodMultiMax) {
+        XferAdd(1);
+        mb[nb].put_fut =
+            clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+                SlotPtr(mb[nb].put));
+        mb[nb].put_pending = 1u;
+        mb[nb].put_n = filled;
+        ++nb;
+        filled = 0;
+        open = false;
+        if (nb == h_->multi_per_block_) return;   // provisioning ceiling
+      }
+    }
+    if (open && filled > 0) {
+      XferAdd(1);
+      mb[nb].put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+          SlotPtr(mb[nb].put));
+      mb[nb].put_pending = 1u;
+      mb[nb].put_n = filled;
+    }
+  }
+
+  /** Non-blocking completion probe of an async flush batch. */
+  CTP_GPU_FUN bool PutDone(const MultiBatch *mb) const {
+    if (mb->put_fut.IsNull()) return true;
+    volatile const unsigned int *fp =
+        reinterpret_cast<volatile const unsigned int *>(
+            &mb->put_fut.get()->fut_.is_complete_.x);
+    return ((*fp) & 1u) != 0u;
+  }
+
+  /** Settle an async flush batch: wait its future, clear dirty on each
+   *  successful record, release the flushing=3 marks. Lock held. */
+  CTP_GPU_FUN void SettlePutLocked(MultiBatch *mb) {
+    if (mb->put_pending == 0u) return;
+    mb->put_fut.Wait();
+    Page *tbl = BlockPages();
+    auto *t = mb->put;
+    for (clio::run::u32 r = 0; r < mb->put_n; ++r) {
+      Page *p = &tbl[mb->page_slot[r]];
+      if (p->flushing == 3u) p->flushing = 0u;
+      if (r < t->count_ && t->reqs_[r].rc_ == 0) p->dirty = 0u;
+    }
+    mb->put_pending = 0u;
+    mb->put_n = 0u;
+    XferAdd(-1);
+  }
+
+  /** Reap step for AwaitFlush: settle async flush batches that landed. */
+  CTP_GPU_FUN void ReapFlushBatches() {
+    if (h_->multi_ == nullptr) return;
+    LockBlock();
+    MultiBatch *mb = BlockBatches();
+    for (clio::run::u32 b = 0; b < h_->multi_per_block_; ++b) {
+      if (mb[b].put_pending != 0u && PutDone(&mb[b])) SettlePutLocked(&mb[b]);
+    }
+    UnlockBlock();
+  }
+
+ public:
+
   CTP_GPU_FUN void BeginFlush(clio::run::u64 off, clio::run::u64 count) {
     LockBlock();
     ForEachResident(off, count, [this](Page *p) {
@@ -996,6 +1157,7 @@ class DeviceVector {
     return n;
   }
 
+ private:
   /**
    * Fault pages [first_page, first_page + n) into this block's cache with
    * BATCHED gets, and wait for them.
@@ -1045,32 +1207,164 @@ class DeviceVector {
     return got;
   }
 
+ public:
+
   /**
-   * Batched prefetch through the SYNC multi slot: issue one multi-get for
-   * the run and return WITHOUT waiting for its data. Unlike
-   * FetchPagesBatchedAsync this uses mb[0] -- shared with the demand path's
-   * run-fetch -- so a still-pending previous batch is SETTLED here first
-   * (a wait, but on the previous batch's tail, not this one's data). One
-   * multi task per call instead of one scalar task per page: a prefetch
-   * pass over ~78 pages costs 2 submissions instead of 78, which keeps the
-   * host workers off the cores the caller's own packing threads need.
-   * Claimed pages are fetching=2; the demand path's reap settles them.
+   * BASIC: batched rescore, up to kPodMultiMax (64) entries per call.
+   *
+   * `gen(i)` returns the i-th PageScore. score == 1.0f is the maximum
+   * preference and means MAKE IT RESIDENT: the entry joins one batched
+   * fetch (the page is claimed and its bytes requested; a resident page
+   * no-ops). Any other score is a CTE placement hint: the page's local
+   * eviction score is refreshed if resident, and the blob's tier
+   * preference rides one batched PodMultiScore task.
+   *
+   * Fire-and-forget: ISSUES both batches and returns without waiting for
+   * either. `co_await AwaitRescore()` when completion matters; otherwise
+   * the machinery settles them lazily. BLOCK-COLLECTIVE: every thread of
+   * the block calls it together (thread 0 does the work). A
+   * still-pending previous batch is settled here first (a bounded wait on
+   * the PREVIOUS call's tail, never on this call's own data). Entries
+   * that cannot claim a slot are dropped -- this is a hint interface, and
+   * a later true access simply faults.
+   *
+   * @return entries accepted (fetch-claimed + score-batched).
    */
-  CTP_GPU_FUN clio::run::u32 PrefetchRun(clio::run::u64 first_page,
-                                         clio::run::u32 n) {
-    LockBlock();
-    MultiBatch *mb = (h_->multi_ != nullptr) ? BlockBatches() : nullptr;
-    if (mb == nullptr) {
-      UnlockBlock();
-      return 0;
+  template <typename GenF>
+  CTP_GPU_FUN clio::run::u32 RescorePagesBatchedAsync(clio::run::u32 n,
+                                                      GenF &&gen) {
+    __syncthreads();
+    clio::run::u32 got = 0;
+    if (threadIdx.x == 0) {
+      got = RescorePagesBatchedAsyncT0(n, gen);
     }
-    if (mb[0].async_pending != 0u) {
+    __syncthreads();
+    return got;   // meaningful on thread 0; a hint count, never load-bearing
+  }
+
+ private:
+  template <typename GenF>
+  CTP_GPU_FUN clio::run::u32 RescorePagesBatchedAsyncT0(clio::run::u32 n,
+                                                        GenF &&gen) {
+    if (h_->multi_ == nullptr || h_->multi_per_block_ == 0) return 0;
+    if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    LockBlock();
+    MultiBatch *mb = BlockBatches();
+    if (mb[0].async_pending != 0u) SettleOneLocked(&mb[0]);
+    if (mb[0].score_pending != 0u) SettleScoreLocked(&mb[0]);
+    PrepareMultiGet(mb[0].get);
+    mb[0].get->flags_ = clio::cte::core::kCtePrefetchHint;
+    PrepareMultiScore(mb[0].score);
+    Page *tbl = BlockPages();
+    clio::run::u32 nf = 0, ns = 0;
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      const PageScore e = gen(i);
+      char name[32];
+      PageBlobName(e.page, name);
+      if (e.score == 1.0f) {
+        if (Find(e.page) != nullptr) continue;   // resident or in flight
+        const clio::run::u32 slot = ClaimSlotWindowLocked(e.page);
+        if (slot == ~0u) continue;               // hint: drop, never stall
+        Page *np = &tbl[slot];
+        np->gen += 1u;
+        np->pins = 0u;
+        np->fetching = 2u;   // batch-async; settled via the reap
+        __threadfence();
+        np->page_num = e.page;
+        np->dirty = 0u;
+        np->flushing = 0u;
+        np->score = 2.0f;
+        np->user_score = 0.0f;
+        np->has_user = 0u;
+        np->last_access = Now();
+        mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+        mb[0].page_slot[nf++] = slot;
+        Bump(h_->stat_faults_);
+        Bump(h_->stat_prefetches_);
+      } else {
+        Page *p = Find(e.page);
+        if (p != nullptr) {
+          p->score = e.score;
+          p->user_score = e.score;
+          p->has_user = 1u;
+        }
+        const float clamped =
+            e.score < 0.0f ? 0.0f : (e.score > 1.0f ? 1.0f : e.score);
+        mb[0].score->Add(name, 0, 0, ctp::ipc::ShmPtr<>::GetNull(), clamped);
+        ++ns;
+      }
+    }
+    if (nf != 0u) {
+      XferAdd(1);
+      mb[0].get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+          SlotPtr(mb[0].get));
+      mb[0].async_pending = 1u;
+      mb[0].async_n = nf;
+    }
+    if (ns != 0u) {
+      mb[0].score_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+          SlotPtr(mb[0].score));
+      mb[0].score_pending = 1u;
+    }
+    UnlockBlock();
+    return nf + ns;
+  }
+
+  CTP_GPU_FUN void PrepareMultiScore(
+      clio::cte::core::PodMultiScoreTask *t) const {
+    t->task_flags_.Clear();
+    t->return_code_.store(0);
+    t->task_id_ = NextTaskId(kKindRescore);
+    t->pool_id_ = h_->pool_id_;
+    t->method_ = clio::cte::core::Method::kPodMultiScore;
+    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->tag_id_ = h_->tag_id_;
+    t->count_ = 0;
+    t->flags_ = 0;
+    t->num_ok_ = 0;
+    t->context_ = clio::cte::core::Context();
+    ClearRunCtx(t);
+  }
+
+  /** Non-blocking completion probe of the score batch. */
+  CTP_GPU_FUN bool ScoreDone(MultiBatch *mb) {
+    if (mb->score_fut.IsNull()) return true;
+    volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
+        &mb->score_fut.get()->fut_.is_complete_.x);
+    return ((*fp) & 1u) != 0u;
+  }
+
+  /** Settle the score batch: wait (bounded; the task has no data phase)
+   *  and clear the pending mark. Caller holds the block lock. */
+  CTP_GPU_FUN void SettleScoreLocked(MultiBatch *mb) {
+    if (mb->score_pending == 0u) return;
+    mb->score_fut.Wait();
+    mb->score_pending = 0u;
+  }
+
+  /** Reap step for AwaitRescore: settle whichever batches have landed. */
+  CTP_GPU_FUN void ReapRescore() {
+    if (h_->multi_ == nullptr) return;
+    LockBlock();
+    MultiBatch *mb = BlockBatches();
+    if (mb[0].async_pending != 0u && MultiGetDone(&mb[0])) {
       SettleOneLocked(&mb[0]);
     }
-    const clio::run::u32 got = BeginFetchRunLocked(first_page, n);
+    if (mb[0].score_pending != 0u && ScoreDone(&mb[0])) {
+      SettleScoreLocked(&mb[0]);
+    }
     UnlockBlock();
-    return got;
   }
+
+  /** Block-uniform: is anything from RescorePagesBatchedAsync unsettled? */
+  CTP_GPU_FUN bool RescoreInFlight() const {
+    if (h_->multi_ == nullptr) return false;
+    const MultiBatch *mb = BlockBatches();
+    return mb[0].async_pending != 0u || mb[0].score_pending != 0u;
+  }
+
+ public:
+
 
   /**
    * Pin the page THIS THREAD is holding, and hand back the slot so it can be
@@ -1439,6 +1733,45 @@ class DeviceVector {
     // 3. Resident for the whole block: the lock-free fast path.
     *run_out = HoldPage(off, count);
   }
+
+  /**
+   * BASIC: `co_await vec.HoldPage(off, count, &run)` -- THE access
+   * primitive. Resident pages complete on the fast path with no
+   * suspension; a miss faults the page in and suspends the block until it
+   * lands. Block-collective: every thread of the block must co_await it
+   * together (it synchronizes internally). On return `*run` is how many
+   * elements from `off` are contiguous in the held page.
+   */
+  __device__ clio::run::gpu::YCoroTask HoldPage(clio::run::u64 off,
+                                                clio::run::u64 count,
+                                                clio::run::u64 *run) {
+    *run = TryHoldFast(off, count);
+    if (*run != 0) co_return;
+    co_await HoldPageCoro(off, count, run);
+  }
+
+  /**
+   * BASIC: `co_await vec.AwaitFlush()` -- suspends until every writeback
+   * started by FlushAsync on this block's table has completed. Reaps
+   * completed puts as it waits. Block-collective.
+   */
+  __device__ clio::run::gpu::YCoroTask AwaitFlush() {
+    CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFlushBatches()),
+                       AnyFlushInFlight(), FlushWaitTag());
+  }
+
+  /**
+   * BASIC: `co_await vec.AwaitRescore()` -- suspends until both batches a
+   * RescorePagesBatchedAsync call issued (the score-1 fetch batch and the
+   * placement-score batch) have settled. Block-collective. Waiting is
+   * OPTIONAL: an unawaited batch settles lazily through the machinery's
+   * own reaps; await only when subsequent logic depends on residency or
+   * on the placement having been applied.
+   */
+  __device__ clio::run::gpu::YCoroTask AwaitRescore() {
+    CLIO_CO_YIELD_WHEN((ReapRescore()), RescoreInFlight(), FlushWaitTag());
+  }
+
 #endif  // CLIO_YIELD_CORO
 
   /** One lane re-issues a page's fetch if no slot carries it (see the
@@ -1501,13 +1834,42 @@ class DeviceVector {
     return h_->xfer_cnt_ != nullptr && h_->xfer_cnt_[BlockIndex()] == 0u;
   }
 
+  /** Flush-only variant of AnyTransferInFlight, for AwaitFlush. Covers the
+   *  scalar puts AND the async flush batches (flushing == 3u pages have no
+   *  live scalar future; their completion is the batch's). */
+  CTP_GPU_FUN bool AnyFlushInFlight() const {
+    if (XferIdle()) return false;
+    const Page *tbl = BlockPages();
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      const Page *p = &tbl[i];
+      if (p->flushing == 3u) continue;   // completion is the BATCH future's
+      if (p->flushing && p->put->fut_.is_complete_.load() == 0) return true;
+    }
+    if (h_->multi_ != nullptr) {
+      const MultiBatch *mb = BlockBatches();
+      for (clio::run::u32 b = 0; b < h_->multi_per_block_; ++b) {
+        // In-flight only while the future is INCOMPLETE: an unsettled but
+        // landed batch must not spin a waiter that never reaps.
+        if (mb[b].put_pending != 0u && !PutDone(&mb[b])) return true;
+      }
+    }
+    return false;
+  }
+
   CTP_GPU_FUN bool AnyTransferInFlight() const {
     if (XferIdle()) return false;
     const Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       const Page *p = &tbl[i];
+      if (p->flushing == 3u) continue;   // completion is the BATCH future's
       if (p->flushing && p->put->fut_.is_complete_.load() == 0) return true;
       if (p->fetching && p->get->fut_.is_complete_.load() == 0) return true;
+    }
+    if (h_->multi_ != nullptr) {
+      const MultiBatch *mb = BlockBatches();
+      for (clio::run::u32 b = 0; b < h_->multi_per_block_; ++b) {
+        if (mb[b].put_pending != 0u && !PutDone(&mb[b])) return true;
+      }
     }
     return false;
   }
@@ -1645,6 +2007,7 @@ class DeviceVector {
     Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       Page *p = &tbl[i];
+      if (p->flushing == 3u) continue;   // batch-flushed: settled below
       if (p->flushing && p->put->fut_.is_complete_.load() != 0) {
         AwaitPut(p);   // clears `flushing`; re-dirties the page if it FAILED
         if (p->evicting && !p->dirty) {
@@ -1661,6 +2024,12 @@ class DeviceVector {
         // that is its contract ("a later write re-dirties the page"). Freeing
         // the slot here evicted every flushed page and counted it as an
         // eviction, which is where a no-op EvictPages(0) got 4 evicts from.
+      }
+    }
+    if (h_->multi_ != nullptr) {
+      MultiBatch *mb = BlockBatches();
+      for (clio::run::u32 b = 0; b < h_->multi_per_block_; ++b) {
+        if (mb[b].put_pending != 0u && PutDone(&mb[b])) SettlePutLocked(&mb[b]);
       }
     }
     UnlockBlock();
@@ -2825,6 +3194,24 @@ class DeviceVector {
     }
   }
 #endif  // CTP_IS_GPU_COMPILER
+};
+
+/** White-box access to DeviceVector machinery, for the tests and benches
+ *  that measure it directly. Production kernels use the public tiers; if a
+ *  kernel needs something from here, the public API is missing a verb --
+ *  add the verb, do not widen this. */
+struct DeviceVectorTestAccess {
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u32 FetchPagesBatched(DeviceVector<T> &v,
+                                                      clio::run::u64 first,
+                                                      clio::run::u32 n) {
+    return v.FetchPagesBatched(first, n);
+  }
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u32 FetchPagesBatchedAsync(
+      DeviceVector<T> &v, clio::run::u64 first, clio::run::u32 n) {
+    return v.FetchPagesBatchedAsync(first, n);
+  }
 };
 
 }  // namespace clio::cte::gpu_vector

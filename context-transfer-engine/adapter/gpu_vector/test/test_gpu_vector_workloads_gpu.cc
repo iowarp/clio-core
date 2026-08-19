@@ -91,11 +91,8 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
       v[base + i + k] = Seed(base + i + k);
     }
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }
@@ -132,11 +129,8 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
     // Double buffer: hand this page to the runtime NOW and keep computing.
     // The barrier matters: SubmitPut clears `dirty` as it submits, so a lane
     // still writing when thread 0 flushes loses its writes.
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      v.BeginFlush(base + off, run);
-    }
-    __syncthreads();
+    // Collective, internally BATCHED (one multi-put per 64 pages).
+    v.FlushAsync(base + off, run);
   }
   // Then flush the WHOLE slice. The per-page BeginFlush above is the overlap
   // this workload exists to show, but it is a submission, not a guarantee:
@@ -145,11 +139,8 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
   // and pages 1-7 did not, so the reader saw Step(Seed) for the first 1024
   // elements and plain Seed for the other 7168. The original spelled this the
   // same way -- BeginFlush per page, then one WaitFlush over the slice.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }
@@ -227,11 +218,8 @@ __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
     }
     __syncthreads();
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, per);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }

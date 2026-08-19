@@ -221,7 +221,7 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
     u64 n = pages_per_block - k;
     if (n > chunk) n = chunk;
     if (threadIdx.x == 0) {
-      v.FetchPagesBatched(base_page + k, static_cast<u32>(n));
+      gv::DeviceVectorTestAccess::FetchPagesBatched(v, base_page + k, static_cast<u32>(n));
     }
     __syncthreads();
     // The chunk is resident now, so this walk faults on nothing.

@@ -446,7 +446,8 @@ class Vector {
     const clio::run::u64 scalar_task_bytes =
         nslots * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
     const clio::run::u64 multi_task_bytes =
-        nbatch * (sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
+        nbatch *
+        (sizeof(MultiPutSlot) + sizeof(MultiGetSlot) + sizeof(MultiScoreSlot));
     // The batch tasks share the per-page slots' backend ON PURPOSE. SlotPtr
     // stamps `task_alloc_id_` -- ONE allocator id -- on every task it sends,
     // so a task living in a different registered backend reaches the runtime
@@ -548,7 +549,8 @@ class Vector {
     // stamped with their POD size so RecvIn knows how many bytes to copy back
     // without dereferencing the task.
     {
-      const size_t pair = sizeof(MultiPutSlot) + sizeof(MultiGetSlot);
+      const size_t pair =
+          sizeof(MultiPutSlot) + sizeof(MultiGetSlot) + sizeof(MultiScoreSlot);
       std::vector<char> mtasks(static_cast<size_t>(nbatch) * pair, 0);
       std::vector<MultiBatch> mtbl(static_cast<size_t>(nbatch));
       for (clio::run::u64 i = 0; i < nbatch; ++i) {
@@ -562,16 +564,30 @@ class Vector {
             static_cast<clio::run::u32>(sizeof(MultiPutSlot));
         reinterpret_cast<MultiGetSlot *>(slot + sizeof(MultiPutSlot))
             ->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(MultiGetSlot));
+        new (slot + sizeof(MultiPutSlot) + sizeof(MultiGetSlot))
+            MultiScoreSlot(clio::run::CreateTaskId(),
+                           clio::cte::core::kCtePoolId, local, tag_id_);
+        reinterpret_cast<MultiScoreSlot *>(slot + sizeof(MultiPutSlot) +
+                                           sizeof(MultiGetSlot))
+            ->fut_.task_size_ =
+            static_cast<clio::run::u32>(sizeof(MultiScoreSlot));
         char *dev = st.multi_task_base + static_cast<size_t>(i) * pair;
         mtbl[static_cast<size_t>(i)].put = reinterpret_cast<MultiPutSlot *>(dev);
         mtbl[static_cast<size_t>(i)].get =
             reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
+        mtbl[static_cast<size_t>(i)].score = reinterpret_cast<MultiScoreSlot *>(
+            dev + sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
         mtbl[static_cast<size_t>(i)].put_fut =
             clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
         mtbl[static_cast<size_t>(i)].get_fut =
             clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
+        mtbl[static_cast<size_t>(i)].score_fut =
+            clio::run::gpu::Future<clio::cte::core::PodMultiScoreTask>();
         mtbl[static_cast<size_t>(i)].async_pending = 0;
         mtbl[static_cast<size_t>(i)].async_n = 0;
+        mtbl[static_cast<size_t>(i)].score_pending = 0;
+        mtbl[static_cast<size_t>(i)].put_pending = 0;
+        mtbl[static_cast<size_t>(i)].put_n = 0;
       }
       UploadBytes(mtasks.data(), st.multi_task_base,
                   static_cast<clio::run::u64>(nbatch) * pair);

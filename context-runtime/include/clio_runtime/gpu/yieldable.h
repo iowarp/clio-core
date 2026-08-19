@@ -190,7 +190,13 @@ struct YieldableView {
 // ---------------------------------------------------------------------------
 // Host driver
 // ---------------------------------------------------------------------------
-#if !defined(__CUDA_ARCH__)
+// NOT guarded out of the device pass. clang compiles a CUDA TU twice and
+// PARSES host code in both passes; hiding these host-only classes behind
+// !defined(__CUDA_ARCH__) made every test and bench that defines a host
+// launch helper fail to compile for the device target ("no member named
+// 'Yieldable'"), because the helper's non-dependent names are looked up at
+// parse time. The classes remain host-only in USE -- their members call
+// host CUDA APIs -- but they must be visible to both passes.
 
 namespace clio::run::gpu {
 
@@ -528,6 +534,5 @@ class Yieldable {
 
 }  // namespace clio::run::gpu
 
-#endif  // !__CUDA_ARCH__
 
 #endif  // CLIO_RUNTIME_GPU_YIELDABLE_H_

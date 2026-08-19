@@ -106,13 +106,12 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
   u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPageCoro(base + off, n, &run);
+    co_await v.HoldPage(base + off, n, &run);
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
       v[base + off + i] = PointVal(base + off + i, dims, k);
     }
-    __syncthreads();
-    if (threadIdx.x == 0) v.BeginFlush(base + off, n);
-    __syncthreads();
+    // Collective, internally BATCHED (one multi-put per 64 pages).
+    v.FlushAsync(base + off, n);
   }
 }
 
@@ -142,7 +141,7 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
   u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPageCoro(base + off, n, &run);
+    co_await v.HoldPage(base + off, n, &run);
     // Whole pages hold whole points (enforced on the host), so a page is
     // exactly n/dims points and no point straddles a page boundary.
     const u64 npts = n / dims;

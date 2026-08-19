@@ -260,7 +260,7 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
     if (n > chunk) n = chunk;
     if (threadIdx.x == 0) {
       atomicAdd(got, static_cast<unsigned long long>(
-                         v.FetchPagesBatched(k, static_cast<u32>(n))));
+                         gv::DeviceVectorTestAccess::FetchPagesBatched(v, k, static_cast<u32>(n))));
     }
     __syncthreads();
     for (j = 0; j < n; ++j) {
@@ -335,11 +335,8 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
     CLIO_YCALL(v.HoldPageYield(first_of_next, 1, &run));
     if (threadIdx.x == 0) v[first_of_next] = Val(first_of_next, 7u);
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(last_of_prev, 2);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(last_of_prev, 2);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }

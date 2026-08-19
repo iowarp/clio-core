@@ -103,11 +103,8 @@ __global__ void WriteRangeKernel(clio::run::IpcManagerGpuInfo info,
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when
   // thread 0 flushes would lose its writes AND leave the page looking clean.
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    v.BeginFlush(base, elems_per_block);
-  }
-  __syncthreads();
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, elems_per_block);
   CLIO_YIELD_IF(v.AnyTransferInFlight());
   CLIO_YEND();
 }

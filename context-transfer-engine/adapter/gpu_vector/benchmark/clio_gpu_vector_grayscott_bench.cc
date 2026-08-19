@@ -179,21 +179,19 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 ubase, u64 vbase) {
   u64 run = 0;
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.HoldPageCoro(ubase + z * plane, plane, &run);
+    co_await vec.HoldPage(ubase + z * plane, plane, &run);
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       vec[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
     }
-    __syncthreads();
-    if (threadIdx.x == 0) vec.BeginFlush(ubase + z * plane, plane);
-    __syncthreads();
+    // Collective, internally BATCHED (one multi-put per 64 pages).
+    vec.FlushAsync(ubase + z * plane, plane);
 
-    co_await vec.HoldPageCoro(vbase + z * plane, plane, &run);
+    co_await vec.HoldPage(vbase + z * plane, plane, &run);
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       vec[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
     }
-    __syncthreads();
-    if (threadIdx.x == 0) vec.BeginFlush(vbase + z * plane, plane);
-    __syncthreads();
+    // Collective, internally BATCHED (one multi-put per 64 pages).
+    vec.FlushAsync(vbase + z * plane, plane);
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
   // durable before this kernel returns.
@@ -235,14 +233,14 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     // Three input planes of u, then three of v. Held together: the sliding
     // window means z and z+1 are needed again on the next iteration, which is
     // the reuse this benchmark measures.
-    co_await vec.HoldPageCoro(ubase + zm * plane, plane, &run);
-    co_await vec.HoldPageCoro(ubase + z * plane, plane, &run);
-    co_await vec.HoldPageCoro(ubase + zp * plane, plane, &run);
-    co_await vec.HoldPageCoro(vbase + zm * plane, plane, &run);
-    co_await vec.HoldPageCoro(vbase + z * plane, plane, &run);
-    co_await vec.HoldPageCoro(vbase + zp * plane, plane, &run);
-    co_await vec.HoldPageCoro(unext + z * plane, plane, &run);
-    co_await vec.HoldPageCoro(vnext + z * plane, plane, &run);
+    co_await vec.HoldPage(ubase + zm * plane, plane, &run);
+    co_await vec.HoldPage(ubase + z * plane, plane, &run);
+    co_await vec.HoldPage(ubase + zp * plane, plane, &run);
+    co_await vec.HoldPage(vbase + zm * plane, plane, &run);
+    co_await vec.HoldPage(vbase + z * plane, plane, &run);
+    co_await vec.HoldPage(vbase + zp * plane, plane, &run);
+    co_await vec.HoldPage(unext + z * plane, plane, &run);
+    co_await vec.HoldPage(vnext + z * plane, plane, &run);
 
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       const u64 x = i % nx, y = i / nx;
@@ -336,7 +334,7 @@ __device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
                                  u64 z0, u64 z1, u64 vbase, double *out) {
   u64 run = 0;
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.HoldPageCoro(vbase + z * plane, plane, &run);
+    co_await vec.HoldPage(vbase + z * plane, plane, &run);
     double acc = 0.0;
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       acc += static_cast<double>(vec.at(vbase + z * plane + i));

@@ -119,7 +119,7 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.h_->elems_per_page_;
       u64 run = 0;
-      co_await v.HoldPageCoro(poff, v.h_->elems_per_page_, &run);
+      co_await v.HoldPage(poff, v.h_->elems_per_page_, &run);
       WritePage(v, poff, 0u);
     }
     if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
@@ -208,7 +208,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
         // Required: operator[] indexes the HELD page and does no resolution,
         // so without this last_page_ is null and the write dereferences it.
         u64 run = 0;
-        co_await v.HoldPageCoro(poff, v.h_->elems_per_page_, &run);
+        co_await v.HoldPage(poff, v.h_->elems_per_page_, &run);
         WritePage(v, poff, pass);
       }
       // ---- block-level flush: ONE call covering the whole region ----
