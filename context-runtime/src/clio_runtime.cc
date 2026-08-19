@@ -52,6 +52,20 @@ bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
   }
 
   auto* runtime_manager = CLIO_RUNTIME_MANAGER;
+
+  // CLIO_RESTART, mirroring CLIO_WITH_RUNTIME below. Without it, restart mode
+  // -- which is what replays the metadata WAL and makes a previous run's tags
+  // and blobs visible again -- was reachable only through `clio_run restart`,
+  // i.e. only for a standalone daemon. An application that hosts its own
+  // runtime had no way to ask for it, so it always came up with an empty
+  // metadata table and could not read back data an earlier process had
+  // stored, however durable that data was on disk.
+  const char* restart_env = clio::run::env::GetCompat("RESTART");
+  if (restart_env != nullptr) {
+    is_restart = (std::strcmp(restart_env, "1") == 0 ||
+                  std::strcmp(restart_env, "true") == 0 ||
+                  std::strcmp(restart_env, "TRUE") == 0);
+  }
   runtime_manager->is_restart_ = is_restart;
 
   // Check environment variable CLIO_WITH_RUNTIME
