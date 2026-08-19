@@ -1480,10 +1480,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // Update context with selected compression library and preset
     context.compress_lib_ = best_lib;
     context.compress_preset_ = best_preset;
-    CLIO_PATH_TRACE("WRITE  neuropress selected lib=%d (%s) preset=%d",
+    // PRIMARY, not final: exploration below can replace this with a different
+    // codec, and does. Reporting this as "selected" claimed gdeflate on 62
+    // chunks whose stored headers on disk say bitcomp -- see the final hook at
+    // the end of this function.
+    CLIO_PATH_TRACE("WRITE  neuropress primary lib=%d (%s) preset=%d",
                     best_lib,
                     ctp::CompressionFactory::NameForWireId(best_lib).c_str(),
                     best_preset);
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+    const int np_primary_lib = best_lib;
+    const int np_primary_preset = best_preset;
+#endif
     task->tier_score_ = tier_score;
 
     // Log scheduling decision time if tracing enabled
@@ -2447,6 +2455,26 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         }
       }
     }
+
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+    // The decision that actually reaches storage. `context` is a reference to
+    // task->context_, and an adopted exploration winner is committed by
+    // assigning task->context_ wholesale -- so reading it here, after the
+    // exploration block, is the only place that agrees with the CTEC header
+    // the chunk is written with.
+    {
+      const int np_final_lib = context.compress_lib_;
+      const int np_final_preset = context.compress_preset_;
+      CLIO_PATH_TRACE(
+          "WRITE  neuropress FINAL lib=%d (%s) preset=%d %s",
+          np_final_lib,
+          ctp::CompressionFactory::NameForWireId(np_final_lib).c_str(),
+          np_final_preset,
+          (np_final_lib == np_primary_lib && np_final_preset == np_primary_preset)
+              ? "(primary kept)"
+              : "(EXPLORATION OVERRODE THE PRIMARY)");
+    }
+#endif
 
   } catch (const std::exception& e) {
     HLOG(kError, "Exception in DynamicSchedule: {}", e.what());

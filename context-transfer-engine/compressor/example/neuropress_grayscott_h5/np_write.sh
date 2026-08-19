@@ -5,7 +5,7 @@
 #
 # Usage: ./np_write.sh [-b BUILD] [-L N] [-s STEPS] [-g GAP] [--store DIR]
 set -euo pipefail
-BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0
+BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--build) BUILD=$2; shift 2 ;;
@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do
     --store)    STORE=$2; shift 2 ;;
     --chunk)    CHUNK=$2; shift 2 ;;
     --explore)  EXPLORE_K=$2; shift 2 ;;
+    --best)     BEST=true; shift ;;
     -h|--help)  sed -n '2,7p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -34,16 +35,16 @@ echo "store: $STORE  (persistent file tier + metadata log)"
   || { echo "write FAILED -- tail:"; tail -25 "$STORE/write.log"; exit 1; }
 
 grep -E 'Gray-Scott|step |done:' "$STORE/write.log" || true
-n=$(grep -c 'Compression: ' "$STORE/write.log" || true)
+# Expected chunks: each snapshot is L^3*4 bytes cut into CHUNK-sized pieces.
+BYTES_PER_SNAP=$(( L * L * L * 4 ))
+CHUNKS_PER_SNAP=$(( (BYTES_PER_SNAP + CHUNK - 1) / CHUNK ))
+EXPECT=$(( CHUNKS_PER_SNAP * NSNAP ))
 echo
-echo "chunks compressed: $n"
-if [ "${n:-0}" -gt 0 ]; then
-  grep -oE 'Compression: [0-9]+ bytes -> [0-9]+ bytes' "$STORE/write.log" \
-    | awk '{i+=$2; o+=$5} END{printf("  stored: %.2f MiB from %.1f MiB (%.1fx)\n", o/1048576, i/1048576, i/o)}'
-else
-  echo "  NO COMPRESSION -- the reader cannot prove anything. Check that"
-  echo "  CLIO_VOL_COMPRESSOR_POOL matched the compressor pool_id."
+echo "chunks expected: $EXPECT ($CHUNKS_PER_SNAP per snapshot x $NSNAP)"
+np_stored_stats "$STORE" "$EXPECT" || {
+  echo "  Nothing was compressed -- the reader cannot prove anything. Check"
+  echo "  that CLIO_VOL_COMPRESSOR_POOL matched the compressor pool_id."
   exit 1
-fi
+}
 echo
 echo "now run:  ./np_read.sh --store $STORE -L $L -s $STEPS -g $GAP"

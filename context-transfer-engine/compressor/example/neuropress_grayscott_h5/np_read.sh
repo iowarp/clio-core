@@ -12,7 +12,7 @@
 #
 # Usage: ./np_read.sh [-b BUILD] [-L N] [-s STEPS] [-g GAP] [--store DIR]
 set -euo pipefail
-BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0
+BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--build) BUILD=$2; shift 2 ;;
@@ -22,6 +22,7 @@ while [ $# -gt 0 ]; do
     --store)    STORE=$2; shift 2 ;;
     --chunk)    CHUNK=$2; shift 2 ;;
     --explore)  EXPLORE_K=$2; shift 2 ;;
+    --best)     BEST=true; shift ;;
     -h|--help)  sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac

@@ -30,6 +30,9 @@ build first:  make -C $BUILD neuropress_grayscott_h5 clio_hdf5_vol" >&2; return 
   # Exploration needs online learning: the point of trying K candidates is to
   # feed their measured outcomes back into the model, and with learning off the
   # extra compressions are paid for and then discarded.
+  # Best mode brings its own exploration settings (it forces exploration on and
+  # pins K to 31) and ranks on ratio alone, so it does not take an explicit K.
+  BEST=${BEST:-false}
   EXPLORE_K=${EXPLORE_K:-0}
   if [ "${EXPLORE_K:-0}" -gt 0 ]; then
     NP_LEARN=true;  NP_EXPLORE=true
@@ -64,6 +67,7 @@ compose:
     neuropress_online_learning_enabled: $NP_LEARN
     neuropress_exploration_enabled: $NP_EXPLORE
     neuropress_exploration_k: $EXPLORE_K
+    neuropress_best_mode: $BEST
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local
@@ -119,4 +123,47 @@ np_trace_on() {
         "$BUILD/bin/libclio_cte_compressor_runtime.so" 2>/dev/null \
       | grep -c 'np-path' || true)
   [ "${n:-0}" -gt 0 ]
+}
+
+# Stored size, read from the CTEC headers in the tier rather than by summing
+# "Compression:" log lines. Those lines are one per CODEC RUN, and exploration
+# runs several candidates per chunk, so summing them counted alternatives that
+# were measured and thrown away -- it reported 19.82 MiB for a store that holds
+# 2.43 MiB. The header carries the codec and the payload length of the bytes
+# that were actually kept, so it cannot disagree with what is on disk.
+#
+# $1 = store dir, $2 = expected chunk count (0 to skip the cross-check)
+np_stored_stats() {
+  python3 - "$1" "${2:-0}" "$CHUNK" <<'PYEOF'
+import struct, sys
+from collections import Counter
+store, expect, chunk = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+NAMES = {11:"lz4",12:"snappy",13:"zstd",14:"gdeflate",15:"deflate",16:"ans",
+         21:"cascaded",22:"bitcomp"}
+try:
+    raw = open(f"{store}/cte_tier.dat_node0","rb").read()
+except OSError:
+    print("  (no tier file -- nothing stored)"); raise SystemExit(1)
+needle = struct.pack("<I", 0x43544543)   # "CTEC"
+off = tot = orig = n = 0
+codecs = Counter()
+while True:
+    i = raw.find(needle, off)
+    if i < 0: break
+    _, lib, _, csz, osz = struct.unpack_from("<IIIIQ", raw, i)
+    # A real header: known codec, payload smaller than the original, and an
+    # original no larger than one chunk. Keeps stray "CTEC" bytes inside
+    # compressed payloads from being counted as records.
+    if lib in NAMES and 0 < csz < osz <= chunk:
+        tot += csz; orig += osz; n += 1; codecs[NAMES[lib]] += 1
+    off = i + 4
+if not n:
+    print("  NO COMPRESSED CHUNKS FOUND in the tier."); raise SystemExit(1)
+print(f"  stored: {tot/1048576:.2f} MiB from {orig/1048576:.1f} MiB "
+      f"({orig/tot:.1f}x)")
+print(f"  codecs: " + " ".join(f"{k}:{v}" for k,v in codecs.most_common()))
+if expect and n != expect:
+    print(f"  WARNING: found {n} chunk headers, expected {expect} -- the tier "
+          f"may hold chunks from an earlier run, or the scan missed some.")
+PYEOF
 }
