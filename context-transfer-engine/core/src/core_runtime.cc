@@ -5590,6 +5590,7 @@ void Runtime::ReplayTransactionLogs() {
     loader.Close();
 
     for (const auto &[type, payload] : entries) {
+      try {
       if (type == TxnType::kCreateNewBlob) {
         auto txn = TransactionLog::DeserializeCreateNewBlob(payload);
         TagId tag_id{txn.tag_major_, txn.tag_minor_};
@@ -5754,6 +5755,19 @@ void Runtime::ReplayTransactionLogs() {
                                     txn.blob_name_;
         tag_blob_name_to_info_.erase(composite_key);
         blobs_replayed++;
+      }
+      } catch (const std::exception &e) {
+        // A damaged record. Stop replaying THIS log and keep everything
+        // already applied: records are appended in order, so nothing after a
+        // torn one can be trusted, and there is no way to resynchronise on a
+        // frame boundary. Recovering partially is the point of a WAL --
+        // previously this threw out of a coroutine and killed the runtime, so
+        // one bad record made every subsequent restart impossible.
+        HLOG(kWarning,
+             "ReplayTransactionLogs: stopping replay of {} at a damaged "
+             "record ({}); {} tag and {} blob op(s) applied before it",
+             blob_log_path, e.what(), tags_replayed, blobs_replayed);
+        break;
       }
     }
   }

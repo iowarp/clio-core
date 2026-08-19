@@ -38,6 +38,8 @@
 
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <stdexcept>
 #include <fstream>
 #include <string>
 #include <utility>
@@ -185,6 +187,7 @@ class TransactionLog {
   // ---- Log helpers for each transaction type ----
 
   void Log(TxnType type, const TxnCreateNewBlob &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -194,6 +197,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnExtendBlob &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -210,6 +214,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnExtendReplica &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -232,6 +237,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnClearBlob &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -240,6 +246,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnDelBlob &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -248,6 +255,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnSetBlobTransform &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -257,6 +265,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnCreateTag &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteString(buffer_, txn.tag_name_);
     WriteU32(buffer_, txn.tag_major_);
@@ -265,6 +274,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnDelTag &txn) {
+    std::lock_guard<std::mutex> txn_lk(mtx_);
     buffer_.clear();
     WriteString(buffer_, txn.tag_name_);
     WriteU32(buffer_, txn.tag_major_);
@@ -299,6 +309,7 @@ class TransactionLog {
 
     std::ifstream ifs(file_path_, std::ios::binary);
     if (!ifs.is_open()) return entries;
+    const std::uintmax_t file_size = fs::file_size(file_path_);
 
     while (ifs.peek() != EOF) {
       uint8_t type_byte;
@@ -308,6 +319,18 @@ class TransactionLog {
       uint32_t payload_size;
       ifs.read(reinterpret_cast<char *>(&payload_size), sizeof(payload_size));
       if (!ifs.good()) break;
+
+      // A framed size larger than what is left in the file cannot be a real
+      // record. Stop instead of sizing a vector from it: an interleaved write
+      // once put a blob name where this field belongs, and allocating from
+      // that value is an OOM (or a very large pointless allocation) before any
+      // parsing even starts. Everything after a bad frame is unusable anyway.
+      const std::streampos here = ifs.tellg();
+      if (here < 0 || static_cast<std::uintmax_t>(payload_size) >
+                          static_cast<std::uintmax_t>(file_size) -
+                              static_cast<std::uintmax_t>(here)) {
+        break;
+      }
 
       std::vector<char> payload(payload_size);
       ifs.read(payload.data(), payload_size);
@@ -447,6 +470,21 @@ class TransactionLog {
   clio::run::u64 capacity_bytes_ = 0;
   std::ofstream ofs_;
   std::vector<char> buffer_;  // Reusable serialization buffer
+  /**
+   * Serializes Log(), which mutates buffer_ and ofs_.
+   *
+   * Log() is called from worker threads, and the per-worker log array is sized
+   * ONCE, at container create, from GetTotalWorkerCount(). The scheduler grows
+   * the pool afterwards, so the `wid % blob_txn_logs_.size()` at the call site
+   * aliases several live workers onto a single log -- an alias that did not
+   * exist when the array was sized.
+   *
+   * Two of them interleaving in Log() emitted records whose framed size did
+   * not match their contents. Replay then read a blob name where a length
+   * prefix belonged, took the ASCII "V_00" as a length of 808,476,502, and
+   * segfaulted -- every restart after that write, including `clio_run restart`.
+   */
+  mutable std::mutex mtx_;
 
   /** Write a complete record: [u8 type][u32 size][payload] */
   void WriteRecord(TxnType type, const std::vector<char> &payload) {
@@ -482,32 +520,58 @@ class TransactionLog {
   }
 
   // ---- Deserialization primitives ----
+  /**
+   * Bounds gate for every read below.
+   *
+   * A WAL is exactly the structure that must tolerate a torn tail: the writer
+   * can die mid-record, and a reader that trusts the bytes turns a recoverable
+   * truncation into a crash. These primitives previously indexed straight into
+   * the payload, so one bad length (see mtx_) was an out-of-bounds read of
+   * ~808 MB rather than a rejected record.
+   *
+   * Throws so the caller can stop replaying THIS file at the first damaged
+   * record and keep everything already applied -- the correct WAL response,
+   * since nothing after a torn record can be trusted anyway.
+   */
+  static void Need(const std::vector<char> &data, size_t off, size_t n) {
+    if (off > data.size() || n > data.size() - off) {
+      throw std::runtime_error(
+          "TransactionLog: truncated record (need " + std::to_string(n) +
+          " bytes at offset " + std::to_string(off) + " of " +
+          std::to_string(data.size()) + ")");
+    }
+  }
   static clio::run::u32 ReadU32(const std::vector<char> &data, size_t &off) {
     clio::run::u32 val;
+    Need(data, off, sizeof(val));
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
   static clio::run::u64 ReadU64(const std::vector<char> &data, size_t &off) {
     clio::run::u64 val;
+    Need(data, off, sizeof(val));
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
   static float ReadFloat(const std::vector<char> &data, size_t &off) {
     float val;
+    Need(data, off, sizeof(val));
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
   static std::string ReadString(const std::vector<char> &data, size_t &off) {
     clio::run::u32 len = ReadU32(data, off);
+    Need(data, off, len);
     std::string s(data.data() + off, len);
     off += len;
     return s;
   }
   static void ReadRaw(const std::vector<char> &data, size_t &off, void *ptr,
                       size_t len) {
+    Need(data, off, len);
     std::memcpy(ptr, data.data() + off, len);
     off += len;
   }
