@@ -10,3 +10,7 @@ sglang/
 vllm/
 weightpress/
 xfstests/
+lammps/
+gromacs/
+lbann/
+eternia/

@@ -59,6 +59,65 @@ def _wait_for_free_vram(log, need_gb, timeout_s=180):
         f'{timeout_s}s -- the cell may fail for lack of device memory')
 
 
+
+def _reap_stale_runtime(log, binary, port=9441, timeout_s=60):
+    """Kill an orphaned benchmark left behind by a PREVIOUS cell.
+
+    These benchmarks host the runtime in-process, so an orphan keeps the
+    runtime's TCP port bound. `timeout` sends SIGTERM, which a WEDGED GPU cell
+    does not always honour -- the process survives its own kill, and every
+    LATER cell then dies at startup with "Could not start TCP server on any
+    host from hostfile", a FATAL that has nothing to do with that cell's own
+    settings.
+
+    One hang therefore invalidates the ENTIRE REMAINDER of a sweep rather than
+    costing a single cell. Measured: a Gray-Scott cache sweep wedged at 256
+    pages/block, and the next cell died instantly on the orphan rather than on
+    its own merits. This is also how a sweep can report "36 successful, 0
+    failed" while cells were being killed.
+
+    Processes are matched by the exact target of /proc/<pid>/exe, NOT by name:
+    pgrep -x compares against a 15-character comm field, which every one of
+    these binaries overflows, and pkill -f would also match the shell wrapper
+    and the tee. The exe match means an unrelated clio process belonging to
+    the user is never touched.
+    """
+    import os, signal, time
+
+    def orphans():
+        found = []
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                exe = os.path.basename(os.readlink('/proc/%s/exe' % entry))
+            except OSError:
+                continue  # not ours to see, or already gone
+            if exe == binary and int(entry) != os.getpid():
+                found.append(int(entry))
+        return found
+
+    pids = orphans()
+    if not pids:
+        return
+    log('  REAPING %d orphaned %s process(es) from a previous cell: %s'
+        % (len(pids), binary, ' '.join(str(p) for p in pids)))
+    log('  (a wedged cell that ignored SIGTERM holds port %d and would fail '
+        'every remaining cell of this sweep)' % port)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not orphans():
+            log('  reaped; port %d released' % port)
+            return
+        time.sleep(2)
+    log('  WARNING: %s survived SIGKILL for %ds -- this cell will probably '
+        'fail to bind port %d' % (binary, timeout_s, port))
+
 class ClioGpuVectorGrayscott(Application):
     """Gray-Scott stencil benchmark over a GPU vector."""
 
@@ -76,6 +135,26 @@ class ClioGpuVectorGrayscott(Application):
                     f'the stencil holds 6 input planes and 2 output planes at '
                     f'once',
              'type': int, 'default': 8},
+            {'name': 'cache_frac',
+             'msg': 'TOTAL page cache as a FRACTION OF THE DATASET (e.g. 0.75 '
+                    '= three quarters of it). Takes precedence over cache_mb. '
+                    'This is the axis that actually moves the hit rate: misses '
+                    'scale with 1 - cache/working_set, so what matters is '
+                    'COVERAGE, not an absolute byte count. Measured on weights '
+                    'at 16GB, taking the cache from 0.05%% to 6.25%% of the '
+                    'dataset (128x more slots) removed only 2.3%% of faults -- '
+                    'the benefit is a step function that turns on as coverage '
+                    'approaches 1, not a smooth 1/cache curve',
+             'type': float, 'default': 0.0},
+            {'name': 'cache_mb',
+             'msg': 'TOTAL page cache across all blocks, in MB. When set '
+                    '(non-zero) it overrides `slots`, which is derived as '
+                    'cache_mb/blocks/page_kb. This is the axis worth sweeping: '
+                    '`slots` is per block, so holding it fixed while blocks '
+                    f'varies changes the cache by the same factor and confounds '
+                    f'the two axes. The derived value must still clear the '
+                    f'{MIN_SLOTS}-plane floor',
+             'type': int, 'default': 0},
             {'name': 'steps', 'msg': 'Gray-Scott steps per timed run',
              'type': int, 'default': 4},
             {'name': 'page_kb',
@@ -116,14 +195,77 @@ class ClioGpuVectorGrayscott(Application):
              'default': '/tmp/clio_gpu_vector_grayscott'},
         ]
 
+
+    def _dataset_mb(self):
+        """Size of the workload's dataset in MB."""
+        return float(self.config['data_mb'])
+
+    def _cache_mb(self):
+        """Total device page cache in MB, from the fraction when one is set.
+
+        `cache_frac` wins over the absolute `cache_mb` because hit rate is
+        governed by COVERAGE -- cache divided by working set -- not by an
+        absolute size. A 1 GB cache is nearly useless against 16 GB (6.25%%
+        coverage, measured 2.3%% fewer faults) and nearly total against 1.3 GB.
+        Expressing the axis as a fraction makes the sweep comparable across
+        dataset sizes and puts its points where the knee actually is.
+        """
+        c = self.config
+        frac = c.get('cache_frac') or 0.0
+        if frac:
+            return self._dataset_mb() * frac
+        return c.get('cache_mb') or 0
+
+    def _slots(self):
+        """Planes per block, derived from the total cache budget when one is set.
+
+        `cache_mb` is the TOTAL device page cache; `slots` is per block. The
+        total is what costs VRAM and what a cache-size question is about, so it
+        is the swept quantity and `slots` follows from it.
+
+        A cell whose per-block share is under one plane is REFUSED, not rounded
+        up: rounding would silently run a larger cache than the one asked for
+        and report it under the small-cache label. The MIN_SLOTS floor is
+        checked separately by the caller, since it is a correctness bound
+        rather than an arithmetic one.
+        """
+        c = self.config
+        cache_mb = self._cache_mb()
+        if not cache_mb:
+            return c['slots']
+        per_block_kb = cache_mb * 1024.0 / c['blocks']
+        slots = int(cache_mb * 1024 // (c['blocks'] * c['page_kb']))
+        if slots < 1:
+            raise Exception(
+                f"cache_mb={cache_mb:.0f} over blocks={c['blocks']} leaves "
+                f"{per_block_kb:.1f} KB per block, under one {c['page_kb']}KB "
+                f"plane. Refused rather than rounded up to "
+                f"{c['blocks'] * c['page_kb'] / 1024.0:.0f} MB, which would "
+                f"report a larger cache under this cell's label.")
+        return slots
+
+    def _actual_cache_mb(self):
+        """Cache the run really allocates: blocks x slots x page_kb."""
+        c = self.config
+        return self._slots() * c['blocks'] * c['page_kb'] / 1024.0
+
     def _configure(self, **kwargs):
         c = self.config
         os.makedirs(c['output_dir'], exist_ok=True)
-        if c['slots'] < MIN_SLOTS:
+        slots = self._slots()
+        if slots < MIN_SLOTS:
+            # With cache_mb driving the axis this is reachable by asking for a
+            # total too small to give every block 8 planes, so the message
+            # names the total as well as the per-block result.
             raise Exception(
-                f"slots={c['slots']} but the stencil holds {MIN_SLOTS} planes "
+                f"slots={slots} but the stencil holds {MIN_SLOTS} planes "
                 f"at once (z-1,z,z+1 of u and v, plus both outputs). A smaller "
-                f"cache would let a plane still being read be evicted.")
+                f"cache would let a plane still being read be evicted."
+                + (f" Derived from cache_mb={c['cache_mb']} over "
+                   f"{c['blocks']} blocks at {c['page_kb']}KB; this workload "
+                   f"needs at least "
+                   f"{MIN_SLOTS * c['blocks'] * c['page_kb'] // 1024} MB."
+                   if c.get('cache_mb') else ''))
         plane_elems = c['page_kb'] * 1024 // 4
         nz = (c['data_mb'] * 1024 * 1024 // 4) // (4 * plane_elems)
         if nz < 3:
@@ -136,12 +278,12 @@ class ClioGpuVectorGrayscott(Application):
         # wants 16 GB of cache on an 8 GB GPU). They printed a header and died,
         # and only the post-processing trust check caught them. Fail here with
         # the arithmetic instead.
-        cache_gb = (c['blocks'] * c['slots'] * c['page_kb']) / (1024.0 * 1024.0)
+        cache_gb = (c['blocks'] * slots * c['page_kb']) / (1024.0 * 1024.0)
         budget_gb = c.get('vram_budget_gb', 7.0)
         if cache_gb + c['hbm_mb'] / 1024.0 > budget_gb:
             raise Exception(
                 f"page cache needs {cache_gb:.1f} GB (blocks={c['blocks']} x "
-                f"slots={c['slots']} x {c['page_kb']}KB) plus a "
+                f"slots={slots} x {c['page_kb']}KB) plus a "
                 f"{c['hbm_mb'] / 1024.0:.1f} GB kHBM tier, over the "
                 f"{budget_gb:.1f} GB budget. Reduce blocks, slots or page_kb.")
         self.log('GPU vector Gray-Scott configured')
@@ -150,7 +292,8 @@ class ClioGpuVectorGrayscott(Application):
         self.log(f'  total:     {c["data_mb"]}MB over 4 fields '
                  f'(u, v, u_next, v_next)')
         self.log(f'  parallel:  {c["blocks"]} blocks x {c["threads"]} threads, '
-                 f'cache {c["slots"]} planes/block')
+                 f'cache {slots} planes/block '
+                 f'({cache_gb * 1024:.0f}MB total over {c["blocks"]} blocks)')
         self.log(f'  kHBM tier: {c["hbm_mb"]}MB'
                  f'{" (HBM ONLY)" if c["hbm_only"] else ""}')
         if c['data_mb'] < 2 * c['hbm_mb']:
@@ -165,7 +308,7 @@ class ClioGpuVectorGrayscott(Application):
         completed sweep.
         """
         c = self.config
-        tag = (f'b{c["blocks"]}_pg{c["page_kb"]}kb_sl{c["slots"]}'
+        tag = (f'b{c["blocks"]}_pg{c["page_kb"]}kb_sl{self._slots()}'
                f'_d{c["data_mb"]}mb_hbm{c["hbm_mb"]}_st{c["steps"]}')
         return os.path.join(c['output_dir'], f'grayscott_{tag}.log')
 
@@ -184,6 +327,16 @@ class ClioGpuVectorGrayscott(Application):
         the reduction uses atomicAdd, so the float summation order follows the
         page and block layout and is not associative.
         """
+        # Record what the cache axis ACTUALLY was, not what was requested: the
+        # requested cache_mb is in the sweep variables already, so carrying the
+        # realised slots and total lets the post-processing check the two agree
+        # instead of assuming it.
+        try:
+            stats['slots'] = self._slots()
+            stats['cache_mb_actual'] = round(self._actual_cache_mb(), 1)
+        except Exception:
+            return
+
         path = self._output_file()
         if not os.path.exists(path):
             return
@@ -196,7 +349,12 @@ class ClioGpuVectorGrayscott(Application):
 
         line = None
         for ln in text.splitlines():
-            if ln.startswith('GRAYSCOTT blocks=') and 'ms=' in ln:
+            # Matched on the workload name plus `ms=`, NOT on the field that
+            # used to follow it: the summary line gained a `mode=` field when
+            # the baseline kernel was added, and `GRAYSCOTT blocks=` then
+            # matched nothing -- every cell reported completed=0 with no stats,
+            # which reads as a failed run rather than a stale parser.
+            if ln.startswith('GRAYSCOTT ') and 'ms=' in ln:
                 line = ln
         if line is None:
             # No summary line: the binary never got far enough to print one.
@@ -211,7 +369,10 @@ class ClioGpuVectorGrayscott(Application):
                          ('ny', 'ny'), ('nz', 'nz'), ('faults', 'faults'),
                          ('evicts', 'evicts'), ('puts', 'puts'),
                          ('get_errors', 'get_errors'),
-                         ('put_errors', 'put_errors')):
+                         ('put_errors', 'put_errors'),
+                         # Achievable H2D bandwidth at THIS page size.
+                         ('memcpy_pin_gbps', 'memcpy_pin_gbps'),
+                         ('memcpy_page_gbps', 'memcpy_page_gbps')):
             # Anchored at a word boundary: an unanchored 'ms=' also matches the
             # 'ms=' inside another key, which reports a wrong number rather
             # than a missing one and would pass every downstream check.
@@ -234,11 +395,14 @@ class ClioGpuVectorGrayscott(Application):
             stats['faults_per_plane_step'] = round(per_step, 2)
 
     def start(self):
+        # Clear a previous cell's orphan BEFORE anything else: it
+        # holds the runtime port and would fail this cell at startup.
+        _reap_stale_runtime(self.log, 'clio_gpu_vector_grayscott_bench')
         Which('clio_gpu_vector_grayscott_bench',
               LocalExecInfo(env=self.mod_env)).run()
         _wait_for_free_vram(self.log,
                             self.config['hbm_mb'] / 1024.0 +
-                            (self.config['blocks'] * self.config['slots'] *
+                            (self.config['blocks'] * self._slots() *
                              self.config['page_kb']) / (1024.0 * 1024.0) + 1.0)
         c = self.config
         os.makedirs(c['output_dir'], exist_ok=True)
@@ -246,7 +410,7 @@ class ClioGpuVectorGrayscott(Application):
 
         cmd = ['clio_gpu_vector_grayscott_bench',
                f'--blocks {c["blocks"]}', f'--threads {c["threads"]}',
-               f'--slots {c["slots"]}', f'--steps {c["steps"]}',
+               f'--slots {self._slots()}', f'--steps {c["steps"]}',
                f'--page-kb {c["page_kb"]}', f'--data-mb {c["data_mb"]}',
                f'--hbm-mb {c["hbm_mb"]}', f'--repeat {c["repeat"]}',
                f'--Du {c["Du"]}', f'--Dv {c["Dv"]}', f'--F {c["F"]}',

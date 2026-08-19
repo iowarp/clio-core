@@ -68,6 +68,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../benchmark/bench_memcpy_probe.h"
 
 using namespace std::chrono_literals;
 
@@ -922,6 +923,10 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u32 window = std::getenv("CLIO_GNN_WINDOW") ? (clio::run::u32)std::atoi(std::getenv("CLIO_GNN_WINDOW")) : 4;
   const clio::run::u64 page_rows = std::getenv("CLIO_GNN_PAGE_ROWS") ? (clio::run::u64)std::atoi(std::getenv("CLIO_GNN_PAGE_ROWS")) : 512;
   const clio::run::u64 page_size = page_rows * (clio::run::u64)F * sizeof(float);
+  // REFERENCE CEILING for the gather path: a bare H2D cudaMemcpy at exactly
+  // this page size, measured before the runtime starts. The gap between this
+  // and the achieved gather rate is the vector's overhead.
+  const MemcpyProbe mcp = ProbeMemcpyBandwidth(static_cast<size_t>(page_size));
   const clio::run::u64 epp = page_size / sizeof(float);
   REQUIRE(epp % (clio::run::u64)F == 0);
   clio::run::u64 want = std::getenv("CLIO_GNN_TRAIN_NODES") ? (clio::run::u64)std::atoll(std::getenv("CLIO_GNN_TRAIN_NODES")) : 0;
@@ -1488,9 +1493,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u64 peak_win = (clio::run::u64)window * page_size;
   std::fprintf(stderr,
       "[TRAIN] ETERNIA: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f val_acc=%.4f (%.2fs)  "
-      "peak GPU window=%lluMiB\n", et_loss[0], et_acc[0], epochs - 1,
+      "peak GPU window=%lluMiB memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
+      et_loss[0], et_acc[0], epochs - 1,
       et_loss[epochs - 1], et_acc[epochs - 1], et_vacc[epochs - 1], et_time,
-      (unsigned long long)(peak_win >> 20));
+      (unsigned long long)(peak_win >> 20), mcp.pinned_gbps,
+      mcp.pageable_gbps);
 
   // ---- Did the GPU actually read the right bytes? --------------------
   //

@@ -60,6 +60,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
 
@@ -71,6 +72,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "bench_memcpy_probe.h"
+
+/** CTE core pool id, matching pool_id "512.0" in the server config the
+ *  benchmark writes. The baseline talks to the core directly. */
+const clio::run::PoolId kCorePool(512, 0);
 
 namespace gv = clio::cte::gpu_vector;
 namespace gy = clio::run::gpu;
@@ -116,6 +122,52 @@ CTP_INLINE_CROSS_FUN float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
  * reduction reassociates at ~1e-12. The block count changed which planes
  * crossed a cache boundary, so it changed the answer.
  */
+/**
+ * BASELINE KERNEL -- the out-of-core model WITHOUT in-kernel faulting.
+ *
+ * Same stencil as StepKernel, but every plane arrives as a plain device
+ * pointer the HOST staged there. The kernel computes one z and exits; the
+ * host does all I/O around it, synchronously, in both directions:
+ *
+ *   read  : blocking CTE GetBlob per input plane
+ *   write : blocking CTE PutBlob per output plane  <-- writes are synchronous
+ *           too, not just reads. The paged path submits its writebacks with
+ *           BeginFlush and keeps going; the baseline cannot, so the put lands
+ *           on the critical path of every z-iteration.
+ *   copy  : blocking cudaMemcpy each way
+ *   kernel: torn down and relaunched for every single z
+ *
+ * Nothing overlaps. This is the cost the vector's in-kernel faulting and
+ * async writeback are there to remove, and it is the only one of the four
+ * baselines that exercises the WRITE path at all -- weights and k-means are
+ * read-only in their timed regions, so for them there is nothing to make
+ * synchronous.
+ */
+__global__ void GrayscottBaselineKernel(const float *uzm, const float *uz,
+                                        const float *uzp, const float *vzm,
+                                        const float *vz, const float *vzp,
+                                        float *unx, float *vnx, u64 plane,
+                                        u64 nx, u64 ny, int interior, float Du,
+                                        float Dv, float F, float K, float dt) {
+  for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
+    const u64 x = i % nx, y = i / nx;
+    const float u = uz[i];
+    const float v = vz[i];
+    float lu, lv;
+    if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
+      lu = 0.0f; lv = 0.0f;      // fixed boundary, as in StepKernel
+    } else {
+      lu = uz[i - 1] + uz[i + 1] + uz[i - nx] + uz[i + nx] + uzm[i] + uzp[i] -
+           6.0f * u;
+      lv = vz[i - 1] + vz[i + 1] + vz[i - nx] + vz[i + nx] + vzm[i] + vzp[i] -
+           6.0f * v;
+    }
+    const float uvv = u * v * v;
+    unx[i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
+    vnx[i] = v + dt * (Dv * lv + uvv - (F + K) * v);
+  }
+}
+
 __device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
   CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
                      v.AnyTransferInFlight(), v.FlushWaitTag());
@@ -219,8 +271,27 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+      // SLIDING-WINDOW HINT. The caller knows the reuse distance here and the
+      // cache cannot infer it: iteration z+1 needs planes z and z+1, plane
+      // z-1 leaves the window and is never touched again, and the two output
+      // planes are write-once. A recency policy gets this exactly backwards --
+      // z-1 was touched most recently of the three inputs, so LRU keeps it and
+      // evicts the plane about to be reused.
+      vec.RescorePage(vec.PageOf(ubase + z * plane), 1.0f);
+      vec.RescorePage(vec.PageOf(vbase + z * plane), 1.0f);
+      if (interior) {
+        vec.RescorePage(vec.PageOf(ubase + zp * plane), 1.0f);
+        vec.RescorePage(vec.PageOf(vbase + zp * plane), 1.0f);
+        // zm == z when not interior, so releasing it there would release the
+        // plane the next iteration still needs.
+        vec.RescorePage(vec.PageOf(ubase + zm * plane), 0.0f);
+        vec.RescorePage(vec.PageOf(vbase + zm * plane), 0.0f);
+      }
       vec.BeginFlush(unext + z * plane, plane);
       vec.BeginFlush(vnext + z * plane, plane);
+      // Write-once: consumed the moment the flush is submitted.
+      vec.RescorePage(vec.PageOf(unext + z * plane), 0.0f);
+      vec.RescorePage(vec.PageOf(vnext + z * plane), 0.0f);
     }
     __syncthreads();
   }
@@ -338,6 +409,12 @@ int main(int argc, char **argv) {
   u32 blocks = 64, threads = 256, slots = 8, steps = 4;
   u64 page_kb = 1024, data_mb = 16384, hbm_mb = 4096;
   int repeat = 3;
+  // Out-of-core WITHOUT in-kernel faulting: synchronous CTE reads AND
+  // writes, synchronous memcpy both ways, kernel torn down per z.
+  bool baseline = false;
+  // Storage tier: without it no workload ever touches a disk.
+  unsigned long long nvme_mb = 0;
+  std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;
   float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
 
@@ -358,6 +435,10 @@ int main(int argc, char **argv) {
     else if (a == "--hbm-mb") hbm_mb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--hbm-only") hbm_only = true;
+    else if (a == "--nvme-mb") nvme_mb = next();
+    // next() parses a number; the path needs the raw argv token.
+    else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
+    else if (a == "--baseline") baseline = true;
     else if (a == "--Du") Du = nextf();
     else if (a == "--Dv") Dv = nextf();
     else if (a == "--F") F = nextf();
@@ -394,6 +475,11 @@ int main(int argc, char **argv) {
   }
 
   const u64 page_bytes = page_kb * 1024;
+
+  // REFERENCE CEILING for the paging path: a bare H2D cudaMemcpy at exactly
+  // this page size, on an idle device before the runtime starts. The gap
+  // between this and the achieved rate is the vector's overhead.
+  const MemcpyProbe mcp = ProbeMemcpyBandwidth(static_cast<size_t>(page_bytes));
   const u64 plane = page_bytes / sizeof(float);   // one page == one XY plane
   // Square-ish plane: nx*ny == plane, both powers of two.
   u64 nx = 1, ny = plane;
@@ -437,6 +523,25 @@ int main(int argc, char **argv) {
           << "        capacity_limit: \"" << (data_mb + 1024) << "MB\"\n"
           << "        score: 0.2\n";
     }
+      // OPTIONAL STORAGE TIER. Without it the whole dataset lives in host
+      // DRAM and NOTHING EVER TOUCHES STORAGE -- what such a run measures is
+      // DRAM over PCIe, not I/O. On this machine that spill is nearly free,
+      // which is exactly why a cache-size sweep over a DRAM-only hierarchy
+      // comes back flat: there is no penalty for the cache to save.
+      //
+      // score BELOW the host tier. MaxBwDpe splits on target_score <=
+      // blob_score and sorts the preferred group DESCENDING, and the vector
+      // puts pages at blob score 1.0, so HIGHER score = preferred. This is the
+      // REVERSE of the GNN trainer's hierarchy, whose put path uses blob score
+      // 0.5 -- copying its numbers here would silently make storage the
+      // FIRST-choice tier.
+      if (nvme_mb > 0) {
+        cfg << "      - path: \"" << nvme_path << "\"\n"
+            << "        bdev_type: \"file\"\n"
+            << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
+            << "        score: 0.0\n";
+      }
+
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gv_grayscott_bench.yaml", 1);
@@ -484,6 +589,86 @@ int main(int argc, char **argv) {
   double *d_sum = nullptr;
   cudaMalloc(&d_sum, sizeof(double));
 
+  // ---- BASELINE DRIVER ------------------------------------------------
+  // Per z: blocking reads of the 6 input planes, blocking H2D, one kernel
+  // launch, blocking D2H, then BLOCKING PUTS of the two output planes. Every
+  // transfer is on the critical path and the grid is rebuilt for each z.
+  //
+  // The 6 reads are issued every iteration rather than kept as a sliding
+  // window. That IS the model being measured: with the kernel torn down at
+  // every step there is no in-kernel state to carry the window in, and a host
+  // that wanted to keep one would be reimplementing the cache this benchmark
+  // exists to compare against.
+  ctp::ipc::FullPtr<char> bl_h[6];
+  ctp::ipc::FullPtr<char> bl_out[2];
+  float *bl_d[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  float *bl_dout[2] = {nullptr, nullptr};
+  clio::cte::core::Client *bl_core = nullptr;
+  const u64 page_bytes_gs = plane * sizeof(float);
+  if (baseline) {
+    for (int i = 0; i < 6; ++i) {
+      bl_h[i] = CLIO_IPC->AllocateBuffer((size_t)page_bytes_gs);
+      if (bl_h[i].IsNull() ||
+          cudaMalloc(&bl_d[i], (size_t)page_bytes_gs) != cudaSuccess) {
+        std::fprintf(stderr, "GRAYSCOTT ERROR: baseline alloc failed\n");
+        return 1;
+      }
+    }
+    for (int i = 0; i < 2; ++i) {
+      bl_out[i] = CLIO_IPC->AllocateBuffer((size_t)page_bytes_gs);
+      if (bl_out[i].IsNull() ||
+          cudaMalloc(&bl_dout[i], (size_t)page_bytes_gs) != cudaSuccess) {
+        std::fprintf(stderr, "GRAYSCOTT ERROR: baseline alloc failed\n");
+        return 1;
+      }
+    }
+    bl_core = new clio::cte::core::Client(kCorePool);
+  }
+  // Blocking read of one plane into staging slot `i`.
+  auto bl_read = [&](int i, u64 region_base, u64 z) {
+    char nm[32];
+    gv::PageBlobName((region_base + z * plane) / plane, nm);
+    auto gf = bl_core->AsyncGetBlob(vec.TagId(), nm, 0, page_bytes_gs, 0,
+                                    bl_h[i].shm_.template Cast<void>(),
+                                    clio::run::PoolQuery::Local());
+    gf.Wait();
+    if (gf->GetReturnCode() != 0) {
+      std::memset(bl_h[i].ptr_, 0, (size_t)page_bytes_gs);
+    }
+    return cudaMemcpy(bl_d[i], bl_h[i].ptr_, (size_t)page_bytes_gs,
+                      cudaMemcpyHostToDevice) == cudaSuccess;
+  };
+  // SYNCHRONOUS WRITE of one output plane: D2H, then a blocking PutBlob.
+  auto bl_write = [&](int i, u64 region_base, u64 z) {
+    if (cudaMemcpy(bl_out[i].ptr_, bl_dout[i], (size_t)page_bytes_gs,
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      return false;
+    }
+    char nm[32];
+    gv::PageBlobName((region_base + z * plane) / plane, nm);
+    auto pf = bl_core->AsyncPutBlob(vec.TagId(), nm, 0, page_bytes_gs,
+                                    bl_out[i].shm_.template Cast<void>(), 1.0f);
+    pf.Wait();
+    return pf->GetReturnCode() == 0;
+  };
+  auto run_baseline_step = [&](u64 cu_, u64 cv_, u64 nu_, u64 nv_) {
+    for (u64 z = 0; z < nz; ++z) {
+      const bool interior = (z > 0 && z + 1 < nz);
+      const u64 zm = interior ? (z - 1) : z;
+      const u64 zp = interior ? (z + 1) : z;
+      if (!bl_read(0, cu_, zm) || !bl_read(1, cu_, z) || !bl_read(2, cu_, zp) ||
+          !bl_read(3, cv_, zm) || !bl_read(4, cv_, z) || !bl_read(5, cv_, zp)) {
+        return false;
+      }
+      GrayscottBaselineKernel<<<1, threads>>>(
+          bl_d[0], bl_d[1], bl_d[2], bl_d[3], bl_d[4], bl_d[5], bl_dout[0],
+          bl_dout[1], plane, nx, ny, interior ? 1 : 0, Du, Dv, F, K, dt);
+      if (cudaDeviceSynchronize() != cudaSuccess) return false;
+      if (!bl_write(0, nu_, z) || !bl_write(1, nv_, z)) return false;
+    }
+    return true;
+  };
+
   double best_ms = 1e30, checksum = 0.0;
   for (int r = 0; r < repeat; ++r) {
     // RE-SEED between repeats. Without this, repeat 2 continues evolving the
@@ -507,12 +692,19 @@ int main(int argc, char **argv) {
     const double t0 = NowMs();
     u64 cu = ubase, cv = vbase, nu = unext, nv = vnext;
     for (u32 s = 0; s < steps; ++s) {
-      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
-        StepKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu, nv, Du, Dv, F, K,
-            dt, vw, sv);
-      });
+      if (baseline) {
+        if (!run_baseline_step(cu, cv, nu, nv)) {
+          std::fprintf(stderr, "GRAYSCOTT ERROR: baseline step failed\n");
+          return 1;
+        }
+      } else {
+        runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          StepKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu, nv, Du, Dv, F, K,
+              dt, vw, sv);
+        });
+      }
       std::swap(cu, nu);
       std::swap(cv, nv);
     }
@@ -541,18 +733,65 @@ int main(int argc, char **argv) {
       (1024.0 * 1024.0 * 1024.0);
   const double gbps = (best_ms > 0.0) ? moved_gb / (best_ms / 1000.0) : 0.0;
 
+  // ---- TIER PLACEMENT CHECK -------------------------------------------
+  // Data must land in the FASTEST tier that has capacity, spilling only once
+  // that tier is full. MEASURED, not assumed: MaxBwDpe splits tiers on
+  // target_score <= blob_score and ranks within the group, so a tier scored on
+  // the wrong side of the blob's own score silently drops out of the preferred
+  // set. That has produced "kHBM 0MiB" with a healthy, correctly sized HBM
+  // tier sitting empty -- no error, just a run that never touched the GPU tier
+  // and lost the device-to-device fault path with it.
+  //
+  // Tier bdevs are numbered from major 512 with minor 1, in CONFIG ORDER,
+  // independent of cte_core's own major: (512,1) is the first storage
+  // entry (kHBM) and (513,1) the second (host). Deriving them from
+  // cte_core's major instead gave remaining > capacity -- an impossible
+  // reading that would have been reported as a placement violation.
+  {
+    clio::run::bdev::Client t_fast(clio::run::PoolId(512, 1));
+    clio::run::bdev::Client t_host(clio::run::PoolId(513, 1));
+    auto fa = t_fast.AsyncGetStats(); fa.Wait();
+    auto ha = t_host.AsyncGetStats(); ha.Wait();
+    const clio::run::u64 fast_cap = (clio::run::u64)hbm_mb * 1024ull * 1024ull;
+    const clio::run::u64 host_cap = (clio::run::u64)(data_mb + 1024) * 1024ull * 1024ull;
+    const clio::run::u64 fast_used =
+        fast_cap > fa->remaining_size_ ? fast_cap - fa->remaining_size_ : 0;
+    const clio::run::u64 host_used =
+        host_cap > ha->remaining_size_ ? host_cap - ha->remaining_size_ : 0;
+    // RAW remaining is printed alongside the derived used, because the
+    // derived number alone is not interpretable: if a queried pool does not
+    // exist or the stat fails, remaining reads 0 and "used" then equals the
+    // full capacity -- which looks like a completely full tier rather than a
+    // failed query. Both were indistinguishable in the first version of this
+    // report and it nearly produced a false VIOLATION.
+    std::fprintf(stderr,
+                 "TIER SPLIT: kHBM used=%lluMiB cap=%lluMiB remain=%lluMiB | "
+                 "host used=%lluMiB cap=%lluMiB remain=%lluMiB%s\n",
+                 (unsigned long long)(fast_used >> 20),
+                 (unsigned long long)(fast_cap >> 20),
+                 (unsigned long long)(fa->remaining_size_ >> 20),
+                 (unsigned long long)(host_used >> 20),
+                 (unsigned long long)(host_cap >> 20),
+                 (unsigned long long)(ha->remaining_size_ >> 20),
+                 (fast_used == 0 && fa->remaining_size_ == fast_cap)
+                     ? "   <-- nothing landed in the fastest tier"
+                     : "");
+  }
+
   std::fprintf(stderr,
-               "GRAYSCOTT blocks=%u thr=%u nx=%llu ny=%llu nz=%llu "
+               "GRAYSCOTT mode=%s blocks=%u thr=%u nx=%llu ny=%llu nz=%llu "
                "page_kb=%llu slots=%u steps=%u data_mb=%.0f hbm_mb=%llu "
                "ms=%.1f GB/s=%.2f v_checksum=%.6f faults=%llu evicts=%llu "
-               "puts=%llu get_errors=%llu put_errors=%llu\n",
+               "puts=%llu get_errors=%llu put_errors=%llu memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
+               baseline ? "baseline" : "paged",
                blocks, threads, (unsigned long long)nx, (unsigned long long)ny,
                (unsigned long long)nz, (unsigned long long)page_kb, slots,
                steps, logical_mb, (unsigned long long)hbm_mb, best_ms, gbps,
                checksum, (unsigned long long)st.faults,
                (unsigned long long)st.evicts, (unsigned long long)st.puts,
                (unsigned long long)st.get_errors,
-               (unsigned long long)st.put_errors);
+               (unsigned long long)st.put_errors,
+               mcp.pinned_gbps, mcp.pageable_gbps);
 
   cudaFree(d_sum);
   clio::run::CLIO_RUNTIME_FINALIZE();

@@ -29,6 +29,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
+#include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_runtime/gpu/yield_stack.h>
@@ -53,6 +54,7 @@ static constexpr clio::run::u32 kYieldLaneBytes = 256;
 #include <string>
 #include <thread>
 #include <vector>
+#include "bench_memcpy_probe.h"
 
 namespace gv = clio::cte::gpu_vector;
 namespace gy = clio::run::gpu;
@@ -125,6 +127,44 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Weight(clio::run::u64 i) {
 
 CTP_INLINE_CROSS_FUN clio::run::u32 Activation(clio::run::u64 i) {
   return static_cast<clio::run::u32>((i % 7) + 1);
+}
+
+/**
+ * BASELINE KERNEL -- the textbook out-of-core GPU model, for comparison.
+ *
+ * The GPU vector's whole claim is that a kernel can fault on data it does not
+ * have and keep running. The honest control for that claim is how everyone
+ * does it WITHOUT such a mechanism:
+ *
+ *   1. storage I/O is SYNCHRONOUS   -- the host blocks on a CTE GetBlob
+ *   2. HBM<->DRAM copy is SYNCHRONOUS -- a blocking cudaMemcpy per tile
+ *   3. THE KERNEL TERMINATES for I/O -- one launch per tile, and the grid is
+ *      torn down and rebuilt between every transfer
+ *
+ * Those three are one design, not three: once a kernel must exit to get data,
+ * the transfer is necessarily host-driven and serialised behind it. Nothing
+ * overlaps -- read, copy, compute and teardown all run end to end.
+ *
+ * It computes EXACTLY the contributions the paged kernel does (same integer
+ * arithmetic, same per-page accounting), so the existing got-vs-want checksum
+ * validates the baseline rather than a second implementation being trusted on
+ * inspection. Integer accumulation means order does not change the total.
+ */
+__global__ void WeightsBaselineKernel(const clio::run::u32 *tile,
+                                      clio::run::u64 gbase, clio::run::u64 n,
+                                      unsigned long long *sum,
+                                      unsigned long long *page_sum,
+                                      unsigned *page_visits,
+                                      clio::run::u64 page_elems) {
+  unsigned long long r = 0;
+  for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
+    r += static_cast<unsigned long long>(tile[i]) * Activation(gbase + i);
+  }
+  atomicAdd(sum, r);
+  atomicAdd(&page_sum[gbase / page_elems], r);
+  if (threadIdx.x == 0) {
+    atomicAdd(&page_visits[gbase / page_elems], 1u);
+  }
 }
 
 clio::run::u64 NowMs() {
@@ -416,6 +456,9 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
 int main(int argc, char **argv) {
   unsigned blocks = 16;
   clio::run::u64 hbm_mb = 64;
+  // Storage tier: without it no workload ever touches a disk.
+  unsigned long long nvme_mb = 0;
+  std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;   // omit the host spill tier entirely
   clio::run::u64 page_kb = 64;  // vector page size; the DATA granule is fixed
   // Threads per block. 32 = ONE warp, which means one warp is all there is to
@@ -430,6 +473,9 @@ int main(int argc, char **argv) {
   int prefetch = 1;
   int repeat = 3;
   bool yieldable = false;
+  // The out-of-core model WITHOUT in-kernel faulting: sync storage I/O,
+  // sync HBM<->DRAM copy, and the kernel torn down for every transfer.
+  bool baseline = false;
   clio::run::u32 flat_pct = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -438,6 +484,9 @@ int main(int argc, char **argv) {
     if (a == "--blocks") blocks = static_cast<unsigned>(next());
     else if (a == "--hbm-mb") hbm_mb = static_cast<clio::run::u64>(next());
     else if (a == "--hbm-only") hbm_only = true;
+    else if (a == "--nvme-mb") nvme_mb = next();
+    // next() parses a number; the path needs the raw argv token.
+    else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--threads") nthreads = static_cast<clio::run::u32>(next());
     else if (a == "--rt-threads") rt_threads = static_cast<clio::run::u32>(next());
     else if (a == "--pages") pages_per_block = static_cast<clio::run::u64>(next());
@@ -446,6 +495,12 @@ int main(int argc, char **argv) {
     else if (a == "--cpu-codec") gpu_codec = false;
     else if (a == "--no-prefetch") prefetch = 0;
     else if (a == "--yieldable") yieldable = true;
+    // --baseline REPLACES THE TIMED LOOP ONLY; the seed still runs through
+    // the vector, so it must use the coroutine kernel. Without this, passing
+    // --baseline alone silently left yieldable=false and seeding fell into the
+    // path its own source calls "single-threaded per block on purpose" -- a
+    // 64MB run then hung past 420s and looked like a broken baseline driver.
+    else if (a == "--baseline") { baseline = true; yieldable = true; }
     else if (a == "--flat-pct") flat_pct = static_cast<clio::run::u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
@@ -454,6 +509,8 @@ int main(int argc, char **argv) {
                    "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--threads T] [--pages P] "
                    "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n"
                    "       [--yieldable]  block-collective faults, parallel page reads\n",
+                 "       [--baseline]   NO in-kernel faulting: one kernel launch\n"
+                 "                      per tile, blocking GetBlob + blocking memcpy\n",
                    argv[0]);
       return 0;
     }
@@ -463,6 +520,10 @@ int main(int argc, char **argv) {
   // its capacity decides how much of the model is device-resident. Everything
   // beyond it spills to the host RAM tier below.
   const clio::run::u64 page_bytes = page_kb * 1024;
+  // REFERENCE CEILING for the paging path: a bare H2D cudaMemcpy at exactly
+  // this page size, on an idle device before the runtime starts. The gap
+  // between this and the achieved rate is the vector's overhead.
+  const MemcpyProbe mcp = ProbeMemcpyBandwidth(static_cast<size_t>(page_bytes));
   const clio::run::u64 page_elems = page_bytes / sizeof(clio::run::u32);
 
   {
@@ -513,6 +574,25 @@ int main(int argc, char **argv) {
           << "MB\"\n"
           << "        score: 0.2\n";
     }
+      // OPTIONAL STORAGE TIER. Without it the whole dataset lives in host
+      // DRAM and NOTHING EVER TOUCHES STORAGE -- what such a run measures is
+      // DRAM over PCIe, not I/O. On this machine that spill is nearly free,
+      // which is exactly why a cache-size sweep over a DRAM-only hierarchy
+      // comes back flat: there is no penalty for the cache to save.
+      //
+      // score BELOW the host tier. MaxBwDpe splits on target_score <=
+      // blob_score and sorts the preferred group DESCENDING, and the vector
+      // puts pages at blob score 1.0, so HIGHER score = preferred. This is the
+      // REVERSE of the GNN trainer's hierarchy, whose put path uses blob score
+      // 0.5 -- copying its numbers here would silently make storage the
+      // FIRST-choice tier.
+      if (nvme_mb > 0) {
+        cfg << "      - path: \"" << nvme_path << "\"\n"
+            << "        bdev_type: \"file\"\n"
+            << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
+            << "        score: 0.0\n";
+      }
+
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gv_weights_bench.yaml", 1);
@@ -670,6 +750,53 @@ int main(int argc, char **argv) {
     want += static_cast<unsigned long long>(Weight(i, flat_pct)) * Activation(i);
   }
 
+  // ---- BASELINE DRIVER ------------------------------------------------
+  // One tile at a time, nothing overlapped: block on the CTE read, block on
+  // the H2D copy, launch, tear the grid down, repeat. This is the control the
+  // vector's in-kernel faulting is measured against.
+  ctp::ipc::FullPtr<char> bl_host;
+  clio::run::u32 *bl_dev = nullptr;
+  clio::cte::core::Client *bl_core = nullptr;
+  if (baseline) {
+    bl_host = CLIO_IPC->AllocateBuffer(static_cast<size_t>(page_bytes));
+    if (bl_host.IsNull() ||
+        cudaMalloc(&bl_dev, static_cast<size_t>(page_bytes)) != cudaSuccess) {
+      std::fprintf(stderr, "bench: baseline staging alloc failed\n");
+      return 1;
+    }
+    bl_core = new clio::cte::core::Client(kCorePool);
+    std::fprintf(stderr, "[baseline] staging ready, %llu tiles of %lluB\n",
+                 (unsigned long long)total_pages,
+                 (unsigned long long)page_bytes);
+  }
+  auto run_baseline = [&]() {
+    for (clio::run::u64 p = 0; p < total_pages; ++p) {
+      if ((p & 7) == 0) {
+        std::fprintf(stderr, "[baseline] tile %llu/%llu\n",
+                     (unsigned long long)p, (unsigned long long)total_pages);
+      }
+      char nm[32];
+      gv::PageBlobName(p, nm);
+      // (1) SYNCHRONOUS storage read -- the host waits for the tier.
+      auto gf = bl_core->AsyncGetBlob(vec.TagId(), nm, 0, page_bytes, 0,
+                                      bl_host.shm_.template Cast<void>(),
+                                      clio::run::PoolQuery::Local());
+      gf.Wait();
+      if (gf->GetReturnCode() != 0) continue;   // never stored
+      // (2) SYNCHRONOUS HBM<->DRAM copy.
+      if (cudaMemcpy(bl_dev, bl_host.ptr_, static_cast<size_t>(page_bytes),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+      }
+      // (3) The kernel runs ONLY while its tile is resident, then exits.
+      WeightsBaselineKernel<<<1, nthreads>>>(
+          bl_dev, p * page_elems, page_elems, d_sum, d_page_sum, d_page_visits,
+          page_elems);
+      if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    }
+    return true;
+  };
+
   double best_gbps = 0.0;
   clio::run::u32 rounds = 0;
   clio::run::u64 best_ms = 0;
@@ -679,7 +806,12 @@ int main(int argc, char **argv) {
     cudaMemset(d_page_sum, 0, total_pages * sizeof(unsigned long long));
     cudaMemset(d_page_visits, 0, total_pages * sizeof(unsigned));
     const clio::run::u64 t0 = NowMs();
-    if (yieldable) {
+    if (baseline) {
+      if (!run_baseline()) {
+        std::fprintf(stderr, "bench: baseline tile loop failed\n");
+        return 1;
+      }
+    } else if (yieldable) {
       gy::Yieldable<> drv(blocks, nthreads);
       gy::YieldStack ystack(blocks, nthreads, kYieldLaneBytes);
       rounds = drv.RunToCompletion(
@@ -765,13 +897,58 @@ int main(int argc, char **argv) {
                  (unsigned long long) stats.put_errors);
   }
 
+  // ---- TIER PLACEMENT CHECK -------------------------------------------
+  // Data must land in the FASTEST tier that has capacity, spilling only once
+  // that tier is full. MEASURED, not assumed: MaxBwDpe splits tiers on
+  // target_score <= blob_score and ranks within the group, so a tier scored on
+  // the wrong side of the blob's own score silently drops out of the preferred
+  // set. That has produced "kHBM 0MiB" with a healthy, correctly sized HBM
+  // tier sitting empty -- no error, just a run that never touched the GPU tier
+  // and lost the device-to-device fault path with it.
+  //
+  // Tier bdevs are numbered from major 512 with minor 1, in CONFIG ORDER,
+  // independent of cte_core's own major: (512,1) is the first storage
+  // entry (kHBM) and (513,1) the second (host). Deriving them from
+  // cte_core's major instead gave remaining > capacity -- an impossible
+  // reading that would have been reported as a placement violation.
+  {
+    clio::run::bdev::Client t_fast(clio::run::PoolId(512, 1));
+    clio::run::bdev::Client t_host(clio::run::PoolId(513, 1));
+    auto fa = t_fast.AsyncGetStats(); fa.Wait();
+    auto ha = t_host.AsyncGetStats(); ha.Wait();
+    const clio::run::u64 fast_cap = (clio::run::u64)hbm_mb * 1024ull * 1024ull;
+    const clio::run::u64 host_cap = (logical / (1024ull * 1024ull) + 1024ull) * 1024ull * 1024ull;
+    const clio::run::u64 fast_used =
+        fast_cap > fa->remaining_size_ ? fast_cap - fa->remaining_size_ : 0;
+    const clio::run::u64 host_used =
+        host_cap > ha->remaining_size_ ? host_cap - ha->remaining_size_ : 0;
+    // RAW remaining is printed alongside the derived used, because the
+    // derived number alone is not interpretable: if a queried pool does not
+    // exist or the stat fails, remaining reads 0 and "used" then equals the
+    // full capacity -- which looks like a completely full tier rather than a
+    // failed query. Both were indistinguishable in the first version of this
+    // report and it nearly produced a false VIOLATION.
+    std::fprintf(stderr,
+                 "TIER SPLIT: kHBM used=%lluMiB cap=%lluMiB remain=%lluMiB | "
+                 "host used=%lluMiB cap=%lluMiB remain=%lluMiB%s\n",
+                 (unsigned long long)(fast_used >> 20),
+                 (unsigned long long)(fast_cap >> 20),
+                 (unsigned long long)(fa->remaining_size_ >> 20),
+                 (unsigned long long)(host_used >> 20),
+                 (unsigned long long)(host_cap >> 20),
+                 (unsigned long long)(ha->remaining_size_ >> 20),
+                 (fast_used == 0 && fa->remaining_size_ == fast_cap)
+                     ? "   <-- nothing landed in the fastest tier"
+                     : "");
+  }
+
   std::fprintf(stderr,
                "GVW mode=%s%s blocks=%u thr=%u hbm=%lluMB slots=%u pages=%llu "
                "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
                "checksum=%s put_errors=%llu faults=%llu get_errors=%llu "
-               "evicts=%llu rounds=%u\n",
-               compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw",
-               yieldable ? "+yield" : "", blocks, nthreads,
+               "evicts=%llu rounds=%u memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
+               baseline ? "baseline" : (compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw"),
+               baseline ? "" : (yieldable ? "+yield" : ""), blocks, nthreads,
                (unsigned long long) hbm_mb, slots,
                (unsigned long long) (n / page_elems), flat_pct,
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
@@ -780,7 +957,8 @@ int main(int argc, char **argv) {
                (unsigned long long) stats.put_errors,
                (unsigned long long) stats.faults,
                (unsigned long long) stats.get_errors,
-               (unsigned long long) stats.evicts, rounds);
+               (unsigned long long) stats.evicts, rounds,
+               mcp.pinned_gbps, mcp.pageable_gbps);
   return ok ? 0 : 1;
 }
 
