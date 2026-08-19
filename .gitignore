@@ -117,6 +117,10 @@ context-transfer-engine/adapter/hdf5_vol/example/
 context-transfer-engine/compressor/example/*
 !context-transfer-engine/compressor/example/CMakeLists.txt
 !context-transfer-engine/compressor/example/neuropress_grayscott_h5/
+# Same reasoning for the LAMMPS demo: a stock, unmodified simulation whose
+# binary links nothing from Clio. Scripts and an input deck only -- CMake
+# builds nothing here, the harness drives a prebuilt LAMMPS.
+!context-transfer-engine/compressor/example/neuropress_lammps_h5/
 Win32/
 x64/
 Release/
