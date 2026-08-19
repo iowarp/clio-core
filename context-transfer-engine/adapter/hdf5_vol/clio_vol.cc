@@ -93,6 +93,15 @@ struct clio_obj_t {
   hid_t           under_vol_id;
   clio_file_t  *parent_file;
   clio_kind_t     kind = clio_kind_t::kObj;
+  /* This object's location in the file, absolute and normalised ("" for the
+     file root, "/particles/all" for a group). HDF5 hands a connector the name
+     RELATIVE to whatever object the call was made on, so this is the only way
+     to key a dataset by something stable: H5Dcreate(group, "value") and
+     H5Dopen(file, "/g/value") name the same dataset and must produce the same
+     key. Without it every h5md-shaped file collided -- three datasets all
+     created as "value" inside their own group shared one set of chunk blobs
+     and silently overwrote each other. */
+  std::string     path;
 };
 
 struct clio_file_t {
@@ -207,18 +216,37 @@ struct clio_dataset_t {
    same fully-formed clio_dataset_t — otherwise a dataset returned as a bare
    clio_obj_t would be fatally mis-cast when HDF5 later routes
    dataset_read/close to it. */
+/* Compose an absolute object path from a parent's path and the (relative)
+   name HDF5 passed to this call.
+
+   A name that is already absolute is taken as-is: HDF5 permits
+   H5Dopen(file, "/g/value") and H5Dopen(group, "value") to designate the same
+   dataset, and both have to normalise to one key or a writer and a reader
+   never meet. An empty/absent name yields the parent unchanged, which keeps
+   the "no stable path -> not cacheable" contract intact. */
+static std::string clio_join_path(const std::string &parent,
+                                    const char *name) {
+  if (name == nullptr || name[0] == '\0') return parent;
+  if (name[0] == '/') return name;              /* already absolute */
+  std::string out = parent;
+  if (out.empty() || out.back() != '/') out.push_back('/');
+  out.append(name);
+  return out;
+}
+
 static clio_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
                                               clio_file_t *parent_file,
-                                              const char *path) {
+                                              const std::string &path) {
   auto *dset = new clio_dataset_t;
   dset->obj.under_object = under;
   dset->obj.under_vol_id = under_vol_id;
   dset->obj.kind = clio_kind_t::kDataset;
   dset->file = parent_file;
   dset->obj.parent_file = parent_file;
-  dset->dataset_path = path ? path : "";
+  dset->dataset_path = path;
+  dset->obj.path = path;
   dset->cacheable = (parent_file != nullptr) && parent_file->cache_enabled &&
-                    path && path[0] != '\0';
+                    !path.empty();
   /* Register with the file so Safe-mode flush/close can drain this dataset's
      pending puts. Only cacheable datasets accumulate CTE puts. */
   if (dset->cacheable) {
@@ -783,7 +811,8 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
      CLIO_VOL_TRACE (previously they were silently dropped). */
   clio_file_t *parent_file = ctx ? ctx->parent_file : nullptr;
   if (obj_type == H5I_DATASET) {
-    return make_dataset_wrapper(under, under_vol_id, parent_file, nullptr);
+    return make_dataset_wrapper(under, under_vol_id, parent_file,
+                                std::string());
   }
   auto *o = new clio_obj_t;
   o->under_object = under;
@@ -1627,7 +1656,8 @@ static void *clio_dataset_create(void *obj,
   if (!under_dset) return nullptr;
 
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              clio_join_path(o->path, name));
 }
 
 static void *clio_dataset_open(void *obj,
@@ -1642,7 +1672,8 @@ static void *clio_dataset_open(void *obj,
   if (!under_dset) return nullptr;
 
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              clio_join_path(o->path, name));
 }
 
 /* ---- Access telemetry helpers (observe-only; active only under CLIO_VOL_TRACE) */
@@ -2775,6 +2806,16 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                           clio_type_matches_file(dataset, mem_type_id[d],
                                                  dxpl_id) &&
                           !clio_is_collective(dxpl_id);
+    CLIO_PATH_TRACE("READ   gate  flat=%d usable=%d cacheable=%d type_ok=%d "
+                    "type_match=%d collective=%d whole=%d populated=%d",
+                    cacheable_flat ? 1 : 0,
+                    clio_cache_usable(dataset->file) ? 1 : 0,
+                    dataset->cacheable ? 1 : 0,
+                    clio_type_is_read_cacheable(mem_type_id[d]) ? 1 : 0,
+                    clio_type_matches_file(dataset, mem_type_id[d], dxpl_id) ? 1 : 0,
+                    clio_is_collective(dxpl_id) ? 1 : 0,
+                    clio_read_is_whole(mem_space_id[d], file_space_id[d]) ? 1 : 0,
+                    clio_cache_populated(dataset) ? 1 : 0);
     if (!cacheable_flat) {
       /* Propagate the native status: a failed read previously returned success
          with the user's buffer untouched. */
@@ -3150,6 +3191,7 @@ static void *clio_group_create(void *obj,
   grp->under_object = under;
   grp->under_vol_id = o->under_vol_id;
   grp->parent_file = o->parent_file;     /* inherit from parent */
+  grp->path = clio_join_path(o->path, name);
   return grp;
 }
 
@@ -3166,6 +3208,7 @@ static void *clio_group_open(void *obj,
   grp->under_object = under;
   grp->under_vol_id = o->under_vol_id;
   grp->parent_file = o->parent_file;     /* inherit from parent */
+  grp->path = clio_join_path(o->path, name);
   return grp;
 }
 
@@ -3355,7 +3398,8 @@ static void *clio_object_open(void *obj,
     if (loc_params && loc_params->type == H5VL_OBJECT_BY_NAME) {
       name = loc_params->loc_data.loc_by_name.name;
     }
-    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file, name);
+    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file,
+                                clio_join_path(o->path, name));
   }
 
   auto *wrapped = new clio_obj_t;

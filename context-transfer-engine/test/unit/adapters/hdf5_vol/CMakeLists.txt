@@ -112,11 +112,18 @@ if(NOT WIN32)
   add_test(NAME cte_hdf5_vol_io_append
       COMMAND test_hdf5_vol_io "HDF5 VOL IO - Appended frames populate the linear cache")
 
+  # Blob keys must come from the dataset's absolute path. Keyed on the bare
+  # name HDF5 passes, every h5md/openPMD-shaped file collides -- distinct
+  # datasets sharing chunk blobs is a wrong answer, not a slow one.
+  add_test(NAME cte_hdf5_vol_io_keying
+      COMMAND test_hdf5_vol_io "HDF5 VOL IO - Same dataset name in two groups stays distinct")
+
   set_tests_properties(
       cte_hdf5_vol_io_dataset
       cte_hdf5_vol_io_groups_attrs
       cte_hdf5_vol_io_passthrough
       cte_hdf5_vol_io_append
+      cte_hdf5_vol_io_keying
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"

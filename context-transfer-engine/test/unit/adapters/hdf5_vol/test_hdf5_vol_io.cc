@@ -373,9 +373,9 @@ TEST_CASE("HDF5 VOL IO - Chunk blobs hold only their own bytes",
   H5Sclose(space);
   REQUIRE(H5Fclose(file) >= 0);
 
-  REQUIRE(cteBlobSize(path, "data/chunk_0") == 4096);
-  REQUIRE(cteBlobSize(path, "data/chunk_1") == 4096);  // was 8192 (1 chunk hole)
-  REQUIRE(cteBlobSize(path, "data/chunk_3") == 4096);  // was 16384
+  REQUIRE(cteBlobSize(path, "/data/chunk_0") == 4096);
+  REQUIRE(cteBlobSize(path, "/data/chunk_1") == 4096);  // was 8192 (1 chunk hole)
+  REQUIRE(cteBlobSize(path, "/data/chunk_3") == 4096);  // was 16384
 
   REQUIRE(H5Pclose(fapl) >= 0);
 }
@@ -409,7 +409,7 @@ TEST_CASE("HDF5 VOL IO - Whole rewrite invalidates when staging is skipped",
   REQUIRE(H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
                   rbuf.data()) >= 0);
   REQUIRE(rbuf[0] == 1);
-  REQUIRE(cteBlobSize(path, "data/chunk_0") > 0);  // v1 image is cached
+  REQUIRE(cteBlobSize(path, "/data/chunk_0") > 0);  // v1 image is cached
 
   // Whole rewrite: no staging under read-miss, so the v1 image must be
   // invalidated or the read below hits it.
@@ -470,7 +470,7 @@ TEST_CASE("HDF5 VOL IO - Partial-write-first dataset stays cacheable",
   H5Sclose(space);
   REQUIRE(H5Fclose(file) >= 0);
 
-  REQUIRE(cteBlobSize(path, "data/chunk_0") == kN * sizeof(int));
+  REQUIRE(cteBlobSize(path, "/data/chunk_0") == kN * sizeof(int));
 
   // And the data itself round-trips.
   hid_t file2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
@@ -513,11 +513,11 @@ TEST_CASE("HDF5 VOL IO - A missing chunk is a miss, not garbage",
   REQUIRE(H5Dclose(dset) >= 0);  // drains the async puts
   H5Sclose(space);
   REQUIRE(H5Fclose(file) >= 0);
-  REQUIRE(cteBlobSize(path, "data/chunk_2") > 0);
+  REQUIRE(cteBlobSize(path, "/data/chunk_2") > 0);
 
   // Evict a middle chunk. chunk_0 survives, so the read still hit-tests as a
   // cache hit and must discover the hole during reassembly.
-  cteDelBlob(path, "data/chunk_2");
+  cteDelBlob(path, "/data/chunk_2");
 
   hid_t file2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
   REQUIRE(file2 >= 0);
@@ -538,7 +538,7 @@ TEST_CASE("HDF5 VOL IO - A missing chunk is a miss, not garbage",
   // so the hit-test key is gone. Without that, the assertion above could pass
   // on whatever the recycled buffer happened to hold; this is the part that
   // actually distinguishes "detected the hole" from "got lucky".
-  REQUIRE(cteBlobSize(path, "data/chunk_0") == 0);
+  REQUIRE(cteBlobSize(path, "/data/chunk_0") == 0);
 
   REQUIRE(H5Dclose(dset2) >= 0);
   REQUIRE(H5Fclose(file2) >= 0);
@@ -626,7 +626,7 @@ TEST_CASE("HDF5 VOL IO - Appended frames populate the linear cache",
   size_t cached_total = 0;
   for (size_t i = 0; i < num_chunks; ++i) {
     const size_t expect = std::min(kChunk, kTotalBytes - i * kChunk);
-    const std::string blob = "data/chunk_" + std::to_string(i);
+    const std::string blob = "/data/chunk_" + std::to_string(i);
     REQUIRE(cteBlobSize(path, blob) == expect);
     cached_total += expect;
   }
@@ -648,6 +648,87 @@ TEST_CASE("HDF5 VOL IO - Appended frames populate the linear cache",
 
   REQUIRE(H5Dclose(dset2) >= 0);
   REQUIRE(H5Fclose(file2) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+TEST_CASE("HDF5 VOL IO - Same dataset name in two groups stays distinct",
+          "[hdf5_vol][io][keying]") {
+  // Blob keys are derived from the dataset's name. HDF5 hands the connector
+  // the name RELATIVE to the location object, so two datasets created as
+  // H5Dcreate(group, "value", ...) in different groups both arrive as "value"
+  // -- and keyed on that alone they share every chunk blob and overwrite each
+  // other. That is not a cache miss, it is a wrong answer: a read that hits
+  // those keys returns the other dataset's bytes.
+  //
+  // This is exactly the shape every h5md/openPMD/AMReX writer produces. A
+  // 1 GB LAMMPS run wrote position, velocity and force -- three 328 MiB
+  // datasets -- into one set of "value/chunk_N" keys: 83 distinct chunk
+  // indices where 246 were expected.
+  //
+  // The second half of the same defect is that a reader opening by absolute
+  // path ("/g_a/value") keys differently from the writer that created it
+  // relative to a group, so nothing written can ever be found again.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string path = "/tmp/clio_vol_io_keying.h5";
+  std::remove(path.c_str());
+
+  constexpr size_t kN = 4096;  // 16 KiB = 4 chunks at the 4 KiB test size
+  std::vector<int> a(kN), b(kN);
+  for (size_t i = 0; i < kN; ++i) {
+    a[i] = static_cast<int>(i + 1000000);
+    b[i] = static_cast<int>(i + 9000000);   // disjoint from a[] on every index
+  }
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+  hsize_t dims[1] = {kN};
+
+  // Two groups, each with a dataset called "value" -- the h5md layout.
+  for (int which = 0; which < 2; ++which) {
+    const char *gname = which == 0 ? "g_a" : "g_b";
+    hid_t grp = H5Gcreate2(file, gname, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    REQUIRE(grp >= 0);
+    hid_t space = H5Screate_simple(1, dims, nullptr);
+    hid_t dset = H5Dcreate2(grp, "value", H5T_NATIVE_INT, space,
+                            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    REQUIRE(dset >= 0);
+    REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     which == 0 ? a.data() : b.data()) >= 0);
+    REQUIRE(H5Dclose(dset) >= 0);   // drains the async puts
+    H5Sclose(space);
+    REQUIRE(H5Gclose(grp) >= 0);
+  }
+  REQUIRE(H5Fclose(file) >= 0);
+
+  // The two datasets must occupy DIFFERENT blob keys. Keyed on the bare name
+  // both would live at "value/chunk_0" and the second write would overwrite
+  // the first.
+  REQUIRE(cteBlobSize(path, "/g_a/value/chunk_0") == 4096);
+  REQUIRE(cteBlobSize(path, "/g_b/value/chunk_0") == 4096);
+
+  // And each dataset reads back its OWN bytes through a fresh handle. Under
+  // the collision this is where the wrong answer surfaces: whichever group
+  // was written last supplies both.
+  hid_t f2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  REQUIRE(f2 >= 0);
+  for (int which = 0; which < 2; ++which) {
+    const char *dpath = which == 0 ? "/g_a/value" : "/g_b/value";
+    const std::vector<int> &want = which == 0 ? a : b;
+    hid_t d = H5Dopen2(f2, dpath, H5P_DEFAULT);
+    REQUIRE(d >= 0);
+    std::vector<int> rbuf(kN, -1);
+    REQUIRE(H5Dread(d, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                    rbuf.data()) >= 0);
+    bool match = true;
+    for (size_t i = 0; i < kN; ++i) {
+      if (rbuf[i] != want[i]) { match = false; break; }
+    }
+    REQUIRE(match);
+    REQUIRE(H5Dclose(d) >= 0);
+  }
+  REQUIRE(H5Fclose(f2) >= 0);
   REQUIRE(H5Pclose(fapl) >= 0);
 }
 
