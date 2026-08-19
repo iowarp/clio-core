@@ -3421,6 +3421,21 @@ clio::run::TaskResume Runtime::PodGetBlob(
     clio::run::shared_ptr<PodGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
+    // CLIO_DR_LOG=1: task-identity trace for the stale-page hunt. A repeated
+    // (task ptr, id) pair here means one submission was DELIVERED TWICE by
+    // the gpu2cpu queue; distinct ids into one destination mean the device
+    // double-issued.
+    static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+    if (dr_log) {
+      fprintf(stderr, "[gb] t %p id %u.%u.%u.%u blob %s dst %p\n",
+              (void *)task.get(), task->task_id_.pid_, task->task_id_.tid_,
+              task->task_id_.major_, task->task_id_.unique_,
+              task->blob_name_.c_str(),
+              (void *)CLIO_IPC->ToFullPtr(task->blob_data_)
+                  .template Cast<char>().ptr_);
+    }
+  }
+  {
     std::string eff_name = task->blob_name_.str();
     if (task->gpu_page_idx_ != PodGetBlobTask::kNoPageIdx) {
       eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
@@ -3503,6 +3518,22 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
     clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_CPU_IPC;
+  {
+    // CLIO_DR_LOG=1: per-record trace (stale-page hunt) -- multi gets were
+    // invisible to the PodGetBlob trace and are most of a rebuild storm.
+    static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+    if (dr_log) {
+      clio::run::u32 nn = task->count_;
+      if (nn > kPodMultiMax) nn = kPodMultiMax;
+      for (clio::run::u32 i = 0; i < nn; ++i) {
+        fprintf(stderr, "[mg] t %p id %u.%u rec %u blob %s dst %p\n",
+                (void *)task.get(), task->task_id_.major_,
+                task->task_id_.unique_, i, task->reqs_[i].blob_name_.c_str(),
+                (void *)CLIO_IPC->ToFullPtr(task->reqs_[i].data_)
+                    .template Cast<char>().ptr_);
+      }
+    }
+  }
   const unsigned long long ev_t0 = clio::run::CycleNow();
   task->num_ok_ = 0;
   int first_rc = 0;

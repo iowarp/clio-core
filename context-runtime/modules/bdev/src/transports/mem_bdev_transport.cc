@@ -656,6 +656,16 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
                                           clio::run::u64& bytes_read) {
   clio::run::u64 total_bytes_read = 0;
   clio::run::u64 data_offset = 0;
+  // CLIO_DR_LOG=1: trace every device-destination read so a corrupted frame
+  // address can be matched against the copy that wrote it (stale-page hunt).
+  static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+  if (dr_log) {
+    fprintf(stderr, "[dr-task] dst %p sz %llu off %llu\n", (void *)data,
+            (unsigned long long)task->length_,
+            (unsigned long long)(task->blocks_.empty()
+                                     ? 0
+                                     : task->blocks_[0].offset_));
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -814,6 +824,12 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
   // device-backed SOURCE page (GetRamPage returns raw device pointers then,
   // and memcpy from device memory is invalid however dst is allocated).
   const bool use_stream = dev_dst || device_backed_;
+  // CLIO_DR_LOG=1: trace device-destination direct reads (stale-page hunt).
+  static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+  if (dr_log && use_stream) {
+    fprintf(stderr, "[dr-direct] dst %p sz %llu off %llu\n", (void *)dst,
+            (unsigned long long)size, (unsigned long long)off);
+  }
   void* stream = nullptr;
   if (use_stream) {
     // Borrowed, never created (creating a stream needs the context write lock

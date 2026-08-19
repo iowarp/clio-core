@@ -297,6 +297,7 @@ class DeviceVector {
       p->last_access = Now();
       p->score += 1.0f;
       last_page_ = p;
+      last_pn_ = pn;
     }
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
@@ -408,6 +409,7 @@ class DeviceVector {
       // 3/4 fast here) — do not re-tune blind; measure page-level churn
       // first.
       last_page_ = p;
+      last_pn_ = pn;
     }
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
@@ -693,6 +695,16 @@ class DeviceVector {
       // it is silent corruption, so it is not a candidate at any score.
       if (pgi.pins != 0u) continue;
       if (pgi.page_num == kNoPage) {
+        // A FREED slot can still have I/O IN FLIGHT targeting its frame
+        // (e.g. a batch settle freeing a failed record whose sibling copies
+        // have not retired, or any path that clears page_num early). The
+        // victim branch below has always checked fetching/flushing; this
+        // fast-path did not, and handing such a frame to a new page let the
+        // old transfer land on top of the new page's content. Caught live:
+        // page 33's freshly written frame containing page 57's bytes -- a
+        // crossed copy, not stale data -- the intermittent rebuild
+        // corruption (~25% of runs).
+        if (pgi.fetching || pgi.flushing) continue;
         return i;
       }
       // Score is still AGED here so the frequency history stays live and the
@@ -1047,11 +1059,22 @@ class DeviceVector {
    */
   CTP_GPU_FUN Page *PinHeld() {
     Page *p = last_page_;
-    if (p != nullptr) {
-      LockBlock();
-      p->pins += 1u;
+    if (p == nullptr) return nullptr;
+    LockBlock();
+    // RE-VALIDATE under the lock. In a SHARED (ro-shard) cache a sibling
+    // block can evict and re-tenant this slot between the hold that cached
+    // last_page_ and this pin; pinning blind then protects -- and lets the
+    // caller PUBLISH -- the wrong page's frame. Caught live: page 33
+    // published to a frame a sibling had re-claimed for page 57, whose
+    // in-flight fetch then landed on top of page 33's freshly written
+    // content (the intermittent rebuild corruption, ~25% of runs). A null
+    // return means the caller must re-hold and try again.
+    if (p->page_num != last_pn_ || p->fetching != 0u) {
       UnlockBlock();
+      return nullptr;
     }
+    p->pins += 1u;
+    UnlockBlock();
     return p;
   }
 
@@ -1732,6 +1755,9 @@ class DeviceVector {
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
   Page *last_page_ = nullptr;
+  /** Page number last_page_ was holding when it was cached, so PinHeld can
+   *  detect a sibling block re-tenanting the slot in a SHARED shard cache. */
+  clio::run::u64 last_pn_ = kNoPage;
   /**
    * Slot index where the lock-free scan STARTS: the last hit.
    *
@@ -2236,6 +2262,13 @@ class DeviceVector {
     if (n > h_->pages_per_block_) n = h_->pages_per_block_;
 
     MultiBatch *mb = BlockBatches();
+    // Same POD-reuse rule as SubmitGetAsync/BeginFetchRunLocked: a still-
+    // pending run-fetch on the sync slot must be settled before its task is
+    // rewritten, or the new Send's completion-flag reset races the old
+    // completion across PCIe.
+    if (mb[0].async_pending != 0u) {
+      SettleOneLocked(&mb[0]);
+    }
     PrepareMultiGet(mb[0].get);
     clio::run::u32 filled = 0;
     clio::run::u32 resident = 0;
@@ -2538,6 +2571,20 @@ class DeviceVector {
    */
   CTP_GPU_FUN void SubmitGetAsync(Page *p, clio::run::u64 page_num,
                                   bool is_prefetch = true) {
+    // NEVER reuse a task POD the runtime may still be reading -- the same
+    // rule RescoreLocked has always enforced, adopted here after it was
+    // caught red-handed: the new Send resets the POD's is_complete_ to 0,
+    // and that device store RACES the PREVIOUS request's CPU-side
+    // completion store of 1 across PCIe. When the old store wins, the new
+    // fetch reads as already complete: the page is published and written
+    // while the CPU worker is still queued to copy stale blob bytes over
+    // it. Captured live (task trace + write-then-readback audit): three
+    // gets through one POD, the last one's stale copy landing microseconds
+    // after the page's fresh content -- the intermittent rebuild
+    // stale-page corruption (~25% of runs). Waiting here makes the device
+    // OBSERVE the previous completion before the reset, closing the race;
+    // in the common case the flag is already 1 and this is a single read.
+    if (!p->get_fut.IsNull()) p->get_fut.Wait();
     PrepareGet(p, page_num);
     Bump(h_->stat_faults_);
     if (is_prefetch) Bump(h_->stat_prefetches_);
