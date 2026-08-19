@@ -512,3 +512,45 @@ if(MPI_FOUND)
 else()
     message(STATUS "Synthetic workload generator disabled (MPI not found)")
 endif()
+
+#------------------------------------------------------------------------------
+# Exploration must store exactly what the adopted codec needs (issue #693)
+#------------------------------------------------------------------------------
+# Guards the invariant that a rejected candidate's footprint is not left
+# allocated: PutBlob overwrites bytes but does not shorten a longer blob, so
+# adopting a winner smaller than the primary used to leave 4-9x the needed
+# space behind and made every ratio read off the tier wrong by that factor.
+add_executable(test_explore_single_write
+  test_explore_single_write.cc
+)
+
+target_link_libraries(test_explore_single_write
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_include_directories(test_explore_single_write PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
+
+target_compile_definitions(test_explore_single_write PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+add_test(NAME compressor_explore_single_write
+    COMMAND test_explore_single_write "[explore]")
+
+set_tests_properties(
+    compressor_explore_single_write
+    PROPERTIES
+        TIMEOUT 180
+        LABELS "693;compressor;neuropress;explore;integration;gpu;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)

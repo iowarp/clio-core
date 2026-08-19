@@ -2356,6 +2356,36 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                      "the primary's stored result",
                      winner_rc);
               } else {
+                // Shrink the blob to what the winner actually needs. PutBlob
+                // overwrites the bytes but does not shorten a blob that was
+                // already longer, so adopting a winner smaller than the
+                // primary left the difference allocated and unreadable: the
+                // blob kept the PRIMARY's length while holding the WINNER's
+                // payload. Measured on a best-mode run, gdeflate primaries of
+                // 331868/438580/438772 bytes stayed exactly that size around
+                // 36936-byte bitcomp payloads -- 4-9x the space, and every
+                // ratio computed from the tier was wrong by that factor.
+                //
+                // Truncating to winner_total keeps the header's own bound
+                // check intact: PayloadSize() rejects a record whose
+                // header+payload exceeds the physical size, and after this
+                // they are equal by construction.
+                auto winner_trunc = core_client_->AsyncTruncateBlob(
+                    task->tag_id_, task->blob_name_.str(), winner_total,
+                    clio::run::PoolQuery::Local());
+                CLIO_CO_AWAIT(winner_trunc);
+                if (winner_trunc->return_code_ != 0) {
+                  // Not fatal: the blob still holds the winner's bytes and
+                  // reads correctly, it just occupies more room than it
+                  // needs. Worth saying so rather than silently over-
+                  // reporting the ratio.
+                  HLOG(kWarning,
+                       "NeuroPress explore: adopted a smaller winner for '{}' "
+                       "but could not shrink the blob to {} bytes (rc={}); it "
+                       "still occupies the primary's footprint",
+                       task->blob_name_.str(), winner_total,
+                       winner_trunc->return_code_);
+                }
                 task->context_ = winner_ctx;
                 task->context_.actual_original_size_ = chunk_size;
                 task->context_.actual_compressed_size_ = winner_total;
