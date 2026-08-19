@@ -126,8 +126,11 @@ struct Block {
   clio::run::u32 block_type_;  // Block size category (BlockSizeCategory:
                                // 512B..1MB; see block_allocator.h)
 
-  CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
-  CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
+  // CROSS, not GPU: host code constructs Blocks too -- the deserializer
+  // placement-news them in priv::vector::resize, and a __device__-only ctor
+  // fails that host instantiation under clang-CUDA's strict checking.
+  CTP_CROSS_FUN Block() : offset_(0), size_(0), block_type_(0) {}
+  CTP_CROSS_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
       : offset_(offset), size_(size), block_type_(block_type) {}
 
   // Cereal serialization

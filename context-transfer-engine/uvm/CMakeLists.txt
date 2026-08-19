@@ -77,8 +77,15 @@ if(CLIO_CORE_ENABLE_TESTS AND NOT WIN32)
         POSITION_INDEPENDENT_CODE ON
         CUDA_RUNTIME_LIBRARY Shared
         BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
-    target_compile_options(test_gpu_vmm PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_80,code=[sm_80]>)
+    # nvcc-only spelling; clang-CUDA gets the same SASS-only sm_80 embed
+    # from --cuda-gpu-arch (clang emits no PTX unless asked).
+    if(CMAKE_CUDA_COMPILER_ID STREQUAL "Clang")
+      target_compile_options(test_gpu_vmm PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:--cuda-gpu-arch=sm_80>)
+    else()
+      target_compile_options(test_gpu_vmm PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_80,code=[sm_80]>)
+    endif()
     # nvcc may not forward CMake's BUILD_RPATH; add it explicitly via the linker.
     target_link_options(test_gpu_vmm PRIVATE
         "-Wl,-rpath,${CMAKE_BINARY_DIR}/bin")

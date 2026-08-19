@@ -45,8 +45,15 @@ target_compile_definitions(kvhdf5_e2e_tests PRIVATE KVHDF5_GPU_OOR_TRAP=0)
 # WritePipelined producer, so it is also where that kernel's register/spill cost
 # is measured. Same rationale as occupancy_bench below: ptxas has to SAY what it
 # allocated. (Pre-device-link, as noted there.)
+# nvcc spells it -Xptxas=-v; clang-CUDA rejects that and wants
+# -Xcuda-ptxas -v. Same ptxas underneath, same verbose report.
+if(CMAKE_CUDA_COMPILER_ID STREQUAL "Clang")
+  set(KVHDF5_PTXAS_VERBOSE "-Xcuda-ptxas;-v")
+else()
+  set(KVHDF5_PTXAS_VERBOSE "-Xptxas=-v")
+endif()
 set_source_files_properties(pooled_double_buffer_test.cu PROPERTIES
-    COMPILE_OPTIONS "-Xptxas=-v")
+    COMPILE_OPTIONS "${KVHDF5_PTXAS_VERBOSE}")
 
 # The occupancy bench measures per-kernel register / shared-memory / spill usage,
 # so it needs ptxas to SAY what it allocated. Scoped to this one source file to
@@ -55,7 +62,7 @@ set_source_files_properties(pooled_double_buffer_test.cu PROPERTIES
 # `cuobjdump -res-usage bin/kvhdf5_e2e_tests` gives the post-link ground truth
 # and is what the reported table uses.
 set_source_files_properties(occupancy_bench.cu PROPERTIES
-    COMPILE_OPTIONS "-Xptxas=-v")
+    COMPILE_OPTIONS "${KVHDF5_PTXAS_VERBOSE}")
 
 # The gsbench `hdf5` arm (the conventional GPU->D2H->HDF5 baseline) needs libhdf5.
 # The root CMakeLists only looks for HDF5 under CLIO_CTE_ENABLE_HDF5_VOL, which is
