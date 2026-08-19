@@ -414,6 +414,14 @@ struct clio_wrap_ctx_t {
  * Helper: Get CTE client
  * ======================================================================== */
 
+/* Set by an atexit handler registered when this connector first attaches to
+   the runtime; see the teardown guard in get_cte_client(). */
+static std::atomic<bool> g_vol_process_exiting{false};
+
+static bool clio_vol_process_exiting() {
+  return g_vol_process_exiting.load(std::memory_order_acquire);
+}
+
 static clio::cte::core::Client *get_cte_client() {
   /* Lazily attach this process to the running clio/CTE runtime on first
      use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
@@ -427,9 +435,38 @@ static clio::cte::core::Client *get_cte_client() {
      H5Fcreate. There is always a correct fallback -- pass everything through to
      the native VOL -- because the native file is authoritative and the CTE tier
      is a performance layer, not a correctness one. */
+  /* Teardown guard. HDF5 registers H5_term_library() with atexit(), so an
+     application that leaves a file open at exit closes it AFTER the point
+     where CLIO has torn its transports down -- LAMMPS' h5md dump is one, and
+     a stock binary cannot be changed to close earlier. The close path writes
+     the coherence stamp, and sending that task through a destroyed transport
+     faults inside Transport::Send with this=0x0.
+
+     The flag is local to this translation unit ON PURPOSE. Asking
+     CLIO_RUNTIME_MANAGER whether it has finalized does not work and is worse
+     than useless: that accessor publishes a lazily constructed singleton, so
+     during exit it hands back a BRAND-NEW RuntimeManager whose
+     finalize_complete_ is false -- observed as two distinct manager pointers,
+     the real one finalizing while the VOL allocated a second and sailed past
+     the check into the same crash.
+
+     Ordering is what makes the flag correct: HDF5 registers its handler when
+     the library initialises, which necessarily precedes the VOL being loaded
+     and attached here, and atexit runs handlers in reverse. Ours is therefore
+     set before H5_term_library() closes anything. A close that happens
+     normally (an explicit H5Fclose before exit) still takes the full path.
+     Skipping the stamp is the documented fail-closed fallback: the native VOL
+     has already closed the file, and the next open simply drops its cache. */
+  if (clio_vol_process_exiting()) {
+    return nullptr;
+  }
+
   static std::once_flag once;
   static bool attached = false;
   std::call_once(once, []() {
+    std::atexit([]() {
+      g_vol_process_exiting.store(true, std::memory_order_release);
+    });
     attached = clio::cte::core::CLIO_CTE_CLIENT_INIT();
     if (!attached) {
       fprintf(stderr,
