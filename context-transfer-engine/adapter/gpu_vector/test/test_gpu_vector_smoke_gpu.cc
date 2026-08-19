@@ -240,20 +240,19 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
 
   RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, vw, sv); });
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
 
   unsigned long long *d_bad = nullptr;
-  REQUIRE(cudaMalloc(&d_bad, sizeof(unsigned long long)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+  d_bad = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_bad)>>(sizeof(unsigned long long));
+  ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
 
   RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, d_bad, vw, sv); });
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
 
   unsigned long long bad = 1;
-  REQUIRE(cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost) ==
-          cudaSuccess);
-  cudaFree(d_bad);
+  ctp::GpuApi::Memcpy(&bad, d_bad, sizeof(bad));
+  ctp::GpuApi::Free(d_bad);
   std::fprintf(stderr, "[smoke] mismatches=%llu / %llu\n",
                (unsigned long long) bad, (unsigned long long) kElems);
   REQUIRE(bad == 0);
@@ -274,19 +273,18 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
 
     RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long *d2 = nullptr;
-    REQUIRE(cudaMalloc(&d2, sizeof(unsigned long long)) == cudaSuccess);
-    REQUIRE(cudaMemset(d2, 0, sizeof(unsigned long long)) == cudaSuccess);
+    d2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d2)>>(sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d2, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, d2, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long b2 = 1;
-    REQUIRE(cudaMemcpy(&b2, d2, sizeof(b2), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-    cudaFree(d2);
+    ctp::GpuApi::Memcpy(&b2, d2, sizeof(b2));
+    ctp::GpuApi::Free(d2);
     std::fprintf(stderr, "[evict] mismatches=%llu / %llu\n",
                  (unsigned long long) b2, (unsigned long long) n);
     REQUIRE(b2 == 0);
@@ -313,19 +311,18 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
 
     RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long *d3 = nullptr;
-    REQUIRE(cudaMalloc(&d3, sizeof(unsigned long long)) == cudaSuccess);
-    REQUIRE(cudaMemset(d3, 0, sizeof(unsigned long long)) == cudaSuccess);
+    d3 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d3)>>(sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d3, 0, sizeof(unsigned long long));
     RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, d3, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long b3 = 1;
-    REQUIRE(cudaMemcpy(&b3, d3, sizeof(b3), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-    cudaFree(d3);
+    ctp::GpuApi::Memcpy(&b3, d3, sizeof(b3));
+    ctp::GpuApi::Free(d3);
     std::fprintf(stderr, "[multi-%u] mismatches=%llu / %llu\n", nb,
                  (unsigned long long) b3, (unsigned long long) n);
     REQUIRE(b3 == 0);
@@ -367,18 +364,17 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
                                   /*pages_per_block=*/2, n);
     RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long *d4 = nullptr;
-    REQUIRE(cudaMalloc(&d4, sizeof(unsigned long long)) == cudaSuccess);
-    REQUIRE(cudaMemset(d4, 0, sizeof(unsigned long long)) == cudaSuccess);
+    d4 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d4)>>(sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d4, 0, sizeof(unsigned long long));
     RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, d4, vw, sv); });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     unsigned long long b4 = 1;
-    REQUIRE(cudaMemcpy(&b4, d4, sizeof(b4), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-    cudaFree(d4);
+    ctp::GpuApi::Memcpy(&b4, d4, sizeof(b4));
+    ctp::GpuApi::Free(d4);
     std::fprintf(stderr, "[multi-oversub-64] mismatches=%llu / %llu\n",
                  (unsigned long long) b4, (unsigned long long) n);
     REQUIRE(b4 == 0);

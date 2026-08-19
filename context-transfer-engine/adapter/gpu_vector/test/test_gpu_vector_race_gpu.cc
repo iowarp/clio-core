@@ -279,7 +279,7 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
           RaceSeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
               gpu_info, vec.GetDevice(0), per, vw, sv);
         });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     const auto st = vec.ReadStats(0);
     std::fprintf(stderr,
                  "[race-seed] rounds=%u faults=%llu puts=%llu evicts=%llu "
@@ -330,26 +330,20 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
   }
 
   unsigned long long *err = nullptr;
-  REQUIRE(cudaMalloc(&err, 4 * sizeof(unsigned long long)) == cudaSuccess);
-  REQUIRE(cudaMemset(err, 0, 4 * sizeof(unsigned long long)) == cudaSuccess);
+  err = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(err)>>(4 * sizeof(unsigned long long));
+  ctp::GpuApi::Memset(err, 0, 4 * sizeof(unsigned long long));
 
   RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                             gy::YieldStackView sv) {
     RaceStressKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
         gpu_info, vec.GetDevice(0), kTotalPages, kIters, err, vw, sv);
   });
-  {
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-      std::fprintf(stderr, "[race] CUDA ERROR after stress: %s\n",
-                   cudaGetErrorString(e));
-    }
-    REQUIRE(e == cudaSuccess);
-  }
+  // GpuApi::Synchronize error-checks fatally, so reaching the next
+  // line IS the assertion.
+  ctp::GpuApi::Synchronize();
 
   unsigned long long h[4] = {0};
-  REQUIRE(cudaMemcpy(h, err, sizeof(h), cudaMemcpyDeviceToHost) ==
-          cudaSuccess);
+  ctp::GpuApi::Memcpy(h, err, sizeof(h));
   if (h[0] != 0) {
     fprintf(stderr,
             "race: %llu mismatches; first bad page=%llu got=0x%llx "
@@ -357,7 +351,7 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
             h[0], h[1], h[2], h[3]);
   }
   REQUIRE(h[0] == 0);
-  cudaFree(err);
+  ctp::GpuApi::Free(err);
 }
 
 #endif  // !CTP_IS_DEVICE_PASS

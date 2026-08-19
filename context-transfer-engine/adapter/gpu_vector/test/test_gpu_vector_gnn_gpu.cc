@@ -276,10 +276,10 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
 
   // ---- CSR to device (shared by both runs) ----
   std::int64_t *d_indptr = nullptr, *d_indices = nullptr;
-  REQUIRE(cudaMalloc(&d_indptr, (N + 1) * sizeof(std::int64_t)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_indices, csrE * sizeof(std::int64_t)) == cudaSuccess);
-  cudaMemcpy(d_indptr, h_indptr, (N + 1) * sizeof(std::int64_t), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_indices, h_indices, csrE * sizeof(std::int64_t), cudaMemcpyHostToDevice);
+  d_indptr = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_indptr)>>((N + 1) * sizeof(std::int64_t));
+  d_indices = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_indices)>>(csrE * sizeof(std::int64_t));
+  ctp::GpuApi::Memcpy(d_indptr, h_indptr, (N + 1) * sizeof(std::int64_t));
+  ctp::GpuApi::Memcpy(d_indices, h_indices, csrE * sizeof(std::int64_t));
 
   // ---- fixed seeded random weights (shared by both runs) ----
   auto make_weights = [](int din, int dout, unsigned seed) {
@@ -295,23 +295,23 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
   std::vector<float> hWself2 = make_weights(H, C, 3);
   std::vector<float> hWneigh2 = make_weights(H, C, 4);
   float *dWself1, *dWneigh1, *dWself2, *dWneigh2;
-  REQUIRE(cudaMalloc(&dWself1, hWself1.size() * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dWneigh1, hWneigh1.size() * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dWself2, hWself2.size() * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dWneigh2, hWneigh2.size() * sizeof(float)) == cudaSuccess);
-  cudaMemcpy(dWself1, hWself1.data(), hWself1.size() * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(dWneigh1, hWneigh1.data(), hWneigh1.size() * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(dWself2, hWself2.data(), hWself2.size() * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(dWneigh2, hWneigh2.data(), hWneigh2.size() * sizeof(float), cudaMemcpyHostToDevice);
+  dWself1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dWself1)>>(hWself1.size() * sizeof(float));
+  dWneigh1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dWneigh1)>>(hWneigh1.size() * sizeof(float));
+  dWself2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dWself2)>>(hWself2.size() * sizeof(float));
+  dWneigh2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dWneigh2)>>(hWneigh2.size() * sizeof(float));
+  ctp::GpuApi::Memcpy(dWself1, hWself1.data(), hWself1.size() * sizeof(float));
+  ctp::GpuApi::Memcpy(dWneigh1, hWneigh1.data(), hWneigh1.size() * sizeof(float));
+  ctp::GpuApi::Memcpy(dWself2, hWself2.data(), hWself2.size() * sizeof(float));
+  ctp::GpuApi::Memcpy(dWneigh2, hWneigh2.data(), hWneigh2.size() * sizeof(float));
 
   // ---- device scratch shared by both forward passes ----
   float *d_feat = nullptr, *d_agg1 = nullptr, *d_h1 = nullptr, *d_agg2 = nullptr,
         *d_logits = nullptr;
-  REQUIRE(cudaMalloc(&d_feat, feat_elems * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_agg1, feat_elems * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_h1, N * (std::int64_t)H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_agg2, N * (std::int64_t)H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_logits, N * (std::int64_t)C * sizeof(float)) == cudaSuccess);
+  d_feat = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_feat)>>(feat_elems * sizeof(float));
+  d_agg1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_agg1)>>(feat_elems * sizeof(float));
+  d_h1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_h1)>>(N * (std::int64_t)H * sizeof(float));
+  d_agg2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_agg2)>>(N * (std::int64_t)H * sizeof(float));
+  d_logits = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_logits)>>(N * (std::int64_t)C * sizeof(float));
 
   auto forward = [&](std::vector<float> &out_logits) -> double {
     ctp::GpuApi::Synchronize();
@@ -323,15 +323,15 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
     ctp::GpuApi::Synchronize();
     double dt = NowSec() - t0;
     out_logits.resize((size_t)(N * (std::int64_t)C));
-    cudaMemcpy(out_logits.data(), d_logits,
-               N * (std::int64_t)C * sizeof(float), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(out_logits.data(), d_logits,
+               N * (std::int64_t)C * sizeof(float));
     return dt;
   };
 
   // =====================================================================
   //  BASELINE: features resident in HBM, no compression.
   // =====================================================================
-  cudaMemcpy(d_feat, h_feat, logical_bytes, cudaMemcpyHostToDevice);
+  ctp::GpuApi::Memcpy(d_feat, h_feat, logical_bytes);
   // Warmup: the first launch pays PTX->SASS JIT (arch 90 PTX on sm_120), which
   // would otherwise be charged entirely to the baseline. Discard it so the two
   // reported forward times reflect steady state (they run identical work).
@@ -409,7 +409,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
   double ratio = stored_bytes ? (double)logical_bytes / (double)stored_bytes : 0.0;
 
   // ---- read loop (timed): decompress on host -> H2D into d_feat ----
-  cudaMemset(d_feat, 0, logical_bytes);
+  ctp::GpuApi::Memset(d_feat, 0, logical_bytes);
   std::vector<char> stage((size_t)(rows_per_page * row_bytes));
   double read_t0 = NowSec();
   for (std::int64_t p = 0; p < npages; ++p) {
@@ -428,14 +428,14 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
     gf.Wait();
     REQUIRE(gf->GetReturnCode() == 0);
     REQUIRE((std::int64_t)gf->output_size_ == bytes);
-    cudaMemcpy(d_feat + r0 * (std::int64_t)F, stage.data(), bytes,
-               cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(d_feat + r0 * (std::int64_t)F),
+                        stage.data(), (size_t)bytes);
   }
   double read_dt = NowSec() - read_t0;
 
   // ---- lossless proof #1: decompressed device bytes == original bytes ----
   std::vector<float> feat_rt((size_t)feat_elems);
-  cudaMemcpy(feat_rt.data(), d_feat, logical_bytes, cudaMemcpyDeviceToHost);
+  ctp::GpuApi::Memcpy(feat_rt.data(), d_feat, logical_bytes);
   int feat_cmp = std::memcmp(feat_rt.data(), h_feat, (size_t)logical_bytes);
   std::fprintf(stderr, "[GNN] feature round-trip memcmp = %d (0 == bit-exact)\n",
                feat_cmp);
@@ -574,10 +574,10 @@ TEST_CASE("gpu_vector: GraphSAGE forward over a lossless-zstd compressed "
   // floor separates the two without being tight on real data.
   REQUIRE(ratio > 1.01);
 
-  cudaFree(d_indptr); cudaFree(d_indices);
-  cudaFree(dWself1); cudaFree(dWneigh1); cudaFree(dWself2); cudaFree(dWneigh2);
-  cudaFree(d_feat); cudaFree(d_agg1); cudaFree(d_h1); cudaFree(d_agg2);
-  cudaFree(d_logits);
+  ctp::GpuApi::Free(d_indptr); ctp::GpuApi::Free(d_indices);
+  ctp::GpuApi::Free(dWself1); ctp::GpuApi::Free(dWneigh1); ctp::GpuApi::Free(dWself2); ctp::GpuApi::Free(dWneigh2);
+  ctp::GpuApi::Free(d_feat); ctp::GpuApi::Free(d_agg1); ctp::GpuApi::Free(d_h1); ctp::GpuApi::Free(d_agg2);
+  ctp::GpuApi::Free(d_logits);
 }
 
 SIMPLE_TEST_MAIN()

@@ -207,7 +207,7 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
               gpu_info, vec.GetDevice(0), per, view, stack.View());
         },
         [] {}, /*max_rounds=*/200000);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     std::fprintf(stderr, "[hbm-nvcomp] seed rounds=%u\n", rounds);
   }
 
@@ -245,8 +245,8 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
 
   // --- read back and check the arithmetic -------------------------------
   unsigned long long *d_sum = nullptr;
-  REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
+  d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(unsigned long long));
+  ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
   {
     gy::Yieldable<> drv(kBlocks, 32);
     gy::YieldStack stack(kBlocks, 32, 256);
@@ -256,13 +256,12 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
               gpu_info, vec.GetDevice(0), per, d_sum, view, stack.View());
         },
         [] {}, /*max_rounds=*/200000);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     std::fprintf(stderr, "[hbm-nvcomp] read rounds=%u\n", rounds);
   }
 
   unsigned long long got = 0;
-  REQUIRE(cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost) ==
-          cudaSuccess);
+  ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
   unsigned long long want = 0;
   for (clio::run::u64 i = 0; i < n; ++i) {
     want += static_cast<unsigned long long>(Weight(i)) * Activation(i);
@@ -271,7 +270,7 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   REQUIRE(got == want);
   REQUIRE(vec.ReadStats(0).put_errors == 0);
 
-  cudaFree(d_sum);
+  ctp::GpuApi::Free(d_sum);
 }
 
 SIMPLE_TEST_MAIN()

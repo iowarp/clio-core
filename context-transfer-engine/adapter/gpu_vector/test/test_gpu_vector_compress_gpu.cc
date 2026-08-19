@@ -335,11 +335,11 @@ TEST_CASE("gpu_vector: model weights through the compression path",
       SeedWeightsKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
           gpu_info, vec.GetDevice(0), per, vw, sv);
     });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long *d_sum = nullptr;
-    REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
-    REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
+    d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
     if (c.chunk > 0) {
       RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
@@ -353,19 +353,13 @@ TEST_CASE("gpu_vector: model weights through the compression path",
             gpu_info, vec.GetDevice(0), per, d_sum, vw, sv);
       });
     }
-    {
-      const cudaError_t e = cudaDeviceSynchronize();
-      if (e != cudaSuccess) {
-        std::fprintf(stderr, "[%s] CUDA ERROR after dot kernel: %s\n", c.name,
-                     cudaGetErrorString(e));
-      }
-      REQUIRE(e == cudaSuccess);
-    }
+    // GpuApi::Synchronize error-checks fatally, so reaching the next
+  // line IS the assertion.
+  ctp::GpuApi::Synchronize();
 
     unsigned long long got = 0;
-    REQUIRE(cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-    cudaFree(d_sum);
+    ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
+    ctp::GpuApi::Free(d_sum);
 
     const unsigned long long want = ExpectedDot(n);
     const clio::run::u64 stored =

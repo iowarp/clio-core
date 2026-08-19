@@ -371,12 +371,10 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
   // ---- CSR + weights to device (shared by both forward passes) ----
   const std::int64_t csrE = ds.Csr()[1];
   std::int64_t *d_indptr = nullptr, *d_indices = nullptr;
-  REQUIRE(cudaMalloc(&d_indptr, (N + 1) * sizeof(std::int64_t)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_indices, csrE * sizeof(std::int64_t)) == cudaSuccess);
-  cudaMemcpy(d_indptr, ds.Indptr(), (N + 1) * sizeof(std::int64_t),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(d_indices, ds.Indices(), csrE * sizeof(std::int64_t),
-             cudaMemcpyHostToDevice);
+  d_indptr = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_indptr)>>((N + 1) * sizeof(std::int64_t));
+  d_indices = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_indices)>>(csrE * sizeof(std::int64_t));
+  ctp::GpuApi::Memcpy(d_indptr, ds.Indptr(), (N + 1) * sizeof(std::int64_t));
+  ctp::GpuApi::Memcpy(d_indices, ds.Indices(), csrE * sizeof(std::int64_t));
 
   auto make_weights = [](int din, int dout, unsigned seed) {
     std::mt19937 rng(seed);
@@ -390,20 +388,18 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
                               make_weights(H, C, 3), make_weights(H, C, 4)};
   float *dW[4] = {nullptr, nullptr, nullptr, nullptr};
   for (int i = 0; i < 4; ++i) {
-    REQUIRE(cudaMalloc(&dW[i], hW[i].size() * sizeof(float)) == cudaSuccess);
-    cudaMemcpy(dW[i], hW[i].data(), hW[i].size() * sizeof(float),
-               cudaMemcpyHostToDevice);
+    dW[i] = ctp::GpuApi::Malloc<float>(hW[i].size() * sizeof(float));
+    ctp::GpuApi::Memcpy(dW[i], hW[i].data(), hW[i].size() * sizeof(float));
   }
 
   float *d_feat = nullptr, *d_src = nullptr, *d_agg1 = nullptr, *d_h1 = nullptr,
         *d_agg2 = nullptr, *d_logits = nullptr;
-  REQUIRE(cudaMalloc(&d_feat, feat_elems * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_src, feat_elems * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_agg1, feat_elems * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_h1, N * (std::int64_t)H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_agg2, N * (std::int64_t)H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_logits, N * (std::int64_t)C * sizeof(float)) ==
-          cudaSuccess);
+  d_feat = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_feat)>>(feat_elems * sizeof(float));
+  d_src = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_src)>>(feat_elems * sizeof(float));
+  d_agg1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_agg1)>>(feat_elems * sizeof(float));
+  d_h1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_h1)>>(N * (std::int64_t)H * sizeof(float));
+  d_agg2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_agg2)>>(N * (std::int64_t)H * sizeof(float));
+  d_logits = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_logits)>>(N * (std::int64_t)C * sizeof(float));
 
   auto forward = [&](std::vector<float> &out_logits) {
     GnnAggMeanKernel<<<256, 256>>>(d_feat, F, d_indptr, d_indices, N, d_agg1);
@@ -411,15 +407,15 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
     GnnAggMeanKernel<<<256, 256>>>(d_h1, H, d_indptr, d_indices, N, d_agg2);
     GnnCombineKernel<<<256, 256>>>(d_h1, d_agg2, H, C, dW[2], dW[3], N, d_logits,
                                    0);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     out_logits.resize((size_t)(N * (std::int64_t)C));
-    cudaMemcpy(out_logits.data(), d_logits,
-               N * (std::int64_t)C * sizeof(float), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(out_logits.data(), d_logits,
+               N * (std::int64_t)C * sizeof(float));
   };
 
   // ---- BASELINE: features resident, never compressed ----
-  cudaMemcpy(d_feat, ds.Feat(), logical_bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_src, ds.Feat(), logical_bytes, cudaMemcpyHostToDevice);
+  ctp::GpuApi::Memcpy(d_feat, ds.Feat(), logical_bytes);
+  ctp::GpuApi::Memcpy(d_src, ds.Feat(), logical_bytes);
   std::vector<float> logits_base;
   forward(logits_base);
 
@@ -479,7 +475,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
         VecFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu_info, vec.GetDevice(0), d_src, elems_per_block, vw, sv);
       });
-      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      ctp::GpuApi::Synchronize();
     }
     t_store = NowSec() - t0;
     if (ingest_file != nullptr) {
@@ -492,7 +488,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
 
     // Wipe the destination so a drain that silently does nothing cannot pass
     // by leaving the baseline bytes in place.
-    REQUIRE(cudaMemset(d_feat, 0, feat_elems * sizeof(float)) == cudaSuccess);
+    ctp::GpuApi::Memset(d_feat, 0, feat_elems * sizeof(float));
 
     t0 = NowSec();
     RunYieldable(nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
@@ -500,7 +496,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
       VecDrainKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
           gpu_info, vec.GetDevice(0), d_feat, elems_per_block, vw, sv);
     });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
     t_stream = NowSec() - t0;
 
     st = vec.ReadStats(0);
@@ -522,8 +518,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
 
   // ---- lossless proof #1: the streamed bytes are the original bytes ----
   std::vector<float> feat_rt((size_t)feat_elems);
-  cudaMemcpy(feat_rt.data(), d_feat, feat_elems * sizeof(float),
-             cudaMemcpyDeviceToHost);
+  ctp::GpuApi::Memcpy(feat_rt.data(), d_feat, feat_elems * sizeof(float));
   int feat_cmp = std::memcmp(feat_rt.data(), ds.Feat(),
                              (size_t)(feat_elems * sizeof(float)));
 
@@ -563,10 +558,10 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
   REQUIRE(logit_cmp == 0);
   REQUIRE(max_abs == 0.0);
 
-  cudaFree(d_indptr); cudaFree(d_indices);
-  for (int i = 0; i < 4; ++i) cudaFree(dW[i]);
-  cudaFree(d_feat); cudaFree(d_src); cudaFree(d_agg1); cudaFree(d_h1);
-  cudaFree(d_agg2); cudaFree(d_logits);
+  ctp::GpuApi::Free(d_indptr); ctp::GpuApi::Free(d_indices);
+  for (int i = 0; i < 4; ++i) ctp::GpuApi::Free(dW[i]);
+  ctp::GpuApi::Free(d_feat); ctp::GpuApi::Free(d_src); ctp::GpuApi::Free(d_agg1); ctp::GpuApi::Free(d_h1);
+  ctp::GpuApi::Free(d_agg2); ctp::GpuApi::Free(d_logits);
 }
 
 SIMPLE_TEST_MAIN()

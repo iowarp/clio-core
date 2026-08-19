@@ -292,7 +292,7 @@ int main() {
 
   const u64 elems_per_block = elems_per_node / blocks;
   unsigned long long *d_out = nullptr;
-  cudaMalloc(&d_out, 2 * sizeof(unsigned long long));
+  d_out = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_out)>>(2 * sizeof(unsigned long long));
 
   Step(node, "barrier-start");
   if (!Barrier(cte, tag, node, nodes, "start", barrier_timeout_s)) return 1;
@@ -311,11 +311,7 @@ int main() {
           gpu_info, vec.GetDevice(0), my_first, elems_per_block,
           static_cast<u32>(r), vw, sv);
     });
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "[node%d] write kernel failed (round %d)\n", node,
-                   r);
-      return 1;
-    }
+    ctp::GpuApi::Synchronize();
     Step(node, "barrier-write");
     if (!Barrier(cte, tag, node, nodes, "w" + std::to_string(r),
                  barrier_timeout_s)) {
@@ -326,7 +322,7 @@ int main() {
     const int peer = (node % nodes) + 1;
     const u64 peer_first =
         round_base + static_cast<u64>(peer - 1) * elems_per_node;
-    cudaMemset(d_out, 0, 2 * sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_out, 0, 2 * sizeof(unsigned long long));
     Step(node, "read-kernel");
     RunYieldable(blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                              gy::YieldStackView sv) {
@@ -334,13 +330,9 @@ int main() {
           gpu_info, vec.GetDevice(0), peer_first, elems_per_block,
           static_cast<u32>(r), d_out, d_out + 1, vw, sv);
     });
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "[node%d] read kernel failed (round %d)\n", node,
-                   r);
-      return 1;
-    }
+    ctp::GpuApi::Synchronize();
     unsigned long long h[2] = {0, 0};
-    cudaMemcpy(h, d_out, sizeof(h), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(h, d_out, sizeof(h));
     const auto st = vec.ReadStats(0);
     std::fprintf(stderr,
                  "[node%d] round %d: read node%d's %llu pages, sum=%llx "

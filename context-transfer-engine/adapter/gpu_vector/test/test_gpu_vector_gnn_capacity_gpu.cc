@@ -346,18 +346,18 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   // Resident tiled degree array (the "graph"; small vs features). deg_all[v] =
   // deg0[v mod N0]. Kept resident on both paths (identical weight sequence).
   int *d_deg = nullptr;
-  REQUIRE(cudaMalloc(&d_deg, N * sizeof(int)) == cudaSuccess);
+  d_deg = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_deg)>>(N * sizeof(int));
   {
     std::vector<int> tile(std::min<clio::run::u64>(N, 1u << 22));
     for (clio::run::u64 off = 0; off < N; off += tile.size()) {
       clio::run::u64 n = std::min<clio::run::u64>(tile.size(), N - off);
       for (clio::run::u64 i = 0; i < n; ++i) tile[i] = deg0[(off + i) % N0];
-      cudaMemcpy(d_deg + off, tile.data(), n * sizeof(int), cudaMemcpyHostToDevice);
+      ctp::GpuApi::Memcpy(d_deg + off, tile.data(), n * sizeof(int));
     }
   }
 
   double *d_pool = nullptr;
-  REQUIRE(cudaMalloc(&d_pool, (size_t)F * sizeof(double)) == cudaSuccess);
+  d_pool = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_pool)>>((size_t)F * sizeof(double));
   const int tpb = 128, fblocks = (F + tpb - 1) / tpb;
 
   // =====================================================================
@@ -372,6 +372,8 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
     float *d_all = nullptr;
     cudaError_t alloc = cudaErrorMemoryAllocation;
     if (dataset_bytes + (size_t(384) << 20) < free_b)
+      // RAW cudaMalloc on purpose: this probe WANTS a graceful OOM (the
+      // in-core comparison is optional), and GpuApi::Malloc fails fatally.
       alloc = cudaMalloc(&d_all, dataset_bytes);
     if (alloc != cudaSuccess) {
       cudaGetLastError();
@@ -382,16 +384,16 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
     } else {
       for (clio::run::u64 off = 0; off < total_elems; off += file_elems) {
         clio::run::u64 n = std::min(file_elems, total_elems - off);
-        cudaMemcpy(d_all + off, feat.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        ctp::GpuApi::Memcpy(d_all + off, feat.data(), n * sizeof(float));
       }
-      cudaMemset(d_pool, 0, (size_t)F * sizeof(double));
+      ctp::GpuApi::Memset(d_pool, 0, (size_t)F * sizeof(double));
       double t0 = NowSec();
       GnnReadoutResidentKernel<<<fblocks, tpb>>>(d_all, N, d_deg, F, d_pool);
       ctp::GpuApi::Synchronize();
       trad_runtime = NowSec() - t0;
-      cudaMemcpy(pool_trad.data(), d_pool, (size_t)F * sizeof(double), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(pool_trad.data(), d_pool, (size_t)F * sizeof(double));
       trad_status = "OK"; trad_ran = true;
-      cudaFree(d_all);
+      ctp::GpuApi::Free(d_all);
       std::fprintf(stderr,
           "[GCAP] TRADITIONAL: OK in %.3fs (pinned %lluMiB of HBM). pool[0]=%.6e\n",
           trad_runtime, (unsigned long long)(dataset_bytes >> 20), pool_trad[0]);
@@ -462,10 +464,10 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   }
   const clio::run::u64 win_elems = (clio::run::u64)window * epp;
   float *d_scratch = nullptr;
-  REQUIRE(cudaMalloc(&d_scratch, win_elems * sizeof(float)) == cudaSuccess);
+  d_scratch = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_scratch)>>(win_elems * sizeof(float));
   const long long mem_working = free_mib();
 
-  cudaMemset(d_pool, 0, (size_t)F * sizeof(double));
+  ctp::GpuApi::Memset(d_pool, 0, (size_t)F * sizeof(double));
   double km_t0 = NowSec();
   // Sweep the whole vector one window at a time. This is what
   // SequentialTransaction::Iterate did; expressed directly, the window is just
@@ -485,7 +487,7 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   ctp::GpuApi::Synchronize();
   double km_dt = NowSec() - km_t0;
   std::vector<double> pool_eternia(F, 0.0);
-  cudaMemcpy(pool_eternia.data(), d_pool, (size_t)F * sizeof(double), cudaMemcpyDeviceToHost);
+  ctp::GpuApi::Memcpy(pool_eternia.data(), d_pool, (size_t)F * sizeof(double));
 
   const clio::run::u64 peak_win_b = win_elems * sizeof(float);
   std::fprintf(stderr,
@@ -550,7 +552,7 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
     }
   }
 
-  cudaFree(d_deg); cudaFree(d_pool); cudaFree(d_scratch);
+  ctp::GpuApi::Free(d_deg); ctp::GpuApi::Free(d_pool); ctp::GpuApi::Free(d_scratch);
 }
 
 SIMPLE_TEST_MAIN()

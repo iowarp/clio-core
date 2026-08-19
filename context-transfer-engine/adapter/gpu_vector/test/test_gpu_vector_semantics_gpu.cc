@@ -463,25 +463,24 @@ clio::run::IpcManagerGpuInfo g_gpu;
 /** Device scratch for a counter, zeroed. */
 unsigned long long *NewCounter() {
   unsigned long long *p = nullptr;
-  REQUIRE(cudaMalloc(&p, sizeof(*p)) == cudaSuccess);
-  REQUIRE(cudaMemset(p, 0, sizeof(*p)) == cudaSuccess);
+  p = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(p)>>(sizeof(*p));
+  ctp::GpuApi::Memset(p, 0, sizeof(*p));
   return p;
 }
 
 unsigned long long ReadCounter(unsigned long long *p) {
   unsigned long long h = 0;
-  REQUIRE(cudaMemcpy(&h, p, sizeof(h), cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(&h, p, sizeof(h));
   return h;
 }
 
-void Sync() { REQUIRE(cudaDeviceSynchronize() == cudaSuccess); }
+void Sync() { ctp::GpuApi::Synchronize(); }
 
 /** Upload a page-index list for TouchSeqKernel. */
 u64 *UploadPages(const std::vector<u64> &pages) {
   u64 *d = nullptr;
-  REQUIRE(cudaMalloc(&d, pages.size() * sizeof(u64)) == cudaSuccess);
-  REQUIRE(cudaMemcpy(d, pages.data(), pages.size() * sizeof(u64),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
+  d = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d)>>(pages.size() * sizeof(u64));
+  ctp::GpuApi::Memcpy(d, pages.data(), pages.size() * sizeof(u64));
   return d;
 }
 
@@ -596,8 +595,8 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     FlushAgainKernel<<<1, 32>>>(g_gpu, f.dev, again);
     Sync();
     REQUIRE(ReadCounter(again) == 0);
-    cudaFree(flushed);
-    cudaFree(again);
+    ctp::GpuApi::Free(flushed);
+    ctp::GpuApi::Free(again);
   }
 
   // -------------------------------------------------------------------
@@ -624,7 +623,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // fail rc, and the fetched-count assertion below reads short even
     // though the (demand-faulted) content checks still pass.
     FlushKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
     Sync();
 
@@ -640,8 +639,8 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
                  (unsigned long long) kPages, ReadCounter(got), nbad);
     REQUIRE(nbad == 0);
     REQUIRE(ReadCounter(got) == kPages);
-    REQUIRE(cudaMemset(bad, 0, sizeof(*bad)) == cudaSuccess);
-    cudaFree(got);
+    ctp::GpuApi::Memset(bad, 0, sizeof(*bad));
+    ctp::GpuApi::Free(got);
   }
 
   // -------------------------------------------------------------------
@@ -727,7 +726,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
     Sync();
 
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 3u, bad, vw_, sv_);
@@ -821,8 +820,8 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // touched most recently -- which is the classic inverted-comparison bug.
     REQUIRE(s.faults == 1);
     REQUIRE(s.evicts == 1);
-    cudaFree(warm);
-    cudaFree(probe);
+    ctp::GpuApi::Free(warm);
+    ctp::GpuApi::Free(probe);
   }
 
   // -------------------------------------------------------------------
@@ -890,7 +889,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     REQUIRE(s.evicts == 4);
 
     // And the data is still correct afterwards.
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 7u, bad, vw_, sv_);
@@ -956,7 +955,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 2u, vw_, sv_);
     });
     Sync();
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 0, n, 8u, bad, vw_, sv_);
@@ -989,7 +988,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(kBlocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 9u, bad, vw_, sv_);
@@ -1026,7 +1025,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
                  (unsigned long long) s.faults);
     REQUIRE(s.faults == 0);
 
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 8 * kPageElems, 10u, bad, vw_, sv_);
@@ -1042,14 +1041,13 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     const u64 n = 3 * kPageElems + 5;
     gv::Vector<u32> vec("gv_sem_size", {0}, kPageBytes, 1, 2, n);
     u64 *d = nullptr;
-    REQUIRE(cudaMalloc(&d, sizeof(u64)) == cudaSuccess);
+    d = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d)>>(sizeof(u64));
     SizeKernel<<<1, 32>>>(g_gpu, vec.GetDevice(0), d);
     Sync();
     u64 h = 0;
-    REQUIRE(cudaMemcpy(&h, d, sizeof(h), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
+    ctp::GpuApi::Memcpy(&h, d, sizeof(h));
     REQUIRE(h == n);
-    cudaFree(d);
+    ctp::GpuApi::Free(d);
   }
 
   // -------------------------------------------------------------------
@@ -1117,7 +1115,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
     Sync();
 
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     MultiLaneReadKernel<<<1, 32>>>(g_gpu, f.dev, kPages * kPageElems, 11u, bad);
     Sync();
     const unsigned long long mism = ReadCounter(bad);
@@ -1145,7 +1143,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     Sync();
 
     f.Reset();
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     MultiLaneReadKernel<<<1, 32>>>(g_gpu, f.dev, kPages * kPageElems, 12u, bad);
     Sync();
     auto s = f.Stats();
@@ -1172,7 +1170,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
     Sync();
 
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kPages * kPageElems, 13u, bad, vw_, sv_);
@@ -1219,7 +1217,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
       Sync();
 
-      REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+      ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
       RunYieldable(sc.blocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, per, 14u, bad, vw_, sv_);
@@ -1254,7 +1252,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     Sync();
 
     f.Reset();
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(4, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       PrefetchWalkKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, per, 15u, bad, vw_, sv_);
@@ -1298,7 +1296,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
                  (unsigned long long) s.rescores);
     REQUIRE(s.rescores == 64);
 
-    REQUIRE(cudaMemset(bad, 0, sizeof(unsigned long long)) == cudaSuccess);
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
       VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, 4 * kPageElems, 16u, bad, vw_, sv_);
@@ -1307,8 +1305,8 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     REQUIRE(ReadCounter(bad) == 0);
   }
 
-  cudaFree(bad);
-  cudaFree(sink);
+  ctp::GpuApi::Free(bad);
+  ctp::GpuApi::Free(sink);
 }
 
 #endif  // !CTP_IS_DEVICE_PASS

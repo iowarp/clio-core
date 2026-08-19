@@ -308,7 +308,7 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
                                 gy::YieldStackView sv) {
       SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per, vw, sv);
     });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     // ---- Gray Scott: read-modify-write with overlapped write-back --------
     RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
@@ -316,23 +316,22 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
       GrayScottKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per,
                                                        kPageElems, vw, sv);
     });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     // ---- weights: read-only stream with prefetch hints -------------------
     unsigned long long *d_sum = nullptr;
-    REQUIRE(cudaMalloc(&d_sum, sizeof(unsigned long long)) == cudaSuccess);
-    REQUIRE(cudaMemset(d_sum, 0, sizeof(unsigned long long)) == cudaSuccess);
+    d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
     RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                 gy::YieldStackView sv) {
       WeightsKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, dev, per,
                                                      kPageElems, d_sum, vw, sv);
     });
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    ctp::GpuApi::Synchronize();
 
     unsigned long long got = 0;
-    REQUIRE(cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-    cudaFree(d_sum);
+    ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
+    ctp::GpuApi::Free(d_sum);
 
     {
       const auto st = vec.ReadStats(0);
@@ -373,7 +372,7 @@ TEST_CASE("gpu_vector: a slot claim must not drop a DIRTY page",
     DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
                                                       per, kPageElems, vw, sv);
   });
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
   const auto st = vec.ReadStats(0);
   std::fprintf(stderr,
                "  [dirty-claim] faults=%llu puts=%llu evicts=%llu "

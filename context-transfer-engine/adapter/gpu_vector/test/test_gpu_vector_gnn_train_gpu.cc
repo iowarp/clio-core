@@ -974,12 +974,12 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u64 file_elems = N0 * (clio::run::u64)F;
 
   // Resident tiled labels.
-  long long *d_lab = nullptr; REQUIRE(cudaMalloc(&d_lab, N * sizeof(long long)) == cudaSuccess);
+  long long *d_lab = nullptr; d_lab = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_lab)>>(N * sizeof(long long));
   { std::vector<long long> tile(std::min<clio::run::u64>(N, 1u << 22));
     for (clio::run::u64 off = 0; off < N; off += tile.size()) {
       clio::run::u64 n = std::min<clio::run::u64>(tile.size(), N - off);
       for (clio::run::u64 i = 0; i < n; ++i) tile[i] = lab0[(off + i) % N0];
-      cudaMemcpy(d_lab + off, tile.data(), n * sizeof(long long), cudaMemcpyHostToDevice);
+      ctp::GpuApi::Memcpy(d_lab + off, tile.data(), n * sizeof(long long));
     } }
 
   // ---- Shared init weights (seeded; identical for both runs) ----
@@ -996,34 +996,30 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   double *loss_part = nullptr;
 
   float *h1_buf, *dz1_buf, *dz2_buf, *d_scratch;
-  REQUIRE(cudaMalloc(&dW1, H * F * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&db1, H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dW2, C * H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&db2, C * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gW1, H * F * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gw1_part,
-                     (size_t)kGradSplits * H * F * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gb1_part,
-                     (size_t)kGradSplits * H * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gw2_part,
-                     (size_t)kGradSplits * C * H * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gb2_part,
-                     (size_t)kGradSplits * C * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&loss_part, kLossBlocks * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gb1, H * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gW2, C * H * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&gb2, C * sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&h1_buf, max_nn * H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dz1_buf, max_nn * H * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&dz2_buf, max_nn * C * sizeof(float)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_scratch, max_nn * F * sizeof(float)) == cudaSuccess);
-  double *loss_buf; REQUIRE(cudaMalloc(&loss_buf, max_nn * sizeof(double)) == cudaSuccess);
+  dW1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dW1)>>(H * F * sizeof(float));
+  db1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(db1)>>(H * sizeof(float));
+  dW2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dW2)>>(C * H * sizeof(float));
+  db2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(db2)>>(C * sizeof(float));
+  gW1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gW1)>>(H * F * sizeof(double));
+  gw1_part = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gw1_part)>>((size_t)kGradSplits * H * F * sizeof(double));
+  gb1_part = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gb1_part)>>((size_t)kGradSplits * H * sizeof(double));
+  gw2_part = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gw2_part)>>((size_t)kGradSplits * C * H * sizeof(double));
+  gb2_part = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gb2_part)>>((size_t)kGradSplits * C * sizeof(double));
+  loss_part = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(loss_part)>>(kLossBlocks * sizeof(double));
+  gb1 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gb1)>>(H * sizeof(double));
+  gW2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gW2)>>(C * H * sizeof(double));
+  gb2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(gb2)>>(C * sizeof(double));
+  h1_buf = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(h1_buf)>>(max_nn * H * sizeof(float));
+  dz1_buf = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dz1_buf)>>(max_nn * H * sizeof(float));
+  dz2_buf = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dz2_buf)>>(max_nn * C * sizeof(float));
+  d_scratch = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_scratch)>>(max_nn * F * sizeof(float));
+  double *loss_buf; loss_buf = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(loss_buf)>>(max_nn * sizeof(double));
   double *d_loss; int *d_correct, *d_count, *d_vcorrect, *d_vcount;
-  REQUIRE(cudaMalloc(&d_loss, sizeof(double)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_correct, sizeof(int)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_count, sizeof(int)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_vcorrect, sizeof(int)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_vcount, sizeof(int)) == cudaSuccess);
+  d_loss = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_loss)>>(sizeof(double));
+  d_correct = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_correct)>>(sizeof(int));
+  d_count = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_count)>>(sizeof(int));
+  d_vcorrect = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_vcorrect)>>(sizeof(int));
+  d_vcount = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_vcount)>>(sizeof(int));
 
   clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
 
@@ -1032,38 +1028,38 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   auto run_epoch = [&](std::function<void(clio::run::u64, clio::run::u64, clio::run::u64)> gather,
                        double &out_loss, double &out_acc, clio::run::u64 &out_count,
                        double &out_vacc) {
-    cudaMemset(gW1, 0, H * F * sizeof(double)); cudaMemset(gb1, 0, H * sizeof(double));
-    cudaMemset(gW2, 0, C * H * sizeof(double)); cudaMemset(gb2, 0, C * sizeof(double));
-    cudaMemset(d_loss, 0, sizeof(double)); cudaMemset(d_correct, 0, sizeof(int));
-    cudaMemset(d_count, 0, sizeof(int));
-    cudaMemset(d_vcorrect, 0, sizeof(int)); cudaMemset(d_vcount, 0, sizeof(int));
+    ctp::GpuApi::Memset(gW1, 0, H * F * sizeof(double)); ctp::GpuApi::Memset(gb1, 0, H * sizeof(double));
+    ctp::GpuApi::Memset(gW2, 0, C * H * sizeof(double)); ctp::GpuApi::Memset(gb2, 0, C * sizeof(double));
+    ctp::GpuApi::Memset(d_loss, 0, sizeof(double)); ctp::GpuApi::Memset(d_correct, 0, sizeof(int));
+    ctp::GpuApi::Memset(d_count, 0, sizeof(int));
+    ctp::GpuApi::Memset(d_vcorrect, 0, sizeof(int)); ctp::GpuApi::Memset(d_vcount, 0, sizeof(int));
 
     // Apply one SGD step from the currently accumulated gradients, normalised by
     // `nrm` contributing nodes, then (in mini-batch mode) clear them for the next
     // batch. Weights are tiny (H*F + C*H floats), so the host round-trip is cheap.
     auto apply_step = [&](int nrm, bool clear_grads) {
       std::vector<double> aW1(H * F), ab1(H), aW2(C * H), ab2(C);
-      cudaMemcpy(aW1.data(), gW1, H * F * sizeof(double), cudaMemcpyDeviceToHost);
-      cudaMemcpy(ab1.data(), gb1, H * sizeof(double), cudaMemcpyDeviceToHost);
-      cudaMemcpy(aW2.data(), gW2, C * H * sizeof(double), cudaMemcpyDeviceToHost);
-      cudaMemcpy(ab2.data(), gb2, C * sizeof(double), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(aW1.data(), gW1, H * F * sizeof(double));
+      ctp::GpuApi::Memcpy(ab1.data(), gb1, H * sizeof(double));
+      ctp::GpuApi::Memcpy(aW2.data(), gW2, C * H * sizeof(double));
+      ctp::GpuApi::Memcpy(ab2.data(), gb2, C * sizeof(double));
       std::vector<float> aw1(H * F), ab1f(H), aw2(C * H), ab2f(C);
-      cudaMemcpy(aw1.data(), dW1, H * F * sizeof(float), cudaMemcpyDeviceToHost);
-      cudaMemcpy(ab1f.data(), db1, H * sizeof(float), cudaMemcpyDeviceToHost);
-      cudaMemcpy(aw2.data(), dW2, C * H * sizeof(float), cudaMemcpyDeviceToHost);
-      cudaMemcpy(ab2f.data(), db2, C * sizeof(float), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(aw1.data(), dW1, H * F * sizeof(float));
+      ctp::GpuApi::Memcpy(ab1f.data(), db1, H * sizeof(float));
+      ctp::GpuApi::Memcpy(aw2.data(), dW2, C * H * sizeof(float));
+      ctp::GpuApi::Memcpy(ab2f.data(), db2, C * sizeof(float));
       float ainv = 1.0f / (float)std::max<int>(1, nrm);
       for (int i = 0; i < H * F; ++i) aw1[i] -= lr * (float)(aW1[i] * ainv);
       for (int i = 0; i < H; ++i) ab1f[i] -= lr * (float)(ab1[i] * ainv);
       for (int i = 0; i < C * H; ++i) aw2[i] -= lr * (float)(aW2[i] * ainv);
       for (int i = 0; i < C; ++i) ab2f[i] -= lr * (float)(ab2[i] * ainv);
-      cudaMemcpy(dW1, aw1.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
-      cudaMemcpy(db1, ab1f.data(), H * sizeof(float), cudaMemcpyHostToDevice);
-      cudaMemcpy(dW2, aw2.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
-      cudaMemcpy(db2, ab2f.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+      ctp::GpuApi::Memcpy(dW1, aw1.data(), H * F * sizeof(float));
+      ctp::GpuApi::Memcpy(db1, ab1f.data(), H * sizeof(float));
+      ctp::GpuApi::Memcpy(dW2, aw2.data(), C * H * sizeof(float));
+      ctp::GpuApi::Memcpy(db2, ab2f.data(), C * sizeof(float));
       if (clear_grads) {
-        cudaMemset(gW1, 0, H * F * sizeof(double)); cudaMemset(gb1, 0, H * sizeof(double));
-        cudaMemset(gW2, 0, C * H * sizeof(double)); cudaMemset(gb2, 0, C * sizeof(double));
+        ctp::GpuApi::Memset(gW1, 0, H * F * sizeof(double)); ctp::GpuApi::Memset(gb1, 0, H * sizeof(double));
+        ctp::GpuApi::Memset(gW2, 0, C * H * sizeof(double)); ctp::GpuApi::Memset(gb2, 0, C * sizeof(double));
       }
     };
     int prev_cnt = 0;   // labelled nodes seen before the current batch
@@ -1120,7 +1116,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
         // the labelled nodes in THIS batch (d_count accumulates across the epoch).
         ctp::GpuApi::Synchronize();
         int cnt_now = 0;
-        cudaMemcpy(&cnt_now, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+        ctp::GpuApi::Memcpy(&cnt_now, d_count, sizeof(int));
         apply_step(cnt_now - prev_cnt, /*clear_grads=*/true);
         prev_cnt = cnt_now;
       }
@@ -1128,21 +1124,21 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     ctp::GpuApi::Synchronize();
     // SGD update on host (weights are small).
     std::vector<double> hW1(H * F), hb1(H), hW2(C * H), hb2(C); double hloss; int hcorr, hcnt;
-    cudaMemcpy(hW1.data(), gW1, H * F * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hb1.data(), gb1, H * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hW2.data(), gW2, C * H * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hb2.data(), gb2, C * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&hloss, d_loss, sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&hcorr, d_correct, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&hcnt, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(hW1.data(), gW1, H * F * sizeof(double));
+    ctp::GpuApi::Memcpy(hb1.data(), gb1, H * sizeof(double));
+    ctp::GpuApi::Memcpy(hW2.data(), gW2, C * H * sizeof(double));
+    ctp::GpuApi::Memcpy(hb2.data(), gb2, C * sizeof(double));
+    ctp::GpuApi::Memcpy(&hloss, d_loss, sizeof(double));
+    ctp::GpuApi::Memcpy(&hcorr, d_correct, sizeof(int));
+    ctp::GpuApi::Memcpy(&hcnt, d_count, sizeof(int));
     int hvcorr = 0, hvcnt = 0;
-    cudaMemcpy(&hvcorr, d_vcorrect, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&hvcnt, d_vcount, sizeof(int), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(&hvcorr, d_vcorrect, sizeof(int));
+    ctp::GpuApi::Memcpy(&hvcnt, d_vcount, sizeof(int));
     std::vector<float> W1(H * F), b1(H), W2(C * H), b2(C);
-    cudaMemcpy(W1.data(), dW1, H * F * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(b1.data(), db1, H * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(W2.data(), dW2, C * H * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(b2.data(), db2, C * sizeof(float), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(W1.data(), dW1, H * F * sizeof(float));
+    ctp::GpuApi::Memcpy(b1.data(), db1, H * sizeof(float));
+    ctp::GpuApi::Memcpy(W2.data(), dW2, C * H * sizeof(float));
+    ctp::GpuApi::Memcpy(b2.data(), db2, C * sizeof(float));
     float inv = 1.0f / (float)std::max<int>(1, hcnt);
     if (kMinibatch) {
       // Updates were already applied per window; do not apply an extra epoch-level
@@ -1157,20 +1153,20 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     for (int i = 0; i < H; ++i) b1[i] -= lr * (float)(hb1[i] * inv);
     for (int i = 0; i < C * H; ++i) W2[i] -= lr * (float)(hW2[i] * inv);
     for (int i = 0; i < C; ++i) b2[i] -= lr * (float)(hb2[i] * inv);
-    cudaMemcpy(dW1, W1.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(db1, b1.data(), H * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dW2, W2.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(db2, b2.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(dW1, W1.data(), H * F * sizeof(float));
+    ctp::GpuApi::Memcpy(db1, b1.data(), H * sizeof(float));
+    ctp::GpuApi::Memcpy(dW2, W2.data(), C * H * sizeof(float));
+    ctp::GpuApi::Memcpy(db2, b2.data(), C * sizeof(float));
     out_loss = hloss / std::max<int>(1, hcnt); out_acc = (double)hcorr / std::max<int>(1, hcnt);
     out_count = (clio::run::u64)hcnt;
     out_vacc = hvcnt ? (double)hvcorr / (double)hvcnt : 0.0;
   };
 
   auto reset_weights = [&]() {
-    cudaMemcpy(dW1, W1_0.data(), H * F * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(db1, b1_0.data(), H * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dW2, W2_0.data(), C * H * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(db2, b2_0.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(dW1, W1_0.data(), H * F * sizeof(float));
+    ctp::GpuApi::Memcpy(db1, b1_0.data(), H * sizeof(float));
+    ctp::GpuApi::Memcpy(dW2, W2_0.data(), C * H * sizeof(float));
+    ctp::GpuApi::Memcpy(db2, b2_0.data(), C * sizeof(float));
   };
 
   // =========================== IN-CORE baseline ===========================
@@ -1186,6 +1182,8 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     if (A0.empty()) {
       al = cudaErrorMemoryAllocation;
     } else if (dataset_bytes + (size_t(384) << 20) < fb) {
+      // RAW cudaMalloc on purpose: this probe WANTS a graceful OOM (the
+      // in-core baseline is optional), and GpuApi::Malloc fails fatally.
       al = cudaMalloc(&d_all, dataset_bytes);
     }
     if (al != cudaSuccess) {
@@ -1201,18 +1199,18 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     } else {
       for (clio::run::u64 off = 0; off < total_elems; off += file_elems) {
         clio::run::u64 n = std::min(file_elems, total_elems - off);
-        cudaMemcpy(d_all + off, A0.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        ctp::GpuApi::Memcpy(d_all + off, A0.data(), n * sizeof(float));
       }
       reset_weights();
       double t0 = NowSec();
       for (int e = 0; e < epochs; ++e) {
         clio::run::u64 cnt;
         run_epoch([&](clio::run::u64, clio::run::u64 first, clio::run::u64 nn) {
-          cudaMemcpy(d_scratch, d_all + first * F, nn * F * sizeof(float), cudaMemcpyDeviceToDevice);
+          ctp::GpuApi::Memcpy(d_scratch, d_all + first * F, nn * F * sizeof(float));
         }, base_loss[e], base_acc[e], cnt, base_vacc[e]);
       }
       base_time = NowSec() - t0; base_status = "OK";
-      cudaFree(d_all);
+      ctp::GpuApi::Free(d_all);
       std::fprintf(stderr, "[TRAIN] IN-CORE: epoch0 loss=%.6f acc=%.4f -> epoch%d loss=%.6f acc=%.4f val_acc=%.4f (%.2fs)\n",
                    base_loss[0], base_acc[0], epochs - 1, base_loss[epochs - 1], base_acc[epochs - 1],
                    base_vacc[epochs - 1], base_time);
@@ -1532,10 +1530,9 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
           GnnGatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
               gpu_info, vec.GetDevice(0), lo, lo + epp, d_scratch, 1, vw, sv);
         });
-        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-        REQUIRE(cudaMemcpy(gpu_rows.data(), d_scratch,
-                           (size_t)(epp * sizeof(float)),
-                           cudaMemcpyDeviceToHost) == cudaSuccess);
+        ctp::GpuApi::Synchronize();
+        ctp::GpuApi::Memcpy(gpu_rows.data(), d_scratch,
+                            (size_t)(epp * sizeof(float)));
 
         char nm[32];
         clio::cte::gpu_vector::PageBlobName(pg, nm);
@@ -1635,11 +1632,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
           << exact << "\n"; }
   }
 
-  cudaFree(d_vcorrect); cudaFree(d_vcount);
-  cudaFree(d_lab); cudaFree(dW1); cudaFree(db1); cudaFree(dW2); cudaFree(db2);
-  cudaFree(gW1); cudaFree(gb1); cudaFree(gW2); cudaFree(gb2);
-  cudaFree(h1_buf); cudaFree(dz1_buf); cudaFree(dz2_buf); cudaFree(d_scratch);
-  cudaFree(loss_buf); cudaFree(d_loss); cudaFree(d_correct); cudaFree(d_count);
+  ctp::GpuApi::Free(d_vcorrect); ctp::GpuApi::Free(d_vcount);
+  ctp::GpuApi::Free(d_lab); ctp::GpuApi::Free(dW1); ctp::GpuApi::Free(db1); ctp::GpuApi::Free(dW2); ctp::GpuApi::Free(db2);
+  ctp::GpuApi::Free(gW1); ctp::GpuApi::Free(gb1); ctp::GpuApi::Free(gW2); ctp::GpuApi::Free(gb2);
+  ctp::GpuApi::Free(h1_buf); ctp::GpuApi::Free(dz1_buf); ctp::GpuApi::Free(dz2_buf); ctp::GpuApi::Free(d_scratch);
+  ctp::GpuApi::Free(loss_buf); ctp::GpuApi::Free(d_loss); ctp::GpuApi::Free(d_correct); ctp::GpuApi::Free(d_count);
 }
 
 SIMPLE_TEST_MAIN()
