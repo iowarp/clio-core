@@ -202,7 +202,7 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
     co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run);
+        &run, /*write=*/true);
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
     for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
@@ -248,7 +248,7 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
   for (; off < per; off += page_elems) {
     CLIO_YCALL(v.HoldPageYield(
         base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run));
+        &run, /*write=*/true));
     {
       const clio::run::u64 n =
           (off + page_elems <= per) ? page_elems : (per - off);
@@ -277,7 +277,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
   if (threadIdx.x != 0) return;
   const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i);
+    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i, /*write=*/true);
     for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
       v[base + i] = Weight(base + i);
       }
@@ -361,7 +361,7 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
         (off + page_elems <= per) ? page_elems : (per - off);
     unsigned long long r = 0;                     // register, not the frame
     for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      r += static_cast<unsigned long long>(v.at(base + off + i)) *
+      r += static_cast<unsigned long long>(v[base + off + i]) *
            Activation(base + off + i);
     }
     acc += r;
@@ -431,7 +431,7 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
           (off + page_elems <= per) ? page_elems : (per - off);
       unsigned long long r = 0;                   // register, not the frame
       for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        r += static_cast<unsigned long long>(v.at(base + off + i)) *
+        r += static_cast<unsigned long long>(v[base + off + i]) *
              Activation(base + off + i);
       }
       acc += r;

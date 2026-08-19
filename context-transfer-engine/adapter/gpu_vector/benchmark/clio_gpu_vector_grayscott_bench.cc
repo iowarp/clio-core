@@ -180,14 +180,14 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 ubase, u64 vbase) {
   u64 run = 0;
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.HoldPage(ubase + z * plane, plane, &run);
+    co_await vec.HoldPage(ubase + z * plane, plane, &run, /*write=*/true);
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       vec[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
     }
     // Collective, internally BATCHED (one multi-put per 64 pages).
     vec.FlushAsync(ubase + z * plane, plane);
 
-    co_await vec.HoldPage(vbase + z * plane, plane, &run);
+    co_await vec.HoldPage(vbase + z * plane, plane, &run, /*write=*/true);
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       vec[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
     }
@@ -240,29 +240,29 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     co_await vec.HoldPage(vbase + zm * plane, plane, &run);
     co_await vec.HoldPage(vbase + z * plane, plane, &run);
     co_await vec.HoldPage(vbase + zp * plane, plane, &run);
-    co_await vec.HoldPage(unext + z * plane, plane, &run);
-    co_await vec.HoldPage(vnext + z * plane, plane, &run);
+    co_await vec.HoldPage(unext + z * plane, plane, &run, /*write=*/true);
+    co_await vec.HoldPage(vnext + z * plane, plane, &run, /*write=*/true);
 
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       const u64 x = i % nx, y = i / nx;
-      const float u = vec.at(ubase + z * plane + i);
-      const float v = vec.at(vbase + z * plane + i);
+      const float u = vec[ubase + z * plane + i];
+      const float v = vec[vbase + z * plane + i];
       float lu, lv;
       if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
         lu = 0.0f; lv = 0.0f;      // fixed boundary
       } else {
-        lu = vec.at(ubase + z * plane + i - 1) +
-             vec.at(ubase + z * plane + i + 1) +
-             vec.at(ubase + z * plane + i - nx) +
-             vec.at(ubase + z * plane + i + nx) +
-             vec.at(ubase + zm * plane + i) +
-             vec.at(ubase + zp * plane + i) - 6.0f * u;
-        lv = vec.at(vbase + z * plane + i - 1) +
-             vec.at(vbase + z * plane + i + 1) +
-             vec.at(vbase + z * plane + i - nx) +
-             vec.at(vbase + z * plane + i + nx) +
-             vec.at(vbase + zm * plane + i) +
-             vec.at(vbase + zp * plane + i) - 6.0f * v;
+        lu = vec[ubase + z * plane + i - 1] +
+             vec[ubase + z * plane + i + 1] +
+             vec[ubase + z * plane + i - nx] +
+             vec[ubase + z * plane + i + nx] +
+             vec[ubase + zm * plane + i] +
+             vec[ubase + zp * plane + i] - 6.0f * u;
+        lv = vec[vbase + z * plane + i - 1] +
+             vec[vbase + z * plane + i + 1] +
+             vec[vbase + z * plane + i - nx] +
+             vec[vbase + z * plane + i + nx] +
+             vec[vbase + zm * plane + i] +
+             vec[vbase + zp * plane + i] - 6.0f * v;
       }
       const float uvv = u * v * v;
       vec[unext + z * plane + i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
@@ -338,7 +338,7 @@ __device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
     co_await vec.HoldPage(vbase + z * plane, plane, &run);
     double acc = 0.0;
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      acc += static_cast<double>(vec.at(vbase + z * plane + i));
+      acc += static_cast<double>(vec[vbase + z * plane + i]);
     }
     atomicAdd(out, acc);
     __syncthreads();

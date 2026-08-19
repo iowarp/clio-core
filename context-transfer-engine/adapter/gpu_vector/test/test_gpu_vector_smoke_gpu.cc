@@ -85,7 +85,7 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < n; i += run) {
-    CLIO_YCALL(v.HoldPageYield(i, n - i, &run));
+    CLIO_YCALL(v.HoldPageYield(i, n - i, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[i + k] = static_cast<clio::run::u32>((i + k) * 7 + 1);
     }
@@ -147,7 +147,7 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < per; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + i + k] = static_cast<clio::run::u32>((base + i + k) * 7 + 1);
     }

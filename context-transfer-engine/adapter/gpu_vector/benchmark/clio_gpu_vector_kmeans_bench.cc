@@ -107,7 +107,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
   u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPage(base + off, n, &run);
+    co_await v.HoldPage(base + off, n, &run, /*write=*/true);
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
       v[base + off + i] = PointVal(base + off + i, dims, k);
     }
@@ -142,7 +142,7 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
   u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPage(base + off, n, &run);
+    co_await v.HoldPage(base + off, n, &run, /*write=*/true);
     // Whole pages hold whole points (enforced on the host), so a page is
     // exactly n/dims points and no point straddles a page boundary.
     const u64 npts = n / dims;
@@ -153,13 +153,13 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
       for (u32 c = 0; c < k; ++c) {
         float d = 0.0f;
         for (u32 i = 0; i < dims; ++i) {
-          const float x = v.at(pbase + i) - cent[c * dims + i];
+          const float x = v[pbase + i] - cent[c * dims + i];
           d += x * x;
         }
         if (d < best) { best = d; bestk = c; }
       }
       for (u32 i = 0; i < dims; ++i) {
-        atomicAdd(&sums[bestk * dims + i], v.at(pbase + i));
+        atomicAdd(&sums[bestk * dims + i], v[pbase + i]);
       }
       atomicAdd(&counts[bestk], 1u);
     }

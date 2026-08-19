@@ -138,7 +138,7 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-    co_await v.HoldPage(off, pe, &run);
+    co_await v.HoldPage(off, pe, &run, /*write=*/true);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       v[off + i] = Value(p, off + i, zero_pct);
     }
@@ -198,7 +198,7 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
     }
     co_await v.HoldPage(off, pe, &run);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-      acc += static_cast<unsigned long long>(v.at(off + i)) *
+      acc += static_cast<unsigned long long>(v[off + i]) *
              PosWeight(off + i);
     }
     __syncthreads();
@@ -250,7 +250,7 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
       const u64 off = (base_page + k + j) * pe;
       co_await v.HoldPage(off, pe, &run);
       for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
-        acc += static_cast<unsigned long long>(v.at(off + i)) *
+        acc += static_cast<unsigned long long>(v[off + i]) *
                PosWeight(off + i);
       }
       __syncthreads();

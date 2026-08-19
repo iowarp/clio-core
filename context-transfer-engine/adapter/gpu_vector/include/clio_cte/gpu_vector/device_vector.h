@@ -206,16 +206,17 @@ struct DeviceVectorTestAccess;
  * ============================ API TIERS =================================
  * BASIC (use these):
  *   size()
- *   co_await HoldPage(off, count, &run)      access, faulting as needed
+ *   co_await HoldPage(off, count, &run, w)   access, faulting as needed;
+ *                                            w=true declares stores
  *   FlushAsync(off, count)                   start writeback, no wait
  *   co_await AwaitFlush()                    all started flushes durable
  *   RescorePagesBatchedAsync(n, gen)         score==1 -> prefetch batch,
  *                                            else -> batched CTE rescore
  *   co_await AwaitRescore()                  both batches settled
  * ADVANCED (pointer-publishing designs; contracts in each doc comment):
- *   operator[]/at, TryHoldFast, raw holds, PinHeld (MAY REFUSE -- retry
- *   the hold), UnpinPage, GetPagePtr, MarkResidentDirty, DropAll,
- *   block_override_, ...
+ *   operator[] (reads AND writes; write intent is the hold's `write` flag),
+ *   TryHoldFast, raw holds, PinHeld (MAY REFUSE -- retry the hold),
+ *   UnpinPage, GetPagePtr, MarkResidentDirty, DropAll, block_override_, ...
  * Everything else is machinery: private, reachable in tests only through
  * DeviceVectorTestAccess.
  * ========================================================================
@@ -234,19 +235,12 @@ class DeviceVector {
   // ---- device API -----------------------------------------------------
 
   /**
-   * Element access. Resolves the page (faulting it in if needed), records
-   * the access, and returns a reference into the page's bytes.
-   *
-   * The non-const form marks the page dirty: a reference handed out for
-   * writing cannot be observed later, so the write must be assumed.
-   */
-  /**
    * Pin the page holding `off` and report how far you can walk from there.
    *
    * This is the indexing fast path. It resolves the page ONCE -- faulting it in
    * if needed -- caches it in last_page_, and returns how many elements can be
    * read or written sequentially from `off` before leaving that page. The
-   * caller loops over that run using operator[]/at(), which then do no
+   * caller loops over that run using operator[], which then does no
    * resolution at all.
    *
    * Why this exists: resolving per element cost 64x a raw pointer on resident
@@ -264,7 +258,8 @@ class DeviceVector {
    *         >= 1 and <= count. Loop that many, then call again.
    */
   CTP_GPU_FUN clio::run::u64 HoldPage(clio::run::u64 off,
-                                      clio::run::u64 count) {
+                                      clio::run::u64 count,
+                                      bool write = false) {
     const clio::run::u64 pn = PageOf(off);
     Page *p = last_page_;
     if (p == nullptr || p->page_num != pn || p->fetching) {
@@ -333,6 +328,11 @@ class DeviceVector {
       last_page_ = p;
       last_pn_ = pn;
     }
+    // Write intent is declared HERE, at the hold, not inferred per element:
+    // operator[] is side-effect-free for reads and writes alike, so a page
+    // held without write=true is dropped clean at eviction no matter what
+    // was stored through it.
+    if (write) p->dirty = 1u;
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
     return (count < left) ? count : left;
@@ -360,7 +360,9 @@ class DeviceVector {
   }
 
   /**
-   * Element access through the HELD page -- no resolution, no checks.
+   * Element access through the HELD page -- no resolution, no checks, and NO
+   * side effects. This is the ONLY element accessor, for reads and writes
+   * alike (the old read-only at() is gone).
    *
    * Assumes HoldPage() covers `off`: it indexes last_page_ directly, which is
    * what makes it cost about the same as a pointer dereference. Accessing
@@ -368,15 +370,22 @@ class DeviceVector {
    * HoldPage returned is a contract, not a hint: re-hold before stepping past
    * it. There is deliberately no resolve-per-access accessor -- that path cost
    * 12x a raw pointer even when it always hit, and hold-and-iterate is 1.44x.
+   *
+   * WRITES ARE DECLARED AT THE HOLD. operator[] used to mark the page dirty
+   * on every non-const access, which silently dirtied read paths too (a
+   * read-only walk would write every evicted page back). Now nothing is
+   * inferred from a reference: pass write=true to the HoldPage that covers
+   * the stores (or use MarkResidentDirty for pages resident by other means).
+   * A page held without the flag is dropped CLEAN at eviction, whatever was
+   * stored through it -- the declaration is part of the write, not an
+   * optimization.
    */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) {
     Page *p = last_page_;
-    p->dirty = 1u;
     return static_cast<T *>(p->data)[IndexIn(off, p)];
   }
 
-  /** Read-only access through the held page. Does NOT dirty it. */
-  CTP_GPU_FUN const T &at(clio::run::u64 off) const {
+  CTP_GPU_FUN const T &operator[](clio::run::u64 off) const {
     const Page *p = last_page_;
     return static_cast<const T *>(p->data)[IndexIn(off, p)];
   }
@@ -390,8 +399,8 @@ class DeviceVector {
    * inner loop is tight enough for that load to matter.
    */
   CTP_GPU_FUN T *HoldRaw(clio::run::u64 off, clio::run::u64 count,
-                         clio::run::u64 *run) {
-    *run = HoldPage(off, count);
+                         clio::run::u64 *run, bool write = true) {
+    *run = HoldPage(off, count, write);
     Page *p = last_page_;
     p->dirty = 1u;
     return static_cast<T *>(p->data) + IndexIn(off, p);
@@ -987,9 +996,12 @@ class DeviceVector {
    *
    * Exists for callers that fill a page's bytes OUTSIDE this view -- the
    * two-phase pair kernel writes forces through raw pinned-page pointers in
-   * a plain (non-coroutine) kernel, where operator[]'s dirty marking never
-   * runs. Marking is separated from flushing so the write and the flush can
-   * live in different kernel launches.
+   * a plain (non-coroutine) kernel, or written into by machinery that never
+   * took a write-hold (batched fetches, decode scratch) -- since operator[]
+   * no longer infers a write from a non-const access, writes are declared
+   * at the hold (`write=true`) and this covers the pages no hold saw.
+   * Marking is separated from flushing so the write and the flush can live
+   * in different kernel launches.
    */
   CTP_GPU_FUN void MarkResidentDirty(clio::run::u64 off, clio::run::u64 count) {
     LockBlock();
@@ -1505,7 +1517,8 @@ class DeviceVector {
    * CLIO_YLOCAL so its address is stable across the suspend.
    */
   CTP_GPU_FUN void HoldPageYield(clio::run::u64 off, clio::run::u64 count,
-                                 clio::run::u64 *run_out) {
+                                 clio::run::u64 *run_out,
+                                 bool write = false) {
     CLIO_YFRAME();
     // FIRST: wait for the whole block to be done with whatever it was doing.
     //
@@ -1602,7 +1615,7 @@ class DeviceVector {
 
     // 3. Resident for the whole block now, so this is the lock-free fast path
     //    and every lane may read the page.
-    *run_out = HoldPage(off, count);
+    *run_out = HoldPage(off, count, write);
     CLIO_YEND();
   }
 
@@ -1641,7 +1654,8 @@ class DeviceVector {
    * cannot split the block across a barrier.
    */
   CTP_GPU_FUN clio::run::u64 TryHoldFast(clio::run::u64 off,
-                                         clio::run::u64 count) {
+                                         clio::run::u64 count,
+                                         bool write = false) {
     // The barrier is NOT optional. HoldPageCoro opens with one, and the block
     // relies on it: a thread must not inspect the page table while another is
     // still writing to the page the previous hold covered. Dropping it here
@@ -1652,14 +1666,15 @@ class DeviceVector {
     if (!IsResident(PageOf(off))) {
       return 0;
     }
-    const clio::run::u64 r = HoldPage(off, count);
+    const clio::run::u64 r = HoldPage(off, count, write);
     __syncthreads();
     return r;
   }
 
   __device__ clio::run::gpu::YCoroTask HoldPageCoro(clio::run::u64 off,
                                                     clio::run::u64 count,
-                                                    clio::run::u64 *run_out) {
+                                                    clio::run::u64 *run_out,
+                                                    bool write = false) {
     if (threadIdx.x == 0) {
       ReapFetched();
       ReapFlushed();
@@ -1731,23 +1746,29 @@ class DeviceVector {
                         RetryLostFetch(PageOf(off))),
                        !IsResident(PageOf(off)), FetchWaitTag(PageOf(off)));
     // 3. Resident for the whole block: the lock-free fast path.
-    *run_out = HoldPage(off, count);
+    *run_out = HoldPage(off, count, write);
   }
 
   /**
-   * BASIC: `co_await vec.HoldPage(off, count, &run)` -- THE access
+   * BASIC: `co_await vec.HoldPage(off, count, &run, write)` -- THE access
    * primitive. Resident pages complete on the fast path with no
    * suspension; a miss faults the page in and suspends the block until it
    * lands. Block-collective: every thread of the block must co_await it
    * together (it synchronizes internally). On return `*run` is how many
    * elements from `off` are contiguous in the held page.
+   *
+   * `write` declares intent for the WHOLE hold: pass true when anything will
+   * be stored through the page (operator[] or a raw pointer), and the page
+   * is marked dirty up front so eviction and FlushAsync write it back. A
+   * page held with write=false is dropped clean no matter what was stored.
    */
   __device__ clio::run::gpu::YCoroTask HoldPage(clio::run::u64 off,
                                                 clio::run::u64 count,
-                                                clio::run::u64 *run) {
-    *run = TryHoldFast(off, count);
+                                                clio::run::u64 *run,
+                                                bool write = false) {
+    *run = TryHoldFast(off, count, write);
     if (*run != 0) co_return;
-    co_await HoldPageCoro(off, count, run);
+    co_await HoldPageCoro(off, count, run, write);
   }
 
   /**

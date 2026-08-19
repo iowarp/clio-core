@@ -86,7 +86,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < per; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + i + k] = Seed(base + i + k);
     }
@@ -122,7 +122,7 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
   // reduces the value) by about two elements' worth.
   CLIO_YBEGIN();
   for (; off < per; off += run) {
-    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
+    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + off + k] = Step(v[base + off + k]);
     }
@@ -205,7 +205,7 @@ __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; off < per; off += run) {
-    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
+    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + off + k] = Seed(base + off + k);
     }

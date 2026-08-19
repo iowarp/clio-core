@@ -74,7 +74,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
   const u64 base = static_cast<u64>(block) * per;
   u64 run = 0;
   for (u64 i = 0; i < per; i += run) {
-    co_await v.HoldPage(base + i, per - i, &run);
+    co_await v.HoldPage(base + i, per - i, &run, /*write=*/true);
     for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + i + k] = Elem(base + i + k);
     }
@@ -149,7 +149,7 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
     co_await v.HoldPage(off, v.h_->elems_per_page_, &run);
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-      local += v.at(off + i);
+      local += v[off + i];
     }
     acc += local;
     __syncthreads();

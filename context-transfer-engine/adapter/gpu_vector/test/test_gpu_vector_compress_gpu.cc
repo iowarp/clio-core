@@ -91,7 +91,7 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   clio::run::u64 run = 0;
   for (clio::run::u64 i = 0; i < per; i += run) {
-    co_await v.HoldPage(base + i, per - i, &run);
+    co_await v.HoldPage(base + i, per - i, &run, /*write=*/true);
     if (threadIdx.x == 0) {
       for (clio::run::u64 k = 0; k < run; ++k) {
         v[base + i + k] = Weight(base + i + k);
@@ -133,7 +133,7 @@ __device__ gy::YCoroMain WeightsDotCoro(gv::DeviceVector<clio::run::u32> v,
     co_await v.HoldPage(base + i, per - i, &run);
     if (threadIdx.x == 0) {
       for (clio::run::u64 k = 0; k < run; ++k) {
-        acc += static_cast<unsigned long long>(v.at(base + i + k)) *
+        acc += static_cast<unsigned long long>(v[base + i + k]) *
                Activation(base + i + k);
       }
     }
@@ -187,7 +187,7 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
         co_await v.HoldPage(off + i, v.h_->elems_per_page_ - i, &run);
         if (threadIdx.x == 0) {
           for (clio::run::u64 k = 0; k < run; ++k) {
-            acc += static_cast<unsigned long long>(v.at(off + i + k)) *
+            acc += static_cast<unsigned long long>(v[off + i + k]) *
                    Activation(off + i + k);
           }
         }

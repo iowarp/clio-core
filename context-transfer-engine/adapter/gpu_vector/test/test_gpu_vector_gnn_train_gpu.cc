@@ -243,7 +243,7 @@ CTP_GPU_FUN void GnnCopyRun(gv::DeviceVector<float> &v, clio::run::u64 lo,
     // operator[] would mark the page dirty, which blocks the run-fetch from
     // claiming slots and forces single-page paging.
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      scratch[i + k] = v.at(lo + i + k);
+      scratch[i + k] = v[lo + i + k];
     }
   }
 }

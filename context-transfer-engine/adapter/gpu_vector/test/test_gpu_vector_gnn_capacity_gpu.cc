@@ -220,16 +220,9 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
   for (; i < n; i += run) {
     CLIO_YCALL(v.HoldPageYield(lo + i, n - i, &run));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // operator[], NOT at(), and that costs real performance -- see below.
-      // at() is the read-only accessor and does not dirty the page, which is what a
-      // read-only sweep wants: no writeback, 32% faster epochs, and no SHM growth.
-      // It is also WRONG here today. A dirty page is skipped as an eviction victim
-      // (see the !pgi.dirty test in device_vector.h ClaimSlot); marking every page
-      // dirty therefore makes it non-evictable while any lane still holds it. With
-      // clean pages the slot can be claimed and refilled underneath a lane that is
-      // still reading, and the sweep returns wrong bytes -- measured 2 of 3 runs
-      // failing bit-exactness with at() versus 3 of 3 passing with operator[].
-      // Restore at() once eviction is safe against concurrent readers.
+      // Read-only sweep: the hold stays write=false, so every page is dropped
+      // clean and nothing is written back. A held page is pinned, so eviction
+      // cannot re-tenant the slot under a lane that is still reading.
       scratch[i + k] = v[lo + i + k];
     }
   }

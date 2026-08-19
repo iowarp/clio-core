@@ -88,7 +88,7 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < count; i += run) {
-    CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run));
+    CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[off + i + k] = Val(off + i + k, salt);
     }
@@ -120,7 +120,7 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
     CLIO_YCALL(v.HoldPageYield(off + i, count - i, &run));
     unsigned long long local = 0;
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      if (v.at(off + i + k) != Val(off + i + k, salt)) ++local;
+      if (v[off + i + k] != Val(off + i + k, salt)) ++local;
     }
     if (local != 0) atomicAdd(bad, local);
   }
@@ -138,7 +138,7 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
     for (u64 k = 0; k < npages; ++k) {
       const u64 off = (first_page + k) * v.h_->elems_per_page_;
       v.HoldPage(off, 1);
-      acc += v.at(off);
+      acc += v[off];
     }
   }
   atomicAdd(sink, acc);
@@ -156,7 +156,7 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
   for (u32 i = 0; i < n; ++i) {
     const u64 off = pages[i] * v.h_->elems_per_page_;
     v.HoldPage(off, 1);
-    acc += v.at(off);
+    acc += v[off];
   }
   atomicAdd(sink, acc);
 }
@@ -216,7 +216,7 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
   // Dirty every page first, THEN flush the whole block in one batched
   // submission -- that batch is what this test is about.
   for (; off < total; off += run) {
-    CLIO_YCALL(v.HoldPageYield(off, total - off, &run));
+    CLIO_YCALL(v.HoldPageYield(off, total - off, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[off + k] = Val(off + k, salt);
     }
@@ -273,7 +273,7 @@ __global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
         const u64 off = (k + j) * v.h_->elems_per_page_;
         unsigned long long local = 0;
         for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
-          if (v.at(off + i) != Val(off + i, salt)) ++local;
+          if (v[off + i] != Val(off + i, salt)) ++local;
         }
         if (local != 0) atomicAdd(bad, local);
       }
@@ -333,9 +333,9 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
   // service from inside the kernel.
   CLIO_YBEGIN();
   for (; r < reps; ++r) {
-    CLIO_YCALL(v.HoldPageYield(last_of_prev, 1, &run));
+    CLIO_YCALL(v.HoldPageYield(last_of_prev, 1, &run, /*write=*/true));
     if (threadIdx.x == 0) v[last_of_prev] = Val(last_of_prev, 7u);
-    CLIO_YCALL(v.HoldPageYield(first_of_next, 1, &run));
+    CLIO_YCALL(v.HoldPageYield(first_of_next, 1, &run, /*write=*/true));
     if (threadIdx.x == 0) v[first_of_next] = Val(first_of_next, 7u);
   }
   // Collective, internally BATCHED (one multi-put per 64 pages).
@@ -362,7 +362,7 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
     const u64 base = p * v.h_->elems_per_page_;
     v.HoldPage(base, v.h_->elems_per_page_);
     for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-      if (v.at(base + i) != Val(base + i, salt)) ++local;
+      if (v[base + i] != Val(base + i, salt)) ++local;
     }
     __syncthreads();
   }
@@ -380,7 +380,7 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
   const u64 pages = count / v.h_->elems_per_page_;
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = slice + p * v.h_->elems_per_page_;
-    v.HoldPage(base, v.h_->elems_per_page_);
+    v.HoldPage(base, v.h_->elems_per_page_, /*write=*/true);
     {
       for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
         v[base + i] = Val(base + i, salt);
@@ -421,7 +421,7 @@ __device__ gy::YCoroMain PrefetchWalkCoro(gv::DeviceVector<u32> v, u64 count,
     co_await v.HoldPage(off, v.h_->elems_per_page_, &run);
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < run; i += blockDim.x) {
-      if (v.at(off + i) != Val(off + i, salt)) ++local;
+      if (v[off + i] != Val(off + i, salt)) ++local;
     }
     if (local != 0) atomicAdd(bad, local);
     __syncthreads();

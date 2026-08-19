@@ -93,7 +93,7 @@ __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < per; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run));
+    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run, /*write=*/true));
     for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + i + k] = Seed(base + i + k);
     }

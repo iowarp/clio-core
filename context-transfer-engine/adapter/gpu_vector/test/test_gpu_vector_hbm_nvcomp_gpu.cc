@@ -85,7 +85,7 @@ __global__ void HbmSeedKernel(clio::run::IpcManagerGpuInfo info,
   for (; off < per; off += kPageElems) {
     CLIO_YCALL(v.HoldPageYield(
         base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
-        &run));
+        &run, /*write=*/true));
     {
       const clio::run::u64 n =
           (off + kPageElems <= per) ? kPageElems : (per - off);
@@ -126,7 +126,7 @@ __global__ void HbmDotKernel(clio::run::IpcManagerGpuInfo info,
           (off + kPageElems <= per) ? kPageElems : (per - off);
       unsigned long long acc = 0;
       for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        acc += static_cast<unsigned long long>(v.at(base + off + i)) *
+        acc += static_cast<unsigned long long>(v[base + off + i]) *
                Activation(base + off + i);
       }
       atomicAdd(sum, acc);

@@ -106,8 +106,8 @@ __global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
   // One resolution per field for the whole kernel, instead of one per access.
   ui.HoldPage(0, cells);
   vi.HoldPage(0, cells);
-  uo.HoldPage(0, cells);
-  vo.HoldPage(0, cells);
+  uo.HoldPage(0, cells, /*write=*/true);
+  vo.HoldPage(0, cells, /*write=*/true);
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
     const int x = static_cast<int>(idx % dim);
@@ -116,9 +116,9 @@ __global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
     const u64 r = y * dim + Wrap(x + 1, dim);
     const u64 d = Wrap(y - 1, dim) * dim + x;
     const u64 t = Wrap(y + 1, dim) * dim + x;
-    const float u = ui.at(idx), v = vi.at(idx);
-    const float lu = ui.at(l) + ui.at(r) + ui.at(d) + ui.at(t) - 4.0f * u;
-    const float lv = vi.at(l) + vi.at(r) + vi.at(d) + vi.at(t) - 4.0f * v;
+    const float u = ui[idx], v = vi[idx];
+    const float lu = ui[l] + ui[r] + ui[d] + ui[t] - 4.0f * u;
+    const float lv = vi[l] + vi[r] + vi[d] + vi[t] - 4.0f * v;
     const float uvv = u * v * v;
     uo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
     vo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
@@ -148,10 +148,10 @@ __device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
   const u64 cells = static_cast<u64>(dim) * dim;
   u64 run = 0;
   for (u64 i = 0; i < cells; i += run) {
-    co_await u.HoldPage(i, cells - i, &run);
-    co_await v.HoldPage(i, cells - i, &run);
-    co_await uo.HoldPage(i, cells - i, &run);
-    co_await vo.HoldPage(i, cells - i, &run);
+    co_await u.HoldPage(i, cells - i, &run, /*write=*/true);
+    co_await v.HoldPage(i, cells - i, &run, /*write=*/true);
+    co_await uo.HoldPage(i, cells - i, &run, /*write=*/true);
+    co_await vo.HoldPage(i, cells - i, &run, /*write=*/true);
     for (u64 k = i + threadIdx.x; k < i + run; k += blockDim.x) {
       float a, b;
       InitCell(k, dim, &a, &b);
@@ -187,7 +187,7 @@ __global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
   for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
        idx += static_cast<u64>(gridDim.x) * blockDim.x) {
     src.HoldPage(idx, 1);
-    dst[idx] = src.at(idx);
+    dst[idx] = src[idx];
   }
 }
 

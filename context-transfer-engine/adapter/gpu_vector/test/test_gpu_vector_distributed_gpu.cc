@@ -96,7 +96,8 @@ __global__ void WriteRangeKernel(clio::run::IpcManagerGpuInfo info,
 
   CLIO_YBEGIN();
   for (; i < elems_per_block; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run));
+    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run,
+                               /*write=*/true));
     for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
       v[base + i + k] = Pattern(base + i + k, round);
     }
@@ -131,16 +132,9 @@ __global__ void ReadRangeKernel(clio::run::IpcManagerGpuInfo info,
   for (; i < elems_per_block; i += run) {
     CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run));
     for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // operator[], NOT at(), and that costs real performance -- see below.
-      // at() is the read-only accessor and does not dirty the page, which is what a
-      // read-only sweep wants: no writeback, 32% faster epochs, and no SHM growth.
-      // It is also WRONG here today. A dirty page is skipped as an eviction victim
-      // (see the !pgi.dirty test in device_vector.h ClaimSlot); marking every page
-      // dirty therefore makes it non-evictable while any lane still holds it. With
-      // clean pages the slot can be claimed and refilled underneath a lane that is
-      // still reading, and the sweep returns wrong bytes -- measured 2 of 3 runs
-      // failing bit-exactness with at() versus 3 of 3 passing with operator[].
-      // Restore at() once eviction is safe against concurrent readers.
+      // Read-only sweep: the hold stays write=false, so every page is dropped
+      // clean and nothing is written back. A held page is pinned, so eviction
+      // cannot re-tenant the slot under a lane that is still reading.
       const u32 got = v[base + i + k];
       atomicAdd(sum, static_cast<unsigned long long>(got));
       if (got != Pattern(base + i + k, round)) atomicAdd(mismatches, 1ull);

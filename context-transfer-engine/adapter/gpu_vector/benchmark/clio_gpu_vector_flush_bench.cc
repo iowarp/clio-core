@@ -14,6 +14,10 @@
  *   sync    spin, write, BeginFlush, WaitFlush        -> spin + flush
  *   async   spin, collect PREVIOUS flush, write,      -> max(spin, flush)
  *           BeginFlush, continue
+ *   stock   plain device buffer; the HOST synchronously cudaMemcpy's it out
+ *           at every phase boundary (kernel exit) -- the pattern a
+ *           phase-structured application uses without the vector. Same spin,
+ *           same bytes; reported head-to-head against sync and async.
  *
  * Both baselines are taken the same way as the real runs -- spin with no I/O,
  * and I/O with no spin -- so "sum" and "max" are measured quantities and the
@@ -120,7 +124,7 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.h_->elems_per_page_;
       u64 run = 0;
-      co_await v.HoldPage(poff, v.h_->elems_per_page_, &run);
+      co_await v.HoldPage(poff, v.h_->elems_per_page_, &run, /*write=*/true);
       WritePage(v, poff, 0u);
     }
     if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
@@ -155,7 +159,7 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
       const u64 off = block_base + it * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.h_->elems_per_page_;
-        v.HoldPage(poff, v.h_->elems_per_page_);
+        v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
         for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
           v[poff + i] = Val(poff + i, 0u);
         }
@@ -209,7 +213,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
         // Required: operator[] indexes the HELD page and does no resolution,
         // so without this last_page_ is null and the write dereferences it.
         u64 run = 0;
-        co_await v.HoldPage(poff, v.h_->elems_per_page_, &run);
+        co_await v.HoldPage(poff, v.h_->elems_per_page_, &run, /*write=*/true);
         WritePage(v, poff, pass);
       }
       // ---- block-level flush: ONE call covering the whole region ----
@@ -275,7 +279,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
           const u64 poff = off + pg * v.h_->elems_per_page_;
           // Required: operator[] indexes the HELD page and does no resolution,
           // so without this last_page_ is null and the write dereferences it.
-          v.HoldPage(poff, v.h_->elems_per_page_);
+          v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
           for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
             v[poff + i] = Val(poff + i, pass);
           }
@@ -351,7 +355,7 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
       unsigned long long local = 0;
       unsigned long long wrong = 0;
       for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-        const u32 got = v.at(poff + i);
+        const u32 got = v[poff + i];
         local += got;
         // Compare element by element: a single global sum says only THAT
         // something is wrong, never which page or offset.
@@ -379,6 +383,30 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
     }
   }
   atomicAdd(sum, acc);
+}
+
+/**
+ * STOCK baseline: the phase-structured pattern this vector replaces. One
+ * plain device buffer holds a single iteration's regions; the kernel spins
+ * and writes them, then the HOST synchronously copies the buffer out before
+ * launching the next phase. No paging, no runtime -- the write-back cost is
+ * a kernel-launch + cudaDeviceSynchronize + blocking cudaMemcpy per phase,
+ * serialized by construction. Indexing matches the vector kernels (block
+ * b, iteration it writes Val over the same global offsets), so the two
+ * approaches move byte-identical data.
+ */
+__global__ void StockPhaseKernel(u32 *buf, u64 it, u64 iters,
+                                 u64 region_elems, u32 spin_us, u64 clock_khz,
+                                 int do_write, u32 pass) {
+  Spin(spin_us, clock_khz);
+  __syncthreads();
+  if (!do_write) return;
+  const u64 dst = static_cast<u64>(blockIdx.x) * region_elems;
+  const u64 src_base =
+      (static_cast<u64>(blockIdx.x) * iters + it) * region_elems;
+  for (u64 i = threadIdx.x; i < region_elems; i += blockDim.x) {
+    buf[dst + i] = Val(src_base + i, pass);
+  }
 }
 
 /** Diagnostic: each slot's page_num and the first word of its buffer. */
@@ -415,6 +443,10 @@ struct Args {
   // cache -- the block must evict to make room, which is the only way the
   // lower tiers (host DRAM, NVMe) ever get exercised.
   u32 pages_per_block = 0;
+  // Stock phase-copy baseline: plain device buffer + synchronous cudaMemcpy
+  // at every phase boundary. On by default in write mode; it is the number
+  // the eternia sync/async flushes are compared against.
+  bool stock = true;
 };
 
 /**
@@ -479,11 +511,12 @@ int main(int argc, char **argv) {
     else if (f == "--repeat") a.repeat = std::atoi(next());
     else if (f == "--pages-per-block") a.pages_per_block = std::atoi(next());
     else if (f == "--read") a.read = true;
+    else if (f == "--no-stock") a.stock = false;
     else if (f == "--help") {
       std::printf(
           "usage: %s [--blocks N] [--iters N] [--spin-us N] [--page-kb N] "
           "[--flush-mb N] [--threads N] [--repeat N] "
-          "[--pages-per-block N]\n"
+          "[--pages-per-block N] [--no-stock]\n"
           "tiers (MB, 0 = omit): GV_HBM_MB GV_DRAM_MB GV_NVME_MB "
           "GV_NVME_PATH\n", argv[0]);
       return 0;
@@ -946,6 +979,71 @@ int main(int argc, char **argv) {
   const double measured_total = NowMs() - measured_t0;
   const u32 last_pass = pass - 1;
 
+  // ---- STOCK phase-copy baseline ----------------------------------------
+  // Same spin, same bytes, same Val over the same global offsets -- but a
+  // plain device buffer drained by a BLOCKING host copy at every phase
+  // boundary. Passes 9000+ are private to this section: nothing here touches
+  // the CTE, so the vector verification below still checks last_pass.
+  double stock_spin = 0, stock_copy = 0, stock_sync = 0;
+  bool stock_ok = true;
+  const u32 stock_pass = 9002u;
+  if (a.stock) {
+    const u64 region_elems = pages_per_region * page_elems;
+    const u64 iter_elems = region_elems * a.blocks;
+    const u64 iter_bytes = iter_elems * sizeof(u32);
+    u32 *d_stock = ctp::GpuApi::Malloc<u32>(iter_bytes);
+    // Pinned destination: the strongest form of the stock approach. A
+    // pageable buffer would stage through the driver's internal pinned
+    // bounce and only make the baseline look worse.
+    u32 *h_stock = ctp::GpuApi::MallocHost<u32>(iter_bytes * a.iters);
+    auto srun = [&](u32 spin, int do_write, int do_copy, u32 this_pass) {
+      double best = 1e30;
+      for (u32 r = 0; r < a.repeat; ++r) {
+        ctp::GpuApi::Synchronize();
+        const double t0 = NowMs();
+        for (u64 it = 0; it < a.iters; ++it) {
+          StockPhaseKernel<<<a.blocks, a.threads>>>(
+              d_stock, it, a.iters, region_elems, spin, clock_khz, do_write,
+              this_pass);
+          ctp::GpuApi::Synchronize();  // the phase boundary
+          if (do_copy) {
+            ctp::GpuApi::Memcpy(h_stock + it * iter_elems, d_stock,
+                                iter_bytes);
+          }
+        }
+        const double ms = NowMs() - t0;
+        if (ms < best) best = ms;
+      }
+      return best;
+    };
+    stock_spin = srun(a.spin_us, 0, 0, 9000u);  // compute, no copy
+    stock_copy = srun(0, 1, 1, 9001u);          // copy, no compute
+    stock_sync = srun(a.spin_us, 1, 1, stock_pass);
+    // The last srun wrote stock_pass everywhere; the host buffer must agree.
+    for (u32 b = 0; b < a.blocks && stock_ok; ++b) {
+      for (u64 it = 0; it < a.iters && stock_ok; ++it) {
+        const u64 src_base =
+            (static_cast<u64>(b) * a.iters + it) * region_elems;
+        const u32 *h =
+            h_stock + it * iter_elems + static_cast<u64>(b) * region_elems;
+        for (u64 i = 0; i < region_elems; i += 97) {
+          if (h[static_cast<size_t>(i)] != Val(src_base + i, stock_pass)) {
+            std::fprintf(stderr,
+                         "  STOCK MISMATCH block %u iter %llu elem %llu: "
+                         "got %u want %u\n",
+                         b, (unsigned long long) it, (unsigned long long) i,
+                         h[static_cast<size_t>(i)],
+                         Val(src_base + i, stock_pass));
+            stock_ok = false;
+            break;
+          }
+        }
+      }
+    }
+    ctp::GpuApi::Free(d_stock);
+    ctp::GpuApi::FreeHost(h_stock);
+  }
+
   // Verify the async pass reached the CTE. Sampled: first and last page of
   // every region, which is enough to catch a lost or mis-ordered flush without
   // reading hundreds of megabytes back through the client.
@@ -1033,8 +1131,8 @@ int main(int argc, char **argv) {
       // and a flat curve is the CORRECT answer rather than a suspicious one --
       // the cache has nothing to hit. Evicts vs puts says whether writebacks
       // came from reclaiming slots or from the explicit flush.
-      "  measured total   %8.2f ms   (all timed phases; EXCLUDES init, warm, "
-      "and verification)\n"
+      "  measured total   %8.2f ms   (all vector timed phases; EXCLUDES "
+      "init, warm, verification, and the stock baseline)\n"
       "  faults           %8llu     (cache hits are impossible when this is 0)\n"
       "  evicts / puts    %8llu / %llu\n",
       spin_only, spin_only * 1000.0 / per_iter,
@@ -1050,7 +1148,28 @@ int main(int argc, char **argv) {
   report_tiers();
   report_streams();
 
-  if (!ok) {
+  if (a.stock) {
+    const double s_mx = (stock_spin > stock_copy) ? stock_spin : stock_copy;
+    const double stock_mbps =
+        (stock_copy > 0.0) ? (working_mb / (stock_copy / 1000.0)) : 0.0;
+    std::printf(
+        "\n  STOCK BASELINE (plain device buffer, blocking cudaMemcpy per "
+        "phase)\n"
+        "  stock spin only  %8.2f ms\n"
+        "  stock copy only  %8.2f ms   (%.0f MB/s D2H, pinned dest)\n"
+        "  stock sync       %8.2f ms   %s\n"
+        "  sum / max        %8.2f / %.2f ms\n"
+        "\n  HEAD-TO-HEAD (same spin, same bytes written back)\n"
+        "  stock sync copy  %8.2f ms\n"
+        "  eternia sync     %8.2f ms   (%.2fx vs stock)\n"
+        "  eternia async    %8.2f ms   (%.2fx vs stock)\n",
+        stock_spin, stock_copy, stock_mbps, stock_sync,
+        stock_ok ? "data=OK" : "data=MISMATCH", stock_spin + stock_copy, s_mx,
+        stock_sync, sync_ms, stock_sync / sync_ms, async_ms,
+        stock_sync / async_ms);
+  }
+
+  if (!ok || !stock_ok) {
     std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");
     return 1;
   }
