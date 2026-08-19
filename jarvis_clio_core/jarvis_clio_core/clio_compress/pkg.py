@@ -113,6 +113,79 @@ class ClioCompress(Service):
                 'type': str,
                 'default': '',
             },
+            # ----------------------------------------------------------
+            # NeuroPress neural selection (issue #693)
+            # ----------------------------------------------------------
+            # neuropress_model_path is the master switch: the compressor
+            # only builds the predictor when it is non-empty, so every
+            # option below is inert without it. It needs the DIRECTORY
+            # holding the trained .nnwt weights, not the file.
+            #
+            # Selection also requires the caller to ask for dynamic
+            # compression -- Context.dynamic_compress_ is 0=skip, 1=static,
+            # 2=dynamic, and the NeuroPress gate is `!= 1`. A workload
+            # pinning a library gets that library, model or no model.
+            {
+                'name': 'neuropress_model_path',
+                'msg': ('Directory of trained NeuroPress .nnwt weights '
+                        '(empty = NeuroPress disabled)'),
+                'type': str,
+                'default': '',
+            },
+            # Off by default, mirroring NeuroPress's own
+            # g_online_learning_enabled{false}: pointing at weights must
+            # give INFERENCE ONLY. A deployment that just wants the trained
+            # model should not silently get one whose weights drift.
+            {
+                'name': 'neuropress_online_learning_enabled',
+                'msg': 'Enable NeuroPress online SGD learning',
+                'type': bool,
+                'default': False,
+            },
+            {
+                'name': 'neuropress_mape_threshold',
+                'msg': ('Weighted-cost error above which online SGD fires '
+                        '(0.30 = 30%)'),
+                'type': float,
+                'default': 0.30,
+            },
+            {
+                'name': 'neuropress_learning_rate',
+                'msg': 'Online SGD step size',
+                'type': float,
+                'default': 0.01,
+            },
+            # Exploration compresses alternatives purely to generate
+            # training samples and never stores them. Opt-in, and costly:
+            # a full sweep is ~32 compressions per chunk.
+            {
+                'name': 'neuropress_exploration_enabled',
+                'msg': 'Enable K-way exploration (requires online learning)',
+                'type': bool,
+                'default': False,
+            },
+            {
+                'name': 'neuropress_exploration_threshold',
+                'msg': 'Cost error above which a sweep runs (0.50 = 50%)',
+                'type': float,
+                'default': 0.50,
+            },
+            {
+                'name': 'neuropress_exploration_k',
+                'msg': 'Alternatives measured per sweep (31 = whole space)',
+                'type': int,
+                'default': 3,
+            },
+            # Measurement mode, not a faster one: every chunk is explored
+            # exhaustively and both SGD phases are suppressed, so it
+            # establishes the ceiling on selection quality rather than
+            # improving throughput.
+            {
+                'name': 'neuropress_best_mode',
+                'msg': 'Exhaustive-search mode (slow; measurement only)',
+                'type': bool,
+                'default': False,
+            },
         ]
 
     # ------------------------------------------------------------------
@@ -178,10 +251,25 @@ class ClioCompress(Service):
         # runtime's path-empty short-circuits keep behaving as before.
         for key in ('qtable_model_path', 'linreg_model_path',
                     'distribution_model_path', 'dnn_model_weights_path',
-                    'trace_folder_path'):
+                    'trace_folder_path', 'neuropress_model_path'):
             value = self.config.get(key, '')
             if value:
                 compose_entry[key] = value
+
+        # NeuroPress tunables ride along only when the model is configured.
+        # Emitting them on their own would put keys in the compose file that
+        # tune a predictor the compressor never builds — parsed, applied to
+        # the config struct, and with nothing to act on.
+        if self.config.get('neuropress_model_path', ''):
+            for key in ('neuropress_online_learning_enabled',
+                        'neuropress_mape_threshold',
+                        'neuropress_learning_rate',
+                        'neuropress_exploration_enabled',
+                        'neuropress_exploration_threshold',
+                        'neuropress_exploration_k',
+                        'neuropress_best_mode'):
+                if key in self.config:
+                    compose_entry[key] = self.config[key]
 
         compose_config = {'compose': [compose_entry]}
 
@@ -204,6 +292,27 @@ class ClioCompress(Service):
         if compress_preset in self._COMPRESS_PRESET_IDS:
             self.setenv('CLIO_CTE_COMPRESS_DEFAULT_PRESET_ID',
                         str(self._COMPRESS_PRESET_IDS[compress_preset]))
+
+        # Point the HDF5 VOL connector at this compressor pool.
+        #
+        # This is what makes transparent compression reachable at all for an
+        # HDF5 application. clio_adapters sets HDF5_VOL_CONNECTOR=clio and
+        # LD_PRELOADs the connector, but the connector only builds a
+        # compressor client when it knows which pool to talk to
+        # (clio_vol.cc's clio_resolve_compressor_pool reads
+        # CLIO_VOL_COMPRESSOR_POOL); with it unset, clio_make_file leaves
+        # file->compressor_client null and every write skips
+        # AsyncDynamicSchedule -- so the pool is composed, the model is
+        # loaded, and nothing is ever compressed.
+        #
+        # It belongs here rather than in clio_adapters because the pool id is
+        # this package's own configuration; the adapter has no way to know it.
+        #
+        # The VOL is currently the ONLY adapter that calls DynamicSchedule.
+        # The PutBlob path the other adapters use (ADIOS2, FUSE, POSIX,
+        # MPI-IO) has no dynamic-selection branch, so it reaches static
+        # compression at best and never the NeuroPress model.
+        self.setenv('CLIO_VOL_COMPRESSOR_POOL', compose_entry['pool_id'])
 
         self.log(f"clio_compress: compose written to {self.compose_config_path} "
                  f"(pool {compose_entry['pool_id']} -> "

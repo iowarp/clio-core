@@ -41,6 +41,8 @@
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <clio_cte/compressor/compressor_tasks.h>
@@ -49,6 +51,7 @@
 #include <clio_cte/compressor/models/qtable_predictor.h>
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
+#include <clio_ctp/compress/model/neuropress_nn_predictor.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
 
@@ -266,6 +269,59 @@ private:
   std::unique_ptr<DenseNNPredictor> nn_predictor_;
 #endif
 
+  // NeuroPress NN predictor (issue #693). Consulted first in
+  // EstCompressionStats()'s dynamic-selection path when loaded/ready --
+  // it ranks the full clio_ctp::compress::model candidate set (CPU + GPU),
+  // not just the legacy 5-candidate hardcoded list qtable/nn_predictor
+  // choose among.
+  std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
+      neuropress_predictor_;
+
+  /**
+   * Deferred decompression-time learning (NeuroPress's DiagnosticsStore +
+   * gpucompress_batched_decomp_sgd, src/api/). Decompression time is the one
+   * label that cannot be known when data is compressed -- only a later read
+   * reveals it. So Compress records the features it predicted from, keyed by
+   * blob, and Decompress joins its own measured time back to them and trains
+   * the decomp head (NeuroPressNNPredictor::TrainDecompHead).
+   *
+   * Bounded and FIFO-evicted: a blob that is never read back must not pin an
+   * entry forever, and this is a cache of training hints -- dropping the
+   * oldest costs a learning opportunity, never correctness.
+   */
+  struct DecompFeatureRecord {
+    ctp::compress::model::CompressionFeatures features;
+    clio::run::u64 seq;  ///< insertion order, for FIFO eviction
+    /**
+     * Measured decompression time, 0 until a read back-fills it.
+     *
+     * Mirrors gpucompress_chunk_diag_t::decompression_ms, which starts at 0
+     * and is filled in by DiagnosticsStore::recordDecompMs() from the read
+     * path. Records are NOT consumed once trained: upstream's
+     * gpucompress_batched_decomp_sgd() re-sweeps its whole store on every
+     * read, so previously-seen chunks are replayed into each subsequent
+     * batch, and its trust region (0.15 * mean|err|) is computed over that
+     * growing population.
+     */
+    double measured_ms = 0.0;
+  };
+  static constexpr size_t kMaxDecompFeatureRecords = 4096;
+  std::mutex decomp_features_mutex_;
+  std::unordered_map<std::string, DecompFeatureRecord> decomp_features_;
+  clio::run::u64 decomp_feature_seq_ = 0;
+
+  /** Record the features a Compress predicted from, for a later read. */
+  void RecordDecompFeatures(
+      const std::string& blob_key,
+      const ctp::compress::model::CompressionFeatures& features);
+
+  /**
+   * Join a real measured decompression time back to its recorded features
+   * and run the head-only update. No-op when online learning is off, the
+   * blob has no recorded features, or the predictor isn't ready.
+   */
+  void LearnDecompTime(const std::string& blob_key, double measured_ms);
+
   // Compression telemetry ring buffer for performance monitoring
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
   ctp::ipc::ShmPtr<CompressionTelemetryLog> compression_telemetry_log_;
@@ -331,10 +387,32 @@ private:
    * @param chunk Pointer to data chunk
    * @param chunk_size Size of chunk in bytes
    * @param context Compression context with parameters
+   * @param out_ranked_by_cost When non-null, set true if the returned stats
+   *   came from NeuroPress and are therefore ALREADY ordered best-first by
+   *   its cost model. Callers must then take element 0 rather than
+   *   re-selecting (BestCompressRatio would re-pick on ratio alone and
+   *   discard the cost ordering, which is the whole point of it).
    * @return Vector of compression statistics for candidate libraries
    */
+  // out_entropy/out_mad/out_second_deriv report the data statistics this
+  // call actually ranked on. They are computed here regardless of whether
+  // online learning is on -- the separate snapshot in DynamicSchedule is
+  // taken only for SGD -- so this is the one place a caller can observe the
+  // statistics behind a selection in an inference-only run.
+  // out_neuropress_gpu_failed: set when NeuroPress was the selected model, the
+  // chunk was device-resident, and its GPU path could not produce a selection.
+  // That case is NOT "no compression available" -- upstream treats it as a
+  // failed write. gpucompress_compress_gpu returns
+  // GPUCOMPRESS_ERROR_NN_NOT_LOADED on a null d_stats_ptr or a failed inference
+  // (gpucompress_compress.cpp, :208-212); the VOL turns that into
+  // worker_err = -1 (H5VLgpucompress.cu:2057), which becomes the function's
+  // return value (:2463) and then H5Dwrite's (:3542). It never stores the chunk
+  // by another route. Callers should propagate rather than degrade.
   std::vector<CompressionStats> EstCompressionStats(
-      const void* chunk, clio::run::u64 chunk_size, const Context& context);
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      bool* out_ranked_by_cost = nullptr, double* out_entropy = nullptr,
+      double* out_mad = nullptr, double* out_second_deriv = nullptr,
+      bool* out_neuropress_gpu_failed = nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier

@@ -229,10 +229,12 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(18) == "cusz");
     REQUIRE(CompressionFactory::NameForWireId(19) == "ndzip");
     REQUIRE(CompressionFactory::NameForWireId(20) == "cuszp");
+    REQUIRE(CompressionFactory::NameForWireId(21) == "nvcomp-cascaded");
+    REQUIRE(CompressionFactory::NameForWireId(22) == "nvcomp-bitcomp");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(21) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(23) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -295,6 +297,13 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", FAST) == 221);
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", BAL) == 222);
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", BEST) == 223);
+
+    // nvcomp-cascaded / nvcomp-bitcomp: single-mode lossless GPU (base_ids
+    // 23/24, NeuroPress action-space completion), preset forced to 2.
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-cascaded", FAST) == 232);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-cascaded", BEST) == 232);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-bitcomp", FAST) == 242);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-bitcomp", BEST) == 242);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -325,6 +334,8 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(201).second ==
             CompressionPreset::FAST);
     REQUIRE(CompressionFactory::GetLibraryInfo(212).first == "ndzip");
+    REQUIRE(CompressionFactory::GetLibraryInfo(232).first == "nvcomp-cascaded");
+    REQUIRE(CompressionFactory::GetLibraryInfo(242).first == "nvcomp-bitcomp");
   }
 
   PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
@@ -563,14 +574,25 @@ TEST_CASE("TestCuszGpu") {
 
     REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
                        cudaMemcpyDeviceToHost) == cudaSuccess);
-    // Lossy within the BALANCED relative error bound (1e-3) on a [-100,100]
-    // signal -> generous absolute slack.
+    // Lossy within the BALANCED error bound, which is ABSOLUTE -- Cusz now
+    // defaults to psz_mode Abs, matching NeuroPress's unconditional
+    // `rc.mode = Abs` (external_compressors.cu:118).
+    //
+    // This assertion used to be `max_err < 1.0`, a thousand times looser than
+    // the nominal bound, with a comment explaining it as slack for RELATIVE
+    // mode on a [-100,100] signal. That is why it passed in either mode and
+    // never caught the divergence: it was written around the behaviour
+    // instead of against the specification. Asserting the bound the caller
+    // actually asked for is the whole point of an error-bounded codec.
+    constexpr double kBalancedEb = 1e-3;
     double max_err = 0.0;
     for (size_t i = 0; i < n; ++i) {
       max_err = std::max(max_err,
                          std::abs(static_cast<double>(orig[i] - deco[i])));
     }
-    REQUIRE(max_err < 1.0);
+    // A small multiple, not 1000x: cuSZ's quantiser reports its own bound
+    // per stream and can land marginally outside it at the extremes.
+    REQUIRE(max_err <= kBalancedEb * 2.0);
 
     cudaFree(d_in);
     cudaFree(d_comp);

@@ -10,6 +10,7 @@ set(COMPRESSOR_SOURCES
     src/compressor_runtime.cc
     src/models/linreg_table_predictor.cc
     src/models/qtable_predictor.cc
+    src/models/neuropress_bridge.cc
     src/autogen/compressor_lib_exec.cc
 )
 
@@ -31,11 +32,17 @@ else()
     message(STATUS "Compressor: XGBoost predictor disabled")
 endif()
 
+# clio::cte::core_client: compressor_runtime.cc's Compress() calls into
+# clio::cte::core::Client::AsyncPutBlob (compressor storing its own output
+# via CTE core), whose device-buffer staging now lives out-of-line in
+# core_client.cc -- must link the library that defines it.
 add_clio_module_runtime(
   SOURCES
     ${COMPRESSOR_SOURCES}
   LINK_LIBRARIES
     ctp::compress
+    ctp::compress_model
+    clio::cte::core_client
 )
 
 # Link optional dependencies if available
@@ -44,6 +51,20 @@ if(Eigen3_FOUND)
 endif()
 if(xgboost_FOUND)
     target_link_libraries(clio_cte_compressor_runtime PRIVATE xgboost::xgboost)
+endif()
+
+# EstCompressionStats (compressor_runtime.cc) needs CTP_ENABLE_CUDA/ROCM to
+# see ctp::GpuApi::IsDevicePointer / ctp::ComputeDeviceStats, so it can
+# detect a CUDA-IPC device buffer and compute NeuroPress's selection
+# features on-device instead of segfaulting on a direct host read.
+# ctp::compress_model (linked above) only propagates CTP_ENABLE_NEUROPRESS_GPU,
+# not CTP_ENABLE_CUDA itself (that stays contained to avoid the g++/CUDA-
+# builtins issue -- see context-runtime/src/CMakeLists.txt and modules/admin/
+# CMakeLists.txt for the same pattern applied one level down).
+if(CLIO_CORE_ENABLE_CUDA)
+    target_link_libraries(clio_cte_compressor_runtime PRIVATE ctp::cuda_cxx)
+elseif(CLIO_CORE_ENABLE_ROCM)
+    target_link_libraries(clio_cte_compressor_runtime PRIVATE ctp::rocm_cxx)
 endif()
 
 add_clio_module_client(

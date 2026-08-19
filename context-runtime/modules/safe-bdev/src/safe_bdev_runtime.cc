@@ -1754,7 +1754,14 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
-    pk.pack_map(14);
+    // 14 scalar fields below plus "members" packed after pack_members is
+    // defined -- 15 total. A stale 14 here truncates the map one key short
+    // of "members", so a standards-compliant decoder (Python's msgpack)
+    // stops after the 14th pair and raises ExtraData on the trailing
+    // "members" bytes instead of returning a dict -- which is silently
+    // swallowed by the dashboard's decode fallback, making every field
+    // (including recovery_ops_total) look absent to callers.
+    pk.pack_map(15);
     pk.pack("pool_name");     pk.pack(pool_name_);
     pk.pack("max_failures");  pk.pack(max_failures_);
     pk.pack("data_count");

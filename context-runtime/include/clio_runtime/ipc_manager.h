@@ -1094,23 +1094,38 @@ class IpcManager {
       if (result.ptr_ != nullptr) return result;
     }
 
-    // Case 4: Check GPU client backends (kPinnedHost / kManagedUvm /
-    // kDeviceMem). The IpcGpu2Cpu producer convention stashes the raw
-    // device-or-host-accessible address in `off_` directly, so resolution
-    // is the same as the null-alloc_id case once we've confirmed the
-    // alloc_id refers to a registered GPU backend. Callers that operate
-    // on the resolved ptr_ via DeviceAwareMemcpy (which dispatches
-    // through cudaMemcpyDefault / hipMemcpyDefault / sycl::queue::memcpy)
-    // can copy from kDeviceMem pointers without first staging through
-    // the host.
+    // Case 4: This process's own PID minted the alloc_id (e.g. a GPU device
+    // backend from AllocateAndRegisterGpuBackend) but it isn't in
+    // alloc_map_ (that's a host SHM segment, and case 3 above would have
+    // caught it). The process that OWNS a GPU allocation can always
+    // dereference its own pointer directly -- no IPC handle needed, that
+    // machinery is only for handing the pointer to a DIFFERENT process.
+    // off_ holds that raw pointer by convention (see
+    // AllocateAndRegisterGpuBackend's out_base).
+    if (shm_ptr.alloc_id_.major_ ==
+        static_cast<u32>(ctp::SystemInfo::GetPid())) {
+      T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
+      if (raw_ptr) return ctp::ipc::FullPtr<T>(raw_ptr);
+    }
+
+    // Case 5: Check GPU client backends (kPinnedHost / kManagedUvm /
+    // kDeviceMem). Resolve through the registered backend's own
+    // device_ptr, NOT shm_ptr.off_ -- off_ is whatever pointer value the
+    // SENDING process put there, which for kDeviceMem is only valid in
+    // that process (a cudaMalloc'd address is not portable). RegisterMemory
+    // (admin_runtime.cc) opens the real cudaIpcMemHandle_t on this
+    // (receiving) process and stores the pointer THAT yields as
+    // backend->device_ptr -- that's the one safe to dereference here. For
+    // kPinnedHost/kManagedUvm, off_ and device_ptr are the same value
+    // (same address space), so this is a no-op change for those.
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL) && CTP_IS_HOST
     if (gpu_ipc_) {
       size_t ngpu = gpu_ipc_->GetGpuQueueCount();
       for (size_t g = 0; g < ngpu; ++g) {
-        if (gpu_ipc_->FindClientBackend(static_cast<u32>(g),
-                                         shm_ptr.alloc_id_)) {
-          T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
-          return ctp::ipc::FullPtr<T>(raw_ptr);
+        if (const auto *backend = gpu_ipc_->FindClientBackend(
+                static_cast<u32>(g), shm_ptr.alloc_id_)) {
+          return ctp::ipc::FullPtr<T>(
+              reinterpret_cast<T *>(backend->device_ptr));
         }
       }
     }
@@ -1749,6 +1764,60 @@ class IpcManager {
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
+
+#if CTP_IS_HOST && (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL)
+  // What AllocateAndRegisterGpuBackend actually handed out, so FreeGpuBackend
+  // can release it.
+  //
+  // Guarded on CTP_IS_HOST as well as the backend switch, matching every other
+  // GPU member and method in this class: std::unordered_map and std::mutex are
+  // host-only types, and nvcc's device pass must not see them (same reason
+  // client_conn_cache_ below is host-gated).
+  //
+  // This cannot live in gpu::IpcManager::ClientBackend, which is the obvious
+  // place for it: that map is only populated on the RUNTIME side. A client
+  // registers its backend remotely through RegisterMemoryTask and has no local
+  // ClientBackend record at all, so a FindClientBackend-based free would still
+  // leak every client allocation. The allocation happens here, so the
+  // bookkeeping does too, and both modes are covered by one map.
+  //
+  // Keyed exactly like gpu::IpcManager::FindClientBackend so the two agree:
+  // (major << 32) | minor.
+  // `in_process` records WHICH registration branch ran, and it is a safety
+  // gate, not bookkeeping. When the backend was registered remotely, the
+  // runtime process opened our device memory with cudaIpcOpenMemHandle
+  // (admin_runtime.cc's kGpuDeviceMemory case) and holds a mapping into it.
+  // Freeing here would invalidate that mapping under it. There is currently
+  // no DeregisterMemory task and no CloseIpcMemHandle call anywhere in the
+  // tree, so nothing can tell the importer to let go first — which is exactly
+  // why the remote case must NOT be freed here. See FreeGpuBackend.
+  struct OwnedGpuBackend {
+    char *base = nullptr;
+    gpu::IpcManager::MemKind kind = gpu::IpcManager::MemKind::kPinnedHost;
+    bool in_process = false;
+  };
+  std::unordered_map<u64, OwnedGpuBackend> owned_gpu_backends_;
+  std::mutex owned_gpu_backends_mutex_;
+#elif CTP_IS_HOST
+  /** Layout placeholders — same rule as gpu_ipc_placeholder_ below, and the
+   *  same reason. These members sit BEFORE hostfile_map_, so omitting them in
+   *  a non-GPU translation unit shifts every member after this point. Test
+   *  binaries link clio_run_cxx (built with CTP_ENABLE_CUDA=1) without
+   *  defining it themselves, so the two HOST views of IpcManager must agree.
+   *
+   *  Host-only, like the real members above: the device pass gets neither
+   *  branch, so no host-only type reaches nvcc. Host/device layout already
+   *  differs for client_conn_cache_ and is not required to match; host/host
+   *  layout is, and that is what this branch preserves.
+   *
+   *  Both stand-ins are size- and alignment-exact by construction rather than
+   *  by hand-counted bytes: libstdc++'s unordered_map layout does not depend
+   *  on its mapped_type, and the mutex is the same type. OwnedGpuBackend
+   *  itself cannot be declared here because gpu::IpcManager::MemKind lives in
+   *  gpu_ipc_manager.h, whose include is guarded the same way. */
+  std::unordered_map<u64, void *> owned_gpu_backends_placeholder_;
+  std::mutex owned_gpu_backends_mutex_placeholder_;
+#endif
 
   // Pending response archives (client-side, keyed by net_key)
   // Archives stay alive after Recv() deserialization so that zmq zero-copy

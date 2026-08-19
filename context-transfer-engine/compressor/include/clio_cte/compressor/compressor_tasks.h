@@ -58,6 +58,72 @@ struct CompressorConfig {
   std::string linreg_model_path_;
   std::string distribution_model_path_;
   std::string dnn_model_weights_path_;
+  // Directory of a trained NeuroPress NN's .nnwt weights (issue #693
+  // 3). Loaded once at Create() time and consulted by EstCompressionStats()'s
+  // dynamic-selection path (compressor_runtime.cc) whenever set.
+  std::string neuropress_model_path_;
+  // Master switch for ONLINE LEARNING (SGD Phase 1 + exploration Phase 2).
+  // Off by default, mirroring NeuroPress's own
+  // g_online_learning_enabled{false} (gpucompress_api.cpp), which gates its
+  // whole learning block (gpucompress_compress.cpp) and must be turned on
+  // explicitly via gpucompress_enable_online_learning(). Configuring
+  // neuropress_model_path_ alone must give INFERENCE ONLY: a deployment
+  // that just wants the trained model should not silently get a model whose
+  // weights drift out from under it.
+  bool neuropress_online_learning_enabled_ = false;
+  // MAPE (mean absolute percentage error, weighted-cost) threshold that
+  // gates online SGD after a real compress (issue #693). Mirrors
+  // NeuroPress's own g_reinforce_mape_threshold / GPUCOMPRESS_MAPE_LOW_THRESH
+  // (default 0.30 = 30%, gpucompress_api.cpp): training only fires when the
+  // model's prediction for the chunk actually compressed was wrong by more
+  // than this fraction, not on every chunk. This never writes .nnwt back to
+  // disk -- it only adjusts the in-memory weights for this process's
+  // lifetime, matching NeuroPress's own behavior (no runtime API persists a
+  // trained model file either).
+  float neuropress_mape_threshold_ = 0.30f;
+  /**
+   * Online-SGD learning rate. Mirrors NeuroPress's g_reinforce_lr
+   * (gpucompress_api.cpp, default 0.01f), which is settable at runtime
+   * through gpucompress_set_reinforcement(). Only the main SGD kernel
+   * consumes it -- `lr_out = learning_rate * clip_scale` (nn_gpu.cu).
+   * The deferred decompression-head pass takes the value but never uses it:
+   * its step comes entirely from its own trust region.
+   *
+   * Values <= 0 are ignored rather than applied, matching upstream's
+   * `if (learning_rate > 0.0f)` guard (gpucompress_learning.cpp).
+   */
+  float neuropress_learning_rate_ = 0.01f;
+  // K-way exploration. Off by default, matching NeuroPress's own
+  // g_exploration_enabled{false} -- an opt-in, not the normal route. When
+  // enabled and error_pct (the same metric Phase 1 above uses) crosses this
+  // HIGHER threshold (default 0.50, mirrors g_exploration_threshold /
+  // GPUCOMPRESS_MAPE_HIGH_THRESH), up to neuropress_exploration_k_
+  // alternative candidates are actually compressed (never stored) purely to
+  // generate more real-outcome training samples.
+  bool neuropress_exploration_enabled_ = false;
+  float neuropress_exploration_threshold_ = 0.50f;
+  int neuropress_exploration_k_ = 3;  // NeuroPress's own default K
+  /**
+   * Exhaustive-search ("best") mode, mirroring NeuroPress's g_best_mode /
+   * gpucompress_set_best_mode(). Every chunk is explored with the full
+   * remaining action space regardless of prediction error, and the cheapest
+   * measured configuration is stored.
+   *
+   * This is a MEASUREMENT mode, not a faster one: it compresses each chunk
+   * ~32 times and is correspondingly slower. Its purpose is to establish the
+   * ceiling on selection quality reachable inside the action space, so a
+   * model's real selections can be scored against the best available one.
+   *
+   * Both SGD phases are suppressed while it is on, exactly as upstream
+   * suppresses them (`&& !g_best_mode.load()` on each): the training signal
+   * is derived from the model's own prediction error, and a mode that
+   * overrides the model's choice on every chunk would teach it from outcomes
+   * it did not choose. Upstream calls that weight contamination.
+   *
+   * Requires neuropress_exploration_enabled_ -- this widens the exploration
+   * gate, it does not open it.
+   */
+  bool neuropress_best_mode_ = false;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -80,6 +146,16 @@ struct CompressorConfig {
         linreg_model_path_(other.linreg_model_path_),
         distribution_model_path_(other.distribution_model_path_),
         dnn_model_weights_path_(other.dnn_model_weights_path_),
+        neuropress_model_path_(other.neuropress_model_path_),
+        neuropress_online_learning_enabled_(
+            other.neuropress_online_learning_enabled_),
+        neuropress_mape_threshold_(other.neuropress_mape_threshold_),
+        neuropress_learning_rate_(other.neuropress_learning_rate_),
+        neuropress_exploration_enabled_(other.neuropress_exploration_enabled_),
+        neuropress_exploration_threshold_(
+            other.neuropress_exploration_threshold_),
+        neuropress_exploration_k_(other.neuropress_exploration_k_),
+        neuropress_best_mode_(other.neuropress_best_mode_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -93,8 +169,13 @@ struct CompressorConfig {
     // created compressor pool straight to the default core, bypassing any
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
-       tracking_enabled_);
+       dnn_model_weights_path_, neuropress_model_path_,
+       neuropress_online_learning_enabled_,
+       neuropress_mape_threshold_, neuropress_learning_rate_,
+       neuropress_exploration_enabled_,
+       neuropress_exploration_threshold_, neuropress_exploration_k_,
+       neuropress_best_mode_,
+       trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 
   /**
@@ -118,6 +199,72 @@ struct CompressorConfig {
         }
         if (node["tracking_enabled"]) {
           tracking_enabled_ = node["tracking_enabled"].as<bool>();
+        }
+        // Predictor and trace paths. These are written into the compose file
+        // by jarvis_clio_core.clio_compress and were, until now, read by
+        // nobody: config_manager.cc hands the whole pool node over for
+        // "module-specific parsing" and this is the only place that parsing
+        // happens, so every model path configured through a pipeline was
+        // silently dropped and the compressor ran with its defaults. Each is
+        // empty by default and every consumer short-circuits on empty, so
+        // parsing them changes nothing for a config that does not set them.
+        if (node["qtable_model_path"]) {
+          qtable_model_path_ = node["qtable_model_path"].as<std::string>();
+        }
+        if (node["linreg_model_path"]) {
+          linreg_model_path_ = node["linreg_model_path"].as<std::string>();
+        }
+        if (node["distribution_model_path"]) {
+          distribution_model_path_ =
+              node["distribution_model_path"].as<std::string>();
+        }
+        if (node["dnn_model_weights_path"]) {
+          dnn_model_weights_path_ =
+              node["dnn_model_weights_path"].as<std::string>();
+        }
+        if (node["trace_folder_path"]) {
+          trace_folder_path_ = node["trace_folder_path"].as<std::string>();
+        }
+        // The NeuroPress master switch (issue #693): the directory holding the
+        // trained .nnwt weights. Everything else in this block is inert
+        // without it -- compressor_runtime.cc only builds the predictor when
+        // this is non-empty, so a compose file that set, say, an exploration
+        // threshold but could not set this got a compressor with no model and
+        // no indication of why.
+        if (node["neuropress_model_path"]) {
+          neuropress_model_path_ =
+              node["neuropress_model_path"].as<std::string>();
+        }
+        if (node["neuropress_online_learning_enabled"]) {
+          neuropress_online_learning_enabled_ =
+              node["neuropress_online_learning_enabled"].as<bool>();
+        }
+        if (node["neuropress_mape_threshold"]) {
+          neuropress_mape_threshold_ =
+              node["neuropress_mape_threshold"].as<float>();
+        }
+        if (node["neuropress_learning_rate"]) {
+          neuropress_learning_rate_ =
+              node["neuropress_learning_rate"].as<float>();
+        }
+        if (node["neuropress_exploration_enabled"]) {
+          neuropress_exploration_enabled_ =
+              node["neuropress_exploration_enabled"].as<bool>();
+        }
+        if (node["neuropress_exploration_threshold"]) {
+          neuropress_exploration_threshold_ =
+              node["neuropress_exploration_threshold"].as<float>();
+        }
+        if (node["neuropress_exploration_k"]) {
+          neuropress_exploration_k_ =
+              node["neuropress_exploration_k"].as<int>();
+        }
+        // Exhaustive-search measurement mode. Widens the exploration gate
+        // rather than opening it, so the runtime forces exploration on and K
+        // to the full action space when this is set -- see Create() in
+        // compressor_runtime.cc; no coupling is enforced here.
+        if (node["neuropress_best_mode"]) {
+          neuropress_best_mode_ = node["neuropress_best_mode"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort

@@ -156,6 +156,119 @@ if(NOT WIN32)
   )
 endif()
 
+#------------------------------------------------------------------------------
+# GPU device-pointer passthrough: H5Dwrite/H5Dread with a real cudaMalloc
+# buffer. Its own executable/ctest entry (not folded into test_hdf5_vol_io)
+# so a crash here is an isolated, clearly-attributed failure rather than
+# taking the whole IO suite down with it. Only registered when CUDA is on;
+# without it the connector's write/read paths never see a device pointer.
+#------------------------------------------------------------------------------
+if(NOT WIN32 AND CLIO_CORE_ENABLE_CUDA)
+  add_executable(test_hdf5_vol_gpu_ptr
+      test_hdf5_vol_gpu_ptr.cc
+  )
+
+  target_include_directories(test_hdf5_vol_gpu_ptr PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+      ${CMAKE_SOURCE_DIR}/context-runtime/test
+      ${HDF5_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(test_hdf5_vol_gpu_ptr
+      clio_hdf5_vol
+      clio_cte_core_runtime
+      clio_cte_core_client
+      clio::run::admin_runtime
+      clio::run::admin_client
+      clio::run::bdev_runtime
+      clio::run::bdev_client
+      ctp::cxx
+      ctp::cuda_cxx
+      ${HDF5_LIBRARIES}
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  # One ctest entry per case. The single filtered entry that used to live here
+  # ran only the whole-dataset case, so the hyperslab cases in the same source
+  # file were compiled and never executed -- which is how the hyperslab-read
+  # device-pointer crash (a raw memcpy into the caller's buffer at
+  # clio_vol.cc's clio_serve_selection) survived in a file written expressly
+  # to catch that bug class.
+  add_test(NAME cte_hdf5_vol_gpu_ptr
+      COMMAND test_hdf5_vol_gpu_ptr "Write/read survives a real GPU device pointer")
+
+  add_test(NAME cte_hdf5_vol_gpu_ptr_partial_write
+      COMMAND test_hdf5_vol_gpu_ptr "Partial (hyperslab) write survives a real GPU device pointer")
+
+  add_test(NAME cte_hdf5_vol_gpu_ptr_partial_read
+      COMMAND test_hdf5_vol_gpu_ptr "Partial (hyperslab) read survives a real GPU device pointer")
+
+  set_tests_properties(cte_hdf5_vol_gpu_ptr
+                       cte_hdf5_vol_gpu_ptr_partial_write
+                       cte_hdf5_vol_gpu_ptr_partial_read PROPERTIES
+      TIMEOUT 300
+      LABELS "unit;adapter;hdf5_vol;cte;gpu"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
+  )
+
+  install(TARGETS test_hdf5_vol_gpu_ptr RUNTIME DESTINATION bin)
+endif()
+
+#------------------------------------------------------------------------------
+# Compressor-pool wiring (issue #693): a FAPL-configured compressor pool
+# makes H5Dwrite route through it (compress) and H5Dread decompress on the
+# way back out, rather than the VOL and compressor chimod staying two
+# disconnected subsystems. Needs the compressor runtime/client libraries and
+# an in-process chimod (like test_transparent_compress), so it gets the same
+# RESOURCE_LOCK treatment as that integration test.
+#------------------------------------------------------------------------------
+add_executable(test_hdf5_vol_compressor_write
+    test_hdf5_vol_compressor_write.cc
+)
+
+target_include_directories(test_hdf5_vol_compressor_write PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${HDF5_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_hdf5_vol_compressor_write
+    clio_hdf5_vol
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${HDF5_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_hdf5_vol_compressor_write
+    COMMAND test_hdf5_vol_compressor_write
+            "H5Dwrite routes through the compressor and H5Dread decompresses correctly")
+
+# Second case in the same binary: compressor pool AND a device read buffer.
+# Neither existing test covered that pairing (this file's other case is
+# host-only; test_hdf5_vol_gpu_ptr.cc has no compressor pool), so the VOL's
+# device decompress destination had no coverage.
+add_test(NAME cte_hdf5_vol_compressor_devread
+    COMMAND test_hdf5_vol_compressor_write
+            "compressor-backed read into a GPU device pointer")
+
+set_tests_properties(cte_hdf5_vol_compressor_write
+                     cte_hdf5_vol_compressor_devread PROPERTIES
+    TIMEOUT 300
+    LABELS "unit;adapter;hdf5_vol;cte;compressor;693"
+    RESOURCE_LOCK "clio_runtime"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
+)
+
+install(TARGETS test_hdf5_vol_compressor_write RUNTIME DESTINATION bin)
+
 install(
     TARGETS test_hdf5_vol_adapter test_hdf5_vol_io
     RUNTIME DESTINATION bin

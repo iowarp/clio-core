@@ -71,8 +71,10 @@ namespace ctp {
  * carry its decode metadata).
  *
  * IMPORTANT -- LOSSY. Each value is reconstructed within the configured error
- * bound (relative by default), not bit-exact. Presets map to error bounds:
- * FAST=1e-2 (loose), BALANCED=1e-3, BEST=1e-4 (tight).
+ * bound, which is ABSOLUTE by default, matching NeuroPress's unconditional
+ * `rc.mode = Abs` (external_compressors.cu:118) and the cuSZp sibling in this
+ * directory. Not bit-exact. Presets map to error bounds: FAST=1e-2 (loose),
+ * BALANCED=1e-3, BEST=1e-4 (tight).
  *
  * Tested against the cuSZ master / 0.14 C API (psz_create_resource_manager,
  * psz_compress_float, psz_decompress_float, psz_release_resource). The NVIDIA
@@ -82,9 +84,27 @@ class Cusz : public Compressor {
  public:
   /**
    * @param eb error bound (default 1e-3).
-   * @param mode error-bound mode: Rel (relative) or Abs (absolute).
+   * @param mode error-bound mode: Abs (absolute, the default) or Rel.
+   *
+   * The default is ABSOLUTE because that is what NeuroPress uses:
+   * `rc.mode = Abs` (external_compressors.cu:118), unconditionally, on every
+   * cuSZ compression. It also matches what this class already advertises --
+   * the cuSZp sibling documents "the configured ABSOLUTE error bound" and
+   * passes CUSZP_MODE_OUTLIER to match upstream exactly.
+   *
+   * This defaulted to Rel, which silently reinterpreted every caller's bound
+   * as a FRACTION OF THE DATA RANGE rather than an absolute tolerance. On a
+   * [-100, 100] signal an eb of 1e-3 then permits ~0.2 of error instead of
+   * 0.001 -- two orders of magnitude looser than the number the caller
+   * passed. Nothing overrode it: MakeCusz (compress_factory.h:439) is the
+   * only construction site in the tree and it passes eb alone.
+   *
+   * Existing blobs are unaffected: each one carries its own psz_header in the
+   * frame prefix and Decompress rebuilds the manager from that, exactly as
+   * upstream's cuszDecompress does, so a stream written under Rel still
+   * decodes as Rel.
    */
-  explicit Cusz(double eb = 1e-3, psz_mode mode = Rel)
+  explicit Cusz(double eb = 1e-3, psz_mode mode = Abs)
       : eb_(eb), mode_(mode) {}
 
   bool Compress(void *output, size_t &output_size, void *input,

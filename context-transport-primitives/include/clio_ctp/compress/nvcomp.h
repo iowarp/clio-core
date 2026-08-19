@@ -38,10 +38,14 @@
 
 #include <cuda_runtime.h>
 #include <nvcomp/ans.hpp>
+#include <nvcomp/bitcomp.hpp>
+#include <nvcomp/cascaded.hpp>
 #include <nvcomp/deflate.hpp>
 #include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
+
+#include <cstdlib>
 #include <nvcomp/snappy.hpp>
 #include <nvcomp/zstd.hpp>
 
@@ -66,6 +70,8 @@ enum class NvCompAlgo {
   GDEFLATE,
   DEFLATE,
   ANS,
+  CASCADED,
+  BITCOMP,
 };
 
 /**
@@ -86,10 +92,106 @@ class NvComp : public Compressor {
  public:
   explicit NvComp(NvCompAlgo algo = NvCompAlgo::LZ4) : algo_(algo) {}
 
+  /** @brief Manager-cache counters, mirroring upstream's hit/miss tallies. */
+  struct ManagerCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+  };
+
+  /** @brief Snapshot this thread's manager-cache counters. */
+  static ManagerCacheStats GetManagerCacheStats() {
+    const auto &c = Cache();
+    return ManagerCacheStats{c.hits, c.misses};
+  }
+
+  /** @brief Drop every cached manager and zero the counters (tests). */
+  static void ResetManagerCache() {
+    auto &c = Cache();
+    for (auto &slot : c.slots) {
+      slot.mgr.reset();
+      slot.algo = -1;
+      slot.tick = 0;
+    }
+    c.clock = 0;
+    c.hits = 0;
+    c.misses = 0;
+  }
+
+
+  /**
+   * CUDA-event bracket around a codec launch, and nothing else.
+   *
+   * Enabled only when CLIO_CODEC_KERNEL_TIMING is set: creating and
+   * recording two events per call is real overhead, and the number is only
+   * wanted when something is being compared. Records on the SAME stream the
+   * codec runs on, so the interval covers device work rather than host
+   * launch latency. NeuroPress times its equivalent call the same way
+   * (gpucompress_compress.cpp).
+   */
+  struct KernelTimer {
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cudaStream_t stream = nullptr;
+    bool on = false;
+
+    /**
+     * Always on now, and no longer gated by CLIO_CODEC_KERNEL_TIMING.
+     *
+     * The gate existed because each timer created and destroyed its own event
+     * pair, which is real per-call overhead. The events are now persistent
+     * per thread (ManagerCache::ev_start/ev_stop, created once), so the cost
+     * of a bracket is two cudaEventRecords -- the same thing NeuroPress does
+     * unconditionally with its per-CompContext events.
+     *
+     * It has to be unconditional because the number is no longer just a
+     * report: the exploration cost model consumes it. Leaving it opt-in meant
+     * cost was computed from a host wall-clock that also covered staging, a
+     * possible cudaMalloc, configure_compression, the stream sync and the
+     * output copy -- so CLIO's costs were systematically larger than the
+     * kernel times NeuroPress ranks on, and cost decides the exploration
+     * winner, the SGD compression-time target, and the error_pct gate that
+     * fires either of them.
+     *
+     * CLIO_CODEC_KERNEL_TIMING is retained as a no-op for compatibility with
+     * existing scripts; the measurement it used to switch on is now default.
+     */
+    explicit KernelTimer(cudaStream_t s) : stream(s) {
+      LastCodecKernelMs() = -1.0;
+      if (!s) return;
+      auto &c = Cache();
+      if (!c.ev_start && cudaEventCreate(&c.ev_start) != cudaSuccess) return;
+      if (!c.ev_stop && cudaEventCreate(&c.ev_stop) != cudaSuccess) return;
+      start = c.ev_start;
+      stop = c.ev_stop;
+      on = (cudaEventRecord(start, stream) == cudaSuccess);
+    }
+
+    /** Call after the launch; the elapsed time lands in LastCodecKernelMs(). */
+    void Stop() {
+      if (!on) return;
+      if (cudaEventRecord(stop, stream) != cudaSuccess) return;
+      if (cudaEventSynchronize(stop) != cudaSuccess) return;
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, start, stop) == cudaSuccess) {
+        LastCodecKernelMs() = static_cast<double>(ms);
+      }
+    }
+
+    // No destructor work: the events belong to the thread's ManagerCache and
+    // outlive every individual timer.
+  };
+
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Persistent per-thread stream and cached manager. Both used to be built
+    // and torn down on EVERY call, inside the window Runtime::Compress times
+    // to produce the model's comp_time label -- so the label carried a cost
+    // that is large relative to the compress kernels and roughly independent
+    // of chunk size, flattening the time-vs-size relationship the network
+    // learns. NeuroPress pays neither per chunk: a persistent context stream
+    // and an LRU of managers (gpucompress_pool.cpp), with its
+    // CUDA-event bracket around compress() alone.
+    cudaStream_t stream = CachedStream();
+    if (!stream) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -107,7 +209,8 @@ class NvComp : public Compressor {
         d_in = ToDeviceInput(input, input_size, stream, &free_in);
         if (!d_in) break;
 
-        std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
+        std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
+            GetOrCreateManager(stream);
         if (!mgr) break;
         nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
 
@@ -127,7 +230,9 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        KernelTimer timer(stream);
         mgr->compress(d_in, d_out, cfg);
+        timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
         size_t comp_size = mgr->get_compressed_output_size(d_out);
         if (comp_size > output_size) break;  // caller buffer too small
@@ -147,14 +252,199 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+    // The stream is owned by the thread's cache, not by this call.
     return ok;
+  }
+
+  /**
+   * @brief One slot of a stream-parallel compression sweep.
+   *
+   * Mirrors upstream's ExploreSlot (gpucompress_compress.cpp): its own stream,
+   * its own timing events, its own manager, and its own device buffers, so K
+   * of these can be in flight at once. Everything the slot owns is released by
+   * ReleaseSlot().
+   */
+  struct AsyncSlot {
+    cudaStream_t stream = nullptr;  ///< owned by the slot
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;  ///< owned by the slot
+    std::shared_ptr<nvcomp::nvcompManagerBase> mgr;
+    uint8_t *d_in = nullptr;
+    uint8_t *d_out = nullptr;
+    bool free_in = false;
+    bool free_out = false;
+    void *out = nullptr;  ///< caller's destination, not owned
+    size_t out_capacity = 0;
+    bool out_is_device = false;
+    bool launched = false;
+    size_t compressed_size = 0;  ///< valid after CompressFinish
+    double kernel_ms = -1.0;     ///< valid after CompressFinish
+
+    AsyncSlot() = default;
+    // The slot owns a stream, two events and possibly two device buffers, so
+    // releasing is not optional and must not depend on the caller reaching a
+    // cleanup path. Destroying here makes an early `continue` between
+    // OpenSlot() and CompressLaunch() safe, which is exactly the shape the
+    // preprocessing steps in between need.
+    ~AsyncSlot() { ReleaseSlot(this); }
+    AsyncSlot(const AsyncSlot &) = delete;
+    AsyncSlot &operator=(const AsyncSlot &) = delete;
+  };
+
+  /**
+   * @brief Create the slot's stream and timing events, without launching.
+   *
+   * Split out of CompressLaunch so a caller can run its OWN preprocessing on
+   * the slot's stream first. Upstream needs exactly this: it quantizes and
+   * byte-shuffles each explored candidate on s.stream and then compresses on
+   * s.stream, so the whole per-slot pipeline is queued as one dependent chain
+   * and nothing waits until every slot is collected
+   * (gpucompress_compress.cpp). Idempotent, so CompressLaunch can call it for
+   * a caller that has no preprocessing to do.
+   */
+  static bool OpenSlot(AsyncSlot *slot) {
+    if (!slot) return false;
+    if (slot->stream) return true;  // already open
+    if (cudaStreamCreate(&slot->stream) != cudaSuccess) {
+      slot->stream = nullptr;
+      return false;
+    }
+    if (cudaEventCreate(&slot->ev_start) != cudaSuccess ||
+        cudaEventCreate(&slot->ev_stop) != cudaSuccess) {
+      ReleaseSlot(slot);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief Launch a compression on the slot's own stream and RETURN, without
+   * synchronizing.
+   *
+   * This is the half of Compress() that can overlap. Compress() takes the
+   * thread's one cached stream and blocks on it, so two codec calls on a
+   * thread can never be in flight together; a caller that wants K running at
+   * once pairs this with CompressFinish() instead, which is exactly how
+   * upstream drives its exploration sweep -- launch all K, then sync all K.
+   *
+   * The manager is built fresh on this slot's stream rather than taken from
+   * the thread's LRU: a manager is bound to the stream it was constructed on,
+   * so a cache keyed by algorithm alone cannot serve K slots that share an
+   * algorithm but not a stream. Upstream constructs its per-slot comp_mgr the
+   * same way and for the same reason.
+   *
+   * @return true if the launch was issued; false leaves the slot released.
+   */
+  bool CompressLaunch(void *output, size_t output_capacity, void *input,
+                      size_t input_size, AsyncSlot *slot) {
+    if (!OpenSlot(slot)) return false;
+    slot->out = output;
+    slot->out_capacity = output_capacity;
+    try {
+      slot->d_in = ToDeviceInput(input, input_size, slot->stream,
+                                 &slot->free_in);
+      if (!slot->d_in) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->mgr = MakeManager(slot->stream);
+      if (!slot->mgr) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      nvcomp::CompressionConfig cfg = slot->mgr->configure_compression(input_size);
+      slot->out_is_device = IsDeviceAccessible(output);
+      if (slot->out_is_device &&
+          output_capacity >= cfg.max_compressed_buffer_size) {
+        slot->d_out = static_cast<uint8_t *>(output);
+      } else {
+        if (cudaMalloc(&slot->d_out, cfg.max_compressed_buffer_size) !=
+            cudaSuccess) {
+          ReleaseSlot(slot);
+          return false;
+        }
+        slot->free_out = true;
+      }
+      // Events bracket the codec launch alone, same as Compress()'s
+      // KernelTimer and same as upstream's per-slot ev_start/ev_stop.
+      if (cudaEventRecord(slot->ev_start, slot->stream) != cudaSuccess) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->mgr->compress(slot->d_in, slot->d_out, cfg);
+      if (cudaEventRecord(slot->ev_stop, slot->stream) != cudaSuccess) {
+        ReleaseSlot(slot);
+        return false;
+      }
+      slot->launched = true;
+      return true;
+    } catch (...) {
+      // The nvcomp Manager API reports errors by throwing, and compress() is
+      // void, so a throw is its only failure signal -- same contract Compress()
+      // handles.
+      ReleaseSlot(slot);
+      return false;
+    }
+  }
+
+  /**
+   * @brief Wait for a launched slot, then read its size and kernel time.
+   *
+   * Delivers into the caller's buffer if the codec wrote to a temporary.
+   * Leaves the slot's resources intact; call ReleaseSlot() when the output has
+   * been consumed.
+   */
+  bool CompressFinish(AsyncSlot *slot) {
+    if (!slot || !slot->launched) return false;
+    if (cudaStreamSynchronize(slot->stream) != cudaSuccess) return false;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, slot->ev_start, slot->ev_stop) ==
+        cudaSuccess) {
+      slot->kernel_ms = static_cast<double>(ms);
+    }
+    try {
+      const size_t comp_size = slot->mgr->get_compressed_output_size(slot->d_out);
+      if (comp_size > slot->out_capacity) return false;
+      if (slot->d_out != static_cast<uint8_t *>(slot->out)) {
+        const cudaMemcpyKind kind = slot->out_is_device
+                                        ? cudaMemcpyDeviceToDevice
+                                        : cudaMemcpyDeviceToHost;
+        if (cudaMemcpy(slot->out, slot->d_out, comp_size, kind) != cudaSuccess) {
+          return false;
+        }
+      }
+      slot->compressed_size = comp_size;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  /** @brief Release everything the slot owns. Safe to call more than once. */
+  static void ReleaseSlot(AsyncSlot *slot) {
+    if (!slot) return;
+    // The manager must die before the stream it was built on.
+    slot->mgr.reset();
+    if (slot->free_in && slot->d_in) cudaFree(slot->d_in);
+    if (slot->free_out && slot->d_out) cudaFree(slot->d_out);
+    slot->d_in = slot->d_out = nullptr;
+    slot->free_in = slot->free_out = false;
+    if (slot->ev_start) cudaEventDestroy(slot->ev_start);
+    if (slot->ev_stop) cudaEventDestroy(slot->ev_stop);
+    slot->ev_start = slot->ev_stop = nullptr;
+    if (slot->stream) cudaStreamDestroy(slot->stream);
+    slot->stream = nullptr;
+    slot->launched = false;
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // Same persistent stream as Compress. The MANAGER cannot be cached here
+    // and upstream does not cache it either: the NVCOMP_NATIVE bitstream is
+    // self-describing, so create_manager derives it from the blob's own bytes
+    // (compression_factory.cpp:157). Only the stream is reusable, and it is
+    // inside the window Runtime::Decompress times for the decomp head.
+    cudaStream_t stream = CachedStream();
+    if (!stream) {
       return false;
     }
     uint8_t *d_in = nullptr;
@@ -186,7 +476,9 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        KernelTimer timer(stream);
         mgr->decompress(d_out, d_in, cfg);
+        timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
 
         if (d_out != static_cast<uint8_t *>(output)) {
@@ -204,7 +496,7 @@ class NvComp : public Compressor {
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
+    // Stream owned by the thread's cache; do not destroy it here.
     return ok;
   }
 
@@ -254,26 +546,175 @@ class NvComp : public Compressor {
   }
 
   /** Construct the nvcomp manager for the configured algorithm. */
+  /**
+   * Per-thread manager cache and its persistent stream.
+   *
+   * NeuroPress keeps this per CompContext -- an LRU of LRU_DEPTH = 3
+   * managers keyed by algorithm, on the context's own stream, with hit/miss
+   * counters (gpucompress_pool.cpp, internal.hpp). Clio has no
+   * per-context object at this layer, so the equivalent scope is the worker
+   * THREAD: it gives each concurrent flow its own managers and stream, which
+   * is the isolation upstream gets from per-context state, without a lock on
+   * the compression path. Sharing one manager across threads would not be
+   * safe -- an nvcomp manager is bound to the stream it was built on.
+   */
+  static constexpr int kLruDepth = 3;  // CompContext::LRU_DEPTH
+
+  struct ManagerCache {
+    struct Slot {
+      std::shared_ptr<nvcomp::nvcompManagerBase> mgr;
+      int algo = -1;
+      uint64_t tick = 0;
+    };
+    Slot slots[kLruDepth];
+    uint64_t clock = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    cudaStream_t stream = nullptr;
+
+    // Codec-timing events, created once and reused for every launch on this
+    // thread. NeuroPress does exactly this: t_start/t_stop are allocated per
+    // CompContext when the pool is built (gpucompress_pool.cpp) and reused for
+    // every chunk, which is what makes always-on event timing free. Creating
+    // and destroying a pair per call -- as this used to -- was the whole
+    // reason the measurement had to be opt-in.
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+
+    ~ManagerCache() {
+      // Managers must die before the stream they were built on.
+      for (auto &s : slots) s.mgr.reset();
+      if (ev_start) cudaEventDestroy(ev_start);
+      if (ev_stop) cudaEventDestroy(ev_stop);
+      if (stream) cudaStreamDestroy(stream);
+    }
+  };
+
+  static ManagerCache &Cache() {
+    static thread_local ManagerCache cache;
+    return cache;
+  }
+
+  /** @brief This thread's persistent stream, created once. */
+  static cudaStream_t CachedStream() {
+    auto &c = Cache();
+    if (!c.stream && cudaStreamCreate(&c.stream) != cudaSuccess) {
+      c.stream = nullptr;
+    }
+    return c.stream;
+  }
+
+  /**
+   * @brief Cached manager for algo_, built on the persistent stream.
+   *
+   * Same walk as getOrCreateCompManager: scan for a live slot with this
+   * algorithm and bump its tick on a hit; otherwise take an empty slot, or
+   * evict the lowest tick, and build there.
+   */
+  std::shared_ptr<nvcomp::nvcompManagerBase> GetOrCreateManager(
+      cudaStream_t stream) {
+    auto &c = Cache();
+    const int idx = static_cast<int>(algo_);
+
+    for (auto &slot : c.slots) {
+      if (slot.mgr && slot.algo == idx) {
+        slot.tick = ++c.clock;
+        ++c.hits;
+        return slot.mgr;
+      }
+    }
+
+    int victim = -1;
+    for (int i = 0; i < kLruDepth; ++i) {
+      if (!c.slots[i].mgr) { victim = i; break; }
+    }
+    if (victim < 0) {
+      uint64_t min_tick = c.slots[0].tick;
+      victim = 0;
+      for (int i = 1; i < kLruDepth; ++i) {
+        if (c.slots[i].tick < min_tick) {
+          min_tick = c.slots[i].tick;
+          victim = i;
+        }
+      }
+      c.slots[victim].mgr.reset();
+    }
+
+    auto mgr = MakeManager(stream);
+    if (!mgr) return nullptr;
+    c.slots[victim].mgr = mgr;
+    c.slots[victim].algo = idx;
+    c.slots[victim].tick = ++c.clock;
+    ++c.misses;
+    return mgr;
+  }
+
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
     switch (algo_) {
+      // NOTE: nvcomp >= 5.x split each algorithm's single "DefaultOpts" into
+      // separate Compress/Decompress opts (discovered while adding Cascaded/
+      // Bitcomp below -- the single-opts symbols no longer exist and these
+      // 6 pre-existing cases failed to compile against the installed
+      // nvcomp 5.3.0.16; fixed here using the same two-opts pattern nvcomp
+      // itself now uses everywhere).
       case NvCompAlgo::LZ4:
         return std::make_shared<nvcomp::LZ4Manager>(
-            kChunkSize, nvcompBatchedLZ4DefaultOpts, stream);
+            kChunkSize, nvcompBatchedLZ4CompressDefaultOpts,
+            nvcompBatchedLZ4DecompressDefaultOpts, stream);
       case NvCompAlgo::SNAPPY:
         return std::make_shared<nvcomp::SnappyManager>(
-            kChunkSize, nvcompBatchedSnappyDefaultOpts, stream);
+            kChunkSize, nvcompBatchedSnappyCompressDefaultOpts,
+            nvcompBatchedSnappyDecompressDefaultOpts, stream);
       case NvCompAlgo::ZSTD:
         return std::make_shared<nvcomp::ZstdManager>(
-            kChunkSize, nvcompBatchedZstdDefaultOpts, stream);
+            kChunkSize, nvcompBatchedZstdCompressDefaultOpts,
+            nvcompBatchedZstdDecompressDefaultOpts, stream);
       case NvCompAlgo::GDEFLATE:
         return std::make_shared<nvcomp::GdeflateManager>(
-            kChunkSize, nvcompBatchedGdeflateDefaultOpts, stream);
+            kChunkSize, nvcompBatchedGdeflateCompressDefaultOpts,
+            nvcompBatchedGdeflateDecompressDefaultOpts, stream);
       case NvCompAlgo::DEFLATE:
         return std::make_shared<nvcomp::DeflateManager>(
-            kChunkSize, nvcompBatchedDeflateDefaultOpts, stream);
+            kChunkSize, nvcompBatchedDeflateCompressDefaultOpts,
+            nvcompBatchedDeflateDecompressDefaultOpts, stream);
       case NvCompAlgo::ANS:
         return std::make_shared<nvcomp::ANSManager>(
-            kChunkSize, nvcompBatchedANSDefaultOpts, stream);
+            kChunkSize, nvcompBatchedANSCompressDefaultOpts,
+            nvcompBatchedANSDecompressDefaultOpts, stream);
+      case NvCompAlgo::CASCADED: {
+        // NeuroPress overrides the nvcomp default here
+        // (compression_factory.cpp:121-126): "Byte-level: correct for any
+        // quantized precision (INT8/16/32)". The default is NOT char --
+        // nvcompBatchedCascadedCompressDefaultOpts is {4096,
+        // NVCOMP_TYPE_INT, 2, 1, 1, {0}} -- so leaving it alone ran
+        // Cascaded's RLE+delta+bitpack pipeline over 32-bit words instead
+        // of bytes, producing a different bitstream (and so a different
+        // ratio label) than the model was trained against. It also made
+        // correctness depend on the input size: nvcomp documents that each
+        // chunk must be a multiple of the element type's size "else this
+        // may crash or produce invalid output", and the manager's final
+        // chunk is input_size % 64 KiB.
+        nvcompBatchedCascadedCompressOpts_t opts =
+            nvcompBatchedCascadedCompressDefaultOpts;
+        opts.type = NVCOMP_TYPE_CHAR;
+        return std::make_shared<nvcomp::CascadedManager>(
+            kChunkSize, opts, nvcompBatchedCascadedDecompressDefaultOpts,
+            stream);
+      }
+      case NvCompAlgo::BITCOMP: {
+        // Likewise (compression_factory.cpp:128-134): "Good for scientific
+        // data". Bitcomp models the buffer as an array of its declared
+        // type, so the default NVCOMP_TYPE_UCHAR compresses 8-byte-wide
+        // scientific data byte-wise and reaches a materially different
+        // ratio. algorithm 0 matches the default but is set explicitly,
+        // as upstream does.
+        nvcompBatchedBitcompCompressOpts_t opts =
+            nvcompBatchedBitcompCompressDefaultOpts;
+        opts.data_type = NVCOMP_TYPE_LONGLONG;
+        opts.algorithm = 0;
+        return std::make_shared<nvcomp::BitcompManager>(
+            kChunkSize, opts, nvcompBatchedBitcompDecompressDefaultOpts,
+            stream);
+      }
     }
     return nullptr;
   }

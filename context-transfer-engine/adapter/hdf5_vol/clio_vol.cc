@@ -29,6 +29,7 @@
 #include <H5FDmpio.h>       /* H5Pget_dxpl_mpio (collective-IO detection) */
 #endif
 
+#include <cstdio>
 #include <sys/stat.h>       /* stat() -- coherence stamp */
 #include <time.h>           /* time_t, for struct stat's mtime members */
 
@@ -55,9 +56,11 @@
    clio.h alone). Without this include the linker leaves the
    templated symbols undefined in our .so. */
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
+#include <clio_cte/compressor/compressor_client.h>
 
 /* The connector's capability set. Defined once because it is reported from two
    places (the class literal and introspect_get_cap_flags) that must agree. */
@@ -97,6 +100,14 @@ struct clio_file_t {
   clio::cte::core::TagId tag_id;
   std::string file_name;
   size_t chunk_size;
+  /* Set (non-null) when the FAPL configured a compressor chimod pool via
+     clio_vol_info_t. When set, cacheable H5Dwrite/H5Dread chunk transfers
+     route through this compressor::Client (AsyncPutBlob analyzes + compresses
+     + stores; AsyncGetBlob fetches + decompresses) instead of going straight
+     to the CTE core pool uncompressed. Owned per-file, mirroring how
+     chunk_size is resolved once at open and reused for every dataset in the
+     file -- there is no per-dataset override. */
+  std::unique_ptr<clio::cte::compressor::Client> compressor_client;
   /* False when the CTE tier is bypassed entirely for this file: either the user
      disabled it (CLIO_VOL_CACHE=0) or the CLIO runtime was unreachable at open.
      The connector then behaves as a pure pass-through to the native VOL, which
@@ -141,7 +152,22 @@ struct clio_dataset_t {
   bool cacheable;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
+  /* Same as pending_puts, but for chunks routed through the compressor
+     chimod (file->compressor_client set) -- DynamicScheduleTask is a
+     different Task type than core's PutBlobTask, so it cannot share the
+     vector above even though both are drained the same way. */
+  std::vector<clio::run::Future<clio::cte::compressor::DynamicScheduleTask>>
+      pending_compressed_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
+  /* Chunks staged into a client-owned DEVICE backend (AllocateAndRegisterGpuBackend)
+     instead of host SHM, when src was GPU-resident -- see the write loop. Unlike
+     pending_buffers, these need an explicit FreeGpuBackend once drained: a device
+     backend is not released by simply letting the handle go out of scope. */
+  struct PendingGpuBuffer {
+    clio::run::u32 gpu_id;
+    ctp::ipc::AllocatorId alloc_id;
+  };
+  std::vector<PendingGpuBuffer> pending_gpu_buffers;
   /* One staging-failure report per dataset (see drain_dataset_puts). */
   bool put_failure_reported = false;
   /* Telemetry-only storage-layout probe, filled lazily on first traced access
@@ -321,6 +347,14 @@ static bool drain_dataset_puts(clio_dataset_t *dset) {
       if (first_rc == 0) first_rc = rc;
     }
   }
+  for (auto &future : dset->pending_compressed_puts) {
+    future.Wait();
+    const int rc = future->GetReturnCode();
+    if (rc != 0) {
+      ok = false;
+      if (first_rc == 0) first_rc = rc;
+    }
+  }
   /* Name the reason, once per dataset -- the failing case is the repeating
      one, so an unrated message would be a line per chunk per write, and a
      silent one hides a full tier entirely. */
@@ -337,11 +371,22 @@ static bool drain_dataset_puts(clio_dataset_t *dset) {
      only their return codes here say whether the bytes landed. */
   if (!ok && clio_put_rc_is_placement_failure(first_rc)) {
     clio_tier_mark_full();
-  } else if (ok && !dset->pending_puts.empty()) {
+  } else if (ok && (!dset->pending_puts.empty() ||
+                    !dset->pending_compressed_puts.empty())) {
     clio_tier_mark_accepting();
   }
   dset->pending_puts.clear();
+  dset->pending_compressed_puts.clear();
   dset->pending_buffers.clear();
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  /* Safe only now: every future above has been Waited on, so whichever task
+     consumed each device-resident chunk (compress, or raw PutBlob storage)
+     has already read it. */
+  for (auto &gpu_buf : dset->pending_gpu_buffers) {
+    CLIO_IPC->FreeGpuBackend(gpu_buf.gpu_id, gpu_buf.alloc_id);
+  }
+  dset->pending_gpu_buffers.clear();
+#endif
   return ok;
 }
 
@@ -774,6 +819,29 @@ static void clio_resolve_config(hid_t fapl_id, size_t *chunk_size,
   }
 }
 
+/* Resolve the compressor chimod pool for a file, same precedence as
+   clio_resolve_config()'s chunk_size: connector info, then
+   CLIO_VOL_COMPRESSOR_POOL ("major" or "major.minor"), then "unset"
+   (GetNull() -- writes stay uncompressed, today's behavior). */
+static clio::run::PoolId clio_resolve_compressor_pool(hid_t fapl_id) {
+  clio::run::PoolId pool_id = clio::run::PoolId::GetNull();
+  clio_vol_info_t *vol_info = nullptr;
+  H5Pget_vol_info(fapl_id, reinterpret_cast<void **>(&vol_info));
+  if (vol_info && vol_info->compressor_pool_major != 0) {
+    pool_id = clio::run::PoolId(vol_info->compressor_pool_major,
+                                 vol_info->compressor_pool_minor);
+  }
+  const char *env_pool = std::getenv("CLIO_VOL_COMPRESSOR_POOL");
+  if (env_pool && *env_pool) {
+    unsigned major = 0, minor = 0;
+    int parsed = std::sscanf(env_pool, "%u.%u", &major, &minor);
+    if (parsed >= 1 && major != 0) {
+      pool_id = clio::run::PoolId(major, minor);
+    }
+  }
+  return pool_id;
+}
+
 /* On blob SCORES: every blob is written with -1.0f, and that is deliberate.
  * Score is a PLACEMENT hint -- which tier a blob belongs on -- with domain
  * -1.0 (auto) or [0.0, 1.0] (explicit); anything else is REJECTED (rc=5).
@@ -1033,8 +1101,10 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
    same name describes data that no longer exists and must be dropped -- the tag
    is keyed on the filename, which a truncate does not change. */
 static clio_file_t *clio_make_file(void *under_file, const char *name,
-                                   size_t chunk_size, bool truncated,
-                                   bool cache_enabled) {
+                                     size_t chunk_size,
+                                     const clio::run::PoolId &compressor_pool_id,
+                                     bool truncated,
+                                     bool cache_enabled) {
   auto *file = new clio_file_t;
   file->obj.under_object = under_file;
   file->obj.under_vol_id = H5VL_NATIVE;
@@ -1044,6 +1114,16 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->chunk_size = chunk_size;
   file->cache_enabled = cache_enabled;
   file->trace = clio::trace::open_file(name);
+  if (!compressor_pool_id.IsNull()) {
+    /* Runtime-internal one-arg ctor: only the compressor pool is known here,
+       exactly the situation its doc comment describes. Its own chimod config
+       (next_pool_id_, set at AsyncCreateCompressor time) resolves which core
+       pool to forward compressed blobs to -- this client never needs the
+       inherited pass-through pool_id_ for anything, since get_cte_client()
+       remains the one used for tags/deletes/etc. */
+    file->compressor_client =
+        std::make_unique<clio::cte::compressor::Client>(compressor_pool_id);
+  }
 
   /* Refuse rather than degrade when the caller asked for that. Only when the
      cache was WANTED: an explicit CLIO_VOL_CACHE=0 is a choice, not a failure,
@@ -1118,6 +1198,7 @@ static void *clio_file_create(const char *name, unsigned flags,
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
+  clio::run::PoolId compressor_pool_id = clio_resolve_compressor_pool(fapl_id);
 
   /* Create file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -1129,8 +1210,8 @@ static void *clio_file_create(const char *name, unsigned flags,
 
   /* H5Fcreate always yields an empty file (TRUNC replaces an existing one,
      EXCL/CREAT means there was none), so any pre-existing tag is stale. */
-  auto *file = clio_make_file(under_file, name, chunk_size, /*truncated*/ true,
-                              cache_on);
+  auto *file = clio_make_file(under_file, name, chunk_size, compressor_pool_id,
+                              /*truncated*/ true, cache_on);
   /* Null means CLIO_REQUIRE_RUNTIME refused the degradation. The native file is
      already open and this connector is the only holder, so close it rather than
      leak an fd on the way out. */
@@ -1146,6 +1227,7 @@ static void *clio_file_open(const char *name, unsigned flags,
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
+  clio::run::PoolId compressor_pool_id = clio_resolve_compressor_pool(fapl_id);
 
   /* Open file via native VOL */
   hid_t native_fapl = H5Pcopy(fapl_id);
@@ -1154,8 +1236,8 @@ static void *clio_file_open(const char *name, unsigned flags,
   H5Pclose(native_fapl);
   if (!under_file) return nullptr;
 
-  auto *file = clio_make_file(under_file, name, chunk_size, /*truncated*/ false,
-                              cache_on);
+  auto *file = clio_make_file(under_file, name, chunk_size, compressor_pool_id,
+                              /*truncated*/ false, cache_on);
   if (!file) {  /* see clio_file_create */
     H5VLfile_close(under_file, H5VL_NATIVE, dxpl_id, req);
     return nullptr;
@@ -1310,6 +1392,38 @@ static clio_file_t *find_parent_file(void *obj) {
  */
 static bool clio_is_whole_read(hid_t mem_space_id, hid_t file_space_id) {
   return mem_space_id == H5S_ALL && file_space_id == H5S_ALL;
+}
+
+/**
+ * Number of elements a transfer's buffer holds, per HDF5's actual space
+ * semantics -- NOT just "the dataset's full extent whenever mem_space is
+ * H5S_ALL". mem_space_id == H5S_ALL means "the buffer is a contiguous
+ * array sized to match whatever is selected in file_space_id", so a
+ * whole-memory-space transfer against a PARTIAL (hyperslab) file
+ * selection is only as large as that selection -- resolving it against
+ * the dataset's full extent instead over-reads/over-writes the caller's
+ * buffer by however much the selection is smaller than the dataset.
+ * (This one call, when both spaces happen to be H5S_ALL, degenerates to
+ * exactly the dataset's full extent, which is why every earlier call site
+ * that assumed that got away with it -- they only ever had whole-dataset
+ * selections to deal with.)
+ */
+static hssize_t clio_transfer_nelem(clio_dataset_t *dataset, hid_t mem_space_id,
+                                     hid_t file_space_id, hid_t dxpl_id) {
+  hid_t sel_space = (mem_space_id != H5S_ALL) ? mem_space_id : file_space_id;
+  hid_t owned_space = H5I_INVALID_HID;
+  if (sel_space == H5S_ALL) {
+    H5VL_dataset_get_args_t get_args;
+    get_args.op_type = H5VL_DATASET_GET_SPACE;
+    get_args.args.get_space.space_id = H5I_INVALID_HID;
+    H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
+                    &get_args, dxpl_id, nullptr);
+    sel_space = get_args.args.get_space.space_id;
+    owned_space = sel_space;
+  }
+  hssize_t nelem = (sel_space >= 0) ? H5Sget_select_npoints(sel_space) : -1;
+  if (owned_space >= 0) H5Sclose(owned_space);
+  return nelem;
 }
 
 /**
@@ -1657,10 +1771,30 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       /* The native VOL is the authoritative store: its status IS this call's
          status. Discarding it (as this did) reported success for writes that
          never reached the file -- ENOSPC, filter failure, a bad selection. */
+      /* This is the uncacheable branch (partial/collective/non-whole write),
+         so it never goes through the chunk-staging path below that already
+         handles device pointers. buf[d] may still be a GPU device pointer
+         here (H5Dwrite places no restriction on selection shape when the
+         caller passes device memory), and the native VOL underneath expects
+         a host-dereferenceable buffer -- stage it the same way the cacheable
+         write path (and NeuroPress's own gpu_bypass_dh_write) does. */
+      const void *native_write_buf = buf[d];
+      std::vector<char> native_write_staging;
+      if (ctp::IsDevicePointer(buf[d])) {
+        hssize_t nelem = clio_transfer_nelem(dataset, mem_space_id[d],
+                                             file_space_id[d], dxpl_id);
+        if (nelem > 0) {
+          size_t total_size =
+              static_cast<size_t>(nelem) * H5Tget_size(mem_type_id[d]);
+          native_write_staging.resize(total_size);
+          ctp::DeviceAwareMemcpy(native_write_staging.data(), buf[d], total_size);
+          native_write_buf = native_write_staging.data();
+        }
+      }
       herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                          dataset->obj.under_vol_id,
                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                         dxpl_id, &buf[d], req);
+                         dxpl_id, &native_write_buf, req);
       if (rc < 0) ret_value = rc;
       /* This write did NOT refresh the whole linear image, so any cached image
          is now stale. Invalidate it (drop the chunk_0 hit-test key) so later
@@ -1726,20 +1860,64 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        file then holds data the cache does not, so any previously staged image
        must be invalidated below or a later read would hit pre-write bytes. */
     bool staged_fully = admit_here;
+    /* Checked once, not per chunk -- src is the same buffer for the whole
+       H5Dwrite call. When true (and a compressor pool is configured -- see
+       below), each chunk is staged into a client-owned DEVICE backend
+       instead of host SHM, so the ShmPtr handed to AsyncDynamicSchedule
+       still resolves to a real device pointer on the runtime side
+       (DynamicSchedule's ToFullPtr, the CUDA IPC round trip) -- which is
+       what lets NeuroPress's device-only candidate restriction in
+       EstCompressionStats actually apply, instead of every chunk looking
+       like host data by the time it gets there.
+       Only worth it when routing through the compressor: the raw core
+       client's AsyncPutBlob (the no-compressor branch below) stages any
+       device-resident ShmPtr right back to host itself the moment it's
+       called from a client process (StageDeviceBlobForPut, core_client.h)
+       -- so a device buffer built here would just be copied again and
+       thrown away, doubling the work for nothing. */
+    const bool src_is_device =
+        ctp::IsDevicePointer(src) && dataset->file->compressor_client;
 
     for (size_t i = 0; admit_here && i < num_chunks; ++i) {
       size_t offset = i * chunk_size;
       size_t this_size = std::min(chunk_size, total_size - offset);
 
-      /* Allocate SHM buffer and copy data. An allocation failure stops the
-         staging, never the write: the native path below is always available,
-         and failing H5Dwrite over a cache buffer is an error the application
-         would not have seen without CLIO. */
-      auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-      if (buffer.IsNull()) { staged_fully = false; break; }
-      std::memcpy(buffer.ptr_, src + offset, this_size);
+      ctp::ipc::ShmPtr<> blob_data;
+      bool staged_on_device = false;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+      if (src_is_device) {
+        char *device_ptr = nullptr;
+        ctp::ipc::AllocatorId gpu_alloc_id =
+            CLIO_IPC->AllocateAndRegisterGpuBackend(
+                /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                this_size, &device_ptr);
+        if (!gpu_alloc_id.IsNull()) {
+          ctp::GpuApi::Memcpy(device_ptr, src + offset, this_size);
+          blob_data.alloc_id_ = gpu_alloc_id;
+          blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
+          dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});
+          staged_on_device = true;
+        }
+        /* Falls through to the host buffer below on allocation failure --
+           same graceful-degradation contract the host path already has. */
+      }
+#endif
+      if (!staged_on_device) {
+        /* Host SHM fallback: no device source, or the device backend alloc
+         * failed. DeviceAwareMemcpy still handles src being a device
+         * pointer here (D2H) -- the fallback stages correctly even though
+         * it can no longer keep NeuroPress's candidate set GPU-only.
+         * An allocation failure stops the staging, never the write: the
+         * native path below is always available, and failing H5Dwrite over
+         * a cache buffer is an error the application would not have seen
+         * without CLIO. */
+        auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) { staged_fully = false; break; }
+        ctp::DeviceAwareMemcpy(buffer.ptr_, src + offset, this_size);
+        blob_data = buffer.shm_.template Cast<void>();
+        dataset->pending_buffers.push_back(std::move(buffer));
+      }
 
-      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
 
@@ -1749,23 +1927,61 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          the I/O path, so an N-chunk dataset cost N(N+1)/2 chunks of tier --
          invisible to every round-trip test because the read side used the same
          offset. The read side (clio_read_cached_image) must stay at 0 with
-         this. */
-      auto future = cte_client->AsyncPutBlob(
-          dataset->file->tag_id, blob_name, 0, this_size,
-          blob_data, -1.0f, clio::cte::core::Context(), 0);
+         this -- true for both branches below, compressed or not.
 
-      dataset->pending_puts.push_back(std::move(future));
-      dataset->pending_buffers.push_back(std::move(buffer));
+         When the file was opened with a compressor pool configured, route
+         through it instead of the raw core client: compressor::Client's
+         AsyncDynamicSchedule analyzes the chunk (NeuroPress dynamic
+         selection among them), compresses, and stores via core PutBlob --
+         rather than storing the chunk uncompressed. The two return
+         different Task types (DynamicScheduleTask vs PutBlobTask), so they
+         go into separate pending-future vectors drained the same way on
+         close.
+
+         AsyncDynamicSchedule (not the AsyncPutBlob override) so the core
+         pool id can be passed explicitly: the override always sends
+         PoolId::GetNull() for it, which only resolves if the compressor
+         pool's own compose config set next_pool_id_ -- a VOL-opened
+         compressor pool has no such guarantee, and an unresolved core
+         client null-derefs deep in the compressor runtime instead of
+         failing cleanly. cte_client->pool_id_ is the core pool this VOL
+         connector's own CTE core client is already bound to, so compressed
+         chunks land in the same core pool uncompressed chunks would have. */
+      if (dataset->file->compressor_client) {
+        auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
+            clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+            0, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+            0, cte_client->pool_id_);
+        dataset->pending_compressed_puts.push_back(std::move(future));
+      } else {
+        auto future = cte_client->AsyncPutBlob(
+            dataset->file->tag_id, blob_name, 0, this_size,
+            blob_data, -1.0f, clio::cte::core::Context(), 0);
+        dataset->pending_puts.push_back(std::move(future));
+      }
       staged_bytes += this_size;
     }
 
     /* Write to the native VOL -- the authoritative store. Its status is this
        call's status; if it failed, the bytes we just staged into CTE describe
-       data the file does not contain, so drop them. */
+       data the file does not contain, so drop them.
+       Native HDF5 has no concept of GPU memory: H5D__contig_writevv_sieve_cb
+       (and friends) dereference this buffer directly on the host, so a raw
+       device pointer here segfaults deep inside libhdf5 -- not something we
+       can fix on the native side. Stage a host copy first when buf[d] is a
+       device pointer (mirrors NeuroPress's own gpu_bypass_dh_write, which
+       hits this exact same constraint on its own native-passthrough path). */
+    const void *native_write_buf = buf[d];
+    std::vector<char> native_write_staging;
+    if (ctp::IsDevicePointer(buf[d])) {
+      native_write_staging.resize(total_size);
+      ctp::DeviceAwareMemcpy(native_write_staging.data(), buf[d], total_size);
+      native_write_buf = native_write_staging.data();
+    }
     herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
                        dataset->obj.under_vol_id,
                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                       dxpl_id, &buf[d], req);
+                       dxpl_id, &native_write_buf, req);
     if (rc < 0) {
       ret_value = rc;
       drain_dataset_puts(dataset);
@@ -1836,13 +2052,120 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
                                      size_t total_size, char *dst,
                                      size_t want_lo = 0,
                                      size_t want_hi = SIZE_MAX) {
-  auto *cte_client = get_cte_client();
   size_t chunk_size = dataset->file->chunk_size;
   size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
   if (want_hi > total_size) want_hi = total_size;
   if (want_lo >= want_hi) return true;  /* nothing selected: nothing to fetch */
   const size_t first = want_lo / chunk_size;
   const size_t last = (want_hi - 1) / chunk_size;  /* inclusive */
+
+  /* Chunks written through the compressor chimod are stored COMPRESSED --
+     fetching them with the raw core client (no decompression) would hand
+     back compressed bytes as if they were the real data. Whichever client
+     wrote the chunk must be the one that reads it back, so this mirrors the
+     branch in clio_dataset_write() exactly, keyed the same way (whether
+     file->compressor_client is set). */
+  if (dataset->file->compressor_client) {
+    auto *compressor_client = dataset->file->compressor_client.get();
+    /* See the write-side comment in clio_dataset_write(): the convenience
+       AsyncGetBlob override always sends a null core_pool_id, which only
+       resolves via compose config; use the explicit-core-pool-id method
+       with the CTE core client's own pool id instead, so a VOL-opened
+       compressor pool (no compose config of its own) doesn't null-deref
+       inside the compressor runtime. */
+    auto *cte_client = get_cte_client();
+    std::vector<clio::run::Future<clio::cte::compressor::DecompressTask>>
+        futures;
+    std::vector<ctp::ipc::FullPtr<char>> buffers;
+    std::vector<size_t> offsets;
+    futures.reserve(last - first + 1);
+    buffers.reserve(last - first + 1);
+    offsets.reserve(last - first + 1);
+    /* Decompress into GPU-SHARED memory when the caller's buffer is device
+       memory, so the decompressor can land bytes somewhere the GPU can reach.
+       NeuroPress decompresses straight into the caller's device buffer
+       (`dst_ptr = static_cast<uint8_t*>(d_buf) + off`, gpu_aware_chunked_read);
+       handing this path a CPU SHM buffer instead cost a full-size staging copy
+       per chunk and left the compressor's device unshuffle/dequantize
+       unreachable from the VOL, because codec_dst was always host.
+
+       kManagedUvm, NOT kDeviceMem. Both are "GPU memory", but only managed
+       memory is addressable from both sides: ToFullPtr's own comment
+       (ipc_manager.h:1119) notes that for kPinnedHost/kManagedUvm `off_` and
+       `device_ptr` are the same value because they share an address space,
+       so the runtime resolves it without needing a portable
+       cudaIpcMemHandle. A kDeviceMem backend allocated by a CLIENT is not
+       resolvable that way -- the runtime falls through to
+       TryLazyRegisterClientSegment, which shm_open()s "clio_<pid>_<n>" and
+       fails, and a CPU codec handed the result segfaults. Both were observed
+       before switching to managed memory.
+
+       Falls back to CPU SHM on allocation failure, matching the write path's
+       graceful-degradation contract. */
+    const bool dst_is_device = ctp::IsDevicePointer(dst);
+    std::vector<ctp::ipc::AllocatorId> gpu_allocs;
+    std::vector<char *> gpu_ptrs;
+    gpu_allocs.reserve(last - first + 1);
+    gpu_ptrs.reserve(last - first + 1);
+
+    for (size_t i = first; i <= last && i < num_chunks; ++i) {
+      size_t offset = i * chunk_size;
+      size_t this_size = std::min(chunk_size, total_size - offset);
+      ctp::ipc::FullPtr<char> buffer;
+      ctp::ipc::ShmPtr<> blob_data;
+      ctp::ipc::AllocatorId gpu_alloc;
+      char *gpu_ptr = nullptr;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+      if (dst_is_device) {
+        gpu_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kManagedUvm,
+            this_size, &gpu_ptr);
+        if (gpu_alloc.IsNull()) gpu_ptr = nullptr;
+        if (gpu_ptr) {
+          blob_data.alloc_id_ = gpu_alloc;
+          blob_data.off_ = reinterpret_cast<clio::run::u64>(gpu_ptr);
+        }
+      }
+#endif
+      if (gpu_ptr == nullptr) {
+        buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) return false;
+        blob_data = buffer.shm_.template Cast<void>();
+      }
+      std::string blob_name = dataset->dataset_path + "/chunk_" +
+                              std::to_string(i);
+      /* Blob-internal offset 0, same convention as the raw-blob path below
+         and the write side: each chunk blob holds only its own bytes. */
+      futures.push_back(compressor_client->AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+          0, this_size, 0, blob_data, cte_client->pool_id_));
+      buffers.push_back(std::move(buffer));
+      gpu_allocs.push_back(gpu_alloc);
+      gpu_ptrs.push_back(gpu_ptr);
+      offsets.push_back(offset);
+    }
+    size_t fetched = 0;
+    for (size_t i = 0; i < futures.size(); ++i) {
+      futures[i].Wait();
+      if (futures[i]->GetReturnCode() != 0) return false;
+      size_t offset = offsets[i];
+      size_t this_size = std::min(chunk_size, total_size - offset);
+      const char *src_ptr = gpu_ptrs[i] ? gpu_ptrs[i] : buffers[i].ptr_;
+      ctp::DeviceAwareMemcpy(dst + offset, src_ptr, this_size);
+      fetched += this_size;
+    }
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+    for (auto &a : gpu_allocs) {
+      if (!a.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, a);
+    }
+#endif
+    if (dataset->file && dataset->file->trace)
+      clio::trace::record_fetch(dataset->file->trace, dataset->dataset_path,
+                                fetched);
+    return true;
+  }
+
+  auto *cte_client = get_cte_client();
   std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futures;
   std::vector<ctp::ipc::FullPtr<char>> buffers;
   std::vector<size_t> offsets;
@@ -1878,7 +2201,9 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
     if (futures[i]->GetReturnCode() != 0) { ok = false; continue; }
     size_t offset = offsets[i];
     size_t this_size = std::min(chunk_size, total_size - offset);
-    std::memcpy(dst + offset, buffers[i].ptr_, this_size);
+    // dst is the caller's buffer -- same GPU-pointer caveat as the write
+    // path above.
+    ctp::DeviceAwareMemcpy(dst + offset, buffers[i].ptr_, this_size);
     fetched += this_size;
   }
   if (!ok) return false;  /* caller invalidates and re-reads native */
@@ -2007,18 +2332,93 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     /* Place the gathered elements into the user buffer. H5S_ALL mem space means
        a contiguous buffer of the selected elements; otherwise scatter per the
        mem-space selection. */
+    /* `buf` is the CALLER's buffer and may be a raw cudaMalloc'd device
+       pointer -- H5Dwrite/H5Dread accept whatever the caller passes, and the
+       GPU paths in this file exist precisely to serve that case. Neither
+       placement below may touch it with host code: a plain std::memcpy
+       dereferences device memory from the host (a SIGSEGV, not a wrong
+       answer), and H5Dscatter writes through the same host pointer
+       internally. Every sibling that lands bytes in a user destination
+       already goes through DeviceAwareMemcpy (:2055, :2102, :2288, :2509);
+       these two were the exceptions. */
+    const bool buf_on_device = ctp::IsDevicePointer(buf);
     if (mem_space_id == H5S_ALL) {
-      std::memcpy(buf, sel.data(), sel_size);
+      ctp::DeviceAwareMemcpy(buf, sel.data(), sel_size);
       ok = true;
-    } else {
+    } else if (!buf_on_device) {
       clio_scatter_ctx ctx{sel.data(), sel_size};
       ok = (H5Dscatter(clio_scatter_cb, &ctx, mem_type_id, mem_space_id,
                        buf) >= 0);
+    } else {
+      /* Scatter cannot write to device memory, so stage it. The mem-space
+         selection may be sparse, so the staging buffer is seeded with the
+         destination's CURRENT contents first: scatter only fills the selected
+         positions, and copying an unseeded buffer back would overwrite the
+         elements the selection deliberately left alone. */
+      hssize_t mem_nelem = H5Sget_simple_extent_npoints(mem_space_id);
+      if (mem_nelem <= 0) break;
+      size_t mem_size = static_cast<size_t>(mem_nelem) * type_size;
+      std::vector<char> scatter_staging(mem_size);
+      ctp::DeviceAwareMemcpy(scatter_staging.data(), buf, mem_size);
+      clio_scatter_ctx ctx{sel.data(), sel_size};
+      ok = (H5Dscatter(clio_scatter_cb, &ctx, mem_type_id, mem_space_id,
+                       scatter_staging.data()) >= 0);
+      if (ok) {
+        ctp::DeviceAwareMemcpy(buf, scatter_staging.data(), mem_size);
+      }
     }
   } while (false);
 
   H5Sclose(full_space);
   return ok;
+}
+
+/**
+ * Read through the native VOL into dst, staging via a host buffer first if
+ * dst is a GPU device pointer. Native HDF5 dereferences its destination
+ * buffer directly on the host (H5D__contig_readvv_sieve_cb has no concept
+ * of GPU memory), so a raw device pointer here segfaults deep inside
+ * libhdf5 -- the same constraint the write path and the cache-miss read
+ * path above both document. Every native-passthrough fallback in
+ * clio_dataset_read() below goes through this one helper so the staging
+ * logic (and its size-resolution edge cases) lives in exactly one place.
+ */
+static herr_t clio_native_read_device_safe(clio_dataset_t *dataset,
+                                            hid_t mem_type_id,
+                                            hid_t mem_space_id,
+                                            hid_t file_space_id,
+                                            hid_t dxpl_id, void *dst,
+                                            void **req) {
+  if (!ctp::IsDevicePointer(dst)) {
+    void *buf = dst;
+    return H5VLdataset_read(1, &dataset->obj.under_object,
+                            dataset->obj.under_vol_id, &mem_type_id,
+                            &mem_space_id, &file_space_id, dxpl_id, &buf, req);
+  }
+
+  hssize_t nelem =
+      clio_transfer_nelem(dataset, mem_space_id, file_space_id, dxpl_id);
+  if (nelem <= 0) {
+    /* Can't size a staging buffer -- pass the device pointer straight
+       through. If the underlying VOL can't handle it either, that failure
+       is no worse than the un-staged behavior this helper replaces. */
+    void *buf = dst;
+    return H5VLdataset_read(1, &dataset->obj.under_object,
+                            dataset->obj.under_vol_id, &mem_type_id,
+                            &mem_space_id, &file_space_id, dxpl_id, &buf, req);
+  }
+
+  size_t total_size = static_cast<size_t>(nelem) * H5Tget_size(mem_type_id);
+  std::vector<char> staging(total_size);
+  void *staging_buf = staging.data();
+  herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
+                               dataset->obj.under_vol_id, &mem_type_id,
+                               &mem_space_id, &file_space_id, dxpl_id,
+                               &staging_buf, req);
+  if (rc >= 0) {
+    ctp::DeviceAwareMemcpy(dst, staging.data(), total_size);
+  }
+  return rc;
 }
 
 /**
@@ -2058,10 +2458,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     if (!cacheable_flat) {
       /* Propagate the native status: a failed read previously returned success
          with the user's buffer untouched. */
-      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                        dataset->obj.under_vol_id,
-                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                        dxpl_id, &buf[d], req);
+      herr_t rc = clio_native_read_device_safe(
+          dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+          dxpl_id, buf[d], req);
       if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -2081,10 +2480,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                            mem_space_id[d], file_space_id[d],
                                            dxpl_id, buf[d]);
       if (!served) {
-        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                          dataset->obj.under_vol_id,
-                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                          dxpl_id, &buf[d], req);
+        herr_t rc = clio_native_read_device_safe(
+            dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+            dxpl_id, buf[d], req);
         if (rc < 0) ret_value = rc;
       }
       if (tracing)
@@ -2107,10 +2505,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     if (space >= 0) H5Sclose(space);
     if (nelem <= 0) {
       /* Can't size it — fall back to native for safety. */
-      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                        dataset->obj.under_vol_id,
-                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                        dxpl_id, &buf[d], req);
+      herr_t rc = clio_native_read_device_safe(
+          dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+          dxpl_id, buf[d], req);
       if (rc < 0) ret_value = rc;
       if (tracing)
         clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
@@ -2140,11 +2537,25 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     bool served_cache = (cached != 0);
 
     if (cached == 0) {
-      /* MISS — native read is the source of truth, then stage into the tier. */
+      /* MISS — native read is the source of truth, then stage into the tier.
+         Native HDF5 dereferences the destination buffer directly on the host
+         (same constraint as the write path above -- H5D__contig_readvv_sieve_cb
+         has no concept of GPU memory), so read into a host staging buffer when
+         dst is a device pointer; the CTE staging loop below then sources from
+         that same staging buffer, and the result is copied out to the real
+         (device) dst once at the end. */
+      bool dst_on_device = ctp::IsDevicePointer(dst);
+      std::vector<char> native_read_staging;
+      char *native_read_dst = dst;
+      if (dst_on_device) {
+        native_read_staging.resize(total_size);
+        native_read_dst = native_read_staging.data();
+      }
+      void *native_read_buf = native_read_dst;
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
                                    &mem_type_id[d], &mem_space_id[d],
-                                   &file_space_id[d], dxpl_id, &buf[d], req);
+                                   &file_space_id[d], dxpl_id, &native_read_buf, req);
       if (rc < 0) {
         /* Nothing to stage from a failed read; record the failure and move to
            the next dataset like every other fallback path (an early return
@@ -2180,20 +2591,37 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         size_t this_size = std::min(chunk_size, total_size - offset);
         auto buffer = CLIO_IPC->AllocateBuffer(this_size);
         if (buffer.IsNull()) { staged_ok = false; break; }
-        std::memcpy(buffer.ptr_, dst + offset, this_size);
+        std::memcpy(buffer.ptr_, native_read_dst + offset, this_size);
         ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
         std::string blob_name = dataset->dataset_path + "/chunk_" +
                                 std::to_string(i);
-        /* Blob-internal offset 0, same as the write path -- the chunk index
+        /* Must match whichever client will later read this chunk back
+           (clio_read_cached_image() branches the same way): staging it
+           uncompressed via the core client here, then decompressing it on
+           read, would corrupt the image.
+
+           Blob-internal offset 0, same as the write path -- the chunk index
            lives in the name. See the comment there. */
-        auto fut = cte_client->AsyncPutBlob(
-            dataset->file->tag_id, blob_name, 0, this_size, blob_data,
-            -1.0f, clio::cte::core::Context(), 0);
-        fut.Wait();
-        const int put_rc = fut->GetReturnCode();
-        if (put_rc != 0) {
+        int rc_code;
+        if (dataset->file->compressor_client) {
+          /* Explicit core_pool_id, same reason as clio_dataset_write()'s
+             write-side branch. */
+          auto fut = dataset->file->compressor_client->AsyncDynamicSchedule(
+              clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+              0, this_size, blob_data, -1.0f, clio::cte::core::Context(),
+              0, cte_client->pool_id_);
+          fut.Wait();
+          rc_code = fut->GetReturnCode();
+        } else {
+          auto fut = cte_client->AsyncPutBlob(
+              dataset->file->tag_id, blob_name, 0, this_size, blob_data,
+              -1.0f, clio::cte::core::Context(), 0);
+          fut.Wait();
+          rc_code = fut->GetReturnCode();
+        }
+        if (rc_code != 0) {
           staged_ok = false;
-          if (clio_put_rc_is_placement_failure(put_rc)) clio_tier_mark_full();
+          if (clio_put_rc_is_placement_failure(rc_code)) clio_tier_mark_full();
         } else {
           read_staged_bytes += this_size;
           clio_tier_mark_accepting();
@@ -2208,6 +2636,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
       if (!staged_ok) {
         clio_invalidate_dataset(dataset);
       }
+      if (dst_on_device) {
+        ctp::DeviceAwareMemcpy(dst, native_read_staging.data(), total_size);
+      }
     } else {
       /* HIT — serve the whole image from the CTE tier. If reassembly fails we
          have no data to return, so fall back to native rather than handing back
@@ -2215,10 +2646,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
       if (!clio_read_cached_image(dataset, total_size, dst)) {
         served_cache = false;
         clio_invalidate_dataset(dataset);
-        herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
-                          dataset->obj.under_vol_id,
-                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                          dxpl_id, &buf[d], req);
+        herr_t rc = clio_native_read_device_safe(
+            dataset, mem_type_id[d], mem_space_id[d], file_space_id[d],
+            dxpl_id, dst, req);
         if (rc < 0) ret_value = rc;
       }
     }

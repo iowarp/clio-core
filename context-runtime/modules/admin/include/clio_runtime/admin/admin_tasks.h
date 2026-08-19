@@ -1424,6 +1424,80 @@ enum class MemoryType : clio::run::u32 {
  * - kPinnedHostMemory: GpuShmMmap pinned host memory
  * - kGpuDeviceMemory: GpuMalloc IPC handle-based GPU memory
  */
+/**
+ * DeregisterMemoryTask - release a client-registered memory backend.
+ *
+ * The counterpart RegisterMemoryTask never had one, and its absence was a
+ * real leak rather than an omission of convenience: for kGpuDeviceMemory the
+ * runtime IMPORTS the client's allocation with cudaIpcOpenMemHandle
+ * (admin_runtime.cc) and holds a device pointer into it. Until the importer
+ * closes that mapping the exporter cannot safely cudaFree -- doing so is a
+ * cross-process use-after-free -- so IpcManager::FreeGpuBackend had to skip
+ * remotely-registered backends entirely and leak them for the process
+ * lifetime.
+ *
+ * This task closes the loop: the runtime unregisters the backend and, for an
+ * imported GPU allocation, calls CloseIpcMemHandle before replying. Only then
+ * is the owning process free to release the memory.
+ */
+struct DeregisterMemoryTask : public clio::run::Task {
+  IN clio::run::u32 alloc_major_;  ///< AllocatorId major (owning pid)
+  IN clio::run::u32 alloc_minor_;  ///< AllocatorId minor (index)
+  IN clio::run::u32 gpu_id_;       ///< GPU device id the backend belongs to
+  OUT bool success_;
+
+  /** SHM default constructor */
+  DeregisterMemoryTask()
+      : clio::run::Task(),
+        alloc_major_(0),
+        alloc_minor_(0),
+        gpu_id_(0),
+        success_(false) {}
+
+  /** Emplace constructor */
+  explicit DeregisterMemoryTask(const clio::run::TaskId &task_node,
+                                const clio::run::PoolId &pool_id,
+                                const clio::run::PoolQuery &pool_query,
+                                const ctp::ipc::AllocatorId &alloc_id,
+                                clio::run::u32 gpu_id)
+      : clio::run::Task(task_node, pool_id, pool_query,
+                        Method::kDeregisterMemory),
+        alloc_major_(alloc_id.major_),
+        alloc_minor_(alloc_id.minor_),
+        gpu_id_(gpu_id),
+        success_(false) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kDeregisterMemory;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(alloc_major_, alloc_minor_, gpu_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(success_);
+  }
+  void Copy(const ctp::ipc::FullPtr<DeregisterMemoryTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    alloc_major_ = other->alloc_major_;
+    alloc_minor_ = other->alloc_minor_;
+    gpu_id_ = other->gpu_id_;
+    success_ = other->success_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DeregisterMemoryTask>());
+  }
+};
+
 struct RegisterMemoryTask : public clio::run::Task {
   IN clio::run::u32 alloc_major_;       ///< AllocatorId/BackendId major (pid)
   IN clio::run::u32 alloc_minor_;       ///< AllocatorId/BackendId minor (index)

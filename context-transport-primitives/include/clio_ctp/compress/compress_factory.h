@@ -40,6 +40,8 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <vector>
+#include "clio_ctp/util/gpu_api.h"
 #include "compress.h"
 #include "lossless_modes.h"
 #include "snappy.h"
@@ -200,6 +202,64 @@ class CompressionFactory {
   }
 
   /**
+   * Whether the library at this wire ID accepts a CUDA device pointer
+   * directly (it stages its own H2D/D2H as needed). A caller with a
+   * device-resident input buffer must stage a host copy itself before
+   * calling Compress()/Decompress() on anything this returns false for.
+   *
+   * @param wire_id Integer wire ID (compress_lib_)
+   * @return true for GPU-native libraries (nvcomp/cusz/cuszp/ndzip); false
+   *   for CPU libraries or an unrecognized id (the safe default).
+   */
+  static bool IsGpuLibraryWireId(int wire_id) {
+    const CompressorInfo* info = FindByWireId(wire_id);
+    return info && info->is_gpu;
+  }
+
+  /**
+   * Returns a pointer safe to pass as Compress()/Decompress()'s `input` for
+   * the library at `wire_id`. `input` is returned unchanged when it's
+   * already host-readable or the library accepts a device pointer directly
+   * (IsGpuLibraryWireId) -- in both cases no copy happens. Otherwise
+   * `input` is a CUDA device pointer and the library can't read it, so this
+   * stages a D2H copy into `staging` (resized and owned by the caller) and
+   * returns a pointer into that instead.
+   *
+   * A caller driving NeuroPress's own selection should keep the candidate
+   * set GPU-only for a device-resident buffer (DefaultCandidates'
+   * include_cpu=false) so this staging path is a safety net that should not
+   * normally fire, not the expected route.
+   *
+   * @param input Buffer that will be handed to Compress()/Decompress().
+   * @param input_size Size of `input` in bytes.
+   * @param wire_id Library that will receive it (compress_lib_).
+   * @param staging Host scratch buffer this may resize and copy into.
+   * @return `input`, or `staging.data()` if a copy was staged.
+   */
+  static char* StageInputIfNeeded(char* input, size_t input_size,
+                                   int wire_id, std::vector<char>& staging) {
+    if (!ctp::IsDevicePointer(input) || IsGpuLibraryWireId(wire_id)) {
+      return input;
+    }
+    staging.resize(input_size);
+    ctp::GpuApi::Memcpy(staging.data(), input, input_size);
+    return staging.data();
+  }
+
+  /**
+   * Map a canonical library name to its CTE wire ID. Reverse of
+   * NameForWireId(). Unknown names fall back to zstd's wire id (10), the
+   * same historical default NameForWireId() falls back to by name.
+   *
+   * @param library_name Canonical (case-insensitive) library name
+   * @return Wire ID (compress_lib_), or zstd's wire id if unknown
+   */
+  static int WireIdForName(const std::string& library_name) {
+    const CompressorInfo* info = FindByName(library_name);
+    return info ? info->wire_id : FindByName("zstd")->wire_id;
+  }
+
+  /**
    * Get string name for preset.
    *
    * @param preset Compression preset
@@ -239,6 +299,11 @@ class CompressionFactory {
     int wire_id;       // CTE wire/on-disk id (frozen, append-only)
     int base_id;       // ML scheme base id (frozen, append-only)
     bool single_mode;  // preset ignored; id always uses preset slot 2
+    bool is_gpu;        // Compress()/Decompress() accept a CUDA device
+                         // pointer directly (stages its own H2D/D2H as
+                         // needed) -- callers with a device-resident buffer
+                         // must stage a host copy themselves for anything
+                         // NOT marked true here.
     MakeFn make;       // constructor, or nullptr if backend disabled
   };
 
@@ -315,6 +380,22 @@ class CompressionFactory {
   static std::unique_ptr<Compressor> MakeNvCompAns(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
     return std::make_unique<NvComp>(NvCompAlgo::ANS);
+#else
+    return nullptr;
+#endif
+  }
+  // Completes NeuroPress's 8-algorithm GPU action space (the other 6 are
+  // above): both single-mode like the other nvcomp lossless codecs.
+  static std::unique_ptr<Compressor> MakeNvCompCascaded(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::CASCADED);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompBitcomp(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::BITCOMP);
 #else
     return nullptr;
 #endif
@@ -399,29 +480,34 @@ class CompressionFactory {
    * only once per blob (in the factory setup path), never in the compress loop.
    */
   static const auto& Registry() {
-    //                                          name  wire base single  make
+    //                                          name  wire base single  gpu    make
     static constexpr std::array kRegistry = {
-        CompressorInfo{"brotli",      0,  6, false, &CreateLossless<BrotliWithModes>},
-        CompressorInfo{"bzip2",       1,  1, false, &CreateLossless<Bzip2WithModes>},
-        CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc},
-        CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip},
-        CompressorInfo{"lz4",         4,  3, false, &CreateLossless<Lz4WithModes>},
-        CompressorInfo{"lzma",        5,  5, false, &CreateLossless<LzmaWithModes>},
-        CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy},
-        CompressorInfo{"sz3",         7, 11, false, &MakeSz3},
-        CompressorInfo{"zfp",         8, 10, false, &MakeZfp},
-        CompressorInfo{"zlib",        9,  4, false, &CreateLossless<ZlibWithModes>},
-        CompressorInfo{"zstd",       10,  2, false, &CreateLossless<ZstdWithModes>},
-        CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4},
-        CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy},
-        CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd},
-        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate},
-        CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
-        CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
-        CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
-        CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
-        CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
-        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
+        CompressorInfo{"brotli",      0,  6, false, false, &CreateLossless<BrotliWithModes>},
+        CompressorInfo{"bzip2",       1,  1, false, false, &CreateLossless<Bzip2WithModes>},
+        CompressorInfo{"blosc2",      2,  8, true,  false, &MakeBlosc},
+        CompressorInfo{"fpzip",       3, 12, false, false, &MakeFpzip},
+        CompressorInfo{"lz4",         4,  3, false, false, &CreateLossless<Lz4WithModes>},
+        CompressorInfo{"lzma",        5,  5, false, false, &CreateLossless<LzmaWithModes>},
+        CompressorInfo{"snappy",      6,  7, true,  false, &MakeSnappy},
+        CompressorInfo{"sz3",         7, 11, false, false, &MakeSz3},
+        CompressorInfo{"zfp",         8, 10, false, false, &MakeZfp},
+        CompressorInfo{"zlib",        9,  4, false, false, &CreateLossless<ZlibWithModes>},
+        CompressorInfo{"zstd",       10,  2, false, false, &CreateLossless<ZstdWithModes>},
+        CompressorInfo{"nvcomp-lz4",      11, 13, true, true, &MakeNvCompLz4},
+        CompressorInfo{"nvcomp-snappy",   12, 14, true, true, &MakeNvCompSnappy},
+        CompressorInfo{"nvcomp-zstd",     13, 15, true, true, &MakeNvCompZstd},
+        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, true, &MakeNvCompGdeflate},
+        CompressorInfo{"nvcomp-deflate",  15, 17, true, true, &MakeNvCompDeflate},
+        CompressorInfo{"nvcomp-ans",      16, 18, true, true, &MakeNvCompAns},
+        // zfp-sycl targets SYCL/oneAPI devices, a separate device model from
+        // the CUDA/HIP one ctp::IsDevicePointer checks -- not safe to hand a
+        // CUDA-IPC device pointer directly, so it stays false here.
+        CompressorInfo{"zfp-sycl",        17, 19, false, false, &MakeSyclZfp},
+        CompressorInfo{"cusz",            18, 20, false, true, &MakeCusz},
+        CompressorInfo{"ndzip",           19, 21, true,  true, &MakeNdzip},
+        CompressorInfo{"cuszp",           20, 22, false, true, &MakeCuszp},
+        CompressorInfo{"nvcomp-cascaded", 21, 23, true, true, &MakeNvCompCascaded},
+        CompressorInfo{"nvcomp-bitcomp",  22, 24, true, true, &MakeNvCompBitcomp},
     };
     return kRegistry;
   }

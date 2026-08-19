@@ -103,6 +103,13 @@ nanobind.egg-info
 
 # Example and debug directories
 example.dir
+
+# NeuroPress example harnesses (issue #693). Kept on disk for local runs but
+# out of the branch: they are development and parity tooling, not part of the
+# integration. Their CMake entry points were removed with them, so a checkout
+# without these directories still configures.
+context-transfer-engine/adapter/hdf5_vol/example/
+context-transfer-engine/compressor/example/
 Win32/
 x64/
 Release/
@@ -140,8 +147,12 @@ external/boost/
 # (context-runtime/test/integration/chimaera_stop/run_tests.sh)
 external/jarvis-cd/
 
-# Model weights (large binaries)
+# Model weights (large binaries). NOT meant to catch source directories that
+# happen to be named "models/" (e.g. the compressor chimod's predictor
+# implementations) -- those are excluded below.
 models/
+!context-transfer-engine/compressor/include/clio_cte/compressor/models/
+!context-transfer-engine/compressor/src/models/
 
 # Submodules managed by .gitmodules
 #external/libzmq/

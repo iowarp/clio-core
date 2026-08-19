@@ -10,6 +10,7 @@
 
 #include <hdf5.h>
 #include <H5VLconnector.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,14 @@ typedef struct clio_vol_info_t {
     hid_t  under_vol_id;    /* VOL ID for the underlying connector */
     void  *under_vol_info;  /* Info for the underlying connector */
     size_t chunk_size;      /* Chunk size for async I/O (0 = default) */
+    /* Compressor chimod pool to route cacheable H5Dwrite/H5Dread through
+       (0,0) = unset -- writes go straight to the CTE core pool uncompressed,
+       exactly today's behavior. Mirrors clio::run::PoolId's null-pool
+       convention (major 0 means "no pool"), so a zero-initialized info
+       struct (the common case, e.g. this file's own makeFapl() helpers
+       before this field existed) still means "no compressor". */
+    uint32_t compressor_pool_major;
+    uint32_t compressor_pool_minor;
     int    cache_enabled;   /* CTE tier: CLIO_VOL_CACHE_{UNSET,ON,OFF} */
 } clio_vol_info_t;
 

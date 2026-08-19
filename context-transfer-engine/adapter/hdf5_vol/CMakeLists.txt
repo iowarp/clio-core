@@ -38,12 +38,26 @@ target_include_directories(clio_hdf5_vol PRIVATE
     ${HDF5_C_INCLUDE_DIRS}
 )
 
+# GPU-pointer passthrough (issue: apps writing/reading a device buffer through
+# H5Dwrite/H5Dread). ctp::cuda_cxx is an INTERFACE target that carries
+# CTP_ENABLE_CUDA=1 plus the real CUDA runtime; without it, gpu_api.h's
+# IsDevicePointer()/DeviceAwareMemcpy() compile down to their CPU-only
+# fallback (always false / always std::memcpy), same as mem_bdev_transport.cc.
+set(VOL_GPU_LIBS "")
+if(CLIO_CORE_ENABLE_CUDA)
+    list(APPEND VOL_GPU_LIBS ctp::cuda_cxx)
+elseif(CLIO_CORE_ENABLE_ROCM)
+    list(APPEND VOL_GPU_LIBS ctp::rocm_cxx)
+endif()
+
 target_link_libraries(clio_hdf5_vol
     clio_cte_core_client
     clio_cte_core_runtime
+    clio_cte_compressor_client
     clio::run::admin_runtime
     clio::run::admin_client
     clio::run::bdev_runtime
+    ${VOL_GPU_LIBS}
     clio::run::bdev_client
     ctp::cxx
     ${HDF5_LIBRARIES}
@@ -66,3 +80,12 @@ install(TARGETS clio_hdf5_vol
 )
 
 message(STATUS "HDF5 VOL adapter configured successfully")
+
+#------------------------------------------------------------------------------
+# Examples
+#------------------------------------------------------------------------------
+# The NeuroPress examples are kept out of the repository (see .gitignore), so
+# this is guarded: present in a working tree that has them, a no-op elsewhere.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/example/CMakeLists.txt)
+  add_subdirectory(example)
+endif()

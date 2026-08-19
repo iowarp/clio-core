@@ -537,7 +537,14 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # exposes the imported target nvcomp::nvcomp (which pulls in CUDA::cudart).
     set(CLIO_CTP_ENABLE_NVCOMP OFF)
     if(CLIO_CORE_ENABLE_CUDA)
-        find_package(nvcomp QUIET)
+        # The Debian/Ubuntu libnvcomp5-dev-cuda-12 package ships a real
+        # nvcomp-config.cmake, but installs it under a package-namespaced
+        # path (.../cmake/libnvcomp5-dev-cuda-12/nvcomp/) that is not on
+        # find_package's default search path, so the plain call below finds
+        # nothing on a fresh checkout even though nvcomp is fully installed.
+        # Hint the well-known apt location as a fallback search path.
+        find_package(nvcomp QUIET
+            HINTS /usr/lib/x86_64-linux-gnu/cmake/libnvcomp5-dev-cuda-12/nvcomp)
         if(nvcomp_FOUND)
             message(STATUS "found nvcomp ${nvcomp_VERSION} (GPU compression) - target nvcomp::nvcomp")
             set(CLIO_CTP_ENABLE_NVCOMP ON)
@@ -584,6 +591,28 @@ if(CLIO_CTE_ENABLE_COMPRESS)
             set(cusz_INCLUDE_DIRS ${CUSZ_INCLUDE_DIRS})
             set(CLIO_CTP_ENABLE_CUSZ ON)
             message(STATUS "found cuSZ via CMake config (GPU lossy compression)")
+
+            # cuSZ's exported CUSZ::psz_cu_compile_settings (an internal
+            # dependency of CUSZ::cusz) advertises INTERFACE_COMPILE_FEATURES
+            # "cxx_std_17;cuda_std_17" -- a CUDA-LANGUAGE compile feature.
+            # Because ctp::compress links cusz_LIBRARIES as INTERFACE, that
+            # requirement leaks transitively into every consumer of
+            # ctp::compress, including pure-C++ targets with zero .cu files
+            # of their own (e.g. context-assimilation-engine). Those targets
+            # never enable_language(CUDA), so CMake's generate-phase feature
+            # check for them fails with "No known features for CUDA
+            # compiler" -- a configure error unrelated to anything the
+            # failing target actually does. clio_ctp/compress/cusz.h only
+            # calls the CUDA *runtime API* from plain C++ (matching the
+            # CTP_ENABLE_CUDA -> <cuda_runtime_api.h> pattern used
+            # throughout this codebase); it is never compiled as CUDA
+            # language, so it needs cxx_std_17, not cuda_std_17. Strip the
+            # over-broad requirement at its source instead of working around
+            # it in every downstream consumer.
+            if(TARGET CUSZ::psz_cu_compile_settings)
+                set_target_properties(CUSZ::psz_cu_compile_settings PROPERTIES
+                    INTERFACE_COMPILE_FEATURES "cxx_std_17")
+            endif()
         else()
             find_path(cusz_INCLUDE_DIR cusz.h PATH_SUFFIXES cusz)
             find_library(cusz_LIBRARY NAMES cusz pszcuda cuszapi)

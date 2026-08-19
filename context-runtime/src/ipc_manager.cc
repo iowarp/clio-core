@@ -3896,7 +3896,9 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
   // (kServer mode), short-circuit the admin RegisterMemoryTask round-trip
   // and call gpu_ipc_->RegisterClientBackend directly. Otherwise send the
   // admin task over the wire so the runtime can register it on our behalf.
-  if (CLIO_RUNTIME_MANAGER->IsRuntime() && gpu_ipc_) {
+  const bool registered_in_process =
+      CLIO_RUNTIME_MANAGER->IsRuntime() && gpu_ipc_ != nullptr;
+  if (registered_in_process) {
     gpu::IpcManager::ClientBackend b;
     b.alloc_id = alloc_id;
     b.gpu_id = gpu_id;
@@ -3908,6 +3910,11 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     if (!gpu_ipc_->RegisterClientBackend(b)) {
       HLOG(kError, "AllocateAndRegisterGpuBackend: in-process register "
            "failed");
+      if (kind == gpu::IpcManager::MemKind::kPinnedHost) {
+        ctp::GpuApi::FreeHost(base);
+      } else {
+        ctp::GpuApi::Free(base);
+      }
       return result;
     }
   } else {
@@ -3926,13 +3933,54 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     }
     ctp::ipc::MemoryBackendId backend_id(alloc_id.major_, alloc_id.minor_);
     char ipc_handle_bytes[64] = {0};
-    std::memcpy(ipc_handle_bytes, &base, sizeof(char *));
+    if (kind == gpu::IpcManager::MemKind::kDeviceMem) {
+      // A cudaMalloc'd pointer VALUE is meaningless in another process's
+      // address space -- cudaIpcGetMemHandle() produces the actual
+      // portable, opaque handle another process can open with
+      // cudaIpcOpenMemHandle() to get a pointer valid in ITS OWN context.
+      // Sending the raw pointer bytes here (as the two host/UVM branches
+      // below correctly do, since those share host address space) would
+      // hand the receiving runtime process garbage.
+      ctp::GpuIpcMemHandle handle;
+      ctp::GpuApi::GetIpcMemHandle(handle, base);
+      static_assert(sizeof(handle) <= sizeof(ipc_handle_bytes),
+                    "GpuIpcMemHandle must fit in RegisterMemoryTask's "
+                    "64-byte ipc_handle_bytes_");
+      std::memcpy(ipc_handle_bytes, &handle, sizeof(handle));
+    } else {
+      // Pinned host / managed UVM: same address space as the runtime
+      // process (or accessible via UVM's unified addressing either way),
+      // so the raw pointer value itself is directly usable there.
+      std::memcpy(ipc_handle_bytes, &base, sizeof(char *));
+    }
 
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         backend_id, admin_kind, gpu_id, static_cast<u64>(bytes),
         ipc_handle_bytes);
-    IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp).Wait();
+    auto reg_future = IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp);
+    reg_future.Wait();
+    if (reg_future->GetReturnCode() != 0 || !reg_future->success_) {
+      HLOG(kError, "AllocateAndRegisterGpuBackend: remote RegisterMemory "
+           "failed (rc={}, success={})", reg_future->GetReturnCode(),
+           reg_future->success_);
+      if (kind == gpu::IpcManager::MemKind::kPinnedHost) {
+        ctp::GpuApi::FreeHost(base);
+      } else {
+        ctp::GpuApi::Free(base);
+      }
+      return result;
+    }
+  }
+
+  // Record what we handed out so FreeGpuBackend can release it. Registered
+  // AFTER both branches succeed, so a failed registration (which frees `base`
+  // itself above) never leaves a dangling entry behind.
+  {
+    u64 key = (static_cast<u64>(alloc_id.major_) << 32) |
+              static_cast<u64>(alloc_id.minor_);
+    std::lock_guard<std::mutex> lk(owned_gpu_backends_mutex_);
+    owned_gpu_backends_[key] = OwnedGpuBackend{base, kind, registered_in_process};
   }
 
   result = alloc_id;
@@ -3942,13 +3990,82 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
 
 void IpcManager::FreeGpuBackend(u32 gpu_id,
                                  const ctp::ipc::AllocatorId &alloc_id) {
+  // Take ownership of the record FIRST. Erasing under the lock is what makes
+  // this idempotent: a second FreeGpuBackend for the same id finds nothing and
+  // returns without freeing, so a double release cannot become a double free.
+  OwnedGpuBackend owned;
+  bool have_owned = false;
+  {
+    u64 key = (static_cast<u64>(alloc_id.major_) << 32) |
+              static_cast<u64>(alloc_id.minor_);
+    std::lock_guard<std::mutex> lk(owned_gpu_backends_mutex_);
+    auto it = owned_gpu_backends_.find(key);
+    if (it != owned_gpu_backends_.end()) {
+      owned = it->second;
+      owned_gpu_backends_.erase(it);
+      have_owned = true;
+    }
+  }
+
+  // Unregister before freeing, never after: once the memory is released, any
+  // resolve that still found this backend would hand out a dangling pointer.
   if (gpu_ipc_) {
     gpu_ipc_->UnregisterClientBackend(gpu_id, alloc_id);
   }
-  // The actual ctp::GpuApi::Free relies on caller-tracked metadata —
-  // the host caller passes the base back (out_base from
-  // AllocateAndRegisterGpuBackend) and frees through the same API. In a
-  // future iteration we could fold that bookkeeping into ClientBackend.
+
+  if (!have_owned || !owned.base) return;
+
+  // ---- CUDA IPC safety gate ----
+  //
+  // Only memory registered IN-PROCESS is ours alone to release. On that path
+  // RegisterClientBackend stored `b.device_ptr = base` directly: no IPC handle
+  // was exported and no other process holds a mapping, so cudaFree here is
+  // safe and is what closes the leak.
+  //
+  // The remote path is different in kind, not degree. There the runtime
+  // process imported this allocation with cudaIpcOpenMemHandle
+  // (admin_runtime.cc, kGpuDeviceMemory) and holds a live device pointer into
+  // it. Freeing under an open import is a cross-process use-after-free: the
+  // importer keeps a pointer the driver has already reclaimed. The correct
+  // sequence is importer-closes-then-exporter-frees, and the machinery for it
+  // does not exist yet — there is no DeregisterMemory task and no
+  // CloseIpcMemHandle call anywhere in this tree.
+  //
+  // So the remote case still leaks, deliberately, and says so once per process
+  // rather than silently. Closing it needs a DeregisterMemory round trip that
+  // makes the runtime cudaIpcCloseMemHandle before this returns.
+  if (!owned.in_process) {
+    // Tell the runtime to drop its import FIRST, then free. The round trip is
+    // synchronous on purpose: cudaFree-ing while the importer still holds a
+    // cudaIpcOpenMemHandle mapping is a cross-process use-after-free, so the
+    // ordering is a correctness requirement, not a tidiness one.
+    auto dereg_task = NewTask<clio::run::admin::DeregisterMemoryTask>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+        clio::run::PoolQuery::Local(), alloc_id, gpu_id);
+    auto fut = IpcCpu2CpuZmq::SendIn(this, dereg_task, IpcMode::kTcp);
+    fut.Wait();
+    const bool closed = (fut->GetReturnCode() == 0) && fut->success_;
+    if (!closed) {
+      // The importer may still hold the mapping; leaking is the safe failure.
+      static std::once_flag warned;
+      std::call_once(warned, [] {
+        HLOG(kWarning,
+             "FreeGpuBackend: DeregisterMemory failed; leaving the allocation "
+             "in place rather than freeing under a possibly-live import");
+      });
+      return;
+    }
+  }
+
+  // Release the allocation itself, dispatching on the kind it was allocated
+  // with — the same dispatch AllocateAndRegisterGpuBackend's own failure paths
+  // use. Without this the buffer leaked for the process lifetime: the
+  // registration entry went away and the device memory did not.
+  if (owned.kind == gpu::IpcManager::MemKind::kPinnedHost) {
+    ctp::GpuApi::FreeHost(owned.base);
+  } else {
+    ctp::GpuApi::Free(owned.base);
+  }
 }
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
