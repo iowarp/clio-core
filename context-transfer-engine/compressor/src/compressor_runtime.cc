@@ -613,8 +613,19 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       num_elements > 0 && neuropress_active && ctp::IsDevicePointer(chunk);
   if (np_device_path) {
     np_stream = ctp::DeviceStatsStream();
-    device_stats = ctp::ComputeDeviceStatsResident(chunk, num_elements,
-                                                   data_type, np_stream);
+    /* A device-resident float64 chunk is CONVERTED on the GPU, not
+       reinterpreted -- `data_type` above is pinned to FLOAT32 for the model's
+       normalisation, and applying that to doubles reads each one as two
+       float32 words whose low half is a NaN about one time in 256. Host and
+       device now agree, so the features a chunk gets no longer depend on which
+       memory the application happened to write it from. */
+    if (context.data_type_ == 2) {
+      device_stats = ctp::ComputeDeviceStatsResidentF32From64(
+          chunk, chunk_size / sizeof(double), np_stream);
+    } else {
+      device_stats = ctp::ComputeDeviceStatsResident(chunk, num_elements,
+                                                     data_type, np_stream);
+    }
   }
 
   // When the device path was the right one, it is the ONLY one. Computing the
@@ -624,13 +635,26 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // than substituting anything (a null d_stats_ptr gives
   // GPUCOMPRESS_ERROR_NN_NOT_LOADED, gpucompress_compress.cpp), so this
   // reports it and declines NeuroPress for the chunk.
+  /* Host path with NeuroPress: go through ComputeNeuroPressFeatures, which
+     honours the element type. `data_type` above is pinned to FLOAT32 for the
+     model's normalisation, and applying that to a float64 buffer relabels the
+     bytes instead of converting the values -- each double reads as two float32
+     words whose low half lands on the NaN encoding about one time in 256, so
+     MAD and the second derivative came back NaN for every chunk of every
+     float64 dataset and the model was handed NaN for two of its three inputs.
+     The other callers keep the plain factory call: they are not feeding
+     NeuroPress and their models were fit on Clio's own features. */
   const bool features_ok =
       np_device_path
           ? device_stats != nullptr
-          : (num_elements > 0 &&
-             ctp::ComputeCompressionFeatures(chunk, num_elements, data_type,
-                                             &entropy, &mad,
-                                             &second_derivative_mean));
+          : (neuropress_active
+                 ? ctp::ComputeNeuroPressFeatures(chunk, chunk_size,
+                                                  context.data_type_, &entropy,
+                                                  &mad, &second_derivative_mean)
+                 : (num_elements > 0 &&
+                    ctp::ComputeCompressionFeatures(chunk, num_elements,
+                                                    data_type, &entropy, &mad,
+                                                    &second_derivative_mean)));
   if (np_device_path && device_stats == nullptr) {
     HLOG(kError,
          "EstCompressionStats: device-resident statistics failed for a "
@@ -1537,9 +1561,16 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       // Same guard as EstCompressionStats: on a device-resident chunk whose
       // stats cannot be computed the values are zeros, and training on them
       // would teach the model that chunk was trivially compressible.
-      neuropress_feat_valid = ctp::ComputeCompressionFeatures(
-          chunk_data, feat_num_elements, feat_type, &neuropress_entropy,
-          &neuropress_mad, &neuropress_second_deriv);
+      /* Same call as inference above, for the same reason: training on
+         statistics read from a different interpretation of the bytes than the
+         prediction was made from teaches the model against an input it never
+         saw. On float64 those statistics were NaN, so every SGD step took a
+         NaN gradient. */
+      (void)feat_type;
+      (void)feat_num_elements;
+      neuropress_feat_valid = ctp::ComputeNeuroPressFeatures(
+          chunk_data, chunk_size, task->context_.data_type_,
+          &neuropress_entropy, &neuropress_mad, &neuropress_second_deriv);
     }
 
     // Defer the store when exploration may replace this pick. Exploration

@@ -8,6 +8,8 @@
 #ifndef HERMES_SHM_DATA_STATS_GPU_H
 #define HERMES_SHM_DATA_STATS_GPU_H
 
+#include <vector>
+
 #include "clio_ctp/compress/preprocess/data_stats.h"
 #include "clio_ctp/util/gpu_api.h"
 
@@ -104,6 +106,16 @@ const void *ComputeDeviceStatsResident(const void *device_data,
  * Train()'s samples; upstream reads its own the same way when it needs them
  * on the host (nn_gpu.cu's debug path, and the VOL's per-chunk diagnostics).
  */
+/**
+ * Device-resident float64 selection features: converts the chunk to float32 on
+ * the GPU and measures that, so a double chunk yields the same features
+ * whether it was written from host or device memory. Returns the same opaque
+ * stats handle ComputeDeviceStatsResident returns, or nullptr on failure.
+ */
+const void *ComputeDeviceStatsResidentF32From64(const void *device_data,
+                                                  size_t num_doubles,
+                                                  void *stream);
+
 bool ReadDeviceFeatureStats(const void *device_stats, double *out_entropy,
                             double *out_mad, double *out_second_derivative,
                             void *stream);
@@ -144,6 +156,70 @@ inline bool ComputeCompressionFeatures(const void *chunk, size_t num_elements,
   *out_second_derivative =
       DataStatisticsFactory::CalculateSecondDerivative(chunk, num_elements, type);
   return true;
+}
+
+
+/**
+ * Selection features for the NeuroPress model, honouring the element type.
+ *
+ * The model was normalised on FLOAT32 statistics, so everything it is shown
+ * has to arrive on that scale. Getting there by REINTERPRETING a float64
+ * buffer as float32 does not do that -- it relabels the bytes instead of
+ * converting the numbers. Each double is then read as two float32 words, and
+ * the low word is pure mantissa: about one time in 256 its top bits land on
+ * IEEE-754's reserved exponent==255, which IS the NaN encoding. NaN
+ * propagates through the mean, so MAD and the second derivative came back NaN
+ * for every chunk of every float64 dataset, and the model -- handed NaN for
+ * two of its three inputs -- returned a constant prediction. Measured on a
+ * 4 MiB LAMMPS chunk: 2212 NaN words of 1048576, and a predicted ratio
+ * identical to five significant figures across 249 chunks whose real ratios
+ * spanned 0.995x to 2.80x.
+ *
+ * A float64 buffer is therefore CONVERTED: the values are downcast to float32
+ * and the statistics computed on those, which is the same physical data on the
+ * scale the model expects. Entropy is unaffected either way (it is a byte
+ * histogram and never interprets a float), but it is computed from the same
+ * downcast array so all three features describe one representation.
+ *
+ * @param chunk       host- or device-resident chunk
+ * @param chunk_bytes size of the chunk in BYTES (not elements)
+ * @param data_type   Context::data_type_ -- 1 float32, 2 float64, else opaque
+ */
+inline bool ComputeNeuroPressFeatures(const void *chunk, size_t chunk_bytes,
+                                        int data_type, double *out_entropy,
+                                        double *out_mad,
+                                        double *out_second_derivative) {
+  if (chunk == nullptr || chunk_bytes == 0) return false;
+
+  /* Float64 on the GPU: convert there and read the result back, so a double
+     chunk gets the same features wherever it lives. */
+  if (data_type == 2 && IsDevicePointer(chunk)) {
+    const size_t n = chunk_bytes / sizeof(double);
+    if (n == 0) return false;
+    const void *stats = ComputeDeviceStatsResidentF32From64(chunk, n, nullptr);
+    if (stats == nullptr) return false;
+    return ReadDeviceFeatureStats(stats, out_entropy, out_mad,
+                                  out_second_derivative, nullptr);
+  }
+
+  /* Float64, host-resident: convert, then measure. */
+  if (data_type == 2 && !IsDevicePointer(chunk)) {
+    const size_t n = chunk_bytes / sizeof(double);
+    if (n == 0) return false;
+    const double *src = static_cast<const double *>(chunk);
+    std::vector<float> narrowed(n);
+    for (size_t i = 0; i < n; ++i) {
+      narrowed[i] = static_cast<float>(src[i]);
+    }
+    return ComputeCompressionFeatures(narrowed.data(), n, DataType::FLOAT32,
+                                      out_entropy, out_mad,
+                                      out_second_derivative);
+  }
+
+  const size_t n = chunk_bytes / sizeof(float);
+  if (n == 0) return false;
+  return ComputeCompressionFeatures(chunk, n, DataType::FLOAT32, out_entropy,
+                                    out_mad, out_second_derivative);
 }
 
 }  // namespace ctp

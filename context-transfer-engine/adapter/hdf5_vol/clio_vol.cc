@@ -1613,10 +1613,23 @@ static bool clio_is_collective(hid_t dxpl_id) {
  * one: it fed the selection model a char one-hot for every float chunk the
  * VOL wrote.
  */
+/* Context::data_type_ for a dataset's element type: 1 float32, 2 float64,
+   0 anything else (opaque bytes as far as the selection model is concerned).
+
+   float64 used to report 0, which the compressor could not distinguish from
+   "unknown" -- so it fell back to reading the buffer as float32, relabelling
+   the bytes rather than converting the values. Roughly one float32 word in 256
+   built that way is an IEEE-754 NaN, which propagated through the mean and
+   left the model with NaN for two of its three input features on EVERY
+   float64 dataset. Since h5md, openPMD and AMReX all write float64, that was
+   most real data. */
 static int clio_context_data_type(hid_t type_id) {
   if (type_id < 0) return 0;
   if (H5Tget_class(type_id) != H5T_FLOAT) return 0;
-  return (H5Tget_size(type_id) == 4) ? 1 : 0;
+  const size_t sz = H5Tget_size(type_id);
+  if (sz == 4) return 1;
+  if (sz == 8) return 2;
+  return 0;
 }
 
 static bool clio_type_is_cacheable(hid_t type_id) {

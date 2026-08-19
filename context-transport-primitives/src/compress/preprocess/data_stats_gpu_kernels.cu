@@ -224,6 +224,30 @@ __global__ void EntropyFromHistKernel(const unsigned int *__restrict__ histogram
  * EntropyFromHistKernel writes it straight into the struct, the same way
  * upstream's entropy kernel writes into `&d_stats->entropy`.
  */
+/* Convert a float64 chunk to float32 in place of reinterpreting it.
+ *
+ * The distinction is the entire bug this exists to fix: reinterpreting keeps
+ * the bits and changes their meaning, so each double is read as two float32
+ * words and the low word -- pure mantissa -- lands on IEEE-754's reserved
+ * exponent==255 (a NaN) about one time in 256. Converting keeps the meaning
+ * and changes the bits, which is what the model was normalised against.
+ *
+ * Native float64 statistics were the obvious alternative and are wrong here:
+ * MAD and the second derivative come out identical either way (they measure
+ * values, so precision is irrelevant -- 37.731005 vs 37.731004 on a real
+ * chunk), but entropy is a BYTE histogram and shifts by 0.58 bits (6.8747 vs
+ * 6.2985) because a double spends eight bytes where a float spends four. The
+ * model has only ever seen the four-byte distribution. */
+__global__ void DowncastF64ToF32Kernel(const double *__restrict__ in,
+                                        float *__restrict__ out,
+                                        size_t num_elements) {
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elements;
+       i += stride) {
+    out[i] = static_cast<float>(in[i]);
+  }
+}
+
 __global__ void FinalizeFeatureStatsKernel(const double *__restrict__ scalars,
                                             size_t num_elements,
                                             DeviceFeatureStats *__restrict__ out) {
@@ -254,6 +278,11 @@ struct DeviceStatsScratch {
   unsigned int *d_hist = nullptr;
   double *d_scalars = nullptr;  // [sum, sum_abs_d2, sum_abs_dev]
   DeviceFeatureStats *d_stats = nullptr;
+  /* Narrowed copy of a float64 chunk, grown on demand and reused. See
+     ComputeDeviceStatsResidentF32From64: the model is normalised on float32
+     statistics, so a double chunk is CONVERTED before it is measured. */
+  float *d_narrow = nullptr;
+  size_t narrow_capacity = 0;
   bool ok = false;
 };
 
@@ -409,6 +438,49 @@ bool ComputeDeviceStats(const void *device_data, size_t num_elements,
 void *DeviceStatsStream() {
   DeviceStatsScratch &s = Scratch();
   return s.ok ? static_cast<void *>(s.stream) : nullptr;
+}
+
+/* Device-resident float64: convert to float32 on the GPU, then measure that.
+ *
+ * Same treatment the host path applies, so a chunk gets the same features
+ * wherever it happens to live -- otherwise the model's input would depend on
+ * whether the application wrote from host or device memory, which is not a
+ * property of the data at all.
+ *
+ * The narrowed buffer is scratch, grown on demand and reused across chunks;
+ * it costs half the chunk's size in device memory. Returns the same opaque
+ * stats pointer the float32 path returns, so callers are unchanged. */
+const void *ComputeDeviceStatsResidentF32From64(const void *device_data,
+                                                  size_t num_doubles,
+                                                  void *stream) {
+  DeviceStatsScratch &s = Scratch();
+  if (!s.ok || device_data == nullptr || num_doubles == 0) return nullptr;
+  cudaStream_t st = stream ? static_cast<cudaStream_t>(stream) : s.stream;
+
+  if (s.narrow_capacity < num_doubles) {
+    if (s.d_narrow != nullptr) cudaFree(s.d_narrow);
+    s.d_narrow = nullptr;
+    s.narrow_capacity = 0;
+    if (cudaMalloc(&s.d_narrow, num_doubles * sizeof(float)) != cudaSuccess) {
+      /* Out of device memory for the scratch: report failure rather than fall
+         back to reinterpreting, which is the defect this replaces. */
+      s.d_narrow = nullptr;
+      return nullptr;
+    }
+    s.narrow_capacity = num_doubles;
+  }
+
+  const int block = 256;
+  const int grid = static_cast<int>(
+      (num_doubles + block - 1) / block > 65535
+          ? 65535
+          : (num_doubles + block - 1) / block);
+  DowncastF64ToF32Kernel<<<grid, block, 0, st>>>(
+      static_cast<const double *>(device_data), s.d_narrow, num_doubles);
+  if (cudaGetLastError() != cudaSuccess) return nullptr;
+
+  return ComputeDeviceStatsResident(static_cast<const void *>(s.d_narrow),
+                                    num_doubles, DataType::FLOAT32, stream);
 }
 
 const void *ComputeDeviceStatsResident(const void *device_data,

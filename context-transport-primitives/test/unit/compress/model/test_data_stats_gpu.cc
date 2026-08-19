@@ -13,6 +13,7 @@
  */
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "basic_test.h"
@@ -107,6 +108,64 @@ TEST_CASE("ComputeCompressionFeatures auto-dispatches device vs host, "
                     double *m, double *d2) {
                    ctp::ComputeCompressionFeatures(d, n, t, e, m, d2);
                  });
+}
+
+
+/* Selection features on float64 input (issue #693 follow-up).
+ *
+ * The defect was not that DataStatisticsFactory cannot do float64 -- it can,
+ * and always could. It was that the NeuroPress path never asked it to: the
+ * element type was pinned to FLOAT32 to match the model's normalisation, which
+ * turned a float64 buffer into a REINTERPRET rather than a CONVERT. Each
+ * double then reads as two float32 words, and the low word -- pure mantissa --
+ * lands on IEEE-754's reserved exponent==255 about one time in 256. Those
+ * words ARE NaN, NaN propagates through the mean, and MAD and the second
+ * derivative came back NaN for every chunk of every float64 dataset.
+ *
+ * So this asserts on ComputeNeuroPressFeatures, the call the runtime actually
+ * makes, and pins BOTH sides of it: declared float64 must produce finite
+ * statistics, and the same bytes declared float32 must still reproduce the old
+ * NaN -- otherwise the test would pass on data that never had the problem.
+ *
+ * The values are built so the low half of each double is exactly such a word.
+ * Computed on the doubles themselves the statistics are entirely ordinary. */
+TEST_CASE("Float64 selection features are finite, not NaN") {
+  /* Real, varied coordinates -- then the LOW 32 bits of each are forced to a
+     float32 NaN pattern. The high word is untouched, so every value stays a
+     perfectly ordinary double near 100, and they differ enough to survive a
+     downcast (differing only in the low mantissa would downcast to one float
+     and give a legitimately zero MAD, which tests nothing). */
+  std::vector<double> data;
+  data.reserve(4096);
+  for (int i = 0; i < 4096; ++i) {
+    double v = 100.0 + i * 0.01;
+    uint64_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    bits = (bits & 0xFFFFFFFF00000000ull) | 0x7FFE0000ull | (uint64_t)(i & 0xFFFF);
+    double d;
+    std::memcpy(&d, &bits, sizeof(d));
+    data.push_back(d);
+  }
+  const size_t bytes = data.size() * sizeof(double);
+  for (double d : data) REQUIRE(std::isfinite(d));
+
+  /* Declared float64: converted, so the statistics describe real values. */
+  double entropy = 0.0, mad = 0.0, second = 0.0;
+  REQUIRE(ctp::ComputeNeuroPressFeatures(data.data(), bytes, /*data_type=*/2,
+                                         &entropy, &mad, &second));
+  REQUIRE(std::isfinite(entropy));
+  REQUIRE(std::isfinite(mad));
+  REQUIRE(std::isfinite(second));
+  REQUIRE(mad > 0.0);
+
+  /* The same bytes declared float32: reinterpreted, and the NaN is back. This
+     is the behaviour every float64 write used to get, kept here so the test
+     cannot pass by accident on data that was never affected. */
+  double e2 = 0.0, m2 = 0.0, s2 = 0.0;
+  REQUIRE(ctp::ComputeNeuroPressFeatures(data.data(), bytes, /*data_type=*/1,
+                                         &e2, &m2, &s2));
+  REQUIRE(std::isnan(m2));
+  REQUIRE(std::isnan(s2));
 }
 
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
