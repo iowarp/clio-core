@@ -213,12 +213,17 @@ class Client : public clio::cte::core::Client {
       const clio::cte::core::TagId &tag_id, const std::string &blob_name,
       clio::run::u64 offset, clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data,
       float score, const clio::cte::core::Context &context,
-      clio::run::u32 flags, const clio::run::PoolId &core_pool_id) {
+      clio::run::u32 flags, const clio::run::PoolId &core_pool_id,
+      // Compress and measure without storing, handing the bytes back through
+      // the task's stored_* fields for the caller to put once. See
+      // CompressTask::no_store_. LOCAL CALLS ONLY -- the handoff is a pointer
+      // plus an allocator id, which mean nothing in another address space.
+      bool no_store = false) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<CompressTask>(
         clio::run::CreateTaskId(), compressor_pool_id_, pool_query, tag_id,
         blob_name, offset, size, blob_data, score, context, flags,
-        core_pool_id);
+        core_pool_id, no_store);
     return ipc_manager->Send(task);
   }
 

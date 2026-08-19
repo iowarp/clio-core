@@ -469,9 +469,48 @@ struct CompressTask : public clio::run::Task {
   INOUT Context context_;                 // Context for compression control and statistics
   IN clio::run::u32 flags_;                     // Operation flags
   IN clio::run::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
+  /**
+   * Compress and MEASURE, but do not store.
+   *
+   * Set by DynamicSchedule when exploration is on. Exploration only learns
+   * which codec wins by compressing alternatives and comparing them against
+   * the primary's measured cost, so the primary has to run -- but storing it
+   * first means a winner is written over the top, and PutBlob overwrites
+   * bytes without shortening a blob that was already longer. The rejected
+   * candidate's footprint stays allocated (4-9x measured), and the two writes
+   * leave two WAL records for one blob, which a shard-sequential replay can
+   * apply out of order.
+   *
+   * With this set, Compress hands the bytes back through stored_* below and
+   * the caller performs exactly one PutBlob once the winner is known -- which
+   * is also what upstream effectively does, having no blob store: a winner
+   * simply overwrites the primary in the caller's output buffer.
+   */
+  IN bool no_store_;
 
   // Output fields
   OUT float tier_score_;                  // Selected tier score (0-1, normalized)
+  /**
+   * no_store_ only. The compressed image (header + payload) and its length.
+   *
+   * OWNERSHIP TRANSFERS TO THE CALLER. stored_gpu_alloc_ is non-null when the
+   * bytes live in device memory (Compress keeps its output on the device
+   * whenever the input chunk is device-resident); the caller must then
+   * FreeGpuBackend it, and FreeBuffer the host SHM otherwise. Compress's own
+   * device-scratch guard deliberately releases its claim on this one
+   * allocation so it is not freed out from under the caller.
+   */
+  OUT ctp::ipc::ShmPtr<> stored_data_;
+  OUT clio::run::u64 stored_size_;
+  OUT ctp::ipc::AllocatorId stored_gpu_alloc_;
+  /**
+   * Whether the caller must free stored_data_.
+   *
+   * False when the codec did not beat the input: the bytes to store are then
+   * the caller's ORIGINAL buffer, handed straight back, and freeing it would
+   * destroy memory this task never allocated.
+   */
+  OUT bool stored_owned_;
 
   // SHM constructor
   CompressTask()
@@ -479,7 +518,9 @@ struct CompressTask : public clio::run::Task {
         blob_name_(CTP_MALLOC), offset_(0), size_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()), score_(0.5f),
         context_(), flags_(0), core_pool_id_(clio::run::PoolId::GetNull()),
-        tier_score_(0.0f) {}
+        no_store_(false), tier_score_(0.0f),
+        stored_data_(ctp::ipc::ShmPtr<>::GetNull()), stored_size_(0),
+        stored_gpu_alloc_(), stored_owned_(false) {}
 
   // Emplace constructor
   explicit CompressTask(const clio::run::TaskId &task_id,
@@ -491,12 +532,15 @@ struct CompressTask : public clio::run::Task {
                         ctp::ipc::ShmPtr<> blob_data,
                         float score, const Context &context,
                         clio::run::u32 flags,
-                        const clio::run::PoolId &core_pool_id)
+                        const clio::run::PoolId &core_pool_id,
+                        bool no_store = false)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kCompress),
         tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name),
         offset_(offset), size_(size), blob_data_(blob_data), score_(score),
         context_(context), flags_(flags), core_pool_id_(core_pool_id),
-        tier_score_(0.0f) {}
+        no_store_(no_store), tier_score_(0.0f),
+        stored_data_(ctp::ipc::ShmPtr<>::GetNull()), stored_size_(0),
+        stored_gpu_alloc_(), stored_owned_(false) {}
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
@@ -514,7 +558,12 @@ struct CompressTask : public clio::run::Task {
     context_ = other->context_;
     flags_ = other->flags_;
     core_pool_id_ = other->core_pool_id_;
+    no_store_ = other->no_store_;
     tier_score_ = other->tier_score_;
+    stored_data_ = other->stored_data_;
+    stored_size_ = other->stored_size_;
+    stored_gpu_alloc_ = other->stored_gpu_alloc_;
+    stored_owned_ = other->stored_owned_;
   }
 
   /** Serialize */
@@ -522,13 +571,18 @@ struct CompressTask : public clio::run::Task {
   void SerializeStart(Ar &ar) {
     task_serialize<Ar>(ar);
     ar(tag_id_, blob_name_, offset_, size_, score_, context_, flags_,
-       core_pool_id_, tier_score_);
+       core_pool_id_, no_store_, tier_score_);
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
   /** Deserialize */
   template <typename Ar>
   void SerializeEnd(Ar &ar) {
+    // stored_* are deliberately NOT serialized. They hand a buffer's OWNERSHIP
+    // to the caller, which only means anything in-process -- a pointer and an
+    // allocator id carried to another address space would name memory the
+    // receiver cannot free. no_store_ is only ever set on the local
+    // DynamicSchedule -> Compress call, so this never crosses a boundary.
     ar(blob_name_, context_, tier_score_);
   }
 };

@@ -1542,17 +1542,64 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           &neuropress_mad, &neuropress_second_deriv);
     }
 
-    // Now call Compress to perform compression and PutBlob
+    // Defer the store when exploration may replace this pick. Exploration
+    // needs the primary MEASURED to have something to beat, but storing it
+    // first means a winner is written over the top: PutBlob overwrites bytes
+    // without shortening a longer blob, so the rejected candidate's footprint
+    // stays allocated, and one blob ends up with two WAL records that a
+    // shard-sequential replay can apply out of order. With the store deferred
+    // there is exactly one put per blob, made once the winner is known.
+    //
+    // Only when exploration is actually on. With it off there is nothing that
+    // could replace the pick, so the ordinary single-put path stands and this
+    // costs nothing.
+    const bool defer_store = config_.neuropress_exploration_enabled_;
+    // Set when the exploration block below performs the one put. If it never
+    // adopts anything, the primary still has to be stored -- see the fallback
+    // after that block.
+    bool stored_by_exploration = false;
+
+    // Now call Compress to perform compression (and PutBlob unless deferred)
     auto compress_task = client_.AsyncCompress(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
         task->offset_, task->size_, task->blob_data_, task->score_, context,
-        task->flags_, task->core_pool_id_);
+        task->flags_, task->core_pool_id_, defer_store);
     CLIO_CO_AWAIT(compress_task);
 
     // Copy results back
     task->context_ = compress_task->context_;
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
+
+    // The primary's image, held unstored while exploration runs. Freed by
+    // PrimaryImage's destructor on every exit -- including the exception path,
+    // which is why it is a guard and not a pair of locals.
+    struct PrimaryImage {
+      ctp::ipc::ShmPtr<> data = ctp::ipc::ShmPtr<>::GetNull();
+      clio::run::u64 size = 0;
+      ctp::ipc::AllocatorId gpu_alloc;
+      bool owned = false;
+      bool valid() const { return size != 0 && !data.IsNull(); }
+      void release() {
+        if (!owned) { data = ctp::ipc::ShmPtr<>::GetNull(); size = 0; return; }
+        if (!gpu_alloc.IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, gpu_alloc);
+          gpu_alloc = ctp::ipc::AllocatorId();
+        } else if (!data.IsNull()) {
+          CLIO_IPC->FreeBuffer(CLIO_IPC->ToFullPtr<char>(
+              data.template Cast<char>()));
+        }
+        data = ctp::ipc::ShmPtr<>::GetNull();
+        size = 0;
+      }
+      ~PrimaryImage() { release(); }
+    } primary_image;
+    if (defer_store) {
+      primary_image.data = compress_task->stored_data_;
+      primary_image.size = compress_task->stored_size_;
+      primary_image.gpu_alloc = compress_task->stored_gpu_alloc_;
+      primary_image.owned = compress_task->stored_owned_;
+    }
 
     // Record what the model chose for this chunk, before the online-learning
     // and exploration blocks below can adopt an alternative. Not gated on
@@ -2356,36 +2403,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                      "the primary's stored result",
                      winner_rc);
               } else {
-                // Shrink the blob to what the winner actually needs. PutBlob
-                // overwrites the bytes but does not shorten a blob that was
-                // already longer, so adopting a winner smaller than the
-                // primary left the difference allocated and unreadable: the
-                // blob kept the PRIMARY's length while holding the WINNER's
-                // payload. Measured on a best-mode run, gdeflate primaries of
-                // 331868/438580/438772 bytes stayed exactly that size around
-                // 36936-byte bitcomp payloads -- 4-9x the space, and every
-                // ratio computed from the tier was wrong by that factor.
-                //
-                // Truncating to winner_total keeps the header's own bound
-                // check intact: PayloadSize() rejects a record whose
-                // header+payload exceeds the physical size, and after this
-                // they are equal by construction.
-                auto winner_trunc = core_client_->AsyncTruncateBlob(
-                    task->tag_id_, task->blob_name_.str(), winner_total,
-                    clio::run::PoolQuery::Local());
-                CLIO_CO_AWAIT(winner_trunc);
-                if (winner_trunc->return_code_ != 0) {
-                  // Not fatal: the blob still holds the winner's bytes and
-                  // reads correctly, it just occupies more room than it
-                  // needs. Worth saying so rather than silently over-
-                  // reporting the ratio.
-                  HLOG(kWarning,
-                       "NeuroPress explore: adopted a smaller winner for '{}' "
-                       "but could not shrink the blob to {} bytes (rc={}); it "
-                       "still occupies the primary's footprint",
-                       task->blob_name_.str(), winner_total,
-                       winner_trunc->return_code_);
-                }
+                stored_by_exploration = true;
                 task->context_ = winner_ctx;
                 task->context_.actual_original_size_ = chunk_size;
                 task->context_.actual_compressed_size_ = winner_total;
@@ -2509,6 +2527,29 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               : "(EXPLORATION OVERRODE THE PRIMARY)");
     }
 #endif
+
+    // The one put, when exploration did not make it. Reaching here with a
+    // deferred image means either exploration never ran for this chunk (below
+    // its threshold) or it ran and nothing beat the primary -- in both cases
+    // the primary's bytes are the answer and nothing has stored them yet.
+    if (defer_store && !stored_by_exploration && primary_image.valid()) {
+      auto primary_put = core_client_->AsyncPutBlob(
+          task->tag_id_, task->blob_name_.str(), task->offset_,
+          primary_image.size, primary_image.data, task->score_,
+          task->context_, task->flags_, clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(primary_put);
+      if (primary_put->return_code_ != 0) {
+        // Nothing else stored this blob, so unlike a failed exploration put
+        // there is no earlier copy to fall back on: the chunk is simply not
+        // in the tier and the caller has to know.
+        HLOG(kError,
+             "DynamicSchedule: deferred store of '{}' failed (rc={}); the "
+             "chunk was compressed but is NOT in the tier",
+             task->blob_name_.str(), primary_put->return_code_);
+        task->return_code_ = primary_put->return_code_;
+      }
+    }
+    primary_image.release();
 
   } catch (const std::exception& e) {
     HLOG(kError, "Exception in DynamicSchedule: {}", e.what());
@@ -2981,17 +3022,43 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       context.transform_flags_ |= clio::cte::core::kBlobTransformed |
                                   clio::cte::core::kBlobTransformCompressed;
 
-      // Call PutBlob with header + compressed data
-      auto put_task = core_client_->AsyncPutBlob(
-          task->tag_id_, task->blob_name_.str(), task->offset_,
-          total_stored_size, compressed_shm_ptr, task->score_, context,
-          task->flags_, clio::run::PoolQuery::Local());
-      CLIO_CO_AWAIT(put_task);
+      int stored_put_rc = 0;
+      if (task->no_store_) {
+        // Hand the image to the caller instead of storing it, so exploration
+        // can compare candidates and write the winner exactly once. See
+        // CompressTask::no_store_ for why storing here first is the thing
+        // being avoided.
+        //
+        // Ownership moves with the pointer. On the device path the buffer is
+        // one of the three allocations device_scratch frees on every exit, so
+        // release its claim by nulling the id it watches -- otherwise the
+        // guard would free the bytes the caller is about to store. On the host
+        // path simply skip the FreeBuffer below.
+        task->stored_data_ = compressed_shm_ptr;
+        task->stored_size_ = total_stored_size;
+        task->stored_owned_ = true;
+        if (output_on_device) {
+          task->stored_gpu_alloc_ = device_output_alloc_id;
+          device_output_alloc_id = ctp::ipc::AllocatorId();
+        } else {
+          task->stored_gpu_alloc_ = ctp::ipc::AllocatorId();
+        }
+        task->context_ = context;
+        task->return_code_ = 0;
+      } else {
+        // Call PutBlob with header + compressed data
+        auto put_task = core_client_->AsyncPutBlob(
+            task->tag_id_, task->blob_name_.str(), task->offset_,
+            total_stored_size, compressed_shm_ptr, task->score_, context,
+            task->flags_, clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(put_task);
+        stored_put_rc = put_task->return_code_;
 
-      // Device allocations belong to device_scratch above, which releases
-      // them on every exit; only the host SHM buffer is freed here.
-      if (!output_on_device) {
-        CLIO_IPC->FreeBuffer(compressed_shm);
+        // Device allocations belong to device_scratch above, which releases
+        // them on every exit; only the host SHM buffer is freed here.
+        if (!output_on_device) {
+          CLIO_IPC->FreeBuffer(compressed_shm);
+        }
       }
 
       // Log compression telemetry
@@ -3009,7 +3076,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
            compress_time);
 
       task->context_ = context;
-      task->return_code_ = put_task->return_code_;
+      // The no-store branch already set its own return code; put_task only
+      // exists on the storing branch.
+      if (!task->no_store_) task->return_code_ = stored_put_rc;
     } else {
       // Compression failed or didn't reduce size - store original data
       HLOG(kDebug, "Compression not beneficial, storing original data");
@@ -3021,6 +3090,23 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // half of why compress_lib_ cannot be trusted as a transform signal
       // (issue #818). transform_flags_ is deliberately left unset here.
       context.compress_lib_ = 0;
+
+      if (task->no_store_) {
+        // Same deferral as the compressed path, and for the same reason: an
+        // exploration winner must not be written over an already-stored blob.
+        // The bytes here are the CALLER'S original buffer, so hand it back
+        // unowned -- freeing it would destroy memory this task never
+        // allocated. Without this branch the raw image was stored anyway and
+        // a later winner left the full uncompressed footprint behind, which
+        // is exactly the case the regression test caught.
+        task->stored_data_ = task->blob_data_;
+        task->stored_size_ = task->size_;
+        task->stored_gpu_alloc_ = ctp::ipc::AllocatorId();
+        task->stored_owned_ = false;
+        task->context_ = context;
+        task->return_code_ = 0;
+        CLIO_CO_RETURN;
+      }
 
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
