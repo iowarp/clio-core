@@ -106,10 +106,17 @@ if(NOT WIN32)
   add_test(NAME cte_hdf5_vol_io_passthrough
       COMMAND test_hdf5_vol_io "HDF5 VOL IO - Passthrough callbacks")
 
+  # Appends are how real simulation writers emit HDF5 (LAMMPS h5md, openPMD,
+  # AMReX), and until this was supported every such write bypassed the tier
+  # entirely -- registered here so that cannot regress unnoticed.
+  add_test(NAME cte_hdf5_vol_io_append
+      COMMAND test_hdf5_vol_io "HDF5 VOL IO - Appended frames populate the linear cache")
+
   set_tests_properties(
       cte_hdf5_vol_io_dataset
       cte_hdf5_vol_io_groups_attrs
       cte_hdf5_vol_io_passthrough
+      cte_hdf5_vol_io_append
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"

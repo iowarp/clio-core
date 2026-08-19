@@ -32,6 +32,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -538,6 +539,112 @@ TEST_CASE("HDF5 VOL IO - A missing chunk is a miss, not garbage",
   // on whatever the recycled buffer happened to hold; this is the part that
   // actually distinguishes "detected the hole" from "got lucky".
   REQUIRE(cteBlobSize(path, "data/chunk_0") == 0);
+
+  REQUIRE(H5Dclose(dset2) >= 0);
+  REQUIRE(H5Fclose(file2) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+TEST_CASE("HDF5 VOL IO - Appended frames populate the linear cache",
+          "[hdf5_vol][io][append]") {
+  // The append pattern every real simulation writer uses: an extensible
+  // dataset that grows by one frame per timestep, each frame written as a
+  // hyperslab. LAMMPS' h5md dump, openPMD and AMReX HDF5 all emit exactly
+  // this, and none of them can be changed to write whole datasets instead.
+  //
+  // Before append support the write gate demanded mem_space AND file_space be
+  // literally H5S_ALL, so every one of these writes fell through to the native
+  // VOL and NOTHING was ever staged -- a stock LAMMPS run produced 50 VOL
+  // intercepts and an empty tier.
+  //
+  // Frame size is deliberately NOT a multiple of the chunk size (1500 ints =
+  // 6000 B against 4096 B chunks), so every frame straddles a chunk boundary
+  // and no frame boundary coincides with a chunk boundary. A staging scheme
+  // that only handled frame-aligned appends would pass a friendlier size and
+  // still leave holes here.
+  hid_t vol_id = setupVolEnvironment();
+  hid_t fapl = makeFapl(vol_id);
+
+  const std::string path = "/tmp/clio_vol_io_append.h5";
+  std::remove(path.c_str());
+
+  constexpr size_t kFrameElems = 1500;           // 6000 bytes
+  constexpr size_t kFrames = 4;                  // 24000 bytes total
+  constexpr size_t kTotalBytes = kFrameElems * kFrames * sizeof(int);
+  constexpr size_t kChunk = 4096;                // set by setupVolEnvironment
+
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  REQUIRE(file >= 0);
+
+  hsize_t dims[2] = {0, kFrameElems};
+  hsize_t maxdims[2] = {H5S_UNLIMITED, kFrameElems};
+  hid_t space = H5Screate_simple(2, dims, maxdims);
+  REQUIRE(space >= 0);
+  hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+  hsize_t cdims[2] = {1, kFrameElems};
+  REQUIRE(H5Pset_chunk(dcpl, 2, cdims) >= 0);
+  hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space,
+                          H5P_DEFAULT, dcpl, H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+
+  std::vector<int> all(kFrameElems * kFrames);
+  for (size_t f = 0; f < kFrames; ++f) {
+    // Extend by one frame, then select just that frame -- h5md_extend_by_one
+    // followed by H5Sselect_hyperslab, the same order ch5md uses.
+    hsize_t newdims[2] = {f + 1, kFrameElems};
+    REQUIRE(H5Dset_extent(dset, newdims) >= 0);
+
+    std::vector<int> frame(kFrameElems);
+    for (size_t i = 0; i < kFrameElems; ++i) {
+      frame[i] = static_cast<int>(f * 100000 + i);
+      all[f * kFrameElems + i] = frame[i];
+    }
+
+    hid_t fspace = H5Dget_space(dset);
+    hsize_t start[2] = {f, 0};
+    hsize_t count[2] = {1, kFrameElems};
+    REQUIRE(H5Sselect_hyperslab(fspace, H5S_SELECT_SET, start, nullptr,
+                                count, nullptr) >= 0);
+    hsize_t mdims[1] = {kFrameElems};
+    hid_t mspace = H5Screate_simple(1, mdims, nullptr);
+    REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, mspace, fspace, H5P_DEFAULT,
+                     frame.data()) >= 0);
+    H5Sclose(mspace);
+    H5Sclose(fspace);
+  }
+
+  REQUIRE(H5Dclose(dset) >= 0);  // drains the async puts
+  H5Pclose(dcpl);
+  H5Sclose(space);
+  REQUIRE(H5Fclose(file) >= 0);
+
+  // Every chunk of the linear image is present and holds exactly its own
+  // bytes -- including the ones no single frame covered end to end. Checking
+  // the total alone would pass a scheme that staged the interior and dropped
+  // both boundary chunks, which is the failure mode that matters here.
+  const size_t num_chunks = (kTotalBytes + kChunk - 1) / kChunk;
+  size_t cached_total = 0;
+  for (size_t i = 0; i < num_chunks; ++i) {
+    const size_t expect = std::min(kChunk, kTotalBytes - i * kChunk);
+    const std::string blob = "data/chunk_" + std::to_string(i);
+    REQUIRE(cteBlobSize(path, blob) == expect);
+    cached_total += expect;
+  }
+  REQUIRE(cached_total == kTotalBytes);
+
+  // And the appended image reads back byte-exact through a fresh handle.
+  hid_t file2 = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  REQUIRE(file2 >= 0);
+  hid_t dset2 = H5Dopen2(file2, "data", H5P_DEFAULT);
+  REQUIRE(dset2 >= 0);
+  std::vector<int> rbuf(kFrameElems * kFrames, -1);
+  REQUIRE(H5Dread(dset2, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                  rbuf.data()) >= 0);
+  bool match = true;
+  for (size_t i = 0; i < rbuf.size(); ++i) {
+    if (rbuf[i] != all[i]) { match = false; break; }
+  }
+  REQUIRE(match);
 
   REQUIRE(H5Dclose(dset2) >= 0);
   REQUIRE(H5Fclose(file2) >= 0);

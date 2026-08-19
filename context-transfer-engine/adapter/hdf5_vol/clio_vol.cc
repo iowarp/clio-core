@@ -168,6 +168,30 @@ struct clio_dataset_t {
     ctp::ipc::AllocatorId alloc_id;
   };
   std::vector<PendingGpuBuffer> pending_gpu_buffers;
+  /* Append staging. Every real simulation writer -- LAMMPS' h5md dump,
+     openPMD, AMReX HDF5 -- grows a dataset by one frame per timestep and
+     writes that frame as a hyperslab, so no single write ever covers the whole
+     extent. Such writes used to be rejected outright and the tier stayed
+     empty for the entire run.
+
+     Frames also rarely divide the chunk size (LAMMPS: 6,144,000 B frames
+     against 1 MiB chunks), so chunk boundaries fall INSIDE frames and no
+     single write can produce a whole chunk on its own. Chunks are therefore
+     assembled across successive writes: append_tail holds the bytes of the
+     chunk the previous write left unfinished, and append_tail_off is that
+     chunk's absolute offset in the linear image -- always a chunk boundary,
+     which is the invariant that lets staging resume in whole chunks. A write
+     continuing exactly where the tail ended completes those chunks; anything
+     else is a discontinuity that drops the image (see clio_append_reset).
+
+     Bounded by one chunk_size per open dataset. */
+  std::vector<char> append_tail;
+  size_t append_tail_off = 0;
+  /* Image size and NeuroPress data type as of the last append, so
+     clio_dataset_close can settle the trailing short chunk without a live
+     hid_t (the caller's type id is long gone by then). */
+  size_t append_total_size = 0;
+  int append_data_type = 0;
   /* One staging-failure report per dataset (see drain_dataset_puts). */
   bool put_failure_reported = false;
   /* Telemetry-only storage-layout probe, filled lazily on first traced access
@@ -1779,6 +1803,249 @@ static inline double clio_since_us(std::chrono::steady_clock::time_point s) {
 #define CLIO_PATH_TRACE(...) ((void)0)
 #endif
 
+/* Forward decl: defined with the read-side selection helpers below, but the
+   write path needs it to decide whether an append is a contiguous run. */
+static bool clio_selection_byte_span(hid_t full_space, hid_t file_space_id,
+                                     size_t type_size, size_t total_size,
+                                     size_t *lo, size_t *hi);
+
+/* Stage ONE chunk of a dataset's linear image into the tier.
+ *
+ * Factored out of clio_dataset_write's whole-dataset loop so the append path
+ * stages through exactly the same code -- chunk naming, the device/host
+ * staging choice, and the compressor-vs-core routing all have to agree between
+ * the two or a dataset written by one and read by the other silently
+ * mismatches. `chunk_index` is the index in the FULL linear image, never an
+ * index within the write being served.
+ *
+ * Returns false only when the staging buffer could not be allocated; the
+ * caller then stops staging and invalidates, exactly as before.
+ */
+static bool clio_stage_chunk(clio_dataset_t *dataset, size_t chunk_index,
+                             const char *src, size_t this_size,
+                             bool src_is_device, int np_data_type,
+                             clio::cte::core::Client *cte_client) {
+  ctp::ipc::ShmPtr<> blob_data;
+  bool staged_on_device = false;
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  if (src_is_device) {
+    char *device_ptr = nullptr;
+    ctp::ipc::AllocatorId gpu_alloc_id =
+        CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+            this_size, &device_ptr);
+    if (!gpu_alloc_id.IsNull()) {
+      ctp::GpuApi::Memcpy(device_ptr, src, this_size);
+      blob_data.alloc_id_ = gpu_alloc_id;
+      blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
+      dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});
+      staged_on_device = true;
+    }
+    /* Falls through to the host buffer below on allocation failure --
+       same graceful-degradation contract the host path already has. */
+  }
+#endif
+  if (!staged_on_device) {
+    auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+    if (buffer.IsNull()) return false;
+    ctp::DeviceAwareMemcpy(buffer.ptr_, src, this_size);
+    blob_data = buffer.shm_.template Cast<void>();
+    dataset->pending_buffers.push_back(std::move(buffer));
+  }
+
+  CLIO_PATH_TRACE("WRITE  staged chunk=%zu bytes=%zu via=%s alloc=(%u.%u)",
+                  chunk_index, this_size,
+                  staged_on_device ? "gpu-ipc" : "host-shm",
+                  blob_data.alloc_id_.major_, blob_data.alloc_id_.minor_);
+
+  std::string blob_name =
+      dataset->dataset_path + "/chunk_" + std::to_string(chunk_index);
+
+  if (dataset->file->compressor_client) {
+    clio::cte::core::Context np_ctx;
+    np_ctx.data_type_ = np_data_type;
+    CLIO_PATH_TRACE("WRITE  ctx data_type_=%d (%s)", np_ctx.data_type_,
+                    np_ctx.data_type_ == 1 ? "float32" : "other");
+    auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
+        0, this_size, blob_data, -1.0f, np_ctx, 0, cte_client->pool_id_);
+    dataset->pending_compressed_puts.push_back(std::move(future));
+  } else {
+    auto future = cte_client->AsyncPutBlob(
+        dataset->file->tag_id, blob_name, 0, this_size,
+        blob_data, -1.0f, clio::cte::core::Context(), 0);
+    dataset->pending_puts.push_back(std::move(future));
+  }
+  return true;
+}
+
+/* Abandon any partially assembled chunk. Called when a write does not
+   continue the run the tail belongs to: the bytes buffered there describe an
+   image the next write is not extending, and keeping them would let a later
+   chunk be assembled from two unrelated writes. */
+static void clio_append_reset(clio_dataset_t *dataset) {
+  dataset->append_tail.clear();
+  dataset->append_tail.shrink_to_fit();
+  dataset->append_tail_off = 0;
+}
+
+/* Is this write one contiguous run of the dataset's linear image?
+ *
+ * Returns true and fills [*lo, *hi) and *total_size when it is. The bounding
+ * box alone is not enough: a strided selection has a box far larger than the
+ * elements it actually selects, and staging its box would publish bytes the
+ * write never supplied. Requiring the selected point count to equal the box
+ * is what distinguishes "one contiguous run" from "a rectangle with holes".
+ *
+ * The memory side must also be a dense buffer whose elements appear in image
+ * order, or src does not map onto [lo, hi) one-to-one. H5S_ALL says so
+ * outright; an explicit mem space qualifies when it selects all of its own
+ * extent, which is what writers like ch5md pass (H5Screate_simple with no
+ * selection set).
+ */
+static bool clio_write_span(clio_dataset_t *dataset, hid_t mem_space_id,
+                            hid_t file_space_id, hid_t dxpl_id,
+                            size_t type_size, size_t *lo, size_t *hi,
+                            size_t *total_size) {
+  if (type_size == 0) return false;
+
+  H5VL_dataset_get_args_t ga;
+  ga.op_type = H5VL_DATASET_GET_SPACE;
+  ga.args.get_space.space_id = H5I_INVALID_HID;
+  if (H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id, &ga,
+                      dxpl_id, nullptr) < 0)
+    return false;
+  hid_t full_space = ga.args.get_space.space_id;
+  if (full_space < 0) return false;
+
+  bool ok = false;
+  do {
+    hssize_t total_nelem = H5Sget_simple_extent_npoints(full_space);
+    if (total_nelem <= 0) break;
+    *total_size = static_cast<size_t>(total_nelem) * type_size;
+
+    hid_t sel = (file_space_id == H5S_ALL) ? full_space : file_space_id;
+    hssize_t nsel = H5Sget_select_npoints(sel);
+    if (nsel <= 0) break;
+
+    /* Memory side: dense and in order. */
+    if (mem_space_id != H5S_ALL) {
+      hssize_t msel = H5Sget_select_npoints(mem_space_id);
+      hssize_t mext = H5Sget_simple_extent_npoints(mem_space_id);
+      if (msel != nsel || msel != mext) break;
+    }
+
+    if (!clio_selection_byte_span(full_space, file_space_id, type_size,
+                                  *total_size, lo, hi))
+      break;
+    /* Contiguity: the box holds exactly the selected elements and no more. */
+    if (*hi - *lo != static_cast<size_t>(nsel) * type_size) break;
+    ok = true;
+  } while (false);
+
+  H5Sclose(full_space);
+  return ok;
+}
+
+/* Stage a contiguous APPEND into the linear image.
+ *
+ * `lo`/`hi` are the write's byte range in the image and `src` its bytes; the
+ * caller has already established that the selection is one contiguous run
+ * (clio_write_span) so src maps onto [lo, hi) one-to-one.
+ *
+ * Chunks are assembled across calls. The tail from the previous write is
+ * prepended when this write continues it, whole chunks are staged, and the
+ * remainder becomes the new tail at the next chunk boundary -- which keeps
+ * append_tail_off chunk-aligned for the next call. A write that does not
+ * continue the tail is a discontinuity: the image is dropped rather than
+ * stitched together from two unrelated runs.
+ *
+ * The trailing partial chunk is deliberately NOT staged here. Until the
+ * dataset stops growing there is no way to tell a chunk that is short because
+ * it is the last one from a chunk that is short because the next frame has not
+ * arrived, and staging the latter publishes a blob whose size disagrees with
+ * what the read path computes from the final extent. clio_dataset_close
+ * settles it once the extent is final.
+ *
+ * Host staging, deliberately: the run is assembled in host memory because the
+ * tail has to survive between H5Dwrite calls, and a device buffer cannot be
+ * carried across them cheaply. Appending writers (h5md, openPMD) hand us host
+ * pointers anyway. Compression still happens on the GPU inside the compressor
+ * runtime -- only the staging buffer is host SHM, exactly as the existing
+ * host fallback does.
+ *
+ * Returns the number of bytes staged; sets *ok false if staging failed
+ * partway, which the caller turns into an invalidation.
+ */
+static size_t clio_stage_append(clio_dataset_t *dataset, const void *src_raw,
+                                size_t lo, size_t hi, size_t total_size,
+                                int np_data_type,
+                                clio::cte::core::Client *cte_client, bool *ok) {
+  *ok = true;
+  const size_t chunk_size = dataset->file->chunk_size;
+  if (hi <= lo) return 0;
+
+  /* Bring the write's bytes to host memory once. DeviceAwareMemcpy handles a
+     device src (D2H); for a host src this is a plain copy. */
+  const size_t nbytes = hi - lo;
+  std::vector<char> incoming(nbytes);
+  ctp::DeviceAwareMemcpy(incoming.data(), src_raw, nbytes);
+
+  /* Does this write continue the buffered tail? */
+  size_t run_off;
+  std::vector<char> run;
+  if (!dataset->append_tail.empty() &&
+      dataset->append_tail_off + dataset->append_tail.size() == lo) {
+    run_off = dataset->append_tail_off;
+    run = std::move(dataset->append_tail);
+    run.insert(run.end(), incoming.begin(), incoming.end());
+  } else {
+    if (!dataset->append_tail.empty()) {
+      /* Discontinuous: whatever was buffered belongs to a run this write does
+         not extend. */
+      clio_append_reset(dataset);
+      clio_invalidate_dataset(dataset);
+    }
+    if (lo % chunk_size != 0) {
+      /* A run that does not begin on a chunk boundary cannot be assembled
+         into whole chunks without the bytes before it, which this connector
+         never saw. Leave the image alone and let the read fall to native. */
+      clio_invalidate_dataset(dataset);
+      *ok = false;
+      return 0;
+    }
+    run_off = lo;
+    run = std::move(incoming);
+  }
+
+  /* Stage every chunk the run covers end to end. */
+  size_t staged = 0;
+  size_t pos = 0;  /* offset within run */
+  while (run_off + pos + chunk_size <= run_off + run.size()) {
+    const size_t abs = run_off + pos;
+    const size_t index = abs / chunk_size;
+    if (!clio_stage_chunk(dataset, index, run.data() + pos, chunk_size,
+                          /*src_is_device=*/false, np_data_type, cte_client)) {
+      *ok = false;
+      clio_append_reset(dataset);
+      return staged;
+    }
+    staged += chunk_size;
+    pos += chunk_size;
+  }
+
+  /* Carry the remainder. It starts on a chunk boundary by construction. */
+  dataset->append_total_size = total_size;
+  dataset->append_data_type = np_data_type;
+  dataset->append_tail_off = run_off + pos;
+  dataset->append_tail.assign(run.begin() + pos, run.end());
+
+  CLIO_PATH_TRACE("WRITE  append [%zu,%zu) staged=%zu tail=%zu@%zu total=%zu",
+                  lo, hi, staged, dataset->append_tail.size(),
+                  dataset->append_tail_off, total_size);
+  return staged;
+}
+
 static herr_t clio_dataset_write(size_t count, void *dset[],
                                    hid_t mem_type_id[],
                                    hid_t mem_space_id[],
@@ -1801,11 +2068,83 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        CTE chunk cache. For no-file-reference, partial (hyperslab), or
        collective writes, persist to the native VOL only — caching a partial
        write under a whole-dataset key would poison a later whole read. */
-    if (!clio_cache_usable(dataset->file) || !dataset->cacheable ||
-        !clio_is_whole_read(mem_space_id[d], file_space_id[d]) ||
-        !clio_type_is_cacheable(mem_type_id[d]) ||
-        !clio_type_matches_file(dataset, mem_type_id[d], dxpl_id) ||
-        clio_is_collective(dxpl_id)) {
+    CLIO_PATH_TRACE("WRITE  gate  usable=%d cacheable=%d whole=%d "
+                    "type_ok=%d type_match=%d collective=%d",
+                    clio_cache_usable(dataset->file) ? 1 : 0,
+                    dataset->cacheable ? 1 : 0,
+                    clio_is_whole_read(mem_space_id[d], file_space_id[d]) ? 1 : 0,
+                    clio_type_is_cacheable(mem_type_id[d]) ? 1 : 0,
+                    clio_type_matches_file(dataset, mem_type_id[d], dxpl_id) ? 1 : 0,
+                    clio_is_collective(dxpl_id) ? 1 : 0);
+    /* Everything except the shape of the selection. Split out because a
+       partial write that satisfies all of these is an APPEND candidate: it can
+       still populate the linear image, one contiguous run at a time. Only the
+       writes that fail one of these are unconditionally native-only. */
+    const bool cache_eligible =
+        clio_cache_usable(dataset->file) && dataset->cacheable &&
+        clio_type_is_cacheable(mem_type_id[d]) &&
+        clio_type_matches_file(dataset, mem_type_id[d], dxpl_id) &&
+        !clio_is_collective(dxpl_id);
+    const bool whole_write =
+        clio_is_whole_read(mem_space_id[d], file_space_id[d]);
+
+    /* Contiguous partial write -> append path. Handled before the rejection
+       below because that branch invalidates the image, which is exactly the
+       wrong answer for a write that is extending it. */
+    if (cache_eligible && !whole_write &&
+        (clio_admit_policy() == ClioAdmit::kOnWrite) && clio_tier_accepting()) {
+      size_t a_lo = 0, a_hi = 0, a_total = 0;
+      size_t t_size = H5Tget_size(mem_type_id[d]);
+      if (clio_write_span(dataset, mem_space_id[d], file_space_id[d], dxpl_id,
+                          t_size, &a_lo, &a_hi, &a_total)) {
+        auto *append_client = get_cte_client();
+        bool append_ok = false;
+        size_t append_staged =
+            clio_stage_append(dataset, buf[d], a_lo, a_hi, a_total,
+                              clio_context_data_type(mem_type_id[d]),
+                              append_client, &append_ok);
+
+        /* The native file is authoritative and is written the same way it
+           always was; only the staging above is new. */
+        const void *nb = buf[d];
+        std::vector<char> nstage;
+        if (ctp::IsDevicePointer(buf[d])) {
+          nstage.resize(a_hi - a_lo);
+          ctp::DeviceAwareMemcpy(nstage.data(), buf[d], nstage.size());
+          nb = nstage.data();
+        }
+        herr_t arc = H5VLdataset_write(1, &dataset->obj.under_object,
+                                       dataset->obj.under_vol_id,
+                                       &mem_type_id[d], &mem_space_id[d],
+                                       &file_space_id[d], dxpl_id, &nb, req);
+        if (arc < 0) {
+          ret_value = arc;
+          drain_dataset_puts(dataset);
+          clio_append_reset(dataset);
+          clio_invalidate_dataset(dataset);
+        } else if (!append_ok) {
+          drain_dataset_puts(dataset);
+          clio_invalidate_dataset(dataset);
+        }
+        if (tracing) {
+          const bool did_stage = (arc >= 0 && append_staged > 0);
+          clio_trace_access(dataset, clio::trace::Op::kWrite, mem_type_id[d],
+                            mem_space_id[d], file_space_id[d], dxpl_id,
+                            did_stage ? clio::trace::Served::kStaged
+                                      : clio::trace::Served::kUncacheable,
+                            clio_since_us(t0),
+                            did_stage ? append_staged : 0);
+          if (did_stage)
+            clio::trace::record_stage(dataset->file->trace,
+                                      dataset->dataset_path, append_staged);
+        }
+        continue;
+      }
+      /* Not a contiguous run (strided/point selection): fall through and be
+         handled as the uncacheable write it has always been. */
+    }
+
+    if (!cache_eligible || !whole_write) {
       /* The native VOL is the authoritative store: its status IS this call's
          status. Discarding it (as this did) reported success for writes that
          never reached the file -- ENOSPC, filter failure, a bad selection. */
@@ -1919,95 +2258,20 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
     for (size_t i = 0; admit_here && i < num_chunks; ++i) {
       size_t offset = i * chunk_size;
       size_t this_size = std::min(chunk_size, total_size - offset);
-
-      ctp::ipc::ShmPtr<> blob_data;
-      bool staged_on_device = false;
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-      if (src_is_device) {
-        char *device_ptr = nullptr;
-        ctp::ipc::AllocatorId gpu_alloc_id =
-            CLIO_IPC->AllocateAndRegisterGpuBackend(
-                /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-                this_size, &device_ptr);
-        if (!gpu_alloc_id.IsNull()) {
-          ctp::GpuApi::Memcpy(device_ptr, src + offset, this_size);
-          blob_data.alloc_id_ = gpu_alloc_id;
-          blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
-          dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});
-          staged_on_device = true;
-        }
-        /* Falls through to the host buffer below on allocation failure --
-           same graceful-degradation contract the host path already has. */
-      }
-#endif
-      if (!staged_on_device) {
-        /* Host SHM fallback: no device source, or the device backend alloc
-         * failed. DeviceAwareMemcpy still handles src being a device
-         * pointer here (D2H) -- the fallback stages correctly even though
-         * it can no longer keep NeuroPress's candidate set GPU-only.
-         * An allocation failure stops the staging, never the write: the
-         * native path below is always available, and failing H5Dwrite over
-         * a cache buffer is an error the application would not have seen
-         * without CLIO. */
-        auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-        if (buffer.IsNull()) { staged_fully = false; break; }
-        ctp::DeviceAwareMemcpy(buffer.ptr_, src + offset, this_size);
-        blob_data = buffer.shm_.template Cast<void>();
-        dataset->pending_buffers.push_back(std::move(buffer));
-      }
-
-      CLIO_PATH_TRACE("WRITE  staged chunk=%zu bytes=%zu via=%s "
-                      "alloc=(%u.%u)",
-                      i, this_size, staged_on_device ? "gpu-ipc" : "host-shm",
-                      blob_data.alloc_id_.major_, blob_data.alloc_id_.minor_);
-
-      std::string blob_name = dataset->dataset_path + "/chunk_" +
-                              std::to_string(i);
-
-      /* Blob-internal offset MUST be 0: the chunk's position in the image is
-         carried by its NAME. Passing the image offset here made CTE size every
-         chunk_i blob to (i+1) chunks and zero-fill the [0, offset) hole through
-         the I/O path, so an N-chunk dataset cost N(N+1)/2 chunks of tier --
-         invisible to every round-trip test because the read side used the same
-         offset. The read side (clio_read_cached_image) must stay at 0 with
-         this -- true for both branches below, compressed or not.
-
-         When the file was opened with a compressor pool configured, route
-         through it instead of the raw core client: compressor::Client's
-         AsyncDynamicSchedule analyzes the chunk (NeuroPress dynamic
-         selection among them), compresses, and stores via core PutBlob --
-         rather than storing the chunk uncompressed. The two return
-         different Task types (DynamicScheduleTask vs PutBlobTask), so they
-         go into separate pending-future vectors drained the same way on
-         close.
-
-         AsyncDynamicSchedule (not the AsyncPutBlob override) so the core
-         pool id can be passed explicitly: the override always sends
-         PoolId::GetNull() for it, which only resolves if the compressor
-         pool's own compose config set next_pool_id_ -- a VOL-opened
-         compressor pool has no such guarantee, and an unresolved core
-         client null-derefs deep in the compressor runtime instead of
-         failing cleanly. cte_client->pool_id_ is the core pool this VOL
-         connector's own CTE core client is already bound to, so compressed
-         chunks land in the same core pool uncompressed chunks would have. */
-      if (dataset->file->compressor_client) {
-        clio::cte::core::Context np_ctx;
-        np_ctx.data_type_ = clio_context_data_type(mem_type_id[d]);
-        CLIO_PATH_TRACE("WRITE  ctx data_type_=%d (%s)", np_ctx.data_type_,
-                        np_ctx.data_type_ == 1 ? "float32" : "other");
-        auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
-            clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
-            0, this_size, blob_data, -1.0f, np_ctx,
-            0, cte_client->pool_id_);
-        dataset->pending_compressed_puts.push_back(std::move(future));
-      } else {
-        auto future = cte_client->AsyncPutBlob(
-            dataset->file->tag_id, blob_name, 0, this_size,
-            blob_data, -1.0f, clio::cte::core::Context(), 0);
-        dataset->pending_puts.push_back(std::move(future));
+      /* An allocation failure stops the staging, never the write: the native
+         path below is always available, and failing H5Dwrite over a cache
+         buffer is an error the application would not have seen without CLIO. */
+      if (!clio_stage_chunk(dataset, i, src + offset, this_size, src_is_device,
+                            clio_context_data_type(mem_type_id[d]),
+                            cte_client)) {
+        staged_fully = false;
+        break;
       }
       staged_bytes += this_size;
     }
+    /* A whole write republishes the entire image, so nothing may still be
+       buffered from an earlier append run. */
+    clio_append_reset(dataset);
 
     /* Write to the native VOL -- the authoritative store. Its status is this
        call's status; if it failed, the bytes we just staged into CTE describe
@@ -2756,8 +3020,50 @@ static herr_t clio_dataset_specific(void *obj,
         clio_invalidate_dataset(dset);
       }
     } else if (args->op_type == H5VL_DATASET_SET_EXTENT) {
-      drain_dataset_puts(dset);
-      clio_invalidate_dataset(dset);
+      /* Growing ONLY the slowest-varying dimension appends new byte range
+         past the end of the linear image and moves nothing already in it:
+         in row-major order dim 0 has the largest stride, so every existing
+         element keeps its offset. That is precisely the extend an appending
+         writer does once per frame (h5md_extend_by_one), and invalidating
+         there deleted the image every single frame -- the chunks staged for
+         frame N were dropped by frame N+1's extend, so a run that staged
+         every chunk correctly still ended with an empty tier.
+
+         Any other change does move bytes: growing a faster-varying dimension
+         re-strides every row, and shrinking drops elements the image still
+         claims. Those keep the original drain-and-invalidate. */
+      bool append_growth = false;
+      if (args->args.set_extent.size != nullptr) {
+        H5VL_dataset_get_args_t ga;
+        ga.op_type = H5VL_DATASET_GET_SPACE;
+        ga.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(dset->obj.under_object, dset->obj.under_vol_id,
+                            &ga, dxpl_id, nullptr) >= 0 &&
+            ga.args.get_space.space_id >= 0) {
+          hid_t cur = ga.args.get_space.space_id;
+          int rank = H5Sget_simple_extent_ndims(cur);
+          if (rank > 0 && rank <= H5S_MAX_RANK) {
+            std::vector<hsize_t> dims(static_cast<size_t>(rank));
+            if (H5Sget_simple_extent_dims(cur, dims.data(), nullptr) >= 0) {
+              const hsize_t *want = args->args.set_extent.size;
+              bool tail_same = true;
+              for (int i = 1; i < rank; ++i) {
+                if (want[i] != dims[static_cast<size_t>(i)]) {
+                  tail_same = false;
+                  break;
+                }
+              }
+              append_growth = tail_same && want[0] >= dims[0];
+            }
+          }
+          H5Sclose(cur);
+        }
+      }
+      if (!append_growth) {
+        drain_dataset_puts(dset);
+        clio_append_reset(dset);
+        clio_invalidate_dataset(dset);
+      }
     }
   }
   return H5VLdataset_specific(dset->obj.under_object, dset->obj.under_vol_id,
@@ -2778,6 +3084,35 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
     dset->file->open_datasets.erase(dset);
     if (dset->file->close_deferred && dset->file->open_datasets.empty())
       file_to_free = dset->file;
+  }
+
+  /* Settle the trailing chunk of an append run. Only here is the extent
+     final, so only here can a short chunk be told from one whose next frame
+     had not arrived yet -- staging it any earlier publishes a blob whose size
+     disagrees with what the read path derives from the final extent.
+
+     The tail must reach the end of the image. If it stops short, some byte
+     range between the tail and the end was never offered to the tier, and the
+     image would have a hole that reads as a hit; drop it instead. */
+  if (!dset->append_tail.empty()) {
+    const bool reaches_end =
+        dset->append_tail_off + dset->append_tail.size() ==
+        dset->append_total_size;
+    auto *tail_client = (dset->file && dset->cacheable) ? get_cte_client()
+                                                        : nullptr;
+    if (reaches_end && tail_client != nullptr) {
+      const size_t chunk_size = dset->file->chunk_size;
+      if (!clio_stage_chunk(dset, dset->append_tail_off / chunk_size,
+                            dset->append_tail.data(),
+                            dset->append_tail.size(),
+                            /*src_is_device=*/false, dset->append_data_type,
+                            tail_client)) {
+        clio_invalidate_dataset(dset);
+      }
+    } else if (!reaches_end) {
+      clio_invalidate_dataset(dset);
+    }
+    clio_append_reset(dset);
   }
 
   /* Flush all pending async writes; a failed put leaves a partial image, so
