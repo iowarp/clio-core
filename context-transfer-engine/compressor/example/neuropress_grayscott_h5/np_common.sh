@@ -159,8 +159,18 @@ while True:
     off = i + 4
 if not n:
     print("  NO COMPRESSED CHUNKS FOUND in the tier."); raise SystemExit(1)
-print(f"  stored: {tot/1048576:.2f} MiB from {orig/1048576:.1f} MiB "
+# Two different quantities, and under exploration they diverge sharply.
+# CODEC OUTPUT is what the winning codec produced. STORAGE OCCUPIED is what
+# the blob actually takes in the tier -- and when exploration adopts a winner
+# smaller than the primary, the blob keeps the PRIMARY's size and the surplus
+# is dead space. Measured: without exploration physical == payload + 24 (the
+# header) exactly; with it, physical ran 4-9x the payload. Reporting only the
+# payload made exploration look far better than it stores, so print both and
+# let the gap show.
+print(f"  codec output    : {tot/1048576:.2f} MiB from {orig/1048576:.1f} MiB "
       f"({orig/tot:.1f}x)")
+print(f"  storage occupied: run np_read.sh -- it reports the real footprint "
+      f"from GetBlobSize (physical), which is the number to quote")
 print(f"  codecs: " + " ".join(f"{k}:{v}" for k,v in codecs.most_common()))
 if expect and n != expect:
     print(f"  WARNING: found {n} chunk headers, expected {expect} -- the tier "

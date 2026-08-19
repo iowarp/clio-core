@@ -2465,8 +2465,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     {
       const int np_final_lib = context.compress_lib_;
       const int np_final_preset = context.compress_preset_;
+      // Blob name included so this can be joined per chunk against the codec
+      // the READ side recovers from the stored CTEC header. Aggregate counts
+      // can agree while individual assignments differ.
       CLIO_PATH_TRACE(
-          "WRITE  neuropress FINAL lib=%d (%s) preset=%d %s",
+          "WRITE  neuropress FINAL blob='%s' lib=%d (%s) preset=%d %s",
+          task->blob_name_.str().c_str(),
           np_final_lib,
           ctp::CompressionFactory::NameForWireId(np_final_lib).c_str(),
           np_final_preset,
