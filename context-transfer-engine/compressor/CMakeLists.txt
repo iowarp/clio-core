@@ -73,6 +73,11 @@ add_clio_module_client(
 )
 
 # Add core include directory for Context struct
+if(CLIO_NEUROPRESS_PATH_TRACE)
+  target_compile_definitions(clio_cte_compressor_runtime PRIVATE
+    CLIO_NEUROPRESS_PATH_TRACE)
+endif()
+
 target_include_directories(clio_cte_compressor_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
 target_include_directories(clio_cte_compressor_client PRIVATE
@@ -82,6 +87,28 @@ target_include_directories(clio_cte_compressor_client PRIVATE
 # Synthetic Data Generators
 #------------------------------------------------------------------------------
 add_subdirectory(generator)
+
+
+#------------------------------------------------------------------------------
+# End-to-end path trace (issue #693)
+#------------------------------------------------------------------------------
+# Compile-time, off by default. When on, the compressor and the HDF5 VOL each
+# print "[np-path]" lines at every hop a write/read takes through the stack, so
+# one grep shows whether data was really intercepted and compressed rather than
+# quietly passed to native HDF5. Undefined => the calls expand to nothing.
+option(CLIO_NEUROPRESS_PATH_TRACE "Trace the NeuroPress write/read path" OFF)
+if(CLIO_NEUROPRESS_PATH_TRACE)
+  message(STATUS "NeuroPress path trace: ENABLED (-DCLIO_NEUROPRESS_PATH_TRACE)")
+endif()
+
+#------------------------------------------------------------------------------
+# Examples
+#------------------------------------------------------------------------------
+# The NeuroPress examples are kept out of the repository (see .gitignore), so
+# this is guarded: present in a working tree that has them, a no-op elsewhere.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/example/CMakeLists.txt)
+  add_subdirectory(example)
+endif()
 
 #------------------------------------------------------------------------------
 # Tests

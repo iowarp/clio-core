@@ -64,6 +64,14 @@ target_link_libraries(clio_hdf5_vol
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
+# Same compile-time path trace as the compressor (see its CMakeLists). The
+# connector half answers "was this write intercepted at all", which the
+# compressor half cannot: a write that never reaches the compressor leaves no
+# trace there by definition.
+if(CLIO_NEUROPRESS_PATH_TRACE)
+  target_compile_definitions(clio_hdf5_vol PRIVATE CLIO_NEUROPRESS_PATH_TRACE)
+endif()
+
 set_target_properties(clio_hdf5_vol PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON

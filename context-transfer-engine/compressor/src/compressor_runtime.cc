@@ -1358,6 +1358,24 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 
 }  // namespace
 
+
+/* ---------------------------------------------------------------------------
+ * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
+ * Compressor half of the trace in clio_vol.cc; same "[np-path]" prefix so one
+ * grep spans connector and compressor. Undefined => expands to nothing, so
+ * the compress path pays nothing.
+ * --------------------------------------------------------------------------- */
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+#define CLIO_PATH_TRACE(...)                          \
+  do {                                                \
+    std::fprintf(stderr, "[np-path] " __VA_ARGS__);    \
+    std::fprintf(stderr, "\n");                       \
+    std::fflush(stderr);                              \
+  } while (0)
+#else
+#define CLIO_PATH_TRACE(...) ((void)0)
+#endif
+
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1376,6 +1394,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       context.trace_key_ = g_trace_key_counter.fetch_add(1);
       context.trace_node_ = static_cast<int>(CLIO_IPC->GetNodeId());
     }
+
+    CLIO_PATH_TRACE("WRITE  compressor DynamicSchedule blob='%s' bytes=%llu "
+                    "ptr=%s device=%d",
+                    task->blob_name_.str().c_str(),
+                    (unsigned long long)chunk_size,
+                    chunk_data ? "ok" : "NULL",
+                    chunk_data ? (ctp::IsDevicePointer(chunk_data) ? 1 : 0) : -1);
 
     // Check if we have valid chunk data
     if (chunk_data == nullptr || chunk_size == 0) {
@@ -1455,6 +1480,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // Update context with selected compression library and preset
     context.compress_lib_ = best_lib;
     context.compress_preset_ = best_preset;
+    CLIO_PATH_TRACE("WRITE  neuropress selected lib=%d (%s) preset=%d",
+                    best_lib,
+                    ctp::CompressionFactory::NameForWireId(best_lib).c_str(),
+                    best_preset);
     task->tier_score_ = tier_score;
 
     // Log scheduling decision time if tracing enabled
@@ -2764,6 +2793,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
                            compress_kernel_ms);
     }
 
+    CLIO_PATH_TRACE("WRITE  codec ran lib=%d in=%zu out=%zu kept=%d",
+                    context.compress_lib_, (size_t)input_size,
+                    (size_t)total_stored_size,
+                    (success && total_stored_size < input_size) ? 1 : 0);
+
     if (success && total_stored_size < input_size) {
       // Update context with compression statistics
       context.actual_original_size_ = input_size;
@@ -3932,6 +3966,15 @@ clio::run::TaskResume Runtime::GetBlob(
   // authoritative transform state OUT through the context either way.
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                          task.template Cast<clio::run::Task>()));
+  {
+    const bool compressed = (task->context_.transform_flags_ &
+                             clio::cte::core::kBlobTransformCompressed) != 0;
+    CLIO_PATH_TRACE("READ   compressor GetBlob blob='%s' rc=%d replica=%d "
+                    "stored_compressed=%d -> %s",
+                    task->blob_name_.str().c_str(), (int)task->GetReturnCode(),
+                    (int)task->context_.replica_, compressed ? 1 : 0,
+                    compressed ? "decompressing" : "passthrough");
+  }
   if (task->GetReturnCode() != 0 || task->context_.replica_ != 0 ||
       !(task->context_.transform_flags_ &
         clio::cte::core::kBlobTransformCompressed)) {
@@ -3986,6 +4029,9 @@ clio::run::TaskResume Runtime::GetBlob(
     clio::run::u64 out_size = 0;
     int rc = DecompressStored(stored.ptr_, stored_size, scratch.ptr_,
                               original_size, &out_size);
+    CLIO_PATH_TRACE("READ   codec inverted stored=%llu -> original=%llu rc=%d",
+                    (unsigned long long)stored_size,
+                    (unsigned long long)out_size, rc);
     CLIO_IPC->FreeBuffer(stored);
     if (rc != 0) {
       CLIO_IPC->FreeBuffer(scratch);

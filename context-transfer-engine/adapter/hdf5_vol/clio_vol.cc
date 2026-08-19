@@ -1695,6 +1695,33 @@ static inline double clio_since_us(std::chrono::steady_clock::time_point s) {
  * Each chunk is copied to shared memory and submitted via AsyncPutBlob.
  * Futures are collected in the dataset state and flushed on close.
  */
+
+/* ---------------------------------------------------------------------------
+ * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
+ *
+ * Answers one question a return code cannot: did my data actually get
+ * intercepted and carried through this stack, or did the connector quietly
+ * hand it to native HDF5? Both look like a successful H5Dwrite. Every hop
+ * prints the same "[np-path]" prefix, so one grep shows the whole journey --
+ * and a MISSING line is as informative as a present one.
+ *
+ * Compile-time rather than an env check: when the macro is undefined the
+ * calls expand to nothing, so there is no branch, no string, and no cost on
+ * the write path at all. Enable with
+ *   cmake -DCLIO_NEUROPRESS_PATH_TRACE=ON
+ * --------------------------------------------------------------------------- */
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+#define CLIO_PATH_TRACE(...)                          \
+  do {                                                \
+    std::fprintf(stderr, "[np-path] " __VA_ARGS__);    \
+    std::fprintf(stderr, "\n");                       \
+    std::fflush(stderr);                              \
+  } while (0)
+#else
+/* (void)0 keeps it a statement so `if (x) CLIO_PATH_TRACE(...);` still parses. */
+#define CLIO_PATH_TRACE(...) ((void)0)
+#endif
+
 static herr_t clio_dataset_write(size_t count, void *dset[],
                                    hid_t mem_type_id[],
                                    hid_t mem_space_id[],
@@ -1707,6 +1734,11 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
     auto *dataset = static_cast<clio_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
     auto t0 = std::chrono::steady_clock::now();
+    CLIO_PATH_TRACE("WRITE  vol-intercept  dset='%s' cacheable=%d "
+                    "compressor=%d device_src=%d",
+                    dataset->dataset_path.c_str(), dataset->cacheable ? 1 : 0,
+                    (dataset->file && dataset->file->compressor_client) ? 1 : 0,
+                    ctp::IsDevicePointer(buf[d]) ? 1 : 0);
 
     /* Only whole-dataset, independent writes can be represented in the linear
        CTE chunk cache. For no-file-reference, partial (hyperslab), or
@@ -1866,6 +1898,11 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
         blob_data = buffer.shm_.template Cast<void>();
         dataset->pending_buffers.push_back(std::move(buffer));
       }
+
+      CLIO_PATH_TRACE("WRITE  staged chunk=%zu bytes=%zu via=%s "
+                      "alloc=(%u.%u)",
+                      i, this_size, staged_on_device ? "gpu-ipc" : "host-shm",
+                      blob_data.alloc_id_.major_, blob_data.alloc_id_.minor_);
 
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
@@ -2081,6 +2118,10 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
         if (buffer.IsNull()) return false;
         blob_data = buffer.shm_.template Cast<void>();
       }
+      CLIO_PATH_TRACE("READ   refill chunk=%zu bytes=%zu via=%s alloc=(%u.%u)",
+                      i, this_size, gpu_ptr ? "gpu" : "host-shm",
+                      blob_data.alloc_id_.major_, blob_data.alloc_id_.minor_);
+
       std::string blob_name = dataset->dataset_path + "/chunk_" +
                               std::to_string(i);
       /* Blob-internal offset 0, same convention as the raw-blob path below
@@ -2393,6 +2434,11 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     auto *dataset = static_cast<clio_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
     auto t0 = std::chrono::steady_clock::now();
+    CLIO_PATH_TRACE("READ   vol-intercept  dset='%s' cacheable=%d "
+                    "compressor=%d device_dst=%d",
+                    dataset->dataset_path.c_str(), dataset->cacheable ? 1 : 0,
+                    (dataset->file && dataset->file->compressor_client) ? 1 : 0,
+                    ctp::IsDevicePointer(buf[d]) ? 1 : 0);
 
     /* Native passthrough when the cache is unusable, there is no file
        reference, the type is not flat, the memory type disagrees in size with
