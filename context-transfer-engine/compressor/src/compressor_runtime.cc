@@ -3103,6 +3103,14 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
         (get_task->context_.transform_flags_ &
          clio::cte::core::kBlobTransformCompressed) != 0;
 
+    CLIO_PATH_TRACE("READ   compressor Decompress blob='%s' physical=%llu "
+                    "logical=%llu stored_compressed=%d -> %s",
+                    task->blob_name_.str().c_str(),
+                    (unsigned long long)expected_size,
+                    (unsigned long long)task->size_,
+                    blob_is_compressed ? 1 : 0,
+                    blob_is_compressed ? "inverting codec" : "passthrough");
+
     auto* header = reinterpret_cast<CompressionHeader*>(temp_buffer.ptr_);
     size_t header_size = sizeof(CompressionHeader);
 
@@ -3360,6 +3368,53 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       if (success) {
         task->output_size_ = decompressed_size;
         task->decompress_time_ms_ = decompress_time;
+
+        // Show the RECONSTRUCTED VALUES, not just that a call returned 0.
+        // Same env gate as the codec-level trace above; this one fires after
+        // unshuffle and dequantize, so it reports the buffer the caller is
+        // actually about to receive. Sizes alone cannot distinguish a real
+        // reconstruction from a zero-filled buffer of the right length, and a
+        // zeroed buffer is what a silently-failed codec leaves behind.
+        //
+        // Scans the WHOLE buffer, not a sample. The fields this path carries
+        // are sparse -- a Gray-Scott V field is a few percent non-zero, packed
+        // into the slabs that hold the reacting region -- so both a head sample
+        // and an interior window read legitimate zeros and cry "blank" over a
+        // perfect reconstruction. A full count is the only sample that cannot
+        // lie, and per-chunk totals can be summed and checked against the
+        // source, which is what makes this proof rather than reassurance.
+        // One D2H copy per chunk, on a path that is already opt-in.
+        {
+          static const bool vtrace = [] {
+            const char *e = std::getenv("CLIO_NEUROPRESS_DECOMPRESS_TRACE");
+            return e && *e;
+          }();
+          if (vtrace && decompressed_size >= sizeof(float)) {
+            const size_t nfloat = decompressed_size / sizeof(float);
+            std::vector<float> all(nfloat);
+            // output_fullptr may be device memory (the VOL stages GPU-side),
+            // so this cannot be a plain dereference.
+            ctp::DeviceAwareMemcpy(reinterpret_cast<char *>(all.data()),
+                                   output_fullptr.ptr_,
+                                   nfloat * sizeof(float));
+            size_t nz = 0;
+            float lo = all[0], hi = all[0];
+            double sum = 0.0;
+            for (float f : all) {
+              if (f != 0.0f) ++nz;
+              lo = std::min(lo, f);
+              hi = std::max(hi, f);
+              sum += f;
+            }
+            std::fprintf(stderr,
+                         "[clio-decompress]   -> produced %zu bytes = %zu "
+                         "floats; nonzero=%zu min=%.6f max=%.6f mean=%.6g %s\n",
+                         static_cast<size_t>(decompressed_size), nfloat, nz,
+                         lo, hi, sum / (double)nfloat,
+                         nz == 0 ? "(all-zero chunk)" : "");
+            std::fflush(stderr);
+          }
+        }
 
         // Deferred decomp-head learning: this is the ONLY point a real
         // decompression time exists. Join it back to the features the

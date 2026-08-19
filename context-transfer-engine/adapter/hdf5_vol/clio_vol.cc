@@ -2554,6 +2554,11 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
        reassemble falls back to native below and must not be recorded as a
        cache serve. */
     bool served_cache = (cached != 0);
+    CLIO_PATH_TRACE("READ   cache probe dset='%s' chunk_0_size=%llu chunks=%zu "
+                    "total=%zu -> %s",
+                    dataset->dataset_path.c_str(),
+                    (unsigned long long)cached, num_chunks, total_size,
+                    cached ? "HIT (serve from CTE)" : "MISS (native + stage)");
 
     if (cached == 0) {
       /* MISS — native read is the source of truth, then stage into the tier.
