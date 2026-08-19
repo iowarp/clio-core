@@ -63,6 +63,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cmath>
@@ -578,14 +579,10 @@ int main(int argc, char **argv) {
     SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nx, ny, nz,
                                                 zper, ubase, vbase, vw, sv);
   });
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "GRAYSCOTT ERROR: seed failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  ctp::GpuApi::Synchronize();
 
   double *d_sum = nullptr;
-  cudaMalloc(&d_sum, sizeof(double));
+  d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(double));
 
   // ---- BASELINE DRIVER ------------------------------------------------
   // Per z: blocking reads of the 6 input planes, blocking H2D, one kernel
@@ -606,19 +603,20 @@ int main(int argc, char **argv) {
   if (baseline) {
     for (int i = 0; i < 6; ++i) {
       bl_h[i] = CLIO_IPC->AllocateBuffer((size_t)page_bytes_gs);
-      if (bl_h[i].IsNull() ||
-          cudaMalloc(&bl_d[i], (size_t)page_bytes_gs) != cudaSuccess) {
+      if (bl_h[i].IsNull()) {
         std::fprintf(stderr, "GRAYSCOTT ERROR: baseline alloc failed\n");
         return 1;
       }
+      // GpuApi::Malloc fails fatally, which is the same abort with less code.
+      bl_d[i] = ctp::GpuApi::Malloc<float>((size_t)page_bytes_gs);
     }
     for (int i = 0; i < 2; ++i) {
       bl_out[i] = CLIO_IPC->AllocateBuffer((size_t)page_bytes_gs);
-      if (bl_out[i].IsNull() ||
-          cudaMalloc(&bl_dout[i], (size_t)page_bytes_gs) != cudaSuccess) {
+      if (bl_out[i].IsNull()) {
         std::fprintf(stderr, "GRAYSCOTT ERROR: baseline alloc failed\n");
         return 1;
       }
+      bl_dout[i] = ctp::GpuApi::Malloc<float>((size_t)page_bytes_gs);
     }
     bl_core = new clio::cte::core::Client(kCorePool);
   }
@@ -633,15 +631,15 @@ int main(int argc, char **argv) {
     if (gf->GetReturnCode() != 0) {
       std::memset(bl_h[i].ptr_, 0, (size_t)page_bytes_gs);
     }
-    return cudaMemcpy(bl_d[i], bl_h[i].ptr_, (size_t)page_bytes_gs,
-                      cudaMemcpyHostToDevice) == cudaSuccess;
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(bl_d[i]), bl_h[i].ptr_,
+                        (size_t)page_bytes_gs);
+    return true;
   };
   // SYNCHRONOUS WRITE of one output plane: D2H, then a blocking PutBlob.
   auto bl_write = [&](int i, u64 region_base, u64 z) {
-    if (cudaMemcpy(bl_out[i].ptr_, bl_dout[i], (size_t)page_bytes_gs,
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-      return false;
-    }
+    ctp::GpuApi::Memcpy(bl_out[i].ptr_,
+                        reinterpret_cast<const char *>(bl_dout[i]),
+                        (size_t)page_bytes_gs);
     char nm[32];
     gv::PageBlobName((region_base + z * plane) / plane, nm);
     auto pf = bl_core->AsyncPutBlob(vec.TagId(), nm, 0, page_bytes_gs,
@@ -661,7 +659,7 @@ int main(int argc, char **argv) {
       GrayscottBaselineKernel<<<1, threads>>>(
           bl_d[0], bl_d[1], bl_d[2], bl_d[3], bl_d[4], bl_d[5], bl_dout[0],
           bl_dout[1], plane, nx, ny, interior ? 1 : 0, Du, Dv, F, K, dt);
-      if (cudaDeviceSynchronize() != cudaSuccess) return false;
+      ctp::GpuApi::Synchronize();
       if (!bl_write(0, nu_, z) || !bl_write(1, nv_, z)) return false;
     }
     return true;
@@ -679,14 +677,10 @@ int main(int argc, char **argv) {
         SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nx, ny, nz,
                                                     zper, ubase, vbase, vw, sv);
       });
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::fprintf(stderr, "GRAYSCOTT ERROR: re-seed failed: %s\n",
-                     cudaGetErrorString(cudaGetLastError()));
-        return 1;
-      }
+      ctp::GpuApi::Synchronize();
     }
     vec.ResetStats();
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
     u64 cu = ubase, cv = vbase, nu = unext, nv = vnext;
     for (u32 s = 0; s < steps; ++s) {
@@ -706,22 +700,18 @@ int main(int argc, char **argv) {
       std::swap(cu, nu);
       std::swap(cv, nv);
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "GRAYSCOTT ERROR: step failed: %s\n",
-                   cudaGetErrorString(cudaGetLastError()));
-      return 1;
-    }
+    ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
 
-    cudaMemset(d_sum, 0, sizeof(double));
+    ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       SumKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nz, zper, cv,
                                                  d_sum, vw, sv);
     });
-    cudaDeviceSynchronize();
-    cudaMemcpy(&checksum, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Synchronize();
+    ctp::GpuApi::Memcpy(&checksum, d_sum, sizeof(double));
   }
 
   const auto st = vec.ReadStats(0);
@@ -791,7 +781,7 @@ int main(int argc, char **argv) {
                (unsigned long long)st.put_errors,
                mcp.pinned_gbps, mcp.pageable_gbps);
 
-  cudaFree(d_sum);
+  ctp::GpuApi::Free(d_sum);
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 #endif  // GV_GS_CORO

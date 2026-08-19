@@ -25,6 +25,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/gpu/yieldable.h>
@@ -712,11 +713,7 @@ int main(int argc, char **argv) {
       WarmKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, a.iters,
                                                   pages_per_region, vw, sv);
     });
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "warm failed: %s\n",
-                   cudaGetErrorString(cudaGetLastError()));
-      std::exit(1);
-    }
+    ctp::GpuApi::Synchronize();
   };
   warm();
 
@@ -750,43 +747,39 @@ int main(int argc, char **argv) {
   // ---------------- read + prefetch mode -----------------------------
   if (a.read) {
     unsigned long long *d_sum = nullptr;
-    cudaMalloc(&d_sum, sizeof(unsigned long long));
+    d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(unsigned long long));
     unsigned long long *d_bad = nullptr, *d_first = nullptr, *d_boff = nullptr;
     u32 *d_bgot = nullptr;
-    cudaMalloc(&d_bad, sizeof(unsigned long long));
-    cudaMalloc(&d_first, sizeof(unsigned long long));
-    cudaMalloc(&d_boff, sizeof(unsigned long long));
-    cudaMalloc(&d_bgot, sizeof(u32));
+    d_bad = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_bad)>>(sizeof(unsigned long long));
+    d_first = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_first)>>(sizeof(unsigned long long));
+    d_boff = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_boff)>>(sizeof(unsigned long long));
+    d_bgot = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_bgot)>>(sizeof(u32));
     auto rrun = [&](u32 spin, int async, unsigned long long *out) {
       double best = 1e30;
       for (u32 r = 0; r < a.repeat; ++r) {
-        cudaMemset(d_sum, 0, sizeof(unsigned long long));
-        cudaMemset(d_bad, 0, sizeof(unsigned long long));
+        ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
+        ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
         const unsigned long long big = ~0ull;
-        cudaMemcpy(d_first, &big, sizeof(big), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_boff, &big, sizeof(big), cudaMemcpyHostToDevice);
-        cudaMemset(d_bgot, 0, sizeof(u32));
+        ctp::GpuApi::Memcpy(d_first, &big, sizeof(big));
+        ctp::GpuApi::Memcpy(d_boff, &big, sizeof(big));
+        ctp::GpuApi::Memset(d_bgot, 0, sizeof(u32));
         vec.ResetStats();
-        cudaDeviceSynchronize();
+        ctp::GpuApi::Synchronize();
         const double t0 = NowMs();
         SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
             gpu, dev, a.iters, pages_per_region, spin, clock_khz, async, d_sum,
             d_bad, d_first, d_boff, d_bgot);
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-          std::fprintf(stderr, "read kernel failed: %s\n",
-                       cudaGetErrorString(cudaGetLastError()));
-          std::exit(1);
-        }
+        ctp::GpuApi::Synchronize();
         const double ms = NowMs() - t0;
         if (ms < best) best = ms;
       }
-      cudaMemcpy(out, d_sum, sizeof(*out), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(out, d_sum, sizeof(*out));
       unsigned long long nb = 0, fb = 0;
-      cudaMemcpy(&nb, d_bad, sizeof(nb), cudaMemcpyDeviceToHost);
-      cudaMemcpy(&fb, d_first, sizeof(fb), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(&nb, d_bad, sizeof(nb));
+      ctp::GpuApi::Memcpy(&fb, d_first, sizeof(fb));
       unsigned long long bo = 0; u32 bg = 0;
-      cudaMemcpy(&bo, d_boff, sizeof(bo), cudaMemcpyDeviceToHost);
-      cudaMemcpy(&bg, d_bgot, sizeof(bg), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(&bo, d_boff, sizeof(bo));
+      ctp::GpuApi::Memcpy(&bg, d_bgot, sizeof(bg));
       const auto st_now = vec.ReadStats(0);
       std::printf("    [%s spin=%u] wrong_elems=%llu first_bad_page=%lld "
                   "faults=%llu GET_ERRORS=%llu\n",
@@ -815,33 +808,28 @@ int main(int argc, char **argv) {
     // each slot. Data from pages 0..15 => copies land, readers raced them.
     // Data still from 96..111 => the copies never arrived at all.
     {
-      cudaMemset(d_sum, 0, sizeof(unsigned long long));
-      cudaMemset(d_bad, 0, sizeof(unsigned long long));
+      ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
+      ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
       const unsigned long long big2 = ~0ull;
-      cudaMemcpy(d_first, &big2, sizeof(big2), cudaMemcpyHostToDevice);
-      cudaMemcpy(d_boff, &big2, sizeof(big2), cudaMemcpyHostToDevice);
-      cudaMemset(d_bgot, 0, sizeof(u32));
+      ctp::GpuApi::Memcpy(d_first, &big2, sizeof(big2));
+      ctp::GpuApi::Memcpy(d_boff, &big2, sizeof(big2));
+      ctp::GpuApi::Memset(d_bgot, 0, sizeof(u32));
       SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
           gpu, dev, 1, pages_per_region, 0, clock_khz, 0, d_sum, d_bad,
           d_first, d_boff, d_bgot);
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::fprintf(stderr, "probe kernel failed: %s\n",
-                     cudaGetErrorString(cudaGetLastError()));
-        return 1;
-      }
+      ctp::GpuApi::Synchronize();
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
       unsigned long long *d_dump = nullptr;
-      cudaMalloc(&d_dump, 2 * slots * sizeof(unsigned long long));
+      d_dump = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_dump)>>(2 * slots * sizeof(unsigned long long));
       DumpSlotsKernel<<<1, 32>>>(dev, d_dump);
-      cudaDeviceSynchronize();
+      ctp::GpuApi::Synchronize();
       std::vector<unsigned long long> hd(2 * slots);
-      cudaMemcpy(hd.data(), d_dump, 2 * slots * sizeof(unsigned long long),
-                 cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(hd.data(), d_dump, 2 * slots * sizeof(unsigned long long));
       const u32 A2 = 2654435761u;
       u32 inv2 = 1u;
       for (int k = 0; k < 6; ++k) inv2 *= (2u - A2 * inv2);
       unsigned long long nbad = 0;
-      cudaMemcpy(&nbad, d_bad, sizeof(nbad), cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(&nbad, d_bad, sizeof(nbad));
       std::printf("  PROBE (1 region, sync, wrong_elems=%llu):\n", nbad);
       for (u64 i2 = 0; i2 < slots; ++i2) {
         const unsigned long long pn = hd[2 * i2];
@@ -854,7 +842,7 @@ int main(int argc, char **argv) {
                     (unsigned long long) i2, pn, (unsigned long long) src_page,
                     (pn == src_page) ? "" : "   <-- STALE");
       }
-      cudaFree(d_dump);
+      ctp::GpuApi::Free(d_dump);
       // Probe consumed region 0's warm state; restore it for the real runs.
       warm();
     }
@@ -923,7 +911,7 @@ int main(int argc, char **argv) {
     double best = 1e30;
     for (u32 r = 0; r < a.repeat; ++r) {
       vec.ResetStats();
-      cudaDeviceSynchronize();
+      ctp::GpuApi::Synchronize();
       const double t0 = NowMs();
       const u32 this_pass = pass++;
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
@@ -932,11 +920,7 @@ int main(int argc, char **argv) {
             gpu, dev, a.iters, pages_per_region, spin, clock_khz, do_write,
             this_pass, async, vw, sv);
       });
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::fprintf(stderr, "kernel failed: %s\n",
-                     cudaGetErrorString(cudaGetLastError()));
-        std::exit(1);
-      }
+      ctp::GpuApi::Synchronize();
       const double ms = NowMs() - t0;
       if (ms < best) best = ms;
     }

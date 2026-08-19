@@ -32,6 +32,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/gpu/yieldable.h>
 
@@ -655,10 +656,10 @@ int main(int argc, char **argv) {
             // Dump block 0's page table: which slots are wedged, and how.
             gv::DeviceVector<clio::run::u32> dv = vec.GetDevice(0);
             gv::VecHeader hh;
-            cudaMemcpy(&hh, dv.h_, sizeof(hh), cudaMemcpyDeviceToHost);
+            ctp::GpuApi::Memcpy(&hh, dv.h_, sizeof(hh));
             std::vector<gv::Page> pg(hh.pages_per_block_);
-            cudaMemcpy(pg.data(), hh.pages_ + (size_t)b * hh.pages_per_block_,
-                       pg.size() * sizeof(gv::Page), cudaMemcpyDeviceToHost);
+            ctp::GpuApi::Memcpy(pg.data(), hh.pages_ + (size_t)b * hh.pages_per_block_,
+                       pg.size() * sizeof(gv::Page));
             for (clio::run::u32 i = 0; i < hh.pages_per_block_; ++i) {
               if (pg[i].page_num == gv::kNoPage && !pg[i].fetching &&
                   !pg[i].flushing) continue;
@@ -700,10 +701,7 @@ int main(int argc, char **argv) {
   } else {
       SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
   }
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "bench: seed failed\n");
-    return 1;
-  }
+  ctp::GpuApi::Synchronize();
 
   // Stored footprint: what the model actually occupies in the CTE, which is
   // what decides whether it fits the GPU tier.
@@ -740,12 +738,12 @@ int main(int argc, char **argv) {
   }
 
   unsigned long long *d_sum = nullptr;
-  cudaMalloc(&d_sum, sizeof(unsigned long long));
+  d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(unsigned long long));
   const clio::run::u64 total_pages = n / page_elems;
   unsigned long long *d_page_sum = nullptr;
   unsigned *d_page_visits = nullptr;
-  cudaMalloc(&d_page_sum, total_pages * sizeof(unsigned long long));
-  cudaMalloc(&d_page_visits, total_pages * sizeof(unsigned));
+  d_page_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_page_sum)>>(total_pages * sizeof(unsigned long long));
+  d_page_visits = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_page_visits)>>(total_pages * sizeof(unsigned));
   unsigned long long want = 0;
   for (clio::run::u64 i = 0; i < n; ++i) {
     want += static_cast<unsigned long long>(Weight(i, flat_pct)) * Activation(i);
@@ -760,11 +758,13 @@ int main(int argc, char **argv) {
   clio::cte::core::Client *bl_core = nullptr;
   if (baseline) {
     bl_host = CLIO_IPC->AllocateBuffer(static_cast<size_t>(page_bytes));
-    if (bl_host.IsNull() ||
-        cudaMalloc(&bl_dev, static_cast<size_t>(page_bytes)) != cudaSuccess) {
+    if (bl_host.IsNull()) {
       std::fprintf(stderr, "bench: baseline staging alloc failed\n");
       return 1;
     }
+    // GpuApi::Malloc fails fatally, which is the same abort with less code.
+    bl_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(bl_dev)>>(
+        static_cast<size_t>(page_bytes));
     bl_core = new clio::cte::core::Client(kCorePool);
     std::fprintf(stderr, "[baseline] staging ready, %llu tiles of %lluB\n",
                  (unsigned long long)total_pages,
@@ -785,15 +785,13 @@ int main(int argc, char **argv) {
       gf.Wait();
       if (gf->GetReturnCode() != 0) continue;   // never stored
       // (2) SYNCHRONOUS HBM<->DRAM copy.
-      if (cudaMemcpy(bl_dev, bl_host.ptr_, static_cast<size_t>(page_bytes),
-                     cudaMemcpyHostToDevice) != cudaSuccess) {
-        return false;
-      }
+      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(bl_dev), bl_host.ptr_,
+                          static_cast<size_t>(page_bytes));
       // (3) The kernel runs ONLY while its tile is resident, then exits.
       WeightsBaselineKernel<<<1, nthreads>>>(
           bl_dev, p * page_elems, page_elems, d_sum, d_page_sum, d_page_visits,
           page_elems);
-      if (cudaDeviceSynchronize() != cudaSuccess) return false;
+      ctp::GpuApi::Synchronize();
     }
     return true;
   };
@@ -803,9 +801,9 @@ int main(int argc, char **argv) {
   clio::run::u64 best_ms = 0;
   bool ok = true;
   for (int r = 0; r < repeat; ++r) {
-    cudaMemset(d_sum, 0, sizeof(unsigned long long));
-    cudaMemset(d_page_sum, 0, total_pages * sizeof(unsigned long long));
-    cudaMemset(d_page_visits, 0, total_pages * sizeof(unsigned));
+    ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_page_sum, 0, total_pages * sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_page_visits, 0, total_pages * sizeof(unsigned));
     const clio::run::u64 t0 = NowMs();
     if (baseline) {
       if (!run_baseline()) {
@@ -827,21 +825,19 @@ int main(int argc, char **argv) {
             // 4 bytes over PCIe (~5us) instead of relaunching the grid (~50us+)
             // just to have the block discover its page has not landed.
             unsigned flag = 0;
-            cudaMemcpy(&flag, reinterpret_cast<const void *>(tag),
-                       sizeof(flag), cudaMemcpyDeviceToHost);
+            ctp::GpuApi::Memcpy(&flag,
+                                reinterpret_cast<const unsigned *>(tag),
+                                sizeof(flag));
             return flag != 0;
           });
     } else {
       WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, page_elems,
                                     prefetch, d_sum);
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "bench: kernel failed\n");
-      return 1;
-    }
+    ctp::GpuApi::Synchronize();
     const clio::run::u64 ms = NowMs() - t0;
     unsigned long long got = 0;
-    cudaMemcpy(&got, d_sum, sizeof(got), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
     if (got != want) {
       ok = false;
       std::fprintf(stderr, "[cmp] got=%llu want=%llu ratio=%.4f\n",
@@ -849,11 +845,9 @@ int main(int argc, char **argv) {
                    want ? (double) got / (double) want : 0.0);
       std::vector<unsigned long long> ps(total_pages);
       std::vector<unsigned> pv(total_pages);
-      cudaMemcpy(ps.data(), d_page_sum,
-                 total_pages * sizeof(unsigned long long),
-                 cudaMemcpyDeviceToHost);
-      cudaMemcpy(pv.data(), d_page_visits, total_pages * sizeof(unsigned),
-                 cudaMemcpyDeviceToHost);
+      ctp::GpuApi::Memcpy(ps.data(), d_page_sum,
+                 total_pages * sizeof(unsigned long long));
+      ctp::GpuApi::Memcpy(pv.data(), d_page_visits, total_pages * sizeof(unsigned));
       int shown = 0;
       for (clio::run::u64 p = 0; p < total_pages && shown < 6; ++p) {
         unsigned long long w = 0;
@@ -879,7 +873,7 @@ int main(int argc, char **argv) {
       best_ms = ms;
     }
   }
-  cudaFree(d_sum);
+  ctp::GpuApi::Free(d_sum);
 
   // A run that could not write its data back is not a valid measurement,
   // however good its throughput looks. Reported SEPARATELY from the checksum:

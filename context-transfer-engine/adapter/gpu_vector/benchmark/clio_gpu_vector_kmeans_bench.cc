@@ -39,6 +39,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cstdio>
@@ -455,18 +456,14 @@ int main(int argc, char **argv) {
     SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, per, page_elems,
                                                 dims, k, vw, sv);
   });
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::fprintf(stderr, "KMEANS ERROR: seed failed: %s\n",
-                 cudaGetErrorString(cudaGetLastError()));
-    return 1;
-  }
+  ctp::GpuApi::Synchronize();
 
   // ---- device state -------------------------------------------------------
   float *d_cent = nullptr, *d_sums = nullptr;
   unsigned *d_counts = nullptr;
-  cudaMalloc(&d_cent, k * dims * sizeof(float));
-  cudaMalloc(&d_sums, k * dims * sizeof(float));
-  cudaMalloc(&d_counts, k * sizeof(unsigned));
+  d_cent = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_cent)>>(k * dims * sizeof(float));
+  d_sums = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sums)>>(k * dims * sizeof(float));
+  d_counts = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_counts)>>(k * sizeof(unsigned));
 
   // Initial centroids: the first k points, taken on the host from the same
   // generator, so every configuration starts identically.
@@ -486,11 +483,13 @@ int main(int argc, char **argv) {
   const u64 total_pages = (per * static_cast<u64>(blocks)) / page_elems;
   if (baseline) {
     bl_host = CLIO_IPC->AllocateBuffer(static_cast<size_t>(page_bytes));
-    if (bl_host.IsNull() ||
-        cudaMalloc(&bl_dev, static_cast<size_t>(page_bytes)) != cudaSuccess) {
+    if (bl_host.IsNull()) {
       std::fprintf(stderr, "KMEANS ERROR: baseline staging alloc failed\n");
       return 1;
     }
+    // GpuApi::Malloc fails fatally, which is the same abort with less code.
+    bl_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(bl_dev)>>(
+        static_cast<size_t>(page_bytes));
     bl_core = new clio::cte::core::Client(kCorePool);
   }
   auto run_baseline_pass = [&]() {
@@ -502,13 +501,11 @@ int main(int argc, char **argv) {
                                       clio::run::PoolQuery::Local());
       gf.Wait();
       if (gf->GetReturnCode() != 0) continue;
-      if (cudaMemcpy(bl_dev, bl_host.ptr_, static_cast<size_t>(page_bytes),
-                     cudaMemcpyHostToDevice) != cudaSuccess) {
-        return false;
-      }
+      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(bl_dev), bl_host.ptr_,
+                          static_cast<size_t>(page_bytes));
       KmeansBaselineKernel<<<1, threads>>>(bl_dev, page_elems, dims, k, d_cent,
                                            d_sums, d_counts);
-      if (cudaDeviceSynchronize() != cudaSuccess) return false;
+      ctp::GpuApi::Synchronize();
     }
     return true;
   };
@@ -516,14 +513,13 @@ int main(int argc, char **argv) {
   double best_ms = 1e30;
   std::vector<float> h_final(static_cast<size_t>(k) * dims);
   for (int r = 0; r < repeat; ++r) {
-    cudaMemcpy(d_cent, h_cent.data(), h_cent.size() * sizeof(float),
-               cudaMemcpyHostToDevice);
+    ctp::GpuApi::Memcpy(d_cent, h_cent.data(), h_cent.size() * sizeof(float));
     vec.ResetStats();
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
     for (u32 it = 0; it < iters; ++it) {
-      cudaMemset(d_sums, 0, k * dims * sizeof(float));
-      cudaMemset(d_counts, 0, k * sizeof(unsigned));
+      ctp::GpuApi::Memset(d_sums, 0, k * dims * sizeof(float));
+      ctp::GpuApi::Memset(d_counts, 0, k * sizeof(unsigned));
       if (baseline) {
         if (!run_baseline_pass()) {
           std::fprintf(stderr, "KMEANS ERROR: baseline tile loop failed\n");
@@ -539,15 +535,10 @@ int main(int argc, char **argv) {
       }
       UpdateKernel<<<(k + 63) / 64, 64>>>(d_cent, d_sums, d_counts, dims, k);
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      std::fprintf(stderr, "KMEANS ERROR: assign failed: %s\n",
-                   cudaGetErrorString(cudaGetLastError()));
-      return 1;
-    }
+    ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
-    cudaMemcpy(h_final.data(), d_cent, h_final.size() * sizeof(float),
-               cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(h_final.data(), d_cent, h_final.size() * sizeof(float));
   }
 
   // Checksum of the final centroids. Compare across configurations with a
@@ -623,7 +614,7 @@ int main(int argc, char **argv) {
                (unsigned long long)st.put_errors,
                mcp.pinned_gbps, mcp.pageable_gbps);
 
-  cudaFree(d_cent); cudaFree(d_sums); cudaFree(d_counts);
+  ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 #endif  // GV_KM_CORO
