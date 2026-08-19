@@ -34,8 +34,23 @@ build first:  make -C $BUILD neuropress_grayscott_h5 clio_hdf5_vol" >&2; return 
   # pins K to 31) and ranks on ratio alone, so it does not take an explicit K.
   BEST=${BEST:-false}
   EXPLORE_K=${EXPLORE_K:-0}
+  LEARN=${LEARN:-false}
+  # Exploration only fires on chunks whose cost error exceeds this. 0 means
+  # every chunk, which is what best mode does via its own bypass -- but best
+  # mode ALSO forces ratio-only adoption (kCostW0/W1 are hardcoded off it), so
+  # it cannot be used to study the cost model. Setting the threshold directly
+  # gets exhaustive exploration while leaving the weights alone.
+  THRESH=${THRESH:-0.5}
+  # Three distinct modes, and they are not a ladder:
+  #   inference   predict and pick, nothing is measured back
+  #   learning    SGD updates the model from each chunk's real outcome
+  #   exploration learning PLUS actually compressing alternatives to compare
+  # Exploration implies learning (its samples are what SGD trains on), but
+  # learning is useful on its own and used to be unreachable here.
   if [ "${EXPLORE_K:-0}" -gt 0 ]; then
     NP_LEARN=true;  NP_EXPLORE=true
+  elif [ "$LEARN" = true ]; then
+    NP_LEARN=true;  NP_EXPLORE=false
   else
     NP_LEARN=false; NP_EXPLORE=false
   fi
@@ -67,6 +82,7 @@ compose:
     neuropress_online_learning_enabled: $NP_LEARN
     neuropress_exploration_enabled: $NP_EXPLORE
     neuropress_exploration_k: $EXPLORE_K
+    neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
   - mod_name: clio_cte_core
     pool_name: cte_core

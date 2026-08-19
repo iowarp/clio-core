@@ -5,7 +5,7 @@
 #
 # Usage: ./np_write.sh [-b BUILD] [-L N] [-s STEPS] [-g GAP] [--store DIR]
 set -euo pipefail
-BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false
+BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false; LEARN=false; THRESH=0.5
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--build) BUILD=$2; shift 2 ;;
@@ -14,7 +14,9 @@ while [ $# -gt 0 ]; do
     -g|--gap)   GAP=$2; shift 2 ;;
     --store)    STORE=$2; shift 2 ;;
     --chunk)    CHUNK=$2; shift 2 ;;
+    --learn)    LEARN=true; shift ;;
     --explore)  EXPLORE_K=$2; shift 2 ;;
+    --threshold) THRESH=$2; shift 2 ;;
     --best)     BEST=true; shift ;;
     -h|--help)  sed -n '2,7p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
