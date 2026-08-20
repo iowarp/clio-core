@@ -128,13 +128,35 @@ int main(int argc, char **argv) {
   const char *weights = nullptr;
   bool inference_only = false;
   bool zero_output = false;
+  // Static algorithm override. Mirrors Clio's neuropress_static_lib: when
+  // set, the NN is not consulted and every chunk uses this algorithm. This
+  // is the control condition -- the ratio a fixed codec gets on the same
+  // bytes, which is what a NeuroPress ratio has to be measured against.
+  gpucompress_algorithm_t static_algo = GPUCOMPRESS_ALGO_AUTO;
   long dump_chunk = -1;
   bool flush_cache = false;
   const char *clio_payload_dir = nullptr;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--inference-only") {
+    if (a == "--algo" && i + 1 < argc) {
+      // Name, so the command line says what it means. Only the algorithms
+      // Clio's registry can also name are accepted -- an algorithm with no
+      // Clio counterpart cannot be part of a comparison.
+      std::string an = argv[++i];
+      if      (an == "auto")     static_algo = GPUCOMPRESS_ALGO_AUTO;
+      else if (an == "lz4")      static_algo = GPUCOMPRESS_ALGO_LZ4;
+      else if (an == "snappy")   static_algo = GPUCOMPRESS_ALGO_SNAPPY;
+      else if (an == "deflate")  static_algo = GPUCOMPRESS_ALGO_DEFLATE;
+      else if (an == "gdeflate") static_algo = GPUCOMPRESS_ALGO_GDEFLATE;
+      else if (an == "zstd")     static_algo = GPUCOMPRESS_ALGO_ZSTD;
+      else if (an == "ans")      static_algo = GPUCOMPRESS_ALGO_ANS;
+      else if (an == "bitcomp")  static_algo = GPUCOMPRESS_ALGO_BITCOMP;
+      else {
+        std::fprintf(stderr, "unknown --algo '%s'\n", an.c_str());
+        return 2;
+      }
+    } else if (a == "--inference-only") {
       inference_only = true;
     } else if (a == "--dump-chunk" && i + 1 < argc) {
       dump_chunk = std::atol(argv[++i]);
@@ -192,6 +214,10 @@ int main(int argc, char **argv) {
     }
   }
   gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);
+  // A static algorithm never reaches the selector, so learning has no
+  // prediction error to train on. Force it off rather than leaving a switch
+  // set that does nothing -- same normalisation Clio's Create() does.
+  if (static_algo != GPUCOMPRESS_ALGO_AUTO) inference_only = true;
   if (inference_only) {
     gpucompress_disable_online_learning();
   } else {
@@ -257,7 +283,7 @@ int main(int argc, char **argv) {
   }
 
   gpucompress_config_t cfg = gpucompress_default_config();
-  cfg.algorithm = GPUCOMPRESS_ALGO_AUTO;  // NN picks per chunk
+  cfg.algorithm = static_algo;  // ALGO_AUTO = NN picks per chunk
   cfg.preprocessing = GPUCOMPRESS_PREPROC_NONE;
   cfg.error_bound = 0.0;  // lossless, matching the Clio run
 
