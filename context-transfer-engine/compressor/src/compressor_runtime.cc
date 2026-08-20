@@ -1584,7 +1584,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool neuropress_feat_valid = false;
     double neuropress_entropy = 0.0, neuropress_mad = 0.0,
            neuropress_second_deriv = 0.0;
-    if (config_.neuropress_online_learning_enabled_ &&
+    // Best mode needs these too. The features gate the exploration block
+    // below (via neuropress_feat_valid), and best mode explores without
+    // learning -- so keying their computation on the learning switch alone
+    // left best mode with no features, hence no exploration, hence a run
+    // that quietly returned an inference result.
+    if ((config_.neuropress_online_learning_enabled_ ||
+         config_.neuropress_best_mode_) &&
         context.dynamic_compress_ != 1 && neuropress_predictor_ &&
         neuropress_predictor_->IsReady()) {
       // FLOAT32 unconditionally, and NOT context.data_type_. Reaching here
@@ -1679,8 +1685,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
     // Record what the model chose for this chunk, before the online-learning
     // and exploration blocks below can adopt an alternative. Not gated on
-    // neuropress_feat_valid: that flag is only set when online learning is on,
-    // and a selection is worth recording either way -- the entropy/mad/curvature
+    // neuropress_feat_valid: that flag is only set when online learning or
+    // best mode is on, and a selection is worth recording either way -- the
+    // entropy/mad/curvature
     // columns are zero without that snapshot, but the chosen configuration is
     // always real.
     {
@@ -1728,7 +1735,19 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // which threshold gates them. actual_compression_ratio_ <= 0 means the
     // codec produced no measurable result, so there is no ground truth to
     // train on.
-    if (config_.neuropress_online_learning_enabled_ && neuropress_feat_valid &&
+    // Best mode reaches this block WITHOUT online learning. Exploration is
+    // nested inside it, so gating purely on the learning switch made
+    // `--best` silently degrade to plain inference: Create() turned
+    // exploration on and pinned K to 31, the per-chunk path never looked,
+    // and the run finished in inference time reporting an inference result.
+    // Both SGD phases stay suppressed under best mode by their own
+    // `!neuropress_best_mode_` guards below, so admitting it here buys the
+    // exhaustive sweep and no training -- which is what best mode claims to
+    // be. Mirror of e28e9315, which made exploration reachable without best
+    // mode; this makes best mode reachable without learning.
+    if ((config_.neuropress_online_learning_enabled_ ||
+         config_.neuropress_best_mode_) &&
+        neuropress_feat_valid &&
         task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
       const CompressionStats* predicted = nullptr;
       for (const auto& stat : stats) {
