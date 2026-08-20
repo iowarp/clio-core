@@ -434,7 +434,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<int> nl, u32 nb,
                                        u32 cap, float box, float rlist,
                                        u32 maxneigh, u32 *d_cnt, int *d_err,
-                                       u32 nblocks, u32 block) {
+                                       u32 rowchunk, u32 nblocks, u32 block) {
   extern __shared__ char smem_raw[];
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
   // holds the same rows and the same list guards, but a thread-local array
@@ -460,30 +460,41 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
   const u64 rowlist = islots * maxneigh;
   const float r2list = rlist * rlist;
   const float halfL = 0.5f * box;
-  for (u64 row = block; row < nrows; row += nblocks) {
-    const u32 by = static_cast<u32>(row % nb);
-    const u32 bz = static_cast<u32>(row / nb);
-    // HOLD THE STENCIL AS SPANS, NOT ROWS. For a fixed dz the three dy
-    // rows are ADJACENT in the index space (row = bz*nb + by), so one hold
-    // covers all three -- three spans instead of nine rows. On the y wrap
-    // boundary the -1/+1 rows are not adjacent and that dz falls back to
-    // three spans. This is the optimization that matters, because holds
-    // ARE the cost of this pass: measured with the pair loop disabled,
-    // force was 309.8 ms against 300.6 ms with it -- the physics is free
-    // and every millisecond is barriers, fences and probes.
-    gv::Held<float> hg[9][2];
-    u64 srun[9];
-    const float *sp0[9], *sp1[9];
-    u32 qspan[9];
-    u64 qoff[9];
+  // Same amortization as the force pass: the stencil spans serve a CHUNK
+  // of rows, so the three holds are paid once per chunk rather than once
+  // per row.
+  const u32 cpz = (nb + rowchunk - 1) / rowchunk;
+  const u64 nchunks = static_cast<u64>(nb) * cpz;
+  for (u64 ch = block; ch < nchunks; ch += nblocks) {
+    const u32 bz = static_cast<u32>(ch / cpz);
+    const u32 y0 = static_cast<u32>(ch % cpz) * rowchunk;
+    if (y0 >= nb) continue;
+    const u32 ylast = (y0 + rowchunk - 1 < nb) ? (y0 + rowchunk - 1)
+                                               : (nb - 1);
+    gv::Held<float> hg[6][2];
+    u64 srun[6];
+    const float *sp0[6], *sp1[6];
+    u32 sbase[6], scnt[6], sdz[6];
     u32 nspans = 0;
-    const bool merge = (by >= 1 && by + 1 < nb);
     for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
-      if (merge) {
+      const int lo = static_cast<int>(y0) - 1;
+      const int hi = static_cast<int>(ylast) + 1;
+      u32 rl[2], rn[2], nr = 0;
+      if (lo < 0) {
+        rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+        rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+      } else if (hi > static_cast<int>(nb) - 1) {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
+        rl[nr] = 0; rn[nr] = 1u; ++nr;
+      } else {
+        rl[nr] = static_cast<u32>(lo);
+        rn[nr] = static_cast<u32>(hi - lo + 1); ++nr;
+      }
+      for (u32 t = 0; t < nr; ++t) {
         const u64 rb =
-            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
-        const u64 len = 3 * row_elems;
+            ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+        const u64 len = static_cast<u64>(rn[t]) * row_elems;
         hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
@@ -492,32 +503,39 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         }
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
-        for (int dy = -1; dy <= 1; ++dy) {
-          const int q = (dz + 1) * 3 + (dy + 1);
-          qspan[q] = nspans;
-          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
-        }
+        sbase[nspans] = rl[t];
+        scnt[nspans] = rn[t];
+        sdz[nspans] = static_cast<u32>(dz + 1);
         ++nspans;
-      } else {
+      }
+    }
+    if (threadIdx.x == 0) {
+      for (u32 t = 0; t < nspans; ++t) {
+        s_sp0[t] = sp0[t];
+        s_sp1[t] = sp1[t];
+        s_srun[t] = srun[t];
+      }
+    }
+    __syncthreads();
+    for (u32 by = y0; by <= ylast; ++by) {
+    const u64 row = static_cast<u64>(bz) * nb + by;
+    if (threadIdx.x == 0) {
+      for (int dz = -1; dz <= 1; ++dz) {
         for (int dy = -1; dy <= 1; ++dy) {
           const u32 wy = (by + nb + dy) % nb;
-          const u64 rb =
-              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
-          hg[nspans][0] = co_await x.HoldPage(rb, row_elems);
-          srun[nspans] = hg[nspans][0].run();
-          if (srun[nspans] < row_elems) {
-            hg[nspans][1] = co_await x.HoldPage(rb + srun[nspans],
-                                                row_elems - srun[nspans]);
-          }
-          sp0[nspans] = hg[nspans][0].ptr();
-          sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
           const int q = (dz + 1) * 3 + (dy + 1);
-          qspan[q] = nspans;
-          qoff[q] = 0;
-          ++nspans;
+          for (u32 t = 0; t < nspans; ++t) {
+            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
+            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
+              s_qspan[q] = t;
+              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
+              break;
+            }
+          }
         }
       }
     }
+    __syncthreads();
     // Write-hold this row's whole list region (host-checked to fit the
     // guard array): the working-set lower bound for the neigh vector.
     gv::Held<int> hn[kMaxNlGuards];
@@ -538,15 +556,6 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
       }
     }
     if (threadIdx.x == 0) {
-      for (u32 q = 0; q < nspans; ++q) {
-        s_sp0[q] = sp0[q];
-        s_sp1[q] = sp1[q];
-        s_srun[q] = srun[q];
-      }
-      for (int q = 0; q < 9; ++q) {
-        s_qspan[q] = qspan[q];
-        s_qoff[q] = qoff[q];
-      }
       for (u32 q = 0; q < nguards; ++q) {
         s_np[q] = np[q];
         s_gs[q] = gstart[q];
@@ -611,7 +620,8 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
       d_cnt[slotbase + s] = cnt;
     }
     __syncthreads();
-  }
+    }   // per-row loop
+  }     // per-chunk loop
 }
 
 /**
@@ -1199,7 +1209,8 @@ __global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<int> nl, u32 nb, u32 cap,
                                 float box, float rlist, u32 maxneigh,
-                                u32 *d_cnt, int *d_err, u32 nblocks,
+                                u32 *d_cnt, int *d_err, u32 rowchunk,
+                                u32 nblocks,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -1208,7 +1219,7 @@ __global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(BuildListCoro(x, nl, nb, cap, box, rlist, maxneigh, d_cnt,
-                               d_err, nblocks, yv.Block()));
+                               d_err, rowchunk, nblocks, yv.Block()));
 }
 
 __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
@@ -1645,7 +1656,7 @@ int main(int argc, char **argv) {
                      gy::YieldStackView sv) {
         BuildListKernel<<<gr, b, smem_force>>>(
             gpu, dx, dn, g.nb, g.cap, fbox, frlist, a.maxneigh, d_cnt,
-            d_err, a.blocks, vw, sv);
+            d_err, a.rowchunk, a.blocks, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       int err = 0;
