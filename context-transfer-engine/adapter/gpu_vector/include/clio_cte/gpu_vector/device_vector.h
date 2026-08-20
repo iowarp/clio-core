@@ -748,24 +748,31 @@ class DeviceVector {
     return cand.last_access < cur.last_access;   // kEvictLru
   }
 
-  /** Number of hash ways: min(kMaxWays, pages_per_block). */
-  CTP_GPU_FUN clio::run::u32 Ways() const {
-    const clio::run::u32 ppb = h_->pages_per_block_;
+ public:
+  /** Number of hash ways: min(kMaxWays, pages_per_block). CROSS and PUBLIC:
+   *  the host Vector's Prefetch places pages with the SAME function the
+   *  device looks up with; a host-side mirror would be a drift bug waiting
+   *  to happen. */
+  static CTP_CROSS_FUN clio::run::u32 Ways(clio::run::u32 ppb) {
     return ppb < kMaxWays ? ppb : kMaxWays;
+  }
+  CTP_GPU_FUN clio::run::u32 Ways() const {
+    return Ways(h_->pages_per_block_);
   }
 
   /**
    * The slot page `pn` occupies in way `w`.
    *
-   * MUST be a pure function of (pn, w, ppb): lookup and claim both derive the
-   * candidate set from it, and any disagreement makes a resident page
-   * invisible -- which does not fail loudly, it re-fetches the page into a
-   * second slot and leaves two slots holding it.
+   * MUST be a pure function of (pn, w, ppb): lookup, claim, AND the host's
+   * Prefetch all derive the candidate set from it, and any disagreement
+   * makes a resident page invisible -- which does not fail loudly, it
+   * re-fetches the page into a second slot and leaves two slots holding it.
    */
-  CTP_GPU_FUN clio::run::u32 WaySlot(clio::run::u64 pn,
-                                     clio::run::u32 w) const {
-    const clio::run::u64 ppb = (clio::run::u64) h_->pages_per_block_;
-    const clio::run::u64 d = (clio::run::u64) Ways();
+  static CTP_CROSS_FUN clio::run::u32 WaySlot(clio::run::u64 pn,
+                                              clio::run::u32 w,
+                                              clio::run::u32 ppb32) {
+    const clio::run::u64 ppb = (clio::run::u64) ppb32;
+    const clio::run::u64 d = (clio::run::u64) Ways(ppb32);
     const clio::run::u32 base = (clio::run::u32) ((ppb * w) / d);
     const clio::run::u32 end = (clio::run::u32) ((ppb * (w + 1)) / d);
     const clio::run::u32 span = end - base;   // >= 1, since d <= ppb
@@ -780,6 +787,12 @@ class DeviceVector {
     x ^= x >> 31;
     return base + (clio::run::u32) (x % (clio::run::u64) span);
   }
+  CTP_GPU_FUN clio::run::u32 WaySlot(clio::run::u64 pn,
+                                     clio::run::u32 w) const {
+    return WaySlot(pn, w, h_->pages_per_block_);
+  }
+
+ private:
 
   /**
    * Claim one of `pn`'s d candidate slots.

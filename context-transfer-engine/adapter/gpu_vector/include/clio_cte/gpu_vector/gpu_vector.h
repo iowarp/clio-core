@@ -394,6 +394,85 @@ class Vector {
 #endif
   }
 
+  /**
+   * Prefault pages [pg_lo, pg_hi) into the caches of blocks
+   * [blk_lo, blk_hi) FROM THE HOST -- outside any kernel, and therefore
+   * outside its timing. The kernel then starts with the pages resident and
+   * its holds all take the fast path; nothing faults, nothing parks.
+   *
+   * Each page's bytes are fetched from the backing store ONCE and copied
+   * into every target block's claimed frame. Placement uses the SAME
+   * DeviceVector::WaySlot function the device looks up with. A page whose
+   * candidate ways are all occupied by other pages is skipped -- it simply
+   * demand-faults later -- so this is always safe, merely best-effort.
+   *
+   * QUIESCENT-ONLY, like ClearCache: the host rewrites live table entries.
+   * The intended sequence is Preload/upload, ClearCache, Prefetch, launch.
+   *
+   * @return pages fetched from the backing store (once each).
+   */
+  clio::run::u64 Prefetch(clio::run::u64 pg_lo, clio::run::u64 pg_hi,
+                          clio::run::u32 blk_lo = 0,
+                          clio::run::u32 blk_hi = ~0u) {
+    clio::run::u64 fetched = 0;
+#if CTP_ENABLE_CUDA
+    if (pg_hi <= pg_lo) return 0;
+    const clio::run::u32 ppb = pages_per_block_;
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      const clio::run::u32 b_lo = (blk_lo < nblocks_) ? blk_lo : nblocks_;
+      const clio::run::u32 b_hi = (blk_hi < nblocks_) ? blk_hi : nblocks_;
+      if (b_lo >= b_hi) continue;
+      // Pull the affected block tables down once, place, push back once.
+      const size_t ntb = static_cast<size_t>(b_hi - b_lo) * ppb;
+      std::vector<Page> tbl(ntb);
+      Page *dev_tbl =
+          reinterpret_cast<Page *>(st.table_base) +
+          static_cast<size_t>(b_lo) * ppb;
+      ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ntb * sizeof(Page));
+      fetched = DownloadPages(
+          pg_lo, pg_hi, [&](clio::run::u64 pg, const char *bytes) {
+            for (clio::run::u32 b = b_lo; b < b_hi; ++b) {
+              Page *bt = tbl.data() + static_cast<size_t>(b - b_lo) * ppb;
+              clio::run::u32 slot = ~0u;
+              const clio::run::u32 d = DeviceVector<T>::Ways(ppb);
+              for (clio::run::u32 w = 0; w < d; ++w) {
+                const clio::run::u32 i = DeviceVector<T>::WaySlot(pg, w, ppb);
+                if (bt[i].page_num == pg) {
+                  slot = i;   // already mapped: refresh its bytes
+                  break;
+                }
+                if (slot == ~0u && bt[i].page_num == kNoPage &&
+                    !bt[i].fetching && !bt[i].flushing && bt[i].pins == 0) {
+                  slot = i;   // first free way
+                }
+              }
+              if (slot == ~0u) continue;   // every way taken: demand-fault
+              Page &p = bt[slot];
+              p.page_num = pg;
+              p.score = 1.0f;
+              p.user_score = 0.0f;
+              p.has_user = 0;
+              p.last_access = 0;
+              p.pins = 0;
+              p.dirty = 0;
+              p.flushing = 0;
+              p.fetching = 0;
+              p.evicting = 0;
+              p.rescoring = 0;
+              // p.data is the slot's fixed device frame; land the bytes.
+              ctp::GpuApi::Memcpy(static_cast<char *>(p.data), bytes,
+                                  page_bytes_);
+            }
+          });
+      ctp::GpuApi::Memcpy(dev_tbl, tbl.data(), ntb * sizeof(Page));
+    }
+#else
+    (void) pg_lo; (void) pg_hi; (void) blk_lo; (void) blk_hi;
+#endif
+    return fetched;
+  }
+
   /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
    *  `buf` (PageBytes() long). */
   template <typename FillFn>
