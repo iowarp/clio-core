@@ -33,6 +33,10 @@ build first:  make -C $BUILD neuropress_grayscott_h5 clio_hdf5_vol" >&2; return 
   # Best mode brings its own exploration settings (it forces exploration on and
   # pins K to 31) and ranks on ratio alone, so it does not take an explicit K.
   BEST=${BEST:-false}
+  # Static codec control -- see the LAMMPS example's lmp_common.sh. Non-empty
+  # pins every chunk to one library and takes NeuroPress out of the loop, the
+  # fixed-codec baseline a selector has to be measured against.
+  STATIC_LIB=${STATIC_LIB:-}
   EXPLORE_K=${EXPLORE_K:-0}
   LEARN=${LEARN:-false}
   # Exploration only fires on chunks whose cost error exceeds this. 0 means
@@ -47,7 +51,9 @@ build first:  make -C $BUILD neuropress_grayscott_h5 clio_hdf5_vol" >&2; return 
   #   exploration learning PLUS actually compressing alternatives to compare
   # Exploration implies learning (its samples are what SGD trains on), but
   # learning is useful on its own and used to be unreachable here.
-  if [ "${EXPLORE_K:-0}" -gt 0 ]; then
+  if [ -n "$STATIC_LIB" ]; then
+    NP_LEARN=false; NP_EXPLORE=false
+  elif [ "${EXPLORE_K:-0}" -gt 0 ]; then
     NP_LEARN=true;  NP_EXPLORE=true
   elif [ "$LEARN" = true ]; then
     NP_LEARN=true;  NP_EXPLORE=false
@@ -84,6 +90,7 @@ compose:
     neuropress_exploration_k: $EXPLORE_K
     neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
+${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local

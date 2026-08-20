@@ -4,8 +4,15 @@
 # own runtime, to read it back.
 #
 # Usage: ./np_write.sh [-b BUILD] [-L N] [-s STEPS] [-g GAP] [--store DIR]
+#                      [--chunk BYTES] [--learn] [--explore K] [--threshold X]
+#                      [--best] [--static LIB]
+#
+# Selection modes: default is inference. --learn adds SGD from measured
+# outcomes; --explore K also compresses K alternatives per chunk; --best is
+# the exhaustive ratio-only sweep. --static LIB pins one codec and bypasses
+# NeuroPress entirely -- the fixed-codec control (e.g. --static nvcomp-zstd).
 set -euo pipefail
-BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false; LEARN=false; THRESH=0.5
+BUILD=""; L=128; STEPS=50; GAP=25; STORE=/tmp/np_store; CHUNK=1048576; EXPLORE_K=0; BEST=false; LEARN=false; THRESH=0.5; STATIC_LIB=
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--build) BUILD=$2; shift 2 ;;
@@ -18,7 +25,8 @@ while [ $# -gt 0 ]; do
     --explore)  EXPLORE_K=$2; shift 2 ;;
     --threshold) THRESH=$2; shift 2 ;;
     --best)     BEST=true; shift ;;
-    -h|--help)  sed -n '2,7p' "$0"; exit 0 ;;
+    --static)   STATIC_LIB=$2; shift 2 ;;
+    -h|--help)  sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -30,6 +38,7 @@ np_setup || exit 1
 rm -f "$STORE"/gs.h5 "$STORE"/gs.h5.ref "$STORE"/cte_tier.dat \
       "$STORE"/chi_bdev.dat "$STORE"/cte_metadata_log* "$STORE"/write.log
 echo "Gray-Scott ${L}^3, $STEPS steps, snapshot every $GAP"
+[ -n "$STATIC_LIB" ] && echo "STATIC codec: $STATIC_LIB (NeuroPress bypassed)"
 echo "store: $STORE  (persistent file tier + metadata log)"
 
 "${NP_ENV[@]}" "$BIN" "$STORE/gs.h5" "$L" "$STEPS" "$GAP" write \
