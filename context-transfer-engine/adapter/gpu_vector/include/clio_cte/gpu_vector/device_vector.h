@@ -443,6 +443,20 @@ class DeviceVector {
     // adopts and releases; the fast path pins too, or a re-hold's guard
     // would release a pin nobody took.
     AcquireHoldPin(p);
+    // The prober's half of the FreeVictimSlot handshake: publish the pin,
+    // THEN re-read the slot. A claim that read pins == 0 before the pin
+    // landed has published its takeover by now (its fence is between the
+    // two), so one of us is guaranteed to see the other. A slot that
+    // changed hands in the match->pin window is a MISS, never a hold --
+    // thread 0's pin is the one that counts (AcquireHoldPin), and its miss
+    // fails the caller's all-or-nothing vote for the whole block.
+    __threadfence();
+    if (*(volatile clio::run::u64 *)&p->page_num != pn ||
+        *(volatile clio::run::u32 *)&p->fetching != 0u) {
+      ReleaseHoldPin(p);
+      last_page_ = nullptr;
+      return 0;
+    }
     // Write intent is declared HERE, at the hold, not inferred per element:
     // operator[] is side-effect-free for reads and writes alike, so a page
     // held without write=true is dropped clean at eviction no matter what
@@ -831,6 +845,34 @@ class DeviceVector {
     return s;
   }
 
+  /**
+   * Free a victim slot with the DEKKER HANDSHAKE against the lock-free hold
+   * fast path. ProbeHold pins WITHOUT the block lock -- that is what makes
+   * it fast -- so a "pins == 0" read moments earlier proves nothing: a hold
+   * can land in the window between that read and the takeover (the window
+   * spans the caller's whole victim scan, and on the prober's side two
+   * __syncthreads of its vote). Both sides therefore publish-then-check
+   * with fences: the prober publishes its pin and re-reads page_num;
+   * this side publishes the takeover and re-reads pins. The fences make
+   * it impossible for BOTH to miss the other, so exactly one backs off.
+   * (This was the intermittent reneighbour-step corruption: a shared-shard
+   * claim re-tenanted a slot a sibling block had just fast-path held, and
+   * the sibling walked the new tenant's bytes with the old page's ranges.)
+   * @return true when the slot is now free; false when a holder raced in --
+   *         the slot is restored untouched and must not be taken.
+   */
+  CTP_GPU_FUN bool FreeVictimSlot(Page *p) {
+    const clio::run::u64 prev = p->page_num;
+    p->page_num = kNoPage;
+    __threadfence();
+    if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+      p->page_num = prev;
+      __threadfence();
+      return false;
+    }
+    return true;
+  }
+
   CTP_GPU_FUN clio::run::u32 ClaimSlotWindowOnceLocked(clio::run::u64 pn) {
     Page *tbl = BlockPages();
     const clio::run::u32 nw = Ways();
@@ -899,8 +941,9 @@ class DeviceVector {
       return ~0u;
     }
     // The victim is CLEAN (guaranteed above), so dropping it is a metadata
-    // write and loses nothing.
-    tbl[victim].page_num = kNoPage;
+    // write and loses nothing -- unless a lock-free hold raced in since the
+    // pins check above, in which case the handshake declines the claim.
+    if (!FreeVictimSlot(&tbl[victim])) return ~0u;
     Bump(h_->stat_evicts_);
     return victim;
   }
@@ -956,7 +999,11 @@ class DeviceVector {
       SubmitPut(p);
       AwaitPut(p);
     }
-    p->page_num = kNoPage;
+    if (!FreeVictimSlot(p)) {
+      // A lock-free hold landed during the scan or the writeback: the page
+      // stays resident (and is clean now), and the caller must wait.
+      return false;
+    }
     p->dirty = 0u;
     p->flushing = 0u;
     Bump(h_->stat_evicts_);
@@ -991,7 +1038,7 @@ class DeviceVector {
         SubmitPut(p);
         AwaitPut(p);
       }
-      p->page_num = kNoPage;
+      if (!FreeVictimSlot(p)) continue;   // holder raced in; rescan skips it
       p->dirty = 0u;
       p->flushing = 0u;
       Bump(h_->stat_evicts_);
@@ -1358,7 +1405,7 @@ class DeviceVector {
     Page *p = Find(page_id);
     if (p == nullptr || p->fetching || p->pins != 0u) return false;
     if (p->dirty || p->flushing) return false;
-    p->page_num = kNoPage;
+    if (!FreeVictimSlot(p)) return false;   // lock-free hold raced in
     p->dirty = 0u;
     p->flushing = 0u;
     p->score = 0.0f;
@@ -1962,8 +2009,7 @@ class DeviceVector {
     if (p->dirty || p->flushing) {
       p->evicting = 1u;        // tells ReapFlushed to release the slot
       SubmitPut(p);            // async; the caller yields on AnyTransferInFlight
-    } else {
-      p->page_num = kNoPage;
+    } else if (FreeVictimSlot(p)) {
       Bump(h_->stat_evicts_);
     }
     UnlockBlock();
@@ -2039,10 +2085,12 @@ class DeviceVector {
       if (p->flushing && p->put->fut_.is_complete_.load() != 0) {
         AwaitPut(p);   // clears `flushing`; re-dirties the page if it FAILED
         if (p->evicting && !p->dirty) {
-          // Eviction: the bytes are safely stored, so release the slot.
-          p->page_num = kNoPage;
+          // Eviction: the bytes are safely stored -- release the slot,
+          // UNLESS a lock-free hold landed while the writeback ran (probes
+          // do not reject flushing slots). The page then simply stays
+          // resident, clean.
+          if (FreeVictimSlot(p)) Bump(h_->stat_evicts_);
           p->evicting = 0u;
-          Bump(h_->stat_evicts_);
         } else if (p->evicting) {
           // The writeback failed, so the cache holds the only copy. Keep the
           // page and let the next attempt retry rather than dropping it.
@@ -2575,13 +2623,15 @@ class DeviceVector {
     Page *tbl = BlockPages();
     for (clio::run::u32 r = 0; r < mb->async_n; ++r) {
       Page *p = &tbl[mb->page_slot[r]];
-      if (p->fetching == 2u) p->fetching = 0u;
       if (!(r < t->count_ && t->reqs_[r].rc_ == 0)) {
         // Same rule as the synchronous batch: a failed record must free its
-        // slot, never serve its stale bytes as this page.
+        // slot, never serve its stale bytes as this page -- and it must be
+        // freed BEFORE `fetching` clears, while probes still skip the slot.
         p->page_num = kNoPage;
         Bump(h_->stat_get_errors_);
+        __threadfence();
       }
+      if (p->fetching == 2u) p->fetching = 0u;
     }
     mb->async_pending = 0u;
     XferAdd(-1);
@@ -2755,15 +2805,18 @@ class DeviceVector {
     clio::run::u32 ok = 0;
     for (clio::run::u32 r = 0; r < filled; ++r) {
       Page *p = &tbl[mb[0].page_slot[r]];
-      p->fetching = 0u;
       if (r < t->count_ && t->reqs_[r].rc_ == 0) {
+        p->fetching = 0u;
         ++ok;
       } else {
         // A failed get leaves the slot holding whatever it held before. Free
         // it rather than letting the caller read those bytes as this page --
         // serving stale data silently is the one outcome worse than a miss.
+        // Freed BEFORE `fetching` clears, while probes still skip the slot.
         p->page_num = kNoPage;
         Bump(h_->stat_get_errors_);
+        __threadfence();
+        p->fetching = 0u;
       }
     }
     return resident + ok;
@@ -2983,6 +3036,7 @@ class DeviceVector {
     if (p->get_fut.IsNull()) {
       Bump(h_->stat_get_errors_);
       p->page_num = kNoPage;
+      __threadfence();   // freed before `fetching` clears; probes skip it
       p->fetching = 0u;
       return false;
     }

@@ -473,6 +473,103 @@ class Vector {
     return fetched;
   }
 
+  /**
+   * DIAGNOSTIC (chasing intermittent post-Prefetch corruption): compare every
+   * resident cache frame in blocks [blk_lo, blk_hi) against the caller's
+   * expected bytes, and independently re-get each page from the backing
+   * store and compare that too. `expect(pg)` returns the PageBytes() the
+   * page was uploaded with. Logs each mismatch to stderr.
+   * @return mismatch count (frames + gets).
+   */
+  template <typename ExpectFn>
+  clio::run::u64 VerifyCache(clio::run::u64 pg_lo, clio::run::u64 pg_hi,
+                             clio::run::u32 blk_lo, clio::run::u32 blk_hi,
+                             ExpectFn expect) {
+    clio::run::u64 bad = 0;
+#if CTP_ENABLE_CUDA
+    const clio::run::u32 ppb = pages_per_block_;
+    std::vector<char> frame(page_bytes_);
+    // (1) the frames the kernel will actually read
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      const clio::run::u32 b_lo = (blk_lo < nblocks_) ? blk_lo : nblocks_;
+      const clio::run::u32 b_hi = (blk_hi < nblocks_) ? blk_hi : nblocks_;
+      if (b_lo >= b_hi) continue;
+      const size_t ntb = static_cast<size_t>(b_hi - b_lo) * ppb;
+      std::vector<Page> tbl(ntb);
+      Page *dev_tbl = reinterpret_cast<Page *>(st.table_base) +
+                      static_cast<size_t>(b_lo) * ppb;
+      ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ntb * sizeof(Page));
+      for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
+        const char *want = expect(pg);
+        for (clio::run::u32 b = b_lo; b < b_hi; ++b) {
+          Page *bt = tbl.data() + static_cast<size_t>(b - b_lo) * ppb;
+          const clio::run::u32 d = DeviceVector<T>::Ways(ppb);
+          for (clio::run::u32 w = 0; w < d; ++w) {
+            const clio::run::u32 i = DeviceVector<T>::WaySlot(pg, w, ppb);
+            if (bt[i].page_num != pg) continue;
+            if (bt[i].data == nullptr) {
+              std::fprintf(stderr,
+                           "[vfy] blk=%u pg=%llu slot=%u NULL frame ptr\n",
+                           b, (unsigned long long)pg, i);
+              ++bad;
+              break;
+            }
+            ctp::GpuApi::Memcpy(frame.data(),
+                                static_cast<const char *>(bt[i].data),
+                                page_bytes_);
+            if (std::memcmp(frame.data(), want, page_bytes_) != 0) {
+              size_t o = 0;
+              while (o < page_bytes_ && frame[o] == want[o]) ++o;
+              std::fprintf(stderr,
+                           "[vfy] blk=%u pg=%llu slot=%u FRAME mismatch at "
+                           "byte %zu: got %08x want %08x\n",
+                           b, (unsigned long long)pg, i, o,
+                           *reinterpret_cast<const unsigned *>(
+                               frame.data() + (o & ~3ull)),
+                           *reinterpret_cast<const unsigned *>(
+                               want + (o & ~3ull)));
+              ++bad;
+            }
+            break;
+          }
+        }
+      }
+    }
+    // (2) the backing store itself, re-got fresh
+    std::vector<char> gotbuf(page_bytes_);
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
+      const char *want = expect(pg);
+      clio::run::u64 n = DownloadPages(pg, pg + 1,
+                                       [&](clio::run::u64, const char *bb) {
+                                         std::memcpy(gotbuf.data(), bb,
+                                                     page_bytes_);
+                                       });
+      if (n == 0) {
+        std::fprintf(stderr, "[vfy] pg=%llu GET returned nothing\n",
+                     (unsigned long long)pg);
+        ++bad;
+        continue;
+      }
+      if (std::memcmp(gotbuf.data(), want, page_bytes_) != 0) {
+        size_t o = 0;
+        while (o < page_bytes_ && gotbuf[o] == want[o]) ++o;
+        std::fprintf(stderr,
+                     "[vfy] pg=%llu GET mismatch at byte %zu: got %08x "
+                     "want %08x\n",
+                     (unsigned long long)pg, o,
+                     *reinterpret_cast<const unsigned *>(gotbuf.data() +
+                                                         (o & ~3ull)),
+                     *reinterpret_cast<const unsigned *>(want + (o & ~3ull)));
+        ++bad;
+      }
+    }
+#else
+    (void)pg_lo; (void)pg_hi; (void)blk_lo; (void)blk_hi; (void)expect;
+#endif
+    return bad;
+  }
+
   /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
    *  `buf` (PageBytes() long). */
   template <typename FillFn>
