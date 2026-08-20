@@ -108,6 +108,7 @@ struct Args {
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
+  u64 ckpt = 0;            // checkpoint every N steps (0 = never)
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
@@ -1069,7 +1070,15 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
  *  One block does it; the others exit immediately. Validation-path only --
  *  steady-state MD never flushes x/v (they are device-canonical). */
 __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
-                                      gv::DeviceVector<float> v, u32 block) {
+                                      gv::DeviceVector<float> v, u32 nblocks,
+                                      u32 block) {
+  // ONE BLOCK, and that is a constraint rather than a choice: the flush
+  // path uses the block TABLE's batch slots and block lock, and this
+  // benchmark deliberately maps every CUDA block onto ONE SHARED table so
+  // each page exists once. Disjoint-page HOLDS are safe there (lock-free
+  // probes); concurrent FLUSHES are not -- splitting the flush across
+  // blocks wedged the runtime outright.
+  (void)nblocks;
   if (block == 0) {
     x.FlushAsync(0, x.h_->size_);
     co_await x.AwaitFlush();
@@ -1299,7 +1308,7 @@ __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
 
 __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> x,
-                               gv::DeviceVector<float> v,
+                               gv::DeviceVector<float> v, u32 nblocks,
                                gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -1307,7 +1316,7 @@ __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
   v.block_override_ = 0;
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(FlushAllCoro(x, v, yv.Block()));
+  CLIO_YCORO_RUN(FlushAllCoro(x, v, nblocks, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -1374,6 +1383,7 @@ int main(int argc, char **argv) {
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
@@ -1643,7 +1653,8 @@ int main(int argc, char **argv) {
     // difference against a normal run IS the hold cost.
     const int nocompute = std::getenv("MD_NOCOMPUTE") != nullptr ? 1 : 0;
     double acc[3] = {0, 0, 0};
-    double t_force_kern = 0.0;
+    double t_force_kern = 0.0, t_ckpt = 0.0, t_ckpt_stock = 0.0;
+    u64 n_ckpt = 0;
     double t_force = 0.0, t_kick = 0.0, t_resort = 0.0, t_build = 0.0;
     const float frlist = static_cast<float>(a.cutoff + a.skin);
     // Build the Verlet list: device count pass, host prefix sum (index
@@ -1784,6 +1795,37 @@ int main(int argc, char **argv) {
     std::printf("  STATICS GATE: %s (ref_rel=%.2e, melt_abs=%.2e)\n",
                 statics_ok ? "PASS" : "FAIL", ref_rel, melt_abs);
 
+    // ---- CHECKPOINTING -------------------------------------------------
+    // A checkpoint here is what the paged design makes it: FlushAsync over
+    // the live state plus AwaitFlush, page-granular, straight into the CTE
+    // tier stack. Nothing is staged through the host, and the flush is
+    // asynchronous by construction, so a real application can overlap it
+    // with the following steps.
+    //
+    // The honest baseline alongside it is what a NON-paged GPU code must
+    // pay before it can write anything at all: a device-to-host copy of the
+    // same bytes. That is timed with the same clock on the same data size.
+    float *d_ckpt_stock = nullptr;
+    float *h_ckpt_stock = nullptr;
+    if (a.ckpt != 0) {
+      d_ckpt_stock = ctp::GpuApi::Malloc<float>(2 * g.nelems * sizeof(float));
+      cudaMallocHost(&h_ckpt_stock, 2 * g.nelems * sizeof(float));
+    }
+    auto checkpoint = [&]() {
+      const double _t = NowMs();
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv, a.blocks,
+                                                        vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      t_ckpt += NowMs() - _t;
+      const double _t2 = NowMs();
+      ctp::GpuApi::Memcpy(h_ckpt_stock, d_ckpt_stock, 2 * g.nelems);
+      t_ckpt_stock += NowMs() - _t2;
+      ++n_ckpt;
+    };
+
     // ---- resort continuity gate: same physical state, new layout, so the
     // potential energy must be unchanged to float-summation noise ----------
     bool resort_ok = true;
@@ -1811,6 +1853,7 @@ int main(int argc, char **argv) {
       }
       force(/*eflag=*/0);  // f(t+dt)
       kick(/*drift=*/0);
+      if (a.ckpt != 0 && (step + 1) % a.ckpt == 0) checkpoint();
     }
     ctp::GpuApi::Synchronize();
     const double run_ms = NowMs() - t0;
@@ -1836,6 +1879,25 @@ int main(int argc, char **argv) {
                 "Matom-steps/s)\n",
                 (unsigned long long)a.steps, run_ms, run_ms / a.steps,
                 static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
+    if (n_ckpt != 0) {
+      // A checkpoint is only worth anything if it can be read back, so the
+      // last one is verified against the live device state.
+      std::vector<float> ck(g.nelems);
+      const u64 got = cvx->Download(ck.data(), g.nelems);
+      u64 bad = 0;
+      for (u64 e = 0; e < g.nelems; e += kStride) {
+        if (ck[e + 3] >= 0.0f && !(ck[e] == ck[e])) ++bad;   // NaN check
+      }
+      std::printf("  checkpoints: %llu | eternia flush %.2f ms each "
+                  "(page-granular into the tier stack) | host staging a "
+                  "non-paged code would pay first: %.2f ms each | readback "
+                  "%llu/%llu pages, %llu bad\n",
+                  (unsigned long long)n_ckpt, t_ckpt / n_ckpt,
+                  t_ckpt_stock / n_ckpt, (unsigned long long)got,
+                  (unsigned long long)npages, (unsigned long long)bad);
+    }
+    if (d_ckpt_stock != nullptr) ctp::GpuApi::Free(d_ckpt_stock);
+    if (h_ckpt_stock != nullptr) cudaFreeHost(h_ckpt_stock);
     std::printf("  phases (total ms): force=%.1f (gpu %.1f) kick=%.1f "
                 "resort=%.1f build=%.1f\n", t_force, t_force_kern, t_kick,
                 t_resort, t_build);
@@ -1928,7 +1990,8 @@ int main(int argc, char **argv) {
     // x/v; they are device-canonical).
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv, vw, sv);
+      FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv, a.blocks,
+                                                        vw, sv);
     });
     ctp::GpuApi::Synchronize();
     std::vector<float> gx_out(g.nelems), gv_out(g.nelems);
