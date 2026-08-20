@@ -702,6 +702,53 @@ extern "C" void clio_direct_read_unregister(unsigned long long pool_id) {
   g_direct_read_map.erase(pool_id);
 }
 
+// Write-side twin of the direct-read registry. The put path pays the same
+// per-dispatched-level await-resume latency the read path collapsed, and a
+// mem-transport write is just as synchronously servable (resolve page, one
+// DMA or memcpy). Same key, same fallback contract.
+namespace {
+struct DirectWriteEntry {
+  int (*fn)(void *, unsigned long long, unsigned long long, const char *,
+            void **);
+  void *ctx;
+};
+std::mutex g_direct_write_mu;
+std::unordered_map<unsigned long long, DirectWriteEntry> g_direct_write_map;
+}  // namespace
+
+extern "C" void clio_direct_write_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, const char *,
+              void **),
+    void *ctx) {
+  std::lock_guard<std::mutex> lk(g_direct_write_mu);
+  g_direct_write_map[pool_id] = DirectWriteEntry{fn, ctx};
+}
+
+extern "C" void clio_direct_write_unregister(unsigned long long pool_id) {
+  std::lock_guard<std::mutex> lk(g_direct_write_mu);
+  g_direct_write_map.erase(pool_id);
+}
+
+/** @return 0 on success; nonzero → caller must fall back to the task path.
+ *  On success *pending_stream may carry a borrowed GPU stream whose copies
+ *  are still in flight: the CALLER must poll it done and return it (GpuApi
+ *  StreamQuery/ReturnStream). This is what lets a coroutine caller YIELD
+ *  during the DMA instead of the transport busy-spinning a worker. */
+extern "C" int clio_direct_write(unsigned long long pool_id,
+                                 unsigned long long off,
+                                 unsigned long long size, const char *src,
+                                 void **pending_stream) {
+  DirectWriteEntry e{nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lk(g_direct_write_mu);
+    auto it = g_direct_write_map.find(pool_id);
+    if (it == g_direct_write_map.end()) return -1;
+    e = it->second;
+  }
+  return e.fn(e.ctx, off, size, src, pending_stream);
+}
+
 // Device-tier DIRECT MAP: a device-backed (kHbm) bdev publishes its
 // device_base_ so a device-resident consumer (the gpu_vector) can resolve
 // tier-resident bytes to a DIRECT DEVICE POINTER instead of copying.

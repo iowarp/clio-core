@@ -492,6 +492,49 @@ class GpuApi {
     return nullptr;
   }
 
+  /** Non-fatal host registration: pin [ptr, ptr+size) so async DMA against
+   *  it stays asynchronous (an unpinned destination silently degrades
+   *  MemcpyAsync to a driver-staged SYNCHRONOUS copy at roughly a fifth of
+   *  the engine bandwidth). Unlike RegisterHostMemory this reports failure
+   *  instead of dying, so callers can pin opportunistically -- e.g. an SHM
+   *  tier on a host that may have no GPU driver at all.
+   *  @return true if the range is now (or was already) pinned. */
+  static bool TryRegisterHostMemory(void *ptr, size_t size) {
+#if CTP_ENABLE_ROCM
+    hipError_t e = hipHostRegister(ptr, size, hipHostRegisterPortable);
+    if (e != hipSuccess) {
+      (void) hipGetLastError();   // clear the sticky error
+    }
+    return e == hipSuccess || e == hipErrorHostMemoryAlreadyRegistered;
+#elif CTP_ENABLE_CUDA
+    cudaError_t e = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
+    if (e != cudaSuccess) {
+      (void) cudaGetLastError();   // clear the sticky error
+    }
+    return e == cudaSuccess || e == cudaErrorHostMemoryAlreadyRegistered;
+#else
+    (void) ptr;
+    (void) size;
+    return false;
+#endif
+  }
+
+  /** Non-fatal partner of TryRegisterHostMemory; `ptr` must be a base
+   *  pointer that was passed to it. */
+  static void TryUnregisterHostMemory(void *ptr) {
+#if CTP_ENABLE_ROCM
+    if (hipHostUnregister(ptr) != hipSuccess) {
+      (void) hipGetLastError();
+    }
+#elif CTP_ENABLE_CUDA
+    if (cudaHostUnregister(ptr) != cudaSuccess) {
+      (void) cudaGetLastError();
+    }
+#else
+    (void) ptr;
+#endif
+  }
+
   template <typename T>
   static void RegisterHostMemory(T *ptr, size_t size) {
 #if CTP_ENABLE_ROCM

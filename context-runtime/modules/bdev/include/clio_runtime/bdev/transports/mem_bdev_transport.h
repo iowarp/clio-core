@@ -47,6 +47,12 @@ class MemBdevTransport : public BdevTransport {
    *         (device-backed tier, out of bounds, or no stream available).
    */
   int DirectRead(clio::run::u64 off, clio::run::u64 size, char* dst);
+  /** Write-side twin of DirectRead: in-process write of a tier-resident
+   *  range, no dispatched task. Nonzero = use the task path. When
+   *  `pending_stream` is non-null a GPU-involved copy is returned STILL IN
+   *  FLIGHT through it; the caller polls it done and returns the stream. */
+  int DirectWrite(clio::run::u64 off, clio::run::u64 size, const char* src,
+                  void** pending_stream = nullptr);
 
   /** Device base of a kHbm tier (nullptr otherwise) — zero-copy mapping. */
   char *DeviceBase() const { return device_backed_ ? device_base_ : nullptr; }
@@ -219,6 +225,10 @@ class MemBdevTransport : public BdevTransport {
   std::atomic<clio::run::u64> populated_bytes_{0};
   /** Bulk-fault [populated_bytes_, round_up(end, unit)) if end crosses it. */
   void EnsurePopulated(clio::run::u64 end);
+  /** SHM spans EnsurePopulated pinned for async GPU DMA; unpinned in
+   *  Destroy() before the mapping is torn down. */
+  std::mutex pinned_spans_mu_;
+  std::vector<std::pair<char *, size_t>> pinned_spans_;
 
   // A lazily-allocated RAM page. A kPinned pool allocates page-locked host
   // memory through GpuApi (cudaMallocHost / hipHostMalloc / sycl::malloc_host)

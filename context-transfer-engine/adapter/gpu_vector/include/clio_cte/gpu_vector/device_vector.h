@@ -1747,8 +1747,34 @@ class DeviceVector {
     const Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       const Page *p = &tbl[i];
+      if (p->flushing == 3u) continue;   // completion is the BATCH future's
       if (p->flushing && p->put->fut_.is_complete_.load() == 0) {
         return reinterpret_cast<clio::run::u64>(&p->put->fut_.is_complete_.x);
+      }
+    }
+    // BATCH futures too, or a batched flush has no tag at all: pages ride
+    // flushing=3 with no live scalar future, the tag stays 0, and the yield
+    // driver RELAUNCHES the parked block immediately instead of waiting --
+    // measured as ~37 relaunch rounds per AwaitFlush (98% of a flush
+    // benchmark's wall was kernel-resident spin, ~1.7ms per round).
+    if (h_->multi_ != nullptr) {
+      const MultiBatch *mb = BlockBatches();
+      for (clio::run::u32 b = 0; b < h_->multi_per_block_; ++b) {
+        if (mb[b].put_pending != 0u && !mb[b].put_fut.IsNull() &&
+            !PutDone(&mb[b])) {
+          return reinterpret_cast<clio::run::u64>(
+              &mb[b].put_fut.get()->fut_.is_complete_.x);
+        }
+        if (mb[b].async_pending != 0u && !mb[b].get_fut.IsNull() &&
+            (mb[b].get_fut.get()->fut_.is_complete_.load() & 1u) == 0u) {
+          return reinterpret_cast<clio::run::u64>(
+              &mb[b].get_fut.get()->fut_.is_complete_.x);
+        }
+        if (mb[b].score_pending != 0u && !mb[b].score_fut.IsNull() &&
+            (mb[b].score_fut.get()->fut_.is_complete_.load() & 1u) == 0u) {
+          return reinterpret_cast<clio::run::u64>(
+              &mb[b].score_fut.get()->fut_.is_complete_.x);
+        }
       }
     }
     return 0;

@@ -258,6 +258,17 @@ void MemBdevTransport::PreallocateRamPages() {
 }
 
 void MemBdevTransport::Destroy() {
+#if CTP_ENABLE_GPU
+  {
+    // Unpin before the mapping goes away; a registered range must not
+    // outlive its backing.
+    std::lock_guard<std::mutex> lock(pinned_spans_mu_);
+    for (auto &span : pinned_spans_) {
+      ctp::GpuApi::TryUnregisterHostMemory(span.first);
+    }
+    pinned_spans_.clear();
+  }
+#endif
   if (shm_backed_) {
     // Mark unusable before tearing the mapping down so a client that is
     // mid-attach refuses rather than reading a dying segment.
@@ -340,6 +351,21 @@ void MemBdevTransport::EnsurePopulated(clio::run::u64 end) {
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
       ctp::SystemInfo::BulkFault(shm_base_ + cur, target - cur);
+#if CTP_ENABLE_GPU
+      // Pin the span we just committed. Unpinned SHM turns every
+      // MemcpyAsync against this tier into a driver-staged SYNCHRONOUS
+      // copy (~2.4 GB/s measured against ~12 GB/s pinned), which was the
+      // whole flush-bench gap vs a raw cudaMemcpy. Spans are disjoint by
+      // the CAS claim above, so no range registers twice. Best-effort: a
+      // GPU-less host just skips it. CLIO_BDEV_NO_PIN=1 opts out (pinning
+      // holds the committed pages in RAM).
+      static const bool no_pin = std::getenv("CLIO_BDEV_NO_PIN") != nullptr;
+      if (!no_pin && ctp::GpuApi::GetDeviceCount() > 0 &&
+          ctp::GpuApi::TryRegisterHostMemory(shm_base_ + cur, target - cur)) {
+        std::lock_guard<std::mutex> lock(pinned_spans_mu_);
+        pinned_spans_.emplace_back(shm_base_ + cur, target - cur);
+      }
+#endif
       return;
     }
   }
@@ -588,8 +614,11 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
     CLIO_CO_AWAIT(clio::run::yield(10.0));
     stream = ctp::GpuApi::BorrowStream();
   }
+  static const bool put_prof = std::getenv("CLIO_PUT_PROF") != nullptr;
+  const auto bw_t0 = std::chrono::steady_clock::now();
   clio::run::u64 bytes_written = 0;
   int rc = LaunchWriteBlocksGpu(task, data_ptr.ptr_, stream, bytes_written);
+  const auto bw_t1 = std::chrono::steady_clock::now();
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
     ctp::GpuApi::PollSync(stream);
@@ -599,6 +628,20 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
     }
   }
   ctp::GpuApi::ReturnStream(stream);
+  if (put_prof) {
+    const auto bw_t2 = std::chrono::steady_clock::now();
+    auto *w = CLIO_CUR_WORKER;
+    fprintf(stderr, "[bwr] worker=%u launch_us=%lld wait_us=%lld len=%llu "
+            "end_us=%lld\n",
+            w != nullptr ? w->GetId() : 9999u,
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t1 - bw_t0).count(),
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t2 - bw_t1).count(),
+            (unsigned long long) task->length_,
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t2.time_since_epoch()).count());
+  }
 
   task->return_code_ = rc;
   task->bytes_written_ = bytes_written;
@@ -872,6 +915,76 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
     ctp::GpuApi::PollSync(stream);   // never block in driver sync
     ctp::GpuApi::ReturnStream(stream);
     clio_evlat_add(3, clio::run::CycleNow() - ev_s0);  // ch3: DirectRead sync portion
+  }
+  return 0;
+}
+
+int MemBdevTransport::DirectWrite(clio::run::u64 off, clio::run::u64 size,
+                                  const char* src, void** pending_stream) {
+  if (pending_stream != nullptr) *pending_stream = nullptr;
+  if (size == 0) return 0;
+  if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max() &&
+      off + size > ram_capacity_) {
+    return -1;
+  }
+  // Same device-tier gate as DirectRead, same rationale: an intra-device
+  // copy issued from a fault serviced BETWEEN kernel rounds is safe; the
+  // env knob restores the refusal for anything still faulting from a
+  // resident kernel.
+  static const bool dev_direct = [] {
+    const char *e = getenv("CLIO_DIRECT_READ_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (device_backed_ && !dev_direct) return -1;
+
+  const bool dev_src = ctp::IsDeviceAccessible(const_cast<char *>(src));
+  const bool use_stream = dev_src || device_backed_;
+  void* stream = nullptr;
+  if (use_stream) {
+    // Borrowed, never created; none free right now = task path, not a spin.
+    stream = ctp::GpuApi::BorrowStream();
+    if (stream == nullptr) return -1;
+  }
+
+  clio::run::u64 cur_off = off;
+  clio::run::u64 left = size;
+  clio::run::u64 data_offset = 0;
+  while (left > 0) {
+    size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
+    clio::run::u64 intra = cur_off % kRamPageSize;
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    // Ensure, not Get: a write ALLOCATES the page it lands in.
+    char* page = EnsureRamPage(page_idx);
+    if (page == nullptr) {
+      if (use_stream) {
+        ctp::GpuApi::PollSync(stream);
+        ctp::GpuApi::ReturnStream(stream);
+      }
+      return -1;
+    }
+    const char* s = src + data_offset;
+    if (use_stream) {
+      ctp::GpuApi::MemcpyAsync(page + intra, s, chunk, stream);
+    } else {
+      std::memcpy(page + intra, s, chunk);
+    }
+    cur_off += chunk;
+    data_offset += chunk;
+    left -= chunk;
+  }
+
+  if (use_stream) {
+    if (pending_stream != nullptr) {
+      // Hand the in-flight stream to the caller: a coroutine caller yields
+      // during the DMA instead of this function busy-spinning the worker,
+      // which is what lets that worker run OTHER puts under the copy.
+      *pending_stream = stream;
+      return 0;
+    }
+    const unsigned long long ev_s0 = clio::run::CycleNow();
+    ctp::GpuApi::PollSync(stream);
+    ctp::GpuApi::ReturnStream(stream);
+    clio_evlat_add(3, clio::run::CycleNow() - ev_s0);
   }
   return 0;
 }

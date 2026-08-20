@@ -40,6 +40,14 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" int clio_direct_read(unsigned long long pool_id,
                                 unsigned long long off, unsigned long long size,
                                 char *dst);
+// Write-side twin: ModifyExistingData services tier-resident blocks inline
+// through it, skipping the dispatched WriteTask. 0 on success; nonzero →
+// task path. *pending_stream may return a borrowed GPU stream with the
+// copy still in flight; the caller yields until it drains and returns it.
+extern "C" int clio_direct_write(unsigned long long pool_id,
+                                 unsigned long long off,
+                                 unsigned long long size, const char *src,
+                                 void **pending_stream);
 // Zero-copy device-tier mapping: register an in-process blob locator so the
 // gpu_vector can resolve page blobs to (pool, target offset) at init.
 extern "C" void clio_cte_locate_register(
@@ -1597,6 +1605,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 #endif
 
   try {
+    static const bool put_prof = getenv("CLIO_PUT_PROF") != nullptr;
+    const auto pi_t0 = std::chrono::steady_clock::now();
+    auto pi_t1 = pi_t0, pi_t2 = pi_t0;
     TagId tag_id = task->tag_id_;
     std::string blob_name = task->blob_name_.str();
     // Append the per-page suffix when a GPU client (gpu_vector::Vector)
@@ -1714,6 +1725,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
+    pi_t1 = std::chrono::steady_clock::now();
 
     // Replica-targeted put (issue #886): Context::replica_ == N > 0 diverts
     // this ENTIRE write to replica N's block layout — the primary's blocks,
@@ -1784,16 +1796,24 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     //  - kCtePutReplace (wholesale replace): resize to exactly offset+size,
     //    shrinking if needed, via the shared ResizeBlob helper.
     clio::run::u32 alloc_result = 0;
+    const auto pi_ext0 = std::chrono::steady_clock::now();
     if (task->flags_ & kCtePutReplace) {
       CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, offset + size, blob_score,
                           alloc_result,
                           task->context_.min_persistence_level_));
-    } else {
+    } else if (offset + size > old_blob_size) {
+      // Level collapse: ExtendBlob's first statement is exactly this
+      // comparison, returning untouched when the write fits inside the
+      // current size — but reaching that early-out through CLIO_CO_AWAIT
+      // costs ~140us of nested-coroutine overhead per put. An in-place
+      // overwrite (every page-cache flush after the first) skips the call
+      // outright.
       CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
                           alloc_result,
                           task->context_.min_persistence_level_,
                           task->context_.preallocate_));
     }
+    const auto pi_ext1 = std::chrono::steady_clock::now();
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
       CLIO_CO_RETURN;
@@ -1878,6 +1898,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
 
       // Step 3: ModifyExistingData — write data to blocks.
+      pi_t2 = std::chrono::steady_clock::now();
       clio::run::u32 write_result = 0;
       if constexpr (TaskT::kSupportsVectored) {
        if (vectored) {
@@ -1917,6 +1938,16 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           CLIO_CO_RETURN;
         }
       }
+    }
+    if (put_prof) {
+      const auto pi_t3 = std::chrono::steady_clock::now();
+      auto us = [](auto a, auto b) {
+        return (long long) std::chrono::duration_cast<
+            std::chrono::microseconds>(b - a).count();
+      };
+      fprintf(stderr, "[pimp] tok_us=%lld pre_us=%lld ext_us=%lld mod_us=%lld\n",
+              us(pi_t0, pi_t1), us(pi_t1, pi_t2), us(pi_ext0, pi_ext1),
+              us(pi_t2, pi_t3));
     }
 
     // Write-through (issue #886): Context::replica_ == kAllReplicas repeats
@@ -3411,7 +3442,17 @@ clio::run::TaskResume Runtime::PodPutBlob(
       CLIO_CO_RETURN;
     }
   }
-  CLIO_CO_AWAIT(PutBlobImpl(task));
+  {
+    static const bool put_prof = getenv("CLIO_PUT_PROF") != nullptr;
+    const auto pp_t0 = std::chrono::steady_clock::now();
+    CLIO_CO_AWAIT(PutBlobImpl(task));
+    if (put_prof) {
+      fprintf(stderr, "[pput] us=%lld\n",
+              (long long)
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - pp_t0).count());
+    }
+  }
   CLIO_CO_RETURN;
 }
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
@@ -3493,6 +3534,16 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
   int first_rc = 0;
   clio::run::u32 n = task->count_;
   if (n > kPodMultiMax) n = kPodMultiMax;
+  // CLIO_PUT_PROF=1: which worker serves each flush batch and how long it
+  // takes -- separates "all batches on one worker" from "copies don't
+  // overlap" when flush throughput is under investigation.
+  static const bool put_prof = getenv("CLIO_PUT_PROF") != nullptr;
+  const auto prof_t0 = std::chrono::steady_clock::now();
+  // Serial-inline ON PURPOSE, and it was re-litigated with data: dispatching
+  // the records issue-all/await-all (mirroring PodMultiGetBlob's large-batch
+  // regime) costs each child the blocked-queue resume cadence (~560us) that
+  // inline avoids, which measured as a 7x SLOWDOWN for a single-block flush
+  // (954 MB/s vs the historical 6.5 GB/s) and no gain at 16 blocks.
   for (clio::run::u32 i = 0; i < n; ++i) {
     auto &req = task->reqs_[i];
     auto sub = ipc_manager->NewTask<PodPutBlobTask>(
@@ -3501,7 +3552,23 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
         req.offset_, req.size_, req.data_, req.score_, task->context_,
         task->flags_);
     sub.get()->BeginRunContext();
-    CLIO_CO_AWAIT(PodPutBlob(sub));
+    // Level collapse: skip the PodPutBlob wrapper when the record is
+    // node-local (a flush batch always is). Its only other job -- the
+    // "_pi" suffix -- lives inside PutBlobImpl already, and each skipped
+    // nested-coroutine level is ~100us per record.
+    {
+      std::string eff_name = sub->blob_name_.str();
+      if (sub->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
+        eff_name += "_pi" + std::to_string(sub->gpu_page_idx_);
+      }
+      const clio::run::PoolQuery owner =
+          HashBlobToContainer(sub->tag_id_, eff_name);
+      if (TargetIsNodeLocal(owner, sub->pool_id_)) {
+        CLIO_CO_AWAIT(PutBlobImpl(sub));
+      } else {
+        CLIO_CO_AWAIT(PodPutBlob(sub));
+      }
+    }
     int rc = sub->GetReturnCode();
     req.rc_ = static_cast<clio::run::u32>(rc);
     if (rc == 0) {
@@ -3509,6 +3576,13 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
     } else if (first_rc == 0) {
       first_rc = rc;
     }
+  }
+  if (put_prof) {
+    auto *w = CLIO_CUR_WORKER;
+    fprintf(stderr, "[mput] worker=%u n=%u us=%lld\n",
+            w != nullptr ? w->GetId() : 9999u, n,
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - prof_t0).count());
   }
   task->SetReturnCode(first_rc);
   CLIO_CO_RETURN;
@@ -6885,6 +6959,41 @@ clio::run::TaskResume Runtime::ModifyExistingData(
       timer.Pause();
       t_setup_ms += timer.GetMsec();
       timer.Reset();
+
+      // Level collapse, mirroring ReadData's direct-read: a node-local mem
+      // transport services the write RIGHT HERE on this fiber. No dispatched
+      // task, no await, none of the per-level await-resume latency that made
+      // a page flush cost ~1 ms against the ~150 us the copy itself takes.
+      // Any failure falls through to the task path unchanged.
+      static const bool direct_write_enabled = [] {
+        const char *e = getenv("CLIO_DIRECT_WRITE");
+        return e == nullptr || e[0] != '0';
+      }();
+      if (direct_write_enabled &&
+          TargetIsNodeLocal(block.target_query_, block.bdev_client_.pool_id_)) {
+        auto *ipc_mgr = CLIO_IPC;
+        const char *src = ipc_mgr->ToFullPtr(data_ptr).Cast<char>().ptr_;
+        void *pending = nullptr;
+        if (src != nullptr &&
+            clio_direct_write(block.bdev_client_.pool_id_.ToU64(),
+                              bdev_block.offset_, write_size, src,
+                              &pending) == 0) {
+          if (pending != nullptr) {
+            // The DMA is still in flight on a borrowed stream. Yield-poll
+            // rather than blocking: the ~90us a 1MB copy takes is exactly
+            // the window in which this worker can run its OTHER puts, and
+            // busy-spinning it was what pinned flush throughput to worker
+            // CPU instead of the copy engine.
+            while (!ctp::GpuApi::StreamQuery(pending)) {
+              CLIO_CO_AWAIT(clio::run::yield(10.0));
+            }
+            ctp::GpuApi::ReturnStream(pending);
+          }
+          remaining_size -= write_size;
+          block_offset_in_blob += block.size_;
+          continue;
+        }
+      }
 
       // Wrap single block in clio::run::priv::vector for AsyncWrite
       timer.Resume();

@@ -81,10 +81,15 @@ CTP_GPU_FUN void Spin(u32 us, u64 clock_khz) {
 }
 
 #if defined(GV_FLUSH_CORO)
-/** Write one held page of a region. Shared by the warm and timed coroutines. */
+/** Write one held page of a region. Shared by the warm and timed coroutines.
+ *  HOISTED: in a coroutine the guard lives in the frame, which is the
+ *  yield-stack lane in GLOBAL memory; indexing through the guard re-reads
+ *  data_/run_ from that frame on every store. Copy them to locals once. */
 __device__ void WritePage(const gv::Held<u32> &h, u64 poff, u32 pass) {
-  for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
-    h[poff + i] = Val(poff + i, pass);
+  u32 *const p = h.ptr();
+  const u64 n = h.run();
+  for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
+    p[i] = Val(poff + i, pass);
   }
   __syncthreads();
 }
@@ -398,14 +403,27 @@ class YieldRunner {
       : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
+    drv_.ResetTimers();
     drv_.Reset();
     stack_.Reset();
     return drv_.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           launch(g, b, view, stack_.View());
         },
-        [] {}, /*max_rounds=*/2000000);
+        [] {}, /*max_rounds=*/2000000,
+        [](u32, u64 tag) -> bool {
+          // The tag is a DEVICE address of a 32-bit completion flag (bit 0
+          // = complete). Poll it host-side so a parked block relaunches
+          // ONCE, when its wait is satisfied -- unconditional relaunching
+          // measured ~40 rounds per AwaitFlush at ~1.6ms of GPU time each,
+          // 98% of the flush wall.
+          unsigned int v = 0;
+          ctp::GpuApi::Memcpy(&v, reinterpret_cast<const unsigned int *>(tag),
+                              sizeof(v));
+          return (v & 1u) != 0u;
+        });
   }
+  double KernelMs() const { return drv_.KernelMs(); }
 
  private:
   gy::Yieldable<> drv_;
@@ -544,7 +562,9 @@ int main(int argc, char **argv) {
   {
     std::ofstream cfg("gpu_vector_flush.yaml");
     cfg << "networking:\n  port: 9437\n\n"
-        << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
+        << "runtime:\n  num_threads: "
+        << (getenv("GV_THREADS") ? atoi(getenv("GV_THREADS")) : 8)
+        << "\n  queue_depth: 8192\n"
         << "  first_busy_wait: " << busy_us << "\n\n"
         << "gpu:\n  queue_depth: 8192\n\n"
         << "compose:\n"
@@ -892,14 +912,21 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Synchronize();
       const double t0 = NowMs();
       const u32 this_pass = pass++;
-      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
+      const u32 rr = runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                    gy::YieldStackView sv) {
         SpinWriteFlushKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dev, a.iters, pages_per_region, spin, clock_khz, do_write,
             this_pass, async, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       const double ms = NowMs() - t0;
+      // Where a slow flush lives: rounds is the park/relaunch count, and
+      // kernel_ms the GPU-resident time -- (ms - kernel_ms) is the host gap.
+      if (getenv("CLIO_PUT_PROF")) {
+        std::printf(
+            "    [runp] rounds=%u wall=%.1fms kernel=%.1fms gap=%.1fms\n",
+            rr, ms, runner.KernelMs(), ms - runner.KernelMs());
+      }
       if (ms < best) best = ms;
     }
     return best;

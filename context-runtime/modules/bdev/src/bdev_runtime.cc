@@ -13,6 +13,12 @@ extern "C" void clio_direct_read_register(
     int (*fn)(void *, unsigned long long, unsigned long long, char *),
     void *ctx);
 extern "C" void clio_direct_read_unregister(unsigned long long pool_id);
+extern "C" void clio_direct_write_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, const char *,
+              void **),
+    void *ctx);
+extern "C" void clio_direct_write_unregister(unsigned long long pool_id);
 extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
                                               char *base);
 extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
@@ -337,6 +343,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
              char *dst) -> int {
             return static_cast<MemBdevTransport *>(ctx)->DirectRead(off, size,
                                                                     dst);
+          },
+          mem);
+      clio_direct_write_register(
+          pool_id_.ToU64(),
+          [](void *ctx, unsigned long long off, unsigned long long size,
+             const char *src, void **pending_stream) -> int {
+            return static_cast<MemBdevTransport *>(ctx)->DirectWrite(
+                off, size, src, pending_stream);
           },
           mem);
     }
@@ -716,9 +730,10 @@ void Runtime::StopHealthPolling() {
     health_poll_thread_.join();
   }
   if (transport_) {
-    // Retract the direct-read entry BEFORE tearing down the transport it
-    // points at (no-op if this pool never registered one).
+    // Retract the direct entries BEFORE tearing down the transport they
+    // point at (no-ops if this pool never registered them).
     clio_direct_read_unregister(pool_id_.ToU64());
+    clio_direct_write_unregister(pool_id_.ToU64());
     clio_direct_dev_base_unregister(pool_id_.ToU64());
     transport_->Destroy();
     transport_.reset();
