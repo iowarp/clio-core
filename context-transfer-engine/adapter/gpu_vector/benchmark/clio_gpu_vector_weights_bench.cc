@@ -41,11 +41,7 @@
  * frames are compiler-laid-out and carry the whole live state plus resume /
  * destroy pointers, so they get an order of magnitude more headroom.
  */
-#if defined(CLIO_YIELD_CORO)
 static constexpr clio::run::u32 kYieldLaneBytes = 4096;
-#else
-static constexpr clio::run::u32 kYieldLaneBytes = 256;
-#endif
 
 #include <chrono>
 #include <cstdio>
@@ -188,8 +184,8 @@ clio::run::u64 NowMs() {
 #if defined(CLIO_YIELD_CORO) && defined(__clang__)
 /**
  * The seed pass as a per-lane C++20 coroutine (clang-CUDA builds). Ordinary
- * locals -- `off` and `run` cross suspends and the COMPILER puts them in the
- * frame; compare the CLIO_YLOCAL_INIT bookkeeping in the macro version
+ * locals -- `off` and the guard cross suspends and the COMPILER puts them in
+ * the frame; compare the CLIO_YLOCAL_INIT bookkeeping in the macro version
  * below. Suspends stay block-collective: every yield site votes.
  */
 __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
@@ -198,21 +194,20 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
                                       clio::run::u32 flat_pct,
                                       clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
-  clio::run::u64 run = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.HoldPage(
+    auto h = co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run, /*write=*/true);
+        /*write=*/true);
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
     for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      v[base + off + i] = Weight(base + off + i, flat_pct);
+      h[base + off + i] = Weight(base + off + i, flat_pct);
     }
   }
-  // Final writeback; the barrier is load-bearing (see the macro version).
-  // Collective, internally BATCHED (one multi-put per 64 pages).
+  // Final writeback -- explicit, because drops and eviction never write a
+  // page back on their own now. Collective, internally BATCHED.
   v.FlushAsync(base, per);
-  CLIO_CO_YIELD_WHEN((void)0, v.AnyTransferInFlight(), 0);
+  co_await v.AwaitFlush();
 }
 
 __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
@@ -228,116 +223,12 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
   __syncthreads();
   CLIO_YCORO_RUN(SeedLaneCoro(v, per, page_elems, flat_pct, yv.Block()));
 }
-#else  // !CLIO_YIELD_CORO -- the switch/macro mechanism
-__global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
-                                gv::DeviceVector<clio::run::u32> v,
-                                clio::run::u64 per,
-                                clio::run::u64 page_elems,
-                                clio::run::u32 flat_pct,
-                                gy::YieldableView<> yv,
-                                gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; off < per; off += page_elems) {
-    CLIO_YCALL(v.HoldPageYield(
-        base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run, /*write=*/true));
-    {
-      const clio::run::u64 n =
-          (off + page_elems <= per) ? page_elems : (per - off);
-      // The page is resident for the whole block, so every lane may write.
-      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        v[base + off + i] = Weight(base + off + i, flat_pct);
-      }
-    }
-  }
-  // Final writeback, also without blocking in-kernel.
-  //
-  // The barrier is load-bearing: SubmitPut clears `dirty` as it submits, so a
-  // lane still writing the last page when thread 0 flushes loses its writes
-  // AND leaves the page looking clean. That cost ~1% of the checksum.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
-}
 #endif  // CLIO_YIELD_CORO
 
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<clio::run::u32> v,
-                           clio::run::u64 per) {
-  CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  for (clio::run::u64 i = 0; i < per;) {
-    const clio::run::u64 run_i = v.HoldPage(base + i, (per) - i, /*write=*/true);
-    for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-      v[base + i] = Weight(base + i);
-      }
-  }
-  v.BeginFlush(base, per);
-  v.WaitFlush(base, per);
-}
-
-/** The measured pass: a weighted sum over this block's slice of the model. */
-__global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
-                              gv::DeviceVector<clio::run::u32> v,
-                              clio::run::u64 per, clio::run::u64 page_elems,
-                              int prefetch, unsigned long long *sum) {
-  CLIO_GPU_INIT(info, nullptr);
-  const clio::run::u64 base = static_cast<clio::run::u64>(blockIdx.x) * per;
-  unsigned long long acc = 0;
-  for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    const clio::run::u64 n =
-        (off + page_elems <= per) ? page_elems : (per - off);
-    // SINGLE-THREADED per block, deliberately.
-    //
-    // Reading a 64 KiB page with one thread costs milliseconds and dominates
-    // this measurement, so parallelising the inner loop across the block was
-    // tried: 6x faster (122ms -> 21ms) and WRONG (checksum mismatch). A lane
-    // other than 0 that misses still enters the fault path, where Send and
-    // Wait are no-ops for it, so it reads an unpopulated page. Concurrent
-    // access needs a block-collective fault in the vector itself; until then
-    // the correct-but-slow form is the honest one.
-    if (threadIdx.x == 0) {
-      if (prefetch && off + page_elems < per) {
-        // Metadata-only hint: raise the NEXT page's score so the organizer
-        // keeps it in the top tier before this block reaches it.
-        v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
-      }
-      (void) v.HoldPage(base + off, 1);   // fault it in
-    }
-    if (threadIdx.x != 0) continue;
-    for (clio::run::u64 i = 0; i < n;) {
-      const clio::run::u64 run_i = v.HoldPage(base + off + i, (n) - i);
-      for (clio::run::u64 k_i = 0; k_i < run_i; ++k_i, ++i) {
-        acc += static_cast<unsigned long long>(v[base + off + i]) *
-               Activation(base + off + i);
-          }
-    }
-  }
-  atomicAdd(sum, acc);
-}
-
 /**
- * The same weighted sum, but the block SUSPENDS on a miss instead of one lane
- * blocking on it.
- *
- * The non-yieldable kernel above is single-threaded per block on purpose, and
- * its comment explains why: parallelising the page read was 6x faster and
- * WRONG, because a lane other than 0 that missed entered the fault path where
- * Send and Wait are no-ops for it and then read an unpopulated page. What it
- * asks for is "a block-collective fault in the vector itself".
- *
- * CLIO_YIELD_IF is that fault. Every lane votes on whether its page is
- * resident, the whole block suspends if ANY lane is waiting, and the kernel
+ * The measured pass: a weighted sum over this block's slice of the model,
+ * SUSPENDING on a miss. Every lane votes on whether its page is resident,
+ * the whole block suspends if ANY lane is waiting, and the kernel
  * exits so the fetch can land. On resume the page is resident for everyone, so
  * the read is an ordinary parallel loop with no fault path in it at all.
  */
@@ -352,16 +243,14 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
                                          clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
-  clio::run::u64 run = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.HoldPage(
-        base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run);
+    auto h = co_await v.HoldPage(
+        base + off, (off + page_elems <= per) ? page_elems : (per - off));
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
     unsigned long long r = 0;                     // register, not the frame
     for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      r += static_cast<unsigned long long>(v[base + off + i]) *
+      r += static_cast<unsigned long long>(h[base + off + i]) *
            Activation(base + off + i);
     }
     acc += r;
@@ -389,61 +278,6 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(WeightsLaneCoro(v, per, page_elems, sum, page_sum,
                                  page_visits, yv.Block()));
 }
-#else  // !CLIO_YIELD_CORO -- the switch/macro mechanism
-__global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
-                                   gv::DeviceVector<clio::run::u32> v,
-                                   clio::run::u64 per,
-                                   clio::run::u64 page_elems,
-                                   unsigned long long *sum,
-                                   unsigned long long *page_sum,
-                                   unsigned *page_visits,
-                                   gy::YieldableView<> yv,
-                                   gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  // The driver relaunches only unfinished blocks, so blockIdx.x is not this
-  // block's identity. block_override_ already exists for launch fusion and is
-  // exactly the hook needed here.
-  v.block_override_ = yv.Block();
-
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  // Only these two cross a suspend. Both are touched once per PAGE, never in
-  // the inner loop, which is what keeps the frame off the hot path.
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(unsigned long long, acc, 0);
-  // Declared before the switch: re-derived on every entry, so the resume
-  // cannot jump over its initialization.
-  const clio::run::u64 base =
-      static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-
-  CLIO_YBEGIN();
-  for (; off < per; off += page_elems) {
-    // The VECTOR owns the fault now: this suspends the block on a miss and
-    // comes back with the page resident. YCALL is what carries that suspend
-    // out through this kernel.
-    CLIO_YCALL(v.HoldPageYield(
-        base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        &run));
-    {
-      const clio::run::u64 n =
-          (off + page_elems <= per) ? page_elems : (per - off);
-      unsigned long long r = 0;                   // register, not the frame
-      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        r += static_cast<unsigned long long>(v[base + off + i]) *
-             Activation(base + off + i);
-      }
-      acc += r;
-      atomicAdd(&page_sum[(base + off) / page_elems], r);
-      if (threadIdx.x == 0) {
-        atomicAdd(&page_visits[(base + off) / page_elems], 1u);
-      }
-    }
-  }
-  atomicAdd(sum, acc);
-  CLIO_YEND();
-}
 #endif  // CLIO_YIELD_CORO
 
 #if !CTP_IS_DEVICE_PASS
@@ -467,13 +301,6 @@ int main(int argc, char **argv) {
   bool gpu_codec = true;   // nvcomp by default; --cpu-codec for lz4
   int prefetch = 1;
   int repeat = 3;
-  // Coroutine faulting is the DEFAULT. The blocking kernels spin in-kernel
-  // on every fault, and this bench always routes through the compressor
-  // pool, which services faults by LAUNCHING KERNELS -- so the blocking
-  // path is a guaranteed wedge (GPU pegged at 100% in SeedKernel, main
-  // stuck in cudaDeviceSynchronize forever), not a slower mode. It is
-  // reachable only by explicit opt-in for deadlock-repro work.
-  bool yieldable = true;
   // The out-of-core model WITHOUT in-kernel faulting: sync storage I/O,
   // sync HBM<->DRAM copy, and the kernel torn down for every transfer.
   bool baseline = false;
@@ -495,14 +322,9 @@ int main(int argc, char **argv) {
     else if (a == "--compressed") compressed = true;
     else if (a == "--cpu-codec") gpu_codec = false;
     else if (a == "--no-prefetch") prefetch = 0;
-    else if (a == "--yieldable") yieldable = true;
-    else if (a == "--blocking-unsafe") yieldable = false;  // wedges; repro only
     // --baseline REPLACES THE TIMED LOOP ONLY; the seed still runs through
-    // the vector, so it must use the coroutine kernel. Without this, passing
-    // --baseline alone silently left yieldable=false and seeding fell into the
-    // path its own source calls "single-threaded per block on purpose" -- a
-    // 64MB run then hung past 420s and looked like a broken baseline driver.
-    else if (a == "--baseline") { baseline = true; yieldable = true; }
+    // the vector's coroutine kernel.
+    else if (a == "--baseline") { baseline = true; }
     else if (a == "--flat-pct") flat_pct = static_cast<clio::run::u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
@@ -510,7 +332,6 @@ int main(int argc, char **argv) {
       std::fprintf(stderr,
                    "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--threads T] [--pages P] "
                    "[--slots S] [--compressed] [--no-prefetch] [--repeat R]\n"
-                   "       [--yieldable]  block-collective faults, parallel page reads\n",
                  "       [--baseline]   NO in-kernel faulting: one kernel launch\n"
                  "                      per tile, blocking GetBlob + blocking memcpy\n",
                    argv[0]);
@@ -630,7 +451,7 @@ int main(int argc, char **argv) {
   vec.EnableStats();
 
   clio::run::u32 seed_checks = 0;
-  if (yieldable) {
+  {
     gy::Yieldable<> sdrv(blocks, nthreads);
     gy::YieldStack sstack(blocks, nthreads, kYieldLaneBytes);
     const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
@@ -680,7 +501,7 @@ int main(int argc, char **argv) {
         /*max_rounds=*/static_cast<clio::run::u32>(
             (n / page_elems) * 200ull + 50000ull));
     const bool sdrv_aborted = sdrv.Aborted();
-    std::fprintf(stderr, "[seed] yieldable, rounds=%u%s\n", seed_rounds,
+    std::fprintf(stderr, "[seed] rounds=%u%s\n", seed_rounds,
                  sdrv_aborted ? " ABORTED (writeback failed)" : "");
     {
       const auto seed_stats = vec.ReadStats(0);
@@ -698,8 +519,6 @@ int main(int argc, char **argv) {
         return 1;
       }
     }
-  } else {
-      SeedKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per);
   }
   ctp::GpuApi::Synchronize();
 
@@ -810,7 +629,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "bench: baseline tile loop failed\n");
         return 1;
       }
-    } else if (yieldable) {
+    } else {
       gy::Yieldable<> drv(blocks, nthreads);
       gy::YieldStack ystack(blocks, nthreads, kYieldLaneBytes);
       rounds = drv.RunToCompletion(
@@ -830,9 +649,6 @@ int main(int argc, char **argv) {
                                 sizeof(flag));
             return flag != 0;
           });
-    } else {
-      WeightsKernel<<<blocks, 32>>>(gpu_info, vec.GetDevice(0), per, page_elems,
-                                    prefetch, d_sum);
     }
     ctp::GpuApi::Synchronize();
     const clio::run::u64 ms = NowMs() - t0;
@@ -943,7 +759,7 @@ int main(int argc, char **argv) {
                "checksum=%s put_errors=%llu faults=%llu get_errors=%llu "
                "evicts=%llu rounds=%u memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
                baseline ? "baseline" : (compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw"),
-               baseline ? "" : (yieldable ? "+yield" : ""), blocks, nthreads,
+               baseline ? "" : "+yield", blocks, nthreads,
                (unsigned long long) hbm_mb, slots,
                (unsigned long long) (n / page_elems), flat_pct,
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),

@@ -72,14 +72,17 @@ CTP_INLINE_CROSS_FUN u32 Elem(u64 i) { return static_cast<u32>(i % 251); }
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
                                   u32 block) {
   const u64 base = static_cast<u64>(block) * per;
-  u64 run = 0;
-  for (u64 i = 0; i < per; i += run) {
-    co_await v.HoldPage(base + i, per - i, &run, /*write=*/true);
-    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + i + k] = Elem(base + i + k);
+  for (u64 i = 0; i < per;) {
+    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + i + k] = Elem(base + i + k);
     }
     __syncthreads();
+    i += h.run();
   }
+  // Explicit flush is REQUIRED, not belt-and-braces: only explicit flushes
+  // write data back now (drops refuse dirty pages), so seeded data left to
+  // eviction would simply be lost.
   v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
@@ -127,7 +130,6 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
   const u64 first_page = base / v.h_->elems_per_page_;
   const u64 pages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
-  u64 run = 0;
 
   for (u64 p = 0; p < pages; ++p) {
     if (prefetch) {
@@ -146,10 +148,10 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
     }
 
     const u64 off = base + p * v.h_->elems_per_page_;
-    co_await v.HoldPage(off, v.h_->elems_per_page_, &run);
+    auto h = co_await v.HoldPage(off, v.h_->elems_per_page_);
     unsigned long long local = 0;
-    for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-      local += v[off + i];
+    for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
+      local += h[off + i];
     }
     acc += local;
     __syncthreads();
@@ -184,12 +186,14 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
                      yv.Block()));
 }
 
-/** Drop every resident page, so a timed run always starts cold. */
+/** Drop every resident page, so a timed run always starts cold. A warm-state
+ *  reset between benchmark modes, not a data path: DropAll is machinery now,
+ *  reached through the white-box test shim. */
 __global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v) {
   CLIO_GPU_INIT(info, nullptr);
   if (threadIdx.x != 0) return;
-  v.DropAll();
+  gv::DeviceVectorTestAccess::DropAll(v);
 }
 
 #if !CTP_IS_DEVICE_PASS

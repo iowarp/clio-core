@@ -3,7 +3,7 @@
  * Does an asynchronous flush overlap with compute? The simplest possible test.
  *
  * Each iteration a block spins for a fixed time, writes a REGION, and flushes
- * that region. The flush is block level: one BeginFlush over the whole region,
+ * that region. The flush is block level: one FlushAsync over the whole region,
  * which issues a put per page and leaves them all in flight, so a large region
  * amortises the per-put round trip instead of paying it once per 64 KB.
  *
@@ -11,9 +11,9 @@
  * the cache is sized to hold every region at once and everything is made
  * resident before timing starts. The ONLY I/O measured is the write-back.
  *
- *   sync    spin, write, BeginFlush, WaitFlush        -> spin + flush
+ *   sync    spin, write, FlushAsync, AwaitFlush       -> spin + flush
  *   async   spin, collect PREVIOUS flush, write,      -> max(spin, flush)
- *           BeginFlush, continue
+ *           FlushAsync, continue
  *   stock   plain device buffer; the HOST synchronously cudaMemcpy's it out
  *           at every phase boundary (kernel exit) -- the pattern a
  *           phase-structured application uses without the vector. Same spin,
@@ -47,13 +47,10 @@ namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
 
-/** Per-lane yield frame; coroutine frames are compiler-laid-out and far
- *  larger than the hand-packed macro ones. */
-#if defined(CLIO_YIELD_CORO)
+/** Per-lane yield frame; coroutine frames are compiler-laid-out and large.
+ *  The macro transport (and its 256-byte hand-packed frames) is gone, so the
+ *  coroutine size is unconditional. */
 static constexpr u32 kYieldLaneBytes = 4096;
-#else
-static constexpr u32 kYieldLaneBytes = 256;
-#endif
 
 /** Cap on a single host-side verification read. Generous next to a normal
  *  read (sub-millisecond even from the NVMe tier) so it only ever fires on a
@@ -84,32 +81,10 @@ CTP_GPU_FUN void Spin(u32 us, u64 clock_khz) {
 }
 
 #if defined(GV_FLUSH_CORO)
-/**
- * Wait for this block's outstanding transfers by PARKING, not spinning.
- *
- * DeviceVector::WaitFlush spins on the device (AwaitPut in a loop). That
- * deadlocks: the kernel stays resident spinning while the completion it is
- * waiting for needs the host side to make progress, and the host is inside
- * cuCtxSynchronize waiting for the kernel. Every kernel in this benchmark
- * used to do exactly that, and every configuration hung in the warm pass --
- * including the stock defaults -- with the main thread parked in
- * cuCtxSynchronize forever.
- *
- * The yieldable form suspends the block back to the host driver instead, so
- * the runtime gets to run, complete the put, and resume us. Waiting on
- * AnyTransferInFlight rather than a range is deliberate: it is the same
- * condition HoldPageCoro's writeback step uses, and it cannot miss a put
- * that a concurrent eviction started.
- */
-__device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<u32> &v) {
-  CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
-                     v.AnyTransferInFlight(), v.FlushWaitTag());
-}
-
-/** Write one page of a region. Shared by the warm and timed coroutines. */
-__device__ void WritePage(gv::DeviceVector<u32> &v, u64 poff, u32 pass) {
-  for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-    v[poff + i] = Val(poff + i, pass);
+/** Write one held page of a region. Shared by the warm and timed coroutines. */
+__device__ void WritePage(const gv::Held<u32> &h, u64 poff, u32 pass) {
+  for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
+    h[poff + i] = Val(poff + i, pass);
   }
   __syncthreads();
 }
@@ -123,13 +98,11 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.h_->elems_per_page_;
-      u64 run = 0;
-      co_await v.HoldPage(poff, v.h_->elems_per_page_, &run, /*write=*/true);
-      WritePage(v, poff, 0u);
+      auto h = co_await v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
+      WritePage(h, poff, 0u);
     }
-    if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
-    __syncthreads();
-    co_await FlushWaitCoro(v);
+    v.FlushAsync(off, region_elems);
+    co_await v.AwaitFlush();
   }
 }
 
@@ -143,46 +116,14 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
   __syncthreads();
   CLIO_YCORO_RUN(WarmCoro(v, iters, pages_per_region, yv.Block()));
 }
-#else
-/** Touch and flush every page, so the timed loop faults nothing. */
-__global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<u32> v, u64 iters,
-                           u64 pages_per_region, gy::YieldableView<> yv,
-                           gy::YieldStackView ys) {
-  (void) ys;
-  CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
-  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
-  const u64 block_base = static_cast<u64>(yv.Block()) * iters * region_elems;
-  for (u64 it = 0; it < iters; ++it) {
-    {
-      const u64 off = block_base + it * region_elems;
-      for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 poff = off + pg * v.h_->elems_per_page_;
-        v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
-        for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-          v[poff + i] = Val(poff + i, 0u);
-        }
-        __syncthreads();
-      }
-      if (threadIdx.x == 0) {
-        v.BeginFlush(off, region_elems);
-        v.WaitFlush(off, region_elems);
-      }
-      __syncthreads();
-      }
-  }
-}
-#endif  // GV_FLUSH_CORO
 
 /**
  * spin -> write region -> flush region, `iters` times.
  *
- * @param async 0: BeginFlush then WaitFlush immediately.
- *              1: BeginFlush and collect it on the NEXT iteration, after that
+ * @param async 0: FlushAsync then AwaitFlush immediately.
+ *              1: FlushAsync and collect it on the NEXT iteration, after that
  *                 iteration's spin, so the transfer runs under the spin.
  */
-#if defined(GV_FLUSH_CORO)
 __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
                                             u64 pages_per_region, u32 spin_us,
                                             u64 clock_khz, int do_write,
@@ -200,7 +141,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
     //      the spin above. Sync collects it below, before the next spin --
     //      that placement is the entire difference the benchmark measures.
     if (async && pending) {
-      co_await FlushWaitCoro(v);
+      co_await v.AwaitFlush();
       pending = false;
     }
 
@@ -210,23 +151,20 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
       // the granularity the vector's paging contract assumes.
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.h_->elems_per_page_;
-        // Required: operator[] indexes the HELD page and does no resolution,
-        // so without this last_page_ is null and the write dereferences it.
-        u64 run = 0;
-        co_await v.HoldPage(poff, v.h_->elems_per_page_, &run, /*write=*/true);
-        WritePage(v, poff, pass);
+        auto h =
+            co_await v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
+        WritePage(h, poff, pass);
       }
-      // ---- block-level flush: ONE call covering the whole region ----
-      if (threadIdx.x == 0) v.BeginFlush(off, region_elems);
-      __syncthreads();
+      // ---- block-level flush: ONE collective call covering the region ----
+      v.FlushAsync(off, region_elems);
       if (async) {
         pending = true;
       } else {
-        co_await FlushWaitCoro(v);
+        co_await v.AwaitFlush();
       }
     }
   }
-  if (pending) co_await FlushWaitCoro(v);
+  if (pending) co_await v.AwaitFlush();
 }
 
 __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
@@ -243,94 +181,35 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                                     clock_khz, do_write, pass, async,
                                     yv.Block()));
 }
-#else
-__global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
-                                     gv::DeviceVector<u32> v, u64 iters,
-                                     u64 pages_per_region, u32 spin_us,
-                                     u64 clock_khz, int do_write, u32 pass,
-                                     int async, gy::YieldableView<> yv,
-                                     gy::YieldStackView ys) {
-  (void) ys;
-  CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
-  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
-  const u64 block_base = static_cast<u64>(yv.Block()) * iters * region_elems;
-  long long prev = -1;
-
-  for (u64 it = 0; it < iters; ++it) {
-    {
-      // ---- compute ----
-      Spin(spin_us, clock_khz);
-      __syncthreads();
-
-      // ---- async: collect the previous flush, which has been running under
-      //      the spin above ----
-      if (async && do_write && threadIdx.x == 0 && prev >= 0) {
-        v.WaitFlush(block_base + static_cast<u64>(prev) * region_elems,
-                    region_elems);
-      }
-      __syncthreads();
-
-      if (do_write) {
-        const u64 off = block_base + it * region_elems;
-        // Page at a time, so the whole block is inside one page at any moment --
-        // the granularity the vector's paging contract assumes.
-        for (u64 pg = 0; pg < pages_per_region; ++pg) {
-          const u64 poff = off + pg * v.h_->elems_per_page_;
-          // Required: operator[] indexes the HELD page and does no resolution,
-          // so without this last_page_ is null and the write dereferences it.
-          v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
-          for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-            v[poff + i] = Val(poff + i, pass);
-          }
-          __syncthreads();
-        }
-        // ---- block-level flush: ONE call covering the whole region ----
-        if (threadIdx.x == 0) {
-          v.BeginFlush(off, region_elems);
-          if (!async) {
-            v.WaitFlush(off, region_elems);
-          }
-        }
-        __syncthreads();
-        prev = static_cast<long long>(it);
-      }
-      }
-  }
-
-  if (async == 1 && do_write && threadIdx.x == 0 && prev >= 0) {
-    v.WaitFlush(block_base + static_cast<u64>(prev) * region_elems,
-                region_elems);
-  }
-}
-#endif  // GV_FLUSH_CORO
 
 /**
- * The READ mirror of SpinWriteFlushKernel: spin, then read a region.
+ * The READ mirror of SpinWriteFlushCoro: spin, then read a region.
  *
  * sync  (async=0)  touch the region and let it demand-fault, page by page.
  * async (async=1)  BeginFetch every page of the NEXT region before reading
  *                  this one, so those transfers run under this region's spin
- *                  and read. RescorePage pins what is being fetched and
- *                  releases what has been consumed, so the prefetch's slot
- *                  claim evicts a finished page rather than one still in use.
+ *                  and read. The scalar rescore pins what is being fetched
+ *                  and releases what has been consumed, so the prefetch's
+ *                  slot claim evicts a finished page rather than one still
+ *                  in use. Scalar RescorePage and BeginFetch are MACHINERY
+ *                  this diagnostic probes deliberately, so they go through
+ *                  the white-box test shim rather than the public verbs.
  *
  * The cache holds exactly two regions, so a prefetched region can be resident
  * alongside the one being read and nothing else fits -- prefetching either
  * lands in time or it does not.
  */
-__global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
-                                       gv::DeviceVector<u32> v, u64 iters,
-                                       u64 pages_per_region, u32 spin_us,
-                                       u64 clock_khz, int async,
-                                       unsigned long long *sum,
-                                       unsigned long long *bad,
-                                       unsigned long long *first_bad,
-                                       unsigned long long *bad_off,
-                                       u32 *bad_got) {
-  CLIO_GPU_INIT(info, nullptr);
+__device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
+                                              u64 iters, u64 pages_per_region,
+                                              u32 spin_us, u64 clock_khz,
+                                              int async,
+                                              unsigned long long *sum,
+                                              unsigned long long *bad,
+                                              unsigned long long *first_bad,
+                                              unsigned long long *bad_off,
+                                              u32 *bad_got, u32 block) {
   const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
-  const u64 block_base = static_cast<u64>(blockIdx.x) * iters * region_elems;
+  const u64 block_base = static_cast<u64>(block) * iters * region_elems;
   unsigned long long acc = 0;
 
   for (u64 it = 0; it < iters; ++it) {
@@ -342,8 +221,8 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
       const u64 nxt = block_base + (it + 1) * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 pn = v.PageOf(nxt + pg * v.h_->elems_per_page_);
-        v.RescorePage(pn, 1000.0f);
-        v.BeginFetch(pn);
+        gv::DeviceVectorTestAccess::RescorePage(v, pn, 1000.0f);
+        gv::DeviceVectorTestAccess::BeginFetch(v, pn);
       }
     }
     __syncthreads();
@@ -351,11 +230,11 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.h_->elems_per_page_;
-      v.HoldPage(poff, v.h_->elems_per_page_);
+      auto h = co_await v.HoldPage(poff, v.h_->elems_per_page_);
       unsigned long long local = 0;
       unsigned long long wrong = 0;
-      for (u64 i = threadIdx.x; i < v.h_->elems_per_page_; i += blockDim.x) {
-        const u32 got = v[poff + i];
+      for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
+        const u32 got = h[poff + i];
         local += got;
         // Compare element by element: a single global sum says only THAT
         // something is wrong, never which page or offset.
@@ -377,13 +256,69 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
       // Consumed: lowest score makes it the next victim, freeing a slot for
       // the prefetch that follows.
       if (async && threadIdx.x == 0) {
-        v.RescorePage(v.PageOf(poff), -1000.0f);
+        gv::DeviceVectorTestAccess::RescorePage(v, v.PageOf(poff), -1000.0f);
       }
       __syncthreads();
     }
   }
   atomicAdd(sum, acc);
 }
+
+__global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
+                                       gv::DeviceVector<u32> v, u64 iters,
+                                       u64 pages_per_region, u32 spin_us,
+                                       u64 clock_khz, int async,
+                                       unsigned long long *sum,
+                                       unsigned long long *bad,
+                                       unsigned long long *first_bad,
+                                       unsigned long long *bad_off,
+                                       u32 *bad_got, gy::YieldableView<> yv,
+                                       gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SpinReadPrefetchCoro(v, iters, pages_per_region, spin_us,
+                                      clock_khz, async, sum, bad, first_bad,
+                                      bad_off, bad_got, yv.Block()));
+}
+#else
+// Without C++20 device coroutines there is no transport for these kernels
+// (the macro/blocking variants are gone with the five-verb API). The stubs
+// keep the file compiling under nvcc; main refuses to run (see below) rather
+// than silently measuring nothing.
+__global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
+                           gv::DeviceVector<u32> v, u64 iters,
+                           u64 pages_per_region, gy::YieldableView<> yv,
+                           gy::YieldStackView ys) {
+  (void) info; (void) v; (void) iters; (void) pages_per_region;
+  (void) yv; (void) ys;
+}
+__global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
+                                     gv::DeviceVector<u32> v, u64 iters,
+                                     u64 pages_per_region, u32 spin_us,
+                                     u64 clock_khz, int do_write, u32 pass,
+                                     int async, gy::YieldableView<> yv,
+                                     gy::YieldStackView ys) {
+  (void) info; (void) v; (void) iters; (void) pages_per_region;
+  (void) spin_us; (void) clock_khz; (void) do_write; (void) pass;
+  (void) async; (void) yv; (void) ys;
+}
+__global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
+                                       gv::DeviceVector<u32> v, u64 iters,
+                                       u64 pages_per_region, u32 spin_us,
+                                       u64 clock_khz, int async,
+                                       unsigned long long *sum,
+                                       unsigned long long *bad,
+                                       unsigned long long *first_bad,
+                                       unsigned long long *bad_off,
+                                       u32 *bad_got, gy::YieldableView<> yv,
+                                       gy::YieldStackView ys) {
+  (void) info; (void) v; (void) iters; (void) pages_per_region;
+  (void) spin_us; (void) clock_khz; (void) async; (void) sum; (void) bad;
+  (void) first_bad; (void) bad_off; (void) bad_got; (void) yv; (void) ys;
+}
+#endif  // GV_FLUSH_CORO
 
 /**
  * STOCK baseline: the phase-structured pattern this vector replaces. One
@@ -523,18 +458,22 @@ int main(int argc, char **argv) {
     }
   }
 
-  // The read+prefetch path has NOT been converted to the yieldable form: its
-  // kernel still calls the blocking HoldPage/AwaitFetch, which spins on the
-  // device while the completion it waits for needs the host to run -- the
-  // deadlock that hung every configuration of this benchmark, including the
-  // stock defaults. Refusing is better than reproducing that hang; the fix is
-  // the same conversion the write path just got.
+#if !defined(GV_FLUSH_CORO)
+  std::fprintf(stderr,
+               "FLUSH ERROR: built without C++20 device coroutines. This "
+               "benchmark only implements the coroutine paging path; running "
+               "it under nvcc would measure nothing. Rebuild with "
+               "-DCLIO_GPU_YIELD_CORO=ON and CMAKE_CUDA_COMPILER=clang++.\n");
+  return 2;
+#endif
+  // The read+prefetch path has been ported to the coroutine transport but has
+  // not been re-validated on it since the port; refuse rather than report
+  // numbers no run has vouched for.
   if (a.read) {
     std::fprintf(stderr,
-                 "--read is unavailable: SpinReadPrefetchKernel still uses the "
-                 "blocking HoldPage path and deadlocks a resident kernel. Only "
-                 "the write+flush path has been converted to the yieldable "
-                 "coroutine form.\n");
+                 "--read is unavailable: the read+prefetch path is ported to "
+                 "the coroutine transport but has not been re-validated since "
+                 "the port. Only the write+flush path is vouched for.\n");
     return 1;
   }
 
@@ -799,9 +738,12 @@ int main(int argc, char **argv) {
         vec.ResetStats();
         ctp::GpuApi::Synchronize();
         const double t0 = NowMs();
-        SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
-            gpu, dev, a.iters, pages_per_region, spin, clock_khz, async, d_sum,
-            d_bad, d_first, d_boff, d_bgot);
+        runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          SpinReadPrefetchKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dev, a.iters, pages_per_region, spin, clock_khz, async,
+              d_sum, d_bad, d_first, d_boff, d_bgot, vw, sv);
+        });
         ctp::GpuApi::Synchronize();
         const double ms = NowMs() - t0;
         if (ms < best) best = ms;
@@ -847,9 +789,12 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Memcpy(d_first, &big2, sizeof(big2));
       ctp::GpuApi::Memcpy(d_boff, &big2, sizeof(big2));
       ctp::GpuApi::Memset(d_bgot, 0, sizeof(u32));
-      SpinReadPrefetchKernel<<<a.blocks, a.threads>>>(
-          gpu, dev, 1, pages_per_region, 0, clock_khz, 0, d_sum, d_bad,
-          d_first, d_boff, d_bgot);
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        SpinReadPrefetchKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dev, 1, pages_per_region, 0, clock_khz, 0, d_sum, d_bad,
+            d_first, d_boff, d_bgot, vw, sv);
+      });
       ctp::GpuApi::Synchronize();
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
       unsigned long long *d_dump = nullptr;

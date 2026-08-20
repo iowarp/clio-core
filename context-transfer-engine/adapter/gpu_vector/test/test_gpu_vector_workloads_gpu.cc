@@ -3,16 +3,16 @@
  * The two workload shapes the vector exists to serve, each across the four
  * capacity/parallelism configurations.
  *
- *   Gray Scott   -- read-modify-write over a grid. Uses BeginFlush to start
+ *   Gray Scott   -- read-modify-write over a grid. Uses FlushAsync to start
  *                   writing back the page just finished while the next one
- *                   is being computed (double buffering), and WaitFlush only
+ *                   is being computed (double buffering), and AwaitFlush only
  *                   at the end, so the write-back overlaps compute instead
  *                   of stalling it.
  *
- *   Model weights -- read-only streaming. Uses RescorePage to raise the score
- *                   of the page about to be needed, so it is a PREFETCH hint
- *                   rather than a data copy, and eviction keeps the pages the
- *                   kernel is about to read.
+ *   Model weights -- read-only streaming. Uses a batched rescore (score 1.0)
+ *                   to raise the score of the page about to be needed, so it
+ *                   is a PREFETCH hint rather than a data copy, and eviction
+ *                   keeps the pages the kernel is about to read.
  *
  * Configurations: {single block, many blocks} x {fits, larger than cache}.
  * "Larger than cache" means pages_per_block is smaller than the pages a
@@ -48,7 +48,9 @@ namespace gy = clio::run::gpu;
 template <typename LaunchT>
 static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  // 8192, not the macro-era 256: coroutine frames are compiler-laid-out and
+  // spill into the lane, overflowing anything page-thin.
+  gy::YieldStack stack(nblocks, 32, 8192);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
@@ -72,36 +74,73 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Step(clio::run::u32 v) {
 }  // namespace
 
 /** Seed the vector so later kernels have something real to read. */
+__device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
+                                  clio::run::u64 per, clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  for (clio::run::u64 i = 0; i < per;) {
+    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + i + k] = Seed(base + i + k);
+    }
+    i += h.run();
+  }
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<clio::run::u32> v,
                            clio::run::u64 per, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; i < per; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run, /*write=*/true));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + i + k] = Seed(base + i + k);
-    }
-  }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SeedCoro(v, per, yv.Block()));
 }
 
 /**
  * Gray Scott: update the block's slice page by page, starting the write-back
- * of each finished page immediately (BeginFlush) so it overlaps the next
- * page's compute. One WaitFlush at the end drains them all.
+ * of each finished page immediately (FlushAsync) so it overlaps the next
+ * page's compute. One AwaitFlush at the end drains them all.
  */
+__device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
+                                       clio::run::u64 per,
+                                       clio::run::u64 page_elems,
+                                       clio::run::u32 block) {
+  (void) page_elems;
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+
+  // Advance by the hold's run, NOT by page_elems: HoldPage returns how many
+  // elements are actually reachable from this hold, which can be fewer.
+  // Stepping `run` of them and then skipping a whole page_elems left the
+  // remainder un-Stepped, which showed up as a sum that was too HIGH (Step
+  // reduces the value) by about two elements' worth.
+  for (clio::run::u64 off = 0; off < per;) {
+    auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + off + k] = Step(h[base + off + k]);
+    }
+    // Double buffer: hand this page to the runtime NOW and keep computing.
+    // The internal barrier matters: SubmitPut clears `dirty` as it submits,
+    // so a lane still writing when the flush submits loses its writes.
+    // Collective, internally BATCHED (one multi-put per 64 pages).
+    v.FlushAsync(base + off, h.run());
+    off += h.run();
+  }
+  // Then flush the WHOLE slice. The per-page FlushAsync above is the overlap
+  // this workload exists to show, but it is a submission, not a guarantee:
+  // whatever it did not manage to submit stays dirty in the cache and is lost
+  // when the kernel ends. Measured with only the per-page flush: page 0 landed
+  // and pages 1-7 did not, so the reader saw Step(Seed) for the first 1024
+  // elements and plain Seed for the other 7168. The original spelled this the
+  // same way -- a flush submission per page, then one wait over the slice.
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<clio::run::u32> v,
                                 clio::run::u64 per, clio::run::u64 page_elems,
@@ -109,47 +148,41 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  // Advance by `run`, NOT by page_elems: HoldPageYield returns how many
-  // elements are actually reachable from this hold, which can be fewer.
-  // Stepping `run` of them and then skipping a whole page_elems left the
-  // remainder un-Stepped, which showed up as a sum that was too HIGH (Step
-  // reduces the value) by about two elements' worth.
-  CLIO_YBEGIN();
-  for (; off < per; off += run) {
-    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run, /*write=*/true));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + off + k] = Step(v[base + off + k]);
-    }
-    // Double buffer: hand this page to the runtime NOW and keep computing.
-    // The barrier matters: SubmitPut clears `dirty` as it submits, so a lane
-    // still writing when thread 0 flushes loses its writes.
-    // Collective, internally BATCHED (one multi-put per 64 pages).
-    v.FlushAsync(base + off, run);
-  }
-  // Then flush the WHOLE slice. The per-page BeginFlush above is the overlap
-  // this workload exists to show, but it is a submission, not a guarantee:
-  // whatever it did not manage to submit stays dirty in the cache and is lost
-  // when the kernel ends. Measured with only the per-page flush: page 0 landed
-  // and pages 1-7 did not, so the reader saw Step(Seed) for the first 1024
-  // elements and plain Seed for the other 7168. The original spelled this the
-  // same way -- BeginFlush per page, then one WaitFlush over the slice.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GrayScottCoro(v, per, page_elems, yv.Block()));
 }
 
 /**
- * Weight streaming: read-only pass with a prefetch hint. RescorePage raises
- * the next page's score before it is touched, which is a metadata op -- it
- * steers placement and eviction rather than copying data.
+ * Weight streaming: read-only pass with a prefetch hint. The batched rescore
+ * (score 1.0) raises the next page's score before it is touched: a prefetch
+ * hint that steers placement and eviction rather than copying data.
  */
+__device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
+                                     clio::run::u64 per,
+                                     clio::run::u64 page_elems,
+                                     unsigned long long *sum,
+                                     clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  for (clio::run::u64 off = 0; off < per;) {
+    // Hint the NEXT page before reading this one. Block-collective (thread 0
+    // does the work inside); `off` and `per` are block-uniform, so every lane
+    // takes this branch together. Fire-and-forget: a hint needs no await.
+    if (off + page_elems < per) {
+      const clio::run::u64 next = (base + off + page_elems) / page_elems;
+      v.RescorePagesBatchedAsync(
+          1, [next](clio::run::u32) { return gv::PageScore{next, 1.0f}; });
+    }
+    auto h = co_await v.HoldPage(base + off, per - off);
+    unsigned long long acc = 0;
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      acc += h[base + off + k];
+    }
+    atomicAdd(sum, acc);
+    off += h.run();
+  }
+}
+
 __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<clio::run::u32> v,
                               clio::run::u64 per, clio::run::u64 page_elems,
@@ -157,38 +190,50 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; off < per; off += run) {
-    // Hint the NEXT page before reading this one. One lane: it is a metadata
-    // op, and every lane sending it would be pure duplication.
-    if (threadIdx.x == 0 && off + page_elems < per) {
-      v.RescorePage((base + off + page_elems) / page_elems, 1.0f);
-    }
-    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run));
-    unsigned long long acc = 0;
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      acc += v[base + off + k];
-    }
-    atomicAdd(sum, acc);
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WeightsCoro(v, per, page_elems, sum, yv.Block()));
 }
 
 /**
  * Dirty every page, then force the claim path to look for a slot.
  *
- * The claim used by BeginFetch (and by the batched fetch) picks its victim on
- * score alone and DROPS it without writing it back, which is only safe when
- * the victim is clean. Here every page is dirty and unflushed, so a claim
- * that ignores `dirty` discards the only copy of those writes and the
+ * The claim used by the batched prefetch (rescore with score 1.0) picks its
+ * victim on score alone and DROPS it without writing it back, which is only
+ * safe when the victim is clean. Here every page is dirty and unflushed, so a
+ * claim that ignores `dirty` discards the only copy of those writes and the
  * host-side verification fails.
  */
+__device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
+                                        clio::run::u64 per,
+                                        clio::run::u64 page_elems,
+                                        clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  const clio::run::u64 npages = per / page_elems;
+
+  for (clio::run::u64 off = 0; off < per;) {
+    auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + off + k] = Seed(base + off + k);
+    }
+    // Ask for a page far ahead while THIS one is still dirty. With the cache
+    // full of dirty pages the claim must decline; if it evicts one anyway,
+    // those writes are gone. Block-collective (thread 0 does the work
+    // inside); fire-and-forget on purpose -- it is a probe, not a fetch the
+    // loop depends on.
+    {
+      const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
+      const clio::run::u64 page = base / page_elems + ahead;
+      v.RescorePagesBatchedAsync(
+          1, [page](clio::run::u32) { return gv::PageScore{page, 1.0f}; });
+    }
+    off += h.run();
+  }
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<clio::run::u32> v,
                                  clio::run::u64 per, clio::run::u64 page_elems,
@@ -196,32 +241,9 @@ __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-  const clio::run::u64 npages = per / page_elems;
-
-  CLIO_YBEGIN();
-  for (; off < per; off += run) {
-    CLIO_YCALL(v.HoldPageYield(base + off, per - off, &run, /*write=*/true));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + off + k] = Seed(base + off + k);
-    }
-    // Ask for a page far ahead while THIS one is still dirty. With the cache
-    // full of dirty pages the claim must decline; if it evicts one anyway,
-    // those writes are gone.
-    if (threadIdx.x == 0) {
-      const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
-      v.BeginFetch(base / page_elems + ahead);
-    }
-    __syncthreads();
-  }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(DirtyClaimCoro(v, per, page_elems, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS

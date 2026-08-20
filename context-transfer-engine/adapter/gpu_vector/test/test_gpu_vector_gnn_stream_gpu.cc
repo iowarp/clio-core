@@ -25,16 +25,18 @@
  * rewrite deleted all of it -- there is no transaction.h any more. The current
  * Vector takes the storage pool, codec and preset directly, which is a better
  * fit for this test than the old windowed-prefetch abstraction was, so the
- * streaming is now expressed as what it always meant: a yieldable kernel
- * walking the vector with HoldPageYield while the cache thrashes underneath it.
+ * streaming is now expressed as what it always meant: a device coroutine
+ * walking the vector with co_await HoldPage while the cache thrashes
+ * underneath it.
  *
- * The kernels MUST yield. The blocking HoldPage deadlocks against itself the
- * moment a page needs a transfer: the kernel holds the SM waiting for it, and a
- * resident kernel blocks every later launch in its context, including the one
- * that would service the transfer. Every lane runs the loop for the same
- * reason -- the fault path is block-collective and ends in __syncthreads, so no
- * lane may return early -- and the slice is keyed off yv.Block() because the
- * driver relaunches a compacted grid of whichever blocks are still pending.
+ * The kernels MUST yield. A kernel that spins in-kernel on a fault deadlocks
+ * against itself the moment a page needs a transfer: the kernel holds the SM
+ * waiting for it, and a resident kernel blocks every later launch in its
+ * context, including the one that would service the transfer. Every lane runs
+ * the loop for the same reason -- the fault path is block-collective and ends
+ * in __syncthreads, so no lane may return early -- and the slice is keyed off
+ * yv.Block() because the driver relaunches a compacted grid of whichever
+ * blocks are still pending.
  *
  * Correctness statement: zstd is LOSSLESS, and both the aggregation and the
  * combine are deterministic (one thread owns one output element, fixed-order
@@ -81,58 +83,62 @@ using clio::run::u64;
 // ===========================================================================
 
 /** Copy `count` floats from a plain device buffer INTO the paged vector. */
+__device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
+                                     const float *src, u64 elems_per_block,
+                                     clio::run::u32 block) {
+  const u64 base = static_cast<u64>(block) * elems_per_block;
+  for (u64 i = 0; i < elems_per_block;) {
+    auto h = co_await v.HoldPage(base + i, elems_per_block - i,
+                                 /*write=*/true);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + i + k] = src[base + i + k];
+    }
+    i += h.run();
+  }
+  // SubmitPut clears `dirty` as it submits, so a lane still writing when
+  // thread 0 flushes would lose its writes and leave the page looking clean.
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, elems_per_block);
+  co_await v.AwaitFlush();
+}
+
 __global__ void VecFillKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> v, const float *src,
                               u64 elems_per_block, gy::YieldableView<> yv,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(u64, i, 0);
-  CLIO_YLOCAL_INIT(u64, run, 0);
-  const u64 base = static_cast<u64>(yv.Block()) * elems_per_block;
-
-  CLIO_YBEGIN();
-  for (; i < elems_per_block; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run,
-                               /*write=*/true));
-    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + i + k] = src[base + i + k];
-    }
-  }
-  // SubmitPut clears `dirty` as it submits, so a lane still writing when
-  // thread 0 flushes would lose its writes and leave the page looking clean.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, elems_per_block);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(VecFillCoro(v, src, elems_per_block, yv.Block()));
 }
 
 /** Scatter the paged vector back OUT into a plain device buffer. */
+__device__ gy::YCoroMain VecDrainCoro(gv::DeviceVector<float> v, float *dst,
+                                      u64 elems_per_block,
+                                      clio::run::u32 block) {
+  const u64 base = static_cast<u64>(block) * elems_per_block;
+  for (u64 i = 0; i < elems_per_block;) {
+    auto h = co_await v.HoldPage(base + i, elems_per_block - i);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      // Read-only sweep: the hold stays write=false, so every page is dropped
+      // clean and nothing is written back. THE HOLD IS THE PIN, so eviction
+      // cannot re-tenant the slot under a lane that is still reading.
+      dst[base + i + k] = h[base + i + k];
+    }
+    i += h.run();
+  }
+}
+
 __global__ void VecDrainKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> v, float *dst,
                                u64 elems_per_block, gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(u64, i, 0);
-  CLIO_YLOCAL_INIT(u64, run, 0);
-  const u64 base = static_cast<u64>(yv.Block()) * elems_per_block;
-
-  CLIO_YBEGIN();
-  for (; i < elems_per_block; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run));
-    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // Read-only sweep: the hold stays write=false, so every page is dropped
-      // clean and nothing is written back. A held page is pinned, so eviction
-      // cannot re-tenant the slot under a lane that is still reading.
-      dst[base + i + k] = v[base + i + k];
-    }
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(VecDrainCoro(v, dst, elems_per_block, yv.Block()));
 }
 
 __global__ void GnnAggMeanKernel(const float *feat, int D,
@@ -298,11 +304,16 @@ bool IngestFromFile(const char *path, const clio::cte::core::TagId &tag,
   return ok && pg == want_pages;
 }
 
+/** Per-lane yield frame. Coroutine frames are compiler-laid-out and hold the
+ *  whole live state plus resume/destroy pointers, so they need far more than
+ *  the few u64s a hand-packed macro frame did. */
+constexpr unsigned kYieldLaneBytes = 8192;
+
 /** Run a yieldable kernel to completion (re-launch until no block is pending). */
 template <typename LaunchT>
 u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());

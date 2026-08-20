@@ -9,7 +9,7 @@
  *               region through the paged cache. The cache is deliberately
  *               SMALLER than the range (slots < P), so the write phase
  *               continuously evicts: dirty victims flush mid-phase, then
- *               BeginFlush drains the rest. Each flushed page is a
+ *               FlushAsync/AwaitFlush drains the rest. Each flushed page is a
  *               PodPutBlob whose blob HASHES to some node -- so the writes
  *               land across the whole cluster, not on the writer.
  *   2. BARRIER — a sentinel blob per (node, round), polled via the ordinary
@@ -69,17 +69,38 @@ __host__ __device__ inline u32 Pattern(u64 i, u32 round) {
 /**
  * Write this node's range.
  *
- * YIELDABLE, and that is not a style choice. The blocking HoldPage deadlocks
- * against itself as soon as a page must be written back: the kernel sits on
- * the SM waiting for the writeback, and a resident kernel blocks every later
- * launch in its context -- including the one that would service it. Yielding
- * lets the block suspend so the fault can be served.
+ * A COROUTINE, and that is not a style choice. The blocking HoldPage
+ * deadlocked against itself as soon as a page had to be written back: the
+ * kernel sat on the SM waiting for the writeback, and a resident kernel
+ * blocks every later launch in its context -- including the one that would
+ * service it. co_await suspends the block so the fault can be served.
  *
- * The slice is keyed off yv.Block(), not blockIdx.x: the driver relaunches a
- * COMPACTED grid of the still-pending blocks, so blockIdx.x is not stable
- * across resumes. Every lane runs the loop and they split each resolved run;
- * the fault path is block-collective, so no lane may return early.
+ * The slice is keyed off the driver-assigned block id, not blockIdx.x: the
+ * driver relaunches a COMPACTED grid of the still-pending blocks, so
+ * blockIdx.x is not stable across resumes. Every lane runs the loop and they
+ * split each resolved run; the fault path is block-collective, so no lane
+ * may return early.
  */
+__device__ gy::YCoroMain WriteRangeCoro(gv::DeviceVector<u32> v,
+                                        u64 first_elem, u64 elems_per_block,
+                                        u32 round, clio::run::u32 block) {
+  const u64 base = first_elem + static_cast<u64>(block) * elems_per_block;
+  for (u64 i = 0; i < elems_per_block;) {
+    auto h = co_await v.HoldPage(base + i, elems_per_block - i, /*write=*/true);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + i + k] = Pattern(base + i + k, round);
+    }
+    i += h.run();
+  }
+  // The flush clears `dirty` as it submits, so a lane still writing when the
+  // puts go out would lose its writes AND leave the page looking clean.
+  // FlushAsync is block-collective and barriers internally before thread 0
+  // submits, so every lane's stores above are complete first. Internally
+  // BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, elems_per_block);
+  co_await v.AwaitFlush();
+}
+
 __global__ void WriteRangeKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceVector<u32> v, u64 first_elem,
                                  u64 elems_per_block, u32 round,
@@ -87,31 +108,34 @@ __global__ void WriteRangeKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(u64, i, 0);
-  CLIO_YLOCAL_INIT(u64, run, 0);
-  const u64 base =
-      first_elem + static_cast<u64>(yv.Block()) * elems_per_block;
-
-  CLIO_YBEGIN();
-  for (; i < elems_per_block; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run,
-                               /*write=*/true));
-    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + i + k] = Pattern(base + i + k, round);
-    }
-  }
-  // SubmitPut clears `dirty` as it submits, so a lane still writing when
-  // thread 0 flushes would lose its writes AND leave the page looking clean.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, elems_per_block);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(
+      WriteRangeCoro(v, first_elem, elems_per_block, round, yv.Block()));
 }
 
 /** Read + verify a range; accumulates mismatches and a checksum. Every page
  *  here is a fault, and most of them are owned by another node. */
+__device__ gy::YCoroMain ReadRangeCoro(gv::DeviceVector<u32> v, u64 first_elem,
+                                       u64 elems_per_block, u32 round,
+                                       unsigned long long *sum,
+                                       unsigned long long *mismatches,
+                                       clio::run::u32 block) {
+  const u64 base = first_elem + static_cast<u64>(block) * elems_per_block;
+  for (u64 i = 0; i < elems_per_block;) {
+    auto h = co_await v.HoldPage(base + i, elems_per_block - i);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      // Read-only sweep: the hold stays write=false, so every page is dropped
+      // clean and nothing is written back. THE HOLD IS THE PIN: eviction
+      // cannot re-tenant the slot under a lane that is still reading.
+      const u32 got = h[base + i + k];
+      atomicAdd(sum, static_cast<unsigned long long>(got));
+      if (got != Pattern(base + i + k, round)) atomicAdd(mismatches, 1ull);
+    }
+    i += h.run();
+  }
+}
+
 __global__ void ReadRangeKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<u32> v, u64 first_elem,
                                 u64 elems_per_block, u32 round,
@@ -121,26 +145,10 @@ __global__ void ReadRangeKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(u64, i, 0);
-  CLIO_YLOCAL_INIT(u64, run, 0);
-  const u64 base =
-      first_elem + static_cast<u64>(yv.Block()) * elems_per_block;
-
-  CLIO_YBEGIN();
-  for (; i < elems_per_block; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, elems_per_block - i, &run));
-    for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // Read-only sweep: the hold stays write=false, so every page is dropped
-      // clean and nothing is written back. A held page is pinned, so eviction
-      // cannot re-tenant the slot under a lane that is still reading.
-      const u32 got = v[base + i + k];
-      atomicAdd(sum, static_cast<unsigned long long>(got));
-      if (got != Pattern(base + i + k, round)) atomicAdd(mismatches, 1ull);
-    }
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(ReadRangeCoro(v, first_elem, elems_per_block, round, sum,
+                               mismatches, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -165,7 +173,10 @@ void Step(int node, const char *what) {
 template <typename LaunchT>
 clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  // 8192, not the macro-era 256: the kernels are C++20 coroutines now and
+  // their frames spill into the yield lane -- a page-thin lane overflows on
+  // the first co_await.
+  gy::YieldStack stack(nblocks, 32, 8192);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());

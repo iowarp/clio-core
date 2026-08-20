@@ -200,51 +200,34 @@ void ReadMeta(const std::string &dir, clio::run::u64 &N, int &F, clio::run::u64 
 
 }  // namespace
 
-/** Per-lane yield frame. Macro frames are hand-packed (a few u64s);
- *  coroutine frames are compiler-laid-out and hold the whole live state plus
- *  resume/destroy pointers, so they need an order of magnitude more. */
-#if defined(CLIO_YIELD_CORO)
+/** Per-lane yield frame. Coroutine frames are compiler-laid-out and hold the
+ *  whole live state plus resume/destroy pointers, so they need an order of
+ *  magnitude more than the hand-packed macro frames (a few u64s) ever did. */
 static constexpr clio::run::u32 kYieldLaneBytes = 4096;
-#else
-static constexpr clio::run::u32 kYieldLaneBytes = 256;
-#endif
 
 namespace gv = clio::cte::gpu_vector;
 namespace gy = clio::run::gpu;
 
-/** Copy one held run into the window scratch. Shared by both mechanisms. */
-CTP_GPU_FUN void GnnCopyRun(gv::DeviceVector<float> &v, clio::run::u64 lo,
-                            clio::run::u64 i, clio::run::u64 n,
-                            clio::run::u64 run, float *scratch) {
-  // BULK COPY off the page pointer, not element-by-element. The page is
-  // already resolved and pinned by the hold, so TryHoldRawConst hands back the
-  // base directly (read-only, so it does not dirty the page the way HoldRaw
-  // would) and the run becomes a flat memcpy. Four floats per thread lets the
-  // compiler emit 128-bit loads and stores.
-  clio::run::u64 probe = 0;
-  const float *src = v.TryHoldRawConst(lo + i, n - i, &probe);
-  if (src != nullptr && probe >= run) {
-    float *dst = scratch + i;
-    const clio::run::u64 quads = run >> 2;
-    for (clio::run::u64 q = threadIdx.x; q < quads; q += blockDim.x) {
-      float4 val;
-      val.x = src[q * 4 + 0];
-      val.y = src[q * 4 + 1];
-      val.z = src[q * 4 + 2];
-      val.w = src[q * 4 + 3];
-      reinterpret_cast<float4 *>(dst)[q] = val;
-    }
-    for (clio::run::u64 k = (quads << 2) + threadIdx.x; k < run;
-         k += blockDim.x) {
-      dst[k] = src[k];
-    }
-  } else {
-    // Miss on the probe: fall back to the scalar accessor. at() is read-only;
-    // operator[] would mark the page dirty, which blocks the run-fetch from
-    // claiming slots and forces single-page paging.
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      scratch[i + k] = v[lo + i + k];
-    }
+/** Copy one held run into the window scratch. The caller has just held
+ *  (lo+i, n-i), so the run lives entirely on the held page. */
+CTP_GPU_FUN void GnnCopyRun(const float *src, clio::run::u64 run,
+                            float *dst) {
+  // BULK COPY off the guard's base pointer, not element-by-element. The
+  // guard's ptr() IS the first held element -- valid for exactly the guard's
+  // lifetime -- so the run becomes a flat memcpy. Four floats per thread
+  // lets the compiler emit 128-bit loads and stores.
+  const clio::run::u64 quads = run >> 2;
+  for (clio::run::u64 q = threadIdx.x; q < quads; q += blockDim.x) {
+    float4 val;
+    val.x = src[q * 4 + 0];
+    val.y = src[q * 4 + 1];
+    val.z = src[q * 4 + 2];
+    val.w = src[q * 4 + 3];
+    reinterpret_cast<float4 *>(dst)[q] = val;
+  }
+  for (clio::run::u64 k = (quads << 2) + threadIdx.x; k < run;
+       k += blockDim.x) {
+    dst[k] = src[k];
   }
 }
 
@@ -262,20 +245,14 @@ CTP_GPU_FUN void GnnSlice(clio::run::u64 &lo, clio::run::u64 hi,
   scratch += base;
 }
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 /**
  * The gather, as a REAL C++20 device coroutine.
  *
- * co_await on HoldPageCoro instead of the CLIO_Y* macro state machine. The
- * compiler hoists everything live across a suspend into the coroutine frame,
- * so `i` and `run` are ordinary locals rather than CLIO_YLOCAL slots, and the
- * loop reads as a loop. The kernel is never parked spinning: a suspend returns
- * from the kernel entirely and the host driver resumes the frame.
- *
- * Requires clang as the CUDA compiler AND -DCLIO_GPU_YIELD_CORO=ON. nvcc
- * rejects co_await in device code, so under nvcc this whole branch is
- * preprocessed out and the macro form below is used instead -- which is easy
- * to not notice, because the build still succeeds.
+ * co_await on HoldPage instead of the deleted CLIO_Y* macro state machine.
+ * The compiler hoists everything live across a suspend into the coroutine
+ * frame, so `i` and `run` are ordinary locals, and the loop reads as a loop.
+ * The kernel is never parked spinning: a suspend returns from the kernel
+ * entirely and the host driver resumes the frame.
  */
 __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
                                        clio::run::u64 lo, clio::run::u64 hi,
@@ -283,10 +260,10 @@ __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
                                        clio::run::u32 block) {
   clio::run::u64 n = 0;
   GnnSlice(lo, hi, scratch, nblocks, block, n);
-  clio::run::u64 run = 0;
-  for (clio::run::u64 i = 0; i < n; i += run) {
-    co_await v.HoldPage(lo + i, n - i, &run);
-    GnnCopyRun(v, lo, i, n, run, scratch);
+  for (clio::run::u64 i = 0; i < n;) {
+    auto h = co_await v.HoldPage(lo + i, n - i);
+    GnnCopyRun(h.ptr(), h.run(), scratch + i);
+    i += h.run();
   }
 }
 
@@ -301,33 +278,6 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
   __syncthreads();
   CLIO_YCORO_RUN(GnnGatherCoro(v, lo, hi, scratch, nblocks, yv.Block()));
 }
-#else
-/**
- * The gather, macro/Duff's-device form. Used only when the build is not
- * clang-CUDA with CLIO_GPU_YIELD_CORO=ON; see GnnGatherCoro above.
- */
-__global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
-                                gv::DeviceVector<float> v, clio::run::u64 lo,
-                                clio::run::u64 hi, float *scratch,
-                                clio::run::u32 nblocks, gy::YieldableView<> yv,
-                                gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  clio::run::u64 n = 0;
-  GnnSlice(lo, hi, scratch, nblocks, yv.Block(), n);
-
-  CLIO_YBEGIN();
-  for (; i < n; i += run) {
-    CLIO_YCALL(v.HoldPageYield(lo + i, n - i, &run));
-    GnnCopyRun(v, lo, i, n, run, scratch);
-  }
-  CLIO_YEND();
-}
-#endif
 
 /** Forward + backward for the window's nodes (one thread per node). Writes per-node
  *  h1, dz1, dz2 to window buffers; accumulates loss/correct/count. */

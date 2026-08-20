@@ -68,71 +68,65 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Activation(clio::run::u64 i) {
 
 }  // namespace
 
-/** Seed the weights through the YIELDING fault path. */
+/** Seed the weights through the YIELDING (coroutine) fault path. */
+__device__ gy::YCoroMain HbmSeedCoro(gv::DeviceVector<clio::run::u32> v,
+                                     clio::run::u64 per,
+                                     clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  for (clio::run::u64 off = 0; off < per; off += kPageElems) {
+    auto h = co_await v.HoldPage(
+        base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
+        /*write=*/true);
+    for (clio::run::u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
+      h[base + off + i] = Weight(base + off + i);
+    }
+  }
+  // SubmitPut clears `dirty` as it submits, so a lane still writing the last
+  // page when the flush submits would lose its writes AND leave the page
+  // looking clean.
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void HbmSeedKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<clio::run::u32> v,
                               clio::run::u64 per, gy::YieldableView<> yv,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; off < per; off += kPageElems) {
-    CLIO_YCALL(v.HoldPageYield(
-        base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
-        &run, /*write=*/true));
-    {
-      const clio::run::u64 n =
-          (off + kPageElems <= per) ? kPageElems : (per - off);
-      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        v[base + off + i] = Weight(base + off + i);
-      }
-    }
-  }
-  // SubmitPut clears `dirty` as it submits, so a lane still writing the last
-  // page when thread 0 flushes would lose its writes AND leave the page
-  // looking clean.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(HbmSeedCoro(v, per, yv.Block()));
 }
 
 /** sum(w[i] * activation(i)) read back through the yielding fault path. */
+__device__ gy::YCoroMain HbmDotCoro(gv::DeviceVector<clio::run::u32> v,
+                                    clio::run::u64 per,
+                                    unsigned long long *sum,
+                                    clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  for (clio::run::u64 off = 0; off < per; off += kPageElems) {
+    auto h = co_await v.HoldPage(
+        base + off, (off + kPageElems <= per) ? kPageElems : (per - off));
+    unsigned long long acc = 0;
+    for (clio::run::u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
+      acc += static_cast<unsigned long long>(h[base + off + i]) *
+             Activation(base + off + i);
+    }
+    atomicAdd(sum, acc);
+  }
+}
+
 __global__ void HbmDotKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<clio::run::u32> v,
                              clio::run::u64 per, unsigned long long *sum,
                              gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, off, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; off < per; off += kPageElems) {
-    CLIO_YCALL(v.HoldPageYield(
-        base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
-        &run));
-    {
-      const clio::run::u64 n =
-          (off + kPageElems <= per) ? kPageElems : (per - off);
-      unsigned long long acc = 0;
-      for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-        acc += static_cast<unsigned long long>(v[base + off + i]) *
-               Activation(base + off + i);
-      }
-      atomicAdd(sum, acc);
-    }
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(HbmDotCoro(v, per, sum, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -200,7 +194,9 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   // --- seed -----------------------------------------------------------
   {
     gy::Yieldable<> drv(kBlocks, 32);
-    gy::YieldStack stack(kBlocks, 32, 256);
+    // 8192, not the macro-era 256: coroutine frames are compiler-laid-out
+    // and spill into the lane, overflowing anything page-thin.
+    gy::YieldStack stack(kBlocks, 32, 8192);
     const clio::run::u32 rounds = drv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           HbmSeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -249,7 +245,8 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   ctp::GpuApi::Memset(d_sum, 0, sizeof(unsigned long long));
   {
     gy::Yieldable<> drv(kBlocks, 32);
-    gy::YieldStack stack(kBlocks, 32, 256);
+    // Coroutine-frame lane size (see the seed launch above).
+    gy::YieldStack stack(kBlocks, 32, 8192);
     const clio::run::u32 rounds = drv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           HbmDotKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(

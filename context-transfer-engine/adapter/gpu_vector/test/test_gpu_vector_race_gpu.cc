@@ -42,10 +42,9 @@ namespace gy = clio::run::gpu;
 template <typename LaunchT>
 static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  // 8 KB lanes, not 256 B: the stress kernel is a C++20 COROUTINE now and
-  // its frame lives on this lane -- a macro-era 256-byte lane overflows on
-  // the first co_await and traps. The macro seed kernel shares the driver
-  // and simply leaves the extra room unused.
+  // 8 KB lanes, not 256 B: both kernels are C++20 COROUTINES and their
+  // frames live on this lane -- a macro-era 256-byte lane overflows on the
+  // first co_await and traps.
   gy::YieldStack stack(nblocks, 32, 8192);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
@@ -79,29 +78,31 @@ CTP_INLINE_CROSS_FUN clio::run::u32 Seed(clio::run::u64 i) {
  * is deliberately larger than the cache so the eviction writeback is what
  * stores most of it.
  */
+__device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
+                                      clio::run::u64 per,
+                                      clio::run::u32 block) {
+  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
+  for (clio::run::u64 i = 0; i < per;) {
+    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      h[base + i + k] = Seed(base + i + k);
+    }
+    i += h.run();
+  }
+  // Collective, internally BATCHED (one multi-put per 64 pages).
+  v.FlushAsync(base, per);
+  co_await v.AwaitFlush();
+}
+
 __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<clio::run::u32> v,
                                clio::run::u64 per, gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 base = static_cast<clio::run::u64>(yv.Block()) * per;
-
-  CLIO_YBEGIN();
-  for (; i < per; i += run) {
-    CLIO_YCALL(v.HoldPageYield(base + i, per - i, &run, /*write=*/true));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      v[base + i + k] = Seed(base + i + k);
-    }
-  }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  CLIO_YIELD_IF(v.AnyTransferInFlight());
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RaceSeedCoro(v, per, yv.Block()));
 }
 
 /**
@@ -143,16 +144,18 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     }
 
     // Demand access: suspend until resident, then take a RAW pointer with
-    // its claim generation and read across a long window. Nothing pins a
-    // held page, so a sibling's claim can re-tenant the slot mid-read --
-    // the generation check below is what must catch that.
-    clio::run::u64 run = 0;
-    co_await v.HoldPage(pn * kPageElems, kPageElems, &run);
-    if (threadIdx.x == 0 && run != 0) {
+    // its claim generation and read across a long window. THE HOLD IS THE
+    // PIN now, so the held page itself cannot be re-tenanted -- but the raw
+    // probe and its generation are machinery this test exists to exercise
+    // (TestAccess): the seqlock is what guards any raw read the pin does
+    // not cover, and it must never invalidate a read that was in fact safe.
+    auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
+    if (threadIdx.x == 0 && h.run() != 0) {
+      clio::run::u64 run = 0;
       clio::run::u32 gen = 0;
       gv::Page *slot = nullptr;
-      const clio::run::u32 *q = v.TryHoldRawConstG(pn * kPageElems, kPageElems,
-                                                   &run, &gen, &slot);
+      const clio::run::u32 *q = gv::DeviceVectorTestAccess::TryHoldRawConstG(
+          v, pn * kPageElems, kPageElems, &run, &gen, &slot);
       if (q != nullptr && run != 0) {
         // LONG READ: ~50 us of "compute" while holding the raw pointer.
         const long long t0 = clock64();
@@ -163,7 +166,7 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
         for (int k = 0; k < 3; ++k) got[k] = q[idx[k]];
         // Only a read that SURVIVED its claim generation may be judged:
         // a recycled slot is the expected hazard, not a data error.
-        if (v.HoldStillValid(slot, gen)) {
+        if (gv::DeviceVectorTestAccess::HoldStillValid(v, slot, gen)) {
           for (int k = 0; k < 3; ++k) {
             const clio::run::u64 el = pn * kPageElems + idx[k];
             const clio::run::u32 want = Seed(el);
@@ -179,7 +182,7 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
       }
     }
     __syncthreads();
-  }
+  }  // each iteration's guard died at its scope end: no pin outlives its turn
 }
 
 __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,

@@ -112,7 +112,7 @@ CTP_INLINE_CROSS_FUN float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
  * Wait for this block's outstanding writebacks by PARKING, not spinning.
  *
  * REQUIRED FOR CORRECTNESS ACROSS STEPS, not just for timing. Page caches are
- * PER BLOCK: block A writes plane z into its own cache and BeginFlush only
+ * PER BLOCK: block A writes plane z into its own cache and FlushAsync only
  * *issues* the put. On the next step those regions swap, and block B -- which
  * owns a neighbouring z-slab -- faults on plane z, misses its own cache, and
  * fetches from the tier. If A's put has not landed, B reads a STALE plane.
@@ -133,7 +133,7 @@ CTP_INLINE_CROSS_FUN float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
  *   read  : blocking CTE GetBlob per input plane
  *   write : blocking CTE PutBlob per output plane  <-- writes are synchronous
  *           too, not just reads. The paged path submits its writebacks with
- *           BeginFlush and keeps going; the baseline cannot, so the put lands
+ *           FlushAsync and keeps going; the baseline cannot, so the put lands
  *           on the critical path of every z-iteration.
  *   copy  : blocking cudaMemcpy each way
  *   kernel: torn down and relaunched for every single z
@@ -169,34 +169,31 @@ __global__ void GrayscottBaselineKernel(const float *uzm, const float *uz,
   }
 }
 
-__device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
-  CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
-                     v.AnyTransferInFlight(), v.FlushWaitTag());
-}
-
 /** Seed u and v for this block's z-range, one plane (= one page) at a time. */
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
                                   u64 ubase, u64 vbase) {
-  u64 run = 0;
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.HoldPage(ubase + z * plane, plane, &run, /*write=*/true);
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      vec[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
+    {
+      auto h = co_await vec.HoldPage(ubase + z * plane, plane, /*write=*/true);
+      for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
+        h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
+      }
+      // Collective, internally BATCHED (one multi-put per 64 pages).
+      vec.FlushAsync(ubase + z * plane, plane);
     }
-    // Collective, internally BATCHED (one multi-put per 64 pages).
-    vec.FlushAsync(ubase + z * plane, plane);
-
-    co_await vec.HoldPage(vbase + z * plane, plane, &run, /*write=*/true);
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      vec[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
+    {
+      auto h = co_await vec.HoldPage(vbase + z * plane, plane, /*write=*/true);
+      for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
+        h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
+      }
+      // Collective, internally BATCHED (one multi-put per 64 pages).
+      vec.FlushAsync(vbase + z * plane, plane);
     }
-    // Collective, internally BATCHED (one multi-put per 64 pages).
-    vec.FlushAsync(vbase + z * plane, plane);
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
   // durable before this kernel returns.
-  co_await FlushWaitCoro(vec);
+  co_await vec.AwaitFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -225,80 +222,88 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 ubase, u64 vbase, u64 unext, u64 vnext,
                                   float Du, float Dv, float F, float K,
                                   float dt) {
-  u64 run = 0;
+  // One guard per concurrently-needed plane; declared OUTSIDE the loop and
+  // move-assigned each iteration, so the assignment releases the previous
+  // plane's pin instead of leaking it.
+  gv::Held<float> uzm, uz, uzp;
+  gv::Held<float> vzm, vz, vzp;
+  gv::Held<float> unx, vnx;
   for (u64 z = z0; z < z1; ++z) {
     const bool interior = (z > 0 && z + 1 < nz);
     const u64 zm = interior ? (z - 1) : z;
     const u64 zp = interior ? (z + 1) : z;
 
-    // Three input planes of u, then three of v. Held together: the sliding
-    // window means z and z+1 are needed again on the next iteration, which is
-    // the reuse this benchmark measures.
-    co_await vec.HoldPage(ubase + zm * plane, plane, &run);
-    co_await vec.HoldPage(ubase + z * plane, plane, &run);
-    co_await vec.HoldPage(ubase + zp * plane, plane, &run);
-    co_await vec.HoldPage(vbase + zm * plane, plane, &run);
-    co_await vec.HoldPage(vbase + z * plane, plane, &run);
-    co_await vec.HoldPage(vbase + zp * plane, plane, &run);
-    co_await vec.HoldPage(unext + z * plane, plane, &run, /*write=*/true);
-    co_await vec.HoldPage(vnext + z * plane, plane, &run, /*write=*/true);
+    // Three input planes of u, then three of v, then the two outputs -- ONE
+    // GUARD PER PLANE, because a guard indexes only its own held page.
+    // THE HOLD IS THE PIN: each guard's plane stays resident until the
+    // guard is re-assigned past it, so the sliding window (z and z+1 are
+    // re-held next iteration) is expressed by the pins themselves and needs
+    // no score hints.
+    uzm = co_await vec.HoldPage(ubase + zm * plane, plane);
+    uz = co_await vec.HoldPage(ubase + z * plane, plane);
+    uzp = co_await vec.HoldPage(ubase + zp * plane, plane);
+    vzm = co_await vec.HoldPage(vbase + zm * plane, plane);
+    vz = co_await vec.HoldPage(vbase + z * plane, plane);
+    vzp = co_await vec.HoldPage(vbase + zp * plane, plane);
+    unx = co_await vec.HoldPage(unext + z * plane, plane, /*write=*/true);
+    vnx = co_await vec.HoldPage(vnext + z * plane, plane, /*write=*/true);
 
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       const u64 x = i % nx, y = i / nx;
-      const float u = vec[ubase + z * plane + i];
-      const float v = vec[vbase + z * plane + i];
+      const float u = uz[ubase + z * plane + i];
+      const float v = vz[vbase + z * plane + i];
       float lu, lv;
       if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
         lu = 0.0f; lv = 0.0f;      // fixed boundary
       } else {
-        lu = vec[ubase + z * plane + i - 1] +
-             vec[ubase + z * plane + i + 1] +
-             vec[ubase + z * plane + i - nx] +
-             vec[ubase + z * plane + i + nx] +
-             vec[ubase + zm * plane + i] +
-             vec[ubase + zp * plane + i] - 6.0f * u;
-        lv = vec[vbase + z * plane + i - 1] +
-             vec[vbase + z * plane + i + 1] +
-             vec[vbase + z * plane + i - nx] +
-             vec[vbase + z * plane + i + nx] +
-             vec[vbase + zm * plane + i] +
-             vec[vbase + zp * plane + i] - 6.0f * v;
+        lu = uz[ubase + z * plane + i - 1] +
+             uz[ubase + z * plane + i + 1] +
+             uz[ubase + z * plane + i - nx] +
+             uz[ubase + z * plane + i + nx] +
+             uzm[ubase + zm * plane + i] +
+             uzp[ubase + zp * plane + i] - 6.0f * u;
+        lv = vz[vbase + z * plane + i - 1] +
+             vz[vbase + z * plane + i + 1] +
+             vz[vbase + z * plane + i - nx] +
+             vz[vbase + z * plane + i + nx] +
+             vzm[vbase + zm * plane + i] +
+             vzp[vbase + zp * plane + i] - 6.0f * v;
       }
       const float uvv = u * v * v;
-      vec[unext + z * plane + i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
-      vec[vnext + z * plane + i] = v + dt * (Dv * lv + uvv - (F + K) * v);
+      unx[unext + z * plane + i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
+      vnx[vnext + z * plane + i] = v + dt * (Dv * lv + uvv - (F + K) * v);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-      // SLIDING-WINDOW HINT. The caller knows the reuse distance here and the
-      // cache cannot infer it: iteration z+1 needs planes z and z+1, plane
-      // z-1 leaves the window and is never touched again, and the two output
-      // planes are write-once. A recency policy gets this exactly backwards --
-      // z-1 was touched most recently of the three inputs, so LRU keeps it and
-      // evicts the plane about to be reused.
-      vec.RescorePage(vec.PageOf(ubase + z * plane), 1.0f);
-      vec.RescorePage(vec.PageOf(vbase + z * plane), 1.0f);
-      if (interior) {
-        vec.RescorePage(vec.PageOf(ubase + zp * plane), 1.0f);
-        vec.RescorePage(vec.PageOf(vbase + zp * plane), 1.0f);
-        // zm == z when not interior, so releasing it there would release the
-        // plane the next iteration still needs.
-        vec.RescorePage(vec.PageOf(ubase + zm * plane), 0.0f);
-        vec.RescorePage(vec.PageOf(vbase + zm * plane), 0.0f);
-      }
-      vec.BeginFlush(unext + z * plane, plane);
-      vec.BeginFlush(vnext + z * plane, plane);
-      // Write-once: consumed the moment the flush is submitted.
-      vec.RescorePage(vec.PageOf(unext + z * plane), 0.0f);
-      vec.RescorePage(vec.PageOf(vnext + z * plane), 0.0f);
+    // Flush the write-once outputs; the drop below is best-effort (a page
+    // still flushing or pinned is refused and reclaimed by ordinary eviction
+    // once it settles).
+    vec.FlushAsync(unext + z * plane, plane);
+    vec.FlushAsync(vnext + z * plane, plane);
+    if (interior) {
+      // Plane z-1 leaves the sliding window for good: empty the guard so the
+      // drop can take it. (zm == z when not interior, so releasing it there
+      // would release the plane the next iteration still needs.)
+      uzm = {};
+      vzm = {};
+      const u64 d0 = vec.PageOf(ubase + zm * plane);
+      const u64 d1 = vec.PageOf(vbase + zm * plane);
+      const u64 d2 = vec.PageOf(unext + z * plane);
+      const u64 d3 = vec.PageOf(vnext + z * plane);
+      const u64 drops[4] = {d0, d1, d2, d3};
+      vec.RescorePagesBatchedAsync(4, [&drops](u32 i) {
+        return gv::PageScore{drops[i], 0.0f};
+      });
     }
-    __syncthreads();
   }
   // Drain before returning: the next step swaps the regions and other blocks
   // will fault on the planes written here. Waiting once per block per step,
   // rather than once per plane, keeps the puts pipelined while still making
-  // them durable at the step boundary.
-  co_await FlushWaitCoro(vec);
+  // them durable at the step boundary. Every guard empties first so nothing
+  // stays pinned when the drops below run.
+  uzm = {}; uz = {}; uzp = {};
+  vzm = {}; vz = {}; vzp = {};
+  unx = {}; vnx = {};
+  co_await vec.AwaitFlush();
   // ...and then DROP THE CACHE. Durability alone is not enough. A block reads
   // planes owned by its NEIGHBOURS (z-1 at the bottom of its slab, z+1 at the
   // top), and those pages stay resident in this block's cache. The regions
@@ -310,8 +315,22 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
   // The residual scaled with the PLANE COUNT, which is the signature: 1.70e-03
   // at 64KB pages (65536 planes) down to nothing measurable at 4MB (1024
   // planes) -- more planes, more block-boundary sharing, more stale hits.
-  if (threadIdx.x == 0) vec.DropAll();
-  __syncthreads();
+  // Everything this block touched is clean (flushed and awaited above) and
+  // unpinned, so the batched score-0 drop takes it all.
+  {
+    const u64 zlo = (z0 > 0) ? (z0 - 1) : 0;
+    const u64 zhi = (z1 + 1 < nz) ? (z1 + 1) : nz;
+    const u64 bases[4] = {ubase, vbase, unext, vnext};
+    for (u64 b = 0; b < 4; ++b) {
+      for (u64 pg = zlo; pg < zhi; pg += 64) {
+        const u32 nb = (zhi - pg < 64) ? static_cast<u32>(zhi - pg) : 64u;
+        const u64 pbase = vec.PageOf(bases[b]);
+        vec.RescorePagesBatchedAsync(nb, [pbase, pg](u32 i) {
+          return gv::PageScore{pbase + pg + i, 0.0f};
+        });
+      }
+    }
+  }
 }
 
 __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
@@ -333,12 +352,11 @@ __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
 /** Sum of v over this block's range, for the correctness checksum. */
 __device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
                                  u64 z0, u64 z1, u64 vbase, double *out) {
-  u64 run = 0;
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.HoldPage(vbase + z * plane, plane, &run);
+    auto h = co_await vec.HoldPage(vbase + z * plane, plane);
     double acc = 0.0;
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      acc += static_cast<double>(vec[vbase + z * plane + i]);
+      acc += static_cast<double>(h[vbase + z * plane + i]);
     }
     atomicAdd(out, acc);
     __syncthreads();
@@ -405,7 +423,7 @@ class YieldRunner {
 }  // namespace
 
 int main(int argc, char **argv) {
-  u32 blocks = 64, threads = 256, slots = 8, steps = 4;
+  u32 blocks = 64, threads = 256, slots = 12, steps = 4;
   u64 page_kb = 1024, data_mb = 16384, hbm_mb = 4096;
   int repeat = 3;
   // Out-of-core WITHOUT in-kernel faulting: synchronous CTE reads AND
@@ -463,7 +481,7 @@ int main(int argc, char **argv) {
   // The kernel holds 6 input planes + 2 output planes at once. A smaller cache
   // could evict a plane the kernel is still reading -- that would not crash,
   // it would silently read whatever replaced it, so it is refused.
-  const u32 kNeededSlots = 8;
+  const u32 kNeededSlots = 10;
   if (slots < kNeededSlots) {
     std::fprintf(stderr,
                  "GRAYSCOTT ERROR: slots=%u but the stencil holds %u planes at "

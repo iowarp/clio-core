@@ -104,16 +104,19 @@ CTP_GPU_FUN float DistSq(const float *pt, const float *cent, u32 dims) {
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
                                   u64 page_elems, u32 dims, u32 k, u32 block) {
   const u64 base = static_cast<u64>(block) * per;
-  u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPage(base + off, n, &run, /*write=*/true);
+    auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      v[base + off + i] = PointVal(base + off + i, dims, k);
+      h[base + off + i] = PointVal(base + off + i, dims, k);
     }
     // Collective, internally BATCHED (one multi-put per 64 pages).
     v.FlushAsync(base + off, n);
   }
+  // Collect every flush started above: only explicit flushes write data back
+  // now (drops refuse dirty pages), so a seeded page left in flight or left
+  // to eviction would simply be lost.
+  co_await v.AwaitFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -139,10 +142,11 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
                                     const float *cent, float *sums,
                                     unsigned *counts, u32 block) {
   const u64 base = static_cast<u64>(block) * per;
-  u64 run = 0;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.HoldPage(base + off, n, &run, /*write=*/true);
+    // Read-only pass: no write intent, so every page stays clean and the
+    // oversubscribed streaming read sheds pages without writeback.
+    auto h = co_await v.HoldPage(base + off, n);
     // Whole pages hold whole points (enforced on the host), so a page is
     // exactly n/dims points and no point straddles a page boundary.
     const u64 npts = n / dims;
@@ -153,13 +157,13 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
       for (u32 c = 0; c < k; ++c) {
         float d = 0.0f;
         for (u32 i = 0; i < dims; ++i) {
-          const float x = v[pbase + i] - cent[c * dims + i];
+          const float x = h[pbase + i] - cent[c * dims + i];
           d += x * x;
         }
         if (d < best) { best = d; bestk = c; }
       }
       for (u32 i = 0; i < dims; ++i) {
-        atomicAdd(&sums[bestk * dims + i], v[pbase + i]);
+        atomicAdd(&sums[bestk * dims + i], h[pbase + i]);
       }
       atomicAdd(&counts[bestk], 1u);
     }

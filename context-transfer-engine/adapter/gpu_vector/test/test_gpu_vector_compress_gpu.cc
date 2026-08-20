@@ -89,15 +89,15 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
                                          clio::run::u64 per,
                                          clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
-  clio::run::u64 run = 0;
-  for (clio::run::u64 i = 0; i < per; i += run) {
-    co_await v.HoldPage(base + i, per - i, &run, /*write=*/true);
+  for (clio::run::u64 i = 0; i < per;) {
+    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
     if (threadIdx.x == 0) {
-      for (clio::run::u64 k = 0; k < run; ++k) {
-        v[base + i + k] = Weight(base + i + k);
+      for (clio::run::u64 k = 0; k < h.run(); ++k) {
+        h[base + i + k] = Weight(base + i + k);
       }
     }
     __syncthreads();
+    i += h.run();
   }
   v.FlushAsync(base, per);
   co_await v.AwaitFlush();
@@ -128,16 +128,16 @@ __device__ gy::YCoroMain WeightsDotCoro(gv::DeviceVector<clio::run::u32> v,
                                         clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
-  clio::run::u64 run = 0;
-  for (clio::run::u64 i = 0; i < per; i += run) {
-    co_await v.HoldPage(base + i, per - i, &run);
+  for (clio::run::u64 i = 0; i < per;) {
+    auto h = co_await v.HoldPage(base + i, per - i);
     if (threadIdx.x == 0) {
-      for (clio::run::u64 k = 0; k < run; ++k) {
-        acc += static_cast<unsigned long long>(v[base + i + k]) *
+      for (clio::run::u64 k = 0; k < h.run(); ++k) {
+        acc += static_cast<unsigned long long>(h[base + i + k]) *
                Activation(base + i + k);
       }
     }
     __syncthreads();
+    i += h.run();
   }
   if (threadIdx.x == 0) atomicAdd(sum, acc);
 }
@@ -173,7 +173,6 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
   const clio::run::u64 first_page = base / v.h_->elems_per_page_;
   const clio::run::u64 npages = per / v.h_->elems_per_page_;
   unsigned long long acc = 0;
-  clio::run::u64 run = 0;
   for (clio::run::u64 p0 = 0; p0 < npages; p0 += chunk) {
     clio::run::u64 n = npages - p0;
     if (n > chunk) n = chunk;
@@ -183,15 +182,16 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
         [fp](clio::run::u32 i) { return gv::PageScore{fp + i, 1.0f}; });
     for (clio::run::u64 j = 0; j < n; ++j) {
       const clio::run::u64 off = base + (p0 + j) * v.h_->elems_per_page_;
-      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_; i += run) {
-        co_await v.HoldPage(off + i, v.h_->elems_per_page_ - i, &run);
+      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {
+        auto h = co_await v.HoldPage(off + i, v.h_->elems_per_page_ - i);
         if (threadIdx.x == 0) {
-          for (clio::run::u64 k = 0; k < run; ++k) {
-            acc += static_cast<unsigned long long>(v[off + i + k]) *
+          for (clio::run::u64 k = 0; k < h.run(); ++k) {
+            acc += static_cast<unsigned long long>(h[off + i + k]) *
                    Activation(off + i + k);
           }
         }
         __syncthreads();
+        i += h.run();
       }
     }
   }

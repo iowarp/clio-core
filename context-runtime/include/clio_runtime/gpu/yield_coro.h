@@ -180,6 +180,72 @@ struct YCoroTask {
   }
 };
 
+/**
+ * YCoroTask that RETURNS A VALUE to its awaiter: `V v = co_await Child(...)`.
+ *
+ * Identical trampoline to YCoroTask; the only additions are the value slot in
+ * the promise and the move-out in await_resume, which runs in the parent
+ * right before the child's frame is freed.
+ */
+template <typename V>
+struct YCoroTaskT {
+  struct promise_type {
+    void *parent_ = nullptr;
+    V value_{};
+    __device__ void *operator new(size_t n) { return YCoroAlloc(n); }
+    __device__ void operator delete(void *p) { YCoroFree(p); }
+    __device__ void operator delete(void *p, size_t) { YCoroFree(p); }
+    __device__ YCoroTaskT get_return_object() {
+      return YCoroTaskT{
+          __builtin_coro_promise(reinterpret_cast<char *>(this),
+                                 alignof(promise_type), /*from-promise=*/true)};
+    }
+    __device__ std::suspend_always initial_suspend() noexcept { return {}; }
+    struct FinalXfer {
+      __device__ bool await_ready() const noexcept { return false; }
+      __device__ void await_suspend(
+          std::coroutine_handle<promise_type> h) noexcept {
+        auto *p = reinterpret_cast<promise_type *>(__builtin_coro_promise(
+            h.address(), alignof(promise_type), /*from-promise=*/false));
+        YieldLane()->coro_resume_ =
+            reinterpret_cast<clio::run::u64>(p->parent_);
+      }
+      __device__ void await_resume() const noexcept {}
+    };
+    __device__ FinalXfer final_suspend() noexcept { return {}; }
+    // BY RVALUE REFERENCE, not by value: clang's device lowering
+    // materializes `co_return <prvalue>` in the coroutine frame and then
+    // BITWISE-copies it into a by-value parameter -- no move constructor
+    // runs, so an RAII operand ends up with two live owners and its
+    // destructor fires twice (observed as page pins underflowing by one
+    // blockDim per hold). Binding the reference to the materialized
+    // temporary lets the move-assign steal from -- and null -- the one and
+    // only object.
+    __device__ void return_value(V &&v) noexcept {
+      value_ = static_cast<V &&>(v);
+    }
+    __device__ void unhandled_exception() {}
+  };
+
+  void *frame_;
+
+  __device__ bool await_ready() const noexcept { return false; }
+  template <typename P>
+  __device__ void await_suspend(std::coroutine_handle<P> parent) noexcept {
+    auto *p = reinterpret_cast<promise_type *>(__builtin_coro_promise(
+        frame_, alignof(promise_type), /*from-promise=*/false));
+    p->parent_ = parent.address();
+    YieldLane()->coro_resume_ = reinterpret_cast<clio::run::u64>(frame_);
+  }
+  __device__ V await_resume() noexcept {
+    auto *p = reinterpret_cast<promise_type *>(__builtin_coro_promise(
+        frame_, alignof(promise_type), /*from-promise=*/false));
+    V v = static_cast<V &&>(p->value_);
+    __builtin_coro_destroy(frame_);
+    return v;
+  }
+};
+
 /** The lane's TOP-LEVEL coroutine. Created by the wrapper, resumed by the
  *  wrapper, parks at final_suspend so done() answers "lane finished?". */
 struct YCoroMain {

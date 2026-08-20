@@ -91,38 +91,55 @@ __global__ void GrayScottRaw(const float *ui, const float *vi, float *uo,
 /**
  * The same step, through the vector, using the INDEXING FAST PATH.
  *
- * HoldPage resolves each field's page once, up front; the loop then uses
- * operator[]/at(), which index the held page with no resolution at all. This
- * is only valid while every access stays inside the held page -- here that
- * means one page per field, which the caller guarantees before launching.
+ * HoldPage resolves each field's page once, up front (everything is resident
+ * by construction, so each co_await completes on the fast path with no
+ * suspension); the loop then indexes through the guards, which touch the held
+ * page with no resolution at all. This is only valid while every access stays
+ * inside the held page -- here that means one page per field, which the
+ * caller guarantees before launching.
  */
-__global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
-                              gv::DeviceVector<float> ui,
-                              gv::DeviceVector<float> vi,
-                              gv::DeviceVector<float> uo,
-                              gv::DeviceVector<float> vo, u32 dim) {
-  CLIO_GPU_INIT(info, nullptr);
+__device__ gy::YCoroMain GrayScottHoldCoro(gv::DeviceVector<float> ui,
+                                           gv::DeviceVector<float> vi,
+                                           gv::DeviceVector<float> uo,
+                                           gv::DeviceVector<float> vo, u32 dim,
+                                           u32 block) {
   const u64 cells = static_cast<u64>(dim) * dim;
   // One resolution per field for the whole kernel, instead of one per access.
-  ui.HoldPage(0, cells);
-  vi.HoldPage(0, cells);
-  uo.HoldPage(0, cells, /*write=*/true);
-  vo.HoldPage(0, cells, /*write=*/true);
-  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
-       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+  auto hui = co_await ui.HoldPage(0, cells);
+  auto hvi = co_await vi.HoldPage(0, cells);
+  auto huo = co_await uo.HoldPage(0, cells, /*write=*/true);
+  auto hvo = co_await vo.HoldPage(0, cells, /*write=*/true);
+  for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
+       idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
     const int x = static_cast<int>(idx % dim);
     const int y = static_cast<int>(idx / dim);
     const u64 l = y * dim + Wrap(x - 1, dim);
     const u64 r = y * dim + Wrap(x + 1, dim);
     const u64 d = Wrap(y - 1, dim) * dim + x;
     const u64 t = Wrap(y + 1, dim) * dim + x;
-    const float u = ui[idx], v = vi[idx];
-    const float lu = ui[l] + ui[r] + ui[d] + ui[t] - 4.0f * u;
-    const float lv = vi[l] + vi[r] + vi[d] + vi[t] - 4.0f * v;
+    const float u = hui[idx], v = hvi[idx];
+    const float lu = hui[l] + hui[r] + hui[d] + hui[t] - 4.0f * u;
+    const float lv = hvi[l] + hvi[r] + hvi[d] + hvi[t] - 4.0f * v;
     const float uvv = u * v * v;
-    uo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
-    vo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
+    huo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
+    hvo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
   }
+}
+
+__global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<float> ui,
+                              gv::DeviceVector<float> vi,
+                              gv::DeviceVector<float> uo,
+                              gv::DeviceVector<float> vo, u32 dim,
+                              gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  ui.block_override_ = yv.Block();
+  vi.block_override_ = yv.Block();
+  uo.block_override_ = yv.Block();
+  vo.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GrayScottHoldCoro(ui, vi, uo, vo, dim, yv.Block()));
 }
 
 __global__ void InitRaw(float *u, float *v, u32 dim) {
@@ -146,21 +163,21 @@ __device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
                                      gv::DeviceVector<float> uo,
                                      gv::DeviceVector<float> vo, u32 dim) {
   const u64 cells = static_cast<u64>(dim) * dim;
-  u64 run = 0;
-  for (u64 i = 0; i < cells; i += run) {
-    co_await u.HoldPage(i, cells - i, &run, /*write=*/true);
-    co_await v.HoldPage(i, cells - i, &run, /*write=*/true);
-    co_await uo.HoldPage(i, cells - i, &run, /*write=*/true);
-    co_await vo.HoldPage(i, cells - i, &run, /*write=*/true);
-    for (u64 k = i + threadIdx.x; k < i + run; k += blockDim.x) {
+  for (u64 i = 0; i < cells;) {
+    auto hu = co_await u.HoldPage(i, cells - i, /*write=*/true);
+    auto hv = co_await v.HoldPage(i, cells - i, /*write=*/true);
+    auto huo = co_await uo.HoldPage(i, cells - i, /*write=*/true);
+    auto hvo = co_await vo.HoldPage(i, cells - i, /*write=*/true);
+    for (u64 k = i + threadIdx.x; k < i + hu.run(); k += blockDim.x) {
       float a, b;
       InitCell(k, dim, &a, &b);
-      u[k] = a;
-      v[k] = b;
-      uo[k] = a;
-      vo[k] = b;
+      hu[k] = a;
+      hv[k] = b;
+      huo[k] = a;
+      hvo[k] = b;
     }
     __syncthreads();
+    i += hu.run();
   }
 }
 
@@ -179,16 +196,30 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(InitVecCoro(u, v, uo, vo, dim));
 }
 
-/** Copy a vector's contents out to a raw buffer, for comparison. */
-__global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
-                         gv::DeviceVector<float> src, float *dst, u32 dim) {
-  CLIO_GPU_INIT(info, nullptr);
+/** Copy a vector's contents out to a raw buffer, for comparison.
+ *
+ * Holds ONE ELEMENT AT A TIME on purpose: this measures the resolve-per-access
+ * cost, and the coroutine hold's fast path (resident page, no suspension) IS
+ * the resolution being measured. Everything is resident here, so the co_await
+ * never actually suspends. */
+__device__ gy::YCoroMain VecToRawCoro(gv::DeviceVector<float> src, float *dst,
+                                      u32 dim, u32 block) {
   const u64 cells = static_cast<u64>(dim) * dim;
-  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
-       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    src.HoldPage(idx, 1);
-    dst[idx] = src[idx];
+  for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
+       idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    auto h = co_await src.HoldPage(idx, 1);
+    dst[idx] = h[idx];
   }
+}
+
+__global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
+                         gv::DeviceVector<float> src, float *dst, u32 dim,
+                         gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  src.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(VecToRawCoro(src, dst, dim, yv.Block()));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -205,15 +236,42 @@ constexpr unsigned kYieldLaneBytes = 8192;
 
 /** Drive a coroutine kernel to completion: launch, service, relaunch. */
 template <typename LaunchT>
-clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
-  gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
+clio::run::u32 RunYieldable(unsigned nblocks, unsigned nthreads,
+                            LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, nthreads);
+  gy::YieldStack stack(nblocks, nthreads, kYieldLaneBytes);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
       [] {}, /*max_rounds=*/200000);
 }
+
+/** Reusable yield driver for the TIMED loops: constructing the driver and
+ *  its stack allocates, and doing that once per stencil step would put the
+ *  allocation inside the timed region. Both Reset() calls are required --
+ *  RunToCompletion does not reset, so a reused runner whose driver still
+ *  reads "done" skips the launch entirely and reports an instant, empty
+ *  success. */
+class YieldRunner {
+ public:
+  YieldRunner(unsigned nblocks, unsigned nthreads)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+  template <typename LaunchT>
+  clio::run::u32 Run(LaunchT &&launch) {
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          launch(g, b, view, stack_.View());
+        },
+        [] {}, /*max_rounds=*/200000);
+  }
+
+ private:
+  gy::Yieldable<> drv_;
+  gy::YieldStack stack_;
+};
 
 }  // namespace
 
@@ -358,10 +416,14 @@ int main(int argc, char **argv) {
     vu.EnableStats();
     auto du = vu.GetDevice(0), dv = vv.GetDevice(0);
     auto du2 = vu2.GetDevice(0), dv2 = vv2.GetDevice(0);
+    // Constructed once, OUTSIDE the timed region: the driver and its yield
+    // stack allocate. The stencil is single-block (per-block caches) but
+    // keeps its original thread count.
+    YieldRunner srunner(1, threads);
 
     for (u32 r = 0; r < repeat; ++r) {
-      RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                          gy::YieldStackView sv) {
+      RunYieldable(1, 32, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
         InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
                                                  vw, sv);
       });
@@ -370,7 +432,11 @@ int main(int argc, char **argv) {
       const double t0 = NowMs();
       auto a = du, b = dv, c = du2, d = dv2;
       for (u32 s = 0; s < steps; ++s) {
-        GrayScottHold<<<1, threads>>>(gpu, a, b, c, d, dim);
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          GrayScottHold<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, b, c, d, dim,
+                                                          vw, sv);
+        });
         auto ta = a; a = c; c = ta;
         auto tb = b; b = d; d = tb;
       }
@@ -381,8 +447,14 @@ int main(int argc, char **argv) {
         // Compare the vector's final state against the raw run's.
         float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
         float *cv = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
-        VecToRaw<<<1, threads>>>(gpu, a, cu, dim);
-        VecToRaw<<<1, threads>>>(gpu, b, cv, dim);
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, cu, dim, vw, sv);
+        });
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, b, cv, dim, vw, sv);
+        });
         ctp::GpuApi::Synchronize();
         std::vector<float> hu(cells), hv(cells), hru(cells), hrv(cells);
         ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));
@@ -412,8 +484,8 @@ int main(int argc, char **argv) {
     // ---- fast path, when each field is a single page ----
     if (pages == 1) {
       for (u32 r = 0; r < repeat; ++r) {
-        RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                            gy::YieldStackView sv) {
+        RunYieldable(1, 32, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
           InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
                                                    vw, sv);
         });
@@ -421,7 +493,11 @@ int main(int argc, char **argv) {
         const double t0 = NowMs();
         auto a = du, b = dv, c = du2, d = dv2;
         for (u32 s2 = 0; s2 < steps; ++s2) {
-          GrayScottHold<<<1, threads>>>(gpu, a, b, c, d, dim);
+          srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+            GrayScottHold<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, b, c, d,
+                                                            dim, vw, sv);
+          });
           auto ta = a; a = c; c = ta;
           auto tb = b; b = d; d = tb;
         }
@@ -430,7 +506,11 @@ int main(int argc, char **argv) {
         if (ms < hold_ms) hold_ms = ms;
         if (r + 1 == repeat) {
           float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
-          VecToRaw<<<1, threads>>>(gpu, a, cu, dim);
+          srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+            VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, cu, dim, vw,
+                                                       sv);
+          });
           ctp::GpuApi::Synchronize();
           std::vector<float> hu(cells), hru(cells);
           ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));

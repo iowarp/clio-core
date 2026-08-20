@@ -200,33 +200,36 @@ namespace gy = clio::run::gpu;
 /**
  * Gather element range [lo,hi) of the paged vector into `scratch`.
  *
- * YIELDABLE: every page here is a fault the runtime must service, and the
- * blocking HoldPage deadlocks against itself on exactly that. Replaces the old
- * DeviceView + dev::vector::read_range pair, which the rewrite deleted.
+ * A DEVICE COROUTINE: every page here is a fault the runtime must service, and
+ * a kernel that spins in-kernel on a fault deadlocks against itself on exactly
+ * that -- co_await suspends instead. Replaces the old DeviceView +
+ * dev::vector::read_range pair, which the rewrite deleted.
  */
+__device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
+                                       clio::run::u64 lo, clio::run::u64 hi,
+                                       float *scratch) {
+  const clio::run::u64 n = hi - lo;
+  for (clio::run::u64 i = 0; i < n;) {
+    auto h = co_await v.HoldPage(lo + i, n - i);
+    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      // Read-only sweep: the hold stays write=false, so every page is dropped
+      // clean and nothing is written back. THE HOLD IS THE PIN, so eviction
+      // cannot re-tenant the slot under a lane that is still reading.
+      scratch[i + k] = h[lo + i + k];
+    }
+    i += h.run();
+  }
+}
+
 __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> v, clio::run::u64 lo,
                                 clio::run::u64 hi, float *scratch,
                                 gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.block_override_ = yv.Block();
-  CLIO_YKERNEL_ENTER(yv, ys);
-  CLIO_YFRAME();
-  CLIO_YLOCAL_INIT(clio::run::u64, i, 0);
-  CLIO_YLOCAL_INIT(clio::run::u64, run, 0);
-  const clio::run::u64 n = hi - lo;
-
-  CLIO_YBEGIN();
-  for (; i < n; i += run) {
-    CLIO_YCALL(v.HoldPageYield(lo + i, n - i, &run));
-    for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-      // Read-only sweep: the hold stays write=false, so every page is dropped
-      // clean and nothing is written back. A held page is pinned, so eviction
-      // cannot re-tenant the slot under a lane that is still reading.
-      scratch[i + k] = v[lo + i + k];
-    }
-  }
-  CLIO_YEND();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GnnGatherCoro(v, lo, hi, scratch));
 }
 
 __global__ void GnnReadoutKernel(const float *scratch, clio::run::u64 node_lo,
@@ -259,11 +262,16 @@ __global__ void GnnReadoutResidentKernel(const float *d_feat, clio::run::u64 N,
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
+/** Per-lane yield frame. Coroutine frames are compiler-laid-out and hold the
+ *  whole live state plus resume/destroy pointers, so they need far more than
+ *  the few u64s a hand-packed macro frame did. */
+constexpr unsigned kYieldLaneBytes = 8192;
+
 /** Run a yieldable kernel to completion (re-launch until no block is pending). */
 template <typename LaunchT>
 clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
-  gy::YieldStack stack(nblocks, 32, 256);
+  gy::YieldStack stack(nblocks, 32, kYieldLaneBytes);
   return drv.RunToCompletion(
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
