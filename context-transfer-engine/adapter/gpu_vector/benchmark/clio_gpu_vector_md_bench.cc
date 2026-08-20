@@ -88,8 +88,14 @@ struct Args {
   u64 steps = 100;
   double dt = 0.005;
   int gate = 1;            // stage 1: the ballistic gate IS the run
+  int md = 0;              // stage 2: real LJ forces + NVE, statics gates
   double g[3] = {0.1, -0.05, 0.02};   // constant acceleration for the gate
 };
+
+/** LAMMPS melt step-0 pair energy per atom (rho=0.8442 FCC, lj/cut 2.5,
+ *  no shift): the published stock value this reimplementation must reproduce
+ *  from geometry alone. */
+static constexpr double kMeltPePerAtom = -6.7733681;
 
 double NowMs() {
   using clock = std::chrono::high_resolution_clock;
@@ -167,6 +173,64 @@ bool BuildInitialState(const Args &a, const Geometry &g,
   return atom_id == g.natoms;
 }
 
+/**
+ * Host double-precision reference for the step-0 statics (stage-2 gate,
+ * validation layer 2): the same cell-direct pass in double. Returns PE,
+ * the scalar virial sum W = sum r.f over pairs (counted once), and the
+ * pair count within the cutoff.
+ */
+void HostForceReference(const Geometry &g, const std::vector<float> &hx,
+                        double cutoff, double *pe_out, double *w_out,
+                        unsigned long long *pairs_out) {
+  const double L = g.box;
+  const double c2 = cutoff * cutoff;
+  double pe = 0.0, w = 0.0;
+  unsigned long long pairs = 0;
+  const int nb = static_cast<int>(g.nb);
+  for (u64 bin = 0; bin < g.nbins; ++bin) {
+    const int bx = static_cast<int>(bin % nb);
+    const int by = static_cast<int>((bin / nb) % nb);
+    const int bz = static_cast<int>(bin / (static_cast<u64>(nb) * nb));
+    for (u32 si = 0; si < g.cap; ++si) {
+      const u64 ei = (bin * g.cap + si) * kStride;
+      if (hx[ei + 3] < 0.0f) continue;
+      const double xi = hx[ei], yi = hx[ei + 1], zi = hx[ei + 2];
+      for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dxx = -1; dxx <= 1; ++dxx) {
+            const int jbx = (bx + dxx + nb) % nb;
+            const int jby = (by + dy + nb) % nb;
+            const int jbz = (bz + dz + nb) % nb;
+            const u64 jbin =
+                (static_cast<u64>(jbz) * nb + jby) * nb + jbx;
+            for (u32 sj = 0; sj < g.cap; ++sj) {
+              const u64 ej = (jbin * g.cap + sj) * kStride;
+              if (hx[ej + 3] < 0.0f) continue;
+              if (ej == ei) continue;
+              double ddx = xi - hx[ej];
+              double ddy = yi - hx[ej + 1];
+              double ddz = zi - hx[ej + 2];
+              if (ddx > 0.5 * L) ddx -= L; else if (ddx < -0.5 * L) ddx += L;
+              if (ddy > 0.5 * L) ddy -= L; else if (ddy < -0.5 * L) ddy += L;
+              if (ddz > 0.5 * L) ddz -= L; else if (ddz < -0.5 * L) ddz += L;
+              const double r2 = ddx * ddx + ddy * ddy + ddz * ddz;
+              if (r2 >= c2) continue;
+              const double r2i = 1.0 / r2;
+              const double r6i = r2i * r2i * r2i;
+              pe += 0.5 * (4.0 * r6i * (r6i - 1.0));     // pair counted twice
+              w += 0.5 * (r6i * (48.0 * r6i - 24.0));    // r.f, same halving
+              ++pairs;
+            }
+          }
+        }
+      }
+    }
+  }
+  *pe_out = pe;
+  *w_out = w;
+  *pairs_out = pairs / 2;   // full-list double count -> unique pairs
+}
+
 }  // namespace
 
 #if defined(GV_MD_CORO)
@@ -182,6 +246,176 @@ bool BuildInitialState(const Args &a, const Geometry &g,
  * Stage 2 note: `accel` becomes a read-hold on the f vector; the hold
  * structure of this kernel does not change.
  */
+/**
+ * K3: the cell-direct LJ force pass (stage 2). Work unit = one full X-ROW
+ * of bins (bz, by, *): the row is index-contiguous, and because the x
+ * dimension wraps WITHIN the row, its stencil is exactly NINE full rows
+ * (dz, dy in {-1,0,1}, z/y wrapped) -- each one contiguous elem range,
+ * held in at most two guards (a row can straddle one page boundary).
+ * One thread per i-atom, register accumulation, ONE store per component:
+ * no atomics anywhere (full-list/newton-off: every atom's force is
+ * computed entirely here, each pair evaluated from both sides; PE and the
+ * virial take the standard 0.5x).
+ *
+ * acc[0] += PE, acc[1] += virial W = sum r.f, acc[2] += pairs-within-cutoff
+ * (double count), accumulated only when eflag != 0.
+ */
+__device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
+                                   gv::DeviceVector<float> f,
+                                   u32 nb, u32 cap, float box, float cutoff,
+                                   int eflag, double *acc, u32 nblocks,
+                                   u32 block) {
+  extern __shared__ char smem_raw[];
+  double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  const u64 nrows = static_cast<u64>(nb) * nb;
+  const float c2 = cutoff * cutoff;
+  const float halfL = 0.5f * box;
+  double pe = 0.0, w = 0.0, npairs = 0.0;
+
+  for (u64 row = block; row < nrows; row += nblocks) {
+    const u32 by = static_cast<u32>(row % nb);
+    const u32 bz = static_cast<u32>(row / nb);
+
+    // Hold the NINE stencil rows (this row is rows[4]); <= 2 guards each.
+    gv::Held<float> hg[9][2];
+    u64 rbase[9], rrun0[9];
+    const float *rp0[9], *rp1[9];
+    for (int q = 0; q < 9; ++q) {
+      const int dz = q / 3 - 1, dy = q % 3 - 1;
+      const u32 wz = (bz + nb + dz) % nb;
+      const u32 wy = (by + nb + dy) % nb;
+      const u64 rowbin0 = (static_cast<u64>(wz) * nb + wy) * nb;
+      rbase[q] = rowbin0 * cap * kStride;
+      hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
+      rrun0[q] = hg[q][0].run();
+      if (rrun0[q] < row_elems) {
+        hg[q][1] = co_await x.HoldPage(rbase[q] + rrun0[q],
+                                       row_elems - rrun0[q]);
+      }
+      rp0[q] = hg[q][0].ptr();
+      rp1[q] = hg[q][1] ? hg[q][1].ptr() : nullptr;
+    }
+    // Write-hold this row of f and zero it.
+    const u64 fbase = (static_cast<u64>(bz) * nb + by) * static_cast<u64>(nb) *
+                      cap * kStride;
+    gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
+    gv::Held<float> hf1;
+    const u64 frun0 = hf0.run();
+    if (frun0 < row_elems) {
+      hf1 = co_await f.HoldPage(fbase + frun0, row_elems - frun0, true);
+    }
+    float *const fp0 = hf0.ptr();
+    float *const fp1 = hf1 ? hf1.ptr() : nullptr;
+    for (u64 e = threadIdx.x; e < row_elems; e += blockDim.x) {
+      (e < frun0 ? fp0[e] : fp1[e - frun0]) = 0.0f;
+    }
+    __syncthreads();
+
+    // One thread per i-slot of the row.
+    const u64 islots = static_cast<u64>(nb) * cap;
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const u64 ei = s * kStride;
+      const float *const ip =
+          (ei < rrun0[4]) ? rp0[4] + ei : rp1[4] + (ei - rrun0[4]);
+      if (ip[3] < 0.0f) continue;   // padded slot
+      const float xi = ip[0], yi = ip[1], zi = ip[2];
+      const u32 bx = static_cast<u32>(s / cap);
+      float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+      for (int q = 0; q < 9; ++q) {
+        for (int dxx = -1; dxx <= 1; ++dxx) {
+          const u32 jbx = (bx + nb + dxx) % nb;
+          const u64 jb = static_cast<u64>(jbx) * cap * kStride;
+          for (u32 sj = 0; sj < cap; ++sj) {
+            const u64 ej = jb + static_cast<u64>(sj) * kStride;
+            const float *const jp =
+                (ej < rrun0[q]) ? rp0[q] + ej : rp1[q] + (ej - rrun0[q]);
+            const float tj = jp[3];
+            if (tj < 0.0f) continue;
+            if (q == 4 && jbx == bx && sj == s % cap) continue;   // self
+            float ddx = xi - jp[0];
+            float ddy = yi - jp[1];
+            float ddz = zi - jp[2];
+            // Minimum image: bins wrap, so a raw delta can be ~box.
+            if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+            if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+            if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+            const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (rsq >= c2) continue;
+            const float r2i = 1.0f / rsq;
+            const float r6i = r2i * r2i * r2i;
+            const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
+            fx = __fmaf_rn(ddx, fpair, fx);
+            fy = __fmaf_rn(ddy, fpair, fy);
+            fz = __fmaf_rn(ddz, fpair, fz);
+            if (eflag) {
+              pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
+              w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
+              npairs += 1.0;
+            }
+          }
+        }
+      }
+      float *const op = (ei < frun0) ? fp0 + ei : fp1 + (ei - frun0);
+      op[0] = fx;
+      op[1] = fy;
+      op[2] = fz;
+    }
+    __syncthreads();
+  }  // guards die per row
+
+  if (eflag) {
+    const double vals[3] = {pe, w, npairs};
+    for (int q = 0; q < 3; ++q) {
+      red[threadIdx.x] = vals[q];
+      __syncthreads();
+      for (u32 wd = blockDim.x / 2; wd > 0; wd >>= 1) {
+        if (threadIdx.x < wd) red[threadIdx.x] += red[threadIdx.x + wd];
+        __syncthreads();
+      }
+      if (threadIdx.x == 0) atomicAdd(&acc[q], red[0]);
+      __syncthreads();
+    }
+  }
+}
+
+/** K1/K4 for real MD: the kick reads the FORCE VECTOR (mass = 1). Same
+ *  page-parallel shape as the ballistic form. */
+__device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
+                                         gv::DeviceVector<float> v,
+                                         gv::DeviceVector<float> f,
+                                         float dt, int drift, u32 nblocks,
+                                         u32 block) {
+  const u64 epp = x.h_->elems_per_page_;
+  const u64 npages = (x.h_->size_ + epp - 1) / epp;
+  const float half = 0.5f * dt;
+  for (u64 pg = block; pg < npages; pg += nblocks) {
+    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+    auto hf = co_await f.HoldPage(pg * epp, epp);
+    float *const px = hx.ptr();
+    float *const pv = hv.ptr();
+    const float *const pf = hf.ptr();
+    const u64 nslots = epp / kStride;
+    for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
+      const u64 e = s * kStride;
+      if (px[e + 3] < 0.0f) continue;
+      const float vx0 = __fmaf_rn(half, pf[e + 0], pv[e + 0]);
+      const float vy0 = __fmaf_rn(half, pf[e + 1], pv[e + 1]);
+      const float vz0 = __fmaf_rn(half, pf[e + 2], pv[e + 2]);
+      pv[e + 0] = vx0;
+      pv[e + 1] = vy0;
+      pv[e + 2] = vz0;
+      if (drift) {
+        px[e + 0] = __fmaf_rn(dt, vx0, px[e + 0]);
+        px[e + 1] = __fmaf_rn(dt, vy0, px[e + 1]);
+        px[e + 2] = __fmaf_rn(dt, vz0, px[e + 2]);
+      }
+    }
+    __syncthreads();
+  }
+}
+
 /** Flush every dirty page of the SHARED x/v tables to the backing store, so
  *  host Download (which reads the store, not the frames) sees the truth.
  *  One block does it; the others exit immediately. Validation-path only --
@@ -308,6 +542,37 @@ __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(ThermoCoro(x, v, out, nblocks, yv.Block()));
 }
 
+__global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
+                            gv::DeviceVector<float> x,
+                            gv::DeviceVector<float> f, u32 nb, u32 cap,
+                            float box, float cutoff, int eflag, double *acc,
+                            u32 nblocks, gy::YieldableView<> yv,
+                            gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  f.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(ForceCoro(x, f, nb, cap, box, cutoff, eflag, acc, nblocks,
+                           yv.Block()));
+}
+
+__global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
+                                  gv::DeviceVector<float> x,
+                                  gv::DeviceVector<float> v,
+                                  gv::DeviceVector<float> f, float dt,
+                                  int drift, u32 nblocks,
+                                  gy::YieldableView<> yv,
+                                  gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  v.block_override_ = 0;
+  f.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(MDIntegrateCoro(x, v, f, dt, drift, nblocks, yv.Block()));
+}
+
 __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> x,
                                gv::DeviceVector<float> v,
@@ -382,6 +647,7 @@ int main(int argc, char **argv) {
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
+    else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
       return 1;
@@ -509,6 +775,117 @@ int main(int argc, char **argv) {
   YieldRunner runner(a.blocks, a.threads);
   const u32 smem_thermo =
       CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
+
+  // ---- STAGE 2: real MD (cell-direct LJ + NVE) ---------------------------
+  if (a.md) {
+    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, slots,
+                         g.nelems);
+    vf.EnableStats();
+    {
+      std::vector<float> hz(g.nelems, 0.0f);
+      vf.Preload(hz.data(), g.nelems);
+    }
+    vf.ClearCache();
+    vf.Prefetch(0, npages, 0, 1);
+    auto df = vf.GetDevice(0);
+    double *d_acc = ctp::GpuApi::Malloc<double>(3 * sizeof(double));
+    const u32 smem_force =
+        CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
+    const float fbox = static_cast<float>(g.box);
+    const float fcut = static_cast<float>(a.cutoff);
+    const float fdt = static_cast<float>(a.dt);
+
+    double acc[3] = {0, 0, 0};
+    auto force = [&](int eflag) {
+      if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
+                                           fcut, eflag, d_acc, a.blocks, vw,
+                                           sv);
+      });
+      ctp::GpuApi::Synchronize();
+      if (eflag) ctp::GpuApi::Memcpy(acc, d_acc, 3 * sizeof(double));
+    };
+    auto kick = [&](int drift) {
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, dv, df, fdt, drift, a.blocks, vw, sv);
+      });
+    };
+    auto thermo_ke = [&]() -> double {
+      ctp::GpuApi::Memset(d_thermo, 0, 4 * sizeof(double));
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        ThermoKernel<<<gr, b, smem_thermo>>>(gpu, dx, dv, d_thermo, a.blocks,
+                                             vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      double t4[4];
+      ctp::GpuApi::Memcpy(t4, d_thermo, sizeof(t4));
+      return t4[0];
+    };
+
+    // ---- validation layer 2: step-0 statics from geometry alone ----------
+    force(/*eflag=*/1);
+    double pe_ref = 0.0, w_ref = 0.0;
+    unsigned long long pairs_ref = 0;
+    HostForceReference(g, hx, a.cutoff, &pe_ref, &w_ref, &pairs_ref);
+    const double pe0 = acc[0];
+    const unsigned long long pairs0 =
+        static_cast<unsigned long long>(acc[2] + 0.5) / 2;
+    const double pe_atom = pe0 / static_cast<double>(g.natoms);
+    const double ref_rel =
+        std::fabs(pe0 - pe_ref) / std::fabs(pe_ref);
+    const double melt_abs = std::fabs(pe_atom - kMeltPePerAtom);
+    std::printf(
+        "  statics: PE/atom dev=%.7f hostref=%.7f LAMMPS=%.7f | pairs "
+        "dev=%llu ref=%llu | W dev=%.6g ref=%.6g\n",
+        pe_atom, pe_ref / g.natoms, kMeltPePerAtom, pairs0, pairs_ref,
+        acc[1], w_ref);
+    const bool statics_ok =
+        (pairs0 == pairs_ref) && (ref_rel < 2e-5) && (melt_abs < 2e-4);
+    std::printf("  STATICS GATE: %s (ref_rel=%.2e, melt_abs=%.2e)\n",
+                statics_ok ? "PASS" : "FAIL", ref_rel, melt_abs);
+
+    // ---- NVE: energy and momentum must be conserved ----------------------
+    const double ke0 = thermo_ke();
+    const double e0 = pe0 + ke0;
+    const double t0 = NowMs();
+    for (u64 step = 0; step < a.steps; ++step) {
+      kick(/*drift=*/1);   // uses f(t)
+      force(/*eflag=*/0);  // f(t+dt)
+      kick(/*drift=*/0);
+    }
+    ctp::GpuApi::Synchronize();
+    const double run_ms = NowMs() - t0;
+    force(/*eflag=*/1);
+    const double ke_n = thermo_ke();
+    const double e_n = acc[0] + ke_n;
+    const double e_drift = std::fabs(e_n - e0) / std::fabs(e0);
+    const auto sfx = vx.ReadStats(0);
+    const auto sff = vf.ReadStats(0);
+    const bool res_ok = (sfx.faults == 0 && sfx.evicts == 0 &&
+                         sff.faults == 0 && sff.evicts == 0);
+    std::printf(
+        "  NVE %llu steps: E0=%.6f En=%.6f drift=%.2e | KE %.3f -> %.3f\n"
+        "  paging: x faults=%llu evicts=%llu | f faults=%llu evicts=%llu  "
+        "%s\n",
+        (unsigned long long)a.steps, e0, e_n, e_drift, ke0, ke_n,
+        (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
+        (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
+        res_ok ? "[resident contract HELD]" : "[RESIDENT CONTRACT VIOLATED]");
+    const bool nve_ok = (e_drift < 5e-4) && res_ok;
+    std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
+    std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
+                "Matom-steps/s)\n",
+                (unsigned long long)a.steps, run_ms, run_ms / a.steps,
+                static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
+    ctp::GpuApi::Free(d_acc);
+    ctp::GpuApi::Free(d_thermo);
+    return (statics_ok && nve_ok) ? 0 : 1;
+  }
 
   // ---- the run ------------------------------------------------------------
   const float fdt = static_cast<float>(a.dt);
