@@ -62,6 +62,24 @@ struct VecHeader {
   clio::run::u64 page_mask_ = 0;
   /** Logical element count of the whole vector. */
   clio::run::u64 size_ = 0;
+  /**
+   * 1 when every page of this vector has a dedicated, already-placed slot
+   * in every block table -- the RESIDENT regime. Set by Vector::Prefetch
+   * when it places the whole vector (which the identity way makes
+   * possible: page p always fits slot p % ppb when npages <= slots) and
+   * cleared by ClearCache.
+   *
+   * It is a licence to SKIP WORK, not to change behaviour. Nothing can be
+   * claimed or evicted here, because no page is ever missing and so no
+   * fault path ever runs -- which makes three things in the hold fast path
+   * provably dead: the eviction policy's LRU bookkeeping (every thread
+   * writing last_access/score to the SAME address, the contended write
+   * this exists to kill), and the __threadfence + re-read of the
+   * hold-vs-claim handshake, whose whole purpose is to catch a concurrent
+   * claim. The pin is still taken: it costs one atomic on thread 0 and it
+   * keeps the invariant true even if a fault ever did occur.
+   */
+  clio::run::u32 no_evict_ = 0;
   /** Pool the page tasks are addressed to (the CTE core). */
   clio::run::PoolId pool_id_;
   /** Allocator of the backend holding the task slots. */
@@ -229,8 +247,9 @@ class Held {
   Held(const Held &) = delete;
   Held &operator=(const Held &) = delete;
   CTP_GPU_FUN Held(Page *page, T *data, clio::run::u64 begin,
-                   clio::run::u64 run)
-      : page_(page), data_(data), begin_(begin), run_(run) {}
+                   clio::run::u64 run, bool pinned = true)
+      : page_(page), data_(data), begin_(begin), run_(run),
+        pinned_(pinned) {}
   CTP_GPU_FUN Held(Held &&o) noexcept { Steal(o); }
   CTP_GPU_FUN Held &operator=(Held &&o) noexcept {
     if (this != &o) {
@@ -266,7 +285,7 @@ class Held {
 
  private:
   CTP_GPU_FUN void Unhold() {
-    if (page_ != nullptr) {
+    if (page_ != nullptr && pinned_) {
       // Pins are PER-BLOCK (see AcquireHoldPin): every thread carries a
       // guard, but only thread 0's decrements the counter.
       if (threadIdx.x == 0) {
@@ -280,6 +299,7 @@ class Held {
     data_ = o.data_;
     begin_ = o.begin_;
     run_ = o.run_;
+    pinned_ = o.pinned_;
     o.page_ = nullptr;
   }
 
@@ -287,6 +307,13 @@ class Held {
   T *data_ = nullptr;
   clio::run::u64 begin_ = 0;
   clio::run::u64 run_ = 0;
+  /** False when the hold took no pin because none was needed -- the
+   *  resident regime, where nothing can be claimed or evicted (see
+   *  VecHeader::no_evict_). The guard is still the access; it simply has
+   *  no reference count to give back. Pin atomics from every block onto
+   *  the SAME shared Page serialize through L2 and were measured to be
+   *  the dominant cost of a resident hold. */
+  bool pinned_ = true;
 };
 #endif  // CTP_IS_GPU_COMPILER (Held)
 
@@ -429,6 +456,10 @@ class DeviceVector {
         // verb parks the block and retries once the page lands.
         return 0;
       }
+      // Skipped entirely in the resident regime: nothing evicts, so the
+      // policy that would read these never runs, and these two stores are
+      // made by EVERY thread to one address (see VecHeader::no_evict_).
+      if (h_->no_evict_ == 0u) {
       // Recency must be stamped on a HIT as well, not just in ResolveLocked.
       // Once the lock-free path started serving hits, ResolveLocked stopped
       // running for them, so re-touching a resident page no longer refreshed
@@ -436,13 +467,22 @@ class DeviceVector {
       // Still once per page TRANSITION, never per element.
       p->last_access = Now();
       p->score += 1.0f;
+      }
       last_page_ = p;
       last_pn_ = pn;
     }
     // EVERY successful hold takes one pin, which exactly one Held guard
     // adopts and releases; the fast path pins too, or a re-hold's guard
     // would release a pin nobody took.
-    AcquireHoldPin(p);
+    //
+    // ... EXCEPT in the resident regime, where no claim or eviction can
+    // ever run and the pin therefore protects nothing. It is not free:
+    // every block holding a shared page does an atomicAdd and an
+    // atomicSub on the SAME address, and those serialize through L2. With
+    // the pair loop deleted the force pass of a 256k-atom MD step cost
+    // 245 ms against 252 with it -- i.e. the arithmetic was 3% and this
+    // was most of the rest.
+    if (h_->no_evict_ == 0u) AcquireHoldPin(p);
     // The prober's half of the FreeVictimSlot handshake: publish the pin,
     // THEN re-read the slot. A claim that read pins == 0 before the pin
     // landed has published its takeover by now (its fence is between the
@@ -450,18 +490,25 @@ class DeviceVector {
     // changed hands in the match->pin window is a MISS, never a hold --
     // thread 0's pin is the one that counts (AcquireHoldPin), and its miss
     // fails the caller's all-or-nothing vote for the whole block.
-    __threadfence();
-    if (*(volatile clio::run::u64 *)&p->page_num != pn ||
-        *(volatile clio::run::u32 *)&p->fetching != 0u) {
-      ReleaseHoldPin(p);
-      last_page_ = nullptr;
-      return 0;
+    // ... and skipped in the resident regime, where there is no claim to
+    // race against (see VecHeader::no_evict_): a device-scope fence per
+    // hold is not free.
+    if (h_->no_evict_ == 0u) {
+      __threadfence();
+      if (*(volatile clio::run::u64 *)&p->page_num != pn ||
+          *(volatile clio::run::u32 *)&p->fetching != 0u) {
+        ReleaseHoldPin(p);
+        last_page_ = nullptr;
+        return 0;
+      }
     }
     // Write intent is declared HERE, at the hold, not inferred per element:
     // operator[] is side-effect-free for reads and writes alike, so a page
     // held without write=true is dropped clean at eviction no matter what
     // was stored through it.
-    if (write) p->dirty = 1u;
+    // One writer, not all of them: `dirty` is idempotent, and the vote
+    // barrier below publishes thread 0's store to the whole block.
+    if (write && threadIdx.x == 0) p->dirty = 1u;
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
     return (count < left) ? count : left;
@@ -1776,7 +1823,7 @@ class DeviceVector {
     }
     Page *p = last_page_;
     co_return Held<T>(p, static_cast<T *>(p->data) + IndexIn(off, p), off,
-                      run);
+                      run, /*pinned=*/h_->no_evict_ == 0u);
   }
 
   /**

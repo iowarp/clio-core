@@ -390,6 +390,10 @@ class Vector {
     for (auto &kv : devs_) {
       InitPageTable(kv.second);
       InitBatchTable(kv.second);
+      // The cache is empty again, so the resident claim is void until a
+      // Prefetch re-establishes it.
+      kv.second.hdr.no_evict_ = 0;
+      PublishHeader(kv.second);
     }
 #endif
   }
@@ -418,8 +422,17 @@ class Vector {
 #if CTP_ENABLE_CUDA
     if (pg_hi <= pg_lo) return 0;
     const clio::run::u32 ppb = pages_per_block_;
+
     for (auto &kv : devs_) {
       DevState &st = kv.second;
+      // Whether this call leaves the vector FULLY RESIDENT -- every page
+      // placed in every target block, with a dedicated slot each. Only
+      // then may the device skip the eviction machinery
+      // (VecHeader::no_evict_); anything less and a demand fault is still
+      // reachable, so the handshake must stay armed.
+      const clio::run::u64 total_pages = NumPagesOf(st.hdr);
+      bool all_placed = (pg_lo == 0) && (pg_hi >= total_pages) &&
+                        (total_pages <= ppb);
       const clio::run::u32 b_lo = (blk_lo < nblocks_) ? blk_lo : nblocks_;
       const clio::run::u32 b_hi = (blk_hi < nblocks_) ? blk_hi : nblocks_;
       if (b_lo >= b_hi) continue;
@@ -447,7 +460,10 @@ class Vector {
                   slot = i;   // first free way
                 }
               }
-              if (slot == ~0u) continue;   // every way taken: demand-fault
+              if (slot == ~0u) {
+                all_placed = false;
+                continue;   // every way taken: demand-fault
+              }
               Page &p = bt[slot];
               p.page_num = pg;
               p.score = 1.0f;
@@ -466,6 +482,9 @@ class Vector {
             }
           });
       ctp::GpuApi::Memcpy(dev_tbl, tbl.data(), ntb * sizeof(Page));
+      if (fetched < (pg_hi - pg_lo)) all_placed = false;
+      st.hdr.no_evict_ = all_placed ? 1u : 0u;
+      PublishHeader(st);
     }
 #else
     (void) pg_lo; (void) pg_hi; (void) blk_lo; (void) blk_hi;
@@ -492,6 +511,14 @@ class Vector {
     // (1) the frames the kernel will actually read
     for (auto &kv : devs_) {
       DevState &st = kv.second;
+      // Whether this call leaves the vector FULLY RESIDENT -- every page
+      // placed in every target block, with a dedicated slot each. Only
+      // then may the device skip the eviction machinery
+      // (VecHeader::no_evict_); anything less and a demand fault is still
+      // reachable, so the handshake must stay armed.
+      const clio::run::u64 total_pages = NumPagesOf(st.hdr);
+      bool all_placed = (pg_lo == 0) && (pg_hi >= total_pages) &&
+                        (total_pages <= ppb);
       const clio::run::u32 b_lo = (blk_lo < nblocks_) ? blk_lo : nblocks_;
       const clio::run::u32 b_hi = (blk_hi < nblocks_) ? blk_hi : nblocks_;
       if (b_lo >= b_hi) continue;

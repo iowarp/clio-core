@@ -46,7 +46,14 @@ using clio::run::u32;
 using clio::run::u64;
 
 /** Coroutine frames live in the lane; integrator coroutines are small. */
-static constexpr u32 kYieldLaneBytes = 4096;
+/**
+ * Per-thread coroutine-frame lane. SMALLER IS FASTER, and not for the
+ * memory: lanes are strided by this value, so a warp reading one frame
+ * local touches 32 separate cache lines. At 4096 a 64-thread block's
+ * frames span 256 KB and blow past L1; trimming the frame (see
+ * kMaxNlGuards) lets a block's whole frame working set stay cached.
+ */
+static constexpr u32 kYieldLaneBytes = 2048;   // largest frame measured 1856
 /** Elements per atom in x and v (float4 packing). */
 static constexpr u32 kStride = 4;
 /** MD_PROF=1 phase attribution inside the force coroutine, cycles, thread
@@ -54,8 +61,12 @@ static constexpr u32 kStride = 4;
  *  [3] pair loop [4] whole row loop [5] rows processed. */
 __device__ unsigned long long g_md_cyc[8];
 
-/** Guards a block may hold over one row of the paged list. */
-static constexpr int kMaxNlGuards = 24;
+/** Guards a block may hold over one row of the paged list. Deliberately
+ *  small: this array lives in the per-thread coroutine FRAME, so every
+ *  slot costs frame footprint whether used or not, and the list page is
+ *  sized to hold a whole row (one guard, two across a boundary). The host
+ *  validates the bound in configuration terms before any run. */
+static constexpr int kMaxNlGuards = 4;
 
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_MD_CORO 1
@@ -585,8 +596,14 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
             }
             const u64 o = static_cast<u64>(cnt) * islots + s;
             while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
+            // ENCODE WHAT THE FORCE PASS ACTUALLY NEEDS: the span index
+            // and the element offset INSIDE that span. Both passes hold
+            // the identical spans for a row, so the pair loop then needs
+            // no (q -> span, offset) translation at all -- it was doing
+            // ~8 shared-memory lookups per pair, every one indexed by a
+            // warp-divergent value, i.e. bank-conflicting.
             const_cast<int *>(s_np[gi])[o - s_gs[gi]] = static_cast<int>(
-                (static_cast<u32>(q) << 16) | (jbx * cap + sj));
+                (spq << 27) | static_cast<u32>(ej));
             ++cnt;
           }
         }
@@ -768,10 +785,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         const u64 o = static_cast<u64>(k) * islots + s;
         while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
         const u32 ent = static_cast<u32>(s_np[gi][o - s_gs[gi]]);
-        const u32 q = ent >> 16;
-        const u32 spq = s_qspan[q];
-        const u64 ej = s_qoff[q] +
-                       static_cast<u64>(ent & 0xffffu) * kStride;
+        const u32 spq = ent >> 27;
+        const u64 ej = static_cast<u64>(ent & 0x07ffffffu);
         const u64 rq = s_srun[spq];
         const float *const jp =
             (ej < rq) ? s_sp0[spq] + ej : s_sp1[spq] + (ej - rq);
