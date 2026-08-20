@@ -267,7 +267,11 @@ class Held {
  private:
   CTP_GPU_FUN void Unhold() {
     if (page_ != nullptr) {
-      atomicSub((clio::run::u32 *) &page_->pins, 1u);
+      // Pins are PER-BLOCK (see AcquireHoldPin): every thread carries a
+      // guard, but only thread 0's decrements the counter.
+      if (threadIdx.x == 0) {
+        atomicSub((clio::run::u32 *) &page_->pins, 1u);
+      }
       page_ = nullptr;
     }
   }
@@ -459,6 +463,9 @@ class DeviceVector {
    * not resident or carries no pin.
    */
   CTP_GPU_FUN void UnholdPage(clio::run::u64 page_num) {
+    // Pins are PER-BLOCK (see AcquireHoldPin): one decrement releases the
+    // block's hold, however many threads call this.
+    if (threadIdx.x != 0) return;
     LockBlock();
     Page *p = Find(page_num);
     if (p != nullptr && p->pins != 0u) {
@@ -473,8 +480,15 @@ class DeviceVector {
    *  (or UnholdPage(page_num) after a release()) is the only release.
    *  Per-thread: block-collective holds put blockDim.x pins on the page and
    *  each thread's guard takes one back off. */
+  /** PER-BLOCK, not per-thread: holds are block-collective, so one pin per
+   *  block carries the same meaning as 256 -- and 256 threads atomically
+   *  bumping ONE address per hold, across every block sharing the table,
+   *  measured as most of the fast-path hold's cost (~58us/hold at 64
+   *  blocks). Thread 0 pins; the thread-0 lane of the guards unpins. */
   CTP_GPU_FUN void AcquireHoldPin(Page *p) {
-    atomicAdd((clio::run::u32 *) &p->pins, 1u);
+    if (threadIdx.x == 0) {
+      atomicAdd((clio::run::u32 *) &p->pins, 1u);
+    }
   }
 
   /** Undo one AcquireHoldPin. Used when a probe SUCCEEDED on this thread but
@@ -483,7 +497,9 @@ class DeviceVector {
    *  back here or the page is pinned forever. `last_page_` is the page that
    *  probe pinned -- ProbeHold updates it on every success. */
   CTP_GPU_FUN void ReleaseHoldPin(Page *p) {
-    atomicSub((clio::run::u32 *) &p->pins, 1u);
+    if (threadIdx.x == 0) {
+      atomicSub((clio::run::u32 *) &p->pins, 1u);
+    }
   }
 
  public:
