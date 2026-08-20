@@ -438,8 +438,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kWarning,
          "Static codec '{}' (resolved '{}', wire {}) is ON for pool '{}': "
          "every chunk uses this library and NeuroPress selection, learning "
-         "and exploration are all disabled.",
-         config_.neuropress_static_lib_, resolved, wire, pool_name_);
+         "and exploration are all disabled (byte shuffle: {}).",
+         config_.neuropress_static_lib_, resolved, wire, pool_name_,
+         config_.neuropress_static_shuffle_ == 0
+             ? std::string("off")
+             : std::to_string(config_.neuropress_static_shuffle_) + "-byte");
     if (resolved != config_.neuropress_static_lib_) {
       HLOG(kWarning,
            "  '{}' is not a registered library; it fell back to '{}'. Check "
@@ -1495,7 +1498,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       // single_mode -- preset is ignored and the id always uses slot 2 -- and
       // upstream's non-AUTO algorithms apply no shuffle, so a shuffled
       // control would not be comparing the same transform.
-      fixed.compress_preset_ = static_cast<int>(PackPreset(2, 0));
+      fixed.compress_preset_ = static_cast<int>(
+          PackPreset(2, config_.neuropress_static_shuffle_));
       fixed.compression_ratio_ = 1.0;
       stats.push_back(fixed);
       ranked_by_cost = true;  // take stats.front() verbatim below

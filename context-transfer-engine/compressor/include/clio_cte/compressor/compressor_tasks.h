@@ -143,6 +143,21 @@ struct CompressorConfig {
    * is its like-for-like counterpart, not "zstd".
    */
   std::string neuropress_static_lib_;
+  /**
+   * Byte-shuffle element size for the static codec, in bytes. 0 = no shuffle.
+   *
+   * Only meaningful alongside neuropress_static_lib_. Shuffling groups the
+   * Nth byte of every element together, which makes the exponent and sign
+   * bytes of a float array -- highly repetitive -- adjacent, and is often
+   * worth more than the choice of codec on floating-point data.
+   *
+   * Upstream offers exactly one width: GPUCOMPRESS_PREPROC_SHUFFLE_4, and
+   * its NN action space encodes shuffle as a single bit, so 4 is the
+   * like-for-like setting. Clio's packed preset carries the width itself, so
+   * 8 is also expressible here and worth trying on float64 -- but a run using
+   * it is no longer comparable with upstream.
+   */
+  clio::run::u32 neuropress_static_shuffle_ = 0;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -176,6 +191,7 @@ struct CompressorConfig {
         neuropress_exploration_k_(other.neuropress_exploration_k_),
         neuropress_best_mode_(other.neuropress_best_mode_),
         neuropress_static_lib_(other.neuropress_static_lib_),
+        neuropress_static_shuffle_(other.neuropress_static_shuffle_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -195,6 +211,7 @@ struct CompressorConfig {
        neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
        neuropress_best_mode_, neuropress_static_lib_,
+       neuropress_static_shuffle_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 
@@ -285,6 +302,10 @@ struct CompressorConfig {
         if (node["neuropress_static_lib"]) {
           neuropress_static_lib_ =
               node["neuropress_static_lib"].as<std::string>();
+        }
+        if (node["neuropress_static_shuffle"]) {
+          neuropress_static_shuffle_ =
+              node["neuropress_static_shuffle"].as<clio::run::u32>();
         }
         // Exhaustive-search measurement mode. Widens the exploration gate
         // rather than opening it, so the runtime forces exploration on and K

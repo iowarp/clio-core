@@ -37,6 +37,9 @@ build first:  make -C $BUILD neuropress_grayscott_h5 clio_hdf5_vol" >&2; return 
   # pins every chunk to one library and takes NeuroPress out of the loop, the
   # fixed-codec baseline a selector has to be measured against.
   STATIC_LIB=${STATIC_LIB:-}
+  # Byte-shuffle width for the static codec: 0 = off, 4 = upstream's only
+  # setting (GPUCOMPRESS_PREPROC_SHUFFLE_4), 8 expressible but not comparable.
+  STATIC_SHUF=${STATIC_SHUF:-0}
   EXPLORE_K=${EXPLORE_K:-0}
   LEARN=${LEARN:-false}
   # Exploration only fires on chunks whose cost error exceeds this. 0 means
@@ -91,6 +94,7 @@ compose:
     neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
+${STATIC_LIB:+    neuropress_static_shuffle: $STATIC_SHUF}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local

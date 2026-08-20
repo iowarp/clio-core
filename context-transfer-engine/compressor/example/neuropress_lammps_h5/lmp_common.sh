@@ -36,6 +36,9 @@ lmp_setup() {
   # GPUCOMPRESS_ALGO_ZSTD builds an nvcomp::ZstdManager, so the CPU zstd is
   # not its counterpart.
   STATIC_LIB=${STATIC_LIB:-}
+  # Byte-shuffle width for the static codec: 0 = off, 4 = upstream's only
+  # setting (GPUCOMPRESS_PREPROC_SHUFFLE_4), 8 expressible but not comparable.
+  STATIC_SHUF=${STATIC_SHUF:-0}
   EXPLORE_K=${EXPLORE_K:-0}
   LEARN=${LEARN:-false}
   THRESH=${THRESH:-0.5}
@@ -75,6 +78,7 @@ compose:
     neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
+${STATIC_LIB:+    neuropress_static_shuffle: $STATIC_SHUF}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local
