@@ -622,7 +622,20 @@ class CoroRunner {
         [&](dim3 g, dim3 b, YieldableView<StateT> v) {
           launch(g, b, v, stack_.View());
         },
-        [] {}, max_rounds);
+        [] {}, max_rounds,
+        [](clio::run::u32, clio::run::u64 tag) -> bool {
+          // Honor the wait tag: a parked block relaunches only once the
+          // 32-bit completion flag it published (bit 0 = complete) has
+          // fired. Relaunching unconditionally costs each parked block
+          // its full coroutine-resume price (~125us of GPU time measured)
+          // per round just to re-park -- most of a fault-heavy step's
+          // kernel time. Tag 0 means "no specific wait"; the driver
+          // relaunches those unconditionally.
+          unsigned int v = 0;
+          ctp::GpuApi::Memcpy(&v, reinterpret_cast<const unsigned int *>(tag),
+                              sizeof(v));
+          return (v & 1u) != 0u;
+        });
   }
 
   double KernelMs() const { return drv_.KernelMs(); }

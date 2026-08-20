@@ -372,6 +372,28 @@ class Vector {
   // how a pipelined writer corrupts its own data.
   static constexpr clio::run::u64 kHostPipelineDepth = 32;
 
+  /**
+   * Drop every cached page on every device view: the next kernel launch
+   * starts from an empty cache and faults fresh bytes from the backing
+   * store. THE host-side invalidation verb -- when the host rewrites a
+   * vector's data (Preload, a new upload), it calls this, and kernels
+   * never carry per-vector "drop my cache" flags of their own.
+   *
+   * Host-only and QUIESCENT-only: call it between kernel launches, never
+   * while one is resident. It rewrites the device page and batch tables to
+   * their pristine construction state, which is only sound when nothing is
+   * pinned, fetching, or flushing -- exactly the state a returned kernel
+   * leaves behind (guards died in scope, AwaitFlush settled the puts).
+   */
+  void ClearCache() {
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      InitPageTable(kv.second);
+      InitBatchTable(kv.second);
+    }
+#endif
+  }
+
   /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
    *  `buf` (PageBytes() long). */
   template <typename FillFn>
@@ -597,36 +619,7 @@ class Vector {
 
     // Build the page table on the host, then upload it once. Doing this
     // device-side would mean a kernel writing pointers it cannot compute.
-    std::vector<Page> table(static_cast<size_t>(nslots));
-    char *pages_bytes = st.pages_base;
-    char *tasks_bytes = st.tasks_base;
-    for (clio::run::u64 i = 0; i < nslots; ++i) {
-      Page &p = table[static_cast<size_t>(i)];
-      p.page_num = kNoPage;
-      p.data = pages_bytes + i * page_bytes_;
-      p.score = 0.0f;
-      p.user_score = 0.0f;
-      p.has_user = 0;      // no RescorePage hint until the kernel sets one
-      p.last_access = 0;
-      p.pins = 0;
-      p.dirty = 0;
-      p.flushing = 0;
-      p.fetching = 0;
-      p.evicting = 0;
-      p.rescoring = 0;
-      p.seq = 0;
-      char *slot = tasks_bytes +
-                   i * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
-      p.put = reinterpret_cast<PutSlot *>(slot);
-      p.get = reinterpret_cast<GetSlot *>(slot + sizeof(PutSlot));
-      p.rescore = reinterpret_cast<RescoreSlot *>(
-          slot + sizeof(PutSlot) + sizeof(GetSlot));
-      p.put_fut = clio::run::gpu::Future<clio::cte::core::PodPutBlobTask>();
-      p.get_fut = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
-      p.rescore_fut =
-          clio::run::gpu::Future<clio::cte::core::PodReorganizeBlobTask>();
-    }
-    UploadTable(table, st.table_base);
+    InitPageTable(st);
 
     // The tasks must be CONSTRUCTED, not zeroed: each one now embeds its own
     // RunContext (the separate FutureShm is gone), and the runtime derefs it
@@ -698,29 +691,11 @@ class Vector {
                                            sizeof(MultiGetSlot))
             ->fut_.task_size_ =
             static_cast<clio::run::u32>(sizeof(MultiScoreSlot));
-        char *dev = st.multi_task_base + static_cast<size_t>(i) * pair;
-        mtbl[static_cast<size_t>(i)].put = reinterpret_cast<MultiPutSlot *>(dev);
-        mtbl[static_cast<size_t>(i)].get =
-            reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
-        mtbl[static_cast<size_t>(i)].score = reinterpret_cast<MultiScoreSlot *>(
-            dev + sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
-        mtbl[static_cast<size_t>(i)].put_fut =
-            clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
-        mtbl[static_cast<size_t>(i)].get_fut =
-            clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
-        mtbl[static_cast<size_t>(i)].score_fut =
-            clio::run::gpu::Future<clio::cte::core::PodMultiScoreTask>();
-        mtbl[static_cast<size_t>(i)].async_pending = 0;
-        mtbl[static_cast<size_t>(i)].async_n = 0;
-        mtbl[static_cast<size_t>(i)].score_pending = 0;
-        mtbl[static_cast<size_t>(i)].put_pending = 0;
-        mtbl[static_cast<size_t>(i)].put_n = 0;
       }
       UploadBytes(mtasks.data(), st.multi_task_base,
                   static_cast<clio::run::u64>(nbatch) * pair);
-      UploadBytes(mtbl.data(), st.multi_tbl_base,
-                  nbatch * sizeof(MultiBatch));
     }
+    InitBatchTable(st);
 
     // One device-global counter per vector, feeding unique task ids.
     void *seq = nullptr;
@@ -793,6 +768,73 @@ class Vector {
     st.hdr = v;
     PublishHeader(st);
     devs_[gpu_id] = st;
+  }
+
+  /** Build one GPU's page table in its pristine state -- every slot empty,
+   *  every flag clear, the slot/task pointers wired -- and upload it. Used
+   *  at construction AND by ClearCache(); resetting is re-initializing. */
+  void InitPageTable(DevState &st) {
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+    std::vector<Page> table(static_cast<size_t>(nslots));
+    for (clio::run::u64 i = 0; i < nslots; ++i) {
+      Page &p = table[static_cast<size_t>(i)];
+      p.page_num = kNoPage;
+      p.data = st.pages_base + i * page_bytes_;
+      p.score = 0.0f;
+      p.user_score = 0.0f;
+      p.has_user = 0;      // no rescore hint until the kernel sets one
+      p.last_access = 0;
+      p.pins = 0;
+      p.dirty = 0;
+      p.flushing = 0;
+      p.fetching = 0;
+      p.evicting = 0;
+      p.rescoring = 0;
+      p.seq = 0;
+      char *slot = st.tasks_base +
+                   i * (sizeof(PutSlot) + sizeof(GetSlot) + sizeof(RescoreSlot));
+      p.put = reinterpret_cast<PutSlot *>(slot);
+      p.get = reinterpret_cast<GetSlot *>(slot + sizeof(PutSlot));
+      p.rescore = reinterpret_cast<RescoreSlot *>(
+          slot + sizeof(PutSlot) + sizeof(GetSlot));
+      p.put_fut = clio::run::gpu::Future<clio::cte::core::PodPutBlobTask>();
+      p.get_fut = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
+      p.rescore_fut =
+          clio::run::gpu::Future<clio::cte::core::PodReorganizeBlobTask>();
+    }
+    UploadTable(table, st.table_base);
+  }
+
+  /** Same for the batched-op table: pointers wired, futures null, nothing
+   *  pending. The batch TASK slots are untouched -- they are constructed
+   *  once (they embed live RunContexts) and only their POD inputs mutate. */
+  void InitBatchTable(DevState &st) {
+    const clio::run::u64 multi_per_block =
+        (pages_per_block_ + clio::cte::core::kPodMultiMax - 1) /
+        clio::cte::core::kPodMultiMax;
+    const clio::run::u64 nbatch =
+        static_cast<clio::run::u64>(nblocks_) * multi_per_block;
+    const size_t pair =
+        sizeof(MultiPutSlot) + sizeof(MultiGetSlot) + sizeof(MultiScoreSlot);
+    std::vector<MultiBatch> mtbl(static_cast<size_t>(nbatch));
+    for (clio::run::u64 i = 0; i < nbatch; ++i) {
+      MultiBatch &b = mtbl[static_cast<size_t>(i)];
+      char *dev = st.multi_task_base + static_cast<size_t>(i) * pair;
+      b.put = reinterpret_cast<MultiPutSlot *>(dev);
+      b.get = reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
+      b.score = reinterpret_cast<MultiScoreSlot *>(
+          dev + sizeof(MultiPutSlot) + sizeof(MultiGetSlot));
+      b.put_fut = clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask>();
+      b.get_fut = clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask>();
+      b.score_fut = clio::run::gpu::Future<clio::cte::core::PodMultiScoreTask>();
+      b.async_pending = 0;
+      b.async_n = 0;
+      b.score_pending = 0;
+      b.put_pending = 0;
+      b.put_n = 0;
+    }
+    UploadBytes(mtbl.data(), st.multi_tbl_base, nbatch * sizeof(MultiBatch));
   }
 
   static void UploadTable(const std::vector<Page> &table, void *dst) {

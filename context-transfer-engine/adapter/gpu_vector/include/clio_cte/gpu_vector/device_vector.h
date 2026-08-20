@@ -477,6 +477,15 @@ class DeviceVector {
     atomicAdd((clio::run::u32 *) &p->pins, 1u);
   }
 
+  /** Undo one AcquireHoldPin. Used when a probe SUCCEEDED on this thread but
+   *  the block's all-or-nothing vote abandoned the round: the pin was taken
+   *  in ProbeHold and no Held guard will ever adopt it, so it must be given
+   *  back here or the page is pinned forever. `last_page_` is the page that
+   *  probe pinned -- ProbeHold updates it on every success. */
+  CTP_GPU_FUN void ReleaseHoldPin(Page *p) {
+    atomicSub((clio::run::u32 *) &p->pins, 1u);
+  }
+
  public:
 
 
@@ -1530,12 +1539,26 @@ class DeviceVector {
     // against the correct -4.7638693 -- wrong, and plausible enough to pass
     // an eyeball.
     __syncthreads();
-    if (!IsResident(PageOf(off))) {
-      return 0;
-    }
+    // VOTE THE OUTCOME, not just each thread's own probe. The scan is
+    // lock-free, and on a SHARED table (eternia's read-only shards) another
+    // block's eviction can flip a slot between two threads' reads: thread A
+    // then succeeds where thread B misses. Returning those per-thread
+    // answers splits the caller's `if (run == 0) co_await ...` across the
+    // block -- half the threads suspend inside HoldPageCoro's barriers while
+    // the rest run ahead, and sm_89 traps the mismatched BAR as an illegal
+    // instruction (observed as the LAMMPS 256k-atom crash). The whole block
+    // must take ONE path: all-fast only when EVERY thread held the page.
     const clio::run::u64 r = ProbeHold(off, count, write);
+    if (__syncthreads_and(r != 0 ? 1 : 0)) {
+      return r;   // every thread succeeded; each carries its pin
+    }
+    // At least one thread missed: the block falls to the coro path
+    // TOGETHER. A thread that DID succeed gives its pin back.
+    if (r != 0) {
+      ReleaseHoldPin(last_page_);
+    }
     __syncthreads();
-    return r;
+    return 0;
   }
 
   __device__ clio::run::gpu::YCoroTask HoldPageCoro(clio::run::u64 off,
@@ -1617,9 +1640,22 @@ class DeviceVector {
       // can still lose the slot to a concurrent claim between the vote and
       // the scan -- that is a MISS, and the answer is another park, never a
       // synchronous fetch from inside the kernel.
+      //
+      // AND-vote, not OR. On a shared table the probe can diverge across the
+      // block (another block's eviction lands between two threads' scans);
+      // breaking on ANY success let the LOSING threads exit with run == 0 and
+      // a stale last_page_, and the caller then built their Held from the
+      // wrong page -- observed as a few thousand silently skipped pair
+      // entries per step under eviction pressure. Exit only when EVERY
+      // thread holds the page; winners of a failed round release the pin
+      // they just took, or the retry pins the page up forever.
       *run_out = ProbeHold(off, count, write);
-      if (__syncthreads_or(*run_out != 0)) {
+      if (__syncthreads_and(*run_out != 0 ? 1 : 0)) {
         break;
+      }
+      if (*run_out != 0) {
+        ReleaseHoldPin(last_page_);
+        *run_out = 0;
       }
     }
   }
