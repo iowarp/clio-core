@@ -49,6 +49,13 @@ using clio::run::u64;
 static constexpr u32 kYieldLaneBytes = 4096;
 /** Elements per atom in x and v (float4 packing). */
 static constexpr u32 kStride = 4;
+/** MD_PROF=1 phase attribution inside the force coroutine, cycles, thread
+ *  0 of each block: [0] stencil holds [1] f hold+zero [2] list guards
+ *  [3] pair loop [4] whole row loop [5] rows processed. */
+__device__ unsigned long long g_md_cyc[8];
+
+/** Guards a block may hold over one row of the paged list. */
+static constexpr int kMaxNlGuards = 24;
 
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_MD_CORO 1
@@ -88,6 +95,9 @@ struct Args {
   u64 steps = 100;
   u64 rebin = 20;          // resort cadence (steps); 0 = never
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
+  u32 maxneigh = 96;       // Verlet-list capacity per atom slot
+  u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
+  int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
   // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
   // is discontinuous at the cutoff, and STOCK LAMMPS itself (double
@@ -372,6 +382,432 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
     __syncthreads();
   }  // guards die per row
 
+  if (eflag) {
+    const double vals[3] = {pe, w, npairs};
+    for (int q = 0; q < 3; ++q) {
+      red[threadIdx.x] = vals[q];
+      __syncthreads();
+      for (u32 wd = blockDim.x / 2; wd > 0; wd >>= 1) {
+        if (threadIdx.x < wd) red[threadIdx.x] += red[threadIdx.x + wd];
+        __syncthreads();
+      }
+      if (threadIdx.x == 0) atomicAdd(&acc[q], red[0]);
+      __syncthreads();
+    }
+  }
+}
+
+/**
+ * K2c (stage 3): build the Verlet list on the PAGED neigh vector.
+ *
+ * TRANSPOSED, PADDED layout -- entry k of row-slot s lives at
+ *     row * islots * maxneigh  +  k * islots  +  s
+ * so at every k the threads of a warp read CONSECUTIVE addresses: fully
+ * coalesced. The CSR layout this replaces gave each thread its own
+ * contiguous run, which is the worst pattern a GPU can be handed (32
+ * threads, 32 unrelated cache lines) plus a divergent per-entry guard
+ * walk; measured, the CSR list LOST to cell-direct outright -- 532 ms of
+ * force time against 427 -- despite examining ~8x fewer candidates.
+ *
+ * Fixed padding also deletes the count/prefix-sum/fill round trip: counts
+ * go straight to the resident d_cnt in one pass and nothing crosses PCIe
+ * at a rebuild. Overflow past maxneigh sets d_err and the host refuses.
+ *
+ * Entries are packed ROW-RELATIVE: (q << 16) | row_slot, where q is the
+ * stencil row (0..8); the force pass decodes with two shifts instead of a
+ * global-index page lookup. 16 bits hold any row (nb * cap < 65536,
+ * checked at startup).
+ */
+__device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
+                                       gv::DeviceVector<int> nl, u32 nb,
+                                       u32 cap, float box, float rlist,
+                                       u32 maxneigh, u32 *d_cnt, int *d_err,
+                                       u32 nblocks, u32 block) {
+  extern __shared__ char smem_raw[];
+  // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
+  // holds the same rows and the same list guards, but a thread-local array
+  // indexed by a runtime value (rp0[q], np[gi]) cannot be a register: it
+  // lands in the coroutine frame, which IS the yield-stack lane in GLOBAL
+  // memory. That made ~6 dependent global loads of pure bookkeeping per
+  // entry and is why the list pass first measured SLOWER than cell-direct
+  // despite 17x fewer candidates. Filled once per row after every hold
+  // (no co_await follows, so shared survives) and read by all threads.
+  char *tbl = smem_raw + CLIO_YIELD_SMEM_BYTES +
+              blockDim.x * sizeof(double);
+  const float **s_sp0 = reinterpret_cast<const float **>(tbl);
+  const float **s_sp1 = s_sp0 + 9;
+  u64 *s_srun = reinterpret_cast<u64 *>(s_sp1 + 9);
+  u64 *s_qoff = s_srun + 9;
+  u32 *s_qspan = reinterpret_cast<u32 *>(s_qoff + 9);
+  const int **s_np = reinterpret_cast<const int **>(s_qspan + 12);
+  u64 *s_gs = reinterpret_cast<u64 *>(s_np + kMaxNlGuards);
+  u64 *s_gl = s_gs + kMaxNlGuards;
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  const u64 nrows = static_cast<u64>(nb) * nb;
+  const u64 islots = static_cast<u64>(nb) * cap;
+  const u64 rowlist = islots * maxneigh;
+  const float r2list = rlist * rlist;
+  const float halfL = 0.5f * box;
+  for (u64 row = block; row < nrows; row += nblocks) {
+    const u32 by = static_cast<u32>(row % nb);
+    const u32 bz = static_cast<u32>(row / nb);
+    // HOLD THE STENCIL AS SPANS, NOT ROWS. For a fixed dz the three dy
+    // rows are ADJACENT in the index space (row = bz*nb + by), so one hold
+    // covers all three -- three spans instead of nine rows. On the y wrap
+    // boundary the -1/+1 rows are not adjacent and that dz falls back to
+    // three spans. This is the optimization that matters, because holds
+    // ARE the cost of this pass: measured with the pair loop disabled,
+    // force was 309.8 ms against 300.6 ms with it -- the physics is free
+    // and every millisecond is barriers, fences and probes.
+    gv::Held<float> hg[9][2];
+    u64 srun[9];
+    const float *sp0[9], *sp1[9];
+    u32 qspan[9];
+    u64 qoff[9];
+    u32 nspans = 0;
+    const bool merge = (by >= 1 && by + 1 < nb);
+    for (int dz = -1; dz <= 1; ++dz) {
+      const u32 wz = (bz + nb + dz) % nb;
+      if (merge) {
+        const u64 rb =
+            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
+        const u64 len = 3 * row_elems;
+        hg[nspans][0] = co_await x.HoldPage(rb, len);
+        srun[nspans] = hg[nspans][0].run();
+        if (srun[nspans] < len) {
+          hg[nspans][1] =
+              co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
+        }
+        sp0[nspans] = hg[nspans][0].ptr();
+        sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+        for (int dy = -1; dy <= 1; ++dy) {
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
+        }
+        ++nspans;
+      } else {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
+          hg[nspans][0] = co_await x.HoldPage(rb, row_elems);
+          srun[nspans] = hg[nspans][0].run();
+          if (srun[nspans] < row_elems) {
+            hg[nspans][1] = co_await x.HoldPage(rb + srun[nspans],
+                                                row_elems - srun[nspans]);
+          }
+          sp0[nspans] = hg[nspans][0].ptr();
+          sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = 0;
+          ++nspans;
+        }
+      }
+    }
+    // Write-hold this row's whole list region (host-checked to fit the
+    // guard array): the working-set lower bound for the neigh vector.
+    gv::Held<int> hn[kMaxNlGuards];
+    int *np[kMaxNlGuards];
+    u64 gstart[kMaxNlGuards], glen[kMaxNlGuards];
+    u32 nguards = 0;
+    {
+      const u64 nb0 = row * rowlist;
+      u64 off = 0;
+      while (off < rowlist && nguards < kMaxNlGuards) {
+        hn[nguards] =
+            co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
+        np[nguards] = hn[nguards].ptr();
+        gstart[nguards] = off;
+        glen[nguards] = hn[nguards].run();
+        off += hn[nguards].run();
+        ++nguards;
+      }
+    }
+    if (threadIdx.x == 0) {
+      for (u32 q = 0; q < nspans; ++q) {
+        s_sp0[q] = sp0[q];
+        s_sp1[q] = sp1[q];
+        s_srun[q] = srun[q];
+      }
+      for (int q = 0; q < 9; ++q) {
+        s_qspan[q] = qspan[q];
+        s_qoff[q] = qoff[q];
+      }
+      for (u32 q = 0; q < nguards; ++q) {
+        s_np[q] = np[q];
+        s_gs[q] = gstart[q];
+        s_gl[q] = glen[q];
+      }
+    }
+    __syncthreads();
+    const u64 slotbase = row * islots;
+    const u32 sp4 = s_qspan[4];
+    const u64 off4 = s_qoff[4], run4 = s_srun[sp4];
+    const float *const ip0 = s_sp0[sp4];
+    const float *const ip1 = s_sp1[sp4];
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const u64 e = off4 + s * kStride;
+      const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
+      if (ip[3] < 0.0f) {
+        d_cnt[slotbase + s] = 0;
+        continue;
+      }
+      const float xi = ip[0], yi = ip[1], zi = ip[2];
+      const u32 bx = static_cast<u32>(s / cap);
+      u32 cnt = 0, gi = 0;
+      for (int q = 0; q < 9; ++q) {
+        for (int dxx = -1; dxx <= 1; ++dxx) {
+          const u32 jbx = (bx + nb + dxx) % nb;
+          const u64 jb = static_cast<u64>(jbx) * cap * kStride;
+          const u32 spq = s_qspan[q];
+          const u64 rq = s_srun[spq];
+          const u64 qo = s_qoff[q];
+          const float *const qp0 = s_sp0[spq];
+          const float *const qp1 = s_sp1[spq];
+          for (u32 sj = 0; sj < cap; ++sj) {
+            const u64 ej = qo + jb + static_cast<u64>(sj) * kStride;
+            const float *const jp = (ej < rq) ? qp0 + ej : qp1 + (ej - rq);
+            if (jp[3] < 0.0f) continue;
+            if (q == 4 && jbx == bx && sj == s % cap) continue;
+            float ddx = xi - jp[0];
+            float ddy = yi - jp[1];
+            float ddz = zi - jp[2];
+            if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+            if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+            if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+            const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (rsq >= r2list) continue;
+            if (cnt >= maxneigh) {   // refuse, never overrun
+              *d_err = 1;
+              continue;
+            }
+            const u64 o = static_cast<u64>(cnt) * islots + s;
+            while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
+            const_cast<int *>(s_np[gi])[o - s_gs[gi]] = static_cast<int>(
+                (static_cast<u32>(q) << 16) | (jbx * cap + sj));
+            ++cnt;
+          }
+        }
+      }
+      d_cnt[slotbase + s] = cnt;
+    }
+    __syncthreads();
+  }
+}
+
+/**
+ * K3-list (stage 3): the force pass streaming the Verlet list. Same
+ * nine-row x holds and f write-hold as the cell-direct pass; the candidate
+ * scan is replaced by this atom's padded column of entries, decoded
+ * (q, row_slot) with two shifts. Entries cover cutoff + skin; the cutoff
+ * test here skips the skin shell, which is what keeps the list valid
+ * between rebuilds.
+ */
+__device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
+                                       gv::DeviceVector<float> f,
+                                       gv::DeviceVector<int> nl, u32 nb,
+                                       u32 cap, float box, float cutoff,
+                                       u32 maxneigh, const u32 *d_cnt,
+                                       int eflag, double *acc, int nocompute,
+                                       u32 nblocks, u32 block) {
+  extern __shared__ char smem_raw[];
+  double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
+  // holds the same rows and the same list guards, but a thread-local array
+  // indexed by a runtime value (rp0[q], np[gi]) cannot be a register: it
+  // lands in the coroutine frame, which IS the yield-stack lane in GLOBAL
+  // memory. That made ~6 dependent global loads of pure bookkeeping per
+  // entry and is why the list pass first measured SLOWER than cell-direct
+  // despite 17x fewer candidates. Filled once per row after every hold
+  // (no co_await follows, so shared survives) and read by all threads.
+  char *tbl = smem_raw + CLIO_YIELD_SMEM_BYTES +
+              blockDim.x * sizeof(double);
+  const float **s_sp0 = reinterpret_cast<const float **>(tbl);
+  const float **s_sp1 = s_sp0 + 9;
+  u64 *s_srun = reinterpret_cast<u64 *>(s_sp1 + 9);
+  u64 *s_qoff = s_srun + 9;
+  u32 *s_qspan = reinterpret_cast<u32 *>(s_qoff + 9);
+  const int **s_np = reinterpret_cast<const int **>(s_qspan + 12);
+  u64 *s_gs = reinterpret_cast<u64 *>(s_np + kMaxNlGuards);
+  u64 *s_gl = s_gs + kMaxNlGuards;
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  const u64 nrows = static_cast<u64>(nb) * nb;
+  const u64 islots = static_cast<u64>(nb) * cap;
+  const u64 rowlist = islots * maxneigh;
+  const float c2 = cutoff * cutoff;
+  const float halfL = 0.5f * box;
+  double pe = 0.0, w = 0.0, npairs = 0.0;
+  for (u64 row = block; row < nrows; row += nblocks) {
+    const long long _r0 = clock64();
+    const u32 by = static_cast<u32>(row % nb);
+    const u32 bz = static_cast<u32>(row / nb);
+    // HOLD THE STENCIL AS SPANS, NOT ROWS. For a fixed dz the three dy
+    // rows are ADJACENT in the index space (row = bz*nb + by), so one hold
+    // covers all three -- three spans instead of nine rows. On the y wrap
+    // boundary the -1/+1 rows are not adjacent and that dz falls back to
+    // three spans. This is the optimization that matters, because holds
+    // ARE the cost of this pass: measured with the pair loop disabled,
+    // force was 309.8 ms against 300.6 ms with it -- the physics is free
+    // and every millisecond is barriers, fences and probes.
+    gv::Held<float> hg[9][2];
+    u64 srun[9];
+    const float *sp0[9], *sp1[9];
+    u32 qspan[9];
+    u64 qoff[9];
+    u32 nspans = 0;
+    const bool merge = (by >= 1 && by + 1 < nb);
+    for (int dz = -1; dz <= 1; ++dz) {
+      const u32 wz = (bz + nb + dz) % nb;
+      if (merge) {
+        const u64 rb =
+            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
+        const u64 len = 3 * row_elems;
+        hg[nspans][0] = co_await x.HoldPage(rb, len);
+        srun[nspans] = hg[nspans][0].run();
+        if (srun[nspans] < len) {
+          hg[nspans][1] =
+              co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
+        }
+        sp0[nspans] = hg[nspans][0].ptr();
+        sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+        for (int dy = -1; dy <= 1; ++dy) {
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
+        }
+        ++nspans;
+      } else {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
+          hg[nspans][0] = co_await x.HoldPage(rb, row_elems);
+          srun[nspans] = hg[nspans][0].run();
+          if (srun[nspans] < row_elems) {
+            hg[nspans][1] = co_await x.HoldPage(rb + srun[nspans],
+                                                row_elems - srun[nspans]);
+          }
+          sp0[nspans] = hg[nspans][0].ptr();
+          sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = 0;
+          ++nspans;
+        }
+      }
+    }
+    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[0], (unsigned long long)(clock64() - _r0));
+    const long long _f0 = clock64();
+    const u64 fbase = row * row_elems;
+    gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
+    gv::Held<float> hf1;
+    const u64 frun0 = hf0.run();
+    if (frun0 < row_elems) {
+      hf1 = co_await f.HoldPage(fbase + frun0, row_elems - frun0, true);
+    }
+    float *const fp0 = hf0.ptr();
+    float *const fp1 = hf1 ? hf1.ptr() : nullptr;
+    for (u64 e = threadIdx.x; e < row_elems; e += blockDim.x) {
+      (e < frun0 ? fp0[e] : fp1[e - frun0]) = 0.0f;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[1], (unsigned long long)(clock64() - _f0));
+    const long long _l0 = clock64();
+    // Read-hold this row's whole list region.
+    gv::Held<int> hn[kMaxNlGuards];
+    const int *np[kMaxNlGuards];
+    u64 gstart[kMaxNlGuards], glen[kMaxNlGuards];
+    u32 nguards = 0;
+    {
+      const u64 nb0 = row * rowlist;
+      u64 off = 0;
+      while (off < rowlist && nguards < kMaxNlGuards) {
+        hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
+        np[nguards] = hn[nguards].ptr();
+        gstart[nguards] = off;
+        glen[nguards] = hn[nguards].run();
+        off += hn[nguards].run();
+        ++nguards;
+      }
+    }
+    if (threadIdx.x == 0) {
+      for (u32 q = 0; q < nspans; ++q) {
+        s_sp0[q] = sp0[q];
+        s_sp1[q] = sp1[q];
+        s_srun[q] = srun[q];
+      }
+      for (int q = 0; q < 9; ++q) {
+        s_qspan[q] = qspan[q];
+        s_qoff[q] = qoff[q];
+      }
+      for (u32 q = 0; q < nguards; ++q) {
+        s_np[q] = np[q];
+        s_gs[q] = gstart[q];
+        s_gl[q] = glen[q];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[2], (unsigned long long)(clock64() - _l0));
+    const long long _p0 = clock64();
+    const u64 slotbase = row * islots;
+    const u32 sp4 = s_qspan[4];
+    const u64 off4 = s_qoff[4], run4 = s_srun[sp4];
+    const float *const ip0 = s_sp0[sp4];
+    const float *const ip1 = s_sp1[sp4];
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const u64 e = off4 + s * kStride;
+      const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
+      if (ip[3] < 0.0f) continue;
+      const float xi = ip[0], yi = ip[1], zi = ip[2];
+      const u32 cnt = nocompute ? 0u : d_cnt[slotbase + s];
+      float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+      u32 gi = 0;
+      for (u32 k = 0; k < cnt; ++k) {
+        const u64 o = static_cast<u64>(k) * islots + s;
+        while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
+        const u32 ent = static_cast<u32>(s_np[gi][o - s_gs[gi]]);
+        const u32 q = ent >> 16;
+        const u32 spq = s_qspan[q];
+        const u64 ej = s_qoff[q] +
+                       static_cast<u64>(ent & 0xffffu) * kStride;
+        const u64 rq = s_srun[spq];
+        const float *const jp =
+            (ej < rq) ? s_sp0[spq] + ej : s_sp1[spq] + (ej - rq);
+        float ddx = xi - jp[0];
+        float ddy = yi - jp[1];
+        float ddz = zi - jp[2];
+        if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+        if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+        if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+        const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (rsq >= c2) continue;
+        const float r2i = 1.0f / rsq;
+        const float r6i = r2i * r2i * r2i;
+        const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
+        fx = __fmaf_rn(ddx, fpair, fx);
+        fy = __fmaf_rn(ddy, fpair, fy);
+        fz = __fmaf_rn(ddz, fpair, fz);
+        if (eflag) {
+          pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
+          w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
+          npairs += 1.0;
+        }
+      }
+      const u64 fe = s * kStride;
+      float *const op = (fe < frun0) ? fp0 + fe : fp1 + (fe - frun0);
+      op[0] = fx;
+      op[1] = fy;
+      op[2] = fz;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_md_cyc[3], (unsigned long long)(clock64() - _p0));
+      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+      atomicAdd(&g_md_cyc[5], 1ull);
+    }
+  }
   if (eflag) {
     const double vals[3] = {pe, w, npairs};
     for (int q = 0; q < 3; ++q) {
@@ -723,6 +1159,42 @@ __global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
+__global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<float> x,
+                                gv::DeviceVector<int> nl, u32 nb, u32 cap,
+                                float box, float rlist, u32 maxneigh,
+                                u32 *d_cnt, int *d_err, u32 nblocks,
+                                gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  nl.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(BuildListCoro(x, nl, nb, cap, box, rlist, maxneigh, d_cnt,
+                               d_err, nblocks, yv.Block()));
+}
+
+__global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<float> x,
+                                gv::DeviceVector<float> f,
+                                gv::DeviceVector<int> nl, u32 nb, u32 cap,
+                                float box, float cutoff, u32 maxneigh,
+                                const u32 *d_cnt, int eflag, double *acc,
+                                int nocompute, u32 nblocks,
+                                gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  f.block_override_ = 0;
+  nl.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
+                               d_cnt, eflag, acc, nocompute, nblocks,
+                               yv.Block()));
+}
+
 __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> x, u32 nb, u32 cap,
                             float box, u32 *bincnt, u32 *d_dest, int *d_err,
@@ -853,6 +1325,9 @@ int main(int argc, char **argv) {
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
+    else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
@@ -1049,31 +1524,135 @@ int main(int argc, char **argv) {
     u32 *d_bincnt = ctp::GpuApi::Malloc<u32>(g.nbins * sizeof(u32));
     u32 *d_dest = ctp::GpuApi::Malloc<u32>(g.nslots * sizeof(u32));
     int *d_err = ctp::GpuApi::Malloc<int>(sizeof(int));
+    // Stage 3: the Verlet list on a PAGED int vector, plus its resident
+    // index (per-slot counts and CSR offsets).
+    if (static_cast<u64>(g.nb) * g.cap >= 65536) {
+      std::fprintf(stderr, "nb*cap must fit 16 bits for entry packing\n");
+      return 1;
+    }
+    // Padded rows: every row owns islots * maxneigh entries, so a row's
+    // region is a fixed contiguous span the block holds in one go. The
+    // guard array bounds how many pages that may take -- checked here, in
+    // configuration terms, rather than discovered as a device trap.
+    const u64 md_islots = static_cast<u64>(g.nb) * g.cap;
+    const u64 md_rowlist = md_islots * a.maxneigh;
+    // THE LIST GETS ITS OWN PAGE SIZE, and the default is one whole ROW
+    // per page: a row region is exactly what a block holds, so one page
+    // means ONE guard instead of a chain of them. Holds are block-
+    // collective (a barrier plus a per-thread guard written into the
+    // coroutine frame), so their count -- not their size -- is what the
+    // pass pays for.
+    u64 nl_page_bytes = a.nl_page_kb * 1024;
+    if (nl_page_bytes == 0) {
+      nl_page_bytes = md_rowlist * sizeof(int);
+      u64 pw = 4096;                       // round up to a power of two
+      while (pw < nl_page_bytes) pw <<= 1;
+      nl_page_bytes = pw;
+    }
+    const u64 nl_page_elems = nl_page_bytes / sizeof(int);
+    const u64 nl_elems_raw = static_cast<u64>(g.nb) * g.nb * md_rowlist;
+    const u64 nl_pages = (nl_elems_raw + nl_page_elems - 1) / nl_page_elems;
+    const u64 nl_elems = nl_pages * nl_page_elems;
+    if ((md_rowlist + nl_page_elems - 1) / nl_page_elems + 1 >
+        static_cast<u64>(kMaxNlGuards)) {
+      std::fprintf(stderr,
+                   "list: one row spans %llu entries = more than %d pages; "
+                   "raise --page-kb or lower --maxneigh/--cap\n",
+                   (unsigned long long)md_rowlist, kMaxNlGuards - 1);
+      return 1;
+    }
+    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, 1,
+                       static_cast<u32>(nl_pages + 2), nl_elems);
+    vn.EnableStats();
+    {
+      std::vector<int> hz(nl_elems, 0);
+      vn.Preload(hz.data(), nl_elems);
+    }
+    vn.ClearCache();
+    vn.Prefetch(0, nl_pages, 0, 1);
+    auto dn = vn.GetDevice(0);
+    std::printf("  list: maxneigh=%u row=%llu entries page=%lluKB "
+                "(%llu pages, %llu guards/row)\n",
+                a.maxneigh, (unsigned long long)md_rowlist,
+                (unsigned long long)(nl_page_bytes >> 10),
+                (unsigned long long)nl_pages,
+                (unsigned long long)((md_rowlist + nl_page_elems - 1) /
+                                     nl_page_elems + 1));
+    u32 *d_cnt = ctp::GpuApi::Malloc<u32>(g.nslots * sizeof(u32));
     double *d_acc = ctp::GpuApi::Malloc<double>(3 * sizeof(double));
+    // reduction scratch + the block-uniform pointer tables (9 stencil
+    // rows, kMaxNlGuards list guards) that must not live in the frame.
+    const u32 smem_tbl = static_cast<u32>(
+        9 * (2 * sizeof(void *) + 2 * sizeof(u64)) + 12 * sizeof(u32) +
+        kMaxNlGuards * (sizeof(void *) + 2 * sizeof(u64)));
     const u32 smem_force =
-        CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
+        CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double) + smem_tbl;
     const float fbox = static_cast<float>(g.box);
     const float fcut = static_cast<float>(a.cutoff);
     const float fdt = static_cast<float>(a.dt);
 
+    // MD_NOCOMPUTE=1 keeps every hold and skips the pair loop: the
+    // difference against a normal run IS the hold cost.
+    const int nocompute = std::getenv("MD_NOCOMPUTE") != nullptr ? 1 : 0;
     double acc[3] = {0, 0, 0};
-    auto force = [&](int eflag) {
-      if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
+    double t_force_kern = 0.0;
+    double t_force = 0.0, t_kick = 0.0, t_resort = 0.0, t_build = 0.0;
+    const float frlist = static_cast<float>(a.cutoff + a.skin);
+    // Build the Verlet list: device count pass, host prefix sum (index
+    // class, ~MBs), device fill pass. Refuses loudly on maxneigh or the
+    // per-row guard bound.
+    auto build_list = [&]() -> bool {
+      const double _t = NowMs();
+      ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
-                                           fcut, eflag, d_acc, a.blocks, vw,
-                                           sv);
+        BuildListKernel<<<gr, b, smem_force>>>(
+            gpu, dx, dn, g.nb, g.cap, fbox, frlist, a.maxneigh, d_cnt,
+            d_err, a.blocks, vw, sv);
       });
       ctp::GpuApi::Synchronize();
+      int err = 0;
+      ctp::GpuApi::Memcpy(&err, d_err, sizeof(int));
+      t_build += NowMs() - _t;
+      if (err != 0) {
+        std::fprintf(stderr,
+                     "list: an atom has more than --maxneigh %u neighbours "
+                     "within cutoff+skin\n", a.maxneigh);
+        return false;
+      }
+      return true;
+    };
+    auto force = [&](int eflag) {
+      const double _t = NowMs();
+      if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
+      if (a.use_list) {
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          ListForceKernel<<<gr, b, smem_force>>>(
+              gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
+              eflag, d_acc, nocompute, a.blocks, vw, sv);
+        });
+      } else {
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
+                                             fcut, eflag, d_acc, a.blocks,
+                                             vw, sv);
+        });
+      }
+      ctp::GpuApi::Synchronize();
       if (eflag) ctp::GpuApi::Memcpy(acc, d_acc, 3 * sizeof(double));
+      t_force += NowMs() - _t;
+      t_force_kern += runner.KernelMs();
     };
     auto kick = [&](int drift) {
+      const double _t = NowMs();
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, df, fdt, drift, a.blocks, vw, sv);
       });
+      t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
       ctp::GpuApi::Memset(d_thermo, 0, 4 * sizeof(double));
@@ -1090,6 +1669,7 @@ int main(int argc, char **argv) {
     // K2: wrap + rebin + double-buffered scatter, then swap the handles.
     // Returns false on bin overflow (the host refuses the run).
     auto resort = [&]() -> bool {
+      const double _t = NowMs();
       ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       const float fbox2 = static_cast<float>(g.box);
@@ -1129,10 +1709,12 @@ int main(int argc, char **argv) {
       std::swap(dx, dx2);
       std::swap(dv, dv2);
       cvx = (cvx == &vx) ? &vx2 : &vx;
+      t_resort += NowMs() - _t;
       return true;
     };
 
     // ---- validation layer 2: step-0 statics from geometry alone ----------
+    if (a.use_list && !build_list()) return 1;
     force(/*eflag=*/1);
     double pe_ref = 0.0, w_ref = 0.0;
     unsigned long long pairs_ref = 0;
@@ -1161,6 +1743,7 @@ int main(int argc, char **argv) {
     if (a.rebin != 0) {
       const double pe_before = acc[0];
       if (!resort()) return 1;
+      if (a.use_list && !build_list()) return 1;
       force(/*eflag=*/1);
       resort_rel = std::fabs(acc[0] - pe_before) / std::fabs(pe_before);
       resort_ok = resort_rel < 1e-6;
@@ -1176,6 +1759,7 @@ int main(int argc, char **argv) {
       kick(/*drift=*/1);   // uses f(t)
       if (a.rebin != 0 && step != 0 && step % a.rebin == 0) {
         if (!resort()) return 1;
+        if (a.use_list && !build_list()) return 1;
       }
       force(/*eflag=*/0);  // f(t+dt)
       kick(/*drift=*/0);
@@ -1204,11 +1788,28 @@ int main(int argc, char **argv) {
                 "Matom-steps/s)\n",
                 (unsigned long long)a.steps, run_ms, run_ms / a.steps,
                 static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
+    std::printf("  phases (total ms): force=%.1f (gpu %.1f) kick=%.1f "
+                "resort=%.1f build=%.1f\n", t_force, t_force_kern, t_kick,
+                t_resort, t_build);
+    if (std::getenv("MD_PROF") != nullptr) {
+      unsigned long long c[8] = {0};
+      cudaMemcpyFromSymbol(c, g_md_cyc, sizeof(c));
+      int khz = 0;
+      cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0);
+      const double us = 1000.0 / (double)khz;
+      std::printf("  [mdprof] rows=%llu | stencil-holds=%.1f f-hold+zero=%.1f "
+                  "list-guards=%.1f pair=%.1f total=%.1f (ms summed over "
+                  "blocks)\n",
+                  c[5], c[0] * us / 1000.0, c[1] * us / 1000.0,
+                  c[2] * us / 1000.0, c[3] * us / 1000.0,
+                  c[4] * us / 1000.0);
+    }
     ctp::GpuApi::Free(d_acc);
     ctp::GpuApi::Free(d_thermo);
     ctp::GpuApi::Free(d_bincnt);
     ctp::GpuApi::Free(d_dest);
     ctp::GpuApi::Free(d_err);
+    ctp::GpuApi::Free(d_cnt);
     return (statics_ok && nve_ok && resort_ok) ? 0 : 1;
   }
 

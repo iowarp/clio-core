@@ -192,6 +192,15 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_gpu_vector_md_bench RUNTIME DESTINATION bin)
+    # REGISTER CEILING for the coroutine kernels. Clang's coroutine lowering
+    # allocates ~130 registers regardless of body, which on sm_89 caps the
+    # MD kernels at 7 blocks/SM (14 of 48 warp slots) -- and these kernels
+    # are LATENCY bound, not throughput bound: deleting the entire pair loop
+    # moved wall time by 3% while device clocks attributed 56% of block time
+    # to it. Occupancy is the lever. See lib/eternia/CMakeLists.txt in the
+    # LAMMPS tree, where the same ceiling is applied by an LLVM pass.
+    target_compile_options(clio_gpu_vector_md_bench PRIVATE
+        -Xcuda-ptxas --maxrregcount=64)
 
     add_cuda_executable(clio_gpu_vector_access_bench FALSE
         clio_gpu_vector_access_bench.cc
