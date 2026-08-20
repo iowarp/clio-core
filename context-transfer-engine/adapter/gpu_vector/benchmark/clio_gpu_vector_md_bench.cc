@@ -86,6 +86,14 @@ struct Args {
   u32 threads = 256;
   u32 slots = 0;           // x/v cache slots per block; 0 = resident (auto)
   u64 steps = 100;
+  u64 rebin = 20;          // resort cadence (steps); 0 = never
+  double temp = 0.0;       // scale initial velocities to this T (0 = leave)
+  // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
+  // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
+  // is discontinuous at the cutoff, and STOCK LAMMPS itself (double
+  // precision) drifts 1.9e-3 over the same 250 steps at T=3 -- measured
+  // from its own logs, cadence-independent here (same at rebin 10/5/2).
+  double drift_tol = 5e-4;
   double dt = 0.005;
   int gate = 1;            // stage 1: the ballistic gate IS the run
   int md = 0;              // stage 2: real LJ forces + NVE, statics gates
@@ -379,6 +387,164 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
   }
 }
 
+/**
+ * K2a: destination pass of the resort (stage 2). Positions have drifted
+ * (and possibly left the box); wrap each atom into [0, box), compute its
+ * new bin, claim a slot with an atomic per-bin counter, and record the
+ * destination in d_dest (resident index class). The wrapped coordinates
+ * are stored back, exactly as LAMMPS wraps at reneighbour. An atom moves
+ * at most one bin per rebuild window (the skin rule), which is what makes
+ * K2b's scatter row-local. Bin overflow sets d_err; the host refuses.
+ */
+__device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
+                                   u32 cap, float box, u32 *bincnt,
+                                   u32 *d_dest, int *d_err, u32 nblocks,
+                                   u32 block) {
+  const u64 epp = x.h_->elems_per_page_;
+  const u64 npages = (x.h_->size_ + epp - 1) / epp;
+  const float fnb = static_cast<float>(nb);
+  for (u64 pg = block; pg < npages; pg += nblocks) {
+    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    float *const px = hx.ptr();
+    const u64 nslots = epp / kStride;
+    const u64 slot0 = pg * nslots;
+    for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
+      const u64 e = s * kStride;
+      if (px[e + 3] < 0.0f) {
+        d_dest[slot0 + s] = ~0u;
+        continue;
+      }
+      float px0 = px[e + 0], py0 = px[e + 1], pz0 = px[e + 2];
+      if (px0 < 0.0f) px0 += box; else if (px0 >= box) px0 -= box;
+      if (py0 < 0.0f) py0 += box; else if (py0 >= box) py0 -= box;
+      if (pz0 < 0.0f) pz0 += box; else if (pz0 >= box) pz0 -= box;
+      px[e + 0] = px0; px[e + 1] = py0; px[e + 2] = pz0;
+      u32 bx = static_cast<u32>(px0 * fnb / box);
+      u32 by = static_cast<u32>(py0 * fnb / box);
+      u32 bz = static_cast<u32>(pz0 * fnb / box);
+      if (bx >= nb) bx = nb - 1;
+      if (by >= nb) by = nb - 1;
+      if (bz >= nb) bz = nb - 1;
+      const u64 bin = (static_cast<u64>(bz) * nb + by) * nb + bx;
+      const u32 slot = atomicAdd(&bincnt[bin], 1u);
+      if (slot >= cap) {
+        *d_err = 1;
+        d_dest[slot0 + s] = ~0u;
+        continue;
+      }
+      d_dest[slot0 + s] = static_cast<u32>(bin * cap + slot);
+    }
+    __syncthreads();
+  }
+}
+
+/**
+ * K2b: apply the permutation for ONE vector, src -> dst (the ping-pong
+ * buffer). Row-parallel like the force pass: a source row's destinations
+ * lie within +-1 bin, i.e. inside the same NINE-row stencil, so the block
+ * write-holds those rows of dst collectively and threads scatter. dst rows
+ * were pre-sentineled by SentinelCoro. All slot claims were made in K2a,
+ * so no two atoms share a destination. `keep_w` carries the type lane for
+ * x and writes 0 for v.
+ */
+__device__ gy::YCoroMain ScatterCoro(gv::DeviceVector<float> src,
+                                     gv::DeviceVector<float> srcx,
+                                     gv::DeviceVector<float> dst, u32 nb,
+                                     u32 cap, const u32 *d_dest, int keep_w,
+                                     u32 nblocks, u32 block) {
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  const u64 nrows = static_cast<u64>(nb) * nb;
+  for (u64 row = block; row < nrows; row += nblocks) {
+    const u32 by = static_cast<u32>(row % nb);
+    const u32 bz = static_cast<u32>(row / nb);
+    // Hold the NINE destination stencil rows for writing.
+    gv::Held<float> hg[9][2];
+    u64 rbase[9], rrun0[9];
+    float *rp0[9], *rp1[9];
+    for (int q = 0; q < 9; ++q) {
+      const int dz = q / 3 - 1, dy = q % 3 - 1;
+      const u32 wz = (bz + nb + dz) % nb;
+      const u32 wy = (by + nb + dy) % nb;
+      rbase[q] = ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
+      hg[q][0] = co_await dst.HoldPage(rbase[q], row_elems, true);
+      rrun0[q] = hg[q][0].run();
+      if (rrun0[q] < row_elems) {
+        hg[q][1] =
+            co_await dst.HoldPage(rbase[q] + rrun0[q], row_elems - rrun0[q],
+                                  true);
+      }
+      rp0[q] = hg[q][0].ptr();
+      rp1[q] = hg[q][1] ? hg[q][1].ptr() : nullptr;
+    }
+    // Source row of the vector being moved, and of x (for the sentinel).
+    const u64 sbase = row * static_cast<u64>(nb) * cap * kStride;
+    auto hs0 = co_await src.HoldPage(sbase, row_elems);
+    gv::Held<float> hs1;
+    const u64 srun0 = hs0.run();
+    if (srun0 < row_elems) {
+      hs1 = co_await src.HoldPage(sbase + srun0, row_elems - srun0);
+    }
+    auto hxs0 = co_await srcx.HoldPage(sbase, row_elems);
+    gv::Held<float> hxs1;
+    const u64 xrun0 = hxs0.run();
+    if (xrun0 < row_elems) {
+      hxs1 = co_await srcx.HoldPage(sbase + xrun0, row_elems - xrun0);
+    }
+    const float *const sp0 = hs0.ptr();
+    const float *const sp1 = hs1 ? hs1.ptr() : nullptr;
+    const float *const xp0 = hxs0.ptr();
+    const float *const xp1 = hxs1 ? hxs1.ptr() : nullptr;
+    const u64 islots = static_cast<u64>(nb) * cap;
+    const u64 slotbase = row * islots;
+    const u64 rowbin0 = row * nb;   // first linear bin of this source row
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const u64 e = s * kStride;
+      const float tw = (e < xrun0) ? xp0[e + 3] : xp1[e + 3 - xrun0];
+      if (tw < 0.0f) continue;
+      const u32 dest = d_dest[slotbase + s];
+      if (dest == ~0u) continue;   // overflow victim; host already refused
+      const u64 dbin = dest / cap;
+      // Locate dbin inside the 9-row stencil.
+      const u32 dbz = static_cast<u32>(dbin / (static_cast<u64>(nb) * nb));
+      const u32 dby = static_cast<u32>((dbin / nb) % nb);
+      const int ddz = (dbz == (bz + nb - 1) % nb) ? -1
+                      : (dbz == bz)               ? 0
+                                                  : 1;
+      const int ddy = (dby == (by + nb - 1) % nb) ? -1
+                      : (dby == by)               ? 0
+                                                  : 1;
+      const int q = (ddz + 1) * 3 + (ddy + 1);
+      const u64 de = (dbin - (rbase[q] / (cap * kStride))) * cap * kStride +
+                     (dest % cap) * kStride;
+      float *const dp =
+          (de < rrun0[q]) ? rp0[q] + de : rp1[q] + (de - rrun0[q]);
+      const float *const spp = (e < srun0) ? sp0 + e : sp1 + (e - srun0);
+      dp[0] = spp[0];
+      dp[1] = spp[1];
+      dp[2] = spp[2];
+      dp[3] = keep_w ? spp[3] : 0.0f;
+      (void)rowbin0;
+    }
+    __syncthreads();
+  }
+}
+
+/** Pre-sentinel every slot of a ping-pong destination vector. */
+__device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst,
+                                      u32 nblocks, u32 block) {
+  const u64 epp = dst.h_->elems_per_page_;
+  const u64 npages = (dst.h_->size_ + epp - 1) / epp;
+  for (u64 pg = block; pg < npages; pg += nblocks) {
+    auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
+    float *const p = h.ptr();
+    const u64 nslots = epp / kStride;
+    for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
+      p[s * kStride + 3] = -1.0f;
+    }
+    __syncthreads();
+  }
+}
+
 /** K1/K4 for real MD: the kick reads the FORCE VECTOR (mass = 1). Same
  *  page-parallel shape as the ballistic form. */
 __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
@@ -557,6 +723,45 @@ __global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
+__global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
+                            gv::DeviceVector<float> x, u32 nb, u32 cap,
+                            float box, u32 *bincnt, u32 *d_dest, int *d_err,
+                            u32 nblocks, gy::YieldableView<> yv,
+                            gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RebinCoro(x, nb, cap, box, bincnt, d_dest, d_err, nblocks,
+                           yv.Block()));
+}
+
+__global__ void ScatterKernel(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<float> src,
+                              gv::DeviceVector<float> srcx,
+                              gv::DeviceVector<float> dst, u32 nb, u32 cap,
+                              const u32 *d_dest, int keep_w, u32 nblocks,
+                              gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  src.block_override_ = 0;
+  srcx.block_override_ = 0;
+  dst.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(ScatterCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
+                             nblocks, yv.Block()));
+}
+
+__global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
+                               gv::DeviceVector<float> dst, u32 nblocks,
+                               gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  dst.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SentinelCoro(dst, nblocks, yv.Block()));
+}
+
 __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceVector<float> x,
                                   gv::DeviceVector<float> v,
@@ -645,6 +850,9 @@ int main(int argc, char **argv) {
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--slots")) a.slots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
+    else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
+    else if (want("--temp")) a.temp = atof(argv[++i]);
+    else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
@@ -710,6 +918,34 @@ int main(int argc, char **argv) {
   std::vector<float> hx, hv;
   std::vector<u32> bin_count;
   if (!BuildInitialState(a, g, hx, hv, bin_count)) return 1;
+  if (a.temp > 0.0) {
+    // Zero the net momentum, then scale velocities to the requested reduced
+    // temperature (KE = 1.5 N T, m = 1) -- the melt deck's hot start.
+    double mean[3] = {0, 0, 0};
+    for (u64 s = 0; s < g.nslots; ++s) {
+      if (hx[s * kStride + 3] < 0.0f) continue;
+      for (int d = 0; d < 3; ++d) mean[d] += hv[s * kStride + d];
+    }
+    for (int d = 0; d < 3; ++d) mean[d] /= static_cast<double>(g.natoms);
+    double ke = 0.0;
+    for (u64 s = 0; s < g.nslots; ++s) {
+      if (hx[s * kStride + 3] < 0.0f) continue;
+      for (int d = 0; d < 3; ++d) {
+        const double vd = hv[s * kStride + d] - mean[d];
+        hv[s * kStride + d] = static_cast<float>(vd);
+        ke += 0.5 * vd * vd;
+      }
+    }
+    const double scale =
+        std::sqrt(1.5 * a.temp * static_cast<double>(g.natoms) / ke);
+    for (u64 s = 0; s < g.nslots; ++s) {
+      if (hx[s * kStride + 3] < 0.0f) continue;
+      for (int d = 0; d < 3; ++d) {
+        hv[s * kStride + d] =
+            static_cast<float>(hv[s * kStride + d] * scale);
+      }
+    }
+  }
 
   // ---- runtime ------------------------------------------------------------
   {
@@ -778,6 +1014,10 @@ int main(int argc, char **argv) {
 
   // ---- STAGE 2: real MD (cell-direct LJ + NVE) ---------------------------
   if (a.md) {
+    if (g.nb < 3) {
+      std::fprintf(stderr, "need at least 3 bins per dimension\n");
+      return 1;
+    }
     gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, slots,
                          g.nelems);
     vf.EnableStats();
@@ -788,6 +1028,27 @@ int main(int argc, char **argv) {
     vf.ClearCache();
     vf.Prefetch(0, npages, 0, 1);
     auto df = vf.GetDevice(0);
+    // Ping-pong destination vectors for the resort (K2b scatters into
+    // these, then the handles swap). Same geometry, resident.
+    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, slots, g.nelems);
+    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, slots, g.nelems);
+    {
+      std::vector<float> hs(g.nelems, 0.0f);
+      for (u64 s = 0; s < g.nslots; ++s) hs[s * kStride + 3] = -1.0f;
+      vx2.Preload(hs.data(), g.nelems);
+      vv2.Preload(hs.data(), g.nelems);
+    }
+    vx2.ClearCache();
+    vv2.ClearCache();
+    vx2.Prefetch(0, npages, 0, 1);
+    vv2.Prefetch(0, npages, 0, 1);
+    auto dx2 = vx2.GetDevice(0);
+    auto dv2 = vv2.GetDevice(0);
+    gv::Vector<float> *cvx = &vx;   // current x (for stats/flush/download)
+    // Resident index class for the resort.
+    u32 *d_bincnt = ctp::GpuApi::Malloc<u32>(g.nbins * sizeof(u32));
+    u32 *d_dest = ctp::GpuApi::Malloc<u32>(g.nslots * sizeof(u32));
+    int *d_err = ctp::GpuApi::Malloc<int>(sizeof(int));
     double *d_acc = ctp::GpuApi::Malloc<double>(3 * sizeof(double));
     const u32 smem_force =
         CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
@@ -826,6 +1087,50 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Memcpy(t4, d_thermo, sizeof(t4));
       return t4[0];
     };
+    // K2: wrap + rebin + double-buffered scatter, then swap the handles.
+    // Returns false on bin overflow (the host refuses the run).
+    auto resort = [&]() -> bool {
+      ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
+      ctp::GpuApi::Memset(d_err, 0, sizeof(int));
+      const float fbox2 = static_cast<float>(g.box);
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        RebinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, g.nb, g.cap, fbox2, d_bincnt, d_dest, d_err, a.blocks,
+            vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      int err = 0;
+      ctp::GpuApi::Memcpy(&err, d_err, sizeof(int));
+      if (err != 0) {
+        std::fprintf(stderr, "resort: bin overflow -- raise --cap\n");
+        return false;
+      }
+      for (auto *dst : {&dx2, &dv2}) {
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          SentinelKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, *dst,
+                                                           a.blocks, vw, sv);
+        });
+      }
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, dx, dx2, g.nb, g.cap, d_dest, /*keep_w=*/1, a.blocks,
+            vw, sv);
+      });
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dv, dx, dv2, g.nb, g.cap, d_dest, /*keep_w=*/0, a.blocks,
+            vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      std::swap(dx, dx2);
+      std::swap(dv, dv2);
+      cvx = (cvx == &vx) ? &vx2 : &vx;
+      return true;
+    };
 
     // ---- validation layer 2: step-0 statics from geometry alone ----------
     force(/*eflag=*/1);
@@ -849,12 +1154,29 @@ int main(int argc, char **argv) {
     std::printf("  STATICS GATE: %s (ref_rel=%.2e, melt_abs=%.2e)\n",
                 statics_ok ? "PASS" : "FAIL", ref_rel, melt_abs);
 
+    // ---- resort continuity gate: same physical state, new layout, so the
+    // potential energy must be unchanged to float-summation noise ----------
+    bool resort_ok = true;
+    double resort_rel = 0.0;
+    if (a.rebin != 0) {
+      const double pe_before = acc[0];
+      if (!resort()) return 1;
+      force(/*eflag=*/1);
+      resort_rel = std::fabs(acc[0] - pe_before) / std::fabs(pe_before);
+      resort_ok = resort_rel < 1e-6;
+      std::printf("  RESORT GATE: %s (PE %.6f -> %.6f, rel=%.2e)\n",
+                  resort_ok ? "PASS" : "FAIL", pe_before, acc[0], resort_rel);
+    }
+
     // ---- NVE: energy and momentum must be conserved ----------------------
     const double ke0 = thermo_ke();
-    const double e0 = pe0 + ke0;
+    const double e0 = acc[0] + ke0;
     const double t0 = NowMs();
     for (u64 step = 0; step < a.steps; ++step) {
       kick(/*drift=*/1);   // uses f(t)
+      if (a.rebin != 0 && step != 0 && step % a.rebin == 0) {
+        if (!resort()) return 1;
+      }
       force(/*eflag=*/0);  // f(t+dt)
       kick(/*drift=*/0);
     }
@@ -864,7 +1186,7 @@ int main(int argc, char **argv) {
     const double ke_n = thermo_ke();
     const double e_n = acc[0] + ke_n;
     const double e_drift = std::fabs(e_n - e0) / std::fabs(e0);
-    const auto sfx = vx.ReadStats(0);
+    const auto sfx = cvx->ReadStats(0);
     const auto sff = vf.ReadStats(0);
     const bool res_ok = (sfx.faults == 0 && sfx.evicts == 0 &&
                          sff.faults == 0 && sff.evicts == 0);
@@ -876,7 +1198,7 @@ int main(int argc, char **argv) {
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
         res_ok ? "[resident contract HELD]" : "[RESIDENT CONTRACT VIOLATED]");
-    const bool nve_ok = (e_drift < 5e-4) && res_ok;
+    const bool nve_ok = (e_drift < a.drift_tol) && res_ok;
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
     std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
                 "Matom-steps/s)\n",
@@ -884,7 +1206,10 @@ int main(int argc, char **argv) {
                 static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
     ctp::GpuApi::Free(d_acc);
     ctp::GpuApi::Free(d_thermo);
-    return (statics_ok && nve_ok) ? 0 : 1;
+    ctp::GpuApi::Free(d_bincnt);
+    ctp::GpuApi::Free(d_dest);
+    ctp::GpuApi::Free(d_err);
+    return (statics_ok && nve_ok && resort_ok) ? 0 : 1;
   }
 
   // ---- the run ------------------------------------------------------------
