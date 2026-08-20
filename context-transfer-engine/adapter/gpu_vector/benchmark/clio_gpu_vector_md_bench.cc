@@ -107,6 +107,7 @@ struct Args {
   u64 rebin = 20;          // resort cadence (steps); 0 = never
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
+  u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
@@ -596,14 +597,13 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
             }
             const u64 o = static_cast<u64>(cnt) * islots + s;
             while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
-            // ENCODE WHAT THE FORCE PASS ACTUALLY NEEDS: the span index
-            // and the element offset INSIDE that span. Both passes hold
-            // the identical spans for a row, so the pair loop then needs
-            // no (q -> span, offset) translation at all -- it was doing
-            // ~8 shared-memory lookups per pair, every one indexed by a
-            // warp-divergent value, i.e. bank-conflicting.
+            // Entries are STENCIL-RELATIVE, (q, slot-within-row), not
+            // span-relative: the two passes then need not agree on how
+            // they group rows into held spans, which is what lets the
+            // force pass amortize its holds over a CHUNK of rows while
+            // the build pass holds per row.
             const_cast<int *>(s_np[gi])[o - s_gs[gi]] = static_cast<int>(
-                (spq << 27) | static_cast<u32>(ej));
+                (static_cast<u32>(q) << 16) | (jbx * cap + sj));
             ++cnt;
           }
         }
@@ -628,7 +628,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
                                        u32 cap, float box, float cutoff,
                                        u32 maxneigh, const u32 *d_cnt,
                                        int eflag, double *acc, int nocompute,
-                                       u32 nblocks, u32 block) {
+                                       u32 rowchunk, u32 nblocks, u32 block) {
   extern __shared__ char smem_raw[];
   double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
@@ -656,31 +656,49 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
   const float c2 = cutoff * cutoff;
   const float halfL = 0.5f * box;
   double pe = 0.0, w = 0.0, npairs = 0.0;
-  for (u64 row = block; row < nrows; row += nblocks) {
+  // AMORTIZE THE STENCIL HOLDS OVER A CHUNK OF ROWS. Holds are what this
+  // pass costs (with the pair loop deleted it ran 245 ms against 252 with
+  // it), and a single row needed 3 span holds to serve 1 row of work. A
+  // chunk of R rows in one z-plane needs the SAME 3 spans -- rows
+  // [y0-1, ylast+1] -- so the cost per row falls by R. Rows are grouped
+  // within a plane, never across one, because that is the axis along which
+  // the index space is contiguous.
+  const u32 cpz = (nb + rowchunk - 1) / rowchunk;
+  const u64 nchunks = static_cast<u64>(nb) * cpz;
+  for (u64 ch = block; ch < nchunks; ch += nblocks) {
     const long long _r0 = clock64();
-    const u32 by = static_cast<u32>(row % nb);
-    const u32 bz = static_cast<u32>(row / nb);
-    // HOLD THE STENCIL AS SPANS, NOT ROWS. For a fixed dz the three dy
-    // rows are ADJACENT in the index space (row = bz*nb + by), so one hold
-    // covers all three -- three spans instead of nine rows. On the y wrap
-    // boundary the -1/+1 rows are not adjacent and that dz falls back to
-    // three spans. This is the optimization that matters, because holds
-    // ARE the cost of this pass: measured with the pair loop disabled,
-    // force was 309.8 ms against 300.6 ms with it -- the physics is free
-    // and every millisecond is barriers, fences and probes.
-    gv::Held<float> hg[9][2];
-    u64 srun[9];
-    const float *sp0[9], *sp1[9];
-    u32 qspan[9];
-    u64 qoff[9];
+    const u32 bz = static_cast<u32>(ch / cpz);
+    const u32 y0 = static_cast<u32>(ch % cpz) * rowchunk;
+    if (y0 >= nb) continue;
+    const u32 ylast = (y0 + rowchunk - 1 < nb) ? (y0 + rowchunk - 1)
+                                               : (nb - 1);
+    // The stencil rows for the whole chunk: [y0-1, ylast+1] mod nb at
+    // each of the three z planes, as one contiguous run (two when the
+    // range crosses the y wrap).
+    gv::Held<float> hg[6][2];
+    u64 srun[6];
+    const float *sp0[6], *sp1[6];
+    u32 sbase[6], scnt[6], sdz[6];
     u32 nspans = 0;
-    const bool merge = (by >= 1 && by + 1 < nb);
     for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
-      if (merge) {
+      const int lo = static_cast<int>(y0) - 1;
+      const int hi = static_cast<int>(ylast) + 1;
+      u32 rl[2], rn[2], nr = 0;
+      if (lo < 0) {
+        rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+        rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+      } else if (hi > static_cast<int>(nb) - 1) {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
+        rl[nr] = 0; rn[nr] = 1u; ++nr;
+      } else {
+        rl[nr] = static_cast<u32>(lo);
+        rn[nr] = static_cast<u32>(hi - lo + 1); ++nr;
+      }
+      for (u32 t = 0; t < nr; ++t) {
         const u64 rb =
-            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
-        const u64 len = 3 * row_elems;
+            ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+        const u64 len = static_cast<u64>(rn[t]) * row_elems;
         hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
@@ -689,33 +707,42 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         }
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
-        for (int dy = -1; dy <= 1; ++dy) {
-          const int q = (dz + 1) * 3 + (dy + 1);
-          qspan[q] = nspans;
-          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
-        }
+        sbase[nspans] = rl[t];
+        scnt[nspans] = rn[t];
+        sdz[nspans] = static_cast<u32>(dz + 1);
         ++nspans;
-      } else {
+      }
+    }
+    if (threadIdx.x == 0) {
+      for (u32 t = 0; t < nspans; ++t) {
+        s_sp0[t] = sp0[t];
+        s_sp1[t] = sp1[t];
+        s_srun[t] = srun[t];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[0], (unsigned long long)(clock64() - _r0));
+    for (u32 by = y0; by <= ylast; ++by) {
+    const u64 row = static_cast<u64>(bz) * nb + by;
+    // Which span holds each stencil row, and at what offset. Block-uniform
+    // and only 9 entries, so thread 0 resolves it once per row.
+    if (threadIdx.x == 0) {
+      for (int dz = -1; dz <= 1; ++dz) {
         for (int dy = -1; dy <= 1; ++dy) {
           const u32 wy = (by + nb + dy) % nb;
-          const u64 rb =
-              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
-          hg[nspans][0] = co_await x.HoldPage(rb, row_elems);
-          srun[nspans] = hg[nspans][0].run();
-          if (srun[nspans] < row_elems) {
-            hg[nspans][1] = co_await x.HoldPage(rb + srun[nspans],
-                                                row_elems - srun[nspans]);
-          }
-          sp0[nspans] = hg[nspans][0].ptr();
-          sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
           const int q = (dz + 1) * 3 + (dy + 1);
-          qspan[q] = nspans;
-          qoff[q] = 0;
-          ++nspans;
+          for (u32 t = 0; t < nspans; ++t) {
+            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
+            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
+              s_qspan[q] = t;
+              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
+              break;
+            }
+          }
         }
       }
     }
-    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[0], (unsigned long long)(clock64() - _r0));
+    __syncthreads();
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
     gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
@@ -750,15 +777,6 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       }
     }
     if (threadIdx.x == 0) {
-      for (u32 q = 0; q < nspans; ++q) {
-        s_sp0[q] = sp0[q];
-        s_sp1[q] = sp1[q];
-        s_srun[q] = srun[q];
-      }
-      for (int q = 0; q < 9; ++q) {
-        s_qspan[q] = qspan[q];
-        s_qoff[q] = qoff[q];
-      }
       for (u32 q = 0; q < nguards; ++q) {
         s_np[q] = np[q];
         s_gs[q] = gstart[q];
@@ -785,8 +803,10 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         const u64 o = static_cast<u64>(k) * islots + s;
         while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
         const u32 ent = static_cast<u32>(s_np[gi][o - s_gs[gi]]);
-        const u32 spq = ent >> 27;
-        const u64 ej = static_cast<u64>(ent & 0x07ffffffu);
+        const u32 q = ent >> 16;
+        const u32 spq = s_qspan[q];
+        const u64 ej = s_qoff[q] +
+                       static_cast<u64>(ent & 0xffffu) * kStride;
         const u64 rq = s_srun[spq];
         const float *const jp =
             (ej < rq) ? s_sp0[spq] + ej : s_sp1[spq] + (ej - rq);
@@ -822,7 +842,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
       atomicAdd(&g_md_cyc[5], 1ull);
     }
-  }
+    }   // per-row loop
+  }     // per-chunk loop
   if (eflag) {
     const double vals[3] = {pe, w, npairs};
     for (int q = 0; q < 3; ++q) {
@@ -1196,7 +1217,7 @@ __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<int> nl, u32 nb, u32 cap,
                                 float box, float cutoff, u32 maxneigh,
                                 const u32 *d_cnt, int eflag, double *acc,
-                                int nocompute, u32 nblocks,
+                                int nocompute, u32 rowchunk, u32 nblocks,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -1206,8 +1227,8 @@ __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
-                               d_cnt, eflag, acc, nocompute, nblocks,
-                               yv.Block()));
+                               d_cnt, eflag, acc, nocompute, rowchunk,
+                               nblocks, yv.Block()));
 }
 
 __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
@@ -1341,6 +1362,7 @@ int main(int argc, char **argv) {
     else if (want("--temp")) a.temp = atof(argv[++i]);
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
@@ -1645,7 +1667,7 @@ int main(int argc, char **argv) {
                        gy::YieldStackView sv) {
           ListForceKernel<<<gr, b, smem_force>>>(
               gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
-              eflag, d_acc, nocompute, a.blocks, vw, sv);
+              eflag, d_acc, nocompute, a.rowchunk, a.blocks, vw, sv);
         });
       } else {
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
