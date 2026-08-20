@@ -8,6 +8,7 @@
  * @brief Unit tests for the compression preprocessors (issue #693):
  *        feature extraction, error-bounded quantization, and byte-plane shuffle.
  */
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -72,4 +73,50 @@ TEST_CASE("ByteShuffle/ByteUnshuffle is a lossless round-trip") {
                                         elem_size);
     REQUIRE(restored == bytes);
   }
+}
+
+/**
+ * The case above uses elem_size * 300 -- always an exact multiple of the
+ * element, and always 2,400 bytes, which is one kShuffleChunkBytes block. So
+ * it exercises neither of the two paths whose comments in byte_shuffle.h
+ * record past bugs: the trailing partial element ("silent corruption on round
+ * trip, since the length was still right") and the per-256-KiB-block plane
+ * walk.
+ *
+ * neuropress_preprocess_parity.cu does cover both, across the same widths and
+ * against upstream's own kernels -- but it is SKIPPED without CUDA and a
+ * NeuroPress checkout, which is most builds. This pins the host round-trip
+ * unconditionally so a plain build cannot regress it silently.
+ */
+TEST_CASE("ByteShuffle round-trips across block edges and partial elements") {
+  constexpr size_t kBlock = 256 * 1024;  // kShuffleChunkBytes
+  const std::vector<size_t> sizes = {
+      1, 2, 3, 5, 7, 9, 15, 17, 31, 33, 127, 129,   // sub-element and ragged
+      1000, 1001, 1023, 1024, 1025,
+      kBlock - 1, kBlock, kBlock + 1, kBlock + 7,   // the block edge
+      2 * kBlock, 2 * kBlock + 3, 4 * kBlock,       // multi-block
+      318208,                                       // a real LAMMPS tail chunk
+      1048576 - 1, 1048576, 1048576 + 1};           // the VOL's chunk size
+
+  size_t with_partial_element = 0;
+  for (size_t elem_size : {size_t(2), size_t(4), size_t(8)}) {
+    for (size_t n : sizes) {
+      std::vector<uint8_t> bytes(n);
+      for (size_t i = 0; i < n; ++i) {
+        bytes[i] = static_cast<uint8_t>((i * 131u + elem_size * 7u + 3u) & 0xFF);
+      }
+      auto shuffled = ByteShuffleVector(bytes.data(), n, elem_size);
+      REQUIRE(shuffled.size() == n);
+      auto restored = ByteUnshuffleVector(shuffled.data(), n, elem_size);
+      REQUIRE(restored == bytes);
+
+      for (size_t base = 0; base < n; base += kBlock) {
+        const size_t chunk = std::min(kBlock, n - base);
+        if (chunk % elem_size != 0) { ++with_partial_element; break; }
+      }
+    }
+  }
+  // Guards the guard: if a future change to the size list stopped producing
+  // ragged blocks, this case would still pass while testing nothing new.
+  REQUIRE(with_partial_element > 0);
 }
