@@ -586,6 +586,61 @@ class YieldStack {
   char *d_base_ = nullptr;
 };
 
+#if !CTP_IS_DEVICE_PASS
+
+/**
+ * Host runner for a coroutine kernel: the per-lane frame stack plus the
+ * relaunch driver, reset together and run to completion.
+ *
+ *     CoroRunner<> runner(nblocks, nthreads, lane_bytes);
+ *     runner.Run([&](dim3 g, dim3 b, YieldableView<> v, YieldStackView s) {
+ *       MyKernel<<<g, b>>>(v, s, other_args...);
+ *     });
+ *
+ * The service callback is deliberately empty, and it was worth checking: a
+ * suspended block publishes wait_tag_ so the host could wait on what it is
+ * blocked on instead of relaunching, but spinning in the service step until
+ * parked tokens could have landed cuts rounds without making the kernel any
+ * faster -- the relaunches are not the cost.
+ */
+template <typename StateT = YieldNoState>
+class CoroRunner {
+ public:
+  CoroRunner(clio::run::u32 nblocks, clio::run::u32 nthreads,
+             clio::run::u32 lane_bytes)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, lane_bytes) {}
+
+  /** `launch(grid, block, yieldable_view, stack_view)` issues the kernel.
+   *  @return rounds taken. */
+  template <typename LaunchFn>
+  clio::run::u32 Run(LaunchFn &&launch,
+                     clio::run::u32 max_rounds = 2000000) {
+    drv_.ResetTimers();
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, YieldableView<StateT> v) {
+          launch(g, b, v, stack_.View());
+        },
+        [] {}, max_rounds);
+  }
+
+  double KernelMs() const { return drv_.KernelMs(); }
+  double CopyMs() const { return drv_.CopyMs(); }
+  double UploadMs() const { return drv_.UploadMs(); }
+  const std::vector<std::pair<double, clio::run::u32>> &RoundLog() const {
+    return drv_.RoundLog();
+  }
+  Yieldable<StateT> &Driver() { return drv_; }
+  YieldStack &Stack() { return stack_; }
+
+ private:
+  Yieldable<StateT> drv_;
+  YieldStack stack_;
+};
+
+#endif  // !CTP_IS_DEVICE_PASS
+
 }  // namespace clio::run::gpu
 
 

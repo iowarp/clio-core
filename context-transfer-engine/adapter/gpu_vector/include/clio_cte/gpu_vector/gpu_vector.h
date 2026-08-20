@@ -361,6 +361,129 @@ class Vector {
     return (num_elems_ + per - 1) / per;
   }
 
+  // ---- Host data transfer -------------------------------------------------
+  // A vector page IS the blob named "p<page>" under the vector's tag, so the
+  // host fills or reads the backing store page by page and never holds the
+  // whole array -- which is the point of an out-of-core vector. Transfers
+  // are pipelined: a window of async round trips in flight, then drained
+  // (a scalar put-then-Wait costs a full CTE round trip per page and
+  // overlaps nothing). Each in-flight page owns its buffer for the life of
+  // its future; reusing one scratch buffer across an un-drained window is
+  // how a pipelined writer corrupts its own data.
+  static constexpr clio::run::u64 kHostPipelineDepth = 32;
+
+  /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
+   *  `buf` (PageBytes() long). */
+  template <typename FillFn>
+  bool PreloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi, FillFn fill) {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    if (pg_hi <= pg_lo) return true;
+    const clio::run::u64 depth =
+        std::min(pg_hi - pg_lo, kHostPipelineDepth);
+    std::vector<std::vector<char>> bufs(
+        static_cast<size_t>(depth), std::vector<char>(page_bytes_));
+    bool ok = true;
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi;) {
+      const clio::run::u64 lo = pg;
+      const clio::run::u64 hi = std::min(lo + depth, pg_hi);
+      std::vector<decltype(core.AsyncPutBlob(tag_id_, std::string(), 0, 0,
+                                             nullptr, 1.0f))> futs;
+      futs.reserve(hi - lo);
+      for (clio::run::u64 q = lo; q < hi; ++q) {
+        std::vector<char> &buf = bufs[static_cast<size_t>(q - lo)];
+        fill(q, buf.data());
+        char name[32];
+        PageBlobName(q, name);
+        // Constant score, matching the device flush: a reput whose score
+        // differs from the previous put relocates the blob, and gets can
+        // then return the stale replica.
+        futs.push_back(core.AsyncPutBlob(tag_id_, std::string(name), 0,
+                                         page_bytes_, buf.data(), 1.0f));
+      }
+      for (auto &fut : futs) {
+        fut.Wait();
+        if (fut.get() == nullptr || fut->GetReturnCode() != 0) ok = false;
+      }
+      pg = hi;
+    }
+    return ok;
+  }
+
+  /** Preload the backing store with `count` elements from `src`, starting at
+   *  page-aligned `elem_off`. The tail page is zero-padded. */
+  bool Preload(const T *src, clio::run::u64 count,
+               clio::run::u64 elem_off = 0) {
+    const clio::run::u64 per = page_bytes_ / sizeof(T);
+    if (per == 0 || (elem_off % per) != 0) return false;
+    const clio::run::u64 pg0 = elem_off / per;
+    const clio::run::u64 npg = (count + per - 1) / per;
+    return PreloadPages(pg0, pg0 + npg, [&](clio::run::u64 pg, char *buf) {
+      const clio::run::u64 e0 = (pg - pg0) * per;
+      const clio::run::u64 nn = std::min(per, count - e0);
+      std::memcpy(buf, src + e0, nn * sizeof(T));
+      if (nn < per) {
+        std::memset(buf + nn * sizeof(T), 0, (per - nn) * sizeof(T));
+      }
+    });
+  }
+
+  /** Get pages [pg_lo, pg_hi): `sink(pg, buf)` consumes each page that
+   *  exists. A page the kernel never wrote is skipped -- that is the
+   *  write-allocate case, not an error.
+   *  @return pages delivered to `sink`. */
+  template <typename SinkFn>
+  clio::run::u64 DownloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi,
+                               SinkFn sink) {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    if (pg_hi <= pg_lo) return 0;
+    const clio::run::u64 depth =
+        std::min(pg_hi - pg_lo, kHostPipelineDepth);
+    std::vector<std::vector<char>> bufs(
+        static_cast<size_t>(depth), std::vector<char>(page_bytes_));
+    clio::run::u64 got = 0;
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi;) {
+      const clio::run::u64 lo = pg;
+      const clio::run::u64 hi = std::min(lo + depth, pg_hi);
+      std::vector<decltype(core.AsyncGetBlob(tag_id_, std::string(), 0, 0, 0u,
+                                             nullptr))> futs;
+      futs.reserve(hi - lo);
+      for (clio::run::u64 q = lo; q < hi; ++q) {
+        char name[32];
+        PageBlobName(q, name);
+        futs.push_back(core.AsyncGetBlob(
+            tag_id_, std::string(name), 0, page_bytes_, 0u,
+            bufs[static_cast<size_t>(q - lo)].data()));
+      }
+      for (clio::run::u64 q = lo; q < hi; ++q) {
+        auto &fut = futs[static_cast<size_t>(q - lo)];
+        fut.Wait();
+        if (fut.get() == nullptr || fut->GetReturnCode() != 0) continue;
+        sink(q, static_cast<const char *>(
+                    bufs[static_cast<size_t>(q - lo)].data()));
+        ++got;
+      }
+      pg = hi;
+    }
+    return got;
+  }
+
+  /** Read `count` elements into `dst` from page-aligned `elem_off`. Pages
+   *  never written leave their span of `dst` untouched.
+   *  @return pages copied. */
+  clio::run::u64 Download(T *dst, clio::run::u64 count,
+                          clio::run::u64 elem_off = 0) {
+    const clio::run::u64 per = page_bytes_ / sizeof(T);
+    if (per == 0 || (elem_off % per) != 0) return 0;
+    const clio::run::u64 pg0 = elem_off / per;
+    const clio::run::u64 npg = (count + per - 1) / per;
+    return DownloadPages(
+        pg0, pg0 + npg, [&](clio::run::u64 pg, const char *buf) {
+          const clio::run::u64 e0 = (pg - pg0) * per;
+          const clio::run::u64 nn = std::min(per, count - e0);
+          std::memcpy(dst + e0, buf, nn * sizeof(T));
+        });
+  }
+
  private:
   // NOTE: forward-declared in the public section above; the definition must
   // carry the same access, or clang rejects the redeclaration ([class.mem]).
