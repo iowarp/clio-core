@@ -802,6 +802,19 @@ class DeviceVector {
                                               clio::run::u32 w,
                                               clio::run::u32 ppb32) {
     const clio::run::u64 ppb = (clio::run::u64) ppb32;
+    // WAY 0 IS THE IDENTITY WAY: pn % ppb, over the whole table. This is
+    // what makes the resident regime a THEOREM instead of a lottery: when
+    // npages <= slots, every page's identity slot is distinct, so host
+    // Prefetch (which tries ways in order into an empty table) places EVERY
+    // page and the kernel cannot fault. Before this, placement was
+    // best-effort d-left hashing, and a 96-page vector in a 98-slot table
+    // silently left way-collided pages to demand-fault mid-kernel. Out of
+    // core, mod is collision-free over any contiguous window of <= ppb
+    // pages -- the working-set shape the range/stencil holds produce -- and
+    // pathological strides fall back to the hashed ways below.
+    if (w == 0) {
+      return (clio::run::u32) (pn % ppb);
+    }
     const clio::run::u64 d = (clio::run::u64) Ways(ppb32);
     const clio::run::u32 base = (clio::run::u32) ((ppb * w) / d);
     const clio::run::u32 end = (clio::run::u32) ((ppb * (w + 1)) / d);
