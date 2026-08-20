@@ -226,3 +226,94 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS clio_gpu_vector_access_bench RUNTIME DESTINATION bin)
 endif()
+
+#------------------------------------------------------------------------------
+# eternia-MD, NVSHMEM edition: the scale-out baseline for the paged MD bench.
+#
+# Built by NVCC through a custom rule rather than add_cuda_executable(), and
+# the reason is not style. The NVSHMEM device library is a relocatable-device-
+# code archive, so it needs -rdc=true and nvlink; this tree sets
+# CMAKE_CUDA_COMPILER to clang for the device-coroutine kernels and turns
+# separable compilation OFF there (see CLIO_CUDA_SEPARABLE in
+# cmake/ClioCoreCommon.cmake). The two cannot share one target.
+#
+# It links NOTHING from clio -- no runtime, no CTE, no gpu_vector. A baseline
+# that shares a substrate with the thing it is benchmarked against is not a
+# baseline.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
+    find_path(NVSHMEM_INCLUDE_DIR nvshmem.h
+        HINTS ENV NVSHMEM_HOME ENV NVSHMEM_PREFIX
+        PATH_SUFFIXES include nvshmem/include)
+    find_library(NVSHMEM_HOST_LIB NAMES nvshmem_host libnvshmem_host.so.3
+        HINTS ENV NVSHMEM_HOME ENV NVSHMEM_PREFIX
+        PATH_SUFFIXES lib lib64 nvshmem/lib)
+    find_library(NVSHMEM_DEVICE_LIB NAMES nvshmem_device
+        HINTS ENV NVSHMEM_HOME ENV NVSHMEM_PREFIX
+        PATH_SUFFIXES lib lib64 nvshmem/lib)
+    find_program(NVSHMEM_NVCC nvcc
+        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
+        PATH_SUFFIXES bin)
+
+    if(NVSHMEM_INCLUDE_DIR AND NVSHMEM_HOST_LIB AND NVSHMEM_DEVICE_LIB
+       AND NVSHMEM_NVCC)
+        get_filename_component(NVSHMEM_LIB_DIR ${NVSHMEM_HOST_LIB} DIRECTORY)
+
+        # The arch list nvcc needs. CMAKE_CUDA_ARCHITECTURES entries carry
+        # CMake suffixes ("89-real"); strip them.
+        set(_nvs_arch_flags "")
+        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
+            list(APPEND _nvs_arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
+        endforeach()
+        if(NOT _nvs_arch_flags)
+            list(APPEND _nvs_arch_flags "-arch=sm_80")
+        endif()
+
+        # MPI bootstrap when MPI is available: `mpirun -n N` then gives one PE
+        # per GPU. Without it the bench still builds and runs single-PE on a
+        # unique-ID bootstrap, which is what a one-GPU workstation gets.
+        # Compile flags and link libraries are kept apart on purpose: nvcc
+        # takes anything before -o as an INPUT, so an MPI .so listed with the
+        # -I flags is handed to the preprocessor as a source file.
+        find_package(MPI QUIET COMPONENTS CXX)
+        set(_nvs_mpi_cflags "")
+        set(_nvs_mpi_libs "")
+        if(MPI_CXX_FOUND)
+            set(_nvs_mpi_cflags -DMD_NVSHMEM_USE_MPI)
+            foreach(_dir IN LISTS MPI_CXX_INCLUDE_DIRS)
+                list(APPEND _nvs_mpi_cflags -I${_dir})
+            endforeach()
+            # Handed to the LINKER by absolute path. `-x cu` applies to every
+            # input nvcc classifies as a source, and a bare .so on the command
+            # line is one of those -- it gets preprocessed as CUDA and the
+            # build dies in a wall of "null character(s) preserved in literal".
+            foreach(_lib IN LISTS MPI_CXX_LIBRARIES)
+                list(APPEND _nvs_mpi_libs -Xlinker ${_lib})
+            endforeach()
+        endif()
+
+        set(_nvs_out ${CMAKE_BINARY_DIR}/bin/clio_md_nvshmem_bench)
+        set(_nvs_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_md_nvshmem_bench.cc)
+        add_custom_command(
+            OUTPUT ${_nvs_out}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+            COMMAND ${NVSHMEM_NVCC}
+                -x cu -std=c++17 -O3 -rdc=true ${_nvs_arch_flags}
+                -I${NVSHMEM_INCLUDE_DIR} ${_nvs_mpi_cflags}
+                ${_nvs_src} -o ${_nvs_out}
+                -L${NVSHMEM_LIB_DIR} -lnvshmem_device -lnvshmem_host
+                ${_nvs_mpi_libs}
+                -Xlinker -rpath -Xlinker ${NVSHMEM_LIB_DIR}
+            DEPENDS ${_nvs_src}
+            COMMENT "Building clio_md_nvshmem_bench (nvcc + NVSHMEM device rdc)"
+            VERBATIM)
+        add_custom_target(clio_md_nvshmem_bench ALL DEPENDS ${_nvs_out})
+        install(PROGRAMS ${_nvs_out} DESTINATION bin)
+        message(STATUS "eternia-MD NVSHMEM baseline: ON (${NVSHMEM_INCLUDE_DIR})")
+    else()
+        message(STATUS
+            "CLIO_CORE_ENABLE_NVSHMEM=ON but NVSHMEM was not found "
+            "(set NVSHMEM_HOME); skipping clio_md_nvshmem_bench")
+    endif()
+endif()
