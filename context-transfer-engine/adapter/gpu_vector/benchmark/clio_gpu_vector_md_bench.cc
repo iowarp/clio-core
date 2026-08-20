@@ -943,23 +943,57 @@ __device__ gy::YCoroMain ScatterCoro(gv::DeviceVector<float> src,
     const u32 by = static_cast<u32>(row % nb);
     const u32 bz = static_cast<u32>(row / nb);
     // Hold the NINE destination stencil rows for writing.
+    // Destination stencil as SPANS, not rows -- the same merge the force
+    // and build passes use. Nine separate row holds pin nine pages per
+    // block, which is what made the resort exceed a shrunken cache and
+    // livelock while the force pass was already running fine out of core.
     gv::Held<float> hg[9][2];
-    u64 rbase[9], rrun0[9];
-    float *rp0[9], *rp1[9];
-    for (int q = 0; q < 9; ++q) {
-      const int dz = q / 3 - 1, dy = q % 3 - 1;
+    u64 dsrun[9];
+    float *dsp0[9], *dsp1[9];
+    u32 qspan[9];
+    u64 qoff[9];
+    u32 nspans = 0;
+    const bool merge = (by >= 1 && by + 1 < nb);
+    for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
-      const u32 wy = (by + nb + dy) % nb;
-      rbase[q] = ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
-      hg[q][0] = co_await dst.HoldPage(rbase[q], row_elems, true);
-      rrun0[q] = hg[q][0].run();
-      if (rrun0[q] < row_elems) {
-        hg[q][1] =
-            co_await dst.HoldPage(rbase[q] + rrun0[q], row_elems - rrun0[q],
-                                  true);
+      if (merge) {
+        const u64 rb =
+            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
+        const u64 len = 3 * row_elems;
+        hg[nspans][0] = co_await dst.HoldPage(rb, len, true);
+        dsrun[nspans] = hg[nspans][0].run();
+        if (dsrun[nspans] < len) {
+          hg[nspans][1] =
+              co_await dst.HoldPage(rb + dsrun[nspans], len - dsrun[nspans],
+                                    true);
+        }
+        dsp0[nspans] = hg[nspans][0].ptr();
+        dsp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+        for (int dy = -1; dy <= 1; ++dy) {
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
+        }
+        ++nspans;
+      } else {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
+          hg[nspans][0] = co_await dst.HoldPage(rb, row_elems, true);
+          dsrun[nspans] = hg[nspans][0].run();
+          if (dsrun[nspans] < row_elems) {
+            hg[nspans][1] = co_await dst.HoldPage(
+                rb + dsrun[nspans], row_elems - dsrun[nspans], true);
+          }
+          dsp0[nspans] = hg[nspans][0].ptr();
+          dsp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = 0;
+          ++nspans;
+        }
       }
-      rp0[q] = hg[q][0].ptr();
-      rp1[q] = hg[q][1] ? hg[q][1].ptr() : nullptr;
     }
     // Source row of the vector being moved, and of x (for the sentinel).
     const u64 sbase = row * static_cast<u64>(nb) * cap * kStride;
@@ -999,10 +1033,14 @@ __device__ gy::YCoroMain ScatterCoro(gv::DeviceVector<float> src,
                       : (dby == by)               ? 0
                                                   : 1;
       const int q = (ddz + 1) * 3 + (ddy + 1);
-      const u64 de = (dbin - (rbase[q] / (cap * kStride))) * cap * kStride +
+      // Offset inside the held span: the destination row's slot within the
+      // span, then the bin within that row, then the slot within the bin.
+      const u64 rowbin = (static_cast<u64>(dbz) * nb + dby) * nb;
+      const u32 sp = qspan[q];
+      const u64 de = qoff[q] + (dbin - rowbin) * cap * kStride +
                      (dest % cap) * kStride;
       float *const dp =
-          (de < rrun0[q]) ? rp0[q] + de : rp1[q] + (de - rrun0[q]);
+          (de < dsrun[sp]) ? dsp0[sp] + de : dsp1[sp] + (de - dsrun[sp]);
       const float *const spp = (e < srun0) ? sp0 + e : sp1 + (e - srun0);
       dp[0] = spp[0];
       dp[1] = spp[1];
@@ -1679,6 +1717,7 @@ int main(int argc, char **argv) {
     // MD_NOCOMPUTE=1 keeps every hold and skips the pair loop: the
     // difference against a normal run IS the hold cost.
     const int nocompute = std::getenv("MD_NOCOMPUTE") != nullptr ? 1 : 0;
+    const bool trace = std::getenv("MD_TRACE") != nullptr;
     double acc[3] = {0, 0, 0};
     double t_force_kern = 0.0, t_ckpt = 0.0, t_ckpt_stock = 0.0;
     u64 n_ckpt = 0;
@@ -1688,6 +1727,7 @@ int main(int argc, char **argv) {
     // class, ~MBs), device fill pass. Refuses loudly on maxneigh or the
     // per-row guard bound.
     auto build_list = [&]() -> bool {
+      if (trace) { std::fprintf(stderr, "[md] build\n"); std::fflush(stderr); }
       const double _t = NowMs();
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
@@ -1709,6 +1749,8 @@ int main(int argc, char **argv) {
       return true;
     };
     auto force = [&](int eflag) {
+      if (trace) { std::fprintf(stderr, "[md] force eflag=%d\n", eflag);
+                   std::fflush(stderr); }
       const double _t = NowMs();
       if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
       if (a.use_list) {
@@ -1732,6 +1774,8 @@ int main(int argc, char **argv) {
       t_force_kern += runner.KernelMs();
     };
     auto kick = [&](int drift) {
+      if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
+                   std::fflush(stderr); }
       const double _t = NowMs();
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
