@@ -1156,6 +1156,20 @@ struct SelectionLog {
  * The hash covers the codec's own output only -- not Clio's 24-byte header
  * -- so it is directly comparable with NeuroPress's payload, whose 64-byte
  * header is likewise excluded.
+ *
+ * A chunk can appear TWICE, distinguished by the `stage` column, and the LAST
+ * row for a blob is the one that describes what is on the tier:
+ *
+ *   primary  what the selected codec produced, from Compress()
+ *   adopted  what exploration replaced it with, from DynamicSchedule
+ *
+ * The second row exists because Compress() runs before exploration can
+ * override its result. With only the primary row, a chunk stored at the
+ * winner's size was reported at the primary's -- always the larger of the
+ * two, and only ever on the modes that explore, so a comparison built on
+ * this log ranked exploration below configurations it actually beat. A
+ * consumer that keys a map on blob name gets the right answer for free; one
+ * that SUMS the rows must filter to the last per blob.
  */
 struct PayloadLog {
   std::mutex mutex;
@@ -1172,7 +1186,7 @@ PayloadLog *PayloadLogInstance() {
       if (l->fp) {
         std::fprintf(l->fp,
                      "blob,compressed_size,payload_hash,beneficial,"
-                     "compress_kernel_ms\n");
+                     "compress_kernel_ms,stage\n");
       }
     }
     return l;
@@ -1182,7 +1196,7 @@ PayloadLog *PayloadLogInstance() {
 
 void LogCompressedPayload(const std::string &blob_name, const char *payload,
                           size_t payload_size, bool on_device, bool beneficial,
-                          double compress_kernel_ms) {
+                          double compress_kernel_ms, const char *stage) {
   PayloadLog *log = PayloadLogInstance();
   if (!log->fp || !payload || payload_size == 0) return;
 
@@ -1199,8 +1213,8 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
     h *= 1099511628211ull;
   }
   std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(log->fp, "%s,%zu,%llu,%d,%.10g\n", blob_name.c_str(),
-               payload_size, h, beneficial ? 1 : 0, compress_kernel_ms);
+  std::fprintf(log->fp, "%s,%zu,%llu,%d,%.10g,%s\n", blob_name.c_str(),
+               payload_size, h, beneficial ? 1 : 0, compress_kernel_ms, stage);
   std::fflush(log->fp);
 
   // Diagnostic: dump one chunk's raw payload so it can be diffed against
@@ -2499,6 +2513,19 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                      winner_rc);
               } else {
                 stored_by_exploration = true;
+                // Supersede the primary's payload-log row. That row was
+                // written from Compress() before this sweep existed, so
+                // leaving it alone reports a chunk at the size the PRIMARY
+                // produced while the tier holds the winner's -- always
+                // larger, and only ever for the modes that explore, so a
+                // comparison built on it ranks exploration below
+                // configurations it actually beats. Last row for a blob wins.
+                if (SelectionLogEnabled()) {
+                  LogCompressedPayload(
+                      task->blob_name_.str(), winner_payload.data(),
+                      winner_payload.size(), /*on_device=*/false,
+                      winner_total < chunk_size, winner_time_ms, "adopted");
+                }
                 task->context_ = winner_ctx;
                 task->context_.actual_original_size_ = chunk_size;
                 task->context_.actual_compressed_size_ = winner_total;
@@ -2995,7 +3022,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       LogCompressedPayload(task->blob_name_.str(), compress_dst,
                            compressed_size, output_on_device,
                            total_stored_size < input_size,
-                           compress_kernel_ms);
+                           compress_kernel_ms, "primary");
     }
 
     CLIO_PATH_TRACE("WRITE  codec ran lib=%d in=%zu out=%zu kept=%d",

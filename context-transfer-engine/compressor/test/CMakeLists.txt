@@ -55,6 +55,40 @@ add_test(NAME test_compressor_compose_config
 set_tests_properties(test_compressor_compose_config PROPERTIES
   LABELS "693;compressor;config;unit")
 
+# Payload-log fidelity (issue #693). The .payload companion of
+# CLIO_NEUROPRESS_SELECTION_LOG is read as "what this chunk cost on the tier",
+# and was written before exploration could replace the result -- so it
+# described the primary and under-reported exactly the modes that explore.
+# Own executable because both log handles are function-local statics: whichever
+# test runs first in a process fixes the path for all of them.
+add_executable(test_compressor_payload_log_exec
+  test_compressor_payload_log.cc
+)
+target_link_libraries(test_compressor_payload_log_exec
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+if(CLIO_CORE_ENABLE_CUDA)
+    target_link_libraries(test_compressor_payload_log_exec ctp::cuda_cxx)
+elseif(CLIO_CORE_ENABLE_ROCM)
+    target_link_libraries(test_compressor_payload_log_exec ctp::rocm_cxx)
+endif()
+target_compile_definitions(test_compressor_payload_log_exec PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+add_test(NAME test_compressor_payload_log
+         COMMAND test_compressor_payload_log_exec)
+set_tests_properties(test_compressor_payload_log PROPERTIES
+  LABELS "693;compressor;payload_log;unit")
+
 # Test NeuroPress bridge (issue #693 cycle 3): NeuroPressCandidateStats
 # ranking GPU/NeuroPress candidates for dynamic selection.
 add_executable(test_neuropress_bridge_exec
