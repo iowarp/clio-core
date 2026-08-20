@@ -510,33 +510,8 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         ++nspans;
       }
     }
-    if (threadIdx.x == 0) {
-      for (u32 t = 0; t < nspans; ++t) {
-        s_sp0[t] = sp0[t];
-        s_sp1[t] = sp1[t];
-        s_srun[t] = srun[t];
-      }
-    }
-    __syncthreads();
     for (u32 by = y0; by <= ylast; ++by) {
     const u64 row = static_cast<u64>(bz) * nb + by;
-    if (threadIdx.x == 0) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-          const u32 wy = (by + nb + dy) % nb;
-          const int q = (dz + 1) * 3 + (dy + 1);
-          for (u32 t = 0; t < nspans; ++t) {
-            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
-            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
-              s_qspan[q] = t;
-              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
-              break;
-            }
-          }
-        }
-      }
-    }
-    __syncthreads();
     // Write-hold this row's whole list region (host-checked to fit the
     // guard array): the working-set lower bound for the neigh vector.
     gv::Held<int> hn[kMaxNlGuards];
@@ -556,7 +531,33 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         ++nguards;
       }
     }
+    // SHARED DOES NOT SURVIVE A PARK. The yield driver exits the kernel on
+    // a fault, so every block-uniform table has to be (re)published AFTER
+    // the last hold that can suspend -- the span pointers included, even
+    // though the holds themselves are taken once per CHUNK and their guards
+    // live in the frame. Resident runs never park and so never noticed;
+    // out of core this read back garbage pointers and died on an MMU fault
+    // inside the coroutine's resume path.
     if (threadIdx.x == 0) {
+      for (u32 t = 0; t < nspans; ++t) {
+        s_sp0[t] = sp0[t];
+        s_sp1[t] = sp1[t];
+        s_srun[t] = srun[t];
+      }
+      for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          for (u32 t = 0; t < nspans; ++t) {
+            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
+            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
+              s_qspan[q] = t;
+              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
+              break;
+            }
+          }
+        }
+      }
       for (u32 q = 0; q < nguards; ++q) {
         s_np[q] = np[q];
         s_gs[q] = gstart[q];
@@ -724,36 +725,11 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         ++nspans;
       }
     }
-    if (threadIdx.x == 0) {
-      for (u32 t = 0; t < nspans; ++t) {
-        s_sp0[t] = sp0[t];
-        s_sp1[t] = sp1[t];
-        s_srun[t] = srun[t];
-      }
-    }
-    __syncthreads();
     if (threadIdx.x == 0) atomicAdd(&g_md_cyc[0], (unsigned long long)(clock64() - _r0));
     for (u32 by = y0; by <= ylast; ++by) {
     const u64 row = static_cast<u64>(bz) * nb + by;
     // Which span holds each stencil row, and at what offset. Block-uniform
     // and only 9 entries, so thread 0 resolves it once per row.
-    if (threadIdx.x == 0) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-          const u32 wy = (by + nb + dy) % nb;
-          const int q = (dz + 1) * 3 + (dy + 1);
-          for (u32 t = 0; t < nspans; ++t) {
-            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
-            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
-              s_qspan[q] = t;
-              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
-              break;
-            }
-          }
-        }
-      }
-    }
-    __syncthreads();
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
     gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
@@ -787,7 +763,33 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         ++nguards;
       }
     }
+    // SHARED DOES NOT SURVIVE A PARK. The yield driver exits the kernel on
+    // a fault, so every block-uniform table has to be (re)published AFTER
+    // the last hold that can suspend -- the span pointers included, even
+    // though the holds themselves are taken once per CHUNK and their guards
+    // live in the frame. Resident runs never park and so never noticed;
+    // out of core this read back garbage pointers and died on an MMU fault
+    // inside the coroutine's resume path.
     if (threadIdx.x == 0) {
+      for (u32 t = 0; t < nspans; ++t) {
+        s_sp0[t] = sp0[t];
+        s_sp1[t] = sp1[t];
+        s_srun[t] = srun[t];
+      }
+      for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          for (u32 t = 0; t < nspans; ++t) {
+            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
+            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
+              s_qspan[q] = t;
+              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
+              break;
+            }
+          }
+        }
+      }
       for (u32 q = 0; q < nguards; ++q) {
         s_np[q] = np[q];
         s_gs[q] = gstart[q];
@@ -1420,6 +1422,31 @@ int main(int argc, char **argv) {
     return 1;
   }
   const u64 npages = (g.nelems + page_elems - 1) / page_elems;
+  // A HELD SPAN MUST FIT ONE PAGE, or two guards cannot cover it.
+  // The force and build passes hold a span of (rowchunk + 2) rows with a
+  // guard for the page it starts in and one for the page it straddles
+  // into. A span LONGER than a page crosses three, and the third is
+  // unguarded -- reads walk off the second page into whatever frame
+  // follows. Resident that is benign and invisible, because identity
+  // placement puts page p in slot p and the frames are contiguous; out of
+  // core the next frame is a different page, and the run either invents
+  // neighbours (caught by the maxneigh refusal) or dies on an illegal
+  // access. Checked here, in configuration terms, before anything runs.
+  {
+    const u64 row_bytes =
+        static_cast<u64>(g.nb) * g.cap * kStride * sizeof(float);
+    const u64 span_bytes = static_cast<u64>(a.rowchunk + 2) * row_bytes;
+    if (span_bytes > page_bytes) {
+      std::fprintf(stderr,
+                   "page too small: a %u-row held span is %llu bytes but the "
+                   "page is %llu; raise --page-kb to at least %llu or lower "
+                   "--rowchunk/--cap\n",
+                   a.rowchunk + 2, (unsigned long long)span_bytes,
+                   (unsigned long long)page_bytes,
+                   (unsigned long long)((span_bytes + 1023) / 1024));
+      return 1;
+    }
+  }
   // THE VECTOR OWNS WHOLE PAGES. A partial tail page would leave slots the
   // kernels can reach but the host never initialized: Preload zero-pads
   // them, zero is not the sentinel, and 2464 phantom atoms integrated the
