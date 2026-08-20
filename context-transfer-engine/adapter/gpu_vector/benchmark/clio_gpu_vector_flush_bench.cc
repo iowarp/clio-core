@@ -81,11 +81,18 @@ CTP_GPU_FUN void Spin(u32 us, u64 clock_khz) {
 }
 
 #if defined(GV_FLUSH_CORO)
+/** Per-resumed-round cost attribution (thread 0 of each block, cycles):
+ *  [0] CLIO_GPU_INIT  [1] TLS publish  [2] the coroutine run itself
+ *  [3] launched rounds counted device-side
+ *  [4] hold+write loop  [5] FlushAsync  [6] AwaitFlush (incl. parked). */
+__device__ unsigned long long g_round_cyc[8];
+
 /** Write one held page of a region. Shared by the warm and timed coroutines.
  *  HOISTED: in a coroutine the guard lives in the frame, which is the
  *  yield-stack lane in GLOBAL memory; indexing through the guard re-reads
  *  data_/run_ from that frame on every store. Copy them to locals once. */
-__device__ void WritePage(const gv::Held<u32> &h, u64 poff, u32 pass) {
+__device__ __noinline__ void WritePage(const gv::Held<u32> &h, u64 poff,
+                                       u32 pass) {
   u32 *const p = h.ptr();
   const u64 n = h.run();
   for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
@@ -132,7 +139,8 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
 __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
                                             u64 pages_per_region, u32 spin_us,
                                             u64 clock_khz, int do_write,
-                                            u32 pass, int async, u32 block) {
+                                            u32 pass, int async, int no_flush,
+                                            u32 block) {
   const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
   const u64 block_base = static_cast<u64>(block) * iters * region_elems;
   bool pending = false;
@@ -152,20 +160,39 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
 
     if (do_write) {
       const u64 off = block_base + it * region_elems;
+      const long long w0 = clock64();
       // Page at a time, so the whole block is inside one page at any moment --
       // the granularity the vector's paging contract assumes.
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.h_->elems_per_page_;
+        const long long h0 = clock64();
         auto h =
             co_await v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
+        if (threadIdx.x == 0) {
+          atomicAdd(&g_round_cyc[7], (unsigned long long) (clock64() - h0));
+        }
         WritePage(h, poff, pass);
       }
+      const long long w1 = clock64();
       // ---- block-level flush: ONE collective call covering the region ----
-      v.FlushAsync(off, region_elems);
-      if (async) {
+      // GV_NO_FLUSH diagnostic: isolate the write loop's cost from the
+      // flush machinery (dirty pages are simply left behind).
+      if (!no_flush) v.FlushAsync(off, region_elems);
+      const long long w2 = clock64();
+      if (threadIdx.x == 0) {
+        atomicAdd(&g_round_cyc[4], (unsigned long long) (w1 - w0));
+        atomicAdd(&g_round_cyc[5], (unsigned long long) (w2 - w1));
+      }
+      if (no_flush) {
+        // nothing submitted, nothing to await
+      } else if (async) {
         pending = true;
       } else {
+        const long long w3 = clock64();
         co_await v.AwaitFlush();
+        if (threadIdx.x == 0) {
+          atomicAdd(&g_round_cyc[6], (unsigned long long) (clock64() - w3));
+        }
       }
     }
   }
@@ -176,15 +203,25 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceVector<u32> v, u64 iters,
                                      u64 pages_per_region, u32 spin_us,
                                      u64 clock_khz, int do_write, u32 pass,
-                                     int async, gy::YieldableView<> yv,
+                                     int async, int no_flush,
+                                     gy::YieldableView<> yv,
                                      gy::YieldStackView ys) {
+  const long long t0 = clock64();
   CLIO_GPU_INIT(info, nullptr);
+  const long long t1 = clock64();
   v.block_override_ = yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
+  const long long t2 = clock64();
   CLIO_YCORO_RUN(SpinWriteFlushCoro(v, iters, pages_per_region, spin_us,
                                     clock_khz, do_write, pass, async,
-                                    yv.Block()));
+                                    no_flush, yv.Block()));
+  if (threadIdx.x == 0) {
+    atomicAdd(&g_round_cyc[0], (unsigned long long) (t1 - t0));
+    atomicAdd(&g_round_cyc[1], (unsigned long long) (t2 - t1));
+    atomicAdd(&g_round_cyc[2], (unsigned long long) (clock64() - t2));
+    atomicAdd(&g_round_cyc[3], 1ull);
+  }
 }
 
 /**
@@ -303,11 +340,12 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceVector<u32> v, u64 iters,
                                      u64 pages_per_region, u32 spin_us,
                                      u64 clock_khz, int do_write, u32 pass,
-                                     int async, gy::YieldableView<> yv,
+                                     int async, int no_flush,
+                                     gy::YieldableView<> yv,
                                      gy::YieldStackView ys) {
   (void) info; (void) v; (void) iters; (void) pages_per_region;
   (void) spin_us; (void) clock_khz; (void) do_write; (void) pass;
-  (void) async; (void) yv; (void) ys;
+  (void) async; (void) no_flush; (void) yv; (void) ys;
 }
 __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
                                        gv::DeviceVector<u32> v, u64 iters,
@@ -905,6 +943,7 @@ int main(int argc, char **argv) {
   }
 
   u32 pass = 1;
+  static const int no_flush = getenv("GV_NO_FLUSH") != nullptr;
   auto run = [&](u32 spin, int do_write, int async) {
     double best = 1e30;
     for (u32 r = 0; r < a.repeat; ++r) {
@@ -912,20 +951,48 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Synchronize();
       const double t0 = NowMs();
       const u32 this_pass = pass++;
+      {
+        const unsigned long long z[8] = {0};
+        cudaMemcpyToSymbol(g_round_cyc, z, sizeof(z));
+      }
       const u32 rr = runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                     gy::YieldStackView sv) {
         SpinWriteFlushKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dev, a.iters, pages_per_region, spin, clock_khz, do_write,
-            this_pass, async, vw, sv);
+            this_pass, async, no_flush, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       const double ms = NowMs() - t0;
       // Where a slow flush lives: rounds is the park/relaunch count, and
       // kernel_ms the GPU-resident time -- (ms - kernel_ms) is the host gap.
       if (getenv("CLIO_PUT_PROF")) {
+        unsigned long long rc4[8] = {0};
+        cudaMemcpyFromSymbol(rc4, g_round_cyc, sizeof(rc4));
+        const double n = rc4[3] ? (double) rc4[3] : 1.0;
+        const double us = 1000.0 / (double) clock_khz;
+        const auto ps = vec.ReadStats(0);
         std::printf(
-            "    [runp] rounds=%u wall=%.1fms kernel=%.1fms gap=%.1fms\n",
-            rr, ms, runner.KernelMs(), ms - runner.KernelMs());
+            "    [runp] rounds=%u wall=%.1fms kernel=%.1fms gap=%.1fms | "
+            "block-rounds=%llu per-round: init=%.0fus publish=%.0fus "
+            "run=%.0fus | totals: write=%.1fms (holds=%.1fms) "
+            "flushasync=%.1fms await=%.1fms | faults=%llu evicts=%llu\n",
+            rr, ms, runner.KernelMs(), ms - runner.KernelMs(),
+            (unsigned long long) rc4[3], rc4[0] / n * us, rc4[1] / n * us,
+            rc4[2] / n * us, rc4[4] * us / 1000.0, rc4[7] * us / 1000.0,
+            rc4[5] * us / 1000.0, rc4[6] * us / 1000.0,
+            (unsigned long long) ps.faults, (unsigned long long) ps.evicts);
+        const auto hist = vec.ReadFaultHist(0);
+        if (!hist.empty()) {
+          std::printf("    [hist] faulting pages:");
+          int shown = 0;
+          for (size_t p = 0; p < hist.size() && shown < 16; ++p) {
+            if (hist[p] != 0) {
+              std::printf(" %zu:%u", p, hist[p]);
+              ++shown;
+            }
+          }
+          std::printf("\n");
+        }
       }
       if (ms < best) best = ms;
     }
