@@ -124,6 +124,25 @@ struct CompressorConfig {
    * gate, it does not open it.
    */
   bool neuropress_best_mode_ = false;
+  /**
+   * Static codec override. When non-empty, every chunk is compressed with
+   * this library and NeuroPress's selection is not consulted at all -- no
+   * inference, no learning, no exploration.
+   *
+   * This is the control condition for any claim about the selector. A
+   * NeuroPress ratio only means something against the ratio a fixed codec
+   * would have produced on the same bytes, and until now Clio had no way to
+   * produce that number through the real write path: the only way to hold
+   * the codec fixed was to not compress at all.
+   *
+   * Value is a canonical library name from CompressionFactory's registry
+   * ("nvcomp-zstd", "zstd", "lz4", ...). An unknown name resolves to zstd,
+   * matching WireIdForName's documented fallback. Note "zstd" is the CPU
+   * codec and "nvcomp-zstd" is the GPU one -- upstream NeuroPress's
+   * GPUCOMPRESS_ALGO_ZSTD builds an nvcomp::ZstdManager, so "nvcomp-zstd"
+   * is its like-for-like counterpart, not "zstd".
+   */
+  std::string neuropress_static_lib_;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -156,6 +175,7 @@ struct CompressorConfig {
             other.neuropress_exploration_threshold_),
         neuropress_exploration_k_(other.neuropress_exploration_k_),
         neuropress_best_mode_(other.neuropress_best_mode_),
+        neuropress_static_lib_(other.neuropress_static_lib_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -174,7 +194,7 @@ struct CompressorConfig {
        neuropress_mape_threshold_, neuropress_learning_rate_,
        neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
-       neuropress_best_mode_,
+       neuropress_best_mode_, neuropress_static_lib_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 
@@ -258,6 +278,13 @@ struct CompressorConfig {
         if (node["neuropress_exploration_k"]) {
           neuropress_exploration_k_ =
               node["neuropress_exploration_k"].as<int>();
+        }
+        // Static codec override -- the control condition. Deliberately
+        // parsed alongside the NeuroPress knobs rather than above them: it
+        // overrides all of them, and reading it here keeps that visible.
+        if (node["neuropress_static_lib"]) {
+          neuropress_static_lib_ =
+              node["neuropress_static_lib"].as<std::string>();
         }
         // Exhaustive-search measurement mode. Widens the exploration gate
         // rather than opening it, so the runtime forces exploration on and K

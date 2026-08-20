@@ -30,10 +30,18 @@ lmp_setup() {
   # across successive H5Dwrite calls rather than getting whole ones handed to it.
   CHUNK=${CHUNK:-4194304}
   BEST=${BEST:-false}
+  # Static codec control. Non-empty pins every chunk to one library and takes
+  # NeuroPress out of the loop entirely -- the baseline a selector's ratio has
+  # to be compared against. "nvcomp-zstd", not "zstd": upstream's
+  # GPUCOMPRESS_ALGO_ZSTD builds an nvcomp::ZstdManager, so the CPU zstd is
+  # not its counterpart.
+  STATIC_LIB=${STATIC_LIB:-}
   EXPLORE_K=${EXPLORE_K:-0}
   LEARN=${LEARN:-false}
   THRESH=${THRESH:-0.5}
-  if [ "${EXPLORE_K:-0}" -gt 0 ]; then
+  if [ -n "$STATIC_LIB" ]; then
+    NP_LEARN=false; NP_EXPLORE=false
+  elif [ "${EXPLORE_K:-0}" -gt 0 ]; then
     NP_LEARN=true;  NP_EXPLORE=true
   elif [ "$LEARN" = true ]; then
     NP_LEARN=true;  NP_EXPLORE=false
@@ -66,6 +74,7 @@ compose:
     neuropress_exploration_k: $EXPLORE_K
     neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
+${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local

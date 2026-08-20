@@ -11,7 +11,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 BOX=80 STEPS=300 GAP=50 CHUNK=4194304
 STORE=${STORE:-$HERE/store}
-LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false
+LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB=
 usage() {
   cat <<USAGE
 usage: $0 [options]
@@ -24,6 +24,8 @@ usage: $0 [options]
   --explore K      exploration with K candidates (implies --learn)
   --threshold X    cost error above which exploration fires (default 0.5; 0 = every chunk)
   --best           best mode: exhaustive, ratio-only ranking, ~32x slower
+  --static LIB     pin every chunk to LIB and bypass NeuroPress entirely
+                   (e.g. nvcomp-zstd) -- the fixed-codec control
 Modes: default is inference (predict and store, nothing measured back).
 USAGE
 }
@@ -38,11 +40,12 @@ while [ $# -gt 0 ]; do
     --explore) EXPLORE_K=$2; shift 2;;
     --threshold) THRESH=$2; shift 2;;
     --best) BEST=true; shift;;
+    --static) STATIC_LIB=$2; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "unknown option: $1" >&2; usage; exit 2;;
   esac
 done
-export BOX STEPS GAP CHUNK STORE LEARN EXPLORE_K THRESH BEST
+export BOX STEPS GAP CHUNK STORE LEARN EXPLORE_K THRESH BEST STATIC_LIB
 
 # A fresh store every write: a stale tier from an earlier run would let the
 # reader "pass" on data this run never produced.
@@ -55,7 +58,11 @@ FRAMES=$(( STEPS / GAP + 1 ))
 MIB=$(( NATOMS * 3 * 8 * 3 * FRAMES / 1048576 ))
 echo "LAMMPS -> HDF5 -> Clio -> NeuroPress"
 echo "  atoms=$NATOMS frames=$FRAMES  ~${MIB} MiB across 3 fields (float64)"
-echo "  chunk=$CHUNK  learn=$NP_LEARN explore=$NP_EXPLORE k=$EXPLORE_K best=$BEST"
+if [ -n "$STATIC_LIB" ]; then
+  echo "  chunk=$CHUNK  STATIC codec=$STATIC_LIB (NeuroPress bypassed)"
+else
+  echo "  chunk=$CHUNK  learn=$NP_LEARN explore=$NP_EXPLORE k=$EXPLORE_K best=$BEST"
+fi
 echo "  store=$STORE"
 
 # -log into the store: LAMMPS writes log.lammps into the working directory by

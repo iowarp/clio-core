@@ -422,6 +422,32 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
   }
 
+  // Static codec: the control condition. It overrides every selection knob,
+  // so force them off HERE rather than trusting the config to be internally
+  // consistent -- a run that reported "static nvcomp-zstd" while exploration
+  // silently replaced the codec on some chunks would be a worthless control.
+  // Symmetric with the best-mode block below: both normalise the config once
+  // so the per-chunk path reads plain fields.
+  if (!config_.neuropress_static_lib_.empty()) {
+    const int wire =
+        ctp::CompressionFactory::WireIdForName(config_.neuropress_static_lib_);
+    const std::string resolved = ctp::CompressionFactory::NameForWireId(wire);
+    config_.neuropress_online_learning_enabled_ = false;
+    config_.neuropress_exploration_enabled_ = false;
+    config_.neuropress_best_mode_ = false;
+    HLOG(kWarning,
+         "Static codec '{}' (resolved '{}', wire {}) is ON for pool '{}': "
+         "every chunk uses this library and NeuroPress selection, learning "
+         "and exploration are all disabled.",
+         config_.neuropress_static_lib_, resolved, wire, pool_name_);
+    if (resolved != config_.neuropress_static_lib_) {
+      HLOG(kWarning,
+           "  '{}' is not a registered library; it fell back to '{}'. Check "
+           "the name against CompressionFactory's registry.",
+           config_.neuropress_static_lib_, resolved);
+    }
+  }
+
   // Best mode brings its own exploration settings rather than requiring the
   // caller to assemble them, the same way gpucompress_set_best_mode() turns
   // exploration on and pins the K override to 31 rather than leaving either
@@ -1442,10 +1468,29 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool ranked_by_cost = false;
     double sel_entropy = 0.0, sel_mad = 0.0, sel_second_deriv = 0.0;
     bool neuropress_gpu_failed = false;
-    auto stats =
-        EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
-                            &sel_entropy, &sel_mad, &sel_second_deriv,
-                            &neuropress_gpu_failed);
+    std::vector<CompressionStats> stats;
+    if (!config_.neuropress_static_lib_.empty()) {
+      // Control condition: one candidate, no inference. Deliberately does
+      // NOT call EstCompressionStats -- running the model and discarding its
+      // answer would put NN latency into a measurement whose entire point is
+      // to exclude it.
+      CompressionStats fixed{};
+      fixed.compress_lib_ =
+          ctp::CompressionFactory::WireIdForName(config_.neuropress_static_lib_);
+      // Preset 2 (BALANCED) with no byte shuffle. The GPU codecs are
+      // single_mode -- preset is ignored and the id always uses slot 2 -- and
+      // upstream's non-AUTO algorithms apply no shuffle, so a shuffled
+      // control would not be comparing the same transform.
+      fixed.compress_preset_ = static_cast<int>(PackPreset(2, 0));
+      fixed.compression_ratio_ = 1.0;
+      stats.push_back(fixed);
+      ranked_by_cost = true;  // take stats.front() verbatim below
+    } else {
+      stats =
+          EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
+                              &sel_entropy, &sel_mad, &sel_second_deriv,
+                              &neuropress_gpu_failed);
+    }
 
     if (neuropress_gpu_failed) {
       // NeuroPress was asked for, the chunk was on the device, and its GPU
