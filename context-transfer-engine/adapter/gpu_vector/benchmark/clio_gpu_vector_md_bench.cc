@@ -2235,6 +2235,14 @@ int main(int argc, char **argv) {
                                                         vw, sv);
     });
     ctp::GpuApi::Synchronize();
+    // MD_SETTLE_MS=N waits before reading the backing store. If the
+    // out-of-core mismatches vanish with a wait, the final AwaitFlush is
+    // returning before its puts are durable ("landed but unsettled") and
+    // the host is simply reading the store too early -- which would make
+    // this a VERIFICATION artefact, not lost data.
+    if (const char *ms = std::getenv("MD_SETTLE_MS")) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(ms)));
+    }
     std::vector<float> gx_out(g.nelems), gv_out(g.nelems);
     vx.Download(gx_out.data(), g.nelems);
     vv.Download(gv_out.data(), g.nelems);
