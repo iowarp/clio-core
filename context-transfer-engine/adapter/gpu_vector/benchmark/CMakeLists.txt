@@ -201,6 +201,12 @@ if(CLIO_CORE_ENABLE_CUDA)
     # LAMMPS tree, where the same ceiling is applied by an LLVM pass.
     target_compile_options(clio_gpu_vector_md_bench PRIVATE
         -Xcuda-ptxas --maxrregcount=64)
+    # MD_DEVTRACE=ON turns on the fault path's own device printf tracing
+    # (CLIO_YCORO_DEVTRACE in device_vector.h) for debugging wedges.
+    if(MD_DEVTRACE)
+      target_compile_definitions(clio_gpu_vector_md_bench PRIVATE
+          CLIO_YCORO_DEVTRACE)
+    endif()
 
     add_cuda_executable(clio_gpu_vector_access_bench FALSE
         clio_gpu_vector_access_bench.cc
