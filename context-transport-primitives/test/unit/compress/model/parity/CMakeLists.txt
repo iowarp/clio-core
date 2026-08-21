@@ -116,6 +116,27 @@ clio_add_neuropress_parity_test(neuropress_dataset_parity_exec
     ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_dataset_parity.cu
     ctp_neuropress_dataset_parity)
 
+# Model outputs 4-7 (rmse, max_error, mae, ssim): newly ported into Clio, so
+# checked against upstream's own per-config values rather than against its
+# source. Head 7 inverts differently from 4-6 and is where a plausible-looking
+# port goes wrong.
+clio_add_neuropress_parity_test(neuropress_full_outputs_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_full_outputs_parity.cu
+    ctp_neuropress_full_outputs_parity)
+
+# Real simulation output as one of its data regimes: synthetic ramps and noise
+# do not have the spatial structure a reaction-diffusion field does, and the
+# statistics that feed the model are exactly the quantities that structure
+# changes. Reuses the Gray-Scott port the workload harness already builds.
+if(EXISTS ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/generator/grayscott/grayscott_sim.cu)
+    target_sources(neuropress_full_outputs_parity_exec PRIVATE
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/generator/grayscott/grayscott_sim.cu)
+    target_include_directories(neuropress_full_outputs_parity_exec PRIVATE
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/generator/grayscott)
+    target_compile_definitions(neuropress_full_outputs_parity_exec PRIVATE
+        CLIO_HAVE_GRAYSCOTT=1)
+endif()
+
 # Per-flow SGD state: drives upstream's runNNSGDCtx on two CompContexts
 # against two Clio worker threads. Needs src/api on the include path for the
 # real CompContext layout, and a thread library for the Clio-side flows.

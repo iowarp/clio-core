@@ -322,6 +322,48 @@ CompressionPrediction NeuroPressNNPredictor::Predict(
   return batch.empty() ? CompressionPrediction() : batch.front();
 }
 
+bool NeuroPressNNPredictor::PredictBatchFull(
+    const std::vector<CompressionFeatures>& batch, FullOutputs* out) const {
+  if (out == nullptr || batch.empty()) return false;
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (!gpu_weights_) return false;
+
+  // Same input assembly as PredictBatch, including the lossless sentinel --
+  // asking the two paths different questions would make any comparison
+  // between them meaningless.
+  std::vector<float> raw_inputs(batch.size() * kInputDim);
+  for (size_t i = 0; i < batch.size(); ++i) {
+    auto x = FeaturesTo8Input(batch[i]);
+    std::copy(x.begin(), x.end(),
+              raw_inputs.begin() + static_cast<long>(i * kInputDim));
+  }
+
+  const size_t n = batch.size();
+  out->comp_time_ms.assign(n, 0.0f);
+  out->decomp_time_ms.assign(n, 0.0f);
+  out->ratio.assign(n, 0.0f);
+  out->psnr_db.assign(n, 0.0f);
+  out->rmse.assign(n, 0.0f);
+  out->max_error.assign(n, 0.0f);
+  out->mae.assign(n, 0.0f);
+  out->ssim.assign(n, 0.0f);
+
+  std::lock_guard<std::mutex> lock(*model_mutex_);
+  if (!gpu::NeuroPressGpuInferBatchFull(
+          gpu_weights_.get(), raw_inputs.data(), static_cast<int>(n),
+          out->comp_time_ms.data(), out->decomp_time_ms.data(),
+          out->ratio.data(), out->psnr_db.data(), out->rmse.data(),
+          out->max_error.data(), out->mae.data(), out->ssim.data())) {
+    *out = FullOutputs{};
+    return false;
+  }
+  return true;
+#else
+  (void)batch;
+  return false;
+#endif
+}
+
 std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
     const std::vector<CompressionFeatures>& batch) {
   if (batch.empty()) {
@@ -403,7 +445,7 @@ std::vector<CompressionPrediction>
 NeuroPressNNPredictor::PredictBatchDeviceStats(
     const void* device_stats, const std::vector<CompressionFeatures>& batch,
     void* stream, const RankingWeights* weights, std::vector<int>* out_order,
-    double min_psnr, std::vector<double>* out_scores) {
+    double min_psnr, std::vector<double>* out_scores, FullOutputs* out_full) {
 #if CTP_ENABLE_NEUROPRESS_GPU
   // Same lock PredictBatch takes, for the same reason: TrainDecompHead()
   // downloads every parameter, edits two and uploads them all back, so an
@@ -494,18 +536,44 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
     }
   }
 
+  // Outputs 4-7, only when asked. Sized here so the pointers below are valid
+  // for the whole call; left empty (and null) otherwise, which is what tells
+  // the kernel to skip the transforms and the fetch to stop after output 3.
+  const size_t nb = batch.size();
+  if (out_full != nullptr) {
+    out_full->comp_time_ms.assign(nb, 0.0f);
+    out_full->decomp_time_ms.assign(nb, 0.0f);
+    out_full->ratio.assign(nb, 0.0f);
+    out_full->psnr_db.assign(nb, 0.0f);
+    out_full->rmse.assign(nb, 0.0f);
+    out_full->max_error.assign(nb, 0.0f);
+    out_full->mae.assign(nb, 0.0f);
+    out_full->ssim.assign(nb, 0.0f);
+  }
+  float *q_rmse = out_full ? out_full->rmse.data() : nullptr;
+  float *q_maxe = out_full ? out_full->max_error.data() : nullptr;
+  float *q_mae = out_full ? out_full->mae.data() : nullptr;
+  float *q_ssim = out_full ? out_full->ssim.data() : nullptr;
+
   if (!gpu::NeuroPressGpuInferBatchDeviceStats(
           gpu_weights_.get(), device_stats, action_ids.data(),
           static_cast<int>(batch.size()),
           static_cast<float>(batch[0].chunk_size_bytes),
           static_cast<float>(chunk_error_bound_for_kernel), stream,
           comp_time.data(), decomp_time.data(), ratio.data(), psnr.data(),
-          rank_ptr, order_ptr, scores_ptr)) {
+          rank_ptr, order_ptr, scores_ptr, q_rmse, q_maxe, q_mae, q_ssim)) {
+    if (out_full != nullptr) *out_full = FullOutputs{};
     if (out_order != nullptr) out_order->clear();
     if (out_scores != nullptr) out_scores->clear();
     // Same contract as PredictBatch: an empty vector, never a zero-filled
     // one that would read as a complete and pessimistic ranking.
     return {};
+  }
+  if (out_full != nullptr) {
+    out_full->comp_time_ms.assign(comp_time.begin(), comp_time.end());
+    out_full->decomp_time_ms.assign(decomp_time.begin(), decomp_time.end());
+    out_full->ratio.assign(ratio.begin(), ratio.end());
+    out_full->psnr_db.assign(psnr.begin(), psnr.end());
   }
 
   auto end_time = std::chrono::high_resolution_clock::now();

@@ -324,7 +324,13 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
 constexpr int kMaxCandidates = 32;
 
 /** ct, dt, ratio, psnr -- the four per-candidate outputs, packed in one buffer. */
-constexpr int kPredOutputs = 4;
+/* Eight, not four: upstream's device-resident entry point
+   (runNNFusedInferenceCtx) hands back rmse/max_error/mae/ssim alongside the
+   four the ranking uses, and Clio's could not. The extra 4*cap floats are the
+   cost of that parity -- 512 bytes at the 32-wide device path. The per-chunk
+   D2H is NOT doubled: the fetch copies only as far as the caller asked (see
+   FetchPredictionsSync), so a ranking-only call moves exactly what it did. */
+constexpr int kPredOutputs = 8;
 
 /**
  * decodeAction, in the kernel.
@@ -366,7 +372,14 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     float *s_h1, float *s_h2, float *s_h3, float *s_h4, float *s_y, int t,
     int cand, float *__restrict__ out_comp_time,
     float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
-    float *__restrict__ out_psnr) {
+    float *__restrict__ out_psnr,
+    /* Outputs 4-7. Optional: selection reads none of them (upstream's own
+       NN_INFER_OUTPUTS is 4, nn_weights.h:15), so a caller that only ranks
+       passes nullptr and the inverse transforms are never evaluated. */
+    float *__restrict__ out_rmse = nullptr,
+    float *__restrict__ out_max_error = nullptr,
+    float *__restrict__ out_mae = nullptr,
+    float *__restrict__ out_ssim = nullptr) {
   float sum = w->params[kOffB1 + t];
   for (int i = 0; i < kInputDim; ++i) sum += w->params[kOffW1 + t * kInputDim + i] * s_x[i];
   s_h1[t] = fmaxf(0.0f, sum);
@@ -414,6 +427,35 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     out_decomp_time[cand] = fmaxf(1.0f, decomp_time);
     out_ratio[cand] = fminf(100.0f, ratio);
     out_psnr[cand] = psnr;
+
+    // Outputs 4-7, upstream nn_gpu.cu:211-216 for the transforms and :223-226
+    // for the clamps. 4-6 are log1p-transformed like ratio/times; 7 is stored
+    // as -log(1-ssim), so it inverts with 1-exp(-x) and NOT with expm1f.
+    //
+    // The clamps are NOT optional and were missed on the first pass here: an
+    // untrained head readily produces a small negative expm1f result, and
+    // upstream floors all three error metrics at 0 (and ssim into [0,1]).
+    // Without them Clio reported values like rmse = -1.4e-4, which is not a
+    // rounding difference from upstream's 0 but a physically meaningless
+    // number. The differential test against upstream's own per-config output
+    // is what caught it.
+    if (out_rmse != nullptr) {
+      const float v = expm1f(s_y[4] * w->y_stds[4] + w->y_means[4]);
+      out_rmse[cand] = fmaxf(0.0f, fminf(v, 1e6f));
+    }
+    if (out_max_error != nullptr) {
+      const float v = expm1f(s_y[5] * w->y_stds[5] + w->y_means[5]);
+      out_max_error[cand] = fmaxf(0.0f, fminf(v, 1e6f));
+    }
+    if (out_mae != nullptr) {
+      const float v = expm1f(s_y[6] * w->y_stds[6] + w->y_means[6]);
+      out_mae[cand] = fmaxf(0.0f, fminf(v, 1e6f));
+    }
+    if (out_ssim != nullptr) {
+      const float ssim_nlog = s_y[7] * w->y_stds[7] + w->y_means[7];
+      const float v = 1.0f - expf(-fmaxf(0.0f, ssim_nlog));
+      out_ssim[cand] = fmaxf(0.0f, fminf(v, 1.0f));
+    }
   }
 }
 
@@ -444,6 +486,43 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
 }
 
 /**
+ * All eight outputs, for reporting and for differential testing against
+ * upstream. Selection never calls this -- it needs only the first four, and
+ * upstream says so itself (NN_INFER_OUTPUTS = 4, nn_weights.h:15). Kept as a
+ * separate kernel rather than as optional arguments on InferKernel so the
+ * ranking path's register footprint and launch signature are untouched.
+ */
+__global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
+                                const float *__restrict__ raw_inputs,
+                                float *__restrict__ out_comp_time,
+                                float *__restrict__ out_decomp_time,
+                                float *__restrict__ out_ratio,
+                                float *__restrict__ out_psnr,
+                                float *__restrict__ out_rmse,
+                                float *__restrict__ out_max_error,
+                                float *__restrict__ out_mae,
+                                float *__restrict__ out_ssim) {
+  int cand = blockIdx.x;
+  int t = threadIdx.x;
+
+  __shared__ float s_x[kInputDim];
+  __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
+      s_h4[kHiddenDim];
+  __shared__ float s_y[kOutputDim];
+
+  if (t < kInputDim) {
+    float std_val = w->x_stds[t];
+    if (std_val < 1e-8f) std_val = 1e-8f;
+    s_x[t] = (raw_inputs[cand * kInputDim + t] - w->x_means[t]) / std_val;
+  }
+  __syncthreads();
+
+  NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
+                          out_comp_time, out_decomp_time, out_ratio, out_psnr,
+                          out_rmse, out_max_error, out_mae, out_ssim);
+}
+
+/**
  * Device-stats entry point: reads the three data features straight out of
  * device memory instead of receiving them in a host-built matrix.
  *
@@ -462,7 +541,18 @@ __global__ void InferKernelDeviceStats(
     const ctp::DeviceFeatureStats *__restrict__ stats, float chunk_size_bytes,
     float error_bound, float *__restrict__ out_comp_time,
     float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
-    float *__restrict__ out_psnr) {
+    float *__restrict__ out_psnr,
+    /* Outputs 4-7. Null on the ranking path, which reads none of them, so the
+       transforms are not evaluated there. Present so that a caller wanting the
+       data-quality predictions can have them WITHOUT leaving the device: this
+       is the path whose inputs are built in-kernel from AutoStatsGPU, and
+       routing such a caller through the host-matrix entry point instead would
+       stage the chunk's statistics through host memory to get numbers the GPU
+       already had. */
+    float *__restrict__ out_rmse = nullptr,
+    float *__restrict__ out_max_error = nullptr,
+    float *__restrict__ out_mae = nullptr,
+    float *__restrict__ out_ssim = nullptr) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -516,7 +606,8 @@ __global__ void InferKernelDeviceStats(
   __syncthreads();
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
-                          out_comp_time, out_decomp_time, out_ratio, out_psnr);
+                          out_comp_time, out_decomp_time, out_ratio, out_psnr,
+                          out_rmse, out_max_error, out_mae, out_ssim);
 }
 
 /**
@@ -852,11 +943,15 @@ struct InferScratch {
   void *d_out = nullptr;
   double *d_scores = nullptr;  // [cap] ranked scores, best first
   int *d_order = nullptr;      // [cap] ranked slots, same order
-  float *d_pred = nullptr;     // [4][cap]
+  float *d_pred = nullptr;     // [8][cap]
   float *d_ct = nullptr;       // = d_pred + 0*cap
   float *d_dt = nullptr;       // = d_pred + 1*cap
   float *d_r = nullptr;        // = d_pred + 2*cap
   float *d_p = nullptr;        // = d_pred + 3*cap
+  float *d_rmse = nullptr;     // = d_pred + 4*cap
+  float *d_maxe = nullptr;     // = d_pred + 5*cap
+  float *d_mae = nullptr;      // = d_pred + 6*cap
+  float *d_ssim = nullptr;     // = d_pred + 7*cap
 
   // Host landing buffer for that single copy, scattered to the caller's
   // separate arrays after the stream wait. Per-thread and grown with cap, so a
@@ -882,6 +977,7 @@ bool EnsureInferCapacity(InferScratch &s, int n) {
   s.d_scores = nullptr;
   s.d_order = nullptr;
   s.d_pred = s.d_ct = s.d_dt = s.d_r = s.d_p = nullptr;
+  s.d_rmse = s.d_maxe = s.d_mae = s.d_ssim = nullptr;
   s.cap = 0;
   const size_t nn = static_cast<size_t>(n);
   if (cudaMalloc(&s.d_raw, sizeof(float) * nn * kInputDim) != cudaSuccess ||
@@ -900,6 +996,10 @@ bool EnsureInferCapacity(InferScratch &s, int n) {
   s.d_dt = s.d_pred + n;
   s.d_r = s.d_pred + 2 * n;
   s.d_p = s.d_pred + 3 * n;
+  s.d_rmse = s.d_pred + 4 * n;
+  s.d_maxe = s.d_pred + 5 * n;
+  s.d_mae = s.d_pred + 6 * n;
+  s.d_ssim = s.d_pred + 7 * n;
   s.host_out.resize(PackedOutBytes(nn));
   s.cap = n;
   return true;
@@ -921,7 +1021,10 @@ bool EnsureInferCapacity(InferScratch &s, int n) {
 bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
                           float *out_ct, float *out_dt, float *out_r,
                           float *out_p, int *out_order = nullptr,
-                          double *out_scores = nullptr) {
+                          double *out_scores = nullptr,
+                          float *out_rmse = nullptr,
+                          float *out_maxe = nullptr, float *out_mae = nullptr,
+                          float *out_ssim = nullptr) {
   // STRIDES ARE THE ALLOCATION'S, NOT THE CALL'S.
   //
   // EnsureInferCapacity lays d_out out by `cap`, and cap can exceed this
@@ -943,8 +1046,16 @@ bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
   // capacity because the regions are cap-strided; it is still ONE transfer,
   // which is the property being bought here.
   const bool want_rank = (out_order != nullptr);
+  // Outputs 4-7 are the tail of the predictions region, so a caller that does
+  // not want them simply stops the copy earlier. This is what keeps widening
+  // the layout free for the ranking path: same bytes on the wire as before.
+  const bool want_quality = (out_rmse != nullptr || out_maxe != nullptr ||
+                             out_mae != nullptr || out_ssim != nullptr);
   const size_t off = want_rank ? 0 : pred_off;
-  const size_t len = PackedOutBytes(cap) - off;
+  const size_t end =
+      want_quality ? PackedOutBytes(cap)
+                   : pred_off + sizeof(float) * cap * 4;
+  const size_t len = end - off;
   auto *dst = s.host_out.data() + off;
   auto *src = static_cast<const unsigned char *>(s.d_out) + off;
 
@@ -966,6 +1077,10 @@ bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
   std::memcpy(out_dt, p + stride, want);
   std::memcpy(out_r, p + 2 * stride, want);
   std::memcpy(out_p, p + 3 * stride, want);
+  if (out_rmse != nullptr) std::memcpy(out_rmse, p + 4 * stride, want);
+  if (out_maxe != nullptr) std::memcpy(out_maxe, p + 5 * stride, want);
+  if (out_mae != nullptr) std::memcpy(out_mae, p + 6 * stride, want);
+  if (out_ssim != nullptr) std::memcpy(out_ssim, p + 7 * stride, want);
   return true;
 }
 
@@ -1015,7 +1130,8 @@ bool NeuroPressGpuInferBatchDeviceStats(
     const int *action_ids, int num_candidates, float chunk_size_bytes,
     float error_bound, void *stream, float *out_comp_time_ms,
     float *out_decomp_time_ms, float *out_ratio, float *out_psnr_db,
-    const GpuRankParams *rank, int *out_order, double *out_scores) {
+    const GpuRankParams *rank, int *out_order, double *out_scores,
+    float *out_rmse, float *out_max_error, float *out_mae, float *out_ssim) {
   if (!w || !device_stats || !action_ids || num_candidates <= 0 ||
       num_candidates > kMaxCandidates) {
     return false;
@@ -1063,7 +1179,11 @@ bool NeuroPressGpuInferBatchDeviceStats(
     InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_actions,
         static_cast<const ctp::DeviceFeatureStats *>(device_stats),
-        chunk_size_bytes, error_bound, s.d_ct, s.d_dt, s.d_r, s.d_p);
+        chunk_size_bytes, error_bound, s.d_ct, s.d_dt, s.d_r, s.d_p,
+        /* Only ask the kernel for outputs 4-7 when the caller wants them; the
+           transforms are skipped on a null pointer, so ranking pays nothing. */
+        out_rmse ? s.d_rmse : nullptr, out_max_error ? s.d_maxe : nullptr,
+        out_mae ? s.d_mae : nullptr, out_ssim ? s.d_ssim : nullptr);
     ok = cudaGetLastError() == cudaSuccess;
   }
   // Cost model and ordering, still on the device and still on this stream --
@@ -1087,8 +1207,90 @@ bool NeuroPressGpuInferBatchDeviceStats(
   if (ok) {
     ok = FetchPredictionsSync(s, num_candidates, st, out_comp_time_ms,
                               out_decomp_time_ms, out_ratio, out_psnr_db,
-                              ranked ? out_order : nullptr, out_scores);
+                              ranked ? out_order : nullptr, out_scores,
+                              out_rmse, out_max_error, out_mae, out_ssim);
   }
+  return ok;
+}
+
+/**
+ * Persistent scratch for the all-outputs path, mirroring InferScratch. Held
+ * per thread and grown rather than reallocated, so a repeated caller does no
+ * allocation in the steady state.
+ */
+struct FullScratch {
+  float *d_raw = nullptr;
+  float *d_out[8] = {nullptr};
+  int cap = 0;
+};
+
+FullScratch &Full() {
+  static thread_local FullScratch s;
+  return s;
+}
+
+bool EnsureFullCapacity(FullScratch &s, int n) {
+  if (n <= s.cap) return true;
+  cudaFree(s.d_raw);
+  for (int i = 0; i < 8; ++i) cudaFree(s.d_out[i]);
+  s.d_raw = nullptr;
+  for (int i = 0; i < 8; ++i) s.d_out[i] = nullptr;
+  s.cap = 0;
+
+  const size_t nn = static_cast<size_t>(n);
+  if (cudaMalloc(&s.d_raw, sizeof(float) * nn * kInputDim) != cudaSuccess) {
+    return false;
+  }
+  for (int i = 0; i < 8; ++i) {
+    if (cudaMalloc(&s.d_out[i], sizeof(float) * nn) != cudaSuccess) return false;
+  }
+  s.cap = n;
+  return true;
+}
+
+bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
+                                 const float *raw_inputs, int num_candidates,
+                                 float *out_comp_time_ms,
+                                 float *out_decomp_time_ms, float *out_ratio,
+                                 float *out_psnr_db, float *out_rmse,
+                                 float *out_max_error, float *out_mae,
+                                 float *out_ssim) {
+  if (!w || !raw_inputs || num_candidates <= 0) return false;
+
+  // Same discipline as the ranking path: the per-thread persistent stream and
+  // a scratch buffer that is grown, not reallocated. An earlier version of
+  // this function used nine cudaMalloc/cudaFree per call and a
+  // cudaDeviceSynchronize -- which stalls every other worker's kernels, not
+  // just this call's. That pattern was removed from the ranking path for
+  // exactly that reason (see NeuroPressGpuInferBatch) and must not come back
+  // in through a side entrance.
+  const size_t n = static_cast<size_t>(num_candidates);
+  const size_t out_bytes = sizeof(float) * n;
+  const size_t in_bytes = out_bytes * kInputDim;
+
+  FullScratch &s = Full();
+  if (!EnsureFullCapacity(s, num_candidates)) return false;
+  cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
+
+  bool ok = cudaMemcpyAsync(s.d_raw, raw_inputs, in_bytes,
+                            cudaMemcpyHostToDevice, st) == cudaSuccess;
+  if (ok) {
+    InferKernelFull<<<num_candidates, kHiddenDim, 0, st>>>(
+        w, s.d_raw, s.d_out[0], s.d_out[1], s.d_out[2], s.d_out[3],
+        s.d_out[4], s.d_out[5], s.d_out[6], s.d_out[7]);
+    ok = cudaGetLastError() == cudaSuccess;
+  }
+
+  float *host[8] = {out_comp_time_ms, out_decomp_time_ms, out_ratio,
+                    out_psnr_db,      out_rmse,           out_max_error,
+                    out_mae,          out_ssim};
+  for (int i = 0; ok && i < 8; ++i) {
+    if (host[i] == nullptr) continue;
+    ok = cudaMemcpyAsync(host[i], s.d_out[i], out_bytes,
+                         cudaMemcpyDeviceToHost, st) == cudaSuccess;
+  }
+  // One wait on OUR stream, not the device.
+  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
   return ok;
 }
 

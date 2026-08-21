@@ -176,6 +176,30 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    * Rank() itself GPU-batched for free. On the CPU fallback this is
    * equivalent to looping Predict().
    */
+  /**
+   * @brief All EIGHT model outputs for a batch.
+   *
+   * PredictBatch returns the four that selection uses. The network also
+   * predicts data-quality outputs 4-7 -- rmse, max_error, mae and ssim -- which
+   * upstream inverts and reports (nn_gpu.cu:211-216) and which ranking ignores
+   * on both sides (upstream's own NN_INFER_OUTPUTS is 4, nn_weights.h:15).
+   *
+   * Empty vectors on failure, matching PredictBatch's contract: a zero-filled
+   * result would be a complete, plausible-looking answer built from nothing.
+   */
+  struct FullOutputs {
+    std::vector<float> comp_time_ms;
+    std::vector<float> decomp_time_ms;
+    std::vector<float> ratio;
+    std::vector<float> psnr_db;
+    std::vector<float> rmse;
+    std::vector<float> max_error;
+    std::vector<float> mae;
+    std::vector<float> ssim;  /**< in [0,1]; stored as -log(1-ssim) */
+  };
+  bool PredictBatchFull(const std::vector<CompressionFeatures>& batch,
+                        FullOutputs* out) const;
+
   std::vector<CompressionPrediction> PredictBatch(
       const std::vector<CompressionFeatures>& batch) override;
 
@@ -209,7 +233,14 @@ class NeuroPressNNPredictor : public CompressionPredictor {
       const std::vector<CompressionFeatures>& batch, void* stream,
       const RankingWeights* weights = nullptr,
       std::vector<int>* out_order = nullptr, double min_psnr = 0.0,
-      std::vector<double>* out_scores = nullptr);
+      std::vector<double>* out_scores = nullptr,
+      /* Optional: also return the data-quality heads (outputs 4-7). Upstream's
+         device-resident call hands these back beside the four the ranking uses
+         (runNNFusedInferenceCtx); without this parameter Clio's device path
+         could not, and a caller wanting them had to route the chunk's
+         statistics through host memory to reach PredictBatchFull. Null on the
+         ranking path, which then skips the transforms and shortens the copy. */
+      FullOutputs* out_full = nullptr);
 
   /**
    * @brief Set the online-SGD learning rate.

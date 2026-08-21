@@ -81,6 +81,29 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
  *   NeuroPress returns -1 here and its caller reports
  *   GPUCOMPRESS_ERROR_NN_NOT_LOADED (nn_gpu.cu).
  */
+/**
+ * @brief All EIGHT model outputs for a host-built input matrix.
+ *
+ * Selection uses only the first four, and upstream says so itself
+ * (NN_INFER_OUTPUTS = 4, nn_weights.h:15) -- outputs 4-7 are rmse, max_error,
+ * mae and ssim, which upstream computes for reporting
+ * (nn_gpu.cu:211-216) and Clio previously did not invert at all.
+ *
+ * Any `out_*` may be null. Note output 7: ssim is stored by the model as
+ * -log(1-ssim) and inverts with `1 - exp(-max(0,x))`, NOT with expm1f like
+ * the other three.
+ *
+ * Not on the ranking path: allocates per call. For reporting and for the
+ * differential test against upstream.
+ */
+bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
+                                 const float *raw_inputs, int num_candidates,
+                                 float *out_comp_time_ms,
+                                 float *out_decomp_time_ms, float *out_ratio,
+                                 float *out_psnr_db, float *out_rmse,
+                                 float *out_max_error, float *out_mae,
+                                 float *out_ssim);
+
 bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
                              int num_candidates, float *out_comp_time_ms,
                              float *out_decomp_time_ms, float *out_ratio,
@@ -149,7 +172,14 @@ bool NeuroPressGpuInferBatchDeviceStats(
     int num_candidates, float chunk_size_bytes, float error_bound,
     void *stream, float *out_comp_time_ms, float *out_decomp_time_ms,
     float *out_ratio, float *out_psnr_db, const GpuRankParams *rank = nullptr,
-    int *out_order = nullptr, double *out_scores = nullptr);
+    int *out_order = nullptr, double *out_scores = nullptr,
+    /* Outputs 4-7, matching upstream's device-resident entry point
+       (runNNFusedInferenceCtx returns rmse/max_error/mae/ssim beside the four
+       the ranking uses). Null on the ranking path: the transforms are skipped
+       and the D2H copy stops after output 3, so ranking moves exactly the
+       bytes it did before these existed. */
+    float *out_rmse = nullptr, float *out_max_error = nullptr,
+    float *out_mae = nullptr, float *out_ssim = nullptr);
 
 /**
  * @brief One deferred decompression-time observation.
