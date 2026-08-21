@@ -92,6 +92,15 @@ __device__ unsigned long long g_blk_last[64];
  *  validates the bound in configuration terms before any run. */
 static constexpr int kMaxNlGuards = 4;
 
+/**
+ * Worst-case x-span guards a force chunk holds at once: three z planes, each
+ * up to two y ranges when the stencil crosses the y wrap, each range up to
+ * two guards when it straddles a page boundary. Reserved up front because
+ * the true count is not known until the spans are computed, and reserving
+ * after the first hold is exactly the deadlock admission exists to prevent.
+ */
+static constexpr u32 kSpanGuards = 12;
+
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_MD_CORO 1
 #endif
@@ -717,6 +726,25 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // The stencil rows for the whole chunk: [y0-1, ylast+1] mod nb at
     // each of the three z planes, as one contiguous run (two when the
     // range crosses the y wrap).
+    //
+    // ADMITTED BEFORE THE FIRST HOLD. These span guards stay alive for the
+    // whole chunk, so without admission enough blocks pin the entire table
+    // between them and no claim can succeed -- measured as 48 of 48 slots
+    // pinned at a failing claim, and as a 32-slot cache that wedges at 64
+    // blocks but runs at 32. Waiting here costs nothing held; waiting after
+    // the first hold is what deadlocks.
+    // How many spans this chunk will actually hold. The y range
+    // [y0-1, ylast+1] splits in two only when it crosses the wrap, and the
+    // split depends solely on (y0, ylast, nb) -- the same for all three z
+    // planes. So the count is pure geometry, known BEFORE any hold, and
+    // reserving it beats reserving the worst case: at 48 slots the blanket
+    // 12 admitted only 4 of 64 blocks and cost 124 ms/step against 43.
+    const u32 nyr = (static_cast<int>(y0) - 1 < 0 ||
+                     static_cast<int>(ylast) + 1 > static_cast<int>(nb) - 1)
+                        ? 2u : 1u;
+    const u32 span_guards = 3u * nyr * 2u;   // 3 z planes, <=2 guards/span
+    if (x.AdmissionOn()) co_await x.EnterHoldSet(span_guards);
+    {   // guards die at the close of this scope, before ExitHoldSet
     gv::Held<float> hg[6][2];
     u64 srun[6];
     const float *sp0[6], *sp1[6];
@@ -762,6 +790,14 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // and only 9 entries, so thread 0 resolves it once per row.
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
+    // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
+    // Every paged vector needs it, not just x -- f and nl have their own
+    // tables and can exhaust them exactly the same way. Tightening only x's
+    // reservation re-wedged a 32-slot run precisely because the blanket
+    // reservation had been throttling f/nl concurrency by accident. A fixed
+    // acquisition order is what keeps the nesting (x held while waiting for
+    // f) from forming a cycle.
+    if (f.AdmissionOn()) co_await f.EnterHoldSet(2);
     gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
     gv::Held<float> hf1;
     const u64 frun0 = hf0.run();
@@ -781,6 +817,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     const int *np[kMaxNlGuards];
     u64 gstart[kMaxNlGuards], glen[kMaxNlGuards];
     u32 nguards = 0;
+    if (nl.AdmissionOn()) co_await nl.EnterHoldSet(kMaxNlGuards);
     {
       const u64 nb0 = row * rowlist;
       u64 off = 0;
@@ -885,7 +922,16 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
       atomicAdd(&g_md_cyc[5], 1ull);
     }
+    // Both reservations released here, after every f and nl guard of this
+    // row has been destroyed.
+    nl.ExitHoldSet(kMaxNlGuards);
+    f.ExitHoldSet(2);
     }   // per-row loop
+    // Every span guard above is dead here (the chunk body scope ends with
+    // this brace), so the reservation is given back exactly once per
+    // EnterHoldSet. The only chunk-level `continue` is above the Enter.
+    }
+    x.ExitHoldSet(span_guards);
   }     // per-chunk loop
   if (eflag) {
     const double vals[3] = {pe, w, npairs};

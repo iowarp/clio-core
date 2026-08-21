@@ -1044,7 +1044,30 @@ class Vector {
     }
 #endif
 
+    // Admission counter for hold sets (see VecHeader::hold_admits_). One
+    // u32 for the whole vector; the cap is the table's slot count, so the
+    // slots blocks have collectively reserved can never exceed the slots
+    // that exist.
+    // OPT-IN (CLIO_GV_ADMIT=1). Admission provably converts the small-cache
+    // livelock into a slow-but-correct run -- a 32-slot/64-block config that
+    // wedged indefinitely completes with it -- but as currently sized it
+    // reserves a chunk's WORST-CASE guard count, which admits only a few of
+    // 64 blocks and costs 2.5-3x (48 slots: 43 ms/step without, 112-124
+    // with). Until the reservation is sized from the true concurrent hold
+    // set rather than a bound, paying that on every run is the wrong
+    // default. A null counter makes Enter/ExitHoldSet no-ops.
+    void *admits = nullptr;
+    if (std::getenv("CLIO_GV_ADMIT") != nullptr) {
+      admits = ctp::GpuApi::Malloc<void>(sizeof(unsigned int));
+      if (admits == nullptr) {
+        throw std::runtime_error("gpu_vector: admission counter alloc failed");
+      }
+      ctp::GpuApi::Memset(admits, 0, sizeof(unsigned int));
+    }
+
     VecHeader v;   // filled here, then uploaded; the view only points at it
+    v.hold_admits_ = static_cast<unsigned int *>(admits);
+    v.hold_admit_cap_ = pages_per_block_;
     v.xfer_cnt_ = static_cast<unsigned int *>(xfers);
     v.block_locks_ = static_cast<int *>(locks);
     v.task_seq_ = static_cast<unsigned long long *>(seq);
@@ -1202,6 +1225,10 @@ class Vector {
     }
     if (st.hdr.task_seq_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.task_seq_);
+    }
+    if (st.hdr.hold_admits_ != nullptr) {
+      ctp::GpuApi::Free(st.hdr.hold_admits_);
+      st.hdr.hold_admits_ = nullptr;
     }
     if (st.hdr.block_locks_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.block_locks_);

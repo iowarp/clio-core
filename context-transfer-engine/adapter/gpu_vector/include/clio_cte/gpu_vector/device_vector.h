@@ -133,6 +133,23 @@ struct VecHeader {
   MultiBatch *multi_ = nullptr;
   clio::run::u32 multi_per_block_ = 0;
   int *block_locks_ = nullptr;
+  /**
+   * ADMISSION CONTROL against the hold-while-waiting livelock.
+   *
+   * A block that parks inside a multi-page hold keeps its slots pinned, so
+   * with enough blocks in flight every slot in the table is spoken for and
+   * no claim can ever succeed -- measured directly as "48 of 48 slots
+   * pinned" at a failing claim, and confirmed by the fact that the same
+   * 32-slot cache that wedges at 64 blocks runs fine at 32.
+   *
+   * `hold_admits_` counts slots RESERVED by blocks currently inside a hold
+   * set; a block may not begin one until its reservation fits under
+   * `hold_admit_cap_`. Total reservations therefore never exceed the slots
+   * that exist, so every admitted block can complete its working set and
+   * release -- progress is structural rather than a matter of luck.
+   */
+  unsigned int *hold_admits_ = nullptr;
+  clio::run::u32 hold_admit_cap_ = 0;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
   unsigned long long *stat_evicts_ = nullptr;   // slots reclaimed
@@ -1933,6 +1950,64 @@ class DeviceVector {
    * started by FlushAsync on this block's table has completed. Reaps
    * completed puts as it waits. Block-collective.
    */
+  /**
+   * Is admission control armed on this vector?
+   *
+   * Call sites MUST test this before `co_await EnterHoldSet(...)`. An
+   * early-returning coroutine is not free: awaiting one still builds a frame
+   * on the yield stack and costs a __syncthreads, and at three per row that
+   * measured 110 ms/step against 43 with the awaits skipped -- i.e. the
+   * disabled path cost 2.5x all by itself.
+   */
+  CTP_GPU_FUN bool AdmissionOn() const { return h_->hold_admits_ != nullptr; }
+
+  /** Reserve `n` slots for this block's hold set, or fail without waiting. */
+  CTP_GPU_FUN bool TryAdmit(clio::run::u32 n) {
+    unsigned int *a = h_->hold_admits_;
+    clio::run::u32 cur = *(volatile unsigned int *) a;
+    while (cur + n <= h_->hold_admit_cap_) {
+      const clio::run::u32 old = atomicCAS(a, cur, cur + n);
+      if (old == cur) return true;
+      cur = old;
+    }
+    return false;
+  }
+
+  /**
+   * BASIC: `co_await vec.EnterHoldSet(n)` -- declare that this block is
+   * about to hold up to `n` pages AT ONCE, and wait until that many slots
+   * can be reserved for it. Pair with ExitHoldSet(n) once the guards die.
+   *
+   * Waiting happens while holding NOTHING, which is the whole point: a
+   * block that cannot be admitted parks without pinning anything, so it
+   * cannot contribute to the exhaustion it is waiting on.
+   *
+   * Block-collective. `n` is clamped to the cap so a single block is always
+   * admissible -- an unclamped request larger than the table would wait
+   * forever for slots that cannot exist.
+   */
+  __device__ clio::run::gpu::YCoroTask EnterHoldSet(clio::run::u32 n) {
+    if (h_->hold_admits_ == nullptr || n == 0) {
+      __syncthreads();
+      co_return;
+    }
+    if (n > h_->hold_admit_cap_) n = h_->hold_admit_cap_;
+    // Only thread 0 reserves; the others vote false, so the OR-vote inside
+    // the macro carries thread 0's answer to the whole block and every
+    // thread leaves together.
+    CLIO_CO_YIELD_WHEN((void) 0,
+                       (threadIdx.x == 0) ? !TryAdmit(n) : false,
+                       AdmitWaitTag());
+  }
+
+  /** Release a hold set's reservation. Pairs with one EnterHoldSet(n). */
+  CTP_GPU_FUN void ExitHoldSet(clio::run::u32 n) {
+    if (h_->hold_admits_ == nullptr || n == 0) return;
+    if (n > h_->hold_admit_cap_) n = h_->hold_admit_cap_;
+    __syncthreads();   // every guard in the set is dead before we give slots back
+    if (threadIdx.x == 0) atomicSub(h_->hold_admits_, n);
+  }
+
   __device__ clio::run::gpu::YCoroTask AwaitFlush() {
     // Reap BEFORE the first vote, not only after a resume. A put that
     // completed before this call makes AnyFlushInFlight() false on the
@@ -2029,6 +2104,21 @@ class DeviceVector {
   }
 
   /** Same, for the first writeback still outstanding in this block. */
+  /**
+   * Admission waits with NO tag, i.e. tag 0 -- "always worth relaunching".
+   *
+   * A tag is polled by the host as `*tag != 0`, so the admission counter is
+   * exactly the wrong thing to point at: it is non-zero while the table is
+   * BUSY and zero when slots are free, so blocks were resumed while full
+   * and left parked once space appeared. That inversion deadlocked 48- and
+   * 40-slot runs that worked before admission existed. Tag 0 re-tries the
+   * reservation each round, which also lets the driver service fetches in
+   * between -- the reason a spin here would be fatal rather than merely
+   * wasteful (the yield driver exits the kernel to service a fault, so a
+   * block that never parks stops every fetch in the grid).
+   */
+  CTP_GPU_FUN clio::run::u64 AdmitWaitTag() const { return 0; }
+
   CTP_GPU_FUN clio::run::u64 FlushWaitTag() const {
     const Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
