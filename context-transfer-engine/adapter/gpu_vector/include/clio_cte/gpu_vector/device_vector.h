@@ -1887,7 +1887,19 @@ class DeviceVector {
    *  HoldPageCoro comment: a failed claim must not become a silent park). */
   CTP_GPU_FUN void RetryLostFetch(clio::run::u64 page_num) {
     if (threadIdx.x == 0 && Find(page_num) == nullptr) {
-      BeginFetch(page_num, /*is_prefetch=*/false);
+      if (!BeginFetch(page_num, /*is_prefetch=*/false)) {
+        // AND MAKE ROOM AGAIN. BeginFetch fails when the claim finds every
+        // candidate slot pinned, dirty or mid-transfer, and retrying it
+        // alone changes nothing: StartEvictionAsync runs ONCE, at the top
+        // of HoldPageCoro, so if its victim was taken by a sibling block
+        // before this block got there, no slot is ever freed again and the
+        // fault spins until the driver's round cap -- which used to be
+        // silent, so the kernel came back partially executed. Re-arming the
+        // eviction here is what the fault path's own contract says
+        // ("whoever needs room must arrange it"); it is a no-op when the
+        // page is already present or coming.
+        StartEvictionAsync(page_num);
+      }
     }
   }
 
