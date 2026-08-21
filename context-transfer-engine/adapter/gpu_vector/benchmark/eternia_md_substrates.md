@@ -71,6 +71,66 @@ Every configuration reproduces the same physics as the paged bench: PE/atom
 **bitwise** at 2 PEs while 891 atoms cross the slab boundary, which is the
 gate that actually exercises the migration path.
 
+## The family, and which variable each one changes
+
+Five benches now run the same melt deck with the same physics, layout,
+decomposition, list encoding and gates. Each changes exactly one thing, which
+is the only reason any comparison between them means anything.
+
+| bench | axis | what changes |
+|---|---|---|
+| `clio_gpu_vector_md_bench` | capacity | paged `gv::Vector` over the CTE tier stack |
+| `clio_md_bam_bench` | capacity | Verlet list behind BaM's GPU page cache over pinned host DRAM |
+| `clio_md_mpi_bench` | transport | two-sided, host-staged (D2H → MPI → H2D) |
+| `clio_md_nccl_bench` | transport | two-sided, GPU-resident (`ncclSend`/`ncclRecv`) |
+| `clio_md_nvshmem_bench` | transport | one-sided, in-kernel (`nvshmemx_getmem_block`) |
+
+Every one of them reproduces PE/atom −6.7733683 against stock's published
+−6.7733681 and a pair count of exactly 864000 against the host double
+reference. That agreement across five substrates is the evidence that the
+substrate is the only variable.
+
+### NCCL: the host bounce, priced
+
+MPI and NVSHMEM differ in *two* ways at once — two-sided vs one-sided, and
+host-staged vs device-resident — so neither can say which property costs
+what. NCCL is two-sided like MPI and device-resident like NVSHMEM, which
+splits the pair. At one rank with `--force-halo` both benches perform the
+identical self-exchange — 110 exchanges, 0.08 GB, 0.85 MB/step — and:
+
+| halo transport | halo time (100 steps) |
+|---|---|
+| MPI, host-staged | 18.8 ms |
+| NCCL, device pointers | **1.6 ms** |
+
+**11.8× for the same bytes**, with two-sidedness and volume held fixed. That
+is the host bounce and nothing else, measured on a single GPU.
+
+NCCL requires one GPU per rank (`ncclCommInitRank` rejects two ranks naming
+the same device), so unlike its siblings it cannot run multi-rank on a
+single-GPU host; it refuses with a message saying so rather than deadlocking.
+
+### BaM: resident works, out of core does not
+
+The list resident in BaM's cache passes every gate at 2.30 ms/step, against
+0.34–0.40 with the list in VRAM. Two defects in `external/bam` came out of
+it, both caught by the gates, neither fixed there (the module is shared):
+
+1. `host_read_page` copies a full page with **no clamp against the array
+   size**, so an array not ending on a page boundary reads past its pinned
+   allocation — silently when that lands in mapped memory, as an illegal
+   access when it does not. Worked around by rounding the backing array up.
+2. **Out of core it returns wrong data under concurrency.** Nothing excludes
+   an evicting block from changing a page another block is mid-read of.
+   Bisected on block count: correct at 1 and 2, 2% energy error at 8, `inf`
+   at 64. Only the RESIDENT number is quotable.
+
+BaM also cannot express eternia's "hold nine stencil rows, then compute":
+its cache is direct-mapped with no pin, so two rows that collide in slot
+space cannot both be live. That is why the list — read once per entry, never
+revisited — is the only structure it backs here, and why its write path
+(a whole page written back per element) is avoided entirely.
+
 ## The MPI sibling, and what it exposed
 
 `clio_md_mpi_bench` is the same kernels with one variable changed: two-sided,
