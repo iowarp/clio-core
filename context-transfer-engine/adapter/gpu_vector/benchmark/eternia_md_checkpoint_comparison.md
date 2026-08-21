@@ -25,13 +25,48 @@ GB/s including fsync.
 | MPI (two-sided, host-staged) | transport | **64.7** | **80.4** (+24%) | 143.7 ms (23.8 stage + 119.9 write) |
 | NCCL (two-sided, GPU-resident) | transport | **64.7** | **80.4** (+24%) | 144.4 ms |
 | NVSHMEM (one-sided, in-kernel) | transport | **65.8** | **81.8** (+24%) | 146.5 ms |
-| BaM (list via GPU page cache, 2 GB) | capacity | **1174.5** | **1188.9** (+1.2%) | 151.9 ms |
+| BaM (list via GPU page cache) | capacity | see below -- **the number first published here was invalid** | | |
 
 A durable checkpoint costs every non-persistent substrate ~144 ms: 23.8 ms
 of PCIe D2H plus ~120 ms of NVMe write. **The write is 5x the staging** --
 which is exactly why measuring only the D2H hop, as an earlier version of
 this document did, understated the cost 6x and has to be called out rather
 than quietly corrected.
+
+### The BaM row was wrong, and the bench said so
+
+The first version of this table quoted BaM at 1174.5 ms/step. That run had
+`--bam-cache-mb 2048` against a **3524.6 MB** list, which puts BaM OUT OF
+CORE -- and its own banner says not to quote it:
+
+    !! out-of-core BaM is EXPECTED TO FAIL the gates above 2 blocks: its
+       page cache has no pin, so an evicting block can change a page another
+       block is mid-read of. Quote the RESIDENT number; the out-of-core one
+       is not a result.
+
+It was run at 128 blocks. The gates happened to pass, which is luck, not
+evidence. BaM also **cannot be resident at lattice 112 on this GPU**: the
+list needs 3524.6 MB of cache and the largest cache that allocates is ~3072
+MB, so there is no valid BaM number at this deck at all.
+
+At lattice 100, where it fits, all three run on the same deck with durable
+checkpoints:
+
+| config | ms/step | durable write |
+|---|---|---|
+| BaM resident (2600 MB cache >= 2406.8 MB list) | 137.9 | 92.7 ms (2.11 GB/s) |
+| BaM out of core (1200 MB cache) | 944.8 | 92.4 ms (2.12 GB/s) |
+| MPI | 55.8 | 87.9 ms (2.23 GB/s) |
+
+So the 18x was the out-of-core penalty -- BaM's designed trade, capacity
+past VRAM paid for in PCIe page faults -- not a property of BaM resident,
+which costs ~2.5x MPI for its page-cache indirection on every neighbour
+read.
+
+And the checkpoint difference is not about BaM at all: 92.7 vs 87.9 ms is
+5%, the write path is identical code in all four benches, and out-of-core
+BaM writes at the same 2.12 GB/s while moving GB/s of list traffic. Read it
+as contention/noise, not as a substrate property.
 
 ## What that buys, priced honestly
 
