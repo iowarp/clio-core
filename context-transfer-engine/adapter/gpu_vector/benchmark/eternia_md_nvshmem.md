@@ -55,8 +55,9 @@ the **owner's** bin counter, and its four floats go over as element puts.
 
 ## Measured (2026-08-20, RTX 4070 Laptop, sm_89, NVSHMEM 3.7.2)
 
-Deck: `--md --lattice 20 --steps 50 --rebin 10 --temp 3.0 --cap 48
---blocks 128 --threads 64 --drift-tol 5e-3` (32k atoms, 11³ bins).
+Gate deck: `--md --lattice 20 --steps 50 --rebin 10 --temp 3.0 --cap 48
+--blocks 128 --threads 64 --drift-tol 5e-3` (32k atoms, 11³ bins). The
+256k-atom timing deck is in the next section.
 
 | PEs | statics | resort | NVE | ms/step | staged/step | migrants |
 |-----|---------|--------|-----|---------|-------------|----------|
@@ -70,7 +71,54 @@ Every configuration reproduces the same physics as the paged bench: PE/atom
 **bitwise** at 2 PEs while 891 atoms cross the slab boundary, which is the
 gate that actually exercises the migration path.
 
-### Two numbers above are not performance numbers
+## Against stock LAMMPS, and against paging
+
+The deck all three run: 256k atoms (`lattice 40`, rho 0.8442), lj/cut 2.5,
+skin 0.3, rebuild every 10 steps, T = 3.0, 100 steps. Stock is `lj/cut/kk`
+(KOKKOS CUDA, `-k on g 1 -sf kk -pk kokkos newton on neigh half`) from
+`lbann-stack/lmp-kk-build`. Each configuration tuned for itself; runs
+INTERLEAVED (stock, NVSHMEM, paged, repeat ×3) because this laptop GPU's
+clock state moves the absolute numbers by ~40% across a session while the
+ratios hold — a non-interleaved comparison here is worthless.
+
+| code | substrate | ms/step | Matom-step/s | vs stock |
+|------|-----------|---------|--------------|----------|
+| stock `lj/cut/kk` | LAMMPS device arrays | 3.66 | 70.0 | 1.00× |
+| `clio_md_nvshmem_bench` | symmetric heap | **1.77** | 145.0 | **0.48× (2.07× faster)** |
+| `clio_gpu_vector_md_bench` | paged `gv::Vector` | 6.99 | 36.6 | 1.91× slower |
+
+Spread across 3 interleaved reps was under 5% for all three. Best configs:
+NVSHMEM `--rowchunk 1 --threads 128`; paged `--rowchunk 2 --page-kb 69
+--threads 64` (the paged bench loses badly at 128 threads — 11.0 ms/step —
+which is the coroutine register ceiling, exactly as its own notes predict).
+
+**Why the NVSHMEM bench beats stock, honestly.** Two effects of the same
+order push in opposite directions, and this machine cannot separate them:
+
+- *For us:* single precision against stock's double. On a bandwidth-bound
+  kernel that is worth roughly 2× on its own, and it plausibly accounts for
+  the entire margin. LAMMPS has no single-precision KOKKOS pair style to
+  compare against, so this is stated, not measured.
+- *For us:* the bin-major layout IS a permanent spatial sort, refreshed at
+  every rebuild. Stock's `atom_modify sort` defaults to every 1000 steps.
+- *Against us:* full list / newton off, so every pair is evaluated twice.
+
+The defensible claim is therefore "at or about stock speed, in single
+precision", not "twice as fast as LAMMPS". What the number does establish
+firmly is that the reimplementation is not leaving an order of magnitude on
+the floor, which is the precondition for the substrate comparison below
+meaning anything.
+
+**The substrate cost, which is the point.** The NVSHMEM and paged benches
+share physics, layout, decomposition, list encoding and gates; they differ
+only in how a stencil row is reached. That difference is **3.95×** (1.77 vs
+6.99 ms/step), and the paged run held its resident contract — zero faults,
+zero evictions — so this is the cost of the hold machinery itself (coroutine
+frames, pins, guards), not of tier traffic. Paging buys a capacity ceiling
+that is not VRAM; on this deck it costs about 4× against the scale-out way
+of buying the same thing, and about 1.9× against stock.
+
+### Two numbers in the PE table are not performance numbers
 
 - **The 2-PE ms/step is meaningless as scaling.** This machine has one GPU, so
   the two PEs time-slice it in NVSHMEM's "limited MPG" mode. The run is a
