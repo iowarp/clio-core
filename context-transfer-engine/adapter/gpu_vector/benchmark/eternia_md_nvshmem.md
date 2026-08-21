@@ -71,6 +71,67 @@ Every configuration reproduces the same physics as the paged bench: PE/atom
 **bitwise** at 2 PEs while 891 atoms cross the slab boundary, which is the
 gate that actually exercises the migration path.
 
+## The MPI sibling, and what it exposed
+
+`clio_md_mpi_bench` is the same kernels with one variable changed: two-sided,
+host-staged `MPI_Sendrecv` of the boundary planes before each launch instead
+of one-sided `nvshmemx_getmem_block` inside it. It was built to check that
+the NVSHMEM bench was a fair baseline. It found that it was not, for a reason
+that has nothing to do with communication.
+
+Interleaved, 256k atoms, best config for each (`--rowchunk 1 --threads 128`),
+3 reps, spread under 0.5%:
+
+| configuration | ms/step | note |
+|---|---|---|
+| stock `lj/cut/kk` | 3.63 | |
+| MPI, 1 rank | **1.47** | no communication at all |
+| NVSHMEM, 1 PE | 1.77 | no communication at all |
+| MPI, 2 ranks | 2.33 | one GPU, time-sliced |
+| NVSHMEM, 2 PEs | 8.23 | one GPU, time-sliced, **limited MPG** |
+
+**Finding 1 — the rdc tax, and it is real everywhere.** At one rank *neither*
+bench communicates, yet they differ by 20%. That is not transport. NVSHMEM's
+device library is a relocatable-device-code archive, so linking it forces
+`-rdc=true` on the whole binary and blocks whole-program device optimisation.
+Compiling the MPI bench — same source, same kernels — with `-rdc=true` alone
+reproduces it exactly:
+
+| MPI bench, 1 rank | ms/step |
+|---|---|
+| default | 1.472 |
+| `-rdc=true` | 1.740 |
+| (NVSHMEM bench, 1 PE) | 1.768 |
+
+So **+18% on the compute kernels, paid before a single byte moves**, purely
+for linking NVSHMEM. This is machine-independent and worth knowing before
+choosing NVSHMEM for a kernel-bound code.
+
+**Finding 2 — the 2-rank row is NOT a transport result, and must not be
+quoted as one.** With two PEs on one GPU NVSHMEM runs in "limited MPG" mode
+with no direct peer mapping, and its device-side remote reads collapse. The
+arithmetic, from the ledgers: at 2 PEs the force pass goes 130 → 644 ms while
+only 11000 of 189750 spans are remote, i.e. ~46.7 µs per remote span. The
+same staging copy issued to *itself* within one process (`--force-remote` at
+1 PE: 1.770 → 2.402 ms/step over 189750 spans) costs ~0.33 µs. A remote span
+is **140× a local one** here. On real multi-GPU with NVLink a `getmem` is a
+direct peer load, not a proxied round trip, so that 140× is an artifact of
+this box and nothing else.
+
+**What survives the machine, and is worth keeping:**
+
+- *Bytes moved.* One-sided per-block pull moves **3.0×** the halo of a bulk
+  pre-staged exchange (5.11 vs 1.70 MB/step), because each block re-pulls the
+  boundary rows it needs — 11000 span fetches against 110 plane exchanges.
+  Lazy and fine-grained costs redundancy; that is algorithmic, not hardware.
+- *Migration.* Two-sided messaging has no remote atomic, so an atom leaving
+  a slab must be packed, exchanged and unpacked. The MPI resort phase is
+  221.8 ms against NVSHMEM's 126.7 — one-sided genuinely wins here, and that
+  direction should hold on real hardware.
+- *Both agree, exactly.* All gates pass in all five configurations, and the
+  two transports migrate an identical **5137** atoms with resort continuity
+  bitwise. That is the check that they are the same simulation.
+
 ## Against stock LAMMPS, and against paging
 
 The deck all three run: 256k atoms (`lattice 40`, rho 0.8442), lj/cut 2.5,
@@ -84,8 +145,13 @@ ratios hold — a non-interleaved comparison here is worthless.
 | code | substrate | ms/step | rebuild-matched | Matom-step/s | vs stock |
 |------|-----------|---------|-----------------|--------------|----------|
 | stock `lj/cut/kk` | LAMMPS device arrays | 3.64 | 3.64 | 70.3 | 1.00× |
-| `clio_md_nvshmem_bench` | symmetric heap | 1.76 | **1.81** | 145.1 | **2.01× faster** |
+| `clio_md_mpi_bench` | plain CUDA + MPI halo | 1.47 | **1.52** | 174.4 | **2.40× faster** |
+| `clio_md_nvshmem_bench` | symmetric heap | 1.76 | **1.81** | 145.1 | 2.01× faster |
 | `clio_gpu_vector_md_bench` | paged `gv::Vector` | 7.05 | **7.31** | 36.3 | 2.01× slower |
+
+The MPI row is the honest single-rank compute number for this physics, since
+it carries neither the rdc tax nor any communication; the NVSHMEM row is the
+same kernels plus 18% of relocatable-device-code overhead.
 
 Spread across 3 interleaved reps was under 5% for all three. Best configs:
 NVSHMEM `--rowchunk 1 --threads 128`; paged `--rowchunk 2 --page-kb 69

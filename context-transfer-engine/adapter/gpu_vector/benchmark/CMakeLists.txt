@@ -317,3 +317,57 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
             "(set NVSHMEM_HOME); skipping clio_md_nvshmem_bench")
     endif()
 endif()
+
+#------------------------------------------------------------------------------
+# eternia-MD, MPI edition: the SAME kernels as the NVSHMEM baseline with the
+# one variable changed -- two-sided, host-staged halo exchange instead of
+# one-sided in-kernel RMA. Built by nvcc for symmetry with its sibling (it
+# needs no rdc of its own), and like the sibling it links nothing from clio.
+#
+# Gated on MPI alone, NOT on CLIO_CORE_ENABLE_NVSHMEM: the whole point is
+# that this baseline has no NVSHMEM dependency.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA)
+    find_package(MPI QUIET COMPONENTS CXX)
+    find_program(MD_MPI_NVCC nvcc
+        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
+        PATH_SUFFIXES bin)
+    if(MPI_CXX_FOUND AND MD_MPI_NVCC)
+        set(_mpi_arch_flags "")
+        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
+            list(APPEND _mpi_arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
+        endforeach()
+        if(NOT _mpi_arch_flags)
+            list(APPEND _mpi_arch_flags "-arch=sm_80")
+        endif()
+        set(_mpi_cflags "")
+        foreach(_dir IN LISTS MPI_CXX_INCLUDE_DIRS)
+            list(APPEND _mpi_cflags -I${_dir})
+        endforeach()
+        # Link libs by absolute path through -Xlinker: with `-x cu` a bare
+        # .so on the command line is classified as a SOURCE and handed to the
+        # CUDA preprocessor.
+        set(_mpi_libs "")
+        foreach(_lib IN LISTS MPI_CXX_LIBRARIES)
+            list(APPEND _mpi_libs -Xlinker ${_lib})
+        endforeach()
+
+        set(_mpi_out ${CMAKE_BINARY_DIR}/bin/clio_md_mpi_bench)
+        set(_mpi_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_md_mpi_bench.cc)
+        add_custom_command(
+            OUTPUT ${_mpi_out}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+            COMMAND ${MD_MPI_NVCC}
+                -x cu -std=c++17 -O3 ${_mpi_arch_flags} ${_mpi_cflags}
+                ${_mpi_src} -o ${_mpi_out} ${_mpi_libs}
+            DEPENDS ${_mpi_src}
+            COMMENT "Building clio_md_mpi_bench (nvcc + MPI)"
+            VERBATIM)
+        add_custom_target(clio_md_mpi_bench ALL DEPENDS ${_mpi_out})
+        install(PROGRAMS ${_mpi_out} DESTINATION bin)
+        message(STATUS "eternia-MD MPI baseline: ON")
+    else()
+        message(STATUS "MPI not found; skipping clio_md_mpi_bench")
+    endif()
+endif()
