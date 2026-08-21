@@ -763,7 +763,8 @@ private:
    */
 
   clio::run::TaskResume ReadData(const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data,
-                           size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code);
+                           size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code,
+                           size_t *bytes_covered = nullptr);
 
   /**
    * Model the wall time of a data transfer over the blocks overlapping

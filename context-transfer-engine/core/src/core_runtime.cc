@@ -2622,16 +2622,45 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     } else {
       clio::run::u32 read_result = 0;
+      size_t covered = 0;
       clio_evlat_add(5, clio::run::CycleNow() - ev_g0);   // metadata phase
       { const unsigned long long ev_r0 = clio::run::CycleNow();
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
-                        read_result));
+                        read_result, &covered));
       clio_evlat_add(4, clio::run::CycleNow() - ev_r0); }  // ReadData await
 
       if (read_result != 0) {
         task->return_code_ = read_result;
         clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
+      }
+      // A READ THAT COVERED LESS THAN THE BLOB SAYS IT HAS IS NOT A SUCCESS.
+      // ReadData reports success for ranges no block covers, so a torn or
+      // incomplete layout returned rc 0 with the caller's buffer untouched
+      // -- indistinguishable from a real read, and the exact silent shape
+      // the guards above this were added one at a time to close.
+      //
+      // Reading PAST EOF stays a legitimate short read: the expectation is
+      // clamped to the blob's declared size, so only bytes the blob claims
+      // to have and did not deliver are an error.
+      {
+        const size_t declared =
+            replica_sel > 0
+                ? blob_info_ptr->GetReplica(replica_sel, false)
+                      ->total_size_cache_
+                : blob_info_ptr->GetTotalSize();
+        const size_t live_end = (offset + size < declared) ? offset + size
+                                                           : declared;
+        const size_t want = (offset < live_end) ? live_end - offset : 0;
+        if (covered < want) {
+          HLOG(kError,
+               "GetBlob: layout covered {} of {} live bytes for blob {} "
+               "(offset {}, declared size {}) -- refusing to report success",
+               covered, want, blob_name, offset, declared);
+          task->return_code_ = 1;
+          clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+          CLIO_CO_RETURN;
+        }
       }
     }
 
@@ -7094,7 +7123,8 @@ clio::run::TaskResume Runtime::ModifyExistingData(
 clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock> &blocks,
                                   ctp::ipc::ShmPtr<> data, size_t data_size,
                                   size_t data_offset_in_blob,
-                                  clio::run::u32 &error_code) {
+                                  clio::run::u32 &error_code,
+                                  size_t *bytes_covered) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -7247,6 +7277,15 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
   }
 
   HLOG(kDebug, "ReadData: All read tasks completed successfully");
+  // HOW MUCH THE BLOCKS ACTUALLY COVERED. `remaining_size` was tracked all
+  // along and never checked, so a range no block covers fell straight
+  // through to success having written nothing -- the caller then read its
+  // own untouched buffer and could not tell. Report it; the caller knows
+  // the blob's declared size and so can tell a legitimate short read past
+  // EOF from a layout that failed to cover live bytes.
+  if (bytes_covered != nullptr) {
+    *bytes_covered = data_size - remaining_size;
+  }
   if (remaining_size != 0) {
     static const bool trace = getenv("CLIO_SHORT_READ_TRACE") != nullptr;
     if (trace) {
