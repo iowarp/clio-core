@@ -208,6 +208,45 @@ if(CLIO_CORE_ENABLE_CUDA)
           CLIO_YCORO_DEVTRACE)
     endif()
 
+    # CORRECTNESS GATES AS TESTS. The bench already exits non-zero unless the
+    # statics, resort and NVE gates all pass, so registering it is enough to
+    # make the LAMMPS comparison a regression gate rather than something a
+    # human has to remember to eyeball.
+    #
+    # Two entries, deliberately: one per REGIME. The resident entry asserts
+    # the zero-fault contract (a cache that can hold the working set must
+    # never page); the out-of-core entry runs the same physics through a
+    # cache far too small for it and must produce the same energies. A
+    # single entry could not check both, and separate entries are separate
+    # processes -- CLIO_INIT runs once per process.
+    add_test(NAME cte_gpu_vector_md_resident
+        COMMAND clio_gpu_vector_md_bench --md --lattice 20 --steps 20
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_md_resident PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;md"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    # 11 pages of working set through an 8-slot cache. CLIO_GV_ADMIT=1 is
+    # REQUIRED here, not incidental: without admission this configuration
+    # (64 blocks against 8 slots) wedges rather than merely thrashing, which
+    # is the documented concurrency-vs-capacity trade, not a defect in the
+    # physics being gated.
+    add_test(NAME cte_gpu_vector_md_ooc
+        COMMAND clio_gpu_vector_md_bench --md --lattice 20 --steps 20
+                --slots 8
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_md_ooc PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;md"
+        ENVIRONMENT "CLIO_GV_ADMIT=1"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+
     add_cuda_executable(clio_gpu_vector_access_bench FALSE
         clio_gpu_vector_access_bench.cc
         INCLUDE_DIRS
