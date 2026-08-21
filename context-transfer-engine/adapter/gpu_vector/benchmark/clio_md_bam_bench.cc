@@ -116,6 +116,9 @@ struct Args {
   int use_list = 1;
   u64 bam_page_kb = 64;    // BaM cache page size (power of two)
   u64 bam_cache_mb = 0;    // BaM HBM cache; 0 = auto (fits the list)
+  bool bam_nvme_emu = false;  // route misses through an EMULATED NVMe queue
+                              // pair over pinned host memory, instead of a
+                              // bare memcpy from the host backing store
   double drift_tol = 5e-4;
   double dt = 0.005;
   int gate = 1;
@@ -576,9 +579,16 @@ __global__ void ListForceKernel(Decomp d, const float *x, float *f,
         const float xi = ip[0], yi = ip[1], zi = ip[2];
         const u32 n = nocompute ? 0u : cnt[slotbase + s];
         float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+        // HOLD THE PAGE ACROSS THE NEIGHBOUR LOOP, which is what upstream
+        // BaM's bam_ptr exists for. The list is transposed, so consecutive
+        // k stride by islots elements; a 64KB page still covers several of
+        // them, and re-resolving per element (two atomics each) was the
+        // whole reason this bench looked 3x slower than a span-granular
+        // cache. bam_ptr re-resolves only when k leaves the page.
+        bam::bam_ptr<int> nlp(&nl);
         for (u32 k = 0; k < n; ++k) {
           const u32 ent = static_cast<u32>(
-              nl.read(nlbase + static_cast<u64>(k) * islots + s));
+              nlp.at(nlbase + static_cast<u64>(k) * islots + s));
           const float *const jp =
               s_qptr[ent >> 16] + static_cast<u64>(ent & 0xffffu) * kStride;
           float ddx = xi - jp[0];
@@ -842,6 +852,18 @@ int main(int argc, char **argv) {
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--bam-page-kb")) a.bam_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (want("--bam-cache-mb")) a.bam_cache_mb = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--bam-nvme-emu") == 0) {
+      // WIP: the queue-pair path runs end to end but does not yet deliver
+      // correct bytes -- the gates fail with PE 0. Left in because the
+      // protocol half is real and reviewable, but it must not be mistaken
+      // for a result.
+      std::fprintf(stderr,
+                   "WARNING: --bam-nvme-emu is INCOMPLETE. The emulated queue "
+                   "pair submits and completes, but page contents are wrong "
+                   "and the physics gates FAIL. Do not quote numbers from "
+                   "this mode.\n");
+      a.bam_nvme_emu = true;
+    }
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
     else {
@@ -1079,8 +1101,14 @@ int main(int argc, char **argv) {
       cfg.num_pages = static_cast<size_t>(bam_cache_bytes / bam_page_bytes);
       cfg.num_queues = 1;
       cfg.queue_depth = 64;
-      cfg.backend = bam::BackendType::kHostMemory;
+      // kNvme with no device path = the emulated controller: the kernel
+      // speaks the real submission/doorbell/completion sequence and a host
+      // thread plays the drive over pinned memory. kHostMemory keeps the
+      // old bare-copy path for comparison.
+      cfg.backend = a.bam_nvme_emu ? bam::BackendType::kNvme
+                                   : bam::BackendType::kHostMemory;
       cfg.nvme_dev = nullptr;
+      cfg.queue_depth = 1024;
       cfg_num_pages = cfg.num_pages;
       bam_cache.reset(new bam::PageCache(cfg));
       // ROUND THE BACKING ARRAY UP TO A WHOLE NUMBER OF PAGES. BaM's

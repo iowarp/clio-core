@@ -15,6 +15,8 @@
 
 namespace bam {
 
+class NvmeEmuController;
+
 class PageCache {
  public:
   /**
@@ -68,6 +70,29 @@ class PageCache {
   uint32_t *d_page_states_;   // Per-page state
   uint64_t *d_page_tags_;     // Per-page tag (storage offset)
   uint32_t *d_page_locks_;    // Per-page spinlock
+  uint32_t *d_page_refs_;     // Per-page pin count (acquire_page/release_page)
+
+  /** Emulated NVMe controller, used when backend==kNvme and no device path
+   *  was given. See bam/nvme_emu.h. */
+  std::unique_ptr<NvmeEmuController> emu_;
+  QueuePairDevice dev_qp_{};
+  bool emu_pending_ = false;
+  const uint8_t *host_backing_ = nullptr;
+  size_t host_backing_size_ = 0;
+
+ public:
+  /** Point the emulated controller at its medium. Call before init(). */
+  void set_host_backing(const uint8_t *p, size_t n) {
+    host_backing_ = p; host_backing_size_ = n;
+  }
+  /** Queue pair for kernels (emulated or real). */
+  QueuePairDevice queue_pair() const { return dev_qp_; }
+  /** Start the emulated controller once the backing size is known. */
+  int ensure_emu_started(size_t total_bytes);
+  bool emu_pending() const { return emu_pending_; }
+  uint64_t emu_completions() const;
+
+ private:
   uint64_t *d_bus_addrs_;     // Per-cache-page bus addresses (NVMe mode)
 
   // NVMe controller (optional)

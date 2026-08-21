@@ -56,6 +56,7 @@ set(BAM_HOST_SOURCES
 
 set(BAM_CUDA_SOURCES
   src/page_cache_host.cc
+    src/nvme_emu.cc
   src/page_cache.cu
   src/array.cu
 )

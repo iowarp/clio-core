@@ -53,6 +53,20 @@ struct PageCacheDeviceState {
   uint32_t *page_states;     // GPU VRAM: per-page state (atomics)
   uint64_t *page_tags;       // GPU VRAM: per-page storage offset tag
   uint32_t *page_locks;      // GPU VRAM: per-page spinlocks
+  /**
+   * GPU VRAM: per-page reference count -- the PIN behind acquire_page.
+   *
+   * Without it `release_page` was a no-op and a slot could be re-tagged
+   * while another block was mid-read of it, which is why out-of-core runs
+   * above 2 blocks were documented as "not a result". A takeover now waits
+   * for the count to drain.
+   *
+   * CONTRACT: a thread may hold at most ONE pin at a time. The cache is
+   * direct-mapped, so pinning page A and then missing on page B that maps to
+   * the same slot would wait on yourself. bam_ptr::update_page releases
+   * before it acquires for exactly this reason.
+   */
+  uint32_t *page_refs;
   size_t    page_size;
   uint32_t  num_pages;
   uint32_t  page_shift;      // log2(page_size)
@@ -62,6 +76,29 @@ struct PageCacheDeviceState {
 struct QueuePairDevice {
   volatile void *sq;         // SQ entries
   volatile void *cq;         // CQ entries
+  /**
+   * Slot allocator, in DEVICE memory.
+   *
+   * It must be device memory: this GPU reports
+   * cudaDevAttrHostNativeAtomicSupported = 0, so an atomicAdd on mapped host
+   * memory is not merely slow, it is illegal -- the same constraint that
+   * forced the gpu2cpu ring to split. So the queue splits the same way:
+   * atomicity lives on the device, visibility lives in host memory.
+   */
+  uint32_t *sq_alloc;
+  /**
+   * Per-slot publication stamps, in MAPPED HOST memory.
+   *
+   * Stands in for a doorbell register. A single tail doorbell would need an
+   * atomic on host memory to advance in order; a per-slot stamp needs only a
+   * volatile store after a system fence, and it carries strictly more
+   * information -- the controller learns that a slot is claimed AND that its
+   * entry is fully written. Same trick the gpu2cpu ring uses.
+   */
+  volatile uint32_t *sq_ready;
+  /** Real-hardware doorbells, used by the gnb NVMe path. The emulated
+   *  controller uses sq_alloc + sq_ready instead, for the reason given
+   *  above; both sets coexist so either backend can be wired. */
   volatile uint32_t *sq_doorbell;
   volatile uint32_t *cq_doorbell;
   uint32_t sq_depth;

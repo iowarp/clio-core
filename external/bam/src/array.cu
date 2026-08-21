@@ -21,8 +21,14 @@ Array<T>::Array(uint64_t num_elements, PageCache &cache)
   dev_.total_bytes = num_elements * sizeof(T);
   dev_.backend = cache.backend();
 
-  if (cache.backend() == BackendType::kNvme && cache.controller()) {
-    dev_.qp = cache.queue_pair_device(0);
+  if (cache.backend() == BackendType::kNvme && cache.emu_pending()) {
+    cache.ensure_emu_started(num_elements * sizeof(T));
+  }
+  if (cache.backend() == BackendType::kNvme) {
+    // Real controller or emulated one -- the kernel path is identical, which
+    // is the point of the emulation. queue_pair() returns whichever is live.
+    dev_.qp = cache.controller() ? cache.queue_pair_device(0)
+                                 : cache.queue_pair();
     dev_.buf_bus_addrs = cache.device_bus_addrs();
     dev_.host_base = nullptr;
   } else {

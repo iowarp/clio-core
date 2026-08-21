@@ -22,6 +22,16 @@ namespace bam {
 /* Per-thread page cache operations (original API)                     */
 /* ================================================================== */
 
+/** Device-side mirrors of bam::EmuSqe / bam::EmuCqe. Kept here so the
+ *  kernel path does not have to include the host header. */
+struct EmuSqeDev {
+  uint64_t offset; uint64_t bus_addr;
+  uint32_t nbytes; uint32_t opcode; uint32_t cid; uint32_t pad;
+};
+struct EmuCqeDev {
+  uint32_t cid; uint32_t status; uint32_t phase; uint32_t pad;
+};
+
 __device__ inline uint8_t *page_cache_acquire(
     PageCacheDeviceState &state,
     uint64_t offset,
@@ -71,10 +81,77 @@ __device__ inline void page_cache_finish_load(
   __threadfence();
 }
 
+/**
+ * Acquire a page AND PIN IT. Upstream BaM's acquire_page/release_page pair
+ * is a reference count, not just a lookup: it is what stops a slot being
+ * re-tagged while another block is mid-read of it. Without the pin this
+ * cache was documented as unusable above 2 blocks out of core.
+ *
+ * A takeover waits for the slot's pin count to drain. See
+ * PageCacheDeviceState::page_refs for the one-pin-per-thread contract that
+ * keeps that wait acyclic on a direct-mapped cache.
+ */
+__device__ inline uint8_t *page_cache_acquire_pinned(
+    PageCacheDeviceState &state,
+    uint64_t offset,
+    bool *needs_load) {
+  const uint32_t slot =
+      (uint32_t)((offset >> state.page_shift) % state.num_pages);
+  uint8_t *page = state.cache_mem + (uint64_t)slot * state.page_size;
+  unsigned long long desired = (unsigned long long)offset;
+  unsigned long long *tag_ptr = (unsigned long long *)&state.page_tags[slot];
+
+  for (;;) {
+    // Pin FIRST, then check the tag. Reversed, the slot could be taken over
+    // between the check and the pin -- the same publish-then-verify order a
+    // page cache always needs.
+    atomicAdd(&state.page_refs[slot], 1u);
+    __threadfence();
+    if (atomicAdd(tag_ptr, 0ULL) == desired) {
+      const uint32_t st = atomicAdd(&state.page_states[slot], 0);
+      if (st == static_cast<uint32_t>(PageState::kValid) ||
+          st == static_cast<uint32_t>(PageState::kDirty)) {
+        *needs_load = false;
+        return page;                      // hit, pinned
+      }
+      if (st == static_cast<uint32_t>(PageState::kLoading)) {
+        atomicSub(&state.page_refs[slot], 1u);   // someone else is filling it
+        __nanosleep(64);
+        continue;
+      }
+    }
+    // Miss: claim the slot. Drop our pin while waiting for the others to
+    // drain, or we would be waiting on ourselves.
+    atomicSub(&state.page_refs[slot], 1u);
+    while (atomicAdd(&state.page_refs[slot], 0u) != 0u) {
+      __nanosleep(64);
+    }
+    if (atomicCAS(&state.page_states[slot],
+                  static_cast<uint32_t>(PageState::kValid),
+                  static_cast<uint32_t>(PageState::kLoading)) ==
+            static_cast<uint32_t>(PageState::kValid) ||
+        atomicCAS(&state.page_states[slot],
+                  static_cast<uint32_t>(PageState::kInvalid),
+                  static_cast<uint32_t>(PageState::kLoading)) ==
+            static_cast<uint32_t>(PageState::kInvalid)) {
+      atomicExch(tag_ptr, desired);
+      __threadfence();
+      atomicAdd(&state.page_refs[slot], 1u);   // pin the page we will fill
+      *needs_load = true;
+      return page;
+    }
+    __nanosleep(64);                     // lost the claim; re-examine
+  }
+}
+
+/** Drop one pin taken by page_cache_acquire_pinned. */
 __device__ inline void page_cache_release(
     PageCacheDeviceState &state,
     uint64_t offset) {
-  (void)state; (void)offset;
+  const uint32_t slot =
+      (uint32_t)((offset >> state.page_shift) % state.num_pages);
+  __threadfence();
+  atomicSub(&state.page_refs[slot], 1u);
 }
 
 __device__ inline void page_cache_mark_dirty(
@@ -234,18 +311,70 @@ __device__ inline void host_write_page(
 /* NVMe I/O stubs                                                      */
 /* ================================================================== */
 
+/**
+ * Submit one page-granular command and wait for its completion.
+ *
+ * This is the real sequence a GPU issues to an NVMe queue pair -- claim an
+ * SQ slot, write the SQE, ring the doorbell, poll the CQ for the phase this
+ * command is due -- against an emulated controller whose medium is pinned
+ * host memory (see bam/nvme_emu.h). It replaces stubs that ignored their
+ * arguments and returned -1, which is why a "miss" used to cost a memcpy
+ * and nothing else.
+ *
+ * Called by ONE thread per page fill; the rest of the warp waits at the
+ * barrier its caller already holds.
+ */
+__device__ inline int nvme_submit_page(
+    QueuePairDevice &qp, uint64_t bus_addr,
+    uint64_t offset, uint32_t page_size, uint32_t opcode) {
+  if (qp.sq == nullptr || qp.cq == nullptr) return -1;
+
+  // CLAIM ON THE DEVICE, PUBLISH INTO HOST MEMORY.
+  //
+  // The claim is an atomicAdd on device memory because this GPU cannot do
+  // atomics on mapped host memory at all (cudaDevAttrHostNativeAtomicSupported
+  // = 0) -- a doorbell register in host memory would be illegal, not just
+  // slow. Publication is therefore a per-slot STAMP: write the entry, fence
+  // system-wide, then store the stamp. A controller that observes the stamp
+  // is guaranteed to observe the entry beside it.
+  const unsigned int mine = atomicAdd(qp.sq_alloc, 1u);
+
+  const uint32_t idx = mine & (qp.sq_depth - 1u);
+  volatile EmuSqeDev *sqe = &((volatile EmuSqeDev *)qp.sq)[idx];
+  sqe->offset = offset;
+  sqe->bus_addr = bus_addr;
+  sqe->nbytes = page_size;
+  sqe->opcode = opcode;
+  sqe->cid = mine;
+  __threadfence_system();
+  qp.sq_ready[idx] = (mine / qp.sq_depth) + 1u;   // publish
+  __threadfence_system();
+
+  // Poll for our completion. The phase distinguishes this generation's CQE
+  // from the previous one occupying the same slot.
+  const uint32_t cidx = mine & (qp.cq_depth - 1u);
+  volatile EmuCqeDev *cqe = &((volatile EmuCqeDev *)qp.cq)[cidx];
+  const unsigned int want = (mine / qp.cq_depth) + 1u;
+  for (;;) {
+    const unsigned int ph = cqe->phase;
+    if (ph == want) {
+      __threadfence_system();
+      return (int)cqe->status;
+    }
+    __nanosleep(32);
+  }
+}
+
 __device__ inline int nvme_read_page(
     QueuePairDevice &qp, uint64_t bus_addr,
     uint64_t offset, uint32_t page_size) {
-  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
-  return -1;
+  return nvme_submit_page(qp, bus_addr, offset, page_size, /*opcode=*/0u);
 }
 
 __device__ inline int nvme_write_page(
     QueuePairDevice &qp, uint64_t bus_addr,
     uint64_t offset, uint32_t page_size) {
-  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
-  return -1;
+  return nvme_submit_page(qp, bus_addr, offset, page_size, /*opcode=*/1u);
 }
 
 }  // namespace bam
