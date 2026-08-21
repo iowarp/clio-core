@@ -112,6 +112,7 @@ struct Args {
   u32 blocks = 64;
   u32 threads = 256;
   u32 slots = 0;           // x/v cache slots per block; 0 = resident (auto)
+  u32 ppslots = 0;         // resort ping-pong cache slots; 0 = same as slots
   u64 steps = 100;
   u64 rebin = 20;          // resort cadence (steps); 0 = never
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
@@ -1468,6 +1469,7 @@ int main(int argc, char **argv) {
     else if (want("--blocks")) a.blocks = static_cast<u32>(atoi(argv[++i]));
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--slots")) a.slots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--ppslots")) a.ppslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
@@ -1687,8 +1689,13 @@ int main(int argc, char **argv) {
     auto df = vf.GetDevice(0);
     // Ping-pong destination vectors for the resort (K2b scatters into
     // these, then the handles swap). Same geometry, resident.
-    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, slots, g.nelems);
-    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, slots, g.nelems);
+    // The resort's destinations get their own cache size, so "the scatter
+    // is wrong" can be told apart from "the scatter's PAGING is wrong".
+    const u32 ppslots = (a.ppslots != 0) ? a.ppslots : slots;
+    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, ppslots, g.nelems);
+    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, ppslots, g.nelems);
+    vx2.EnableStats();
+    vv2.EnableStats();
     {
       std::vector<float> hs(g.nelems, 0.0f);
       for (u64 s = 0; s < g.nslots; ++s) hs[s * kStride + 3] = -1.0f;
