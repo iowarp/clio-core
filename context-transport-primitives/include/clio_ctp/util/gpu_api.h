@@ -726,8 +726,22 @@ class GpuApi {
                                     static_cast<hipStream_t>(stream)));
 #endif
 #if CTP_ENABLE_CUDA
-    CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault,
-                                      static_cast<cudaStream_t>(stream)));
+    {
+      cudaError_t _rc = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault,
+                                        static_cast<cudaStream_t>(stream));
+      if (_rc != cudaSuccess) {
+        cudaPointerAttributes _ad{}, _as{};
+        cudaError_t _rd = cudaPointerGetAttributes(&_ad, dst);
+        cudaError_t _rs = cudaPointerGetAttributes(&_as, src);
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "[memcpyasync-fail] dst=%p (rc=%d type=%d) src=%p (rc=%d "
+                "type=%d) size=%zu stream=%p\n",
+                dst, (int)_rd, (int)_ad.type, (const void *)src, (int)_rs,
+                (int)_as.type, size, stream);
+      }
+      CUDA_ERROR_CHECK(_rc);
+    }
 #endif
   }
 

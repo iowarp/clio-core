@@ -500,6 +500,16 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
       clio::run::u64 intra = cur_off % kRamPageSize;
       clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
+      // A RAM page is PINNED host memory, and that allocation can fail --
+      // it is a scarcer resource than plain DRAM. Unchecked, the null went
+      // straight into the copy below: a segfault on the CPU path and
+      // "MemcpyAsync CUDA Error 1: invalid argument" on the GPU one. Report
+      // a short write instead, which is the same shape a full device
+      // reports and which callers already handle.
+      if (page == nullptr) {
+        task->return_code_ = 1;
+        return;
+      }
       memcpy(page + intra, data + data_offset, chunk);
       cur_off += chunk;
       data_offset += chunk;
@@ -539,6 +549,13 @@ int MemBdevTransport::LaunchWriteBlocksGpu(const ctp::ipc::FullPtr<WriteTask>& t
       clio::run::u64 intra = cur_off % kRamPageSize;
       clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
+      // See the CPU path: a pinned-page allocation failure must not become a
+      // null destination for the copy. This is the site that actually fired
+      // -- a gpu_vector flush of ~5.6M atoms exhausted pinned memory and
+      // crashed the run with "invalid argument" out of cudaMemcpyAsync.
+      if (page == nullptr) {
+        return 1;
+      }
       // Enqueue only; the caller yields and waits on the stream afterward.
       ctp::GpuApi::MemcpyAsync(page + intra, data + data_offset, chunk, stream);
       cur_off += chunk;
