@@ -1,27 +1,25 @@
-name: Distributed MD (MPI + NVSHMEM)
+name: MD baselines compile gate (MPI + NVSHMEM)
 
-# CI for the two distributed eternia-MD baselines,
+# COMPILE gate for the two distributed eternia-MD baselines,
 # context-transfer-engine/adapter/gpu_vector/benchmark/clio_md_{mpi,nvshmem}_bench.cc.
 #
-# WHAT THIS CAN AND CANNOT GATE, stated plainly so nobody mistakes a green
-# check for more coverage than it is:
+# This workflow deliberately does NOT try to run them. GitHub-hosted runners
+# have no GPU, so the distributed test cannot execute here at all; that job
+# lives in the repo as a script, not as CI:
 #
-#   * compile-md-benches  runs on every PR that touches these files, on a
-#     STANDARD GitHub runner. Compiling CUDA needs nvcc, not a GPU, so this
-#     job is real coverage: it catches the compile rot that is by far the
-#     likeliest way these two files break, and it catches it in review.
+#     context-transfer-engine/adapter/gpu_vector/test/distributed_md/
+#         run_md_distributed.sh
 #
-#   * distributed-md-gpu  actually RUNS both benches as 2-rank jobs across two
-#     containers and checks the physics gates. It needs a GPU, the nvidia
-#     container toolkit and an NVSHMEM install, none of which a
-#     GitHub-hosted runner has. It therefore runs ONLY on a self-hosted
-#     runner labelled `gpu`, or on demand via workflow_dispatch. On a repo
-#     with no such runner it is skipped, visibly, rather than silently
-#     passing -- and the same script is what a developer runs locally.
+# which stands up two containers, compiles both benches inside each, runs
+# them as 2-rank jobs and asserts the physics gates plus a nonzero migrant
+# count. Run it on any GPU host (it is what was used to validate these
+# files). A CI job that could never run would be worse than none: it reads
+# as coverage that does not exist.
 #
-# The GPU job is not a nice-to-have duplicate of the compile job: the failure
-# modes it catches (slab decomposition, halo exchange, cross-rank atom
-# migration) are exactly the ones that compile cleanly.
+# What IS real coverage here: compiling CUDA needs nvcc, not a GPU, so the
+# compile-rot failure mode -- by far the likeliest way these two files break
+# -- is caught on a standard runner, in review, on every PR that touches
+# them.
 
 on:
   push:
@@ -33,16 +31,11 @@ on:
       - 'context-transfer-engine/adapter/gpu_vector/benchmark/clio_md_nvshmem_bench.cc'
       - 'context-transfer-engine/adapter/gpu_vector/benchmark/CMakeLists.txt'
       - 'context-transfer-engine/adapter/gpu_vector/test/distributed_md/**'
-      - '.github/workflows/ci-md-distributed.yml'
+      - '.github/workflows/ci-md-benches.yml'
   workflow_dispatch:
-    inputs:
-      run_gpu:
-        description: 'Also run the 2-container GPU job (needs a self-hosted gpu runner)'
-        type: boolean
-        default: false
 
 concurrency:
-  group: ci-md-distributed-${{ github.ref }}
+  group: ci-md-benches-${{ github.ref }}
   # Cancel superseded PR-branch runs only; a merge to a shared branch must
   # always finish (same rationale as gpu-tests.yml).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -131,33 +124,3 @@ jobs:
           cd context-transfer-engine/adapter/gpu_vector/test/distributed_md
           HOST_WORKSPACE=/tmp CUDA_HOME=/tmp NVSHMEM_HOME=/tmp MD_SSH_DIR=/tmp \
             docker compose config -q
-
-  distributed-md-gpu:
-    name: 2 containers x 2 ranks, both transports (needs a GPU runner)
-    # Skipped with a visible "no runner" rather than a false green when the
-    # repo has no self-hosted GPU runner.
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu }}
-    runs-on: [self-hosted, gpu]
-    timeout-minutes: 60
-    needs: compile-md-benches
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Install NVSHMEM (wheel)
-        run: |
-          python3 -m pip install --quiet --target "$HOME/nvshmem-pkg" "$NVSHMEM_WHEEL"
-          NVS="$HOME/nvshmem-pkg/nvidia/nvshmem"
-          ln -sf libnvshmem_host.so.3 "$NVS/lib/libnvshmem_host.so"
-          echo "NVSHMEM_HOME=$NVS" >> $GITHUB_ENV
-
-      - name: Pull dependency image
-        run: docker pull iowarp/deps-cpu:latest
-
-      # Compiles both benches inside each container and runs them as 2-rank
-      # jobs across the two, asserting the statics / resort / NVE gates AND
-      # that a nonzero number of atoms actually migrated between ranks.
-      - name: Run the distributed MD harness
-        run: |
-          cd context-transfer-engine/adapter/gpu_vector/test/distributed_md
-          CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" ./run_md_distributed.sh
