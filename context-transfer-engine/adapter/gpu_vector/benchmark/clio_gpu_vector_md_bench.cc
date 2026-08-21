@@ -1381,20 +1381,45 @@ __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
 #if !CTP_IS_DEVICE_PASS
 namespace {
 
+/** Rounds after which the driver gives up on a kernel that never finishes. */
+static constexpr u32 kMaxRounds = 2000000;
+
 class YieldRunner {
  public:
   YieldRunner(unsigned nblocks, unsigned nthreads)
       : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+
+  /** True once any Run hit the round cap. THE CAP IS OTHERWISE SILENT:
+   *  RunToCompletion returning at max_rounds looks exactly like success, so
+   *  a livelocked block is abandoned mid-coroutine and the caller happily
+   *  uses whatever it managed to compute. That is how an out-of-core run
+   *  came back with 17 of 22 page iterations done and no error anywhere. */
+  bool HitCap() const { return hit_cap_; }
+
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
     drv_.ResetTimers();
     drv_.Reset();
     stack_.Reset();
+    const u32 r = RunInner(std::forward<LaunchT>(launch));
+    if (r >= kMaxRounds && !hit_cap_) {
+      hit_cap_ = true;
+      std::fprintf(stderr,
+                   "[driver] GAVE UP after %u rounds -- blocks are still "
+                   "parked and their remaining work will NOT run. Results "
+                   "from here are incomplete.\n", r);
+    }
+    return r;
+  }
+
+ private:
+  template <typename LaunchT>
+  u32 RunInner(LaunchT &&launch) {
     return drv_.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           launch(g, b, view, stack_.View());
         },
-        [] {}, /*max_rounds=*/2000000,
+        [] {}, kMaxRounds,
         [](u32, u64 tag) -> bool {
           unsigned int f = 0;
           ctp::GpuApi::Memcpy(&f, reinterpret_cast<const unsigned int *>(tag),
@@ -1402,11 +1427,18 @@ class YieldRunner {
           return (f & 1u) != 0u;
         });
   }
+ public:
   double KernelMs() const { return drv_.KernelMs(); }
+  /** Blocks launched per round -- if the driver ever exits while a block
+   *  is still parked, the tail of this log shows it. */
+  const std::vector<std::pair<double, u32>> &RoundLog() const {
+    return drv_.RoundLog();
+  }
 
  private:
   gy::Yieldable<> drv_;
   gy::YieldStack stack_;
+  bool hit_cap_ = false;
 };
 
 }  // namespace
@@ -1971,7 +2003,8 @@ int main(int argc, char **argv) {
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
         res_ok ? "[resident contract HELD]" : "[RESIDENT CONTRACT VIOLATED]");
-    const bool nve_ok = (e_drift < a.drift_tol) && res_ok;
+    const bool nve_ok = (e_drift < a.drift_tol) && res_ok &&
+                        !runner.HitCap();
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
     std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
                 "Matom-steps/s)\n",
@@ -2038,12 +2071,21 @@ int main(int argc, char **argv) {
           gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/1, a.blocks,
           !a.per_block, vw, sv);
     });
-    runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                   gy::YieldStackView sv) {
+    const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
           gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/0, a.blocks,
           !a.per_block, vw, sv);
     });
+    if (std::getenv("MD_ROUNDS") != nullptr) {
+      const auto &rl = runner.RoundLog();
+      std::fprintf(stderr, "[rounds] step=%llu n=%zu rounds=%u blocks/round:",
+                   (unsigned long long)step, rl.size(), rr);
+      for (size_t i = 0; i < rl.size() && i < 40; ++i) {
+        std::fprintf(stderr, " %u", rl[i].second);
+      }
+      std::fprintf(stderr, "\n");
+    }
   }
   ctp::GpuApi::Synchronize();
   const double run_ms = NowMs() - t0;
@@ -2194,7 +2236,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)bit_x, (unsigned long long)bit_v, max_cf,
                 thermo[0], ke_ref, ke_err, mom_err);
     const bool gate_ok = (bit_x == 0 && bit_v == 0) && (max_cf < 1e-2) &&
-                         (ke_err < 1e-9) && (mom_err < 1e-6) && resident_ok;
+                         (ke_err < 1e-9) && (mom_err < 1e-6) && resident_ok &&
+                         !runner.HitCap();
     std::printf("  BALLISTIC GATE: %s\n", gate_ok ? "PASS" : "FAIL");
     if (!gate_ok) rc = 1;
   }
