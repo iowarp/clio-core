@@ -133,6 +133,36 @@ struct VecHeader {
   MultiBatch *multi_ = nullptr;
   clio::run::u32 multi_per_block_ = 0;
   int *block_locks_ = nullptr;
+  /**
+   * ADMISSION CONTROL against the hold-while-waiting livelock.
+   *
+   * A block that parks inside a multi-page hold keeps its slots pinned, so
+   * with enough blocks in flight every slot in the table is spoken for and
+   * no claim can ever succeed -- measured directly as "48 of 48 slots
+   * pinned" at a failing claim, and confirmed by the fact that the same
+   * 32-slot cache that wedges at 64 blocks runs fine at 32.
+   *
+   * `hold_admits_` counts slots RESERVED by blocks currently inside a hold
+   * set; a block may not begin one until its reservation fits under
+   * `hold_admit_cap_`. Total reservations therefore never exceed the slots
+   * that exist, so every admitted block can complete its working set and
+   * release -- progress is structural rather than a matter of luck.
+   */
+  unsigned int *hold_admits_ = nullptr;
+  clio::run::u32 hold_admit_cap_ = 0;
+  /**
+   * Whether admission is in force. Set once at construction from
+   * CLIO_GV_ADMIT; [1] is unused.
+   *
+   * AUTO-ARMING ON THE LIVELOCK SIGNATURE WAS TRIED AND DOES NOT WORK. By
+   * the time claims are failing en masse every block is already INSIDE a
+   * hold set, and a block only consults this flag before entering one -- so
+   * the blocks that would need throttling are past the decision, and the
+   * next chunk that would honour it is never reached. Measured: with the
+   * watchdog in place a 32-slot run still wedged, exactly as it did
+   * without. Admission has to be armed BEFORE the run, not during it.
+   */
+  unsigned int *admit_armed_ = nullptr;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
   unsigned long long *stat_evicts_ = nullptr;   // slots reclaimed
@@ -145,6 +175,13 @@ struct VecHeader {
   /** Gets that came back with a NON-ZERO return code. SubmitGet never checked
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
+  /** Gets that read COMPLETE immediately after Send (stale flag). */
+  unsigned long long *stat_early_complete_ = nullptr;
+  /** [0]=resolves landing outside the block's table, [1]=last site id. */
+  unsigned long long *stat_bad_slot_ = nullptr;
+  /** [0]=claims that found NO usable slot, [1]=peak slots pinned at such a
+   *  moment. Sampled only on failure, so the hot path pays nothing. */
+  unsigned long long *stat_claim_fail_ = nullptr;
   /** Writebacks that came back with a NON-ZERO return code. AwaitPut cleared
    *  `flushing` without ever reading it, so a put that failed -- a full tier
    *  being the obvious way -- marked the page CLEAN and dropped its contents
@@ -268,6 +305,38 @@ class Held {
   CTP_GPU_FUN T *begin() const { return data_; }
   CTP_GPU_FUN T *end() const { return data_ + run_; }
   CTP_GPU_FUN T *ptr() const { return data_; }
+
+  /** Diagnostic: the page this guard's SLOT currently holds. A guard whose
+   *  slot does not hold the page the caller asked for is reading a frame
+   *  that belongs to someone else. */
+  /** Diagnostic: {pins, fetching} of this guard's slot, packed. */
+  /** Diagnostic: the page of the last get SUBMITTED into this guard's own
+   *  frame. Table-independent -- it reads the guard's slot directly, so it
+   *  is valid no matter which block table the slot belongs to. */
+  /** Diagnostic: this guard's slot object itself. */
+  CTP_GPU_FUN const void *dbg_slot_ptr() const { return page_; }
+
+  CTP_GPU_FUN clio::run::u64 dbg_slot_fetched() const {
+    return page_ == nullptr
+               ? ~static_cast<clio::run::u64>(0)
+               : *reinterpret_cast<volatile clio::run::u64 *>(
+                     &page_->dbg_get_page);
+  }
+
+  CTP_GPU_FUN clio::run::u32 dbg_slot_state() const {
+    if (page_ == nullptr) return ~0u;
+    const clio::run::u32 pins =
+        *reinterpret_cast<volatile clio::run::u32 *>(&page_->pins);
+    const clio::run::u32 f =
+        *reinterpret_cast<volatile clio::run::u32 *>(&page_->fetching);
+    return (pins << 8) | (f & 0xffu);
+  }
+
+  CTP_GPU_FUN clio::run::u64 dbg_slot_page() const {
+    return page_ == nullptr
+               ? ~static_cast<clio::run::u64>(0)
+               : *reinterpret_cast<volatile clio::run::u64 *>(&page_->page_num);
+  }
   /** Element access by GLOBAL offset; valid within [begin_off, end_off). */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) const {
     return data_[off - begin_];
@@ -471,6 +540,7 @@ class DeviceVector {
       last_page_ = p;
       last_pn_ = pn;
     }
+    DbgCheckInTable(p, 1);
     // EVERY successful hold takes one pin, which exactly one Held guard
     // adopts and releases; the fast path pins too, or a re-hold's guard
     // would release a pin nobody took.
@@ -497,6 +567,18 @@ class DeviceVector {
       __threadfence();
       if (*(volatile clio::run::u64 *)&p->page_num != pn ||
           *(volatile clio::run::u32 *)&p->fetching != 0u) {
+        ReleaseHoldPin(p);
+        last_page_ = nullptr;
+        return 0;
+      }
+      // A WRITE must not proceed into a page whose writeback is already in
+      // flight. SubmitPut clears `dirty` as it sends, so a store landing
+      // after the put's DMA would leave the page marked CLEAN with the
+      // update only in the frame -- and the next drop discards it. This is
+      // the prober's half of the eviction handshake (StartEvictionAsync
+      // has the other); the caller waits for the flush and retries.
+      if (write && (*(volatile clio::run::u32 *)&p->flushing != 0u ||
+                    *(volatile clio::run::u32 *)&p->evicting != 0u)) {
         ReleaseHoldPin(p);
         last_page_ = nullptr;
         return 0;
@@ -615,6 +697,7 @@ class DeviceVector {
       last_page_ = p;
       last_pn_ = pn;
     }
+    DbgCheckInTable(p, 2);
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
     *run = (count < left) ? count : left;
@@ -665,8 +748,23 @@ class DeviceVector {
 
   /** Offset of an element within its page. */
   CTP_GPU_FUN clio::run::u64 IndexIn(clio::run::u64 off, const Page *p) const {
+    // A PURE FUNCTION OF `off` -- never of the slot.
+    //
+    // The fallback arm used to read p->page_num, and that is shared mutable
+    // state: when it disagreed with the page `off` belongs to, the returned
+    // offset was wrong by (PageOf(off) - page_num) WHOLE PAGES, so the guard
+    // handed the caller a pointer into a different frame entirely. The
+    // reader then saw zeros (a frame nothing had fetched into) or another
+    // page's bytes (one that was in use), with the fetch, the rc, the pin
+    // and the slot all perfectly correct -- the out-of-core read corruption.
+    //
+    // The power-of-two arm was always immune because `off & page_mask_` does
+    // not consult the slot, which is exactly why every gate (64KB pages)
+    // passed while a 96KB-page run corrupted: 24576 elements is not a power
+    // of two, so only that configuration took the racy arm.
+    (void) p;
     return h_->page_shift_ ? (off & h_->page_mask_)
-                       : (off - p->page_num * h_->elems_per_page_);
+                           : (off - PageOf(off) * h_->elems_per_page_);
   }
 
  private:
@@ -1056,8 +1154,20 @@ class DeviceVector {
     }
     Page *p = &tbl[victim];
     if (p->dirty || p->flushing) {
+      // Same handshake as StartEvictionAsync, and MORE important here
+      // because AwaitPut BLOCKS: the victim was chosen with pins == 0, but
+      // ProbeHold pins without the lock and SubmitPut clears `dirty` as it
+      // sends, so a writer landing after the DMA would leave the page
+      // marked CLEAN with its update only in the frame.
+      p->evicting = 1u;
+      __threadfence();
+      if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+        p->evicting = 0u;
+        return false;              // a writer owns it; caller must wait
+      }
       SubmitPut(p);
       AwaitPut(p);
+      p->evicting = 0u;
     }
     if (!FreeVictimSlot(p)) {
       // A lock-free hold landed during the scan or the writeback: the page
@@ -1095,8 +1205,15 @@ class DeviceVector {
       if (victim == h_->pages_per_block_) return;   // nothing resident
       Page *p = &tbl[victim];
       if (p->dirty || p->flushing) {
+        p->evicting = 1u;          // see EvictWindowLocked for why
+        __threadfence();
+        if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+          p->evicting = 0u;
+          continue;                // a writer owns it; leave it alone
+        }
         SubmitPut(p);
         AwaitPut(p);
+        p->evicting = 0u;
       }
       if (!FreeVictimSlot(p)) continue;   // holder raced in; rescan skips it
       p->dirty = 0u;
@@ -1424,6 +1541,7 @@ class DeviceVector {
         np->has_user = 0u;
         np->last_access = Now();
         mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+        np->dbg_get_page = e.page;
         mb[0].page_slot[nf++] = slot;
         Bump(h_->stat_faults_);
         Bump(h_->stat_prefetches_);
@@ -1603,6 +1721,13 @@ class DeviceVector {
     UnlockBlock();
   }
 
+  /** True when `pg` is resident but its writeback is in flight, so a WRITE
+   *  hold must wait rather than store into it (see ProbeHold). */
+  CTP_GPU_FUN bool WriteBusy(clio::run::u64 pg) const {
+    const Page *p = Find(pg);
+    return p != nullptr && (p->flushing != 0u || p->evicting != 0u);
+  }
+
   /** Lock-free residency probe. RACY BY DESIGN: a concurrent claim can
    *  make it misread one page — callers only use it to decide whether a
    *  batched fault phase is worth entering, where either error is safe. */
@@ -1769,9 +1894,16 @@ class DeviceVector {
     // neighbours. Retrying inside the yield's reap step turns a transient
     // claim failure into one extra round instead of a livelock.
     for (;;) {
+      // ... and wait out an in-flight writeback for a WRITE hold, or the
+      // loop would spin without yielding: the page IS resident, so the
+      // residency condition alone never suspends, and `evicting` is only
+      // cleared by the reap step that a suspension runs.
       CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched(),
                           RetryLostFetch(PageOf(off))),
-                         !IsResident(PageOf(off)), FetchWaitTag(PageOf(off)));
+                         !IsResident(PageOf(off)) ||
+                             (write && WriteBusy(PageOf(off))),
+                         IsResident(PageOf(off)) ? FlushWaitTag()
+                                                 : FetchWaitTag(PageOf(off)));
       // 3. Resident for the whole block: the lock-free fast path. The probe
       // can still lose the slot to a concurrent claim between the vote and
       // the scan -- that is a MISS, and the answer is another park, never a
@@ -1831,6 +1963,103 @@ class DeviceVector {
    * started by FlushAsync on this block's table has completed. Reaps
    * completed puts as it waits. Block-collective.
    */
+  /**
+   * Is admission control armed on this vector?
+   *
+   * Call sites MUST test this before `co_await EnterHoldSet(...)`. An
+   * early-returning coroutine is not free: awaiting one still builds a frame
+   * on the yield stack and costs a __syncthreads, and at three per row that
+   * measured 110 ms/step against 43 with the awaits skipped -- i.e. the
+   * disabled path cost 2.5x all by itself.
+   */
+  /**
+   * Is admission in force RIGHT NOW? Call sites must latch this in a local
+   * at Enter and reuse that local at Exit: it can flip mid-run (see
+   * VecHeader::admit_armed_), and re-testing it at Exit would let a block
+   * release a reservation it never took.
+   */
+  CTP_GPU_FUN bool AdmissionOn() const {
+    return h_->hold_admits_ != nullptr && h_->admit_armed_ != nullptr &&
+           *(volatile unsigned int *) h_->admit_armed_ != 0u;
+  }
+
+  /**
+   * Do these two handles address the SAME page table (and so the same
+   * admission counter)?
+   *
+   * Callers must aggregate their reservations per TABLE, not per handle: two
+   * EnterHoldSet calls on one table by one block self-deadlock, because the
+   * second waits for capacity the first is already holding. The gather pass
+   * is launched as (src=dx, srcx=dx, dst=dx2) -- two of its three handles
+   * are the same vector -- so this is not hypothetical.
+   */
+  CTP_GPU_FUN bool SameTableAs(const DeviceVector<T> &o) const {
+    return h_->pages_ == o.h_->pages_;
+  }
+
+  /**
+   * How many pages the range [off, off+count) touches -- i.e. exactly how
+   * many guards holding it will take, since a hold is cut at each page
+   * boundary.
+   *
+   * This is what lets a caller reserve its TRUE hold set instead of a
+   * worst-case bound. It is pure arithmetic on the request, so it can run
+   * before any hold is taken, which is the ordering admission requires.
+   */
+  CTP_GPU_FUN clio::run::u32 PagesSpanned(clio::run::u64 off,
+                                          clio::run::u64 count) const {
+    if (count == 0) return 0;
+    return static_cast<clio::run::u32>(PageOf(off + count - 1) - PageOf(off)) +
+           1u;
+  }
+
+  /** Reserve `n` slots for this block's hold set, or fail without waiting. */
+  CTP_GPU_FUN bool TryAdmit(clio::run::u32 n) {
+    unsigned int *a = h_->hold_admits_;
+    clio::run::u32 cur = *(volatile unsigned int *) a;
+    while (cur + n <= h_->hold_admit_cap_) {
+      const clio::run::u32 old = atomicCAS(a, cur, cur + n);
+      if (old == cur) return true;
+      cur = old;
+    }
+    return false;
+  }
+
+  /**
+   * BASIC: `co_await vec.EnterHoldSet(n)` -- declare that this block is
+   * about to hold up to `n` pages AT ONCE, and wait until that many slots
+   * can be reserved for it. Pair with ExitHoldSet(n) once the guards die.
+   *
+   * Waiting happens while holding NOTHING, which is the whole point: a
+   * block that cannot be admitted parks without pinning anything, so it
+   * cannot contribute to the exhaustion it is waiting on.
+   *
+   * Block-collective. `n` is clamped to the cap so a single block is always
+   * admissible -- an unclamped request larger than the table would wait
+   * forever for slots that cannot exist.
+   */
+  __device__ clio::run::gpu::YCoroTask EnterHoldSet(clio::run::u32 n) {
+    if (h_->hold_admits_ == nullptr || n == 0) {
+      __syncthreads();
+      co_return;
+    }
+    if (n > h_->hold_admit_cap_) n = h_->hold_admit_cap_;
+    // Only thread 0 reserves; the others vote false, so the OR-vote inside
+    // the macro carries thread 0's answer to the whole block and every
+    // thread leaves together.
+    CLIO_CO_YIELD_WHEN((void) 0,
+                       (threadIdx.x == 0) ? !TryAdmit(n) : false,
+                       AdmitWaitTag());
+  }
+
+  /** Release a hold set's reservation. Pairs with one EnterHoldSet(n). */
+  CTP_GPU_FUN void ExitHoldSet(clio::run::u32 n) {
+    if (h_->hold_admits_ == nullptr || n == 0) return;
+    if (n > h_->hold_admit_cap_) n = h_->hold_admit_cap_;
+    __syncthreads();   // every guard in the set is dead before we give slots back
+    if (threadIdx.x == 0) atomicSub(h_->hold_admits_, n);
+  }
+
   __device__ clio::run::gpu::YCoroTask AwaitFlush() {
     // Reap BEFORE the first vote, not only after a resume. A put that
     // completed before this call makes AnyFlushInFlight() false on the
@@ -1887,7 +2116,19 @@ class DeviceVector {
    *  HoldPageCoro comment: a failed claim must not become a silent park). */
   CTP_GPU_FUN void RetryLostFetch(clio::run::u64 page_num) {
     if (threadIdx.x == 0 && Find(page_num) == nullptr) {
-      BeginFetch(page_num, /*is_prefetch=*/false);
+      if (!BeginFetch(page_num, /*is_prefetch=*/false)) {
+        // AND MAKE ROOM AGAIN. BeginFetch fails when the claim finds every
+        // candidate slot pinned, dirty or mid-transfer, and retrying it
+        // alone changes nothing: StartEvictionAsync runs ONCE, at the top
+        // of HoldPageCoro, so if its victim was taken by a sibling block
+        // before this block got there, no slot is ever freed again and the
+        // fault spins until the driver's round cap -- which used to be
+        // silent, so the kernel came back partially executed. Re-arming the
+        // eviction here is what the fault path's own contract says
+        // ("whoever needs room must arrange it"); it is a no-op when the
+        // page is already present or coming.
+        StartEvictionAsync(page_num);
+      }
     }
   }
 
@@ -1915,6 +2156,21 @@ class DeviceVector {
   }
 
   /** Same, for the first writeback still outstanding in this block. */
+  /**
+   * Admission waits with NO tag, i.e. tag 0 -- "always worth relaunching".
+   *
+   * A tag is polled by the host as `*tag != 0`, so the admission counter is
+   * exactly the wrong thing to point at: it is non-zero while the table is
+   * BUSY and zero when slots are free, so blocks were resumed while full
+   * and left parked once space appeared. That inversion deadlocked 48- and
+   * 40-slot runs that worked before admission existed. Tag 0 re-tries the
+   * reservation each round, which also lets the driver service fetches in
+   * between -- the reason a spin here would be fatal rather than merely
+   * wasteful (the yield driver exits the kernel to service a fault, so a
+   * block that never parks stops every fetch in the grid).
+   */
+  CTP_GPU_FUN clio::run::u64 AdmitWaitTag() const { return 0; }
+
   CTP_GPU_FUN clio::run::u64 FlushWaitTag() const {
     const Page *tbl = BlockPages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
@@ -2067,8 +2323,22 @@ class DeviceVector {
     }
     Page *p = &tbl[victim];
     if (p->dirty || p->flushing) {
+      // THE SAME HANDSHAKE THE CLEAN PATH USES, and for the same reason.
+      // The victim was chosen with pins == 0, but ProbeHold pins WITHOUT
+      // the block lock, so a write-hold can land in the window between
+      // that read and this writeback. SubmitPut clears `dirty` as it
+      // sends, so a writer whose data lands after the put's DMA leaves the
+      // page marked CLEAN with its update only in the frame -- and the
+      // next drop discards it. Publish `evicting`, fence, then re-read
+      // pins: a holder that raced in wins and the writeback is abandoned
+      // (the page stays dirty and will be flushed later).
       p->evicting = 1u;        // tells ReapFlushed to release the slot
-      SubmitPut(p);            // async; the caller yields on AnyTransferInFlight
+      __threadfence();
+      if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+        p->evicting = 0u;      // someone is writing it; do not write back
+      } else {
+        SubmitPut(p);          // async; caller yields on AnyTransferInFlight
+      }
     } else if (FreeVictimSlot(p)) {
       Bump(h_->stat_evicts_);
     }
@@ -2388,12 +2658,60 @@ class DeviceVector {
    * first's RunContext ("null RunContext" at varying points, constant under
    * an eviction storm, rare but latent in ordinary fused decode).
    */
+  /**
+   * DIAGNOSTIC: a resolved slot MUST live in this block's own table. A
+   * pointer outside it means the lookup and the fetch are addressing
+   * different tables, and the guard hands out a frame nothing fetched into.
+   * `site` identifies which resolve produced it.
+   */
+  CTP_GPU_FUN void DbgCheckInTable(const Page *p, clio::run::u32 site) const {
+    if (h_->stat_bad_slot_ == nullptr || p == nullptr) return;
+    const Page *tbl = BlockPages();
+    if (p < tbl || p >= tbl + h_->pages_per_block_) {
+      atomicAdd(h_->stat_bad_slot_, 1ull);
+      atomicMax(reinterpret_cast<unsigned long long *>(h_->stat_bad_slot_ + 1),
+                static_cast<unsigned long long>(site));
+    }
+  }
+
   CTP_GPU_FUN clio::run::u32 BlockIndex() const {
     const clio::run::u32 raw =
         block_override_ != kNoBlockOverride ? block_override_ : blockIdx.x;
     return raw % h_->nblocks_;
   }
 
+ public:
+  /**
+   * Diagnostic: which page is parked in slot `sl` of THIS block right now.
+   * Exposed so a kernel can look for a page occupying two slots at the exact
+   * moment it reads a bad value -- a transient duplicate is invisible to any
+   * host-side check that runs once the kernel is already quiescent.
+   */
+  /** Diagnostic: the frame address slot `sl` is backed by. */
+  /** Diagnostic: index of a slot within THIS block's table, or -1. */
+  CTP_GPU_FUN long long DbgSlotIndexOf(const void *slot) const {
+    if (slot == nullptr) return -1;
+    const Page *tbl = BlockPages();
+    const Page *p = static_cast<const Page *>(slot);
+    if (p < tbl || p >= tbl + h_->pages_per_block_) return -1;
+    return static_cast<long long>(p - tbl);
+  }
+
+  CTP_GPU_FUN const void *DbgFrameAt(clio::run::u32 sl) const {
+    return BlockPages()[sl].data;
+  }
+
+  CTP_GPU_FUN clio::run::u64 DbgGetPageAt(clio::run::u32 sl) const {
+    return *reinterpret_cast<volatile clio::run::u64 *>(
+        &BlockPages()[sl].dbg_get_page);
+  }
+
+  CTP_GPU_FUN clio::run::u64 PageAt(clio::run::u32 sl) const {
+    return *reinterpret_cast<volatile clio::run::u64 *>(
+        &BlockPages()[sl].page_num);
+  }
+
+ private:
   CTP_GPU_FUN Page *BlockPages() const {
     return h_->pages_ +
            static_cast<clio::run::u64>(BlockIndex()) * h_->pages_per_block_;
@@ -2525,11 +2843,19 @@ class DeviceVector {
     t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
     Bump(h_->stat_puts_);
-    p->put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->put));
-    // Clean as of THIS put: the bytes it carries are what the page held
-    // when it was submitted. A later write dirties it again for the next.
+    // PUBLISH BEFORE ISSUING THE TRANSFER, not after. Send() queues the
+    // put, so its DMA may begin immediately; clearing `dirty` afterwards
+    // leaves a window in which a store is BOTH missed by the DMA and
+    // stripped of its dirty flag -- silently lost, with the page then
+    // looking clean and droppable. Done in this order the invariant holds:
+    // everything written before this point is captured by the transfer,
+    // and anything written after it re-dirties the page and survives.
+    // Setting `flushing` first also means a concurrent write-hold sees it
+    // and backs off (see ProbeHold) rather than racing the DMA.
     p->dirty = 0u;
     p->flushing = 1u;
+    __threadfence();
+    p->put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->put));
   }
 
   /** Header fields of a batch task; the records are appended by the caller. */
@@ -2776,6 +3102,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb->get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb->page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -2851,6 +3178,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb[0].page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -2937,6 +3265,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb[0].page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -2993,7 +3322,24 @@ class DeviceVector {
     const clio::run::u32 free_slot = ClaimSlotWindowLocked(page_num);
     // Every candidate mid-transfer: report failure rather than stalling, so
     // the caller simply falls back to a demand fault later.
-    if (free_slot == ~0u) return false;
+    if (free_slot == ~0u) {
+      // DERIVING THE CACHE FLOOR, at the only moment it matters: a claim
+      // that found nothing. Count how much of the table is PINNED right
+      // now. If that approaches the slot count, every slot is spoken for by
+      // a live hold and no block can assemble its working set while the
+      // others hold theirs -- the wedge. Sampled on failure only, so the
+      // hot path pays nothing and the measurement does not perturb the
+      // timing of the thing being measured.
+      if (h_->stat_claim_fail_ != nullptr && threadIdx.x == 0) {
+        atomicAdd(h_->stat_claim_fail_, 1ull);
+        unsigned long long pinned = 0;
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+          if (*(volatile clio::run::u32 *) &tbl[i].pins != 0u) ++pinned;
+        }
+        atomicMax(h_->stat_claim_fail_ + 1, pinned);
+      }
+      return false;
+    }
     Page *p = &tbl[free_slot];
     // Same ordering as the synchronous claim: busy first, then the page
     // number. Reversed, HoldPage's lock-free scan can see a slot that looks
@@ -3001,6 +3347,7 @@ class DeviceVector {
     p->fetching = 1u;
     __threadfence_block();
     p->gen += 1u;
+    p->dbg_get_page = kNoPage;
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -3062,6 +3409,7 @@ class DeviceVector {
     p->fetching = 4u;
     __threadfence_block();
     p->gen += 1u;
+    p->dbg_get_page = kNoPage;
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -3141,7 +3489,18 @@ class DeviceVector {
     if (is_prefetch) Bump(h_->stat_prefetches_);
     XferAdd(1);
     p->fetching = 1u;                     // already set by the claim; keep it
+    p->dbg_get_page = page_num;
     p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
+    // DIAGNOSTIC (publish-before-fill hunt): the POD's completion flag must
+    // read NOT-COMPLETE immediately after a Send -- the Send resets it to 0.
+    // If it reads 1 here, the reset lost the race against the PREVIOUS
+    // request's CPU-side completion store, and this brand-new get already
+    // looks finished: ReapFetched will clear `fetching` and publish the frame
+    // before a single byte of the new page has landed.
+    if (h_->stat_early_complete_ != nullptr &&
+        p->get->fut_.is_complete_.load() != 0) {
+      atomicAdd(h_->stat_early_complete_, 1ull);
+    }
     if (p->get_fut.IsNull()) {
       Bump(h_->stat_get_errors_);
     }
@@ -3283,6 +3642,7 @@ class DeviceVector {
           p->fetching = 1u;
           __threadfence_block();
           p->gen += 1u;
+          p->dbg_get_page = kNoPage;
           p->page_num = page_num;
           p->dirty = 0u;
           p->flushing = 0u;

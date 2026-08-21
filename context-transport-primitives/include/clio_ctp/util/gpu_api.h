@@ -944,15 +944,31 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // memory: device, managed, or PINNED host — a pageable pointer (ingest
   // buffers) must stay on the engine path (those copies never run under a
   // resident kernel; converting them crashed ingest outright).
+  // THE COPY KERNEL IS ONLY FOR TRUE DEVICE-RESIDENT MEMORY.
+  //
+  // This used to count MAPPED PINNED HOST memory as "device" (type == Host
+  // with a non-null devicePointer). That made a plain D2H staging copy --
+  // device task POD into a pinned host buffer -- take the kernel path, and a
+  // kernel launch is exactly what a resident kernel blocks. Copy engines are
+  // exempt from that; kernel launches queue behind it.
+  //
+  // The deadlock: a producer kernel Sends a task and spins in-kernel on its
+  // completion flag. The worker picks the task up, stages the POD with this
+  // function, gets the copy KERNEL, and that kernel cannot launch until the
+  // producer exits -- which it will not do until the task completes. The GPU
+  // sat at 100% with every worker healthy and stalls_detected=0, hung on a
+  // 448-byte copy. Kernels that PARK (the gpu_vector coroutine path) hid it,
+  // because exiting to yield lets the queued copy kernel through.
+  //
+  // Mapped host memory is perfectly reachable by cudaMemcpyAsync, so routing
+  // it to the copy engine is both correct and what unblocks the case.
   auto dev_ok = [](const void *p) {
     cudaPointerAttributes a{};
     if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
       (void)cudaGetLastError();
       return false;
     }
-    return a.type == cudaMemoryTypeDevice ||
-           a.type == cudaMemoryTypeManaged ||
-           (a.type == cudaMemoryTypeHost && a.devicePointer != nullptr);
+    return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
   };
   if (dev_ok(dst) && dev_ok(src)) {
     ctp_copy_kernel_launch(static_cast<char *>(dst),

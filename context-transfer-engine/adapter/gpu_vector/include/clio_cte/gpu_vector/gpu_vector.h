@@ -167,13 +167,23 @@ class Vector {
     clio::run::u64 prefetch_hits = 0;   // arrivals found already in flight
     clio::run::u64 rescores = 0;        // placement hints sent
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
+    /** Gets whose POD already read COMPLETE the instant it was sent -- a
+     *  stale completion flag from the slot's previous request. */
+    clio::run::u64 early_complete = 0;
+    /** Resolves that returned a slot outside the block's own page table. */
+    clio::run::u64 bad_slot = 0;
+    clio::run::u64 bad_slot_site = 0;
+    /** Claims that found no usable slot, and the peak number of slots
+     *  pinned at such a moment -- the floor a cache must exceed. */
+    clio::run::u64 claim_fails = 0;
+    clio::run::u64 peak_pinned_on_fail = 0;
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
     clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
     clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
     clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
     clio::run::u64 put_errors = 0;      // writebacks that returned non-zero
   };
-  static constexpr int kNumStats = 12;
+  static constexpr int kNumStats = 17;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -222,6 +232,15 @@ class Vector {
       kv.second.hdr.stat_verify_ok_ = c + 9;
       kv.second.hdr.stat_verify_lost_ = c + 10;
       kv.second.hdr.stat_put_errors_ = c + 11;
+      kv.second.hdr.stat_early_complete_ = c + 12;
+      kv.second.hdr.stat_bad_slot_ = c + 13;   // c + 14 is its site id
+      // OFF unless asked for: the claim-failure sampler walks the whole
+      // table under the block lock, and that cost is enough to move the
+      // livelock boundary it exists to measure (40 slots ran at 58.8
+      // ms/step without it and wedged with it). Opt in with
+      // CLIO_GV_CLAIM_PROF=1 when profiling, never in a timed run.
+      kv.second.hdr.stat_claim_fail_ =
+          (std::getenv("CLIO_GV_CLAIM_PROF") != nullptr) ? c + 15 : nullptr;
       kv.second.hdr.trace_put_errors_ =
           (std::getenv("CLIO_GV_TRACE_PUT_ERRORS") != nullptr) ? 1u : 0u;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
@@ -343,6 +362,11 @@ class Vector {
     s.prefetch_hits = h[4];
     s.rescores = h[5];
     s.put_errors = h[11];
+    s.early_complete = h[12];
+    s.bad_slot = h[13];
+    s.bad_slot_site = h[14];
+    s.claim_fails = h[15];
+    s.peak_pinned_on_fail = h[16];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
     s.pf_dropped = h[8];
@@ -493,6 +517,46 @@ class Vector {
   }
 
   /**
+   * DIAGNOSTIC: every slot must own the frame its index names --
+   * InitPageTable sets slot i -> pages_base + i * page_bytes and nothing may
+   * ever rewrite it. A violation means a reader can be handed a pointer into
+   * a frame no transfer for its page ever targeted.
+   * @return number of slots whose data pointer disagrees with their index.
+   */
+  clio::run::u64 AuditFrames(const char *when) {
+    clio::run::u64 bad = 0;
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      const clio::run::u64 nslots =
+          static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+      std::vector<Page> tbl(static_cast<size_t>(nslots));
+      ctp::GpuApi::Memcpy(tbl.data(), reinterpret_cast<Page *>(st.table_base),
+                          nslots * sizeof(Page));
+      for (clio::run::u64 i = 0; i < nslots; ++i) {
+        const char *want = st.pages_base + i * page_bytes_;
+        if (static_cast<const char *>(tbl[i].data) != want) {
+          if (bad < 8) {
+            std::fprintf(stderr,
+                         "[frame-audit %s] slot %llu: data=%p want=%p "
+                         "(off by %lld frames), page_num=%lld\n",
+                         when, (unsigned long long)i, tbl[i].data,
+                         (const void *)want,
+                         (long long)((static_cast<const char *>(tbl[i].data) -
+                                      want) / (long long)page_bytes_),
+                         (long long)tbl[i].page_num);
+          }
+          ++bad;
+        }
+      }
+    }
+#else
+    (void)when;
+#endif
+    return bad;
+  }
+
+  /**
    * DIAGNOSTIC (chasing intermittent post-Prefetch corruption): compare every
    * resident cache frame in blocks [blk_lo, blk_hi) against the caller's
    * expected bytes, and independently re-get each page from the backing
@@ -595,6 +659,49 @@ class Vector {
     (void)pg_lo; (void)pg_hi; (void)blk_lo; (void)blk_hi; (void)expect;
 #endif
     return bad;
+  }
+
+  /**
+   * DIAGNOSTIC: how many pages are held by MORE THAN ONE slot of the same
+   * block table, and how many of those duplicates are dirty.
+   *
+   * A page in two slots is the hazard WaySlot's comment warns about: a
+   * racy "not resident" probe re-fetches a page that is already present,
+   * and afterwards a lookup can pick either copy. If one of them carries
+   * writes the other does not, reads go back in time and updates vanish --
+   * which is what an out-of-core run losing exactly one half-kick per page
+   * looks like. Cheap, host-side, quiescent-only.
+   *
+   * @return duplicated page count; *dirty_dups gets those with >1 dirty.
+   */
+  clio::run::u64 CountDuplicateSlots(int dev_id, clio::run::u64 *dirty_dups) {
+    clio::run::u64 dups = 0;
+    if (dirty_dups != nullptr) *dirty_dups = 0;
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(dev_id);
+    if (it == devs_.end()) return 0;
+    DevState &st = it->second;
+    const clio::run::u32 ppb = pages_per_block_;
+    std::vector<Page> tbl(static_cast<size_t>(nblocks_) * ppb);
+    ctp::GpuApi::Memcpy(tbl.data(), reinterpret_cast<Page *>(st.table_base),
+                        tbl.size() * sizeof(Page));
+    for (clio::run::u32 b = 0; b < nblocks_; ++b) {
+      const Page *t = tbl.data() + static_cast<size_t>(b) * ppb;
+      for (clio::run::u32 i = 0; i < ppb; ++i) {
+        if (t[i].page_num == kNoPage) continue;
+        for (clio::run::u32 j = i + 1; j < ppb; ++j) {
+          if (t[j].page_num != t[i].page_num) continue;
+          ++dups;
+          if (dirty_dups != nullptr && (t[i].dirty || t[j].dirty)) {
+            ++(*dirty_dups);
+          }
+        }
+      }
+    }
+#else
+    (void)dev_id;
+#endif
+    return dups;
   }
 
   /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
@@ -937,7 +1044,39 @@ class Vector {
     }
 #endif
 
+    // Admission counter for hold sets (see VecHeader::hold_admits_). One
+    // u32 for the whole vector; the cap is the table's slot count, so the
+    // slots blocks have collectively reserved can never exceed the slots
+    // that exist.
+    // OPT-IN (CLIO_GV_ADMIT=1). Admission provably converts the small-cache
+    // livelock into a slow-but-correct run -- a 32-slot/64-block config that
+    // wedged indefinitely completes with it -- but as currently sized it
+    // reserves a chunk's WORST-CASE guard count, which admits only a few of
+    // 64 blocks and costs 2.5-3x (48 slots: 43 ms/step without, 112-124
+    // with). Until the reservation is sized from the true concurrent hold
+    // set rather than a bound, paying that on every run is the wrong
+    // default. A null counter makes Enter/ExitHoldSet no-ops.
+    void *admits = ctp::GpuApi::Malloc<void>(sizeof(unsigned int));
+    if (admits == nullptr) {
+      throw std::runtime_error("gpu_vector: admission counter alloc failed");
+    }
+    ctp::GpuApi::Memset(admits, 0, sizeof(unsigned int));
+    // [0] armed flag, [1] failed-claim count. Armed from the start only when
+    // forced; otherwise the device arms it if the livelock signature shows
+    // up, so a comfortable cache never pays admission's ~2.3x and a cache
+    // too small throttles instead of wedging.
+    void *armed = ctp::GpuApi::Malloc<void>(2 * sizeof(unsigned int));
+    if (armed == nullptr) {
+      throw std::runtime_error("gpu_vector: admission flag alloc failed");
+    }
+    const unsigned int arm_init[2] = {
+        (std::getenv("CLIO_GV_ADMIT") != nullptr) ? 1u : 0u, 0u};
+    ctp::GpuApi::Memcpy(static_cast<unsigned int *>(armed), arm_init, 2);
+
     VecHeader v;   // filled here, then uploaded; the view only points at it
+    v.hold_admits_ = static_cast<unsigned int *>(admits);
+    v.admit_armed_ = static_cast<unsigned int *>(armed);
+    v.hold_admit_cap_ = pages_per_block_;
     v.xfer_cnt_ = static_cast<unsigned int *>(xfers);
     v.block_locks_ = static_cast<int *>(locks);
     v.task_seq_ = static_cast<unsigned long long *>(seq);
@@ -983,6 +1122,7 @@ class Vector {
     for (clio::run::u64 i = 0; i < nslots; ++i) {
       Page &p = table[static_cast<size_t>(i)];
       p.page_num = kNoPage;
+      p.dbg_get_page = kNoPage;
       p.data = st.pages_base + i * page_bytes_;
       p.score = 0.0f;
       p.user_score = 0.0f;
@@ -1094,6 +1234,14 @@ class Vector {
     }
     if (st.hdr.task_seq_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.task_seq_);
+    }
+    if (st.hdr.hold_admits_ != nullptr) {
+      ctp::GpuApi::Free(st.hdr.hold_admits_);
+      st.hdr.hold_admits_ = nullptr;
+    }
+    if (st.hdr.admit_armed_ != nullptr) {
+      ctp::GpuApi::Free(st.hdr.admit_armed_);
+      st.hdr.admit_armed_ = nullptr;
     }
     if (st.hdr.block_locks_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.block_locks_);

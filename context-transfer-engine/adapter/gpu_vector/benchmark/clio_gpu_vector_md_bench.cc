@@ -61,12 +61,45 @@ static constexpr u32 kStride = 4;
  *  [3] pair loop [4] whole row loop [5] rows processed. */
 __device__ unsigned long long g_md_cyc[8];
 
+/** Page iterations actually completed by the integrator, summed over
+ *  blocks. Distinguishes WORK DROPPED (driver/park bookkeeping) from DATA
+ *  CORRUPTED (the paging path): the expected count is exact and known. */
+__device__ unsigned long long g_pages_done;
+/** Sink for the ballistic path's optional THIRD vector read, so the load
+ *  cannot be optimised away while the physics stays untouched. */
+__device__ unsigned long long g_third_sink;
+/** READ-ONLY PROBE (--readprobe). Every experiment so far assumed writes
+ *  were being lost; this asks the other half of the question -- does the
+ *  FAULT PATH ever deliver wrong bytes? The vector is seeded with a value
+ *  that is unique per element and exact in float, then only READ.
+ *  [0] mismatches [1] first bad page [2] first bad index. */
+__device__ unsigned long long g_read_bad[4];
+/** First bad sample: {claimed, page, elem, observed-value-as-u32-bits}. */
+__device__ unsigned long long g_read_sample[8];
+/** Set from MD_PROBE_LDCG: read the probe's elements bypassing L1. */
+__device__ bool kProbeLdcg;
+/** {frame0, pages_per_block, page_bytes, elems_per_page} of the probe's table. */
+__device__ unsigned long long g_read_geom[12];
+/** Per LOGICAL block: page iterations completed, and the last page index
+ *  reached. Says WHICH block loses work, and where it stopped. */
+__device__ unsigned long long g_blk_done[64];
+__device__ unsigned long long g_blk_last[64];
+
 /** Guards a block may hold over one row of the paged list. Deliberately
  *  small: this array lives in the per-thread coroutine FRAME, so every
  *  slot costs frame footprint whether used or not, and the list page is
  *  sized to hold a whole row (one guard, two across a boundary). The host
  *  validates the bound in configuration terms before any run. */
 static constexpr int kMaxNlGuards = 4;
+
+/**
+ * Worst-case x-span guards a force chunk holds at once: three z planes, each
+ * up to two y ranges when the stencil crosses the y wrap, each range up to
+ * two guards when it straddles a page boundary. Reserved up front because
+ * the true count is not known until the spans are computed, and reserving
+ * after the first hold is exactly the deadlock admission exists to prevent.
+ */
+static constexpr u32 kSpanGuards = 12;
 
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_MD_CORO 1
@@ -103,12 +136,17 @@ struct Args {
   u32 blocks = 64;
   u32 threads = 256;
   u32 slots = 0;           // x/v cache slots per block; 0 = resident (auto)
+  u32 ppslots = 0;         // resort ping-pong cache slots; 0 = same as slots
+  u32 fslots = 0;          // force-vector cache slots; 0 = same as slots
+  u32 vslots = 0;          // velocity cache slots; 0 = same as slots
   u64 steps = 100;
   u64 rebin = 20;          // resort cadence (steps); 0 = never
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  int per_block = 0;       // one page table PER CUDA BLOCK (the designed
+                           // model) instead of one shared table
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
@@ -119,6 +157,7 @@ struct Args {
   double drift_tol = 5e-4;
   double dt = 0.005;
   int gate = 1;            // stage 1: the ballistic gate IS the run
+  int readprobe = 0;       // read-only paging probe (no writes at all)
   int md = 0;              // stage 2: real LJ forces + NVE, statics gates
   double g[3] = {0.1, -0.05, 0.02};   // constant acceleration for the gate
 };
@@ -472,6 +511,45 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     if (y0 >= nb) continue;
     const u32 ylast = (y0 + rowchunk - 1 < nb) ? (y0 + rowchunk - 1)
                                                : (nb - 1);
+    // Same admission as the force chunk, and for the same reason: this
+    // kernel's span guards live for the whole chunk and its list guards are
+    // WRITE holds, so it exhausts the very same tables. Admitting only the
+    // force kernel just relocates the exhaustion to this one -- every hold
+    // set in the grid has to be admitted, or none of them are protected.
+    u32 span_guards = 0;
+    {
+      const int lo0 = static_cast<int>(y0) - 1;
+      const int hi0 = static_cast<int>(ylast) + 1;
+      for (int dz = -1; dz <= 1; ++dz) {
+        const u32 wz = (bz + nb + dz) % nb;
+        u32 rl[2], rn[2], nr = 0;
+        if (lo0 < 0) {
+          rl[nr] = 0; rn[nr] = static_cast<u32>(hi0) + 1u; ++nr;
+          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+        } else if (hi0 > static_cast<int>(nb) - 1) {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = nb - static_cast<u32>(lo0); ++nr;
+          rl[nr] = 0; rn[nr] = 1u; ++nr;
+        } else {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = static_cast<u32>(hi0 - lo0 + 1); ++nr;
+        }
+        for (u32 t = 0; t < nr; ++t) {
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+          span_guards += x.PagesSpanned(rb, static_cast<u64>(rn[t]) * row_elems);
+        }
+      }
+    }
+    // LATCHED. Admission can arm mid-run (the livelock watchdog), so the
+    // decision is taken once here and reused at the release below; retesting
+    // it there would let a block give back a reservation it never took.
+    const bool adm = x.AdmissionOn();
+    if (adm) {
+      co_await x.EnterHoldSet(span_guards);
+      co_await nl.EnterHoldSet(kMaxNlGuards);
+    }
+    {   // guards die at the close of this scope, before the reservations go back
     gv::Held<float> hg[6][2];
     u64 srun[6];
     const float *sp0[6], *sp1[6];
@@ -623,6 +701,11 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     }
     __syncthreads();
     }   // per-row loop
+    }
+    if (adm) {
+      nl.ExitHoldSet(kMaxNlGuards);
+      x.ExitHoldSet(span_guards);
+    }
   }     // per-chunk loop
 }
 
@@ -687,6 +770,64 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // The stencil rows for the whole chunk: [y0-1, ylast+1] mod nb at
     // each of the three z planes, as one contiguous run (two when the
     // range crosses the y wrap).
+    //
+    // ADMITTED BEFORE THE FIRST HOLD. These span guards stay alive for the
+    // whole chunk, so without admission enough blocks pin the entire table
+    // between them and no claim can succeed -- measured as 48 of 48 slots
+    // pinned at a failing claim, and as a 32-slot cache that wedges at 64
+    // blocks but runs at 32. Waiting here costs nothing held; waiting after
+    // the first hold is what deadlocks.
+    // How many spans this chunk will actually hold. The y range
+    // [y0-1, ylast+1] splits in two only when it crosses the wrap, and the
+    // split depends solely on (y0, ylast, nb) -- the same for all three z
+    // planes. So the count is pure geometry, known BEFORE any hold, and
+    // reserving it beats reserving the worst case: at 48 slots the blanket
+    // 12 admitted only 4 of 64 blocks and cost 124 ms/step against 43.
+    // EXACTLY how many x guards this chunk will hold. The span geometry is
+    // pure arithmetic, and PagesSpanned turns each span into the number of
+    // guards holding it takes, so the reservation is the true hold set
+    // rather than a bound. The bound (3 planes x 2 ranges x 2 guards = 12)
+    // over-reserved badly enough to admit only a few of 64 blocks, which is
+    // what made admission cost 2.5-3x and kept it opt-in.
+    u32 span_guards = 0;
+    {
+      const int lo0 = static_cast<int>(y0) - 1;
+      const int hi0 = static_cast<int>(ylast) + 1;
+      for (int dz = -1; dz <= 1; ++dz) {
+        const u32 wz = (bz + nb + dz) % nb;
+        u32 rl[2], rn[2], nr = 0;
+        if (lo0 < 0) {
+          rl[nr] = 0; rn[nr] = static_cast<u32>(hi0) + 1u; ++nr;
+          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+        } else if (hi0 > static_cast<int>(nb) - 1) {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = nb - static_cast<u32>(lo0); ++nr;
+          rl[nr] = 0; rn[nr] = 1u; ++nr;
+        } else {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = static_cast<u32>(hi0 - lo0 + 1); ++nr;
+        }
+        for (u32 t = 0; t < nr; ++t) {
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+          span_guards += x.PagesSpanned(rb, static_cast<u64>(rn[t]) * row_elems);
+        }
+      }
+    }
+    // ALL THREE RESERVATIONS BEFORE ANY HOLD. Reserving x, taking the x
+    // holds, and only then waiting for f/nl admission is the very
+    // hold-while-waiting pattern admission exists to remove -- just moved
+    // across vectors: blocks sit on x slots waiting for f, so x is
+    // exhausted by blocks that are themselves blocked. Acquiring every
+    // reservation up front, while holding nothing, is what makes the
+    // guarantee hold across the whole working set rather than per vector.
+    const bool adm = x.AdmissionOn();   // latched; see the build pass
+    if (adm) {
+      co_await x.EnterHoldSet(span_guards);
+      co_await f.EnterHoldSet(2);
+      co_await nl.EnterHoldSet(kMaxNlGuards);
+    }
+    {   // guards die at the close of this scope, before ExitHoldSet
     gv::Held<float> hg[6][2];
     u64 srun[6];
     const float *sp0[6], *sp1[6];
@@ -732,6 +873,13 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // and only 9 entries, so thread 0 resolves it once per row.
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
+    // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
+    // Every paged vector needs it, not just x -- f and nl have their own
+    // tables and can exhaust them exactly the same way. Tightening only x's
+    // reservation re-wedged a 32-slot run precisely because the blanket
+    // reservation had been throttling f/nl concurrency by accident. A fixed
+    // acquisition order is what keeps the nesting (x held while waiting for
+    // f) from forming a cycle.
     gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
     gv::Held<float> hf1;
     const u64 frun0 = hf0.run();
@@ -852,10 +1000,28 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(&g_md_cyc[3], (unsigned long long)(clock64() - _p0));
-      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+      // NOT the chunk total here. _r0 is stamped once per CHUNK, so
+      // accumulating (now - _r0) once per ROW sums rowchunk overlapping
+      // spans and inflates the total by ~rowchunk -- which made the named
+      // phases look like a quarter of the kernel and invented a 74%
+      // "unattributed" gap that does not exist. The chunk total is taken
+      // once, after the row loop.
       atomicAdd(&g_md_cyc[5], 1ull);
     }
     }   // per-row loop
+    // The chunk total, taken ONCE. See the note at g_md_cyc[5].
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+    }
+    // Every span guard above is dead here (the chunk body scope ends with
+    // this brace), so the reservation is given back exactly once per
+    // EnterHoldSet. The only chunk-level `continue` is above the Enter.
+    }
+    if (adm) {
+      nl.ExitHoldSet(kMaxNlGuards);
+      f.ExitHoldSet(2);
+      x.ExitHoldSet(span_guards);
+    }
   }     // per-chunk loop
   if (eflag) {
     const double vals[3] = {pe, w, npairs};
@@ -932,86 +1098,150 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
  * so no two atoms share a destination. `keep_w` carries the type lane for
  * x and writes 0 for v.
  */
-__device__ gy::YCoroMain ScatterCoro(gv::DeviceVector<float> src,
-                                     gv::DeviceVector<float> srcx,
-                                     gv::DeviceVector<float> dst, u32 nb,
-                                     u32 cap, const u32 *d_dest, int keep_w,
-                                     u32 nblocks, u32 block) {
-  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+/**
+ * K2b as a GATHER, not a scatter (the page-boundary rule).
+ *
+ * A scatter has block r writing destination rows r-1..r+1 while block r+1
+ * writes r..r+2: their destination spans OVERLAP, so two blocks write the
+ * same page. Resident that is invisible -- one frame, disjoint slots,
+ * nothing evicts -- but with page-granular writeback one block's eviction
+ * discards the other's writes, which showed up out of core as an
+ * intermittent CUDA fatal, a 10x energy drift, or NaN, run to run on the
+ * same command.
+ *
+ * Inverted, each block OWNS one destination row and PULLS into it: it
+ * scans the nine source rows that could possibly target this row (an atom
+ * moves at most one bin per rebuild window) and copies the ones whose
+ * recorded destination lands here. Every destination slot then has exactly
+ * ONE writer and no page is written by two blocks. The cost is reading
+ * nine source rows per destination row instead of one, which is the same
+ * stencil shape the force pass already pays and is safe to share because
+ * it is read-only.
+ */
+__device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
+                                    gv::DeviceVector<float> srcx,
+                                    gv::DeviceVector<float> dst, u32 nb,
+                                    u32 cap, const u32 *d_dest, int keep_w,
+                                    u32 nblocks, u32 block) {
+  const u64 islots = static_cast<u64>(nb) * cap;
+  const u64 row_elems = islots * kStride;
   const u64 nrows = static_cast<u64>(nb) * nb;
   for (u64 row = block; row < nrows; row += nblocks) {
     const u32 by = static_cast<u32>(row % nb);
     const u32 bz = static_cast<u32>(row / nb);
-    // Hold the NINE destination stencil rows for writing.
-    gv::Held<float> hg[9][2];
-    u64 rbase[9], rrun0[9];
-    float *rp0[9], *rp1[9];
-    for (int q = 0; q < 9; ++q) {
-      const int dz = q / 3 - 1, dy = q % 3 - 1;
+    // THE ONLY WRITE HOLD: this block's own destination row.
+    // ADMITTED, with reservations AGGREGATED PER TABLE. This pass is
+    // launched as (src=dx, srcx=dx, dst=dx2), so two of its three handles
+    // are the same vector; issuing one Enter per handle made the second
+    // wait for capacity the block itself was already holding, which
+    // self-deadlocked and turned a 24-slot marginal pass into a hard wedge.
+    // One Enter per distinct table, counts summed, is the rule.
+    u32 nd = 2, ns = kSpanGuards, nx = kSpanGuards;
+    if (src.SameTableAs(dst)) { nd += ns; ns = 0; }
+    if (srcx.SameTableAs(dst)) { nd += nx; nx = 0; }
+    else if (srcx.SameTableAs(src)) { ns += nx; nx = 0; }
+    const bool adm = dst.AdmissionOn();   // latched; see the build pass
+    if (adm) {
+      co_await dst.EnterHoldSet(nd);
+      if (ns != 0) co_await src.EnterHoldSet(ns);
+      if (nx != 0) co_await srcx.EnterHoldSet(nx);
+    }
+    {   // every guard dies at this scope's close, before the reservations
+    gv::Held<float> hd0 = co_await dst.HoldPage(row * row_elems, row_elems,
+                                                /*write=*/true);
+    gv::Held<float> hd1;
+    const u64 drun = hd0.run();
+    if (drun < row_elems) {
+      hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
+                                  /*write=*/true);
+    }
+    float *const dp0 = hd0.ptr();
+    float *const dp1 = hd1 ? hd1.ptr() : nullptr;
+    // The nine candidate source rows, held as SPANS (one or two contiguous
+    // runs per dz), of both vectors -- they are the same vector on the
+    // position pass, where the second hold is a cache hit. Row-at-a-time
+    // holds needed 36 live guards and overflowed the coroutine frame.
+    gv::Held<float> hs[6][2], hx[6][2];
+    u64 srun[6], xrun[6];
+    const float *sp0[6], *sp1[6], *xp0[6], *xp1[6];
+    u32 qspan[9];
+    u64 qoff[9];
+    u64 srow[9];
+    u32 nspans = 0;
+    for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
-      const u32 wy = (by + nb + dy) % nb;
-      rbase[q] = ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
-      hg[q][0] = co_await dst.HoldPage(rbase[q], row_elems, true);
-      rrun0[q] = hg[q][0].run();
-      if (rrun0[q] < row_elems) {
-        hg[q][1] =
-            co_await dst.HoldPage(rbase[q] + rrun0[q], row_elems - rrun0[q],
-                                  true);
+      const int lo = static_cast<int>(by) - 1;
+      const int hi = static_cast<int>(by) + 1;
+      u32 rl[2], rn[2], nr = 0;
+      if (lo < 0) {
+        rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+        rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+      } else if (hi > static_cast<int>(nb) - 1) {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
+        rl[nr] = 0; rn[nr] = 1u; ++nr;
+      } else {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = 3u; ++nr;
       }
-      rp0[q] = hg[q][0].ptr();
-      rp1[q] = hg[q][1] ? hg[q][1].ptr() : nullptr;
+      for (u32 t = 0; t < nr; ++t) {
+        const u64 rb =
+            (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
+        const u64 len = static_cast<u64>(rn[t]) * row_elems;
+        hs[nspans][0] = co_await src.HoldPage(rb, len);
+        srun[nspans] = hs[nspans][0].run();
+        if (srun[nspans] < len) {
+          hs[nspans][1] =
+              co_await src.HoldPage(rb + srun[nspans], len - srun[nspans]);
+        }
+        sp0[nspans] = hs[nspans][0].ptr();
+        sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
+        hx[nspans][0] = co_await srcx.HoldPage(rb, len);
+        xrun[nspans] = hx[nspans][0].run();
+        if (xrun[nspans] < len) {
+          hx[nspans][1] =
+              co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);
+        }
+        xp0[nspans] = hx[nspans][0].ptr();
+        xp1[nspans] = hx[nspans][1] ? hx[nspans][1].ptr() : nullptr;
+        // Which logical stencil rows this run covers.
+        for (int dy = -1; dy <= 1; ++dy) {
+          const u32 wy = (by + nb + dy) % nb;
+          if (wy < rl[t] || wy >= rl[t] + rn[t]) continue;
+          const int q = (dz + 1) * 3 + (dy + 1);
+          qspan[q] = nspans;
+          qoff[q] = static_cast<u64>(wy - rl[t]) * row_elems;
+          srow[q] = static_cast<u64>(wz) * nb + wy;
+        }
+        ++nspans;
+      }
     }
-    // Source row of the vector being moved, and of x (for the sentinel).
-    const u64 sbase = row * static_cast<u64>(nb) * cap * kStride;
-    auto hs0 = co_await src.HoldPage(sbase, row_elems);
-    gv::Held<float> hs1;
-    const u64 srun0 = hs0.run();
-    if (srun0 < row_elems) {
-      hs1 = co_await src.HoldPage(sbase + srun0, row_elems - srun0);
-    }
-    auto hxs0 = co_await srcx.HoldPage(sbase, row_elems);
-    gv::Held<float> hxs1;
-    const u64 xrun0 = hxs0.run();
-    if (xrun0 < row_elems) {
-      hxs1 = co_await srcx.HoldPage(sbase + xrun0, row_elems - xrun0);
-    }
-    const float *const sp0 = hs0.ptr();
-    const float *const sp1 = hs1 ? hs1.ptr() : nullptr;
-    const float *const xp0 = hxs0.ptr();
-    const float *const xp1 = hxs1 ? hxs1.ptr() : nullptr;
-    const u64 islots = static_cast<u64>(nb) * cap;
-    const u64 slotbase = row * islots;
-    const u64 rowbin0 = row * nb;   // first linear bin of this source row
-    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
-      const u64 e = s * kStride;
-      const float tw = (e < xrun0) ? xp0[e + 3] : xp1[e + 3 - xrun0];
-      if (tw < 0.0f) continue;
-      const u32 dest = d_dest[slotbase + s];
-      if (dest == ~0u) continue;   // overflow victim; host already refused
-      const u64 dbin = dest / cap;
-      // Locate dbin inside the 9-row stencil.
-      const u32 dbz = static_cast<u32>(dbin / (static_cast<u64>(nb) * nb));
-      const u32 dby = static_cast<u32>((dbin / nb) % nb);
-      const int ddz = (dbz == (bz + nb - 1) % nb) ? -1
-                      : (dbz == bz)               ? 0
-                                                  : 1;
-      const int ddy = (dby == (by + nb - 1) % nb) ? -1
-                      : (dby == by)               ? 0
-                                                  : 1;
-      const int q = (ddz + 1) * 3 + (ddy + 1);
-      const u64 de = (dbin - (rbase[q] / (cap * kStride))) * cap * kStride +
-                     (dest % cap) * kStride;
-      float *const dp =
-          (de < rrun0[q]) ? rp0[q] + de : rp1[q] + (de - rrun0[q]);
-      const float *const spp = (e < srun0) ? sp0 + e : sp1 + (e - srun0);
-      dp[0] = spp[0];
-      dp[1] = spp[1];
-      dp[2] = spp[2];
-      dp[3] = keep_w ? spp[3] : 0.0f;
-      (void)rowbin0;
+    for (u64 idx = threadIdx.x; idx < 9 * islots; idx += blockDim.x) {
+      const u32 q = static_cast<u32>(idx / islots);
+      const u64 sslot = idx % islots;
+      const u32 sp = qspan[q];
+      const u64 e = qoff[q] + sslot * kStride;
+      const float *const xs =
+          (e < xrun[sp]) ? xp0[sp] + e : xp1[sp] + (e - xrun[sp]);
+      if (xs[3] < 0.0f) continue;              // padded source slot
+      const u32 dest = d_dest[srow[q] * islots + sslot];
+      if (dest == ~0u) continue;               // overflow victim
+      if (static_cast<u64>(dest) / islots != row) continue;   // not ours
+      const u64 de = (static_cast<u64>(dest) % islots) * kStride;
+      float *const dp = (de < drun) ? dp0 + de : dp1 + (de - drun);
+      const float *const sv =
+          (e < srun[sp]) ? sp0[sp] + e : sp1[sp] + (e - srun[sp]);
+      dp[0] = sv[0];
+      dp[1] = sv[1];
+      dp[2] = sv[2];
+      dp[3] = keep_w ? sv[3] : 0.0f;
     }
     __syncthreads();
-  }
+    }   // guards dead here
+    if (adm) {
+      if (nx != 0) srcx.ExitHoldSet(nx);
+      if (ns != 0) src.ExitHoldSet(ns);
+      dst.ExitHoldSet(nd);
+    }
+  }     // per-row loop
 }
 
 /** Pre-sentinel every slot of a ping-pong destination vector. */
@@ -1089,19 +1319,158 @@ __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
   }
 }
 
+/** Seeded value of element i: unique and exactly representable (the whole
+ *  vector is well under 2^24 elements). */
+CTP_INLINE_CROSS_FUN float ProbeVal(u64 i) { return static_cast<float>(i); }
+
+__device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
+                                       u32 nblocks, u32 block) {
+  const u64 epp = x.h_->elems_per_page_;
+  const u64 npages = (x.h_->size_ + epp - 1) / epp;
+  // Publish this block's table geometry once, so a bad guard pointer can be
+  // converted to an actual slot index instead of being guessed at from raw
+  // addresses (which are only comparable within one process).
+  if (threadIdx.x == 0 && blockIdx.x < 4) {
+    // EVERY block publishes its own table base. If two blocks disagree, the
+    // block_override_ that is supposed to put them all on one shared table
+    // is not taking effect, and each block is resolving in a table of its
+    // own while the fetches land in another.
+    g_read_geom[8 + blockIdx.x] =
+        reinterpret_cast<unsigned long long>(x.DbgFrameAt(0));
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    g_read_geom[0] = reinterpret_cast<unsigned long long>(x.DbgFrameAt(0));
+    g_read_geom[1] = x.h_->pages_per_block_;
+    g_read_geom[2] = x.h_->page_bytes_;
+    g_read_geom[3] = epp;
+    g_read_geom[4] = x.h_->page_shift_;
+    g_read_geom[5] = x.h_->page_mask_;
+  }
+  for (u64 it = 0; it < passes; ++it) {
+    for (u64 pg = block; pg < npages; pg += nblocks) {
+      auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
+      // Is the guard born valid? Its slot must hold the page we asked for.
+      // This separates "the hold returned the wrong frame" from "the frame
+      // was right and the slot was recycled out from under the pin".
+
+      const float *const p = h.ptr();
+      for (u64 i = threadIdx.x; i < epp; i += blockDim.x) {
+        // MD_PROBE_LDCG=1: read past the (non-coherent) per-SM L1. If the
+        // mismatches vanish only under this, the bytes were always in the
+        // frame and the kernel was reading a stale cached line -- host DMA
+        // that lands mid-kernel is not visible to an ordinary ld.global.
+        const float seen = kProbeLdcg ? __ldcg(&p[i]) : p[i];
+        if (seen != ProbeVal(pg * epp + i)) {
+          atomicAdd(&g_read_bad[0], 1ull);
+          // IS THE DATA ACTUALLY THERE? Re-read the SAME element fully
+          // uncached (ld.global.cv bypasses L1 AND treats L2 as volatile),
+          // with no delay -- this is a pure cache question, not a timing
+          // one. A match here means the bytes were in the frame all along
+          // and the kernel was reading a stale cached line.
+          if (__ldcv(&p[i]) == ProbeVal(pg * epp + i)) {
+            atomicAdd(&g_read_bad[1], 1ull);
+          }
+          // DOES IT HEAL? Wait, re-read the SAME address through the SAME
+          // guard, and see whether the value arrives late. If it does, the
+          // page was published as resident before its transfer landed; if
+          // it stays wrong, the get truly never wrote the frame.
+          // LIVE DUPLICATE CHECK. The quiescent host-side check runs after
+          // the kernel and cannot see a TRANSIENT duplicate. If this page
+          // occupies more than one slot right now, the get filled one of
+          // them and this reader is looking at the other -- which is
+          // exactly what an untouched (zero) frame plus rc == 0 looks like.
+          if (threadIdx.x == 0) {
+            u32 seen = 0;
+            for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+              if (x.PageAt(sl) == pg) ++seen;
+            }
+            if (seen > 1) atomicAdd(&g_read_bad[2], 1ull);
+            // Was a get for THIS page ever submitted into the frame we are
+            // reading? The slot stamps the page each transfer targets and
+            // clears it on every claim, so a stamp that is not `pg` means the
+            // page was published resident without its bytes being requested.
+            for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+              if (x.PageAt(sl) == pg && x.DbgGetPageAt(sl) != pg) {
+                atomicAdd(&g_read_bad[3], 1ull);
+              }
+              // Is the pointer we are reading through even the frame of the
+              // slot that holds this page? The get trace says the page's
+              // bytes landed in a DIFFERENT frame, which would mean the
+              // resolve handed back a stale slot, not that the fetch failed.
+              if (x.PageAt(sl) == pg &&
+                  x.DbgFrameAt(sl) != (const void *)p) {
+                atomicAdd(&g_read_bad[2], 1ull);
+              }
+            }
+            // Capture ONE bad sample verbatim. "The frame is zero" has been an
+            // assumption, not a measurement: if the value instead decodes to
+            // another page's pattern, the get delivered the WRONG BLOB, which
+            // is a completely different defect from one that delivers nothing.
+            if (atomicCAS(&g_read_sample[0], 0ull, 1ull) == 0ull) {
+              const float got = *(volatile float *)&p[i];
+              u32 bits;
+              __builtin_memcpy(&bits, &got, 4);
+              g_read_sample[1] = pg;
+              g_read_sample[2] = i;
+              g_read_sample[3] = bits;
+              // The frame this reader is looking at. Compared against the
+              // destination the get actually wrote (CLIO_DR_LOG prints it),
+              // this says whether the transfer targeted a DIFFERENT address.
+              g_read_sample[4] =
+                  reinterpret_cast<unsigned long long>(h.ptr());
+              g_read_sample[5] =
+                  (static_cast<unsigned long long>(h.dbg_slot_state()) << 32) |
+                  (h.dbg_slot_page() & 0xffffffffull);
+              // How many slots in the table claim this page right now, and
+              // is the guard's own frame one of them? If the page is in two
+              // slots, the fetch filled one and the reader was handed the
+              // other.
+              u32 nclaim = 0, gidx = ~0u;
+              for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+                if (x.PageAt(sl) == pg) ++nclaim;
+                if (x.DbgFrameAt(sl) == (const void *)p) gidx = sl;
+              }
+              g_read_sample[6] = nclaim;
+              g_read_sample[7] = h.dbg_slot_fetched();
+              g_read_geom[6] =
+                  static_cast<unsigned long long>(
+                      x.DbgSlotIndexOf(h.dbg_slot_ptr()));
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> v,
-                                       float dt, float gx, float gy_,
-                                       float gz, int drift, u32 nblocks,
-                                       u32 block) {
+                                       gv::DeviceVector<float> third,
+                                       int use_third, float dt, float gx,
+                                       float gy_, float gz, int drift,
+                                       u32 nblocks, u32 block) {
   const u64 epp = x.h_->elems_per_page_;
   const u64 npages = (x.h_->size_ + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
     auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
     auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+    // THE TEST: a THIRD vector held read-only alongside the other two, the
+    // pattern the real integrator has (x write, v write, f read) and the
+    // ballistic gate never had. The value is only sunk, so the physics --
+    // and therefore the bitwise comparison against the host replica --
+    // is untouched.
+    gv::Held<float> ht;
+    if (use_third) {
+      ht = co_await third.HoldPage(pg * epp, epp);
+    }
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
+    if (use_third && threadIdx.x == 0) {
+      atomicAdd(&g_third_sink,
+                static_cast<unsigned long long>(__float_as_uint(ht.ptr()[0])));
+    }
     const u64 nslots = epp / kStride;
     for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
       const u64 e = s * kStride;
@@ -1122,6 +1491,13 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_pages_done, 1ull);
+      if (block < 64) {
+        atomicAdd(&g_blk_done[block], 1ull);
+        g_blk_last[block] = pg;
+      }
+    }
     // Guards die here: pages unpin. Nothing flushes -- x/v are device-
     // canonical; the backing store is only written on eviction (none in the
     // resident regime) or by an explicit host Download for validation.
@@ -1173,19 +1549,33 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
  * every block at that table; blocks write DISJOINT pages, so the only
  * sharing is the lock-free probes. */
 
-__global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
-                                gv::DeviceVector<float> x,
-                                gv::DeviceVector<float> v, float dt,
-                                float gx, float gy_, float gz, int drift,
+__global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<float> x, u64 passes,
                                 u32 nblocks, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.block_override_ = 0;
-  v.block_override_ = 0;
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(IntegrateCoro(x, v, dt, gx, gy_, gz, drift, nblocks,
-                               yv.Block()));
+  CLIO_YCORO_RUN(ReadProbeCoro(x, passes, nblocks, yv.Block()));
+}
+
+__global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<float> x,
+                                gv::DeviceVector<float> v,
+                                gv::DeviceVector<float> third, int use_third,
+                                float dt, float gx, float gy_, float gz,
+                                int drift, u32 nblocks, int shared_tbl,
+                                gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = shared_tbl ? 0 : yv.Block();
+  v.block_override_ = shared_tbl ? 0 : yv.Block();
+  third.block_override_ = shared_tbl ? 0 : yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(IntegrateCoro(x, v, third, use_third, dt, gx, gy_, gz,
+                               drift, nblocks, yv.Block()));
 }
 
 __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
@@ -1266,7 +1656,7 @@ __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
-__global__ void ScatterKernel(clio::run::IpcManagerGpuInfo info,
+__global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> src,
                               gv::DeviceVector<float> srcx,
                               gv::DeviceVector<float> dst, u32 nb, u32 cap,
@@ -1278,8 +1668,8 @@ __global__ void ScatterKernel(clio::run::IpcManagerGpuInfo info,
   dst.block_override_ = 0;
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(ScatterCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
-                             nblocks, yv.Block()));
+  CLIO_YCORO_RUN(GatherCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
+                            nblocks, yv.Block()));
 }
 
 __global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
@@ -1324,20 +1714,45 @@ __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
 #if !CTP_IS_DEVICE_PASS
 namespace {
 
+/** Rounds after which the driver gives up on a kernel that never finishes. */
+static constexpr u32 kMaxRounds = 2000000;
+
 class YieldRunner {
  public:
   YieldRunner(unsigned nblocks, unsigned nthreads)
       : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+
+  /** True once any Run hit the round cap. THE CAP IS OTHERWISE SILENT:
+   *  RunToCompletion returning at max_rounds looks exactly like success, so
+   *  a livelocked block is abandoned mid-coroutine and the caller happily
+   *  uses whatever it managed to compute. That is how an out-of-core run
+   *  came back with 17 of 22 page iterations done and no error anywhere. */
+  bool HitCap() const { return hit_cap_; }
+
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
     drv_.ResetTimers();
     drv_.Reset();
     stack_.Reset();
+    const u32 r = RunInner(std::forward<LaunchT>(launch));
+    if (r >= kMaxRounds && !hit_cap_) {
+      hit_cap_ = true;
+      std::fprintf(stderr,
+                   "[driver] GAVE UP after %u rounds -- blocks are still "
+                   "parked and their remaining work will NOT run. Results "
+                   "from here are incomplete.\n", r);
+    }
+    return r;
+  }
+
+ private:
+  template <typename LaunchT>
+  u32 RunInner(LaunchT &&launch) {
     return drv_.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           launch(g, b, view, stack_.View());
         },
-        [] {}, /*max_rounds=*/2000000,
+        [] {}, kMaxRounds,
         [](u32, u64 tag) -> bool {
           unsigned int f = 0;
           ctp::GpuApi::Memcpy(&f, reinterpret_cast<const unsigned int *>(tag),
@@ -1345,11 +1760,18 @@ class YieldRunner {
           return (f & 1u) != 0u;
         });
   }
+ public:
   double KernelMs() const { return drv_.KernelMs(); }
+  /** Blocks launched per round -- if the driver ever exits while a block
+   *  is still parked, the tail of this log shows it. */
+  const std::vector<std::pair<double, u32>> &RoundLog() const {
+    return drv_.RoundLog();
+  }
 
  private:
   gy::Yieldable<> drv_;
   gy::YieldStack stack_;
+  bool hit_cap_ = false;
 };
 
 }  // namespace
@@ -1379,6 +1801,9 @@ int main(int argc, char **argv) {
     else if (want("--blocks")) a.blocks = static_cast<u32>(atoi(argv[++i]));
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--slots")) a.slots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--ppslots")) a.ppslots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--fslots")) a.fslots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--vslots")) a.vslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
@@ -1386,11 +1811,13 @@ int main(int argc, char **argv) {
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--per-block-tables") == 0) a.per_block = 1;
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
+    else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
       return 1;
@@ -1461,6 +1888,10 @@ int main(int argc, char **argv) {
   // --slots below that is a configuration for later stages, not this gate.
   const u32 slots =
       (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  // Which regime this configuration is IN: the cache either can hold every
+  // page of the working set or it cannot. The gates below key off this
+  // rather than assuming residency.
+  const bool expect_resident = (static_cast<clio::run::u64>(slots) >= npages);
 
   std::printf(
       "eternia-MD stage 1 (integrator + ballistic gate)\n"
@@ -1551,9 +1982,20 @@ int main(int argc, char **argv) {
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
   // ---- vectors ------------------------------------------------------------
-  gv::Vector<float> vx("md_x", {0}, page_bytes, /*nblocks=*/1, slots,
+  // ONE TABLE PER CUDA BLOCK is the designed model (independent per-block
+  // caches); the single shared table is the alternative this benchmark
+  // used so that a page exists exactly once. They are not equivalent under
+  // FAULTS: a table owns its lock, its scalar task slots AND its batch
+  // slots, so N CUDA blocks on one table share one set of in-flight
+  // transfer state.
+  const u32 tbl_blocks = a.per_block ? a.blocks : 1u;
+  gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, slots,
                        g.nelems);
-  gv::Vector<float> vv("md_v", {0}, page_bytes, /*nblocks=*/1, slots,
+  // v gets its own knob too, so x-paging and v-paging can be separated:
+  // x is the only vector read through multi-page SPAN holds that stay live
+  // across a park, which is the access pattern no other gate covers.
+  const u32 vslots = (a.vslots != 0) ? a.vslots : slots;
+  gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, vslots,
                        g.nelems);
   vx.EnableStats();
   vv.EnableStats();
@@ -1561,10 +2003,23 @@ int main(int argc, char **argv) {
   vv.Preload(hv.data(), g.nelems);
   vx.ClearCache();
   vv.ClearCache();
-  vx.Prefetch(0, npages, 0, 1);
-  vv.Prefetch(0, npages, 0, 1);
+  vx.Prefetch(0, npages, 0, tbl_blocks);
+  vv.Prefetch(0, npages, 0, tbl_blocks);
   auto dx = vx.GetDevice(0);
   auto dv = vv.GetDevice(0);
+
+  // MD_THIRD=1 gives the ballistic path a third, read-only paged vector.
+  const int use_third = std::getenv("MD_THIRD") != nullptr ? 1 : 0;
+  gv::Vector<float> vthird("md_third", {0}, page_bytes, tbl_blocks,
+                           use_third ? slots : 1u,
+                           use_third ? g.nelems : page_elems);
+  if (use_third) {
+    std::vector<float> hz(g.nelems, 0.0f);
+    vthird.Preload(hz.data(), g.nelems);
+    vthird.ClearCache();
+    vthird.Prefetch(0, npages, 0, tbl_blocks);
+  }
+  auto dthird = vthird.GetDevice(0);
 
   double *d_thermo = ctp::GpuApi::Malloc<double>(4 * sizeof(double));
 
@@ -1572,13 +2027,135 @@ int main(int argc, char **argv) {
   const u32 smem_thermo =
       CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
 
+  // ---- READ-ONLY PAGING PROBE -------------------------------------------
+  if (a.readprobe) {
+    std::vector<float> pat(g.nelems);
+    for (u64 i = 0; i < g.nelems; ++i) pat[i] = static_cast<float>(i);
+    vx.Preload(pat.data(), g.nelems);
+    vx.ClearCache();
+    vx.Prefetch(0, npages, 0, tbl_blocks);
+    auto dxp = vx.GetDevice(0);
+    const unsigned long long z4[4] = {0, 0, 0, 0};
+    cudaMemcpyToSymbol(g_read_bad, z4, sizeof(z4));
+    const unsigned long long z8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    cudaMemcpyToSymbol(g_read_sample, z8, sizeof(z8));
+    const bool ldcg = getenv("MD_PROBE_LDCG") != nullptr;
+    cudaMemcpyToSymbol(kProbeLdcg, &ldcg, sizeof(ldcg));
+    const unsigned long long epp_host = g.nelems / npages;
+    const clio::run::u64 audit_before = vx.AuditFrames("post-prefetch");
+    const double t0p = NowMs();
+    runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      ReadProbeKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dxp, a.steps,
+                                                        a.blocks, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    std::printf("  frame audit: after Prefetch=%llu bad, after kernel=%llu "
+                "bad (slot i must own frame i)\n",
+                (unsigned long long)audit_before,
+                (unsigned long long)vx.AuditFrames("post-kernel"));
+    unsigned long long rb[4] = {0, 0, 0, 0};
+    cudaMemcpyFromSymbol(rb, g_read_bad, sizeof(rb));
+    const auto sp = vx.ReadStats(0);
+    std::printf("  READ PROBE: %llu wrong elements over %llu passes "
+                "(faults %llu evicts %llu GET_ERRORS %llu puts %llu "
+                "put_errors %llu prefetch_late %llu EARLY_COMPLETE %llu "
+                "OUT-OF-TABLE %llu (site %llu), %.0f ms)%s\n",
+                rb[0], (unsigned long long)a.steps,
+                (unsigned long long)sp.faults, (unsigned long long)sp.evicts,
+                (unsigned long long)sp.get_errors,
+                (unsigned long long)sp.puts,
+                (unsigned long long)sp.put_errors,
+                (unsigned long long)sp.prefetch_late,
+                (unsigned long long)sp.early_complete,
+                (unsigned long long)sp.bad_slot,
+                (unsigned long long)sp.bad_slot_site,
+                NowMs() - t0p,
+                rb[0] ? "   <-- THE FAULT PATH DELIVERS WRONG BYTES"
+                      : "  [reads are clean]");
+    if (rb[0]) {
+      std::printf("    of those, %llu were CORRECT when re-read "
+                  "uncached (stale-cache reads) | "
+                  "WRONG-FRAME resolves=%llu | misses whose frame "
+                  "NO GET EVER TARGETED=%llu\n", rb[1], rb[2], rb[3]);
+      unsigned long long sm[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      cudaMemcpyFromSymbol(sm, g_read_sample, sizeof(sm));
+      if (sm[0]) {
+        unsigned int bits = static_cast<unsigned int>(sm[3]);
+        float got;
+        std::memcpy(&got, &bits, 4);
+        const unsigned long long want = sm[1] * epp_host + sm[2];
+        std::printf("    sample: page %llu elem %llu -> got %.1f (bits 0x%08x)"
+                    ", wanted %.1f.", sm[1], sm[2], got, bits,
+                    static_cast<double>(want));
+        if (bits == 0u) {
+          std::printf("  ZERO: the frame was never written."
+                      "  guard slot now holds page %llu, pins=%llu, "
+                      "fetching=%llu (we asked for page %llu); "
+                      "last get submitted into THIS frame was for "
+                      "page %lld; DEVICE FRAME=%p\n",
+                      sm[5] & 0xffffffffull, (sm[5] >> 40) & 0xffffff,
+                      (sm[5] >> 32) & 0xffull, sm[1],
+                      (long long)sm[7], (void *)(uintptr_t)sm[4]);
+        unsigned long long gm[12] = {0};
+        cudaMemcpyFromSymbol(gm, g_read_geom, sizeof(gm));
+        if (gm[2]) {
+          const long long idx =
+              (static_cast<long long>(sm[4]) - static_cast<long long>(gm[0])) /
+              static_cast<long long>(gm[2]);
+          std::printf("    table: frame0=%p slots/block=%llu page_bytes=%llu"
+                      " -> the guard's frame is SLOT %lld of this block "
+                      "(%s)\n",
+                      (void *)(uintptr_t)gm[0], gm[1], gm[2], idx,
+                      (idx >= 0 && idx < (long long)gm[1])
+                          ? "in range"
+                          : "OUT OF THIS BLOCK'S TABLE");
+          const bool pow2 = gm[3] && ((gm[3] & (gm[3] - 1)) == 0);
+          std::printf("    elems/page=%llu (%s) page_shift=%llu "
+                      "page_mask=%#llx%s\n",
+                      gm[3], pow2 ? "power of two" : "NOT a power of two",
+                      gm[4], gm[5],
+                      (!pow2 && gm[4])
+                          ? "  <-- SHIFT/MASK FAST PATH ON A "
+                            "NON-POWER-OF-TWO PAGE"
+                          : "");
+          std::printf("    SAME Page: table slot index=%lld, but its frame "
+                      "is arena index %lld -- %s\n",
+                      (long long)gm[6], idx,
+                      ((long long)gm[6] == idx)
+                          ? "consistent"
+                          : "MISMATCH: Page::data does not match its slot");
+          std::printf("    per-block table bases: b0=%p b1=%p b2=%p b3=%p%s\n",
+                      (void *)(uintptr_t)gm[8], (void *)(uintptr_t)gm[9],
+                      (void *)(uintptr_t)gm[10], (void *)(uintptr_t)gm[11],
+                      (gm[9] && gm[9] != gm[8])
+                          ? "  <-- BLOCKS ARE ON DIFFERENT TABLES"
+                          : "  (all blocks share one table)");
+        }
+        } else if (got == static_cast<float>(static_cast<unsigned long long>(got))) {
+          const unsigned long long enc =
+              static_cast<unsigned long long>(got);
+          std::printf("  That value is element %llu, i.e. PAGE %llu -- the get "
+                      "delivered ANOTHER PAGE'S BLOB.\n", enc, enc / epp_host);
+        } else {
+          std::printf("  Not a seeded value at all: torn or foreign bytes.\n");
+        }
+      }
+    }
+    return rb[0] ? 1 : 0;
+  }
+
   // ---- STAGE 2: real MD (cell-direct LJ + NVE) ---------------------------
   if (a.md) {
     if (g.nb < 3) {
       std::fprintf(stderr, "need at least 3 bins per dimension\n");
       return 1;
     }
-    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, slots,
+    // f gets its own cache size: the ballistic gate integrates a CONSTANT
+    // acceleration, so it never exercises READING f under paging, and that
+    // is the one path the resident gates cannot cover.
+    const u32 fslots = (a.fslots != 0) ? a.fslots : slots;
+    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, fslots,
                          g.nelems);
     vf.EnableStats();
     {
@@ -1590,8 +2167,13 @@ int main(int argc, char **argv) {
     auto df = vf.GetDevice(0);
     // Ping-pong destination vectors for the resort (K2b scatters into
     // these, then the handles swap). Same geometry, resident.
-    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, slots, g.nelems);
-    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, slots, g.nelems);
+    // The resort's destinations get their own cache size, so "the scatter
+    // is wrong" can be told apart from "the scatter's PAGING is wrong".
+    const u32 ppslots = (a.ppslots != 0) ? a.ppslots : slots;
+    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, ppslots, g.nelems);
+    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, ppslots, g.nelems);
+    vx2.EnableStats();
+    vv2.EnableStats();
     {
       std::vector<float> hs(g.nelems, 0.0f);
       for (u64 s = 0; s < g.nslots; ++s) hs[s * kStride + 3] = -1.0f;
@@ -1679,6 +2261,7 @@ int main(int argc, char **argv) {
     // MD_NOCOMPUTE=1 keeps every hold and skips the pair loop: the
     // difference against a normal run IS the hold cost.
     const int nocompute = std::getenv("MD_NOCOMPUTE") != nullptr ? 1 : 0;
+    const bool trace = std::getenv("MD_TRACE") != nullptr;
     double acc[3] = {0, 0, 0};
     double t_force_kern = 0.0, t_ckpt = 0.0, t_ckpt_stock = 0.0;
     u64 n_ckpt = 0;
@@ -1688,6 +2271,7 @@ int main(int argc, char **argv) {
     // class, ~MBs), device fill pass. Refuses loudly on maxneigh or the
     // per-row guard bound.
     auto build_list = [&]() -> bool {
+      if (trace) { std::fprintf(stderr, "[md] build\n"); std::fflush(stderr); }
       const double _t = NowMs();
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
@@ -1709,6 +2293,8 @@ int main(int argc, char **argv) {
       return true;
     };
     auto force = [&](int eflag) {
+      if (trace) { std::fprintf(stderr, "[md] force eflag=%d\n", eflag);
+                   std::fflush(stderr); }
       const double _t = NowMs();
       if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
       if (a.use_list) {
@@ -1731,13 +2317,29 @@ int main(int argc, char **argv) {
       t_force += NowMs() - _t;
       t_force_kern += runner.KernelMs();
     };
+    // MD_FLUSH_AFTER_KICK=1 makes every dirty x/v page durable in the
+    // backing store before anything can fault it back in. If that removes
+    // the intermittent out-of-core error, the hazard is a refetch racing an
+    // in-flight writeback (read-after-write through the store).
+    const bool flush_after_kick =
+        std::getenv("MD_FLUSH_AFTER_KICK") != nullptr;
     auto kick = [&](int drift) {
+      if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
+                   std::fflush(stderr); }
       const double _t = NowMs();
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, df, fdt, drift, a.blocks, vw, sv);
       });
+      if (flush_after_kick) {
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv,
+                                                           a.blocks, vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+      }
       t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
@@ -1781,13 +2383,13 @@ int main(int argc, char **argv) {
       }
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+        GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dx, dx2, g.nb, g.cap, d_dest, /*keep_w=*/1, a.blocks,
             vw, sv);
       });
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+        GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dv, dx, dv2, g.nb, g.cap, d_dest, /*keep_w=*/0, a.blocks,
             vw, sv);
       });
@@ -1899,8 +2501,24 @@ int main(int argc, char **argv) {
         (unsigned long long)a.steps, e0, e_n, e_drift, ke0, ke_n,
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
-        res_ok ? "[resident contract HELD]" : "[RESIDENT CONTRACT VIOLATED]");
-    const bool nve_ok = (e_drift < a.drift_tol) && res_ok;
+        expect_resident
+            ? (res_ok ? "[resident contract HELD]"
+                      : "[RESIDENT CONTRACT VIOLATED]")
+            : "[out-of-core regime: faults EXPECTED]");
+    // REGIME-AWARE. The resident contract -- zero faults in the timed region
+    // -- is a promise about the RESIDENT regime only: it says a cache that
+    // can hold the working set must never page. Out of core the cache
+    // provably cannot hold it, so faults are the feature, not a failure, and
+    // asserting res_ok there failed runs whose physics was bit-identical to
+    // the resident answer. What must hold in BOTH regimes is the energy.
+    std::printf("  claim failures: x=%llu (peak %llu of %u slots pinned at "
+                "the time) | f=%llu (peak %llu pinned)\n",
+                (unsigned long long)sfx.claim_fails,
+                (unsigned long long)sfx.peak_pinned_on_fail, slots,
+                (unsigned long long)sff.claim_fails,
+                (unsigned long long)sff.peak_pinned_on_fail);
+    const bool nve_ok = (e_drift < a.drift_tol) &&
+                        (!expect_resident || res_ok) && !runner.HitCap();
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
     std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
                 "Matom-steps/s)\n",
@@ -1955,18 +2573,33 @@ int main(int argc, char **argv) {
   const float fgx = static_cast<float>(a.g[0]);
   const float fgy = static_cast<float>(a.g[1]);
   const float fgz = static_cast<float>(a.g[2]);
+  {
+    const unsigned long long z = 0;
+    cudaMemcpyToSymbol(g_pages_done, &z, sizeof(z));
+  }
   const double t0 = NowMs();
   for (u64 step = 0; step < a.steps; ++step) {
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/1, a.blocks, vw, sv);
+          gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
+          a.blocks, !a.per_block, vw, sv);
     });
-    runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                   gy::YieldStackView sv) {
+    const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/0, a.blocks, vw, sv);
+          gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
+          a.blocks, !a.per_block, vw, sv);
     });
+    if (std::getenv("MD_ROUNDS") != nullptr) {
+      const auto &rl = runner.RoundLog();
+      std::fprintf(stderr, "[rounds] step=%llu n=%zu rounds=%u blocks/round:",
+                   (unsigned long long)step, rl.size(), rr);
+      for (size_t i = 0; i < rl.size() && i < 40; ++i) {
+        std::fprintf(stderr, " %u", rl[i].second);
+      }
+      std::fprintf(stderr, "\n");
+    }
   }
   ctp::GpuApi::Synchronize();
   const double run_ms = NowMs() - t0;
@@ -1993,6 +2626,33 @@ int main(int argc, char **argv) {
                   ? "[deterministic]" : "[VARIES: race]");
 
   // ---- resident-regime assertion -----------------------------------------
+  {
+    unsigned long long done = 0;
+    cudaMemcpyFromSymbol(&done, g_pages_done, sizeof(done));
+    const unsigned long long want =
+        static_cast<unsigned long long>(npages) * a.steps * 2ull;
+    std::printf("  page iterations: %llu of %llu expected%s\n", done, want,
+                (done == want) ? "  [all work ran]"
+                               : "   <-- WORK WAS DROPPED");
+    unsigned long long bd[64] = {0}, bl[64] = {0};
+    cudaMemcpyFromSymbol(bd, g_blk_done, sizeof(bd));
+    cudaMemcpyFromSymbol(bl, g_blk_last, sizeof(bl));
+    std::printf("  per block (done,last):");
+    for (u32 b = 0; b < a.blocks && b < 8; ++b) {
+      std::printf(" b%u=(%llu,%llu)", b, bd[b], bl[b]);
+    }
+    std::printf("\n");
+  }
+  {
+    clio::run::u64 dx_dirty = 0, dv_dirty = 0;
+    const u64 dupx = vx.CountDuplicateSlots(0, &dx_dirty);
+    const u64 dupv = vv.CountDuplicateSlots(0, &dv_dirty);
+    std::printf("  duplicate slots: x %llu (%llu with dirty) | v %llu "
+                "(%llu with dirty)%s\n",
+                (unsigned long long)dupx, (unsigned long long)dx_dirty,
+                (unsigned long long)dupv, (unsigned long long)dv_dirty,
+                (dupx || dupv) ? "   <-- a page lives in TWO slots" : "");
+  }
   const auto sx = vx.ReadStats(0);
   const auto sv2 = vv.ReadStats(0);
   const bool resident_ok = (sx.faults == 0 && sx.evicts == 0 &&
@@ -2021,6 +2681,14 @@ int main(int argc, char **argv) {
                                                         vw, sv);
     });
     ctp::GpuApi::Synchronize();
+    // MD_SETTLE_MS=N waits before reading the backing store. If the
+    // out-of-core mismatches vanish with a wait, the final AwaitFlush is
+    // returning before its puts are durable ("landed but unsettled") and
+    // the host is simply reading the store too early -- which would make
+    // this a VERIFICATION artefact, not lost data.
+    if (const char *ms = std::getenv("MD_SETTLE_MS")) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(ms)));
+    }
     std::vector<float> gx_out(g.nelems), gv_out(g.nelems);
     vx.Download(gx_out.data(), g.nelems);
     vv.Download(gv_out.data(), g.nelems);
@@ -2090,7 +2758,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)bit_x, (unsigned long long)bit_v, max_cf,
                 thermo[0], ke_ref, ke_err, mom_err);
     const bool gate_ok = (bit_x == 0 && bit_v == 0) && (max_cf < 1e-2) &&
-                         (ke_err < 1e-9) && (mom_err < 1e-6) && resident_ok;
+                         (ke_err < 1e-9) && (mom_err < 1e-6) && resident_ok &&
+                         !runner.HitCap();
     std::printf("  BALLISTIC GATE: %s\n", gate_ok ? "PASS" : "FAIL");
     if (!gate_ok) rc = 1;
   }
