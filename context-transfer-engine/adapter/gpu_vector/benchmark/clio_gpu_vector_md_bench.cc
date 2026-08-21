@@ -944,121 +944,124 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
  * so no two atoms share a destination. `keep_w` carries the type lane for
  * x and writes 0 for v.
  */
-__device__ gy::YCoroMain ScatterCoro(gv::DeviceVector<float> src,
-                                     gv::DeviceVector<float> srcx,
-                                     gv::DeviceVector<float> dst, u32 nb,
-                                     u32 cap, const u32 *d_dest, int keep_w,
-                                     u32 nblocks, u32 block) {
-  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+/**
+ * K2b as a GATHER, not a scatter (the page-boundary rule).
+ *
+ * A scatter has block r writing destination rows r-1..r+1 while block r+1
+ * writes r..r+2: their destination spans OVERLAP, so two blocks write the
+ * same page. Resident that is invisible -- one frame, disjoint slots,
+ * nothing evicts -- but with page-granular writeback one block's eviction
+ * discards the other's writes, which showed up out of core as an
+ * intermittent CUDA fatal, a 10x energy drift, or NaN, run to run on the
+ * same command.
+ *
+ * Inverted, each block OWNS one destination row and PULLS into it: it
+ * scans the nine source rows that could possibly target this row (an atom
+ * moves at most one bin per rebuild window) and copies the ones whose
+ * recorded destination lands here. Every destination slot then has exactly
+ * ONE writer and no page is written by two blocks. The cost is reading
+ * nine source rows per destination row instead of one, which is the same
+ * stencil shape the force pass already pays and is safe to share because
+ * it is read-only.
+ */
+__device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
+                                    gv::DeviceVector<float> srcx,
+                                    gv::DeviceVector<float> dst, u32 nb,
+                                    u32 cap, const u32 *d_dest, int keep_w,
+                                    u32 nblocks, u32 block) {
+  const u64 islots = static_cast<u64>(nb) * cap;
+  const u64 row_elems = islots * kStride;
   const u64 nrows = static_cast<u64>(nb) * nb;
   for (u64 row = block; row < nrows; row += nblocks) {
     const u32 by = static_cast<u32>(row % nb);
     const u32 bz = static_cast<u32>(row / nb);
-    // Hold the NINE destination stencil rows for writing.
-    // Destination stencil as SPANS, not rows -- the same merge the force
-    // and build passes use. Nine separate row holds pin nine pages per
-    // block, which is what made the resort exceed a shrunken cache and
-    // livelock while the force pass was already running fine out of core.
-    gv::Held<float> hg[9][2];
-    u64 dsrun[9];
-    float *dsp0[9], *dsp1[9];
+    // THE ONLY WRITE HOLD: this block's own destination row.
+    gv::Held<float> hd0 = co_await dst.HoldPage(row * row_elems, row_elems,
+                                                /*write=*/true);
+    gv::Held<float> hd1;
+    const u64 drun = hd0.run();
+    if (drun < row_elems) {
+      hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
+                                  /*write=*/true);
+    }
+    float *const dp0 = hd0.ptr();
+    float *const dp1 = hd1 ? hd1.ptr() : nullptr;
+    // The nine candidate source rows, held as SPANS (one or two contiguous
+    // runs per dz), of both vectors -- they are the same vector on the
+    // position pass, where the second hold is a cache hit. Row-at-a-time
+    // holds needed 36 live guards and overflowed the coroutine frame.
+    gv::Held<float> hs[6][2], hx[6][2];
+    u64 srun[6], xrun[6];
+    const float *sp0[6], *sp1[6], *xp0[6], *xp1[6];
     u32 qspan[9];
     u64 qoff[9];
+    u64 srow[9];
     u32 nspans = 0;
-    const bool merge = (by >= 1 && by + 1 < nb);
     for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
-      if (merge) {
-        const u64 rb =
-            ((static_cast<u64>(wz) * nb + (by - 1)) * nb) * cap * kStride;
-        const u64 len = 3 * row_elems;
-        hg[nspans][0] = co_await dst.HoldPage(rb, len, true);
-        dsrun[nspans] = hg[nspans][0].run();
-        if (dsrun[nspans] < len) {
-          hg[nspans][1] =
-              co_await dst.HoldPage(rb + dsrun[nspans], len - dsrun[nspans],
-                                    true);
-        }
-        dsp0[nspans] = hg[nspans][0].ptr();
-        dsp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
-        for (int dy = -1; dy <= 1; ++dy) {
-          const int q = (dz + 1) * 3 + (dy + 1);
-          qspan[q] = nspans;
-          qoff[q] = static_cast<u64>(dy + 1) * row_elems;
-        }
-        ++nspans;
+      const int lo = static_cast<int>(by) - 1;
+      const int hi = static_cast<int>(by) + 1;
+      u32 rl[2], rn[2], nr = 0;
+      if (lo < 0) {
+        rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+        rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+      } else if (hi > static_cast<int>(nb) - 1) {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
+        rl[nr] = 0; rn[nr] = 1u; ++nr;
       } else {
+        rl[nr] = static_cast<u32>(lo); rn[nr] = 3u; ++nr;
+      }
+      for (u32 t = 0; t < nr; ++t) {
+        const u64 rb =
+            (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
+        const u64 len = static_cast<u64>(rn[t]) * row_elems;
+        hs[nspans][0] = co_await src.HoldPage(rb, len);
+        srun[nspans] = hs[nspans][0].run();
+        if (srun[nspans] < len) {
+          hs[nspans][1] =
+              co_await src.HoldPage(rb + srun[nspans], len - srun[nspans]);
+        }
+        sp0[nspans] = hs[nspans][0].ptr();
+        sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
+        hx[nspans][0] = co_await srcx.HoldPage(rb, len);
+        xrun[nspans] = hx[nspans][0].run();
+        if (xrun[nspans] < len) {
+          hx[nspans][1] =
+              co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);
+        }
+        xp0[nspans] = hx[nspans][0].ptr();
+        xp1[nspans] = hx[nspans][1] ? hx[nspans][1].ptr() : nullptr;
+        // Which logical stencil rows this run covers.
         for (int dy = -1; dy <= 1; ++dy) {
           const u32 wy = (by + nb + dy) % nb;
-          const u64 rb =
-              ((static_cast<u64>(wz) * nb + wy) * nb) * cap * kStride;
-          hg[nspans][0] = co_await dst.HoldPage(rb, row_elems, true);
-          dsrun[nspans] = hg[nspans][0].run();
-          if (dsrun[nspans] < row_elems) {
-            hg[nspans][1] = co_await dst.HoldPage(
-                rb + dsrun[nspans], row_elems - dsrun[nspans], true);
-          }
-          dsp0[nspans] = hg[nspans][0].ptr();
-          dsp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
+          if (wy < rl[t] || wy >= rl[t] + rn[t]) continue;
           const int q = (dz + 1) * 3 + (dy + 1);
           qspan[q] = nspans;
-          qoff[q] = 0;
-          ++nspans;
+          qoff[q] = static_cast<u64>(wy - rl[t]) * row_elems;
+          srow[q] = static_cast<u64>(wz) * nb + wy;
         }
+        ++nspans;
       }
     }
-    // Source row of the vector being moved, and of x (for the sentinel).
-    const u64 sbase = row * static_cast<u64>(nb) * cap * kStride;
-    auto hs0 = co_await src.HoldPage(sbase, row_elems);
-    gv::Held<float> hs1;
-    const u64 srun0 = hs0.run();
-    if (srun0 < row_elems) {
-      hs1 = co_await src.HoldPage(sbase + srun0, row_elems - srun0);
-    }
-    auto hxs0 = co_await srcx.HoldPage(sbase, row_elems);
-    gv::Held<float> hxs1;
-    const u64 xrun0 = hxs0.run();
-    if (xrun0 < row_elems) {
-      hxs1 = co_await srcx.HoldPage(sbase + xrun0, row_elems - xrun0);
-    }
-    const float *const sp0 = hs0.ptr();
-    const float *const sp1 = hs1 ? hs1.ptr() : nullptr;
-    const float *const xp0 = hxs0.ptr();
-    const float *const xp1 = hxs1 ? hxs1.ptr() : nullptr;
-    const u64 islots = static_cast<u64>(nb) * cap;
-    const u64 slotbase = row * islots;
-    const u64 rowbin0 = row * nb;   // first linear bin of this source row
-    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
-      const u64 e = s * kStride;
-      const float tw = (e < xrun0) ? xp0[e + 3] : xp1[e + 3 - xrun0];
-      if (tw < 0.0f) continue;
-      const u32 dest = d_dest[slotbase + s];
-      if (dest == ~0u) continue;   // overflow victim; host already refused
-      const u64 dbin = dest / cap;
-      // Locate dbin inside the 9-row stencil.
-      const u32 dbz = static_cast<u32>(dbin / (static_cast<u64>(nb) * nb));
-      const u32 dby = static_cast<u32>((dbin / nb) % nb);
-      const int ddz = (dbz == (bz + nb - 1) % nb) ? -1
-                      : (dbz == bz)               ? 0
-                                                  : 1;
-      const int ddy = (dby == (by + nb - 1) % nb) ? -1
-                      : (dby == by)               ? 0
-                                                  : 1;
-      const int q = (ddz + 1) * 3 + (ddy + 1);
-      // Offset inside the held span: the destination row's slot within the
-      // span, then the bin within that row, then the slot within the bin.
-      const u64 rowbin = (static_cast<u64>(dbz) * nb + dby) * nb;
+    for (u64 idx = threadIdx.x; idx < 9 * islots; idx += blockDim.x) {
+      const u32 q = static_cast<u32>(idx / islots);
+      const u64 sslot = idx % islots;
       const u32 sp = qspan[q];
-      const u64 de = qoff[q] + (dbin - rowbin) * cap * kStride +
-                     (dest % cap) * kStride;
-      float *const dp =
-          (de < dsrun[sp]) ? dsp0[sp] + de : dsp1[sp] + (de - dsrun[sp]);
-      const float *const spp = (e < srun0) ? sp0 + e : sp1 + (e - srun0);
-      dp[0] = spp[0];
-      dp[1] = spp[1];
-      dp[2] = spp[2];
-      dp[3] = keep_w ? spp[3] : 0.0f;
-      (void)rowbin0;
+      const u64 e = qoff[q] + sslot * kStride;
+      const float *const xs =
+          (e < xrun[sp]) ? xp0[sp] + e : xp1[sp] + (e - xrun[sp]);
+      if (xs[3] < 0.0f) continue;              // padded source slot
+      const u32 dest = d_dest[srow[q] * islots + sslot];
+      if (dest == ~0u) continue;               // overflow victim
+      if (static_cast<u64>(dest) / islots != row) continue;   // not ours
+      const u64 de = (static_cast<u64>(dest) % islots) * kStride;
+      float *const dp = (de < drun) ? dp0 + de : dp1 + (de - drun);
+      const float *const sv =
+          (e < srun[sp]) ? sp0[sp] + e : sp1[sp] + (e - srun[sp]);
+      dp[0] = sv[0];
+      dp[1] = sv[1];
+      dp[2] = sv[2];
+      dp[3] = keep_w ? sv[3] : 0.0f;
     }
     __syncthreads();
   }
@@ -1324,7 +1327,7 @@ __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
-__global__ void ScatterKernel(clio::run::IpcManagerGpuInfo info,
+__global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> src,
                               gv::DeviceVector<float> srcx,
                               gv::DeviceVector<float> dst, u32 nb, u32 cap,
@@ -1336,8 +1339,8 @@ __global__ void ScatterKernel(clio::run::IpcManagerGpuInfo info,
   dst.block_override_ = 0;
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(ScatterCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
-                             nblocks, yv.Block()));
+  CLIO_YCORO_RUN(GatherCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
+                            nblocks, yv.Block()));
 }
 
 __global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
@@ -1891,13 +1894,13 @@ int main(int argc, char **argv) {
       }
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+        GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dx, dx2, g.nb, g.cap, d_dest, /*keep_w=*/1, a.blocks,
             vw, sv);
       });
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ScatterKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+        GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dv, dx, dv2, g.nb, g.cap, d_dest, /*keep_w=*/0, a.blocks,
             vw, sv);
       });
