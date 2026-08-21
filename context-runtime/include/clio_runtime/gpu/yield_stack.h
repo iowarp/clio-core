@@ -618,7 +618,7 @@ class CoroRunner {
     drv_.ResetTimers();
     drv_.Reset();
     stack_.Reset();
-    return drv_.RunToCompletion(
+    const clio::run::u32 rounds = drv_.RunToCompletion(
         [&](dim3 g, dim3 b, YieldableView<StateT> v) {
           launch(g, b, v, stack_.View());
         },
@@ -636,8 +636,22 @@ class CoroRunner {
                               sizeof(v));
           return (v & 1u) != 0u;
         });
+    // SAY SO. The cap returning quietly is how a livelocked kernel gets
+    // mistaken for a finished one by every caller that only looks at the
+    // data it produced.
+    if (drv_.HitRoundCap() && !warned_cap_) {
+      warned_cap_ = true;
+      printf("[yield] driver GAVE UP after %u rounds: blocks are still "
+             "parked and their remaining work did NOT run -- results are "
+             "incomplete (see CoroRunner::HitRoundCap)\n",
+             (unsigned)rounds);
+    }
+    return rounds;
   }
 
+  /** See Yieldable::HitRoundCap(). A kernel that hit the cap was ABANDONED
+   *  with blocks still parked; anything it produced is incomplete. */
+  bool HitRoundCap() const { return drv_.HitRoundCap(); }
   double KernelMs() const { return drv_.KernelMs(); }
   double CopyMs() const { return drv_.CopyMs(); }
   double UploadMs() const { return drv_.UploadMs(); }
@@ -650,6 +664,7 @@ class CoroRunner {
  private:
   Yieldable<StateT> drv_;
   YieldStack stack_;
+  bool warned_cap_ = false;
 };
 
 #endif  // !CTP_IS_DEVICE_PASS

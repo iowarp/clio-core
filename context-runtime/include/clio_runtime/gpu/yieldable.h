@@ -417,6 +417,7 @@ class Yieldable {
     while (Round(launch)) {
       ++rounds;
       if (max_rounds != 0 && rounds >= max_rounds) {
+        hit_round_cap_ = true;
         break;
       }
       if constexpr (std::is_same_v<decltype(service()), bool>) {
@@ -437,6 +438,22 @@ class Yieldable {
   /** True when a service callback returned false and stopped the loop. Lets
    *  the caller tell "finished" from "gave up" without inspecting rounds. */
   bool Aborted() const { return aborted_; }
+
+  /**
+   * True when a run stopped because it hit `max_rounds` -- i.e. blocks were
+   * STILL PARKED and their remaining work never ran.
+   *
+   * This has to be askable, because the cap is otherwise INVISIBLE:
+   * RunToCompletion returns normally either way, so a livelocked kernel is
+   * handed back looking exactly like a finished one and the caller computes
+   * on a partially executed kernel. That is not hypothetical -- an
+   * out-of-core MD step came back having run 17 of its 22 page iterations,
+   * with no error anywhere, and the wrong answer looked plausible.
+   * `Aborted()` does NOT cover this; it only reports the service-callback
+   * path. STICKY: set once, never cleared by Reset(), so a caller can check
+   * it after a whole phase rather than after every round.
+   */
+  bool HitRoundCap() const { return hit_round_cap_; }
 
   /** Recompute the pending set from device state (used after a partial round). */
   void RestorePendingFromState() {
@@ -459,6 +476,7 @@ class Yieldable {
     while (Round(launch, resume_when)) {
       ++rounds;
       if (max_rounds != 0 && rounds >= max_rounds) {
+        hit_round_cap_ = true;   // see HitRoundCap(): never silent again
         break;
       }
       service();
@@ -525,6 +543,8 @@ class Yieldable {
   clio::run::u32 num_pending_ = 0;
   /** Set when a service callback returned false; see RunToCompletion. */
   bool aborted_ = false;
+  /** See HitRoundCap(). Sticky across Reset(). */
+  bool hit_round_cap_ = false;
   YieldBlockState *d_yield_ = nullptr;
   StateT *d_user_ = nullptr;
   clio::run::u32 *d_pending_ = nullptr;
