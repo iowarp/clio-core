@@ -501,6 +501,18 @@ class DeviceVector {
         last_page_ = nullptr;
         return 0;
       }
+      // A WRITE must not proceed into a page whose writeback is already in
+      // flight. SubmitPut clears `dirty` as it sends, so a store landing
+      // after the put's DMA would leave the page marked CLEAN with the
+      // update only in the frame -- and the next drop discards it. This is
+      // the prober's half of the eviction handshake (StartEvictionAsync
+      // has the other); the caller waits for the flush and retries.
+      if (write && (*(volatile clio::run::u32 *)&p->flushing != 0u ||
+                    *(volatile clio::run::u32 *)&p->evicting != 0u)) {
+        ReleaseHoldPin(p);
+        last_page_ = nullptr;
+        return 0;
+      }
     }
     // Write intent is declared HERE, at the hold, not inferred per element:
     // operator[] is side-effect-free for reads and writes alike, so a page
@@ -1603,6 +1615,13 @@ class DeviceVector {
     UnlockBlock();
   }
 
+  /** True when `pg` is resident but its writeback is in flight, so a WRITE
+   *  hold must wait rather than store into it (see ProbeHold). */
+  CTP_GPU_FUN bool WriteBusy(clio::run::u64 pg) const {
+    const Page *p = Find(pg);
+    return p != nullptr && (p->flushing != 0u || p->evicting != 0u);
+  }
+
   /** Lock-free residency probe. RACY BY DESIGN: a concurrent claim can
    *  make it misread one page — callers only use it to decide whether a
    *  batched fault phase is worth entering, where either error is safe. */
@@ -1769,9 +1788,16 @@ class DeviceVector {
     // neighbours. Retrying inside the yield's reap step turns a transient
     // claim failure into one extra round instead of a livelock.
     for (;;) {
+      // ... and wait out an in-flight writeback for a WRITE hold, or the
+      // loop would spin without yielding: the page IS resident, so the
+      // residency condition alone never suspends, and `evicting` is only
+      // cleared by the reap step that a suspension runs.
       CLIO_CO_YIELD_WHEN((ReapFlushed(), ReapFetched(),
                           RetryLostFetch(PageOf(off))),
-                         !IsResident(PageOf(off)), FetchWaitTag(PageOf(off)));
+                         !IsResident(PageOf(off)) ||
+                             (write && WriteBusy(PageOf(off))),
+                         IsResident(PageOf(off)) ? FlushWaitTag()
+                                                 : FetchWaitTag(PageOf(off)));
       // 3. Resident for the whole block: the lock-free fast path. The probe
       // can still lose the slot to a concurrent claim between the vote and
       // the scan -- that is a MISS, and the answer is another park, never a
@@ -2079,8 +2105,22 @@ class DeviceVector {
     }
     Page *p = &tbl[victim];
     if (p->dirty || p->flushing) {
+      // THE SAME HANDSHAKE THE CLEAN PATH USES, and for the same reason.
+      // The victim was chosen with pins == 0, but ProbeHold pins WITHOUT
+      // the block lock, so a write-hold can land in the window between
+      // that read and this writeback. SubmitPut clears `dirty` as it
+      // sends, so a writer whose data lands after the put's DMA leaves the
+      // page marked CLEAN with its update only in the frame -- and the
+      // next drop discards it. Publish `evicting`, fence, then re-read
+      // pins: a holder that raced in wins and the writeback is abandoned
+      // (the page stays dirty and will be flushed later).
       p->evicting = 1u;        // tells ReapFlushed to release the slot
-      SubmitPut(p);            // async; the caller yields on AnyTransferInFlight
+      __threadfence();
+      if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+        p->evicting = 0u;      // someone is writing it; do not write back
+      } else {
+        SubmitPut(p);          // async; caller yields on AnyTransferInFlight
+      }
     } else if (FreeVictimSlot(p)) {
       Bump(h_->stat_evicts_);
     }
