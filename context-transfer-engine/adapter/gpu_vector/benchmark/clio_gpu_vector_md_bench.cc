@@ -113,6 +113,8 @@ struct Args {
   u32 threads = 256;
   u32 slots = 0;           // x/v cache slots per block; 0 = resident (auto)
   u32 ppslots = 0;         // resort ping-pong cache slots; 0 = same as slots
+  u32 fslots = 0;          // force-vector cache slots; 0 = same as slots
+  u32 vslots = 0;          // velocity cache slots; 0 = same as slots
   u64 steps = 100;
   u64 rebin = 20;          // resort cadence (steps); 0 = never
   double temp = 0.0;       // scale initial velocities to this T (0 = leave)
@@ -1473,6 +1475,8 @@ int main(int argc, char **argv) {
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--slots")) a.slots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ppslots")) a.ppslots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--fslots")) a.fslots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--vslots")) a.vslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
@@ -1655,7 +1659,11 @@ int main(int argc, char **argv) {
   const u32 tbl_blocks = a.per_block ? a.blocks : 1u;
   gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, slots,
                        g.nelems);
-  gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, slots,
+  // v gets its own knob too, so x-paging and v-paging can be separated:
+  // x is the only vector read through multi-page SPAN holds that stay live
+  // across a park, which is the access pattern no other gate covers.
+  const u32 vslots = (a.vslots != 0) ? a.vslots : slots;
+  gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, vslots,
                        g.nelems);
   vx.EnableStats();
   vv.EnableStats();
@@ -1680,7 +1688,11 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "need at least 3 bins per dimension\n");
       return 1;
     }
-    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, slots,
+    // f gets its own cache size: the ballistic gate integrates a CONSTANT
+    // acceleration, so it never exercises READING f under paging, and that
+    // is the one path the resident gates cannot cover.
+    const u32 fslots = (a.fslots != 0) ? a.fslots : slots;
+    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, fslots,
                          g.nelems);
     vf.EnableStats();
     {
