@@ -33,7 +33,60 @@ which is exactly why measuring only the D2H hop, as an earlier version of
 this document did, understated the cost 6x and has to be called out rather
 than quietly corrected.
 
-### The BaM row was wrong, and the bench said so
+### RETRACTED: the BaM leg does not measure BaM
+
+`external/bam` is not upstream BaM. Its own README calls it "a basic
+implementation of BaM (ASPLOS'23)", and it diverges from
+github.com/ZaidQureshi/bam on both axes that decide the numbers.
+
+**The GPU API is not the same.** Upstream exposes three separate mechanisms
+for holding a page across many accesses:
+
+| upstream | ours |
+|---|---|
+| `array_d_t<T>::acquire_page(i, page_, start, end, r)` / `release_page(...)` -- returns `start`/`end` so the kernel loops the whole page on a raw pointer | absent |
+| `bam_ptr<T>` / `bam_ptr_tlb<T>` -- smart pointer holding a page reference across accesses, `update_page(i)` | absent |
+| `tlb<T, n, scope, loc>::acquire/release` -- translation lookaside buffer | absent |
+| `array_d_t<T>`: `operator[]`, `seq_read`, `seq_write`, `get_raw`/`release_raw`, `AtomicAdd`; `range_d_t<T>`: `operator[]`, `mark_page_dirty` | `ArrayDevice<T>::read(idx)` / `write(idx, val)` only |
+
+So every element read in our version re-resolves the page --
+`page_cache_acquire` does an `atomicCAS` on the tag plus an `atomicAdd` on
+the state -- while upstream's whole point is that you acquire once and then
+stream the page. **The 3x force-pass gap measured against the paged vector
+is that missing API, not BaM.** It benchmarks the one access pattern
+upstream provides three mechanisms to avoid.
+
+**NVMe is not emulated -- it is stubbed.**
+
+```cpp
+__device__ inline int nvme_read_page(QueuePairDevice &qp, uint64_t bus_addr,
+                                     uint64_t offset, uint32_t page_size) {
+  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
+  return -1;
+}
+```
+
+The only working backend is `host_read_page`, a warp-cooperative `uint4`
+copy straight out of pinned host memory: no submission queue, no doorbell,
+no completion polling, none of the latency structure a page cache exists to
+hide. That makes misses far CHEAPER than real BaM, at the same time as the
+missing acquire/release API makes hits far more EXPENSIVE.
+
+The two errors push in opposite directions, so neither the resident number
+nor the out-of-core one can be quoted as BaM. **The BaM row is withdrawn
+from this comparison**; what follows is kept only as a record of what was
+measured.
+
+To make the leg real: implement `acquire_page`/`release_page` returning
+`start`/`end`, plus `bam_ptr` and the TLB, and use the acquire-then-stream
+pattern in the force kernel the way upstream's own benchmarks do; and back
+`nvme_read_page` with an emulated queue pair over pinned host memory --
+submission queue, doorbell, completion polling -- rather than bypassing the
+protocol with a memcpy.
+
+### The originally published BaM number was also an out-of-core run
+
+
 
 The first version of this table quoted BaM at 1174.5 ms/step. That run had
 `--bam-cache-mb 2048` against a **3524.6 MB** list, which puts BaM OUT OF
