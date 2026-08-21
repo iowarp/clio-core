@@ -1000,10 +1000,19 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(&g_md_cyc[3], (unsigned long long)(clock64() - _p0));
-      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+      // NOT the chunk total here. _r0 is stamped once per CHUNK, so
+      // accumulating (now - _r0) once per ROW sums rowchunk overlapping
+      // spans and inflates the total by ~rowchunk -- which made the named
+      // phases look like a quarter of the kernel and invented a 74%
+      // "unattributed" gap that does not exist. The chunk total is taken
+      // once, after the row loop.
       atomicAdd(&g_md_cyc[5], 1ull);
     }
     }   // per-row loop
+    // The chunk total, taken ONCE. See the note at g_md_cyc[5].
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+    }
     // Every span guard above is dead here (the chunk body scope ends with
     // this brace), so the reservation is given back exactly once per
     // EnterHoldSet. The only chunk-level `continue` is above the Enter.
