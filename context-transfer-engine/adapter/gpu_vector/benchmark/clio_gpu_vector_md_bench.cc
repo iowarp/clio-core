@@ -1842,6 +1842,12 @@ int main(int argc, char **argv) {
       t_force += NowMs() - _t;
       t_force_kern += runner.KernelMs();
     };
+    // MD_FLUSH_AFTER_KICK=1 makes every dirty x/v page durable in the
+    // backing store before anything can fault it back in. If that removes
+    // the intermittent out-of-core error, the hazard is a refetch racing an
+    // in-flight writeback (read-after-write through the store).
+    const bool flush_after_kick =
+        std::getenv("MD_FLUSH_AFTER_KICK") != nullptr;
     auto kick = [&](int drift) {
       if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
                    std::fflush(stderr); }
@@ -1851,6 +1857,14 @@ int main(int argc, char **argv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, df, fdt, drift, a.blocks, vw, sv);
       });
+      if (flush_after_kick) {
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv,
+                                                           a.blocks, vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+      }
       t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
