@@ -65,6 +65,9 @@ __device__ unsigned long long g_md_cyc[8];
  *  blocks. Distinguishes WORK DROPPED (driver/park bookkeeping) from DATA
  *  CORRUPTED (the paging path): the expected count is exact and known. */
 __device__ unsigned long long g_pages_done;
+/** Sink for the ballistic path's optional THIRD vector read, so the load
+ *  cannot be optimised away while the physics stays untouched. */
+__device__ unsigned long long g_third_sink;
 /** Per LOGICAL block: page iterations completed, and the last page index
  *  reached. Says WHICH block loses work, and where it stopped. */
 __device__ unsigned long long g_blk_done[64];
@@ -1146,17 +1149,31 @@ __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
 
 __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> v,
-                                       float dt, float gx, float gy_,
-                                       float gz, int drift, u32 nblocks,
-                                       u32 block) {
+                                       gv::DeviceVector<float> third,
+                                       int use_third, float dt, float gx,
+                                       float gy_, float gz, int drift,
+                                       u32 nblocks, u32 block) {
   const u64 epp = x.h_->elems_per_page_;
   const u64 npages = (x.h_->size_ + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
     auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
     auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+    // THE TEST: a THIRD vector held read-only alongside the other two, the
+    // pattern the real integrator has (x write, v write, f read) and the
+    // ballistic gate never had. The value is only sunk, so the physics --
+    // and therefore the bitwise comparison against the host replica --
+    // is untouched.
+    gv::Held<float> ht;
+    if (use_third) {
+      ht = co_await third.HoldPage(pg * epp, epp);
+    }
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
+    if (use_third && threadIdx.x == 0) {
+      atomicAdd(&g_third_sink,
+                static_cast<unsigned long long>(__float_as_uint(ht.ptr()[0])));
+    }
     const u64 nslots = epp / kStride;
     for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
       const u64 e = s * kStride;
@@ -1237,18 +1254,20 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
 
 __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
-                                gv::DeviceVector<float> v, float dt,
-                                float gx, float gy_, float gz, int drift,
-                                u32 nblocks, int shared_tbl,
+                                gv::DeviceVector<float> v,
+                                gv::DeviceVector<float> third, int use_third,
+                                float dt, float gx, float gy_, float gz,
+                                int drift, u32 nblocks, int shared_tbl,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.block_override_ = shared_tbl ? 0 : yv.Block();
   v.block_override_ = shared_tbl ? 0 : yv.Block();
+  third.block_override_ = shared_tbl ? 0 : yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(IntegrateCoro(x, v, dt, gx, gy_, gz, drift, nblocks,
-                               yv.Block()));
+  CLIO_YCORO_RUN(IntegrateCoro(x, v, third, use_third, dt, gx, gy_, gz,
+                               drift, nblocks, yv.Block()));
 }
 
 __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
@@ -1675,6 +1694,19 @@ int main(int argc, char **argv) {
   vv.Prefetch(0, npages, 0, tbl_blocks);
   auto dx = vx.GetDevice(0);
   auto dv = vv.GetDevice(0);
+
+  // MD_THIRD=1 gives the ballistic path a third, read-only paged vector.
+  const int use_third = std::getenv("MD_THIRD") != nullptr ? 1 : 0;
+  gv::Vector<float> vthird("md_third", {0}, page_bytes, tbl_blocks,
+                           use_third ? slots : 1u,
+                           use_third ? g.nelems : page_elems);
+  if (use_third) {
+    std::vector<float> hz(g.nelems, 0.0f);
+    vthird.Preload(hz.data(), g.nelems);
+    vthird.ClearCache();
+    vthird.Prefetch(0, npages, 0, tbl_blocks);
+  }
+  auto dthird = vthird.GetDevice(0);
 
   double *d_thermo = ctp::GpuApi::Malloc<double>(4 * sizeof(double));
 
@@ -2104,14 +2136,14 @@ int main(int argc, char **argv) {
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/1, a.blocks,
-          !a.per_block, vw, sv);
+          gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
+          a.blocks, !a.per_block, vw, sv);
     });
     const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/0, a.blocks,
-          !a.per_block, vw, sv);
+          gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
+          a.blocks, !a.per_block, vw, sv);
     });
     if (std::getenv("MD_ROUNDS") != nullptr) {
       const auto &rl = runner.RoundLog();
