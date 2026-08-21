@@ -407,3 +407,54 @@ if(CLIO_CORE_ENABLE_CUDA)
         message(STATUS "MPI not found; skipping clio_md_mpi_bench")
     endif()
 endif()
+
+#------------------------------------------------------------------------------
+# eternia-MD, BaM edition: the capacity sibling rather than a transport one.
+# Single rank, no MPI; the Verlet list lives behind BaM's GPU page cache over
+# pinned host DRAM. Gated on CLIO_CORE_ENABLE_BAM, which is what builds the
+# in-tree external/bam module this links against.
+#
+# It compiles BaM's four sources ITSELF rather than linking the `bam` target,
+# and that is not gratuitous: external/bam passes --expt-relaxed-constexpr
+# unconditionally, which clang rejects outright ("unknown argument"), so the
+# bam target cannot build at all in a tree whose CMAKE_CUDA_COMPILER is clang
+# -- as this one's is, for the device coroutines. Compiling here with nvcc
+# keeps the bench buildable in every configuration and matches its three
+# siblings, none of which link anything from the tree either.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
+    find_program(MD_BAM_NVCC nvcc
+        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
+        PATH_SUFFIXES bin)
+    if(MD_BAM_NVCC)
+        set(_bam_arch_flags "")
+        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
+            list(APPEND _bam_arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
+        endforeach()
+        if(NOT _bam_arch_flags)
+            list(APPEND _bam_arch_flags "-arch=sm_80")
+        endif()
+        set(_bam_out ${CMAKE_BINARY_DIR}/bin/clio_md_bam_bench)
+        set(_bam_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_md_bam_bench.cc)
+        add_custom_command(
+            OUTPUT ${_bam_out}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+            COMMAND ${MD_BAM_NVCC}
+                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
+                ${_bam_arch_flags}
+                -I${CMAKE_SOURCE_DIR}/external/bam/include
+                ${_bam_src}
+                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
+                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
+                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
+                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
+                -o ${_bam_out}
+            DEPENDS ${_bam_src}
+            COMMENT "Building clio_md_bam_bench (nvcc + BaM page cache)"
+            VERBATIM)
+        add_custom_target(clio_md_bam_bench ALL DEPENDS ${_bam_out})
+        install(PROGRAMS ${_bam_out} DESTINATION bin)
+        message(STATUS "eternia-MD BaM baseline: ON")
+    endif()
+endif()
