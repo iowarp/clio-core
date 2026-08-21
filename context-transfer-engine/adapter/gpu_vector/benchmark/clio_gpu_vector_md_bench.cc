@@ -78,6 +78,8 @@ __device__ unsigned long long g_read_bad[4];
 __device__ unsigned long long g_read_sample[8];
 /** Set from MD_PROBE_LDCG: read the probe's elements bypassing L1. */
 __device__ bool kProbeLdcg;
+/** {frame0, pages_per_block, page_bytes, elems_per_page} of the probe's table. */
+__device__ unsigned long long g_read_geom[12];
 /** Per LOGICAL block: page iterations completed, and the last page index
  *  reached. Says WHICH block loses work, and where it stopped. */
 __device__ unsigned long long g_blk_done[64];
@@ -1166,15 +1168,32 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
                                        u32 nblocks, u32 block) {
   const u64 epp = x.h_->elems_per_page_;
   const u64 npages = (x.h_->size_ + epp - 1) / epp;
+  // Publish this block's table geometry once, so a bad guard pointer can be
+  // converted to an actual slot index instead of being guessed at from raw
+  // addresses (which are only comparable within one process).
+  if (threadIdx.x == 0 && blockIdx.x < 4) {
+    // EVERY block publishes its own table base. If two blocks disagree, the
+    // block_override_ that is supposed to put them all on one shared table
+    // is not taking effect, and each block is resolving in a table of its
+    // own while the fetches land in another.
+    g_read_geom[8 + blockIdx.x] =
+        reinterpret_cast<unsigned long long>(x.DbgFrameAt(0));
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    g_read_geom[0] = reinterpret_cast<unsigned long long>(x.DbgFrameAt(0));
+    g_read_geom[1] = x.h_->pages_per_block_;
+    g_read_geom[2] = x.h_->page_bytes_;
+    g_read_geom[3] = epp;
+    g_read_geom[4] = x.h_->page_shift_;
+    g_read_geom[5] = x.h_->page_mask_;
+  }
   for (u64 it = 0; it < passes; ++it) {
     for (u64 pg = block; pg < npages; pg += nblocks) {
       auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
       // Is the guard born valid? Its slot must hold the page we asked for.
       // This separates "the hold returned the wrong frame" from "the frame
       // was right and the slot was recycled out from under the pin".
-      if (threadIdx.x == 0 && h.dbg_slot_page() != pg) {
-        atomicAdd(&g_read_bad[1], 1ull);
-      }
+
       const float *const p = h.ptr();
       for (u64 i = threadIdx.x; i < epp; i += blockDim.x) {
         // MD_PROBE_LDCG=1: read past the (non-coherent) per-SM L1. If the
@@ -1184,6 +1203,14 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
         const float seen = kProbeLdcg ? __ldcg(&p[i]) : p[i];
         if (seen != ProbeVal(pg * epp + i)) {
           atomicAdd(&g_read_bad[0], 1ull);
+          // IS THE DATA ACTUALLY THERE? Re-read the SAME element fully
+          // uncached (ld.global.cv bypasses L1 AND treats L2 as volatile),
+          // with no delay -- this is a pure cache question, not a timing
+          // one. A match here means the bytes were in the frame all along
+          // and the kernel was reading a stale cached line.
+          if (__ldcv(&p[i]) == ProbeVal(pg * epp + i)) {
+            atomicAdd(&g_read_bad[1], 1ull);
+          }
           // DOES IT HEAL? Wait, re-read the SAME address through the SAME
           // guard, and see whether the value arrives late. If it does, the
           // page was published as resident before its transfer landed; if
@@ -1246,6 +1273,9 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
               }
               g_read_sample[6] = nclaim;
               g_read_sample[7] = h.dbg_slot_fetched();
+              g_read_geom[6] =
+                  static_cast<unsigned long long>(
+                      x.DbgSlotIndexOf(h.dbg_slot_ptr()));
             }
           }
         }
@@ -1861,18 +1891,23 @@ int main(int argc, char **argv) {
     const auto sp = vx.ReadStats(0);
     std::printf("  READ PROBE: %llu wrong elements over %llu passes "
                 "(faults %llu evicts %llu GET_ERRORS %llu puts %llu "
-                "put_errors %llu prefetch_late %llu, %.0f ms)%s\n",
+                "put_errors %llu prefetch_late %llu EARLY_COMPLETE %llu "
+                "OUT-OF-TABLE %llu (site %llu), %.0f ms)%s\n",
                 rb[0], (unsigned long long)a.steps,
                 (unsigned long long)sp.faults, (unsigned long long)sp.evicts,
                 (unsigned long long)sp.get_errors,
                 (unsigned long long)sp.puts,
                 (unsigned long long)sp.put_errors,
                 (unsigned long long)sp.prefetch_late,
+                (unsigned long long)sp.early_complete,
+                (unsigned long long)sp.bad_slot,
+                (unsigned long long)sp.bad_slot_site,
                 NowMs() - t0p,
                 rb[0] ? "   <-- THE FAULT PATH DELIVERS WRONG BYTES"
                       : "  [reads are clean]");
     if (rb[0]) {
-      std::printf("    guards BORN ON THE WRONG SLOT=%llu | "
+      std::printf("    of those, %llu were CORRECT when re-read "
+                  "uncached (stale-cache reads) | "
                   "WRONG-FRAME resolves=%llu | misses whose frame "
                   "NO GET EVER TARGETED=%llu\n", rb[1], rb[2], rb[3]);
       unsigned long long sm[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1890,10 +1925,45 @@ int main(int argc, char **argv) {
                       "  guard slot now holds page %llu, pins=%llu, "
                       "fetching=%llu (we asked for page %llu); "
                       "last get submitted into THIS frame was for "
-                      "page %lld\n",
+                      "page %lld; DEVICE FRAME=%p\n",
                       sm[5] & 0xffffffffull, (sm[5] >> 40) & 0xffffff,
                       (sm[5] >> 32) & 0xffull, sm[1],
-                      (long long)sm[7]);
+                      (long long)sm[7], (void *)(uintptr_t)sm[4]);
+        unsigned long long gm[12] = {0};
+        cudaMemcpyFromSymbol(gm, g_read_geom, sizeof(gm));
+        if (gm[2]) {
+          const long long idx =
+              (static_cast<long long>(sm[4]) - static_cast<long long>(gm[0])) /
+              static_cast<long long>(gm[2]);
+          std::printf("    table: frame0=%p slots/block=%llu page_bytes=%llu"
+                      " -> the guard's frame is SLOT %lld of this block "
+                      "(%s)\n",
+                      (void *)(uintptr_t)gm[0], gm[1], gm[2], idx,
+                      (idx >= 0 && idx < (long long)gm[1])
+                          ? "in range"
+                          : "OUT OF THIS BLOCK'S TABLE");
+          const bool pow2 = gm[3] && ((gm[3] & (gm[3] - 1)) == 0);
+          std::printf("    elems/page=%llu (%s) page_shift=%llu "
+                      "page_mask=%#llx%s\n",
+                      gm[3], pow2 ? "power of two" : "NOT a power of two",
+                      gm[4], gm[5],
+                      (!pow2 && gm[4])
+                          ? "  <-- SHIFT/MASK FAST PATH ON A "
+                            "NON-POWER-OF-TWO PAGE"
+                          : "");
+          std::printf("    SAME Page: table slot index=%lld, but its frame "
+                      "is arena index %lld -- %s\n",
+                      (long long)gm[6], idx,
+                      ((long long)gm[6] == idx)
+                          ? "consistent"
+                          : "MISMATCH: Page::data does not match its slot");
+          std::printf("    per-block table bases: b0=%p b1=%p b2=%p b3=%p%s\n",
+                      (void *)(uintptr_t)gm[8], (void *)(uintptr_t)gm[9],
+                      (void *)(uintptr_t)gm[10], (void *)(uintptr_t)gm[11],
+                      (gm[9] && gm[9] != gm[8])
+                          ? "  <-- BLOCKS ARE ON DIFFERENT TABLES"
+                          : "  (all blocks share one table)");
+        }
         } else if (got == static_cast<float>(static_cast<unsigned long long>(got))) {
           const unsigned long long enc =
               static_cast<unsigned long long>(got);

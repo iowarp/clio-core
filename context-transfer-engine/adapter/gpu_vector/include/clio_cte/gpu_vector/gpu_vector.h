@@ -167,13 +167,19 @@ class Vector {
     clio::run::u64 prefetch_hits = 0;   // arrivals found already in flight
     clio::run::u64 rescores = 0;        // placement hints sent
     clio::run::u64 prefetch_late = 0;   // prefetched, but not landed in time
+    /** Gets whose POD already read COMPLETE the instant it was sent -- a
+     *  stale completion flag from the slot's previous request. */
+    clio::run::u64 early_complete = 0;
+    /** Resolves that returned a slot outside the block's own page table. */
+    clio::run::u64 bad_slot = 0;
+    clio::run::u64 bad_slot_site = 0;
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
     clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
     clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
     clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
     clio::run::u64 put_errors = 0;      // writebacks that returned non-zero
   };
-  static constexpr int kNumStats = 12;
+  static constexpr int kNumStats = 15;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -222,6 +228,8 @@ class Vector {
       kv.second.hdr.stat_verify_ok_ = c + 9;
       kv.second.hdr.stat_verify_lost_ = c + 10;
       kv.second.hdr.stat_put_errors_ = c + 11;
+      kv.second.hdr.stat_early_complete_ = c + 12;
+      kv.second.hdr.stat_bad_slot_ = c + 13;   // c + 14 is its site id
       kv.second.hdr.trace_put_errors_ =
           (std::getenv("CLIO_GV_TRACE_PUT_ERRORS") != nullptr) ? 1u : 0u;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
@@ -343,6 +351,9 @@ class Vector {
     s.prefetch_hits = h[4];
     s.rescores = h[5];
     s.put_errors = h[11];
+    s.early_complete = h[12];
+    s.bad_slot = h[13];
+    s.bad_slot_site = h[14];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
     s.pf_dropped = h[8];

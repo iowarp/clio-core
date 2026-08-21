@@ -145,6 +145,10 @@ struct VecHeader {
   /** Gets that came back with a NON-ZERO return code. SubmitGet never checked
    *  this, so a failed read silently left the slot's previous page in place. */
   unsigned long long *stat_get_errors_ = nullptr;
+  /** Gets that read COMPLETE immediately after Send (stale flag). */
+  unsigned long long *stat_early_complete_ = nullptr;
+  /** [0]=resolves landing outside the block's table, [1]=last site id. */
+  unsigned long long *stat_bad_slot_ = nullptr;
   /** Writebacks that came back with a NON-ZERO return code. AwaitPut cleared
    *  `flushing` without ever reading it, so a put that failed -- a full tier
    *  being the obvious way -- marked the page CLEAN and dropped its contents
@@ -276,6 +280,9 @@ class Held {
   /** Diagnostic: the page of the last get SUBMITTED into this guard's own
    *  frame. Table-independent -- it reads the guard's slot directly, so it
    *  is valid no matter which block table the slot belongs to. */
+  /** Diagnostic: this guard's slot object itself. */
+  CTP_GPU_FUN const void *dbg_slot_ptr() const { return page_; }
+
   CTP_GPU_FUN clio::run::u64 dbg_slot_fetched() const {
     return page_ == nullptr
                ? ~static_cast<clio::run::u64>(0)
@@ -500,6 +507,7 @@ class DeviceVector {
       last_page_ = p;
       last_pn_ = pn;
     }
+    DbgCheckInTable(p, 1);
     // EVERY successful hold takes one pin, which exactly one Held guard
     // adopts and releases; the fast path pins too, or a re-hold's guard
     // would release a pin nobody took.
@@ -656,6 +664,7 @@ class DeviceVector {
       last_page_ = p;
       last_pn_ = pn;
     }
+    DbgCheckInTable(p, 2);
     const clio::run::u64 within = IndexIn(off, p);
     const clio::run::u64 left = h_->elems_per_page_ - within;
     *run = (count < left) ? count : left;
@@ -2489,6 +2498,22 @@ class DeviceVector {
    * first's RunContext ("null RunContext" at varying points, constant under
    * an eviction storm, rare but latent in ordinary fused decode).
    */
+  /**
+   * DIAGNOSTIC: a resolved slot MUST live in this block's own table. A
+   * pointer outside it means the lookup and the fetch are addressing
+   * different tables, and the guard hands out a frame nothing fetched into.
+   * `site` identifies which resolve produced it.
+   */
+  CTP_GPU_FUN void DbgCheckInTable(const Page *p, clio::run::u32 site) const {
+    if (h_->stat_bad_slot_ == nullptr || p == nullptr) return;
+    const Page *tbl = BlockPages();
+    if (p < tbl || p >= tbl + h_->pages_per_block_) {
+      atomicAdd(h_->stat_bad_slot_, 1ull);
+      atomicMax(reinterpret_cast<unsigned long long *>(h_->stat_bad_slot_ + 1),
+                static_cast<unsigned long long>(site));
+    }
+  }
+
   CTP_GPU_FUN clio::run::u32 BlockIndex() const {
     const clio::run::u32 raw =
         block_override_ != kNoBlockOverride ? block_override_ : blockIdx.x;
@@ -2503,6 +2528,15 @@ class DeviceVector {
    * host-side check that runs once the kernel is already quiescent.
    */
   /** Diagnostic: the frame address slot `sl` is backed by. */
+  /** Diagnostic: index of a slot within THIS block's table, or -1. */
+  CTP_GPU_FUN long long DbgSlotIndexOf(const void *slot) const {
+    if (slot == nullptr) return -1;
+    const Page *tbl = BlockPages();
+    const Page *p = static_cast<const Page *>(slot);
+    if (p < tbl || p >= tbl + h_->pages_per_block_) return -1;
+    return static_cast<long long>(p - tbl);
+  }
+
   CTP_GPU_FUN const void *DbgFrameAt(clio::run::u32 sl) const {
     return BlockPages()[sl].data;
   }
@@ -3280,6 +3314,16 @@ class DeviceVector {
     p->fetching = 1u;                     // already set by the claim; keep it
     p->dbg_get_page = page_num;
     p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
+    // DIAGNOSTIC (publish-before-fill hunt): the POD's completion flag must
+    // read NOT-COMPLETE immediately after a Send -- the Send resets it to 0.
+    // If it reads 1 here, the reset lost the race against the PREVIOUS
+    // request's CPU-side completion store, and this brand-new get already
+    // looks finished: ReapFetched will clear `fetching` and publish the frame
+    // before a single byte of the new page has landed.
+    if (h_->stat_early_complete_ != nullptr &&
+        p->get->fut_.is_complete_.load() != 0) {
+      atomicAdd(h_->stat_early_complete_, 1ull);
+    }
     if (p->get_fut.IsNull()) {
       Bump(h_->stat_get_errors_);
     }
