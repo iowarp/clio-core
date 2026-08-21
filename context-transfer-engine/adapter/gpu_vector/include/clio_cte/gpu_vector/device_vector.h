@@ -1068,8 +1068,20 @@ class DeviceVector {
     }
     Page *p = &tbl[victim];
     if (p->dirty || p->flushing) {
+      // Same handshake as StartEvictionAsync, and MORE important here
+      // because AwaitPut BLOCKS: the victim was chosen with pins == 0, but
+      // ProbeHold pins without the lock and SubmitPut clears `dirty` as it
+      // sends, so a writer landing after the DMA would leave the page
+      // marked CLEAN with its update only in the frame.
+      p->evicting = 1u;
+      __threadfence();
+      if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+        p->evicting = 0u;
+        return false;              // a writer owns it; caller must wait
+      }
       SubmitPut(p);
       AwaitPut(p);
+      p->evicting = 0u;
     }
     if (!FreeVictimSlot(p)) {
       // A lock-free hold landed during the scan or the writeback: the page
@@ -1107,8 +1119,15 @@ class DeviceVector {
       if (victim == h_->pages_per_block_) return;   // nothing resident
       Page *p = &tbl[victim];
       if (p->dirty || p->flushing) {
+        p->evicting = 1u;          // see EvictWindowLocked for why
+        __threadfence();
+        if (*(volatile clio::run::u32 *)&p->pins != 0u) {
+          p->evicting = 0u;
+          continue;                // a writer owns it; leave it alone
+        }
         SubmitPut(p);
         AwaitPut(p);
+        p->evicting = 0u;
       }
       if (!FreeVictimSlot(p)) continue;   // holder raced in; rescan skips it
       p->dirty = 0u;
