@@ -715,8 +715,23 @@ class DeviceVector {
 
   /** Offset of an element within its page. */
   CTP_GPU_FUN clio::run::u64 IndexIn(clio::run::u64 off, const Page *p) const {
+    // A PURE FUNCTION OF `off` -- never of the slot.
+    //
+    // The fallback arm used to read p->page_num, and that is shared mutable
+    // state: when it disagreed with the page `off` belongs to, the returned
+    // offset was wrong by (PageOf(off) - page_num) WHOLE PAGES, so the guard
+    // handed the caller a pointer into a different frame entirely. The
+    // reader then saw zeros (a frame nothing had fetched into) or another
+    // page's bytes (one that was in use), with the fetch, the rc, the pin
+    // and the slot all perfectly correct -- the out-of-core read corruption.
+    //
+    // The power-of-two arm was always immune because `off & page_mask_` does
+    // not consult the slot, which is exactly why every gate (64KB pages)
+    // passed while a 96KB-page run corrupted: 24576 elements is not a power
+    // of two, so only that configuration took the racy arm.
+    (void) p;
     return h_->page_shift_ ? (off & h_->page_mask_)
-                       : (off - p->page_num * h_->elems_per_page_);
+                           : (off - PageOf(off) * h_->elems_per_page_);
   }
 
  private:

@@ -1879,6 +1879,7 @@ int main(int argc, char **argv) {
     const bool ldcg = getenv("MD_PROBE_LDCG") != nullptr;
     cudaMemcpyToSymbol(kProbeLdcg, &ldcg, sizeof(ldcg));
     const unsigned long long epp_host = g.nelems / npages;
+    const clio::run::u64 audit_before = vx.AuditFrames("post-prefetch");
     const double t0p = NowMs();
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
@@ -1886,6 +1887,10 @@ int main(int argc, char **argv) {
                                                         a.blocks, vw, sv);
     });
     ctp::GpuApi::Synchronize();
+    std::printf("  frame audit: after Prefetch=%llu bad, after kernel=%llu "
+                "bad (slot i must own frame i)\n",
+                (unsigned long long)audit_before,
+                (unsigned long long)vx.AuditFrames("post-kernel"));
     unsigned long long rb[4] = {0, 0, 0, 0};
     cudaMemcpyFromSymbol(rb, g_read_bad, sizeof(rb));
     const auto sp = vx.ReadStats(0);

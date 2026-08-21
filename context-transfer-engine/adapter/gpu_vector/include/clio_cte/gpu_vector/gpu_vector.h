@@ -504,6 +504,46 @@ class Vector {
   }
 
   /**
+   * DIAGNOSTIC: every slot must own the frame its index names --
+   * InitPageTable sets slot i -> pages_base + i * page_bytes and nothing may
+   * ever rewrite it. A violation means a reader can be handed a pointer into
+   * a frame no transfer for its page ever targeted.
+   * @return number of slots whose data pointer disagrees with their index.
+   */
+  clio::run::u64 AuditFrames(const char *when) {
+    clio::run::u64 bad = 0;
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      const clio::run::u64 nslots =
+          static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+      std::vector<Page> tbl(static_cast<size_t>(nslots));
+      ctp::GpuApi::Memcpy(tbl.data(), reinterpret_cast<Page *>(st.table_base),
+                          nslots * sizeof(Page));
+      for (clio::run::u64 i = 0; i < nslots; ++i) {
+        const char *want = st.pages_base + i * page_bytes_;
+        if (static_cast<const char *>(tbl[i].data) != want) {
+          if (bad < 8) {
+            std::fprintf(stderr,
+                         "[frame-audit %s] slot %llu: data=%p want=%p "
+                         "(off by %lld frames), page_num=%lld\n",
+                         when, (unsigned long long)i, tbl[i].data,
+                         (const void *)want,
+                         (long long)((static_cast<const char *>(tbl[i].data) -
+                                      want) / (long long)page_bytes_),
+                         (long long)tbl[i].page_num);
+          }
+          ++bad;
+        }
+      }
+    }
+#else
+    (void)when;
+#endif
+    return bad;
+  }
+
+  /**
    * DIAGNOSTIC (chasing intermittent post-Prefetch corruption): compare every
    * resident cache frame in blocks [blk_lo, blk_hi) against the caller's
    * expected bytes, and independently re-get each page from the backing
