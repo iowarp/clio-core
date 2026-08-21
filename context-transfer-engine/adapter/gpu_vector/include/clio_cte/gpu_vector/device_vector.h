@@ -149,6 +149,9 @@ struct VecHeader {
   unsigned long long *stat_early_complete_ = nullptr;
   /** [0]=resolves landing outside the block's table, [1]=last site id. */
   unsigned long long *stat_bad_slot_ = nullptr;
+  /** [0]=claims that found NO usable slot, [1]=peak slots pinned at such a
+   *  moment. Sampled only on failure, so the hot path pays nothing. */
+  unsigned long long *stat_claim_fail_ = nullptr;
   /** Writebacks that came back with a NON-ZERO return code. AwaitPut cleared
    *  `flushing` without ever reading it, so a put that failed -- a full tier
    *  being the obvious way -- marked the page CLEAN and dropped its contents
@@ -3177,7 +3180,24 @@ class DeviceVector {
     const clio::run::u32 free_slot = ClaimSlotWindowLocked(page_num);
     // Every candidate mid-transfer: report failure rather than stalling, so
     // the caller simply falls back to a demand fault later.
-    if (free_slot == ~0u) return false;
+    if (free_slot == ~0u) {
+      // DERIVING THE CACHE FLOOR, at the only moment it matters: a claim
+      // that found nothing. Count how much of the table is PINNED right
+      // now. If that approaches the slot count, every slot is spoken for by
+      // a live hold and no block can assemble its working set while the
+      // others hold theirs -- the wedge. Sampled on failure only, so the
+      // hot path pays nothing and the measurement does not perturb the
+      // timing of the thing being measured.
+      if (h_->stat_claim_fail_ != nullptr && threadIdx.x == 0) {
+        atomicAdd(h_->stat_claim_fail_, 1ull);
+        unsigned long long pinned = 0;
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+          if (*(volatile clio::run::u32 *) &tbl[i].pins != 0u) ++pinned;
+        }
+        atomicMax(h_->stat_claim_fail_ + 1, pinned);
+      }
+      return false;
+    }
     Page *p = &tbl[free_slot];
     // Same ordering as the synchronous claim: busy first, then the page
     // number. Reversed, HoldPage's lock-free scan can see a slot that looks

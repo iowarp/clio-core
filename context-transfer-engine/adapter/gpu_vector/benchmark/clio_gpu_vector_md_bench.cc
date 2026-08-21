@@ -2352,6 +2352,12 @@ int main(int argc, char **argv) {
     // provably cannot hold it, so faults are the feature, not a failure, and
     // asserting res_ok there failed runs whose physics was bit-identical to
     // the resident answer. What must hold in BOTH regimes is the energy.
+    std::printf("  claim failures: x=%llu (peak %llu of %u slots pinned at "
+                "the time) | f=%llu (peak %llu pinned)\n",
+                (unsigned long long)sfx.claim_fails,
+                (unsigned long long)sfx.peak_pinned_on_fail, slots,
+                (unsigned long long)sff.claim_fails,
+                (unsigned long long)sff.peak_pinned_on_fail);
     const bool nve_ok = (e_drift < a.drift_tol) &&
                         (!expect_resident || res_ok) && !runner.HitCap();
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");

@@ -173,13 +173,17 @@ class Vector {
     /** Resolves that returned a slot outside the block's own page table. */
     clio::run::u64 bad_slot = 0;
     clio::run::u64 bad_slot_site = 0;
+    /** Claims that found no usable slot, and the peak number of slots
+     *  pinned at such a moment -- the floor a cache must exceed. */
+    clio::run::u64 claim_fails = 0;
+    clio::run::u64 peak_pinned_on_fail = 0;
     clio::run::u64 get_errors = 0;      // gets that returned non-zero
     clio::run::u64 pf_dropped = 0;      // async batch hints dropped (slots busy)
     clio::run::u64 verify_ok = 0;       // re-probe after compute: page intact
     clio::run::u64 verify_lost = 0;     // re-probe: page evicted mid-read
     clio::run::u64 put_errors = 0;      // writebacks that returned non-zero
   };
-  static constexpr int kNumStats = 15;
+  static constexpr int kNumStats = 17;
 
   /**
    * Turn on device-side paging counters for every device view.
@@ -230,6 +234,13 @@ class Vector {
       kv.second.hdr.stat_put_errors_ = c + 11;
       kv.second.hdr.stat_early_complete_ = c + 12;
       kv.second.hdr.stat_bad_slot_ = c + 13;   // c + 14 is its site id
+      // OFF unless asked for: the claim-failure sampler walks the whole
+      // table under the block lock, and that cost is enough to move the
+      // livelock boundary it exists to measure (40 slots ran at 58.8
+      // ms/step without it and wedged with it). Opt in with
+      // CLIO_GV_CLAIM_PROF=1 when profiling, never in a timed run.
+      kv.second.hdr.stat_claim_fail_ =
+          (std::getenv("CLIO_GV_CLAIM_PROF") != nullptr) ? c + 15 : nullptr;
       kv.second.hdr.trace_put_errors_ =
           (std::getenv("CLIO_GV_TRACE_PUT_ERRORS") != nullptr) ? 1u : 0u;
       if (getenv("CLIO_FAULT_HIST") != nullptr) {
@@ -354,6 +365,8 @@ class Vector {
     s.early_complete = h[12];
     s.bad_slot = h[13];
     s.bad_slot_site = h[14];
+    s.claim_fails = h[15];
+    s.peak_pinned_on_fail = h[16];
     s.prefetch_late = h[6];
     s.get_errors = h[7];
     s.pf_dropped = h[8];
