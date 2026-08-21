@@ -1962,6 +1962,20 @@ class DeviceVector {
   CTP_GPU_FUN bool AdmissionOn() const { return h_->hold_admits_ != nullptr; }
 
   /**
+   * Do these two handles address the SAME page table (and so the same
+   * admission counter)?
+   *
+   * Callers must aggregate their reservations per TABLE, not per handle: two
+   * EnterHoldSet calls on one table by one block self-deadlock, because the
+   * second waits for capacity the first is already holding. The gather pass
+   * is launched as (src=dx, srcx=dx, dst=dx2) -- two of its three handles
+   * are the same vector -- so this is not hypothetical.
+   */
+  CTP_GPU_FUN bool SameTableAs(const DeviceVector<T> &o) const {
+    return h_->pages_ == o.h_->pages_;
+  }
+
+  /**
    * How many pages the range [off, off+count) touches -- i.e. exactly how
    * many guards holding it will take, since a hold is cut at each page
    * boundary.

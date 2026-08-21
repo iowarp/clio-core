@@ -1112,6 +1112,22 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     const u32 by = static_cast<u32>(row % nb);
     const u32 bz = static_cast<u32>(row / nb);
     // THE ONLY WRITE HOLD: this block's own destination row.
+    // ADMITTED, with reservations AGGREGATED PER TABLE. This pass is
+    // launched as (src=dx, srcx=dx, dst=dx2), so two of its three handles
+    // are the same vector; issuing one Enter per handle made the second
+    // wait for capacity the block itself was already holding, which
+    // self-deadlocked and turned a 24-slot marginal pass into a hard wedge.
+    // One Enter per distinct table, counts summed, is the rule.
+    u32 nd = 2, ns = kSpanGuards, nx = kSpanGuards;
+    if (src.SameTableAs(dst)) { nd += ns; ns = 0; }
+    if (srcx.SameTableAs(dst)) { nd += nx; nx = 0; }
+    else if (srcx.SameTableAs(src)) { ns += nx; nx = 0; }
+    if (dst.AdmissionOn()) {
+      co_await dst.EnterHoldSet(nd);
+      if (ns != 0) co_await src.EnterHoldSet(ns);
+      if (nx != 0) co_await srcx.EnterHoldSet(nx);
+    }
+    {   // every guard dies at this scope's close, before the reservations
     gv::Held<float> hd0 = co_await dst.HoldPage(row * row_elems, row_elems,
                                                 /*write=*/true);
     gv::Held<float> hd1;
@@ -1200,7 +1216,11 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
       dp[3] = keep_w ? sv[3] : 0.0f;
     }
     __syncthreads();
-  }
+    }   // guards dead here
+    if (nx != 0) srcx.ExitHoldSet(nx);
+    if (ns != 0) src.ExitHoldSet(ns);
+    dst.ExitHoldSet(nd);
+  }     // per-row loop
 }
 
 /** Pre-sentinel every slot of a ping-pong destination vector. */
