@@ -1026,6 +1026,7 @@ class Vector {
     for (clio::run::u64 i = 0; i < nslots; ++i) {
       Page &p = table[static_cast<size_t>(i)];
       p.page_num = kNoPage;
+      p.dbg_get_page = kNoPage;
       p.data = st.pages_base + i * page_bytes_;
       p.score = 0.0f;
       p.user_score = 0.0f;

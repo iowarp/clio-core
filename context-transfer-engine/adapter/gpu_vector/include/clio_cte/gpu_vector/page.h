@@ -79,6 +79,15 @@ struct MultiBatch {
 struct Page {
   /** Which page of the vector this slot holds; kNoPage when free. */
   clio::run::u64 page_num;
+  /**
+   * DIAGNOSTIC: the page number of the last get SUBMITTED into this frame.
+   *
+   * A reader that finds `page_num == P` but `dbg_get_page != P` is holding a
+   * frame no transfer for P ever targeted -- the page was published resident
+   * without its bytes being requested. Distinguishes that from a get that ran
+   * and delivered the wrong or partial content.
+   */
+  clio::run::u64 dbg_get_page;
   /** Claim generation: bumped every time this slot is (re)claimed. A reader
    *  that captured gen at hold time and sees it unchanged after computing
    *  knows the slot was never recycled mid-read (seqlock validate). */

@@ -2653,6 +2653,27 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
+    // CLIO_GET_READBACK=1: read the first word BACK through the very
+    // pointer this read just filled. The gpu_vector fault path has a case
+    // where a get completes with rc 0 into the right frame and the DEVICE
+    // still sees zeros; this separates "the bytes never landed anywhere"
+    // from "they landed somewhere the device cannot see".
+    {
+      static const bool readback = getenv("CLIO_GET_READBACK") != nullptr;
+      if (readback && !task->context_.emulate_ && !vectored) {
+        char *dst = CLIO_IPC->ToFullPtr(blob_data_ptr)
+                        .template Cast<char>().ptr_;
+        if (dst != nullptr) {
+          unsigned int word = 0xdeadbeefu;
+          ctp::DeviceAwareMemcpy(&word, dst, sizeof(word));
+          if (word == 0u) {
+            fprintf(stderr, "[readback] blob %s size %zu dst %p -> ZERO\n",
+                    blob_name.c_str(), (size_t)size, (void *)dst);
+          }
+        }
+      }
+    }
+
     // Log telemetry and success messages after releasing lock
     LogTelemetry(CteOp::kGetBlob, offset, size, tag_id,
                  blob_info_ptr->last_modified_, now);
@@ -7226,6 +7247,13 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
   }
 
   HLOG(kDebug, "ReadData: All read tasks completed successfully");
+  if (remaining_size != 0) {
+    static const bool trace = getenv("CLIO_SHORT_READ_TRACE") != nullptr;
+    if (trace) {
+      fprintf(stderr, "[shortread] blocks=%zu want=%zu off=%zu UNCOVERED=%zu\n",
+              blocks.size(), data_size, data_offset_in_blob, remaining_size);
+    }
+  }
   error_code = 0;  // Success
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -74,6 +74,10 @@ __device__ unsigned long long g_third_sink;
  *  that is unique per element and exact in float, then only READ.
  *  [0] mismatches [1] first bad page [2] first bad index. */
 __device__ unsigned long long g_read_bad[4];
+/** First bad sample: {claimed, page, elem, observed-value-as-u32-bits}. */
+__device__ unsigned long long g_read_sample[8];
+/** Set from MD_PROBE_LDCG: read the probe's elements bypassing L1. */
+__device__ bool kProbeLdcg;
 /** Per LOGICAL block: page iterations completed, and the last page index
  *  reached. Says WHICH block loses work, and where it stopped. */
 __device__ unsigned long long g_blk_done[64];
@@ -1165,19 +1169,84 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
   for (u64 it = 0; it < passes; ++it) {
     for (u64 pg = block; pg < npages; pg += nblocks) {
       auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
+      // Is the guard born valid? Its slot must hold the page we asked for.
+      // This separates "the hold returned the wrong frame" from "the frame
+      // was right and the slot was recycled out from under the pin".
+      if (threadIdx.x == 0 && h.dbg_slot_page() != pg) {
+        atomicAdd(&g_read_bad[1], 1ull);
+      }
       const float *const p = h.ptr();
       for (u64 i = threadIdx.x; i < epp; i += blockDim.x) {
-        if (p[i] != ProbeVal(pg * epp + i)) {
+        // MD_PROBE_LDCG=1: read past the (non-coherent) per-SM L1. If the
+        // mismatches vanish only under this, the bytes were always in the
+        // frame and the kernel was reading a stale cached line -- host DMA
+        // that lands mid-kernel is not visible to an ordinary ld.global.
+        const float seen = kProbeLdcg ? __ldcg(&p[i]) : p[i];
+        if (seen != ProbeVal(pg * epp + i)) {
           atomicAdd(&g_read_bad[0], 1ull);
           // DOES IT HEAL? Wait, re-read the SAME address through the SAME
           // guard, and see whether the value arrives late. If it does, the
           // page was published as resident before its transfer landed; if
           // it stays wrong, the get truly never wrote the frame.
-          const long long t0 = clock64();
-          while (clock64() - t0 < 2000000ll) { }
-          __threadfence_system();
-          if (*(volatile float *)&p[i] == ProbeVal(pg * epp + i)) {
-            atomicAdd(&g_read_bad[1], 1ull);   // healed => published early
+          // LIVE DUPLICATE CHECK. The quiescent host-side check runs after
+          // the kernel and cannot see a TRANSIENT duplicate. If this page
+          // occupies more than one slot right now, the get filled one of
+          // them and this reader is looking at the other -- which is
+          // exactly what an untouched (zero) frame plus rc == 0 looks like.
+          if (threadIdx.x == 0) {
+            u32 seen = 0;
+            for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+              if (x.PageAt(sl) == pg) ++seen;
+            }
+            if (seen > 1) atomicAdd(&g_read_bad[2], 1ull);
+            // Was a get for THIS page ever submitted into the frame we are
+            // reading? The slot stamps the page each transfer targets and
+            // clears it on every claim, so a stamp that is not `pg` means the
+            // page was published resident without its bytes being requested.
+            for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+              if (x.PageAt(sl) == pg && x.DbgGetPageAt(sl) != pg) {
+                atomicAdd(&g_read_bad[3], 1ull);
+              }
+              // Is the pointer we are reading through even the frame of the
+              // slot that holds this page? The get trace says the page's
+              // bytes landed in a DIFFERENT frame, which would mean the
+              // resolve handed back a stale slot, not that the fetch failed.
+              if (x.PageAt(sl) == pg &&
+                  x.DbgFrameAt(sl) != (const void *)p) {
+                atomicAdd(&g_read_bad[2], 1ull);
+              }
+            }
+            // Capture ONE bad sample verbatim. "The frame is zero" has been an
+            // assumption, not a measurement: if the value instead decodes to
+            // another page's pattern, the get delivered the WRONG BLOB, which
+            // is a completely different defect from one that delivers nothing.
+            if (atomicCAS(&g_read_sample[0], 0ull, 1ull) == 0ull) {
+              const float got = *(volatile float *)&p[i];
+              u32 bits;
+              __builtin_memcpy(&bits, &got, 4);
+              g_read_sample[1] = pg;
+              g_read_sample[2] = i;
+              g_read_sample[3] = bits;
+              // The frame this reader is looking at. Compared against the
+              // destination the get actually wrote (CLIO_DR_LOG prints it),
+              // this says whether the transfer targeted a DIFFERENT address.
+              g_read_sample[4] =
+                  reinterpret_cast<unsigned long long>(h.ptr());
+              g_read_sample[5] =
+                  (static_cast<unsigned long long>(h.dbg_slot_state()) << 32) |
+                  (h.dbg_slot_page() & 0xffffffffull);
+              // How many slots in the table claim this page right now, and
+              // is the guard's own frame one of them? If the page is in two
+              // slots, the fetch filled one and the reader was handed the
+              // other.
+              u32 nclaim = 0, gidx = ~0u;
+              for (u32 sl = 0; sl < x.h_->pages_per_block_; ++sl) {
+                if (x.PageAt(sl) == pg) ++nclaim;
+                if (x.DbgFrameAt(sl) == (const void *)p) gidx = sl;
+              }
+              g_read_sample[6] = nclaim;
+              g_read_sample[7] = h.dbg_slot_fetched();
+            }
           }
         }
       }
@@ -1775,6 +1844,11 @@ int main(int argc, char **argv) {
     auto dxp = vx.GetDevice(0);
     const unsigned long long z4[4] = {0, 0, 0, 0};
     cudaMemcpyToSymbol(g_read_bad, z4, sizeof(z4));
+    const unsigned long long z8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    cudaMemcpyToSymbol(g_read_sample, z8, sizeof(z8));
+    const bool ldcg = getenv("MD_PROBE_LDCG") != nullptr;
+    cudaMemcpyToSymbol(kProbeLdcg, &ldcg, sizeof(ldcg));
+    const unsigned long long epp_host = g.nelems / npages;
     const double t0p = NowMs();
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
@@ -1798,9 +1872,37 @@ int main(int argc, char **argv) {
                 rb[0] ? "   <-- THE FAULT PATH DELIVERS WRONG BYTES"
                       : "  [reads are clean]");
     if (rb[0]) {
-      std::printf("    of those, %llu healed on a later re-read. Zero "
-                  "healing means the data NEVER ARRIVES: the get reported "
-                  "success and left the frame untouched.\n", rb[1]);
+      std::printf("    guards BORN ON THE WRONG SLOT=%llu | "
+                  "WRONG-FRAME resolves=%llu | misses whose frame "
+                  "NO GET EVER TARGETED=%llu\n", rb[1], rb[2], rb[3]);
+      unsigned long long sm[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      cudaMemcpyFromSymbol(sm, g_read_sample, sizeof(sm));
+      if (sm[0]) {
+        unsigned int bits = static_cast<unsigned int>(sm[3]);
+        float got;
+        std::memcpy(&got, &bits, 4);
+        const unsigned long long want = sm[1] * epp_host + sm[2];
+        std::printf("    sample: page %llu elem %llu -> got %.1f (bits 0x%08x)"
+                    ", wanted %.1f.", sm[1], sm[2], got, bits,
+                    static_cast<double>(want));
+        if (bits == 0u) {
+          std::printf("  ZERO: the frame was never written."
+                      "  guard slot now holds page %llu, pins=%llu, "
+                      "fetching=%llu (we asked for page %llu); "
+                      "last get submitted into THIS frame was for "
+                      "page %lld\n",
+                      sm[5] & 0xffffffffull, (sm[5] >> 40) & 0xffffff,
+                      (sm[5] >> 32) & 0xffull, sm[1],
+                      (long long)sm[7]);
+        } else if (got == static_cast<float>(static_cast<unsigned long long>(got))) {
+          const unsigned long long enc =
+              static_cast<unsigned long long>(got);
+          std::printf("  That value is element %llu, i.e. PAGE %llu -- the get "
+                      "delivered ANOTHER PAGE'S BLOB.\n", enc, enc / epp_host);
+        } else {
+          std::printf("  Not a seeded value at all: torn or foreign bytes.\n");
+        }
+      }
     }
     return rb[0] ? 1 : 0;
   }

@@ -268,6 +268,35 @@ class Held {
   CTP_GPU_FUN T *begin() const { return data_; }
   CTP_GPU_FUN T *end() const { return data_ + run_; }
   CTP_GPU_FUN T *ptr() const { return data_; }
+
+  /** Diagnostic: the page this guard's SLOT currently holds. A guard whose
+   *  slot does not hold the page the caller asked for is reading a frame
+   *  that belongs to someone else. */
+  /** Diagnostic: {pins, fetching} of this guard's slot, packed. */
+  /** Diagnostic: the page of the last get SUBMITTED into this guard's own
+   *  frame. Table-independent -- it reads the guard's slot directly, so it
+   *  is valid no matter which block table the slot belongs to. */
+  CTP_GPU_FUN clio::run::u64 dbg_slot_fetched() const {
+    return page_ == nullptr
+               ? ~static_cast<clio::run::u64>(0)
+               : *reinterpret_cast<volatile clio::run::u64 *>(
+                     &page_->dbg_get_page);
+  }
+
+  CTP_GPU_FUN clio::run::u32 dbg_slot_state() const {
+    if (page_ == nullptr) return ~0u;
+    const clio::run::u32 pins =
+        *reinterpret_cast<volatile clio::run::u32 *>(&page_->pins);
+    const clio::run::u32 f =
+        *reinterpret_cast<volatile clio::run::u32 *>(&page_->fetching);
+    return (pins << 8) | (f & 0xffu);
+  }
+
+  CTP_GPU_FUN clio::run::u64 dbg_slot_page() const {
+    return page_ == nullptr
+               ? ~static_cast<clio::run::u64>(0)
+               : *reinterpret_cast<volatile clio::run::u64 *>(&page_->page_num);
+  }
   /** Element access by GLOBAL offset; valid within [begin_off, end_off). */
   CTP_GPU_FUN T &operator[](clio::run::u64 off) const {
     return data_[off - begin_];
@@ -1455,6 +1484,7 @@ class DeviceVector {
         np->has_user = 0u;
         np->last_access = Now();
         mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+        np->dbg_get_page = e.page;
         mb[0].page_slot[nf++] = slot;
         Bump(h_->stat_faults_);
         Bump(h_->stat_prefetches_);
@@ -2465,6 +2495,29 @@ class DeviceVector {
     return raw % h_->nblocks_;
   }
 
+ public:
+  /**
+   * Diagnostic: which page is parked in slot `sl` of THIS block right now.
+   * Exposed so a kernel can look for a page occupying two slots at the exact
+   * moment it reads a bad value -- a transient duplicate is invisible to any
+   * host-side check that runs once the kernel is already quiescent.
+   */
+  /** Diagnostic: the frame address slot `sl` is backed by. */
+  CTP_GPU_FUN const void *DbgFrameAt(clio::run::u32 sl) const {
+    return BlockPages()[sl].data;
+  }
+
+  CTP_GPU_FUN clio::run::u64 DbgGetPageAt(clio::run::u32 sl) const {
+    return *reinterpret_cast<volatile clio::run::u64 *>(
+        &BlockPages()[sl].dbg_get_page);
+  }
+
+  CTP_GPU_FUN clio::run::u64 PageAt(clio::run::u32 sl) const {
+    return *reinterpret_cast<volatile clio::run::u64 *>(
+        &BlockPages()[sl].page_num);
+  }
+
+ private:
   CTP_GPU_FUN Page *BlockPages() const {
     return h_->pages_ +
            static_cast<clio::run::u64>(BlockIndex()) * h_->pages_per_block_;
@@ -2855,6 +2908,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb->get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb->page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -2930,6 +2984,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb[0].page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -3016,6 +3071,7 @@ class DeviceVector {
       char name[32];
       PageBlobName(pg, name);
       mb[0].get->Add(name, 0, h_->page_bytes_, RawPtr(np->data));
+      np->dbg_get_page = pg;
       mb[0].page_slot[filled] = slot;
       ++filled;
       Bump(h_->stat_faults_);
@@ -3080,6 +3136,7 @@ class DeviceVector {
     p->fetching = 1u;
     __threadfence_block();
     p->gen += 1u;
+    p->dbg_get_page = kNoPage;
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -3141,6 +3198,7 @@ class DeviceVector {
     p->fetching = 4u;
     __threadfence_block();
     p->gen += 1u;
+    p->dbg_get_page = kNoPage;
     p->page_num = page_num;
     p->dirty = 0u;
     p->flushing = 0u;
@@ -3220,6 +3278,7 @@ class DeviceVector {
     if (is_prefetch) Bump(h_->stat_prefetches_);
     XferAdd(1);
     p->fetching = 1u;                     // already set by the claim; keep it
+    p->dbg_get_page = page_num;
     p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->get));
     if (p->get_fut.IsNull()) {
       Bump(h_->stat_get_errors_);
@@ -3362,6 +3421,7 @@ class DeviceVector {
           p->fetching = 1u;
           __threadfence_block();
           p->gen += 1u;
+          p->dbg_get_page = kNoPage;
           p->page_num = page_num;
           p->dirty = 0u;
           p->flushing = 0u;
