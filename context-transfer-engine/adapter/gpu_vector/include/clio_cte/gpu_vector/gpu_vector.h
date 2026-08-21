@@ -1056,17 +1056,26 @@ class Vector {
     // with). Until the reservation is sized from the true concurrent hold
     // set rather than a bound, paying that on every run is the wrong
     // default. A null counter makes Enter/ExitHoldSet no-ops.
-    void *admits = nullptr;
-    if (std::getenv("CLIO_GV_ADMIT") != nullptr) {
-      admits = ctp::GpuApi::Malloc<void>(sizeof(unsigned int));
-      if (admits == nullptr) {
-        throw std::runtime_error("gpu_vector: admission counter alloc failed");
-      }
-      ctp::GpuApi::Memset(admits, 0, sizeof(unsigned int));
+    void *admits = ctp::GpuApi::Malloc<void>(sizeof(unsigned int));
+    if (admits == nullptr) {
+      throw std::runtime_error("gpu_vector: admission counter alloc failed");
     }
+    ctp::GpuApi::Memset(admits, 0, sizeof(unsigned int));
+    // [0] armed flag, [1] failed-claim count. Armed from the start only when
+    // forced; otherwise the device arms it if the livelock signature shows
+    // up, so a comfortable cache never pays admission's ~2.3x and a cache
+    // too small throttles instead of wedging.
+    void *armed = ctp::GpuApi::Malloc<void>(2 * sizeof(unsigned int));
+    if (armed == nullptr) {
+      throw std::runtime_error("gpu_vector: admission flag alloc failed");
+    }
+    const unsigned int arm_init[2] = {
+        (std::getenv("CLIO_GV_ADMIT") != nullptr) ? 1u : 0u, 0u};
+    ctp::GpuApi::Memcpy(static_cast<unsigned int *>(armed), arm_init, 2);
 
     VecHeader v;   // filled here, then uploaded; the view only points at it
     v.hold_admits_ = static_cast<unsigned int *>(admits);
+    v.admit_armed_ = static_cast<unsigned int *>(armed);
     v.hold_admit_cap_ = pages_per_block_;
     v.xfer_cnt_ = static_cast<unsigned int *>(xfers);
     v.block_locks_ = static_cast<int *>(locks);
@@ -1229,6 +1238,10 @@ class Vector {
     if (st.hdr.hold_admits_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.hold_admits_);
       st.hdr.hold_admits_ = nullptr;
+    }
+    if (st.hdr.admit_armed_ != nullptr) {
+      ctp::GpuApi::Free(st.hdr.admit_armed_);
+      st.hdr.admit_armed_ = nullptr;
     }
     if (st.hdr.block_locks_ != nullptr) {
       ctp::GpuApi::Free(st.hdr.block_locks_);

@@ -150,6 +150,19 @@ struct VecHeader {
    */
   unsigned int *hold_admits_ = nullptr;
   clio::run::u32 hold_admit_cap_ = 0;
+  /**
+   * Whether admission is in force. Set once at construction from
+   * CLIO_GV_ADMIT; [1] is unused.
+   *
+   * AUTO-ARMING ON THE LIVELOCK SIGNATURE WAS TRIED AND DOES NOT WORK. By
+   * the time claims are failing en masse every block is already INSIDE a
+   * hold set, and a block only consults this flag before entering one -- so
+   * the blocks that would need throttling are past the decision, and the
+   * next chunk that would honour it is never reached. Measured: with the
+   * watchdog in place a 32-slot run still wedged, exactly as it did
+   * without. Admission has to be armed BEFORE the run, not during it.
+   */
+  unsigned int *admit_armed_ = nullptr;
   unsigned long long *stat_faults_ = nullptr;   // page-ins  (SubmitGet)
   unsigned long long *stat_puts_ = nullptr;     // writebacks (SubmitPut)
   unsigned long long *stat_evicts_ = nullptr;   // slots reclaimed
@@ -1959,7 +1972,16 @@ class DeviceVector {
    * measured 110 ms/step against 43 with the awaits skipped -- i.e. the
    * disabled path cost 2.5x all by itself.
    */
-  CTP_GPU_FUN bool AdmissionOn() const { return h_->hold_admits_ != nullptr; }
+  /**
+   * Is admission in force RIGHT NOW? Call sites must latch this in a local
+   * at Enter and reuse that local at Exit: it can flip mid-run (see
+   * VecHeader::admit_armed_), and re-testing it at Exit would let a block
+   * release a reservation it never took.
+   */
+  CTP_GPU_FUN bool AdmissionOn() const {
+    return h_->hold_admits_ != nullptr && h_->admit_armed_ != nullptr &&
+           *(volatile unsigned int *) h_->admit_armed_ != 0u;
+  }
 
   /**
    * Do these two handles address the SAME page table (and so the same

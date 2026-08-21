@@ -541,7 +541,11 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         }
       }
     }
-    if (x.AdmissionOn()) {
+    // LATCHED. Admission can arm mid-run (the livelock watchdog), so the
+    // decision is taken once here and reused at the release below; retesting
+    // it there would let a block give back a reservation it never took.
+    const bool adm = x.AdmissionOn();
+    if (adm) {
       co_await x.EnterHoldSet(span_guards);
       co_await nl.EnterHoldSet(kMaxNlGuards);
     }
@@ -698,8 +702,10 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     __syncthreads();
     }   // per-row loop
     }
-    nl.ExitHoldSet(kMaxNlGuards);
-    x.ExitHoldSet(span_guards);
+    if (adm) {
+      nl.ExitHoldSet(kMaxNlGuards);
+      x.ExitHoldSet(span_guards);
+    }
   }     // per-chunk loop
 }
 
@@ -815,7 +821,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // exhausted by blocks that are themselves blocked. Acquiring every
     // reservation up front, while holding nothing, is what makes the
     // guarantee hold across the whole working set rather than per vector.
-    if (x.AdmissionOn()) {
+    const bool adm = x.AdmissionOn();   // latched; see the build pass
+    if (adm) {
       co_await x.EnterHoldSet(span_guards);
       co_await f.EnterHoldSet(2);
       co_await nl.EnterHoldSet(kMaxNlGuards);
@@ -1001,9 +1008,11 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // this brace), so the reservation is given back exactly once per
     // EnterHoldSet. The only chunk-level `continue` is above the Enter.
     }
-    nl.ExitHoldSet(kMaxNlGuards);
-    f.ExitHoldSet(2);
-    x.ExitHoldSet(span_guards);
+    if (adm) {
+      nl.ExitHoldSet(kMaxNlGuards);
+      f.ExitHoldSet(2);
+      x.ExitHoldSet(span_guards);
+    }
   }     // per-chunk loop
   if (eflag) {
     const double vals[3] = {pe, w, npairs};
@@ -1122,7 +1131,8 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     if (src.SameTableAs(dst)) { nd += ns; ns = 0; }
     if (srcx.SameTableAs(dst)) { nd += nx; nx = 0; }
     else if (srcx.SameTableAs(src)) { ns += nx; nx = 0; }
-    if (dst.AdmissionOn()) {
+    const bool adm = dst.AdmissionOn();   // latched; see the build pass
+    if (adm) {
       co_await dst.EnterHoldSet(nd);
       if (ns != 0) co_await src.EnterHoldSet(ns);
       if (nx != 0) co_await srcx.EnterHoldSet(nx);
@@ -1217,9 +1227,11 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     }
     __syncthreads();
     }   // guards dead here
-    if (nx != 0) srcx.ExitHoldSet(nx);
-    if (ns != 0) src.ExitHoldSet(ns);
-    dst.ExitHoldSet(nd);
+    if (adm) {
+      if (nx != 0) srcx.ExitHoldSet(nx);
+      if (ns != 0) src.ExitHoldSet(ns);
+      dst.ExitHoldSet(nd);
+    }
   }     // per-row loop
 }
 
