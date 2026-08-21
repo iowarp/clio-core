@@ -68,6 +68,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <vector>
 
@@ -108,6 +110,7 @@ struct Args {
   u32 threads = 64;
   u64 steps = 100;
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  std::string ckpt_dir;    // if set, checkpoints are made DURABLE here
   u64 rebin = 20;
   double temp = 0.0;
   u32 maxneigh = 96;
@@ -824,6 +827,7 @@ int main(int argc, char **argv) {
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
+    else if (want("--ckpt-dir")) a.ckpt_dir = argv[++i];
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
@@ -1318,6 +1322,7 @@ int main(int argc, char **argv) {
     // two destinations, not two substrates.
     float *h_ckpt = nullptr;
     double t_ckpt = 0.0;
+    double t_ckpt_io = 0.0;
     u64 n_ckpt = 0;
     const u64 ckpt_elems = 2 * local_elems;
     if (a.ckpt != 0) {
@@ -1331,6 +1336,29 @@ int main(int argc, char **argv) {
                                local_elems * sizeof(float),
                                cudaMemcpyDeviceToHost));
       t_ckpt += NowMs() - _t;
+      // DURABLE HALF. Staging to host DRAM is only the PCIe hop; a
+      // checkpoint that a crash cannot eat has to reach storage. Written as
+      // one file per checkpoint (restart-file shaped) and fsync'd, because
+      // without the fsync this measures the page cache, not the device.
+      if (!a.ckpt_dir.empty()) {
+        const double _w = NowMs();
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s/ckpt_%llu.bin",
+                      a.ckpt_dir.c_str(), (unsigned long long)n_ckpt);
+        int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+          const char *p = reinterpret_cast<const char *>(h_ckpt);
+          size_t left = ckpt_elems * sizeof(float);
+          while (left > 0) {
+            ssize_t w = ::write(fd, p, left);
+            if (w <= 0) break;
+            p += w; left -= static_cast<size_t>(w);
+          }
+          ::fsync(fd);
+          ::close(fd);
+        }
+        t_ckpt_io += NowMs() - _w;
+      }
       ++n_ckpt;
     };
     for (u64 step = 0; step < a.steps; ++step) {
@@ -1360,13 +1388,16 @@ int main(int argc, char **argv) {
       const double mb = static_cast<double>(ckpt_elems) * sizeof(float) /
                         (1024.0 * 1024.0);
       std::printf(
-          "  checkpoints: %llu x %.1f MB = %.2f GB staged to host DRAM | "
-          "%.1f ms each (%.2f GB/s) | %.1f ms total = %.1f%% on top of the "
-          "%.1f ms run\n",
+          "  checkpoints: %llu x %.1f MB = %.2f GB | stage D2H %.1f ms each "
+          "(%.2f GB/s) | durable write %.1f ms each (%.2f GB/s) | total "
+          "%.1f ms = %.1f%% on top of the %.1f ms run%s\n",
           (unsigned long long)n_ckpt, mb,
           mb * static_cast<double>(n_ckpt) / 1024.0, t_ckpt / n_ckpt,
-          (mb / 1024.0) / (t_ckpt / n_ckpt / 1000.0), t_ckpt,
-          100.0 * t_ckpt / run_ms, run_ms);
+          (mb / 1024.0) / (t_ckpt / n_ckpt / 1000.0),
+          n_ckpt ? t_ckpt_io / n_ckpt : 0.0,
+          t_ckpt_io > 0.0 ? (mb / 1024.0) / (t_ckpt_io / n_ckpt / 1000.0) : 0.0,
+          t_ckpt + t_ckpt_io, 100.0 * (t_ckpt + t_ckpt_io) / run_ms, run_ms,
+          a.ckpt_dir.empty() ? "  [DRAM ONLY -- NOT durable]" : "");
     }
     if (h_ckpt != nullptr) cudaFreeHost(h_ckpt);
 
