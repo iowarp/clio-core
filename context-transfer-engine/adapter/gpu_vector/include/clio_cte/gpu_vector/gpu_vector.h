@@ -597,6 +597,49 @@ class Vector {
     return bad;
   }
 
+  /**
+   * DIAGNOSTIC: how many pages are held by MORE THAN ONE slot of the same
+   * block table, and how many of those duplicates are dirty.
+   *
+   * A page in two slots is the hazard WaySlot's comment warns about: a
+   * racy "not resident" probe re-fetches a page that is already present,
+   * and afterwards a lookup can pick either copy. If one of them carries
+   * writes the other does not, reads go back in time and updates vanish --
+   * which is what an out-of-core run losing exactly one half-kick per page
+   * looks like. Cheap, host-side, quiescent-only.
+   *
+   * @return duplicated page count; *dirty_dups gets those with >1 dirty.
+   */
+  clio::run::u64 CountDuplicateSlots(int dev_id, clio::run::u64 *dirty_dups) {
+    clio::run::u64 dups = 0;
+    if (dirty_dups != nullptr) *dirty_dups = 0;
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(dev_id);
+    if (it == devs_.end()) return 0;
+    DevState &st = it->second;
+    const clio::run::u32 ppb = pages_per_block_;
+    std::vector<Page> tbl(static_cast<size_t>(nblocks_) * ppb);
+    ctp::GpuApi::Memcpy(tbl.data(), reinterpret_cast<Page *>(st.table_base),
+                        tbl.size() * sizeof(Page));
+    for (clio::run::u32 b = 0; b < nblocks_; ++b) {
+      const Page *t = tbl.data() + static_cast<size_t>(b) * ppb;
+      for (clio::run::u32 i = 0; i < ppb; ++i) {
+        if (t[i].page_num == kNoPage) continue;
+        for (clio::run::u32 j = i + 1; j < ppb; ++j) {
+          if (t[j].page_num != t[i].page_num) continue;
+          ++dups;
+          if (dirty_dups != nullptr && (t[i].dirty || t[j].dirty)) {
+            ++(*dirty_dups);
+          }
+        }
+      }
+    }
+#else
+    (void)dev_id;
+#endif
+    return dups;
+  }
+
   /** Put pages [pg_lo, pg_hi): `fill(pg, buf)` writes page `pg`'s bytes into
    *  `buf` (PageBytes() long). */
   template <typename FillFn>

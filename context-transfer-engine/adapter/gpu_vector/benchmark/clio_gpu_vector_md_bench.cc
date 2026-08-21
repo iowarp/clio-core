@@ -2037,6 +2037,16 @@ int main(int argc, char **argv) {
                   ? "[deterministic]" : "[VARIES: race]");
 
   // ---- resident-regime assertion -----------------------------------------
+  {
+    clio::run::u64 dx_dirty = 0, dv_dirty = 0;
+    const u64 dupx = vx.CountDuplicateSlots(0, &dx_dirty);
+    const u64 dupv = vv.CountDuplicateSlots(0, &dv_dirty);
+    std::printf("  duplicate slots: x %llu (%llu with dirty) | v %llu "
+                "(%llu with dirty)%s\n",
+                (unsigned long long)dupx, (unsigned long long)dx_dirty,
+                (unsigned long long)dupv, (unsigned long long)dv_dirty,
+                (dupx || dupv) ? "   <-- a page lives in TWO slots" : "");
+  }
   const auto sx = vx.ReadStats(0);
   const auto sv2 = vv.ReadStats(0);
   const bool resident_ok = (sx.faults == 0 && sx.evicts == 0 &&
