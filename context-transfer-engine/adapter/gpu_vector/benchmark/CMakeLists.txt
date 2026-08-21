@@ -367,6 +367,42 @@ if(CLIO_CORE_ENABLE_CUDA)
         add_custom_target(clio_md_mpi_bench ALL DEPENDS ${_mpi_out})
         install(PROGRAMS ${_mpi_out} DESTINATION bin)
         message(STATUS "eternia-MD MPI baseline: ON")
+
+        #----------------------------------------------------------------------
+        # eternia-MD, NCCL edition: same kernels again, halo and migrants moved
+        # by ncclSend/ncclRecv on DEVICE pointers. Needs MPI too (to bootstrap
+        # the communicator and to carry migrant counts), so it is nested inside
+        # the MPI block rather than duplicating that discovery.
+        #----------------------------------------------------------------------
+        find_path(NCCL_INCLUDE_DIR nccl.h
+            HINTS ENV NCCL_HOME ENV NCCL_PREFIX
+            PATH_SUFFIXES include nccl/include)
+        find_library(NCCL_LIB NAMES nccl libnccl.so.2
+            HINTS ENV NCCL_HOME ENV NCCL_PREFIX
+            PATH_SUFFIXES lib lib64 nccl/lib)
+        if(NCCL_INCLUDE_DIR AND NCCL_LIB)
+            get_filename_component(NCCL_LIB_DIR ${NCCL_LIB} DIRECTORY)
+            set(_nccl_out ${CMAKE_BINARY_DIR}/bin/clio_md_nccl_bench)
+            set(_nccl_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_md_nccl_bench.cc)
+            add_custom_command(
+                OUTPUT ${_nccl_out}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+                COMMAND ${MD_MPI_NVCC}
+                    -x cu -std=c++17 -O3 ${_mpi_arch_flags} ${_mpi_cflags}
+                    -I${NCCL_INCLUDE_DIR}
+                    ${_nccl_src} -o ${_nccl_out}
+                    -L${NCCL_LIB_DIR} -lnccl ${_mpi_libs}
+                    -Xlinker -rpath -Xlinker ${NCCL_LIB_DIR}
+                DEPENDS ${_nccl_src}
+                COMMENT "Building clio_md_nccl_bench (nvcc + NCCL + MPI)"
+                VERBATIM)
+            add_custom_target(clio_md_nccl_bench ALL DEPENDS ${_nccl_out})
+            install(PROGRAMS ${_nccl_out} DESTINATION bin)
+            message(STATUS "eternia-MD NCCL baseline: ON (${NCCL_INCLUDE_DIR})")
+        else()
+            message(STATUS
+                "NCCL not found (set NCCL_HOME); skipping clio_md_nccl_bench")
+        endif()
     else()
         message(STATUS "MPI not found; skipping clio_md_mpi_bench")
     endif()
