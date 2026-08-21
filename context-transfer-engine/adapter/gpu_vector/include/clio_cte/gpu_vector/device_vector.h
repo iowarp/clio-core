@@ -2596,11 +2596,19 @@ class DeviceVector {
     t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
     Bump(h_->stat_puts_);
-    p->put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->put));
-    // Clean as of THIS put: the bytes it carries are what the page held
-    // when it was submitted. A later write dirties it again for the next.
+    // PUBLISH BEFORE ISSUING THE TRANSFER, not after. Send() queues the
+    // put, so its DMA may begin immediately; clearing `dirty` afterwards
+    // leaves a window in which a store is BOTH missed by the DMA and
+    // stripped of its dirty flag -- silently lost, with the page then
+    // looking clean and droppable. Done in this order the invariant holds:
+    // everything written before this point is captured by the transfer,
+    // and anything written after it re-dirties the page and survives.
+    // Setting `flushing` first also means a concurrent write-hold sees it
+    // and backs off (see ProbeHold) rather than racing the DMA.
     p->dirty = 0u;
     p->flushing = 1u;
+    __threadfence();
+    p->put_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(p->put));
   }
 
   /** Header fields of a batch task; the records are appended by the caller. */
