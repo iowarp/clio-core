@@ -28,6 +28,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstddef>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -147,6 +148,75 @@ struct EmaRegistry {
 EmaRegistry &Registry() {
   static EmaRegistry *r = new EmaRegistry();
   return *r;
+}
+
+/* SGD stream, completion event, and "has SGD ever run" flag.
+ *
+ * These mirror upstream's g_sgd_stream / g_sgd_done / g_sgd_ever_fired
+ * (nn_gpu.cu). The ordering between "update the weights" and "read the
+ * weights" is a GPU-side dependency there, not a host one: SGD runs on its own
+ * stream and records an event, and inference issues cudaStreamWaitEvent on
+ * that event before its kernel. The host never blocks for it.
+ *
+ * Process-wide, not per-thread, and that is required rather than convenient:
+ * every worker shares ONE device weight buffer, so an update issued by one
+ * worker must be visible to inference issued by another. A per-thread event
+ * would only order a thread against itself. */
+struct SgdSync {
+  cudaStream_t stream = nullptr;
+  cudaEvent_t done = nullptr;
+  std::atomic<bool> ever_fired{false};
+  bool ok = false;
+};
+
+SgdSync &Sgd() {
+  /* Initialized in place: SgdSync holds an atomic and so is not copyable, and
+     returning one from a lambda would need a copy. */
+  static SgdSync s;
+  static const bool once = [] {
+    /* Non-blocking: this stream must not implicitly synchronize with the
+       legacy default stream, or recording an event on it would serialize
+       against every other worker -- the exact cost this exists to avoid. */
+    s.ok = cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) ==
+               cudaSuccess &&
+           cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming) ==
+               cudaSuccess;
+    return true;
+  }();
+  (void)once;
+  return s;
+}
+
+/* Persistent per-thread SGD sample buffer, grown rather than reallocated.
+ * Upstream allocates ctx->d_sgd_samples once per CompContext
+ * (gpucompress_pool.cpp) and never frees it per call; this is the same
+ * property without a context pool. */
+struct SgdScratch {
+  void *d_samples = nullptr;
+  size_t bytes = 0;
+};
+
+SgdScratch &SgdSamples() {
+  static thread_local SgdScratch s;
+  return s;
+}
+
+bool EnsureSgdSamples(SgdScratch &s, size_t need) {
+  if (need <= s.bytes) return true;
+  cudaFree(s.d_samples);
+  s.d_samples = nullptr;
+  s.bytes = 0;
+  if (cudaMalloc(&s.d_samples, need) != cudaSuccess) return false;
+  s.bytes = need;
+  return true;
+}
+
+/* Called by the inference paths before they read the weights. */
+void SgdWaitIfEverFired(cudaStream_t st) {
+  SgdSync &g = Sgd();
+  if (g.ok && g.ever_fired.load(std::memory_order_acquire)) {
+    cudaStreamWaitEvent(st, g.done, 0);
+  }
 }
 
 float *EmaBuffer() {
@@ -1104,24 +1174,33 @@ bool NeuroPressGpuTrainDecompHead(NeuroPressGpuWeights *w,
                                   int num_samples) {
   if (!w || !samples || num_samples <= 0) return false;
 
-  // Per-thread stream and a stream-scoped wait, as everywhere else on this
-  // path. Upstream runs this on its dedicated g_sgd_stream (nn_gpu.cu);
-  // the point either way is that it is not a device-wide barrier.
-  cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
+  /* Upstream's runBatchedDecompSGD, step for step. Note it does NOT drop its
+     synchronize the way runNNSGDCtx does -- it copies its SGDOutput back and
+     waits -- so this keeps the wait too. Matching upstream means matching the
+     asymmetry, not tidying it away. What changes is the stream (the shared SGD
+     stream, so the event orders this against inference as well) and the buffer
+     (persistent, not allocated and freed per call). */
+  SgdSync &g = Sgd();
+  if (!g.ok) return false;
 
-  NeuroPressGpuDecompSample *d_samples = nullptr;
   const size_t bytes =
       sizeof(NeuroPressGpuDecompSample) * static_cast<size_t>(num_samples);
-  if (cudaMalloc(&d_samples, bytes) != cudaSuccess) return false;
+  SgdScratch &sc = SgdSamples();
+  if (!EnsureSgdSamples(sc, bytes)) return false;
 
-  bool ok = cudaMemcpyAsync(d_samples, samples, bytes, cudaMemcpyHostToDevice,
-                            st) == cudaSuccess;
+  bool ok = cudaMemcpyAsync(sc.d_samples, samples, bytes,
+                            cudaMemcpyHostToDevice, g.stream) == cudaSuccess;
   if (ok) {
-    DecompHeadSGDKernel<<<1, kHiddenDim, 0, st>>>(w, d_samples, num_samples);
-    ok = cudaGetLastError() == cudaSuccess &&
-         cudaStreamSynchronize(st) == cudaSuccess;
+    DecompHeadSGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
+        w, static_cast<const NeuroPressGpuDecompSample *>(sc.d_samples),
+        num_samples);
+    ok = cudaGetLastError() == cudaSuccess;
+    if (ok && cudaEventRecord(g.done, g.stream) == cudaSuccess) {
+      g.ever_fired.store(true, std::memory_order_release);
+    }
+    /* The wait upstream keeps. */
+    if (ok) ok = cudaStreamSynchronize(g.stream) == cudaSuccess;
   }
-  cudaFree(d_samples);
   return ok;
 }
 
@@ -1176,7 +1255,13 @@ bool NeuroPressGpuInferBatchDeviceStats(
   }
   bool ranked = false;
   if (ok) {
-    InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
+      /* GPU-level barrier before reading the weights: wait for the last SGD on
+       its stream. Upstream does exactly this
+       (cudaStreamWaitEvent(stream, g_sgd_done, 0), nn_gpu.cu) and it is what
+       lets the SGD path be fire-and-forget -- the ordering is enforced on the
+       device, so neither host thread blocks for it. */
+    SgdWaitIfEverFired(st);
+  InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_actions,
         static_cast<const ctp::DeviceFeatureStats *>(device_stats),
         chunk_size_bytes, error_bound, s.d_ct, s.d_dt, s.d_r, s.d_p,
@@ -1275,6 +1360,12 @@ bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
   bool ok = cudaMemcpyAsync(s.d_raw, raw_inputs, in_bytes,
                             cudaMemcpyHostToDevice, st) == cudaSuccess;
   if (ok) {
+    /* GPU-level barrier before reading the weights: wait for the last SGD on
+       its stream. Upstream does exactly this
+       (cudaStreamWaitEvent(stream, g_sgd_done, 0), nn_gpu.cu) and it is what
+       lets the SGD path be fire-and-forget -- the ordering is enforced on the
+       device, so neither host thread blocks for it. */
+    SgdWaitIfEverFired(st);
     InferKernelFull<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_raw, s.d_out[0], s.d_out[1], s.d_out[2], s.d_out[3],
         s.d_out[4], s.d_out[5], s.d_out[6], s.d_out[7]);
@@ -1320,6 +1411,12 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
   bool ok = cudaMemcpyAsync(s.d_raw, raw_inputs, in_bytes,
                             cudaMemcpyHostToDevice, st) == cudaSuccess;
   if (ok) {
+    /* GPU-level barrier before reading the weights: wait for the last SGD on
+       its stream. Upstream does exactly this
+       (cudaStreamWaitEvent(stream, g_sgd_done, 0), nn_gpu.cu) and it is what
+       lets the SGD path be fire-and-forget -- the ordering is enforced on the
+       device, so neither host thread blocks for it. */
+    SgdWaitIfEverFired(st);
     InferKernel<<<num_candidates, kHiddenDim, 0, st>>>(w, s.d_raw, s.d_ct,
                                                        s.d_dt, s.d_r, s.d_p);
     ok = cudaGetLastError() == cudaSuccess;
@@ -1733,24 +1830,65 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
   if (!w || num_samples <= 0) return false;
   if (num_samples > kMaxSamples) num_samples = kMaxSamples;
 
-  NeuroPressGpuSGDSample *d_samples = nullptr;
-  bool *d_applied = nullptr;
-  cudaMalloc(&d_samples, sizeof(NeuroPressGpuSGDSample) * static_cast<size_t>(num_samples));
-  cudaMalloc(&d_applied, sizeof(bool));
-  cudaMemcpy(d_samples, samples,
-            sizeof(NeuroPressGpuSGDSample) * static_cast<size_t>(num_samples),
-            cudaMemcpyHostToDevice);
+  /* Choreography matched to upstream's runNNSGDCtx (nn_gpu.cu) step for step:
+   *
+   *   async H->D of the samples on the SGD stream, into a buffer that already
+   *   exists; launch on that stream; record the completion event; return.
+   *
+   * FIRE AND FORGET. There is deliberately no read-back and no synchronize.
+   * Upstream removed exactly that and left the measurement in the file:
+   *
+   *   "P6: fire-and-forget -- no D->H readback or stream sync needed.
+   *    SGDOutput ... is dead code: both callers pass &gn/&gc/&gs but never
+   *    read them after the call. Removing the sync drops g_sgd_mutex hold
+   *    time from 0.1-0.5ms to ~10us, eliminating serialization across
+   *    concurrent workers."
+   *
+   * Clio's readback had the same shape and the same uselessness: a one-byte
+   * `applied` flag whose only consumer was an HLOG(kDebug) field, paid for
+   * with a full host synchronize on every chunk the model learned from.
+   *
+   * The consequence is that "did the update apply" is no longer known when
+   * this returns, which is precisely upstream's contract -- it returns 0 for
+   * "launched", not for "applied". The kernel still computes the flag into
+   * the device buffer; nothing reads it, and nothing waits for it. */
+  SgdSync &g = Sgd();
+  if (!g.ok) return false;
+
+  const size_t bytes =
+      sizeof(NeuroPressGpuSGDSample) * static_cast<size_t>(num_samples);
+  SgdScratch &sc = SgdSamples();
+  if (!EnsureSgdSamples(sc, bytes)) return false;
 
   float *ema = EmaBuffer();
   if (!ema) return false;
-  SGDKernel<<<1, kHiddenDim>>>(w, d_samples, num_samples, learning_rate, ema,
-                               d_applied);
 
-  bool applied = false;
-  cudaMemcpy(&applied, d_applied, sizeof(bool), cudaMemcpyDeviceToHost);
-  cudaFree(d_samples);
-  cudaFree(d_applied);
-  return applied;
+  /* The flag the kernel writes. Persistent and never read: kept because the
+     kernel's signature takes it, and dropping the parameter would diverge
+     from upstream's nnSGDKernel, which also writes an output nobody reads. */
+  static thread_local bool *d_applied = [] {
+    bool *p = nullptr;
+    if (cudaMalloc(&p, sizeof(bool)) != cudaSuccess) return static_cast<bool *>(nullptr);
+    return p;
+  }();
+  if (!d_applied) return false;
+
+  if (cudaMemcpyAsync(sc.d_samples, samples, bytes, cudaMemcpyHostToDevice,
+                      g.stream) != cudaSuccess) {
+    return false;
+  }
+
+  SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
+      w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
+      num_samples, learning_rate, ema, d_applied);
+  if (cudaGetLastError() != cudaSuccess) return false;
+
+  /* Only set the flag if the record succeeded, so inference never waits on an
+     unrecorded event -- upstream's "W2" note makes the same point. */
+  if (cudaEventRecord(g.done, g.stream) == cudaSuccess) {
+    g.ever_fired.store(true, std::memory_order_release);
+  }
+  return true;
 }
 
 }  // namespace ctp::compress::model::gpu

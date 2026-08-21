@@ -124,6 +124,38 @@ clio_add_neuropress_parity_test(neuropress_full_outputs_parity_exec
     ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_full_outputs_parity.cu
     ctp_neuropress_full_outputs_parity)
 
+# The SGD's CHOREOGRAPHY rather than its arithmetic: persistent buffers, no
+# host synchronize, not the default stream, completion event recorded. These
+# produce identical weights either way, which is why no numeric harness sees
+# them.
+clio_add_neuropress_parity_test(neuropress_sgd_choreography_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_sgd_choreography_parity.cu
+    ctp_neuropress_sgd_choreography_parity)
+
+# Timing of the two phases on both sides. Reports, never asserts -- a timing
+# threshold would be flaky on the first busy runner.
+clio_add_neuropress_parity_test(neuropress_phase_timing_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_phase_timing.cu
+    ctp_neuropress_phase_timing)
+
+# Per-chunk: what each side predicts and which codec it chooses. Numeric
+# agreement does not imply the same argmin -- ties are routine once the ratio
+# saturates at the cap.
+clio_add_neuropress_parity_test(neuropress_selection_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_selection_parity.cu
+    ctp_neuropress_selection_parity)
+
+# The same selection comparison on data the harness above never sees: 18
+# shapes (denormals, near-FLT_MAX, NaN/Inf, heavy tails, bimodal, sorted vs
+# shuffled, 1-ULP cancellation pairs), 6 chunk sizes down to 3 elements, and
+# 8 error bounds. Also compares the two sides' STATISTICS to each other and
+# all 32 candidates' predictions, not just the winner's, and drives upstream
+# through the bitonic path production actually uses.
+clio_add_neuropress_parity_test(neuropress_selection_parity_wide_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_selection_parity_wide.cu
+    ctp_neuropress_selection_parity_wide)
+set_tests_properties(ctp_neuropress_selection_parity_wide PROPERTIES TIMEOUT 900)
+
 # Real simulation output as one of its data regimes: synthetic ramps and noise
 # do not have the spatial structure a reaction-diffusion field does, and the
 # statistics that feed the model are exactly the quantities that structure
