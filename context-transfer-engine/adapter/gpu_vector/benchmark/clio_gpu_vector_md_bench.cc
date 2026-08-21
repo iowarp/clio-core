@@ -68,6 +68,12 @@ __device__ unsigned long long g_pages_done;
 /** Sink for the ballistic path's optional THIRD vector read, so the load
  *  cannot be optimised away while the physics stays untouched. */
 __device__ unsigned long long g_third_sink;
+/** READ-ONLY PROBE (--readprobe). Every experiment so far assumed writes
+ *  were being lost; this asks the other half of the question -- does the
+ *  FAULT PATH ever deliver wrong bytes? The vector is seeded with a value
+ *  that is unique per element and exact in float, then only READ.
+ *  [0] mismatches [1] first bad page [2] first bad index. */
+__device__ unsigned long long g_read_bad[4];
 /** Per LOGICAL block: page iterations completed, and the last page index
  *  reached. Says WHICH block loses work, and where it stopped. */
 __device__ unsigned long long g_blk_done[64];
@@ -136,6 +142,7 @@ struct Args {
   double drift_tol = 5e-4;
   double dt = 0.005;
   int gate = 1;            // stage 1: the ballistic gate IS the run
+  int readprobe = 0;       // read-only paging probe (no writes at all)
   int md = 0;              // stage 2: real LJ forces + NVE, statics gates
   double g[3] = {0.1, -0.05, 0.02};   // constant acceleration for the gate
 };
@@ -1147,6 +1154,38 @@ __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
   }
 }
 
+/** Seeded value of element i: unique and exactly representable (the whole
+ *  vector is well under 2^24 elements). */
+CTP_INLINE_CROSS_FUN float ProbeVal(u64 i) { return static_cast<float>(i); }
+
+__device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
+                                       u32 nblocks, u32 block) {
+  const u64 epp = x.h_->elems_per_page_;
+  const u64 npages = (x.h_->size_ + epp - 1) / epp;
+  for (u64 it = 0; it < passes; ++it) {
+    for (u64 pg = block; pg < npages; pg += nblocks) {
+      auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
+      const float *const p = h.ptr();
+      for (u64 i = threadIdx.x; i < epp; i += blockDim.x) {
+        if (p[i] != ProbeVal(pg * epp + i)) {
+          atomicAdd(&g_read_bad[0], 1ull);
+          // DOES IT HEAL? Wait, re-read the SAME address through the SAME
+          // guard, and see whether the value arrives late. If it does, the
+          // page was published as resident before its transfer landed; if
+          // it stays wrong, the get truly never wrote the frame.
+          const long long t0 = clock64();
+          while (clock64() - t0 < 2000000ll) { }
+          __threadfence_system();
+          if (*(volatile float *)&p[i] == ProbeVal(pg * epp + i)) {
+            atomicAdd(&g_read_bad[1], 1ull);   // healed => published early
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> v,
                                        gv::DeviceVector<float> third,
@@ -1251,6 +1290,17 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
  * copy of every page, held by all GPU blocks. block_override_ = 0 points
  * every block at that table; blocks write DISJOINT pages, so the only
  * sharing is the lock-free probes. */
+
+__global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
+                                gv::DeviceVector<float> x, u64 passes,
+                                u32 nblocks, gy::YieldableView<> yv,
+                                gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(ReadProbeCoro(x, passes, nblocks, yv.Block()));
+}
 
 __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
@@ -1509,6 +1559,7 @@ int main(int argc, char **argv) {
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
+    else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
       return 1;
@@ -1713,6 +1764,46 @@ int main(int argc, char **argv) {
   YieldRunner runner(a.blocks, a.threads);
   const u32 smem_thermo =
       CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
+
+  // ---- READ-ONLY PAGING PROBE -------------------------------------------
+  if (a.readprobe) {
+    std::vector<float> pat(g.nelems);
+    for (u64 i = 0; i < g.nelems; ++i) pat[i] = static_cast<float>(i);
+    vx.Preload(pat.data(), g.nelems);
+    vx.ClearCache();
+    vx.Prefetch(0, npages, 0, tbl_blocks);
+    auto dxp = vx.GetDevice(0);
+    const unsigned long long z4[4] = {0, 0, 0, 0};
+    cudaMemcpyToSymbol(g_read_bad, z4, sizeof(z4));
+    const double t0p = NowMs();
+    runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      ReadProbeKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dxp, a.steps,
+                                                        a.blocks, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    unsigned long long rb[4] = {0, 0, 0, 0};
+    cudaMemcpyFromSymbol(rb, g_read_bad, sizeof(rb));
+    const auto sp = vx.ReadStats(0);
+    std::printf("  READ PROBE: %llu wrong elements over %llu passes "
+                "(faults %llu evicts %llu GET_ERRORS %llu puts %llu "
+                "put_errors %llu prefetch_late %llu, %.0f ms)%s\n",
+                rb[0], (unsigned long long)a.steps,
+                (unsigned long long)sp.faults, (unsigned long long)sp.evicts,
+                (unsigned long long)sp.get_errors,
+                (unsigned long long)sp.puts,
+                (unsigned long long)sp.put_errors,
+                (unsigned long long)sp.prefetch_late,
+                NowMs() - t0p,
+                rb[0] ? "   <-- THE FAULT PATH DELIVERS WRONG BYTES"
+                      : "  [reads are clean]");
+    if (rb[0]) {
+      std::printf("    of those, %llu healed on a later re-read. Zero "
+                  "healing means the data NEVER ARRIVES: the get reported "
+                  "success and left the frame untouched.\n", rb[1]);
+    }
+    return rb[0] ? 1 : 0;
+  }
 
   // ---- STAGE 2: real MD (cell-direct LJ + NVE) ---------------------------
   if (a.md) {
