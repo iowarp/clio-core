@@ -1729,6 +1729,10 @@ int main(int argc, char **argv) {
   // --slots below that is a configuration for later stages, not this gate.
   const u32 slots =
       (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  // Which regime this configuration is IN: the cache either can hold every
+  // page of the working set or it cannot. The gates below key off this
+  // rather than assuming residency.
+  const bool expect_resident = (static_cast<clio::run::u64>(slots) >= npages);
 
   std::printf(
       "eternia-MD stage 1 (integrator + ballistic gate)\n"
@@ -2338,9 +2342,18 @@ int main(int argc, char **argv) {
         (unsigned long long)a.steps, e0, e_n, e_drift, ke0, ke_n,
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
-        res_ok ? "[resident contract HELD]" : "[RESIDENT CONTRACT VIOLATED]");
-    const bool nve_ok = (e_drift < a.drift_tol) && res_ok &&
-                        !runner.HitCap();
+        expect_resident
+            ? (res_ok ? "[resident contract HELD]"
+                      : "[RESIDENT CONTRACT VIOLATED]")
+            : "[out-of-core regime: faults EXPECTED]");
+    // REGIME-AWARE. The resident contract -- zero faults in the timed region
+    // -- is a promise about the RESIDENT regime only: it says a cache that
+    // can hold the working set must never page. Out of core the cache
+    // provably cannot hold it, so faults are the feature, not a failure, and
+    // asserting res_ok there failed runs whose physics was bit-identical to
+    // the resident answer. What must hold in BOTH regimes is the energy.
+    const bool nve_ok = (e_drift < a.drift_tol) &&
+                        (!expect_resident || res_ok) && !runner.HitCap();
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
     std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
                 "Matom-steps/s)\n",
