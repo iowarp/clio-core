@@ -102,6 +102,7 @@ struct Args {
   u32 blocks = 128;
   u32 threads = 64;
   u64 steps = 100;
+  u64 ckpt = 0;            // checkpoint every N steps (0 = never)
   u64 rebin = 20;
   double temp = 0.0;
   u32 maxneigh = 96;
@@ -817,6 +818,7 @@ int main(int argc, char **argv) {
     else if (want("--blocks")) a.blocks = static_cast<u32>(atoi(argv[++i]));
     else if (want("--threads")) a.threads = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
+    else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
@@ -1329,6 +1331,34 @@ int main(int argc, char **argv) {
                              kCtrNumCtrs * sizeof(unsigned long long)));
     MPI_Barrier(MPI_COMM_WORLD);
     const double t0 = NowMs();
+    // ---- CHECKPOINT ------------------------------------------------------
+    // What a non-persistent substrate must do to survive a crash: get the
+    // simulation state off the GPU. x and v only -- forces and the Verlet
+    // list are derived and a restart rebuilds them, which is what LAMMPS
+    // restart files carry too.
+    //
+    // The destination is PINNED HOST DRAM, deliberately: the paged vector
+    // this is being compared against persists into a CTE tier stack whose
+    // only configured target is a RAM tier, so staging to host DRAM lands
+    // the bytes in the same storage class. Anything else would be comparing
+    // two destinations, not two substrates.
+    float *h_ckpt = nullptr;
+    double t_ckpt = 0.0;
+    u64 n_ckpt = 0;
+    const u64 ckpt_elems = 2 * local_elems;
+    if (a.ckpt != 0) {
+      MD_CUDA_CHECK(cudaMallocHost(&h_ckpt, ckpt_elems * sizeof(float)));
+    }
+    auto checkpoint = [&]() {
+      const double _t = NowMs();
+      MD_CUDA_CHECK(cudaMemcpy(h_ckpt, dx, local_elems * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+      MD_CUDA_CHECK(cudaMemcpy(h_ckpt + local_elems, dv,
+                               local_elems * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+      t_ckpt += NowMs() - _t;
+      ++n_ckpt;
+    };
     for (u64 step = 0; step < a.steps; ++step) {
       kick(1);
       if (a.rebin != 0 && step != 0 && step % a.rebin == 0) {
@@ -1339,6 +1369,7 @@ int main(int argc, char **argv) {
       exchange_halo();   // positions moved in the kick
       force(0);
       kick(0);
+     if (a.ckpt != 0 && (step + 1) % a.ckpt == 0) checkpoint();
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const double run_ms = NowMs() - t0;
@@ -1348,6 +1379,22 @@ int main(int argc, char **argv) {
     const double e_n = acc[0] + ke_n;
     const double e_drift = std::fabs(e_n - e0) / std::fabs(e0);
     const bool nve_ok = (e_drift < a.drift_tol);
+
+    // Checkpoint ledger. Reported per run so the with/without comparison is
+    // a difference in one measured quantity rather than an inference.
+    if (n_ckpt != 0 && root) {
+      const double mb = static_cast<double>(ckpt_elems) * sizeof(float) /
+                        (1024.0 * 1024.0);
+      std::printf(
+          "  checkpoints: %llu x %.1f MB = %.2f GB staged to host DRAM | "
+          "%.1f ms each (%.2f GB/s) | %.1f ms total = %.1f%% on top of the "
+          "%.1f ms run\n",
+          (unsigned long long)n_ckpt, mb,
+          mb * static_cast<double>(n_ckpt) / 1024.0, t_ckpt / n_ckpt,
+          (mb / 1024.0) / (t_ckpt / n_ckpt / 1000.0), t_ckpt,
+          100.0 * t_ckpt / run_ms, run_ms);
+    }
+    if (h_ckpt != nullptr) cudaFreeHost(h_ckpt);
 
     unsigned long long ctr[kCtrNumCtrs] = {0};
     MD_CUDA_CHECK(cudaMemcpy(ctr, d_ctr, sizeof(ctr), cudaMemcpyDeviceToHost));
