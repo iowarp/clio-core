@@ -61,6 +61,15 @@ static constexpr u32 kStride = 4;
  *  [3] pair loop [4] whole row loop [5] rows processed. */
 __device__ unsigned long long g_md_cyc[8];
 
+/** Page iterations actually completed by the integrator, summed over
+ *  blocks. Distinguishes WORK DROPPED (driver/park bookkeeping) from DATA
+ *  CORRUPTED (the paging path): the expected count is exact and known. */
+__device__ unsigned long long g_pages_done;
+/** Per LOGICAL block: page iterations completed, and the last page index
+ *  reached. Says WHICH block loses work, and where it stopped. */
+__device__ unsigned long long g_blk_done[64];
+__device__ unsigned long long g_blk_last[64];
+
 /** Guards a block may hold over one row of the paged list. Deliberately
  *  small: this array lives in the per-thread coroutine FRAME, so every
  *  slot costs frame footprint whether used or not, and the list page is
@@ -109,6 +118,8 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  int per_block = 0;       // one page table PER CUDA BLOCK (the designed
+                           // model) instead of one shared table
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
@@ -1160,6 +1171,13 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_pages_done, 1ull);
+      if (block < 64) {
+        atomicAdd(&g_blk_done[block], 1ull);
+        g_blk_last[block] = pg;
+      }
+    }
     // Guards die here: pages unpin. Nothing flushes -- x/v are device-
     // canonical; the backing store is only written on eviction (none in the
     // resident regime) or by an explicit host Download for validation.
@@ -1215,11 +1233,12 @@ __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<float> v, float dt,
                                 float gx, float gy_, float gz, int drift,
-                                u32 nblocks, gy::YieldableView<> yv,
+                                u32 nblocks, int shared_tbl,
+                                gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  v.block_override_ = 0;
+  x.block_override_ = shared_tbl ? 0 : yv.Block();
+  v.block_override_ = shared_tbl ? 0 : yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(IntegrateCoro(x, v, dt, gx, gy_, gz, drift, nblocks,
@@ -1424,6 +1443,7 @@ int main(int argc, char **argv) {
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--per-block-tables") == 0) a.per_block = 1;
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
@@ -1589,9 +1609,16 @@ int main(int argc, char **argv) {
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
   // ---- vectors ------------------------------------------------------------
-  gv::Vector<float> vx("md_x", {0}, page_bytes, /*nblocks=*/1, slots,
+  // ONE TABLE PER CUDA BLOCK is the designed model (independent per-block
+  // caches); the single shared table is the alternative this benchmark
+  // used so that a page exists exactly once. They are not equivalent under
+  // FAULTS: a table owns its lock, its scalar task slots AND its batch
+  // slots, so N CUDA blocks on one table share one set of in-flight
+  // transfer state.
+  const u32 tbl_blocks = a.per_block ? a.blocks : 1u;
+  gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, slots,
                        g.nelems);
-  gv::Vector<float> vv("md_v", {0}, page_bytes, /*nblocks=*/1, slots,
+  gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, slots,
                        g.nelems);
   vx.EnableStats();
   vv.EnableStats();
@@ -1599,8 +1626,8 @@ int main(int argc, char **argv) {
   vv.Preload(hv.data(), g.nelems);
   vx.ClearCache();
   vv.ClearCache();
-  vx.Prefetch(0, npages, 0, 1);
-  vv.Prefetch(0, npages, 0, 1);
+  vx.Prefetch(0, npages, 0, tbl_blocks);
+  vv.Prefetch(0, npages, 0, tbl_blocks);
   auto dx = vx.GetDevice(0);
   auto dv = vv.GetDevice(0);
 
@@ -1999,17 +2026,23 @@ int main(int argc, char **argv) {
   const float fgx = static_cast<float>(a.g[0]);
   const float fgy = static_cast<float>(a.g[1]);
   const float fgz = static_cast<float>(a.g[2]);
+  {
+    const unsigned long long z = 0;
+    cudaMemcpyToSymbol(g_pages_done, &z, sizeof(z));
+  }
   const double t0 = NowMs();
   for (u64 step = 0; step < a.steps; ++step) {
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/1, a.blocks, vw, sv);
+          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/1, a.blocks,
+          !a.per_block, vw, sv);
     });
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/0, a.blocks, vw, sv);
+          gpu, dx, dv, fdt, fgx, fgy, fgz, /*drift=*/0, a.blocks,
+          !a.per_block, vw, sv);
     });
   }
   ctp::GpuApi::Synchronize();
@@ -2037,6 +2070,23 @@ int main(int argc, char **argv) {
                   ? "[deterministic]" : "[VARIES: race]");
 
   // ---- resident-regime assertion -----------------------------------------
+  {
+    unsigned long long done = 0;
+    cudaMemcpyFromSymbol(&done, g_pages_done, sizeof(done));
+    const unsigned long long want =
+        static_cast<unsigned long long>(npages) * a.steps * 2ull;
+    std::printf("  page iterations: %llu of %llu expected%s\n", done, want,
+                (done == want) ? "  [all work ran]"
+                               : "   <-- WORK WAS DROPPED");
+    unsigned long long bd[64] = {0}, bl[64] = {0};
+    cudaMemcpyFromSymbol(bd, g_blk_done, sizeof(bd));
+    cudaMemcpyFromSymbol(bl, g_blk_last, sizeof(bl));
+    std::printf("  per block (done,last):");
+    for (u32 b = 0; b < a.blocks && b < 8; ++b) {
+      std::printf(" b%u=(%llu,%llu)", b, bd[b], bl[b]);
+    }
+    std::printf("\n");
+  }
   {
     clio::run::u64 dx_dirty = 0, dv_dirty = 0;
     const u64 dupx = vx.CountDuplicateSlots(0, &dx_dirty);
