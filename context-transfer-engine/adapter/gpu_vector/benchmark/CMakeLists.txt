@@ -500,7 +500,6 @@ if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.c
                 ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
                 ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
                 ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/nvme_emu.cc
                 -o ${_bam_out}
             # DEPENDS must list the BaM sources too. With only the bench
             # here, edits under external/bam/ never relinked and the build
@@ -510,11 +509,9 @@ if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.c
                 ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
                 ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
                 ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/nvme_emu.cc
                 ${CMAKE_SOURCE_DIR}/external/bam/include/bam/array.cuh
                 ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache.cuh
                 ${CMAKE_SOURCE_DIR}/external/bam/include/bam/types.h
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/nvme_emu.h
                 ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache_host.h
             COMMENT "Building clio_md_bam_bench (nvcc + BaM page cache)"
             VERBATIM)

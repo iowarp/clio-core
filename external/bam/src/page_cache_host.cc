@@ -2,7 +2,6 @@
  * page_cache_host.cc -- Host-side page cache manager implementation
  */
 #include <bam/page_cache_host.h>
-#include <bam/nvme_emu.h>
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -109,17 +108,9 @@ fail:
 }
 
 int PageCache::init_nvme_backend() {
-  // NO DEVICE NAMED -> EMULATED CONTROLLER over pinned host memory. The GPU
-  // still speaks the full submission/doorbell/completion sequence; only the
-  // medium changes. This is what makes a miss cost a queued command instead
-  // of the bare memcpy the host-memory backend performs, which is the whole
-  // point of having a page cache in front of it.
   if (!config_.nvme_dev) {
-    // DEFERRED. The emulated controller's medium is the pinned backing
-    // store, which is allocated lazily once the array's size is known, so
-    // the controller is started from ensure_emu_started() rather than here.
-    emu_pending_ = true;
-    return 0;
+    fprintf(stderr, "bam::PageCache: nvme_dev not specified\n");
+    return -1;
   }
 
   ctrl_ = std::make_unique<NvmeController>();
@@ -222,48 +213,5 @@ QueuePairDevice PageCache::queue_pair_device(uint32_t idx) const {
 
 namespace bam {
 
-/**
- * Start the emulated controller once its medium exists.
- *
- * Called from Array's constructor, which is the first point at which the
- * backing size is known. Idempotent.
- */
-uint64_t PageCache::emu_completions() const {
-  return emu_ ? emu_->completions() : 0;
-}
-
-int PageCache::ensure_emu_started(size_t total_bytes) {
-  if (!emu_pending_ || emu_) return 0;
-  if (alloc_host_backing(total_bytes) != 0) return -1;
-  emu_ = std::make_unique<NvmeEmuController>();
-  const uint32_t qd = config_.queue_depth > 0 ? config_.queue_depth : 1024;
-  if (!emu_->start(host_buf_, host_buf_size_, qd)) {
-    emu_.reset();
-    fprintf(stderr, "bam::PageCache: emulated NVMe controller failed\n");
-    return -1;
-  }
-  // A slot's "bus address" is its device address -- what the controller
-  // DMAs into. A real drive is handed a PCIe address for the same memory.
-  {
-    const size_t n = config_.num_pages;
-    std::vector<uint64_t> addrs(n);
-    for (size_t i = 0; i < n; ++i) {
-      addrs[i] = reinterpret_cast<uint64_t>(d_cache_mem_) +
-                 (uint64_t)i * config_.page_size;
-    }
-    if (cudaMalloc(&d_bus_addrs_, n * sizeof(uint64_t)) != cudaSuccess ||
-        cudaMemcpy(d_bus_addrs_, addrs.data(), n * sizeof(uint64_t),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-      emu_.reset();
-      return -1;
-    }
-  }
-  dev_qp_ = emu_->device_state();
-  fprintf(stderr,
-          "bam::PageCache: NVMe EMULATED over pinned host memory "
-          "(queue depth %u, %.1f MB backing)\n",
-          qd, (double)host_buf_size_ / (1024.0 * 1024.0));
-  return 0;
-}
 
 }  // namespace bam

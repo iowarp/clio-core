@@ -116,9 +116,6 @@ struct Args {
   int use_list = 1;
   u64 bam_page_kb = 64;    // BaM cache page size (power of two)
   u64 bam_cache_mb = 0;    // BaM HBM cache; 0 = auto (fits the list)
-  bool bam_nvme_emu = false;  // route misses through an EMULATED NVMe queue
-                              // pair over pinned host memory, instead of a
-                              // bare memcpy from the host backing store
   double drift_tol = 5e-4;
   double dt = 0.005;
   int gate = 1;
@@ -852,18 +849,6 @@ int main(int argc, char **argv) {
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--bam-page-kb")) a.bam_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (want("--bam-cache-mb")) a.bam_cache_mb = static_cast<u64>(atol(argv[++i]));
-    else if (std::strcmp(argv[i], "--bam-nvme-emu") == 0) {
-      // WIP: the queue-pair path runs end to end but does not yet deliver
-      // correct bytes -- the gates fail with PE 0. Left in because the
-      // protocol half is real and reviewable, but it must not be mistaken
-      // for a result.
-      std::fprintf(stderr,
-                   "WARNING: --bam-nvme-emu is INCOMPLETE. The emulated queue "
-                   "pair submits and completes, but page contents are wrong "
-                   "and the physics gates FAIL. Do not quote numbers from "
-                   "this mode.\n");
-      a.bam_nvme_emu = true;
-    }
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
     else {
@@ -1105,8 +1090,7 @@ int main(int argc, char **argv) {
       // speaks the real submission/doorbell/completion sequence and a host
       // thread plays the drive over pinned memory. kHostMemory keeps the
       // old bare-copy path for comparison.
-      cfg.backend = a.bam_nvme_emu ? bam::BackendType::kNvme
-                                   : bam::BackendType::kHostMemory;
+      cfg.backend = bam::BackendType::kHostMemory;
       cfg.nvme_dev = nullptr;
       cfg.queue_depth = 1024;
       cfg_num_pages = cfg.num_pages;

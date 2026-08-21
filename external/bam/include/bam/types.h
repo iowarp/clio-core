@@ -76,29 +76,6 @@ struct PageCacheDeviceState {
 struct QueuePairDevice {
   volatile void *sq;         // SQ entries
   volatile void *cq;         // CQ entries
-  /**
-   * Slot allocator, in DEVICE memory.
-   *
-   * It must be device memory: this GPU reports
-   * cudaDevAttrHostNativeAtomicSupported = 0, so an atomicAdd on mapped host
-   * memory is not merely slow, it is illegal -- the same constraint that
-   * forced the gpu2cpu ring to split. So the queue splits the same way:
-   * atomicity lives on the device, visibility lives in host memory.
-   */
-  uint32_t *sq_alloc;
-  /**
-   * Per-slot publication stamps, in MAPPED HOST memory.
-   *
-   * Stands in for a doorbell register. A single tail doorbell would need an
-   * atomic on host memory to advance in order; a per-slot stamp needs only a
-   * volatile store after a system fence, and it carries strictly more
-   * information -- the controller learns that a slot is claimed AND that its
-   * entry is fully written. Same trick the gpu2cpu ring uses.
-   */
-  volatile uint32_t *sq_ready;
-  /** Real-hardware doorbells, used by the gnb NVMe path. The emulated
-   *  controller uses sq_alloc + sq_ready instead, for the reason given
-   *  above; both sets coexist so either backend can be wired. */
   volatile uint32_t *sq_doorbell;
   volatile uint32_t *cq_doorbell;
   uint32_t sq_depth;

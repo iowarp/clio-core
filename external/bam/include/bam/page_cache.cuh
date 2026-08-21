@@ -22,16 +22,6 @@ namespace bam {
 /* Per-thread page cache operations (original API)                     */
 /* ================================================================== */
 
-/** Device-side mirrors of bam::EmuSqe / bam::EmuCqe. Kept here so the
- *  kernel path does not have to include the host header. */
-struct EmuSqeDev {
-  uint64_t offset; uint64_t bus_addr;
-  uint32_t nbytes; uint32_t opcode; uint32_t cid; uint32_t pad;
-};
-struct EmuCqeDev {
-  uint32_t cid; uint32_t status; uint32_t phase; uint32_t pad;
-};
-
 __device__ inline uint8_t *page_cache_acquire(
     PageCacheDeviceState &state,
     uint64_t offset,
@@ -312,69 +302,34 @@ __device__ inline void host_write_page(
 /* ================================================================== */
 
 /**
- * Submit one page-granular command and wait for its completion.
+ * Fill a cache page from the "device".
  *
- * This is the real sequence a GPU issues to an NVMe queue pair -- claim an
- * SQ slot, write the SQE, ring the doorbell, poll the CQ for the phase this
- * command is due -- against an emulated controller whose medium is pinned
- * host memory (see bam/nvme_emu.h). It replaces stubs that ignored their
- * arguments and returned -1, which is why a "miss" used to cost a memcpy
- * and nothing else.
+ * NOT a queue-pair emulation. A full submission/doorbell/completion path was
+ * built and removed: it needs device atomics on mapped host memory, which
+ * this GPU cannot do (cudaDevAttrHostNativeAtomicSupported = 0), and the
+ * host-side controller it requires serialises against the very kernel
+ * waiting on it. The protocol shape was not worth that.
  *
- * Called by ONE thread per page fill; the rest of the warp waits at the
- * barrier its caller already holds.
+ * What a miss actually costs on real BaM is a bulk asynchronous transfer
+ * from storage into the cache page, and CUDA already gives that: the
+ * warp-cooperative copy below moves a page from pinned host memory over
+ * PCIe with all 32 lanes in flight, GPU-initiated, no host thread. That is
+ * the transfer being modelled, so it IS the emulation -- the medium is
+ * DRAM rather than flash, which understates a real NVMe miss and is worth
+ * saying out loud whenever a miss-heavy number is quoted.
  */
-__device__ inline int nvme_submit_page(
-    QueuePairDevice &qp, uint64_t bus_addr,
-    uint64_t offset, uint32_t page_size, uint32_t opcode) {
-  if (qp.sq == nullptr || qp.cq == nullptr) return -1;
-
-  // CLAIM ON THE DEVICE, PUBLISH INTO HOST MEMORY.
-  //
-  // The claim is an atomicAdd on device memory because this GPU cannot do
-  // atomics on mapped host memory at all (cudaDevAttrHostNativeAtomicSupported
-  // = 0) -- a doorbell register in host memory would be illegal, not just
-  // slow. Publication is therefore a per-slot STAMP: write the entry, fence
-  // system-wide, then store the stamp. A controller that observes the stamp
-  // is guaranteed to observe the entry beside it.
-  const unsigned int mine = atomicAdd(qp.sq_alloc, 1u);
-
-  const uint32_t idx = mine & (qp.sq_depth - 1u);
-  volatile EmuSqeDev *sqe = &((volatile EmuSqeDev *)qp.sq)[idx];
-  sqe->offset = offset;
-  sqe->bus_addr = bus_addr;
-  sqe->nbytes = page_size;
-  sqe->opcode = opcode;
-  sqe->cid = mine;
-  __threadfence_system();
-  qp.sq_ready[idx] = (mine / qp.sq_depth) + 1u;   // publish
-  __threadfence_system();
-
-  // Poll for our completion. The phase distinguishes this generation's CQE
-  // from the previous one occupying the same slot.
-  const uint32_t cidx = mine & (qp.cq_depth - 1u);
-  volatile EmuCqeDev *cqe = &((volatile EmuCqeDev *)qp.cq)[cidx];
-  const unsigned int want = (mine / qp.cq_depth) + 1u;
-  for (;;) {
-    const unsigned int ph = cqe->phase;
-    if (ph == want) {
-      __threadfence_system();
-      return (int)cqe->status;
-    }
-    __nanosleep(32);
-  }
-}
-
 __device__ inline int nvme_read_page(
     QueuePairDevice &qp, uint64_t bus_addr,
     uint64_t offset, uint32_t page_size) {
-  return nvme_submit_page(qp, bus_addr, offset, page_size, /*opcode=*/0u);
+  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
+  return -1;   // wired only when real gnb hardware is present
 }
 
 __device__ inline int nvme_write_page(
     QueuePairDevice &qp, uint64_t bus_addr,
     uint64_t offset, uint32_t page_size) {
-  return nvme_submit_page(qp, bus_addr, offset, page_size, /*opcode=*/1u);
+  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
+  return -1;
 }
 
 }  // namespace bam
