@@ -390,7 +390,22 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
 
   Task *task_raw = nullptr;
   if (task_on_device) {
-    ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
+    // ENGINE COPY, NOT DeviceAwareMemcpy. This stages the POD out of device
+    // memory while the PRODUCER'S KERNEL IS STILL RESIDENT -- it is spinning
+    // on the completion flag this task will set. DeviceAwareMemcpy may route
+    // a device-to-device-addressable copy through a copy KERNEL, and that
+    // kernel cannot be scheduled behind a producer that never exits: the
+    // device-memory round trip hung here every time, on 448 bytes, with the
+    // GPU at 100% and every worker healthy. A copy engine is not subject to
+    // that, so this path names its transport explicitly.
+    if (void *rs = gpu_ipc != nullptr ? gpu_ipc->GetRingStream(0) : nullptr) {
+      ctp::GpuApi::MemcpyAsync(task_scratch,
+                               reinterpret_cast<const char *>(gpu_task_raw),
+                               task_pod_size, rs);
+      ctp::GpuApi::PollSync(rs);
+    } else {
+      ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
+    }
     task_raw = reinterpret_cast<Task *>(task_scratch);
   } else {
     task_raw = static_cast<Task *>(gpu_task_raw);
@@ -407,8 +422,18 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
       size_t off = reinterpret_cast<char *>(&task_raw->fut_.is_complete_.x) -
                    reinterpret_cast<char *>(task_raw);
       u32 one = 1;
-      ctp::DeviceAwareMemcpy(reinterpret_cast<char *>(gpu_task_raw) + off, &one,
-                             sizeof(u32));
+      // Engine copy: this unblocks a kernel that may be spinning right now,
+      // and a copy KERNEL cannot be scheduled behind it (see SendOut).
+      void *rs = gpu_ipc != nullptr ? gpu_ipc->GetRingStream(0) : nullptr;
+      if (rs != nullptr) {
+        ctp::GpuApi::MemcpyAsync(reinterpret_cast<char *>(gpu_task_raw) + off,
+                                 reinterpret_cast<const char *>(&one),
+                                 sizeof(u32), rs);
+        ctp::GpuApi::PollSync(rs);
+      } else {
+        ctp::DeviceAwareMemcpy(reinterpret_cast<char *>(gpu_task_raw) + off,
+                               &one, sizeof(u32));
+      }
     } else {
       task_raw->fut_.is_complete_.store(1);
     }
@@ -611,9 +636,23 @@ void IpcGpu2Cpu::SendOut(
     // kDeviceMem: write back the mutated POD. is_complete_ is still 0 here on
     // purpose -- the flag is flipped at the END of this function, once nothing
     // else will touch the task (see below).
-    ctp::DeviceAwareMemcpy(
-        reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_), host_task,
-        future_shm->gpu_task_size_);
+    //
+    // ENGINE COPY, STILL SYNCHRONOUS. DeviceAwareMemcpy may route this to a
+    // copy KERNEL (both ends are device-addressable), and a copy kernel
+    // cannot be scheduled behind a producer kernel that spins on the very
+    // flag this completion is about to set. Keeping it synchronous preserves
+    // the measured ordering and latency; only the transport changes.
+    if (ring_stream != nullptr) {
+      ctp::GpuApi::MemcpyAsync(
+          reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_),
+          reinterpret_cast<const char *>(host_task),
+          future_shm->gpu_task_size_, ring_stream);
+      ctp::GpuApi::PollSync(ring_stream);
+    } else {
+      ctp::DeviceAwareMemcpy(
+          reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_), host_task,
+          future_shm->gpu_task_size_);
+    }
   } else if (use_async) {
     ctp::GpuApi::MemcpyAsync(
         reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_),
@@ -648,10 +687,21 @@ void IpcGpu2Cpu::SendOut(
           sizeof(u32), ring_stream);
     } else {
       u32 one = 1;
-      ctp::DeviceAwareMemcpy(
-          reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
-              complete_off,
-          &one, sizeof(u32));
+      // The kernel's release signal -- an engine copy for the same reason as
+      // the payload above. Issued after that copy's PollSync, so the flag
+      // still cannot land before the bytes it advertises.
+      if (ring_stream != nullptr) {
+        ctp::GpuApi::MemcpyAsync(
+            reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+                complete_off,
+            reinterpret_cast<const char *>(&one), sizeof(u32), ring_stream);
+        ctp::GpuApi::PollSync(ring_stream);
+      } else {
+        ctp::DeviceAwareMemcpy(
+            reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+                complete_off,
+            &one, sizeof(u32));
+      }
       EvPush('F', 0xFFFF, future_shm->gpu_task_device_ptr_,
              host_task->task_id_.unique_);
     }
