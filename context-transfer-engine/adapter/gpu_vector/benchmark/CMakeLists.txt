@@ -199,8 +199,14 @@ if(CLIO_CORE_ENABLE_CUDA)
     # moved wall time by 3% while device clocks attributed 56% of block time
     # to it. Occupancy is the lever. See lib/eternia/CMakeLists.txt in the
     # LAMMPS tree, where the same ceiling is applied by an LLVM pass.
+    # Sweepable: -DMD_MAXRREG=<n>. 64 is the measured default; the ceiling
+    # trades registers against blocks/SM and these kernels are latency
+    # bound, so the optimum is empirical.
+    if(NOT DEFINED MD_MAXRREG)
+      set(MD_MAXRREG 64)
+    endif()
     target_compile_options(clio_gpu_vector_md_bench PRIVATE
-        -Xcuda-ptxas --maxrregcount=64)
+        -Xcuda-ptxas --maxrregcount=${MD_MAXRREG})
     # MD_DEVTRACE=ON turns on the fault path's own device printf tracing
     # (CLIO_YCORO_DEVTRACE in device_vector.h) for debugging wedges.
     if(MD_DEVTRACE)
