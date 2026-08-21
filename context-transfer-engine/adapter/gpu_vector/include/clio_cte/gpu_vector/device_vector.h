@@ -1961,6 +1961,22 @@ class DeviceVector {
    */
   CTP_GPU_FUN bool AdmissionOn() const { return h_->hold_admits_ != nullptr; }
 
+  /**
+   * How many pages the range [off, off+count) touches -- i.e. exactly how
+   * many guards holding it will take, since a hold is cut at each page
+   * boundary.
+   *
+   * This is what lets a caller reserve its TRUE hold set instead of a
+   * worst-case bound. It is pure arithmetic on the request, so it can run
+   * before any hold is taken, which is the ordering admission requires.
+   */
+  CTP_GPU_FUN clio::run::u32 PagesSpanned(clio::run::u64 off,
+                                          clio::run::u64 count) const {
+    if (count == 0) return 0;
+    return static_cast<clio::run::u32>(PageOf(off + count - 1) - PageOf(off)) +
+           1u;
+  }
+
   /** Reserve `n` slots for this block's hold set, or fail without waiting. */
   CTP_GPU_FUN bool TryAdmit(clio::run::u32 n) {
     unsigned int *a = h_->hold_admits_;

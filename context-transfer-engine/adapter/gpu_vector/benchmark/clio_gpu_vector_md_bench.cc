@@ -511,6 +511,41 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     if (y0 >= nb) continue;
     const u32 ylast = (y0 + rowchunk - 1 < nb) ? (y0 + rowchunk - 1)
                                                : (nb - 1);
+    // Same admission as the force chunk, and for the same reason: this
+    // kernel's span guards live for the whole chunk and its list guards are
+    // WRITE holds, so it exhausts the very same tables. Admitting only the
+    // force kernel just relocates the exhaustion to this one -- every hold
+    // set in the grid has to be admitted, or none of them are protected.
+    u32 span_guards = 0;
+    {
+      const int lo0 = static_cast<int>(y0) - 1;
+      const int hi0 = static_cast<int>(ylast) + 1;
+      for (int dz = -1; dz <= 1; ++dz) {
+        const u32 wz = (bz + nb + dz) % nb;
+        u32 rl[2], rn[2], nr = 0;
+        if (lo0 < 0) {
+          rl[nr] = 0; rn[nr] = static_cast<u32>(hi0) + 1u; ++nr;
+          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+        } else if (hi0 > static_cast<int>(nb) - 1) {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = nb - static_cast<u32>(lo0); ++nr;
+          rl[nr] = 0; rn[nr] = 1u; ++nr;
+        } else {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = static_cast<u32>(hi0 - lo0 + 1); ++nr;
+        }
+        for (u32 t = 0; t < nr; ++t) {
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+          span_guards += x.PagesSpanned(rb, static_cast<u64>(rn[t]) * row_elems);
+        }
+      }
+    }
+    if (x.AdmissionOn()) {
+      co_await x.EnterHoldSet(span_guards);
+      co_await nl.EnterHoldSet(kMaxNlGuards);
+    }
+    {   // guards die at the close of this scope, before the reservations go back
     gv::Held<float> hg[6][2];
     u64 srun[6];
     const float *sp0[6], *sp1[6];
@@ -662,6 +697,9 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     }
     __syncthreads();
     }   // per-row loop
+    }
+    nl.ExitHoldSet(kMaxNlGuards);
+    x.ExitHoldSet(span_guards);
   }     // per-chunk loop
 }
 
@@ -739,11 +777,49 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // planes. So the count is pure geometry, known BEFORE any hold, and
     // reserving it beats reserving the worst case: at 48 slots the blanket
     // 12 admitted only 4 of 64 blocks and cost 124 ms/step against 43.
-    const u32 nyr = (static_cast<int>(y0) - 1 < 0 ||
-                     static_cast<int>(ylast) + 1 > static_cast<int>(nb) - 1)
-                        ? 2u : 1u;
-    const u32 span_guards = 3u * nyr * 2u;   // 3 z planes, <=2 guards/span
-    if (x.AdmissionOn()) co_await x.EnterHoldSet(span_guards);
+    // EXACTLY how many x guards this chunk will hold. The span geometry is
+    // pure arithmetic, and PagesSpanned turns each span into the number of
+    // guards holding it takes, so the reservation is the true hold set
+    // rather than a bound. The bound (3 planes x 2 ranges x 2 guards = 12)
+    // over-reserved badly enough to admit only a few of 64 blocks, which is
+    // what made admission cost 2.5-3x and kept it opt-in.
+    u32 span_guards = 0;
+    {
+      const int lo0 = static_cast<int>(y0) - 1;
+      const int hi0 = static_cast<int>(ylast) + 1;
+      for (int dz = -1; dz <= 1; ++dz) {
+        const u32 wz = (bz + nb + dz) % nb;
+        u32 rl[2], rn[2], nr = 0;
+        if (lo0 < 0) {
+          rl[nr] = 0; rn[nr] = static_cast<u32>(hi0) + 1u; ++nr;
+          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+        } else if (hi0 > static_cast<int>(nb) - 1) {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = nb - static_cast<u32>(lo0); ++nr;
+          rl[nr] = 0; rn[nr] = 1u; ++nr;
+        } else {
+          rl[nr] = static_cast<u32>(lo0);
+          rn[nr] = static_cast<u32>(hi0 - lo0 + 1); ++nr;
+        }
+        for (u32 t = 0; t < nr; ++t) {
+          const u64 rb =
+              ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+          span_guards += x.PagesSpanned(rb, static_cast<u64>(rn[t]) * row_elems);
+        }
+      }
+    }
+    // ALL THREE RESERVATIONS BEFORE ANY HOLD. Reserving x, taking the x
+    // holds, and only then waiting for f/nl admission is the very
+    // hold-while-waiting pattern admission exists to remove -- just moved
+    // across vectors: blocks sit on x slots waiting for f, so x is
+    // exhausted by blocks that are themselves blocked. Acquiring every
+    // reservation up front, while holding nothing, is what makes the
+    // guarantee hold across the whole working set rather than per vector.
+    if (x.AdmissionOn()) {
+      co_await x.EnterHoldSet(span_guards);
+      co_await f.EnterHoldSet(2);
+      co_await nl.EnterHoldSet(kMaxNlGuards);
+    }
     {   // guards die at the close of this scope, before ExitHoldSet
     gv::Held<float> hg[6][2];
     u64 srun[6];
@@ -797,7 +873,6 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // reservation had been throttling f/nl concurrency by accident. A fixed
     // acquisition order is what keeps the nesting (x held while waiting for
     // f) from forming a cycle.
-    if (f.AdmissionOn()) co_await f.EnterHoldSet(2);
     gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
     gv::Held<float> hf1;
     const u64 frun0 = hf0.run();
@@ -817,7 +892,6 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     const int *np[kMaxNlGuards];
     u64 gstart[kMaxNlGuards], glen[kMaxNlGuards];
     u32 nguards = 0;
-    if (nl.AdmissionOn()) co_await nl.EnterHoldSet(kMaxNlGuards);
     {
       const u64 nb0 = row * rowlist;
       u64 off = 0;
@@ -922,15 +996,13 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
       atomicAdd(&g_md_cyc[5], 1ull);
     }
-    // Both reservations released here, after every f and nl guard of this
-    // row has been destroyed.
-    nl.ExitHoldSet(kMaxNlGuards);
-    f.ExitHoldSet(2);
     }   // per-row loop
     // Every span guard above is dead here (the chunk body scope ends with
     // this brace), so the reservation is given back exactly once per
     // EnterHoldSet. The only chunk-level `continue` is above the Enter.
     }
+    nl.ExitHoldSet(kMaxNlGuards);
+    f.ExitHoldSet(2);
     x.ExitHoldSet(span_guards);
   }     // per-chunk loop
   if (eflag) {
