@@ -81,42 +81,78 @@ INTERLEAVED (stock, NVSHMEM, paged, repeat ×3) because this laptop GPU's
 clock state moves the absolute numbers by ~40% across a session while the
 ratios hold — a non-interleaved comparison here is worthless.
 
-| code | substrate | ms/step | Matom-step/s | vs stock |
-|------|-----------|---------|--------------|----------|
-| stock `lj/cut/kk` | LAMMPS device arrays | 3.66 | 70.0 | 1.00× |
-| `clio_md_nvshmem_bench` | symmetric heap | **1.77** | 145.0 | **0.48× (2.07× faster)** |
-| `clio_gpu_vector_md_bench` | paged `gv::Vector` | 6.99 | 36.6 | 1.91× slower |
+| code | substrate | ms/step | rebuild-matched | Matom-step/s | vs stock |
+|------|-----------|---------|-----------------|--------------|----------|
+| stock `lj/cut/kk` | LAMMPS device arrays | 3.64 | 3.64 | 70.3 | 1.00× |
+| `clio_md_nvshmem_bench` | symmetric heap | 1.76 | **1.81** | 145.1 | **2.01× faster** |
+| `clio_gpu_vector_md_bench` | paged `gv::Vector` | 7.05 | **7.31** | 36.3 | 2.01× slower |
 
 Spread across 3 interleaved reps was under 5% for all three. Best configs:
 NVSHMEM `--rowchunk 1 --threads 128`; paged `--rowchunk 2 --page-kb 69
 --threads 64` (the paged bench loses badly at 128 threads — 11.0 ms/step —
 which is the coroutine register ceiling, exactly as its own notes predict).
 
-**Why the NVSHMEM bench beats stock, honestly.** Two effects of the same
-order push in opposite directions, and this machine cannot separate them:
+"Rebuild-matched" corrects the one scale mismatch in the decks: stock does
+**10** neighbour builds in 100 steps, both benches do **9** (their loop skips
+step 0). Per-rebuild cost measured by differencing against `--rebin 0` in the
+same clock regime — 4.9 ms NVSHMEM, 26.1 ms paged — and one is added back.
+It is a 3% effect on the NVSHMEM number and 4% on the paged one; it does not
+move any conclusion, but it is the kind of thing that should not be left for
+a reader to discover.
 
-- *For us:* single precision against stock's double. On a bandwidth-bound
-  kernel that is worth roughly 2× on its own, and it plausibly accounts for
-  the entire margin. LAMMPS has no single-precision KOKKOS pair style to
-  compare against, so this is stated, not measured.
-- *For us:* the bin-major layout IS a permanent spatial sort, refreshed at
-  every rebuild. Stock's `atom_modify sort` defaults to every 1000 steps.
-- *Against us:* full list / newton off, so every pair is evaluated twice.
+### Is this the same problem? An audit
 
-The defensible claim is therefore "at or about stock speed, in single
-precision", not "twice as fast as LAMMPS". What the number does establish
-firmly is that the reimplementation is not leaving an order of magnitude on
-the floor, which is the precondition for the substrate comparison below
-meaning anything.
+Scale and problem size are identical and verified from both logs. The
+numerical and algorithmic *conventions* are not, and they do not all push the
+same way:
 
-**The substrate cost, which is the point.** The NVSHMEM and paged benches
-share physics, layout, decomposition, list encoding and gates; they differ
-only in how a stencil row is reached. That difference is **3.95×** (1.77 vs
-6.99 ms/step), and the paged run held its resident contract — zero faults,
-zero evictions — so this is the cost of the hold machinery itself (coroutine
-frames, pins, guards), not of tier traffic. Paging buys a capacity ceiling
-that is not VRAM; on this deck it costs about 4× against the scale-out way
-of buying the same thing, and about 1.9× against stock.
+| aspect | stock | both benches | same |
+|---|---|---|---|
+| atoms | 256000 | 256000 | ✅ |
+| box edge | 67.183848 | 67.1838 | ✅ |
+| lattice / density | fcc 0.8442 | fcc 0.8442 | ✅ |
+| cutoff / skin / rlist | 2.5 / 0.3 / 2.8 | 2.5 / 0.3 / 2.8 | ✅ |
+| timestep | 0.005 (verified explicitly) | 0.005 | ✅ |
+| initial temperature | 3.0 | 3.0 | ✅ |
+| steps | 100 | 100 | ✅ |
+| rebuild cadence | every 10, `check no` | every 10 | ✅ (10 vs 9 builds, corrected above) |
+| neighbour bins | 2.8, 24³ | 2.921, 23³ | ≈ |
+| **precision** | **double** | **float** | ❌ favours the benches |
+| **ghosts** | **70348 ghost atoms + per-step comm** | **none (minimum image)** | ❌ favours the benches |
+| **spatial sort** | every 1000 steps (default) | every rebuild | ❌ favours the benches |
+| **list convention** | **half, newton on — 37.9 neigh/atom, 9.70M pairs** | **full, newton off — ~75.7/atom, 19.4M pair evals** | ❌ favours stock |
+| list storage | compact dynamic, 9.70M entries | padded fixed, 56M slots (214 MB) | ❌ favours stock |
+| initial velocities | uniform RNG, seed 87287 | deterministic analytic, momentum-zeroed, scaled to T=3 | ❌ same macrostate, different microstate |
+
+So the honest reading of "2× faster than LAMMPS" is: the benches carry a real
+2× advantage in precision and pay a real 2× penalty in pair evaluations, plus
+a ghost-comm and sorting advantage that stock's own timing cannot cleanly
+separate (on one rank KOKKOS attributes ~78% of the loop to `Comm`, which is
+mostly the async sync point rather than genuine ghost traffic). The
+defensible claim is **"at or about stock speed, in single precision"** — not
+a win over LAMMPS. What the number does establish is that the
+reimplementation is not leaving an order of magnitude on the floor, which is
+the precondition for the substrate comparison below meaning anything.
+
+**The substrate cost, which is the point.** Every caveat in the audit above
+cancels between the two benches: they are the same source lineage, same
+precision, same full-list/newton-off convention, same ghost-free minimum
+image, same sort cadence, same rebuild count. They differ *only* in how a
+stencil row is reached. That difference is **4.0×** (1.81 vs 7.31 ms/step
+rebuild-matched), and the paged run held its resident contract — zero faults,
+zero evictions — so it is the hold machinery itself being measured (coroutine
+frames, pins, guards), not tier traffic. Per phase, in one clock regime:
+
+| phase (100 steps) | NVSHMEM | paged |
+|---|---|---|
+| force | 130.0 ms | 393.7 ms |
+| list build + resort | 50.6 ms | 307.2 ms |
+| integrate (kick) | 10.1 ms | 75.8 ms |
+
+Paging buys a capacity ceiling that is not VRAM. On this deck it costs about
+4× against the scale-out way of buying the same thing, and about 2× against
+stock — and that is the number the comparison is actually for, because it is
+the only one where nothing else differs.
 
 ### Two numbers in the PE table are not performance numbers
 
