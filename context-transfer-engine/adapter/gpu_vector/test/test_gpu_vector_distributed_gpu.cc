@@ -86,18 +86,20 @@ __device__ gy::YCoroMain WriteRangeCoro(gv::DeviceVector<u32> v,
                                         u32 round, clio::run::u32 block) {
   const u64 base = first_elem + static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
-    auto h = co_await v.HoldPage(base + i, elems_per_block - i, /*write=*/true);
-    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = Pattern(base + i + k, round);
+    u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, elems_per_block - i, /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Pattern(base + i + k, round);
+      }
     }
-    i += h.run();
+    // Flush as we go: the vector never writes back on its own, so a
+    // dirty page is unevictable until the caller flushes it. Async, so
+    // it overlaps the next page; the servicer retires it once it lands.
+    v.FlushAsync(base + i, run);
+    i += run;
   }
-  // The flush clears `dirty` as it submits, so a lane still writing when the
-  // puts go out would lose its writes AND leave the page looking clean.
-  // FlushAsync is block-collective and barriers internally before thread 0
-  // submits, so every lane's stores above are complete first. Internally
-  // BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, elems_per_block);
   co_await v.AwaitFlush();
 }
 

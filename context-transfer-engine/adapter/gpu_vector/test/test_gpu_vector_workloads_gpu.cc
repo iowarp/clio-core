@@ -125,26 +125,25 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
   // remainder un-Stepped, which showed up as a sum that was too HIGH (Step
   // reduces the value) by about two elements' worth.
   for (clio::run::u64 off = 0; off < per;) {
-    auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + off + k] = Step(h[base + off + k]);
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + off + k] = Step(h[base + off + k]);
+      }
+      // Double buffer: hand this page to the runtime NOW and keep computing.
+      // The internal barrier matters: SubmitPut clears `dirty` as it submits,
+      // so a lane still writing when the flush submits loses its writes.
+      // Collective, internally BATCHED (one multi-put per 64 pages).
+      v.FlushAsync(base + off, run);
     }
-    // Double buffer: hand this page to the runtime NOW and keep computing.
-    // The internal barrier matters: SubmitPut clears `dirty` as it submits,
-    // so a lane still writing when the flush submits loses its writes.
-    // Collective, internally BATCHED (one multi-put per 64 pages).
-    v.FlushAsync(base + off, h.run());
-    off += h.run();
+    // Flush as we go: the vector never writes back on its own, so a
+    // dirty page is unevictable until the caller flushes it. Async, so
+    // it overlaps the next page; the servicer retires it once it lands.
+    v.FlushAsync(base + off, run);
+    off += run;
   }
-  // Then flush the WHOLE slice. The per-page FlushAsync above is the overlap
-  // this workload exists to show, but it is a submission, not a guarantee:
-  // whatever it did not manage to submit stays dirty in the cache and is lost
-  // when the kernel ends. Measured with only the per-page flush: page 0 landed
-  // and pages 1-7 did not, so the reader saw Step(Seed) for the first 1024
-  // elements and plain Seed for the other 7168. The original spelled this the
-  // same way -- a flush submission per page, then one wait over the slice.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 
@@ -219,25 +218,32 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 npages = per / page_elems;
 
   for (clio::run::u64 off = 0; off < per;) {
-    auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + off + k] = Seed(base + off + k);
-    }
-    // Ask for a page far ahead while THIS one is still dirty. With the cache
-    // full of dirty pages the claim must decline; if it evicts one anyway,
-    // those writes are gone. Block-collective (thread 0 does the work
-    // inside); fire-and-forget on purpose -- it is a probe, not a fetch the
-    // loop depends on.
+    clio::run::u64 run = 0;
     {
-      const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
-      const clio::run::u64 page = base / page_elems + ahead;
-      v.RescorePagesBatchedAsync(
-          1, [page](clio::run::u32) { return gv::PageScore{page, 1.0f}; });
+      auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + off + k] = Seed(base + off + k);
+      }
+      // Ask for a page far ahead while THIS one is still dirty. With the cache
+      // full of dirty pages the claim must decline; if it evicts one anyway,
+      // those writes are gone. Block-collective (thread 0 does the work
+      // inside); fire-and-forget on purpose -- it is a probe, not a fetch the
+      // loop depends on.
+      {
+        const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
+        const clio::run::u64 page = base / page_elems + ahead;
+        v.RescorePagesBatchedAsync(
+              1, [page](clio::run::u32) { return gv::PageScore{page, 1.0f}; });
+      }
     }
-    off += h.run();
+    // DELIBERATELY NOT FLUSHED. This kernel exists to prove the vector
+    // refuses to drop a dirty page: it dirties more pages than the table
+    // holds and never flushes, so the fault MUST fail loudly. A flush here
+    // silently turns the case into a no-op -- which a generic "flush as you
+    // go" rewrite did, and it went green by testing nothing.
+    off += run;
   }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 

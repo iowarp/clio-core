@@ -30,6 +30,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <vector>
 
 extern "C" int clio_cte_locate(const void *tag_id, const char *name,
@@ -280,10 +281,20 @@ class Vector {
       DevState &st = kv.second;
       if (st.faults == nullptr) continue;
       std::vector<Page> tbl(ppb);
-      for (clio::run::u32 b = 0; b < nblocks_; ++b) {
-        volatile FaultReq *f = &st.faults[b];
+      // Frames filled EARLIER IN THIS PASS are off limits as victims. A page
+      // the servicer just placed is clean and unpinned, which makes it the
+      // ideal victim for the very next fault -- so serving block A's page
+      // could evict it to serve block B, and A would resume to a page that was
+      // fetched and then thrown away. That tripped the "served but not
+      // resident" trap once the mailbox stopped aliasing.
+      std::set<size_t> filled_this_pass;
+      for (clio::run::u32 slot_i = 0; slot_i < kMaxFaultSlots; ++slot_i) {
+        volatile FaultReq *f = &st.faults[slot_i];
         if (f->pending == 0u) continue;
         const clio::run::u64 pg = f->page_num;
+        // The table the REQUEST names, which need not be the requester's own
+        // index: a kernel may rebind block_override_ per page.
+        const clio::run::u32 b = f->table < nblocks_ ? f->table : 0u;
         Page *dev_tbl = st.hdr.pages_ + static_cast<size_t>(b) * ppb;
         ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ppb * sizeof(Page));
 
@@ -319,6 +330,7 @@ class Vector {
           Page &c = tbl[i];
           if (c.page_num == pg) { slot = i; break; }   // already there
           if (c.pins != 0 || c.fetching || c.flushing) continue;
+          if (filled_this_pass.count(static_cast<size_t>(b) * ppb + i)) continue;
           if (c.page_num == kNoPage) { slot = i; break; }   // free: take it
           if (c.dirty) continue;                            // never evict dirty
           if (slot == ~0u || c.score < worst) { slot = i; worst = c.score; }
@@ -383,6 +395,7 @@ class Vector {
         ++p.gen;
         ctp::GpuApi::Memcpy(dev_tbl, tbl.data(), ppb * sizeof(Page));
 
+        filled_this_pass.insert(static_cast<size_t>(b) * ppb + slot);
         f->pending = 0u;   // only now: the page is resident and readable
         ++served;
       }
@@ -1273,7 +1286,7 @@ class Vector {
     // all. Pinned host memory -- device writes the request, host writes the
     // acknowledgement, one writer per side.
     if (st.faults == nullptr) {
-      const size_t fbytes = sizeof(FaultReq) * nblocks_;
+      const size_t fbytes = sizeof(FaultReq) * kMaxFaultSlots;
       st.faults =
           reinterpret_cast<FaultReq *>(ctp::GpuApi::MallocHost<char>(fbytes));
       if (st.faults == nullptr) {

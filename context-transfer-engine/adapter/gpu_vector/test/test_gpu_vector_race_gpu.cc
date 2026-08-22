@@ -83,14 +83,20 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
                                       clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = Seed(base + i + k);
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Seed(base + i + k);
+      }
     }
-    i += h.run();
+    // Flush as we go: the vector never writes back on its own, so a
+    // dirty page is unevictable until the caller flushes it. Async, so
+    // it overlaps the next page; the servicer retires it once it lands.
+    v.FlushAsync(base + i, run);
+    i += run;
   }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 

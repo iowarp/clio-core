@@ -46,9 +46,24 @@ namespace clio::cte::gpu_vector {
  * volatile accesses with a system fence are sufficient -- no atomics, which
  * this GPU cannot do on host memory anyway.
  */
+/** Mailbox slots, i.e. the largest grid this vector can serve faults for.
+ *  One slot per CUDA block; 16 bytes each, so this is 64 KB of pinned host
+ *  memory. Exceeding it is checked at launch rather than silently aliased. */
+static constexpr clio::run::u32 kMaxFaultSlots = 4096;
+
 struct FaultReq {
   /** Page the block is waiting for. */
   clio::run::u64 page_num;
+  /**
+   * Which page TABLE to place it in -- not necessarily the requester's own
+   * index. A kernel may rebind `block_override_` per page (page->table
+   * affinity, as the MoE pattern does), so the table is a property of the
+   * REQUEST while the mailbox slot is a property of the REQUESTER. Indexing
+   * the mailbox by table instead let two blocks aiming at one table overwrite
+   * each other's request: one was served, the other resumed to a page that was
+   * never fetched, and tripped the "served but not resident" trap.
+   */
+  clio::run::u32 table;
   /** Nonzero when the hold declared write intent. */
   clio::run::u32 write;
   /** 1 = the device needs this served; 0 = resident, resume. The wait tag a
@@ -1633,9 +1648,10 @@ class DeviceVector {
       // This is the whole device-side fault path. No claim, no eviction, no
       // writeback, no task submission, no future. Measured, the machinery this
       // replaces was 19,400 of a hold's 20,000 instructions.
-      volatile FaultReq *f = &h_->faults_[BlockIndex()];
+      volatile FaultReq *f = &h_->faults_[FaultSlot()];
       if (threadIdx.x == 0) {
         f->page_num = PageOf(off);
+        f->table = BlockIndex();
         f->write = write ? 1u : 0u;
         __threadfence_system();     // request visible before the doorbell
         f->pending = 1u;
@@ -2214,6 +2230,12 @@ class DeviceVector {
       atomicMax(reinterpret_cast<unsigned long long *>(h_->stat_bad_slot_ + 1),
                 static_cast<unsigned long long>(site));
     }
+  }
+
+  /** This block's mailbox slot: the REQUESTER's identity, which is the CUDA
+   *  block, never the table it happens to be aiming at. */
+  CTP_GPU_FUN clio::run::u32 FaultSlot() const {
+    return blockIdx.x < kMaxFaultSlots ? blockIdx.x : 0u;
   }
 
   CTP_GPU_FUN clio::run::u32 BlockIndex() const {

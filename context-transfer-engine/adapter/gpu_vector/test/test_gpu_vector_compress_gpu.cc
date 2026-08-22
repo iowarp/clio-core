@@ -90,16 +90,23 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
                                          clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
-    if (threadIdx.x == 0) {
-      for (clio::run::u64 k = 0; k < h.run(); ++k) {
-        h[base + i + k] = Weight(base + i + k);
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+      run = h.run();
+      if (threadIdx.x == 0) {
+        for (clio::run::u64 k = 0; k < run; ++k) {
+            h[base + i + k] = Weight(base + i + k);
+        }
       }
+      __syncthreads();
     }
-    __syncthreads();
-    i += h.run();
+    // Flush as we go: the vector never writes back on its own, so a
+    // dirty page is unevictable until the caller flushes it. Async, so
+    // it overlaps the next page; the servicer retires it once it lands.
+    v.FlushAsync(base + i, run);
+    i += run;
   }
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 
