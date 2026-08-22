@@ -3,159 +3,143 @@
 Same melt deck, same physics, same gates, one variable changed per bench.
 Measured 2026-08-21, RTX 4070 Laptop (8188 MiB), CUDA 13.3.
 
-**Deck:** `--md --lattice 112 --steps 80` = 5,619,712 atoms, 67³ bins,
-Verlet list kept. Every substrate reproduces PE/atom −6.7733681 against the
-host double reference, with the statics, resort and NVE gates green.
+## Read this first: every earlier number in this file was mis-measured
 
-**Checkpoint:** x and v staged device->pinned host DRAM, then written to a
-file on NVMe and **fsync'd**, 8 times (every 10 steps) = **8 x 293.7 MB =
-2.29 GB made durable**. Forces and the neighbour list are derived and a
-restart rebuilds them, which is what a LAMMPS restart file carries too.
+The four transport/capacity benches default to `--blocks 128 --threads 64`.
+The paged bench defaults to `--blocks 64 --threads 256`. Earlier revisions of
+this document ran each bench **at its own default**, so the paged vector was
+measured at its favourable geometry and everything else at an unfavourable
+one. Geometry is worth up to 1.7x on this kernel, so that comparison was not
+like-for-like and its headline conclusion (paging "4% behind", break-even at
+~10.6 checkpoints) was wrong.
 
-The fsync is not optional. Without it the measurement is the page cache,
-not the device, and a crash still eats the checkpoint. Raw device speed for
-reference: `dd oflag=direct` writes 3.6 GB/s; the benches achieve 2.24-2.39
-GB/s including fsync.
+**Everything below is run at a single matched geometry: `--blocks 64
+--threads 256` for all five substrates.** Any future row added here must
+state its geometry or it is not a result.
 
-## Result
+## Result: lattice 100, 80 steps, 64 x 256
 
-| substrate | axis | no checkpoint | 8 durable checkpoints | checkpoint cost each |
+4,000,000 atoms. The only deck where all five substrates are resident.
+
+| substrate | axis | no checkpoint | 8 durable checkpoints | durable write each |
 |---|---|---|---|---|
-| paged `gv::Vector` | capacity | **83.7 ms/step** | 83.7 (unchanged) | **0** by design -- but see the caveat |
-| MPI (two-sided, host-staged) | transport | **64.7** | **80.4** (+24%) | 143.7 ms (23.8 stage + 119.9 write) |
-| NCCL (two-sided, GPU-resident) | transport | **64.7** | **80.4** (+24%) | 144.4 ms |
-| NVSHMEM (one-sided, in-kernel) | transport | **65.8** | **81.8** (+24%) | 146.5 ms |
-| BaM (list via GPU page cache) | capacity | see below -- **the number first published here was invalid** | | |
+| MPI (two-sided, host-staged) | transport | **23.918 ms/step** | **35.228** | 87.4 ms (2.23 GB/s) |
+| NCCL (two-sided, GPU-resident) | transport | **24.012** | **35.164** | 86.6 ms |
+| NVSHMEM (one-sided, in-kernel) | transport | **25.069** | **35.603** | 84.4 ms + 16.3 stage |
+| paged `gv::Vector` | capacity | **58.724** | 0 by design -- **but unverified, see below** | -- |
+| BaM (list via GPU page cache) | capacity | **135.451** | **146.992** | 90.6 ms |
 
-A durable checkpoint costs every non-persistent substrate ~144 ms: 23.8 ms
-of PCIe D2H plus ~120 ms of NVMe write. **The write is 5x the staging** --
-which is exactly why measuring only the D2H hop, as an earlier version of
-this document did, understated the cost 6x and has to be called out rather
-than quietly corrected.
+At matched geometry the paged vector costs **2.46x MPI** on this deck. The
+earlier 1.29x was the geometry artifact. This is the honest standing of the
+abstraction against a transport baseline when the problem fits in VRAM.
 
-### RETRACTED: the BaM leg does not measure BaM
+## Result: lattice 112, 80 steps, 64 x 256
 
-`external/bam` is not upstream BaM. Its own README calls it "a basic
-implementation of BaM (ASPLOS'23)", and it diverges from
-github.com/ZaidQureshi/bam on both axes that decide the numbers.
+5,619,712 atoms. BaM cannot be resident here (the list needs 3524.6 MB of
+cache; the largest that allocates on this GPU is ~3072 MB), and NVSHMEM
+refuses unless the GPU is fully idle -- see the operational notes.
 
-**The GPU API is not the same.** Upstream exposes three separate mechanisms
-for holding a page across many accesses:
-
-| upstream | ours |
-|---|---|
-| `array_d_t<T>::acquire_page(i, page_, start, end, r)` / `release_page(...)` -- returns `start`/`end` so the kernel loops the whole page on a raw pointer | absent |
-| `bam_ptr<T>` / `bam_ptr_tlb<T>` -- smart pointer holding a page reference across accesses, `update_page(i)` | absent |
-| `tlb<T, n, scope, loc>::acquire/release` -- translation lookaside buffer | absent |
-| `array_d_t<T>`: `operator[]`, `seq_read`, `seq_write`, `get_raw`/`release_raw`, `AtomicAdd`; `range_d_t<T>`: `operator[]`, `mark_page_dirty` | `ArrayDevice<T>::read(idx)` / `write(idx, val)` only |
-
-So every element read in our version re-resolves the page --
-`page_cache_acquire` does an `atomicCAS` on the tag plus an `atomicAdd` on
-the state -- while upstream's whole point is that you acquire once and then
-stream the page. **The 3x force-pass gap measured against the paged vector
-is that missing API, not BaM.** It benchmarks the one access pattern
-upstream provides three mechanisms to avoid.
-
-**NVMe is not emulated -- it is stubbed.**
-
-```cpp
-__device__ inline int nvme_read_page(QueuePairDevice &qp, uint64_t bus_addr,
-                                     uint64_t offset, uint32_t page_size) {
-  (void)qp; (void)bus_addr; (void)offset; (void)page_size;
-  return -1;
-}
-```
-
-The only working backend is `host_read_page`, a warp-cooperative `uint4`
-copy straight out of pinned host memory: no submission queue, no doorbell,
-no completion polling, none of the latency structure a page cache exists to
-hide. That makes misses far CHEAPER than real BaM, at the same time as the
-missing acquire/release API makes hits far more EXPENSIVE.
-
-The two errors push in opposite directions, so neither the resident number
-nor the out-of-core one can be quoted as BaM. **The BaM row is withdrawn
-from this comparison**; what follows is kept only as a record of what was
-measured.
-
-To make the leg real: implement `acquire_page`/`release_page` returning
-`start`/`end`, plus `bam_ptr` and the TLB, and use the acquire-then-stream
-pattern in the force kernel the way upstream's own benchmarks do; and back
-`nvme_read_page` with an emulated queue pair over pinned host memory --
-submission queue, doorbell, completion polling -- rather than bypassing the
-protocol with a memcpy.
-
-### The originally published BaM number was also an out-of-core run
-
-
-
-The first version of this table quoted BaM at 1174.5 ms/step. That run had
-`--bam-cache-mb 2048` against a **3524.6 MB** list, which puts BaM OUT OF
-CORE -- and its own banner says not to quote it:
-
-    !! out-of-core BaM is EXPECTED TO FAIL the gates above 2 blocks: its
-       page cache has no pin, so an evicting block can change a page another
-       block is mid-read of. Quote the RESIDENT number; the out-of-core one
-       is not a result.
-
-It was run at 128 blocks. The gates happened to pass, which is luck, not
-evidence. BaM also **cannot be resident at lattice 112 on this GPU**: the
-list needs 3524.6 MB of cache and the largest cache that allocates is ~3072
-MB, so there is no valid BaM number at this deck at all.
-
-At lattice 100, where it fits, all three run on the same deck with durable
-checkpoints:
-
-| config | ms/step | durable write |
+| substrate | no checkpoint | 8 durable checkpoints |
 |---|---|---|
-| BaM resident (2600 MB cache >= 2406.8 MB list) | 137.9 | 92.7 ms (2.11 GB/s) |
-| BaM out of core (1200 MB cache) | 944.8 | 92.4 ms (2.12 GB/s) |
-| MPI | 55.8 | 87.9 ms (2.23 GB/s) |
+| MPI | **36.187 ms/step** | **51.878** (120.4 ms write each) |
+| NCCL | **36.167** | **51.983** (119.9 ms) |
+| paged `gv::Vector` | **83.278** | crash -- see below |
+| BaM, 2 GB cache | 2453.459 **(out of core, not a resident result)** | 2475.230 |
 
-So the 18x was the out-of-core penalty -- BaM's designed trade, capacity
-past VRAM paid for in PCIe page faults -- not a property of BaM resident,
-which costs ~2.5x MPI for its page-cache indirection on every neighbour
-read.
+Paged is **2.30x MPI** here, consistent with the 2.46x at lattice 100.
 
-And the checkpoint difference is not about BaM at all: 92.7 vs 87.9 ms is
-5%, the write path is identical code in all four benches, and out-of-core
-BaM writes at the same 2.12 GB/s while moving GB/s of list traffic. Read it
-as contention/noise, not as a substrate property.
+## The paged vector's "zero checkpoint cost" is a design claim, not a measurement
 
-## What that buys, priced honestly
+The premise is that the vector is persistent, so no checkpoint is needed
+beyond the initial placement. That only holds if the contents are genuinely
+durable in the CTE tier stack rather than sitting dirty in the VRAM page
+cache -- where a crash loses them exactly like an unsaved transport run.
 
-Over 80 steps the transports pay ~1150 ms to make 2.29 GB durable. Paging
-pays 19 ms/step for its abstraction against those same transports (83.7 vs
-64.7), or 1520 ms over the same 80 steps.
+The one path that forces that durability, `--ckpt` on the paged bench,
+**crashes**, at lattice 100 and 112 alike:
 
-So paging is **4% behind** on total wall clock (6696 ms against MPI's 6432
-including its checkpoints), not the 8x it appeared to be when checkpoints
-were priced as a DRAM copy. **Break-even is ~10.6 checkpoints per 80 steps,
-i.e. checkpointing about every 7.5 steps.** Checkpoint more often than that
-and the paged vector wins outright; less often and staging to NVMe is
-cheaper than carrying paging's per-step overhead all run.
+    [memcpyasync-fail] dst=... (rc=0 type=1) src=... (rc=0 type=2) size=393216
+    FATAL MemcpyAsync CUDA Error 0: no error
 
-That is a real and defensible result for the paged design, and it only
-becomes visible once the checkpoint is actually durable.
+So the "0" column is what the design intends, not something these runs
+demonstrate. Until that flush path works, the paged vector's durability
+story is unverified and the comparison below should be read as favourable to
+paging by assumption.
+
+## Break-even, recomputed
+
+Over 80 steps at lattice 100, a durable checkpoint costs the transports
+~113 ms all-in (16.3 ms PCIe stage + ~87 ms NVMe write + fsync). Paging
+pays 34.8 ms/step against MPI, or 2784 ms over the run.
+
+**Break-even is ~24.6 checkpoints per 80 steps -- checkpointing every ~3.3
+steps.** Lattice 112 gives the same answer (~24.0). That is far more
+aggressive than any realistic MD checkpoint cadence, so on this workload
+**staging to NVMe is cheaper than carrying paging's per-step overhead**,
+and the earlier "every 7.5 steps, paging wins" claim is withdrawn.
+
+The fsync is not optional. Without it the measurement is the page cache, not
+the device. Raw device speed for reference: `dd oflag=direct` writes 3.6
+GB/s; the benches achieve 2.23-2.39 GB/s including fsync.
+
+## Where the paged abstraction does win: run length
+
+BaM and the paged vector are the two capacity substrates, and they diverge
+with horizon. Same deck, same 64 x 256, lattice 100:
+
+| steps | BaM resident (2600 MB) | paged `gv::Vector` |
+|---|---|---|
+| 20 | **35.500 ms/step** | 45.956 |
+| 80 | 135.517 | **58.862** |
+
+At a short horizon BaM is 23% faster; by 80 steps it is 2.3x slower. BaM's
+direct-mapped page cache degrades as atoms drift and the neighbour-list
+access pattern loses the locality the cache was mapped for; the paged
+vector's holds do not. **This -- not per-access translation cost -- is the
+abstraction difference that favours ours**, and it only appears if the
+measurement runs long enough. A 20-step benchmark reports the opposite
+conclusion.
+
+Note that the earlier claim of a 3x resident force-pass advantage over BaM
+was the geometry artifact, and the claim that it came from BaM's missing
+acquire-then-stream API was also wrong: routing the force loop through
+`bam_ptr`, which amortizes exactly that, moved nothing (126.08 vs 125.87).
 
 ## Capacity ceilings, which is the other half of the story
 
-At **lattice 128** (8,388,608 atoms, 6.2 GB of state):
+At **lattice 128** (8,388,608 atoms, 6.2 GB of state), at each bench's
+default geometry -- these rows predate the matched-geometry rule and are
+kept only for the pass/refuse outcome, not the timings:
 
 | substrate | result |
 |---|---|
-| paged `gv::Vector` | 111.8 ms/step, fully resident, 0 faults |
-| MPI | 99.5 ms/step |
-| NCCL | 99.6 ms/step |
+| paged `gv::Vector` | runs, fully resident, 0 faults |
+| MPI / NCCL | run |
 | NVSHMEM | **refuses**: 6463.9 MB of per-PE state, "no tier to spill to" |
 | BaM | **OOM** in its page cache unless `--bam-cache-mb` is set explicitly |
 
-NVSHMEM's ceiling is 1 × VRAM by construction and its own guard says so.
-That is the capacity claim the paged vector exists to answer — and it does
-answer it, at 1.3x the step cost of the transports.
+NVSHMEM's ceiling is 1 x VRAM by construction and its own guard says so.
+That is the capacity claim the paged vector exists to answer, and it does
+answer it -- at 2.3-2.5x the step cost of the transports.
 
-Two operational notes. NVSHMEM refuses spuriously when run back-to-back
-because the previous process has not released VRAM yet ("3226 MB free" on an
-idle 7820 MB card); leave a settle gap between runs. BaM's `--bam-cache-mb`
-default of auto ("fits the list") over-sizes and OOMs at both lattices; 2 GB
-works and is the mode its design intends — 1174 ms/step, 18x the transports,
-which is what paging the list from host DRAM costs.
+## Operational notes
+
+**NVSHMEM needs a genuinely idle GPU.** It refused at lattice 100 with
+"3017.4 MB of per-PE state against 3226.0 MB free VRAM" even after a 30 s
+settle, while `nvidia-smi` showed 7820 MB free and no compute apps. Run it
+standalone; it then completes at 25.069 ms/step. A refusal in a back-to-back
+sweep is not a capacity result.
+
+**BaM's `--bam-cache-mb` default (auto, "fits the list") OOMs.** Set it
+explicitly. Below the list size it goes out of core, and the bench's own
+banner forbids quoting that as a BaM result.
+
+**NVMe is emulated as an asynchronous bulk copy from pinned host memory**
+(warp-cooperative `uint4`, 32 lanes in flight), not as a queue pair. The
+medium is DRAM, so miss cost is understated relative to real flash; that
+belongs next to any miss-heavy number. Two findings from the abandoned
+queue-pair emulation, each of which cost a session: a doorbell in mapped
+host memory needs device atomics on host memory, which this GPU cannot do
+(`cudaDevAttrHostNativeAtomicSupported = 0`); and a host controller's plain
+`cudaMemcpy` serializes on the legacy default stream against the very kernel
+awaiting its completion.
