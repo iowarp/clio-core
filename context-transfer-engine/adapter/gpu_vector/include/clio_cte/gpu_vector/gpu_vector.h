@@ -257,13 +257,19 @@ class Vector {
         // Place the page into THIS block's table. Prefetch already claims a
         // slot, evicts and writes back a dirty victim, and fetches -- the
         // whole miss path, host-side, where it costs no registers.
-        // GAP (measured, 2026-08-22): Prefetch is the wrong primitive here. It
-        // places only into FREE or already-matching slots and never evicts, so
-        // with a full table it fetches the bytes and then drops them
-        // (readback showed the page absent from the device table while
-        // Prefetch reported success). Servicing a fault needs a host-side
-        // claim-with-eviction that this class does not yet have. See design.md
-        // section 15.
+        // PLACEHOLDER -- THE WRONG PRIMITIVE ON PURPOSE, PENDING THE RIGHT ONE.
+        //
+        // Prefetch is ADVISORY: it fills free slots and correctly refuses to
+        // evict, because discarding a page in use to make room for one nobody
+        // asked for yet would be wrong. Fault servicing is MANDATORY -- a
+        // parked block cannot proceed without this exact page -- so it must be
+        // willing to displace something.
+        //
+        // Consequence, measured: with a full table this places nothing (the
+        // page is absent from the device table afterwards even though the
+        // bytes were fetched) and the block re-faults forever. See design.md
+        // section 15; the fix is a claim-with-eviction, not a change to
+        // Prefetch.
         Prefetch(pg, pg + 1, b, b + 1);
         f->pending = 0u;   // rule 1: only after the page is really there
         ++served;

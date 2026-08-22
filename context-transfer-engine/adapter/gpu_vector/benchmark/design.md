@@ -564,25 +564,48 @@ gaps in the HOST side rather than the protocol:
    servicer needs an *allocate-empty* case beside *fetch*: claim a slot, zero
    the frame, publish it. The legacy in-kernel path does this implicitly; the
    host path has no equivalent.
-2. **`Prefetch` never evicts.** With the table full it placed nothing:
-   instrumented readback showed the page absent from the device table while
-   `Prefetch` reported success -- it fetched the bytes and dropped them,
-   because it only places into free or already-matching slots. It is a bulk
-   fill for an empty cache ("Preload, ClearCache, Prefetch"), not a demand
-   servicer.
+2. **`Prefetch` was the wrong primitive, and correctly refused.** With the
+   table full it placed nothing: instrumented readback showed the page absent
+   from the device table while `Prefetch` reported having fetched it.
 
-   It also has a side effect that disqualifies it here regardless: it sets
-   `no_evict_` from whether *its own range* was fully placed, so servicing one
-   page would declare the whole vector resident.
+   That refusal is **right, not a defect**. Prefetch is ADVISORY -- a
+   recommendation about pages that may be wanted soon. An advisory operation
+   must never evict: it would discard a page some block is using to make room
+   for one nobody has asked for yet. When there is no free slot, the correct
+   answer is to do nothing.
+
+   Servicing a fault is the opposite: MANDATORY. A block is parked and cannot
+   proceed until that exact page is resident, so the servicer must be willing
+   to displace something. Using the advisory primitive for the mandatory job
+   was the mistake.
+
+   (It also sets `no_evict_` from whether its own range was fully placed --
+   another reason it cannot be reused as-is, and another sign these are
+   different operations.)
 
 Symptom of both: the block re-faulted on the same page every round until the
 driver's 200,000-round cap. The data check still read zero mismatches, so an
 earlier version of the test **passed while livelocked** -- convergence has to be
 asserted separately from correctness, and the round count is the assertion.
 
+### Advisory vs mandatory placement
+
+The attempt clarified a distinction the design should state outright, because
+conflating the two is what broke it:
+
+| | advisory (`Prefetch`) | mandatory (fault servicing) |
+|---|---|---|
+| who asked | nobody yet -- a prediction | a parked block, by page number |
+| may evict | **no** | **yes, it must** |
+| may decline | yes, silently | no -- declining is a livelock |
+| page absent from backing store | skip it | allocate an empty frame |
+
+`Prefetch` implements the left column correctly and should not change.
+
 ### What the design needs before it can work
 
-A host-side **claim-with-eviction**, which does not currently exist:
+A host-side **claim-with-eviction** implementing the right column, which does
+not currently exist:
 
 - choose a victim in that block's table by score and recency,
 - refuse pinned or in-flight slots,
