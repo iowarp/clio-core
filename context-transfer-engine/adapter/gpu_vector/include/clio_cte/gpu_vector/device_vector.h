@@ -3716,6 +3716,75 @@ class DeviceVector {
  *  kernel needs something from here, the public API is missing a verb --
  *  add the verb, do not widen this. */
 struct DeviceVectorTestAccess {
+  // ---- register/size attribution (benchmark/gpu_vector_regprobe.cc) -------
+  // Forwarders so one compile-only kernel can exercise ONE internal and
+  // `cuobjdump -res-usage` can price it. Templates: uninstantiated in every
+  // build that does not use them, so they cost nothing.
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u64 ProbeHold(DeviceVector<T> &v,
+                                              clio::run::u64 off) {
+    return v.ProbeHold(off, 1, false);
+  }
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u64 TryHoldFast(DeviceVector<T> &v,
+                                                clio::run::u64 off) {
+    return v.TryHoldFast(off, 1, false);
+  }
+  template <typename T>
+  static CTP_GPU_FUN const void *Find(DeviceVector<T> &v, clio::run::u64 pn) {
+    return v.Find(pn);
+  }
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u32 ClaimSlot(DeviceVector<T> &v,
+                                              clio::run::u64 pn) {
+    v.LockBlock();
+    const clio::run::u32 r = v.ClaimSlotWindowLocked(pn);
+    v.UnlockBlock();
+    return r;
+  }
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u32 FetchBatchedLocked(DeviceVector<T> &v,
+                                                       clio::run::u64 pn) {
+    v.LockBlock();
+    const clio::run::u32 r = v.FetchPagesBatchedLocked(pn, 8);
+    v.UnlockBlock();
+    return r;
+  }
+  template <typename T>
+  static CTP_GPU_FUN clio::run::u32 FetchRunLocked(DeviceVector<T> &v,
+                                                   clio::run::u64 pn) {
+    v.LockBlock();
+    const clio::run::u32 r = v.BeginFetchRunLocked(pn, 8);
+    v.UnlockBlock();
+    return r;
+  }
+  template <typename T>
+  static CTP_GPU_FUN void StartEviction(DeviceVector<T> &v,
+                                        clio::run::u64 pn) {
+    v.StartEvictionAsync(pn);
+  }
+  template <typename T>
+  static CTP_GPU_FUN void EvictPages(DeviceVector<T> &v, clio::run::u32 n) {
+    v.EvictPages(n);
+  }
+  template <typename T>
+  static CTP_GPU_FUN void FlushRangeLocked(DeviceVector<T> &v,
+                                           clio::run::u64 off) {
+    v.LockBlock();
+    v.FlushRangeBatchedAsyncLocked(off, 4096);
+    v.UnlockBlock();
+  }
+  template <typename T>
+  static CTP_GPU_FUN void SettleBatch(DeviceVector<T> &v) {
+    v.LockBlock();
+    v.SettleBatchLocked();
+    v.UnlockBlock();
+  }
+  template <typename T>
+  static CTP_GPU_FUN void ReapFetched(DeviceVector<T> &v) { v.ReapFetched(); }
+  template <typename T>
+  static CTP_GPU_FUN void ReapFlushed(DeviceVector<T> &v) { v.ReapFlushed(); }
+
   template <typename T>
   static CTP_GPU_FUN clio::run::u32 FetchPagesBatched(DeviceVector<T> &v,
                                                       clio::run::u64 first,
