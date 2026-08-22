@@ -530,3 +530,71 @@ about kernels that do not, rather than silently degrading.
 > declared working set that fits, and it will give you an array larger than
 > VRAM at close to resident speed. Violate any of those and it will still be
 > correct, but it will not be fast -- and the vector should say so.
+
+---
+
+## 15. First implementation attempt — what it proved and what it did not
+
+Attempted 2026-08-22. Skeleton committed; the design is **not yet working**.
+
+### What was built
+
+- `FaultReq`, a per-block mailbox in pinned host memory (page number, write
+  intent, pending flag).
+- `DeviceVector::HoldPageServiced` -- probe, and on a miss record the fault,
+  park on the mailbox's `pending` field, re-probe on resume. No claim, no
+  fetch, no task submission, no future.
+- `Vector::EnableServicedFaults()` / `Vector::ServiceFaults()`, the host side.
+- A driver that runs the host servicer between kernel rounds.
+
+### What the device side proved
+
+**The protocol works.** The kernel recorded faults, parked, and resumed; the
+host observed every request through the mailbox and acknowledged it. The park
+and resume path needed no new machinery -- the existing yield driver already
+relaunches parked blocks, and its `service` callback is the right hook.
+
+### What it did not prove: the host lacks the primitive
+
+Both attempts to service a fault failed, for two separate reasons, and both are
+gaps in the HOST side rather than the protocol:
+
+1. **First-touch writes cannot be fetched.** A page that has never been written
+   has no blob, so `Prefetch` returns 0 and nothing becomes resident. The
+   servicer needs an *allocate-empty* case beside *fetch*: claim a slot, zero
+   the frame, publish it. The legacy in-kernel path does this implicitly; the
+   host path has no equivalent.
+2. **`Prefetch` never evicts.** With the table full it placed nothing:
+   instrumented readback showed the page absent from the device table while
+   `Prefetch` reported success -- it fetched the bytes and dropped them,
+   because it only places into free or already-matching slots. It is a bulk
+   fill for an empty cache ("Preload, ClearCache, Prefetch"), not a demand
+   servicer.
+
+   It also has a side effect that disqualifies it here regardless: it sets
+   `no_evict_` from whether *its own range* was fully placed, so servicing one
+   page would declare the whole vector resident.
+
+Symptom of both: the block re-faulted on the same page every round until the
+driver's 200,000-round cap. The data check still read zero mismatches, so an
+earlier version of the test **passed while livelocked** -- convergence has to be
+asserted separately from correctness, and the round count is the assertion.
+
+### What the design needs before it can work
+
+A host-side **claim-with-eviction**, which does not currently exist:
+
+- choose a victim in that block's table by score and recency,
+- refuse pinned or in-flight slots,
+- write the victim back if dirty and wait for that to land,
+- fetch the requested page, or zero the frame if it has no blob yet,
+- publish `page_num` last, and only then clear `pending`.
+
+That is the same policy the device path implements today, moved to the host --
+which is the whole point, since on the host it costs no registers and no
+instruction cache. It is the real work of Part II, and it is not a small
+change: it must reproduce the victim selection and writeback ordering that the
+device path gets right, including the rule that a dirty page is never dropped.
+
+Until it exists, `HoldPageServiced` is a skeleton and the legacy in-kernel path
+remains the only working fault path.

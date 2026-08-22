@@ -208,6 +208,71 @@ class Vector {
 #endif
   }
 
+  /**
+   * Install the per-block fault mailbox and switch the vector to SERVICED
+   * faults (design.md Part II): the kernel records a fault and parks, and
+   * this class resolves it.
+   *
+   * Pinned host memory so the device can write the request and the host can
+   * read it without a copy. One writer per side, so plain volatile access
+   * plus the device's system fence is sufficient.
+   */
+  void EnableServicedFaults() {
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      if (st.faults != nullptr) continue;
+      const size_t bytes = sizeof(FaultReq) * nblocks_;
+      st.faults = reinterpret_cast<FaultReq *>(
+          ctp::GpuApi::MallocHost<char>(bytes));
+      if (st.faults == nullptr) {
+        throw std::runtime_error("gpu_vector: fault mailbox allocation failed");
+      }
+      std::memset(st.faults, 0, bytes);
+      st.hdr.faults_ = st.faults;
+      PublishHeader(st);
+    }
+#endif
+  }
+
+  /**
+   * Resolve every outstanding fault. Call from the yield driver's service
+   * callback, i.e. between kernel rounds, while no kernel is resident.
+   *
+   * The page must be RESIDENT AND READABLE before `pending` is cleared --
+   * that is rule 1, and the device side has no retry path if it is broken.
+   *
+   * @return how many faults were served this round.
+   */
+  clio::run::u32 ServiceFaults() {
+    clio::run::u32 served = 0;
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      DevState &st = kv.second;
+      if (st.faults == nullptr) continue;
+      for (clio::run::u32 b = 0; b < nblocks_; ++b) {
+        volatile FaultReq *f = &st.faults[b];
+        if (f->pending == 0u) continue;
+        const clio::run::u64 pg = f->page_num;
+        // Place the page into THIS block's table. Prefetch already claims a
+        // slot, evicts and writes back a dirty victim, and fetches -- the
+        // whole miss path, host-side, where it costs no registers.
+        // GAP (measured, 2026-08-22): Prefetch is the wrong primitive here. It
+        // places only into FREE or already-matching slots and never evicts, so
+        // with a full table it fetches the bytes and then drops them
+        // (readback showed the page absent from the device table while
+        // Prefetch reported success). Servicing a fault needs a host-side
+        // claim-with-eviction that this class does not yet have. See design.md
+        // section 15.
+        Prefetch(pg, pg + 1, b, b + 1);
+        f->pending = 0u;   // rule 1: only after the page is really there
+        ++served;
+      }
+    }
+#endif
+    return served;
+  }
+
   void EnableStats() {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
@@ -823,6 +888,9 @@ class Vector {
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
+    /** Per-block fault mailbox (pinned host memory); null unless
+     *  EnableServicedFaults() was called. */
+    FaultReq *faults = nullptr;
     /** Host-side image of the shared state, and its device copy. */
     VecHeader hdr;
     VecHeader *d_hdr = nullptr;

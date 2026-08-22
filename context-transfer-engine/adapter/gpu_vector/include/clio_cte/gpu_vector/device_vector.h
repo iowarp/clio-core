@@ -31,6 +31,32 @@ namespace clio::cte::gpu_vector {
  * Vector::GetDevice() and copied into the kernel as a plain argument.
  */
 /**
+ * One per block: what that block faulted on, and whether it has been served.
+ *
+ * THE POINT OF THIS STRUCT is that the kernel does not resolve its own fault.
+ * It records the page it needs and parks; the host servicer claims a slot,
+ * writes back a dirty victim, fetches, publishes the page, and only then
+ * clears `pending`. The kernel resumes with the page GUARANTEED resident, so
+ * there is no retry path on the device -- and, more importantly, none of the
+ * task-submission machinery that made the in-kernel fault path 19,400 of a
+ * hold's 20,000 instructions.
+ *
+ * Lives in pinned host memory: the device writes the request, the host reads
+ * it and writes the acknowledgement. Single writer per side, so ordinary
+ * volatile accesses with a system fence are sufficient -- no atomics, which
+ * this GPU cannot do on host memory anyway.
+ */
+struct FaultReq {
+  /** Page the block is waiting for. */
+  clio::run::u64 page_num;
+  /** Nonzero when the hold declared write intent. */
+  clio::run::u32 write;
+  /** 1 = the device needs this served; 0 = resident, resume. The wait tag a
+   *  parked block publishes is the address of THIS field. */
+  clio::run::u32 pending;
+};
+
+/**
  * Everything about a vector that is the SAME for every thread, kept in
  * GLOBAL memory next to the page table rather than inside the view.
  *
@@ -97,6 +123,9 @@ struct VecHeader {
    * so ids must be distinct in the fields that actually vary.
    */
   unsigned long long *task_seq_ = nullptr;
+  /** Per-block fault mailbox, `nblocks_` entries in pinned host memory.
+   *  Null when the vector is driven by the legacy in-kernel fault path. */
+  FaultReq *faults_ = nullptr;
   /**
    * Optional instrumentation, null unless Vector::EnableStats() is called.
    *
@@ -1947,6 +1976,47 @@ class DeviceVector {
    * eviction and FlushAsync write it back. A page held without the flag is
    * dropped clean no matter what was stored.
    */
+  /**
+   * SERVICED HOLD -- the target fault path (design.md Part II).
+   *
+   * On a miss the block does not resolve anything. It records the page it
+   * needs in its fault mailbox, parks, and re-probes on resume. The host
+   * servicer claims the slot, writes back a dirty victim, fetches, publishes
+   * the page and only then clears `pending`, so:
+   *
+   *   RULE 1: when this co_await returns, the page IS resident.
+   *   RULE 2: the only wait on the device is the park. No future, no spin.
+   *
+   * The loop below should therefore execute its body exactly once. It is a
+   * safety net against a servicer bug, not a retry protocol -- if it ever
+   * iterates twice, rule 1 has been violated and the servicer is wrong.
+   *
+   * Falls back to the legacy in-kernel path when no mailbox is installed, so
+   * both can coexist while this is proven out.
+   */
+  __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPageServiced(
+      clio::run::u64 off, clio::run::u64 count, bool write = false) {
+    clio::run::u64 run = TryHoldFast(off, count, write);
+    while (run == 0) {
+      volatile FaultReq *f = &h_->faults_[BlockIndex()];
+      if (threadIdx.x == 0) {
+        f->page_num = PageOf(off);
+        f->write = write ? 1u : 0u;
+        __threadfence_system();       // request visible before the doorbell
+        f->pending = 1u;
+        __threadfence_system();
+      }
+      __syncthreads();
+      co_await clio::run::gpu::YCoroSuspend{
+          reinterpret_cast<clio::run::u64>(
+              const_cast<clio::run::u32 *>(&f->pending))};
+      run = TryHoldFast(off, count, write);
+    }
+    Page *p = last_page_;
+    co_return Held<T>(p, static_cast<T *>(p->data) + IndexIn(off, p), off,
+                      run, /*pinned=*/h_->no_evict_ == 0u);
+  }
+
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPage(
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     clio::run::u64 run = TryHoldFast(off, count, write);
