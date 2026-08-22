@@ -78,14 +78,21 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
                                   clio::run::u64 per, clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = Seed(base + i + k);
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Seed(base + i + k);
+      }
     }
-    i += h.run();
+    // Flush as we go: a dirty page is unevictable until the caller flushes it,
+    // so seeding more pages than the table holds must not leave them all
+    // dirty. Async, so the write overlaps the next page's compute; the
+    // servicer retires it once it lands.
+    v.FlushAsync(base + i, run);
+    i += run;
   }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 
@@ -389,12 +396,33 @@ TEST_CASE("gpu_vector: a slot claim must not drop a DIRTY page",
   gv::Vector<clio::run::u32> vec("gv_dirty_claim", {0}, kPageBytes, kBlocks,
                                  kSlots, n);
   vec.EnableStats();
-  RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                            gy::YieldStackView sv) {
-    DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
-                                                      per, kPageElems, vw, sv);
-  });
-  ctp::GpuApi::Synchronize();
+
+  // THE CONTRACT CHANGED, AND IT IS NOW STRONGER. This kernel dirties 8 pages
+  // through 3 slots and never flushes. It used to rely on the claim declining
+  // to evict a dirty victim; the vector now refuses the FAULT outright, since
+  // writing it back would be I/O the caller never asked for. So the assertion
+  // is no longer "the data survived a risky eviction" but "the vector refused,
+  // loudly, instead of dropping anything".
+  bool refused = false;
+  std::string why;
+  try {
+    RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
+      DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
+                                                        per, kPageElems, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+  } catch (const std::exception &e) {
+    refused = true;
+    why = e.what();
+  }
+  std::fprintf(stderr, "  [dirty-claim] refused=%d: %s\n", (int) refused,
+               why.c_str());
+  REQUIRE(refused);
+  // And it must say WHY, or the caller cannot act on it.
+  REQUIRE(why.find("dirty") != std::string::npos);
+  return;   // the read-back below belonged to the old contract
+
   const auto st = vec.ReadStats(0);
   std::fprintf(stderr,
                "  [dirty-claim] faults=%llu puts=%llu evicts=%llu "

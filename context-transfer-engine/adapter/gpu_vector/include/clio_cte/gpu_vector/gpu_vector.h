@@ -15,6 +15,7 @@
 #ifndef CLIO_CTE_GPU_VECTOR_GPU_VECTOR_H_
 #define CLIO_CTE_GPU_VECTOR_GPU_VECTOR_H_
 
+#include <cstdio>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
@@ -286,6 +287,29 @@ class Vector {
         Page *dev_tbl = st.hdr.pages_ + static_cast<size_t>(b) * ppb;
         ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ppb * sizeof(Page));
 
+        // RETIRE LANDED FLUSHES FIRST. A frame the caller flushed is clean the
+        // moment its put completes, but nothing clears the flag while the
+        // block is parked -- the device reaper only runs inside a kernel. If
+        // the servicer did not do this, a kernel that flushes asynchronously
+        // (the overlap pattern: flush page N, compute page N+1) would find
+        // every frame stuck `flushing` forever and fault to a standstill.
+        //
+        // This is NOT implicit writeback: the caller asked for these writes.
+        // We are only observing that I/O they started has finished.
+        for (clio::run::u32 i = 0; i < ppb; ++i) {
+          Page &c = tbl[i];
+          if (c.flushing == 0u || c.put == nullptr) continue;
+          unsigned int done = 0;
+          ctp::GpuApi::Memcpy(
+              &done,
+              reinterpret_cast<const unsigned int *>(&c.put->fut_.is_complete_.x),
+              sizeof(done));
+          if ((done & 1u) != 0u) {
+            c.flushing = 0u;
+            c.dirty = 0u;     // the bytes are in the backing store now
+          }
+        }
+
         // Candidate frames are only this page's ways (d-left placement), so a
         // scan of the whole table would be both wrong and pointless.
         clio::run::u32 slot = ~0u;
@@ -300,10 +324,38 @@ class Vector {
           if (slot == ~0u || c.score < worst) { slot = i; worst = c.score; }
         }
         if (slot == ~0u) {
-          throw std::runtime_error(
-              "gpu_vector: cannot serve fault -- every candidate frame is "
-              "dirty, pinned or in flight. Flush before the dirty working set "
-              "fills the block's table, or size the table for it.");
+          // Say WHICH state blocked it. "every candidate is unusable" sends the
+          // reader guessing between three very different causes: unflushed
+          // writes (a caller error), leaked pins (a guard held too long), or
+          // in-flight I/O (a timing problem).
+          clio::run::u32 n_dirty = 0, n_pinned = 0, n_flushing = 0, n_fetching = 0;
+          char detail[512];
+          int off2 = 0;
+          for (clio::run::u32 w = 0; w < nways; ++w) {
+            const clio::run::u32 i = DeviceVector<T>::WaySlot(pg, w, ppb);
+            const Page &c = tbl[i];
+            if (c.dirty) ++n_dirty;
+            if (c.pins) ++n_pinned;
+            if (c.flushing) ++n_flushing;
+            if (c.fetching) ++n_fetching;
+            if (off2 < 400) {
+              off2 += std::snprintf(detail + off2, sizeof(detail) - off2,
+                                    " [way%u slot%u pg=%lld d=%u p=%u fl=%u fe=%u]",
+                                    w, i, (long long) c.page_num, c.dirty,
+                                    c.pins, c.flushing, c.fetching);
+            }
+          }
+          char msg[900];
+          std::snprintf(msg, sizeof(msg),
+                        "gpu_vector: cannot serve fault for page %llu on block "
+                        "%u -- all %u candidate frames unusable (dirty=%u "
+                        "pinned=%u flushing=%u fetching=%u).%s\n"
+                        "  dirty: the vector never writes back on its own; flush "
+                        "before the dirty set fills the table.\n"
+                        "  pinned: a Held guard outlived the hold that needed it.",
+                        (unsigned long long) pg, b, nways, n_dirty, n_pinned,
+                        n_flushing, n_fetching, detail);
+          throw std::runtime_error(msg);
         }
 
         Page &p = tbl[slot];
