@@ -67,8 +67,10 @@ Two further GPU-specific mismatches the standard lowering does not model:
 **Non-goals**
 
 - Host coroutines -- untouched, this is device-only.
-- Recursion or dynamically-typed chains. If a chain is not statically
-  resolvable the pass **errors**; it does not fall back to indirect dispatch.
+- Dynamically-dispatched chains. If the reachable coroutine set is not
+  statically resolvable the pass **errors**; it never falls back to indirect
+  dispatch, because a silent fallback restores the full register cost with no
+  visible symptom.
 - Symmetric transfer / arbitrary `await_suspend` returning a handle.
 - Exceptions (already unavailable on device).
 
@@ -108,9 +110,15 @@ For each kernel that transitively reaches a coroutine:
 
 **4.1 Build the chain graph.** Walk direct calls from the kernel; collect
 reachable coroutines. Every edge must be a direct call. Error with a source
-location on: recursion, a call through a pointer, or a coroutine reached from
-two kernels with incompatible frame layouts (the latter is legal, just needs
-per-kernel cloning -- see 4.6).
+location when the set cannot be closed: a resume through a pointer, a handle
+escaping to a function whose body is not visible, or a coroutine whose
+definition is not in this TU (see 5.4 on why that does not happen with
+header-defined templates).
+
+Note that a **cycle** in the coroutine graph is NOT a problem for the switch:
+the reachable *set* stays finite even when the depth does not, so the switch is
+still complete. Cycles bound frame depth, not the candidate set, and are
+therefore handled by the frame-budget check (C3) rather than here.
 
 **4.2 Number the states.** Assign each `(coroutine, suspend point)` pair a
 dense integer ID, unique **within the kernel**. IDs are per-kernel so a kernel
@@ -165,9 +173,87 @@ us a debugging session:
   only under block-uniform conditions) and error otherwise.
 - **C3. Frame budget.** The lane region is fixed. Summing max chain depth x
   frame size gives a compile-time bound; overflow becomes a build error instead
-  of a runtime corruption.
+  of a runtime corruption. This is also where a **cycle** in the coroutine
+  graph is handled: a cycle leaves the candidate set finite (so the switch is
+  unaffected, 4.1) but makes depth unbounded, so a cycle without a
+  statically-provable depth bound is rejected here.
 
 C1 and C2 are arguably worth more than the register win.
+
+---
+
+## 5.4 What kernels this supports (the envelope)
+
+The lowering rewrites only the resume dispatch. **Kernel bodies are untouched**
+-- arbitrary control flow, shared memory, atomics, arbitrary `co_await` nesting
+depth. There is no constraint on what a kernel computes. The single requirement
+is that the set of coroutines a kernel can reach be **visible at compile time**.
+
+| Supported | Rejected (compile error, with source location) |
+|---|---|
+| Arbitrary kernel logic and control flow | Resuming a handle fetched from a data structure at runtime |
+| Deep `co_await` nesting (chains) | Resuming through a function pointer or virtual dispatch |
+| **Templated coroutines** -- see below | A handle escaping into a body the pass cannot see |
+| Cycles in the coroutine graph (finite set; C3 bounds depth) | A coroutine only *declared* in this TU |
+| Many distinct coroutines -- measured to 16 cases, see 5.5 | |
+
+### Templated coroutines are a first-class supported case
+
+They already work, and this tree already depends on it. The 18 resume symbols
+in the current device PTX include **two instantiations of the same template**:
+
+```
+clio::cte::gpu_vector::DeviceVector<float>::HoldPageCoro_$_resume
+clio::cte::gpu_vector::DeviceVector<int>::HoldPageCoro_$_resume
+```
+
+By the time the pass runs **there are no templates left**. Instantiation
+happens in the front end; the pass sees ordinary concrete functions with
+mangled names, so each instantiation is simply one more switch case. Nothing
+about templates is special to the lowering.
+
+This also scales without maintenance: adding `DeviceVector<double>` produces a
+new instantiation that the reachability walk finds on its own. There is no
+registration list to keep in sync.
+
+**The requirement templates impose: definitions must be visible in the TU that
+uses them.** A coroutine template instantiated in another TU and only declared
+here could not be proven complete, and the pass would (correctly) error. This
+does not arise in practice here because `HoldPageCoro`, `EnterHoldSet` and
+`AwaitFlush` are **header-defined** in `device_vector.h`, so every
+instantiation lands in the same TU as the kernel using it. The complete-switch
+requirement is satisfiable by construction -- but it is a real constraint and
+must be documented for consumers, not assumed.
+
+### The cost model to design against
+
+Registers become **max over what the kernel can reach** -- not over the module
+(today's behaviour), and not over what it happens to execute on a given run. A
+kernel touching both a `float` and an `int` vector reaches both `HoldPageCoro`
+instantiations and pays the larger.
+
+The practical consequence is that the tuning knob changes character: from "cap
+the registers" (a number nobody can set correctly, since block size is a
+runtime flag) to "**do not pull a heavy coroutine into a light kernel's
+reachable set**" -- a design property visible in the source and under the
+author's control.
+
+## 5.5 Switch scaling: measured, not assumed
+
+The obvious failure mode is that a large switch gets lowered back into a
+function-pointer table -- reintroducing the indirect call and the whole bug.
+Measured at 16 cases of direct calls to distinct `__noinline__ ` functions
+(`scratchpad/bigswitch.cu`, sm_89):
+
+| metric | result |
+|---|---|
+| `callprototype` (indirect call sites) | **0** -- stayed direct |
+| `brx.idx` (jump table) | 1 |
+| kernel registers | 18 |
+
+The switch does get a jump table, but that is a branch among **known labels**,
+not an indirect call, so it does not trigger the callee-set conservatism. V1
+guards this permanently by failing the build on any surviving indirect call.
 
 ---
 
