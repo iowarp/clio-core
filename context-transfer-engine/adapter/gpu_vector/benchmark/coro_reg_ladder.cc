@@ -138,3 +138,25 @@ __global__ void R6_FastOnly(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(FastOnlyCoro(dst));
 }
 #endif
+
+#if RUNG == 7
+// R7: NO COROUTINE ANYWHERE. A plain __global__ that does the page lookup via
+// the non-coroutine fast path and then uses the page. This is what
+// "HoldPage without co_await" would cost. If R7 is cheap, the problem is the
+// coroutine; if R7 is expensive, the problem is the page lookup itself.
+__global__ void R7_NoCoroHold(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<float> dst) {
+  CLIO_GPU_INIT(info, nullptr);
+  dst.block_override_ = 0;
+  __syncthreads();
+  const u64 epp = dst.h_->elems_per_page_;
+  const u64 run = dst.TryHoldFast(0, epp, /*write=*/true);
+  if (run != 0) {
+    float *const p = static_cast<float *>(dst.last_page_->data);
+    const u64 nslots = epp / kStride;
+    for (u64 s = threadIdx.x; s < nslots; s += blockDim.x)
+      p[s * kStride + 3] = -1.0f;
+    __syncthreads();
+  }
+}
+#endif

@@ -22,7 +22,63 @@ Each rung adds exactly one ingredient to the one below it.
 
 ## 2. The answer
 
-**Coroutines are not the problem. They cost 6 registers.**
+**An EMPTY coroutine costs 6 registers. A coroutine that HOLDS LIVE STATE
+ACROSS A SUSPEND costs far more -- and `HoldPage` is one on every call,
+including the resident hits that never suspend.**
+
+The decisive rung (R7): the *identical* page lookup, done from a plain
+`__global__` with no coroutine anywhere, costs **40 registers**. Wrapped in a
+coroutine (R6) the same lookup costs **72**. Adding the miss path (R4) reaches
+**106**.
+
+| what | REG |
+|---|---|
+| raw pointer loop | 14 |
+| + runtime init | 22 |
+| **page lookup + use, NO coroutine (R7)** | **40** |
+| same lookup inside a coroutine (R6) | 72 |
+| + the coroutine miss path (R4) | 106 |
+
+So `co_await` as a concept is not the problem, and neither is the lowering.
+The problem is that `HoldPage` is a coroutine **on the hit path**: it
+constructs a frame, runs the promise machinery and carries the inflated
+cross-suspend live set even when the page is resident and it never suspends.
+Values that could have stayed in registers and returned must instead survive
+a frame round-trip.
+
+**If HoldPage were not a coroutine on the hit path, this would be ~40, not
+~106.**
+
+### The fix is half-built already
+
+`TryHoldFast` is *already* a plain, non-suspending function; only
+`HoldPageCoro` can suspend. But the wrapper is a coroutine, so every resident
+hit pays anyway:
+
+```cpp
+YCoroTaskT<Held<T>> HoldPage(off, count, write) {   // a coroutine, ALWAYS
+  u64 run = TryHoldFast(off, count, write);         // plain, cannot suspend
+  if (run == 0) co_await HoldPageCoro(...);         // only this suspends
+```
+
+Splitting it at the call site so `co_await` appears only on a real miss:
+
+```cpp
+auto h = vec.TryHold(off, count, write);                    // no coroutine
+if (!h) h = co_await vec.HoldPageSlow(off, count, write);   // only on a miss
+```
+
+This is the same defect, with the same cure, that `TryHoldFast`'s own comment
+already records for LATENCY: `co_await HoldPageCoro(...)` costs ~31,000 cycles
+on a resident hit because every thread in the block builds a frame -- ~16 ms of
+a 65 ms kernel. Registers and latency have one root cause here.
+
+### The older claim, corrected
+
+An earlier revision of this document said "coroutines are not the problem, they
+cost 6 registers" and attributed all 78 to paging. The 6 is right only for an
+EMPTY coroutine. R7 shows the split is roughly 18 for the lookup itself and 32
+for doing it inside a coroutine.
 
 The paging machinery costs 78, and it splits almost evenly:
 
