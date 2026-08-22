@@ -2557,6 +2557,11 @@ class DeviceVector {
 
  private:
   /** Per-thread cache of the last page touched. NOT __shared__. */
+  /** BlockIndex() memo -- see the comment there. `mutable` because the
+   *  accessor is const and this is a pure cache of a pure function. */
+  mutable clio::run::u32 bi_raw_ = 0;
+  mutable clio::run::u32 bi_val_ = 0;
+  mutable bool bi_valid_ = false;
   Page *last_page_ = nullptr;
   /** Page number last_page_ was holding when it was cached, so PinHeld can
    *  detect a sibling block re-tenanting the slot in a SHARED shard cache. */
@@ -2675,9 +2680,25 @@ class DeviceVector {
   }
 
   CTP_GPU_FUN clio::run::u32 BlockIndex() const {
+    // CACHED. The modulo is the point: a GPU has no integer divide, so
+    // `raw % nblocks_` is a software sequence, and this accessor is reached
+    // from BlockPages(), Find(), Ways() and most other helpers -- measured at
+    // ~350 invocations inside a SINGLE HoldPage, 700 PTX instructions of
+    // nothing but re-deriving a value that cannot change within a block.
+    //
+    // Keyed on `raw`, not computed once, because `block_override_` is public
+    // and kernels assign it AFTER construction (`dst.block_override_ = 0;`).
+    // A cache that ignored that would silently serve another block's table --
+    // the same class of bug as the stale-slot page corruption. Keying on the
+    // input makes a changed override recompute by construction.
     const clio::run::u32 raw =
         block_override_ != kNoBlockOverride ? block_override_ : blockIdx.x;
-    return raw % h_->nblocks_;
+    if (!bi_valid_ || raw != bi_raw_) {
+      bi_raw_ = raw;
+      bi_val_ = raw % h_->nblocks_;
+      bi_valid_ = true;
+    }
+    return bi_val_;
   }
 
  public:
