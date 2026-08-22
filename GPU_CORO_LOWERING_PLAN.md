@@ -334,3 +334,79 @@ register problem. M2-M4 -- "our own coroutine system" -- is justified by the
 divergent-suspend bugs have each cost real debugging time and are invisible to
 the stock lowering. That is the argument for building it, and it should be
 made on those grounds rather than on performance.
+
+---
+
+# 13. M1 RESULT -- devirtualization works, and does NOT fix the register problem
+
+Run 2026-08-22. `tools/coro_regcap/CoroDevirt.cpp`, measured on the real MD TU.
+
+## 13.1 What worked
+
+**All indirect calls are gone: 63 -> 0.** The reachability analysis is correct
+and genuinely per-kernel -- the candidate sets differ exactly as the design
+predicted:
+
+| kernel | candidates |
+|---|---|
+| Sentinel, Thermo, Force, Rebin, MDIntegrate, ReadProbe, Integrate | 6 |
+| Gather | 8 |
+| ListForce, BuildList | 14 (they pull in `EnterHoldSet` and the `DeviceVector<int>` instantiations) |
+
+Two implementation lessons, both measured:
+
+- **Rewriting only kernel bodies changes nothing.** The first version filtered
+  on `PTX_Kernel` and rewrote 22 top-level resume sites: not one register
+  saved, because the nested resumes live *inside* the coroutine bodies
+  (`HoldPageCoro.resume` resuming its child). The pass must rewrite every
+  function, not just kernels.
+- **Devirtualizing without re-inlining changes nothing.** The pass runs at
+  `OptimizerLast`, after the inliner, so the now-direct calls had already
+  missed their chance. An inliner + SROA/InstCombine/SimplifyCFG must follow.
+
+## 13.2 What failed: the exit criterion
+
+**`SentinelKernel` still reports the same registers as `ListForceKernel`.**
+All eleven coroutine kernels: 122 before, **130 after** -- identical to each
+other, and slightly worse.
+
+## 13.3 Why -- and it invalidates the premise
+
+The kernels do not report identical counts *only* because of an inflated
+candidate set. They report identical counts because **they genuinely all inline
+the same dominant code**: every one of them awaits `HoldPage`/`HoldPageCoro`,
+and that paging machinery -- not the per-kernel workload -- is what costs ~130
+registers. `SentinelCoro` is one line, but the `HoldPage` chain it awaits is
+not, and after devirtualization that chain is inlined into it.
+
+So the "all kernels identical" signature, which section 11 read as proof of the
+bug and section 12.3 adopted as the acceptance test, is **not diagnostic**. It
+is equally consistent with the kernels honestly sharing their dominant cost.
+The indirect call was real and is now fixed; it was not what set the register
+count.
+
+## 13.4 The premise that remains unresolved
+
+Registers rose to 130 once nothing constrained the allocator, yet capping at 64
+compiles **spill-free** (`LOCAL:0`, +1.4% instructions) and runs at the same
+speed. Both cannot be "the exact requirement". What ptxas picks unconstrained
+is not a minimum -- it is a greedy choice made when no occupancy target is
+stated, which is precisely the information a GPU cannot infer at compile time
+because block size is a runtime value.
+
+That is the real conclusion of M1, and it is a negative one for the framing of
+this whole plan: **"exact register usage" is not well defined for these kernels
+without an occupancy target.** The uniform 130 is honest, the cap of 64 is also
+honest, and choosing between them is an occupancy decision, not a compilation
+fact.
+
+## 13.5 Status of the milestones
+
+- M1: **done, and negative.** The pass is correct and worth keeping (0 indirect
+  calls is a real property, and it is a prerequisite for any per-kernel
+  allocation) but it does not deliver per-kernel differentiation.
+- M2-M4: the register argument for them is **withdrawn**. The safety argument
+  (C1 shared memory across a suspend, C2 divergent suspends, C3 frame budget)
+  is untouched and is now the only justification for building them.
+- Section 12.3's acceptance test must be replaced: kernel-count inequality
+  tests nothing.
