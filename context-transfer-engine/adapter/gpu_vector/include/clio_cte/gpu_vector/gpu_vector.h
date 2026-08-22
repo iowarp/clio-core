@@ -1020,9 +1020,19 @@ class Vector {
       for (clio::run::u64 q = lo; q < hi; ++q) {
         char name[32];
         PageBlobName(q, name);
+        // CARRY THE CODEC. A get with an empty context returns the bytes as
+        // stored, i.e. still compressed -- the device get sets exactly this
+        // and says so in its own comment. Missing it here is invisible on
+        // incompressible data (the codec left those pages alone) and silently
+        // corrupts everything the codec actually shrank, which is why only the
+        // GNN tests, with real float features, caught it.
+        clio::cte::core::Context gctx;
+        gctx.compress_lib_ = compress_lib_;
+        gctx.compress_preset_ = compress_preset_;
         futs.push_back(core.AsyncGetBlob(
             tag_id_, std::string(name), 0, page_bytes_, 0u,
-            bufs[static_cast<size_t>(q - lo)].data()));
+            bufs[static_cast<size_t>(q - lo)].data(),
+            clio::run::PoolQuery::Dynamic(), gctx));
       }
       for (clio::run::u64 q = lo; q < hi; ++q) {
         auto &fut = futs[static_cast<size_t>(q - lo)];
