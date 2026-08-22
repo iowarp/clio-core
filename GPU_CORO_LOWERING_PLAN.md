@@ -1,8 +1,8 @@
-# Plan: a GPU-native coroutine lowering (LLVM plugin) for CUDA and ROCm
+# Plan: a GPU-native coroutine lowering (LLVM plugin) for CUDA
 
 **Status:** proposed
 **Motivation:** `CORO_REGISTER_EXACTNESS_PLAN.md` section 11 (verified Phase 0)
-**Targets:** NVPTX (sm_80+) and AMDGPU
+**Target:** NVPTX (sm_80+). AMDGPU is explicitly out of scope.
 **Vehicle:** an LLVM pass plugin (`-fpass-plugin=`), the same delivery mechanism
 already wired into this tree
 
@@ -61,12 +61,14 @@ Two further GPU-specific mismatches the standard lowering does not model:
   no ceiling, no `maxnreg`, no assumed block size.
 - G3. **Keep `co_await` syntax.** Reuse clang's coroutine front end; replace
   only the lowering. No source churn across gpu_vector, eternia, LBANN.
-- G4. **Target-portable**: one IR-level lowering for NVPTX and AMDGPU.
-- G5. **Statically bounded chains** verified at compile time.
+- G4. **Statically bounded chains** verified at compile time.
 
 **Non-goals**
 
 - Host coroutines -- untouched, this is device-only.
+- **AMDGPU / ROCm.** Out of scope by decision, not by difficulty. The
+  lowering is plain IR and would likely port, but nothing here is measured on
+  AMDGPU and no ROCm claim is made.
 - Dynamically-dispatched chains. If the reachable coroutine set is not
   statically resolvable the pass **errors**; it never falls back to indirect
   dispatch, because a silent fallback restores the full register cost with no
@@ -91,7 +93,7 @@ clang parse/sema  ->  presplitcoroutine functions in IR
                           |
               strip presplitcoroutine attribute
                           |
-     rest of the LLVM pipeline (inlining, codegen)  -> PTX / GCN
+     rest of the LLVM pipeline (inlining, codegen)  ->  PTX
 ```
 
 The existing plugin already proves the hook point works: it finds
@@ -257,25 +259,20 @@ guards this permanently by failing the build on any surviving indirect call.
 
 ---
 
-## 6. Targets
+## 6. Target
 
-**NVPTX** is the reference target: all Phase 0 evidence is ptxas.
+**NVPTX only.** All Phase 0 evidence is ptxas (sm_89), and every claim in this
+plan is measured there.
 
-**AMDGPU is unverified.** The register-pressure story is *assumed* to be
-analogous (AMDGPU also allocates conservatively around indirect calls) but this
-has not been measured. **M0 measures it before any ROCm claim is made.** The
-lowering itself is target-independent -- it is plain IR -- so if AMDGPU does
-not have the problem, the pass is still correct there, just not a win.
+AMDGPU is out of scope. The lowering itself is target-independent -- it is
+plain IR before codegen -- so a future port is not precluded, but no AMDGPU
+measurement exists and none is implied.
 
 ---
 
 ## 7. Milestones
 
 Each milestone is independently shippable and independently revertible.
-
-**M0 -- Evidence (0.5 day).**
-Reproduce the Phase 0 indirect-call experiment on AMDGPU. Deliverable: the same
-three-row table for `amdgcn`. Decides whether G4 is a real goal or NVPTX-only.
 
 **M1 -- Devirtualize, no new lowering (2-3 days). THE BIG WIN, CHEAPLY.**
 Keep CoroSplit. Add a pass that runs *after* it, computes each kernel's
@@ -288,7 +285,7 @@ switch over direct calls. Settles 4.7 by measuring both discriminators.
   building.** Decide there, with numbers.
 
 **M2 -- Custom lowering behind a flag (2-3 weeks).**
-Implement sections 4.1-4.6 as a real lowering, opt-in per target, with the
+Implement sections 4.1-4.6 as a real lowering, behind an opt-in flag, with the
 stock path still available. Golden test: bit-identical results to the stock
 lowering on the full gpu_vector suite.
 
@@ -299,14 +296,12 @@ that is *supposed* to fail to compile.
 Delete the cap machinery (`tools/coro_regcap`, `ClioCoroRegCap.cmake`,
 `MD_MAXRREG`, eternia's `Cap = 128`) -- Phase 2 of the other plan.
 
-**M5 -- ROCm (scoped only if M0 says yes).**
-
 ---
 
 ## 8. Verification
 
-- **V1.** No indirect calls in device code: scan the emitted PTX/GCN for
-  `callprototype` / equivalent. A build-failing check, not a report.
+- **V1.** No indirect calls in device code: scan the emitted PTX for
+  `callprototype`. A build-failing check, not a report.
 - **V2.** Per-kernel register counts differ across kernels of differing
   complexity. The all-identical signature is the bug and must not return.
 - **V3.** Physics gates digit-identical: MD statics/resort/NVE at lattice 100
@@ -327,7 +322,6 @@ Delete the cap machinery (`tools/coro_regcap`, `ClioCoroRegCap.cmake`,
 | Discriminator by pointer comparison re-escapes addresses | measured in M1 before design commits (4.7) |
 | Losing inlining across the switch | V4 measures ms/step, not registers |
 | LLVM version churn (plugin ABI, `presplitcoroutine`) | pin llvm-22; the plugin already vendors the PassPlugin struct |
-| AMDGPU may not share the problem | M0 gates the ROCm claim |
 | Complete-switch requirement violated silently | V1 fails the build if any indirect call survives |
 
 ---
