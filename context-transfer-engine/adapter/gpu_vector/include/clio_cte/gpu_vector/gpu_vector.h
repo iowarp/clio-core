@@ -209,33 +209,6 @@ class Vector {
   }
 
   /**
-   * Install the per-block fault mailbox and switch the vector to SERVICED
-   * faults (design.md Part II): the kernel records a fault and parks, and
-   * this class resolves it.
-   *
-   * Pinned host memory so the device can write the request and the host can
-   * read it without a copy. One writer per side, so plain volatile access
-   * plus the device's system fence is sufficient.
-   */
-  void EnableServicedFaults() {
-#if CTP_ENABLE_CUDA
-    for (auto &kv : devs_) {
-      DevState &st = kv.second;
-      if (st.faults != nullptr) continue;
-      const size_t bytes = sizeof(FaultReq) * nblocks_;
-      st.faults = reinterpret_cast<FaultReq *>(
-          ctp::GpuApi::MallocHost<char>(bytes));
-      if (st.faults == nullptr) {
-        throw std::runtime_error("gpu_vector: fault mailbox allocation failed");
-      }
-      std::memset(st.faults, 0, bytes);
-      st.hdr.faults_ = st.faults;
-      PublishHeader(st);
-    }
-#endif
-  }
-
-  /**
    * Resolve every outstanding fault. Call from the yield driver's service
    * callback, i.e. between kernel rounds, while no kernel is resident.
    *
@@ -244,34 +217,90 @@ class Vector {
    *
    * @return how many faults were served this round.
    */
+  /**
+   * Resolve every outstanding fault. Called from the yield driver's service
+   * callback -- between kernel rounds, while no kernel is resident.
+   *
+   * MANDATORY placement, unlike Prefetch: a parked block cannot proceed
+   * without this exact page, so this will displace a resident page to make
+   * room. It will only ever displace a CLEAN one.
+   *
+   *   - A clean frame's bytes are already in the backing store, so dropping it
+   *     costs nothing and loses nothing. Eviction is a scan and a pointer swap:
+   *     no I/O, nothing to wait for.
+   *   - A DIRTY frame is never taken. The vector does not write back on its
+   *     own; flushing is the caller's explicit operation. If every candidate
+   *     frame is dirty the fault CANNOT be served without silently writing out
+   *     data nobody asked to write, so this fails loudly instead.
+   *
+   * Publishes `page_num` last and clears `pending` only after the bytes are in
+   * place, which is what lets the device side have no retry path.
+   *
+   * @return faults served this round.
+   * @throws std::runtime_error if a block's dirty working set fills its table.
+   */
   clio::run::u32 ServiceFaults() {
     clio::run::u32 served = 0;
 #if CTP_ENABLE_CUDA
+    const clio::run::u32 ppb = pages_per_block_;
+    const clio::run::u32 nways = DeviceVector<T>::Ways(ppb);
     for (auto &kv : devs_) {
       DevState &st = kv.second;
       if (st.faults == nullptr) continue;
+      std::vector<Page> tbl(ppb);
       for (clio::run::u32 b = 0; b < nblocks_; ++b) {
         volatile FaultReq *f = &st.faults[b];
         if (f->pending == 0u) continue;
         const clio::run::u64 pg = f->page_num;
-        // Place the page into THIS block's table. Prefetch already claims a
-        // slot, evicts and writes back a dirty victim, and fetches -- the
-        // whole miss path, host-side, where it costs no registers.
-        // PLACEHOLDER -- THE WRONG PRIMITIVE ON PURPOSE, PENDING THE RIGHT ONE.
-        //
-        // Prefetch is ADVISORY: it fills free slots and correctly refuses to
-        // evict, because discarding a page in use to make room for one nobody
-        // asked for yet would be wrong. Fault servicing is MANDATORY -- a
-        // parked block cannot proceed without this exact page -- so it must be
-        // willing to displace something.
-        //
-        // Consequence, measured: with a full table this places nothing (the
-        // page is absent from the device table afterwards even though the
-        // bytes were fetched) and the block re-faults forever. See design.md
-        // section 15; the fix is a claim-with-eviction, not a change to
-        // Prefetch.
-        Prefetch(pg, pg + 1, b, b + 1);
-        f->pending = 0u;   // rule 1: only after the page is really there
+        Page *dev_tbl = st.hdr.pages_ + static_cast<size_t>(b) * ppb;
+        ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ppb * sizeof(Page));
+
+        // Candidate frames are only this page's ways (d-left placement), so a
+        // scan of the whole table would be both wrong and pointless.
+        clio::run::u32 slot = ~0u;
+        float worst = 0.0f;
+        for (clio::run::u32 w = 0; w < nways; ++w) {
+          const clio::run::u32 i = DeviceVector<T>::WaySlot(pg, w, ppb);
+          Page &c = tbl[i];
+          if (c.page_num == pg) { slot = i; break; }   // already there
+          if (c.pins != 0 || c.fetching || c.flushing) continue;
+          if (c.page_num == kNoPage) { slot = i; break; }   // free: take it
+          if (c.dirty) continue;                            // never evict dirty
+          if (slot == ~0u || c.score < worst) { slot = i; worst = c.score; }
+        }
+        if (slot == ~0u) {
+          throw std::runtime_error(
+              "gpu_vector: cannot serve fault -- every candidate frame is "
+              "dirty, pinned or in flight. Flush before the dirty working set "
+              "fills the block's table, or size the table for it.");
+        }
+
+        Page &p = tbl[slot];
+        // Fetch the page's bytes, or zero the frame when it has no blob yet
+        // (a first touch: nothing was ever written, so empty IS the content).
+        bool filled = false;
+        DownloadPages(pg, pg + 1, [&](clio::run::u64, const char *bytes) {
+          ctp::GpuApi::Memcpy(static_cast<char *>(p.data), bytes, page_bytes_);
+          filled = true;
+        });
+        if (!filled) {
+          ctp::GpuApi::Memset(static_cast<char *>(p.data), 0, page_bytes_);
+        }
+        p.page_num = pg;
+        p.score = 1.0f;
+        p.user_score = 0.0f;
+        p.has_user = 0;
+        p.last_access = 0;
+        p.pins = 0;
+        p.dirty = 0;
+        p.flushing = 0;
+        p.fetching = 0;
+        p.evicting = 0;
+        p.rescoring = 0;
+        ++p.gen;
+        ctp::GpuApi::Memcpy(dev_tbl, tbl.data(), ppb * sizeof(Page));
+
+        f->pending = 0u;   // only now: the page is resident and readable
         ++served;
       }
     }
@@ -894,8 +923,8 @@ class Vector {
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
-    /** Per-block fault mailbox (pinned host memory); null unless
-     *  EnableServicedFaults() was called. */
+    /** Per-block fault mailbox, pinned host memory, one entry per block.
+     *  Always allocated: HoldPage has no other miss path. */
     FaultReq *faults = nullptr;
     /** Host-side image of the shared state, and its device copy. */
     VecHeader hdr;
@@ -1156,6 +1185,20 @@ class Vector {
     v.task_seq_ = static_cast<unsigned long long *>(seq);
     v.tag_id_ = tag_id_;
     v.pages_ = reinterpret_cast<Page *>(st.table_base);
+    // The fault mailbox is not optional: HoldPage's only miss path records a
+    // fault here and parks, so a vector without one cannot serve a fault at
+    // all. Pinned host memory -- device writes the request, host writes the
+    // acknowledgement, one writer per side.
+    if (st.faults == nullptr) {
+      const size_t fbytes = sizeof(FaultReq) * nblocks_;
+      st.faults =
+          reinterpret_cast<FaultReq *>(ctp::GpuApi::MallocHost<char>(fbytes));
+      if (st.faults == nullptr) {
+        throw std::runtime_error("gpu_vector: fault mailbox allocation failed");
+      }
+      std::memset(st.faults, 0, fbytes);
+    }
+    v.faults_ = st.faults;
     v.nblocks_ = nblocks_;
     v.pages_per_block_ = pages_per_block_;
     v.page_bytes_ = page_bytes_;

@@ -41,8 +41,9 @@ namespace gy = clio::run::gpu;
  * once but re-launched until no block is left suspended, with a fresh
  * continuation stack backing the blocks' saved state.
  */
-template <typename LaunchT>
-static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+template <typename VecT, typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, VecT &vec,
+                                   LaunchT &&launch) {
   gy::Yieldable<> drv(nblocks, 32);
   // 8192, not the macro-era 256: coroutine frames are compiler-laid-out and
   // spill into the lane, overflowing anything page-thin.
@@ -51,7 +52,20 @@ static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      [] {}, /*max_rounds=*/200000);
+      // SERVICE THE FAULTS. A kernel records the page it needs and parks; this
+      // runs between rounds, while no kernel is resident, and makes the page
+      // resident before the next launch. Without it nothing ever clears a
+      // fault and the run spins to the round cap.
+      [&] { vec.ServiceFaults(); }, /*max_rounds=*/200000);
+  // CONVERGENCE IS PART OF THE RESULT, not just the data. A servicer that
+  // never makes progress still returns correct bytes for pages that happened
+  // to be resident, so a data-only check can pass while livelocked -- observed
+  // exactly that at 200,000 rounds.
+  if (rounds >= 200000) {
+    std::fprintf(stderr, "[gv] FATAL: hit the round cap -- faults are not "
+                         "being served\n");
+    std::abort();
+  }
   return rounds;
 }
 
@@ -78,17 +92,24 @@ constexpr clio::run::u64 kElems = 4096;          // 4 pages
 __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
                                   clio::run::u64 n) {
   for (clio::run::u64 i = 0; i < n;) {
-    auto h = co_await v.HoldPage(i, n - i, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[i + k] = static_cast<clio::run::u32>((i + k) * 7 + 1);
-    }
-    i += h.run();
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(i, n - i, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[i + k] = static_cast<clio::run::u32>((i + k) * 7 + 1);
+      }
+    }   // guard dies here: the page is unpinned but still DIRTY
+    // FLUSH AS WE GO. The vector never writes back on its own, so a dirty page
+    // is unevictable until the caller flushes it. Writing more pages than the
+    // table holds without flushing is a caller error, and the servicer says so
+    // rather than silently writing data out. Flushing per page keeps the dirty
+    // set at one.
+    v.FlushAsync(i, run);
+    co_await v.AwaitFlush();
+    i += run;
   }
-  // SubmitPut clears `dirty` as it submits, so a lane still writing when the
-  // flush submits would lose its writes AND leave the page looking clean.
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(0, n);
-  co_await v.AwaitFlush();
+  // Every page was flushed as it was written; nothing is left dirty.
 }
 
 __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
@@ -144,15 +165,21 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
                                        clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = static_cast<clio::run::u32>((base + i + k) * 7 + 1);
-    }
-    i += h.run();
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = static_cast<clio::run::u32>((base + i + k) * 7 + 1);
+      }
+    }   // guard dies: unpinned, still dirty
+    // Flush as we go -- see FillCoro. With 2 slots per block this vector is
+    // oversubscribed, so leaving pages dirty would fill the table and the
+    // fault could not be served without a writeback nobody asked for.
+    v.FlushAsync(base + i, run);
+    co_await v.AwaitFlush();
+    i += run;
   }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
-  co_await v.AwaitFlush();
 }
 
 __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
@@ -249,7 +276,7 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   gv::Vector<clio::run::u32> vec("gv_smoke", {0}, kPageBytes,
                                  /*nblocks=*/1, /*pages_per_block=*/4, kElems);
 
-  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+  RunYieldable(1, vec, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, vw, sv); });
   ctp::GpuApi::Synchronize();
 
@@ -257,7 +284,7 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   d_bad = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_bad)>>(sizeof(unsigned long long));
   ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
 
-  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+  RunYieldable(1, vec, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), kElems, d_bad, vw, sv); });
   ctp::GpuApi::Synchronize();
 
@@ -282,14 +309,14 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     gv::Vector<clio::run::u32> big("gv_evict", {0}, kPageBytes,
                                    /*nblocks=*/1, /*pages_per_block=*/4, n);
 
-    RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(1, big, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, vw, sv); });
     ctp::GpuApi::Synchronize();
 
     unsigned long long *d2 = nullptr;
     d2 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d2)>>(sizeof(unsigned long long));
     ctp::GpuApi::Memset(d2, 0, sizeof(unsigned long long));
-    RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(1, big, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, big.GetDevice(0), n, d2, vw, sv); });
     ctp::GpuApi::Synchronize();
 
@@ -320,14 +347,14 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
                                   kPageBytes, /*nblocks=*/nb,
                                   /*pages_per_block=*/2, n);
 
-    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(nb, mv, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, vw, sv); });
     ctp::GpuApi::Synchronize();
 
     unsigned long long *d3 = nullptr;
     d3 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d3)>>(sizeof(unsigned long long));
     ctp::GpuApi::Memset(d3, 0, sizeof(unsigned long long));
-    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(nb, mv, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, d3, vw, sv); });
     ctp::GpuApi::Synchronize();
 
@@ -373,14 +400,14 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     const clio::run::u64 n = per * nb;
     gv::Vector<clio::run::u32> ov("gv_multi_ov", {0}, kPageBytes, nb,
                                   /*pages_per_block=*/2, n);
-    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(nb, ov, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, vw, sv); });
     ctp::GpuApi::Synchronize();
 
     unsigned long long *d4 = nullptr;
     d4 = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d4)>>(sizeof(unsigned long long));
     ctp::GpuApi::Memset(d4, 0, sizeof(unsigned long long));
-    RunYieldable(nb, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    RunYieldable(nb, ov, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiCheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, d4, vw, sv); });
     ctp::GpuApi::Synchronize();
     unsigned long long b4 = 1;

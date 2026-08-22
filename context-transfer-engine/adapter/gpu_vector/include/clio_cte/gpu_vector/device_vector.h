@@ -1976,33 +1976,23 @@ class DeviceVector {
    * eviction and FlushAsync write it back. A page held without the flag is
    * dropped clean no matter what was stored.
    */
-  /**
-   * SERVICED HOLD -- the target fault path (design.md Part II).
-   *
-   * On a miss the block does not resolve anything. It records the page it
-   * needs in its fault mailbox, parks, and re-probes on resume. The host
-   * servicer claims the slot, writes back a dirty victim, fetches, publishes
-   * the page and only then clears `pending`, so:
-   *
-   *   RULE 1: when this co_await returns, the page IS resident.
-   *   RULE 2: the only wait on the device is the park. No future, no spin.
-   *
-   * The loop below should therefore execute its body exactly once. It is a
-   * safety net against a servicer bug, not a retry protocol -- if it ever
-   * iterates twice, rule 1 has been violated and the servicer is wrong.
-   *
-   * Falls back to the legacy in-kernel path when no mailbox is installed, so
-   * both can coexist while this is proven out.
-   */
-  __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPageServiced(
+  __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPage(
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     clio::run::u64 run = TryHoldFast(off, count, write);
-    while (run == 0) {
+    if (run == 0) {
+      // MISS. The kernel does not resolve its own fault: it records the page
+      // it needs and parks. The host servicer claims a CLEAN frame, fills it,
+      // publishes the page, and only then clears `pending` -- so on resume the
+      // page is resident and there is nothing to retry.
+      //
+      // This is the whole device-side fault path. No claim, no eviction, no
+      // writeback, no task submission, no future. Measured, the machinery this
+      // replaces was 19,400 of a hold's 20,000 instructions.
       volatile FaultReq *f = &h_->faults_[BlockIndex()];
       if (threadIdx.x == 0) {
         f->page_num = PageOf(off);
         f->write = write ? 1u : 0u;
-        __threadfence_system();       // request visible before the doorbell
+        __threadfence_system();     // request visible before the doorbell
         f->pending = 1u;
         __threadfence_system();
       }
@@ -2011,17 +2001,16 @@ class DeviceVector {
           reinterpret_cast<clio::run::u64>(
               const_cast<clio::run::u32 *>(&f->pending))};
       run = TryHoldFast(off, count, write);
-    }
-    Page *p = last_page_;
-    co_return Held<T>(p, static_cast<T *>(p->data) + IndexIn(off, p), off,
-                      run, /*pinned=*/h_->no_evict_ == 0u);
-  }
-
-  __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPage(
-      clio::run::u64 off, clio::run::u64 count, bool write = false) {
-    clio::run::u64 run = TryHoldFast(off, count, write);
-    if (run == 0) {
-      co_await HoldPageCoro(off, count, &run, write);
+      if (run == 0) {
+        // The servicer said the page was resident and it is not. Trapping
+        // beats looping: a livelock reads as a hang or, worse, as a pass with
+        // correct data (observed) while the round cap silently ends the run.
+        if (threadIdx.x == 0) {
+          printf("[gpu_vector] FATAL blk=%u page=%llu served but not resident\n",
+                 BlockIndex(), (unsigned long long) PageOf(off));
+        }
+        __trap();
+      }
     }
     Page *p = last_page_;
     co_return Held<T>(p, static_cast<T *>(p->data) + IndexIn(off, p), off,
