@@ -1650,6 +1650,11 @@ class DeviceVector {
       // replaces was 19,400 of a hold's 20,000 instructions.
       volatile FaultReq *f = &h_->faults_[FaultSlot()];
       if (threadIdx.x == 0) {
+        // Count it HERE: this is where a page-in begins now. Several tests
+        // assert paging behaviour through these counters, and deleting the old
+        // fault path silently zeroed them -- "faults=0" then reads as a
+        // perfectly warm cache instead of a broken one.
+        Bump(h_->stat_faults_);
         f->page_num = PageOf(off);
         f->table = BlockIndex();
         f->write = write ? 1u : 0u;
@@ -2520,8 +2525,15 @@ class DeviceVector {
       PageBlobName(p->page_num, name);
       // Same placement contract as SubmitPut: an unscored page asks for the
       // CTE's default tier rather than requesting score zero.
+      // CLAMPED, for the same reason SubmitPut clamps -- see the long comment
+      // there. Device `score` is an unbounded eviction rank (+1.0 per touch);
+      // the CTE's is a tier preference in [0,1] and PutBlob REJECTS anything
+      // above 1.0 with rc=5. This batch site never got the fix the scalar site
+      // did, so every batched writeback of a page touched more than once
+      // failed. It surfaced the moment the return code was actually checked:
+      // 6 dirty pages submitted, 6 records with rc=5, flushed=0.
       mb[nb].put->Add(name, 0, h_->page_bytes_, RawPtr(p->data),
-                      (p->score > 0.0f) ? p->score : -1.0f);
+                      (p->score > 0.0f) ? fminf(p->score, 1.0f) : -1.0f);
       mb[nb].page_slot[filled] = i;
       ++filled;
       Bump(h_->stat_puts_);

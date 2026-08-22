@@ -79,13 +79,22 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u64 base,
                                    clio::run::u32 block) {
   const u64 off = base + static_cast<u64>(block) * count;
   for (u64 i = 0; i < count;) {
-    auto h = co_await v.HoldPage(off + i, count - i, /*write=*/true);
-    for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[off + i + k] = Val(off + i + k, salt);
+    u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(off + i, count - i, /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[off + i + k] = Val(off + i + k, salt);
+      }
     }
-    i += h.run();
+    // Flush each page as it is finished. The vector never writes back on its
+    // own, so a dirty page is unevictable; walking a working set larger than
+    // the cache without flushing cannot be served and is refused. Async, so
+    // the write still overlaps the next page.
+    v.FlushAsync(off + i, run);
+    i += run;
   }
-  if (flush) v.FlushAsync(off, count);
+  (void) flush;   // every page is flushed above; the flag is now advisory
   // Awaited even when this kernel did not flush: eviction writebacks from
   // the walk above may still be in flight, and callers assume they landed.
   co_await v.AwaitFlush();
@@ -322,14 +331,20 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
       auto h = co_await v.HoldPage(last_of_prev, 1, /*write=*/true);
       if (threadIdx.x == 0) h[last_of_prev] = Val(last_of_prev, 7u);
     }
+    // FLUSH BEFORE THE OTHER PAGE TAKES THE SLOT. With one slot these two
+    // pages evict each other every step, and a dirty page is unevictable --
+    // the vector will not write it back on the caller's behalf. Awaited, not
+    // just submitted: the very next hold needs this exact frame, so there is
+    // nothing to overlap with.
+    v.FlushAsync(last_of_prev, 1);
+    co_await v.AwaitFlush();
     {
       auto h = co_await v.HoldPage(first_of_next, 1, /*write=*/true);
       if (threadIdx.x == 0) h[first_of_next] = Val(first_of_next, 7u);
     }
+    v.FlushAsync(first_of_next, 1);
+    co_await v.AwaitFlush();
   }
-  // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(last_of_prev, 2);
-  co_await v.AwaitFlush();
 }
 
 __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
@@ -1328,11 +1343,32 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // block won the race) -- so the count is a range, not an equality. The
     // hard invariants are below: exact fault count (no page fetched twice)
     // and zero mismatches.
-    REQUIRE(s.prefetches > 0);
-    REQUIRE(s.prefetches <= 4 * (kPages - 1));
-    // A page must never be fetched twice: a prefetch followed by a demand
-    // fault for the same page would mean the wait path is not working.
+    // DEVICE-INITIATED PREFETCH IS GONE, BY DESIGN. A kernel can only fault
+    // and park; deciding what to fetch early is the host's job now. So the
+    // device counter must be zero, and the capability is proven below through
+    // the host path instead of asserted away.
+    REQUIRE(s.prefetches == 0);
+    // A page must never be fetched twice.
     REQUIRE(s.faults == 4 * kPages);
+
+    // THE REPLACEMENT CAPABILITY. Drop the cache, prefetch host-side, then
+    // walk: if prefetching works the walk faults for nothing at all. This is
+    // a stronger check than the old one -- it measures the effect (no faults)
+    // rather than the attempt (a counter of issued hints).
+    f.vec.ClearCache();
+    const u64 kFits = 4;   // 4 slots per block: ask only for what fits
+    f.vec.Prefetch(0, kFits);
+    f.Reset();
+    RunYieldable(4, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                               gy::YieldStackView sv_) {
+      WalkKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0, kFits,
+                                                    15u, sink, vw_, sv_);
+    });
+    Sync();
+    const auto sp = f.Stats();
+    std::fprintf(stderr, "[prefetch] host-prefetched walk faults=%llu\n",
+                 (unsigned long long) sp.faults);
+    REQUIRE(sp.faults == 0);
   }
 
   // -------------------------------------------------------------------

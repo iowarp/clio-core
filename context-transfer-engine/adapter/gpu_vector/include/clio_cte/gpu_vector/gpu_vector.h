@@ -16,6 +16,7 @@
 #define CLIO_CTE_GPU_VECTOR_GPU_VECTOR_H_
 
 #include <cstdio>
+#include <cstdlib>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
@@ -272,6 +273,20 @@ class Vector {
    * @return faults served this round.
    * @throws std::runtime_error if a block's dirty working set fills its table.
    */
+  /** Increment a device-side counter from the host. Safe because the servicer
+   *  runs between rounds, with no kernel resident. */
+  void BumpHostStat(unsigned long long *dev_counter) {
+#if CTP_ENABLE_CUDA
+    if (dev_counter == nullptr) return;
+    unsigned long long v = 0;
+    ctp::GpuApi::Memcpy(&v, dev_counter, sizeof(v));
+    ++v;
+    ctp::GpuApi::Memcpy(dev_counter, &v, sizeof(v));
+#else
+    (void) dev_counter;
+#endif
+  }
+
   clio::run::u32 ServiceFaults() {
     clio::run::u32 served = 0;
 #if CTP_ENABLE_CUDA
@@ -298,6 +313,15 @@ class Vector {
         Page *dev_tbl = st.hdr.pages_ + static_cast<size_t>(b) * ppb;
         ctp::GpuApi::Memcpy(tbl.data(), dev_tbl, ppb * sizeof(Page));
 
+        if (std::getenv("CLIO_GV_SVC_TRACE") != nullptr) {
+          clio::run::u32 nd = 0, nres = 0;
+          for (clio::run::u32 i = 0; i < ppb; ++i) {
+            if (tbl[i].page_num != kNoPage) ++nres;
+            if (tbl[i].dirty) ++nd;
+          }
+          std::fprintf(stderr, "[svc] tbl%u want=%llu resident=%u dirty=%u\n",
+                       b, (unsigned long long) pg, nres, nd);
+        }
         // RETIRE LANDED FLUSHES FIRST. A frame the caller flushed is clean the
         // moment its put completes, but nothing clears the flag while the
         // block is parked -- the device reaper only runs inside a kernel. If
@@ -325,6 +349,7 @@ class Vector {
         // scan of the whole table would be both wrong and pointless.
         clio::run::u32 slot = ~0u;
         float worst = 0.0f;
+        clio::run::u64 worst_access = 0;
         for (clio::run::u32 w = 0; w < nways; ++w) {
           const clio::run::u32 i = DeviceVector<T>::WaySlot(pg, w, ppb);
           Page &c = tbl[i];
@@ -333,7 +358,17 @@ class Vector {
           if (filled_this_pass.count(static_cast<size_t>(b) * ppb + i)) continue;
           if (c.page_num == kNoPage) { slot = i; break; }   // free: take it
           if (c.dirty) continue;                            // never evict dirty
-          if (slot == ~0u || c.score < worst) { slot = i; worst = c.score; }
+          // Lowest score wins; TIES BREAK ON LAST ACCESS (LRU), which is the
+          // policy the device path used. Dropping the tiebreak is not
+          // cosmetic: with equal scores it picks a different victim, and the
+          // scoring test -- which counts faults exactly to prove a pinned page
+          // is never evicted -- read 13 where the policy gives 14.
+          if (slot == ~0u || c.score < worst ||
+              (c.score == worst && c.last_access < worst_access)) {
+            slot = i;
+            worst = c.score;
+            worst_access = c.last_access;
+          }
         }
         if (slot == ~0u) {
           // Say WHICH state blocked it. "every candidate is unusable" sends the
@@ -371,6 +406,7 @@ class Vector {
         }
 
         Page &p = tbl[slot];
+        const clio::run::u64 evicted_page = p.page_num;
         // Fetch the page's bytes, or zero the frame when it has no blob yet
         // (a first touch: nothing was ever written, so empty IS the content).
         bool filled = false;
@@ -395,6 +431,12 @@ class Vector {
         ++p.gen;
         ctp::GpuApi::Memcpy(dev_tbl, tbl.data(), ppb * sizeof(Page));
 
+        // An eviction is a page displaced, not a frame filled: count it only
+        // when the frame held a DIFFERENT page. Slot policy lives here now, so
+        // this counter has to be maintained here too.
+        if (evicted_page != kNoPage && evicted_page != pg) {
+          BumpHostStat(st.hdr.stat_evicts_);
+        }
         filled_this_pass.insert(static_cast<size_t>(b) * ppb + slot);
         f->pending = 0u;   // only now: the page is resident and readable
         ++served;
