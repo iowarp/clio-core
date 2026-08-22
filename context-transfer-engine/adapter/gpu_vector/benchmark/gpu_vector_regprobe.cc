@@ -52,28 +52,8 @@ GVP_KERNEL_V(K_Baseline, (void) v)
 GVP_KERNEL(K_IsResident, A::IsResident(v, arg))
 #elif GVP == 2
 GVP_KERNEL(K_Find, A::Find(v, arg))
-#elif GVP == 3
-GVP_KERNEL(K_ProbeHold, A::ProbeHold(v, arg))
-#elif GVP == 4
-GVP_KERNEL(K_TryHoldFast, A::TryHoldFast(v, arg))
-#elif GVP == 5
-GVP_KERNEL(K_ClaimSlot, A::ClaimSlot(v, arg))
-#elif GVP == 6
-GVP_KERNEL_V(K_ReapFetched, A::ReapFetched(v))
 #elif GVP == 7
 GVP_KERNEL_V(K_ReapFlushed, A::ReapFlushed(v))
-#elif GVP == 8
-GVP_KERNEL_V(K_SettleBatch, A::SettleBatch(v))
-#elif GVP == 9
-GVP_KERNEL_V(K_StartEviction, A::StartEviction(v, arg))
-#elif GVP == 10
-GVP_KERNEL_V(K_EvictPages, A::EvictPages(v, (u32) arg))
-#elif GVP == 11
-GVP_KERNEL(K_BeginFetch, A::BeginFetch(v, arg))
-#elif GVP == 12
-GVP_KERNEL(K_FetchBatched, A::FetchBatchedLocked(v, arg))
-#elif GVP == 13
-GVP_KERNEL(K_FetchRun, A::FetchRunLocked(v, arg))
 #elif GVP == 14
 GVP_KERNEL_V(K_FlushBatched, A::FlushRangeLocked(v, arg))
 

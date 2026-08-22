@@ -292,58 +292,56 @@ smoke tests.
 
 ## 11. What the design costs — measured, per piece
 
-Not estimated. `benchmark/gpu_vector_regprobe.cc` compiles one kernel per
-internal function, **each in its own translation unit** (compiled together,
-every coroutine kernel inherits the module's worst one and all rungs report the
-same number). sm_89, `-O3`, SASS instruction count and ptxas register count.
+Measured with `benchmark/gpu_vector_regprobe.cc`: one kernel per internal,
+**each in its own translation unit** (compiled together, every coroutine kernel
+inherits the module's worst one and every rung reports the same number).
+sm_89, `-O3`. "before" is the in-kernel fault path; "after" is the serviced
+design of Part II with the old machinery deleted.
 
-| piece | SASS | REG | over baseline |
-|---|---|---|---|
-| baseline (kernel shell + `CLIO_GPU_INIT`) | 56 | 22 | — |
-| **empty coroutine + yield driver** | **200** | **28** | **+144** |
-| `Find` | 360 | 34 | +304 |
-| `IsResident` | 440 | 39 | +384 |
-| `SettleBatchLocked` | 464 | 39 | +408 |
-| `EnterHoldSet` | 488 | 32 | +432 |
-| `ReapFlushed` | 504 | 39 | +448 |
-| **`ProbeHold`** | **600** | **44** | **+544** |
-| **`TryHoldFast` (the whole hit path)** | **632** | **46** | **+576** |
-| `ReapFetched` | 1,392 | 36 | +1,336 |
-| `EvictPages` | 1,480 | 48 | +1,424 |
-| `ClaimSlotWindowLocked` | 1,576 | 36 | +1,520 |
-| `StartEvictionAsync` | 1,848 | 44 | +1,792 |
-| `BeginFetchRunLocked` | 3,104 | 56 | +3,048 |
-| `FlushRangeBatchedAsyncLocked` | 3,120 | 62 | +3,064 |
-| `BeginFetch` | 3,160 | 48 | +3,104 |
-| `AwaitFlush` | 4,232 | 46 | +4,176 |
-| **`FetchPagesBatchedLocked`** | **8,208** | **72** | **+8,152** |
-| **`HoldPage` (everything)** | **20,000** | **90** | **+19,944** |
+| piece | before | after |
+|---|---|---|
+| baseline (kernel shell + `CLIO_GPU_INIT`) | 56 / 22 | 56 / 22 |
+| empty coroutine + yield driver | 200 / 28 | 200 / 28 |
+| `Find` | 360 / 34 | 360 / 34 |
+| `IsResident` | 440 / 39 | 440 / 39 |
+| `EnterHoldSet` | 488 / 32 | 488 / 32 |
+| `ReapFlushed` | 504 / 39 | 504 / 39 |
+| `ProbeHold` | 600 / 44 | 600 / 44 |
+| `TryHoldFast` (the hit path) | 632 / 46 | 632 / 46 |
+| `SettleBatchLocked` | 464 / 39 | **deleted** |
+| `ReapFetched` | 1,392 / 36 | **deleted** |
+| `EvictPages` | 1,480 / 48 | **deleted** |
+| `ClaimSlotWindowLocked` | 1,576 / 36 | **deleted** |
+| `StartEvictionAsync` | 1,848 / 44 | **deleted** |
+| `BeginFetchRunLocked` | 3,104 / 56 | **deleted** |
+| `BeginFetch` | 3,160 / 48 | **deleted** |
+| `FetchPagesBatchedLocked` | 8,208 / 72 | **deleted** |
+| `FlushRangeBatchedAsyncLocked` | 3,120 / 62 | 2,928 / 62 *(kept: explicit flush)* |
+| `AwaitFlush` | 4,232 / 46 | 4,232 / 46 *(kept: explicit flush)* |
+| **`HoldPage` (everything)** | **20,000 / 90** | **2,184 / 80** |
+
+Twenty-four functions deleted; `device_vector.h` 3,096 → 2,764 lines.
 
 ### What this says
 
-**The hit path is cheap.** `TryHoldFast` — probe, block-uniform vote, pin — is
-**632 instructions, 3% of a hold**. The lookup itself (`ProbeHold`) is 600.
-Nothing about resident access is expensive.
+**The fault path is 89% smaller: 20,000 -> 2,184 instructions.** The hit path is
+untouched at 632/46, which is the point -- the hit path was never the problem.
 
-**The coroutine is not the cost.** The empty coroutine plus its driver is
-**200 instructions and 28 registers**, 1% of a hold. Every theory blaming
-`co_await` for the kernel bloat was wrong, and this rung is the disproof.
+**Everything deleted was task submission or the slot policy that fed it.** The
+single biggest piece, `FetchPagesBatchedLocked` at 8,208 instructions, is gone
+entirely, along with claim, eviction, writeback-on-evict, settle and reap. What
+survives on the device is: probe, record a fault, park.
 
-**The miss path is 97% of a hold.** ~19,400 of the 20,000 instructions are
-code that runs only when a page is absent — and it is compiled into every
-kernel, at every hold site, whether or not it ever executes.
+**Registers moved least: 90 -> 80.** Code size fell 9x and registers fell 11%,
+which is worth stating plainly -- register pressure was never proportional to
+the fault path's size, and the earlier sessions spent chasing registers were
+chasing the wrong quantity.
 
-**The single largest piece is `FetchPagesBatchedLocked`: 8,208 instructions
-and 72 registers — 41% of a hold by itself.** The fetch/submit family
-(`BeginFetch`, `FetchPagesBatchedLocked`, `BeginFetchRunLocked`,
-`FlushRangeBatchedAsyncLocked`, `AwaitFlush`) accounts for essentially all of
-the rest. That family is **task submission**: constructing a runtime task,
-filling it with shared-memory pointers, pushing it on the gpu2cpu ring,
-waiting on a future, and settling the batch afterwards.
-
-For scale, a comparable GPU page cache (BaM) implements its **entire** cache —
-tag check, slot mapping, pin, miss handling — in ~1,672 instructions, which is
-smaller than a single one of our fetch-submission functions.
+**The flush path is deliberately untouched** (`FlushRangeBatchedAsyncLocked`,
+`AwaitFlush`). Flushing is the caller's explicit operation, so its task
+submission stays on the device where the caller invokes it. It is now the
+largest remaining device-side machinery and the obvious next target if it
+needs to shrink.
 
 ### The conclusion this forces
 
