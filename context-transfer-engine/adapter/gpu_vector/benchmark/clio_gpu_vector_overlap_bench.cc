@@ -186,15 +186,10 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
                      yv.Block()));
 }
 
-/** Drop every resident page, so a timed run always starts cold. A warm-state
- *  reset between benchmark modes, not a data path: DropAll is machinery now,
- *  reached through the white-box test shim. */
-__global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
-                              gv::DeviceVector<u32> v) {
-  CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  gv::DeviceVectorTestAccess::DropAll(v);
-}
+/* Dropping resident pages is a HOST operation now (Vector::ClearCache).
+ * Cache management moved off the device with the rest of the slot policy, so
+ * there is no DropAllKernel any more -- callers reset between modes from the
+ * host, between launches, where it belongs. */
 
 #if !CTP_IS_DEVICE_PASS
 
@@ -237,7 +232,7 @@ unsigned long long ExpectedSum(u64 n) {
 }
 
 /** One timed run. Returns wall ms; fills stats and the checksum verdict. */
-double RunOnce(const gv::DeviceVector<u32> &dev,
+double RunOnce(gv::Vector<u32> &host_vec, const gv::DeviceVector<u32> &dev,
                const clio::run::IpcManagerGpuInfo &gpu, u32 blocks, u64 per,
                u32 compute_iters, int prefetch, u32 depth, bool cold,
                unsigned long long *d_sum, unsigned long long *out_sum) {
@@ -251,7 +246,8 @@ double RunOnce(const gv::DeviceVector<u32> &dev,
   // that silently calibrated the compute down to near zero, so there was
   // nothing left for a prefetch to hide and every mode measured the same.
   if (cold) {
-    DropAllKernel<<<blocks, 32>>>(gpu, dev);
+    // Host-side now: cache management left the device with the slot policy.
+    host_vec.ClearCache();
     ctp::GpuApi::Synchronize();
   }
   const double t0 = NowMs();
@@ -385,7 +381,7 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Synchronize();
     for (u32 r = 0; r < a.repeat; ++r) {
       const double ms =
-          RunOnce(wdev, gpu, a.blocks, per, 0, 0, 0, false, d_sum, &got);
+          RunOnce(warm, wdev, gpu, a.blocks, per, 0, 0, 0, false, d_sum, &got);
       if (ms < scan_ms) scan_ms = ms;
     }
   }
@@ -397,7 +393,7 @@ int main(int argc, char **argv) {
   for (u32 r = 0; r < a.repeat; ++r) {
     vec.ResetStats();
     const double ms =
-        RunOnce(dev, gpu, a.blocks, per, 0, 0, 0, true, d_sum, &got);
+        RunOnce(vec, dev, gpu, a.blocks, per, 0, 0, 0, true, d_sum, &got);
     if (ms < io_ms) io_ms = ms;
   }
   const bool io_ok = (got == want);
@@ -448,7 +444,7 @@ int main(int argc, char **argv) {
       double best = 1e30;
       for (u32 r = 0; r < a.repeat; ++r) {
         const double ms =
-            RunOnce(hotdev, gpu, a.blocks, per, cu, 0, 0, false, d_sum, &got);
+            RunOnce(hot, hotdev, gpu, a.blocks, per, cu, 0, 0, false, d_sum, &got);
         if (ms < best) best = ms;
       }
       return best;
@@ -489,7 +485,7 @@ int main(int argc, char **argv) {
 
   for (u32 r = 0; r < a.repeat; ++r) {
     vec.ResetStats();
-    const double ms = RunOnce(dev, gpu, a.blocks, per, compute_iters, 0, 0, true, d_sum, &got);
+    const double ms = RunOnce(vec, dev, gpu, a.blocks, per, compute_iters, 0, 0, true, d_sum, &got);
     if (ms < serial_ms) {
       serial_ms = ms;
       serial_stats = vec.ReadStats(0);
@@ -498,7 +494,7 @@ int main(int argc, char **argv) {
   }
   for (u32 r = 0; r < a.repeat; ++r) {
     vec.ResetStats();
-    const double ms = RunOnce(dev, gpu, a.blocks, per, compute_iters, 1, a.depth, true, d_sum,
+    const double ms = RunOnce(vec, dev, gpu, a.blocks, per, compute_iters, 1, a.depth, true, d_sum,
                               &got);
     if (ms < pre_ms) {
       pre_ms = ms;

@@ -60,6 +60,7 @@
 #ifndef CLIO_RUNTIME_GPU_YIELDABLE_H_
 #define CLIO_RUNTIME_GPU_YIELDABLE_H_
 
+#include <cstdio>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
 
@@ -219,6 +220,22 @@ namespace clio::run::gpu {
  *         },
  *         [&]() { ServiceWhateverTheBlocksAreWaitingFor(); });
  */
+/**
+ * Hook the yield driver calls between rounds, while no kernel is resident.
+ *
+ * A parked block is waiting for something only the host can supply. Whoever
+ * supplies it registers here, and the driver calls it every round -- so a
+ * caller cannot forget to service faults and silently spin to the round cap.
+ * That is not hypothetical: every gpu_vector test except one forgot, and the
+ * suite reported 100% passing off stale binaries.
+ *
+ * Null by default; nothing in this header knows what a page is.
+ */
+inline void (*&YieldServiceHook())() {
+  static void (*hook)() = nullptr;
+  return hook;
+}
+
 template <typename StateT = YieldNoState>
 class Yieldable {
  public:
@@ -418,6 +435,19 @@ class Yieldable {
       ++rounds;
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;
+        // LOUD ON PURPOSE. Hitting the cap means blocks kept parking and
+        // nothing ever satisfied them -- a livelock. It is not a slow run.
+        // Silently returning here let a gpu_vector test report CORRECT DATA
+        // while spinning 200,000 rounds, because the pages that happened to
+        // be resident still read back fine; the run looked like a pass. Any
+        // caller that reaches this must treat it as a failure, and now cannot
+        // miss it.
+        std::fprintf(stderr,
+                     "[yieldable] ROUND CAP HIT after %u rounds with %u block(s) "
+                     "still suspended -- faults are not being satisfied. This is "
+                     "a livelock, not a slow run.\n",
+                     rounds, num_pending_);
+        std::fflush(stderr);
         break;
       }
       if constexpr (std::is_same_v<decltype(service()), bool>) {
@@ -428,6 +458,7 @@ class Yieldable {
       } else {
         service();
       }
+      if (YieldServiceHook() != nullptr) YieldServiceHook()();
     }
     if (num_pending_ == 0) {
       ++rounds;  // count the round that finished the last block
@@ -477,9 +508,16 @@ class Yieldable {
       ++rounds;
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;   // see HitRoundCap(): never silent again
+        std::fprintf(stderr,
+                     "[yieldable] ROUND CAP HIT after %u rounds with %u block(s) "
+                     "still suspended -- faults are not being satisfied. This is "
+                     "a livelock, not a slow run.\n",
+                     rounds, num_pending_);
+        std::fflush(stderr);
         break;
       }
       service();
+      if (YieldServiceHook() != nullptr) YieldServiceHook()();
     }
     if (num_pending_ == 0) {
       ++rounds;

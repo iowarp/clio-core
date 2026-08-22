@@ -264,7 +264,11 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 pn = v.PageOf(nxt + pg * v.h_->elems_per_page_);
         gv::DeviceVectorTestAccess::RescorePage(v, pn, 1000.0f);
-        gv::DeviceVectorTestAccess::BeginFetch(v, pn);
+        // DEVICE-INITIATED PREFETCH IS GONE. A kernel cannot start a fetch any
+        // more: it can only fault (record + park) and let the host servicer
+        // resolve it. Prefetching is a host operation between launches. The
+        // scoring hint above still applies; what this mode used to overlap is
+        // now the servicer's cross-block batching.
       }
     }
     __syncthreads();

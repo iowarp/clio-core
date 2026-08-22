@@ -277,62 +277,6 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(BatchFlushCoro(v, npages, salt, flushed));
 }
 
-/**
- * Batched-fetch `npages` in chunks of `chunk`, then verify every element.
- * Reports mismatches and how many pages the batched fetch reported resident.
- * MACHINERY test: the batched fetch is private; reached through TestAccess.
- */
-__device__ gy::YCoroMain BatchFetchCoro(gv::DeviceVector<u32> v, u64 npages,
-                                        u32 chunk, u32 salt,
-                                        unsigned long long *bad,
-                                        unsigned long long *got) {
-  for (clio::run::u64 k = 0; k < npages; k += chunk) {
-    u64 n = npages - k;
-    if (n > chunk) n = chunk;
-    // The previous chunk's guards died at their scope ends, so no pin is
-    // left when the fetch runs: THE HOLD IS THE PIN, and the batched fetch
-    // skips pinned slots -- with the cache exactly chunk-sized, a leftover
-    // pin would leave the fetch one slot short and under-report `got`.
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      const u32 g = gv::DeviceVectorTestAccess::FetchPagesBatched(
-          v, k, static_cast<u32>(n));
-      atomicAdd(got, static_cast<unsigned long long>(g));
-    }
-    __syncthreads();
-    for (clio::run::u64 j = 0; j < n; ++j) {
-      const u64 off = (k + j) * v.h_->elems_per_page_;
-      auto h = co_await v.HoldPage(off, v.h_->elems_per_page_);
-      unsigned long long local = 0;
-      for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
-        if (h[off + i] != Val(off + i, salt)) ++local;
-      }
-      if (local != 0) atomicAdd(bad, local);
-    }
-  }
-}
-
-__global__ void BatchFetchKernel(clio::run::IpcManagerGpuInfo info,
-                                 gv::DeviceVector<u32> v, u64 npages, u32 chunk,
-                                 u32 salt, unsigned long long *bad,
-                                 unsigned long long *got,
-                                 gy::YieldableView<> yv,
-                                 gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(BatchFetchCoro(v, npages, chunk, salt, bad, got));
-}
-
-/** Drop the calling block's cache, so the next reads must fault. Warm-state
- *  reset between test phases -- TestAccess by design. */
-__global__ void DropAllKernel(clio::run::IpcManagerGpuInfo info,
-                              gv::DeviceVector<u32> v) {
-  CLIO_GPU_INIT(info, nullptr);
-  if (threadIdx.x != 0) return;
-  gv::DeviceVectorTestAccess::DropAll(v);
-}
 
 /** Batched-flush a block whose pages should already be clean (machinery). */
 __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
@@ -697,23 +641,12 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // though the (demand-faulted) content checks still pass.
     FlushKernel<<<1, 32>>>(g_gpu, f.dev, 0, kPages * kPageElems);
     ctp::GpuApi::Synchronize();
-    DropAllKernel<<<1, 32>>>(g_gpu, f.dev);
-    Sync();
+    f.vec.ClearCache();   // host-side: cache management left the device
 
-    unsigned long long *got = NewCounter();
-    f.Reset();
-    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
-                        gy::YieldStackView sv_) {
-      BatchFetchKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, kPages, 4u, 31u, bad, got, vw_, sv_);
-    });
-    Sync();
-    const unsigned long long nbad = ReadCounter(bad);
-    std::fprintf(stderr, "[batch-fetch] pages=%llu resident=%llu bad=%llu\n",
-                 (unsigned long long) kPages, ReadCounter(got), nbad);
-    REQUIRE(nbad == 0);
-    REQUIRE(ReadCounter(got) == kPages);
-    ctp::GpuApi::Memset(bad, 0, sizeof(*bad));
-    ctp::GpuApi::Free(got);
+    // The device-side batched fetch this case asserted on is gone: a kernel
+    // cannot fetch any more, only fault and park. What remains worth checking
+    // -- that faulted pages hold the right bytes -- the content cases above
+    // already cover.
   }
 
   // -------------------------------------------------------------------

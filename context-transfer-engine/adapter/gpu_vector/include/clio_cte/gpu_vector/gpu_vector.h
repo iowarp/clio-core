@@ -47,6 +47,25 @@ namespace clio::cte::gpu_vector {
  * @tparam T element type. The page granularity is given in BYTES, so T only
  *           affects how offsets are interpreted, never the page layout.
  */
+/**
+ * Every live vector, and the one function the yield driver calls to serve
+ * their faults.
+ *
+ * REGISTERED AUTOMATICALLY, because forgetting is not a recoverable mistake: a
+ * parked block whose fault is never served spins until the round cap and the
+ * run still reports whatever it managed to compute. Requiring each caller to
+ * remember produced exactly that -- one test out of ten serviced faults, and
+ * the suite looked green.
+ */
+inline std::vector<std::function<void()>> &LiveVectorServicers() {
+  static std::vector<std::function<void()>> v;
+  return v;
+}
+
+inline void ServiceAllVectorFaults() {
+  for (auto &f : LiveVectorServicers()) f();
+}
+
 template <typename T>
 class Vector {
  public:
@@ -102,10 +121,22 @@ class Vector {
       devs_.clear();
       throw;
     }
+    // Register with the yield driver so this vector's faults are served every
+    // round, without any caller remembering to ask.
+    servicer_id_ = LiveVectorServicers().size();
+    LiveVectorServicers().emplace_back([this] { this->ServiceFaults(); });
+    clio::run::gpu::YieldServiceHook() = &ServiceAllVectorFaults;
   }
 
   /** Releases every device allocation this vector made. Callers free nothing. */
+  size_t servicer_id_ = ~size_t(0);
+
   ~Vector() {
+    // Disarm before the device state goes away: the driver may still call the
+    // hook, and a servicer pointing at a freed vector is a use-after-free.
+    if (servicer_id_ < LiveVectorServicers().size()) {
+      LiveVectorServicers()[servicer_id_] = [] {};
+    }
     for (auto &kv : devs_) {
       Free(kv.second);
     }
