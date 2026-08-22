@@ -74,18 +74,25 @@ __device__ gy::YCoroMain HbmSeedCoro(gv::DeviceVector<clio::run::u32> v,
                                      clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 off = 0; off < per; off += kPageElems) {
-    auto h = co_await v.HoldPage(
-        base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
-        /*write=*/true);
-    for (clio::run::u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
-      h[base + off + i] = Weight(base + off + i);
+    clio::run::u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(
+          base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
+          /*write=*/true);
+      run = h.run();
+      for (clio::run::u64 i = threadIdx.x; i < run; i += blockDim.x) {
+        h[base + off + i] = Weight(base + off + i);
+      }
     }
+    // Flush as we go: the vector never writes back on its own, so a dirty
+    // page is unevictable and a working set larger than the cache cannot be
+    // served. Async, so the write still overlaps the next page.
+    v.FlushAsync(base + off, run);
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing the last
   // page when the flush submits would lose its writes AND leave the page
   // looking clean.
   // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, per);
   co_await v.AwaitFlush();
 }
 

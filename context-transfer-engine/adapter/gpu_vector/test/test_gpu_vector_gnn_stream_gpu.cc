@@ -88,17 +88,24 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
                                      clio::run::u32 block) {
   const u64 base = static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
-    auto h = co_await v.HoldPage(base + i, elems_per_block - i,
-                                 /*write=*/true);
-    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = src[base + i + k];
+    u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, elems_per_block - i,
+                                   /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = src[base + i + k];
+      }
     }
-    i += h.run();
+    // Flush as we go: the vector never writes back on its own, so a dirty
+    // page is unevictable and a working set larger than the cache cannot be
+    // served. Async, so the write still overlaps the next page.
+    v.FlushAsync(base + i, run);
+    i += run;
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when
   // thread 0 flushes would lose its writes and leave the page looking clean.
   // Collective, internally BATCHED (one multi-put per 64 pages).
-  v.FlushAsync(base, elems_per_block);
   co_await v.AwaitFlush();
 }
 
