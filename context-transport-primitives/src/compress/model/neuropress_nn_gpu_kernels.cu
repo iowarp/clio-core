@@ -201,6 +201,20 @@ SgdScratch &SgdSamples() {
   return s;
 }
 
+/* SGD-owned copy of the chunk's statistics: the resident buffer is reused by
+ * the next chunk while a fire-and-forget launch may still be queued. Upstream's
+ * D2D into ctx->d_stats (gpucompress_compress.cpp). Leaked like EmaBuffer(). */
+ctp::DeviceFeatureStats *SgdStatsSnapshot() {
+  static thread_local ctp::DeviceFeatureStats *p = [] {
+    ctp::DeviceFeatureStats *q = nullptr;
+    if (cudaMalloc(&q, sizeof(ctp::DeviceFeatureStats)) != cudaSuccess) {
+      return static_cast<ctp::DeviceFeatureStats *>(nullptr);
+    }
+    return q;
+  }();
+  return p;
+}
+
 bool EnsureSgdSamples(SgdScratch &s, size_t need) {
   if (need <= s.bytes) return true;
   cudaFree(s.d_samples);
@@ -1465,16 +1479,30 @@ __device__ __forceinline__ void ForwardOneLayer(
 __global__ void SGDKernel(NeuroPressGpuWeights *w,
                           const NeuroPressGpuSGDSample *__restrict__ samples,
                           int num_samples, float learning_rate,
-                          float *__restrict__ ema, bool *out_applied) {
+                          float *__restrict__ ema, bool *out_applied,
+                          const ctp::DeviceFeatureStats *__restrict__
+                              device_stats) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
   // ---- Phase 1: per-sample forward pass + target/error computation ----
   for (int si = 0; si < num_samples; ++si) {
     if (t < kInputDim) {
+      // Inputs 5-7 from DEVICE memory, as nnSGDKernel reads d_stats
+      // in-kernel (nn_gpu.cu). Null keeps the host-matrix behaviour.
+      float raw = samples[si].raw_input[t];
+      if (device_stats != nullptr) {
+        if (t == 5) {
+          raw = static_cast<float>(device_stats->entropy);
+        } else if (t == 6) {
+          raw = static_cast<float>(device_stats->mad);
+        } else if (t == 7) {
+          raw = static_cast<float>(device_stats->second_derivative);
+        }
+      }
       float std_val = w->x_stds[t];
       if (std_val < 1e-8f) std_val = 1e-8f;
-      w->act_x[si][t] = (samples[si].raw_input[t] - w->x_means[t]) / std_val;
+      w->act_x[si][t] = (raw - w->x_means[t]) / std_val;
     }
     __syncthreads();
 
@@ -1848,7 +1876,8 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
 
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,
-                        int num_samples, float learning_rate) {
+                        int num_samples, float learning_rate,
+                        const void *device_stats) {
   if (!w || num_samples <= 0) return false;
   if (num_samples > kMaxSamples) num_samples = kMaxSamples;
 
@@ -1900,9 +1929,21 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
     return false;
   }
 
+  /* On the SGD stream, so it is ordered before the kernel that reads it. */
+  const ctp::DeviceFeatureStats *d_stats = nullptr;
+  if (device_stats != nullptr) {
+    ctp::DeviceFeatureStats *snap = SgdStatsSnapshot();
+    if (snap != nullptr &&
+        cudaMemcpyAsync(snap, device_stats, sizeof(ctp::DeviceFeatureStats),
+                        cudaMemcpyDeviceToDevice, g.stream) == cudaSuccess) {
+      d_stats = snap;
+    }
+    /* Fall back to the samples' host rows, not another chunk's stats. */
+  }
+
   SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
       w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
-      num_samples, learning_rate, ema, d_applied);
+      num_samples, learning_rate, ema, d_applied, d_stats);
   if (cudaGetLastError() != cudaSuccess) return false;
 
   /* Only set the flag if the record succeeded, so inference never waits on an

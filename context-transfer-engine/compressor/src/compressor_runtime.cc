@@ -65,6 +65,7 @@
 #include "clio_ctp/compress/model/ranking.h"
 #include "clio_ctp/util/logging.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
+#include "clio_cte/compressor/neuropress_chunk_diag.h"
 
 namespace clio::cte::compressor {
 
@@ -590,10 +591,12 @@ bool SelectionLogEnabled();
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
-    double* out_second_deriv, bool* out_neuropress_gpu_failed) {
+    double* out_second_deriv, bool* out_neuropress_gpu_failed,
+    const void** out_device_stats) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
+  if (out_device_stats) *out_device_stats = nullptr;
 
   // NeuroPress takes priority over the legacy heuristics below whenever it
   // is ready, so decide that first -- it determines how the chunk must be
@@ -655,6 +658,9 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       device_stats = ctp::ComputeDeviceStatsResident(chunk, num_elements,
                                                      data_type, np_stream);
     }
+    /* Reused below instead of re-measuring; upstream passes one d_stats_ptr
+       to both inference and runNNSGDCtx. */
+    if (out_device_stats) *out_device_stats = device_stats;
   }
 
   // When the device path was the right one, it is the ONLY one. Computing the
@@ -1286,6 +1292,18 @@ bool ExploreLogEnabled() {
 }
 
 /** Leaked on purpose, same reason as SelectionLogInstance below. */
+/** Per-chunk NN input history; upstream's g_chunk_history
+ *  (gpucompress_diagnostics.cpp). */
+struct ChunkDiagHistory {
+  std::mutex mtx;
+  std::vector<NeuroPressChunkDiag> rows;
+};
+
+ChunkDiagHistory *ChunkDiagHistoryInstance() {
+  static ChunkDiagHistory *h = new ChunkDiagHistory();
+  return h;
+}
+
 ExploreLog *ExploreLogInstance() {
   static ExploreLog *log = [] {
     auto *l = new ExploreLog();
@@ -1425,6 +1443,50 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 
 }  // namespace
 
+/* Upstream's reset/count/get accessors (gpucompress.h), -1 on a bad index. */
+
+void NeuroPressResetChunkHistory() {
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  h->rows.clear();
+}
+
+int NeuroPressChunkHistoryCount() {
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  return static_cast<int>(h->rows.size());
+}
+
+int NeuroPressGetChunkDiag(int idx, NeuroPressChunkDiag *out) {
+  if (out == nullptr || idx < 0) return -1;
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  if (static_cast<size_t>(idx) >= h->rows.size()) return -1;
+  *out = h->rows[static_cast<size_t>(idx)];
+  return 0;
+}
+
+int NeuroPressRecordChunkDiag(const NeuroPressChunkDiag &diag) {
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  // Drop, not evict: a reader always sees a contiguous prefix.
+  if (h->rows.size() >= kNeuroPressChunkDiagCap) return -1;
+  h->rows.push_back(diag);
+  return static_cast<int>(h->rows.size()) - 1;
+}
+
+void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
+                                          bool triggered, float regret) {
+  if (idx < 0) return;
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  if (static_cast<size_t>(idx) >= h->rows.size()) return;
+  NeuroPressChunkDiag &row = h->rows[static_cast<size_t>(idx)];
+  row.nn_action = final_action;
+  row.exploration_triggered = triggered ? 1 : 0;
+  row.regret = regret;
+  // feat_action untouched: upstream ties it to nn_original_action.
+}
 
 /* ---------------------------------------------------------------------------
  * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
@@ -1485,6 +1547,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool ranked_by_cost = false;
     double sel_entropy = 0.0, sel_mad = 0.0, sel_second_deriv = 0.0;
     bool neuropress_gpu_failed = false;
+    // Statistics the selection ranked on; see out_device_stats.
+    const void* sel_device_stats = nullptr;
     std::vector<CompressionStats> stats;
     if (!config_.neuropress_static_lib_.empty()) {
       // Control condition: one candidate, no inference. Deliberately does
@@ -1507,7 +1571,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       stats =
           EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
                               &sel_entropy, &sel_mad, &sel_second_deriv,
-                              &neuropress_gpu_failed);
+                              &neuropress_gpu_failed, &sel_device_stats);
     }
 
     if (neuropress_gpu_failed) {
@@ -1599,6 +1663,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // (chunk_data is certainly still valid -- the same pointer
     // EstCompressionStats just read) rather than after the await, since
     // nothing downstream guarantees the input blob outlives Compress().
+    // Chunk-record slot, completed by the exploration block. -1 = none.
+    int np_diag_slot = -1;
     bool neuropress_feat_valid = false;
     double neuropress_entropy = 0.0, neuropress_mad = 0.0,
            neuropress_second_deriv = 0.0;
@@ -1637,9 +1703,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
          NaN gradient. */
       (void)feat_type;
       (void)feat_num_elements;
-      neuropress_feat_valid = ctp::ComputeNeuroPressFeatures(
-          chunk_data, chunk_size, task->context_.data_type_,
-          &neuropress_entropy, &neuropress_mad, &neuropress_second_deriv);
+      if (sel_device_stats != nullptr) {
+        /* The SGD kernel reads the statistics from this device buffer. The
+           24 bytes come back only for the host consumers -- diagnostics,
+           explore log, decomp head -- as upstream's "P4 fix" does. */
+        neuropress_feat_valid = ctp::ReadDeviceFeatureStats(
+            sel_device_stats, &neuropress_entropy, &neuropress_mad,
+            &neuropress_second_deriv, nullptr);
+      } else {
+        /* Nothing on the device to reuse. Same call as inference, so both
+           read the bytes the same way (float64 would otherwise give NaN). */
+        neuropress_feat_valid = ctp::ComputeNeuroPressFeatures(
+            chunk_data, chunk_size, task->context_.data_type_,
+            &neuropress_entropy, &neuropress_mad, &neuropress_second_deriv);
+      }
     }
 
     // Defer the store when exploration may replace this pick. Exploration
@@ -1855,6 +1932,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               static_cast<int>(UnpackPreset(static_cast<uint32_t>(best_preset)));
           candidate.byte_shuffle =
               UnpackShuffle(static_cast<uint32_t>(best_preset)) != 0;
+          // Both default to false/0 into FeaturesTo8Input slots 1 and 3, so
+          // leaving them trained the lossless row at a bound of zero.
+          candidate.quantize =
+              UnpackQuantEnabled(static_cast<uint32_t>(best_preset));
+          // Unconditional, not `quantize ? eb : 0`: nnSGDKernel writes
+          // raw[3] with no quant test, and the 1e-7 sentinel is
+          // inference-only (nn_gpu.cu).
+          candidate.error_bound = context.error_bound_;
           candidate.library_name = lib_name;
 
           ctp::compress::model::CompressionFeatures chunk_features =
@@ -1865,6 +1950,86 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // be read back later, and that read is the only place a real
           // decompression time ever becomes available.
           RecordDecompFeatures(task->blob_name_.str(), chunk_features);
+
+          // Built from `candidate` and `data`, so the record cannot
+          // disagree with the features. sgd_fired says whether it trained.
+          {
+            NeuroPressChunkDiag diag;
+            const int primary_action =
+                ctp::compress::model::NeuroPressActionId(
+                    candidate.base_id, candidate.quantize,
+                    candidate.byte_shuffle);
+            diag.nn_original_action = primary_action;
+            // Provisional; the exploration block completes it.
+            diag.nn_action = primary_action;
+            // Upstream ties feat_action to nn_original_action
+            // (gpucompress_diagnostics.cpp).
+            diag.feat_action = primary_action;
+            diag.feat_entropy =
+                static_cast<float>(chunk_features.shannon_entropy);
+            diag.feat_mad = static_cast<float>(chunk_features.mad);
+            diag.feat_deriv =
+                static_cast<float>(chunk_features.second_derivative_mean);
+            diag.feat_eb_enc = static_cast<float>(chunk_features.error_bound);
+            diag.feat_ds_enc =
+                static_cast<float>(chunk_features.chunk_size_bytes);
+
+            diag.cost_model_error_pct = static_cast<float>(error_pct);
+            diag.actual_cost = static_cast<float>(actual_cost);
+            diag.predicted_cost = static_cast<float>(predicted_cost);
+
+            const double pred_r =
+                predicted ? std::min(100.0, predicted->compression_ratio_) : 0.0;
+            const double act_r =
+                std::min(100.0, context.actual_compression_ratio_);
+            const double pred_ct =
+                predicted ? std::max(1.0, predicted->compress_time_ms_) : 0.0;
+            const double act_ct =
+                std::max(1.0, context.actual_compress_time_ms_);
+            // Clamped first: ct floored at 1 ms, ratio capped at 100x
+            // (gpucompress_compress.cpp).
+            diag.ratio_mape =
+                (act_r > 0.0)
+                    ? static_cast<float>(std::fabs(act_r - pred_r) / act_r)
+                    : 0.0f;
+            diag.comp_time_mape =
+                (act_ct > 0.0)
+                    ? static_cast<float>(std::fabs(act_ct - pred_ct) / act_ct)
+                    : 0.0f;
+
+            diag.predicted_ratio =
+                predicted ? static_cast<float>(predicted->compression_ratio_)
+                          : 0.0f;
+            diag.actual_ratio =
+                static_cast<float>(context.actual_compression_ratio_);
+            diag.sgd_fired =
+                (error_pct >
+                     static_cast<double>(config_.neuropress_mape_threshold_) &&
+                 !config_.neuropress_best_mode_)
+                    ? 1
+                    : 0;
+
+            // `stats` IS the ranking, so ids are read off it.
+            int nrank = 0;
+            for (const auto &s : stats) {
+              if (nrank >= kNeuroPressRankingSlots) break;
+              const std::string rn =
+                  ctp::CompressionFactory::NameForWireId(s.compress_lib_);
+              int rb = -1;
+              for (const auto &entry :
+                   ctp::compress::model::KnownCompressors()) {
+                if (rn == entry.name) { rb = entry.base_id; break; }
+              }
+              if (rb < 0) continue;
+              const uint32_t rp = static_cast<uint32_t>(s.compress_preset_);
+              diag.predicted_ranking[nrank++] =
+                  ctp::compress::model::NeuroPressActionId(
+                      rb, UnpackQuantEnabled(rp), UnpackShuffle(rp) != 0);
+            }
+            diag.predicted_ranking_count = nrank;
+
+            np_diag_slot = NeuroPressRecordChunkDiag(diag);
+          }
 
           // Withheld under best mode: that mode replaces the model's choice on
           // every chunk, so training on the outcome would teach the network
@@ -1882,7 +2047,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     static_cast<float>(context.actual_compress_time_ms_),
                     /*decompress_time=*/0.0f)};
 
-            bool trained = neuropress_predictor_->Train(features, labels);
+            // Device-resident statistics when the selection had them, so the
+            // SGD kernel reads entropy/MAD/second-derivative on-device exactly
+            // as nnSGDKernel does. Null falls back to the host fields already
+            // in `features`.
+            bool trained = neuropress_predictor_->TrainDeviceStats(
+                features, labels, sel_device_stats);
             HLOG(kDebug,
                  "NeuroPress SGD: lib={} preset={} error_pct={} "
                  "threshold={} trained={}",
@@ -2389,8 +2559,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // belongs to the unshuffled variant.
             alt_candidate.byte_shuffle = alt_applied_shuffle != 0;
             alt_candidate.quantize = alt_applied_quant;
-            alt_candidate.error_bound =
-                alt_applied_quant ? context.error_bound_ : 0.0;
+            // The configured bound, not `applied ? eb : 0` -- see the primary
+            // sample above. nnSGDKernel writes raw[3] with no quant test and
+            // its caller passes cfg.error_bound for every explored sample
+            // alike (gpucompress_compress.cpp).
+            alt_candidate.error_bound = context.error_bound_;
             alt_candidate.library_name = alt_name;
 
             explore_features.push_back(
@@ -2561,8 +2734,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   win_candidate.preset_id = static_cast<int>(winner_preset_id);
                   win_candidate.byte_shuffle = winner_shuffle != 0;
                   win_candidate.quantize = winner_quant;
-                  win_candidate.error_bound =
-                      winner_quant ? context.error_bound_ : 0.0;
+                  // Feeds the deferred decomp head, whose upstream counterpart
+                  // reads DeferredDecompSample::error_bound_enc from the
+                  // diagnostics field `feat_eb_enc = d.error_bound`, itself
+                  // set from cfg.error_bound unconditionally
+                  // (gpucompress_diagnostics.cpp, gpucompress_compress.cpp).
+                  win_candidate.error_bound = context.error_bound_;
                   win_candidate.library_name = win_name;
                   RecordDecompFeatures(
                       task->blob_name_.str(),
@@ -2612,8 +2789,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             explore_features.swap(sorted_feats);
             explore_labels.swap(sorted_labels);
 
-            bool explore_trained =
-                neuropress_predictor_->Train(explore_features, explore_labels);
+            // Same chunk, so the same device statistics -- exploration varies
+            // the ACTION, not the data. Upstream's phase-2 SGD reuses its
+            // d_stats_ptr across the explored samples for the same reason
+            // (gpucompress_compress.cpp).
+            bool explore_trained = neuropress_predictor_->TrainDeviceStats(
+                explore_features, explore_labels, sel_device_stats);
             // Regret: how much worse the primary's real cost was than the
             // best alternative found. 0 if the primary was already best.
             double regret = (best_cost > 0.0)
@@ -2625,6 +2806,27 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                  explore_features.size(), error_pct,
                  config_.neuropress_exploration_threshold_, explore_trained,
                  regret);
+
+            // `context` holds the adopted winner: what was written.
+            if (np_diag_slot >= 0) {
+              int final_action = -1;
+              const std::string fn =
+                  ctp::CompressionFactory::NameForWireId(context.compress_lib_);
+              for (const auto &entry :
+                   ctp::compress::model::KnownCompressors()) {
+                if (fn == entry.name) {
+                  const uint32_t fp =
+                      static_cast<uint32_t>(context.compress_preset_);
+                  final_action = ctp::compress::model::NeuroPressActionId(
+                      entry.base_id, UnpackQuantEnabled(fp),
+                      UnpackShuffle(fp) != 0);
+                  break;
+                }
+              }
+              NeuroPressUpdateChunkDiagExploration(
+                  np_diag_slot, final_action, /*triggered=*/true,
+                  static_cast<float>(regret));
+            }
           }
         }
       }

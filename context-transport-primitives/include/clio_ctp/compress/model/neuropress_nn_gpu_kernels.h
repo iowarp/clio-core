@@ -241,10 +241,15 @@ struct NeuroPressGpuSGDSample {
  * @param learning_rate Online-SGD rate, upstream's g_reinforce_lr. Consumed
  *   at exactly one place, `lr_out = learning_rate * clip_scale`
  *   (nn_gpu.cu), matching runNNSGD's own parameter.
+ * @param device_stats Optional `ctp::DeviceFeatureStats*`. When given the
+ *   kernel reads the statistics from device memory and ignores slots 5-7 of
+ *   each sample's raw_input, as nnSGDKernel does (nn_gpu.cu). Snapshotted D2D
+ *   before launch. Null keeps the host-matrix behaviour.
  */
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,
-                        int num_samples, float learning_rate);
+                        int num_samples, float learning_rate,
+                        const void *device_stats = nullptr);
 
 }  // namespace ctp::compress::model::gpu
 

@@ -608,6 +608,12 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
 bool NeuroPressNNPredictor::Train(
     const std::vector<CompressionFeatures>& features,
     const std::vector<TrainingLabels>& labels) {
+  return TrainDeviceStats(features, labels, nullptr);
+}
+
+bool NeuroPressNNPredictor::TrainDeviceStats(
+    const std::vector<CompressionFeatures>& features,
+    const std::vector<TrainingLabels>& labels, const void* device_stats) {
   if (!is_ready_ || features.empty() || features.size() != labels.size()) {
     return false;
   }
@@ -633,7 +639,7 @@ bool NeuroPressNNPredictor::Train(
     }
     return gpu::NeuroPressGpuTrain(gpu_weights_.get(), gpu_samples.data(),
                                    static_cast<int>(num_samples),
-                                   learning_rate_);
+                                   learning_rate_, device_stats);
   }
   // Unreachable for the same reason as PredictBatch's: Load() refuses without
   // device weights. Refuse the update rather than running SGD on the host --
@@ -643,6 +649,7 @@ bool NeuroPressNNPredictor::Train(
   // No CPU path -- see TrainDecompHead.
   (void)features;
   (void)labels;
+  (void)device_stats;
   return false;
 #endif  // !CTP_ENABLE_NEUROPRESS_GPU
 }

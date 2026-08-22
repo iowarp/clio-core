@@ -188,6 +188,14 @@ clio_add_neuropress_parity_test(neuropress_tiebreak_parity_exec
 # The dataset harness sweeps 1 GiB in 4 MiB chunks on both sides.
 set_tests_properties(ctp_neuropress_dataset_parity PROPERTIES TIMEOUT 900)
 
+# The same dataset at 16 MiB through all three operating modes. The harness
+# above freezes the weights; learning and exploration mutate the model between
+# chunks, where a divergence compounds.
+clio_add_neuropress_parity_test(neuropress_modes_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_modes_parity.cu
+    ctp_neuropress_modes_parity)
+set_tests_properties(ctp_neuropress_modes_parity PROPERTIES TIMEOUT 1800)
+
 # Device-resident selection path: Clio's GPU stats + GPU inference chain,
 # cross-examined against the upstream kernels it mirrors. Needs stats_kernel.cu
 # and entropy_kernel.cu (already in _np_required) but not nn_gpu.cu -- it drives
@@ -226,6 +234,38 @@ endif()
 add_test(NAME ctp_neuropress_device_path_parity
          COMMAND ${CMAKE_BINARY_DIR}/bin/neuropress_device_path_parity_exec)
 set_tests_properties(ctp_neuropress_device_path_parity PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 600
+    LABELS "693;parity;gpu")
+
+# Device-resident TRAINING path: the SGD reads the statistics the selection
+# already filled, as nnSGDKernel does. Clio's predictor only, so no upstream
+# sources and no globals stub.
+add_executable(neuropress_train_device_stats_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_train_device_stats_parity.cu)
+
+set_target_properties(neuropress_train_device_stats_parity_exec PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON)
+
+target_compile_definitions(neuropress_train_device_stats_parity_exec PRIVATE
+    CTP_ENABLE_NEUROPRESS_GPU=1
+    CTP_ENABLE_CUDA=1
+    CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CLIO_CTP_ROOT}/src/compress/model/weights")
+
+target_link_libraries(neuropress_train_device_stats_parity_exec
+    clio_ctp_compress_model)
+if(TARGET ctp::cuda_cxx)
+    target_link_libraries(neuropress_train_device_stats_parity_exec ctp::cuda_cxx)
+endif()
+if(CLIO_CORE_CUDA_NEEDS_GCOV)
+    set_property(TARGET neuropress_train_device_stats_parity_exec
+                 APPEND PROPERTY LINK_LIBRARIES gcov)
+endif()
+
+add_test(NAME ctp_neuropress_train_device_stats_parity
+         COMMAND ${CMAKE_BINARY_DIR}/bin/neuropress_train_device_stats_parity_exec)
+set_tests_properties(ctp_neuropress_train_device_stats_parity PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 600
     LABELS "693;parity;gpu")

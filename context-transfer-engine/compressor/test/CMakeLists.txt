@@ -588,3 +588,101 @@ set_tests_properties(
         LABELS "693;compressor;neuropress;explore;integration;gpu;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
+
+# The online update must be shown the config that actually ran. Drives the
+# real compressor and asserts on NeuroPressChunkDiag.
+add_executable(test_neuropress_training_inputs
+  test_neuropress_training_inputs.cc
+)
+
+target_link_libraries(test_neuropress_training_inputs
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_include_directories(test_neuropress_training_inputs PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
+
+target_compile_definitions(test_neuropress_training_inputs PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+# Twice from one binary: only with exploration ON can the written action
+# differ from the predicted one.
+add_test(NAME compressor_neuropress_training_inputs
+    COMMAND test_neuropress_training_inputs "[learning]")
+
+set_tests_properties(
+    compressor_neuropress_training_inputs
+    PROPERTIES
+        TIMEOUT 180
+        ENVIRONMENT "NP_TEST_EXPLORATION=0"
+        LABELS "693;compressor;neuropress;learning;integration;gpu;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
+
+add_test(NAME compressor_neuropress_training_inputs_explore
+    COMMAND test_neuropress_training_inputs "[learning]")
+
+set_tests_properties(
+    compressor_neuropress_training_inputs_explore
+    PROPERTIES
+        TIMEOUT 300
+        ENVIRONMENT "NP_TEST_EXPLORATION=1"
+        LABELS "693;compressor;neuropress;learning;explore;integration;gpu;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
+
+# Record-semantics parity, by compiling upstream's own
+# gpucompress_diagnostics.cpp. Skipped without a NeuroPress checkout.
+set(CLIO_NEUROPRESS_SRC_DIR "$ENV{HOME}/NeuroPress" CACHE PATH
+    "NeuroPress source tree, for the cross-project parity tests")
+
+find_path(CLIO_NVCOMP_INCLUDE_DIR nvcomp.hpp
+    PATH_SUFFIXES nvcomp
+    HINTS /usr/include/libnvcomp5-dev-cuda-12 /usr/local/include)
+
+if(EXISTS ${CLIO_NEUROPRESS_SRC_DIR}/src/api/gpucompress_diagnostics.cpp
+   AND CLIO_NVCOMP_INCLUDE_DIR)
+  add_executable(test_neuropress_diag_parity
+    test_neuropress_diag_parity.cc
+    ${CLIO_NEUROPRESS_SRC_DIR}/src/api/gpucompress_diagnostics.cpp
+    neuropress_diag_parity_globals.cc
+  )
+
+  target_link_libraries(test_neuropress_diag_parity
+    clio::cte::compressor_runtime
+    ctp::compress
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  target_include_directories(test_neuropress_diag_parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test      # simple_test.h
+    ${CLIO_NEUROPRESS_SRC_DIR}/src
+    ${CLIO_NEUROPRESS_SRC_DIR}/include
+    ${CLIO_NVCOMP_INCLUDE_DIR}
+    ${CLIO_NVCOMP_INCLUDE_DIR}/..)
+
+  add_test(NAME compressor_neuropress_diag_parity
+      COMMAND test_neuropress_diag_parity)
+
+  set_tests_properties(
+      compressor_neuropress_diag_parity
+      PROPERTIES
+          TIMEOUT 120
+          LABELS "693;compressor;neuropress;diag;parity"
+  )
+else()
+  message(STATUS
+    "NeuroPress diag parity: skipped (no NeuroPress tree at "
+    "${CLIO_NEUROPRESS_SRC_DIR}, or nvcomp headers not found)")
+endif()

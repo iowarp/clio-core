@@ -279,6 +279,21 @@ class NeuroPressNNPredictor : public CompressionPredictor {
             const std::vector<TrainingLabels>& labels) override;
 
   /**
+   * @brief Train(), with the data features read from DEVICE memory.
+   *
+   * Upstream hands inference's own d_stats_ptr to nnSGDKernel rather than
+   * measuring the chunk again to rebuild them on the host. Inputs 5-7 come
+   * from `device_stats`; the matching `features` fields are ignored.
+   *
+   * @param device_stats From ctp::ComputeDeviceStatsResident(). Snapshotted
+   *   D2D before launch, so the caller may reuse it on return. Null behaves
+   *   as Train().
+   */
+  bool TrainDeviceStats(const std::vector<CompressionFeatures>& features,
+                        const std::vector<TrainingLabels>& labels,
+                        const void* device_stats);
+
+  /**
    * @brief Deferred, head-only SGD for the DEcompression-time output.
    *
    * Port of NeuroPress's nnBatchedDecompSGDKernel and its driver.

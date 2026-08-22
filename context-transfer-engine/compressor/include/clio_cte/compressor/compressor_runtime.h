@@ -408,11 +408,17 @@ private:
   // worker_err = -1 (H5VLgpucompress.cu:2057), which becomes the function's
   // return value (:2463) and then H5Dwrite's (:3542). It never stores the chunk
   // by another route. Callers should propagate rather than degrade.
+  // out_device_stats: on the device-resident path, the
+  // ctp::DeviceFeatureStats* the ranking used, so online learning trains from
+  // those same words instead of re-measuring -- upstream passes one
+  // d_stats_ptr to both (gpucompress_compress.cpp). Null on the host path;
+  // valid only until the next chunk on this thread.
   std::vector<CompressionStats> EstCompressionStats(
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
       bool* out_ranked_by_cost = nullptr, double* out_entropy = nullptr,
       double* out_mad = nullptr, double* out_second_deriv = nullptr,
-      bool* out_neuropress_gpu_failed = nullptr);
+      bool* out_neuropress_gpu_failed = nullptr,
+      const void** out_device_stats = nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier
