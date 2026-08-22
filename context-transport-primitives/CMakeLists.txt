@@ -518,7 +518,7 @@ if(CLIO_CORE_ENABLE_BENCHMARKS)
     add_subdirectory(benchmark)
 endif()
 
-# add_subdirectory(example)
+add_subdirectory(example)
 
 # ------------------------------------------------------------------------------
 # Install hshm

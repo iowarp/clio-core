@@ -336,3 +336,18 @@ else()
     message(STATUS
         "NeuroPress Gray-Scott parity: skipped (no gray-scott sources)")
 endif()
+
+# The upstream-side twin of context-transport-primitives/example/
+# neuropress_gpu_inference.cu: same chunk, same 32 actions, same table, but
+# every number computed by NeuroPress's own kernels. Built with the parity
+# targets because it needs the upstream sources; NOT registered with ctest,
+# because it asserts nothing -- it exists to be run beside the Clio example
+# and diffed.
+clio_add_neuropress_parity_test(neuropress_upstream_inference_example_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_upstream_inference_example.cu
+    ctp_neuropress_upstream_inference_example)
+# Undo the add_test() the helper performs: this one is an example, not a test.
+if(TEST ctp_neuropress_upstream_inference_example)
+    set_tests_properties(ctp_neuropress_upstream_inference_example PROPERTIES
+        DISABLED TRUE)
+endif()
