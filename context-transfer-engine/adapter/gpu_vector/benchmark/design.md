@@ -477,6 +477,43 @@ suspend.
 
 ---
 
+## 13.5 Two principles that shrink the fault path
+
+**Principle 1: eviction takes clean pages only.** A page whose bytes are
+already in the backing store can be dropped instantly -- no I/O, no waiting,
+no completion to track. Eviction becomes a pointer operation.
+
+**Principle 2: the vector never writes back implicitly. Flushing is the
+caller's job.** There are explicit flush verbs for exactly this reason. The
+vector does not decide when the user's data is written; the user does.
+
+Together these delete the largest remaining piece of the fault path. If
+eviction never writes back, then:
+
+- there is no dirty-victim writeback to submit, so `StartEvictionAsync`
+  (1,848 instructions) and `FlushRangeBatchedAsyncLocked` (3,120) leave the
+  fault path entirely;
+- there is nothing to wait for mid-fault -- the fault's "make room" step stops
+  being an I/O operation and becomes a scan for a clean frame;
+- the put/settle machinery disappears from the miss path along with it.
+
+The measured miss path was ~19,400 instructions. Removing task submission
+(section 13) and implicit writeback (here) accounts for nearly all of it.
+
+**What happens when there is no clean victim.** Every frame in the block's
+table is dirty, so the fault cannot be served without violating principle 2.
+This is a *caller* error -- the block's dirty working set exceeds its table --
+and the right response is to say so, loudly, not to paper over it with a
+writeback the user did not ask for. It joins the requirements in section 14:
+flush before you exceed your table, or size the table for your dirty set.
+
+This is also why a fault must be able to fail. Section 13.1 says a resumed
+block finds its page resident; the honest form of that guarantee is "resident,
+or the run stops with a diagnosable error" -- never "resident eventually,
+after some I/O you did not request".
+
+---
+
 ## 14. Requirements on the caller
 
 The vector serves kernels that meet these. It should refuse or loudly warn
@@ -513,6 +550,10 @@ about kernels that do not, rather than silently degrading.
 
 - **A dirty page belongs to exactly one block.** Page-granular writeback means
   one block's eviction discards another's writes. Partition writes by page.
+- **Flush before your dirty set exceeds your table.** The vector never writes
+  back on its own (13.5), so a dirty page is unevictable until you flush it. A
+  block whose dirty pages fill its table cannot fault in anything new, and the
+  vector will say so rather than silently writing your data out.
 - **Read sharing is free.** The same page may be resident in many blocks.
 
 ### 14.4 Kernel structure
@@ -596,22 +637,31 @@ conflating the two is what broke it:
 | | advisory (`Prefetch`) | mandatory (fault servicing) |
 |---|---|---|
 | who asked | nobody yet -- a prediction | a parked block, by page number |
-| may evict | **no** | **yes, it must** |
-| may decline | yes, silently | no -- declining is a livelock |
+| may evict a **clean** page | yes | yes |
+| may evict a **dirty** page | **never** | **never** |
+| may decline | yes, silently | only by failing loudly |
 | page absent from backing store | skip it | allocate an empty frame |
 
-`Prefetch` implements the left column correctly and should not change.
+Both columns may take any **unmodified** page: its bytes are already in the
+backing store, so dropping the frame costs nothing and loses nothing. Neither
+may take a dirty one -- see the next principle.
+
+`Prefetch`'s current refusal to evict *at all* is stricter than it needs to be;
+it may reclaim clean frames. What it must never do is silently write back.
 
 ### What the design needs before it can work
 
 A host-side **claim-with-eviction** implementing the right column, which does
 not currently exist:
 
-- choose a victim in that block's table by score and recency,
-- refuse pinned or in-flight slots,
-- write the victim back if dirty and wait for that to land,
+- choose a **clean** victim in that block's table by score and recency,
+- refuse pinned, dirty, or in-flight slots,
 - fetch the requested page, or zero the frame if it has no blob yet,
-- publish `page_num` last, and only then clear `pending`.
+- publish `page_num` last, and only then clear `pending`,
+- and if no clean victim exists, fail loudly rather than write back (13.5).
+
+Note what is *absent*: no writeback, and therefore no waiting inside the
+servicer either. Eviction is a scan and a pointer swap.
 
 That is the same policy the device path implements today, moved to the host --
 which is the whole point, since on the host it costs no registers and no
