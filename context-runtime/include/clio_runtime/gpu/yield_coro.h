@@ -59,6 +59,55 @@
 
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 
+/* ------------------------------------------------------------------ */
+/* MEASUREMENT MODE: -DCLIO_YIELD_SYNC                                  */
+/*                                                                      */
+/* Compiles the SAME kernels with the coroutine-ness removed: co_await  */
+/* is elided, co_return becomes a plain return, the task types collapse */
+/* to their value types, and a yield becomes a SPIN on the same         */
+/* condition. The paging machinery is untouched -- probe, fetch, evict  */
+/* and flush all still compile in. The only thing that goes away is the */
+/* coroutine.                                                           */
+/*                                                                      */
+/* WHY: it answers "what would these kernels cost if co_await were      */
+/* free?" -- the register count of the real workload, with real paging, */
+/* and no coroutine ABI. That number is the target the coroutine build  */
+/* should be judged against, and it cannot be obtained any other way.   */
+/*                                                                      */
+/* NEVER RUN A BINARY BUILT THIS WAY. A spin cannot service a fault:    */
+/* the fetch needs the kernel to EXIT so the servicer can run, so this  */
+/* build deadlocks by construction on any miss. It is compiled and read */
+/* with cuobjdump, never launched.                                      */
+/* ------------------------------------------------------------------ */
+#if defined(CLIO_YIELD_SYNC)
+
+namespace clio::run::gpu {
+template <class V> using YCoroTaskT = V;
+using YCoroTask = void;
+using YCoroMain = void;
+struct YCoroSuspend {   // constructed and discarded; never suspends
+  clio::run::u64 tag;
+};
+}  // namespace clio::run::gpu
+
+#define co_await
+#define co_return return
+
+// The driver becomes a plain call: no frame, no resume loop, no indirection.
+#define CLIO_YCORO_RUN(create_expr) \
+  do {                              \
+    (create_expr);                  \
+  } while (0)
+
+// A yield is DELETED. Not replaced by a spin -- a spin has its own live
+// state (the resumed flag, the vote, the barrier) and would be measured as
+// coroutine cost that is not coroutine cost. Nothing is substituted.
+#define CLIO_CO_YIELD_WHEN(reap, cond, tag) do { (void)(tag); } while (0)
+
+#else  // !CLIO_YIELD_SYNC -- the real coroutine implementation follows
+
+
+
 #include <coroutine>
 
 #include <clio_runtime/gpu/yield_stack.h>
@@ -337,5 +386,6 @@ struct YCoroMain {
     }                                                                         \
   } while (0)
 
+#endif  // CLIO_YIELD_SYNC
 #endif  // CLIO_YIELD_CORO && __clang__ && __CUDA__
 #endif  // CLIO_RUNTIME_GPU_YIELD_CORO_H_

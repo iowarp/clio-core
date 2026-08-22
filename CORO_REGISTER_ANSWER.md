@@ -1,5 +1,73 @@
 # Why our kernels use 130 registers and NVSHMEM's use 87
 
+> **ROOT CAUSE FOUND (2026-08-22) -- see section 0. Everything below section 0
+> is the investigation that led there, including several wrong turns kept on
+> purpose. The registers were never the disease.**
+
+## 0. The answer: 316 integer divides per HoldPage
+
+`ListForceKernel` is **65,840 SASS instructions with 10,224 loads**. MPI's is
+1,816 with 59. **BaM's -- a real GPU page cache -- is 1,672 with 63**, smaller
+than MPI's. So paging is not inherently expensive; ours is 39x BaM's.
+
+The size ladder (one rung per TU, sm_89) locates it exactly:
+
+| rung | SASS | REG |
+|---|---|---|
+| raw pointer loop | 32 | 14 |
+| + `CLIO_GPU_INIT` + `YieldTlsPublish` | 88 | 22 |
+| + an **empty coroutine** | **200** | 28 |
+| + the loop inside the coroutine | 240 | 28 |
+| page lookup, **no coroutine** | 528 | 40 |
+| probe only (`TryHoldFast`) | 856 | 72 |
+| **+ ONE full `HoldPage`** | **21,104** | 106 |
+
+An entire coroutine is 200 instructions -- 0.3% of the kernel. **One
+`HoldPage` is 21,104.**
+
+**Why: one `HoldPage` performs 316 integer divisions/modulos.**
+
+| op | count |
+|---|---|
+| `rem.u32` | 169 |
+| `div.u32` | 52 |
+| `div.u64` | 52 |
+| `rem.u64` | 43 |
+
+NVIDIA GPUs have **no integer divide instruction**. Each expands to ~50-70
+instructions (64-bit) or ~20-30 (32-bit) -- on the order of 11,000 of the
+21,104. Every divisor is a RUNTIME value, so none can be strength-reduced:
+
+```cpp
+PageOf:     h_->page_shift_ ? (off >> h_->page_shift_) : (off / h_->elems_per_page_)
+BlockIndex: raw % h_->nblocks_
+WaySlot:    pn % ppb        (ppb * w) / d        (ppb * (w + 1)) / d
+```
+
+Hottest attributed lines: `BlockIndex` 578 instructions, `PageOf` 239,
+`Ways`/`WaySlot` 377. `BlockIndex()` is called from `BlockPages()`, `Find()`,
+`Ways()` and most other helpers, so that 64-bit modulo re-runs at every level
+of every hold.
+
+**The `PageOf` trap:** the shift is selected by a *runtime* ternary, so the
+divide is compiled in even when the shift path is the one that always
+executes. You have the optimization and still pay for the slow path.
+
+### Fixes, in order of value
+
+1. Make the divisors compile-time powers of two (`nblocks_`,
+   `pages_per_block_`, `elems_per_page_`, `d`) and use shift/mask.
+2. Make `PageOf`'s shift path unconditional so the divide is not compiled in.
+3. Cache `BlockIndex()` once per kernel instead of recomputing a 64-bit modulo
+   at every call site.
+
+### What this retires
+
+Not a compiler defect, not the coroutine lowering, not an occupancy-target
+problem, and not fixable by a register cap or `__launch_bounds__`. Eleven
+earlier hypotheses in this document were refuted by measurement; they are kept
+below so the same ground is not re-walked.
+
 Measured 2026-08-22, sm_89, real headers and real build flags. Ladder source:
 `context-transfer-engine/adapter/gpu_vector/benchmark/coro_reg_ladder.cc`.
 Each rung compiled in **its own translation unit** (see the trap in section 4).

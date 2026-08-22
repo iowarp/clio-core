@@ -95,6 +95,13 @@ cl::opt<unsigned> DevirtMaxTargets(
     cl::desc("Give up on a call site with more candidate targets than this; "
              "the compare chain stops paying for itself."));
 
+cl::opt<bool> DevirtInline(
+    "clio-coro-devirt-inline", cl::Hidden, cl::init(true),
+    cl::desc("Re-run the inliner after devirtualizing. Off by default is "
+             "wrong for small chains but ON re-flattens every kernel to the "
+             "module max, because each kernel then contains every candidate "
+             "body it could reach."));
+
 cl::opt<bool> DevirtVerbose(
     "clio-coro-devirt-verbose", cl::Hidden, cl::init(false),
     cl::desc("Report each rewritten call site and its candidate set."));
@@ -303,7 +310,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                   // heavy) only appear once the resume body is inlined into
                   // its kernel. So give the inliner a second pass over the
                   // now-direct edges, then clean up after it.
-                  if (Level != OptimizationLevel::O0) {
+                  if (DevirtInline && Level != OptimizationLevel::O0) {
                     MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(
                         InlinerPass()));
                     FunctionPassManager FPM;

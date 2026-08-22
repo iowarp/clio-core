@@ -160,3 +160,32 @@ __global__ void R7_NoCoroHold(clio::run::IpcManagerGpuInfo info,
   }
 }
 #endif
+
+#if RUNG == 8
+// R8: the SPLIT API -- plain TryHold on the hit path, co_await only on a miss.
+// Same work as R4/R5. If the hit-path coroutine was the cost, this lands near
+// R7 (40) instead of R4 (106).
+__device__ gy::YCoroMain SplitHoldCoro(gv::DeviceVector<float> dst,
+                                       u32 nblocks, u32 block) {
+  const u64 epp = dst.h_->elems_per_page_;
+  const u64 npages = (dst.h_->size_ + epp - 1) / epp;
+  for (u64 pg = block; pg < npages; pg += nblocks) {
+    auto h = dst.TryHold(pg * epp, epp, /*write=*/true);
+    if (!h) h = co_await dst.HoldPageSlow(pg * epp, epp, /*write=*/true);
+    float *const p = h.ptr();
+    const u64 nslots = epp / kStride;
+    for (u64 s = threadIdx.x; s < nslots; s += blockDim.x)
+      p[s * kStride + 3] = -1.0f;
+    __syncthreads();
+  }
+}
+__global__ void R8_SplitHold(clio::run::IpcManagerGpuInfo info,
+                             gv::DeviceVector<float> dst, u32 nblocks,
+                             gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  dst.block_override_ = 0;
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SplitHoldCoro(dst, nblocks, yv.Block()));
+}
+#endif
