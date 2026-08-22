@@ -397,6 +397,10 @@ endif()
 # nnSGDKernel directly with a fixed outcome and traces the predicted ratio, so
 # the ping-pong between the 0.1 forward clamp and the 100x cap is attributed to
 # upstream's constants rather than inferred from reading them.
+clio_add_neuropress_parity_test(neuropress_bimodal_parity_exec
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_bimodal_parity.cu
+    ctp_neuropress_bimodal_parity)
+
 clio_add_neuropress_parity_test(neuropress_ratio_head_oscillation_exec
     ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_ratio_head_oscillation.cu
     ctp_neuropress_ratio_head_oscillation)
