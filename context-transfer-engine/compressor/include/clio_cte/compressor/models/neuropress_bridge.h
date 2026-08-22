@@ -76,6 +76,20 @@ namespace clio::cte::compressor {
  *   of another algorithm's. They stay reachable through explicit selection,
  *   just not through this dynamic path.
  */
+/**
+ * @brief The cost-model weights the ranking actually used, after any
+ *        CLIO_NEUROPRESS_COST_W_* override.
+ *
+ * Upstream keeps ONE set of weights (g_rank_w0/w1/w2, g_measured_bw_bytes_per_ms)
+ * and reads them both in the ranking kernel and in the cost it gates SGD on
+ * (gpucompress_compress.cpp:662-664). Clio had the override reach the ranking
+ * only, so a "ratio cost model" run changed what was selected while the gate
+ * kept scoring the balanced cost -- training the model against an objective it
+ * was not ranking on. This exposes the resolved values so both agree.
+ */
+struct NeuroPressCostWeights { double ct, dt, io, bw; };
+NeuroPressCostWeights NeuroPressResolvedCostWeights();
+
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, double entropy, double mad,

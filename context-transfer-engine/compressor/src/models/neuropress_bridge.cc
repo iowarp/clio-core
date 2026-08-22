@@ -42,7 +42,41 @@
 #include "clio_ctp/compress/model/neuropress_nn_predictor.h"
 #include "clio_ctp/compress/model/ranking.h"
 
+
+
 namespace clio::cte::compressor {
+
+namespace {
+struct CostWeightOverride { double ct, dt, io, bw; bool any; };
+
+/* Read once: this runs per chunk on runtime worker threads, where a getenv per
+   call is both a syscall and a data race against anything setting the env. */
+CostWeightOverride ResolveCostOverride() {
+    auto read = [](const char *name, double fallback, bool *seen) {
+      const char *v = std::getenv(name);
+      if (v == nullptr || *v == '\0') return fallback;
+      char *end = nullptr;
+      const double parsed = std::strtod(v, &end);
+      if (end == v) return fallback;
+      *seen = true;
+      return parsed;
+    };
+    bool seen = false;
+    CostWeightOverride o{};
+    o.ct = read("CLIO_NEUROPRESS_COST_W_CT", 1.0, &seen);
+    o.dt = read("CLIO_NEUROPRESS_COST_W_DT", 1.0, &seen);
+    o.io = read("CLIO_NEUROPRESS_COST_W_IO", 1.0, &seen);
+    o.bw = read("CLIO_NEUROPRESS_COST_BW", 5e6, &seen);
+    o.any = seen;
+    return o;
+  }
+}  // namespace
+
+NeuroPressCostWeights NeuroPressResolvedCostWeights() {
+  static const CostWeightOverride o = ResolveCostOverride();
+  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw};
+}
+
 
 namespace {
 
@@ -235,29 +269,7 @@ std::vector<CompressionStats> RankIntoStats(
   // That is a genuinely different selector, not a tuning knob -- with equal
   // weights the I/O term is ~0.4% of the cost at 4 MiB, so the shipped model
   // is effectively a latency model and the ratio one picks quite differently.
-  struct CostWeightOverride {
-    double ct, dt, io, bw;
-    bool any;
-  };
-  static const CostWeightOverride kOverride = [] {
-    auto read = [](const char *name, double fallback, bool *seen) {
-      const char *v = std::getenv(name);
-      if (v == nullptr || *v == '\0') return fallback;
-      char *end = nullptr;
-      const double parsed = std::strtod(v, &end);
-      if (end == v) return fallback;
-      *seen = true;
-      return parsed;
-    };
-    bool seen = false;
-    CostWeightOverride o{};
-    o.ct = read("CLIO_NEUROPRESS_COST_W_CT", 1.0, &seen);
-    o.dt = read("CLIO_NEUROPRESS_COST_W_DT", 1.0, &seen);
-    o.io = read("CLIO_NEUROPRESS_COST_W_IO", 1.0, &seen);
-    o.bw = read("CLIO_NEUROPRESS_COST_BW", 5e6, &seen);
-    o.any = seen;
-    return o;
-  }();
+  static const CostWeightOverride kOverride = ResolveCostOverride();
   if (kOverride.any) {
     weights.w_cost_compress_time = kOverride.ct;
     weights.w_cost_decompress_time = kOverride.dt;
@@ -369,6 +381,7 @@ std::vector<CompressionStats> RankIntoStats(
 }
 
 }  // namespace
+
 
 std::vector<CompressionStats> NeuroPressCandidateStats(
     ctp::compress::model::CompressionPredictor &predictor,

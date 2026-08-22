@@ -9,8 +9,17 @@ context-transfer-engine/compressor/test/results
 context-transfer-engine/compressor/results
 .claude/worktrees/
 
-# CMake generated files (only in build directories)
-# Build directories already ignored above, but add specific patterns for safety
+# CMake generated files. The build/ rules above only help when the build tree is
+# actually build/ -- a stray in-source `cmake .` at the repo root writes these
+# into EVERY directory holding a CMakeLists.txt, which buries real changes under
+# ~150 untracked entries. These names have no tracked counterpart, so ignoring
+# them everywhere is safe; the one tracked Makefile is re-included below.
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+!external/bam/gnb/Makefile
 compile_commands.json
 _deps/
 venv

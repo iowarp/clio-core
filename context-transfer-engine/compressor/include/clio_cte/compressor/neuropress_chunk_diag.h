@@ -50,16 +50,28 @@ struct NeuroPressChunkDiag {
   float actual_cost = 0;     /**< post-clamp */
   float predicted_cost = 0;  /**< post-clamp */
 
-  /* ---- MAPE, clamped first: ratio capped at 100x, times floored 1 ms ---- */
+  /* ---- Per-statistic MAPE, one per predicted metric, clamped first as
+   *      upstream does: ratio capped at 100x, times floored at 1 ms
+   *      (gpucompress_compress.cpp). ---- */
   float ratio_mape = 0;
   float comp_time_mape = 0;
+  /** Decompression is not measured at write time, so upstream substitutes the
+   *  prediction for the actual and this reads 0 until a later read fills it. */
+  float decomp_time_mape = 0;
 
   /** (primary_cost - best_explored_cost) / best_explored_cost. -1 when
    *  exploration did not fire: upstream's sentinel, not a zero. */
   float regret = -1.0f;
 
+  /* ---- Predicted vs measured, per metric. Upstream's names. ---- */
   float predicted_ratio = 0;
   float actual_ratio = 0;
+  float predicted_comp_time = 0;   /**< ms, NN output 0 */
+  float compression_ms = 0;        /**< ms, measured codec kernel time */
+  float predicted_decomp_time = 0; /**< ms, NN output 1 */
+  /** Not measured at write time -- a later read is the only place it becomes
+   *  known, which is also why decomp_time_mape reads 0 here. */
+  float decompression_ms = 0;
 
   /** The model's ranked order, best first. */
   int predicted_ranking[kNeuroPressRankingSlots] = {};
@@ -89,6 +101,9 @@ int NeuroPressRecordChunkDiag(const NeuroPressChunkDiag &diag);
  */
 void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
                                           bool triggered, float regret);
+
+/** Mark that this chunk produced a weight update. No-op for a bad index. */
+void NeuroPressUpdateChunkDiagSgd(int idx, bool sgd_fired);
 
 /** @brief Cap on retained records between resets. */
 constexpr size_t kNeuroPressChunkDiagCap = 65536;

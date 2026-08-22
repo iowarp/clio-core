@@ -686,3 +686,88 @@ else()
     "NeuroPress diag parity: skipped (no NeuroPress tree at "
     "${CLIO_NEUROPRESS_SRC_DIR}, or nvcomp headers not found)")
 endif()
+
+# Does the online update make the model more accurate? Three phases of
+# randomized data with a distribution shift between them, written through the
+# real compressor, accuracy read back from NeuroPressChunkDiag. NP_LEARN=0
+# reruns the same data with learning off, which is what rules out "later
+# chunks are simply easier".
+add_executable(test_neuropress_learning_phases
+  test_neuropress_learning_phases.cc
+)
+
+target_link_libraries(test_neuropress_learning_phases
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_include_directories(test_neuropress_learning_phases PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
+
+target_compile_definitions(test_neuropress_learning_phases PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+add_test(NAME compressor_neuropress_learning_phases
+    COMMAND test_neuropress_learning_phases "[phases]")
+
+set_tests_properties(
+    compressor_neuropress_learning_phases
+    PROPERTIES
+        TIMEOUT 600
+        ENVIRONMENT "NP_LEARN=1"
+        LABELS "693;compressor;neuropress;learning;phases;integration;gpu;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
+
+# Diverse statistics -> diverse codec selection. 14 regimes spanning entropy
+# 0.03-7.5, MAD 0-65536 and 2nd derivative 0-584. NP_MODE selects
+# inference / learning / exploration; one mode per process, so the model is
+# reloaded from the .nnwt each time and a previous phase cannot carry over.
+add_executable(test_neuropress_regime_diversity
+  test_neuropress_regime_diversity.cc
+)
+
+target_link_libraries(test_neuropress_regime_diversity
+  clio::cte::compressor_runtime
+  clio::cte::compressor_client
+  clio::cte::core_runtime
+  clio::cte::core_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
+  ctp::compress
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+target_include_directories(test_neuropress_regime_diversity PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-runtime/test)
+
+target_compile_definitions(test_neuropress_regime_diversity PRIVATE
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+
+# Exploration measures K=31 alternatives per chunk, so it does ~32x the codec
+# work of the other two and needs a correspondingly longer budget.
+foreach(_m inference learning exploration)
+  set(_to 2400)
+  if(_m STREQUAL exploration)
+    set(_to 7200)
+  endif()
+  add_test(NAME compressor_neuropress_regimes_${_m}
+      COMMAND test_neuropress_regime_diversity "[regimes]")
+  set_tests_properties(compressor_neuropress_regimes_${_m} PROPERTIES
+      TIMEOUT ${_to}
+      ENVIRONMENT "NP_MODE=${_m}"
+      LABELS "693;compressor;neuropress;regimes;integration;gpu;msan_skip"
+      RESOURCE_LOCK "clio_runtime")
+endforeach()

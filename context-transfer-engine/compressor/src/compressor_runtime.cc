@@ -733,16 +733,12 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
-      // The stream is idle now -- the ranking waited on it once -- so this is a
-      // 24-byte copy and no additional stall. Gated because the selection log is
-      // its only consumer: the online-learning block recomputes its own features
-      // with ComputeCompressionFeatures. The statistics themselves stay on the
-      // device either way.
-      if (!SelectionLogEnabled()) {
-        entropy = mad = second_derivative_mean = 0.0;
-      } else if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
-                                              &second_derivative_mean,
-                                              np_stream)) {
+      // The stream is idle now -- the ranking waited on it once -- so this is
+      // a 24-byte copy and no additional stall. Ungated: the per-chunk record
+      // needs these on every chunk, not only when the selection log is on.
+      // The statistics themselves stay on the device.
+      if (!ctp::ReadDeviceFeatureStats(device_stats, &entropy, &mad,
+                                       &second_derivative_mean, np_stream)) {
         entropy = mad = second_derivative_mean = 0.0;
       }
       if (out_entropy) *out_entropy = entropy;
@@ -1475,6 +1471,14 @@ int NeuroPressRecordChunkDiag(const NeuroPressChunkDiag &diag) {
   return static_cast<int>(h->rows.size()) - 1;
 }
 
+void NeuroPressUpdateChunkDiagSgd(int idx, bool sgd_fired) {
+  if (idx < 0) return;
+  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
+  std::lock_guard<std::mutex> lk(h->mtx);
+  if (static_cast<size_t>(idx) >= h->rows.size()) return;
+  h->rows[static_cast<size_t>(idx)].sgd_fired = sgd_fired ? 1 : 0;
+}
+
 void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
                                           bool triggered, float regret) {
   if (idx < 0) return;
@@ -1840,6 +1844,101 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // exhaustive sweep and no training -- which is what best mode claims to
     // be. Mirror of e28e9315, which made exploration reachable without best
     // mode; this makes best mode reachable without learning.
+
+    // Recorded on EVERY chunk NeuroPress selected for, not only when learning
+    // is on -- upstream's recordChunkDiagnostic is likewise ungated
+    // (gpucompress_compress.cpp), and a diagnostic that only exists while the
+    // thing it diagnoses is enabled cannot serve as its control. The
+    // cost-model fields are filled in by the learning block below.
+    if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+        neuropress_predictor_->IsReady() && !stats.empty()) {
+      const std::string np_name =
+          ctp::CompressionFactory::NameForWireId(best_lib);
+      int np_base = -1;
+      for (const auto &e : ctp::compress::model::KnownCompressors()) {
+        if (np_name == e.name) { np_base = e.base_id; break; }
+      }
+      if (np_base >= 0) {
+        const uint32_t np_preset = static_cast<uint32_t>(best_preset);
+        NeuroPressChunkDiag diag;
+        diag.nn_original_action = ctp::compress::model::NeuroPressActionId(
+            np_base, UnpackQuantEnabled(np_preset), UnpackShuffle(np_preset) != 0);
+        diag.nn_action = diag.nn_original_action;
+        // Upstream ties feat_action to nn_original_action
+        // (gpucompress_diagnostics.cpp).
+        diag.feat_action = diag.nn_original_action;
+        // The selection's own features, so the record cannot disagree with
+        // what was predicted from.
+        diag.feat_entropy = static_cast<float>(sel_entropy);
+        diag.feat_mad = static_cast<float>(sel_mad);
+        diag.feat_deriv = static_cast<float>(sel_second_deriv);
+        diag.feat_eb_enc = static_cast<float>(context.error_bound_);
+        diag.feat_ds_enc = static_cast<float>(chunk_size);
+        diag.predicted_ratio = static_cast<float>(stats.front().compression_ratio_);
+        diag.actual_ratio = static_cast<float>(context.actual_compression_ratio_);
+        diag.predicted_comp_time =
+            static_cast<float>(stats.front().compress_time_ms_);
+        diag.predicted_decomp_time =
+            static_cast<float>(stats.front().decompress_time_ms_);
+        diag.compression_ms =
+            static_cast<float>(context.actual_compress_time_ms_);
+        diag.decompression_ms = 0.0f;  // only a later read can fill this
+        // One MAPE per predicted metric, plus the cost error, exactly as
+        // upstream derives them (gpucompress_compress.cpp): clamp first --
+        // times floored at 1 ms, ratio capped at 100x -- then compare.
+        // Computed here rather than on the learning path so a frozen-weights
+        // run has an accuracy to compare against.
+        {
+          const auto &f = stats.front();
+          const double pred_r = std::min(100.0, f.compression_ratio_);
+          const double pred_ct = std::max(1.0, f.compress_time_ms_);
+          const double pred_dt = std::max(1.0, f.decompress_time_ms_);
+          const double act_r = std::min(100.0, context.actual_compression_ratio_);
+          const double act_ct = std::max(1.0, context.actual_compress_time_ms_);
+          // Decompression is not measured at write time; upstream substitutes
+          // the prediction, which makes this term contribute nothing rather
+          // than penalizing an unmeasured value.
+          const double act_dt = pred_dt;
+          diag.ratio_mape = static_cast<float>(
+              (act_r > 0.0) ? std::fabs(act_r - pred_r) / act_r : 0.0);
+          diag.comp_time_mape = static_cast<float>(
+              (act_ct > 0.0) ? std::fabs(act_ct - pred_ct) / act_ct : 0.0);
+          diag.decomp_time_mape = static_cast<float>(
+              (act_dt > 0.0) ? std::fabs(act_dt - pred_dt) / act_dt : 0.0);
+
+          // Same resolved weights the gate uses, so the reported cost and
+          // the gated cost cannot disagree.
+          const auto cw = NeuroPressResolvedCostWeights();
+          const double ds = static_cast<double>(chunk_size);
+          const double a_cost = cw.ct * act_ct + cw.dt * act_dt +
+              ((act_r > 0.0) ? cw.io * ds / (act_r * cw.bw) : 0.0);
+          const double p_cost = cw.ct * pred_ct + cw.dt * pred_dt +
+              ((pred_r > 0.0) ? cw.io * ds / (pred_r * cw.bw) : 0.0);
+          diag.actual_cost = static_cast<float>(a_cost);
+          diag.predicted_cost = static_cast<float>(p_cost);
+          diag.cost_model_error_pct = static_cast<float>(
+              (a_cost > 0.0) ? std::fabs(a_cost - p_cost) / a_cost : 0.0);
+        }
+        // `stats` IS the ranking, so ids are read off it.
+        int nrank = 0;
+        for (const auto &r : stats) {
+          if (nrank >= kNeuroPressRankingSlots) break;
+          const std::string rn =
+              ctp::CompressionFactory::NameForWireId(r.compress_lib_);
+          int rb = -1;
+          for (const auto &e : ctp::compress::model::KnownCompressors()) {
+            if (rn == e.name) { rb = e.base_id; break; }
+          }
+          if (rb < 0) continue;
+          const uint32_t rp = static_cast<uint32_t>(r.compress_preset_);
+          diag.predicted_ranking[nrank++] =
+              ctp::compress::model::NeuroPressActionId(
+                  rb, UnpackQuantEnabled(rp), UnpackShuffle(rp) != 0);
+        }
+        diag.predicted_ranking_count = nrank;
+        np_diag_slot = NeuroPressRecordChunkDiag(diag);
+      }
+    }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&
         neuropress_feat_valid &&
@@ -1863,10 +1962,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // smallest output, not the fastest path to it. Leaving the latency
         // weights in would make the exhaustive search report a ceiling for a
         // different objective than the one it claims to measure.
-        const double kCostW0 = config_.neuropress_best_mode_ ? 0.0 : 1.0;
-        const double kCostW1 = config_.neuropress_best_mode_ ? 0.0 : 1.0;
-        constexpr double kCostW2 = 1.0;
-        constexpr double kCostBandwidthBytesPerMs = 5e6;
+        // The SAME weights the ranking used, so the model is gated on the
+        // objective it was ranked by. Upstream keeps one set of globals for
+        // both (g_rank_w0/w1/w2 feed nnForwardPass AND the cost at
+        // gpucompress_compress.cpp:662-664); Clio had the
+        // CLIO_NEUROPRESS_COST_W_* override reach the ranking only, so a
+        // "ratio cost model" run selected on ratio while SGD still scored the
+        // balanced cost.
+        const auto kCw = NeuroPressResolvedCostWeights();
+        const double kCostW0 = config_.neuropress_best_mode_ ? 0.0 : kCw.ct;
+        const double kCostW1 = config_.neuropress_best_mode_ ? 0.0 : kCw.dt;
+        const double kCostW2 = kCw.io;
+        const double kCostBandwidthBytesPerMs = kCw.bw;
         auto cost = [&](double compress_ms, double decompress_ms,
                         double ratio) -> double {
           double ct = std::max(1.0, compress_ms);
@@ -1951,93 +2058,61 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // decompression time ever becomes available.
           RecordDecompFeatures(task->blob_name_.str(), chunk_features);
 
-          // Built from `candidate` and `data`, so the record cannot
-          // disagree with the features. sgd_fired says whether it trained.
-          {
-            NeuroPressChunkDiag diag;
-            const int primary_action =
-                ctp::compress::model::NeuroPressActionId(
-                    candidate.base_id, candidate.quantize,
-                    candidate.byte_shuffle);
-            diag.nn_original_action = primary_action;
-            // Provisional; the exploration block completes it.
-            diag.nn_action = primary_action;
-            // Upstream ties feat_action to nn_original_action
-            // (gpucompress_diagnostics.cpp).
-            diag.feat_action = primary_action;
-            diag.feat_entropy =
-                static_cast<float>(chunk_features.shannon_entropy);
-            diag.feat_mad = static_cast<float>(chunk_features.mad);
-            diag.feat_deriv =
-                static_cast<float>(chunk_features.second_derivative_mean);
-            diag.feat_eb_enc = static_cast<float>(chunk_features.error_bound);
-            diag.feat_ds_enc =
-                static_cast<float>(chunk_features.chunk_size_bytes);
-
-            diag.cost_model_error_pct = static_cast<float>(error_pct);
-            diag.actual_cost = static_cast<float>(actual_cost);
-            diag.predicted_cost = static_cast<float>(predicted_cost);
-
-            const double pred_r =
-                predicted ? std::min(100.0, predicted->compression_ratio_) : 0.0;
-            const double act_r =
-                std::min(100.0, context.actual_compression_ratio_);
-            const double pred_ct =
-                predicted ? std::max(1.0, predicted->compress_time_ms_) : 0.0;
-            const double act_ct =
-                std::max(1.0, context.actual_compress_time_ms_);
-            // Clamped first: ct floored at 1 ms, ratio capped at 100x
-            // (gpucompress_compress.cpp).
-            diag.ratio_mape =
-                (act_r > 0.0)
-                    ? static_cast<float>(std::fabs(act_r - pred_r) / act_r)
-                    : 0.0f;
-            diag.comp_time_mape =
-                (act_ct > 0.0)
-                    ? static_cast<float>(std::fabs(act_ct - pred_ct) / act_ct)
-                    : 0.0f;
-
-            diag.predicted_ratio =
-                predicted ? static_cast<float>(predicted->compression_ratio_)
-                          : 0.0f;
-            diag.actual_ratio =
-                static_cast<float>(context.actual_compression_ratio_);
-            diag.sgd_fired =
-                (error_pct >
-                     static_cast<double>(config_.neuropress_mape_threshold_) &&
-                 !config_.neuropress_best_mode_)
-                    ? 1
-                    : 0;
-
-            // `stats` IS the ranking, so ids are read off it.
-            int nrank = 0;
-            for (const auto &s : stats) {
-              if (nrank >= kNeuroPressRankingSlots) break;
-              const std::string rn =
-                  ctp::CompressionFactory::NameForWireId(s.compress_lib_);
-              int rb = -1;
-              for (const auto &entry :
-                   ctp::compress::model::KnownCompressors()) {
-                if (rn == entry.name) { rb = entry.base_id; break; }
-              }
-              if (rb < 0) continue;
-              const uint32_t rp = static_cast<uint32_t>(s.compress_preset_);
-              diag.predicted_ranking[nrank++] =
-                  ctp::compress::model::NeuroPressActionId(
-                      rb, UnpackQuantEnabled(rp), UnpackShuffle(rp) != 0);
-            }
-            diag.predicted_ranking_count = nrank;
-
-            np_diag_slot = NeuroPressRecordChunkDiag(diag);
-          }
 
           // Withheld under best mode: that mode replaces the model's choice on
           // every chunk, so training on the outcome would teach the network
           // from a decision it did not make (upstream's
           // `&& !g_best_mode.load()`, gpucompress_compress.cpp).
-          if (error_pct >
-                  static_cast<double>(config_.neuropress_mape_threshold_) &&
-              !config_.neuropress_best_mode_) {
+          // EXPERIMENTAL, OFF BY DEFAULT -- a deliberate divergence from
+          // upstream, which gates on the cost alone (error_pct, :705
+          // gpucompress_compress.cpp) and never on a per-statistic MAPE.
+          //
+          // Why it exists: with balanced weights at 4 MiB the io term is
+          // ~0.4% of the cost, so a ratio prediction can be wrong by 4-5x
+          // while the cost error stays under the gate and the ratio head is
+          // never corrected. Setting CLIO_NEUROPRESS_SGD_ON_RATIO=1 ORs a
+          // ratio-MAPE gate onto the cost gate so that head trains too.
+          // CLIO_NEUROPRESS_RATIO_MAPE_THRESH overrides its threshold,
+          // defaulting to the same value as the cost gate.
+          //
+          // Read once: this is a per-chunk path on runtime worker threads,
+          // where a getenv per call is both a syscall and a data race.
+          struct RatioGateCfg { bool on; double thresh; };
+          static const RatioGateCfg kRatioGate = [] {
+            RatioGateCfg c{false, -1.0};
+            const char *e = std::getenv("CLIO_NEUROPRESS_SGD_ON_RATIO");
+            c.on = (e != nullptr && e[0] == '1');
+            const char *t = std::getenv("CLIO_NEUROPRESS_RATIO_MAPE_THRESH");
+            if (t && *t) {
+              char *end = nullptr;
+              const double v = std::strtod(t, &end);
+              if (end != t && v >= 0.0) c.thresh = v;
+            }
+            return c;
+          }();
+
+          const double np_cost_thresh =
+              static_cast<double>(config_.neuropress_mape_threshold_);
+          const bool np_cost_gate = error_pct > np_cost_thresh;
+
+          // Same clamps the reported ratio_mape uses, so the gate and the
+          // column agree.
+          double np_ratio_mape = 0.0;
+          {
+            const double pr = std::min(100.0, predicted->compression_ratio_);
+            const double ar = std::min(100.0, context.actual_compression_ratio_);
+            if (ar > 0.0) np_ratio_mape = std::fabs(ar - pr) / ar;
+          }
+          const bool np_ratio_gate =
+              kRatioGate.on &&
+              np_ratio_mape > (kRatioGate.thresh >= 0.0 ? kRatioGate.thresh
+                                                        : np_cost_thresh);
+
+          const bool np_will_train =
+              (np_cost_gate || np_ratio_gate) &&
+              !config_.neuropress_best_mode_;
+          NeuroPressUpdateChunkDiagSgd(np_diag_slot, np_will_train);
+          if (np_will_train) {
             std::vector<ctp::compress::model::CompressionFeatures> features = {
                 chunk_features};
             std::vector<ctp::compress::model::TrainingLabels> labels = {
