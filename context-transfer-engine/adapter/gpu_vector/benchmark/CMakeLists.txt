@@ -192,21 +192,23 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_gpu_vector_md_bench RUNTIME DESTINATION bin)
-    # REGISTER CEILING for the coroutine kernels. Clang's coroutine lowering
-    # allocates ~130 registers regardless of body, which on sm_89 caps the
-    # MD kernels at 7 blocks/SM (14 of 48 warp slots) -- and these kernels
-    # are LATENCY bound, not throughput bound: deleting the entire pair loop
-    # moved wall time by 3% while device clocks attributed 56% of block time
-    # to it. Occupancy is the lever. See lib/eternia/CMakeLists.txt in the
-    # LAMMPS tree, where the same ceiling is applied by an LLVM pass.
-    # Sweepable: -DMD_MAXRREG=<n>. 64 is the measured default; the ceiling
-    # trades registers against blocks/SM and these kernels are latency
-    # bound, so the optimum is empirical.
-    if(NOT DEFINED MD_MAXRREG)
-      set(MD_MAXRREG 64)
-    endif()
-    target_compile_options(clio_gpu_vector_md_bench PRIVATE
-        -Xcuda-ptxas --maxrregcount=${MD_MAXRREG})
+    # REGISTER CEILING for the coroutine kernels, MEASURED rather than typed.
+    # Clang's coroutine lowering allocates ~138 registers regardless of body,
+    # which on sm_89 collapses these kernels to 1 block/SM -- and they are
+    # LATENCY bound, not throughput bound: deleting the entire pair loop moved
+    # wall time by 3% while device clocks attributed 56% of block time to it.
+    # Occupancy is the lever.
+    #
+    # This used to be `-Xcuda-ptxas --maxrregcount=64`, which is translation-
+    # unit wide: it clamped every kernel in the file to one hand-picked number,
+    # plain kernels included. clio_coro_regcap() instead builds a probe copy of
+    # this target with the ceiling off, reads the REAL per-kernel register
+    # counts out of its cubin, and caps exactly the kernels that execute a
+    # device coroutine and exceed the occupancy budget. Nothing here names a
+    # register count. See cmake/ClioCoroRegCap.cmake; the occupancy target is
+    # CLIO_CORO_TARGET_BLOCKS (default 4 blocks/SM at 256 threads = 64 regs,
+    # which is what this target was validated at).
+    clio_coro_regcap(clio_gpu_vector_md_bench)
     # MD_DEVTRACE=ON turns on the fault path's own device printf tracing
     # (CLIO_YCORO_DEVTRACE in device_vector.h) for debugging wedges.
     if(MD_DEVTRACE)

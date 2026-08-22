@@ -272,6 +272,9 @@ endif()
 # Provides macros for dependency resolution and ChiMod build functions
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(ClioCoreCommon)
+# Measured per-kernel register ceilings for device-coroutine kernels; a no-op
+# unless CLIO_GPU_YIELD_CORO is on and the CUDA compiler is clang.
+include(ClioCoroRegCap)
 
 #------------------------------------------------------------------------------
 # External Library Discovery
