@@ -357,3 +357,176 @@ evict, submit, settle — does not need to be inside the compute kernel at all.
 Recording "this block needs page P" and parking would leave the compute kernel
 with the 632-instruction hit path and drop the other ~19,400.
 
+
+---
+
+# Part II — The target design
+
+Part I describes what exists. This part describes what it should be, given the
+measurements in section 11 and three rules:
+
+1. **On return from a `co_await`, the data is resident.** No re-check, no
+   retry loop, no "declined" path in the kernel.
+2. **Anything that can wait is a `co_await`.** No `future.Wait()`, no spin, no
+   blocking call anywhere in device code.
+3. **The vector states its requirements and the kernel meets them.** It does
+   not bend to accommodate access patterns it cannot serve well.
+
+---
+
+## 12. What the measurements actually indict
+
+The hit path is fine: 632 instructions, 46 registers, 3% of a hold. Keep it.
+
+The indictment is narrow and specific: **the kernel builds and submits runtime
+tasks.** `FetchPagesBatchedLocked` alone is 8,208 instructions and 72
+registers; with `BeginFetch`, `BeginFetchRunLocked`,
+`FlushRangeBatchedAsyncLocked` and `AwaitFlush` it is essentially the entire
+20,000. That code constructs a task, populates it with shared-memory pointers,
+pushes it on the gpu2cpu ring, waits on a future, and settles a batch --
+**inside a kernel whose next act, on the path that needs it, is to exit.**
+
+It is also duplicated at every hold site in every kernel, so a kernel with
+eighteen holds carries eighteen copies of a fetch engine it may never run.
+
+The current design reached this state honestly: it made the fault path
+self-service so a block could make progress without leaving. But a block
+*cannot* make progress without leaving -- the servicer cannot run while the
+kernel holds the GPU. The self-service machinery buys nothing and costs
+everything.
+
+---
+
+## 13. The target: the kernel resolves, the servicer provides
+
+**The kernel's device-side page-cache code reduces to two things: a probe, and
+a fault record plus a park.** No claim, no eviction, no writeback, no task
+construction, no batching, no settlement.
+
+### 13.1 The fault protocol
+
+1. **Probe.** Block-uniform lookup in this block's table, voted. A hit returns
+   a pointer and a run length. This is the 632-instruction path, unchanged.
+2. **Record.** On a miss, thread 0 writes one small record -- page number,
+   write intent, block identity -- into this block's fault slot. A few stores.
+3. **Park.** The block suspends with a wait tag naming its fault slot, and the
+   kernel returns. This is the existing park; nothing new is needed.
+4. **Serve.** The servicer -- the host-side driver that already relaunches
+   parked kernels -- reads the outstanding fault records across *all* blocks
+   and, for each: chooses a victim, writes it back if dirty, issues the fetch
+   (batching freely across blocks), waits for completion, publishes the page
+   into the slot, and only then clears the fault.
+5. **Resume.** The kernel relaunches and the block re-probes. **By rule 1 this
+   is guaranteed to hit**, because the servicer does not clear the fault until
+   the page is resident and readable.
+
+The kernel-side cost of a miss becomes a few stores and a suspend. Everything
+that made the miss path 19,400 instructions moves to the host, where it is
+written once, in ordinary C++, with no register budget and no instruction-cache
+pressure.
+
+### 13.2 What this deletes outright
+
+- `FetchPagesBatchedLocked`, `BeginFetch`, `BeginFetchRunLocked` -- task
+  submission leaves the device.
+- `FlushRangeBatchedAsyncLocked` -- writeback becomes the servicer's job,
+  triggered by eviction or an explicit flush epoch.
+- `SettleOneLocked`, `SettlePutLocked`, `SettleScoreLocked`,
+  `SettleBatchLocked`, `ReapFetched`, `ReapFlushed` -- nothing to settle on the
+  device if nothing was submitted there.
+- Every `future.Wait()` -- rule 2, achieved structurally rather than by
+  discipline.
+- `ClaimSlotWindowLocked`, `StartEvictionAsync`, `EvictPages` -- slot policy
+  becomes the servicer's.
+- `RetryLostFetch` and the re-issue loop -- rule 1 makes a resume that misses
+  impossible, so there is nothing to retry.
+- The block lock in the steady state: with no claiming or eviction on the
+  device, the only device-side table access is a read-only probe.
+
+Projected kernel cost per hold site: **~700 instructions instead of 20,000**,
+registers in the mid-40s instead of 90 -- the hit path plus a store and a
+suspend.
+
+### 13.3 What it buys beyond size
+
+- **Better batching, not worse.** The servicer sees every block's outstanding
+  faults at once. A single block can only batch its own; the servicer can
+  coalesce across the whole grid and issue one transfer where the current
+  design issues many.
+- **The eviction policy gets a global view** instead of a per-block one, and
+  can change without recompiling a kernel.
+- **Rule 2 becomes structural.** There is no device-side future to wait on, so
+  no one can reintroduce a spin.
+- **The block lock stops being a latency risk.** Today a device thread can spin
+  on a host completion while holding it.
+
+### 13.4 What it costs, honestly
+
+- **A fault always costs a kernel exit and relaunch.** Today a fault that could
+  be satisfied from an already-landed batch is retired in-kernel; that case
+  disappears. This is only acceptable because faults are meant to be rare --
+  and where they are not, the answer is prefetch, not in-kernel servicing.
+- **Per-fault latency may rise** even as throughput improves, because
+  everything round-trips through the servicer. The mitigation is cross-block
+  batching, which lowers the *per-page* cost.
+- **The servicer becomes load-bearing** and sits on the critical path of every
+  fault.
+- **The fault slot is a new shared structure** needing its own discipline --
+  though one writer per block is far simpler than the current multi-state page
+  table.
+
+---
+
+## 14. Requirements on the caller
+
+The vector serves kernels that meet these. It should refuse or loudly warn
+about kernels that do not, rather than silently degrading.
+
+### 14.1 Geometry
+
+- **Page size is a power of two.** Every index derivation becomes a shift and a
+  mask. Non-power-of-two sizes force integer division, which a GPU has no
+  instruction for -- measured at 316 div/mod operations per hold today.
+- **Pages per block and block count are powers of two**, for the same reason.
+- **A page divides the kernel's access unit.** A row, tile or record must lie
+  wholly within one page. This is the highest-value requirement in this list:
+  it removes the two-span split, and with it a second hold, a second guard, and
+  a select on every element access.
+- **Block size is known at compile time.** Template the kernel on it, so the
+  launch shape can be declared and the compiler can derive the register count
+  for the real configuration instead of guessing.
+
+### 14.2 Access discipline
+
+- **Access is page-granular.** Take a hold, get a pointer and a run, loop over
+  the run. Per-element resolution is not a supported pattern.
+- **Holds are block-uniform.** Every thread of the block takes the same hold; a
+  hold only some threads take will hang at the suspend.
+- **The working set is declared and fits the block's table.** A block that
+  holds more pages than it has slots cannot progress; the vector should refuse
+  that configuration at launch rather than deadlock at runtime.
+- **Holds are scoped tightly.** A guard alive across the next hold keeps its
+  page unevictable -- correct for an intended multi-page working set, a slot
+  leak otherwise.
+
+### 14.3 Data ownership
+
+- **A dirty page belongs to exactly one block.** Page-granular writeback means
+  one block's eviction discards another's writes. Partition writes by page.
+- **Read sharing is free.** The same page may be resident in many blocks.
+
+### 14.4 Kernel structure
+
+- **`__shared__` state does not survive a hold that can fault.** A fault exits
+  the kernel; anything staged in shared memory is gone on resume. Use registers
+  or per-block global scratch, or re-stage after every hold.
+- **Prefetch what you can predict.** The design targets the resident case with
+  faults as the exception. A kernel whose access pattern is known ahead of time
+  should declare it rather than discover it by faulting.
+
+### 14.5 The contract in one line
+
+> Give the vector page-aligned, block-uniform, page-granular access with a
+> declared working set that fits, and it will give you an array larger than
+> VRAM at close to resident speed. Violate any of those and it will still be
+> correct, but it will not be fast -- and the vector should say so.
