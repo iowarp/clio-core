@@ -219,6 +219,26 @@ void SgdWaitIfEverFired(cudaStream_t st) {
   }
 }
 
+/* Called by the HOST-side weight readback before it copies.
+ *
+ * The stream variant above expresses the dependency GPU-side, which is what
+ * inference needs and what upstream does. A host readback needs the host
+ * itself to wait, and needs it for a reason specific to this design: the SGD
+ * stream is cudaStreamNonBlocking precisely so it does NOT serialize against
+ * the legacy default stream -- which means a blocking cudaMemcpy on that
+ * stream is not ordered against SGD either, and copies the weights as they
+ * were BEFORE the update. That is a one-step lag, not a corruption, so it
+ * reads as a plausible parity result rather than an obvious bug.
+ *
+ * Waiting on the event rather than the stream keeps this correct under
+ * --default-stream per-thread, where "the default stream" is not one stream. */
+void SgdHostWaitIfEverFired() {
+  SgdSync &g = Sgd();
+  if (g.ok && g.ever_fired.load(std::memory_order_acquire)) {
+    cudaEventSynchronize(g.done);
+  }
+}
+
 float *EmaBuffer() {
   static thread_local float *buf = [] {
     float *p = nullptr;
@@ -342,6 +362,8 @@ void NeuroPressGpuFree(NeuroPressGpuWeights *w) {
 void NeuroPressGpuDownloadWeights(NeuroPressGpuWeights *w, float *weights_out,
                                   float *biases_out) {
   if (!w) return;
+  /* The weights this reads may still be in flight on the SGD stream. */
+  SgdHostWaitIfEverFired();
   float host_params[kParamCount];
   cudaMemcpy(host_params, &w->params, sizeof(host_params),
             cudaMemcpyDeviceToHost);
