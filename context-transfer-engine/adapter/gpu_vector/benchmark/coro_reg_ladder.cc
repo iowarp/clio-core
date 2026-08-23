@@ -70,7 +70,7 @@ __global__ void R3_RawLoopCoro(clio::run::IpcManagerGpuInfo info, float *p,
 #if RUNG == 4
 // R4: + ONE HoldPage. This is the paging machinery entering the kernel.
 __device__ gy::YCoroMain OneHoldCoro(gv::DeviceVector<float> dst) {
-  const u64 epp = dst.h_->elems_per_page_;
+  const u64 epp = dst.ElemsPerPage();
   auto h = co_await dst.HoldPage(0, epp, /*write=*/true);
   float *const p = h.ptr();
   const u64 nslots = epp / kStride;
@@ -93,7 +93,7 @@ __global__ void R4_OneHold(clio::run::IpcManagerGpuInfo info,
 // R5: the real SentinelCoro -- HoldPage in a LOOP. What the MD bench ships.
 __device__ gy::YCoroMain SentinelLikeCoro(gv::DeviceVector<float> dst,
                                           u32 nblocks, u32 block) {
-  const u64 epp = dst.h_->elems_per_page_;
+  const u64 epp = dst.ElemsPerPage();
   const u64 npages = (dst.h_->size_ + epp - 1) / epp;
   for (u64 pg = block; pg < npages; pg += nblocks) {
     auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
@@ -121,7 +121,7 @@ __global__ void R5_Sentinel(clio::run::IpcManagerGpuInfo info,
 // what costs the registers, this rung is cheap and the fix is architectural
 // rather than compiler-side.
 __device__ gy::YCoroMain FastOnlyCoro(gv::DeviceVector<float> dst) {
-  const u64 epp = dst.h_->elems_per_page_;
+  const u64 epp = dst.ElemsPerPage();
   volatile u64 run = dst.TryHoldFast(0, epp, /*write=*/true);
   // Consume `run` without touching the page: this rung prices the PROBE,
   // not the access.
@@ -149,7 +149,7 @@ __global__ void R7_NoCoroHold(clio::run::IpcManagerGpuInfo info,
   CLIO_GPU_INIT(info, nullptr);
   dst.block_override_ = 0;
   __syncthreads();
-  const u64 epp = dst.h_->elems_per_page_;
+  const u64 epp = dst.ElemsPerPage();
   const u64 run = dst.TryHoldFast(0, epp, /*write=*/true);
   if (run != 0) {
     float *const p = static_cast<float *>(dst.last_page_->data);
@@ -167,7 +167,7 @@ __global__ void R7_NoCoroHold(clio::run::IpcManagerGpuInfo info,
 // R7 (40) instead of R4 (106).
 __device__ gy::YCoroMain SplitHoldCoro(gv::DeviceVector<float> dst,
                                        u32 nblocks, u32 block) {
-  const u64 epp = dst.h_->elems_per_page_;
+  const u64 epp = dst.ElemsPerPage();
   const u64 npages = (dst.h_->size_ + epp - 1) / epp;
   for (u64 pg = block; pg < npages; pg += nblocks) {
     auto h = dst.TryHold(pg * epp, epp, /*write=*/true);

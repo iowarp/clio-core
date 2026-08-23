@@ -104,17 +104,17 @@ __device__ __noinline__ void WritePage(const gv::Held<u32> &h, u64 poff,
 /** Touch and flush every page, so the timed loop starts from a known state. */
 __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
                                   u64 pages_per_region, u32 block) {
-  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
+  const u64 region_elems = pages_per_region * v.ElemsPerPage();
   const u64 block_base = static_cast<u64>(block) * iters * region_elems;
   for (u64 it = 0; it < iters; ++it) {
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
-      const u64 poff = off + pg * v.h_->elems_per_page_;
-      auto h = co_await v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
+      const u64 poff = off + pg * v.ElemsPerPage();
+      auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
       WritePage(h, poff, 0u);
     }
-    v.FlushAsync(off, region_elems);
-    co_await v.AwaitFlush();
+    co_await v.BeginFlush();
+    co_await v.EndFlush();
   }
 }
 
@@ -141,7 +141,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
                                             u64 clock_khz, int do_write,
                                             u32 pass, int async, int no_flush,
                                             u32 block) {
-  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
+  const u64 region_elems = pages_per_region * v.ElemsPerPage();
   const u64 block_base = static_cast<u64>(block) * iters * region_elems;
   bool pending = false;
 
@@ -154,7 +154,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
     //      the spin above. Sync collects it below, before the next spin --
     //      that placement is the entire difference the benchmark measures.
     if (async && pending) {
-      co_await v.AwaitFlush();
+      co_await v.EndFlush();
       pending = false;
     }
 
@@ -164,10 +164,10 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
       // Page at a time, so the whole block is inside one page at any moment --
       // the granularity the vector's paging contract assumes.
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 poff = off + pg * v.h_->elems_per_page_;
+        const u64 poff = off + pg * v.ElemsPerPage();
         const long long h0 = clock64();
         auto h =
-            co_await v.HoldPage(poff, v.h_->elems_per_page_, /*write=*/true);
+            co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
         if (threadIdx.x == 0) {
           atomicAdd(&g_round_cyc[7], (unsigned long long) (clock64() - h0));
         }
@@ -177,7 +177,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
       // ---- block-level flush: ONE collective call covering the region ----
       // GV_NO_FLUSH diagnostic: isolate the write loop's cost from the
       // flush machinery (dirty pages are simply left behind).
-      if (!no_flush) v.FlushAsync(off, region_elems);
+      if (!no_flush) co_await v.BeginFlush();
       const long long w2 = clock64();
       if (threadIdx.x == 0) {
         atomicAdd(&g_round_cyc[4], (unsigned long long) (w1 - w0));
@@ -189,14 +189,14 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
         pending = true;
       } else {
         const long long w3 = clock64();
-        co_await v.AwaitFlush();
+        co_await v.EndFlush();
         if (threadIdx.x == 0) {
           atomicAdd(&g_round_cyc[6], (unsigned long long) (clock64() - w3));
         }
       }
     }
   }
-  if (pending) co_await v.AwaitFlush();
+  if (pending) co_await v.EndFlush();
 }
 
 __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
@@ -250,7 +250,7 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
                                               unsigned long long *first_bad,
                                               unsigned long long *bad_off,
                                               u32 *bad_got, u32 block) {
-  const u64 region_elems = pages_per_region * v.h_->elems_per_page_;
+  const u64 region_elems = pages_per_region * v.ElemsPerPage();
   const u64 block_base = static_cast<u64>(block) * iters * region_elems;
   unsigned long long acc = 0;
 
@@ -262,8 +262,10 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
     if (async && threadIdx.x == 0 && it + 1 < iters) {
       const u64 nxt = block_base + (it + 1) * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
-        const u64 pn = v.PageOf(nxt + pg * v.h_->elems_per_page_);
-        gv::DeviceVectorTestAccess::RescorePage(v, pn, 1000.0f);
+        const u64 pn = v.PageOf(nxt + pg * v.ElemsPerPage());
+        co_await v.RescorePages(1, [=](clio::run::u32) {
+          return gv::PageScore{pn, 1000.0f};
+        });
         // DEVICE-INITIATED PREFETCH IS GONE. A kernel cannot start a fetch any
         // more: it can only fault (record + park) and let the host servicer
         // resolve it. Prefetching is a host operation between launches. The
@@ -275,8 +277,8 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
 
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
-      const u64 poff = off + pg * v.h_->elems_per_page_;
-      auto h = co_await v.HoldPage(poff, v.h_->elems_per_page_);
+      const u64 poff = off + pg * v.ElemsPerPage();
+      auto h = co_await v.HoldPage(poff, v.ElemsPerPage());
       unsigned long long local = 0;
       unsigned long long wrong = 0;
       for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
@@ -302,7 +304,9 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
       // Consumed: lowest score makes it the next victim, freeing a slot for
       // the prefetch that follows.
       if (async && threadIdx.x == 0) {
-        gv::DeviceVectorTestAccess::RescorePage(v, v.PageOf(poff), -1000.0f);
+        co_await v.RescorePages(1, [=](clio::run::u32) {
+          return gv::PageScore{v.PageOf(poff), -1000.0f};
+        });
       }
       __syncthreads();
     }
@@ -396,8 +400,8 @@ __global__ void DumpSlotsKernel(gv::DeviceVector<u32> v,
                                 unsigned long long *out) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   // Block 0's slice sits at the front of the shared page table.
-  const gv::Page *tbl = v.h_->pages_;
-  for (clio::run::u32 i = 0; i < v.h_->pages_per_block_; ++i) {
+  const gv::Page *tbl = v.TableForDebug();
+  for (clio::run::u32 i = 0; i < v.PagesPerTable(); ++i) {
     out[2 * i] = tbl[i].page_num;
     out[2 * i + 1] =
         (tbl[i].page_num == gv::kNoPage || tbl[i].data == nullptr)
@@ -930,9 +934,6 @@ int main(int argc, char **argv) {
         (io_only > 0.0) ? working_mb / (io_only / 1000.0) : 0.0,
         sync_ms, (unsigned long long) sync_st.faults,
         async_ms, (unsigned long long) async_st.faults,
-        (unsigned long long) async_st.prefetches,
-        (unsigned long long) async_st.prefetch_hits,
-        (unsigned long long) async_st.prefetch_late,
         ok ? "data=OK" : "data=MISMATCH",
         spin_only + io_only, mx, sync_ms / async_ms,
         (sync_ms > mx) ? (sync_ms - async_ms) / (sync_ms - mx) * 100.0 : 0.0);
@@ -985,7 +986,7 @@ int main(int argc, char **argv) {
             rc4[2] / n * us, rc4[4] * us / 1000.0, rc4[7] * us / 1000.0,
             rc4[5] * us / 1000.0, rc4[6] * us / 1000.0,
             (unsigned long long) ps.faults, (unsigned long long) ps.evicts);
-        const auto hist = vec.ReadFaultHist(0);
+        const std::vector<unsigned int> hist;  // histogram removed
         if (!hist.empty()) {
           std::printf("    [hist] faulting pages:");
           int shown = 0;

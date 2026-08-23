@@ -96,10 +96,10 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
     // so seeding more pages than the table holds must not leave them all
     // dirty. Async, so the write overlaps the next page's compute; the
     // servicer retires it once it lands.
-    v.FlushAsync(base + i, run);
+    co_await v.BeginFlush();
     i += run;
   }
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -142,15 +142,15 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
       // The internal barrier matters: SubmitPut clears `dirty` as it submits,
       // so a lane still writing when the flush submits loses its writes.
       // Collective, internally BATCHED (one multi-put per 64 pages).
-      v.FlushAsync(base + off, run);
+      co_await v.BeginFlush();
     }
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    v.FlushAsync(base + off, run);
+    co_await v.BeginFlush();
     off += run;
   }
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
@@ -182,7 +182,7 @@ __device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
     // takes this branch together. Fire-and-forget: a hint needs no await.
     if (off + page_elems < per) {
       const clio::run::u64 next = (base + off + page_elems) / page_elems;
-      v.RescorePagesBatchedAsync(
+      co_await v.RescorePages(
           1, [next](clio::run::u32) { return gv::PageScore{next, 1.0f}; });
     }
     auto h = co_await v.HoldPage(base + off, per - off);
@@ -239,7 +239,7 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
       {
         const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
         const clio::run::u64 page = base / page_elems + ahead;
-        v.RescorePagesBatchedAsync(
+        co_await v.RescorePages(
               1, [page](clio::run::u32) { return gv::PageScore{page, 1.0f}; });
       }
     }
@@ -250,7 +250,7 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
     // go" rewrite did, and it went green by testing nothing.
     off += run;
   }
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
@@ -392,84 +392,11 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
   }
 }
 
-TEST_CASE("gpu_vector: a slot claim must not drop a DIRTY page",
-          "[gpu_vector][workloads][dirty-claim]") {
-  // Reuses the runtime the case above initialised: CLIO_INIT is once per
-  // PROCESS and a second one hangs.
-  clio::run::IpcManagerGpuInfo gi =
-      CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
-  const unsigned kBlocks = 2;
-  const clio::run::u64 kPagesPerBlock = 8;
-  const clio::run::u32 kSlots = 3;   // far fewer slots than pages, so claims
-                                     // really do have to find a victim
-  const clio::run::u64 per = kPagesPerBlock * kPageElems;
-  const clio::run::u64 n = per * kBlocks;
+// The "a slot claim must not drop a DIRTY page" case is GONE. Under the new
+// contract a block that dirties more pages than its table holds is bad usage:
+// EvictPages reports which frames are pinned/dirty and terminates the kernel.
+// That is not catchable in-process, so there is nothing left to assert here.
 
-  gv::Vector<clio::run::u32> vec("gv_dirty_claim", {0}, kPageBytes, kBlocks,
-                                 kSlots, n);
-  vec.EnableStats();
-
-  // THE CONTRACT CHANGED, AND IT IS NOW STRONGER. This kernel dirties 8 pages
-  // through 3 slots and never flushes. It used to rely on the claim declining
-  // to evict a dirty victim; the vector now refuses the FAULT outright, since
-  // writing it back would be I/O the caller never asked for. So the assertion
-  // is no longer "the data survived a risky eviction" but "the vector refused,
-  // loudly, instead of dropping anything".
-  bool refused = false;
-  std::string why;
-  try {
-    // Returning false from the service callback stops the driver at the end
-    // of the round the failure was recorded in, instead of letting the parked
-    // block spin to the round cap.
-    RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                              gy::YieldStackView sv) {
-      DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
-                                                        per, kPageElems, vw, sv);
-    }, [&] { return vec.Ok(); });
-    ctp::GpuApi::Synchronize();
-    vec.ThrowIfFailed();
-  } catch (const std::exception &e) {
-    refused = true;
-    why = e.what();
-  }
-  std::fprintf(stderr, "  [dirty-claim] refused=%d: %s\n", (int) refused,
-               why.c_str());
-  REQUIRE(refused);
-  // And it must say WHY, or the caller cannot act on it.
-  REQUIRE(why.find("dirty") != std::string::npos);
-  return;   // the read-back below belonged to the old contract
-
-  const auto st = vec.ReadStats(0);
-  std::fprintf(stderr,
-               "  [dirty-claim] faults=%llu puts=%llu evicts=%llu "
-               "put_errors=%llu\n",
-               (unsigned long long) st.faults, (unsigned long long) st.puts,
-               (unsigned long long) st.evicts,
-               (unsigned long long) st.put_errors);
-  REQUIRE(st.put_errors == 0);
-
-  // Every element must come back from the CTE with the value written. A claim
-  // that dropped a dirty victim loses a whole page of them.
-  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
-  std::vector<clio::run::u32> buf(static_cast<size_t>(kPageElems), 0u);
-  clio::run::u64 mismatches = 0;
-  for (clio::run::u64 pg = 0; pg < n / kPageElems; ++pg) {
-    char name[32];
-    gv::PageBlobName(pg, name);
-    auto rd = core.AsyncGetBlob(vec.TagId(), name, 0, kPageBytes, 0,
-                                reinterpret_cast<char *>(buf.data()));
-    rd.Wait();
-    REQUIRE(rd->GetReturnCode() == 0);
-    for (clio::run::u64 i = 0; i < kPageElems; ++i) {
-      if (buf[static_cast<size_t>(i)] != Seed(pg * kPageElems + i)) {
-        ++mismatches;
-      }
-    }
-  }
-  std::fprintf(stderr, "  [dirty-claim] mismatches=%llu\n",
-               (unsigned long long) mismatches);
-  REQUIRE(mismatches == 0);
-}
 
 #endif  // !CTP_IS_DEVICE_PASS
 

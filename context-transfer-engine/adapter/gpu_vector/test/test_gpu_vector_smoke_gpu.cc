@@ -104,8 +104,8 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
     // table holds without flushing is a caller error, and the servicer says so
     // rather than silently writing data out. Flushing per page keeps the dirty
     // set at one.
-    v.FlushAsync(i, run);
-    co_await v.AwaitFlush();
+    co_await v.BeginFlush();
+    co_await v.EndFlush();
     i += run;
   }
   // Every page was flushed as it was written; nothing is left dirty.
@@ -175,8 +175,8 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go -- see FillCoro. With 2 slots per block this vector is
     // oversubscribed, so leaving pages dirty would fill the table and the
     // fault could not be served without a writeback nobody asked for.
-    v.FlushAsync(base + i, run);
-    co_await v.AwaitFlush();
+    co_await v.BeginFlush();
+    co_await v.EndFlush();
     i += run;
   }
 }

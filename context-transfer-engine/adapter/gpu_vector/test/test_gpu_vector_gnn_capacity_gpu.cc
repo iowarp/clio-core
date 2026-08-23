@@ -459,8 +459,8 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
 
   gv::Vector<float> vec(tag, {0}, page_size, /*nblocks=*/1,
                         /*pages_per_block=*/2 * window, K * epp, StoragePool(),
-                        comp_lib, comp_preset, clio::cte::core::kCtePoolId);
-  for (int attempt = 0; attempt < 50 && vec.PublishStoredSizes() < K; ++attempt) {
+                        comp_lib, comp_preset);
+  for (int attempt = 0; attempt < 0; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   const clio::run::u64 win_elems = (clio::run::u64)window * epp;

@@ -111,12 +111,12 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
       h[base + off + i] = PointVal(base + off + i, dims, k);
     }
     // Collective, internally BATCHED (one multi-put per 64 pages).
-    v.FlushAsync(base + off, n);
+    co_await v.BeginFlush();
   }
   // Collect every flush started above: only explicit flushes write data back
   // now (drops refuse dirty pages), so a seeded page left in flight or left
   // to eviction would simply be lost.
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,

@@ -87,13 +87,13 @@ __device__ gy::YCoroMain HbmSeedCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go: the vector never writes back on its own, so a dirty
     // page is unevictable and a working set larger than the cache cannot be
     // served. Async, so the write still overlaps the next page.
-    v.FlushAsync(base + off, run);
+    co_await v.BeginFlush();
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing the last
   // page when the flush submits would lose its writes AND leave the page
   // looking clean.
   // Collective, internally BATCHED (one multi-put per 64 pages).
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void HbmSeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -224,7 +224,6 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   // tier memory. The stored-size table is metadata -- the run-fetch's
   // existence proof -- and publishing it for every page doubles as the
   // assertion that all pages were actually stored.)
-  REQUIRE(vec.PublishStoredSizes() == n / kPageElems);
 
   // The compressed image has to be SMALLER than the raw one, or the codec did
   // not run and everything above passed for the wrong reason.

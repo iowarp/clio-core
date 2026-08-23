@@ -1358,11 +1358,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
                                      page_size) >> 20));
   gv::Vector<float> vec(vec_tag, {0}, page_size, gather_blocks,
                         /*pages_per_block=*/ppb, K * epp, StoragePool(),
-                        comp_lib, comp_preset, clio::cte::core::kCtePoolId);
+                        comp_lib, comp_preset);
   vec.EnableStats();
   // Tell the device side how big each stored page is, so an encoded page is
   // fetched with its true (compressed) length rather than the logical one.
-  for (int attempt = 0; attempt < 50 && vec.PublishStoredSizes() < K; ++attempt) {
+  for (int attempt = 0; attempt < 0; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   std::vector<double> et_loss(epochs), et_acc(epochs), et_vacc(epochs);
@@ -1401,37 +1401,13 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     const unsigned long long need = (unsigned long long)K * (unsigned long long)epochs;
     std::fprintf(stderr,
         "[TRAIN] PAGING: faults=%llu (workload needs %llu -> %.2fx) evicts=%llu puts=%llu "
-        "prefetches=%llu pf_hits=%llu pf_late=%llu pf_dropped=%llu "
-        "verify_lost=%llu get_err=%llu put_err=%llu\n",
+        "get_err=%llu put_err=%llu\n",
         (unsigned long long)vs.faults, need,
         need ? (double)vs.faults / (double)need : 0.0,
         (unsigned long long)vs.evicts, (unsigned long long)vs.puts,
-        (unsigned long long)vs.prefetches,
-        (unsigned long long)vs.prefetch_hits, (unsigned long long)vs.prefetch_late,
-        (unsigned long long)vs.pf_dropped, (unsigned long long)vs.verify_lost,
         (unsigned long long)vs.get_errors, (unsigned long long)vs.put_errors);
   }
-  {
-    // Per-page fetch counts (CLIO_FAULT_HIST=1). The workload reads each page
-    // exactly `epochs` times, so any page fetched more than that was evicted
-    // before it was used -- this says WHICH pages churn, not just how many.
-    auto fh = vec.ReadFaultHist(0);
-    if (!fh.empty()) {
-      unsigned long long tot = 0, over = 0, zero = 0, mx = 0;
-      for (auto v : fh) {
-        tot += v;
-        if (v == 0) ++zero;
-        if (v > (unsigned)epochs) over += (v - (unsigned)epochs);
-        if (v > mx) mx = v;
-      }
-      std::fprintf(stderr,
-          "[TRAIN] FAULT HIST: pages=%zu never_fetched=%llu total_fetches=%llu "
-          "wasted=%llu (%.1f%%) max_per_page=%llu ideal=%llu\n",
-          fh.size(), zero, tot, over,
-          tot ? 100.0 * (double)over / (double)tot : 0.0, mx,
-          (unsigned long long)fh.size() * (unsigned long long)epochs);
-    }
-  }
+
   if (g_ktime) {
     std::fprintf(stderr,
         "[TRAIN] KTIME: gather=%.2fs forward=%.2fs gradW1=%.2fs gradW2=%.2fs\n",

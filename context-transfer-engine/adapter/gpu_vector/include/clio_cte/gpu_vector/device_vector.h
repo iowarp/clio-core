@@ -46,6 +46,10 @@ struct VecHeader {
   unsigned long long *stat_faults_;
   unsigned long long *stat_puts_;
   unsigned long long *stat_evicts_;
+  /** Transfers that came back non-zero. Load-bearing: a codec that quietly
+   *  stored raw bytes shows up here and nowhere else. */
+  unsigned long long *stat_get_errors_;
+  unsigned long long *stat_put_errors_;
 };
 
 /**
@@ -120,6 +124,14 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 PageOf(clio::run::u64 off) const {
     return off / h_->elems_per_page_;
   }
+  CTP_GPU_FUN clio::run::u32 NumTables() const { return h_->nblocks_; }
+  /** This block's page table, for diagnostics that dump residency. */
+  CTP_GPU_FUN const Page *TableForDebug() const { return Pages(); }
+  /** The device header, so a host diagnostic can copy the table out. */
+  CTP_CROSS_FUN const VecHeader *HeaderForDebug() const { return h_; }
+  CTP_GPU_FUN clio::run::u32 PagesPerTable() const {
+    return h_->pages_per_block_;
+  }
   CTP_GPU_FUN clio::run::u64 NumPages() const {
     return (h_->num_elems_ + h_->elems_per_page_ - 1) / h_->elems_per_page_;
   }
@@ -137,7 +149,13 @@ class DeviceVector {
       co_await EvictPages(1, 1);
       if (threadIdx.x == 0) SubmitFault(pn);
       CLIO_CO_YIELD_WHEN(;, !FaultDone(), FaultTag());
-      if (threadIdx.x == 0) PublishFault(pn);
+      if (threadIdx.x == 0) {
+        if (Tasks()->fault->GetReturnCode() != 0 &&
+            h_->stat_get_errors_ != nullptr) {
+          atomicAdd(h_->stat_get_errors_, 1ull);
+        }
+        PublishFault(pn);
+      }
       __syncthreads();
       p = Find(pn);
     }
@@ -260,7 +278,29 @@ class DeviceVector {
       Release(victim);
       ++freed;
     }
-    return freed >= min;
+    if (freed >= min) return true;
+    // Nothing evictable. If this block has a flush in flight, waiting for it
+    // is progress; otherwise the caller is asking for more pages at once than
+    // its table holds, and no amount of waiting fixes that.
+    if (FlushBusy()) return false;
+    ReportStuck(min);
+    __trap();
+    return false;
+  }
+
+  /** Say what is holding the table before the trap. */
+  CTP_GPU_FUN void ReportStuck(clio::run::u32 min) const {
+    Page *tbl = Pages();
+    clio::run::u32 pinned = 0, dirty = 0;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      if (tbl[i].pins != 0u) ++pinned;
+      if (tbl[i].dirty) ++dirty;
+    }
+    printf("[gpu_vector] FATAL table=%u: need %u free of %u frames, "
+           "%u pinned %u dirty, no flush in flight.\n"
+           "  Hold fewer pages at once, or flush before the dirty set fills "
+           "the table.\n",
+           Table(), min, h_->pages_per_block_, pinned, dirty);
   }
 
   /** Pin a resident frame and build the guard. */
@@ -392,6 +432,10 @@ class DeviceVector {
   /** Clear the flags of a landed flush. Thread 0 only. */
   CTP_GPU_FUN void RetireFlush() {
     BlockTasks *bt = Tasks();
+    if (bt->flush_n != 0 && bt->flush->GetReturnCode() != 0 &&
+        h_->stat_put_errors_ != nullptr) {
+      atomicAdd(h_->stat_put_errors_, 1ull);
+    }
     Page *tbl = Pages();
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &tbl[bt->flush_slot[i]];

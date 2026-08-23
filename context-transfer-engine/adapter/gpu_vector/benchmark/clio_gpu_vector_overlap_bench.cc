@@ -83,8 +83,8 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
   // Explicit flush is REQUIRED, not belt-and-braces: only explicit flushes
   // write data back now (drops refuse dirty pages), so seeded data left to
   // eviction would simply be lost.
-  v.FlushAsync(base, per);
-  co_await v.AwaitFlush();
+  co_await v.BeginFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -127,8 +127,8 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
                                         u32 depth, unsigned long long *total,
                                         u32 block) {
   const u64 base = static_cast<u64>(block) * per;
-  const u64 first_page = base / v.h_->elems_per_page_;
-  const u64 pages = per / v.h_->elems_per_page_;
+  const u64 first_page = base / v.ElemsPerPage();
+  const u64 pages = per / v.ElemsPerPage();
   unsigned long long acc = 0;
 
   for (u64 p = 0; p < pages; ++p) {
@@ -142,13 +142,13 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
       if (p + nwant >= pages) nwant = static_cast<u32>(pages - 1 - p);
       if (nwant > 0) {
         const u64 p1 = first_page + p + 1;
-        v.RescorePagesBatchedAsync(
+        co_await v.RescorePages(
             nwant, [p1](u32 d) { return gv::PageScore{p1 + d, 1.0f}; });
       }
     }
 
-    const u64 off = base + p * v.h_->elems_per_page_;
-    auto h = co_await v.HoldPage(off, v.h_->elems_per_page_);
+    const u64 off = base + p * v.ElemsPerPage();
+    auto h = co_await v.HoldPage(off, v.ElemsPerPage());
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
       local += h[off + i];
@@ -512,10 +512,6 @@ int main(int argc, char **argv) {
       serial_ok ? "sum=OK" : "sum=MISMATCH",
       pre_ms, (unsigned long long) pre_stats.faults,
       (unsigned long long) pre_stats.evicts,
-      (unsigned long long) pre_stats.prefetches,
-      (unsigned long long) pre_stats.prefetch_hits,
-      (unsigned long long) pre_stats.prefetch_late,
-      (unsigned long long) pre_stats.rescores,
       pre_ok ? "sum=OK" : "sum=MISMATCH");
 
   // ---- Breakdown --------------------------------------------------------

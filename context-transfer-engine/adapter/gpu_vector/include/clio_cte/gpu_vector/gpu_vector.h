@@ -40,6 +40,8 @@ class Vector {
     clio::run::u64 faults = 0;   // pages read in
     clio::run::u64 puts = 0;     // pages written back
     clio::run::u64 evicts = 0;   // frames reclaimed
+    clio::run::u64 get_errors = 0;   // faults that returned non-zero
+    clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
   };
 
   /**
@@ -98,6 +100,7 @@ class Vector {
     return it->second.view;
   }
 
+  clio::cte::core::TagId TagId() const { return tag_id_; }
   clio::run::u64 PageBytes() const { return page_bytes_; }
   clio::run::u64 ElemsPerPage() const { return page_bytes_ / sizeof(T); }
   clio::run::u64 NumPages() const {
@@ -109,7 +112,7 @@ class Vector {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 3 * sizeof(unsigned long long);
+      const size_t bytes = 5 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -118,7 +121,151 @@ class Vector {
       kv.second.hdr.stat_faults_ = c;
       kv.second.hdr.stat_puts_ = c + 1;
       kv.second.hdr.stat_evicts_ = c + 2;
+      kv.second.hdr.stat_get_errors_ = c + 3;
+      kv.second.hdr.stat_put_errors_ = c + 4;
       PublishHeader(kv.second);
+    }
+#endif
+  }
+
+  /**
+   * HOST-SIDE data movement. Not part of the device API: a kernel never calls
+   * these. They exist because host data has to reach the vector somehow, and
+   * because benches reset residency between measured rounds.
+   */
+
+  /** Make pages [pg_lo, pg_hi) resident in every table, best effort. */
+  void Prefetch(clio::run::u64 pg_lo, clio::run::u64 pg_hi, int gpu_id = 0,
+                clio::run::u32 tables = 0) {
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(gpu_id);
+    if (it == devs_.end()) return;
+    DevState &st = it->second;
+    const clio::run::u32 ntab = (tables == 0) ? nblocks_ : tables;
+    clio::cte::core::Client core(storage_pool_id_);
+    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    std::vector<Page> tbl(pages_per_block_);
+    for (clio::run::u32 b = 0; b < ntab && b < nblocks_; ++b) {
+      Page *dev = reinterpret_cast<Page *>(st.table_base) +
+                  static_cast<size_t>(b) * pages_per_block_;
+      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(tbl.data()),
+                          reinterpret_cast<const char *>(dev),
+                          static_cast<size_t>(pages_per_block_ * sizeof(Page)));
+      clio::run::u32 slot = 0;
+      for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
+        while (slot < pages_per_block_ && tbl[slot].page_num != kNoPage) ++slot;
+        if (slot >= pages_per_block_) break;
+        if (!ReadPage(core, pg, buf.data())) continue;
+        ctp::GpuApi::Memcpy(static_cast<char *>(tbl[slot].data), buf.data(),
+                            static_cast<size_t>(page_bytes_));
+        tbl[slot].page_num = pg;
+        tbl[slot].dirty = 0;
+        tbl[slot].pins = 0;
+        tbl[slot].flushing = 0;
+        tbl[slot].fetching = 0;
+        tbl[slot].score = kDefaultScore;
+        ++slot;
+      }
+      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(dev),
+                          reinterpret_cast<const char *>(tbl.data()),
+                          static_cast<size_t>(pages_per_block_ * sizeof(Page)));
+    }
+#else
+    (void) pg_lo; (void) pg_hi; (void) gpu_id; (void) tables;
+#endif
+  }
+
+  /** Drop every resident page. Dirty pages are DISCARDED -- flush first. */
+  void ClearCache(int gpu_id = 0) {
+#if CTP_ENABLE_CUDA
+    auto it = devs_.find(gpu_id);
+    if (it == devs_.end()) return;
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+    std::vector<Page> tbl(static_cast<size_t>(nslots));
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(tbl.data()),
+                        it->second.table_base,
+                        static_cast<size_t>(nslots * sizeof(Page)));
+    for (auto &p : tbl) {
+      p.page_num = kNoPage;
+      p.dirty = 0;
+      p.pins = 0;
+      p.flushing = 0;
+      p.fetching = 0;
+      p.score = kDefaultScore;
+      p.last_access = 0;
+    }
+    ctp::GpuApi::Memcpy(it->second.table_base,
+                        reinterpret_cast<const char *>(tbl.data()),
+                        static_cast<size_t>(nslots * sizeof(Page)));
+#else
+    (void) gpu_id;
+#endif
+  }
+
+  /** Write pages [pg_lo, pg_hi); `fill(pg, buf)` supplies each page's bytes. */
+  template <typename FillFn>
+  void PreloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi, FillFn fill) {
+    clio::cte::core::Client core(storage_pool_id_);
+    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
+      std::memset(buf.data(), 0, buf.size());
+      fill(pg, buf.data());
+      auto f = core.AsyncPutBlob(tag_id_, PageName(pg), 0, page_bytes_,
+                                 buf.data(), 0.5f, PageContext(), 0u,
+                                 clio::run::PoolQuery::Dynamic());
+      f.Wait();
+    }
+  }
+
+  /** Write `n` elements from host memory into the vector. */
+  void Preload(const T *src, clio::run::u64 n) {
+    const clio::run::u64 epp = ElemsPerPage();
+    PreloadPages(0, (n + epp - 1) / epp, [&](clio::run::u64 pg, char *buf) {
+      const clio::run::u64 off = pg * epp;
+      const clio::run::u64 cnt = (epp < n - off) ? epp : (n - off);
+      std::memcpy(buf, src + off, static_cast<size_t>(cnt * sizeof(T)));
+    });
+  }
+
+  /** Read `n` elements out of the vector into host memory.
+   *  @return elements actually read. */
+  clio::run::u64 Download(T *dst, clio::run::u64 n) {
+    const clio::run::u64 epp = ElemsPerPage();
+    clio::run::u64 got = 0;
+    DownloadPages(0, (n + epp - 1) / epp,
+                  [&](clio::run::u64 pg, const char *bytes) {
+                    const clio::run::u64 off = pg * epp;
+                    if (off >= n) return;
+                    const clio::run::u64 cnt = (epp < n - off) ? epp : (n - off);
+                    std::memcpy(dst + off, bytes,
+                                static_cast<size_t>(cnt * sizeof(T)));
+                    got += cnt;
+                  });
+    return got;
+  }
+
+  /** Read pages [pg_lo, pg_hi); `sink(pg, bytes)` receives each page. */
+  template <typename SinkFn>
+  clio::run::u64 DownloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi,
+                               SinkFn sink) {
+    clio::cte::core::Client core(storage_pool_id_);
+    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    clio::run::u64 got = 0;
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
+      if (!ReadPage(core, pg, buf.data())) continue;
+      sink(pg, static_cast<const char *>(buf.data()));
+      ++got;
+    }
+    return got;
+  }
+
+  /** Zero the counters, for benches that measure per-round. */
+  void ResetStats() {
+#if CTP_ENABLE_CUDA
+    for (auto &kv : devs_) {
+      if (kv.second.stats == nullptr) continue;
+      ctp::GpuApi::Memset(kv.second.stats, 0, 5 * sizeof(unsigned long long));
     }
 #endif
   }
@@ -128,11 +275,13 @@ class Vector {
 #if CTP_ENABLE_CUDA
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[3] = {0, 0, 0};
+    unsigned long long h[5] = {0, 0, 0, 0, 0};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.faults = h[0];
     s.puts = h[1];
     s.evicts = h[2];
+    s.get_errors = h[3];
+    s.put_errors = h[4];
 #else
     (void) gpu_id;
 #endif
@@ -203,6 +352,8 @@ class Vector {
     st.hdr.stat_faults_ = nullptr;
     st.hdr.stat_puts_ = nullptr;
     st.hdr.stat_evicts_ = nullptr;
+    st.hdr.stat_get_errors_ = nullptr;
+    st.hdr.stat_put_errors_ = nullptr;
     PublishHeader(st);
     devs_[gpu_id] = st;
   }
@@ -290,6 +441,28 @@ class Vector {
     ctp::GpuApi::Memcpy(st.d_hdr, &st.hdr, sizeof(VecHeader));
     st.view = DeviceVector<T>(st.d_hdr);
 #endif
+  }
+
+  std::string PageName(clio::run::u64 pg) const {
+    char n[32];
+    PageBlobName(pg, n);
+    return std::string(n);
+  }
+
+  clio::cte::core::Context PageContext() const {
+    clio::cte::core::Context c;
+    c.compress_lib_ = compress_lib_;
+    c.compress_preset_ = compress_preset_;
+    return c;
+  }
+
+  /** One page's bytes into `out`; false when the page has no blob yet. */
+  bool ReadPage(clio::cte::core::Client &core, clio::run::u64 pg, char *out) {
+    auto ctx = PageContext();
+    auto f = core.AsyncGetBlob(tag_id_, PageName(pg), 0, page_bytes_, 0u, out,
+                               clio::run::PoolQuery::Dynamic(), ctx);
+    f.Wait();
+    return f.get() != nullptr && f->GetReturnCode() == 0;
   }
 
   static void UploadBytes(const void *src, void *dst, clio::run::u64 bytes) {

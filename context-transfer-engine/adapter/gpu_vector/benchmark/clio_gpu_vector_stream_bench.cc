@@ -132,7 +132,7 @@ CTP_INLINE_CROSS_FUN u32 Value(u64 p, u64 i, u32 zero_pct) {
 __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
                                          u64 pages_per_block, u32 zero_pct,
                                          u32 block) {
-  const u64 pe = v.h_->elems_per_page_;
+  const u64 pe = v.ElemsPerPage();
   const u64 base_page = static_cast<u64>(block) * pages_per_block;
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
@@ -145,12 +145,12 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
     // Fire-and-forget: the store of page k stays in flight through the fill
     // of page k+1; the claim path settles finished flushes when it needs a
     // slot, and the AwaitFlush at the end collects the stragglers.
-    v.FlushAsync(off, pe);
+    co_await v.BeginFlush();
   }
   // The explicit flush is what persists the data: drops refuse dirty pages
   // and nothing writes back on eviction, so every written page must have been
   // FlushAsync'd (above) and collected here.
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
@@ -178,14 +178,14 @@ __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
 __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
                                         u64 pages_per_block, u32 depth,
                                         unsigned long long *sum, u32 block) {
-  const u64 pe = v.h_->elems_per_page_;
+  const u64 pe = v.ElemsPerPage();
   const u64 base_page = static_cast<u64>(block) * pages_per_block;
   unsigned long long acc = 0;
   // Prime the pipeline: score 1.0 == make resident, the batched prefetch.
   if (depth > 0) {
     u32 prime = depth;
     if (prime > pages_per_block) prime = static_cast<u32>(pages_per_block);
-    v.RescorePagesBatchedAsync(
+    co_await v.RescorePages(
         prime, [base_page](u32 d) { return gv::PageScore{base_page + d, 1.0f}; });
   }
   for (u64 k = 0; k < pages_per_block; ++k) {
@@ -194,7 +194,7 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
     // it is already in flight by the time we get there.
     if (depth > 0 && k + depth < pages_per_block) {
       const u64 want = base_page + k + depth;
-      v.RescorePagesBatchedAsync(
+      co_await v.RescorePages(
           1u, [want](u32) { return gv::PageScore{want, 1.0f}; });
     }
     auto h = co_await v.HoldPage(off, pe);
@@ -234,7 +234,7 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
                                                u64 pages_per_block, u32 chunk,
                                                unsigned long long *sum,
                                                u32 block) {
-  const u64 pe = v.h_->elems_per_page_;
+  const u64 pe = v.ElemsPerPage();
   const u64 base_page = static_cast<u64>(block) * pages_per_block;
   unsigned long long acc = 0;
   for (u64 k = 0; k < pages_per_block; k += chunk) {
@@ -243,7 +243,7 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
     // One batched get for the whole chunk (score 1.0 == make resident); the
     // holds below wait on arrivals rather than issuing per-page faults.
     const u64 c0 = base_page + k;
-    v.RescorePagesBatchedAsync(
+    co_await v.RescorePages(
         static_cast<u32>(n),
         [c0](u32 j) { return gv::PageScore{c0 + j, 1.0f}; });
     for (u64 j = 0; j < n; ++j) {
@@ -594,7 +594,6 @@ int main(int argc, char **argv) {
                  "get_errors=%llu\n",
                  (unsigned long long) st.faults, (unsigned long long) st.puts,
                  (unsigned long long) st.evicts,
-                 (unsigned long long) st.prefetches,
                  (unsigned long long) st.get_errors);
   }
 

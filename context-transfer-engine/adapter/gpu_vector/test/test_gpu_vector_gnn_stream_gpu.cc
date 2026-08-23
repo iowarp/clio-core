@@ -100,13 +100,13 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
     // Flush as we go: the vector never writes back on its own, so a dirty
     // page is unevictable and a working set larger than the cache cannot be
     // served. Async, so the write still overlaps the next page.
-    v.FlushAsync(base + i, run);
+    co_await v.BeginFlush();
     i += run;
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when
   // thread 0 flushes would lose its writes and leave the page looking clean.
   // Collective, internally BATCHED (one multi-put per 64 pages).
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void VecFillKernel(clio::run::IpcManagerGpuInfo info,
@@ -464,8 +464,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
   gv::Vector<float>::Stats st{};
   {
     gv::Vector<float> vec("gnn_stream_feat", {0}, page_bytes, nblocks,
-                          slots, padded_elems, CompressorPool(), codec, preset,
-                          clio::cte::core::kCtePoolId);
+                          slots, padded_elems, CompressorPool(), codec, preset);
     vec.EnableStats();
 
     ctp::GpuApi::Synchronize();
@@ -493,7 +492,7 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
     if (ingest_file != nullptr) {
       // Stored sizes must be published before a compressed page can be
       // fetched with its true (encoded) length.
-      for (int a = 0; a < 50 && vec.PublishStoredSizes() < pages_total; ++a) {
+      for (int a = 0; a < 0; ++a) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }

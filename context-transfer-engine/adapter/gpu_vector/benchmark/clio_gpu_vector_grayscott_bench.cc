@@ -180,7 +180,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
         h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective, internally BATCHED (one multi-put per 64 pages).
-      vec.FlushAsync(ubase + z * plane, plane);
+      co_await vec.BeginFlush();
     }
     {
       auto h = co_await vec.HoldPage(vbase + z * plane, plane, /*write=*/true);
@@ -188,12 +188,12 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
         h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective, internally BATCHED (one multi-put per 64 pages).
-      vec.FlushAsync(vbase + z * plane, plane);
+      co_await vec.BeginFlush();
     }
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
   // durable before this kernel returns.
-  co_await vec.AwaitFlush();
+  co_await vec.EndFlush();
 }
 
 __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -277,8 +277,8 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     // Flush the write-once outputs; the drop below is best-effort (a page
     // still flushing or pinned is refused and reclaimed by ordinary eviction
     // once it settles).
-    vec.FlushAsync(unext + z * plane, plane);
-    vec.FlushAsync(vnext + z * plane, plane);
+    co_await vec.BeginFlush();
+    co_await vec.BeginFlush();
     if (interior) {
       // Plane z-1 leaves the sliding window for good: empty the guard so the
       // drop can take it. (zm == z when not interior, so releasing it there
@@ -290,7 +290,7 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
       const u64 d2 = vec.PageOf(unext + z * plane);
       const u64 d3 = vec.PageOf(vnext + z * plane);
       const u64 drops[4] = {d0, d1, d2, d3};
-      vec.RescorePagesBatchedAsync(4, [&drops](u32 i) {
+      co_await vec.RescorePages(4, [&drops](u32 i) {
         return gv::PageScore{drops[i], 0.0f};
       });
     }
@@ -303,7 +303,7 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
   uzm = {}; uz = {}; uzp = {};
   vzm = {}; vz = {}; vzp = {};
   unx = {}; vnx = {};
-  co_await vec.AwaitFlush();
+  co_await vec.EndFlush();
   // ...and then DROP THE CACHE. Durability alone is not enough. A block reads
   // planes owned by its NEIGHBOURS (z-1 at the bottom of its slab, z+1 at the
   // top), and those pages stay resident in this block's cache. The regions
@@ -325,7 +325,7 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
       for (u64 pg = zlo; pg < zhi; pg += 64) {
         const u32 nb = (zhi - pg < 64) ? static_cast<u32>(zhi - pg) : 64u;
         const u64 pbase = vec.PageOf(bases[b]);
-        vec.RescorePagesBatchedAsync(nb, [pbase, pg](u32 i) {
+        co_await vec.RescorePages(nb, [pbase, pg](u32 i) {
           return gv::PageScore{pbase + pg + i, 0.0f};
         });
       }

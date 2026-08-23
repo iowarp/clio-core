@@ -94,10 +94,10 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    v.FlushAsync(base + i, run);
+    co_await v.BeginFlush();
     i += run;
   }
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
@@ -134,7 +134,7 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
   for (int it = 0; it < iters; ++it) {
     rng = rng * 1664525u + 1013904223u;
     const clio::run::u64 pn = rng % total_pages;
-    v.block_override_ = (clio::run::u32) (pn % v.h_->nblocks_);
+    v.block_override_ = (clio::run::u32) (pn % v.NumTables());
 
     // Fire-and-forget prefetch of an unrelated range every iteration --
     // the long in-flight window is what widens claim races enough to
@@ -142,11 +142,11 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     {
       rng = rng * 1664525u + 1013904223u;
       const clio::run::u64 pf = rng % total_pages;
-      v.block_override_ = (clio::run::u32) (pf % v.h_->nblocks_);
-      v.RescorePagesBatchedAsync(4u, [pf, total_pages](clio::run::u32 i) {
+      v.block_override_ = (clio::run::u32) (pf % v.NumTables());
+      co_await v.RescorePages(4u, [pf, total_pages](clio::run::u32 i) {
         return gv::PageScore{(pf + i) % total_pages, 1.0f};
       });
-      v.block_override_ = (clio::run::u32) (pn % v.h_->nblocks_);
+      v.block_override_ = (clio::run::u32) (pn % v.NumTables());
     }
 
     // Demand access: suspend until resident, then take a RAW pointer with
@@ -157,31 +157,28 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     // not cover, and it must never invalidate a read that was in fact safe.
     auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
     if (threadIdx.x == 0 && h.run() != 0) {
-      clio::run::u64 run = 0;
-      clio::run::u32 gen = 0;
-      gv::Page *slot = nullptr;
-      const clio::run::u32 *q = gv::DeviceVectorTestAccess::TryHoldRawConstG(
-          v, pn * kPageElems, kPageElems, &run, &gen, &slot);
+      // The GUARD is the pin: while `h` is alive this frame cannot be
+      // evicted, so a raw read through it is valid by construction. The old
+      // seqlock (TryHoldRawConstG + HoldStillValid) existed because a raw
+      // pointer could be taken WITHOUT a pin; that hazard no longer exists.
+      const clio::run::u32 *q = h.ptr();
+      const clio::run::u64 run = h.run();
       if (q != nullptr && run != 0) {
-        // LONG READ: ~50 us of "compute" while holding the raw pointer.
+        // LONG READ: ~50 us of "compute" while holding the pointer.
         const long long t0 = clock64();
         while (clock64() - t0 < 100000) {
         }
         const clio::run::u64 idx[3] = {0, run / 2, run - 1};
         clio::run::u32 got[3];
         for (int k = 0; k < 3; ++k) got[k] = q[idx[k]];
-        // Only a read that SURVIVED its claim generation may be judged:
-        // a recycled slot is the expected hazard, not a data error.
-        if (gv::DeviceVectorTestAccess::HoldStillValid(v, slot, gen)) {
-          for (int k = 0; k < 3; ++k) {
-            const clio::run::u64 el = pn * kPageElems + idx[k];
-            const clio::run::u32 want = Seed(el);
-            if (got[k] != want) {
-              if (atomicAdd(err, 1ull) == 0) {
-                err[1] = pn;
-                err[2] = got[k];
-                err[3] = want;
-              }
+        for (int k = 0; k < 3; ++k) {
+          const clio::run::u64 el = pn * kPageElems + idx[k];
+          const clio::run::u32 want = Seed(el);
+          if (got[k] != want) {
+            if (atomicAdd(err, 1ull) == 0) {
+              err[1] = pn;
+              err[2] = got[k];
+              err[3] = want;
             }
           }
         }

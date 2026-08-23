@@ -85,7 +85,7 @@ __global__ void K_HoldPage(clio::run::IpcManagerGpuInfo info,
 }
 #elif GVP == 22
 __device__ gy::YCoroMain C_Flush(gv::DeviceVector<float> v) {
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 __global__ void K_AwaitFlush(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<float> v, u64 arg, u64 *out,

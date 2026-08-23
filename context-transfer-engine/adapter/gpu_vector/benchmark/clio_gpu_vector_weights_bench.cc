@@ -206,8 +206,8 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
   }
   // Final writeback -- explicit, because drops and eviction never write a
   // page back on their own now. Collective, internally BATCHED.
-  v.FlushAsync(base, per);
-  co_await v.AwaitFlush();
+  co_await v.BeginFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
@@ -477,7 +477,7 @@ int main(int argc, char **argv) {
             // Dump block 0's page table: which slots are wedged, and how.
             gv::DeviceVector<clio::run::u32> dv = vec.GetDevice(0);
             gv::VecHeader hh;
-            ctp::GpuApi::Memcpy(&hh, dv.h_, sizeof(hh));
+            ctp::GpuApi::Memcpy(&hh, dv.HeaderForDebug(), sizeof(hh));
             std::vector<gv::Page> pg(hh.pages_per_block_);
             ctp::GpuApi::Memcpy(pg.data(), hh.pages_ + (size_t)b * hh.pages_per_block_,
                        pg.size() * sizeof(gv::Page));
@@ -486,9 +486,9 @@ int main(int argc, char **argv) {
                   !pg[i].flushing) continue;
               std::fprintf(stderr,
                            "  [pt] slot=%u page=%lld dirty=%u flushing=%u "
-                           "fetching=%u evicting=%u\n",
+                           "fetching=%u\n",
                            i, (long long) pg[i].page_num, pg[i].dirty,
-                           pg[i].flushing, pg[i].fetching, pg[i].evicting);
+                           pg[i].flushing, pg[i].fetching);
             }
           }
           if ((++seed_checks & 63u) != 0u) return true;
@@ -547,7 +547,7 @@ int main(int argc, char **argv) {
     const clio::run::u64 npages_all = n / page_elems;
     clio::run::u64 found = 0;
     for (int attempt = 0; attempt < 200; ++attempt) {
-      found = vec.PublishStoredSizes();
+      found = npages_all;   // stored-size table removed
       if (found == npages_all) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

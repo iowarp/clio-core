@@ -104,10 +104,10 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    v.FlushAsync(base + i, run);
+    co_await v.BeginFlush();
     i += run;
   }
-  co_await v.AwaitFlush();
+  co_await v.EndFlush();
 }
 
 __global__ void SeedWeightsKernel(clio::run::IpcManagerGpuInfo info,
@@ -177,20 +177,20 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
     gv::DeviceVector<clio::run::u32> v, clio::run::u64 per,
     clio::run::u32 chunk, unsigned long long *sum, clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
-  const clio::run::u64 first_page = base / v.h_->elems_per_page_;
-  const clio::run::u64 npages = per / v.h_->elems_per_page_;
+  const clio::run::u64 first_page = base / v.ElemsPerPage();
+  const clio::run::u64 npages = per / v.ElemsPerPage();
   unsigned long long acc = 0;
   for (clio::run::u64 p0 = 0; p0 < npages; p0 += chunk) {
     clio::run::u64 n = npages - p0;
     if (n > chunk) n = chunk;
     const clio::run::u64 fp = first_page + p0;
-    v.RescorePagesBatchedAsync(
+    co_await v.RescorePages(
         static_cast<clio::run::u32>(n),
         [fp](clio::run::u32 i) { return gv::PageScore{fp + i, 1.0f}; });
     for (clio::run::u64 j = 0; j < n; ++j) {
-      const clio::run::u64 off = base + (p0 + j) * v.h_->elems_per_page_;
-      for (clio::run::u64 i = 0; i < v.h_->elems_per_page_;) {
-        auto h = co_await v.HoldPage(off + i, v.h_->elems_per_page_ - i);
+      const clio::run::u64 off = base + (p0 + j) * v.ElemsPerPage();
+      for (clio::run::u64 i = 0; i < v.ElemsPerPage();) {
+        auto h = co_await v.HoldPage(off + i, v.ElemsPerPage() - i);
         if (threadIdx.x == 0) {
           for (clio::run::u64 k = 0; k < h.run(); ++k) {
             acc += static_cast<unsigned long long>(h[off + i + k]) *
