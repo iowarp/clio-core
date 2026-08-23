@@ -76,6 +76,8 @@ __device__ gy::YCoroMain HbmSeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per; off += kPageElems) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + off, (base + off) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(
           base + off, (off + kPageElems <= per) ? kPageElems : (per - off),
           /*write=*/true);
@@ -114,6 +116,8 @@ __device__ gy::YCoroMain HbmDotCoro(gv::DeviceVector<clio::run::u32> v,
                                     clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 off = 0; off < per; off += kPageElems) {
+    co_await v.BeginFetch(base + off, (base + off) + 1);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(
         base + off, (off + kPageElems <= per) ? kPageElems : (per - off));
     unsigned long long acc = 0;

@@ -53,6 +53,18 @@ __device__ gy::YCoroMain C_Hold(gv::DeviceVector<float> v, u64 off, u64 *out) {
 }
 GVP_CORO_KERNEL(K_HoldPage, C_Hold(v, arg, out))
 
+#elif GVP == 6
+__device__ gy::YCoroMain C_BeginFetch(gv::DeviceVector<float> v, u64 off) {
+  co_await v.BeginFetch(off, off + 1);
+}
+GVP_CORO_KERNEL(K_BeginFetch, C_BeginFetch(v, arg))
+
+#elif GVP == 7
+__device__ gy::YCoroMain C_AwaitFetch(gv::DeviceVector<float> v) {
+  co_await v.AwaitFetch();
+}
+GVP_CORO_KERNEL(K_AwaitFetch, C_AwaitFetch(v))
+
 #elif GVP == 3
 __device__ gy::YCoroMain C_BeginFlush(gv::DeviceVector<float> v) {
   co_await v.BeginFlush();
@@ -68,6 +80,8 @@ GVP_CORO_KERNEL(K_EndFlush, C_EndFlush(v))
 #elif GVP == 5
 // Hold, write, flush, wait -- a whole realistic use of the vector.
 __device__ gy::YCoroMain C_All(gv::DeviceVector<float> v, u64 off, u64 *out) {
+  co_await v.BeginFetch(off, off + 1);
+  co_await v.AwaitFetch();
   {
     auto h = co_await v.HoldPage(off, 1, /*write=*/true);
     if (h.run() != 0) h[0] = 1.0f;

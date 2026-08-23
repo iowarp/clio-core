@@ -92,6 +92,8 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       if (threadIdx.x == 0) {
@@ -136,6 +138,8 @@ __device__ gy::YCoroMain WeightsDotCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
   for (clio::run::u64 i = 0; i < per;) {
+    co_await v.BeginFetch(base + i, (base + i) + 1);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(base + i, per - i);
     if (threadIdx.x == 0) {
       for (clio::run::u64 k = 0; k < h.run(); ++k) {
@@ -187,6 +191,8 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
     for (clio::run::u64 j = 0; j < n; ++j) {
       const clio::run::u64 off = base + (p0 + j) * v.ElemsPerPage();
       for (clio::run::u64 i = 0; i < v.ElemsPerPage();) {
+        co_await v.BeginFetch(off + i, (off + i) + 1);
+        co_await v.AwaitFetch();
         auto h = co_await v.HoldPage(off + i, v.ElemsPerPage() - i);
         if (threadIdx.x == 0) {
           for (clio::run::u64 k = 0; k < h.run(); ++k) {

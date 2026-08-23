@@ -17,7 +17,7 @@ namespace clio::cte::gpu_vector {
 /** page_num of an empty slot. */
 constexpr clio::run::u64 kNoPage = ~static_cast<clio::run::u64>(0);
 
-using GetSlot = clio::cte::core::PodGetBlobTask;
+using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
 using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 
 /** One resident page. */
@@ -34,19 +34,22 @@ struct Page {
 
 /**
  * The tasks a block owns. One set per page table: a bulk put for flushing and
- * a scalar get for faulting.
+ * a bulk get for fetching.
  */
 struct BlockTasks {
   MultiPutSlot *flush;
-  GetSlot *fault;
+  MultiGetSlot *fetch;
   clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> flush_fut;
-  clio::run::gpu::Future<clio::cte::core::PodGetBlobTask> fault_fut;
+  clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask> fetch_fut;
   clio::run::u32 flush_n;     // records in the outstanding flush
+  clio::run::u32 fetch_n;     // records in the outstanding fetch
   clio::run::u32 flush_busy;  // a flush is in flight
+  clio::run::u32 fetch_busy;  // a fetch is in flight
   clio::run::u32 seq;         // bumped per submission so TaskIds differ
-  /** Page table index each flush record came from, so completion can clear
-   *  the right frames' flags. */
+  /** Page table index each record came from, so completion can clear the
+   *  right frames' flags. */
   clio::run::u32 flush_slot[clio::cte::core::kPodMultiMax];
+  clio::run::u32 fetch_slot[clio::cte::core::kPodMultiMax];
 };
 
 /**
@@ -70,7 +73,7 @@ CTP_INLINE_CROSS_FUN clio::run::TaskId DeviceTaskId(clio::run::u64 table,
 }
 
 constexpr clio::run::u32 kKindFlush = 0;
-constexpr clio::run::u32 kKindFault = 1;
+constexpr clio::run::u32 kKindFetch = 1;
 
 }  // namespace clio::cte::gpu_vector
 

@@ -89,6 +89,8 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -153,6 +155,8 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     // probe and its generation are machinery this test exists to exercise
     // (TestAccess): the seqlock is what guards any raw read the pin does
     // not cover, and it must never invalidate a read that was in fact safe.
+    co_await v.BeginFetch(pn * kPageElems, (pn * kPageElems) + 1);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
     if (threadIdx.x == 0 && h.run() != 0) {
       // The GUARD is the pin: while `h` is alive this frame cannot be
@@ -193,6 +197,11 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  // BIND THE TABLE TO THE LOGICAL BLOCK, not to blockIdx.x. The driver
+  // compacts the grid between rounds, so a coroutine resumes on a different
+  // CUDA block than it started on; leaving block_override_ unset makes its
+  // page table move underneath it mid-hold.
+  v.block_override_ = yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RaceStressCoro(v, total_pages, iters, err, yv.Block()));

@@ -307,7 +307,7 @@ class Vector {
 
   /** Bytes of one block's four tasks, laid out in this order. */
   static constexpr size_t kTaskSetBytes =
-      sizeof(MultiPutSlot) + sizeof(GetSlot);
+      sizeof(MultiPutSlot) + sizeof(MultiGetSlot);
 
   void BuildDevice(int gpu_id) {
     auto *ipc = CLIO_CPU_IPC;
@@ -398,16 +398,15 @@ class Vector {
       fl->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(MultiPutSlot));
 
       char *p2 = slot + sizeof(MultiPutSlot);
-      auto *ft = new (p2)
-          GetSlot(clio::run::CreateTaskId(), clio::cte::core::kCtePoolId, local,
-                  tag_id_, "p0", 0, page_bytes_, 0,
-                  ctp::ipc::ShmPtr<>::GetNull(), clio::cte::core::Context());
-      ft->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(GetSlot));
+      auto *ft = new (p2) MultiGetSlot(clio::run::CreateTaskId(),
+                                       clio::cte::core::kCtePoolId, local,
+                                       tag_id_);
+      ft->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(MultiGetSlot));
 
       BlockTasks &bt = btbl[b];
       std::memset(&bt, 0, sizeof(bt));
       bt.flush = reinterpret_cast<MultiPutSlot *>(dev);
-      bt.fault = reinterpret_cast<GetSlot *>(dev + sizeof(MultiPutSlot));
+      bt.fetch = reinterpret_cast<MultiGetSlot *>(dev + sizeof(MultiPutSlot));
     }
     UploadBytes(raw.data(), st.tasks_base, nblocks_ * kTaskSetBytes);
     UploadBytes(btbl.data(), st.btbl_base, nblocks_ * sizeof(BlockTasks));

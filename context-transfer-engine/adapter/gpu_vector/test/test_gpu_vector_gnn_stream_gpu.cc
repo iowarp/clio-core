@@ -90,6 +90,8 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
   for (u64 i = 0; i < elems_per_block;) {
     u64 run = 0;
     {
+      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, elems_per_block - i,
                                    /*write=*/true);
       run = h.run();
@@ -126,6 +128,8 @@ __device__ gy::YCoroMain VecDrainCoro(gv::DeviceVector<float> v, float *dst,
                                       clio::run::u32 block) {
   const u64 base = static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
+    co_await v.BeginFetch(base + i, (base + i) + 1);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(base + i, elems_per_block - i);
     for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
       // Read-only sweep: the hold stays write=false, so every page is dropped

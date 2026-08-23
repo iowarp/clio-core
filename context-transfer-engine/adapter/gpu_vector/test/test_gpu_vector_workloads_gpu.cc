@@ -86,6 +86,8 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -133,6 +135,8 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per;) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + off, (base + off) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -183,6 +187,8 @@ __device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
     if (off + page_elems < per) {
       const clio::run::u64 next = (base + off + page_elems) / page_elems;
     }
+    co_await v.BeginFetch(base + off, (base + off) + 1);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(base + off, per - off);
     unsigned long long acc = 0;
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
@@ -224,6 +230,8 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per;) {
     clio::run::u64 run = 0;
     {
+      co_await v.BeginFetch(base + off, (base + off) + 1);
+      co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {

@@ -138,28 +138,82 @@ class DeviceVector {
     return (h_->num_elems_ + h_->elems_per_page_ - 1) / h_->elems_per_page_;
   }
 
+  /** Ranges a single BeginFetch may name. */
+  static constexpr clio::run::u32 kMaxFetchRanges = 8;
+
   /**
-   * Hold one page. Every thread of the block calls it with the same offset.
-   * Elements from `off` to the end of that page are reachable through the
-   * guard, capped at `count`.
+   * Require every page of the given element ranges to become resident, at the
+   * expense of other pages. MANDATORY: HoldPage no longer faults, so a page
+   * that was not fetched is a caller error.
+   *
+   * Takes (lo, hi) pairs: BeginFetch(a0, a1, b0, b1). Returns once the fetch
+   * has been SUBMITTED; pair it with AwaitFetch before holding.
+   */
+  template <typename... Args>
+  __device__ clio::run::gpu::YCoroTask BeginFetch(Args... args) {
+    clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(lo, hi, nr, args...);
+    // One fetch in flight per block: staging into a task the runtime is still
+    // reading would overwrite records mid-transfer.
+    if (FetchBusy()) {
+      co_await AwaitFetch();
+    }
+    // Pin what is already resident BEFORE making room, so the eviction that
+    // frees frames for the missing pages cannot take a page of this very
+    // range and turn one fetch into two.
+    clio::run::u32 missing = 0;
+    if (threadIdx.x == 0) {
+      missing = PinResidentAndCountMissing(lo, hi, nr);
+    }
+    missing = __syncthreads_or(static_cast<int>(missing));
+    if (missing != 0) {
+      co_await EvictPages(missing, missing);
+      if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    }
+    if (threadIdx.x == 0) UnpinRanges(lo, hi, nr);
+    __syncthreads();
+    co_return;
+  }
+
+  /** Wait for the outstanding BeginFetch and publish its pages. */
+  __device__ clio::run::gpu::YCoroTask AwaitFetch() {
+    CLIO_CO_YIELD_WHEN(;, FetchBusy() && !FetchDone(), FetchTag());
+    if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
+    __syncthreads();
+    co_return;
+  }
+
+  /**
+   * The page holding `off`. Does NOT fault: BeginFetch/AwaitFetch put it
+   * there. A page that is still absent is a caller error and the kernel
+   * stops -- proceeding would read another page's bytes.
    */
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPage(
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     const clio::run::u64 pn = PageOf(off);
     Page *p = Find(pn);
     if (p == nullptr) {
-      co_await EvictPages(1, 1);
-      if (threadIdx.x == 0) SubmitFault(pn);
-      CLIO_CO_YIELD_WHEN(;, !FaultDone(), FaultTag());
-      if (threadIdx.x == 0) {
-        if (Tasks()->fault->GetReturnCode() != 0 &&
-            h_->stat_get_errors_ != nullptr) {
-          atomicAdd(h_->stat_get_errors_, 1ull);
-        }
-        PublishFault(pn);
-      }
-      __syncthreads();
+      co_await AwaitFetch();      // it may simply not have landed yet
       p = Find(pn);
+    }
+    if (p == nullptr) {
+      if (threadIdx.x == 0) {
+        Page *tbl = Pages();
+        clio::run::u32 have = 0, fetching = 0, free_n = 0;
+        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+          if (tbl[i].page_num == pn) ++have;
+          if (tbl[i].fetching) ++fetching;
+          if (tbl[i].page_num == kNoPage) ++free_n;
+        }
+        printf("[gpu_vector] FATAL table=%u page=%llu not resident "
+               "(frames holding it=%u fetching=%u free=%u of %u | "
+               "fetch_busy=%u fetch_n=%u). HoldPage does not fetch -- name "
+               "it in a BeginFetch first.\n",
+               Table(), (unsigned long long) pn, have, fetching, free_n,
+               h_->pages_per_block_, Tasks()->fetch_busy, Tasks()->fetch_n);
+      }
+      __trap();
     }
     co_return Pin(p, off, count, write);
   }
@@ -297,76 +351,141 @@ class DeviceVector {
     return Held<T>(p, static_cast<T *>(p->data) + in, off, run);
   }
 
-  // ------------------------------ fault ------------------------------
+  // ------------------------------ fetch ------------------------------
 
-  /** Parameterize and submit this block's GetBlob for `pn`. Thread 0 only. */
-  CTP_GPU_FUN void SubmitFault(clio::run::u64 pn) {
-    BlockTasks *bt = Tasks();
-    Page *p = FindFree();
-    if (p == nullptr) {
-      // EvictPages just guaranteed a free frame. Reaching here means one was
-      // taken behind our back -- do not fail silently, the block would spin
-      // on a hold that can never resolve.
-      printf("[gpu_vector] FATAL table=%u: no free frame after EvictPages "
-             "(page %llu)\n", Table(), (unsigned long long) pn);
-      __trap();
+  CTP_GPU_FUN void GatherRanges(clio::run::u64 *, clio::run::u64 *,
+                                clio::run::u32 &) const {}
+  template <typename... Rest>
+  CTP_GPU_FUN void GatherRanges(clio::run::u64 *lo, clio::run::u64 *hi,
+                                clio::run::u32 &n, clio::run::u64 a,
+                                clio::run::u64 b, Rest... rest) const {
+    if (n < kMaxFetchRanges) {
+      lo[n] = a;
+      hi[n] = b;
+      ++n;
     }
-    p->fetching = 1u;
-    p->page_num = pn;
-    auto *t = bt->fault;
+    GatherRanges(lo, hi, n, rest...);
+  }
+
+  /** Pin every resident page of the ranges; @return how many are missing. */
+  CTP_GPU_FUN clio::run::u32 PinResidentAndCountMissing(
+      const clio::run::u64 *lo, const clio::run::u64 *hi,
+      clio::run::u32 nr) {
+    clio::run::u32 missing = 0;
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
+        Page *p = Find(pn);
+        if (p != nullptr) {
+          ++p->pins;
+        } else {
+          ++missing;
+        }
+      }
+    }
+    return missing;
+  }
+
+  /** Undo PinResidentAndCountMissing's pins. */
+  CTP_GPU_FUN void UnpinRanges(const clio::run::u64 *lo,
+                               const clio::run::u64 *hi, clio::run::u32 nr) {
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
+        Page *p = Find(pn);
+        if (p != nullptr && p->pins != 0u) --p->pins;
+      }
+    }
+  }
+
+  /** Claim a frame per missing page, fill the bulk get, send it. Thread 0. */
+  CTP_GPU_FUN void SubmitFetch(const clio::run::u64 *lo,
+                               const clio::run::u64 *hi, clio::run::u32 nr) {
+    BlockTasks *bt = Tasks();
+    auto *t = bt->fetch;
+    t->count_ = 0;
+    clio::run::u32 n = 0;
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0;
+           pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
+        if (Find(pn) != nullptr) continue;     // already here
+        Page *p = FindFree();
+        if (p == nullptr) {
+          printf("[gpu_vector] FATAL table=%u: no free frame for page %llu "
+                 "after EvictPages\n", Table(), (unsigned long long) pn);
+          __trap();
+        }
+        p->fetching = 1u;
+        p->page_num = pn;
+        const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
+        t->Add("", 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
+        t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
+                                      sizeof(pn32));
+        bt->fetch_slot[n++] = static_cast<clio::run::u32>(p - Pages());
+      }
+    }
+    bt->fetch_n = n;
+    if (n == 0) return;
     t->task_flags_.Clear();
     t->return_code_.store(0);
-    t->task_id_ = DeviceTaskId(Table(), kKindFault, bt->seq++);
+    t->task_id_ = DeviceTaskId(Table(), kKindFetch, bt->seq++);
     t->pool_id_ = h_->pool_id_;
-    t->method_ = clio::cte::core::Method::kPodGetBlob;
+    t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
     t->tag_id_ = h_->tag_id_;
-    // The page number goes over RAW, not as digits: formatting a string in a
-    // kernel is pure waste. Context::kBlobNameRawInt32 tells the runtime to
-    // render it decimal.
-    const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
-    t->blob_name_.assign(reinterpret_cast<const char *>(&pn32), sizeof(pn32));
-    t->offset_ = 0;
-    t->size_ = h_->page_bytes_;
-    t->blob_data_ = RawPtr(p->data);
-    t->flags_ = 0;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
     t->context_.blob_name_flags_ =
         clio::cte::core::Context::kBlobNameRawInt32;
-    // A page nobody has written yet has no blob. The CTE creates it and
+    // A page nobody has written yet has no blob; the CTE creates it and
     // returns success, so the vector needs no first-touch case of its own.
     t->context_.create_on_get_ = true;
     ClearRunCtx(t);
-    if (h_->stat_faults_ != nullptr) atomicAdd(h_->stat_faults_, 1ull);
+    if (h_->stat_faults_ != nullptr) {
+      atomicAdd(h_->stat_faults_, static_cast<unsigned long long>(n));
+    }
+    bt->fetch_busy = 1u;
     t->fut_.is_complete_.store(0);   // reused task: clear the last completion
-    bt->fault_fut =
+    bt->fetch_fut =
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
 
-  CTP_GPU_FUN bool FaultDone() const {
+  CTP_GPU_FUN bool FetchBusy() const { return Tasks()->fetch_busy != 0u; }
+  CTP_GPU_FUN bool FetchDone() const {
     BlockTasks *bt = Tasks();
-    return bt->fault_fut.IsNull() ||
-           (bt->fault->fut_.is_complete_.load() & 1u) != 0u;
+    return bt->fetch_fut.IsNull() ||
+           (bt->fetch->fut_.is_complete_.load() & 1u) != 0u;
   }
-  CTP_GPU_FUN clio::run::u64 FaultTag() const {
+  CTP_GPU_FUN clio::run::u64 FetchTag() const {
     return reinterpret_cast<clio::run::u64>(
-        &Tasks()->fault->fut_.is_complete_.x);
+        &Tasks()->fetch->fut_.is_complete_.x);
   }
 
-  /** Make the faulted page readable. Thread 0 only. */
-  CTP_GPU_FUN void PublishFault(clio::run::u64 pn) {
+  /** Make a landed fetch's pages readable. Thread 0 only. */
+  CTP_GPU_FUN void PublishFetch() {
+    BlockTasks *bt = Tasks();
     Page *tbl = Pages();
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-      if (tbl[i].page_num == pn && tbl[i].fetching) {
-        tbl[i].fetching = 0u;
-        tbl[i].dirty = 0u;
-        tbl[i].score = kDefaultScore;
-        tbl[i].last_access = clock64();
-        return;
-      }
+    if (bt->fetch->GetReturnCode() != 0 && h_->stat_get_errors_ != nullptr) {
+      atomicAdd(h_->stat_get_errors_, 1ull);
     }
+    for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
+      Page *p = &tbl[bt->fetch_slot[i]];
+      p->dirty = 0u;
+      p->score = kDefaultScore;
+      p->last_access = clock64();
+      __threadfence();
+      p->fetching = 0u;      // published last: Find skips a fetching frame
+    }
+    bt->fetch_n = 0;
+    bt->fetch_busy = 0u;
   }
 
   // ------------------------------ flush ------------------------------
