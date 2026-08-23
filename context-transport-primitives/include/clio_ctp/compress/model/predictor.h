@@ -195,6 +195,8 @@ struct RankingWeights {
   double w_cost_decompress_time = 1.0;
   double w_cost_io = 1.0;
   double bandwidth_bytes_per_ms = 5e6;
+  /** Compression-ratio ceiling (upstream RATIO_CAP). 100 = upstream. */
+  double ratio_cap = 100.0;
 
   double Score(const CompressionPrediction &p) const {
     return w_ratio * p.compression_ratio -
@@ -223,7 +225,7 @@ struct RankingWeights {
     // vanishing or negative ratio. Callers whose predictor already floors
     // (NeuroPressNNPredictor does) are unaffected; this protects the ones
     // that do not.
-    double ratio = std::max(0.1, std::min(100.0, p.compression_ratio));
+    double ratio = std::max(0.1, std::min(ratio_cap, p.compression_ratio));
     double bw = (bandwidth_bytes_per_ms > 0.0) ? bandwidth_bytes_per_ms : 1.0;
     double io_cost = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
     double cost = w_cost_compress_time * ct + w_cost_decompress_time * dt +

@@ -1890,10 +1890,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // run has an accuracy to compare against.
         {
           const auto &f = stats.front();
-          const double pred_r = std::min(100.0, f.compression_ratio_);
+          // Same ceiling the cost model and the kernel used; a hardcoded 100
+          // here would report a MAPE against a differently-clamped ratio.
+          const double kMapeCap = NeuroPressResolvedCostWeights().cap;
+          const double pred_r = std::min(kMapeCap, f.compression_ratio_);
           const double pred_ct = std::max(1.0, f.compress_time_ms_);
           const double pred_dt = std::max(1.0, f.decompress_time_ms_);
-          const double act_r = std::min(100.0, context.actual_compression_ratio_);
+          const double act_r = std::min(kMapeCap, context.actual_compression_ratio_);
           const double act_ct = std::max(1.0, context.actual_compress_time_ms_);
           // Decompression is not measured at write time; upstream substitutes
           // the prediction, which makes this term contribute nothing rather
@@ -1974,11 +1977,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         const double kCostW1 = config_.neuropress_best_mode_ ? 0.0 : kCw.dt;
         const double kCostW2 = kCw.io;
         const double kCostBandwidthBytesPerMs = kCw.bw;
+        const double kCostRatioCap = kCw.cap;
         auto cost = [&](double compress_ms, double decompress_ms,
                         double ratio) -> double {
           double ct = std::max(1.0, compress_ms);
           double dt = std::max(1.0, decompress_ms);
-          double rc = std::min(100.0, ratio);
+          double rc = std::min(kCostRatioCap, ratio);
           return kCostW0 * ct + kCostW1 * dt +
                  ((rc > 0.0) ? kCostW2 * static_cast<double>(chunk_size) /
                                    (rc * kCostBandwidthBytesPerMs)
@@ -2099,8 +2103,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // column agree.
           double np_ratio_mape = 0.0;
           {
-            const double pr = std::min(100.0, predicted->compression_ratio_);
-            const double ar = std::min(100.0, context.actual_compression_ratio_);
+            const double cap = NeuroPressResolvedCostWeights().cap;
+            const double pr = std::min(cap, predicted->compression_ratio_);
+            const double ar = std::min(cap, context.actual_compression_ratio_);
             if (ar > 0.0) np_ratio_mape = std::fabs(ar - pr) / ar;
           }
           const bool np_ratio_gate =

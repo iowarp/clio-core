@@ -87,7 +87,13 @@ namespace clio::cte::compressor {
  * kept scoring the balanced cost -- training the model against an objective it
  * was not ranking on. This exposes the resolved values so both agree.
  */
-struct NeuroPressCostWeights { double ct, dt, io, bw; };
+/**
+ * Resolved cost-model parameters. `cap` is the compression-ratio ceiling the
+ * cost model applies (upstream's RATIO_CAP, 100). It is exposed here so the
+ * adoption cost and the exploration gate use one value rather than each
+ * hardcoding it.
+ */
+struct NeuroPressCostWeights { double ct, dt, io, bw, cap; };
 NeuroPressCostWeights NeuroPressResolvedCostWeights();
 
 std::vector<CompressionStats> NeuroPressCandidateStats(

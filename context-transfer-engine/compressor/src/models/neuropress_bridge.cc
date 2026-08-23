@@ -47,7 +47,7 @@
 namespace clio::cte::compressor {
 
 namespace {
-struct CostWeightOverride { double ct, dt, io, bw; bool any; };
+struct CostWeightOverride { double ct, dt, io, bw, cap; bool any; };
 
 /* Read once: this runs per chunk on runtime worker threads, where a getenv per
    call is both a syscall and a data race against anything setting the env. */
@@ -67,6 +67,28 @@ CostWeightOverride ResolveCostOverride() {
     o.dt = read("CLIO_NEUROPRESS_COST_W_DT", 1.0, &seen);
     o.io = read("CLIO_NEUROPRESS_COST_W_IO", 1.0, &seen);
     o.bw = read("CLIO_NEUROPRESS_COST_BW", 5e6, &seen);
+    /* Compression-ratio ceiling. Defaults to upstream's RATIO_CAP of 100
+       (nn_gpu.cu, gpucompress_compress.cpp), so a normal run is unchanged.
+       Raising it is an experiment knob, and it has to reach SEVEN places at
+       once -- the forward pass, RankKernel, PredictBatchDeviceStats's host
+       post-clamp, RankingWeights::Score, the adoption cost lambda and both
+       ratio-MAPE computations. Miss one and it silently re-imposes 100: the
+       host post-clamp alone kept every prediction pinned at exactly 100.00
+       while this knob appeared to work.
+
+       Expect the MAPE that gates SGD and exploration to RISE. It is not
+       distortion -- the cap was suppressing real prediction error. On a
+       4 MiB chunk whose model predicted 1000x and measured 129.75x, both
+       sides clamp to 100 at the default and the cost error is exactly 0;
+       at cap=1000 the same chunk reports 0.87, which is the error that was
+       always there. A raised cap makes the model look worse because it stops
+       hiding how wrong it was. */
+    /* Deliberately NOT folded into `seen`: the cap is not one of the four
+       cost WEIGHTS, and letting it set that flag would make a cap-only
+       experiment re-apply all four weights from their fallbacks. */
+    bool cap_seen = false;
+    o.cap = read("CLIO_NEUROPRESS_RATIO_CAP", 100.0, &cap_seen);
+    if (!(o.cap > 0.0)) o.cap = 100.0;
     o.any = seen;
     return o;
   }
@@ -74,7 +96,7 @@ CostWeightOverride ResolveCostOverride() {
 
 NeuroPressCostWeights NeuroPressResolvedCostWeights() {
   static const CostWeightOverride o = ResolveCostOverride();
-  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw};
+  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw, o.cap};
 }
 
 
@@ -272,6 +294,10 @@ std::vector<CompressionStats> RankIntoStats(
     weights.w_cost_io = kOverride.io;
     weights.bandwidth_bytes_per_ms = kOverride.bw;
   }
+  /* Independent of the weight override (see ResolveCostOverride): the cap
+     reaches the RANKING and the inference kernel's own clamp, so the model's
+     predictions and the cost model score on one scale. */
+  weights.ratio_cap = kOverride.cap;
 
   // Best mode's ratio-only objective. Upstream reaches it by zeroing
   // g_rank_w0/w1 (gpucompress_learning.cpp), which leaves

@@ -420,6 +420,11 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
       // Already clamped inside the kernel (nn_gpu.cu order: sanity
       // ceiling first, then the policy floors/caps). Repeat the policy half
       // here so the CPU and GPU paths read identically.
+      //
+      // Upstream's literal 100, not the configurable cap: this entry point
+      // takes no RankingWeights and therefore has no cost model, so there is
+      // no cap to honour. Callers that raise the ceiling go through
+      // PredictBatchDeviceStats, which carries the weights.
       results.emplace_back(
           std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
           std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
@@ -515,6 +520,7 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
     rank.w_decompress_time = weights->w_cost_decompress_time;
     rank.w_io = weights->w_cost_io;
     rank.bandwidth_bytes_per_ms = weights->bandwidth_bytes_per_ms;
+    rank.ratio_cap = weights->ratio_cap;
     // The two mask inputs.
     //
     // The bound is the CHUNK's, i.e. upstream's cfg.error_bound -- NOT
@@ -581,13 +587,15 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
       std::chrono::duration<double, std::milli>(end_time - start_time).count() /
       static_cast<double>(batch.size());
 
+  const double kRatioCap = (weights != nullptr) ? weights->ratio_cap : 100.0;
   std::vector<CompressionPrediction> results;
   results.reserve(batch.size());
   for (size_t i = 0; i < batch.size(); ++i) {
     // Identical post-clamps to PredictBatch's GPU branch, so a chunk routed
-    // through either path lands on the same numbers.
+    // through either path lands on the same numbers -- and with the SAME cap
+    // the kernel used, or this re-clamp silently undoes a raised ceiling.
     results.emplace_back(
-        std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
+        std::max(0.1, std::min(kRatioCap, static_cast<double>(ratio[i]))),
         std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
         std::max(1.0, static_cast<double>(comp_time[i])),
         std::max(1.0, static_cast<double>(decomp_time[i])), infer_ms);

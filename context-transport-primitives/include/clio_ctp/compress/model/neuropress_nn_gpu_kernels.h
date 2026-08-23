@@ -155,6 +155,14 @@ struct GpuRankParams {
   double bandwidth_bytes_per_ms = 5e6;
 
   /**
+   * Compression-ratio ceiling, upstream's RATIO_CAP. Default 100 matches
+   * nn_gpu.cu exactly. It is applied to the PREDICTION in the forward pass and
+   * again in the ranking, so raising it moves both halves together -- see the
+   * note at the InferKernelDeviceStats launch.
+   */
+  double ratio_cap = 100.0;
+
+  /**
    * The two mask inputs, applied in-kernel exactly as nn_gpu.cu does:
    *   quantize actions are masked when error_bound <= 0
    *   any action is masked when min_psnr > 0 and its predicted PSNR is below it

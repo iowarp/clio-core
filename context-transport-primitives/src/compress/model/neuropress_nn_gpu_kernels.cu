@@ -478,6 +478,10 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     float *s_h1, float *s_h2, float *s_h3, float *s_h4, float *s_y, int t,
     int cand, float *__restrict__ out_comp_time,
     float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
+    /* Policy ratio ceiling. Upstream's RATIO_CAP is a literal 100
+       (nn_gpu.cu); it is a parameter here only so an experiment can raise it,
+       and every caller that does not opt in passes 100.0f. */
+    float ratio_cap,
     float *__restrict__ out_psnr,
     /* Outputs 4-7. Optional: selection reads none of them (upstream's own
        NN_INFER_OUTPUTS is 4, nn_weights.h:15), so a caller that only ranks
@@ -531,7 +535,7 @@ __device__ __forceinline__ void NeuroPressForwardShared(
 
     out_comp_time[cand] = fmaxf(1.0f, comp_time);
     out_decomp_time[cand] = fmaxf(1.0f, decomp_time);
-    out_ratio[cand] = fminf(100.0f, ratio);
+    out_ratio[cand] = fminf(ratio_cap, ratio);
     out_psnr[cand] = psnr;
 
     // Outputs 4-7, upstream nn_gpu.cu:211-216 for the transforms and :223-226
@@ -571,7 +575,8 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
                             float *__restrict__ out_comp_time,
                             float *__restrict__ out_decomp_time,
                             float *__restrict__ out_ratio,
-                            float *__restrict__ out_psnr) {
+                            float *__restrict__ out_psnr,
+                            float ratio_cap = 100.0f) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -588,7 +593,8 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
   __syncthreads();
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
-                          out_comp_time, out_decomp_time, out_ratio, out_psnr);
+                          out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          out_psnr);
 }
 
 /**
@@ -607,7 +613,8 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
                                 float *__restrict__ out_rmse,
                                 float *__restrict__ out_max_error,
                                 float *__restrict__ out_mae,
-                                float *__restrict__ out_ssim) {
+                                float *__restrict__ out_ssim,
+                                float ratio_cap = 100.0f) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -624,8 +631,8 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
   __syncthreads();
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
-                          out_comp_time, out_decomp_time, out_ratio, out_psnr,
-                          out_rmse, out_max_error, out_mae, out_ssim);
+                          out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          out_psnr, out_rmse, out_max_error, out_mae, out_ssim);
 }
 
 /**
@@ -658,7 +665,7 @@ __global__ void InferKernelDeviceStats(
     float *__restrict__ out_rmse = nullptr,
     float *__restrict__ out_max_error = nullptr,
     float *__restrict__ out_mae = nullptr,
-    float *__restrict__ out_ssim = nullptr) {
+    float *__restrict__ out_ssim = nullptr, float ratio_cap = 100.0f) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -712,8 +719,8 @@ __global__ void InferKernelDeviceStats(
   __syncthreads();
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
-                          out_comp_time, out_decomp_time, out_ratio, out_psnr,
-                          out_rmse, out_max_error, out_mae, out_ssim);
+                          out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          out_psnr, out_rmse, out_max_error, out_mae, out_ssim);
 }
 
 /**
@@ -751,7 +758,8 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
                            const int *__restrict__ action_ids, int n,
                            double data_size_bytes, double w_ct, double w_dt,
                            double w_io, double bw, double error_bound,
-                           double min_psnr, int *__restrict__ out_order,
+                           double min_psnr, double ratio_cap,
+                           int *__restrict__ out_order,
                            double *__restrict__ out_scores) {
   const int tid = static_cast<int>(threadIdx.x);
   double score = -CUDART_INF;
@@ -778,7 +786,7 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
     const double dt_raw = static_cast<double>(dt_in[tid]);
     const double dt = (dt_raw > 0.0) ? fmax(1.0, dt_raw) : ct;
     const double ratio =
-        fmax(0.1, fmin(100.0, static_cast<double>(ratio_in[tid])));
+        fmax(0.1, fmin(ratio_cap, static_cast<double>(ratio_in[tid])));
     const double io = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
     score = -(w_ct * ct + w_dt * dt + w_io * io);
 
@@ -1304,7 +1312,13 @@ bool NeuroPressGpuInferBatchDeviceStats(
         /* Only ask the kernel for outputs 4-7 when the caller wants them; the
            transforms are skipped on a null pointer, so ranking pays nothing. */
         out_rmse ? s.d_rmse : nullptr, out_max_error ? s.d_maxe : nullptr,
-        out_mae ? s.d_mae : nullptr, out_ssim ? s.d_ssim : nullptr);
+        out_mae ? s.d_mae : nullptr, out_ssim ? s.d_ssim : nullptr,
+        /* One cap for BOTH halves. Clamping the prediction at 100 while the
+           cost model scores the measurement at something higher puts the two
+           on different scales and inflates the MAPE that gates SGD and
+           exploration, so the ranking parameters carry the value the caller
+           chose and the forward pass uses the same one. */
+        rank != nullptr ? static_cast<float>(rank->ratio_cap) : 100.0f);
     ok = cudaGetLastError() == cudaSuccess;
   }
   // Cost model and ordering, still on the device and still on this stream --
@@ -1317,7 +1331,7 @@ bool NeuroPressGpuInferBatchDeviceStats(
         s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_actions, num_candidates,
         rank->data_size_bytes, rank->w_compress_time, rank->w_decompress_time,
         rank->w_io, rank->bandwidth_bytes_per_ms, rank->error_bound,
-        rank->min_psnr, s.d_order, s.d_scores);
+        rank->min_psnr, rank->ratio_cap, s.d_order, s.d_scores);
     ok = cudaGetLastError() == cudaSuccess;
     // The ranking is NOT fetched here: it shares one allocation with the
     // predictions, so FetchPredictionsSync below brings back scores, order and
@@ -1453,8 +1467,11 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
        lets the SGD path be fire-and-forget -- the ordering is enforced on the
        device, so neither host thread blocks for it. */
     SgdWaitIfEverFired(st);
-    InferKernel<<<num_candidates, kHiddenDim, 0, st>>>(w, s.d_raw, s.d_ct,
-                                                       s.d_dt, s.d_r, s.d_p);
+    /* This entry point takes no ranking parameters, so the cap stays at
+       upstream's literal 100. Callers that want a different ceiling go
+       through the device-stats path, which carries GpuRankParams. */
+    InferKernel<<<num_candidates, kHiddenDim, 0, st>>>(
+        w, s.d_raw, s.d_ct, s.d_dt, s.d_r, s.d_p, 100.0f);
     ok = cudaGetLastError() == cudaSuccess;
   }
   if (ok) {
