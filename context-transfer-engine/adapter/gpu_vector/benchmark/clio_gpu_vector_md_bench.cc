@@ -1231,6 +1231,12 @@ co_await srcx.BeginFetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun
       dp[3] = keep_w ? sv[3] : 0.0f;
     }
     __syncthreads();
+    // PUBLISH THIS ROW. Each block owns a private page table, so a row left
+    // in this block's cache is invisible to every other block. Flush exactly
+    // the row -- a whole-page flush would also send this block's stale copy
+    // of the ~11 OTHER rows sharing the page and clobber their owners.
+    co_await dst.BeginFlush(row * row_elems, row_elems);
+    co_await dst.EndFlush();
     }   // guards dead here
     if (false) {
     }
@@ -2342,6 +2348,14 @@ int main(int argc, char **argv) {
             vw, sv);
       });
       ctp::GpuApi::Synchronize();
+      // INVALIDATE. Per-block caches have no cross-block coherence: after the
+      // gather republished every row, each block still holds its own stale
+      // copies of pages other blocks rewrote. Drop them so the next phase
+      // fetches the published bytes. Safe here -- the gather flushed.
+      vx.ClearCache();
+      vv.ClearCache();
+      vx2.ClearCache();
+      vv2.ClearCache();
       std::swap(dx, dx2);
       std::swap(dv, dv2);
       cvx = (cvx == &vx) ? &vx2 : &vx;
@@ -2440,8 +2454,19 @@ int main(int argc, char **argv) {
     const double e_drift = std::fabs(e_n - e0) / std::fabs(e0);
     const auto sfx = cvx->ReadStats(0);
     const auto sff = vf.ReadStats(0);
-    const bool res_ok = (sfx.faults == 0 && sfx.evicts == 0 &&
-                         sff.faults == 0 && sff.evicts == 0);
+    // THE RESIDENT CONTRACT IS "NO EVICTION", NOT "NO FAULT".
+    //
+    // It used to mean zero faults, which only held because every block shared
+    // ONE page table: a page fetched by any block was resident for all of
+    // them. With a private table per block -- the launch geometry the vector
+    // requires -- each block must fetch every page it reads at least once,
+    // and the resort's invalidation forces a refetch of anything another
+    // block republished. Faults are therefore structural here.
+    //
+    // What "resident" still means, and what actually matters, is that the
+    // cache never has to give anything up: no evictions, so nothing is
+    // fetched twice for want of a frame.
+    const bool res_ok = (sfx.evicts == 0 && sff.evicts == 0);
     std::printf(
         "  NVE %llu steps: E0=%.6f En=%.6f drift=%.2e | KE %.3f -> %.3f\n"
         "  paging: x faults=%llu evicts=%llu | f faults=%llu evicts=%llu  "
@@ -2450,8 +2475,8 @@ int main(int argc, char **argv) {
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
         expect_resident
-            ? (res_ok ? "[resident contract HELD]"
-                      : "[RESIDENT CONTRACT VIOLATED]")
+            ? (res_ok ? "[resident contract HELD: no evictions]"
+                      : "[RESIDENT CONTRACT VIOLATED: evicted]")
             : "[out-of-core regime: faults EXPECTED]");
     // REGIME-AWARE. The resident contract -- zero faults in the timed region
     // -- is a promise about the RESIDENT regime only: it says a cache that
