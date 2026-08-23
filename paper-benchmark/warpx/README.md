@@ -117,19 +117,48 @@ chunks the gate did select were the ones that mattered.
 
 ## Verification
 
-Every run writes the authoritative native `.h5` alongside the tier, so `read.sh`
-reads one field dataset twice — through Clio's VOL and through the native VOL —
-and compares. Bytes match.
+`read.sh` reads field datasets back through the VOL from a **separate process**
+(`CLIO_RESTART=1`, replaying the metadata log) and checks two things: the bytes
+match a native read, and the path trace shows the tier actually answered.
 
-**That is necessary but not sufficient, and this workload does not yet clear the
-bar the others do.** Because the native file holds the same data uncompressed, a
-VOL read that misses the tier entirely still returns correct bytes. The path
-trace currently shows the read taking `MISS (native + stage)` rather than
-inverting a codec, so `read.sh` reports **INCONCLUSIVE** and the `verified`
-column reads `n/a`. The Nyx and VPIC benchmarks have no such escape — their tier
-is the only copy — and both verify by digest. Closing this for WarpX means
-finding why the restart-mode probe misses blobs the writer stored; it is not
-done.
+```console
+$ ./read.sh --run static-zstd-s4
+== cold read of diags/diag1/openpmd_000010.h5 (writer process is long gone)
+   /data/10/fields/B/x: 8388608 B, identical to native, 8 chunk(s) inverted by a codec
+   /data/10/fields/B/y: 8388608 B, identical to native, 8 chunk(s) inverted by a codec
+   /data/10/fields/B/z: 8388608 B, identical to native, 8 chunk(s) inverted by a codec
+
+PASS: every dataset came back byte-identical AND was served from the compressed tier
+      (24 chunk inversions, 0 cache miss(es))
+```
+
+**Both halves are needed, and this workload is the one that proves it.** The
+native `.h5` is authoritative and holds the same data uncompressed, so a read
+that misses the tier entirely still returns correct bytes. Measured on a fresh
+store, reading the identical file by the wrong key:
+
+| | codec inversions | cache misses | bytes correct |
+|---|---|---|---|
+| tier served the read | 24 | 0 | yes |
+| tier never touched | **0** | 1 | **yes** |
+
+Correct bytes with zero tier use — indistinguishable from success on data alone.
+`read.sh` fails the run when the trace shows no inversion, so that case cannot
+pass silently.
+
+### The file name is the key
+
+The reason the second row happens at all: **the VOL keys its tag on the file
+name as given**. WarpX runs in its output directory and writes
+`diags/diag1/openpmd_*.h5` *relative*; a reader that opens the same file by
+absolute path keys differently and finds nothing the writer stored —
+`populated=0`, `chunk_0_size=0`, `MISS (native + stage)` — then silently
+re-stages it, so a *second* absolute read appears to work. `read.sh` therefore
+cds into the run directory and opens the same relative path the writer used.
+
+This is the same defect class the HDF5 VOL's own tests record for datasets
+opened by absolute path versus relative to a group. It is a property of Clio's
+VOL, not of WarpX.
 
 ## Notes
 
