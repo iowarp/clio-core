@@ -15,7 +15,7 @@
 # selection policy. Each run stores its per-chunk CSV, its NeuroPress
 # selection log, and -- for exploration -- every candidate it measured.
 #
-# Then: ./collect.py results/  ->  summary.csv + summary.md
+# Then: ../collect.py results/  ->  summary.csv + summary.md
 #
 # NOTE ON REPEATS: a GPU (Kokkos) run is not bit-reproducible, so repeats of
 # the same configuration differ slightly in the bytes they compress. Use
@@ -63,7 +63,7 @@ for rep in $(seq 1 "$REPEATS"); do
 done
 
 echo "sweep done; $FAILED run(s) failed"
-if command -v python3 >/dev/null && [ -x "$HERE/collect.py" ]; then
-  "$HERE/collect.py" "$RESULTS"
+if command -v python3 >/dev/null && [ -x "$HERE/../collect.py" ]; then
+  "$HERE/../collect.py" "$RESULTS"
 fi
 exit $(( FAILED > 0 ))

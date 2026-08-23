@@ -148,4 +148,11 @@ if(CLIO_CORE_ENABLE_CUDA)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_lammps_lib/CMakeLists.txt)
     add_subdirectory(neuropress_lammps_lib)
   endif()
+
+  # Replay a simulation's field dumps through the compressor -- the shape
+  # upstream NeuroPress uses for Nyx, and the only one available for codes
+  # with no library interface to embed. No simulation dependency.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_field_replay/CMakeLists.txt)
+    add_subdirectory(neuropress_field_replay)
+  endif()
 endif()

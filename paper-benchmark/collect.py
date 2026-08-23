@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Aggregate a paper-benchmark sweep into summary.csv and summary.md.
 
+Shared by every workload under paper-benchmark/. Field names are derived from
+the blob names rather than hardcoded, so a workload only has to name its blobs
+"<field>/..." (LAMMPS: position/step_50/chunk_3) or use the AMReX dump naming
+("plt00007/fab0000_comp00_density/chunk_1"), and the per-field columns follow.
+
 Reads each run directory's meta.json (what was configured) and blobs.csv (what
 happened to every chunk) and reports the numbers a paper needs: compression
 ratio, bytes stored, how many chunks the codec actually shrank, the codec mix,
@@ -15,7 +20,24 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 
-FIELDS = ("position", "velocity", "force")
+def field_of(blob):
+    """Physical field a blob belongs to, from its name.
+
+    Two shapes in use. LAMMPS-style "<field>/step_N/chunk_M" puts the field
+    first. AMReX-style dumps name the middle segment
+    "fab%04d_comp%02d_<field>", so the field is what follows the component
+    index -- taking the first segment there would group everything under a
+    timestep instead, which is not a physical quantity.
+    """
+    parts = blob.split("/")
+    if len(parts) >= 2:
+        mid = parts[1]
+        c = mid.find("_comp")
+        if c != -1:
+            u = mid.find("_", c + 5)
+            if u != -1:
+                return mid[u + 1:]
+    return parts[0]
 
 
 def load_run(d):
@@ -36,13 +58,13 @@ def load_run(d):
     total_stored = sum(int(r["stored"]) for r in rows)
     compressed = [r for r in rows if r["lib"] != "0"]
 
-    per_field = {}
-    for f in FIELDS:
-        sel = [r for r in rows if r["blob"].startswith(f + "/")]
-        if sel:
-            i = sum(int(r["bytes"]) for r in sel)
-            s = sum(int(r["stored"]) for r in sel)
-            per_field[f] = round(i / s, 4) if s else 0.0
+    per_field_io = defaultdict(lambda: [0, 0])
+    for r in rows:
+        io = per_field_io[field_of(r["blob"])]
+        io[0] += int(r["bytes"])
+        io[1] += int(r["stored"])
+    per_field = {f: (round(i / s, 4) if s else 0.0)
+                 for f, (i, s) in per_field_io.items()}
 
     mix = Counter(r["codec"] if r["lib"] != "0" else "raw" for r in rows)
     ms = [float(r["compress_ms"]) for r in rows]
@@ -62,11 +84,15 @@ def load_run(d):
     phys = meta.get("physics", {}) or {}
     phys_set = {k: v for k, v in phys.items() if v not in ("deck", "", None)}
     phys_key = " ".join(f"{k}={v}" for k, v in sorted(phys_set.items()))
+    precision = phys.get("precision")
 
     return {
         "tag": meta.get("tag", os.path.basename(d)),
         "config": meta.get("config", ""),
+        "workload": meta.get("workload", "lammps-ljmelt"),
+        "files": meta.get("files", 0),
         "physics": phys_key or "deck defaults",
+        "physics_precision": precision,
         "device": meta.get("device", ""),
         "atoms": meta.get("atoms", 0),
         "frames": meta.get("frames", 0),
@@ -82,7 +108,7 @@ def load_run(d):
         "verified": verified or "n/a",
         "rc": meta.get("rc", 0),
         "codec_mix": " ".join(f"{k}:{v}" for k, v in mix.most_common()),
-        **{f"ratio_{f}": per_field.get(f, 0.0) for f in FIELDS},
+        "fields": per_field,
     }
 
 
@@ -105,12 +131,21 @@ def main():
     if not runs:
         sys.exit(f"no completed runs found under {root}/")
 
-    cols = list(runs[0].keys())
+    # Every field any run saw, so the CSV has a stable header even if a run
+    # dumped a different component set.
+    all_fields = sorted({f for r in runs for f in r["fields"]})
+    flat = []
+    for r in runs:
+        row = {k: v for k, v in r.items() if k != "fields"}
+        for f in all_fields:
+            row[f"ratio_{f}"] = r["fields"].get(f, 0.0)
+        flat.append(row)
+    cols = list(flat[0].keys())
     csv_p = os.path.join(outdir, "summary.csv")
     with open(csv_p, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
-        w.writerows(runs)
+        w.writerows(flat)
 
     # Average repeats -- but only of runs that are the same experiment.
     # Config AND physics both have to match, or a sweep repeated at a second
@@ -120,21 +155,35 @@ def main():
         by_cfg[(r["config"] or r["tag"], r["physics"])].append(r)
     multi_physics = len({r["physics"] for r in runs}) > 1
 
-    lines = ["# LAMMPS paper benchmark", ""]
     a = runs[0]
+    # The workload line is written from meta.json, not hardcoded: this
+    # aggregator is shared, and a Nyx sweep described as "LJ melt ... float64"
+    # is worse than no description at all.
+    wl = a.get("workload", "lammps-ljmelt")
+    prec = (a.get("physics_precision") or
+            ("float32" if wl.startswith("nyx") else "float64"))
+    if wl.startswith("nyx"):
+        title = "Nyx paper benchmark"
+        what = (f"Nyx Sedov blast, {a['files']} field file(s), "
+                f"{a['frames']} frames")
+    else:
+        title = "LAMMPS paper benchmark"
+        what = f"LJ melt, {a['atoms']:,} atoms, {a['frames']} frames"
+    lines = [f"# {title}", ""]
     lines += [
-        f"Workload: LJ melt, {a['atoms']:,} atoms, {a['frames']} frames, "
-        f"{a['payload_bytes'] / 1048576:.1f} MiB float64, {a['chunks']} chunks, "
+        f"Workload: {what}, "
+        f"{a['payload_bytes'] / 1048576:.1f} MiB {prec}, {a['chunks']} chunks, "
         f"{a['device'].upper()}."
         + (f" Physics: {a['physics']}."
            if not multi_physics
            else " Runs below differ in physics -- see the column."),
         "",
         "| config |" + (" physics |" if multi_physics else "") +
-        " ratio | stored | compressed/raw | position | velocity | force "
-        "| compress ms | wall s | verified |",
-        "|---|" + ("---|" if multi_physics else "") +
-        "---|---|---|---|---|---|---|---|---|",
+        " ratio | stored | compressed/raw | "
+        + " | ".join(all_fields) +
+        " | compress ms | wall s | verified |",
+        "|---|" + ("---|" if multi_physics else "")
+        + "---|---|---|" + "---|" * len(all_fields) + "---|---|---|",
     ]
     for (cfg, phys), rs in by_cfg.items():
         n = len(rs)
@@ -147,8 +196,10 @@ def main():
             f"| `{cfg}`{note} |{physcol} **{avg('ratio'):.3f}×** | "
             f"{avg('stored_bytes') / 1048576:.1f} MiB | "
             f"{avg('compressed_chunks'):.0f} / {avg('raw_chunks'):.0f} | "
-            f"{avg('ratio_position'):.3f}× | {avg('ratio_velocity'):.3f}× | "
-            f"{avg('ratio_force'):.3f}× | {avg('compress_ms_sum'):.0f} | "
+            + "".join(
+                f"{sum(r['fields'].get(f, 0.0) for r in rs) / n:.3f}× | "
+                for f in all_fields)
+            + f"{avg('compress_ms_sum'):.0f} | "
             f"{avg('wall_s'):.1f} | {ver} |")
     lines += ["", "## Codec mix", ""]
     for (cfg, phys), rs in by_cfg.items():
