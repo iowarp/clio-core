@@ -67,6 +67,7 @@ struct Options {
   bool f64 = false;                // dumps are float64 rather than float32
   bool verify = false;
   bool readback = false;           // read a previous report back, no files
+  std::string dump_dir;            // write decompressed bytes here (readback)
 };
 
 void Usage(const char *argv0) {
@@ -81,7 +82,10 @@ void Usage(const char *argv0) {
       << "  --tag NAME       CTE tag [field_replay]\n"
       << "  --report CSV     per-chunk outcome\n"
       << "  --verify         read every blob back and compare\n"
-      << "  --readback CSV   no files: read the blobs a previous run listed\n";
+      << "  --readback CSV   no files: read the blobs a previous run listed\n"
+      << "  --dump-decompressed DIR  with --readback, write each decompressed\n"
+      << "                   blob to DIR so an EXTERNAL tool can compare it\n"
+      << "                   against the simulation's own output files\n";
 }
 
 bool ParseArgs(int argc, char **argv, Options *o) {
@@ -101,6 +105,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--tag") o->tag = need("NAME");
     else if (a == "--report") o->report = need("CSV");
     else if (a == "--readback") { o->readback = true; o->report = need("CSV"); }
+    else if (a == "--dump-decompressed") o->dump_dir = need("DIR");
     else if (a == "--f64") o->f64 = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "-h" || a == "--help") { Usage(argv[0]); std::exit(0); }
@@ -194,6 +199,17 @@ int main(int argc, char **argv) {
       if (!ok) {
         ++bad;
         std::cerr << "  MISMATCH " << r.name << " rc=" << get->GetReturnCode() << "\n";
+      }
+      /* Optionally hand the decompressed bytes to an external checker. The
+         digest above is computed by the same program that computed the
+         original one, so it proves the round trip is self-consistent; writing
+         the bytes out lets something else compare them against the
+         simulation's own output and remove this program from the loop. */
+      if (!opt.dump_dir.empty() && get->GetReturnCode() == 0) {
+        std::string fn = r.name;
+        for (auto &ch : fn) if (ch == '/') ch = '_';
+        std::ofstream(opt.dump_dir + "/" + fn + ".bin", std::ios::binary)
+            .write(buf.ptr_, static_cast<std::streamsize>(r.bytes));
       }
       CLIO_IPC->FreeBuffer(buf);
     }
