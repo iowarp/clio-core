@@ -210,7 +210,7 @@ __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
                                        float *scratch) {
   const clio::run::u64 n = hi - lo;
   for (clio::run::u64 i = 0; i < n;) {
-    co_await v.BeginFetch(lo + i, (lo + i) + 1);
+    co_await v.BeginFetch(v.PageLo(lo + i), v.PageSpan(lo + i, 1));
     co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(lo + i, n - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {

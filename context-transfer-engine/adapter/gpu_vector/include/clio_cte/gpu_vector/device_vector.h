@@ -150,6 +150,20 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 PageOf(clio::run::u64 off) const {
     return off / h_->elems_per_page_;
   }
+  /** Start of the page containing `off`. Use with PageSpan to fetch WHOLE
+   *  pages: a frame is only valid where it was fetched, so anything that
+   *  will be flushed as a whole page must be fetched as a whole page. */
+  CTP_GPU_FUN clio::run::u64 PageLo(clio::run::u64 off) const {
+    return PageOf(off) * h_->elems_per_page_;
+  }
+  /** Element count from PageLo(off) covering whole pages through
+   *  [off, off+count). Pairs with PageLo as a (start, count) argument. */
+  CTP_GPU_FUN clio::run::u64 PageSpan(clio::run::u64 off,
+                                      clio::run::u64 count) const {
+    const clio::run::u64 last = off + (count != 0 ? count - 1 : 0);
+    return (PageOf(last) + 1) * h_->elems_per_page_ - PageLo(off);
+  }
+
   CTP_GPU_FUN clio::run::u32 NumTables() const { return h_->nblocks_; }
   /** This block's page table, for diagnostics that dump residency. */
   CTP_GPU_FUN const Page *TableForDebug() const { return Pages(); }
@@ -170,8 +184,13 @@ class DeviceVector {
    * expense of other pages. MANDATORY: HoldPage no longer faults, so a page
    * that was not fetched is a caller error.
    *
-   * Takes (lo, hi) pairs: BeginFetch(a0, a1, b0, b1). Returns once the fetch
-   * has been SUBMITTED; pair it with AwaitFetch before holding.
+   * Takes (offset, count) pairs: BeginFetch(off1, n1, off2, n2). Returns
+   * once the fetch has been SUBMITTED; pair it with AwaitFetch before
+   * holding.
+   *
+   * Only the named bytes become valid in the frame. Anything that will later
+   * be flushed as a WHOLE page must be fetched as a whole page -- see
+   * PageLo/PageSpan.
    */
   template <typename... Args>
   __device__ clio::run::gpu::YCoroTask BeginFetch(Args... args) {
@@ -186,11 +205,15 @@ class DeviceVector {
     // Pin what is already resident BEFORE making room, so the eviction that
     // frees frames for the missing pages cannot take a page of this very
     // range and turn one fetch into two.
-    clio::run::u32 missing = 0;
-    if (threadIdx.x == 0) {
-      missing = PinResidentAndCountMissing(lo, hi, nr);
-    }
-    missing = __syncthreads_or(static_cast<int>(missing));
+    // COUNT ON EVERY THREAD. The scan is read-only, so every thread reaches
+    // the same number and no broadcast is needed. Voting it with
+    // __syncthreads_or would collapse the COUNT to 0/1 and free one frame for
+    // a range missing several pages -- which is how "no free frame after
+    // EvictPages" fired.
+    const clio::run::u32 missing = CountMissing(lo, hi, nr);
+    // Pinning mutates, so only thread 0 does it.
+    if (threadIdx.x == 0) PinResident(lo, hi, nr);
+    __syncthreads();
     if (missing != 0) {
       co_await EvictPages(missing, missing);
       if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
@@ -242,7 +265,29 @@ class DeviceVector {
     co_return Pin(p, off, count, write);
   }
 
-  /** Start writing back every dirty page of this block's table. */
+  /**
+   * Write back only the named element ranges, as (offset, count) pairs. Use
+   * this when several blocks write different parts of one page: a full-page
+   * flush would send the frame's other bytes too and clobber whatever
+   * another block put there.
+   */
+  template <typename... Rest>
+  __device__ clio::run::gpu::YCoroTask BeginFlush(clio::run::u64 off,
+                                                  clio::run::u64 count,
+                                                  Rest... rest) {
+    clio::run::u64 rlo[kMaxFetchRanges], rhi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(rlo, rhi, nr, off, count, rest...);
+    CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
+    if (threadIdx.x == 0) {
+      if (FlushBusy()) RetireFlush();
+      SubmitFlushRanges(rlo, rhi, nr);
+    }
+    __syncthreads();
+    co_return;
+  }
+
+  /** Start writing back every dirty page of this block's table, in full. */
   __device__ clio::run::gpu::YCoroTask BeginFlush() {
     // Wait only while the previous put is still moving. Callers flush inside
     // a loop to overlap the next page's compute, so a landed flush is retired
@@ -259,7 +304,7 @@ class DeviceVector {
   /** Wait for the writeback started by BeginFlush. */
   __device__ clio::run::gpu::YCoroTask EndFlush() {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
-    if (threadIdx.x == 0) RetireFlush();
+    if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();
     co_return;
   }
@@ -316,8 +361,13 @@ class DeviceVector {
    */
   __device__ clio::run::gpu::YCoroTask EvictPages(clio::run::u32 min,
                                                   clio::run::u32 max) {
-    CLIO_CO_YIELD_WHEN(;, (threadIdx.x == 0) ? !FreeSome(min, max) : false,
-                       FlushTag());
+    // The reap slot is load-bearing. Without it this deadlocks: FreeSome
+    // returns false while a flush is in flight, but flush_busy is only
+    // cleared by EndFlush -- which the caller cannot reach, because it is
+    // suspended here. Retire the landed flush ourselves and retry.
+    CLIO_CO_YIELD_WHEN(
+        if (FlushBusy() && FlushDone()) RetireFlush();,
+        (threadIdx.x == 0) ? !FreeSome(min, max) : false, FlushTag());
     co_return;
   }
 
@@ -386,39 +436,72 @@ class DeviceVector {
 
   // ------------------------------ fetch ------------------------------
 
+  /** Ranges arrive as (offset, count) pairs; stored as [lo, hi). */
   CTP_GPU_FUN void GatherRanges(clio::run::u64 *, clio::run::u64 *,
                                 clio::run::u32 &) const {}
   template <typename... Rest>
   CTP_GPU_FUN void GatherRanges(clio::run::u64 *lo, clio::run::u64 *hi,
-                                clio::run::u32 &n, clio::run::u64 a,
-                                clio::run::u64 b, Rest... rest) const {
-    if (n < kMaxFetchRanges) {
-      lo[n] = a;
-      hi[n] = b;
+                                clio::run::u32 &n, clio::run::u64 off,
+                                clio::run::u64 count, Rest... rest) const {
+    if (n < kMaxFetchRanges && count != 0) {
+      lo[n] = off;
+      hi[n] = off + count;
       ++n;
     }
     GatherRanges(lo, hi, n, rest...);
   }
 
-  /** Pin every resident page of the ranges; @return how many are missing. */
-  CTP_GPU_FUN clio::run::u32 PinResidentAndCountMissing(
-      const clio::run::u64 *lo, const clio::run::u64 *hi,
-      clio::run::u32 nr) {
+  /**
+   * The byte extent of element range [lo, hi) that lies inside page `pn`.
+   * @return false when the range does not touch the page.
+   *
+   * This is what makes fetch and flush PARTIAL: a caller that names half a
+   * page moves half a page, and two blocks writing different parts of one
+   * page no longer overwrite each other.
+   */
+  CTP_GPU_FUN bool ClipToPage(clio::run::u64 pn, clio::run::u64 lo,
+                              clio::run::u64 hi, clio::run::u64 *byte_off,
+                              clio::run::u64 *byte_len) const {
+    const clio::run::u64 epp = h_->elems_per_page_;
+    const clio::run::u64 pstart = pn * epp;
+    const clio::run::u64 a = lo > pstart ? lo : pstart;
+    const clio::run::u64 b = hi < pstart + epp ? hi : pstart + epp;
+    if (b <= a) return false;
+    *byte_off = (a - pstart) * sizeof(T);
+    *byte_len = (b - a) * sizeof(T);
+    return true;
+  }
+
+  /** How many pages of the ranges are not resident. Read-only, so every
+   *  thread computes the same answer. */
+  CTP_GPU_FUN clio::run::u32 CountMissing(const clio::run::u64 *lo,
+                                          const clio::run::u64 *hi,
+                                          clio::run::u32 nr) const {
     clio::run::u32 missing = 0;
     for (clio::run::u32 r = 0; r < nr; ++r) {
       if (hi[r] <= lo[r]) continue;
       const clio::run::u64 p0 = PageOf(lo[r]);
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
-        Page *p = Find(pn);
-        if (p != nullptr) {
-          ++p->pins;
-        } else {
-          ++missing;
-        }
+        if (Find(pn) == nullptr) ++missing;
       }
     }
     return missing;
+  }
+
+  /** Pin every resident page of the ranges, so the eviction that makes room
+   *  for the missing ones cannot take a page of this very range. */
+  CTP_GPU_FUN void PinResident(const clio::run::u64 *lo,
+                               const clio::run::u64 *hi, clio::run::u32 nr) {
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
+        Page *p = Find(pn);
+        if (p != nullptr) ++p->pins;
+      }
+    }
   }
 
   /** Undo PinResidentAndCountMissing's pins. */
@@ -455,10 +538,15 @@ class DeviceVector {
                  "after EvictPages\n", Table(), (unsigned long long) pn);
           __trap();
         }
+        clio::run::u64 boff = 0, blen = 0;
+        if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
         p->fetching = 1u;
         p->page_num = pn;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
-        t->Add("", 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
+        // Only the bytes the caller named. The rest of the frame keeps
+        // whatever it held; the caller owns what it asked for.
+        t->Add("", boff, blen,
+               RawPtr(static_cast<char *>(p->data) + boff), 0.5f);
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                       sizeof(pn32));
         bt->fetch_slot[n++] = static_cast<clio::run::u32>(p - Pages());
@@ -534,7 +622,7 @@ class DeviceVector {
         &Tasks()->flush->fut_.is_complete_.x);
   }
 
-  /** Stage every dirty page into the flush task and send it. Thread 0 only. */
+  /** Stage every dirty page IN FULL and send it. Thread 0 only. */
   CTP_GPU_FUN void SubmitFlush() {
     BlockTasks *bt = Tasks();
     Page *tbl = Pages();
@@ -544,11 +632,11 @@ class DeviceVector {
     for (clio::run::u32 i = 0;
          i < h_->pages_per_block_ && n < clio::cte::core::kPodMultiMax; ++i) {
       Page *p = &tbl[i];
-      if (!p->dirty || p->flushing || p->fetching) continue;
+      // A flush is unconditional: it does not consult `dirty`, it writes
+      // what is resident and then declares the frame clean.
+      if (p->page_num == kNoPage || p->flushing || p->fetching) continue;
       const clio::run::u32 pn32 = static_cast<clio::run::u32>(p->page_num);
       t->Add("", 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
-      // Overwrite the record's name with the raw page number; Add() takes a
-      // C string and would stop at the first zero byte.
       t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                     sizeof(pn32));
       bt->flush_slot[n++] = i;
@@ -556,6 +644,46 @@ class DeviceVector {
     }
     bt->flush_n = n;
     if (n == 0) return;
+    FinishFlushSubmit(t, n);
+  }
+
+  /** Stage only the named ranges of dirty pages. Thread 0 only. */
+  CTP_GPU_FUN void SubmitFlushRanges(const clio::run::u64 *lo,
+                                     const clio::run::u64 *hi,
+                                     clio::run::u32 nr) {
+    BlockTasks *bt = Tasks();
+    Page *tbl = Pages();
+    auto *t = bt->flush;
+    t->count_ = 0;
+    clio::run::u32 n = 0;
+    for (clio::run::u32 r = 0; r < nr && n < clio::cte::core::kPodMultiMax;
+         ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0;
+           pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
+        Page *p = Find(pn);
+        if (p == nullptr || p->flushing) continue;
+        clio::run::u64 boff = 0, blen = 0;
+        if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
+        const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
+        t->Add("", boff, blen,
+               RawPtr(static_cast<char *>(p->data) + boff), 0.5f);
+        t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
+                                      sizeof(pn32));
+        bt->flush_slot[n++] = static_cast<clio::run::u32>(p - tbl);
+        p->flushing = 1u;
+      }
+    }
+    bt->flush_n = n;
+    if (n == 0) return;
+    FinishFlushSubmit(t, n);
+  }
+
+  /** The task fields every flush submission shares. */
+  CTP_GPU_FUN void FinishFlushSubmit(MultiPutSlot *t, clio::run::u32 n) {
+    BlockTasks *bt = Tasks();
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = DeviceTaskId(Table(), kKindFlush, bt->seq++);
@@ -573,7 +701,7 @@ class DeviceVector {
       atomicAdd(h_->stat_puts_, static_cast<unsigned long long>(n));
     }
     bt->flush_busy = 1u;
-    t->fut_.is_complete_.store(0);   // reused task: clear the last completion
+    t->fut_.is_complete_.store(0);
     bt->flush_fut =
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
@@ -589,7 +717,7 @@ class DeviceVector {
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &tbl[bt->flush_slot[i]];
       p->flushing = 0u;
-      p->dirty = 0u;
+      p->dirty = 0u;   // a flush always cleans the frame
     }
     bt->flush_n = 0;
     bt->flush_busy = 0u;

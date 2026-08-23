@@ -89,7 +89,7 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
       co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
@@ -155,7 +155,7 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     // probe and its generation are machinery this test exists to exercise
     // (TestAccess): the seqlock is what guards any raw read the pin does
     // not cover, and it must never invalidate a read that was in fact safe.
-    co_await v.BeginFetch(pn * kPageElems, (pn * kPageElems) + 1);
+    co_await v.BeginFetch(v.PageLo(pn * kPageElems), v.PageSpan(pn * kPageElems, 1));
     co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
     if (threadIdx.x == 0 && h.run() != 0) {

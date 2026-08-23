@@ -153,8 +153,6 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
-  int per_block = 0;       // one page table PER CUDA BLOCK (the designed
-                           // model) instead of one shared table
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
@@ -365,7 +363,9 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
       const u32 wy = (by + nb + dy) % nb;
       const u64 rowbin0 = (static_cast<u64>(wz) * nb + wy) * nb;
       rbase[q] = rowbin0 * cap * kStride;
-      hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
+co_await x.BeginFetch(x.PageLo(rbase[q]), x.PageSpan(rbase[q], row_elems));
+      co_await x.AwaitFetch();
+            hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
       rrun0[q] = hg[q][0].run();
       if (rrun0[q] < row_elems) {
         hg[q][1] = co_await x.HoldPage(rbase[q] + rrun0[q],
@@ -377,7 +377,9 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
     // Write-hold this row of f and zero it.
     const u64 fbase = (static_cast<u64>(bz) * nb + by) * static_cast<u64>(nb) *
                       cap * kStride;
-    gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
+co_await f.BeginFetch(f.PageLo(fbase), f.PageSpan(fbase, row_elems));
+    co_await f.AwaitFetch();
+        gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
     gv::Held<float> hf1;
     const u64 frun0 = hf0.run();
     if (frun0 < row_elems) {
@@ -577,7 +579,9 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        hg[nspans][0] = co_await x.HoldPage(rb, len);
+co_await x.BeginFetch(x.PageLo(rb), x.PageSpan(rb, len));
+        co_await x.AwaitFetch();
+                hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
           hg[nspans][1] =
@@ -603,7 +607,9 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-        hn[nguards] =
+co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, rowlist - off));
+        co_await nl.AwaitFetch();
+                hn[nguards] =
             co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
@@ -845,7 +851,9 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        hg[nspans][0] = co_await x.HoldPage(rb, len);
+co_await x.BeginFetch(x.PageLo(rb), x.PageSpan(rb, len));
+        co_await x.AwaitFetch();
+                hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
           hg[nspans][1] =
@@ -866,7 +874,9 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // and only 9 entries, so thread 0 resolves it once per row.
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
-    // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
+co_await f.BeginFetch(f.PageLo(fbase), f.PageSpan(fbase, row_elems));
+    co_await f.AwaitFetch();
+        // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
     // Every paged vector needs it, not just x -- f and nl have their own
     // tables and can exhaust them exactly the same way. Tightening only x's
     // reservation re-wedged a 32-slot run precisely because the blanket
@@ -896,7 +906,9 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-        hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
+co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, rowlist - off));
+        co_await nl.AwaitFetch();
+                hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
         glen[nguards] = hn[nguards].run();
@@ -1043,7 +1055,9 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float fnb = static_cast<float>(nb);
   for (u64 pg = block; pg < npages; pg += nblocks) {
-    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
+    co_await x.AwaitFetch();
+        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
     float *const px = hx.ptr();
     const u64 nslots = epp / kStride;
     const u64 slot0 = pg * nslots;
@@ -1118,13 +1132,17 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     const u32 by = static_cast<u32>(row % nb);
     const u32 bz = static_cast<u32>(row / nb);
     // THE ONLY WRITE HOLD: this block's own destination row.
-    {   // every guard dies at this scope's close, before the reservations
+    {co_await dst.BeginFetch(dst.PageLo(row * row_elems), dst.PageSpan(row * row_elems, row_elems));
+    co_await dst.AwaitFetch();
+       // every guard dies at this scope's close, before the reservations
     gv::Held<float> hd0 = co_await dst.HoldPage(row * row_elems, row_elems,
                                                 /*write=*/true);
     gv::Held<float> hd1;
     const u64 drun = hd0.run();
     if (drun < row_elems) {
-      hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
+co_await dst.BeginFetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * row_elems + drun, row_elems - drun));
+      co_await dst.AwaitFetch();
+            hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
                                   /*write=*/true);
     }
     float *const dp0 = hd0.ptr();
@@ -1158,7 +1176,9 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         const u64 rb =
             (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        hs[nspans][0] = co_await src.HoldPage(rb, len);
+co_await src.BeginFetch(src.PageLo(rb), src.PageSpan(rb, len));
+        co_await src.AwaitFetch();
+                hs[nspans][0] = co_await src.HoldPage(rb, len);
         srun[nspans] = hs[nspans][0].run();
         if (srun[nspans] < len) {
           hs[nspans][1] =
@@ -1166,10 +1186,14 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         }
         sp0[nspans] = hs[nspans][0].ptr();
         sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
-        hx[nspans][0] = co_await srcx.HoldPage(rb, len);
+co_await srcx.BeginFetch(srcx.PageLo(rb), srcx.PageSpan(rb, len));
+        co_await srcx.AwaitFetch();
+                hx[nspans][0] = co_await srcx.HoldPage(rb, len);
         xrun[nspans] = hx[nspans][0].run();
         if (xrun[nspans] < len) {
-          hx[nspans][1] =
+co_await srcx.BeginFetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun[nspans], len - xrun[nspans]));
+          co_await srcx.AwaitFetch();
+                    hx[nspans][1] =
               co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);
         }
         xp0[nspans] = hx[nspans][0].ptr();
@@ -1219,7 +1243,9 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst,
   const u64 epp = dst.ElemsPerPage();
   const u64 npages = (dst.size() + epp - 1) / epp;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-    auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
+co_await dst.BeginFetch(dst.PageLo(pg * epp), dst.PageSpan(pg * epp, epp));
+    co_await dst.AwaitFetch();
+        auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
     float *const p = h.ptr();
     const u64 nslots = epp / kStride;
     for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
@@ -1240,9 +1266,15 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
-    auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
-    auto hf = co_await f.HoldPage(pg * epp, epp);
+co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
+    co_await x.AwaitFetch();
+        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+co_await v.BeginFetch(v.PageLo(pg * epp), v.PageSpan(pg * epp, epp));
+    co_await v.AwaitFetch();
+        auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+co_await f.BeginFetch(f.PageLo(pg * epp), f.PageSpan(pg * epp, epp));
+    co_await f.AwaitFetch();
+        auto hf = co_await f.HoldPage(pg * epp, epp);
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
     const float *const pf = hf.ptr();
@@ -1272,20 +1304,21 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
  *  steady-state MD never flushes x/v (they are device-canonical). */
 __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
                                       gv::DeviceVector<float> v, u32 nblocks,
-                                      u32 block) {
-  // ONE BLOCK, and that is a constraint rather than a choice: the flush
-  // path uses the block TABLE's batch slots and block lock, and this
-  // benchmark deliberately maps every CUDA block onto ONE SHARED table so
-  // each page exists once. Disjoint-page HOLDS are safe there (lock-free
-  // probes); concurrent FLUSHES are not -- splitting the flush across
-  // blocks wedged the runtime outright.
-  (void)nblocks;
-  if (block == 0) {
-    co_await x.BeginFlush();
-    co_await x.EndFlush();
-    co_await v.BeginFlush();
-    co_await v.EndFlush();
-  }
+                                      u32 block, u64 row_elems, u64 nrows) {
+  // EVERY BLOCK FLUSHES ITS OWN TABLE, in full.
+  //
+  // Each block owns a private page table now, so the old "block 0 flushes
+  // everything" would publish one block's copy and drop the rest. A full
+  // flush is right here because IntegrateCoro partitions x and v BY PAGE
+  // (pg = block; pg += nblocks) -- a block's table only ever holds pages it
+  // owns outright, so there is no other block's data in them to clobber.
+  (void) row_elems;
+  (void) nrows;
+  (void) block;
+  co_await x.BeginFlush();
+  co_await x.EndFlush();
+  co_await v.BeginFlush();
+  co_await v.EndFlush();
 }
 
 /** Seeded value of element i: unique and exactly representable (the whole
@@ -1306,7 +1339,9 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
   }
   for (u64 it = 0; it < passes; ++it) {
     for (u64 pg = block; pg < npages; pg += nblocks) {
-      auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
+co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
+      co_await x.AwaitFetch();
+            auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
       // Is the guard born valid? Its slot must hold the page we asked for.
       // This separates "the hold returned the wrong frame" from "the frame
       // was right and the slot was recycled out from under the pin".
@@ -1353,8 +1388,12 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
-    auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
+    co_await x.AwaitFetch();
+        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+co_await v.BeginFetch(v.PageLo(pg * epp), v.PageSpan(pg * epp, epp));
+    co_await v.AwaitFetch();
+        auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
     // THE TEST: a THIRD vector held read-only alongside the other two, the
     // pattern the real integrator has (x write, v write, f read) and the
     // ballistic gate never had. The value is only sunk, so the physics --
@@ -1362,7 +1401,9 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
     // is untouched.
     gv::Held<float> ht;
     if (use_third) {
-      ht = co_await third.HoldPage(pg * epp, epp);
+co_await third.BeginFetch(third.PageLo(pg * epp), third.PageSpan(pg * epp, epp));
+      co_await third.AwaitFetch();
+            ht = co_await third.HoldPage(pg * epp, epp);
     }
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
@@ -1415,8 +1456,12 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   double ke = 0.0, mx = 0.0, my = 0.0, mz = 0.0;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-    auto hx = co_await x.HoldPage(pg * epp, epp);
-    auto hv = co_await v.HoldPage(pg * epp, epp);
+co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
+    co_await x.AwaitFetch();
+        auto hx = co_await x.HoldPage(pg * epp, epp);
+co_await v.BeginFetch(v.PageLo(pg * epp), v.PageSpan(pg * epp, epp));
+    co_await v.AwaitFetch();
+        auto hv = co_await v.HoldPage(pg * epp, epp);
     const float *const px = hx.ptr();
     const float *const pv = hv.ptr();
     const u64 nslots = epp / kStride;
@@ -1453,7 +1498,7 @@ __global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
                                 u32 nblocks, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
+  x.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ReadProbeCoro(x, passes, nblocks, yv.Block()));
@@ -1464,13 +1509,13 @@ __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> v,
                                 gv::DeviceVector<float> third, int use_third,
                                 float dt, float gx, float gy_, float gz,
-                                int drift, u32 nblocks, int shared_tbl,
+                                int drift, u32 nblocks,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(shared_tbl ? 0 : yv.Block());
-  v.Init(shared_tbl ? 0 : yv.Block());
-  third.Init(shared_tbl ? 0 : yv.Block());
+  x.Init(yv.Block());
+  v.Init(yv.Block());
+  third.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(IntegrateCoro(x, v, third, use_third, dt, gx, gy_, gz,
@@ -1483,8 +1528,8 @@ __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
                              u32 nblocks, gy::YieldableView<> yv,
                              gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  v.Init(0);
+  x.Init(yv.Block());
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ThermoCoro(x, v, out, nblocks, yv.Block()));
@@ -1497,8 +1542,8 @@ __global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
                             u32 nblocks, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  f.Init(0);
+  x.Init(yv.Block());
+  f.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ForceCoro(x, f, nb, cap, box, cutoff, eflag, acc, nblocks,
@@ -1514,8 +1559,8 @@ __global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  nl.Init(0);
+  x.Init(yv.Block());
+  nl.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(BuildListCoro(x, nl, nb, cap, box, rlist, maxneigh, d_cnt,
@@ -1532,9 +1577,9 @@ __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  f.Init(0);
-  nl.Init(0);
+  x.Init(yv.Block());
+  f.Init(yv.Block());
+  nl.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
@@ -1548,7 +1593,7 @@ __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                             u32 nblocks, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
+  x.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RebinCoro(x, nb, cap, box, bincnt, d_dest, d_err, nblocks,
@@ -1562,9 +1607,9 @@ __global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               const u32 *d_dest, int keep_w, u32 nblocks,
                               gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  src.Init(0);
-  srcx.Init(0);
-  dst.Init(0);
+  src.Init(yv.Block());
+  srcx.Init(yv.Block());
+  dst.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GatherCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
@@ -1575,7 +1620,7 @@ __global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> dst, u32 nblocks,
                                gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.Init(0);
+  dst.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SentinelCoro(dst, nblocks, yv.Block()));
@@ -1589,9 +1634,9 @@ __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                   gy::YieldableView<> yv,
                                   gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  v.Init(0);
-  f.Init(0);
+  x.Init(yv.Block());
+  v.Init(yv.Block());
+  f.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MDIntegrateCoro(x, v, f, dt, drift, nblocks, yv.Block()));
@@ -1600,14 +1645,16 @@ __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> x,
                                gv::DeviceVector<float> v, u32 nblocks,
+                               u64 row_elems, u64 nrows,
                                gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(0);
-  v.Init(0);
+  x.Init(yv.Block());
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(FlushAllCoro(x, v, nblocks, yv.Block()));
+  CLIO_YCORO_RUN(FlushAllCoro(x, v, nblocks, yv.Block(), row_elems,
+                              nrows));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -1710,7 +1757,6 @@ int main(int argc, char **argv) {
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
-    else if (std::strcmp(argv[i], "--per-block-tables") == 0) a.per_block = 1;
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
@@ -1796,7 +1842,7 @@ int main(int argc, char **argv) {
       "eternia-MD stage 1 (integrator + ballistic gate)\n"
       "  atoms=%llu box=%.4f bins=%u^3 cap=%u slots/bin-pad=%.0f%%\n"
       "  page=%lluKB (%llu bins/page) pages=%llu blocks=%u threads=%u "
-      "cache=%u slots (one shared table)\n"
+      "cache=%u slots (one table per block)\n"
       "  steps=%llu dt=%g g=(%g,%g,%g)\n",
       (unsigned long long)g.natoms, g.box, g.nb, g.cap,
       100.0 * (1.0 - static_cast<double>(g.natoms) / g.nslots),
@@ -1887,7 +1933,12 @@ int main(int argc, char **argv) {
   // FAULTS: a table owns its lock, its scalar task slots AND its batch
   // slots, so N CUDA blocks on one table share one set of in-flight
   // transfer state.
-  const u32 tbl_blocks = a.per_block ? a.blocks : 1u;
+  // A vector is parameterized by the EXACT launch configuration of the
+  // kernel that uses it: one page table per CUDA block, always.
+  const u32 tbl_blocks = a.blocks;
+  // Row geometry, so a flush can name exactly the rows a block owns.
+  const u64 md_row_elems = static_cast<u64>(g.nb) * g.cap * kStride;
+  const u64 md_nrows = static_cast<u64>(g.nb) * g.nb;
   gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, slots,
                        g.nelems);
   // v gets its own knob too, so x-paging and v-paging can be separated:
@@ -2050,7 +2101,7 @@ int main(int argc, char **argv) {
     // acceleration, so it never exercises READING f under paging, and that
     // is the one path the resident gates cannot cover.
     const u32 fslots = (a.fslots != 0) ? a.fslots : slots;
-    gv::Vector<float> vf("md_f", {0}, page_bytes, /*nblocks=*/1, fslots,
+    gv::Vector<float> vf("md_f", {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems);
     vf.EnableStats();
     {
@@ -2065,8 +2116,10 @@ int main(int argc, char **argv) {
     // The resort's destinations get their own cache size, so "the scatter
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
     const u32 ppslots = (a.ppslots != 0) ? a.ppslots : slots;
-    gv::Vector<float> vx2("md_x2", {0}, page_bytes, 1, ppslots, g.nelems);
-    gv::Vector<float> vv2("md_v2", {0}, page_bytes, 1, ppslots, g.nelems);
+    gv::Vector<float> vx2("md_x2", {0}, page_bytes, tbl_blocks, ppslots,
+                          g.nelems);
+    gv::Vector<float> vv2("md_v2", {0}, page_bytes, tbl_blocks, ppslots,
+                          g.nelems);
     vx2.EnableStats();
     vv2.EnableStats();
     {
@@ -2123,7 +2176,7 @@ int main(int argc, char **argv) {
                    (unsigned long long)md_rowlist, kMaxNlGuards - 1);
       return 1;
     }
-    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, 1,
+    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks,
                        static_cast<u32>(nl_pages + 2), nl_elems);
     vn.EnableStats();
     {
@@ -2230,8 +2283,8 @@ int main(int argc, char **argv) {
       if (flush_after_kick) {
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
-          FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv,
-                                                           a.blocks, vw, sv);
+          FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
         });
         ctp::GpuApi::Synchronize();
       }
@@ -2339,8 +2392,8 @@ int main(int argc, char **argv) {
       const double _t = NowMs();
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv, a.blocks,
-                                                        vw, sv);
+        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       t_ckpt += NowMs() - _t;
@@ -2475,13 +2528,13 @@ int main(int argc, char **argv) {
                    gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
-          a.blocks, !a.per_block, vw, sv);
+          a.blocks, vw, sv);
     });
     const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
       IntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
-          a.blocks, !a.per_block, vw, sv);
+          a.blocks, vw, sv);
     });
     if (std::getenv("MD_ROUNDS") != nullptr) {
       const auto &rl = runner.RoundLog();
@@ -2569,8 +2622,8 @@ int main(int argc, char **argv) {
     // x/v; they are device-canonical).
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dx, dv, a.blocks,
-                                                        vw, sv);
+      FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     // MD_SETTLE_MS=N waits before reading the backing store. If the

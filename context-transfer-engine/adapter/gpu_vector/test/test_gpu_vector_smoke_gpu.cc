@@ -93,7 +93,7 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < n;) {
     clio::run::u64 run = 0;
     {
-      co_await v.BeginFetch(i, (i) + 1);
+      co_await v.BeginFetch(v.PageLo(i), v.PageSpan(i, 1));
       co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(i, n - i, /*write=*/true);
       run = h.run();
@@ -129,7 +129,7 @@ __device__ gy::YCoroMain CheckCoro(gv::DeviceVector<clio::run::u32> v,
                                    clio::run::u64 n,
                                    unsigned long long *bad) {
   for (clio::run::u64 i = 0; i < n;) {
-    co_await v.BeginFetch(i, (i) + 1);
+    co_await v.BeginFetch(v.PageLo(i), v.PageSpan(i, 1));
     co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(i, n - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
@@ -170,7 +170,7 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.BeginFetch(base + i, (base + i) + 1);
+      co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
       co_await v.AwaitFetch();
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
@@ -204,7 +204,7 @@ __device__ gy::YCoroMain MultiCheckCoro(gv::DeviceVector<clio::run::u32> v,
                                         clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    co_await v.BeginFetch(base + i, (base + i) + 1);
+    co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
     co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(base + i, per - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
