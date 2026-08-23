@@ -2115,10 +2115,42 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           if (np_will_train) {
             std::vector<ctp::compress::model::CompressionFeatures> features = {
                 chunk_features};
+            // PSNR label for the PRIMARY sample. A lossless primary trains
+            // toward 120 dB, not the -1.0 that withholds the gradient.
+            //
+            // Upstream is asymmetric here, and the asymmetry is deliberate on
+            // both sides:
+            //   primary  -- seeded to a literal 120.0 and overwritten only
+            //               when quantization ran (gpucompress_compress.cpp:
+            //               `explored_samples.push_back({..., 120.0, ...})`
+            //               at :697-700, read into primary_sgd[0].actual_psnr
+            //               at :711).
+            //   explored -- left at -1.0 for a lossless slot, with upstream's
+            //               own note that 0.0 cannot be used because the
+            //               kernel remaps <=0 to 120 (:895-899). Clio matches
+            //               that separately, at the explore_labels site.
+            //
+            // context.actual_psnr_db_ stays -1.0 and is NOT reused here: it
+            // feeds LogNeuroPressSelection above, which is upstream's
+            // DIAGNOSTICS value (`primary_actual_psnr`, :388, reported as
+            // di.actual_psnr at :1100) -- a different variable from the SGD
+            // sample's. Conflating the two was the defect: the PSNR head's
+            // error backpropagates through every shared layer, so withholding
+            // it moved 5513 of 13576 weights per step relative to upstream.
+            // Upstream's net effect, written as one expression: the sample is
+            // seeded 120.0 and replaced ONLY by a valid positive analytical
+            // PSNR, so `>0 ? it : 120.0` is the same function. Reading the
+            // sign of actual_psnr_db_ rather than a quantize flag also keeps
+            // the degenerate-range case right -- AnalyticalPsnr returns -1 for
+            // a zero range, and upstream's `if (psnr > 0.0)` leaves 120.0
+            // standing in exactly that case too.
+            const double primary_sgd_psnr =
+                (context.actual_psnr_db_ > 0.0) ? context.actual_psnr_db_
+                                                : 120.0;
             std::vector<ctp::compress::model::TrainingLabels> labels = {
                 ctp::compress::model::TrainingLabels(
                     static_cast<float>(context.actual_compression_ratio_),
-                    static_cast<float>(context.actual_psnr_db_),
+                    static_cast<float>(primary_sgd_psnr),
                     static_cast<float>(context.actual_compress_time_ms_),
                     /*decompress_time=*/0.0f)};
 
@@ -3342,11 +3374,18 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
       // PSNR is DEFINED only when quantization ran. Upstream seeds
       // primary_actual_psnr = -1.0 ("lossless -> skip PSNR MAPE",
-      // gpucompress_compress.cpp) and overwrites it only inside
-      // `if (d_quantized && quant_result.isValid())` (:653-658). A negative
-      // value makes the SGD withhold the PSNR gradient entirely
-      // (nn_gpu.cu), which is exactly right: a lossless codec has no
-      // reconstruction error to learn from.
+      // gpucompress_compress.cpp:388) and overwrites it only inside
+      // `if (d_quantized && quant_result.isValid())` (:653-658).
+      //
+      // That variable is upstream's DIAGNOSTICS value -- it is reported as
+      // di.actual_psnr (:1100) and nothing else. It is NOT what reaches the
+      // SGD: the phase-1 sample gets a literal 120.0 (:697-700, :711). This
+      // field therefore feeds the selection log only, and the SGD site
+      // re-derives its own label -- see primary_sgd_psnr above. Reusing this
+      // value for training was the defect: it withheld the PSNR gradient on
+      // every lossless chunk, and because that error backpropagates through
+      // the shared trunk it moved 5513 of 13576 weights per step away from
+      // upstream, not just the one head.
       if (applied_quant) {
         const double psnr = AnalyticalPsnr(
             quant_params.data_max - quant_params.data_min,
