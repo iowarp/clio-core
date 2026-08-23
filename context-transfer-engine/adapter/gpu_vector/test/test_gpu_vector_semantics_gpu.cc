@@ -543,13 +543,12 @@ u64 *UploadPages(const std::vector<u64> &pages) {
 bool HostPageMatches(const clio::cte::core::TagId &tag, u64 page, u32 salt) {
   clio::cte::core::Client core(clio::cte::core::kCtePoolId);
   std::vector<u32> buf(static_cast<size_t>(kPageElems), 0u);
-  char name[32];
-  gv::PageBlobName(page, name);
+  const std::string name = std::to_string(page);
   auto f = core.AsyncGetBlob(tag, std::string(name), 0, kPageBytes, 0,
                              reinterpret_cast<char *>(buf.data()));
   f.Wait();
   if (f->GetReturnCode() != 0) {
-    std::fprintf(stderr, "  host read of %s failed rc=%d\n", name,
+    std::fprintf(stderr, "  host read of %s failed rc=%d\n", name.c_str(),
                  f->GetReturnCode());
     return false;
   }
@@ -557,7 +556,7 @@ bool HostPageMatches(const clio::cte::core::TagId &tag, u64 page, u32 salt) {
     const u64 idx = page * kPageElems + i;
     if (buf[static_cast<size_t>(i)] != Val(idx, salt)) {
       std::fprintf(stderr, "  host mismatch %s elem %llu: got %u want %u\n",
-                   name, (unsigned long long) i, buf[static_cast<size_t>(i)],
+                   name.c_str(), (unsigned long long) i, buf[static_cast<size_t>(i)],
                    Val(idx, salt));
       return false;
     }
@@ -1022,14 +1021,14 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     // does not apply -- check the two straddling elements directly.
     clio::cte::core::Client core(clio::cte::core::kCtePoolId);
     std::vector<u32> buf(static_cast<size_t>(kPageElems), 0u);
-    auto rd = core.AsyncGetBlob(f.vec.TagId(), "p1", 0, kPageBytes, 0,
+    auto rd = core.AsyncGetBlob(f.vec.TagId(), "1", 0, kPageBytes, 0,
                                 reinterpret_cast<char *>(buf.data()));
     rd.Wait();
     REQUIRE(rd->GetReturnCode() == 0);
     const u64 last_of_prev = 2 * kPageElems - 1;
     REQUIRE(buf[static_cast<size_t>(kPageElems - 1)] == Val(last_of_prev, 7u));
     std::vector<u32> buf2(static_cast<size_t>(kPageElems), 0u);
-    auto rd2 = core.AsyncGetBlob(f.vec.TagId(), "p2", 0, kPageBytes, 0,
+    auto rd2 = core.AsyncGetBlob(f.vec.TagId(), "2", 0, kPageBytes, 0,
                                  reinterpret_cast<char *>(buf2.data()));
     rd2.Wait();
     REQUIRE(rd2->GetReturnCode() == 0);

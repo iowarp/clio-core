@@ -1214,10 +1214,10 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
     }
     ctp::ipc::ShmPtr<> dp; dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
     dp.off_ = reinterpret_cast<clio::run::u64>(pagebuf.data());
-    // The vector's fault path asks for "p<page_num>" (PageBlobName in page.h).
+    // The vector's fault path names a page by its number in decimal.
     // The old "<tag>_b0_pi<n>" scheme is from the pre-rewrite vector; storing
     // under it would leave every page a miss with no visible error.
-    std::string name = "p" + std::to_string(p);
+    std::string name = std::to_string(p);
     auto pf = comp.AsyncPutBlob(tag_id, name, 0ull, page_size, dp, 0.5f, ctx, 0, clio::run::PoolQuery::Local());
     pf.Wait(); REQUIRE(pf->GetReturnCode() == 0);
   }
@@ -1460,8 +1460,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
         ctp::GpuApi::Memcpy(gpu_rows.data(), d_scratch,
                             (size_t)(epp * sizeof(float)));
 
-        char nm[32];
-        clio::cte::gpu_vector::PageBlobName(pg, nm);
+        const std::string nm = std::to_string(pg);
         auto gf = comp.AsyncGetBlob(tag_id, nm, (clio::run::u64)0, page_size, 0,
                                     cpu.shm_.template Cast<void>(),
                                     clio::run::PoolQuery::Local());

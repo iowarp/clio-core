@@ -72,25 +72,6 @@ CTP_INLINE_CROSS_FUN clio::run::TaskId DeviceTaskId(clio::run::u64 table,
 constexpr clio::run::u32 kKindFlush = 0;
 constexpr clio::run::u32 kKindFault = 1;
 
-/** Compose a page's blob name: "p<page_num>". Device-callable, no CRT. */
-CTP_INLINE_CROSS_FUN void PageBlobName(clio::run::u64 page_num, char *out) {
-  char digits[24];
-  int n = 0;
-  if (page_num == 0) {
-    digits[n++] = '0';
-  }
-  while (page_num > 0) {
-    digits[n++] = static_cast<char>('0' + (page_num % 10));
-    page_num /= 10;
-  }
-  int w = 0;
-  out[w++] = 'p';
-  while (n > 0) {
-    out[w++] = digits[--n];
-  }
-  out[w] = '\0';
-}
-
 }  // namespace clio::cte::gpu_vector
 
 #endif  // CLIO_CTE_GPU_VECTOR_PAGE_H_

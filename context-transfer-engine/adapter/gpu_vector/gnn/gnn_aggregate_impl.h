@@ -56,7 +56,7 @@ struct Params {
 
 /**
  * A[i] = mean({X[i]} U {X[j] : j in N(i)}), reading `feat_tag` and writing
- * `out_tag`, both as vector pages ("p<N>", PageBlobName).
+ * `out_tag`, both as vector pages (named by page number in decimal).
  *
  * `indptr` has nodes+1 entries and `indices` indptr[nodes]; the graph must be
  * UNDIRECTED (see gnn_aggregate.cc). Returns false on any CTE error.
@@ -115,8 +115,7 @@ inline bool Aggregate(clio::cte::core::Client &comp,
     std::fill(acc.begin(), acc.begin() + (size_t)(nrows * dim), 0.0);
 
     for (std::int64_t pg = 0; pg < npages; ++pg) {
-      char name[32];
-      clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
+      const std::string name = std::to_string(pg);
       auto gf = comp.AsyncGetBlob(feat_tag, name, (clio::run::u64)0,
                                   (clio::run::u64)p.page_bytes, 0,
                                   inb.shm_.template Cast<void>(),
@@ -158,8 +157,7 @@ inline bool Aggregate(clio::cte::core::Client &comp,
           std::memset(&outbuf[(size_t)(used * dim)], 0,
                       (size_t)((rows_per_page - used) * dim) * sizeof(float));
         }
-        char name[32];
-        clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
+        const std::string name = std::to_string(pg);
         auto pf = comp.AsyncPutBlob(out_tag, name, (clio::run::u64)0,
                                     (clio::run::u64)p.page_bytes,
                                     outb.shm_.template Cast<void>(), 0.5f, ctx,
@@ -219,8 +217,7 @@ inline bool VerifyRows(clio::cte::core::Client &comp,
 
   auto fetch = [&](const clio::cte::core::TagId &tag, std::int64_t pg,
                    ctp::ipc::FullPtr<char> &buf) -> bool {
-    char name[32];
-    clio::cte::gpu_vector::PageBlobName((clio::run::u64)pg, name);
+    const std::string name = std::to_string(pg);
     auto gf = comp.AsyncGetBlob(tag, name, (clio::run::u64)0,
                                (clio::run::u64)p.page_bytes, 0,
                                buf.shm_.template Cast<void>(),

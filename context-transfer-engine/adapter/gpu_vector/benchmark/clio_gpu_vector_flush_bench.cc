@@ -770,7 +770,7 @@ int main(int argc, char **argv) {
       std::printf("  host GetBlob %-12s x%d: avg %8.1f us  best %8.1f us\n",
                   name, n, sum * 1000.0 / n, best * 1000.0);
     };
-    probe("p0", 100);            // exists (warm flushed it)
+    probe("0", 100);            // exists (warm flushed it)
     probe("nonexistent", 100);   // missing
     clio::run::CLIO_RUNTIME_FINALIZE();
     return 0;
@@ -1094,8 +1094,7 @@ int main(int argc, char **argv) {
         const u64 first = (b * a.iters + it) * pages_per_region;
         const u64 probe[2] = {first, first + pages_per_region - 1};
         for (int k = 0; k < 2 && ok; ++k) {
-          char name[32];
-          gv::PageBlobName(probe[k], name);
+          const std::string name = std::to_string(probe[k]);
           auto f = core.AsyncGetBlob(vec.TagId(), std::string(name), 0,
                                      page_bytes, 0,
                                      reinterpret_cast<char *>(buf.data()));
@@ -1114,14 +1113,14 @@ int main(int argc, char **argv) {
                          "\n  *** HANG: GetBlob(%s) did not complete within "
                          "%.0fs (block %u, iter %llu, page %llu). The task "
                          "never signalled completion.\n",
-                         name, (double) kVerifyTimeoutSec, b,
+                         name.c_str(), (double) kVerifyTimeoutSec, b,
                          (unsigned long long) it,
                          (unsigned long long) probe[k]);
             ok = false;
             break;
           }
           if (f->GetReturnCode() != 0) {
-            std::fprintf(stderr, "  read of %s failed rc=%d\n", name,
+            std::fprintf(stderr, "  read of %s failed rc=%d\n", name.c_str(),
                          f->GetReturnCode());
             ok = false;
             break;
@@ -1130,7 +1129,7 @@ int main(int argc, char **argv) {
           for (u64 i = 0; i < page_elems; i += 97) {
             if (buf[static_cast<size_t>(i)] != Val(base + i, last_pass)) {
               std::fprintf(stderr,
-                           "  MISMATCH %s elem %llu: got %u want %u\n", name,
+                           "  MISMATCH %s elem %llu: got %u want %u\n", name.c_str(),
                            (unsigned long long) i, buf[static_cast<size_t>(i)],
                            Val(base + i, last_pass));
               ok = false;

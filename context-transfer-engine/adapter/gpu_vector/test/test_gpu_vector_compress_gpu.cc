@@ -247,8 +247,7 @@ clio::run::u64 StoredBytes(const clio::cte::core::TagId &tag,
   clio::cte::core::Client core(kCorePool);
   clio::run::u64 total = 0;
   for (clio::run::u64 p = 0; p < num_pages; ++p) {
-    char name[32];
-    gv::PageBlobName(p, name);
+    const std::string name = std::to_string(p);
     auto sz = core.AsyncGetBlobSize(tag, name);
     sz.Wait();
     if (sz->GetReturnCode() == 0) total += sz->size_;

@@ -2434,7 +2434,7 @@ clio::run::TaskResume Runtime::PutBlob(
             std::make_unique<clio::cte::core::Client>(CorePoolId());
       }
       auto put = core_client_->AsyncPutBlob(
-          task->tag_id_, task->blob_name_.str(), 0, stored_size,
+          task->tag_id_, task->GetBlobName(), 0, stored_size,
           stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
           clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(put);
@@ -2465,9 +2465,11 @@ clio::run::TaskResume Runtime::PutBlob(
  * through, so pages written from a kernel were stored UNCOMPRESSED while
  * every layer reported success.
  */
+
 clio::run::TaskResume Runtime::CompressPodPutBlob(
     clio::run::shared_ptr<clio::cte::core::PodPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   // Any put may rewrite a blob whose chunk table the batched decoder cached.
   tier_write_gen_.fetch_add(1, std::memory_order_release);
   {
@@ -2556,7 +2558,7 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
               std::make_unique<clio::cte::core::Client>(CorePoolId());
         }
         auto put = core_client_->AsyncPutBlob(
-            task->tag_id_, task->blob_name_.str(), 0, csize + hdr_sz,
+            task->tag_id_, task->GetBlobName(), 0, csize + hdr_sz,
             ScratchShmPtr(scratch), task->score_, ctx, task->flags_,
             clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put);
@@ -2641,7 +2643,7 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
       core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
     }
     auto put = core_client_->AsyncPutBlob(
-        task->tag_id_, task->blob_name_.str(), 0, stored_size,
+        task->tag_id_, task->GetBlobName(), 0, stored_size,
         stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
         clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(put);
@@ -2682,6 +2684,7 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
 clio::run::TaskResume Runtime::DecompressPodGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   {
     if (task->context_.compress_lib_ <= 0) {
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodGetBlob,
@@ -2694,7 +2697,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     clio::run::u64 stored_size = 0;
     {
       auto sz = core_client_->AsyncGetBlobSize(task->tag_id_,
-                                               task->blob_name_.str());
+                                               task->GetBlobName());
       CLIO_CO_AWAIT(sz);
       if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
         task->return_code_ = sz->GetReturnCode() != 0 ? sz->GetReturnCode() : 1;
@@ -2720,7 +2723,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         // to move. Decode straight from the tier instead.
         {
           unsigned long long lpool = 0, loff = 0, lsz = 0;
-          if (clio_cte_locate(&task->tag_id_, task->blob_name_.str().c_str(),
+          if (clio_cte_locate(&task->tag_id_, task->GetBlobName().c_str(),
                               &lpool, &loff, &lsz) == 0 &&
               lsz > sizeof(CompressionHeader)) {
             char *tier = clio_direct_dev_base(lpool);
@@ -2771,7 +2774,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         }
         if (dscratch != nullptr) {
           auto dget = core_client_->AsyncGetBlob(
-              task->tag_id_, task->blob_name_.str(), 0, stored_size, 0,
+              task->tag_id_, task->GetBlobName(), 0, stored_size, 0,
               ScratchShmPtr(dscratch), clio::run::PoolQuery::Local());
           CLIO_CO_AWAIT(dget);
           if (dget->GetReturnCode() == 0) {
@@ -2817,7 +2820,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     }
     {
       auto get = core_client_->AsyncGetBlob(
-          task->tag_id_, task->blob_name_.str(), 0, stored_size, 0,
+          task->tag_id_, task->GetBlobName(), 0, stored_size, 0,
           buf.shm_.template Cast<void>(), clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() != 0) {
@@ -2904,7 +2907,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       HLOG(kError,
            "compressor: GPU-compressed blob '{}' could not be served by the "
            "codec context; failing the read rather than deadlocking",
-           task->blob_name_.str());
+           task->GetBlobName());
       task->return_code_ = 6;
       CLIO_IPC->FreeBuffer(buf);
       CLIO_CO_RETURN;
@@ -2970,6 +2973,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
 clio::run::TaskResume Runtime::CompressPodMultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::PodMultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   {
     auto *ipc_manager = CLIO_CPU_IPC;
     task->num_ok_ = 0;
@@ -3002,6 +3006,7 @@ clio::run::TaskResume Runtime::CompressPodMultiPutBlob(
 clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   const auto mg_t0 = std::chrono::steady_clock::now();
 
   {
@@ -3247,7 +3252,7 @@ clio::run::TaskResume Runtime::GetBlob(
     clio::run::u64 stored_size = 0;
     {
       auto sz = core_client_->AsyncGetBlobSize(task->tag_id_,
-                                               task->blob_name_.str());
+                                               task->GetBlobName());
       CLIO_CO_AWAIT(sz);
       if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
         task->return_code_ = 10 + sz->GetReturnCode();
@@ -3262,7 +3267,7 @@ clio::run::TaskResume Runtime::GetBlob(
     }
     {
       auto get = core_client_->AsyncGetBlob(
-          task->tag_id_, task->blob_name_.str(), 0, stored_size,
+          task->tag_id_, task->GetBlobName(), 0, stored_size,
           /*flags=*/0, stored.shm_.template Cast<void>(),
           clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(get);

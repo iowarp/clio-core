@@ -528,8 +528,7 @@ int main(int argc, char **argv) {
   {
     clio::cte::core::Client core(kCorePool);
     for (clio::run::u64 p = 0; p < n / page_elems; ++p) {
-      char name[32];
-      gv::PageBlobName(p, name);
+      const std::string name = std::to_string(p);
       auto sz = core.AsyncGetBlobSize(vec.TagId(), name);
       sz.Wait();
       if (sz->GetReturnCode() == 0) stored += sz->size_;
@@ -595,8 +594,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[baseline] tile %llu/%llu\n",
                      (unsigned long long)p, (unsigned long long)total_pages);
       }
-      char nm[32];
-      gv::PageBlobName(p, nm);
+      const std::string nm = std::to_string(p);
       // (1) SYNCHRONOUS storage read -- the host waits for the tier.
       auto gf = bl_core->AsyncGetBlob(vec.TagId(), nm, 0, page_bytes, 0,
                                       bl_host.shm_.template Cast<void>(),

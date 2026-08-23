@@ -26,7 +26,7 @@
  * the compressed store -- nothing else.
  *
  * The page naming is the vector's own: page N is blob "p<N>" under the vector's
- * tag (see PageBlobName in gpu_vector/page.h). Get that wrong and the vector
+ * tag (the page number in decimal). Get that wrong and the vector
  * faults forever against blobs that exist under names nobody asks for, with no
  * error anywhere -- so it is asserted against the header, not just documented.
  *
@@ -117,18 +117,12 @@ int main(int argc, char **argv) {
   }
   if (tag_name.empty() || page_bytes == 0) { Usage(); return 2; }
 
-  // The vector composes page blob names itself; borrow the same function so
-  // this can never drift from what the fault path will ask for.
-  {
-    char probe[32];
-    clio::cte::gpu_vector::PageBlobName(1234, probe);
-    if (std::string(probe) != "p1234") {
-      std::fprintf(stderr,
-                   "[ingest] FATAL: PageBlobName produced '%s', expected "
-                   "'p1234' -- the vector's naming changed and every page "
-                   "written here would be unreachable\n", probe);
-      return 1;
-    }
+  // A page's blob name is its number in decimal. The device sends the number
+  // raw (Context::kBlobNameRawInt32) and the runtime renders it the same way,
+  // so this must agree or every page written here is unreachable.
+  if (std::to_string(1234) != "1234") {
+    std::fprintf(stderr, "[ingest] FATAL: page naming changed\n");
+    return 1;
   }
 
   // Pure client: attach to the daemon that owns the composed tiers. Passing
@@ -174,8 +168,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     for (std::uint64_t p = 0; p < read_pages; ++p) {
-      char name[32];
-      clio::cte::gpu_vector::PageBlobName(p, name);
+      const std::string name = std::to_string(p);
       ctp::ipc::ShmPtr<> dp = rb.shm_.template Cast<void>();
       auto gf = comp.AsyncGetBlob(tag_id, name, (clio::run::u64)0,
                                   (clio::run::u64)page_bytes, 0, dp,
@@ -219,8 +212,7 @@ int main(int argc, char **argv) {
                    (unsigned long long)page_bytes);
     }
 
-    char name[32];
-    clio::cte::gpu_vector::PageBlobName(pg, name);
+    const std::string name = std::to_string(pg);
     ctp::ipc::ShmPtr<> dp = pb.shm_.template Cast<void>();
     auto pf = comp.AsyncPutBlob(tag_id, name, (clio::run::u64)0,
                                 (clio::run::u64)page_bytes, dp, 0.5f, ctx, 0,

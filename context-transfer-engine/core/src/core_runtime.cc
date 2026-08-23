@@ -545,6 +545,7 @@ std::shared_ptr<BlobInfo> Runtime::LocateBlobShared(const std::string &key) {
   return tag_blob_name_to_info_.get(key);
 }
 
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio_cte_locate_register(&CteLocateTrampoline, this);
@@ -967,11 +968,11 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     // Blob operations: hash blob name to container
     case Method::kPutBlob: {
       auto typed = task.template Cast<PutBlobTask>();
-      return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
+      return HashBlobToContainer(typed->tag_id_, typed->GetBlobName());
     }
     case Method::kGetBlob: {
       auto typed = task.template Cast<GetBlobTask>();
-      return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
+      return HashBlobToContainer(typed->tag_id_, typed->GetBlobName());
     }
     case Method::kReorganizeBlob: {
       auto typed = task.template Cast<ReorganizeBlobTask>();
@@ -1609,7 +1610,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     const auto pi_t0 = std::chrono::steady_clock::now();
     auto pi_t1 = pi_t0, pi_t2 = pi_t0;
     TagId tag_id = task->tag_id_;
-    std::string blob_name = task->blob_name_.str();
+    std::string blob_name = task->GetBlobName();
     // Append the per-page suffix when a GPU client (gpu_vector::Vector)
     // routed this put through a per-(block, page) sub-blob — keeps cache
     // pages from colliding on a shared blob name. Sentinel kNoPageIdx
@@ -1719,7 +1720,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         HLOG(kError,
              "[HANGWATCH-TOK] PutBlob spinning on write token blob='{}' "
              "owner_tok={} my_tok={} spins={}",
-             task->blob_name_.str(),
+             task->GetBlobName(),
              _own.load(std::memory_order_relaxed), lock_tok, _tok_spin);
       }
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
@@ -2398,7 +2399,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
-    std::string blob_name = task->blob_name_.str();
+    std::string blob_name = task->GetBlobName();
     if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
       blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
@@ -3478,8 +3479,9 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
 clio::run::TaskResume Runtime::PodPutBlob(
     clio::run::shared_ptr<PodPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   {
-    std::string eff_name = task->blob_name_.str();
+    std::string eff_name = task->GetBlobName();
     if (task->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
       eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
@@ -3522,9 +3524,11 @@ clio::run::TaskResume Runtime::PodPutBlob(
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   return GetBlobImpl(task);
 }
+
 clio::run::TaskResume Runtime::PodGetBlob(
     clio::run::shared_ptr<PodGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   {
     // CLIO_DR_LOG=1: task-identity trace for the stale-page hunt. A repeated
     // (task ptr, id) pair here means one submission was DELIVERED TWICE by
@@ -3541,7 +3545,7 @@ clio::run::TaskResume Runtime::PodGetBlob(
     }
   }
   {
-    std::string eff_name = task->blob_name_.str();
+    std::string eff_name = task->GetBlobName();
     if (task->gpu_page_idx_ != PodGetBlobTask::kNoPageIdx) {
       eff_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
@@ -3593,6 +3597,7 @@ clio::run::TaskResume Runtime::PodReorganizeBlob(
 clio::run::TaskResume Runtime::PodMultiPutBlob(
     clio::run::shared_ptr<PodMultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   auto *ipc_manager = CLIO_CPU_IPC;
   task->num_ok_ = 0;
   int first_rc = 0;
@@ -3610,9 +3615,10 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
   // (954 MB/s vs the historical 6.5 GB/s) and no gain at 16 blocks.
   for (clio::run::u32 i = 0; i < n; ++i) {
     auto &req = task->reqs_[i];
+    const std::string rec_name = task->GetBlobName(i);
     auto sub = ipc_manager->NewTask<PodPutBlobTask>(
         clio::run::CreateTaskId(), task->pool_id_,
-        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        clio::run::PoolQuery::Local(), task->tag_id_, rec_name.c_str(),
         req.offset_, req.size_, req.data_, req.score_, task->context_,
         task->flags_);
     sub.get()->BeginRunContext();
@@ -3621,7 +3627,7 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
     // "_pi" suffix -- lives inside PutBlobImpl already, and each skipped
     // nested-coroutine level is ~100us per record.
     {
-      std::string eff_name = sub->blob_name_.str();
+      std::string eff_name = sub->GetBlobName();
       if (sub->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
         eff_name += "_pi" + std::to_string(sub->gpu_page_idx_);
       }
@@ -3655,6 +3661,7 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
 clio::run::TaskResume Runtime::PodMultiGetBlob(
     clio::run::shared_ptr<PodMultiGetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  task->NormalizeBlobName();
   auto *ipc_manager = CLIO_CPU_IPC;
   {
     // CLIO_DR_LOG=1: per-record trace (stale-page hunt) -- multi gets were
@@ -3710,7 +3717,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
         auto sub = ipc_manager->NewTask<PodGetBlobTask>(
             clio::run::CreateTaskId(), task->pool_id_,
             clio::run::PoolQuery::Local(), task->tag_id_,
-            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
+            task->GetBlobName(i).c_str(), req.offset_, req.size_, sub_flags,
             req.data_, task->context_);
         sub.get()->BeginRunContext();
         CLIO_CO_AWAIT(PodGetBlob(sub));
@@ -3730,7 +3737,7 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
         auto sub = ipc_manager->NewTask<PodGetBlobTask>(
             clio::run::CreateTaskId(), task->pool_id_,
             clio::run::PoolQuery::Local(), task->tag_id_,
-            req.blob_name_.c_str(), req.offset_, req.size_, sub_flags,
+            task->GetBlobName(i).c_str(), req.offset_, req.size_, sub_flags,
             req.data_, task->context_);
         futs[i] = ipc_manager->Send(sub);
       }
@@ -3767,7 +3774,7 @@ clio::run::TaskResume Runtime::PodMultiScore(
     auto &req = task->reqs_[i];
     auto sub = ipc_manager->NewTask<PodReorganizeBlobTask>(
         clio::run::CreateTaskId(), task->pool_id_,
-        clio::run::PoolQuery::Local(), task->tag_id_, req.blob_name_.c_str(),
+        clio::run::PoolQuery::Local(), task->tag_id_, task->GetBlobName(i).c_str(),
         req.score_);
     sub.get()->BeginRunContext();
     CLIO_CO_AWAIT(PodReorganizeBlob(sub));

@@ -231,8 +231,7 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
   {
     clio::cte::core::Client core(kCorePool);
     for (clio::run::u64 p = 0; p < n / kPageElems; ++p) {
-      char name[32];
-      gv::PageBlobName(p, name);
+      const std::string name = std::to_string(p);
       auto sz = core.AsyncGetBlobSize(vec.TagId(), name);
       sz.Wait();
       if (sz->GetReturnCode() == 0) stored += sz->size_;

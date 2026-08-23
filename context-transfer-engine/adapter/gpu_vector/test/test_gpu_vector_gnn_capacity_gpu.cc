@@ -435,9 +435,9 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
     FillTiled(feat, file_elems, p * epp, epp, pagebuf_h.data());
     ctp::ipc::ShmPtr<> dp; dp.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
     dp.off_ = reinterpret_cast<clio::run::u64>(pagebuf_h.data());
-    // The vector asks for "p<page_num>" (PageBlobName); the old
+    // The vector names a page by its number in decimal; the old
     // "<tag>_b0_pi<n>" scheme belongs to the pre-rewrite vector.
-    std::string name = "p" + std::to_string(p);
+    std::string name = std::to_string(p);
     auto pf = comp.AsyncPutBlob(tag_id, name, (clio::run::u64)0, page_size, dp,
                                 0.5f, ctx, 0, clio::run::PoolQuery::Local());
     pf.Wait();

@@ -426,11 +426,9 @@ class Vector {
 #endif
   }
 
-  std::string PageName(clio::run::u64 pg) const {
-    char n[32];
-    PageBlobName(pg, n);
-    return std::string(n);
-  }
+  /** A page's blob name: the page number in decimal. Matches what the
+   *  runtime renders for a device request (Context::kBlobNameRawInt32). */
+  std::string PageName(clio::run::u64 pg) const { return std::to_string(pg); }
 
   clio::cte::core::Context PageContext() const {
     clio::cte::core::Context c;

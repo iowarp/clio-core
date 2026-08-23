@@ -634,8 +634,7 @@ int main(int argc, char **argv) {
   }
   // Blocking read of one plane into staging slot `i`.
   auto bl_read = [&](int i, u64 region_base, u64 z) {
-    char nm[32];
-    gv::PageBlobName((region_base + z * plane) / plane, nm);
+    const std::string nm = std::to_string((region_base + z * plane) / plane);
     auto gf = bl_core->AsyncGetBlob(vec.TagId(), nm, 0, page_bytes_gs, 0,
                                     bl_h[i].shm_.template Cast<void>(),
                                     clio::run::PoolQuery::Local());
@@ -652,8 +651,7 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Memcpy(bl_out[i].ptr_,
                         reinterpret_cast<const char *>(bl_dout[i]),
                         (size_t)page_bytes_gs);
-    char nm[32];
-    gv::PageBlobName((region_base + z * plane) / plane, nm);
+    const std::string nm = std::to_string((region_base + z * plane) / plane);
     auto pf = bl_core->AsyncPutBlob(vec.TagId(), nm, 0, page_bytes_gs,
                                     bl_out[i].shm_.template Cast<void>(), 1.0f);
     pf.Wait();

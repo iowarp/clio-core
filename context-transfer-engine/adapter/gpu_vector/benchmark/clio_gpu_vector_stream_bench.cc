@@ -509,8 +509,7 @@ int main(int argc, char **argv) {
     const u64 stride =
         (total_pages > stored_sample) ? (total_pages / stored_sample) : 1;
     for (u64 p = 0; p < total_pages; p += stride) {
-      char name[32];
-      gv::PageBlobName(p, name);
+      const std::string name = std::to_string(p);
       auto sz = core.AsyncGetBlobSize(vec.TagId(), name);
       sz.Wait();
       if (sz->GetReturnCode() == 0) {

@@ -498,8 +498,7 @@ int main(int argc, char **argv) {
   }
   auto run_baseline_pass = [&]() {
     for (u64 p = 0; p < total_pages; ++p) {
-      char nm[32];
-      gv::PageBlobName(p, nm);
+      const std::string nm = std::to_string(p);
       auto gf = bl_core->AsyncGetBlob(vec.TagId(), nm, 0, page_bytes, 0,
                                       bl_host.shm_.template Cast<void>(),
                                       clio::run::PoolQuery::Local());

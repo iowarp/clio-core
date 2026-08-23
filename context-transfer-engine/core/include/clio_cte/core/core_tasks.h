@@ -1577,6 +1577,15 @@ struct Context {
   // "missing" from "read failed" itself.
   bool create_on_get_;
 
+  /**
+   * How blob_name_ is encoded. kBlobNameRawInt32 means the field holds a
+   * 32-bit page number as raw bytes, not digits: the runtime renders it
+   * decimal. Lets a GPU caller name a page without formatting a string in a
+   * kernel.
+   */
+  clio::run::u32 blob_name_flags_;
+  static constexpr clio::run::u32 kBlobNameRawInt32 = 1u << 0;
+
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1614,6 +1623,7 @@ struct Context {
         origin_node_(kNoOriginNode),
         version_(0),
         create_on_get_(false),
+        blob_name_flags_(0),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1838,9 +1848,49 @@ struct BlobSegment {
   }
 };
 
+
+/**
+ * A blob name as the runtime should see it.
+ *
+ * Context::kBlobNameRawInt32 means the name field holds a 32-bit page number
+ * as raw bytes rather than digits, so a GPU caller need not format a string
+ * inside a kernel. Every task exposes GetBlobName(), so call sites get the
+ * decoding for free instead of each one remembering to check the flag.
+ */
+template <typename NameT>
+CTP_CROSS_FUN std::string DecodeBlobName(const NameT &name,
+                                         const Context &ctx) {
+  // c_str()/size(), not str(): the name is priv::string on some tasks and a
+  // fixed_string on the batched records, and only the former has str().
+  const char *p = name.c_str();
+  const size_t len = name.size();
+  if ((ctx.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) {
+    return std::string(p, len);
+  }
+  clio::run::u32 v = 0;
+  memcpy(&v, p, len < sizeof(v) ? len : sizeof(v));
+  return std::to_string(v);
+}
+
 struct PutBlobTask : public clio::run::Task {
   IN TagId tag_id_;                    // Tag ID for blob grouping
   INOUT clio::run::priv::string blob_name_;  // Blob name (required)
+
+  /** This task's blob name, decoded (see DecodeBlobName). */
+  CTP_CROSS_FUN std::string GetBlobName() const {
+    return DecodeBlobName(blob_name_, context_);
+  }
+
+  /** Render the name decimal IN PLACE and clear the flag. A pool that
+   *  decodes and then forwards must do this: otherwise the child carries a
+   *  decimal name with the raw-int flag still set, and the next pool decodes
+   *  it a second time. */
+  CTP_CROSS_FUN void NormalizeBlobName() {
+    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    const std::string dec = GetBlobName();
+    context_.blob_name_flags_ = 0;
+    blob_name_ = dec.c_str();
+  }
   IN clio::run::u64 offset_;                 // Offset within blob
   IN clio::run::u64 size_;                   // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;        // Blob data (shared memory pointer)
@@ -2060,6 +2110,22 @@ struct PutBlobTask : public clio::run::Task {
 struct GetBlobTask : public clio::run::Task {
   IN TagId tag_id_;                 // Tag ID for blob lookup
   IN clio::run::priv::string blob_name_;  // Blob name (required)
+
+  /** This task's blob name, decoded (see DecodeBlobName). */
+  CTP_CROSS_FUN std::string GetBlobName() const {
+    return DecodeBlobName(blob_name_, context_);
+  }
+
+  /** Render the name decimal IN PLACE and clear the flag. A pool that
+   *  decodes and then forwards must do this: otherwise the child carries a
+   *  decimal name with the raw-int flag still set, and the next pool decodes
+   *  it a second time. */
+  CTP_CROSS_FUN void NormalizeBlobName() {
+    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    const std::string dec = GetBlobName();
+    context_.blob_name_flags_ = 0;
+    blob_name_ = dec.c_str();
+  }
   IN clio::run::u64 offset_;              // Offset within blob
   IN clio::run::u64 size_;                // Size of data to retrieve
   IN clio::run::u32 flags_;               // Operation flags
@@ -2605,6 +2671,22 @@ struct PodPutBlobTask : public clio::run::Task {
   static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   INOUT PodBlobName blob_name_;
+
+  /** This task's blob name, decoded (see DecodeBlobName). */
+  CTP_CROSS_FUN std::string GetBlobName() const {
+    return DecodeBlobName(blob_name_, context_);
+  }
+
+  /** Render the name decimal IN PLACE and clear the flag. A pool that
+   *  decodes and then forwards must do this: otherwise the child carries a
+   *  decimal name with the raw-int flag still set, and the next pool decodes
+   *  it a second time. */
+  CTP_CROSS_FUN void NormalizeBlobName() {
+    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    const std::string dec = GetBlobName();
+    context_.blob_name_flags_ = 0;
+    blob_name_ = dec.c_str();
+  }
   IN clio::run::u64 offset_;
   IN clio::run::u64 size_;
   IN ctp::ipc::ShmPtr<> blob_data_;
@@ -2729,6 +2811,22 @@ struct PodGetBlobTask : public clio::run::Task {
   static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   IN PodBlobName blob_name_;
+
+  /** This task's blob name, decoded (see DecodeBlobName). */
+  CTP_CROSS_FUN std::string GetBlobName() const {
+    return DecodeBlobName(blob_name_, context_);
+  }
+
+  /** Render the name decimal IN PLACE and clear the flag. A pool that
+   *  decodes and then forwards must do this: otherwise the child carries a
+   *  decimal name with the raw-int flag still set, and the next pool decodes
+   *  it a second time. */
+  CTP_CROSS_FUN void NormalizeBlobName() {
+    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    const std::string dec = GetBlobName();
+    context_.blob_name_flags_ = 0;
+    blob_name_ = dec.c_str();
+  }
   IN clio::run::u64 offset_;
   IN clio::run::u64 size_;
   IN clio::run::u32 flags_;
@@ -2947,6 +3045,7 @@ struct PodBlobReq {
  */
 GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
 
+
 /** Common body of the batched POD tasks: a tag, N records, and a tally. */
 #define CLIO_POD_MULTI_BODY(TaskName, MethodId)                               \
   IN TagId tag_id_;                                                           \
@@ -2975,6 +3074,26 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
         context_(),                                                           \
         num_ok_(0) {                                                          \
     task_flags_.Clear();                                                      \
+  }                                                                           \
+                                                                              \
+  /** Record i's blob name, decoded (see DecodeBlobName). */                  \
+  CTP_CROSS_FUN std::string GetBlobName(clio::run::u32 i) const {             \
+    return DecodeBlobName(reqs_[i].blob_name_, context_);                     \
+  }                                                                           \
+                                                                              \
+  /** Render every record's name decimal IN PLACE and clear the flag; see     \
+   *  the scalar NormalizeBlobName. */                                        \
+  CTP_CROSS_FUN void NormalizeBlobName() {                                    \
+    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) {      \
+      return;                                                                 \
+    }                                                                         \
+    clio::run::u32 n = count_;                                                \
+    if (n > kPodMultiMax) n = kPodMultiMax;                                   \
+    for (clio::run::u32 i = 0; i < n; ++i) {                                  \
+      const std::string dec = GetBlobName(i);                                 \
+      reqs_[i].blob_name_ = dec.c_str();                                      \
+    }                                                                         \
+    context_.blob_name_flags_ = 0;                                            \
   }                                                                           \
                                                                               \
   /** Append a record. Returns false when the batch is full, which is the      \

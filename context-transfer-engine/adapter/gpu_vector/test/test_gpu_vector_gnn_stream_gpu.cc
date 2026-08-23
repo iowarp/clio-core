@@ -291,8 +291,7 @@ bool IngestFromFile(const char *path, const clio::cte::core::TagId &tag,
     size_t got = std::fread(buf.ptr_, 1, (size_t)page_bytes, f);
     if (got == 0) break;
     if (got < page_bytes) std::memset(buf.ptr_ + got, 0, page_bytes - got);
-    char name[32];
-    clio::cte::gpu_vector::PageBlobName(pg, name);
+    const std::string name = std::to_string(pg);
     auto pf = comp.AsyncPutBlob(tag, name, (u64)0, page_bytes,
                                 buf.shm_.template Cast<void>(), 0.5f, ctx, 0,
                                 clio::run::PoolQuery::Local());

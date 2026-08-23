@@ -303,13 +303,12 @@ TEST_CASE("gpu_vector: concurrent probe/fault/prefetch/evict serves exact bytes"
     std::vector<clio::run::u32> buf(kPageElems, 0u);
     clio::run::u64 bad_pages = 0;
     for (clio::run::u64 pg = 0; pg < kTotalPages; pg += 7) {
-      char name[32];
-      gv::PageBlobName(pg, name);
+      const std::string name = std::to_string(pg);
       auto f = core.AsyncGetBlob(vec.TagId(), std::string(name), 0, kPageBytes,
                                  0, reinterpret_cast<char *>(buf.data()));
       f.Wait();
       if (f->GetReturnCode() != 0) {
-        std::fprintf(stderr, "seed-verify: host read %s rc=%d\n", name,
+        std::fprintf(stderr, "seed-verify: host read %s rc=%d\n", name.c_str(),
                      f->GetReturnCode());
         ++bad_pages;
         continue;

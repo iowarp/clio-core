@@ -321,9 +321,11 @@ class DeviceVector {
     t->method_ = clio::cte::core::Method::kPodGetBlob;
     t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
     t->tag_id_ = h_->tag_id_;
-    char name[32];
-    PageBlobName(pn, name);
-    t->blob_name_ = name;
+    // The page number goes over RAW, not as digits: formatting a string in a
+    // kernel is pure waste. Context::kBlobNameRawInt32 tells the runtime to
+    // render it decimal.
+    const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
+    t->blob_name_.assign(reinterpret_cast<const char *>(&pn32), sizeof(pn32));
     t->offset_ = 0;
     t->size_ = h_->page_bytes_;
     t->blob_data_ = RawPtr(p->data);
@@ -331,6 +333,8 @@ class DeviceVector {
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
+    t->context_.blob_name_flags_ =
+        clio::cte::core::Context::kBlobNameRawInt32;
     // A page nobody has written yet has no blob. The CTE creates it and
     // returns success, so the vector needs no first-touch case of its own.
     t->context_.create_on_get_ = true;
@@ -389,9 +393,12 @@ class DeviceVector {
          i < h_->pages_per_block_ && n < clio::cte::core::kPodMultiMax; ++i) {
       Page *p = &tbl[i];
       if (!p->dirty || p->flushing || p->fetching) continue;
-      char name[32];
-      PageBlobName(p->page_num, name);
-      t->Add(name, 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
+      const clio::run::u32 pn32 = static_cast<clio::run::u32>(p->page_num);
+      t->Add("", 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
+      // Overwrite the record's name with the raw page number; Add() takes a
+      // C string and would stop at the first zero byte.
+      t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
+                                    sizeof(pn32));
       bt->flush_slot[n++] = i;
       p->flushing = 1u;
     }
@@ -407,6 +414,8 @@ class DeviceVector {
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
+    t->context_.blob_name_flags_ =
+        clio::cte::core::Context::kBlobNameRawInt32;
     ClearRunCtx(t);
     if (h_->stat_puts_ != nullptr) {
       atomicAdd(h_->stat_puts_, static_cast<unsigned long long>(n));
