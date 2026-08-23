@@ -3,6 +3,12 @@
 #
 #   ./run_config.sh <config> [--ncell "NX NY NZ"] [--steps N] [--interval N]
 #                            [--chunk BYTES] [--results DIR] [--tag NAME]
+#                            [--verify]
+#
+# --verify runs read.sh afterwards: reads field datasets back through the VOL
+# from a separate process and requires BOTH that the bytes match a native read
+# AND that the trace shows the tier served them. See read.sh for why the second
+# half is not optional here.
 #
 # Unlike the other three workloads, nothing is dumped and replayed: a STOCK,
 # UNPATCHED WarpX runs, writes openPMD-HDF5 as it always does, and HDF5 loads
@@ -36,7 +42,7 @@ CONFIG=${1:-dynamic}; shift || true
 NCELL=${NCELL:-"64 64 512"}
 STEPS=${STEPS:-40} INTERVAL=${INTERVAL:-10}
 CHUNK=${CHUNK:-1048576}
-RESULTS="$HERE/results" TAG=""
+RESULTS="$HERE/results" TAG="" VERIFY=0
 WARPX_BIN=${WARPX_BIN:-$(ls "$HOME"/src/warpx/build-clio/bin/warpx.3d.* 2>/dev/null | head -1)}
 DECK=${DECK:-$HOME/src/warpx/Examples/Physics_applications/laser_acceleration/inputs_base_3d}
 while [ $# -gt 0 ]; do
@@ -49,6 +55,7 @@ while [ $# -gt 0 ]; do
     --tag) TAG=$2; shift 2;;
     --bin) WARPX_BIN=$2; shift 2;;
     --deck) DECK=$2; shift 2;;
+    --verify) VERIFY=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -130,12 +137,22 @@ if [ "$NCHUNKS" -le 0 ]; then
   echo "   the note at the top of this script. Try --chunk 1048576."
 fi
 
+VERIFY_RESULT="n/a"
+if [ "$VERIFY" = 1 ] && [ $RC -eq 0 ]; then
+  if "$HERE/read.sh" --run "$NAME" --results "$RESULTS" > "$STORE/verify.log" 2>&1; then
+    VERIFY_RESULT="pass"
+  else
+    VERIFY_RESULT="FAIL"
+  fi
+  sed 's/^/   /' "$STORE/verify.log" | tail -6
+fi
+
 cat > "$STORE/meta.json" <<JSON
 {"config":"$CONFIG","tag":"$NAME","rc":$RC,"device":"gpu","workload":"warpx-laser",
  "atoms":0,"steps":$STEPS,"gap":$INTERVAL,
  "frames":$(( STEPS / INTERVAL + 1 )),"chunk":$CHUNK,"files":$NCHUNKS,
  "payload_bytes":$PAYLOAD,"native_h5_bytes":$NATIVE,"wall_s":$WALL,
- "verified":0,"port":$PORT,
+ "verified":$VERIFY,"verify_result":"$VERIFY_RESULT","port":$PORT,
  "physics":{"problem":"laser_acceleration","precision":"float32","insitu":"yes"}}
 JSON
 cat "$STORE/convert.log" | sed 's/^/   /'

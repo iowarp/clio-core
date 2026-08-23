@@ -68,17 +68,21 @@ granularity**, and this is the first workload here where that binds.
 Laser acceleration, 64×64×512, 5 dumps, 400 MiB float32, 400 chunks, A100,
 lossless.
 
-| config | ratio | stored | wall |
-|---|---|---|---|
-| **`static-zstd-s4`** | **17.433×** | 22.9 MiB | 12.0 s |
-| `explore` (ratio cap 1e6) | 17.439× | 22.9 MiB | 22 s |
-| `explore` (default cap) | 16.833× | 23.8 MiB | 22.0 s |
-| `static-zstd-s8` | 16.367× | 24.4 MiB | 12.0 s |
-| `best` | 16.544× | 24.2 MiB | 41.0 s |
-| `static-zstd` | 13.218× | 30.3 MiB | 9.0 s |
-| `dynamic-ratio` | 11.995× | 33.3 MiB | 13.0 s |
-| `dynamic` | 11.788× | 33.9 MiB | 14.1 s |
-| `learn` | 8.762× | 45.7 MiB | 17.0 s |
+| config | ratio | stored | wall | verified |
+|---|---|---|---|---|
+| **`static-zstd-s4`** | **17.434×** | 22.9 MiB | 13.1 s | pass |
+| `explore` | 17.044× | 23.5 MiB | 22.1 s | pass |
+| `best` | 16.544× | 24.2 MiB | 42.1 s | pass |
+| `static-zstd-s8` | 16.368× | 24.4 MiB | 12.1 s | pass |
+| `static-zstd` | 13.214× | 30.3 MiB | 9.1 s | pass |
+| `dynamic-ratio` | 12.069× | 33.1 MiB | 13.1 s | pass |
+| `dynamic` | 11.785× | 33.9 MiB | 12.1 s | pass |
+| `learn` | 7.107× | 56.3 MiB | 16.1 s | pass |
+
+Every run is verified: `run_sweep.sh` passes `--verify`, so each configuration
+reads three field datasets back through the VOL from a separate process and
+requires both byte-equality with a native read and trace evidence that the tier
+served them. Across the eight runs: **192 chunk inversions, 0 cache misses.**
 
 Consistent with the other three workloads: **the 4-byte stride wins on float32**
 (17.43× against 16.37× for 8-byte), inference under the balanced cost model
@@ -86,7 +90,7 @@ leaves most of the ratio on the table (11.79×), and online learning is the wors
 option (8.76×).
 
 Unlike the other workloads, exploration here **does** essentially reach the best
-fixed codec — 16.83× against 17.43×, and 17.44× once the ratio cap is raised.
+fixed codec — 17.04× against 17.43×, and 17.44× once the ratio cap is raised.
 
 ### What the ratio cap does to exploration
 
@@ -107,7 +111,7 @@ the gate cannot fire at **any** threshold — including 0. Measured:
 
 | | chunks explored | ratio |
 |---|---|---|
-| cap 100 (default) | 78 / 400 | 16.83× |
+| cap 100 (default) | 78 / 400 | 17.04× |
 | cap 10⁶ | 400 / 400 | 17.44× |
 
 and every one of the 322 unexplored chunks at the default cap was one whose

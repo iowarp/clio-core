@@ -69,7 +69,12 @@ def load_run(d):
     mix = Counter(r["codec"] if r["lib"] != "0" else "raw" for r in rows)
     ms = [float(r["compress_ms"]) for r in rows]
 
-    verified = None
+    # A workload may record its own verification outcome in meta.json -- the
+    # in-situ one does, because its application is a stock binary whose stdout
+    # says nothing about Clio. Fall back to scanning the driver's output.
+    verified = meta.get("verify_result")
+    if verified in (None, "n/a"):
+        verified = None
     out_p = os.path.join(d, "stdout.log")
     if os.path.isfile(out_p):
         txt = open(out_p, errors="replace").read()

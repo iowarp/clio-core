@@ -19,6 +19,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 NCELL="64 64 512" STEPS=40 INTERVAL=10 CHUNK=1048576 REPEATS=1
+VERIFY="--verify"   # --no-verify to skip the read-back
 RESULTS="$HERE/results"
 CONFIGS="dynamic dynamic-ratio learn explore best static-zstd static-zstd-s4 static-zstd-s8"
 while [ $# -gt 0 ]; do
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
     --repeats) REPEATS=$2; shift 2;;
     --results) RESULTS=$2; shift 2;;
     --configs) CONFIGS=$2; shift 2;;
+    --no-verify) VERIFY=""; shift;;
     -h|--help) sed -n '2,18p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -46,9 +48,11 @@ for rep in $(seq 1 "$REPEATS"); do
     tag=$c; [ "$REPEATS" -gt 1 ] && tag="${c}__r${rep}"
     "$HERE/run_config.sh" "$c" --ncell "$NCELL" --steps "$STEPS" \
         --interval "$INTERVAL" --chunk "$CHUNK" \
-        --results "$RESULTS" --tag "$tag" || { FAILED=$((FAILED+1)); echo "   ^ $tag FAILED"; }
+        --results "$RESULTS" --tag "$tag" $VERIFY || { FAILED=$((FAILED+1)); echo "   ^ $tag FAILED"; }
     # Each run writes a full set of openPMD files; keeping eight of them is
-    # gigabytes of duplicate native output nobody reads.
+    # gigabytes of duplicate native output nobody reads. Deleted only AFTER
+    # verification, which needs them -- read.sh compares the VOL read against a
+    # native read of the same file.
     rm -rf "$RESULTS/$tag/run/diags"
     echo
   done
