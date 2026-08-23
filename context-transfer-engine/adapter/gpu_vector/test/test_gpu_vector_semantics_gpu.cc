@@ -94,7 +94,7 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u64 base,
     // own, so a dirty page is unevictable; walking a working set larger than
     // the cache without flushing cannot be served and is refused. Async, so
     // the write still overlaps the next page.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(off + i, run);
     i += run;
   }
   (void) flush;   // every page is flushed above; the flag is now advisory
@@ -213,10 +213,19 @@ __device__ gy::YCoroMain EvictCoro(gv::DeviceVector<u32> v, u32 n) {
   const u64 npages = (v.size() + epp - 1) / epp;
   // Writes back only. Dropping the pages is Vector::ClearCache on the host:
   // the device API has no "discard these pages" verb.
-  co_await v.BeginFlush();
+  // Flush this block's whole page range, naming it explicitly and in
+  // batches: one MultiPutBlob carries kPodMultiMax records, so a table with
+  // more resident frames than that needs several submissions. Pages of the
+  // range that are not resident are skipped.
+  const clio::run::u64 kBatch =
+      static_cast<clio::run::u64>(clio::cte::core::kPodMultiMax);
+  for (u64 p = 0; p < npages; p += kBatch) {
+    const u64 off = p * epp;
+    const u64 cnt = (v.size() - off < kBatch * epp) ? v.size() - off
+                                                    : kBatch * epp;
+    co_await v.BeginFlush(off, cnt);
+  }
   co_await v.EndFlush();
-  (void) epp;
-  (void) npages;
 }
 
 __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
@@ -253,7 +262,20 @@ __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
 /** MACHINERY probe: BeginFlush/WaitFlush over a range with no writes, to test
  *  the clean case (and to drain stragglers in a plain, non-coroutine kernel). */
 __device__ gy::YCoroMain FlushCoro(gv::DeviceVector<u32> v) {
-  co_await v.BeginFlush();
+  const u64 epp = v.ElemsPerPage();
+  const u64 npages = (v.size() + epp - 1) / epp;
+  // Flush this block's whole page range, naming it explicitly and in
+  // batches: one MultiPutBlob carries kPodMultiMax records, so a table with
+  // more resident frames than that needs several submissions. Pages of the
+  // range that are not resident are skipped.
+  const clio::run::u64 kBatch =
+      static_cast<clio::run::u64>(clio::cte::core::kPodMultiMax);
+  for (u64 p = 0; p < npages; p += kBatch) {
+    const u64 off = p * epp;
+    const u64 cnt = (v.size() - off < kBatch * epp) ? v.size() - off
+                                                    : kBatch * epp;
+    co_await v.BeginFlush(off, cnt);
+  }
   co_await v.EndFlush();
 }
 __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
@@ -292,7 +314,19 @@ __device__ gy::YCoroMain BatchFlushCoro(gv::DeviceVector<u32> v, u64 npages,
   // so a lane still writing when lane 0 flushes loses its writes AND leaves
   // the page looking clean.
   __syncthreads();
-  co_await v.BeginFlush();
+  // Flush this block's whole page range, naming it explicitly and in
+  // batches: one MultiPutBlob carries kPodMultiMax records, so a table with
+  // more resident frames than that needs several submissions. Pages of the
+  // range that are not resident are skipped.
+  const clio::run::u64 kBatch =
+      static_cast<clio::run::u64>(clio::cte::core::kPodMultiMax);
+  for (u64 p = 0; p < npages; p += kBatch) {
+    const u64 off = p * v.ElemsPerPage();
+    const u64 cnt = (total - off < kBatch * v.ElemsPerPage())
+                        ? total - off
+                        : kBatch * v.ElemsPerPage();
+    co_await v.BeginFlush(off, cnt);
+  }
   if (threadIdx.x == 0) atomicAdd(flushed, npages);
   co_await v.EndFlush();
 }
@@ -313,7 +347,20 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
 /** Batched-flush a block whose pages should already be clean (machinery). */
 __device__ gy::YCoroMain FlushAgainCoro(gv::DeviceVector<u32> v,
                                         unsigned long long *flushed) {
-  co_await v.BeginFlush();
+  const u64 epp = v.ElemsPerPage();
+  const u64 npages = (v.size() + epp - 1) / epp;
+  // Flush this block's whole page range, naming it explicitly and in
+  // batches: one MultiPutBlob carries kPodMultiMax records, so a table with
+  // more resident frames than that needs several submissions. Pages of the
+  // range that are not resident are skipped.
+  const clio::run::u64 kBatch =
+      static_cast<clio::run::u64>(clio::cte::core::kPodMultiMax);
+  for (u64 p = 0; p < npages; p += kBatch) {
+    const u64 off = p * epp;
+    const u64 cnt = (v.size() - off < kBatch * epp) ? v.size() - off
+                                                    : kBatch * epp;
+    co_await v.BeginFlush(off, cnt);
+  }
   // Nothing was dirty, so nothing should have been staged.
   if (threadIdx.x == 0) atomicAdd(flushed, 0ull);
   co_await v.EndFlush();
@@ -370,7 +417,7 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
     // the vector will not write it back on the caller's behalf. Awaited, not
     // just submitted: the very next hold needs this exact frame, so there is
     // nothing to overlap with.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(last_of_prev, 1);
     co_await v.EndFlush();
     {
       co_await v.BeginFetch(v.PageLo(first_of_next), v.PageSpan(first_of_next, 1));
@@ -378,7 +425,7 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
       auto h = co_await v.HoldPage(first_of_next, 1, /*write=*/true);
       if (threadIdx.x == 0) h[first_of_next] = Val(first_of_next, 7u);
     }
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(first_of_next, 1);
     co_await v.EndFlush();
   }
 }
@@ -450,7 +497,7 @@ __device__ gy::YCoroMain MultiLaneWriteCoro(gv::DeviceVector<u32> v, u64 count,
     // Per-page flush while the page is still held, as before -- the
     // collective FlushAsync barriers internally, so no lane's writes can be
     // lost to the submit clearing `dirty`.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(base, v.ElemsPerPage());
     co_await v.EndFlush();
   }
 }

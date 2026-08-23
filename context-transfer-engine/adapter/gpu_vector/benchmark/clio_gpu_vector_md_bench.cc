@@ -1383,19 +1383,38 @@ co_await f.BeginFetch(f.PageLo(pg * epp), f.PageSpan(pg * epp, epp));
 __device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
                                       gv::DeviceVector<float> v, u32 nblocks,
                                       u32 block, u64 row_elems, u64 nrows) {
-  // EVERY BLOCK FLUSHES ITS OWN TABLE, in full.
+  // EVERY BLOCK WRITES BACK WHATEVER IT HAS RESIDENT OF THE WHOLE RANGE.
   //
-  // Each block owns a private page table now, so the old "block 0 flushes
-  // everything" would publish one block's copy and drop the rest. A full
-  // flush is right here because IntegrateCoro partitions x and v BY PAGE
-  // (pg = block; pg += nblocks) -- a block's table only ever holds pages it
-  // owns outright, so there is no other block's data in them to clobber.
+  // Naming [0, size) flushes exactly the pages this block holds -- a range
+  // covers whole pages and non-resident ones are skipped -- so this is the
+  // block's entire table, stated explicitly rather than implied.
+  //
+  // KNOWN HAZARD, unchanged from the whole-table flush this replaces: a
+  // block's table also holds pages it only READ (the force stencil and the
+  // resort gather fault in neighbouring rows), and writing those back ships
+  // this block's stale copy over the owner's newer data. Several blocks hold
+  // the same page, so the last writer wins nondeterministically. Restricting
+  // this to the pages a block owns is NOT a safe local fix: it measured
+  // worse (drift 4.98e-02 against 1.47e-03), so some read path depends on
+  // these extra writes.
   (void) row_elems;
   (void) nrows;
   (void) block;
-  co_await x.BeginFlush();
+  (void) nblocks;
+  const u64 kBatch = static_cast<u64>(clio::cte::core::kPodMultiMax);
+  const u64 xepp = x.ElemsPerPage();
+  const u64 xspan = kBatch * xepp;
+  for (u64 off = 0; off < x.size(); off += xspan) {
+    const u64 cnt = (x.size() - off < xspan) ? x.size() - off : xspan;
+    co_await x.BeginFlush(off, cnt);
+  }
   co_await x.EndFlush();
-  co_await v.BeginFlush();
+  const u64 vepp = v.ElemsPerPage();
+  const u64 vspan = kBatch * vepp;
+  for (u64 off = 0; off < v.size(); off += vspan) {
+    const u64 cnt = (v.size() - off < vspan) ? v.size() - off : vspan;
+    co_await v.BeginFlush(off, cnt);
+  }
   co_await v.EndFlush();
 }
 

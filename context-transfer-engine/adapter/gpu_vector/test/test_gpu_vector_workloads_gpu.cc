@@ -99,7 +99,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
     // so seeding more pages than the table holds must not leave them all
     // dirty. Async, so the write overlaps the next page's compute; the
     // servicer retires it once it lands.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(base + i, run);
     i += run;
   }
   co_await v.EndFlush();
@@ -147,12 +147,12 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
       // The internal barrier matters: SubmitPut clears `dirty` as it submits,
       // so a lane still writing when the flush submits loses its writes.
       // Collective, internally BATCHED (one multi-put per 64 pages).
-      co_await v.BeginFlush();
+      co_await v.BeginFlush(base + off, run);
     }
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(base + off, run);
     off += run;
   }
   co_await v.EndFlush();

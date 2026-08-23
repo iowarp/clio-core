@@ -99,7 +99,7 @@ __device__ gy::YCoroMain WriteRangeCoro(gv::DeviceVector<u32> v,
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(base + i, run);
     i += run;
   }
   co_await v.EndFlush();

@@ -147,7 +147,7 @@ co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, pe));
     // Fire-and-forget: the store of page k stays in flight through the fill
     // of page k+1; the claim path settles finished flushes when it needs a
     // slot, and the AwaitFlush at the end collects the stragglers.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(off, pe);
   }
   // The explicit flush is what persists the data: drops refuse dirty pages
   // and nothing writes back on eviction, so every written page must have been

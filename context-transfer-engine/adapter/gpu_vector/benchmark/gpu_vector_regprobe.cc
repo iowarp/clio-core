@@ -67,10 +67,10 @@ __device__ gy::YCoroMain C_AwaitFetch(gv::DeviceVector<float> v) {
 GVP_CORO_KERNEL(K_AwaitFetch, C_AwaitFetch(v))
 
 #elif GVP == 3
-__device__ gy::YCoroMain C_BeginFlush(gv::DeviceVector<float> v) {
-  co_await v.BeginFlush();
+__device__ gy::YCoroMain C_BeginFlush(gv::DeviceVector<float> v, u64 off) {
+  co_await v.BeginFlush(off, 1);
 }
-GVP_CORO_KERNEL(K_BeginFlush, C_BeginFlush(v))
+GVP_CORO_KERNEL(K_BeginFlush, C_BeginFlush(v, arg))
 
 #elif GVP == 4
 __device__ gy::YCoroMain C_EndFlush(gv::DeviceVector<float> v) {
@@ -88,7 +88,7 @@ __device__ gy::YCoroMain C_All(gv::DeviceVector<float> v, u64 off, u64 *out) {
     if (h.run() != 0) h[0] = 1.0f;
     out[threadIdx.x] = (u64) h.ptr();
   }
-  co_await v.BeginFlush();
+  co_await v.BeginFlush(off, 1);
   co_await v.EndFlush();
 }
 GVP_CORO_KERNEL(K_All, C_All(v, arg, out))

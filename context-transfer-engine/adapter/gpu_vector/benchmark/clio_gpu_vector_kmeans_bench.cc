@@ -112,8 +112,8 @@ co_await v.BeginFetch(v.PageLo(base + off), v.PageSpan(base + off, n));
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
       h[base + off + i] = PointVal(base + off + i, dims, k);
     }
-    // Collective, internally BATCHED (one multi-put per 64 pages).
-    co_await v.BeginFlush();
+    // Collective: name the page just written.
+    co_await v.BeginFlush(base + off, n);
   }
   // Collect every flush started above: only explicit flushes write data back
   // now (drops refuse dirty pages), so a seeded page left in flight or left

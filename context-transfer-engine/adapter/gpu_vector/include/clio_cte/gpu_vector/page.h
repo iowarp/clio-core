@@ -44,11 +44,6 @@ struct BlockTasks {
   clio::run::u32 flush_n;     // records in the outstanding flush
   clio::run::u32 fetch_n;     // records in the outstanding fetch
   clio::run::u32 flush_busy;  // a flush is in flight
-  /** Where the next whole-table flush batch starts. A table can hold more
-   *  frames than one MultiPutBlob carries (kPodMultiMax), so a full flush
-   *  takes several batches -- capping the loop instead would silently drop
-   *  every frame past the first 64. */
-  clio::run::u32 flush_cursor;
   clio::run::u32 fetch_busy;  // a fetch is in flight
   clio::run::u32 seq;         // bumped per submission so TaskIds differ
   /** Page table index each record came from, so completion can clear the

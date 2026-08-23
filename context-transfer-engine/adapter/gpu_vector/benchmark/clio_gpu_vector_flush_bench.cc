@@ -115,7 +115,14 @@ co_await v.BeginFetch(v.PageLo(poff), v.PageSpan(poff, v.ElemsPerPage()));
             auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
       WritePage(h, poff, 0u);
     }
-    co_await v.BeginFlush();
+    // One MultiPutBlob carries kPodMultiMax records, so a region wider than
+    // that is several named submissions -- never an implicit whole-table one.
+    const u64 span = static_cast<u64>(clio::cte::core::kPodMultiMax) *
+                     v.ElemsPerPage();
+    for (u64 b = 0; b < region_elems; b += span) {
+      const u64 cnt = (region_elems - b < span) ? region_elems - b : span;
+      co_await v.BeginFlush(off + b, cnt);
+    }
     co_await v.EndFlush();
   }
 }
@@ -181,7 +188,14 @@ co_await v.BeginFetch(v.PageLo(poff), v.PageSpan(poff, v.ElemsPerPage()));
       // ---- block-level flush: ONE collective call covering the region ----
       // GV_NO_FLUSH diagnostic: isolate the write loop's cost from the
       // flush machinery (dirty pages are simply left behind).
-      if (!no_flush) co_await v.BeginFlush();
+      if (!no_flush) {
+        const u64 span = static_cast<u64>(clio::cte::core::kPodMultiMax) *
+                         v.ElemsPerPage();
+        for (u64 b = 0; b < region_elems; b += span) {
+          const u64 cnt = (region_elems - b < span) ? region_elems - b : span;
+          co_await v.BeginFlush(off + b, cnt);
+        }
+      }
       const long long w2 = clock64();
       if (threadIdx.x == 0) {
         atomicAdd(&g_round_cyc[4], (unsigned long long) (w1 - w0));

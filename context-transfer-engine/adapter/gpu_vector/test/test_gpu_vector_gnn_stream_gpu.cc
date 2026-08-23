@@ -102,7 +102,7 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
     // Flush as we go: the vector never writes back on its own, so a dirty
     // page is unevictable and a working set larger than the cache cannot be
     // served. Async, so the write still overlaps the next page.
-    co_await v.BeginFlush();
+    co_await v.BeginFlush(base + i, run);
     i += run;
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when

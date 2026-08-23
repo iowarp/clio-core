@@ -181,8 +181,8 @@ co_await vec.BeginFetch(vec.PageLo(ubase + z * plane), vec.PageSpan(ubase + z * 
       for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
         h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
       }
-      // Collective, internally BATCHED (one multi-put per 64 pages).
-      co_await vec.BeginFlush();
+      // Collective: name the plane just written.
+      co_await vec.BeginFlush(ubase + z * plane, plane);
     }
     {
 co_await vec.BeginFetch(vec.PageLo(vbase + z * plane), vec.PageSpan(vbase + z * plane, plane));
@@ -191,8 +191,8 @@ co_await vec.BeginFetch(vec.PageLo(vbase + z * plane), vec.PageSpan(vbase + z * 
       for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
         h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
       }
-      // Collective, internally BATCHED (one multi-put per 64 pages).
-      co_await vec.BeginFlush();
+      // Collective: name the plane just written.
+      co_await vec.BeginFlush(vbase + z * plane, plane);
     }
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
@@ -297,8 +297,8 @@ co_await vec.BeginFetch(vec.PageLo(vnext + z * plane), vec.PageSpan(vnext + z * 
     // Flush the write-once outputs; the drop below is best-effort (a page
     // still flushing or pinned is refused and reclaimed by ordinary eviction
     // once it settles).
-    co_await vec.BeginFlush();
-    co_await vec.BeginFlush();
+    co_await vec.BeginFlush(unext + z * plane, plane);
+    co_await vec.BeginFlush(vnext + z * plane, plane);
     if (interior) {
       // Plane z-1 leaves the sliding window for good: empty the guard so the
       // drop can take it. (zm == z when not interior, so releasing it there

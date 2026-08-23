@@ -287,28 +287,6 @@ class DeviceVector {
     co_return;
   }
 
-  /** Start writing back every dirty page of this block's table, in full. */
-  __device__ clio::run::gpu::YCoroTask BeginFlush() {
-    // Wait only while the previous put is still moving. Callers flush inside
-    // a loop to overlap the next page's compute, so a landed flush is retired
-    // here rather than requiring an EndFlush between every pair.
-    if (threadIdx.x == 0) Tasks()->flush_cursor = 0;
-    __syncthreads();
-    // One iteration per BATCH, not per poll: each pass submits real work and
-    // waits only for the batch it just sent.
-    for (;;) {
-      CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
-      __shared__ unsigned int s_more;
-      if (threadIdx.x == 0) {
-        if (FlushBusy()) RetireFlush();
-        s_more = SubmitFlushBatch() ? 1u : 0u;
-      }
-      __syncthreads();
-      if (s_more == 0u) break;
-    }
-    co_return;
-  }
-
   /** Wait for the writeback started by BeginFlush. */
   __device__ clio::run::gpu::YCoroTask EndFlush() {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
@@ -629,43 +607,6 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 FlushTag() const {
     return reinterpret_cast<clio::run::u64>(
         &Tasks()->flush->fut_.is_complete_.x);
-  }
-
-  /** Stage every dirty page IN FULL and send it. Thread 0 only. */
-  /**
-   * Stage ONE batch of resident frames, starting at flush_cursor.
-   * @return true when frames remain after this batch.
-   *
-   * A MultiPutBlob carries at most kPodMultiMax records but a table may hold
-   * far more frames (the race test runs 192 slots against a 64-record task),
-   * so a whole-table flush is several batches. The earlier single-batch loop
-   * silently wrote the first 64 and dropped the rest, leaving those pages'
-   * blobs zero-length.
-   */
-  CTP_GPU_FUN bool SubmitFlushBatch() {
-    BlockTasks *bt = Tasks();
-    Page *tbl = Pages();
-    auto *t = bt->flush;
-    t->count_ = 0;
-    clio::run::u32 n = 0;
-    clio::run::u32 i = bt->flush_cursor;
-    for (; i < h_->pages_per_block_ && n < clio::cte::core::kPodMultiMax; ++i) {
-      Page *p = &tbl[i];
-      // A flush is unconditional: it does not consult `dirty`, it writes
-      // what is resident and then declares the frame clean.
-      if (p->page_num == kNoPage || p->flushing || p->fetching) continue;
-      const clio::run::u32 pn32 = static_cast<clio::run::u32>(p->page_num);
-      t->Add("", 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
-      t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
-                                    sizeof(pn32));
-      bt->flush_slot[n++] = i;
-      p->flushing = 1u;
-    }
-    bt->flush_cursor = i;
-    bt->flush_n = n;
-    if (n == 0) return false;
-    FinishFlushSubmit(t, n);
-    return i < h_->pages_per_block_;
   }
 
   /** Stage only the named ranges of dirty pages. Thread 0 only. */
