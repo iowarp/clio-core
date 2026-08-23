@@ -1145,7 +1145,12 @@ co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
       if (dy > 1u || dz > 1u) *d_err = 2;
     }
     __syncthreads();
+    // Publish the wrap. Rebin holds x for WRITE and folds each position back
+    // into the box; the gather then reads these rows from other blocks.
+    const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
+    co_await x.BeginFlush(pg * epp, cnt);
   }
+  co_await x.EndFlush();
 }
 
 /**
@@ -1380,43 +1385,6 @@ co_await f.BeginFetch(f.PageLo(pg * epp), f.PageSpan(pg * epp, epp));
  *  host Download (which reads the store, not the frames) sees the truth.
  *  One block does it; the others exit immediately. Validation-path only --
  *  steady-state MD never flushes x/v (they are device-canonical). */
-__device__ gy::YCoroMain FlushAllCoro(gv::DeviceVector<float> x,
-                                      gv::DeviceVector<float> v, u32 nblocks,
-                                      u32 block, u64 row_elems, u64 nrows) {
-  // EVERY BLOCK WRITES BACK WHATEVER IT HAS RESIDENT OF THE WHOLE RANGE.
-  //
-  // Naming [0, size) flushes exactly the pages this block holds -- a range
-  // covers whole pages and non-resident ones are skipped -- so this is the
-  // block's entire table, stated explicitly rather than implied.
-  //
-  // KNOWN HAZARD, unchanged from the whole-table flush this replaces: a
-  // block's table also holds pages it only READ (the force stencil and the
-  // resort gather fault in neighbouring rows), and writing those back ships
-  // this block's stale copy over the owner's newer data. Several blocks hold
-  // the same page, so the last writer wins nondeterministically. Restricting
-  // this to the pages a block owns is NOT a safe local fix: it measured
-  // worse (drift 4.98e-02 against 1.47e-03), so some read path depends on
-  // these extra writes.
-  (void) row_elems;
-  (void) nrows;
-  (void) block;
-  (void) nblocks;
-  const u64 kBatch = static_cast<u64>(clio::cte::core::kPodMultiMax);
-  const u64 xepp = x.ElemsPerPage();
-  const u64 xspan = kBatch * xepp;
-  for (u64 off = 0; off < x.size(); off += xspan) {
-    const u64 cnt = (x.size() - off < xspan) ? x.size() - off : xspan;
-    co_await x.BeginFlush(off, cnt);
-  }
-  co_await x.EndFlush();
-  const u64 vepp = v.ElemsPerPage();
-  const u64 vspan = kBatch * vepp;
-  for (u64 off = 0; off < v.size(); off += vspan) {
-    const u64 cnt = (v.size() - off < vspan) ? v.size() - off : vspan;
-    co_await v.BeginFlush(off, cnt);
-  }
-  co_await v.EndFlush();
-}
 
 /** Seeded value of element i: unique and exactly representable (the whole
  *  vector is well under 2^24 elements). */
@@ -1535,10 +1503,20 @@ co_await third.BeginFetch(third.PageLo(pg * epp), third.PageSpan(pg * epp, epp))
         g_blk_last[block] = pg;
       }
     }
-    // Guards die here: pages unpin. Nothing flushes -- x/v are device-
-    // canonical; the backing store is only written on eviction (none in the
-    // resident regime) or by an explicit host Download for validation.
+    // PUBLISH THIS PAGE, BY NAME. A block's table is private, so a page left
+    // here is invisible to every other block -- and both the force stencil
+    // and the resort gather read pages this block owns. Flushing the exact
+    // page just written keeps every put disjoint: no two blocks can name the
+    // same range, which is precisely what a whole-table flush could not
+    // promise. Async, so the put overlaps the next page's integration.
+    const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
+    co_await x.BeginFlush(pg * epp, cnt);
+    co_await v.BeginFlush(pg * epp, cnt);
   }
+  // Land them before the kernel exits: the next kernel reads these pages
+  // from other blocks, so they must be in the backing store by then.
+  co_await x.EndFlush();
+  co_await v.EndFlush();
 }
 
 /** K5: thermo -- KE and net momentum, block-reduced then atomically merged.
@@ -1739,20 +1717,6 @@ __global__ MD_LAUNCH_BOUNDS void MDIntegrateKernel(clio::run::IpcManagerGpuInfo 
   CLIO_YCORO_RUN(MDIntegrateCoro(x, v, f, dt, drift, nblocks, yv.Block()));
 }
 
-__global__ MD_LAUNCH_BOUNDS void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
-                               gv::DeviceVector<float> x,
-                               gv::DeviceVector<float> v, u32 nblocks,
-                               u64 row_elems, u64 nrows,
-                               gy::YieldableView<> yv,
-                               gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  x.Init(yv.Block());
-  v.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(FlushAllCoro(x, v, nblocks, yv.Block(), row_elems,
-                              nrows));
-}
 
 #if !CTP_IS_DEVICE_PASS
 namespace {
@@ -2421,14 +2385,6 @@ int main(int argc, char **argv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, df, fdt, drift, a.blocks, vw, sv);
       });
-      if (flush_after_kick) {
-        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                       gy::YieldStackView sv) {
-          FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
-        });
-        ctp::GpuApi::Synchronize();
-      }
       t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
@@ -2447,20 +2403,10 @@ int main(int argc, char **argv) {
     // Returns false on bin overflow (the host refuses the run).
     auto resort = [&]() -> bool {
       const double _t = NowMs();
-      // PUBLISH THE INPUTS FIRST. Integrate wrote x and v into each block's
-      // PRIVATE cache. The gather below reads a nine-row stencil, and all but
-      // one of those rows belong to other blocks -- whose integrated writes
-      // are still dirty and invisible. Without this it gathers stale
-      // positions, and the error only appears once the loop reaches its first
-      // resort (a run shorter than the resort interval looks perfect).
-      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
-        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
-      });
-      ctp::GpuApi::Synchronize();
-      // Flushing alone is not enough: a block that already has a neighbour's
-      // page cached would keep reading its stale copy rather than refetch.
+      // The inputs are already published: IntegrateCoro flushes each page it
+      // writes, by name. What is still needed is invalidation -- a block
+      // holding a neighbour's page would keep reading its stale copy rather
+      // than refetch the version its owner just wrote.
       // Clear all four -- resort swaps the handles, so dx/dv alias vx2/vv2 on
       // every other pass and naming one pair would clear the wrong vectors.
       vx.ClearCache();
@@ -2490,19 +2436,8 @@ int main(int argc, char **argv) {
                      "--rebin\n");
         return false;
       }
-      // PUBLISH THE WRAP. Rebin holds x for WRITE: it folds each position back
-      // into the box and computes d_dest from the folded value. Those writes
-      // land in the rebinning block's private cache, but the gather below
-      // reads a stencil of rows owned by OTHER blocks -- which would still see
-      // the pre-wrap coordinate while its destination was chosen from the
-      // wrapped one. Only atoms crossing a box face are affected, so the error
-      // starts tiny and compounds as the run proceeds.
-      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
-        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
-      });
-      ctp::GpuApi::Synchronize();
+      // RebinCoro publishes the wrapped positions itself, page by page, so
+      // only invalidation is left before the gather reads them.
       vx.ClearCache();
       vv.ClearCache();
       vx2.ClearCache();
@@ -2582,12 +2517,13 @@ int main(int argc, char **argv) {
       cudaMallocHost(&h_ckpt_stock, 2 * g.nelems * sizeof(float));
     }
     auto checkpoint = [&]() {
+      // NO SEPARATE CHECKPOINT PASS EXISTS ANY MORE, and that is the result,
+      // not a measurement bug. Every kernel publishes each page as it writes
+      // it -- it has to, because the other blocks read those pages -- so the
+      // live state is already in the tier stack at every step boundary. The
+      // paged checkpoint cost is therefore folded into the step, and what is
+      // timed here is only the barrier that proves it landed.
       const double _t = NowMs();
-      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
-        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
-      });
       ctp::GpuApi::Synchronize();
       t_ckpt += NowMs() - _t;
       const double _t2 = NowMs();
@@ -2838,14 +2774,8 @@ int main(int argc, char **argv) {
   //     x_n = x0 + n dt v0 + n^2 dt^2/2 g in double bounds float drift.
   int rc = 0;
   if (a.gate) {
-    // Download reads the BACKING STORE; the kernels wrote the cache frames.
-    // Flush first (validation-path only -- steady-state MD never flushes
-    // x/v; they are device-canonical).
-    runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                   gy::YieldStackView sv) {
-      FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
-    });
+    // Download reads the BACKING STORE, which the kernels have already
+    // written: each one flushes every page it writes, by name.
     ctp::GpuApi::Synchronize();
     // MD_SETTLE_MS=N waits before reading the backing store. If the
     // out-of-core mismatches vanish with a wait, the final AwaitFlush is
