@@ -1129,6 +1129,20 @@ co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
         continue;
       }
       d_dest[slot0 + s] = static_cast<u32>(bin * cap + slot);
+      // THE GATHER CAN ONLY REACH ONE BIN IN Y AND Z.
+      //
+      // A destination row is (bz, by) and spans every bx, so movement along x
+      // is free -- but the gather scans a +/-1 stencil in y and z, so an atom
+      // that crossed more than one bin in either is never collected by the row
+      // that now owns it and is dropped with no trace. That is a silent loss
+      // of binding energy, so flag it and let the host refuse the run.
+      const u64 islots_r = static_cast<u64>(nb) * cap;
+      const u64 srow = (slot0 + s) / islots_r;
+      const u32 sby = static_cast<u32>(srow % nb);
+      const u32 sbz = static_cast<u32>(srow / nb);
+      const u32 dy = min((by + nb - sby) % nb, (sby + nb - by) % nb);
+      const u32 dz = min((bz + nb - sbz) % nb, (sbz + nb - bz) % nb);
+      if (dy > 1u || dz > 1u) *d_err = 2;
     }
     __syncthreads();
   }
@@ -1190,6 +1204,21 @@ co_await dst.BeginFetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * r
     }
     float *const dp0 = hd0.ptr();
     float *const dp1 = hd1 ? hd1.ptr() : nullptr;
+    // RESET THE DESTINATION ROW TO PADDED FIRST.
+    //
+    // The scatter below writes only the slots that RECEIVE an atom. Every
+    // other slot would keep this buffer's contents from the previous resort,
+    // and w >= 0 marks a slot occupied -- so those ghosts are read back as
+    // real atoms sitting on top of the live ones, and the pair force between
+    // a ghost and its own current copy is what blows the energy up. The
+    // step-0 resort gate cannot see this: the buffer is padded at setup, so
+    // only the SECOND resort onwards inherits stale slots.
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const u64 de = s * kStride;
+      float *const dp = (de < drun) ? dp0 + de : dp1 + (de - drun);
+      dp[3] = -1.0f;
+    }
+    __syncthreads();
     // The nine candidate source rows, held as SPANS (one or two contiguous
     // runs per dz), of both vectors -- they are the same vector on the
     // position pass, where the second hold is a cache hit. Row-at-a-time
@@ -2399,6 +2428,26 @@ int main(int argc, char **argv) {
     // Returns false on bin overflow (the host refuses the run).
     auto resort = [&]() -> bool {
       const double _t = NowMs();
+      // PUBLISH THE INPUTS FIRST. Integrate wrote x and v into each block's
+      // PRIVATE cache. The gather below reads a nine-row stencil, and all but
+      // one of those rows belong to other blocks -- whose integrated writes
+      // are still dirty and invisible. Without this it gathers stale
+      // positions, and the error only appears once the loop reaches its first
+      // resort (a run shorter than the resort interval looks perfect).
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      // Flushing alone is not enough: a block that already has a neighbour's
+      // page cached would keep reading its stale copy rather than refetch.
+      // Clear all four -- resort swaps the handles, so dx/dv alias vx2/vv2 on
+      // every other pass and naming one pair would clear the wrong vectors.
+      vx.ClearCache();
+      vv.ClearCache();
+      vx2.ClearCache();
+      vv2.ClearCache();
       ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       const float fbox2 = static_cast<float>(g.box);
@@ -2411,10 +2460,34 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Synchronize();
       int err = 0;
       ctp::GpuApi::Memcpy(&err, d_err, sizeof(int));
-      if (err != 0) {
+      if (err == 1) {
         std::fprintf(stderr, "resort: bin overflow -- raise --cap\n");
         return false;
       }
+      if (err == 2) {
+        std::fprintf(stderr,
+                     "resort: an atom crossed more than one bin in y or z, "
+                     "which the +/-1 gather stencil cannot reach -- lower "
+                     "--rebin\n");
+        return false;
+      }
+      // PUBLISH THE WRAP. Rebin holds x for WRITE: it folds each position back
+      // into the box and computes d_dest from the folded value. Those writes
+      // land in the rebinning block's private cache, but the gather below
+      // reads a stencil of rows owned by OTHER blocks -- which would still see
+      // the pre-wrap coordinate while its destination was chosen from the
+      // wrapped one. Only atoms crossing a box face are affected, so the error
+      // starts tiny and compounds as the run proceeds.
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        FlushAllKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, dv, a.blocks, md_row_elems, md_nrows, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      vx.ClearCache();
+      vv.ClearCache();
+      vx2.ClearCache();
+      vv2.ClearCache();
       for (auto *dst : {&dx2, &dv2}) {
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
@@ -2526,8 +2599,25 @@ int main(int argc, char **argv) {
     for (u64 step = 0; step < a.steps; ++step) {
       kick(/*drift=*/1);   // uses f(t)
       if (a.rebin != 0 && step != 0 && step % a.rebin == 0) {
+        // Same continuity check the step-0 RESORT GATE applies, but on a
+        // resort that runs mid-flight: same physical state, new layout, so PE
+        // must be unchanged. Off by default -- it costs two extra force
+        // evaluations per resort.
+        const bool rchk = std::getenv("MD_RESORT_CHECK") != nullptr;
+        double pe_b = 0.0, pr_b = 0.0;
+        if (rchk) { force(/*eflag=*/1); pe_b = acc[0]; pr_b = acc[2]; }
         if (!resort()) return 1;
         if (a.use_list && !build_list()) return 1;
+        if (rchk) {
+          force(/*eflag=*/1);
+          // Pairs alongside PE: a resort that DROPS atoms loses pairs, one
+          // that merely misplaces them keeps the count and moves the energy.
+          std::printf("  [resort-check] step %llu: PE %.6f -> %.6f rel=%.2e | "
+                      "pairs %.0f -> %.0f (%+.0f)\n",
+                      (unsigned long long)step, pe_b, acc[0],
+                      std::fabs(acc[0] - pe_b) / std::fabs(pe_b), pr_b, acc[2],
+                      acc[2] - pr_b);
+        }
       }
       force(/*eflag=*/0);  // f(t+dt)
       kick(/*drift=*/0);
