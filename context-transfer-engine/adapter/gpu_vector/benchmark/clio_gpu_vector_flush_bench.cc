@@ -110,7 +110,9 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.ElemsPerPage();
-      auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
+co_await v.BeginFetch(v.PageLo(poff), v.PageSpan(poff, v.ElemsPerPage()));
+      co_await v.AwaitFetch();
+            auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
       WritePage(h, poff, 0u);
     }
     co_await v.BeginFlush();
@@ -166,7 +168,9 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.ElemsPerPage();
         const long long h0 = clock64();
-        auto h =
+co_await v.BeginFetch(v.PageLo(poff), v.PageSpan(poff, v.ElemsPerPage()));
+        co_await v.AwaitFetch();
+                auto h =
             co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
         if (threadIdx.x == 0) {
           atomicAdd(&g_round_cyc[7], (unsigned long long) (clock64() - h0));
@@ -275,7 +279,9 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.ElemsPerPage();
-      auto h = co_await v.HoldPage(poff, v.ElemsPerPage());
+co_await v.BeginFetch(v.PageLo(poff), v.PageSpan(poff, v.ElemsPerPage()));
+      co_await v.AwaitFetch();
+            auto h = co_await v.HoldPage(poff, v.ElemsPerPage());
       unsigned long long local = 0;
       unsigned long long wrong = 0;
       for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {

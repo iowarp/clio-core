@@ -607,7 +607,7 @@ co_await x.BeginFetch(x.PageLo(rb), x.PageSpan(rb, len));
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, rowlist - off));
+co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         co_await nl.AwaitFetch();
                 hn[nguards] =
             co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
@@ -906,7 +906,7 @@ co_await f.BeginFetch(f.PageLo(fbase), f.PageSpan(fbase, row_elems));
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, rowlist - off));
+co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         co_await nl.AwaitFetch();
                 hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
         np[nguards] = hn[nguards].ptr();
@@ -1140,7 +1140,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     gv::Held<float> hd1;
     const u64 drun = hd0.run();
     if (drun < row_elems) {
-co_await dst.BeginFetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * row_elems + drun, row_elems - drun));
+co_await dst.BeginFetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * row_elems + drun, 1));
       co_await dst.AwaitFetch();
             hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
                                   /*write=*/true);
@@ -1191,7 +1191,7 @@ co_await srcx.BeginFetch(srcx.PageLo(rb), srcx.PageSpan(rb, len));
                 hx[nspans][0] = co_await srcx.HoldPage(rb, len);
         xrun[nspans] = hx[nspans][0].run();
         if (xrun[nspans] < len) {
-co_await srcx.BeginFetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun[nspans], len - xrun[nspans]));
+co_await srcx.BeginFetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun[nspans], 1));
           co_await srcx.AwaitFetch();
                     hx[nspans][1] =
               co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);

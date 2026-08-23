@@ -106,7 +106,9 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
   const u64 base = static_cast<u64>(block) * per;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
+co_await v.BeginFetch(v.PageLo(base + off), v.PageSpan(base + off, n));
+    co_await v.AwaitFetch();
+        auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
       h[base + off + i] = PointVal(base + off + i, dims, k);
     }
@@ -144,7 +146,9 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
   const u64 base = static_cast<u64>(block) * per;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    // Read-only pass: no write intent, so every page stays clean and the
+co_await v.BeginFetch(v.PageLo(base + off), v.PageSpan(base + off, n));
+    co_await v.AwaitFetch();
+        // Read-only pass: no write intent, so every page stays clean and the
     // oversubscribed streaming read sheds pages without writeback.
     auto h = co_await v.HoldPage(base + off, n);
     // Whole pages hold whole points (enforced on the host), so a page is

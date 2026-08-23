@@ -137,7 +137,9 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-    auto h = co_await v.HoldPage(off, pe, /*write=*/true);
+co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, pe));
+    co_await v.AwaitFetch();
+        auto h = co_await v.HoldPage(off, pe, /*write=*/true);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       h[off + i] = Value(p, off + i, zero_pct);
     }
@@ -181,18 +183,17 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
   const u64 pe = v.ElemsPerPage();
   const u64 base_page = static_cast<u64>(block) * pages_per_block;
   unsigned long long acc = 0;
-  // Prime the pipeline: score 1.0 == make resident, the batched prefetch.
-  if (depth > 0) {
-    u32 prime = depth;
-    if (prime > pages_per_block) prime = static_cast<u32>(pages_per_block);
-  }
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 off = (base_page + k) * pe;
-    // Start the page `depth` ahead before touching this one, so the fault for
-    // it is already in flight by the time we get there.
-    if (depth > 0 && k + depth < pages_per_block) {
-      const u64 want = base_page + k + depth;
-    }
+    // ONE bulk get for this page plus the lookahead window. A block has a
+    // single fetch task, so issuing a separate lookahead fetch would just
+    // serialize behind this one; naming the whole window in one BeginFetch
+    // is how the depth is actually expressed now. Pages already resident
+    // cost nothing -- BeginFetch skips them.
+    u64 win = (depth > 0) ? static_cast<u64>(depth) + 1 : 1;
+    if (k + win > pages_per_block) win = pages_per_block - k;
+    co_await v.BeginFetch(v.PageLo(off), pe * win);
+    co_await v.AwaitFetch();
     auto h = co_await v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       acc += static_cast<unsigned long long>(h[off + i]) *
@@ -239,6 +240,11 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
     // One batched get for the whole chunk (score 1.0 == make resident); the
     // holds below wait on arrivals rather than issuing per-page faults.
     const u64 c0 = base_page + k;
+    // ONE batched get for the whole chunk, then hold its pages one at a
+    // time. Fetching inside the j loop would defeat the batching this case
+    // exists to measure.
+    co_await v.BeginFetch(v.PageLo(c0 * pe), pe * n);
+    co_await v.AwaitFetch();
     for (u64 j = 0; j < n; ++j) {
       const u64 off = (base_page + k + j) * pe;
       auto h = co_await v.HoldPage(off, pe);

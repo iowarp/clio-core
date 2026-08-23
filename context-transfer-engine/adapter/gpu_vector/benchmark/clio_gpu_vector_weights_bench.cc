@@ -195,18 +195,23 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
                                       clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    auto h = co_await v.HoldPage(
-        base + off, (off + page_elems <= per) ? page_elems : (per - off),
-        /*write=*/true);
+co_await v.BeginFetch(v.PageLo(base + off), v.PageSpan(base + off,
+                   (off + page_elems <= per) ? page_elems : (per - off)));
+    co_await v.AwaitFetch();
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
+    {
+      auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
     for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
       h[base + off + i] = Weight(base + off + i, flat_pct);
     }
+    __syncthreads();
+    }
+    // FLUSH AS WE GO. A dirty frame is not evictable, so deferring every
+    // writeback to the end dirties the whole table and the next fetch has
+    // nowhere to land. Ranged, so this sends only what was just written.
+    co_await v.BeginFlush(base + off, n);
   }
-  // Final writeback -- explicit, because drops and eviction never write a
-  // page back on their own now. Collective, internally BATCHED.
-  co_await v.BeginFlush();
   co_await v.EndFlush();
 }
 
@@ -244,7 +249,10 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    auto h = co_await v.HoldPage(
+co_await v.BeginFetch(v.PageLo(base + off), v.PageSpan(base + off,
+                   (off + page_elems <= per) ? page_elems : (per - off)));
+    co_await v.AwaitFetch();
+        auto h = co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off));
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);

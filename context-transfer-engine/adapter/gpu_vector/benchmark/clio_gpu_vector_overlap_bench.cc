@@ -73,17 +73,26 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
                                   u32 block) {
   const u64 base = static_cast<u64>(block) * per;
   for (u64 i = 0; i < per;) {
-    auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
-    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      h[base + i + k] = Elem(base + i + k);
+    u64 run = 0;
+    {
+      co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
+      co_await v.AwaitFetch();
+      auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Elem(base + i + k);
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    i += h.run();
+    // FLUSH AS WE GO, and this is the overlap the benchmark measures: a
+    // ranged BeginFlush returns as soon as the put is submitted, so this
+    // page's writeback rides alongside the next page's fetch and compute.
+    // Deferring every flush to the end would dirty the whole table and then
+    // fail -- a dirty frame is not evictable, so the region cannot exceed
+    // the cache without flushing first.
+    co_await v.BeginFlush(base + i, run);
+    i += run;
   }
-  // Explicit flush is REQUIRED, not belt-and-braces: only explicit flushes
-  // write data back now (drops refuse dirty pages), so seeded data left to
-  // eviction would simply be lost.
-  co_await v.BeginFlush();
   co_await v.EndFlush();
 }
 
@@ -131,22 +140,31 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
   const u64 pages = per / v.ElemsPerPage();
   unsigned long long acc = 0;
 
-  for (u64 p = 0; p < pages; ++p) {
-    if (prefetch) {
-      // Keep `depth` pages in flight, not one: one page of lookahead cannot
-      // cover a whole fault round trip unless a page's compute exceeds it.
-      // Score 1.0 == make resident, batched; already-resident/in-flight
-      // entries are skipped inside, so re-hinting each iteration is cheap.
-      // The page in use needs no pin hint -- HoldPage's pin protects it.
-      u32 nwant = depth;
-      if (p + nwant >= pages) nwant = static_cast<u32>(pages - 1 - p);
-      if (nwant > 0) {
-        const u64 p1 = first_page + p + 1;
-      }
-    }
+  const u64 pe = v.ElemsPerPage();
+  (void) first_page;
+  // PRIME: page 0 must be resident before the loop, because the loop body
+  // issues the fetch for page p+1 and then computes on p.
+  co_await v.BeginFetch(v.PageLo(base), pe);
+  co_await v.AwaitFetch();
 
-    const u64 off = base + p * v.ElemsPerPage();
-    auto h = co_await v.HoldPage(off, v.ElemsPerPage());
+  for (u64 p = 0; p < pages; ++p) {
+    const u64 off = base + p * pe;
+    if (prefetch && p + 1 < pages) {
+      // THE OVERLAP: submit the next window and do NOT await it. The page
+      // being computed on is already resident, so this transfer is in flight
+      // for the whole compute below. `depth` pages per window because one
+      // page of lookahead cannot cover a fault round trip unless a page's
+      // compute exceeds it.
+      u64 win = (depth > 0) ? depth : 1;
+      if (p + 1 + win > pages) win = pages - (p + 1);
+      co_await v.BeginFetch(v.PageLo(base + (p + 1) * pe), pe * win);
+    } else if (!prefetch) {
+      // No lookahead: pay the fault right here, which is the baseline this
+      // case is measured against.
+      co_await v.BeginFetch(v.PageLo(off), pe);
+      co_await v.AwaitFetch();
+    }
+    auto h = co_await v.HoldPage(off, pe);
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
       local += h[off + i];
@@ -504,8 +522,7 @@ int main(int argc, char **argv) {
 
   std::printf(
       "\n[serial]    %8.1f ms   faults=%llu evicts=%llu   %s\n"
-      "[prefetch]  %8.1f ms   faults=%llu evicts=%llu prefetch=%llu "
-      "landed=%llu late=%llu rescores=%llu   %s\n",
+      "[prefetch]  %8.1f ms   faults=%llu evicts=%llu   %s\n",
       serial_ms, (unsigned long long) serial_stats.faults,
       (unsigned long long) serial_stats.evicts,
       serial_ok ? "sum=OK" : "sum=MISMATCH",
