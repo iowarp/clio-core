@@ -218,3 +218,9 @@ abrt_bt.so
 # Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
 # Generated output, never source.
 demologs/
+
+# Paper-benchmark run output. The DRIVERS (paper-benchmark/*/run_*.sh,
+# collect.py, decks, README) are tracked; the results trees they write --
+# per-chunk CSVs, LAMMPS logs, the tier and its metadata log -- are generated
+# and can run to hundreds of MB. Override the location with --results DIR.
+paper-benchmark/*/results/

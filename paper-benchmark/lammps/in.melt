@@ -1,0 +1,38 @@
+# LJ melt -- the paper benchmark workload, fully parameterised.
+#
+# Contains no "dump" and no "run": the driver (bin/neuropress_lammps_lib)
+# issues the run in GAP-step segments and reads Atom::x/v/f between them, so
+# the simulation state reaches Clio without a file ever being written.
+#
+# Every parameter below is a `variable ... index <default>`, which LAMMPS uses
+# ONLY when the value was not supplied on the command line. run_config.sh
+# passes them as -var, so this deck still runs standalone with the defaults --
+# and those defaults are upstream NeuroPress's own in.melt_gpuc shape, so
+# sizes and physics stay comparable unless deliberately changed.
+
+variable        BOX      index 80        # lattice cells/side -> 4*BOX^3 atoms
+variable        GAP      index 50        # thermo interval (driver's frame gap)
+variable        DENSITY  index 0.8442    # reduced LJ density of the fcc lattice
+variable        TEMP     index 3.0       # initial temperature (melts the lattice)
+variable        CUTOFF   index 2.5       # lj/cut pair cutoff, sigma
+variable        SKIN     index 0.3       # neighbor-list skin
+variable        EVERY    index 20        # neigh_modify every
+variable        SEED     index 87287     # velocity RNG seed
+variable        DT       index 0.005     # timestep (LAMMPS' lj-units default)
+
+units           lj
+atom_style      atomic
+lattice         fcc ${DENSITY}
+region          box block 0 ${BOX} 0 ${BOX} 0 ${BOX}
+create_box      1 box
+create_atoms    1 box
+mass            1 1.0
+velocity        all create ${TEMP} ${SEED} loop geom
+pair_style      lj/cut ${CUTOFF}
+pair_coeff      1 1 1.0 1.0 ${CUTOFF}
+neighbor        ${SKIN} bin
+neigh_modify    every ${EVERY} delay 0 check no
+fix             1 all nve
+timestep        ${DT}
+
+thermo          ${GAP}
