@@ -292,12 +292,20 @@ class DeviceVector {
     // Wait only while the previous put is still moving. Callers flush inside
     // a loop to overlap the next page's compute, so a landed flush is retired
     // here rather than requiring an EndFlush between every pair.
-    CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
-    if (threadIdx.x == 0) {
-      if (FlushBusy()) RetireFlush();
-      SubmitFlush();
-    }
+    if (threadIdx.x == 0) Tasks()->flush_cursor = 0;
     __syncthreads();
+    // One iteration per BATCH, not per poll: each pass submits real work and
+    // waits only for the batch it just sent.
+    for (;;) {
+      CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
+      __shared__ unsigned int s_more;
+      if (threadIdx.x == 0) {
+        if (FlushBusy()) RetireFlush();
+        s_more = SubmitFlushBatch() ? 1u : 0u;
+      }
+      __syncthreads();
+      if (s_more == 0u) break;
+    }
     co_return;
   }
 
@@ -624,14 +632,24 @@ class DeviceVector {
   }
 
   /** Stage every dirty page IN FULL and send it. Thread 0 only. */
-  CTP_GPU_FUN void SubmitFlush() {
+  /**
+   * Stage ONE batch of resident frames, starting at flush_cursor.
+   * @return true when frames remain after this batch.
+   *
+   * A MultiPutBlob carries at most kPodMultiMax records but a table may hold
+   * far more frames (the race test runs 192 slots against a 64-record task),
+   * so a whole-table flush is several batches. The earlier single-batch loop
+   * silently wrote the first 64 and dropped the rest, leaving those pages'
+   * blobs zero-length.
+   */
+  CTP_GPU_FUN bool SubmitFlushBatch() {
     BlockTasks *bt = Tasks();
     Page *tbl = Pages();
     auto *t = bt->flush;
     t->count_ = 0;
     clio::run::u32 n = 0;
-    for (clio::run::u32 i = 0;
-         i < h_->pages_per_block_ && n < clio::cte::core::kPodMultiMax; ++i) {
+    clio::run::u32 i = bt->flush_cursor;
+    for (; i < h_->pages_per_block_ && n < clio::cte::core::kPodMultiMax; ++i) {
       Page *p = &tbl[i];
       // A flush is unconditional: it does not consult `dirty`, it writes
       // what is resident and then declares the frame clean.
@@ -643,9 +661,11 @@ class DeviceVector {
       bt->flush_slot[n++] = i;
       p->flushing = 1u;
     }
+    bt->flush_cursor = i;
     bt->flush_n = n;
-    if (n == 0) return;
+    if (n == 0) return false;
     FinishFlushSubmit(t, n);
+    return i < h_->pages_per_block_;
   }
 
   /** Stage only the named ranges of dirty pages. Thread 0 only. */
@@ -656,16 +676,15 @@ class DeviceVector {
     Page *tbl = Pages();
     auto *t = bt->flush;
     t->count_ = 0;
-    clio::run::u32 n = 0;
-    for (clio::run::u32 r = 0; r < nr && n < clio::cte::core::kPodMultiMax;
-         ++r) {
+    clio::run::u32 n = 0, dropped = 0;
+    for (clio::run::u32 r = 0; r < nr; ++r) {
       if (hi[r] <= lo[r]) continue;
       const clio::run::u64 p0 = PageOf(lo[r]);
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
-      for (clio::run::u64 pn = p0;
-           pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
         Page *p = Find(pn);
         if (p == nullptr || p->flushing) continue;
+        if (n >= clio::cte::core::kPodMultiMax) { ++dropped; continue; }
         clio::run::u64 boff = 0, blen = 0;
         if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
@@ -678,6 +697,12 @@ class DeviceVector {
       }
     }
     bt->flush_n = n;
+    if (dropped != 0) {
+      printf("[gpu_vector] FATAL table=%u: flush range needs %u records, one "
+             "task carries %u. Split the range.\n",
+             Table(), n + dropped, clio::cte::core::kPodMultiMax);
+      __trap();
+    }
     if (n == 0) return;
     FinishFlushSubmit(t, n);
   }
