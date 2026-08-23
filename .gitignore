@@ -130,6 +130,21 @@ context-transfer-engine/compressor/example/*
 # binary links nothing from Clio. Scripts and an input deck only -- CMake
 # builds nothing here, the harness drives a prebuilt LAMMPS.
 !context-transfer-engine/compressor/example/neuropress_lammps_h5/
+
+# NeuroPress differential parity harnesses (issue #693). Same reasoning as the
+# example directories above: they compile a second project's CUDA sources from
+# a path outside this tree (CLIO_NEUROPRESS_SRC_DIR) and exist to compare the
+# port against it, which is development tooling rather than part of the
+# integration. Their CMakeLists skips the whole directory when that tree or
+# nvcomp is absent, so a checkout without them still configures and still runs
+# every non-parity test.
+context-transport-primitives/test/unit/compress/model/parity/
+
+# Parity/sweep CSV output, written into the working directory by the harnesses
+# and examples above.
+neuropress_*_parity.csv
+neuropress_modes_parity.csv
+neuropress_selection_parity.csv
 Win32/
 x64/
 Release/
