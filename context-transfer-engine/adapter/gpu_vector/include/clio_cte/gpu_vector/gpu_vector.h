@@ -946,7 +946,10 @@ class Vector {
    *  `buf` (PageBytes() long). */
   template <typename FillFn>
   bool PreloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi, FillFn fill) {
-    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    // THROUGH the compressor, not behind it. core_pool_id_ is the raw-bytes
+    // route that only the in-kernel decoder may use; a host transfer has no
+    // decoder, so it must let the composed pool do the transform.
+    clio::cte::core::Client core(storage_pool_id_);
     if (pg_hi <= pg_lo) return true;
     const clio::run::u64 depth =
         std::min(pg_hi - pg_lo, kHostPipelineDepth);
@@ -1004,7 +1007,8 @@ class Vector {
   template <typename SinkFn>
   clio::run::u64 DownloadPages(clio::run::u64 pg_lo, clio::run::u64 pg_hi,
                                SinkFn sink) {
-    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    // See PreloadPages: host transfers go through the composed pool.
+    clio::cte::core::Client core(storage_pool_id_);
     if (pg_hi <= pg_lo) return 0;
     const clio::run::u64 depth =
         std::min(pg_hi - pg_lo, kHostPipelineDepth);
