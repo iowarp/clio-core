@@ -837,6 +837,10 @@ class DeviceVector {
    * stranded.
    */
   static constexpr clio::run::u32 kMaxWays = 8;
+  /** Eviction rank a freshly faulted-in frame starts at. Named so that
+   *  "never rescored" is a legible state rather than a magic float; see
+   *  Held::RescorePage. Higher means keep. */
+  static constexpr float kDefaultEvictRank = 1.0f;
 
   /**
    * Victim selection among the d candidates.
@@ -891,6 +895,22 @@ class DeviceVector {
     clio::run::u64 x = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     x ^= x >> 33;
     return (clio::run::u32) (x >> 16);
+  }
+
+  /**
+   * Victim order, design section 6.1: ascending (evict_rank, last_access).
+   *
+   * Score first, LRU second -- recency only ever decides ties. Both keys
+   * ascend, so the pair reads naturally: lowest rank is least wanted, and
+   * among equally-wanted frames the stalest goes.
+   *
+   * The tiebreak is load-bearing. Equal ranks are the COMMON case, since a
+   * block that never calls RescorePage has uniform ranks and the policy is
+   * pure LRU -- dropping it changed a scoring test's fault count 14 -> 13.
+   */
+  CTP_GPU_FUN bool WorseVictim(const Page &a, const Page &b) const {
+    if (a.score != b.score) return a.score < b.score;
+    return a.last_access < b.last_access;
   }
 
   /**
@@ -1021,6 +1041,57 @@ class DeviceVector {
   }
 
 
+
+  /**
+   * Secure the frame page `pn` will live in. Design section 6.1.
+   *
+   * Candidates are `pn`'s d-left ways ONLY. Returns the frame, or nullptr when
+   * every way is unusable -- the caller reports which state blocked it.
+   *
+   * Never writes back: a dirty frame is not a candidate, because the caller
+   * owns flushing (principle 4).
+   */
+  CTP_GPU_FUN Page *ClaimFrameForPage(clio::run::u64 pn) {
+    Page *tbl = BlockPages();
+    const clio::run::u32 nways = Ways();
+    Page *best = nullptr;
+    for (clio::run::u32 w = 0; w < nways; ++w) {
+      Page *c = &tbl[WaySlot(pn, w)];
+      if (c->page_num == pn) return c;            // already here: a hit
+      if (c->pins != 0u || c->fetching || c->flushing || c->dirty) continue;
+      if (c->page_num == kNoPage) return c;       // free: take it
+      if (best == nullptr || WorseVictim(*c, *best)) best = c;
+    }
+    if (best == nullptr) return nullptr;
+    // Dekker handshake against the lock-free hold fast path; see
+    // FreeVictimSlot. A loser leaves the slot untouched.
+    if (!FreeVictimSlot(best)) return nullptr;
+    Bump(h_->stat_evicts_);
+    return best;
+  }
+
+  /** Why no frame could be claimed, printed once by thread 0 before the trap.
+   *  "All candidates unusable" would send the reader guessing between a caller
+   *  error (unflushed writes), a leaked guard (a pin held too long) and
+   *  in-flight I/O, which are three unrelated bugs. */
+  CTP_GPU_FUN void ReportClaimFailure(clio::run::u64 pn) {
+    Page *tbl = BlockPages();
+    const clio::run::u32 nways = Ways();
+    clio::run::u32 nd = 0, np = 0, nfl = 0, nfe = 0;
+    for (clio::run::u32 w = 0; w < nways; ++w) {
+      const Page &c = tbl[WaySlot(pn, w)];
+      if (c.dirty) ++nd;
+      if (c.pins) ++np;
+      if (c.flushing) ++nfl;
+      if (c.fetching) ++nfe;
+    }
+    printf("[gpu_vector] FATAL blk=%u page=%llu: no usable frame in %u ways "
+           "(dirty=%u pinned=%u flushing=%u fetching=%u)\n"
+           "  dirty: the vector never writes back on its own -- flush before "
+           "the dirty set fills the table\n"
+           "  pinned: a Held guard outlived the hold that needed it\n",
+           BlockIndex(), (unsigned long long) pn, nways, nd, np, nfl, nfe);
+  }
 
   /** EvictPages' body, for callers that already hold the block lock. */
   CTP_GPU_FUN void EvictLocked(clio::run::u32 num_pages) {
@@ -1640,40 +1711,72 @@ class DeviceVector {
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     clio::run::u64 run = TryHoldFast(off, count, write);
     if (run == 0) {
-      // MISS. The kernel does not resolve its own fault: it records the page
-      // it needs and parks. The host servicer claims a CLEAN frame, fills it,
-      // publishes the page, and only then clears `pending` -- so on resume the
-      // page is resident and there is nothing to retry.
-      //
-      // This is the whole device-side fault path. No claim, no eviction, no
-      // writeback, no task submission, no future. Measured, the machinery this
-      // replaces was 19,400 of a hold's 20,000 instructions.
-      volatile FaultReq *f = &h_->faults_[FaultSlot()];
+      // MISS. Design section 5.1: the block resolves its own fault -- claim a
+      // frame among this page's ways, submit this block's scalar GetBlob, park
+      // until it lands, publish. No batching, no settle/reap, no
+      // writeback-on-evict (a dirty frame is never a candidate).
+      const clio::run::u64 pn = PageOf(off);
+      Page *tbl = BlockPages();
+      // Thread 0 claims; the block needs the answer. __shared__ is safe HERE
+      // and only here -- the broadcast happens before any suspension, and each
+      // thread copies it into a coroutine-frame local, which does survive a
+      // park. (A __shared__ value read AFTER a co_await would be garbage: the
+      // yield driver exits the kernel.)
+      __shared__ clio::run::u32 s_slot;
       if (threadIdx.x == 0) {
-        // Count it HERE: this is where a page-in begins now. Several tests
-        // assert paging behaviour through these counters, and deleting the old
-        // fault path silently zeroed them -- "faults=0" then reads as a
-        // perfectly warm cache instead of a broken one.
-        Bump(h_->stat_faults_);
-        f->page_num = PageOf(off);
-        f->table = BlockIndex();
-        f->write = write ? 1u : 0u;
-        __threadfence_system();     // request visible before the doorbell
-        f->pending = 1u;
-        __threadfence_system();
+        Page *p = ClaimFrameForPage(pn);
+        if (p != nullptr && p->page_num != pn) {
+          p->fetching = 1u;      // promises the frame to this transfer
+          __threadfence();
+          PrepareGet(p, pn);
+          Bump(h_->stat_faults_);
+          p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+              SlotPtr(p->get));
+          // An empty future means the send was DISCARDED. Waiting on it
+          // returns at once and the stale return code reads 0, so the frame's
+          // previous page would be served as this one -- silently.
+          if (p->get_fut.IsNull()) Bump(h_->stat_get_errors_);
+        }
+        s_slot = (p == nullptr) ? h_->pages_per_block_
+                                : (clio::run::u32) (p - tbl);
       }
       __syncthreads();
-      co_await clio::run::gpu::YCoroSuspend{
-          reinterpret_cast<clio::run::u64>(
-              const_cast<clio::run::u32 *>(&f->pending))};
+      const clio::run::u32 slot = s_slot;   // -> coroutine frame, survives park
+      if (slot >= h_->pages_per_block_) {
+        if (threadIdx.x == 0) ReportClaimFailure(pn);
+        __trap();
+      }
+      // Park until the get lands. The tag names the completion word, but the
+      // driver is free to relaunch without consulting it (3-arg
+      // RunToCompletion ignores tags), so the loop re-checks -- and the vote
+      // keeps the whole block on one side of the suspend.
+      while (__syncthreads_and(GetDone(&tbl[slot]) ? 1 : 0) == 0) {
+        co_await clio::run::gpu::YCoroSuspend{reinterpret_cast<clio::run::u64>(
+            &tbl[slot].get->fut_.is_complete_.x)};
+      }
+      if (threadIdx.x == 0) {
+        Page *p = &tbl[slot];
+        if (p->page_num != pn) {
+          // CHECK IT. A failed get leaves the frame holding whatever it held
+          // before, and the caller reads that as the page it asked for.
+          if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
+          p->dirty = 0u;
+          p->score = kDefaultEvictRank;
+          p->last_access = 0;
+          __threadfence();
+          p->page_num = pn;       // PUBLISH LAST -- see section 4.1
+          __threadfence();
+          p->fetching = 0u;
+        }
+      }
+      __syncthreads();
       run = TryHoldFast(off, count, write);
       if (run == 0) {
-        // The servicer said the page was resident and it is not. Trapping
-        // beats looping: a livelock reads as a hang or, worse, as a pass with
-        // correct data (observed) while the round cap silently ends the run.
+        // Trapping beats looping: a livelock reads as a hang or, worse, as a
+        // pass with correct data (observed) while the round cap ends the run.
         if (threadIdx.x == 0) {
-          printf("[gpu_vector] FATAL blk=%u page=%llu served but not resident\n",
-                 BlockIndex(), (unsigned long long) PageOf(off));
+          printf("[gpu_vector] FATAL blk=%u page=%llu fetched but not resident\n",
+                 BlockIndex(), (unsigned long long) pn);
         }
         __trap();
       }
@@ -2676,6 +2779,13 @@ class DeviceVector {
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
     ClearRunCtx(t);
+  }
+
+  /** Has this frame's scalar get completed? Block-uniform: every thread reads
+   *  the same word, and HoldPage votes the answer anyway. */
+  CTP_GPU_FUN bool GetDone(const Page *p) const {
+    if (p->get_fut.IsNull()) return true;   // discarded send: do not hang
+    return (p->get->fut_.is_complete_.load() & 1u) != 0u;
   }
 
   /** Fault `page_num` into `p` with a SYNCHRONOUS get. */
