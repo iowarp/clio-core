@@ -246,17 +246,6 @@ std::vector<CompressionStats> RankIntoStats(
   // wants, and not what NeuroPress does.
   ctp::compress::model::RankingWeights weights;
   weights.use_cost_model = true;
-  // Best mode's ratio-only objective. Upstream reaches it by zeroing
-  // g_rank_w0/w1 (gpucompress_learning.cpp), which leaves
-  // cost = size/(ratio*bw) -- a monotone function of ratio alone, so the
-  // ranking becomes "smallest output first". This has to apply to the NN
-  // RANKING too, not just to the exploration winner: the ranking is what
-  // decides which slots the exhaustive sweep visits.
-  if (ratio_only) {
-    weights.w_cost_compress_time = 0.0;
-    weights.w_cost_decompress_time = 0.0;
-  }
-
   // Cost-model weights are overridable for experiments, and ONLY for
   // experiments: the defaults above are upstream's (all 1.0, bw 5e6) and are
   // what every normal write uses. Read once -- this runs per chunk on runtime
@@ -269,12 +258,39 @@ std::vector<CompressionStats> RankIntoStats(
   // That is a genuinely different selector, not a tuning knob -- with equal
   // weights the I/O term is ~0.4% of the cost at 4 MiB, so the shipped model
   // is effectively a latency model and the ratio one picks quite differently.
+  //
+  // ORDER MATTERS, and it is upstream's order: the environment is resolved
+  // FIRST, then best mode has the last word. Upstream reads its one env knob
+  // (GPUCOMPRESS_BW_GBPS) inside gpucompress_init (gpucompress_api.cpp:229),
+  // and gpucompress_set_best_mode runs later and overwrites g_rank_w0/w1 to
+  // zero (gpucompress_learning.cpp:134-136), so nothing can land on top of
+  // the ratio-only objective.
   static const CostWeightOverride kOverride = ResolveCostOverride();
   if (kOverride.any) {
     weights.w_cost_compress_time = kOverride.ct;
     weights.w_cost_decompress_time = kOverride.dt;
     weights.w_cost_io = kOverride.io;
     weights.bandwidth_bytes_per_ms = kOverride.bw;
+  }
+
+  // Best mode's ratio-only objective. Upstream reaches it by zeroing
+  // g_rank_w0/w1 (gpucompress_learning.cpp), which leaves
+  // cost = size/(ratio*bw) -- a monotone function of ratio alone, so the
+  // ranking becomes "smallest output first". This has to apply to the NN
+  // RANKING too, not just to the exploration winner: the ranking is what
+  // decides which slots the exhaustive sweep visits.
+  //
+  // LAST, deliberately -- see the ordering note above. When this ran before
+  // the override block, setting ANY one of the four env vars re-applied the
+  // other three from their FALLBACKS, and two of those fallbacks (ct=1, dt=1)
+  // are exactly what this zeroes. A bandwidth-only tweak therefore restored
+  // the latency objective in the RANKING while DynamicSchedule's own cost
+  // lambda kept `best_mode ? 0.0 : ...` -- the two halves of best mode then
+  // ranked on different objectives, a state upstream cannot reach because it
+  // keeps one copy of the weights that every reader shares.
+  if (ratio_only) {
+    weights.w_cost_compress_time = 0.0;
+    weights.w_cost_decompress_time = 0.0;
   }
 
   std::vector<RankedPrediction> ranked;
