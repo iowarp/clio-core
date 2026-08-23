@@ -59,6 +59,26 @@ static constexpr u32 kStride = 4;
 /** MD_PROF=1 phase attribution inside the force coroutine, cycles, thread
  *  0 of each block: [0] stencil holds [1] f hold+zero [2] list guards
  *  [3] pair loop [4] whole row loop [5] rows processed. */
+/**
+ * Launch bounds for the MD kernels. Every one is launched with a.threads
+ * (default 256), so the max-threads half is exact. The second number is the
+ * occupancy target: it tells ptxas how many blocks per SM to allocate
+ * registers for, which is the same budget coro_regcap enforces from outside.
+ *
+ * MD_LB_BLOCKS=0 compiles them out, for an A/B against the pass alone.
+ */
+#ifndef MD_LB_THREADS
+#define MD_LB_THREADS 256
+#endif
+#ifndef MD_LB_BLOCKS
+#define MD_LB_BLOCKS 4
+#endif
+#if MD_LB_BLOCKS > 0
+#define MD_LAUNCH_BOUNDS __launch_bounds__(MD_LB_THREADS, MD_LB_BLOCKS)
+#else
+#define MD_LAUNCH_BOUNDS
+#endif
+
 __device__ unsigned long long g_md_cyc[8];
 
 /** Page iterations actually completed by the integrator, summed over
@@ -100,6 +120,25 @@ static constexpr int kMaxNlGuards = 4;
  * after the first hold is exactly the deadlock admission exists to prevent.
  */
 static constexpr u32 kSpanGuards = 12;
+
+/**
+ * MINIMUM frames a table must have for these kernels to make progress.
+ *
+ * A cache is not a free parameter: it has to hold everything a kernel pins
+ * AT ONCE, plus room to fetch the next span while those stay pinned. Below
+ * that, EvictPages has nothing it may take and traps -- correctly, because
+ * the request cannot be satisfied. Asking for fewer slots does not produce
+ * "more paging", it produces an impossible configuration.
+ *
+ * x    the pair loop pins up to kSpanGuards spans, and the gather runs as
+ *      (src=dx, srcx=dx, dst=dx2) so ONE table supplies both span sets;
+ *      +2 for the destination row, +2 free frames for the next fetch.
+ * f    two guards (a row and its straddle), +2 to fetch against.
+ * nl   kMaxNlGuards, +2 to fetch against.
+ */
+static constexpr u32 kMinSlotsX = 2 * kSpanGuards + 4;
+static constexpr u32 kMinSlotsF = 4;
+static constexpr u32 kMinSlotsNl = static_cast<u32>(kMaxNlGuards) + 2;
 
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
 #define GV_MD_CORO 1
@@ -1499,7 +1538,7 @@ co_await v.BeginFetch(v.PageLo(pg * epp), v.PageSpan(pg * epp, epp));
  * every block at that table; blocks write DISJOINT pages, so the only
  * sharing is the lock-free probes. */
 
-__global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x, u64 passes,
                                 u32 nblocks, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
@@ -1510,7 +1549,7 @@ __global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(ReadProbeCoro(x, passes, nblocks, yv.Block()));
 }
 
-__global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<float> v,
                                 gv::DeviceVector<float> third, int use_third,
@@ -1528,7 +1567,7 @@ __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                drift, nblocks, yv.Block()));
 }
 
-__global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void ThermoKernel(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<float> x,
                              gv::DeviceVector<float> v, double *out,
                              u32 nblocks, gy::YieldableView<> yv,
@@ -1541,7 +1580,7 @@ __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(ThermoCoro(x, v, out, nblocks, yv.Block()));
 }
 
-__global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void ForceKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> x,
                             gv::DeviceVector<float> f, u32 nb, u32 cap,
                             float box, float cutoff, int eflag, double *acc,
@@ -1556,7 +1595,7 @@ __global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
-__global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void BuildListKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<int> nl, u32 nb, u32 cap,
                                 float box, float rlist, u32 maxneigh,
@@ -1573,7 +1612,7 @@ __global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
                                d_err, rowchunk, nblocks, yv.Block()));
 }
 
-__global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<float> f,
                                 gv::DeviceVector<int> nl, u32 nb, u32 cap,
@@ -1593,7 +1632,7 @@ __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
                                nblocks, yv.Block()));
 }
 
-__global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void RebinKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> x, u32 nb, u32 cap,
                             float box, u32 *bincnt, u32 *d_dest, int *d_err,
                             u32 nblocks, gy::YieldableView<> yv,
@@ -1606,7 +1645,7 @@ __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                            yv.Block()));
 }
 
-__global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> src,
                               gv::DeviceVector<float> srcx,
                               gv::DeviceVector<float> dst, u32 nb, u32 cap,
@@ -1622,7 +1661,7 @@ __global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
                             nblocks, yv.Block()));
 }
 
-__global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void SentinelKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> dst, u32 nblocks,
                                gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -1632,7 +1671,7 @@ __global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(SentinelCoro(dst, nblocks, yv.Block()));
 }
 
-__global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceVector<float> x,
                                   gv::DeviceVector<float> v,
                                   gv::DeviceVector<float> f, float dt,
@@ -1648,7 +1687,7 @@ __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(MDIntegrateCoro(x, v, f, dt, drift, nblocks, yv.Block()));
 }
 
-__global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
+__global__ MD_LAUNCH_BOUNDS void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> x,
                                gv::DeviceVector<float> v, u32 nblocks,
                                u64 row_elems, u64 nrows,
@@ -1731,6 +1770,15 @@ class YieldRunner {
 #endif  // GV_MD_CORO
 
 #if !CTP_IS_DEVICE_PASS
+
+/** Clamp a requested slot count up to what the kernels actually pin. */
+static u32 AtLeastSlots(u32 want, u32 floor_slots, const char *what) {
+  if (want >= floor_slots) return want;
+  std::printf("  note: %s cache %u frames is below the %u pinned at once; "
+              "raising to %u\n", what, want, floor_slots, floor_slots);
+  return floor_slots;
+}
+
 int main(int argc, char **argv) {
 #if !defined(GV_MD_CORO)
   (void)argc; (void)argv;
@@ -1837,8 +1885,13 @@ int main(int argc, char **argv) {
   // page, held by all GPU blocks, which write disjoint pages. Stage 1 is
   // the resident regime: the default cache holds everything. An explicit
   // --slots below that is a configuration for later stages, not this gate.
-  const u32 slots =
-      (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  u32 slots = (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  if (slots < kMinSlotsX) {
+    std::printf("  note: --slots %u is below the %u frames these kernels pin "
+                "at once; raising to %u\n",
+                slots, kMinSlotsX, kMinSlotsX);
+    slots = kMinSlotsX;
+  }
   // Which regime this configuration is IN: the cache either can hold every
   // page of the working set or it cannot. The gates below key off this
   // rather than assuming residency.
@@ -1950,7 +2003,8 @@ int main(int argc, char **argv) {
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
-  const u32 vslots = (a.vslots != 0) ? a.vslots : slots;
+  const u32 vslots =
+      AtLeastSlots((a.vslots != 0) ? a.vslots : slots, kMinSlotsX, "v");
   gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, vslots,
                        g.nelems);
   vx.EnableStats();
@@ -2106,7 +2160,8 @@ int main(int argc, char **argv) {
     // f gets its own cache size: the ballistic gate integrates a CONSTANT
     // acceleration, so it never exercises READING f under paging, and that
     // is the one path the resident gates cannot cover.
-    const u32 fslots = (a.fslots != 0) ? a.fslots : slots;
+    const u32 fslots =
+        AtLeastSlots((a.fslots != 0) ? a.fslots : slots, kMinSlotsF, "f");
     gv::Vector<float> vf("md_f", {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems);
     vf.EnableStats();
@@ -2121,7 +2176,8 @@ int main(int argc, char **argv) {
     // these, then the handles swap). Same geometry, resident.
     // The resort's destinations get their own cache size, so "the scatter
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
-    const u32 ppslots = (a.ppslots != 0) ? a.ppslots : slots;
+    const u32 ppslots =
+        AtLeastSlots((a.ppslots != 0) ? a.ppslots : slots, kMinSlotsX, "x2/v2");
     gv::Vector<float> vx2("md_x2", {0}, page_bytes, tbl_blocks, ppslots,
                           g.nelems);
     gv::Vector<float> vv2("md_v2", {0}, page_bytes, tbl_blocks, ppslots,
@@ -2183,7 +2239,8 @@ int main(int argc, char **argv) {
       return 1;
     }
     gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks,
-                       static_cast<u32>(nl_pages + 2), nl_elems);
+                       AtLeastSlots(static_cast<u32>(nl_pages + 2), kMinSlotsNl, "nl"),
+                       nl_elems);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
