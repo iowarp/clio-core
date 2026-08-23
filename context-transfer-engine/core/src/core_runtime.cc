@@ -2451,8 +2451,17 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Step 1: Check if blob exists
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
 
-    // If blob doesn't exist, error
+    // If blob doesn't exist, error -- unless the caller asked for it to be
+    // created. Context::create_on_get_ makes a first read of a never-written
+    // blob succeed with the caller's buffer untouched, so a pager does not
+    // have to tell "missing" apart from "read failed" itself.
     if (blob_info_ptr == nullptr) {
+      if (task->context_.create_on_get_) {
+        task->return_code_ =
+            (CreateNewBlob(blob_name, tag_id, 0.5f) != nullptr) ? 0 : 5;
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+        CLIO_CO_RETURN;
+      }
       task->return_code_ = 1;
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;

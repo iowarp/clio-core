@@ -1571,6 +1571,12 @@ struct Context {
   // ABI-skew hazard (two of these bit this tree already — see the
   // transform_flags_ note above and blob_transform.h). A build without
   // codecs simply carries zeroed fields.
+  // IN (GetBlob): create the blob's metadata if it does not exist, and
+  // return success with the caller's buffer untouched. Lets a reader treat a
+  // never-written page as empty without the caller having to distinguish
+  // "missing" from "read failed" itself.
+  bool create_on_get_;
+
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1607,6 +1613,7 @@ struct Context {
         replica_min_score_(-1.0f),
         origin_node_(kNoOriginNode),
         version_(0),
+        create_on_get_(false),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
