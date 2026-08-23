@@ -2,7 +2,7 @@
 # The paper's Nyx sweep: one dataset, every selection policy.
 #
 #   ./run_sweep.sh [--fields DIR] [--chunk B] [--max-files N] [--repeats N]
-#                  [--results DIR] [--configs "a b c"]
+#                  [--f64] [--results DIR] [--configs "a b c"]
 #
 # Replays the dumps from ./gen_fields.sh. Generate once, sweep many times:
 # every policy sees the IDENTICAL bytes, so unlike the LAMMPS sweep (whose GPU
@@ -23,13 +23,14 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 FIELDS=${FIELDS:-$HERE/fields}
-CHUNK=4194304 MAX_FILES=0 REPEATS=1 RESULTS="$HERE/results"
+CHUNK=4194304 MAX_FILES=0 REPEATS=1 RESULTS="$HERE/results" F64=""
 CONFIGS="dynamic dynamic-ratio learn explore best static-zstd static-zstd-s4 static-zstd-s8"
 while [ $# -gt 0 ]; do
   case "$1" in
     --fields) FIELDS=$2; shift 2;;
     --chunk) CHUNK=$2; shift 2;;
     --max-files) MAX_FILES=$2; shift 2;;
+    --f64) F64="--f64"; shift;;
     --repeats) REPEATS=$2; shift 2;;
     --results) RESULTS=$2; shift 2;;
     --configs) CONFIGS=$2; shift 2;;
@@ -41,7 +42,7 @@ done
 mkdir -p "$RESULTS"
 [ -d "$FIELDS" ] || { echo "no field dumps at $FIELDS -- run ./gen_fields.sh first" >&2; exit 1; }
 echo "Nyx paper sweep: fields=$FIELDS chunk=$CHUNK repeats=$REPEATS"
-echo "payload: $(du -sh "$FIELDS" | cut -f1) in $(find "$FIELDS" -name '*.f32' | wc -l) file(s)"
+echo "payload: $(du -sh "$FIELDS" | cut -f1) in $(find "$FIELDS" -name '*.f32' -o -name '*.f64' | wc -l) file(s)${F64:+  (float64)}"
 echo "configs: $CONFIGS"
 echo "results: $RESULTS"
 echo
@@ -53,7 +54,7 @@ for rep in $(seq 1 "$REPEATS"); do
     EXTRA=()
     [ "$MAX_FILES" -gt 0 ] && EXTRA=(--max-files "$MAX_FILES")
     "$HERE/run_config.sh" "$c" --fields "$FIELDS" --chunk "$CHUNK" \
-        --results "$RESULTS" --tag "$tag" "${EXTRA[@]+"${EXTRA[@]}"}" || { FAILED=$((FAILED+1)); echo "   ^ $tag FAILED"; }
+        --results "$RESULTS" --tag "$tag" $F64 "${EXTRA[@]+"${EXTRA[@]}"}" || { FAILED=$((FAILED+1)); echo "   ^ $tag FAILED"; }
     echo
   done
 done

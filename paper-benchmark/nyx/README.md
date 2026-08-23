@@ -105,14 +105,23 @@ All 252 blobs verified bit-exact in every configuration.
 | `dynamic` | 11.9× | 84.5 MiB | 11× | 6.5× | 7.6× | 20× | 21× | 30× | 287 | 77.2 s |
 | `learn` | 8.7× | 115.3 MiB | 6.4× | 5.3× | 4.6× | 25× | 25× | 24× | 190 | 106.8 s |
 
-### The shuffle stride is the headline, and it flips with the data type
+### The shuffle stride is the headline, and it flips with the element width
 
-| | LAMMPS (float64) | Nyx (float32) |
+Nyx can be built at either precision, so this is a **controlled** result:
+identical problem, identical code, identical timesteps — only `AMReX_PRECISION`
+changes. (`gen_fields.sh` with a double build and `NYX_DUMP_NATIVE=1` emits
+`.f64`; replay with `--f64`.)
+
+| fixed nvcomp-zstd | Nyx float32 (1,008 MiB) | Nyx float64 (2,016 MiB) |
 |---|---|---|
-| no shuffle | 1.124× | 79.1× |
-| **4-byte** shuffle | 1.159× | **156.1×** |
-| **8-byte** shuffle | **1.198×** | 135.1× |
-| best stride | 8 | 4 |
+| no shuffle | 79.1× | 94.3× |
+| **4-byte** shuffle | **156.1×** | 104.4× |
+| **8-byte** shuffle | 135.1× | **110.8×** |
+| best stride | **4** | **8** |
+
+The preference flips with the width, on the same physics. The cross-workload
+comparison points the same way — LAMMPS float64 prefers 8 (1.198× against
+1.159×) — but that one confounds data and width; this one does not.
 
 The stride has to match the element width, and getting it wrong costs more
 than any codec choice. NeuroPress encodes byte-shuffle as a **single bit**
@@ -155,8 +164,12 @@ codec, and the search is bounded by what the action space can express.
 
 - Lossless throughout: `error_bound_ = 0`, which masks the 16 quantize actions;
   every blob verified by digest against the bytes staged.
-- Element type is float32 (`Context::data_type_ = 1`), matching the dumps and
-  the model's training distribution.
+- Element type is float32 (`Context::data_type_ = 1`) by default, float64
+  (`= 2`) under `--f64`, matching the dumps either way.
+- The float64 control needs a second Nyx build (drop the two
+  `PRECISION=SINGLE` flags) and `NYX_DUMP_NATIVE=1` at dump time. Without that
+  environment variable the patch downcasts to float32 whatever the build, which
+  would make the control a silent duplicate of the baseline.
 - These ratios are much larger than a cosmology production run would show. The
   Sedov blast is a point explosion into uniform background, so early frames are
   nearly constant; upstream reports 141–369× on the same problem. It is chosen

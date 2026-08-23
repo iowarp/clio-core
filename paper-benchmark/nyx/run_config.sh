@@ -2,7 +2,12 @@
 # Run ONE named configuration of the Nyx paper benchmark.
 #
 #   ./run_config.sh <config> [--fields DIR] [--chunk B] [--max-files N]
-#                            [--no-verify] [--results DIR] [--tag NAME]
+#                            [--f64] [--no-verify] [--results DIR] [--tag NAME]
+#
+# --f64 replays .f64 dumps (a double Nyx build with NYX_DUMP_NATIVE=1) instead
+# of .f32. The element width is the point of that control: the byte shuffle has
+# to match it, so the same physics at both widths is what shows the stride
+# actually matters rather than the dataset happening to prefer one.
 #
 # Replays the field dumps gen_fields.sh produced. Configurations differ only in
 # how a codec is chosen per chunk -- identical to the LAMMPS benchmark's, so the
@@ -28,12 +33,13 @@ esac
 CONFIG=${1:-dynamic}; shift || true
 
 FIELDS=${FIELDS:-$HERE/fields}
-CHUNK=4194304 MAX_FILES=0 VERIFY=1 RESULTS="$HERE/results" TAG=""
+CHUNK=4194304 MAX_FILES=0 VERIFY=1 RESULTS="$HERE/results" TAG="" F64=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --fields) FIELDS=$2; shift 2;;
     --chunk) CHUNK=$2; shift 2;;
     --max-files) MAX_FILES=$2; shift 2;;
+    --f64) F64=1; shift;;
     --no-verify) VERIFY=0; shift;;
     --results) RESULTS=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
@@ -71,12 +77,15 @@ STORE=$RESULTS/$NAME
 rm -rf "$STORE"; mkdir -p "$STORE"
 bench_compose "$STORE"
 
-NFILES=$(find "$FIELDS" -name '*.f32' | wc -l)
+if [ "$F64" = 1 ]; then EXT=.f64; PREC=float64; else EXT=.f32; PREC=float32; fi
+NFILES=$(find "$FIELDS" -name "*$EXT" | wc -l)
+[ "$NFILES" -gt 0 ] || { echo "no *$EXT files under $FIELDS" >&2; exit 1; }
 PAYLOAD=$(du -sb "$FIELDS" | cut -f1)
-echo "== $NAME: $NFILES field file(s), $(awk -v p="$PAYLOAD" 'BEGIN{printf "%.1f", p/1048576}') MiB float32, chunk $CHUNK, port $PORT"
+echo "== $NAME: $NFILES field file(s), $(awk -v p="$PAYLOAD" 'BEGIN{printf "%.1f", p/1048576}') MiB $PREC, chunk $CHUNK, port $PORT"
 
-ARGS=(--dir "$FIELDS" --ext .f32 --chunk "$CHUNK"
+ARGS=(--dir "$FIELDS" --ext "$EXT" --chunk "$CHUNK"
       --tag "nyx_$NAME" --report "$STORE/blobs.csv")
+[ "$F64" = 1 ] && ARGS+=(--f64)
 [ "$MAX_FILES" -gt 0 ] && ARGS+=(--max-files "$MAX_FILES")
 [ "$VERIFY" = 1 ]      && ARGS+=(--verify)
 
@@ -107,7 +116,7 @@ cat > "$STORE/meta.json" <<JSON
  "atoms":0,"steps":0,"gap":0,"frames":$(ls "$FIELDS" | grep -c '^plt' || echo 0),
  "chunk":$CHUNK,"files":$NFILES,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
  "verified":$VERIFY,"port":$PORT,
- "physics":{"problem":"sedov","precision":"float32"}}
+ "physics":{"problem":"sedov","precision":"$PREC"}}
 JSON
 grep -E "^stored|VERIFIED|FAILED:|  time:" "$STORE/stdout.log" | sed 's/^/   /' || true
 exit $RC
