@@ -204,7 +204,11 @@ struct Args {
   int gate = 1;            // stage 1: the ballistic gate IS the run
   int readprobe = 0;       // read-only paging probe (no writes at all)
   int md = 0;              // stage 2: real LJ forces + NVE, statics gates
-  double g[3] = {0.1, -0.05, 0.02};   // constant acceleration for the gate
+  // Constant acceleration for the ballistic gate. It COMPACTS the system:
+  // over a long run atoms pile up, bins overflow --cap and neighbour counts
+  // pass --maxneigh, so a 100+ step run needs it off. --gravity 0 does that
+  // and leaves plain NVE, which is what a long checkpointing run wants.
+  double g[3] = {0.1, -0.05, 0.02};
 };
 
 /** LAMMPS melt step-0 pair energy per atom (rho=0.8442 FCC, lj/cut 2.5,
@@ -1779,6 +1783,29 @@ static u32 AtLeastSlots(u32 want, u32 floor_slots, const char *what) {
   return floor_slots;
 }
 
+/**
+ * Frames for the neighbour-list cache.
+ *
+ * NOT nl_pages + 2. A Verlet row is islots*maxneigh ints -- 372 KB at lattice
+ * 50 -- so a fully resident list is hundreds of pages, and with one table per
+ * block that is multiplied by the block count: 699 pages x 512 KB x 16 blocks
+ * is 5.6 GB, which simply fails to allocate. The list is also STREAMED, one
+ * row at a time, so residency buys nothing.
+ *
+ * Size it to what the kernel pins, with a little headroom, and let it page.
+ */
+static u32 NlSlots(clio::run::u64 nl_pages) {
+  // MEASURED, not derived. kMaxNlGuards (4) and rowchunk (4) describe what a
+  // single row pins, but the force pass keeps far more of the list live than
+  // that product: at lattice 50 this fails at 48 frames and passes at 96.
+  // Until the true working set is pinned down, cap the list cache here --
+  // enough for the widest case measured, and bounded so it does not scale
+  // with the list (572 pages x 512 KB x 16 blocks would be 4.7 GB).
+  const u32 want = 128;
+  const u32 all = static_cast<u32>(nl_pages + 2);
+  return (all < want) ? AtLeastSlots(all, kMinSlotsNl, "nl") : want;
+}
+
 int main(int argc, char **argv) {
 #if !defined(GV_MD_CORO)
   (void)argc; (void)argv;
@@ -1805,6 +1832,10 @@ int main(int argc, char **argv) {
     else if (want("--fslots")) a.fslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--vslots")) a.vslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--steps")) a.steps = static_cast<u64>(atol(argv[++i]));
+    else if (want("--gravity")) {
+      const double gs = atof(argv[++i]);
+      a.g[0] = 0.1 * gs; a.g[1] = -0.05 * gs; a.g[2] = 0.02 * gs;
+    }
     else if (want("--rebin")) a.rebin = static_cast<u64>(atol(argv[++i]));
     else if (want("--temp")) a.temp = atof(argv[++i]);
     else if (want("--drift-tol")) a.drift_tol = atof(argv[++i]);
@@ -2239,8 +2270,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks,
-                       AtLeastSlots(static_cast<u32>(nl_pages + 2), kMinSlotsNl, "nl"),
-                       nl_elems);
+                       NlSlots(nl_pages), nl_elems);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
