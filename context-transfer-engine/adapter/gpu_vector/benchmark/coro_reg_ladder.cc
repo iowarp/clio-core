@@ -82,7 +82,7 @@ __global__ void R4_OneHold(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<float> dst,
                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(OneHoldCoro(dst));
@@ -108,7 +108,7 @@ __global__ void R5_Sentinel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> dst, u32 nblocks,
                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SentinelLikeCoro(dst, nblocks, yv.Block()));
@@ -132,7 +132,7 @@ __global__ void R6_FastOnly(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> dst,
                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(FastOnlyCoro(dst));
@@ -147,7 +147,7 @@ __global__ void R6_FastOnly(clio::run::IpcManagerGpuInfo info,
 __global__ void R7_NoCoroHold(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> dst) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   __syncthreads();
   const u64 epp = dst.ElemsPerPage();
   const u64 run = dst.TryHoldFast(0, epp, /*write=*/true);
@@ -183,7 +183,7 @@ __global__ void R8_SplitHold(clio::run::IpcManagerGpuInfo info,
                              gv::DeviceVector<float> dst, u32 nblocks,
                              gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SplitHoldCoro(dst, nblocks, yv.Block()));

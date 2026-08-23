@@ -91,7 +91,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<u32> v, u64 per,
                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SeedCoro(v, per, yv.Block()));
@@ -176,7 +176,7 @@ __global__ void SumComputeKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(

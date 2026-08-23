@@ -124,7 +124,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            u32 dims, u32 k, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SeedCoro(v, per, page_elems, dims, k, yv.Block()));
@@ -182,7 +182,7 @@ __global__ void AssignKernel(clio::run::IpcManagerGpuInfo info,
                              unsigned *counts, gy::YieldableView<> yv,
                              gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(AssignCoro(v, per, page_elems, dims, k, cent, sums, counts,

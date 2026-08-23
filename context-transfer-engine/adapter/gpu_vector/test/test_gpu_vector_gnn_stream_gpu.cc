@@ -116,7 +116,7 @@ __global__ void VecFillKernel(clio::run::IpcManagerGpuInfo info,
                               u64 elems_per_block, gy::YieldableView<> yv,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(VecFillCoro(v, src, elems_per_block, yv.Block()));
@@ -146,7 +146,7 @@ __global__ void VecDrainKernel(clio::run::IpcManagerGpuInfo info,
                                u64 elems_per_block, gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(VecDrainCoro(v, dst, elems_per_block, yv.Block()));

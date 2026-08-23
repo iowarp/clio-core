@@ -23,6 +23,9 @@ namespace clio::cte::gpu_vector {
 /** Eviction rank a freshly faulted page starts at. Higher means keep. */
 constexpr float kDefaultScore = 1.0f;
 
+/** table_ before Init binds it. */
+constexpr clio::run::u32 kUnbound = ~0u;
+
 /** Shared state, one per vector per GPU. */
 struct VecHeader {
   Page *pages_;              // nblocks_ * pages_per_block_
@@ -106,19 +109,40 @@ class DeviceVector {
  public:
   // ======================= 1. Public variables =======================
 
-  /** Page table this block uses; ~0u means blockIdx.x. */
-  clio::run::u32 block_override_ = ~0u;
+  // (none: a kernel drives the vector entirely through the functions below)
 
  private:
   // ======================= 2. Private variables ======================
 
   VecHeader *h_ = nullptr;
+  /** Which page table this block owns. Set by Init; kUnbound until then. */
+  clio::run::u32 table_ = kUnbound;
 
  public:
   // ======================= 3. Public functions =======================
 
   CTP_CROSS_FUN DeviceVector() = default;
   CTP_CROSS_FUN explicit DeviceVector(VecHeader *h) : h_(h) {}
+
+  /**
+   * Bind this block to a page table. CALL ONCE, AT THE TOP OF THE KERNEL,
+   * before any other verb.
+   *
+   * `block` is the LOGICAL block index -- yv.Block() under the yield driver,
+   * not blockIdx.x. The driver compacts the grid between rounds, so a
+   * coroutine resumes on a different CUDA block than it started on; binding
+   * to blockIdx.x makes the table move underneath a block mid-hold.
+   */
+  CTP_GPU_FUN void Init(clio::run::u32 block) {
+    if (block >= h_->nblocks_) {
+      if (threadIdx.x == 0) {
+        printf("[gpu_vector] FATAL Init(%u): only %u tables exist\n", block,
+               h_->nblocks_);
+      }
+      __trap();
+    }
+    table_ = block;
+  }
 
   CTP_GPU_FUN clio::run::u64 size() const { return h_->num_elems_; }
   CTP_GPU_FUN clio::run::u64 PageBytes() const { return h_->page_bytes_; }
@@ -243,8 +267,17 @@ class DeviceVector {
  private:
   // ======================= 4. Private functions ======================
 
+  /** This block's table. Unbound is a caller error, never blockIdx.x: that
+   *  fallback silently gave a block a different cache on every relaunch. */
   CTP_GPU_FUN clio::run::u32 Table() const {
-    return block_override_ == ~0u ? blockIdx.x : block_override_;
+    if (table_ == kUnbound) {
+      if (threadIdx.x == 0) {
+        printf("[gpu_vector] FATAL: vector used before Init(). Call "
+               "v.Init(yv.Block()) at the top of the kernel.\n");
+      }
+      __trap();
+    }
+    return table_;
   }
   CTP_GPU_FUN Page *Pages() const {
     return h_->pages_ + static_cast<size_t>(Table()) * h_->pages_per_block_;

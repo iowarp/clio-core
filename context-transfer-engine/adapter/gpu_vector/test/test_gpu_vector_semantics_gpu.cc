@@ -107,7 +107,7 @@ __global__ void WriteKernel(clio::run::IpcManagerGpuInfo info,
                             u32 salt, int flush, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WriteCoro(v, base, count, salt, flush, yv.Block()));
@@ -137,7 +137,7 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
                              u32 salt, unsigned long long *bad,
                              gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(VerifyCoro(v, base, count, salt, bad, yv.Block()));
@@ -165,7 +165,7 @@ __global__ void WalkKernel(clio::run::IpcManagerGpuInfo info,
                            u32 passes, unsigned long long *sink,
                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WalkCoro(v, first_page, npages, passes, sink));
@@ -193,7 +193,7 @@ __global__ void TouchSeqKernel(clio::run::IpcManagerGpuInfo info,
                                u32 n, unsigned long long *sink,
                                gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(TouchSeqCoro(v, pages, n, sink));
@@ -222,7 +222,7 @@ __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u32 n,
                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(EvictCoro(v, n));
@@ -243,6 +243,7 @@ __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v, u64 page, float score,
                               gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RescoreCoro(v, page, score));
@@ -258,6 +259,7 @@ __global__ void FlushKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<u32> v, u64 off, u64 count,
                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
   (void) off; (void) count;   // BeginFlush covers the block's whole table
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
@@ -300,7 +302,7 @@ __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(BatchFlushCoro(v, npages, salt, flushed));
@@ -320,6 +322,7 @@ __global__ void FlushAgainKernel(clio::run::IpcManagerGpuInfo info,
                                  unsigned long long *flushed,
                                  gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(FlushAgainCoro(v, flushed));
@@ -384,7 +387,7 @@ __global__ void BoundaryKernel(clio::run::IpcManagerGpuInfo info,
                                u32 reps, gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(BoundaryCoro(v, boundary_page, reps));
@@ -422,7 +425,7 @@ __global__ void MultiLaneReadKernel(clio::run::IpcManagerGpuInfo info,
                                     gy::YieldableView<> yv,
                                     gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MultiLaneReadCoro(v, count, salt, bad));
@@ -456,7 +459,7 @@ __global__ void MultiLaneWriteKernel(clio::run::IpcManagerGpuInfo info,
                                      u32 salt, gy::YieldableView<> yv,
                                      gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MultiLaneWriteCoro(v, count, salt, yv.Block()));
@@ -500,7 +503,7 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
                                    gy::YieldableView<> yv,
                                    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(PrefetchWalkCoro(v, count, salt, bad, yv.Block()));
@@ -524,6 +527,7 @@ __global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
                                    gy::YieldableView<> yv,
                                    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RescoreStormCoro(v, page, reps));

@@ -25,6 +25,7 @@ using clio::run::u64;
                        gv::DeviceVector<float> v, u64 arg, u64 *out,      \
                        gy::YieldableView<> yv, gy::YieldStackView ys) {   \
     CLIO_GPU_INIT(info, nullptr);                                         \
+    v.Init(yv.Block());                                                   \
     (void) arg;                                                           \
     (void) out;                                                           \
     gy::YieldTlsPublish(ys, yv.Y(), yv.Block());                          \

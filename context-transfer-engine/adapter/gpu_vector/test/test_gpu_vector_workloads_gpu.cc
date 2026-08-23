@@ -109,7 +109,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            clio::run::u64 per, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SeedCoro(v, per, yv.Block()));
@@ -163,7 +163,7 @@ __global__ void GrayScottKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GrayScottCoro(v, per, page_elems, yv.Block()));
@@ -205,7 +205,7 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
                               unsigned long long *sum, gy::YieldableView<> yv,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WeightsCoro(v, per, page_elems, sum, yv.Block()));
@@ -263,7 +263,7 @@ __global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(DirtyClaimCoro(v, per, page_elems, yv.Block()));

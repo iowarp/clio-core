@@ -111,7 +111,7 @@ __global__ void RaceSeedKernel(clio::run::IpcManagerGpuInfo info,
                                clio::run::u64 per, gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RaceSeedCoro(v, per, yv.Block()));
@@ -201,7 +201,7 @@ __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,
   // compacts the grid between rounds, so a coroutine resumes on a different
   // CUDA block than it started on; leaving block_override_ unset makes its
   // page table move underneath it mid-hold.
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RaceStressCoro(v, total_pages, iters, err, yv.Block()));

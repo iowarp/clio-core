@@ -118,7 +118,7 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
                            clio::run::u64 n, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(FillCoro(v, n));
@@ -146,7 +146,7 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
                             clio::run::u64 n, unsigned long long *bad,
                             gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(CheckCoro(v, n, bad));
@@ -192,7 +192,7 @@ __global__ void MultiFillKernel(clio::run::IpcManagerGpuInfo info,
                                 clio::run::u64 per, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MultiFillCoro(v, per, yv.Block()));
@@ -223,7 +223,7 @@ __global__ void MultiCheckKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MultiCheckCoro(v, per, bad, yv.Block()));

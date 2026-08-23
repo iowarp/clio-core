@@ -228,7 +228,7 @@ __global__ void GnnGatherKernel(clio::run::IpcManagerGpuInfo info,
                                 clio::run::u64 hi, float *scratch,
                                 gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GnnGatherCoro(v, lo, hi, scratch));

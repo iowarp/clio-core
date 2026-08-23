@@ -158,7 +158,7 @@ __global__ void StreamWriteKernel(clio::run::IpcManagerGpuInfo info,
                                   u32 zero_pct, gy::YieldableView<> yv,
                                   gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(StreamWriteCoro(v, pages_per_block, zero_pct, yv.Block()));
@@ -209,7 +209,7 @@ __global__ void StreamReadKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(StreamReadCoro(v, pages_per_block, depth, sum, yv.Block()));
@@ -259,7 +259,7 @@ __global__ void StreamReadBatchedKernel(clio::run::IpcManagerGpuInfo info,
                                         gy::YieldableView<> yv,
                                         gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(

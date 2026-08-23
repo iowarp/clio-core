@@ -117,7 +117,7 @@ __global__ void SeedWeightsKernel(clio::run::IpcManagerGpuInfo info,
                                   clio::run::u64 per, gy::YieldableView<> yv,
                                   gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SeedWeightsCoro(v, per, yv.Block()));
@@ -159,7 +159,7 @@ __global__ void WeightsDotKernel(clio::run::IpcManagerGpuInfo info,
                                  gy::YieldableView<> yv,
                                  gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WeightsDotCoro(v, per, sum, yv.Block()));
@@ -213,7 +213,7 @@ __global__ void WeightsDotBatchedKernel(
     clio::run::u64 per, clio::run::u32 chunk, unsigned long long *sum,
     gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WeightsDotBatchedCoro(v, per, chunk, sum, yv.Block()));

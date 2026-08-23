@@ -133,10 +133,10 @@ __global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> vo, u32 dim,
                               gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  ui.block_override_ = yv.Block();
-  vi.block_override_ = yv.Block();
-  uo.block_override_ = yv.Block();
-  vo.block_override_ = yv.Block();
+  ui.Init(yv.Block());
+  vi.Init(yv.Block());
+  uo.Init(yv.Block());
+  vo.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GrayScottHoldCoro(ui, vi, uo, vo, dim, yv.Block()));
@@ -187,10 +187,10 @@ __global__ void InitVec(clio::run::IpcManagerGpuInfo info,
                         u32 dim, gy::YieldableView<> yv,
                         gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  u.block_override_ = yv.Block();
-  v.block_override_ = yv.Block();
-  uo.block_override_ = yv.Block();
-  vo.block_override_ = yv.Block();
+  u.Init(yv.Block());
+  v.Init(yv.Block());
+  uo.Init(yv.Block());
+  vo.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(InitVecCoro(u, v, uo, vo, dim));
@@ -216,7 +216,7 @@ __global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
                          gv::DeviceVector<float> src, float *dst, u32 dim,
                          gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  src.block_override_ = yv.Block();
+  src.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(VecToRawCoro(src, dst, dim, yv.Block()));

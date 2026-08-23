@@ -218,7 +218,7 @@ __global__ void SeedKernelYield(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SeedLaneCoro(v, per, page_elems, flat_pct, yv.Block()));
@@ -272,7 +272,7 @@ __global__ void WeightsKernelYield(clio::run::IpcManagerGpuInfo info,
                                    gy::YieldableView<> yv,
                                    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WeightsLaneCoro(v, per, page_elems, sum, page_sum,

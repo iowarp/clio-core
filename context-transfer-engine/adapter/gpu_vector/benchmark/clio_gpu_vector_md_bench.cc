@@ -1453,7 +1453,7 @@ __global__ void ReadProbeKernel(clio::run::IpcManagerGpuInfo info,
                                 u32 nblocks, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
+  x.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ReadProbeCoro(x, passes, nblocks, yv.Block()));
@@ -1468,9 +1468,9 @@ __global__ void IntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = shared_tbl ? 0 : yv.Block();
-  v.block_override_ = shared_tbl ? 0 : yv.Block();
-  third.block_override_ = shared_tbl ? 0 : yv.Block();
+  x.Init(shared_tbl ? 0 : yv.Block());
+  v.Init(shared_tbl ? 0 : yv.Block());
+  third.Init(shared_tbl ? 0 : yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(IntegrateCoro(x, v, third, use_third, dt, gx, gy_, gz,
@@ -1483,8 +1483,8 @@ __global__ void ThermoKernel(clio::run::IpcManagerGpuInfo info,
                              u32 nblocks, gy::YieldableView<> yv,
                              gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  v.block_override_ = 0;
+  x.Init(0);
+  v.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ThermoCoro(x, v, out, nblocks, yv.Block()));
@@ -1497,8 +1497,8 @@ __global__ void ForceKernel(clio::run::IpcManagerGpuInfo info,
                             u32 nblocks, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  f.block_override_ = 0;
+  x.Init(0);
+  f.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ForceCoro(x, f, nb, cap, box, cutoff, eflag, acc, nblocks,
@@ -1514,8 +1514,8 @@ __global__ void BuildListKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  nl.block_override_ = 0;
+  x.Init(0);
+  nl.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(BuildListCoro(x, nl, nb, cap, box, rlist, maxneigh, d_cnt,
@@ -1532,9 +1532,9 @@ __global__ void ListForceKernel(clio::run::IpcManagerGpuInfo info,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  f.block_override_ = 0;
-  nl.block_override_ = 0;
+  x.Init(0);
+  f.Init(0);
+  nl.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
@@ -1548,7 +1548,7 @@ __global__ void RebinKernel(clio::run::IpcManagerGpuInfo info,
                             u32 nblocks, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
+  x.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(RebinCoro(x, nb, cap, box, bincnt, d_dest, d_err, nblocks,
@@ -1562,9 +1562,9 @@ __global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               const u32 *d_dest, int keep_w, u32 nblocks,
                               gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  src.block_override_ = 0;
-  srcx.block_override_ = 0;
-  dst.block_override_ = 0;
+  src.Init(0);
+  srcx.Init(0);
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GatherCoro(src, srcx, dst, nb, cap, d_dest, keep_w,
@@ -1575,7 +1575,7 @@ __global__ void SentinelKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> dst, u32 nblocks,
                                gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  dst.block_override_ = 0;
+  dst.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SentinelCoro(dst, nblocks, yv.Block()));
@@ -1589,9 +1589,9 @@ __global__ void MDIntegrateKernel(clio::run::IpcManagerGpuInfo info,
                                   gy::YieldableView<> yv,
                                   gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  v.block_override_ = 0;
-  f.block_override_ = 0;
+  x.Init(0);
+  v.Init(0);
+  f.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(MDIntegrateCoro(x, v, f, dt, drift, nblocks, yv.Block()));
@@ -1603,8 +1603,8 @@ __global__ void FlushAllKernel(clio::run::IpcManagerGpuInfo info,
                                gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.block_override_ = 0;
-  v.block_override_ = 0;
+  x.Init(0);
+  v.Init(0);
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(FlushAllCoro(x, v, nblocks, yv.Block()));

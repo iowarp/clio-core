@@ -201,7 +201,7 @@ __global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
                            u64 ny, u64 nz, u64 zper, u64 ubase, u64 vbase,
                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  vec.block_override_ = yv.Block();
+  vec.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   const u64 z0 = static_cast<u64>(yv.Block()) * zper;
@@ -334,7 +334,7 @@ __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
                            float K, float dt, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  vec.block_override_ = yv.Block();
+  vec.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   const u64 z0 = static_cast<u64>(yv.Block()) * zper;
@@ -362,7 +362,7 @@ __global__ void SumKernel(clio::run::IpcManagerGpuInfo info,
                           u64 zper, u64 vbase, double *out,
                           gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  vec.block_override_ = yv.Block();
+  vec.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   const u64 z0 = static_cast<u64>(yv.Block()) * zper;

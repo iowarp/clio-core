@@ -123,7 +123,7 @@ __global__ void WarmKernel(clio::run::IpcManagerGpuInfo info,
                            u64 pages_per_region, gy::YieldableView<> yv,
                            gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WarmCoro(v, iters, pages_per_region, yv.Block()));
@@ -209,7 +209,7 @@ __global__ void SpinWriteFlushKernel(clio::run::IpcManagerGpuInfo info,
   const long long t0 = clock64();
   CLIO_GPU_INIT(info, nullptr);
   const long long t1 = clock64();
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   const long long t2 = clock64();
@@ -319,7 +319,7 @@ __global__ void SpinReadPrefetchKernel(clio::run::IpcManagerGpuInfo info,
                                        u32 *bad_got, gy::YieldableView<> yv,
                                        gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  v.block_override_ = yv.Block();
+  v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(SpinReadPrefetchCoro(v, iters, pages_per_region, spin_us,
