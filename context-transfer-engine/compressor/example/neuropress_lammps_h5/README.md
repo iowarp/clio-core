@@ -22,6 +22,11 @@ calls `gpucompress_*` directly:
 
 Everything Clio needs arrives through the environment.
 
+(For the other direction -- LAMMPS linked *into* a program as `liblammps`,
+with Clio's client called directly and no HDF5 in the path -- see
+`../neuropress_lammps_lib`, which also documents where in the timestep the
+atom arrays are complete and when each hand-over point fires.)
+
 ## Building LAMMPS
 
 Nothing here is Clio-specific; it is a normal LAMMPS build that happens to

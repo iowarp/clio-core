@@ -140,4 +140,12 @@ if(CLIO_CORE_ENABLE_CUDA)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_grayscott_h5/CMakeLists.txt)
     add_subdirectory(neuropress_grayscott_h5)
   endif()
+
+  # LAMMPS linked IN as a library, Clio's runtime hosted in the same process,
+  # the driver reading Atom::x/v/f between `run` segments -- the coupling-code
+  # shape, with no HDF5 and no LAMMPS patch. Its own CMakeLists skips itself
+  # when no LAMMPS build is found (LAMMPS_SRC_DIR / LAMMPS_BUILD_DIR).
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_lammps_lib/CMakeLists.txt)
+    add_subdirectory(neuropress_lammps_lib)
+  endif()
 endif()

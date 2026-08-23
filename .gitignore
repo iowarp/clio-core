@@ -130,6 +130,12 @@ context-transfer-engine/compressor/example/*
 # binary links nothing from Clio. Scripts and an input deck only -- CMake
 # builds nothing here, the harness drives a prebuilt LAMMPS.
 !context-transfer-engine/compressor/example/neuropress_lammps_h5/
+# And for the LAMMPS-as-a-library example: the third shape (liblammps linked
+# in, Clio hosted in the same process, no HDF5). Its CMakeLists skips itself
+# when no LAMMPS build is found, so a checkout without one still configures.
+# The store directories its scripts write are run output, not source.
+!context-transfer-engine/compressor/example/neuropress_lammps_lib/
+context-transfer-engine/compressor/example/neuropress_lammps_lib/store*/
 
 # NeuroPress differential parity harnesses (issue #693). Same reasoning as the
 # example directories above: they compile a second project's CUDA sources from
