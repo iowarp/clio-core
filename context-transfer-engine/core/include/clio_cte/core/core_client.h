@@ -1979,8 +1979,17 @@ class Client : public clio::run::ContainerClient {
     // Replica-targeted reads (issue #886, context.replica_ != 0) must also
     // reach the runtime: the SHM mirror publishes the PRIMARY's block layout
     // only, so serving them here would silently return primary bytes.
+    // A CODEC MUST REACH THE RUNTIME. This path serves the blob straight out
+    // of the SHM mirror, which holds the bytes AS STORED -- it applies no
+    // transform. A get that asked for decompression and took this route got
+    // compressed bytes back and a return code of 0, and only for blobs the
+    // codec had actually shrunk, so incompressible data still looked correct.
+    // Symptom: gv::Vector reads were bit-exact with codec=NONE and corrupt
+    // with zstd, identically at every page size. Device-destination gets never
+    // hit it because TryReadBlobShm refuses device pointers, which is why the
+    // in-kernel path looked fine and only host-side reads were wrong.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        context.replica_ != 0 || ForceNetEnv()) {
+        context.replica_ != 0 || context.compress_lib_ != 0 || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {

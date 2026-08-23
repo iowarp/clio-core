@@ -45,8 +45,9 @@ namespace gy = clio::run::gpu;
  * Run a yieldable kernel to completion: re-launch until no block is still
  * suspended, with a continuation stack backing the blocks' saved state.
  */
-template <typename LaunchT>
-static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+template <typename LaunchT, typename ServiceT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch,
+                                   ServiceT &&svc) {
   gy::Yieldable<> drv(nblocks, 32);
   // 8192, not the macro-era 256: coroutine frames are compiler-laid-out and
   // spill into the lane, overflowing anything page-thin.
@@ -55,7 +56,12 @@ static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      [] {}, /*max_rounds=*/200000);
+      svc, /*max_rounds=*/200000);
+}
+
+template <typename LaunchT>
+static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  return RunYieldable(nblocks, std::forward<LaunchT>(launch), [] {});
 }
 
 namespace {
@@ -412,12 +418,16 @@ TEST_CASE("gpu_vector: a slot claim must not drop a DIRTY page",
   bool refused = false;
   std::string why;
   try {
+    // Returning false from the service callback stops the driver at the end
+    // of the round the failure was recorded in, instead of letting the parked
+    // block spin to the round cap.
     RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                               gy::YieldStackView sv) {
       DirtyClaimKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gi, vec.GetDevice(0),
                                                         per, kPageElems, vw, sv);
-    });
+    }, [&] { return vec.Ok(); });
     ctp::GpuApi::Synchronize();
+    vec.ThrowIfFailed();
   } catch (const std::exception &e) {
     refused = true;
     why = e.what();

@@ -170,10 +170,20 @@ together.
 6.  Submit                                     [tid 0]
 7.  __syncthreads()
 8.  co_await completion                        [unpredicated, whole block]
-9.  Publish page_num, mark RESIDENT
+9.  Zero the frame if the get failed (first touch), then publish page_num
 10. Re-probe. Resident by contract; otherwise trap.
 11. Pin, return.
 ```
+
+**Step 9's zero-fill is not optional.** A page that has never been written has
+no blob, so its get returns non-zero. Leaving the frame alone would serve the
+previous tenant's bytes as this page, silently. Empty *is* the content of a
+first touch.
+
+The CTE cannot distinguish "no blob yet" from "the read failed", so the two
+are counted apart rather than folded together: a discarded send bumps
+`get_errors` (a real bug), a non-zero return code bumps `empty_fills` (almost
+always a first touch). Folding them would hide either one inside the other.
 
 **Step 2 votes the outcome, not each thread's own probe.** On a shared table
 another block's eviction can flip a slot between two threads' reads; returning
@@ -239,8 +249,18 @@ must fail loudly; advisory may not and fails silently.
 3. Skip pinned, dirty, fetching, flushing. What remains is the candidate set.
 4. Take `FREE` frames first, then candidates in victim order.
 5. Fewer than `min` and a flush is in flight → `co_await` it, then retry.
-6. Still fewer than `min` → **fail loudly**: print which state blocked it
-   (dirty / pinned / flushing / fetching, with the offending slots) and trap.
+6. Still fewer than `min` → **fail loudly, to the host**. The block records
+   the reason in a pinned-memory `FaultFail` record (page, table, and the
+   dirty/pinned/flushing/fetching counts) and parks. The driver's service
+   callback returns false, which stops the run at the end of that round;
+   `Vector::ThrowIfFailed()` then turns the record into an exception naming
+   the blocking state.
+
+   **Not `__trap()`.** A trap is loud but useless: it kills the CUDA context,
+   so the host aborts inside its next `Synchronize` and the caller never
+   learns which page or which state blocked it. A caller cannot act on a dead
+   context, and "flush before the dirty set fills the table" is exactly the
+   kind of error a caller *can* act on.
 
 Step 5 is not a policy violation of principle 4. The only put that can be in
 flight is one the caller started with `BeginFlush`; waiting on it is observing

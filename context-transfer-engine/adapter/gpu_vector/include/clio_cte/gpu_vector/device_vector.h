@@ -46,30 +46,6 @@ namespace clio::cte::gpu_vector {
  * volatile accesses with a system fence are sufficient -- no atomics, which
  * this GPU cannot do on host memory anyway.
  */
-/** Mailbox slots, i.e. the largest grid this vector can serve faults for.
- *  One slot per CUDA block; 16 bytes each, so this is 64 KB of pinned host
- *  memory. Exceeding it is checked at launch rather than silently aliased. */
-static constexpr clio::run::u32 kMaxFaultSlots = 4096;
-
-struct FaultReq {
-  /** Page the block is waiting for. */
-  clio::run::u64 page_num;
-  /**
-   * Which page TABLE to place it in -- not necessarily the requester's own
-   * index. A kernel may rebind `block_override_` per page (page->table
-   * affinity, as the MoE pattern does), so the table is a property of the
-   * REQUEST while the mailbox slot is a property of the REQUESTER. Indexing
-   * the mailbox by table instead let two blocks aiming at one table overwrite
-   * each other's request: one was served, the other resumed to a page that was
-   * never fetched, and tripped the "served but not resident" trap.
-   */
-  clio::run::u32 table;
-  /** Nonzero when the hold declared write intent. */
-  clio::run::u32 write;
-  /** 1 = the device needs this served; 0 = resident, resume. The wait tag a
-   *  parked block publishes is the address of THIS field. */
-  clio::run::u32 pending;
-};
 
 /**
  * Everything about a vector that is the SAME for every thread, kept in
@@ -87,6 +63,19 @@ struct FaultReq {
  * submit-only fields and the statistics counters are touched on a fault,
  * which already costs a round trip. So they cost nothing behind a pointer.
  */
+/** A fault that could not be served; see VecHeader::fail_. */
+struct FaultFail {
+  clio::run::u64 page;     // the page nobody could make room for
+  clio::run::u32 block;    // which page table
+  clio::run::u32 ways;     // candidates considered
+  clio::run::u32 dirty;    // ... and why each was unusable
+  clio::run::u32 pinned;
+  clio::run::u32 flushing;
+  clio::run::u32 fetching;
+  /** 1 = a block is parked on this. The host clears nothing; it aborts. */
+  clio::run::u32 pending;
+};
+
 struct VecHeader {
   // ---- layout, filled in by the host ---------------------------------
   clio::cte::core::TagId tag_id_;
@@ -138,9 +127,6 @@ struct VecHeader {
    * so ids must be distinct in the fields that actually vary.
    */
   unsigned long long *task_seq_ = nullptr;
-  /** Per-block fault mailbox, `nblocks_` entries in pinned host memory.
-   *  Null when the vector is driven by the legacy in-kernel fault path. */
-  FaultReq *faults_ = nullptr;
   /**
    * Optional instrumentation, null unless Vector::EnableStats() is called.
    *
@@ -232,6 +218,22 @@ struct VecHeader {
    *  on the floor. With no spill tier configured, 14 of 16 MB vanished this
    *  way and the run still reported success until the checksum disagreed. */
   unsigned long long *stat_put_errors_ = nullptr;
+  /** Frames zero-filled because the get returned non-zero -- usually a first
+   *  touch, where the page has no blob yet and empty IS its content. Kept
+   *  apart from stat_get_errors_ because the CTE cannot tell that from a read
+   *  failure, and folding them together would hide one inside the other. */
+  unsigned long long *stat_empty_fills_ = nullptr;
+  /**
+   * Where a block reports a fault it CANNOT serve, in pinned host memory.
+   *
+   * A device trap would be loud but useless: it kills the CUDA context, so the
+   * host aborts inside its next Synchronize and the caller never learns which
+   * page or which state blocked it. A caller cannot act on a dead context.
+   * The block records the reason here and parks; the host's service callback
+   * returns false, the driver stops, and Vector::ThrowIfFailed turns it into
+   * an exception naming the blocking state.
+   */
+  FaultFail *fail_ = nullptr;
   unsigned long long *stat_pf_dropped_ = nullptr;  // async hints dropped
   /** CLIO_GV_TRACE_PUT_ERRORS: device-print each failed writeback's page and
    *  return code. Off by default; a failed put is otherwise only a counter. */
@@ -349,6 +351,27 @@ class Held {
   CTP_GPU_FUN T *begin() const { return data_; }
   CTP_GPU_FUN T *end() const { return data_ + run_; }
   CTP_GPU_FUN T *ptr() const { return data_; }
+
+  /**
+   * Set this frame's eviction rank. HIGHER MEANS KEEP -- the victim scan takes
+   * the lowest. State the direction: the CTE blob score runs the other way in
+   * the DPE's preferred group, and conflating the two has cost data before.
+   *
+   * This is the whole of rescoring, and deliberately not a task, not
+   * asynchronous, and not a co_await: the page is already pinned by this
+   * guard, so the rank is one store to a frame nobody can take away.
+   *
+   * The rank is CACHE-LOCAL and dies with the frame. Evict the page and it is
+   * gone; fault it back and it returns to kDefaultEvictRank. It is a hint
+   * about this residency, not durable metadata about the page -- and it never
+   * touches the blob's CTE score.
+   *
+   * A store, so it is predicated. No barrier: nothing in the block reads it
+   * back, only eviction does.
+   */
+  CTP_GPU_FUN void RescorePage(float rank) const {
+    if (page_ != nullptr && threadIdx.x == 0) page_->score = rank;
+  }
 
   /** Diagnostic: the page this guard's SLOT currently holds. A guard whose
    *  slot does not hold the page the caller asked for is reading a frame
@@ -1075,6 +1098,7 @@ class DeviceVector {
    *  error (unflushed writes), a leaked guard (a pin held too long) and
    *  in-flight I/O, which are three unrelated bugs. */
   CTP_GPU_FUN void ReportClaimFailure(clio::run::u64 pn) {
+    if (h_->fail_ == nullptr || h_->fail_->pending != 0u) return;   // once
     Page *tbl = BlockPages();
     const clio::run::u32 nways = Ways();
     clio::run::u32 nd = 0, np = 0, nfl = 0, nfe = 0;
@@ -1085,12 +1109,17 @@ class DeviceVector {
       if (c.flushing) ++nfl;
       if (c.fetching) ++nfe;
     }
-    printf("[gpu_vector] FATAL blk=%u page=%llu: no usable frame in %u ways "
-           "(dirty=%u pinned=%u flushing=%u fetching=%u)\n"
-           "  dirty: the vector never writes back on its own -- flush before "
-           "the dirty set fills the table\n"
-           "  pinned: a Held guard outlived the hold that needed it\n",
-           BlockIndex(), (unsigned long long) pn, nways, nd, np, nfl, nfe);
+    volatile FaultFail *f = h_->fail_;
+    f->page = pn;
+    f->block = BlockIndex();
+    f->ways = nways;
+    f->dirty = nd;
+    f->pinned = np;
+    f->flushing = nfl;
+    f->fetching = nfe;
+    __threadfence_system();       // the reason is readable before the flag
+    f->pending = 1u;
+    __threadfence_system();
   }
 
   /** EvictPages' body, for callers that already hold the block lock. */
@@ -1717,34 +1746,41 @@ class DeviceVector {
       // writeback-on-evict (a dirty frame is never a candidate).
       const clio::run::u64 pn = PageOf(off);
       Page *tbl = BlockPages();
-      // Thread 0 claims; the block needs the answer. __shared__ is safe HERE
-      // and only here -- the broadcast happens before any suspension, and each
-      // thread copies it into a coroutine-frame local, which does survive a
-      // park. (A __shared__ value read AFTER a co_await would be garbage: the
-      // yield driver exits the kernel.)
-      __shared__ clio::run::u32 s_slot;
-      if (threadIdx.x == 0) {
-        Page *p = ClaimFrameForPage(pn);
-        if (p != nullptr && p->page_num != pn) {
-          p->fetching = 1u;      // promises the frame to this transfer
-          __threadfence();
-          PrepareGet(p, pn);
-          Bump(h_->stat_faults_);
-          p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
-              SlotPtr(p->get));
-          // An empty future means the send was DISCARDED. Waiting on it
-          // returns at once and the stale return code reads 0, so the frame's
-          // previous page would be served as this one -- silently.
-          if (p->get_fut.IsNull()) Bump(h_->stat_get_errors_);
+      clio::run::u32 slot = 0;
+      // Retry loop, not a spin: a block that cannot claim a frame records why
+      // and parks. The host aborts the run; if it chose not to, we re-try on
+      // resume rather than proceeding on a frame we never got.
+      for (;;) {
+        // Thread 0 claims; the block needs the answer. __shared__ is safe HERE
+        // and only here -- the broadcast happens before any suspension, and
+        // each thread copies it into a coroutine-frame local, which does
+        // survive a park. A __shared__ value read AFTER a co_await would be
+        // garbage: the yield driver exits the kernel.
+        __shared__ clio::run::u32 s_slot;
+        if (threadIdx.x == 0) {
+          Page *p = ClaimFrameForPage(pn);
+          if (p != nullptr && p->page_num != pn) {
+            p->fetching = 1u;      // promises the frame to this transfer
+            __threadfence();
+            PrepareGet(p, pn);
+            Bump(h_->stat_faults_);
+            p->get_fut = clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(
+                SlotPtr(p->get));
+            // An empty future means the send was DISCARDED. Waiting on it
+            // returns at once and the stale return code reads 0, so the
+            // frame's previous page would be served as this one -- silently.
+            if (p->get_fut.IsNull()) Bump(h_->stat_get_errors_);
+          }
+          s_slot = (p == nullptr) ? h_->pages_per_block_
+                                  : (clio::run::u32) (p - tbl);
         }
-        s_slot = (p == nullptr) ? h_->pages_per_block_
-                                : (clio::run::u32) (p - tbl);
-      }
-      __syncthreads();
-      const clio::run::u32 slot = s_slot;   // -> coroutine frame, survives park
-      if (slot >= h_->pages_per_block_) {
+        __syncthreads();
+        slot = s_slot;             // -> coroutine frame, survives a park
+        if (slot < h_->pages_per_block_) break;
         if (threadIdx.x == 0) ReportClaimFailure(pn);
-        __trap();
+        __syncthreads();
+        co_await clio::run::gpu::YCoroSuspend{
+            reinterpret_cast<clio::run::u64>(&h_->fail_->pending)};
       }
       // Park until the get lands. The tag names the completion word, but the
       // driver is free to relaunch without consulting it (3-arg
@@ -1754,12 +1790,23 @@ class DeviceVector {
         co_await clio::run::gpu::YCoroSuspend{reinterpret_cast<clio::run::u64>(
             &tbl[slot].get->fut_.is_complete_.x)};
       }
-      if (threadIdx.x == 0) {
-        Page *p = &tbl[slot];
-        if (p->page_num != pn) {
-          // CHECK IT. A failed get leaves the frame holding whatever it held
-          // before, and the caller reads that as the page it asked for.
-          if (p->get->GetReturnCode() != 0) Bump(h_->stat_get_errors_);
+      Page *p = &tbl[slot];
+      if (p->page_num != pn) {
+        // A failed get means the page has no blob yet -- a FIRST TOUCH, where
+        // empty IS the content. Leaving the frame alone would serve the
+        // previous tenant's bytes as this page, silently. The block-uniform
+        // reads below make this branch block-uniform too.
+        const bool discarded = p->get_fut.IsNull();
+        if (discarded || p->get->GetReturnCode() != 0) {
+          ZeroFrame(p);
+          if (threadIdx.x == 0) {
+            // A discarded send is a real bug; a non-zero rc is almost always
+            // a first touch. Counted apart so neither hides in the other.
+            Bump(discarded ? h_->stat_get_errors_ : h_->stat_empty_fills_);
+          }
+        }
+        __syncthreads();          // frame filled before page_num is published
+        if (threadIdx.x == 0) {
           p->dirty = 0u;
           p->score = kDefaultEvictRank;
           p->last_access = 0;
@@ -2340,12 +2387,6 @@ class DeviceVector {
     }
   }
 
-  /** This block's mailbox slot: the REQUESTER's identity, which is the CUDA
-   *  block, never the table it happens to be aiming at. */
-  CTP_GPU_FUN clio::run::u32 FaultSlot() const {
-    return blockIdx.x < kMaxFaultSlots ? blockIdx.x : 0u;
-  }
-
   CTP_GPU_FUN clio::run::u32 BlockIndex() const {
     // CACHED. The modulo is the point: a GPU has no integer divide, so
     // `raw % nblocks_` is a software sequence, and this accessor is reached
@@ -2786,6 +2827,13 @@ class DeviceVector {
   CTP_GPU_FUN bool GetDone(const Page *p) const {
     if (p->get_fut.IsNull()) return true;   // discarded send: do not hang
     return (p->get->fut_.is_complete_.load() & 1u) != 0u;
+  }
+
+  /** Block-collective zero of a frame: a first touch's content. */
+  CTP_GPU_FUN void ZeroFrame(Page *p) const {
+    auto *w = static_cast<unsigned int *>(p->data);
+    const clio::run::u64 n = h_->page_bytes_ / sizeof(unsigned int);
+    for (clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) w[i] = 0u;
   }
 
   /** Fault `page_num` into `p` with a SYNCHRONOUS get. */

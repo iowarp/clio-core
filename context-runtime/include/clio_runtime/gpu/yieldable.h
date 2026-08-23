@@ -220,22 +220,6 @@ namespace clio::run::gpu {
  *         },
  *         [&]() { ServiceWhateverTheBlocksAreWaitingFor(); });
  */
-/**
- * Hook the yield driver calls between rounds, while no kernel is resident.
- *
- * A parked block is waiting for something only the host can supply. Whoever
- * supplies it registers here, and the driver calls it every round -- so a
- * caller cannot forget to service faults and silently spin to the round cap.
- * That is not hypothetical: every gpu_vector test except one forgot, and the
- * suite reported 100% passing off stale binaries.
- *
- * Null by default; nothing in this header knows what a page is.
- */
-inline void (*&YieldServiceHook())() {
-  static void (*hook)() = nullptr;
-  return hook;
-}
-
 template <typename StateT = YieldNoState>
 class Yieldable {
  public:
@@ -458,7 +442,6 @@ class Yieldable {
       } else {
         service();
       }
-      if (YieldServiceHook() != nullptr) YieldServiceHook()();
     }
     if (num_pending_ == 0) {
       ++rounds;  // count the round that finished the last block
@@ -517,7 +500,6 @@ class Yieldable {
         break;
       }
       service();
-      if (YieldServiceHook() != nullptr) YieldServiceHook()();
     }
     if (num_pending_ == 0) {
       ++rounds;

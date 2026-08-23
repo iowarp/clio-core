@@ -52,11 +52,10 @@ static clio::run::u32 RunYieldable(unsigned nblocks, VecT &vec,
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      // SERVICE THE FAULTS. A kernel records the page it needs and parks; this
-      // runs between rounds, while no kernel is resident, and makes the page
-      // resident before the next launch. Without it nothing ever clears a
-      // fault and the run spins to the round cap.
-      [&] { vec.ServiceFaults(); }, /*max_rounds=*/200000);
+      // No service callback: the block resolves its own fault (design 5.1).
+      // The get it submits is completed by the runtime's CPU workers, not
+      // here. The round cap still matters -- see below.
+      [] {}, /*max_rounds=*/200000);
   // CONVERGENCE IS PART OF THE RESULT, not just the data. A servicer that
   // never makes progress still returns correct bytes for pages that happened
   // to be resident, so a data-only check can pass while livelocked -- observed
