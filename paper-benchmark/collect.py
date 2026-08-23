@@ -160,15 +160,27 @@ def main():
     # aggregator is shared, and a Nyx sweep described as "LJ melt ... float64"
     # is worse than no description at all.
     wl = a.get("workload", "lammps-ljmelt")
-    prec = (a.get("physics_precision") or
-            ("float32" if wl.startswith("nyx") else "float64"))
-    if wl.startswith("nyx"):
-        title = "Nyx paper benchmark"
-        what = (f"Nyx Sedov blast, {a['files']} field file(s), "
-                f"{a['frames']} frames")
-    else:
-        title = "LAMMPS paper benchmark"
-        what = f"LJ melt, {a['atoms']:,} atoms, {a['frames']} frames"
+    prec = a.get("physics_precision") or "float64"
+    # A table, not an if/else chain. The previous version defaulted anything it
+    # did not recognise to "LAMMPS ... LJ melt ... 0 atoms", so the first VPIC
+    # sweep was published under the wrong workload's name. Unknown workloads
+    # now describe themselves from meta.json instead of borrowing a label.
+    WORKLOADS = {
+        "lammps-ljmelt": ("LAMMPS paper benchmark",
+                          lambda r: f"LJ melt, {r['atoms']:,} atoms, "
+                                    f"{r['frames']} frames"),
+        "nyx-sedov": ("Nyx paper benchmark",
+                      lambda r: f"Nyx Sedov blast, {r['files']} field file(s), "
+                                f"{r['frames']} frames"),
+        "vpic-weibel": ("VPIC paper benchmark",
+                        lambda r: f"VPIC Weibel instability, {r['files']} "
+                                  f"field file(s), {r['frames']} frames"),
+    }
+    title, describe = WORKLOADS.get(
+        wl, (f"{wl} benchmark",
+             lambda r: f"{wl}, {r['files'] or r['chunks']} unit(s), "
+                       f"{r['frames']} frames"))
+    what = describe(a)
     lines = [f"# {title}", ""]
     lines += [
         f"Workload: {what}, "
