@@ -281,7 +281,8 @@ clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      [] {}, /*max_rounds=*/2000000);
+      [] {}, /*max_rounds=*/2000000,
+      gv::ResumeWhenComplete);
 }
 
 double NowMs() {

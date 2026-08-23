@@ -406,7 +406,8 @@ class YieldRunner {
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           launch(g, b, view, stack_.View());
         },
-        [] {}, /*max_rounds=*/2000000);
+        [] {}, /*max_rounds=*/2000000,
+      gv::ResumeWhenComplete);
   }
 
  private:

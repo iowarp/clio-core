@@ -55,7 +55,8 @@ static clio::run::u32 RunYieldable(unsigned nblocks, VecT &vec,
       // No service callback: the block resolves its own fault (design 5.1).
       // The get it submits is completed by the runtime's CPU workers, not
       // here. The round cap still matters -- see below.
-      [] {}, /*max_rounds=*/200000);
+      [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
   // CONVERGENCE IS PART OF THE RESULT, not just the data. A servicer that
   // never makes progress still returns correct bytes for pages that happened
   // to be resident, so a data-only check can pass while livelocked -- observed

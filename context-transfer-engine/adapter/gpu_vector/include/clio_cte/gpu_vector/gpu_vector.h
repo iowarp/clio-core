@@ -27,6 +27,31 @@
 
 namespace clio::cte::gpu_vector {
 
+/**
+ * Resume a parked block ONLY when the completion word its wait tag names has
+ * flipped.
+ *
+ * Pass this as RunToCompletion's resume_when. Without it the driver relaunches
+ * every parked block every round, which polls a fault by kernel launch: the
+ * block wakes, sees its transfer has not landed, and parks again. With it the
+ * host reads the completion word and holds the block back until the task is
+ * actually done -- one relaunch per fault.
+ *
+ * A wait tag of 0 means "no condition", so those blocks always resume.
+ */
+inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
+#if CTP_ENABLE_CUDA
+  if (tag == 0) return true;
+  unsigned int done = 0;
+  ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
+                      reinterpret_cast<const char *>(tag), sizeof(done));
+  return (done & 1u) != 0u;
+#else
+  (void) tag;
+  return true;
+#endif
+}
+
 // The host class is HOST-ONLY. Its body calls host-only client methods
 // (AsyncGetOrCreateTag), and those are non-dependent names, so the device
 // pass would fail to parse them even though it never instantiates the class.

@@ -50,7 +50,8 @@ static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      [] {}, /*max_rounds=*/200000);
+      [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
 }
 using clio::run::u32;
 using clio::run::u64;

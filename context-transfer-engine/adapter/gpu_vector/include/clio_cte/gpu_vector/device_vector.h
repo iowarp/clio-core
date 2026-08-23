@@ -361,13 +361,21 @@ class DeviceVector {
    */
   __device__ clio::run::gpu::YCoroTask EvictPages(clio::run::u32 min,
                                                   clio::run::u32 max) {
-    // The reap slot is load-bearing. Without it this deadlocks: FreeSome
-    // returns false while a flush is in flight, but flush_busy is only
-    // cleared by EndFlush -- which the caller cannot reach, because it is
-    // suspended here. Retire the landed flush ourselves and retry.
-    CLIO_CO_YIELD_WHEN(
-        if (FlushBusy() && FlushDone()) RetireFlush();,
-        (threadIdx.x == 0) ? !FreeSome(min, max) : false, FlushTag());
+    // Try, await the outstanding flush, try once more, error. No loop, no
+    // spin: EndFlush is the only thing that can change the answer, and it
+    // can only land once.
+    __shared__ unsigned int s_ok;
+    if (threadIdx.x == 0) s_ok = FreeSome(min, max) ? 1u : 0u;
+    __syncthreads();
+    if (s_ok == 0u) {
+      co_await EndFlush();
+      if (threadIdx.x == 0) s_ok = FreeSome(min, max) ? 1u : 0u;
+      __syncthreads();
+      if (s_ok == 0u) {
+        if (threadIdx.x == 0) ReportStuck(min);
+        __trap();
+      }
+    }
     co_return;
   }
 
@@ -394,14 +402,7 @@ class DeviceVector {
       Release(victim);
       ++freed;
     }
-    if (freed >= min) return true;
-    // Nothing evictable. If this block has a flush in flight, waiting for it
-    // is progress; otherwise the caller is asking for more pages at once than
-    // its table holds, and no amount of waiting fixes that.
-    if (FlushBusy()) return false;
-    ReportStuck(min);
-    __trap();
-    return false;
+    return freed >= min;
   }
 
   /** Say what is holding the table before the trap. */

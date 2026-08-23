@@ -56,7 +56,8 @@ static clio::run::u32 RunYieldable(unsigned nblocks, LaunchT &&launch,
       [&](dim3 g, dim3 b, gy::YieldableView<> view) {
         launch(g, b, view, stack.View());
       },
-      svc, /*max_rounds=*/200000);
+      svc, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
 }
 
 template <typename LaunchT>

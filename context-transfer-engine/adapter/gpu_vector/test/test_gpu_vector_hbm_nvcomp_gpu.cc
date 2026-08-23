@@ -213,7 +213,8 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
           HbmSeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
               gpu_info, vec.GetDevice(0), per, view, stack.View());
         },
-        [] {}, /*max_rounds=*/200000);
+        [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
     ctp::GpuApi::Synchronize();
     std::fprintf(stderr, "[hbm-nvcomp] seed rounds=%u\n", rounds);
   }
@@ -261,7 +262,8 @@ TEST_CASE("gpu_vector: nvcomp on a kHBM-only tier, decoded in-kernel",
           HbmDotKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
               gpu_info, vec.GetDevice(0), per, d_sum, view, stack.View());
         },
-        [] {}, /*max_rounds=*/200000);
+        [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
     ctp::GpuApi::Synchronize();
     std::fprintf(stderr, "[hbm-nvcomp] read rounds=%u\n", rounds);
   }
