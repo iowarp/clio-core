@@ -2457,8 +2457,10 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // have to tell "missing" apart from "read failed" itself.
     if (blob_info_ptr == nullptr) {
       if (task->context_.create_on_get_) {
-        task->return_code_ =
-            (CreateNewBlob(blob_name, tag_id, 0.5f) != nullptr) ? 0 : 5;
+        // Bind the name so a later put has something to extend; the read
+        // itself returns success with the caller's buffer untouched.
+        CreateNewBlob(blob_name, tag_id, 0.5f);
+        task->return_code_ = 0;
         clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
         CLIO_CO_RETURN;
       }
@@ -2588,7 +2590,10 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                   0
             : blob_info_ptr->GetTotalSize() == 0;
     if (blob_is_gone) {
-      task->return_code_ = 1;
+      // create_on_get_: a blob with no bytes yet is not an error. The caller
+      // asked to treat "nothing stored" as readable -- it owns whatever is in
+      // its buffer and will overwrite it. Report success, copy nothing.
+      task->return_code_ = task->context_.create_on_get_ ? 0 : 1;
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }

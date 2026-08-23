@@ -182,8 +182,6 @@ __device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
     // takes this branch together. Fire-and-forget: a hint needs no await.
     if (off + page_elems < per) {
       const clio::run::u64 next = (base + off + page_elems) / page_elems;
-      co_await v.RescorePages(
-          1, [next](clio::run::u32) { return gv::PageScore{next, 1.0f}; });
     }
     auto h = co_await v.HoldPage(base + off, per - off);
     unsigned long long acc = 0;
@@ -239,8 +237,6 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
       {
         const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
         const clio::run::u64 page = base / page_elems + ahead;
-        co_await v.RescorePages(
-              1, [page](clio::run::u32) { return gv::PageScore{page, 1.0f}; });
       }
     }
     // DELIBERATELY NOT FLUSHED. This kernel exists to prove the vector

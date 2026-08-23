@@ -23,12 +23,6 @@ namespace clio::cte::gpu_vector {
 /** Eviction rank a freshly faulted page starts at. Higher means keep. */
 constexpr float kDefaultScore = 1.0f;
 
-/** One entry of a batched rescore. */
-struct PageScore {
-  clio::run::u64 page;
-  float score;
-};
-
 /** Shared state, one per vector per GPU. */
 struct VecHeader {
   Page *pages_;              // nblocks_ * pages_per_block_
@@ -60,8 +54,9 @@ template <typename T>
 class Held {
  public:
   CTP_GPU_FUN Held() = default;
-  CTP_GPU_FUN Held(Page *page, T *data, clio::run::u64 run)
-      : page_(page), data_(data), run_(run) {}
+  CTP_GPU_FUN Held(Page *page, T *data, clio::run::u64 begin,
+                   clio::run::u64 run)
+      : page_(page), data_(data), begin_(begin), run_(run) {}
   CTP_GPU_FUN Held(Held &&o) noexcept { Steal(o); }
   CTP_GPU_FUN Held &operator=(Held &&o) noexcept {
     if (this != &o) {
@@ -75,7 +70,12 @@ class Held {
   CTP_GPU_FUN T *ptr() const { return data_; }
   CTP_GPU_FUN clio::run::u64 run() const { return run_; }
   CTP_GPU_FUN explicit operator bool() const { return page_ != nullptr; }
-  CTP_GPU_FUN T &operator[](clio::run::u64 i) const { return data_[i]; }
+  /** Indexed by ABSOLUTE element offset, like the offset passed to
+   *  HoldPage -- not by position within the run. */
+  CTP_GPU_FUN T &operator[](clio::run::u64 off) const {
+    return data_[off - begin_];
+  }
+  CTP_GPU_FUN clio::run::u64 begin_off() const { return begin_; }
 
   /** Set this frame's eviction rank. Higher means keep. */
   CTP_GPU_FUN void Rescore(float rank) const {
@@ -90,12 +90,14 @@ class Held {
   CTP_GPU_FUN void Steal(Held &o) {
     page_ = o.page_;
     data_ = o.data_;
+    begin_ = o.begin_;
     run_ = o.run_;
     o.page_ = nullptr;
   }
 
   Page *page_ = nullptr;
   T *data_ = nullptr;
+  clio::run::u64 begin_ = 0;
   clio::run::u64 run_ = 0;
 };
 
@@ -164,8 +166,14 @@ class DeviceVector {
 
   /** Start writing back every dirty page of this block's table. */
   __device__ clio::run::gpu::YCoroTask BeginFlush() {
-    CLIO_CO_YIELD_WHEN(;, FlushBusy(), FlushTag());
-    if (threadIdx.x == 0) SubmitFlush();
+    // Wait only while the previous put is still moving. Callers flush inside
+    // a loop to overlap the next page's compute, so a landed flush is retired
+    // here rather than requiring an EndFlush between every pair.
+    CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
+    if (threadIdx.x == 0) {
+      if (FlushBusy()) RetireFlush();
+      SubmitFlush();
+    }
     __syncthreads();
     co_return;
   }
@@ -174,35 +182,6 @@ class DeviceVector {
   __device__ clio::run::gpu::YCoroTask EndFlush() {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
     if (threadIdx.x == 0) RetireFlush();
-    __syncthreads();
-    co_return;
-  }
-
-  /**
-   * Apply `n` page scores from `gen`:
-   *   score == 0                -> evict the page
-   *   score  > 0, resident      -> update the local score
-   *   score >= .9, not resident -> stage a prefetch
-   *   score  < .9, not resident -> stage a rescore
-   */
-  template <typename GenF>
-  __device__ clio::run::gpu::YCoroTask RescorePages(clio::run::u32 n, GenF gen) {
-    if (threadIdx.x == 0) {
-      for (clio::run::u32 i = 0; i < n; ++i) {
-        const PageScore ps = gen(i);
-        Page *p = Find(ps.page);
-        if (ps.score == 0.0f) {
-          if (p != nullptr && p->pins == 0u && !p->dirty) Release(p);
-        } else if (p != nullptr) {
-          p->score = ps.score;
-        } else if (ps.score >= 0.9f) {
-          StagePrefetch(ps.page);
-        } else {
-          StageRescore(ps);
-        }
-      }
-      SubmitStaged();
-    }
     __syncthreads();
     co_return;
   }
@@ -315,7 +294,7 @@ class DeviceVector {
     const clio::run::u64 in = off % h_->elems_per_page_;
     clio::run::u64 run = h_->elems_per_page_ - in;
     if (run > count) run = count;
-    return Held<T>(p, static_cast<T *>(p->data) + in, run);
+    return Held<T>(p, static_cast<T *>(p->data) + in, off, run);
   }
 
   // ------------------------------ fault ------------------------------
@@ -324,7 +303,14 @@ class DeviceVector {
   CTP_GPU_FUN void SubmitFault(clio::run::u64 pn) {
     BlockTasks *bt = Tasks();
     Page *p = FindFree();
-    if (p == nullptr) return;
+    if (p == nullptr) {
+      // EvictPages just guaranteed a free frame. Reaching here means one was
+      // taken behind our back -- do not fail silently, the block would spin
+      // on a hold that can never resolve.
+      printf("[gpu_vector] FATAL table=%u: no free frame after EvictPages "
+             "(page %llu)\n", Table(), (unsigned long long) pn);
+      __trap();
+    }
     p->fetching = 1u;
     p->page_num = pn;
     auto *t = bt->fault;
@@ -350,6 +336,7 @@ class DeviceVector {
     t->context_.create_on_get_ = true;
     ClearRunCtx(t);
     if (h_->stat_faults_ != nullptr) atomicAdd(h_->stat_faults_, 1ull);
+    t->fut_.is_complete_.store(0);   // reused task: clear the last completion
     bt->fault_fut =
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
@@ -425,6 +412,7 @@ class DeviceVector {
       atomicAdd(h_->stat_puts_, static_cast<unsigned long long>(n));
     }
     bt->flush_busy = 1u;
+    t->fut_.is_complete_.store(0);   // reused task: clear the last completion
     bt->flush_fut =
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
@@ -444,71 +432,6 @@ class DeviceVector {
     }
     bt->flush_n = 0;
     bt->flush_busy = 0u;
-  }
-
-  // ------------------- prefetch / rescore staging --------------------
-
-  CTP_GPU_FUN void StagePrefetch(clio::run::u64 pn) {
-    BlockTasks *bt = Tasks();
-    if (bt->prefetch_n >= clio::cte::core::kPodMultiMax) return;
-    if (!FreeSome(1, 1)) return;   // advisory: no room, no prefetch
-    Page *p = FindFree();
-    if (p == nullptr) return;
-    p->fetching = 1u;
-    p->page_num = pn;
-    char name[32];
-    PageBlobName(pn, name);
-    bt->prefetch->Add(name, 0, h_->page_bytes_, RawPtr(p->data), 0.5f);
-    ++bt->prefetch_n;
-  }
-
-  CTP_GPU_FUN void StageRescore(const PageScore &ps) {
-    BlockTasks *bt = Tasks();
-    if (bt->rescore_n >= clio::cte::core::kPodMultiMax) return;
-    char name[32];
-    PageBlobName(ps.page, name);
-    float c = ps.score;
-    if (c < 0.0f) c = 0.0f;
-    if (c > 1.0f) c = 1.0f;   // CTE scores are a tier preference in [0,1]
-    bt->rescore->Add(name, 0, 0, ctp::ipc::ShmPtr<>::GetNull(), c);
-    ++bt->rescore_n;
-  }
-
-  /** Send whatever RescorePages staged. Thread 0 only. */
-  CTP_GPU_FUN void SubmitStaged() {
-    BlockTasks *bt = Tasks();
-    if (bt->prefetch_n != 0) {
-      auto *t = bt->prefetch;
-      t->task_flags_.Clear();
-      t->return_code_.store(0);
-      t->task_id_ = DeviceTaskId(Table(), kKindPrefetch, bt->seq++);
-      t->pool_id_ = h_->pool_id_;
-      t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
-      t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-      t->tag_id_ = h_->tag_id_;
-      t->context_ = clio::cte::core::Context();
-      t->context_.compress_lib_ = h_->compress_lib_;
-      t->context_.compress_preset_ = h_->compress_preset_;
-      t->context_.create_on_get_ = true;
-      ClearRunCtx(t);
-      bt->prefetch_fut =
-          clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
-      bt->prefetch_n = 0;
-    }
-    if (bt->rescore_n != 0) {
-      auto *t = bt->rescore;
-      t->task_flags_.Clear();
-      t->return_code_.store(0);
-      t->task_id_ = DeviceTaskId(Table(), kKindRescore, bt->seq++);
-      t->pool_id_ = h_->pool_id_;
-      t->method_ = clio::cte::core::Method::kPodMultiScore;
-      t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
-      t->tag_id_ = h_->tag_id_;
-      ClearRunCtx(t);
-      bt->rescore_fut =
-          clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
-      bt->rescore_n = 0;
-    }
   }
 
   // ----------------------------- plumbing ----------------------------

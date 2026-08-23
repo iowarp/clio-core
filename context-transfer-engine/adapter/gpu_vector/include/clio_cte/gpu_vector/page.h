@@ -19,8 +19,6 @@ constexpr clio::run::u64 kNoPage = ~static_cast<clio::run::u64>(0);
 
 using GetSlot = clio::cte::core::PodGetBlobTask;
 using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
-using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
-using MultiScoreSlot = clio::cte::core::PodMultiScoreTask;
 
 /** One resident page. */
 struct Page {
@@ -35,23 +33,17 @@ struct Page {
 };
 
 /**
- * The four tasks a block owns, per the design. One set per page table, sized
- * so every warp can augment the multi-tasks.
+ * The tasks a block owns. One set per page table: a bulk put for flushing and
+ * a scalar get for faulting.
  */
 struct BlockTasks {
   MultiPutSlot *flush;
   GetSlot *fault;
-  MultiGetSlot *prefetch;
-  MultiScoreSlot *rescore;
   clio::run::gpu::Future<clio::cte::core::PodMultiPutBlobTask> flush_fut;
   clio::run::gpu::Future<clio::cte::core::PodGetBlobTask> fault_fut;
-  clio::run::gpu::Future<clio::cte::core::PodMultiGetBlobTask> prefetch_fut;
-  clio::run::gpu::Future<clio::cte::core::PodMultiScoreTask> rescore_fut;
-  clio::run::u32 flush_n;      // records in the outstanding flush
-  clio::run::u32 prefetch_n;   // atomic counter: records staged for prefetch
-  clio::run::u32 rescore_n;    // atomic counter: records staged for rescore
-  clio::run::u32 flush_busy;   // a flush is in flight
-  clio::run::u32 seq;          // bumped per submission so TaskIds differ
+  clio::run::u32 flush_n;     // records in the outstanding flush
+  clio::run::u32 flush_busy;  // a flush is in flight
+  clio::run::u32 seq;         // bumped per submission so TaskIds differ
   /** Page table index each flush record came from, so completion can clear
    *  the right frames' flags. */
   clio::run::u32 flush_slot[clio::cte::core::kPodMultiMax];
@@ -70,7 +62,7 @@ CTP_INLINE_CROSS_FUN clio::run::TaskId DeviceTaskId(clio::run::u64 table,
   clio::run::TaskId id;
   id.pid_ = 0;
   id.tid_ = 0;
-  id.major_ = static_cast<clio::run::u32>(table) * 4u + kind + 1u;
+  id.major_ = static_cast<clio::run::u32>(table) * 2u + kind + 1u;
   id.replica_id_ = 0;
   id.unique_ = seq + 1u;
   id.node_id_ = 0;
@@ -79,8 +71,6 @@ CTP_INLINE_CROSS_FUN clio::run::TaskId DeviceTaskId(clio::run::u64 table,
 
 constexpr clio::run::u32 kKindFlush = 0;
 constexpr clio::run::u32 kKindFault = 1;
-constexpr clio::run::u32 kKindPrefetch = 2;
-constexpr clio::run::u32 kKindRescore = 3;
 
 /** Compose a page's blob name: "p<page_num>". Device-callable, no CRT. */
 CTP_INLINE_CROSS_FUN void PageBlobName(clio::run::u64 page_num, char *out) {

@@ -142,8 +142,6 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
       if (p + nwant >= pages) nwant = static_cast<u32>(pages - 1 - p);
       if (nwant > 0) {
         const u64 p1 = first_page + p + 1;
-        co_await v.RescorePages(
-            nwant, [p1](u32 d) { return gv::PageScore{p1 + d, 1.0f}; });
       }
     }
 

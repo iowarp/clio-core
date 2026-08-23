@@ -184,9 +184,6 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
     clio::run::u64 n = npages - p0;
     if (n > chunk) n = chunk;
     const clio::run::u64 fp = first_page + p0;
-    co_await v.RescorePages(
-        static_cast<clio::run::u32>(n),
-        [fp](clio::run::u32 i) { return gv::PageScore{fp + i, 1.0f}; });
     for (clio::run::u64 j = 0; j < n; ++j) {
       const clio::run::u64 off = base + (p0 + j) * v.ElemsPerPage();
       for (clio::run::u64 i = 0; i < v.ElemsPerPage();) {

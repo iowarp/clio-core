@@ -290,9 +290,6 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
       const u64 d2 = vec.PageOf(unext + z * plane);
       const u64 d3 = vec.PageOf(vnext + z * plane);
       const u64 drops[4] = {d0, d1, d2, d3};
-      co_await vec.RescorePages(4, [&drops](u32 i) {
-        return gv::PageScore{drops[i], 0.0f};
-      });
     }
   }
   // Drain before returning: the next step swaps the regions and other blocks
@@ -325,9 +322,6 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
       for (u64 pg = zlo; pg < zhi; pg += 64) {
         const u32 nb = (zhi - pg < 64) ? static_cast<u32>(zhi - pg) : 64u;
         const u64 pbase = vec.PageOf(bases[b]);
-        co_await vec.RescorePages(nb, [pbase, pg](u32 i) {
-          return gv::PageScore{pbase + pg + i, 0.0f};
-        });
       }
     }
   }

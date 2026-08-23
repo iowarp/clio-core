@@ -202,15 +202,12 @@ __device__ gy::YCoroMain EvictCoro(gv::DeviceVector<u32> v, u32 n) {
   if (n == 0) co_return;
   const u64 epp = v.ElemsPerPage();
   const u64 npages = (v.size() + epp - 1) / epp;
+  // Writes back only. Dropping the pages is Vector::ClearCache on the host:
+  // the device API has no "discard these pages" verb.
   co_await v.BeginFlush();
   co_await v.EndFlush();
-  for (u64 first = 0; first < npages; first += 64) {
-    u64 cnt = npages - first;
-    if (cnt > 64) cnt = 64;
-    co_await v.RescorePages(static_cast<u32>(cnt), [first](u32 i) {
-      return gv::PageScore{first + i, 0.0f};
-    });
-  }
+  (void) epp;
+  (void) npages;
 }
 
 __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
@@ -227,9 +224,10 @@ __global__ void EvictKernel(clio::run::IpcManagerGpuInfo info,
 // purpose -- the public batched verb is exercised elsewhere.
 __device__ gy::YCoroMain RescoreCoro(gv::DeviceVector<u32> v, u64 page,
                                      float score) {
-  co_await v.RescorePages(1, [page, score](u32) {
-    return gv::PageScore{page, score};
-  });
+  // Scoring is a property of a HELD page now: the guard is the pin, and
+  // Rescore stamps the frame it is holding.
+  auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
+  h.Rescore(score);
 }
 __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v, u64 page, float score,
@@ -462,8 +460,6 @@ __device__ gy::YCoroMain PrefetchWalkCoro(gv::DeviceVector<u32> v, u64 count,
     // protects the page being read; no explicit rescore needed.
     if (p + 1 < pages) {
       const u64 np = first + p + 1;
-      co_await v.RescorePages(
-          1u, [np](u32) { return gv::PageScore{np, 1.0f}; });
     }
     const u64 off = slice + p * v.ElemsPerPage();
     auto h = co_await v.HoldPage(off, v.ElemsPerPage());
@@ -496,11 +492,8 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
 // lane sending them would multiply that by the block width.
 __device__ gy::YCoroMain RescoreStormCoro(gv::DeviceVector<u32> v, u64 page,
                                           u32 reps) {
-  for (u32 r = 0; r < reps; ++r) {
-    co_await v.RescorePages(1, [page, r](u32) {
-      return gv::PageScore{page, static_cast<float>(r)};
-    });
-  }
+  auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
+  for (u32 r = 0; r < reps; ++r) h.Rescore(static_cast<float>(r));
 }
 __global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 page, u32 reps,
@@ -745,6 +738,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });   // start from an empty cache
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     f.Reset();
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -792,6 +786,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -832,6 +827,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 3u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     // Make page 0 resident, then pin it with a score nothing else has.
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -887,6 +883,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     u64 *warm = UploadPages({0, 1, 0});
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -975,7 +972,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 0u, vw_, sv_);
     });
     Sync();
-    REQUIRE(f.Stats().evicts == 0);
+    f.vec.ClearCache();   // the drop is host-side now
 
     f.Reset();
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -983,10 +980,14 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 99u, vw_, sv_);
     });   // far more than resident
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
     auto s = f.Stats();
-    std::fprintf(stderr, "[evict] over-evict evicts=%llu (expect 4)\n",
+    // The device counter no longer moves here: dropping resident pages is
+    // ClearCache on the host, and there is no "evict N pages" device verb to
+    // over-ask. What still has to hold is below -- the data survives a full
+    // drop and reads back correctly.
+    std::fprintf(stderr, "[evict] dropped, device evicts=%llu\n",
                  (unsigned long long) s.evicts);
-    REQUIRE(s.evicts == 4);
 
     // And the data is still correct afterwards.
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
@@ -1016,6 +1017,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 1u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
     // Only ONE element of each page was written, so the whole-page helper
     // does not apply -- check the two straddling elements directly.
     clio::cte::core::Client core(clio::cte::core::kCtePoolId);
@@ -1055,6 +1057,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, dev, 2u, vw_, sv_);
     });
     Sync();
+    vec.ClearCache();   // the drop is host-side now
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
@@ -1088,6 +1091,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(kBlocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
                         gy::YieldStackView sv_) {
@@ -1101,8 +1105,11 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
   }
 
   // -------------------------------------------------------------------
-  // Rescoring a page that is NOT resident must not fault it in, crash, or
-  // corrupt the slot it hashes onto -- it is a hint to the CTE only.
+  // Scoring is a property of a HELD page: Held::Rescore stamps the frame the
+  // guard is holding, so "rescore a page that is not resident" no longer
+  // exists as an operation. What is checked here is that scoring an absent
+  // page -- which now means faulting it in and stamping it -- leaves the
+  // vector intact and the data correct.
   // -------------------------------------------------------------------
   {
     Fixture f("gv_sem_rescore_absent", 1, 2, 8);
@@ -1116,6 +1123,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     f.Reset();
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -1125,9 +1133,9 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
     Sync();
     auto s = f.Stats();
-    std::fprintf(stderr, "[rescore-absent] faults=%llu (expect 0)\n",
+    std::fprintf(stderr, "[rescore] faults=%llu (the hold faults it in)\n",
                  (unsigned long long) s.faults);
-    REQUIRE(s.faults == 0);
+    REQUIRE(s.faults == 1);   // exactly the page held, nothing else
 
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -1218,6 +1226,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -1249,6 +1258,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     f.Reset();
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
@@ -1285,6 +1295,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 2u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
     RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -1336,6 +1347,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, sc.slots, vw_, sv_);
     });
       Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
       ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
       RunYieldable(sc.blocks, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
@@ -1370,6 +1382,7 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       EvictKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(g_gpu, f.dev, 4u, vw_, sv_);
     });
     Sync();
+    f.vec.ClearCache();   // the drop is host-side now
 
     f.Reset();
     ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));

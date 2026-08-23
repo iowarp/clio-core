@@ -12,7 +12,11 @@
  * took hours to attribute. This reproduces that class of bug in seconds:
  * a paging bug shows up as wrong bytes far more often than as a crash.
  *
- * Page->table affinity mirrors the MoE kernel: block_override_ = pn % nblocks,
+ * A block owns its page table for the whole kernel. The page->table affinity
+ * this test used to do (rebinding block_override_ per page) put several CUDA
+ * blocks on one table, and therefore on one set of that table's tasks --
+ * concurrent submissions into a single task object, which is exactly what the
+ * design forbids.
  * so every block touching page pn uses the SAME table — probe/claim/evict
  * collide across blocks by construction.
  */
@@ -134,7 +138,6 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
   for (int it = 0; it < iters; ++it) {
     rng = rng * 1664525u + 1013904223u;
     const clio::run::u64 pn = rng % total_pages;
-    v.block_override_ = (clio::run::u32) (pn % v.NumTables());
 
     // Fire-and-forget prefetch of an unrelated range every iteration --
     // the long in-flight window is what widens claim races enough to
@@ -142,11 +145,6 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     {
       rng = rng * 1664525u + 1013904223u;
       const clio::run::u64 pf = rng % total_pages;
-      v.block_override_ = (clio::run::u32) (pf % v.NumTables());
-      co_await v.RescorePages(4u, [pf, total_pages](clio::run::u32 i) {
-        return gv::PageScore{(pf + i) % total_pages, 1.0f};
-      });
-      v.block_override_ = (clio::run::u32) (pn % v.NumTables());
     }
 
     // Demand access: suspend until resident, then take a RAW pointer with

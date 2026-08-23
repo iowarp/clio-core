@@ -263,9 +263,6 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
       const u64 nxt = block_base + (it + 1) * region_elems;
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 pn = v.PageOf(nxt + pg * v.ElemsPerPage());
-        co_await v.RescorePages(1, [=](clio::run::u32) {
-          return gv::PageScore{pn, 1000.0f};
-        });
         // DEVICE-INITIATED PREFETCH IS GONE. A kernel cannot start a fetch any
         // more: it can only fault (record + park) and let the host servicer
         // resolve it. Prefetching is a host operation between launches. The
@@ -304,9 +301,6 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
       // Consumed: lowest score makes it the next victim, freeing a slot for
       // the prefetch that follows.
       if (async && threadIdx.x == 0) {
-        co_await v.RescorePages(1, [=](clio::run::u32) {
-          return gv::PageScore{v.PageOf(poff), -1000.0f};
-        });
       }
       __syncthreads();
     }
