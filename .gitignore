@@ -235,3 +235,5 @@ paper-benchmark/nyx/fields/
 paper-benchmark/vpic/fields/
 paper-benchmark/vpic/*.Linux
 paper-benchmark/vpic/build_deck.log
+# WarpX writes openPMD output and per-run stores under results/.
+paper-benchmark/warpx/results/

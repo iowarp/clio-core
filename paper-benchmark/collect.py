@@ -175,6 +175,9 @@ def main():
         "vpic-weibel": ("VPIC paper benchmark",
                         lambda r: f"VPIC Weibel instability, {r['files']} "
                                   f"field file(s), {r['frames']} frames"),
+        "warpx-laser": ("WarpX paper benchmark",
+                        lambda r: f"WarpX laser acceleration IN SITU, "
+                                  f"{r['frames']} openPMD dumps"),
     }
     title, describe = WORKLOADS.get(
         wl, (f"{wl} benchmark",
