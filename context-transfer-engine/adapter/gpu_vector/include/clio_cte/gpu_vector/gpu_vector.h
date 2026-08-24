@@ -189,6 +189,12 @@ class Vector {
         tbl[slot].flushing = 0;
         tbl[slot].fetching = 0;
         tbl[slot].score = kDefaultScore;
+        // A WHOLE page was copied in, so the whole page is valid. Without
+        // this the device sees a resident frame whose valid range is empty
+        // and correctly refuses to read it.
+        tbl[slot].valid_lo = 0;
+        tbl[slot].valid_hi =
+            static_cast<clio::run::u32>(page_bytes_ / sizeof(T));
         ++slot;
       }
       ctp::GpuApi::Memcpy(reinterpret_cast<char *>(dev),
@@ -218,6 +224,8 @@ class Vector {
       p.flushing = 0;
       p.fetching = 0;
       p.score = kDefaultScore;
+      p.valid_lo = 0;
+      p.valid_hi = 0;
       p.last_access = 0;
     }
     ctp::GpuApi::Memcpy(it->second.table_base,
@@ -394,6 +402,8 @@ class Vector {
       p.last_access = 0;
       p.pins = 0;
       p.dirty = 0;
+      p.valid_lo = 0;
+      p.valid_hi = 0;
       p.flushing = 0;
       p.fetching = 0;
     }

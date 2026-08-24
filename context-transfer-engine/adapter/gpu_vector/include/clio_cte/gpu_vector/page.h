@@ -30,6 +30,13 @@ struct Page {
   clio::run::u32 dirty;       // written since faulted or flushed
   clio::run::u32 flushing;    // a put is outstanding
   clio::run::u32 fetching;    // a get is outstanding
+  /** WHICH ELEMENTS OF THIS FRAME ARE ACTUALLY THERE, as offsets within the
+   *  page. Residency is per PAGE but a transfer is per RANGE, so "this page
+   *  is present" is not the same statement as "the bytes you asked for are
+   *  present": a fetch of part of a page leaves the rest of the frame
+   *  holding whatever it held before. valid_hi <= valid_lo means empty. */
+  clio::run::u32 valid_lo;
+  clio::run::u32 valid_hi;
 };
 
 /**
@@ -50,6 +57,10 @@ struct BlockTasks {
    *  right frames' flags. */
   clio::run::u32 flush_slot[clio::cte::core::kPodMultiMax];
   clio::run::u32 fetch_slot[clio::cte::core::kPodMultiMax];
+  /** The element interval each fetch record covers, so completion can widen
+   *  the frame's valid range to exactly what landed. */
+  clio::run::u32 fetch_vlo[clio::cte::core::kPodMultiMax];
+  clio::run::u32 fetch_vhi[clio::cte::core::kPodMultiMax];
 };
 
 /**

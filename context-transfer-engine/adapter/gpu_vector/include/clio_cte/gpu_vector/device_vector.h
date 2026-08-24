@@ -198,6 +198,25 @@ class DeviceVector {
     clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(lo, hi, nr, args...);
+    // ROUND OUT TO WHOLE PAGES, HERE, ONCE.
+    //
+    // RESIDENCY IS PER PAGE but a transfer is per range, so a fetch of part
+    // of a page fills part of a frame and marks the whole page resident --
+    // and the next fetch of a DIFFERENT part of that page is skipped as
+    // "already here" and hands back whatever the frame happened to hold.
+    // Callers used to dodge that by wrapping every offset in PageLo/PageSpan,
+    // which was 93 call sites doing the vector's arithmetic for it and one
+    // forgotten wrapper away from reading garbage.
+    //
+    // FLUSH DELIBERATELY DOES NOT DO THIS. A flush must stay byte-exact:
+    // rounding it out would ship bytes the caller never wrote, which is
+    // exactly how blocks clobber each other's slices of a shared page.
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      lo[r] = PageLo(lo[r]);
+      hi[r] = (PageOf(hi[r] - 1) + 1) * h_->elems_per_page_;
+      if (hi[r] > h_->num_elems_) hi[r] = h_->num_elems_;
+    }
     // One fetch in flight per block: staging into a task the runtime is still
     // reading would overwrite records mid-transfer.
     if (FetchBusy()) {
@@ -275,6 +294,26 @@ class DeviceVector {
                h_->pages_per_block_, Tasks()->fetch_busy, Tasks()->fetch_n);
       }
       __trap();
+    }
+    // RESIDENT IS NOT VALID. The frame may hold a different slice of this
+    // page -- a fetch transfers only the range it was given -- and reading
+    // the rest would hand back whatever the frame held before.
+    if (!write) {
+      const clio::run::u64 in = off % h_->elems_per_page_;
+      clio::run::u64 run = h_->elems_per_page_ - in;
+      if (run > count) run = count;
+      if (!Covers(p, static_cast<clio::run::u32>(in),
+                  static_cast<clio::run::u32>(in + run))) {
+        if (threadIdx.x == 0) {
+          printf("[gpu_vector] FATAL table=%u page=%llu: elements [%u,%u) of "
+                 "this page were never fetched -- the frame holds [%u,%u). "
+                 "Name the range in a Fetch first.\n",
+                 Table(), (unsigned long long) PageOf(off),
+                 (unsigned) in, (unsigned) (in + run), p->valid_lo,
+                 p->valid_hi);
+        }
+        __trap();
+      }
     }
     co_return Pin(p, off, count, write);
   }
@@ -356,7 +395,11 @@ class DeviceVector {
           // fixed in this tree.
           atomicAdd(&p->pins, 1u);
           __threadfence();
-          if (static_cast<volatile Page *>(p)->page_num == pn) {
+          clio::run::u32 a = 0, b = 0;
+          const bool need = PageNeed(pn, off, off + count, &a, &b);
+          // The peer having the PAGE is not the peer having the RANGE.
+          if (static_cast<volatile Page *>(p)->page_num == pn && need &&
+              Covers(p, a, b)) {
             s_src = p;
           } else {
             atomicSub(&p->pins, 1u);
@@ -390,6 +433,8 @@ class DeviceVector {
           // Clean: the bytes match what the peer had, and this block has
           // written nothing of its own yet.
           dst->page_num = pn;
+          dst->valid_lo = src->valid_lo;
+          dst->valid_hi = src->valid_hi;
           dst->dirty = 0u;
           dst->fetching = 0u;
           dst->flushing = 0u;
@@ -521,6 +566,8 @@ class DeviceVector {
   /** Drop a resident, unpinned, clean page. */
   CTP_GPU_FUN void Release(Page *p) {
     p->page_num = kNoPage;
+    p->valid_lo = 0u;
+    p->valid_hi = 0u;
     p->dirty = 0u;
     p->score = kDefaultScore;
     if (h_->stat_evicts_ != nullptr) atomicAdd(h_->stat_evicts_, 1ull);
@@ -603,6 +650,21 @@ class DeviceVector {
     const clio::run::u64 in = off % h_->elems_per_page_;
     clio::run::u64 run = h_->elems_per_page_ - in;
     if (run > count) run = count;
+    if (write && threadIdx.x == 0) {
+      // Writing defines these elements whether or not they were ever
+      // fetched, so a first-touch page becomes valid without a transfer.
+      // Conservative: the interval is unioned, so writing two disjoint
+      // slices of one page claims the gap between them as valid too.
+      const clio::run::u32 a = static_cast<clio::run::u32>(in);
+      const clio::run::u32 b = static_cast<clio::run::u32>(in + run);
+      if (p->valid_hi <= p->valid_lo) {
+        p->valid_lo = a;
+        p->valid_hi = b;
+      } else {
+        if (a < p->valid_lo) p->valid_lo = a;
+        if (b > p->valid_hi) p->valid_hi = b;
+      }
+    }
     return Held<T>(p, static_cast<T *>(p->data) + in, off, run);
   }
 
@@ -631,6 +693,28 @@ class DeviceVector {
    * page moves half a page, and two blocks writing different parts of one
    * page no longer overwrite each other.
    */
+  /** Element interval of [lo,hi) that falls inside page `pn`, as offsets
+   *  WITHIN the page. Returns false when the range misses the page. */
+  CTP_GPU_FUN bool PageNeed(clio::run::u64 pn, clio::run::u64 lo,
+                            clio::run::u64 hi, clio::run::u32 *a,
+                            clio::run::u32 *b) const {
+    const clio::run::u64 epp = h_->elems_per_page_;
+    const clio::run::u64 pstart = pn * epp;
+    const clio::run::u64 x = lo > pstart ? lo : pstart;
+    const clio::run::u64 y = hi < pstart + epp ? hi : pstart + epp;
+    if (y <= x) return false;
+    *a = static_cast<clio::run::u32>(x - pstart);
+    *b = static_cast<clio::run::u32>(y - pstart);
+    return true;
+  }
+
+  /** Does this frame actually hold elements [a,b) of its page? */
+  CTP_GPU_FUN bool Covers(const Page *p, clio::run::u32 a,
+                          clio::run::u32 b) const {
+    return p != nullptr && p->valid_hi > p->valid_lo && p->valid_lo <= a &&
+           p->valid_hi >= b;
+  }
+
   CTP_GPU_FUN bool ClipToPage(clio::run::u64 pn, clio::run::u64 lo,
                               clio::run::u64 hi, clio::run::u64 *byte_off,
                               clio::run::u64 *byte_len) const {
@@ -703,15 +787,33 @@ class DeviceVector {
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0;
            pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
-        if (Find(pn) != nullptr) continue;     // already here
-        Page *p = FindFree();
-        if (p == nullptr) {
-          printf("[gpu_vector] FATAL table=%u: no free frame for page %llu "
-                 "after EvictPages\n", Table(), (unsigned long long) pn);
-          __trap();
+        clio::run::u32 a = 0, b = 0;
+        if (!PageNeed(pn, lo[r], hi[r], &a, &b)) continue;
+        Page *p = Find(pn);
+        // RESIDENT IS NOT THE SAME AS VALID. A frame that holds a different
+        // slice of this page still needs a transfer; widen to the union so
+        // the valid range stays one interval.
+        if (Covers(p, a, b)) continue;
+        clio::run::u32 flo = a, fhi = b;
+        if (p != nullptr) {
+          if (p->valid_hi > p->valid_lo) {
+            flo = p->valid_lo < a ? p->valid_lo : a;
+            fhi = p->valid_hi > b ? p->valid_hi : b;
+          }
+        } else {
+          p = FindFree();
+          if (p == nullptr) {
+            printf("[gpu_vector] FATAL table=%u: no free frame for page %llu "
+                   "after EvictPages\n", Table(), (unsigned long long) pn);
+            __trap();
+          }
+          p->valid_lo = 0u;
+          p->valid_hi = 0u;
         }
-        clio::run::u64 boff = 0, blen = 0;
-        if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
+        const clio::run::u64 boff =
+            static_cast<clio::run::u64>(flo) * sizeof(T);
+        const clio::run::u64 blen =
+            static_cast<clio::run::u64>(fhi - flo) * sizeof(T);
         p->fetching = 1u;
         p->page_num = pn;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
@@ -721,6 +823,8 @@ class DeviceVector {
                RawPtr(static_cast<char *>(p->data) + boff), 0.5f);
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                       sizeof(pn32));
+        bt->fetch_vlo[n] = flo;
+        bt->fetch_vhi[n] = fhi;
         bt->fetch_slot[n++] = static_cast<clio::run::u32>(p - Pages());
       }
     }
@@ -771,6 +875,8 @@ class DeviceVector {
     }
     for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
       Page *p = &tbl[bt->fetch_slot[i]];
+      p->valid_lo = bt->fetch_vlo[i];
+      p->valid_hi = bt->fetch_vhi[i];
       p->dirty = 0u;
       p->score = kDefaultScore;
       p->last_access = clock64();
