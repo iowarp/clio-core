@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "adapter/vfd/H5FDclio.h"
+#include "adapter/vfd/H5FDclio_trace.h"
 
 namespace {
 
@@ -194,6 +195,19 @@ int main() {
     CHECK(gone < 0, "the deleted file is really gone");
     H5Pclose(fapl);
     std::printf("[vfd-no-runtime] ok: delete works with no runtime\n");
+  }
+
+  // The static_assert in H5FDclio.cc pins the constant; this pins the
+  // comparison, which a correct constant alone does not.
+  {
+    CHECK(std::string(clio::vfdtrace::MemClass(H5FD_MEM_DRAW)) == "raw",
+          "H5FD_MEM_DRAW classifies as raw");
+    for (H5FD_mem_t t : {H5FD_MEM_SUPER, H5FD_MEM_BTREE, H5FD_MEM_GHEAP,
+                         H5FD_MEM_LHEAP, H5FD_MEM_OHDR, H5FD_MEM_DEFAULT}) {
+      CHECK(std::string(clio::vfdtrace::MemClass(t)) == "meta",
+            "non-DRAW memory types classify as meta");
+    }
+    std::printf("[vfd-no-runtime] ok: raw/meta classification\n");
   }
 
   std::printf("[vfd-no-runtime] PASS: the driver is complete without CLIO\n");
