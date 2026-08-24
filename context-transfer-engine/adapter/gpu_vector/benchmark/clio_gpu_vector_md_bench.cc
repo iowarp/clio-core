@@ -84,6 +84,12 @@ __device__ unsigned long long g_md_cyc[8];
 /** Page iterations actually completed by the integrator, summed over
  *  blocks. Distinguishes WORK DROPPED (driver/park bookkeeping) from DATA
  *  CORRUPTED (the paging path): the expected count is exact and known. */
+/** MD_NO_PUBLISH=1 drops every publish. The physics is then WRONG (blocks
+ *  read each other's stale pages); it exists only so the device-side cost of
+ *  publishing can be measured as a difference against a correct run. Uniform
+ *  across all threads, so the co_await stays out of a divergent branch. */
+__device__ u32 g_publish = 1u;
+
 __device__ unsigned long long g_pages_done;
 /** Sink for the ballistic path's optional THIRD vector read, so the load
  *  cannot be optimised away while the physics stays untouched. */
@@ -1148,7 +1154,7 @@ co_await x.BeginFetch(x.PageLo(pg * epp), x.PageSpan(pg * epp, epp));
     // Publish the wrap. Rebin holds x for WRITE and folds each position back
     // into the box; the gather then reads these rows from other blocks.
     const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
-    co_await x.BeginFlush(pg * epp, cnt);
+    if (g_publish) co_await x.BeginFlush(pg * epp, cnt);
   }
   co_await x.EndFlush();
 }
@@ -1312,8 +1318,10 @@ co_await srcx.BeginFetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun
     // in this block's cache is invisible to every other block. Flush exactly
     // the row -- a whole-page flush would also send this block's stale copy
     // of the ~11 OTHER rows sharing the page and clobber their owners.
-    co_await dst.BeginFlush(row * row_elems, row_elems);
-    co_await dst.EndFlush();
+    if (g_publish) {
+      co_await dst.BeginFlush(row * row_elems, row_elems);
+      co_await dst.EndFlush();
+    }
     }   // guards dead here
     if (false) {
     }
@@ -1510,8 +1518,10 @@ co_await third.BeginFetch(third.PageLo(pg * epp), third.PageSpan(pg * epp, epp))
     // same range, which is precisely what a whole-table flush could not
     // promise. Async, so the put overlaps the next page's integration.
     const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
-    co_await x.BeginFlush(pg * epp, cnt);
-    co_await v.BeginFlush(pg * epp, cnt);
+    if (g_publish) {
+      co_await x.BeginFlush(pg * epp, cnt);
+      co_await v.BeginFlush(pg * epp, cnt);
+    }
   }
   // Land them before the kernel exits: the next kernel reads these pages
   // from other blocks, so they must be in the backing store by then.
@@ -2477,6 +2487,15 @@ int main(int argc, char **argv) {
       return true;
     };
 
+    {
+      const u32 pub = (std::getenv("MD_NO_PUBLISH") != nullptr) ? 0u : 1u;
+      cudaMemcpyToSymbol(g_publish, &pub, sizeof(pub));
+      if (pub == 0u) {
+        std::printf("  [MD_NO_PUBLISH] publishing DISABLED -- physics is "
+                    "invalid, timing only\n");
+      }
+    }
+
     // ---- validation layer 2: step-0 statics from geometry alone ----------
     if (a.use_list && !build_list()) return 1;
     force(/*eflag=*/1);
@@ -2550,6 +2569,11 @@ int main(int argc, char **argv) {
     // ---- NVE: energy and momentum must be conserved ----------------------
     const double ke0 = thermo_ke();
     const double e0 = acc[0] + ke0;
+    // ZERO THE PHASE TIMERS HERE. The statics and resort gates above call
+    // force() and build_list() too, and counting those made the phase totals
+    // sum to more than the run they were supposedly decomposing.
+    t_force = 0.0; t_kick = 0.0; t_resort = 0.0; t_build = 0.0;
+    t_force_kern = 0.0; t_ckpt = 0.0; t_ckpt_stock = 0.0; n_ckpt = 0;
     const double t0 = NowMs();
     for (u64 step = 0; step < a.steps; ++step) {
       kick(/*drift=*/1);   // uses f(t)
