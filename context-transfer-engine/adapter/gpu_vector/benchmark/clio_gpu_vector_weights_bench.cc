@@ -195,7 +195,8 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
                                       clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-co_await v.Fetch(base + off, (off + page_elems <= per) ? page_elems : (per - off));
+    co_await v.Fetch(base + off,
+                     (off + page_elems <= per) ? page_elems : (per - off));
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
     {
@@ -247,8 +248,9 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-co_await v.Fetch(base + off, (off + page_elems <= per) ? page_elems : (per - off));
-        auto h = co_await v.HoldPage(
+    co_await v.Fetch(base + off,
+                     (off + page_elems <= per) ? page_elems : (per - off));
+    auto h = co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off));
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);

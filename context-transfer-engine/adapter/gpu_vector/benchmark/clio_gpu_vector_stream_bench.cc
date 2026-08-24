@@ -137,8 +137,8 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-co_await v.Fetch(off, pe);
-        auto h = co_await v.HoldPage(off, pe, /*write=*/true);
+    co_await v.Fetch(off, pe);
+    auto h = co_await v.HoldPage(off, pe, /*write=*/true);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       h[off + i] = Value(p, off + i, zero_pct);
     }

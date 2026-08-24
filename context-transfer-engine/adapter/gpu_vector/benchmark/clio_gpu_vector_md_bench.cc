@@ -444,8 +444,8 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
       const u32 wy = (by + nb + dy) % nb;
       const u64 rowbin0 = (static_cast<u64>(wz) * nb + wy) * nb;
       rbase[q] = rowbin0 * cap * kStride;
-co_await x.Fetch(rbase[q], row_elems);
-            hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
+      co_await x.Fetch(rbase[q], row_elems);
+      hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
       rrun0[q] = hg[q][0].run();
       if (rrun0[q] < row_elems) {
         hg[q][1] = co_await x.HoldPage(rbase[q] + rrun0[q],
@@ -455,10 +455,10 @@ co_await x.Fetch(rbase[q], row_elems);
       rp1[q] = hg[q][1] ? hg[q][1].ptr() : nullptr;
     }
     // Write-hold this row of f and zero it.
-    const u64 fbase = (static_cast<u64>(bz) * nb + by) * static_cast<u64>(nb) *
-                      cap * kStride;
-co_await f.Fetch(fbase, row_elems);
-        gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
+    const u64 fbase =
+        (static_cast<u64>(bz) * nb + by) * static_cast<u64>(nb) * cap * kStride;
+    co_await f.Fetch(fbase, row_elems);
+    gv::Held<float> hf0 = co_await f.HoldPage(fbase, row_elems, true);
     gv::Held<float> hf1;
     const u64 frun0 = hf0.run();
     if (frun0 < row_elems) {
@@ -661,8 +661,8 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-co_await x.Fetch(rb, len);
-                hg[nspans][0] = co_await x.HoldPage(rb, len);
+        co_await x.Fetch(rb, len);
+        hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
           hg[nspans][1] =
@@ -689,8 +689,8 @@ co_await x.Fetch(rb, len);
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-co_await nl.Fetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
-                hn[nguards] =
+        co_await nl.Fetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
+        hn[nguards] =
             co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
         MarkPages(g_nlmask, nl.PageOf(nb0 + off),
                   nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
@@ -947,8 +947,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-co_await x.Fetch(rb, len);
-                hg[nspans][0] = co_await x.HoldPage(rb, len);
+        co_await x.Fetch(rb, len);
+        hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
           hg[nspans][1] =
@@ -970,8 +970,8 @@ co_await x.Fetch(rb, len);
     // and only 9 entries, so thread 0 resolves it once per row.
     const long long _f0 = clock64();
     const u64 fbase = row * row_elems;
-co_await f.Fetch(fbase, row_elems);
-        // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
+    co_await f.Fetch(fbase, row_elems);
+    // ADMISSION, and in a FIXED ORDER: x at the chunk, then f, then nl.
     // Every paged vector needs it, not just x -- f and nl have their own
     // tables and can exhaust them exactly the same way. Tightening only x's
     // reservation re-wedged a 32-slot run precisely because the blanket
@@ -1001,8 +1001,8 @@ co_await f.Fetch(fbase, row_elems);
       const u64 nb0 = row * rowlist;
       u64 off = 0;
       while (off < rowlist && nguards < kMaxNlGuards) {
-co_await nl.Fetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
-                hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
+        co_await nl.Fetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
+        hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
         MarkPages(g_nlmask, nl.PageOf(nb0 + off),
                   nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
         np[nguards] = hn[nguards].ptr();
@@ -1150,8 +1150,8 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float fnb = static_cast<float>(nb);
   for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await x.Fetch(pg * epp, epp);
-        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await x.Fetch(pg * epp, epp);
+    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
     float *const px = hx.ptr();
     const u64 nslots = epp / kStride;
     const u64 slot0 = pg * nslots;
@@ -1252,8 +1252,9 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     gv::Held<float> hd1;
     const u64 drun = hd0.run();
     if (drun < row_elems) {
-co_await dst.Fetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * row_elems + drun, 1));
-            hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
+      co_await dst.Fetch(dst.PageLo(row * row_elems + drun),
+                         dst.PageSpan(row * row_elems + drun, 1));
+      hd1 = co_await dst.HoldPage(row * row_elems + drun, row_elems - drun,
                                   /*write=*/true);
     }
     float *const dp0 = hd0.ptr();
@@ -1302,8 +1303,8 @@ co_await dst.Fetch(dst.PageLo(row * row_elems + drun), dst.PageSpan(row * row_el
         const u64 rb =
             (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-co_await src.Fetch(rb, len);
-                hs[nspans][0] = co_await src.HoldPage(rb, len);
+        co_await src.Fetch(rb, len);
+        hs[nspans][0] = co_await src.HoldPage(rb, len);
         srun[nspans] = hs[nspans][0].run();
         if (srun[nspans] < len) {
           hs[nspans][1] =
@@ -1311,12 +1312,13 @@ co_await src.Fetch(rb, len);
         }
         sp0[nspans] = hs[nspans][0].ptr();
         sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
-co_await srcx.Fetch(rb, len);
-                hx[nspans][0] = co_await srcx.HoldPage(rb, len);
+        co_await srcx.Fetch(rb, len);
+        hx[nspans][0] = co_await srcx.HoldPage(rb, len);
         xrun[nspans] = hx[nspans][0].run();
         if (xrun[nspans] < len) {
-co_await srcx.Fetch(srcx.PageLo(rb + xrun[nspans]), srcx.PageSpan(rb + xrun[nspans], 1));
-                    hx[nspans][1] =
+          co_await srcx.Fetch(srcx.PageLo(rb + xrun[nspans]),
+                              srcx.PageSpan(rb + xrun[nspans], 1));
+          hx[nspans][1] =
               co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);
         }
         xp0[nspans] = hx[nspans][0].ptr();
@@ -1373,8 +1375,8 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst,
   const u64 epp = dst.ElemsPerPage();
   const u64 npages = (dst.size() + epp - 1) / epp;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await dst.Fetch(pg * epp, epp);
-        auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await dst.Fetch(pg * epp, epp);
+    auto h = co_await dst.HoldPage(pg * epp, epp, /*write=*/true);
     float *const p = h.ptr();
     const u64 nslots = epp / kStride;
     for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
@@ -1395,12 +1397,12 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await x.Fetch(pg * epp, epp);
-        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
-co_await v.Fetch(pg * epp, epp);
-        auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
-co_await f.Fetch(pg * epp, epp);
-        auto hf = co_await f.HoldPage(pg * epp, epp);
+    co_await x.Fetch(pg * epp, epp);
+    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await v.Fetch(pg * epp, epp);
+    auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await f.Fetch(pg * epp, epp);
+    auto hf = co_await f.HoldPage(pg * epp, epp);
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
     const float *const pf = hf.ptr();
@@ -1447,8 +1449,8 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
   }
   for (u64 it = 0; it < passes; ++it) {
     for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await x.Fetch(pg * epp, epp);
-            auto h = co_await x.HoldPage(pg * epp, epp);   // READ hold only
+      co_await x.Fetch(pg * epp, epp);
+      auto h = co_await x.HoldPage(pg * epp, epp);  // READ hold only
       // Is the guard born valid? Its slot must hold the page we asked for.
       // This separates "the hold returned the wrong frame" from "the frame
       // was right and the slot was recycled out from under the pin".
@@ -1495,10 +1497,10 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await x.Fetch(pg * epp, epp);
-        auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
-co_await v.Fetch(pg * epp, epp);
-        auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await x.Fetch(pg * epp, epp);
+    auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    co_await v.Fetch(pg * epp, epp);
+    auto hv = co_await v.HoldPage(pg * epp, epp, /*write=*/true);
     // THE TEST: a THIRD vector held read-only alongside the other two, the
     // pattern the real integrator has (x write, v write, f read) and the
     // ballistic gate never had. The value is only sunk, so the physics --
@@ -1506,8 +1508,8 @@ co_await v.Fetch(pg * epp, epp);
     // is untouched.
     gv::Held<float> ht;
     if (use_third) {
-co_await third.Fetch(pg * epp, epp);
-            ht = co_await third.HoldPage(pg * epp, epp);
+      co_await third.Fetch(pg * epp, epp);
+      ht = co_await third.HoldPage(pg * epp, epp);
     }
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
@@ -1572,10 +1574,10 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
   const u64 npages = (x.size() + epp - 1) / epp;
   double ke = 0.0, mx = 0.0, my = 0.0, mz = 0.0;
   for (u64 pg = block; pg < npages; pg += nblocks) {
-co_await x.Fetch(pg * epp, epp);
-        auto hx = co_await x.HoldPage(pg * epp, epp);
-co_await v.Fetch(pg * epp, epp);
-        auto hv = co_await v.HoldPage(pg * epp, epp);
+    co_await x.Fetch(pg * epp, epp);
+    auto hx = co_await x.HoldPage(pg * epp, epp);
+    co_await v.Fetch(pg * epp, epp);
+    auto hv = co_await v.HoldPage(pg * epp, epp);
     const float *const px = hx.ptr();
     const float *const pv = hv.ptr();
     const u64 nslots = epp / kStride;
