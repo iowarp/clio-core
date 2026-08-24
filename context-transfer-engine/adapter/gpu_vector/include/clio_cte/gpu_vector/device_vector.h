@@ -874,8 +874,10 @@ class DeviceVector {
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
-    t->context_.op_flags_ =
-        clio::cte::core::Context::kBlobNameRawInt32;
+    // OR, NEVER ASSIGN. op_flags_ carries more than the name encoding now,
+    // and a plain assignment here wiped the generational bit that the flush
+    // had just set -- so every generational put went out as an ordinary one.
+    t->context_.op_flags_ |= clio::cte::core::Context::kBlobNameRawInt32;
     // A page nobody has written yet has no blob; the CTE creates it and
     // returns success, so the vector needs no first-touch case of its own.
     t->context_.create_on_get_ = true;
@@ -1003,8 +1005,10 @@ class DeviceVector {
       t->context_.generation_ = bt->flush_generation;
     }
     t->context_.compress_preset_ = h_->compress_preset_;
-    t->context_.op_flags_ =
-        clio::cte::core::Context::kBlobNameRawInt32;
+    // OR, NEVER ASSIGN. op_flags_ carries more than the name encoding now,
+    // and a plain assignment here wiped the generational bit that the flush
+    // had just set -- so every generational put went out as an ordinary one.
+    t->context_.op_flags_ |= clio::cte::core::Context::kBlobNameRawInt32;
     ClearRunCtx(t);
     if (h_->stat_puts_ != nullptr) {
       atomicAdd(h_->stat_puts_, static_cast<unsigned long long>(n));
