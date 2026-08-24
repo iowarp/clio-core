@@ -199,6 +199,8 @@ struct Args {
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
+  u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
+  u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
   // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
@@ -1816,6 +1818,99 @@ static u32 AtLeastSlots(u32 want, u32 floor_slots, const char *what) {
  *
  * Size it to what the kernel pins, with a little headroom, and let it page.
  */
+/**
+ * The list's page geometry, needed BEFORE the list is built so the cache
+ * budget can account for it. Kept here so the planner and the construction
+ * site cannot disagree about how big a list page is.
+ */
+struct NlGeom { clio::run::u64 page_bytes, pages; };
+static NlGeom NlGeometry(u32 nb, u32 cap, u32 maxneigh, clio::run::u64 page_kb) {
+  const clio::run::u64 rowlist =
+      static_cast<clio::run::u64>(nb) * cap * maxneigh;
+  clio::run::u64 pb = page_kb * 1024;
+  if (pb == 0) {
+    pb = rowlist * sizeof(int);
+    clio::run::u64 pw = 4096;
+    while (pw < pb) pw <<= 1;
+    pb = pw;
+  }
+  const clio::run::u64 pe = pb / sizeof(int);
+  const clio::run::u64 raw = static_cast<clio::run::u64>(nb) * nb * rowlist;
+  return NlGeom{pb, (raw + pe - 1) / pe};
+}
+
+/**
+ * Divide a VRAM budget across the six per-block caches.
+ *
+ * EVERY CACHE IS PER BLOCK, so each frame is paid for `nblocks` times -- that
+ * multiplier, not the data, is what makes a paged run expensive: at 16 blocks
+ * a fully resident configuration holds sixteen copies of everything.
+ *
+ * The split is not proportional to size. The atom vectors (x, v, x2, v2, f)
+ * are small and every one of them is re-read each step, so residency is what
+ * keeps evictions at zero; the list is an order of magnitude larger and is
+ * STREAMED one row at a time, so frames spent on it buy almost nothing. So:
+ * floors first, then take the atom vectors as close to resident as the budget
+ * allows, then hand the remainder to the list.
+ */
+struct CachePlan { u32 slots, fslots, nlslots; clio::run::u64 bytes; };
+static clio::run::u64 PlanCost(u32 nblocks, u32 s, u32 fs, u32 nls,
+                               clio::run::u64 pb, clio::run::u64 nlpb) {
+  return static_cast<clio::run::u64>(nblocks) *
+         ((4ull * s + fs) * pb + static_cast<clio::run::u64>(nls) * nlpb);
+}
+static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
+                       clio::run::u64 npages, clio::run::u64 page_bytes,
+                       clio::run::u64 nl_pages, clio::run::u64 nl_page_bytes,
+                       CachePlan *out) {
+  const u32 s_max = static_cast<u32>(npages + 2);
+  const u32 nl_max = (nl_pages == 0) ? 0u : static_cast<u32>(nl_pages + 2);
+  // THE LIST'S FLOOR IS A BYTE COUNT, NOT A FRAME COUNT. kMinSlotsNl counts
+  // the guards ONE row pins, but the force pass keeps far more of the list
+  // live than that: measured at lattice 50, 64 frames of 2 MB passes and 32
+  // fails, while 128 frames of 1 MB passes and 64 fails -- the same 128 MB
+  // per block either way. Sizing the list by frames let the planner hand it
+  // 6 and the run died in the list build with an illegal access.
+  const clio::run::u64 kNlLiveBytes = 128ull * 1024 * 1024;
+  u32 nl_floor = 0;
+  if (nl_pages != 0) {
+    nl_floor = static_cast<u32>((kNlLiveBytes + nl_page_bytes - 1) /
+                                nl_page_bytes);
+    if (nl_floor < kMinSlotsNl) nl_floor = kMinSlotsNl;
+    if (nl_floor > nl_max) nl_floor = nl_max;
+  }
+  u32 s = kMinSlotsX, fs = kMinSlotsF, nls = nl_floor;
+  if (s > s_max) s = s_max;
+  if (nls > nl_max) nls = nl_max;
+  if (PlanCost(nblocks, s, fs, nls, page_bytes, nl_page_bytes) > budget) {
+    std::fprintf(stderr,
+                 "--vram-mb %llu is below the floor: %u blocks x (4x%u + %u) "
+                 "atom frames + %u list frames needs %llu MB minimum\n",
+                 (unsigned long long)(budget / (1024 * 1024)), nblocks, s, fs,
+                 nls,
+                 (unsigned long long)(PlanCost(nblocks, s, fs, nls, page_bytes,
+                                               nl_page_bytes) /
+                                      (1024 * 1024)));
+    return false;
+  }
+  // Atom vectors toward residency first.
+  while (s < s_max &&
+         PlanCost(nblocks, s + 1, fs + 1, nls, page_bytes, nl_page_bytes) <=
+             budget) {
+    ++s;
+    if (fs < s_max) ++fs;
+  }
+  // Whatever is left goes to the list.
+  while (nls < nl_max &&
+         PlanCost(nblocks, s, fs, nls + 1, page_bytes, nl_page_bytes) <=
+             budget) {
+    ++nls;
+  }
+  *out = CachePlan{s, fs, nls,
+                   PlanCost(nblocks, s, fs, nls, page_bytes, nl_page_bytes)};
+  return true;
+}
+
 static u32 NlSlots(clio::run::u64 nl_pages) {
   // MEASURED, not derived. kMaxNlGuards (4) and rowchunk (4) describe what a
   // single row pins, but the force pass keeps far more of the list live than
@@ -1865,6 +1960,8 @@ int main(int argc, char **argv) {
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
+    else if (want("--nlslots")) a.nlslots = static_cast<u32>(atoi(argv[++i]));
+    else if (want("--vram-mb")) a.vram_mb = static_cast<u64>(atol(argv[++i]));
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
@@ -1939,6 +2036,32 @@ int main(int argc, char **argv) {
   // the resident regime: the default cache holds everything. An explicit
   // --slots below that is a configuration for later stages, not this gate.
   u32 slots = (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  // --vram-mb divides a budget across every per-block cache. Explicit
+  // per-vector flags still win, so a single vector can be pinned while the
+  // rest fit the budget.
+  if (a.vram_mb != 0) {
+    const NlGeom nlg =
+        a.md ? NlGeometry(g.nb, g.cap, a.maxneigh, a.nl_page_kb)
+             : NlGeom{0, 0};
+    CachePlan plan;
+    if (!PlanCaches(a.vram_mb * 1024ull * 1024ull, a.blocks, npages,
+                    page_bytes, nlg.pages, nlg.page_bytes, &plan)) {
+      return 1;
+    }
+    if (a.slots == 0) slots = plan.slots;
+    if (a.fslots == 0) a.fslots = plan.fslots;
+    if (a.vslots == 0) a.vslots = plan.slots;
+    if (a.ppslots == 0) a.ppslots = plan.slots;
+    if (a.nlslots == 0 && a.md) a.nlslots = plan.nlslots;
+    std::printf("  VRAM budget %llu MB -> %u atom frames/block (of %llu "
+                "resident), %u f, %u list frames (of %llu); caches use "
+                "%llu MB over %u blocks\n",
+                (unsigned long long)a.vram_mb, plan.slots,
+                (unsigned long long)(npages + 2), plan.fslots, plan.nlslots,
+                (unsigned long long)(nlg.pages ? nlg.pages + 2 : 0),
+                (unsigned long long)(plan.bytes / (1024 * 1024)),
+                a.blocks);
+  }
   if (slots < kMinSlotsX) {
     std::printf("  note: --slots %u is below the %u frames these kernels pin "
                 "at once; raising to %u\n",
@@ -1948,7 +2071,13 @@ int main(int argc, char **argv) {
   // Which regime this configuration is IN: the cache either can hold every
   // page of the working set or it cannot. The gates below key off this
   // rather than assuming residency.
-  const bool expect_resident = (static_cast<clio::run::u64>(slots) >= npages);
+  // A BUDGET MEANS EVICTIONS ARE THE POINT, not a broken promise. The
+  // resident contract only applies when every cache was sized to hold its
+  // whole vector; under --vram-mb the caches are deliberately smaller, and
+  // the f vector evicting is the budget working. Energy still has to hold.
+  const bool expect_resident =
+      (static_cast<clio::run::u64>(slots) >= npages) && a.vram_mb == 0 &&
+      a.fslots == 0 && a.nlslots == 0;
 
   std::printf(
       "eternia-MD stage 1 (integrator + ballistic gate)\n"
@@ -2292,7 +2421,10 @@ int main(int argc, char **argv) {
       return 1;
     }
     gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks,
-                       NlSlots(nl_pages), nl_elems);
+                       (a.nlslots != 0)
+                           ? AtLeastSlots(a.nlslots, kMinSlotsNl, "nl")
+                           : NlSlots(nl_pages),
+                       nl_elems);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
