@@ -365,6 +365,9 @@ struct YCoroMain {
       _yc_lane->coro_resume_ = _yc_lane->coro_top_;                           \
     }                                                                         \
     __syncthreads();                                                          \
+    /* Shared did not survive the park; bring the persistent arena back  */   \
+    /* BEFORE resuming, while every thread is still here to help copy.   */   \
+    ::clio::run::gpu::PersistRestore();                                       \
     for (;;) {                                                                \
       __builtin_coro_resume(                                                  \
           reinterpret_cast<void *>(_yc_lane->coro_resume_));                  \
@@ -378,11 +381,15 @@ struct YCoroMain {
     __syncthreads();                                                          \
     if (__builtin_coro_done(                                                  \
             reinterpret_cast<void *>(_yc_lane->coro_top_))) {                 \
+      ::clio::run::gpu::PersistClear();                                       \
       __builtin_coro_destroy(                                                 \
           reinterpret_cast<void *>(_yc_lane->coro_top_));                     \
       _yc_lane->coro_top_ = 0;                                                \
       _yc_lane->coro_resume_ = 0;                                             \
       _yc_lane->sp_ = sizeof(clio::run::gpu::YieldLaneHeader);                \
+    } else {                                                                  \
+      /* Parked: the kernel is about to exit and take shared with it. */      \
+      ::clio::run::gpu::PersistSave();                                        \
     }                                                                         \
   } while (0)
 

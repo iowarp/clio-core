@@ -158,6 +158,18 @@ enum YieldError : clio::run::u32 {
   kYieldErrOverflow = 2,
 };
 
+/** Bytes of block-uniform shared state that survive a park. */
+#define CLIO_PERSIST_BYTES 1024
+/** Per-block backing-store stride: the arena plus its header. */
+#define CLIO_PERSIST_STRIDE (CLIO_PERSIST_BYTES + 16)
+
+/** Header of one block's persist backing store. */
+struct PersistHeader {
+  /** Live bytes of the arena, or 0 when nothing is saved. */
+  clio::run::u32 bytes_;
+  clio::run::u32 pad_[3];
+};
+
 /** Header of one call frame: everything before the locals. */
 struct YieldFrameHeader {
   /** 0 = this call has not yielded yet; else the __LINE__ to resume at. */
@@ -173,6 +185,12 @@ struct YieldStackView {
   char *base_ = nullptr;
   clio::run::u32 bytes_per_lane_ = 0;
   clio::run::u32 lanes_per_block_ = 0;
+  /** Backing store for the persistent shared arena, one region per LOGICAL
+   *  block. Shared memory does not survive a park -- the driver exits the
+   *  kernel -- so the arena is copied out here on suspend and back on
+   *  resume. Indexed by LOGICAL block, never blockIdx.x: the driver compacts
+   *  the grid between rounds, so a block resumes on different hardware. */
+  char *persist_base_ = nullptr;
 
 #if defined(__CUDACC__)
   /** Region for one lane of one LOGICAL block. */
@@ -181,6 +199,11 @@ struct YieldStackView {
     const clio::run::u64 idx =
         static_cast<clio::run::u64>(logical_block) * lanes_per_block_ + lane;
     return base_ + idx * bytes_per_lane_;
+  }
+  /** This logical block's persistent-arena backing store. */
+  __device__ char *PersistLane(clio::run::u32 logical_block) const {
+    return persist_base_ +
+           static_cast<clio::run::u64>(logical_block) * CLIO_PERSIST_STRIDE;
   }
 #endif
 };
@@ -194,13 +217,41 @@ struct YieldSmem {
   YieldBlockState *block_state_;
   /** This block's logical id, so device functions need not be told it. */
   clio::run::u32 logical_block_;
-  clio::run::u32 pad_;
+  /** Live bytes of persist_, set by CLIO_SHARED_PERSIST. */
+  clio::run::u32 persist_bytes_;
+  /** THE PERSISTENT SHARED ARENA. Lives inside YieldSmem on purpose:
+   *  CLIO_YIELD_SMEM_BYTES is sizeof(YieldSmem), so every kernel that already
+   *  offsets its own shared past it keeps working with no change. */
+  __align__(16) char persist_[CLIO_PERSIST_BYTES];
 };
 
 }  // namespace clio::run::gpu
 
 /** Dynamic shared memory a yieldable kernel must reserve, in bytes. */
 #define CLIO_YIELD_SMEM_BYTES (sizeof(clio::run::gpu::YieldSmem))
+
+/**
+ * Block-uniform shared state that SURVIVES A PARK.
+ *
+ *     struct Tables { const float *sp[9]; clio::run::u64 run[9]; };
+ *     CLIO_SHARED_PERSIST(Tables, t);      // t.sp[q], t.run[q]
+ *
+ * Declares `Type &name` over the block's persistent arena and tells the
+ * driver how much of it to carry across suspensions. Plain __shared__ is
+ * GARBAGE after a co_await, because the driver exits the kernel to suspend;
+ * anything block-uniform that is read after a suspension belongs here.
+ *
+ * One arena per block, so one such declaration per coroutine. Declare it
+ * before the first co_await -- the size has to be known before anything can
+ * suspend.
+ */
+#define CLIO_SHARED_PERSIST(Type, name)                                       \
+  static_assert(sizeof(Type) <= CLIO_PERSIST_BYTES,                           \
+                "CLIO_SHARED_PERSIST: type is larger than the arena; raise "  \
+                "CLIO_PERSIST_BYTES or stage less");                          \
+  Type &name = *reinterpret_cast<Type *>(                                     \
+      ::clio::run::gpu::SharedPersistBase());                                 \
+  ::clio::run::gpu::PersistDeclare(sizeof(Type))
 
 /**
  * Limit checks. On by default: the failures they catch (nesting too deep, a
@@ -229,6 +280,87 @@ __device__ __forceinline__ YieldSmem &YieldTls() {
   return *reinterpret_cast<YieldSmem *>(clio_yield_smem);
 }
 
+/**
+ * PERSISTENT SHARED STATE ACROSS A PARK.
+ *
+ * A suspension here is a KERNEL EXIT, which destroys shared memory. The
+ * coroutine frame survives only because it was deliberately placed in global
+ * memory; the language preserves nothing else, and __shared__ has static
+ * storage duration in another address space, so the coroutine transform will
+ * never promote it into the frame. These three calls close that gap for one
+ * block-uniform arena: the driver copies it out on suspend and back on
+ * resume.
+ *
+ * THIS PRESERVES BITS, NOT VALIDITY. Restoring a pointer gives back the same
+ * address; whether it still points at what you meant is the caller's problem.
+ * It is safe for pointers into page frames only because the guards that pin
+ * those frames live in the coroutine frame and so survive the park too.
+ */
+__device__ __forceinline__ char *SharedPersistBase() {
+  return YieldTls().persist_;
+}
+
+/** Declare how much of the arena is live. Block-collective. */
+__device__ __forceinline__ void PersistDeclare(clio::run::u32 bytes) {
+  if (threadIdx.x == 0) {
+    YieldTls().persist_bytes_ = (bytes + 3u) & ~3u;
+  }
+  __syncthreads();
+}
+
+/** Copy the arena back from global. Block-collective; call before resuming. */
+__device__ __forceinline__ void PersistRestore() {
+  YieldSmem &s = YieldTls();
+  if (s.stack_.persist_base_ != nullptr) {
+    PersistHeader *h =
+        reinterpret_cast<PersistHeader *>(s.stack_.PersistLane(s.logical_block_));
+    const clio::run::u32 n =
+        (h->bytes_ <= CLIO_PERSIST_BYTES) ? h->bytes_ : 0u;
+    if (n != 0) {
+      const clio::run::u32 *src =
+          reinterpret_cast<const clio::run::u32 *>(h + 1);
+      clio::run::u32 *dst = reinterpret_cast<clio::run::u32 *>(s.persist_);
+      for (clio::run::u32 i = threadIdx.x; i < (n >> 2); i += blockDim.x) {
+        dst[i] = src[i];
+      }
+      // Shared was wiped, so the live-byte count has to come back too.
+      if (threadIdx.x == 0) s.persist_bytes_ = n;
+    }
+  }
+  __syncthreads();
+}
+
+/** Copy the arena out to global. Block-collective; call after a suspend. */
+__device__ __forceinline__ void PersistSave() {
+  __syncthreads();   // every thread's writes to the arena must be visible
+  YieldSmem &s = YieldTls();
+  if (s.stack_.persist_base_ != nullptr) {
+    const clio::run::u32 n =
+        (s.persist_bytes_ <= CLIO_PERSIST_BYTES) ? s.persist_bytes_ : 0u;
+    PersistHeader *h =
+        reinterpret_cast<PersistHeader *>(s.stack_.PersistLane(s.logical_block_));
+    if (n != 0) {
+      const clio::run::u32 *src =
+          reinterpret_cast<const clio::run::u32 *>(s.persist_);
+      clio::run::u32 *dst = reinterpret_cast<clio::run::u32 *>(h + 1);
+      for (clio::run::u32 i = threadIdx.x; i < (n >> 2); i += blockDim.x) {
+        dst[i] = src[i];
+      }
+    }
+    if (threadIdx.x == 0) h->bytes_ = n;
+  }
+  __syncthreads();
+}
+
+/** Forget the saved arena; the coroutine that owned it has finished. */
+__device__ __forceinline__ void PersistClear() {
+  YieldSmem &s = YieldTls();
+  if (s.stack_.persist_base_ != nullptr && threadIdx.x == 0) {
+    reinterpret_cast<PersistHeader *>(
+        s.stack_.PersistLane(s.logical_block_))->bytes_ = 0;
+  }
+}
+
 /** Publish the stack for this block. Called once, by the kernel prologue. */
 __device__ __forceinline__ void YieldTlsPublish(const YieldStackView &stack,
                                                 YieldBlockState *block_state,
@@ -238,6 +370,10 @@ __device__ __forceinline__ void YieldTlsPublish(const YieldStackView &stack,
     s.stack_ = stack;
     s.block_state_ = block_state;
     s.logical_block_ = logical_block;
+    // ZERO THE ARENA'S LIVE-BYTE COUNT. Shared memory starts uninitialized,
+    // so a kernel that never declares CLIO_SHARED_PERSIST would otherwise
+    // hand PersistSave a garbage length and walk off the end of shared.
+    s.persist_bytes_ = 0;
     // Stamp "finished" up front: any return that is not a yield -- including
     // paths nobody thought about -- then ends the block instead of leaving the
     // driver relaunching it forever.
@@ -545,6 +681,12 @@ class YieldStack {
         static_cast<size_t>(nblocks_) * lanes_per_block_ * bytes_per_lane_;
     d_base_ = ctp::GpuApi::Malloc<char>(total);
     ctp::GpuApi::Memset(d_base_, 0, total);
+    // Backing store for the persistent shared arena, one region per LOGICAL
+    // block. Zeroed, so bytes_ == 0 and the first entry restores nothing.
+    const size_t ptotal =
+        static_cast<size_t>(nblocks_) * CLIO_PERSIST_STRIDE;
+    d_persist_ = ctp::GpuApi::Malloc<char>(ptotal);
+    ctp::GpuApi::Memset(d_persist_, 0, ptotal);
 #endif
     Reset();
   }
@@ -554,8 +696,12 @@ class YieldStack {
     if (d_base_ != nullptr) {
       ctp::GpuApi::Free(d_base_);
     }
+    if (d_persist_ != nullptr) {
+      ctp::GpuApi::Free(d_persist_);
+    }
 #endif
     d_base_ = nullptr;
+    d_persist_ = nullptr;
   }
 
   YieldStack(const YieldStack &) = delete;
@@ -566,6 +712,7 @@ class YieldStack {
     v.base_ = d_base_;
     v.bytes_per_lane_ = bytes_per_lane_;
     v.lanes_per_block_ = lanes_per_block_;
+    v.persist_base_ = d_persist_;
     return v;
   }
 
@@ -584,6 +731,7 @@ class YieldStack {
   clio::run::u32 lanes_per_block_;
   clio::run::u32 bytes_per_lane_;
   char *d_base_ = nullptr;
+  char *d_persist_ = nullptr;
 };
 
 #if !CTP_IS_DEVICE_PASS
