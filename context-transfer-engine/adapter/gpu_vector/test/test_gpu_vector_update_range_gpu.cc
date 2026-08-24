@@ -67,16 +67,15 @@ static u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
 /** Block b writes and publishes page b, leaving it resident in b's table. */
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u32 block) {
   const u64 off = static_cast<u64>(block) * kEpp;
-  co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, kEpp));
-  co_await v.AwaitFetch();
+  // Synchronous forms: this seed has nothing to overlap the transfers with.
+  co_await v.Fetch(v.PageLo(off), v.PageSpan(off, kEpp));
   {
     auto h = co_await v.HoldPage(off, kEpp, /*write=*/true);
     for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
       h[off + i] = Pattern(block, i);
     }
   }
-  co_await v.BeginFlush(off, kEpp);
-  co_await v.EndFlush();
+  co_await v.Flush(off, kEpp);
 }
 
 /** Block b reads the page OWNED BY ANOTHER BLOCK through its owner. */
@@ -95,8 +94,7 @@ __device__ gy::YCoroMain CopyCoro(gv::DeviceVector<u32> v, u32 block,
                                   u32 nblocks, unsigned long long *bad) {
   const u32 owner = (block + 2u) % nblocks;
   const u64 off = static_cast<u64>(owner) * kEpp;
-  co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, kEpp));
-  co_await v.AwaitFetch();
+  co_await v.Fetch(v.PageLo(off), v.PageSpan(off, kEpp));
   auto h = co_await v.HoldPage(off, kEpp);
   for (u64 i = threadIdx.x; i < kCheck; i += blockDim.x) {
     if (h[off + i] != Pattern(owner, i)) atomicAdd(bad, 1ull);

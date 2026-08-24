@@ -233,6 +233,19 @@ class DeviceVector {
   }
 
   /**
+   * BeginFetch then AwaitFetch. Same ranges, same rules -- this is the whole
+   * of it, for callers with nothing to overlap the transfer with. Splitting
+   * the two is what lets a caller compute over one range while the next is
+   * in flight; when there is no such work, the split is only noise.
+   */
+  template <typename... Args>
+  __device__ clio::run::gpu::YCoroTask Fetch(Args... args) {
+    co_await BeginFetch(args...);
+    co_await AwaitFetch();
+    co_return;
+  }
+
+  /**
    * The page holding `off`. Does NOT fault: BeginFetch/AwaitFetch put it
    * there. A page that is still absent is a caller error and the kernel
    * stops -- proceeding would read another page's bytes.
@@ -400,6 +413,20 @@ class DeviceVector {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
     if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();
+    co_return;
+  }
+
+  /**
+   * BeginFlush then EndFlush. The put has landed when this returns, so the
+   * range is readable by any other block. Prefer the split form inside a
+   * loop, where the put of one page overlaps the next page's compute.
+   */
+  template <typename... Rest>
+  __device__ clio::run::gpu::YCoroTask Flush(clio::run::u64 off,
+                                             clio::run::u64 count,
+                                             Rest... rest) {
+    co_await BeginFlush(off, count, rest...);
+    co_await EndFlush();
     co_return;
   }
 
