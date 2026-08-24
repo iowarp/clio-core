@@ -2,26 +2,36 @@
 /**
  * Distributed generational put/get -- CTE only, no GPU, no benchmark.
  *
- * Two nodes, ONE blob, two non-overlapping regions. Each iteration a node
- * writes its own region and then reads the OTHER node's region, naming the
- * generation both sides are on. The regions SWAP every iteration, so neither
- * node can be reading a region it just wrote, and a cached or stale answer
- * shows up as the wrong iteration's bytes.
+ * Two nodes, TWO blobs, and the blobs SWAP each iteration: on iteration i a
+ * node writes one blob and reads the other, and which one it writes flips
+ * every iteration. So each blob has EXACTLY ONE WRITER per iteration, and
+ * that writer alternates between the nodes.
  *
- *   iter 0:  P1 put [0,R)      P2 put [R,2R)
- *            P1 get [R,2R)     P2 get [0,R)
- *   iter 1:  P1 put [R,2R)     P2 put [0,R)
- *            P1 get [0,R)      P2 get [R,2R)
+ *   iter 0:  P1 put blobA        P2 put blobB
+ *            P1 get blobB        P2 get blobA
+ *   iter 1:  P1 put blobB        P2 put blobA
+ *            P1 get blobA        P2 get blobB
+ *
+ * WHY ONE WRITER PER BLOB IS THE RIGHT SHAPE. This models the STENCIL
+ * exchange, which is the property the paged vector needs: in a domain
+ * decomposition each process writes only its own cells and reads its
+ * neighbour's, so a page has one writer and its readers never write it. The
+ * earlier version of this test had both nodes writing disjoint regions of ONE
+ * blob -- that is the RESORT/migration phase, not the stencil, and it is the
+ * case where a per-blob generation cannot work at all: a reader's own put
+ * raises the blob to the generation it is waiting for and releases it early.
+ * Migration is a barrier problem, not a versioning one; it is deliberately
+ * out of scope here.
  *
  * There is deliberately NO barrier between the put and the get: the
  * generation is the only thing ordering them. That is the claim under test.
  *
- * WHAT IS ASSERTED. A generational get promises AT LEAST the generation
- * asked for, so a reader may legitimately see a NEWER iteration if the peer
- * has raced ahead. What it must never see is an OLDER one, and what it sees
- * must be one whole snapshot rather than a mix -- so each region carries the
+ * WHAT IS ASSERTED. A generational get promises AT LEAST the generation asked
+ * for, so a reader may legitimately see a NEWER iteration if the peer has
+ * raced ahead. What it must never see is an OLDER one, and what it sees must
+ * be one whole snapshot rather than a mix -- so each blob carries the
  * iteration that wrote it in its first element, and the check is
- * "seen >= asked, and the rest of the region agrees with seen".
+ * "seen >= asked, and the rest of the blob agrees with seen".
  */
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/singletons.h>
@@ -133,7 +143,8 @@ int main() {
     return 1;
   }
   const core::TagId tag = tagf->tag_id_;
-  const std::string blob = "gen_swap";
+  // TWO blobs. Each is written by exactly one node per iteration.
+  const std::string blob_name[2] = {"gen_swap_a", "gen_swap_b"};
 
   Step(node, "barrier-start");
   if (!StartBarrier(cte, tag, node, nodes, timeout_s)) return 1;
@@ -143,19 +154,20 @@ int main() {
 
   for (int it = 0; it < iters; ++it) {
     const u64 gen = static_cast<u64>(it) + 1;   // 0 means "no generation"
-    // Regions swap every iteration, so a node never reads what it just wrote.
-    const int my_region = ((node - 1) + it) % 2;
-    const int peer_region = 1 - my_region;
+    // Blobs swap every iteration, so a node never reads what it just wrote,
+    // and each blob's single writer alternates between the nodes.
+    const int my_blob = ((node - 1) + it) % 2;
+    const int peer_blob = 1 - my_blob;
 
     // ---- write my region, published AS this generation ----
     for (u64 i = 0; i < kRegionElems; ++i) {
-      wbuf[i] = (i == 0) ? static_cast<u32>(it) : Pattern(my_region, i, it);
+      wbuf[i] = (i == 0) ? static_cast<u32>(it) : Pattern(my_blob, i, it);
     }
     core::Context put_ctx;
     put_ctx.op_flags_ |= core::Context::kGenerational;
     put_ctx.generation_ = gen;
     auto pf = cte.AsyncPutBlob(
-        tag, blob, static_cast<u64>(my_region) * kRegionBytes, kRegionBytes,
+        tag, blob_name[my_blob], 0, kRegionBytes,
         reinterpret_cast<char *>(wbuf.data()), 0.5f, put_ctx, 0u,
         clio::run::PoolQuery::Dynamic());
     pf.Wait();
@@ -174,8 +186,8 @@ int main() {
     get_ctx.op_flags_ |= core::Context::kGenerational;
     get_ctx.generation_ = gen;
     auto gf = cte.AsyncGetBlob(
-        tag, blob, static_cast<u64>(peer_region) * kRegionBytes, kRegionBytes,
-        0u, reinterpret_cast<char *>(rbuf.data()),
+        tag, blob_name[peer_blob], 0, kRegionBytes, 0u,
+        reinterpret_cast<char *>(rbuf.data()),
         clio::run::PoolQuery::Dynamic(), get_ctx);
     gf.Wait();
     if (gf->GetReturnCode() != 0) {
@@ -188,16 +200,16 @@ int main() {
     const int seen = static_cast<int>(rbuf[0]);
     int bad = 0;
     for (u64 i = 1; i < kRegionElems; ++i) {
-      if (rbuf[i] != Pattern(peer_region, i, seen)) ++bad;
+      if (rbuf[i] != Pattern(peer_blob, i, seen)) ++bad;
     }
     const bool is_stale = seen < it;
     if (is_stale) ++stale;
     if (bad != 0) ++torn;
     if (is_stale || bad != 0) ++failures;
     std::fprintf(stderr,
-                 "[gen-node%d] iter %d gen %llu: wrote r%d, read r%d -> "
+                 "[gen-node%d] iter %d gen %llu: wrote blob%d, read blob%d -> "
                  "iter %d %s%s\n",
-                 node, it, (unsigned long long)gen, my_region, peer_region,
+                 node, it, (unsigned long long)gen, my_blob, peer_blob,
                  seen, is_stale ? "STALE " : "",
                  bad != 0 ? "TORN" : (is_stale ? "" : "ok"));
   }

@@ -1758,7 +1758,14 @@ struct Context {
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
              actual_original_size_, actual_compressed_size_,
              actual_compression_ratio_, actual_compress_time_ms_,
-             actual_psnr_db_);
+             actual_psnr_db_,
+             // A FIELD NOT LISTED HERE DOES NOT CROSS THE WIRE. These three
+             // were set on the task and then silently dropped on the first
+             // remote hop, so every behaviour they select was local-only:
+             // a generational get forwarded to the blob's owner arrived as
+             // an ordinary one and was served immediately with stale bytes,
+             // while the same call on the owning node worked perfectly.
+             create_on_get_, op_flags_, generation_);
   }
 
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
