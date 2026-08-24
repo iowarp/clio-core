@@ -1864,11 +1864,12 @@ static NlGeom NlGeometry(u32 nb, u32 cap, u32 maxneigh, clio::run::u64 page_kb) 
  * floors first, then take the atom vectors as close to resident as the budget
  * allows, then hand the remainder to the list.
  */
-struct CachePlan { u32 slots, fslots, nlslots; clio::run::u64 bytes; };
-static clio::run::u64 PlanCost(u32 nblocks, u32 s, u32 fs, u32 nls,
+struct CachePlan { u32 slots, vslots, fslots, nlslots; clio::run::u64 bytes; };
+/** x, x2 and v2 share `s`; v and f are sized separately. */
+static clio::run::u64 PlanCost(u32 nblocks, u32 s, u32 vs, u32 fs, u32 nls,
                                clio::run::u64 pb, clio::run::u64 nlpb) {
   return static_cast<clio::run::u64>(nblocks) *
-         ((4ull * s + fs) * pb + static_cast<clio::run::u64>(nls) * nlpb);
+         ((3ull * s + vs + fs) * pb + static_cast<clio::run::u64>(nls) * nlpb);
 }
 static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
                        clio::run::u64 npages, clio::run::u64 page_bytes,
@@ -1876,12 +1877,10 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
                        CachePlan *out) {
   const u32 s_max = static_cast<u32>(npages + 2);
   const u32 nl_max = (nl_pages == 0) ? 0u : static_cast<u32>(nl_pages + 2);
-  // The list floor WAS 128 MB per block, because BuildListCoro dirtied every
-  // row it built and never published one -- a dirty page is unevictable, so
-  // the table filled and EvictPages trapped. That is fixed at the write site,
-  // and both passes touch ONE row at a time, so a few frames plus fetch
-  // headroom is the real floor. Frames beyond it buy fewer refetches, not
-  // correctness, so the planner spends what is left over here.
+  // The list floor WAS 128 MB per block, which described a bug: the build
+  // pass dirtied every row and never published one, and a dirty page cannot
+  // be evicted. That is fixed at the write site; both passes read one row at
+  // a time, so a few frames plus fetch headroom is the real floor.
   const clio::run::u64 kNlLiveBytes = 16ull * 1024 * 1024;
   u32 nl_floor = 0;
   if (nl_pages != 0) {
@@ -1890,35 +1889,53 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
     if (nl_floor < kMinSlotsNl) nl_floor = kMinSlotsNl;
     if (nl_floor > nl_max) nl_floor = nl_max;
   }
-  u32 s = kMinSlotsX, fs = kMinSlotsF, nls = nl_floor;
+  // MEASURED FLOOR, not derived. kMinSlotsX/kMinSlotsF count what one hold
+  // pins, and sizing v and f by that crashed: 16 frames fails, 24 passes.
+  // Guessing a floor from the guard count has now been wrong twice -- the
+  // list's floor was the same mistake -- so it is pinned to what runs.
+  const u32 kAtomFloor = 24;
+  u32 s = kAtomFloor, vs = kAtomFloor, fs = kAtomFloor, nls = nl_floor;
   if (s > s_max) s = s_max;
-  if (nls > nl_max) nls = nl_max;
-  if (PlanCost(nblocks, s, fs, nls, page_bytes, nl_page_bytes) > budget) {
+  if (vs > s_max) vs = s_max;
+  if (PlanCost(nblocks, s, vs, fs, nls, page_bytes, nl_page_bytes) > budget) {
     std::fprintf(stderr,
-                 "--vram-mb %llu is below the floor: %u blocks x (4x%u + %u) "
-                 "atom frames + %u list frames needs %llu MB minimum\n",
-                 (unsigned long long)(budget / (1024 * 1024)), nblocks, s, fs,
-                 nls,
-                 (unsigned long long)(PlanCost(nblocks, s, fs, nls, page_bytes,
-                                               nl_page_bytes) /
+                 "--vram-mb %llu is below the floor: %u blocks needs %llu MB "
+                 "minimum for the pinned frames alone\n",
+                 (unsigned long long)(budget / (1024 * 1024)), nblocks,
+                 (unsigned long long)(PlanCost(nblocks, s, vs, fs, nls,
+                                               page_bytes, nl_page_bytes) /
                                       (1024 * 1024)));
     return false;
   }
-  // Atom vectors toward residency first.
+  // MEASURED PRIORITY, at lattice 50 with 16 blocks.
+  //
+  // x and the resort's two ping-pong destinations are the vectors that must
+  // be resident: x is read through nine-row stencils that sweep the whole
+  // domain, and the gather writes destination rows scattered across it.
+  // Holding those three resident and starving v and f costs 102 ms/step;
+  // starving the ping-pong instead costs 153, and starving everything but x
+  // costs 157. So spend on the three first, then the list, then v and f --
+  // which only ever touch pages their own block owns.
   while (s < s_max &&
-         PlanCost(nblocks, s + 1, fs + 1, nls, page_bytes, nl_page_bytes) <=
+         PlanCost(nblocks, s + 1, vs, fs, nls, page_bytes, nl_page_bytes) <=
              budget) {
     ++s;
-    if (fs < s_max) ++fs;
   }
-  // Whatever is left goes to the list.
   while (nls < nl_max &&
-         PlanCost(nblocks, s, fs, nls + 1, page_bytes, nl_page_bytes) <=
+         PlanCost(nblocks, s, vs, fs, nls + 1, page_bytes, nl_page_bytes) <=
              budget) {
     ++nls;
   }
-  *out = CachePlan{s, fs, nls,
-                   PlanCost(nblocks, s, fs, nls, page_bytes, nl_page_bytes)};
+  while ((vs < s_max || fs < s_max) &&
+         PlanCost(nblocks, s, vs + (vs < s_max ? 1 : 0),
+                  fs + (fs < s_max ? 1 : 0), nls, page_bytes,
+                  nl_page_bytes) <= budget) {
+    if (vs < s_max) ++vs;
+    if (fs < s_max) ++fs;
+  }
+  *out = CachePlan{s, vs, fs, nls,
+                   PlanCost(nblocks, s, vs, fs, nls, page_bytes,
+                            nl_page_bytes)};
   return true;
 }
 
@@ -2061,14 +2078,15 @@ int main(int argc, char **argv) {
     }
     if (a.slots == 0) slots = plan.slots;
     if (a.fslots == 0) a.fslots = plan.fslots;
-    if (a.vslots == 0) a.vslots = plan.slots;
+    if (a.vslots == 0) a.vslots = plan.vslots;
     if (a.ppslots == 0) a.ppslots = plan.slots;
     if (a.nlslots == 0 && a.md) a.nlslots = plan.nlslots;
-    std::printf("  VRAM budget %llu MB -> %u atom frames/block (of %llu "
-                "resident), %u f, %u list frames (of %llu); caches use "
+    std::printf("  VRAM budget %llu MB -> x/x2/v2 %u frames/block (of %llu "
+                "resident), v %u, f %u, list %u (of %llu); caches use "
                 "%llu MB over %u blocks\n",
                 (unsigned long long)a.vram_mb, plan.slots,
-                (unsigned long long)(npages + 2), plan.fslots, plan.nlslots,
+                (unsigned long long)(npages + 2), plan.vslots, plan.fslots,
+                plan.nlslots,
                 (unsigned long long)(nlg.pages ? nlg.pages + 2 : 0),
                 (unsigned long long)(plan.bytes / (1024 * 1024)),
                 a.blocks);
