@@ -94,8 +94,7 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < n;) {
     clio::run::u64 run = 0;
     {
-      co_await v.BeginFetch(v.PageLo(i), v.PageSpan(i, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(i), v.PageSpan(i, 1));
       auto h = co_await v.HoldPage(i, n - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -107,8 +106,7 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
     // table holds without flushing is a caller error, and the servicer says so
     // rather than silently writing data out. Flushing per page keeps the dirty
     // set at one.
-    co_await v.BeginFlush(i, run);
-    co_await v.EndFlush();
+    co_await v.Flush(i, run);
     i += run;
   }
   // Every page was flushed as it was written; nothing is left dirty.
@@ -130,8 +128,7 @@ __device__ gy::YCoroMain CheckCoro(gv::DeviceVector<clio::run::u32> v,
                                    clio::run::u64 n,
                                    unsigned long long *bad) {
   for (clio::run::u64 i = 0; i < n;) {
-    co_await v.BeginFetch(v.PageLo(i), v.PageSpan(i, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(i), v.PageSpan(i, 1));
     auto h = co_await v.HoldPage(i, n - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
       if (h[i + k] != static_cast<clio::run::u32>((i + k) * 7 + 1)) {
@@ -171,8 +168,7 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -182,8 +178,7 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go -- see FillCoro. With 2 slots per block this vector is
     // oversubscribed, so leaving pages dirty would fill the table and the
     // fault could not be served without a writeback nobody asked for.
-    co_await v.BeginFlush(base + i, run);
-    co_await v.EndFlush();
+    co_await v.Flush(base + i, run);
     i += run;
   }
 }
@@ -205,8 +200,7 @@ __device__ gy::YCoroMain MultiCheckCoro(gv::DeviceVector<clio::run::u32> v,
                                         clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 i = 0; i < per;) {
-    co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
     auto h = co_await v.HoldPage(base + i, per - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
       if (h[base + i + k] !=

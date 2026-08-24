@@ -137,8 +137,7 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, pe));
-    co_await v.AwaitFetch();
+co_await v.Fetch(off, pe);
         auto h = co_await v.HoldPage(off, pe, /*write=*/true);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       h[off + i] = Value(p, off + i, zero_pct);
@@ -192,8 +191,7 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
     // cost nothing -- BeginFetch skips them.
     u64 win = (depth > 0) ? static_cast<u64>(depth) + 1 : 1;
     if (k + win > pages_per_block) win = pages_per_block - k;
-    co_await v.BeginFetch(v.PageLo(off), pe * win);
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(off), pe * win);
     auto h = co_await v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       acc += static_cast<unsigned long long>(h[off + i]) *
@@ -243,8 +241,7 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
     // ONE batched get for the whole chunk, then hold its pages one at a
     // time. Fetching inside the j loop would defeat the batching this case
     // exists to measure.
-    co_await v.BeginFetch(v.PageLo(c0 * pe), pe * n);
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(c0 * pe), pe * n);
     for (u64 j = 0; j < n; ++j) {
       const u64 off = (base_page + k + j) * pe;
       auto h = co_await v.HoldPage(off, pe);

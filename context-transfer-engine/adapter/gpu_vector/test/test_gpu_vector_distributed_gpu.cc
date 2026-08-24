@@ -88,8 +88,7 @@ __device__ gy::YCoroMain WriteRangeCoro(gv::DeviceVector<u32> v,
   for (u64 i = 0; i < elems_per_block;) {
     u64 run = 0;
     {
-      co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
       auto h = co_await v.HoldPage(base + i, elems_per_block - i, /*write=*/true);
       run = h.run();
       for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -127,8 +126,7 @@ __device__ gy::YCoroMain ReadRangeCoro(gv::DeviceVector<u32> v, u64 first_elem,
                                        clio::run::u32 block) {
   const u64 base = first_elem + static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
-    co_await v.BeginFetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
     auto h = co_await v.HoldPage(base + i, elems_per_block - i);
     for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
       // Read-only sweep: the hold stays write=false, so every page is dropped

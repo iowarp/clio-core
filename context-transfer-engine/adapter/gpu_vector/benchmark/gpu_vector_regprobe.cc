@@ -81,15 +81,13 @@ GVP_CORO_KERNEL(K_EndFlush, C_EndFlush(v))
 #elif GVP == 5
 // Hold, write, flush, wait -- a whole realistic use of the vector.
 __device__ gy::YCoroMain C_All(gv::DeviceVector<float> v, u64 off, u64 *out) {
-  co_await v.BeginFetch(off, off + 1);
-  co_await v.AwaitFetch();
+  co_await v.Fetch(off, off + 1);
   {
     auto h = co_await v.HoldPage(off, 1, /*write=*/true);
     if (h.run() != 0) h[0] = 1.0f;
     out[threadIdx.x] = (u64) h.ptr();
   }
-  co_await v.BeginFlush(off, 1);
-  co_await v.EndFlush();
+  co_await v.Flush(off, 1);
 }
 GVP_CORO_KERNEL(K_All, C_All(v, arg, out))
 #endif

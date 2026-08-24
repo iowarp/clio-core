@@ -68,7 +68,7 @@ static u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u32 block) {
   const u64 off = static_cast<u64>(block) * kEpp;
   // Synchronous forms: this seed has nothing to overlap the transfers with.
-  co_await v.Fetch(v.PageLo(off), v.PageSpan(off, kEpp));
+  co_await v.Fetch(off, kEpp);
   {
     auto h = co_await v.HoldPage(off, kEpp, /*write=*/true);
     for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
@@ -94,7 +94,7 @@ __device__ gy::YCoroMain CopyCoro(gv::DeviceVector<u32> v, u32 block,
                                   u32 nblocks, unsigned long long *bad) {
   const u32 owner = (block + 2u) % nblocks;
   const u64 off = static_cast<u64>(owner) * kEpp;
-  co_await v.Fetch(v.PageLo(off), v.PageSpan(off, kEpp));
+  co_await v.Fetch(off, kEpp);
   auto h = co_await v.HoldPage(off, kEpp);
   for (u64 i = threadIdx.x; i < kCheck; i += blockDim.x) {
     if (h[off + i] != Pattern(owner, i)) atomicAdd(bad, 1ull);
@@ -117,8 +117,7 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u32 block,
       h[off + i] = Pattern(owner, i) + 77u;
     }
   }
-  co_await v.BeginFlush(off, kEpp);
-  co_await v.EndFlush();
+  co_await v.Flush(off, kEpp);
   (void)bad;
 }
 
@@ -156,8 +155,7 @@ __device__ gy::YCoroMain SliceCoro(gv::DeviceVector<u32> v, u32 block,
       h[off + i] = Pattern(block, i) ^ 0xABCDu;
     }
   }
-  co_await v.BeginFlush(off, slice);
-  co_await v.EndFlush();
+  co_await v.Flush(off, slice);
   (void)bad;
 }
 

@@ -82,8 +82,7 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u64 base,
   for (u64 i = 0; i < count;) {
     u64 run = 0;
     {
-      co_await v.BeginFetch(v.PageLo(off + i), v.PageSpan(off + i, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(off + i), v.PageSpan(off + i, 1));
       auto h = co_await v.HoldPage(off + i, count - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -121,8 +120,7 @@ __device__ gy::YCoroMain VerifyCoro(gv::DeviceVector<u32> v, u64 base,
                                     clio::run::u32 block) {
   const u64 off = base + static_cast<u64>(block) * count;
   for (u64 i = 0; i < count;) {
-    co_await v.BeginFetch(v.PageLo(off + i), v.PageSpan(off + i, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(off + i), v.PageSpan(off + i, 1));
     auto h = co_await v.HoldPage(off + i, count - i);
     unsigned long long local = 0;
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
@@ -152,8 +150,7 @@ __device__ gy::YCoroMain WalkCoro(gv::DeviceVector<u32> v, u64 first_page,
   for (u32 p = 0; p < passes; ++p) {
     for (u64 k = 0; k < npages; ++k) {
       const u64 off = (first_page + k) * v.ElemsPerPage();
-      co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(off), v.PageSpan(off, 1));
       auto h = co_await v.HoldPage(off, 1);
       if (threadIdx.x == 0) acc += h[off];
     }
@@ -181,8 +178,7 @@ __device__ gy::YCoroMain TouchSeqCoro(gv::DeviceVector<u32> v,
   // NOT contiguous, so each needs its own hold.
   for (u32 i = 0; i < n; ++i) {
     const u64 off = pages[i] * v.ElemsPerPage();
-    co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(off), v.PageSpan(off, 1));
     auto h = co_await v.HoldPage(off, 1);
     if (threadIdx.x == 0) acc += h[off];
   }
@@ -244,8 +240,7 @@ __device__ gy::YCoroMain RescoreCoro(gv::DeviceVector<u32> v, u64 page,
                                      float score) {
   // Scoring is a property of a HELD page now: the guard is the pin, and
   // Rescore stamps the frame it is holding.
-  co_await v.BeginFetch(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
-  co_await v.AwaitFetch();
+  co_await v.Fetch(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
   auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
   h.Rescore(score);
 }
@@ -302,8 +297,7 @@ __device__ gy::YCoroMain BatchFlushCoro(gv::DeviceVector<u32> v, u64 npages,
   // Dirty every page first, THEN flush the whole block in one batched
   // submission -- that batch is what this test is about.
   for (clio::run::u64 off = 0; off < total;) {
-    co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(off), v.PageSpan(off, 1));
     auto h = co_await v.HoldPage(off, total - off, /*write=*/true);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
       h[off + k] = Val(off + k, salt);
@@ -407,8 +401,7 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
   // the kernel would relaunch forever.
   for (u32 r = 0; r < reps; ++r) {
     {
-      co_await v.BeginFetch(v.PageLo(last_of_prev), v.PageSpan(last_of_prev, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(last_of_prev), v.PageSpan(last_of_prev, 1));
       auto h = co_await v.HoldPage(last_of_prev, 1, /*write=*/true);
       if (threadIdx.x == 0) h[last_of_prev] = Val(last_of_prev, 7u);
     }
@@ -417,16 +410,13 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
     // the vector will not write it back on the caller's behalf. Awaited, not
     // just submitted: the very next hold needs this exact frame, so there is
     // nothing to overlap with.
-    co_await v.BeginFlush(last_of_prev, 1);
-    co_await v.EndFlush();
+    co_await v.Flush(last_of_prev, 1);
     {
-      co_await v.BeginFetch(v.PageLo(first_of_next), v.PageSpan(first_of_next, 1));
-      co_await v.AwaitFetch();
+      co_await v.Fetch(v.PageLo(first_of_next), v.PageSpan(first_of_next, 1));
       auto h = co_await v.HoldPage(first_of_next, 1, /*write=*/true);
       if (threadIdx.x == 0) h[first_of_next] = Val(first_of_next, 7u);
     }
-    co_await v.BeginFlush(first_of_next, 1);
-    co_await v.EndFlush();
+    co_await v.Flush(first_of_next, 1);
   }
 }
 
@@ -456,8 +446,7 @@ __device__ gy::YCoroMain MultiLaneReadCoro(gv::DeviceVector<u32> v, u64 count,
   const u64 pages = count / v.ElemsPerPage();
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = p * v.ElemsPerPage();
-    co_await v.BeginFetch(v.PageLo(base), v.PageSpan(base, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(base), v.PageSpan(base, 1));
     auto h = co_await v.HoldPage(base, v.ElemsPerPage());
     for (u64 i = threadIdx.x; i < v.ElemsPerPage(); i += blockDim.x) {
       if (h[base + i] != Val(base + i, salt)) ++local;
@@ -488,8 +477,7 @@ __device__ gy::YCoroMain MultiLaneWriteCoro(gv::DeviceVector<u32> v, u64 count,
   const u64 pages = count / v.ElemsPerPage();
   for (u64 p = 0; p < pages; ++p) {
     const u64 base = slice + p * v.ElemsPerPage();
-    co_await v.BeginFetch(v.PageLo(base), v.PageSpan(base, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(base), v.PageSpan(base, 1));
     auto h = co_await v.HoldPage(base, v.ElemsPerPage(), /*write=*/true);
     for (u64 i = threadIdx.x; i < v.ElemsPerPage(); i += blockDim.x) {
       h[base + i] = Val(base + i, salt);
@@ -497,8 +485,7 @@ __device__ gy::YCoroMain MultiLaneWriteCoro(gv::DeviceVector<u32> v, u64 count,
     // Per-page flush while the page is still held, as before -- the
     // collective FlushAsync barriers internally, so no lane's writes can be
     // lost to the submit clearing `dirty`.
-    co_await v.BeginFlush(base, v.ElemsPerPage());
-    co_await v.EndFlush();
+    co_await v.Flush(base, v.ElemsPerPage());
   }
 }
 
@@ -533,8 +520,7 @@ __device__ gy::YCoroMain PrefetchWalkCoro(gv::DeviceVector<u32> v, u64 count,
       const u64 np = first + p + 1;
     }
     const u64 off = slice + p * v.ElemsPerPage();
-    co_await v.BeginFetch(v.PageLo(off), v.PageSpan(off, 1));
-    co_await v.AwaitFetch();
+    co_await v.Fetch(v.PageLo(off), v.PageSpan(off, 1));
     auto h = co_await v.HoldPage(off, v.ElemsPerPage());
     unsigned long long local = 0;
     for (u64 i = threadIdx.x; i < h.run(); i += blockDim.x) {
@@ -565,8 +551,7 @@ __global__ void PrefetchWalkKernel(clio::run::IpcManagerGpuInfo info,
 // lane sending them would multiply that by the block width.
 __device__ gy::YCoroMain RescoreStormCoro(gv::DeviceVector<u32> v, u64 page,
                                           u32 reps) {
-  co_await v.BeginFetch(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
-  co_await v.AwaitFetch();
+  co_await v.Fetch(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
   auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
   for (u32 r = 0; r < reps; ++r) h.Rescore(static_cast<float>(r));
 }
