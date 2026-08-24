@@ -110,7 +110,7 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.ElemsPerPage();
-      co_await v.Fetch(poff, v.ElemsPerPage());
+      co_await v.Fetch(0, poff, v.ElemsPerPage());
       auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
       WritePage(h, poff, 0u);
     }
@@ -120,7 +120,7 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
                      v.ElemsPerPage();
     for (u64 b = 0; b < region_elems; b += span) {
       const u64 cnt = (region_elems - b < span) ? region_elems - b : span;
-      co_await v.BeginFlush(off + b, cnt);
+      co_await v.BeginFlush(0, off + b, cnt);
     }
     co_await v.EndFlush();
   }
@@ -174,7 +174,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
       for (u64 pg = 0; pg < pages_per_region; ++pg) {
         const u64 poff = off + pg * v.ElemsPerPage();
         const long long h0 = clock64();
-        co_await v.Fetch(poff, v.ElemsPerPage());
+        co_await v.Fetch(0, poff, v.ElemsPerPage());
         auto h = co_await v.HoldPage(poff, v.ElemsPerPage(), /*write=*/true);
         if (threadIdx.x == 0) {
           atomicAdd(&g_round_cyc[7], (unsigned long long) (clock64() - h0));
@@ -190,7 +190,7 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
                          v.ElemsPerPage();
         for (u64 b = 0; b < region_elems; b += span) {
           const u64 cnt = (region_elems - b < span) ? region_elems - b : span;
-          co_await v.BeginFlush(off + b, cnt);
+          co_await v.BeginFlush(0, off + b, cnt);
         }
       }
       const long long w2 = clock64();
@@ -290,7 +290,7 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
     const u64 off = block_base + it * region_elems;
     for (u64 pg = 0; pg < pages_per_region; ++pg) {
       const u64 poff = off + pg * v.ElemsPerPage();
-      co_await v.Fetch(poff, v.ElemsPerPage());
+      co_await v.Fetch(0, poff, v.ElemsPerPage());
       auto h = co_await v.HoldPage(poff, v.ElemsPerPage());
       unsigned long long local = 0;
       unsigned long long wrong = 0;

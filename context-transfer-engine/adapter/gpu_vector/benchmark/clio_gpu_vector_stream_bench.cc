@@ -137,7 +137,7 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
   for (u64 k = 0; k < pages_per_block; ++k) {
     const u64 p = base_page + k;
     const u64 off = p * pe;
-    co_await v.Fetch(off, pe);
+    co_await v.Fetch(0, off, pe);
     auto h = co_await v.HoldPage(off, pe, /*write=*/true);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       h[off + i] = Value(p, off + i, zero_pct);
@@ -146,7 +146,7 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
     // Fire-and-forget: the store of page k stays in flight through the fill
     // of page k+1; the claim path settles finished flushes when it needs a
     // slot, and the AwaitFlush at the end collects the stragglers.
-    co_await v.BeginFlush(off, pe);
+    co_await v.BeginFlush(0, off, pe);
   }
   // The explicit flush is what persists the data: drops refuse dirty pages
   // and nothing writes back on eviction, so every written page must have been
@@ -191,7 +191,7 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
     // cost nothing -- BeginFetch skips them.
     u64 win = (depth > 0) ? static_cast<u64>(depth) + 1 : 1;
     if (k + win > pages_per_block) win = pages_per_block - k;
-    co_await v.Fetch(v.PageLo(off), pe * win);
+    co_await v.Fetch(0, v.PageLo(off), pe * win);
     auto h = co_await v.HoldPage(off, pe);
     for (u64 i = threadIdx.x; i < pe; i += blockDim.x) {
       acc += static_cast<unsigned long long>(h[off + i]) *
@@ -241,7 +241,7 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
     // ONE batched get for the whole chunk, then hold its pages one at a
     // time. Fetching inside the j loop would defeat the batching this case
     // exists to measure.
-    co_await v.Fetch(v.PageLo(c0 * pe), pe * n);
+    co_await v.Fetch(0, v.PageLo(c0 * pe), pe * n);
     for (u64 j = 0; j < n; ++j) {
       const u64 off = (base_page + k + j) * pe;
       auto h = co_await v.HoldPage(off, pe);

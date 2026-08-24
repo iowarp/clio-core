@@ -261,7 +261,7 @@ __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
   clio::run::u64 n = 0;
   GnnSlice(lo, hi, scratch, nblocks, block, n);
   for (clio::run::u64 i = 0; i < n;) {
-    co_await v.Fetch(v.PageLo(lo + i), v.PageSpan(lo + i, 1));
+    co_await v.Fetch(0, v.PageLo(lo + i), v.PageSpan(lo + i, 1));
     auto h = co_await v.HoldPage(lo + i, n - i);
     GnnCopyRun(h.ptr(), h.run(), scratch + i);
     i += h.run();

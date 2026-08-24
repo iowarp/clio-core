@@ -104,14 +104,14 @@ __device__ gy::YCoroMain GrayScottHoldCoro(gv::DeviceVector<float> ui,
                                            gv::DeviceVector<float> vo, u32 dim,
                                            u32 block) {
   const u64 cells = static_cast<u64>(dim) * dim;
-  co_await ui.Fetch(0, cells);
+  co_await ui.Fetch(0, 0, cells);
   // One resolution per field for the whole kernel, instead of one per access.
   auto hui = co_await ui.HoldPage(0, cells);
-  co_await vi.Fetch(0, cells);
+  co_await vi.Fetch(0, 0, cells);
   auto hvi = co_await vi.HoldPage(0, cells);
-  co_await uo.Fetch(0, cells);
+  co_await uo.Fetch(0, 0, cells);
   auto huo = co_await uo.HoldPage(0, cells, /*write=*/true);
-  co_await vo.Fetch(0, cells);
+  co_await vo.Fetch(0, 0, cells);
   auto hvo = co_await vo.HoldPage(0, cells, /*write=*/true);
   for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
        idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
@@ -168,13 +168,13 @@ __device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
                                      gv::DeviceVector<float> vo, u32 dim) {
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 i = 0; i < cells;) {
-    co_await u.Fetch(u.PageLo(i), u.PageSpan(i, 1));
+    co_await u.Fetch(0, u.PageLo(i), u.PageSpan(i, 1));
     auto hu = co_await u.HoldPage(i, cells - i, /*write=*/true);
-    co_await v.Fetch(v.PageLo(i), v.PageSpan(i, 1));
+    co_await v.Fetch(0, v.PageLo(i), v.PageSpan(i, 1));
     auto hv = co_await v.HoldPage(i, cells - i, /*write=*/true);
-    co_await uo.Fetch(uo.PageLo(i), uo.PageSpan(i, 1));
+    co_await uo.Fetch(0, uo.PageLo(i), uo.PageSpan(i, 1));
     auto huo = co_await uo.HoldPage(i, cells - i, /*write=*/true);
-    co_await vo.Fetch(vo.PageLo(i), vo.PageSpan(i, 1));
+    co_await vo.Fetch(0, vo.PageLo(i), vo.PageSpan(i, 1));
     auto hvo = co_await vo.HoldPage(i, cells - i, /*write=*/true);
     for (u64 k = i + threadIdx.x; k < i + hu.run(); k += blockDim.x) {
       float a, b;
@@ -215,7 +215,7 @@ __device__ gy::YCoroMain VecToRawCoro(gv::DeviceVector<float> src, float *dst,
   const u64 cells = static_cast<u64>(dim) * dim;
   for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
        idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
-    co_await src.Fetch(src.PageLo(idx), src.PageSpan(idx, 1));
+    co_await src.Fetch(0, src.PageLo(idx), src.PageSpan(idx, 1));
     auto h = co_await src.HoldPage(idx, 1);
     dst[idx] = h[idx];
   }

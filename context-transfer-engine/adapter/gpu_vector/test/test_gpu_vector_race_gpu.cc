@@ -90,7 +90,7 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
+      co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -100,7 +100,7 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    co_await v.BeginFlush(base + i, run);
+    co_await v.BeginFlush(0, base + i, run);
     i += run;
   }
   co_await v.EndFlush();
@@ -155,7 +155,7 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     // probe and its generation are machinery this test exists to exercise
     // (TestAccess): the seqlock is what guards any raw read the pin does
     // not cover, and it must never invalidate a read that was in fact safe.
-    co_await v.Fetch(v.PageLo(pn * kPageElems), v.PageSpan(pn * kPageElems, 1));
+    co_await v.Fetch(0, v.PageLo(pn * kPageElems), v.PageSpan(pn * kPageElems, 1));
     auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
     if (threadIdx.x == 0 && h.run() != 0) {
       // The GUARD is the pin: while `h` is alive this frame cannot be

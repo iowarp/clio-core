@@ -175,22 +175,22 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 ubase, u64 vbase) {
   for (u64 z = z0; z < z1; ++z) {
     {
-      co_await vec.Fetch(ubase + z * plane, plane);
+      co_await vec.Fetch(0, ubase + z * plane, plane);
       auto h = co_await vec.HoldPage(ubase + z * plane, plane, /*write=*/true);
       for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
         h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      co_await vec.BeginFlush(ubase + z * plane, plane);
+      co_await vec.BeginFlush(0, ubase + z * plane, plane);
     }
     {
-      co_await vec.Fetch(vbase + z * plane, plane);
+      co_await vec.Fetch(0, vbase + z * plane, plane);
       auto h = co_await vec.HoldPage(vbase + z * plane, plane, /*write=*/true);
       for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
         h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      co_await vec.BeginFlush(vbase + z * plane, plane);
+      co_await vec.BeginFlush(0, vbase + z * plane, plane);
     }
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
@@ -235,7 +235,7 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     const u64 zm = interior ? (z - 1) : z;
     const u64 zp = interior ? (z + 1) : z;
 
-    co_await vec.Fetch(ubase + zm * plane, plane);
+    co_await vec.Fetch(0, ubase + zm * plane, plane);
     // Three input planes of u, then three of v, then the two outputs -- ONE
     // GUARD PER PLANE, because a guard indexes only its own held page.
     // THE HOLD IS THE PIN: each guard's plane stays resident until the
@@ -243,19 +243,19 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     // re-held next iteration) is expressed by the pins themselves and needs
     // no score hints.
     uzm = co_await vec.HoldPage(ubase + zm * plane, plane);
-    co_await vec.Fetch(ubase + z * plane, plane);
+    co_await vec.Fetch(0, ubase + z * plane, plane);
     uz = co_await vec.HoldPage(ubase + z * plane, plane);
-    co_await vec.Fetch(ubase + zp * plane, plane);
+    co_await vec.Fetch(0, ubase + zp * plane, plane);
     uzp = co_await vec.HoldPage(ubase + zp * plane, plane);
-    co_await vec.Fetch(vbase + zm * plane, plane);
+    co_await vec.Fetch(0, vbase + zm * plane, plane);
     vzm = co_await vec.HoldPage(vbase + zm * plane, plane);
-    co_await vec.Fetch(vbase + z * plane, plane);
+    co_await vec.Fetch(0, vbase + z * plane, plane);
     vz = co_await vec.HoldPage(vbase + z * plane, plane);
-    co_await vec.Fetch(vbase + zp * plane, plane);
+    co_await vec.Fetch(0, vbase + zp * plane, plane);
     vzp = co_await vec.HoldPage(vbase + zp * plane, plane);
-    co_await vec.Fetch(unext + z * plane, plane);
+    co_await vec.Fetch(0, unext + z * plane, plane);
     unx = co_await vec.HoldPage(unext + z * plane, plane, /*write=*/true);
-    co_await vec.Fetch(vnext + z * plane, plane);
+    co_await vec.Fetch(0, vnext + z * plane, plane);
     vnx = co_await vec.HoldPage(vnext + z * plane, plane, /*write=*/true);
 
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
@@ -287,8 +287,8 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     // Flush the write-once outputs; the drop below is best-effort (a page
     // still flushing or pinned is refused and reclaimed by ordinary eviction
     // once it settles).
-    co_await vec.BeginFlush(unext + z * plane, plane);
-    co_await vec.BeginFlush(vnext + z * plane, plane);
+    co_await vec.BeginFlush(0, unext + z * plane, plane);
+    co_await vec.BeginFlush(0, vnext + z * plane, plane);
     if (interior) {
       // Plane z-1 leaves the sliding window for good: empty the guard so the
       // drop can take it. (zm == z when not interior, so releasing it there
@@ -357,7 +357,7 @@ __global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
 __device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
                                  u64 z0, u64 z1, u64 vbase, double *out) {
   for (u64 z = z0; z < z1; ++z) {
-    co_await vec.Fetch(vbase + z * plane, plane);
+    co_await vec.Fetch(0, vbase + z * plane, plane);
     auto h = co_await vec.HoldPage(vbase + z * plane, plane);
     double acc = 0.0;
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {

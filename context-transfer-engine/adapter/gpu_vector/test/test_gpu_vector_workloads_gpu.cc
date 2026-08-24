@@ -87,7 +87,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 i = 0; i < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
+      co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -98,7 +98,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
     // so seeding more pages than the table holds must not leave them all
     // dirty. Async, so the write overlaps the next page's compute; the
     // servicer retires it once it lands.
-    co_await v.BeginFlush(base + i, run);
+    co_await v.BeginFlush(0, base + i, run);
     i += run;
   }
   co_await v.EndFlush();
@@ -135,7 +135,7 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.Fetch(v.PageLo(base + off), v.PageSpan(base + off, 1));
+      co_await v.Fetch(0, v.PageLo(base + off), v.PageSpan(base + off, 1));
       auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -145,12 +145,12 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
       // The internal barrier matters: SubmitPut clears `dirty` as it submits,
       // so a lane still writing when the flush submits loses its writes.
       // Collective, internally BATCHED (one multi-put per 64 pages).
-      co_await v.BeginFlush(base + off, run);
+      co_await v.BeginFlush(0, base + off, run);
     }
     // Flush as we go: the vector never writes back on its own, so a
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
-    co_await v.BeginFlush(base + off, run);
+    co_await v.BeginFlush(0, base + off, run);
     off += run;
   }
   co_await v.EndFlush();
@@ -186,7 +186,7 @@ __device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
     if (off + page_elems < per) {
       const clio::run::u64 next = (base + off + page_elems) / page_elems;
     }
-    co_await v.Fetch(v.PageLo(base + off), v.PageSpan(base + off, 1));
+    co_await v.Fetch(0, v.PageLo(base + off), v.PageSpan(base + off, 1));
     auto h = co_await v.HoldPage(base + off, per - off);
     unsigned long long acc = 0;
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
@@ -228,7 +228,7 @@ __device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
   for (clio::run::u64 off = 0; off < per;) {
     clio::run::u64 run = 0;
     {
-      co_await v.Fetch(v.PageLo(base + off), v.PageSpan(base + off, 1));
+      co_await v.Fetch(0, v.PageLo(base + off), v.PageSpan(base + off, 1));
       auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
       run = h.run();
       for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {

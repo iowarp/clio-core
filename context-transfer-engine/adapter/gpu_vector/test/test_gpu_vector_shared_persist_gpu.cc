@@ -99,7 +99,7 @@ __device__ gy::YCoroMain PersistCoro(gv::DeviceVector<u32> v, u32 block,
     // A page this block has not touched, so the fetch must fault and park.
     const u64 pg = (static_cast<u64>(block) * 3ull + k + 1ull) % kPages;
     const u64 off = pg * kElemsPerPage;
-    co_await v.Fetch(v.PageLo(off), v.PageSpan(off, 1));
+    co_await v.Fetch(0, v.PageLo(off), v.PageSpan(off, 1));
 
     for (u32 i = threadIdx.x; i < kMagic; i += blockDim.x) {
       if (t.magic[i] != Pattern(block, i)) atomicAdd(bad, 1ull);

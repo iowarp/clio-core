@@ -195,7 +195,7 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
                                       clio::run::u32 block) {
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.Fetch(base + off,
+    co_await v.Fetch(0, base + off,
                      (off + page_elems <= per) ? page_elems : (per - off));
     const clio::run::u64 n =
         (off + page_elems <= per) ? page_elems : (per - off);
@@ -209,7 +209,7 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
     // FLUSH AS WE GO. A dirty frame is not evictable, so deferring every
     // writeback to the end dirties the whole table and the next fetch has
     // nowhere to land. Ranged, so this sends only what was just written.
-    co_await v.BeginFlush(base + off, n);
+    co_await v.BeginFlush(0, base + off, n);
   }
   co_await v.EndFlush();
 }
@@ -248,7 +248,7 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
   const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
   unsigned long long acc = 0;
   for (clio::run::u64 off = 0; off < per; off += page_elems) {
-    co_await v.Fetch(base + off,
+    co_await v.Fetch(0, base + off,
                      (off + page_elems <= per) ? page_elems : (per - off));
     auto h = co_await v.HoldPage(
         base + off, (off + page_elems <= per) ? page_elems : (per - off));

@@ -75,7 +75,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
   for (u64 i = 0; i < per;) {
     u64 run = 0;
     {
-      co_await v.Fetch(v.PageLo(base + i), v.PageSpan(base + i, 1));
+      co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
       auto h = co_await v.HoldPage(base + i, per - i, /*write=*/true);
       run = h.run();
       for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
@@ -89,7 +89,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
     // Deferring every flush to the end would dirty the whole table and then
     // fail -- a dirty frame is not evictable, so the region cannot exceed
     // the cache without flushing first.
-    co_await v.BeginFlush(base + i, run);
+    co_await v.BeginFlush(0, base + i, run);
     i += run;
   }
   co_await v.EndFlush();
@@ -143,7 +143,7 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
   (void) first_page;
   // PRIME: page 0 must be resident before the loop, because the loop body
   // issues the fetch for page p+1 and then computes on p.
-  co_await v.Fetch(v.PageLo(base), pe);
+  co_await v.Fetch(0, v.PageLo(base), pe);
 
   for (u64 p = 0; p < pages; ++p) {
     const u64 off = base + p * pe;
@@ -155,11 +155,11 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
       // compute exceeds it.
       u64 win = (depth > 0) ? depth : 1;
       if (p + 1 + win > pages) win = pages - (p + 1);
-      co_await v.BeginFetch(v.PageLo(base + (p + 1) * pe), pe * win);
+      co_await v.BeginFetch(0, v.PageLo(base + (p + 1) * pe), pe * win);
     } else if (!prefetch) {
       // No lookahead: pay the fault right here, which is the baseline this
       // case is measured against.
-      co_await v.Fetch(v.PageLo(off), pe);
+      co_await v.Fetch(0, v.PageLo(off), pe);
     }
     auto h = co_await v.HoldPage(off, pe);
     unsigned long long local = 0;

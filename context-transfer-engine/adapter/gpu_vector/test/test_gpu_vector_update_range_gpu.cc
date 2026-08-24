@@ -68,14 +68,14 @@ static u32 RunYieldable(unsigned nblocks, LaunchT &&launch) {
 __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u32 block) {
   const u64 off = static_cast<u64>(block) * kEpp;
   // Synchronous forms: this seed has nothing to overlap the transfers with.
-  co_await v.Fetch(off, kEpp);
+  co_await v.Fetch(0, off, kEpp);
   {
     auto h = co_await v.HoldPage(off, kEpp, /*write=*/true);
     for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
       h[off + i] = Pattern(block, i);
     }
   }
-  co_await v.Flush(off, kEpp);
+  co_await v.Flush(0, off, kEpp);
 }
 
 /** Block b reads the page OWNED BY ANOTHER BLOCK through its owner. */
@@ -94,7 +94,7 @@ __device__ gy::YCoroMain CopyCoro(gv::DeviceVector<u32> v, u32 block,
                                   u32 nblocks, unsigned long long *bad) {
   const u32 owner = (block + 2u) % nblocks;
   const u64 off = static_cast<u64>(owner) * kEpp;
-  co_await v.Fetch(off, kEpp);
+  co_await v.Fetch(0, off, kEpp);
   auto h = co_await v.HoldPage(off, kEpp);
   for (u64 i = threadIdx.x; i < kCheck; i += blockDim.x) {
     if (h[off + i] != Pattern(owner, i)) atomicAdd(bad, 1ull);
@@ -117,7 +117,7 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u32 block,
       h[off + i] = Pattern(owner, i) + 77u;
     }
   }
-  co_await v.Flush(off, kEpp);
+  co_await v.Flush(0, off, kEpp);
   (void)bad;
 }
 
@@ -155,8 +155,47 @@ __device__ gy::YCoroMain SliceCoro(gv::DeviceVector<u32> v, u32 block,
       h[off + i] = Pattern(block, i) ^ 0xABCDu;
     }
   }
-  co_await v.Flush(off, slice);
+  co_await v.Flush(0, off, slice);
   (void)bad;
+}
+
+/**
+ * GENERATIONAL ROUND TRIP, on the device -- in TWO launches.
+ *
+ * Publish, then read. One launch would have blocks waiting on peers in the
+ * same grid, and the driver makes no bounded-time promise about that: it was
+ * flaky one run in three. The WAITING semantics are proven on the host
+ * (a get returns 400 ms behind a 400 ms writer); what a kernel has to prove
+ * is that it carries a generation at all, and that a resident copy at an
+ * older generation is refused rather than served.
+ *
+ * The refusal is the real assertion here: every reader already holds these
+ * pages from the earlier cases, at generation 0.
+ */
+__device__ gy::YCoroMain GenPublishCoro(gv::DeviceVector<u32> v, u32 block,
+                                        u64 gen) {
+  const u64 mine = static_cast<u64>(block) * kEpp;
+  {
+    auto h = co_await v.UpdateRange(mine, kEpp, block, /*write=*/true);
+    for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
+      h[mine + i] = Pattern(block, i) + static_cast<u32>(gen);
+    }
+  }
+  co_await v.Flush(gen, mine, kEpp);
+}
+
+__device__ gy::YCoroMain GenReadCoro(gv::DeviceVector<u32> v, u32 block,
+                                     u32 nblocks, u64 gen,
+                                     unsigned long long *bad) {
+  const u32 peer = (block + 1u) % nblocks;
+  const u64 theirs = static_cast<u64>(peer) * kEpp;
+  co_await v.Fetch(gen, theirs, kEpp);
+  auto h = co_await v.HoldPage(theirs, kEpp);
+  for (u64 i = threadIdx.x; i < kCheck; i += blockDim.x) {
+    if (h[theirs + i] != Pattern(peer, i) + static_cast<u32>(gen)) {
+      atomicAdd(bad, 1ull);
+    }
+  }
 }
 
 #define GV_KERNEL(name, coro)                                                 \
@@ -177,6 +216,30 @@ GV_KERNEL(CopyKernel, CopyCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(FallbackKernel, FallbackCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(WriteKernel, WriteCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(SliceKernel, SliceCoro(v, yv.Block(), nblocks, bad))
+
+__global__ void GenPublishKernel(clio::run::IpcManagerGpuInfo info,
+                                 gv::DeviceVector<u32> v, u32 nblocks,
+                                 u64 gen, unsigned long long *bad,
+                                 gy::YieldableView<> yv,
+                                 gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  (void) nblocks; (void) bad;
+  CLIO_YCORO_RUN(GenPublishCoro(v, yv.Block(), gen));
+}
+
+__global__ void GenReadKernel(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<u32> v, u32 nblocks, u64 gen,
+                              unsigned long long *bad, gy::YieldableView<> yv,
+                              gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GenReadCoro(v, yv.Block(), nblocks, gen, bad));
+}
 
 #if !CTP_IS_DEVICE_PASS
 TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
@@ -302,6 +365,27 @@ TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
     std::printf("  all 8 slices survived:       %llu of %llu wrong\n",
                 (unsigned long long)wrong, (unsigned long long)kEpp);
     REQUIRE(wrong == 0);
+  }
+
+  // A generational round trip through the device verbs.
+  {
+    ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
+    RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
+      GenPublishKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, vec.GetDevice(0), kBlocks, 7ull, d_bad, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
+      GenReadKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, vec.GetDevice(0), kBlocks, 7ull, d_bad, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    unsigned long long bad = 0;
+    ctp::GpuApi::Memcpy(&bad, d_bad, sizeof(bad));
+    std::printf("  generational round trip      wrong=%llu\n", bad);
+    REQUIRE(bad == 0);
   }
 
   // Data has to be right in all three.

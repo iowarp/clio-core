@@ -194,7 +194,10 @@ class DeviceVector {
    * PageLo/PageSpan.
    */
   template <typename... Args>
-  __device__ clio::run::gpu::YCoroTask BeginFetch(Args... args) {
+  __device__ clio::run::gpu::YCoroTask BeginFetch(clio::run::u64 generation,
+                                                  Args... args) {
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
     clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(lo, hi, nr, args...);
@@ -234,10 +237,19 @@ class DeviceVector {
     // Pinning mutates, so only thread 0 does it.
     if (threadIdx.x == 0) PinResident(lo, hi, nr);
     __syncthreads();
+    // EVICTION IS SIZED BY MISSING PAGES; THE SUBMIT IS NOT.
+    //
+    // CountMissing counts pages with no frame, which is the right number of
+    // frames to free -- but a page can be RESIDENT and still need a
+    // transfer: holding a different slice of itself, or an older generation.
+    // Gating the submit on `missing` meant those never reached SubmitFetch
+    // at all, so a generational fetch of a resident-but-stale page silently
+    // returned the stale bytes. SubmitFetch itself decides what to send and
+    // sends nothing when everything is current.
     if (missing != 0) {
       co_await EvictPages(missing, missing);
-      if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
     }
+    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
     if (threadIdx.x == 0) UnpinRanges(lo, hi, nr);
     __syncthreads();
     co_return;
@@ -252,52 +264,15 @@ class DeviceVector {
   }
 
   /**
-   * GENERATIONAL FETCH: wait for a publication, not merely for bytes.
-   *
-   * The fetch is not served until the blob has reached `generation`, so a
-   * reader that runs ahead of its writer WAITS instead of being handed
-   * whatever exists. Without this a never-written page reads back as an
-   * empty blob with a success code, which is indistinguishable from real
-   * data -- the readiness question a multi-GPU run cannot otherwise answer.
-   *
-   * Pass 0 to mean "whatever is there", i.e. an ordinary fetch.
-   */
-  template <typename... Args>
-  __device__ clio::run::gpu::YCoroTask FetchGen(clio::run::u64 generation,
-                                                Args... args) {
-    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
-    __syncthreads();
-    co_await BeginFetch(args...);
-    co_await AwaitFetch();
-    if (threadIdx.x == 0) Tasks()->fetch_generation = 0;
-    __syncthreads();
-    co_return;
-  }
-
-  /** Publish this range AS `generation`, releasing readers waiting on it. */
-  template <typename... Rest>
-  __device__ clio::run::gpu::YCoroTask FlushGen(clio::run::u64 generation,
-                                                clio::run::u64 off,
-                                                clio::run::u64 count,
-                                                Rest... rest) {
-    if (threadIdx.x == 0) Tasks()->flush_generation = generation;
-    __syncthreads();
-    co_await BeginFlush(off, count, rest...);
-    co_await EndFlush();
-    if (threadIdx.x == 0) Tasks()->flush_generation = 0;
-    __syncthreads();
-    co_return;
-  }
-
-  /**
    * BeginFetch then AwaitFetch. Same ranges, same rules -- this is the whole
    * of it, for callers with nothing to overlap the transfer with. Splitting
    * the two is what lets a caller compute over one range while the next is
    * in flight; when there is no such work, the split is only noise.
    */
   template <typename... Args>
-  __device__ clio::run::gpu::YCoroTask Fetch(Args... args) {
-    co_await BeginFetch(args...);
+  __device__ clio::run::gpu::YCoroTask Fetch(clio::run::u64 generation,
+                                             Args... args) {
+    co_await BeginFetch(generation, args...);
     co_await AwaitFetch();
     co_return;
   }
@@ -363,9 +338,12 @@ class DeviceVector {
    * another block put there.
    */
   template <typename... Rest>
-  __device__ clio::run::gpu::YCoroTask BeginFlush(clio::run::u64 off,
+  __device__ clio::run::gpu::YCoroTask BeginFlush(clio::run::u64 generation,
+                                                  clio::run::u64 off,
                                                   clio::run::u64 count,
                                                   Rest... rest) {
+    if (threadIdx.x == 0) Tasks()->flush_generation = generation;
+    __syncthreads();
     clio::run::u64 rlo[kMaxFetchRanges], rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(rlo, rhi, nr, off, count, rest...);
@@ -490,7 +468,7 @@ class DeviceVector {
       if (threadIdx.x == 0) atomicSub(&src->pins, 1u);
       __syncthreads();
     }
-    co_await FetchGen(generation, PageLo(off), PageSpan(off, count));
+    co_await Fetch(generation, PageLo(off), PageSpan(off, count));
     Held<T> h = co_await HoldPage(off, count, write);
     co_return static_cast<Held<T> &&>(h);
   }
@@ -509,10 +487,11 @@ class DeviceVector {
    * loop, where the put of one page overlaps the next page's compute.
    */
   template <typename... Rest>
-  __device__ clio::run::gpu::YCoroTask Flush(clio::run::u64 off,
+  __device__ clio::run::gpu::YCoroTask Flush(clio::run::u64 generation,
+                                             clio::run::u64 off,
                                              clio::run::u64 count,
                                              Rest... rest) {
-    co_await BeginFlush(off, count, rest...);
+    co_await BeginFlush(generation, off, count, rest...);
     co_await EndFlush();
     co_return;
   }
@@ -833,10 +812,22 @@ class DeviceVector {
         clio::run::u32 a = 0, b = 0;
         if (!PageNeed(pn, lo[r], hi[r], &a, &b)) continue;
         Page *p = Find(pn);
-        // RESIDENT IS NOT THE SAME AS VALID. A frame that holds a different
-        // slice of this page still needs a transfer; widen to the union so
-        // the valid range stays one interval.
-        if (Covers(p, a, b)) continue;
+        // RESIDENT IS NOT THE SAME AS VALID, and VALID IS NOT THE SAME AS
+        // CURRENT. A frame holding a different slice of this page needs a
+        // transfer; so does one holding an older generation, or a
+        // generational fetch would be satisfied by exactly the stale copy it
+        // exists to refuse. Widen to the union so the valid range stays one
+        // interval.
+        const bool current =
+            (bt->fetch_generation == 0) || (p != nullptr &&
+                                            p->generation >= bt->fetch_generation);
+        if (Covers(p, a, b) && current) continue;
+        if (p != nullptr && !current) {
+          // Stale: refetch the whole page rather than patch an interval whose
+          // two halves would then be from different generations.
+          p->valid_lo = 0u;
+          p->valid_hi = 0u;
+        }
         clio::run::u32 flo = a, fhi = b;
         if (p != nullptr) {
           if (p->valid_hi > p->valid_lo) {
