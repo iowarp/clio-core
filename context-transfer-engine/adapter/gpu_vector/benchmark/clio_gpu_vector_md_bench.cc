@@ -130,6 +130,25 @@ __device__ unsigned long long g_blk_last[64];
 static constexpr int kMaxNlGuards = 4;
 
 /**
+ * The block-uniform tables the list passes stage out of the coroutine frame.
+ *
+ * Declared as a TYPE, not carved out of `extern __shared__` with casts: the
+ * arena is one struct, so its size is a compile-time fact instead of a
+ * hand-summed byte count that has to be kept in step at the launch site.
+ */
+struct MdTables {
+  const float *sp0[9];
+  const float *sp1[9];
+  u64 srun[9];
+  u64 qoff[9];
+  u32 qspan[12];
+  const int *np[kMaxNlGuards];
+  u64 gs[kMaxNlGuards];
+  u64 gl[kMaxNlGuards];
+};
+
+
+/**
  * Worst-case x-span guards a force chunk holds at once: three z planes, each
  * up to two y ranges when the stencil crosses the y wrap, each range up to
  * two guards when it straddles a page boundary. Reserved up front because
@@ -556,16 +575,19 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
   // entry and is why the list pass first measured SLOWER than cell-direct
   // despite 17x fewer candidates. Filled once per row after every hold
   // (no co_await follows, so shared survives) and read by all threads.
-  char *tbl = smem_raw + CLIO_YIELD_SMEM_BYTES +
-              blockDim.x * sizeof(double);
-  const float **s_sp0 = reinterpret_cast<const float **>(tbl);
-  const float **s_sp1 = s_sp0 + 9;
-  u64 *s_srun = reinterpret_cast<u64 *>(s_sp1 + 9);
-  u64 *s_qoff = s_srun + 9;
-  u32 *s_qspan = reinterpret_cast<u32 *>(s_qoff + 9);
-  const int **s_np = reinterpret_cast<const int **>(s_qspan + 12);
-  u64 *s_gs = reinterpret_cast<u64 *>(s_np + kMaxNlGuards);
-  u64 *s_gl = s_gs + kMaxNlGuards;
+  // SURVIVES A PARK. These were staged in plain __shared__, which the driver
+  // destroys when it exits the kernel to suspend, so every one of them had to
+  // be re-published by hand after the last hold that could suspend -- and a
+  // suspend added anywhere after that fill would have read stale pointers.
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
+  const float **s_sp0 = s_tbl.sp0;
+  const float **s_sp1 = s_tbl.sp1;
+  u64 *s_srun = s_tbl.srun;
+  u64 *s_qoff = s_tbl.qoff;
+  u32 *s_qspan = s_tbl.qspan;
+  const int **s_np = s_tbl.np;
+  u64 *s_gs = s_tbl.gs;
+  u64 *s_gl = s_tbl.gl;
   const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
   const u64 nrows = static_cast<u64>(nb) * nb;
   const u64 islots = static_cast<u64>(nb) * cap;
@@ -683,13 +705,12 @@ co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         ++nguards;
       }
     }
-    // SHARED DOES NOT SURVIVE A PARK. The yield driver exits the kernel on
-    // a fault, so every block-uniform table has to be (re)published AFTER
-    // the last hold that can suspend -- the span pointers included, even
-    // though the holds themselves are taken once per CHUNK and their guards
-    // live in the frame. Resident runs never park and so never noticed;
-    // out of core this read back garbage pointers and died on an MMU fault
-    // inside the coroutine's resume path.
+    // Publish the block-uniform tables. This used to be a RE-publication
+    // that had to sit after the last hold that could suspend, because the
+    // arena was plain __shared__ and the driver destroys shared when it
+    // exits the kernel to park. CLIO_SHARED_PERSIST carries it across the
+    // suspension now, so this is an ordinary fill and a co_await added below
+    // it is no longer a silent corruption.
     if (threadIdx.x == 0) {
       for (u32 t = 0; t < nspans; ++t) {
         s_sp0[t] = sp0[t];
@@ -815,16 +836,19 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
   // entry and is why the list pass first measured SLOWER than cell-direct
   // despite 17x fewer candidates. Filled once per row after every hold
   // (no co_await follows, so shared survives) and read by all threads.
-  char *tbl = smem_raw + CLIO_YIELD_SMEM_BYTES +
-              blockDim.x * sizeof(double);
-  const float **s_sp0 = reinterpret_cast<const float **>(tbl);
-  const float **s_sp1 = s_sp0 + 9;
-  u64 *s_srun = reinterpret_cast<u64 *>(s_sp1 + 9);
-  u64 *s_qoff = s_srun + 9;
-  u32 *s_qspan = reinterpret_cast<u32 *>(s_qoff + 9);
-  const int **s_np = reinterpret_cast<const int **>(s_qspan + 12);
-  u64 *s_gs = reinterpret_cast<u64 *>(s_np + kMaxNlGuards);
-  u64 *s_gl = s_gs + kMaxNlGuards;
+  // SURVIVES A PARK. These were staged in plain __shared__, which the driver
+  // destroys when it exits the kernel to suspend, so every one of them had to
+  // be re-published by hand after the last hold that could suspend -- and a
+  // suspend added anywhere after that fill would have read stale pointers.
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
+  const float **s_sp0 = s_tbl.sp0;
+  const float **s_sp1 = s_tbl.sp1;
+  u64 *s_srun = s_tbl.srun;
+  u64 *s_qoff = s_tbl.qoff;
+  u32 *s_qspan = s_tbl.qspan;
+  const int **s_np = s_tbl.np;
+  u64 *s_gs = s_tbl.gs;
+  u64 *s_gl = s_tbl.gl;
   const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
   const u64 nrows = static_cast<u64>(nb) * nb;
   const u64 islots = static_cast<u64>(nb) * cap;
@@ -995,13 +1019,12 @@ co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         ++nguards;
       }
     }
-    // SHARED DOES NOT SURVIVE A PARK. The yield driver exits the kernel on
-    // a fault, so every block-uniform table has to be (re)published AFTER
-    // the last hold that can suspend -- the span pointers included, even
-    // though the holds themselves are taken once per CHUNK and their guards
-    // live in the frame. Resident runs never park and so never noticed;
-    // out of core this read back garbage pointers and died on an MMU fault
-    // inside the coroutine's resume path.
+    // Publish the block-uniform tables. This used to be a RE-publication
+    // that had to sit after the last hold that could suspend, because the
+    // arena was plain __shared__ and the driver destroys shared when it
+    // exits the kernel to park. CLIO_SHARED_PERSIST carries it across the
+    // suspension now, so this is an ordinary fill and a co_await added below
+    // it is no longer a silent corruption.
     if (threadIdx.x == 0) {
       for (u32 t = 0; t < nspans; ++t) {
         s_sp0[t] = sp0[t];
@@ -2488,13 +2511,12 @@ int main(int argc, char **argv) {
                                      nl_page_elems + 1));
     u32 *d_cnt = ctp::GpuApi::Malloc<u32>(g.nslots * sizeof(u32));
     double *d_acc = ctp::GpuApi::Malloc<double>(3 * sizeof(double));
-    // reduction scratch + the block-uniform pointer tables (9 stencil
-    // rows, kMaxNlGuards list guards) that must not live in the frame.
-    const u32 smem_tbl = static_cast<u32>(
-        9 * (2 * sizeof(void *) + 2 * sizeof(u64)) + 12 * sizeof(u32) +
-        kMaxNlGuards * (sizeof(void *) + 2 * sizeof(u64)));
+    // Reduction scratch only. The block-uniform tables moved into the
+    // persistent arena, which lives inside YieldSmem and is therefore
+    // already covered by CLIO_YIELD_SMEM_BYTES -- no hand-summed byte count
+    // to keep in step with the struct any more.
     const u32 smem_force =
-        CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double) + smem_tbl;
+        CLIO_YIELD_SMEM_BYTES + a.threads * sizeof(double);
     const float fbox = static_cast<float>(g.box);
     const float fcut = static_cast<float>(a.cutoff);
     const float fdt = static_cast<float>(a.dt);
