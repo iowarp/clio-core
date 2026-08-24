@@ -137,6 +137,32 @@ __device__ gy::YCoroMain FallbackCoro(gv::DeviceVector<u32> v, u32 block,
   }
 }
 
+/**
+ * DISJOINT WRITERS ON ONE PAGE. All eight blocks copy page 0 and each writes
+ * its own slice of it, then flushes only that slice.
+ *
+ * This is the case the design says is legal, and the thing that makes it
+ * legal is ClipToPage: a ranged flush puts only the bytes the caller named,
+ * so eight blocks flushing eight disjoint slices of one blob issue eight
+ * non-overlapping partial puts. Each block's copy holds a STALE version of
+ * the other seven slices, and none of that staleness reaches the store as
+ * long as nobody flushes wider than they wrote.
+ */
+__device__ gy::YCoroMain SliceCoro(gv::DeviceVector<u32> v, u32 block,
+                                   u32 nblocks, unsigned long long *bad) {
+  const u64 slice = kEpp / nblocks;
+  const u64 off = static_cast<u64>(block) * slice;   // page 0, this slice
+  {
+    auto h = co_await v.UpdateRange(off, slice, /*from=*/0u, /*write=*/true);
+    for (u64 i = threadIdx.x; i < slice; i += blockDim.x) {
+      h[off + i] = Pattern(block, i) ^ 0xABCDu;
+    }
+  }
+  co_await v.BeginFlush(off, slice);
+  co_await v.EndFlush();
+  (void)bad;
+}
+
 #define GV_KERNEL(name, coro)                                                 \
   __global__ void name(clio::run::IpcManagerGpuInfo info,                     \
                        gv::DeviceVector<u32> v, u32 nblocks,                  \
@@ -154,6 +180,7 @@ GV_KERNEL(BorrowKernel, BorrowCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(CopyKernel, CopyCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(FallbackKernel, FallbackCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(WriteKernel, WriteCoro(v, yv.Block(), nblocks, bad))
+GV_KERNEL(SliceKernel, SliceCoro(v, yv.Block(), nblocks, bad))
 
 #if !CTP_IS_DEVICE_PASS
 TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
@@ -264,6 +291,22 @@ TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
     REQUIRE(wrong == 0);
   }
   REQUIRE(wr.second == 0);
+
+  run("disjoint writers, one page", SliceKernel);
+  {
+    std::vector<u32> host(kElems, 0u);
+    vec.Download(host.data(), kElems);
+    const u64 slice = kEpp / kBlocks;
+    u64 wrong = 0;
+    for (u32 b = 0; b < kBlocks; ++b) {
+      for (u64 i = 0; i < slice; ++i) {
+        if (host[b * slice + i] != (Pattern(b, i) ^ 0xABCDu)) ++wrong;
+      }
+    }
+    std::printf("  all 8 slices survived:       %llu of %llu wrong\n",
+                (unsigned long long)wrong, (unsigned long long)kEpp);
+    REQUIRE(wrong == 0);
+  }
 
   // Data has to be right in all three.
   REQUIRE(borrow.second == 0);
