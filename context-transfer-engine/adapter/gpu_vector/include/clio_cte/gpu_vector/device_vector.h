@@ -252,6 +252,44 @@ class DeviceVector {
   }
 
   /**
+   * GENERATIONAL FETCH: wait for a publication, not merely for bytes.
+   *
+   * The fetch is not served until the blob has reached `generation`, so a
+   * reader that runs ahead of its writer WAITS instead of being handed
+   * whatever exists. Without this a never-written page reads back as an
+   * empty blob with a success code, which is indistinguishable from real
+   * data -- the readiness question a multi-GPU run cannot otherwise answer.
+   *
+   * Pass 0 to mean "whatever is there", i.e. an ordinary fetch.
+   */
+  template <typename... Args>
+  __device__ clio::run::gpu::YCoroTask FetchGen(clio::run::u64 generation,
+                                                Args... args) {
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    co_await BeginFetch(args...);
+    co_await AwaitFetch();
+    if (threadIdx.x == 0) Tasks()->fetch_generation = 0;
+    __syncthreads();
+    co_return;
+  }
+
+  /** Publish this range AS `generation`, releasing readers waiting on it. */
+  template <typename... Rest>
+  __device__ clio::run::gpu::YCoroTask FlushGen(clio::run::u64 generation,
+                                                clio::run::u64 off,
+                                                clio::run::u64 count,
+                                                Rest... rest) {
+    if (threadIdx.x == 0) Tasks()->flush_generation = generation;
+    __syncthreads();
+    co_await BeginFlush(off, count, rest...);
+    co_await EndFlush();
+    if (threadIdx.x == 0) Tasks()->flush_generation = 0;
+    __syncthreads();
+    co_return;
+  }
+
+  /**
    * BeginFetch then AwaitFetch. Same ranges, same rules -- this is the whole
    * of it, for callers with nothing to overlap the transfer with. Splitting
    * the two is what lets a caller compute over one range while the next is
@@ -370,12 +408,13 @@ class DeviceVector {
    */
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> UpdateRange(
       clio::run::u64 off, clio::run::u64 count, clio::run::u32 from,
-      bool write = false) {
+      bool write = false, clio::run::u64 generation = 0) {
     const clio::run::u64 pn = PageOf(off);
     // Already here: this is FetchRange semantics -- do not re-transfer a
     // version we hold.
-    if (Find(pn) != nullptr) {
-      co_return Pin(Find(pn), off, count, write);
+    Page *mine = Find(pn);
+    if (mine != nullptr && mine->generation >= generation) {
+      co_return Pin(mine, off, count, write);
     }
     // Does the peer have it? Decide ONCE and block-uniformly: a concurrent
     // eviction in the owner can make one thread's probe succeed and
@@ -398,8 +437,11 @@ class DeviceVector {
           clio::run::u32 a = 0, b = 0;
           const bool need = PageNeed(pn, off, off + count, &a, &b);
           // The peer having the PAGE is not the peer having the RANGE.
+          // The peer having the RANGE is still not the peer having the
+          // GENERATION: a copy of last round's bytes is exactly the stale
+          // read this is meant to prevent.
           if (static_cast<volatile Page *>(p)->page_num == pn && need &&
-              Covers(p, a, b)) {
+              Covers(p, a, b) && p->generation >= generation) {
             s_src = p;
           } else {
             atomicSub(&p->pins, 1u);
@@ -435,6 +477,7 @@ class DeviceVector {
           dst->page_num = pn;
           dst->valid_lo = src->valid_lo;
           dst->valid_hi = src->valid_hi;
+          dst->generation = src->generation;
           dst->dirty = 0u;
           dst->fetching = 0u;
           dst->flushing = 0u;
@@ -447,8 +490,7 @@ class DeviceVector {
       if (threadIdx.x == 0) atomicSub(&src->pins, 1u);
       __syncthreads();
     }
-    co_await BeginFetch(PageLo(off), PageSpan(off, count));
-    co_await AwaitFetch();
+    co_await FetchGen(generation, PageLo(off), PageSpan(off, count));
     Held<T> h = co_await HoldPage(off, count, write);
     co_return static_cast<Held<T> &&>(h);
   }
@@ -568,6 +610,7 @@ class DeviceVector {
     p->page_num = kNoPage;
     p->valid_lo = 0u;
     p->valid_hi = 0u;
+    p->generation = 0;
     p->dirty = 0u;
     p->score = kDefaultScore;
     if (h_->stat_evicts_ != nullptr) atomicAdd(h_->stat_evicts_, 1ull);
@@ -845,6 +888,16 @@ class DeviceVector {
     // A page nobody has written yet has no blob; the CTE creates it and
     // returns success, so the vector needs no first-touch case of its own.
     t->context_.create_on_get_ = true;
+    // GENERATIONAL FETCH: when a generation was named, the runtime does not
+    // serve the get until the writer has published it. create_on_get_ stays
+    // on for the ordinary case, where a never-written page legitimately reads
+    // as empty -- but a generational get is exactly the case where "empty"
+    // must not be mistaken for "ready", and the gate runs before
+    // create_on_get_ gets to answer.
+    if (bt->fetch_generation != 0) {
+      t->context_.generational_ = true;
+      t->context_.generation_ = bt->fetch_generation;
+    }
     ClearRunCtx(t);
     if (h_->stat_faults_ != nullptr) {
       atomicAdd(h_->stat_faults_, static_cast<unsigned long long>(n));
@@ -877,6 +930,7 @@ class DeviceVector {
       Page *p = &tbl[bt->fetch_slot[i]];
       p->valid_lo = bt->fetch_vlo[i];
       p->valid_hi = bt->fetch_vhi[i];
+      p->generation = bt->fetch_generation;
       p->dirty = 0u;
       p->score = kDefaultScore;
       p->last_access = clock64();
@@ -951,6 +1005,12 @@ class DeviceVector {
     t->tag_id_ = h_->tag_id_;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
+    if (bt->flush_generation != 0) {
+      // GENERATIONAL PUT: stamp what this writer is publishing, so a reader
+      // waiting on this generation is released only once the bytes are in.
+      t->context_.generational_ = true;
+      t->context_.generation_ = bt->flush_generation;
+    }
     t->context_.compress_preset_ = h_->compress_preset_;
     t->context_.blob_name_flags_ =
         clio::cte::core::Context::kBlobNameRawInt32;

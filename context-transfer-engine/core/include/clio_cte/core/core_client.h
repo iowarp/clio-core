@@ -1988,8 +1988,15 @@ class Client : public clio::run::ContainerClient {
     // with zstd, identically at every page size. Device-destination gets never
     // hit it because TryReadBlobShm refuses device pointers, which is why the
     // in-kernel path looked fine and only host-side reads were wrong.
+    // A GENERATIONAL GET MUST REACH THE RUNTIME. Its whole contract is "do
+    // not serve until the blob has reached this generation", and the
+    // generation lives in the runtime's blob metadata -- serving the bytes
+    // from the SHM mirror here would answer the readiness question with
+    // whatever happens to be cached, which is precisely the stale read the
+    // flag exists to prevent.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        context.replica_ != 0 || context.compress_lib_ != 0 || ForceNetEnv()) {
+        context.replica_ != 0 || context.compress_lib_ != 0 ||
+        context.generational_ || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {

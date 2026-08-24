@@ -1770,6 +1770,14 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       auto rep_now = GetCurrentTimeNs();
       blob_info_ptr->last_modified_ = rep_now;
       blob_info_ptr->access_count_++;
+      // GENERATIONAL PUT: publish the writer's generation, never lower it.
+      // Out-of-order arrival of an older generation must not un-publish a
+      // newer one, so this is a max rather than an assignment.
+      if (task->context_.generational_ &&
+          task->context_.generation_ > blob_info_ptr->generation_) {
+        blob_info_ptr->generation_ = task->context_.generation_;
+      }
+
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -2015,6 +2023,14 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->last_modified_ = now;
     blob_info_ptr->access_count_++;  // frequency input for the data organizer
     blob_info_ptr->score_ = blob_score;
+    // GENERATIONAL PUT: publish the writer's generation, never lower it.
+    // Out-of-order arrival of an older generation must not un-publish a
+    // newer one, so this is a max rather than an assignment.
+    if (task->context_.generational_ &&
+        task->context_.generation_ > blob_info_ptr->generation_) {
+      blob_info_ptr->generation_ = task->context_.generation_;
+    }
+
     {
       // Write lock: we may need to insert a fresh tag_info entry. The
       // tag's name lives on whichever container `GetOrCreateTag`'s
@@ -2451,6 +2467,42 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 
     // Step 1: Check if blob exists
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+
+    // GENERATIONAL GET: do not serve until the writer has published.
+    //
+    // This is the whole point of the flag. Without it a reader that runs
+    // ahead of its writer is handed whatever exists -- and with
+    // create_on_get_ that is a zero-filled blob returned as SUCCESS, so
+    // correctness silently becomes a question of which side ran first. Here
+    // the reader waits for the generation it named.
+    //
+    // Yielding, not spinning: the worker runs other tasks while this one is
+    // parked. Bounded, because a writer that never arrives has to surface as
+    // an error rather than a hung worker.
+    if (task->context_.generational_ && task->context_.generation_ != 0) {
+      // Bound by TIME, not iterations: how long a yield actually parks is
+      // not something this loop can assume, and an iteration count silently
+      // became a 167 ms timeout that fired before a writer 400 ms away.
+      constexpr clio::run::u64 kGenWaitNs = 10ull * 1000 * 1000 * 1000;
+      const clio::run::u64 gen_t0 = GetCurrentTimeNs();
+      while (blob_info_ptr == nullptr ||
+             blob_info_ptr->generation_ < task->context_.generation_) {
+        if (GetCurrentTimeNs() - gen_t0 > kGenWaitNs) {
+          HLOG(kWarning,
+                "GetBlob '{}': generation {} never reached (blob at {})",
+                blob_name,
+                (unsigned long long) task->context_.generation_,
+                (unsigned long long) (blob_info_ptr == nullptr
+                                          ? 0ull
+                                          : blob_info_ptr->generation_));
+          task->return_code_ = 1;
+          clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+          CLIO_CO_RETURN;
+        }
+        CLIO_CO_AWAIT(clio::run::yield(25.0));
+        blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+      }
+    }
 
     // If blob doesn't exist, error -- unless the caller asked for it to be
     // created. Context::create_on_get_ makes a first read of a never-written
@@ -6556,6 +6608,9 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   auto new_blob_info = std::make_shared<BlobInfo>();
   new_blob_info->blob_name_ = blob_name;
   new_blob_info->score_ = blob_score;
+  // Generation 0 == "nothing has been published here yet", so a generational
+  // get for any generation >= 1 waits rather than reading an empty blob.
+  new_blob_info->generation_ = 0;
 
   // Construct composite key for blob storage
   std::string composite_key = std::to_string(tag_id.major_) + "." +

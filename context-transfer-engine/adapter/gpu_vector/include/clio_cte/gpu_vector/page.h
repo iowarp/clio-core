@@ -37,6 +37,10 @@ struct Page {
    *  holding whatever it held before. valid_hi <= valid_lo means empty. */
   clio::run::u32 valid_lo;
   clio::run::u32 valid_hi;
+  /** Generation of the bytes in this frame, for generational reads. 0 means
+   *  "unknown" -- a frame filled by a non-generational fetch says nothing
+   *  about which publication it caught. */
+  clio::run::u64 generation;
 };
 
 /**
@@ -61,6 +65,10 @@ struct BlockTasks {
    *  the frame's valid range to exactly what landed. */
   clio::run::u32 fetch_vlo[clio::cte::core::kPodMultiMax];
   clio::run::u32 fetch_vhi[clio::cte::core::kPodMultiMax];
+  /** Generation the in-flight fetch is waiting for (0 = ordinary fetch). */
+  clio::run::u64 fetch_generation;
+  /** Generation stamped on the in-flight flush (0 = ordinary flush). */
+  clio::run::u64 flush_generation;
 };
 
 /**

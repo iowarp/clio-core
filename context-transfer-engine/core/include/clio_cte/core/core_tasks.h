@@ -995,6 +995,13 @@ struct BlobInfo {
   // registrations and no stale invalidation targets.
   clio::run::priv::vector<clio::run::u64> replica_nodes_;
   float score_;  // 0-1 score for reorganization
+  /**
+   * Highest generation stamped by a generational put (Context::generation_).
+   * A generational get blocks until this reaches what it asked for, which is
+   * how a reader learns its writer is DONE rather than merely that the blob
+   * exists. Monotonic: an older generation arriving late never lowers it.
+   */
+  clio::run::u64 generation_;
   Timestamp last_modified_;
   Timestamp last_read_;
   // Number of data ops (PutBlob/GetBlob) served by this blob since creation.
@@ -1586,6 +1593,27 @@ struct Context {
   clio::run::u32 blob_name_flags_;
   static constexpr clio::run::u32 kBlobNameRawInt32 = 1u << 0;
 
+  /**
+   * GENERATIONAL PUT/GET (readiness, not recency).
+   *
+   * A caller-chosen constant, not a clock: `version_` above is the owner's
+   * last_modified_ tick reported OUT of a get, which answers "did this
+   * change?" but cannot answer "is the data I am waiting for here yet?".
+   *
+   * PUT stamps the blob with generation_ (monotonically -- a late-arriving
+   * older generation never lowers it).
+   *
+   * GET names the generation it needs and IS NOT SERVED UNTIL THE BLOB HAS
+   * REACHED IT. That is the point: a reader that runs ahead of its writer
+   * waits instead of being handed whatever exists, which with
+   * create_on_get_ would be a zero-filled blob that reads as success.
+   *
+   * Both are inert unless generational_ is set, so every existing caller is
+   * unaffected.
+   */
+  bool generational_;
+  clio::run::u64 generation_;
+
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1624,6 +1652,8 @@ struct Context {
         version_(0),
         create_on_get_(false),
         blob_name_flags_(0),
+        generational_(false),
+        generation_(0),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
