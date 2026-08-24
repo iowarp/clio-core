@@ -1,0 +1,34 @@
+# Cluster config for the 2-node distributed paged halo test. Same shape as
+# distributed/gvd_conf.yaml -- its own port and subnet so the two harnesses
+# can be up at the same time without fighting over either.
+networking:
+  port: 9414
+  hostfile: "/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_paged/hostfile"
+
+runtime:
+  num_threads: 4
+  queue_depth: 8192
+  first_busy_wait: 2000000000
+
+gpu:
+  queue_depth: 8192
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::gvmd_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::gvmd_ram"
+        bdev_type: "ram"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

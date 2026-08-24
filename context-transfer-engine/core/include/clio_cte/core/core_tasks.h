@@ -1433,6 +1433,77 @@ struct BlobInfo {
     }
   }
 #endif  // CTP_IS_HOST
+
+  /**
+   * PUBLISHED RANGES, at the granularity the CALLER wrote them.
+   *
+   * Neither the blob nor its extents can carry this. Per blob is raised by
+   * whichever writer lands first, so with two writers sharing a blob a
+   * reader waiting for generation g is released by its OWN put and reads the
+   * peer's stale half. Per extent is no better: the bdev rounds allocations
+   * into slabs and grows a block in place, so two logically separate regions
+   * routinely share one extent and stamping either stamps both.
+   *
+   * Fixed size, so BlobInfo gains no allocation. A blob written in more
+   * distinct ranges than this falls back to the blob-wide generation, which
+   * is the coarse behaviour rather than a wrong one.
+   */
+  static constexpr clio::run::u32 kMaxPublishedRanges = 8;
+  struct PublishedRange {
+    clio::run::u64 off_ = 0;
+    clio::run::u64 size_ = 0;
+    clio::run::u64 gen_ = 0;
+  };
+  PublishedRange published_[kMaxPublishedRanges];
+  clio::run::u32 published_n_ = 0;
+  bool published_overflow_ = false;
+
+  /**
+   * Generation covering [off, off+size): the lowest generation among the
+   * published ranges overlapping it, or 0 if any of it is unpublished --
+   * which for a generational reader is the same as "not ready".
+   */
+  clio::run::u64 RangeGeneration(clio::run::u64 off,
+                                 clio::run::u64 size) const {
+    if (size == 0) return 0;
+    if (published_n_ == 0 || published_overflow_) return generation_;
+    const clio::run::u64 hi = off + size;
+    clio::run::u64 lowest = ~0ull, covered_to = off;
+    for (clio::run::u32 pass = 0; pass < published_n_; ++pass) {
+      bool grew = false;
+      for (clio::run::u32 i = 0; i < published_n_; ++i) {
+        const auto &p = published_[i];
+        const clio::run::u64 p_hi = p.off_ + p.size_;
+        if (p_hi <= covered_to || p.off_ > covered_to || p.off_ >= hi) continue;
+        if (p.gen_ < lowest) lowest = p.gen_;
+        covered_to = p_hi;
+        grew = true;
+      }
+      if (!grew || covered_to >= hi) break;
+    }
+    if (covered_to < hi) return 0;
+    return lowest == ~0ull ? 0 : lowest;
+  }
+
+  /** Record that [off, off+size) is now published at `gen`. */
+  void StampRangeGeneration(clio::run::u64 off, clio::run::u64 size,
+                            clio::run::u64 gen) {
+    if (size == 0) return;
+    for (clio::run::u32 i = 0; i < published_n_; ++i) {
+      if (published_[i].off_ == off && published_[i].size_ == size) {
+        if (published_[i].gen_ < gen) published_[i].gen_ = gen;
+        return;
+      }
+    }
+    if (published_n_ < kMaxPublishedRanges) {
+      published_[published_n_].off_ = off;
+      published_[published_n_].size_ = size;
+      published_[published_n_].gen_ = gen;
+      ++published_n_;
+    } else {
+      published_overflow_ = true;   // degrade to blob-wide, never to wrong
+    }
+  }
 };
 
 #if CTP_IS_HOST

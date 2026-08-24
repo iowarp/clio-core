@@ -1770,12 +1770,15 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       auto rep_now = GetCurrentTimeNs();
       blob_info_ptr->last_modified_ = rep_now;
       blob_info_ptr->access_count_++;
-      // GENERATIONAL PUT: publish the writer's generation, never lower it.
-      // Out-of-order arrival of an older generation must not un-publish a
-      // newer one, so this is a max rather than an assignment.
-      if ((task->context_.op_flags_ & Context::kGenerational) &&
-          task->context_.generation_ > blob_info_ptr->generation_) {
-        blob_info_ptr->generation_ = task->context_.generation_;
+      // GENERATIONAL PUT: publish the writer's generation on the EXTENTS it
+      // wrote, never lowering one. Per extent, because two writers sharing a
+      // blob otherwise release each other's waits -- see BlobBlock.
+      if (task->context_.op_flags_ & Context::kGenerational) {
+        if (task->context_.generation_ > blob_info_ptr->generation_) {
+          blob_info_ptr->generation_ = task->context_.generation_;
+        }
+        blob_info_ptr->StampRangeGeneration(offset, size,
+                                            task->context_.generation_);
       }
 
       task->return_code_ = 0;
@@ -2023,12 +2026,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->last_modified_ = now;
     blob_info_ptr->access_count_++;  // frequency input for the data organizer
     blob_info_ptr->score_ = blob_score;
-    // GENERATIONAL PUT: publish the writer's generation, never lower it.
-    // Out-of-order arrival of an older generation must not un-publish a
-    // newer one, so this is a max rather than an assignment.
-    if ((task->context_.op_flags_ & Context::kGenerational) &&
-        task->context_.generation_ > blob_info_ptr->generation_) {
-      blob_info_ptr->generation_ = task->context_.generation_;
+    // GENERATIONAL PUT: see the note on the replica path above.
+    if (task->context_.op_flags_ & Context::kGenerational) {
+      if (task->context_.generation_ > blob_info_ptr->generation_) {
+        blob_info_ptr->generation_ = task->context_.generation_;
+      }
+      blob_info_ptr->StampRangeGeneration(offset, size,
+                                          task->context_.generation_);
     }
 
     {
@@ -2486,15 +2490,19 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       constexpr clio::run::u64 kGenWaitNs = 10ull * 1000 * 1000 * 1000;
       const clio::run::u64 gen_t0 = GetCurrentTimeNs();
       while (blob_info_ptr == nullptr ||
-             blob_info_ptr->generation_ < task->context_.generation_) {
+             blob_info_ptr->RangeGeneration(offset, size) <
+                 task->context_.generation_) {
         if (GetCurrentTimeNs() - gen_t0 > kGenWaitNs) {
           HLOG(kWarning,
-                "GetBlob '{}': generation {} never reached (blob at {})",
+                "GetBlob '{}': generation {} never reached for [{},{}) "
+                "(range at {})",
                 blob_name,
                 (unsigned long long) task->context_.generation_,
+                (unsigned long long) offset, (unsigned long long) size,
                 (unsigned long long) (blob_info_ptr == nullptr
                                           ? 0ull
-                                          : blob_info_ptr->generation_));
+                                          : blob_info_ptr->RangeGeneration(
+                                                offset, size)));
           task->return_code_ = 1;
           clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
           CLIO_CO_RETURN;
