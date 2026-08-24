@@ -103,6 +103,27 @@ __device__ gy::YCoroMain CopyCoro(gv::DeviceVector<u32> v, u32 block,
   }
 }
 
+/**
+ * WRITE THROUGH THE COPY, then publish it. The result of UpdateRange is this
+ * block's OWN frame, so dirty tracking and flush work exactly as they do for
+ * a faulted page -- that is what copying buys over pointing at the owner's
+ * frame, which could not be written at all.
+ */
+__device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u32 block,
+                                   u32 nblocks, unsigned long long *bad) {
+  const u32 owner = (block + 4u) % nblocks;
+  const u64 off = static_cast<u64>(owner) * kEpp;
+  {
+    auto h = co_await v.UpdateRange(off, kEpp, owner, /*write=*/true);
+    for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
+      h[off + i] = Pattern(owner, i) + 77u;
+    }
+  }
+  co_await v.BeginFlush(off, kEpp);
+  co_await v.EndFlush();
+  (void)bad;
+}
+
 /** A `from` that does NOT have the page: must fall back, not fail. */
 __device__ gy::YCoroMain FallbackCoro(gv::DeviceVector<u32> v, u32 block,
                                       u32 nblocks, unsigned long long *bad) {
@@ -132,6 +153,7 @@ GV_KERNEL(SeedKernel, SeedCoro(v, yv.Block()))
 GV_KERNEL(BorrowKernel, BorrowCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(CopyKernel, CopyCoro(v, yv.Block(), nblocks, bad))
 GV_KERNEL(FallbackKernel, FallbackCoro(v, yv.Block(), nblocks, bad))
+GV_KERNEL(WriteKernel, WriteCoro(v, yv.Block(), nblocks, bad))
 
 #if !CTP_IS_DEVICE_PASS
 TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
@@ -223,6 +245,25 @@ TEST_CASE("gpu_vector: UpdateRange borrows a peer's frame",
   const auto borrow = run("UpdateRange from owner", BorrowKernel);
   const auto copy = run("control: BeginFetch+Hold", CopyKernel);
   const auto fb = run("UpdateRange, wrong owner", FallbackKernel);
+
+  const auto wr = run("write through the copy", WriteKernel);
+  {
+    std::vector<u32> host(kElems, 0u);
+    vec.Download(host.data(), kElems);
+    u64 wrong = 0;
+    for (u32 b = 0; b < kBlocks; ++b) {
+      // Block b wrote the page owned by (b+4)%kBlocks.
+      const u32 owner = (b + 4u) % kBlocks;
+      for (u64 i = 0; i < kCheck; ++i) {
+        if (host[owner * kEpp + i] != Pattern(owner, i) + 77u) ++wrong;
+      }
+    }
+    std::printf("  write reached the store:     %llu of %llu wrong\n",
+                (unsigned long long)wrong,
+                (unsigned long long)(kBlocks * kCheck));
+    REQUIRE(wrong == 0);
+  }
+  REQUIRE(wr.second == 0);
 
   // Data has to be right in all three.
   REQUIRE(borrow.second == 0);

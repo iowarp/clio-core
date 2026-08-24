@@ -80,6 +80,7 @@ class Held {
   }
   CTP_GPU_FUN clio::run::u64 begin_off() const { return begin_; }
 
+
   /** Set this frame's eviction rank. Higher means keep. */
   CTP_GPU_FUN void Rescore(float rank) const {
     if (page_ != nullptr && threadIdx.x == 0) page_->score = rank;
@@ -288,45 +289,62 @@ class DeviceVector {
   }
 
   /**
-   * Read a range that ANOTHER block already has resident, without fetching a
-   * second copy of it into this block's table.
+   * Make this block's copy of a range current, sourcing it from a peer's
+   * cache when possible instead of from the tier stack.
    *
-   * `from` is the LOGICAL block that owns the range. It is an argument, not
-   * something the vector works out: discovering an owner needs a page
-   * directory, and a directory needs publication, pinning and eviction
-   * coordination between blocks -- exactly the coupling this design avoids.
-   * NVSHMEM makes the same call: `nvshmemx_getmem_block` takes the peer as a
-   * parameter and the application supplies it from its own decomposition.
+   * Already resident here -> hold it, no transfer. Otherwise, if the block
+   * named by `from` has the page, COPY it frame-to-frame -- at most one page
+   * (256 KB in the MD bench), device-to-device, a few hundred nanoseconds
+   * against the microseconds a fault through the runtime costs. Otherwise
+   * fall back to a fetch, so a wrong `from` costs latency, never
+   * correctness.
    *
-   * Falls back to BeginFetch/AwaitFetch/HoldPage when the owner does not
-   * have it either, so a wrong `from` costs a fetch, never correctness.
+   * `from` is an argument, never discovered. Working out an owner at runtime
+   * needs a page directory, and a directory needs publication, pinning and
+   * eviction coordination between blocks -- the coupling this design exists
+   * to avoid. NVSHMEM makes the same call: nvshmemx_getmem_block takes the
+   * peer as a parameter and the application supplies it from its own
+   * decomposition.
    *
-   * READ-ONLY BY CONSTRUCTION. Two blocks writing one frame is the
-   * clobbering class this design has already paid for twice.
+   * THE RESULT IS THIS BLOCK'S OWN FRAME, so it is writable like any other
+   * hold and its dirty bit and flush work normally. Copying is what buys
+   * that: a pointer INTO the owner's frame could not be written, because
+   * this block cannot mark another block's page dirty and the write would be
+   * dropped on eviction or clobber the owner on flush.
+   *
+   * It does NOT make a page safe for two writers. The copy is a snapshot;
+   * if two blocks write the same page and both flush, one loses. Writes
+   * still need a single owner per range.
    */
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> UpdateRange(
-      clio::run::u64 off, clio::run::u64 count, clio::run::u32 from) {
+      clio::run::u64 off, clio::run::u64 count, clio::run::u32 from,
+      bool write = false) {
     const clio::run::u64 pn = PageOf(off);
-    // THE DECISION MUST BE BLOCK-UNIFORM. A concurrent eviction in the owner
-    // can make one thread's probe succeed and another's fail; if the threads
-    // then took different paths, the co_await below would sit inside a
-    // divergent branch and the block would hang on its own barrier.
-    __shared__ Page *s_borrow;
+    // Already here: this is FetchRange semantics -- do not re-transfer a
+    // version we hold.
+    if (Find(pn) != nullptr) {
+      co_return Pin(Find(pn), off, count, write);
+    }
+    // Does the peer have it? Decide ONCE and block-uniformly: a concurrent
+    // eviction in the owner can make one thread's probe succeed and
+    // another's fail, and divergent threads would hang on the barrier in the
+    // fallback's co_await.
+    __shared__ Page *s_src;
     if (threadIdx.x == 0) {
-      s_borrow = nullptr;
+      s_src = nullptr;
       if (from != Table() && from < h_->nblocks_) {
         Page *p = FindIn(from, pn);
         if (p != nullptr) {
           // PIN, THEN VERIFY -- never probe-then-pin. Release() clears
           // page_num before a frame is reused and eviction refuses a pinned
           // frame, so a pin that survives the re-read cannot be pulled out
-          // from under us. The reverse order loses the frame in the window
-          // between the two, which is the shape of two bugs already fixed in
-          // this tree.
+          // from under the copy. The reverse order loses the frame in the
+          // window between the two, which is the shape of two bugs already
+          // fixed in this tree.
           atomicAdd(&p->pins, 1u);
           __threadfence();
           if (static_cast<volatile Page *>(p)->page_num == pn) {
-            s_borrow = p;
+            s_src = p;
           } else {
             atomicSub(&p->pins, 1u);
           }
@@ -334,20 +352,46 @@ class DeviceVector {
       }
     }
     __syncthreads();
-    Page *b = s_borrow;
-    if (b != nullptr) {
-      // One pin per THREAD, matching Pin/Unpin; thread 0 already took its
-      // own above to hold the frame across the vote.
-      if (threadIdx.x != 0) atomicAdd(&b->pins, 1u);
-      const clio::run::u64 in = off % h_->elems_per_page_;
-      clio::run::u64 run = h_->elems_per_page_ - in;
-      if (run > count) run = count;
+    // OUT OF SHARED BEFORE ANYTHING CAN SUSPEND. EvictPages parks, and a park
+    // is a kernel exit that destroys shared memory; a Page* left in __shared__
+    // across it comes back garbage. A local lives in the coroutine frame,
+    // which is in global memory and does survive.
+    Page *src = s_src;
+    if (src != nullptr) {
+      // Room for the copy. The source stays pinned across the eviction, so
+      // it cannot be reclaimed while we make space for its copy.
+      __shared__ Page *s_dst;
+      if (threadIdx.x == 0) s_dst = FindFree();
       __syncthreads();
-      co_return Held<T>(b, static_cast<T *>(b->data) + in, off, run);
+      Page *dst = s_dst;
+      if (dst == nullptr) {
+        co_await EvictPages(1, 1);
+        if (threadIdx.x == 0) s_dst = FindFree();
+        __syncthreads();
+        dst = s_dst;
+      }
+      if (dst != nullptr) {
+        CopyFrame(dst->data, src->data, h_->page_bytes_);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          // Clean: the bytes match what the peer had, and this block has
+          // written nothing of its own yet.
+          dst->page_num = pn;
+          dst->dirty = 0u;
+          dst->fetching = 0u;
+          dst->flushing = 0u;
+          dst->score = kDefaultScore;
+          atomicSub(&src->pins, 1u);
+        }
+        __syncthreads();
+        co_return Pin(dst, off, count, write);
+      }
+      if (threadIdx.x == 0) atomicSub(&src->pins, 1u);
+      __syncthreads();
     }
     co_await BeginFetch(PageLo(off), PageSpan(off, count));
     co_await AwaitFetch();
-    Held<T> h = co_await HoldPage(off, count);
+    Held<T> h = co_await HoldPage(off, count, write);
     co_return static_cast<Held<T> &&>(h);
   }
 
@@ -380,6 +424,41 @@ class DeviceVector {
   CTP_GPU_FUN BlockTasks *Tasks() const { return &h_->tasks_[Table()]; }
 
   /** The frame holding `pn` and readable, or null. */
+  /**
+   * Copy one frame's bytes, the whole block cooperating.
+   *
+   * 16 bytes per thread per step. There is no hardware path for this:
+   * cp.async / memcpy_async and Hopper's cp.async.bulk all target SHARED
+   * memory, and both ends here are page frames in GLOBAL memory, so a
+   * vectorized strided loop IS the fast path. Device memcpy() would be a
+   * per-thread BYTE loop -- every thread copying every byte.
+   *
+   * Frames are page-sized slices of one allocation, so src and dst share
+   * alignment; the scalar tail covers page sizes that are not a multiple
+   * of 16.
+   */
+  CTP_GPU_FUN void CopyFrame(void *dst, const void *src,
+                             clio::run::u64 bytes) const {
+    const clio::run::u64 addr =
+        reinterpret_cast<clio::run::u64>(dst) |
+        reinterpret_cast<clio::run::u64>(src);
+    clio::run::u64 done = 0;
+    if ((addr & 15u) == 0u && bytes >= 16u) {
+      const clio::run::u64 n16 = bytes >> 4;
+      auto *d4 = static_cast<int4 *>(dst);
+      const auto *s4 = static_cast<const int4 *>(src);
+      for (clio::run::u64 i = threadIdx.x; i < n16; i += blockDim.x) {
+        d4[i] = s4[i];
+      }
+      done = n16 << 4;
+    }
+    auto *d1 = static_cast<char *>(dst);
+    const auto *s1 = static_cast<const char *>(src);
+    for (clio::run::u64 i = done + threadIdx.x; i < bytes; i += blockDim.x) {
+      d1[i] = s1[i];
+    }
+  }
+
   /**
    * Probe ANOTHER block's table. Volatile because the owner writes these
    * fields from a different block, and a cached load would happily reuse a
