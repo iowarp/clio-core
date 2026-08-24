@@ -111,6 +111,25 @@ __device__ gy::YCoroMain HaloCoro(gv::DeviceVector<u32> v, u64 halo_row,
     atomicAdd(older, 1ull);
     printf("[halo] row=%llu STALE: asked round %u, got round %u\n",
            (unsigned long long) halo_row, round, seen);
+    // WHICH FRAME DID WE READ? If more than one frame in this block's table
+    // holds the page, Find() picks whichever comes first -- which may be the
+    // older copy. Dump every frame claiming it, with what it holds.
+    const gv::Page *tbl = v.TableForDebug();
+    const u64 pn = v.PageOf(off);
+    u32 holders = 0;
+    for (u32 i = 0; i < v.PagesPerTable(); ++i) {
+      if (tbl[i].page_num == pn) {
+        ++holders;
+        printf("[halo]   frame %u holds page %llu gen=%llu valid=[%u,%u) "
+               "pins=%u dirty=%u fetching=%u flushing=%u\n",
+               i, (unsigned long long) pn,
+               (unsigned long long) tbl[i].generation, tbl[i].valid_lo,
+               tbl[i].valid_hi, tbl[i].pins, tbl[i].dirty, tbl[i].fetching,
+               tbl[i].flushing);
+      }
+    }
+    printf("[halo]   %u frame(s) hold page %llu; asked gen %llu\n", holders,
+           (unsigned long long) pn, (unsigned long long) gen);
   }
   // Whatever snapshot it is, it must be a WHOLE one.
   for (u64 i = threadIdx.x + 1; i < kCheck; i += blockDim.x) {

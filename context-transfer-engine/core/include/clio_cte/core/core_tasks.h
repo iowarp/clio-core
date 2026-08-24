@@ -1998,7 +1998,10 @@ struct PutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void NormalizeBlobName() {
     if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.op_flags_ = 0;
+    // CLEAR ONLY THE NAME BIT. op_flags_ carries the generational flag too,
+    // and wiping the whole field here silently un-generationalised EVERY task
+    // that used a raw-int32 blob name -- which is every gpu_vector task.
+    context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;                 // Offset within blob
@@ -2233,7 +2236,10 @@ struct GetBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void NormalizeBlobName() {
     if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.op_flags_ = 0;
+    // CLEAR ONLY THE NAME BIT. op_flags_ carries the generational flag too,
+    // and wiping the whole field here silently un-generationalised EVERY task
+    // that used a raw-int32 blob name -- which is every gpu_vector task.
+    context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;              // Offset within blob
@@ -2794,7 +2800,10 @@ struct PodPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void NormalizeBlobName() {
     if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.op_flags_ = 0;
+    // CLEAR ONLY THE NAME BIT. op_flags_ carries the generational flag too,
+    // and wiping the whole field here silently un-generationalised EVERY task
+    // that used a raw-int32 blob name -- which is every gpu_vector task.
+    context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;
@@ -2934,7 +2943,10 @@ struct PodGetBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void NormalizeBlobName() {
     if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.op_flags_ = 0;
+    // CLEAR ONLY THE NAME BIT. op_flags_ carries the generational flag too,
+    // and wiping the whole field here silently un-generationalised EVERY task
+    // that used a raw-int32 blob name -- which is every gpu_vector task.
+    context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;
@@ -3203,7 +3215,7 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
       const std::string dec = GetBlobName(i);                                 \
       reqs_[i].blob_name_ = dec.c_str();                                      \
     }                                                                         \
-    context_.op_flags_ = 0;                                            \
+    context_.op_flags_ &= ~Context::kBlobNameRawInt32; /* NAME BIT ONLY */ \
   }                                                                           \
                                                                               \
   /** Append a record. Returns false when the batch is full, which is the      \
