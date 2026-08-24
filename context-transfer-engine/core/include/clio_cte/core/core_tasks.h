@@ -1585,13 +1585,17 @@ struct Context {
   bool create_on_get_;
 
   /**
-   * How blob_name_ is encoded. kBlobNameRawInt32 means the field holds a
-   * 32-bit page number as raw bytes, not digits: the runtime renders it
-   * decimal. Lets a GPU caller name a page without formatting a string in a
-   * kernel.
+   * Per-operation flags. One u32 of bits rather than a boolean per feature,
+   * which is how Context grew four of those already.
+   *
+   * kBlobNameRawInt32 -- blob_name_ holds a 32-bit page number as raw bytes,
+   *   not digits; the runtime renders it decimal. Lets a GPU caller name a
+   *   page without formatting a string in a kernel.
+   * kGenerational -- this operation is generational; see generation_.
    */
-  clio::run::u32 blob_name_flags_;
+  clio::run::u32 op_flags_;
   static constexpr clio::run::u32 kBlobNameRawInt32 = 1u << 0;
+  static constexpr clio::run::u32 kGenerational = 1u << 1;
 
   /**
    * GENERATIONAL PUT/GET (readiness, not recency).
@@ -1608,10 +1612,9 @@ struct Context {
    * waits instead of being handed whatever exists, which with
    * create_on_get_ would be a zero-filled blob that reads as success.
    *
-   * Both are inert unless generational_ is set, so every existing caller is
-   * unaffected.
+   * Both are inert unless kGenerational is set in op_flags_, so every
+   * existing caller is unaffected.
    */
-  bool generational_;
   clio::run::u64 generation_;
 
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
@@ -1651,8 +1654,7 @@ struct Context {
         origin_node_(kNoOriginNode),
         version_(0),
         create_on_get_(false),
-        blob_name_flags_(0),
-        generational_(false),
+        op_flags_(0),
         generation_(0),
         dynamic_compress_(0),
         compress_lib_(0),
@@ -1894,7 +1896,7 @@ CTP_CROSS_FUN std::string DecodeBlobName(const NameT &name,
   // fixed_string on the batched records, and only the former has str().
   const char *p = name.c_str();
   const size_t len = name.size();
-  if ((ctx.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) {
+  if ((ctx.op_flags_ & Context::kBlobNameRawInt32) == 0) {
     return std::string(p, len);
   }
   clio::run::u32 v = 0;
@@ -1916,9 +1918,9 @@ struct PutBlobTask : public clio::run::Task {
    *  decimal name with the raw-int flag still set, and the next pool decodes
    *  it a second time. */
   CTP_CROSS_FUN void NormalizeBlobName() {
-    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.blob_name_flags_ = 0;
+    context_.op_flags_ = 0;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;                 // Offset within blob
@@ -2151,9 +2153,9 @@ struct GetBlobTask : public clio::run::Task {
    *  decimal name with the raw-int flag still set, and the next pool decodes
    *  it a second time. */
   CTP_CROSS_FUN void NormalizeBlobName() {
-    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.blob_name_flags_ = 0;
+    context_.op_flags_ = 0;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;              // Offset within blob
@@ -2712,9 +2714,9 @@ struct PodPutBlobTask : public clio::run::Task {
    *  decimal name with the raw-int flag still set, and the next pool decodes
    *  it a second time. */
   CTP_CROSS_FUN void NormalizeBlobName() {
-    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.blob_name_flags_ = 0;
+    context_.op_flags_ = 0;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;
@@ -2852,9 +2854,9 @@ struct PodGetBlobTask : public clio::run::Task {
    *  decimal name with the raw-int flag still set, and the next pool decodes
    *  it a second time. */
   CTP_CROSS_FUN void NormalizeBlobName() {
-    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) return;
+    if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) return;
     const std::string dec = GetBlobName();
-    context_.blob_name_flags_ = 0;
+    context_.op_flags_ = 0;
     blob_name_ = dec.c_str();
   }
   IN clio::run::u64 offset_;
@@ -3114,7 +3116,7 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
   /** Render every record's name decimal IN PLACE and clear the flag; see     \
    *  the scalar NormalizeBlobName. */                                        \
   CTP_CROSS_FUN void NormalizeBlobName() {                                    \
-    if ((context_.blob_name_flags_ & Context::kBlobNameRawInt32) == 0) {      \
+    if ((context_.op_flags_ & Context::kBlobNameRawInt32) == 0) {      \
       return;                                                                 \
     }                                                                         \
     clio::run::u32 n = count_;                                                \
@@ -3123,7 +3125,7 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiMax = 64;
       const std::string dec = GetBlobName(i);                                 \
       reqs_[i].blob_name_ = dec.c_str();                                      \
     }                                                                         \
-    context_.blob_name_flags_ = 0;                                            \
+    context_.op_flags_ = 0;                                            \
   }                                                                           \
                                                                               \
   /** Append a record. Returns false when the batch is full, which is the      \

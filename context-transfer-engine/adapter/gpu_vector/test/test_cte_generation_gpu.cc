@@ -78,7 +78,7 @@ TEST_CASE("cte: a generational get waits for its generation",
   auto put_gen = [&](const char *name, char fill, clio::run::u64 gen) {
     std::fill(wbuf.begin(), wbuf.end(), fill);
     core::Context ctx;
-    ctx.generational_ = true;
+    ctx.op_flags_ |= core::Context::kGenerational;
     ctx.generation_ = gen;
     auto f = cte.AsyncPutBlob(tag, std::string(name), 0, kBytes, wbuf.data(),
                               0.5f, ctx, 0u,
@@ -92,7 +92,7 @@ TEST_CASE("cte: a generational get waits for its generation",
     core::Context ctx;
     ctx.create_on_get_ = create_on_get;
     if (gen != 0) {
-      ctx.generational_ = true;
+      ctx.op_flags_ |= core::Context::kGenerational;
       ctx.generation_ = gen;
     }
     auto f = cte.AsyncGetBlob(tag, std::string(name), 0, kBytes, 0,
@@ -127,7 +127,7 @@ TEST_CASE("cte: a generational get waits for its generation",
       std::this_thread::sleep_for(std::chrono::milliseconds(400));
       std::vector<char> w(kBytes, 'B');
       core::Context ctx;
-      ctx.generational_ = true;
+      ctx.op_flags_ |= core::Context::kGenerational;
       ctx.generation_ = 9;
       auto f = cte.AsyncPutBlob(tag, std::string("b"), 0, kBytes, w.data(),
                                 0.5f, ctx, 0u,

@@ -1996,7 +1996,7 @@ class Client : public clio::run::ContainerClient {
     // flag exists to prevent.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
         context.replica_ != 0 || context.compress_lib_ != 0 ||
-        context.generational_ || ForceNetEnv()) {
+        (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {

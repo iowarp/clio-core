@@ -1773,7 +1773,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // GENERATIONAL PUT: publish the writer's generation, never lower it.
       // Out-of-order arrival of an older generation must not un-publish a
       // newer one, so this is a max rather than an assignment.
-      if (task->context_.generational_ &&
+      if ((task->context_.op_flags_ & Context::kGenerational) &&
           task->context_.generation_ > blob_info_ptr->generation_) {
         blob_info_ptr->generation_ = task->context_.generation_;
       }
@@ -2026,7 +2026,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // GENERATIONAL PUT: publish the writer's generation, never lower it.
     // Out-of-order arrival of an older generation must not un-publish a
     // newer one, so this is a max rather than an assignment.
-    if (task->context_.generational_ &&
+    if ((task->context_.op_flags_ & Context::kGenerational) &&
         task->context_.generation_ > blob_info_ptr->generation_) {
       blob_info_ptr->generation_ = task->context_.generation_;
     }
@@ -2479,7 +2479,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Yielding, not spinning: the worker runs other tasks while this one is
     // parked. Bounded, because a writer that never arrives has to surface as
     // an error rather than a hung worker.
-    if (task->context_.generational_ && task->context_.generation_ != 0) {
+    if ((task->context_.op_flags_ & Context::kGenerational) && task->context_.generation_ != 0) {
       // Bound by TIME, not iterations: how long a yield actually parks is
       // not something this loop can assume, and an iteration count silently
       // became a 167 ms timeout that fired before a writer 400 ms away.

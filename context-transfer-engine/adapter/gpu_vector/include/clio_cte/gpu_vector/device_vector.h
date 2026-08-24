@@ -883,7 +883,7 @@ class DeviceVector {
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
     t->context_.compress_preset_ = h_->compress_preset_;
-    t->context_.blob_name_flags_ =
+    t->context_.op_flags_ =
         clio::cte::core::Context::kBlobNameRawInt32;
     // A page nobody has written yet has no blob; the CTE creates it and
     // returns success, so the vector needs no first-touch case of its own.
@@ -895,7 +895,7 @@ class DeviceVector {
     // must not be mistaken for "ready", and the gate runs before
     // create_on_get_ gets to answer.
     if (bt->fetch_generation != 0) {
-      t->context_.generational_ = true;
+      t->context_.op_flags_ |= clio::cte::core::Context::kGenerational;
       t->context_.generation_ = bt->fetch_generation;
     }
     ClearRunCtx(t);
@@ -1008,11 +1008,11 @@ class DeviceVector {
     if (bt->flush_generation != 0) {
       // GENERATIONAL PUT: stamp what this writer is publishing, so a reader
       // waiting on this generation is released only once the bytes are in.
-      t->context_.generational_ = true;
+      t->context_.op_flags_ |= clio::cte::core::Context::kGenerational;
       t->context_.generation_ = bt->flush_generation;
     }
     t->context_.compress_preset_ = h_->compress_preset_;
-    t->context_.blob_name_flags_ =
+    t->context_.op_flags_ =
         clio::cte::core::Context::kBlobNameRawInt32;
     ClearRunCtx(t);
     if (h_->stat_puts_ != nullptr) {
