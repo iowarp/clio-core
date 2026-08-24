@@ -90,6 +90,17 @@ __device__ unsigned long long g_md_cyc[8];
  *  across all threads, so the co_await stays out of a divergent branch. */
 __device__ u32 g_publish = 1u;
 
+/** SHARING PROBE: bit b set means block b held that page at least once.
+ *  16 blocks fit a u32; the popcount per page is the sharing degree. */
+__device__ u32 g_xmask[8192];
+__device__ u32 g_nlmask[8192];
+__device__ void MarkPages(u32 *mask, u64 p0, u64 p1, u32 block) {
+  if (threadIdx.x != 0 || block >= 32) return;
+  for (u64 p = p0; p <= p1 && p < 8192; ++p) {
+    atomicOr(&mask[p], 1u << block);
+  }
+}
+
 __device__ unsigned long long g_pages_done;
 /** Sink for the ballistic path's optional THIRD vector read, so the load
  *  cannot be optimised away while the physics stays untouched. */
@@ -638,6 +649,7 @@ co_await x.BeginFetch(x.PageLo(rb), x.PageSpan(rb, len));
           hg[nspans][1] =
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
+        MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
         sbase[nspans] = rl[t];
@@ -662,6 +674,8 @@ co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         co_await nl.AwaitFetch();
                 hn[nguards] =
             co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
+        MarkPages(g_nlmask, nl.PageOf(nb0 + off),
+                  nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
         glen[nguards] = hn[nguards].run();
@@ -921,6 +935,7 @@ co_await x.BeginFetch(x.PageLo(rb), x.PageSpan(rb, len));
           hg[nspans][1] =
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
+        MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
         sbase[nspans] = rl[t];
@@ -971,6 +986,8 @@ co_await f.BeginFetch(f.PageLo(fbase), f.PageSpan(fbase, row_elems));
 co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         co_await nl.AwaitFetch();
                 hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
+        MarkPages(g_nlmask, nl.PageOf(nb0 + off),
+                  nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
         glen[nguards] = hn[nguards].run();
@@ -2804,6 +2821,38 @@ int main(int argc, char **argv) {
     // Claim-failure counters are gone: a claim that cannot succeed now
     // terminates the kernel rather than being tallied.
     std::printf("  slots per table: %u\n", slots);
+    {
+      // HOW OFTEN IS A PAGE SHARED? popcount of the per-page block mask.
+      static u32 xm[8192], nm[8192];
+      cudaMemcpyFromSymbol(xm, g_xmask, sizeof(xm));
+      cudaMemcpyFromSymbol(nm, g_nlmask, sizeof(nm));
+      const char *nms[2] = {"x", "list"};
+      const u32 *ms[2] = {xm, nm};
+      for (int k = 0; k < 2; ++k) {
+        u64 touched = 0, shared = 0, sumdeg = 0, maxdeg = 0, hist[17] = {0};
+        for (u32 p = 0; p < 8192; ++p) {
+          const u32 d = __builtin_popcount(ms[k][p]);
+          if (d == 0) continue;
+          ++touched; sumdeg += d;
+          if (d > 1) ++shared;
+          if (d > maxdeg) maxdeg = d;
+          if (d <= 16) ++hist[d];
+        }
+        if (touched == 0) continue;
+        std::printf("  SHARING %-4s: %llu pages touched, %llu shared by >1 "
+                    "block (%.1f%%), mean degree %.2f, max %llu\n",
+                    nms[k], (unsigned long long)touched,
+                    (unsigned long long)shared,
+                    100.0 * static_cast<double>(shared) / touched,
+                    static_cast<double>(sumdeg) / touched,
+                    (unsigned long long)maxdeg);
+        std::printf("    degree histogram:");
+        for (int d = 1; d <= 16; ++d) {
+          if (hist[d]) std::printf(" %d:%llu", d, (unsigned long long)hist[d]);
+        }
+        std::printf("\n");
+      }
+    }
     const bool nve_ok = (e_drift < a.drift_tol) &&
                         (!expect_resident || res_ok) && !runner.HitCap();
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
