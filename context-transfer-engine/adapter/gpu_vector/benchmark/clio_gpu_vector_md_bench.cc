@@ -760,8 +760,19 @@ co_await nl.BeginFetch(nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
       d_cnt[slotbase + s] = cnt;
     }
     __syncthreads();
+    // PUBLISH THIS LIST ROW AND LET THE FRAME GO.
+    //
+    // The row was write-held, and a dirty page is unevictable -- the vector
+    // will not write it back on the caller's behalf. Building every row this
+    // block owns without flushing therefore fills the table with dirty frames
+    // that EvictPages cannot reclaim, and it traps. That, not any working
+    // set, is what set the list cache floor: a block builds ~53 rows, so it
+    // needed ~64 frames purely to keep every dirty row. The pass only ever
+    // reads one row at a time, so with the flush the cache can be tiny.
+    co_await nl.BeginFlush(row * rowlist, rowlist);
     }   // per-row loop
     }
+    co_await nl.EndFlush();
   }     // per-chunk loop
 }
 
@@ -1865,13 +1876,13 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
                        CachePlan *out) {
   const u32 s_max = static_cast<u32>(npages + 2);
   const u32 nl_max = (nl_pages == 0) ? 0u : static_cast<u32>(nl_pages + 2);
-  // THE LIST'S FLOOR IS A BYTE COUNT, NOT A FRAME COUNT. kMinSlotsNl counts
-  // the guards ONE row pins, but the force pass keeps far more of the list
-  // live than that: measured at lattice 50, 64 frames of 2 MB passes and 32
-  // fails, while 128 frames of 1 MB passes and 64 fails -- the same 128 MB
-  // per block either way. Sizing the list by frames let the planner hand it
-  // 6 and the run died in the list build with an illegal access.
-  const clio::run::u64 kNlLiveBytes = 128ull * 1024 * 1024;
+  // The list floor WAS 128 MB per block, because BuildListCoro dirtied every
+  // row it built and never published one -- a dirty page is unevictable, so
+  // the table filled and EvictPages trapped. That is fixed at the write site,
+  // and both passes touch ONE row at a time, so a few frames plus fetch
+  // headroom is the real floor. Frames beyond it buy fewer refetches, not
+  // correctness, so the planner spends what is left over here.
+  const clio::run::u64 kNlLiveBytes = 16ull * 1024 * 1024;
   u32 nl_floor = 0;
   if (nl_pages != 0) {
     nl_floor = static_cast<u32>((kNlLiveBytes + nl_page_bytes - 1) /
