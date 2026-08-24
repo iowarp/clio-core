@@ -287,6 +287,70 @@ class DeviceVector {
     co_return;
   }
 
+  /**
+   * Read a range that ANOTHER block already has resident, without fetching a
+   * second copy of it into this block's table.
+   *
+   * `from` is the LOGICAL block that owns the range. It is an argument, not
+   * something the vector works out: discovering an owner needs a page
+   * directory, and a directory needs publication, pinning and eviction
+   * coordination between blocks -- exactly the coupling this design avoids.
+   * NVSHMEM makes the same call: `nvshmemx_getmem_block` takes the peer as a
+   * parameter and the application supplies it from its own decomposition.
+   *
+   * Falls back to BeginFetch/AwaitFetch/HoldPage when the owner does not
+   * have it either, so a wrong `from` costs a fetch, never correctness.
+   *
+   * READ-ONLY BY CONSTRUCTION. Two blocks writing one frame is the
+   * clobbering class this design has already paid for twice.
+   */
+  __device__ clio::run::gpu::YCoroTaskT<Held<T>> UpdateRange(
+      clio::run::u64 off, clio::run::u64 count, clio::run::u32 from) {
+    const clio::run::u64 pn = PageOf(off);
+    // THE DECISION MUST BE BLOCK-UNIFORM. A concurrent eviction in the owner
+    // can make one thread's probe succeed and another's fail; if the threads
+    // then took different paths, the co_await below would sit inside a
+    // divergent branch and the block would hang on its own barrier.
+    __shared__ Page *s_borrow;
+    if (threadIdx.x == 0) {
+      s_borrow = nullptr;
+      if (from != Table() && from < h_->nblocks_) {
+        Page *p = FindIn(from, pn);
+        if (p != nullptr) {
+          // PIN, THEN VERIFY -- never probe-then-pin. Release() clears
+          // page_num before a frame is reused and eviction refuses a pinned
+          // frame, so a pin that survives the re-read cannot be pulled out
+          // from under us. The reverse order loses the frame in the window
+          // between the two, which is the shape of two bugs already fixed in
+          // this tree.
+          atomicAdd(&p->pins, 1u);
+          __threadfence();
+          if (static_cast<volatile Page *>(p)->page_num == pn) {
+            s_borrow = p;
+          } else {
+            atomicSub(&p->pins, 1u);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    Page *b = s_borrow;
+    if (b != nullptr) {
+      // One pin per THREAD, matching Pin/Unpin; thread 0 already took its
+      // own above to hold the frame across the vote.
+      if (threadIdx.x != 0) atomicAdd(&b->pins, 1u);
+      const clio::run::u64 in = off % h_->elems_per_page_;
+      clio::run::u64 run = h_->elems_per_page_ - in;
+      if (run > count) run = count;
+      __syncthreads();
+      co_return Held<T>(b, static_cast<T *>(b->data) + in, off, run);
+    }
+    co_await BeginFetch(PageLo(off), PageSpan(off, count));
+    co_await AwaitFetch();
+    Held<T> h = co_await HoldPage(off, count);
+    co_return static_cast<Held<T> &&>(h);
+  }
+
   /** Wait for the writeback started by BeginFlush. */
   __device__ clio::run::gpu::YCoroTask EndFlush() {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
@@ -316,6 +380,21 @@ class DeviceVector {
   CTP_GPU_FUN BlockTasks *Tasks() const { return &h_->tasks_[Table()]; }
 
   /** The frame holding `pn` and readable, or null. */
+  /**
+   * Probe ANOTHER block's table. Volatile because the owner writes these
+   * fields from a different block, and a cached load would happily reuse a
+   * slot that has since been released.
+   */
+  CTP_GPU_FUN Page *FindIn(clio::run::u32 table, clio::run::u64 pn) const {
+    Page *tbl = h_->pages_ + static_cast<size_t>(table) * h_->pages_per_block_;
+    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      volatile Page *c = &tbl[i];
+      if (c->page_num == pn && c->fetching == 0u && c->flushing == 0u) {
+        return &tbl[i];
+      }
+    }
+    return nullptr;
+  }
   CTP_GPU_FUN Page *Find(clio::run::u64 pn) const {
     Page *tbl = Pages();
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {

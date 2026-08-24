@@ -126,9 +126,19 @@ TEST_CASE("gpu_vector: shared state survives a park",
           "[gpu_vector][persist]") {
   {
     std::ofstream cfg("gpu_vector_persist.yaml");
-    cfg << "devices:\n  - name: \"ram\"\n    mount_point: \"ram::gv_persist\"\n"
-        << "    capacity: \"256MB\"\n"
-        << "cte:\n  targets:\n    tiers:\n      - path: \"ram::gv_persist\"\n"
+    cfg << "networking:\n  port: 9431\n\n"
+        << "runtime:\n  num_threads: 4\n  queue_depth: 4096\n\n"
+        << "gpu:\n  queue_depth: 4096\n\n"
+        << "compose:\n"
+        << "  - mod_name: clio_bdev\n"
+        << "    pool_name: \"ram::chi_default_bdev\"\n"
+        << "    pool_query: local\n    pool_id: \"301.0\"\n"
+        << "    bdev_type: ram\n    capacity: \"512MB\"\n\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: cte_core\n    pool_query: local\n"
+        << "    pool_id: \"512.0\"\n"
+        << "    storage:\n"
+        << "      - path: \"ram::gv_persist_tier\"\n"
         << "        bdev_type: \"ram\"\n        capacity_limit: \"256MB\"\n"
         << "        score: 1.0\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
