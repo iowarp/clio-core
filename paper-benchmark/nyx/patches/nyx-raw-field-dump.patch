@@ -1,5 +1,3 @@
-diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
-index 2704b78..1a1b9ba 100644
 --- a/Source/IO/Nyx_output.cpp
 +++ b/Source/IO/Nyx_output.cpp
 @@ -1,4 +1,6 @@
@@ -9,7 +7,7 @@ index 2704b78..1a1b9ba 100644
  #include <iomanip>
  #include <Nyx.H>
  #ifdef AMREX_USE_SUNDIALS
-@@ -106,11 +108,114 @@ Nyx::writePlotFilePre (const std::string& /*dir*/, ostream& /*os*/)
+@@ -106,11 +108,123 @@
  #endif
  }
  
@@ -70,17 +68,26 @@ index 2704b78..1a1b9ba 100644
 +        const amrex::FArrayBox& fab = mf[mfi];
 +        const long ncells = mfi.validbox().numPts();
 +        for (int comp = 0; comp < mf.nComp(); ++comp) {
-+            const amrex::Real* d_ptr = fab.dataPtr(comp);
 +            const size_t nbytes = (size_t)ncells * sizeof(amrex::Real);
 +            std::vector<char> h_buf(nbytes);
++            /* copyToMem, NOT a straight read of fab.dataPtr(comp). dataPtr
++               addresses the GROWN component -- validbox() is the interior of a
++               box carrying nGrow() ghost cells on every face -- so copying
++               validbox().numPts() elements from it takes a PREFIX of the grown
++               array: a mixture of valid and ghost cells, not the valid box. At
++               128^3 with one ghost layer that is the first 2,097,152 of
++               2,197,000 cells. copyToMem walks the box through the fab's real
++               strides. */
 +#ifdef AMREX_USE_GPU
-+            /* The FAB lives in an AMReX device/managed arena under CUDA.
-+               dtoh_memcpy_async + a stream sync rather than a raw cudaMemcpy:
-+               it is the portable spelling and it respects AMReX's stream. */
-+            amrex::Gpu::dtoh_memcpy_async(h_buf.data(), d_ptr, nbytes);
++            amrex::Gpu::DeviceVector<char> d_buf(nbytes);
++            fab.copyToMem<amrex::RunOn::Device>(mfi.validbox(), comp, 1,
++                                                d_buf.data());
++            amrex::Gpu::streamSynchronize();
++            amrex::Gpu::dtoh_memcpy_async(h_buf.data(), d_buf.data(), nbytes);
 +            amrex::Gpu::streamSynchronize();
 +#else
-+            std::memcpy(h_buf.data(), d_ptr, nbytes);
++            fab.copyToMem<amrex::RunOn::Host>(mfi.validbox(), comp, 1,
++                                              h_buf.data());
 +#endif
 +            char fpath[900];
 +            snprintf(fpath, sizeof(fpath), "%s/fab%04d_comp%02d_%s.%s",
