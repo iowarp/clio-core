@@ -189,9 +189,8 @@ class DeviceVector {
    * once the fetch has been SUBMITTED; pair it with AwaitFetch before
    * holding.
    *
-   * Only the named bytes become valid in the frame. Anything that will later
-   * be flushed as a WHOLE page must be fetched as a whole page -- see
-   * PageLo/PageSpan.
+   * Only the named bytes become valid in the frame, and only those bytes may
+   * be read back: a hold over elements this fetch did not name traps.
    */
   template <typename... Args>
   __device__ clio::run::gpu::YCoroTask BeginFetch(clio::run::u64 generation,
@@ -201,25 +200,12 @@ class DeviceVector {
     clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(lo, hi, nr, args...);
-    // ROUND OUT TO WHOLE PAGES, HERE, ONCE.
-    //
-    // RESIDENCY IS PER PAGE but a transfer is per range, so a fetch of part
-    // of a page fills part of a frame and marks the whole page resident --
-    // and the next fetch of a DIFFERENT part of that page is skipped as
-    // "already here" and hands back whatever the frame happened to hold.
-    // Callers used to dodge that by wrapping every offset in PageLo/PageSpan,
-    // which was 93 call sites doing the vector's arithmetic for it and one
-    // forgotten wrapper away from reading garbage.
-    //
-    // FLUSH DELIBERATELY DOES NOT DO THIS. A flush must stay byte-exact:
-    // rounding it out would ship bytes the caller never wrote, which is
-    // exactly how blocks clobber each other's slices of a shared page.
-    for (clio::run::u32 r = 0; r < nr; ++r) {
-      if (hi[r] <= lo[r]) continue;
-      lo[r] = PageLo(lo[r]);
-      hi[r] = (PageOf(hi[r] - 1) + 1) * h_->elems_per_page_;
-      if (hi[r] > h_->num_elems_) hi[r] = h_->num_elems_;
-    }
+    // NO ROUNDING. A fetch transfers exactly the elements named. Partial
+    // pages are safe because residency is not validity: each frame records
+    // the interval it actually holds, and SubmitFetch widens a fetch to the
+    // union of that interval and the new request, so a later fetch of a
+    // different slice of the same page transfers the gap rather than
+    // trusting bytes nobody read.
     // One fetch in flight per block: staging into a task the runtime is still
     // reading would overwrite records mid-transfer.
     if (FetchBusy()) {
