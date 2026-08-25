@@ -8,10 +8,16 @@ Clio stores the result. With `--hook insitu` Nyx writes **no plotfile and no
 checkpoint at all**: the compressed tier is the only copy of the data in
 existence, and a separate process reads it back bit-exact.
 
+Under MPI it is *N* such processes: one Clio runtime per rank, in the rank's
+own process, on its own port and its own store. That is not the topology one
+would design -- one runtime per node is -- but the alternative does not work
+today, for a reason that has nothing to do with GPUs and is measured in
+"Q5: MPI". Single node only; multi-node was not attempted.
+
 ```
  ┌────────────────────── one process: nyx_HydroTests ──────────────────────────┐
  │                                                                             │
- │  Nyx / AMReX (CUDA)          patch (+339 lines, Nyx_output.cpp)   Clio      │
+ │  Nyx / AMReX (CUDA)          patch (+419 lines, Nyx_output.cpp)   Clio      │
  │  ──────────────────          ───────────────────────────────────  ────      │
  │  Amr::coarseTimeStep                                                        │
  │    Nyx::advance      (GPU)                                                  │
@@ -153,15 +159,151 @@ repeats:
 | 128³ dynamic, 240 blobs | 4 | 0 failures |
 | 64³ decomposed into 8 boxes, `--verify` | 1 | 0 failures, 96/96 bit-exact, 96/96 `device=1` |
 
-## Q5: MPI
+## Q5: MPI -- and the topology that is NOT available
 
-**Single rank only, and refused otherwise.** `NProcs() > 1` aborts with a
-named message: each rank owns a subset of the boxes, and blob names carry only
-the box index, so under MPI several ranks would publish different data under
-the same name and a reader would get a fraction of the domain presented as the
-whole of it. The fix is a naming change (rank- or box-qualified), not a code
-change to the path -- see "Next actions". The Nyx build used here is
-`Nyx_MPI=NO`, so this refusal cannot currently be provoked.
+Nyx is run under MPI, so the hand-over has to work there. It does, on one
+node, at 1, 2 and 4 ranks. **Every rank hosts its own Clio runtime, in its own
+process, with its own store directory and its own TCP port.** That is not a
+preference; it is the only shape that works today, and the reason is worth
+stating before the design, because the obvious alternative was tried first and
+does not work.
+
+### The obvious topology -- one runtime per node, ranks as clients -- is broken
+
+Not by CUDA IPC. Before CUDA IPC: **the compressor chimod has no cross-process
+wire format at all.** Measured, three ways:
+
+```
+$ # Nyx, ONE rank, CLIO_WITH_RUNTIME=0, against a standalone `clio_run start`
+[np-path] WRITE  compressor DynamicSchedule blob='' bytes=0 ptr=ok device=0   (x12)
+compressor_runtime.cc:1010 WARNING DynamicSchedule Invalid chunk data
+[clio-nyx-insitu] FAILED: 0 of 12 blobs round-tripped
+```
+
+Every payload field arrives empty. It is not about device pointers:
+`neuropress_field_replay` on plain **host** memory, same runtime, same
+separate-process arrangement, fails identically -- `blob='' bytes=0`, 0 of 3.
+And it is not the transport: a 40-line client doing a CTE **core**
+`PutBlob` + `GetBlob` of a 256 KiB host buffer against the same standalone
+runtime returns `rc=0` both ways with the bytes matching.
+
+The difference between the two chimods is one of naming.
+`compressor_tasks.h` declares its serializers as
+`SerializeStart` / `SerializeEnd`; `SaveTaskArchive::operator<<`
+(`task_archives.h:218`) calls **`SerializeIn` / `SerializeOut`**, which is what
+`core_tasks.h` uses. Name lookup therefore finds the inherited
+`clio::run::Task::SerializeIn`, which carries pool, method, task id and flags
+and nothing else -- so `tag_id_`, `blob_name_`, `size_`, `context_` and the
+`ar.bulk(blob_data_, ...)` line are never reached. In process this is
+invisible: `IpcManager::Send` hands the task to the runtime **by pointer**
+(`IpcCpu2Self::SendIn`) and no archive ever runs. `replication_tasks.h:131`
+already documents this exact convention and names the compressor as the one
+that does not follow it.
+
+The proof that those methods are dead code, independent of any run: every one
+of them calls `task_serialize<Ar>(ar)`, a helper **defined nowhere in this
+repository** (`grep -rn task_serialize` finds only its six call sites and one
+README). Being templates, that is an error only on instantiation -- and they
+have never been instantiated.
+
+**So CUDA IPC is never reached, and this work could not test it.** The
+machinery is all present -- `AllocateAndRegisterGpuBackend` calls
+`cudaIpcGetMemHandle`, admin `RegisterMemory` calls `cudaIpcOpenMemHandle` and
+stores the result as `backend->device_ptr`, and `ToFullPtr` case 5 resolves
+through it -- and the registration round trip has a test
+(`cr_gpu_ipc_devmem_register_cuda`), but that test says in its own header that
+it "deliberately does not attempt byte-level readback across the process
+boundary". **No payload has ever crossed it.**
+
+`../neuropress_lammps_gpu_direct/README.md` records both of these being found
+and fixed once before: the serializer naming, and a second fix
+(`Context::blob_is_device_`) to stop `ShmMpscTransport::AppendRaw` host-copying
+a device pointer into the message. Neither is in the tree --
+`grep -rn blob_is_device_` finds only README prose -- and that example's own
+notes say its sources were never committed. Reconstructing them is a change to
+Clio's core, not to this adapter, so it is reported here rather than attempted:
+see "Next actions".
+
+### What the adapter does about it
+
+It refuses, loudly, rather than storing nothing and reporting success:
+
+```
+[clio-nyx-insitu] REFUSING: rank 0: the Clio runtime is NOT hosted in this
+  process (CLIO_WITH_RUNTIME is not 1). The compressor's tasks have no
+  cross-process wire format -- every DynamicSchedule would arrive at the
+  runtime with blob_name="" and size=0 and store nothing, while this process
+  reported success. ...
+$ echo $?
+6
+```
+
+### The topology that does work: one runtime per rank
+
+```
+ rank 0                        rank 1                        rank 2 ...
+ ┌───────────────────────┐     ┌───────────────────────┐
+ │ Nyx (its boxes)       │     │ Nyx (its boxes)       │
+ │   updateInSitu()      │     │   updateInSitu()      │
+ │     ↓ device ptr      │     │     ↓ device ptr      │
+ │ libclio_nyx_insitu.so │     │ libclio_nyx_insitu.so │
+ │     ↓ same PID        │     │     ↓ same PID        │
+ │ Clio runtime  :port0  │     │ Clio runtime  :port1  │
+ │   → store/rank0000    │     │   → store/rank0001    │
+ └───────────────────────┘     └───────────────────────┘
+   no Clio traffic between ranks; MPI is Nyx's, not Clio's
+```
+
+Every rank takes the path that was already verified single-rank -- same
+process, `ToFullPtr` case 4, the raw device pointer dereferenced directly, no
+IPC handle. Nothing about the hand-over changes; what changes is that there
+are N of them. The store is N stores; `read.sh` reads them one at a time.
+
+Consequences, all of them real costs:
+
+* **N runtimes on one node.** N TCP ports, N bdev files, N tiers, N metadata
+  logs, N sets of worker threads. `run.sh` picks N free ports and builds
+  `$STORE/rank%04d/` per rank.
+* **N × the GPU memory**, which is what bit at 4 ranks -- see "The GPU memory
+  finding" below.
+* **A reader must open N stores.** This is the same shape AMReX's own
+  plotfiles have (one `Cell_D_%05d` per writer), so it is not foreign to the
+  application, but it is not one tier either.
+* It does not extend off the node in any interesting way. Multi-node was
+  explicitly out of scope for this work and nothing here was tested beyond one
+  node.
+
+### Blob naming: why no rank qualifier is needed
+
+`MFIter::index()` is the **global** BoxArray index, not a rank-local one
+(`AMReX_MFIter.H:175`: `(*index_map)[currentIndex]`, where `index_map` is
+`FabArrayBase::indexArray`), and `DistributionMapping` gives each global box to
+exactly one rank. So `<field>/step_N/fab<index>` is already unique across
+ranks. Measured at 2 ranks over an 8-box domain: rank 0 published
+`fab0000..fab0003`, rank 1 `fab0004..fab0007`; 96 names, 96 distinct.
+
+The assumption is checked rather than trusted -- the frame loop aborts if
+`mf.DistributionMap()[mfi.index()] != MyProc()` for any box it is about to
+publish, because if `index()` ever became rank-local, two ranks would publish
+different bytes under one name and every round-trip check would still pass.
+
+The payoff is that **a blob has the same name and the same bytes at any rank
+count**. Measured: 64³ decomposed into 8 boxes, at 1, 2 and 4 ranks, 96 blob
+names each, 0 missing, 0 extra, **0 digest or size differences**; and the same
+name/size/digest fingerprint `7a59489af1c2115f` over 36 runs spread across the
+three rank counts.
+
+**With one caveat, which is AMReX's, not this adapter's.** If
+`max_grid_size` does not already produce at least as many boxes as there are
+ranks, AMReX chops the base grids so every rank gets one
+(`AmrMesh::MakeBaseGrids` calls `ChopGrids(0, ba, NProcs())`,
+`AMReX_AmrMesh.cpp:540`). At 64³ with `max_grid_size=64`, 1 rank sees one
+64³ box and 2 ranks see two 32×64×64 boxes -- different boxes, so different
+blobs. That is legitimate and still correct (the 2-rank case matched the
+native plotfile 24 of 24), but the cross-rank-count identity above only holds
+when the decomposition is already fine enough. `run.sh` halves
+`max_grid_size` under MPI until there are at least as many boxes as ranks, and
+prints what it chose.
 
 ## How the two halves are joined
 
@@ -177,9 +319,13 @@ so the patch is unavoidable -- but it can be made to cost Nyx nothing:
 * Cadence, chunk size, tag, report path and verification are environment
   variables, so the patch has no options of its own to keep in sync.
 
-The patch touches `Source/IO/Nyx_output.cpp` and nothing else: +339 lines, -0,
+The patch touches `Source/IO/Nyx_output.cpp` and nothing else: +419 lines, -0,
 all in one block, plus one call in `Nyx::updateInSitu()` and one in
-`Nyx::writePlotFile()`. No physics, no timestepping, no numerics.
+`Nyx::writePlotFile()`. No physics, no timestepping, no numerics. The MPI work
+added ~60 lines to that same block and moved nothing: the rank comes from
+`ParallelDescriptor`, the store-collision check is one `MPI_Allgather` inside
+`#ifdef AMREX_USE_MPI`, and the per-box ownership assertion is one array
+lookup.
 
 ## Building
 
@@ -197,6 +343,23 @@ cmake -S . -B build-clio -DCMAKE_BUILD_TYPE=Release \
       -DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE
 cmake --build build-clio --target nyx_HydroTests -j
 ```
+
+And, for MPI, a **second** build tree -- `build-clio` is what every
+single-rank number below was measured on and is left alone:
+
+```bash
+cmake -S . -B build-clio-mpi -DCMAKE_BUILD_TYPE=Release \
+      -DNyx_MPI=YES -DNyx_OMP=NO -DNyx_HYDRO=YES -DNyx_HEATCOOL=NO \
+      -DNyx_GPU_BACKEND=CUDA -DAMReX_CUDA_ARCH=Ampere \
+      -DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE
+cmake --build build-clio-mpi --target nyx_HydroTests -j
+```
+
+`--mpi` and `--ranks N` pick `build-clio-mpi` automatically. Nothing else in
+the patch or the adapter is conditional on MPI: the same
+`libclio_nyx_insitu.so` serves both builds, and the patch compiles unchanged
+with `Nyx_MPI=NO` (the collective store-collision check is inside
+`#ifdef AMREX_USE_MPI`).
 
 Clio:
 
@@ -218,6 +381,11 @@ raw-dump patch's own lines) -- see "Next actions".
 ./run.sh --static nvcomp-zstd --static-shuffle 4     # pin the codec, then:
 ./read.sh                                            #   cold read, separate process
 ./crosscheck_plotfile.sh                             # bytes == AMReX's own plotfile?
+
+./run.sh --mpi --ncell 64 --steps 20 --verify        # mpirun -n 1, MPI build
+./run.sh --ranks 4 --ncell 128 --steps 200 --verify  # 4 ranks, 4 Clio runtimes
+./read.sh                                            #   reads all four stores
+./crosscheck_plotfile.sh --ncell 64 --max-grid 32 --ranks 4
 ```
 
 `run.sh` writes `$STORE/compose.yaml` -- the same three pools as every sibling
@@ -234,6 +402,9 @@ pointing at it and `CLIO_WITH_RUNTIME=1`.
 | `--ghosts` | store the grown FAB rather than the valid box |
 | `--verify` | read every blob back through the decompressor at the end of the run |
 | `--bin PATH` | a different Nyx binary (e.g. the float64 build) |
+| `--mpi` | run the MPI build under `mpirun`, one rank |
+| `--ranks N` | N ranks, N Clio runtimes, `$STORE/rank%04d` each. Implies `--mpi` |
+| `--max-grid N` | `amr.max_grid_size`. Default: the whole domain in one box, halved under MPI until there are at least as many boxes as ranks |
 
 Environment the adapter reads directly: `CLIO_NYX_TAG`, `CLIO_NYX_CHUNK`,
 `CLIO_NYX_POOL`, `CLIO_NYX_REPORT`, `CLIO_NYX_RAW_DIR`, `CLIO_NYX_VERIFY`.
@@ -297,9 +468,156 @@ blobs of 2 MiB (= 6 × 64³ × 8 B per frame), all `device=1`, 24/24 bit-exact.
 The width comes from `sizeof(amrex::Real)` at the call site, so nothing has to
 be told which build it is.
 
+## Under MPI: what was measured
+
+Two questions, in order. The first is whether the MPI **build** changes
+anything about the GPU path -- it initialises CUDA through a different
+AMReX code path and divides the device arena between ranks. The second is
+what happens with more than one rank.
+
+### 1. Does `Nyx_MPI=YES` change the bytes? No.
+
+The MPI build at `mpirun -n 1` and the non-MPI build produce the **same blob
+names, sizes and digests**, byte for byte. The "fingerprint" column below is
+the first 16 hex digits of an `md5` over the sorted `blob,bytes,fnv1a64`
+columns of every CSV a run produced -- one value per run, and it did not vary
+within a row:
+
+| configuration | build | runs | blobs | `device=1` | bit-exact | fingerprint |
+|---|---|---|---|---|---|---|
+| 64³, 20 steps, `insitu.int=10`, 1 box (12 blobs/run) | `Nyx_MPI=NO` | 8 | 96 | 96/96 | 96/96 | `3c23161b7d5a3272` |
+| 64³, same | `mpirun -n 1` | 8 | 96 | 96/96 | 96/96 | **same** |
+| 128³, 200 steps, 1 box (240 blobs/run) | `Nyx_MPI=NO` | 2 | 480 | 480/480 | 480/480 | `4c60cd41ba071d20` |
+| 128³, same | `mpirun -n 1` | 3 | 720 | 720/720 | 720/720 | **same** |
+
+And the independent check, which does not go through Clio on the reference
+side, agrees on both builds:
+
+| plotfile cross-check | `Nyx_MPI=NO` | `mpirun -n 1` |
+|---|---|---|
+| 32³, 1 box | 12 of 12 identical | 12 of 12, **same digests** |
+| 64³, `max_grid_size=32`, 8 boxes | 96 of 96 | 96 of 96, **same digests** |
+
+Plus a cold read from a separate process at `-n 1` with
+`--static nvcomp-zstd --static-shuffle 4`: 12 of 12 bit-exact, 12 codec
+inversions.
+
+### 2. Two and four ranks
+
+64³ cut into 8 boxes (`max_grid_size=32`), 96 blobs per run, every rank
+hosting its own runtime:
+
+| ranks | runs | blobs | `device=1` | bit-exact | fingerprint |
+|---|---|---|---|---|---|
+| 1 | 7 | 672 | 672/672 | 672/672 | `7a59489af1c2115f` |
+| 2 | 20 | 1,920 | 1,920/1,920 | 1,920/1,920 | **same** |
+| 4 | 9 | 864 | 864/864 | 864/864 | **same** |
+
+One fingerprint across all 36 runs: the domain is cut the same way, the boxes
+are handed to different ranks, and the blobs are identical.
+
+128³, 200 steps, `max_grid_size=64` (8 boxes), 960 blobs per run:
+
+| ranks | runs | blobs | `device=1` | bit-exact | codec failures |
+|---|---|---|---|---|---|
+| 2 | 6 | 5,760 | 5,760/5,760 | 5,760/5,760 | 0 |
+| 4 (arena capped) | 10 | 9,600 | 9,600/9,600 | 9,600/9,600 | 0 |
+| 4 (AMReX default arena) | 2 | 1,920 | 1,920/1,920 | **1,899/1,920** | **77** |
+
+2 and 4 ranks share the fingerprint `294423b69cac2a2a` at this size. That last
+row is the finding below.
+
+Cold reads and the plotfile cross-check, multi-rank:
+
+| check | 2 ranks | 4 ranks |
+|---|---|---|
+| cold `./read.sh` (one process per store, `CLIO_RESTART=1`) | 2 stores, 48+48 = 96 of 96, 96 codec inversions | 4 stores, 24×4 = 96 of 96, 96 inversions |
+| `./crosscheck_plotfile.sh` vs AMReX's own multi-file plotfile | 96 of 96, 0 duplicate names | 96 of 96, 0 duplicate names |
+
+**The ratio moves, for a reason that is not MPI.** The headline 23.3× is one
+128³ box; under MPI the domain is cut into 8 boxes of 64³, and the
+documented `./run.sh --ranks 4 --ncell 128 --steps 200 --verify` gives
+20.3–22.5× per rank (960 blobs, 960/960 bit-exact in process, 960/960 on a
+cold read of the four stores with a codec inverted on every one). Smaller
+chunks of the same field compress slightly less well; the decomposition, not
+the rank count, is what changed.
+
+The plotfile check is worth a word under MPI: the native plotfile is now
+written by several ranks into several `Cell_D_%05d` files, and `Cell_H` maps
+each **global** FAB index to (file, offset). The check follows that mapping,
+so "blob `fab0003` == the plotfile's FAB 3" is a statement about AMReX's own
+global ordering, and it is what confirms the naming lines up across ranks.
+
+### The GPU memory finding
+
+At 4 ranks and 128³, with AMReX's default arena, the run degrades and the
+symptom is not obvious:
+
+```
+Total GPU global memory (MB) spread across MPI: [40444 ... 40444]
+Free  GPU global memory (MB) spread across MPI: [162 ... 15314]
+[The Arena] max space (MB) allocated spread across MPI: [7583 ... 7583]
+[The Arena] max space (MB) used      spread across MPI: [474 ... 474]
+
+compressor_runtime.cc:3022 WARNING Compress Compression FAILED for blob
+  'rho_E/step_00119/fab0003/chunk_0' (1048576 bytes, lib 13 (nvcomp-zstd));
+  the ORIGINAL bytes were stored instead ...
+compressor_runtime.cc:3528 ERROR Decompress Decompression failed
+[clio-nyx-insitu] FAILED: 223 of 240 blobs round-tripped bit-exact
+```
+
+AMReX reserves 3/4 of the device up front, divided among the ranks sharing it,
+and it reserves that **whether it needs it or not** -- 7,583 MB per rank
+reserved against 474 MB actually used, leaving 162 MB free on a 40 GB A100 for
+four Clio runtimes and nvcomp's scratch. nvcomp's zstd then fails, those blobs
+are stored raw (which Clio does by design and says so), and some of them then
+fail to *decompress* on read-back, which is a second thing worth chasing: a
+blob stored raw after a codec failure should read back trivially.
+
+Both 4-rank runs at the default were affected (77 codec failures, 21 read-back
+mismatches). 1 rank and 2 ranks at the same size showed **0** codec failures in
+3 runs each, so it is rank-count pressure and not a size effect.
+
+`run.sh` now passes `amrex.the_arena_init_size` whenever `--ranks > 1` and the
+caller has not set it, sized at `max(2 GiB, 16 × frame)` per rank. With that,
+10 runs at 4 ranks × 128³ are clean.
+
+**One thing was seen once and is not explained**: a 4-rank 128³ run with a
+768 MB arena died with SIGSEGV (exit 11) after staging roughly 144 blobs per
+rank. It did not reproduce in 4 further runs at that arena size, and has not
+appeared in 10 runs at 2 GiB. Recorded rather than dismissed.
+
+### Failure modes, all provoked
+
+The multi-rank refusals could not be reached before; they can now.
+
+| condition | result | runs |
+|---|---|---|
+| two ranks given the same `CLIO_SERVER_CONF` | `amrex::Abort`, names both ranks and the shared path | **4 of 4** |
+| two ranks as clients of a separate `clio_run start` | `REFUSING: ... the Clio runtime is NOT hosted in this process`, exit 6 | 1 |
+| `CLIO_WITH_RUNTIME=0` with no runtime running at all | `amrex::Abort`, `clio_nyx_insitu_begin() failed` | 1 |
+| `libclio_nyx_insitu.so` without `clio_nyx_insitu_begin_mpi` (symbol renamed in a copy of the .so) | `amrex::Abort` on every rank, naming the missing symbol | 1 |
+| one rank's port held by another process | that rank exits 1 with `Failed to start main server ... Address already in use`; `mpirun` then kills the job. No CSV is written, so nothing claims a complete store | 2 |
+
+The first is deterministic on purpose. An earlier version detected it with an
+`O_EXCL` lock file in the store directory, which is racy -- two ranks starting
+together can both check before either creates -- and in four attempts the
+port-bind failure won three times. The check that ships is a collective: every
+rank hashes its own `CLIO_SERVER_CONF` and `MPI_Allgather` makes the answer the
+same on every rank in every interleaving. The lock file is kept as well,
+because it catches a case the collective cannot: a rank re-using a directory
+another rank used in a previous run.
+
 ## Verification
 
-Four independent things, with sample sizes.
+Four independent things, with sample sizes. The counts below are the
+**pre-MPI** measurements, which still stand; "Under MPI: what was measured"
+adds the MPI ones and repeats all four checks there. Totalled over this
+session's MPI work (92 runs across 1, 2 and 4 ranks and both builds):
+**28,848 `device=1` traces and 0 `device=0`; 28,272 blobs recorded in CSVs and
+28,251 of them verified bit-exact. All 21 mismatches are in the two 4-rank
+128³ runs that ran the GPU out of memory** (the 576 traces above the CSV count
+are the crashed run, which staged blobs and then died before writing a CSV).
 
 **1. Device residency, per blob.** The `[np-path]` trace prints
 `device=<0|1>` for every `DynamicSchedule` from the compressor's own side,
@@ -405,7 +723,11 @@ not being what was asked for.
 |---|---|---|---|
 | `NYX_CLIO_INSITU=1` and `dlopen` or `dlsym` fails | 1 (Abort) | the run asked for its output to go to Clio; a run that quietly did not is a run whose output does not exist | **yes** |
 | `NYX_CLIO_INSITU=1` on a non-GPU build | Abort | there is no device pointer to hand over; staging host bytes and calling it GPU-direct is the exact claim this example exists to make honestly | no (needs a CPU build) |
-| `NProcs() > 1` | Abort | blob names carry only the box index; ranks would collide and publish a fraction of the domain as the whole | no (`Nyx_MPI=NO`) |
+| two ranks given the same `CLIO_SERVER_CONF` | Abort | one runtime would serve two ranks' bdev, tier and port; the loser stores nothing, usually silently | **yes** (4 of 4) |
+| `NProcs() > 1` with an adapter that has no `clio_nyx_insitu_begin_mpi` | Abort | it would give every rank one report file and could not check that each rank has a store of its own | **yes** |
+| the Clio runtime is not in this process | 6 | the compressor has no cross-process wire format: every blob would arrive empty and store nothing while the run reported success (Q5) | **yes** |
+| `mfi.index()` is not mapped to this rank | Abort | the blob name is the global box id; if it were rank-local, two ranks would publish different bytes under one name | no |
+| the CUDA device changes between blobs of a run | 5 | the staging backends are registered on one device; a backend on the wrong device is a cross-device copy the log would not show | no (one GPU here) |
 | `finestLevel() > 0` | Abort | the hook stores level 0; finer levels would be silently dropped and a coarse image published as the state | **yes** (`amr.max_level=1`) |
 | component stride != `box().numPts()` | Abort | the geometry handed to the extraction would be wrong in a way that compresses, stores and decompresses perfectly | no |
 | `cudaPointerGetAttributes` says the pointer is not `cudaMemoryTypeDevice` | 5 | the compressor would report GPU residency for memory that is not GPU-resident | **yes** (`amrex.the_arena_is_managed=1`) |
@@ -416,7 +738,7 @@ not being what was asked for.
 | element width changes mid-run | 3 | half the blobs would carry the wrong `data_type_` | no |
 | the region does not fit inside the FAB | 3 | an out-of-bounds strided read | no |
 
-Three of the eleven have actually been fired. The managed-memory one is worth
+Six of the fifteen have actually been fired. The managed-memory one is worth
 singling out: `amrex.the_arena_is_managed=1` is a supported AMReX runtime
 option, so this is not a hypothetical, and it produced exactly the intended
 outcome:
@@ -437,25 +759,51 @@ rest of Nyx does.
 
 ## What is NOT verified
 
-- **Eight of the eleven refusals have never fired.** dlopen failure, AMR
-  levels and managed memory were provoked and confirmed. Multi-rank, a CPU
-  build, a null backend allocation, a non-device registered buffer, a changed
-  component stride, a changed chunk layout, a changed element width and an
-  out-of-range region are written and reviewed, not tested. Several need
-  fault injection or a second build to reach.
-- **The cross-process runtime is untested.** Every run here uses
-  `CLIO_WITH_RUNTIME=1`, so client and runtime share a PID and
-  `IpcManager::ToFullPtr` takes its same-process shortcut: it dereferences the
-  raw device pointer directly and the CUDA IPC machinery
-  (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`) is never exercised. A
-  separate-runtime deployment is unproven. This is the same gap the LAMMPS
-  device example reports, and it is the one thing here that could invalidate
-  the design rather than just leave it under-tested.
-- **Multi-box is verified but only at one decomposition.** `64³` with
-  `max_grid_size=32` gives 8 FArrayBoxes; that was run (96 blobs, 96/96
-  bit-exact, 96/96 `device=1`, 96/96 identical to the plotfile). A
-  non-cubic or uneven decomposition, and more boxes than the slot pool sees in
-  its first frame, have not been tried.
+- **Nine of the fifteen refusals have never fired.** dlopen failure, AMR
+  levels, managed memory, a shared store, a missing MPI entry point and an
+  out-of-process runtime were provoked and confirmed. A CPU build, a null
+  backend allocation, a non-device registered buffer, a changed component
+  stride, a changed chunk layout, a changed element width, an out-of-range
+  region, a box not mapped to this rank, and a run whose CUDA device changes
+  are written and reviewed, not tested. Several need fault injection, a second
+  build, or a second GPU to reach.
+- **CUDA IPC is still completely untested, and this work could not test it.**
+  Every run here -- single-rank and multi-rank alike -- has the runtime inside
+  the client process, so `IpcManager::ToFullPtr` takes its same-process
+  shortcut (case 4) and `cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle` are
+  never exercised on a payload. Q5 explains why: the compressor chimod has no
+  cross-process wire format at all, so the attempt fails a layer *above* CUDA
+  IPC and never reaches it. This is unchanged from the previous version of this
+  README except that it is now measured rather than assumed, and the reason is
+  known.
+- **Multi-GPU is not just untested, it was mis-specified until now.** The
+  adapter used to register its staging backends with `gpu_id=0` unconditionally
+  while the data could be on any device. It now takes the device from
+  `cudaPointerGetAttributes` on the pointer Nyx handed over and refuses if it
+  changes mid-run. On this single-GPU machine that is a no-op (always 0), so
+  the fix is reviewed, not tested. AMReX gives rank *r* device *r % ngpu*, so
+  a multi-GPU node is exactly where it would have bitten -- **this is the
+  largest remaining gap in the GPU path and it needs a second GPU.**
+- **Decompression after a codec failure.** When nvcomp failed under memory
+  pressure the blob was correctly stored raw, and then some of those blobs
+  failed to *decompress* on read-back. That looks like a Clio bug rather than
+  an adapter one, but it was only ever seen while the GPU was nearly full, and
+  it was not isolated.
+- **Multi-node is out of scope and was not attempted at all.** Everything here
+  is one node. Nothing is known about how the per-rank-runtime shape behaves
+  across nodes, and no hostfile, no cross-node port plan and no multi-node run
+  exists.
+- **Multi-box is verified at two decompositions.** 64³ with
+  `max_grid_size=32` (8 boxes) and 128³ with `max_grid_size=64` (8 boxes),
+  plus AMReX's own rank-driven chop (64³/`max_grid_size=64` at 2 ranks giving
+  two 32×64×64 boxes, 24 of 24 against the plotfile). A **non-cubic** domain,
+  an uneven decomposition, and more boxes than the slot pool sees in its first
+  frame have still not been tried.
+- **Chunk tails are now covered.** `--chunk 50000` on a 131,072-byte component
+  gives 50000 + 50000 + 31072, i.e. a short final chunk: 3 runs at 1 rank and
+  3 at 2 ranks, 864 blobs each, all `device=1`, all bit-exact, identical
+  fingerprints. What is still untested is a chunk larger than a component and
+  a chunk size that changes between frames.
 - **AMR is refused, not supported.** Everything measured is `max_level=0`.
 - **Particles are not touched.** Nyx is a cosmology code; this stores the
   hydro `State_Type` MultiFab only. Dark-matter particles, `DiagEOS_Type`,
@@ -491,19 +839,40 @@ In the order worth doing them:
    so addressing several chunks as offsets into one backend would silently
    return chunk 0 every time -- which is why this adapter gives every chunk its
    own backend.
-3. **Qualify blob names by rank and lift the MPI refusal.** `rank%04d` (or the
-   global box id, which is already unique across ranks) in the name is most of
-   the work; the rest is deciding whether a reader wants per-box blobs or a
-   reassembled field.
-4. **Make the patch apply to a vanilla Nyx.** It currently anchors on the
+3. **Give the compressor chimod a cross-process wire format.** This is the
+   one item that changes what is possible rather than what is measured.
+   `compressor_tasks.h`'s six tasks declare `SerializeStart`/`SerializeEnd`,
+   which no archive calls; renaming them to `SerializeIn`/`SerializeOut` (as
+   `core_tasks.h` and `replication_tasks.h` already do) is the whole fix for
+   host payloads. Device payloads need the second half as well: with the
+   serializers live, `ar.bulk(blob_data_, ...)` reaches
+   `ShmMpscTransport::AppendRaw`, a plain host `memcpy` from what would be a
+   device address. `../neuropress_lammps_gpu_direct/README.md` records both
+   fixes being made and verified once (the second as
+   `Context::blob_is_device_`, skipping the bulk so the receiver resolves the
+   CUDA IPC handle it already has); neither is in the tree. Until this lands,
+   one runtime per node is not available and CUDA IPC cannot be tested at all.
+4. **Run the device path on a multi-GPU node.** The adapter now takes its
+   `gpu_id` from the pointer rather than assuming 0, which is the correct
+   behaviour but is untested here: a single-GPU box cannot tell the two apart.
+   AMReX gives rank *r* device *r % ngpu*, so two GPUs and two ranks is enough.
+5. **Work out why a raw-stored blob failed to decompress.** Under GPU memory
+   pressure nvcomp failed, the original bytes were stored (correct), and the
+   read-back of some of those blobs then failed. Reproduce it deliberately by
+   starving the device rather than by running four ranks.
+6. **Reduce what MPI costs.** N ranks means N runtimes, N ports, N tiers and N
+   metadata logs on one node, and the arena cap `run.sh` now applies is a
+   workaround for the memory that costs. One runtime per node (item 3) is the
+   real answer.
+7. **Make the patch apply to a vanilla Nyx.** It currently anchors on the
    raw-dump patch's lines. Splitting the plotfile hook into its own optional
    hunk would let the in-situ patch stand alone, at the cost of the
    cross-check needing both.
-5. **Provoke the remaining refusals.** Fault injection: force
+8. **Provoke the remaining refusals.** Fault injection: force
    `AllocateAndRegisterGpuBackend` to return null, hand `stage` a host
    pointer, change `max_grid_size` between frames. A refusal that has never
    fired is a claim, not a guarantee.
-6. **Run a realistic cosmology configuration** before any of these ratios are
+9. **Run a realistic cosmology configuration** before any of these ratios are
    quoted as what Nyx compresses to.
 
 ## Notes
@@ -540,7 +909,24 @@ In the order worth doing them:
   `warning`. The same typo is still present in seven
   `paper-benchmark/*/{run_config,read}.sh` files.
 - **Every Clio runtime binds a TCP port** and one process per port is the
-  limit. `run.sh` picks a free one unless `--port` or `PORT=` is given; a
+  limit. `run.sh` picks a free one unless `--port` or `PORT=` is given -- and
+  under `--ranks N` it picks N of them, or N consecutive ones from `--port`. A
   collision kills the client before it writes anything and produces an empty
-  log rather than an error.
+  log rather than an error, which is why the store-collision check is a
+  collective and not a lock file (Q5).
+- **`CLIO_WITH_RUNTIME=1` is load-bearing under MPI too**, and now enforced.
+  The adapter checks `CLIO_RUNTIME_MANAGER->IsRuntime()` after client init and
+  refuses with exit 6 otherwise, single-rank as well as multi-rank -- the
+  cross-process failure is silent (`blob='' size=0`, rc=1 per blob, a summary
+  saying `failed: N`) and the previous behaviour was to run to completion
+  having stored nothing.
+- **The CSV gained a trailing `rank` column** and nothing else moved.
+  `neuropress_field_replay --readback` parses `blob,bytes,fnv1a64` positionally
+  and ignores the rest, which is why the column is appended rather than
+  inserted. Under MPI each rank writes `blobs.rank%04d.csv` in its own store.
+- **AMReX's device arena is reserved, not used.** Under `--ranks N`,
+  `run.sh` passes `amrex.the_arena_init_size` (default `max(2 GiB, 16 ×
+  frame)`) because the AMReX default leaves nothing for N Clio runtimes -- see
+  "The GPU memory finding". Single-rank runs are not given this flag, so they
+  remain exactly the configuration the older numbers were measured on.
 - `store/` is generated output.

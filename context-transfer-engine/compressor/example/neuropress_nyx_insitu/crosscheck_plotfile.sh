@@ -3,6 +3,7 @@
 #
 #   ./crosscheck_plotfile.sh [--ncell 32] [--steps 10] [--int 10]
 #                            [--max-grid N]      # N < ncell => several boxes
+#                            [--mpi] [--ranks N] # under mpirun; N runtimes
 #
 # Runs Nyx once with --hook plotfile, so the in-situ hand-over fires from
 # Nyx::writePlotFile, on the same MultiFab, at the same instant as the native
@@ -23,26 +24,28 @@
 # README's "What the raw dump actually dumps".
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-NCELL=32 STEPS=10 INT=10 MAXGRID=
+NCELL=32 STEPS=10 INT=10 MAXGRID= MPIARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --ncell) NCELL=$2; shift 2;;
     --steps) STEPS=$2; shift 2;;
     --int) INT=$2; shift 2;;
     --max-grid) MAXGRID=$2; shift 2;;
+    --mpi) MPIARGS+=(--mpi); shift;;
+    --ranks) MPIARGS+=(--ranks "$2"); shift 2;;
     -h|--help) sed -n '2,23p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 EXTRA=()
-[ -n "$MAXGRID" ] && EXTRA+=("amr.max_grid_size=$MAXGRID")
+[ -n "$MAXGRID" ] && EXTRA+=(--max-grid "$MAXGRID")
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 echo "== Nyx, --hook plotfile: Clio in situ AND a native plotfile from the same state"
 STORE=$TMP/store WORK=$TMP/work NYX_DUMP_DIR=$TMP/dump \
   "$HERE/run.sh" --hook plotfile --ncell "$NCELL" --steps "$STEPS" --int "$INT" \
-  --chunk 0 --store "$TMP/store" ${EXTRA+"${EXTRA[@]}"} | tail -2
+  --chunk 0 --store "$TMP/store" ${MPIARGS+"${MPIARGS[@]}"} ${EXTRA+"${EXTRA[@]}"} | tail -3
 
 python3 - "$TMP" "$INT" <<'XPY'
 import sys, os, re
@@ -81,10 +84,23 @@ def read_multifab(level_dir):
     return out
 
 names = ["density", "xmom", "ymom", "zmom", "rho_E", "rho_e"]
+# Under MPI every rank writes its own CSV, in its own store. The blob NAMES
+# carry the global box index, so the union across ranks is exactly the set a
+# single-rank run would have written -- and a duplicate name would mean two
+# ranks published the same box, which is the thing the naming has to rule out.
 csv = {}
-for line in open(os.path.join(TMP, "store/blobs.csv")).read().splitlines()[1:]:
-    p = line.split(',')
-    csv[p[0]] = (int(p[1]), int(p[2], 16))
+dups = []
+import glob
+paths = sorted(glob.glob(os.path.join(TMP, "store", "blobs*.csv")) +
+               glob.glob(os.path.join(TMP, "store", "rank*", "blobs*.csv")))
+for path in paths:
+    for line in open(path).read().splitlines()[1:]:
+        p = line.split(',')
+        if p[0] in csv:
+            dups.append(p[0])
+        csv[p[0]] = (int(p[1]), int(p[2], 16))
+print("-- %d CSV(s), %d blob name(s), %d duplicate name(s) across ranks"
+      % (len(paths), len(csv), len(dups)))
 
 plts = sorted(d for d in os.listdir(os.path.join(TMP, "work")) if d.startswith("plt"))
 same = differ = 0
@@ -115,8 +131,10 @@ for k, plt in enumerate(plts):
                 else: rb_differ += 1
 
 print("\n%d blob(s) byte-identical to the native plotfile, %d differ" % (same, differ))
+if dups:
+    print("DUPLICATE blob names across ranks: %s" % sorted(set(dups))[:5])
 if rb_same + rb_differ:
     print("%d identical to the raw .f32 dump, %d differ -- see README, "
           "'What the raw dump actually dumps'" % (rb_same, rb_differ))
-raise SystemExit(1 if differ else 0)
+raise SystemExit(1 if (differ or dups) else 0)
 XPY

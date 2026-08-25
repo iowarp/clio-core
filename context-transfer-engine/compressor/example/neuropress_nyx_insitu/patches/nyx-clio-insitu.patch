@@ -1,7 +1,7 @@
 diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 --- a/Source/IO/Nyx_output.cpp
 +++ b/Source/IO/Nyx_output.cpp
-@@ -133,6 +133,322 @@
+@@ -133,6 +133,402 @@
   * unconditionally would make a float64 build indistinguishable from a float32
   * one and quietly turn that control into a duplicate of the baseline.
   * ------------------------------------------------------------------------- */
@@ -59,6 +59,7 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +   include path to Clio at all; clio_nyx_insitu.h is the canonical copy. */
 +extern "C" {
 +typedef int (*clio_nyx_begin_fn)(void);
++typedef int (*clio_nyx_begin_mpi_fn)(long long, long long);
 +typedef int (*clio_nyx_frame_begin_fn)(long long, double);
 +typedef int (*clio_nyx_stage_fn)(const char*, const void*, long long,
 +                                 long long, long long, long long,
@@ -75,6 +76,7 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +    std::string hook = "insitu";
 +    void*  handle = nullptr;
 +    clio_nyx_begin_fn       begin       = nullptr;
++    clio_nyx_begin_mpi_fn   begin_mpi   = nullptr;
 +    clio_nyx_frame_begin_fn frame_begin = nullptr;
 +    clio_nyx_stage_fn       stage       = nullptr;
 +    clio_nyx_frame_end_fn   frame_end   = nullptr;
@@ -122,6 +124,10 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +                     "libclio_nyx_insitu.so)");
 +    }
 +    c.begin       = (clio_nyx_begin_fn)       dlsym(c.handle, "clio_nyx_insitu_begin");
++    /* Optional: only an adapter that has this symbol knows what a rank is.
++       Resolved with dlsym rather than assumed, so a Nyx built against this
++       patch still runs single-rank against an older libclio_nyx_insitu.so. */
++    c.begin_mpi   = (clio_nyx_begin_mpi_fn)   dlsym(c.handle, "clio_nyx_insitu_begin_mpi");
 +    c.frame_begin = (clio_nyx_frame_begin_fn) dlsym(c.handle, "clio_nyx_insitu_frame_begin");
 +    c.stage       = (clio_nyx_stage_fn)       dlsym(c.handle, "clio_nyx_insitu_stage");
 +    c.frame_end   = (clio_nyx_frame_end_fn)   dlsym(c.handle, "clio_nyx_insitu_frame_end");
@@ -130,7 +136,60 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +        amrex::Abort(std::string("libclio_nyx_insitu.so ('") + lib +
 +                     "') is missing one of the clio_nyx_insitu_* symbols");
 +    }
-+    if (c.begin() != 0) {
++    /* MPI. Every rank hosts its own Clio runtime, in its own process, with
++       its own store and its own TCP port -- see the README's "Q5: MPI" for
++       why the ranks cannot share one runtime process. The rank comes from
++       ParallelDescriptor, not from an environment variable, so it cannot
++       disagree with the job Nyx thinks it is in. */
++    const int nprocs = amrex::ParallelDescriptor::NProcs();
++    const int myproc = amrex::ParallelDescriptor::MyProc();
++    if (nprocs > 1 && c.begin_mpi == nullptr) {
++        amrex::Abort("NYX_CLIO_INSITU: this run has " + std::to_string(nprocs) +
++                     " ranks but libclio_nyx_insitu.so has no "
++                     "clio_nyx_insitu_begin_mpi symbol, so it does not know "
++                     "what a rank is: it would give every rank the same "
++                     "report file and could not check that each rank has a "
++                     "store of its own. Refusing rather than running an "
++                     "MPI job through a single-rank adapter.");
++    }
++#ifdef AMREX_USE_MPI
++    /* Two ranks pointed at ONE store is the classic launcher mistake, and its
++       natural symptom is silent: the loser of the TCP bind race dies with an
++       empty log, or -- worse, if the timing goes the other way -- one runtime
++       serves two ranks' bdev, tier and metadata log. Detect it here, where
++       MPI is, rather than leaving it to a race: every rank hashes its own
++       CLIO_SERVER_CONF, and an Allgather makes the answer the same on every
++       rank in every interleaving. (The adapter also takes a lock file, which
++       catches a stale or sequential collision this cannot see.) */
++    if (nprocs > 1) {
++        const char* conf = getenv("CLIO_SERVER_CONF");
++        unsigned long long h = 14695981039346656037ULL;
++        for (const char* q = conf ? conf : ""; *q; ++q) {
++            h ^= (unsigned char)(*q); h *= 1099511628211ULL;
++        }
++        std::vector<unsigned long long> all((size_t)nprocs, 0ULL);
++        MPI_Allgather(&h, 1, MPI_UNSIGNED_LONG_LONG, all.data(), 1,
++                      MPI_UNSIGNED_LONG_LONG,
++                      amrex::ParallelDescriptor::Communicator());
++        for (int r = 0; r < nprocs; ++r) {
++            if (r != myproc && all[(size_t)r] == h) {
++                amrex::Abort(std::string("NYX_CLIO_INSITU: rank ") +
++                    std::to_string(myproc) + " and rank " + std::to_string(r) +
++                    " were given the same CLIO_SERVER_CONF ('" +
++                    (conf ? conf : "<unset>") + "'). Every rank hosts its own "
++                    "Clio runtime, and a runtime binds a TCP port and owns its "
++                    "bdev, tier and metadata log -- two ranks sharing them "
++                    "means one of the two stores nothing, usually without "
++                    "saying so. Give each rank its own store directory and "
++                    "port.");
++            }
++        }
++    }
++#endif
++    const int brc = (c.begin_mpi != nullptr)
++                        ? c.begin_mpi((long long)myproc, (long long)nprocs)
++                        : c.begin();
++    if (brc != 0) {
 +        amrex::Abort("clio_nyx_insitu_begin() failed -- is CLIO_SERVER_CONF "
 +                     "set and CLIO_WITH_RUNTIME=1?");
 +    }
@@ -249,13 +308,20 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +
 +    /* --- Refusals. Each of these could have been continued past by storing
 +       something that is not what the run claims to have stored. --- */
-+    if (amrex::ParallelDescriptor::NProcs() > 1) {
-+        amrex::Abort("NYX_CLIO_INSITU: multi-rank runs are refused. Each rank "
-+                     "owns a subset of the boxes and would publish its slice "
-+                     "under an unqualified blob name, so a reader would see a "
-+                     "fraction of the domain presented as the whole of it. "
-+                     "Run single-rank, or extend the naming first.");
-+    }
++    /* Multi-rank is supported, and the thing that makes it safe is that
++       MFIter::index() is the GLOBAL BoxArray index, not a rank-local one
++       (AMReX_MFIter.H:175, index_map is FabArrayBase::indexArray). The
++       DistributionMapping gives each global box to exactly one rank, so
++       "<field>/step_N/fab<index>" is unique across ranks WITHOUT a rank
++       qualifier -- and, better, a blob has the same name and the same bytes
++       at any rank count, which is what makes a 1-rank store and a 4-rank
++       store directly comparable.
++
++       That is the assumption, so it is checked rather than trusted: the
++       loop below refuses if any box it is about to publish is not mapped to
++       this rank. If index() ever became rank-local, two ranks would publish
++       different data under one name and every round-trip check would still
++       pass. */
 +    if (parent_amr != nullptr && parent_amr->finestLevel() > 0) {
 +        amrex::Abort("NYX_CLIO_INSITU: this hook stores level 0 only, but the "
 +                     "run has finer levels whose data would be silently "
@@ -296,6 +362,20 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
 +            nx = vbox.length(0); ny = vbox.length(1); nz = vbox.length(2);
 +        }
 +
++        /* The blob name carries mfi.index() and nothing else, so that index
++           MUST be the global box id this rank alone owns. Checked per box:
++           the cost is one array lookup and the failure it catches is two
++           ranks publishing different bytes under one name. */
++        if (mf.DistributionMap()[mfi.index()] !=
++            amrex::ParallelDescriptor::MyProc()) {
++            amrex::Abort("NYX_CLIO_INSITU: MFIter::index() " +
++                         std::to_string(mfi.index()) +
++                         " is not mapped to this rank, so it is not the "
++                         "global box id the blob name assumes. Under MPI two "
++                         "ranks would publish different data under the same "
++                         "name.");
++        }
++
 +        /* Components are consecutive copies of the GROWN box. If that ever
 +           stops being true the geometry passed below is wrong in a way that
 +           compresses, stores and decompresses perfectly. */
@@ -324,7 +404,7 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
  static void
  nyx_dump_raw_fields (amrex::Amr* parent_amr, const amrex::MultiFab& mf,
                       const amrex::Vector<std::string>& names)
-@@ -215,6 +531,15 @@
+@@ -228,6 +624,15 @@
          amrex::Vector<std::string> nm;
          for (int c = 0; c < S.nComp(); ++c) nm.push_back(desc_lst[State_Type].name(c));
          nyx_dump_raw_fields(parent, S, nm);
@@ -340,7 +420,7 @@ diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
      }
  
  #ifdef AMREX_USE_HDF5
-@@ -1176,6 +1501,20 @@
+@@ -1189,6 +1594,20 @@
  int
  Nyx::updateInSitu ()
  {

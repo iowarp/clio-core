@@ -79,6 +79,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -204,8 +205,32 @@ struct Adapter {
   std::chrono::steady_clock::time_point t_start;
   int elem_bytes = 0;  // the width every blob of this run was submitted at
 
-  /** Refuse unless `p` is genuinely device memory. */
-  void RequireDevice(const void *p, const char *what) const {
+  // MPI. rank/nprocs come from Nyx (ParallelDescriptor), not from an
+  // environment variable, so they cannot disagree with the job the
+  // simulation actually thinks it is in.
+  long long rank = 0;
+  long long nprocs = 1;
+  int store_lock_fd = -1;  // proof this rank's store belongs to this rank
+  std::string store_lock_path;
+
+  /**
+   * Which CUDA device the simulation's memory actually lives on.
+   *
+   * -1 until the first blob is checked, then fixed for the run. It is read
+   * from cudaPointerGetAttributes on the pointer Nyx handed over -- NOT
+   * assumed to be 0 -- because AllocateAndRegisterGpuBackend takes a gpu_id
+   * and registering a backend on a different device from the data is a
+   * cross-device copy that would either fail or silently work through
+   * peer-to-peer while the log claimed one device. AMReX assigns devices
+   * round-robin over the ranks on a node (AMReX_GpuDevice.cpp), so a
+   * multi-GPU node reaches this with device != 0 on some ranks; a
+   * single-GPU node always reads 0, which is what every measurement so far
+   * was taken on.
+   */
+  int device = -1;
+
+  /** Refuse unless `p` is genuinely device memory, on ONE device. */
+  void RequireDevice(const void *p, const char *what) {
     cudaPointerAttributes a{};
     const cudaError_t rc = cudaPointerGetAttributes(&a, p);
     if (rc != cudaSuccess) {
@@ -228,6 +253,17 @@ struct Adapter {
                  std::to_string(static_cast<int>(a.type)) +
                  "), not device memory. The compressor would report GPU "
                  "residency for something that is not GPU-resident.");
+    }
+    if (device < 0) {
+      device = a.device;
+    } else if (device != a.device) {
+      Refuse(CLIO_NYX_EXIT_NOT_DEVICE,
+             std::string(what) + ": this blob is on CUDA device " +
+                 std::to_string(a.device) + " but earlier blobs of this run "
+                 "were on device " + std::to_string(device) +
+                 ". The staging backends are registered on one device; "
+                 "mixing them would register a backend on a device the data "
+                 "is not on.");
     }
   }
 
@@ -299,20 +335,94 @@ Adapter &A() {
   return a;
 }
 
-}  // namespace
+/** dirname(), without pulling in <filesystem> for one call. */
+std::string DirOf(const std::string &path) {
+  const size_t s = path.find_last_of('/');
+  if (s == std::string::npos) return std::string(".");
+  if (s == 0) return std::string("/");
+  return path.substr(0, s);
+}
 
-extern "C" {
+/** "<stem>.rank0003<ext>" -- so N ranks do not overwrite one file. */
+std::string RankQualify(const std::string &path, long long rank) {
+  if (path.empty()) return path;
+  char suffix[32];
+  std::snprintf(suffix, sizeof(suffix), ".rank%04lld", rank);
+  const size_t slash = path.find_last_of('/');
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return path + suffix;
+  }
+  return path.substr(0, dot) + suffix + path.substr(dot);
+}
 
-int clio_nyx_insitu_begin(void) {
+/**
+ * Refuse unless this rank's CLIO_SERVER_CONF directory belongs to this rank
+ * alone.
+ *
+ * Every Clio runtime binds a TCP port and writes its bdev, tier and metadata
+ * log at paths the compose file names. Point two ranks at the same compose
+ * file and the second one's runtime cannot bind -- which, as the sibling
+ * READMEs record, produces an EMPTY LOG rather than an error, so the failure
+ * looks like the adapter silently doing nothing. An O_EXCL lock file named
+ * for the rank turns that into a named refusal at the point of the mistake.
+ *
+ * The lock is per (store directory, rank), so a re-run of the SAME rank is
+ * fine (it reopens its own lock); a different rank arriving in the same
+ * directory is not.
+ */
+void ClaimStoreForRank(Adapter &a) {
+  const std::string conf = EnvStr("CLIO_SERVER_CONF", "");
+  if (conf.empty()) return;  // nothing to claim; begin() will fail anyway
+  const std::string dir = DirOf(conf);
+  char mine[64];
+  std::snprintf(mine, sizeof(mine), "/.clio_nyx_rank%04lld.lock", a.rank);
+  const std::string lock_path = dir + mine;
+
+  // Any OTHER rank's lock in this directory means the launcher handed two
+  // ranks the same store.
+  for (long long r = 0; r < a.nprocs; ++r) {
+    if (r == a.rank) continue;
+    char other[64];
+    std::snprintf(other, sizeof(other), "/.clio_nyx_rank%04lld.lock", r);
+    if (::access((dir + other).c_str(), F_OK) == 0) {
+      Refuse(CLIO_NYX_EXIT_TOPOLOGY,
+             "rank " + std::to_string(a.rank) + " was given the store '" + dir +
+                 "', which rank " + std::to_string(r) +
+                 " of this job is already using. Every rank hosts its own "
+                 "Clio runtime, and a runtime binds a TCP port and owns its "
+                 "bdev, tier and metadata log; two ranks sharing them means "
+                 "one of the two silently stores nothing. Give each rank its "
+                 "own --store directory and port.");
+    }
+  }
+  a.store_lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+  if (a.store_lock_fd >= 0) {
+    char pid[64];
+    const int n = std::snprintf(pid, sizeof(pid), "%d\n", (int)getpid());
+    (void)!::write(a.store_lock_fd, pid, static_cast<size_t>(n));
+    a.store_lock_path = lock_path;
+  }
+}
+
+int BeginImpl(long long rank, long long nprocs) {
   Adapter &a = A();
   if (a.started) return 0;
 
+  a.rank = rank;
+  a.nprocs = nprocs;
   a.tag_name = EnvStr("CLIO_NYX_TAG", "nyx_insitu");
   a.chunk = EnvSize("CLIO_NYX_CHUNK", 4u << 20);
   a.report_path = EnvStr("CLIO_NYX_REPORT", "");
   a.raw_dir = EnvStr("CLIO_NYX_RAW_DIR", "");
   a.verify = EnvBool("CLIO_NYX_VERIFY", false);
   a.t_start = std::chrono::steady_clock::now();
+  if (a.nprocs > 1) {
+    // Per-rank CSV. The blob NAMES stay unqualified on purpose -- see the
+    // header -- but two ranks writing one CSV would lose half of it.
+    a.report_path = RankQualify(a.report_path, a.rank);
+    ClaimStoreForRank(a);
+  }
 
   // Same call the HDF5 VOL makes lazily on first use. With CLIO_WITH_RUNTIME=1
   // the runtime comes up HERE, inside the Nyx process, composed from
@@ -320,11 +430,40 @@ int clio_nyx_insitu_begin(void) {
   // runtime in another process arrives with a device pointer that means
   // nothing there unless it travels as a CUDA IPC handle.
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    std::cerr << "[clio-nyx-insitu] CLIO_CTE_CLIENT_INIT failed -- is "
+    std::cerr << "[clio-nyx-insitu] rank " << a.rank
+              << ": CLIO_CTE_CLIENT_INIT failed -- is "
                  "CLIO_SERVER_CONF set and CLIO_WITH_RUNTIME=1?\n";
     return 1;
   }
   a.cte = CLIO_CTE_CLIENT;
+
+  // The runtime MUST be in this process.
+  //
+  // Not a stylistic preference and not only about device pointers: the
+  // compressor chimod's tasks declare their wire format as
+  // SerializeStart/SerializeEnd (compressor_tasks.h), and no archive calls
+  // those names -- SaveTaskArchive calls SerializeIn/SerializeOut
+  // (task_archives.h). Name lookup therefore finds the inherited
+  // clio::run::Task::SerializeIn, which carries routing fields only, so a
+  // DynamicSchedule task sent to a runtime in another process arrives with
+  // blob_name="" and size=0 and stores nothing. Measured, on host memory as
+  // much as on device memory -- see the README's "Q5: MPI". In-process the
+  // task object is handed over by pointer and no archive ever runs, which is
+  // why this has never bitten a run before.
+  //
+  // Refusing here rather than staging through host memory is the whole point:
+  // the alternative failure is a run that reports success and stores nothing.
+  if (!CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    Refuse(CLIO_NYX_EXIT_TOPOLOGY,
+           "rank " + std::to_string(a.rank) +
+               ": the Clio runtime is NOT hosted in this process "
+               "(CLIO_WITH_RUNTIME is not 1). The compressor's tasks have no "
+               "cross-process wire format -- every DynamicSchedule would "
+               "arrive at the runtime with blob_name=\"\" and size=0 and "
+               "store nothing, while this process reported success. Host the "
+               "runtime in the rank (CLIO_WITH_RUNTIME=1, one store and one "
+               "port per rank).");
+  }
 
   unsigned major = 512, minor = 0;
   const std::string pool = EnvStr("CLIO_NYX_POOL", "512.0");
@@ -351,13 +490,29 @@ int clio_nyx_insitu_begin(void) {
     return 1;
   }
 
-  std::cout << "[clio-nyx-insitu] up: tag='" << a.tag_name << "' pool=" << major
-            << "." << minor << " chunk="
+  std::cout << "[clio-nyx-insitu] rank " << a.rank << "/" << a.nprocs
+            << " up: tag='" << a.tag_name << "' pool=" << major << "." << minor
+            << " chunk="
             << (a.chunk ? std::to_string(a.chunk) : std::string("whole field"))
             << (a.verify ? " verify=on" : "") << " pid=" << getpid()
             << std::endl;
   a.started = true;
   return 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+int clio_nyx_insitu_begin(void) { return BeginImpl(0, 1); }
+
+int clio_nyx_insitu_begin_mpi(long long rank, long long nprocs) {
+  if (nprocs < 1 || rank < 0 || rank >= nprocs) {
+    Refuse(CLIO_NYX_EXIT_PRECONDITION,
+           "clio_nyx_insitu_begin_mpi(rank=" + std::to_string(rank) +
+               ", nprocs=" + std::to_string(nprocs) + "): not a valid rank.");
+  }
+  return BeginImpl(rank, nprocs);
 }
 
 int clio_nyx_insitu_frame_begin(long long step, double sim_time) {
@@ -465,7 +620,8 @@ int clio_nyx_insitu_stage(const char *blob_prefix, const void *dev_base,
     if (a.slot_next >= a.slots.size()) {
       DeviceSlot slot;
       slot.alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
-          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, n,
+          /*gpu_id=*/static_cast<clio::run::u32>(a.device),
+          clio::run::gpu::IpcManager::MemKind::kDeviceMem, n,
           &slot.ptr);
       if (slot.alloc.IsNull()) {
         Refuse(CLIO_NYX_EXIT_ALLOC,
@@ -591,7 +747,8 @@ int clio_nyx_insitu_end(void) {
   }
 
   std::cout << std::fixed << std::setprecision(3)
-            << "\n[clio-nyx-insitu] stored " << a.records.size() << " blob(s) "
+            << "\n[clio-nyx-insitu] rank " << a.rank << "/" << a.nprocs
+            << " stored " << a.records.size() << " blob(s) "
             << "from " << a.frames << " frame(s), " << in_total << " B in -> "
             << stored_total << " B on the tier  (ratio "
             << (stored_total ? double(in_total) / double(stored_total) : 0.0)
@@ -618,12 +775,19 @@ int clio_nyx_insitu_end(void) {
     // --readback` can do the cold read from a separate process without
     // knowing anything about Nyx.
     std::ofstream csv(a.report_path);
-    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,rc\n";
+    // The first three columns and their order are ../neuropress_field_replay's
+    // CSV, which is what lets `neuropress_field_replay --readback` do the cold
+    // read from a separate process without knowing anything about Nyx (its
+    // parser reads blob,bytes,fnv1a64 and ignores the rest). `rank` is
+    // APPENDED, never inserted, for exactly that reason: it tells a reader
+    // which rank owned a box without moving a column the reader depends on.
+    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,rc,rank\n";
     for (const auto &r : a.records) {
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ','
           << ctp::CompressionFactory::NameForWireId(r.lib) << ',' << r.ratio
-          << ',' << r.stored << ',' << r.ms << ',' << (r.ok ? 0 : 1) << '\n';
+          << ',' << r.stored << ',' << r.ms << ',' << (r.ok ? 0 : 1) << ','
+          << a.rank << '\n';
     }
   }
 
@@ -631,13 +795,23 @@ int clio_nyx_insitu_end(void) {
   if (a.verify && !a.VerifyRecords()) rc = 1;
 
   for (auto &s : a.slots) {
-    if (!s.alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, s.alloc);
+    if (!s.alloc.IsNull()) {
+      CLIO_IPC->FreeGpuBackend(static_cast<clio::run::u32>(a.device), s.alloc);
+    }
   }
   a.slots.clear();
   if (a.scratch) {
     cudaFree(a.scratch);
     a.scratch = nullptr;
     a.scratch_bytes = 0;
+  }
+  if (a.store_lock_fd >= 0) {
+    // Removed on a CLEAN exit only. A crash leaves it behind on purpose: the
+    // next run that puts a different rank in this directory should still be
+    // told, and a run that puts the SAME rank back sees only its own lock.
+    ::close(a.store_lock_fd);
+    a.store_lock_fd = -1;
+    if (!a.store_lock_path.empty()) ::unlink(a.store_lock_path.c_str());
   }
   if (a.stream) {
     cudaStreamDestroy(a.stream);

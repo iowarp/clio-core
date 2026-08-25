@@ -14,6 +14,12 @@
 # previous one wrote. There is no plotfile and no .f32 dump to fall through
 # to: the compressed tier is the only copy of the data, so bytes that come
 # back correct came from it.
+#
+# Under MPI the writer was N ranks, each with its own runtime, its own store
+# and its own CSV ($STORE/rank0000, rank0001, ...). This reads them ONE AT A
+# TIME, in one process per store, and sums the result: N tiers, N metadata
+# logs, N cold reads. A rank's store is self-contained, so nothing here needs
+# MPI and the reader is still the same Nyx-free binary.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-$(cd "$HERE/../../../.." && pwd)}
@@ -30,21 +36,34 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -x "$BIN" ] || { echo "missing $BIN -- cmake --build $BUILD --target neuropress_field_replay" >&2; exit 1; }
-[ -f "$STORE/blobs.csv" ] || { echo "no $STORE/blobs.csv -- run ./run.sh first" >&2; exit 1; }
-[ -f "$STORE/compose.yaml" ] || { echo "no $STORE/compose.yaml" >&2; exit 1; }
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 
-ARGS=(--readback "$STORE/blobs.csv" --tag "${CLIO_NYX_TAG:-nyx_insitu}")
-[ -n "$DUMP" ] && { mkdir -p "$DUMP"; ARGS+=(--dump-decompressed "$DUMP"); }
+# One store, or one per rank.
+STORES=()
+if [ -f "$STORE/compose.yaml" ]; then STORES=("$STORE"); else
+  for d in "$STORE"/rank[0-9][0-9][0-9][0-9]; do
+    [ -f "$d/compose.yaml" ] && STORES+=("$d")
+  done
+fi
+[ ${#STORES[@]} -gt 0 ] || { echo "no compose.yaml under $STORE -- run ./run.sh first" >&2; exit 1; }
 
-echo "== cold read from $STORE (the Nyx process is long gone)"
-env CLIO_SERVER_CONF="$STORE/compose.yaml" \
-    CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
-    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
-    "$BIN" "${ARGS[@]}" 2> "$STORE/read.log"
-RC=$?
-grep -c "stored_compressed=1 -> inverting codec" "$STORE/read.log" 2>/dev/null \
-  | sed 's/^/-- blobs the compressor inverted a codec for: /'
-[ $RC -ne 0 ] && { echo "-- last lines of $STORE/read.log:"; tail -20 "$STORE/read.log"; }
-echo "-- exit=$RC (0 = every blob decompressed to its original bytes)"
-exit $RC
+TOT_RC=0 TOT_INV=0
+for SD in "${STORES[@]}"; do
+  CSV=$(ls "$SD"/blobs*.csv 2>/dev/null | head -1)
+  [ -n "$CSV" ] || { echo "no blobs*.csv in $SD" >&2; TOT_RC=1; continue; }
+  ARGS=(--readback "$CSV" --tag "${CLIO_NYX_TAG:-nyx_insitu}")
+  [ -n "$DUMP" ] && { mkdir -p "$DUMP"; ARGS+=(--dump-decompressed "$DUMP"); }
+  echo "== cold read from $SD (the Nyx process is long gone)"
+  env CLIO_SERVER_CONF="$SD/compose.yaml" \
+      CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
+      CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
+      "$BIN" "${ARGS[@]}" 2> "$SD/read.log"
+  RC=$?
+  INV=$(grep -c "stored_compressed=1 -> inverting codec" "$SD/read.log" 2>/dev/null || true)
+  TOT_INV=$((TOT_INV + INV))
+  echo "-- blobs the compressor inverted a codec for: $INV"
+  [ $RC -ne 0 ] && { echo "-- last lines of $SD/read.log:"; tail -20 "$SD/read.log"; TOT_RC=1; }
+done
+[ ${#STORES[@]} -gt 1 ] && echo "-- $((${#STORES[@]})) store(s) read, $TOT_INV codec inversion(s) in total"
+echo "-- exit=$TOT_RC (0 = every blob decompressed to its original bytes)"
+exit $TOT_RC

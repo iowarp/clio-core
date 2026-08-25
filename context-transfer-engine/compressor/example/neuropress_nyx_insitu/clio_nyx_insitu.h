@@ -45,6 +45,7 @@ extern "C" {
 #define CLIO_NYX_EXIT_PRECONDITION 3 /* the caller promised something untrue */
 #define CLIO_NYX_EXIT_ALLOC 4        /* device staging could not be allocated */
 #define CLIO_NYX_EXIT_NOT_DEVICE 5   /* the memory is not device memory */
+#define CLIO_NYX_EXIT_TOPOLOGY 6     /* the runtime topology cannot carry this */
 
 /**
  * Bring up the Clio client (and, with CLIO_WITH_RUNTIME=1, the runtime) in
@@ -61,6 +62,33 @@ extern "C" {
  * @return 0 on success, non-zero if the client could not be initialised.
  */
 int clio_nyx_insitu_begin(void);
+
+/**
+ * The MPI form of clio_nyx_insitu_begin(). Identical, except that the caller
+ * declares its place in the job, which changes three things:
+ *
+ *   1. CLIO_NYX_REPORT and CLIO_NYX_RAW_DIR gain a `.rank%04d` qualifier, so
+ *      N ranks do not overwrite each other's CSV. Blob NAMES are deliberately
+ *      NOT qualified -- they carry the AMReX global box index, which is
+ *      already unique across ranks (DistributionMapping gives each box to
+ *      exactly one rank), so the same blob has the same name and the same
+ *      bytes at any rank count.
+ *   2. The adapter REFUSES unless this rank's Clio runtime is hosted in this
+ *      process. A compressor task sent to a runtime in ANOTHER process
+ *      arrives with every payload field empty -- see the README's "Q5: MPI".
+ *   3. The adapter REFUSES if another rank of the same job is already using
+ *      this rank's CLIO_SERVER_CONF directory, which is what happens when a
+ *      launcher forgets to give each rank a private store and port.
+ *
+ * Nyx's patch dlsym()s this symbol and ABORTS if it is missing while
+ * NProcs() > 1, so an adapter too old to be safe under MPI cannot be used
+ * under MPI by accident.
+ *
+ * @param rank    ParallelDescriptor::MyProc()
+ * @param nprocs  ParallelDescriptor::NProcs()
+ * @return 0 on success. Refusals _exit() rather than returning.
+ */
+int clio_nyx_insitu_begin_mpi(long long rank, long long nprocs);
 
 /**
  * Open a frame. Everything staged until clio_nyx_insitu_frame_end() belongs
