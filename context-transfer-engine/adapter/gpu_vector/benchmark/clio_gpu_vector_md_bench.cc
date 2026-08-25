@@ -1905,7 +1905,13 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
   // pass dirtied every row and never published one, and a dirty page cannot
   // be evicted. That is fixed at the write site; both passes read one row at
   // a time, so a few frames plus fetch headroom is the real floor.
-  const clio::run::u64 kNlLiveBytes = 16ull * 1024 * 1024;
+  // MEASURED, and it is BYTES not frames: the knee is ~8 MB of resident list
+  // per block at 256 KB, 512 KB and 1024 KB list pages alike. 16 MB was the
+  // largest single term in the whole VRAM floor and bought 2.6% at 64 blocks
+  // (45.4 -> 44.2 ms/step) and NOTHING at 16 or 32 blocks, where a bigger
+  // list cache is flat to slightly worse. Correctness needs 2 frames; the
+  // rest is streaming headroom.
+  const clio::run::u64 kNlLiveBytes = 8ull * 1024 * 1024;
   u32 nl_floor = 0;
   if (nl_pages != 0) {
     nl_floor = static_cast<u32>((kNlLiveBytes + nl_page_bytes - 1) /
