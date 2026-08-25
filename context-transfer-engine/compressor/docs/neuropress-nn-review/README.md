@@ -12,11 +12,9 @@ them (`compressor_runtime.cc:1465-1471`; `Save()` is never called).
 |---|---|---|
 | `01_findings.md` | investigator agent | how the prediction path works (Section A), 17 claims F1–F17 with measured evidence (B), ranked improvements (C), reproduction appendix (D) |
 | `02_rebuttal.md` | adversarial agent | independent re-derivation of every claim with its own scorer and a held-out corpus; per-claim verdicts, attacks, missed items M1–M12, learning-loop battery L0–L6 / M1 / N1 |
-| `03_debate_round1.md` | investigator | concede / contest / partial for every attack |
-| `04_debate_round2.md` | adversary | reply; remaining disputes |
-| `05_agreed_findings.md` | moderator | the converged list of gaps and bottlenecks, and the ranked suggestions |
-
-Files 03–05 are added when the debate converges.
+| `03_debate_round1.md` | investigator | concede / contest / partial for every attack; 8 points left in dispute (D1–D8) |
+| `04_debate_round2.md` | adversary | settles D1–D8 with idle-GPU, common-ground-truth runs; agreed gaps and suggestions |
+| `05_agreed_findings.md` | moderator | **start here** — the converged, concise list of gaps and bottlenecks and the ranked suggestions |
 
 Reproduction: the measurement harnesses (`np_eval.cu`, `np_sgd.cu`,
 `np_ood_upstream.cu`, `np_adv.cu`) live in the gitignored

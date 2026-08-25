@@ -597,6 +597,36 @@ and crossed at chunk 91 on `smooth`, but it ran while another GPU job was active
 *balanced* numbers are not comparable to `h0`'s and are marked provisional; its deterministic
 ratio-only column is unchanged from `h0` by construction, since the table only corrects ct.)
 
+**F8.8 — Every adaptation mechanism, on one idle GPU, scored against one common measured
+table** (`scripts/common_gt.py`; 450-chunk 3-block stream, fresh weights per run, so codec-timing
+noise cannot favour any run and `bytes` is deterministic given the pick):
+
+| run | mechanism | SGD calls | mean regret | median | bytes | 1st half | 2nd half |
+|---|---|---|---|---|---|---|---|
+| `h0` / `h0b` | none (baseline, run twice) | 0 | 1.0918 | 0.8070 | 0.90259 | 1.2912 | 0.8924 |
+| `h1` | trunk SGD, cost gate 0.30 (**shipped**) | 74 | 1.5859 | 1.0476 | 0.96209 | 1.2313 | 1.9406 |
+| `h10` | trunk SGD, `ratio_or_cost` gate | 195 | 1.2525 | 0.8135 | 0.90398 | 1.3062 | 1.1988 |
+| `h2` | trunk SGD + explore K=7 | 120 | 1.1181 | **0.5663** | 0.98782 | 0.4047 | 1.8315 |
+| `h9` | residual table, per-algo ct+dt | **0** | 1.0146 | 0.8068 | 0.91821 | 1.2491 | 0.7801 |
+| `h3b` | residual table, per-action ct | **0** | **0.9570** | 0.8024 | 0.93897 | 1.1629 | **0.7512** |
+| `h6` | residual table, ct **+ ratio** | 0 | 1.2348 | 0.8121 | 0.91382 | 1.4568 | 1.0128 |
+| `h5b` | **clamp**, no learning | 0 | **0.8088** | **0.3822** | **0.88697** | 0.5748 | 1.0429 |
+| `h8` | **clamp + learning** | **0** | **0.8088** | **0.3822** | **0.88697** | 0.5748 | 1.0429 |
+
+Three readings. (a) **No trunk-SGD configuration beats not learning**, but the `ratio_or_cost`
+gate is much the best of them. (b) The two mechanisms that *do* beat it use **zero** SGD calls:
+the input clamp and the residual table. (c) `h8` is **bit-identical** to `h5b` — with the clamp
+on, the gate never fires at all (74 → 0 calls), which is the direct causal test of F8.3: the
+gate fires because the model is extrapolating. The adversary's independent run on a different
+560-chunk schedule reproduces this (51 → 3 firings, out-of-bounds chunks 230 → 0).
+
+**A measurement caveat that invalidates cross-run top-1 comparisons.** `h0` and `h0b` are the
+same invocation twice; their predictions and picks are **bit-identical**, yet `np_eval`'s own
+summary reported `top1_bal` 0.122 and **0.000**, because each run scores itself against its own
+measured table and the true-best action flips under timing noise. Any top-1 that compares two
+runs each using its own ground truth is unreliable at the ±0.12 level on this stream. All top-1
+values in the table above are against the single common table.
+
 **Class:** the loss is caused by (a) what the gate selects — upstream design, `:1447-1462`;
 (b) how little the weights can move — upstream constants; (c) scalar `algo_id` through a shared
 trunk — upstream representation. None of it is a port bug.
@@ -623,12 +653,30 @@ Also: the code comment at that site claims the io term is "~0.4 % of the cost" a
 it is mean 12.4 %, median 3.3 % (predicted) / 6.5 % (measured) — the comment is off by more than
 an order of magnitude.
 
-**Why the ratio gate is the interesting one under the deployment constraint.** The cost gate is
-built from a *measured* codec time, so it is an OOD detector on an idle device (F8.3) and a load
-detector on a busy one (F8.4) — neither is "the model is wrong here". The ratio MAPE is
-**timing-independent** (ratios are bit-deterministic across runs, 9440/9440 rows), so it is the
-only deterministic trigger the runtime already has. Whether it *helps* is the open question in
-DEBATE_R1.md.
+**Which trigger is load-invariant, measured (`scripts/debate3.py`, `f0a` primary rows, both
+gates computed exactly as the runtime does, measured ct scaled by a device-load factor k):**
+
+| k | cost gate | ratio gate | cost **OR** ratio (the shipped knob) | cost: % on OOB chunks | ratio: % on OOB | OR: % on OOB |
+|---|---|---|---|---|---|---|
+| 0.5x | 0.234 | **0.475** | 0.476 | 0.99 | 0.66 | 0.66 |
+| **1.0x (idle)** | 0.239 | **0.475** | 0.478 | 0.98 | 0.66 | 0.66 |
+| 2x | 0.317 | **0.475** | 0.607 | 0.58 | 0.66 | 0.52 |
+| 8x | 0.683 | **0.475** | 0.803 | 0.50 | 0.66 | 0.45 |
+| 14x | 0.997 | **0.475** | **0.997** | 0.40 | 0.66 | 0.40 |
+
+Corpus base rate of ≥1 out-of-bounds input: 0.40. Three things follow:
+(i) the **ratio gate is exactly load-invariant** — 0.475 at every k — so it is the only trigger
+the runtime has that a busy GPU cannot saturate;
+(ii) the shipped knob **ORs** it onto the cost gate, so the combination still reaches **0.997 at
+14x load** — it masks the pathology while the device is quiet rather than removing it;
+(iii) the ratio gate still fires on out-of-bounds chunks **66 %** of the time against a 40 % base
+rate, so it halves the F8.3 problem rather than solving it.
+
+**Does it help?** Measured on an idle GPU with all runs scored against one common measured table
+(`scripts/common_gt.py`, 450-chunk 3-block stream, fresh weights): the ratio-OR-cost gate fires
+195 times in 450 chunks and is the **best trunk-SGD configuration** (regret 1.2525, bytes
+0.90398, against the cost gate's 1.5859 / 0.96209) but is still **worse than not learning at
+all** (1.0918 / 0.90259). See F18 and DEBATE_R1.md D1.
 
 **Confidence: high** for the numbers.  **Class: upstream design (gate on cost alone), faithfully
 ported; the ratio-gate knob is a Clio addition.**
@@ -942,6 +990,16 @@ The three things that stop adaptation from helping, in order of measured weight:
    region caps the excursion, and consecutive steps cancel — 590 steps move ‖W‖ by 0.90 %, fewer
    than 226 steps do (F8.2). Longer runs do not become better-adapted runs.
 
+**B0 (highest measured value, and it is C-A/A3 again). Clamp the inputs — it makes the in-run
+loop quiescent instead of harmful.** The shipped gate fires *because the model is extrapolating*
+(F8.3), so removing the extrapolation removes the trigger. Measured on an idle GPU, same stream,
+fresh weights: `learn + clamp` fires **0 SGD calls in 450 chunks** (against 74 for `learn`
+alone) and is therefore bit-identical to `infer + clamp`; both give regret **0.8088** and median
+**0.3822** against the no-learning baseline's 1.0918 / 0.8070. The adversary's independent run on
+a different 560-chunk schedule shows the same effect (51 → 3 firings, OOB chunks 230 → 0). F1,
+F8 and F9 are one defect seen from three sides: fix the inputs and the adaptation problem largely
+stops existing. Nothing else in C-B comes close to this.
+
 **B1. Feed the learner exploration samples, not the primary alone.** This is the single measured
 fix. Fresh runs `h0`/`h1`/`h2`: phase-1-only adaptation needs **~112 chunks / 62 SGD calls** to
 beat fresh weights and only where the gate fires often; with `NPE_EXPLORE_K=7` at the same gate
@@ -961,23 +1019,38 @@ runs 0.239 → 0.997 over the same range. Two refinements the shipped knob does 
 (a) because it **ORs** the two gates, the combination still saturates to 0.997 under load, so the
 cost gate has to be *replaced*, not supplemented; (b) the ratio gate still fires on out-of-bounds
 chunks 66 % of the time (base rate 40 %), so pair it with an `n_x_oob == 0` precondition to stop
-the learner training on extrapolations at all (F8.3). The adversary measured the shipped OR knob
-live (their L6: top-1 0.350, the only learning configuration that does not *cost* top-1 —
-though also not better than the 0.359 of not learning, and at an uncontrolled contention level).
-**The replaced-gate + OOB-precondition combination is unmeasured by either of us** —
-DEBATE_R1.md points D1/D2.
+the learner training on extrapolations at all (F8.3). Measured (idle GPU, common ground truth, `h10`): the shipped OR knob fires 195/450 times and is
+the **best trunk-SGD configuration** — regret 1.2525 and bytes 0.90398 against the cost gate's
+1.5859 / 0.96209 — but still **worse than not learning** (1.0918 / 0.90259). The adversary's live
+`L6` on their own schedule holds top-1 at 0.350 against 0.359 for not learning, i.e. level rather
+than better, and on the corrected contention measure it was fully busy while doing so, which is
+the load-invariance property showing up in practice. Joint reading: **the right trigger, not yet
+a net win.** The **replaced-gate (not ORed) + `n_x_oob == 0` precondition** combination is
+unmeasured by either of us — DEBATE_R1.md points D1/D2.
 
-**B3. Learn the magnitude outside the network.** F7 shows the trunk can only use a clipped scalar
-step; a per-algorithm log-residual table on the time heads is not subject to the clip, is
-per-action so it cannot smear one action's outcome across the other 31 (F8.5), and converges in
-a handful of updates. `np_eval` implements it (`NPE_BIAS`). My live run `h3` (ct-only, key=action,
-α=0.3, no SGD) gave whole-run top-1 0.207 vs 0.122 for no learning and crossed over at chunk 91
-in the `smooth` block — but it shared the GPU with another job, so I mark those balanced numbers
-**provisional pending a clean re-run**. What is not provisional: adding the **ratio** head to the
-table destroys the gain (`h6`, top-1 0.120 ≈ no-learning 0.122), independently reproducing
-F3/M6. The adversary's offline simulation of the same mechanism shows the property that matters
-most here — it *improves with run length* (first-half 0.083 → second-half 0.032), which trunk SGD
-never does.
+**B2b (promoted above B2 after round 1). Learn the magnitude outside the network: an online
+per-algorithm log-residual table on the time heads, with the trunk left alone.** F7 shows the
+trunk can only apply a clipped, sign-directed scalar step; a residual table is not subject to the
+clip, is keyed per algorithm/action so it cannot smear one outcome across the other 31 (F8.5),
+and converges in a handful of updates. `np_eval` implements it (`NPE_BIAS`); the runtime does not.
+Measured on an idle GPU against a common ground truth, **with zero SGD calls**:
+
+| run | SGD | mean regret | median | bytes | 1st half | 2nd half |
+|---|---|---|---|---|---|---|
+| no learning | 0 | 1.0918 | 0.8070 | 0.90259 | 1.2912 | 0.8924 |
+| per-**algorithm**, ct+dt (`h9`) | 0 | 1.0146 | 0.8068 | 0.91821 | 1.2491 | 0.7801 |
+| per-**action**, ct (`h3b`) | 0 | **0.9570** | 0.8024 | 0.93897 | 1.1629 | **0.7512** |
+| per-algorithm, ct **+ ratio** (`h6`) | 0 | 1.2348 | 0.8121 | 0.91382 | 1.4568 | 1.0128 |
+| shipped trunk SGD, cost gate (`h1`) | 74 | 1.5859 | 1.0476 | 0.96209 | 1.2313 | 1.9406 |
+
+It is the only *learning* mechanism measured that beats not learning, and it improves within the
+run (half-ratio 0.625 / 0.646 against the baseline's 0.691 — the baseline falls too because the
+third block is easier, so the true adaptation is the difference). The adversary's live `M1` on a
+better-balanced 28-regime schedule shows the effect much more cleanly: first half 0.1601 ≈ the
+baseline's 0.1602, second half **0.0215 vs 0.1158**. Costs: bytes +1.7 to +4.0 % and top-1, the
+same currency as A4 — because it *is* A4, learned online. Do **not** add the ratio head: it is a
+per-chunk error, not a per-algorithm one (F3/M6), and including it is worse than not adapting
+(1.2348 vs 1.0918) — three independent reproductions now.
 
 **B4. Do not simply widen the cost gate.** `f4` (train every chunk) is the worst configuration
 measured: regret 0.1572 → 0.2624, top-1 0.407 → 0.207, bytes +3.7 %. The reason is B-blocker 1,
@@ -1057,6 +1130,23 @@ and is reproducible in a few lines from the CSV header
 (`run_id,regime,chunk_idx,chunk_bytes,eb,entropy,mad,d2,data_min,data_max,action,algo,quant,
 shuffle,pred_ct,pred_dt,pred_ratio,pred_psnr,pred_ct_raw,...,act_ct,act_dt,act_ratio,act_psnr,
 act_comp_bytes,...,cost_mape,ratio_mape,z_*,h1_*,ok,...`).
+
+### Added in debate round 1, part 2 (idle GPU, after the adversary's battery finished)
+
+```
+h0b_infer            NPE_MODE=infer                                          # replicate of h0
+h10_learn_ratiogate  NPE_MODE=learn NPE_SGD_THRESH=0.30 NPE_GATE=ratio_or_cost
+h8_learn_clamp       NPE_MODE=learn NPE_SGD_THRESH=0.30 NPE_FEATURE_XFORM=clamp
+h5b_infer_clamp      NPE_MODE=infer NPE_FEATURE_XFORM=clamp
+h9_bias_algo_ctdt    NPE_MODE=infer NPE_BIAS=1 NPE_BIAS_KEY=algo NPE_BIAS_HEADS=ct,dt
+h3b_bias_act_ct      NPE_MODE=infer NPE_BIAS=1 NPE_BIAS_KEY=action NPE_BIAS_HEADS=ct
+```
+all with `NPE_EB=0 NPE_COST=balanced NPE_REGIMES=turb_x50,smooth_a1_n1e-2,lammps_pos_sorted
+NPE_CHUNKS_PER_REGIME=150 NPE_SEED=1234`. Scored with `scripts/common_gt.py`, which evaluates
+every run's picks against **one** measured table so timing noise cannot favour a run. These
+supersede the contended `h3`/`h5` and the killed `h4`/`h7`.
+
+Also `scripts/debate3.py` — the gate load-invariance / OOD-selection table in F9.
 
 ### Added in debate round 1
 
