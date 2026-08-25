@@ -1506,6 +1506,46 @@ void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
 
 namespace {
 /**
+ * NeuroPress's weighted cost of one outcome:
+ *   w_ct*compress_ms + w_dt*decompress_ms + w_io*bytes/(min(ratio,cap)*bw)
+ *
+ * An object rather than five loose constants and a lambda because the SGD
+ * gate and the exploration sweep have to score with the SAME weights. That
+ * is the entire reason NeuroPressResolvedCostWeights() exists: when the
+ * CLIO_NEUROPRESS_COST_W_* override reached only the ranking, a "ratio cost
+ * model" run selected on ratio while the gate still scored the balanced
+ * cost, training the model against an objective it was not ranking on.
+ * Passing one callable around makes that mismatch impossible to reintroduce
+ * by editing a weight at one site and not the other.
+ *
+ * Times are floored at 1 ms and the ratio capped, both before weighting,
+ * exactly as upstream clamps them (gpucompress_compress.cpp). A
+ * non-positive ratio yields 1e30 -- "no measurable result", which is a
+ * sentinel the MAPE gate reads, not an arithmetic accident.
+ */
+struct NeuroPressCost {
+  double w_ct;
+  double w_dt;
+  double w_io;
+  double bandwidth_bytes_per_ms;
+  double ratio_cap;
+  clio::run::u64 chunk_size;
+
+  double operator()(double compress_ms, double decompress_ms,
+                    double ratio) const {
+    const double ct = std::max(1.0, compress_ms);
+    const double dt = std::max(1.0, decompress_ms);
+    const double rc = std::min(ratio_cap, ratio);
+    return w_ct * ct + w_dt * dt +
+           ((rc > 0.0) ? w_io * static_cast<double>(chunk_size) /
+                             (rc * bandwidth_bytes_per_ms)
+                       : 1e30);
+  }
+};
+}  // namespace
+
+namespace {
+/**
  * One alternative measured during an exploration sweep: everything the
  * codec call needs, and everything the scoring phase reads back from it.
  *
@@ -2016,21 +2056,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // "ratio cost model" run selected on ratio while SGD still scored the
         // balanced cost.
         const auto kCw = NeuroPressResolvedCostWeights();
-        const double kCostW0 = config_.neuropress_best_mode_ ? 0.0 : kCw.ct;
-        const double kCostW1 = config_.neuropress_best_mode_ ? 0.0 : kCw.dt;
-        const double kCostW2 = kCw.io;
-        const double kCostBandwidthBytesPerMs = kCw.bw;
-        const double kCostRatioCap = kCw.cap;
-        auto cost = [&](double compress_ms, double decompress_ms,
-                        double ratio) -> double {
-          double ct = std::max(1.0, compress_ms);
-          double dt = std::max(1.0, decompress_ms);
-          double rc = std::min(kCostRatioCap, ratio);
-          return kCostW0 * ct + kCostW1 * dt +
-                 ((rc > 0.0) ? kCostW2 * static_cast<double>(chunk_size) /
-                                   (rc * kCostBandwidthBytesPerMs)
-                             : 1e30);
-        };
+        // Best mode scores I/O alone: it ranks on what a configuration
+        // SAVES, not what it costs to get there, so the two time weights
+        // drop out rather than being weighed against bytes.
+        const NeuroPressCost cost{config_.neuropress_best_mode_ ? 0.0 : kCw.ct,
+                                  config_.neuropress_best_mode_ ? 0.0 : kCw.dt,
+                                  kCw.io, kCw.bw, kCw.cap, chunk_size};
         // Decompress time is not measured at write time (only a later read
         // decompresses it) -- use the prediction for both sides, same as
         // NeuroPress's own primary_decomp_time_ms fallback, so this term
