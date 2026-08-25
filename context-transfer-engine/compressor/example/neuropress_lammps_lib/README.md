@@ -7,6 +7,14 @@ segments, reads `Atom::x / v / f` straight out of the LAMMPS instance, and hands
 them to the compressor. No HDF5 anywhere in the path, no `dump` in the deck, no
 patch to LAMMPS.
 
+Three hand-over shapes, chosen with `--order`. Two read LAMMPS' host mirror
+through the C library interface. The third, `--order device`, reads the Kokkos
+**device** views and hands the compressor a CUDA-IPC-registered device pointer,
+so the payload is never host bytes -- still with no LAMMPS patch, because the
+code that needs Kokkos lives in this driver (`lammps_device_view.cc`) rather
+than in a LAMMPS `fix`. **Read "The device write path is not trustworthy yet"
+below before using it for anything but a demonstration.**
+
 ```
  ┌──────────────────────────── one process: neuropress_lammps_lib ────────────────────────────┐
  │                                                                                            │
@@ -28,10 +36,10 @@ patch to LAMMPS.
 | LAMMPS binary | stock `lmp` | patched (`fix cliogpu`) | stock `liblammps`, linked in |
 | Clio in the app | none -- VOL is dlopened by HDF5 | `libclio_gpu_blob.so` | compressor client, directly |
 | hand-over point | `output->write` → `dump h5md` → `H5Dwrite` | `end_of_step` (fix) | between `run` segments (== after `output->write`) |
-| bytes cross | GPU→host (Kokkos sync), packed, sorted, **written to .h5**, staged to Clio | device→device | gather (ID order) → host shm → compressor |
+| bytes cross | GPU→host (Kokkos sync), packed, sorted, **written to .h5**, staged to Clio | device→device | `--order id/local`: gather → host shm → compressor. `--order device`: device→device, ID-gathered on the GPU |
 | native copy of the data | yes (the .h5 is authoritative) | no | no |
 | where the runtime lives | in-process (`CLIO_WITH_RUNTIME=1`) | in-process | in-process |
-| needs | HDF5 + VOL | a LAMMPS tree carrying the fix + adapter | a CMake build of LAMMPS |
+| needs | HDF5 + VOL | a LAMMPS tree carrying the fix + adapter | a CMake build of LAMMPS with KOKKOS |
 
 All three host Clio's runtime inside the LAMMPS process; what differs is how
 the simulation's arrays get to it. The VOL route pays for a file it does not
@@ -119,6 +127,9 @@ target is skipped with a message and nothing else is affected.
 ```bash
 ./run.sh --box 10 --steps 100 --gap 50 --verify            # 4000 atoms, CPU, 3 frames
 ./run.sh --box 80 --steps 300 --gap 50 --kokkos --verify   # 2M atoms, GPU, ~1 GB
+./run.sh --box 10 --steps 100 --gap 50 --kokkos --order device
+                                                           # GPU-resident hand-over;
+                                                           # always reads back (see below)
 ./run.sh --box 10 --static nvcomp-zstd                     # pin the codec, then:
 ./read.sh                                                  #   cold read-back, separate process
 ./crosscheck_h5md.sh --box 10 --steps 100 --gap 50         # bytes == dump h5md?
@@ -135,7 +146,7 @@ options:
 |---|---|
 | `--box N --steps N --gap N` | system size (4N³ atoms), length, frame interval (frame 0 included) |
 | `--chunk BYTES` | bytes per compressor call; 0 = whole field. Default 4 MiB, the siblings' size |
-| `--order id\|local` | gather in atom-ID order (default, == h5md) or LAMMPS' internal order |
+| `--order id\|local\|device` | `id`: atom-ID order via `lammps_gather_atoms` (default, == h5md). `local`: LAMMPS' internal order via `lammps_extract_atom`. `device`: atom-ID order gathered ON THE GPU out of the Kokkos device views -- same ordering as `id`, never host bytes. Needs `--kokkos`. |
 | `--kokkos` | `-k on g 1 -sf kk`: LAMMPS on the GPU; the driver still reads the (synced) host mirror |
 | `--verify` | read every blob back through the decompressor in the same process |
 | `--readback CSV` | no simulation: read the blobs a previous run listed in its CSV (what `read.sh` does) |
@@ -206,15 +217,157 @@ output, and segmented `run GAP pre no` reproduces the continuous trajectory.
 CPU only -- the GPU run is not bit-reproducible, as the sibling's `--cpu` note
 explains.
 
+## `--order device`: the GPU-resident hand-over
+
+`library.h` has no device accessor -- `lammps_extract_atom` returns the host
+mirror and `lammps_gather_atoms` copies out of it -- so `--order id` and
+`--order local` hand the compressor host bytes even when LAMMPS is running on
+the GPU. Measured, with `--kokkos`, on the path trace: `device=0` on every
+blob.
+
+`--order device` goes through `lammps_device_view.cc` instead, the one
+translation unit here compiled with LAMMPS' own `nvcc_wrapper` and LAMMPS' own
+flags. It reads `LAMMPS::atomKK` (`lammps.h:44`, public) to reach
+`AtomKokkos::k_x / k_v / k_f` (`atom_kokkos.h:34-36`, public DualViews),
+gathers into atom-ID order **on the device** with a Kokkos kernel, stages into
+a registered `kDeviceMem` backend, and submits that. Same trace: `device=1` on
+every blob.
+
+The earlier gpu-direct attempt needed a patched LAMMPS only because it put this
+code in a `fix`. In the driver it needs no LAMMPS change at all.
+
+### The ID gather is exactly `lammps_gather_atoms`
+
+`lammps_gather_atoms` zero-fills a `natoms*3` buffer and writes
+`copy[3*(tag[i]-1)+j] = array[i][j]` for each owned atom
+(`library.cpp:3663-3672`). `clio_lmp_device_gather_id` does the same
+permutation, with the same zero fill, in two Kokkos kernels over `k_tag` and
+the field's device view.
+
+Verified directly -- same process, same GPU trajectory, both orders taken at
+the same instant, so any difference would be the gather rather than the
+physics:
+
+```
+step 0    x  host_gather=62385809d0d70bd5  device_gather=62385809d0d70bd5  IDENTICAL
+step 0    v  host_gather=bc91d38b3114b7de  device_gather=bc91d38b3114b7de  IDENTICAL
+step 0    f  host_gather=d29a529281c550ef  device_gather=d29a529281c550ef  IDENTICAL
+step 50   ... IDENTICAL x3
+step 100  ... IDENTICAL x3
+```
+
+`62385809d0d70bd5` is the digest `crosscheck_h5md.sh` records for
+`position/step_0` from a stock `dump h5md`, so the GPU gather reproduces h5md's
+ordering.
+
+**`crosscheck_h5md.sh` cannot be run against `--order device` end to end**, and
+not because of the gather: the crosscheck's reference is a **CPU** `lmp` run,
+`--order device` requires the GPU, and the GPU trajectory is not
+bit-reproducible against the CPU one -- which is why that script says it is
+"only meaningful for a CPU run". The control settles it: the existing,
+unmodified `--order id --kokkos` scores exactly the same 1 of 9 against the CPU
+reference (only `position/step_0`, the initial lattice, is CPU/GPU-identical).
+`--order device` is precisely as h5md-comparable as `--order id` is on the GPU,
+and the digest comparison above is the rigorous form of the check. On the CPU,
+`--order id` still scores 9 of 9.
+
+### What it refuses to do
+
+Each of these could have been continued past by quietly doing something else,
+and the something else would have produced blobs that pass every check while
+not being what was asked for:
+
+| condition | exit | why not carry on |
+|---|---|---|
+| `atomKK == nullptr` (no `-k on g 1 -sf kk`, or a liblammps without KOKKOS) | 3 | the atom arrays are host-resident; there is no device view. Asked of LAMMPS, not inferred from `--kokkos`, because the flag is only what this driver passes in |
+| `need_sync<Device>()` non-zero for x, v, f or tag | 3 | the device image is behind the host one; reading it stores an earlier step under this step's name. A stale **tag** is worse: right coordinates, wrong atoms |
+| `AllocateAndRegisterGpuBackend` returns null | 4 | staging through host memory instead would turn a GPU-resident run into a host one with nothing in the log to show it |
+| the registered buffer is not device memory | 5 | the compressor would get host bytes while the run reported GPU residency |
+| `nlocal != natoms` (multi-rank) | 1 | the device views hold one rank's atoms; storing them unqualified publishes a fraction of the system as the whole of it |
+
+Measured: without `-k on g 1 -sf kk` the run exits **3** and says so. The other
+four are code paths that could not be provoked here without injecting faults --
+stated as unverified rather than claimed.
+
+### The device write path is not trustworthy yet
+
+**A chunk staged as device memory whose codec actually runs can reach the tier
+corrupted.** The read side rejects it with `header is not valid (magic/version
+mismatch)`, and the damage is on disk: a cold read from a separate process with
+`CLIO_RESTART=1` fails the same blobs.
+
+It is not this driver's staging. Isolated by removing one variable at a time,
+box 10, LJ melt:
+
+| configuration | staging | codec ran | runs failed |
+|---|---|---|---|
+| `--order id --kokkos --static nvcomp-zstd` | host | all chunks | **0 of 6** |
+| `--order device --kokkos` (dynamic; 1 chunk in 9 compresses) | device | few chunks | **3 of 10** |
+| `--order device --kokkos --static nvcomp-zstd` | device | all chunks | **5 of 6** |
+| `bin/neuropress_gpu_static` (device + static, **no LAMMPS**) | device | all chunks | **0 of 5** |
+| `bin/neuropress_gpu_direct` (device, **no LAMMPS**) | device | all chunks | **0 of 3** |
+
+The failure rate tracks how many chunks a codec actually runs on: the dynamic
+default stores 8 of 9 chunks raw and fails 3 runs in 10, `--static` compresses
+all 9 and fails 5 in 6. **The default is not safe either** -- an earlier
+5-run sample showed 0 failures and was simply too small.
+
+So it takes device staging **and** a codec that runs **and** LAMMPS/Kokkos
+sharing the process. Remove any one and it is clean. Things that are NOT the
+cause, each tested: chunk count (a single 3-blob frame fails too), reusing or
+freeing the staging backends (a pool that never frees, and deferring every free
+to the end, both still fail), and outstanding CUDA work (a
+`GpuApi::Synchronize()` before every free changes nothing). The per-chunk
+stored sizes match a host-order run of the same configuration exactly, so the
+chunks are being *selected* and *compressed* identically -- it is the store
+that breaks.
+
+That points at Clio's device compress/store path, or at how it shares a CUDA
+context with Kokkos, rather than at anything in this example. It is reported,
+not worked around.
+
+Until it is fixed, **`--order device` always reads every blob back**, whether
+or not `--verify` was passed, and says so on stdout. A run that hits the bug
+exits non-zero with a `MISMATCH` line per blob rather than reporting success
+over bad data.
+
 ## Notes
+
+- **Storing raw is the normal outcome here, not a failure.** Melted LJ float64
+  coordinates are close to incompressible, so on the default settings most
+  chunks come back with `compress_lib_ == 0`: a codec was selected and run, it
+  did not shrink the chunk, and the ORIGINAL bytes went to the tier. The run
+  still returns 0, because storing raw is the correct answer -- writing more
+  bytes than the caller gave us is not. What changed is that the compressor now
+  says so at WARNING with the blob's name and the sizes it achieved
+  (`compressor_runtime.cc`, "Compression not beneficial for blob '...'"),
+  instead of at DEBUG. The summary's `stored raw:` count is the aggregate of
+  the same thing. Use `--static <lib>` when you need every chunk to genuinely
+  go through a codec.
+
+- **Log level: "warning", not "warn".** `Logger::Logger`
+  (`clio_ctp/util/logging.h:143-163`) matches the full level names and then
+  falls through to `std::stoi`, which throws on `"warn"` and leaves the
+  COMPILE-TIME default -- kDebug in this build. `run.sh` and `read.sh` used to
+  pass `warn`, so every run of this example was silently at debug: measured,
+  `warn` produced 386 DEBUG lines out of 540 where `warning` produces 0 out of 50. Both now pass
+  `warning`. The same typo is still present in `paper-benchmark/*/run_config.sh`
+  and `paper-benchmark/*/read.sh` (7 files), which are out of this example's
+  scope. (`../neuropress_lammps_h5/lmp_common.sh` passes `debug` deliberately --
+  its `lmp_write.sh` greps the log for `kept=` -- and is unaffected.)
 
 - `CLIO_WITH_RUNTIME=1` is load-bearing, for the reason the sibling README
   gives: a compressor task sent to a runtime in another process arrives with a
   host pointer that means nothing there. The driver calls
   `CLIO_CTE_CLIENT_INIT()` first thing; with that variable set, the runtime
   comes up inside `main` before LAMMPS is even opened.
-- LAMMPS with Kokkos/CUDA and Clio's CUDA code coexist in the process without
-  incident; the Kokkos run above was verified like the others.
+- LAMMPS with Kokkos/CUDA and Clio's CUDA code coexist in the process for
+  every HOST-staged order -- `--order id --kokkos` was verified like the
+  others, including 6 of 6 clean runs with `--static nvcomp-zstd`. An earlier
+  version of this note said they coexist "without incident" full stop. That is
+  no longer supportable: with `--order device` they demonstrably do not, and
+  the "device write path is not trustworthy yet" section above has the
+  isolation table. The claim was only ever measured for the host orders.
 - Serial only (`BUILD_MPI=OFF`, as the siblings). Under MPI,
   `lammps_gather_atoms` still returns the global ID-ordered array on every
   rank -- rank 0 would stage it -- or each rank stages its own
@@ -222,9 +375,21 @@ explains.
   refuses to run when `nlocal != natoms` rather than silently storing a
   fraction of the system.
 - The staging copy (`gather` → `memcpy` into shm) is the cost of reading the
-  host mirror. Keeping the bytes on the GPU is the gpu-direct example's
-  territory and needs device views, which the C library interface does not
-  expose.
+  host mirror on `--order id` / `--order local`. The C library interface
+  exposes no device view, which is why `--order device` reaches past it into
+  LAMMPS' C++ headers -- see that section above.
+
+- **Cross-process runtime is untested for `--order device`.** Everything here
+  runs with the runtime hosted in this process (`CLIO_WITH_RUNTIME=1`). The
+  gpu-direct sibling's README claims device payloads now cross a process
+  boundary by CUDA IPC handle (`Context::blob_is_device_`); that claim has not
+  been re-checked here and nothing in this example depends on it. One thing
+  that WOULD break out of process is addressing several chunks as offsets into
+  one registered backend: `IpcManager::ToFullPtr` case 4 resolves a same-PID
+  allocation through `ShmPtr::off_`, but case 5 -- the cross-process path --
+  resolves through the backend's own `device_ptr` and ignores `off_`, so every
+  chunk would silently come back as chunk 0. This driver gives each chunk its
+  own backend for that reason.
 - Every in-process runtime binds a TCP port, 9413 by default here and in all
   the siblings. Two Clio-hosting processes on one machine -- this example and
   another harness, say -- collide with `Failed to start main server on

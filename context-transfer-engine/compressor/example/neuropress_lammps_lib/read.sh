@@ -29,10 +29,17 @@ done
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 
 echo "== cold read from $STORE (writer process is long gone)"
+# "warning", not "warn". Logger::Logger (clio_ctp/util/logging.h:143-163) matches
+# the full names only and then falls through to std::stoi, which throws on "warn"
+# and leaves the COMPILE-TIME default in place -- kDebug in this build. Measured:
+# "warn" produced 386 DEBUG lines (540 total) where "warning" produces 0 (50).
+# Every run of this
+# example was silently at debug, which both bloats the log and buries the
+# warnings it is supposed to surface.
 env CLIO_SERVER_CONF="$STORE/compose.yaml" \
     CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
     CLIO_LMP_COMPRESSOR_POOL=512.0 \
-    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
+    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
     "$BIN" --readback "$STORE/blobs.csv" 2> "$STORE/read.log"
 RC=$?
 grep -c "stored_compressed=1 -> inverting codec" "$STORE/read.log" 2>/dev/null | sed 's/^/-- blobs the compressor inverted a codec for: /'

@@ -79,7 +79,24 @@
 #include <clio_cte/compressor/compressor_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_ctp/compress/compress_factory.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/clio_runtime.h>
+
+/* LAMMPS' Kokkos DEVICE views, from lammps_device_view.cc -- the one
+   translation unit here built with nvcc through LAMMPS' own nvcc_wrapper.
+   library.h has no device accessor of any kind, so `--order device` reaches
+   the GPU arrays through these and nothing else. See that file for why the
+   split exists and why none of this needs a LAMMPS patch. */
+extern "C" {
+int clio_lmp_device_available(void *handle);
+long clio_lmp_device_nlocal(void *handle);
+int clio_lmp_need_sync_device(void *handle);
+int clio_lmp_tags_consecutive(void *handle);
+void *clio_lmp_device_scratch(size_t bytes);
+void clio_lmp_device_scratch_free(void);
+int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
+                              long natoms);
+}
 
 namespace {
 
@@ -89,7 +106,9 @@ struct Options {
   int gap = 50;       // store every `gap` steps (frame 0 included)
   size_t chunk = 4u << 20;  // bytes per compressor call; 0 = whole field
   std::string fields = "position,velocity,force";
-  std::string order = "id";  // id (gather, == dump h5md) | local (extract)
+  std::string order = "id";  // id (host gather, == dump h5md)
+                             // | local (host extract, LAMMPS internal order)
+                             // | device (GPU gather, == dump h5md, never host)
   std::string deck;          // LAMMPS input deck (setup only, no `run`)
   std::string tag = "lammps_lib";
   std::string logfile = "none";  // LAMMPS -log
@@ -116,10 +135,17 @@ void Usage(const char *argv0) {
       << "  --chunk BYTES    bytes per compressor call, 0 = whole field "
          "[4194304]\n"
       << "  --fields LIST    any of position,velocity,force [all three]\n"
-      << "  --order id|local id: atom-ID order via lammps_gather_atoms "
+      << "  --order id|local|device\n"
+      << "                   id:     atom-ID order via lammps_gather_atoms "
          "(byte-identical to dump h5md)\n"
-      << "                   local: LAMMPS' internal order via "
+      << "                   local:  LAMMPS' internal order via "
          "lammps_extract_atom, no gather copy\n"
+      << "                   device: atom-ID order gathered ON THE GPU out of "
+         "the Kokkos device views;\n"
+      << "                           the payload never becomes host bytes. "
+         "Requires --kokkos. Same\n"
+      << "                           ordering as id, so crosscheck_h5md.sh "
+         "still applies.\n"
       << "  --kokkos         run LAMMPS on the GPU (-k on g 1 -sf kk)\n"
       << "  --verify         read every blob back and compare\n"
       << "  --report CSV     per-blob outcome\n"
@@ -176,7 +202,8 @@ bool ParseArgs(int argc, char **argv, Options *o) {
   }
   if (o->deck.empty() && o->readback.empty()) { Usage(argv[0]); return false; }
   if (o->gap <= 0 || o->steps < 0 || o->box <= 0) return false;
-  if (o->order != "id" && o->order != "local") return false;
+  if (o->order != "id" && o->order != "local" && o->order != "device")
+    return false;
   return true;
 }
 
@@ -210,7 +237,11 @@ struct BlobRecord {
 
 struct Pending {
   clio::run::Future<clio::cte::compressor::DynamicScheduleTask> fut;
+  // Host orders only. On --order device the staging buffer belongs to the
+  // slot pool below, which outlives every individual task, so there is
+  // nothing per-task to release.
   ctp::ipc::FullPtr<char> buf;
+  bool on_device = false;
   size_t record;  // index into records
 };
 
@@ -354,6 +385,80 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // ---- --order device: every precondition, checked once, before anything
+  // is stored. Each of these is a case where the run could have continued by
+  // quietly doing something else -- reading the host mirror, gathering
+  // against stale tags, storing one rank's slice -- and produced blobs that
+  // pass a round-trip check while not being what was asked for.
+  if (opt.order == "device") {
+    if (!clio_lmp_device_available(lmp)) {
+      // atomKK is null. Deliberately asked of LAMMPS rather than inferred
+      // from --kokkos: the flag is only what this driver PASSES to LAMMPS,
+      // and it can be passed to a liblammps built without the KOKKOS package,
+      // or be overridden by the deck. What matters is whether the atom arrays
+      // are actually on the device, and only LAMMPS can answer that.
+      std::cerr << "--order device: LAMMPS has no Kokkos atom object "
+                   "(atomKK == null), so the atom arrays are host-resident "
+                   "and there is no device view to hand to Clio. Pass "
+                   "--kokkos (-k on g 1 -sf kk), and check this liblammps "
+                   "was built with -DPKG_KOKKOS=ON. Refusing rather than "
+                   "falling back to host bytes.\n";
+      return 3;
+    }
+    const long dev_nlocal = clio_lmp_device_nlocal(lmp);
+    if (dev_nlocal != natoms) {
+      // The device views hold THIS rank's atoms. Storing them under an
+      // unqualified blob name would publish a fraction of the system as if
+      // it were the whole of it -- the same trap --order local refuses.
+      std::cerr << "--order device: nlocal " << dev_nlocal << " != natoms "
+                << natoms
+                << " (multi-rank run). The device views hold only this rank's "
+                   "atoms; use --order id, or name blobs per rank.\n";
+      return 1;
+    }
+    // Read-back is NOT optional on this order, and the reason is a defect,
+    // not caution.
+    //
+    // A chunk staged as DEVICE memory whose codec actually runs can reach the
+    // tier corrupted, in this process configuration. Measured on box 10, LJ
+    // melt: with --static nvcomp-zstd, 5 of 6 runs stored at least one blob
+    // whose header the read side rejects with "magic/version mismatch"; even
+    // on the dynamic default, where only 1 chunk in 9 compresses, 3 of 10 runs
+    // do. The damage is on disk -- a cold read from a separate process with
+    // CLIO_RESTART=1 fails the same blobs. It is not this driver's staging:
+    //   --order id  + --static (HOST staging, same GPU run)    0 of 6 failed
+    //   --order device, no --static (device, 1 chunk in 9)     3 of 10 failed
+    //   --order device + --static (device, all compressed)     5 of 6 failed
+    //   bin/neuropress_gpu_static (device + static, NO LAMMPS) 0 of 5 failed
+    // so it needs device staging AND a codec that runs AND LAMMPS/Kokkos
+    // sharing the process. Remove any one and it is clean. That points at
+    // Clio's device compress/store path rather than at anything here, and it
+    // is reported rather than papered over.
+    //
+    // Until it is fixed, this order must never be able to finish quietly with
+    // bad data in the tier. Forcing the read-back turns the failure into a
+    // non-zero exit and a MISMATCH line per blob. Announced, not silent --
+    // the whole point is that nothing about this run is implicit.
+    if (!opt.verify) {
+      std::cout << "--order device: enabling --verify. A device-staged chunk "
+                   "whose codec runs can reach the tier corrupted in this "
+                   "configuration (see the README), so this order always "
+                   "reads every blob back rather than risk reporting success "
+                   "over bad data."
+                << std::endl;
+      opt.verify = true;
+    }
+
+    if (!clio_lmp_tags_consecutive(lmp)) {
+      // The gather writes to index tag[i]-1. Without consecutive IDs that
+      // index is meaningless -- the same precondition lammps_gather_atoms
+      // raises as a LAMMPS error (library.cpp:3597-3601).
+      std::cerr << "--order device: atom IDs are absent or not consecutive, "
+                   "so an ID-ordered gather is not defined for this system\n";
+      return 1;
+    }
+  }
+
   std::vector<const Field *> fields;
   for (const auto &f : kFields)
     if (opt.fields.find(f.blob_name) != std::string::npos) fields.push_back(&f);
@@ -373,7 +478,16 @@ int main(int argc, char **argv) {
             << chunks_per_field << " chunk(s)/field)  order=" << opt.order
             << "  device=" << (opt.kokkos ? "GPU/Kokkos" : "CPU") << "\n"
             << "  payload=" << (field_bytes * fields.size() * nframes) / 1048576.0
-            << " MiB" << std::endl;
+            << " MiB\n"
+            // What the compressor will actually receive. Said out loud
+            // because it is the one property of this run that no return code
+            // reports and that every log otherwise looks identical for.
+            << "  hand-over to the compressor: "
+            << (opt.order == "device"
+                    ? "DEVICE pointers (CUDA IPC-registered backend)"
+                    : "HOST shm (the atom arrays are read from the host "
+                      "mirror)")
+            << std::endl;
 
   // Context for every chunk: float64, lossless. data_type_ 2 is what the VOL
   // reports for an 8-byte H5T_FLOAT; the compressor converts on that flag
@@ -402,18 +516,99 @@ int main(int argc, char **argv) {
       // beneficial"). actual_compressed_size_ still reports the codec's
       // output in that case, which is NOT what was stored.
       r.stored = (r.ok && r.lib != 0) ? c.actual_compressed_size_ : r.bytes;
-      CLIO_IPC->FreeBuffer(p.buf);
+      // Device staging buffers are pool slots and are not freed here; see
+      // DeviceSlot. Host buffers are per-chunk and are.
+      if (!p.on_device) CLIO_IPC->FreeBuffer(p.buf);
     }
     pending.clear();
   };
 
   // Stage one frame: every selected field, chunked, one AsyncDynamicSchedule
   // per chunk. Returns bytes submitted.
+  // --order device only: the bytes are pulled back to the host solely to
+  // record a digest (and, with --raw, to write them out). Nothing on the
+  // compressor path reads this, so it is skipped entirely when nothing needs
+  // it -- otherwise a "GPU-resident" run would quietly pay a D2H per chunk.
+  const bool need_bytes_on_host =
+      opt.verify || !opt.report.empty() || !opt.raw_dir.empty();
+  std::vector<char> dev_staging;
+
+  // --order device: one registered device backend per chunk OF A FRAME,
+  // allocated on the first frame and REUSED by every frame after it. Never
+  // freed and reallocated mid-run.
+  //
+  // Two reasons, and NEITHER of them is the corruption bug described at the
+  // --order device precondition checks above -- reuse was tried as a fix for
+  // it and does not fix it (5 runs of the pooled build: 4 still failed). Do
+  // not read this pool as a workaround; the bug is Clio's and is unfixed.
+  //
+  //  1. It bounds device memory at one FRAME. The alternative that keeps a
+  //     distinct backend per chunk for the whole run costs the entire payload.
+  //  2. It does no free-and-reallocate churn, so no AllocatorId is ever
+  //     recycled mid-run. That is worth having on its own: an id handed back
+  //     out while anything still resolves through the old registration would
+  //     be a second, independent way to get the wrong bytes.
+  //
+  // Reuse is safe because drain() waits for every task of frame N before
+  // frame N+1 stages anything into the same slots. Within a frame each chunk
+  // has its own slot, so nothing is overwritten while it is in flight.
+  struct DeviceSlot {
+    ctp::ipc::AllocatorId alloc;
+    char *ptr = nullptr;
+    size_t bytes = 0;
+  };
+  std::vector<DeviceSlot> device_slots;
+  size_t device_slot_next = 0;  // reset at the top of every frame
+
   auto store_frame = [&](int64_t step) -> size_t {
     size_t submitted = 0;
+    // Frame N reuses the same slots as frame N-1, in the same order. Safe
+    // only because drain() has already waited for frame N-1's tasks.
+    device_slot_next = 0;
     for (const Field *f : fields) {
       const double *src = nullptr;
-      if (opt.order == "id") {
+      // --order device: the field, ID-ordered, sitting in device memory. Set
+      // instead of `src`, and the two are never both valid.
+      const char *dev_field = nullptr;
+      if (opt.order == "device") {
+        // Freshness, checked per field per frame rather than once at startup:
+        // whether a device view is current is a property of where LAMMPS is
+        // in the timestep, not of the run. Between `run` segments every mask
+        // bit is clear (VerletKokkos::run has just synced to host without
+        // marking the device stale). If that ever stops being true, reading
+        // anyway would store a previous step's image under this step's name
+        // -- a frame that round-trips perfectly and is simply the wrong data.
+        // NOT repaired with sync(Device, ...): see lammps_device_view.cc.
+        const int stale = clio_lmp_need_sync_device(lmp);
+        if (stale != 0) {
+          std::cerr << "--order device: LAMMPS' device views are stale at step "
+                    << step << " (need_sync mask=" << stale
+                    << ", bits 1=x 2=v 4=f 8=tag). Reading them now would "
+                       "store an earlier image under this step's name. "
+                       "Refusing.\n";
+          std::exit(3);
+        }
+        auto *scratch =
+            static_cast<double *>(clio_lmp_device_scratch(field_bytes));
+        if (scratch == nullptr) {
+          std::cerr << "--order device: could not allocate " << field_bytes
+                    << " B of device scratch for the ID gather\n";
+          std::exit(4);
+        }
+        // Same permutation lammps_gather_atoms performs on the host
+        // (library.cpp:3663-3672), run on the GPU into the scratch buffer:
+        // the ordering `dump h5md` writes, without the payload ever being
+        // host bytes. This is what keeps crosscheck_h5md.sh meaningful for
+        // this order.
+        const int grc =
+            clio_lmp_device_gather_id(lmp, f->lmp_name, scratch, natoms);
+        if (grc != 0) {
+          std::cerr << "--order device: ID gather of '" << f->lmp_name
+                    << "' failed (rc=" << grc << ") at step " << step << "\n";
+          std::exit(3);
+        }
+        dev_field = reinterpret_cast<const char *>(scratch);
+      } else if (opt.order == "id") {
         // Global array ordered by atom ID -- what dump h5md writes after its
         // own sort(). One copy (LAMMPS' internal order -> ID order); the
         // sibling h5md path does the same copy inside Dump::write, then a
@@ -438,23 +633,98 @@ int main(int argc, char **argv) {
       for (size_t ci = 0; ci < chunks_per_field; ++ci) {
         const size_t off = ci * chunk;
         const size_t n = std::min(chunk, field_bytes - off);
-        const char *bytes = reinterpret_cast<const char *>(src) + off;
+        ctp::ipc::ShmPtr<> blob_data;
+        ctp::ipc::FullPtr<char> host_buf;
+        // Bytes to digest / write with --raw. Points into the caller's host
+        // array on the host orders; into dev_staging on --order device.
+        const char *bytes = nullptr;
 
-        // Host staging, exactly as the VOL's clio_stage_chunk host branch:
-        // a runtime-visible buffer the compressor can reach through the
-        // ShmPtr. (A device-resident producer would register a GPU backend
-        // instead -- see neuropress_gpu_direct.cc.)
-        auto buf = CLIO_IPC->AllocateBuffer(n);
-        if (buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; std::exit(1); }
-        std::memcpy(buf.ptr_, bytes, n);
+        if (dev_field != nullptr) {
+          // One registered backend PER CHUNK, and the chunk's bytes copied
+          // into it -- rather than one backend for the field with each chunk
+          // addressed by an offset into it. The offset form works today
+          // (IpcManager::ToFullPtr case 4 resolves a same-PID alloc through
+          // ShmPtr::off_) but breaks silently the moment the runtime moves to
+          // another process: case 5 resolves through the registered
+          // backend's own device_ptr and IGNORES off_, so every chunk would
+          // come back as chunk 0's bytes -- and each blob would still
+          // round-trip bit-exact against the digest of what was submitted.
+          // This is the shape the VOL already uses (clio_stage_chunk).
+          if (device_slot_next >= device_slots.size()) {
+            DeviceSlot slot;
+            slot.alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+                /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                n, &slot.ptr);
+            if (slot.alloc.IsNull()) {
+              std::cerr << "--order device: AllocateAndRegisterGpuBackend("
+                        << n
+                        << ") failed. Refusing to stage this chunk through "
+                           "host memory instead -- that would silently turn a "
+                           "GPU-resident run into a host one.\n";
+              std::exit(4);
+            }
+            slot.bytes = n;
+            device_slots.push_back(slot);
+          }
+          DeviceSlot &slot = device_slots[device_slot_next++];
+          if (slot.bytes < n) {
+            // Every frame chunks the same field size the same way, so a slot
+            // is always revisited with the size it was made for. If that ever
+            // stops being true, growing the slot would mean a free and a
+            // realloc -- the exact thing this pool exists to avoid.
+            std::cerr << "--order device: staging slot is " << slot.bytes
+                      << " B but this chunk is " << n
+                      << " B; chunk layout changed between frames\n";
+            std::exit(4);
+          }
+          char *registered = slot.ptr;
+          ctp::GpuApi::Memcpy(registered, dev_field + off, n);
+          // The compressor reads `registered` from another thread and Clio's
+          // own streams; the copy above is not host-synchronous for D2D. One
+          // sync per chunk on an otherwise idle device is microseconds, and
+          // it removes the class of bug where a chunk is compressed before
+          // its bytes have landed -- which produces a perfectly valid blob of
+          // the wrong contents.
+          ctp::GpuApi::Synchronize();
+          if (!ctp::IsDevicePointer(registered)) {
+            std::cerr << "--order device: the registered staging buffer is "
+                         "not device memory. The compressor would receive "
+                         "host bytes while the run reported GPU residency. "
+                         "Refusing.\n";
+            std::exit(5);
+          }
+          blob_data.alloc_id_ = slot.alloc;
+          blob_data.off_ = reinterpret_cast<clio::run::u64>(registered);
+
+          if (need_bytes_on_host) {
+            // Read from the SCRATCH, not from `registered`: the gather has
+            // been fenced, so these bytes are certainly final. (Hashing the
+            // destination of an unsynchronized D2D is how the earlier
+            // gpu-direct example's verifier accused correct data of being
+            // wrong.)
+            dev_staging.resize(n);
+            ctp::GpuApi::Memcpy(dev_staging.data(), dev_field + off, n);
+            bytes = dev_staging.data();
+          }
+        } else {
+          bytes = reinterpret_cast<const char *>(src) + off;
+
+          // Host staging, exactly as the VOL's clio_stage_chunk host branch:
+          // a runtime-visible buffer the compressor can reach through the
+          // ShmPtr.
+          host_buf = CLIO_IPC->AllocateBuffer(n);
+          if (host_buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; std::exit(1); }
+          std::memcpy(host_buf.ptr_, bytes, n);
+          blob_data = host_buf.shm_.template Cast<void>();
+        }
 
         BlobRecord rec;
         rec.name = std::string(f->blob_name) + "/step_" + std::to_string(step) +
                    "/chunk_" + std::to_string(ci);
         rec.bytes = n;
-        rec.digest = Fnv1a(bytes, n);
+        rec.digest = bytes ? Fnv1a(bytes, n) : 0;
         records.push_back(rec);
-        if (!opt.raw_dir.empty()) {
+        if (!opt.raw_dir.empty() && bytes) {
           std::string fn = rec.name;
           for (auto &ch : fn) if (ch == '/') ch = '_';
           std::ofstream(opt.raw_dir + "/" + fn + ".bin", std::ios::binary)
@@ -464,9 +734,10 @@ int main(int argc, char **argv) {
         Pending p;
         p.fut = compressor.AsyncDynamicSchedule(
             clio::run::PoolQuery::Local(), tag_id, rec.name, /*offset=*/0, n,
-            buf.shm_.template Cast<void>(), /*score=*/-1.0f, ctx, /*flags=*/0,
+            blob_data, /*score=*/-1.0f, ctx, /*flags=*/0,
             cte_client->pool_id_);
-        p.buf = buf;
+        p.buf = host_buf;
+        p.on_device = (dev_field != nullptr);
         p.record = records.size() - 1;
         pending.push_back(std::move(p));
         submitted += n;
@@ -563,6 +834,18 @@ int main(int argc, char **argv) {
   int rc = failed ? 1 : 0;
   if (opt.verify && !verify_records(records)) rc = 1;
 
+  // Before lammps_kokkos_finalize(): the scratch lives in a Kokkos memory
+  // space, and freeing it after Kokkos has torn that space down is a
+  // use-after-free in the allocator.
+  if (opt.order == "device") {
+    // After the final drain, so nothing is in flight, and nothing allocates
+    // a backend after this point -- so no id can be recycled.
+    for (auto &slot : device_slots) {
+      if (!slot.alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, slot.alloc);
+    }
+    device_slots.clear();
+    clio_lmp_device_scratch_free();
+  }
   lammps_close(lmp);
   lammps_kokkos_finalize();
   lammps_mpi_finalize();

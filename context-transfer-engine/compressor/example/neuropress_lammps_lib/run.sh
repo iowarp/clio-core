@@ -2,9 +2,14 @@
 # LAMMPS as a library, Clio in the same process.
 #
 #   ./run.sh [--box N] [--steps N] [--gap N] [--chunk BYTES] [--store DIR]
-#            [--order id|local] [--kokkos] [--verify] [--restart]
+#            [--order id|local|device] [--kokkos] [--verify] [--restart]
 #            [--learn] [--explore K] [--threshold X] [--best]
 #            [--static LIB] [--static-shuffle N] [--port N]
+#
+#   --order device gathers into atom-ID order ON THE GPU and hands the
+#   compressor a CUDA-IPC-registered device pointer, so the payload is never
+#   host bytes. Needs --kokkos; the driver refuses without it rather than
+#   quietly reading the host mirror. Same ordering as --order id.
 #
 # One process, one binary (bin/neuropress_lammps_lib): liblammps runs the LJ
 # melt, Clio's runtime is composed from $STORE/compose.yaml and hosted in that
@@ -25,7 +30,7 @@ STORE=${STORE:-$HERE/store}
 KOKKOS=false VERIFY=false RESTART=false
 LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB= STATIC_SHUF=0
 EXTRA=()
-usage() { sed -n '2,12p' "$0"; }
+usage() { sed -n '2,17p' "$0"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --box) BOX=$2; shift 2;;
@@ -131,7 +136,13 @@ echo "   store=$STORE  port=$PORT"
 NP_ENV=(env CLIO_SERVER_CONF="$STORE/compose.yaml"
         CLIO_WITH_RUNTIME=1
         CLIO_LMP_COMPRESSOR_POOL=512.0
-        CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}")
+        # "warning", not "warn". Logger::Logger (clio_ctp/util/logging.h:143-163)
+        # matches the full names only and then falls through to std::stoi, which
+        # throws on "warn" and leaves the COMPILE-TIME default in place -- kDebug in
+        # this build. Measured on this example: "warn" gives 386 DEBUG lines out
+        # of 540, "warning" gives 0 out of 50. Every run was silently at debug,
+        # which both bloats the log and buries the warnings it should surface.
+        CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}")
 # CLIO_RESTART=1 replays the metadata log, so a second process can see the
 # blobs a first one stored. Same switch the siblings' read phases use.
 [ "$RESTART" = true ] && NP_ENV+=(CLIO_RESTART=1)
