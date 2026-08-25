@@ -28,7 +28,8 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots) {
   // action space is all GPU, so this branch is not taken on the real path.
   for (auto& sp : slots) {
     ExploreSlot* s = sp.get();
-    if (s->gpu != nullptr) continue;
+    if (s->collected || s->gpu != nullptr) continue;
+    s->collected = true;
     const auto t0 = std::chrono::high_resolution_clock::now();
     size_t sz = s->capacity;
     s->ok = s->compressor->Compress(s->out_ptr, sz, s->input,
@@ -43,7 +44,8 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots) {
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
   for (auto& sp : slots) {
     ExploreSlot* s = sp.get();
-    if (!s->launched || s->gpu == nullptr) continue;
+    if (s->collected || !s->launched || s->gpu == nullptr) continue;
+    s->collected = true;
     s->ok = s->gpu->CompressFinish(&s->async);
     // This slot's OWN events, the same quantity the primary is measured with.
     // No host-clock fallback: a missing reading means no launch happened.

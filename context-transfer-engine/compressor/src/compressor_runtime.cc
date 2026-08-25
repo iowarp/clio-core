@@ -452,6 +452,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
            "the name against CompressionFactory's registry.",
            config_.neuropress_static_lib_, resolved);
     }
+    // Upstream exposes ONE width: GPUCOMPRESS_PREPROC_SHUFFLE_4, and its NN
+    // encodes shuffle as a single bit. 2 and 8 are Clio-only, so a run using
+    // one is no longer a like-for-like comparison with NeuroPress.
+    if (config_.neuropress_static_shuffle_ != 0 &&
+        config_.neuropress_static_shuffle_ != 4) {
+      HLOG(kWarning,
+           "  byte shuffle {} diverges from upstream, which offers only "
+           "4-byte (GPUCOMPRESS_PREPROC_SHUFFLE_4). Results from this run are "
+           "not comparable with NeuroPress.",
+           config_.neuropress_static_shuffle_);
+    }
   }
 
   // Best mode brings its own exploration settings rather than requiring the
@@ -1707,6 +1718,23 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           std::vector<std::unique_ptr<ExploreSlot>> slots;
           slots.reserve(alternatives.size());
 
+          // Codec launches in flight at once. Same alternatives measured
+          // either way; only contention changes. 0 = all, which is upstream's
+          // behaviour and what CLIO_NEUROPRESS_EXPLORE_STREAMS=0 restores.
+
+          // Default 4, diverging from upstream deliberately. Contention
+          // inflated per-slot kernel time up to 76x against an idle-GPU
+          // reference (median 1.40x); at 4 that is 17.8x worst, 0.97x median.
+
+          // The cost model ranks on those times, so the inflation can hand the
+          // sweep to the wrong codec. 4 buys that for ~19% of sweep wall clock.
+          static const size_t kExploreStreams = [] {
+            const char *e = std::getenv("CLIO_NEUROPRESS_EXPLORE_STREAMS");
+            if (e == nullptr || *e == '\0') return size_t{4};
+            const long v = std::atol(e);
+            return v > 0 ? static_cast<size_t>(v) : size_t{0};  // 0 = all
+          }();
+
           // The three steps below are the SWEEP's, not the two
           // learning phases' -- this whole sweep runs inside learning
           // Phase 2. They are numbered on their own axis so a
@@ -1913,9 +1941,19 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             }
 #endif
             slots.push_back(std::move(slot));
+
+            // Batched: drain once the in-flight count reaches the limit, so
+            // the next launches start against an idle device.
+            if (kExploreStreams != 0) {
+              size_t in_flight = 0;
+              for (const auto& sp : slots) {
+                if (!sp->collected) ++in_flight;
+              }
+              if (in_flight >= kExploreStreams) CollectExploreSlots(slots);
+            }
           }
 
-          // ---- Sweep step 2: every slot is already in flight; collect it ----
+          // ---- Sweep step 2: collect whatever is still in flight ----
           CollectExploreSlots(slots);
 
           std::vector<ExploreRow> explore_rows;
@@ -2059,13 +2097,30 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             explore_costs.push_back(alt_cost);
           }
 
+          // The model's own pick, logged alongside the alternatives so every
+          // action for a chunk sits in one file. It has no sweep rank -- it
+          // was never one of the measured slots -- hence -1.
+          if (ExploreLogEnabled()) {
+            const uint32_t p_packed = static_cast<uint32_t>(best_preset);
+            LogNeuroPressExplore(
+                task->blob_name_.str(), chunk_size, /*rank=*/-1,
+                ctp::CompressionFactory::NameForWireId(best_lib),
+                UnpackPreset(p_packed), UnpackQuantEnabled(p_packed),
+                UnpackShuffle(p_packed),
+                predicted->compression_ratio_, predicted->compress_time_ms_,
+                context.actual_compression_ratio_,
+                context.actual_compress_time_ms_, context.actual_psnr_db_,
+                actual_cost, actual_cost,
+                /*adopted=*/!winner.have, /*is_primary=*/true);
+          }
           for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
             const ExploreRow& row = explore_rows[ri];
             LogNeuroPressExplore(
                 task->blob_name_.str(), chunk_size, row.rank, row.lib,
                 row.preset_id, row.quant, row.shuffle, row.pred_ratio,
                 row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
-                actual_cost, static_cast<int>(ri) == winner.row);
+                actual_cost, static_cast<int>(ri) == winner.row,
+                /*is_primary=*/false);
           }
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP

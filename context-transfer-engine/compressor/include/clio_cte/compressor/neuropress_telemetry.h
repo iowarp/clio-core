@@ -36,14 +36,16 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             double actual_ratio, double actual_ct_ms,
                             double actual_psnr, unsigned long long checksum);
 
-/** One swept alternative. The selection log cannot express this: its row is
- *  written before the sweep runs. */
+/** One row of a sweep. is_primary marks the model's own pick, logged alongside
+ *  the alternatives so all actions for a chunk sit in one file. `adopted` marks
+ *  whichever row's bytes are stored -- exactly one per chunk. */
 void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           int rank, const std::string &lib_name,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,
                           double pred_ratio, double pred_ct_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
-                          double primary_cost, bool adopted);
+                          double primary_cost, bool adopted,
+                          bool is_primary = false);
 
 /** Hash of codec output, from Compress(); joined by blob name. stage is
  *  "primary" or "adopted" -- a chunk can appear twice and the LAST row is the

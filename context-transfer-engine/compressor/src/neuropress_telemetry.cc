@@ -86,10 +86,11 @@ ExploreLog *ExploreLogInstance() {
     if (path && *path) {
       l->fp = std::fopen(path, "w");
       if (l->fp) {
-        // `rank` is the model's own ordering; `adopted` marks the row whose
-        // bytes replaced the primary's -- at most one per chunk, maybe none.
+        // role=primary is the model's own pick, role=alt a swept alternative.
+        // `adopted` marks whichever row's bytes are stored: exactly one per
+        // chunk, the primary unless an alternative beat it.
         std::fprintf(l->fp,
-                     "seq,blob,chunk_bytes,rank,lib_name,algo_idx,preset,"
+                     "seq,blob,chunk_bytes,role,rank,lib_name,algo_idx,preset,"
                      "quantize,shuffle,pred_ratio,pred_ct_ms,ratio,ct_ms,"
                      "psnr_db,cost,primary_cost,adopted\n");
       }
@@ -198,7 +199,7 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,
                           double pred_ratio, double pred_ct_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
-                          double primary_cost, bool adopted) {
+                          double primary_cost, bool adopted, bool is_primary) {
   ExploreLog *log = ExploreLogInstance();
   if (!log->fp) return;
 
@@ -222,9 +223,10 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
 
   std::lock_guard<std::mutex> lock(log->mutex);
   std::fprintf(log->fp,
-               "%ld,%s,%zu,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
+               "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
                "%.10g,%.10g,%.10g,%d\n",
-               log->seq++, blob_name.c_str(), chunk_size, rank,
+               log->seq++, blob_name.c_str(), chunk_size,
+               is_primary ? "primary" : "alt", rank,
                lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
                shuffle, pred_ratio, pred_ct_ms, ratio, ct_ms, psnr_db, cost,
                primary_cost, adopted ? 1 : 0);
@@ -267,7 +269,10 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
   }
   const uint32_t bits = static_cast<uint32_t>(packed_preset);
   const int quantize = ((bits >> 24) & 1u) ? 1 : 0;
-  const int shuffle = (((bits >> 8) & 0xFFu) != 0u) ? 1 : 0;
+  // The WIDTH, not a boolean. Upstream has one width so a flag would be
+  // lossless there, but Clio's static codec also reaches 2 and 8 -- collapsing
+  // them made a stride-8 run indistinguishable from a stride-4 one in this log.
+  const int shuffle = static_cast<int>((bits >> 8) & 0xFFu);
   const int preset = static_cast<int>(bits & 0xFFu);
 
   std::fprintf(fp,

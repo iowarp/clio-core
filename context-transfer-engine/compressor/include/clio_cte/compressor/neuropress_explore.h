@@ -79,6 +79,8 @@ struct ExploreSlot {
   // Filled by the launch/collect phases below.
   bool ok = false;
   bool launched = false;
+  /** Set once collected, so a batched sweep never finishes a slot twice. */
+  bool collected = false;
   size_t compressed_size = 0;
   double time_ms = 0.0;
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP

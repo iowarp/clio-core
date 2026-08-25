@@ -57,7 +57,11 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
 
 /** Same ranking with the network reading statistics from DEVICE memory. Takes
  *  no entropy/MAD args on purpose: reading them back first is a stream sync
- *  that would reinstate the stall this path removes. Falls back to host. */
+ *  that would reinstate the stall this path removes.
+ *
+ *  Does NOT fall back to the host: a failed device inference returns empty and
+ *  sets out_inference_failed, so the caller declines NeuroPress for the chunk
+ *  rather than being handed a plausible ranking the GPU never produced. */
 std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
