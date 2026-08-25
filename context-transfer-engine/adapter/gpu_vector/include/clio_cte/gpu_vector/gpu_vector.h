@@ -73,32 +73,45 @@ class Vector {
    * @param tag_name   CTE tag representing this vector
    * @param gpu_ids    GPUs to build device views for
    * @param page_bytes page granularity
-   * @param nblocks    page tables to create; in SHARED mode, associative SETS
-   * @param pages_per_block resident pages each table may hold; in SHARED mode
-   *        the size of one set, ~2x the budget's share so hash collisions
-   *        have somewhere to go
+   * @param nblocks    CUDA BLOCKS the kernel will launch. This dimensions the
+   *        per-block task sets -- each block owns its MultiGet and MultiPut,
+   *        because two blocks staging into one slot would overwrite each
+   *        other's records mid-transfer -- and, by default, the set count.
+   * @param set_size   frames in one associative set. Enough of them to cover
+   *        every block that can hold a page of one set at once, plus room for
+   *        hash collisions.
    * @param num_elems  logical length of the vector
-   * @param shared     one cache for the whole grid instead of one table per
-   *        CUDA block. A page's home set is Hash(page_num) % nblocks, so a
-   *        page touched by every block is stored ONCE. Costs a per-set lock;
-   *        buys back the replication.
+   * @param nsets      associative sets; 0 means "as many as there are blocks".
+   *        Separate from nblocks because the cache's geometry and the grid's
+   *        width are unrelated numbers -- they were one field, and reading
+   *        `nblocks` as either "tables" or "sets" depending on context is
+   *        exactly what made this class hard to follow.
+   *
+   * THERE IS ONE CACHE. `nblocks` sets, `pages_per_block` frames each, and a
+   * page's home set is Hash(page_num) % nblocks -- a function of the PAGE, so
+   * every CUDA block looks in the same place and a page touched by all of
+   * them is stored ONCE. The per-block page table this class used to build is
+   * gone: it stored a hot page once per block, and every cross-block
+   * correctness rule (invalidate after a resort, borrow a peer's frame,
+   * publish before another block can read) existed to paper over that.
    */
   Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
-         clio::run::u32 pages_per_block, clio::run::u64 num_elems,
+         clio::run::u32 set_size, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0, int compress_preset = 1, bool shared = false)
+         int compress_lib = 0, int compress_preset = 1,
+         clio::run::u32 nsets = 0)
       : storage_pool_id_(storage_pool_id.IsNull() ? clio::cte::core::kCtePoolId
                                                   : storage_pool_id),
         compress_lib_(compress_lib),
         compress_preset_(compress_preset),
         page_bytes_(page_bytes),
         nblocks_(nblocks),
-        pages_per_block_(pages_per_block),
-        num_elems_(num_elems),
-        shared_(shared) {
-    if (page_bytes_ == 0 || nblocks_ == 0 || pages_per_block_ == 0) {
-      throw std::runtime_error("gpu_vector: zero page size / blocks / pages");
+        nsets_(nsets != 0 ? nsets : nblocks),
+        set_size_(set_size),
+        num_elems_(num_elems) {
+    if (page_bytes_ == 0 || nblocks_ == 0 || set_size_ == 0 || nsets_ == 0) {
+      throw std::runtime_error("gpu_vector: zero page size / blocks / sets");
     }
     clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
     auto tag = cte.AsyncGetOrCreateTag(tag_name);
@@ -166,47 +179,33 @@ class Vector {
    * because benches reset residency between measured rounds.
    */
 
-  /** Make pages [pg_lo, pg_hi) resident in every table, best effort. */
+  /**
+   * A page's home set, host side. MUST mirror DeviceVector::SetOf exactly --
+   * the host and the device disagreeing about where a page lives is a page
+   * the device can never find and a slot nothing can reclaim.
+   */
+  clio::run::u32 HomeSet(clio::run::u64 pn) const {
+    const clio::run::u64 mixed = (pn ^ (pn >> 29)) * 0x9E3779B97F4A7C15ull;
+    return static_cast<clio::run::u32>((mixed >> 32) % nsets_);
+  }
+
+  /**
+   * Make pages [pg_lo, pg_hi) resident, best effort: ONCE each, in the page's
+   * home set, because the whole grid shares one cache.
+   *
+   * `tables` named how many per-block tables to fill and is ignored -- there
+   * is one cache. Filling a table at a time put each page in as many wrong
+   * sets as there were blocks: invisible to a device lookup, which searches
+   * only the home set, while occupying every slot the real fetch then needed.
+   */
   void Prefetch(clio::run::u64 pg_lo, clio::run::u64 pg_hi, int gpu_id = 0,
                 clio::run::u32 tables = 0) {
 #if CTP_ENABLE_CUDA
+    (void) tables;
     auto it = devs_.find(gpu_id);
     if (it == devs_.end()) return;
-    DevState &st = it->second;
-    const clio::run::u32 ntab = (tables == 0) ? nblocks_ : tables;
     clio::cte::core::Client core(storage_pool_id_);
-    std::vector<char> buf(static_cast<size_t>(page_bytes_));
-    std::vector<Page> tbl(pages_per_block_);
-    for (clio::run::u32 b = 0; b < ntab && b < nblocks_; ++b) {
-      Page *dev = reinterpret_cast<Page *>(st.table_base) +
-                  static_cast<size_t>(b) * pages_per_block_;
-      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(tbl.data()),
-                          reinterpret_cast<const char *>(dev),
-                          static_cast<size_t>(pages_per_block_ * sizeof(Page)));
-      clio::run::u32 slot = 0;
-      for (clio::run::u64 pg = pg_lo; pg < pg_hi; ++pg) {
-        while (slot < pages_per_block_ && tbl[slot].page_num != kNoPage) ++slot;
-        if (slot >= pages_per_block_) break;
-        if (!ReadPage(core, pg, buf.data())) continue;
-        ctp::GpuApi::Memcpy(static_cast<char *>(tbl[slot].data), buf.data(),
-                            static_cast<size_t>(page_bytes_));
-        tbl[slot].page_num = pg;
-        tbl[slot].pins = 0;
-        tbl[slot].flushing = 0;
-        tbl[slot].fetching = 0;
-        tbl[slot].score = kDefaultScore;
-        // A WHOLE page was copied in, so the whole page is valid. Without
-        // this the device sees a resident frame whose valid range is empty
-        // and correctly refuses to read it.
-        tbl[slot].valid_lo = 0;
-        tbl[slot].valid_hi =
-            static_cast<clio::run::u32>(page_bytes_ / sizeof(T));
-        ++slot;
-      }
-      ctp::GpuApi::Memcpy(reinterpret_cast<char *>(dev),
-                          reinterpret_cast<const char *>(tbl.data()),
-                          static_cast<size_t>(pages_per_block_ * sizeof(Page)));
-    }
+    PrefetchShared(it->second, pg_lo, pg_hi, core);
 #else
     (void) pg_lo; (void) pg_hi; (void) gpu_id; (void) tables;
 #endif
@@ -218,7 +217,7 @@ class Vector {
     auto it = devs_.find(gpu_id);
     if (it == devs_.end()) return;
     const clio::run::u64 nslots =
-        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+        static_cast<clio::run::u64>(nsets_) * set_size_;
     std::vector<Page> tbl(static_cast<size_t>(nslots));
     ctp::GpuApi::Memcpy(reinterpret_cast<char *>(tbl.data()),
                         it->second.table_base,
@@ -236,6 +235,15 @@ class Vector {
     ctp::GpuApi::Memcpy(it->second.table_base,
                         reinterpret_cast<const char *>(tbl.data()),
                         static_cast<size_t>(nslots * sizeof(Page)));
+    // AND THE OCCUPANCY COUNTER. It is the shared cache's notion of how full
+    // it is; emptying every frame while leaving the count where it was makes
+    // the cache permanently over budget, so the next allocation evicts on a
+    // cache that is in fact empty.
+    if (it->second.count_base != nullptr) {
+      const unsigned long long zero = 0;
+      ctp::GpuApi::Memcpy(it->second.count_base,
+                          reinterpret_cast<const char *>(&zero), sizeof(zero));
+    }
 #else
     (void) gpu_id;
 #endif
@@ -320,7 +328,7 @@ class Vector {
     auto it = devs_.find(gpu_id);
     if (it == devs_.end()) return {};
     const clio::run::u64 nslots =
-        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+        static_cast<clio::run::u64>(nsets_) * set_size_;
     std::vector<Page> out(static_cast<size_t>(nslots));
     ctp::GpuApi::Memcpy(reinterpret_cast<char *>(out.data()),
                         reinterpret_cast<const char *>(it->second.table_base),
@@ -389,7 +397,7 @@ class Vector {
     DevState st;
     st.gpu_id = gpu_id;
     const clio::run::u64 nslots =
-        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+        static_cast<clio::run::u64>(nsets_) * set_size_;
 
     st.pages_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
@@ -407,14 +415,14 @@ class Vector {
         st.tasks_alloc.IsNull() || st.btbl_alloc.IsNull()) {
       throw std::runtime_error("gpu_vector: device backend allocation failed");
     }
-    if (shared_) {
+    {
       // One lock per set, strided so no two share a cache line, plus the
       // occupancy counter that holds an over-provisioned frame array to the
       // byte budget it was sized from.
       const clio::run::u32 kLockStride = 32;
       st.locks_alloc = ipc->AllocateAndRegisterGpuBackend(
           gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-          static_cast<size_t>(nblocks_) * kLockStride * sizeof(int),
+          static_cast<size_t>(nsets_) * kLockStride * sizeof(int),
           &st.locks_base);
       st.count_alloc = ipc->AllocateAndRegisterGpuBackend(
           gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
@@ -423,7 +431,7 @@ class Vector {
         throw std::runtime_error("gpu_vector: shared-cache allocation failed");
       }
       ctp::GpuApi::Memset(st.locks_base, 0,
-                          static_cast<size_t>(nblocks_) * kLockStride *
+                          static_cast<size_t>(nsets_) * kLockStride *
                               sizeof(int));
       ctp::GpuApi::Memset(st.count_base, 0, sizeof(unsigned long long));
     }
@@ -437,17 +445,19 @@ class Vector {
     st.hdr.elems_per_page_ = page_bytes_ / sizeof(T);
     st.hdr.num_elems_ = num_elems_;
     st.hdr.nblocks_ = nblocks_;
-    st.hdr.pages_per_block_ = pages_per_block_;
-    st.hdr.shared_ = shared_ ? 1u : 0u;
-    st.hdr.set_locks_ =
-        shared_ ? reinterpret_cast<int *>(st.locks_base) : nullptr;
+    st.hdr.nsets_ = nsets_;
+    st.hdr.set_size_ = set_size_;
+    st.hdr.set_locks_ = reinterpret_cast<int *>(st.locks_base);
     st.hdr.cache_frames_ =
-        shared_ ? reinterpret_cast<unsigned long long *>(st.count_base)
-                : nullptr;
-    // Sets are 2x over-provisioned for collisions, so the BYTE budget is half
-    // the frames that exist. Without this the cache grows to the size of the
-    // array rather than the size it was asked for.
-    st.hdr.max_frames_ = shared_ ? (nslots / 2) : nslots;
+        reinterpret_cast<unsigned long long *>(st.count_base);
+    // THE BUDGET IS THE FRAME ARRAY. It used to be half of it, on the theory
+    // that sets are over-provisioned for collisions -- but that made
+    // `pages_per_block` mean half what it says, and every caller that sized a
+    // cache to hold exactly its pages silently got room for half of them
+    // ("four pages, four slots, already resident" faulting on every access).
+    // Collision headroom is a sizing decision, so it belongs to the caller
+    // who picks the slot count, not to a hidden divide-by-two here.
+    st.hdr.max_frames_ = nslots;
     st.hdr.tag_id_ = tag_id_;
     st.hdr.pool_id_ = storage_pool_id_;
     st.hdr.task_alloc_id_ = st.tasks_alloc;
@@ -464,6 +474,65 @@ class Vector {
 
   /** Build the Page[] on the host -- it holds pointers a kernel cannot
    *  compute -- then upload it once. */
+  /**
+   * Prefetch into a SHARED cache: one copy of each page, in its home set.
+   *
+   * Stops at the byte budget rather than at the end of the frame array. The
+   * array is 2x over-provisioned for collisions, so filling it would hand the
+   * device a cache twice the size it was asked for and leave cache_frames_
+   * describing a budget already blown. A page whose home set is full is
+   * simply left out -- residency here is best effort, and the device fault
+   * path will bring it in.
+   */
+  void PrefetchShared(DevState &st, clio::run::u64 pg_lo, clio::run::u64 pg_hi,
+                      clio::cte::core::Client &core) {
+#if CTP_ENABLE_CUDA
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nsets_) * set_size_;
+    std::vector<Page> tbl(static_cast<size_t>(nslots));
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(tbl.data()), st.table_base,
+                        static_cast<size_t>(nslots * sizeof(Page)));
+    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    unsigned long long placed = 0;
+    for (const auto &p : tbl) {
+      if (p.page_num != kNoPage) ++placed;
+    }
+    const unsigned long long budget = nslots;
+    for (clio::run::u64 pg = pg_lo; pg < pg_hi && placed < budget; ++pg) {
+      const size_t base =
+          static_cast<size_t>(HomeSet(pg)) * set_size_;
+      size_t slot = base;
+      const size_t end = base + set_size_;
+      while (slot < end && tbl[slot].page_num != kNoPage) ++slot;
+      if (slot >= end) continue;                 // home set full
+      if (!ReadPage(core, pg, buf.data())) continue;
+      ctp::GpuApi::Memcpy(static_cast<char *>(tbl[slot].data), buf.data(),
+                          static_cast<size_t>(page_bytes_));
+      tbl[slot].page_num = pg;
+      tbl[slot].pins = 0;
+      tbl[slot].flushing = 0;
+      tbl[slot].fetching = 0;
+      tbl[slot].score = kDefaultScore;
+      tbl[slot].valid_lo = 0;
+      tbl[slot].valid_hi = static_cast<clio::run::u32>(page_bytes_ / sizeof(T));
+      ++placed;
+    }
+    ctp::GpuApi::Memcpy(st.table_base,
+                        reinterpret_cast<const char *>(tbl.data()),
+                        static_cast<size_t>(nslots * sizeof(Page)));
+    // The occupancy counter is what holds the over-provisioned array to its
+    // budget. Leaving it at zero after a prefetch tells the device the cache
+    // is empty and lets it grow to the size of the array.
+    if (st.count_base != nullptr) {
+      ctp::GpuApi::Memcpy(st.count_base,
+                          reinterpret_cast<const char *>(&placed),
+                          sizeof(placed));
+    }
+#else
+    (void) st; (void) pg_lo; (void) pg_hi; (void) core;
+#endif
+  }
+
   void InitPageTable(DevState &st, clio::run::u64 nslots) {
     std::vector<Page> tbl(static_cast<size_t>(nslots));
     for (clio::run::u64 i = 0; i < nslots; ++i) {
@@ -588,10 +657,10 @@ class Vector {
   int compress_lib_ = 0;
   int compress_preset_ = 1;
   clio::run::u64 page_bytes_ = 0;
-  clio::run::u32 nblocks_ = 0;
-  clio::run::u32 pages_per_block_ = 0;
+  clio::run::u32 nblocks_ = 0;   // CUDA blocks == task sets
+  clio::run::u32 nsets_ = 0;     // associative sets in the cache
+  clio::run::u32 set_size_ = 0;  // frames per set
   clio::run::u64 num_elems_ = 0;
-  bool shared_ = false;
   clio::cte::core::TagId tag_id_;
   std::map<int, DevState> devs_;
 };

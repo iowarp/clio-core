@@ -113,6 +113,8 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
     }
     // Collective: name the page just written.
     co_await v.BeginFlush(0, base + off, n);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(base + off, n);
   }
   // Collect every flush started above: only explicit flushes write data back
   // now (drops refuse dirty pages), so a seeded page left in flight or left
@@ -174,7 +176,9 @@ __device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
     // was measured to be actively WRONG: the page IS re-read on the next
     // Lloyd pass, and the frequency policy was retaining ~10% of them across
     // passes. Releasing guaranteed a 0% hit rate and cost ~6% in rescore
-    // traffic on top.
+    // traffic on top. The unpin below is NOT that hint -- it gives back the
+    // fetch's reservation and leaves the page resident.
+    v.UnpinRange(base + off, n);
   }
 }
 
@@ -453,7 +457,12 @@ int main(int argc, char **argv) {
               (unsigned long long)npoints, (unsigned long long)hbm_mb,
               hbm_only ? " (HBM ONLY)" : "");
 
-  gv::Vector<float> vec("gv_kmeans", {0}, page_bytes, blocks, slots, n);
+  // ASSOCIATIVITY, NOT FULL ASSOCIATIVITY. A lookup scans its set, so one
+  // giant set costs O(frames) per probe -- kmeans went 4.7 s -> 42 s as a
+  // 512-way cache. Keep a set per block and floor the width at 8, which is
+  // what covers several blocks colliding on one set.
+  gv::Vector<float> vec("gv_kmeans", {0}, page_bytes, blocks,
+                        slots < 16u ? 16u : slots, n);
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
   YieldRunner runner(blocks, threads);

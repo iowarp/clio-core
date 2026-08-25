@@ -123,6 +123,12 @@ __device__ gy::YCoroMain WarmCoro(gv::DeviceVector<u32> v, u64 iters,
       co_await v.BeginFlush(0, off + b, cnt);
     }
     co_await v.EndFlush();
+    // Give back one pin per page fetched above, after the region's flush:
+    // an unpin before the writeback would let a frame be evicted with the
+    // writes still only in it, and eviction performs no I/O.
+    for (u64 pg = 0; pg < pages_per_region; ++pg) {
+      v.UnpinRange(off + pg * v.ElemsPerPage(), v.ElemsPerPage());
+    }
   }
 }
 
@@ -194,6 +200,9 @@ __device__ gy::YCoroMain SpinWriteFlushCoro(gv::DeviceVector<u32> v, u64 iters,
         }
       }
       const long long w2 = clock64();
+      for (u64 pg = 0; pg < pages_per_region; ++pg) {
+        v.UnpinRange(off + pg * v.ElemsPerPage(), v.ElemsPerPage());
+      }
       if (threadIdx.x == 0) {
         atomicAdd(&g_round_cyc[4], (unsigned long long) (w1 - w0));
         atomicAdd(&g_round_cyc[5], (unsigned long long) (w2 - w1));
@@ -314,6 +323,7 @@ __device__ gy::YCoroMain SpinReadPrefetchCoro(gv::DeviceVector<u32> v,
       acc += local;
       if (wrong) atomicAdd(bad, wrong);
       __syncthreads();
+      v.UnpinRange(poff, v.ElemsPerPage());
       // Consumed: lowest score makes it the next victim, freeing a slot for
       // the prefetch that follows.
       if (async && threadIdx.x == 0) {
@@ -411,7 +421,8 @@ __global__ void DumpSlotsKernel(gv::DeviceVector<u32> v,
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   // Block 0's slice sits at the front of the shared page table.
   const gv::Page *tbl = v.TableForDebug();
-  for (clio::run::u32 i = 0; i < v.PagesPerTable(); ++i) {
+  // The whole cache: one frame array, not a per-block share of one.
+  for (clio::run::u64 i = 0; i < v.NumFrames(); ++i) {
     out[2 * i] = tbl[i].page_num;
     out[2 * i + 1] =
         (tbl[i].page_num == gv::kNoPage || tbl[i].data == nullptr)

@@ -213,12 +213,15 @@ __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
     co_await v.Fetch(0, v.PageLo(lo + i), v.PageSpan(lo + i, 1));
     auto h = co_await v.HoldPage(lo + i, n - i);
     for (clio::run::u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      // Read-only sweep: the hold stays write=false, so every page is dropped
-      // clean and nothing is written back. THE HOLD IS THE PIN, so eviction
-      // cannot re-tenant the slot under a lane that is still reading.
+      // Read-only sweep: the hold stays write=false, so every page is
+      // dropped clean and nothing is written back. THE FETCH IS THE PIN, and
+      // it holds until UnpinRange below, so eviction cannot re-tenant the
+      // frame under a lane that is still reading.
       scratch[i + k] = h[lo + i + k];
     }
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(lo + i), v.PageSpan(lo + i, 1));
+    i += run;
   }
 }
 

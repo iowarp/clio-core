@@ -101,6 +101,8 @@ __device__ gy::YCoroMain RaceSeedCoro(gv::DeviceVector<clio::run::u32> v,
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   co_await v.EndFlush();
@@ -158,10 +160,11 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
     co_await v.Fetch(0, v.PageLo(pn * kPageElems), v.PageSpan(pn * kPageElems, 1));
     auto h = co_await v.HoldPage(pn * kPageElems, kPageElems);
     if (threadIdx.x == 0 && h.run() != 0) {
-      // The GUARD is the pin: while `h` is alive this frame cannot be
-      // evicted, so a raw read through it is valid by construction. The old
-      // seqlock (TryHoldRawConstG + HoldStillValid) existed because a raw
-      // pointer could be taken WITHOUT a pin; that hazard no longer exists.
+      // THE FETCH is the pin, and it is still held here (UnpinRange comes
+      // after this scope), so the frame cannot be evicted and a raw read
+      // through it is valid by construction. The old seqlock
+      // (TryHoldRawConstG + HoldStillValid) existed because a raw pointer
+      // could be taken WITHOUT a pin; that hazard no longer exists.
       const clio::run::u32 *q = h.ptr();
       const clio::run::u64 run = h.run();
       if (q != nullptr && run != 0) {
@@ -186,7 +189,8 @@ __device__ gy::YCoroMain RaceStressCoro(gv::DeviceVector<clio::run::u32> v,
       }
     }
     __syncthreads();
-  }  // each iteration's guard died at its scope end: no pin outlives its turn
+    v.UnpinRange(v.PageLo(pn * kPageElems), v.PageSpan(pn * kPageElems, 1));
+  }  // the fetch's pin goes back each iteration: none outlives its turn
 }
 
 __global__ void RaceStressKernel(clio::run::IpcManagerGpuInfo info,

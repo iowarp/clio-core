@@ -99,6 +99,9 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<clio::run::u32> v,
     // dirty. Async, so the write overlaps the next page's compute; the
     // servicer retires it once it lands.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser. Safe after BeginFlush:
+    // a frame with a flush in flight is not an eviction candidate.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   co_await v.EndFlush();
@@ -151,6 +154,7 @@ __device__ gy::YCoroMain GrayScottCoro(gv::DeviceVector<clio::run::u32> v,
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
     co_await v.BeginFlush(0, base + off, run);
+    v.UnpinRange(v.PageLo(base + off), v.PageSpan(base + off, 1));
     off += run;
   }
   co_await v.EndFlush();
@@ -193,7 +197,9 @@ __device__ gy::YCoroMain WeightsCoro(gv::DeviceVector<clio::run::u32> v,
       acc += h[base + off + k];
     }
     atomicAdd(sum, acc);
-    off += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(base + off), v.PageSpan(base + off, 1));
+    off += run;
   }
 }
 
@@ -284,8 +290,13 @@ TEST_CASE("gpu_vector: Gray Scott and weight streaming across configurations",
     const clio::run::u64 n = per * c.nblocks;
     const std::string tag = std::string("gv_wl_") + c.name;
 
+    // Same total frames, ONE fully-associative set: `pages_per_block` was a
+    // per-block table size, and as a per-SET size it would let three blocks
+    // collide on two frames.
     gv::Vector<clio::run::u32> vec(tag, {0}, kPageBytes, c.nblocks,
-                                   c.pages_per_block, n);
+                                   c.pages_per_block * c.nblocks, n,
+                                   clio::run::PoolId::GetNull(), 0, 1,
+                                   /*nsets=*/1);
     vec.EnableStats();
     auto dev = vec.GetDevice(0);
 

@@ -147,6 +147,8 @@ __device__ gy::YCoroMain StreamWriteCoro(gv::DeviceVector<u32> v,
     // of page k+1; the claim path settles finished flushes when it needs a
     // slot, and the AwaitFlush at the end collects the stragglers.
     co_await v.BeginFlush(0, off, pe);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(off, pe);
   }
   // The explicit flush is what persists the data: drops refuse dirty pages
   // and nothing writes back on eviction, so every written page must have been
@@ -198,6 +200,7 @@ __device__ gy::YCoroMain StreamReadCoro(gv::DeviceVector<u32> v,
              PosWeight(off + i);
     }
     __syncthreads();
+    v.UnpinRange(v.PageLo(off), pe * win);
   }
   atomicAdd(sum, acc);
 }
@@ -251,6 +254,8 @@ __device__ gy::YCoroMain StreamReadBatchedCoro(gv::DeviceVector<u32> v,
       }
       __syncthreads();
     }
+    // One unpin for the one batched fetch that covered the whole chunk.
+    v.UnpinRange(v.PageLo(c0 * pe), pe * n);
   }
   atomicAdd(sum, acc);
 }
@@ -586,8 +591,10 @@ int main(int argc, char **argv) {
   {
     const auto st = vec.ReadStats(0);
     std::fprintf(stderr,
-                 "GVSTAT faults=%llu puts=%llu evicts=%llu prefetch=%llu "
-                 "get_errors=%llu\n",
+                 // FOUR fields, four arguments. There used to be five of the
+                 // former and four of the latter, so get_errors printed
+                 // whatever followed on the stack (4648950312181170176).
+                 "GVSTAT faults=%llu puts=%llu evicts=%llu get_errors=%llu\n",
                  (unsigned long long) st.faults, (unsigned long long) st.puts,
                  (unsigned long long) st.evicts,
                  (unsigned long long) st.get_errors);

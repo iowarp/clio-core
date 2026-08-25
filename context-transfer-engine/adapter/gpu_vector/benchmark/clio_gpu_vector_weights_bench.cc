@@ -210,6 +210,8 @@ __device__ gy::YCoroMain SeedLaneCoro(gv::DeviceVector<clio::run::u32> v,
     // writeback to the end dirties the whole table and the next fetch has
     // nowhere to land. Ranged, so this sends only what was just written.
     co_await v.BeginFlush(0, base + off, n);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(base + off, n);
   }
   co_await v.EndFlush();
 }
@@ -264,6 +266,7 @@ __device__ gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<clio::run::u32> v,
     if (threadIdx.x == 0) {
       atomicAdd(&page_visits[(base + off) / page_elems], 1u);
     }
+    v.UnpinRange(base + off, n);
   }
   atomicAdd(sum, acc);
 }
@@ -446,8 +449,12 @@ int main(int argc, char **argv) {
       std::to_string(blocks) + "_" + std::to_string(hbm_mb) + "_" +
       std::to_string(pages_per_block);
 
-  gv::Vector<clio::run::u32> vec(tag, {0}, page_bytes, blocks, slots, n,
-                                 kCompressorPool,
+  // ASSOCIATIVITY, NOT FULL ASSOCIATIVITY. A lookup scans its set, so one
+  // giant set costs O(frames) per probe -- kmeans went 4.7 s -> 42 s as a
+  // 512-way cache. Keep a set per block and floor the width at 8, which is
+  // what covers several blocks colliding on one set.
+  gv::Vector<clio::run::u32> vec(tag, {0}, page_bytes, blocks,
+                                 slots < 8u ? 8u : slots, n, kCompressorPool,
                                  compressed ? (gpu_codec ? kNvcompLz4WireId
                                                         : kLz4WireId)
                                             : 0);
@@ -480,14 +487,18 @@ int main(int argc, char **argv) {
                          seed_checks, sdrv.NumPending(), b,
                          (unsigned) sdrv.BlockState(b).status_,
                          (unsigned long long) sdrv.BlockState(b).wait_tag_);
-            // Dump block 0's page table: which slots are wedged, and how.
+            // Dump the SET this block's id maps to. There is one cache, so
+            // "block b's page table" no longer exists; set b is the nearest
+            // equivalent and is what the old index meant in practice.
             gv::DeviceVector<clio::run::u32> dv = vec.GetDevice(0);
             gv::VecHeader hh;
             ctp::GpuApi::Memcpy(&hh, dv.HeaderForDebug(), sizeof(hh));
-            std::vector<gv::Page> pg(hh.pages_per_block_);
-            ctp::GpuApi::Memcpy(pg.data(), hh.pages_ + (size_t)b * hh.pages_per_block_,
+            const clio::run::u32 set = b % hh.nsets_;
+            std::vector<gv::Page> pg(hh.set_size_);
+            ctp::GpuApi::Memcpy(pg.data(),
+                       hh.pages_ + (size_t)set * hh.set_size_,
                        pg.size() * sizeof(gv::Page));
-            for (clio::run::u32 i = 0; i < hh.pages_per_block_; ++i) {
+            for (clio::run::u32 i = 0; i < hh.set_size_; ++i) {
               if (pg[i].page_num == gv::kNoPage && !pg[i].fetching &&
                   !pg[i].flushing) continue;
               std::fprintf(stderr,

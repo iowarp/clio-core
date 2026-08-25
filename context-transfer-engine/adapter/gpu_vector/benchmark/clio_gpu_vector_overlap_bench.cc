@@ -90,6 +90,8 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<u32> v, u64 per,
     // fail -- a dirty frame is not evictable, so the region cannot exceed
     // the cache without flushing first.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   co_await v.EndFlush();
@@ -141,22 +143,37 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
 
   const u64 pe = v.ElemsPerPage();
   (void) first_page;
-  // PRIME: page 0 must be resident before the loop, because the loop body
-  // issues the fetch for page p+1 and then computes on p.
-  co_await v.Fetch(0, v.PageLo(base), pe);
+  // WINDOWS DO NOT OVERLAP, and that is a pin-accounting requirement rather
+  // than a taste. A sliding window starting at every p pins each page `depth`
+  // times and consumes it once, so it can never balance; and releasing a
+  // window at the end of the iteration that FETCHED it leaves the pages
+  // unpinned for the iterations that actually read them, which is how page
+  // 252 came back "not resident, fetching=7" with the frame already
+  // reclaimed. One window in flight, released once its last page is consumed.
+  const u64 win = (depth > 0) ? depth : 1;
+  // PRIME: the first window must be resident before the loop, because the
+  // loop body issues the fetch for the NEXT window and computes on this one.
+  if (prefetch) {
+    u64 w0 = win;
+    if (w0 > pages) w0 = pages;
+    co_await v.Fetch(0, v.PageLo(base), pe * w0);
+  }
 
   for (u64 p = 0; p < pages; ++p) {
     const u64 off = base + p * pe;
-    if (prefetch && p + 1 < pages) {
-      // THE OVERLAP: submit the next window and do NOT await it. The page
-      // being computed on is already resident, so this transfer is in flight
-      // for the whole compute below. `depth` pages per window because one
-      // page of lookahead cannot cover a fault round trip unless a page's
-      // compute exceeds it.
-      u64 win = (depth > 0) ? depth : 1;
-      if (p + 1 + win > pages) win = pages - (p + 1);
-      co_await v.BeginFetch(0, v.PageLo(base + (p + 1) * pe), pe * win);
-    } else if (!prefetch) {
+    if (prefetch) {
+      // THE OVERLAP: at the head of each window, submit the NEXT one and do
+      // not await it. This window is already resident, so that transfer is in
+      // flight for the whole compute below.
+      if (p % win == 0) {
+        const u64 nxt = p + win;
+        if (nxt < pages) {
+          u64 w = win;
+          if (nxt + w > pages) w = pages - nxt;
+          co_await v.BeginFetch(0, v.PageLo(base + nxt * pe), pe * w);
+        }
+      }
+    } else {
       // No lookahead: pay the fault right here, which is the baseline this
       // case is measured against.
       co_await v.Fetch(0, v.PageLo(off), pe);
@@ -180,6 +197,21 @@ __device__ gy::YCoroMain SumComputeCoro(gv::DeviceVector<u32> v, u64 per,
                                   static_cast<float>(local & 0xff)) *
         1.0e-9f);
     __syncthreads();
+    // ONE UNPIN PER FETCH, SAME SHAPE. The prefetch arm pins a whole window
+    // per iteration and the baseline arm pins one page, so the release
+    // mirrors whichever ran. Windows overlap, so a page in two windows is
+    // pinned twice and released twice -- the counts balance, which is what
+    // the cache cares about.
+    if (prefetch) {
+      // Release a window once its LAST page has been consumed, never before:
+      // the pin is what keeps the lookahead alive until it is read.
+      if ((p + 1) % win == 0 || p + 1 == pages) {
+        const u64 w0 = p - (p % win);
+        v.UnpinRange(v.PageLo(base + w0 * pe), pe * (p - w0 + 1));
+      }
+    } else {
+      v.UnpinRange(v.PageLo(off), pe);
+    }
   }
   atomicAdd(total, acc);
 }
@@ -355,7 +387,11 @@ int main(int argc, char **argv) {
       a.blocks, (unsigned long long) a.pages_per_block, slots, a.oversub, a.depth,
       (unsigned long long) (kPageBytes / 1024), data_mb, cache_mb);
 
-  gv::Vector<u32> vec("gv_overlap", {0}, kPageBytes, a.blocks, slots, n);
+  // A SET PER BLOCK, floored wide enough for the lookahead. One giant set
+  // would be correct but costs O(frames) per probe -- as a 128-way cache the
+  // serial arm measured 47.3 ms against 39.5 ms for per-block tables.
+  gv::Vector<u32> vec("gv_overlap", {0}, kPageBytes, a.blocks,
+                      slots < 16u ? 16u : slots, n);
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
 
@@ -446,7 +482,7 @@ int main(int argc, char **argv) {
   u32 compute_iters = a.compute_iters ? a.compute_iters : 20000u;
   {
     gv::Vector<u32> hot("gv_overlap_hot", {0}, kPageBytes, a.blocks,
-                        static_cast<u32>(a.pages_per_block), n);
+                         static_cast<u32>(a.pages_per_block), n);
     auto hotdev = hot.GetDevice(0);
     RunYieldable(a.blocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                gy::YieldStackView sv) {

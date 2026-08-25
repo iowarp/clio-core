@@ -182,6 +182,8 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
       }
       // Collective: name the plane just written.
       co_await vec.BeginFlush(0, ubase + z * plane, plane);
+      // Fetch is the pinner; UnpinRange is the releaser, after the flush.
+      vec.UnpinRange(ubase + z * plane, plane);
     }
     {
       co_await vec.Fetch(0, vbase + z * plane, plane);
@@ -191,6 +193,7 @@ __device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
       }
       // Collective: name the plane just written.
       co_await vec.BeginFlush(0, vbase + z * plane, plane);
+      vec.UnpinRange(vbase + z * plane, plane);
     }
   }
   // The first step reads planes seeded by OTHER blocks, so the seed must be
@@ -289,6 +292,18 @@ __device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
     // once it settles).
     co_await vec.BeginFlush(0, unext + z * plane, plane);
     co_await vec.BeginFlush(0, vnext + z * plane, plane);
+    // ONE UNPIN PER FETCH, all eight planes of this step. The sliding window
+    // is expressed by re-fetching z and z+1 next iteration, not by holding
+    // their pins across it: a pin held across the step would accumulate one
+    // per plane per z and fill the set.
+    vec.UnpinRange(ubase + zm * plane, plane);
+    vec.UnpinRange(ubase + z * plane, plane);
+    vec.UnpinRange(ubase + zp * plane, plane);
+    vec.UnpinRange(vbase + zm * plane, plane);
+    vec.UnpinRange(vbase + z * plane, plane);
+    vec.UnpinRange(vbase + zp * plane, plane);
+    vec.UnpinRange(unext + z * plane, plane);
+    vec.UnpinRange(vnext + z * plane, plane);
     if (interior) {
       // Plane z-1 leaves the sliding window for good: empty the guard so the
       // drop can take it. (zm == z when not interior, so releasing it there
@@ -365,6 +380,7 @@ __device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
     }
     atomicAdd(out, acc);
     __syncthreads();
+    vec.UnpinRange(vbase + z * plane, plane);
   }
 }
 
@@ -592,7 +608,14 @@ int main(int argc, char **argv) {
               (unsigned long long)hbm_mb, hbm_only ? " (HBM ONLY)" : "",
               steps, Du, Dv, F, K, dt);
 
-  gv::Vector<float> vec("gv_grayscott", {0}, page_bytes, blocks, slots, n);
+  // ASSOCIATIVITY, NOT FULL ASSOCIATIVITY. A lookup scans its set, so one
+  // giant set costs O(frames) per probe -- kmeans went 4.7 s -> 42 s as a
+  // 512-way cache. Keep a set per block and floor the width at 8, which is
+  // what covers several blocks colliding on one set.
+  // This kernel holds eight planes per step per block, so the set must be
+  // wide enough for several blocks' worth of those.
+  gv::Vector<float> vec("gv_grayscott", {0}, page_bytes, blocks,
+                        slots < 24u ? 24u : slots, n);
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
   YieldRunner runner(blocks, threads);

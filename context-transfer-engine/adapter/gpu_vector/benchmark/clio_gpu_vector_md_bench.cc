@@ -231,7 +231,6 @@ struct Args {
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
-  int shared_x = 0;        // x in ONE shared associative cache, not per block
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
   // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
@@ -522,6 +521,13 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
       op[2] = fz;
     }
     __syncthreads();
+    // GIVE THE PINS BACK. In shared mode Fetch is the pinner and UnpinRange
+    // the releaser, one unpin per fetch over the same range; a range fetched
+    // and never released is a frame no block can reclaim. A no-op under
+    // private tables, where the guards above own their pins -- which is what
+    // lets this one kernel run unmodified under both modes.
+    for (int q = 0; q < 9; ++q) x.UnpinRange(rbase[q], row_elems);
+    f.UnpinRange(fbase, row_elems);
   }  // guards die per row
 
   if (eflag) {
@@ -809,6 +815,19 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     // needed ~64 frames purely to keep every dirty row. The pass only ever
     // reads one row at a time, so with the flush the cache can be tiny.
     co_await nl.BeginFlush(0, row * rowlist, rowlist);
+    // Safe after BeginFlush and not before the writes: a frame with a flush
+    // in flight is not an eviction candidate, so the row's bytes cannot be
+    // dropped between the submit and the wait.
+    //
+    // RECOMPUTED FROM gstart, NOT STORED. Two more u64 arrays here overflow
+    // the coroutine frame (2144 > 2048) -- and they were redundant: gstart
+    // already records the offset each fetch was issued at, and nothing
+    // between the fetch and here suspends, so the arithmetic costs
+    // registers rather than frame.
+    for (u32 gq = 0; gq < nguards; ++gq) {
+      const u64 fo = row * rowlist + gstart[gq];
+      nl.UnpinRange(nl.PageLo(fo), nl.PageSpan(fo, 1));
+    }
     }   // per-row loop
     // Inside the guard scope: sxrb/nspans live here, and the pins must go
     // back before the next chunk fetches its own spans.
@@ -1126,6 +1145,15 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       // once, after the row loop.
       atomicAdd(&g_md_cyc[5], 1ull);
     }
+    // The row's own pins go back here; the chunk's x spans go back below.
+    // f is written and never flushed by design -- the next kernel reads it
+    // out of the cache -- so this releases the pin, not the page.
+    // Recomputed from gstart; see the note in the build pass.
+    for (u32 gq = 0; gq < nguards; ++gq) {
+      const u64 fo = row * rowlist + gstart[gq];
+      nl.UnpinRange(nl.PageLo(fo), nl.PageSpan(fo, 1));
+    }
+    f.UnpinRange(fbase, row_elems);
     }   // per-row loop
     // The chunk total, taken ONCE. See the note at g_md_cyc[5].
     if (threadIdx.x == 0) {
@@ -1219,6 +1247,7 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
     // into the box; the gather then reads these rows from other blocks.
     const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
     if (g_publish) co_await x.BeginFlush(0, pg * epp, cnt);
+    x.UnpinRange(pg * epp, epp);
   }
   co_await x.EndFlush();
 }
@@ -1388,6 +1417,50 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     if (g_publish) {
       co_await dst.Flush(0, row * row_elems, row_elems);
     }
+    // One unpin per fetch, in the same shape the fetches were issued: the
+    // stencil spans of src and srcx (the same vector on the position pass,
+    // so it was pinned twice and is released twice), the second srcx page
+    // when a span straddles, then this row of dst.
+    //
+    // THE SPAN GEOMETRY IS RECOMPUTED, NOT REMEMBERED. Carrying (rb, len)
+    // for six spans costs 96 bytes of coroutine frame, which is exactly what
+    // overflowed it (2144 > 2048). This loop suspends nowhere, so the same
+    // arithmetic lives in registers instead. It must walk dz and t in the
+    // ORIGINAL ORDER, because that order is what defined the span index.
+    {
+      u32 sq = 0;
+      for (int dz = -1; dz <= 1; ++dz) {
+        const u32 wz = (bz + nb + dz) % nb;
+        const int lo = static_cast<int>(by) - 1;
+        const int hi = static_cast<int>(by) + 1;
+        u32 rl[2], rn[2], nr = 0;
+        if (lo < 0) {
+          rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+        } else if (hi > static_cast<int>(nb) - 1) {
+          rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo);
+          ++nr;
+          rl[nr] = 0; rn[nr] = 1u; ++nr;
+        } else {
+          rl[nr] = static_cast<u32>(lo); rn[nr] = 3u; ++nr;
+        }
+        for (u32 t = 0; t < nr && sq < nspans; ++t, ++sq) {
+          const u64 rb = (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
+          const u64 len = static_cast<u64>(rn[t]) * row_elems;
+          src.UnpinRange(src.PageLo(rb), src.PageSpan(rb, len));
+          srcx.UnpinRange(srcx.PageLo(rb), srcx.PageSpan(rb, len));
+          if (xrun[sq] < len) {
+            srcx.UnpinRange(srcx.PageLo(rb + xrun[sq]),
+                            srcx.PageSpan(rb + xrun[sq], 1));
+          }
+        }
+      }
+    }
+    dst.UnpinRange(row * row_elems, row_elems);
+    if (drun < row_elems) {
+      dst.UnpinRange(dst.PageLo(row * row_elems + drun),
+                     dst.PageSpan(row * row_elems + drun, 1));
+    }
     }   // guards dead here
     if (false) {
     }
@@ -1408,6 +1481,7 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst,
       p[s * kStride + 3] = -1.0f;
     }
     __syncthreads();
+    dst.UnpinRange(pg * epp, epp);
   }
 }
 
@@ -1448,6 +1522,9 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
       }
     }
     __syncthreads();
+    x.UnpinRange(pg * epp, epp);
+    v.UnpinRange(pg * epp, epp);
+    f.UnpinRange(pg * epp, epp);
   }
 }
 
@@ -1468,7 +1545,7 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
   // converted to an actual slot index instead of being guessed at from raw
   // addresses (which are only comparable within one process).
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    g_read_geom[1] = x.PagesPerTable();
+    g_read_geom[1] = x.SetSize();
     g_read_geom[2] = x.PageBytes();
     g_read_geom[3] = epp;
   }
@@ -1508,6 +1585,7 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
         }
       }
       __syncthreads();
+      x.UnpinRange(pg * epp, epp);
     }
   }
 }
@@ -1580,6 +1658,9 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
       co_await x.BeginFlush(0, pg * epp, cnt);
       co_await v.BeginFlush(0, pg * epp, cnt);
     }
+    x.UnpinRange(pg * epp, epp);
+    v.UnpinRange(pg * epp, epp);
+    if (use_third) third.UnpinRange(pg * epp, epp);
   }
   // Land them before the kernel exits: the next kernel reads these pages
   // from other blocks, so they must be in the backing store by then.
@@ -1614,6 +1695,8 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
       mx += vx; my += vy; mz += vz;
     }
     __syncthreads();
+    x.UnpinRange(pg * epp, epp);
+    v.UnpinRange(pg * epp, epp);
   }
   // Tree-reduce the four sums through shared, one at a time.
   const double vals[4] = {ke, mx, my, mz};
@@ -2014,6 +2097,31 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
   return true;
 }
 
+/**
+ * Frames per SET for a shared cache that holds a whole vector.
+ *
+ * Shared mode changes what a cache costs. Private residency is
+ * blocks * (pages+2) frames -- the same page stored once per CUDA block --
+ * so it scales with the launch and residency stops being affordable long
+ * before the vector is large. Shared residency is (pages+2) frames TOTAL,
+ * independent of the block count, so sizing for residency is the default
+ * here rather than the thing a budget has to be talked out of.
+ *
+ * Two multipliers on top of that:
+ *  - 2x for collisions. A hash cache needs somewhere for a colliding page to
+ *    go, and every slot owns its page storage, so asking for room for 2x the
+ *    pages is what makes residency actually reachable. The vector spends
+ *    exactly what it is given -- there is no hidden halving -- so this 2x is
+ *    the real cost and the accounting below prints it.
+ *  - a floor of 4. With more sets than pages the formula yields ONE frame per
+ *    set, which is a direct map with no room for a collision, and the first
+ *    two pages that hash together wedge. Associativity is not optional.
+ */
+static u32 SharedSlots(clio::run::u64 pages, u32 nsets) {
+  const clio::run::u64 want = (2ull * (pages + 2) + nsets - 1) / nsets;
+  return static_cast<u32>(want < 4 ? 4 : want);
+}
+
 static u32 NlSlots(clio::run::u64 nl_pages) {
   // MEASURED, not derived. kMaxNlGuards (4) and rowchunk (4) describe what a
   // single row pins, but the force pass keeps far more of the list live than
@@ -2069,7 +2177,6 @@ int main(int argc, char **argv) {
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
-    else if (std::strcmp(argv[i], "--shared-x") == 0) a.shared_x = 1;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
@@ -2147,7 +2254,16 @@ int main(int argc, char **argv) {
   // "CUDA Error 2: out of memory" with nothing having checked. Residency is
   // still the default WHEN IT FITS; when it does not, plan within what the
   // device actually has rather than asking for what it does not.
-  if (a.vram_mb == 0 && a.slots == 0) {
+  // PlanCaches divides a budget across per-BLOCK caches, and there are none:
+  // a cache is global now, so its arithmetic would size every cache
+  // blocks-times too small. Say so rather than quietly mean something else.
+  if (a.vram_mb != 0) {
+    std::fprintf(stderr,
+                 "--vram-mb divided a budget across per-block caches, which no "
+                 "longer exist. One cache per vector, sized for residency.\n");
+    return 1;
+  }
+  if (false) {
     size_t dev_free = 0, dev_total = 0;
     if (cudaMemGetInfo(&dev_free, &dev_total) == cudaSuccess) {
       const NlGeom nlg0 =
@@ -2324,41 +2440,57 @@ int main(int argc, char **argv) {
   // Row geometry, so a flush can name exactly the rows a block owns.
   const u64 md_row_elems = static_cast<u64>(g.nb) * g.cap * kStride;
   const u64 md_nrows = static_cast<u64>(g.nb) * g.nb;
-  // SHARED x: one associative cache for the whole grid instead of one table
-  // per CUDA block. Sized to hold the WHOLE vector -- sets are 2x
-  // over-provisioned so the byte budget is half the frames, and x is the
-  // vector every block reads (100% shared, mean degree 8.22), so the point is
-  // for it never to evict at all.
-  const u32 x_sets = tbl_blocks;
-  // A SET OF ONE IS A DIRECT MAP WITH NO ROOM FOR A COLLISION, and with more
-  // sets than pages that is exactly what the formula produces (64 sets, 11
-  // pages -> 1 frame per set), so the first two pages that hash together
-  // wedge. Floor it: associativity is what makes a hash cache work at all.
-  u32 x_slots = slots;
-  if (a.shared_x) {
-    const u64 want = (2ull * (npages + 2) + x_sets - 1) / x_sets;
-    x_slots = static_cast<u32>(want < 4 ? 4 : want);
-  }
+  // SHARED MODE: `nblocks` is a count of associative SETS rather than of
+  // per-block tables, and every vector below is sized by SharedSlots for its
+  // own page count. The per-vector knobs (--slots/--vslots/--fslots/...) are
+  // private-mode sizing and do not apply; shared mode holds each vector.
+  const u32 nsets = tbl_blocks;
+  // Running total of what the caches cost, so the two modes can be compared
+  // as one number rather than six. Paired with a MEASURED free-VRAM delta:
+  // the frame arrays are what this arithmetic covers, and the page tables,
+  // task slots and staging buffers are what it does not, so a run reports
+  // both and the gap between them is visible rather than assumed.
+  u64 cache_frames_total = 0, cache_bytes_total = 0;
+  size_t vram_free_before = 0, vram_total_dev = 0;
+  cudaMemGetInfo(&vram_free_before, &vram_total_dev);
+  auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages) {
+    const u64 frames = static_cast<u64>(nsets) * nslot;
+    const u64 bytes = frames * pgb;
+    cache_frames_total += frames;
+    cache_bytes_total += bytes;
+    std::printf("  %-5s %u sets x %u = %llu frames (%.1f MB) for %llu pages\n",
+                what, nsets, nslot, (unsigned long long)frames,
+                (double)bytes / 1048576.0, (unsigned long long)vec_pages);
+  };
+  bool cache_reported = false;
+  auto report_caches = [&]() {
+    if (cache_reported) return;
+    cache_reported = true;
+    size_t fnow = 0, tnow = 0;
+    cudaMemGetInfo(&fnow, &tnow);
+    const double used_mb =
+        (vram_free_before > fnow)
+            ? (double)(vram_free_before - fnow) / 1048576.0
+            : 0.0;
+    std::printf("  CACHE TOTAL: %llu frames, %.1f MB of frame arrays; "
+                "device VRAM consumed by the vectors %.1f MB "
+                "(free %.0f -> %.0f MB of %.0f)\n",
+                (unsigned long long)cache_frames_total,
+                (double)cache_bytes_total / 1048576.0, used_mb,
+                (double)vram_free_before / 1048576.0, (double)fnow / 1048576.0,
+                (double)vram_total_dev / 1048576.0);
+  };
+  const u32 x_slots = SharedSlots(npages, nsets);
   gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, x_slots,
-                       g.nelems, clio::run::PoolId::GetNull(), 0, 1,
-                       a.shared_x != 0);
-  if (a.shared_x) {
-    std::printf("  SHARED x: %u sets x %u frames = %llu frames for %llu pages "
-                "(budget %llu frames, %.1f MB) -- one copy for the whole "
-                "grid\n",
-                x_sets, x_slots,
-                (unsigned long long)((u64)x_sets * x_slots),
-                (unsigned long long)npages,
-                (unsigned long long)((u64)x_sets * x_slots / 2),
-                (double)((u64)x_sets * x_slots / 2) * page_bytes / 1048576.0);
-  }
+                       g.nelems);
+  account("x", x_slots, page_bytes, npages);
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
-  const u32 vslots =
-      AtLeastSlots((a.vslots != 0) ? a.vslots : slots, kMinSlotsX, "v");
+  const u32 vslots = SharedSlots(npages, nsets);
   gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, vslots,
                        g.nelems);
+  account("v", vslots, page_bytes, npages);
   vx.EnableStats();
   vv.EnableStats();
   vx.Preload(hx.data(), g.nelems);
@@ -2372,16 +2504,22 @@ int main(int argc, char **argv) {
 
   // MD_THIRD=1 gives the ballistic path a third, read-only paged vector.
   const int use_third = std::getenv("MD_THIRD") != nullptr ? 1 : 0;
+  const u32 third_slots = use_third ? SharedSlots(npages, nsets) : 1u;
   gv::Vector<float> vthird("md_third", {0}, page_bytes, tbl_blocks,
-                           use_third ? slots : 1u,
-                           use_third ? g.nelems : page_elems);
+                           third_slots,
+                           use_third ? g.nelems : page_elems,
+                           clio::run::PoolId::GetNull(), 0, 1);
   if (use_third) {
+    account("third", third_slots, page_bytes, npages);
     std::vector<float> hz(g.nelems, 0.0f);
     vthird.Preload(hz.data(), g.nelems);
     vthird.ClearCache();
     vthird.Prefetch(0, npages, 0, tbl_blocks);
   }
   auto dthird = vthird.GetDevice(0);
+  // The ballistic and probe paths own every vector they will ever build; the
+  // MD path reports after the list, which is the last of its six.
+  if (!a.md) report_caches();
 
   double *d_thermo = ctp::GpuApi::Malloc<double>(4 * sizeof(double));
 
@@ -2512,10 +2650,10 @@ int main(int argc, char **argv) {
     // f gets its own cache size: the ballistic gate integrates a CONSTANT
     // acceleration, so it never exercises READING f under paging, and that
     // is the one path the resident gates cannot cover.
-    const u32 fslots =
-        AtLeastSlots((a.fslots != 0) ? a.fslots : slots, kMinSlotsF, "f");
+    const u32 fslots = SharedSlots(npages, nsets);
     gv::Vector<float> vf("md_f", {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems);
+    account("f", fslots, page_bytes, npages);
     vf.EnableStats();
     {
       std::vector<float> hz(g.nelems, 0.0f);
@@ -2528,12 +2666,13 @@ int main(int argc, char **argv) {
     // these, then the handles swap). Same geometry, resident.
     // The resort's destinations get their own cache size, so "the scatter
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
-    const u32 ppslots =
-        AtLeastSlots((a.ppslots != 0) ? a.ppslots : slots, kMinSlotsX, "x2/v2");
+    const u32 ppslots = SharedSlots(npages, nsets);
     gv::Vector<float> vx2("md_x2", {0}, page_bytes, tbl_blocks, ppslots,
                           g.nelems);
     gv::Vector<float> vv2("md_v2", {0}, page_bytes, tbl_blocks, ppslots,
                           g.nelems);
+    account("x2", ppslots, page_bytes, npages);
+    account("v2", ppslots, page_bytes, npages);
     vx2.EnableStats();
     vv2.EnableStats();
     {
@@ -2590,11 +2729,17 @@ int main(int argc, char **argv) {
                    (unsigned long long)md_rowlist, kMaxNlGuards - 1);
       return 1;
     }
-    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks,
-                       (a.nlslots != 0)
-                           ? AtLeastSlots(a.nlslots, kMinSlotsNl, "nl")
-                           : NlSlots(nl_pages),
+    // THE LIST IS THE ONE VECTOR SHARING WAS NOT OBVIOUSLY FOR: it is
+    // streamed a row at a time, degree 1.39, so a private cache already
+    // stores each page about once. It goes shared anyway, because the run
+    // has ONE mode -- and the interesting question is exactly what that
+    // costs a vector with nothing to share. Sized for residency like the
+    // rest: shared residency is 2x the list, where private residency was
+    // blocks x the list and had to be capped at NlSlots to allocate at all.
+    const u32 nlslots = SharedSlots(nl_pages, nsets);
+    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks, nlslots,
                        nl_elems);
+    account("list", nlslots, nl_page_bytes, nl_pages);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
@@ -2603,6 +2748,7 @@ int main(int argc, char **argv) {
     vn.ClearCache();
     vn.Prefetch(0, nl_pages, 0, 1);
     auto dn = vn.GetDevice(0);
+    report_caches();
     std::printf("  list: maxneigh=%u row=%llu entries page=%lluKB "
                 "(%llu pages, %llu guards/row)\n",
                 a.maxneigh, (unsigned long long)md_rowlist,

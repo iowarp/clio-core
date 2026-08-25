@@ -82,6 +82,8 @@ __device__ gy::YCoroMain PublishCoro(gv::DeviceVector<u32> v, u64 first_row,
     }
     // Publish AS this generation: a reader naming it is released only now.
     co_await v.Flush(gen, off, kRowElems);
+    // UpdateRange fetches, and a fetch pins: release it after the flush.
+    v.UnpinRange(v.PageLo(off), v.PageSpan(off, kRowElems));
   }
 }
 
@@ -117,7 +119,8 @@ __device__ gy::YCoroMain HaloCoro(gv::DeviceVector<u32> v, u64 halo_row,
     const gv::Page *tbl = v.TableForDebug();
     const u64 pn = v.PageOf(off);
     u32 holders = 0;
-    for (u32 i = 0; i < v.PagesPerTable(); ++i) {
+    // The whole cache, not a block's share of it: there are no shares.
+    for (u64 i = 0; i < v.NumFrames(); ++i) {
       if (tbl[i].page_num == pn) {
         ++holders;
         printf("[halo]   frame %u holds page %llu gen=%llu valid=[%u,%u) "
@@ -141,6 +144,7 @@ __device__ gy::YCoroMain HaloCoro(gv::DeviceVector<u32> v, u64 halo_row,
       }
     }
   }
+  v.UnpinRange(v.PageLo(off), v.PageSpan(off, kRowElems));
 }
 
 __global__ void PublishKernel(clio::run::IpcManagerGpuInfo info,

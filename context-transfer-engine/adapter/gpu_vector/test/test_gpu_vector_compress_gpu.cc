@@ -106,6 +106,8 @@ __device__ gy::YCoroMain SeedWeightsCoro(gv::DeviceVector<clio::run::u32> v,
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   co_await v.EndFlush();
@@ -146,7 +148,9 @@ __device__ gy::YCoroMain WeightsDotCoro(gv::DeviceVector<clio::run::u32> v,
       }
     }
     __syncthreads();
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
   }
   if (threadIdx.x == 0) atomicAdd(sum, acc);
 }
@@ -198,7 +202,9 @@ __device__ gy::YCoroMain WeightsDotBatchedCoro(
           }
         }
         __syncthreads();
-        i += h.run();
+        const clio::run::u64 run = h.run();
+        v.UnpinRange(v.PageLo(off + i), v.PageSpan(off + i, 1));
+        i += run;
       }
     }
   }
@@ -333,9 +339,15 @@ TEST_CASE("gpu_vector: model weights through the compression path",
     const clio::run::u64 n = per * c.nblocks;
     const std::string tag = std::string("gv_cmp_") + c.name;
 
+    // A SMALL CACHE IS NOW FEW WIDE SETS, NOT MANY NARROW ONES.
+    // `slots` used to be frames in THIS BLOCK's table, so 2 meant 2. Under
+    // one associative cache it would mean 2 frames in a set every block
+    // hashes into, and the third block to want a page there finds it full
+    // -- a caller error, correctly reported, not something to wait out.
+    // Keep the same total frame count in ONE fully-associative set.
     gv::Vector<clio::run::u32> vec(tag, {0}, kPageBytes, c.nblocks,
-                                   c.pages_per_block, n, kCompressorPool,
-                                   c.codec);
+                                   c.pages_per_block * c.nblocks, n,
+                                   kCompressorPool, c.codec, 1, /*nsets=*/1);
 
     RunYieldable(c.nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                 gy::YieldStackView sv) {

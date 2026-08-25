@@ -106,6 +106,9 @@ __device__ gy::YCoroMain PersistCoro(gv::DeviceVector<u32> v, u32 block,
     }
     if (threadIdx.x == 0 && t.cookie != Cookie(block)) atomicAdd(bad, 1ull);
     __syncthreads();
+    // This fetch never holds the page -- it exists to force a park -- so the
+    // pin it took has no guard to outlive and must be given back here.
+    v.UnpinRange(v.PageLo(off), v.PageSpan(off, 1));
   }
 }
 
@@ -173,8 +176,15 @@ TEST_CASE("gpu_vector: shared state survives a park",
 
   int rc = 0;
   for (const Case &c : cases) {
-    gv::Vector<u32> vec("gv_persist", {0}, kPageBytes, c.nblocks, kSlots,
-                        kElems);
+    // A SMALL CACHE IS NOW FEW WIDE SETS, NOT MANY NARROW ONES.
+    // `slots` used to be frames in THIS BLOCK's table, so 2 meant 2. Under
+    // one associative cache it would mean 2 frames in a set every block
+    // hashes into, and the third block to want a page there finds it full
+    // -- a caller error, correctly reported, not something to wait out.
+    // Keep the same total frame count in ONE fully-associative set.
+    gv::Vector<u32> vec("gv_persist", {0}, kPageBytes, c.nblocks,
+                        kSlots * c.nblocks, kElems,
+                        clio::run::PoolId::GetNull(), 0, 1, /*nsets=*/1);
     ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
     const u32 rounds = RunYieldable(
         c.nblocks, vec,

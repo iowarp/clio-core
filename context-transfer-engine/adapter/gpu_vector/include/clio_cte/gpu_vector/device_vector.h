@@ -28,18 +28,21 @@ constexpr clio::run::u32 kUnbound = ~0u;
 
 /** Shared state, one per vector per GPU. */
 struct VecHeader {
-  Page *pages_;              // nblocks_ * pages_per_block_
+  Page *pages_;              // nsets_ * set_size_
+  /** ONE TASK SET PER CUDA BLOCK, indexed by the LOGICAL block id. A block
+   *  owns its MultiGet and MultiPut outright: two blocks staging into one
+   *  slot would overwrite each other's records mid-transfer. Dimensioned by
+   *  the LAUNCH, which is why it is not nsets_ -- the cache's geometry and
+   *  the grid's width are unrelated numbers that happened to be equal. */
   BlockTasks *tasks_;        // nblocks_
   clio::run::u64 page_bytes_;
   clio::run::u64 elems_per_page_;
   clio::run::u64 num_elems_;
-  clio::run::u32 nblocks_;          // private: tables. shared: SETS.
-  clio::run::u32 pages_per_block_;  // private: frames/table. shared: set_size.
-  /** SHARED MODE. 0 = one private table per CUDA block (a page touched by N
-   *  blocks is stored N times). 1 = one associative cache for the whole grid,
-   *  where a page's home set is Hash(page_num) % nblocks_ -- a function of the
-   *  PAGE, not of who is asking. That is the entire difference. */
-  clio::run::u32 shared_;
+  /** CUDA blocks in the launch this vector was built for = task sets. */
+  clio::run::u32 nblocks_;
+  /** Associative sets in the cache, and frames in each. */
+  clio::run::u32 nsets_;
+  clio::run::u32 set_size_;
   /** One spin lock per set, kLockStride ints apart so two sets never share a
    *  cache line. Null in private mode: a private table has exactly one writer.
    */
@@ -158,7 +161,8 @@ class DeviceVector {
   CTP_GPU_FUN void Init(clio::run::u32 block) {
     if (block >= h_->nblocks_) {
       if (threadIdx.x == 0) {
-        printf("[gpu_vector] FATAL Init(%u): only %u tables exist\n", block,
+        printf("[gpu_vector] FATAL Init(%u): the vector was built for %u CUDA "
+               "blocks, so there is no task set for this one.\n", block,
                h_->nblocks_);
       }
       __trap();
@@ -186,14 +190,19 @@ class DeviceVector {
     return (PageOf(last) + 1) * h_->elems_per_page_ - PageLo(off);
   }
 
-  CTP_GPU_FUN clio::run::u32 NumTables() const { return h_->nblocks_; }
-  /** This block's page table, for diagnostics that dump residency. */
-  CTP_GPU_FUN const Page *TableForDebug() const { return Pages(); }
+  /** Associative sets in the one cache this vector has. */
+  CTP_GPU_FUN clio::run::u32 NumSets() const { return h_->nsets_; }
+  /** Every frame, for diagnostics that dump residency. Walk NumFrames() of
+   *  them: the array is the WHOLE cache, not one block's share, because
+   *  blocks do not have shares. */
+  CTP_GPU_FUN const Page *TableForDebug() const { return h_->pages_; }
+  CTP_GPU_FUN clio::run::u64 NumFrames() const {
+    return static_cast<clio::run::u64>(h_->nsets_) * h_->set_size_;
+  }
   /** The device header, so a host diagnostic can copy the table out. */
   CTP_CROSS_FUN const VecHeader *HeaderForDebug() const { return h_; }
-  CTP_GPU_FUN clio::run::u32 PagesPerTable() const {
-    return h_->pages_per_block_;
-  }
+  /** Frames in one associative set. */
+  CTP_GPU_FUN clio::run::u32 SetSize() const { return h_->set_size_; }
   CTP_GPU_FUN clio::run::u64 NumPages() const {
     return (h_->num_elems_ + h_->elems_per_page_ - 1) / h_->elems_per_page_;
   }
@@ -221,75 +230,32 @@ class DeviceVector {
     clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(lo, hi, nr, args...);
-    // NO ROUNDING. A fetch transfers exactly the elements named. Partial
-    // pages are safe because residency is not validity: each frame records
-    // the interval it actually holds, and SubmitFetch widens a fetch to the
-    // union of that interval and the new request, so a later fetch of a
-    // different slice of the same page transfers the gap rather than
-    // trusting bytes nobody read.
     // One fetch in flight per block: staging into a task the runtime is still
     // reading would overwrite records mid-transfer.
     if (FetchBusy()) {
       co_await AwaitFetch();
     }
-    // Pin what is already resident BEFORE making room, so the eviction that
-    // frees frames for the missing pages cannot take a page of this very
-    // range and turn one fetch into two.
-    // COUNT ON EVERY THREAD. The scan is read-only, so every thread reaches
-    // the same number and no broadcast is needed. Voting it with
-    // __syncthreads_or would collapse the COUNT to 0/1 and free one frame for
-    // a range missing several pages -- which is how "no free frame after
-    // EvictPages" fired.
-    if (Shared()) {
-      // SHARED: no separate count/evict/pin pass. SubmitFetch claims each page
-      // in its home set under that set's lock, evicting there if it has to,
-      // and leaves it pinned. Those pins persist until the caller's
-      // UnpinRange -- that is the whole difference from the private path,
-      // which releases them below because there the guard owns the pin.
-      if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
-      __syncthreads();
-      co_return;
-    }
-    const clio::run::u32 missing = CountMissing(lo, hi, nr);
-    // Pinning mutates, so only thread 0 does it.
-    if (threadIdx.x == 0) PinResident(lo, hi, nr);
-    __syncthreads();
-    // EVICTION IS SIZED BY MISSING PAGES; THE SUBMIT IS NOT.
-    //
-    // CountMissing counts pages with no frame, which is the right number of
-    // frames to free -- but a page can be RESIDENT and still need a
-    // transfer: holding a different slice of itself, or an older generation.
-    // Gating the submit on `missing` meant those never reached SubmitFetch
-    // at all, so a generational fetch of a resident-but-stale page silently
-    // returned the stale bytes. SubmitFetch itself decides what to send and
-    // sends nothing when everything is current.
-    if (missing != 0) {
-      if (threadIdx.x == 0 && !EvictPages(missing, missing)) __trap();
-      __syncthreads();
-    }
+    // NO SEPARATE COUNT/EVICT/PIN PASS. SubmitFetch claims each page in its
+    // home set under that set's lock, evicting there if it has to, and leaves
+    // it pinned. Those pins persist until the caller's UnpinRange.
     if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
-    if (threadIdx.x == 0) UnpinRanges(lo, hi, nr);
     __syncthreads();
     co_return;
   }
 
   /**
-   * Release the pins a shared-cache Fetch took over [off, off+count).
+   * Release the pins a Fetch took over [off, off+count).
    *
-   * In shared mode FetchRange is the pinner, because a page fetched by this
-   * CUDA block can be evicted by ANY other one before the hold happens. The
-   * pin closes that window, and it lasts until this call -- so a range you
-   * fetched and never unpin is a frame nobody can reclaim, and eventually a
-   * set that is full of pinned frames.
-   *
-   * A no-op in private mode, where the guard owns the pin and dies on its own.
-   * Callers can therefore issue it unconditionally, which is what lets one
-   * kernel run under both modes for the A/B.
+   * FETCH IS THE PINNER, because a page fetched by this CUDA block can be
+   * evicted by ANY other one before the hold happens -- there is one cache
+   * and every block is in it. The pin closes that window, and it lasts until
+   * this call, so a range you fetched and never unpin is a frame nobody can
+   * reclaim and eventually a set that is full of pinned frames.
    *
    * Block-collective: call it with the whole block, like Fetch.
    */
   CTP_GPU_FUN void UnpinRange(clio::run::u64 off, clio::run::u64 count) {
-    if (!Shared() || count == 0) return;
+    if (count == 0) return;
     __syncthreads();
     if (threadIdx.x == 0) {
       const clio::run::u64 lo = off;
@@ -334,21 +300,39 @@ class DeviceVector {
       co_await AwaitFetch();      // it may simply not have landed yet
       p = Find(pn);
     }
+    // WAIT FOR THE PEER THAT CLAIMED IT. In a shared cache the block that
+    // claims a frame is the only one that fills it -- a second transfer into
+    // a live frame overwrites whatever the other blocks have written into it.
+    // So a block that finds the frame claimed but not yet published has
+    // nothing to fetch and everything to wait for. The claimer always reaches
+    // its own AwaitFetch, so this makes progress.
+    if (p == nullptr && FindClaimed(pn) != nullptr) {
+      // TAG 0, DELIBERATELY: "no condition, always resume". A wait tag names
+      // a COMPLETION WORD the host polls, and what this block waits for --
+      // another block publishing a frame -- has no such word. Passing the
+      // frame's address instead made the driver test the low bit of
+      // `page_num`, which flips for no reason connected to the wait: the
+      // round cap hit with 7 of 8 blocks suspended forever. Resuming every
+      // round and re-checking costs relaunches; it terminates.
+      CLIO_CO_YIELD_WHEN(;, Find(pn) == nullptr && FindClaimed(pn) != nullptr,
+                         0ull);
+      p = Find(pn);
+    }
     if (p == nullptr) {
       if (threadIdx.x == 0) {
-        Page *tbl = Pages();
+        Page *tbl = SetPages(SetOf(pn));
         clio::run::u32 have = 0, fetching = 0, free_n = 0;
-        for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+        for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
           if (tbl[i].page_num == pn) ++have;
           if (tbl[i].fetching) ++fetching;
           if (tbl[i].page_num == kNoPage) ++free_n;
         }
-        printf("[gpu_vector] FATAL table=%u page=%llu not resident "
+        printf("[gpu_vector] FATAL set=%u page=%llu not resident "
                "(frames holding it=%u fetching=%u free=%u of %u | "
                "fetch_busy=%u fetch_n=%u). HoldPage does not fetch -- name "
                "it in a BeginFetch first.\n",
-               Table(), (unsigned long long) pn, have, fetching, free_n,
-               h_->pages_per_block_, Tasks()->fetch_busy, Tasks()->fetch_n);
+               SetOf(pn), (unsigned long long) pn, have, fetching, free_n,
+               h_->set_size_, Tasks()->fetch_busy, Tasks()->fetch_n);
       }
       __trap();
     }
@@ -401,116 +385,23 @@ class DeviceVector {
   }
 
   /**
-   * Make this block's copy of a range current, sourcing it from a peer's
-   * cache when possible instead of from the tier stack.
+   * Make a range current and hold it.
    *
-   * Already resident here -> hold it, no transfer. Otherwise, if the block
-   * named by `from` has the page, COPY it frame-to-frame -- at most one page
-   * (256 KB in the MD bench), device-to-device, a few hundred nanoseconds
-   * against the microseconds a fault through the runtime costs. Otherwise
-   * fall back to a fetch, so a wrong `from` costs latency, never
-   * correctness.
+   * `from` NAMED A PEER'S PAGE TABLE, and there are no peers any more: one
+   * associative cache serves the whole grid, so a page another block has IS
+   * the page this block has, found in the same set at the same address. The
+   * frame-to-frame copy this verb used to perform -- probe the owner's table,
+   * pin, re-verify, copy a page device-to-device -- was the private cache
+   * paying to undo its own replication. The argument is kept so callers that
+   * expressed an ownership hint still compile, and it is ignored.
    *
-   * `from` is an argument, never discovered. Working out an owner at runtime
-   * needs a page directory, and a directory needs publication, pinning and
-   * eviction coordination between blocks -- the coupling this design exists
-   * to avoid. NVSHMEM makes the same call: nvshmemx_getmem_block takes the
-   * peer as a parameter and the application supplies it from its own
-   * decomposition.
-   *
-   * THE RESULT IS THIS BLOCK'S OWN FRAME, so it is writable like any other
-   * hold and flush works normally. Copying is what buys that: a pointer INTO
-   * the owner's frame could not be written without clobbering the owner when
-   * it publishes.
-   *
-   * It does NOT make a page safe for two writers. The copy is a snapshot;
-   * if two blocks write the same page and both flush, one loses. Writes
-   * still need a single owner per range.
+   * What remains is Fetch + HoldPage, which is what the peer-miss path always
+   * fell back to.
    */
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> UpdateRange(
       clio::run::u64 off, clio::run::u64 count, clio::run::u32 from,
       bool write = false, clio::run::u64 generation = 0) {
-    const clio::run::u64 pn = PageOf(off);
-    // Already here: this is FetchRange semantics -- do not re-transfer a
-    // version we hold.
-    Page *mine = Find(pn);
-    if (mine != nullptr && mine->generation >= generation) {
-      co_return Pin(mine, off, count, write);
-    }
-    // Does the peer have it? Decide ONCE and block-uniformly: a concurrent
-    // eviction in the owner can make one thread's probe succeed and
-    // another's fail, and divergent threads would hang on the barrier in the
-    // fallback's co_await.
-    __shared__ Page *s_src;
-    if (threadIdx.x == 0) {
-      s_src = nullptr;
-      if (from != Table() && from < h_->nblocks_) {
-        Page *p = FindIn(from, pn);
-        if (p != nullptr) {
-          // PIN, THEN VERIFY -- never probe-then-pin. Release() clears
-          // page_num before a frame is reused and eviction refuses a pinned
-          // frame, so a pin that survives the re-read cannot be pulled out
-          // from under the copy. The reverse order loses the frame in the
-          // window between the two, which is the shape of two bugs already
-          // fixed in this tree.
-          atomicAdd(&p->pins, 1u);
-          __threadfence();
-          clio::run::u32 a = 0, b = 0;
-          const bool need = PageNeed(pn, off, off + count, &a, &b);
-          // The peer having the PAGE is not the peer having the RANGE.
-          // The peer having the RANGE is still not the peer having the
-          // GENERATION: a copy of last round's bytes is exactly the stale
-          // read this is meant to prevent.
-          if (static_cast<volatile Page *>(p)->page_num == pn && need &&
-              Covers(p, a, b) && p->generation >= generation) {
-            s_src = p;
-          } else {
-            atomicSub(&p->pins, 1u);
-          }
-        }
-      }
-    }
-    __syncthreads();
-    // OUT OF SHARED BEFORE ANYTHING CAN SUSPEND. EvictPages parks, and a park
-    // is a kernel exit that destroys shared memory; a Page* left in __shared__
-    // across it comes back garbage. A local lives in the coroutine frame,
-    // which is in global memory and does survive.
-    Page *src = s_src;
-    if (src != nullptr) {
-      // Room for the copy. The source stays pinned across the eviction, so
-      // it cannot be reclaimed while we make space for its copy.
-      __shared__ Page *s_dst;
-      if (threadIdx.x == 0) s_dst = FindFree();
-      __syncthreads();
-      Page *dst = s_dst;
-      if (dst == nullptr) {
-        if (threadIdx.x == 0 && !EvictPages(1, 1)) __trap();
-        __syncthreads();
-        if (threadIdx.x == 0) s_dst = FindFree();
-        __syncthreads();
-        dst = s_dst;
-      }
-      if (dst != nullptr) {
-        CopyFrame(dst->data, src->data, h_->page_bytes_);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          // Clean: the bytes match what the peer had, and this block has
-          // written nothing of its own yet.
-          dst->page_num = pn;
-          dst->valid_lo = src->valid_lo;
-          dst->valid_hi = src->valid_hi;
-          dst->generation = src->generation;
-          dst->fetching = 0u;
-          dst->flushing = 0u;
-          dst->score = kDefaultScore;
-          atomicSub(&src->pins, 1u);
-        }
-        __syncthreads();
-        co_return Pin(dst, off, count, write);
-      }
-      if (threadIdx.x == 0) atomicSub(&src->pins, 1u);
-      __syncthreads();
-    }
+    (void) from;
     co_await Fetch(generation, PageLo(off), PageSpan(off, count));
     Held<T> h = co_await HoldPage(off, count, write);
     co_return static_cast<Held<T> &&>(h);
@@ -554,15 +445,10 @@ class DeviceVector {
     }
     return table_;
   }
-  CTP_GPU_FUN Page *Pages() const {
-    return h_->pages_ + static_cast<size_t>(Table()) * h_->pages_per_block_;
-  }
-
   /** Ints between adjacent set locks, so two sets never share a cache line. */
   static constexpr clio::run::u32 kLockStride = 32;
 
   /** True when one cache serves the whole grid. */
-  CTP_GPU_FUN bool Shared() const { return h_->shared_ != 0u; }
 
   /**
    * A page's home set.
@@ -573,12 +459,11 @@ class DeviceVector {
    * PRIVATE: this block's own table, i.e. today's behaviour.
    */
   CTP_GPU_FUN clio::run::u32 SetOf(clio::run::u64 pn) const {
-    if (!Shared()) return Table();
     const clio::run::u64 mixed = (pn ^ (pn >> 29)) * 0x9E3779B97F4A7C15ull;
-    return static_cast<clio::run::u32>((mixed >> 32) % h_->nblocks_);
+    return static_cast<clio::run::u32>((mixed >> 32) % h_->nsets_);
   }
   CTP_GPU_FUN Page *SetPages(clio::run::u32 set) const {
-    return h_->pages_ + static_cast<size_t>(set) * h_->pages_per_block_;
+    return h_->pages_ + static_cast<size_t>(set) * h_->set_size_;
   }
 
   /**
@@ -619,65 +504,33 @@ class DeviceVector {
   }
   CTP_GPU_FUN BlockTasks *Tasks() const { return &h_->tasks_[Table()]; }
 
-  /** The frame holding `pn` and readable, or null. */
-  /**
-   * Copy one frame's bytes, the whole block cooperating.
-   *
-   * 16 bytes per thread per step. There is no hardware path for this:
-   * cp.async / memcpy_async and Hopper's cp.async.bulk all target SHARED
-   * memory, and both ends here are page frames in GLOBAL memory, so a
-   * vectorized strided loop IS the fast path. Device memcpy() would be a
-   * per-thread BYTE loop -- every thread copying every byte.
-   *
-   * Frames are page-sized slices of one allocation, so src and dst share
-   * alignment; the scalar tail covers page sizes that are not a multiple
-   * of 16.
-   */
-  CTP_GPU_FUN void CopyFrame(void *dst, const void *src,
-                             clio::run::u64 bytes) const {
-    const clio::run::u64 addr =
-        reinterpret_cast<clio::run::u64>(dst) |
-        reinterpret_cast<clio::run::u64>(src);
-    clio::run::u64 done = 0;
-    if ((addr & 15u) == 0u && bytes >= 16u) {
-      const clio::run::u64 n16 = bytes >> 4;
-      auto *d4 = static_cast<int4 *>(dst);
-      const auto *s4 = static_cast<const int4 *>(src);
-      for (clio::run::u64 i = threadIdx.x; i < n16; i += blockDim.x) {
-        d4[i] = s4[i];
-      }
-      done = n16 << 4;
-    }
-    auto *d1 = static_cast<char *>(dst);
-    const auto *s1 = static_cast<const char *>(src);
-    for (clio::run::u64 i = done + threadIdx.x; i < bytes; i += blockDim.x) {
-      d1[i] = s1[i];
-    }
-  }
 
   /**
-   * Probe ANOTHER block's table. Volatile because the owner writes these
-   * fields from a different block, and a cached load would happily reuse a
-   * slot that has since been released.
+   * The frame holding `pn` and readable, searched in its home set.
+   *
+   * IN FLIGHT IS NOT THE SAME AS UNREADABLE. `fetching` exists to hide a
+   * frame that has been CLAIMED but never filled -- its valid interval is
+   * empty and a hold on it would read whatever the frame held before. It must
+   * not hide a frame that is already published, because in a shared cache a
+   * peer block re-fetching a different slice of the same page raises
+   * `fetching` again on a frame this block has already had published to it.
+   * Rejecting that frame is how a page that IS resident came back "not
+   * resident" (page 9, set 1, have=1, fetching=1, 6 frames free) and trapped.
+   *
+   * So the test is emptiness, not flight: an empty frame is invisible until
+   * someone publishes it; a published frame stays visible while a peer
+   * extends it, and HoldPage's Covers check decides whether THIS block's
+   * range is among the bytes that landed.
    */
-  CTP_GPU_FUN Page *FindIn(clio::run::u32 table, clio::run::u64 pn) const {
-    Page *tbl = h_->pages_ + static_cast<size_t>(table) * h_->pages_per_block_;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-      volatile Page *c = &tbl[i];
-      if (c->page_num == pn && c->fetching == 0u && c->flushing == 0u) {
-        return &tbl[i];
-      }
-    }
-    return nullptr;
-  }
-  /** The frame holding `pn` and readable, searched in its home set. */
   CTP_GPU_FUN Page *Find(clio::run::u64 pn) const {
     Page *tbl = SetPages(SetOf(pn));
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
       // volatile: in shared mode another CUDA block writes these fields, and
       // a cached load would reuse a frame that has since been re-tagged.
       volatile Page *c = &tbl[i];
-      if (c->page_num == pn && !c->fetching) return &tbl[i];
+      if (c->page_num != pn) continue;
+      if (c->fetching != 0u && c->valid_hi <= c->valid_lo) continue;
+      return &tbl[i];
     }
     return nullptr;
   }
@@ -685,7 +538,7 @@ class DeviceVector {
   /** Frame holding `pn` even if a fetch into it is still in flight. */
   CTP_GPU_FUN Page *FindClaimed(clio::run::u64 pn) const {
     Page *tbl = SetPages(SetOf(pn));
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
       volatile Page *c = &tbl[i];
       if (c->page_num == pn) return &tbl[i];
     }
@@ -695,12 +548,11 @@ class DeviceVector {
   /** A frame with no page in this set, or null. */
   CTP_GPU_FUN Page *FindFreeIn(clio::run::u32 set) const {
     Page *tbl = SetPages(set);
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
       if (tbl[i].page_num == kNoPage) return &tbl[i];
     }
     return nullptr;
   }
-  CTP_GPU_FUN Page *FindFree() const { return FindFreeIn(Table()); }
 
   /** Drop a resident, unpinned, clean page. */
   CTP_GPU_FUN void Release(Page *p) {
@@ -712,23 +564,6 @@ class DeviceVector {
     if (h_->stat_evicts_ != nullptr) atomicAdd(h_->stat_evicts_, 1ull);
   }
 
-  /**
-   * Guarantee at least `min` free frames, freeing up to `max`.
-   *
-   * EVICTION PERFORMS NO I/O. It selects victims and drops them: no transfer,
-   * no task submission, no suspend. A frame that is mid-flush or mid-fetch is
-   * simply not a candidate; an unpinned, quiet frame is dropped on the spot.
-   *
-   * This used to `co_await EndFlush()` and retry, which put I/O on the
-   * allocation path. Everything else depends on it not doing that -- a
-   * bounded, non-suspending eviction is what lets the caller hold a lock
-   * across this call.
-   */
-  CTP_GPU_FUN bool EvictPages(clio::run::u32 min, clio::run::u32 max) {
-    const bool ok = FreeSome(min, max);
-    if (!ok) ReportStuck(min);
-    return ok;
-  }
 
   /**
    * Reclaim frames ANYWHERE to get back under the byte budget.
@@ -740,10 +575,10 @@ class DeviceVector {
    */
   CTP_GPU_FUN void EvictForBudget(clio::run::u32 want, clio::run::u32 home) {
     if (h_->cache_frames_ == nullptr) return;
-    for (clio::run::u32 n = 0; n < h_->nblocks_ && want != 0; ++n) {
+    for (clio::run::u32 n = 0; n < h_->nsets_ && want != 0; ++n) {
       // Start away from the home set: its frames are the ones we just
       // pinned, and it is the set most likely to be contended.
-      const clio::run::u32 set = (home + 1u + n) % h_->nblocks_;
+      const clio::run::u32 set = (home + 1u + n) % h_->nsets_;
       LockSet(set);
       const clio::run::u32 got = FreeSomeIn(set, 0, want);
       UnlockSet(set);
@@ -783,15 +618,20 @@ class DeviceVector {
       *is_new = false;
       return nullptr;                 // caller reports; see ReportSetFull
     }
-    p->page_num = pn;
+    // MARK IT EMPTY AND IN FLIGHT BEFORE PUBLISHING THE TAG, and fence between
+    // the two. Find() reads page_num first and rejects a frame that is empty
+    // and in flight, so a reader that sees the new tag is guaranteed to see
+    // the state that goes with it; publishing the tag first lets a peer match
+    // it against the PREVIOUS occupant's valid range and hold a frame whose
+    // contents are about to be overwritten.
     p->valid_lo = 0u;
     p->valid_hi = 0u;
     p->generation = 0;
-    // MARK IT IN FLIGHT BEFORE PUBLISHING THE TAG. Find() skips fetching
-    // frames, so until the transfer lands no other CUDA block can mistake
-    // this claimed-but-empty frame for a resident page -- which it otherwise
-    // does, and then traps on the hold because the valid range is [0,0).
-    p->fetching = 1u;
+    // A COUNT, NOT A FLAG -- see PublishFetch. Several blocks fetch into one
+    // frame; whoever publishes first must not clear the others' marks.
+    atomicAdd(&p->fetching, 1u);
+    __threadfence();
+    p->page_num = pn;
     atomicAdd(&p->pins, 1u);
     UnlockSet(set);
     // Charge AFTER releasing the lock: paying the budget back may need other
@@ -802,12 +642,13 @@ class DeviceVector {
     return p;
   }
 
+
   /** Say which set overflowed and what is holding it. */
   CTP_GPU_FUN void ReportSetFull(clio::run::u64 pn) const {
     const clio::run::u32 set = SetOf(pn);
     Page *tbl = SetPages(set);
     clio::run::u32 pinned = 0, busy = 0;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+    for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
       if (tbl[i].pins != 0u) ++pinned;
       if (tbl[i].fetching || tbl[i].flushing) ++busy;
     }
@@ -816,7 +657,7 @@ class DeviceVector {
            "  Freeing space in another set cannot help -- this page's home is "
            "fixed by the hash. Fetch fewer pages at once, UnpinRange sooner, "
            "or raise the cache size.\n",
-           set, (unsigned long long) pn, pinned, h_->pages_per_block_, busy);
+           set, (unsigned long long) pn, pinned, h_->set_size_, busy);
   }
 
   /** One eviction pass over one set; returns how many frames it dropped. */
@@ -826,7 +667,7 @@ class DeviceVector {
     clio::run::u32 dropped = 0;
     while (dropped < max) {
       Page *victim = nullptr;
-      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
+      for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
         Page *c = &tbl[i];
         if (c->page_num == kNoPage) continue;
         if (c->pins != 0u || c->fetching || c->flushing) continue;
@@ -845,48 +686,7 @@ class DeviceVector {
     return dropped;
   }
 
-  /** One eviction pass; true when at least `min` frames are free. */
-  CTP_GPU_FUN bool FreeSome(clio::run::u32 min, clio::run::u32 max) {
-    Page *tbl = Pages();
-    clio::run::u32 freed = 0;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-      if (tbl[i].page_num == kNoPage) ++freed;
-    }
-    while (freed < max) {
-      Page *victim = nullptr;
-      for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-        Page *c = &tbl[i];
-        if (c->page_num == kNoPage) continue;
-        if (c->pins != 0u || c->fetching || c->flushing) continue;
-        if (victim == nullptr || c->score < victim->score ||
-            (c->score == victim->score &&
-             c->last_access < victim->last_access)) {
-          victim = c;
-        }
-      }
-      if (victim == nullptr) break;
-      Release(victim);
-      ++freed;
-    }
-    return freed >= min;
-  }
 
-  /** Say what is holding the table before the trap. */
-  CTP_GPU_FUN void ReportStuck(clio::run::u32 min) const {
-    Page *tbl = Pages();
-    clio::run::u32 pinned = 0, busy = 0;
-    for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
-      if (tbl[i].pins != 0u) ++pinned;
-      if (tbl[i].fetching || tbl[i].flushing) ++busy;
-    }
-    // NAME WHAT IS HOLDING IT. "no free frame" without the counts cost a day
-    // to decode once already.
-    printf("[gpu_vector] FATAL table=%u: need %u free of %u frames, "
-           "%u pinned, %u in flight.\n"
-           "  Hold fewer pages at once. Eviction performs no I/O, so it "
-           "cannot wait for the in-flight ones.\n",
-           Table(), min, h_->pages_per_block_, pinned, busy);
-  }
 
   /** Pin a resident frame and build the guard. */
   CTP_GPU_FUN Held<T> Pin(Page *p, clio::run::u64 off, clio::run::u64 count,
@@ -895,8 +695,9 @@ class DeviceVector {
     // SHARED: the fetch already pinned this frame and UnpinRange releases it,
     // so the guard neither takes nor drops a reference -- it only resolves
     // one. PRIVATE: the guard IS the pin, as before.
-    const bool owns = !Shared();
-    if (owns) atomicAdd(&p->pins, 1u);
+    // THE HOLD IS NOT THE PIN. Fetch pinned this frame and UnpinRange
+    // releases it; the guard only resolves a pointer into it.
+    const bool owns = false;
     if (threadIdx.x == 0) {
       p->last_access = clock64();
     }
@@ -981,39 +782,9 @@ class DeviceVector {
     return true;
   }
 
-  /** How many pages of the ranges are not resident. Read-only, so every
-   *  thread computes the same answer. */
-  CTP_GPU_FUN clio::run::u32 CountMissing(const clio::run::u64 *lo,
-                                          const clio::run::u64 *hi,
-                                          clio::run::u32 nr) const {
-    clio::run::u32 missing = 0;
-    for (clio::run::u32 r = 0; r < nr; ++r) {
-      if (hi[r] <= lo[r]) continue;
-      const clio::run::u64 p0 = PageOf(lo[r]);
-      const clio::run::u64 p1 = PageOf(hi[r] - 1);
-      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
-        if (Find(pn) == nullptr) ++missing;
-      }
-    }
-    return missing;
-  }
 
-  /** Pin every resident page of the ranges, so the eviction that makes room
-   *  for the missing ones cannot take a page of this very range. */
-  CTP_GPU_FUN void PinResident(const clio::run::u64 *lo,
-                               const clio::run::u64 *hi, clio::run::u32 nr) {
-    for (clio::run::u32 r = 0; r < nr; ++r) {
-      if (hi[r] <= lo[r]) continue;
-      const clio::run::u64 p0 = PageOf(lo[r]);
-      const clio::run::u64 p1 = PageOf(hi[r] - 1);
-      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
-        Page *p = Find(pn);
-        if (p != nullptr) atomicAdd(&p->pins, 1u);
-      }
-    }
-  }
 
-  /** Undo PinResidentAndCountMissing's pins. */
+  /** Give back one pin per page of each range. */
   CTP_GPU_FUN void UnpinRanges(const clio::run::u64 *lo,
                                const clio::run::u64 *hi, clio::run::u32 nr) {
     for (clio::run::u32 r = 0; r < nr; ++r) {
@@ -1021,7 +792,14 @@ class DeviceVector {
       const clio::run::u64 p0 = PageOf(lo[r]);
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
-        Page *p = Find(pn);
+        // FindClaimed, NOT Find. Unpinning is about the frame's IDENTITY, not
+        // its readability: a caller may release a range it began fetching and
+        // never awaited (a prefetch window it decided not to wait for), and
+        // those frames are claimed-but-empty, which is exactly what Find
+        // hides. Looking them up with Find silently skipped the unpin and
+        // leaked one pin per prefetched page -- the overlap bench filled a
+        // 16-frame cache in 16 pages, every frame pinned, nothing in flight.
+        Page *p = FindClaimed(pn);
         if (p != nullptr && p->pins != 0u) atomicSub(&p->pins, 1u);
       }
     }
@@ -1042,9 +820,36 @@ class DeviceVector {
            pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
         clio::run::u32 a = 0, b = 0;
         if (!PageNeed(pn, lo[r], hi[r], &a, &b)) continue;
+        // A SHARED FRAME IS FETCHED WHOLE, ALWAYS.
+        //
+        // One valid interval per frame cannot describe what several CUDA
+        // blocks fetch into one frame. Two blocks asking for disjoint slices
+        // of a page BOTH read valid=[0,0), so each transfers only its own
+        // slice -- and PublishFetch then unions the two, publishing the GAP
+        // BETWEEN THEM as valid although nobody transferred it. A later hold
+        // over that gap passes Covers and reads whatever the frame held
+        // before: no trap, no error, just wrong numbers. Measured on the MD
+        // resort, which lost no atoms at all and still moved the potential
+        // energy by 1.6% at 4 blocks and 0.5% at 2 (exact at 1).
+        //
+        // Fetching the page whole makes the interval degenerate -- always
+        // [0, page) -- so there is no hole to misdescribe. It moves more
+        // bytes per miss than the caller asked for; it also moves them ONCE
+        // for the whole grid instead of once per block, which is the point of
+        // sharing. Private tables keep the exact-range behaviour, where one
+        // writer per frame makes the interval sound.
+        {
+          const clio::run::u64 pstart = pn * h_->elems_per_page_;
+          const clio::run::u64 avail =
+              h_->num_elems_ > pstart ? h_->num_elems_ - pstart : 0;
+          const clio::run::u64 whole =
+              avail < h_->elems_per_page_ ? avail : h_->elems_per_page_;
+          a = 0;
+          b = static_cast<clio::run::u32>(whole > b ? whole : b);
+        }
         bool is_new = false;
         Page *p = nullptr;
-        if (Shared()) {
+        {
           // Find-or-claim is ONE decision, taken under the set lock, and it
           // leaves the frame PINNED -- the pin is what stops another CUDA
           // block evicting this page between here and the caller's HoldPage.
@@ -1053,48 +858,28 @@ class DeviceVector {
             ReportSetFull(pn);
             __trap();
           }
-          (void)is_new;
-        } else {
-          p = Find(pn);
-        }
-        // RESIDENT IS NOT THE SAME AS VALID, and VALID IS NOT THE SAME AS
-        // CURRENT. A frame holding a different slice of this page needs a
-        // transfer; so does one holding an older generation, or a
-        // generational fetch would be satisfied by exactly the stale copy it
-        // exists to refuse. Widen to the union so the valid range stays one
-        // interval.
-        const bool current =
-            (bt->fetch_generation == 0) || (p != nullptr &&
-                                            p->generation >= bt->fetch_generation);
-        if (Covers(p, a, b) && current) continue;
-        if (p != nullptr && !current) {
-          // Stale: refetch the whole page rather than patch an interval whose
-          // two halves would then be from different generations.
-          p->valid_lo = 0u;
-          p->valid_hi = 0u;
-        }
-        clio::run::u32 flo = a, fhi = b;
-        if (p != nullptr) {
-          if (p->valid_hi > p->valid_lo) {
-            flo = p->valid_lo < a ? p->valid_lo : a;
-            fhi = p->valid_hi > b ? p->valid_hi : b;
+          if (!is_new) {
+            const bool stale = bt->fetch_generation != 0 &&
+                               p->generation < bt->fetch_generation;
+            if (!stale) continue;              // pinned; peer fills it
+            if (atomicCAS(&p->fetching, 0u, 1u) != 0u) continue;
+            p->valid_lo = 0u;                  // ours to refill, whole
+            p->valid_hi = 0u;
+            is_new = true;
           }
-        } else {
-          p = FindFree();
-          if (p == nullptr) {
-            printf("[gpu_vector] FATAL table=%u: no free frame for page %llu "
-                   "after EvictPages\n", Table(), (unsigned long long) pn);
-            __trap();
-          }
-          p->valid_lo = 0u;
-          p->valid_hi = 0u;
-          if (ChargeFrame()) EvictForBudget(1u, SetOf(pn));
         }
+        // Everything below runs for a frame THIS block just claimed and must
+        // fill: a frame a peer owns took the `continue` above, and a stale one
+        // was reset to empty when the CAS won it. So there is no residency to
+        // re-check, no interval to widen, and no free-frame search -- the
+        // claim already did all three.
+        const clio::run::u32 flo = a, fhi = b;
         const clio::run::u64 boff =
             static_cast<clio::run::u64>(flo) * sizeof(T);
         const clio::run::u64 blen =
             static_cast<clio::run::u64>(fhi - flo) * sizeof(T);
-        p->fetching = 1u;
+        // AllocatePage (or the staleness CAS) already marked this frame in
+        // flight, and PublishFetch takes that mark back. One mark per record.
         p->page_num = pn;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
         // Only the bytes the caller named. The rest of the frame keeps
@@ -1147,6 +932,8 @@ class DeviceVector {
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
 
+
+
   CTP_GPU_FUN bool FetchBusy() const { return Tasks()->fetch_busy != 0u; }
   CTP_GPU_FUN bool FetchDone() const {
     BlockTasks *bt = Tasks();
@@ -1161,7 +948,6 @@ class DeviceVector {
   /** Make a landed fetch's pages readable. Thread 0 only. */
   CTP_GPU_FUN void PublishFetch() {
     BlockTasks *bt = Tasks();
-    Page *tbl = Pages();
     if (bt->fetch->GetReturnCode() != 0 && h_->stat_get_errors_ != nullptr) {
       atomicAdd(h_->stat_get_errors_, 1ull);
     }
@@ -1172,9 +958,8 @@ class DeviceVector {
       // is a lost update: with eight blocks filling eight slices of one page,
       // ALL EIGHT read valid=[0,0) and the last writer's slice is the only
       // one that survives -- measured, every block saw pre=[0,0).
-      const bool locked = Shared();
-      if (locked) LockSet(SetOf(p->page_num));
-      if (Shared() && p->valid_hi > p->valid_lo) {
+      LockSet(SetOf(p->page_num));
+      if (p->valid_hi > p->valid_lo) {
         // UNION, DO NOT OVERWRITE. In a shared cache several CUDA blocks fill
         // the SAME frame with different slices of one page. Assigning made
         // the frame claim only whichever landed last, and every other block
@@ -1193,8 +978,12 @@ class DeviceVector {
       p->score = kDefaultScore;
       p->last_access = clock64();
       __threadfence();
-      p->fetching = 0u;      // published last: Find skips a fetching frame
-      if (locked) UnlockSet(SetOf(p->page_num));
+      // A COUNT, LIKE `flushing`. Assigning zero here is one block clearing
+      // every other block's mark: with several blocks fetching slices of one
+      // frame, the first to publish declared the frame settled while the rest
+      // were still in flight.
+      atomicSub(&p->fetching, 1u);
+      UnlockSet(SetOf(p->page_num));
     }
     bt->fetch_n = 0;
     bt->fetch_busy = 0u;
@@ -1218,7 +1007,6 @@ class DeviceVector {
                                      const clio::run::u64 *hi,
                                      clio::run::u32 nr) {
     BlockTasks *bt = Tasks();
-    Page *tbl = Pages();
     auto *t = bt->flush;
     t->count_ = 0;
     clio::run::u32 n = 0, dropped = 0;
@@ -1235,7 +1023,6 @@ class DeviceVector {
         // block's bytes away. Measured: eight blocks writing eight slices of
         // one page, and only the first one's slice reached the store.
         // Private tables never saw it -- one writer per frame.
-        if (!Shared() && p->flushing) continue;
         if (n >= clio::cte::core::kPodMultiMax) { ++dropped; continue; }
         clio::run::u64 boff = 0, blen = 0;
         if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
@@ -1299,7 +1086,6 @@ class DeviceVector {
         h_->stat_put_errors_ != nullptr) {
       atomicAdd(h_->stat_put_errors_, 1ull);
     }
-    Page *tbl = Pages();
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &h_->pages_[bt->flush_slot[i]];
       atomicSub(&p->flushing, 1u);   // count, so concurrent flushes nest

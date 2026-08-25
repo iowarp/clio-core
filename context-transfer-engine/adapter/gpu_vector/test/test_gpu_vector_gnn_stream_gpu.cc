@@ -85,7 +85,7 @@ using clio::run::u64;
 /** Copy `count` floats from a plain device buffer INTO the paged vector. */
 __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
                                      const float *src, u64 elems_per_block,
-                                     clio::run::u32 block) {
+                                     u64 logical, clio::run::u32 block) {
   const u64 base = static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
     u64 run = 0;
@@ -95,13 +95,21 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
                                    /*write=*/true);
       run = h.run();
       for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
-        h[base + i + k] = src[base + i + k];
+        // CLAMP TO THE LOGICAL LENGTH. The vector is padded up to whole pages
+        // per block, `src` is not, and the last block's tail read past the end
+        // of it -- "1 bytes after the nearest allocation", caught by memcheck.
+        // The padding is still written (with zeros) so the page flushes whole.
+        const u64 idx = base + i + k;
+        h[idx] = (idx < logical) ? src[idx] : 0.0f;
       }
     }
     // Flush as we go: the vector never writes back on its own, so a dirty
     // page is unevictable and a working set larger than the cache cannot be
     // served. Async, so the write still overlaps the next page.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser. Safe after BeginFlush:
+    // a frame with a flush in flight is not an eviction candidate.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing when
@@ -112,18 +120,19 @@ __device__ gy::YCoroMain VecFillCoro(gv::DeviceVector<float> v,
 
 __global__ void VecFillKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> v, const float *src,
-                              u64 elems_per_block, gy::YieldableView<> yv,
+                              u64 elems_per_block, u64 logical,
+                              gy::YieldableView<> yv,
                               gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(VecFillCoro(v, src, elems_per_block, yv.Block()));
+  CLIO_YCORO_RUN(VecFillCoro(v, src, elems_per_block, logical, yv.Block()));
 }
 
 /** Scatter the paged vector back OUT into a plain device buffer. */
 __device__ gy::YCoroMain VecDrainCoro(gv::DeviceVector<float> v, float *dst,
-                                      u64 elems_per_block,
+                                      u64 elems_per_block, u64 logical,
                                       clio::run::u32 block) {
   const u64 base = static_cast<u64>(block) * elems_per_block;
   for (u64 i = 0; i < elems_per_block;) {
@@ -133,21 +142,25 @@ __device__ gy::YCoroMain VecDrainCoro(gv::DeviceVector<float> v, float *dst,
       // Read-only sweep: the hold stays write=false, so every page is dropped
       // clean and nothing is written back. THE HOLD IS THE PIN, so eviction
       // cannot re-tenant the slot under a lane that is still reading.
-      dst[base + i + k] = h[base + i + k];
+      const u64 idx = base + i + k;
+      if (idx < logical) dst[idx] = h[idx];
     }
-    i += h.run();
+    const u64 run = h.run();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
   }
 }
 
 __global__ void VecDrainKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> v, float *dst,
-                               u64 elems_per_block, gy::YieldableView<> yv,
+                               u64 elems_per_block, u64 logical,
+                               gy::YieldableView<> yv,
                                gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(VecDrainCoro(v, dst, elems_per_block, yv.Block()));
+  CLIO_YCORO_RUN(VecDrainCoro(v, dst, elems_per_block, logical, yv.Block()));
 }
 
 __global__ void GnnAggMeanKernel(const float *feat, int D,
@@ -465,8 +478,11 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
   double t_store = 0.0, t_stream = 0.0;
   gv::Vector<float>::Stats st{};
   {
+    // Same total frames as the old per-block tables, in ONE set: with a
+    // 2-frame set every block hashes into, the third to arrive finds it full.
     gv::Vector<float> vec("gnn_stream_feat", {0}, page_bytes, nblocks,
-                          slots, padded_elems, CompressorPool(), codec, preset);
+                          slots * nblocks, padded_elems, CompressorPool(),
+                          codec, preset, /*nsets=*/1);
     vec.EnableStats();
 
     ctp::GpuApi::Synchronize();
@@ -486,7 +502,8 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
       RunYieldable(nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                 gy::YieldStackView sv) {
         VecFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu_info, vec.GetDevice(0), d_src, elems_per_block, vw, sv);
+            gpu_info, vec.GetDevice(0), d_src, elems_per_block,
+            static_cast<u64>(feat_elems), vw, sv);
       });
       ctp::GpuApi::Synchronize();
     }
@@ -507,7 +524,8 @@ TEST_CASE("gpu_vector: GraphSAGE forward over features streamed through a "
     RunYieldable(nblocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                               gy::YieldStackView sv) {
       VecDrainKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu_info, vec.GetDevice(0), d_feat, elems_per_block, vw, sv);
+          gpu_info, vec.GetDevice(0), d_feat, elems_per_block,
+          static_cast<u64>(feat_elems), vw, sv);
     });
     ctp::GpuApi::Synchronize();
     t_stream = NowSec() - t0;

@@ -99,6 +99,8 @@ __device__ gy::YCoroMain WriteRangeCoro(gv::DeviceVector<u32> v,
     // dirty page is unevictable until the caller flushes it. Async, so
     // it overlaps the next page; the servicer retires it once it lands.
     co_await v.BeginFlush(0, base + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
   co_await v.EndFlush();
@@ -129,14 +131,17 @@ __device__ gy::YCoroMain ReadRangeCoro(gv::DeviceVector<u32> v, u64 first_elem,
     co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
     auto h = co_await v.HoldPage(base + i, elems_per_block - i);
     for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
-      // Read-only sweep: the hold stays write=false, so every page is dropped
-      // clean and nothing is written back. THE HOLD IS THE PIN: eviction
-      // cannot re-tenant the slot under a lane that is still reading.
+      // Read-only sweep: the hold stays write=false, so every page is
+      // dropped clean and nothing is written back. THE FETCH IS THE PIN and
+      // it is still held here, so eviction cannot re-tenant the frame under
+      // a lane that is still reading.
       const u32 got = h[base + i + k];
       atomicAdd(sum, static_cast<unsigned long long>(got));
       if (got != Pattern(base + i + k, round)) atomicAdd(mismatches, 1ull);
     }
-    i += h.run();
+    const u64 run = h.run();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
   }
 }
 

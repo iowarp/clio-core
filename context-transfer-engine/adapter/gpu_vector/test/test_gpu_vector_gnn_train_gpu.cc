@@ -264,7 +264,9 @@ __device__ gy::YCoroMain GnnGatherCoro(gv::DeviceVector<float> v,
     co_await v.Fetch(0, v.PageLo(lo + i), v.PageSpan(lo + i, 1));
     auto h = co_await v.HoldPage(lo + i, n - i);
     GnnCopyRun(h.ptr(), h.run(), scratch + i);
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(lo + i), v.PageSpan(lo + i, 1));
+    i += run;
   }
 }
 

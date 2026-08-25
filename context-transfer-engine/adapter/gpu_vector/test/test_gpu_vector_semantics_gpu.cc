@@ -94,6 +94,8 @@ __device__ gy::YCoroMain WriteCoro(gv::DeviceVector<u32> v, u64 base,
     // the cache without flushing cannot be served and is refused. Async, so
     // the write still overlaps the next page.
     co_await v.BeginFlush(0, off + i, run);
+    // Fetch is the pinner; UnpinRange is the releaser.
+    v.UnpinRange(v.PageLo(off + i), v.PageSpan(off + i, 1));
     i += run;
   }
   (void) flush;   // every page is flushed above; the flag is now advisory
@@ -127,7 +129,9 @@ __device__ gy::YCoroMain VerifyCoro(gv::DeviceVector<u32> v, u64 base,
       if (h[off + i + k] != Val(off + i + k, salt)) ++local;
     }
     if (local != 0) atomicAdd(bad, local);
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(off + i), v.PageSpan(off + i, 1));
+    i += run;
   }
 }
 
@@ -153,6 +157,7 @@ __device__ gy::YCoroMain WalkCoro(gv::DeviceVector<u32> v, u64 first_page,
       co_await v.Fetch(0, v.PageLo(off), v.PageSpan(off, 1));
       auto h = co_await v.HoldPage(off, 1);
       if (threadIdx.x == 0) acc += h[off];
+      v.UnpinRange(v.PageLo(off), v.PageSpan(off, 1));
     }
   }
   if (threadIdx.x == 0) atomicAdd(sink, acc);
@@ -181,6 +186,7 @@ __device__ gy::YCoroMain TouchSeqCoro(gv::DeviceVector<u32> v,
     co_await v.Fetch(0, v.PageLo(off), v.PageSpan(off, 1));
     auto h = co_await v.HoldPage(off, 1);
     if (threadIdx.x == 0) acc += h[off];
+    v.UnpinRange(v.PageLo(off), v.PageSpan(off, 1));
   }
   if (threadIdx.x == 0) atomicAdd(sink, acc);
 }
@@ -243,6 +249,7 @@ __device__ gy::YCoroMain RescoreCoro(gv::DeviceVector<u32> v, u64 page,
   co_await v.Fetch(0, v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
   auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
   h.Rescore(score);
+  v.UnpinRange(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
 }
 __global__ void RescoreKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<u32> v, u64 page, float score,
@@ -304,6 +311,11 @@ __device__ gy::YCoroMain BatchFlushCoro(gv::DeviceVector<u32> v, u64 npages,
     }
     off += h.run();
   }
+  // HOLD THE PINS UNTIL AFTER THE FLUSH. This coro deliberately dirties every
+  // page and only then writes them back, so unpinning per page let the frames
+  // be evicted in between -- and eviction performs no I/O, so those writes
+  // were dropped and the flush found nothing to send. The host read of page 0
+  // failed outright. The pins go back at the end, one per fetch.
   // The barrier is load-bearing: FlushBlockBatched submits and clears `dirty`,
   // so a lane still writing when lane 0 flushes loses its writes AND leaves
   // the page looking clean.
@@ -323,6 +335,10 @@ __device__ gy::YCoroMain BatchFlushCoro(gv::DeviceVector<u32> v, u64 npages,
   }
   if (threadIdx.x == 0) atomicAdd(flushed, npages);
   co_await v.EndFlush();
+  // One unpin per page, matching the one fetch per page above.
+  for (clio::run::u64 off = 0; off < total; off += v.ElemsPerPage()) {
+    v.UnpinRange(v.PageLo(off), v.PageSpan(off, 1));
+  }
 }
 
 __global__ void BatchFlushKernel(clio::run::IpcManagerGpuInfo info,
@@ -411,12 +427,14 @@ __device__ gy::YCoroMain BoundaryCoro(gv::DeviceVector<u32> v,
     // just submitted: the very next hold needs this exact frame, so there is
     // nothing to overlap with.
     co_await v.Flush(0, last_of_prev, 1);
+    v.UnpinRange(v.PageLo(last_of_prev), v.PageSpan(last_of_prev, 1));
     {
       co_await v.Fetch(0, v.PageLo(first_of_next), v.PageSpan(first_of_next, 1));
       auto h = co_await v.HoldPage(first_of_next, 1, /*write=*/true);
       if (threadIdx.x == 0) h[first_of_next] = Val(first_of_next, 7u);
     }
     co_await v.Flush(0, first_of_next, 1);
+    v.UnpinRange(v.PageLo(first_of_next), v.PageSpan(first_of_next, 1));
   }
 }
 
@@ -452,6 +470,7 @@ __device__ gy::YCoroMain MultiLaneReadCoro(gv::DeviceVector<u32> v, u64 count,
       if (h[base + i] != Val(base + i, salt)) ++local;
     }
     __syncthreads();
+    v.UnpinRange(v.PageLo(base), v.PageSpan(base, 1));
   }
   atomicAdd(bad, local);
 }
@@ -486,6 +505,7 @@ __device__ gy::YCoroMain MultiLaneWriteCoro(gv::DeviceVector<u32> v, u64 count,
     // collective FlushAsync barriers internally, so no lane's writes can be
     // lost to the submit clearing `dirty`.
     co_await v.Flush(0, base, v.ElemsPerPage());
+    v.UnpinRange(v.PageLo(base), v.PageSpan(base, 1));
   }
 }
 
@@ -528,6 +548,7 @@ __device__ gy::YCoroMain PrefetchWalkCoro(gv::DeviceVector<u32> v, u64 count,
     }
     if (local != 0) atomicAdd(bad, local);
     __syncthreads();
+    v.UnpinRange(v.PageLo(off), v.PageSpan(off, 1));
   }
 }
 
@@ -554,6 +575,7 @@ __device__ gy::YCoroMain RescoreStormCoro(gv::DeviceVector<u32> v, u64 page,
   co_await v.Fetch(0, v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
   auto h = co_await v.HoldPage(page * kPageElems, kPageElems);
   for (u32 r = 0; r < reps; ++r) h.Rescore(static_cast<float>(r));
+  v.UnpinRange(v.PageLo(page * kPageElems), v.PageSpan(page * kPageElems, 1));
 }
 __global__ void RescoreStormKernel(clio::run::IpcManagerGpuInfo info,
                                    gv::DeviceVector<u32> v, u64 page, u32 reps,
@@ -630,8 +652,16 @@ struct Fixture {
   gv::Vector<u32> vec;
   gv::DeviceVector<u32> dev;
 
+  // A SMALL CACHE IS NOW FEW WIDE SETS, NOT MANY NARROW ONES.
+  // `slots` used to be frames in THIS BLOCK's table, so 2 meant 2. Under
+  // one associative cache it would mean 2 frames in a set every block
+  // hashes into, and the third block to want a page there finds it full
+  // -- a caller error, correctly reported, not something to wait out.
+  // Keep the same total frame count in ONE fully-associative set.
   Fixture(const std::string &tag, u32 nblocks, u32 slots, u64 npages)
-      : vec(tag, {0}, kPageBytes, nblocks, slots, npages * kPageElems) {
+      : vec(tag, {0}, kPageBytes, nblocks, slots * nblocks,
+            npages * kPageElems, clio::run::PoolId::GetNull(), 0, 1,
+            /*nsets=*/1) {
     vec.EnableStats();
     dev = vec.GetDevice(0);
   }

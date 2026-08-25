@@ -128,6 +128,10 @@ __device__ gy::YCoroMain GrayScottHoldCoro(gv::DeviceVector<float> ui,
     huo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
     hvo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
   }
+  ui.UnpinRange(0, cells);
+  vi.UnpinRange(0, cells);
+  uo.UnpinRange(0, cells);
+  vo.UnpinRange(0, cells);
 }
 
 __global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
@@ -185,7 +189,12 @@ __device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
       hvo[k] = b;
     }
     __syncthreads();
-    i += hu.run();
+    const u64 run = hu.run();
+    u.UnpinRange(u.PageLo(i), u.PageSpan(i, 1));
+    v.UnpinRange(v.PageLo(i), v.PageSpan(i, 1));
+    uo.UnpinRange(uo.PageLo(i), uo.PageSpan(i, 1));
+    vo.UnpinRange(vo.PageLo(i), vo.PageSpan(i, 1));
+    i += run;
   }
 }
 
@@ -218,6 +227,7 @@ __device__ gy::YCoroMain VecToRawCoro(gv::DeviceVector<float> src, float *dst,
     co_await src.Fetch(0, src.PageLo(idx), src.PageSpan(idx, 1));
     auto h = co_await src.HoldPage(idx, 1);
     dst[idx] = h[idx];
+    src.UnpinRange(src.PageLo(idx), src.PageSpan(idx, 1));
   }
 }
 
@@ -311,7 +321,28 @@ int main(int argc, char **argv) {
     }
   }
   const u64 cells = static_cast<u64>(dim) * dim;
-  const u64 page_bytes = page_kb * 1024;
+  // ONE HOLD PER FIELD MEANS ONE PAGE PER FIELD.
+  //
+  // The hold arm takes a single guard over the whole field and then indexes
+  // it across every cell, including the stencil's neighbours. A guard reaches
+  // only to the end of ITS page, so with several pages per field that read
+  // ran off the frame. It used to land on the right bytes anyway: the private
+  // cache filled a block's table in page order, so page k+1 was the next
+  // frame in memory. One associative cache places a frame by hash, so the
+  // accident is gone and the same read returns another page's data --
+  // measured here as 3541 of 65536 cells disagreeing with the raw baseline.
+  //
+  // Round the page up to the whole field so the premise is true by
+  // construction rather than by luck.
+  u64 page_bytes = page_kb * 1024;
+  const u64 field_bytes = cells * sizeof(float);
+  if (page_bytes < field_bytes) {
+    while (page_bytes < field_bytes) page_bytes <<= 1;
+    std::printf("  note: one hold per field needs one page per field; "
+                "raising page to %lluKB\n",
+                (unsigned long long)(page_bytes >> 10));
+    page_kb = page_bytes >> 10;
+  }
   const u64 page_elems = page_bytes / sizeof(float);
   const u64 pages = (cells + page_elems - 1) / page_elems;
 

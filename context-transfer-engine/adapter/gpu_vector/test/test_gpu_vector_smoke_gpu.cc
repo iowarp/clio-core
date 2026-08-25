@@ -107,6 +107,9 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector<clio::run::u32> v,
     // rather than silently writing data out. Flushing per page keeps the dirty
     // set at one.
     co_await v.Flush(0, i, run);
+    // GIVE THE PIN BACK. Fetch is the pinner; a range fetched and never
+    // unpinned is a frame no block can reclaim, and the set fills up.
+    v.UnpinRange(v.PageLo(i), v.PageSpan(i, 1));
     i += run;
   }
   // Every page was flushed as it was written; nothing is left dirty.
@@ -135,7 +138,9 @@ __device__ gy::YCoroMain CheckCoro(gv::DeviceVector<clio::run::u32> v,
         atomicAdd(bad, 1ull);
       }
     }
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(i), v.PageSpan(i, 1));
+    i += run;
   }
 }
 
@@ -179,6 +184,7 @@ __device__ gy::YCoroMain MultiFillCoro(gv::DeviceVector<clio::run::u32> v,
     // oversubscribed, so leaving pages dirty would fill the table and the
     // fault could not be served without a writeback nobody asked for.
     co_await v.Flush(0, base + i, run);
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
     i += run;
   }
 }
@@ -208,7 +214,9 @@ __device__ gy::YCoroMain MultiCheckCoro(gv::DeviceVector<clio::run::u32> v,
         atomicAdd(bad, 1ull);
       }
     }
-    i += h.run();
+    const clio::run::u64 run = h.run();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
   }
 }
 
@@ -331,8 +339,13 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
   }
 
   // ---- many blocks ------------------------------------------------------
-  // Each block drives its own slice through its own page table. Slices are
-  // page-aligned so blocks never contend for a page.
+  // Each block drives its own slice. Slices are page-aligned so blocks never
+  // contend for a PAGE -- but they do contend for a SET, which is the new
+  // sizing rule: distinct pages hash into shared sets, so associativity must
+  // cover however many blocks can hold a page of one set at the same time.
+  // At 2 frames per set a third block finds them both pinned and the cache
+  // says so ("set=0 full for page 11: 2 of 2 frames pinned"). 8 is the
+  // measured floor here.
   //
   // Runs to 128 blocks, the spec's maximum. Each block gets as many cache
   // slots as pages, so this axis measures BLOCK COUNT alone.
@@ -346,8 +359,8 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     const clio::run::u64 per = 2 * 1024;            // 2 pages per block
     const clio::run::u64 n = per * nb;
     gv::Vector<clio::run::u32> mv("gv_multi" + std::to_string(nb), {0},
-                                  kPageBytes, /*nblocks=*/nb,
-                                  /*pages_per_block=*/2, n);
+                                  kPageBytes, /*nsets=*/nb,
+                                  /*frames_per_set=*/8, n);
 
     RunYieldable(nb, mv, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, mv.GetDevice(0), per, vw, sv); });
@@ -400,8 +413,11 @@ TEST_CASE("gpu_vector: write, flush, read back", "[gpu_vector][smoke]") {
     const unsigned nb = 64u;
     const clio::run::u64 per = 4 * 1024;
     const clio::run::u64 n = per * nb;
+    // Associativity 8 for the same reason as above; oversubscription now
+    // comes from the BYTE BUDGET (half the frame array) against 4 pages per
+    // block, not from a two-slot table.
     gv::Vector<clio::run::u32> ov("gv_multi_ov", {0}, kPageBytes, nb,
-                                  /*pages_per_block=*/2, n);
+                                  /*frames_per_set=*/8, n);
     RunYieldable(nb, ov, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
       MultiFillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, ov.GetDevice(0), per, vw, sv); });
     ctp::GpuApi::Synchronize();

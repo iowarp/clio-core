@@ -89,6 +89,9 @@ __device__ gy::YCoroMain HbmSeedCoro(gv::DeviceVector<clio::run::u32> v,
     // page is unevictable and a working set larger than the cache cannot be
     // served. Async, so the write still overlaps the next page.
     co_await v.BeginFlush(0, base + off, run);
+    // Fetch is the pinner; UnpinRange is the releaser. Safe after BeginFlush:
+    // a frame with a flush in flight is not an eviction candidate.
+    v.UnpinRange(v.PageLo(base + off), v.PageSpan(base + off, 1));
   }
   // SubmitPut clears `dirty` as it submits, so a lane still writing the last
   // page when the flush submits would lose its writes AND leave the page
@@ -124,6 +127,7 @@ __device__ gy::YCoroMain HbmDotCoro(gv::DeviceVector<clio::run::u32> v,
              Activation(base + off + i);
     }
     atomicAdd(sum, acc);
+    v.UnpinRange(v.PageLo(base + off), v.PageSpan(base + off, 1));
   }
 }
 

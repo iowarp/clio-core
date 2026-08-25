@@ -49,7 +49,6 @@ constexpr u64 kPages = 8;
 constexpr u64 kElems = kPages * kEpp;
 /** Private: frames per table. Shared: frames per SET, 2x over-provisioned so
  *  hash collisions have room -- the byte budget is held by cache_frames_. */
-constexpr u32 kSlotsPrivate = 8;
 constexpr u32 kSlotsShared = 4;
 
 CTP_INLINE_CROSS_FUN u32 Pattern(u64 i) {
@@ -261,13 +260,14 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
 
   int rc = 0;
 
-  // Same workload twice: private tables, then one shared cache. Identical
-  // kernels -- UnpinRange is a no-op in private mode, which is what lets one
-  // kernel serve both halves of the A/B.
-  auto run_mode = [&](const char *what, bool shared, u32 slots) -> u32 {
-    gv::Vector<u32> vec(shared ? "gv_shared_b" : "gv_shared_a", {0}, kPageBytes,
-                        kBlocks, slots, kElems,
-                        clio::run::PoolId::GetNull(), 0, 1, shared);
+  // Every block reads every page. THE CLAIM is that the cache holds each of
+  // them once, no matter how many blocks are in it. There is no private-table
+  // arm any more -- per-block tables are gone -- so the control is the
+  // arithmetic: with kBlocks blocks and one table each this would have read
+  // back kBlocks copies of every page.
+  auto run_mode = [&](const char *what, u32 slots) -> u32 {
+    gv::Vector<u32> vec("gv_shared_b", {0}, kPageBytes, kBlocks, slots,
+                        kElems);
     {
       std::vector<u32> zero(kElems, 0u);
       vec.Preload(zero.data(), kElems);
@@ -303,17 +303,14 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
     return copies;
   };
 
-  const u32 priv_copies = run_mode("private", false, kSlotsPrivate);
-  const u32 shared_copies = run_mode("shared", true, kSlotsShared);
+  const u32 shared_copies = run_mode("shared", kSlotsShared);
 
   // ---- the cases a SHARED cache creates, which a private one cannot ----
   //
   // Above, every block reads whole pages, so a frame is either wholly there
   // or absent. These three put several blocks on ONE frame at once.
-  auto scenario = [&](const char *what, bool shared, u32 slots, u64 pages,
-                      auto &&body) {
-    gv::Vector<u32> vec(what, {0}, kPageBytes, kBlocks, slots, pages * kEpp,
-                        clio::run::PoolId::GetNull(), 0, 1, shared);
+  auto scenario = [&](const char *what, u32 slots, u64 pages, auto &&body) {
+    gv::Vector<u32> vec(what, {0}, kPageBytes, kBlocks, slots, pages * kEpp);
     {
       std::vector<u32> zero(static_cast<size_t>(pages * kEpp), 0u);
       vec.Preload(zero.data(), pages * kEpp);
@@ -341,7 +338,7 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
 
   // 1. Eight blocks each fetch a DIFFERENT SLICE of page 0, at the same time,
   //    then read back only their own slice. One frame, eight partial fills.
-  scenario("shared: partial fetch x8", true, kSlotsShared, kPages,
+  scenario("shared: partial fetch x8", kSlotsShared, kPages,
            [&](gv::Vector<u32> &vec) {
              RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                        gy::YieldStackView sv) {
@@ -354,7 +351,7 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
   //    eight concurrent writers -- each flushing only its own bytes. Then the
   //    page is re-read whole. A whole-page flush, or a lost slice, shows up
   //    as mismatches here.
-  scenario("shared: disjoint writers x8", true, kSlotsShared, kPages,
+  scenario("shared: disjoint writers x8", kSlotsShared, kPages,
            [&](gv::Vector<u32> &vec) {
              RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                        gy::YieldStackView sv) {
@@ -372,37 +369,11 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
 
   // 3. Eviction under contention: 8 pages, 2 frames per set, every block
   //    streaming every page three times from a different starting offset.
-  scenario("shared: eviction churn", true, /*slots=*/2, kPages,
+  scenario("shared: eviction churn", /*slots=*/2, kPages,
            [&](gv::Vector<u32> &vec) {
              RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
                                        gy::YieldStackView sv) {
                ChurnKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-                   gpu, vec.GetDevice(0), d_bad, vw, sv);
-             });
-           });
-
-  // The same three under PRIVATE tables, as the control: they must pass
-  // there too, or the scenario is testing the workload rather than sharing.
-  scenario("private: partial fetch x8", false, kSlotsPrivate, kPages,
-           [&](gv::Vector<u32> &vec) {
-             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                                       gy::YieldStackView sv) {
-               PartialFetchKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-                   gpu, vec.GetDevice(0), d_bad, vw, sv);
-             });
-           });
-  scenario("private: disjoint writers x8", false, kSlotsPrivate, kPages,
-           [&](gv::Vector<u32> &vec) {
-             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                                       gy::YieldStackView sv) {
-               SliceWriteKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-                   gpu, vec.GetDevice(0), d_bad, vw, sv);
-             });
-             ctp::GpuApi::Synchronize();
-             vec.ClearCache();
-             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                                       gy::YieldStackView sv) {
-               SliceVerifyKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
                    gpu, vec.GetDevice(0), d_bad, vw, sv);
              });
            });
@@ -414,15 +385,8 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
                 shared_copies);
     rc = 1;
   }
-  // The control. If private mode also stored one copy, this workload would
-  // not be exercising sharing at all and the check above would prove nothing.
-  if (priv_copies <= 1u) {
-    std::printf("  FAIL: private tables held %u copies -- the A/B is not "
-                "measuring anything\n", priv_copies);
-    rc = 1;
-  }
-  std::printf("  replication: private %u copies -> shared %u\n", priv_copies,
-              shared_copies);
+  std::printf("  replication: %u blocks reading every page -> %u copies\n",
+              kBlocks, shared_copies);
   REQUIRE(rc == 0);
 }
 #endif  // !CTP_IS_DEVICE_PASS
