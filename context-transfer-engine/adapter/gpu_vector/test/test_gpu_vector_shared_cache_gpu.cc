@@ -113,6 +113,98 @@ __device__ gy::YCoroMain ReadAllCoro(gv::DeviceVector<u32> v,
   }
 }
 
+/**
+ * SEVERAL BLOCKS WRITE ONE PAGE, each its own slice, and each publishes only
+ * that slice.
+ *
+ * In a shared cache this is literally one frame being written by every block
+ * at once. It is safe only because the slices are byte-disjoint and Flush is
+ * byte-exact -- a whole-page flush here would have each block ship its view
+ * of the other seven slices and clobber them.
+ */
+__device__ gy::YCoroMain SliceWriteCoro(gv::DeviceVector<u32> v, u32 block,
+                                        u32 nblocks) {
+  const u64 slice = kEpp / nblocks;
+  const u64 off = static_cast<u64>(block) * slice;   // all inside page 0
+  co_await v.Fetch(0, off, slice);
+  {
+    auto h = co_await v.HoldPage(off, slice, /*write=*/true);
+    for (u64 i = threadIdx.x; i < slice; i += blockDim.x) {
+      h[off + i] = Pattern(off + i) ^ 0xABCDu;
+    }
+  }
+  __syncthreads();
+  co_await v.Flush(0, off, slice);       // exactly this block's bytes
+  v.UnpinRange(off, slice);
+}
+
+/** Read back the whole page every block just co-wrote. */
+__device__ gy::YCoroMain SliceVerifyCoro(gv::DeviceVector<u32> v,
+                                         unsigned long long *bad) {
+  co_await v.Fetch(0, 0, kEpp);
+  {
+    auto h = co_await v.HoldPage(0, kEpp);
+    for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
+      if (h[i] != (Pattern(i) ^ 0xABCDu)) atomicAdd(bad, 1ull);
+    }
+  }
+  __syncthreads();
+  v.UnpinRange(0, kEpp);
+}
+
+/**
+ * SEVERAL BLOCKS FETCH DIFFERENT SLICES OF ONE PAGE, concurrently.
+ *
+ * This is the case a shared cache creates and a private one cannot: two
+ * blocks filling the SAME frame with different sub-ranges. Each block then
+ * reads back only what it asked for, so any block whose slice was dropped
+ * from the frame's valid range fails here rather than silently reading bytes
+ * nobody fetched.
+ */
+__device__ gy::YCoroMain PartialFetchCoro(gv::DeviceVector<u32> v, u32 block,
+                                          u32 nblocks,
+                                          unsigned long long *bad) {
+  const u64 slice = kEpp / nblocks;
+  const u64 off = static_cast<u64>(block) * slice;   // all inside page 0
+  co_await v.Fetch(0, off, slice);
+  {
+    auto h = co_await v.HoldPage(off, slice);
+    for (u64 i = threadIdx.x; i < slice; i += blockDim.x) {
+      if (h[off + i] != Pattern(off + i)) atomicAdd(bad, 1ull);
+    }
+  }
+  __syncthreads();
+  v.UnpinRange(off, slice);
+}
+
+/**
+ * Every block streams every page with a cache far smaller than the vector,
+ * so frames are evicted and refetched under contention from all sides.
+ * Correct data here means eviction is picking victims nobody is using.
+ */
+__device__ gy::YCoroMain ChurnCoro(gv::DeviceVector<u32> v, u32 block,
+                                   u32 nblocks, u64 pages,
+                                   unsigned long long *bad) {
+  for (u64 r = 0; r < 3; ++r) {
+    for (u64 k = 0; k < pages; ++k) {
+      // Start each block at a different page so they collide continuously
+      // instead of marching in lockstep.
+      const u64 pg = (k + block) % pages;
+      const u64 off = pg * kEpp;
+      co_await v.Fetch(0, off, kEpp);
+      {
+        auto h = co_await v.HoldPage(off, kEpp);
+        for (u64 i = threadIdx.x; i < kEpp; i += blockDim.x) {
+          if (h[off + i] != Pattern(off + i)) atomicAdd(bad, 1ull);
+        }
+      }
+      __syncthreads();
+      v.UnpinRange(off, kEpp);
+    }
+  }
+  (void)nblocks;
+}
+
 #define GV_KERNEL(name, coro)                                                 \
   __global__ void name(clio::run::IpcManagerGpuInfo info,                     \
                        gv::DeviceVector<u32> v,                               \
@@ -127,6 +219,10 @@ __device__ gy::YCoroMain ReadAllCoro(gv::DeviceVector<u32> v,
 
 GV_KERNEL(SeedKernel, SeedCoro(v, yv.Block()))
 GV_KERNEL(ReadAllKernel, ReadAllCoro(v, bad))
+GV_KERNEL(SliceWriteKernel, SliceWriteCoro(v, yv.Block(), kBlocks))
+GV_KERNEL(SliceVerifyKernel, SliceVerifyCoro(v, bad))
+GV_KERNEL(PartialFetchKernel, PartialFetchCoro(v, yv.Block(), kBlocks, bad))
+GV_KERNEL(ChurnKernel, ChurnCoro(v, yv.Block(), kBlocks, kPages, bad))
 
 #if !CTP_IS_DEVICE_PASS
 TEST_CASE("gpu_vector: a shared cache stores a page once",
@@ -209,6 +305,107 @@ TEST_CASE("gpu_vector: a shared cache stores a page once",
 
   const u32 priv_copies = run_mode("private", false, kSlotsPrivate);
   const u32 shared_copies = run_mode("shared", true, kSlotsShared);
+
+  // ---- the cases a SHARED cache creates, which a private one cannot ----
+  //
+  // Above, every block reads whole pages, so a frame is either wholly there
+  // or absent. These three put several blocks on ONE frame at once.
+  auto scenario = [&](const char *what, bool shared, u32 slots, u64 pages,
+                      auto &&body) {
+    gv::Vector<u32> vec(what, {0}, kPageBytes, kBlocks, slots, pages * kEpp,
+                        clio::run::PoolId::GetNull(), 0, 1, shared);
+    {
+      std::vector<u32> zero(static_cast<size_t>(pages * kEpp), 0u);
+      vec.Preload(zero.data(), pages * kEpp);
+      vec.ClearCache();
+    }
+    // Seed every page through the one-writer-per-page path.
+    RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
+      SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, vec.GetDevice(0), d_bad,
+                                                  vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    vec.ClearCache();
+    ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
+    body(vec);
+    ctp::GpuApi::Synchronize();
+    unsigned long long bad = 0;
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&bad),
+                        reinterpret_cast<const char *>(d_bad),
+                        sizeof(unsigned long long));
+    std::printf("  %-28s bad=%llu -> %s\n", what, (unsigned long long)bad,
+                bad == 0 ? "PASS" : "FAIL");
+    if (bad != 0) rc = 1;
+  };
+
+  // 1. Eight blocks each fetch a DIFFERENT SLICE of page 0, at the same time,
+  //    then read back only their own slice. One frame, eight partial fills.
+  scenario("shared: partial fetch x8", true, kSlotsShared, kPages,
+           [&](gv::Vector<u32> &vec) {
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               PartialFetchKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+           });
+
+  // 2. Eight blocks WRITE disjoint slices of page 0 -- one shared frame,
+  //    eight concurrent writers -- each flushing only its own bytes. Then the
+  //    page is re-read whole. A whole-page flush, or a lost slice, shows up
+  //    as mismatches here.
+  scenario("shared: disjoint writers x8", true, kSlotsShared, kPages,
+           [&](gv::Vector<u32> &vec) {
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               SliceWriteKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+             ctp::GpuApi::Synchronize();
+             vec.ClearCache();          // force the read to go to the store
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               SliceVerifyKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+           });
+
+  // 3. Eviction under contention: 8 pages, 2 frames per set, every block
+  //    streaming every page three times from a different starting offset.
+  scenario("shared: eviction churn", true, /*slots=*/2, kPages,
+           [&](gv::Vector<u32> &vec) {
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               ChurnKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+           });
+
+  // The same three under PRIVATE tables, as the control: they must pass
+  // there too, or the scenario is testing the workload rather than sharing.
+  scenario("private: partial fetch x8", false, kSlotsPrivate, kPages,
+           [&](gv::Vector<u32> &vec) {
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               PartialFetchKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+           });
+  scenario("private: disjoint writers x8", false, kSlotsPrivate, kPages,
+           [&](gv::Vector<u32> &vec) {
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               SliceWriteKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+             ctp::GpuApi::Synchronize();
+             vec.ClearCache();
+             RunYieldable(kBlocks, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                       gy::YieldStackView sv) {
+               SliceVerifyKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+                   gpu, vec.GetDevice(0), d_bad, vw, sv);
+             });
+           });
 
   // THE CLAIM. Shared mode stores each page exactly once no matter how many
   // blocks read it.

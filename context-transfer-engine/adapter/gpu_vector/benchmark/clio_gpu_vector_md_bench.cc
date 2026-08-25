@@ -231,6 +231,7 @@ struct Args {
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
+  int shared_x = 0;        // x in ONE shared associative cache, not per block
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
   // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
@@ -641,6 +642,11 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     u64 srun[6];
     const float *sp0[6], *sp1[6];
     u32 sbase[6], scnt[6], sdz[6];
+    // WHAT THE FETCH PINNED, so the chunk can give it back. In shared mode
+    // Fetch is the pinner and UnpinRange the releaser; a range fetched and
+    // never released is a frame no other block can ever reclaim. A no-op
+    // under private tables, where the guards above own their own pins.
+    u64 sxrb[6], sxlen[6];
     u32 nspans = 0;
     for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
@@ -669,6 +675,8 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
         MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
+        sxrb[nspans] = rb;
+        sxlen[nspans] = len;
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
         sbase[nspans] = rl[t];
@@ -802,6 +810,9 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     // reads one row at a time, so with the flush the cache can be tiny.
     co_await nl.BeginFlush(0, row * rowlist, rowlist);
     }   // per-row loop
+    // Inside the guard scope: sxrb/nspans live here, and the pins must go
+    // back before the next chunk fetches its own spans.
+    for (u32 sq = 0; sq < nspans; ++sq) x.UnpinRange(sxrb[sq], sxlen[sq]);
     }
     co_await nl.EndFlush();
   }     // per-chunk loop
@@ -927,6 +938,11 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     u64 srun[6];
     const float *sp0[6], *sp1[6];
     u32 sbase[6], scnt[6], sdz[6];
+    // WHAT THE FETCH PINNED, so the chunk can give it back. In shared mode
+    // Fetch is the pinner and UnpinRange the releaser; a range fetched and
+    // never released is a frame no other block can ever reclaim. A no-op
+    // under private tables, where the guards above own their own pins.
+    u64 sxrb[6], sxlen[6];
     u32 nspans = 0;
     for (int dz = -1; dz <= 1; ++dz) {
       const u32 wz = (bz + nb + dz) % nb;
@@ -955,6 +971,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
         MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
+        sxrb[nspans] = rb;
+        sxlen[nspans] = len;
         sp0[nspans] = hg[nspans][0].ptr();
         sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
         sbase[nspans] = rl[t];
@@ -1116,6 +1134,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // Every span guard above is dead here (the chunk body scope ends with
     // this brace), so the reservation is given back exactly once per
     // EnterHoldSet. The only chunk-level `continue` is above the Enter.
+    for (u32 sq = 0; sq < nspans; ++sq) x.UnpinRange(sxrb[sq], sxlen[sq]);
     }
   }     // per-chunk loop
   if (eflag) {
@@ -2050,6 +2069,7 @@ int main(int argc, char **argv) {
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
+    else if (std::strcmp(argv[i], "--shared-x") == 0) a.shared_x = 1;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
@@ -2304,8 +2324,34 @@ int main(int argc, char **argv) {
   // Row geometry, so a flush can name exactly the rows a block owns.
   const u64 md_row_elems = static_cast<u64>(g.nb) * g.cap * kStride;
   const u64 md_nrows = static_cast<u64>(g.nb) * g.nb;
-  gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, slots,
-                       g.nelems);
+  // SHARED x: one associative cache for the whole grid instead of one table
+  // per CUDA block. Sized to hold the WHOLE vector -- sets are 2x
+  // over-provisioned so the byte budget is half the frames, and x is the
+  // vector every block reads (100% shared, mean degree 8.22), so the point is
+  // for it never to evict at all.
+  const u32 x_sets = tbl_blocks;
+  // A SET OF ONE IS A DIRECT MAP WITH NO ROOM FOR A COLLISION, and with more
+  // sets than pages that is exactly what the formula produces (64 sets, 11
+  // pages -> 1 frame per set), so the first two pages that hash together
+  // wedge. Floor it: associativity is what makes a hash cache work at all.
+  u32 x_slots = slots;
+  if (a.shared_x) {
+    const u64 want = (2ull * (npages + 2) + x_sets - 1) / x_sets;
+    x_slots = static_cast<u32>(want < 4 ? 4 : want);
+  }
+  gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, x_slots,
+                       g.nelems, clio::run::PoolId::GetNull(), 0, 1,
+                       a.shared_x != 0);
+  if (a.shared_x) {
+    std::printf("  SHARED x: %u sets x %u frames = %llu frames for %llu pages "
+                "(budget %llu frames, %.1f MB) -- one copy for the whole "
+                "grid\n",
+                x_sets, x_slots,
+                (unsigned long long)((u64)x_sets * x_slots),
+                (unsigned long long)npages,
+                (unsigned long long)((u64)x_sets * x_slots / 2),
+                (double)((u64)x_sets * x_slots / 2) * page_bytes / 1048576.0);
+  }
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.

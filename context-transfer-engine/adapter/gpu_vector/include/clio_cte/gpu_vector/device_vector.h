@@ -787,6 +787,11 @@ class DeviceVector {
     p->valid_lo = 0u;
     p->valid_hi = 0u;
     p->generation = 0;
+    // MARK IT IN FLIGHT BEFORE PUBLISHING THE TAG. Find() skips fetching
+    // frames, so until the transfer lands no other CUDA block can mistake
+    // this claimed-but-empty frame for a resident page -- which it otherwise
+    // does, and then traps on the hold because the valid range is [0,0).
+    p->fetching = 1u;
     atomicAdd(&p->pins, 1u);
     UnlockSet(set);
     // Charge AFTER releasing the lock: paying the budget back may need other
@@ -1162,13 +1167,34 @@ class DeviceVector {
     }
     for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
       Page *p = &h_->pages_[bt->fetch_slot[i]];
-      p->valid_lo = bt->fetch_vlo[i];
-      p->valid_hi = bt->fetch_vhi[i];
+      // UNDER THE SET LOCK, because this is a read-modify-write on a frame
+      // several CUDA blocks are publishing into at once. Unioning without it
+      // is a lost update: with eight blocks filling eight slices of one page,
+      // ALL EIGHT read valid=[0,0) and the last writer's slice is the only
+      // one that survives -- measured, every block saw pre=[0,0).
+      const bool locked = Shared();
+      if (locked) LockSet(SetOf(p->page_num));
+      if (Shared() && p->valid_hi > p->valid_lo) {
+        // UNION, DO NOT OVERWRITE. In a shared cache several CUDA blocks fill
+        // the SAME frame with different slices of one page. Assigning made
+        // the frame claim only whichever landed last, and every other block
+        // then failed Covers on a range it had itself just fetched:
+        //   "elements [896,1024) were never fetched -- the frame holds
+        //    [640,768)"
+        // where [640,768) is another block's slice. Private tables never see
+        // this: one writer per frame.
+        if (bt->fetch_vlo[i] < p->valid_lo) p->valid_lo = bt->fetch_vlo[i];
+        if (bt->fetch_vhi[i] > p->valid_hi) p->valid_hi = bt->fetch_vhi[i];
+      } else {
+        p->valid_lo = bt->fetch_vlo[i];
+        p->valid_hi = bt->fetch_vhi[i];
+      }
       p->generation = bt->fetch_generation;
       p->score = kDefaultScore;
       p->last_access = clock64();
       __threadfence();
       p->fetching = 0u;      // published last: Find skips a fetching frame
+      if (locked) UnlockSet(SetOf(p->page_num));
     }
     bt->fetch_n = 0;
     bt->fetch_busy = 0u;
@@ -1202,7 +1228,14 @@ class DeviceVector {
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
         Page *p = Find(pn);
-        if (p == nullptr || p->flushing) continue;
+        if (p == nullptr) continue;
+        // `flushing` IS A COUNT, NOT A FLAG. In a shared cache several CUDA
+        // blocks flush DISJOINT slices of the same frame at the same time;
+        // skipping because someone else is mid-flush silently threw this
+        // block's bytes away. Measured: eight blocks writing eight slices of
+        // one page, and only the first one's slice reached the store.
+        // Private tables never saw it -- one writer per frame.
+        if (!Shared() && p->flushing) continue;
         if (n >= clio::cte::core::kPodMultiMax) { ++dropped; continue; }
         clio::run::u64 boff = 0, blen = 0;
         if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
@@ -1212,7 +1245,7 @@ class DeviceVector {
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                       sizeof(pn32));
         bt->flush_slot[n++] = static_cast<clio::run::u32>(p - h_->pages_);
-        p->flushing = 1u;
+        atomicAdd(&p->flushing, 1u);
       }
     }
     bt->flush_n = n;
@@ -1269,7 +1302,7 @@ class DeviceVector {
     Page *tbl = Pages();
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &h_->pages_[bt->flush_slot[i]];
-      p->flushing = 0u;
+      atomicSub(&p->flushing, 1u);   // count, so concurrent flushes nest
     }
     bt->flush_n = 0;
     bt->flush_busy = 0u;
