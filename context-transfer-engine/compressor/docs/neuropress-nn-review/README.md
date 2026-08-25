@@ -15,6 +15,9 @@ them (`compressor_runtime.cc:1465-1471`; `Save()` is never called).
 | `03_debate_round1.md` | investigator | concede / contest / partial for every attack; 8 points left in dispute (D1–D8) |
 | `04_debate_round2.md` | adversary | settles D1–D8 with idle-GPU, common-ground-truth runs; agreed gaps and suggestions |
 | `05_agreed_findings.md` | moderator | **start here** — the converged, concise list of gaps and bottlenecks and the ranked suggestions |
+| `06_in_memory_adaptation.md` | moderator | First step without retraining: adaptive SGD rule (an input clamp was evaluated and removed), measured on live LAMMPS simulations through the runtime. Read this after 05. |
+| `06a_adaptive_rule_implementation.md` | implementation agent | What changed in the kernels/predictor, knob semantics, bit-identity proof, deterministic probes P1–P4. |
+| `06b_adaptive_rule_measurements.md` | benchmark agent | Datasets, protocol, every arm and table behind 06. |
 
 Reproduction: the measurement harnesses (`np_eval.cu`, `np_sgd.cu`,
 `np_ood_upstream.cu`, `np_adv.cu`) live in the gitignored
