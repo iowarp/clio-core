@@ -13,6 +13,7 @@ set(COMPRESSOR_SOURCES
     src/models/neuropress_bridge.cc
     src/neuropress_chunk_diag.cc
     src/neuropress_telemetry.cc
+    src/neuropress_explore.cc
     src/autogen/compressor_lib_exec.cc
 )
 
