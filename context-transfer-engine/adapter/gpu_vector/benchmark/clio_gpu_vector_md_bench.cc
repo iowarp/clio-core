@@ -2082,6 +2082,41 @@ int main(int argc, char **argv) {
   // the resident regime: the default cache holds everything. An explicit
   // --slots below that is a configuration for later stages, not this gate.
   u32 slots = (a.slots != 0) ? a.slots : static_cast<u32>(npages + 2);
+  // A DEFAULT CACHE MUST STILL FIT THE DEVICE. `slots` above sizes ONE table
+  // for full residency, but the per-block vectors get one table per block, so
+  // the default cost is blocks * (npages+2) * page_bytes while the PROBLEM
+  // SIZE IS UNCHANGED -- raising --blocks alone used to walk straight into
+  // "CUDA Error 2: out of memory" with nothing having checked. Residency is
+  // still the default WHEN IT FITS; when it does not, plan within what the
+  // device actually has rather than asking for what it does not.
+  if (a.vram_mb == 0 && a.slots == 0) {
+    size_t dev_free = 0, dev_total = 0;
+    if (cudaMemGetInfo(&dev_free, &dev_total) == cudaSuccess) {
+      const NlGeom nlg0 =
+          a.md ? NlGeometry(g.nb, g.cap, a.maxneigh, a.nl_page_kb)
+               : NlGeom{0, 0};
+      const u32 s_full = static_cast<u32>(npages + 2);
+      const u32 nl_full =
+          (nlg0.pages == 0) ? 0u : static_cast<u32>(nlg0.pages + 2);
+      const clio::run::u64 want =
+          PlanCost(a.blocks, s_full, s_full, s_full, nl_full, page_bytes,
+                   nlg0.page_bytes);
+      // Headroom for the runtime, the staging buffers and the frames the
+      // vectors allocate outside their caches. Measured, not guessed: 0.80
+      // of free is what leaves lattice 50 at 16 blocks resident.
+      const clio::run::u64 budget =
+          static_cast<clio::run::u64>(static_cast<double>(dev_free) * 0.80);
+      if (want > budget) {
+        a.vram_mb = budget / (1024ull * 1024ull);
+        std::printf("  note: full residency needs %llu MB over %u blocks but "
+                    "only %llu MB is free; planning caches within %llu MB "
+                    "(problem size unchanged -- pass --vram-mb to override)\n",
+                    (unsigned long long)(want / (1024 * 1024)), a.blocks,
+                    (unsigned long long)(dev_free / (1024 * 1024)),
+                    (unsigned long long)a.vram_mb);
+      }
+    }
+  }
   // --vram-mb divides a budget across every per-block cache. Explicit
   // per-vector flags still win, so a single vector can be pinned while the
   // rest fit the budget.
