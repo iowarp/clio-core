@@ -73,15 +73,21 @@ class Vector {
    * @param tag_name   CTE tag representing this vector
    * @param gpu_ids    GPUs to build device views for
    * @param page_bytes page granularity
-   * @param nblocks    page tables to create
-   * @param pages_per_block resident pages each table may hold
+   * @param nblocks    page tables to create; in SHARED mode, associative SETS
+   * @param pages_per_block resident pages each table may hold; in SHARED mode
+   *        the size of one set, ~2x the budget's share so hash collisions
+   *        have somewhere to go
    * @param num_elems  logical length of the vector
+   * @param shared     one cache for the whole grid instead of one table per
+   *        CUDA block. A page's home set is Hash(page_num) % nblocks, so a
+   *        page touched by every block is stored ONCE. Costs a per-set lock;
+   *        buys back the replication.
    */
   Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 pages_per_block, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
-         int compress_lib = 0, int compress_preset = 1)
+         int compress_lib = 0, int compress_preset = 1, bool shared = false)
       : storage_pool_id_(storage_pool_id.IsNull() ? clio::cte::core::kCtePoolId
                                                   : storage_pool_id),
         compress_lib_(compress_lib),
@@ -89,7 +95,8 @@ class Vector {
         page_bytes_(page_bytes),
         nblocks_(nblocks),
         pages_per_block_(pages_per_block),
-        num_elems_(num_elems) {
+        num_elems_(num_elems),
+        shared_(shared) {
     if (page_bytes_ == 0 || nblocks_ == 0 || pages_per_block_ == 0) {
       throw std::runtime_error("gpu_vector: zero page size / blocks / pages");
     }
@@ -301,6 +308,39 @@ class Vector {
 #endif
   }
 
+  /**
+   * Copy every frame's metadata to the host.
+   *
+   * THE DUPLICATION CHECK NEEDS TO SEE THE WHOLE ARRAY AT ONCE. "Is this
+   * cache actually shared" is answered by counting how many frames hold the
+   * same page_num: one in shared mode, up to one-per-CUDA-block in private
+   * mode. That is not visible from any single set.
+   */
+  std::vector<Page> ReadTable(int gpu_id) const {
+    auto it = devs_.find(gpu_id);
+    if (it == devs_.end()) return {};
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nblocks_) * pages_per_block_;
+    std::vector<Page> out(static_cast<size_t>(nslots));
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(out.data()),
+                        reinterpret_cast<const char *>(it->second.table_base),
+                        static_cast<size_t>(nslots * sizeof(Page)));
+    return out;
+  }
+
+  /** How many frames hold the most-duplicated resident page. 1 == shared. */
+  clio::run::u32 MaxPageCopies(int gpu_id) const {
+    const std::vector<Page> tbl = ReadTable(gpu_id);
+    std::map<clio::run::u64, clio::run::u32> seen;
+    clio::run::u32 worst = 0;
+    for (const Page &p : tbl) {
+      if (p.page_num == kNoPage) continue;
+      const clio::run::u32 n = ++seen[p.page_num];
+      if (n > worst) worst = n;
+    }
+    return worst;
+  }
+
   Stats ReadStats(int gpu_id) const {
     Stats s;
 #if CTP_ENABLE_CUDA
@@ -333,6 +373,10 @@ class Vector {
     ctp::ipc::AllocatorId table_alloc;
     ctp::ipc::AllocatorId tasks_alloc;
     ctp::ipc::AllocatorId btbl_alloc;
+    ctp::ipc::AllocatorId locks_alloc;
+    ctp::ipc::AllocatorId count_alloc;
+    char *locks_base = nullptr;
+    char *count_base = nullptr;
     unsigned long long *stats = nullptr;
   };
 
@@ -363,6 +407,26 @@ class Vector {
         st.tasks_alloc.IsNull() || st.btbl_alloc.IsNull()) {
       throw std::runtime_error("gpu_vector: device backend allocation failed");
     }
+    if (shared_) {
+      // One lock per set, strided so no two share a cache line, plus the
+      // occupancy counter that holds an over-provisioned frame array to the
+      // byte budget it was sized from.
+      const clio::run::u32 kLockStride = 32;
+      st.locks_alloc = ipc->AllocateAndRegisterGpuBackend(
+          gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          static_cast<size_t>(nblocks_) * kLockStride * sizeof(int),
+          &st.locks_base);
+      st.count_alloc = ipc->AllocateAndRegisterGpuBackend(
+          gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          sizeof(unsigned long long), &st.count_base);
+      if (st.locks_alloc.IsNull() || st.count_alloc.IsNull()) {
+        throw std::runtime_error("gpu_vector: shared-cache allocation failed");
+      }
+      ctp::GpuApi::Memset(st.locks_base, 0,
+                          static_cast<size_t>(nblocks_) * kLockStride *
+                              sizeof(int));
+      ctp::GpuApi::Memset(st.count_base, 0, sizeof(unsigned long long));
+    }
 
     InitPageTable(st, nslots);
     InitTasks(st);
@@ -374,6 +438,16 @@ class Vector {
     st.hdr.num_elems_ = num_elems_;
     st.hdr.nblocks_ = nblocks_;
     st.hdr.pages_per_block_ = pages_per_block_;
+    st.hdr.shared_ = shared_ ? 1u : 0u;
+    st.hdr.set_locks_ =
+        shared_ ? reinterpret_cast<int *>(st.locks_base) : nullptr;
+    st.hdr.cache_frames_ =
+        shared_ ? reinterpret_cast<unsigned long long *>(st.count_base)
+                : nullptr;
+    // Sets are 2x over-provisioned for collisions, so the BYTE budget is half
+    // the frames that exist. Without this the cache grows to the size of the
+    // array rather than the size it was asked for.
+    st.hdr.max_frames_ = shared_ ? (nslots / 2) : nslots;
     st.hdr.tag_id_ = tag_id_;
     st.hdr.pool_id_ = storage_pool_id_;
     st.hdr.task_alloc_id_ = st.tasks_alloc;
@@ -517,6 +591,7 @@ class Vector {
   clio::run::u32 nblocks_ = 0;
   clio::run::u32 pages_per_block_ = 0;
   clio::run::u64 num_elems_ = 0;
+  bool shared_ = false;
   clio::cte::core::TagId tag_id_;
   std::map<int, DevState> devs_;
 };
