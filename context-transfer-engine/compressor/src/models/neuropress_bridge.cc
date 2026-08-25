@@ -265,6 +265,10 @@ std::vector<CompressionStats> RankIntoStats(
     // Score() call, no sort. That is the point of the kernel having done it.
     if (order.size() != candidates.size() ||
         scores.size() != candidates.size()) {
+      // Say it FAILED. Without this the caller sees an empty list, skips its
+      // rc=4, and quietly re-ranks on the legacy CPU candidates -- the exact
+      // host fallback the kError below claims is not happening.
+      if (out_inference_failed) *out_inference_failed = true;
       return {};
     }
     ranked.reserve(order.size());
@@ -273,6 +277,7 @@ std::vector<CompressionStats> RankIntoStats(
       if (slot < 0 || static_cast<size_t>(slot) >= candidates.size()) {
         // Malformed permutation. Refuse rather than silently re-rank on the
         // host for a stage that just ran on the GPU.
+        if (out_inference_failed) *out_inference_failed = true;
         return {};
       }
       ranked.push_back({candidates[slot], preds[slot], scores[i]});

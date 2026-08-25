@@ -2377,7 +2377,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           np_final_lib,
           ctp::CompressionFactory::NameForWireId(np_final_lib).c_str(),
           np_final_preset,
-          (np_final_lib == np_primary_lib && np_final_preset == np_primary_preset)
+          np_final_lib == 0
+              ? "(STORED RAW -- no codec kept)"
+          : (np_final_lib == np_primary_lib &&
+             np_final_preset == np_primary_preset)
               ? "(primary kept)"
               : "(EXPLORATION OVERRODE THE PRIMARY)");
     }
@@ -2711,7 +2714,15 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
           header_size + worst_case_size, &device_output);
       if (device_output_alloc_id.IsNull()) {
-        output_on_device = false;  // Fall back to the host buffer below.
+        // GPU OOM is exactly when the caller needs to know: a device-resident
+        // chunk is about to be compressed into a HOST buffer, which is a
+        // different data path with different cost, not a detail.
+        HLOG(kError,
+             "Compress: GPU output allocation failed ({} bytes); the chunk is "
+             "device-resident but its compressed output falls back to HOST "
+             "memory",
+             header_size + worst_case_size);
+        output_on_device = false;
       }
     }
     if (!output_on_device) {
@@ -2847,13 +2858,22 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         // Core and extension are copied SEPARATELY: header_size is 56 for a
         // quantized blob, and copying that many bytes out of the 24-byte
         // struct would read past it.
-        ctp::GpuApi::Memcpy(device_output,
-                            reinterpret_cast<const char *>(&header),
-                            sizeof(CompressionHeader));
+        // DeviceAwareMemcpy, NOT GpuApi::Memcpy. The latter is cudaMemcpy on
+        // the LEGACY DEFAULT stream, and a pageable H2D returns once the
+        // source is staged -- the DMA is still outstanding. The bdev worker
+        // reads these bytes back on a cudaStreamNonBlocking stream, which is
+        // not ordered against the legacy one, so it could copy whatever the
+        // previous occupant of this recycled address left in the first 24
+        // bytes; the read side then rejected the blob. The payload never
+        // raced -- the codec synchronizes its own stream. DeviceAwareMemcpy
+        // syncs its private stream, so the header is on the device here.
+        ctp::DeviceAwareMemcpy(device_output,
+                               reinterpret_cast<const char *>(&header),
+                               sizeof(CompressionHeader));
         if (applied_quant) {
-          ctp::GpuApi::Memcpy(device_output + sizeof(CompressionHeader),
-                              reinterpret_cast<const char *>(&quant_ext),
-                              sizeof(quant_ext));
+          ctp::DeviceAwareMemcpy(device_output + sizeof(CompressionHeader),
+                                 reinterpret_cast<const char *>(&quant_ext),
+                                 sizeof(quant_ext));
         }
         compressed_shm_ptr.alloc_id_ = device_output_alloc_id;
         compressed_shm_ptr.off_ = reinterpret_cast<clio::run::u64>(device_output);
@@ -2942,8 +2962,42 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // exists on the storing branch.
       if (!task->no_store_) task->return_code_ = stored_put_rc;
     } else {
-      // Compression failed or didn't reduce size - store original data
-      HLOG(kDebug, "Compression not beneficial, storing original data");
+      // Compression failed or didn't reduce size - store original data.
+      //
+      // kWarning, not kDebug: this is a SUBSTITUTION. The caller asked for the
+      // chunk to be compressed, a codec was selected and run, and what reached
+      // the tier is the original bytes with compress_lib_ zeroed. Nothing in
+      // the return code says so -- rc stays 0 -- and downstream a raw blob is
+      // indistinguishable from one whose codec happened to be lib 0. On
+      // incompressible data (melted-LJ float64 coordinates, say) this is the
+      // MAJORITY outcome, not a rare corner, so a run can store almost nothing
+      // compressed and report success.
+      //
+      // It stays a warning rather than a failure because storing raw is the
+      // correct answer here: the alternative is writing more bytes than the
+      // caller gave us. What must not happen is doing it quietly.
+      //
+      // The name and the ratio are both in the message because the aggregate
+      // ("8 of 9 raw") does not say WHICH chunks, and the ratio distinguishes
+      // "the codec achieved 0.99x" from "the codec failed outright" -- the
+      // first is data, the second is a defect.
+      if (success) {
+        HLOG(kWarning,
+             "Compression not beneficial for blob '{}': {} bytes in -> {} "
+             "bytes out with lib {} ({}), which is not smaller, so the "
+             "ORIGINAL bytes were stored and compress_lib_ was reset to 0. "
+             "The blob is in the tier UNCOMPRESSED.",
+             task->blob_name_.str(), (size_t)input_size,
+             (size_t)total_stored_size, context.compress_lib_,
+             ctp::CompressionFactory::NameForWireId(context.compress_lib_));
+      } else {
+        HLOG(kWarning,
+             "Compression FAILED for blob '{}' ({} bytes, lib {} ({})); the "
+             "ORIGINAL bytes were stored instead and compress_lib_ was reset "
+             "to 0. The blob is in the tier UNCOMPRESSED.",
+             task->blob_name_.str(), (size_t)input_size, context.compress_lib_,
+             ctp::CompressionFactory::NameForWireId(context.compress_lib_));
+      }
 
       // Mark uncompressed BEFORE the put, not after. The bytes below are the
       // caller's original bytes, so the blob must not be recorded as carrying

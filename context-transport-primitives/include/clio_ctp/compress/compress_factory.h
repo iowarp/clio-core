@@ -241,6 +241,13 @@ class CompressionFactory {
     if (!ctp::IsDevicePointer(input) || IsGpuLibraryWireId(wire_id)) {
       return input;
     }
+    // A CPU codec cannot read device memory, so the whole chunk comes down.
+    // Say so: this is a full D2H of the payload, not a detail -- a caller that
+    // arranged for device residency has just lost it.
+    HLOG(kWarning,
+         "StageInputIfNeeded: staging {} bytes DEVICE->HOST because wire id {} "
+         "is a CPU codec; the chunk is no longer device-resident",
+         input_size, wire_id);
     staging.resize(input_size);
     ctp::GpuApi::Memcpy(staging.data(), input, input_size);
     return staging.data();

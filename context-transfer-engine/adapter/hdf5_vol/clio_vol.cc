@@ -1990,8 +1990,17 @@ static bool clio_stage_chunk(clio_dataset_t *dataset, size_t chunk_index,
       dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});
       staged_on_device = true;
     }
-    /* Falls through to the host buffer below on allocation failure --
-       same graceful-degradation contract the host path already has. */
+    /* Falls through to the host buffer below on allocation failure. The VOL
+       must not fail the write (clio_vol.cc's contract), but a device-resident
+       write silently becoming a host one is precisely the kind of degradation
+       that has to be visible -- the only record used to be a PATH_TRACE line
+       that exists in instrumented builds alone. */
+    if (!staged_on_device) {
+      HLOG(kError,
+           "clio_stage_chunk: GPU staging allocation failed ({} bytes); this "
+           "device-resident write falls back to HOST staging",
+           this_size);
+    }
   }
 #endif
   if (!staged_on_device) {
@@ -2599,6 +2608,15 @@ static bool clio_read_cached_image(clio_dataset_t *dataset,
         if (gpu_ptr) {
           blob_data.alloc_id_ = gpu_alloc;
           blob_data.off_ = reinterpret_cast<clio::run::u64>(gpu_ptr);
+        } else {
+          // The caller asked for a DEVICE destination. Falling back to a CPU
+          // SHM buffer abandons the compressor's device unshuffle/dequantize
+          // path, so the read silently takes a different route than requested.
+          HLOG(kError,
+               "refill: GPU destination allocation failed ({} bytes); this "
+               "read falls back to a HOST buffer and the device decompress "
+               "path is not used",
+               this_size);
         }
       }
 #endif

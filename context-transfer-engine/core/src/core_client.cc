@@ -54,6 +54,13 @@ bool StageDeviceBlobForPut(clio::run::IpcManager *ipc_manager,
     blob_data = ctp::ipc::ShmPtr<>::GetNull();
     return false;
   }
+  // Whole-blob D2H. Deliberate -- a non-runtime caller cannot hand device
+  // memory straight to the core -- but it means a device-resident put has
+  // become a host one, and that has to be visible rather than inferred.
+  HLOG(kWarning,
+       "StageDeviceBlobForPut: staging {} bytes DEVICE->HOST; this put is no "
+       "longer device-resident",
+       size);
   ctp::GpuApi::Memcpy(staging.ptr_, resolved.ptr_, size);
   blob_data = ctp::ipc::ShmPtr<>(staging.shm_);
   return true;
