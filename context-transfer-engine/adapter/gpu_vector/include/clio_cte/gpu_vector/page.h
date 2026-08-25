@@ -27,7 +27,6 @@ struct Page {
   float score;                // eviction rank; EvictPages takes the lowest
   clio::run::u64 last_access; // breaks score ties (LRU)
   clio::run::u32 pins;        // holders; a pinned page is never a victim
-  clio::run::u32 dirty;       // written since faulted or flushed
   clio::run::u32 flushing;    // a put is outstanding
   clio::run::u32 fetching;    // a get is outstanding
   /** WHICH ELEMENTS OF THIS FRAME ARE ACTUALLY THERE, as offsets within the

@@ -209,63 +209,6 @@ __global__ void WeightsKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(WeightsCoro(v, per, page_elems, sum, yv.Block()));
 }
 
-/**
- * Dirty every page, then force the claim path to look for a slot.
- *
- * The claim used by the batched prefetch (rescore with score 1.0) picks its
- * victim on score alone and DROPS it without writing it back, which is only
- * safe when the victim is clean. Here every page is dirty and unflushed, so a
- * claim that ignores `dirty` discards the only copy of those writes and the
- * host-side verification fails.
- */
-__device__ gy::YCoroMain DirtyClaimCoro(gv::DeviceVector<clio::run::u32> v,
-                                        clio::run::u64 per,
-                                        clio::run::u64 page_elems,
-                                        clio::run::u32 block) {
-  const clio::run::u64 base = static_cast<clio::run::u64>(block) * per;
-  const clio::run::u64 npages = per / page_elems;
-
-  for (clio::run::u64 off = 0; off < per;) {
-    clio::run::u64 run = 0;
-    {
-      co_await v.Fetch(0, v.PageLo(base + off), v.PageSpan(base + off, 1));
-      auto h = co_await v.HoldPage(base + off, per - off, /*write=*/true);
-      run = h.run();
-      for (clio::run::u64 k = threadIdx.x; k < run; k += blockDim.x) {
-        h[base + off + k] = Seed(base + off + k);
-      }
-      // Ask for a page far ahead while THIS one is still dirty. With the cache
-      // full of dirty pages the claim must decline; if it evicts one anyway,
-      // those writes are gone. Block-collective (thread 0 does the work
-      // inside); fire-and-forget on purpose -- it is a probe, not a fetch the
-      // loop depends on.
-      {
-        const clio::run::u64 ahead = (off / page_elems + npages / 2) % npages;
-        const clio::run::u64 page = base / page_elems + ahead;
-      }
-    }
-    // DELIBERATELY NOT FLUSHED. This kernel exists to prove the vector
-    // refuses to drop a dirty page: it dirties more pages than the table
-    // holds and never flushes, so the fault MUST fail loudly. A flush here
-    // silently turns the case into a no-op -- which a generic "flush as you
-    // go" rewrite did, and it went green by testing nothing.
-    off += run;
-  }
-  co_await v.EndFlush();
-}
-
-__global__ void DirtyClaimKernel(clio::run::IpcManagerGpuInfo info,
-                                 gv::DeviceVector<clio::run::u32> v,
-                                 clio::run::u64 per, clio::run::u64 page_elems,
-                                 gy::YieldableView<> yv,
-                                 gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(DirtyClaimCoro(v, per, page_elems, yv.Block()));
-}
-
 #if !CTP_IS_DEVICE_PASS
 
 namespace {

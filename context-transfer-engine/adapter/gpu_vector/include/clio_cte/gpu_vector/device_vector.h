@@ -233,7 +233,8 @@ class DeviceVector {
     // returned the stale bytes. SubmitFetch itself decides what to send and
     // sends nothing when everything is current.
     if (missing != 0) {
-      co_await EvictPages(missing, missing);
+      if (threadIdx.x == 0 && !EvictPages(missing, missing)) __trap();
+      __syncthreads();
     }
     if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
     if (threadIdx.x == 0) UnpinRanges(lo, hi, nr);
@@ -361,10 +362,9 @@ class DeviceVector {
    * decomposition.
    *
    * THE RESULT IS THIS BLOCK'S OWN FRAME, so it is writable like any other
-   * hold and its dirty bit and flush work normally. Copying is what buys
-   * that: a pointer INTO the owner's frame could not be written, because
-   * this block cannot mark another block's page dirty and the write would be
-   * dropped on eviction or clobber the owner on flush.
+   * hold and flush works normally. Copying is what buys that: a pointer INTO
+   * the owner's frame could not be written without clobbering the owner when
+   * it publishes.
    *
    * It does NOT make a page safe for two writers. The copy is a snapshot;
    * if two blocks write the same page and both flush, one loses. Writes
@@ -427,7 +427,8 @@ class DeviceVector {
       __syncthreads();
       Page *dst = s_dst;
       if (dst == nullptr) {
-        co_await EvictPages(1, 1);
+        if (threadIdx.x == 0 && !EvictPages(1, 1)) __trap();
+        __syncthreads();
         if (threadIdx.x == 0) s_dst = FindFree();
         __syncthreads();
         dst = s_dst;
@@ -442,7 +443,6 @@ class DeviceVector {
           dst->valid_lo = src->valid_lo;
           dst->valid_hi = src->valid_hi;
           dst->generation = src->generation;
-          dst->dirty = 0u;
           dst->fetching = 0u;
           dst->flushing = 0u;
           dst->score = kDefaultScore;
@@ -576,33 +576,26 @@ class DeviceVector {
     p->valid_lo = 0u;
     p->valid_hi = 0u;
     p->generation = 0;
-    p->dirty = 0u;
     p->score = kDefaultScore;
     if (h_->stat_evicts_ != nullptr) atomicAdd(h_->stat_evicts_, 1ull);
   }
 
   /**
-   * Guarantee at least `min` free frames, freeing up to `max`. If there are
-   * not enough, wait for this block's outstanding flush to land and retry.
+   * Guarantee at least `min` free frames, freeing up to `max`.
+   *
+   * EVICTION PERFORMS NO I/O. It selects victims and drops them: no transfer,
+   * no task submission, no suspend. A frame that is mid-flush or mid-fetch is
+   * simply not a candidate; an unpinned, quiet frame is dropped on the spot.
+   *
+   * This used to `co_await EndFlush()` and retry, which put I/O on the
+   * allocation path. Everything else depends on it not doing that -- a
+   * bounded, non-suspending eviction is what lets the caller hold a lock
+   * across this call.
    */
-  __device__ clio::run::gpu::YCoroTask EvictPages(clio::run::u32 min,
-                                                  clio::run::u32 max) {
-    // Try, await the outstanding flush, try once more, error. No loop, no
-    // spin: EndFlush is the only thing that can change the answer, and it
-    // can only land once.
-    __shared__ unsigned int s_ok;
-    if (threadIdx.x == 0) s_ok = FreeSome(min, max) ? 1u : 0u;
-    __syncthreads();
-    if (s_ok == 0u) {
-      co_await EndFlush();
-      if (threadIdx.x == 0) s_ok = FreeSome(min, max) ? 1u : 0u;
-      __syncthreads();
-      if (s_ok == 0u) {
-        if (threadIdx.x == 0) ReportStuck(min);
-        __trap();
-      }
-    }
-    co_return;
+  CTP_GPU_FUN bool EvictPages(clio::run::u32 min, clio::run::u32 max) {
+    const bool ok = FreeSome(min, max);
+    if (!ok) ReportStuck(min);
+    return ok;
   }
 
   /** One eviction pass; true when at least `min` frames are free. */
@@ -617,7 +610,7 @@ class DeviceVector {
       for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
         Page *c = &tbl[i];
         if (c->page_num == kNoPage) continue;
-        if (c->pins != 0u || c->dirty || c->fetching || c->flushing) continue;
+        if (c->pins != 0u || c->fetching || c->flushing) continue;
         if (victim == nullptr || c->score < victim->score ||
             (c->score == victim->score &&
              c->last_access < victim->last_access)) {
@@ -634,16 +627,18 @@ class DeviceVector {
   /** Say what is holding the table before the trap. */
   CTP_GPU_FUN void ReportStuck(clio::run::u32 min) const {
     Page *tbl = Pages();
-    clio::run::u32 pinned = 0, dirty = 0;
+    clio::run::u32 pinned = 0, busy = 0;
     for (clio::run::u32 i = 0; i < h_->pages_per_block_; ++i) {
       if (tbl[i].pins != 0u) ++pinned;
-      if (tbl[i].dirty) ++dirty;
+      if (tbl[i].fetching || tbl[i].flushing) ++busy;
     }
+    // NAME WHAT IS HOLDING IT. "no free frame" without the counts cost a day
+    // to decode once already.
     printf("[gpu_vector] FATAL table=%u: need %u free of %u frames, "
-           "%u pinned %u dirty, no flush in flight.\n"
-           "  Hold fewer pages at once, or flush before the dirty set fills "
-           "the table.\n",
-           Table(), min, h_->pages_per_block_, pinned, dirty);
+           "%u pinned, %u in flight.\n"
+           "  Hold fewer pages at once. Eviction performs no I/O, so it "
+           "cannot wait for the in-flight ones.\n",
+           Table(), min, h_->pages_per_block_, pinned, busy);
   }
 
   /** Pin a resident frame and build the guard. */
@@ -652,7 +647,6 @@ class DeviceVector {
     if (p == nullptr) return Held<T>();
     atomicAdd(&p->pins, 1u);
     if (threadIdx.x == 0) {
-      if (write) p->dirty = 1u;
       p->last_access = clock64();
     }
     const clio::run::u64 in = off % h_->elems_per_page_;
@@ -910,7 +904,6 @@ class DeviceVector {
       p->valid_lo = bt->fetch_vlo[i];
       p->valid_hi = bt->fetch_vhi[i];
       p->generation = bt->fetch_generation;
-      p->dirty = 0u;
       p->score = kDefaultScore;
       p->last_access = clock64();
       __threadfence();
@@ -933,7 +926,7 @@ class DeviceVector {
         &Tasks()->flush->fut_.is_complete_.x);
   }
 
-  /** Stage only the named ranges of dirty pages. Thread 0 only. */
+  /** Stage only the named ranges. Thread 0 only. */
   CTP_GPU_FUN void SubmitFlushRanges(const clio::run::u64 *lo,
                                      const clio::run::u64 *hi,
                                      clio::run::u32 nr) {
@@ -1016,7 +1009,6 @@ class DeviceVector {
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &tbl[bt->flush_slot[i]];
       p->flushing = 0u;
-      p->dirty = 0u;   // a flush always cleans the frame
     }
     bt->flush_n = 0;
     bt->flush_busy = 0u;

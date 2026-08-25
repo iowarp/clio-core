@@ -184,7 +184,6 @@ class Vector {
         ctp::GpuApi::Memcpy(static_cast<char *>(tbl[slot].data), buf.data(),
                             static_cast<size_t>(page_bytes_));
         tbl[slot].page_num = pg;
-        tbl[slot].dirty = 0;
         tbl[slot].pins = 0;
         tbl[slot].flushing = 0;
         tbl[slot].fetching = 0;
@@ -219,7 +218,6 @@ class Vector {
                         static_cast<size_t>(nslots * sizeof(Page)));
     for (auto &p : tbl) {
       p.page_num = kNoPage;
-      p.dirty = 0;
       p.pins = 0;
       p.flushing = 0;
       p.fetching = 0;
@@ -401,7 +399,6 @@ class Vector {
       p.score = kDefaultScore;
       p.last_access = 0;
       p.pins = 0;
-      p.dirty = 0;
       p.valid_lo = 0;
       p.valid_hi = 0;
       p.flushing = 0;

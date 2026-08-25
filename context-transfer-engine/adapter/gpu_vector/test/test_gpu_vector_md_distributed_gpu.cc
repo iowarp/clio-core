@@ -121,10 +121,10 @@ __device__ gy::YCoroMain HaloCoro(gv::DeviceVector<u32> v, u64 halo_row,
       if (tbl[i].page_num == pn) {
         ++holders;
         printf("[halo]   frame %u holds page %llu gen=%llu valid=[%u,%u) "
-               "pins=%u dirty=%u fetching=%u flushing=%u\n",
+               "pins=%u fetching=%u flushing=%u\n",
                i, (unsigned long long) pn,
                (unsigned long long) tbl[i].generation, tbl[i].valid_lo,
-               tbl[i].valid_hi, tbl[i].pins, tbl[i].dirty, tbl[i].fetching,
+               tbl[i].valid_hi, tbl[i].pins, tbl[i].fetching,
                tbl[i].flushing);
       }
     }

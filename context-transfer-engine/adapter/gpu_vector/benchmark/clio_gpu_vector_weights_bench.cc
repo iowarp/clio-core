@@ -491,9 +491,9 @@ int main(int argc, char **argv) {
               if (pg[i].page_num == gv::kNoPage && !pg[i].fetching &&
                   !pg[i].flushing) continue;
               std::fprintf(stderr,
-                           "  [pt] slot=%u page=%lld dirty=%u flushing=%u "
+                           "  [pt] slot=%u page=%lld flushing=%u "
                            "fetching=%u\n",
-                           i, (long long) pg[i].page_num, pg[i].dirty,
+                           i, (long long) pg[i].page_num,
                            pg[i].flushing, pg[i].fetching);
             }
           }
