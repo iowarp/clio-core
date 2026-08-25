@@ -1504,6 +1504,56 @@ void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
 #define CLIO_PATH_TRACE(...) ((void)0)
 #endif
 
+namespace {
+/**
+ * One alternative measured during an exploration sweep: everything the
+ * codec call needs, and everything the scoring phase reads back from it.
+ *
+ * At file scope rather than inside DynamicSchedule because the sweep's
+ * three phases hand slots to one another, and a type they can all name
+ * is easier to follow than one declared ten levels deep inside the single
+ * function that uses it.
+ */
+// Upstream launches its K alternatives on K separate CUDA streams and
+// only then syncs and scores them ("Parallel exploration: K
+// alternatives on K separate streams", gpucompress_compress.cpp).
+// The same three phases are kept here, with one deliberate
+// narrowing: only the CODEC CALL is parallel. Preparation stays on
+// this thread because it allocates and registers GPU backends
+// through the runtime, and scoring stays on it because the winner
+// comparison has to be order-deterministic -- a tie decided by which
+// worker happened to finish first would make the stored blob vary
+// run to run.
+struct ExploreSlot {
+  const CompressionStats* alt = nullptr;
+  std::string name;
+  uint32_t preset_id = 0;
+  uint32_t applied_shuffle = 0;
+  bool applied_quant = false;
+  ctp::compress::preprocess::DeviceQuantizeParams quant_params;
+  std::unique_ptr<ctp::Compressor> compressor;
+  // Buffers the codec call reads or writes. They are MOVED in from
+  // the prep loop's locals; moving a std::vector transfers the heap
+  // block rather than copying it, so `input`/`out_ptr` keep pointing
+  // at the right bytes without any fixup.
+  std::vector<char> device_staging, quant_staging, shuffle_staging,
+      output;
+  char* input = nullptr;
+  size_t compress_size = 0;
+  char* out_ptr = nullptr;
+  size_t capacity = 0;
+  // Filled by the launch/collect phases below.
+  bool ok = false;
+  bool launched = false;
+  size_t compressed_size = 0;
+  double time_ms = 0.0;
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+  ctp::NvComp* gpu = nullptr;   ///< non-null when the async path ran
+  ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
+#endif
+};
+}  // namespace
+
 clio::run::TaskResume Runtime::DynamicSchedule(
     clio::run::shared_ptr<DynamicScheduleTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -2257,48 +2307,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           bool winner_quant = false;
           ctp::compress::preprocess::DeviceQuantizeParams winner_quant_params;
 
-          // Upstream launches its K alternatives on K separate CUDA streams and
-          // only then syncs and scores them ("Parallel exploration: K
-          // alternatives on K separate streams", gpucompress_compress.cpp).
-          // The same three phases are kept here, with one deliberate
-          // narrowing: only the CODEC CALL is parallel. Preparation stays on
-          // this thread because it allocates and registers GPU backends
-          // through the runtime, and scoring stays on it because the winner
-          // comparison has to be order-deterministic -- a tie decided by which
-          // worker happened to finish first would make the stored blob vary
-          // run to run.
-          struct ExploreSlot {
-            const CompressionStats* alt = nullptr;
-            std::string name;
-            uint32_t preset_id = 0;
-            uint32_t applied_shuffle = 0;
-            bool applied_quant = false;
-            ctp::compress::preprocess::DeviceQuantizeParams quant_params;
-            std::unique_ptr<ctp::Compressor> compressor;
-            // Buffers the codec call reads or writes. They are MOVED in from
-            // the prep loop's locals; moving a std::vector transfers the heap
-            // block rather than copying it, so `input`/`out_ptr` keep pointing
-            // at the right bytes without any fixup.
-            std::vector<char> device_staging, quant_staging, shuffle_staging,
-                output;
-            char* input = nullptr;
-            size_t compress_size = 0;
-            char* out_ptr = nullptr;
-            size_t capacity = 0;
-            // Filled by the launch/collect phases below.
-            bool ok = false;
-            bool launched = false;
-            size_t compressed_size = 0;
-            double time_ms = 0.0;
-#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
-            ctp::NvComp* gpu = nullptr;   ///< non-null when the async path ran
-            ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
-#endif
-          };
           std::vector<std::unique_ptr<ExploreSlot>> slots;
           slots.reserve(alternatives.size());
 
-          // ---- Phase 1: prepare every slot (serial) ----
+          // The three steps below are the SWEEP's, not the two
+          // learning phases' -- this whole sweep runs inside learning
+          // Phase 2. They are numbered on their own axis so a
+          // reference to "Phase 2" keeps meaning upstream's.
+          // ---- Sweep step 1: prepare every slot (serial) ----
           for (const auto* alt : alternatives) {
             std::string alt_name =
                 ctp::CompressionFactory::NameForWireId(alt->compress_lib_);
@@ -2502,7 +2518,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             slots.push_back(std::move(slot));
           }
 
-          // ---- Phase 2: every slot is already in flight; collect them ----
+          // ---- Sweep step 2: every slot is already in flight; collect it ----
           // Upstream's split, on one thread: each candidate's quantize,
           // shuffle and codec launch were queued above on that candidate's own
           // CUDA stream and none of them waited, so by the time the prep loop
@@ -2564,7 +2580,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           int winner_row = -1;
           int explore_rank = 0;
 
-          // ---- Phase 3: score the slots in rank order (serial) ----
+          // ---- Sweep step 3: score the slots in rank order (serial) ----
           for (auto& sp : slots) {
             ExploreSlot& slot_ref = *sp;
             const CompressionStats* alt = slot_ref.alt;
