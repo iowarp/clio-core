@@ -1303,7 +1303,13 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         const u64 rb =
             (static_cast<u64>(wz) * nb + rl[t]) * row_elems;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        co_await src.Fetch(0, rb, len);
+        // WHOLE PAGES, BECAUSE THIS READER RE-READS THEM. The nine stencil
+        // spans of a row overlap heavily: neighbouring spans land in the same
+        // pages, and a page made valid over only one span's slice forces the
+        // next span to refetch it. Asking for the pages outright makes the
+        // second span a cache hit. The vector fetches exactly what it is
+        // told -- so a caller that wants pages has to say pages.
+        co_await src.Fetch(0, src.PageLo(rb), src.PageSpan(rb, len));
         hs[nspans][0] = co_await src.HoldPage(rb, len);
         srun[nspans] = hs[nspans][0].run();
         if (srun[nspans] < len) {
@@ -1312,7 +1318,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         }
         sp0[nspans] = hs[nspans][0].ptr();
         sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
-        co_await srcx.Fetch(0, rb, len);
+        co_await srcx.Fetch(0, srcx.PageLo(rb), srcx.PageSpan(rb, len));
         hx[nspans][0] = co_await srcx.HoldPage(rb, len);
         xrun[nspans] = hx[nspans][0].run();
         if (xrun[nspans] < len) {
