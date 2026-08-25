@@ -14,6 +14,7 @@ set(COMPRESSOR_SOURCES
     src/neuropress_chunk_diag.cc
     src/neuropress_telemetry.cc
     src/neuropress_explore.cc
+    src/neuropress_selection.cc
     src/autogen/compressor_lib_exec.cc
 )
 

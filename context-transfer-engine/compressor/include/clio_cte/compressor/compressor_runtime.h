@@ -441,6 +441,29 @@ private:
       const void** out_device_stats = nullptr);
 
   /**
+   * @brief NeuroPress's half of EstCompressionStats: rank one chunk with the
+   * model, or decline it. Defined in neuropress_selection.cc.
+   *
+   * Reads the chunk as float32 unconditionally -- the statistics kernel is
+   * typed that way and the shipped weights were normalized against it -- which
+   * is precisely why this cannot share a feature computation with the legacy
+   * models, whose features use the context's own type mapping.
+   *
+   * @param entropy,mad,second_derivative_mean The statistics it computed,
+   *   returned so a caller that falls through to the legacy heuristics can
+   *   reuse them instead of measuring the same chunk twice.
+   * @return Candidates best-first under NeuroPress's cost model, or empty
+   *   when it declined -- no usable statistics, or nothing survived the PSNR
+   *   floor. Empty is not an error: the caller's own heuristics take over,
+   *   and this has already logged that the resulting pick is not the model's.
+   */
+  std::vector<CompressionStats> NeuroPressRankChunk(
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      double* entropy, double* mad, double* second_derivative_mean,
+      double* out_entropy, double* out_mad, double* out_second_deriv,
+      bool* out_neuropress_gpu_failed, const void** out_device_stats);
+
+  /**
    * Estimate workflow compression time for a specific tier
    * @param chunk_size Size of chunk in bytes
    * @param tier_bw Tier bandwidth in bytes/second
