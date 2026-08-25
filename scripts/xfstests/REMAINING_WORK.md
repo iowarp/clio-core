@@ -44,7 +44,18 @@ exactly the measured rate and would have been red under the old gate):
 
 Both are **real filesystem-semantics bugs that are merely rare**, not test
 noise. Quarantining them is right for the gate; tolerating them is not.
-**Root cause not yet found.** They are almost
+
+**The five are really two bugs**, now tracked separately:
+
+* **#1028 — O_DIRECT vs page-cache/mmap coherence.** `generic/209` (DIO
+  invalidation of readahead), `451` (buffered reads vs async O_DIRECT writes),
+  `647` and `729` (`mmap-rw-fault`; 729 *is* 647 plus one case) are one family
+  — 8 of the 11 flake events. Every failure is an output mismatch, i.e. wrong
+  data, not a timeout.
+* **#1029 — `rmdir` ENOTEMPTY after the children were unlinked.**
+  `generic/070`, 3 events, a different deep path each time.
+
+**Root cause not yet found for either.** They are almost
 certainly the same class as the 2026-07-05 pool above — a scheduling race that
 only manifests under the runner's constrained CPU — but unlike that pool these
 FAIL rather than HANG, so the two are not proven identical. Next step is to

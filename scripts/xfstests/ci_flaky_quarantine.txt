@@ -24,12 +24,12 @@
 #
 #   test           failures / 134 clean runs   when
 #   ------------   -------------------------   -----------------------------
-#   generic/209        3  (2.2%)               1011-macfuse-build-break x2,
+#   generic/209        3  (2.2%)  [#1028]      1011-macfuse-build-break x2,
 #                                              1020-viz-teardown-deadlock
-#   generic/729        2  (1.5%)               dev (push), 1018-bdev-prealloc
-#   generic/647        1  (0.7%)               dev (push)
-#   generic/451        1  (0.7%)               1018-bdev-preallocate-budget
-#   generic/070        1  (0.7%)               1020-viz-teardown-deadlock
+#   generic/729        2  (1.5%)  [#1028]      dev (push), 1018-bdev-prealloc
+#   generic/647        1  (0.7%)  [#1028]      dev (push)
+#   generic/451        1  (0.7%)  [#1028]      1018-bdev-preallocate-budget
+#   generic/070        1  (0.7%)  [#1029]      1020-viz-teardown-deadlock
 #
 # Every one of those five red runs was on a branch that touched NOTHING these
 # tests exercise (a macFUSE-only build fix; a dashboard-teardown fix; a bdev
@@ -60,6 +60,12 @@
 #
 #   generic/729  mmap-rw-fault: pread (D_DIRECT) from hole is broken
 #                -> an O_DIRECT read from a hole did not come back zeroed.
+#
+# TRACKED: #1028 (O_DIRECT vs page-cache/mmap coherence -- generic/209, 451,
+# 647 and 729 are ONE bug family, not four flakes: 647 and 729 are the same
+# test, 451 races buffered reads against async O_DIRECT writes, 209 checks DIO
+# invalidation of readahead) and #1029 (generic/070: rmdir ENOTEMPTY after the
+# children were unlinked).
 #
 # So these are REAL filesystem-semantics bugs that happen to be rare -- not
 # infrastructure noise. Quarantine is the right call for the gate (a 0.7-2.2%
