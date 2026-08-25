@@ -12,8 +12,9 @@ through the C library interface. The third, `--order device`, reads the Kokkos
 **device** views and hands the compressor a CUDA-IPC-registered device pointer,
 so the payload is never host bytes -- still with no LAMMPS patch, because the
 code that needs Kokkos lives in this driver (`lammps_device_view.cc`) rather
-than in a LAMMPS `fix`. **Read "The device write path is not trustworthy yet"
-below before using it for anything but a demonstration.**
+than in a LAMMPS `fix`. The corruption this path used to hit is fixed (see
+"The device write path: a stream race, found and fixed"); **read "What is NOT
+verified" before relying on it outside this configuration.**
 
 ```
  ┌──────────────────────────── one process: neuropress_lammps_lib ────────────────────────────┐
@@ -289,47 +290,96 @@ Measured: without `-k on g 1 -sf kk` the run exits **3** and says so. The other
 four are code paths that could not be provoked here without injecting faults --
 stated as unverified rather than claimed.
 
-### The device write path is not trustworthy yet
+### The device write path: a stream race, found and fixed
 
-**A chunk staged as device memory whose codec actually runs can reach the tier
-corrupted.** The read side rejects it with `header is not valid (magic/version
-mismatch)`, and the damage is on disk: a cold read from a separate process with
-`CLIO_RESTART=1` fails the same blobs.
+Device-staged chunks whose codec ran **used to** reach the tier corrupted --
+the read side rejected them with `header is not valid (magic/version
+mismatch)`, and the damage was on disk: a cold read from a separate process
+failed the same blobs. It needed three things at once, and removing any one
+made it clean: device staging, a codec that actually ran, and LAMMPS/Kokkos
+sharing the process. That last condition is why the standalone GPU examples
+never showed it.
 
-It is not this driver's staging. Isolated by removing one variable at a time,
-box 10, LJ melt:
+**Root cause: a CUDA stream-ordering violation, in Clio, not in this driver.**
+The 24-byte `CompressionHeader` was written with `GpuApi::Memcpy` -- a
+`cudaMemcpy` on the **legacy default stream**, from pageable stack memory,
+which returns as soon as the source is staged while the DMA to the device is
+still outstanding. The bdev worker then read those bytes back on a
+`cudaStreamNonBlocking` stream, which is not ordered against the legacy one,
+and copied whatever the previous occupant of that recycled allocation had left
+in the first 24 bytes. The payload never raced: the codec synchronizes its own
+stream before returning. Kokkos mattered only because it parks work on the
+legacy stream, widening the window -- without it the DMA retired long before
+the reader arrived and the race was essentially never lost.
 
-| configuration | staging | codec ran | runs failed |
-|---|---|---|---|
-| `--order id --kokkos --static nvcomp-zstd` | host | all chunks | **0 of 6** |
-| `--order device --kokkos` (dynamic; 1 chunk in 9 compresses) | device | few chunks | **3 of 10** |
-| `--order device --kokkos --static nvcomp-zstd` | device | all chunks | **5 of 6** |
-| `bin/neuropress_gpu_static` (device + static, **no LAMMPS**) | device | all chunks | **0 of 5** |
-| `bin/neuropress_gpu_direct` (device, **no LAMMPS**) | device | all chunks | **0 of 3** |
+Fixed by writing the header with `ctp::DeviceAwareMemcpy`, which synchronizes
+its own private stream. `GpuApi::Synchronize()` would also have worked but was
+rejected: on the legacy stream it blocks a compressor worker until the
+simulation's entire queued `run` segment retires.
 
-The failure rate tracks how many chunks a codec actually runs on: the dynamic
-default stores 8 of 9 chunks raw and fails 3 runs in 10, `--static` compresses
-all 9 and fails 5 in 6. **The default is not safe either** -- an earlier
-5-run sample showed 0 failures and was simply too small.
+| configuration | before | after |
+|---|---|---|
+| `--order device --kokkos --static nvcomp-zstd` | 5 of 8 runs failed | **0 of 8** |
+| `--order device --kokkos` (dynamic) | 3 of 10 failed | **0 of 6** |
+| cold `./read.sh`, separate process, `CLIO_RESTART=1` | failed | **9 of 9 bit-exact** |
+| 50 steps, 500 atoms, 12 KB chunks | -- | **9 of 9 bit-exact** |
 
-So it takes device staging **and** a codec that runs **and** LAMMPS/Kokkos
-sharing the process. Remove any one and it is clean. Things that are NOT the
-cause, each tested: chunk count (a single 3-blob frame fails too), reusing or
-freeing the staging backends (a pool that never frees, and deferring every free
-to the end, both still fail), and outstanding CUDA work (a
-`GpuApi::Synchronize()` before every free changes nothing). The per-chunk
-stored sizes match a host-order run of the same configuration exactly, so the
-chunks are being *selected* and *compressed* identically -- it is the store
-that breaks.
+Note the last row: 12 KB chunks against the 4 MiB everything else was measured
+at, so the fix holds across a ~350x size difference.
 
-That points at Clio's device compress/store path, or at how it shares a CUDA
-context with Kokkos, rather than at anything in this example. It is reported,
-not worked around.
+`--order device` still **reads every blob back**, whether or not `--verify` was
+passed. That was added while the corruption was unexplained and is now
+redundant insurance; see "Next actions" for the case for removing it.
 
-Until it is fixed, **`--order device` always reads every blob back**, whether
-or not `--verify` was passed, and says so on stdout. A run that hits the bug
-exits non-zero with a `MISMATCH` line per blob rather than reporting success
-over bad data.
+## What is NOT verified
+
+Be careful about reading the results above as broader than they are.
+
+- **Refusals 2-5 have never fired.** Only refusal 1 (no `atomKK`, i.e. missing
+  `-k on g 1 -sf kk`) was provoked and confirmed to exit 3. Stale device views,
+  a failed backend allocation, a registered pointer that is not device memory,
+  and the multi-rank `nlocal != natoms` case are all code paths nobody has
+  triggered. They are written and reviewed, not tested.
+- **The cross-process path is untested.** Every run here uses
+  `CLIO_WITH_RUNTIME=1`, so client and runtime share a PID and
+  `IpcManager::ToFullPtr` takes its same-process shortcut: it dereferences the
+  raw device pointer directly and the CUDA IPC handle machinery
+  (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`) is never exercised. A
+  separate-runtime deployment is unproven.
+- **The integrity check is not independent of the codec.** `--verify` reads
+  back through the same Clio decompressor that wrote the data, so a codec that
+  corrupted symmetrically would pass. `crosscheck_h5md.sh`, which compares
+  against a stock `dump h5md`, is the independent check -- and is what the
+  `k_tag` gather was validated against.
+- **Single-node, single-rank only.** MPI is refused, not supported.
+
+## Next actions
+
+In the order worth doing them:
+
+1. **Test the cross-process path.** Run the Clio runtime as a separate process
+   rather than `CLIO_WITH_RUNTIME=1`, and confirm the blobs still arrive
+   device-resident and bit-exact. This is the difference between "works in this
+   configuration" and "works", and it is the only one of these that could
+   invalidate the design rather than just leave it under-tested.
+2. **Provoke refusals 2-5.** Fault injection: force
+   `AllocateAndRegisterGpuBackend` to return null, hand `store_frame` a host
+   pointer, mark a view stale before the read. A refusal that has never fired is
+   a claim, not a guarantee.
+3. **Drop the unconditional read-back**, once 1 and 2 hold. Restore `--verify`
+   to opt-in so `--order device` stops paying for a bug that no longer exists.
+4. **Fix `GpuApi::Memcpy`'s contract.** It reads as a completed copy but is
+   asynchronous for pageable-H2D *and* for D2D. This example hand-compensates
+   with an explicit `Synchronize()` after its D2D staging copy; two other call
+   sites rely on the wrong assumption, one saved only by an incidental
+   `cudaFree` sync. Either rename it (`MemcpyEnqueue`) or give it
+   `DeviceAwareMemcpy`'s private-stream-and-sync shape. The header bug was one
+   instance of this trap; the trap is still set.
+5. **Fix `warn` in the paper-benchmark scripts.** The log-level parser accepts
+   `warning`, not `warn` -- `std::stoi("warn")` throws and the level silently
+   stays at debug. Fixed here and in `read.sh`, still wrong in seven
+   `paper-benchmark/*/{run_config,read}.sh` files, where it means those runs
+   have been logging at debug all along.
 
 ## Notes
 
@@ -363,11 +413,11 @@ over bad data.
   comes up inside `main` before LAMMPS is even opened.
 - LAMMPS with Kokkos/CUDA and Clio's CUDA code coexist in the process for
   every HOST-staged order -- `--order id --kokkos` was verified like the
-  others, including 6 of 6 clean runs with `--static nvcomp-zstd`. An earlier
-  version of this note said they coexist "without incident" full stop. That is
-  no longer supportable: with `--order device` they demonstrably do not, and
-  the "device write path is not trustworthy yet" section above has the
-  isolation table. The claim was only ever measured for the host orders.
+  others. An earlier version of this note said they coexist "without incident"
+  full stop, which was only ever measured for the host orders. With
+  `--order device` they did not, until the stream race documented above was
+  fixed -- Kokkos parking work on the legacy default stream is precisely what
+  made that race lose. They coexist; the ordering has to be explicit.
 - Serial only (`BUILD_MPI=OFF`, as the siblings). Under MPI,
   `lammps_gather_atoms` still returns the global ID-ordered array on every
   rank -- rank 0 would stage it -- or each rank stages its own
