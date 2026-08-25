@@ -7,18 +7,8 @@
 
 /**
  * @file neuropress_chunk_diag.cc
- * @brief The per-chunk diagnostic history declared in neuropress_chunk_diag.h.
- *
- * Clio's counterpart of upstream's g_chunk_history and its reset/count/get
- * accessors (gpucompress_diagnostics.cpp). It lived in compressor_runtime.cc,
- * which is the generic compressor chimod and has no interest in what the
- * model was shown -- the header had no matching source file at all. Keeping
- * the store beside its own declarations means the generic runtime only calls
- * the accessors, and the record's shape can change without touching it.
- *
- * The store is process-wide rather than per-Runtime because upstream's is,
- * and because the tests and examples read it through these free functions
- * without holding a Runtime.
+ * @brief Per-chunk diagnostic history; upstream's g_chunk_history. Process-wide,
+ * as upstream's is, so tests read it without holding a Runtime.
  */
 
 #include "clio_cte/compressor/neuropress_chunk_diag.h"
@@ -37,12 +27,8 @@ struct ChunkDiagHistory {
   std::vector<NeuroPressChunkDiag> rows;
 };
 
-/**
- * Leaked on purpose: worker threads can still reach this while static
- * destructors are running, and tearing a mutex down underneath a thread
- * mid-write is a crash with no upside. Nothing here needs releasing at
- * exit -- the process is going away.
- */
+/** Leaked on purpose: worker threads can reach this during static
+ *  destruction, and tearing the mutex down under them crashes for no gain. */
 ChunkDiagHistory *ChunkDiagHistoryInstance() {
   static ChunkDiagHistory *h = new ChunkDiagHistory();
   return h;

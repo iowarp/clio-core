@@ -32,51 +32,18 @@
 namespace clio::cte::compressor {
 
 namespace {
-/**
- * Per-chunk NeuroPress selection trace.
- *
- * Off unless CLIO_NEUROPRESS_SELECTION_LOG names a file, so this costs a single
- * relaxed load on the normal path. A selection is otherwise invisible: it
- * happens inside the compressor runtime, several layers below whatever issued
- * the write, and the caller only learns that the write succeeded.
- *
- * The `seq` column is a COMPLETION order, not a chunk order -- the HDF5 VOL
- * queues each chunk's DynamicSchedule asynchronously and drains on close, so
- * with online learning on, completion order IS the order the model is updated
- * in. A replay reproducing this run's learning must follow seq.
- */
+/** Per-chunk selection trace. `seq` is COMPLETION order, not chunk order --
+ *  with online learning on it IS the order the model is updated in, so a
+ *  replay must follow seq. */
 struct SelectionLog {
   std::mutex mutex;
   std::FILE *fp = nullptr;
   long seq = 0;
 };
 
-/**
- * Companion to the selection log: a hash of the COMPRESSED payload each
- * chunk produced, written from Compress() where those bytes actually exist.
- *
- * Logged here rather than passed up to DynamicSchedule because the two run
- * as separate tasks and need not share a thread; keying on the blob name
- * lets a comparison join them afterwards without any cross-task plumbing.
- *
- * The hash covers the codec's own output only -- not Clio's 24-byte header
- * -- so it is directly comparable with NeuroPress's payload, whose 64-byte
- * header is likewise excluded.
- *
- * A chunk can appear TWICE, distinguished by the `stage` column, and the LAST
- * row for a blob is the one that describes what is on the tier:
- *
- *   primary  what the selected codec produced, from Compress()
- *   adopted  what exploration replaced it with, from DynamicSchedule
- *
- * The second row exists because Compress() runs before exploration can
- * override its result. With only the primary row, a chunk stored at the
- * winner's size was reported at the primary's -- always the larger of the
- * two, and only ever on the modes that explore, so a comparison built on
- * this log ranked exploration below configurations it actually beat. A
- * consumer that keys a map on blob name gets the right answer for free; one
- * that SUMS the rows must filter to the last per blob.
- */
+/** Hash of the COMPRESSED payload, codec output only (no 24-byte header), so
+ *  it compares directly with NeuroPress's. A chunk appears twice -- primary,
+ *  then adopted -- and the LAST row per blob is what is on the tier. */
 struct PayloadLog {
   std::mutex mutex;
   std::FILE *fp = nullptr;
@@ -102,20 +69,9 @@ PayloadLog *PayloadLogInstance() {
 
 
 
-/**
- * Per-candidate record of an exploration sweep.
- *
- * The selection log above records ONE row per chunk: the configuration the
- * model chose. That is the right shape for auditing selection, and the wrong
- * shape for auditing exploration -- a sweep measures up to 31 alternatives per
- * chunk and the interesting question is what the other 30 actually cost, which
- * the selection log cannot express because by the time it is written the sweep
- * has not run.
- *
- * Enabled by CLIO_NEUROPRESS_EXPLORE_LOG (a path). Off otherwise, and the
- * measurement is not taken at all -- the sweep already runs only when the
- * error gate trips, and this must not add work to a path that does.
- */
+/** Per-candidate sweep record (CLIO_NEUROPRESS_EXPLORE_LOG). Off means the
+ *  measurement is not taken at all -- this must not add work to the gated
+ *  path the sweep already runs on. */
 struct ExploreLog {
   std::mutex mutex;
   std::FILE *fp = nullptr;
@@ -130,10 +86,8 @@ ExploreLog *ExploreLogInstance() {
     if (path && *path) {
       l->fp = std::fopen(path, "w");
       if (l->fp) {
-        // `rank` is the candidate's position in the model's own ranking, so a
-        // reader can tell an alternative the model rated highly from one it
-        // buried. `adopted` marks the row whose bytes actually replaced the
-        // primary's, which is at most one per chunk and may be none.
+        // `rank` is the model's own ordering; `adopted` marks the row whose
+        // bytes replaced the primary's -- at most one per chunk, maybe none.
         std::fprintf(l->fp,
                      "seq,blob,chunk_bytes,rank,lib_name,algo_idx,preset,"
                      "quantize,shuffle,pred_ratio,pred_ct_ms,ratio,ct_ms,"
@@ -145,20 +99,12 @@ ExploreLog *ExploreLogInstance() {
   return log;
 }
 
-/**
- * @brief One explored candidate. `primary_cost` is repeated on every row so a
- * row is self-contained: the whole point of a sweep row is the comparison
- * against what the model actually chose.
- */
+/** One explored candidate. `primary_cost` repeats on every row so the
+ *  comparison against the model's own pick is self-contained. */
 
-/**
- * Leaked on purpose, for the reason documented on
- * neuropress_nn_gpu_kernels.cu's Registry(): worker threads can still reach
- * this while static destructors are running, and tearing down a mutex (or
- * closing the stream) underneath a thread that is mid-write is a crash with
- * no upside. Nothing here needs releasing at exit -- the process is going
- * away and the stream is flushed on every row.
- */
+/** Leaked on purpose: worker threads can reach this during static
+ *  destruction, and tearing the mutex down under a mid-write thread crashes
+ *  for no gain. Flushed on every row, so nothing is lost at exit. */
 SelectionLog *SelectionLogInstance() {
   static SelectionLog *log = [] {
     auto *l = new SelectionLog();

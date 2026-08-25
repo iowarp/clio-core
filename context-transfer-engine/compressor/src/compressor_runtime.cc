@@ -612,10 +612,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       if (out_ranked_by_cost) *out_ranked_by_cost = true;
       return neuropress_stats;
     }
-    // Declined. The statistics it computed are still the right ones for this
-    // chunk, so the heuristics below reuse them rather than measuring again --
-    // and the selection they produce is NOT NeuroPress's, which
-    // NeuroPressRankChunk has already said out loud.
+    // Declined. Its statistics are still right for this chunk, so the
+    // heuristics below reuse them rather than measuring again.
   } else {
     // Clio's own models were fit on these features, with the context's type
     // mapping rather than NeuroPress's unconditional float32.

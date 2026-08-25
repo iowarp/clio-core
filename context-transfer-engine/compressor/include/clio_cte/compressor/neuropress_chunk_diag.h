@@ -7,12 +7,8 @@
 
 /**
  * @file neuropress_chunk_diag.h
- * @brief Per-chunk record of what the model was shown and what it decided.
- *
- * Clio's counterpart of gpucompress_chunk_diag_t and its reset/count/get
- * accessors (gpucompress.h). The feat_* group IS the model's input vector,
- * which neither the selection nor the explore log records. A subset of
- * upstream's 65 fields, under upstream's names so the two can be diffed.
+ * @brief What the model was shown and what it decided. A subset of upstream's
+ * 65 fields under upstream's names, so the two can be diffed.
  */
 
 #ifndef CLIO_CTE_COMPRESSOR_NEUROPRESS_CHUNK_DIAG_H_
@@ -87,18 +83,12 @@ int NeuroPressChunkHistoryCount();
 /** Upstream's gpucompress_get_chunk_diag(): 0, or -1 on a bad index/null. */
 int NeuroPressGetChunkDiag(int idx, NeuroPressChunkDiag *out);
 
-/**
- * Append a record; returns its slot index, or -1 if not stored. The index
- * enables the post-hoc update below, as upstream's recordChunkDiagnostic
- * returns one (internal.hpp). Past the cap, chunks are dropped, not evicted.
- */
+/** Append a record; returns its slot index, or -1. Past the cap chunks are
+ *  dropped, not evicted, so a reader always sees a contiguous prefix. */
 int NeuroPressRecordChunkDiag(const NeuroPressChunkDiag &diag);
 
-/**
- * Fill in what only the exploration block knows. The record is written where
- * the inputs are assembled, before exploration runs, so the slot is claimed
- * early and completed here -- upstream's split for decompression time.
- */
+/** Fill in what only exploration knows. The slot is claimed early, where the
+ *  inputs are assembled, and completed here. */
 void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
                                           bool triggered, float regret);
 

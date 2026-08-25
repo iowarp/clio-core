@@ -271,27 +271,13 @@ private:
   std::unique_ptr<DenseNNPredictor> nn_predictor_;
 #endif
 
-  // NeuroPress NN predictor (issue #693). Consulted first in
-  // EstCompressionStats()'s dynamic-selection path when loaded/ready --
-  // it ranks the full clio_ctp::compress::model candidate set (CPU + GPU),
-  // not just the legacy 5-candidate hardcoded list qtable/nn_predictor
-  // choose among.
+  // NeuroPress NN predictor (issue #693). Consulted first in the dynamic
+  // path when ready; ranks the full model candidate set.
   std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
       neuropress_predictor_;
 
-  /**
-   * @brief Is NeuroPress the model that decides for this chunk?
-   *
-   * Three conditions have to hold together -- the context asked for dynamic
-   * selection, a predictor was constructed, and its weights loaded -- and
-   * every NeuroPress path is gated on all three. They were spelled out
-   * separately at each site, so the paths could drift apart silently: a
-   * selection made under one spelling would still be recorded, trained on
-   * and explored under another. One predicate keeps them from diverging.
-   *
-   * Cheap enough for the hot path: a compare, a pointer test and a relaxed
-   * load on the predictor's ready flag.
-   */
+  /** Is NeuroPress deciding for this chunk? All three conditions gate every
+   *  NeuroPress path; spelled out separately they drift apart silently. */
   bool NeuroPressActive(const Context& context) const {
     return context.dynamic_compress_ != 1 && neuropress_predictor_ &&
            neuropress_predictor_->IsReady();
@@ -440,23 +426,9 @@ private:
       bool* out_neuropress_gpu_failed = nullptr,
       const void** out_device_stats = nullptr);
 
-  /**
-   * @brief NeuroPress's half of EstCompressionStats: rank one chunk with the
-   * model, or decline it. Defined in neuropress_selection.cc.
-   *
-   * Reads the chunk as float32 unconditionally -- the statistics kernel is
-   * typed that way and the shipped weights were normalized against it -- which
-   * is precisely why this cannot share a feature computation with the legacy
-   * models, whose features use the context's own type mapping.
-   *
-   * @param entropy,mad,second_derivative_mean The statistics it computed,
-   *   returned so a caller that falls through to the legacy heuristics can
-   *   reuse them instead of measuring the same chunk twice.
-   * @return Candidates best-first under NeuroPress's cost model, or empty
-   *   when it declined -- no usable statistics, or nothing survived the PSNR
-   *   floor. Empty is not an error: the caller's own heuristics take over,
-   *   and this has already logged that the resulting pick is not the model's.
-   */
+  /** NeuroPress's half of EstCompressionStats (neuropress_selection.cc). Best
+   *  first, or empty when it declined -- not an error, the caller's heuristics
+   *  take over and reuse the statistics returned through entropy/mad/deriv. */
   std::vector<CompressionStats> NeuroPressRankChunk(
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
       double* entropy, double* mad, double* second_derivative_mean,
