@@ -333,6 +333,14 @@ class NeuroPressNNPredictor : public CompressionPredictor {
   const std::vector<float>& DebugWeights();
   const std::vector<float>& DebugBiases();
 
+  /**
+   * @brief SGD firings applied so far (upstream's sgd_call_count).
+   *
+   * Read-only. Lets a harness tell "the update law ran and did nothing" from
+   * "the gate never fired" without inferring it from the weights.
+   */
+  int DebugSgdCallCount();
+
  private:
   /**
    * @brief Build the 8-element NN input from CompressionFeatures.

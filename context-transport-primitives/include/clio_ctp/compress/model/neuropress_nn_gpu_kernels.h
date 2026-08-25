@@ -259,6 +259,14 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         int num_samples, float learning_rate,
                         const void *device_stats = nullptr);
 
+/**
+ * @brief Firings applied to this handle so far (upstream's sgd_call_count).
+ *
+ * Read-only, host-synchronizing; for tests and harnesses that need to know
+ * whether the update law actually ran. Returns 0 on a null handle.
+ */
+int NeuroPressGpuSgdCallCount(NeuroPressGpuWeights *w);
+
 }  // namespace ctp::compress::model::gpu
 
 #endif  // CLIO_CTP_COMPRESS_MODEL_NEUROPRESS_NN_GPU_KERNELS_H_

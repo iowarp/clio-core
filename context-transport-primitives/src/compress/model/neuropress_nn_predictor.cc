@@ -119,9 +119,8 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
 
   // Feature bounds are a v2 addition. A v1 file simply ends here, and
   // upstream fills in wide-open defaults rather than failing
-  // (nn_gpu.cu). Nothing consults these at inference on either
-  // side -- they exist for out-of-distribution reporting -- so the defaults
-  // cost nothing beyond making v1 loadable.
+  // (nn_gpu.cu). Nothing consults them at inference or training; they are
+  // parsed so a v2 file round-trips through Save().
   x_mins_.resize(input_dim);
   x_maxs_.resize(input_dim);
   if (version >= 2) {
@@ -660,6 +659,15 @@ bool NeuroPressNNPredictor::TrainDeviceStats(
   (void)device_stats;
   return false;
 #endif  // !CTP_ENABLE_NEUROPRESS_GPU
+}
+
+int NeuroPressNNPredictor::DebugSgdCallCount() {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  if (gpu_weights_) {
+    return gpu::NeuroPressGpuSgdCallCount(gpu_weights_.get());
+  }
+#endif
+  return 0;
 }
 
 const std::vector<float>& NeuroPressNNPredictor::DebugWeights() {

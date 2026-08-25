@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -63,6 +64,22 @@ constexpr int kOffB4 = kOffW4 + kW234;
 constexpr int kOffW5 = kOffB4 + kHiddenDim;
 constexpr int kOffB5 = kOffW5 + kW5;
 static_assert(kOffB5 + kOutputDim == kParamCount, "offset layout mismatch");
+
+/**
+ * Env-gated deviations from the ported rule. Every field's default reproduces
+ * upstream exactly, so a process that sets nothing runs the shipped kernel on
+ * the shipped path. Read once (see Opts()) and passed to the kernels by value.
+ */
+struct AdaptOptions {
+  bool adaptive = false;      // CLIO_NEUROPRESS_SGD_RULE=adaptive
+  float lr = 0.0f;            // CLIO_NEUROPRESS_SGD_LR (<=0: caller's rate)
+  int head_steps = 32;        // CLIO_NEUROPRESS_SGD_HEAD_STEPS
+  float trunk_scale = 0.1f;   // CLIO_NEUROPRESS_SGD_TRUNK_SCALE
+  float decay_tau = 100.0f;   // CLIO_NEUROPRESS_SGD_DECAY_TAU (0: no decay)
+  float max_step = 0.02f;     // CLIO_NEUROPRESS_SGD_MAX_STEP
+  float grad_clip = 1.0f;     // CLIO_NEUROPRESS_SGD_GRAD_CLIP (<=0: off)
+  float momentum = 0.85f;     // CLIO_NEUROPRESS_SGD_MOMENTUM
+};
 }  // namespace
 
 /** @brief Device-resident state. Persists for the handle's lifetime. */
@@ -96,6 +113,34 @@ struct NeuroPressGpuWeights {
 };
 
 namespace {
+
+/**
+ * The options, parsed ONCE per process on first use.
+ *
+ * A function-local static, so the runtime and the direct-predictor harnesses
+ * see the same values with no per-call getenv on the training path.
+ */
+const AdaptOptions &Opts() {
+  static const AdaptOptions o = [] {
+    AdaptOptions a;
+    auto num = [](const char *name, float dflt) {
+      const char *v = std::getenv(name);
+      return (v != nullptr && *v != '\0') ? std::strtof(v, nullptr) : dflt;
+    };
+    const char *rule = std::getenv("CLIO_NEUROPRESS_SGD_RULE");
+    a.adaptive = (rule != nullptr && std::strcmp(rule, "adaptive") == 0);
+    a.lr = num("CLIO_NEUROPRESS_SGD_LR", 0.0f);
+    const char *hs = std::getenv("CLIO_NEUROPRESS_SGD_HEAD_STEPS");
+    a.head_steps = (hs != nullptr && *hs != '\0') ? std::atoi(hs) : 32;
+    a.trunk_scale = num("CLIO_NEUROPRESS_SGD_TRUNK_SCALE", 0.1f);
+    a.decay_tau = num("CLIO_NEUROPRESS_SGD_DECAY_TAU", 100.0f);
+    a.max_step = num("CLIO_NEUROPRESS_SGD_MAX_STEP", 0.02f);
+    a.grad_clip = num("CLIO_NEUROPRESS_SGD_GRAD_CLIP", 1.0f);
+    a.momentum = num("CLIO_NEUROPRESS_SGD_MOMENTUM", 0.85f);
+    return a;
+  }();
+  return o;
+}
 
 /**
  * Per-flow EMA gradient buffer.
@@ -319,8 +364,8 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   constexpr size_t kOffYStds = kOffYMeans + kOutputDim;
   constexpr size_t kPrefixFloats = kOffYStds + kOutputDim;
   // The single copy is only correct if the device struct really is laid out
-  // the way this staging buffer assumes. All five members are float arrays so
-  // no padding can appear between them, but assert it rather than trust it:
+  // the way this staging buffer assumes. Every member is a float array so no
+  // padding can appear between them, but assert it rather than trust it:
   // inserting a member into the struct above would otherwise silently corrupt
   // the normalization constants instead of failing to build.
   static_assert(offsetof(NeuroPressGpuWeights, x_means) ==
@@ -588,7 +633,9 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
   if (t < kInputDim) {
     float std_val = w->x_stds[t];
     if (std_val < 1e-8f) std_val = 1e-8f;
-    s_x[t] = (raw_inputs[cand * kInputDim + t] - w->x_means[t]) / std_val;
+    const float raw =
+        raw_inputs[cand * kInputDim + t];
+    s_x[t] = (raw - w->x_means[t]) / std_val;
   }
   __syncthreads();
 
@@ -626,7 +673,9 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
   if (t < kInputDim) {
     float std_val = w->x_stds[t];
     if (std_val < 1e-8f) std_val = 1e-8f;
-    s_x[t] = (raw_inputs[cand * kInputDim + t] - w->x_means[t]) / std_val;
+    const float raw =
+        raw_inputs[cand * kInputDim + t];
+    s_x[t] = (raw - w->x_means[t]) / std_val;
   }
   __syncthreads();
 
@@ -1418,7 +1467,7 @@ bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
     SgdWaitIfEverFired(st);
     InferKernelFull<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_raw, s.d_out[0], s.d_out[1], s.d_out[2], s.d_out[3],
-        s.d_out[4], s.d_out[5], s.d_out[6], s.d_out[7]);
+        s.d_out[4], s.d_out[5], s.d_out[6], s.d_out[7], 100.0f);
     ok = cudaGetLastError() == cudaSuccess;
   }
 
@@ -1493,15 +1542,22 @@ __device__ __forceinline__ void ForwardOneLayer(
   h_out = fmaxf(0.0f, sum);
 }
 
-__global__ void SGDKernel(NeuroPressGpuWeights *w,
-                          const NeuroPressGpuSGDSample *__restrict__ samples,
-                          int num_samples, float learning_rate,
-                          float *__restrict__ ema, bool *out_applied,
-                          const ctp::DeviceFeatureStats *__restrict__
-                              device_stats) {
-  int t = threadIdx.x;  // 0..63
-  __shared__ float s_reduce[kHiddenDim];
-
+/**
+ * Phases 1 and 1.5 of the ported rule: forward pass, per-head error in
+ * standardized log1p space, and Kendall uncertainty weighting.
+ *
+ * Shared verbatim by both update laws below -- the adaptive rule changes only
+ * what happens to the gradient afterwards, and two copies of the error math
+ * would be free to drift apart.
+ *
+ * __forceinline__ matches NeuroPressForwardShared above and keeps this out of
+ * an ABI call inside a hot single-block kernel. Measured: it does not change
+ * any result -- both forms pass the parity suite identically.
+ */
+__device__ __forceinline__ void SgdForwardAndErrors(
+    NeuroPressGpuWeights *w,
+    const NeuroPressGpuSGDSample *__restrict__ samples, int num_samples, int t,
+    const ctp::DeviceFeatureStats *__restrict__ device_stats) {
   // ---- Phase 1: per-sample forward pass + target/error computation ----
   for (int si = 0; si < num_samples; ++si) {
     if (t < kInputDim) {
@@ -1519,7 +1575,8 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
       }
       float std_val = w->x_stds[t];
       if (std_val < 1e-8f) std_val = 1e-8f;
-      w->act_x[si][t] = (raw - w->x_means[t]) / std_val;
+      w->act_x[si][t] =
+          (raw - w->x_means[t]) / std_val;
     }
     __syncthreads();
 
@@ -1622,6 +1679,19 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     for (int si = 0; si < num_samples; ++si) w->d5_clamped[si][t] *= uw;
   }
   __syncthreads();
+
+}
+
+__global__ void SGDKernel(NeuroPressGpuWeights *w,
+                          const NeuroPressGpuSGDSample *__restrict__ samples,
+                          int num_samples, float learning_rate,
+                          float *__restrict__ ema, bool *out_applied,
+                          const ctp::DeviceFeatureStats *__restrict__
+                              device_stats) {
+  int t = threadIdx.x;  // 0..63
+  __shared__ float s_reduce[kHiddenDim];
+
+  SgdForwardAndErrors(w, samples, num_samples, t, device_stats);
 
   // ---- Phase 2: per-output backward passes with PCGrad-lite ----
   constexpr float kGradClipThreshold = 0.1f;
@@ -1891,6 +1961,149 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   if (t == 0) *out_applied = finite_ok;
 }
 
+/** Block-wide sum of one float per thread; every thread gets the total. */
+__device__ __forceinline__ float BlockSum(float *s_reduce, int t, float v) {
+  s_reduce[t] = v;
+  __syncthreads();
+  for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
+    if (t < s) s_reduce[t] += s_reduce[t + s];
+    __syncthreads();
+  }
+  const float total = s_reduce[0];
+  __syncthreads();
+  return total;
+}
+
+/**
+ * The adaptive update law (CLIO_NEUROPRESS_SGD_RULE=adaptive).
+ *
+ * Same errors as the kernel above, then TRUE backprop of their sum: no
+ * per-output unit-normalisation, no per-output clip-renormalise, no PCGrad and
+ * no global unit-normalisation, so the learning rate survives to the weights.
+ */
+__global__ void AdaptiveSGDKernel(
+    NeuroPressGpuWeights *w,
+    const NeuroPressGpuSGDSample *__restrict__ samples, int num_samples,
+    float learning_rate, float *__restrict__ ema, bool *out_applied,
+    const ctp::DeviceFeatureStats *__restrict__ device_stats, AdaptOptions o) {
+  const int t = threadIdx.x;  // 0..63
+  __shared__ float s_reduce[kHiddenDim];
+  __shared__ float s_dz4[kHiddenDim], s_dz3[kHiddenDim], s_dz2[kHiddenDim];
+
+  SgdForwardAndErrors(w, samples, num_samples, t, device_stats);
+
+  for (int i = t; i < kParamCount; i += kHiddenDim) w->combined[i] = 0.0f;
+  __syncthreads();
+
+  // ---- One backward pass over all eight heads, summed over samples ----
+  for (int si = 0; si < num_samples; ++si) {
+    float dh4 = 0.0f;
+    for (int oi = 0; oi < kOutputDim; ++oi) {
+      const float e = w->d5_clamped[si][oi];
+      w->combined[kOffW5 + oi * kHiddenDim + t] += e * w->act_h4[si][t];
+      dh4 += w->params[kOffW5 + oi * kHiddenDim + t] * e;
+    }
+    if (t < kOutputDim) w->combined[kOffB5 + t] += w->d5_clamped[si][t];
+    const float dz4 = (w->act_z4[si][t] > 0.0f) ? dh4 : 0.0f;
+
+    for (int i = 0; i < kHiddenDim; ++i)
+      w->combined[kOffW4 + t * kHiddenDim + i] += dz4 * w->act_h3[si][i];
+    w->combined[kOffB4 + t] += dz4;
+    s_dz4[t] = dz4;
+    __syncthreads();
+
+    float dh3 = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh3 += w->params[kOffW4 + j * kHiddenDim + t] * s_dz4[j];
+    const float dz3 = (w->act_z3[si][t] > 0.0f) ? dh3 : 0.0f;
+    for (int i = 0; i < kHiddenDim; ++i)
+      w->combined[kOffW3 + t * kHiddenDim + i] += dz3 * w->act_h2[si][i];
+    w->combined[kOffB3 + t] += dz3;
+    s_dz3[t] = dz3;
+    __syncthreads();
+
+    float dh2 = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh2 += w->params[kOffW3 + j * kHiddenDim + t] * s_dz3[j];
+    const float dz2 = (w->act_z2[si][t] > 0.0f) ? dh2 : 0.0f;
+    for (int i = 0; i < kHiddenDim; ++i)
+      w->combined[kOffW2 + t * kHiddenDim + i] += dz2 * w->act_h1[si][i];
+    w->combined[kOffB2 + t] += dz2;
+    s_dz2[t] = dz2;
+    __syncthreads();
+
+    float dh1 = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh1 += w->params[kOffW2 + j * kHiddenDim + t] * s_dz2[j];
+    const float dz1 = (w->act_z1[si][t] > 0.0f) ? dh1 : 0.0f;
+    for (int i = 0; i < kInputDim; ++i)
+      w->combined[kOffW1 + t * kInputDim + i] += dz1 * w->act_x[si][i];
+    w->combined[kOffB1 + t] += dz1;
+    __syncthreads();
+  }
+
+  // ---- Mean over samples, global-norm clip (scale DOWN only) ----
+  const float inv_n = 1.0f / static_cast<float>(num_samples);
+  float local = 0.0f;
+  for (int i = t; i < kParamCount; i += kHiddenDim) {
+    float g = w->combined[i] * inv_n;
+    if (!isfinite(g)) g = 0.0f;
+    w->combined[i] = g;
+    local += g * g;
+  }
+  const float g_norm = sqrtf(BlockSum(s_reduce, t, local));
+  float clip = 1.0f;
+  if (o.grad_clip > 0.0f && g_norm > o.grad_clip) clip = o.grad_clip / g_norm;
+
+  // Momentum on the clipped, UNNORMALISED gradient: 0 is plain SGD.
+  for (int i = t; i < kParamCount; i += kHiddenDim)
+    ema[i] = o.momentum * ema[i] + (1.0f - o.momentum) * w->combined[i] * clip;
+  __syncthreads();
+
+  // ---- Per-block learning rates: decayed base, trunk frozen for HEAD_STEPS ----
+  float lr = learning_rate;
+  if (o.decay_tau > 0.0f) {
+    lr /= sqrtf(1.0f + static_cast<float>(w->sgd_call_count) / o.decay_tau);
+  }
+  const bool trunk_on =
+      (o.head_steps >= 0) && (w->sgd_call_count >= o.head_steps);
+
+  // Output 1's head row/bias stays owned by the deferred decomp pass, exactly
+  // as the ported kernel withholds it.
+  const int skip_w5_begin = kOffW5 + 1 * kHiddenDim;
+  const int skip_w5_end = skip_w5_begin + kHiddenDim;
+  const int skip_b5 = kOffB5 + 1;
+  float step_sq = 0.0f;
+  for (int i = t; i < kParamCount; i += kHiddenDim) {
+    float d;
+    if (i >= kOffW5) {
+      d = ((i >= skip_w5_begin && i < skip_w5_end) || i == skip_b5)
+              ? 0.0f
+              : lr * ema[i];
+    } else {
+      d = trunk_on ? lr * o.trunk_scale * ema[i] : 0.0f;
+    }
+    w->out_grad[i] = d;
+    step_sq += d * d;
+  }
+  const float step_norm = sqrtf(BlockSum(s_reduce, t, step_sq));
+
+  // Trust region: shrink an oversized firing, never grow a small one.
+  float scale = 1.0f;
+  if (o.max_step > 0.0f && step_norm > o.max_step) scale = o.max_step / step_norm;
+
+  if (t == 0) w->sgd_call_count += 1;
+  const bool finite_ok = isfinite(step_norm) && isfinite(scale);
+  if (finite_ok) {
+    constexpr float kWClamp = 10.0f;
+    for (int i = t; i < kParamCount; i += kHiddenDim) {
+      const float pv = w->params[i] - scale * w->out_grad[i];
+      w->params[i] = fmaxf(-kWClamp, fminf(kWClamp, pv));
+    }
+  }
+  if (t == 0) *out_applied = finite_ok;
+}
+
 bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
                         const NeuroPressGpuSGDSample *samples,
                         int num_samples, float learning_rate,
@@ -1958,9 +2171,19 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
     /* Fall back to the samples' host rows, not another chunk's stats. */
   }
 
-  SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
-      w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
-      num_samples, learning_rate, ema, d_applied, d_stats);
+  /* One `if` on the parsed options: `upstream` (the default) reaches exactly
+     the kernel it always did, with the same arguments. */
+  const AdaptOptions &opt = Opts();
+  const float lr = (opt.lr > 0.0f) ? opt.lr : learning_rate;
+  if (opt.adaptive) {
+    AdaptiveSGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
+        w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
+        num_samples, lr, ema, d_applied, d_stats, opt);
+  } else {
+    SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
+        w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
+        num_samples, lr, ema, d_applied, d_stats);
+  }
   if (cudaGetLastError() != cudaSuccess) return false;
 
   /* Only set the flag if the record succeeded, so inference never waits on an
@@ -1969,6 +2192,14 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
     g.ever_fired.store(true, std::memory_order_release);
   }
   return true;
+}
+
+int NeuroPressGpuSgdCallCount(NeuroPressGpuWeights *w) {
+  if (!w) return 0;
+  SgdHostWaitIfEverFired();
+  int n = 0;
+  cudaMemcpy(&n, &w->sgd_call_count, sizeof(int), cudaMemcpyDeviceToHost);
+  return n;
 }
 
 }  // namespace ctp::compress::model::gpu

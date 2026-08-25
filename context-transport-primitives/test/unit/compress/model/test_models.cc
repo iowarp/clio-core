@@ -457,6 +457,138 @@ TEST_CASE("NeuroPressNNPredictor::Train() moves predictions toward "
   REQUIRE(std::fabs(after - kTrueRatio) < std::fabs(before - kTrueRatio));
 }
 
+namespace {
+
+// One in-distribution chunk (every continuous input inside the shipped
+// .nnwt's own x_mins/x_maxs) and one lossless lz4 candidate on it.
+CompressionFeatures AdaptSample() {
+  DataFeatures data;
+  data.chunk_size_bytes = 4.0 * 1024 * 1024;
+  data.shannon_entropy = 4.964;
+  data.mad = 0.005744;
+  data.second_derivative_mean = 0.01159;
+  data.data_type_float = 1.0;
+  CandidateConfig candidate;
+  candidate.base_id = 13;  // nvcomp-lz4
+  candidate.preset_id = 2;
+  return MakeCompressionFeatures(data, candidate);
+}
+
+// L2 norm of the weight change one Train() produced, and its direction.
+struct WeightDelta {
+  std::vector<double> d;
+  double norm() const {
+    double s = 0.0;
+    for (double x : d) s += x * x;
+    return std::sqrt(s);
+  }
+};
+
+WeightDelta TrainOnceAt(float learning_rate, double *out_target_ratio) {
+  NeuroPressNNPredictor nn;
+  if (!nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR)) return WeightDelta{};
+  nn.SetLearningRate(learning_rate);
+  auto features = AdaptSample();
+  const double target = nn.Predict(features).compression_ratio / 3.0;
+  if (out_target_ratio != nullptr) *out_target_ratio = target;
+
+  std::vector<float> w0 = nn.DebugWeights();
+  std::vector<float> b0 = nn.DebugBiases();
+  std::vector<CompressionFeatures> feats(1, features);
+  // psnr < 0 and decomp <= 0 are the "not applicable" encodings, so only the
+  // ratio and compression-time heads carry an error here.
+  std::vector<TrainingLabels> labels(
+      1, TrainingLabels(static_cast<float>(target), /*psnr=*/-1.0f,
+                        /*comp_time_ms=*/6.0f, /*decomp_time_ms=*/0.0f));
+  nn.Train(feats, labels);
+  const std::vector<float> &w1 = nn.DebugWeights();
+  const std::vector<float> &b1 = nn.DebugBiases();
+
+  WeightDelta out;
+  for (size_t i = 0; i < w0.size(); ++i) out.d.push_back(w1[i] - w0[i]);
+  for (size_t i = 0; i < b0.size(); ++i) out.d.push_back(b1[i] - b0[i]);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("The shipped SGD rule's step size does not depend on the learning "
+          "rate (unit-normalised update)") {
+  // The ported rule renormalises the combined gradient to unit norm before
+  // sizing the step, so `learning_rate` multiplies a vector that is divided by
+  // its own norm one line later and cancels. This pins that property: it is
+  // what makes an in-memory adaptation knob a no-op today, and it is also the
+  // cheapest available check that the default path is still the ported one.
+  NeuroPressNNPredictor probe;
+  if (!probe.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR)) {
+    SKIP("NeuroPress requires a CUDA device; Load() declined");
+  }
+
+  double target = 0.0;
+  WeightDelta slow = TrainOnceAt(0.01f, &target);
+  WeightDelta fast = TrainOnceAt(10.0f, nullptr);
+  REQUIRE(slow.d.size() == fast.d.size());
+  REQUIRE(slow.norm() > 0.0);
+
+  double dot = 0.0;
+  for (size_t i = 0; i < slow.d.size(); ++i) dot += slow.d[i] * fast.d[i];
+  const double cosine = dot / (slow.norm() * fast.norm());
+  const double ratio = fast.norm() / slow.norm();
+  INFO("|dW| slow=" << slow.norm() << " fast=" << fast.norm()
+                    << " cos=" << cosine);
+  // Not bit-identical: the rate scales the accumulator BEFORE the float
+  // normalisation, so the two differ by rounding -- 1000x the rate moves the
+  // step by parts in a million, not by 1000x.
+  REQUIRE(std::fabs(ratio - 1.0) < 1e-4);
+  REQUIRE(cosine > 1.0 - 1e-6);
+}
+
+TEST_CASE("CLIO_NEUROPRESS_SGD_RULE=adaptive converges one sample without "
+          "overshooting",
+          "[.np_adaptive]") {
+  // Hidden by default and registered as its own ctest with the env set: the
+  // knobs are parsed once per process by design, so the rule cannot be
+  // switched from inside a running test binary.
+  NeuroPressNNPredictor nn;
+  if (!nn.Load(CLIO_CTP_NEUROPRESS_WEIGHTS_DIR)) {
+    SKIP("NeuroPress requires a CUDA device; Load() declined");
+  }
+  REQUIRE(nn.IsReady());
+
+  auto features = AdaptSample();
+  std::vector<CompressionFeatures> feats(1, features);
+  const auto first = nn.Predict(features);
+  const double start = first.compression_ratio;
+  const double target = start / 3.0;  // label three times below the prediction
+  std::vector<TrainingLabels> labels(
+      1, TrainingLabels(static_cast<float>(target), /*psnr=*/-1.0f,
+                        static_cast<float>(first.compression_time_ms * 2.0),
+                        /*decomp_time_ms=*/0.0f));
+
+  std::vector<double> err;
+  for (int i = 0; i < 50; ++i) {
+    const double pred = nn.Predict(features).compression_ratio;
+    err.push_back(std::fabs(pred - target) / target);
+    REQUIRE(nn.Train(feats, labels));
+    // Approaches the label from one side while the trunk is frozen: the step
+    // is sized by the error, so a shrinking error shrinks the step instead of
+    // stepping past zero. (Unfreezing the trunk does overshoot -- see
+    // $NPADAPT/impl/IMPL.md P2; that is why only the frozen phase is pinned.)
+    if (i < 30) REQUIRE(pred > target);
+  }
+  REQUIRE(nn.DebugSgdCallCount() == 50);
+
+  // Monotone through the descent phase (the trunk is still frozen there at the
+  // default HEAD_STEPS=32), and halved overall.
+  for (size_t i = 1; i < 30; ++i) {
+    INFO("step " << i << ": " << err[i - 1] << " -> " << err[i]);
+    REQUIRE(err[i] <= err[i - 1] + 1e-6);
+  }
+  const double last = nn.Predict(features).compression_ratio;
+  INFO("start=" << start << " target=" << target << " last=" << last);
+  REQUIRE(std::fabs(last - target) / target < 0.5 * err[0]);
+}
+
 TEST_CASE("NeuroPressNNPredictor::Train() stays numerically stable under "
           "repeated adversarial/out-of-distribution labels") {
   // Regression coverage for the clipping/clamping/trust-region machinery

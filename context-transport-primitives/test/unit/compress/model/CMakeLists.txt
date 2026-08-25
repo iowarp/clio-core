@@ -31,6 +31,14 @@ target_compile_definitions(test_compress_model_exec PRIVATE
 add_test(NAME ctp_compress_model COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_model_exec "~[error=FatalError]")
 
+# The adaptive online-SGD rule is env-gated and its knobs are parsed once per
+# process, so the case that exercises it is hidden ([.np_adaptive]) and gets
+# its own run of the same binary with the rule selected.
+add_test(NAME ctp_neuropress_adaptive_sgd COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_compress_model_exec "[.np_adaptive]")
+set_tests_properties(ctp_neuropress_adaptive_sgd PROPERTIES
+        ENVIRONMENT "CLIO_NEUROPRESS_SGD_RULE=adaptive")
+
 install(TARGETS test_compress_model_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
