@@ -11,6 +11,8 @@ set(COMPRESSOR_SOURCES
     src/models/linreg_table_predictor.cc
     src/models/qtable_predictor.cc
     src/models/neuropress_bridge.cc
+    src/neuropress_chunk_diag.cc
+    src/neuropress_telemetry.cc
     src/autogen/compressor_lib_exec.cc
 )
 

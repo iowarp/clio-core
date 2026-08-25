@@ -66,6 +66,7 @@
 #include "clio_ctp/util/logging.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 #include "clio_cte/compressor/neuropress_chunk_diag.h"
+#include "clio_cte/compressor/neuropress_telemetry.h"
 
 namespace clio::cte::compressor {
 
@@ -584,10 +585,6 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 /** Defined with the selection log below; used here to skip work it alone reads.
  *  Declared in the same anonymous namespace as the definition, or this would
  *  be a different function and the call would be ambiguous. */
-namespace {
-bool SelectionLogEnabled();
-}  // namespace
-
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
@@ -1116,376 +1113,6 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
        batch_features.size(), trained);
 }
 
-namespace {
-
-/**
- * Per-chunk NeuroPress selection trace.
- *
- * Off unless CLIO_NEUROPRESS_SELECTION_LOG names a file, so this costs a single
- * relaxed load on the normal path. A selection is otherwise invisible: it
- * happens inside the compressor runtime, several layers below whatever issued
- * the write, and the caller only learns that the write succeeded.
- *
- * The `seq` column is a COMPLETION order, not a chunk order -- the HDF5 VOL
- * queues each chunk's DynamicSchedule asynchronously and drains on close, so
- * with online learning on, completion order IS the order the model is updated
- * in. A replay reproducing this run's learning must follow seq.
- */
-struct SelectionLog {
-  std::mutex mutex;
-  std::FILE *fp = nullptr;
-  long seq = 0;
-};
-
-/**
- * Companion to the selection log: a hash of the COMPRESSED payload each
- * chunk produced, written from Compress() where those bytes actually exist.
- *
- * Logged here rather than passed up to DynamicSchedule because the two run
- * as separate tasks and need not share a thread; keying on the blob name
- * lets a comparison join them afterwards without any cross-task plumbing.
- *
- * The hash covers the codec's own output only -- not Clio's 24-byte header
- * -- so it is directly comparable with NeuroPress's payload, whose 64-byte
- * header is likewise excluded.
- *
- * A chunk can appear TWICE, distinguished by the `stage` column, and the LAST
- * row for a blob is the one that describes what is on the tier:
- *
- *   primary  what the selected codec produced, from Compress()
- *   adopted  what exploration replaced it with, from DynamicSchedule
- *
- * The second row exists because Compress() runs before exploration can
- * override its result. With only the primary row, a chunk stored at the
- * winner's size was reported at the primary's -- always the larger of the
- * two, and only ever on the modes that explore, so a comparison built on
- * this log ranked exploration below configurations it actually beat. A
- * consumer that keys a map on blob name gets the right answer for free; one
- * that SUMS the rows must filter to the last per blob.
- */
-struct PayloadLog {
-  std::mutex mutex;
-  std::FILE *fp = nullptr;
-};
-
-PayloadLog *PayloadLogInstance() {
-  static PayloadLog *log = [] {
-    auto *l = new PayloadLog();  // leaked on purpose, see SelectionLogInstance
-    const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
-    if (path && *path) {
-      std::string p = std::string(path) + ".payload";
-      l->fp = std::fopen(p.c_str(), "w");
-      if (l->fp) {
-        std::fprintf(l->fp,
-                     "blob,compressed_size,payload_hash,beneficial,"
-                     "compress_kernel_ms,stage\n");
-      }
-    }
-    return l;
-  }();
-  return log;
-}
-
-void LogCompressedPayload(const std::string &blob_name, const char *payload,
-                          size_t payload_size, bool on_device, bool beneficial,
-                          double compress_kernel_ms, const char *stage) {
-  PayloadLog *log = PayloadLogInstance();
-  if (!log->fp || !payload || payload_size == 0) return;
-
-  std::vector<char> staged;
-  const unsigned char *p = reinterpret_cast<const unsigned char *>(payload);
-  if (on_device) {
-    staged.resize(payload_size);
-    ctp::DeviceAwareMemcpy(staged.data(), payload, payload_size);
-    p = reinterpret_cast<const unsigned char *>(staged.data());
-  }
-  unsigned long long h = 14695981039346656037ull;  // 0xcbf29ce484222325
-  for (size_t i = 0; i < payload_size; ++i) {
-    h ^= p[i];
-    h *= 1099511628211ull;
-  }
-  std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(log->fp, "%s,%zu,%llu,%d,%.10g,%s\n", blob_name.c_str(),
-               payload_size, h, beneficial ? 1 : 0, compress_kernel_ms, stage);
-  std::fflush(log->fp);
-
-  // Diagnostic: dump one chunk's raw payload so it can be diffed against
-  // another implementation's byte for byte. Whole-payload hashes say THAT
-  // two encoders disagree; only the bytes say where and how.
-  const char *want = std::getenv("CLIO_NEUROPRESS_DUMP_CHUNK");
-  if (want && *want) {
-    // "all" dumps every chunk, which is what a whole-dataset cross-decode
-    // needs; a bare index dumps just that one for a byte diff.
-    const std::string suffix = std::string("/chunk_") + want;
-    const bool all = (std::strcmp(want, "all") == 0);
-    if (all || (blob_name.size() >= suffix.size() &&
-        blob_name.compare(blob_name.size() - suffix.size(), suffix.size(),
-                          suffix) == 0)) {
-      const char *base = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
-      std::string idx = want;
-      if (all) {
-        const size_t pos = blob_name.rfind("/chunk_");
-        idx = (pos == std::string::npos) ? "x"
-                                         : blob_name.substr(pos + 7);
-      }
-      std::string dp = std::string(base ? base : "/tmp/clio") + ".chunk" +
-                       idx + ".bin";
-      if (std::FILE *df = std::fopen(dp.c_str(), "wb")) {
-        std::fwrite(p, 1, payload_size, df);
-        std::fclose(df);
-      }
-    }
-  }
-}
-
-bool SelectionLogEnabled() {
-  static const bool on = [] {
-    const char *p = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
-    return p && *p;
-  }();
-  return on;
-}
-
-/**
- * Per-candidate record of an exploration sweep.
- *
- * The selection log above records ONE row per chunk: the configuration the
- * model chose. That is the right shape for auditing selection, and the wrong
- * shape for auditing exploration -- a sweep measures up to 31 alternatives per
- * chunk and the interesting question is what the other 30 actually cost, which
- * the selection log cannot express because by the time it is written the sweep
- * has not run.
- *
- * Enabled by CLIO_NEUROPRESS_EXPLORE_LOG (a path). Off otherwise, and the
- * measurement is not taken at all -- the sweep already runs only when the
- * error gate trips, and this must not add work to a path that does.
- */
-struct ExploreLog {
-  std::mutex mutex;
-  std::FILE *fp = nullptr;
-  long seq = 0;
-};
-
-bool ExploreLogEnabled() {
-  static const bool on = [] {
-    const char *p = std::getenv("CLIO_NEUROPRESS_EXPLORE_LOG");
-    return p && *p;
-  }();
-  return on;
-}
-
-/** Per-chunk NN input history; upstream's g_chunk_history
- *  (gpucompress_diagnostics.cpp). */
-struct ChunkDiagHistory {
-  std::mutex mtx;
-  std::vector<NeuroPressChunkDiag> rows;
-};
-
-/** Leaked on purpose, same reason as SelectionLogInstance below. */
-ChunkDiagHistory *ChunkDiagHistoryInstance() {
-  static ChunkDiagHistory *h = new ChunkDiagHistory();
-  return h;
-}
-
-ExploreLog *ExploreLogInstance() {
-  static ExploreLog *log = [] {
-    auto *l = new ExploreLog();
-    const char *path = std::getenv("CLIO_NEUROPRESS_EXPLORE_LOG");
-    if (path && *path) {
-      l->fp = std::fopen(path, "w");
-      if (l->fp) {
-        // `rank` is the candidate's position in the model's own ranking, so a
-        // reader can tell an alternative the model rated highly from one it
-        // buried. `adopted` marks the row whose bytes actually replaced the
-        // primary's, which is at most one per chunk and may be none.
-        std::fprintf(l->fp,
-                     "seq,blob,chunk_bytes,rank,lib_name,algo_idx,preset,"
-                     "quantize,shuffle,pred_ratio,pred_ct_ms,ratio,ct_ms,"
-                     "psnr_db,cost,primary_cost,adopted\n");
-      }
-    }
-    return l;
-  }();
-  return log;
-}
-
-/**
- * @brief One explored candidate. `primary_cost` is repeated on every row so a
- * row is self-contained: the whole point of a sweep row is the comparison
- * against what the model actually chose.
- */
-void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
-                          int rank, const std::string &lib_name,
-                          uint32_t preset_id, bool quantize, uint32_t shuffle,
-                          double pred_ratio, double pred_ct_ms, double ratio,
-                          double ct_ms, double psnr_db, double cost,
-                          double primary_cost, bool adopted) {
-  ExploreLog *log = ExploreLogInstance();
-  if (!log->fp) return;
-
-  int algo_idx = -1;
-  for (const auto &entry : ctp::compress::model::KnownCompressors()) {
-    if (lib_name == entry.name) {
-      switch (entry.base_id) {
-        case 13: algo_idx = 0; break;
-        case 14: algo_idx = 1; break;
-        case 17: algo_idx = 2; break;
-        case 16: algo_idx = 3; break;
-        case 15: algo_idx = 4; break;
-        case 18: algo_idx = 5; break;
-        case 23: algo_idx = 6; break;
-        case 24: algo_idx = 7; break;
-        default: algo_idx = -1; break;
-      }
-      break;
-    }
-  }
-
-  std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(log->fp,
-               "%ld,%s,%zu,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
-               "%.10g,%.10g,%.10g,%d\n",
-               log->seq++, blob_name.c_str(), chunk_size, rank,
-               lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
-               shuffle, pred_ratio, pred_ct_ms, ratio, ct_ms, psnr_db, cost,
-               primary_cost, adopted ? 1 : 0);
-  std::fflush(log->fp);
-}
-
-/**
- * Leaked on purpose, for the reason documented on
- * neuropress_nn_gpu_kernels.cu's Registry(): worker threads can still reach
- * this while static destructors are running, and tearing down a mutex (or
- * closing the stream) underneath a thread that is mid-write is a crash with
- * no upside. Nothing here needs releasing at exit -- the process is going
- * away and the stream is flushed on every row.
- */
-SelectionLog *SelectionLogInstance() {
-  static SelectionLog *log = [] {
-    auto *l = new SelectionLog();
-    const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
-    if (path && *path) {
-      l->fp = std::fopen(path, "w");
-      if (l->fp) {
-        std::fprintf(l->fp,
-                     "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
-                     "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
-                     "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
-                     "actual_ct_ms,actual_psnr,checksum\n");
-      }
-    }
-    return l;
-  }();
-  return log;
-}
-
-void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
-                            double entropy, double mad, double second_deriv,
-                            int wire_lib, int packed_preset,
-                            const CompressionStats *predicted,
-                            double actual_ratio, double actual_ct_ms,
-                            double actual_psnr,
-                            unsigned long long checksum) {
-  SelectionLog *log = SelectionLogInstance();
-  if (!log->fp) return;
-
-  std::lock_guard<std::mutex> lock(log->mutex);
-  std::FILE *fp = log->fp;
-
-  const std::string lib_name =
-      ctp::CompressionFactory::NameForWireId(wire_lib);
-  // The 0-7 index NeuroPress's decodeAction uses, recovered through the ML
-  // base id so the two sides' logs are directly comparable.
-  int algo_idx = -1;
-  for (const auto &entry : ctp::compress::model::KnownCompressors()) {
-    if (lib_name == entry.name) {
-      switch (entry.base_id) {
-        case 13: algo_idx = 0; break;
-        case 14: algo_idx = 1; break;
-        case 17: algo_idx = 2; break;
-        case 16: algo_idx = 3; break;
-        case 15: algo_idx = 4; break;
-        case 18: algo_idx = 5; break;
-        case 23: algo_idx = 6; break;
-        case 24: algo_idx = 7; break;
-        default: algo_idx = -1; break;
-      }
-      break;
-    }
-  }
-  const uint32_t bits = static_cast<uint32_t>(packed_preset);
-  const int quantize = ((bits >> 24) & 1u) ? 1 : 0;
-  const int shuffle = (((bits >> 8) & 0xFFu) != 0u) ? 1 : 0;
-  const int preset = static_cast<int>(bits & 0xFFu);
-
-  std::fprintf(fp,
-               "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
-               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu\n",
-               log->seq++, blob_name.c_str(), chunk_size, entropy, mad,
-               second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
-               shuffle, preset,
-               predicted ? predicted->compression_ratio_ : 0.0,
-               predicted ? predicted->compress_time_ms_ : 0.0,
-               predicted ? predicted->decompress_time_ms_ : 0.0,
-               predicted ? predicted->psnr_db_ : 0.0,
-               actual_ratio, actual_ct_ms, actual_psnr, checksum);
-  std::fflush(fp);
-}
-
-}  // namespace
-
-/* Upstream's reset/count/get accessors (gpucompress.h), -1 on a bad index. */
-
-void NeuroPressResetChunkHistory() {
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  h->rows.clear();
-}
-
-int NeuroPressChunkHistoryCount() {
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  return static_cast<int>(h->rows.size());
-}
-
-int NeuroPressGetChunkDiag(int idx, NeuroPressChunkDiag *out) {
-  if (out == nullptr || idx < 0) return -1;
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  if (static_cast<size_t>(idx) >= h->rows.size()) return -1;
-  *out = h->rows[static_cast<size_t>(idx)];
-  return 0;
-}
-
-int NeuroPressRecordChunkDiag(const NeuroPressChunkDiag &diag) {
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  // Drop, not evict: a reader always sees a contiguous prefix.
-  if (h->rows.size() >= kNeuroPressChunkDiagCap) return -1;
-  h->rows.push_back(diag);
-  return static_cast<int>(h->rows.size()) - 1;
-}
-
-void NeuroPressUpdateChunkDiagSgd(int idx, bool sgd_fired) {
-  if (idx < 0) return;
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  if (static_cast<size_t>(idx) >= h->rows.size()) return;
-  h->rows[static_cast<size_t>(idx)].sgd_fired = sgd_fired ? 1 : 0;
-}
-
-void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
-                                          bool triggered, float regret) {
-  if (idx < 0) return;
-  ChunkDiagHistory *h = ChunkDiagHistoryInstance();
-  std::lock_guard<std::mutex> lk(h->mtx);
-  if (static_cast<size_t>(idx) >= h->rows.size()) return;
-  NeuroPressChunkDiag &row = h->rows[static_cast<size_t>(idx)];
-  row.nn_action = final_action;
-  row.exploration_triggered = triggered ? 1 : 0;
-  row.regret = regret;
-  // feat_action untouched: upstream ties it to nn_original_action.
-}
 
 /* ---------------------------------------------------------------------------
  * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
@@ -1505,6 +1132,49 @@ void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
 #endif
 
 namespace {
+/**
+ * One row of the per-candidate sweep log.
+ *
+ * Rows are held until the scoring loop ends rather than written as each
+ * candidate is measured, because `adopted` is settled only by the LAST
+ * candidate to beat the running best -- a row emitted at measurement time
+ * would claim adoption for every successive winner.
+ */
+struct ExploreRow {
+  std::string lib;
+  uint32_t preset_id;
+  bool quant;
+  uint32_t shuffle;
+  double pred_ratio, pred_ct, ratio, ct_ms, psnr, cost;
+  int rank;
+};
+
+/**
+ * The best alternative a sweep has found so far, and everything needed to
+ * store it if it survives to the end.
+ *
+ * One object rather than ten locals because these are written together, at a
+ * single point in the scoring loop, and read together by the block that
+ * commits the winner. Kept apart, a candidate could be adopted with one field
+ * left behind from an earlier one -- and the quantization pair is exactly
+ * where that goes unnoticed: a blob whose header says "not quantized" while
+ * its payload is quantized is unrecoverable on read, and nothing about the
+ * write reports a problem.
+ */
+struct ExploreWinner {
+  bool have = false;
+  std::vector<char> payload;
+  int lib = 0;
+  uint32_t preset_id = 0;
+  uint32_t shuffle = 0;
+  double ratio = 0.0;
+  double time_ms = 0.0;
+  bool quant = false;
+  ctp::compress::preprocess::DeviceQuantizeParams quant_params;
+  /** Index into the sweep-log rows, so the last adopter carries the flag. */
+  int row = -1;
+};
+
 /**
  * One alternative measured during an exploration sweep: everything the
  * codec call needs, and everything the scoring phase reads back from it.
@@ -1552,6 +1222,66 @@ struct ExploreSlot {
   ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
 #endif
 };
+}  // namespace
+
+namespace {
+/**
+ * Sweep step 2: finish every launched slot and record what it produced.
+ *
+ * Separated from the launch step because the two must not interleave --
+ * every slot has to be in flight before any is waited on, or the sweep
+ * serializes into K sequential codec calls and stops measuring what it
+ * was written to measure.
+ *
+ * Takes only the slots: what a codec produced is entirely recorded in
+ * them, so this step needs nothing about the chunk or the selection.
+ */
+void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots) {
+  // Upstream's split, on one thread: each candidate's quantize,
+  // shuffle and codec launch were queued above on that candidate's own
+  // CUDA stream and none of them waited, so by the time the prep loop
+  // ends all K are running together. Nothing here is parallelized with
+  // OS threads -- the concurrency is the device's, and it costs one
+  // stream plus two events per slot.
+  //
+  // Compressor::Compress() cannot be used for that: it takes the
+  // thread's single cached stream and synchronizes before returning,
+  // so two calls on one thread serialize by construction. NvComp's
+  // OpenSlot/CompressLaunch/CompressFinish split it at exactly the
+  // points upstream splits it.
+  //
+  // A codec with no async path (any CPU compressor) is compressed
+  // synchronously here instead. NeuroPress's action space is entirely
+  // GPU codecs, so on the path that matters this branch is not taken.
+  for (auto& sp : slots) {
+    ExploreSlot* s = sp.get();
+    if (s->gpu != nullptr) continue;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    size_t sz = s->capacity;
+    s->ok = s->compressor->Compress(s->out_ptr, sz, s->input,
+                                    s->compress_size);
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::high_resolution_clock::now() - t0)
+                               .count();
+    const double kernel_ms = ctp::LastCodecKernelMs();
+    s->time_ms = (kernel_ms >= 0.0) ? kernel_ms : wall_ms;
+    s->compressed_size = s->ok ? sz : 0;
+  }
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+  for (auto& sp : slots) {
+    ExploreSlot* s = sp.get();
+    if (!s->launched || s->gpu == nullptr) continue;
+    s->ok = s->gpu->CompressFinish(&s->async);
+    // Kernel time from this slot's OWN events, bracketing its codec
+    // launch alone -- the same quantity the primary is measured with,
+    // and the same one upstream scores its slots on. There is no
+    // host-clock fallback here: the events are created with the slot,
+    // so a missing reading means the launch did not happen.
+    s->time_ms = (s->async.kernel_ms >= 0.0) ? s->async.kernel_ms : 0.0;
+    s->compressed_size = s->ok ? s->async.compressed_size : 0;
+  }
+#endif
+}
 }  // namespace
 
 clio::run::TaskResume Runtime::DynamicSchedule(
@@ -2288,15 +2018,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // observable outcome is reached by remembering the best and
           // re-storing once after the loop -- upstream's intermediate writes
           // land in a local buffer nothing can observe.
-          bool have_winner = false;
-          std::vector<char> winner_payload;
-          int winner_lib = 0;
-          uint32_t winner_preset_id = 0;
-          uint32_t winner_shuffle = 0;
-          double winner_ratio = 0.0;
-          double winner_time_ms = 0.0;
-          bool winner_quant = false;
-          ctp::compress::preprocess::DeviceQuantizeParams winner_quant_params;
+          ExploreWinner winner;
 
           std::vector<std::unique_ptr<ExploreSlot>> slots;
           slots.reserve(alternatives.size());
@@ -2510,65 +2232,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           }
 
           // ---- Sweep step 2: every slot is already in flight; collect it ----
-          // Upstream's split, on one thread: each candidate's quantize,
-          // shuffle and codec launch were queued above on that candidate's own
-          // CUDA stream and none of them waited, so by the time the prep loop
-          // ends all K are running together. Nothing here is parallelized with
-          // OS threads -- the concurrency is the device's, and it costs one
-          // stream plus two events per slot.
-          //
-          // Compressor::Compress() cannot be used for that: it takes the
-          // thread's single cached stream and synchronizes before returning,
-          // so two calls on one thread serialize by construction. NvComp's
-          // OpenSlot/CompressLaunch/CompressFinish split it at exactly the
-          // points upstream splits it.
-          //
-          // A codec with no async path (any CPU compressor) is compressed
-          // synchronously here instead. NeuroPress's action space is entirely
-          // GPU codecs, so on the path that matters this branch is not taken.
-          for (auto& sp : slots) {
-            ExploreSlot* s = sp.get();
-            if (s->gpu != nullptr) continue;
-            const auto t0 = std::chrono::high_resolution_clock::now();
-            size_t sz = s->capacity;
-            s->ok = s->compressor->Compress(s->out_ptr, sz, s->input,
-                                            s->compress_size);
-            const double wall_ms = std::chrono::duration<double, std::milli>(
-                                       std::chrono::high_resolution_clock::now() - t0)
-                                       .count();
-            const double kernel_ms = ctp::LastCodecKernelMs();
-            s->time_ms = (kernel_ms >= 0.0) ? kernel_ms : wall_ms;
-            s->compressed_size = s->ok ? sz : 0;
-          }
-#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
-          for (auto& sp : slots) {
-            ExploreSlot* s = sp.get();
-            if (!s->launched || s->gpu == nullptr) continue;
-            s->ok = s->gpu->CompressFinish(&s->async);
-            // Kernel time from this slot's OWN events, bracketing its codec
-            // launch alone -- the same quantity the primary is measured with,
-            // and the same one upstream scores its slots on. There is no
-            // host-clock fallback here: the events are created with the slot,
-            // so a missing reading means the launch did not happen.
-            s->time_ms = (s->async.kernel_ms >= 0.0) ? s->async.kernel_ms : 0.0;
-            s->compressed_size = s->ok ? s->async.compressed_size : 0;
-          }
-#endif
+          CollectExploreSlots(slots);
 
-          // Sweep rows, held until the loop ends because `adopted` is only
-          // settled by the LAST candidate to beat the running best -- a row
-          // written the moment it was measured would claim adoption for every
-          // successive winner.
-          struct ExploreRow {
-            std::string lib;
-            uint32_t preset_id;
-            bool quant;
-            uint32_t shuffle;
-            double pred_ratio, pred_ct, ratio, ct_ms, psnr, cost;
-            int rank;
-          };
           std::vector<ExploreRow> explore_rows;
-          int winner_row = -1;
           int explore_rank = 0;
 
           // ---- Sweep step 3: score the slots in rank order (serial) ----
@@ -2611,31 +2277,31 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               const size_t winner_total =
                   alt_compressed_size + sizeof(CompressionHeader);
               if (winner_total < chunk_size) {
-                have_winner = true;
+                winner.have = true;
                 // The row for THIS candidate has not been pushed yet, so its
                 // index is the current size. A later winner overwrites this,
                 // which is what makes only the final one carry the flag.
-                winner_row = static_cast<int>(explore_rows.size());
+                winner.row = static_cast<int>(explore_rows.size());
                 // Pull the winner's bytes back AFTER the measurement, so the
                 // copy never lands inside the timed window.
-                winner_payload.resize(alt_compressed_size);
+                winner.payload.resize(alt_compressed_size);
                 if (ctp::IsDevicePointer(alt_out_ptr)) {
-                  ctp::DeviceAwareMemcpy(winner_payload.data(), alt_out_ptr,
+                  ctp::DeviceAwareMemcpy(winner.payload.data(), alt_out_ptr,
                                          alt_compressed_size);
                 } else {
-                  std::memcpy(winner_payload.data(), alt_out_ptr,
+                  std::memcpy(winner.payload.data(), alt_out_ptr,
                               alt_compressed_size);
                 }
-                winner_lib = alt->compress_lib_;
-                winner_preset_id = alt_preset_id;
-                winner_shuffle = alt_applied_shuffle;
-                winner_ratio = alt_ratio;
-                winner_time_ms = alt_time_ms;
+                winner.lib = alt->compress_lib_;
+                winner.preset_id = alt_preset_id;
+                winner.shuffle = alt_applied_shuffle;
+                winner.ratio = alt_ratio;
+                winner.time_ms = alt_time_ms;
                 // Carry the quantization state too. Without it the adopted
                 // blob's header would say "not quantized" while its payload
                 // IS quantized -- unrecoverable on read.
-                winner_quant = alt_applied_quant;
-                winner_quant_params = alt_quant_params;
+                winner.quant = alt_applied_quant;
+                winner.quant_params = alt_quant_params;
               }
             }
 
@@ -2715,7 +2381,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 task->blob_name_.str(), chunk_size, row.rank, row.lib,
                 row.preset_id, row.quant, row.shuffle, row.pred_ratio,
                 row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
-                actual_cost, static_cast<int>(ri) == winner_row);
+                actual_cost, static_cast<int>(ri) == winner.row);
           }
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
@@ -2750,23 +2416,23 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // at the same offset, exactly what the primary itself did. The
           // Context is updated the same way upstream updates its diagnostics
           // state, so what the blob records matches what it now contains.
-          if (have_winner) {
+          if (winner.have) {
             const size_t hdr_size =
                 sizeof(CompressionHeader) +
-                (winner_quant ? sizeof(QuantHeaderExtension) : 0);
-            const size_t winner_total = winner_payload.size() + hdr_size;
+                (winner.quant ? sizeof(QuantHeaderExtension) : 0);
+            const size_t winner_total = winner.payload.size() + hdr_size;
             CompressionHeader winner_header(
-                static_cast<uint32_t>(winner_lib),
-                PackPreset(winner_preset_id, winner_shuffle) |
-                    PackQuant(winner_quant, winner_quant_params.precision),
-                chunk_size, winner_payload.size());
+                static_cast<uint32_t>(winner.lib),
+                PackPreset(winner.preset_id, winner.shuffle) |
+                    PackQuant(winner.quant, winner.quant_params.precision),
+                chunk_size, winner.payload.size());
             QuantHeaderExtension winner_ext{};
-            if (winner_quant) {
+            if (winner.quant) {
               winner_ext.error_bound =
-                  winner_quant_params.effective_error_bound;
-              winner_ext.scale = winner_quant_params.scale;
-              winner_ext.data_min = winner_quant_params.data_min;
-              winner_ext.data_max = winner_quant_params.data_max;
+                  winner.quant_params.effective_error_bound;
+              winner_ext.scale = winner.quant_params.scale;
+              winner_ext.data_min = winner.quant_params.data_min;
+              winner_ext.data_max = winner.quant_params.data_max;
             }
 
             auto winner_shm = CLIO_IPC->AllocateBuffer(winner_total);
@@ -2777,18 +2443,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             } else {
               std::memcpy(winner_shm.ptr_, &winner_header,
                           sizeof(CompressionHeader));
-              if (winner_quant) {
+              if (winner.quant) {
                 std::memcpy(winner_shm.ptr_ + sizeof(CompressionHeader),
                             &winner_ext, sizeof(winner_ext));
               }
-              std::memcpy(winner_shm.ptr_ + hdr_size, winner_payload.data(),
-                          winner_payload.size());
+              std::memcpy(winner_shm.ptr_ + hdr_size, winner.payload.data(),
+                          winner.payload.size());
 
               Context winner_ctx = context;
-              winner_ctx.compress_lib_ = winner_lib;
+              winner_ctx.compress_lib_ = winner.lib;
               winner_ctx.compress_preset_ = static_cast<int>(
-                  PackPreset(winner_preset_id, winner_shuffle) |
-                  PackQuant(winner_quant, winner_quant_params.precision));
+                  PackPreset(winner.preset_id, winner.shuffle) |
+                  PackQuant(winner.quant, winner.quant_params.precision));
               winner_ctx.transform_flags_ |=
                   clio::cte::core::kBlobTransformed |
                   clio::cte::core::kBlobTransformCompressed;
@@ -2821,15 +2487,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 // configurations it actually beats. Last row for a blob wins.
                 if (SelectionLogEnabled()) {
                   LogCompressedPayload(
-                      task->blob_name_.str(), winner_payload.data(),
-                      winner_payload.size(), /*on_device=*/false,
-                      winner_total < chunk_size, winner_time_ms, "adopted");
+                      task->blob_name_.str(), winner.payload.data(),
+                      winner.payload.size(), /*on_device=*/false,
+                      winner_total < chunk_size, winner.time_ms, "adopted");
                 }
                 task->context_ = winner_ctx;
                 task->context_.actual_original_size_ = chunk_size;
                 task->context_.actual_compressed_size_ = winner_total;
-                task->context_.actual_compression_ratio_ = winner_ratio;
-                task->context_.actual_compress_time_ms_ = winner_time_ms;
+                task->context_.actual_compression_ratio_ = winner.ratio;
+                task->context_.actual_compress_time_ms_ = winner.time_ms;
                 // The stored bytes are now the winner's, so the features the
                 // deferred decomp head will join a later read against must
                 // describe the winner, not the primary.
@@ -2842,7 +2508,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 win_data.data_type_float = (context.data_type_ == 1) ? 1.0 : 0.0;
                 int win_base_id = -1;
                 std::string win_name =
-                    ctp::CompressionFactory::NameForWireId(winner_lib);
+                    ctp::CompressionFactory::NameForWireId(winner.lib);
                 for (const auto& entry :
                      ctp::compress::model::KnownCompressors()) {
                   if (win_name == entry.name) {
@@ -2853,9 +2519,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 if (win_base_id >= 0) {
                   ctp::compress::model::CandidateConfig win_candidate;
                   win_candidate.base_id = win_base_id;
-                  win_candidate.preset_id = static_cast<int>(winner_preset_id);
-                  win_candidate.byte_shuffle = winner_shuffle != 0;
-                  win_candidate.quantize = winner_quant;
+                  win_candidate.preset_id = static_cast<int>(winner.preset_id);
+                  win_candidate.byte_shuffle = winner.shuffle != 0;
+                  win_candidate.quantize = winner.quant;
                   // Feeds the deferred decomp head, whose upstream counterpart
                   // reads DeferredDecompSample::error_bound_enc from the
                   // diagnostics field `feat_eb_enc = d.error_bound`, itself
@@ -2871,9 +2537,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 HLOG(kDebug,
                      "NeuroPress explore: adopted {} (ratio={} time={}ms "
                      "quant={} shuffle={}) over the primary",
-                     win_name, winner_ratio, winner_time_ms,
-                     winner_quant ? winner_quant_params.precision : 0,
-                     winner_shuffle);
+                     win_name, winner.ratio, winner.time_ms,
+                     winner.quant ? winner.quant_params.precision : 0,
+                     winner.shuffle);
               }
             }
           }
