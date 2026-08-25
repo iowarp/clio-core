@@ -1506,46 +1506,6 @@ void NeuroPressUpdateChunkDiagExploration(int idx, int final_action,
 
 namespace {
 /**
- * NeuroPress's weighted cost of one outcome:
- *   w_ct*compress_ms + w_dt*decompress_ms + w_io*bytes/(min(ratio,cap)*bw)
- *
- * An object rather than five loose constants and a lambda because the SGD
- * gate and the exploration sweep have to score with the SAME weights. That
- * is the entire reason NeuroPressResolvedCostWeights() exists: when the
- * CLIO_NEUROPRESS_COST_W_* override reached only the ranking, a "ratio cost
- * model" run selected on ratio while the gate still scored the balanced
- * cost, training the model against an objective it was not ranking on.
- * Passing one callable around makes that mismatch impossible to reintroduce
- * by editing a weight at one site and not the other.
- *
- * Times are floored at 1 ms and the ratio capped, both before weighting,
- * exactly as upstream clamps them (gpucompress_compress.cpp). A
- * non-positive ratio yields 1e30 -- "no measurable result", which is a
- * sentinel the MAPE gate reads, not an arithmetic accident.
- */
-struct NeuroPressCost {
-  double w_ct;
-  double w_dt;
-  double w_io;
-  double bandwidth_bytes_per_ms;
-  double ratio_cap;
-  clio::run::u64 chunk_size;
-
-  double operator()(double compress_ms, double decompress_ms,
-                    double ratio) const {
-    const double ct = std::max(1.0, compress_ms);
-    const double dt = std::max(1.0, decompress_ms);
-    const double rc = std::min(ratio_cap, ratio);
-    return w_ct * ct + w_dt * dt +
-           ((rc > 0.0) ? w_io * static_cast<double>(chunk_size) /
-                             (rc * bandwidth_bytes_per_ms)
-                       : 1e30);
-  }
-};
-}  // namespace
-
-namespace {
-/**
  * One alternative measured during an exploration sweep: everything the
  * codec call needs, and everything the scoring phase reads back from it.
  *

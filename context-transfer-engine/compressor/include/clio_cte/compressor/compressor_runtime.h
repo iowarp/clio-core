@@ -52,6 +52,8 @@
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_ctp/compress/model/neuropress_nn_predictor.h>
+
+#include "clio_cte/compressor/models/neuropress_cost.h"
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
 

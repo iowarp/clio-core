@@ -47,29 +47,9 @@
 #include <vector>
 
 #include "clio_cte/compressor/compressor_runtime.h"
+#include "clio_cte/compressor/models/neuropress_cost.h"
 
 namespace clio::cte::compressor {
-
-/**
- * Resolved cost-model parameters. `cap` is the compression-ratio ceiling the
- * cost model applies (upstream's RATIO_CAP, 100). It is exposed here so the
- * adoption cost and the exploration gate use one value rather than each
- * hardcoding it.
- */
-struct NeuroPressCostWeights { double ct, dt, io, bw, cap; };
-
-/**
- * @brief The cost-model weights the ranking actually used, after any
- *        CLIO_NEUROPRESS_COST_W_* override.
- *
- * Upstream keeps ONE set of weights (g_rank_w0/w1/w2, g_measured_bw_bytes_per_ms)
- * and reads them both in the ranking kernel and in the cost it gates SGD on
- * (gpucompress_compress.cpp:662-664). Clio had the override reach the ranking
- * only, so a "ratio cost model" run changed what was selected while the gate
- * kept scoring the balanced cost -- training the model against an objective it
- * was not ranking on. This exposes the resolved values so both agree.
- */
-NeuroPressCostWeights NeuroPressResolvedCostWeights();
 
 /**
  * @brief Rank clio_ctp::compress::model's candidate set for one data
