@@ -232,6 +232,11 @@ struct Args {
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
   int use_list = 1;        // stage 3 list force; --no-list = cell-direct
+  // PREPENDED TO EVERY VECTOR TAG. Two processes sharing one CTE would
+  // otherwise both create "md_x" and page into each other's blobs; the
+  // distributed harness runs a bench per node, so each needs its own
+  // namespace. Empty by default, so a single-node run is unchanged.
+  const char *tag_prefix = "";
   // NVE drift tolerance. The default suits cold runs (measured 6e-7 over
   // 200 steps). HOT melt-deck runs need ~5e-3: the unshifted lj/cut energy
   // is discontinuous at the cutoff, and STOCK LAMMPS itself (double
@@ -2176,6 +2181,7 @@ int main(int argc, char **argv) {
     else if (std::strcmp(argv[i], "--no-list") == 0) a.use_list = 0;
     else if (want("--dt")) a.dt = atof(argv[++i]);
     else if (std::strcmp(argv[i], "--no-gate") == 0) a.gate = 0;
+    else if (want("--tag-prefix")) a.tag_prefix = argv[++i];
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
@@ -2385,7 +2391,17 @@ int main(int argc, char **argv) {
   }
 
   // ---- runtime ------------------------------------------------------------
-  {
+  //
+  // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. It used to
+  // write gpu_vector_md.yaml and Setenv with overwrite=1 unconditionally,
+  // which made it impossible to point at a cluster: any CLIO_SERVER_CONF the
+  // caller exported was clobbered a line later. A distributed harness needs
+  // exactly that -- a config naming a hostfile and the other nodes -- so an
+  // already-set CLIO_SERVER_CONF is now left alone.
+  if (getenv("CLIO_SERVER_CONF") != nullptr) {
+    std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
+                getenv("CLIO_SERVER_CONF"));
+  } else {
     std::ofstream cfg("gpu_vector_md.yaml");
     const char *thr = getenv("GV_THREADS");
     auto env_mb = [](const char *k, long d) {
@@ -2437,6 +2453,9 @@ int main(int argc, char **argv) {
   // A vector is parameterized by the EXACT launch configuration of the
   // kernel that uses it: one page table per CUDA block, always.
   const u32 tbl_blocks = a.blocks;
+  auto tag = [&](const char *name) {
+    return std::string(a.tag_prefix) + name;
+  };
   // Row geometry, so a flush can name exactly the rows a block owns.
   const u64 md_row_elems = static_cast<u64>(g.nb) * g.cap * kStride;
   const u64 md_nrows = static_cast<u64>(g.nb) * g.nb;
@@ -2481,14 +2500,14 @@ int main(int argc, char **argv) {
                 (double)vram_total_dev / 1048576.0);
   };
   const u32 x_slots = SharedSlots(npages, nsets);
-  gv::Vector<float> vx("md_x", {0}, page_bytes, tbl_blocks, x_slots,
+  gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks, x_slots,
                        g.nelems);
   account("x", x_slots, page_bytes, npages);
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
   const u32 vslots = SharedSlots(npages, nsets);
-  gv::Vector<float> vv("md_v", {0}, page_bytes, tbl_blocks, vslots,
+  gv::Vector<float> vv(tag("md_v"), {0}, page_bytes, tbl_blocks, vslots,
                        g.nelems);
   account("v", vslots, page_bytes, npages);
   vx.EnableStats();
@@ -2505,7 +2524,7 @@ int main(int argc, char **argv) {
   // MD_THIRD=1 gives the ballistic path a third, read-only paged vector.
   const int use_third = std::getenv("MD_THIRD") != nullptr ? 1 : 0;
   const u32 third_slots = use_third ? SharedSlots(npages, nsets) : 1u;
-  gv::Vector<float> vthird("md_third", {0}, page_bytes, tbl_blocks,
+  gv::Vector<float> vthird(tag("md_third"), {0}, page_bytes, tbl_blocks,
                            third_slots,
                            use_third ? g.nelems : page_elems,
                            clio::run::PoolId::GetNull(), 0, 1);
@@ -2651,7 +2670,7 @@ int main(int argc, char **argv) {
     // acceleration, so it never exercises READING f under paging, and that
     // is the one path the resident gates cannot cover.
     const u32 fslots = SharedSlots(npages, nsets);
-    gv::Vector<float> vf("md_f", {0}, page_bytes, tbl_blocks, fslots,
+    gv::Vector<float> vf(tag("md_f"), {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems);
     account("f", fslots, page_bytes, npages);
     vf.EnableStats();
@@ -2667,9 +2686,9 @@ int main(int argc, char **argv) {
     // The resort's destinations get their own cache size, so "the scatter
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
     const u32 ppslots = SharedSlots(npages, nsets);
-    gv::Vector<float> vx2("md_x2", {0}, page_bytes, tbl_blocks, ppslots,
+    gv::Vector<float> vx2(tag("md_x2"), {0}, page_bytes, tbl_blocks, ppslots,
                           g.nelems);
-    gv::Vector<float> vv2("md_v2", {0}, page_bytes, tbl_blocks, ppslots,
+    gv::Vector<float> vv2(tag("md_v2"), {0}, page_bytes, tbl_blocks, ppslots,
                           g.nelems);
     account("x2", ppslots, page_bytes, npages);
     account("v2", ppslots, page_bytes, npages);
@@ -2737,7 +2756,7 @@ int main(int argc, char **argv) {
     // rest: shared residency is 2x the list, where private residency was
     // blocks x the list and had to be capped at NlSlots to allocate at all.
     const u32 nlslots = SharedSlots(nl_pages, nsets);
-    gv::Vector<int> vn("md_nl", {0}, nl_page_bytes, tbl_blocks, nlslots,
+    gv::Vector<int> vn(tag("md_nl"), {0}, nl_page_bytes, tbl_blocks, nlslots,
                        nl_elems);
     account("list", nlslots, nl_page_bytes, nl_pages);
     vn.EnableStats();
