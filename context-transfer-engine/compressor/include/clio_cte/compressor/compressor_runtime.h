@@ -278,6 +278,24 @@ private:
       neuropress_predictor_;
 
   /**
+   * @brief Is NeuroPress the model that decides for this chunk?
+   *
+   * Three conditions have to hold together -- the context asked for dynamic
+   * selection, a predictor was constructed, and its weights loaded -- and
+   * every NeuroPress path is gated on all three. They were spelled out
+   * separately at each site, so the paths could drift apart silently: a
+   * selection made under one spelling would still be recorded, trained on
+   * and explored under another. One predicate keeps them from diverging.
+   *
+   * Cheap enough for the hot path: a compare, a pointer test and a relaxed
+   * load on the predictor's ready flag.
+   */
+  bool NeuroPressActive(const Context& context) const {
+    return context.dynamic_compress_ != 1 && neuropress_predictor_ &&
+           neuropress_predictor_->IsReady();
+  }
+
+  /**
    * Deferred decompression-time learning (NeuroPress's DiagnosticsStore +
    * gpucompress_batched_decomp_sgd, src/api/). Decompression time is the one
    * label that cannot be known when data is compressed -- only a later read

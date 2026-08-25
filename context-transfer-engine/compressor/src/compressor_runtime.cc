@@ -74,10 +74,6 @@ using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
 
 /**
- * Compression header prepended to compressed data for self-describing format.
- * This allows decompression without external metadata.
- */
-/**
  * Byte-shuffle element size packed into the free high bits of
  * compress_preset_.
  *
@@ -123,18 +119,6 @@ inline uint32_t UnpackVersion(uint32_t packed) {
 }
 
 /**
- * Quantization state, in the last free byte of the same word.
- *
- * bit 24    : quantize applied
- * bits 25-26: precision code (0 = int8, 1 = int16, 2 = int32)
- *
- * Upstream keeps the equivalent in a quant_flags field, with room for it
- * because its header is 64 bytes. Clio's is 24 and fixed, so the flags ride
- * here and the four doubles that make the transform invertible go in a header
- * EXTENSION appended only when quantization ran -- see QuantHeaderExtension.
- * Type is not encoded because LINEAR is the only quantizer either side has.
- */
-/**
  * @brief Analytical PSNR for linear quantization, verbatim from upstream.
  *
  * gpucompress_compress.cpp -- expected MSE for uniform error in
@@ -149,6 +133,18 @@ inline double AnalyticalPsnr(double data_range, double error_bound) {
                   120.0);
 }
 
+/**
+ * Quantization state, in the last free byte of the same word.
+ *
+ * bit 24    : quantize applied
+ * bits 25-26: precision code (0 = int8, 1 = int16, 2 = int32)
+ *
+ * Upstream keeps the equivalent in a quant_flags field, with room for it
+ * because its header is 64 bytes. Clio's is 24 and fixed, so the flags ride
+ * here and the four doubles that make the transform invertible go in a header
+ * EXTENSION appended only when quantization ran -- see QuantHeaderExtension.
+ * Type is not encoded because LINEAR is the only quantizer either side has.
+ */
 constexpr uint32_t kQuantShift = 24;
 constexpr uint32_t kQuantEnabledBit = 1u;
 constexpr uint32_t kQuantPrecisionShift = 1;
@@ -188,6 +184,10 @@ static_assert(sizeof(QuantHeaderExtension) == 32,
               "QuantHeaderExtension is part of the on-disk format");
 
 
+/**
+ * Compression header prepended to compressed data for self-describing format.
+ * This allows decompression without external metadata.
+ */
 struct CompressionHeader {
   static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
   uint32_t magic_;            // Magic number to identify compressed data
@@ -601,9 +601,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // NeuroPress takes priority over the legacy heuristics below whenever it
   // is ready, so decide that first -- it determines how the chunk must be
   // interpreted for the statistics.
-  const bool neuropress_active = context.dynamic_compress_ != 1 &&
-                                 neuropress_predictor_ &&
-                                 neuropress_predictor_->IsReady();
+  const bool neuropress_active = NeuroPressActive(context);
 
   // NeuroPress reads every chunk as float32: its statistics kernel is typed
   // `const float*` with no data-type parameter, and the shipped model.nnwt was
@@ -720,8 +718,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // trained 8-algorithm nvcomp action space (see NeuroPressCandidateStats);
   // every candidate is GPU-native, so a device-resident chunk never forces a
   // host round-trip downstream in Compress().
-  if (features_ok && context.dynamic_compress_ != 1 && neuropress_predictor_ &&
-      neuropress_predictor_->IsReady()) {
+  if (features_ok && neuropress_active) {
     bool data_type_float = (context.data_type_ == 1);
     std::vector<CompressionStats> neuropress_stats;
     if (device_stats != nullptr) {
@@ -785,28 +782,26 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     // device path, because there the empty result means GPU inference
     // declined, and a selection silently made by a different model is
     // indistinguishable downstream from one NeuroPress made.
-    if (neuropress_stats.empty()) {
-      if (device_stats != nullptr) {
-        HLOG(kError,
-             "EstCompressionStats: NeuroPress produced no candidates for a "
-             "device-resident chunk (size={}); NOT re-ranking it on the host",
-             chunk_size);
-      } else {
-        // Host-resident chunks rank through NeuroPress too -- same gate, same
-        // RankIntoStats -- so an empty list here is the same model hand-off
-        // the device branch above reports, and was previously the only one
-        // that happened silently. It is a warning rather than an error
-        // because nothing failed: the legacy heuristics are Clio's own and
-        // will produce a valid selection. What must not stay invisible is
-        // WHICH model chose it, since downstream a legacy pick is
-        // indistinguishable from a NeuroPress one.
-        HLOG(kWarning,
-             "EstCompressionStats: NeuroPress produced no candidates for a "
-             "host-resident chunk (size={} entropy={} mad={}); falling back "
-             "to Clio's legacy heuristics -- this selection is NOT "
-             "NeuroPress's",
-             chunk_size, entropy, mad);
-      }
+    if (device_stats != nullptr) {
+      HLOG(kError,
+           "EstCompressionStats: NeuroPress produced no candidates for a "
+           "device-resident chunk (size={}); NOT re-ranking it on the host",
+           chunk_size);
+    } else {
+      // Host-resident chunks rank through NeuroPress too -- same gate, same
+      // RankIntoStats -- so an empty list here is the same model hand-off
+      // the device branch above reports, and was previously the only one
+      // that happened silently. It is a warning rather than an error
+      // because nothing failed: the legacy heuristics are Clio's own and
+      // will produce a valid selection. What must not stay invisible is
+      // WHICH model chose it, since downstream a legacy pick is
+      // indistinguishable from a NeuroPress one.
+      HLOG(kWarning,
+           "EstCompressionStats: NeuroPress produced no candidates for a "
+           "host-resident chunk (size={} entropy={} mad={}); falling back "
+           "to Clio's legacy heuristics -- this selection is NOT "
+           "NeuroPress's",
+           chunk_size, entropy, mad);
     }
   }
 
@@ -1143,14 +1138,6 @@ struct SelectionLog {
 };
 
 /**
- * Leaked on purpose, for the reason documented on
- * neuropress_nn_gpu_kernels.cu's Registry(): worker threads can still reach
- * this while static destructors are running, and tearing down a mutex (or
- * closing the stream) underneath a thread that is mid-write is a crash with
- * no upside. Nothing here needs releasing at exit -- the process is going
- * away and the stream is flushed on every row.
- */
-/**
  * Companion to the selection log: a hash of the COMPRESSED payload each
  * chunk produced, written from Compress() where those bytes actually exist.
  *
@@ -1212,7 +1199,7 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
     ctp::DeviceAwareMemcpy(staged.data(), payload, payload_size);
     p = reinterpret_cast<const unsigned char *>(staged.data());
   }
-  unsigned long long h = 1469598103934665603ull;
+  unsigned long long h = 14695981039346656037ull;  // 0xcbf29ce484222325
   for (size_t i = 0; i < payload_size; ++i) {
     h ^= p[i];
     h *= 1099511628211ull;
@@ -1287,7 +1274,6 @@ bool ExploreLogEnabled() {
   return on;
 }
 
-/** Leaked on purpose, same reason as SelectionLogInstance below. */
 /** Per-chunk NN input history; upstream's g_chunk_history
  *  (gpucompress_diagnostics.cpp). */
 struct ChunkDiagHistory {
@@ -1295,6 +1281,7 @@ struct ChunkDiagHistory {
   std::vector<NeuroPressChunkDiag> rows;
 };
 
+/** Leaked on purpose, same reason as SelectionLogInstance below. */
 ChunkDiagHistory *ChunkDiagHistoryInstance() {
   static ChunkDiagHistory *h = new ChunkDiagHistory();
   return h;
@@ -1365,6 +1352,14 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
   std::fflush(log->fp);
 }
 
+/**
+ * Leaked on purpose, for the reason documented on
+ * neuropress_nn_gpu_kernels.cu's Registry(): worker threads can still reach
+ * this while static destructors are running, and tearing down a mutex (or
+ * closing the stream) underneath a thread that is mid-write is a crash with
+ * no upside. Nothing here needs releasing at exit -- the process is going
+ * away and the stream is flushed on every row.
+ */
 SelectionLog *SelectionLogInstance() {
   static SelectionLog *log = [] {
     auto *l = new SelectionLog();
@@ -1679,8 +1674,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // that quietly returned an inference result.
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&
-        context.dynamic_compress_ != 1 && neuropress_predictor_ &&
-        neuropress_predictor_->IsReady()) {
+        NeuroPressActive(context)) {
       // FLOAT32 unconditionally, and NOT context.data_type_. Reaching here
       // means the enclosing guard already matched `neuropress_active` above
       // exactly, so inference computed these same three statistics as float32
@@ -1815,7 +1809,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           ctp::DeviceAwareMemcpy(staged.data(), chunk_data, chunk_size);
           p = reinterpret_cast<const unsigned char *>(staged.data());
         }
-        checksum = 1469598103934665603ull;
+        checksum = 14695981039346656037ull;  // 0xcbf29ce484222325
         for (size_t k = 0; k < chunk_size; ++k) {
           checksum ^= p[k];
           checksum *= 1099511628211ull;
@@ -1850,8 +1844,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // (gpucompress_compress.cpp), and a diagnostic that only exists while the
     // thing it diagnoses is enabled cannot serve as its control. The
     // cost-model fields are filled in by the learning block below.
-    if (context.dynamic_compress_ != 1 && neuropress_predictor_ &&
-        neuropress_predictor_->IsReady() && !stats.empty()) {
+    if (NeuroPressActive(context) && !stats.empty()) {
       const std::string np_name =
           ctp::CompressionFactory::NameForWireId(best_lib);
       int np_base = -1;
