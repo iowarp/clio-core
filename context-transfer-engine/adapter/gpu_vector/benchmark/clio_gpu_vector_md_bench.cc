@@ -1898,7 +1898,7 @@ static clio::run::u64 PlanCost(u32 nblocks, u32 s, u32 vs, u32 fs, u32 nls,
 static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
                        clio::run::u64 npages, clio::run::u64 page_bytes,
                        clio::run::u64 nl_pages, clio::run::u64 nl_page_bytes,
-                       CachePlan *out) {
+                       u32 rows_per_block, CachePlan *out) {
   const u32 s_max = static_cast<u32>(npages + 2);
   const u32 nl_max = (nl_pages == 0) ? 0u : static_cast<u32>(nl_pages + 2);
   // The list floor WAS 128 MB per block, which described a bug: the build
@@ -1918,9 +1918,35 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
   // Guessing a floor from the guard count has now been wrong twice -- the
   // list's floor was the same mistake -- so it is pinned to what runs.
   const u32 kAtomFloor = 24;
+  // THE FLOOR SCALES WITH ROWS PER BLOCK. A block sweeps nrows/nblocks rows
+  // of each atom vector per kernel, and the write-side ones go dirty -- a
+  // dirty frame is stuck until its flush lands. Fewer blocks means more rows
+  // each, so a constant floor that holds at 64 blocks traps at 8.
+  //
+  // MEASURED minima for x at lattice 50 (rows/block 106 / 53 / 27 / 14 at
+  // --blocks 8 / 16 / 32 / 64): 48 / 40 / 24 / 24 frames. It is ROWS, not
+  // pages: at 16 blocks the minimum is 40 at BOTH 128 KB and 256 KB pages,
+  // which is why sizing this off pages-per-block still trapped.
+  //
+  // f, the vector the force pass WRITES, needs the most (48 at 8 blocks where
+  // v and x run at 24) -- but a FLAT 48 for f is wrong in the other
+  // direction: at 128 blocks it pushed the floor to 6656 MB and made a
+  // configuration that runs fine at 24 unaffordable. One scaled rule, applied
+  // to all three, covers both ends.
+  //
+  // 3/4 of rows-per-block fits 53->40 exactly and is generous at the low end.
+  // Deliberately generous: too high wastes VRAM, too low ADVERTISES A BUDGET
+  // THAT CANNOT RUN -- which is what "needs 248 MB minimum" did before it
+  // trapped in EvictPages.
+  u32 scaled = rows_per_block == 0 ? 0u : (3u * rows_per_block + 3u) / 4u;
+  if (scaled > s_max) scaled = s_max;
   u32 s = kAtomFloor, vs = kAtomFloor, fs = kAtomFloor, nls = nl_floor;
+  if (s < scaled) s = scaled;
+  if (vs < scaled) vs = scaled;
+  if (fs < scaled) fs = scaled;
   if (s > s_max) s = s_max;
   if (vs > s_max) vs = s_max;
+  if (fs > s_max) fs = s_max;
   if (PlanCost(nblocks, s, vs, fs, nls, page_bytes, nl_page_bytes) > budget) {
     std::fprintf(stderr,
                  "--vram-mb %llu is below the floor: %u blocks needs %llu MB "
@@ -2131,8 +2157,12 @@ int main(int argc, char **argv) {
         a.md ? NlGeometry(g.nb, g.cap, a.maxneigh, a.nl_page_kb)
              : NlGeom{0, 0};
     CachePlan plan;
+    const u32 rpb =
+        a.md ? static_cast<u32>((static_cast<u64>(g.nb) * g.nb + a.blocks - 1) /
+                                a.blocks)
+             : 0u;
     if (!PlanCaches(a.vram_mb * 1024ull * 1024ull, a.blocks, npages,
-                    page_bytes, nlg.pages, nlg.page_bytes, &plan)) {
+                    page_bytes, nlg.pages, nlg.page_bytes, rpb, &plan)) {
       return 1;
     }
     if (a.slots == 0) slots = plan.slots;
