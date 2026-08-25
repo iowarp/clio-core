@@ -1,0 +1,363 @@
+diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
+--- a/Source/IO/Nyx_output.cpp
++++ b/Source/IO/Nyx_output.cpp
+@@ -133,6 +133,322 @@
+  * unconditionally would make a float64 build indistinguishable from a float32
+  * one and quietly turn that control into a duplicate of the baseline.
+  * ------------------------------------------------------------------------- */
++/* ---------------------------------------------------------------------------
++ * Clio / NeuroPress IN-SITU hand-over.
++ *
++ * Nyx keeps its hydro state in an amrex::MultiFab allocated by The_Arena(),
++ * which in a CUDA build is a plain cudaMalloc arena -- fab.dataPtr(comp) is
++ * DEVICE memory (verify it yourself with NYX_PTR_PROBE=1 below). This block
++ * hands those pointers, unchanged and uncopied-to-host, to Clio's compressor
++ * inside the running simulation. NeuroPress picks a codec per chunk and Clio
++ * stores the result; no plotfile and no dump file is involved.
++ *
++ * NOTHING HERE TOUCHES THE PHYSICS. It runs only from output/observation
++ * callbacks, it only reads state, and every function it calls on the AMReX
++ * side is a query or a stream synchronise.
++ *
++ * The Clio side is ONE shared library, libclio_nyx_insitu.so, resolved with
++ * dlopen at first use -- so Nyx's build is untouched: no CMake change, no
++ * Clio in the link line, nothing to configure. It is the same relationship
++ * HDF5 has with a VOL connector.
++ *
++ * Environment:
++ *   NYX_CLIO_INSITU=1        turn it on (off = every function here returns
++ *                            immediately and Nyx behaves exactly as before)
++ *   NYX_CLIO_INSITU_LIB=P    path to libclio_nyx_insitu.so [that soname]
++ *   NYX_CLIO_INSITU_HOOK=H   insitu (default) | plotfile | both, see below
++ *   NYX_CLIO_INSITU_GHOSTS=1 store the whole grown FAB instead of the valid
++ *                            box (see the adapter's header for why the valid
++ *                            box is the default)
++ *   NYX_PTR_PROBE=1          print cudaPointerGetAttributes for the first
++ *                            FAB's components and stop -- the evidence that
++ *                            this is device memory at all
++ * plus the CLIO_NYX_* variables the adapter itself reads.
++ *
++ * WHICH HOOK
++ *   insitu    Nyx::updateInSitu(), Nyx's OWN in-situ callback, fired from
++ *             post_timestep at level 0 on the `insitu.int` cadence. This is
++ *             the in-situ path: no plotfile need ever be written, so Clio is
++ *             the only I/O in the run. Note that post_timestep runs
++ *             reset_internal_energy / compute_new_temp AFTER this point, so
++ *             rho_E and rho_e here are pre-reset -- the same state SENSEI and
++ *             Ascent see through this callback.
++ *   plotfile  Nyx::writePlotFile(), the app's output path, on `amr.plot_int`.
++ *             Same MultiFab, one step later in the loop, and alongside the
++ *             raw dump of nyx-raw-field-dump.patch -- which makes the two
++ *             directly byte-comparable.
++ * ------------------------------------------------------------------------- */
++#include <dlfcn.h>
++#if defined(AMREX_USE_CUDA)
++#include <cuda_runtime.h>
++#endif
++
++/* The adapter's ABI. Declared here rather than #included so this file has no
++   include path to Clio at all; clio_nyx_insitu.h is the canonical copy. */
++extern "C" {
++typedef int (*clio_nyx_begin_fn)(void);
++typedef int (*clio_nyx_frame_begin_fn)(long long, double);
++typedef int (*clio_nyx_stage_fn)(const char*, const void*, long long,
++                                 long long, long long, long long,
++                                 long long, long long, long long,
++                                 long long, long long, long long);
++typedef int (*clio_nyx_frame_end_fn)(void);
++typedef int (*clio_nyx_end_fn)(void);
++}
++
++namespace {
++struct NyxClioInSitu {
++    int    state = -1;           /* -1 unknown, 0 off, 1 loaded */
++    int    ghosts = 0;
++    std::string hook = "insitu";
++    void*  handle = nullptr;
++    clio_nyx_begin_fn       begin       = nullptr;
++    clio_nyx_frame_begin_fn frame_begin = nullptr;
++    clio_nyx_stage_fn       stage       = nullptr;
++    clio_nyx_frame_end_fn   frame_end   = nullptr;
++    clio_nyx_end_fn         end         = nullptr;
++};
++NyxClioInSitu& nyx_clio (void) { static NyxClioInSitu s; return s; }
++}
++
++/** Load the adapter once. Returns true when the in-situ path is active.
++ *  Every failure ABORTS rather than degrading: NYX_CLIO_INSITU=1 asked for
++ *  the data to go to Clio, and a run that quietly did not do that is a run
++ *  whose output silently does not exist. */
++static bool
++nyx_clio_insitu_load (void)
++{
++    NyxClioInSitu& c = nyx_clio();
++    if (c.state >= 0) return c.state == 1;
++
++    const char* e = getenv("NYX_CLIO_INSITU");
++    if (!(e && atoi(e))) { c.state = 0; return false; }
++
++#ifndef AMREX_USE_GPU
++    amrex::Abort("NYX_CLIO_INSITU=1 but this Nyx was built without a GPU "
++                 "backend. The in-situ path exists to hand DEVICE memory to "
++                 "the compressor; on a host build there is no device pointer "
++                 "to hand over. Refusing rather than staging host bytes and "
++                 "calling it GPU-direct.");
++#endif
++
++    if (const char* g = getenv("NYX_CLIO_INSITU_GHOSTS")) c.ghosts = atoi(g);
++    if (const char* h = getenv("NYX_CLIO_INSITU_HOOK"))   c.hook  = h;
++    if (c.hook != "insitu" && c.hook != "plotfile" && c.hook != "both") {
++        amrex::Abort("NYX_CLIO_INSITU_HOOK must be insitu, plotfile or both");
++    }
++
++    const char* lib = getenv("NYX_CLIO_INSITU_LIB");
++    if (!lib || !*lib) lib = "libclio_nyx_insitu.so";
++    /* RTLD_GLOBAL: Clio's runtime dlopens its own modules, and they resolve
++       Clio symbols out of this library. */
++    c.handle = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
++    if (!c.handle) {
++        amrex::Abort(std::string("NYX_CLIO_INSITU=1 but dlopen('") + lib +
++                     "') failed: " + dlerror() +
++                     "  (set NYX_CLIO_INSITU_LIB to the built "
++                     "libclio_nyx_insitu.so)");
++    }
++    c.begin       = (clio_nyx_begin_fn)       dlsym(c.handle, "clio_nyx_insitu_begin");
++    c.frame_begin = (clio_nyx_frame_begin_fn) dlsym(c.handle, "clio_nyx_insitu_frame_begin");
++    c.stage       = (clio_nyx_stage_fn)       dlsym(c.handle, "clio_nyx_insitu_stage");
++    c.frame_end   = (clio_nyx_frame_end_fn)   dlsym(c.handle, "clio_nyx_insitu_frame_end");
++    c.end         = (clio_nyx_end_fn)         dlsym(c.handle, "clio_nyx_insitu_end");
++    if (!c.begin || !c.frame_begin || !c.stage || !c.frame_end || !c.end) {
++        amrex::Abort(std::string("libclio_nyx_insitu.so ('") + lib +
++                     "') is missing one of the clio_nyx_insitu_* symbols");
++    }
++    if (c.begin() != 0) {
++        amrex::Abort("clio_nyx_insitu_begin() failed -- is CLIO_SERVER_CONF "
++                     "set and CLIO_WITH_RUNTIME=1?");
++    }
++    /* The summary, the CSV the cold read replays, and the optional read-back
++       all happen here. ExecOnFinalize rather than atexit so it runs inside
++       the application's own shutdown, while the Clio runtime is still up. */
++    amrex::ExecOnFinalize([](){ NyxClioInSitu& x = nyx_clio();
++                               if (x.state == 1 && x.end) x.end(); });
++    c.state = 1;
++    return true;
++}
++
++static bool
++nyx_clio_hook_is (const char* which)
++{
++    if (!nyx_clio_insitu_load()) return false;
++    const std::string& h = nyx_clio().hook;
++    return h == "both" || h == which;
++}
++
++/* The evidence for "fab.dataPtr(comp) is device memory". Off unless
++   NYX_PTR_PROBE=1; prints once. Kept in the patch deliberately: the claim the
++   whole design rests on should be re-checkable on any machine, on any AMReX
++   configuration, without rebuilding anything. */
++static void
++nyx_clio_ptr_probe (const amrex::MultiFab& mf,
++                    const amrex::Vector<std::string>& names)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* e = getenv("NYX_PTR_PROBE");
++        enabled = (e && atoi(e)) ? 1 : 0;
++    }
++    if (!enabled) return;
++    static int done = 0;
++    if (done) return;
++    done = 1;
++
++    amrex::Arena* a = amrex::The_Arena();
++    amrex::Print() << "[ptr-probe] sizeof(amrex::Real)=" << sizeof(amrex::Real)
++                   << " The_Arena: isDeviceAccessible=" << a->isDeviceAccessible()
++                   << " isHostAccessible=" << a->isHostAccessible()
++                   << " isManaged=" << a->isManaged()
++                   << " isDevice=" << a->isDevice()
++                   << " isPinned=" << a->isPinned() << "\n";
++    amrex::Print() << "[ptr-probe] MultiFab nComp=" << mf.nComp()
++                   << " nGrow=" << mf.nGrowVect()
++                   << " local_size=" << mf.local_size()
++                   << " size=" << mf.size() << "\n";
++
++    for (amrex::MFIter mfi(mf); mfi.isValid(); ++mfi) {
++        const amrex::FArrayBox& fab = mf[mfi];
++        amrex::Print() << "[ptr-probe] fab index=" << mfi.index()
++                       << " validbox=" << mfi.validbox()
++                       << " numPts(valid)=" << mfi.validbox().numPts()
++                       << " fabbox=" << fab.box()
++                       << " numPts(fab)=" << fab.box().numPts()
++                       << " nComp=" << fab.nComp() << "\n";
++        for (int comp = 0; comp < mf.nComp(); ++comp) {
++            const amrex::Real* d_ptr = fab.dataPtr(comp);
++            const char* nm = (comp < (int)names.size()) ? names[comp].c_str() : "unk";
++#if defined(AMREX_USE_CUDA)
++            cudaPointerAttributes attr;
++            memset(&attr, 0, sizeof(attr));
++            cudaError_t rc = cudaPointerGetAttributes(&attr, (const void*)d_ptr);
++            const char* tname = "?";
++            if (rc != cudaSuccess) { tname = "ERROR"; }
++            else if (attr.type == cudaMemoryTypeUnregistered) tname = "unregistered-host";
++            else if (attr.type == cudaMemoryTypeHost)         tname = "pinned-host";
++            else if (attr.type == cudaMemoryTypeDevice)       tname = "DEVICE";
++            else if (attr.type == cudaMemoryTypeManaged)      tname = "MANAGED";
++            amrex::Print() << "[ptr-probe]   comp=" << comp << " (" << nm << ") ptr="
++                           << (const void*)d_ptr
++                           << " cudaPointerGetAttributes rc=" << (int)rc
++                           << " type=" << (int)attr.type << " (" << tname << ")"
++                           << " device=" << attr.device
++                           << " devicePointer=" << attr.devicePointer
++                           << " hostPointer=" << attr.hostPointer << "\n";
++#else
++            amrex::Print() << "[ptr-probe]   comp=" << comp << " (" << nm
++                           << ") ptr=" << (const void*)d_ptr << " (no CUDA)\n";
++#endif
++        }
++        if (mf.nComp() > 1) {
++            amrex::Print() << "[ptr-probe] comp stride (elements) = "
++                           << (fab.dataPtr(1) - fab.dataPtr(0))
++                           << "   fab.box().numPts()=" << fab.box().numPts()
++                           << "   validbox().numPts()=" << mfi.validbox().numPts()
++                           << "\n";
++        }
++        break;  /* one FAB is enough */
++    }
++}
++
++/**
++ * One in-situ frame: every FArrayBox of @p mf, every component, handed to
++ * Clio as a device pointer plus the geometry needed to cut the valid box out
++ * of the grown one.
++ *
++ * A blob is one (component, box, chunk). Ghost cells are excluded by default:
++ * a FAB component is contiguous over the GROWN box, so the valid region is a
++ * strided sub-volume, and the adapter extracts it with a single
++ * cudaMemcpy3DAsync on its own stream. Including them would store each
++ * interior cell of a neighbour twice and make a blob correspond to no region
++ * of the domain. NYX_CLIO_INSITU_GHOSTS=1 stores the whole FAB instead.
++ */
++static void
++nyx_clio_insitu_frame (amrex::Amr* parent_amr, const amrex::MultiFab& mf,
++                       const amrex::Vector<std::string>& names,
++                       long long step, double sim_time)
++{
++    NyxClioInSitu& c = nyx_clio();
++    if (c.state != 1) return;
++
++    nyx_clio_ptr_probe(mf, names);
++
++    /* --- Refusals. Each of these could have been continued past by storing
++       something that is not what the run claims to have stored. --- */
++    if (amrex::ParallelDescriptor::NProcs() > 1) {
++        amrex::Abort("NYX_CLIO_INSITU: multi-rank runs are refused. Each rank "
++                     "owns a subset of the boxes and would publish its slice "
++                     "under an unqualified blob name, so a reader would see a "
++                     "fraction of the domain presented as the whole of it. "
++                     "Run single-rank, or extend the naming first.");
++    }
++    if (parent_amr != nullptr && parent_amr->finestLevel() > 0) {
++        amrex::Abort("NYX_CLIO_INSITU: this hook stores level 0 only, but the "
++                     "run has finer levels whose data would be silently "
++                     "dropped. Refusing rather than storing a coarse image "
++                     "and calling it the state.");
++    }
++    if (AMREX_SPACEDIM != 3) {
++        amrex::Abort("NYX_CLIO_INSITU: the sub-volume extraction is written "
++                     "for 3D");
++    }
++
++    /* AMReX runs its kernels on its own streams and post_timestep does not
++       synchronise before the in-situ callback. The FAB may still be being
++       written when we get here, and Clio reads it from another thread on
++       another stream, so the frame has to be COMPLETE, not merely issued.
++       Device::synchronize() covers every AMReX stream, not just the current
++       one -- MFIter rotates through a pool. */
++    amrex::Gpu::Device::synchronize();
++
++    c.frame_begin(step, sim_time);
++
++    for (amrex::MFIter mfi(mf); mfi.isValid(); ++mfi) {
++        const amrex::FArrayBox& fab = mf[mfi];
++        const amrex::Box& gbox = fab.box();       /* grown: valid + nGrow */
++        const amrex::Box& vbox = mfi.validbox();
++
++        const long long gx = gbox.length(0);
++        const long long gy = gbox.length(1);
++        const long long gz = gbox.length(2);
++
++        long long ox, oy, oz, nx, ny, nz;
++        if (c.ghosts) {
++            ox = oy = oz = 0; nx = gx; ny = gy; nz = gz;
++        } else {
++            ox = vbox.smallEnd(0) - gbox.smallEnd(0);
++            oy = vbox.smallEnd(1) - gbox.smallEnd(1);
++            oz = vbox.smallEnd(2) - gbox.smallEnd(2);
++            nx = vbox.length(0); ny = vbox.length(1); nz = vbox.length(2);
++        }
++
++        /* Components are consecutive copies of the GROWN box. If that ever
++           stops being true the geometry passed below is wrong in a way that
++           compresses, stores and decompresses perfectly. */
++        if (mf.nComp() > 1 &&
++            (fab.dataPtr(1) - fab.dataPtr(0)) != gbox.numPts()) {
++            amrex::Abort("NYX_CLIO_INSITU: FArrayBox component stride is not "
++                         "box().numPts(); the layout assumption behind the "
++                         "sub-volume extraction does not hold");
++        }
++
++        for (int comp = 0; comp < mf.nComp(); ++comp) {
++            char blob[512];
++            snprintf(blob, sizeof(blob), "%s/step_%05lld/fab%04d",
++                     (comp < (int)names.size()) ? names[comp].c_str() : "unk",
++                     step, mfi.index());
++            c.stage(blob, (const void*)fab.dataPtr(comp),
++                    (long long)sizeof(amrex::Real),
++                    gx, gy, gz, ox, oy, oz, nx, ny, nz);
++        }
++    }
++
++    c.frame_end();
++}
++
++
+ static void
+ nyx_dump_raw_fields (amrex::Amr* parent_amr, const amrex::MultiFab& mf,
+                      const amrex::Vector<std::string>& names)
+@@ -215,6 +531,15 @@
+         amrex::Vector<std::string> nm;
+         for (int c = 0; c < S.nComp(); ++c) nm.push_back(desc_lst[State_Type].name(c));
+         nyx_dump_raw_fields(parent, S, nm);
++        /* Clio in-situ at the PLOTFILE cadence. Same MultiFab the raw dump
++           just walked, so with both enabled the blobs and the .f32 files are
++           byte-comparable. NYX_CLIO_INSITU_HOOK=insitu (the default) skips
++           this and uses Nyx::updateInSitu() instead. */
++        if (nyx_clio_hook_is("plotfile")) {
++            nyx_clio_insitu_frame(parent, S, nm,
++                                  (long long)parent->levelSteps(0),
++                                  get_state_data(State_Type).curTime());
++        }
+     }
+ 
+ #ifdef AMREX_USE_HDF5
+@@ -1176,6 +1501,20 @@
+ int
+ Nyx::updateInSitu ()
+ {
++    /* Clio / NeuroPress. This is Nyx's own in-situ callback -- post_timestep
++       fires it at level 0 on the `insitu.int` cadence -- so the hand-over
++       needs no plotfile and Clio ends up being the only I/O in the run.
++       Placed before the SENSEI/Ascent block, and outside its #if, so it works
++       in a build that has neither. */
++    if (nyx_clio_hook_is("insitu")) {
++        const amrex::MultiFab& S = get_new_data(State_Type);
++        amrex::Vector<std::string> nm;
++        for (int c = 0; c < S.nComp(); ++c) nm.push_back(desc_lst[State_Type].name(c));
++        nyx_clio_insitu_frame(parent, S, nm,
++                              (long long)parent->levelSteps(0),
++                              get_state_data(State_Type).curTime());
++    }
++
+ #if defined(BL_USE_SENSEI_INSITU) || defined(AMREX_USE_ASCENT)
+     BL_PROFILE("Nyx::UpdateInSitu()");
+ 

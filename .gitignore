@@ -140,6 +140,13 @@ context-transfer-engine/compressor/example/neuropress_lammps_lib/store*/
 # which is the only shape available for codes with no library interface to
 # embed (Nyx). Plain C++ against the Clio client, no simulation dependency.
 !context-transfer-engine/compressor/example/neuropress_field_replay/
+# And the IN-SITU counterpart of that replay: one shared library a patched Nyx
+# dlopens from its own in-situ callback to hand over AMReX device pointers.
+# Nothing here depends on Nyx or AMReX -- the ABI is plain C -- so it builds
+# wherever the compressor does. The store directories its scripts write are run
+# output, not source.
+!context-transfer-engine/compressor/example/neuropress_nyx_insitu/
+context-transfer-engine/compressor/example/neuropress_nyx_insitu/store*/
 
 # NeuroPress differential parity harnesses (issue #693). Same reasoning as the
 # example directories above: they compile a second project's CUDA sources from
