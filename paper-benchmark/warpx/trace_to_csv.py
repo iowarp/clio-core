@@ -39,6 +39,11 @@ import re
 import sys
 
 BLOB = re.compile(r"DynamicSchedule blob='([^']*)' bytes=(\d+)")
+# CompressionHeader, plus QuantHeaderExtension when the chunk was quantized.
+# The trace's `out=` already includes these; a size derived from a ratio does
+# not, and must add them back to describe the same thing.
+HDR, QHDR = 24, 32
+
 CODEC = re.compile(r"codec ran lib=(\d+) in=(\d+) out=(\d+) kept=([01])")
 FINAL = re.compile(r"neuropress FINAL blob='([^']*)' lib=(\d+) \(([^)]*)\)"
                    r".*?\((primary kept|EXPLORATION OVERRODE THE PRIMARY)\)")
@@ -111,7 +116,8 @@ def main():
             if r.get("adopted") == "1":
                 try:
                     adopted[r["blob"]] = (float(r["ratio"]),
-                                          int(r["chunk_bytes"]))
+                                          int(r["chunk_bytes"]),
+                                          r.get("quantize") == "1")
                 except (ValueError, KeyError):
                     pass
                 try:
@@ -138,8 +144,18 @@ def main():
             continue
         fin = finals.get(name)
         if fin and fin[2] and name in adopted:          # selection overrode
-            ratio, cbytes = adopted[name]
-            stored = int(cbytes / ratio) if ratio > 0 else cin
+            ratio, cbytes, quant = adopted[name]
+            # + the CTEC header. explore.csv's `ratio` is bytes/CODEC PAYLOAD
+            # (upstream's definition, header excluded), so cbytes/ratio is the
+            # payload alone -- while the `kept` branch below takes `out` from
+            # the trace, which is total_stored_size and DOES include it. Two
+            # definitions in one column: every overridden chunk was understated
+            # by 24 bytes, and the run's total with it. Caught by comparing
+            # against what fs_bdev actually wrote (44 of 160 chunks here, 1056
+            # of a 1154-byte shortfall; the rest is metadata blobs and the
+            # truncation below).
+            stored = (int(cbytes / ratio) + HDR + (QHDR if quant else 0)
+                      if ratio > 0 else cin)
             lib_out, codec_out = fin[0], fin[1]
             corrected += 1
         elif kept:                                       # primary, kept

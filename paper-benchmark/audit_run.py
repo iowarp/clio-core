@@ -37,7 +37,7 @@ HDR, QHDR = 24, 32
 def read_log(d):
     """Per-field and total figures from whichever log the adapter wrote."""
     per, tot, codecs, seen = {}, None, Counter(), []
-    for name in ("nyx.log", "vpic.log", "stdout.log", "run.log"):
+    for name in ("nyx.log", "vpic.log", "stdout.log", "convert.log", "run.log"):
         p = os.path.join(d, name)
         if not os.path.isfile(p):
             continue
@@ -51,6 +51,15 @@ def read_log(d):
             m = re.search(r"codec\s+([\w-]+)\s*:\s*(\d+) chunk", line)
             if m:
                 codecs[m.group(1)] = int(m.group(2))
+            # WarpX has no adapter: trace_to_csv.py reconstructs the run from
+            # the runtime log and writes convert.log, whose summary reads
+            # "N chunks, M from the adopted candidate, X B -> Y B (Zx)".
+            # No per-field table and no codec tally, so those checks simply do
+            # not run for it.
+            m = re.search(r"(\d+) chunks?, \d+ from the adopted candidate, "
+                          r"(\d+) B -> (\d+) B \(([\d.]+)x\)", line)
+            if m:
+                tot = (int(m.group(2)), int(m.group(3)), float(m.group(4)))
         if per or tot:
             seen.append(name)
     # Every candidate is read and MERGED, not just the first that matched.
@@ -150,9 +159,22 @@ def audit(d):
     ]
     if writes:
         w_sum = sum(k * v for k, v in writes.items())
-        every = all(writes.get(int(r["stored"]), 0) > 0 for r in blobs)
-        checks += [("fs_bdev bytes written == log", w_sum == tot[1], f"{w_sum} vs {tot[1]}"),
-                   ("every blob's size was written", every, "")]
+        n_w = sum(writes.values())
+        if n_w == len(blobs):
+            # One PutBlob per chunk, one bdev write per PutBlob: the in-situ
+            # adapters and the LAMMPS driver. Exact equality is meaningful.
+            every = all(writes.get(int(r["stored"]), 0) > 0 for r in blobs)
+            checks += [("fs_bdev bytes written == log", w_sum == tot[1],
+                        f"{w_sum} vs {tot[1]}"),
+                       ("every blob's size was written", every, "")]
+        else:
+            # WarpX: blobs.csv is written --fields-only, while the tier also
+            # holds openPMD metadata blobs, so the writes are a SUPERSET and
+            # exact equality would be wrong. The surplus is still bounded and
+            # is reported, because a large one means field bytes are missing.
+            checks.append(("fs_bdev bytes >= log (superset)", w_sum >= tot[1],
+                           f"{w_sum} vs {tot[1]}, surplus {w_sum - tot[1]} B "
+                           f"in {n_w - len(blobs)} non-field write(s)"))
     if log_codecs:
         # From blobs.csv, which has EVERY chunk. The adopted set only covers
         # chunks that actually explored, so tallying it against the log's
