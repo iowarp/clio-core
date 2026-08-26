@@ -233,6 +233,35 @@ void ConfigManager::ApplyEnvOverrides() {
       main_segment_size_ = parsed;
     }
   }
+
+  // issue #990: web dashboard. CLIO_VIZ_ENABLE=1/0 counts as an explicit
+  // choice, so `clio_run runtime start` will not override it. CLIO_VIZ_PORT=0
+  // asks for an ephemeral port (VizServer::GetPort() reports what was bound),
+  // which is how tests avoid colliding with a real daemon.
+  if (const char *env = clio::run::env::GetCompat("VIZ_ENABLE")) {
+    viz_enabled_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T' ||
+                    env[0] == 'y' || env[0] == 'Y');
+    viz_enabled_explicit_ = true;
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_PORT")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n <= 65535) {
+      viz_port_ = static_cast<u32>(n);
+    }
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_BIND")) {
+    if (env[0] != '\0') {
+      viz_bind_addr_ = env;
+    }
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_MAX_THREADS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      viz_max_threads_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {
@@ -275,6 +304,20 @@ std::string ConfigManager::GetServerConfigPath() const {
   const char *env_path = clio::run::env::GetCompat("SERVER_CONF");
   if (env_path) {
     return std::string(env_path);
+  }
+
+  // Unit tests are hermetic: never fall back to the developer's per-user
+  // config. Whatever happens to be in ~/.clio/clio.yaml would otherwise leak
+  // into every test -- a real cluster hostfile makes each test come up as a
+  // peer of that cluster and block on nodes that aren't running, and a
+  // `capacity: 0g` RAM bdev sizes itself at 80% of DRAM, fails to map, and
+  // falls back to the slow private-heap path. Both show up as tests that time
+  // out on a developer machine while passing in CI, which has no such file.
+  // A test that wants a specific config sets CLIO_SERVER_CONF, handled above.
+  if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
+    if (*tm && std::string(tm) != "0") {
+      return std::string();
+    }
   }
 
   // Fall back to a per-user config file. Lookup order, first hit wins:
@@ -394,6 +437,16 @@ void ConfigManager::LoadDefault() {
 
   // Set default task load prediction model learning rate
   learning_rate_ = 0.2f;
+
+  // Web dashboard defaults (issue #990): off unless something asks for it, so
+  // an embedded runtime never opens a listening socket by surprise. Cleared on
+  // every (re)load; the YAML section, ApplyEnvOverrides and the daemon CLI all
+  // run afterwards and restate whatever was configured.
+  viz_enabled_ = false;
+  viz_enabled_explicit_ = false;
+  viz_port_ = 8080;
+  viz_bind_addr_ = "127.0.0.1";
+  viz_max_threads_ = 16;
 }
 
 void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
@@ -541,6 +594,26 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (swim["suspicion_timeout_sec"]) {
       swim_suspicion_timeout_sec_ =
           swim["suspicion_timeout_sec"].as<float>();
+    }
+  }
+
+  // Parse the web-dashboard section (issue #990). All fields optional. Naming
+  // an `enabled` value here counts as an explicit choice, so the daemon CLI's
+  // default (SetVizEnabledDefault) will not override it.
+  if (yaml_conf["viz"]) {
+    auto viz = yaml_conf["viz"];
+    if (viz["enabled"]) {
+      viz_enabled_ = viz["enabled"].as<bool>();
+      viz_enabled_explicit_ = true;
+    }
+    if (viz["port"]) {
+      viz_port_ = viz["port"].as<u32>();
+    }
+    if (viz["bind"]) {
+      viz_bind_addr_ = viz["bind"].as<std::string>();
+    }
+    if (viz["max_threads"]) {
+      viz_max_threads_ = viz["max_threads"].as<u32>();
     }
   }
 

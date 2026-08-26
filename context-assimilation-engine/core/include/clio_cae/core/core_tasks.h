@@ -284,7 +284,23 @@ struct ParseOmniTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ParseOmniTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ParseOmniTask>();
+    // Each replica schedules its own share of the work, so the count is the
+    // SUM. result_code_ keeps the FIRST failure so a later success cannot mask
+    // it.
+    num_tasks_scheduled_ += replica->num_tasks_scheduled_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -437,7 +453,22 @@ struct ExportDataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ExportDataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ExportDataTask>();
+    // Each replica exports its own share, so the byte count is the SUM;
+    // result_code_ keeps the FIRST failure.
+    bytes_exported_ += replica->bytes_exported_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -509,7 +540,22 @@ struct ImportDataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ImportDataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ImportDataTask>();
+    // Each replica imports its own share, so the byte count is the SUM;
+    // result_code_ keeps the FIRST failure.
+    bytes_imported_ += replica->bytes_imported_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 

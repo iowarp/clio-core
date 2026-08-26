@@ -43,6 +43,28 @@ const std::string kH5File = "/tmp/clio_vol_io_test.h5";
 constexpr size_t kNumElems = 4096;  // 16 KiB of ints
 
 /**
+ * Portable setenv/unsetenv. MSVC has neither, so every env tweak in this file
+ * must go through these -- a raw setenv() call compiles everywhere except the
+ * Windows adapter leg, where it fails as "identifier not found".
+ */
+void SetEnvVar(const char *key, const char *value) {
+#ifdef _WIN32
+  _putenv_s(key, value);
+#else
+  setenv(key, value, 1);
+#endif
+}
+
+void UnsetEnvVar(const char *key) {
+#ifdef _WIN32
+  // _putenv_s with an empty value removes the variable outright.
+  _putenv_s(key, "");
+#else
+  unsetenv(key);
+#endif
+}
+
+/**
  * Stand up the in-process runtime + CTE client + a file bdev target exactly
  * once. Mirrors initializeRuntime() in the POSIX adapter test. Returns the VOL
  * connector id (registered once, valid for the process lifetime).
@@ -54,12 +76,8 @@ hid_t setupVolEnvironment() {
   }
 
   // Small chunk size so the multi-chunk AsyncPutBlob loop is exercised even by
-  // a modest dataset (16 KiB / 4 KiB = 4 chunks). setenv is POSIX-only.
-#ifdef _WIN32
-  _putenv_s("CLIO_VOL_CHUNK_SIZE", "4096");
-#else
-  setenv("CLIO_VOL_CHUNK_SIZE", "4096", 1);
-#endif
+  // a modest dataset (16 KiB / 4 KiB = 4 chunks).
+  SetEnvVar("CLIO_VOL_CHUNK_SIZE", "4096");
 
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
@@ -387,7 +405,7 @@ TEST_CASE("HDF5 VOL IO - Whole rewrite invalidates when staging is skipped",
   // next whole read served pre-rewrite bytes with a success status.
   hid_t vol_id = setupVolEnvironment();
   hid_t fapl = makeFapl(vol_id);
-  setenv("CLIO_VOL_ADMIT", "read-miss", 1);
+  SetEnvVar("CLIO_VOL_ADMIT", "read-miss");
 
   const std::string path = "/tmp/clio_vol_io_rewrite.h5";
   std::remove(path.c_str());
@@ -423,7 +441,7 @@ TEST_CASE("HDF5 VOL IO - Whole rewrite invalidates when staging is skipped",
   H5Sclose(space);
   REQUIRE(H5Fclose(file) >= 0);
   REQUIRE(H5Pclose(fapl) >= 0);
-  unsetenv("CLIO_VOL_ADMIT");
+  UnsetEnvVar("CLIO_VOL_ADMIT");
 }
 
 TEST_CASE("HDF5 VOL IO - Partial-write-first dataset stays cacheable",

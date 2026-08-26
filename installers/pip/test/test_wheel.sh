@@ -4,7 +4,7 @@
 # =============================================================================
 # Replicates the full .github/workflows/build-pip.yml pipeline:
 #
-#   Phase 1 (build-wheels): Build the wheel in manylinux_2_34, same as
+#   Phase 1 (build-wheels): Build the wheel in manylinux_2_28, same as
 #       cibuildwheel. Installs deps from source, builds with scikit-build-core,
 #       fixes RPATHs, and verifies static linking.
 #
@@ -36,7 +36,7 @@ SKIP_BUILD=false
 BUILD_ONLY=false
 # Default distros matching CI matrix. ubuntu:24.04 and fedora:40 have cp312;
 # ubuntu:22.04 (cp310) and debian:12 (cp311) need their own wheels.
-DISTROS=("ubuntu:22.04" "ubuntu:24.04" "debian:12" "fedora:40")
+DISTROS=("rockylinux:8" "ubuntu:22.04" "ubuntu:24.04" "debian:12" "fedora:40")
 CUSTOM_DISTRO=""
 
 while [[ $# -gt 0 ]]; do
@@ -73,10 +73,10 @@ echo "  Wheelhouse:   $WHEELHOUSE"
 echo ""
 
 # ==================================================================
-# Phase 1: Build the wheel in manylinux_2_34
+# Phase 1: Build the wheel in manylinux_2_28
 # ==================================================================
 if [[ "$SKIP_BUILD" == "false" ]]; then
-    echo ">>> Phase 1: Building wheel in manylinux_2_34..."
+    echo ">>> Phase 1: Building wheel in manylinux_2_28..."
     echo ""
 
     mkdir -p "$WHEELHOUSE"
@@ -146,7 +146,14 @@ for DISTRO in "${DISTROS[@]}"; do
                 apt-get update -qq
                 apt-get install -y -qq python3 python3-pip python3-venv binutils >/dev/null 2>&1
             elif command -v dnf &>/dev/null; then
-                dnf install -y -q python3 python3-pip binutils >/dev/null 2>&1
+                # RHEL8 family: stock python3 is 3.6, older than any wheel we
+                # build. Prefer the 3.12 AppStream module (#973).
+                dnf install -y -q binutils >/dev/null 2>&1
+                if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+                    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+                else
+                    dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                fi
             elif command -v yum &>/dev/null; then
                 yum install -y -q python3 python3-pip binutils >/dev/null 2>&1
             fi
@@ -155,11 +162,23 @@ for DISTRO in "${DISTROS[@]}"; do
             python3 -m venv /tmp/test-venv
             source /tmp/test-venv/bin/activate
 
-            # Install the wheel matching this Python version
-            if ! pip install --quiet --no-index --find-links /wheels iowarp-core 2>&1; then
+            # Install the wheel matching this Python version.
+            #
+            # Select it by file path and Python tag, the way CI does, and skip
+            # ONLY when no wheel for this interpreter exists. The previous
+            # version installed by name under --no-index, which fails for two
+            # very different reasons -- no matching wheel, or a runtime
+            # dependency (pyyaml, flask, msgpack) that --no-index forbids
+            # fetching -- and reported both as "SKIP: No compatible wheel".
+            # That turns any genuine install failure into a green skip.
+            PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
+            WHEEL=$(ls /wheels/iowarp_core-*-${PYTAG}-*.whl 2>/dev/null | head -1)
+            if [ -z "$WHEEL" ]; then
                 echo "SKIP: No compatible wheel for this Python version"
                 exit 99
             fi
+            echo "Installing built wheel: $WHEEL"
+            pip install --quiet --find-links /wheels --no-cache-dir "$WHEEL"
 
             echo "=== Import test ==="
             python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"

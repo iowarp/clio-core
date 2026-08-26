@@ -37,6 +37,37 @@ runtime:
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
 
+# -- Web dashboard ------------------------------------------------------------
+# The runtime serves a dashboard itself: the admin ChiMod starts one HTTP server
+# per node, and every ChiMod that ships a `viz/` directory of HTML/CSS/JS gets
+# mounted at /viz/<mod_name> with the routes its Container registered. Nothing
+# here is collective, so each node serves the same UI independently.
+#
+# `clio_run runtime start` serves the dashboard by default; an embedded runtime
+# (a unit test, an adapter, a library user's CLIO_INIT) does not. Setting
+# `enabled` here decides it for both, and overrides the CLI default.
+#
+# Environment overrides (they win over this file):
+#   CLIO_VIZ_ENABLE      : 1/0
+#   CLIO_VIZ_PORT        : TCP port (0 = pick a free one)
+#   CLIO_VIZ_BIND        : bind address
+#   CLIO_VIZ_MAX_THREADS : HTTP thread-pool size
+#   CLIO_VIZ_PATH        : ':'-separated viz roots to serve assets from instead
+#                          of the ones next to the loaded ChiMod libraries
+#                          (edit pages without rebuilding)
+# Command line: clio_run runtime start [--viz|--no-viz] [--viz-port N]
+#                                      [--viz-bind ADDR]
+# viz:
+#   enabled: true                      # serve the dashboard on this node
+#   port: 8080                         # 0 = bind an ephemeral port
+#   bind: "127.0.0.1"                  # loopback by default: the dashboard
+#                                      # exposes runtime internals, so binding
+#                                      # 0.0.0.0 publishes them to the network
+#   max_threads: 16                    # HTTP request threads. Thread-per-
+#                                      # connection: a browser parks ~6
+#                                      # keep-alive sockets, so keep this
+#                                      # comfortably above that.
+
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.
 #

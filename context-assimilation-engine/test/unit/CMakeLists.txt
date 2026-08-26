@@ -913,7 +913,7 @@ set_tests_properties(cae_pagify_interpose PROPERTIES
 # client libraries and runs the test against a live runtime (CLIO_WITH_RUNTIME=1).
 # ChunkedDatasetWriter touches no CLIO types at all -- it takes a chunk name and
 # its bytes -- so this test needs only libhdf5 and stays fast and hermetic. That
-# separation is the whole point of hdf5_export.h: inside the ExportData coroutine
+# separation is the whole point of factory/hdf5_export.h: inside the ExportData coroutine
 # these mechanics could not be tested without a runtime, a server, and a GPU.
 #------------------------------------------------------------------------------
 if(HDF5_ENABLED)
@@ -922,7 +922,7 @@ if(HDF5_ENABLED)
   )
 
   target_include_directories(cae_hdf5_export_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/hdf5_export.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/factory/hdf5_export.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include  # kvhdf5/meta_blob.h
     ${HDF5_INCLUDE_DIRS}
   )
@@ -974,7 +974,7 @@ if(HDF5_ENABLED)
   )
 
   target_include_directories(cae_hdf5_import_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/hdf5_import.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/factory/hdf5_import.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include  # kvhdf5/meta_blob.h
     ${HDF5_INCLUDE_DIRS}
   )

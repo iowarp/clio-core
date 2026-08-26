@@ -32,7 +32,7 @@
  */
 
 /**
- * Persistence for the per-pool task-stat model (issue #956).
+ * Persistence for the per-container task-stat model (issues #956, #994).
  *
  * The scheduler routes every task on Container::InferCpuTime /
  * InferWallClockTime, whose coefficients are learned by SGD from completed
@@ -76,14 +76,16 @@ std::string SanitizeForFilename(const std::string &name) {
 }  // namespace
 
 std::string TaskStatModelPath(const std::string &chimod_name,
-                              const std::string &pool_name, u32 node_id) {
+                              const std::string &pool_name, u32 node_id,
+                              u32 container_id) {
   auto *config_manager = CLIO_CONFIG_MANAGER;
   if (!config_manager) {
     return std::string();
   }
   return config_manager->GetConfDir() + "/models/" +
          SanitizeForFilename(chimod_name) + "." + SanitizeForFilename(pool_name) +
-         "." + std::to_string(node_id) + ".yaml";
+         "." + std::to_string(node_id) + "." + std::to_string(container_id) +
+         ".yaml";
 }
 
 bool TaskStatModelSnapshot::Save(const std::string &path) const {
@@ -103,6 +105,7 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
   out << YAML::BeginMap;
   out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
   out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
+  out << YAML::Key << "container_id" << YAML::Value << container_id_;
   out << YAML::Key << "learning_rate" << YAML::Value << learning_rate_;
   out << YAML::Key << "methods" << YAML::Value << YAML::BeginMap;
   for (const auto &kv : methods_) {
@@ -162,6 +165,9 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
     if (root["pool_name"]) {
       pool_name_ = root["pool_name"].as<std::string>();
     }
+    if (root["container_id"]) {
+      container_id_ = root["container_id"].as<u32>();
+    }
     if (root["learning_rate"]) {
       learning_rate_ = root["learning_rate"].as<float>();
     }
@@ -197,57 +203,41 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
 //=============================================================================
 
 TaskStatModelSnapshot Container::ExportModel() const {
-  const Container &owner = ModelOwner();
   TaskStatModelSnapshot snap;
-  snap.pool_name_ = owner.pool_name_;
-  snap.learning_rate_ = owner.learning_rate_;
-  // Names come from THIS container: the static container is Init'd by the same
-  // module, so the tables match, but reading them from the caller keeps the
-  // export usable even if a model owner was never given names.
-  const std::vector<std::string> &names =
-      method_names_.empty() ? owner.method_names_ : method_names_;
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (names[i].empty()) {
+  snap.pool_name_ = pool_name_;
+  snap.container_id_ = container_id_;
+  snap.learning_rate_ = learning_rate_;
+  for (size_t i = 0; i < method_names_.size(); ++i) {
+    if (method_names_[i].empty()) {
       continue;
     }
     MethodStatWeights w;
-    if (i < owner.method_model_.size()) w.cpu_coef_ = owner.method_model_[i];
-    if (i < owner.method_mape_.size()) w.cpu_mape_ = owner.method_mape_[i];
-    if (i < owner.method_model_wall_.size()) {
-      w.wall_coef_ = owner.method_model_wall_[i];
-    }
-    if (i < owner.method_mape_wall_.size()) {
-      w.wall_mape_ = owner.method_mape_wall_[i];
-    }
-    snap.methods_[names[i]] = w;
+    if (i < method_model_.size()) w.cpu_coef_ = method_model_[i];
+    if (i < method_mape_.size()) w.cpu_mape_ = method_mape_[i];
+    if (i < method_model_wall_.size()) w.wall_coef_ = method_model_wall_[i];
+    if (i < method_mape_wall_.size()) w.wall_mape_ = method_mape_wall_[i];
+    snap.methods_[method_names_[i]] = w;
   }
   return snap;
 }
 
 size_t Container::ImportModel(const TaskStatModelSnapshot &snapshot) {
-  Container &owner = ModelOwner();
-  const std::vector<std::string> &names =
-      method_names_.empty() ? owner.method_names_ : method_names_;
   size_t restored = 0;
-  for (size_t i = 0; i < names.size(); ++i) {
-    auto it = snapshot.methods_.find(names[i]);
+  for (size_t i = 0; i < method_names_.size(); ++i) {
+    auto it = snapshot.methods_.find(method_names_[i]);
     if (it == snapshot.methods_.end()) {
-      continue;  // new method, or one this pool never exercised: keep the seed
+      continue;  // new method, or one this container never exercised: keep seed
     }
     const MethodStatWeights &w = it->second;
-    if (i < owner.method_model_.size()) owner.method_model_[i] = w.cpu_coef_;
-    if (i < owner.method_mape_.size()) owner.method_mape_[i] = w.cpu_mape_;
-    if (i < owner.method_model_wall_.size()) {
-      owner.method_model_wall_[i] = w.wall_coef_;
-    }
-    if (i < owner.method_mape_wall_.size()) {
-      owner.method_mape_wall_[i] = w.wall_mape_;
-    }
+    if (i < method_model_.size()) method_model_[i] = w.cpu_coef_;
+    if (i < method_mape_.size()) method_mape_[i] = w.cpu_mape_;
+    if (i < method_model_wall_.size()) method_model_wall_[i] = w.wall_coef_;
+    if (i < method_mape_wall_.size()) method_mape_wall_[i] = w.wall_mape_;
     ++restored;
   }
   // A restore is not new learning: leaving the flag clear keeps the periodic
   // flush from rewriting a file identical to the one just read.
-  owner.model_dirty_.store(false, std::memory_order_relaxed);
+  model_dirty_.store(false, std::memory_order_relaxed);
   return restored;
 }
 

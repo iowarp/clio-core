@@ -7,7 +7,7 @@
    build exposes a working environ-bridge again; the CMake-side source
    of truth is in /CMakeLists.txt project(iowarp-core VERSION X.Y.Z),
    keep this number in sync when bumping. #}
-{% set version = "2.2.0" %}
+{% set version = "2.2.1" %}
 {% set preset = environ.get('IOWARP_PRESET', 'release') %}
 
 package:
@@ -26,6 +26,19 @@ build:
 requirements:
   build:
     - {{ compiler('cxx') }}
+    # {{ stdlib("c") }} pulls in sysroot_linux-64 (version pinned by
+    # c_stdlib_version in conda_build_config.yaml) and adds the matching
+    # __glibc>=x.y run-constraint to the package.
+    #
+    # Without it (#973) the conda-forge compiler activation packages no
+    # longer bring a sysroot of their own, so the build silently compiled
+    # against the CI runner host headers -- /usr on ubuntu-latest, glibc
+    # 2.39. The published 2.2.0 linux-64 package imports GLIBC_2.38
+    # symbols (__isoc23_strtol, ...) and GLIBC_2.34 pthread_create, so it
+    # cannot load on RHEL8-family HPC nodes (glibc 2.28) -- and because no
+    # __glibc constraint was recorded either, conda installed it there
+    # anyway and the failure only surfaced at import time.
+    - {{ stdlib("c") }}
     - cmake >=3.20
     - make
     - pkg-config
@@ -66,16 +79,11 @@ requirements:
     # - google-cloud-cpp
     - pyyaml
     - msgpack-python
-    - flask
 
 test:
   commands:
     - test -f $PREFIX/lib/libclio_run_cxx.so    # [linux]
     - test -f $PREFIX/lib/libclio_run_cxx.dylib  # [osx]
-    # The context visualizer ships as a standard feature: its package must be
-    # importable and the `context-visualizer` launcher must be on PATH.
-    - python -c "import context_visualizer"
-    - context-visualizer --help
 
 about:
   home: https://www.iowarp.ai

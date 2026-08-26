@@ -1176,6 +1176,18 @@ int main() {
       {"bogus=1",           false, "22: unknown key REFUSED, not ignored"},
       {"cache=maybe",       false, "22: non-boolean cache value REFUSED"},
       {"cache",             false, "22: entry with no '=' REFUSED"},
+      {"sieve=0",           true,  "22: sieve=0 accepted (coalescing off)"},
+      {"sieve=4096",        true,  "22: explicit sieve window accepted"},
+      {"cache=1;sieve=8192", true, "22: both keys in one string"},
+      // strtoull WRAPS a negative rather than rejecting it, so "-1" would
+      // otherwise install a SIZE_MAX coalescing window -- i.e. an unbounded
+      // scratch allocation -- from a string that looks like a typo.
+      {"sieve=-1",          false, "22: negative sieve REFUSED (no SIZE_MAX wrap)"},
+      // The window sizes a per-call scratch buffer, so an absurd value is an
+      // out-of-memory rather than a slow open. 1 GiB is the stated maximum.
+      {"sieve=1073741825",  false, "22: sieve above the 1 GiB maximum REFUSED"},
+      {"sieve=abc",         false, "22: non-numeric sieve REFUSED"},
+      {"sieve=",            false, "22: empty sieve value REFUSED"},
     };
     for (auto &c : cases) {
       std::remove(kCfgFile);
@@ -1256,6 +1268,102 @@ int main() {
       std::printf("[vfd-suite] ok 23: byte-altitude telemetry contract\n");
     }
     RunCmd(std::string("rm -rf '") + kTraceDir + "'");
+  }
+
+  // === 24. The coalescing window is a bound, not a suggestion =============
+  // The window (`sieve=`, 64 KiB by default) exists to cap the scratch buffer
+  // the coalescing path allocates. Two shapes break a naive cap check, and both
+  // are reachable through H5FDread_vector, which -- unlike a write vector --
+  // may legitimately carry overlapping elements:
+  //
+  //   (a) a first element already larger than the window. Nothing can be
+  //       coalesced around it without exceeding the window, so it has to stay
+  //       a group of one.
+  //   (b) a later element CONTAINED in the span accumulated so far. Its own end
+  //       is small, so testing that instead of the group's span admits it while
+  //       the span -- and the allocation -- stays above the window.
+  //
+  // Driven through the H5FD* API rather than H5Dread: the library never emits
+  // a vector this shape, which is exactly why the arithmetic has to be pinned
+  // here. H5FDclio_vec_max_span_g reports the largest span serviced as one
+  // coalesced I/O, so the assertion is on the bound itself rather than on data
+  // that round-trips either way.
+  {
+    extern unsigned long H5FDclio_vec_max_span_g;
+    const char *kVecCap = "/tmp/clio_cte_vfd_veccap.h5";
+    std::remove(kVecCap);
+    const size_t kWindow = 4096;
+    const size_t kBig = 8192;   /* deliberately larger than the window */
+
+    hid_t vfapl = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(H5Pset_driver_by_name(vfapl, "clio_vfd", "cache=0;sieve=4096") >= 0,
+          "24: FAPL with a 4 KiB coalescing window");
+
+    H5FD_t *raw = H5FDopen(kVecCap, H5F_ACC_RDWR | H5F_ACC_CREAT | H5F_ACC_TRUNC,
+                           vfapl, HADDR_UNDEF);
+    CHECK(raw != nullptr, "24: H5FDopen");
+    if (raw) {
+      const haddr_t kEnd = (haddr_t)(kBig * 4);
+      CHECK(H5FDset_eoa(raw, H5FD_MEM_DEFAULT, kEnd) >= 0, "24: set EOA");
+
+      // Seed the range so the reads below have something defined to return.
+      std::vector<char> seed(kEnd, 0x5a);
+      CHECK(H5FDwrite(raw, H5FD_MEM_DEFAULT, H5P_DEFAULT, 0, seed.size(),
+                      seed.data()) >= 0, "24: seed the file");
+
+      H5FDclio_vec_max_span_g = 0;
+
+      // (a) big first element, then a small adjacent one.
+      {
+        std::vector<char> b0(kBig, 0), b1(16, 0);
+        H5FD_mem_t types[2] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW};
+        haddr_t addrs[2] = {0, (haddr_t)kBig};
+        size_t sizes[2] = {kBig, 16};
+        void *bufs[2] = {b0.data(), b1.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 2, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector with an oversized first element");
+      }
+
+      // (b) big first element, then one contained inside its span.
+      {
+        std::vector<char> b0(kBig, 0), b1(16, 0);
+        H5FD_mem_t types[2] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW};
+        haddr_t addrs[2] = {0, 8};
+        size_t sizes[2] = {kBig, 16};
+        void *bufs[2] = {b0.data(), b1.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 2, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector with a contained element");
+        CHECK(std::memcmp(b1.data(), seed.data() + 8, 16) == 0,
+              "24: the contained element still reads the right bytes");
+      }
+
+      // (c) a run that SHOULD coalesce, so the assertion below is not
+      // vacuously satisfied by a driver that never groups anything.
+      {
+        std::vector<char> b(64, 0);
+        H5FD_mem_t types[4] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW, H5FD_MEM_DRAW,
+                               H5FD_MEM_DRAW};
+        haddr_t addrs[4] = {0, 64, 128, 192};
+        size_t sizes[4] = {64, 64, 64, 64};
+        std::vector<char> b0(64), b1(64), b2(64), b3(64);
+        void *bufs[4] = {b0.data(), b1.data(), b2.data(), b3.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 4, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector over four adjacent elements");
+        CHECK(std::memcmp(b2.data(), seed.data() + 128, 64) == 0,
+              "24: a coalesced element reads the right bytes");
+      }
+
+      CHECK(H5FDclio_vec_max_span_g > 0,
+            "24: elements within the window were actually coalesced");
+      CHECK(H5FDclio_vec_max_span_g <= (unsigned long)kWindow,
+            "24: no coalesced span exceeded the configured window");
+
+      CHECK(H5FDclose(raw) >= 0, "24: H5FDclose");
+    }
+    H5Pclose(vfapl);
+    std::remove(kVecCap);
+    std::printf("[vfd-suite] ok 24: coalescing window enforced (max span %lu <= %zu)\n",
+                H5FDclio_vec_max_span_g, kWindow);
   }
 
   std::printf("[vfd-suite] PASS: native write-through verified\n");

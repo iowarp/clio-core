@@ -21,12 +21,33 @@ name: CI Adapters
 #             suites; FSKit-backend mount smoke as a non-blocking probe)
 #   Windows : hdf5_vol + libfuse (WinFsp build + unit + in-process ops
 #             suites + live WinFsp mount smoke)
+#
+# NOT A REQUIRED CHECK (2026-08-25, issue #1022). "adapters (linux, all 5)" was
+# a required status check on the dev and main rulesets and was removed from
+# both. Reason: over 157 runs (2026-08-05..08-25) it blocked 5 of 134 otherwise
+# clean runs on xfstests that flake under the runner's scheduling, on branches
+# that touched nothing those tests exercise -- a macFUSE-only build fix, a
+# dashboard-teardown fix, a bdev preallocation clamp. Blocking a merge on a
+# result the author cannot act on trains people to re-run instead of read.
+#
+# It still runs on every PR and every push: this is informational coverage, not
+# a gate. Take it seriously -- the five known-flaky xfstests are quarantined
+# (scripts/xfstests/ci_flaky_quarantine.txt) precisely so that what is left CAN
+# be trusted. Re-add it to the rulesets once it has been green for a stretch on
+# its own merits.
 
 on:
   push:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -97,7 +118,7 @@ jobs:
       # /usr/local; installing the cask needs no kext approval — only
       # mounting through the kext backend would.
       - name: Install macFUSE (libfuse3 for the adapter build)
-        run: brew install --cask macfuse
+        run: bash CI/retry.sh brew install --cask macfuse
       - name: Configure and build (hdf5_vol + macfuse)
         run: |
           set -x
@@ -156,7 +177,7 @@ jobs:
             --no-binary=h5py h5py numpy
           ctest --test-dir build-adapters --output-on-failure \
             --timeout 180 --repeat until-pass:2 \
-            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama"
+            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky"
       # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
@@ -288,7 +309,7 @@ jobs:
           # the ctest timeout (at 300s AND 900s ceilings — hung, not slow).
           # Tracked in #907; test_fuse_adapter + the live mount smoke below
           # are the Windows FUSE coverage until it is root-caused.
-          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama"
+          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:2 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama|flaky"
       # Live end-to-end WinFsp mount (#903): runtime up -> compose -> mount a
       # drive letter -> write/read/verify -> unmount. The WinFsp MSI install
       # above included the driver, so mounting works without a reboot.

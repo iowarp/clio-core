@@ -1,4 +1,4 @@
-// Tests for ChunkedDatasetReader (clio_cae/core/hdf5_import.h): the HDF5-reading
+// Tests for ChunkedDatasetReader (clio_cae/core/factory/hdf5_import.h): the HDF5-reading
 // half of ImportData.
 //
 // No CLIO runtime, no server, no GPU -- this builds .h5 files with the HDF5 C
@@ -12,7 +12,7 @@
 // chunks back individually, so a wrong offset or a transposed coordinate lands
 // data in the wrong place and the element-by-element comparison catches it.
 
-#include <clio_cae/core/hdf5_import.h>
+#include <clio_cae/core/factory/hdf5_import.h>
 #include <clio_cte/kvhdf5/meta_blob.h>
 
 #include <hdf5.h>

@@ -31,6 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <cstring>
+
 #include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_runtime/ipc_manager.h>
 #include <clio_runtime/pool_manager.h>
@@ -661,25 +663,37 @@ int IpcManagerRun2Run::RecvOutAggregate(
     // Contract guard (issue #915). AggregateOut merges a REPLICA's OUT fields
     // into the origin; it must never touch the origin's IDENTITY. Tasks that
     // implement it by delegating to Copy() — a whole-task assignment — run
-    // Task::Copy and overwrite task_id_/pool_query_/completer_ with the
-    // replica's while send_map_ and the completion path still reference the
-    // origin, and re-assign IN shm strings across segments. That corrupted the
-    // runtime in production (#856) and ~26 such implementations still exist in
-    // tasks that are currently only routed single-replica. This catches any of
-    // them the instant someone routes that task multi-replica, naming the
-    // method, instead of letting it corrupt memory silently.
+    // Task::Copy and overwrite task_id_/pool_query_/method_/completer_ with
+    // the replica's while send_map_ and the completion path still reference
+    // the origin, and re-assign IN shm strings across segments. That corrupted
+    // the runtime in production (#856). Every in-tree AggregateOut now merges
+    // OUT fields only, and this guard keeps it that way: an out-of-tree chimod
+    // (or a new one that copy-pastes the old shape) is caught here, named by
+    // method, instead of corrupting memory silently.
+    //
+    // pool_query_ has no operator== and is deliberately trivially copyable and
+    // raw-byte compared elsewhere in the tree, so memcmp is the right test.
     const clio::run::TaskId id_before = origin_task->task_id_;
+    const clio::run::PoolQuery query_before = origin_task->pool_query_;
+    const clio::run::u32 method_before = origin_task->method_;
     container->AggregateOut(origin_task->method_, origin_task, replica);
-    if (!(origin_task->task_id_ == id_before)) {
+    const bool id_changed = !(origin_task->task_id_ == id_before);
+    const bool query_changed = memcmp(&origin_task->pool_query_, &query_before,
+                                      sizeof(clio::run::PoolQuery)) != 0;
+    const bool method_changed = origin_task->method_ != method_before;
+    if (id_changed || query_changed || method_changed) {
       HLOG(kError,
            "[AggregateOut CONTRACT VIOLATION] pool={} method={}: the origin's "
-           "task_id_ changed during aggregation ({} -> {}). This task's "
+           "identity changed during aggregation (task_id {} -> {}; "
+           "pool_query changed={}; method changed={}). This task's "
            "AggregateOut is copying the whole replica (almost certainly "
            "`Copy(other_base...)`) instead of merging OUT fields only. See "
            "issue #915. Restoring the origin's identity to avoid corruption.",
-           origin_task->pool_id_, origin_task->method_, id_before,
-           origin_task->task_id_);
+           origin_task->pool_id_, method_before, id_before,
+           origin_task->task_id_, query_changed, method_changed);
       origin_task->task_id_ = id_before;
+      origin_task->pool_query_ = query_before;
+      origin_task->method_ = method_before;
     }
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);

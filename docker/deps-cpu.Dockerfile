@@ -432,8 +432,17 @@ ENV VIRTUAL_ENV="/home/iowarp/venv"
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 # Install Jarvis-CD (deployment and pipeline management)
+#
+# --branch dev, not the default branch. jarvis_clio_core's packages
+# (clio_runtime, clio_cte, clio_cte_libfuse) import container_kwargs from
+# jarvis_cd.util.container_utils, which exists on jarvis-cd's dev branch and
+# NOT on main. Cloning the default branch produces an image where every one of
+# those packages raises ModuleNotFoundError on import -- which is what kept the
+# distributed stop test red once it could finally run. clio_runtime's own
+# Dockerfile.deploy already pins --branch dev; this aligns the deps image with
+# it.
 RUN cd /home/iowarp \
-    && git clone https://github.com/grc-iit/jarvis-cd.git jarvis-cd \
+    && git clone --branch dev https://github.com/grc-iit/jarvis-cd.git jarvis-cd \
     && cd jarvis-cd \
     && pip install -r requirements.txt \
     && pip install -e .

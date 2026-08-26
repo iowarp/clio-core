@@ -71,7 +71,13 @@ jarvis hostfile set "${HOSTFILE}"
 
 echo '[node1] building pipeline (clio_runtime only, tcp:9413)'
 jarvis ppl create chimaera_stop
-jarvis pkg append jarvis_clio_core.clio_runtime runtime
+# Capture PATH/LD_LIBRARY_PATH (etc.) into the pipeline env. `ppl create`
+# starts with an EMPTY env, and PsshExec only forwards the pipeline env to the
+# remote shells -- without this every pssh'd `clio_run` on both nodes fails
+# with `bash: clio_run: command not found` (the runtime never starts).
+# `jarvis ppl run yaml` does this automatically; the imperative flow does not.
+jarvis ppl env build
+jarvis ppl append jarvis_clio_core.clio_runtime runtime
 jarvis pkg conf runtime \
     port=9413 \
     ipc_mode=tcp \
@@ -95,7 +101,9 @@ assert_all() {
     local want="$1" host out rc fail=0
     while read -r host; do
         [ -z "$host" ] && continue
-        out=$(ssh -o BatchMode=yes "$host" "$STATUS_CMD" 2>&1); rc=$?
+        # -n: keep ssh from swallowing the rest of the hostfile on stdin --
+        # without it the loop silently probes only the first host.
+        out=$(ssh -n -o BatchMode=yes "$host" "$STATUS_CMD" 2>&1); rc=$?
         echo "[status:$want] $host -> rc=$rc"
         echo "$out" | sed 's/^/    /'
         if [ "$want" = running ]; then

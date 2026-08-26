@@ -45,7 +45,7 @@ ENV PATH="${VIRTUAL_ENV}/bin:/home/iowarp/.local/bin:${PATH}"
 
 RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
-    git clone --depth 1 https://github.com/grc-iit/jarvis-cd.git \
+    git clone --depth 1 --branch dev https://github.com/grc-iit/jarvis-cd.git \
         /workspace/external/jarvis-cd && \
     cd /workspace/external/jarvis-cd && \
     pip install -r requirements.txt && \

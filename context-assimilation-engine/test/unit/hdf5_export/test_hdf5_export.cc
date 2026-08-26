@@ -1,4 +1,4 @@
-// Tests for ChunkedDatasetWriter (clio_cae/core/hdf5_export.h): the HDF5-writing
+// Tests for ChunkedDatasetWriter (clio_cae/core/factory/hdf5_export.h): the HDF5-writing
 // half of ExportData.
 //
 // No CLIO runtime, no server, no GPU -- this drives the writer with synthetic
@@ -14,7 +14,7 @@
 // and the element-by-element comparison would catch it. A test that wrote chunks
 // in order with uniform values would happily pass with the offsets transposed.
 
-#include <clio_cae/core/hdf5_export.h>
+#include <clio_cae/core/factory/hdf5_export.h>
 #include <clio_cte/kvhdf5/meta_blob.h>
 
 #include <hdf5.h>

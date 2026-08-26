@@ -924,6 +924,74 @@ function(clio_run_read_module_config MODULE_DIR)
 endfunction()
 
 #------------------------------------------------------------------------------
+# ChiMod Web Dashboard Assets (issue #990)
+#------------------------------------------------------------------------------
+
+# clio_add_viz_assets - Stage and install a ChiMod's `viz/` web assets
+#
+# A ChiMod that ships HTML/CSS/JS for the in-runtime dashboard calls this from
+# its CMakeLists.txt. The assets are placed where VizServer::AssetSearchDirs()
+# looks for them, which is deliberately derived from the ChiMod's own library
+# location so that BOTH layouts work with no configuration:
+#
+#   built, not installed : libs -> <build>/bin,   assets -> <build>/bin/viz/<mod>
+#   installed            : libs -> <prefix>/lib,  assets -> <prefix>/share/clio/viz/<mod>
+#
+# $CLIO_VIZ_PATH overrides both at runtime (for editing assets without a
+# rebuild).
+#
+# Parameters:
+#   MOD_NAME - ChiMod name as reported by get_chimod_name() (the URL and
+#              directory the assets are served under)
+#   DIR      - Source directory of the assets
+#              (default: ${CMAKE_CURRENT_SOURCE_DIR}/viz)
+#
+function(clio_add_viz_assets)
+  cmake_parse_arguments(ARG "" "MOD_NAME;DIR" "" ${ARGN})
+
+  if(NOT ARG_MOD_NAME)
+    message(FATAL_ERROR "clio_add_viz_assets: MOD_NAME is required")
+  endif()
+  if(NOT ARG_DIR)
+    set(ARG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/viz")
+  endif()
+  if(NOT EXISTS "${ARG_DIR}")
+    message(FATAL_ERROR "clio_add_viz_assets: ${ARG_DIR} does not exist")
+  endif()
+
+  set(_viz_build_dir "${CMAKE_BINARY_DIR}/bin/viz/${ARG_MOD_NAME}")
+
+  # Re-stage only when an asset actually changed: the stamp depends on the file
+  # list, so an edited .js is picked up by a plain `cmake --build` while an
+  # untouched tree costs nothing.
+  file(GLOB_RECURSE _viz_files "${ARG_DIR}/*")
+  set(_viz_stamp "${CMAKE_CURRENT_BINARY_DIR}/${ARG_MOD_NAME}_viz.stamp")
+  add_custom_command(
+    OUTPUT "${_viz_stamp}"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${ARG_DIR}" "${_viz_build_dir}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${_viz_stamp}"
+    DEPENDS ${_viz_files}
+    COMMENT "Staging ${ARG_MOD_NAME} viz assets -> ${_viz_build_dir}"
+    VERBATIM
+  )
+  add_custom_target(${ARG_MOD_NAME}_viz ALL DEPENDS "${_viz_stamp}")
+
+  # Installed twice on purpose. The default ("Unspecified") component is what
+  # cpack's DEB / RPM / AppImage generators package; the pip wheel filters to
+  # COMPONENT pip_package and would otherwise ship a runtime whose dashboard has
+  # no pages (the #899 class of bug). The wheel's install prefix is
+  # <wheel>/iowarp_core, so lib/ and share/ keep the same relative position that
+  # VizServer::AssetSearchDirs() resolves.
+  install(DIRECTORY "${ARG_DIR}/"
+    DESTINATION share/clio/viz/${ARG_MOD_NAME}
+  )
+  install(DIRECTORY "${ARG_DIR}/"
+    DESTINATION share/clio/viz/${ARG_MOD_NAME}
+    COMPONENT pip_package
+  )
+endfunction()
+
+#------------------------------------------------------------------------------
 # ChiMod Client Library Function
 #------------------------------------------------------------------------------
 

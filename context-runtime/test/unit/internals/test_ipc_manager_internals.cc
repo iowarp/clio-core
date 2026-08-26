@@ -153,6 +153,70 @@ TEST_CASE("IpcInternals - hostfile loading and host lookup",
   fs::remove(empty_cfg);
 }
 
+// A loopback bind address means "single node, this machine only", so a
+// configured hostfile cannot apply and LoadHostfile drops it. This is what
+// keeps a developer's ~/.clio/clio.yaml cluster hostfile from promoting a unit
+// test into a peer of a real cluster (#978). Both sides of that decision are
+// exercised here: CLIO_BIND_ADDR drives the bind address directly, so the
+// non-loopback path is reachable without a real multi-node deployment.
+TEST_CASE("IpcInternals - loopback bind ignores a configured hostfile",
+          "[ipc][hostfile]") {
+  EnsureInitialized();
+  auto *ipc = CLIO_IPC;
+  auto *config = CLIO_CONFIG_MANAGER;
+  REQUIRE(ipc != nullptr);
+  REQUIRE(config != nullptr);
+
+  // 10.255.255.1 is the sentinel: it only ever appears if the hostfile was
+  // actually parsed. It is in the RFC 1918 range and never bound by the test.
+  fs::path hostfile = fs::temp_directory_path() / "clio_loopback_hostfile.txt";
+  {
+    std::ofstream f(hostfile);
+    f << "127.0.0.1\n";
+    f << "10.255.255.1\n";
+  }
+  fs::path cfg = fs::temp_directory_path() / "clio_loopback_hostfile_cfg.yaml";
+  {
+    std::ofstream f(cfg);
+    f << "networking:\n  hostfile: " << hostfile.string() << "\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+
+  SECTION("A non-loopback bind address honors the hostfile");
+  ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", "0.0.0.0", 1);
+  REQUIRE(ipc->LoadHostfile());
+  REQUIRE(ipc->GetHostByIp("10.255.255.1") != nullptr);
+
+  SECTION("Each loopback spelling drops the hostfile");
+  // 127.0.0.1 covers the "127." prefix test, and localhost / ::1 cover the
+  // two literal comparisons, so every branch of IsLoopbackBindAddr runs.
+  const char *loopback_addrs[] = {"127.0.0.1", "127.1.2.3", "localhost",
+                                  "::1"};
+  for (const char *addr : loopback_addrs) {
+    ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", addr, 1);
+    REQUIRE(ipc->LoadHostfile());
+    // The hostfile was dropped, so the sentinel peer is absent and the
+    // single-node wildcard host stands in its place.
+    REQUIRE(ipc->GetHostByIp("10.255.255.1") == nullptr);
+    REQUIRE(ipc->GetHost(0) != nullptr);
+  }
+
+  // Restore the no-hostfile, no-override state for later users of the
+  // singleton, matching the hostfile test case above.
+  ctp::SystemInfo::Unsetenv("CLIO_BIND_ADDR");
+  fs::remove(hostfile);
+  fs::remove(cfg);
+  fs::path empty_cfg =
+      fs::temp_directory_path() / "clio_loopback_empty_cfg.yaml";
+  {
+    std::ofstream f(empty_cfg);
+    f << "runtime:\n  num_threads: 1\n";
+  }
+  (void)config->LoadYaml(empty_cfg.string());
+  (void)ipc->LoadHostfile();
+  fs::remove(empty_cfg);
+}
+
 TEST_CASE("IpcInternals - PoolQuery FromString/ToString round-trips",
           "[ipc][pool_query]") {
   struct Case {

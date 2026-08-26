@@ -1,7 +1,7 @@
 # Safe-BDev interactive integration test
 
 A single-node, fully containerized demo of safe-bdev erasure-coding recovery,
-driven from the context-visualizer dashboard.
+driven from the runtime's built-in dashboard.
 
 ## What it launches
 
@@ -16,7 +16,7 @@ Inside one container (`node_entrypoint.sh`):
 2. a 4th 256 MB device added as **parity** (`safe_bdev_add_bdev`) → 3 data + 1
    parity = tolerates **1 drive failure** using exactly 4 devices
 3. the **clio-fs FUSE mount** at `/mnt/clio_fs`
-4. the **context-visualizer** dashboard on **:5000**
+4. the runtime's **built-in dashboard** on **:5000**
 
 ## Run it (interactive)
 
@@ -53,5 +53,5 @@ still readable, then tears down. This is the form registered with ctest as
 - Docker with `--cap-add SYS_ADMIN` and `/dev/fuse`
 - A build with `-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON` (provides `clio_cte_fuse`)
   and the `clio_runtime_ext` python module (dashboard controls)
-- A container image carrying `fuse3` + `flask` (default
+- A container image carrying `fuse3` (default
   `iowarp/cte-xfstests:latest`; override with `IOWARP_DOCKER_IMAGE`)

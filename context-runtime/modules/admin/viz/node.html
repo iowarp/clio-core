@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Node</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="index.html">Cluster</a></li>
+      <li><a href="pools.html">Pools</a></li>
+      <li><a href="config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1 id="title">Node</h1>
+    <p class="sub"><a href="index.html">&larr; back to cluster</a></p>
+    <div id="errors"></div>
+
+    <h2>Utilization</h2>
+    <div class="grid" id="system"></div>
+
+    <h2>Workers</h2>
+    <div id="workers"></div>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/node.js"></script>
+</body>
+</html>

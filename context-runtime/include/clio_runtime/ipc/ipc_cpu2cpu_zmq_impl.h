@@ -25,6 +25,30 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
 #else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
+  // Finalized-client guard (issue #970). ClientFinalize resets the transports
+  // this function is about to use, so a submit after it dereferences a dangling
+  // one. Complete the task with an error instead.
+  //
+  // Placed HERE rather than in IpcManager::Send, which is where it started: Send
+  // is not the only way in. ClientConnect (reconnect) and RegisterMemory call
+  // this directly from ipc_manager.cc -- five sites that bypass Send entirely --
+  // and each of them would hit the same dangling transport. Guarding the
+  // transport entry points covers those too, and needs no CTP_IS_HOST block of
+  // its own because this body is already the host half of one.
+  //
+  // The runtime self-send path (IpcCpu2Self::SendIn) is deliberately untouched:
+  // it uses none of these transports, so excluding it is structural here rather
+  // than an is_runtime test.
+  if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+    HLOG(kWarning,
+         "Send(ZMQ): client is finalized; failing task instead of submitting on a "
+         "torn-down transport (issue #970)");
+    Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+    task_ptr->SetReturnCode(static_cast<u32>(-1));
+    task_ptr->SetComplete();
+    return future;
+  }
+
   // Set net_key for response routing
   size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
   task_ptr->task_id_.net_key_ = net_key;
@@ -81,6 +105,19 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   ClientOrigin origin = future_shm->origin_;
 
+  // Finalized-client escape (issue #970), before the reconnect head below.
+  // Reaching here during teardown means the SHM path handed off after seeing
+  // the server flagged dead; reconnecting would rebuild transports the caller
+  // is concurrently destroying, and the resent task still has no listener to
+  // answer it.
+  if (ipc->client_finalized_.load(std::memory_order_acquire) &&
+      !task_ptr->IsComplete()) {
+    HLOG(kWarning,
+         "Recv: client is finalized; failing task instead of reconnecting "
+         "(issue #970)");
+    return false;
+  }
+
   // If origin was SHM but server is dead, reconnect and resend via ZMQ
   if (origin == ClientOrigin::kClientShm) {
     if (ipc->client_retry_timeout_ == 0 && ipc->client_try_new_servers_ <= 0) {
@@ -107,6 +144,11 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
         std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
             .count();
     if (max_sec > 0 && elapsed >= max_sec) return false;
+    if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+      HLOG(kWarning,
+           "Recv: client finalized mid-wait; failing task (issue #970)");
+      return false;
+    }
     if (!ipc->server_alive_.load() && !ipc->reconnecting_.load()) {
       if (ipc->client_retry_timeout_ == 0 &&
           ipc->client_try_new_servers_ <= 0) {

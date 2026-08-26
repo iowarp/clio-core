@@ -1,21 +1,26 @@
 # Add Windows Defender Firewall allow rules for every test binary under each
 # build*/bin directory so ctest never pops an "Allow access?" prompt when a
-# runtime/test process binds a port. Adding rules requires Administrator, so the
-# script self-elevates -- but ONLY when there are new binaries to allow.
+# runtime/test process binds a port. Adding rules requires Administrator.
 #
-# How it stays prompt-free: after applying rules it records the set of allowed
-# .exe paths in a marker file (.clio_firewall_allowed at the repo root). On the
-# next run it compares the current binaries to the marker; if they match it
-# exits immediately WITHOUT elevating, so the common "build once, run ctest many
-# times" loop only triggers a single UAC prompt right after a fresh build adds
-# new executables.
+# It NEVER raises a UAC prompt on its own: a prompt nobody answers blocks until
+# the caller gives up, which is how the cr_firewall_allow ctest fixture used to
+# eat its full TIMEOUT and fail on the dashboard. Unelevated, it reports which
+# binaries still need rules and exits 0.
 #
-# It is best-effort: any failure (including a declined UAC prompt) exits 0 so it
-# never fails the test suite -- you just get the per-binary prompts back.
+# After applying rules it records the set of allowed .exe paths in a marker file
+# (.clio_firewall_allowed at the repo root). On the next run it compares the
+# current binaries to the marker; if they match it exits immediately, so the
+# common "build once, run ctest many times" loop does no work at all.
 #
-# Usage (wired into ctest via the cr_firewall_allow setup fixture, or run by
-# hand from a normal PowerShell prompt):
+# It is best-effort: it always exits 0 so it never fails the test suite -- if the
+# rules weren't applied you just get the per-binary prompts back.
+#
+# Usage (wired into ctest via the cr_firewall_allow setup fixture; to actually
+# apply rules, run it by hand from an ELEVATED PowerShell prompt):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\allow_firewall.ps1
+#
+# Set CLIO_FIREWALL_ELEVATE=1 to let an unelevated run self-elevate via UAC --
+# only from an interactive shell where you can answer the prompt.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -44,15 +49,36 @@ if (Test-Path $marker) {
     }
 }
 
-# Need to (re)apply rules -- self-elevate if we aren't Administrator.
+# Need to (re)apply rules -- which requires Administrator.
 $principal = New-Object Security.Principal.WindowsPrincipal(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Do NOT auto-elevate. `Start-Process -Verb RunAs` blocks inside
+    # ShellExecuteEx until the UAC consent dialog is answered, and on an
+    # unattended run (ctest -D <Dashboard>, CI, a scheduled task) nobody answers
+    # it -- the fixture silently burns its whole TIMEOUT and reports a failure
+    # (CDash test 446369917). No timeout on our side can rescue that: the block
+    # happens before we ever get a process handle back.
+    #
+    # There is no reliable way to tell "a human is watching" from here -- ctest
+    # does not even export CTEST_INTERACTIVE_DEBUG_MODE in dashboard mode -- so
+    # elevation is opt-in only. Either run this script from an already-elevated
+    # prompt (the branch below), or set CLIO_FIREWALL_ELEVATE=1 to accept the
+    # prompt.
+    if ($env:CLIO_FIREWALL_ELEVATE -ne '1') {
+        Write-Host ("Firewall: $($exePaths.Count) test binaries still need rules; " +
+                    "not elevating (a UAC prompt would hang an unattended run).")
+        Write-Host ("Firewall: to apply them, run " +
+                    "scripts\windows\allow_firewall.ps1 from an elevated prompt, " +
+                    "or set CLIO_FIREWALL_ELEVATE=1.")
+        exit 0
+    }
+
     $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
     try {
         Start-Process $shell -Verb RunAs -Wait -ErrorAction Stop -ArgumentList @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass',
-            '-File', $MyInvocation.MyCommand.Path)
+            '-File', $PSCommandPath)
     } catch {
         Write-Host "Firewall: elevation declined; per-binary prompts may still appear."
     }

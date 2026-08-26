@@ -44,8 +44,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetxattr = 32;         // get an extended att
 GLOBAL_CROSS_CONST clio::run::u32 kListxattr = 33;        // list extended attrs
 GLOBAL_CROSS_CONST clio::run::u32 kRemovexattr = 34;      // remove an extended attr
 GLOBAL_CROSS_CONST clio::run::u32 kChown = 35;            // set file owner uid/gid
+GLOBAL_CROSS_CONST clio::run::u32 kMultiCreate = 36;      // batched file creation (sieve flush)
+GLOBAL_CROSS_CONST clio::run::u32 kAdvanceSize = 37;      // tag-keyed logical-size advance
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 36;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 38;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

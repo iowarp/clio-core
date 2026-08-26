@@ -40,10 +40,10 @@
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
 // ChunkedDatasetWriter + DTypeToH5: the HDF5-writing half of ExportData, kept out
 // of this file so it is testable without a runtime, a server, or a GPU.
-#include <clio_cae/core/hdf5_export.h>
+#include <clio_cae/core/factory/hdf5_export.h>
 // ChunkedDatasetReader + H5ToDType: the HDF5-reading half of ImportData, kept out
 // for the same reason.
-#include <clio_cae/core/hdf5_import.h>
+#include <clio_cae/core/factory/hdf5_import.h>
 #endif
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"

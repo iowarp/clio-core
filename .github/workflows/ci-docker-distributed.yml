@@ -21,6 +21,9 @@ name: Docker Distributed Stop Test
 on:
   push:
     branches: [main, dev]
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -55,10 +58,13 @@ jobs:
       - name: Pull dependency image
         run: docker pull "$DEPS_IMAGE"
 
-      # Compile ONLY clio_run (its runtime start/stop/status subcommands are all
-      # this test needs) inside deps-cpu, so it links the same libraries the node
-      # containers provide at runtime.
-      - name: Build clio_run (inside deps-cpu)
+      # Compile ONLY clio_run plus the admin ChiMod inside deps-cpu, so they link
+      # the same libraries the node containers provide at runtime. clio_run's
+      # start/stop/status subcommands are all this test drives, but `runtime
+      # start` refuses to come up without libclio_admin_runtime.so ("Admin
+      # ChiMod not found! This is a required system component."), and the
+      # runtime discovers ChiMods by scanning LD_LIBRARY_PATH (build/bin here).
+      - name: Build clio_run + admin ChiMod (inside deps-cpu)
         run: |
           docker run --rm \
             -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
@@ -69,7 +75,7 @@ jobs:
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF
-              cmake --build build -j"$(nproc)" --target clio_run
+              cmake --build build -j"$(nproc)" --target clio_run clio_admin_runtime
               # Hand ownership back to the runner so the test cluster (which runs
               # as the runner uid) and post-job cleanup can access build/.
               chown -R "$HOST_UID:$HOST_GID" build

@@ -79,6 +79,12 @@ add_executable(test_evict
     test_evict.cc
 )
 
+# PutBlob's make-room-and-retry trigger: the caller side of kEvict, which had
+# no non-test caller until now.
+add_executable(test_evict_trigger
+    test_evict_trigger.cc
+)
+
 # Internal data organizer (issue #738): factory/frecency-score/config units
 # plus the end-to-end periodic DynamicReorganize promote/demote flow.
 add_executable(test_data_organizer
@@ -348,6 +354,18 @@ target_link_libraries(test_reorganize_blob
 
 # Link test_evict - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_evict
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_evict_trigger - same dependency set as test_evict
+target_link_libraries(test_evict_trigger
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -921,6 +939,41 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Client-side data sieving (issue #1007). The same binary runs twice: once
+# with the sieve (default-on) and once with CLIO_CTE_PUT_SIEVE=0, so every
+# case is also a kill-switch parity check against the plain batch pipeline.
+add_executable(test_put_sieve test_put_sieve.cc)
+target_link_libraries(test_put_sieve
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_put_sieve
+    COMMAND test_put_sieve)
+add_test(NAME cte_put_sieve_disabled
+    COMMAND test_put_sieve)
+
+set_tests_properties(
+    cte_put_sieve
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;sieve;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+set_tests_properties(
+    cte_put_sieve_disabled
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;sieve;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_CTE_PUT_SIEVE=0"
+)
+
 # Blob replicas + replication chimod (issue #886). Gated on the module: the
 # mechanism tests also exercise the policy verbs, and the module is ON by
 # default, so the gate only matters for trimmed builds.
@@ -1146,6 +1199,21 @@ add_test(NAME cte_evict
 
 set_tests_properties(
     cte_evict
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;evict;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# PutBlob's make-room-and-retry trigger. The TIMEOUT is load-bearing here: if
+# the eviction candidate filter regresses, the grow case livelocks on its own
+# blob's write lock rather than failing an assertion, so the timeout is what
+# turns that into a red test.
+add_test(NAME cte_evict_trigger
+    COMMAND test_evict_trigger)
+
+set_tests_properties(
+    cte_evict_trigger
     PROPERTIES
         TIMEOUT 300
         LABELS "unit;evict;cte"
@@ -1408,7 +1476,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_evict test_data_organizer test_io_emulation)
+set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_evict test_evict_trigger test_data_organizer test_io_emulation)
 # (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
 # and their ctest registrations were removed along with the GPU runtime. CTE
 # GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)

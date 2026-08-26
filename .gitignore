@@ -136,6 +136,9 @@ CMakeUserPresents.json
 external/boost-*.tar.gz
 external/boost-*/
 external/boost/
+# jarvis-cd checkout provisioned by the distributed docker CI test
+# (context-runtime/test/integration/chimaera_stop/run_tests.sh)
+external/jarvis-cd/
 
 # Model weights (large binaries)
 models/

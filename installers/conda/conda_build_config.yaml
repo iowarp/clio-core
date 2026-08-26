@@ -6,6 +6,34 @@
 python:
   - 3.12
 
+# glibc floor for the Linux package (#973).
+#
+# 2.28 == RHEL/Rocky/AlmaLinux 8, still the standard HPC login-node OS, and
+# the same floor the pip wheels use (manylinux_2_28, see
+# .github/workflows/build-pip.yml). Together with {{ stdlib("c") }} in
+# meta.yaml this makes conda-build compile against sysroot_linux-64 2.28
+# instead of whatever glibc the CI runner happens to ship, and records a
+# __glibc>=2.28 constraint so older hosts get a clean solver error rather
+# than a package that installs and then fails to load.
+#
+# The macOS half is not optional. conda-build strips non-matching `# [selector]`
+# lines *before* parsing this file, so a Linux-only c_stdlib leaves the key
+# undefined on macOS, and conda_build/jinja_context.py's `_target()` then falls
+# back to the language name itself (`package_prefix = language`, then
+# `f"{package_prefix}_{target_platform}"`) -- rendering {{ stdlib("c") }} as the
+# package `c_osx-arm64`, which does not exist on conda-forge. On macOS the C
+# stdlib package is macosx_deployment_target, exactly as conda-forge's own
+# pinning declares it. Windows needs no entry today: nothing runs CI/ci-deps.sh
+# there (ci-adapters.yml's windows-2025 leg uses vcpkg), and the conda package
+# itself is built ubuntu-only.
+c_stdlib:
+  - sysroot                    # [linux]
+  - macosx_deployment_target   # [osx]
+c_stdlib_version:
+  - '2.28'                     # [linux]
+  - '11.0'                     # [osx and arm64]
+  - '10.13'                    # [osx and x86_64]
+
 # Bump the macOS x86_64 deployment target. conda-forge's osx-64 default is
 # 10.9, but nanobind uses C++17 aligned new/delete which is only available on
 # macOS 10.13+, so the Intel-mac build fails to compile nanobind. osx-arm64

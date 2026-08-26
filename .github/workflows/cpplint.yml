@@ -7,9 +7,13 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
 jobs:
   cpplint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v6
     - run: pipx run cpplint --recursive .

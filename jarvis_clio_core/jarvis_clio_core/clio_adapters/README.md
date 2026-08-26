@@ -162,7 +162,7 @@ jarvis interceptor append clio_adapters cte_adapters
 jarvis interceptor conf cte_adapters posix=true mpiio=true
 
 # Add application and link interceptor
-jarvis pkg append my_application app
+jarvis ppl append my_application app
 jarvis pkg conf app interceptors='["cte_adapters"]'
 
 # Start pipeline (interceptor is applied automatically)

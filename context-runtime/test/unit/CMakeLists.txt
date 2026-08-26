@@ -34,6 +34,15 @@ set(SAVE_LOAD_TASK_TEST_SOURCES
   test_save_load_task.cc
 )
 
+# AggregateOut contract lint (issue #915). Source-level guard: fails if any
+# AggregateOut implementation anywhere in the tree delegates to Copy(), which
+# is a whole-task assignment that destroys the origin task's identity. Reads
+# sources only — no runtime, no links beyond ctp::cxx.
+set(AGGREGATE_OUT_CONTRACT_TEST_TARGET clio_run_aggregate_out_contract_tests)
+set(AGGREGATE_OUT_CONTRACT_TEST_SOURCES
+  test_aggregate_out_contract.cc
+)
+
 # Local Task Archive test executable
 set(LOCAL_TASK_ARCHIVE_TEST_TARGET clio_run_local_task_archive_tests)
 set(LOCAL_TASK_ARCHIVE_TEST_SOURCES
@@ -44,6 +53,13 @@ set(LOCAL_TASK_ARCHIVE_TEST_SOURCES
 set(TASK_STAT_MODEL_TEST_TARGET clio_run_task_stat_model_tests)
 set(TASK_STAT_MODEL_TEST_SOURCES
   test_task_stat_model.cc
+)
+
+# Web dashboard test executable (issue #990). Needs Poco: the dashboard's HTTP
+# transport is Poco::Net, and the test drives it with Poco's HTTP client.
+set(VIZ_TEST_TARGET clio_run_viz_tests)
+set(VIZ_TEST_SOURCES
+  test_viz_server.cc
 )
 
 # Per-Process Shared Memory test executable
@@ -204,6 +220,33 @@ set_target_properties(${SAVE_LOAD_TASK_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Create AggregateOut contract lint executable (issue #915)
+add_executable(${AGGREGATE_OUT_CONTRACT_TEST_TARGET}
+  ${AGGREGATE_OUT_CONTRACT_TEST_SOURCES})
+
+target_include_directories(${AGGREGATE_OUT_CONTRACT_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+
+# The lint reads the repository's sources, so it needs to know where they are.
+# When the binary is run from an install tree the directory is gone and the
+# test reports a skip instead of failing.
+target_compile_definitions(${AGGREGATE_OUT_CONTRACT_TEST_TARGET} PRIVATE
+  CLIO_REPO_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+target_link_libraries(${AGGREGATE_OUT_CONTRACT_TEST_TARGET}
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${AGGREGATE_OUT_CONTRACT_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create Local Task Archive test executable
 add_executable(${LOCAL_TASK_ARCHIVE_TEST_TARGET} ${LOCAL_TASK_ARCHIVE_TEST_SOURCES})
 
@@ -259,6 +302,39 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Create web dashboard test executable (issue #990). Skipped entirely when Poco
+# is absent: without it the build has no HTTP transport to test.
+if(Poco_FOUND)
+  add_executable(${VIZ_TEST_TARGET} ${VIZ_TEST_SOURCES})
+
+  target_include_directories(${VIZ_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test  # For simple_test.h
+    ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+  )
+
+  target_link_libraries(${VIZ_TEST_TARGET}
+    clio_admin_runtime          # Admin module runtime (starts the dashboard)
+    clio_admin_client           # Admin module client
+    clio_bdev_runtime           # Composed by the default config
+    clio_bdev_client
+    ctp::cxx                    # ClioCtp library
+    Poco::Net                   # HTTP client used to drive the dashboard
+    Poco::Foundation
+    ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+  )
+
+  # The test fetches /viz/clio_admin/index.html, so the assets have to be staged
+  # next to the libraries before it runs.
+  add_dependencies(${VIZ_TEST_TARGET} clio_admin_viz)
+
+  set_target_properties(${VIZ_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endif()
 
 # Create Per-Process Shared Memory test executable.
 # POSIX-only: uses fork()/waitpid()/setenv() — no Windows equivalent that
@@ -818,6 +894,24 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 300
   )
 
+  # Web dashboard (issue #990). Own ctest entry => own process: it brings up an
+  # in-process runtime, and CLIO_INIT is once-per-process. The dashboard binds an
+  # ephemeral port (CLIO_VIZ_PORT=0, set by the test itself) so a concurrently
+  # running daemon cannot collide with it -- only the RPC port needs the shared
+  # lock that CLIO_PORT implies.
+  if(Poco_FOUND)
+    add_test(
+      NAME cr_viz_tests
+      COMMAND ${VIZ_TEST_TARGET}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_viz_tests PROPERTIES
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      TIMEOUT 300
+      RESOURCE_LOCK "clio_runtime_port"
+    )
+  endif()
+
   add_test(
     NAME cr_unit_tests
     COMMAND ${TEST_TARGET}
@@ -826,6 +920,17 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(cr_unit_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 600
+  )
+
+  # AggregateOut contract lint (issue #915). Pure source scan: fast, no
+  # runtime, no ports, safe under every sanitizer.
+  add_test(
+    NAME cr_aggregate_out_contract
+    COMMAND ${AGGREGATE_OUT_CONTRACT_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_aggregate_out_contract PROPERTIES
+    TIMEOUT 120
   )
 
   # IPC AllocateBuffer Tests
@@ -1418,6 +1523,9 @@ if(NOT WIN32)
 endif()
 if(CLIO_CORE_ENABLE_CAE)
   list(APPEND _install_test_targets ${AUTOGEN_COVERAGE_TEST_TARGET})
+endif()
+if(Poco_FOUND)
+  list(APPEND _install_test_targets ${VIZ_TEST_TARGET})
 endif()
 install(TARGETS ${_install_test_targets} RUNTIME DESTINATION bin)
 

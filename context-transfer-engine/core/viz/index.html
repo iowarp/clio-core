@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio CTE</title>
+  <!-- The admin shell's stylesheet + helpers: every page is same-origin. -->
+  <link rel="stylesheet" href="/viz/clio_admin/css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="/viz/clio_admin/index.html">Cluster</a></li>
+      <li><a href="/viz/clio_admin/pools.html">Pools</a></li>
+      <li><a href="/viz/clio_admin/config.html">Config</a></li>
+      <li><a href="/viz/clio_cte_core/index.html" class="active">CTE</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1>Context Transfer Engine</h1>
+    <p class="sub">
+      Storage targets of the <code>clio_cte_core</code> ChiMod: the block
+      devices data placement chooses between, with their scores and capacity.
+    </p>
+    <p class="sub"><a href="/viz/clio_admin/pools.html">&larr; back to pools</a></p>
+    <div id="errors"></div>
+
+    <div class="row">
+      <label for="pool-select">Pool:</label>
+      <select id="pool-select"></select>
+    </div>
+
+    <h2>Targets</h2>
+    <div id="targets"></div>
+
+    <h2>Register bdev</h2>
+    <p class="sub">
+      Registers a block device (by name) as a new placement target. Leave
+      "attach pool id" empty to create a fresh bdev of the given type and
+      capacity; fill it to attach an existing pool (e.g. a safe-bdev array).
+    </p>
+    <div class="row">
+      <input id="rt-name" size="22" placeholder="target name">
+      <select id="rt-type">
+        <option value="ram">ram</option><option value="file">file</option>
+        <option value="hbm">hbm</option><option value="pinned">pinned</option>
+        <option value="noop">noop</option>
+      </select>
+      <input id="rt-capacity" size="8" placeholder="capacity" value="1GB">
+      <input id="rt-attach" size="10" placeholder="attach pool id">
+      <button id="rt-submit">Register</button>
+    </div>
+    <div class="sub" id="rt-msg"></div>
+
+    <h2>Task predictions</h2>
+    <p class="sub">
+      The learned per-method cost model for this pool: predicted time =
+      coefficient &times; task size; the error columns are the average miss.
+    </p>
+    <div id="predictions"></div>
+  </main>
+
+  <script src="/viz/clio_admin/js/api.js"></script>
+  <script src="js/cte.js"></script>
+</body>
+</html>

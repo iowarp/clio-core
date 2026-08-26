@@ -36,6 +36,7 @@ jobs:
   check-version:
     name: Check tag matches version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
     - name: Checkout repository
@@ -57,6 +58,17 @@ jobs:
 
   #------------------------------------------------------------
   # Build manylinux wheels via cibuildwheel
+  #
+  # Image choice (#973): manylinux_2_28 (AlmaLinux 8, glibc 2.28), NOT
+  # manylinux_2_34 (AlmaLinux 9, glibc 2.34).  A manylinux_2_34 wheel is
+  # uninstallable on the RHEL8 family -- Rocky/Alma/RHEL 8 ship glibc 2.28
+  # and are still the standard HPC login-node OS, so `pip install
+  # iowarp-core` failed there with "no wheels with a matching platform tag"
+  # and there is no sdist fallback.  manylinux_2_28 wheels install on
+  # glibc >= 2.28, i.e. RHEL8 *and* every newer distro the 2_34 wheels
+  # already covered, so this is a strict widening.  Do not bump this image
+  # without a matching bump in installers/pip/repair_wheel.sh (which stamps
+  # the platform tag) and a reason to drop RHEL8.
   #------------------------------------------------------------
   build-wheels:
     runs-on: ${{ matrix.runner }}
@@ -68,7 +80,7 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
-            cibw_image: manylinux_2_34
+            cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
               PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
@@ -77,7 +89,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
             cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
-            cibw_image: manylinux_2_34
+            cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
               PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
@@ -95,7 +107,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build wheels
       env:
@@ -113,9 +125,20 @@ jobs:
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
           bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel}
+          ${{ matrix.cibw_image }}
         CIBW_TEST_COMMAND: >
           python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
       run: cibuildwheel --output-dir installers/pip/wheelhouse
+
+    # Guard for #973: repair_wheel.sh stamps the manylinux tag with
+    # `wheel tags`, which rewrites metadata without ever inspecting the
+    # binaries.  So a wheel can claim manylinux_2_28 while actually
+    # importing GLIBC_2.34 symbols -- pip installs it and the import then
+    # dies with a link error.  Verify the claim against what the ELF files
+    # really require.
+    - name: Verify wheel glibc requirements match the platform tag
+      run: |
+        python3 installers/pip/check_wheel_glibc.py installers/pip/wheelhouse/*.whl
 
     - name: Upload wheels
       uses: actions/upload-artifact@v4
@@ -157,11 +180,20 @@ jobs:
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
     # package installs to %ProgramFiles(x86)%\WinFsp, which is the CMake
     # default search path.
+    # Retry transient registry failures, then ASSERT the SDK is really there:
+    # choco has been observed to exit 0 on a community-feed 503 ("Unable to
+    # find package 'winfsp'"), after which the wheel silently built WITHOUT
+    # clio_cte_fuse.exe and the miss only surfaced ~40 minutes later in the
+    # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
+        }
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build Windows wheels
       env:
@@ -243,12 +275,12 @@ jobs:
         # cppzmq is the C++ header wrapper for zeromq; cereal and cppzmq
         # are header-only. msgpack-c is the C library (the recipe uses
         # the C API in serialize/msgpack_wrapper.h).
-        brew update
-        brew install cmake pkg-config \
+        bash CI/retry.sh brew update
+        bash CI/retry.sh brew install cmake pkg-config \
           yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build macOS wheels
       env:
@@ -300,6 +332,16 @@ jobs:
       matrix:
         include:
           # x86_64 tests
+          #
+          # rockylinux:8 is the regression test for #973: glibc 2.28, the
+          # oldest distro the manylinux_2_28 wheels claim to support, and the
+          # RHEL8-family login-node OS the 2_34 wheels locked out entirely.
+          # Keep it first -- if the image ever gets bumped past 2_28 this is
+          # the job that must fail.
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: rockylinux:8
+            pkg_manager: dnf
           - runner: ubuntu-latest
             arch: x86_64
             distro: ubuntu:22.04
@@ -317,6 +359,12 @@ jobs:
             distro: fedora:40
             pkg_manager: dnf
           # aarch64 tests
+          # The aarch64 wheel is a separately built and separately tagged
+          # artifact, so it needs its own glibc-2.28 regression test (#973).
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            distro: rockylinux:8
+            pkg_manager: dnf
           - runner: ubuntu-24.04-arm
             arch: aarch64
             distro: ubuntu:22.04
@@ -348,10 +396,19 @@ jobs:
 
             # Install Python
             if command -v apt-get &>/dev/null; then
-              apt-get update -qq
-              apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1
+              for i in 1 2 3; do apt-get update -qq && break || sleep 5; done
+              for i in 1 2 3; do apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
-              dnf install -y -q python3 python3-pip >/dev/null 2>&1
+              # RHEL8 family (rockylinux:8, #973): the stock python3 is 3.6,
+              # older than the oldest wheel we build (cp310). Pull the 3.12
+              # AppStream module and put it ahead of the stock interpreter so
+              # the venv below matches a wheel we actually ship. Newer distros
+              # fall through to their default python3.
+              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+                ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+              else
+                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+              fi
             fi
 
             # Create clean venv
@@ -362,9 +419,9 @@ jobs:
             # A by-name install (iowarp-core) lets pip consider PyPI, where the
             # same version may already be published with older metadata, and
             # use that PyPI metadata instead of this wheel — so a changed
-            # dependency set (e.g. flask promoted to a core dep) would not be
+            # dependency set would not be
             # exercised. Selecting the wheel file for this Python tag forces
-            # the local artifact; runtime deps (flask, pyyaml, ...) still
+            # the local artifact; runtime deps (pyyaml, msgpack, ...) still
             # resolve from PyPI via --find-links + the default index.
             PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
             WHEEL=$(ls /wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
@@ -378,12 +435,6 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
-
-            echo "=== Context visualizer (standard feature) ==="
-            # flask is a core dependency, so the dashboard works out of the
-            # box. Verify the package imports and the console script runs.
-            python -c "import context_visualizer; print(\"visualizer import OK\")"
-            context-visualizer --help
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -419,7 +470,7 @@ jobs:
             # fuse3 runtime like an end user would, then apply the same
             # signal-level heuristic as the benchmarks above.
             if command -v apt-get &>/dev/null; then
-              apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
+              for i in 1 2 3; do apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
             fi
@@ -538,11 +589,6 @@ jobs:
         echo "=== CLI test ==="
         clio_run --help
 
-        echo "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        context-visualizer --help
-
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
         # are allowed to be non-zero; only signal-level deaths fail us.
@@ -607,7 +653,7 @@ jobs:
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh
@@ -640,15 +686,6 @@ jobs:
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
-        }
-
-        Write-Host "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        if ($LASTEXITCODE -ne 0) { throw "context_visualizer import failed" }
-        context-visualizer --help
-        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
-          throw "context-visualizer --help died with exit code $LASTEXITCODE"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
@@ -702,6 +739,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -757,6 +795,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

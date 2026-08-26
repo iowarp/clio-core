@@ -504,6 +504,14 @@ void RuntimeManager::ServerFinalize() {
   // StopWorkers / ClearClientPool below.
   ctp::lbm::sock::SetSocketLibShutdown();
 
+  // Stop the web dashboard first (issue #990). Its request handlers submit
+  // tasks and wait on Futures, so they must be drained before the workers stop:
+  // a handler that started after StopWorkers() would wait out its whole timeout
+  // for a task nothing will ever run. Stop() waits for in-flight requests.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Stop();
+  }
+
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and
   // its task + Future allocations are reclaimed instead of being abandoned by

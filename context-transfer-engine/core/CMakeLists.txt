@@ -5,6 +5,7 @@ add_clio_module_runtime(
   SOURCES
     src/core_runtime.cc
     src/core_config.cc
+    src/core_viz.cc
     # Data placement engine: one source file per placement policy
     src/dpe/dpe.cc
     src/dpe/random_dpe.cc
@@ -56,5 +57,9 @@ endif()
 
 # Note: Cross-namespace dependencies (clio_run admin and bdev) are automatically
 # linked by add_chimod_* functions in ClioCoreCommon.cmake for non-clio_run namespaces
+
+# Web dashboard page for this module (issue #990): mounted at /viz/clio_cte_core
+# by the runtime as soon as a CTE pool comes up.
+clio_add_viz_assets(MOD_NAME clio_cte_core)
 
 add_subdirectory(util)

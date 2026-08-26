@@ -99,6 +99,15 @@ public:
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Register the CTE dashboard page's endpoints (issue #990): the pool index,
+   * the target roster, register/unregister-target actions, and the create
+   * form. The page ships in this module's viz/ directory. Defined in
+   * core_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
+  /**
    * Destroy the container (Method::kDestroy)
    */
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
@@ -442,6 +451,7 @@ private:
   /** Project a BlobInfo into its cacheable form. Returns false when the blob
    *  cannot be represented (too many blocks), in which case it is not
    *  cached and clients keep using the RPC path for it. */
+  void MirrorTagShm(const TagId &tag_id, const TagInfo &info);
   bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
 
   /** Mirror one blob into the SHM cache. No-op when caching is off. */
@@ -707,11 +717,46 @@ private:
    * @param blob_score Score for target selection
    * @param error_code Output: 0 for success, non-zero for failure
    * @param min_persistence_level Minimum persistence level for target filtering
+   * @param shortfall Optional output: on a placement failure (error_code 1-3),
+   *                  the bytes that could not be placed; 0 on success.
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
                              int min_persistence_level = 0,
-                             clio::run::u64 preallocate = 0);
+                             clio::run::u64 preallocate = 0,
+                             clio::run::u64 *shortfall = nullptr);
+
+  /**
+   * One placement attempt for a put: grow-to-cover (ExtendBlob) or
+   * wholesale-replace (ResizeBlob), chosen by kCtePutReplace in put_flags.
+   * Shared by the initial attempt and the retry, which must issue an identical
+   * call.
+   * @param error_code Output: 0 on success, allocator code otherwise
+   * @param shortfall Output: bytes that could not be placed (see ExtendBlob)
+   */
+  clio::run::TaskResume PlaceBlobBytesOnce(BlobInfo &blob_info,
+                                     clio::run::u32 put_flags,
+                                     clio::run::u64 offset, clio::run::u64 size,
+                                     float blob_score,
+                                     int min_persistence_level,
+                                     clio::run::u64 preallocate,
+                                     clio::run::u32 &error_code,
+                                     clio::run::u64 &shortfall);
+
+  /**
+   * Place a put's bytes, making room once if the tier is full.
+   *
+   * On a capacity failure for an expendable put (kCtePutDroppable), reclaims
+   * the shortfall from other expendable blobs and retries once. Any other
+   * failure is returned as-is.
+   * @param error_code Output: 0 on success, allocator code otherwise
+   */
+  clio::run::TaskResume PlaceBlobBytes(BlobInfo &blob_info,
+                                 clio::run::u32 put_flags,
+                                 clio::run::u64 offset, clio::run::u64 size,
+                                 float blob_score, int min_persistence_level,
+                                 clio::run::u64 preallocate,
+                                 clio::run::u32 &error_code);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via
@@ -723,10 +768,12 @@ private:
    * @param blob_score Score for target selection on grow
    * @param error_code Output: 0 for success, non-zero for failure
    * @param min_persistence_level Minimum persistence level for target filtering
+   * @param shortfall Optional output: see ExtendBlob.
    */
   clio::run::TaskResume ResizeBlob(BlobInfo &blob_info, clio::run::u64 new_size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 *shortfall = nullptr);
 
   /**
    * Write data to existing blob blocks

@@ -7,12 +7,25 @@
 # We then use `wheel tags` to apply the correct manylinux platform tag.
 #
 # Usage (called by cibuildwheel):
-#   bash repair_wheel.sh {dest_dir} {wheel}
+#   bash repair_wheel.sh {dest_dir} {wheel} [manylinux_tag]
+#
+# manylinux_tag is the glibc part of the platform tag ("2_28" by default,
+# see MANYLINUX_TAG below).
 
 set -euo pipefail
 
-DEST_DIR="${1:?Usage: repair_wheel.sh <dest_dir> <wheel>}"
-WHEEL="${2:?Usage: repair_wheel.sh <dest_dir> <wheel>}"
+DEST_DIR="${1:?Usage: repair_wheel.sh <dest_dir> <wheel> [manylinux_tag]}"
+WHEEL="${2:?Usage: repair_wheel.sh <dest_dir> <wheel> [manylinux_tag]}"
+
+# glibc version stamped into the platform tag.  MUST match the manylinux
+# image the wheel was actually built in (build-pip.yml's matrix.cibw_image)
+# -- `wheel tags` only rewrites metadata, it does not verify the binary,
+# so an over-optimistic tag here produces a wheel that pip happily installs
+# and that then fails at import with a GLIBC_x.y-not-found link error.
+# 2_28 = AlmaLinux 8 / RHEL8 family, which is what CI builds in (#973).
+MANYLINUX_TAG="${3:-${CLIO_MANYLINUX_TAG:-2_28}}"
+# Accept either "2_28" or a full image name like "manylinux_2_28".
+MANYLINUX_TAG="${MANYLINUX_TAG#manylinux_}"
 
 echo "=== Repairing wheel: $(basename "$WHEEL") ==="
 
@@ -123,14 +136,14 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
 " "$WORK_DIR/unpack" "$REPACK_DIR/$WHEEL_NAME"
 
 # Detect the architecture and apply the manylinux platform tag.
-# PyPI rejects raw linux_* platform tags; we need manylinux_2_34_*.
+# PyPI rejects raw linux_* platform tags; we need manylinux_<glibc>_*.
 # `wheel tags` properly updates the filename, WHEEL metadata, and RECORD.
 ARCH=$(echo "$WHEEL_NAME" | grep -oP 'linux_\K(x86_64|aarch64|i686|ppc64le|s390x)')
 if [ -n "$ARCH" ]; then
-    echo "Retagging wheel with manylinux_2_34_${ARCH}..."
+    echo "Retagging wheel with manylinux_${MANYLINUX_TAG}_${ARCH}..."
     pip install -q wheel
     python3 -m wheel tags \
-        --platform-tag "manylinux_2_34_${ARCH}" \
+        --platform-tag "manylinux_${MANYLINUX_TAG}_${ARCH}" \
         --remove \
         "$REPACK_DIR/$WHEEL_NAME"
 fi

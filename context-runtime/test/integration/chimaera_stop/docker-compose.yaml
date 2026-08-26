@@ -33,10 +33,11 @@ services:
       - NODE_IP=172.30.0.10
       - PATH=/workspace/build/bin:/home/iowarp/venv/bin:/home/iowarp/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
-      # Prefer a workspace jarvis-cd checkout over the older one baked into
-      # iowarp/deps-* images, when one is present. PYTHONPATH is processed
-      # before site-packages; a non-existent path is simply ignored, so this
-      # transparently falls back to the venv's jarvis-cd.
+      # Prefer the workspace jarvis-cd checkout (run_tests.sh clones jarvis-cd
+      # `dev` here when absent -- jarvis_clio_core needs its container_utils)
+      # over the older `main` baked into iowarp/deps-* images. PYTHONPATH is
+      # processed before site-packages; a non-existent path is simply ignored,
+      # so this transparently falls back to the venv's jarvis-cd.
       - PYTHONPATH=/workspace/external/jarvis-cd
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1

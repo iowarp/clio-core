@@ -1754,7 +1754,11 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
-    pk.pack_map(14);
+    // 15 = the 14 scalar stats below plus the trailing "members" array. The
+    // count was 14 while 15 pairs were packed, so a spec-conforming unpacker
+    // (msgpack::unpack reads exactly the declared map) silently DROPPED the
+    // members roster -- found by the dashboard's member-table test (#990).
+    pk.pack_map(15);
     pk.pack("pool_name");     pk.pack(pool_name_);
     pk.pack("max_failures");  pk.pack(max_failures_);
     pk.pack("data_count");

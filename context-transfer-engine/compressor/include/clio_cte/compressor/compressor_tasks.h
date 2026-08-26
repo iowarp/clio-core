@@ -119,7 +119,11 @@ struct DestroyTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DestroyTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
@@ -249,7 +253,18 @@ struct DynamicScheduleTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DynamicScheduleTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<DynamicScheduleTask>();
+    // blob_name_ is INOUT only because the wire protocol echoes it back; the
+    // server never writes it and it is the CLIENT's shm string, so assigning
+    // the replica's would free the client's buffer through the wrong
+    // allocator. blob_data_ is bulk-transferred, never merged.
+    context_.AggregateOut(replica->context_);
+    if (replica->tier_score_ > tier_score_) {
+      tier_score_ = replica->tier_score_;
+    }
   }
 
   void Copy(const ctp::ipc::FullPtr<DynamicScheduleTask>& other) {
@@ -328,7 +343,16 @@ struct CompressTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CompressTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<CompressTask>();
+    // See DynamicScheduleTask::AggregateOut — blob_name_/blob_data_ belong to
+    // the client and never merge; context_ and tier_score_ are the OUT state.
+    context_.AggregateOut(replica->context_);
+    if (replica->tier_score_ > tier_score_) {
+      tier_score_ = replica->tier_score_;
+    }
   }
 
   void Copy(const ctp::ipc::FullPtr<CompressTask>& other) {
@@ -404,7 +428,15 @@ struct DecompressTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DecompressTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<DecompressTask>();
+    // blob_data_ is bulk-transferred into the ORIGIN's buffer. Each replica
+    // decompresses its own slice, so both the produced bytes and the CPU time
+    // spent are SUMS.
+    output_size_ += replica->output_size_;
+    decompress_time_ms_ += replica->decompress_time_ms_;
   }
 
   void Copy(const ctp::ipc::FullPtr<DecompressTask>& other) {
@@ -435,6 +467,114 @@ struct DecompressTask : public clio::run::Task {
     ar(output_size_, decompress_time_ms_);
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
+};
+
+/**
+ * NodeLoadSample - Snapshot of a node's CPU utilization and worker load.
+ * Returned as the OUT payload of a PollNodeLoadTask.
+ */
+struct NodeLoadSample {
+  clio::run::u32 node_id_;          ///< Node ID being sampled
+  float cpu_usage_pct_;       ///< AggregateOut CPU utilization (0-100)
+  float worker_load_us_;      ///< Sum of WorkerStats::load_ across all workers (us)
+  clio::run::u32 num_queued_tasks_; ///< Sum of queued tasks across all workers
+  clio::run::u32 num_blocked_tasks_;///< Sum of blocked tasks across all workers
+  clio::run::u32 num_workers_;      ///< Total worker count on this node
+
+  NodeLoadSample()
+      : node_id_(0), cpu_usage_pct_(0.0f), worker_load_us_(0.0f),
+        num_queued_tasks_(0), num_blocked_tasks_(0), num_workers_(0) {}
+
+  template <class Archive>
+  void serialize(Archive &ar) {
+    ar(node_id_, cpu_usage_pct_, worker_load_us_, num_queued_tasks_,
+       num_blocked_tasks_, num_workers_);
+  }
+};
+
+/**
+ * PollNodeLoadTask - Query a node's CPU% and worker load.
+ *
+ * No inputs. The task is routed to a target node via PoolQuery::Physical(node_id)
+ * and the runtime samples the local node's stats and writes them into the OUT
+ * NodeLoadSample.
+ */
+struct PollNodeLoadTask : public clio::run::Task {
+  OUT NodeLoadSample sample_;  ///< Sampled node load (filled by runtime)
+
+  PollNodeLoadTask() : clio::run::Task(), sample_() {}
+
+  explicit PollNodeLoadTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPollNodeLoad),
+        sample_() {}
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<PollNodeLoadTask>();
+    // The sample describes ONE node (the task is Physical-routed), so there is
+    // nothing to reduce: the first replica that actually sampled wins.
+    // num_workers_ is 0 until a replica has filled the sample.
+    if (sample_.num_workers_ == 0) {
+      sample_ = replica->sample_;
+    }
+  }
+
+  void Copy(const ctp::ipc::FullPtr<PollNodeLoadTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    sample_ = other->sample_;
+  }
+
+  template <typename Ar>
+  void SerializeStart(Ar &ar) {
+    task_serialize<Ar>(ar);
+    ar(sample_);
+  }
+
+  template <typename Ar>
+  void SerializeEnd(Ar &ar) {
+    ar(sample_);
+  }
+};
+
+/**
+ * PollConsumersTask - Periodic task that, when fired, iterates the
+ * compressor's tracked consumer list and dispatches PollNodeLoad to each
+ * consumer node. Has no IN/OUT fields — it is a trigger.
+ */
+struct PollConsumersTask : public clio::run::Task {
+  PollConsumersTask() : clio::run::Task() {}
+
+  explicit PollConsumersTask(const clio::run::TaskId &task_id,
+                             const clio::run::PoolId &pool_id,
+                             const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPollConsumers) {}
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
+  }
+
+  void Copy(const ctp::ipc::FullPtr<PollConsumersTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    (void)other;
+  }
+
+  template <typename Ar>
+  void SerializeStart(Ar &ar) {
+    task_serialize<Ar>(ar);
+  }
+
+  template <typename Ar>
+  void SerializeEnd(Ar &ar) {}
 };
 
 }  // namespace clio::cte::compressor

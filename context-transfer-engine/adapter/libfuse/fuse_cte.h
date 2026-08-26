@@ -474,6 +474,71 @@ static inline std::string RegexEscape(const std::string &s) {
 // glue — references it, so it is declared here with external linkage. Only the
 // FUSE builds (which include <fuse3/fuse.h> above) see this declaration.
 extern const struct fuse_operations cte_fuse_ops;
+
+#if !defined(_WIN32)
+#include <sys/statvfs.h>
+#ifdef __APPLE__
+#include <sys/param.h>
+#include <sys/mount.h>  // struct statfs (macFUSE's statfs callback type)
+#endif
+// POSIX spellings of the shared-callback types. These MUST stay byte-identical
+// to the block in fuse_cte.cc: an alias may be redeclared only when it names
+// the SAME type, and macFUSE reports through Darwin's struct statfs where
+// libfuse reports statvfs. Declaring the Linux spelling unconditionally here
+// is what broke the macOS adapters build — 'struct statfs' vs 'struct statvfs'
+// redefinition, plus a statfs callback whose signature no longer matched.
+using cte_stat_t = struct stat;
+using cte_off_t = off_t;
+using cte_mode_t = mode_t;
+using cte_timespec_t = struct timespec;
+#ifdef __APPLE__
+using cte_statvfs_t = struct statfs;
+#else
+using cte_statvfs_t = struct statvfs;
+#endif
+#endif
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// Individual operations, exported for the LOW-LEVEL adapter (fuse_cte_ll.cc):
+// it resolves inode->path and delegates to these proven path-keyed
+// implementations, gaining only the reply shapes (attrs carried in
+// create/lookup/mkdir replies, readdirplus) that the high-level API cannot
+// express. Signatures are exactly the fuse_operations member shapes.
+// ---------------------------------------------------------------------------
+int cte_fuse_bootstrap_clients();
+int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
+                          struct fuse_file_info *fi);
+int cte_fuse_create(const char *path, cte_mode_t mode,
+                    struct fuse_file_info *fi);
+int cte_fuse_open(const char *path, struct fuse_file_info *fi);
+int cte_fuse_read(const char *path, char *buf, size_t size, cte_off_t offset,
+                  struct fuse_file_info *fi);
+int cte_fuse_write(const char *path, const char *buf, size_t size,
+                   cte_off_t offset, struct fuse_file_info *fi);
+int cte_fuse_release(const char *path, struct fuse_file_info *fi);
+int cte_fuse_flush(const char *path, struct fuse_file_info *fi);
+int cte_fuse_fsync(const char *path, int datasync, struct fuse_file_info *fi);
+int cte_fuse_mkdir(const char *path, cte_mode_t mode);
+int cte_fuse_rmdir(const char *path);
+int cte_fuse_unlink(const char *path);
+int cte_fuse_rename(const char *from, const char *to, unsigned int flags);
+int cte_fuse_truncate(const char *path, cte_off_t size,
+                      struct fuse_file_info *fi);
+int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
+                     struct fuse_file_info *fi);
+int cte_fuse_chmod(const char *path, cte_mode_t mode,
+                   struct fuse_file_info *fi);
+int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
+                   struct fuse_file_info *fi);
+int cte_fuse_symlink(const char *target, const char *path);
+int cte_fuse_readlink(const char *path, char *buf, size_t size);
+int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf);
+int cte_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                     cte_off_t offset, struct fuse_file_info *fi,
+                     enum fuse_readdir_flags flags);
+int cte_fuse_link(const char *from, const char *to);
+#endif  // !_WIN32
 #endif  // CLIO_CTE_FUSE_ENABLED
 
 #endif  // CLIO_CTE_ADAPTER_LIBFUSE_FUSE_CTE_H_

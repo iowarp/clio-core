@@ -5,6 +5,62 @@ embedded gate is now **84 tests** (all verified passing, `run_ci`-green) plus 35
 in the scratch gate. Everything below is *why the rest don't pass* and *what it
 would take*, with the concrete caveats found by actually attempting them.
 
+## 2026-08-25 — five xfstests quarantined as flaky; gate 72 -> 67 (issue #1022)
+
+The embedded gate turned **5 of 134 otherwise-clean CI runs red** (3.7%) on
+tests that were not related to the branch under test. Mined from the "adapters
+(linux, all 5)" job logs of all 157 completed CI Adapters runs between
+2026-08-05 and 2026-08-25:
+
+| test | failures / 134 clean runs | seen on |
+|---|---|---|
+| generic/209 | 3 (2.2%) | 1011-macfuse-build-break x2, 1020-viz-teardown-deadlock |
+| generic/729 | 2 (1.5%) | dev (push), 1018-bdev-preallocate-budget |
+| generic/647 | 1 (0.7%) | dev (push) |
+| generic/451 | 1 (0.7%) | 1018-bdev-preallocate-budget |
+| generic/070 | 1 (0.7%) | 1020-viz-teardown-deadlock |
+
+The remaining 67 baseline tests: **0 failures in 134 runs.**
+
+"Clean population" excludes 10 runs with >3 failures each — all of them on
+1007-client-put-sieving, which really did break the filesystem (7-19 failures
+per run, incl. MOUNTFAIL) until it was fixed. Counting those would have
+libelled ~20 healthy tests as flaky; the sieving branch is the counter-example
+that shows what a REAL regression looks like in this data (many tests, both
+ctest attempts, MOUNTFAIL) versus a flake (one or two tests, once).
+
+These five now live in `ci_flaky_quarantine.txt`: still run every job, reported
+as a `::warning::`, never gating.
+
+**First signatures captured** (run 32883603078, the PR that added the
+quarantine -- a CI-scripts-only diff that flaked two of the five, which is
+exactly the measured rate and would have been red under the old gate):
+
+* `generic/070` — `rm: cannot remove '.../fsstress/p0/d4b/.../dd60': Directory
+  not empty`. fsstress teardown: `rmdir` sees a directory as non-empty after
+  its children were unlinked — an unlink/readdir visibility ordering hole.
+* `generic/729` — `mmap-rw-fault: pread (D_DIRECT) from hole is broken`. An
+  `O_DIRECT` read from a hole did not come back zeroed.
+
+Both are **real filesystem-semantics bugs that are merely rare**, not test
+noise. Quarantining them is right for the gate; tolerating them is not.
+**Root cause not yet found.** They are almost
+certainly the same class as the 2026-07-05 pool above — a scheduling race that
+only manifests under the runner's constrained CPU — but unlike that pool these
+FAIL rather than HANG, so the two are not proven identical. Next step is to
+capture the golden-vs-actual diff: `run_clio_xfstests.sh` now prints
+`./check` output plus `.out.bad`/`.full` on failure, which it previously threw
+away (a CI failure literally read `generic/070 : FAIL` and nothing more). Wait
+for the next natural flake, read the diff, then fix and re-admit.
+
+### Related, NOT quarantined
+* `cte_hdf5_vol_io_dataset` — read-back **data mismatch** (`REQUIRE(match)`),
+  first attempt failed in 5 of 146 runs, every one on or before 2026-08-11,
+  0 of 90 since. `ctest --repeat until-pass:2` hid it completely; the adapters
+  job now runs `CI/report_flaky_tests.sh` so a recurrence is annotated.
+* `fuse_ops` — failed 2 runs, both attempts, both on 1007-client-put-sieving.
+  A real regression that was fixed. Not flaky.
+
 ## 2026-07-05 — CI went red: worker oversubscription livelock (FIXED)
 The embedded-FUSE gate passed locally but **hung 12 tests in CI** (run
 28747864260, job "adapters (linux, all 5)"): generic/006/007/011/013/089/100/

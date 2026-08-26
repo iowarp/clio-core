@@ -131,6 +131,26 @@ endif()
 # NOTE: Compression benchmark (clio_cte_compress_bench) has been moved to
 # context-transfer-engine/compressor/test/
 
+if(CLIO_CORE_ENABLE_MPI)
+  add_executable(clio_cte_safe_bench
+    clio_cte_safe_bench.cc
+  )
+
+  target_link_libraries(clio_cte_safe_bench
+    clio::cte::core_client
+    clio::run::safe_bdev_client
+    clio::run::bdev_client
+    clio::run::cxx
+    MPI::MPI_CXX
+  )
+
+  target_compile_features(clio_cte_safe_bench PRIVATE cxx_std_17)
+
+  install(TARGETS clio_cte_safe_bench
+    RUNTIME DESTINATION bin
+  )
+endif()
+
 # YCSB JNI binding (issue #862): thin shim behind site.ycsb.db.ClioClient.
 # Built only when JNI headers are present so plain builds don't grow a Java
 # dependency; the Java half lives in benchmark/ycsb/ClioClient.java and is

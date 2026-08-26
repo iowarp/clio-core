@@ -57,6 +57,27 @@ fi
 
 export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
 
+# jarvis_clio_core's packages import jarvis_cd.util.container_utils, which only
+# exists on jarvis-cd's `dev` branch; the jarvis-cd baked into iowarp/deps-*
+# images is an older `main` checkout that lacks it ("No module named
+# 'jarvis_cd.util.container_utils'" at `jarvis pkg append`). The compose file
+# already puts /workspace/external/jarvis-cd first on PYTHONPATH, so provision
+# a jarvis-cd checkout there when the workspace doesn't have one. Override the
+# ref with JARVIS_CD_REF, or point JARVIS_CD_REPO at a fork.
+JARVIS_CD_DIR="$REPO_ROOT/external/jarvis-cd"
+if [ ! -d "$JARVIS_CD_DIR/jarvis_cd" ]; then
+    JARVIS_CD_REPO="${JARVIS_CD_REPO:-https://github.com/grc-iit/jarvis-cd.git}"
+    JARVIS_CD_REF="${JARVIS_CD_REF:-dev}"
+    log "cloning jarvis-cd ($JARVIS_CD_REF) into external/jarvis-cd"
+    if ! git clone --quiet --depth 1 --branch "$JARVIS_CD_REF" \
+            "$JARVIS_CD_REPO" "$JARVIS_CD_DIR"; then
+        err "FAIL: could not clone jarvis-cd ($JARVIS_CD_REPO @ $JARVIS_CD_REF)"
+        exit 1
+    fi
+else
+    log "using existing external/jarvis-cd checkout"
+fi
+
 log "starting 2-node cluster (image: $IOWARP_DOCKER_IMAGE)"
 docker compose down -v 2>/dev/null || true
 docker compose up -d

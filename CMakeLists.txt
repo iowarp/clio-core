@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.2.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.2.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -40,11 +40,6 @@ option(CLIO_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
-# The context visualizer is pure Python (no compilation), so it ships as a
-# standard feature in every package — independent of the heavyweight nanobind
-# bindings gated by CLIO_CORE_ENABLE_PYTHON. Keep it ON so the .deb/.rpm/conda
-# packages (built with CLIO_CORE_ENABLE_PYTHON=OFF) still include it.
-option(CLIO_CORE_ENABLE_VISUALIZER "Install the pure-Python context visualizer dashboard" ON)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
 # Precompiled headers speed up builds but conflict with WINDOWS_EXPORT_ALL_SYMBOLS
 # under the Ninja generator with non-MSVC Windows compilers (icx/clang-cl): the
@@ -1530,6 +1525,7 @@ if(CLIO_CORE_ENABLE_TESTS)
          rm -rf \"\${CLIO_MEMFD_DIR:-/tmp/clio_\${USER:-unknown}}\" 2>/dev/null; \
          rm -f /dev/shm/sm_segment.* 2>/dev/null; \
          rm -f /dev/shm/test_buddy_bench_* 2>/dev/null; \
+         rm -f /tmp/test_bdev_* /tmp/cae_error_test_storage.dat /tmp/safe_cons_* 2>/dev/null; \
          rm -f \"${CMAKE_BINARY_DIR}\"/cte_*.dat* \"${CMAKE_BINARY_DIR}\"/cte_*.yaml \"${CMAKE_BINARY_DIR}\"/*stress*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.yaml \"${CMAKE_BINARY_DIR}\"/temp_unregister_test.dat 2>/dev/null; \
          rm -rf \"${CMAKE_BINARY_DIR}\"/cee_test_data 2>/dev/null; \
          exit 0")
@@ -1563,9 +1559,20 @@ if(CLIO_CORE_ENABLE_TESTS)
       # stale rule never fails the whole suite. Build artifacts under
       # ${CMAKE_BINARY_DIR}/bin are scrubbed the same way the POSIX path scrubs
       # ${CMAKE_BINARY_DIR}/cte_*.dat etc.
+      #
+      # %TEMP% is scrubbed too, mirroring the POSIX path's /tmp cleanup. Several
+      # tests write bdev backing files under temp_directory_path() and never
+      # delete them, so each suite run leaked GBs onto the system drive:
+      #   test_bdev_*                  10MB, some 100MB (bdev ChiMod tests)
+      #   cae_error_test_storage.dat   1GB   (CAE error-handling test)
+      #   safe_cons_*.bin/.alog        16MB  (safe-bdev consumer tests)
+      # Left alone that eventually fills C:, and the failures it causes are
+      # baffling: tests fail, or ctest dies mid-run, with no disk-space message
+      # anywhere in the output.
       set(_clio_cleanup_cmd_win
           "$ErrorActionPreference='Continue'; \
            Get-Process | Where-Object { $_.Path -and $_.Path -like '${CMAKE_BINARY_DIR}/bin/*' } | Stop-Process -Force -ErrorAction SilentlyContinue; \
+           Get-ChildItem (Join-Path $env:TEMP '*') -File -Include 'test_bdev_*','cae_error_test_storage.dat','safe_cons_*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter 'cte_*.dat*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter 'cte_*.yaml' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter '*stress*.bin*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
@@ -1592,18 +1599,20 @@ if(CLIO_CORE_ENABLE_TESTS)
       )
 
       # Pre-allow every test binary through Windows Defender Firewall so ctest
-      # doesn't pop a per-binary "Allow access?" prompt. The script self-elevates
-      # only when new binaries appear (it caches the allowed set in a marker), so
-      # a normal "build once, run ctest repeatedly" loop triggers at most one UAC
-      # prompt right after a fresh build. It is best-effort (always exits 0), and
-      # is a SETUP for the shared fixture so it runs before any networked test.
+      # doesn't pop a per-binary "Allow access?" prompt. Adding rules needs
+      # Administrator, but the script never elevates on its own: an unanswerable
+      # UAC dialog would block until this fixture hit its TIMEOUT. Unelevated it
+      # just reports which binaries still need rules; apply them by running
+      # scripts/windows/allow_firewall.ps1 once from an elevated prompt. It is
+      # best-effort (always exits 0), and is a SETUP for the shared fixture so it
+      # runs before any networked test.
       add_test(
           NAME cr_firewall_allow
           COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                   -File "${CMAKE_SOURCE_DIR}/scripts/windows/allow_firewall.ps1"
       )
       set_tests_properties(cr_firewall_allow PROPERTIES
-          TIMEOUT 300
+          TIMEOUT 240
           FIXTURES_SETUP clio_test_cleanup_fixture
       )
     endif()
@@ -1713,16 +1722,6 @@ if(CLIO_CORE_ENABLE_CEE)
     list(APPEND _WRP_ENABLED_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/context-exploration-engine")
 else()
     message(STATUS "Context-exploration-engine component disabled")
-endif()
-
-# Context Visualizer (pure Python web dashboard). Gated on its own option so
-# it ships in the .deb/.rpm/conda packages even though those set
-# CLIO_CORE_ENABLE_PYTHON=OFF (it needs no compilation, only a Python runtime).
-if(CLIO_CORE_ENABLE_VISUALIZER)
-    message(STATUS "Building context-visualizer component (Python)")
-    add_subdirectory(context-visualizer)
-else()
-    message(STATUS "Context-visualizer component disabled (CLIO_CORE_ENABLE_VISUALIZER=OFF)")
 endif()
 
 # Gray-Scott Example Application
@@ -1857,6 +1856,84 @@ if(CLIO_CORE_ENABLE_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
         endif()
     endforeach()
+
+    # -----------------------------------------------------------------------
+    # Per-test environment applied to every component test.
+    #
+    # 1. CLIO_TEST_MODE=1 makes the test hermetic: the runtime then ignores the
+    #    developer's ~/.clio/clio.yaml (see ConfigManager::GetServerConfigPath)
+    #    and defaults to a loopback bind. Without it, whatever happens to be in
+    #    that file leaks into every test -- a real cluster hostfile makes each
+    #    test come up as a peer and block on nodes that aren't running, and a
+    #    `capacity: 0g` RAM bdev sizes itself at 80% of DRAM and falls back to
+    #    the slow private-heap path. Both look like tests that time out locally
+    #    but pass in CI, which has no such file. Tests needing a specific config
+    #    set CLIO_SERVER_CONF (in ENVIRONMENT or via setenv), which still wins.
+    #
+    # 2. On Windows with icx, prepend the compiler's own runtime DLL directory.
+    #    Those binaries import the Intel runtime (libmmdd.dll and friends) from
+    #    there, and nothing copies it next to our executables, so the tests only
+    #    run if oneAPI's setvars.bat ran in the launching shell AND succeeded.
+    #    When it hasn't, the loader raises a MODAL "System Error" dialog: the
+    #    test does not fail, it blocks until ctest's TIMEOUT expires (a 1500s
+    #    hang for ctp_sub_alloc, with no output to explain it), and the dialog
+    #    waits for a human that a dashboard run does not have. Deriving the
+    #    directory from CMAKE_CXX_COMPILER keeps this correct for any oneAPI
+    #    install location.
+    #
+    # APPEND so these compose with the LSAN_OPTIONS set above.
+    # -----------------------------------------------------------------------
+    # ENVIRONMENT_MODIFICATION needs CMake >= 3.22, above this project's
+    # declared 3.20 floor, so gate on it explicitly.
+    if(NOT CMAKE_VERSION VERSION_LESS 3.22)
+        set(_clio_test_env_mods "CLIO_TEST_MODE=set:1")
+
+        if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+            get_filename_component(_clio_icx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            if(IS_DIRECTORY "${_clio_icx_bin}")
+                list(APPEND _clio_test_env_mods
+                     "PATH=path_list_prepend:${_clio_icx_bin}")
+                message(STATUS
+                    "Tests: prepending Intel runtime DLL dir to PATH: ${_clio_icx_bin}")
+            endif()
+        endif()
+
+        function(_clio_append_test_env_recursive dir mods)
+            get_directory_property(_tests DIRECTORY "${dir}" TESTS)
+            foreach(_t ${_tests})
+                set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
+                    ENVIRONMENT_MODIFICATION "${mods}")
+            endforeach()
+            get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
+            foreach(_sub ${_subdirs})
+                _clio_append_test_env_recursive("${_sub}" "${mods}")
+            endforeach()
+        endfunction()
+
+        # Same guard as the loops above: a component's source directory can
+        # exist on disk while being disabled, in which case CMake never
+        # processed it and get_directory_property() would error out.
+        foreach(_component_dir_pair
+                "context-transport-primitives:CLIO_CORE_ENABLE_TESTS"
+                "context-runtime:CLIO_CORE_ENABLE_RUNTIME"
+                "context-transfer-engine:CLIO_CORE_ENABLE_CTE"
+                "context-assimilation-engine:CLIO_CORE_ENABLE_CAE"
+                "context-exploration-engine:CLIO_CORE_ENABLE_CEE")
+            string(REPLACE ":" ";" _pair "${_component_dir_pair}")
+            list(GET _pair 0 _component_dir)
+            list(GET _pair 1 _component_flag)
+            if(${_component_flag} AND
+               IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+                _clio_append_test_env_recursive(
+                    "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
+                    "${_clio_test_env_mods}")
+            endif()
+        endforeach()
+    else()
+        message(WARNING
+            "CMake < 3.22: tests will read the per-user ~/.clio/clio.yaml and "
+            "may hang or time out if it configures a cluster or a 0g capacity")
+    endif()
 endif()
 
 # IOWarp KV Cache + Weight Offload libraries (clio_llm_kvcache, clio_llm_weights).
@@ -2198,11 +2275,9 @@ if(CLIO_CORE_ENABLE_PYTHON)
       COMPONENT pip_package
       LIBRARY DESTINATION ext)
   endif()
-  # Note: the context_visualizer Python package ships at the wheel root
-  # (top-level "context_visualizer/") via scikit-build-core's wheel.packages
-  # setting in pyproject.toml, not via CMake install.  That keeps the
-  # `python -m context_visualizer` and `context-visualizer` entry-point
-  # paths consistent with the package's own __main__.py.
+  # Note: the web dashboard is served by the runtime itself (issue #990);
+  # its per-ChiMod assets install via clio_add_viz_assets() under both the
+  # default and pip_package components.
 endif()
 
 # Default config -> iowarp_core/data/

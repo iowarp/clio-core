@@ -78,6 +78,27 @@
 // Global pointer variable definition for IPC manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
 
+/* Interruptible wait between liveness probes.
+ *
+ * The probe used to nap with a plain 1s sleep, which ClientFinalize's join()
+ * then had to sit through: EVERY client process paid up to a full second at
+ * exit, no matter how little work it did. That is invisible in a long-running
+ * application and lethal in a fan-out of short ones -- the netCDF-C tool tests
+ * spawn hundreds of one-file ncgen/ncdump processes, and a ~1s floor per
+ * process turned a 10s test into a ctest timeout (ncdump/tst_ncgen4 and
+ * friends). The condition variable lets the shutdown store wake the probe
+ * immediately while keeping the idle cost at one wakeup per second.
+ *
+ * Deliberately file-scope rather than IpcManager members: ipc_manager.h is
+ * included by every client of the runtime, and growing the class changes its
+ * layout -- any .so not rebuilt in the same pass then disagrees about where
+ * every following member lives, which shows up as a lock taken on the wrong
+ * address and a hang that looks nothing like its cause. There is one
+ * IpcManager per process (the g_ipc_manager global), so a process-wide pair is
+ * exactly as precise as members would be. */
+static std::mutex g_heartbeat_mtx;
+static std::condition_variable g_heartbeat_cv;
+
 namespace clio::run {
 
 // Bind address for the local server sockets (client ROUTER, response listener,
@@ -95,6 +116,14 @@ static std::string DefaultServerBindAddr() {
     if (*tm && std::string(tm) != "0") return std::string("127.0.0.1");
   }
   return std::string("0.0.0.0");
+}
+
+// True for bind addresses that can only ever serve this machine. A loopback
+// listener is single-node by construction: no process on another host can
+// reach it, so there is no such thing as a loopback-bound cluster peer.
+static bool IsLoopbackBindAddr(const std::string &addr) {
+  return addr == "localhost" || addr == "::1" ||
+         addr.compare(0, 4, "127.") == 0;
 }
 
 // ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
@@ -197,6 +226,12 @@ bool IpcManager::ClientInit() {
   if (is_initialized_) {
     return true;
   }
+  // A genuine (re)initialisation builds fresh transports, so clear the
+  // finalized flag (issue #970). Deliberately AFTER the early return above:
+  // when ClientInit is a no-op because the manager is already initialised, the
+  // transports torn down by a previous ClientFinalize are NOT rebuilt, and a
+  // wait on them must keep failing fast rather than parking forever.
+  client_finalized_.store(false, std::memory_order_release);
   // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
   ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
@@ -624,6 +659,12 @@ bool IpcManager::ServerInit() {
 }
 
 void IpcManager::ClientFinalize() {
+  // FIRST, before anything is torn down (issue #970): publish that this client
+  // is going away, so any wait — one already parked on another thread, or one
+  // submitted later from a still-to-run atexit handler — fails fast instead of
+  // blocking on a response that provably cannot arrive.
+  client_finalized_.store(true, std::memory_order_release);
+
   // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
   // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
   ctp::lbm::sock::SetSocketLibShutdown();
@@ -637,9 +678,16 @@ void IpcManager::ClientFinalize() {
                               static_cast<TaskCounter *>(nullptr));
   }
 
-  // Stop heartbeat thread
+  // Stop heartbeat thread. The store must be published under the same mutex
+  // the probe waits on, or the notify can slip into the gap between the
+  // predicate check and the wait and be missed -- which would put the full
+  // interval back into every process's exit path.
   if (heartbeat_running_.load()) {
-    heartbeat_running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+      heartbeat_running_.store(false);
+    }
+    g_heartbeat_cv.notify_all();
     if (heartbeat_thread_.joinable()) {
       heartbeat_thread_.join();
     }
@@ -1628,6 +1676,30 @@ bool IpcManager::LoadHostfile() {
   // Clear existing hostfile map
   hostfile_map_.clear();
   hosts_cache_valid_ = false;
+
+  // A loopback bind target means "single node, this machine only", so a
+  // configured hostfile cannot apply: we could not serve any peer listed in it,
+  // nor could a peer reach us. Drop the hostfile and take the single-node path
+  // below. DefaultServerBindAddr() only yields loopback when CLIO_BIND_ADDR
+  // says so explicitly or CLIO_TEST_MODE is set -- a real deployment gets
+  // 0.0.0.0 -- so this cannot change multi-node behavior.
+  //
+  // This matters because the hostfile comes from the *developer's* config
+  // (~/.clio/clio.yaml). Without this, running the unit tests on a machine that
+  // is also a node of a real cluster silently promotes each test into a peer of
+  // that cluster: it binds the cluster IP as node N, and any cluster-wide
+  // operation then blocks waiting for peers that aren't running (the config's
+  // `wait_for_restart`), so the test hangs until its ctest timeout instead of
+  // running single-node on loopback as CLIO_TEST_MODE asked.
+  if (!hostfile_path.empty()) {
+    const std::string bind_addr = DefaultServerBindAddr();
+    if (IsLoopbackBindAddr(bind_addr)) {
+      HLOG(kInfo,
+           "Bind address {} is loopback (single-node); ignoring hostfile {}",
+           bind_addr, hostfile_path);
+      hostfile_path.clear();
+    }
+  }
 
   if (hostfile_path.empty()) {
     // No hostfile configured: bind on all local interfaces (0.0.0.0) by
@@ -3839,7 +3911,11 @@ void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
     server_alive_.store(alive, std::memory_order_release);
-    CTP_THREAD_MODEL->SleepForUs(1000000);
+    // ClientFinalize clears heartbeat_running_ and notifies, so the join that
+    // follows returns at once instead of waiting out the probe interval.
+    std::unique_lock<std::mutex> lk(g_heartbeat_mtx);
+    g_heartbeat_cv.wait_for(lk, std::chrono::seconds(1),
+                            [this]() { return !heartbeat_running_.load(); });
   }
 }
 

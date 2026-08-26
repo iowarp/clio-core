@@ -1,8 +1,9 @@
 # =============================================================================
-# Dockerfile.build - Build pip wheel in manylinux_2_34
+# Dockerfile.build - Build pip wheel in manylinux_2_28
 # =============================================================================
 # Replicates what cibuildwheel does in CI:
-#   1. Start from manylinux_2_34 (AlmaLinux 9)
+#   1. Start from manylinux_2_28 (AlmaLinux 8, glibc 2.28 -- see #973 and the
+#      image-choice comment in .github/workflows/build-pip.yml)
 #   2. Install build dependencies from source (CIBW_BEFORE_ALL)
 #   3. Build the wheel with scikit-build-core
 #   4. Repair wheel with repair_wheel.sh (CIBW_REPAIR_WHEEL_COMMAND_LINUX)
@@ -13,10 +14,11 @@
 #       -f installers/pip/test/Dockerfile.build .
 # =============================================================================
 
-FROM quay.io/pypa/manylinux_2_34_x86_64:latest AS builder
+FROM quay.io/pypa/manylinux_2_28_x86_64:latest AS builder
 
-# Match CI: yum install curl patchelf
-RUN yum install -y curl patchelf
+# Match CI: yum install curl patchelf fuse3-devel (the Linux wheel builds the
+# FUSE adapter, see the platform override in pyproject.toml)
+RUN yum install -y curl patchelf fuse3-devel
 
 # Copy source tree
 COPY . /project
@@ -42,6 +44,10 @@ RUN cd /project && \
 RUN mkdir -p /tmp/wheelhouse && \
     WHEEL=$(ls /tmp/raw_wheelhouse/iowarp_core*.whl | head -1) && \
     bash /project/installers/pip/repair_wheel.sh /tmp/wheelhouse "$WHEEL"
+
+# Verify the wheel's real glibc requirement matches the tag it now claims
+# (same guard as the CI "Verify wheel glibc requirements" step, #973)
+RUN python3 /project/installers/pip/check_wheel_glibc.py /tmp/wheelhouse/*.whl
 
 # Verify static linking: no dynamic deps on yaml-cpp/zmq/sodium/uring
 RUN cd /tmp && mkdir -p verify && \

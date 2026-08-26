@@ -1,8 +1,9 @@
 #!/bin/bash
 # build_deps_manylinux.sh
-# Builds IOWarp's external dependencies from source inside a manylinux_2_34
-# container (AlmaLinux 9). All libraries are built with both shared and static
-# archives, with -fPIC so the static archives can be linked into shared objects.
+# Builds IOWarp's external dependencies from source inside a manylinux_2_28
+# container (AlmaLinux 8, glibc 2.28). All libraries are built with both shared
+# and static archives, with -fPIC so the static archives can be linked into
+# shared objects.
 #
 # Install prefix: /usr/local
 #
@@ -12,9 +13,10 @@ set -euo pipefail
 PREFIX=/usr/local
 NPROC=$(nproc)
 
-# AlmaLinux 9 / manylinux_2_34: the default compiler may generate x86_64_v2
-# instructions (SSE4.2, POPCNT) because RHEL 9 requires x86_64_v2 hardware.
-# Force baseline x86_64 so the wheel runs on any x86_64 CPU.
+# Force baseline x86_64 so the wheel runs on any x86_64 CPU. This mattered on
+# the old manylinux_2_34 image (AlmaLinux 9 defaults to x86_64_v2: SSE4.2,
+# POPCNT); AlmaLinux 8 does not, but keeping the flag costs nothing and keeps
+# the wheel's ISA floor pinned regardless of which image we build in.
 # On aarch64 we leave the flags alone — the compiler defaults are fine.
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
@@ -36,7 +38,12 @@ download_tar() {
     while [ $attempt -lt $max_attempts ]; do
         attempt=$((attempt + 1))
         echo "  Downloading $url (attempt $attempt/$max_attempts)..."
-        if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors "$url" -o "$dest"; then
+        # No --retry-all-errors: it needs curl >= 7.71 and AlmaLinux 8
+        # (manylinux_2_28) ships 7.61, where the unknown option makes curl
+        # exit immediately -- every download fails, on every attempt. The
+        # retry loop around this call already retries on any failure,
+        # including the non-transient errors --retry-all-errors covered.
+        if curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$dest"; then
             if file "$dest" | grep -qE "gzip|XZ|bzip2|tar archive"; then
                 return 0
             fi

@@ -182,12 +182,37 @@ class Client : public clio::cte::core::Client {
    * @return true if a consistent record was read. false means "not cached /
    *         could not read consistently" -- fall back to the RPC path.
    */
+  /** True once the runtime's mirror dropped ANY record for capacity: a miss
+   *  then proves nothing and authoritative negatives must not fire. */
+  bool MirrorSaturated() const {
+    return shm_fs_root_ != nullptr &&
+           shm_fs_root_->overflow_.load(std::memory_order_acquire) != 0;
+  }
+
   bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    return shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
-                                                   out);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
+                                                 out)) {
+      return false;
+    }
+    // A FILE record from an older namespace generation may sit under a stale
+    // path key (its directory was renamed): treat as absent. Directory
+    // records stay for IsDir purposes (a moved-away dir name SHOULD read
+    // negative, and dir self-stats never serve from the mirror) — but their
+    // COMPLETE claim dies with the generation: after the bump every file
+    // record reads absent, so a still-complete parent would turn that into
+    // authoritative ENOENT for REAL files across the whole tree (fsstress's
+    // one dir rename made rm -r skip everything it then could not rmdir).
+    if (out->nsgen_ !=
+        shm_fs_root_->nsgen_.load(std::memory_order_relaxed)) {
+      if (!(out->flags_ & kShmFileIsDir)) {
+        return false;
+      }
+      out->flags_ &= ~kShmDirComplete;
+    }
+    return true;
   }
 #endif  // CTP_IS_HOST
 
@@ -214,11 +239,53 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle) {
+  /** Tag-keyed size advance (see AdvanceSizeTask). */
+  clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
+      clio::run::u64 tag_packed, clio::run::u64 size) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              tag_packed, size);
+    return ipc->Send(task);
+  }
+
+  /** Batched sieve-flushed creation (see MultiCreateTask). */
+  clio::run::Future<MultiCreateTask> AsyncMultiCreate(
+      const std::string &packed) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MultiCreateTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              packed);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle,
+                                          clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle);
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
     return ipc->Send(task);
+  }
+
+  /** Fire-and-forget close: the task carries TASK_FIRE_AND_FORGET, so no
+   *  response is produced and the returned future is complete immediately.
+   *  close(2) is not a durability point — data durability lives in the
+   *  awaited writes / fsync — and Close's only output is server-side handle
+   *  bookkeeping, so metadata-heavy workloads (one close per file) need not
+   *  pay a full round trip for it. */
+  void AsyncCloseDetached(clio::run::u64 handle,
+                          clio::run::u64 advance_size = 0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
+    // Flag must be set before Send (same ordering rule as the PutBlob
+    // staging flags).
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
   }
 
   clio::run::Future<ReadTask> AsyncRead(clio::run::u64 handle, clio::run::u64 offset,
@@ -256,11 +323,13 @@ class Client : public clio::cte::core::Client {
   }
 
   clio::run::Future<TruncateTask> AsyncTruncate(const std::string &path,
-                                          clio::run::u64 new_size) {
+                                          clio::run::u64 new_size,
+                                          clio::run::u64 tag_packed = 0,
+                                          clio::run::u64 old_extent = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
                                            clio::run::PoolQuery::Local(), path,
-                                           new_size);
+                                           new_size, tag_packed, old_extent);
     return ipc->Send(task);
   }
 
@@ -280,6 +349,20 @@ class Client : public clio::cte::core::Client {
                                           clio::run::PoolQuery::Local(), path,
                                           atime_ns, mtime_ns, flags);
     return ipc->Send(task);
+  }
+
+  /** Fire-and-forget utimens (TASK_FIRE_AND_FORGET; see AsyncCloseDetached).
+   *  Timestamp stamping is pure metadata with no caller-visible output — the
+   *  kernel's writeback SETATTR issues one per dirtied file, and paying a
+   *  round trip for each put a wait on every file of a checkout. */
+  void AsyncUtimensDetached(const std::string &path, clio::run::u64 atime_ns,
+                            clio::run::u64 mtime_ns, clio::run::u32 flags) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), path,
+                                          atime_ns, mtime_ns, flags);
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
   }
 
   clio::run::Future<ChownTask> AsyncChown(const std::string &path,
@@ -957,8 +1040,22 @@ class Client : public clio::cte::core::Client {
     return 0;
   }
 
+  /** Kill switch for the zero-IPC read fast path (diagnostics: forces every
+   *  read through the authoritative RPC so mirror-record corruption can be
+   *  discriminated from store corruption). */
+  static bool ShmReadFastPathEnabled() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CFS_SHM_READ");
+      return e == nullptr || *e != '0';
+    }();
+    return v;
+  }
+
   ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
+    if (!ShmReadFastPathEnabled()) {
+      return -1;
+    }
     // Attach lazily, and RETRY when not yet attached, rather than latching
     // the result of one attempt at init. A client can legitimately come up
     // before its pool has been composed (or before the chimod has registered

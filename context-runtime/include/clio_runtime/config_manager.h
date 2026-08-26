@@ -390,6 +390,58 @@ class ConfigManager : public ctp::BaseConfig {
     return swim_suspicion_timeout_sec_;
   }
 
+  // -- Web dashboard ("viz", issue #990) -------------------------------------
+  // The admin container starts one HTTP server per node when this is enabled.
+  // Default OFF so an embedded / in-process runtime (unit tests, adapters, a
+  // library user's CLIO_INIT) never opens a listening socket it did not ask
+  // for; `clio_run runtime start` turns it on for real daemons via
+  // SetVizEnabledDefault().
+
+  /** @return true if the node-local web dashboard should be served. */
+  bool GetVizEnabled() const { return viz_enabled_; }
+
+  /** @return TCP port for the dashboard (0 = bind an ephemeral port). */
+  u32 GetVizPort() const { return viz_port_; }
+
+  /** @return address the dashboard binds to (default 127.0.0.1: the dashboard
+   *  exposes runtime internals, so it is loopback-only unless asked
+   *  otherwise). */
+  std::string GetVizBindAddr() const { return viz_bind_addr_; }
+
+  /** @return size of the dashboard's HTTP thread pool. */
+  u32 GetVizMaxThreads() const { return viz_max_threads_; }
+
+  /** @return true if the YAML `viz: enabled:` key or CLIO_VIZ_ENABLE stated a
+   *  preference, so a caller supplying a default should stand down. */
+  bool IsVizEnabledExplicit() const { return viz_enabled_explicit_; }
+
+  /**
+   * Force the dashboard on or off, overriding YAML and environment. Used by
+   * `clio_run runtime start --viz / --no-viz`.
+   */
+  void SetVizEnabled(bool enabled) {
+    viz_enabled_ = enabled;
+    viz_enabled_explicit_ = true;
+  }
+
+  /**
+   * Raise the dashboard default without overriding an explicit choice: a no-op
+   * when the YAML `viz: enabled:` key or CLIO_VIZ_ENABLE already spoke. This is
+   * how the daemon CLI turns the dashboard on by default while still honouring
+   * a deployment that switched it off.
+   */
+  void SetVizEnabledDefault(bool enabled) {
+    if (!viz_enabled_explicit_) {
+      viz_enabled_ = enabled;
+    }
+  }
+
+  /** Override the dashboard port (CLI `--viz-port`). */
+  void SetVizPort(u32 port) { viz_port_ = port; }
+
+  /** Override the dashboard bind address (CLI `--viz-bind`). */
+  void SetVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
+
  private:
   /**
    * Set default configuration values (implements ctp::BaseConfig)
@@ -503,6 +555,15 @@ class ConfigManager : public ctp::BaseConfig {
   float swim_direct_probe_timeout_sec_ = 30.0f;
   float swim_indirect_probe_timeout_sec_ = 15.0f;
   float swim_suspicion_timeout_sec_ = 60.0f;
+
+  // Web dashboard (issue #990). viz_enabled_explicit_ records whether the YAML
+  // or the environment stated a preference, so the daemon CLI can supply a
+  // default without silently overriding one.
+  bool viz_enabled_ = false;
+  bool viz_enabled_explicit_ = false;
+  u32 viz_port_ = 8080;
+  std::string viz_bind_addr_ = "127.0.0.1";
+  u32 viz_max_threads_ = 16;
 
   // Compose configuration
   ComposeConfig compose_config_;

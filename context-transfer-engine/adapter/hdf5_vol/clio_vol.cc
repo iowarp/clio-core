@@ -30,7 +30,7 @@
 #endif
 
 #include <sys/stat.h>       /* stat() -- coherence stamp */
-#include <time.h>           /* clock_gettime() -- stamp granularity check */
+#include <time.h>           /* time_t, for struct stat's mtime members */
 
 #include <cstdint>
 #include <cstdlib>
@@ -186,6 +186,19 @@ static clio_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
    holding less than it believes it does, so the caller invalidates the
    dataset's cache rather than leave a partially-staged image that a later read
    would treat as a hit. The native file is authoritative and unaffected. */
+/* Flags on every CTE put this connector makes.
+ *
+ * kCtePutDroppable marks the bytes expendable: the connector is
+ * native-preserving, so every write reaches the HDF5 file first and a CTE blob
+ * here is never the only copy. Unconditional rather than configurable --
+ * it describes what the data is, not a preference.
+ *
+ * Includes the coherence stamp. A discarded stamp reads back as absent, which
+ * already fails closed to a cache miss; excluding stamps would instead pin one
+ * unevictable blob per file ever cached. */
+static constexpr clio::run::u32 kCliovolPutFlags =
+    clio::cte::core::kCtePutDroppable;
+
 /* CTE PutBlob return codes this adapter can say something useful about.
    core_runtime.cc sets `return_code_ = 10 + alloc_result`, so 11-13 are one
    band -- "the tier could not place these bytes" -- with ExtendBlob's three
@@ -227,6 +240,11 @@ static const char *clio_put_rc_meaning(int rc) {
  * When a put fails because the tier is out of space, stop offering: skip the
  * staging path until a cooldown elapses, then let one attempt through as a
  * probe. Success reopens the gate; failure re-arms it.
+ *
+ * These puts are droppable, so the tier has already tried to reclaim space and
+ * retry before reporting failure. A placement failure reaching here therefore
+ * means space could not be reclaimed at all, which is exactly when backing off
+ * is right.
  *
  * Scope is process-wide because fullness is a property of the TIER, which
  * every file in this process shares; a per-dataset latch would re-learn the
@@ -310,9 +328,62 @@ static void clio_tier_mark_accepting() {
   }
 }
 
+/*---------------------------------------------------------------------------
+ * Process-exit guard.
+ *
+ * HDF5 installs atexit(H5_term_library) the first time the library is
+ * initialized, and H5_term_library closes every file the application left
+ * open -- which reaches clio_file_close, and through it drain_dataset_puts and
+ * the coherence stamp, LONG AFTER main() has returned.
+ *
+ * The CLIO client, by contrast, is a set of process-global objects whose
+ * teardown runs as ordinary static destructors: the shared ZeroMQ context
+ * (whose destructor zmq_ctx_shutdown()s every socket), the IPC manager's
+ * receive threads, the deferred-write registry. Every one of those is
+ * registered LATER than HDF5's atexit handler -- the client is first
+ * constructed on the first H5Fopen, long after H5open() -- and exit handlers
+ * run last-registered-first. So by the time H5_term_library asks this
+ * connector to close a file, CLIO is already gone, and the Wait() inside
+ * clio_write_stamp blocks forever on a future no surviving receive thread can
+ * ever complete. That is an unkillable hang at exit, and it is what made the
+ * netCDF-C suite's short-lived tool processes (ncdump, ncgen, nctest, and
+ * every nc_test4 binary that leaves a file open) sit at their ctest timeout
+ * instead of exiting.
+ *
+ * The fix is to stop calling into CLIO once teardown has begun. The guard is
+ * armed from every entry point HDF5 can reach this connector through, all of
+ * which run after H5open(), so LIFO ordering guarantees it is set before
+ * H5_term_library runs. Nothing is lost by skipping the tier there: the native
+ * file is authoritative and already closed correctly by the under-VOL, and a
+ * coherence stamp that is not written simply makes the next open see kAbsent
+ * and re-read from the file -- the fail-closed direction.
+ *
+ * Not atomic on purpose: written once by the thread running exit handlers, at
+ * a point where the C runtime has already serialized teardown.
+ *---------------------------------------------------------------------------*/
+static bool clio_vol_exiting_g = false;
+
+static void clio_vol_note_exit() { clio_vol_exiting_g = true; }
+
+static void clio_vol_install_exit_guard() {
+  static bool installed = false;
+  if (!installed) {
+    installed = true;
+    std::atexit(clio_vol_note_exit);
+  }
+}
+
 static bool drain_dataset_puts(clio_dataset_t *dset) {
   bool ok = true;
   int first_rc = 0;
+  /* Exit handlers are running and the client that would retire these puts is
+     gone; waiting is waiting forever. Report success so the caller does not
+     then try to invalidate (another round trip into the same dead client) --
+     the native file is authoritative and unaffected either way. */
+  if (clio_vol_exiting_g) {
+    dset->pending_puts.clear();
+    return true;
+  }
   for (auto &future : dset->pending_puts) {
     future.Wait();
     const int rc = future->GetReturnCode();
@@ -370,6 +441,11 @@ struct clio_wrap_ctx_t {
  * ======================================================================== */
 
 static clio::cte::core::Client *get_cte_client() {
+  /* Checked before the cached answer, and here rather than at each call site:
+     this is the one door to the tier, so a caller cannot forget the guard.
+     Returning nullptr is a state every caller already handles -- it is the
+     same answer they get when the runtime was never reachable. */
+  if (clio_vol_exiting_g) return nullptr;
   /* Lazily attach this process to the running clio/CTE runtime on first
      use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
      LD_PRELOAD constructor to do it (the POSIX adapter inits in
@@ -377,11 +453,10 @@ static clio::cte::core::Client *get_cte_client() {
      client singleton is unbound and the first AsyncGetOrCreateTag segfaults.
      Config comes from CLIO_SERVER_CONF, same as the runtime.
 
-     Returns nullptr when the runtime is unreachable. Callers MUST check: the
-     attach result was previously discarded, so an absent runtime faulted inside
-     H5Fcreate. There is always a correct fallback -- pass everything through to
-     the native VOL -- because the native file is authoritative and the CTE tier
-     is a performance layer, not a correctness one. */
+     Returns nullptr when the runtime is unreachable. Callers MUST check, and
+     fall back to passing everything through to the native VOL: the native file
+     is authoritative and the CTE tier is a performance layer, not a
+     correctness one. */
   static std::once_flag once;
   static bool attached = false;
   std::call_once(once, []() {
@@ -663,8 +738,8 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
   void *under_wrap_ctx = ctx ? ctx->under_wrap_ctx : nullptr;
 
   /* Let the underlying (native) VOL wrap the raw iteration object first.
-     Skipping this step — as the old code did — left the object unusable by the
-     native VOL and made link/object iteration abort. */
+     Without this the object is unusable by the native VOL and link/object
+     iteration aborts. */
   void *under = H5VLwrap_object(under_obj, obj_type, under_vol_id,
                                 under_wrap_ctx);
   if (!under) return nullptr;
@@ -674,7 +749,7 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
      non-empty path) and their transfers fall back to the native VOL. But the
      parent file IS known via the wrap context, so thread it through: a wrapped
      dataset then inherits file->trace and its reads/writes are recorded by
-     CLIO_VOL_TRACE (previously they were silently dropped). */
+     CLIO_VOL_TRACE. */
   clio_file_t *parent_file = ctx ? ctx->parent_file : nullptr;
   if (obj_type == H5I_DATASET) {
     return make_dataset_wrapper(under, under_vol_id, parent_file, nullptr);
@@ -718,7 +793,7 @@ static void *clio_unwrap_object(void *obj) {
   /* Symmetric with clio_wrap_object()'s H5VLwrap_object(): peel the native
      wrapper back off before discarding our wrapper. */
   void *under = H5VLunwrap_object(o->under_object, o->under_vol_id);
-  /* Free the wrapper either way -- returning NULL previously leaked it. */
+  /* Free the wrapper either way; returning NULL must not leak it. */
   clio_destroy_wrapper(o);
   return under;
 }
@@ -743,8 +818,7 @@ static herr_t clio_free_wrap_ctx(void *_wrap_ctx) {
  * ======================================================================== */
 
 /* Resolve the per-open connector config in ONE place so create and open cannot
-   disagree (open previously never read the info struct at all, so a chunk_size
-   set through H5Pset_vol was honoured on create and ignored on open).
+   disagree about a setting made through H5Pset_vol.
 
    chunk_size: connector info, overridden by CLIO_VOL_CHUNK_SIZE, else default.
    cache: an explicit "off" from EITHER the info struct or the environment wins;
@@ -802,25 +876,66 @@ static void clio_resolve_config(hid_t fapl_id, size_t *chunk_size,
    which HDF5 always renders with a leading '/'. */
 static constexpr const char *kStampBlobName = "__clio_coherence_stamp";
 
+/* The file's modification time, split into whole seconds and nanoseconds.
+ *
+ * `struct stat` does not agree across the platforms this connector builds on:
+ * POSIX-2008 (and glibc) names the timespec member st_mtim, Darwin predates
+ * that name and calls the same member st_mtimespec, and MSVC's struct stat has
+ * no sub-second member at all -- only st_mtime, in whole seconds. Reading
+ * st_mtim unconditionally is what stopped this file compiling anywhere but
+ * glibc; every use goes through here instead.
+ *
+ * Callers keep the two halves separate rather than taking a single nanosecond
+ * count, because the stamp string embeds them as "<sec>.<nsec>" and that text
+ * is compared against stamps already stored in a tier. */
+static void clio_stat_mtime(const struct stat &st, long long *sec,
+                            long long *nsec) {
+#if defined(_WIN32)
+  /* No sub-second field exists; see clio_stamp_granularity_ns, which widens the
+     ambiguity window to match this coarser clock. */
+  *sec = static_cast<long long>(st.st_mtime);
+  *nsec = 0;
+#elif defined(__APPLE__)
+  *sec = static_cast<long long>(st.st_mtimespec.tv_sec);
+  *nsec = static_cast<long long>(st.st_mtimespec.tv_nsec);
+#else
+  *sec = static_cast<long long>(st.st_mtim.tv_sec);
+  *nsec = static_cast<long long>(st.st_mtim.tv_nsec);
+#endif
+}
+
+/* Wall-clock now, in nanoseconds since the epoch.
+ *
+ * std::chrono::system_clock rather than clock_gettime(CLOCK_REALTIME): MSVC has
+ * neither the function nor the macro, and system_clock is the same wall clock
+ * on every implementation this builds against. It also cannot fail, so callers
+ * need no "clock unreadable" arm. */
+static long long clio_realtime_now_ns() {
+  return static_cast<long long>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
 /* Identity + state of the native file, as a string. dev/ino catch the file
    being replaced (a new inode at the same path -- h5repack, rsync, mv); size
    and mtime catch it being modified in place.
 
-   The leading "2:" is the cache-layout version. Chunk blobs used to be written
-   at their absolute image offset; they are now written at blob offset 0.
-   A tier populated by the old layout would read back hole-zeros under the new
-   one while the file itself is unchanged -- the one staleness the file
-   identity cannot catch -- so a layout change must bump this and let the
-   mismatch drop the tag. */
+   The leading "2:" is the cache-layout version. A tier populated under a
+   different blob layout reads back hole-zeros while the file itself is
+   unchanged -- the one staleness file identity cannot catch -- so any layout
+   change must bump this and let the mismatch drop the tag. */
 static std::string clio_file_stamp(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return std::string();
+  long long mtime_sec = 0, mtime_nsec = 0;
+  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
   return std::string("2:") +
          std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":" +
          std::to_string(static_cast<unsigned long long>(st.st_ino)) + ":" +
          std::to_string(static_cast<unsigned long long>(st.st_size)) + ":" +
-         std::to_string(static_cast<long long>(st.st_mtim.tv_sec)) + "." +
-         std::to_string(static_cast<long long>(st.st_mtim.tv_nsec));
+         std::to_string(mtime_sec) + "." +
+         std::to_string(mtime_nsec);
 }
 
 /* Does the stored stamp still describe this file? Anything but kMatched means
@@ -879,7 +994,16 @@ static uint64_t clio_stamp_granularity_ns() {
         if (end != e && *end == '\0') return static_cast<uint64_t>(v);
       }
     }
+#if defined(_WIN32)
+    /* Windows' stat() reports mtime in whole seconds (and only to two on a
+       FAT-formatted volume), so a 10 ms granule would call a file unambiguous
+       whose very next write lands in the same reported second -- exactly the
+       case this check exists to refuse. One second is the smallest default that
+       still fails closed there. */
+    return 1000ull * 1000ull * 1000ull;  /* 1 s */
+#else
     return 10ull * 1000ull * 1000ull;  /* 10 ms */
+#endif
   }();
   return g;
 }
@@ -895,18 +1019,16 @@ static uint64_t clio_stamp_granularity_ns() {
  * cross a tick boundary, which is why it looked flaky rather than broken.
  *
  * True means "cannot tell", and the caller withholds the stamp so the next
- * open fails closed. This is the same rule the rest of the stamp path already
- * follows -- absent, unreadable and unstattable all mean do-not-trust -- with
- * one more case that used to take the confident-yes path by omission. */
+ * open fails closed -- the same rule the rest of the stamp path follows, where
+ * absent, unreadable and unstattable all mean do-not-trust. */
 static bool clio_stamp_ambiguous(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return true;
-  struct timespec now;
-  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return true;
-  const int64_t now_ns = static_cast<int64_t>(now.tv_sec) * 1000000000LL +
-                         static_cast<int64_t>(now.tv_nsec);
-  const int64_t mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL +
-                           static_cast<int64_t>(st.st_mtim.tv_nsec);
+  long long mtime_sec = 0, mtime_nsec = 0;
+  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
+  const int64_t now_ns = static_cast<int64_t>(clio_realtime_now_ns());
+  const int64_t mtime_ns = static_cast<int64_t>(mtime_sec) * 1000000000LL +
+                           static_cast<int64_t>(mtime_nsec);
   /* A negative age means the mtime is in the future (clock skew, or a network
      filesystem stamping from a different host). Nothing can be concluded from
      it, so it is ambiguous too. */
@@ -955,15 +1077,13 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
   }
   std::memcpy(buffer.ptr_, stamp.data(), stamp.size());
   ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
-  /* score: -1.0f is "unknown / let the tier place it". The documented domain is
-     -1.0 or [0.0, 1.0]; anything outside it is REJECTED. Passing an increasing
-     counter here (an attempt at recency ordering) made every put after the
-     second fail, which silently disabled caching for every file after the
-     first -- see the regression test. Score is a PLACEMENT hint, not a
-     priority; do not repurpose it. */
+  /* score: -1.0f is "unknown / let the tier place it". The domain is -1.0 or
+     [0.0, 1.0] and anything outside it is REJECTED, which fails the put. Score
+     is a PLACEMENT hint, not a priority; do not repurpose it. */
   auto put = cte_client->AsyncPutBlob(tag_id, kStampBlobName, 0, stamp.size(),
                                       blob_data, -1.0f,
-                                      clio::cte::core::Context(), 0);
+                                      clio::cte::core::Context(),
+                                      kCliovolPutFlags);
   put.Wait();  /* the stamp must land before the tag is reused */
   if (put->GetReturnCode() != 0) {
     /* Checked, and loudly. An unchecked failure here is invisible at the moment
@@ -1064,6 +1184,10 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
 static void *clio_file_create(const char *name, unsigned flags,
                                 hid_t fcpl_id, hid_t fapl_id,
                                 hid_t dxpl_id, void **req) {
+  /* Belt and braces: whatever route selected this connector, a file open is
+     unconditionally after H5open(), so the guard is armed no later than the
+     first file that could still be open when exit handlers start running. */
+  clio_vol_install_exit_guard();
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
@@ -1092,6 +1216,7 @@ static void *clio_file_create(const char *name, unsigned flags,
 
 static void *clio_file_open(const char *name, unsigned flags,
                               hid_t fapl_id, hid_t dxpl_id, void **req) {
+  clio_vol_install_exit_guard();
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
@@ -1217,6 +1342,13 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
                        file->trace);
     }
   }
+
+  /* See clio_group_close: a failed native close leaves the file open, and
+     HDF5 will call this callback again with the same wrapper -- so stop here,
+     before anything is released or the trace is closed out. The drain above
+     is idempotent and the stamp was already skipped (it is guarded on
+     ret >= 0), so the retry does the whole job. */
+  if (ret < 0) return ret;
 
   clio::trace::close_file(file->trace);  /* writes the summary; no-op if null */
   file->trace = nullptr;
@@ -1417,6 +1549,55 @@ static bool clio_type_matches_file(clio_dataset_t *dataset, hid_t mem_type_id,
   return H5Tget_size(mem_type_id) == dataset->file_type_size;
 }
 
+/* The dataset's FULL path inside the file, e.g. "/g1/g2/var".
+ *
+ * Every CTE blob this connector writes is keyed by this string, so it has to
+ * identify the dataset uniquely within the file. The `name` argument HDF5
+ * hands to dataset_create/open does NOT: it is relative to `obj`, so a
+ * dataset opened through its parent group arrives as bare "var", and two
+ * datasets called "var" in different groups shared one key. The second one
+ * opened then read the first one's bytes -- zero-padded when it was shorter,
+ * which is exactly how it surfaced: ncdump printing `var = 1, 0, 0` for a
+ * variable holding 1, 2, 3 (ncdump/tst_netcdf4 and tst_grp_spec).
+ *
+ * Asked of the under-VOL rather than composed here, because `name` may also be
+ * absolute, may be relative to the file, and may reach us by token from
+ * H5Oopen or a reference -- one query answers all of those the way HDF5 itself
+ * would (this is what H5Iget_name does).
+ *
+ * Returns "" when the name cannot be had, which make_dataset_wrapper() treats
+ * as not cacheable: no key at all is the only safe answer, since a guessed one
+ * is how the collision above happened. */
+static std::string clio_object_full_path(void *under_obj, hid_t under_vol_id,
+                                         H5I_type_t obj_type, hid_t dxpl_id) {
+  if (!under_obj) return std::string();
+  H5VL_loc_params_t loc{};
+  loc.type = H5VL_OBJECT_BY_SELF;
+  loc.obj_type = obj_type;
+
+  size_t name_len = 0;
+  H5VL_object_get_args_t args{};
+  args.op_type = H5VL_OBJECT_GET_NAME;
+  args.args.get_name.buf_size = 0;
+  args.args.get_name.buf = nullptr;
+  args.args.get_name.name_len = &name_len;
+  if (H5VLobject_get(under_obj, &loc, under_vol_id, &args, dxpl_id,
+                     nullptr) < 0 || name_len == 0) {
+    return std::string();
+  }
+
+  std::string path(name_len + 1, '\0');
+  args.args.get_name.buf_size = name_len + 1;
+  args.args.get_name.buf = &path[0];
+  args.args.get_name.name_len = &name_len;
+  if (H5VLobject_get(under_obj, &loc, under_vol_id, &args, dxpl_id,
+                     nullptr) < 0) {
+    return std::string();
+  }
+  path.resize(name_len);
+  return path;
+}
+
 static void *clio_dataset_create(void *obj,
                                    const H5VL_loc_params_t *loc_params,
                                    const char *name, hid_t lcpl_id,
@@ -1431,8 +1612,11 @@ static void *clio_dataset_create(void *obj,
       lcpl_id, type_id, space_id, dcpl_id, dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
+  const std::string path = clio_object_full_path(under_dset, o->under_vol_id,
+                                                 H5I_DATASET, dxpl_id);
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              path.empty() ? nullptr : path.c_str());
 }
 
 static void *clio_dataset_open(void *obj,
@@ -1446,8 +1630,11 @@ static void *clio_dataset_open(void *obj,
       dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
+  const std::string path = clio_object_full_path(under_dset, o->under_vol_id,
+                                                 H5I_DATASET, dxpl_id);
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              path.empty() ? nullptr : path.c_str());
 }
 
 /* ---- Access telemetry helpers (observe-only; active only under CLIO_VOL_TRACE) */
@@ -1628,9 +1815,9 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
     }
     auto *cte_client = get_cte_client();
 
-    /* Compute total data size from memory dataspace. When we had to ask the
-       native dataset for its space we own that hid_t and must close it -- the
-       previous code leaked one per whole-dataset write. */
+    /* Compute total data size from memory dataspace. Asking the native dataset
+       for its space yields an hid_t this code owns and must close, or it leaks
+       one per whole-dataset write. */
     hid_t space = mem_space_id[d];
     hid_t owned_space = H5I_INVALID_HID;
     if (space == H5S_ALL) {
@@ -1701,7 +1888,7 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          this. */
       auto future = cte_client->AsyncPutBlob(
           dataset->file->tag_id, blob_name, 0, this_size,
-          blob_data, -1.0f, clio::cte::core::Context(), 0);
+          blob_data, -1.0f, clio::cte::core::Context(), kCliovolPutFlags);
 
       dataset->pending_puts.push_back(std::move(future));
       dataset->pending_buffers.push_back(std::move(buffer));
@@ -2005,7 +2192,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                                  dxpl_id) &&
                           !clio_is_collective(dxpl_id);
     if (!cacheable_flat) {
-      /* Propagate the native status: a failed read previously returned success
+      /* Propagate the native status, so a failed read cannot report success
          with the user's buffer untouched. */
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                         dataset->obj.under_vol_id,
@@ -2137,7 +2324,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
            lives in the name. See the comment there. */
         auto fut = cte_client->AsyncPutBlob(
             dataset->file->tag_id, blob_name, 0, this_size, blob_data,
-            -1.0f, clio::cte::core::Context(), 0);
+            -1.0f, clio::cte::core::Context(), kCliovolPutFlags);
         fut.Wait();
         const int put_rc = fut->GetReturnCode();
         if (put_rc != 0) {
@@ -2195,9 +2382,8 @@ static herr_t clio_dataset_specific(void *obj,
   auto *dset = static_cast<clio_dataset_t *>(obj);
   /* Safe mode: H5Dflush is a durability barrier at DATASET granularity, and the
      spec names it alongside H5Fflush -- so drain this dataset's pending CTE puts
-     before delegating, exactly as file_specific does for the whole file. This
-     was previously a bare pass-through, so H5Dflush returned with async puts
-     still in flight.
+     before delegating, exactly as file_specific does for the whole file,
+     so H5Dflush cannot return with async puts still in flight.
 
      H5Dset_extent changes the dataset's element count, which is what the linear
      blob image is sized by, so the cached image no longer describes the dataset:
@@ -2238,9 +2424,14 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
     clio_invalidate_dataset(dset);
   }
 
-  if (dset->file_type >= 0) H5Tclose(dset->file_type);
   herr_t ret = H5VLdataset_close(dset->obj.under_object,
                                   dset->obj.under_vol_id, dxpl_id, req);
+  /* See clio_group_close: on failure HDF5 keeps the object and will close it
+     again through this same wrapper, so nothing may be released. The drain
+     above has already run, which is correct either way -- it is idempotent
+     (pending_puts is emptied) and a retry must not re-wait on retired puts. */
+  if (ret < 0) return ret;
+  if (dset->file_type >= 0) H5Tclose(dset->file_type);
   delete dset;
   /* Last, and only after everything above has finished reading through
      dset->file (drain and invalidate both use its tag and trace). */
@@ -2304,7 +2495,15 @@ static herr_t clio_group_close(void *obj, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(obj);
   herr_t ret = H5VLgroup_close(o->under_object, o->under_vol_id,
                                 dxpl_id, req);
-  delete o;
+  /* Free the wrapper ONLY when the underlying close succeeded. A failed close
+     leaves the object open, and HDF5 hands the SAME VOL object back on the
+     caller's next attempt -- freeing it here made that retry a use-after-free.
+     H5F_CLOSE_SEMI is the everyday way to see it: H5Fclose fails while anything
+     in the file is still open, and h5_test/tst_h_files sets exactly that degree
+     and then closes twice, which aborted the process inside malloc rather than
+     reporting the failure. Mirrors H5VLpassthru, which guards every one of its
+     free_obj calls the same way. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2372,7 +2571,9 @@ static herr_t clio_attr_specific(void *obj, const H5VL_loc_params_t *lp,
 static herr_t clio_attr_close(void *attr, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(attr);
   herr_t ret = H5VLattr_close(o->under_object, o->under_vol_id, dxpl_id, req);
-  delete o;
+  /* See clio_group_close: a failed close means HDF5 will hand this same
+     wrapper back on the next attempt. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2465,14 +2666,16 @@ static void *clio_object_open(void *obj,
      the dataset_read/write/close callbacks to this wrapper and cast it to
      clio_dataset_t. h5py opens datasets through H5Oopen, so returning a bare
      clio_obj_t here would be mis-cast and corrupt the heap. Build the right
-     wrapper type. The dataset path is recovered from a by-name location when
-     available; otherwise the dataset is marked non-cacheable. */
+     wrapper type. A dataset whose path cannot be resolved is marked
+     non-cacheable. */
   if (opened_type && *opened_type == H5I_DATASET) {
-    const char *name = nullptr;
-    if (loc_params && loc_params->type == H5VL_OBJECT_BY_NAME) {
-      name = loc_params->loc_data.loc_by_name.name;
-    }
-    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file, name);
+    /* The full path, asked of the under-VOL -- not loc_params' name, which is
+       relative to `obj` and absent entirely for a by-token open. See
+       clio_object_full_path() for why a relative name cannot be a cache key. */
+    const std::string path = clio_object_full_path(under, o->under_vol_id,
+                                                   H5I_DATASET, dxpl_id);
+    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file,
+                                path.empty() ? nullptr : path.c_str());
   }
 
   auto *wrapped = new clio_obj_t;
@@ -2569,7 +2772,8 @@ static herr_t clio_datatype_close(void *obj, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(obj);
   herr_t ret = H5VLdatatype_close(o->under_object, o->under_vol_id, dxpl_id,
                                    req);
-  delete o;
+  /* See clio_group_close. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2577,17 +2781,37 @@ static herr_t clio_datatype_close(void *obj, hid_t dxpl_id, void **req) {
 static herr_t clio_introspect_get_conn_cls(void *obj,
                                              H5VL_get_conn_lvl_t lvl,
                                              const H5VL_class_t **conn_cls) {
-  (void)obj; (void)lvl;
-  *conn_cls = &H5VL_clio_cls;
-  return 0;
+  /* Only H5VL_GET_CONN_LVL_CURR asks about THIS connector. Every other level --
+     H5VL_GET_CONN_LVL_TERMINAL above all -- asks about the connector at the
+     bottom of the stack, and this one is a pass-through: the terminal
+     connector is the native VOL underneath, not us.
+
+     Answering "clio" for every level made H5VLobject_is_native() report false
+     for every object in a clio-backed file. HDF5's own dimension-scale code
+     branches on exactly that: H5DSwith_new_ref() sets
+     is_new_ref = (config_flag || !native), so a false answer diverted
+     H5DSattach_scale onto its new-style-reference path, which attaches a held
+     file ID to each reference it builds. One of those holds is never released
+     (the H5Treclaim after the write is sized by the OLD dataspace, one element
+     short of the buffer), so the file ID outlived H5Fclose and the next
+     H5Fcreate(H5F_ACC_TRUNC) on the same name failed with "unable to truncate
+     a file which is already open" -- h5_test/tst_h_dimscales, with nothing in
+     the error to point back here. Delegating puts a clio-backed file on the
+     same path as a native one. Mirrors H5VLpassthru. */
+  auto *o = static_cast<clio_obj_t *>(obj);
+  if (H5VL_GET_CONN_LVL_CURR == lvl || !o) {
+    *conn_cls = &H5VL_clio_cls;
+    return 0;
+  }
+  return H5VLintrospect_get_conn_cls(o->under_object, o->under_vol_id, lvl,
+                                     conn_cls);
 }
 
 static herr_t clio_introspect_get_cap_flags(const void *info,
                                               uint64_t *cap_flags) {
   (void)info;
-  /* Same constant the class advertises. These previously disagreed -- the class
-     literal omitted LINK_BASIC and OBJECT_BASIC that this callback reported --
-     so what the connector claimed depended on which one HDF5 asked. */
+  /* Same constant the class advertises: if the two disagree, what the
+     connector claims depends on which one HDF5 asks. */
   *cap_flags = CLIO_VOL_CAP_FLAGS;
   return 0;
 }
@@ -2862,6 +3086,7 @@ const H5VL_class_t H5VL_clio_cls = {
 };
 
 hid_t H5VL_clio_register(void) {
+  clio_vol_install_exit_guard();
   return H5VLregister_connector(&H5VL_clio_cls, H5P_DEFAULT);
 }
 
@@ -2881,4 +3106,11 @@ hid_t H5VL_clio_register(void) {
  * H5VL_clio_register() + H5Pset_vol() itself.
  * ======================================================================== */
 extern "C" H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VOL; }
-extern "C" const void *H5PLget_plugin_info(void) { return &H5VL_clio_cls; }
+extern "C" const void *H5PLget_plugin_info(void) {
+  /* The plugin path does NOT go through H5VL_clio_register(): HDF5 asks for
+     the class here and registers the connector itself. This is therefore the
+     entry point that must arm the process-exit guard for every
+     HDF5_VOL_CONNECTOR=clio application. */
+  clio_vol_install_exit_guard();
+  return &H5VL_clio_cls;
+}
