@@ -26,6 +26,7 @@ on:
       - 'CMakePresets.json'
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
+      - 'context-transfer-engine/adapter/gpu_vector/test/distributed*/**'
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous
@@ -184,3 +185,34 @@ jobs:
     #   run: |
     #     ctest -R "cte_gpu_bench|cte_gpu_synthetic" \
     #       --output-on-failure --timeout 120
+
+  # The gpu_vector docker harnesses are the ONLY thing that exercises the
+  # vector across nodes, and nothing in CI ran or even parsed four of the five
+  # -- ci-md-benches validates distributed_md alone, and that harness runs the
+  # MPI/NVSHMEM foils rather than the paged vector. A typo in a compose file or
+  # a run script therefore surfaced on a GPU host, by hand, or not at all.
+  #
+  # CI has no GPU runner (see the disabled steps above), so this cannot RUN
+  # them. It parses every one of them, which is the same bargain the
+  # distributed_md step already makes and catches the same class of mistake.
+  validate-gpu-vector-harnesses:
+    name: gpu_vector docker harnesses parse
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Shell and compose syntax
+        run: |
+          set -e
+          base=context-transfer-engine/adapter/gpu_vector/test
+          for d in distributed distributed_generation distributed_md \
+                   distributed_md_paged distributed_md_bench; do
+            echo "== $d"
+            bash -n "$base/$d"/run_*.sh
+            # The harnesses require these to be set; the values are irrelevant
+            # to a parse and a missing one is a hard error, not a warning.
+            ( cd "$base/$d" && \
+              HOST_WORKSPACE=/tmp CUDA_HOME=/tmp NVSHMEM_HOME=/tmp \
+              MD_SSH_DIR=/tmp docker compose config -q )
+          done
