@@ -180,6 +180,29 @@ class NvComp : public Compressor {
     // outlive every individual timer.
   };
 
+  /**
+   * @brief nvcomp's own worst case for this input, from the cached manager.
+   *
+   * configure_compression() is a host-side calculation on the manager this
+   * thread already holds, so asking costs no device work. Returning it lets
+   * Runtime::Compress allocate a buffer nvcomp can write into directly --
+   * without it, ANS (whose worst case exceeds the caller's input+5% guess)
+   * compresses into a temporary and copies the payload back D2D on every
+   * chunk.
+   * */
+  size_t MaxCompressedSize(size_t input_size) override {
+    if (input_size == 0) return 0;
+    cudaStream_t stream = CachedStream();
+    if (!stream) return 0;
+    try {
+      std::shared_ptr<nvcomp::nvcompManagerBase> mgr = GetOrCreateManager(stream);
+      if (!mgr) return 0;
+      return mgr->configure_compression(input_size).max_compressed_buffer_size;
+    } catch (...) {
+      return 0;  // no opinion; the caller's worst case stands
+    }
+  }
+
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
     // Persistent per-thread stream and cached manager. Both used to be built

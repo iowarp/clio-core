@@ -186,6 +186,39 @@ about 2.3×; the twelve E, B, J and TCA fields sit at 1.00–1.14×, which is wh
 the aggregate is 1.278× and why 56 near-noise chunks are stored raw. That is
 the same structure the offline sweep reports, one frame interval apart.
 
+## Where the bytes actually go
+
+Profiled with `nsys` and diffed against the identical deck with Clio switched
+off, so what is left is Clio's alone. 126³, 1 GiB staged, 801.2 MiB stored:
+
+| direction | VPIC alone | + Clio | **Clio's share** |
+|---|---|---|---|
+| Host→Device | 8,416.8 MiB | 8,416.8 MiB | **0.1 MiB** |
+| Device→Host | 731.4 MiB | 1,532.9 MiB | **801.5 MiB** |
+| Device→Device | 0 | 1,024.0 MiB | **1,024.0 MiB** |
+
+* **Nothing goes host→device.** The 8.4 GiB of H2D is VPIC's own: the particle
+  arrays uploaded once at startup (built host-side in `begin_initialization`)
+  and the per-step mover/boundary buffers this build stages through the host.
+  Clio adds 0.1 MiB across the whole run.
+* **Every host-bound byte is a stored byte.** 801.5 MiB moved against 801.2 MiB
+  on the tier — the compressed (and raw-stored) output on its way to a
+  file-backed bdev. There is no read-back and no staging copy of the input.
+* **The field data moves device-to-device only**: 256 copies of exactly 4 MiB,
+  one per chunk, from the Kokkos view into the Clio-registered backend a
+  `ShmPtr` requires.
+
+That last row used to read 1,191.5 MiB. 64 of the 256 chunks — every
+`nvcomp-ans` one — carried an extra D2D copy of the whole compressed payload,
+because `Runtime::Compress` sized its output buffer with a codec-agnostic
+guess (`input + 5%`) and ANS's own worst case is larger, so nvcomp compressed
+into a temporary and copied the result back, with a `cudaMalloc`/`cudaFree`
+pair per chunk. `Compressor::MaxCompressedSize()` now lets a codec state what
+it needs (nvcomp answers from `configure_compression`, a host-side calculation
+on the manager the thread already holds) and the buffer is sized to the larger
+of the two. Measured after: **64 → 0 extra copies, 167.5 → 0 MiB**, with the
+codec mix, the ratio and every verification unchanged.
+
 ## MPI
 
 `--ranks N` runs under `mpirun` with **one Clio runtime per rank**: its own

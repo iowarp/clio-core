@@ -54,6 +54,25 @@ class Compressor {
    * */
   virtual bool Decompress(void *output, size_t &output_size, void *input,
                           size_t input_size) = 0;
+
+  /**
+   * @brief Output capacity this codec wants for `input_size` bytes, or 0 when
+   * it has no opinion and the caller's own worst case should stand.
+   *
+   * The caller allocates the output buffer before it knows which codec will
+   * run, so it uses a heuristic (input + 5%). A codec whose own worst case is
+   * LARGER than that still works -- it compresses into a temporary of its own
+   * and copies the result back -- but the copy is pure waste, and on the GPU
+   * it is a device-to-device copy of the whole compressed payload plus a
+   * cudaMalloc/cudaFree pair per call. Measured on VPIC in situ: 64 of 256
+   * chunks (every nvcomp-ans one) paid 167.5 MiB of avoidable D2D per GiB
+   * staged. Reporting the number here lets the caller size the buffer once
+   * and let every codec write straight into it.
+   * */
+  virtual size_t MaxCompressedSize(size_t input_size) {
+    (void)input_size;
+    return 0;
+  }
 };
 
 /**

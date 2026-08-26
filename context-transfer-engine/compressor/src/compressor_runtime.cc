@@ -2523,6 +2523,18 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     size_t header_size = sizeof(CompressionHeader);
     // Worst-case compressed size: original size + 5% overhead.
     size_t worst_case_size = input_size + (input_size / 20) + 1024;
+    // Ask the codec what IT needs. The +5% above is a guess made before the
+    // codec is known, and a codec whose worst case is larger still works --
+    // it compresses into a temporary of its own and copies the payload back.
+    // On the GPU that copy is a device-to-device transfer of the whole
+    // compressed output plus a cudaMalloc/cudaFree per chunk: measured on
+    // VPIC in situ as 167.5 MiB of avoidable D2D per GiB staged, all of it on
+    // the 64 nvcomp-ans chunks of 256. Never shrink the buffer on this
+    // answer -- 0 means the codec has no opinion.
+    if (compressor != nullptr) {
+      const size_t codec_wants = compressor->MaxCompressedSize(input_size);
+      if (codec_wants > worst_case_size) worst_case_size = codec_wants;
+    }
 
     // Convert ShmPtr to raw pointer via FullPtr
     auto input_fullptr =
