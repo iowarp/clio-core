@@ -404,6 +404,14 @@ class Vector {
     return out;
   }
 
+  /** Occupied frames in the table -- 0 means the cache has been emptied. */
+  clio::run::u32 Occupied(int gpu_id) const {
+    const std::vector<Page> tbl = ReadTable(gpu_id);
+    clio::run::u32 n = 0;
+    for (const Page &p : tbl) n += (p.page_num != kNoPage);
+    return n;
+  }
+
   /** How many frames hold the most-duplicated resident page. 1 == shared. */
   clio::run::u32 MaxPageCopies(int gpu_id) const {
     const std::vector<Page> tbl = ReadTable(gpu_id);

@@ -94,6 +94,16 @@ __device__ unsigned long long g_md_cyc[8];
  *  publishing can be measured as a difference against a correct run. Uniform
  *  across all threads, so the co_await stays out of a divergent branch. */
 __device__ u32 g_publish = 1u;
+/** Publish the slab INTERIOR (gen-0 track-the-store flushes). Single node
+ *  needs it -- OOC eviction performs no I/O and --ckpt reads the store.
+ *  Decomposed runs are resident, and a peer only ever reads the BOUNDARY
+ *  planes, which exchange() publishes generationally -- so the interior
+ *  flush there was per-step traffic with no reader: measured 12 puts/step
+ *  on x alone against MPI's 0.53 MB/step ledger. */
+__device__ u32 g_pub_interior = 1u;
+/** MD_RESORT_DEBUG: slots the gather actually wrote, plus one sample. */
+__device__ unsigned long long g_gather_wrote = 0ull;
+__device__ unsigned long long g_gather_sample = 0ull;
 
 /** SHARING PROBE: bit b set means block b held that page at least once.
  *  16 blocks fit a u32; the popcount per page is the sharing degree. */
@@ -1585,6 +1595,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
       const u32 dest = d_dest[srow[q] * islots + sslot];
       if (dest == ~0u) continue;               // overflow victim
       if (static_cast<u64>(dest) / islots != row) continue;   // not ours
+      atomicAdd(&g_gather_wrote, 1ull);
       const u64 de = (static_cast<u64>(dest) % islots) * kStride;
       float *const dp = (de < drun) ? dp0 + de : dp1 + (de - drun);
       const float *const sv =
@@ -1599,7 +1610,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     // in this block's cache is invisible to every other block. Flush exactly
     // the row -- a whole-page flush would also send this block's stale copy
     // of the ~11 OTHER rows sharing the page and clobber their owners.
-    if (g_publish) {
+    if (g_publish && g_pub_interior) {
       co_await dst.Flush(0, row * row_elems, row_elems);
     }
     // One unpin per fetch, in the same shape the fetches were issued: the
@@ -1852,7 +1863,7 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
     // same range, which is precisely what a whole-table flush could not
     // promise. Async, so the put overlaps the next page's integration.
     const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
-    if (g_publish) {
+    if (g_publish && g_pub_interior) {
       co_await x.BeginFlush(0, pg * epp, cnt);
       co_await v.BeginFlush(0, pg * epp, cnt);
     }
@@ -1968,10 +1979,25 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
                                          u32 nblocks, u32 block) {
   const u64 epp = x.ElemsPerPage();
   const Slab sl = SlabOf(nb, cap, z0, z1, epp);
+  // ONLY THE BOUNDARY PLANES. A peer reads exactly two of this slab's
+  // planes: the node below reads plane z0 (its "above" halo) and the node
+  // above reads plane z1-1 (its "below" halo). ForceCoro, RebinAssignCoro
+  // and GatherCoro all reach bz +/- 1 and no further, so publishing the
+  // interior sent 4x the bytes any reader would ever demand. The interior
+  // stays cache-resident (the runs are resident; OOC in decomposed mode
+  // would need an interior-flush policy first).
+  const u64 row_elems_p = static_cast<u64>(nb) * cap * kStride;
+  const u64 plane_elems_p = static_cast<u64>(nb) * row_elems_p;
+  const u64 lo_pl = static_cast<u64>(z0) * plane_elems_p;
+  const u64 hi_pl = static_cast<u64>(z1 - 1) * plane_elems_p;
   for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
     const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
     const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
     if (e1 <= e0) continue;
+    const bool boundary =
+        (e0 < lo_pl + plane_elems_p && e1 > lo_pl) ||
+        (e0 < hi_pl + plane_elems_p && e1 > hi_pl);
+    if (!boundary) continue;
     // FETCH BEFORE FLUSH, because a flush only writes back frames it can
     // FIND. SubmitFlushRanges does `Find(pn); if (p == nullptr) continue;`
     // and then returns early on n == 0 -- so publishing a page this block
@@ -1996,11 +2022,18 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
   co_await v.EndFlush();
   // ONLY NOW. The pins taken above are released after the writeback has
   // LANDED; releasing them inside the loop would let a peer reclaim a frame
-  // whose bytes are still in flight.
+  // whose bytes are still in flight. THE FILTER MUST MATCH THE FETCH LOOP
+  // EXACTLY: when the publish narrowed to boundary planes, this loop kept
+  // walking the whole slab and unpinned pages that were never fetched -- a
+  // pin-count UNDERFLOW on every interior page, every step.
   for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
     const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
     const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
     if (e1 <= e0) continue;
+    const bool boundary =
+        (e0 < lo_pl + plane_elems_p && e1 > lo_pl) ||
+        (e0 < hi_pl + plane_elems_p && e1 > hi_pl);
+    if (!boundary) continue;
     x.UnpinRange(e0, e1 - e0);
     v.UnpinRange(e0, e1 - e0);
   }
@@ -2467,9 +2500,19 @@ static bool ReduceSum(clio::cte::core::Client &cte,
   };
   const std::string mine =
       "mdred_" + std::to_string(round) + "_" + std::to_string(node);
+  // GENERATIONAL, LIKE EVERY OTHER CROSS-NODE HANDOFF IN THIS BENCH. A plain
+  // put/get pair has no readiness gate: the put can report complete while a
+  // peer's get still reads unpublished bytes, and with the per-step barrier
+  // deleted the nodes drift far enough apart to hit it -- measured as a node
+  // printing E0 = exactly HALF the true energy (its own partial plus a peer
+  // read of zeros). Each round's blob is written once, so generation 1 is
+  // the whole protocol: the get is not served until the writer's put landed.
+  clio::cte::core::Context red_ctx;
+  red_ctx.op_flags_ |= clio::cte::core::Context::kGenerational;
+  red_ctx.generation_ = 1;
   for (;;) {
     auto f = cte.AsyncPutBlob(tag, mine, 0, n * sizeof(double),
-                              reinterpret_cast<char *>(vals), 1.0f);
+                              reinterpret_cast<char *>(vals), 1.0f, red_ctx);
     f.Wait();
     if (f->GetReturnCode() == 0) break;
     if (expired()) return false;
@@ -2483,7 +2526,8 @@ static bool ReduceSum(clio::cte::core::Client &cte,
     std::vector<double> got(n, 0.0);
     for (;;) {
       auto f = cte.AsyncGetBlob(tag, name, 0, n * sizeof(double), 0u,
-                                reinterpret_cast<char *>(got.data()));
+                                reinterpret_cast<char *>(got.data()),
+                                clio::run::PoolQuery::Dynamic(), red_ctx);
       f.Wait();
       if (f->GetReturnCode() == 0) break;
       if (expired()) {
@@ -2950,8 +2994,17 @@ int main(int argc, char **argv) {
   // and it is the whole difference between our footprint and a resident
   // MPI-style array.
   u64 data_bytes_total = 0, tbl_bytes_total = 0;
+  // The free-VRAM delta since the LAST account() call: everything THIS
+  // vector's construction consumed, not just the frame arrays the arithmetic
+  // below covers. The gap between the two columns is the hidden overhead.
+  size_t vram_prev_probe = vram_free_before;
   auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages,
                      u64 cap_pages) {
+    size_t fnow2 = 0, tnow2 = 0;
+    cudaMemGetInfo(&fnow2, &tnow2);
+    const double real_mb = (vram_prev_probe > fnow2)
+        ? (double)(vram_prev_probe - fnow2) / 1048576.0 : 0.0;
+    vram_prev_probe = fnow2;
     const u64 slots = static_cast<u64>(nsets) * nslot;
     const u64 bytes = cap_pages * pgb;      // the allocator's regions
     const u64 data = vec_pages * pgb;
@@ -2968,6 +3021,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)frames, (double)bytes / 1048576.0,
                 (double)bytes / (double)(data ? data : 1),
                 (unsigned long long)slots, (double)tbl / 1048576.0);
+    std::printf("        REAL free-VRAM delta for %s: %.1f MB\n", what,
+                real_mb);
   };
   bool cache_reported = false;
   auto report_caches = [&]() {
@@ -2990,13 +3045,42 @@ int main(int argc, char **argv) {
                 (double)data_bytes_total / 1048576.0,
                 (double)cache_bytes_total /
                     (double)(data_bytes_total ? data_bytes_total : 1),
-                (double)(cache_bytes_total - data_bytes_total) / 1048576.0,
+                // Slab-sized caches hold FEWER regions than the domain has
+                // pages, so spare = regions - data can be negative; clamp
+                // rather than underflow the unsigned subtraction.
+                (cache_bytes_total > data_bytes_total)
+                    ? (double)(cache_bytes_total - data_bytes_total) /
+                          1048576.0
+                    : 0.0,
                 (double)tbl_bytes_total / 1048576.0, sizeof(gv::Page),
                 used_mb, (double)vram_free_before / 1048576.0,
                 (double)fnow / 1048576.0, (double)vram_total_dev / 1048576.0);
   };
   const u32 x_slots = SharedSlots(npages, nsets);
-  const u32 md_cap = static_cast<u32>(npages + 2);
+  // CACHE THE SLAB, NOT THE DOMAIN. In decomposed mode this node touches its
+  // own planes plus ONE plane either side (force stencil, resort assign,
+  // gather all reach exactly bz +/- 1), so sizing every cache to the whole
+  // domain -- and prefetching all of it -- made each node hold its peer's
+  // half of every vector for no reader. Measured: 84 MB per rank against
+  // MPI's 29.2, with the full-domain neighbour list alone 52 of it. Planes
+  // are whole pages in decomposed mode (the seam rule enforces it), so the
+  // slab's page range is exact.
+  const u64 ppp = (a.nodes > 1)
+      ? (static_cast<u64>(g.nb) * g.nb * g.cap * kStride * sizeof(float)) /
+            page_bytes
+      : 0;
+  const u32 zmine = my_z1 - my_z0;
+  const u64 slab_pg_lo = (a.nodes > 1) ? my_z0 * ppp : 0;
+  const u64 slab_pg_hi = (a.nodes > 1) ? my_z1 * ppp : npages;
+  // x and v carry the halo: slab + 2 planes. f and the ping-pong buffers are
+  // written per-slab only -- but the resort SWAPS the handles, so x2/v2
+  // become x/v and need halo capacity too.
+  const u32 md_cap = (a.nodes > 1)
+      ? static_cast<u32>((zmine + 2) * ppp + 2)
+      : static_cast<u32>(npages + 2);
+  const u32 md_cap_own = (a.nodes > 1)
+      ? static_cast<u32>(zmine * ppp + 2)
+      : static_cast<u32>(npages + 2);
   gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks, x_slots,
                        g.nelems, clio::run::PoolId::GetNull(), 0, 1,
                        /*nsets=*/0, /*capacity_pages=*/md_cap);
@@ -3042,8 +3126,8 @@ int main(int argc, char **argv) {
   }
   vx.ClearCache();
   vv.ClearCache();
-  vx.Prefetch(0, npages, 0, tbl_blocks);
-  vv.Prefetch(0, npages, 0, tbl_blocks);
+  vx.Prefetch(slab_pg_lo, slab_pg_hi, 0, tbl_blocks);
+  vv.Prefetch(slab_pg_lo, slab_pg_hi, 0, tbl_blocks);
   auto dx = vx.GetDevice(0);
   auto dv = vv.GetDevice(0);
 
@@ -3198,15 +3282,15 @@ int main(int argc, char **argv) {
     const u32 fslots = SharedSlots(npages, nsets);
     gv::Vector<float> vf(tag("md_f"), {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
-                         md_cap);
-    account("f", fslots, page_bytes, npages, md_cap);
+                         md_cap_own);
+    account("f", fslots, page_bytes, npages, md_cap_own);
     vf.EnableStats();
     {
       std::vector<float> hz(g.nelems, 0.0f);
       vf.Preload(hz.data(), g.nelems);
     }
     vf.ClearCache();
-    vf.Prefetch(0, npages, 0, 1);
+    vf.Prefetch(slab_pg_lo, slab_pg_hi, 0, 1);
     auto df = vf.GetDevice(0);
     // Ping-pong destination vectors for the resort (K2b scatters into
     // these, then the handles swap). Same geometry, resident.
@@ -3231,8 +3315,8 @@ int main(int argc, char **argv) {
     }
     vx2.ClearCache();
     vv2.ClearCache();
-    vx2.Prefetch(0, npages, 0, 1);
-    vv2.Prefetch(0, npages, 0, 1);
+    vx2.Prefetch(slab_pg_lo, slab_pg_hi, 0, 1);
+    vv2.Prefetch(slab_pg_lo, slab_pg_hi, 0, 1);
     auto dx2 = vx2.GetDevice(0);
     auto dv2 = vv2.GetDevice(0);
     gv::Vector<float> *cvx = &vx;   // current x (for stats/flush/download)
@@ -3285,17 +3369,33 @@ int main(int argc, char **argv) {
     // rest: shared residency is 2x the list, where private residency was
     // blocks x the list and had to be capped at NlSlots to allocate at all.
     const u32 nlslots = SharedSlots(nl_pages, nsets);
+    // THE LIST IS NODE-LOCAL DATA. Each node builds and reads only its own
+    // slab's rows -- no kernel ever touches a peer's -- so caching the whole
+    // domain's list on every node was 48 MB of a 59 MB cache spent holding
+    // rows with no reader. Rows are not page-aligned to the slab, so the cap
+    // is the slab rows' byte extent in pages, +2 seam slack, +2 guards.
+    const u64 nl_row_elems_all = nl_elems / (static_cast<u64>(g.nb) * g.nb);
+    const u64 nl_lo_elem = static_cast<u64>(my_z0) * g.nb * nl_row_elems_all;
+    const u64 nl_hi_elem = static_cast<u64>(my_z1) * g.nb * nl_row_elems_all;
+    const u64 nl_pg_elems = nl_page_bytes / sizeof(int);
+    const u64 nl_slab_lo = (a.nodes > 1) ? nl_lo_elem / nl_pg_elems : 0;
+    const u64 nl_slab_hi = (a.nodes > 1)
+        ? (nl_hi_elem + nl_pg_elems - 1) / nl_pg_elems
+        : nl_pages;
+    const u32 nl_cap = (a.nodes > 1)
+        ? static_cast<u32>(nl_slab_hi - nl_slab_lo + 4)
+        : static_cast<u32>(nl_pages + 2);
     gv::Vector<int> vn(tag("md_nl"), {0}, nl_page_bytes, tbl_blocks, nlslots,
                        nl_elems, clio::run::PoolId::GetNull(), 0, 1, 0,
-                       static_cast<u32>(nl_pages + 2));
-    account("list", nlslots, nl_page_bytes, nl_pages, nl_pages + 2);
+                       nl_cap);
+    account("list", nlslots, nl_page_bytes, nl_pages, nl_cap);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
       vn.Preload(hz.data(), nl_elems);
     }
     vn.ClearCache();
-    vn.Prefetch(0, nl_pages, 0, 1);
+    vn.Prefetch(nl_slab_lo, nl_slab_hi, 0, 1);
     auto dn = vn.GetDevice(0);
     report_caches();
     std::printf("  list: maxneigh=%u row=%llu entries page=%lluKB "
@@ -3505,10 +3605,29 @@ int main(int argc, char **argv) {
       // than refetch the version its owner just wrote.
       // Clear all four -- resort swaps the handles, so dx/dv alias vx2/vv2 on
       // every other pass and naming one pair would clear the wrong vectors.
-      vx.ClearCache();
-      vv.ClearCache();
-      vx2.ClearCache();
-      vv2.ClearCache();
+      //
+      if (EnvOn("MD_RESORT_DEBUG")) {
+        std::printf("  [resort-debug] ENTRY occ x=%u x2=%u v=%u v2=%u\n",
+                    vx.Occupied(0), vx2.Occupied(0), vv.Occupied(0),
+                    vv2.Occupied(0));
+        std::fflush(stdout);
+      }
+      // BUT NOT IN DECOMPOSED MODE, where this is actively DESTRUCTIVE:
+      // eviction performs no I/O and the interior is no longer flushed to
+      // the store, so clearing discards the ONLY copy and the refetch
+      // returns the preloaded zeros -- measured as PE alternating
+      // 0 <-> correct with the swap parity, pairs 0 <-> 4741632. With one
+      // shared cache the gather's write-holds are visible to every block, so
+      // there is nothing to invalidate; cross-node halo staleness is the
+      // GENERATIONAL demand's job (that is what `refetch` counts), not an
+      // invalidation pass's. Single-node keeps the clear until its OOC
+      // interaction is separately verified.
+      if (a.nodes == 1) {
+        vx.ClearCache();
+        vv.ClearCache();
+        vx2.ClearCache();
+        vv2.ClearCache();
+      }
       ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
       // ~0u IS "NO DESTINATION", AND d_dest WAS NEVER CLEARED.
       //
@@ -3544,6 +3663,29 @@ int main(int argc, char **argv) {
             my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
+      // MD_RESORT_DEBUG=1: what the assign actually produced, from the
+      // device arrays themselves -- distinguishes "assign wrote nothing"
+      // from "gather dropped what assign wrote" in one line.
+      if (EnvOn("MD_RESORT_DEBUG")) {
+        unsigned long long gw = 0;
+        cudaMemcpyFromSymbol(&gw, g_gather_wrote, sizeof(gw));
+        const unsigned long long zz = 0;
+        cudaMemcpyToSymbol(g_gather_wrote, &zz, sizeof(zz));
+        std::printf("  [resort-debug] gather_wrote=%llu (both passes) | "
+                    "max page copies x=%u x2=%u\n", gw,
+                    vx.MaxPageCopies(0), vx2.MaxPageCopies(0));
+        std::vector<u32> hd(g.nslots), hb(g.nbins);
+        ctp::GpuApi::Memcpy(hd.data(), d_dest, g.nslots * sizeof(u32));
+        ctp::GpuApi::Memcpy(hb.data(), d_bincnt, g.nbins * sizeof(u32));
+        u64 assigned = 0, bsum = 0;
+        for (u32 vd : hd) assigned += (vd != ~0u);
+        for (u32 vb : hb) bsum += vb;
+        std::printf("  [resort-debug] assigned=%llu bincnt_sum=%llu "
+                    "(atoms=%llu)\n",
+                    (unsigned long long)assigned, (unsigned long long)bsum,
+                    (unsigned long long)g.natoms);
+        std::fflush(stdout);
+      }
       int err = 0;
       ctp::GpuApi::Memcpy(&err, d_err, sizeof(int));
       if (err == 1) {
@@ -3557,12 +3699,19 @@ int main(int argc, char **argv) {
                      "--rebin\n");
         return false;
       }
-      // RebinCoro publishes the wrapped positions itself, page by page, so
-      // only invalidation is left before the gather reads them.
-      vx.ClearCache();
-      vv.ClearCache();
-      vx2.ClearCache();
-      vv2.ClearCache();
+      // SINGLE NODE ONLY. The premise ("RebinCoro publishes the wrapped
+      // positions itself") predates the wrap/assign split -- the wrap no
+      // longer flushes anything -- and in decomposed mode this clear threw
+      // away the WRAPPED positions between the assign and the gather, so the
+      // gather refetched pre-wrap bytes from the store. Same class as the
+      // other two mid-resort clears: with one shared cache there is nothing
+      // to invalidate.
+      if (a.nodes == 1) {
+        vx.ClearCache();
+        vv.ClearCache();
+        vx2.ClearCache();
+        vv2.ClearCache();
+      }
       for (auto *dst : {&dx2, &dv2}) {
         MdMark("Sentinel");
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
@@ -3587,17 +3736,32 @@ int main(int argc, char **argv) {
             my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
-      // INVALIDATE. Per-block caches have no cross-block coherence: after the
-      // gather republished every row, each block still holds its own stale
-      // copies of pages other blocks rewrote. Drop them so the next phase
-      // fetches the published bytes. Safe here -- the gather flushed.
-      vx.ClearCache();
-      vv.ClearCache();
-      vx2.ClearCache();
-      vv2.ClearCache();
+      // INVALIDATE -- SINGLE NODE ONLY, and even there the rationale is the
+      // private-cache era talking: with one shared cache the gather's
+      // write-holds are already visible to every block. In decomposed mode
+      // this clear was the LAST unexplained corruption: "safe here -- the
+      // gather flushed" is FALSE once the interior flush is off, so this
+      // discarded the frames the gather had just written (the cache's ONLY
+      // copy) and the next fetch pulled the store's stale preload. Probes:
+      // assign 43904/43904 correct, gather_wrote 87808 correct, then
+      // Occupied()==0 on the spare -- with evicts=0, because ClearCache does
+      // not count. PE alternated exactly 0 <-> exactly-initial with the swap
+      // parity, KE read 0, and the system never evolved.
+      if (a.nodes == 1) {
+        vx.ClearCache();
+        vv.ClearCache();
+        vx2.ClearCache();
+        vv2.ClearCache();
+      }
       std::swap(dx, dx2);
       std::swap(dv, dv2);
       cvx = (cvx == &vx) ? &vx2 : &vx;
+      if (EnvOn("MD_RESORT_DEBUG")) {
+        std::printf("  [resort-debug] EXIT  occ x=%u x2=%u v=%u v2=%u\n",
+                    vx.Occupied(0), vx2.Occupied(0), vv.Occupied(0),
+                    vv2.Occupied(0));
+        std::fflush(stdout);
+      }
       t_resort += NowMs() - _t;
       return true;
     };
@@ -3605,6 +3769,8 @@ int main(int argc, char **argv) {
     {
       const u32 pub = (EnvOn("MD_NO_PUBLISH")) ? 0u : 1u;
       cudaMemcpyToSymbol(g_publish, &pub, sizeof(pub));
+      const u32 pub_int = (a.nodes > 1 && EnvOn("MD_NO_INTERIOR")) ? 0u : 1u;
+      cudaMemcpyToSymbol(g_pub_interior, &pub_int, sizeof(pub_int));
       if (pub == 0u) {
         std::printf("  [MD_NO_PUBLISH] publishing DISABLED -- physics is "
                     "invalid, timing only\n");

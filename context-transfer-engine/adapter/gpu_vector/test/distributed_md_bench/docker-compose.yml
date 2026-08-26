@@ -100,6 +100,8 @@ services:
       - GVMB_BARRIER=${GVMB_BARRIER:-600}
       - CLIO_GEN_LOG=${CLIO_GEN_LOG:-}
       - MD_RESORT_CHECK=${MD_RESORT_CHECK:-}
+      - MD_NO_INTERIOR=${MD_NO_INTERIOR:-}
+      - MD_RESORT_DEBUG=${MD_RESORT_DEBUG:-}
       - CLIO_NUM_CONTAINERS=2
       # Per-node so the tiers can be made ASYMMETRIC: point node1 at a
       # config whose tier is far smaller than its working set and its pages
@@ -130,6 +132,8 @@ services:
       - GVMB_BARRIER=${GVMB_BARRIER:-600}
       - CLIO_GEN_LOG=${CLIO_GEN_LOG:-}
       - MD_RESORT_CHECK=${MD_RESORT_CHECK:-}
+      - MD_NO_INTERIOR=${MD_NO_INTERIOR:-}
+      - MD_RESORT_DEBUG=${MD_RESORT_DEBUG:-}
       - CLIO_NUM_CONTAINERS=2
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/${GVMB_CONF2:-gvmb_conf.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
