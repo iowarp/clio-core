@@ -77,7 +77,8 @@ runs VPIC with `CLIO_SERVER_CONF` pointing at it and `CLIO_WITH_RUNTIME=1`.
 | `--verify` | read every blob back through the decompressor at the end of the run |
 | `--learn` / `--explore K` / `--threshold X` / `--best` | the NeuroPress knobs, as in the offline sweep |
 | `--static LIB` / `--static-shuffle N` | fixed codec, NeuroPress bypassed |
-| `--port N` / `--store DIR` / `--restart` | one runtime per store; ports must not collide |
+| `--ranks N` | run under `mpirun`, N ranks, one Clio runtime and store each |
+| `--port N` / `--store DIR` / `--restart` | one runtime per store; ports are spaced by `PORT_STRIDE` (8) because a runtime binds more than one |
 
 Environment the adapter reads directly: `CLIO_VPIC_TAG`, `CLIO_VPIC_CHUNK`,
 `CLIO_VPIC_POOL`, `CLIO_VPIC_REPORT`, `CLIO_VPIC_RAW_DIR`, `CLIO_VPIC_VERIFY`.
@@ -185,6 +186,52 @@ about 2.3×; the twelve E, B, J and TCA fields sit at 1.00–1.14×, which is wh
 the aggregate is 1.278× and why 56 near-noise chunks are stored raw. That is
 the same structure the offline sweep reports, one frame interval apart.
 
+## MPI
+
+`--ranks N` runs under `mpirun` with **one Clio runtime per rank**: its own
+process, its own port, its own store under `$STORE/rank%04d`. VPIC splits the
+domain along x by `nproc()`, so each rank hands over its own subdomain; the
+blob names are identical across ranks and the separate stores are what keep
+them apart. `clio_vpic_insitu_begin_mpi` takes rank and size from the deck's
+`rank()`/`nproc()`, not from the environment, so the two cannot disagree.
+
+Measured, 2 ranks, 126³ (each rank 63×126×126 cells + ghosts), 200 steps,
+8 frames, 256 chunks per rank:
+
+| | rank 0 | rank 1 |
+|---|---|---|
+| in | 545,259,520 B | 545,259,520 B |
+| stored | 427,422,268 B (1.276x) | 427,434,810 B (1.276x) |
+| verify, in process | 256 / 256 | 256 / 256 |
+| cold read, separate process | 256 / 256 | 256 / 256 |
+| device residency | 256 `device=1` | 256 `device=1` |
+
+At 30³ the two ranks share exactly 4 digests out of 32 — `div_b_err` and
+`div_e_err` at both frames, which are identically zero in either subdomain
+with divergence cleaning off. The other 28 differ, which is the check that the
+ranks really did hand over different data.
+
+Two things this found, both fixed here:
+
+* **A runtime binds more than the port its compose file names** (a peer socket
+  at `port+1`, at least). Ranks on consecutive ports collide and the second
+  runtime fails to start with `Address already in use` — while the first rank
+  reports a perfectly good run. `run.sh` now spaces ports by `PORT_STRIDE`
+  (default 8) and probes `port..port+3`.
+* **The adapter's stream did not fence the simulation's.** It is created
+  `cudaStreamNonBlocking`, which does *not* synchronise with the legacy default
+  stream Kokkos launches on, so a staging copy could race the tail of the
+  step's own kernels. It showed as exactly one blob of 32 failing its digest on
+  a 2-rank run while the identical code passed single-rank — a timing
+  difference, not a rank-count one, and it could have corrupted a single-rank
+  run just as easily. `frame_begin` now calls `cudaDeviceSynchronize()`, once
+  per frame, at a point the simulation is already synchronising for
+  diagnostics.
+
+Provoked refusal: two ranks pointed at one store exits 6 with
+`REFUSING: rank 0 was given the store '...', which rank 1 of this job is
+already using`, rather than letting one of the two silently store nothing.
+
 ## Notes
 
 - **One run, not two, for the cross-check.** VPIC's current deposition
@@ -194,7 +241,4 @@ the same structure the offline sweep reports, one frame interval apart.
   therefore turns both paths on in one process.
 - Step 0 is skipped on both paths: the field array is still identically zero
   there, and a frame of zeros would dominate any ratio it is averaged into.
-- MPI: the adapter takes `rank()`/`nproc()` from the deck and gives each rank
-  its own store, port and lock file (`clio_vpic_insitu_begin_mpi`), the
-  topology the Nyx example established. Single rank is what is measured above.
 - `store/` and the built `*.Linux` deck are generated and untracked.

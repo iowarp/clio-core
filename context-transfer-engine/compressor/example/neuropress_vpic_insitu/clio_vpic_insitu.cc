@@ -423,6 +423,22 @@ int clio_vpic_insitu_frame_begin(long long step, double sim_time) {
   Adapter &a = A();
   (void)sim_time;
   if (!a.started) return 1;
+  // Fence everything the simulation has issued before reading its fields.
+  //
+  // The adapter's stream is cudaStreamNonBlocking, so it does NOT synchronise
+  // with the legacy default stream Kokkos launches on: without this, a D2D
+  // stage can race the tail of the step's own kernels and copy a field that is
+  // still being written. Seen as exactly one blob out of 32 failing its digest
+  // on a 2-rank run while the same code passed single-rank -- a timing
+  // difference, not a rank-count one. Once per frame, at a point the
+  // simulation is already synchronising for diagnostics.
+  const cudaError_t rc = cudaDeviceSynchronize();
+  if (rc != cudaSuccess) {
+    (void)cudaGetLastError();
+    Refuse(CLIO_VPIC_EXIT_PRECONDITION,
+           std::string("cudaDeviceSynchronize before frame ") +
+               std::to_string(step) + " failed: " + cudaGetErrorString(rc));
+  }
   a.cur_step = step;
   a.slot_next = 0;
   ++a.frames;
