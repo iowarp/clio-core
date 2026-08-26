@@ -128,6 +128,94 @@ inline uint32_t UnpackVersion(uint32_t packed) {
  * Returns -1 for a degenerate range or bound, which is upstream's "PSNR
  * undefined" sentinel and the value that makes the SGD skip the head.
  */
+/**
+ * Say so, ONCE, when the quantizer could not honour the requested bound.
+ *
+ * `bound_achievable` goes false when eb - max|v|*2.4e-7 - 0.05*eb <= 0: the
+ * allowance for float32 representation error is derived from the chunk's
+ * LARGEST magnitude, so a chunk that mixes large values with a tight bound
+ * lands here even where the individual values are finely representable. The
+ * quantizer then relaxes the bound instead of failing, which is upstream's
+ * behaviour ("Using maximum precision quantization (error may exceed bound)").
+ *
+ * Until this existed the condition was recorded at kDebug only, so a run at a
+ * normal log level applied a bound several times looser than asked for and
+ * said nothing -- and the PSNR beside it could not reveal that either, being
+ * derived from the REQUESTED bound rather than from the decoded values.
+ *
+ * Both quantize paths (device and host fallback) call this, so the warning
+ * does not depend on which one a chunk happened to take.
+ */
+/**
+ * True when CLIO_NEUROPRESS_REQUIRE_DEVICE demands that every chunk reach the
+ * compressor in DEVICE memory, and a host-resident one be refused instead of
+ * quietly taking a host path. Read once.
+ *
+ * There are three places the device-resident path can silently become a host
+ * one, and all three are downstream of a single condition -- the residency of
+ * the incoming pointer:
+ *
+ *   1. quantization  -- `want_quant && IsDevicePointer(input_ptr)` picks
+ *      QuantizeDevice, else the host Quantize<float>();
+ *   2. byte shuffle  -- the same predicate picks ByteShuffleDevice, else the
+ *      host ByteShuffle();
+ *   3. the codec     -- EstCompressionStats excludes CPU candidates for a
+ *      device-resident buffer, so a CPU library (and the full D2H copy
+ *      StageInputIfNeeded then performs) is only reachable for a host one.
+ *
+ * So refusing a host-resident chunk at the door is sufficient: it is not one
+ * check among three, it is the condition the other two read. Off by default,
+ * because a host-resident caller is legitimate -- the file-replay driver is
+ * one, and its results are correct, just computed on the CPU.
+ */
+/** One place to say why a host-resident NeuroPress transform is refused.
+ *
+ * The CPU implementations of quantize and byte shuffle were REMOVED: upstream
+ * has none (its src/preprocessing is CUDA-only), and keeping working ones here
+ * meant a host-resident chunk silently ran the transform on the CPU -- same
+ * bytes out, different hardware, nothing in the results to reveal it. There is
+ * now no way to honour the transform on host data, so every such site fails
+ * loudly instead of degrading. */
+inline void RefuseHostPreprocess(const char *what, size_t bytes) {
+  HLOG(kError,
+       "NeuroPress {} is CUDA-only and this {}-byte buffer is HOST-resident, "
+       "so the transform cannot be applied. The CPU implementations were "
+       "removed deliberately. Hand the compressor device memory (an in-situ "
+       "adapter, or the LAMMPS driver's --order device); "
+       "CLIO_NEUROPRESS_REQUIRE_DEVICE=0 disables NeuroPress preprocessing "
+       "for a caller that genuinely wants plain host compression.",
+       what, bytes);
+}
+
+inline bool NeuroPressRequireDevice() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_REQUIRE_DEVICE");
+    // DEFAULT ON. NeuroPress preprocessing is CUDA-only -- the CPU
+    // implementations of quantize and byte shuffle were removed -- so a
+    // host-resident chunk has no way to be preprocessed as asked. Refusing is
+    // the only honest outcome; the alternative was a silent CPU path that
+    // produced identical bytes on different hardware.
+    // CLIO_NEUROPRESS_REQUIRE_DEVICE=0 opts out, for a caller that knowingly
+    // wants plain host compression with no NeuroPress transform.
+    return !(e != nullptr && (*e == '0' || *e == '\0'));
+  }();
+  return on;
+}
+
+inline void WarnIfBoundUnachievable(bool achievable, double requested,
+                                    double effective) {
+  if (achievable) return;
+  static std::atomic<bool> warned{false};
+  if (warned.exchange(true)) return;  // per process; this fires per chunk
+  HLOG(kWarning,
+       "NeuroPress quantize: the requested error bound {} is NOT achievable on "
+       "this data; using effective bound {} instead, so a round trip may "
+       "exceed what was asked for by ~{:.1f}x. Check it with the field-replay "
+       "driver's --check-bound. Further occurrences suppressed.",
+       requested, effective,
+       requested > 0.0 ? effective / requested : 0.0);
+}
+
 inline double AnalyticalPsnr(double data_range, double error_bound) {
   if (data_range <= 0.0 || error_bound <= 0.0) return -1.0;
   const double mse_expected = (error_bound * error_bound) / 3.0;
@@ -1014,6 +1102,25 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       CLIO_CO_RETURN;
     }
 
+    // Strict device residency, when the caller asked for it. FAIL rather than
+    // fall back: a run that requires the GPU path and silently gets the host
+    // one still produces correct bytes, so nothing downstream reveals the
+    // substitution -- the ratios are identical and only the timings differ.
+    // That is exactly the failure this refuses to hand back quietly.
+    if (NeuroPressRequireDevice() && !ctp::IsDevicePointer(chunk_data)) {
+      HLOG(kError,
+           "CLIO_NEUROPRESS_REQUIRE_DEVICE is set and blob '{}' ({} bytes) "
+           "arrived in HOST memory. Quantization, byte shuffle and codec "
+           "selection would all silently take their host paths. Refusing. "
+           "Hand the compressor a device pointer (an in-situ adapter, or the "
+           "LAMMPS driver's --order device), or unset the variable.",
+           task->blob_name_.str(), (unsigned long long)chunk_size);
+      context.compress_lib_ = 0;
+      context.dynamic_compress_ = 0;
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
     // Get compression stats. The three statistics are captured here rather
     // than from the SGD snapshot further down, which is only taken when
     // online learning is on -- these are what the selection actually ranked
@@ -1777,6 +1884,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 UnpackPreset(static_cast<uint32_t>(alt->compress_preset_));
             const bool alt_wants_quant =
                 UnpackQuantEnabled(static_cast<uint32_t>(alt->compress_preset_));
+            // Set when this candidate asks for a transform that is CUDA-only
+            // and its buffer is host-resident. The candidate is then dropped
+            // rather than measured without the transform it was ranked with.
+            bool alt_skip = false;
             const uint32_t alt_shuffle =
                 UnpackShuffle(static_cast<uint32_t>(alt->compress_preset_));
             ctp::CompressionPreset alt_preset =
@@ -1853,26 +1964,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 }
               }
             } else if (alt_want_quant) {
-              // Host-resident alternative: honor the action here too, or the
-              // sample is credited as quantized while measuring unquantized
-              // bytes.
-              auto alt_hq = ctp::compress::preprocess::Quantize<float>(
-                  reinterpret_cast<const float*>(alt_input),
-                  chunk_size / sizeof(float), context.error_bound_);
-              if (!alt_hq.quantized_.empty()) {
-                alt_quant_staging.assign(alt_hq.quantized_.begin(),
-                                         alt_hq.quantized_.end());
-                alt_input = alt_quant_staging.data();
-                alt_compress_size = alt_quant_staging.size();
-                alt_applied_quant = true;
-                alt_quant_params.effective_error_bound =
-                    alt_hq.effective_error_bound_;
-                alt_quant_params.scale = alt_hq.scale_;
-                alt_quant_params.data_min = alt_hq.data_min_;
-                alt_quant_params.data_max = alt_hq.data_max_;
-                alt_quant_params.precision = alt_hq.precision_;
-                alt_quant_params.bound_achievable = alt_hq.bound_achievable_;
-              }
+              // Host-resident alternative, and the transform is CUDA-only.
+              // SKIP the candidate rather than measure it unquantized: the
+              // sample would be credited as a quantize action while carrying
+              // bytes that were never quantized, which is worse than not
+              // exploring it at all.
+              RefuseHostPreprocess("quantization", chunk_size);
+              alt_skip = true;
             }
 
             // Apply the alternative's OWN byte-shuffle before measuring it.
@@ -1903,17 +2001,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   explore_gpu_scratch.push_back(alt_shuf_alloc);
                 }
               } else {
-                alt_shuffle_staging.resize(alt_compress_size);
-                if (ctp::compress::preprocess::ByteShuffle(
-                        reinterpret_cast<const uint8_t*>(alt_input),
-                        alt_compress_size, alt_shuffle,
-                        reinterpret_cast<uint8_t*>(
-                            alt_shuffle_staging.data()))) {
-                  alt_input = alt_shuffle_staging.data();
-                  alt_applied_shuffle = alt_shuffle;
-                }
+                // Same reasoning as the quantize branch above.
+                RefuseHostPreprocess("byte shuffle", alt_compress_size);
+                alt_skip = true;
               }
             }
+
+            if (alt_skip) continue;  // see alt_skip's declaration
 
             size_t alt_worst_case = alt_compress_size + (alt_compress_size / 20) + 1024;
 
@@ -2672,6 +2766,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
              input_size, quant_bytes, quant_params.precision,
              context.error_bound_, quant_params.effective_error_bound,
              quant_params.bound_achievable);
+        WarnIfBoundUnachievable(quant_params.bound_achievable,
+                                context.error_bound_,
+                                quant_params.effective_error_bound);
       } else if (!quant_device_alloc.IsNull()) {
         CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, quant_device_alloc);
         quant_device_alloc = ctp::ipc::AllocatorId();
@@ -2688,26 +2785,14 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // quantizer shares its arithmetic with the device kernels and was
       // shown to produce byte-identical output, so a blob written on either
       // path decodes on either path.
-      auto host_q = ctp::compress::preprocess::Quantize<float>(
-          reinterpret_cast<const float *>(input_ptr),
-          input_size / sizeof(float), context.error_bound_);
-      if (!host_q.quantized_.empty()) {
-        quant_staging.assign(host_q.quantized_.begin(),
-                             host_q.quantized_.end());
-        input_ptr = quant_staging.data();
-        compress_input_size = quant_staging.size();
-        applied_quant = true;
-        quant_params.effective_error_bound = host_q.effective_error_bound_;
-        quant_params.scale = host_q.scale_;
-        quant_params.data_min = host_q.data_min_;
-        quant_params.data_max = host_q.data_max_;
-        quant_params.precision = host_q.precision_;
-        quant_params.bound_achievable = host_q.bound_achievable_;
-        HLOG(kDebug,
-             "NeuroPress quantize (host): {} -> {} bytes (precision={} eb={})",
-             input_size, compress_input_size, host_q.precision_,
-             context.error_bound_);
-      }
+      // Host-resident chunk and a CUDA-only transform: refuse. Previously a
+      // CPU quantizer ran here, so a lossy request on host memory produced
+      // correct bytes computed on the wrong hardware and reported success.
+      RefuseHostPreprocess("quantization", input_size);
+      context.compress_lib_ = 0;
+      context.dynamic_compress_ = 0;
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
     }
 
     if (applied_quant) {
@@ -2736,14 +2821,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           shuffle_device_buf = nullptr;
         }
       } else {
-        shuffle_staging.resize(compress_input_size);
-        if (ctp::compress::preprocess::ByteShuffle(
-                reinterpret_cast<const uint8_t *>(input_ptr), compress_input_size,
-                shuffle_elem,
-                reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
-          input_ptr = shuffle_staging.data();
-          applied_shuffle = shuffle_elem;
-        }
+        RefuseHostPreprocess("byte shuffle", compress_input_size);
+        context.compress_lib_ = 0;
+        context.dynamic_compress_ = 0;
+        task->return_code_ = 1;
+        CLIO_CO_RETURN;
       }
       // On failure input_ptr is untouched and applied_shuffle stays 0, so
       // the header records "not shuffled" and the read side does nothing.
@@ -3455,20 +3537,11 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
             CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, scratch_alloc);
           }
         } else {
-          std::vector<char> unshuffled(decompressed_size);
-          if (ctp::compress::preprocess::ByteUnshuffle(
-                  reinterpret_cast<const uint8_t *>(codec_dst),
-                  decompressed_size, stored_shuffle,
-                  reinterpret_cast<uint8_t *>(unshuffled.data()))) {
-            std::memcpy(codec_dst, unshuffled.data(),
-                        decompressed_size);
-          } else {
-            HLOG(kError,
-                 "Decompress: byte-unshuffle failed (elem={} size={}) -- the "
-                 "returned buffer would be shuffled garbage, failing instead",
-                 stored_shuffle, decompressed_size);
-            success = false;
-          }
+          // The blob records a shuffle, the inverse is CUDA-only, and the
+          // destination is host memory. Returning the buffer unshuffled would
+          // hand back data that is the right length and the wrong values.
+          RefuseHostPreprocess("byte unshuffle", decompressed_size);
+          success = false;
         }
       }
 
@@ -3477,9 +3550,38 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       // 1253-1296). This is what finally produces the caller's float32
       // bytes, so the reported output size becomes the original size again.
       if (success && stored_quant) {
-        if (!ctp::compress::preprocess::DequantizeDevice(
-                codec_dst, quant_elems, stored_quant_params,
-                output_fullptr.ptr_)) {
+        // DequantizeDevice writes its floats from a CUDA kernel, so the
+        // destination has to be DEVICE memory. output_fullptr is the caller's
+        // buffer and may be either -- the VOL stages GPU-side, but a CPU
+        // consumer (the field-replay driver's verify, the read path in
+        // general) hands us host shared memory. Passing a host pointer
+        // straight to the kernel is an illegal access that surfaces later as
+        // a CUDA 700 at an unrelated free, which is what it did before this
+        // branch existed: EVERY lossy read crashed the process.
+        //
+        // Same shape as the byte-unshuffle above, which already tests
+        // IsDevicePointer and keeps a non-device path. Here the inverse is
+        // cheaper as dequantize-into-scratch then one device-aware copy out,
+        // rather than a second CPU implementation of the transform.
+        char *deq_dst = output_fullptr.ptr_;
+        char *deq_scratch = nullptr;
+        ctp::ipc::AllocatorId deq_scratch_alloc;
+        if (!ctp::IsDevicePointer(output_fullptr.ptr_)) {
+          deq_scratch_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+              /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+              original_size, &deq_scratch);
+          if (deq_scratch_alloc.IsNull()) {
+            HLOG(kError,
+                 "Decompress: could not allocate the dequantization output "
+                 "scratch ({} bytes) for blob '{}'",
+                 original_size, task->blob_name_.str());
+            success = false;
+          } else {
+            deq_dst = deq_scratch;
+          }
+        }
+        if (success && !ctp::compress::preprocess::DequantizeDevice(
+                codec_dst, quant_elems, stored_quant_params, deq_dst)) {
           HLOG(kError,
                "Decompress: dequantization failed for blob '{}' (elems={} "
                "precision={}) -- the returned buffer would be quantized "
@@ -3487,8 +3589,15 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
                task->blob_name_.str(), quant_elems,
                stored_quant_params.precision);
           success = false;
-        } else {
+        } else if (success) {
+          if (deq_scratch != nullptr) {
+            ctp::DeviceAwareMemcpy(output_fullptr.ptr_, deq_scratch,
+                                   original_size);
+          }
           decompressed_size = original_size;
+        }
+        if (!deq_scratch_alloc.IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, deq_scratch_alloc);
         }
       }
       if (!quant_scratch_alloc.IsNull()) {
@@ -3868,29 +3977,19 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   ctp::compress::preprocess::QuantizationResult quant_result;
   if (requested_quant && ctx.error_bound_ > 0.0 && size >= sizeof(float) &&
       (size % sizeof(float)) == 0) {
-    quant_result = ctp::compress::preprocess::Quantize<float>(
-        reinterpret_cast<const float *>(src), size / sizeof(float),
-        ctx.error_bound_);
-    if (!quant_result.quantized_.empty()) {
-      quant_staging.assign(quant_result.quantized_.begin(),
-                           quant_result.quantized_.end());
-      compress_src = quant_staging.data();
-      compress_size = quant_staging.size();
-      applied_quant = true;
-    }
+    // This path stages through host SHM by construction, and quantization is
+    // CUDA-only. Dropping the quantize bit silently would store lossless data
+    // under a header that claims a quantize action -- self-consistent, and not
+    // the action that was selected.
+    RefuseHostPreprocess("quantization", size);
+    return false;
   }
 
   std::vector<char> shuffle_staging;
   uint32_t applied_shuffle = 0;
   if (requested_shuffle != 0) {
-    shuffle_staging.resize(compress_size);
-    if (ctp::compress::preprocess::ByteShuffle(
-            reinterpret_cast<const uint8_t *>(compress_src), compress_size,
-            requested_shuffle,
-            reinterpret_cast<uint8_t *>(shuffle_staging.data()))) {
-      compress_src = shuffle_staging.data();
-      applied_shuffle = requested_shuffle;
-    }
+    RefuseHostPreprocess("byte shuffle", compress_size);
+    return false;
     // On failure compress_src is untouched and applied_shuffle stays 0, so
     // the header records "not shuffled" and the read side does nothing.
   }
@@ -4067,45 +4166,22 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   }
 
   // Invert the byte-shuffle before the caller sees the buffer. dst is a host
-  // buffer on this path (the interposer stages through SHM), so the host
-  // routines apply. Failing is the only safe outcome: returning shuffled
-  // bytes is silent corruption, since they are the right LENGTH.
+  // buffer on this path (the interposer stages through SHM) and the inverse is
+  // CUDA-only, so this blob cannot be served here. Failing is the only safe
+  // outcome: returning shuffled bytes is silent corruption, since they are the
+  // right LENGTH.
   if (stored_shuffle != 0) {
-    std::vector<char> unshuffled(decompressed);
-    if (!ctp::compress::preprocess::ByteUnshuffle(
-            reinterpret_cast<const uint8_t *>(codec_dst), decompressed,
-            stored_shuffle, reinterpret_cast<uint8_t *>(unshuffled.data()))) {
-      HLOG(kError,
-           "DecompressStored: byte-unshuffle failed (elem={} size={}) -- the "
-           "returned buffer would be shuffled garbage, failing instead",
-           stored_shuffle, decompressed);
-      return 5;
-    }
-    std::memcpy(codec_dst, unshuffled.data(), decompressed);
+    RefuseHostPreprocess("byte unshuffle", decompressed);
+    return 5;
   }
 
-  // Dequantize LAST, inverting quantize-then-shuffle.
+  // Dequantize LAST, inverting quantize-then-shuffle. CUDA-only, and this
+  // path's destination is host SHM, so a quantized blob cannot be served
+  // here either -- returning the packed integers would be corruption of
+  // exactly the kind the shuffle check above refuses.
   if (stored_quant) {
-    ctp::compress::preprocess::QuantizationResult qr;
-    qr.quantized_.assign(quant_staging.begin(), quant_staging.end());
-    qr.precision_ = UnpackQuantPrecision(header->compress_preset_);
-    qr.scale_ = stored_ext.scale;
-    qr.data_min_ = stored_ext.data_min;
-    qr.data_max_ = stored_ext.data_max;
-    qr.effective_error_bound_ = stored_ext.error_bound;
-    qr.num_elements_ = quant_elems;
-    std::vector<float> restored =
-        ctp::compress::preprocess::Dequantize<float>(qr);
-    if (restored.size() != quant_elems) {
-      HLOG(kError,
-           "DecompressStored: dequantization failed (elems={} precision={}) "
-           "-- the returned buffer would be quantized integers, failing "
-           "instead",
-           quant_elems, qr.precision_);
-      return 5;
-    }
-    std::memcpy(dst, restored.data(), restored.size() * sizeof(float));
-    decompressed = header->original_size_;
+    RefuseHostPreprocess("dequantization", decompressed);
+    return 5;
   }
 
   *out_size = decompressed;

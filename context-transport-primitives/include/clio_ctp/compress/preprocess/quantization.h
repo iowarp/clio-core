@@ -107,165 +107,17 @@ inline int ComputeRequiredPrecision(double data_range,
   return 32;
 }
 
-/**
- * @brief Quantize floating-point data with error bounds.
+/* Quantize<T>() / Dequantize<T>() -- the CPU implementations -- were REMOVED,
+ * for the reason given in byte_shuffle.h: NeuroPress preprocessing is
+ * CUDA-only, and a working CPU mirror turned "the GPU path" into something a
+ * host-resident chunk silently opted out of.
  *
- * Applies linear quantization: q = round(value / (2 * error_bound)).
- * Automatically selects output precision based on data range.
- *
- * Template parameter T: float or double (input type)
- *
- * @param data           Pointer to input data (float or double)
- * @param num_elements   Number of elements
- * @param error_bound    Absolute error tolerance (must be > 0)
- * @return QuantizationResult with quantized data and metadata
+ * Use QuantizeDevice() / DequantizeDevice() below. QuantizationResult is kept
+ * because it still describes what those write into the blob header.
  */
-template <typename T>
-QuantizationResult Quantize(const T* data,
-                            size_t num_elements,
-                            double error_bound) {
-  QuantizationResult result;
 
-  if (!data || num_elements == 0 || error_bound <= 0.0) {
-    return result;
-  }
 
-  // Compute data range
-  T min_val = data[0];
-  T max_val = data[0];
-  for (size_t i = 1; i < num_elements; ++i) {
-    if (data[i] < min_val) min_val = data[i];
-    if (data[i] > max_val) max_val = data[i];
-  }
 
-  const double data_min = static_cast<double>(min_val);
-  const double data_max = static_cast<double>(max_val);
-  // Constant data gets upstream's substituted range, not the degenerate 0
-  // (quantization_kernels.cu:408-411) -- see the same clamp, and why it
-  // changes the selected precision, in QuantizeDevice
-  // (data_stats_gpu_kernels.cu). This path has to agree with that one about
-  // how a blob is encoded, so the derivation stays shared.
-  double data_range = data_max - data_min;
-  if (data_range <= 0.0) data_range = 1.0;
-
-  // ---- Effective error bound (quantization_kernels.cu:418-473) ----
-  // The user's bound has to cover BOTH the quantization step and the error
-  // of representing the reconstructed value back in float. Spending all of
-  // it on quantization means the round trip can exceed the bound this
-  // header promises. Upstream reserves the float32 representation error and
-  // a 5% margin, then floors the result so the quantized values cannot
-  // overflow int32.
-  const double max_abs_value = std::max(std::fabs(data_min), std::fabs(data_max));
-  const double float_repr_error = max_abs_value * 2.4e-7;
-  const double safety_margin = error_bound * 0.05;
-  const double available_for_quant = error_bound - float_repr_error - safety_margin;
-  const double min_eb_for_int32 = data_range / 4.0e9;
-
-  double effective_eb;
-  if (available_for_quant <= 0.0) {
-    // Bound is below what float32 can represent over this range: fall back
-    // to the tightest still-safe value rather than producing garbage.
-    effective_eb = std::max(min_eb_for_int32, float_repr_error * 0.1);
-    result.bound_achievable_ = false;
-  } else {
-    effective_eb = available_for_quant;
-  }
-  effective_eb = std::max(effective_eb, min_eb_for_int32);
-  if (effective_eb <= 0.0) return QuantizationResult();
-
-  // Precision is chosen from the EFFECTIVE bound, so the width can actually
-  // hold every quantized value.
-  const int precision = ComputeRequiredPrecision(data_range, effective_eb);
-  const double scale = 1.0 / (2.0 * effective_eb);
-  const size_t width = PrecisionToBytes(precision);
-
-  // Quantize: q = round((value - min) * scale), clamped to the width.
-  // Upstream clamps in-kernel (quantization_kernels.cu:70-77); without it a
-  // value outside the type's range is an out-of-range float->int conversion,
-  // which is undefined behavior rather than a saturated result.
-  result.quantized_.resize(num_elements * width);
-  for (size_t i = 0; i < num_elements; ++i) {
-    const double centered = static_cast<double>(data[i]) - data_min;
-    double q = std::round(centered * scale);
-    uint8_t* slot = result.quantized_.data() + i * width;
-    if (width == 1) {
-      q = std::max(-128.0, std::min(127.0, q));
-      const int8_t v = static_cast<int8_t>(q);
-      std::memcpy(slot, &v, sizeof(v));
-    } else if (width == 2) {
-      q = std::max(-32768.0, std::min(32767.0, q));
-      const int16_t v = static_cast<int16_t>(q);
-      std::memcpy(slot, &v, sizeof(v));
-    } else {
-      q = std::max(-2147483648.0, std::min(2147483647.0, q));
-      const int32_t v = static_cast<int32_t>(q);
-      std::memcpy(slot, &v, sizeof(v));
-    }
-  }
-
-  result.error_bound_ = error_bound;
-  result.effective_error_bound_ = effective_eb;
-  result.data_min_ = data_min;
-  result.data_max_ = data_max;
-  result.scale_ = scale;
-  result.precision_ = precision;
-  result.num_elements_ = num_elements;
-
-  return result;
-}
-
-/**
- * @brief Dequantize back to floating-point with error bound guarantee.
- *
- * Reverses quantization using metadata from QuantizationResult.
- * Reconstructed value = (q / scale) + min, with error <= error_bound.
- *
- * Template parameter T: float or double (output type)
- *
- * @param result   QuantizationResult from Quantize()
- * @return Vector of reconstructed floating-point values
- */
-template <typename T>
-std::vector<T> Dequantize(const QuantizationResult& result) {
-  std::vector<T> output;
-
-  if (result.quantized_.empty() || result.scale_ <= 0.0 ||
-      result.num_elements_ == 0) {
-    return output;
-  }
-
-  // restored = q * (2 * effective_eb) + data_min -- the exact inverse of the
-  // forward pass, and identical to upstream's dequantize_linear_kernel
-  // (quantization_kernels.cu:83-99), which takes inv_scale = 2*effective_eb
-  // and offset = data_min.
-  const double inv_scale = 1.0 / result.scale_;
-  const size_t width = PrecisionToBytes(result.precision_);
-  if (result.quantized_.size() < result.num_elements_ * width) {
-    return output;
-  }
-
-  output.reserve(result.num_elements_);
-  for (size_t i = 0; i < result.num_elements_; ++i) {
-    const uint8_t* slot = result.quantized_.data() + i * width;
-    double q = 0.0;
-    if (width == 1) {
-      int8_t v = 0;
-      std::memcpy(&v, slot, sizeof(v));
-      q = static_cast<double>(v);
-    } else if (width == 2) {
-      int16_t v = 0;
-      std::memcpy(&v, slot, sizeof(v));
-      q = static_cast<double>(v);
-    } else {
-      int32_t v = 0;
-      std::memcpy(&v, slot, sizeof(v));
-      q = static_cast<double>(v);
-    }
-    output.push_back(static_cast<T>(q * inv_scale + result.data_min_));
-  }
-
-  return output;
-}
 
 /**
  * @brief Parameters a reader needs to invert a device quantization.

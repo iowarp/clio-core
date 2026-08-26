@@ -45,36 +45,6 @@ TEST_CASE("FeatureExtractor populates statistics for float data") {
   REQUIRE(f.config_best == 0.0);
 }
 
-TEST_CASE("Quantize/Dequantize round-trips within the error bound") {
-  std::vector<double> vals(512);
-  for (size_t i = 0; i < vals.size(); ++i) {
-    vals[i] = static_cast<double>(i) * 0.1 - 25.6;
-  }
-  const double error_bound = 0.05;
-
-  auto qr = Quantize<double>(vals.data(), vals.size(), error_bound);
-  auto rec = Dequantize<double>(qr);
-
-  REQUIRE(rec.size() == vals.size());
-  for (size_t i = 0; i < vals.size(); ++i) {
-    REQUIRE(std::abs(rec[i] - vals[i]) <= error_bound + 1e-9);
-  }
-}
-
-TEST_CASE("ByteShuffle/ByteUnshuffle is a lossless round-trip") {
-  for (size_t elem_size : {2u, 4u, 8u}) {
-    std::vector<uint8_t> bytes(elem_size * 300);
-    for (size_t i = 0; i < bytes.size(); ++i) {
-      bytes[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
-    }
-    auto shuffled = ByteShuffleVector(bytes.data(), bytes.size(), elem_size);
-    REQUIRE(shuffled.size() == bytes.size());
-    auto restored = ByteUnshuffleVector(shuffled.data(), shuffled.size(),
-                                        elem_size);
-    REQUIRE(restored == bytes);
-  }
-}
-
 /**
  * The case above uses elem_size * 300 -- always an exact multiple of the
  * element, and always 2,400 bytes, which is one kShuffleChunkBytes block. So
@@ -88,35 +58,9 @@ TEST_CASE("ByteShuffle/ByteUnshuffle is a lossless round-trip") {
  * NeuroPress checkout, which is most builds. This pins the host round-trip
  * unconditionally so a plain build cannot regress it silently.
  */
-TEST_CASE("ByteShuffle round-trips across block edges and partial elements") {
-  constexpr size_t kBlock = 256 * 1024;  // kShuffleChunkBytes
-  const std::vector<size_t> sizes = {
-      1, 2, 3, 5, 7, 9, 15, 17, 31, 33, 127, 129,   // sub-element and ragged
-      1000, 1001, 1023, 1024, 1025,
-      kBlock - 1, kBlock, kBlock + 1, kBlock + 7,   // the block edge
-      2 * kBlock, 2 * kBlock + 3, 4 * kBlock,       // multi-block
-      318208,                                       // a real LAMMPS tail chunk
-      1048576 - 1, 1048576, 1048576 + 1};           // the VOL's chunk size
 
-  size_t with_partial_element = 0;
-  for (size_t elem_size : {size_t(2), size_t(4), size_t(8)}) {
-    for (size_t n : sizes) {
-      std::vector<uint8_t> bytes(n);
-      for (size_t i = 0; i < n; ++i) {
-        bytes[i] = static_cast<uint8_t>((i * 131u + elem_size * 7u + 3u) & 0xFF);
-      }
-      auto shuffled = ByteShuffleVector(bytes.data(), n, elem_size);
-      REQUIRE(shuffled.size() == n);
-      auto restored = ByteUnshuffleVector(shuffled.data(), n, elem_size);
-      REQUIRE(restored == bytes);
-
-      for (size_t base = 0; base < n; base += kBlock) {
-        const size_t chunk = std::min(kBlock, n - base);
-        if (chunk % elem_size != 0) { ++with_partial_element; break; }
-      }
-    }
-  }
-  // Guards the guard: if a future change to the size list stopped producing
-  // ragged blocks, this case would still pass while testing nothing new.
-  REQUIRE(with_partial_element > 0);
-}
+/* The CPU Quantize/Dequantize and ByteShuffle/ByteUnshuffle round-trip cases
+ * were removed with the implementations they covered. NeuroPress preprocessing
+ * is CUDA-only, matching upstream; the device kernels are covered by
+ * test_data_stats_gpu.cc and, against upstream itself, by
+ * model/parity/neuropress_preprocess_parity.cu. */

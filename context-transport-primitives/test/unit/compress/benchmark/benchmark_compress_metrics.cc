@@ -142,11 +142,15 @@ static std::string RunCompressionTrial(
   const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(data.data());
 
   if (byte_shuffle) {
-    shuffled_copy = ByteShuffleVector(data_ptr, input_size, sizeof(float));
-    if (shuffled_copy.empty()) {
-      return "";  // Shuffle failed
-    }
-    to_compress = shuffled_copy;
+    // The CPU byte shuffle was removed: NeuroPress preprocessing is CUDA-only,
+    // and a host mirror let a host-resident chunk silently skip the GPU. This
+    // benchmark measures CPU codecs, so it has no device buffer to shuffle --
+    // refuse the option rather than quietly report unshuffled numbers under a
+    // shuffled label.
+    std::fprintf(stderr,
+                 "benchmark_compress_metrics: --byte-shuffle is no longer "
+                 "supported; the CPU byte shuffle was removed (CUDA-only).\n");
+    return "";
   } else {
     to_compress.assign(data_ptr, data_ptr + input_size);
   }
@@ -191,15 +195,7 @@ static std::string RunCompressionTrial(
   // If byte-shuffled, unshuffle to validate round-trip.
   int success = 1;
   if (byte_shuffle) {
-    std::vector<uint8_t> unshuffled = ByteUnshuffleVector(
-        decompressed.data(), input_size, sizeof(float));
-    if (unshuffled.empty()) {
-      return "";  // Unshuffle failed
-    }
-    // Verify round-trip matches original
-    if (std::memcmp(unshuffled.data(), data_ptr, input_size) != 0) {
-      success = 0;  // Mismatch in round-trip
-    }
+    return "";  // unreachable: refused above
   } else {
     // For non-shuffled, verify decompressed matches original
     if (std::memcmp(decompressed.data(), data_ptr, input_size) != 0) {

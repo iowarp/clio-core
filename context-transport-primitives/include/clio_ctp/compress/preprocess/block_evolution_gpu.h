@@ -164,16 +164,9 @@ bool ComputeBlockEvolutionDevice(const void *d_prev, const void *d_curr,
                                  double epsilon, void *stream,
                                  BlockEvolution *out);
 
-/**
- * The same metric on host-resident buffers, in double precision.
- *
- * Not a fallback for the device path -- it is the reference the GPU kernel is
- * tested against, and the implementation used when a workload hands over host
- * memory. Same NaN/Inf handling, same epsilon, same statuses.
- */
-bool ComputeBlockEvolutionHost(const void *prev, const void *curr,
-                               size_t num_elements, DataType type,
-                               double epsilon, BlockEvolution *out);
+/* ComputeBlockEvolutionHost() was REMOVED -- this metric is CUDA-only, like
+   the byte shuffle and the quantizer. See block_evolution.cc. */
+
 
 /**
  * Retains the previous SAMPLED timestep per block, so the kernel above has a

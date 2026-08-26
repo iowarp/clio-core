@@ -252,6 +252,10 @@ paper-benchmark/vpic/build_deck.log
 # VPIC writes its own energy diagnostic into the working directory on every
 # run; it is simulation output, not source.
 paper-benchmark/vpic/energies
+# VPIC writes its `energies` table into the directory it is RUN from, not its
+# deck's, so an in-situ run started from the example dir or the repo root drops
+# one there instead. Simulation output wherever it lands, never source.
+**/energies
 # WarpX writes openPMD output and per-run stores under results/.
 paper-benchmark/warpx/results/
 # Gray-Scott writes its HDF5, its reference dump and per-run stores under

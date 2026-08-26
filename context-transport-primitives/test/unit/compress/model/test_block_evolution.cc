@@ -43,6 +43,27 @@ std::vector<float> Constant(size_t n, float v) {
 
 }  // namespace
 
+
+/** Upload two host blocks and run the DEVICE metric on them.
+ *
+ * ComputeBlockEvolutionHost() was removed -- the metric is CUDA-only now -- but
+ * the closed-form and non-finite cases below check MATH, not which side ran it,
+ * so they are kept and pointed at the device kernel through this.
+ */
+static bool EvoOnDevice(const float *b1, const float *b2, size_t n,
+                        double epsilon, ctp::BlockEvolution *out) {
+  float *d1 = ctp::GpuApi::Malloc<float>(n * sizeof(float));
+  float *d2 = ctp::GpuApi::Malloc<float>(n * sizeof(float));
+  if (d1 == nullptr || d2 == nullptr) return false;
+  ctp::GpuApi::Memcpy(d1, b1, n * sizeof(float));
+  ctp::GpuApi::Memcpy(d2, b2, n * sizeof(float));
+  const bool ok = ctp::ComputeBlockEvolutionDevice(
+      d1, d2, n, ctp::DataType::FLOAT32, epsilon, nullptr, out);
+  ctp::GpuApi::Free(d1);
+  ctp::GpuApi::Free(d2);
+  return ok;
+}
+
 TEST_CASE("BlockEvolutionHostClosedForm") {
   const size_t n = 4096;
 
@@ -53,8 +74,7 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
     auto b1 = Constant(n, 1.0f);
     auto b2 = Constant(n, 2.0f);
     ctp::BlockEvolution e;
-    REQUIRE(ctp::ComputeBlockEvolutionHost(b1.data(), b2.data(), n,
-                                           ctp::DataType::FLOAT32, kEps, &e));
+    REQUIRE(EvoOnDevice(b1.data(), b2.data(), n, kEps, &e));
     REQUIRE(Close(e.absolute_change, std::sqrt((double)n), 1e-12));
     REQUIRE(Close(e.normalized_change, 1.0 / 3.0, 1e-12));
     REQUIRE(e.elements_compared == n);
@@ -65,8 +85,7 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
   {
     auto b = Constant(n, 7.5f);
     ctp::BlockEvolution e;
-    REQUIRE(ctp::ComputeBlockEvolutionHost(b.data(), b.data(), n,
-                                           ctp::DataType::FLOAT32, kEps, &e));
+    REQUIRE(EvoOnDevice(b.data(), b.data(), n, kEps, &e));
     REQUIRE(e.absolute_change == 0.0);
     REQUIRE(e.normalized_change == 0.0);
   }
@@ -76,8 +95,7 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
   {
     auto z = Constant(n, 0.0f);
     ctp::BlockEvolution e;
-    REQUIRE(ctp::ComputeBlockEvolutionHost(z.data(), z.data(), n,
-                                           ctp::DataType::FLOAT32, kEps, &e));
+    REQUIRE(EvoOnDevice(z.data(), z.data(), n, kEps, &e));
     REQUIRE(std::isfinite(e.normalized_change));
     REQUIRE(e.normalized_change == 0.0);
     REQUIRE(e.b1_norm == 0.0);
@@ -90,10 +108,8 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
     ctp::BlockEvolution big, small;
     auto a1 = Constant(n, 1e9f), a2 = Constant(n, 2e9f);
     auto c1 = Constant(n, 1e-9f), c2 = Constant(n, 2e-9f);
-    REQUIRE(ctp::ComputeBlockEvolutionHost(a1.data(), a2.data(), n,
-                                           ctp::DataType::FLOAT32, kEps, &big));
-    REQUIRE(ctp::ComputeBlockEvolutionHost(c1.data(), c2.data(), n,
-                                           ctp::DataType::FLOAT32, kEps,
+    REQUIRE(EvoOnDevice(a1.data(), a2.data(), n, kEps, &big));
+    REQUIRE(EvoOnDevice(c1.data(), c2.data(), n, kEps,
                                            &small));
     REQUIRE(Close(big.normalized_change, small.normalized_change, 1e-9));
     REQUIRE(Close(small.normalized_change, 1.0 / 3.0, 1e-6));
@@ -106,8 +122,7 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
   {
     auto s1 = Constant(n, 1e-15f), s2 = Constant(n, 2e-15f);
     ctp::BlockEvolution e;
-    REQUIRE(ctp::ComputeBlockEvolutionHost(s1.data(), s2.data(), n,
-                                           ctp::DataType::FLOAT32, kEps, &e));
+    REQUIRE(EvoOnDevice(s1.data(), s2.data(), n, kEps, &e));
     REQUIRE(Close(e.normalized_change, 1.0 / 3.0, 1e-6));
   }
 
@@ -117,11 +132,9 @@ TEST_CASE("BlockEvolutionHostClosedForm") {
     ctp::BlockEvolution quiet, loud;
     auto near = Constant(n, 1.01f);
     auto far = Constant(n, 5.0f);
-    REQUIRE(ctp::ComputeBlockEvolutionHost(b1.data(), near.data(), n,
-                                           ctp::DataType::FLOAT32, kEps,
+    REQUIRE(EvoOnDevice(b1.data(), near.data(), n, kEps,
                                            &quiet));
-    REQUIRE(ctp::ComputeBlockEvolutionHost(b1.data(), far.data(), n,
-                                           ctp::DataType::FLOAT32, kEps,
+    REQUIRE(EvoOnDevice(b1.data(), far.data(), n, kEps,
                                            &loud));
     REQUIRE(quiet.normalized_change < loud.normalized_change);
     REQUIRE(quiet.normalized_change < 0.01);
@@ -137,8 +150,7 @@ TEST_CASE("BlockEvolutionNonFinite") {
   b1[30] = -std::numeric_limits<float>::infinity();
 
   ctp::BlockEvolution e;
-  REQUIRE(ctp::ComputeBlockEvolutionHost(b1.data(), b2.data(), n,
-                                         ctp::DataType::FLOAT32, kEps, &e));
+  REQUIRE(EvoOnDevice(b1.data(), b2.data(), n, kEps, &e));
   // The three poisoned pairs are excluded and counted; everything else still
   // reduces to the clean 1/3, rather than the whole block going NaN.
   REQUIRE(e.nonfinite_skipped == 3);
@@ -149,8 +161,8 @@ TEST_CASE("BlockEvolutionNonFinite") {
   // Every pair poisoned: nothing left to reduce over, and it says so.
   std::vector<float> all_nan(n, std::numeric_limits<float>::quiet_NaN());
   ctp::BlockEvolution dead;
-  REQUIRE_FALSE(ctp::ComputeBlockEvolutionHost(
-      all_nan.data(), all_nan.data(), n, ctp::DataType::FLOAT32, kEps, &dead));
+  REQUIRE_FALSE(EvoOnDevice(
+      all_nan.data(), all_nan.data(), n, kEps, &dead));
   REQUIRE(dead.status == ctp::BlockEvolutionStatus::kAllNonFinite);
 }
 
@@ -244,7 +256,11 @@ TEST_CASE("BlockEvolutionTrackerCapacity") {
  * device memory. Tolerance rather than equality: the kernel's tree reduction
  * and the host's serial loop sum the same terms in different orders.
  */
-TEST_CASE("BlockEvolutionDeviceMatchesHost") {
+/* Was "DeviceMatchesHost". The host implementation is gone, so the comparison
+   arm it was named for no longer exists; what remains is worth keeping on its
+   own terms -- the device kernel's non-finite handling and repeatability, with
+   the absolute expectations (2 skipped) that never depended on the host. */
+TEST_CASE("BlockEvolutionDeviceNonFiniteAndRepeatable") {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
     return;
@@ -263,8 +279,7 @@ TEST_CASE("BlockEvolutionDeviceMatchesHost") {
   b1[999] = std::numeric_limits<float>::infinity();
 
   ctp::BlockEvolution host;
-  REQUIRE(ctp::ComputeBlockEvolutionHost(b1.data(), b2.data(), n,
-                                         ctp::DataType::FLOAT32, kEps, &host));
+  REQUIRE(EvoOnDevice(b1.data(), b2.data(), n, kEps, &host));
 
   // GpuApi rather than raw cudaMalloc: this TU compiles as C++, not CUDA,
   // so the void** out-parameter would need a cast here. Same idiom as

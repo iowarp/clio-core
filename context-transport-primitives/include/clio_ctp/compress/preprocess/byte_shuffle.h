@@ -46,168 +46,21 @@ namespace ctp::compress::preprocess {
  */
 constexpr size_t kShuffleChunkBytes = 256 * 1024;
 
-/**
- * @brief Shuffle data from AoS (Array of Structures) to SoA by byte plane.
+/* ByteShuffle() / ByteUnshuffle() -- the CPU implementations -- were REMOVED.
  *
- * Reorganizes elem_size bytes of each element into separate planes.
- * Each byte position across all elements gets grouped together.
+ * NeuroPress preprocessing is CUDA-only, matching upstream, whose
+ * src/preprocessing/ contains nothing but byte_shuffle_kernels.cu and
+ * quantization_kernels.cu. Keeping a working CPU mirror here meant a
+ * host-resident chunk silently ran the transform on the CPU: same bytes out,
+ * different hardware, and nothing in the results to reveal it. Their absence
+ * is the guarantee -- a caller that needs the transform on host data no longer
+ * compiles, rather than quietly getting it.
  *
- * Supported elem_size: 2, 4, 8 bytes.
- *
- * Example (elem_size=4):
- *   Input:  [A0 A1 A2 A3][B0 B1 B2 B3][C0 C1 C2 C3]
- *   Output: [A0 B0 C0] [A1 B1 C1] [A2 B2 C2] [A3 B3 C3]
- *
- * @param input      Input buffer (AoS format)
- * @param num_bytes  Total input size in bytes
- * @param elem_size  Bytes per element (must be 2, 4, or 8)
- * @param output     Output buffer (must be at least num_bytes)
- * @return true on success, false if elem_size unsupported
+ * Use ByteShuffleDevice() / ByteUnshuffleDevice() below. Data that is not
+ * already device-resident must be refused (see
+ * CLIO_NEUROPRESS_REQUIRE_DEVICE) or staged H2D by the caller first.
  */
-inline bool ByteShuffle(const uint8_t* input,
-                        size_t num_bytes,
-                        size_t elem_size,
-                        uint8_t* output) {
-  if (!input || !output || num_bytes == 0) {
-    return false;
-  }
 
-  if (elem_size != 2 && elem_size != 4 && elem_size != 8) {
-    return false;
-  }
-
-  // A buffer shorter than one element is NOT an error: NeuroPress's
-  // byte_shuffle_simple handles it as num_elements = 0, leftover = the whole
-  // buffer, and copies it verbatim (byte_shuffle_kernels.cu:33-65). The loop
-  // below does the same, so nothing special is needed -- but the guard that
-  // used to reject it here would have made Compress() decline a shuffle
-  // upstream would have performed and recorded.
-
-  // Planes are built WITHIN each kShuffleChunkBytes block, not across the
-  // whole buffer -- see the constant's docs. Blocks are independent, so the
-  // inverse is the same walk.
-  for (size_t base = 0; base < num_bytes; base += kShuffleChunkBytes) {
-    const size_t chunk = std::min(kShuffleChunkBytes, num_bytes - base);
-    const uint8_t* in = input + base;
-    uint8_t* out = output + base;
-    const size_t num_elements = chunk / elem_size;
-    const size_t leftover = chunk % elem_size;
-
-    for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
-      for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
-        out[byte_idx * num_elements + elem_idx] =
-            in[elem_idx * elem_size + byte_idx];
-      }
-    }
-    // Trailing partial element is copied verbatim, matching
-    // byte_shuffle_kernels.cu:59-65. Dropping it (as this did before) left
-    // the caller's tail bytes untouched -- silent corruption on round trip,
-    // since the length was still right.
-    for (size_t i = 0; i < leftover; ++i) {
-      out[elem_size * num_elements + i] = in[elem_size * num_elements + i];
-    }
-  }
-
-  return true;
-}
-
-/**
- * @brief Unshuffle data from SoA (Structure of Arrays) back to AoS.
- *
- * Reverses ByteShuffle: reconstructs AoS layout from byte planes.
- *
- * Supported elem_size: 2, 4, 8 bytes.
- *
- * Example (elem_size=4):
- *   Input:  [A0 B0 C0] [A1 B1 C1] [A2 B2 C2] [A3 B3 C3]
- *   Output: [A0 A1 A2 A3][B0 B1 B2 B3][C0 C1 C2 C3]
- *
- * @param input      Input buffer (SoA format, shuffled)
- * @param num_bytes  Total input size in bytes
- * @param elem_size  Bytes per element (must be 2, 4, or 8)
- * @param output     Output buffer (must be at least num_bytes)
- * @return true on success, false if elem_size unsupported
- */
-inline bool ByteUnshuffle(const uint8_t* input,
-                          size_t num_bytes,
-                          size_t elem_size,
-                          uint8_t* output) {
-  if (!input || !output || num_bytes == 0) {
-    return false;
-  }
-
-  if (elem_size != 2 && elem_size != 4 && elem_size != 8) {
-    return false;
-  }
-
-  // A buffer shorter than one element is NOT an error: NeuroPress's
-  // byte_shuffle_simple handles it as num_elements = 0, leftover = the whole
-  // buffer, and copies it verbatim (byte_shuffle_kernels.cu:33-65). The loop
-  // below does the same, so nothing special is needed -- but the guard that
-  // used to reject it here would have made Compress() decline a shuffle
-  // upstream would have performed and recorded.
-
-  // Exact inverse of ByteShuffle's per-block walk above.
-  for (size_t base = 0; base < num_bytes; base += kShuffleChunkBytes) {
-    const size_t chunk = std::min(kShuffleChunkBytes, num_bytes - base);
-    const uint8_t* in = input + base;
-    uint8_t* out = output + base;
-    const size_t num_elements = chunk / elem_size;
-    const size_t leftover = chunk % elem_size;
-
-    for (size_t byte_idx = 0; byte_idx < elem_size; ++byte_idx) {
-      for (size_t elem_idx = 0; elem_idx < num_elements; ++elem_idx) {
-        out[elem_idx * elem_size + byte_idx] =
-            in[byte_idx * num_elements + elem_idx];
-      }
-    }
-    for (size_t i = 0; i < leftover; ++i) {
-      out[elem_size * num_elements + i] = in[elem_size * num_elements + i];
-    }
-  }
-
-  return true;
-}
-
-/**
- * @brief Shuffle with vector allocation (convenience wrapper).
- *
- * Allocates output vector and performs ByteShuffle.
- *
- * @param input      Input buffer (AoS format)
- * @param num_bytes  Total input size in bytes
- * @param elem_size  Bytes per element (must be 2, 4, or 8)
- * @return Shuffled data vector; empty if elem_size unsupported
- */
-inline std::vector<uint8_t> ByteShuffleVector(const uint8_t* input,
-                                               size_t num_bytes,
-                                               size_t elem_size) {
-  std::vector<uint8_t> output(num_bytes);
-  if (ByteShuffle(input, num_bytes, elem_size, output.data())) {
-    return output;
-  }
-  return std::vector<uint8_t>();
-}
-
-/**
- * @brief Unshuffle with vector allocation (convenience wrapper).
- *
- * Allocates output vector and performs ByteUnshuffle.
- *
- * @param input      Input buffer (SoA format)
- * @param num_bytes  Total input size in bytes
- * @param elem_size  Bytes per element (must be 2, 4, or 8)
- * @return Unshuffled data vector; empty if elem_size unsupported
- */
-inline std::vector<uint8_t> ByteUnshuffleVector(const uint8_t* input,
-                                                 size_t num_bytes,
-                                                 size_t elem_size) {
-  std::vector<uint8_t> output(num_bytes);
-  if (ByteUnshuffle(input, num_bytes, elem_size, output.data())) {
-    return output;
-  }
-  return std::vector<uint8_t>();
-}
 
 /**
  * @brief Device byte-shuffle: device pointer in, device pointer out.

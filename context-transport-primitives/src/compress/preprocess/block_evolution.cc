@@ -26,84 +26,22 @@
 namespace ctp {
 namespace {
 
-/** Kahan-free double accumulation, matching the device kernel exactly: the
-    kernel's per-block tree reduction and this serial loop differ only in
-    summation order, which is why the test compares them with a relative
-    tolerance rather than bit-for-bit. */
-template <typename T>
-void AccumulateTyped(const T *b1, const T *b2, size_t n, double *sum_d2,
-                     double *sum_n1, double *sum_n2,
-                     unsigned long long *bad) {
-  double d2 = 0.0, n1 = 0.0, n2 = 0.0;
-  unsigned long long skipped = 0;
-  for (size_t i = 0; i < n; ++i) {
-    const double x1 = static_cast<double>(b1[i]);
-    const double x2 = static_cast<double>(b2[i]);
-    if (!std::isfinite(x1) || !std::isfinite(x2)) {
-      ++skipped;
-      continue;
-    }
-    const double d = x2 - x1;
-    d2 += d * d;
-    n1 += x1 * x1;
-    n2 += x2 * x2;
-  }
-  *sum_d2 = d2;
-  *sum_n1 = n1;
-  *sum_n2 = n2;
-  *bad = skipped;
-}
+
 
 }  // namespace
 
-bool ComputeBlockEvolutionHost(const void *prev, const void *curr,
-                               size_t num_elements, DataType type,
-                               double epsilon, BlockEvolution *out) {
-  if (out == nullptr) return false;
-  *out = BlockEvolution{};
-  if (prev == nullptr || curr == nullptr || num_elements == 0) return false;
+/* ComputeBlockEvolutionHost() was REMOVED.
+ *
+ * The block-evolution metric is a NeuroPress preprocessing input, and it used
+ * to be computed on whichever side the buffer happened to live: the caller
+ * below chose between the device kernel and a host loop by residency, so a
+ * host-resident chunk silently produced the metric on the CPU. Same number,
+ * different hardware, nothing downstream to reveal it.
+ *
+ * Preprocessing is CUDA-only now -- as with the byte shuffle and the
+ * quantizer, and as upstream is throughout. A host-resident chunk is refused.
+ */
 
-  double d2 = 0.0, n1 = 0.0, n2 = 0.0;
-  unsigned long long bad = 0;
-  switch (type) {
-    case DataType::FLOAT32:
-      AccumulateTyped(static_cast<const float *>(prev),
-                      static_cast<const float *>(curr), num_elements, &d2, &n1,
-                      &n2, &bad);
-      break;
-    case DataType::DOUBLE64:
-      AccumulateTyped(static_cast<const double *>(prev),
-                      static_cast<const double *>(curr), num_elements, &d2,
-                      &n1, &n2, &bad);
-      break;
-    case DataType::INT32:
-      AccumulateTyped(static_cast<const int32_t *>(prev),
-                      static_cast<const int32_t *>(curr), num_elements, &d2,
-                      &n1, &n2, &bad);
-      break;
-    case DataType::UINT8:
-      AccumulateTyped(static_cast<const uint8_t *>(prev),
-                      static_cast<const uint8_t *>(curr), num_elements, &d2,
-                      &n1, &n2, &bad);
-      break;
-    default:
-      return false;
-  }
-
-  const double d = std::sqrt(d2);
-  const double b1n = std::sqrt(n1);
-  const double b2n = std::sqrt(n2);
-  out->absolute_change = d;
-  out->b1_norm = b1n;
-  out->b2_norm = b2n;
-  out->normalized_change = d / (b1n + b2n + epsilon);
-  out->nonfinite_skipped = bad;
-  out->elements_compared = num_elements - bad;
-  out->status = (out->elements_compared == 0)
-                    ? BlockEvolutionStatus::kAllNonFinite
-                    : BlockEvolutionStatus::kOk;
-  return out->status == BlockEvolutionStatus::kOk;
-}
 
 #if !defined(CTP_ENABLE_CUDA) || !CTP_ENABLE_CUDA
 namespace detail {
@@ -279,11 +217,18 @@ bool BlockEvolutionTracker::Observe(const std::string &block_key,
 
   // --- compare, then advance the retained block ----------------------------
   const long long delta_t = timestep - e.timestep;
-  const bool ok = on_device
-                      ? ComputeBlockEvolutionDevice(e.buf, chunk, num_elements,
-                                                    type, epsilon_, stream, out)
-                      : ComputeBlockEvolutionHost(e.buf, chunk, num_elements,
-                                                  type, epsilon_, out);
+  // CUDA-only, like every other NeuroPress preprocessing step. Refuse a
+  // host-resident chunk rather than measure it on the CPU: this metric feeds
+  // selection, so computing it elsewhere silently changes what the model is
+  // told without changing anything visible in the result.
+  bool ok = false;
+  if (on_device) {
+    ok = ComputeBlockEvolutionDevice(e.buf, chunk, num_elements, type,
+                                     epsilon_, stream, out);
+  } else {
+    out->status = BlockEvolutionStatus::kFailed;
+    return false;
+  }
   out->delta_t = delta_t;
   // Only meaningful across runs with different intervals; with a fixed one it
   // is normalized_change scaled by a constant.
