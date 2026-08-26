@@ -45,7 +45,7 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double pred_ratio, double pred_ct_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
                           double primary_cost, bool adopted,
-                          bool is_primary = false);
+                          bool is_primary = false, double dt_ms = -1.0);
 
 /** Hash of codec output, from Compress(); joined by blob name. stage is
  *  "primary" or "adopted" -- a chunk can appear twice and the LAST row is the

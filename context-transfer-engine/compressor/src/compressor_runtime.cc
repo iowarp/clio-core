@@ -1986,8 +1986,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // value either. Using each candidate's OWN predicted dt instead
             // let a difference the exploration never measured move the
             // ranking, and skewed the regret figure derived from it.
-            double alt_cost =
-                cost(alt_time_ms, predicted->decompress_time_ms_, alt_ratio);
+            // MEASURED dt when the sweep took one
+            // (CLIO_NEUROPRESS_EXPLORE_MEASURE_DT), otherwise the primary's
+            // prediction. The default is the prediction, which is upstream's
+            // behaviour and keeps dt CONSTANT across candidates so it cancels
+            // out of the ranking; with a measurement it becomes a real
+            // discriminator, and on this workload a large one -- the dt head
+            // under-predicts nvcomp-bitcomp by ~14x and compresses an 11x
+            // predicted spread into a 1.5x measured one.
+            const double alt_dt = (slot_ref.decomp_time_ms >= 0.0)
+                                      ? slot_ref.decomp_time_ms
+                                      : predicted->decompress_time_ms_;
+            double alt_cost = cost(alt_time_ms, alt_dt, alt_ratio);
             if (alt_cost < best_cost) {
               best_cost = alt_cost;
               // Adopt it. Upstream's only condition here is that the winner
@@ -2037,7 +2047,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                            alt_quant_params.data_min,
                                        alt_quant_params.effective_error_bound)
                       : -1.0,
-                  alt_cost, explore_rank});
+                  alt_cost, explore_rank, slot_ref.decomp_time_ms});
             }
             ++explore_rank;
 
@@ -2120,7 +2130,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 row.preset_id, row.quant, row.shuffle, row.pred_ratio,
                 row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
                 actual_cost, static_cast<int>(ri) == winner.row,
-                /*is_primary=*/false);
+                /*is_primary=*/false, row.dt_ms);
           }
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP

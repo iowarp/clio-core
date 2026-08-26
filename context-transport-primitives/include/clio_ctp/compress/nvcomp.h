@@ -325,6 +325,13 @@ class NvComp : public Compressor {
     size_t compressed_size = 0;  ///< valid after CompressFinish
     double kernel_ms = -1.0;     ///< valid after CompressFinish
 
+    // DecompressMeasure() only. Its destination buffer is freed as soon as
+    // the timing has been read, so the sweep's peak device memory grows by one
+    // chunk rather than by one per slot -- slots are not released until the
+    // whole sweep ends, so a per-slot buffer would be held K times over.
+    cudaEvent_t ev_dstart = nullptr, ev_dstop = nullptr;  ///< owned by the slot
+    double decomp_ms = -1.0;     ///< valid after DecompressMeasure; <0 = none
+
     AsyncSlot() = default;
     // The slot owns a stream, two events and possibly two device buffers, so
     // releasing is not optional and must not depend on the caller reaching a
@@ -476,6 +483,84 @@ class NvComp : public Compressor {
     }
   }
 
+  /**
+   * @brief Decompress this slot's OWN compressed output back, timed.
+   *
+   * Exploration measures ratio and compression time per candidate but has
+   * never had a decompression time: upstream substitutes the NN's prediction
+   * for every alternative (gpucompress_compress.cpp, "decomp_time uses NN
+   * prediction (no decomp at write)"), so the cost model's dt term is a
+   * constant that cancels out of the ranking. This produces the real number.
+   *
+   * Call AFTER CompressFinish, BEFORE ReleaseSlot. The compressed bytes are
+   * still in slot->d_out and the slot still owns its stream.
+   *
+   * TWO THINGS ARE DELIBERATELY OUTSIDE THE TIMED WINDOW, and they are what
+   * make the result comparable to the compression time beside it:
+   *
+   *   create_manager parses the NVCOMP_NATIVE header and SYNCS the stream. The
+   *   bitstream is self-describing so the compressing manager cannot be
+   *   reused, and building one is construction, not decompression -- on a cold
+   *   codec it costs more than the decompression it precedes. CompressLaunch
+   *   brackets only mgr->compress() for the same reason, so bracketing only
+   *   mgr->decompress() keeps ct and dt the same KIND of quantity.
+   *
+   *   The destination allocation, likewise.
+   *
+   * @param expect_size Original chunk size; a header claiming anything else
+   *   means the compressed bytes are not this candidate's, and the slot is
+   *   refused rather than timed.
+   * @return true if decomp_ms holds a measurement.
+   */
+  bool DecompressMeasure(AsyncSlot *slot, size_t expect_size) {
+    if (!slot || !slot->stream || !slot->d_out || slot->compressed_size == 0) {
+      return false;
+    }
+    slot->decomp_ms = -1.0;
+    uint8_t *d_decomp = nullptr;
+    bool ok = false;
+    try {
+      std::shared_ptr<nvcomp::nvcompManagerBase> dmgr =
+          nvcomp::create_manager(slot->d_out, slot->stream);
+      if (dmgr) {
+        InstallScratchAllocators(dmgr);
+        nvcomp::DecompressionConfig dcfg =
+            dmgr->configure_decompression(slot->d_out);
+        if (dcfg.decomp_data_size == expect_size &&
+            cudaMalloc(&d_decomp, dcfg.decomp_data_size) == cudaSuccess &&
+            (slot->ev_dstart != nullptr ||
+             cudaEventCreate(&slot->ev_dstart) == cudaSuccess) &&
+            (slot->ev_dstop != nullptr ||
+             cudaEventCreate(&slot->ev_dstop) == cudaSuccess)) {
+          cudaGetLastError();
+          ScratchOom();  // clear
+          if (cudaEventRecord(slot->ev_dstart, slot->stream) == cudaSuccess) {
+            dmgr->decompress(d_decomp, slot->d_out, dcfg);
+            // Same launch check Compress()/CompressLaunch() make: kernels that
+            // never ran would otherwise be timed as an extremely fast codec.
+            if (cudaPeekAtLastError() == cudaSuccess && !ScratchOom() &&
+                cudaEventRecord(slot->ev_dstop, slot->stream) == cudaSuccess &&
+                cudaStreamSynchronize(slot->stream) == cudaSuccess) {
+              float ms = 0.0f;
+              if (cudaEventElapsedTime(&ms, slot->ev_dstart, slot->ev_dstop) ==
+                  cudaSuccess) {
+                slot->decomp_ms = static_cast<double>(ms);
+                ok = true;
+              }
+            }
+          }
+        }
+      }
+    } catch (...) {
+      // nvcomp reports errors by throwing, and decompress() is void, so a
+      // throw is its only failure signal. decomp_ms stays -1.
+    }
+    // Freed here, not in ReleaseSlot: slots live until the whole sweep ends,
+    // so holding this would multiply the sweep's device memory by K.
+    if (d_decomp) cudaFree(d_decomp);
+    return ok;
+  }
+
   /** @brief Release everything the slot owns. Safe to call more than once. */
   static void ReleaseSlot(AsyncSlot *slot) {
     if (!slot) return;
@@ -488,6 +573,9 @@ class NvComp : public Compressor {
     if (slot->ev_start) cudaEventDestroy(slot->ev_start);
     if (slot->ev_stop) cudaEventDestroy(slot->ev_stop);
     slot->ev_start = slot->ev_stop = nullptr;
+    if (slot->ev_dstart) cudaEventDestroy(slot->ev_dstart);
+    if (slot->ev_dstop) cudaEventDestroy(slot->ev_dstop);
+    slot->ev_dstart = slot->ev_dstop = nullptr;
     if (slot->stream) cudaStreamDestroy(slot->stream);
     slot->stream = nullptr;
     slot->launched = false;

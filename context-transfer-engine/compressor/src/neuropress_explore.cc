@@ -13,8 +13,34 @@
 #include "clio_cte/compressor/neuropress_explore.h"
 
 #include <chrono>
+#include <cstdlib>
 
 namespace clio::cte::compressor {
+
+namespace {
+/**
+ * Measure each explored candidate's decompression time by decompressing its
+ * own output back, instead of substituting the NN's prediction.
+ *
+ * OFF by default, and that default is not timidity. Upstream NeuroPress never
+ * decompresses at write time -- verified: gpucompress_compress.cpp passes
+ * pred_dt to compute_cost for every alternative, its primary_decomp_time_ms
+ * is declared and never assigned, and an nsys trace of its own
+ * explore_algo_patterns shows 13,430 kernel launches and zero decompression
+ * kernels. Turning this on makes Clio's SELECTION diverge from upstream's on
+ * identical data, which is the comparison the benchmark suite rests on.
+ *
+ * It also costs: decompression here runs 1.2-30x the codec's compression time
+ * depending on the algorithm, so the sweep does not merely double.
+ */
+bool MeasureExploreDecompTime() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_EXPLORE_MEASURE_DT");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+}  // namespace
 
 /** Sweep step 2: finish every launched slot. Kept separate from the launch
  *  step -- every slot must be in flight before any is waited on, or the sweep
@@ -51,6 +77,15 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots) {
     // No host-clock fallback: a missing reading means no launch happened.
     s->time_ms = (s->async.kernel_ms >= 0.0) ? s->async.kernel_ms : 0.0;
     s->compressed_size = s->ok ? s->async.compressed_size : 0;
+    // Decompress the candidate's own output back, on the slot's own stream,
+    // timed with the slot's own events -- so dt is the same KIND of quantity
+    // as the ct beside it. Only when the codec actually produced something:
+    // a failed or non-beneficial candidate has nothing to invert.
+    if (s->ok && s->compressed_size > 0 && MeasureExploreDecompTime()) {
+      if (s->gpu->DecompressMeasure(&s->async, s->compress_size)) {
+        s->decomp_time_ms = s->async.decomp_ms;
+      }
+    }
   }
 #endif
 }

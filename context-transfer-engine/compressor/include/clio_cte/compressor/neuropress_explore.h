@@ -36,6 +36,8 @@ struct ExploreRow {
   uint32_t shuffle;
   double pred_ratio, pred_ct, ratio, ct_ms, psnr, cost;
   int rank;
+  /** MEASURED decompression time, or <0 when the sweep did not take one. */
+  double dt_ms = -1.0;
 };
 
 /** Best alternative so far, plus what is needed to store it. One object, not
@@ -83,6 +85,11 @@ struct ExploreSlot {
   bool collected = false;
   size_t compressed_size = 0;
   double time_ms = 0.0;
+  /** MEASURED decompression time, or <0 when it was not measured -- which is
+   *  the default and upstream's only behaviour. Scoring falls back to the
+   *  primary's predicted dt when this is negative, so the two paths differ in
+   *  exactly one term. */
+  double decomp_time_ms = -1.0;
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
   ctp::NvComp* gpu = nullptr;   ///< non-null when the async path ran
   ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
