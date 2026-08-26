@@ -2325,7 +2325,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 task->blob_name_.str(), chunk_size, row.rank, row.lib,
                 row.preset_id, row.quant, row.shuffle, row.pred_ratio,
                 row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
-                actual_cost, static_cast<int>(ri) == winner.row,
+                // primary_rank_cost, NOT actual_cost: the baseline every one
+                // of these rows was actually ranked against (best_cost is
+                // seeded with it above). They differ whenever dt carries
+                // weight -- actual_cost substitutes the PREDICTED decompress
+                // time, primary_rank_cost the MEASURED one -- so logging
+                // actual_cost here made the column disagree with the decision
+                // it is supposed to explain, and with the primary row's own
+                // copy of it. Measured on a balanced Nyx run: 93 of 120
+                // chunks carried a different baseline than the primary row
+                // reported, and 2 adopted alternatives were logged looking
+                // WORSE than the primary they beat.
+                primary_rank_cost, static_cast<int>(ri) == winner.row,
                 /*is_primary=*/false, row.dt_ms);
           }
 
