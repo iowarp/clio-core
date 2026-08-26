@@ -108,6 +108,16 @@ RC=$?
 if [ $RC -ne 0 ]; then echo "Nyx failed (rc=$RC); see $OUT/nyx.log" >&2; tail -20 "$OUT/nyx.log" >&2; exit $RC; fi
 
 N=$(find "$OUT" -name '*.f32' | wc -l)
+# Manifest, so the replay side can report what simulation produced these dumps.
+# The replay driver only ever sees files, so without this a Nyx run reports
+# "0 timesteps" -- the step count is a property of THIS phase, not of the
+# sweep. Written here rather than passed to run_config.sh so it cannot drift
+# from the dumps actually on disk.
+cat > "$OUT/gen.json" <<JSON
+{"ncell":$NCELL,"steps":$STEPS,"plot_int":$PLOT_INT,
+ "frames":$(( STEPS / PLOT_INT + 1 )),"files":$N,
+ "exp_energy":"${EXP_ENERGY:-deck}"}
+JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   fields: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"
 echo

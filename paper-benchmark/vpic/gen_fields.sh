@@ -57,6 +57,17 @@ RC=$?
 if [ $RC -ne 0 ]; then echo "VPIC failed (rc=$RC); see $OUT/vpic.log" >&2; tail -20 "$OUT/vpic.log" >&2; exit $RC; fi
 
 N=$(find "$OUT" -name '*.f32' | wc -l)
+# Manifest, so the replay side can report what simulation produced these dumps
+# -- see the same block in ../nyx/gen_fields.sh. Without it a VPIC run reports
+# "0 timesteps", because the replay phase only ever sees files.
+#
+# frames counts the dumps actually written, which is NOT steps/dump_int + 1
+# here: this deck skips step 0 deliberately (the field array is identically
+# zero before the first solve), so deriving it would overcount by one.
+cat > "$OUT/gen.json" <<JSON
+{"ncell":$NCELL,"nppc":$NPPC,"steps":$STEPS,"dump_int":$DUMP_INT,
+ "frames":$(find "$OUT" -mindepth 1 -maxdepth 1 -type d | wc -l),"files":$N}
+JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   vars: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"
 echo

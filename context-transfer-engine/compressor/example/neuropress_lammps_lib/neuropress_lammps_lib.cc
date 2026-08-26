@@ -256,6 +256,20 @@ struct Field {
 };
 const Field kFields[] = {{"x", "position"}, {"v", "velocity"}, {"f", "force"}};
 
+/**
+ * Absolute error bound for error-bounded lossy compression, from
+ * CLIO_NEUROPRESS_ERROR_BOUND. 0 (the default) means LOSSLESS -- what this
+ * driver did unconditionally before -- and masks NeuroPress's 16 quantize
+ * actions; a positive bound makes them reachable. Same name and meaning as in
+ * neuropress_explore_sweep.cc and gpucompress_config_t::error_bound upstream.
+ */
+double ErrorBoundFromEnv() {
+  const char *e = std::getenv("CLIO_NEUROPRESS_ERROR_BOUND");
+  if (e == nullptr || *e == '\0') return 0.0;
+  const double v = std::atof(e);
+  return v > 0.0 ? v : 0.0;
+}
+
 struct BlobRecord {
   std::string name;
   size_t bytes = 0;
@@ -542,12 +556,17 @@ int main(int argc, char **argv) {
                       "mirror)")
             << std::endl;
 
-  // Context for every chunk: float64, lossless. data_type_ 2 is what the VOL
-  // reports for an 8-byte H5T_FLOAT; the compressor converts on that flag
-  // instead of reading doubles as pairs of float32 (see clio_vol.cc
-  // clio_context_data_type). error_bound_ stays 0 = lossless.
+  // Context for every chunk: float64. data_type_ 2 is what the VOL reports for
+  // an 8-byte H5T_FLOAT; the compressor converts on that flag instead of
+  // reading doubles as pairs of float32 (see clio_vol.cc
+  // clio_context_data_type). error_bound_ is 0 = lossless unless
+  // CLIO_NEUROPRESS_ERROR_BOUND asks otherwise; see ErrorBoundFromEnv.
   clio::cte::core::Context ctx;
   ctx.data_type_ = 2;
+  ctx.error_bound_ = ErrorBoundFromEnv();
+  if (ctx.error_bound_ > 0.0)
+    std::cout << "  error bound=" << ctx.error_bound_
+              << "  LOSSY (quantize actions enabled)" << std::endl;
 
   std::vector<BlobRecord> records;
   std::vector<Pending> pending;
@@ -975,7 +994,32 @@ int main(int argc, char **argv) {
 
   // ---- Verify: every blob back through the decompressor. ---------------
   int rc = failed ? 1 : 0;
-  if (opt.verify && !verify_records(records)) rc = 1;
+  if (opt.verify) {
+    // The digest comparison inside verify_records answers "did these bytes
+    // come back unchanged". Under a positive error bound they are NOT meant
+    // to, so a mismatch there says nothing: it cannot distinguish
+    // quantization (expected) from the device-staging corruption the forced
+    // --order device check exists to catch. Reporting it as a failure would
+    // mark every correct lossy run FAILED; reporting it as a pass would claim
+    // a guarantee that is not being tested.
+    //
+    // So: say plainly that the check does not apply, do not fail the run on
+    // it, and do not pretend the corruption guard ran. The check that DOES
+    // apply to lossy data is an element-wise comparison against the bound,
+    // which needs the original values and so lives in the field-replay driver
+    // (--check-bound), whose inputs are still on disk at verify time.
+    const bool lossy = ctx.error_bound_ > 0.0;
+    if (lossy) {
+      verify_records(records);  // still exercises the full decompress path
+      std::cout << "NOTE: error bound " << ctx.error_bound_
+                << " is in force, so the bit-exact digest check above does "
+                   "not apply and was not used to decide the exit code. The "
+                   "--order device corruption guard is INACTIVE for this run."
+                << std::endl;
+    } else if (!verify_records(records)) {
+      rc = 1;
+    }
+  }
 
   // Before lammps_kokkos_finalize(): the scratch lives in a Kokkos memory
   // space, and freeing it after Kokkos has torn that space down is a

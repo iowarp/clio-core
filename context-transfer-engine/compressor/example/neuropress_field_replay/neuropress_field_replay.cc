@@ -68,6 +68,13 @@ struct Options {
   bool verify = false;
   bool readback = false;           // read a previous report back, no files
   std::string dump_dir;            // write decompressed bytes here (readback)
+  // Check |original - decoded| <= error bound instead of a bit-exact digest.
+  // Only meaningful with a positive CLIO_NEUROPRESS_ERROR_BOUND: under lossy
+  // compression the digest MUST differ, so --verify alone can only report a
+  // failure that is not one. This re-reads each chunk from its source file
+  // and compares element-wise, which is the only check that actually tests
+  // the guarantee the error bound makes.
+  bool check_bound = false;
 };
 
 void Usage(const char *argv0) {
@@ -75,6 +82,10 @@ void Usage(const char *argv0) {
       << "usage: " << argv0 << " --dir DIR [options]\n"
       << "  --dir DIR        directory of flat binary field files\n"
       << "  --ext .f32       file extension to replay [.f32]\n"
+      << "  --check-bound    with a positive CLIO_NEUROPRESS_ERROR_BOUND,\n"
+      << "                   verify |original-decoded| <= bound element-wise\n"
+      << "                   against the source files instead of comparing a\n"
+      << "                   digest, which lossy compression must fail\n"
       << "  --chunk BYTES    bytes per compressor call, 0 = whole file "
          "[4194304]\n"
       << "  --max-files N    replay only the first N files (lexical order)\n"
@@ -106,6 +117,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--report") o->report = need("CSV");
     else if (a == "--readback") { o->readback = true; o->report = need("CSV"); }
     else if (a == "--dump-decompressed") o->dump_dir = need("DIR");
+    else if (a == "--check-bound") o->check_bound = true;
     else if (a == "--f64") o->f64 = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "-h" || a == "--help") { Usage(argv[0]); std::exit(0); }
@@ -123,6 +135,50 @@ uint64_t Fnv1a(const void *p, size_t n) {
   return h;
 }
 
+/**
+ * Absolute error bound for error-bounded lossy compression, from
+ * CLIO_NEUROPRESS_ERROR_BOUND. 0 (the default) means LOSSLESS and is what this
+ * driver did unconditionally before -- NeuroPress's ranking masks all 16
+ * quantize actions to -INFINITY at 0, so the search covers the 16 lossless
+ * configurations only. A positive bound makes the other half reachable.
+ *
+ * Same name and same meaning as the knob neuropress_explore_sweep.cc already
+ * reads, and as gpucompress_config_t::error_bound upstream.
+ */
+double ErrorBoundFromEnv() {
+  const char *e = std::getenv("CLIO_NEUROPRESS_ERROR_BOUND");
+  if (e == nullptr || *e == '\0') return 0.0;
+  const double v = std::atof(e);
+  return v > 0.0 ? v : 0.0;
+}
+
+/**
+ * Source file and offset a blob came from, recovered from its NAME.
+ *
+ * Blobs are named "<frame>/<stem>/chunk_<i>" (see where records are built), so
+ * the original bytes are at `<dir>/<frame>/<stem><ext>` + i*chunk. Deriving it
+ * rather than storing it keeps the cold read-back path working too: that one
+ * rebuilds its records from blobs.csv, which carries the name and nothing
+ * about where the data came from.
+ *
+ * Returns false when the name does not have that shape (a caller that named
+ * its blobs differently), which the bound check reports rather than skips.
+ */
+bool SourceOfBlob(const std::string &name, const std::string &dir,
+                  const std::string &ext, size_t chunk,
+                  std::string *path, size_t *offset) {
+  const size_t c = name.rfind("/chunk_");
+  if (c == std::string::npos) return false;
+  const size_t slash = name.rfind('/', c - 1);
+  if (slash == std::string::npos) return false;
+  const std::string frame = name.substr(0, slash);
+  const std::string stem = name.substr(slash + 1, c - slash - 1);
+  const size_t idx = std::strtoull(name.c_str() + c + 7, nullptr, 10);
+  *path = dir + "/" + frame + "/" + stem + ext;
+  *offset = idx * chunk;
+  return true;
+}
+
 struct BlobRecord {
   std::string name;
   size_t bytes = 0;
@@ -131,6 +187,11 @@ struct BlobRecord {
   double ratio = 0.0;
   size_t stored = 0;
   double ms = 0.0;
+  // MEASURED decompression time (CUDA events around the codec call alone), or
+  // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
+  // Same field, same clock and same caveat as the LAMMPS driver's dt_ms: NOT
+  // comparable with a read-path Decompress(), which times the whole path.
+  double dt_ms = -1.0;
   bool ok = false;
 };
 
@@ -184,8 +245,15 @@ int main(int argc, char **argv) {
   if (tag->GetReturnCode() != 0) { std::cerr << "GetOrCreateTag failed\n"; return 1; }
   const auto tag_id = tag->tag_id_;
 
+  // Error bound in force for this run, so verification can pick the check that
+  // actually applies: bit-exact for lossless, |orig-decoded| <= eb for lossy.
+  const double verify_eb = ErrorBoundFromEnv();
+  size_t bound_checked = 0, bound_exceeded = 0, bound_unreadable = 0;
+  double bound_worst = 0.0;
+
   auto verify_records = [&](const std::vector<BlobRecord> &recs) -> bool {
     size_t bad = 0;
+    std::vector<char> srcbuf;
     for (const auto &r : recs) {
       auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
       if (buf.IsNull()) { std::cerr << "AllocateBuffer (verify) failed\n"; return false; }
@@ -194,11 +262,64 @@ int main(int argc, char **argv) {
           clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
           buf.shm_.template Cast<void>(), cte_client->pool_id_);
       get.Wait();
-      const bool ok = get->GetReturnCode() == 0 &&
-                      Fnv1a(buf.ptr_, r.bytes) == r.digest;
+      const int rc_get = get->GetReturnCode();
+
+      // Which check applies is decided by the error bound, not by a separate
+      // flag: under lossy compression the decoded bytes are NOT the input
+      // bytes by construction, so a digest comparison there reports a failure
+      // that is not one. --check-bound asks for the element-wise comparison
+      // that tests the guarantee the bound actually makes.
+      bool ok;
+      if (opt.check_bound && verify_eb > 0.0) {
+        ok = rc_get == 0;
+        std::string src;
+        size_t off = 0;
+        if (ok && SourceOfBlob(r.name, opt.dir, opt.ext, opt.chunk, &src, &off)) {
+          std::ifstream in(src, std::ios::binary);
+          if (in) {
+            srcbuf.resize(r.bytes);
+            in.seekg(static_cast<std::streamoff>(off));
+            in.read(srcbuf.data(), static_cast<std::streamsize>(r.bytes));
+            if (in.gcount() == static_cast<std::streamsize>(r.bytes)) {
+              // Compare at the element width the run declared. A float64
+              // replay quantizes as float64; reading it as float32 would
+              // compare halves of values against each other.
+              double worst = 0.0;
+              if (opt.f64) {
+                const auto *a = reinterpret_cast<const double *>(srcbuf.data());
+                const auto *b = reinterpret_cast<const double *>(buf.ptr_);
+                for (size_t i = 0; i < r.bytes / sizeof(double); ++i)
+                  worst = std::max(worst, std::fabs(a[i] - b[i]));
+              } else {
+                const auto *a = reinterpret_cast<const float *>(srcbuf.data());
+                const auto *b = reinterpret_cast<const float *>(buf.ptr_);
+                for (size_t i = 0; i < r.bytes / sizeof(float); ++i)
+                  worst = std::max(worst,
+                                   std::fabs(static_cast<double>(a[i]) -
+                                             static_cast<double>(b[i])));
+              }
+              ++bound_checked;
+              bound_worst = std::max(bound_worst, worst);
+              if (worst > verify_eb) {
+                ++bound_exceeded;
+                std::cerr << "  BOUND EXCEEDED " << r.name << " max|err|="
+                          << worst << " > eb=" << verify_eb << "\n";
+              }
+            } else {
+              ++bound_unreadable;
+            }
+          } else {
+            ++bound_unreadable;
+          }
+        } else if (ok) {
+          ++bound_unreadable;
+        }
+      } else {
+        ok = rc_get == 0 && Fnv1a(buf.ptr_, r.bytes) == r.digest;
+      }
       if (!ok) {
         ++bad;
-        std::cerr << "  MISMATCH " << r.name << " rc=" << get->GetReturnCode() << "\n";
+        std::cerr << "  MISMATCH " << r.name << " rc=" << rc_get << "\n";
       }
       /* Optionally hand the decompressed bytes to an external checker. The
          digest above is computed by the same program that computed the
@@ -213,11 +334,36 @@ int main(int argc, char **argv) {
       }
       CLIO_IPC->FreeBuffer(buf);
     }
+    // Say which check ran. In bound mode the bytes are NOT expected to match
+    // bit for bit, so claiming they did would be false on every lossy run --
+    // `bad` there counts decompression failures only, and the verdict on the
+    // data is the BOUND line below.
+    const bool bound_mode = opt.check_bound && verify_eb > 0.0;
     std::cout << (bad == 0 ? "VERIFIED: " : "FAILED: ") << (recs.size() - bad)
               << " of " << recs.size()
-              << " blobs round-tripped bit-exact through the decompressor"
+              << (bound_mode
+                      ? " blobs decompressed without error (bound checked"
+                        " separately below)"
+                      : " blobs round-tripped bit-exact through the"
+                        " decompressor")
               << std::endl;
     return bad == 0;
+  };
+
+  // One line the harness greps, in the same shape as VERIFIED:/FAILED: above.
+  // A chunk whose source could not be re-read is reported, never counted as a
+  // pass -- the whole point of this check is that it not be silently vacuous.
+  auto report_bound = [&]() {
+    if (!(opt.check_bound && verify_eb > 0.0)) return true;
+    const bool ok = bound_exceeded == 0 && bound_checked > 0;
+    std::cout << (ok ? "BOUND OK: " : "BOUND FAILED: ") << bound_checked
+              << " chunk(s) checked against eb=" << verify_eb
+              << ", " << bound_exceeded << " exceeded, worst max|err|="
+              << bound_worst;
+    if (bound_unreadable) std::cout << ", " << bound_unreadable
+                                    << " source(s) unreadable";
+    std::cout << std::endl;
+    return ok;
   };
 
   // ---- Cold read-back: no files touched, the tier is the only source. ----
@@ -239,7 +385,7 @@ int main(int argc, char **argv) {
     }
     std::cout << "cold read-back of " << recs.size() << " blob(s) listed in "
               << opt.report << std::endl;
-    const bool ok = verify_records(recs);
+    const bool ok = verify_records(recs) && report_bound();
     clio::run::CLIO_RUNTIME_FINALIZE();
     return ok ? 0 : 1;
   }
@@ -275,9 +421,14 @@ int main(int argc, char **argv) {
             << std::endl;
 
   // float32 = 1, float64 = 2 -- the same encoding the HDF5 VOL assigns from
-  // an H5T_FLOAT's size. Lossless: error_bound_ stays 0.
+  // an H5T_FLOAT's size. error_bound_ is 0 (lossless) unless
+  // CLIO_NEUROPRESS_ERROR_BOUND asks otherwise; see ErrorBoundFromEnv.
   clio::cte::core::Context ctx;
   ctx.data_type_ = opt.f64 ? 2 : 1;
+  ctx.error_bound_ = ErrorBoundFromEnv();
+  if (ctx.error_bound_ > 0.0)
+    std::cout << "  error bound=" << ctx.error_bound_
+              << "  LOSSY (quantize actions enabled)" << std::endl;
 
   std::vector<BlobRecord> records;
   std::vector<Pending> pending;
@@ -292,6 +443,7 @@ int main(int argc, char **argv) {
       r.lib = c.compress_lib_;
       r.ratio = c.actual_compression_ratio_;
       r.ms = c.actual_compress_time_ms_;
+      r.dt_ms = c.actual_decompress_time_ms_;
       // lib == 0 marks "stored raw": the codec did not shrink the chunk and
       // the caller's bytes went to the tier untouched, so the stored size is
       // the original -- actual_compressed_size_ still reports the codec's
@@ -398,16 +550,22 @@ int main(int argc, char **argv) {
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);
-    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,rc\n";
+    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
+           "decompress_ms,rc\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ',' << ctp::CompressionFactory::NameForWireId(r.lib)
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
-          << (r.ok ? 0 : 1) << '\n';
+          << r.dt_ms << ',' << (r.ok ? 0 : 1) << '\n';
   }
 
   int rc = failed ? 1 : 0;
   if (opt.verify && !verify_records(records)) rc = 1;
+  // A bound violation is a FAILED run. Evaluated after verify_records, which
+  // is what populates the counters, and independently of it: under --check-bound
+  // verify_records only fails on a decompress error, so without this a run
+  // whose data came back outside the bound would exit 0.
+  if (opt.verify && !report_bound()) rc = 1;
 
   clio::run::CLIO_RUNTIME_FINALIZE();
   return rc;

@@ -95,7 +95,17 @@ def main():
                                       m.group(4).startswith("EXPLORATION"))
 
     # The adopted candidate's measured ratio, per blob, when exploration ran.
-    adopted = {}
+    #
+    # The same row is also the only per-chunk TIMING this workload has. The
+    # application is a stock WarpX and the staging happens inside the VOL, so
+    # unlike the other three there is no Clio driver recording a compress time
+    # -- the path trace carries none, and compress_ms was reported as 0.0 for
+    # every chunk. The exploration log's adopted row (primary or alternative,
+    # whichever was stored) carries ct_ms for the codec that actually ran, and
+    # dt_ms when CLIO_NEUROPRESS_EXPLORE_MEASURE_DT asked for a decompression
+    # measurement. Both are CUDA-event brackets around the codec call alone,
+    # so they are the same clock the other workloads' columns use.
+    adopted, times = {}, {}
     if explore_log and os.path.isfile(explore_log):
         for r in csv.DictReader(open(explore_log)):
             if r.get("adopted") == "1":
@@ -103,6 +113,11 @@ def main():
                     adopted[r["blob"]] = (float(r["ratio"]),
                                           int(r["chunk_bytes"]))
                 except (ValueError, KeyError):
+                    pass
+                try:
+                    times[r["blob"]] = (float(r.get("ct_ms", -1) or -1),
+                                        float(r.get("dt_ms", -1) or -1))
+                except ValueError:
                     pass
 
     n = min(len(blobs), len(primaries))
@@ -132,15 +147,17 @@ def main():
             codec_out = fin[1] if fin else f"lib{lib}"
         else:                                            # nothing shrank it
             stored, lib_out, codec_out = cin, 0, "raw"
+        ct_ms, dt_ms = times.get(name, (0.0, -1.0))
         rows.append({
             "blob": normalise(name), "bytes": nbytes, "fnv1a64": "0",
             "lib": lib_out, "codec": codec_out,
             "ratio": round(nbytes / stored, 6) if stored else 0.0,
-            "stored": stored, "compress_ms": 0.0, "rc": 0,
+            "stored": stored, "compress_ms": ct_ms,
+            "decompress_ms": dt_ms, "rc": 0,
         })
 
     cols = ["blob", "bytes", "fnv1a64", "lib", "codec", "ratio", "stored",
-            "compress_ms", "rc"]
+            "compress_ms", "decompress_ms", "rc"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

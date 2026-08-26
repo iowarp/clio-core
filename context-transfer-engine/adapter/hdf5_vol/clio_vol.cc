@@ -1623,6 +1623,30 @@ static bool clio_is_collective(hid_t dxpl_id) {
    left the model with NaN for two of its three input features on EVERY
    float64 dataset. Since h5md, openPMD and AMReX all write float64, that was
    most real data. */
+/* Absolute error bound handed to the compressor on every write, from
+   CLIO_NEUROPRESS_ERROR_BOUND. 0 -- the default, and what the VOL did
+   unconditionally before -- means LOSSLESS: NeuroPress masks all 16 of its
+   quantize actions at 0, so selection covers the 16 lossless configurations.
+   A positive bound makes the other half reachable.
+
+   Environment, not a VOL property, for the reason every other NeuroPress knob
+   here is: the application is a STOCK binary (WarpX, and anything else that
+   writes HDF5), so there is no call site to pass a property list through.
+
+   Re-read on every call rather than cached, matching clio_tier_retry_ms() and
+   clio_admit_policy() above: a cached copy cannot be changed by a test or a
+   long-lived process that sets the variable later, and a function-local static
+   written from the runtime's worker threads would be a data race besides.
+
+   Same name and meaning as neuropress_explore_sweep.cc's knob and as
+   gpucompress_config_t::error_bound upstream. */
+static double clio_np_error_bound() {
+  const char *v = std::getenv("CLIO_NEUROPRESS_ERROR_BOUND");
+  if (!v || !*v) return 0.0;
+  const double eb = std::atof(v);
+  return (eb > 0.0) ? eb : 0.0;
+}
+
 static int clio_context_data_type(hid_t type_id) {
   if (type_id < 0) return 0;
   if (H5Tget_class(type_id) != H5T_FLOAT) return 0;
@@ -2022,8 +2046,11 @@ static bool clio_stage_chunk(clio_dataset_t *dataset, size_t chunk_index,
   if (dataset->file->compressor_client) {
     clio::cte::core::Context np_ctx;
     np_ctx.data_type_ = np_data_type;
-    CLIO_PATH_TRACE("WRITE  ctx data_type_=%d (%s)", np_ctx.data_type_,
-                    np_ctx.data_type_ == 1 ? "float32" : "other");
+    np_ctx.error_bound_ = clio_np_error_bound();
+    CLIO_PATH_TRACE("WRITE  ctx data_type_=%d (%s) error_bound=%g",
+                    np_ctx.data_type_,
+                    np_ctx.data_type_ == 1 ? "float32" : "other",
+                    np_ctx.error_bound_);
     auto future = dataset->file->compressor_client->AsyncDynamicSchedule(
         clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
         0, this_size, blob_data, -1.0f, np_ctx, 0, cte_client->pool_id_);
@@ -2159,6 +2186,36 @@ static size_t clio_stage_append(clio_dataset_t *dataset, const void *src_raw,
   /* Bring the write's bytes to host memory once. DeviceAwareMemcpy handles a
      device src (D2H); for a host src this is a plain copy. */
   const size_t nbytes = hi - lo;
+  /* This path assembles NON-CONTIGUOUS partial writes -- openPMD emits one
+     per AMReX box -- into a host run buffer, so a chunk staged through it is
+     never device-resident, whatever the source was. Say so once, and say
+     which memory the application actually handed over, because the two cases
+     need completely different fixes:
+
+       source HOST   -- the application copied to host before H5Dwrite (AMReX
+                        and openPMD do). Nothing in the VOL can recover device
+                        residency; it is gone before Clio is called.
+       source DEVICE  -- residency is being thrown away HERE, and assembling
+                        the run in device memory would keep it.
+
+     Measured with a stock WarpX: HOST. So for that workload the GPU path is
+     not reachable through the VOL at all, and a run that requires it should
+     fail rather than quietly preprocess on the CPU -- see
+     CLIO_NEUROPRESS_REQUIRE_DEVICE. */
+  {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+      const bool dev = ctp::IsDevicePointer(src_raw);
+      HLOG(kWarning,
+           "clio_stage_append: the application's first partial write is {} "
+           "memory ({} bytes). Chunks assembled by this path are staged to "
+           "HOST, so NeuroPress quantization, byte shuffle and codec "
+           "selection all run on the CPU for them.{}",
+           dev ? "DEVICE" : "HOST", nbytes,
+           dev ? " The source WAS device-resident: this path is what loses it."
+               : " The source was already host memory before Clio saw it.");
+    }
+  }
   std::vector<char> incoming(nbytes);
   ctp::DeviceAwareMemcpy(incoming.data(), src_raw, nbytes);
 
@@ -3129,6 +3186,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
              and the helper yields 0 -- the previous behaviour exactly. */
           clio::cte::core::Context np_ctx;
           np_ctx.data_type_ = clio_context_data_type(dataset->file_type);
+          np_ctx.error_bound_ = clio_np_error_bound();
           auto fut = dataset->file->compressor_client->AsyncDynamicSchedule(
               clio::run::PoolQuery::Local(), dataset->file->tag_id, blob_name,
               0, this_size, blob_data, -1.0f, np_ctx,

@@ -91,6 +91,26 @@
 
 namespace {
 
+/**
+ * Absolute error bound for error-bounded lossy compression, from
+ * CLIO_NEUROPRESS_ERROR_BOUND. 0 (the default) means LOSSLESS -- what this
+ * adapter did unconditionally before -- and masks NeuroPress's 16 quantize
+ * actions; a positive bound makes them reachable. Same name and meaning as in
+ * the sibling drivers and as gpucompress_config_t::error_bound upstream.
+ *
+ * Quantization then runs ON THE DEVICE here, unlike the file-replay route:
+ * the chunk handed to the compressor is already device memory, so
+ * compressor_runtime.cc takes its QuantizeDevice branch instead of the host
+ * fallback. That is the point of the in-situ path.
+ */
+double ClioNpErrorBoundFromEnv() {
+  const char *e = std::getenv("CLIO_NEUROPRESS_ERROR_BOUND");
+  if (e == nullptr || *e == '\0') return 0.0;
+  const double v = std::atof(e);
+  return v > 0.0 ? v : 0.0;
+}
+
+
 /* FNV-1a-64, the digest every sibling example uses, so a CSV written here can
  * be replayed by bin/neuropress_field_replay --readback without translation. */
 uint64_t Fnv1a(const void *p, size_t n) {
@@ -140,6 +160,9 @@ struct BlobRecord {
   double ratio = 0.0;
   size_t stored = 0;
   double ms = 0.0;
+  // MEASURED decompression time (CUDA events around the codec call alone), or
+  // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
+  double dt_ms = -1.0;
   bool ok = false;
 };
 
@@ -291,6 +314,7 @@ struct Adapter {
       r.lib = c.compress_lib_;
       r.ratio = c.actual_compression_ratio_;
       r.ms = c.actual_compress_time_ms_;
+      r.dt_ms = c.actual_decompress_time_ms_;
       // compress_lib_ == 0 is "stored raw": the codec ran, did not shrink the
       // chunk, and the ORIGINAL bytes went to the tier.
       // actual_compressed_size_ still reports the codec's output, which is
@@ -606,8 +630,10 @@ int clio_nyx_insitu_stage(const char *blob_prefix, const void *dev_base,
 
   clio::cte::core::Context ctx;
   // float32 = 1, float64 = 2 -- the same encoding the HDF5 VOL assigns from an
-  // H5T_FLOAT's size. error_bound_ stays 0: lossless.
+  // H5T_FLOAT's size. error_bound_ is 0 (lossless) unless
+  // CLIO_NEUROPRESS_ERROR_BOUND asks otherwise.
   ctx.data_type_ = (elem_bytes == 8) ? 2 : 1;
+  ctx.error_bound_ = ClioNpErrorBoundFromEnv();
 
   const bool need_host_bytes =
       true;  // the digest is what makes the cold read-back checkable
@@ -781,12 +807,13 @@ int clio_nyx_insitu_end(void) {
     // parser reads blob,bytes,fnv1a64 and ignores the rest). `rank` is
     // APPENDED, never inserted, for exactly that reason: it tells a reader
     // which rank owned a box without moving a column the reader depends on.
-    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,rc,rank\n";
+    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
+           "decompress_ms,rc,rank\n";
     for (const auto &r : a.records) {
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ','
           << ctp::CompressionFactory::NameForWireId(r.lib) << ',' << r.ratio
-          << ',' << r.stored << ',' << r.ms << ',' << (r.ok ? 0 : 1) << ','
+          << ',' << r.stored << ',' << r.ms << ',' << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
           << a.rank << '\n';
     }
   }
