@@ -108,6 +108,16 @@ def audit(d):
             a = adopted.get(r["blob"])
             if field(r["blob"]) != f or a is None:
                 continue
+            if r.get("lib") == "0":
+                # STORED RAW: the codec was not beneficial, so the ORIGINAL
+                # bytes went to the tier verbatim -- no CTEC header, and the
+                # adopted row's ratio describes a payload that was discarded.
+                # stored must equal bytes exactly.
+                n_ck += 1
+                if int(r["stored"]) != int(r["bytes"]):
+                    ok, note = False, note + f" raw chunk {r['blob'].split('/')[-1]}" \
+                                             f" stored {r['stored']} != {r['bytes']}"
+                continue
             h = HDR + (QHDR if a["quantize"] == "1" else 0)
             implied = round(int(a["chunk_bytes"]) / float(a["ratio"])) + h
             n_ck += 1
@@ -147,7 +157,12 @@ def audit(d):
         # From blobs.csv, which has EVERY chunk. The adopted set only covers
         # chunks that actually explored, so tallying it against the log's
         # all-chunk count fails on any run where the gate held some back.
-        got = Counter(r["codec"] for r in blobs)
+        # lib 0 is "stored raw, no codec kept". blobs.csv still renders it
+        # through NameForWireId(0), which answers "brotli", so a raw chunk
+        # looks like a compressed one here; the adapters' own tallies count
+        # only chunks a codec was kept for. Excluded on the lib id, never on
+        # the name -- brotli is a real codec that can legitimately be chosen.
+        got = Counter(r["codec"] for r in blobs if r.get("lib") != "0")
         checks.append(("codec tally == log tally", got == log_codecs,
                        f"{dict(got)} vs {dict(log_codecs)}"))
     if adopted:
