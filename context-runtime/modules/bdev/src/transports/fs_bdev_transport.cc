@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -15,20 +16,34 @@
 
 namespace clio::run::bdev {
 
-/* End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
- * Same "[np-path]" prefix as the compressor half in compressor_runtime.cc, so
- * one grep spans selection, codec and the storage write that terminates the
- * device path. Undefined => expands to nothing. */
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
-#define CLIO_PATH_TRACE(...)                       \
-  do {                                             \
-    std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
-    std::fprintf(stderr, "\n");                    \
-    std::fflush(stderr);                           \
+/* End-to-end path trace -- RUNTIME, off unless CLIO_NEUROPRESS_PATH_TRACE is
+ * set in the environment. Same "[np-path]" prefix and the same variable as the
+ * compressor half, so one env var and one grep span selection, codec and the
+ * storage write that terminates the device path.
+ *
+ * A private copy rather than an include of the compressor's
+ * neuropress_path_trace.h: this module is context-runtime, which everything
+ * above it depends on, so including a clio_cte header here would invert the
+ * dependency. Read once per process, for the reasons given there. */
+namespace {
+inline bool NpTraceEnabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_PATH_TRACE");
+    if (e == nullptr || *e == '\0') return false;
+    return !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+}  // namespace
+
+#define CLIO_PATH_TRACE(...)                         \
+  do {                                               \
+    if (NpTraceEnabled()) {                          \
+      std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
+      std::fprintf(stderr, "\n");                    \
+      std::fflush(stderr);                           \
+    }                                                \
   } while (0)
-#else
-#define CLIO_PATH_TRACE(...) ((void)0)
-#endif
 
 namespace {
 

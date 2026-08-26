@@ -10,8 +10,19 @@
  * @brief One definition of the "[np-path]" end-to-end trace, shared by the
  *        compressor runtime and the selection half.
  *
- * COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE. Undefined it expands
- * to nothing, so a normal build pays neither a branch nor a format string.
+ * RUNTIME, off unless CLIO_NEUROPRESS_PATH_TRACE is set in the environment.
+ * It used to be a compile-time define, which meant the only way to turn the
+ * trace on was to hand-edit a generated flags.make and rebuild -- and CMake
+ * silently threw that edit away on its next regenerate, so a trace that had
+ * been working stopped for no visible reason. The env var cannot be lost that
+ * way and needs no rebuild.
+ *
+ * The check is a function-local static read once per process, so a disabled
+ * trace costs one predictable branch at each site, and the sites are per
+ * CHUNK (megabytes apart), never per element. Build with
+ * -DCLIO_NEUROPRESS_PATH_TRACE_OFF to compile the sites out entirely if even
+ * that is unwanted.
+ *
  * Lived in compressor_runtime.cc until the selection half needed it too;
  * copying it a third time would have let the two drift.
  *
@@ -39,18 +50,54 @@
 #define CLIO_CTE_COMPRESSOR_NEUROPRESS_PATH_TRACE_H_
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <clio_ctp/util/gpu_api.h>
 
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
-#define CLIO_PATH_TRACE(...)                        \
-  do {                                              \
-    std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
-    std::fprintf(stderr, "\n");                     \
-    std::fflush(stderr);                            \
+namespace clio::cte::compressor {
+
+/** True when CLIO_NEUROPRESS_PATH_TRACE asks for the trace.
+ *
+ *  Read ONCE per process, not once per chunk: this is consulted from worker
+ *  threads, and a getenv per call would be both a syscall on the hot path and
+ *  a data race against anyone calling setenv. "0" and the empty string are
+ *  off; any other value is on. */
+inline bool NpTraceEnabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_PATH_TRACE");
+    if (e == nullptr || *e == '\0') return false;
+    return !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
+}  // namespace clio::cte::compressor
+
+/* Fully qualified so the macro works from any namespace, including the two
+ * .cc files that expand it from inside clio::cte::compressor. Arguments are
+ * evaluated ONLY when the trace is on, which is what keeps NpWhere()'s
+ * cudaPointerGetAttributes call off a disabled path. */
+#ifdef CLIO_NEUROPRESS_PATH_TRACE_OFF
+/* Compiled out, but the arguments are still PARSED. `if (false)` keeps every
+ * expression referenced, so the locals the trace sites hoist do not turn into
+ * unused-variable warnings (six of them, enough to fail a -Werror build), and
+ * the format strings stay type-checked in a configuration nobody exercises.
+ * The branch is dead and eliminated; nothing is evaluated at runtime. */
+#define CLIO_PATH_TRACE(...)                          \
+  do {                                                \
+    if (false) {                                      \
+      std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
+    }                                                 \
   } while (0)
 #else
-#define CLIO_PATH_TRACE(...) ((void)0)
+#define CLIO_PATH_TRACE(...)                          \
+  do {                                                \
+    if (::clio::cte::compressor::NpTraceEnabled()) {  \
+      std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
+      std::fprintf(stderr, "\n");                    \
+      std::fflush(stderr);                            \
+    }                                                 \
+  } while (0)
 #endif
 
 namespace clio::cte::compressor {

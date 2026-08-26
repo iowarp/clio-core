@@ -1283,10 +1283,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     best_lib,
                     ctp::CompressionFactory::NameForWireId(best_lib).c_str(),
                     best_preset);
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
+    // Kept unconditionally now that the trace is a runtime switch: two int
+    // copies, and the FINAL hook below needs them to say whether exploration
+    // overrode this pick.
     const int np_primary_lib = best_lib;
     const int np_primary_preset = best_preset;
-#endif
     task->tier_score_ = tier_score;
 
     // Log scheduling decision time if tracing enabled
@@ -1833,7 +1834,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // per-slot kernel time inside 1.85 ms of wall time, against 9.24 ms
         // for the same work through Compress(), which takes the thread's
         // single cached stream and synchronizes before returning.
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
         {
           const double np_thresh =
               static_cast<double>(config_.neuropress_exploration_threshold_);
@@ -1848,7 +1848,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   ? "EXPLORE"
                   : "SKIP -- the prediction was good enough (strict >)");
         }
-#endif
         if (config_.neuropress_exploration_enabled_ &&
             (config_.neuropress_best_mode_ ||
              error_pct > static_cast<double>(
@@ -2621,7 +2620,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
     }
 
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
     // The decision that actually reaches storage. `context` is a reference to
     // task->context_, and an adopted exploration winner is committed by
     // assigning task->context_ wholesale -- so reading it here, after the
@@ -2646,7 +2644,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               ? "(primary kept)"
               : "(EXPLORATION OVERRODE THE PRIMARY)");
     }
-#endif
 
     // The one put, when exploration did not make it. Reaching here with a
     // deferred image means either exploration never ran for this chunk (below
@@ -2853,9 +2850,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // legacy heuristic fallback (or an explicit/static compress_lib_) can
     // still land here with a device pointer + CPU library.
     std::vector<char> device_staging;
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
-    const bool np_dev_pre_stage = ctp::IsDevicePointer(input_ptr);
-#endif
+    // Short-circuited on the trace flag: unlike the other hoisted locals this
+    // one costs a cudaPointerGetAttributes, which a disabled trace must not
+    // pay. False when off, and only ever read from inside the trace.
+    const bool np_dev_pre_stage =
+        NpTraceEnabled() && ctp::IsDevicePointer(input_ptr);
     input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
         input_ptr, input_size, context.compress_lib_, device_staging);
     CLIO_PATH_TRACE(
