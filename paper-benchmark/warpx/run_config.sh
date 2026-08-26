@@ -211,6 +211,7 @@ set +e
     CLIO_VOL_CHUNK_SIZE="$CHUNK" \
     CLIO_VOL_STAMP_GRANULARITY_NS=0 \
     CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv" \
+    CLIO_NEUROPRESS_PATH_TRACE=1 \
     $( { [ "$NP_EXPLORE" = true ] || [ "$BEST" = true ]; } && echo CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv" ) \
     CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \
@@ -257,10 +258,18 @@ NCHUNKS=$(( $(wc -l < "$STORE/blobs.csv") - 1 ))
 PAYLOAD=$(awk -F, 'NR>1{s+=$2} END{printf "%d", s+0}' "$STORE/blobs.csv")
 NATIVE=$(du -sb "$RUNDIR/diags" 2>/dev/null | cut -f1 || echo 0)
 
+# A run that staged NO field chunks is a failed run, not a warning. It is the
+# one outcome this workload can produce that looks entirely healthy -- WarpX
+# exits 0, the native openPMD output is perfect, and only an empty blobs.csv
+# says anything is wrong. Reported as a pass, it silently removes a whole
+# workload from a campaign.
 if [ "$NCHUNKS" -le 0 ]; then
-  echo "   WARNING: no field chunks staged. With this writer that usually means"
-  echo "   the chunk size exceeds openPMD's contiguous write granularity -- see"
-  echo "   the note at the top of this script. Try --chunk 1048576."
+  echo "   NO FIELD CHUNKS STAGED -- nothing reached the tier. Usual causes:"
+  echo "     - chunk size exceeds openPMD's contiguous write granularity (see"
+  echo "       the note at the top of this script; try --chunk 1048576)"
+  echo "     - CLIO_NEUROPRESS_PATH_TRACE unset: blobs.csv is RECONSTRUCTED"
+  echo "       from that trace, so without it the run looks empty"
+  RC=1
 fi
 
 VERIFY_RESULT="n/a"
@@ -269,6 +278,10 @@ if [ "$VERIFY" = 1 ] && [ $RC -eq 0 ]; then
     VERIFY_RESULT="pass"
   else
     VERIFY_RESULT="FAIL"
+    # Fail the RUN, not just the record. meta.json carried verify_result=FAIL
+    # while the script exited 0, so run_benchmark.sh counted the cell as
+    # passing and a campaign could report "0 failed" with unverified cells.
+    RC=1
   fi
   sed 's/^/   /' "$STORE/verify.log" | tail -6
 fi

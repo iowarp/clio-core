@@ -4,7 +4,10 @@
 The other workloads run a Clio driver that records every chunk itself. This one
 does not: the application is a stock WarpX and the staging happens inside the
 VOL, so the only per-chunk record is the compile-time path trace
-(-DCLIO_NEUROPRESS_PATH_TRACE=ON).
+(CLIO_NEUROPRESS_PATH_TRACE=1 in the environment -- run_config.sh sets it
+unconditionally for this reason: unlike the other three workloads there is no
+Clio driver recording chunks, so this trace IS this workload's results, and
+without it the run completes, reports rc=0, and produces an EMPTY blobs.csv).
 
 WHICH LINE SAYS WHAT -- this is the part that is easy to get wrong, and an
 earlier version of this script did:

@@ -64,12 +64,16 @@ for D in $DSETS; do
       CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
       HDF5_VOL_CONNECTOR=clio HDF5_PLUGIN_PATH="$STORE" \
       CLIO_VOL_COMPRESSOR_POOL=512.0 CLIO_VOL_CHUNK_SIZE="$CHUNK" \
+      CLIO_NEUROPRESS_PATH_TRACE=1 \
       CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
       h5dump -d "$D" -b LE -o "$STORE/via_clio.bin" "$REL" ) > /dev/null 2>> "$STORE/read.log"
   RC=$?
   ( cd "$RUNDIR" && env -u HDF5_VOL_CONNECTOR -u HDF5_PLUGIN_PATH \
       h5dump -d "$D" -b LE -o "$STORE/via_native.bin" "$REL" ) > /dev/null 2>&1
 
+  # "inverting codec" is a [np-path] trace line, so the trace above is not
+  # optional here: without CLIO_NEUROPRESS_PATH_TRACE the count is always 0 and
+  # every dataset reports "the tier was not used" while its bytes are perfect.
   INV=$(grep -c "inverting codec" "$STORE/read.log" 2>/dev/null | head -1)
   INV=$(( INV - TOTAL_INV )); TOTAL_INV=$(( TOTAL_INV + INV ))
   MISS=$(grep -c "MISS (native + stage)" "$STORE/read.log" 2>/dev/null | head -1)
