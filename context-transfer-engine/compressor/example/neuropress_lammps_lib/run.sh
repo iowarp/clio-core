@@ -147,8 +147,14 @@ NP_ENV=(env CLIO_SERVER_CONF="$STORE/compose.yaml"
 # blobs a first one stored. Same switch the siblings' read phases use.
 [ "$RESTART" = true ] && NP_ENV+=(CLIO_RESTART=1)
 
+# PROFILE=<command> wraps the driver, so the transfer claims in the README can
+# be re-measured rather than believed. It goes INSIDE the env prefix: nsys must
+# see the environment the driver runs with, and mpirun-style argument rules do
+# not apply here.
+#   PROFILE="nsys profile --trace=cuda --force-overwrite=true -o /tmp/x" ./run.sh ...
+PROFILE=${PROFILE:-}
 set +e
-"${NP_ENV[@]}" "$BIN" "${ARGS[@]}" "${EXTRA[@]}" 2> "$STORE/runtime.log"
+"${NP_ENV[@]}" ${PROFILE} "$BIN" "${ARGS[@]}" "${EXTRA[@]}" 2> "$STORE/runtime.log"
 RC=$?
 set -e
 if [ $RC -ne 0 ]; then

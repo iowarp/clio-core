@@ -96,6 +96,12 @@ void *clio_lmp_device_scratch(size_t bytes);
 void clio_lmp_device_scratch_free(void);
 int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
                               long natoms);
+/* Gather only the slice [dst_elem_off, +dst_elem_count) of the field, so a
+   chunk can be produced directly in the buffer the compressor reads instead
+   of being copied out of a whole-field scratch. */
+int clio_lmp_device_gather_id_window(void *handle, const char *field,
+                                     double *dst_dev, long natoms,
+                                     long dst_elem_off, long dst_elem_count);
 }
 
 namespace {
@@ -110,6 +116,15 @@ struct Options {
                              // | local (host extract, LAMMPS internal order)
                              // | device (GPU gather, == dump h5md, never host)
   std::string deck;          // LAMMPS input deck (setup only, no `run`)
+  // Keep the old whole-field gather + per-chunk D2D. Off by default: the
+  // copy it restores does no work. Here so the two can be measured against
+  // each other rather than taken on faith.
+  bool device_staging = false;
+  // Compare every device-gathered chunk against lammps_gather_atoms for the
+  // SAME frame in the SAME process. Cross-run comparison cannot do this job:
+  // LJ force summation on the GPU is not bit-reproducible between runs, so
+  // two runs of identical code already disagree on `force` at step 0.
+  bool crosscheck_host = false;
   std::string tag = "lammps_lib";
   std::string logfile = "none";  // LAMMPS -log
   std::string report;            // per-blob CSV
@@ -146,6 +161,17 @@ void Usage(const char *argv0) {
          "Requires --kokkos. Same\n"
       << "                           ordering as id, so crosscheck_h5md.sh "
          "still applies.\n"
+      << "  --device-staging  on --order device, gather the whole field into\n"
+         "                   scratch and copy each chunk out of it -- the old\n"
+         "                   path, one payload-sized D2D per chunk. Default\n"
+         "                   gathers each chunk straight into the registered\n"
+         "                   backend and makes no copy at all.\n"
+      << "  --crosscheck-host on --order device, also gather each frame with\n"
+         "                   lammps_gather_atoms and require every chunk to\n"
+         "                   match byte for byte. Same frame, same process --\n"
+         "                   the only sound way to check the device gather,\n"
+         "                   since GPU force summation is not reproducible\n"
+         "                   across runs.\n"
       << "  --kokkos         run LAMMPS on the GPU (-k on g 1 -sf kk)\n"
       << "  --verify         read every blob back and compare\n"
       << "  --report CSV     per-blob outcome\n"
@@ -155,6 +181,11 @@ void Usage(const char *argv0) {
          "previous --report CSV back\n"
       << "                   through the decompressor and compare digests "
          "(run with CLIO_RESTART=1)\n"
+      << "  --device-staging on --order device, gather the whole field into\n"
+         "                   scratch and copy each chunk out of it (the old\n"
+         "                   path, one payload-sized D2D per chunk). Default\n"
+         "                   gathers each chunk straight into the registered\n"
+         "                   backend and makes no copy at all.\n"
       << "  --tag NAME       CTE tag [lammps_lib]\n"
       << "  --log FILE       LAMMPS log file [none]\n"
       << "  --quiet          LAMMPS -screen none\n"
@@ -179,6 +210,8 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--chunk") o->chunk = std::strtoull(need("BYTES"), nullptr, 10);
     else if (a == "--fields") o->fields = need("LIST");
     else if (a == "--order") o->order = need("id|local");
+    else if (a == "--device-staging") o->device_staging = true;
+    else if (a == "--crosscheck-host") o->crosscheck_host = true;
     else if (a == "--deck") o->deck = need("FILE");
     else if (a == "--tag") o->tag = need("NAME");
     else if (a == "--log") o->logfile = need("FILE");
@@ -449,6 +482,20 @@ int main(int argc, char **argv) {
       opt.verify = true;
     }
 
+    // The windowed gather addresses the destination in field ELEMENTS, so a
+    // chunk boundary that is not a multiple of sizeof(double) would truncate
+    // to the wrong element and store a shifted field -- which round-trips
+    // perfectly and is the wrong data. field_bytes is natoms*3*8, so every
+    // boundary is aligned as long as the chunk size is.
+    if (!opt.device_staging && opt.chunk % sizeof(double) != 0) {
+      std::cerr << "--order device: --chunk " << opt.chunk
+                << " is not a multiple of " << sizeof(double)
+                << ". The per-chunk gather addresses whole float64 elements, "
+                   "so an unaligned boundary would store a shifted field. "
+                   "Use a multiple of 8, or --device-staging.\n";
+      return 1;
+    }
+
     if (!clio_lmp_tags_consecutive(lmp)) {
       // The gather writes to index tag[i]-1. Without consecutive IDs that
       // index is meaningless -- the same precondition lammps_gather_atoms
@@ -529,8 +576,15 @@ int main(int argc, char **argv) {
   // record a digest (and, with --raw, to write them out). Nothing on the
   // compressor path reads this, so it is skipped entirely when nothing needs
   // it -- otherwise a "GPU-resident" run would quietly pay a D2H per chunk.
-  const bool need_bytes_on_host =
-      opt.verify || !opt.report.empty() || !opt.raw_dir.empty();
+  const bool need_bytes_on_host = opt.verify || !opt.report.empty() ||
+                                  !opt.raw_dir.empty() || opt.crosscheck_host;
+  // The host reference for --crosscheck-host: lammps_gather_atoms into a
+  // plain buffer, per field per frame. This is the definition of the ordering
+  // the device gather is supposed to reproduce (it is what `dump h5md` writes
+  // after its own sort), so comparing against it checks the permutation
+  // itself and not merely that a round trip is self-consistent.
+  std::vector<double> host_ref;
+  size_t crosscheck_ok = 0, crosscheck_bad = 0;
   std::vector<char> dev_staging;
 
   // --order device: one registered device backend per chunk OF A FRAME,
@@ -552,6 +606,13 @@ int main(int argc, char **argv) {
   // Reuse is safe because drain() waits for every task of frame N before
   // frame N+1 stages anything into the same slots. Within a frame each chunk
   // has its own slot, so nothing is overwritten while it is in flight.
+  // "--order device, gathering straight into the registered backend": there
+  // is no whole-field buffer to point at, but the chunk loop still has to know
+  // it is on the device path. Never dereferenced, never offset -- compared
+  // against, and nothing else.
+  static const char kGatherPerChunkStorage = 0;
+  const char *const kGatherPerChunk = &kGatherPerChunkStorage;
+
   struct DeviceSlot {
     ctp::ipc::AllocatorId alloc;
     char *ptr = nullptr;
@@ -588,26 +649,42 @@ int main(int argc, char **argv) {
                        "Refusing.\n";
           std::exit(3);
         }
-        auto *scratch =
-            static_cast<double *>(clio_lmp_device_scratch(field_bytes));
-        if (scratch == nullptr) {
-          std::cerr << "--order device: could not allocate " << field_bytes
-                    << " B of device scratch for the ID gather\n";
-          std::exit(4);
+        if (opt.crosscheck_host) {
+          host_ref.resize(static_cast<size_t>(natoms) * 3);
+          lammps_gather_atoms(lmp, f->lmp_name, /*dtype=*/1, /*count=*/3,
+                              host_ref.data());
+          LmpCheck(lmp, "gather_atoms (crosscheck)");
         }
-        // Same permutation lammps_gather_atoms performs on the host
-        // (library.cpp:3663-3672), run on the GPU into the scratch buffer:
-        // the ordering `dump h5md` writes, without the payload ever being
-        // host bytes. This is what keeps crosscheck_h5md.sh meaningful for
-        // this order.
-        const int grc =
-            clio_lmp_device_gather_id(lmp, f->lmp_name, scratch, natoms);
-        if (grc != 0) {
-          std::cerr << "--order device: ID gather of '" << f->lmp_name
-                    << "' failed (rc=" << grc << ") at step " << step << "\n";
-          std::exit(3);
+        if (opt.device_staging) {
+          // The OLD path, kept only so it can be measured against the new
+          // one: gather the whole field into scratch, then copy each chunk
+          // out of it below. That copy is payload-sized and does no work.
+          auto *scratch =
+              static_cast<double *>(clio_lmp_device_scratch(field_bytes));
+          if (scratch == nullptr) {
+            std::cerr << "--order device: could not allocate " << field_bytes
+                      << " B of device scratch for the ID gather\n";
+            std::exit(4);
+          }
+          // Same permutation lammps_gather_atoms performs on the host
+          // (library.cpp:3663-3672), run on the GPU into the scratch buffer:
+          // the ordering `dump h5md` writes, without the payload ever being
+          // host bytes. This is what keeps crosscheck_h5md.sh meaningful for
+          // this order.
+          const int grc =
+              clio_lmp_device_gather_id(lmp, f->lmp_name, scratch, natoms);
+          if (grc != 0) {
+            std::cerr << "--order device: ID gather of '" << f->lmp_name
+                      << "' failed (rc=" << grc << ") at step " << step << "\n";
+            std::exit(3);
+          }
+          dev_field = reinterpret_cast<const char *>(scratch);
+        } else {
+          // The gather happens per chunk, directly into the registered
+          // backend, in the loop below. Nothing to do here -- and no
+          // whole-field scratch buffer exists at all on this path.
+          dev_field = kGatherPerChunk;
         }
-        dev_field = reinterpret_cast<const char *>(scratch);
       } else if (opt.order == "id") {
         // Global array ordered by atom ID -- what dump h5md writes after its
         // own sort(). One copy (LAMMPS' internal order -> ID order); the
@@ -678,14 +755,41 @@ int main(int argc, char **argv) {
             std::exit(4);
           }
           char *registered = slot.ptr;
-          ctp::GpuApi::Memcpy(registered, dev_field + off, n);
-          // The compressor reads `registered` from another thread and Clio's
-          // own streams; the copy above is not host-synchronous for D2D. One
-          // sync per chunk on an otherwise idle device is microseconds, and
-          // it removes the class of bug where a chunk is compressed before
-          // its bytes have landed -- which produces a perfectly valid blob of
-          // the wrong contents.
-          ctp::GpuApi::Synchronize();
+          if (dev_field == kGatherPerChunk) {
+            // Produce the chunk WHERE THE COMPRESSOR WILL READ IT. The gather
+            // is a scatter by atom id, so it used to need a whole-field
+            // destination and the chunk was then copied out of it -- one
+            // payload-sized D2D per chunk that moved bytes without changing
+            // any. Naming the destination window removes both the copy and
+            // the scratch field.
+            //
+            // The window is in field ELEMENTS (doubles), not bytes: `off` and
+            // `n` are byte quantities and a chunk boundary is always a
+            // multiple of sizeof(double) because the chunk size is and the
+            // field is an array of doubles.
+            const int grc = clio_lmp_device_gather_id_window(
+                lmp, f->lmp_name, reinterpret_cast<double *>(registered),
+                natoms, static_cast<long>(off / sizeof(double)),
+                static_cast<long>(n / sizeof(double)));
+            if (grc != 0) {
+              std::cerr << "--order device: windowed ID gather of '"
+                        << f->lmp_name << "' chunk " << ci << " failed (rc="
+                        << grc << ") at step " << step << "\n";
+              std::exit(3);
+            }
+            // No Synchronize() here: the gather ends in a Kokkos::fence, so
+            // the bytes are already final. The staged path below still needs
+            // one because a D2D memcpy is not host-synchronous.
+          } else {
+            ctp::GpuApi::Memcpy(registered, dev_field + off, n);
+            // The compressor reads `registered` from another thread and Clio's
+            // own streams; the copy above is not host-synchronous for D2D. One
+            // sync per chunk on an otherwise idle device is microseconds, and
+            // it removes the class of bug where a chunk is compressed before
+            // its bytes have landed -- which produces a perfectly valid blob of
+            // the wrong contents.
+            ctp::GpuApi::Synchronize();
+          }
           if (!ctp::IsDevicePointer(registered)) {
             std::cerr << "--order device: the registered staging buffer is "
                          "not device memory. The compressor would receive "
@@ -697,14 +801,45 @@ int main(int argc, char **argv) {
           blob_data.off_ = reinterpret_cast<clio::run::u64>(registered);
 
           if (need_bytes_on_host) {
-            // Read from the SCRATCH, not from `registered`: the gather has
-            // been fenced, so these bytes are certainly final. (Hashing the
-            // destination of an unsynchronized D2D is how the earlier
+            // Read from whichever buffer the gather actually fenced.
+            //
+            // Staged: the SCRATCH, not `registered`. The gather into scratch
+            // has been fenced, so those bytes are certainly final; hashing
+            // the destination of an unsynchronized D2D is how the earlier
             // gpu-direct example's verifier accused correct data of being
-            // wrong.)
+            // wrong.
+            //
+            // Per-chunk: `registered` IS the gather's destination and the
+            // gather ended in a Kokkos::fence, so it is equally final -- and
+            // there is no scratch to read instead.
+            const char *digest_src =
+                (dev_field == kGatherPerChunk) ? registered : dev_field + off;
             dev_staging.resize(n);
-            ctp::GpuApi::Memcpy(dev_staging.data(), dev_field + off, n);
+            ctp::GpuApi::Memcpy(dev_staging.data(), digest_src, n);
             bytes = dev_staging.data();
+
+            if (opt.crosscheck_host) {
+              const char *ref =
+                  reinterpret_cast<const char *>(host_ref.data()) + off;
+              if (std::memcmp(bytes, ref, n) == 0) {
+                ++crosscheck_ok;
+              } else {
+                ++crosscheck_bad;
+                // Say WHICH element, not just that the chunk differs: a
+                // window off by one shows up as a run starting exactly at a
+                // chunk boundary, which names the bug on sight.
+                size_t first = 0;
+                while (first < n / sizeof(double) &&
+                       reinterpret_cast<const double *>(bytes)[first] ==
+                           reinterpret_cast<const double *>(ref)[first])
+                  ++first;
+                std::cerr << "  CROSSCHECK MISMATCH " << f->blob_name
+                          << " step " << step << " chunk " << ci
+                          << ": first differing element " << first << " of "
+                          << (n / sizeof(double)) << " (field element "
+                          << (off / sizeof(double) + first) << ")\n";
+              }
+            }
           }
         } else {
           bytes = reinterpret_cast<const char *>(src) + off;
@@ -837,6 +972,14 @@ int main(int argc, char **argv) {
   // Before lammps_kokkos_finalize(): the scratch lives in a Kokkos memory
   // space, and freeing it after Kokkos has torn that space down is a
   // use-after-free in the allocator.
+  if (opt.crosscheck_host) {
+    std::cout << (crosscheck_bad == 0 ? "CROSSCHECK: " : "CROSSCHECK FAILED: ")
+              << crosscheck_ok << " of " << (crosscheck_ok + crosscheck_bad)
+              << " device-gathered chunk(s) match lammps_gather_atoms byte "
+                 "for byte, same frame same process"
+              << std::endl;
+  }
+
   if (opt.order == "device") {
     // After the final drain, so nothing is in flight, and nothing allocates
     // a backend after this point -- so no id can be recycled.
@@ -850,5 +993,8 @@ int main(int argc, char **argv) {
   lammps_kokkos_finalize();
   lammps_mpi_finalize();
   clio::run::CLIO_RUNTIME_FINALIZE();
+  // A failed crosscheck means the tier holds a correctly-round-tripping blob
+  // of the WRONG bytes, which is the one outcome that must never exit 0.
+  if (crosscheck_bad != 0 && rc == 0) rc = 6;
   return rc;
 }

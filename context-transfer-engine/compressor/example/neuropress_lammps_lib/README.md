@@ -37,7 +37,7 @@ verified" before relying on it outside this configuration.**
 | LAMMPS binary | stock `lmp` | patched (`fix cliogpu`) | stock `liblammps`, linked in |
 | Clio in the app | none -- VOL is dlopened by HDF5 | `libclio_gpu_blob.so` | compressor client, directly |
 | hand-over point | `output->write` → `dump h5md` → `H5Dwrite` | `end_of_step` (fix) | between `run` segments (== after `output->write`) |
-| bytes cross | GPU→host (Kokkos sync), packed, sorted, **written to .h5**, staged to Clio | device→device | `--order id/local`: gather → host shm → compressor. `--order device`: device→device, ID-gathered on the GPU |
+| bytes cross | GPU→host (Kokkos sync), packed, sorted, **written to .h5**, staged to Clio | device→device | `--order id/local`: gather → host shm → compressor. `--order device`: **nothing** — the chunk is gathered on the GPU straight into the buffer the compressor reads |
 | native copy of the data | yes (the .h5 is authoritative) | no | no |
 | where the runtime lives | in-process (`CLIO_WITH_RUNTIME=1`) | in-process | in-process |
 | needs | HDF5 + VOL | a LAMMPS tree carrying the fix + adapter | a CMake build of LAMMPS with KOKKOS |
@@ -131,6 +131,9 @@ target is skipped with a message and nothing else is affected.
 ./run.sh --box 10 --steps 100 --gap 50 --kokkos --order device
                                                            # GPU-resident hand-over;
                                                            # always reads back (see below)
+./run.sh --box 10 --steps 100 --gap 50 --kokkos --order device --crosscheck-host
+                                                           # ...and prove the GPU gather
+                                                           # matches lammps_gather_atoms
 ./run.sh --box 10 --static nvcomp-zstd                     # pin the codec, then:
 ./read.sh                                                  #   cold read-back, separate process
 ./crosscheck_h5md.sh --box 10 --steps 100 --gap 50         # bytes == dump h5md?
@@ -148,6 +151,8 @@ options:
 | `--box N --steps N --gap N` | system size (4N³ atoms), length, frame interval (frame 0 included) |
 | `--chunk BYTES` | bytes per compressor call; 0 = whole field. Default 4 MiB, the siblings' size |
 | `--order id\|local\|device` | `id`: atom-ID order via `lammps_gather_atoms` (default, == h5md). `local`: LAMMPS' internal order via `lammps_extract_atom`. `device`: atom-ID order gathered ON THE GPU out of the Kokkos device views -- same ordering as `id`, never host bytes. Needs `--kokkos`. |
+| `--device-staging` | restore the old whole-field gather + per-chunk D2D, for measuring against the default. Off by default: the copy it restores does no work |
+| `--crosscheck-host` | on `--order device`, also gather each frame with `lammps_gather_atoms` and require every chunk to match byte for byte -- same frame, same process |
 | `--kokkos` | `-k on g 1 -sf kk`: LAMMPS on the GPU; the driver still reads the (synced) host mirror |
 | `--verify` | read every blob back through the decompressor in the same process |
 | `--readback CSV` | no simulation: read the blobs a previous run listed in its CSV (what `read.sh` does) |
@@ -331,6 +336,88 @@ at, so the fix holds across a ~350x size difference.
 passed. That was added while the corruption was unexplained and is now
 redundant insurance; see "Next actions" for the case for removing it.
 
+### The staging copy, removed
+
+`--order device` used to gather a whole field into a scratch buffer and then
+copy each chunk out of it into the registered backend the compressor reads —
+**one payload-sized D2D per chunk that moved bytes without changing any**. The
+gather needed a whole-field destination because it is a *scatter*: thread `i`
+writes to `(tag(i)-1)*3`, which can land anywhere in the field.
+
+Naming a destination **window** removes the need. `clio_lmp_device_gather_id_window`
+takes `[dst_elem_off, +dst_elem_count)` in field-element space; each thread
+still computes its global destination index and writes only when it falls
+inside the window, shifted to a local one. The chunk is produced directly where
+the compressor will read it, and the scratch field stops existing.
+
+Measured with `nsys --trace=cuda`, LJ melt, 20 steps, 3 frames, `--order device`:
+
+| | box 10, 32 KB chunks (27 chunks) | box 30, 4 MiB chunks (9 chunks) |
+|---|---|---|
+| D2D copies, `--device-staging` | 27 | 9 |
+| D2D bytes, `--device-staging` | 864,000 | 23,328,000 |
+| D2D copies, default | **0** | **0** |
+| D2D bytes, default | **0** | **0** |
+| H2D bytes, staged → default | 14,580,472 → 14,580,384 | 448,472,307 → 448,474,095 |
+| D2H bytes, staged → default | 21,117,180 → 21,117,092 | 867,279,257 → 867,281,045 |
+
+**Every payload-sized D2D is gone**; H2D and D2H move by ~88 B and ~1.8 KB of
+control traffic, i.e. not at all. The whole-field scratch allocation is gone
+with it — 2.59 MB at box 30, and it scales with the system.
+
+It is **not** a speed fix, and the numbers say so plainly: 0.103 ms of GPU
+memcpy time out of a 1.8 s run, and total wall time 1.828 s staged against
+1.812 s direct, which is noise. What it removes is bytes and a buffer.
+
+The cost is that the source is re-read once per chunk, since which atoms fall
+in a window is not known without reading `tag`. At one chunk per field — the
+usual case, a field is 96 KB at box 10 against a 4 MiB default chunk — it is a
+strict win: one fewer full-field read and one fewer full-field write. At two
+chunks it is even. Beyond that it trades device-local reads for a device-local
+copy plus a whole extra field of device memory. Nothing here crosses PCIe
+either way.
+
+`--device-staging` restores the old path so the two can be measured against
+each other rather than taken on faith. That is how the table above was made:
+`PROFILE="nsys profile --trace=cuda -o /tmp/x" ./run.sh --order device ...`.
+
+### Why the round-trip check could not validate this, and what did
+
+`--verify` reads each blob back and compares it against a digest **taken from
+the buffer that was submitted**. A gather that wrote the wrong bytes into that
+buffer produces a blob that round-trips perfectly and is simply wrong — so the
+existing check could not have caught a window bug. Neither could comparing
+digests between two runs: **LJ force summation on the GPU is not
+bit-reproducible**, and two runs of identical code already disagree on `force`
+at step 0. (Positions and velocities at step 0 do match, which is what makes
+the cause identifiable rather than mysterious.)
+
+`--crosscheck-host` is the check that works. For each frame it also calls
+`lammps_gather_atoms` — LAMMPS' own reference permutation, the one `dump h5md`
+writes — and requires every device-gathered chunk to match it byte for byte,
+**same frame, same process**, which sidesteps run-to-run nondeterminism
+entirely.
+
+```console
+$ ./run.sh --box 10 --steps 20 --gap 10 --kokkos --order device \
+           --crosscheck-host --chunk 32768
+CROSSCHECK: 27 of 27 device-gathered chunk(s) match lammps_gather_atoms byte
+for byte, same frame same process
+```
+
+Passing at 1, 3 and 7 chunks per field, and with `--device-staging` too. And it
+has teeth — with a deliberate `+1` injected into the window offset:
+
+```
+CROSSCHECK MISMATCH position step 0 chunk 0: first differing element 2 of 4096 (field element 2)
+CROSSCHECK MISMATCH position step 0 chunk 1: first differing element 0 of 4096 (field element 4096)
+```
+
+A first difference at exactly a chunk boundary names the bug on sight. The run
+exits non-zero (6, or 3 when the bad window also trips the gather's own bounds
+refusal), because a correctly-round-tripping blob of the wrong bytes is the one
+outcome that must never exit 0.
+
 ## What is NOT verified
 
 Be careful about reading the results above as broader than they are.
@@ -346,11 +433,18 @@ Be careful about reading the results above as broader than they are.
   raw device pointer directly and the CUDA IPC handle machinery
   (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`) is never exercised. A
   separate-runtime deployment is unproven.
-- **The integrity check is not independent of the codec.** `--verify` reads
-  back through the same Clio decompressor that wrote the data, so a codec that
-  corrupted symmetrically would pass. `crosscheck_h5md.sh`, which compares
-  against a stock `dump h5md`, is the independent check -- and is what the
-  `k_tag` gather was validated against.
+- **`--verify` is not independent of the codec.** It reads back through the
+  same Clio decompressor that wrote the data, so a codec that corrupted
+  symmetrically would pass -- and, more to the point, it digests the buffer
+  that was *submitted*, so it cannot see a gather that filled that buffer
+  wrongly. Two checks cover what it cannot:
+  `crosscheck_h5md.sh` compares against a stock `dump h5md` and is independent
+  of Clio entirely, but is meaningful only for a **CPU** run with `--order id`,
+  because a GPU run is not bit-reproducible. `--crosscheck-host` is the GPU
+  path's equivalent: it compares each device-gathered chunk against
+  `lammps_gather_atoms` in the **same frame and the same process**, which is
+  what makes it immune to that nondeterminism. It is independent of the codec
+  because it runs before compression.
 - **Single-node, single-rank only.** MPI is refused, not supported.
 
 ## Next actions
@@ -370,9 +464,10 @@ In the order worth doing them:
    to opt-in so `--order device` stops paying for a bug that no longer exists.
 4. **Fix `GpuApi::Memcpy`'s contract.** It reads as a completed copy but is
    asynchronous for pageable-H2D *and* for D2D. This example hand-compensates
-   with an explicit `Synchronize()` after its D2D staging copy; two other call
-   sites rely on the wrong assumption, one saved only by an incidental
-   `cudaFree` sync. Either rename it (`MemcpyEnqueue`) or give it
+   with an explicit `Synchronize()` after its D2D staging copy -- now only on
+   `--device-staging`, since the default path has no D2D to compensate for and
+   ends in a `Kokkos::fence` instead; two other call sites rely on the wrong
+   assumption, one saved only by an incidental `cudaFree` sync. Either rename it (`MemcpyEnqueue`) or give it
    `DeviceAwareMemcpy`'s private-stream-and-sync shape. The header bug was one
    instance of this trap; the trap is still set.
 5. **Fix `warn` in the paper-benchmark scripts.** The log-level parser accepts

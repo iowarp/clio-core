@@ -240,11 +240,35 @@ int clio_lmp_tags_consecutive(void *handle) {
  * rank does not own must be exactly 0.0. The driver refuses multi-rank runs,
  * but the arithmetic stays the same one either way.
  *
- * dst_dev must be device memory of at least natoms*3 doubles. Returns 0 on
- * success, non-zero on a refused precondition -- never a partial gather.
+ * dst_dev must be device memory of at least dst_elem_count doubles. Returns 0
+ * on success, non-zero on a refused precondition -- never a partial gather.
+ *
+ * WINDOWED, and that is what lets the caller skip a staging copy.
+ *
+ * The permutation is a SCATTER: thread i writes to (tag(i)-1)*3, which may be
+ * anywhere in the field, so a gather of the whole field needs a whole-field
+ * destination. That is why this used to be handed a scratch buffer, with the
+ * caller then copying each chunk out of it into the registered backend the
+ * compressor reads -- one payload-sized D2D per chunk, doing no work.
+ *
+ * Naming a destination WINDOW [dst_elem_off, dst_elem_off+dst_elem_count) in
+ * field-element space removes it. Each thread still computes its global
+ * destination index, but writes only when that index lands inside the window,
+ * shifted to a local one. The chunk is then produced directly in the buffer
+ * the compressor will read, and the scratch field disappears entirely.
+ *
+ * The cost is that the source is re-read once per chunk, since which atoms
+ * fall in a window is not known without reading tag. Measured against the
+ * copy it replaces: at one chunk per field (the usual case here -- a field is
+ * 96 KB at box 10 against a 4 MiB default chunk) it is a strict win, one
+ * fewer full-field read and one fewer full-field write; at two chunks it is
+ * even; beyond that it trades device-local reads for a device-local copy plus
+ * a whole extra field of device memory. Device bandwidth either way -- nothing
+ * here crosses PCIe.
  */
-int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
-                              long natoms) {
+int clio_lmp_device_gather_id_window(void *handle, const char *field,
+                                     double *dst_dev, long natoms,
+                                     long dst_elem_off, long dst_elem_count) {
   LAMMPS *lmp = KokkosLammps(handle);
   if (!lmp || !field || !dst_dev || natoms <= 0) return 1;
   if (!clio_lmp_tags_consecutive(handle)) return 2;
@@ -252,61 +276,63 @@ int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
   const int nlocal = lmp->atomKK->nlocal;
   if (nlocal < 0 || static_cast<long>(nlocal) > natoms) return 3;
 
+  // A window outside the field would silently gather nothing and store zeros,
+  // which round-trips perfectly and is the wrong data.
+  const long field_elems = natoms * 3;
+  if (dst_elem_off < 0 || dst_elem_count <= 0 ||
+      dst_elem_off + dst_elem_count > field_elems) {
+    return 5;
+  }
+
   // Unmanaged: Clio owns these bytes (a registered kDeviceMem backend), so the
   // View must never take a reference to them.
   using DstView = Kokkos::View<double *, LMPDeviceType,
                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-  DstView dst(dst_dev, static_cast<size_t>(natoms) * 3);
+  DstView dst(dst_dev, static_cast<size_t>(dst_elem_count));
 
   auto tag = lmp->atomKK->k_tag.view<LMPDeviceType>();
+  const size_t lo = static_cast<size_t>(dst_elem_off);
+  const size_t hi = lo + static_cast<size_t>(dst_elem_count);
 
-  // Every slot, then the owned ones. Two passes rather than one because the
-  // permutation is a scatter: which slots this rank writes is not known
-  // without reading tag, and a slot left untouched must still be 0.0.
+  // Every slot in the window, then the owned ones. Two passes rather than one
+  // because the permutation is a scatter: which slots this rank writes is not
+  // known without reading tag, and a slot left untouched must still be 0.0.
   Kokkos::parallel_for(
       "clio_gather_zero",
-      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<size_t>(natoms) * 3),
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<size_t>(dst_elem_count)),
       KOKKOS_LAMBDA(const size_t k) { dst(k) = 0.0; });
 
+  // One body, three fields. A macro rather than three copies of the window
+  // arithmetic: getting the bound test wrong in one of them would corrupt a
+  // single field in a way only a digest catches.
+#define CLIO_LMP_GATHER_WINDOW(SRCVIEW, NAME)                                do {                                                                         auto src = (SRCVIEW);                                                      Kokkos::parallel_for(                                                          NAME, Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),                       KOKKOS_LAMBDA(const int i) {                                                 const size_t off = static_cast<size_t>(tag(i) - 1) * 3;                    for (int c = 0; c < 3; ++c) {                                                const size_t g = off + static_cast<size_t>(c);                             if (g >= lo && g < hi) dst(g - lo) = src(i, c);                          }                                                                        });                                                                  } while (0)
+
   if (std::strcmp(field, "x") == 0) {
-    auto src = lmp->atomKK->k_x.view<LMPDeviceType>();
-    Kokkos::parallel_for(
-        "clio_gather_x", Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),
-        KOKKOS_LAMBDA(const int i) {
-          const size_t off = static_cast<size_t>(tag(i) - 1) * 3;
-          dst(off + 0) = src(i, 0);
-          dst(off + 1) = src(i, 1);
-          dst(off + 2) = src(i, 2);
-        });
+    CLIO_LMP_GATHER_WINDOW(lmp->atomKK->k_x.view<LMPDeviceType>(), "clio_gather_x");
   } else if (std::strcmp(field, "v") == 0) {
-    auto src = lmp->atomKK->k_v.view<LMPDeviceType>();
-    Kokkos::parallel_for(
-        "clio_gather_v", Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),
-        KOKKOS_LAMBDA(const int i) {
-          const size_t off = static_cast<size_t>(tag(i) - 1) * 3;
-          dst(off + 0) = src(i, 0);
-          dst(off + 1) = src(i, 1);
-          dst(off + 2) = src(i, 2);
-        });
+    CLIO_LMP_GATHER_WINDOW(lmp->atomKK->k_v.view<LMPDeviceType>(), "clio_gather_v");
   } else if (std::strcmp(field, "f") == 0) {
-    auto src = lmp->atomKK->k_f.view<LMPDeviceType>();
-    Kokkos::parallel_for(
-        "clio_gather_f", Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),
-        KOKKOS_LAMBDA(const int i) {
-          const size_t off = static_cast<size_t>(tag(i) - 1) * 3;
-          dst(off + 0) = src(i, 0);
-          dst(off + 1) = src(i, 1);
-          dst(off + 2) = src(i, 2);
-        });
+    CLIO_LMP_GATHER_WINDOW(lmp->atomKK->k_f.view<LMPDeviceType>(), "clio_gather_f");
   } else {
+#undef CLIO_LMP_GATHER_WINDOW
     return 4;
   }
+#undef CLIO_LMP_GATHER_WINDOW
 
-  // The caller stages and submits straight after this returns, and Clio's
-  // copy runs on a different stream, so the gather has to be COMPLETE here
-  // rather than merely issued.
+  // The caller submits straight after this returns, and Clio reads the buffer
+  // from another thread on its own streams, so the gather has to be COMPLETE
+  // here rather than merely issued.
   Kokkos::fence("clio_lmp_device_gather_id");
   return 0;
+}
+
+/** Whole-field gather: the window is the field. Kept because the sibling
+ *  step-trace example and the staged path still ask for one. */
+int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
+                              long natoms) {
+  return clio_lmp_device_gather_id_window(handle, field, dst_dev, natoms,
+                                          /*dst_elem_off=*/0,
+                                          /*dst_elem_count=*/natoms * 3);
 }
 
 }  // extern "C"
