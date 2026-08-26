@@ -654,6 +654,20 @@ jobs:
     timeout-minutes: 30
 
     steps:
+    # Runs FIRST, before any artifact download: this job has no source
+    # checkout by design (a repo working directory could shadow the installed
+    # package), but it does need CI/Retry.ps1 -- and actions/checkout DELETES
+    # the contents of a workspace that is not already a git repo, so running it
+    # after "Download Windows wheels" would take the wheels with it.
+    #
+    # Non-cone mode is required: cone mode always adds the top-level files,
+    # pyproject.toml among them, which is exactly the shadowing this job avoids.
+    - name: Fetch the CI retry helper
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+        sparse-checkout-cone-mode: false
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
