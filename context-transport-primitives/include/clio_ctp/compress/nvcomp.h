@@ -230,12 +230,35 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        // Clear any error left by earlier work on this thread, so the
+        // check after the launch can only see this compression's own.
+        cudaGetLastError();
+        ScratchOom();  // clear before the launch
         KernelTimer timer(stream);
         mgr->compress(d_in, d_out, cfg);
+        // A launch that never ran (device out of memory is the case seen)
+        // reports here and NOT through the sync below: with nothing enqueued
+        // the sync succeeds, d_out keeps whatever the allocator recycled, and
+        // get_compressed_output_size() then reads a plausible size out of it.
+        // The result is a unique, well-sized, undecompressable blob stored as
+        // a success. Checking the launch is what turns that into a failure
+        // the caller can fall back from.
+        if (cudaPeekAtLastError() != cudaSuccess) break;
         timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+        if (cudaGetLastError() != cudaSuccess) break;
         size_t comp_size = mgr->get_compressed_output_size(d_out);
-        if (comp_size > output_size) break;  // caller buffer too small
+        // Zero is not a compressed stream: nvcomp writes a header even for
+        // incompressible input, so it means the size came from memory the
+        // kernels never wrote.
+        if (comp_size == 0 || comp_size > output_size) break;
+
+        // The scratch allocator flags a device-memory failure that nvcomp
+        // itself does not report: with cudaMallocAsync (its default) the
+        // failure lands on the stream, compress() returns normally and the
+        // output is a plausible size that no decompressor accepts. See
+        // ScratchOom().
+        if (ScratchOom()) break;
 
         // Deliver to the caller's buffer if we compressed into a temp.
         if (d_out != static_cast<uint8_t *>(output)) {
@@ -351,6 +374,7 @@ class NvComp : public Compressor {
         ReleaseSlot(slot);
         return false;
       }
+      InstallScratchAllocators(slot->mgr);
       nvcomp::CompressionConfig cfg = slot->mgr->configure_compression(input_size);
       slot->out_is_device = IsDeviceAccessible(output);
       if (slot->out_is_device &&
@@ -370,7 +394,16 @@ class NvComp : public Compressor {
         ReleaseSlot(slot);
         return false;
       }
+      cudaGetLastError();
+      ScratchOom();  // clear
       slot->mgr->compress(slot->d_in, slot->d_out, cfg);
+      // Same launch check as Compress(): a launch that never ran leaves the
+      // slot's output buffer holding recycled memory, which CompressWait()
+      // would otherwise size and deliver as a successful candidate.
+      if (cudaPeekAtLastError() != cudaSuccess || ScratchOom()) {
+        ReleaseSlot(slot);
+        return false;
+      }
       if (cudaEventRecord(slot->ev_stop, slot->stream) != cudaSuccess) {
         ReleaseSlot(slot);
         return false;
@@ -403,7 +436,8 @@ class NvComp : public Compressor {
     }
     try {
       const size_t comp_size = slot->mgr->get_compressed_output_size(slot->d_out);
-      if (comp_size > slot->out_capacity) return false;
+      // Zero means the size came from memory the kernels never wrote.
+      if (comp_size == 0 || comp_size > slot->out_capacity) return false;
       if (slot->d_out != static_cast<uint8_t *>(slot->out)) {
         const cudaMemcpyKind kind = slot->out_is_device
                                         ? cudaMemcpyDeviceToDevice
@@ -476,10 +510,15 @@ class NvComp : public Compressor {
           free_out = true;
         }
 
+        cudaGetLastError();
         KernelTimer timer(stream);
         mgr->decompress(d_out, d_in, cfg);
+        // A decompression whose kernels never launched would otherwise leave
+        // the caller's buffer untouched and still report success.
+        if (cudaPeekAtLastError() != cudaSuccess) break;
         timer.Stop();
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+        if (cudaGetLastError() != cudaSuccess) break;
 
         if (d_out != static_cast<uint8_t *>(output)) {
           if (cudaMemcpy(output, d_out, cfg.decomp_data_size,
@@ -665,12 +704,48 @@ class NvComp : public Compressor {
     }
 
     auto mgr = MakeManager(stream);
+    InstallScratchAllocators(mgr);
     if (!mgr) return nullptr;
     c.slots[victim].mgr = mgr;
     c.slots[victim].algo = idx;
     c.slots[victim].tick = ++c.clock;
     ++c.misses;
     return mgr;
+  }
+
+  /** Set when our scratch allocator could not satisfy nvcomp, cleared by the
+   *  caller before each compression. Thread-local: managers are per thread. */
+  static bool &ScratchOomFlag() {
+    static thread_local bool oom = false;
+    return oom;
+  }
+  static bool ScratchOom() {
+    bool v = ScratchOomFlag();
+    ScratchOomFlag() = false;
+    return v;
+  }
+
+  /** nvcomp's own scratch allocator is cudaMallocAsync, whose failure is
+   *  asynchronous -- it does not throw, so compress() reports success and
+   *  writes an output no decompressor accepts. Synchronous cudaMalloc turns
+   *  that into something this call can see. */
+  static void InstallScratchAllocators(
+      const std::shared_ptr<nvcomp::nvcompManagerBase> &mgr) {
+    if (!mgr) return;
+    try {
+      mgr->set_scratch_allocators(
+          [](size_t n) -> void * {
+            void *p = nullptr;
+            if (cudaMalloc(&p, n) != cudaSuccess) {
+              ScratchOomFlag() = true;
+              return nullptr;
+            }
+            return p;
+          },
+          [](void *p, size_t) { if (p) cudaFree(p); });
+    } catch (...) {
+      // CPU managers throw here; they do not use device scratch at all.
+    }
   }
 
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
