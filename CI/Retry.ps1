@@ -22,9 +22,17 @@
 
 [CmdletBinding()]
 param(
+    # Named-only, and that is load-bearing. An advanced function makes every
+    # parameter positional in declaration order unless something claims a
+    # position, so `Retry.ps1 choco install ...` bound "choco" to -Attempts and
+    # died with "Cannot convert value \"choco\" to type System.Int32". Giving
+    # -Command the explicit Position 0 leaves these two reachable by name only,
+    # so both call shapes work: with and without -Attempts/-DelaySeconds.
+    [Parameter()]
     [int]$Attempts = 3,
+    [Parameter()]
     [int]$DelaySeconds = 5,
-    [Parameter(ValueFromRemainingArguments = $true)]
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Command
 )
 
