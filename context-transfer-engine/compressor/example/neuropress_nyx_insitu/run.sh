@@ -43,7 +43,7 @@ STORE=${STORE:-$HERE/store}
 PORT=${PORT:-}
 RANKS=1 USE_MPI=false MAXGRID=
 NYX_BIN_MPI=${NYX_BIN_MPI:-$HOME/src/Nyx/build-clio-mpi/Exec/HydroTests/nyx_HydroTests}
-NYX_BIN_SET=false
+NYX_BIN_SET=false DECK_SET=
 VERIFY=false CHECK_BOUND=false RESTART=false
 LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB= STATIC_SHUF=0
 EXTRA=()
@@ -74,6 +74,7 @@ while [ $# -gt 0 ]; do
     --ranks) RANKS=$2; USE_MPI=true; shift 2;;
     --max-grid) MAXGRID=$2; shift 2;;
     --bin) NYX_BIN=$2; NYX_BIN_SET=true; shift 2;;
+    --deck) DECK_SET=$2; shift 2;;
     -h|--help) usage; exit 0;;
     *) EXTRA+=("$1"); shift;;              # passed to Nyx verbatim
   esac
@@ -88,7 +89,13 @@ if [ "$USE_MPI" = true ]; then
   command -v mpirun >/dev/null || { echo "--mpi needs mpirun on PATH" >&2; exit 1; }
 fi
 [ -d "$WEIGHTS" ] || { echo "missing weights: $WEIGHTS" >&2; exit 1; }
-DECK=$(dirname "$NYX_BIN")/inputs.3d.sph.sedov
+# The Sedov blast is a HydroTests UNIT PROBLEM -- it runs with gravity off,
+# no dark matter and no cosmological expansion, so it exercises Nyx purely as a
+# hydro solver. --deck points at another Exec's inputs (e.g. LyA's, the
+# Lyman-alpha forest problem Nyx is actually for) whose evolution is driven by
+# redshift rather than by a blast. The in-situ hook lives in the shared
+# Source/IO/Nyx_output.cpp, so every Exec's binary carries it.
+DECK=${DECK_SET:-$(dirname "$NYX_BIN")/inputs.3d.sph.sedov}
 [ -f "$DECK" ] || { echo "missing deck: $DECK" >&2; exit 1; }
 
 # Every Clio runtime binds a TCP port and one process per port is the limit.

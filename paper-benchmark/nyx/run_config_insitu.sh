@@ -31,6 +31,7 @@ CONFIG=${1:-explore-balance}; shift || true
 NCELL=128 STEPS=200 INT=10 CHUNK=4194304
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
 RESULTS="$HERE/results" TAG="" VERIFY=0 CHECK_BOUND=0
+EXP_ENERGY="" STOP_TIME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --ncell) NCELL=$2; shift 2;;
@@ -52,6 +53,17 @@ while [ $# -gt 0 ]; do
     # adapter holds each frame's submitted bytes for one frame and compares
     # against those.
     --check-bound) CHECK_BOUND=1; shift;;
+    # Sedov blast energy and the physical time the run stops at. Both reach
+    # the deck verbatim. The defaults leave the data nearly static: the shock
+    # radius goes as R = 1.033*(E t^2/rho)^(1/5), so at the deck's E=1 and
+    # stop_time=0.01 it reaches only ~0.16 of a unit box and most of the
+    # domain never changes. Raising E does two things at once -- it widens the
+    # shock AND, because the timestep is CFL-limited by the higher velocities,
+    # it takes MORE steps to reach the same stop_time. Measured at 128^3:
+    # E=1 -> ~300 steps and a 6.9x ratio range, E=10 -> ~675 and 44x,
+    # E=100 -> ~1575 and 114x.
+    --exp-energy) EXP_ENERGY=$2; shift 2;;
+    --stop-time)  STOP_TIME=$2; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -97,6 +109,8 @@ env "${COST_ENV[@]}" \
         --threshold "$THRESH_OPT" --store "$STORE" \
         ${VERIFY:+$([ "$VERIFY" = 1 ] && echo --verify)} \
         ${CHECK_BOUND:+$([ "$CHECK_BOUND" = 1 ] && echo --check-bound)} \
+        ${EXP_ENERGY:+prob.exp_energy=$EXP_ENERGY} \
+        ${STOP_TIME:+stop_time=$STOP_TIME} \
         > "$RESULTS/.$NAME.stdout" 2>&1
 RC=$?
 set -e
@@ -138,6 +152,7 @@ cat > "$STORE/meta.json" <<JSON
  "cost_model":"$COSTMODEL","bw_bytes_per_ms":${BW:-5e6},
  "error_bound":${EB:-0},"explore_k":$EXPLORE_K_OPT,"explore_thresh":$THRESH_OPT,
  "device":"gpu","workload":"nyx-sedov","residency":"device","host_refusals":$HOSTED,
+ "exp_energy":${EXP_ENERGY:-1},"stop_time":${STOP_TIME:-0.01},
  "atoms":0,"steps":$STEPS,"gap":$INT,"frames":$FRAMES,"chunk":$CHUNK,
  "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
  "verify_result":"$VERDICT",
