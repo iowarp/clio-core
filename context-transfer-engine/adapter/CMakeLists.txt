@@ -51,9 +51,22 @@ if (CLIO_CTE_ENABLE_HDF5_VOL)
     add_subdirectory(hdf5_vol)
 endif()
 
-# GPU Vector adapter (CUDA/ROCm only; device-paged vector over the CTE)
-if (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
+# GPU Vector adapter (device-paged vector over the CTE).
+#
+# CLANG ONLY, AND SILENT ABOUT IT RATHER THAN BROKEN. Its device API is C++20
+# coroutines end to end, which nvcc cannot compile -- so under nvcc every one
+# of its targets fails with "namespace clio::run::gpu has no member
+# YCoroTask", halfway through a build that had no way to know better. That is
+# exactly what a CI job naming test_gpu_vector_* in its --target list got.
+#
+# Not built at all unless the GPU toolchain is clang. A build that cannot
+# compile the vector should not offer its targets.
+if ((CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM) AND CLIO_GPU_CLANG)
     add_subdirectory(gpu_vector)
+elseif (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
+    message(STATUS
+            "gpu_vector: DISABLED -- needs CLIO_GPU_CLANG=ON (its device API "
+            "is C++20 coroutines, which only clang compiles for the device)")
 endif()
 
 # kvhdf5 adapter (CUDA only; HDF5-like producer surface over the CTE KV store)

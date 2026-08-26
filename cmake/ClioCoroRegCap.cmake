@@ -87,7 +87,7 @@ endfunction()
 # because it mirrors those onto the probe.
 # --------------------------------------------------------------------------
 function(clio_coro_regcap tgt)
-  if(NOT CLIO_GPU_YIELD_CORO)
+  if(NOT CLIO_GPU_CLANG)
     return()   # no device coroutines in this configuration; nothing to cap
   endif()
   if(NOT CMAKE_CUDA_COMPILER_ID MATCHES "Clang")

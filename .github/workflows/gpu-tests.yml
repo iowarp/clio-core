@@ -119,6 +119,17 @@ jobs:
     # no hand-placed directory. If the download is unavailable the build still
     # succeeds and cte_gpu_vector_hbm_nvcomp SKIPS, rather than silently
     # measuring the scalar LZ4 fallback and calling it nvcomp.
+    # The CUDA compiler for every GPU target, not just the vector's -- see
+    # CLIO_GPU_CLANG. The version matters: device coroutines need a recent
+    # clang, and this tree is tested with 22.
+    - name: Install clang (CUDA compiler for GPU code)
+      shell: bash -el {0}
+      run: |
+        if ! command -v clang++-22 &>/dev/null; then
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+        fi
+        clang++-22 --version | head -1
+
     - name: Compile GPU tests (compile-only, no device)
       shell: bash -el {0}
       run: |
@@ -128,6 +139,12 @@ jobs:
         # "No rule to make target 'test_yieldable'". CTE + the compressor
         # must be on too: the compressed-tier tests and the weights bench
         # only exist when clio_cte_compressor_runtime does.
+        # CLIO_GPU_CLANG, or the gpu_vector targets below DO NOT EXIST and
+        # this step dies on "No rule to make target". The vector's device API
+        # is C++20 coroutines, which nvcc cannot compile -- so the adapter is
+        # not built at all unless the GPU toolchain is clang. Without this
+        # flag the target list here was naming things the configure had
+        # deliberately skipped.
         cmake -S . -B build-gpu-compile \
           -DCMAKE_BUILD_TYPE=Release \
           -DCLIO_CORE_ENABLE_RUNTIME=ON \
@@ -135,6 +152,7 @@ jobs:
           -DCLIO_CORE_ENABLE_TESTS=ON \
           -DCLIO_CTE_ENABLE_COMPRESS=ON \
           -DCLIO_CORE_ENABLE_CUDA=ON \
+          -DCLIO_GPU_CLANG=ON \
           -DCMAKE_CUDA_ARCHITECTURES=89-real
         cmake --build build-gpu-compile -j "$(nproc)" \
           --target test_yieldable test_yield_stack \

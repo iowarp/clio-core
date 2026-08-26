@@ -143,6 +143,22 @@ endif()
 option(CLIO_CORE_ENABLE_ELF "Enable ELF support (required for CTE adapters)" OFF)
 option(CLIO_CORE_ENABLE_OPENMP "Enable the use of OpenMP" OFF)
 option(CLIO_CORE_ENABLE_CUDA "Enable CUDA support" OFF)
+# ONE SWITCH FOR THE WHOLE GPU BUILD, not a per-feature flag.
+#
+# clang compiles CUDA as C++, so it gets C++20 device coroutines; nvcc does
+# not, and nothing that needs them can be built by it. That is a property of
+# the TOOLCHAIN, so it belongs to the build as a whole -- picking the compiler
+# in one place and letting every GPU component ask "is this a clang build?"
+# rather than each carrying its own flag and its own way to be misconfigured.
+#
+# gpu_vector is the component that needs it: its device API is coroutines all
+# the way down. With this OFF the vector is not built at all (see its
+# CMakeLists) rather than failing halfway through a compile with "namespace
+# clio::run::gpu has no member YCoroTask", which is what a CI job that did not
+# know about this got.
+option(CLIO_GPU_CLANG
+       "Use clang as the CUDA compiler for ALL GPU code (enables device coroutines; required by gpu_vector)"
+       OFF)
 option(CLIO_CORE_ENABLE_GPU_RUNTIME "Enable GPU runtime (CDP-based parallelism)" OFF)
 option(CLIO_CORE_ENABLE_ROCM "Enable ROCm support" OFF)
 option(CLIO_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transport" OFF)
@@ -271,9 +287,39 @@ endif()
 #------------------------------------------------------------------------------
 # Provides macros for dependency resolution and ChiMod build functions
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
+# BEFORE ClioCoreCommon, because that is where enable_language(CUDA) runs and
+# the compiler cannot be chosen after the language is enabled.
+if(CLIO_GPU_CLANG)
+    if(NOT CLIO_CORE_ENABLE_CUDA)
+        message(FATAL_ERROR "CLIO_GPU_CLANG requires CLIO_CORE_ENABLE_CUDA=ON")
+    endif()
+    if(NOT CMAKE_CUDA_COMPILER)
+        # Newest first: device coroutines need a recent clang, and the probe
+        # is the same one a developer would do by hand.
+        find_program(CLIO_GPU_CLANGXX
+                     NAMES clang++-22 clang++-21 clang++-20 clang++-19 clang++
+                     DOC "clang++ used as the CUDA compiler")
+        if(NOT CLIO_GPU_CLANGXX)
+            message(FATAL_ERROR
+                    "CLIO_GPU_CLANG=ON but no clang++ was found. Install one "
+                    "(clang++-22 or newer is what this tree is tested with) "
+                    "or pass -DCMAKE_CUDA_COMPILER=/path/to/clang++.")
+        endif()
+        set(CMAKE_CUDA_COMPILER "${CLIO_GPU_CLANGXX}" CACHE FILEPATH
+            "CUDA compiler (clang, selected by CLIO_GPU_CLANG)" FORCE)
+    elseif(NOT CMAKE_CUDA_COMPILER MATCHES "clang")
+        message(FATAL_ERROR
+                "CLIO_GPU_CLANG=ON but CMAKE_CUDA_COMPILER is "
+                "'${CMAKE_CUDA_COMPILER}'. nvcc cannot compile device "
+                "coroutines; pass a clang++ or turn CLIO_GPU_CLANG off.")
+    endif()
+    message(STATUS "GPU toolchain: clang (${CMAKE_CUDA_COMPILER}) -- device coroutines on")
+endif()
+
 include(ClioCoreCommon)
 # Measured per-kernel register ceilings for device-coroutine kernels; a no-op
-# unless CLIO_GPU_YIELD_CORO is on and the CUDA compiler is clang.
+# unless CLIO_GPU_CLANG is on.
 include(ClioCoroRegCap)
 
 #------------------------------------------------------------------------------
@@ -1281,16 +1327,17 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # device code outright. The macro mechanism stays the default and the
     # two share one stack and host protocol, so this flips per build, not
     # per kernel.
+    # KEPT AS AN ALIAS. CLIO_GPU_CLANG is the switch now -- one toolchain
+    # decision for all GPU code -- but scripts and presets that pass the old
+    # flag should keep working rather than silently building something else.
     option(CLIO_GPU_YIELD_CORO
-           "Yieldable GPU kernels use C++20 device coroutines (requires clang as the CUDA compiler)" OFF)
-    if(CLIO_GPU_YIELD_CORO)
-        if(NOT CLIO_CORE_ENABLE_CUDA)
-            message(FATAL_ERROR "CLIO_GPU_YIELD_CORO requires CLIO_CORE_ENABLE_CUDA=ON")
-        endif()
-        if(NOT CMAKE_CUDA_COMPILER MATCHES "clang")
-            message(FATAL_ERROR "CLIO_GPU_YIELD_CORO requires clang as the CUDA compiler "
-                                "(-DCMAKE_CUDA_COMPILER=clang++-22); nvcc cannot compile device coroutines")
-        endif()
+           "Deprecated alias for CLIO_GPU_CLANG" OFF)
+    if(CLIO_GPU_YIELD_CORO AND NOT CLIO_GPU_CLANG)
+        message(FATAL_ERROR
+                "CLIO_GPU_YIELD_CORO is now CLIO_GPU_CLANG, which also picks "
+                "the compiler. Re-run with -DCLIO_GPU_CLANG=ON.")
+    endif()
+    if(CLIO_GPU_CLANG)
         add_compile_definitions(CLIO_YIELD_CORO)
         message(STATUS "Yieldable GPU kernels: C++20 device coroutines (clang)")
     endif()
