@@ -91,7 +91,8 @@ ExploreLog *ExploreLogInstance() {
         // chunk, the primary unless an alternative beat it.
         std::fprintf(l->fp,
                      "seq,blob,chunk_bytes,role,rank,lib_name,algo_idx,preset,"
-                     "quantize,shuffle,pred_ratio,pred_ct_ms,ratio,ct_ms,"
+                     "quantize,shuffle,pred_ratio,pred_ct_ms,pred_dt_ms,"
+                     "ratio,ct_ms,"
                      "dt_ms,psnr_db,cost,primary_cost,adopted\n");
       }
     }
@@ -197,7 +198,8 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
 void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           int rank, const std::string &lib_name,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,
-                          double pred_ratio, double pred_ct_ms, double ratio,
+                          double pred_ratio, double pred_ct_ms,
+                          double pred_dt_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
                           double primary_cost, bool adopted, bool is_primary,
                           double dt_ms) {
@@ -226,14 +228,18 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
   // dt_ms is -1 unless CLIO_NEUROPRESS_EXPLORE_MEASURE_DT made the sweep
   // decompress each candidate back. -1 means "not measured", which is the
   // default and upstream's only behaviour -- distinct from a measured 0.
+  //
+  // pred_dt_ms has no such caveat: the dt head runs for every action in the
+  // one inference that ranked the chunk, so it is always a real prediction,
+  // and it is what dt_ms should be compared against.
   std::fprintf(log->fp,
                "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
-               "%.10g,%.10g,%.10g,%.10g,%d\n",
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%d\n",
                log->seq++, blob_name.c_str(), chunk_size,
                is_primary ? "primary" : "alt", rank,
                lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
-               shuffle, pred_ratio, pred_ct_ms, ratio, ct_ms, dt_ms, psnr_db,
-               cost, primary_cost, adopted ? 1 : 0);
+               shuffle, pred_ratio, pred_ct_ms, pred_dt_ms, ratio, ct_ms,
+               dt_ms, psnr_db, cost, primary_cost, adopted ? 1 : 0);
   std::fflush(log->fp);
 }
 

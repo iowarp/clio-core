@@ -34,7 +34,9 @@ struct ExploreRow {
   uint32_t preset_id;
   bool quant;
   uint32_t shuffle;
-  double pred_ratio, pred_ct, ratio, ct_ms, psnr, cost;
+  /** pred_ct/pred_dt are the NN's own outputs for THIS action, made in the
+   *  one inference that ranked the chunk -- not recomputed by the sweep. */
+  double pred_ratio, pred_ct, pred_dt, ratio, ct_ms, psnr, cost;
   int rank;
   /** MEASURED decompression time, or <0 when the sweep did not take one. */
   double dt_ms = -1.0;

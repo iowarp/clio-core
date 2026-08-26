@@ -2278,7 +2278,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               explore_rows.push_back(ExploreRow{
                   alt_name, alt_preset_id, alt_applied_quant,
                   alt_applied_shuffle, alt->compression_ratio_,
-                  alt->compress_time_ms_, alt_ratio, alt_time_ms,
+                  alt->compress_time_ms_, alt->decompress_time_ms_, alt_ratio,
+                  alt_time_ms,
                   alt_applied_quant
                       ? AnalyticalPsnr(alt_quant_params.data_max -
                                            alt_quant_params.data_min,
@@ -2355,6 +2356,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 UnpackPreset(p_packed), UnpackQuantEnabled(p_packed),
                 UnpackShuffle(p_packed),
                 predicted->compression_ratio_, predicted->compress_time_ms_,
+                predicted->decompress_time_ms_,
                 context.actual_compression_ratio_,
                 context.actual_compress_time_ms_, context.actual_psnr_db_,
                 primary_rank_cost, primary_rank_cost,
@@ -2365,7 +2367,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             LogNeuroPressExplore(
                 task->blob_name_.str(), chunk_size, row.rank, row.lib,
                 row.preset_id, row.quant, row.shuffle, row.pred_ratio,
-                row.pred_ct, row.ratio, row.ct_ms, row.psnr, row.cost,
+                row.pred_ct, row.pred_dt, row.ratio, row.ct_ms, row.psnr,
+                row.cost,
                 // primary_rank_cost, NOT actual_cost: the baseline every one
                 // of these rows was actually ranked against (best_cost is
                 // seeded with it above). They differ whenever dt carries
