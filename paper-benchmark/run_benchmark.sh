@@ -7,6 +7,12 @@
 #                      [--bw-policy reduced|full|one] [--repeats N] [--results DIR]
 #                      [--skip-gen] [--keep-native] [--check-bound] [--dry-run]
 #
+# ALL FOUR WORKLOADS RUN THEIR PREPROCESSING ON THE GPU. Nyx and VPIC hand the
+# compressor device memory in situ, LAMMPS gathers on the device, and WarpX --
+# whose stock binary gives HDF5 host memory -- stages each chunk H2D and runs
+# the same CUDA kernels. There is no CPU quantize or byte shuffle left to fall
+# back to; a chunk that cannot reach the GPU is refused, not degraded.
+#
 # --smoke is the "does every path still work" run: the quick profile, one
 # repeat, one bandwidth, so each workload contributes exactly the four cells
 # that exercise both modes and both cost models. 4 workloads x 4 cells = 16
@@ -321,14 +327,19 @@ for w in $WORKLOADS; do
     vpic)   SIZE_ARGS=(--ncell "$VPIC_NCELL" --steps "$VPIC_STEPS"
                        --int "$VPIC_DUMPINT")
             CHUNK=$VPIC_CHUNK ;;
-    # --require-device is passed here KNOWING it currently fails: a stock
-    # WarpX hands HDF5 host memory, so every chunk reaches NeuroPress on the
-    # CPU. Failing is the intended outcome -- the alternative is publishing
-    # CPU-preprocessed numbers alongside three GPU workloads as if they were
-    # the same measurement. Drop the flag to run WarpX as a host-resident
-    # control instead; see BENCHMARK.md.
+    # --stage-h2d, not --require-device alone: a stock WarpX hands HDF5 HOST
+    # memory and there is no device pointer to be had, so the chunk is copied
+    # up and the CUDA kernels run on it -- upstream's own route for a
+    # host-resident caller (gpucompress_compress: "Transfers data to GPU,
+    # compresses, and returns result to host"). All preprocessing is still on
+    # the GPU; what differs is one H2D per chunk.
+    #
+    # So WarpX RATIOS compare with the other three; its TIMINGS do not, and
+    # `residency` in meta.json says device-staged-h2d rather than device to
+    # keep that visible. --stage-h2d implies --require-device, so a staging
+    # failure refuses rather than reverting to a host path.
     warpx)  SIZE_ARGS=(--ncell "$WARPX_NCELL" --steps "$WARPX_STEPS"
-                       --interval "$WARPX_INTERVAL" --require-device)
+                       --interval "$WARPX_INTERVAL" --stage-h2d)
             CHUNK=$WARPX_CHUNK ;;
     *)      SIZE_ARGS=(); CHUNK=4194304 ;;
   esac

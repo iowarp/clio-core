@@ -187,6 +187,34 @@ inline void RefuseHostPreprocess(const char *what, size_t bytes) {
        what, bytes);
 }
 
+/** True when CLIO_NEUROPRESS_STAGE_H2D asks a HOST-resident chunk to be copied
+ *  up to the device rather than refused.
+ *
+ *  This is upstream NeuroPress's own model. It has no CPU preprocessing either,
+ *  and resolves the same situation by staging: gpucompress_compress() is
+ *  documented as "Transfers data to GPU, compresses, and returns result to
+ *  host", while gpucompress_compress_gpu() "avoids host-GPU transfer when data
+ *  is already on GPU". Residency decides whether a COPY happens, never where
+ *  the computation happens.
+ *
+ *  So this keeps the guarantee -- every transform still runs in CUDA -- while
+ *  admitting a caller that cannot hand over device memory. The one that cannot
+ *  is the HDF5 VOL: a stock WarpX copies to host before H5Dwrite and openPMD
+ *  emits non-contiguous partial writes the VOL assembles into a host buffer, so
+ *  residency is gone before Clio is called.
+ *
+ *  It is NOT free and must not be read as equivalent: a full H2D of every chunk
+ *  is real bandwidth the in-situ workloads do not spend, so timings from a
+ *  staged run are not comparable with theirs. Off by default for that reason --
+ *  the copy should be asked for, not inherited. */
+inline bool NeuroPressStageH2D() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_STAGE_H2D");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
 inline bool NeuroPressRequireDevice() {
   static const bool on = [] {
     const char *e = std::getenv("CLIO_NEUROPRESS_REQUIRE_DEVICE");
@@ -207,13 +235,18 @@ inline void WarnIfBoundUnachievable(bool achievable, double requested,
   if (achievable) return;
   static std::atomic<bool> warned{false};
   if (warned.exchange(true)) return;  // per process; this fires per chunk
+  // Deliberately NOT phrased as "exceeds by Nx": the fallback picks
+  // max(range/4e9, float_repr_error*0.1), which can land either side of the
+  // requested bound. What is true in every case is that the guarantee no
+  // longer holds -- so report both numbers and say that, rather than a ratio
+  // that reads as nonsense when the effective bound is the tighter one.
   HLOG(kWarning,
        "NeuroPress quantize: the requested error bound {} is NOT achievable on "
-       "this data; using effective bound {} instead, so a round trip may "
-       "exceed what was asked for by ~{:.1f}x. Check it with the field-replay "
-       "driver's --check-bound. Further occurrences suppressed.",
-       requested, effective,
-       requested > 0.0 ? effective / requested : 0.0);
+       "this data; quantizing to an effective bound of {} instead, so the "
+       "round trip is NO LONGER GUARANTEED to stay within what was asked for. "
+       "Measure it with the field-replay driver's --check-bound. Further "
+       "occurrences suppressed.",
+       requested, effective);
 }
 
 inline double AnalyticalPsnr(double data_range, double error_bound) {
@@ -1107,13 +1140,54 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // one still produces correct bytes, so nothing downstream reveals the
     // substitution -- the ratios are identical and only the timings differ.
     // That is exactly the failure this refuses to hand back quietly.
+    // Upstream's route for a host-resident caller: copy up, then run the same
+    // CUDA kernels. Reassigning chunk_data is all it takes -- everything below
+    // (statistics, ranking, quantize, shuffle, codec choice) keys off the
+    // residency of this pointer, so a device pointer here puts the whole
+    // pipeline on the device path.
+    ctp::ipc::AllocatorId h2d_alloc;
+    struct H2dGuard {
+      ctp::ipc::AllocatorId *id;
+      ~H2dGuard() {
+        if (id && !id->IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, *id);
+          *id = ctp::ipc::AllocatorId();
+        }
+      }
+    } h2d_guard{&h2d_alloc};
+    if (NeuroPressStageH2D() && chunk_data != nullptr &&
+        !ctp::IsDevicePointer(chunk_data)) {
+      char *staged = nullptr;
+      h2d_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          chunk_size, &staged);
+      if (h2d_alloc.IsNull()) {
+        HLOG(kError,
+             "CLIO_NEUROPRESS_STAGE_H2D: could not allocate {} bytes of device "
+             "memory to stage blob '{}' up; failing rather than falling back "
+             "to a host path that no longer exists.",
+             (unsigned long long)chunk_size, task->blob_name_.str());
+        context.compress_lib_ = 0;
+        context.dynamic_compress_ = 0;
+        task->return_code_ = 1;
+        CLIO_CO_RETURN;
+      }
+      ctp::GpuApi::Memcpy(staged, static_cast<const char *>(chunk_data),
+                          chunk_size);
+      chunk_data = staged;
+      CLIO_PATH_TRACE("WRITE  staged H2D %llu bytes -> device",
+                      (unsigned long long)chunk_size);
+    }
+
     if (NeuroPressRequireDevice() && !ctp::IsDevicePointer(chunk_data)) {
       HLOG(kError,
            "CLIO_NEUROPRESS_REQUIRE_DEVICE is set and blob '{}' ({} bytes) "
            "arrived in HOST memory. Quantization, byte shuffle and codec "
            "selection would all silently take their host paths. Refusing. "
            "Hand the compressor a device pointer (an in-situ adapter, or the "
-           "LAMMPS driver's --order device), or unset the variable.",
+           "LAMMPS driver's --order device); or set CLIO_NEUROPRESS_STAGE_H2D=1 "
+           "to copy the chunk up and run the CUDA kernels on it, as upstream's "
+           "host entry point does -- at the cost of an H2D per chunk.",
            task->blob_name_.str(), (unsigned long long)chunk_size);
       context.compress_lib_ = 0;
       context.dynamic_compress_ = 0;
@@ -2675,6 +2749,42 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     auto input_fullptr =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     char* input_ptr = input_fullptr.ptr_;
+
+    // Upstream's route for a host-resident caller, applied HERE as well as in
+    // DynamicSchedule. The two are separate task bodies reading separate
+    // buffers: DynamicSchedule stages a copy to run SELECTION on (statistics,
+    // ranking, the exploration sweep), while this one re-reads
+    // task->blob_data_ to do the actual compression. Staging only there left
+    // every real quantize and shuffle still looking at host memory -- so the
+    // selection ran on the GPU and the transform it selected was then refused.
+    ctp::ipc::AllocatorId compress_h2d_alloc;
+    struct CompressH2dGuard {
+      ctp::ipc::AllocatorId *id;
+      ~CompressH2dGuard() {
+        if (id && !id->IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, *id);
+          *id = ctp::ipc::AllocatorId();
+        }
+      }
+    } compress_h2d_guard{&compress_h2d_alloc};
+    if (NeuroPressStageH2D() && input_ptr != nullptr &&
+        !ctp::IsDevicePointer(input_ptr)) {
+      char *staged_in = nullptr;
+      compress_h2d_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          input_size, &staged_in);
+      if (compress_h2d_alloc.IsNull()) {
+        HLOG(kError,
+             "CLIO_NEUROPRESS_STAGE_H2D: could not allocate {} bytes to stage "
+             "this chunk up for compression; failing rather than falling back "
+             "to a host path that no longer exists.",
+             (unsigned long long)input_size);
+        task->return_code_ = 1;
+        CLIO_CO_RETURN;
+      }
+      ctp::GpuApi::Memcpy(staged_in, input_ptr, input_size);
+      input_ptr = staged_in;
+    }
 
     // GPU-native libraries (nvcomp/cusz/cuszp/ndzip) accept a device pointer
     // directly -- they stage their own H2D as needed. Everything else is a

@@ -65,14 +65,24 @@ DECK=${DECK:-$HOME/src/warpx/Examples/Physics_applications/laser_acceleration/in
 # At 0 every chunk explores, so every compressed chunk yields a measured
 # decompression time and the only variable left is the one under test.
 # K stays at 3, NeuroPress's own ranked window.
-# GPU-ONLY mode. Unlike the other three workloads this cannot currently be
-# SATISFIED, and the flag exists so that fact is loud rather than silent: a
-# stock WarpX hands HDF5 HOST memory (measured -- see clio_stage_append's
-# warning), openPMD emits non-contiguous partial writes that the VOL assembles
-# into a host run buffer, and so every chunk reaches NeuroPress on the host.
-# With this set the compressor REFUSES those chunks instead of quietly running
-# quantization, byte shuffle and codec selection on the CPU.
-REQUIRE_DEVICE=0
+# GPU-ONLY mode, in the only shape this workload can have it.
+#
+# A stock WarpX hands HDF5 HOST memory (measured -- see clio_stage_append's
+# report), and openPMD emits non-contiguous partial writes the VOL assembles
+# into a host run buffer, so residency is gone before Clio is called. Unlike
+# Nyx/VPIC/LAMMPS there is no device pointer to hand over.
+#
+# So this takes UPSTREAM's route for a host-resident caller: stage the chunk
+# H2D and run the same CUDA kernels on it. That is what
+# gpucompress_compress() does -- "Transfers data to GPU, compresses, and
+# returns result to host" -- and it keeps the guarantee that every transform
+# runs in CUDA, which is the property being enforced. It costs a full H2D per
+# chunk, real bandwidth the in-situ workloads do not spend, so WarpX timings
+# are NOT comparable with theirs; the ratios are.
+#
+# REQUIRE_DEVICE stays on beneath it, so if staging ever fails to produce a
+# device pointer the run refuses rather than silently reverting.
+REQUIRE_DEVICE=0 STAGE_H2D=0
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,6 +97,7 @@ while [ $# -gt 0 ]; do
     --explore-k) EXPLORE_K_OPT=$2; shift 2;;
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --require-device) REQUIRE_DEVICE=1; shift;;
+    --stage-h2d) STAGE_H2D=1; REQUIRE_DEVICE=1; shift;;
     --bin) WARPX_BIN=$2; shift 2;;
     --deck) DECK=$2; shift 2;;
     --verify) VERIFY=1; shift;;
@@ -183,6 +194,7 @@ set +e
     ${BW:+CLIO_NEUROPRESS_COST_BW=$BW} \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=${MEASURE_DT:-1} \
     ${REQUIRE_DEVICE:+CLIO_NEUROPRESS_REQUIRE_DEVICE=$REQUIRE_DEVICE} \
+    ${STAGE_H2D:+CLIO_NEUROPRESS_STAGE_H2D=$STAGE_H2D} \
     ${RATIO_CAP:+CLIO_NEUROPRESS_RATIO_CAP=$RATIO_CAP} \
     "${COST_ENV[@]}" \
     "$WARPX_BIN" "$DECK" \
@@ -206,8 +218,8 @@ HOSTED=0
 HOSTED=${HOSTED:-0}
 if [ "$HOSTED" -gt 0 ]; then
   echo "   HOST-RESIDENT CHUNKS REFUSED: $HOSTED -- this run did NOT stay on the GPU"
-  echo "   (a stock WarpX hands HDF5 host memory; the GPU path is not reachable"
-  echo "    through the VOL for this workload -- see BENCHMARK.md)"
+  echo "   (a stock WarpX hands HDF5 host memory; pass --stage-h2d to copy each"
+  echo "    chunk up and run the CUDA kernels on it -- see BENCHMARK.md)"
   RC=1
 fi
 
@@ -242,7 +254,7 @@ cat > "$STORE/meta.json" <<JSON
 {"config":"$CONFIG","tag":"$NAME","rc":$RC,"mode":"$MODE",
  "cost_model":"$COSTMODEL","bw_bytes_per_ms":${BW:-5e6},
  "error_bound":${EB:-0},"explore_k":$EXPLORE_K,"explore_thresh":$THRESH,
- "residency":"$([ "$REQUIRE_DEVICE" = 1 ] && echo device-required || echo host)",
+ "residency":"$([ "$STAGE_H2D" = 1 ] && echo device-staged-h2d || { [ "$REQUIRE_DEVICE" = 1 ] && echo device-required || echo host; })",
  "host_refusals":$HOSTED,"device":"gpu","workload":"warpx-laser",
  "atoms":0,"steps":$STEPS,"gap":$INTERVAL,
  "frames":$(( STEPS / INTERVAL + 1 )),"chunk":$CHUNK,"files":$NCHUNKS,

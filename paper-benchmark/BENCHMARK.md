@@ -374,21 +374,47 @@ the timings move -- which is exactly why it has to fail rather than degrade.
   (chunks gathered ON the GPU into CUDA-IPC backends) instead of the default
   `--order id` (gathered through `lammps_gather_atoms` into a host array).
 
-### WarpX cannot satisfy it, and now says so
+### WarpX has no device pointer, so it stages H2D -- upstream's own route
 
 A **stock WarpX hands HDF5 HOST memory** -- measured, not inferred: the VOL's
 `clio_stage_append` reports the application's first partial write, and it is
-`HOST`. openPMD emits one non-contiguous partial write per AMReX box, which
-the VOL assembles into a host run buffer, so residency is gone before Clio is
-called and no VOL change can recover it.
+`HOST`. openPMD emits one non-contiguous partial write per AMReX box, which the
+VOL assembles into a host run buffer, so residency is gone before Clio is
+called and no VOL change recovers it. (Upstream reaches the GPU here by
+patching WarpX with a 636-line diagnostic backend that borrows
+`fab.dataPtr(icomp)`; this workload's entire premise is zero lines in WarpX.)
 
-So the harness passes `--require-device` for WarpX **knowing it fails**: 20/20
-chunks refused, `rc=1`, `host_refusals` in `meta.json`. Failing is the point --
-the alternative is publishing CPU-preprocessed numbers next to three GPU
-workloads as though they were the same measurement. Getting WarpX onto the GPU
-needs a GPU-aware openPMD/HDF5 write path or an in-situ adapter like Nyx's,
-neither of which exists here. Drop the flag to run it as a deliberate
-host-resident control.
+Upstream has an answer for exactly this, because it has no CPU preprocessing
+either. Its two entry points are
+
+```c
+/* Transfers data to GPU, compresses, and returns result to host. */
+gpucompress_compress(const void* input, ...);
+/* Compress data already in GPU memory. Avoids host-GPU transfer. */
+gpucompress_compress_gpu(const void* d_input, ...);
+```
+
+Residency decides whether a **copy** happens, never where the computation
+happens. `--stage-h2d` (`CLIO_NEUROPRESS_STAGE_H2D`) does the same: copy the
+chunk up, run the same CUDA kernels. Measured on WarpX at 64x64x512, lossy
+`eb=1e-3`:
+
+```
+chunks stored 160 | H2D stagings 160 | host quantize 0 | D2H 0 | ratio 36.9x
+```
+
+**It is staged in BOTH task bodies, and must be.** `DynamicSchedule` runs
+selection (statistics, ranking, the exploration sweep) on one buffer; `Compress`
+re-reads `task->blob_data_` to do the actual work. Staging only the first made
+selection run on the GPU and then refused the transform it had selected --
+silently storing nothing while the run still exited 0.
+
+**The copy is not free, and the results say so.** One H2D per chunk is bandwidth
+the in-situ workloads never spend, so WarpX **ratios** compare with the other
+three and its **timings do not**. `meta.json` records `residency` as
+`device-staged-h2d` rather than `device` to keep that visible, and the flag is
+opt-in so the copy is chosen rather than inherited. `--stage-h2d` implies
+`--require-device`, so a failed staging refuses instead of reverting.
 
 ## 4. Sizing: the three targets do not hold at once
 
