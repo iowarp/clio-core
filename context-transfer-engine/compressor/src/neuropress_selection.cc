@@ -34,6 +34,7 @@
 
 #include "clio_cte/compressor/compressor_runtime.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
+#include "clio_cte/compressor/neuropress_path_trace.h"
 
 namespace clio::cte::compressor {
 
@@ -88,6 +89,12 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
                      : ctp::ComputeNeuroPressFeatures(
                            chunk, chunk_size, context.data_type_, entropy,
                            mad, second_derivative_mean);
+  CLIO_PATH_TRACE(
+      "1 stats    %s chunk=%llu B  %s",
+      NpWhere(chunk), (unsigned long long)chunk_size,
+      np_device_path
+          ? "ComputeDeviceStatsResident -- CUDA kernel, stats stay on device"
+          : "ComputeNeuroPressFeatures -- host code, CPU");
   if (np_device_path && device_stats == nullptr) {
     HLOG(kError,
          "EstCompressionStats: device-resident statistics failed for a "
@@ -141,6 +148,13 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
           *second_derivative_mean, data_type_float, context.error_bound_,
           config_.neuropress_best_mode_);
     }
+    CLIO_PATH_TRACE(
+        "2 infer    %s %zu actions, ONE NN forward pass EACH "
+        "(8->64->64->64->64->8) -- %s",
+        device_stats != nullptr ? "[GPU]" : "[CPU]", neuropress_stats.size(),
+        device_stats != nullptr
+            ? "InferKernelDeviceStats<<<n_actions,64>>>, 1 block per action"
+            : "host matrix path, looped per action");
     // HOST path only -- the device path masks inside RankKernel. Not
     // interchangeable: masking ranks last but stays selectable, removing here
     // can empty the list.
@@ -156,6 +170,16 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
       neuropress_stats = std::move(filtered);
     }
     if (!neuropress_stats.empty()) {
+      CLIO_PATH_TRACE(
+          "3 rank     %s %zu ranked by predicted COST; primary=%s  "
+          "(entropy=%.4g mad=%.4g d2=%.4g)",
+          device_stats != nullptr
+              ? "[GPU] RankKernel -- cost model + 32-lane bitonic sort on device"
+              : "[CPU] host sort",
+          neuropress_stats.size(),
+          ctp::CompressionFactory::NameForWireId(
+              neuropress_stats.front().compress_lib_).c_str(),
+          *entropy, *mad, *second_derivative_mean);
       HLOG(kDebug,
            "NeuroPress dynamic selection: chunk_size={} entropy={} mad={} "
            "-> top pick wire_id={} ({} candidates ranked)",

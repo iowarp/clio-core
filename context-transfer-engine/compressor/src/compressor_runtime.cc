@@ -33,6 +33,7 @@
 
 // Copyright 2024 IOWarp contributors
 #include <clio_cte/compressor/compressor_runtime.h>
+#include <clio_cte/compressor/neuropress_path_trace.h>
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 #include <algorithm>
@@ -1082,22 +1083,10 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
 }
 
 
-/* ---------------------------------------------------------------------------
- * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
- * Compressor half of the trace in clio_vol.cc; same "[np-path]" prefix so one
- * grep spans connector and compressor. Undefined => expands to nothing, so
- * the compress path pays nothing.
- * --------------------------------------------------------------------------- */
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
-#define CLIO_PATH_TRACE(...)                          \
-  do {                                                \
-    std::fprintf(stderr, "[np-path] " __VA_ARGS__);    \
-    std::fprintf(stderr, "\n");                       \
-    std::fflush(stderr);                              \
-  } while (0)
-#else
-#define CLIO_PATH_TRACE(...) ((void)0)
-#endif
+/* CLIO_PATH_TRACE and NpWhere() now live in neuropress_path_trace.h, which
+ * documents the seven steps they label. Shared with neuropress_selection.cc,
+ * which owns steps 1-3; a third copy of the macro would have let them drift.
+ * The VOL half in clio_vol.cc keeps its own -- different module, same prefix. */
 
 
 clio::run::TaskResume Runtime::DynamicSchedule(
@@ -1401,6 +1390,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     task->context_ = compress_task->context_;
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
+
+    CLIO_PATH_TRACE(
+        "4 primary  %s ran lib=%d (%s) -- MEASURED ratio=%.2f ct=%.3f ms "
+        "(vs PREDICTED ratio=%.2f ct=%.3f ms) rc=%d",
+        NpWhere(chunk_data), context.compress_lib_,
+        ctp::CompressionFactory::NameForWireId(context.compress_lib_).c_str(),
+        context.actual_compression_ratio_, context.actual_compress_time_ms_,
+        stats.empty() ? -1.0 : stats.front().compression_ratio_,
+        stats.empty() ? -1.0 : stats.front().compress_time_ms_,
+        // GetReturnCode(), not return_code_: the field is a
+        // ctp::ipc::atomic<u32> and handing that object to a vararg prints
+        // whatever its first word happens to be (observed: rc=767525520 on a
+        // run that succeeded).
+        (int)task->GetReturnCode());
 
     // The primary's image, held unstored while exploration runs. Freed by
     // PrimaryImage's destructor on every exit -- including the exception path,
@@ -1830,6 +1833,22 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // per-slot kernel time inside 1.85 ms of wall time, against 9.24 ms
         // for the same work through Compress(), which takes the thread's
         // single cached stream and synchronizes before returning.
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+        {
+          const double np_thresh =
+              static_cast<double>(config_.neuropress_exploration_threshold_);
+          CLIO_PATH_TRACE(
+              "5 gate     error_pct=%.6f vs threshold=%.6f -> %s",
+              error_pct, np_thresh,
+              !config_.neuropress_exploration_enabled_
+                  ? "SKIP -- exploration disabled"
+              : config_.neuropress_best_mode_
+                  ? "EXPLORE -- best mode, gate bypassed"
+              : (error_pct > np_thresh)
+                  ? "EXPLORE"
+                  : "SKIP -- the prediction was good enough (strict >)");
+        }
+#endif
         if (config_.neuropress_exploration_enabled_ &&
             (config_.neuropress_best_mode_ ||
              error_pct > static_cast<double>(
@@ -1943,6 +1962,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             return v > 0 ? static_cast<size_t>(v) : size_t{0};  // 0 = all
           }();
 
+          CLIO_PATH_TRACE(
+              "6 explore  sweep opening: K=%d, %zu alternative(s) to MEASURE, "
+              "%zu concurrent stream(s); the NN is NOT re-run -- each carries "
+              "the prediction step 2 already made for it",
+              config_.neuropress_exploration_k_, alternatives.size(),
+              kExploreStreams);
           // The three steps below are the SWEEP's, not the two
           // learning phases' -- this whole sweep runs inside learning
           // Phase 2. They are numbered on their own axis so a
@@ -2192,6 +2217,16 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             const double alt_dt = (slot_ref.decomp_time_ms >= 0.0)
                                       ? slot_ref.decomp_time_ms
                                       : predicted->decompress_time_ms_;
+            CLIO_PATH_TRACE(
+                "6 explore  %s rank=%d %-16s q=%d sh=%u | PREDICTED "
+                "ratio=%.2f ct=%.3f | MEASURED ratio=%.2f ct=%.3f dt=%.3f%s",
+                NpWhere(alt_out_ptr), explore_rank, alt_name.c_str(),
+                alt_applied_quant ? 1 : 0, (unsigned)alt_applied_shuffle,
+                alt->compression_ratio_, alt->compress_time_ms_, alt_ratio,
+                alt_time_ms, alt_dt,
+                (slot_ref.decomp_time_ms >= 0.0)
+                    ? ""
+                    : " (dt = the PRIMARY's prediction, not measured)");
             double alt_cost = cost(alt_time_ms, alt_dt, alt_ratio);
             if (alt_cost < best_cost) {
               best_cost = alt_cost;
@@ -2230,6 +2265,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 // IS quantized -- unrecoverable on read.
                 winner.quant = alt_applied_quant;
                 winner.quant_params = alt_quant_params;
+                CLIO_PATH_TRACE(
+                    "7 adopt    %s rank=%d %s q=%d sh=%u ratio=%.2f "
+                    "cost=%.6f beats the running best -- REPLACES the primary "
+                    "(payload D2H'd to host for the store)",
+                    NpWhere(alt_out_ptr), explore_rank, alt_name.c_str(),
+                    alt_applied_quant ? 1 : 0, (unsigned)alt_applied_shuffle,
+                    alt_ratio, alt_cost);
               }
             }
 
