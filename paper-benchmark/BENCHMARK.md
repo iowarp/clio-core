@@ -5,13 +5,56 @@ NeuroPress in **exploration mode**, across the two cost models, lossless and
 lossy, and a ladder of assumed storage bandwidths.
 
 ```bash
+./run_benchmark.sh --smoke                                 # 16 cells, every path
 ./run_benchmark.sh --profile quick --workloads lammps      # validate the pipeline
 ./run_benchmark.sh --profile mid                           # ~5-10 min/run
 ./run_benchmark.sh --profile full                          # ~30 GB/run
 ./run_benchmark.sh --check-bound                           # self-verify lossy runs
 ./run_benchmark.sh --dry-run                               # print the matrix
 ./collect.py results/benchmark                             # re-aggregate
+./audit_run.py results/benchmark/<cell>                    # reconcile one run
 ```
+
+### Flags
+
+| flag | default | what it does |
+|---|---|---|
+| `--smoke` | off | `--profile quick --repeats 1 --bw-policy one`. Each workload contributes the four cells that cover both modes and both cost models: 16 runs. Run it before starting a campaign. |
+| `--profile` | `full` | `quick` ~1 GB, 1-2 min/run; `mid` ~8-10 GB, 5-10 min/run; `full` ~30 GB, 17-25 min/run. All but `quick` run >=1000 timesteps. See section 2 for why the brief's three targets are not simultaneously reachable. |
+| `--workloads` | all four | Space-separated subset, e.g. `"nyx vpic"`. |
+| `--bw-policy` | `reduced` | `reduced` runs the full ladder on the balance model and a two-point control set on ratio (bandwidth cannot reorder candidates there -- see section 3). `full` runs the ladder on both; `one` pins 5 GB/s. |
+| `--repeats` | `3` | Mandatory for readable results, not caution -- see "Exploration-mode selection is nondeterministic run to run". |
+| `--check-bound` | off | On lossy runs, verify `|original - decoded| <= eb` elementwise instead of a digest. Only Nyx and VPIC can: they hold the submitted bytes in situ. |
+| `--keep-native` | off | Keep WarpX's native openPMD output. It is deleted per run by default; at the larger profiles it is tens of GB of duplicate data, and it is most of what the disk preflight asks for. |
+| `--results` | `results/benchmark` | Where cell directories go. |
+| `--dry-run` | off | Print the command each cell would run, and stop. |
+
+A run directory keeps its raw per-chunk measurements and nothing is aggregated
+away: `blobs.csv` (one row per chunk), `selection.csv` (NeuroPress's own
+per-chunk record), `explore.csv` (one row per measured candidate, with the
+adopted flag). `collect.py` turns a set of them into `summary.csv` /
+`summary.md`; `audit_run.py` reconciles a single run's CSVs against the bytes
+that actually reached the tier.
+
+### How each workload verifies itself
+
+Not a preference -- it follows from how the data reaches Clio.
+
+| workload | policy | lossless | lossy |
+|---|---|---|---|
+| Nyx, VPIC | in situ | `--verify`: the adapter digests each chunk as it stages it, then reads every blob back through the decompressor | `--check-bound`: compares against the bytes the simulation submitted, since no source file exists in situ |
+| WarpX | read-back | `--verify`: a separate process reads the datasets back through the VOL and requires both that the bytes match a native read and that the trace shows the tier served them | not checked |
+| LAMMPS | inline | the driver always verifies and takes no flag | still runs its digest check, which lossy data must fail -- the log reads `FAILED: N of M`, and `collect.py` records `n/a` rather than propagating it |
+
+`run_benchmark.sh` never *requests* a bit-exact check on a lossy run: decoded
+bytes are not the input bytes by design, so a digest check reports `FAILED` on
+correct behaviour. LAMMPS's driver verifies unconditionally and so prints one
+anyway -- expect `FAILED: 28 of 30` on a lossy LAMMPS cell and read the
+`verified` column in `summary.csv`, which is `n/a` there, not the log line.
+Whether it fails at all depends on whether the cost model picked any quantize
+action, so the same cell can read `FAILED` under `balance` and `VERIFIED`
+under `ratio`; neither is a defect. Quality for a lossy run is the PSNR column in
+`selection.csv`, plus `--check-bound` where the workload supports it.
 
 Each cell of
 
