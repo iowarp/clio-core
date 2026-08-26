@@ -749,7 +749,7 @@ int clio_vpic_insitu_end(void) {
             << "[clio-vpic-insitu] rank " << a.rank << "/" << a.nprocs
             << " stored " << a.records.size() << " blob(s) from " << a.frames
             << " frame(s), " << in_total << " B in -> " << stored_total
-            << " B on the tier  (ratio "
+            << " B on the tier  (stored ratio "
             << (stored_total ? static_cast<double>(in_total) /
                                    static_cast<double>(stored_total)
                              : 0.0)
@@ -785,14 +785,29 @@ int clio_vpic_insitu_end(void) {
       // Exactly the header bin/neuropress_field_replay --readback parses, so
       // the cold reader is the same Clio-only, VPIC-free binary the offline
       // sweep uses.
+      // TWO ratios, because they answer different questions and disagreed
+      // silently before this column existed:
+      //   ratio        = bytes / CODEC PAYLOAD. Upstream's definition
+      //                  (gpucompress_compress.cpp excludes its own header),
+      //                  the NN's training label, and the number explore.csv
+      //                  and selection.csv report. Do not change it: it feeds
+      //                  the cost model and the SGD targets.
+      //   stored_ratio = bytes / STORED. What the tier actually holds,
+      //                  header included, and the basis of the aggregate
+      //                  "(stored ratio N)" line printed above.
+      // They differ by the 24-byte CTEC header (56 when quantized), so
+      // sum(bytes)/sum(stored) never equals the mean of the `ratio` column.
+      // Appended, never inserted: the first three columns are the cold
+      // reader's contract.
       csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
-           "decompress_ms,rc,rank\n";
+           "decompress_ms,rc,rank,stored_ratio\n";
       for (const auto &r : a.records) {
         csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest
             << std::dec << ',' << r.lib << ','
             << ctp::CompressionFactory::NameForWireId(r.lib) << ',' << r.ratio
             << ',' << r.stored << ',' << r.ms << ',' << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
-            << a.rank << '\n';
+            << a.rank << ','
+            << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';
       }
     }
   }

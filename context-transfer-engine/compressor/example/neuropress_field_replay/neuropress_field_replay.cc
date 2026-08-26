@@ -530,7 +530,7 @@ int main(int argc, char **argv) {
   }
   std::cout << std::fixed << std::setprecision(3)
             << "\nstored " << records.size() << " blob(s), " << in_total
-            << " B in -> " << stored_total << " B on the tier  (ratio "
+            << " B in -> " << stored_total << " B on the tier  (stored ratio "
             << (stored_total ? double(in_total) / double(stored_total) : 0.0)
             << ")\n  compressed: " << kept << "   stored raw: " << raw
             << "   failed: " << failed << "\n";
@@ -550,13 +550,28 @@ int main(int argc, char **argv) {
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);
+    // TWO ratios, because they answer different questions and disagreed
+    // silently before this column existed:
+    //   ratio        = bytes / CODEC PAYLOAD. Upstream's definition
+    //                  (gpucompress_compress.cpp excludes its own header),
+    //                  the NN's training label, and the number explore.csv
+    //                  and selection.csv report. Do not change it: it feeds
+    //                  the cost model and the SGD targets.
+    //   stored_ratio = bytes / STORED. What the tier actually holds,
+    //                  header included, and the basis of the aggregate
+    //                  "(stored ratio N)" line printed above.
+    // They differ by the 24-byte CTEC header (56 when quantized), so
+    // sum(bytes)/sum(stored) never equals the mean of the `ratio` column.
+    // Appended, never inserted: the first three columns are the cold
+    // reader's contract.
     csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
-           "decompress_ms,rc\n";
+           "decompress_ms,rc,stored_ratio\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ',' << ctp::CompressionFactory::NameForWireId(r.lib)
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
-          << r.dt_ms << ',' << (r.ok ? 0 : 1) << '\n';
+          << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
+          << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';
   }
 
   int rc = failed ? 1 : 0;

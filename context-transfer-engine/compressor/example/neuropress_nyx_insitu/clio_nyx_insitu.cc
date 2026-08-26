@@ -900,7 +900,7 @@ int clio_nyx_insitu_end(void) {
             << "\n[clio-nyx-insitu] rank " << a.rank << "/" << a.nprocs
             << " stored " << a.records.size() << " blob(s) "
             << "from " << a.frames << " frame(s), " << in_total << " B in -> "
-            << stored_total << " B on the tier  (ratio "
+            << stored_total << " B on the tier  (stored ratio "
             << (stored_total ? double(in_total) / double(stored_total) : 0.0)
             << ")\n  compressed: " << kept << "   stored raw: " << raw
             << "   failed: " << failed << "\n";
@@ -931,14 +931,29 @@ int clio_nyx_insitu_end(void) {
     // parser reads blob,bytes,fnv1a64 and ignores the rest). `rank` is
     // APPENDED, never inserted, for exactly that reason: it tells a reader
     // which rank owned a box without moving a column the reader depends on.
+    // TWO ratios, because they answer different questions and disagreed
+    // silently before this column existed:
+    //   ratio        = bytes / CODEC PAYLOAD. Upstream's definition
+    //                  (gpucompress_compress.cpp excludes its own header),
+    //                  the NN's training label, and the number explore.csv
+    //                  and selection.csv report. Do not change it: it feeds
+    //                  the cost model and the SGD targets.
+    //   stored_ratio = bytes / STORED. What the tier actually holds,
+    //                  header included, and the basis of the aggregate
+    //                  "(stored ratio N)" line printed above.
+    // They differ by the 24-byte CTEC header (56 when quantized), so
+    // sum(bytes)/sum(stored) never equals the mean of the `ratio` column.
+    // Appended, never inserted: the first three columns are the cold
+    // reader's contract.
     csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
-           "decompress_ms,rc,rank\n";
+           "decompress_ms,rc,rank,stored_ratio\n";
     for (const auto &r : a.records) {
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ','
           << ctp::CompressionFactory::NameForWireId(r.lib) << ',' << r.ratio
           << ',' << r.stored << ',' << r.ms << ',' << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
-          << a.rank << '\n';
+          << a.rank << ','
+          << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';
     }
   }
 
