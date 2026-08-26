@@ -87,6 +87,84 @@ state point without editing anything.
 | `--dt X` | `DT` | 0.005 | timestep |
 | `--var K=V` | any | — | any other deck variable, repeatable |
 
+### `--require-device` is a correctness flag, not a performance one
+
+Without it the driver's default `--order id` gathers each chunk through
+`lammps_gather_atoms` into HOST memory. NeuroPress's byte shuffle and quantizer
+are CUDA-only -- the CPU implementations were deliberately removed -- so any
+chunk whose ranked candidate wants a shuffle is REFUSED, `Compress` returns
+rc=1, the blob is never stored, and the read back fails with rc=11. Measured at
+box 40 / 50 steps: 7 refusals, 7 lost blobs under `dynamic`; 4 and 4 under
+`explore-balance`. The run still exits 0 and prints a ratio; only the verify
+line reveals it. `run_benchmark.sh` passes the flag for every LAMMPS cell.
+
+### This is the only float64 workload, and it changes what the numbers mean
+
+`Atom::x/v/f` are `double`: 8 bytes per value, where Nyx, VPIC and WarpX are
+all float32. Two consequences.
+
+**The model cannot express the right shuffle stride.** NeuroPress's action space
+encodes shuffle as one bit meaning 4 bytes, so an 8-byte stride is unreachable
+by inference. Only the static configs can use it. Measured, box 40 / 100 steps:
+
+| config | ratio |
+|---|---|
+| `static-zstd` (no shuffle) | 1.229 |
+| `static-zstd-s4` (4-byte, what the model can pick) | 1.229 |
+| `static-zstd-s8` (8-byte, matches float64) | **1.245** |
+
+So the correct stride is worth ~1.3% here -- real, but far from the headline it
+is on float32 data. Worth knowing before attributing a LAMMPS result to the
+shuffle.
+
+**NeuroPress reads every buffer as float32 regardless.** That is upstream's
+behaviour and Clio keeps it, so the quantizer sees float64 bytes reinterpreted
+as pairs of float32 words.
+
+### The data evolves, but its compressibility barely does
+
+The lattice melts -- that is the point of the deck -- and the statistics say so
+clearly:
+
+| field | step 0 | step 250 | step 500 |
+|---|---|---|---|
+| `position` entropy | 6.03 | 7.13 | 7.02 |
+| `force` MAD | **9.9e-14** | 1.85e+01 | 1.85e+01 |
+
+Force MAD at step 0 is essentially zero: on a perfect fcc lattice the forces
+cancel by symmetry. Once melted it jumps by fourteen orders of magnitude.
+
+Yet the compression ratio moves hardly at all -- `position` spans 1.18x across
+the whole run, `velocity` 1.03x, `force` 1.38x, and the aggregate sits near
+1.05-1.09x. Entropy is 6-7.4 of 8 bits per byte: the structure is in the
+high-order bits while the float64 mantissa is effectively random and dominates.
+Same conclusion as VPIC -- see its README -- and no deck parameter changes it.
+
+### `--eb` is an ABSOLUTE bound, and LJ units make it mean three different things
+
+At `--eb 1e-3`, matched runs at box 40 / 100 steps:
+
+| | ratio | adopted rows that quantized |
+|---|---|---|
+| lossless | 1.090 | 0 of 18 |
+| lossy `--eb 1e-3` | 1.174 | 6 of 18 |
+
+Only a third of chunks quantize, because the same absolute bound is wildly
+mis-scaled across the three fields:
+
+| field | typical MAD | `1e-3` relative to it | quantized |
+|---|---|---|---|
+| `force` | 9.9e-14 | 1.0e+10 | 1 of 6 |
+| `position` | 1.55e+01 | 6.4e-05 | 2 of 6 |
+| `velocity` | 1.50e+00 | 6.7e-04 | 3 of 6 |
+
+For `position` the bound is ~16 bits of precision on a box ~42 wide, so
+quantization buys little; for `force` at step 0 it is ten orders of magnitude
+looser than the data. Contrast VPIC, where the same 1e-3 lets the quantizer
+pick `prec=8` and delivers a 5.3x gain. **A single `--eb` is not a comparable
+setting across workloads**, and a LAMMPS lossy result should not be read beside
+a VPIC one as if it were.
+
 ```bash
 # a colder, denser state point, whole sweep
 ./run_sweep.sh --density 1.2 --temp 0.4 --dt 0.002
