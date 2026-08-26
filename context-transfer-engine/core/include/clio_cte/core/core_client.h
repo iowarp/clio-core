@@ -422,7 +422,7 @@ class Client : public clio::run::ContainerClient {
 
   /**
    * GPU-callable AsyncCreate: takes const char* names for GPU kernel use.
-   * Routes to CPU admin worker via PoolQuery::ToLocalCpu().
+   * Routes via the caller's pool_query (PoolQuery::Dynamic()).
    * @param pool_query Pool query for task routing
    * @param pool_name Name of the pool (const char*, GPU-safe)
    * @param custom_pool_id Explicit pool ID

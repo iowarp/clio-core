@@ -1047,9 +1047,15 @@ class IpcManager {
   template <typename T>
   ctp::ipc::FullPtr<T> ToFullPtr(const ctp::ipc::ShmPtr<T> &shm_ptr) {
     // Full allocator lookup implementation
-    // Case 1: AllocatorId is null - offset IS the raw memory address
-    // This is used for private memory allocations (new/delete)
-    if (shm_ptr.alloc_id_ == ctp::ipc::AllocatorId::GetNull()) {
+    // Case 1: the offset IS the raw address, with no allocator to resolve it
+    // against. Two tags land here:
+    //   GetNull()       - a private HOST address (new/delete).
+    //   GetGpuPointer() - a GPU DEVICE address, which is only dereferenceable
+    //                     in the owning context and must be moved with a
+    //                     device-aware copy. Resolution is the same (pass the
+    //                     address through); the difference is that a holder
+    //                     can now tell the two apart and act on it.
+    if (shm_ptr.alloc_id_.IsRawAddress()) {
       // The offset field contains the raw pointer address
       T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
       return ctp::ipc::FullPtr<T>(raw_ptr);

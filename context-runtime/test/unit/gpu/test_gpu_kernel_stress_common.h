@@ -127,7 +127,7 @@ PlaceTaskSlots(char *base, ctp::ipc::AllocatorId alloc_id, clio::run::u32 gpu_id
     char *task_addr = base + task_off;
     auto *task = new (task_addr) TaskT(
         clio::run::CreateTaskId(), GetTestPoolId(),
-        clio::run::PoolQuery::ToLocalCpu(), gpu_id, /*test_value=*/i);
+        clio::run::PoolQuery::Dynamic(), gpu_id, /*test_value=*/i);
     task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(TaskT));
 
     ctp::ipc::FullPtr<TaskT> fp;

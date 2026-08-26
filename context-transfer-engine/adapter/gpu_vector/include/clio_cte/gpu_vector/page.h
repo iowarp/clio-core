@@ -64,8 +64,23 @@ struct BlockTasks {
    *  the frame's valid range to exactly what landed. */
   clio::run::u32 fetch_vlo[clio::cte::core::kPodMultiMax];
   clio::run::u32 fetch_vhi[clio::cte::core::kPodMultiMax];
-  /** Generation the in-flight fetch is waiting for (0 = ordinary fetch). */
+  /** Generation the NEXT fetch will name (0 = ordinary fetch). Written by
+   *  BeginFetch before it may have to drain a previous fetch, so it is NOT
+   *  the generation the in-flight batch was fetched at -- see
+   *  fetch_gen_sub. */
   clio::run::u64 fetch_generation;
+  /** THE GENERATION THE IN-FLIGHT BATCH WAS ACTUALLY SUBMITTED AT.
+   *
+   *  PublishFetch must stamp the frames with the version they HOLD, and that
+   *  is this one, not fetch_generation. BeginFetch(g) assigns
+   *  fetch_generation = g and only then drains a still-in-flight previous
+   *  fetch, so publishing with fetch_generation stamped the PREVIOUS batch's
+   *  pages with g -- pages claiming a version they do not hold. The next
+   *  demand for g then computed `p->generation < g` as false and skipped the
+   *  refetch: no fault, no error, stale data. That is the md_bench halo
+   *  exchange moving nothing (x faults=36, get_errors=0, identical with the
+   *  exchange disabled). */
+  clio::run::u64 fetch_gen_sub;
   /** Generation stamped on the in-flight flush (0 = ordinary flush). */
   clio::run::u64 flush_generation;
 };

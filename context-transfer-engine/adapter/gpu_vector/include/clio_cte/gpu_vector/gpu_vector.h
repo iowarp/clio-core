@@ -97,6 +97,11 @@ inline std::string FatalReport() {
     case kFatalUnbound:     what = "vector used before Init()"; break;
     case kFatalSetFull:     what = "AllocatePage: set full"; break;
     case kFatalFlushSplit:  what = "flush range needs more records"; break;
+    case kFatalGetFailed:
+      what = "fetch returned an error; its pages were left EMPTY "
+             "(a generational get names a generation the writer has "
+             "not published)";
+      break;
     default: break;
   }
   char buf[256];
@@ -115,6 +120,10 @@ class Vector {
     clio::run::u64 puts = 0;     // pages written back
     clio::run::u64 evicts = 0;   // frames reclaimed
     clio::run::u64 get_errors = 0;   // faults that returned non-zero
+    clio::run::u64 gen_ok = 0;       // generational demand: resident accepted
+    clio::run::u64 gen_stale = 0;    // generational demand: refetch claimed
+    clio::run::u64 gen_busy = 0;     // generational demand: CAS lost to peer
+    clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
   };
 
@@ -213,7 +222,7 @@ class Vector {
 #if CTP_ENABLE_CUDA
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 5 * sizeof(unsigned long long);
+      const size_t bytes = 9 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -224,6 +233,13 @@ class Vector {
       kv.second.hdr.stat_evicts_ = c + 2;
       kv.second.hdr.stat_get_errors_ = c + 3;
       kv.second.hdr.stat_put_errors_ = c + 4;
+      // WHERE A GENERATIONAL DEMAND ACTUALLY GOES. Three outcomes, and only
+      // one of them transfers anything.
+      kv.second.hdr.stat_gen_ok_ = c + 5;      // resident copy accepted
+      kv.second.hdr.stat_gen_stale_ = c + 6;   // stale -> refetch claimed
+      kv.second.hdr.stat_gen_busy_ = c + 7;    // stale but CAS lost
+      // Pages a flush could not FIND -- silently dropped writebacks.
+      kv.second.hdr.stat_flush_skipped_ = c + 8;
       PublishHeader(kv.second);
     }
 #endif
@@ -406,12 +422,16 @@ class Vector {
 #if CTP_ENABLE_CUDA
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[5] = {0, 0, 0, 0, 0};
+    unsigned long long h[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.faults = h[0];
     s.puts = h[1];
     s.evicts = h[2];
     s.get_errors = h[3];
+    s.gen_ok = h[5];
+    s.gen_stale = h[6];
+    s.gen_busy = h[7];
+    s.flush_skipped = h[8];
     s.put_errors = h[4];
 #else
     (void) gpu_id;
@@ -531,6 +551,10 @@ class Vector {
     st.hdr.stat_puts_ = nullptr;
     st.hdr.stat_evicts_ = nullptr;
     st.hdr.stat_get_errors_ = nullptr;
+    st.hdr.stat_gen_ok_ = nullptr;
+    st.hdr.stat_gen_stale_ = nullptr;
+    st.hdr.stat_gen_busy_ = nullptr;
+    st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
     PublishHeader(st);
@@ -683,7 +707,7 @@ class Vector {
    * copy back off the device without dereferencing the task.
    */
   void InitTasks(DevState &st) {
-    const clio::run::PoolQuery local = clio::run::PoolQuery::ToLocalCpu();
+    const clio::run::PoolQuery local = clio::run::PoolQuery::Dynamic();
     std::vector<char> raw(nblocks_ * kTaskSetBytes, 0);
     std::vector<BlockTasks> btbl(nblocks_);
     for (clio::run::u32 b = 0; b < nblocks_; ++b) {

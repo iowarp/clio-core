@@ -4347,9 +4347,6 @@ bool IpcManager::IsTaskLocal(const clio::run::shared_ptr<Task> & /*task_ptr*/,
       // here, they are not local.
       return false;
 
-    case RoutingMode::ToLocalCpu:
-      return true;  // GPU producer-only path: always local
-
     case RoutingMode::Null:
       return true;  // Null mode is a no-op, treat as local
   }
@@ -4552,9 +4549,8 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
     case RoutingMode::Physical:
       result = ResolvePhysicalQuery(query, pool_id, task_ptr);
       break;
-    case RoutingMode::ToLocalCpu:
     case RoutingMode::Null:
-      // GPU producer-only ToLocalCpu and Null modes pass through.
+      // Null mode passes through.
       result = {query};
       break;
     case RoutingMode::ManyToOne:

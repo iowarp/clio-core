@@ -139,7 +139,7 @@ bool RunOverrun(clio::run::u32 num_tasks) {
     size_t task_off = static_cast<size_t>(i) * slot_bytes;
     auto *task = new (base + task_off)
         TaskT(clio::run::CreateTaskId(), GetTestPoolId(),
-              clio::run::PoolQuery::ToLocalCpu(), gpu_id, /*test_value=*/i);
+              clio::run::PoolQuery::Dynamic(), gpu_id, /*test_value=*/i);
     task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(TaskT));
     ctp::ipc::FullPtr<TaskT> fp;
     fp.shm_.alloc_id_ = alloc_id;

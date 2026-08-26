@@ -2172,6 +2172,20 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
       blob_info_ptr->StampRangeGeneration(offset, size,
                                           task->context_.generation_);
+      // EMPTY IS OFF. docker-compose declares `CLIO_GEN_LOG=${CLIO_GEN_LOG:-}`
+    // unconditionally, so the variable is always PRESENT in the container and
+    // `getenv != nullptr` would leave this on for every run.
+    static const bool gen_log = [] {
+      const char *v = getenv("CLIO_GEN_LOG");
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+      if (gen_log) {
+        fprintf(stderr, "[gen] STAMP blob '%s' [%llu,%llu) gen=%llu (node %u)\n",
+                task->GetBlobName().c_str(), (unsigned long long)offset,
+                (unsigned long long)(offset + size),
+                (unsigned long long)task->context_.generation_,
+                (unsigned)CLIO_IPC->GetNodeId());
+      }
     }
 
     {
@@ -3665,11 +3679,12 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
 // Cross-node forwarding for device-originated (Pod) blob ops.
 //
 // A Pod task's data pointer targets memory only the ORIGIN node can touch (a
-// GPU page or a device task slot), so the task itself must execute on the
-// node that popped it -- ToLocalCpu is a physical constraint, not a routing
-// choice. In a multi-node pool, though, blob metadata lives on the blob's
-// HASHED owner (HashBlobToContainer), so a local Impl for a remote-owned
-// blob would simply miss.
+// GPU page or a device task slot). That is a property OF THE POINTER, and it
+// now says so: the ShmPtr carries AllocatorId::GetGpuPointer() rather than
+// the host-address tag it used to borrow, so a holder can ask instead of
+// relying on the task having been pinned to this node. In a multi-node pool
+// blob metadata lives on the blob's HASHED owner (HashBlobToContainer), so a
+// local Impl for a remote-owned blob would simply miss.
 //
 // The forward closes that gap CPU-side, which is exactly the architecture:
 // the fault handler orchestrates a normal hashed client op (bytes cross the
@@ -3690,6 +3705,24 @@ clio::run::TaskResume Runtime::PodPutBlob(
     }
     const clio::run::PoolQuery owner =
         HashBlobToContainer(task->tag_id_, eff_name);
+    // CLIO_GEN_LOG=1: where a GENERATIONAL put/get actually goes. The whole
+    // question in a decomposed run is whether the writer's stamp and the
+    // reader's wait meet on the SAME container; this prints the branch each
+    // side took so that stops being an inference.
+    // EMPTY IS OFF. docker-compose declares `CLIO_GEN_LOG=${CLIO_GEN_LOG:-}`
+    // unconditionally, so the variable is always PRESENT in the container and
+    // `getenv != nullptr` would leave this on for every run.
+    static const bool gen_log = [] {
+      const char *v = getenv("CLIO_GEN_LOG");
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (gen_log && (task->context_.op_flags_ & Context::kGenerational)) {
+      fprintf(stderr, "[gen] PUT blob '%s' gen=%llu -> %s (node %u)\n",
+              eff_name.c_str(),
+              (unsigned long long)task->context_.generation_,
+              TargetIsNodeLocal(owner, task->pool_id_) ? "LOCAL" : "REMOTE",
+              (unsigned)CLIO_IPC->GetNodeId());
+    }
     if (!TargetIsNodeLocal(owner, task->pool_id_)) {
       // Stage the device bytes into a host bounce, then hand the bytes to
       // the owning node through the ordinary put path (score and context --
@@ -3754,13 +3787,36 @@ clio::run::TaskResume Runtime::PodGetBlob(
     }
     const clio::run::PoolQuery owner =
         HashBlobToContainer(task->tag_id_, eff_name);
+    // EMPTY IS OFF. docker-compose declares `CLIO_GEN_LOG=${CLIO_GEN_LOG:-}`
+    // unconditionally, so the variable is always PRESENT in the container and
+    // `getenv != nullptr` would leave this on for every run.
+    static const bool gen_log = [] {
+      const char *v = getenv("CLIO_GEN_LOG");
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (gen_log && (task->context_.op_flags_ & Context::kGenerational)) {
+      fprintf(stderr, "[gen] GET blob '%s' gen=%llu -> %s (node %u)\n",
+              eff_name.c_str(),
+              (unsigned long long)task->context_.generation_,
+              TargetIsNodeLocal(owner, task->pool_id_) ? "LOCAL" : "REMOTE",
+              (unsigned)CLIO_IPC->GetNodeId());
+    }
     if (!TargetIsNodeLocal(owner, task->pool_id_)) {
       // Fetch the remote-owned bytes into a host bounce through the ordinary
       // hashed get, then serve the device-visible destination locally.
+      //
+      // task->context_ RIDES ALONG, and dropping it was a silent correctness
+      // bug. The last parameter defaults to a fresh Context(), so a get that
+      // named a generation lost kGenerational and generation_ the moment it
+      // had to cross a node: the wait-for-the-writer gate in GetBlobImpl never
+      // ran and the reader was handed whatever the owner had. Local-owner gets
+      // waited correctly, remote-owner gets did not -- the kind of split that
+      // makes a distributed bug look like a race. The PUT side has always
+      // passed it (see PodPutBlob).
       std::vector<char> bounce(task->size_);
       auto fut = client_.AsyncGetBlob(task->tag_id_, eff_name, task->offset_,
                                       task->size_, task->flags_,
-                                      bounce.data(), owner);
+                                      bounce.data(), owner, task->context_);
       CLIO_CO_AWAIT(fut);
       task->SetReturnCode(fut->GetReturnCode());
       if (task->GetReturnCode() == 0) {
@@ -4541,8 +4597,43 @@ clio::run::TaskResume Runtime::MultiPutBlob(
       }
     }
     sub.get()->BeginRunContext();
-    CLIO_CO_AWAIT(PutBlob(sub));
-    int rc = sub->GetReturnCode();
+    // EVERY RUN GOES TO ITS OWN BLOB'S OWNER.
+    //
+    // The TASK is routed by `route_blob_` -- the FIRST put only -- and the
+    // handler then ran every record through PutBlobImpl locally. So a batch
+    // whose blobs hash to different containers wrote all of them to whichever
+    // container the first blob happened to own, silently: the records landed
+    // in the wrong place, and a later get (routed by ITS blob's hash, to the
+    // right owner) found nothing there. Single-container pools never saw it,
+    // because there is only one place a blob can be.
+    //
+    // A batch is not required to be owner-homogeneous, so the split belongs
+    // here rather than in a precondition on the caller. Local runs keep the
+    // nested fast path; remote runs ship through the ordinary hashed put, the
+    // same way PodPutBlob forwards a device-originated record.
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(d0.tag_id_, d0.blob_name_);
+    int rc = 0;
+    if (TargetIsNodeLocal(owner, task->pool_id_)) {
+      CLIO_CO_AWAIT(PutBlob(sub));
+      rc = sub->GetReturnCode();
+    } else {
+      for (size_t i : valid) {
+        const auto &d = batch.descs_[i];
+        char *src = CLIO_IPC->ToFullPtr(batch.RecordSlice(i))
+                        .template Cast<char>().ptr_;
+        if (src == nullptr) {
+          rc = 22;  // unmappable source slice
+          break;
+        }
+        auto fut = client_.AsyncPutBlob(d.tag_id_, d.blob_name_, d.offset_,
+                                        d.size_, src, /*score=*/-1.0f,
+                                        task->context_, /*flags=*/0, owner);
+        CLIO_CO_AWAIT(fut);
+        rc = fut->GetReturnCode();
+        if (rc != 0) break;
+      }
+    }
     if (rc == 0) {
       task->num_ok_ += static_cast<clio::run::u32>(valid.size());
     } else if (task->first_rc_ == 0) {

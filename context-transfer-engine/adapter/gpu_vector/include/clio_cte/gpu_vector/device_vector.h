@@ -84,6 +84,10 @@ struct VecHeader {
    *  stored raw bytes shows up here and nowhere else. */
   unsigned long long *stat_get_errors_;
   unsigned long long *stat_put_errors_;
+  unsigned long long *stat_gen_ok_;
+  unsigned long long *stat_gen_stale_;
+  unsigned long long *stat_gen_busy_;
+  unsigned long long *stat_flush_skipped_;
   /** THE FATAL CHANNEL: 8 slots of PINNED HOST memory the device writes just
    *  before it traps. Neither of the obvious channels survives a trap --
    *  device printf is buffered and dies with the context, and device memory
@@ -103,6 +107,7 @@ enum FatalCode : unsigned long long {
   kFatalUnbound = 4,        // vector used before Init()
   kFatalSetFull = 5,        // AllocatePage: no frame (args: page, set, pinned)
   kFatalFlushSplit = 6,     // flush range needs more records than one task
+  kFatalGetFailed = 7,      // fetch returned non-zero (args: page, n, gen)
 };
 
 /**
@@ -1075,8 +1080,20 @@ class DeviceVector {
           if (!is_new) {
             const bool stale = bt->fetch_generation != 0 &&
                                p->generation < bt->fetch_generation;
+            if (bt->fetch_generation != 0 && !stale &&
+                h_->stat_gen_ok_ != nullptr) {
+              atomicAdd(h_->stat_gen_ok_, 1ull);
+            }
             if (!stale) continue;              // pinned; peer fills it
-            if (atomicCAS(&p->fetching, 0u, 1u) != 0u) continue;
+            if (atomicCAS(&p->fetching, 0u, 1u) != 0u) {
+              if (h_->stat_gen_busy_ != nullptr) {
+                atomicAdd(h_->stat_gen_busy_, 1ull);
+              }
+              continue;
+            }
+            if (h_->stat_gen_stale_ != nullptr) {
+              atomicAdd(h_->stat_gen_stale_, 1ull);
+            }
             p->valid_lo = 0u;                  // ours to refill, whole
             p->valid_hi = 0u;
             is_new = true;
@@ -1108,13 +1125,16 @@ class DeviceVector {
       }
     }
     bt->fetch_n = n;
+    // The version THIS batch is being fetched at. PublishFetch stamps the
+    // frames with it; fetch_generation may already have moved on by then.
+    bt->fetch_gen_sub = bt->fetch_generation;
     if (n == 0) return;
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = DeviceTaskId(Table(), kKindFetch, bt->seq++);
     t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodMultiGetBlob;
-    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->pool_query_ = clio::run::PoolQuery::Dynamic();
     t->tag_id_ = h_->tag_id_;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
@@ -1162,8 +1182,46 @@ class DeviceVector {
   /** Make a landed fetch's pages readable. Thread 0 only. */
   CTP_GPU_FUN void PublishFetch() {
     BlockTasks *bt = Tasks();
-    if (bt->fetch->GetReturnCode() != 0 && h_->stat_get_errors_ != nullptr) {
-      atomicAdd(h_->stat_get_errors_, 1ull);
+    // A FAILED GET MUST NOT PRODUCE A VALID FRAME.
+    //
+    // This used to COUNT the error and then publish the frames anyway, so a
+    // get that the runtime refused to serve left every one of its pages
+    // marked readable over a range nobody had transferred. The kernel then
+    // read whatever the frame happened to hold -- zeros for a fresh region --
+    // with no trap, no error and no clue: `pairs dev=0, PE=0` and gates that
+    // fail on physics rather than on I/O.
+    //
+    // It is the generational path that makes this reachable in practice. A
+    // get naming a generation the writer has not published yet is refused,
+    // which is exactly right; the vector then turned that refusal into
+    // silent garbage. Measured with MD_FORCE_GEN=999999 in md_bench:
+    // get_errors=11 and a frame of zeros published as valid.
+    //
+    // So: leave the frames EMPTY. The stale path already reset them, and a
+    // hold over an empty frame fails Covers and traps with the range that was
+    // never fetched -- a loud failure at the read, which is the earliest
+    // point that can name what is missing.
+    const bool get_failed = bt->fetch->GetReturnCode() != 0;
+    if (get_failed) {
+      if (h_->stat_get_errors_ != nullptr) {
+        atomicAdd(h_->stat_get_errors_, 1ull);
+      }
+      for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
+        Page *p = &h_->pages_[bt->fetch_slot[i]];
+        LockSet(SetOf(p->page_num));
+        p->valid_lo = 0u;
+        p->valid_hi = 0u;
+        __threadfence();
+        atomicSub(&p->fetching, 1u);
+        UnlockSet(SetOf(p->page_num));
+      }
+      FatalNote(kFatalGetFailed,
+                bt->fetch_n ? h_->pages_[bt->fetch_slot[0]].page_num : 0ull,
+                static_cast<clio::run::u64>(bt->fetch_n),
+                bt->fetch_gen_sub);
+      bt->fetch_n = 0;
+      bt->fetch_busy = 0u;
+      return;
     }
     for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
       Page *p = &h_->pages_[bt->fetch_slot[i]];
@@ -1188,7 +1246,7 @@ class DeviceVector {
         p->valid_lo = bt->fetch_vlo[i];
         p->valid_hi = bt->fetch_vhi[i];
       }
-      p->generation = bt->fetch_generation;
+      p->generation = bt->fetch_gen_sub;
       p->score = kDefaultScore;
       p->last_access = clock64();
       __threadfence();
@@ -1230,7 +1288,24 @@ class DeviceVector {
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
         Page *p = Find(pn);
-        if (p == nullptr) continue;
+        // A FLUSH OF A PAGE THIS BLOCK DOES NOT HAVE IS DATA LOSS, NOT A
+        // NO-OP. It used to `continue` in silence, so a caller that flushed
+        // without fetching first wrote back NOTHING and was told nothing:
+        // n stays 0, SubmitFlushRanges returns before it builds a task, and
+        // the bytes simply never leave the GPU. md_bench's halo publish did
+        // exactly that -- every generational put in a 2-node run was dropped
+        // here, and the failure surfaced two layers away as readers timing
+        // out against a blob still at generation 0.
+        //
+        // Counted, not trapped: a partially-resident flush range is a caller
+        // error but not always a fatal one, and the count is what lets a
+        // caller assert "my publish actually published".
+        if (p == nullptr) {
+          if (h_->stat_flush_skipped_ != nullptr) {
+            atomicAdd(h_->stat_flush_skipped_, 1ull);
+          }
+          continue;
+        }
         // `flushing` IS A COUNT, NOT A FLAG. In a shared cache several CUDA
         // blocks flush DISJOINT slices of the same frame at the same time;
         // skipping because someone else is mid-flush silently threw this
@@ -1269,7 +1344,7 @@ class DeviceVector {
     t->task_id_ = DeviceTaskId(Table(), kKindFlush, bt->seq++);
     t->pool_id_ = h_->pool_id_;
     t->method_ = clio::cte::core::Method::kPodMultiPutBlob;
-    t->pool_query_ = clio::run::PoolQuery::ToLocalCpu();
+    t->pool_query_ = clio::run::PoolQuery::Dynamic();
     t->tag_id_ = h_->tag_id_;
     t->context_ = clio::cte::core::Context();
     t->context_.compress_lib_ = h_->compress_lib_;
@@ -1326,9 +1401,19 @@ class DeviceVector {
     fp.ptr_ = task;
     return fp;
   }
+  /**
+   * A page's device address, TAGGED AS ONE.
+   *
+   * This used to hand back GetNull(), the tag for a raw HOST address, so a
+   * VRAM address was indistinguishable from something the receiver could
+   * dereference. Nothing checked; the invariant "only run this task where the
+   * pointer is valid" was carried entirely by pinning the task to the local
+   * node, which made a physical property of the pointer look like a routing
+   * preference. GetGpuPointer() states it in the pointer itself.
+   */
   CTP_GPU_FUN ctp::ipc::ShmPtr<> RawPtr(void *addr) const {
     ctp::ipc::ShmPtr<> p;
-    p.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    p.alloc_id_ = ctp::ipc::AllocatorId::GetGpuPointer();
     p.off_ = reinterpret_cast<clio::run::u64>(addr);
     return p;
   }
