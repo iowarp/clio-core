@@ -259,6 +259,30 @@ struct Args {
  *  from geometry alone. */
 static constexpr double kMeltPePerAtom = -6.7733681;
 
+/** Unbuffered kernel marker. GV_MD_TRACE=1. A trap kills the context and the
+ *  runtime aborts, so anything buffered is lost -- this says which launch. */
+static void MdMark(const char *what) {
+  static const bool on = getenv("GV_MD_TRACE") != nullptr;
+  if (!on) return;
+  // ATTRIBUTE THE ERROR TO THE LAUNCH THAT CAUSED IT. CUDA reports
+  // asynchronously, so the Synchronize that FAILS is usually inside a LATER
+  // kernel's driver loop -- the last marker names where it surfaced, not
+  // where it happened. Syncing here pins it down without the full
+  // serialization of CUDA_LAUNCH_BLOCKING, which hides the race entirely.
+  static const char *prev = "(none)";
+  cudaError_t e = cudaDeviceSynchronize();
+  if (e == cudaSuccess) e = cudaGetLastError();
+  if (e != cudaSuccess) {
+    std::fprintf(stderr, "[mdtrace] *** FAILED IN %s: %s\n", prev,
+                 cudaGetErrorString(e));
+    std::fflush(stderr);
+    std::_Exit(9);
+  }
+  std::fprintf(stderr, "[mdtrace] %s\n", what);
+  std::fflush(stderr);
+  prev = what;
+}
+
 double NowMs() {
   using clock = std::chrono::high_resolution_clock;
   return std::chrono::duration<double, std::milli>(
@@ -2124,7 +2148,17 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
  */
 static u32 SharedSlots(clio::run::u64 pages, u32 nsets) {
   const clio::run::u64 want = (2ull * (pages + 2) + nsets - 1) / nsets;
-  return static_cast<u32>(want < 4 ? 4 : want);
+  // A FLOOR OF 4, not because capacity says so but because a set of one is a
+  // direct map with nowhere for a collision to go. Residency needs
+  // 2*(pages+2)/nsets, which rounds to nothing for a small vector.
+  //
+  // I raised this to 16 while chasing an intermittent "illegal instruction",
+  // on the theory that the concurrent pinned working set was overflowing a
+  // set. It was not -- the fault was a divergent barrier in HoldPage -- and
+  // the floor is back at 4, which is 144 MB of cache for this deck against
+  // 576 MB at 16.
+  const clio::run::u64 kConcurrencyFloor = 4;
+  return static_cast<u32>(want < kConcurrencyFloor ? kConcurrencyFloor : want);
 }
 
 static u32 NlSlots(clio::run::u64 nl_pages) {
@@ -2442,6 +2476,42 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+
+  // WATCH THE FATAL CHANNEL. A device trap kills the context, and the
+  // runtime's own error path then aborts the process, so nothing the bench
+  // does AFTER a failed Synchronize is guaranteed to run. The slots live in
+  // pinned host memory, so a poller sees the reason the instant the device
+  // writes it -- which is the difference between "CUDA Error 715" and
+  // "AllocatePage: set full, page 7, set 3, 4 pinned".
+  // The yield driver has its own traps (frame overflow, nesting depth) and
+  // the same problem, so give it the same channel: a device global pointing
+  // at pinned host slots.
+  unsigned long long *yfatal =
+      ctp::GpuApi::MallocHost<unsigned long long>(4 * sizeof(unsigned long long));
+  if (yfatal != nullptr) {
+    std::memset(yfatal, 0, 4 * sizeof(unsigned long long));
+    cudaMemcpyToSymbol(gy::g_yield_fatal, &yfatal, sizeof(yfatal));
+  }
+  std::thread fatal_watch([yfatal] {
+    for (;;) {
+      if (yfatal != nullptr && yfatal[0] != 0) {
+        std::fprintf(stderr,
+                     "[yield] DEVICE FATAL %llu (101=depth 102=frame "
+                     "103=coro-frame): block=%llu lane=%llu need=%llu\n",
+                     yfatal[0], yfatal[1], yfatal[2], yfatal[3]);
+        std::fflush(stderr);
+        return;
+      }
+      const std::string msg = gv::FatalReport();
+      if (!msg.empty()) {
+        std::fprintf(stderr, "%s\n", msg.c_str());
+        std::fflush(stderr);
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  });
+  fatal_watch.detach();
 
   // ---- vectors ------------------------------------------------------------
   // ONE TABLE PER CUDA BLOCK is the designed model (independent per-block
@@ -2803,6 +2873,7 @@ int main(int argc, char **argv) {
       if (trace) { std::fprintf(stderr, "[md] build\n"); std::fflush(stderr); }
       const double _t = NowMs();
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
+      MdMark("BuildList");
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         BuildListKernel<<<gr, b, smem_force>>>(
@@ -2827,6 +2898,7 @@ int main(int argc, char **argv) {
       const double _t = NowMs();
       if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
       if (a.use_list) {
+        MdMark("ListForce");
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           ListForceKernel<<<gr, b, smem_force>>>(
@@ -2834,6 +2906,7 @@ int main(int argc, char **argv) {
               eflag, d_acc, nocompute, a.rowchunk, a.blocks, vw, sv);
         });
       } else {
+        MdMark("Force");
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
@@ -2856,6 +2929,7 @@ int main(int argc, char **argv) {
       if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
                    std::fflush(stderr); }
       const double _t = NowMs();
+      MdMark("MDIntegrate");
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -2892,6 +2966,7 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       const float fbox2 = static_cast<float>(g.box);
+      MdMark("Rebin");
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         RebinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -2919,6 +2994,7 @@ int main(int argc, char **argv) {
       vx2.ClearCache();
       vv2.ClearCache();
       for (auto *dst : {&dx2, &dv2}) {
+        MdMark("Sentinel");
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           SentinelKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, *dst,
@@ -2931,6 +3007,8 @@ int main(int argc, char **argv) {
             gpu, dx, dx, dx2, g.nb, g.cap, d_dest, /*keep_w=*/1, a.blocks,
             vw, sv);
       });
+      MdMark("Gather-v");
+      MdMark("Gather-x");
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -3232,6 +3310,7 @@ int main(int argc, char **argv) {
   double thermo2[4] = {0, 0, 0, 0};
   for (int rep = 0; rep < 2; ++rep) {
     ctp::GpuApi::Memset(d_thermo, 0, 4 * sizeof(double));
+    MdMark("Thermo");
     runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       ThermoKernel<<<gr, b, smem_thermo>>>(gpu, dx, dv, d_thermo, a.blocks,

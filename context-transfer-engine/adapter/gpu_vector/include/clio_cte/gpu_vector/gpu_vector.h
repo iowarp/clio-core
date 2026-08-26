@@ -57,6 +57,55 @@ inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
 // pass would fail to parse them even though it never instantiates the class.
 #if !CTP_IS_DEVICE_PASS
 
+/**
+ * The process-wide fatal channel: eight slots of PINNED HOST memory that the
+ * device writes just before it traps.
+ *
+ * Host memory because nothing else survives a trap -- device printf is
+ * buffered and dies with the context, and so does device memory, which is why
+ * a trapping kernel reports only "CUDA Error 715: an illegal instruction" and
+ * nothing about the cause. Under unified addressing the device can store
+ * straight into a cudaMallocHost allocation, so this costs nothing until it
+ * is used.
+ *
+ * One buffer for the process, not one per vector: a trap is fatal, so only
+ * the first one matters, and every vector can point at the same slots.
+ */
+inline unsigned long long *FatalSlots() {
+#if CTP_ENABLE_CUDA
+  static unsigned long long *slots = [] {
+    auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
+        8 * sizeof(unsigned long long));
+    if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
+    return p;
+  }();
+  return slots;
+#else
+  return nullptr;
+#endif
+}
+
+/** Human-readable form of whatever the device latched, or "" if nothing. */
+inline std::string FatalReport() {
+  unsigned long long *f = FatalSlots();
+  if (f == nullptr || f[0] == kFatalNone) return std::string();
+  const char *what = "unknown";
+  switch (f[0]) {
+    case kFatalInitBlock:   what = "Init(block) beyond the task table"; break;
+    case kFatalNotResident: what = "HoldPage: page not resident"; break;
+    case kFatalNotCovered:  what = "HoldPage: range never fetched"; break;
+    case kFatalUnbound:     what = "vector used before Init()"; break;
+    case kFatalSetFull:     what = "AllocatePage: set full"; break;
+    case kFatalFlushSplit:  what = "flush range needs more records"; break;
+    default: break;
+  }
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
+                "block=%llu", f[0], what, f[1], f[2], f[3], f[4]);
+  return std::string(buf);
+}
+
 template <typename T>
 class Vector {
  public:
@@ -468,6 +517,7 @@ class Vector {
     st.hdr.stat_evicts_ = nullptr;
     st.hdr.stat_get_errors_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
+    st.hdr.fatal_ = FatalSlots();
     PublishHeader(st);
     devs_[gpu_id] = st;
   }

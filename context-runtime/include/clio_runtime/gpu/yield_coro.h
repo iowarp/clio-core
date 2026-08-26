@@ -126,6 +126,7 @@ __device__ __forceinline__ void *YCoroAlloc(size_t n) {
     lane->error_ = kYieldErrOverflow;
     printf("[ycoro] block %u lane %u: frame overflow, need %u > %u bytes\n",
            blockIdx.x, threadIdx.x, end, YieldTls().stack_.bytes_per_lane_);
+    YieldFatalNote(kYieldFatalCoroFrame, blockIdx.x, threadIdx.x, end);
     __trap();
   }
   lane->sp_ = end;

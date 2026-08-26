@@ -65,6 +65,25 @@ struct VecHeader {
    *  stored raw bytes shows up here and nowhere else. */
   unsigned long long *stat_get_errors_;
   unsigned long long *stat_put_errors_;
+  /** THE FATAL CHANNEL: 8 slots of PINNED HOST memory the device writes just
+   *  before it traps. Neither of the obvious channels survives a trap --
+   *  device printf is buffered and dies with the context, and device memory
+   *  dies with it too -- so a kernel that traps normally tells you nothing but
+   *  "CUDA Error 715: an illegal instruction". Host memory outlives the
+   *  context, so a poller sees the reason. Slot 0 is the code (0 = nothing
+   *  happened), 1..4 are its arguments, and it is written once and latched. */
+  unsigned long long *fatal_;
+};
+
+/** Reasons a gpu_vector kernel traps. Slot 0 of the fatal channel. */
+enum FatalCode : unsigned long long {
+  kFatalNone = 0,
+  kFatalInitBlock = 1,      // Init(block) beyond the task table
+  kFatalNotResident = 2,    // HoldPage: page absent (args: page, set, have)
+  kFatalNotCovered = 3,     // HoldPage: range never fetched
+  kFatalUnbound = 4,        // vector used before Init()
+  kFatalSetFull = 5,        // AllocatePage: no frame (args: page, set, pinned)
+  kFatalFlushSplit = 6,     // flush range needs more records than one task
 };
 
 /**
@@ -164,6 +183,12 @@ class DeviceVector {
         printf("[gpu_vector] FATAL Init(%u): the vector was built for %u CUDA "
                "blocks, so there is no task set for this one.\n", block,
                h_->nblocks_);
+      }
+      if (h_->fatal_ != nullptr && threadIdx.x == 0 &&
+          atomicCAS(h_->fatal_, kFatalNone, kFatalInitBlock) == kFatalNone) {
+        h_->fatal_[1] = block;
+        h_->fatal_[2] = h_->nblocks_;
+        __threadfence_system();
       }
       __trap();
     }
@@ -296,7 +321,19 @@ class DeviceVector {
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     const clio::run::u64 pn = PageOf(off);
     Page *p = Find(pn);
-    if (p == nullptr) {
+    // EVERY BRANCH TO A BARRIER MUST BE VOTED, because `p` is derived from
+    // state OTHER BLOCKS MUTATE. Two threads of this block can read the same
+    // frame a microsecond apart and disagree about whether it is resident,
+    // and both paths below contain __syncthreads -- so a plain
+    // `if (p == nullptr)` puts part of the block into a barrier the rest never
+    // reaches. That is undefined behaviour, and it does not announce itself:
+    // it came back as "CUDA Error 715: an illegal instruction" from a kernel
+    // with no trap in it, roughly one run in ten, and vanished under
+    // CUDA_LAUNCH_BLOCKING and compute-sanitizer alike.
+    //
+    // Private tables never had this problem: nobody else touched the table,
+    // so every thread of the block always agreed.
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
       co_await AwaitFetch();      // it may simply not have landed yet
       p = Find(pn);
     }
@@ -306,7 +343,12 @@ class DeviceVector {
     // So a block that finds the frame claimed but not yet published has
     // nothing to fetch and everything to wait for. The claimer always reaches
     // its own AwaitFetch, so this makes progress.
-    if (p == nullptr && FindClaimed(pn) != nullptr) {
+    //
+    // Voted for the same reason, and re-voted every pass: the loop condition
+    // is a read of the same peer-mutated state.
+    for (;;) {
+      if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
+      if (!__syncthreads_or(FindClaimed(pn) != nullptr ? 1 : 0)) break;
       // TAG 0, DELIBERATELY: "no condition, always resume". A wait tag names
       // a COMPLETION WORD the host polls, and what this block waits for --
       // another block publishing a frame -- has no such word. Passing the
@@ -314,11 +356,11 @@ class DeviceVector {
       // `page_num`, which flips for no reason connected to the wait: the
       // round cap hit with 7 of 8 blocks suspended forever. Resuming every
       // round and re-checking costs relaunches; it terminates.
-      CLIO_CO_YIELD_WHEN(;, Find(pn) == nullptr && FindClaimed(pn) != nullptr,
-                         0ull);
+      int once = 0;
+      CLIO_CO_YIELD_WHEN(;, once++ == 0, 0ull);
       p = Find(pn);
     }
-    if (p == nullptr) {
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
       if (threadIdx.x == 0) {
         Page *tbl = SetPages(SetOf(pn));
         clio::run::u32 have = 0, fetching = 0, free_n = 0;
@@ -334,6 +376,7 @@ class DeviceVector {
                SetOf(pn), (unsigned long long) pn, have, fetching, free_n,
                h_->set_size_, Tasks()->fetch_busy, Tasks()->fetch_n);
       }
+      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
       __trap();
     }
     // RESIDENT IS NOT VALID. The frame may hold a different slice of this
@@ -343,8 +386,12 @@ class DeviceVector {
       const clio::run::u64 in = off % h_->elems_per_page_;
       clio::run::u64 run = h_->elems_per_page_ - in;
       if (run > count) run = count;
-      if (!Covers(p, static_cast<clio::run::u32>(in),
-                  static_cast<clio::run::u32>(in + run))) {
+      // Voted like the residency check above: `valid_lo/hi` is peer-mutated,
+      // so threads can disagree, and the report inside is thread-0 only --
+      // an unvoted take by some other thread would trap with no message.
+      if (__syncthreads_or(!Covers(p, static_cast<clio::run::u32>(in),
+                                   static_cast<clio::run::u32>(in + run))
+                               ? 1 : 0)) {
         if (threadIdx.x == 0) {
           printf("[gpu_vector] FATAL table=%u page=%llu: elements [%u,%u) of "
                  "this page were never fetched -- the frame holds [%u,%u). "
@@ -353,6 +400,7 @@ class DeviceVector {
                  (unsigned) in, (unsigned) (in + run), p->valid_lo,
                  p->valid_hi);
         }
+        FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
         __trap();
       }
     }
@@ -433,6 +481,26 @@ class DeviceVector {
  private:
   // ======================= 4. Private functions ======================
 
+  /**
+   * Latch the reason for a trap where the host can still read it.
+   *
+   * Thread 0 only, and FIRST WRITER WINS -- a trap is taken by every thread of
+   * the block and often by several blocks, and the first one explains the
+   * rest. __threadfence_system() is what makes the write cross to the host
+   * before the trap kills the context.
+   */
+  CTP_GPU_FUN void FatalNote(unsigned long long code, unsigned long long a1,
+                             unsigned long long a2,
+                             unsigned long long a3) const {
+    if (h_->fatal_ == nullptr || threadIdx.x != 0) return;
+    if (atomicCAS(h_->fatal_, kFatalNone, code) != kFatalNone) return;
+    h_->fatal_[1] = a1;
+    h_->fatal_[2] = a2;
+    h_->fatal_[3] = a3;
+    h_->fatal_[4] = static_cast<unsigned long long>(table_);
+    __threadfence_system();
+  }
+
   /** This block's table. Unbound is a caller error, never blockIdx.x: that
    *  fallback silently gave a block a different cache on every relaunch. */
   CTP_GPU_FUN clio::run::u32 Table() const {
@@ -440,6 +508,10 @@ class DeviceVector {
       if (threadIdx.x == 0) {
         printf("[gpu_vector] FATAL: vector used before Init(). Call "
                "v.Init(yv.Block()) at the top of the kernel.\n");
+      }
+      if (h_->fatal_ != nullptr && threadIdx.x == 0) {
+        atomicCAS(h_->fatal_, kFatalNone, kFatalUnbound);
+        __threadfence_system();
       }
       __trap();
     }
@@ -642,6 +714,16 @@ class DeviceVector {
     return p;
   }
 
+
+  /** How many frames of a set are pinned. For the fatal channel. */
+  CTP_GPU_FUN clio::run::u32 PinnedInSet(clio::run::u32 set) const {
+    Page *tbl = SetPages(set);
+    clio::run::u32 n = 0;
+    for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+      if (tbl[i].pins != 0u) ++n;
+    }
+    return n;
+  }
 
   /** Say which set overflowed and what is holding it. */
   CTP_GPU_FUN void ReportSetFull(clio::run::u64 pn) const {
@@ -856,6 +938,7 @@ class DeviceVector {
           p = AllocatePage(pn, &is_new);
           if (p == nullptr) {
             ReportSetFull(pn);
+            FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)));
             __trap();
           }
           if (!is_new) {
@@ -1040,6 +1123,7 @@ class DeviceVector {
       printf("[gpu_vector] FATAL table=%u: flush range needs %u records, one "
              "task carries %u. Split the range.\n",
              Table(), n + dropped, clio::cte::core::kPodMultiMax);
+      FatalNote(kFatalFlushSplit, n + dropped, clio::cte::core::kPodMultiMax, 0);
       __trap();
     }
     if (n == 0) return;

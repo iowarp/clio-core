@@ -158,6 +158,45 @@ enum YieldError : clio::run::u32 {
   kYieldErrOverflow = 2,
 };
 
+/** Reasons the yield driver traps, latched in the fatal channel below. */
+enum YieldFatal : unsigned long long {
+  kYieldFatalNone = 0,
+  kYieldFatalDepth = 101,
+  kYieldFatalFrame = 102,
+  kYieldFatalCoroFrame = 103,
+};
+
+/**
+ * THE FATAL CHANNEL: four slots of PINNED HOST memory the driver writes just
+ * before it traps.
+ *
+ * A trap kills the CUDA context, which takes the printf FIFO and all device
+ * memory with it -- so a kernel that traps reports nothing but "CUDA Error
+ * 715: an illegal instruction", and the message explaining why never
+ * arrives. Host memory survives, so a poller can read the reason. The pointer
+ * is installed by the host (YieldSetFatalSlots) and is null until then, so
+ * this costs nothing when unused.
+ */
+__device__ inline unsigned long long *g_yield_fatal = nullptr;
+
+CTP_GPU_FUN inline void YieldFatalNote(unsigned long long code,
+                                       unsigned long long a1,
+                                       unsigned long long a2,
+                                       unsigned long long a3) {
+#if defined(__CUDA_ARCH__)
+  if (g_yield_fatal == nullptr) return;
+  if (atomicCAS(g_yield_fatal, kYieldFatalNone, code) != kYieldFatalNone) {
+    return;   // first writer wins: it is the one that explains the rest
+  }
+  g_yield_fatal[1] = a1;
+  g_yield_fatal[2] = a2;
+  g_yield_fatal[3] = a3;
+  __threadfence_system();
+#else
+  (void) code; (void) a1; (void) a2; (void) a3;
+#endif
+}
+
 /** Bytes of block-uniform shared state that survive a park. */
 #define CLIO_PERSIST_BYTES 1024
 /** Per-block backing-store stride: the arena plus its header. */
@@ -417,6 +456,7 @@ struct YieldFrame {
       lane_->error_ = kYieldErrDepth;
       printf("[yield] block %u lane %u: nesting past kYieldMaxDepth=%u\n",
              blockIdx.x, threadIdx.x, (unsigned)kYieldMaxDepth);
+      YieldFatalNote(kYieldFatalDepth, blockIdx.x, threadIdx.x, d);
       __trap();
     }
 #endif
@@ -457,6 +497,7 @@ struct YieldFrame {
       printf("[yield] block %u lane %u: frame overflow, need %u > %u bytes\n",
              blockIdx.x, threadIdx.x, lcur_,
              YieldTls().stack_.bytes_per_lane_);
+      YieldFatalNote(kYieldFatalFrame, blockIdx.x, threadIdx.x, lcur_);
       __trap();
     }
 #endif

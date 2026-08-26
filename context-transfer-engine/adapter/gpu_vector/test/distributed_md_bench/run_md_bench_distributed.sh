@@ -14,6 +14,9 @@ if [ -z "${CUSZP_LIB_DIR:-}" ]; then
   [ -n "$CUSZP_LIB" ] && export CUSZP_LIB_DIR="$(dirname "$CUSZP_LIB")"
 fi
 cd "$SCRIPT_DIR"
+# The peer barrier is a file each node touches when its bench finishes; a
+# leftover from a previous run would let a node skip the wait entirely.
+rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 # Wait for EVERY node rather than the first exit -- see distributed/ for why
 # --abort-on-container-exit turns a passing run into rc=143.
