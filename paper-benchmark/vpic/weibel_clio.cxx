@@ -169,8 +169,24 @@ begin_initialization {
   num_step             = getenv("VPIC_STEPS") ? atoi(getenv("VPIC_STEPS")) : 200;
   status_interval      = 0; //2000;
   sync_shared_interval = 0; //status_interval;
-  clean_div_e_interval = 0; //turn off cleaning (GY)//status_interval;
-  clean_div_b_interval = 0; //status_interval; //(GY) 
+
+  // DIVERGENCE CLEANING, and why it is not merely a physics preference here.
+  //
+  // Upstream's deck disables it ("turn off cleaning (GY)"). The consequence for
+  // a COMPRESSION benchmark is that div_e_err, div_b_err, rhob and rhof are
+  // never recomputed: they hold their initial values for the whole run and are
+  // dumped unchanged every frame. Measured at 126^3/200 steps, 8 frames: those
+  // four are BIT-IDENTICAL across every consecutive pair, they are 25% of the
+  // payload, and because they compress ~4.2x against the 1.06x the twelve
+  // evolving fields manage, they inflate the run's headline ratio from 1.061
+  // to 1.304 -- a 1.23x lift from data the simulation never touched.
+  //
+  // Non-zero makes them real diagnostics that evolve with the fields. It costs
+  // a Poisson-ish solve every N steps, so it is opt-in rather than defaulted
+  // on, and the default stays upstream's 0 so existing numbers are unchanged.
+  clean_div_e_interval = getenv("VPIC_CLEAN_DIV_INT")
+                             ? atoi(getenv("VPIC_CLEAN_DIV_INT")) : 0;
+  clean_div_b_interval = clean_div_e_interval;
  
   // Raw field dump for the compression benchmark. Off unless
  
