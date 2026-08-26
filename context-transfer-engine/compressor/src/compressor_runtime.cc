@@ -1698,7 +1698,52 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // the batch can be ordered and truncated the way upstream's SGD
           // phase 2 does before training. See the sort below.
           std::vector<double> explore_costs;
-          double best_cost = actual_cost;  // seeded with the primary's own
+
+          // ---- The PRIMARY's decompression time, measured the same way the
+          // alternatives' will be.
+          //
+          // Without this the sweep scores alternatives on a MEASURED dt and
+          // the primary on a PREDICTED one. The dt head over-predicts by
+          // 1.4-18x on this workload, so that combination understates every
+          // alternative's cost against the primary's and biases the sweep
+          // toward adopting one. Both sides must come from the same clock.
+          //
+          // Only the RANKING seed changes. actual_cost keeps the predicted dt
+          // because it also feeds the exploration gate and the MAPE
+          // diagnostics, where upstream deliberately uses the prediction on
+          // both sides so an unmeasured term contributes ~0 error. Moving a
+          // measured value into it would change WHETHER exploration runs, not
+          // just what it picks.
+          double primary_dt_ms = -1.0;
+          double primary_rank_cost = actual_cost;
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+          if (MeasureExploreDecompTime() && primary_image.valid() &&
+              context.compress_lib_ != 0) {
+            // The stored image is header + codec payload; decompression must
+            // start at the payload. HeaderBytesFor, not sizeof(header): a
+            // quantized blob carries a 32-byte extension and would be read
+            // early.
+            const size_t hdr =
+                HeaderBytesFor(static_cast<uint32_t>(context.compress_preset_));
+            if (primary_image.size > hdr) {
+              auto full = CLIO_IPC->ToFullPtr<char>(
+                  primary_image.data.template Cast<char>());
+              if (full.ptr_ != nullptr) {
+                double ms = -1.0;
+                if (ctp::NvComp::DecompressMeasureAnyPtr(
+                        full.ptr_ + hdr,
+                        static_cast<size_t>(primary_image.size) - hdr,
+                        chunk_size, &ms)) {
+                  primary_dt_ms = ms;
+                  primary_rank_cost =
+                      cost(context.actual_compress_time_ms_, primary_dt_ms,
+                           context.actual_compression_ratio_);
+                }
+              }
+            }
+          }
+#endif
+          double best_cost = primary_rank_cost;  // seeded with the primary's own
 
           // Device shuffle scratch for the explored candidates; released
           // together once the loop is done.
@@ -2120,8 +2165,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 predicted->compression_ratio_, predicted->compress_time_ms_,
                 context.actual_compression_ratio_,
                 context.actual_compress_time_ms_, context.actual_psnr_db_,
-                actual_cost, actual_cost,
-                /*adopted=*/!winner.have, /*is_primary=*/true);
+                primary_rank_cost, primary_rank_cost,
+                /*adopted=*/!winner.have, /*is_primary=*/true, primary_dt_ms);
           }
           for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
             const ExploreRow& row = explore_rows[ri];

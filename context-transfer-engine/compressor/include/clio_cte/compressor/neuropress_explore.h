@@ -100,6 +100,12 @@ struct ExploreSlot {
  *  before any is waited on, or the sweep serializes into K sequential calls. */
 void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots);
 
+/** True when CLIO_NEUROPRESS_EXPLORE_MEASURE_DT asks the sweep to decompress
+ *  each candidate back for a real decompression time instead of substituting
+ *  the NN's prediction. Read once. Off by default -- upstream never
+ *  decompresses at write time, and turning this on makes selection diverge. */
+bool MeasureExploreDecompTime();
+
 }  // namespace clio::cte::compressor
 
 #endif  // CLIO_CTE_COMPRESSOR_NEUROPRESS_EXPLORE_H_

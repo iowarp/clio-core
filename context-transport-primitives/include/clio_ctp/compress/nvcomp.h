@@ -517,34 +517,67 @@ class NvComp : public Compressor {
       return false;
     }
     slot->decomp_ms = -1.0;
+    if (!slot->ev_dstart && cudaEventCreate(&slot->ev_dstart) != cudaSuccess) {
+      return false;
+    }
+    if (!slot->ev_dstop && cudaEventCreate(&slot->ev_dstop) != cudaSuccess) {
+      return false;
+    }
+    return DecompressMeasureOn(slot->d_out, expect_size, slot->stream,
+                               slot->ev_dstart, slot->ev_dstop,
+                               &slot->decomp_ms);
+  }
+
+  /**
+   * @brief The measurement itself, for any already-compressed device buffer.
+   *
+   * Split out so the PRIMARY and the explored ALTERNATIVES are timed by
+   * literally the same code. That is not tidiness -- scoring compares their
+   * costs directly, so measuring them by two routes would put a systematic
+   * offset straight into the selection. (Scoring alternatives on a measured dt
+   * while the primary kept a PREDICTED one did exactly that, and biased the
+   * sweep toward adopting alternatives.)
+   *
+   * Each call synchronizes before reading its events, and the sweep collects
+   * slots one at a time, so no two of these overlap -- every candidate is
+   * timed on an otherwise idle device.
+   *
+   * @param compressed Device pointer to the codec's output (no Clio header).
+   * @param expect_size Original uncompressed size; a header claiming anything
+   *   else means these are not the bytes we think, and the call is refused.
+   */
+  static bool DecompressMeasureOn(const void *compressed, size_t expect_size,
+                                  cudaStream_t stream, cudaEvent_t ev0,
+                                  cudaEvent_t ev1, double *out_ms) {
+    if (!compressed || !stream || !ev0 || !ev1 || !out_ms) return false;
+    *out_ms = -1.0;
+    // create_manager and cudaMalloc are deliberately OUTSIDE the event window
+    // (see the caller's contract): they are construction, and on a cold codec
+    // cost more than the decompression they precede.
+    void *src = const_cast<void *>(compressed);
     uint8_t *d_decomp = nullptr;
     bool ok = false;
     try {
       std::shared_ptr<nvcomp::nvcompManagerBase> dmgr =
-          nvcomp::create_manager(slot->d_out, slot->stream);
+          nvcomp::create_manager(static_cast<uint8_t *>(src), stream);
       if (dmgr) {
         InstallScratchAllocators(dmgr);
         nvcomp::DecompressionConfig dcfg =
-            dmgr->configure_decompression(slot->d_out);
+            dmgr->configure_decompression(static_cast<uint8_t *>(src));
         if (dcfg.decomp_data_size == expect_size &&
-            cudaMalloc(&d_decomp, dcfg.decomp_data_size) == cudaSuccess &&
-            (slot->ev_dstart != nullptr ||
-             cudaEventCreate(&slot->ev_dstart) == cudaSuccess) &&
-            (slot->ev_dstop != nullptr ||
-             cudaEventCreate(&slot->ev_dstop) == cudaSuccess)) {
+            cudaMalloc(&d_decomp, dcfg.decomp_data_size) == cudaSuccess) {
           cudaGetLastError();
           ScratchOom();  // clear
-          if (cudaEventRecord(slot->ev_dstart, slot->stream) == cudaSuccess) {
-            dmgr->decompress(d_decomp, slot->d_out, dcfg);
+          if (cudaEventRecord(ev0, stream) == cudaSuccess) {
+            dmgr->decompress(d_decomp, static_cast<uint8_t *>(src), dcfg);
             // Same launch check Compress()/CompressLaunch() make: kernels that
             // never ran would otherwise be timed as an extremely fast codec.
             if (cudaPeekAtLastError() == cudaSuccess && !ScratchOom() &&
-                cudaEventRecord(slot->ev_dstop, slot->stream) == cudaSuccess &&
-                cudaStreamSynchronize(slot->stream) == cudaSuccess) {
+                cudaEventRecord(ev1, stream) == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess) {
               float ms = 0.0f;
-              if (cudaEventElapsedTime(&ms, slot->ev_dstart, slot->ev_dstop) ==
-                  cudaSuccess) {
-                slot->decomp_ms = static_cast<double>(ms);
+              if (cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess) {
+                *out_ms = static_cast<double>(ms);
                 ok = true;
               }
             }
@@ -553,11 +586,44 @@ class NvComp : public Compressor {
       }
     } catch (...) {
       // nvcomp reports errors by throwing, and decompress() is void, so a
-      // throw is its only failure signal. decomp_ms stays -1.
+      // throw is its only failure signal. *out_ms stays -1.
     }
-    // Freed here, not in ReleaseSlot: slots live until the whole sweep ends,
-    // so holding this would multiply the sweep's device memory by K.
+    // Freed here, not held: the sweep's slots live until it ends, so keeping
+    // this would multiply its device memory by K.
     if (d_decomp) cudaFree(d_decomp);
+    return ok;
+  }
+
+  /**
+   * @brief Measure decompression of a buffer that may be host or device
+   * memory, creating and destroying everything it needs.
+   *
+   * For the primary, whose compressed image is a Clio blob rather than a
+   * slot's device buffer. Stages H2D when needed -- outside the timed window,
+   * like every other setup cost here.
+   */
+  static bool DecompressMeasureAnyPtr(const void *compressed,
+                                      size_t compressed_size,
+                                      size_t expect_size, double *out_ms) {
+    if (!compressed || compressed_size == 0 || !out_ms) return false;
+    *out_ms = -1.0;
+    cudaStream_t stream = CachedStream();
+    if (!stream) return false;
+    uint8_t *d_in = nullptr;
+    bool free_in = false;
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    bool ok = false;
+    if (cudaEventCreate(&ev0) == cudaSuccess &&
+        cudaEventCreate(&ev1) == cudaSuccess) {
+      d_in = ToDeviceInput(const_cast<void *>(compressed), compressed_size,
+                           stream, &free_in);
+      if (d_in) {
+        ok = DecompressMeasureOn(d_in, expect_size, stream, ev0, ev1, out_ms);
+      }
+    }
+    if (free_in && d_in) cudaFree(d_in);
+    if (ev0) cudaEventDestroy(ev0);
+    if (ev1) cudaEventDestroy(ev1);
     return ok;
   }
 

@@ -17,7 +17,6 @@
 
 namespace clio::cte::compressor {
 
-namespace {
 /**
  * Measure each explored candidate's decompression time by decompressing its
  * own output back, instead of substituting the NN's prediction.
@@ -40,7 +39,6 @@ bool MeasureExploreDecompTime() {
   }();
   return on;
 }
-}  // namespace
 
 /** Sweep step 2: finish every launched slot. Kept separate from the launch
  *  step -- every slot must be in flight before any is waited on, or the sweep
