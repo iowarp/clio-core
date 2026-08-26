@@ -4,6 +4,7 @@
  */
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -13,6 +14,21 @@
 #include <fcntl.h>
 
 namespace clio::run::bdev {
+
+/* End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
+ * Same "[np-path]" prefix as the compressor half in compressor_runtime.cc, so
+ * one grep spans selection, codec and the storage write that terminates the
+ * device path. Undefined => expands to nothing. */
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+#define CLIO_PATH_TRACE(...)                       \
+  do {                                             \
+    std::fprintf(stderr, "[np-path] " __VA_ARGS__); \
+    std::fprintf(stderr, "\n");                    \
+    std::fflush(stderr);                           \
+  } while (0)
+#else
+#define CLIO_PATH_TRACE(...) ((void)0)
+#endif
 
 namespace {
 
@@ -294,6 +310,11 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     staging.resize(task->length_);
     ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
   }
+  CLIO_PATH_TRACE(
+      "STORE  fs_bdev Write %llu bytes from %s memory%s",
+      (unsigned long long)task->length_, data_on_device ? "DEVICE" : "HOST",
+      data_on_device ? "  <- the single D2H that terminates the device path"
+                     : "  (no D2H: bytes were already on the host)");
 
   clio::run::u64 total_bytes_written = 0;
   clio::run::u64 data_offset = 0;

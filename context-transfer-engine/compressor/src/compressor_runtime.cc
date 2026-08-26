@@ -2797,6 +2797,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       input_ptr = staged_in;
     }
 
+    CLIO_PATH_TRACE("WRITE  Compress ENTRY blob='%s' bytes=%llu device=%d",
+                    task->blob_name_.str().c_str(),
+                    (unsigned long long)input_size,
+                    ctp::IsDevicePointer(input_ptr) ? 1 : 0);
+
     // GPU-native libraries (nvcomp/cusz/cuszp/ndzip) accept a device pointer
     // directly -- they stage their own H2D as needed. Everything else is a
     // plain host codec that would read a device pointer directly and crash,
@@ -2806,8 +2811,19 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // legacy heuristic fallback (or an explicit/static compress_lib_) can
     // still land here with a device pointer + CPU library.
     std::vector<char> device_staging;
+#ifdef CLIO_NEUROPRESS_PATH_TRACE
+    const bool np_dev_pre_stage = ctp::IsDevicePointer(input_ptr);
+#endif
     input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
         input_ptr, input_size, context.compress_lib_, device_staging);
+    CLIO_PATH_TRACE(
+        "WRITE  StageInputIfNeeded lib=%d (%s) device_in=%d device_out=%d %s",
+        context.compress_lib_,
+        ctp::CompressionFactory::NameForWireId(context.compress_lib_).c_str(),
+        np_dev_pre_stage ? 1 : 0, ctp::IsDevicePointer(input_ptr) ? 1 : 0,
+        (np_dev_pre_stage && !ctp::IsDevicePointer(input_ptr))
+            ? "*** HOST FALLBACK: full D2H of the payload ***"
+            : "(no copy)");
 
     // Byte-shuffle preprocessing, when the ranked candidate asked for it.
     // Groups each element's Nth byte together so a codec sees runs of
@@ -2881,6 +2897,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         input_ptr = quant_buf;          // still device-resident
         compress_input_size = quant_bytes;
         applied_quant = true;
+        CLIO_PATH_TRACE(
+            "WRITE  QuantizeDevice (CUDA) %llu -> %llu bytes prec=%d eb=%g "
+            "effective_eb=%g device=1",
+            (unsigned long long)input_size, (unsigned long long)quant_bytes,
+            (int)quant_params.precision, context.error_bound_,
+            quant_params.effective_error_bound);
         HLOG(kDebug,
              "NeuroPress quantize: {} -> {} bytes (precision={} eb={} "
              "effective_eb={} achievable={})",
@@ -2936,6 +2958,9 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
                 input_ptr, shuffle_device_buf, compress_input_size, shuffle_elem)) {
           input_ptr = shuffle_device_buf;  // still on the device
           applied_shuffle = shuffle_elem;
+          CLIO_PATH_TRACE(
+              "WRITE  ByteShuffleDevice (CUDA) %llu bytes elem=%u device=1",
+              (unsigned long long)compress_input_size, (unsigned)shuffle_elem);
         } else if (!shuffle_device_alloc.IsNull()) {
           CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, shuffle_device_alloc);
           shuffle_device_alloc = ctp::ipc::AllocatorId();
@@ -2962,6 +2987,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // function's own host memcpy into the SHM buffer below -- down to the
     // one D2H copy the bdev write does regardless.
     bool output_on_device = ctp::IsDevicePointer(input_ptr);
+    CLIO_PATH_TRACE("WRITE  codec input device=%d -> output buffer %s",
+                    output_on_device ? 1 : 0,
+                    output_on_device ? "DEVICE (no D2H before the bdev write)"
+                                     : "*** HOST (compressed bytes copied "
+                                       "through host SHM) ***");
 
     std::vector<char> compressed_buffer;
     char *device_output = nullptr;
@@ -3209,6 +3239,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         task->context_ = context;
         task->return_code_ = 0;
       } else {
+        CLIO_PATH_TRACE(
+            "WRITE  PutBlob -> tier blob='%s' stored=%llu bytes, handed over "
+            "from %s memory",
+            task->blob_name_.str().c_str(),
+            (unsigned long long)total_stored_size,
+            output_on_device ? "DEVICE" : "HOST");
         // Call PutBlob with header + compressed data
         auto put_task = core_client_->AsyncPutBlob(
             task->tag_id_, task->blob_name_.str(), task->offset_,
