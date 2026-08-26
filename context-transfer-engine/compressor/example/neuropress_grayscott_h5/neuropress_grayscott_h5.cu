@@ -119,6 +119,21 @@ int main(int argc, char **argv) {
        defaults, whose V field goes extinct by ~1000 steps. */
     auto cfg = gs::SimSettings::NeuroPress3D(L);
     cfg.Du = 0.2f; cfg.Dv = 0.1f; cfg.F = 0.02f; cfg.k = 0.048f; cfg.dt = 1.0f;
+    /* GS_REGIME selects the (F, k) pair, which is what moves compressibility:
+       the pattern regime IS the workload variable here, and a benchmark that
+       cannot change it is measuring one dataset. Default keeps the settings
+       above, so an existing run is unchanged. */
+    if (const char *reg = std::getenv("GS_REGIME")) {
+      const std::string r(reg);
+      if (r == "stripes")   { cfg.F = 0.035f; cfg.k = 0.065f; }
+      else if (r == "chaos"){ cfg.F = 0.014f; cfg.k = 0.045f; }
+      else if (r == "sparse"){ cfg.F = 0.04f;  cfg.k = 0.065f; }
+      else if (r != "spots" && !r.empty()) {
+        std::fprintf(stderr, "unknown GS_REGIME '%s' (spots|stripes|chaos|sparse)\n", reg);
+        return 1;
+      }
+      std::printf("regime %s: F=%.4f k=%.5f\n", reg, cfg.F, cfg.k);
+    }
     gs::Simulation sim(cfg);
     if (!sim.Valid() || !sim.Init()) { std::fprintf(stderr, "sim init\n"); return 1; }
     std::printf("Gray-Scott %d^3 (%.1f MiB/field), %d steps, snapshot every %d\n",

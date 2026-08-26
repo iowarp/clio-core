@@ -43,20 +43,28 @@ CODEC = re.compile(r"codec ran lib=(\d+) in=(\d+) out=(\d+) kept=([01])")
 FINAL = re.compile(r"neuropress FINAL blob='([^']*)' lib=(\d+) \(([^)]*)\)"
                    r".*?\((primary kept|EXPLORATION OVERRODE THE PRIMARY)\)")
 OPMD = re.compile(r"/data/(\d+)/fields/([^/]+)(?:/([^/]+))?/chunk_(\d+)$")
+# Gray-Scott writes one dataset per snapshot, named "<field>_<step>", so its
+# blobs arrive as "/V_00025/chunk_3". Same treatment as openPMD's: the field
+# has to end up first or the aggregator files every chunk under its own name.
+GS = re.compile(r"/([A-Za-z]+)_(\d+)/chunk_(\d+)$")
 
 
 def normalise(name):
-    """openPMD path -> "<field>/step_<n>/chunk_<i>".
+    """VOL blob path -> "<field>/step_<n>/chunk_<i>".
 
     The aggregator groups by the first path segment; passing /data/<step>/...
     through would file every chunk under "data" and produce no per-field
     breakdown.
     """
     m = OPMD.match(name)
-    if not m:
-        return name.lstrip("/").replace("/", "_")
-    step, fld, comp, chunk = m.groups()
-    return f"{fld}{comp or ''}/step_{step}/chunk_{chunk}"
+    if m:
+        step, fld, comp, chunk = m.groups()
+        return f"{fld}{comp or ''}/step_{step}/chunk_{chunk}"
+    m = GS.match(name)
+    if m:
+        fld, step, chunk = m.groups()
+        return f"{fld}/step_{step}/chunk_{chunk}"
+    return name.lstrip("/").replace("/", "_")
 
 
 def main():
@@ -72,16 +80,17 @@ def main():
     blobs, primaries, finals = [], [], {}
     with open(log, errors="replace") as f:
         for line in f:
-            m = BLOB.search(line)
-            if m:
+            # finditer, and no `continue` between the three: worker threads log
+            # concurrently and two records land on ONE line often enough to
+            # matter. Matching once per line dropped 3 of 128 codec records on
+            # a Gray-Scott run, which then mis-paired every chunk after the
+            # first collision -- silently, because the counts only differed by
+            # three.
+            for m in BLOB.finditer(line):
                 blobs.append((m.group(1), int(m.group(2))))
-                continue
-            m = CODEC.search(line)
-            if m:
+            for m in CODEC.finditer(line):
                 primaries.append(tuple(int(x) for x in m.groups()))
-                continue
-            m = FINAL.search(line)
-            if m:
+            for m in FINAL.finditer(line):
                 finals[m.group(1)] = (int(m.group(2)), m.group(3),
                                       m.group(4).startswith("EXPLORATION"))
 

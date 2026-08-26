@@ -254,3 +254,6 @@ paper-benchmark/vpic/build_deck.log
 paper-benchmark/vpic/energies
 # WarpX writes openPMD output and per-run stores under results/.
 paper-benchmark/warpx/results/
+# Gray-Scott writes its HDF5, its reference dump and per-run stores under
+# results/. The harness scripts are tracked; what a run produces is not.
+paper-benchmark/grayscott/results/
