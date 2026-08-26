@@ -140,15 +140,45 @@ env CLIO_SERVER_CONF=$W/store/compose.yaml CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
 for f in $W/dec/*.bin; do cmp "$f" "$W/raw/$(basename $f)" || echo "DIFFER $f"; done
 ```
 
-Measured at 30³ (4 MiB, 32 chunks of 128 KiB, codecs `nvcomp-ans` ×18,
-`brotli` ×6 raw, `nvcomp-bitcomp` ×4, `nvcomp-zstd` ×4):
+Run at both sizes. At 126³ each variable is 8 MiB, i.e. two 4 MiB chunks, so
+the per-variable comparison rejoins `chunk_0` and `chunk_1` in order — which
+also checks that the chunking and the names reassemble correctly.
 
-* decompressed vs the exact bytes staged to the GPU — **32 / 32 identical**
-* decompressed vs the deck's own `.f32` files — **32 / 32 identical**
-* md5 over both sets: `dc4287f264b551420fe07b7ac6ee98f4`
+| | 30³ (4 MiB, 32 chunks) | **126³ (1,024 MiB, 256 chunks)** |
+|---|---|---|
+| decompressed vs the bytes staged to the GPU | 32 / 32 identical | **256 / 256 identical**, 1,073,741,824 B |
+| decompressed vs the deck's own `.f32` files | 32 / 32 identical | **128 / 128 identical**, 1,073,741,824 B |
+| md5 over both whole sets | `dc4287f264b551420fe07b7ac6ee98f4` | `39c056da640fcc64277f467b64784366` |
+| codecs exercised | ans 18, raw 6, bitcomp 4, zstd 4 | bitcomp 86, ans 64, lz4 50, raw 56 |
 
-The 126³ figures above are digest-verified; the literal comparison was run at
-30³ because it needs both file sets on disk.
+The second row is the stronger one: it compares against the simulation's own
+output, written host-side down a different code path in the same process. The
+cold read of the whole 1 GiB took 8.9 s in a separate process where the
+compressed tier is the only copy of the data.
+
+## The cost model changes what gets attempted
+
+The same in-situ workload with the latency terms zeroed
+(`CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPRESS_COST_W_IO=1`,
+the offline sweep's `dynamic-ratio`):
+
+| | balanced (default) | ratio-only |
+|---|---|---|
+| ratio | 1.278x | **1.403x** |
+| stored | 801.2 MiB | **730.0 MiB** |
+| compressed / raw | 200 / **56** | **256 / 0** |
+| codecs | bitcomp 86, ans 64, lz4 50 | zstd 173, lz4 83 |
+| stage+compress | 1.30 s | 3.25 s |
+| verify, in process and cold | 256 / 256 | 256 / 256 |
+
+Dropping the time terms buys 71 MiB at 2.5x the compression time, and the model
+then attempts every chunk instead of giving up on a fifth of them. It is not
+free everywhere: `div_b_err`/`div_e_err` fall from 450x to 226x and
+`rhob`/`rhof` from 2.30x to 1.94x, because zstd wins those chunks from bitcomp
+once the latency term stops counting. The twelve E/B/J/TCA fields move the
+other way, 1.00-1.14x to 1.02-1.21x. Both numbers match the offline sweep's
+`dynamic` and `dynamic-ratio` rows, which is the point of running the same
+workload two ways.
 
 The two diagnostic residuals (`div_b_err`, `div_e_err`) reach 450×; `rhob`/`rhof`
 about 2.3×; the twelve E, B, J and TCA fields sit at 1.00–1.14×, which is why
