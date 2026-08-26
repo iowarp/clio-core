@@ -270,13 +270,20 @@ run_cell() {
   # run_config.sh turns any digest check off there anyway.
   local vfy=()
   [ "$w" = warpx ] && [ "$mode" = lossless ] && vfy=(--verify)
+  # Nyx and VPIC verify in situ, against the bytes the simulation submitted:
+  # the adapter digests each chunk as it stages it and reads every blob back
+  # through the decompressor at the end. Without this they reported
+  # `verified: n/a` on every cell -- a whole campaign with nothing checking
+  # that what came back is what went in.
+  case "$w" in nyx|vpic) [ "$mode" = lossless ] && vfy=(--verify) ;; esac
   # --check-bound: on a LOSSY run, verify |original - decoded| <= eb instead of
-  # a digest, which lossy data must fail. Only the two replay workloads can do
-  # it -- the check re-reads each chunk from its source file, and nyx/ and
-  # vpic/ are the only ones whose payload is on disk. LAMMPS generates its
-  # arrays in memory and WarpX's originals are the native openPMD output, so
-  # neither has a source to compare against here; those cells stay unchecked
-  # rather than silently reporting a pass.
+  # a digest, which lossy data must fail. Nyx and VPIC do it IN SITU -- there
+  # is no source file to re-read, so the adapter holds each frame's submitted
+  # bytes for one frame and compares the read-back against those, which bounds
+  # the extra memory at a frame rather than the run. LAMMPS generates its
+  # arrays in memory and WarpX's originals are the native openPMD output, and
+  # neither adapter retains them, so those cells stay unchecked rather than
+  # silently reporting a pass.
   if [ "$CHECK_BOUND" = 1 ] && [ "$mode" = lossy ]; then
     case "$w" in nyx|vpic) vfy+=(--check-bound) ;; esac
   fi

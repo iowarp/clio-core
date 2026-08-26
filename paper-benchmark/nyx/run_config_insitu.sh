@@ -3,7 +3,8 @@
 #
 #   ./run_config_insitu.sh <config> [--ncell N] [--steps N] [--int N]
 #                          [--chunk B] [--bw B/ms] [--eb X] [--explore-k K]
-#                          [--explore-thresh X] [--results DIR] [--tag NAME]
+#                          [--explore-thresh X] [--verify] [--check-bound]
+#                          [--results DIR] [--tag NAME]
 #
 # The difference from run_config.sh that matters: the simulation hands the
 # compressor `fab.dataPtr(comp)` -- AMReX DEVICE memory, uncopied -- from
@@ -29,7 +30,7 @@ CONFIG=${1:-explore-balance}; shift || true
 
 NCELL=128 STEPS=200 INT=10 CHUNK=4194304
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
-RESULTS="$HERE/results" TAG=""
+RESULTS="$HERE/results" TAG="" VERIFY=0 CHECK_BOUND=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ncell) NCELL=$2; shift 2;;
@@ -42,6 +43,15 @@ while [ $# -gt 0 ]; do
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --results) RESULTS=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
+    # Bit-exact digest check of every blob, through the decompressor. Only
+    # meaningful lossless; the adapter downgrades it to a bound check if an
+    # error bound is set.
+    --verify) VERIFY=1; shift;;
+    # LOSSY: |original - decoded| <= eb, elementwise. Unlike the replay route
+    # this does NOT re-read a source file -- there is none in situ -- so the
+    # adapter holds each frame's submitted bytes for one frame and compares
+    # against those.
+    --check-bound) CHECK_BOUND=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -76,6 +86,8 @@ env "${COST_ENV[@]}" \
     "$INSITU/run.sh" --ncell "$NCELL" --steps "$STEPS" --int "$INT" \
         --chunk "$CHUNK" --learn --explore "$EXPLORE_K_OPT" \
         --threshold "$THRESH_OPT" --store "$STORE" \
+        ${VERIFY:+$([ "$VERIFY" = 1 ] && echo --verify)} \
+        ${CHECK_BOUND:+$([ "$CHECK_BOUND" = 1 ] && echo --check-bound)} \
         > "$RESULTS/.$NAME.stdout" 2>&1
 RC=$?
 set -e
@@ -95,6 +107,18 @@ if [ "$HOSTED" -gt 0 ]; then
 fi
 [ $RC -ne 0 ] && { echo "   FAILED rc=$RC"; tail -5 "$STORE/stdout.log"; }
 
+# The adapter prints its verdict on stdout, which run.sh captures into
+# nyx.log and echoes back through its [clio-nyx-insitu] grep -- so it lands in
+# stdout.log either way. Recorded here so summary.csv does not have to scrape
+# it, and so a run that was never asked to verify reads "n/a" rather than a
+# silent 0 that looks like a pass.
+VERDICT=n/a
+if grep -q "BOUND OK:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=bound-ok
+elif grep -q "BOUND FAILED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=BOUND-FAIL
+elif grep -q "VERIFIED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=pass
+elif grep -q "^\[clio-nyx-insitu\] FAILED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=FAIL
+fi
+
 NCHUNKS=0
 [ -f "$STORE/blobs.csv" ] && NCHUNKS=$(( $(wc -l < "$STORE/blobs.csv") - 1 ))
 PAYLOAD=$(awk -F, 'NR>1{s+=$2} END{printf "%d", s+0}' "$STORE/blobs.csv" 2>/dev/null || echo 0)
@@ -106,7 +130,8 @@ cat > "$STORE/meta.json" <<JSON
  "error_bound":${EB:-0},"explore_k":$EXPLORE_K_OPT,"explore_thresh":$THRESH_OPT,
  "device":"gpu","workload":"nyx-sedov","residency":"device","host_refusals":$HOSTED,
  "atoms":0,"steps":$STEPS,"gap":$INT,"frames":$FRAMES,"chunk":$CHUNK,
- "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,"verified":0,
+ "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
+ "verify_result":"$VERDICT",
  "physics":{"problem":"sedov","precision":"float32","insitu":"yes"}}
 JSON
 grep -E "stored [0-9]+ blob" "$STORE/stdout.log" | sed 's/^/   /' || true

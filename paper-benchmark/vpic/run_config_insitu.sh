@@ -27,7 +27,7 @@ CONFIG=${1:-explore-balance}; shift || true
 
 NCELL=126 STEPS=200 INT=25 CHUNK=4194304
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
-RESULTS="$HERE/results" TAG=""
+RESULTS="$HERE/results" TAG="" VERIFY=0 CHECK_BOUND=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ncell) NCELL=$2; shift 2;;
@@ -40,6 +40,13 @@ while [ $# -gt 0 ]; do
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --results) RESULTS=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
+    # Bit-exact digest check of every blob, through the decompressor. Only
+    # meaningful lossless; the adapter downgrades it to a bound check if an
+    # error bound is set.
+    --verify) VERIFY=1; shift;;
+    # LOSSY: |original - decoded| <= eb, elementwise, against the bytes the
+    # simulation submitted -- there is no source file in situ.
+    --check-bound) CHECK_BOUND=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -79,6 +86,8 @@ env "${COST_ENV[@]}" \
     "$INSITU/run.sh" --port "$PORT" --ncell "$NCELL" --steps "$STEPS" --int "$INT" \
         --chunk "$CHUNK" --learn --explore "$EXPLORE_K_OPT" \
         --threshold "$THRESH_OPT" --store "$STORE" \
+        ${VERIFY:+$([ "$VERIFY" = 1 ] && echo --verify)} \
+        ${CHECK_BOUND:+$([ "$CHECK_BOUND" = 1 ] && echo --check-bound)} \
         > "$RESULTS/.$NAME.stdout" 2>&1
 RC=$?
 set -e
@@ -98,6 +107,16 @@ if [ "$HOSTED" -gt 0 ]; then
 fi
 [ $RC -ne 0 ] && { echo "   FAILED rc=$RC"; tail -5 "$STORE/stdout.log"; }
 
+# The adapter prints its verdict on stdout; recorded here so summary.csv does
+# not have to scrape it, and so an unverified run reads "n/a" rather than a
+# silent 0 that looks like a pass.
+VERDICT=n/a
+if grep -q "BOUND OK:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=bound-ok
+elif grep -q "BOUND FAILED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=BOUND-FAIL
+elif grep -q "VERIFIED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=pass
+elif grep -q "^\[clio-vpic-insitu\] FAILED:" "$STORE/stdout.log" 2>/dev/null; then VERDICT=FAIL
+fi
+
 NCHUNKS=0
 [ -f "$STORE/blobs.csv" ] && NCHUNKS=$(( $(wc -l < "$STORE/blobs.csv") - 1 ))
 PAYLOAD=$(awk -F, 'NR>1{s+=$2} END{printf "%d", s+0}' "$STORE/blobs.csv" 2>/dev/null || echo 0)
@@ -109,7 +128,8 @@ cat > "$STORE/meta.json" <<JSON
  "error_bound":${EB:-0},"explore_k":$EXPLORE_K_OPT,"explore_thresh":$THRESH_OPT,
  "device":"gpu","workload":"vpic-weibel","residency":"device","host_refusals":$HOSTED,
  "atoms":0,"steps":$STEPS,"gap":$INT,"frames":$FRAMES,"chunk":$CHUNK,
- "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,"verified":0,
+ "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
+ "verify_result":"$VERDICT",
  "physics":{"problem":"weibel","precision":"float32","insitu":"yes"}}
 JSON
 grep -E "stored [0-9]+ blob" "$STORE/stdout.log" | sed 's/^/   /' || true

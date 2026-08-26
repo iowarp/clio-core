@@ -68,6 +68,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -164,6 +165,13 @@ struct BlobRecord {
   // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
   double dt_ms = -1.0;
   bool ok = false;
+  // The chunk as SUBMITTED, kept only while a bound check still needs it.
+  // A digest cannot answer the lossy question -- |original - decoded| <= eb
+  // needs the values, not a hash of them -- and in situ there is no file on
+  // disk to re-read them from, which is the whole difference from the replay
+  // route. Held for ONE frame and released in VerifyPendingBound(), so the
+  // cost is a frame (48 MiB at 128^3, 384 MiB at 256^3) rather than the run.
+  std::vector<char> original;
 };
 
 struct Pending {
@@ -202,6 +210,17 @@ struct Adapter {
   std::string report_path;
   std::string raw_dir;
   bool verify = false;
+  // Lossy verification: check the VALUES against the requested absolute error
+  // bound instead of a digest. Mutually exclusive with `verify` in practice --
+  // lossy data must fail a digest by construction, so asking for both would
+  // report a failure that is correct behaviour.
+  bool check_bound = false;
+  double error_bound = 0.0;
+  size_t bound_cursor = 0;      // records[0, bound_cursor) already checked
+  size_t bound_checked = 0;     // elements compared
+  size_t bound_violations = 0;  // elements outside the bound
+  size_t bound_bad_blobs = 0;   // blobs that failed to read back at all
+  double bound_max_err = 0.0;   // largest |original - decoded| seen
 
   std::unique_ptr<clio::cte::compressor::Client> compressor;
   clio::cte::core::Client *cte = nullptr;
@@ -322,6 +341,87 @@ struct Adapter {
       r.stored = (r.ok && r.lib != 0) ? c.actual_compressed_size_ : r.bytes;
     }
     pending.clear();
+    // Every task of this frame has landed, so the blobs are readable and the
+    // originals are still held. Check and release them here rather than at
+    // end(), which is what bounds the retained bytes to one frame.
+    if (check_bound) VerifyPendingBound();
+  }
+
+  /**
+   * Check every record staged since the last call against the requested
+   * absolute error bound, then release the originals it held.
+   *
+   * Called from Drain(), so it runs once per frame: the originals of frame N
+   * are compared and freed before frame N+1 stages anything, which is what
+   * keeps the retained bytes at one frame instead of the whole run. A run
+   * that never calls frame_end still gets checked, because end() drains too.
+   *
+   * The comparison is elementwise on the SUBMITTED bytes, at the width the
+   * run was submitted at -- not a digest. A lossy round trip is expected to
+   * change the bytes; what it must not do is move any value further than
+   * `error_bound` from where it started.
+   */
+  void VerifyPendingBound() {
+    for (; bound_cursor < records.size(); ++bound_cursor) {
+      auto &r = records[bound_cursor];
+      if (r.original.empty()) continue;
+      auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
+      if (buf.IsNull()) {
+        std::cerr << "[clio-nyx-insitu] AllocateBuffer (bound) failed\n";
+        ++bound_bad_blobs;
+        r.original.clear();
+        r.original.shrink_to_fit();
+        continue;
+      }
+      std::memset(buf.ptr_, 0, r.bytes);
+      auto get = compressor->AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
+          buf.shm_.template Cast<void>(), cte->pool_id_);
+      get.Wait();
+      if (get->GetReturnCode() != 0) {
+        std::cerr << "[clio-nyx-insitu]   READ FAILED " << r.name << "\n";
+        ++bound_bad_blobs;
+      } else if (elem_bytes == 4) {
+        CompareBound<float>(r, buf.ptr_);
+      } else if (elem_bytes == 8) {
+        CompareBound<double>(r, buf.ptr_);
+      } else {
+        std::cerr << "[clio-nyx-insitu]   cannot bound-check " << r.name
+                  << ": element width " << elem_bytes << " B\n";
+        ++bound_bad_blobs;
+      }
+      CLIO_IPC->FreeBuffer(buf);
+      r.original.clear();
+      r.original.shrink_to_fit();
+    }
+  }
+
+  /** Elementwise |original - decoded| <= error_bound, at width T. */
+  template <typename T>
+  void CompareBound(const BlobRecord &r, const char *decoded) {
+    const size_t n = r.bytes / sizeof(T);
+    const T *a = reinterpret_cast<const T *>(r.original.data());
+    const T *b = reinterpret_cast<const T *>(decoded);
+    for (size_t i = 0; i < n; ++i) {
+      const double d = std::fabs(static_cast<double>(a[i]) -
+                                 static_cast<double>(b[i]));
+      if (d > bound_max_err) bound_max_err = d;
+      if (d > error_bound) ++bound_violations;
+    }
+    bound_checked += n;
+  }
+
+  /** The lossy verdict, in the wording collect.py greps for. */
+  bool ReportBound() {
+    const bool ok = (bound_violations == 0 && bound_bad_blobs == 0);
+    std::cout << "[clio-nyx-insitu] "
+              << (ok ? "BOUND OK: " : "BOUND FAILED: ") << bound_checked
+              << " element(s) checked against |original - decoded| <= "
+              << error_bound << "; max observed error " << bound_max_err
+              << "; " << bound_violations << " violation(s)";
+    if (bound_bad_blobs) std::cout << "; " << bound_bad_blobs << " unreadable blob(s)";
+    std::cout << std::endl;
+    return ok;
   }
 
   bool VerifyRecords() {
@@ -440,6 +540,25 @@ int BeginImpl(long long rank, long long nprocs) {
   a.report_path = EnvStr("CLIO_NYX_REPORT", "");
   a.raw_dir = EnvStr("CLIO_NYX_RAW_DIR", "");
   a.verify = EnvBool("CLIO_NYX_VERIFY", false);
+  a.check_bound = EnvBool("CLIO_NYX_CHECK_BOUND", false);
+  a.error_bound = ClioNpErrorBoundFromEnv();
+  if (a.check_bound && a.error_bound <= 0.0) {
+    // A bound check at eb=0 is a digest check wearing the wrong name, and it
+    // would report "BOUND OK" for a lossless run without having tested
+    // anything the digest path does not already cover. Say so and fall back.
+    std::cerr << "[clio-nyx-insitu] CLIO_NYX_CHECK_BOUND set but the error "
+                 "bound is 0 (lossless) -- checking digests instead.\n";
+    a.check_bound = false;
+    a.verify = true;
+  }
+  if (a.check_bound && a.verify) {
+    // Lossy data cannot match a digest; asking for both would report a
+    // failure that is correct behaviour.
+    std::cerr << "[clio-nyx-insitu] both CLIO_NYX_VERIFY and "
+                 "CLIO_NYX_CHECK_BOUND set; a lossy round trip cannot match a "
+                 "digest, so the bound check wins.\n";
+    a.verify = false;
+  }
   a.t_start = std::chrono::steady_clock::now();
   if (a.nprocs > 1) {
     // Per-rank CSV. The blob NAMES stay unqualified on purpose -- see the
@@ -708,6 +827,11 @@ int clio_nyx_insitu_stage(const char *blob_prefix, const void *dev_base,
                       cudaMemcpyDeviceToHost, a.stream);
       cudaStreamSynchronize(a.stream);
       rec.digest = Fnv1a(a.host_mirror.data(), n);
+      // The bound check needs the VALUES back, and this host copy is the only
+      // place they exist outside device memory the simulation is about to
+      // overwrite. Released one frame later by VerifyPendingBound().
+      if (a.check_bound) rec.original.assign(a.host_mirror.begin(),
+                                             a.host_mirror.end());
       if (!a.raw_dir.empty()) {
         std::string fn = rec.name;
         for (auto &ch : fn) {
@@ -820,6 +944,7 @@ int clio_nyx_insitu_end(void) {
 
   int rc = failed ? 1 : 0;
   if (a.verify && !a.VerifyRecords()) rc = 1;
+  if (a.check_bound && !a.ReportBound()) rc = 1;
 
   for (auto &s : a.slots) {
     if (!s.alloc.IsNull()) {

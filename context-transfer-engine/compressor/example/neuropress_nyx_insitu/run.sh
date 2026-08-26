@@ -2,7 +2,8 @@
 # Nyx in situ: the simulation hands its GPU-resident hydro state to Clio.
 #
 #   ./run.sh [--ncell N] [--steps N] [--int N] [--chunk BYTES] [--store DIR]
-#            [--hook insitu|plotfile|both] [--ghosts] [--verify] [--restart]
+#            [--hook insitu|plotfile|both] [--ghosts] [--verify] [--check-bound]
+#            [--restart]
 #            [--learn] [--explore K] [--threshold X] [--best]
 #            [--static LIB] [--static-shuffle N] [--port N] [--bin PATH]
 #            [--mpi] [--ranks N] [--max-grid N]
@@ -43,7 +44,7 @@ PORT=${PORT:-}
 RANKS=1 USE_MPI=false MAXGRID=
 NYX_BIN_MPI=${NYX_BIN_MPI:-$HOME/src/Nyx/build-clio-mpi/Exec/HydroTests/nyx_HydroTests}
 NYX_BIN_SET=false
-VERIFY=false RESTART=false
+VERIFY=false CHECK_BOUND=false RESTART=false
 LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB= STATIC_SHUF=0
 EXTRA=()
 usage() { sed -n '2,30p' "$0"; }
@@ -57,6 +58,10 @@ while [ $# -gt 0 ]; do
     --hook) HOOK=$2; shift 2;;
     --ghosts) GHOSTS=true; shift;;
     --verify) VERIFY=true; shift;;
+    # LOSSY verification: the values, not a digest. A lossy round trip must
+    # fail a digest by construction, so this is the only check that says
+    # anything about correctness on a run with an error bound.
+    --check-bound) CHECK_BOUND=true; shift;;
     --restart) RESTART=true; shift;;
     --learn) LEARN=true; shift;;
     --explore) EXPLORE_K=$2; shift 2;;
@@ -259,6 +264,7 @@ NP_ENV=(env CLIO_SERVER_CONF="$STORE/compose.yaml"
         CLIO_NYX_REPORT="$STORE/blobs.csv")
 [ "$GHOSTS" = true ] && NP_ENV+=(NYX_CLIO_INSITU_GHOSTS=1)
 [ "$VERIFY" = true ] && NP_ENV+=(CLIO_NYX_VERIFY=1)
+[ "$CHECK_BOUND" = true ] && NP_ENV+=(CLIO_NYX_CHECK_BOUND=1)
 [ -n "${RAW_DIR:-}" ] && { mkdir -p "$RAW_DIR"; NP_ENV+=(CLIO_NYX_RAW_DIR="$RAW_DIR"); }
 [ -n "${NYX_DUMP_DIR:-}" ] && NP_ENV+=(NYX_DUMP_FIELDS=1 NYX_DUMP_DIR="$NYX_DUMP_DIR")
 [ "$RESTART" = true ] && NP_ENV+=(CLIO_RESTART=1)

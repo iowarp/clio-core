@@ -2,7 +2,8 @@
 # VPIC in situ: the deck hands its field arrays to Clio, no file in between.
 #
 #   ./run.sh [--ncell N] [--steps N] [--int N] [--nppc N] [--chunk BYTES]
-#            [--store DIR] [--port N] [--verify] [--restart] [--ranks N]
+#            [--store DIR] [--port N] [--verify] [--check-bound] [--restart]
+#            [--ranks N]
 #            [--learn] [--explore K] [--threshold X] [--best]
 #            [--static LIB] [--static-shuffle N] [--bin PATH]
 #
@@ -32,7 +33,7 @@ WEIGHTS=$REPO/context-transport-primitives/src/compress/model/weights
 NCELL=126 STEPS=200 INT=25 NPPC=8 CHUNK=4194304
 PORT=${PORT:-9413}
 STORE=${STORE:-$HERE/store}
-VERIFY=false RESTART=false RANKS=1
+VERIFY=false CHECK_BOUND=false RESTART=false RANKS=1
 LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB= STATIC_SHUF=0
 usage() { sed -n '2,17p' "$0"; }
 while [ $# -gt 0 ]; do
@@ -45,6 +46,9 @@ while [ $# -gt 0 ]; do
     --store) STORE=$2; shift 2;;
     --port) PORT=$2; shift 2;;
     --verify) VERIFY=true; shift;;
+    # LOSSY verification: the values, not a digest. A lossy round trip must
+    # fail a digest by construction.
+    --check-bound) CHECK_BOUND=true; shift;;
     --restart) RESTART=true; shift;;
     --ranks) RANKS=$2; shift 2;;
     --learn) LEARN=true; shift;;
@@ -189,6 +193,7 @@ COMMON_ENV=(env CLIO_WITH_RUNTIME=1
             CLIO_VPIC_POOL=512.0
             CLIO_VPIC_CHUNK="$CHUNK"
             CLIO_VPIC_VERIFY=$([ "$VERIFY" = true ] && echo 1 || echo 0)
+            CLIO_VPIC_CHECK_BOUND=$([ "$CHECK_BOUND" = true ] && echo 1 || echo 0)
             CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}"
             VPIC_NX="$NCELL" VPIC_NY="$NCELL" VPIC_NZ="$NCELL" VPIC_NPPC="$NPPC"
             VPIC_STEPS="$STEPS" VPIC_INSITU=1 VPIC_INSITU_INT="$INT")

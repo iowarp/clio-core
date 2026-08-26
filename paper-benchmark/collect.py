@@ -165,10 +165,21 @@ def load_run(d):
         # --check-bound it is the only line that says anything about the DATA:
         # the VERIFIED:/FAILED: line beside it reports whether decompression
         # succeeded, not whether the values came back inside the error bound.
+        # A LOSSY run's digest verdict is meaningless and must never be
+        # reported: the decoded bytes are not the input bytes by design, so
+        # VERIFIED/FAILED there reflects whether quantization happened to
+        # change anything, not whether the run was correct. The LAMMPS driver
+        # prints one anyway (it exercises the decompress path and says in a
+        # NOTE that it does not apply), and reading it made lossy cells show
+        # `FAIL` on one cost model and `pass` on the other from the same
+        # correct behaviour. Only a BOUND verdict counts under a bound.
+        lossy = float(meta.get("error_bound", 0) or 0) > 0.0
         if "BOUND OK:" in txt:
             verified = "bound-ok"
         elif "BOUND FAILED:" in txt:
             verified = "BOUND-FAIL"
+        elif lossy:
+            verified = None          # -> "n/a": nothing checked the values
         elif "VERIFIED:" in txt:
             verified = "pass"
         elif "FAILED:" in txt:

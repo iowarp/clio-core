@@ -37,6 +37,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -132,6 +133,10 @@ struct BlobRecord {
   // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
   double dt_ms = -1.0;
   bool ok = false;
+  // The chunk as SUBMITTED, kept only while a bound check still needs it.
+  // A digest cannot answer the lossy question and in situ there is no file to
+  // re-read; held for ONE frame, released in VerifyPendingBound().
+  std::vector<char> original;
 };
 
 struct Pending {
@@ -164,6 +169,16 @@ struct Adapter {
   std::string report_path;
   std::string raw_dir;
   bool verify = false;
+  // Lossy verification: the VALUES against the requested absolute error
+  // bound, not a digest. See the Nyx adapter for the reasoning; the two are
+  // deliberately the same so the two workloads' verdicts mean the same thing.
+  bool check_bound = false;
+  double error_bound = 0.0;
+  size_t bound_cursor = 0;
+  size_t bound_checked = 0;
+  size_t bound_violations = 0;
+  size_t bound_bad_blobs = 0;
+  double bound_max_err = 0.0;
 
   std::unique_ptr<clio::cte::compressor::Client> compressor;
   clio::cte::core::Client *cte = nullptr;
@@ -251,6 +266,74 @@ struct Adapter {
       r.stored = (r.ok && r.lib != 0) ? c.actual_compressed_size_ : r.bytes;
     }
     pending.clear();
+    // Every task of this frame has landed, so the blobs are readable and the
+    // originals are still held. Checking here bounds the retained bytes to
+    // one frame rather than the run.
+    if (check_bound) VerifyPendingBound();
+  }
+
+  /** Check this frame's records against the bound, then free the originals. */
+  void VerifyPendingBound() {
+    for (; bound_cursor < records.size(); ++bound_cursor) {
+      auto &r = records[bound_cursor];
+      if (r.original.empty()) continue;
+      auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
+      if (buf.IsNull()) {
+        std::cerr << "[clio-vpic-insitu] AllocateBuffer (bound) failed\n";
+        ++bound_bad_blobs;
+        r.original.clear();
+        r.original.shrink_to_fit();
+        continue;
+      }
+      std::memset(buf.ptr_, 0, r.bytes);
+      auto get = compressor->AsyncDecompressExplicit(
+          clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
+          buf.shm_.template Cast<void>(), cte->pool_id_);
+      get.Wait();
+      if (get->GetReturnCode() != 0) {
+        std::cerr << "[clio-vpic-insitu]   READ FAILED " << r.name << "\n";
+        ++bound_bad_blobs;
+      } else if (elem_bytes == 4) {
+        CompareBound<float>(r, buf.ptr_);
+      } else if (elem_bytes == 8) {
+        CompareBound<double>(r, buf.ptr_);
+      } else {
+        std::cerr << "[clio-vpic-insitu]   cannot bound-check " << r.name
+                  << ": element width " << elem_bytes << " B\n";
+        ++bound_bad_blobs;
+      }
+      CLIO_IPC->FreeBuffer(buf);
+      r.original.clear();
+      r.original.shrink_to_fit();
+    }
+  }
+
+  /** Elementwise |original - decoded| <= error_bound, at width T. */
+  template <typename T>
+  void CompareBound(const BlobRecord &r, const char *decoded) {
+    const size_t n = r.bytes / sizeof(T);
+    const T *a = reinterpret_cast<const T *>(r.original.data());
+    const T *b = reinterpret_cast<const T *>(decoded);
+    for (size_t i = 0; i < n; ++i) {
+      const double d = std::fabs(static_cast<double>(a[i]) -
+                                 static_cast<double>(b[i]));
+      if (d > bound_max_err) bound_max_err = d;
+      if (d > error_bound) ++bound_violations;
+    }
+    bound_checked += n;
+  }
+
+  /** The lossy verdict, in the wording collect.py greps for. */
+  bool ReportBound() {
+    const bool ok = (bound_violations == 0 && bound_bad_blobs == 0);
+    std::cout << "[clio-vpic-insitu] "
+              << (ok ? "BOUND OK: " : "BOUND FAILED: ") << bound_checked
+              << " element(s) checked against |original - decoded| <= "
+              << error_bound << "; max observed error " << bound_max_err
+              << "; " << bound_violations << " violation(s)";
+    if (bound_bad_blobs) std::cout << "; " << bound_bad_blobs << " unreadable blob(s)";
+    std::cout << std::endl;
+    return ok;
   }
 
   bool VerifyRecords() {
@@ -361,6 +444,20 @@ int BeginImpl(long long rank, long long nprocs) {
   a.report_path = EnvStr("CLIO_VPIC_REPORT", "");
   a.raw_dir = EnvStr("CLIO_VPIC_RAW_DIR", "");
   a.verify = EnvBool("CLIO_VPIC_VERIFY", false);
+  a.check_bound = EnvBool("CLIO_VPIC_CHECK_BOUND", false);
+  a.error_bound = ClioNpErrorBoundFromEnv();
+  if (a.check_bound && a.error_bound <= 0.0) {
+    std::cerr << "[clio-vpic-insitu] CLIO_VPIC_CHECK_BOUND set but the error "
+                 "bound is 0 (lossless) -- checking digests instead.\n";
+    a.check_bound = false;
+    a.verify = true;
+  }
+  if (a.check_bound && a.verify) {
+    std::cerr << "[clio-vpic-insitu] both CLIO_VPIC_VERIFY and "
+                 "CLIO_VPIC_CHECK_BOUND set; a lossy round trip cannot match a "
+                 "digest, so the bound check wins.\n";
+    a.verify = false;
+  }
   a.t_start = std::chrono::steady_clock::now();
   if (a.nprocs > 1) {
     // Per-rank CSV. Blob NAMES stay unqualified: VPIC gives every rank the
@@ -508,7 +605,8 @@ int clio_vpic_insitu_stage(const char *blob_prefix, const void *dev_ptr,
   ctx.data_type_ = (elem_bytes == 4) ? 1 : 2;
   ctx.error_bound_ = ClioNpErrorBoundFromEnv();  // 0 = lossless, as before
 
-  const bool need_host_bytes = a.verify || !a.raw_dir.empty();
+  const bool need_host_bytes =
+      a.verify || a.check_bound || !a.raw_dir.empty();
 
   for (size_t off = 0, ci = 0; off < total; off += chunk, ++ci) {
     const size_t n = (total - off < chunk) ? (total - off) : chunk;
@@ -576,6 +674,10 @@ int clio_vpic_insitu_stage(const char *blob_prefix, const void *dev_ptr,
                       a.stream);
       cudaStreamSynchronize(a.stream);
       rec.digest = Fnv1a(a.host_mirror.data(), n);
+      // The bound check needs the VALUES back, and this host copy is the only
+      // place they exist outside memory the simulation is about to overwrite.
+      if (a.check_bound) rec.original.assign(a.host_mirror.begin(),
+                                             a.host_mirror.end());
       if (!a.raw_dir.empty()) {
         std::string fn = rec.name;
         for (auto &ch : fn) {
@@ -675,6 +777,7 @@ int clio_vpic_insitu_end(void) {
 
   int rc = 0;
   if (a.verify && !a.VerifyRecords()) rc = 1;
+  if (a.check_bound && !a.ReportBound()) rc = 1;
 
   if (!a.report_path.empty()) {
     std::ofstream csv(a.report_path);
