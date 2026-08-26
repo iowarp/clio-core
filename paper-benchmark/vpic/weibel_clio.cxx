@@ -56,9 +56,16 @@
 // to zero before the user's initialization block is executed. Up to 16K
 // of global variables can be defined.
  
+#ifdef CLIO_VPIC_INSITU
+/* Six extern "C" entry points and <stddef.h>; deliberately no Clio C++ header
+   goes through nvcc_wrapper. See clio_vpic_insitu.h. */
+#include "clio_vpic_insitu.h"
+#endif
+
 begin_globals {
   int    clio_dump_interval;   // steps between raw field dumps (0 = off)
   char   clio_dump_dir[512];
+  int    clio_insitu_interval; // steps between IN-SITU hand-overs (0 = off)
   double energies_interval;
   double fields_interval;
   double ehydro_interval;
@@ -186,6 +193,30 @@ begin_initialization {
              d ? d : ".");
  
   }
+
+  // In-situ hand-over to Clio, the alternative to the files above. Off unless
+  // VPIC_INSITU=1; interval in steps from VPIC_INSITU_INT (default: the dump
+  // interval, so the two modes cover the same frames and can be compared).
+  global->clio_insitu_interval =
+      (getenv("VPIC_INSITU") && atoi(getenv("VPIC_INSITU")))
+          ? (getenv("VPIC_INSITU_INT")
+                 ? atoi(getenv("VPIC_INSITU_INT"))
+                 : (getenv("VPIC_DUMP_INT") ? atoi(getenv("VPIC_DUMP_INT")) : 25))
+          : 0;
+#ifdef CLIO_VPIC_INSITU
+  if( global->clio_insitu_interval > 0 ) {
+    // rank()/nproc() rather than an environment variable: the adapter gives
+    // every rank its own store and port, and a disagreement about which rank
+    // this is would put two runtimes on one store.
+    if( clio_vpic_insitu_begin_mpi( rank(), nproc() ) != 0 )
+      sim_log( "[clio-insitu] begin FAILED -- is CLIO_SERVER_CONF set and "
+               "CLIO_WITH_RUNTIME=1?" );
+  }
+#else
+  if( global->clio_insitu_interval > 0 )
+    sim_log( "[clio-insitu] VPIC_INSITU=1 but this deck was built without "
+             "-DCLIO_VPIC_INSITU; rebuild with build_deck.sh --insitu" );
+#endif
 
  
   global->energies_interval  = 1; //000; //status_interval;
@@ -473,6 +504,63 @@ begin_diagnostics {
                << " voxels x " << FIELD_VAR_COUNT << " vars" );
     ++clio_frame;
   }
+
+#ifdef CLIO_VPIC_INSITU
+  /* ------------------------------------------------------------------
+   * The same 16 field variables, handed to Clio from inside this process.
+   *
+   * No deep_copy, no de-interleave, no file. k_f_d is LayoutLeft in a CUDA
+   * build -- (voxel v, variable m) at v + m*nv, verified by the strides
+   * printed under VPIC_INSITU_LAYOUT_CHECK below -- so variable m already IS
+   * the contiguous device array `k_f_d.data() + m*nv`, and the adapter only
+   * has to copy it into a Clio-registered backend and submit it.
+   *
+   * The strides are checked rather than trusted: a host/OpenMP Kokkos build
+   * defaults to LayoutRight, where that pointer arithmetic addresses a
+   * different quantity entirely. Refusing there is the adapter's job (the
+   * pointer is not device memory), but saying so here is cheaper to read.
+   * ------------------------------------------------------------------ */
+  if( global->clio_insitu_interval > 0 && step() > 0 &&
+      step() % global->clio_insitu_interval == 0 ) {
+    static const char* kInsituNames[16] = {
+      "ex","ey","ez","div_e_err", "cbx","cby","cbz","div_b_err",
+      "tcax","tcay","tcaz","rhob",  "jfx","jfy","jfz","rhof" };
+
+    const size_t nv = field_array->k_f_d.extent(0);
+    const float* base = field_array->k_f_d.data();
+
+    if( field_array->k_f_d.stride(0) != 1 ||
+        field_array->k_f_d.stride(1) != (int)nv ) {
+      sim_log( "[clio-insitu] REFUSING: field view is not LayoutLeft "
+               "(stride0=" << field_array->k_f_d.stride(0)
+               << " stride1=" << field_array->k_f_d.stride(1)
+               << "); per-variable arrays are not contiguous on the device "
+               "and handing over base+m*nv would submit the wrong bytes." );
+      /* VPIC's own abort takes a code and unwinds MPI with it; plain
+         abort(void) is shadowed by it inside a deck. */
+      abort( (double)CLIO_VPIC_EXIT_PRECONDITION );
+    }
+
+    char prefix[256];
+    clio_vpic_insitu_frame_begin( (long long)step(), (double)(step()*grid->dt) );
+    for( int m = 0; m < FIELD_VAR_COUNT && m < 16; ++m ) {
+      snprintf( prefix, sizeof(prefix), "%s/step_%05d",
+                kInsituNames[m], (int)step() );
+      clio_vpic_insitu_stage( prefix, base + (size_t)m*nv,
+                              (long long)sizeof(float), (long long)nv );
+    }
+    clio_vpic_insitu_frame_end();
+
+    if( rank() == 0 )
+      sim_log( "[clio-insitu] step " << step() << ": " << nv
+               << " voxels x " << FIELD_VAR_COUNT << " vars handed over" );
+
+    /* Last diagnostic of the run: drain, report and tear the client down
+       here, because a VPIC deck has no finalize hook and the runtime's worker
+       threads must not outlive the process's static destructors. */
+    if( step() >= num_step ) clio_vpic_insitu_end();
+  }
+#endif
  
   if( step()==-10 ) {
     // A grid dump contains all grid parameters, field boundary conditions,

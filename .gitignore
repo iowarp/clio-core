@@ -148,6 +148,13 @@ context-transfer-engine/compressor/example/neuropress_lammps_lib/store*/
 !context-transfer-engine/compressor/example/neuropress_nyx_insitu/
 context-transfer-engine/compressor/example/neuropress_nyx_insitu/store*/
 
+# And the same shape for VPIC: one shared library a vpic-kokkos DECK links and
+# calls from begin_diagnostics. The deck is ours (paper-benchmark/vpic), so no
+# simulation patch exists here at all; the ABI is plain C and the library
+# builds wherever the compressor does.
+!context-transfer-engine/compressor/example/neuropress_vpic_insitu/
+context-transfer-engine/compressor/example/neuropress_vpic_insitu/store*/
+
 # NeuroPress differential parity harnesses (issue #693). Same reasoning as the
 # example directories above: they compile a second project's CUDA sources from
 # a path outside this tree (CLIO_NEUROPRESS_SRC_DIR) and exist to compare the
@@ -242,5 +249,8 @@ paper-benchmark/nyx/fields/
 paper-benchmark/vpic/fields/
 paper-benchmark/vpic/*.Linux
 paper-benchmark/vpic/build_deck.log
+# VPIC writes its own energy diagnostic into the working directory on every
+# run; it is simulation output, not source.
+paper-benchmark/vpic/energies
 # WarpX writes openPMD output and per-run stores under results/.
 paper-benchmark/warpx/results/

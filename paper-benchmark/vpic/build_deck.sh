@@ -22,11 +22,15 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VPIC_DIR=${VPIC_DIR:-$HOME/src/vpic-kokkos}
 VPIC_BUILD=${VPIC_BUILD:-$VPIC_DIR/build-clio}
 DECK=${DECK:-$HERE/weibel_clio.cxx}
+INSITU=${INSITU:-false}
+CLIO_ROOT=${CLIO_ROOT:-$(cd "$HERE/../.." && pwd)}
+CLIO_BUILD=${CLIO_BUILD:-$CLIO_ROOT/build}
 while [ $# -gt 0 ]; do
   case "$1" in
     --vpic) VPIC_DIR=$2; VPIC_BUILD=$2/build-clio; shift 2;;
     --build) VPIC_BUILD=$2; shift 2;;
     --deck) DECK=$2; shift 2;;
+    --insitu) INSITU=true; shift;;
     -h|--help) sed -n '2,20p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -61,12 +65,26 @@ done
 
 PATCHED=$(mktemp /tmp/vpic_build_XXXXXX.sh)
 trap 'rm -f "$PATCHED"' EXIT
-sed "s|-lpthread -ldl|-lpthread -ldl -L$CUDA_DRIVER_DIR -lcuda|" "$STOCK" > "$PATCHED"
+INJECT="-L$CUDA_DRIVER_DIR -lcuda"
+if [ "$INSITU" = true ]; then
+  # The deck calls the six C entry points of libclio_vpic_insitu.so. Only the
+  # C header reaches nvcc_wrapper; everything of Clio's stays behind the .so,
+  # which is why this is three flags and not a Clio build inside VPIC's.
+  ADAPTER_INC=$CLIO_ROOT/context-transfer-engine/compressor/example/neuropress_vpic_insitu
+  ADAPTER_LIB=$CLIO_BUILD/bin
+  [ -f "$ADAPTER_INC/clio_vpic_insitu.h" ] || {
+    echo "missing $ADAPTER_INC/clio_vpic_insitu.h" >&2; exit 1; }
+  [ -f "$ADAPTER_LIB/libclio_vpic_insitu.so" ] || {
+    echo "missing $ADAPTER_LIB/libclio_vpic_insitu.so -- build it first:" >&2
+    echo "  cmake --build $CLIO_BUILD --target clio_vpic_insitu" >&2; exit 1; }
+  INJECT="$INJECT -I$ADAPTER_INC -DCLIO_VPIC_INSITU -L$ADAPTER_LIB -lclio_vpic_insitu -Wl,-rpath,$ADAPTER_LIB"
+fi
+sed "s|-lpthread -ldl|-lpthread -ldl $INJECT|" "$STOCK" > "$PATCHED"
 grep -q -- "-lcuda" "$PATCHED" || { echo "failed to inject -lcuda into $STOCK" >&2; exit 1; }
 chmod +x "$PATCHED"
 
 cd "$HERE"
-echo "== compiling $(basename "$DECK") (vpic $VPIC_BUILD, +$CUDA_DRIVER_DIR/libcuda)"
+echo "== compiling $(basename "$DECK") (vpic $VPIC_BUILD, +$CUDA_DRIVER_DIR/libcuda$([ "$INSITU" = true ] && echo ", +libclio_vpic_insitu"))"
 "$PATCHED" "$DECK" > "$HERE/build_deck.log" 2>&1 || {
   echo "deck compile FAILED; last lines of build_deck.log:" >&2
   grep -iE "error" "$HERE/build_deck.log" | head -10 >&2

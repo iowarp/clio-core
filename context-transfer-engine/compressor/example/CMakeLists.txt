@@ -158,6 +158,14 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_subdirectory(neuropress_nyx_insitu)
   endif()
 
+  # The same shape for VPIC: libclio_vpic_insitu.so, which a vpic-kokkos deck
+  # calls from begin_diagnostics. VPIC's field view is already contiguous per
+  # variable on the device, so this adapter stages (pointer, count) and needs
+  # no extraction -- see its header.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_vpic_insitu/CMakeLists.txt)
+    add_subdirectory(neuropress_vpic_insitu)
+  endif()
+
   # Replay a simulation's field dumps through the compressor -- the shape
   # upstream NeuroPress uses for Nyx, and the only one available for codes
   # with no library interface to embed. No simulation dependency.
