@@ -103,6 +103,10 @@ __device__ u32 g_publish = 1u;
 __device__ u32 g_pub_interior = 1u;
 /** MD_RESORT_DEBUG: slots the gather actually wrote, plus one sample. */
 __device__ unsigned long long g_gather_wrote = 0ull;
+/** Publish-kernel latency split, in device cycles: the flush await vs the
+ *  peer-halo fetch await. The host round counter cannot tell them apart. */
+__device__ unsigned long long g_pub_flush_cyc = 0ull;
+__device__ unsigned long long g_pub_fetch_cyc = 0ull;
 __device__ unsigned long long g_gather_sample = 0ull;
 
 /** SHARING PROBE: bit b set means block b held that page at least once.
@@ -1994,15 +1998,20 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
   const u64 hi_pl = static_cast<u64>(z1 - 1) * plane_elems_p;
   const u64 below = static_cast<u64>((z0 + nb - 1u) % nb) * plane_elems_p;
   const u64 above = static_cast<u64>(z1 % nb) * plane_elems_p;
+  // THREE INDEPENDENT LATENCIES, THREE BLOCKS. The halo wait depends on the
+  // PEER's stamp, not on this node's flush -- measured 38% flush / 62% fetch
+  // stacked SEQUENTIALLY in one block, so the step paid flush + fetch when it
+  // only owes max(flush, fetch). Each block carries its own task slots, so
+  // the three waits genuinely overlap.
   if (block == 0) {
+    const long long _c0 = clock64();
     co_await x.Fetch(0, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
     co_await x.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
     co_await x.EndFlush();
-    // The demand stays on the consumer (force still asks hgen); this fetch
-    // only warms the frames to `gen` so the heavy kernel finds resident_ok.
-    co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
-    x.UnpinRange(below, plane_elems_p);
-    x.UnpinRange(above, plane_elems_p);
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_pub_flush_cyc,
+                (unsigned long long)(clock64() - _c0));
+    }
     x.UnpinRange(lo_pl, plane_elems_p);
     x.UnpinRange(hi_pl, plane_elems_p);
   } else if (block == 1) {
@@ -2011,6 +2020,17 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     co_await v.EndFlush();
     v.UnpinRange(lo_pl, plane_elems_p);
     v.UnpinRange(hi_pl, plane_elems_p);
+  } else if (block == 2) {
+    // The demand stays on the consumer (force still asks hgen); this fetch
+    // only warms the frames to `gen` so the heavy kernel finds resident_ok.
+    const long long _c1 = clock64();
+    co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_pub_fetch_cyc,
+                (unsigned long long)(clock64() - _c1));
+    }
+    x.UnpinRange(below, plane_elems_p);
+    x.UnpinRange(above, plane_elems_p);
   }
 }
 
@@ -3400,6 +3420,8 @@ int main(int argc, char **argv) {
     double t_force_kern = 0.0, t_ckpt = 0.0, t_ckpt_stock = 0.0;
     u64 n_ckpt = 0;
     double t_force = 0.0, t_kick = 0.0, t_resort = 0.0, t_build = 0.0;
+    double t_kick_int = 0.0, t_kick_pub = 0.0;
+    u64 r_kick_int = 0, r_kick_pub = 0;
     const float frlist = static_cast<float>(a.cutoff + a.skin);
     // Build the Verlet list: device count pass, host prefix sum (index
     // class, ~MBs), device fill pass. Refuses loudly on maxneigh or the
@@ -3500,7 +3522,7 @@ int main(int argc, char **argv) {
     auto exchange = [&]() {
       if (a.nodes <= 1 || no_halo) return;
       ++halo_gen;
-      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+      r_kick_pub += runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
@@ -3531,12 +3553,18 @@ int main(int argc, char **argv) {
                    std::fflush(stderr); }
       const double _t = NowMs();
       MdMark("MDIntegrate");
-      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+      // SPLIT-TIMED: two quantum hunts (round-trip count, CTE poll) missed
+      // kick's cost, so measure which half owns it and how many DRIVER
+      // ROUNDS each pays -- a round is a full kernel relaunch, and rounds,
+      // not bytes, are the unit parks are paid in.
+      r_kick_int += runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         MDIntegrateKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, df, fdt, drift, g.nb, g.cap, my_z0, my_z1,
             a.blocks, vw, sv);
       });
+      t_kick_int += NowMs() - _t;
+      const double _t2 = NowMs();
       // EXCHANGE, and only when there is someone to exchange with. Publish
       // this slab AS the next generation, then demand the neighbours' halo AT
       // that generation. No barrier between the two: the generation is the
@@ -3545,6 +3573,7 @@ int main(int argc, char **argv) {
       // run. A distributed gate that passes either way is not testing the
       // exchange, and this is the cheapest way to know which one it is.
       if (drift) exchange();
+      t_kick_pub += NowMs() - _t2;
       t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
@@ -3832,6 +3861,7 @@ int main(int argc, char **argv) {
     // force() and build_list() too, and counting those made the phase totals
     // sum to more than the run they were supposedly decomposing.
     t_force = 0.0; t_kick = 0.0; t_resort = 0.0; t_build = 0.0;
+    t_kick_int = 0.0; t_kick_pub = 0.0; r_kick_int = 0; r_kick_pub = 0;
     t_force_kern = 0.0; t_ckpt = 0.0; t_ckpt_stock = 0.0; n_ckpt = 0;
     const double t0 = NowMs();
     for (u64 step = 0; step < a.steps; ++step) {
@@ -3973,6 +4003,19 @@ int main(int argc, char **argv) {
     }
     if (d_ckpt_stock != nullptr) ctp::GpuApi::Free(d_ckpt_stock);
     if (h_ckpt_stock != nullptr) cudaFreeHost(h_ckpt_stock);
+    std::printf("  kick split: integrate=%.1f ms (%llu rounds) "
+                "publish=%.1f ms (%llu rounds)\n",
+                t_kick_int, (unsigned long long)r_kick_int, t_kick_pub,
+                (unsigned long long)r_kick_pub);
+    {
+      unsigned long long fc = 0, gc = 0;
+      cudaMemcpyFromSymbol(&fc, g_pub_flush_cyc, sizeof(fc));
+      cudaMemcpyFromSymbol(&gc, g_pub_fetch_cyc, sizeof(gc));
+      // Device cycles at ~1 GHz order; the RATIO is what matters.
+      std::printf("  publish split (device cycles): flush=%llu halo_fetch=%llu"
+                  " (%.1f%% fetch)\n", fc, gc,
+                  (fc + gc) ? 100.0 * (double)gc / (double)(fc + gc) : 0.0);
+    }
     std::printf("  phases (total ms): force=%.1f (gpu %.1f) kick=%.1f "
                 "resort=%.1f build=%.1f\n", t_force, t_force_kern, t_kick,
                 t_resort, t_build);
