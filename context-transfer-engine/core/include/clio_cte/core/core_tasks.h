@@ -1602,6 +1602,17 @@ struct Context {
   double actual_compression_ratio_;  // Actual compression ratio
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
+  // MEASURED decompression time, in milliseconds, or < 0 when nothing measured
+  // one -- which is the default, because nothing on the WRITE path needs to
+  // decompress. It is filled only when CLIO_NEUROPRESS_EXPLORE_MEASURE_DT asks
+  // the compressor to decompress its own output back for a real number.
+  //
+  // A CUDA-event bracket around the codec call alone, like
+  // actual_compress_time_ms_ beside it -- NOT the wall clock a read-path
+  // Decompress() reports, which also covers create_manager, allocation,
+  // unshuffle, dequantize and staging. The two differ by more than an order of
+  // magnitude, so mixing them silently inverts which codec looks faster.
+  double actual_decompress_time_ms_;
   // Actual PSNR achieved. Sentinels follow NeuroPress exactly
   // (gpucompress_compress.cpp, nn_gpu.cu):
   //   < 0  -> undefined; the PSNR head gets NO gradient. This is what a
@@ -1642,6 +1653,7 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
+        actual_decompress_time_ms_(-1.0),
         actual_psnr_db_(-1.0) {
   }
 
@@ -1659,7 +1671,7 @@ struct Context {
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
              actual_original_size_, actual_compressed_size_,
              actual_compression_ratio_, actual_compress_time_ms_,
-             actual_psnr_db_);
+             actual_decompress_time_ms_, actual_psnr_db_);
   }
 
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {

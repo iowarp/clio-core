@@ -265,6 +265,12 @@ struct BlobRecord {
   double ratio = 0.0;
   size_t stored = 0;
   double ms = 0.0;
+  // MEASURED decompression time (CUDA events around the codec call alone), or
+  // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
+  // Comparable with `ms` beside it and with the exploration sweep's per
+  // candidate dt -- NOT with a read-path Decompress(), which reports wall
+  // clock around the whole path.
+  double dt_ms = -1.0;
   bool ok = false;
 };
 
@@ -557,6 +563,7 @@ int main(int argc, char **argv) {
       r.lib = c.compress_lib_;
       r.ratio = c.actual_compression_ratio_;
       r.ms = c.actual_compress_time_ms_;
+      r.dt_ms = c.actual_decompress_time_ms_;
       // compress_lib_ == 0 is how the compressor marks "stored raw": the
       // codec it tried did not shrink the chunk, so the caller's bytes went
       // to the tier as they were (compressor_runtime.cc, "Compression not
@@ -957,12 +964,13 @@ int main(int argc, char **argv) {
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);
-    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,rc\n";
+    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
+           "decompress_ms,rc\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ',' << ctp::CompressionFactory::NameForWireId(r.lib)
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
-          << (r.ok ? 0 : 1) << '\n';
+          << r.dt_ms << ',' << (r.ok ? 0 : 1) << '\n';
   }
 
   // ---- Verify: every blob back through the decompressor. ---------------

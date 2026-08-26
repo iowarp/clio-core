@@ -51,6 +51,13 @@ struct ExploreWinner {
   uint32_t shuffle = 0;
   double ratio = 0.0;
   double time_ms = 0.0;
+  /** MEASURED decompression time for THIS candidate, or <0 if not measured.
+   *  Carried for the same reason ratio and time_ms are: when a winner is
+   *  adopted every field the context reports must describe the WINNER. Leaving
+   *  dt behind reported the primary's decompression time beside the winner's
+   *  codec name -- a row that looks right and describes two different
+   *  algorithms. */
+  double dt_ms = -1.0;
   bool quant = false;
   ctp::compress::preprocess::DeviceQuantizeParams quant_params;
   /** Index into the sweep-log rows, so the last adopter carries the flag. */

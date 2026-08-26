@@ -1714,35 +1714,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // both sides so an unmeasured term contributes ~0 error. Moving a
           // measured value into it would change WHETHER exploration runs, not
           // just what it picks.
-          double primary_dt_ms = -1.0;
+          // Taken at the compress site, where every write passes -- static,
+          // inference-only and exploring alike -- rather than measured again
+          // here from primary_image, which would need header arithmetic and
+          // would time the same bytes twice.
+          const double primary_dt_ms = context.actual_decompress_time_ms_;
           double primary_rank_cost = actual_cost;
-#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
-          if (MeasureExploreDecompTime() && primary_image.valid() &&
-              context.compress_lib_ != 0) {
-            // The stored image is header + codec payload; decompression must
-            // start at the payload. HeaderBytesFor, not sizeof(header): a
-            // quantized blob carries a 32-byte extension and would be read
-            // early.
-            const size_t hdr =
-                HeaderBytesFor(static_cast<uint32_t>(context.compress_preset_));
-            if (primary_image.size > hdr) {
-              auto full = CLIO_IPC->ToFullPtr<char>(
-                  primary_image.data.template Cast<char>());
-              if (full.ptr_ != nullptr) {
-                double ms = -1.0;
-                if (ctp::NvComp::DecompressMeasureAnyPtr(
-                        full.ptr_ + hdr,
-                        static_cast<size_t>(primary_image.size) - hdr,
-                        chunk_size, &ms)) {
-                  primary_dt_ms = ms;
-                  primary_rank_cost =
-                      cost(context.actual_compress_time_ms_, primary_dt_ms,
-                           context.actual_compression_ratio_);
-                }
-              }
-            }
+          if (primary_dt_ms >= 0.0) {
+            primary_rank_cost = cost(context.actual_compress_time_ms_,
+                                     primary_dt_ms,
+                                     context.actual_compression_ratio_);
           }
-#endif
           double best_cost = primary_rank_cost;  // seeded with the primary's own
 
           // Device shuffle scratch for the explored candidates; released
@@ -2074,6 +2056,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 winner.shuffle = alt_applied_shuffle;
                 winner.ratio = alt_ratio;
                 winner.time_ms = alt_time_ms;
+                winner.dt_ms = slot_ref.decomp_time_ms;
                 // Carry the quantization state too. Without it the adopted
                 // blob's header would say "not quantized" while its payload
                 // IS quantized -- unrecoverable on read.
@@ -2290,6 +2273,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 task->context_.actual_compressed_size_ = winner_total;
                 task->context_.actual_compression_ratio_ = winner.ratio;
                 task->context_.actual_compress_time_ms_ = winner.time_ms;
+                // ...and dt, or the context reports the PRIMARY's
+                // decompression time next to the WINNER's codec name.
+                task->context_.actual_decompress_time_ms_ = winner.dt_ms;
                 // The stored bytes are now the winner's, so the features the
                 // deferred decomp head will join a later read against must
                 // describe the winner, not the primary.
@@ -2869,6 +2855,31 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // reading (LastCodecKernelMs() returns -1 when it could not run).
       context.actual_compress_time_ms_ =
           (compress_kernel_ms >= 0.0) ? compress_kernel_ms : compress_time;
+
+      // Decompress what we just produced, back, and time the codec call alone.
+      //
+      // Here rather than only inside the exploration sweep, because this is
+      // the ONE site every write passes through -- a static-codec run bypasses
+      // NeuroPress entirely and an inference-only run never explores, so
+      // neither would otherwise have a decompression time at all, and the
+      // sweep's per-candidate dt would have nothing comparable to be measured
+      // against. The read path's Decompress() reports wall clock around
+      // create_manager, allocation, unshuffle, dequantize and staging; that is
+      // a different quantity by more than an order of magnitude and inverts
+      // which codec looks faster.
+      //
+      // compress_dst holds the CODEC's output with no Clio header (the header
+      // is prepended later, which is why total_stored_size adds header_size),
+      // so it can be handed to the decompressor as-is.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+      if (MeasureExploreDecompTime()) {
+        double dt_ms = -1.0;
+        if (ctp::NvComp::DecompressMeasureAnyPtr(compress_dst, compressed_size,
+                                                 compress_input_size, &dt_ms)) {
+          context.actual_decompress_time_ms_ = dt_ms;
+        }
+      }
+#endif
 
       // PSNR is DEFINED only when quantization ran. Upstream seeds
       // primary_actual_psnr = -1.0 ("lossless -> skip PSNR MAPE",

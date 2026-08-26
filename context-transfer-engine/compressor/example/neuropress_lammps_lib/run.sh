@@ -29,6 +29,15 @@ PORT=${PORT:-9413}   # runtime port; every Clio runtime on the box needs its own
 STORE=${STORE:-$HERE/store}
 KOKKOS=false VERIFY=false RESTART=false
 LEARN=false EXPLORE_K=0 THRESH=0.5 BEST=false STATIC_LIB= STATIC_SHUF=0
+LR=            # neuropress_learning_rate  (shipped default 0.01)
+MAPE=          # neuropress_mape_threshold (shipped default 0.30) -- phase-1 SGD gate
+SGD_RULE=      # adaptive -> CLIO_NEUROPRESS_SGD_RULE=adaptive, where the
+               # learning rate actually bites. On the SHIPPED rule the update
+               # is sign-only with a fixed trust step, so learning_rate cancels.
+NO_LEARN=false     # exploration WITHOUT online learning -- the control that
+                   # separates "the model adapted" from "the input changed"
+RATIO_COST=false   # rank on ratio alone (w_ct=0 w_dt=0 w_io=1)
+MEASURE_DT=false   # decompress each candidate back for a real dt
 EXTRA=()
 usage() { sed -n '2,17p' "$0"; }
 while [ $# -gt 0 ]; do
@@ -46,6 +55,12 @@ while [ $# -gt 0 ]; do
     --explore) EXPLORE_K=$2; shift 2;;
     --threshold) THRESH=$2; shift 2;;
     --best) BEST=true; shift;;
+    --lr) LR=$2; shift 2;;
+    --mape) MAPE=$2; shift 2;;
+    --sgd-rule) SGD_RULE=$2; shift 2;;
+    --no-learn) NO_LEARN=true; shift;;
+    --ratio-cost) RATIO_COST=true; shift;;
+    --measure-dt) MEASURE_DT=true; shift;;
     --static) STATIC_LIB=$2; shift 2;;
     --static-shuffle) STATIC_SHUF=$2; shift 2;;
     --port) PORT=$2; shift 2;;
@@ -73,6 +88,22 @@ if [ -n "$STATIC_LIB" ]; then NP_LEARN=false; NP_EXPLORE=false
 elif [ "$EXPLORE_K" -gt 0 ]; then NP_LEARN=true; NP_EXPLORE=true
 elif [ "$LEARN" = true ]; then NP_LEARN=true; NP_EXPLORE=false
 else NP_LEARN=false; NP_EXPLORE=false; fi
+# --explore implies learning in every sibling harness, which conflates the two.
+# It HAS to: the exploration sweep lives inside
+#   if ((online_learning_enabled || best_mode) && ...)
+# (compressor_runtime.cc), so exploration_enabled:true with
+# online_learning_enabled:false is a SILENT NO-OP -- the config is accepted, the
+# sweep never runs, and the run looks like a normal inference-only one. Say so
+# rather than let a control experiment quietly measure nothing.
+if [ "$NO_LEARN" = true ]; then
+  NP_LEARN=false
+  if [ "$NP_EXPLORE" = true ]; then
+    echo "   WARNING: --no-learn disables online learning, and the exploration"
+    echo "            sweep is nested inside that gate -- so exploration will"
+    echo "            NOT run despite --explore. Use --best for an exhaustive"
+    echo "            search with learning off." >&2
+  fi
+fi
 
 if [ "$RESTART" != true ]; then
 cat > "$STORE/compose.yaml" <<YAML
@@ -100,6 +131,8 @@ compose:
     neuropress_exploration_k: $EXPLORE_K
     neuropress_exploration_threshold: $THRESH
     neuropress_best_mode: $BEST
+${LR:+    neuropress_learning_rate: $LR}
+${MAPE:+    neuropress_mape_threshold: $MAPE}
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
 ${STATIC_LIB:+    neuropress_static_shuffle: $STATIC_SHUF}
   - mod_name: clio_cte_core
@@ -132,6 +165,7 @@ if [ -n "$STATIC_LIB" ]; then echo "   STATIC codec=$STATIC_LIB shuffle=$STATIC_
 elif [ "$BEST" = true ]; then echo "   BEST mode (exhaustive, ratio-only)"
 else echo "   learn=$NP_LEARN explore=$NP_EXPLORE k=$EXPLORE_K"; fi
 echo "   store=$STORE  port=$PORT"
+[ -n "$SGD_RULE" ] && echo "   SGD rule: $SGD_RULE  (CLIO_NEUROPRESS_SGD_LR=${LR:-unset})"
 
 NP_ENV=(env CLIO_SERVER_CONF="$STORE/compose.yaml"
         CLIO_WITH_RUNTIME=1
@@ -143,6 +177,30 @@ NP_ENV=(env CLIO_SERVER_CONF="$STORE/compose.yaml"
         # of 540, "warning" gives 0 out of 50. Every run was silently at debug,
         # which both bloats the log and buries the warnings it should surface.
         CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}")
+# Whenever selection can override the model's first pick, record what it tried.
+# Without this the run reports only the winner and "exploration was on" is an
+# unfalsifiable claim.
+if [ "$NP_EXPLORE" = true ] || [ "$BEST" = true ]; then
+  NP_ENV+=(CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv")
+fi
+# The model's predicted ratio/ct/dt for ALL 32 actions per chunk. WriteTraceLog
+# uses std::ofstream and does NOT create the directory; a missing one fails
+# silently and the trace is simply empty.
+mkdir -p "$STORE/trace"
+NP_ENV+=(CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv")
+if [ "$RATIO_COST" = true ]; then
+  NP_ENV+=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0
+           CLIO_NEUROPRESS_COST_W_IO=1)
+fi
+if [ "$MEASURE_DT" = true ]; then
+  NP_ENV+=(CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=1)
+fi
+if [ -n "$SGD_RULE" ]; then
+  NP_ENV+=(CLIO_NEUROPRESS_SGD_RULE="$SGD_RULE")
+  # if/fi, not `[ ] && `: under set -e a false test as the last command of the
+  # line aborts the script.
+  if [ -n "$LR" ]; then NP_ENV+=(CLIO_NEUROPRESS_SGD_LR="$LR"); fi
+fi
 # CLIO_RESTART=1 replays the metadata log, so a second process can see the
 # blobs a first one stored. Same switch the siblings' read phases use.
 [ "$RESTART" = true ] && NP_ENV+=(CLIO_RESTART=1)
