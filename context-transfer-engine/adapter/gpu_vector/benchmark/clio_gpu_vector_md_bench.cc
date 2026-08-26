@@ -2542,14 +2542,28 @@ int main(int argc, char **argv) {
   u64 cache_frames_total = 0, cache_bytes_total = 0;
   size_t vram_free_before = 0, vram_total_dev = 0;
   cudaMemGetInfo(&vram_free_before, &vram_total_dev);
+  // WHERE THE VRAM GOES, per vector: the DATA (what the pages actually hold)
+  // against the FRAME ARRAY (what the cache allocates for them), because
+  // every slot owns dedicated page storage. The ratio is the over-provision,
+  // and it is the whole difference between our footprint and a resident
+  // MPI-style array.
+  u64 data_bytes_total = 0, tbl_bytes_total = 0;
   auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages) {
     const u64 frames = static_cast<u64>(nsets) * nslot;
     const u64 bytes = frames * pgb;
+    const u64 data = vec_pages * pgb;
+    const u64 tbl = frames * sizeof(gv::Page);
     cache_frames_total += frames;
     cache_bytes_total += bytes;
-    std::printf("  %-5s %u sets x %u = %llu frames (%.1f MB) for %llu pages\n",
-                what, nsets, nslot, (unsigned long long)frames,
-                (double)bytes / 1048576.0, (unsigned long long)vec_pages);
+    data_bytes_total += data;
+    tbl_bytes_total += tbl;
+    std::printf("  %-5s page=%3lluKB  data %6.1f MB (%llu pages)  frames "
+                "%llu = %6.1f MB  %.2fx  +tbl %.2f MB\n",
+                what, (unsigned long long)(pgb >> 10),
+                (double)data / 1048576.0, (unsigned long long)vec_pages,
+                (unsigned long long)frames, (double)bytes / 1048576.0,
+                (double)bytes / (double)(data ? data : 1),
+                (double)tbl / 1048576.0);
   };
   bool cache_reported = false;
   auto report_caches = [&]() {
@@ -2561,13 +2575,21 @@ int main(int argc, char **argv) {
         (vram_free_before > fnow)
             ? (double)(vram_free_before - fnow) / 1048576.0
             : 0.0;
-    std::printf("  CACHE TOTAL: %llu frames, %.1f MB of frame arrays; "
-                "device VRAM consumed by the vectors %.1f MB "
-                "(free %.0f -> %.0f MB of %.0f)\n",
+    std::printf("  CACHE TOTAL: %llu frames = %.1f MB of frame arrays for "
+                "%.1f MB of data (%.2fx over-provision, %.1f MB of it spare "
+                "page storage);\n"
+                "  page tables %.2f MB (sizeof(Page)=%zu). Device VRAM "
+                "consumed by the vectors %.1f MB (free %.0f -> %.0f MB "
+                "of %.0f)\n",
                 (unsigned long long)cache_frames_total,
-                (double)cache_bytes_total / 1048576.0, used_mb,
-                (double)vram_free_before / 1048576.0, (double)fnow / 1048576.0,
-                (double)vram_total_dev / 1048576.0);
+                (double)cache_bytes_total / 1048576.0,
+                (double)data_bytes_total / 1048576.0,
+                (double)cache_bytes_total /
+                    (double)(data_bytes_total ? data_bytes_total : 1),
+                (double)(cache_bytes_total - data_bytes_total) / 1048576.0,
+                (double)tbl_bytes_total / 1048576.0, sizeof(gv::Page),
+                used_mb, (double)vram_free_before / 1048576.0,
+                (double)fnow / 1048576.0, (double)vram_total_dev / 1048576.0);
   };
   const u32 x_slots = SharedSlots(npages, nsets);
   gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks, x_slots,
