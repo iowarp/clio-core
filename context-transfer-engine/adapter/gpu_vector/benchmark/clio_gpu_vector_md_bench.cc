@@ -1978,64 +1978,39 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
                                          u32 cap, u32 z0, u32 z1, u64 gen,
                                          u32 nblocks, u32 block) {
   const u64 epp = x.ElemsPerPage();
-  const Slab sl = SlabOf(nb, cap, z0, z1, epp);
-  // ONLY THE BOUNDARY PLANES. A peer reads exactly two of this slab's
-  // planes: the node below reads plane z0 (its "above" halo) and the node
-  // above reads plane z1-1 (its "below" halo). ForceCoro, RebinAssignCoro
-  // and GatherCoro all reach bz +/- 1 and no further, so publishing the
-  // interior sent 4x the bytes any reader would ever demand. The interior
-  // stays cache-resident (the runs are resident; OOC in decomposed mode
-  // would need an interior-flush policy first).
+  // BATCHED, NOT PAGE-AT-A-TIME. This kernel is pure store latency: after
+  // the force pass stopped parking, the per-page loop here -- one awaited
+  // flush per page, one awaited fetch per halo page -- was 60% of the whole
+  // run (15.6 ms/step against MPI's 6.3 TOTAL). GatherRanges is variadic and
+  // a Multi task carries 64 records, so both boundary planes go out as ONE
+  // flush per vector and both halo planes come back as ONE fetch: ~3 store
+  // round trips per step instead of ~12.
+  //
+  // TWO BLOCKS, ONE VECTOR EACH. The wait is latency, not bandwidth; more
+  // blocks would just contend for the same task slots.
   const u64 row_elems_p = static_cast<u64>(nb) * cap * kStride;
   const u64 plane_elems_p = static_cast<u64>(nb) * row_elems_p;
   const u64 lo_pl = static_cast<u64>(z0) * plane_elems_p;
   const u64 hi_pl = static_cast<u64>(z1 - 1) * plane_elems_p;
-  for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
-    const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
-    const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
-    if (e1 <= e0) continue;
-    const bool boundary =
-        (e0 < lo_pl + plane_elems_p && e1 > lo_pl) ||
-        (e0 < hi_pl + plane_elems_p && e1 > hi_pl);
-    if (!boundary) continue;
-    // FETCH BEFORE FLUSH, because a flush only writes back frames it can
-    // FIND. SubmitFlushRanges does `Find(pn); if (p == nullptr) continue;`
-    // and then returns early on n == 0 -- so publishing a page this block
-    // does not have resident is a SILENT NO-OP. That is what this kernel was
-    // doing: every generational put was dropped before it was built, the
-    // readers' `Fetch(gen)` waited out its 10s timeout against a blob still
-    // at generation 0, and the whole exchange looked like a broken
-    // generational protocol. Tracing put/stamp showed the readers demanding
-    // gen 1 over both the LOCAL and REMOTE branches and NOT ONE put being
-    // issued by anybody.
-    //
-    // Fetch is the pinner, so this both makes the page resident and holds it
-    // across the writeback. The unpin comes AFTER EndFlush below -- eviction
-    // performs no I/O, so a frame released between the flush and its
-    // completion can be dropped with the bytes still only in it.
-    co_await x.Fetch(0, e0, e1 - e0);
-    co_await v.Fetch(0, e0, e1 - e0);
-    co_await x.BeginFlush(gen, e0, e1 - e0);
-    co_await v.BeginFlush(gen, e0, e1 - e0);
-  }
-  co_await x.EndFlush();
-  co_await v.EndFlush();
-  // ONLY NOW. The pins taken above are released after the writeback has
-  // LANDED; releasing them inside the loop would let a peer reclaim a frame
-  // whose bytes are still in flight. THE FILTER MUST MATCH THE FETCH LOOP
-  // EXACTLY: when the publish narrowed to boundary planes, this loop kept
-  // walking the whole slab and unpinned pages that were never fetched -- a
-  // pin-count UNDERFLOW on every interior page, every step.
-  for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
-    const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
-    const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
-    if (e1 <= e0) continue;
-    const bool boundary =
-        (e0 < lo_pl + plane_elems_p && e1 > lo_pl) ||
-        (e0 < hi_pl + plane_elems_p && e1 > hi_pl);
-    if (!boundary) continue;
-    x.UnpinRange(e0, e1 - e0);
-    v.UnpinRange(e0, e1 - e0);
+  const u64 below = static_cast<u64>((z0 + nb - 1u) % nb) * plane_elems_p;
+  const u64 above = static_cast<u64>(z1 % nb) * plane_elems_p;
+  if (block == 0) {
+    co_await x.Fetch(0, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
+    co_await x.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
+    co_await x.EndFlush();
+    // The demand stays on the consumer (force still asks hgen); this fetch
+    // only warms the frames to `gen` so the heavy kernel finds resident_ok.
+    co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
+    x.UnpinRange(below, plane_elems_p);
+    x.UnpinRange(above, plane_elems_p);
+    x.UnpinRange(lo_pl, plane_elems_p);
+    x.UnpinRange(hi_pl, plane_elems_p);
+  } else if (block == 1) {
+    co_await v.Fetch(0, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
+    co_await v.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
+    co_await v.EndFlush();
+    v.UnpinRange(lo_pl, plane_elems_p);
+    v.UnpinRange(hi_pl, plane_elems_p);
   }
 }
 

@@ -2662,7 +2662,19 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
           CLIO_CO_RETURN;
         }
-        CLIO_CO_AWAIT(clio::run::yield(25.0));
+        // ADAPTIVE, NOT 25 ms FLAT. A per-step halo exchange arrives here
+        // microseconds before the writer's stamp, and a fixed 25 ms nap
+        // quantized every MD step to the poll clock -- measured as a 15
+        // ms/step kick phase that neither batching nor round-trip count
+        // could move. Poll fast while the wait is young (the common case is
+        // sub-millisecond), back off once it is clearly a straggler.
+        {
+          const clio::run::u64 waited_ns = GetCurrentTimeNs() - gen_t0;
+          const double nap_ms = (waited_ns < 2ull * 1000 * 1000)   ? 0.05
+                                : (waited_ns < 50ull * 1000 * 1000) ? 1.0
+                                                                    : 25.0;
+          CLIO_CO_AWAIT(clio::run::yield(nap_ms));
+        }
         blob_info_ptr = CheckBlobExists(blob_name, tag_id);
       }
     }
