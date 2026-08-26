@@ -1,0 +1,127 @@
+Fix get_comoving_a() aborting on a time that is exactly old_a_time,
+in a single-precision (AMReX_PRECISION=SINGLE) build.
+
+Nyx aborts with
+
+    amrex::Error::0::get_comoving_a: invalid time
+
+partway through a Sedov run, AFTER every plotfile/dump for that step has
+already been written, so the data is intact and only the exit status is lost.
+Reproduced on AMReX 26.08 / Nyx 4ecfea2a85b9 at 64^3 and 128^3.
+
+WHAT IS ACTUALLY WRONG
+
+get_comoving_a() decides "is `time` at one end of the current a-interval" with
+
+    const Real eps = 0.0001 * (new_a_time - old_a_time);
+    ... else if (time > old_a_time - eps && time < old_a_time + eps)
+
+eps is 1e-4 of the interval WIDTH, but it is then added to the interval's
+ABSOLUTE POSITION. Those have wildly different magnitudes late in a run:
+instrumented at the abort, with Real = float,
+
+    time       = 0.13994413614273071
+    old_a_time = 0.13994413614273071      <- time - old_a_time is EXACTLY 0
+    new_a_time = 0.14000000059604645
+    eps        = 5.5864455e-09
+
+One float ULP at 0.14 is 2^-26 ~ 1.49e-8, so eps is below HALF an ulp.
+`old_a_time - eps` and `old_a_time + eps` both round straight back to
+old_a_time, and the test degenerates to
+
+    time > old_a_time && time < old_a_time
+
+which is empty. A `time` exactly equal to old_a_time -- the commonest query
+there is, since the source terms ask for a at the start of every step -- then
+misses that branch, misses the new_a_time branch (it is a full dt away), and
+misses `time > old_a_time && time < new_a_time` on the same strict `>`.
+Every branch falls through to amrex::Error().
+
+This is why the abort looks nondeterministic: it fires only when a step
+sequence happens to land a query exactly on old_a_time, so it depends on
+resolution and on the problem parameters. Measured before this patch, all with
+stop_time=0.13: 64^3/exp_energy=1 exits 0, but 64^3/exp_energy=3, 128^3/
+exp_energy=1 and 128^3/exp_energy=3 all abort -- and the last of those aborted
+at t=0.125, BELOW the stop_time it was given.
+
+Double-precision builds are unaffected: a double ULP at 0.14 is ~2.8e-17, far
+under eps, so the window is always representable there. That is why this has
+survived -- SINGLE is the unusual configuration.
+
+THE FIX
+
+  * Floor eps at a few ulp of the interval's own magnitude, so the tolerance
+    window is always at least representable in whatever precision Real is. In
+    double precision the original 1e-4*dt term still dominates and nothing
+    changes.
+  * Make the endpoint comparisons inclusive. time == old_a_time is a legitimate
+    query with an obvious answer, and strict inequalities are exactly what
+    excluded it once eps underflowed.
+
+VERIFIED
+
+  * Seven configurations that aborted before (64^3 and 128^3, exp_energy 1 and
+    3, stop_time 0.10/0.13/0.14/0.16/0.2) all exit 0 and run to their full
+    stop_time.
+  * The one configuration that already passed (64^3, exp_energy=1,
+    stop_time=0.13) still passes at the identical step count and final time.
+  * No physics change: 126/126 raw field dumps from the default benchmark run
+    (128^3, 200 steps) are BIT-IDENTICAL to the same run on the unpatched
+    binary.
+
+diff --git a/Source/Driver/comoving.cpp b/Source/Driver/comoving.cpp
+index 1433967..eccb909 100644
+--- a/Source/Driver/comoving.cpp
++++ b/Source/Driver/comoving.cpp
+@@ -1,3 +1,5 @@
++#include <algorithm>
++#include <limits>
+ #include <iomanip>
+ #include <Nyx.H>
+ #include <constants_cosmo.H>
+@@ -485,7 +487,25 @@ Nyx::comoving_est_time_step (Real& cur_time, Real& estdt)
+ Real
+ Nyx::get_comoving_a (Real time)
+ {
+-    const Real eps         = 0.0001 * (new_a_time - old_a_time);
++    // The tolerance for "time is at one end of the current a-interval".
++    //
++    // 1.e-4 * dt alone is not usable in a SINGLE-PRECISION build. dt here is
++    // ~5.6e-5 against times of ~0.14, so eps comes out ~5.6e-9 while one float
++    // ULP at 0.14 is ~1.5e-8 -- eps is below HALF an ulp, so both
++    // `old_a_time - eps` and `old_a_time + eps` round straight back to
++    // old_a_time and the window below collapses to the empty interval
++    // (old_a_time, old_a_time). A `time` that is EXACTLY old_a_time then fails
++    // that test, fails the new_a_time test, fails `time > old_a_time` in the
++    // interpolation branch, and aborts with "invalid time" -- for a time that
++    // is precisely the left endpoint of the interval it was asked about.
++    //
++    // Floor it at a few ulp of the interval's own magnitude so the window is
++    // always at least representable. In double precision the first term keeps
++    // dominating and behaviour is unchanged.
++    const Real eps         = std::max(Real(0.0001) * (new_a_time - old_a_time),
++                                      Real(4.0) * std::numeric_limits<Real>::epsilon()
++                                          * std::max(std::abs(old_a_time),
++                                                     std::abs(new_a_time)));
+ 
+     // Test on whether time == old_a_time == new_a_time -- for example after restart
+     //   before a has been integrated for the new time step.
+@@ -495,15 +515,15 @@ Nyx::get_comoving_a (Real time)
+     {
+         return old_a;
+     }
+-    else if (time > old_a_time - eps && time < old_a_time + eps)
++    else if (time >= old_a_time - eps && time <= old_a_time + eps)
+     {
+         return old_a;
+     }
+-    else if (time > new_a_time - eps && time < new_a_time + eps)
++    else if (time >= new_a_time - eps && time <= new_a_time + eps)
+     {
+         return new_a;
+     }
+-    else if (time > old_a_time && time < new_a_time)
++    else if (time >= old_a_time && time <= new_a_time)
+     {
+         Real frac = (time - old_a_time) / (new_a_time - old_a_time);
+         Real    a = frac*new_a + (1.0-frac)*old_a;
