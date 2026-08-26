@@ -22,6 +22,9 @@ lossy, and a ladder of assumed storage bandwidths.
 | `--smoke` | off | `--profile quick --repeats 1 --bw-policy one`. Each workload contributes the four cells that cover both modes and both cost models: 16 runs. Run it before starting a campaign. |
 | `--profile` | `full` | `quick` ~1 GB, 1-2 min/run; `mid` ~8-10 GB, 5-10 min/run; `full` ~30 GB, 17-25 min/run. All but `quick` run >=1000 timesteps. See section 2 for why the brief's three targets are not simultaneously reachable. |
 | `--workloads` | all four | Space-separated subset, e.g. `"nyx vpic"`. |
+| `--cost-models` | `"balance ratio"` | Which corners of the cost model to run. `balance` weights compress time, decompress time and I/O equally; `ratio` zeroes the two latency weights so cost collapses to `bytes/(ratio*bw)`; `speed` zeroes the I/O weight so only latency counts. |
+| `--explore-k` | `3` | Alternatives MEASURED per chunk. 3 is NeuroPress's own ranked window; 31 is the exhaustive action space minus the primary. Wider is not automatically better -- see below. |
+| `--eb` | `1e-3` | Absolute error bound for the lossy half, `\|original - decoded\| <= eb`. 1e-3 is upstream NeuroPress's own benchmark value. |
 | `--bw-policy` | `reduced` | `reduced` runs the full ladder on the balance model and a two-point control set on ratio (bandwidth cannot reorder candidates there -- see section 3). `full` runs the ladder on both; `one` pins 5 GB/s. |
 | `--repeats` | `3` | Mandatory for readable results, not caution -- see "Exploration-mode selection is nondeterministic run to run". |
 | `--check-bound` | off | On lossy runs, verify `|original - decoded| <= eb` elementwise instead of a digest. Only Nyx and VPIC can: they hold the submitted bytes in situ. |
@@ -35,6 +38,34 @@ per-chunk record), `explore.csv` (one row per measured candidate, with the
 adopted flag). `collect.py` turns a set of them into `summary.csv` /
 `summary.md`; `audit_run.py` reconciles a single run's CSVs against the bytes
 that actually reached the tier.
+
+### The three cost models
+
+`balance` and `ratio` are two corners of the same weighting; `speed` is the
+third, and together they span what the model can be asked to optimise:
+
+| model | `w_ct` | `w_dt` | `w_io` | cost reduces to |
+|---|---|---|---|---|
+| `balance` | 1 | 1 | 1 | `ct + dt + bytes/(min(ratio,100)*bw)` |
+| `ratio` | 0 | 0 | 1 | `bytes/(min(ratio,100)*bw)` |
+| `speed` | 1 | 1 | 0 | `ct + dt` |
+
+The times are floored at 1 ms and the ratio capped at 100x before the cost is
+formed, and on megabyte chunks those clamps dominate. Under `speed` that is
+extreme: measured on one Nyx frame at K=31, the top three candidates all cost
+**exactly 2.0000**, because both their times are under the floor --
+
+```
+codec                ratio      ct      dt     cost
+nvcomp-ans            4.27   0.805   0.128   2.0000
+nvcomp-lz4          186.08   0.889   0.242   2.0000
+nvcomp-bitcomp      155.48   0.130   0.147   2.0000
+```
+
+so a 4.27x codec ties with a 186x one and the tie falls to action index. That
+run stored 6.80x where the balanced model stored 47.8x on the same data.
+`speed` is doing its job -- it was never asked about size -- but read its
+`ratio` column as a consequence, not a result.
 
 ### How each workload verifies itself
 

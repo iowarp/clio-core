@@ -145,10 +145,19 @@ COST_ENV=()
 # rest under the ratio-only ones.
 case "$CONFIG" in
   dynamic|learn|explore-balance) COSTMODEL=balance ;;
+  explore-speed)                 COSTMODEL=speed ;;
   static-*)                      COSTMODEL=none ;;
   *)                             COSTMODEL=ratio ;;
 esac
 RATIO_ONLY=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPRESS_COST_W_IO=1)
+# SPEED is the third corner of the cost model: latency only, I/O weight zeroed,
+# so cost = w_ct*compress_ms + w_dt*decompress_ms and the ratio term drops out
+# entirely. It is the complement of `ratio` (which zeroes the two latency
+# weights), and together the three span what the model can be asked to optimise.
+# Expect it to pick the fastest codec regardless of how little it compresses --
+# on data that barely compresses the balanced model already behaves this way,
+# because the 1 ms clamps dominate its cost.
+SPEED_ONLY=(CLIO_NEUROPRESS_COST_W_CT=1 CLIO_NEUROPRESS_COST_W_DT=1 CLIO_NEUROPRESS_COST_W_IO=0)
 case "$CONFIG" in
   dynamic)        ;;
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
@@ -172,6 +181,9 @@ case "$CONFIG" in
   explore-ratio)   NP_LEARN=true; NP_EXPLORE=true
                    EXPLORE_K=$EXPLORE_K_OPT; THRESH=$THRESH_OPT
                    COST_ENV=("${RATIO_ONLY[@]}") ;;
+  explore-speed)   NP_LEARN=true; NP_EXPLORE=true
+                   EXPLORE_K=$EXPLORE_K_OPT; THRESH=$THRESH_OPT
+                   COST_ENV=("${SPEED_ONLY[@]}") ;;
   static-zstd)    STATIC_LIB=nvcomp-zstd; STATIC_SHUF=0 ;;
   static-zstd-s4) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=4 ;;
   static-zstd-s8) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=8 ;;

@@ -3,12 +3,13 @@
 # two cost models, lossless and lossy, across a bandwidth ladder.
 #
 #   ./run_benchmark.sh [--smoke] [--profile quick|mid|full] [--workloads "a b c"]
-#                      [--bw-policy reduced|full|one] [--repeats N] [--results DIR]
-#                      [--keep-native] [--check-bound] [--dry-run]
+#                      [--cost-models "balance ratio speed"] [--explore-k N]
+#                      [--eb X] [--bw-policy reduced|full|one] [--repeats N]
+#                      [--results DIR] [--keep-native] [--check-bound] [--dry-run]
 #
 # Every run is one cell of
 #
-#     workload  x  {lossless, lossy}  x  {balance, ratio}  x  bandwidth
+#     workload  x  {lossless, lossy}  x  cost model  x  bandwidth
 #
 # named for the cell it occupies (nyx_lossy_balance_nvme_10GBs), keeping its
 # raw per-chunk measurements -- blobs.csv, selection.csv, explore.csv. Nothing
@@ -37,6 +38,19 @@ BW_NAMES=(nvme_1GBs nvme_2GBs nvme_5GBs nvme_10GBs dram)
 BW_VALUES=(1e6      2e6       5e6       1e7        2.26e8)
 BW_REDUCED=(nvme_5GBs dram)     # control set for the ratio model
 
+# The three corners of the cost model. balance weights compress time,
+# decompress time and I/O equally; ratio zeroes the two latency weights so cost
+# collapses to bytes/(ratio*bw); speed zeroes the I/O weight so only latency
+# counts. Override with --cost-models to run a subset or add speed.
+COST_MODELS="balance ratio"
+
+# Alternatives MEASURED per chunk. Passed through to each workload's
+# --explore-k; 3 is NeuroPress's own ranked window, 31 the exhaustive action
+# space minus the primary. Wider is not automatically better: on the three
+# workloads whose data barely compresses, a wider sweep measures more
+# candidates under more GPU contention and adopts worse ones. BENCHMARK.md.
+EXPLORE_K=3
+
 LOSSY_EB=1e-3                   # upstream NeuroPress's own benchmark value
 
 # 3, and not out of caution: exploration adopts on MEASURED cost, so repeated
@@ -53,6 +67,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --profile)     PROFILE=$2; shift 2;;
     --workloads)   WORKLOADS=$2; shift 2;;
+    --cost-models) COST_MODELS=$2; shift 2;;
+    --explore-k)   EXPLORE_K=$2; shift 2;;
+    --eb)          LOSSY_EB=$2; shift 2;;
     --bw-policy)   BW_POLICY=$2; shift 2;;
     --repeats)     REPEATS=$2; shift 2;;
     --results)     RESULTS=$2; shift 2;;
@@ -67,6 +84,10 @@ done
 
 case "$BW_POLICY" in reduced|full|one) ;;
   *) echo "unknown --bw-policy: $BW_POLICY (reduced|full|one)" >&2; exit 2;; esac
+for m in $COST_MODELS; do
+  case "$m" in balance|ratio|speed) ;;
+    *) echo "unknown cost model: $m (balance|ratio|speed)" >&2; exit 2;; esac
+done
 
 # ---------------------------------------------------------------------------
 # Profiles -- the three targets in the brief are not simultaneously reachable
@@ -130,6 +151,10 @@ workload_spec() {
 }
 
 # Bandwidths for one cost model. `one` is the smoke setting.
+# Only `balance` has a bandwidth-sensitive cost. Under `ratio` bandwidth is a
+# positive scalar on the sole term, so it cannot reorder candidates; under
+# `speed` there is no bandwidth term at all. Both get the two-point control set
+# so the invariance is visible in the results rather than asserted.
 bw_list_for() {
   if   [ "$BW_POLICY" = one ];                            then echo "nvme_5GBs"
   elif [ "$1" = balance ] || [ "$BW_POLICY" = full ];     then printf '%s\n' "${BW_NAMES[@]}"
@@ -163,7 +188,8 @@ verify_args_for() {
 mkdir -p "$RESULTS"
 free_gb=$(df -BG --output=avail "$RESULTS" | tail -1 | tr -dc '0-9')
 echo "== Clio-NeuroPress benchmark"
-echo "   profile=$PROFILE  bw-policy=$BW_POLICY  repeats=$REPEATS  results=$RESULTS"
+echo "   profile=$PROFILE  models='$COST_MODELS'  K=$EXPLORE_K  eb=$LOSSY_EB"
+echo "   bw-policy=$BW_POLICY  repeats=$REPEATS  results=$RESULTS"
 echo "   disk: ${free_gb} GB free, profile needs ~${NEED_GB} GB"
 if [ "$free_gb" -lt "$NEED_GB" ]; then
   echo
@@ -201,12 +227,13 @@ run_cell() {
 
   local cfg; cfg=$(config_for "$w")
   if [ "$DRY" = 1 ]; then
-    echo "[dry] $(basename "$cfg") explore-$model --bw $bw ${eb[*]} ${W_VFY[*]} --chunk $W_CHUNK ${W_SIZE[*]} --tag $tag"
+    echo "[dry] $(basename "$cfg") explore-$model --bw $bw ${eb[*]} ${W_VFY[*]} --explore-k $EXPLORE_K --chunk $W_CHUNK ${W_SIZE[*]} --tag $tag"
     return 0
   fi
 
   "$cfg" "explore-$model" \
       --bw "$bw" "${eb[@]}" "${W_VFY[@]}" \
+      --explore-k "$EXPLORE_K" \
       --chunk "$W_CHUNK" "${W_SIZE[@]}" \
       --results "$RESULTS" --tag "$tag"
   local rc=$?
@@ -226,7 +253,7 @@ for w in $WORKLOADS; do
   [ -d "$HERE/$w" ] || { echo "!! no such workload: $w" >&2; FAILED=$((FAILED+1)); continue; }
   workload_spec "$w"
   for mode in lossless lossy; do
-    for model in balance ratio; do
+    for model in $COST_MODELS; do
       while read -r bwname; do
         [ -z "$bwname" ] && continue
         for rep in $(seq 1 "$REPEATS"); do

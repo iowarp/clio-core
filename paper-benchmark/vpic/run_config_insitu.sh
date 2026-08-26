@@ -51,13 +51,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Same two cost models as the replay route, so the numbers compare.
+# Same cost models as the replay route, so the numbers compare.
 RATIO_ONLY=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPRESS_COST_W_IO=1)
+# SPEED is the third corner of the cost model: latency only, I/O weight zeroed,
+# so cost = w_ct*compress_ms + w_dt*decompress_ms and the ratio term drops out
+# entirely. It is the complement of `ratio` (which zeroes the two latency
+# weights), and together the three span what the model can be asked to optimise.
+# Expect it to pick the fastest codec regardless of how little it compresses --
+# on data that barely compresses the balanced model already behaves this way,
+# because the 1 ms clamps dominate its cost.
+SPEED_ONLY=(CLIO_NEUROPRESS_COST_W_CT=1 CLIO_NEUROPRESS_COST_W_DT=1 CLIO_NEUROPRESS_COST_W_IO=0)
 COST_ENV=()
 case "$CONFIG" in
   explore-balance) COSTMODEL=balance ;;
   explore-ratio)   COSTMODEL=ratio; COST_ENV=("${RATIO_ONLY[@]}") ;;
-  *) echo "unknown config: $CONFIG (explore-balance|explore-ratio)" >&2; exit 2;;
+  explore-speed)   COSTMODEL=speed; COST_ENV=("${SPEED_ONLY[@]}") ;;
+  *) echo "unknown config: $CONFIG (explore-balance|explore-ratio|explore-speed)" >&2; exit 2;;
 esac
 
 MODE=lossless
