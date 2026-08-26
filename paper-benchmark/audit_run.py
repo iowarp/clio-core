@@ -36,8 +36,8 @@ HDR, QHDR = 24, 32
 
 def read_log(d):
     """Per-field and total figures from whichever log the adapter wrote."""
-    per, tot, codecs = {}, None, Counter()
-    for name in ("nyx.log", "stdout.log", "vpic.log", "run.log"):
+    per, tot, codecs, seen = {}, None, Counter(), []
+    for name in ("nyx.log", "vpic.log", "stdout.log", "run.log"):
         p = os.path.join(d, name)
         if not os.path.isfile(p):
             continue
@@ -52,8 +52,12 @@ def read_log(d):
             if m:
                 codecs[m.group(1)] = int(m.group(2))
         if per or tot:
-            return per, tot, codecs, name
-    return per, tot, codecs, None
+            seen.append(name)
+    # Every candidate is read and MERGED, not just the first that matched.
+    # A VPIC run directory has both stdout.log (which the wrapper echoes the
+    # total into) and vpic.log (which carries the per-field table and the codec
+    # tally); returning at the first hit silently dropped the per-field checks.
+    return per, tot, codecs, ",".join(seen) or None
 
 
 def field(blob):
@@ -113,8 +117,13 @@ def audit(d):
         codecs_here = {r["codec"] for r in blobs if field(r["blob"]) == f}
         a = {"lib_name": "/".join(sorted(codecs_here))} if codecs_here else None
         implied = n_ck or None
-        # the log's own per-field ratio must be bytes/stored
-        if abs(b_in / b_st - b_ra) / b_ra > 1e-4:
+        # The log's own per-field ratio must be bytes/stored. ABSOLUTE
+        # tolerance, not relative: the adapter prints these with a FIXED three
+        # decimals, so the error is bounded by half the last digit regardless
+        # of magnitude. A relative test passes on Nyx (ratios 60-80, six
+        # significant figures) and fails on every VPIC field (ratios ~1.1, four
+        # figures) -- a false alarm on the workload that compresses least.
+        if abs(b_in / b_st - b_ra) > 5.1e-4:
             ok, note = False, note + " ratio!"
         bad += not ok
         print(f"   {f:<10}{b_st:>11}{(got if got is not None else -1):>11}"
@@ -126,7 +135,7 @@ def audit(d):
     checks = [
         ("blobs.csv total in  == log", in_sum == tot[0], f"{in_sum} vs {tot[0]}"),
         ("blobs.csv total out == log", st_sum == tot[1], f"{st_sum} vs {tot[1]}"),
-        ("log total ratio     == in/out", abs(tot[0] / tot[1] - tot[2]) / tot[2] < 1e-4,
+        ("log total ratio     == in/out", abs(tot[0] / tot[1] - tot[2]) <= 5.1e-4,
          f"{tot[0]/tot[1]:.4f} vs {tot[2]}"),
     ]
     if writes:
