@@ -61,6 +61,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
 #include <clio_cte/compressor/compressor_client.h>
+#include <clio_cte/compressor/neuropress_path_trace.h>
 
 /* The connector's capability set. Defined once because it is reported from two
    places (the class literal and introspect_get_cap_flags) that must agree. */
@@ -1951,7 +1952,7 @@ static inline double clio_since_us(std::chrono::steady_clock::time_point s) {
  */
 
 /* ---------------------------------------------------------------------------
- * End-to-end path trace -- COMPILE-TIME, off unless -DCLIO_NEUROPRESS_PATH_TRACE.
+ * End-to-end path trace -- RUNTIME, off unless CLIO_NEUROPRESS_PATH_TRACE is set.
  *
  * Answers one question a return code cannot: did my data actually get
  * intercepted and carried through this stack, or did the connector quietly
@@ -1959,22 +1960,20 @@ static inline double clio_since_us(std::chrono::steady_clock::time_point s) {
  * prints the same "[np-path]" prefix, so one grep shows the whole journey --
  * and a MISSING line is as informative as a present one.
  *
- * Compile-time rather than an env check: when the macro is undefined the
- * calls expand to nothing, so there is no branch, no string, and no cost on
- * the write path at all. Enable with
- *   cmake -DCLIO_NEUROPRESS_PATH_TRACE=ON
+ * Enable with CLIO_NEUROPRESS_PATH_TRACE=1 in the ENVIRONMENT -- the same
+ * variable the compressor and fs_bdev halves read, so one setting lights up
+ * the whole journey and there is nothing to enable per module.
+ *
+ * This used to be a compile-time define with its own copy of the macro, and
+ * the comment here told you to run `cmake -DCLIO_NEUROPRESS_PATH_TRACE=ON`.
+ * No such CMake option ever existed, so that instruction could not work; the
+ * define had to be hand-edited into a generated flags.make, which CMake threw
+ * away on its next regenerate. The definition now lives in one header, shared
+ * with the compressor half, and the switch is durable.
+ *
+ * CLIO_PATH_TRACE and NpWhere() come from neuropress_path_trace.h, included
+ * with the other clio_cte headers at the top of this file.
  * --------------------------------------------------------------------------- */
-#ifdef CLIO_NEUROPRESS_PATH_TRACE
-#define CLIO_PATH_TRACE(...)                          \
-  do {                                                \
-    std::fprintf(stderr, "[np-path] " __VA_ARGS__);    \
-    std::fprintf(stderr, "\n");                       \
-    std::fflush(stderr);                              \
-  } while (0)
-#else
-/* (void)0 keeps it a statement so `if (x) CLIO_PATH_TRACE(...);` still parses. */
-#define CLIO_PATH_TRACE(...) ((void)0)
-#endif
 
 /* Forward decl: defined with the read-side selection helpers below, but the
    write path needs it to decide whether an append is a contiguous run. */
