@@ -3432,30 +3432,24 @@ int main(int argc, char **argv) {
             vw, sv);
       });
       ctp::GpuApi::Synchronize();
-      // AND WAIT FOR EVERY PEER'S PUBLISH BEFORE ANYONE DEMANDS IT.
+      // NO BARRIER HERE. THE GENERATION IS THE BARRIER.
       //
-      // The design here was "no barrier -- the generation IS the barrier",
-      // i.e. a generational get is not served until the writer's put of that
-      // generation lands. It does not behave that way: a demand that arrives
-      // first comes back with an ERROR rather than waiting, and both nodes
-      // hit it on the very first exchange --
-      //   DEVICE FATAL 7 ... a1=16 a2=2 a3=1   (node1 wants node2's page 16)
-      //   DEVICE FATAL 7 ... a1=0  a2=2 a3=1   (node2 wants node1's page 0)
-      // Before PublishFetch was fixed to refuse a failed get, that same event
-      // was SILENT -- the empty frames were published as valid -- and it is
-      // what the intermittent `RESORT GATE: FAIL (-591522.357...)` actually
-      // was.
+      // This used to be an all-reduce on a dummy value, once per exchange --
+      // so at least once per timestep, as a blob put plus N-1 blob gets in a
+      // sleep-polling retry loop, to communicate one bit ("I have
+      // published"). It cost more than the entire force computation:
+      //   phases (total ms): force=2752.9 kick=4591.4 resort=1603.0
+      // where kick is integration (trivial) plus this.
       //
-      // So the barrier is explicit until a generational get genuinely blocks
-      // on the writer. It is one all-reduce per exchange, and it is what makes
-      // the demand that follows always satisfiable.
-      double published = 1.0;
-      if (!ReduceSum(*cte_red, red_tag, a.node, a.nodes, red_round++,
-                     &published, 1)) {
-        std::fprintf(stderr, "  exchange barrier failed\n");
-        std::fflush(stderr);
-        std::_Exit(1);
-      }
+      // It was scaffolding for a bug that is fixed. A generational get that
+      // arrived before its writer's put appeared to ERROR rather than wait,
+      // so the ordering looked like it had to be imposed from outside -- but
+      // the real cause was that the publish flushed pages it had never
+      // fetched, and SubmitFlushRanges drops a page it cannot Find, silently,
+      // before it ever builds a task. Every generational put was being thrown
+      // away; nothing was ever late. With the publish fixed, the demand's own
+      // wait-for-the-writer gate does the ordering, which is what the design
+      // said all along.
     };
     auto kick = [&](int drift) {
       if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
