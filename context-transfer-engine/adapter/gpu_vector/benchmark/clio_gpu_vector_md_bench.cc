@@ -468,6 +468,22 @@ void HostForceReference(const Geometry &g, const std::vector<float> &hx,
  * own elements and flushes BYTE-EXACTLY, so neither can clobber the other's
  * half of the page.
  */
+/**
+ * A boolean env flag that survives docker-compose.
+ *
+ * `getenv(x) != nullptr` is TRUE for an EMPTY value, and the harness declares
+ * `MD_NO_HALO=${MD_NO_HALO:-}` unconditionally, so the variable is always
+ * present in the container and every such flag read as ON -- including in the
+ * "halo enabled" arm of the A/B, which is why both arms produced identical
+ * numbers. Empty, "0", "false" and "no" all mean OFF.
+ */
+static bool EnvOn(const char *name) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+           std::strcmp(v, "no") == 0);
+}
+
 struct Slab {
   u64 lo, hi;          // element range this node owns
   u64 pg_lo, pg_hi;    // pages overlapping it
@@ -486,7 +502,8 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
                                    gv::DeviceVector<float> f,
                                    u32 nb, u32 cap, float box, float cutoff,
                                    int eflag, double *acc, u32 z0, u32 z1,
-                                   u32 nblocks, u32 block) {
+                                   u32 nblocks, u32 block, u64 hgen,
+                                   bool force_all) {
   extern __shared__ char smem_raw[];
   double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
@@ -514,7 +531,19 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
       const u32 wy = (by + nb + dy) % nb;
       const u64 rowbin0 = (static_cast<u64>(wz) * nb + wy) * nb;
       rbase[q] = rowbin0 * cap * kStride;
-      co_await x.Fetch(0, rbase[q], row_elems);
+      // THE VERSION DEMAND BELONGS HERE, on the read that consumes the data.
+      // A z-plane outside [z0,z1) is a neighbour's, and a resident copy of it
+      // is last step's. Generation 0 means "any version", so asking for it
+      // here -- which is what this line used to do -- accepts the stale copy
+      // and makes the whole exchange a no-op no matter what the publisher
+      // does. hgen == 0 restores that unsynchronised behaviour deliberately
+      // (single node, or MD_NO_HALO).
+      // MD_FORCE_GEN makes EVERY stencil row generational, so a single-node
+      // run can answer "does a generational fetch refuse a resident older
+      // copy?" without a second node. hgen is then a generation nobody has
+      // published, which must NOT be served.
+      const bool halo = force_all || (wz < z0 || wz >= z1);
+      co_await x.Fetch(halo ? hgen : 0, rbase[q], row_elems);
       hg[q][0] = co_await x.HoldPage(rbase[q], row_elems);
       rrun0[q] = hg[q][0].run();
       if (rrun0[q] < row_elems) {
@@ -641,7 +670,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
                                        u32 cap, float box, float rlist,
                                        u32 maxneigh, u32 *d_cnt, int *d_err,
                                        u32 rowchunk, u32 z0, u32 z1,
-                                       u32 nblocks, u32 block) {
+                                       u32 nblocks, u32 block, u64 hgen) {
   extern __shared__ char smem_raw[];
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
   // holds the same rows and the same list guards, but a thread-local array
@@ -747,7 +776,9 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        co_await x.Fetch(0, rb, len);
+        // Same rule as ForceCoro: a plane outside this node's slab belongs to
+        // a neighbour, and only a generational fetch refuses last step's copy.
+        co_await x.Fetch((wz < z0 || wz >= z1) ? hgen : 0, rb, len);
         hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
@@ -926,7 +957,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
                                        u32 maxneigh, const u32 *d_cnt,
                                        int eflag, double *acc, int nocompute,
                                        u32 rowchunk, u32 z0, u32 z1,
-                                       u32 nblocks, u32 block) {
+                                       u32 nblocks, u32 block, u64 hgen,
+                                       bool force_all) {
   extern __shared__ char smem_raw[];
   double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
@@ -1059,7 +1091,10 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         const u64 rb =
             ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
         const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        co_await x.Fetch(0, rb, len);
+        // Same rule as ForceCoro: a plane outside this node's slab belongs to
+        // a neighbour, and only a generational fetch refuses last step's copy.
+        co_await x.Fetch((force_all || wz < z0 || wz >= z1) ? hgen : 0,
+                         rb, len);
         hg[nspans][0] = co_await x.HoldPage(rb, len);
         srun[nspans] = hg[nspans][0].run();
         if (srun[nspans] < len) {
@@ -1266,13 +1301,20 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
  * at most one bin per rebuild window (the skin rule), which is what makes
  * K2b's scatter row-local. Bin overflow sets d_err; the host refuses.
  */
-__device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
-                                   u32 cap, float box, u32 *bincnt,
-                                   u32 *d_dest, int *d_err, u32 z0, u32 z1,
-                                   u32 nblocks, u32 block) {
+/**
+ * K2a-i: WRAP ONLY. Fold this node's own atoms back into the box.
+ *
+ * Split out of the old single-pass rebin because the SLOT ASSIGNMENT below
+ * has to read a neighbour's positions, and it must read them ALREADY WRAPPED
+ * -- otherwise the two nodes compute different bins for the same atom. So:
+ * everyone wraps their own, everyone publishes, then everyone assigns.
+ * This pass writes only pages this node owns, so one-writer-per-page holds.
+ */
+__device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
+                                       u32 cap, float box, u32 z0, u32 z1,
+                                       u32 nblocks, u32 block) {
   const u64 epp = x.ElemsPerPage();
   const Slab sl = SlabOf(nb, cap, z0, z1, epp);
-  const float fnb = static_cast<float>(nb);
   for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
     const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
     const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
@@ -1283,56 +1325,107 @@ __device__ gy::YCoroMain RebinCoro(gv::DeviceVector<float> x, u32 nb,
     const u64 nslots = epp / kStride;
     const u64 s_lo = (e0 - pg * epp) / kStride;
     const u64 s_hi = (e1 - pg * epp) / kStride;
-    const u64 slot0 = pg * nslots;
     for (u64 s = s_lo + threadIdx.x; s < s_hi; s += blockDim.x) {
       const u64 e = s * kStride;
-      if (px[e + 3] < 0.0f) {
-        d_dest[slot0 + s] = ~0u;
-        continue;
-      }
+      if (px[e + 3] < 0.0f) continue;
       float px0 = px[e + 0], py0 = px[e + 1], pz0 = px[e + 2];
       if (px0 < 0.0f) px0 += box; else if (px0 >= box) px0 -= box;
       if (py0 < 0.0f) py0 += box; else if (py0 >= box) py0 -= box;
       if (pz0 < 0.0f) pz0 += box; else if (pz0 >= box) pz0 -= box;
       px[e + 0] = px0; px[e + 1] = py0; px[e + 2] = pz0;
-      u32 bx = static_cast<u32>(px0 * fnb / box);
-      u32 by = static_cast<u32>(py0 * fnb / box);
-      u32 bz = static_cast<u32>(pz0 * fnb / box);
-      if (bx >= nb) bx = nb - 1;
-      if (by >= nb) by = nb - 1;
-      if (bz >= nb) bz = nb - 1;
-      const u64 bin = (static_cast<u64>(bz) * nb + by) * nb + bx;
-      const u32 slot = atomicAdd(&bincnt[bin], 1u);
-      if (slot >= cap) {
-        *d_err = 1;
-        d_dest[slot0 + s] = ~0u;
-        continue;
-      }
-      d_dest[slot0 + s] = static_cast<u32>(bin * cap + slot);
-      // THE GATHER CAN ONLY REACH ONE BIN IN Y AND Z.
-      //
-      // A destination row is (bz, by) and spans every bx, so movement along x
-      // is free -- but the gather scans a +/-1 stencil in y and z, so an atom
-      // that crossed more than one bin in either is never collected by the row
-      // that now owns it and is dropped with no trace. That is a silent loss
-      // of binding energy, so flag it and let the host refuse the run.
-      const u64 islots_r = static_cast<u64>(nb) * cap;
-      const u64 srow = (slot0 + s) / islots_r;
-      const u32 sby = static_cast<u32>(srow % nb);
-      const u32 sbz = static_cast<u32>(srow / nb);
-      const u32 dy = min((by + nb - sby) % nb, (sby + nb - by) % nb);
-      const u32 dz = min((bz + nb - sbz) % nb, (sbz + nb - bz) % nb);
-      if (dy > 1u || dz > 1u) *d_err = 2;
     }
     __syncthreads();
-    // Publish the wrap. Rebin holds x for WRITE and folds each position back
-    // into the box; the gather then reads these rows from other blocks.
-    // BYTE-EXACT, and that is what lets two nodes share the seam page: each
-    // flushes only the elements it owns.
-    if (g_publish) co_await x.BeginFlush(0, e0, e1 - e0);
     x.UnpinRange(pg * epp, epp);
   }
-  co_await x.EndFlush();
+}
+
+/**
+ * K2a-ii: ASSIGN. Claim a destination slot for every atom that lands in a bin
+ * THIS NODE OWNS -- and for no other.
+ *
+ * THIS IS THE MIGRATION HANDOFF. The old pass had each node assign slots for
+ * its OWN atoms wherever they landed, so an atom drifting out of node0's slab
+ * got a d_dest pointing into node1's rows -- which node0's gather (bounded to
+ * node0's rows) skipped, and which node1 had never computed. Both dropped it,
+ * and every mid-flight resort shed the atoms that crossed a boundary:
+ * measured as pairs 4741632 -> 4580898 at the first one.
+ *
+ * Inverting the ownership fixes it. A node scans its slab PLUS one plane
+ * either side -- an atom moves at most one bin per rebuild, so that is every
+ * atom that can reach it -- and claims a slot only when the DESTINATION bin is
+ * inside [z0, z1). bincnt is then authoritative for the bins it counts,
+ * because exactly one node counts them, and the arriving migrant has an owner.
+ * The halo planes are read-only here, so the write-per-page invariant the
+ * generational design rests on is untouched.
+ */
+__device__ gy::YCoroMain RebinAssignCoro(gv::DeviceVector<float> x, u32 nb,
+                                         u32 cap, float box, u32 *bincnt,
+                                         u32 *d_dest, int *d_err, u32 z0,
+                                         u32 z1, u32 nblocks, u32 block,
+                                         u64 hgen) {
+  const u64 epp = x.ElemsPerPage();
+  const float fnb = static_cast<float>(nb);
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  const u64 plane_elems = static_cast<u64>(nb) * row_elems;
+  const u64 islots_r = static_cast<u64>(nb) * cap;
+  const u32 mine = z1 - z0;
+  const bool whole = (mine >= nb);          // single node owns everything
+  // ONE PASS PER PAGE, NEVER TWO.
+  //
+  // A PLANE-indexed scan only works when planes are a whole number of pages,
+  // and that is enforced ONLY for --nodes > 1 (the seam rule). On one node an
+  // unaligned lattice shares a boundary page between consecutive planes, so a
+  // plane loop visits it twice and assigns its atoms two slots -- which is a
+  // corruption this pass would introduce rather than fix. When this node owns
+  // everything there are no halo planes to single out, so sweep the pages
+  // directly and skip the plane decomposition entirely.
+  const u64 total_elems = static_cast<u64>(nb) * plane_elems;
+  const u64 npages_all = (total_elems + epp - 1) / epp;
+  const u32 nscan = whole ? 1u : (mine + 2u);
+  for (u32 i = 0; i < nscan; ++i) {
+    const u32 wz = whole ? 0u : ((z0 + nb - 1u + i) % nb);
+    const bool in_mine = whole || (wz >= z0 && wz < z1);
+    const u64 p_lo = whole ? 0ull : static_cast<u64>(wz) * plane_elems;
+    const u64 pg_lo = whole ? 0ull : (p_lo / epp);
+    const u64 pg_hi =
+        whole ? npages_all : ((p_lo + plane_elems + epp - 1) / epp);
+    for (u64 pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
+      // A HALO PLANE IS A NEIGHBOUR'S AND MUST BE DEMANDED AT THE GENERATION
+      // THE WRAP WAS PUBLISHED AS. Generation 0 would accept last step's
+      // positions and bin the atom from them.
+      co_await x.Fetch(in_mine ? 0 : hgen, pg * epp, epp);
+      auto hx = co_await x.HoldPage(pg * epp, epp);
+      const float *const px = hx.ptr();
+      const u64 nslots = epp / kStride;
+      const u64 slot0 = pg * nslots;
+      for (u64 s = threadIdx.x; s < nslots; s += blockDim.x) {
+        const u64 e = s * kStride;
+        if (px[e + 3] < 0.0f) continue;          // padded slot
+        const float px0 = px[e + 0], py0 = px[e + 1], pz0 = px[e + 2];
+        u32 bx = static_cast<u32>(px0 * fnb / box);
+        u32 by = static_cast<u32>(py0 * fnb / box);
+        u32 bz = static_cast<u32>(pz0 * fnb / box);
+        if (bx >= nb) bx = nb - 1;
+        if (by >= nb) by = nb - 1;
+        if (bz >= nb) bz = nb - 1;
+        if (!whole && (bz < z0 || bz >= z1)) continue;   // not my bin
+        const u64 bin = (static_cast<u64>(bz) * nb + by) * nb + bx;
+        const u32 slot = atomicAdd(&bincnt[bin], 1u);
+        if (slot >= cap) { *d_err = 1; continue; }
+        d_dest[slot0 + s] = static_cast<u32>(bin * cap + slot);
+        // THE GATHER CAN ONLY REACH ONE BIN IN Y AND Z (see K2b): an atom
+        // that crossed more than one is never collected and vanishes.
+        const u64 srow = (slot0 + s) / islots_r;
+        const u32 sby = static_cast<u32>(srow % nb);
+        const u32 sbz = static_cast<u32>(srow / nb);
+        const u32 dy = min((by + nb - sby) % nb, (sby + nb - by) % nb);
+        const u32 dz = min((bz + nb - sbz) % nb, (sbz + nb - bz) % nb);
+        if (dy > 1u || dz > 1u) *d_err = 2;
+      }
+      __syncthreads();
+      x.UnpinRange(pg * epp, epp);
+    }
+  }
 }
 
 /**
@@ -1368,7 +1461,8 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
                                     gv::DeviceVector<float> srcx,
                                     gv::DeviceVector<float> dst, u32 nb,
                                     u32 cap, const u32 *d_dest, int keep_w,
-                                    u32 z0, u32 z1, u32 nblocks, u32 block) {
+                                    u32 z0, u32 z1, u32 nblocks, u32 block,
+                                    u64 hgen) {
   const u64 islots = static_cast<u64>(nb) * cap;
   const u64 row_elems = islots * kStride;
   const u64 row_lo = static_cast<u64>(z0) * nb;
@@ -1441,7 +1535,12 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         // next span to refetch it. Asking for the pages outright makes the
         // second span a cache hit. The vector fetches exactly what it is
         // told -- so a caller that wants pages has to say pages.
-        co_await src.Fetch(0, src.PageLo(rb), src.PageSpan(rb, len));
+        // A SOURCE PLANE OUTSIDE THIS SLAB IS A NEIGHBOUR'S, so the same
+        // rule the force pass follows applies here: generation 0 accepts the
+        // resident copy however old, and the gather would scatter atoms from
+        // LAST step's positions.
+        co_await src.Fetch((wz < z0 || wz >= z1) ? hgen : 0,
+                           src.PageLo(rb), src.PageSpan(rb, len));
         hs[nspans][0] = co_await src.HoldPage(rb, len);
         srun[nspans] = hs[nspans][0].run();
         if (srun[nspans] < len) {
@@ -1450,11 +1549,13 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         }
         sp0[nspans] = hs[nspans][0].ptr();
         sp1[nspans] = hs[nspans][1] ? hs[nspans][1].ptr() : nullptr;
-        co_await srcx.Fetch(0, srcx.PageLo(rb), srcx.PageSpan(rb, len));
+        co_await srcx.Fetch((wz < z0 || wz >= z1) ? hgen : 0,
+                            srcx.PageLo(rb), srcx.PageSpan(rb, len));
         hx[nspans][0] = co_await srcx.HoldPage(rb, len);
         xrun[nspans] = hx[nspans][0].run();
         if (xrun[nspans] < len) {
-          co_await srcx.Fetch(0, srcx.PageLo(rb + xrun[nspans]),
+          co_await srcx.Fetch((wz < z0 || wz >= z1) ? hgen : 0,
+                              srcx.PageLo(rb + xrun[nspans]),
                               srcx.PageSpan(rb + xrun[nspans], 1));
           hx[nspans][1] =
               co_await srcx.HoldPage(rb + xrun[nspans], len - xrun[nspans]);
@@ -1871,11 +1972,38 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
     const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
     if (e1 <= e0) continue;
+    // FETCH BEFORE FLUSH, because a flush only writes back frames it can
+    // FIND. SubmitFlushRanges does `Find(pn); if (p == nullptr) continue;`
+    // and then returns early on n == 0 -- so publishing a page this block
+    // does not have resident is a SILENT NO-OP. That is what this kernel was
+    // doing: every generational put was dropped before it was built, the
+    // readers' `Fetch(gen)` waited out its 10s timeout against a blob still
+    // at generation 0, and the whole exchange looked like a broken
+    // generational protocol. Tracing put/stamp showed the readers demanding
+    // gen 1 over both the LOCAL and REMOTE branches and NOT ONE put being
+    // issued by anybody.
+    //
+    // Fetch is the pinner, so this both makes the page resident and holds it
+    // across the writeback. The unpin comes AFTER EndFlush below -- eviction
+    // performs no I/O, so a frame released between the flush and its
+    // completion can be dropped with the bytes still only in it.
+    co_await x.Fetch(0, e0, e1 - e0);
+    co_await v.Fetch(0, e0, e1 - e0);
     co_await x.BeginFlush(gen, e0, e1 - e0);
     co_await v.BeginFlush(gen, e0, e1 - e0);
   }
   co_await x.EndFlush();
   co_await v.EndFlush();
+  // ONLY NOW. The pins taken above are released after the writeback has
+  // LANDED; releasing them inside the loop would let a peer reclaim a frame
+  // whose bytes are still in flight.
+  for (u64 pg = sl.pg_lo + block; pg < sl.pg_hi; pg += nblocks) {
+    const u64 e0 = (pg * epp > sl.lo) ? pg * epp : sl.lo;
+    const u64 e1 = ((pg + 1) * epp < sl.hi) ? (pg + 1) * epp : sl.hi;
+    if (e1 <= e0) continue;
+    x.UnpinRange(e0, e1 - e0);
+    v.UnpinRange(e0, e1 - e0);
+  }
 }
 
 __global__ MD_LAUNCH_BOUNDS void PublishSlabKernel(
@@ -1889,52 +2017,6 @@ __global__ MD_LAUNCH_BOUNDS void PublishSlabKernel(
   __syncthreads();
   CLIO_YCORO_RUN(PublishSlabCoro(x, v, nb, cap, z0, z1, gen, nblocks,
                                  yv.Block()));
-}
-
-/**
- * REFRESH THE HALO, naming the generation.
- *
- * The two planes this node reads but does not own: the one below z0 and the
- * one at z1, both wrapped. A GENERATIONAL fetch is the whole mechanism --
- * a resident copy at an older generation is refused and refetched, and the
- * get is not served until the writer's put of THAT generation has landed. So
- * there is no barrier here and none is wanted: the generation is the barrier.
- */
-__device__ gy::YCoroMain HaloCoro(gv::DeviceVector<float> x,
-                                  gv::DeviceVector<float> v, u32 nb, u32 cap,
-                                  u32 z0, u32 z1, u64 gen, u32 nblocks,
-                                  u32 block) {
-  const u64 plane = static_cast<u64>(nb) * nb * cap * kStride;  // one z-plane
-  const u32 below = (z0 + nb - 1u) % nb;
-  const u32 above = z1 % nb;
-  const u32 planes[2] = {below, above};
-  for (u32 i = 0; i < 2; ++i) {
-    if (nb == 0) break;
-    const u64 lo = static_cast<u64>(planes[i]) * plane;
-    // Whole planes, in page-sized bites: one fetch of a whole plane can name
-    // more pages than a task carries.
-    const u64 epp = x.ElemsPerPage();
-    for (u64 off = lo + block * epp; off < lo + plane; off += nblocks * epp) {
-      const u64 cnt = (off + epp < lo + plane) ? epp : (lo + plane - off);
-      co_await x.Fetch(gen, off, cnt);
-      x.UnpinRange(off, cnt);
-      co_await v.Fetch(gen, off, cnt);
-      v.UnpinRange(off, cnt);
-    }
-  }
-}
-
-__global__ MD_LAUNCH_BOUNDS void HaloKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<float> x,
-                           gv::DeviceVector<float> v, u32 nb, u32 cap, u32 z0,
-                           u32 z1, u64 gen, u32 nblocks,
-                           gy::YieldableView<> yv, gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  x.Init(yv.Block());
-  v.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(HaloCoro(x, v, nb, cap, z0, z1, gen, nblocks, yv.Block()));
 }
 
 __global__ MD_LAUNCH_BOUNDS void ThermoKernel(clio::run::IpcManagerGpuInfo info,
@@ -1955,7 +2037,8 @@ __global__ MD_LAUNCH_BOUNDS void ForceKernel(clio::run::IpcManagerGpuInfo info,
                             gv::DeviceVector<float> x,
                             gv::DeviceVector<float> f, u32 nb, u32 cap,
                             float box, float cutoff, int eflag, double *acc,
-                            u32 z0, u32 z1, u32 nblocks, gy::YieldableView<> yv,
+                            u32 z0, u32 z1, u32 nblocks, u64 hgen,
+                            bool force_all, gy::YieldableView<> yv,
                             gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.Init(yv.Block());
@@ -1963,7 +2046,7 @@ __global__ MD_LAUNCH_BOUNDS void ForceKernel(clio::run::IpcManagerGpuInfo info,
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(ForceCoro(x, f, nb, cap, box, cutoff, eflag, acc, z0, z1, nblocks,
-                           yv.Block()));
+                           yv.Block(), hgen, force_all));
 }
 
 __global__ MD_LAUNCH_BOUNDS void BuildListKernel(clio::run::IpcManagerGpuInfo info,
@@ -1971,7 +2054,7 @@ __global__ MD_LAUNCH_BOUNDS void BuildListKernel(clio::run::IpcManagerGpuInfo in
                                 gv::DeviceVector<int> nl, u32 nb, u32 cap,
                                 float box, float rlist, u32 maxneigh,
                                 u32 *d_cnt, int *d_err, u32 rowchunk,
-                                u32 z0, u32 z1, u32 nblocks,
+                                u32 z0, u32 z1, u32 nblocks, u64 hgen,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -1981,7 +2064,7 @@ __global__ MD_LAUNCH_BOUNDS void BuildListKernel(clio::run::IpcManagerGpuInfo in
   __syncthreads();
   CLIO_YCORO_RUN(BuildListCoro(x, nl, nb, cap, box, rlist, maxneigh, d_cnt,
                                d_err, rowchunk, z0, z1, nblocks,
-                               yv.Block()));
+                               yv.Block(), hgen));
 }
 
 __global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo info,
@@ -1991,7 +2074,7 @@ __global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo in
                                 float box, float cutoff, u32 maxneigh,
                                 const u32 *d_cnt, int eflag, double *acc,
                                 int nocompute, u32 rowchunk, u32 z0, u32 z1, u32 nblocks,
-                                gy::YieldableView<> yv,
+                                u64 hgen, bool force_all, gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.Init(yv.Block());
@@ -2001,22 +2084,30 @@ __global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo in
   __syncthreads();
   CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
                                d_cnt, eflag, acc, nocompute, rowchunk,
-                               z0, z1, nblocks, yv.Block()));
+                               z0, z1, nblocks, yv.Block(), hgen, force_all));
 }
 
-__global__ MD_LAUNCH_BOUNDS void RebinKernel(clio::run::IpcManagerGpuInfo info,
-                            gv::DeviceVector<float> x, u32 nb, u32 cap,
-                            float box, u32 *bincnt, u32 *d_dest, int *d_err,
-                            u32 z0, u32 z1, u32 nblocks,
-                            gy::YieldableView<> yv,
-                            gy::YieldStackView ys) {
+__global__ MD_LAUNCH_BOUNDS void RebinWrapKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u32 nb,
+    u32 cap, float box, u32 z0, u32 z1, u32 nblocks, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(RebinCoro(x, nb, cap, box, bincnt, d_dest, d_err, z0, z1,
-                           nblocks,
-                           yv.Block()));
+  CLIO_YCORO_RUN(RebinWrapCoro(x, nb, cap, box, z0, z1, nblocks, yv.Block()));
+}
+
+__global__ MD_LAUNCH_BOUNDS void RebinAssignKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u32 nb,
+    u32 cap, float box, u32 *bincnt, u32 *d_dest, int *d_err, u32 z0, u32 z1,
+    u32 nblocks, u64 hgen, gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RebinAssignCoro(x, nb, cap, box, bincnt, d_dest, d_err, z0,
+                                 z1, nblocks, yv.Block(), hgen));
 }
 
 __global__ MD_LAUNCH_BOUNDS void GatherKernel(clio::run::IpcManagerGpuInfo info,
@@ -2024,7 +2115,7 @@ __global__ MD_LAUNCH_BOUNDS void GatherKernel(clio::run::IpcManagerGpuInfo info,
                               gv::DeviceVector<float> srcx,
                               gv::DeviceVector<float> dst, u32 nb, u32 cap,
                               const u32 *d_dest, int keep_w, u32 z0, u32 z1,
-                              u32 nblocks,
+                              u32 nblocks, u64 hgen,
                               gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   src.Init(yv.Block());
@@ -2033,7 +2124,7 @@ __global__ MD_LAUNCH_BOUNDS void GatherKernel(clio::run::IpcManagerGpuInfo info,
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(GatherCoro(src, srcx, dst, nb, cap, d_dest, keep_w, z0, z1,
-                            nblocks, yv.Block()));
+                            nblocks, yv.Block(), hgen));
 }
 
 __global__ MD_LAUNCH_BOUNDS void SentinelKernel(clio::run::IpcManagerGpuInfo info,
@@ -2805,6 +2896,14 @@ int main(int argc, char **argv) {
   // Bumped once per drift step; both sides of the exchange agree on it
   // because both derive it from the step count, not from each other.
   u64 halo_gen = 0;
+  // MD_NO_HALO=1 is the unsynchronised control: no publish, and the force
+  // pass demands generation 0, i.e. accepts whatever copy of a neighbour's
+  // plane it happens to be holding. It must produce a MEASURABLY WORSE answer
+  // than the exchange; when it did not, that was the bug.
+  const bool no_halo = EnvOn("MD_NO_HALO");
+  // DIAGNOSTIC: force every force-pass fetch to name this generation.
+  const char *fg = std::getenv("MD_FORCE_GEN");
+  const u64 force_gen = fg ? std::strtoull(fg, nullptr, 10) : 0;
   clio::cte::core::TagId red_tag{};
   u64 red_round = 0;
 
@@ -2912,8 +3011,35 @@ int main(int argc, char **argv) {
   account("v", vslots, page_bytes, npages, md_cap);
   vx.EnableStats();
   vv.EnableStats();
-  vx.Preload(hx.data(), g.nelems);
-  vv.Preload(hv.data(), g.nelems);
+  // ONE WRITER FOR THE INITIAL DECK, AND A BARRIER BEHIND IT.
+  //
+  // Preload writes the host deck into the BLOBS, and in decomposed mode every
+  // node shares one tag namespace -- so every node was laying the whole
+  // lattice down on top of every other node's. node2 starts GVMB_START_DELAY
+  // seconds late, by which time node1 may already have run its statics pass
+  // and resorted; node2's preload then overwrote the wrapped positions node1
+  // had just computed. Intermittent, and both nodes agree on the wrong answer
+  // afterwards because they read the same clobbered store -- which is exactly
+  // what `RESORT GATE: FAIL (rel=4.14e-03)` was, with the halo exchange
+  // playing no part in it.
+  //
+  // Node 0 lays the deck down; everyone waits for it and faults it in. The
+  // reduction doubles as the barrier: it does not return until every node has
+  // published its contribution for the round.
+  if (a.nodes > 1) {
+    if (a.node == 0) {
+      vx.Preload(hx.data(), g.nelems);
+      vv.Preload(hv.data(), g.nelems);
+    }
+    double ready = 1.0;
+    if (!ReduceSum(*cte_red, red_tag, a.node, a.nodes, red_round++, &ready, 1)) {
+      std::fprintf(stderr, "  deck barrier failed\n");
+      return 1;
+    }
+  } else {
+    vx.Preload(hx.data(), g.nelems);
+    vv.Preload(hv.data(), g.nelems);
+  }
   vx.ClearCache();
   vv.ClearCache();
   vx.Prefetch(0, npages, 0, tbl_blocks);
@@ -2922,7 +3048,7 @@ int main(int argc, char **argv) {
   auto dv = vv.GetDevice(0);
 
   // MD_THIRD=1 gives the ballistic path a third, read-only paged vector.
-  const int use_third = std::getenv("MD_THIRD") != nullptr ? 1 : 0;
+  const int use_third = EnvOn("MD_THIRD") ? 1 : 0;
   const u32 third_slots = use_third ? SharedSlots(npages, nsets) : 1u;
   gv::Vector<float> vthird(tag("md_third"), {0}, page_bytes, tbl_blocks,
                            third_slots,
@@ -2958,7 +3084,7 @@ int main(int argc, char **argv) {
     cudaMemcpyToSymbol(g_read_bad, z4, sizeof(z4));
     const unsigned long long z8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     cudaMemcpyToSymbol(g_read_sample, z8, sizeof(z8));
-    const bool ldcg = getenv("MD_PROBE_LDCG") != nullptr;
+    const bool ldcg = EnvOn("MD_PROBE_LDCG");
     cudaMemcpyToSymbol(kProbeLdcg, &ldcg, sizeof(ldcg));
     const unsigned long long epp_host = g.nelems / npages;
     const clio::run::u64 audit_before = 0;  // frame audit removed with the debug accessors
@@ -3193,8 +3319,8 @@ int main(int argc, char **argv) {
 
     // MD_NOCOMPUTE=1 keeps every hold and skips the pair loop: the
     // difference against a normal run IS the hold cost.
-    const int nocompute = std::getenv("MD_NOCOMPUTE") != nullptr ? 1 : 0;
-    const bool trace = std::getenv("MD_TRACE") != nullptr;
+    const int nocompute = EnvOn("MD_NOCOMPUTE") ? 1 : 0;
+    const bool trace = EnvOn("MD_TRACE");
     double acc[3] = {0, 0, 0};
     double t_force_kern = 0.0, t_ckpt = 0.0, t_ckpt_stock = 0.0;
     u64 n_ckpt = 0;
@@ -3212,7 +3338,8 @@ int main(int argc, char **argv) {
                      gy::YieldStackView sv) {
         BuildListKernel<<<gr, b, smem_force>>>(
             gpu, dx, dn, g.nb, g.cap, fbox, frlist, a.maxneigh, d_cnt,
-            d_err, a.rowchunk, my_z0, my_z1, a.blocks, vw, sv);
+            d_err, a.rowchunk, my_z0, my_z1, a.blocks,
+            no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       int err = 0;
@@ -3237,7 +3364,9 @@ int main(int argc, char **argv) {
                        gy::YieldStackView sv) {
           ListForceKernel<<<gr, b, smem_force>>>(
               gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
-              eflag, d_acc, nocompute, a.rowchunk, my_z0, my_z1, a.blocks, vw, sv);
+              eflag, d_acc, nocompute, a.rowchunk, my_z0, my_z1, a.blocks,
+              force_gen ? force_gen : (no_halo ? 0 : halo_gen),
+              force_gen != 0, vw, sv);
         });
       } else {
         MdMark("Force");
@@ -3245,7 +3374,10 @@ int main(int argc, char **argv) {
                        gy::YieldStackView sv) {
           ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
                                              fcut, eflag, d_acc, my_z0, my_z1,
-                                             a.blocks, vw, sv);
+                                             a.blocks,
+                                             force_gen ? force_gen
+                                                       : (no_halo ? 0 : halo_gen),
+                                             force_gen != 0, vw, sv);
         });
       }
       ctp::GpuApi::Synchronize();
@@ -3273,7 +3405,58 @@ int main(int argc, char **argv) {
     // the intermittent out-of-core error, the hazard is a refetch racing an
     // in-flight writeback (read-after-write through the store).
     const bool flush_after_kick =
-        std::getenv("MD_FLUSH_AFTER_KICK") != nullptr;
+        EnvOn("MD_FLUSH_AFTER_KICK");
+    // PUBLISH THIS SLAB AS THE NEXT GENERATION.
+    //
+    // EVERY WRITE THIS NODE MAKES NEEDS ONE OF THESE BEFORE A PEER READS IT,
+    // not just the integrator's. It used to live inside kick(drift=1) only,
+    // so the RESORT -- which rewrites this slab's positions wholesale -- was
+    // followed by a force() that read the neighbours' planes straight out of
+    // the local cache, still holding their PRE-RESORT contents. That is the
+    // intermittent `RESORT GATE: FAIL (rel=5.44e-03)`: same characteristic
+    // value every time, because it is one specific region going stale, and
+    // independent of MD_NO_HALO because the resort never had an exchange at
+    // all.
+    //
+    // NO SEPARATE HALO KERNEL. A prefetch that unpins on the spot holds
+    // nothing for the consumer; the version demand lives on the read that
+    // consumes the data (ForceCoro/ListForceCoro), which is the only place
+    // that can order anything.
+    auto exchange = [&]() {
+      if (a.nodes <= 1 || no_halo) return;
+      ++halo_gen;
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
+            vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      // AND WAIT FOR EVERY PEER'S PUBLISH BEFORE ANYONE DEMANDS IT.
+      //
+      // The design here was "no barrier -- the generation IS the barrier",
+      // i.e. a generational get is not served until the writer's put of that
+      // generation lands. It does not behave that way: a demand that arrives
+      // first comes back with an ERROR rather than waiting, and both nodes
+      // hit it on the very first exchange --
+      //   DEVICE FATAL 7 ... a1=16 a2=2 a3=1   (node1 wants node2's page 16)
+      //   DEVICE FATAL 7 ... a1=0  a2=2 a3=1   (node2 wants node1's page 0)
+      // Before PublishFetch was fixed to refuse a failed get, that same event
+      // was SILENT -- the empty frames were published as valid -- and it is
+      // what the intermittent `RESORT GATE: FAIL (-591522.357...)` actually
+      // was.
+      //
+      // So the barrier is explicit until a generational get genuinely blocks
+      // on the writer. It is one all-reduce per exchange, and it is what makes
+      // the demand that follows always satisfiable.
+      double published = 1.0;
+      if (!ReduceSum(*cte_red, red_tag, a.node, a.nodes, red_round++,
+                     &published, 1)) {
+        std::fprintf(stderr, "  exchange barrier failed\n");
+        std::fflush(stderr);
+        std::_Exit(1);
+      }
+    };
     auto kick = [&](int drift) {
       if (trace) { std::fprintf(stderr, "[md] kick drift=%d\n", drift);
                    std::fflush(stderr); }
@@ -3292,24 +3475,7 @@ int main(int argc, char **argv) {
       // MD_NO_HALO=1 skips the exchange, which must MEASURABLY DEGRADE the
       // run. A distributed gate that passes either way is not testing the
       // exchange, and this is the cheapest way to know which one it is.
-      static const bool no_halo = std::getenv("MD_NO_HALO") != nullptr;
-      if (a.nodes > 1 && drift && !no_halo) {
-        ++halo_gen;
-        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                       gy::YieldStackView sv) {
-          PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
-              vw, sv);
-        });
-        ctp::GpuApi::Synchronize();
-        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                       gy::YieldStackView sv) {
-          HaloKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
-              vw, sv);
-        });
-        ctp::GpuApi::Synchronize();
-      }
+      if (drift) exchange();
       t_kick += NowMs() - _t;
     };
     auto thermo_ke = [&]() -> double {
@@ -3350,14 +3516,38 @@ int main(int argc, char **argv) {
       vx2.ClearCache();
       vv2.ClearCache();
       ctp::GpuApi::Memset(d_bincnt, 0, g.nbins * sizeof(u32));
+      // ~0u IS "NO DESTINATION", AND d_dest WAS NEVER CLEARED.
+      //
+      // RebinKernel fills only the slots of THIS node's slab, but GatherCoro
+      // reads d_dest for every source slot in its stencil -- which reaches one
+      // plane past the slab in y and z. Those entries were whatever the
+      // PREVIOUS resort left there (uninitialised on the first), so the gather
+      // scattered atoms according to stale destinations: duplicates at
+      // overlapping positions, LJ repulsion, and KE climbing 2634 -> 17984
+      // over 200 steps. Clearing makes an unwritten entry mean what the
+      // scatter already tests for -- `dest == ~0u` -> skip.
+      ctp::GpuApi::Memset(d_dest, 0xFF, g.nslots * sizeof(u32));
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       const float fbox2 = static_cast<float>(g.box);
       MdMark("Rebin");
+      // WRAP, PUBLISH, THEN ASSIGN. The assign pass reads a neighbour's
+      // positions to decide whether an atom is arriving in one of this node's
+      // bins, and it must read them ALREADY WRAPPED -- otherwise the two
+      // nodes bin the same atom differently. exchange() both publishes the
+      // wrap as the next generation and barriers behind it, which is exactly
+      // the ordering the assign pass then demands with that generation.
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        RebinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+        RebinWrapKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu, dx, g.nb, g.cap, fbox2, my_z0, my_z1, a.blocks, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      exchange();
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        RebinAssignKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, g.nb, g.cap, fbox2, d_bincnt, d_dest, d_err,
-            my_z0, my_z1, a.blocks, vw, sv);
+            my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       int err = 0;
@@ -3392,7 +3582,7 @@ int main(int argc, char **argv) {
                      gy::YieldStackView sv) {
         GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dx, dx2, g.nb, g.cap, d_dest, /*keep_w=*/1,
-            my_z0, my_z1, a.blocks, vw, sv);
+            my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       MdMark("Gather-v");
       MdMark("Gather-x");
@@ -3400,7 +3590,7 @@ int main(int argc, char **argv) {
                      gy::YieldStackView sv) {
         GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dv, dx, dv2, g.nb, g.cap, d_dest, /*keep_w=*/0,
-            my_z0, my_z1, a.blocks, vw, sv);
+            my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       // INVALIDATE. Per-block caches have no cross-block coherence: after the
@@ -3419,7 +3609,7 @@ int main(int argc, char **argv) {
     };
 
     {
-      const u32 pub = (std::getenv("MD_NO_PUBLISH") != nullptr) ? 0u : 1u;
+      const u32 pub = (EnvOn("MD_NO_PUBLISH")) ? 0u : 1u;
       cudaMemcpyToSymbol(g_publish, &pub, sizeof(pub));
       if (pub == 0u) {
         std::printf("  [MD_NO_PUBLISH] publishing DISABLED -- physics is "
@@ -3489,6 +3679,9 @@ int main(int argc, char **argv) {
     if (a.rebin != 0) {
       const double pe_before = acc[0];
       if (!resort()) return 1;
+      // The resort rewrote this slab; a peer's force must not read the old
+      // copy of it, and this node's must not read the peer's old copy.
+      exchange();
       if (a.use_list && !build_list()) return 1;
       force(/*eflag=*/1);
       resort_rel = std::fabs(acc[0] - pe_before) / std::fabs(pe_before);
@@ -3513,10 +3706,11 @@ int main(int argc, char **argv) {
         // resort that runs mid-flight: same physical state, new layout, so PE
         // must be unchanged. Off by default -- it costs two extra force
         // evaluations per resort.
-        const bool rchk = std::getenv("MD_RESORT_CHECK") != nullptr;
+        const bool rchk = EnvOn("MD_RESORT_CHECK");
         double pe_b = 0.0, pr_b = 0.0;
         if (rchk) { force(/*eflag=*/1); pe_b = acc[0]; pr_b = acc[2]; }
         if (!resort()) return 1;
+        exchange();
         if (a.use_list && !build_list()) return 1;
         if (rchk) {
           force(/*eflag=*/1);
@@ -3556,11 +3750,23 @@ int main(int argc, char **argv) {
     const bool res_ok = (sfx.evicts == 0 && sff.evicts == 0);
     std::printf(
         "  NVE %llu steps: E0=%.6f En=%.6f drift=%.2e | KE %.3f -> %.3f\n"
-        "  paging: x faults=%llu evicts=%llu | f faults=%llu evicts=%llu  "
+        "  paging: x faults=%llu evicts=%llu | f faults=%llu evicts=%llu | "
+        "x puts=%llu get_errors=%llu put_errors=%llu | "
+        "gen: resident_ok=%llu refetch=%llu busy=%llu flush_dropped=%llu  "
         "%s\n",
         (unsigned long long)a.steps, e0, e_n, e_drift, ke0, ke_n,
         (unsigned long long)sfx.faults, (unsigned long long)sfx.evicts,
         (unsigned long long)sff.faults, (unsigned long long)sff.evicts,
+        // A GENERATIONAL GET THAT WAS NEVER SERVED MUST SHOW UP HERE. If the
+        // frames come back empty and this stays 0, the failure is silent and
+        // PublishFetch declared unfetched bytes valid.
+        (unsigned long long)sfx.puts,
+        (unsigned long long)sfx.get_errors,
+        (unsigned long long)sfx.put_errors,
+        (unsigned long long)sfx.gen_ok,
+        (unsigned long long)sfx.gen_stale,
+        (unsigned long long)sfx.gen_busy,
+        (unsigned long long)sfx.flush_skipped,
         expect_resident
             ? (res_ok ? "[resident contract HELD: no evictions]"
                       : "[RESIDENT CONTRACT VIOLATED: evicted]")
@@ -3635,7 +3841,7 @@ int main(int argc, char **argv) {
     std::printf("  phases (total ms): force=%.1f (gpu %.1f) kick=%.1f "
                 "resort=%.1f build=%.1f\n", t_force, t_force_kern, t_kick,
                 t_resort, t_build);
-    if (std::getenv("MD_PROF") != nullptr) {
+    if (EnvOn("MD_PROF")) {
       unsigned long long c[8] = {0};
       cudaMemcpyFromSymbol(c, g_md_cyc, sizeof(c));
       int khz = 0;
