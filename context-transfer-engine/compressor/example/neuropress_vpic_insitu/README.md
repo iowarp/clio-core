@@ -114,12 +114,41 @@ in the `[np-path]` trace, zero host fallbacks, and with `--verify` off there is
 no device-to-host copy on the path at all. The `--verify` digest is taken from
 a separate D2H copy of the *source* and is instrumentation, not the path.
 
-| check | result |
-|---|---|
-| in-process verify, 126³ | 256 / 256 bit-exact |
-| cold read (`read.sh`, `CLIO_RESTART=1`, tier is the only copy) | 256 / 256 bit-exact |
-| `crosscheck.sh` — in-situ blobs vs the deck's own `.f32` dump, same run | **32 / 32 byte-identical**, 0 differ |
-| device residency | 256 / 256 `device=1`, 0 host fallbacks |
+| check | how | result |
+|---|---|---|
+| in-process verify, 126³ | FNV-1a-64 of the decompressed bytes vs the digest of what was staged | 256 / 256 |
+| cold read (`read.sh`, `CLIO_RESTART=1`, tier is the only copy) | same digest, separate process | 256 / 256 |
+| `crosscheck.sh` — in-situ blobs vs the deck's own `.f32` dump, same run | digest of the file vs digest of the blob | **32 / 32 identical** |
+| **literal byte comparison** | `cmp` on files, see below | **32 / 32 identical**, 0 differ |
+| device residency | `[np-path]` trace | 256 / 256 `device=1`, 0 host fallbacks |
+
+### The byte-for-byte check
+
+The digests above are a 64-bit hash. To compare the actual bytes, run the
+adapter with `CLIO_VPIC_RAW_DIR` (it writes every staged chunk to a file), then
+cold-read with `--dump-decompressed` and compare the two directories:
+
+```bash
+VPIC_DUMP_FIELDS=1 VPIC_DUMP_INT=25 VPIC_DUMP_DIR=$W/dump \
+CLIO_VPIC_RAW_DIR=$W/raw ./run.sh --ncell 30 --steps 50 --int 25 --verify --store $W/store
+
+env CLIO_SERVER_CONF=$W/store/compose.yaml CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
+    CLIO_REPLAY_COMPRESSOR_POOL=512.0 \
+    <build>/bin/neuropress_field_replay --readback $W/store/blobs.csv \
+        --tag vpic_insitu --dump-decompressed $W/dec
+
+for f in $W/dec/*.bin; do cmp "$f" "$W/raw/$(basename $f)" || echo "DIFFER $f"; done
+```
+
+Measured at 30³ (4 MiB, 32 chunks of 128 KiB, codecs `nvcomp-ans` ×18,
+`brotli` ×6 raw, `nvcomp-bitcomp` ×4, `nvcomp-zstd` ×4):
+
+* decompressed vs the exact bytes staged to the GPU — **32 / 32 identical**
+* decompressed vs the deck's own `.f32` files — **32 / 32 identical**
+* md5 over both sets: `dc4287f264b551420fe07b7ac6ee98f4`
+
+The 126³ figures above are digest-verified; the literal comparison was run at
+30³ because it needs both file sets on disk.
 
 The two diagnostic residuals (`div_b_err`, `div_e_err`) reach 450×; `rhob`/`rhof`
 about 2.3×; the twelve E, B, J and TCA fields sit at 1.00–1.14×, which is why
