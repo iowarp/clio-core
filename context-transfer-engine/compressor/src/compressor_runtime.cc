@@ -1396,7 +1396,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         "4 primary  %s ran lib=%d (%s) -- MEASURED ratio=%.2f ct=%.3f ms "
         "(vs PREDICTED ratio=%.2f ct=%.3f ms) rc=%d",
         NpWhere(chunk_data), context.compress_lib_,
-        ctp::CompressionFactory::NameForWireId(context.compress_lib_).c_str(),
+        // lib 0 is "stored raw, no codec kept", NOT a codec. NameForWireId(0)
+        // answers "brotli", so printing it unguarded reported a codec that
+        // never ran -- on a LAMMPS host-resident run, where every refused
+        // chunk lands here, that was the whole log.
+        context.compress_lib_ == 0
+            ? "STORED RAW"
+            : ctp::CompressionFactory::NameForWireId(context.compress_lib_).c_str(),
         context.actual_compression_ratio_, context.actual_compress_time_ms_,
         stats.empty() ? -1.0 : stats.front().compression_ratio_,
         stats.empty() ? -1.0 : stats.front().compress_time_ms_,
