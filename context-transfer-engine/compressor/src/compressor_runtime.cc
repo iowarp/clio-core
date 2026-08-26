@@ -3659,10 +3659,63 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           }
         } else {
           // The blob records a shuffle, the inverse is CUDA-only, and the
-          // destination is host memory. Returning the buffer unshuffled would
-          // hand back data that is the right length and the wrong values.
-          RefuseHostPreprocess("byte unshuffle", decompressed_size);
-          success = false;
+          // codec wrote into HOST memory -- which is the ordinary case, not a
+          // corner one: every CPU consumer reads this way (the field-replay
+          // driver's --readback, the HDF5 VOL's host path, an in-situ
+          // adapter's own verify).
+          //
+          // Refusing here was a REGRESSION. Removing the CPU unshuffle made
+          // the write side stage host chunks up to the device (see
+          // CLIO_NEUROPRESS_STAGE_H2D and upstream's gpucompress_compress),
+          // but the read side was left refusing instead of doing the mirror
+          // image, so any blob written with a shuffle action became
+          // unreadable into host memory. Measured on Nyx 128^3 in situ: 73 of
+          // 120 lossless blobs failed to read back, and the same signature
+          // turned up on LAMMPS. A lossless codec that cannot return its own
+          // bytes is the worst failure this component has.
+          //
+          // So stage it: H2D, unshuffle with the same kernel the device path
+          // uses, D2H back into the caller's buffer. One round trip per
+          // chunk, paid only by a host consumer -- a device consumer takes
+          // the branch above and never copies.
+          char *stage = nullptr;
+          ctp::ipc::AllocatorId stage_alloc =
+              CLIO_IPC->AllocateAndRegisterGpuBackend(
+                  /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                  decompressed_size, &stage);
+          char *unshuf = nullptr;
+          ctp::ipc::AllocatorId unshuf_alloc;
+          if (!stage_alloc.IsNull()) {
+            unshuf_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+                /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+                decompressed_size, &unshuf);
+          }
+          if (stage_alloc.IsNull() || unshuf_alloc.IsNull()) {
+            HLOG(kError,
+                 "Decompress: could not allocate the {}-byte device scratch "
+                 "needed to unshuffle blob '{}' into host memory",
+                 decompressed_size, task->blob_name_.str());
+            success = false;
+          } else {
+            ctp::DeviceAwareMemcpy(stage, codec_dst, decompressed_size);
+            if (!ctp::compress::preprocess::ByteUnshuffleDevice(
+                    stage, unshuf, decompressed_size, stored_shuffle)) {
+              HLOG(kError,
+                   "Decompress: staged byte-unshuffle failed (elem={} "
+                   "size={}) -- the returned buffer would be shuffled "
+                   "garbage, failing instead",
+                   stored_shuffle, decompressed_size);
+              success = false;
+            } else {
+              ctp::DeviceAwareMemcpy(codec_dst, unshuf, decompressed_size);
+            }
+          }
+          if (!unshuf_alloc.IsNull()) {
+            CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, unshuf_alloc);
+          }
+          if (!stage_alloc.IsNull()) {
+            CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, stage_alloc);
+          }
         }
       }
 
@@ -4286,23 +4339,85 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
     return 5;
   }
 
-  // Invert the byte-shuffle before the caller sees the buffer. dst is a host
-  // buffer on this path (the interposer stages through SHM) and the inverse is
-  // CUDA-only, so this blob cannot be served here. Failing is the only safe
-  // outcome: returning shuffled bytes is silent corruption, since they are the
-  // right LENGTH.
+  // Invert the byte-shuffle and the quantization before the caller sees the
+  // buffer. dst is a host buffer on this path (the interposer stages through
+  // SHM) and both inverses are CUDA-only, so both stage through the device:
+  // H2D, run the same kernel the device path runs, D2H back.
+  //
+  // These two REFUSED until this change, which made every shuffled or
+  // quantized blob unreadable through the segmented-read path -- the same
+  // regression the whole-blob reader had, from the same cause (removing the
+  // CPU transforms without giving the read side the H2D staging the write
+  // side got). Returning the bytes untransformed is not an option: they are
+  // the right LENGTH and the wrong VALUES, which is silent corruption.
   if (stored_shuffle != 0) {
-    RefuseHostPreprocess("byte unshuffle", decompressed);
-    return 5;
+    char *up = nullptr, *uo = nullptr;
+    ctp::ipc::AllocatorId up_alloc, uo_alloc;
+    up_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+        /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+        decompressed, &up);
+    if (!up_alloc.IsNull()) {
+      uo_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          decompressed, &uo);
+    }
+    bool ok = !up_alloc.IsNull() && !uo_alloc.IsNull();
+    if (ok) {
+      ctp::DeviceAwareMemcpy(up, codec_dst, decompressed);
+      ok = ctp::compress::preprocess::ByteUnshuffleDevice(up, uo, decompressed,
+                                                          stored_shuffle);
+      if (ok) ctp::DeviceAwareMemcpy(codec_dst, uo, decompressed);
+    }
+    if (!uo_alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, uo_alloc);
+    if (!up_alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, up_alloc);
+    if (!ok) {
+      HLOG(kError,
+           "DecompressStored: staged byte-unshuffle failed (elem={} size={})",
+           stored_shuffle, decompressed);
+      return 5;
+    }
   }
 
-  // Dequantize LAST, inverting quantize-then-shuffle. CUDA-only, and this
-  // path's destination is host SHM, so a quantized blob cannot be served
-  // here either -- returning the packed integers would be corruption of
-  // exactly the kind the shuffle check above refuses.
+  // Dequantize LAST, inverting quantize-then-shuffle. DequantizeDevice writes
+  // its floats from a CUDA kernel, so the destination must be device memory
+  // and the result is copied back into the caller's host buffer.
   if (stored_quant) {
-    RefuseHostPreprocess("dequantization", decompressed);
-    return 5;
+    char *qin = nullptr, *qout = nullptr;
+    ctp::ipc::AllocatorId qin_alloc, qout_alloc;
+    qin_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+        /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+        quant_bytes, &qin);
+    if (!qin_alloc.IsNull()) {
+      qout_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
+          header->original_size_, &qout);
+    }
+    bool ok = !qin_alloc.IsNull() && !qout_alloc.IsNull();
+    if (ok) {
+      ctp::DeviceAwareMemcpy(qin, codec_dst, quant_bytes);
+      // Rebuild the writer's parameters from the header extension, the same
+      // four fields Runtime::Decompress reads.
+      ctp::compress::preprocess::DeviceQuantizeParams qp;
+      qp.effective_error_bound = stored_ext.error_bound;
+      qp.scale = stored_ext.scale;
+      qp.data_min = stored_ext.data_min;
+      qp.data_max = stored_ext.data_max;
+      qp.precision = UnpackQuantPrecision(header->compress_preset_);
+      ok = ctp::compress::preprocess::DequantizeDevice(qin, quant_elems, qp,
+                                                       qout);
+      if (ok) {
+        ctp::DeviceAwareMemcpy(dst, qout, header->original_size_);
+        decompressed = header->original_size_;
+      }
+    }
+    if (!qout_alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, qout_alloc);
+    if (!qin_alloc.IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, qin_alloc);
+    if (!ok) {
+      HLOG(kError,
+           "DecompressStored: staged dequantization failed (elems={})",
+           quant_elems);
+      return 5;
+    }
   }
 
   *out_size = decompressed;
