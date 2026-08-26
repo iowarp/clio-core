@@ -70,6 +70,16 @@ with ./build_deck.sh --insitu (without it the deck writes files instead)." >&2
 if [ "$RANKS" -lt 1 ]; then echo "--ranks must be >= 1" >&2; exit 2; fi
 if [ "$RANKS" -gt 1 ]; then
   command -v mpirun >/dev/null || { echo "--ranks needs mpirun on PATH" >&2; exit 1; }
+  # VPIC decomposes along x by nproc() and refuses a grid its topology does not
+  # divide (grid/partition.cc: "Bad resolution for domain decomposition"). It
+  # says so from inside MPI_Init on every rank at once, which is a long way
+  # from the flag that caused it.
+  if [ $((NCELL % RANKS)) -ne 0 ]; then
+    echo "--ncell $NCELL is not divisible by --ranks $RANKS: VPIC splits the
+domain along x by nproc() and refuses a resolution its topology does not
+divide. Pick a grid that divides (e.g. 128 for 1/2/4/8 ranks, 124 for 4)." >&2
+    exit 2
+  fi
 fi
 
 # One runtime per rank means $RANKS ports -- and a runtime binds more than the

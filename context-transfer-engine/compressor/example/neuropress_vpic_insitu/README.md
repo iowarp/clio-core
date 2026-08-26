@@ -195,21 +195,34 @@ blob names are identical across ranks and the separate stores are what keep
 them apart. `clio_vpic_insitu_begin_mpi` takes rank and size from the deck's
 `rank()`/`nproc()`, not from the environment, so the two cannot disagree.
 
-Measured, 2 ranks, 126³ (each rank 63×126×126 cells + ghosts), 200 steps,
-8 frames, 256 chunks per rank:
+Measured, 200 steps, 8 frames, `--verify` and a cold read of every store:
 
-| | rank 0 | rank 1 |
+| | 2 ranks, 126³ | 4 ranks, 128³ |
 |---|---|---|
-| in | 545,259,520 B | 545,259,520 B |
-| stored | 427,422,268 B (1.276x) | 427,434,810 B (1.276x) |
-| verify, in process | 256 / 256 | 256 / 256 |
-| cold read, separate process | 256 / 256 | 256 / 256 |
-| device residency | 256 `device=1` | 256 `device=1` |
+| per rank | 63×126×126 cells + ghosts | 32×128×128 cells + ghosts |
+| in, per rank | 545,259,520 B | 294,195,200 B |
+| stored, per rank | 427,422,268 / 427,434,810 B (**1.276x**) | 213,230,133 / 213,216,672 / 213,228,682 / 213,221,707 B (**1.380x**) |
+| chunks per rank | 256 | 128 |
+| verify, in process | 256 / 256 both | **128 / 128 all four** |
+| cold read, separate process per store | 256 / 256 both | **128 / 128 all four** |
+| device residency | 256 `device=1` | **128 `device=1` each, 0 host** |
 
-At 30³ the two ranks share exactly 4 digests out of 32 — `div_b_err` and
-`div_e_err` at both frames, which are identically zero in either subdomain
-with divergence cleaning off. The other 28 differ, which is the check that the
-ranks really did hand over different data.
+The ranks carry the same 128 blob names and, at 4 ranks, exactly **16** of the
+(name, digest) pairs are identical across all four: `div_b_err` and
+`div_e_err` at each of the 8 frames, which are identically zero in every
+subdomain with divergence cleaning off. Every other blob differs, which is the
+check that the ranks really did hand over different data rather than four
+copies of one subdomain.
+
+The ratio rises with rank count (1.276x → 1.380x) because the subdomains are
+smaller: a 4 MiB chunk covers a larger fraction of a rank's field, and the
+near-zero regions concentrate.
+
+**VPIC decomposes along x by `nproc()` and refuses a grid its topology does not
+divide** — 126 works at 1 and 2 ranks but not at 4, and VPIC says so from
+inside `MPI_Init` on every rank at once (`grid/partition.cc`: "Bad resolution
+for domain decomposition"), a long way from the flag that caused it. `run.sh`
+now checks `ncell % ranks` first and says which values divide.
 
 Two things this found, both fixed here:
 
