@@ -128,6 +128,22 @@ def load_run(d):
     dt_sum = sum(t for _, t in dt_pairs)
     dt_bytes = sum(b for b, _ in dt_pairs)
 
+    # How many chunks actually EXPLORED. Threshold 0 does not mean all of
+    # them: the gate is `error_pct > threshold`, strict and upstream's own, so
+    # a chunk the model priced exactly right is skipped at every threshold.
+    # Under the ratio cost model that is the common case rather than the
+    # corner one -- cost is bytes/(min(ratio,100)*bw) alone, so any two ratios
+    # past the 100x cap price identically and the prediction is "exact" by
+    # arithmetic. A chunk that skipped exploration was compressed with the
+    # model's inference-time pick and never measured against an alternative,
+    # which is a different experiment from the one the run's name implies.
+    explored = 0
+    ex_p = os.path.join(d, "explore.csv")
+    if os.path.isfile(ex_p):
+        with open(ex_p, newline="") as fh:
+            explored = len({r["blob"] for r in csv.DictReader(fh)
+                            if r.get("role") == "primary"})
+
     # Best and worst COMPRESSION RATIO seen on any single chunk. The run-level
     # ratio below is the aggregate; these two are what it averages over.
     chunk_ratios = [int(r["bytes"]) / int(r["stored"])
@@ -210,6 +226,7 @@ def load_run(d):
         "decompress_MBps_max": round(dt_hi, 2),
         "ct_chunks": len(ct_pairs),
         "dt_chunks": len(dt_pairs),
+        "explored_chunks": explored,
         "chunk_ratio_min": round(cr_lo, 4),
         "chunk_ratio_median": round(cr_mid, 4),
         "chunk_ratio_max": round(cr_hi, 4),
@@ -307,6 +324,15 @@ def main():
         f"{len(runs)} run(s) across {len(by_wl)} workload(s). Exploration mode "
         f"throughout unless a run's `config` column says otherwise.",
         "",
+        "Exploration is REQUESTED on every chunk (threshold 0) but not taken "
+        "on every chunk: the gate is `error_pct > threshold`, strict, so a "
+        "chunk the model priced exactly right is skipped. That is rare under "
+        "the balance weights and usual under the ratio ones, where cost is "
+        "`bytes/(min(ratio,100)*bw)` alone and any two ratios past the 100x "
+        "cap price identically. The `explored` column below is the real "
+        "count; a skipped chunk was compressed with the model's inference-time "
+        "pick and never measured against an alternative.",
+        "",
         "Throughput is bytes over CODEC time (CUDA-event bracket around the "
         "codec call), not wall clock, and covers only the chunks that could be "
         "timed -- `ct_chunks` / `dt_chunks` in `summary.csv` say how many. A "
@@ -351,8 +377,8 @@ def main():
             "", f"### {title}: best and worst chunk", "",
             "| mode | cost model | bw GB/s | ratio min / med / max | "
             "cmp MB/s min / med / max | dcmp MB/s min / med / max | "
-            "cmp/dcmp chunks |",
-            "|---|---|---|---|---|---|---|",
+            "cmp/dcmp chunks | explored |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for r in sorted(rs_all, key=axes):
             lines.append(
@@ -365,7 +391,8 @@ def main():
                 f"{r['decompress_MBps_min']:.0f} / "
                 f"{r['decompress_MBps_median']:.0f} / "
                 f"{r['decompress_MBps_max']:.0f} | "
-                f"{r['ct_chunks']}/{r['dt_chunks']} of {r['chunks']} |")
+                f"{r['ct_chunks']}/{r['dt_chunks']} of {r['chunks']} | "
+                f"{r['explored_chunks']} of {r['chunks']} |")
 
         # Repeats, grouped. A single run per cell cannot be read on its own:
         # exploration adopts on MEASURED candidate times, so the winner flips

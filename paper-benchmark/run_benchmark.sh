@@ -39,9 +39,17 @@
 # ---------------------------------------------------------------------------
 # EXPLORATION MODE is the only selection policy used here, via the
 # explore-balance / explore-ratio configs each workload's run_config.sh
-# defines. K=3 (NeuroPress's own ranked window) and threshold 0 so every chunk
-# explores -- see the note in any run_config.sh for why the threshold is not
-# upstream's 0.5 for a comparison matrix.
+# defines. K=3 (NeuroPress's own ranked window) and threshold 0 -- see the note
+# in any run_config.sh for why the threshold is not upstream's 0.5 for a
+# comparison matrix.
+#
+# THRESHOLD 0 IS NOT FULL COVERAGE. The gate is strict (`error_pct >
+# threshold`, upstream's own), so a chunk the model priced exactly right never
+# explores. Under the RATIO cost model that is most of them -- cost collapses
+# to bytes/(min(ratio,100)*bw), and two ratios past the 100x cap price
+# identically -- so those runs are part exploration and part plain inference.
+# `explored` in summary.csv reports the split per run; do not read a
+# `explore-ratio` row as if every chunk had been measured.
 #
 # LOSSLESS vs LOSSY is CLIO_NEUROPRESS_ERROR_BOUND, passed as --eb. It is an
 # ABSOLUTE bound: |original - decoded| <= eb. 0 masks NeuroPress's 16 quantize

@@ -51,8 +51,19 @@ CHUNK=4194304 MAX_FILES=0 VERIFY=1 RESULTS="$HERE/results" TAG="" F64=0
 # varies with the cost model and bandwidth being compared, and (b) it varies
 # run to run on a non-bit-reproducible workload -- measured 16/45 then 33/45
 # on the same LAMMPS settings. Both make the 2x2 matrix less comparable.
-# At 0 every chunk explores, so every compressed chunk yields a measured
-# decompression time and the only variable left is the one under test.
+# At 0 nearly every chunk explores, so nearly every compressed chunk yields a
+# measured decompression time and the only variable left is the one under test.
+#
+# NEARLY, not every: the gate is `error_pct > threshold`, STRICT, and it is
+# upstream's own (gpucompress_compress.cpp:733). A chunk whose cost the model
+# predicted EXACTLY right has error_pct == 0 and does not explore at any
+# threshold, 0 included. That is rare under the balance weights and common
+# under the ratio ones, because ratio-only cost is bytes/(min(ratio,100)*bw)
+# and nothing else: once the predicted AND actual ratio both clear the 100x
+# cap the two costs are the same number, so the model is "exactly right" by
+# arithmetic rather than by accuracy. Measured on Nyx 128^3, explore-ratio:
+# 56 of 120 chunks lossless and 97 of 120 lossy never explored. Read
+# `explored` in summary.csv rather than assuming full coverage.
 # K stays at 3, NeuroPress's own ranked window.
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0 CHECK_BOUND=0
 while [ $# -gt 0 ]; do
