@@ -99,18 +99,31 @@ Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 ## Results
 
 Sedov blast, 128³, 21 frames, 1,008 MiB float32, 252 chunks, A100, lossless.
-All 252 blobs verified bit-exact in every configuration.
+All 252 blobs verified bit-exact in every configuration, in process and on a
+cold read from a separate process.
+
+Regenerated after `775dd9b4` fixed the dump: it had been writing the first
+`validbox().numPts()` elements of the GROWN FArrayBox — a mixture of valid and
+ghost cells — instead of the valid box. Every number in this section is from
+the corrected dump (each file is exactly 128³ × 4 B).
 
 | config | ratio | stored | density | rho_E | rho_e | xmom | ymom | zmom | Σ ms | wall |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **`static-zstd-s4`** | **156.1×** | 6.5 MiB | 206× | 168× | 170× | 146× | 125× | 143× | 739 | 31.8 s |
-| `best` | 135.6× | 7.4 MiB | 175× | 168× | 170× | 120× | 104× | 114× | 854 | 123.9 s |
-| `static-zstd-s8` | 135.1× | 7.5 MiB | 178× | 144× | 144× | 129× | 109× | 125× | 818 | 30.8 s |
-| `explore` | 131.0× | 7.7 MiB | 173× | 154× | 153× | 117× | 103× | 114× | 738 | 105.8 s |
-| `dynamic-ratio` | 79.5× | 12.7 MiB | 79× | 65× | 64× | 95× | 89× | 98× | 726 | 50.8 s |
-| `static-zstd` | 79.1× | 12.7 MiB | 67× | 59× | 59× | 109× | 104× | 116× | 766 | 16.8 s |
-| `dynamic` | 11.9× | 84.5 MiB | 11× | 6.5× | 7.6× | 20× | 21× | 30× | 287 | 77.2 s |
-| `learn` | 8.7× | 115.3 MiB | 6.4× | 5.3× | 4.6× | 25× | 25× | 24× | 190 | 106.8 s |
+| **`static-zstd-s4`** | **162.9×** | 6.2 MiB | 222× | 192× | 194× | 145× | 123× | 144× | 720 | 33.8 s |
+| `static-zstd-s8` | 141.2× | 7.1 MiB | 192× | 166× | 167× | 127× | 107× | 124× | 813 | 32.0 s |
+| `best` | 134.1× | 7.5 MiB | 139× | 192× | 184× | 118× | 103× | 115× | 628 | 111.9 s |
+| `static-zstd` | 132.6× | 7.6 MiB | 184× | 159× | 160× | 109× | 104× | 117× | 895 | 13.8 s |
+| `explore` | 126.9× | 7.9 MiB | 147× | 139× | 164× | 116× | 102× | 114× | 678 | 94.9 s |
+| `dynamic-ratio` | 75.3× | 13.4 MiB | 109× | 52× | 51× | 96× | 90× | 100× | 791 | 45.8 s |
+| `dynamic` | 23.7× | 42.6 MiB | 29× | 36× | 18× | 19× | 20× | 31× | 245 | 54.9 s |
+| `learn` | 20.8× | 48.4 MiB | 29× | 14× | 14× | 26× | 31× | 25× | 151 | 93.8 s |
+
+The mis-sliced data changed more than the magnitudes: `static-zstd` (no
+shuffle) moves from 79.1× to 132.6×, from below `dynamic-ratio` to above
+`explore`, and `dynamic`/`learn` roughly double. The ORDER of the top result is
+unchanged — a fixed zstd with the 4-byte stride still wins — but any statement
+about *how far* the others trail had to be re-derived, which is what the rest
+of this section does.
 
 ### The shuffle stride is the headline, and it flips with the element width
 
@@ -121,10 +134,14 @@ changes. (`gen_fields.sh` with a double build and `NYX_DUMP_NATIVE=1` emits
 
 | fixed nvcomp-zstd | Nyx float32 (1,008 MiB) | Nyx float64 (2,016 MiB) |
 |---|---|---|
-| no shuffle | 79.1× | 94.3× |
-| **4-byte** shuffle | **156.1×** | 104.4× |
-| **8-byte** shuffle | 135.1× | **110.8×** |
+| no shuffle | 132.6× | 94.3× |
+| **4-byte** shuffle | **162.9×** | 104.4× |
+| **8-byte** shuffle | 141.2× | **110.8×** |
 | best stride | **4** | **8** |
+
+(The float64 column was re-measured from the corrected dump too and came back
+unchanged to three digits — 94.321 / 104.406 / 110.804 — so only the float32
+column moved.)
 
 The preference flips with the width, on the same physics. The cross-workload
 comparison points the same way — LAMMPS float64 prefers 8 (1.198× against
@@ -148,22 +165,24 @@ shuffle at all** rather than to 4.
 ### The default cost model is badly wrong on this data
 
 `dynamic` — NeuroPress inference under the default balanced cost — reaches
-**11.9× where 156× was available**, a 13× miss, and `learn` is worse still at
-8.7×. The balanced objective charges compression time, so it picks the fast
-codecs (bitcomp ×126, ans ×66) on data whose whole value is in the slow
-entropy coders. Zeroing the two latency weights (`dynamic-ratio`) recovers
-79.5× immediately.
+**23.7× where 162.9× was available**, a 6.9× miss, and `learn` is worse still
+at 20.8×. The balanced objective charges compression time, so it picks the fast
+codecs (bitcomp ×168, ans ×26, cascaded ×20) on data whose whole value is in
+the slow entropy coders; `best` and `explore`, which do not, pick zstd for
+158–183 of the 252 chunks. Zeroing the two latency weights (`dynamic-ratio`)
+recovers 75.3× immediately — still less than a fixed zstd, because the
+ratio-only objective ranks on a predicted ratio that is itself wrong.
 
 This is the same failure mode as in the LAMMPS benchmark but far larger:
 there, inference reached 1.074× against 1.198× achievable (an 11% miss); here
-it forfeits an order of magnitude. Highly compressible data punishes a
+it forfeits most of an order of magnitude. Highly compressible data punishes a
 selector that optimises for speed.
 
 ### Exploration does not reach the fixed codec
 
-`explore` and `best` measure every alternative and still land at 131–136×,
-below a fixed zstd with the right stride (156×) that costs a third of the wall
-clock. Both facts have the same cause as in the LAMMPS run: the shuffle the
+`explore` and `best` measure every alternative and still land at 127–134×,
+below a fixed zstd with the right stride (162.9×) that costs a third of the
+wall clock — and below a fixed zstd with NO shuffle at all (132.6×). Both facts have the same cause as in the LAMMPS run: the shuffle the
 search can request is chosen per action from a space that pairs it with the
 codec, and the search is bounded by what the action space can express.
 
