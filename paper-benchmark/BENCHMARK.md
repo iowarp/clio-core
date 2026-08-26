@@ -144,11 +144,21 @@ fields and the sweep replays them.
 Step 0 is skipped deliberately: before the first field solve the array is
 identically zero, and a frame of pure zeros would dominate any averaged ratio.
 
-Two of the sixteen variables behave nothing like the rest — `div_e_err` and
-`div_b_err` are divergence-cleaning residuals, near zero almost everywhere, and
-reach ~1,581× under a fixed codec while the twelve real E/B/J/TCA fields sit
-between 1.19× and 1.22×. Any aggregate ratio for VPIC is those two carrying
-twelve of noise.
+Four of the sixteen variables behave nothing like the rest, and with the deck's
+default they do not evolve **at all**. `clean_div_e_interval` and
+`clean_div_b_interval` are 0 (upstream's "turn off cleaning"), so `div_e_err`,
+`div_b_err`, `rhob` and `rhof` are never recomputed: `selection.csv` reports
+**entropy 0.0000 and MAD 0.0** for the first two, and all four are
+**bit-identical between every consecutive dump** (7 of 7 at 126³/200 steps).
+They are 25% of the payload and lift the run's headline ratio from **1.061 to
+1.304** — a 1.23× gain from data the simulation never touched. `vpic/README.md`
+has the measurement and `VPIC_CLEAN_DIV_INT`, which makes them real diagnostics.
+
+The step count is also short for the physics: the deck drives Weibel from a
+temperature anisotropy of 25, and at `dt·ω_pe ≈ 0.044` the default 200 steps is
+~9 `ω_pe⁻¹` — about 1.5 e-foldings out of the noise floor. At 1000 steps the
+deck's own `energies` diagnostic shows magnetic energy `by` growing **22.6×**
+and still accelerating.
 
 ### Nyx — Sedov blast wave
 
@@ -160,6 +170,16 @@ Patched to dump raw fields; the sweep replays them.
 | what changes | a point explosion expands into uniform background. Early frames are nearly constant (hugely compressible); the shock front sweeps outward as R(t) = 1.033·(E·t²/ρ)^(1/5), so more of the domain becomes active with time |
 | written | every `amr.plot_int` steps |
 | size controls | `--ncell`, `--steps`, `--plot-int`, `prob.exp_energy` |
+
+**`--steps` is not what ends a Nyx run — `stop_time` is.** The deck stops at
+`stop_time = 0.01` whatever `max_step` says, and because the timestep is
+CFL-limited the steps needed scale with resolution: asked for 1000, a 128³ run
+does ~300 and a 256³ run **583**. So the profiles' "1000+ timesteps" is not
+reached for Nyx. `--exp-energy` is the knob that fixes both reach and step
+count at once (a stronger blast means higher velocities, so CFL shrinks the
+timestep and the same `stop_time` takes more steps): at 128³, E=1 gives ~300
+steps and a 6.9× ratio range, E=10 ~675 and 44×, E=100 ~1575 and 114×. See
+`nyx/README.md`.
 
 **This is the workload where "evolving data" has to be checked rather than
 assumed.** At the stock 200 steps the shock reaches only ~25% of the box, and
@@ -200,6 +220,16 @@ compose field.
 | bandwidth | `CLIO_NEUROPRESS_COST_BW` (`--bw`) | `models/neuropress_bridge.cc` |
 | lossless / lossy | `CLIO_NEUROPRESS_ERROR_BOUND` (`--eb`) → `Context::error_bound_` | the three drivers + the VOL |
 | decompression timing | `CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=1` | `neuropress_explore.cc` |
+| end-to-end path trace | `CLIO_NEUROPRESS_PATH_TRACE=1` | `neuropress_path_trace.h` |
+
+`CLIO_NEUROPRESS_PATH_TRACE` is diagnostic for three of the workloads and
+**load-bearing for WarpX**: a stock WarpX has no Clio driver recording chunks,
+so `warpx/blobs.csv` is RECONSTRUCTED from that trace by `trace_to_csv.py`, and
+`warpx/read.sh` counts codec inversions by grepping it. Both scripts set it
+themselves for that reason. Without it a WarpX run completes, exits 0, and
+produces an empty `blobs.csv` — which is why `run_config.sh` now fails a run
+that staged no field chunks instead of warning.
+
 
 The cost NeuroPress minimises is
 
@@ -226,6 +256,56 @@ already used.
 ---
 
 ## 3. Findings that change how the results should be read
+
+### Lossless compressibility does not track the physics on two of the four
+
+This is the single most important thing to know before reading a ratio column.
+
+Nyx and WarpX have wide, moving ratios; VPIC and LAMMPS have flat ones. That is
+**not** because their data is static — it is because a lossless codec cannot see
+what changes in them:
+
+| | element | does the data evolve? | lossless ratio over a run |
+|---|---|---|---|
+| WarpX | float32 | yes, untuned | 5.5× … 437× (18–80× per field) |
+| Nyx | float32 | only with `--exp-energy 10`+ | 4.6× … 205× |
+| VPIC | float32 | **yes** — B energy ×22.6 over 1000 steps | ~1.14×, **flat** |
+| LAMMPS | **float64** | **yes** — force MAD 9.9e-14 → 1.85e+01 | ~1.09×, **flat** |
+
+VPIC's magnetic energy grows 22.6× and every field's digest changes at every
+dump; LAMMPS's lattice melts, taking `position` entropy 6.03 → 7.13 and `force`
+MAD across *fourteen orders of magnitude*. Both ratios move by ~1%.
+
+The reason is entropy, not physics: these fields run at **7.3 of 8 bits per
+byte**. The structure lives in the high-order bits while the mantissa is
+effectively random and dominates what a byte-oriented codec sees. No deck
+parameter changes it, and running longer does not help.
+
+**So the four workloads exercise two different halves of the cost model.** Nyx
+and WarpX stress the ratio path, where the I/O term and the 100× cap matter.
+VPIC and LAMMPS stress the latency path, where the 1 ms clamps dominate and
+selection is decided almost entirely by measured kernel time. Both are worth
+having; reading VPIC's ratio column as a compression result is not.
+
+Corollary for `--explore-k`: only Nyx improved with a wider sweep in the
+K = 3/8/16 measurements. VPIC and LAMMPS got *worse*, because when every
+candidate lands within a few percent, widening K adds contention noise without
+adding real choice — and on LAMMPS it pushes chunks over the "not beneficial"
+line into being stored raw.
+
+### Element width decides which actions the model can even reach
+
+LAMMPS is the only float64 workload (`Atom::x/v/f` are `double`); the other
+three are float32 throughout. NeuroPress's action space encodes byte shuffle as
+**one bit meaning 4 bytes**, so the 8-byte stride that matches float64 is
+unreachable by inference — only the `static-zstd-s8` config can use it.
+Measured on LAMMPS at box 40 / 100 steps: `static-zstd` 1.229,
+`static-zstd-s4` 1.229, `static-zstd-s8` **1.245**. Worth ~1.3% here, so the
+gap is real but small; the point is that it is a *structural* limit of the
+action space, not a prediction error.
+
+NeuroPress also reads every buffer as float32 regardless of the declared type,
+which is upstream's behaviour and Clio keeps it.
 
 ### Exploration-mode selection is nondeterministic run to run
 
@@ -319,6 +399,31 @@ the same dumps at 5 GB/s, chunks quantized per field (of 21):
 Balance quantizes everything — quantization is cheap and it is charging for
 time — while ratio takes it only where it actually pays in bytes. Read the
 per-field columns, not just the aggregate.
+
+And it does not mean the same thing across **workloads** either, because the
+quantizer picks its precision per chunk from that chunk's dynamic range. The
+same `--eb 1e-3`:
+
+| workload | what the quantizer does | lossless → lossy |
+|---|---|---|
+| VPIC | `prec=8` — `1149984 → 287496 B`, a **4× narrowing before the codec** | 1.30× → **6.96×** |
+| Nyx | `prec=32` — narrows nothing; the whole gain is the codec | modest |
+| LAMMPS | quantizes only **6 of 18** adopted rows | 1.090× → 1.174× |
+
+LAMMPS shows why: in LJ units the same absolute bound lands very differently on
+its three fields, measured against each one's typical MAD —
+
+| field | typical MAD | `1e-3` relative to it | quantized |
+|---|---|---|---|
+| `force` | 9.9e-14 | 1.0e+10 | 1 of 6 |
+| `position` | 1.55e+01 | 6.4e-05 | 2 of 6 |
+| `velocity` | 1.50e+00 | 6.7e-04 | 3 of 6 |
+
+For `position` that is ~16 bits of precision on a box ~42 wide, so quantization
+buys little; for `force` on a perfect lattice it is ten orders of magnitude
+looser than the data. **A single `--eb` is not a comparable setting across
+workloads**, and of VPIC's 6.96× lossy ratio, 4× is quantization and only
+~1.74× is the codec.
 
 ### PSNR in `selection.csv` is analytical, not measured
 
