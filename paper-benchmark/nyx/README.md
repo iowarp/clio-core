@@ -28,9 +28,14 @@ replays the identical bytes**. A Kokkos LAMMPS trajectory is not
 bit-reproducible, so its policies see slightly different data; here the
 comparison is exact.
 
-## The patch
+## The patches
 
-`patches/nyx-raw-field-dump.patch` adds one self-contained function to
+Two, and both are needed — see "Building Nyx" for why the second one's absence
+is easy to miss.
+
+### `nyx-raw-field-dump.patch`
+
+Adds one self-contained function to
 `Source/IO/Nyx_output.cpp` (+87 lines) that writes each FArrayBox component as
 a flat float32 file when `NYX_DUMP_FIELDS=1`.
 
@@ -45,17 +50,46 @@ directly instead of `derive()`.
 Float32 always — downcasting if `amrex::Real` is double — so a consumer never
 has to ask how Nyx was configured.
 
+### `nyx-comoving-a-single-precision-eps.patch`
+
+Fixes `get_comoving_a: invalid time`, which aborts a run *after* every dump for
+that step has been written — so the output is complete and only the exit status
+is lost, which is why it reads as flaky rather than as a bug.
+
+`get_comoving_a()` decides "is `time` at an end of the current a-interval" with
+`eps = 1e-4 * (new_a_time - old_a_time)`. That is `1e-4` of the interval
+**width**, added to the interval's absolute **position**. In a
+single-precision build both `old_a_time ± eps` round straight back to
+`old_a_time`, the window collapses to the empty interval, and a `time` that is
+*exactly* `old_a_time` — the commonest query there is — falls through every
+branch to `amrex::Error()`. Double-precision builds never see it.
+
+The fix floors `eps` at a few ULP of the interval's own magnitude and makes the
+endpoint comparisons inclusive. No physics change: the default run's field
+dumps are bit-identical to the unpatched binary.
+
 ## Building Nyx
 
 ```bash
 git clone --depth 1 --recursive https://github.com/AMReX-Astro/Nyx.git ~/src/Nyx
 cd ~/src/Nyx
 git apply <clio>/paper-benchmark/nyx/patches/nyx-raw-field-dump.patch
+git apply <clio>/paper-benchmark/nyx/patches/nyx-comoving-a-single-precision-eps.patch
 cmake -S . -B build-clio -DCMAKE_BUILD_TYPE=Release \
       -DNyx_MPI=NO -DNyx_OMP=NO -DNyx_HYDRO=YES -DNyx_HEATCOOL=NO \
       -DNyx_GPU_BACKEND=CUDA -DAMReX_CUDA_ARCH=Ampere \
       -DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE
 cmake --build build-clio --target nyx_HydroTests -j
+```
+
+**Both patches, and REBUILD after applying them.** The `get_comoving_a` fix
+(above) is easy to miss: the default Sedov run never reaches its trigger, so a
+binary built before the patch looks perfectly healthy until a longer run or
+another problem aborts partway — LyA aborts at exactly z=6. Nothing checks that
+the binary is newer than the patch, so if in doubt compare the timestamps:
+
+```bash
+ls -la ~/src/Nyx/Source/Driver/comoving.cpp ~/src/Nyx/build-clio/Exec/*/nyx_*
 ```
 
 `AMReX_PRECISION=SINGLE` is upstream's recommendation for compression
@@ -95,6 +129,91 @@ count as the LAMMPS benchmark.
 
 Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 `rho_E`, `rho_e`.
+
+## Choosing the parameters
+
+### Sizing: payload is set by `--ncell` and the frame count
+
+One frame is every component of the hydro state, so
+
+```
+frame bytes  = ncell^3 x 6 components x 4 B      # 128^3 -> 48 MiB, 256^3 -> 384 MiB
+frames       = steps / int                        # capped by stop_time, see below
+payload      = frame bytes x frames
+```
+
+| target | ncell | int | frames | payload |
+|---|---|---|---|---|
+| ~1 GB | 128 | 32 | 21 | 1.01 GB |
+| ~30 GB | 256 | 6 | ~80 | ~30 GB |
+
+Set `--chunk` to the per-component size (`ncell^3 x 4`) to get one chunk per
+component: 8388608 at 128³, 67108864 at 256³.
+
+### `--steps` is NOT what stops the run — `stop_time` is
+
+The deck ends at `stop_time = 0.01` whatever `max_step` says, and because the
+timestep is CFL-limited the steps needed to reach it scale with resolution.
+Measured, at the default `exp_energy=1`:
+
+| ncell | steps actually run when asked for 1000 |
+|---|---|
+| 128 | ~300 |
+| 256 | **583** |
+
+So a profile that specifies 1000 steps does not get them. Use `--stop-time` to
+extend the run, or `--exp-energy` (below), which raises the step count as a
+side effect.
+
+### `--exp-energy` is the knob that makes the data evolve
+
+The Sedov shock radius goes as `R = 1.033 (E t^2 / rho)^(1/5)`, so at the deck's
+`E=1` and `t=0.01` it reaches only **~0.16 of a unit box** — most of the domain
+never changes and consecutive dumps are nearly identical.
+
+Raising `E` fixes two things at once, which is not obvious: a wider shock also
+means higher velocities, so the CFL timestep shrinks and the *same* `stop_time`
+now takes **more** steps. Measured at 128³, `density` ratio range over the run:
+
+| `--exp-energy` | steps | ratio range | spread |
+|---|---|---|---|
+| 1 (deck default) | ~300 | 12.7x .. 87.5x | 6.9x |
+| **10** | ~675 | 4.6x .. 205.3x | **44.4x** |
+| 100 | ~1575 | 1.8x .. 205.8x | 113.9x |
+
+A validated 1 GB configuration:
+
+```bash
+./run_config_insitu.sh explore-balance   --ncell 128 --steps 2000 --int 32 --chunk 8388608   --exp-energy 10 --explore-k 3 --explore-thresh -1 --verify   --results /tmp/nyx1g --tag e10
+```
+
+21 frames, 671 steps, 126/126 blobs verified bit-exact, and **no frame
+bit-identical to its predecessor on any field**. Compressibility falls
+monotonically from ~86x to ~4.6x as the blast fills the domain, and the
+selector moves cascaded -> bitcomp -> ans along the way. Both knobs are
+recorded in `meta.json`, so a run stays self-describing.
+
+`--steps 2000` there is deliberately generous: the run stops on `stop_time`, so
+the step count is an outcome, not an input.
+
+### `--deck`: Sedov is a hydro unit problem, not Nyx's science
+
+`inputs.3d.sph.sedov` comes from `Exec/HydroTests` and runs with
+`nyx.do_grav = 0`, no dark matter and `comoving_h = 0`, so it exercises Nyx
+purely as a hydro solver. `run.sh --deck PATH` points at another `Exec`'s
+inputs — the in-situ hook lives in the shared `Source/IO/Nyx_output.cpp`, so
+every Exec's binary already carries it.
+
+**LyA, the Lyman-alpha forest problem Nyx is actually for, is the obvious
+candidate and is the wrong benchmark.** It runs end to end (z=159 -> 2, 422
+steps) once given absolute paths for `64sssss_20mpc.nyx` and `TREECOOL_middle`
+(they resolve against the working directory) and gravity tolerances a
+single-precision build can reach — its shipped `1e-10` is unattainable, MLMG
+bottoms out at `resid/bnorm = 7.9e-6`, so `gravity.ml_tol=gravity.sl_tol=2e-5`.
+But its compression ratio sits at **1.0005 .. 1.0022 for the entire history**:
+cosmological float32 fields are incompressible losslessly at every redshift, so
+there is no signal to measure. Sedov with a raised blast energy is the
+configuration that produces one.
 
 ## Results
 
