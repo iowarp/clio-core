@@ -47,12 +47,31 @@ struct VecHeader {
    *  cache line. Null in private mode: a private table has exactly one writer.
    */
   int *set_locks_;
-  /** Occupied frames, and the byte budget expressed in frames. Sets are
-   *  OVERPROVISIONED (set_size = 2x budget/page/sets) so collisions have room,
-   *  which means the frame array is larger than the budget -- this counter is
-   *  what actually holds the cache to its size. */
-  unsigned long long *cache_frames_;
-  clio::run::u64 max_frames_;
+  /**
+   * THE PAGE ALLOCATOR. Storage is no longer welded to a slot.
+   *
+   * A slot used to own a page-sized region for its whole life, so a set wide
+   * enough to avoid collisions cost a page per spare slot -- 580 spare list
+   * slots at 512 KB was 290 MB of emptiness, and that was most of the gap to
+   * a resident MPI run. Now `regions_` holds EXACTLY the capacity the caller
+   * asked for, a slot is a 64-byte tag that points at a region only while it
+   * holds a page, and associativity costs tags rather than pages.
+   *
+   * Regions are owned PER BLOCK: block b owns
+   * [b * regions_per_block_, (b+1) * regions_per_block_), and a free region
+   * goes back to its owner rather than to a global pool, so the common path
+   * touches only this block's list. Ownership is recomputed from the address
+   * (RegionOwner), never stored.
+   */
+  char *regions_;
+  clio::run::u32 nregions_;          // exactly the requested capacity
+  clio::run::u32 regions_per_block_; // ownership stride
+  /** Per-block free lists: `free_q_` is nregions_ region indices, block b
+   *  using [b*regions_per_block_, ...), with head/tail counters per block. */
+  clio::run::u32 *free_q_;
+  clio::run::u32 *free_head_;
+  clio::run::u32 *free_tail_;
+  int *free_lock_;                   // one per block, kLockStride apart
   clio::cte::core::TagId tag_id_;
   clio::run::PoolId pool_id_;
   ctp::ipc::AllocatorId task_alloc_id_;
@@ -562,18 +581,91 @@ class DeviceVector {
     atomicExch(&h_->set_locks_[static_cast<size_t>(set) * kLockStride], 0);
   }
 
-  /** Charge one frame against the byte budget; true if we are now over. */
-  CTP_GPU_FUN bool ChargeFrame() {
-    if (h_->cache_frames_ == nullptr) return false;
-    const unsigned long long prev = atomicAdd(h_->cache_frames_, 1ull);
-    return prev + 1ull > h_->max_frames_;
+  /** Which block owns a region, recomputed from its address.
+   *
+   * Never stored: the layout IS the mapping. Regions are page-sized and laid
+   * out contiguously, so the index is the byte offset over the page size, and
+   * ownership is that index over the per-block stride. (A byte offset divided
+   * by a block count would not be an index -- the page size has to come out
+   * first.) */
+  CTP_GPU_FUN clio::run::u32 RegionOwner(const void *region) const {
+    const clio::run::u64 off =
+        static_cast<clio::run::u64>(static_cast<const char *>(region) -
+                                    h_->regions_);
+    const clio::run::u64 idx = off / h_->page_bytes_;
+    const clio::run::u32 stride =
+        h_->regions_per_block_ != 0 ? h_->regions_per_block_ : 1u;
+    clio::run::u32 owner = static_cast<clio::run::u32>(idx / stride);
+    return owner < h_->nblocks_ ? owner : (h_->nblocks_ - 1u);
   }
-  CTP_GPU_FUN void CreditFrame() {
-    // No atomicSub for unsigned long long; adding -1 wraps to the same thing.
-    if (h_->cache_frames_ != nullptr) {
-      atomicAdd(h_->cache_frames_, ~0ull);
+
+  CTP_GPU_FUN void LockFree(clio::run::u32 b) {
+    int *w = &h_->free_lock_[static_cast<size_t>(b) * kLockStride];
+    while (atomicCAS(w, 0, 1) != 0) {
+#if __CUDA_ARCH__ >= 700
+      __nanosleep(32);
+#endif
     }
+    __threadfence();
   }
+  CTP_GPU_FUN void UnlockFree(clio::run::u32 b) {
+    __threadfence();
+    atomicExch(&h_->free_lock_[static_cast<size_t>(b) * kLockStride], 0);
+  }
+
+  /**
+   * Take a region from block `b`'s free list, or null.
+   *
+   * LOCKED, NOT LOCK-FREE, and that is a deliberate call. A per-block SPSC
+   * ring would let the owner pop without a lock -- but the whole point of the
+   * per-block split is that a block whose own list is empty STEALS from
+   * another, and a stealer is a second consumer, which is exactly what single
+   * consumer rules out. Rather than a ring that is SPSC only until it matters,
+   * every list op takes that list's lock: uncontended on the owner's own
+   * list, a handful of instructions, and next to a page transfer it does not
+   * register.
+   */
+  CTP_GPU_FUN char *PopRegion(clio::run::u32 b) {
+    if (h_->free_q_ == nullptr) return nullptr;
+    char *r = nullptr;
+    LockFree(b);
+    if (h_->free_head_[b] != h_->free_tail_[b]) {
+      const clio::run::u32 stride = h_->regions_per_block_;
+      const clio::run::u32 pos = h_->free_head_[b] % stride;
+      const clio::run::u32 idx = h_->free_q_[b * stride + pos];
+      ++h_->free_head_[b];
+      r = h_->regions_ + static_cast<clio::run::u64>(idx) * h_->page_bytes_;
+    }
+    UnlockFree(b);
+    return r;
+  }
+
+  /** Give a region back to the block that owns it. */
+  CTP_GPU_FUN void PushRegion(char *region) {
+    if (h_->free_q_ == nullptr || region == nullptr) return;
+    const clio::run::u32 b = RegionOwner(region);
+    const clio::run::u64 idx =
+        static_cast<clio::run::u64>(region - h_->regions_) / h_->page_bytes_;
+    const clio::run::u32 stride = h_->regions_per_block_;
+    LockFree(b);
+    const clio::run::u32 pos = h_->free_tail_[b] % stride;
+    h_->free_q_[b * stride + pos] = static_cast<clio::run::u32>(idx);
+    ++h_->free_tail_[b];
+    UnlockFree(b);
+  }
+
+  /** This block's list first, then anyone else's. Null when the cache is
+   *  genuinely full and only eviction can help. */
+  CTP_GPU_FUN char *AllocRegion() {
+    char *r = PopRegion(Table());
+    if (r != nullptr) return r;
+    for (clio::run::u32 n = 1; n < h_->nblocks_; ++n) {
+      r = PopRegion((Table() + n) % h_->nblocks_);
+      if (r != nullptr) return r;
+    }
+    return nullptr;
+  }
+
   CTP_GPU_FUN BlockTasks *Tasks() const { return &h_->tasks_[Table()]; }
 
 
@@ -628,6 +720,12 @@ class DeviceVector {
 
   /** Drop a resident, unpinned, clean page. */
   CTP_GPU_FUN void Release(Page *p) {
+    // THE REGION GOES BACK TO ITS OWNER, not to the slot. A slot is a tag
+    // now; the storage it pointed at is the scarce thing.
+    if (p->data != nullptr) {
+      PushRegion(static_cast<char *>(p->data));
+      p->data = nullptr;
+    }
     p->page_num = kNoPage;
     p->valid_lo = 0u;
     p->valid_hi = 0u;
@@ -638,15 +736,15 @@ class DeviceVector {
 
 
   /**
-   * Reclaim frames ANYWHERE to get back under the byte budget.
+   * Reclaim REGIONS from anywhere. The caller wants storage, not a slot.
    *
-   * BUDGET EVICTION, not slot eviction -- do not confuse the two. This one
-   * answers "the cache is over its size"; any set will do, which is why it
-   * walks them. Slot eviction answers "this page's home set has no free
-   * frame", and only that set can help.
+   * Two evictions, still deliberately distinct: this one answers "there is no
+   * page-sized region left in the whole cache", and any set can supply one,
+   * which is why it walks them. Slot eviction answers "this page's home set
+   * has no free TAG", and only that set can help.
    */
-  CTP_GPU_FUN void EvictForBudget(clio::run::u32 want, clio::run::u32 home) {
-    if (h_->cache_frames_ == nullptr) return;
+  CTP_GPU_FUN void EvictForRegions(clio::run::u32 want, clio::run::u32 home) {
+    if (h_->free_q_ == nullptr) return;
     for (clio::run::u32 n = 0; n < h_->nsets_ && want != 0; ++n) {
       // Start away from the home set: its frames are the ones we just
       // pinned, and it is the set most likely to be contended.
@@ -696,6 +794,44 @@ class DeviceVector {
     // the state that goes with it; publishing the tag first lets a peer match
     // it against the PREVIOUS occupant's valid range and hold a frame whose
     // contents are about to be overwritten.
+    // A FREE SLOT IS NOT YET A PLACE TO PUT A PAGE. It needs a region, and
+    // the cache being full means the REGIONS are gone, not the tags -- so a
+    // failure here is answered by evicting somewhere, anywhere, and trying
+    // again, not by widening the set.
+    char *region = AllocRegion();
+    if (region == nullptr) {
+      // DROP THE SET LOCK BEFORE EVICTING ELSEWHERE. EvictForRegions takes
+      // OTHER sets' locks, and taking a second set lock while holding one is
+      // a cycle: two blocks with different home sets deadlock holding each
+      // other's. Free-list locks are fine to nest inside a set lock -- the
+      // order is always set then free, never the reverse -- but set-then-set
+      // is not, so the window is reopened instead.
+      UnlockSet(set);
+      EvictForRegions(1u, set);
+      LockSet(set);
+      // RE-DECIDE FROM SCRATCH. The set was unlocked, so a peer may have
+      // claimed this very page, taken the slot, or freed another.
+      Page *again = FindClaimed(pn);
+      if (again != nullptr) {
+        atomicAdd(&again->pins, 1u);
+        UnlockSet(set);
+        *is_new = false;
+        return again;
+      }
+      p = FindFreeIn(set);
+      if (p == nullptr) {
+        FreeSomeIn(set, 1, 1);
+        p = FindFreeIn(set);
+      }
+      region = (p != nullptr) ? AllocRegion() : nullptr;
+    }
+    if (p == nullptr || region == nullptr) {
+      if (region != nullptr) PushRegion(region);
+      UnlockSet(set);
+      *is_new = false;
+      return nullptr;                 // caller reports; see ReportSetFull
+    }
+    p->data = region;
     p->valid_lo = 0u;
     p->valid_hi = 0u;
     p->generation = 0;
@@ -706,10 +842,6 @@ class DeviceVector {
     p->page_num = pn;
     atomicAdd(&p->pins, 1u);
     UnlockSet(set);
-    // Charge AFTER releasing the lock: paying the budget back may need other
-    // sets' locks, and taking a second lock while holding one is how lock
-    // ordering deadlocks start.
-    if (ChargeFrame()) EvictForBudget(1u, set);
     *is_new = true;
     return p;
   }
@@ -760,8 +892,7 @@ class DeviceVector {
         }
       }
       if (victim == nullptr) break;
-      Release(victim);
-      CreditFrame();
+      Release(victim);   // returns the region to its owner's free list
       ++dropped;
     }
     (void)min;

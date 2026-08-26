@@ -2147,7 +2147,13 @@ static bool PlanCaches(clio::run::u64 budget, u32 nblocks,
  *    two pages that hash together wedge. Associativity is not optional.
  */
 static u32 SharedSlots(clio::run::u64 pages, u32 nsets) {
-  const clio::run::u64 want = (2ull * (pages + 2) + nsets - 1) / nsets;
+  // TAGS ARE CHEAP NOW. A slot is 64 bytes and the page-sized storage behind
+  // it comes from the allocator, so associativity costs kilobytes rather than
+  // hundreds of megabytes: the 4x headroom below is 4 * (pages+2) * 64B, and
+  // for the neighbour list that is 147 KB against the 290 MB the same
+  // headroom used to cost. Ask for enough that a hash collision never has to
+  // evict a live page.
+  const clio::run::u64 want = (4ull * (pages + 2) + nsets - 1) / nsets;
   // A FLOOR OF 4, not because capacity says so but because a set of one is a
   // direct map with nowhere for a collision to go. Residency needs
   // 2*(pages+2)/nsets, which rounds to nothing for a small vector.
@@ -2548,22 +2554,24 @@ int main(int argc, char **argv) {
   // and it is the whole difference between our footprint and a resident
   // MPI-style array.
   u64 data_bytes_total = 0, tbl_bytes_total = 0;
-  auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages) {
-    const u64 frames = static_cast<u64>(nsets) * nslot;
-    const u64 bytes = frames * pgb;
+  auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages,
+                     u64 cap_pages) {
+    const u64 slots = static_cast<u64>(nsets) * nslot;
+    const u64 bytes = cap_pages * pgb;      // the allocator's regions
     const u64 data = vec_pages * pgb;
-    const u64 tbl = frames * sizeof(gv::Page);
+    const u64 tbl = slots * sizeof(gv::Page);
+    const u64 frames = cap_pages;
     cache_frames_total += frames;
     cache_bytes_total += bytes;
     data_bytes_total += data;
     tbl_bytes_total += tbl;
-    std::printf("  %-5s page=%3lluKB  data %6.1f MB (%llu pages)  frames "
-                "%llu = %6.1f MB  %.2fx  +tbl %.2f MB\n",
+    std::printf("  %-5s page=%3lluKB  data %6.1f MB (%llu pages)  regions "
+                "%llu = %6.1f MB  %.2fx  tags %llu = %.2f MB\n",
                 what, (unsigned long long)(pgb >> 10),
                 (double)data / 1048576.0, (unsigned long long)vec_pages,
                 (unsigned long long)frames, (double)bytes / 1048576.0,
                 (double)bytes / (double)(data ? data : 1),
-                (double)tbl / 1048576.0);
+                (unsigned long long)slots, (double)tbl / 1048576.0);
   };
   bool cache_reported = false;
   auto report_caches = [&]() {
@@ -2575,10 +2583,10 @@ int main(int argc, char **argv) {
         (vram_free_before > fnow)
             ? (double)(vram_free_before - fnow) / 1048576.0
             : 0.0;
-    std::printf("  CACHE TOTAL: %llu frames = %.1f MB of frame arrays for "
+    std::printf("  CACHE TOTAL: %llu regions = %.1f MB of page storage for "
                 "%.1f MB of data (%.2fx over-provision, %.1f MB of it spare "
                 "page storage);\n"
-                "  page tables %.2f MB (sizeof(Page)=%zu). Device VRAM "
+                "  tags %.2f MB (sizeof(Page)=%zu). Device VRAM "
                 "consumed by the vectors %.1f MB (free %.0f -> %.0f MB "
                 "of %.0f)\n",
                 (unsigned long long)cache_frames_total,
@@ -2592,16 +2600,19 @@ int main(int argc, char **argv) {
                 (double)fnow / 1048576.0, (double)vram_total_dev / 1048576.0);
   };
   const u32 x_slots = SharedSlots(npages, nsets);
+  const u32 md_cap = static_cast<u32>(npages + 2);
   gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks, x_slots,
-                       g.nelems);
-  account("x", x_slots, page_bytes, npages);
+                       g.nelems, clio::run::PoolId::GetNull(), 0, 1,
+                       /*nsets=*/0, /*capacity_pages=*/md_cap);
+  account("x", x_slots, page_bytes, npages, md_cap);
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
   const u32 vslots = SharedSlots(npages, nsets);
   gv::Vector<float> vv(tag("md_v"), {0}, page_bytes, tbl_blocks, vslots,
-                       g.nelems);
-  account("v", vslots, page_bytes, npages);
+                       g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
+                       md_cap);
+  account("v", vslots, page_bytes, npages, md_cap);
   vx.EnableStats();
   vv.EnableStats();
   vx.Preload(hx.data(), g.nelems);
@@ -2621,7 +2632,7 @@ int main(int argc, char **argv) {
                            use_third ? g.nelems : page_elems,
                            clio::run::PoolId::GetNull(), 0, 1);
   if (use_third) {
-    account("third", third_slots, page_bytes, npages);
+    account("third", third_slots, page_bytes, npages, md_cap);
     std::vector<float> hz(g.nelems, 0.0f);
     vthird.Preload(hz.data(), g.nelems);
     vthird.ClearCache();
@@ -2763,8 +2774,9 @@ int main(int argc, char **argv) {
     // is the one path the resident gates cannot cover.
     const u32 fslots = SharedSlots(npages, nsets);
     gv::Vector<float> vf(tag("md_f"), {0}, page_bytes, tbl_blocks, fslots,
-                         g.nelems);
-    account("f", fslots, page_bytes, npages);
+                         g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
+                         md_cap);
+    account("f", fslots, page_bytes, npages, md_cap);
     vf.EnableStats();
     {
       std::vector<float> hz(g.nelems, 0.0f);
@@ -2779,11 +2791,13 @@ int main(int argc, char **argv) {
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
     const u32 ppslots = SharedSlots(npages, nsets);
     gv::Vector<float> vx2(tag("md_x2"), {0}, page_bytes, tbl_blocks, ppslots,
-                          g.nelems);
+                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
+                          md_cap);
     gv::Vector<float> vv2(tag("md_v2"), {0}, page_bytes, tbl_blocks, ppslots,
-                          g.nelems);
-    account("x2", ppslots, page_bytes, npages);
-    account("v2", ppslots, page_bytes, npages);
+                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
+                          md_cap);
+    account("x2", ppslots, page_bytes, npages, md_cap);
+    account("v2", ppslots, page_bytes, npages, md_cap);
     vx2.EnableStats();
     vv2.EnableStats();
     {
@@ -2849,8 +2863,9 @@ int main(int argc, char **argv) {
     // blocks x the list and had to be capped at NlSlots to allocate at all.
     const u32 nlslots = SharedSlots(nl_pages, nsets);
     gv::Vector<int> vn(tag("md_nl"), {0}, nl_page_bytes, tbl_blocks, nlslots,
-                       nl_elems);
-    account("list", nlslots, nl_page_bytes, nl_pages);
+                       nl_elems, clio::run::PoolId::GetNull(), 0, 1, 0,
+                       static_cast<u32>(nl_pages + 2));
+    account("list", nlslots, nl_page_bytes, nl_pages, nl_pages + 2);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
