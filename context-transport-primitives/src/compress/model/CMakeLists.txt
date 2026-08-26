@@ -17,6 +17,11 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
     # Provides ByteShuffleDevice/ByteUnshuffleDevice on a CPU-only build;
     # compiles to nothing when CUDA is on (the .cu below defines them).
     ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/byte_shuffle_cpu_stub.cc
+    # Per-block temporal evolution: the host reference and the tracker that
+    # retains the previous sampled timestep. Always built -- the tracker works
+    # for host chunks with or without CUDA, and on a CPU-only build this TU
+    # also supplies the stubs for the device entry points.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/block_evolution.cc
 )
 
 # NeuroPress GPU backend: when CUDA is available, its inference and online-
@@ -36,6 +41,11 @@ if(CLIO_CORE_ENABLE_CUDA)
     # GPU kernels above: no separate install(EXPORT) entry needed.
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu)
+    # Per-block temporal evolution kernel: same rationale and the same target
+    # as the device stats above -- it reduces over the very buffers those
+    # stats are computed from, on the same per-thread stream.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/block_evolution_gpu_kernels.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -48,6 +58,9 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_source_files_properties(neuropress_nn_gpu_kernels.cu PROPERTIES LANGUAGE CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu
+        PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/block_evolution_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
     # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
     # here, instead of once per consumer.

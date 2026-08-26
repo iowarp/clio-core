@@ -7,6 +7,7 @@ add_executable(test_compress_model_exec
         ${TEST_MAIN}/main.cc
         test_models.cc
         test_data_stats_gpu.cc
+        test_block_evolution.cc
         test_compress_factory_gpu.cc)
 
 add_dependencies(test_compress_model_exec clio_ctp_compress_model)
