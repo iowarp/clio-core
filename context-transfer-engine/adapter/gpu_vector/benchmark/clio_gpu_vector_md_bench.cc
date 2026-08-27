@@ -101,6 +101,16 @@ __device__ u32 g_publish = 1u;
  *  flush there was per-step traffic with no reader: measured 12 puts/step
  *  on x alone against MPI's 0.53 MB/step ledger. */
 __device__ u32 g_pub_interior = 1u;
+/** OUT-OF-CORE MD: publish every x/v/dst write at the write site. The md
+ *  path treats x and v as device-canonical -- no flushes, the frames ARE the
+ *  data -- which is only sound while nothing is ever evicted. Under a
+ *  --slots region cap an evicted page's next fault reads the STORE, and an
+ *  unpublished kick means the store still holds older positions: the
+ *  trajectory partly FREEZES, which the drift gate cannot tell from perfect
+ *  conservation (KE 8270.5 -> 8270.4 over 20 steps while the resident run
+ *  melted to 4945). Host sets this whenever the cache is capped below the
+ *  working set; resident runs keep the flush-free fast path. */
+__device__ u32 g_md_flush = 0u;
 /** MD_RESORT_DEBUG: slots the gather actually wrote, plus one sample. */
 __device__ unsigned long long g_gather_wrote = 0ull;
 /** Publish-kernel latency split, in device cycles: the flush await vs the
@@ -108,6 +118,93 @@ __device__ unsigned long long g_gather_wrote = 0ull;
 __device__ unsigned long long g_pub_flush_cyc = 0ull;
 __device__ unsigned long long g_pub_fetch_cyc = 0ull;
 __device__ unsigned long long g_gather_sample = 0ull;
+
+/** HOLD-SET ADMISSION for the force chunks. A chunk pins its whole x
+ *  stencil before computing, chunks drift apart (no inter-chunk barrier), so
+ *  under an out-of-core region pool the union of pinned pages can reach the
+ *  pool size with every block still waiting for MORE pages -- a circular
+ *  partial-hold wait no retry can break (measured: 20 of 20 regions pinned,
+ *  0 on the free lists, claim spinning 4 s). The cure is the one the old
+ *  EnterHoldSet API implemented before the shared-cache rebuild deleted it:
+ *  reserve the ENTIRE hold set up front, while holding nothing. Reservations
+ *  never exceed the pool minus slack, so every admitted chunk can finish its
+ *  pins and progress is guaranteed. Slack covers the pinners that do not
+ *  reserve: the async publish's fetch-pins and a peer's generational refetch.
+ *  Costs nothing when the pool dwarfs the demand -- the CAS succeeds first
+ *  try -- so the gate is always on. */
+__device__ u32 g_adm_used = 0u;
+
+/** One admission attempt. Thread 0 owns the CAS; every other thread reports
+ *  "not waiting" and the yield macro's vote broadcasts thread 0's verdict. */
+__device__ bool AdmitWaits(u32 need, u32 pool, u32 slack) {
+  if (threadIdx.x != 0) return false;
+  // A demand near or above the pool degrades to run-alone, never to a
+  // budget of zero: cur==0 must always admit or the chunk waits forever.
+  const u32 budget = (pool > need + slack) ? (pool - slack) : need;
+  const u32 cur = *(volatile u32 *)&g_adm_used;
+  if (cur + need <= budget &&
+      atomicCAS(&g_adm_used, cur, cur + need) == cur) {
+    return false;                    // admitted -- the reservation is taken
+  }
+  return true;
+}
+
+/** A PARK, NEVER A SPIN. The first cut of this gate busy-waited with
+ *  __nanosleep inside the kernel -- but under the yield driver the current
+ *  reservation holders are PARKED coroutines that only resume (and release)
+ *  after the kernel exits its round. A spin keeps the round alive forever:
+ *  the whole grid wedged in the very first neighbour build. Waiting must go
+ *  through the same yield the holders use. Tag 0 means "always resume", so
+ *  every round retries the CAS until it lands. */
+/** Chunk-tier slack: room the consumer chunks must always leave for the
+ *  PRODUCER. The publish's two x-pinning blocks (boundary flush 6, halo warm
+ *  6) admit with slack 0 -- against the whole pool -- because every node's
+ *  progress transitively depends on its peer's flush landing. Making the
+ *  publish queue behind the chunks deadlocked BOTH nodes: chunks parked on
+ *  the peer's generation held 30 reservations, the publish that would
+ *  satisfy the peer sat at the gate behind them (admit stall need=6
+ *  used=30), and the peer's generational get errored out (DEVICE FATAL 7)
+ *  waiting for a flush that could never land. */
+__device__ constexpr u32 kAdmitSlackChunks = 14u;
+
+__device__ gy::YCoroTask AdmitSpans(u32 need, u32 pool, u32 slack) {
+  if (need == 0u) co_return;
+  u32 rounds = 0;
+  for (;;) {
+    bool wait = false;
+    if (threadIdx.x == 0) {
+      wait = AdmitWaits(need, pool, slack);
+      // A parked kernel exits its round, so this printf reaches the host
+      // console mid-wedge -- unlike a printf before __trap, which dies with
+      // the context. Purely diagnostic; the wait itself never gives up.
+      if (wait && ++rounds == 100000u) {
+        rounds = 0;
+        printf("[gpu_vector] admit stall: need=%u pool=%u slack=%u used=%u\n",
+               need, pool, slack, *(volatile u32 *)&g_adm_used);
+      }
+    }
+    __syncthreads();
+    if (!__syncthreads_or(wait ? 1 : 0)) break;
+    co_await ::clio::run::gpu::YCoroSuspend{0ull};
+  }
+  co_return;
+}
+
+__device__ void ReleaseSpans(u32 need) {
+  __syncthreads();
+  if (threadIdx.x == 0 && need != 0u) {
+    // CLAMPED. An unmatched release must not wrap the counter: a single
+    // underflow parks every later AdmitSpans forever (cur ~4e9 admits
+    // nothing), and that presents as a silent whole-run wedge with every
+    // cache counter clean.
+    for (;;) {
+      const u32 cur = *(volatile u32 *)&g_adm_used;
+      const u32 sub = cur < need ? cur : need;
+      if (sub == 0u) break;
+      if (atomicCAS(&g_adm_used, cur, cur - sub) == cur) break;
+    }
+  }
+}
 
 /** SHARING PROBE: bit b set means block b held that page at least once.
  *  16 blocks fit a u32; the popcount per page is the sharing degree. */
@@ -757,9 +854,10 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         }
       }
     }
-    // LATCHED. Admission can arm mid-run (the livelock watchdog), so the
-    // decision is taken once here and reused at the release below; retesting
-    // it there would let a block give back a reservation it never took.
+    // LATCHED. The reservation taken here is the one given back at the
+    // release below; recomputing it there would let a block give back a
+    // reservation it never took.
+    co_await AdmitSpans(span_guards, x.Regions(), kAdmitSlackChunks);
     {   // guards die at the close of this scope, before the reservations go back
     gv::Held<float> hg[6][2];
     u64 srun[6];
@@ -952,6 +1050,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     // back before the next chunk fetches its own spans.
     for (u32 sq = 0; sq < nspans; ++sq) x.UnpinRange(sxrb[sq], sxlen[sq]);
     }
+    ReleaseSpans(span_guards);
     co_await nl.EndFlush();
   }     // per-chunk loop
 }
@@ -1083,7 +1182,8 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     // exhausted by blocks that are themselves blocked. Acquiring every
     // reservation up front, while holding nothing, is what makes the
     // guarantee hold across the whole working set rather than per vector.
-    {   // guards die at the close of this scope, before ExitHoldSet
+    co_await AdmitSpans(span_guards, x.Regions(), kAdmitSlackChunks);
+    {   // guards die at the close of this scope, before the release below
     gv::Held<float> hg[6][2];
     u64 srun[6];
     const float *sp0[6], *sp1[6];
@@ -1295,9 +1395,10 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     }
     // Every span guard above is dead here (the chunk body scope ends with
     // this brace), so the reservation is given back exactly once per
-    // EnterHoldSet. The only chunk-level `continue` is above the Enter.
+    // the Admit. The only chunk-level `continue` is above the Admit.
     for (u32 sq = 0; sq < nspans; ++sq) x.UnpinRange(sxrb[sq], sxlen[sq]);
     }
+    ReleaseSpans(span_guards);
   }     // per-chunk loop
   if (eflag) {
     const double vals[3] = {pe, w, npairs};
@@ -1357,8 +1458,16 @@ __device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
       px[e + 0] = px0; px[e + 1] = py0; px[e + 2] = pz0;
     }
     __syncthreads();
+    // PUBLISH AT THE WRITE SITE -- eviction performs no I/O, so a wrapped
+    // page evicted before the flush refaults to its PRE-WRAP positions and
+    // the resort bins atoms a box-length away. Resident runs never noticed:
+    // the frame was the only copy anyone read.
+    if (g_md_flush) {
+      co_await x.BeginFlush(0, e0, e1 - e0);
+    }
     x.UnpinRange(pg * epp, epp);
   }
+  if (g_md_flush) co_await x.EndFlush();
 }
 
 /**
@@ -1664,6 +1773,9 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         }
       }
     }
+    if (g_md_flush) {
+      co_await dst.BeginFlush(0, row * row_elems, row_elems);
+    }
     dst.UnpinRange(row * row_elems, row_elems);
     if (drun < row_elems) {
       dst.UnpinRange(dst.PageLo(row * row_elems + drun),
@@ -1673,6 +1785,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     if (false) {
     }
   }     // per-row loop
+  if (g_md_flush) co_await dst.EndFlush();
 }
 
 /** Pre-sentinel every slot of a ping-pong destination vector. */
@@ -1694,8 +1807,10 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst, u32 nb,
       p[s * kStride + 3] = -1.0f;
     }
     __syncthreads();
+    if (g_md_flush) co_await dst.BeginFlush(0, e0, e1 - e0);
     dst.UnpinRange(pg * epp, epp);
   }
+  if (g_md_flush) co_await dst.EndFlush();
 }
 
 /** K1/K4 for real MD: the kick reads the FORCE VECTOR (mass = 1). Same
@@ -1743,9 +1858,21 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
       }
     }
     __syncthreads();
+    // PUBLISH AT THE WRITE SITE (out-of-core only): eviction performs no
+    // I/O, so an unflushed kick is silently undone by the next fault of
+    // this page. Clipped to the slab's own elements -- the seam page
+    // belongs to two nodes and each may flush only its own half.
+    if (g_md_flush) {
+      if (drift) co_await x.BeginFlush(0, e0, e1 - e0);
+      co_await v.BeginFlush(0, e0, e1 - e0);
+    }
     x.UnpinRange(pg * epp, epp);
     v.UnpinRange(pg * epp, epp);
     f.UnpinRange(pg * epp, epp);
+  }
+  if (g_md_flush) {
+    if (drift) co_await x.EndFlush();
+    co_await v.EndFlush();
   }
 }
 
@@ -1988,7 +2115,8 @@ __global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo in
 __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
                                          gv::DeviceVector<float> v, u32 nb,
                                          u32 cap, u32 z0, u32 z1, u64 gen,
-                                         u32 nblocks, u32 block) {
+                                         u32 halo_first, u32 nblocks,
+                                         u32 block) {
   const u64 epp = x.ElemsPerPage();
   // BATCHED, NOT PAGE-AT-A-TIME. This kernel is pure store latency: after
   // the force pass stopped parking, the per-page loop here -- one awaited
@@ -2011,7 +2139,17 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
   // stacked SEQUENTIALLY in one block, so the step paid flush + fetch when it
   // only owes max(flush, fetch). Each block carries its own task slots, so
   // the three waits genuinely overlap.
+  // THE PUBLISH RESERVES LIKE EVERYONE ELSE. These fetches pin up to four
+  // planes of x while the force chunks hold their admitted stencils; as
+  // unreserved pinners they broke the admission invariant, and at a pool two
+  // pages short of the working set the first exchange deadlocked -- publish
+  // waiting for regions the chunks pinned, chunks waiting for regions the
+  // publish pinned. With every x-pinner reserving first, total pins never
+  // exceed pool minus slack, so someone can always finish.
   if (block == 0) {
+    const u32 pub_need = PagesSpanned(x, lo_pl, plane_elems_p) +
+                         PagesSpanned(x, hi_pl, plane_elems_p);
+    co_await AdmitSpans(pub_need, x.Regions(), 0u);
     const long long _c0 = clock64();
     co_await x.Fetch(0, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
     co_await x.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
@@ -2022,6 +2160,7 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     }
     x.UnpinRange(lo_pl, plane_elems_p);
     x.UnpinRange(hi_pl, plane_elems_p);
+    ReleaseSpans(pub_need);
   } else if (block == 1) {
     co_await v.Fetch(0, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
     co_await v.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
@@ -2030,22 +2169,38 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     v.UnpinRange(hi_pl, plane_elems_p);
   } else if (block == 2) {
     // The demand stays on the consumer (force still asks hgen); this fetch
-    // only warms the frames to `gen` so the heavy kernel finds resident_ok.
+    // warms the frames to `gen` -- AND THE PINS IT TAKES ARE KEPT. Under an
+    // out-of-core pool the halo planes are the one place whose backing store
+    // MUTATES while a pass reads them: the peer's write-site flushes land at
+    // its own pace, so a halo page evicted mid-pass refaults into a NEWER
+    // snapshot than its neighbours -- mixed-generation forces, 3e-04 drift
+    // against 5e-07 everywhere the halo stayed resident, with every counter
+    // clean. Pinning is the consumer-side fix (no barrier, no peer help):
+    // the halo stays resident like an MPI ghost buffer, and each exchange
+    // refreshes the SAME frames in place. Every fetch adds one pin; giving
+    // back LAST exchange's keeps the count at exactly one between steps.
+    // The reservation is taken once and released only when the resort swap
+    // hands the halo role to the other vector (HaloUnpinKernel).
+    const u32 pub_need = PagesSpanned(x, below, plane_elems_p) +
+                         PagesSpanned(x, above, plane_elems_p);
+    if (halo_first != 0u) co_await AdmitSpans(pub_need, x.Regions(), 0u);
     const long long _c1 = clock64();
     co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
     if (threadIdx.x == 0) {
       atomicAdd(&g_pub_fetch_cyc,
                 (unsigned long long)(clock64() - _c1));
     }
-    x.UnpinRange(below, plane_elems_p);
-    x.UnpinRange(above, plane_elems_p);
+    if (halo_first == 0u) {
+      x.UnpinRange(below, plane_elems_p);
+      x.UnpinRange(above, plane_elems_p);
+    }
   }
 }
 
 __global__ MD_LAUNCH_BOUNDS void PublishSlabKernel(
     clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x,
     gv::DeviceVector<float> v, u32 nb, u32 cap, u32 z0, u32 z1, u64 gen,
-    u32 nblocks, u32 tbl_base, gy::YieldableView<> yv,
+    u32 halo_first, u32 nblocks, u32 tbl_base, gy::YieldableView<> yv,
     gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   // tbl_base separates the ASYNC publish's task tables from the compute
@@ -2054,8 +2209,201 @@ __global__ MD_LAUNCH_BOUNDS void PublishSlabKernel(
   v.Init(tbl_base + yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(PublishSlabCoro(x, v, nb, cap, z0, z1, gen, nblocks,
-                                 yv.Block()));
+  CLIO_YCORO_RUN(PublishSlabCoro(x, v, nb, cap, z0, z1, gen, halo_first,
+                                 nblocks, yv.Block()));
+}
+
+/** Take the halo pin on a vector whose halo the NEXT pass will read at
+ *  `gen` -- the gather-scoped twin of the publish's persistent x pin. The v
+ *  halo is read only by the resort's gather, so pinning it per-resort beats
+ *  warming it every step; without the pin an evicted v page refaults
+ *  MID-GATHER into whatever generation the peer has flushed since (the peer
+ *  has no barrier and may already be publishing the next step), and a
+ *  migrating atom crosses with one generation's position and another's
+ *  velocity. */
+__device__ gy::YCoroMain HaloPinCoro(gv::DeviceVector<float> x, u32 nb,
+                                     u32 cap, u32 z0, u32 z1, u64 gen,
+                                     u32 block) {
+  if (block == 0) {
+    const u64 row_elems_p = static_cast<u64>(nb) * cap * kStride;
+    const u64 plane_elems_p = static_cast<u64>(nb) * row_elems_p;
+    const u64 below = static_cast<u64>((z0 + nb - 1u) % nb) * plane_elems_p;
+    const u64 above = static_cast<u64>(z1 % nb) * plane_elems_p;
+    const u32 need = PagesSpanned(x, below, plane_elems_p) +
+                     PagesSpanned(x, above, plane_elems_p);
+    co_await AdmitSpans(need, x.Regions(), 0u);
+    co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
+    // Pins deliberately kept; HaloUnpinKernel gives them back.
+  }
+  co_return;
+}
+
+__global__ MD_LAUNCH_BOUNDS void HaloPinKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u32 nb,
+    u32 cap, u32 z0, u32 z1, u64 gen, u32 tbl_base, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.Init(tbl_base + yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(HaloPinCoro(x, nb, cap, z0, z1, gen, yv.Block()));
+}
+
+/** REFAULT-STALENESS PROBE (MD_VERIFY_REFAULT=N): write a round-stamped
+ *  pattern to every slab page, publish it at the write site, drop every
+ *  frame, refault, and compare. The pattern encodes (page, round) in floats
+ *  small enough to be exact, so a mismatch does not just say "wrong" -- its
+ *  value says WHICH ROUND's bytes the store returned. Pages hash across the
+ *  cluster, so roughly half of every node's slab exercises the REMOTE
+ *  put/get path -- the one leg the single-node out-of-core gates never
+ *  touch. */
+__device__ float RefaultPattern(u64 pg, u64 round, u64 e) {
+  return (float)(((pg * 131ull + round * 4099ull + (e & 63ull)) & 0xFFFFull));
+}
+
+__device__ gy::YCoroMain RefaultWriteCoro(gv::DeviceVector<float> x,
+                                          u64 pg_lo, u64 pg_hi, u64 round,
+                                          u64 ppp, u32 nblocks, u32 block) {
+  const u64 epp = x.ElemsPerPage();
+  for (u64 pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
+    co_await x.Fetch(0, pg * epp, epp);
+    auto h = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
+    float *p = h.ptr();
+    for (u64 e = threadIdx.x; e < epp; e += blockDim.x) {
+      p[e] = RefaultPattern(pg, round, e);
+    }
+    __syncthreads();
+    co_await x.BeginFlush(0, pg * epp, epp);
+    x.UnpinRange(pg * epp, epp);
+  }
+  co_await x.EndFlush();
+  // THE EXCHANGE HALF: stamp the boundary planes at round+1, exactly the
+  // publish's job in the md step. ppp == 0 turns the protocol off.
+  if (ppp != 0 && block == 0) {
+    co_await x.BeginFlush(round + 1, pg_lo * epp, ppp * epp,
+                          (pg_hi - ppp) * epp, ppp * epp);
+    co_await x.EndFlush();
+  }
+}
+
+/** Which round wrote this value? -1 if it matches no round's pattern. */
+__device__ int RefaultDecode(u64 pg, u64 e, float v) {
+  for (int r = 0; r < 64; ++r) {
+    if (v == RefaultPattern(pg, (u64)r, e)) return r;
+  }
+  return -1;
+}
+
+__device__ gy::YCoroMain RefaultVerifyCoro(gv::DeviceVector<float> x,
+                                           u64 pg_lo, u64 pg_hi, u64 round,
+                                           u64 ppp, u64 below_pg, u64 above_pg,
+                                           u32 nblocks, u32 block,
+                                           unsigned long long *d_out) {
+  const u64 epp = x.ElemsPerPage();
+  for (u64 pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
+    co_await x.Fetch(0, pg * epp, epp);
+    auto h = co_await x.HoldPage(pg * epp, epp);
+    const float *p = h.ptr();
+    for (u64 e = threadIdx.x; e < epp; e += blockDim.x) {
+      const float want = RefaultPattern(pg, round, e);
+      if (p[e] != want) {
+        atomicAdd(&d_out[0], 1ull);
+        // First offender: page, element, and the observed bits.
+        if (atomicCAS((unsigned long long *)&d_out[1], 0ull, 1ull) == 0ull) {
+          d_out[2] = pg;
+          d_out[3] = e;
+          d_out[4] = (unsigned long long)__float_as_uint(p[e]);
+        }
+      }
+    }
+    __syncthreads();
+    x.UnpinRange(pg * epp, epp);
+  }
+  // THE CONSUMER HALF: read the PEER's boundary (our halo) at >= round+1 and
+  // decode WHICH ROUND each element's bytes came from. `exact` is the only
+  // healthy answer; `newer` is the free-running peer overwriting the store
+  // mid-protocol; `older` is a broken gate; `garbage` is a torn read.
+  if (ppp != 0 && block == 0) {
+    co_await x.Fetch(round + 1, below_pg * epp, ppp * epp, above_pg * epp,
+                     ppp * epp);
+    for (u32 half = 0; half < 2; ++half) {
+      const u64 base = (half == 0 ? below_pg : above_pg);
+      for (u64 pg = base; pg < base + ppp; ++pg) {
+        auto h = co_await x.HoldPage(pg * epp, epp);
+        const float *p = h.ptr();
+        for (u64 e = threadIdx.x; e < epp; e += blockDim.x) {
+          const int r = RefaultDecode(pg, e, p[e]);
+          if (r == (int)round) {
+            atomicAdd(&d_out[5], 1ull);
+          } else if (r > (int)round) {
+            atomicAdd(&d_out[6], 1ull);
+          } else if (r >= 0) {
+            atomicAdd(&d_out[7], 1ull);
+          } else {
+            atomicAdd(&d_out[8], 1ull);
+          }
+        }
+        __syncthreads();
+      }
+    }
+    x.UnpinRange(below_pg * epp, ppp * epp);
+    x.UnpinRange(above_pg * epp, ppp * epp);
+  }
+}
+
+__global__ MD_LAUNCH_BOUNDS void RefaultWriteKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u64 pg_lo,
+    u64 pg_hi, u64 round, u64 ppp, u32 nblocks, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RefaultWriteCoro(x, pg_lo, pg_hi, round, ppp, nblocks,
+                                  yv.Block()));
+}
+
+__global__ MD_LAUNCH_BOUNDS void RefaultVerifyKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u64 pg_lo,
+    u64 pg_hi, u64 round, u64 ppp, u64 below_pg, u64 above_pg, u32 nblocks,
+    unsigned long long *d_out, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(RefaultVerifyCoro(x, pg_lo, pg_hi, round, ppp, below_pg,
+                                   above_pg, nblocks, yv.Block(), d_out));
+}
+
+/** Give back the persistent halo pin before the resort swaps the handles:
+ *  the OTHER vector carries the halo from the next exchange on, and a pin
+ *  left behind would strand two planes of the scatter destination's pool. */
+__device__ gy::YCoroMain HaloUnpinCoro(gv::DeviceVector<float> x, u32 nb,
+                                       u32 cap, u32 z0, u32 z1, u32 block) {
+  if (block == 0) {
+    const u64 row_elems_p = static_cast<u64>(nb) * cap * kStride;
+    const u64 plane_elems_p = static_cast<u64>(nb) * row_elems_p;
+    const u64 below = static_cast<u64>((z0 + nb - 1u) % nb) * plane_elems_p;
+    const u64 above = static_cast<u64>(z1 % nb) * plane_elems_p;
+    const u32 need = PagesSpanned(x, below, plane_elems_p) +
+                     PagesSpanned(x, above, plane_elems_p);
+    x.UnpinRange(below, plane_elems_p);
+    x.UnpinRange(above, plane_elems_p);
+    ReleaseSpans(need);
+  }
+  co_return;
+}
+
+__global__ MD_LAUNCH_BOUNDS void HaloUnpinKernel(
+    clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x, u32 nb,
+    u32 cap, u32 z0, u32 z1, u32 tbl_base, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  x.Init(tbl_base + yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(HaloUnpinCoro(x, nb, cap, z0, z1, yv.Block()));
 }
 
 __global__ MD_LAUNCH_BOUNDS void ThermoKernel(clio::run::IpcManagerGpuInfo info,
@@ -3031,17 +3379,24 @@ int main(int argc, char **argv) {
   // below covers. The gap between the two columns is the hidden overhead.
   size_t vram_prev_probe = vram_free_before;
   auto account = [&](const char *what, u32 nslot, u64 pgb, u64 vec_pages,
-                     u64 cap_pages) {
+                     u64 cap_pages, u64 nblk) {
     size_t fnow2 = 0, tnow2 = 0;
     cudaMemGetInfo(&fnow2, &tnow2);
     const double real_mb = (vram_prev_probe > fnow2)
         ? (double)(vram_prev_probe - fnow2) / 1048576.0 : 0.0;
     vram_prev_probe = fnow2;
     const u64 slots = static_cast<u64>(nsets) * nslot;
-    const u64 bytes = cap_pages * pgb;      // the allocator's regions
+    // THE CONSTRUCTOR ROUNDS UP: every block owns the same number of regions
+    // (per_block = ceil(cap/nblocks)), so the real pool is a MULTIPLE of the
+    // task-table count. Report the rounded pool, not the request -- the first
+    // distributed OOC run asked for 12 regions, silently got 20 (one per
+    // table), and its evicts=0 looked like a broken counter instead of a
+    // cache that genuinely fit.
+    const u64 frames = (nblk != 0) ? ((cap_pages + nblk - 1) / nblk) * nblk
+                                   : cap_pages;
+    const u64 bytes = frames * pgb;         // the allocator's regions
     const u64 data = vec_pages * pgb;
     const u64 tbl = slots * sizeof(gv::Page);
-    const u64 frames = cap_pages;
     cache_frames_total += frames;
     cache_bytes_total += bytes;
     data_bytes_total += data;
@@ -3107,12 +3462,34 @@ int main(int argc, char **argv) {
   // x and v carry the halo: slab + 2 planes. f and the ping-pong buffers are
   // written per-slab only -- but the resort SWAPS the handles, so x2/v2
   // become x/v and need halo capacity too.
-  const u32 md_cap = (a.nodes > 1)
+  u32 md_cap = (a.nodes > 1)
       ? static_cast<u32>((zmine + 2) * ppp + 2)
       : static_cast<u32>(npages + 2);
-  const u32 md_cap_own = (a.nodes > 1)
+  u32 md_cap_own = (a.nodes > 1)
       ? static_cast<u32>(zmine * ppp + 2)
       : static_cast<u32>(npages + 2);
+  // OUT-OF-CORE, DECOMPOSED: an explicit --slots below residency caps the
+  // REGION capacity, not just the tags -- the cache then holds fewer pages
+  // than the slab touches and the run faults+evicts every step. This is only
+  // sound with the interior flushes ON (the default): eviction performs no
+  // I/O, so a dirty page's bytes survive eviction only because every write
+  // path published them first. MD_NO_INTERIOR + --slots would silently lose
+  // data, so refuse the combination outright.
+  if (a.slots != 0) {
+    if (a.nodes > 1 && EnvOn("MD_NO_INTERIOR")) {
+      std::fprintf(stderr,
+                   "--slots (out-of-core) with MD_NO_INTERIOR=1 would evict "
+                   "dirty pages whose only copy is the frame. Refusing.\n");
+      return 1;
+    }
+    // Single node too: same region pressure without the docker harness. The
+    // resident single-node ctests are untouched -- their pool rounds up to
+    // one region per block, which already exceeds their working set.
+    if (a.slots < md_cap) md_cap = a.slots;
+    // f is NOT capped: forces are never flushed (they are per-step scratch,
+    // rebuilt from x every step), so a dirty f page evicted under region
+    // pressure would lose its only copy. x/v/x2/v2 are the state that pages.
+  }
   // +4 TASK TABLES on x and v, reserved for the ASYNC publish kernel.
   // Tables are per logical block, and the publish overlaps the interior
   // force -- two kernels using one table means two in-flight tasks in one
@@ -3126,7 +3503,7 @@ int main(int argc, char **argv) {
   gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks + 4, x_slots,
                        g.nelems, clio::run::PoolId::GetNull(), 0, 1,
                        /*nsets=*/tbl_blocks, /*capacity_pages=*/md_cap);
-  account("x", x_slots, page_bytes, npages, md_cap);
+  account("x", x_slots, page_bytes, npages, md_cap, tbl_blocks + 4);
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
@@ -3134,7 +3511,7 @@ int main(int argc, char **argv) {
   gv::Vector<float> vv(tag("md_v"), {0}, page_bytes, tbl_blocks + 4, vslots,
                        g.nelems, clio::run::PoolId::GetNull(), 0, 1,
                        /*nsets=*/tbl_blocks, md_cap);
-  account("v", vslots, page_bytes, npages, md_cap);
+  account("v", vslots, page_bytes, npages, md_cap, tbl_blocks + 4);
   vx.EnableStats();
   vv.EnableStats();
   // ONE WRITER FOR THE INITIAL DECK, AND A BARRIER BEHIND IT.
@@ -3181,7 +3558,7 @@ int main(int argc, char **argv) {
                            use_third ? g.nelems : page_elems,
                            clio::run::PoolId::GetNull(), 0, 1);
   if (use_third) {
-    account("third", third_slots, page_bytes, npages, md_cap);
+    account("third", third_slots, page_bytes, npages, md_cap, tbl_blocks);
     std::vector<float> hz(g.nelems, 0.0f);
     vthird.Preload(hz.data(), g.nelems);
     vthird.ClearCache();
@@ -3325,7 +3702,7 @@ int main(int argc, char **argv) {
     gv::Vector<float> vf(tag("md_f"), {0}, page_bytes, tbl_blocks, fslots,
                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
                          md_cap_own);
-    account("f", fslots, page_bytes, npages, md_cap_own);
+    account("f", fslots, page_bytes, npages, md_cap_own, tbl_blocks);
     vf.EnableStats();
     {
       std::vector<float> hz(g.nelems, 0.0f);
@@ -3334,6 +3711,74 @@ int main(int argc, char **argv) {
     vf.ClearCache();
     vf.Prefetch(slab_pg_lo, slab_pg_hi, 0, 1);
     auto df = vf.GetDevice(0);
+    // MD_VERIFY_REFAULT=N: the write/evict/refault/compare probe, instead of
+    // the physics. See RefaultWriteCoro.
+    if (const char *vr = getenv("MD_VERIFY_REFAULT");
+        vr != nullptr && *vr != '\0' && atoi(vr) > 0) {
+      const int vr_rounds = atoi(vr);
+      // MD_VR_HALO=1 adds the exchange half: stamped boundary publishes and
+      // generational peer-boundary reads, decoded per element.
+      const bool vr_halo = EnvOn("MD_VR_HALO") && a.nodes > 1;
+      const u64 vr_ppp = vr_halo ? ppp : 0;
+      const u64 vr_below = ((u64)((my_z0 + g.nb - 1u) % g.nb)) * ppp;
+      const u64 vr_above = ((u64)(my_z1 % g.nb)) * ppp;
+      auto *d_vr =
+          ctp::GpuApi::Malloc<unsigned long long>(9 * sizeof(unsigned long long));
+      u64 total_bad = 0, total_newer = 0, total_older = 0, total_torn = 0;
+      for (int r = 0; r < vr_rounds; ++r) {
+        ctp::GpuApi::Memset(d_vr, 0, 9 * sizeof(unsigned long long));
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          RefaultWriteKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dx, slab_pg_lo, slab_pg_hi, (u64)r, vr_ppp, a.blocks, vw,
+              sv);
+        });
+        ctp::GpuApi::Synchronize();
+        vx.ClearCache();          // every frame dropped: each read refaults
+        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          RefaultVerifyKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dx, slab_pg_lo, slab_pg_hi, (u64)r, vr_ppp, vr_below,
+              vr_above, a.blocks, d_vr, vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+        unsigned long long h_vr[9] = {0};
+        ctp::GpuApi::Memcpy(h_vr, d_vr, sizeof(h_vr));
+        total_bad += h_vr[0];
+        total_newer += h_vr[6];
+        total_older += h_vr[7];
+        total_torn += h_vr[8];
+        if (h_vr[0] != 0) {
+          const unsigned int seen_bits = (unsigned int)h_vr[4];
+          float seen;
+          std::memcpy(&seen, &seen_bits, sizeof(seen));
+          std::printf("  refault round %d: %llu BAD elems; first pg=%llu "
+                      "e=%llu seen=%.1f want=%.1f\n",
+                      r, h_vr[0], h_vr[2], h_vr[3], seen,
+                      (double)(((h_vr[2] * 131ull + (u64)r * 4099ull +
+                                 (h_vr[3] & 63ull)) & 0xFFFFull)));
+        }
+        if (vr_halo) {
+          std::printf("  refault round %d: own %s | halo exact=%llu "
+                      "newer=%llu older=%llu garbage=%llu\n",
+                      r, h_vr[0] == 0 ? "clean" : "BAD", h_vr[5], h_vr[6],
+                      h_vr[7], h_vr[8]);
+        } else if (h_vr[0] == 0) {
+          std::printf("  refault round %d: clean\n", r);
+        }
+        std::fflush(stdout);
+      }
+      std::printf("  REFAULT VERIFY: %s (own bad=%llu halo newer=%llu "
+                  "older=%llu garbage=%llu over %d rounds)\n",
+                  (total_bad + total_newer + total_older + total_torn) == 0
+                      ? "PASS" : "FAIL",
+                  (unsigned long long)total_bad,
+                  (unsigned long long)total_newer,
+                  (unsigned long long)total_older,
+                  (unsigned long long)total_torn, vr_rounds);
+      return (total_bad + total_newer + total_older + total_torn) == 0 ? 0
+                                                                       : 1;
+    }
     // Ping-pong destination vectors for the resort (K2b scatters into
     // these, then the handles swap). Same geometry, resident.
     // The resort's destinations get their own cache size, so "the scatter
@@ -3352,8 +3797,8 @@ int main(int argc, char **argv) {
     gv::Vector<float> vv2(tag("md_v2"), {0}, page_bytes, tbl_blocks + 4,
                           ppslots, g.nelems, clio::run::PoolId::GetNull(), 0,
                           1, /*nsets=*/tbl_blocks, md_cap);
-    account("x2", ppslots, page_bytes, npages, md_cap);
-    account("v2", ppslots, page_bytes, npages, md_cap);
+    account("x2", ppslots, page_bytes, npages, md_cap, tbl_blocks + 4);
+    account("v2", ppslots, page_bytes, npages, md_cap, tbl_blocks + 4);
     vx2.EnableStats();
     vv2.EnableStats();
     {
@@ -3437,7 +3882,7 @@ int main(int argc, char **argv) {
     gv::Vector<int> vn(tag("md_nl"), {0}, nl_page_bytes, tbl_blocks, nlslots,
                        nl_elems, clio::run::PoolId::GetNull(), 0, 1, 0,
                        nl_cap);
-    account("list", nlslots, nl_page_bytes, nl_pages, nl_cap);
+    account("list", nlslots, nl_page_bytes, nl_pages, nl_cap, tbl_blocks);
     vn.EnableStats();
     {
       std::vector<int> hz(nl_elems, 0);
@@ -3509,11 +3954,15 @@ int main(int argc, char **argv) {
     // the force kernels while the exchange is in flight.
     YieldRunner pubrunner(4, a.threads);
     bool pub_pending = false;
+    // 1 on the FIRST exchange a vector serves as x (run start, and again
+    // after every resort swap): that exchange takes the persistent halo
+    // reservation and keeps its pins. See PublishSlabCoro block 2.
+    u32 halo_first = 1u;
     auto pub_launch = [&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                           gy::YieldStackView sv) {
       PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-          gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, /*nblocks=*/4,
-          /*tbl_base=*/a.blocks, vw, sv);
+          gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, halo_first,
+          /*nblocks=*/4, /*tbl_base=*/a.blocks, vw, sv);
     };
     auto pub_begin = [&]() {
       ++halo_gen;
@@ -3540,6 +3989,32 @@ int main(int argc, char **argv) {
           std::_Exit(3);
         }
       }
+      halo_first = 0u;   // the persistent halo pin is in place
+    };
+    // PUMP BOTH RUNNERS. runner.Run blocks the host until its kernel
+    // drains, but a force chunk's wait can transitively need the PUBLISH to
+    // advance (a boundary fetch waits on the peer's generation, the peer
+    // waits on OUR boundary flush, and our flush is a parked publish
+    // coroutine that only moves when the host Steps the pubrunner). With
+    // Run() the host is the missing edge in a three-way cycle: force waits
+    // on publish, publish waits on the host, the host waits on force --
+    // observed as one node frozen at `admit stall used=24` and the peer's
+    // generational get timing out (FATAL 7) forever. Stepping the pending
+    // publish between force rounds removes the host edge.
+    auto run_pumped = [&](auto &&launch) {
+      runner.BeginSeq();
+      u32 rounds = 0;
+      for (;;) {
+        const bool more = runner.Step(launch);
+        if (pub_pending && !pubrunner.Step(pub_launch)) pub_pending = false;
+        if (!more) break;
+        if (++rounds >= kMaxRounds) {
+          std::fprintf(stderr,
+                       "[driver] GAVE UP after %u pumped rounds -- blocks "
+                       "are still parked.\n", rounds);
+          break;
+        }
+      }
     };
     auto force = [&](int eflag) {
       if (trace) { std::fprintf(stderr, "[md] force eflag=%d\n", eflag);
@@ -3555,7 +4030,7 @@ int main(int argc, char **argv) {
         // Drain, then the two BOUNDARY planes run against a warm halo.
         const bool overlap = pub_pending && !eflag;
         const u32 band1 = overlap ? 1u : 0u;
-        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+        run_pumped([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           ListForceKernel<<<gr, b, smem_force>>>(
               gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
@@ -3565,7 +4040,7 @@ int main(int argc, char **argv) {
         });
         pub_drain();
         if (overlap) {
-          runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+          run_pumped([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                          gy::YieldStackView sv) {
             ListForceKernel<<<gr, b, smem_force>>>(
                 gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
@@ -3576,7 +4051,7 @@ int main(int argc, char **argv) {
       } else {
         pub_drain();
         MdMark("Force");
-        runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+        run_pumped([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           ForceKernel<<<gr, b, smem_force>>>(gpu, dx, df, g.nb, g.cap, fbox,
                                              fcut, eflag, d_acc, my_z0, my_z1,
@@ -3634,10 +4109,11 @@ int main(int argc, char **argv) {
       r_kick_pub += runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
-            /*tbl_base=*/0, vw, sv);
+            gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, halo_first,
+            a.blocks, /*tbl_base=*/0, vw, sv);
       });
       ctp::GpuApi::Synchronize();
+      halo_first = 0u;   // the persistent halo pin is in place
       // NO BARRIER HERE. THE GENERATION IS THE BARRIER.
       //
       // This used to be an all-reduce on a dummy value, once per exchange --
@@ -3848,6 +4324,19 @@ int main(int argc, char **argv) {
       });
       MdMark("Gather-v");
       MdMark("Gather-x");
+      // The v halo is consumed ONLY here; pin it for the whole gather so an
+      // eviction cannot refault it mid-pass into the peer's NEXT publish.
+      if (a.nodes > 1 && !no_halo) {
+        pubrunner.BeginSeq();
+        while (pubrunner.Step([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+          HaloPinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dv, g.nb, g.cap, my_z0, my_z1, halo_gen,
+              /*tbl_base=*/a.blocks, vw, sv);
+        })) {
+        }
+        ctp::GpuApi::Synchronize();
+      }
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         GatherKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
@@ -3855,6 +4344,17 @@ int main(int argc, char **argv) {
             my_z0, my_z1, a.blocks, no_halo ? 0 : halo_gen, vw, sv);
       });
       ctp::GpuApi::Synchronize();
+      if (a.nodes > 1 && !no_halo) {
+        pubrunner.BeginSeq();
+        while (pubrunner.Step([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+          HaloUnpinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dv, g.nb, g.cap, my_z0, my_z1, /*tbl_base=*/a.blocks, vw,
+              sv);
+        })) {
+        }
+        ctp::GpuApi::Synchronize();
+      }
       // INVALIDATE -- SINGLE NODE ONLY, and even there the rationale is the
       // private-cache era talking: with one shared cache the gather's
       // write-holds are already visible to every block. In decomposed mode
@@ -3871,6 +4371,20 @@ int main(int argc, char **argv) {
         vv.ClearCache();
         vx2.ClearCache();
         vv2.ClearCache();
+      }
+      // The halo role moves with the swap: give the old x its pins back and
+      // let the next exchange re-reserve on the new one.
+      if (a.nodes > 1) {
+        pubrunner.BeginSeq();
+        while (pubrunner.Step([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                                  gy::YieldStackView sv) {
+          HaloUnpinKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+              gpu, dx, g.nb, g.cap, my_z0, my_z1, /*tbl_base=*/a.blocks, vw,
+              sv);
+        })) {
+        }
+        ctp::GpuApi::Synchronize();
+        halo_first = 1u;
       }
       std::swap(dx, dx2);
       std::swap(dv, dv2);
@@ -3890,6 +4404,14 @@ int main(int argc, char **argv) {
       cudaMemcpyToSymbol(g_publish, &pub, sizeof(pub));
       const u32 pub_int = (a.nodes > 1 && EnvOn("MD_NO_INTERIOR")) ? 0u : 1u;
       cudaMemcpyToSymbol(g_pub_interior, &pub_int, sizeof(pub_int));
+      // Out of core the frames are NOT the only copy anyone will ever read:
+      // every write must reach the store before its page can be evicted.
+      const u32 md_flush = (a.slots != 0) ? 1u : 0u;
+      cudaMemcpyToSymbol(g_md_flush, &md_flush, sizeof(md_flush));
+      if (md_flush != 0u) {
+        std::printf("  [out-of-core] write-site publishes ON for x/v and the "
+                    "resort destinations\n");
+      }
       if (pub == 0u) {
         std::printf("  [MD_NO_PUBLISH] publishing DISABLED -- physics is "
                     "invalid, timing only\n");
@@ -4054,6 +4576,24 @@ int main(int argc, char **argv) {
             ? (res_ok ? "[resident contract HELD: no evictions]"
                       : "[RESIDENT CONTRACT VIOLATED: evicted]")
             : "[out-of-core regime: faults EXPECTED]");
+    {
+      // The x line alone hid which vector was actually churning: v and the
+      // neighbour list page too, and each has its own staleness story.
+      const auto sv_ = cvx == &vx ? vv.ReadStats(0) : vv2.ReadStats(0);
+      const auto sx2_ = cvx == &vx ? vx2.ReadStats(0) : vx.ReadStats(0);
+      const auto snl_ = vn.ReadStats(0);
+      std::printf("  paging+: v faults=%llu evicts=%llu ge=%llu | "
+                  "x2 faults=%llu evicts=%llu | nl faults=%llu evicts=%llu "
+                  "ge=%llu\n",
+                  (unsigned long long)sv_.faults,
+                  (unsigned long long)sv_.evicts,
+                  (unsigned long long)sv_.get_errors,
+                  (unsigned long long)sx2_.faults,
+                  (unsigned long long)sx2_.evicts,
+                  (unsigned long long)snl_.faults,
+                  (unsigned long long)snl_.evicts,
+                  (unsigned long long)snl_.get_errors);
+    }
     // REGIME-AWARE. The resident contract -- zero faults in the timed region
     // -- is a promise about the RESIDENT regime only: it says a cache that
     // can hold the working set must never page. Out of core the cache
