@@ -79,6 +79,49 @@ are 1e-07 and the bound annihilates them; here the currents are 1e+12 and the
 bound cannot reach them. Both runs report every chunk inside its bound, and
 both reports are true.
 
+### Reading the fields back: `read_fields.sh`
+
+`read.sh` proves the tier answered and the bytes are right. It does not write
+them anywhere, so there is nothing to look at. `read_fields.sh` does the
+equivalent of `--dump-decompressed` on the other three workloads — which have a
+Clio driver to put the flag on, and this one does not:
+
+```bash
+./read_fields.sh --results /tmp/wx2 --runs "eb001 eb01 eb10" --out /tmp/wx-cmp
+```
+
+It reads each run's own `.h5` **twice** — once through the native HDF5 VOL for
+the originals, once through Clio's for the decompressed copies — and writes both
+as raw float32. Within a run, deliberately: comparing across runs would measure
+WarpX's own 0.6% run-to-run spread instead of the codec.
+
+**The native file is authoritative and uncompressed, so a VOL read that misses
+the tier returns correct bytes and looks exactly like perfect lossless
+compression.** Every read therefore records its `inverting codec` count into
+`inversions.csv`, and a pair whose read reported zero must be discarded, not
+published as bit-exact. That is the one way this comparison can lie. On the
+measurements below all 66 reads inverted at least one codec.
+
+### Read back, one bound annihilates one field and never touches another
+
+`B/y` grows from 0 to 0.11 over the run, so an absolute bound is first wider
+than the entire field and later a small fraction of it. Error as a share of
+`B/y`'s own range, per diagnostic:
+
+| step | 4 | 12 | 20 | 28 | 36 | 40 |
+|---|---|---|---|---|---|---|
+| `B/y` range | 3.7e-06 | 5.6e-05 | 4.7e-04 | 3.9e-03 | 4.1e-02 | 1.1e-01 |
+| `--eb 0.001` | **100%** | **100%** | **100%** | 24% | 2% | 1% |
+| `--eb 0.01` | **100%** | **100%** | **100%** | **100%** | 23% | 9% |
+| `--eb 0.1` | **100%** | **100%** | **100%** | **100%** | **100%** | 89% |
+| `E/z`, any bound | 0% | 0% | 0% | 0% | 0% | 0% |
+
+`E/z` reaches 1.5e+11, so even `--eb 0.1` — whose largest measured error on it
+is 1.0 — rounds to **0.0% of its range at every diagnostic**. One bound, one
+file, one run: total loss on one field and invisible on the other. The same
+bound also changes behaviour *within* the run as the field amplifies, which no
+per-run summary number can show.
+
 **Each policy is its own WarpX run**, so these are not byte-identical
 comparisons the way Nyx and VPIC are. Measured run-to-run spread on this
 configuration is 0.6% (11.860× vs 11.792× lossless; 15.167× vs 15.197× at
