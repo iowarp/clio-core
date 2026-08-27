@@ -118,7 +118,7 @@ SelectionLog *SelectionLogInstance() {
                      "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
                      "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
                      "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
-                     "actual_ct_ms,actual_psnr,checksum\n");
+                     "actual_ct_ms,actual_psnr,checksum,role\n");
       }
     }
     return l;
@@ -249,7 +249,7 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             const CompressionStats *predicted,
                             double actual_ratio, double actual_ct_ms,
                             double actual_psnr,
-                            unsigned long long checksum) {
+                            unsigned long long checksum, const char *role) {
   SelectionLog *log = SelectionLogInstance();
   if (!log->fp) return;
 
@@ -287,7 +287,7 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 
   std::fprintf(fp,
                "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
-               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu\n",
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu,%s\n",
                log->seq++, blob_name.c_str(), chunk_size, entropy, mad,
                second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
                shuffle, preset,
@@ -295,7 +295,8 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                predicted ? predicted->compress_time_ms_ : 0.0,
                predicted ? predicted->decompress_time_ms_ : 0.0,
                predicted ? predicted->psnr_db_ : 0.0,
-               actual_ratio, actual_ct_ms, actual_psnr, checksum);
+               actual_ratio, actual_ct_ms, actual_psnr, checksum,
+               role ? role : "primary");
   std::fflush(fp);
 }
 

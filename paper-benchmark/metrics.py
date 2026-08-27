@@ -59,6 +59,17 @@ def parse_blob(name, interval):
     return None
 
 
+def normalise_selection_key(k):
+    """WarpX selection keys are dataset paths; blobs.csv uses field/step."""
+    m = re.match(r"^/data/(\d+)/fields/([A-Za-z]+)/([xyz])/chunk_(\d+)$", k)
+    if m:
+        return f"{m[2]}{m[3]}/step_{m[1]}/chunk_{m[4]}"
+    m = re.match(r"^/data/(\d+)/fields/([A-Za-z]+)/chunk_(\d+)$", k)
+    if m:
+        return f"{m[2]}/step_{m[1]}/chunk_{m[3]}"
+    return k
+
+
 def num(x, default=0.0):
     try:
         return float(x)
@@ -84,7 +95,18 @@ def summarise(cell):
     sel_path = os.path.join(cell, "selection.csv")
     if os.path.exists(sel_path):
         for s in csv.DictReader(open(sel_path)):
-            sel[s.get("blob", "")] = s
+            k = s.get("blob", "")
+            sel[k] = s
+            # THE TWO LOGS DO NOT AGREE ON BLOB KEYS. WarpX's selection log
+            # names a chunk by its HDF5 dataset path while blobs.csv names it
+            # by field and step:
+            #     /data/0/fields/B/x/chunk_0   vs   Bx/step_0/chunk_0
+            # A plain join therefore matches NOTHING for WarpX and leaves every
+            # model-feature column silently empty -- 240 of 240 rows, with no
+            # error. Normalise so the features actually land.
+            nk = normalise_selection_key(k)
+            if nk != k:
+                sel.setdefault(nk, s)
 
     out_rows, unparsed = [], 0
     for r in rows:
@@ -153,6 +175,15 @@ def summarise(cell):
         "timesteps": steps, "n_timesteps": len(steps),
         "chunks_per_field_frame": len(chunks),
         "unparsed_blob_names": unparsed,
+        # selection.csv records the MODEL'S pick; blobs.csv records what was
+        # actually stored after exploration. They disagree whenever a sweep
+        # overrode the model -- 43% of chunks measured across the smoke matrix,
+        # up to 100% on LAMMPS lossy. Counted here so no analysis silently
+        # attributes a chunk to the codec that lost.
+        "selection_overridden_by_explore": sum(
+            1 for r in out_rows
+            if sel.get(r["blob"], {}).get("lib_name", r["codec"]) != r["codec"]),
+        "selection_features_joined": sum(1 for r in out_rows if r["entropy"] != ""),
 
         "ratio_mean": round(st.mean(ratios), 4) if ratios else None,
         "ratio_median": round(st.median(ratios), 4) if ratios else None,

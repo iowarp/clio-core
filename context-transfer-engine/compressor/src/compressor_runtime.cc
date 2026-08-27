@@ -2497,6 +2497,30 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                       winner.payload.size(), /*on_device=*/false,
                       winner_total < chunk_size, winner.time_ms, "adopted");
                 }
+                // THE SELECTION LOG IS WRITTEN BEFORE THE SWEEP RUNS, so
+                // its row names the model's pick and the PRIMARY's ratio --
+                // measured across a smoke matrix, that disagreed with what
+                // was actually stored for 43% of chunks (100% on LAMMPS
+                // lossy), and its column named "actual_ratio" reported 13.975
+                // where 225.403 was stored. Emit a second row for the winner
+                // so the log ends with the truth. Same "last row for a blob
+                // wins" convention the payload log above already uses; the
+                // primary's row is kept because the model's pick is exactly
+                // what a selection study wants to compare against.
+                if (SelectionLogEnabled()) {
+                  LogNeuroPressSelection(
+                      task->blob_name_.str(), chunk_size, neuropress_entropy,
+                      neuropress_mad, neuropress_second_deriv, winner.lib,
+                      static_cast<int>(
+                          PackPreset(winner.preset_id, winner.shuffle) |
+                          PackQuant(winner.quant,
+                                    winner.quant_params.precision)),
+                      /*predicted=*/nullptr, winner.ratio, winner.time_ms,
+                      /*actual_psnr=*/-1.0,
+                      // The chunk's checksum is on the primary's row; the
+                      // input bytes are the same one, so it is not repeated.
+                      /*checksum=*/0ull, "adopted");
+                }
                 task->context_ = winner_ctx;
                 task->context_.actual_original_size_ = chunk_size;
                 task->context_.actual_compressed_size_ = winner_total;

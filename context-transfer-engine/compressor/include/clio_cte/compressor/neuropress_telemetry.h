@@ -34,7 +34,8 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                             int wire_lib, int packed_preset,
                             const CompressionStats *predicted,
                             double actual_ratio, double actual_ct_ms,
-                            double actual_psnr, unsigned long long checksum);
+                            double actual_psnr, unsigned long long checksum,
+                            const char *role = "primary");
 
 /** One row of a sweep. is_primary marks the model's own pick, logged alongside
  *  the alternatives so all actions for a chunk sit in one file. `adopted` marks
