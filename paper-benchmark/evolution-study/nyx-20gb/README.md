@@ -10,7 +10,38 @@ gen.json  gen.log  gen.nyx.log     the dump run
 evolution.json  blocks.csv.gz      its block evolution, 19,200 block samples
 insitu.*                           the in-situ run at the same settings
 run.sh                             the exact commands, re-runnable
+chunk_log.py                       everything recorded about any one chunk
 ```
+
+## Reading it per chunk
+
+```bash
+./chunk_log.py                                   # index: fields, frames, chunks
+./chunk_log.py --field xmom --step 799 --chunk 5 # one chunk, all four sources
+./chunk_log.py --csv /tmp/chunks.csv             # all 4,800, 33 columns each
+```
+
+The four CSVs record the same run from four angles and none is a superset of
+the others — model inputs and prediction (`selection`), every candidate
+measured (`explore`), what reached the tier (`blobs`), and how far the data
+itself moved (`blocks`). Joining the fourth to the other three needs two
+conversions, which is the whole reason the script exists rather than an awk
+one-liner:
+
+- **step** — the in-situ hook fires after the step completes and labels the
+  frame with the step index, so `step_00039` is the frame at simulation step
+  40, which `blocks.csv` calls `step_to = 40`. `dump_step = insitu_step + 1`.
+- **block size** — a compressor chunk is 4 MiB, an evolution block is 1 MiB, so
+  chunk `c` covers blocks `4c…4c+3` and the evolution figures are aggregates
+  over four rows.
+
+They are also two separate executions of the same configuration, so the
+evolution numbers describe the dump route's bytes, not the in-situ run's.
+
+What the join is for: sorting the 4,800 chunks by `ev_mean` puts the
+**quietest quartile at a mean stored ratio of 265× and the busiest at 13.9×**
+— the same 19× spread the workload was chosen to produce, now attributable to
+individual chunks.
 
 The 20.5 GB of `.f32` and the 5.4 GB compressed tier behind these files are
 **not committed** — same rule as the rest of `evolution-study`. `run.sh`
