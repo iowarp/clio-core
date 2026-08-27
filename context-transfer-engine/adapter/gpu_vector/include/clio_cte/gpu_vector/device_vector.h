@@ -222,6 +222,8 @@ class DeviceVector {
   CTP_GPU_FUN clio::run::u64 size() const { return h_->num_elems_; }
   CTP_GPU_FUN clio::run::u64 PageBytes() const { return h_->page_bytes_; }
   CTP_GPU_FUN clio::run::u64 ElemsPerPage() const { return h_->elems_per_page_; }
+  /** Page-sized regions in the pool: what a caller's hold sets must fit in. */
+  CTP_GPU_FUN clio::run::u32 Regions() const { return h_->nregions_; }
   CTP_GPU_FUN clio::run::u64 PageOf(clio::run::u64 off) const {
     return off / h_->elems_per_page_;
   }
@@ -333,7 +335,79 @@ class DeviceVector {
                                              Args... args) {
     co_await BeginFetch(generation, args...);
     co_await AwaitFetch();
+    // FETCH RETURNS MEANS THE GENERATION ARRIVED. SubmitFetch skips a stale
+    // page whose refetch a PEER already owns (the CAS-lost `busy` arm) -- the
+    // peer's transfer will raise the frame, but OUR multi-task never carries
+    // it, so AwaitFetch cannot wait for it. Returning there let the caller
+    // hold a still-stale frame: a whole page of last-generation positions,
+    // read as current. Resident runs never saw it (busy=0 across every clean
+    // gate); the first distributed out-of-core runs drifted 3e-04 with busy
+    // 4..36 while the same physics held 5e-8..5e-7 wherever busy was zero.
+    // So wait here, holding our own pins only, until every named page shows
+    // the demanded generation. Tag 0: any round may deliver the peer's
+    // publish. The frames cannot vanish -- SubmitFetch pinned each one.
+    if (generation != 0) {
+      clio::run::u64 glo[kMaxFetchRanges], ghi[kMaxFetchRanges];
+      clio::run::u32 gnr = 0;
+      GatherRanges(glo, ghi, gnr, args...);
+      clio::run::u32 rounds = 0;
+      for (;;) {
+        bool wait = false;
+        if (threadIdx.x == 0) {
+          wait = GenStillBelow(generation, glo, ghi, gnr);
+          // Parked kernels exit their round, so this printf reaches the host
+          // console mid-wedge. Diagnostic only; the wait never gives up.
+          if (wait && ++rounds == 100000u) {
+            rounds = 0;
+            ReportGenStall(generation, glo, ghi, gnr);
+          }
+        }
+        __syncthreads();
+        if (!__syncthreads_or(wait ? 1 : 0)) break;
+        co_await ::clio::run::gpu::YCoroSuspend{0ull};
+      }
+    }
     co_return;
+  }
+
+  /** Name the first page still below the demanded generation. */
+  __device__ void ReportGenStall(clio::run::u64 gen, const clio::run::u64 *lo,
+                                 const clio::run::u64 *hi,
+                                 clio::run::u32 nr) const {
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
+        volatile Page *p = const_cast<volatile Page *>(FindClaimed(pn));
+        if (p != nullptr && p->generation < gen) {
+          printf("[gpu_vector] gen stall: page %llu at gen %llu want %llu "
+                 "fetching=%u pins=%u\n",
+                 (unsigned long long)pn, (unsigned long long)p->generation,
+                 (unsigned long long)gen, p->fetching, p->pins);
+          return;
+        }
+      }
+    }
+  }
+
+  /** Any page of these ranges still below `gen`? Thread 0 scans; peers say
+   *  no and the yield macro's vote broadcasts the verdict. */
+  __device__ bool GenStillBelow(clio::run::u64 gen, const clio::run::u64 *lo,
+                                const clio::run::u64 *hi,
+                                clio::run::u32 nr) const {
+    if (threadIdx.x != 0) return false;
+    for (clio::run::u32 r = 0; r < nr; ++r) {
+      if (hi[r] <= lo[r]) continue;
+      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p1 = PageOf(hi[r] - 1);
+      for (clio::run::u64 pn = p0; pn <= p1; ++pn) {
+        volatile Page *p =
+            const_cast<volatile Page *>(FindClaimed(pn));
+        if (p != nullptr && p->generation < gen) return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -877,6 +951,35 @@ class DeviceVector {
            "fixed by the hash. Fetch fewer pages at once, UnpinRange sooner, "
            "or raise the cache size.\n",
            set, (unsigned long long) pn, pinned, h_->set_size_, busy);
+    // THE HOME SET IS NOT THE WHOLE STORY. A clean home set with a failed
+    // claim means the REGION pool is dry, and the regions live wherever
+    // frames across ALL sets hold them -- so say where. `fet`/`flu` frames
+    // are the interesting ones: eviction refuses them, and a leaked mark
+    // (a fetch never published, a flush never settled) turns a frame into
+    // storage no one can ever reclaim.
+    clio::run::u32 res = 0, pin_all = 0, fet = 0, flu = 0, freed = 0;
+    for (clio::run::u32 s = 0; s < h_->nsets_; ++s) {
+      Page *t2 = SetPages(s);
+      for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+        volatile Page *c = &t2[i];
+        if (c->page_num == kNoPage) { ++freed; continue; }
+        ++res;
+        if (c->pins != 0u) ++pin_all;
+        if (c->fetching != 0u) ++fet;
+        if (c->flushing != 0u) ++flu;
+      }
+    }
+    clio::run::u32 q = 0;
+    if (h_->free_q_ != nullptr) {
+      for (clio::run::u32 b = 0; b < h_->nblocks_; ++b) {
+        q += h_->free_head_[b] <= h_->free_tail_[b]
+                 ? (h_->free_tail_[b] - h_->free_head_[b])
+                 : 0u;
+      }
+    }
+    printf("[gpu_vector]   all sets: %u resident (%u pinned, %u fetching, "
+           "%u flushing), %u empty tags; %u of %u regions on free lists\n",
+           res, pin_all, fet, flu, freed, q, h_->nregions_);
   }
 
   /** One eviction pass over one set; returns how many frames it dropped. */
@@ -1072,6 +1175,25 @@ class DeviceVector {
           // leaves the frame PINNED -- the pin is what stops another CUDA
           // block evicting this page between here and the caller's HoldPage.
           p = AllocatePage(pn, &is_new);
+          // TRANSIENT PRESSURE IS NOT A WEDGE. Under a genuinely
+          // oversubscribed cache (regions < working set), every frame can be
+          // pinned for the microseconds it takes peer blocks to finish their
+          // chunks and UnpinRange -- the first distributed out-of-core run
+          // trapped here while its own report showed 1 of 19 frames pinned,
+          // the spike already drained. Peers' unpins need no help from this
+          // block, so waiting is safe: back off and re-claim (AllocatePage
+          // itself retries both evictions). Only a pressure that never
+          // drains -- the true hold-set livelock -- reaches the trap.
+          constexpr clio::run::u32 kMaxWaitNs = 1u << 20;            // 1 ms
+          clio::run::u32 wait_ns = 1024u;
+          for (clio::run::u32 spins = 0; p == nullptr && spins < 4096u;
+               ++spins) {                        // ~4 s of 1 ms waits, then trap
+#if __CUDA_ARCH__ >= 700
+            __nanosleep(wait_ns);
+#endif
+            if (wait_ns < kMaxWaitNs) wait_ns *= 2u;
+            p = AllocatePage(pn, &is_new);
+          }
           if (p == nullptr) {
             ReportSetFull(pn);
             FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)));

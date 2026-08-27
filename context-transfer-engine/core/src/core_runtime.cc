@@ -2677,6 +2677,31 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         }
         blob_info_ptr = CheckBlobExists(blob_name, tag_id);
       }
+      // SERVED-NEWER IS THE FREE-RUNNING-PEER SIGNATURE. The gate promises
+      // ">= generation", so a slow reader (an out-of-core fault chain) can
+      // arrive AFTER the writer has already advanced past the demanded
+      // version -- the read then returns a LATER step's bytes with rc=0.
+      // Log it so a physics drift can be attributed instead of inferred.
+      {
+        static const bool gen_log = [] {
+          const char *v = getenv("CLIO_GEN_LOG");
+          return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (gen_log && blob_info_ptr != nullptr) {
+          const clio::run::u64 served =
+              blob_info_ptr->RangeGeneration(offset, size);
+          if (served > task->context_.generation_) {
+            fprintf(stderr,
+                    "[gen] NEWER get blob '%s' [%llu,%llu) want=%llu "
+                    "served=%llu (node %u)\n",
+                    blob_name.c_str(), (unsigned long long)offset,
+                    (unsigned long long)(offset + size),
+                    (unsigned long long)task->context_.generation_,
+                    (unsigned long long)served,
+                    (unsigned)CLIO_IPC->GetNodeId());
+          }
+        }
+      }
     }
 
     // If blob doesn't exist, error -- unless the caller asked for it to be
