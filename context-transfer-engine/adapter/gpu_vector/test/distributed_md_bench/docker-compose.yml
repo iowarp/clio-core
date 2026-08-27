@@ -73,6 +73,14 @@ x-node: &node
   stop_grace_period: 5s
   security_opt:
     - seccomp:unconfined
+  # UNLIMITED memlock. cudaHostRegister charges against RLIMIT_MEMLOCK, and
+  # docker's default (64 MB) makes the RAM tier's best-effort span pinning
+  # fail SILENTLY once a big deck's tier outgrows it -- leaving holes in the
+  # pinned tiling, and a cuda copy that crosses a pinned/unpinned seam fails
+  # with "invalid argument" (mixed registration in one range is illegal).
+  # Measured as 6 gpu_api recoveries per lattice-41 run.
+  ulimits:
+    memlock: -1
   user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
   volumes:
     - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:rw

@@ -948,6 +948,19 @@ int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
     size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
     clio::run::u64 intra = cur_off % kRamPageSize;
     clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    // NEVER LET ONE CUDA COPY CROSS A REGISTRATION-SPAN BOUNDARY. The SHM
+    // tier is pinned in populate_unit_ quanta as separate cudaHostRegister
+    // calls, and CUDA requires a copy's whole range to lie within ONE
+    // registration -- a range spanning two ADJACENT pinned spans fails with
+    // "invalid argument" (measured: sync and async, base attributes clean,
+    // rlimit unlimited). A tier that fits one span never crosses, which is
+    // why small decks were immune. Split at the quanta like we already split
+    // at page boundaries.
+    if (shm_backed_ && populate_unit_ != 0) {
+      const clio::run::u64 span_left =
+          populate_unit_ - (cur_off % populate_unit_);
+      if (chunk > span_left) chunk = span_left;
+    }
     char* page = GetRamPage(page_idx);
     char* d = dst + data_offset;
     if (page != nullptr && use_stream) {
@@ -1011,6 +1024,19 @@ int MemBdevTransport::DirectWrite(clio::run::u64 off, clio::run::u64 size,
     size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
     clio::run::u64 intra = cur_off % kRamPageSize;
     clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    // NEVER LET ONE CUDA COPY CROSS A REGISTRATION-SPAN BOUNDARY. The SHM
+    // tier is pinned in populate_unit_ quanta as separate cudaHostRegister
+    // calls, and CUDA requires a copy's whole range to lie within ONE
+    // registration -- a range spanning two ADJACENT pinned spans fails with
+    // "invalid argument" (measured: sync and async, base attributes clean,
+    // rlimit unlimited). A tier that fits one span never crosses, which is
+    // why small decks were immune. Split at the quanta like we already split
+    // at page boundaries.
+    if (shm_backed_ && populate_unit_ != 0) {
+      const clio::run::u64 span_left =
+          populate_unit_ - (cur_off % populate_unit_);
+      if (chunk > span_left) chunk = span_left;
+    }
     // Ensure, not Get: a write ALLOCATES the page it lands in.
     char* page = EnsureRamPage(page_idx);
     if (page == nullptr) {
