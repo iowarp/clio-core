@@ -112,6 +112,7 @@ VARS=()
 # out identical and only the timings move.
 REQUIRE_DEVICE=0
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0 RAW_DIR="" F32=0 DECK=""
+DECOMP_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --box) BOX=$2; shift 2;;
@@ -133,6 +134,8 @@ while [ $# -gt 0 ]; do
     --bw) BW=$2; shift 2;;
     --eb) EB=$2; shift 2;;
     --raw) RAW_DIR=$2; shift 2;;
+    # The decompressed bytes, for an external comparison against --raw.
+    --dump-decompressed) DECOMP_DIR=$2; shift 2;;
     --f32) F32=1; shift;;
     --deck) DECK=$2; shift 2;;
     --explore-k) EXPLORE_K_OPT=$2; shift 2;;
@@ -247,6 +250,7 @@ ARGS=(--deck "${DECK:-$HERE/in.melt}" --box "$BOX" --steps "$STEPS" --gap "$GAP"
 # --raw writes the bytes handed to the compressor, which is the only way to see
 # this workload at all: it is in-situ, so there is no dump file anywhere.
 [ -n "$RAW_DIR" ] && { mkdir -p "$RAW_DIR"; ARGS+=(--raw "$RAW_DIR"); }
+[ -n "$DECOMP_DIR" ] && { mkdir -p "$DECOMP_DIR"; ARGS+=(--dump-decompressed "$DECOMP_DIR"); }
 # A positive bound means the decompressed bytes are NOT the bytes staged, so
 # the digest check would report FAILED on a run doing exactly what was asked.
 [ -n "$EB" ] && ARGS+=(--expect-lossy)
