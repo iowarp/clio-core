@@ -53,7 +53,7 @@
 #include <clio_ctp/util/gpu_api.h>
 
 #include "gnn_dataset.h"
-#include "../gnn/gnn_aggregate_impl.h"
+#include "../benchmark/gnn/gnn_aggregate_impl.h"
 
 #include <algorithm>
 #include <chrono>

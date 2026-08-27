@@ -141,7 +141,7 @@ inline Dataset LoadOrSynthDataset(const std::string &dir, const char *tag,
   const std::int64_t deg = EnvI64("CLIO_GNN_SYNTH_DEG", 10);
   std::fprintf(stderr,
                "[%s] %s/meta.txt not found -- SYNTHETIC dataset "
-               "(run gnn/gnn_prep.py for the real ogbn-arxiv numbers)\n",
+               "(run benchmark/gnn/gnn_prep.py for the real ogbn-arxiv numbers)\n",
                tag, dir.c_str());
 
   d.feat.resize((size_t)(d.N * (std::int64_t)d.F * (std::int64_t)sizeof(float)));

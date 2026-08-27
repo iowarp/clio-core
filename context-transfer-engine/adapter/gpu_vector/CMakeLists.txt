@@ -18,7 +18,6 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
         DESTINATION include)
 
 add_subdirectory(benchmark)
-add_subdirectory(gnn)
 
 if(CLIO_CORE_ENABLE_TESTS)
     add_subdirectory(test)

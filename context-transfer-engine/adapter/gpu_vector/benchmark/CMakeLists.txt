@@ -12,12 +12,14 @@
 #   grayscott/   reaction-diffusion paged
 #   kmeans/      k-means            paged
 #   weights/     weight streaming   paged
+#   gnn/         GNN ingest + 1-hop aggregation tooling (host-side)
 #
 # The files remaining here are the vector's own micro-benchmarks (access,
 # flush, overlap, stream) and the register-cap probes.
 #------------------------------------------------------------------------------
 
 add_subdirectory(lammps_md)
+add_subdirectory(gnn)
 add_subdirectory(gmx)
 add_subdirectory(lbann)
 add_subdirectory(grayscott)
