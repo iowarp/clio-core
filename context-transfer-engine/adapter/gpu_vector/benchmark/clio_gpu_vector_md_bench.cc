@@ -4115,15 +4115,18 @@ int main(int argc, char **argv) {
     // that can order anything.
     auto exchange = [&]() {
       if (a.nodes <= 1 || no_halo) return;
-      ++halo_gen;
-      r_kick_pub += runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
-                     gy::YieldStackView sv) {
-        PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
-            gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, halo_first,
-            a.blocks, /*tbl_base=*/0, vw, sv);
-      });
+      // THE SAME 4-BLOCK PUBLISH AS THE PER-STEP EXCHANGE, driven to
+      // completion. This used to launch PublishSlabKernel on the MAIN runner
+      // with a.blocks blocks -- and the coro's halo-warm arm is block 2, so
+      // any --blocks < 3 run simply never executed it while the host still
+      // cleared halo_first: the persistent halo pin was never taken, the
+      // halo paged in and out every step, and the mid-read overwrite race
+      // came back as a silent few-ulp poison (caught by the 4x sweep point:
+      // refetch=0 where every healthy config shows one per halo page per
+      // step, and a trajectory that no longer matched the reference).
+      pub_begin();
+      pub_drain();
       ctp::GpuApi::Synchronize();
-      halo_first = 0u;   // the persistent halo pin is in place
       // NO BARRIER HERE. THE GENERATION IS THE BARRIER.
       //
       // This used to be an all-reduce on a dummy value, once per exchange --
