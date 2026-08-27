@@ -121,14 +121,207 @@ repeats that from a *different* process with `CLIO_RESTART=1`, sharing only the
 store directory and `blobs.csv` with the writer -- the field files are never
 opened, so the compressed tier is the only copy of the data in existence.
 
-`gen_fields.sh` takes `--ncell --steps --plot-int --out --bin`; `run_sweep.sh`
-takes `--fields --chunk --max-files --repeats --configs --results`. Defaults
+`gen_fields.sh` takes `--ncell --steps --plot-int --out --bin --keep-plt`;
+`run_sweep.sh` takes `--fields --chunk --max-files --repeats --configs --results`. Defaults
 are 128³, 200 steps, dumping every 10 → 21 frames × 6 components × 8 MiB ≈
 1,008 MiB, chunked at 4 MiB into 252 chunks — deliberately the same chunk
 count as the LAMMPS benchmark.
 
 Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 `rho_E`, `rho_e`.
+
+## Looking at the data
+
+```bash
+./gen_fields.sh --ncell 64 --steps 400 --plot-int 16 --exp-energy 10 \
+                --keep-plt --out /tmp/nyx-quick             # ~2 s, 157 MiB
+./viz_fields.py --fields /tmp/nyx-quick --plt /tmp/nyx-quick-plotfiles \
+                --out /tmp/nyx-viz                          # ~4 s
+```
+
+`viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
+the point: those files, not Nyx's plotfiles, are what the compressor is handed,
+so what it draws is what the sweep compresses. Per field it writes a montage of
+mid-plane slices across the run and the same slices as a GIF; once per run it
+writes `evolution.png`, which puts shock radius, fraction of the domain off
+ambient, and a zlib stand-in for the compression ratio on one time axis.
+
+**Two things it is worth pointing at a dataset for.**
+
+*Does this run actually evolve?* Point it at the default `./fields` and the
+answer is visibly no — shock radius reaches 0.18 of the box and **1.8% of cells
+are off ambient at the last dump**. That is the deck default `exp_energy=1`
+described under "`--exp-energy` is the knob that makes the data evolve", and it
+is much faster to see than to infer from a ratio table. The 64³ recipe above
+reaches 0.48 and 40%.
+
+*Is the shuffle result real?* The ratio panel reproduces it in three lines of
+python: on the quick run, density goes 1005× → 3.8× unshuffled against
+1005× → 5.1× with a 4-byte shuffle, the same ordering the nvcomp-zstd sweep
+finds at 132.6× vs 162.9×. zlib is not nvcomp-zstd and the magnitudes do not
+transfer; the shape and the ordering do.
+
+Two details that are easy to get wrong and quiet when you do:
+
+- **The dumps are Fortran-ordered** — `copyToMem` packs in the FAB's own
+  layout, x fastest. Read C-ordered, the axes come back reversed. Density is
+  spherically symmetric so it looks fine; `xmom` gets sliced along *x*, where
+  it is antisymmetric and the midplane is ~0, and every frame renders blank.
+  The check is that `xmom` on the z-midplane satisfies `f(x) = -f(-x)`, which
+  it does to 7e-6 in float32.
+- **Signed fields need a percentile color scale, not a max.** The initial
+  energy deposit puts |xmom| ≈ 100 into two cells while the shell that matters
+  carries ≈ 10; scale to the max and 24 of 26 frames are blank.
+
+### Seeing what a lossy bound costs
+
+`viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
+plate. It needs the decompressed bytes, which the replay driver will write on a
+cold read:
+
+```bash
+# Tag explicitly. Deriving one by stripping '0' and '.' collapses 0.001, 0.01
+# and 0.1 to the same string, and the second run silently overwrites the first.
+for spec in 0.001:eb001 0.01:eb01 0.1:eb10; do
+  EB=${spec%%:*}; T=${spec##*:}
+  CLIO_NEUROPRESS_STAGE_H2D=1 ./run_config.sh dynamic --fields /tmp/nyx-quick \
+      --chunk 1048576 --eb $EB --check-bound --results /tmp/nyx-lossy --tag $T
+  $BUILD/bin/neuropress_field_replay --readback /tmp/nyx-lossy/$T/blobs.csv \
+      --dump-decompressed /tmp/nyx-decomp/$T --tag nyx_$T \
+      --dir /tmp/nyx-quick --ext .f32 --chunk 1048576 --check-bound
+done
+./viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
+    --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
+    --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
+./viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
+    --sel 0.01:/tmp/nyx-lossy/eb01 --sel 0.1:/tmp/nyx-lossy/eb10
+```
+
+`--compare EB:DIR` is repeatable. The plate is original on top, one decompressed
+row per bound, then one `|error|` row per bound. Every field row shares one
+color scale so the rows are comparable; each error row is scaled to ITS OWN
+bound, so across bounds compare the decompressed rows, not the error rows.
+
+Three things that will otherwise cost an hour:
+
+- **`CLIO_NEUROPRESS_STAGE_H2D=1` is required for the offline sweep, and
+  nothing here sets it.** `CLIO_NEUROPRESS_REQUIRE_DEVICE` defaults *on*
+  (`compressor_runtime.cc`), NeuroPress preprocessing is CUDA-only, and a
+  file-replay driver hands the compressor host memory by construction. Without
+  the stage every chunk is refused and every blob fails `rc=11` with
+  `0 B in -> 0 B on the tier`. `run_config_insitu.sh` sets residency
+  deliberately; `run_config.sh` sets neither, so the offline path is broken
+  out of the box on this build.
+- **`--chunk` must equal one component** (`ncell^3 x 4`, so 1048576 at 64³),
+  or a dumped `.bin` is a fragment spanning field boundaries and will not
+  reshape.
+- **The readback `--tag` must match the writer's**, which is `nyx_$NAME`, not
+  the config name. A wrong tag finds no blobs and reports `rc=11` — the same
+  symptom as the residency failure, from an unrelated cause.
+
+Measured on the 64³ quick run, `dynamic`, over the same 156 MiB. Every chunk
+landed inside its bound at both settings:
+
+| | stored ratio | worst `max|err|` |
+|---|---|---|
+| lossless | 4.114× | 0 (bit-exact) |
+| `--eb 0.001` | **6.470×** | 0.000949 |
+| `--eb 0.01` | 6.198× | 0.00949 |
+| `--eb 0.1` | 10.975× | 0.0950 |
+
+**The ratio is not monotone in the bound.** `0.001` stores BETTER than `0.01`
+(6.470× against 6.198×) on identical input. The cause is visible in
+`viz_actions.py`: under the balanced cost model the two bounds pick different
+codecs for the same chunk — on density, `0.01` sits on `zstd` for the first
+four dumps and reaches a mean 471.7×, while `0.001` sits on `cascaded` at
+26.2×, and the ordering reverses again once both settle on `ans`. Selection,
+not quantization, is what moves the total. Do not assume a looser bound is a
+smaller file.
+
+The pictures say something the ratio does not. The bound is **absolute**, so
+what it costs depends entirely on local magnitude:
+
+| field | eb 0.001 | eb 0.01 | eb 0.1 | 0.1 as % of peak | outcome |
+|---|---|---|---|---|---|
+| `density` | 25/26 | 26/26 | 24/26 | 3.8% | flattened at 0.01, obliterated at 0.1 |
+| `xmom` `ymom` `zmom` | 17–19/26 | 23–24/26 | 25/26 | 0.10% | shell intact at every bound |
+| `rho_E` | **0/26** | **0/26** | **0/26** | 0.0057% | **bit-exact at all three** |
+| `rho_e` | **0/26** | **0/26** | 9/26 | 0.0085% | **bit-exact below 0.1** |
+
+(chunks quantized, out of 26)
+
+On density the ambient is 1.0 and the evacuated centre reaches 0.002. At 0.001
+the reconstruction is visually indistinguishable from the original. At 0.01 the
+bound is a 1% perturbation outside the shock but already larger than the value
+inside it, so the front is untouched while the interior gradient collapses to a
+slab. At 0.1 the interior becomes a single flat level and the quantizer's
+Cartesian grid shows through as a **diamond** — the clearest picture of the
+effect in the whole set, and still invisible at the shock front. The three
+bounds as a ladder are what makes that legible; any one of them alone is
+ambiguous.
+
+And the bound is a **ceiling, not an instruction**. NeuroPress decides per chunk
+whether quantizing is worth it: `rho_E` declined at all three bounds, `rho_e`
+declined twice and then accepted 0.1 on 9 of 26 chunks, and density actually
+quantizes FEWER chunks at 0.1 (24) than at 0.01 (26). A "lossy run" is lossy
+only where the selector took the offer.
+
+### The action progression
+
+`viz_actions.py` draws what was selected per dump, and it draws the whole
+action rather than just the codec: lane is the library, colour is the bound, a
+filled marker means quantize was taken, a square means the 4-byte shuffle.
+
+The point is that **the selection moves as the physics does**. On density the
+run walks cascaded/zstd/gdeflate → snappy → bitcomp → cascaded → ans, settling
+only once the blast has filled enough of the box that the block stops changing
+character. Measured switches over 26 dumps: density 7 (eb 0.001), 3 (0.01),
+6 (0.1); `xmom` 5 / 10 / 4. `rho_e` never leaves `lz4` — its lane is a flat
+line, and at eb=0.1 the marker simply fills in from dump 19 onward.
+
+Preset is not drawn: it is 2 throughout these runs, and the script says so
+rather than hiding it if that ever changes.
+
+### Temporal redundancy is the number that explains all of it
+
+`evolution.png` now carries a fourth panel: the share of cells **bit-identical
+to the previous dump**.
+
+| dump | 1 | 12 | 25 |
+|---|---|---|---|
+| `density` | 99.9% | 86.5% | 57.1% |
+| `xmom` `ymom` `zmom` | 99.7% | 83.5% | 50.9% |
+| `rho_E` `rho_e` | 99.9% | 86.3% | 56.7% |
+
+It falls almost linearly across the run. That single column is the clearest
+statement of why a fixed codec is the wrong answer here: the block genuinely
+stops being the same kind of data, and every other curve on the page —
+compressibility, the chosen action, the cost of a given bound — is downstream
+of it. It is also the metric `gen_fields.sh` reasons about when it argues for
+raising `--exp-energy`, now measured rather than asserted.
+
+### The tools Nyx itself documents
+
+Nyx writes AMReX plotfiles, which `PostProcessing.rst` says are read natively
+by **VisIt, ParaView, and yt**, and it ships `Util/Diagnostics` (an AMReX
+program that opens a plotfile) as a starting point for custom analysis. Those
+are the right tools if you want AMR levels, the derived fields (`pressure`,
+`Temp`, `Ne`) the raw dumps do not carry, or 3-D rendering.
+
+They are not the tools for this benchmark. The plotfiles are a *different
+serialisation* of the state — 350 MiB against 157 MiB of dumps on the quick run
+— so measuring them measures AMReX's file format, not the bytes Clio moves.
+`gen_fields.sh` therefore discards them by default; `--keep-plt` writes them to
+`<out>-plotfiles`, a sibling of the dump directory rather than a directory
+inside it, because `run_config.sh` sizes the payload with `du -sb $FIELDS` and
+counts frames with `ls $FIELDS | grep -c ^plt`, and "plotfiles" would corrupt
+both.
+
+Even with `--keep-plt`, `viz_fields.py` opens the plotfiles only to read
+`Header` for the simulation time, so frames are labelled `t=0.0236` rather than
+`dump 25`. Without `--plt` it falls back to dump indices and everything else
+still works. (yt is not installed here and there is no `pip`, so the documented
+route was not exercised on this machine.)
 
 ## Choosing the parameters
 

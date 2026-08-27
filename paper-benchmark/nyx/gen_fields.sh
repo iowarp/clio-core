@@ -2,7 +2,19 @@
 # Phase 1 of 2: run Nyx and dump its raw fields as flat float32 files.
 #
 #   ./gen_fields.sh [--ncell N] [--steps N] [--plot-int N] [--stop-time T]
-#                   [--exp-energy E] [--out DIR]
+#                   [--exp-energy E] [--out DIR] [--keep-plt]
+#
+# --keep-plt keeps Nyx's own AMReX plotfiles, in <out>-plotfiles. They are
+# thrown away by default: the sweep never reads them, and at 128^3 they cost
+# more than the dumps do. Ask for them when you want to LOOK at the run --
+# they carry the sim time and the derived fields (pressure, Temp) the raw
+# dumps do not, and yt/VisIt/ParaView open them natively. ./viz_fields.py
+# takes --plt <out>-plotfiles to label frames by time instead of by index.
+#
+# A SIBLING of <out>, deliberately, not a directory inside it. run_config.sh
+# measures the payload with `du -sb $FIELDS` and counts frames with
+# `ls $FIELDS | grep -c ^plt` -- a plotfiles/ directory in there would inflate
+# the first and, since "plotfiles" itself matches ^plt, add one to the second.
 #
 # Nyx is an AMReX application with no library interface to embed, so -- exactly
 # as upstream NeuroPress's own Nyx benchmark does -- the simulation is patched
@@ -47,7 +59,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-NCELL=128 STEPS=200 PLOT_INT=10 EXP_ENERGY=
+NCELL=128 STEPS=200 PLOT_INT=10 EXP_ENERGY= KEEP_PLT=0
 # Parked above any time these step counts can reach; see the note above.
 STOP_TIME=1.0
 OUT=${OUT:-$HERE/fields}
@@ -61,7 +73,8 @@ while [ $# -gt 0 ]; do
     --exp-energy) EXP_ENERGY=$2; shift 2;;
     --out) OUT=$2; shift 2;;
     --bin) NYX_BIN=$2; shift 2;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0;;
+    --keep-plt) KEEP_PLT=1; shift;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -93,9 +106,14 @@ echo "== Nyx Sedov: ${NCELL}^3, $STEPS steps, dump every $PLOT_INT -> ~$FRAMES f
 echo "   out=$OUT"
 
 # Nyx writes its own plotfiles into the working directory; keep them out of the
-# source tree and out of the dump directory.
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# source tree and out of the dump directory. Under --keep-plt the working
+# directory IS the destination, so the plotfiles are simply left where Nyx put
+# them rather than copied afterwards.
+if [ "$KEEP_PLT" = 1 ]; then
+  WORK=$OUT-plotfiles; rm -rf "$WORK"; mkdir -p "$WORK"
+else
+  WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+fi
 cd "$WORK"
 NYX_DUMP_FIELDS=1 NYX_DUMP_DIR="$OUT" "$NYX_BIN" "$DECK" \
     amr.n_cell="$NCELL $NCELL $NCELL" \
@@ -116,9 +134,13 @@ N=$(find "$OUT" -name '*.f32' | wc -l)
 cat > "$OUT/gen.json" <<JSON
 {"ncell":$NCELL,"steps":$STEPS,"plot_int":$PLOT_INT,
  "frames":$(( STEPS / PLOT_INT + 1 )),"files":$N,
- "exp_energy":"${EXP_ENERGY:-deck}"}
+ "exp_energy":"${EXP_ENERGY:-deck}","plotfiles":$KEEP_PLT}
 JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   fields: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"
 echo
 echo "now sweep it:  ./run_sweep.sh --fields $OUT"
+if [ "$KEEP_PLT" = 1 ]; then
+  echo "   plotfiles: $WORK ($(du -sh "$WORK" | cut -f1)) -- yt/VisIt/ParaView read these"
+  echo "or look at it: ./viz_fields.py --fields $OUT --plt $WORK --out /tmp/nyx-viz"
+fi
