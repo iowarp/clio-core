@@ -64,6 +64,60 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS clio_gpu_vector_grayscott_bench RUNTIME DESTINATION bin)
 
+    add_cuda_executable(clio_gpu_vector_gmx_bench FALSE
+        clio_gpu_vector_gmx_bench.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_gpu_vector_gmx_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_gpu_vector_gmx_bench RUNTIME DESTINATION bin)
+
+    add_cuda_executable(clio_gpu_vector_lbann_bench FALSE
+        clio_gpu_vector_lbann_bench.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio_cte_compressor_client
+            clio_cte_compressor_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_gpu_vector_lbann_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_gpu_vector_lbann_bench RUNTIME DESTINATION bin)
+
     add_cuda_executable(clio_gpu_vector_kmeans_bench FALSE
         clio_gpu_vector_kmeans_bench.cc
         INCLUDE_DIRS
@@ -227,6 +281,56 @@ if(CLIO_CORE_ENABLE_CUDA)
     # cache far too small for it and must produce the same energies. A
     # single entry could not check both, and separate entries are separate
     # processes -- CLIO_INIT runs once per process.
+    # The gmx and lbann science benches gate BIT-EQUALITY against a dense
+    # in-VRAM reference: integer-exact charge conservation and mesh checksums
+    # for PME spread/gather, and bit-equal loss + weight digests for MLP
+    # training with in-place SGD on paged weights. The ooc entries run the
+    # same physics through a cache far smaller than the working set, so the
+    # write-site-flush contract (an update must survive its page's eviction)
+    # is what the exact gates certify.
+    add_test(NAME cte_gpu_vector_gmx
+        COMMAND clio_gpu_vector_gmx_bench --page-kb 128 --blocks 8
+                --atoms 200000
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_gmx PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    add_test(NAME cte_gpu_vector_gmx_ooc
+        COMMAND clio_gpu_vector_gmx_bench --page-kb 128 --blocks 8
+                --atoms 200000 --cap 40
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_gmx_ooc PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    add_test(NAME cte_gpu_vector_lbann
+        COMMAND clio_gpu_vector_lbann_bench
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_lbann PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    add_test(NAME cte_gpu_vector_lbann_ooc
+        COMMAND clio_gpu_vector_lbann_bench --cap 24
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_lbann_ooc PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+
     add_test(NAME cte_gpu_vector_md_resident
         COMMAND clio_gpu_vector_md_bench --md --lattice 20 --steps 20
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
