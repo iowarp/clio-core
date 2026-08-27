@@ -25,6 +25,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
+#include "../bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/gpu/yield_stack.h>
@@ -4908,6 +4909,7 @@ int main(int argc, char **argv) {
               (unsigned long long)a.steps, run_ms, run_ms / a.steps,
               static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
   ctp::GpuApi::Free(d_thermo);
+  BenchFlushData();
   return rc;
 #endif  // GV_MD_CORO
 }

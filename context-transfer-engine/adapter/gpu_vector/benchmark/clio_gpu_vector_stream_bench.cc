@@ -43,6 +43,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
+#include "bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 
@@ -618,6 +619,7 @@ int main(int argc, char **argv) {
           (static_cast<double>(vram_mb) * 1024.0 * 1024.0),
       write_ms, GbPerSec(logical, write_ms), read_ms,
       GbPerSec(logical, read_ms), ok ? "OK" : "MISMATCH");
+  BenchFlushData();
   return ok ? 0 : 1;
 }
 

@@ -28,6 +28,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
+#include "bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/bdev/bdev_client.h>
@@ -658,6 +659,7 @@ int main(int argc, char **argv) {
     if (nvme_mb > 0) {
       cfg << "      - path: \"" << nvme_path << "\"\n"
           << "        bdev_type: \"file\"\n"
+          << "        persistence_level: \"temporary\"\n"
           << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
           << "        score: " << kNvmeScore << "\n";
     }
@@ -1237,6 +1239,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "\nDATA MISMATCH -- timings above are void\n");
     return 1;
   }
+  BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 }

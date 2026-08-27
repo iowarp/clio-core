@@ -22,6 +22,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
+#include "bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 
@@ -603,6 +604,7 @@ int main(int argc, char **argv) {
                 "--page-kb >= field size)\n");
   }
 
+  BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 }

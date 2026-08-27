@@ -38,6 +38,7 @@
 #include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
+#include "../bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 
@@ -426,6 +427,7 @@ int main(int argc, char **argv) {
       if (nvme_mb > 0) {
         cfg << "      - path: \"" << nvme_path << "\"\n"
             << "        bdev_type: \"file\"\n"
+            << "        persistence_level: \"temporary\"\n"
             << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
             << "        score: 0.0\n";
       }
@@ -630,6 +632,7 @@ int main(int argc, char **argv) {
                mcp.pinned_gbps, mcp.pageable_gbps);
 
   ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
+  BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 #endif  // GV_KM_CORO

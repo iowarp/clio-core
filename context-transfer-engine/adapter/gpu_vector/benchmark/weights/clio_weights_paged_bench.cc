@@ -31,6 +31,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
+#include "../bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/gpu/yield_stack.h>
@@ -421,6 +422,7 @@ int main(int argc, char **argv) {
       if (nvme_mb > 0) {
         cfg << "      - path: \"" << nvme_path << "\"\n"
             << "        bdev_type: \"file\"\n"
+            << "        persistence_level: \"temporary\"\n"
             << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
             << "        score: 0.0\n";
       }
@@ -785,6 +787,7 @@ int main(int argc, char **argv) {
                (unsigned long long) stats.get_errors,
                (unsigned long long) stats.evicts, rounds,
                mcp.pinned_gbps, mcp.pageable_gbps);
+  BenchFlushData();
   return ok ? 0 : 1;
 }
 

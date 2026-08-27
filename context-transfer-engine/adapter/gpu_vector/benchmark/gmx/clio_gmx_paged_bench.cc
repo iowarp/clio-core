@@ -49,6 +49,7 @@
 #include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
+#include "../bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
 
@@ -748,6 +749,7 @@ int main(int argc, char **argv) {
   }
   std::printf("%s\n", rc == 0 ? "GMX BENCH: ALL GATES PASS"
                               : "GMX BENCH: GATE FAILURE");
+  BenchFlushData();
   return rc;
 #endif  // GV_GMX_CORO
 }
