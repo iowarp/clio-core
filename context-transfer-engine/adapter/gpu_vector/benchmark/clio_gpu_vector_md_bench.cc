@@ -164,8 +164,14 @@ __device__ bool AdmitWaits(u32 need, u32 pool, u32 slack) {
  *  the peer's generation held 30 reservations, the publish that would
  *  satisfy the peer sat at the gate behind them (admit stall need=6
  *  used=30), and the peer's generational get errored out (DEVICE FATAL 7)
- *  waiting for a flush that could never land. */
-__device__ constexpr u32 kAdmitSlackChunks = 14u;
+ *  waiting for a flush that could never land.
+ *
+ *  8, NOT 14: slack covers only demand that never RESERVES -- the boundary
+ *  flush (6) plus margin. The halo warm's 6 pages are a STANDING
+ *  reservation, already inside `used`; budgeting slack for them too made
+ *  pool 24 unrunnable by arithmetic alone (budget 10, standing 6, chunk
+ *  need 6 -- a permanent admit stall before the first force chunk). */
+__device__ constexpr u32 kAdmitSlackChunks = 8u;
 
 __device__ gy::YCoroTask AdmitSpans(u32 need, u32 pool, u32 slack) {
   if (need == 0u) co_return;
