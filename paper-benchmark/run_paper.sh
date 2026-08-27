@@ -12,7 +12,7 @@
 # DATA IS NEVER COPIED THERE -- it is tens of GB per workload, it is identical
 # across the six configurations, and every generator regenerates it.
 #
-# WHY NYX RUNS THROUGH REPLAY AND THE OTHER THREE RUN IN SITU. Nyx in situ
+# NYX IS THE ONLY WORKLOAD ON THE REPLAY ROUTE; the other three run in situ. Nyx in situ
 # faults with CUDA 700 (an out-of-bounds __global__ write inside nvcomp's
 # setup_comp_llif_buffers, Xid 31) once exploration is on; K, the error bound
 # and the cost model only change how many chunks it survives first. Measured:
@@ -104,12 +104,6 @@ gen_fields () {
       "$HERE/nyx/gen_fields.sh" --ncell 128 --steps "$STEPS" --plot-int "$INT" \
           --out "$NYX_FIELDS" > "$SCRATCH/nyx-gen.log" 2>&1
       ;;
-    vpic)
-      [ -d "$VPIC_FIELDS" ] && return 0
-      echo "   generating VPIC fields (126^3, $STEPS steps, clean_div 10)"
-      "$HERE/vpic/gen_fields.sh" --ncell 126 --nppc 8 --steps "$STEPS" \
-          --dump-int "$INT" --out "$VPIC_FIELDS" > "$SCRATCH/vpic-gen.log" 2>&1
-      ;;
   esac
 }
 
@@ -130,10 +124,10 @@ run_cell () {
     *_lossless)
       vkind=digest
       if [ "$VERIFY" = 1 ]; then
-        [ "$w" = warpx ] && vflag=(--verify)          # others: on by default
+        case "$w" in warpx|vpic) vflag=(--verify) ;; esac   # others: on already
       else
         vkind=disabled
-        [ "$w" = warpx ] || vflag=(--no-verify)       # warpx: off by default
+        case "$w" in warpx|vpic) ;; *) vflag=(--no-verify) ;; esac
       fi ;;
     *)
       case "$w" in
@@ -161,9 +155,15 @@ run_cell () {
            --gap "$INT" --chunk $(( natoms * 3 * 8 )) --require-device
            --explore-k "$K" ${vflag[@]+"${vflag[@]}"}
            --results "$store" --tag run) ;;
-    vpic)    # replay; STAGE_H2D is required and nothing else sets it
-      cmd=(env CLIO_NEUROPRESS_STAGE_H2D=1 "$HERE/vpic/run_config.sh" $base
-           --fields "$VPIC_FIELDS" --explore-k "$K"
+    vpic)    # IN SITU: the deck hands the compressor its Kokkos field views
+             # from begin_diagnostics -- device memory, uncopied -- so
+             # quantize, shuffle and selection take their GPU paths. The
+             # replay route reads .f32 into host shm, where all three silently
+             # take HOST paths instead, which is the wrong thing to measure in
+             # a compression paper. Verified at K=31 with an error bound.
+             # clean_div defaults to 10 inside that runner: the study's winner.
+      cmd=("$HERE/vpic/run_config_insitu.sh" $base --ncell 126
+           --steps "$STEPS" --int "$INT" --chunk 4194304 --explore-k "$K"
            ${vflag[@]+"${vflag[@]}"}
            --results "$store" --tag run) ;;
     nyx)     # replay, deliberately -- see the header
@@ -199,10 +199,12 @@ run_cell () {
   # all four share, so it is what gets scraped.
   local vres=n/a vlog="$out/run.stdout.log"
   [ -f "$vlog" ] || vlog="$out/stdout.log"
-  if   grep -q "BOUND FAILED:" "$vlog" 2>/dev/null; then vres=BOUND-FAIL
-  elif grep -q "BOUND OK:"     "$vlog" 2>/dev/null; then vres=bound-ok
-  elif grep -q "^VERIFIED:"    "$vlog" 2>/dev/null; then vres=pass
-  elif grep -qE "^FAILED:|MISMATCH" "$vlog" 2>/dev/null; then vres=FAIL
+  # UNANCHORED: the in-situ runners indent their output, so "^VERIFIED:" misses
+  # a line that is really "   VERIFIED: 64 of 64 blobs ...".
+  if   grep -q  "BOUND FAILED:"              "$vlog" 2>/dev/null; then vres=BOUND-FAIL
+  elif grep -q  "BOUND OK:"                  "$vlog" 2>/dev/null; then vres=bound-ok
+  elif grep -qE "(^|[[:space:]])VERIFIED:"   "$vlog" 2>/dev/null; then vres=pass
+  elif grep -qE "(^|[[:space:]])FAILED:|MISMATCH" "$vlog" 2>/dev/null; then vres=FAIL
   fi
   # What the check actually covered, for the size question: every blob is read
   # back at its own recorded original length into a pre-zeroed buffer, so
@@ -219,7 +221,7 @@ run_cell () {
  "error_bound":$(echo "$c" | grep -oE '[0-9.]+$' || echo 0),
  "explore_k":$K,"exploration_only":true,
  "steps":$STEPS,"interval":$INT,"rc":$rc,"wall_s":$((t1-t0)),
- "route":"$([ "$w" = nyx ] || [ "$w" = vpic ] && echo replay || echo insitu)",
+ "route":"$([ "$w" = nyx ] && echo replay || echo insitu)",
  "verification":"$vkind","verify_result":"$vres",
  "bytes_roundtripped_bit_exact":$vbytes,
  "command":"${cmd[*]}"}
