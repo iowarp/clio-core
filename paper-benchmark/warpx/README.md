@@ -19,6 +19,72 @@ $ ldd $(which warpx.3d...) | grep -c clio
 Upstream NeuroPress reaches WarpX through a **636-line patch** adding a whole
 `FlushFormatGPUCompress` diagnostic backend. Clio needs **zero lines** in WarpX.
 
+## Looking at the data
+
+Nothing needs dumping: WarpX writes openPMD-HDF5 as it always does and the VOL
+compresses on the way past, so the native `.h5` files are in
+`<run>/run/diags/diag1/` afterwards — the same bytes the compressor saw.
+
+```bash
+./run_config.sh dynamic --ncell "64 64 512" --steps 40 --interval 4 \
+    --stage-h2d --results /tmp/wx2 --tag ll                  # ~15 s
+./viz_openpmd.py --run /tmp/wx2/ll --out /tmp/wx-viz
+```
+
+`viz_openpmd.py` needs **no h5py** — datasets come out through the `h5dump` CLI
+(`-b LE -o file`), which ships with HDF5 and is therefore already present
+anywhere WarpX built against it. It draws x–z slices at mid-y with z upward:
+the laser enters at the bottom and the wake oscillations behind it are resolved
+by step 40.
+
+**The grid cannot be shrunk to make the run quick.** At 64×64×128 a field is
+512 KB against the 1 MiB chunk, so no chunk ever completes and ZERO field bytes
+reach the tier — while the run exits 0, the native `.h5` is perfect and nothing
+reports a problem. 64×64×512 is the smallest grid that stages anything. This is
+the same failure the `CLIO_VOL_CHUNK_SIZE` note at the top of `run_config.sh`
+describes, reached from the other direction.
+
+## The state vector spans fifteen orders of magnitude, and the bound only reaches one field
+
+Measured at 64×64×512, 40 steps, 11 diagnostics, 880 chunks, `dynamic`:
+
+| | stored ratio | quantize chosen | quantize ran |
+|---|---|---|---|
+| lossless | 11.536× | 0 / 880 | 0 |
+| `--eb 0.001` | 14.631× | 39 | 30 |
+| `--eb 0.01` | 14.676× | 39 | 26 |
+| `--eb 0.1` | 15.004× | 40 | 23 |
+
+Monotone, unlike Nyx and VPIC — but for a reason that makes the number almost
+meaningless. WarpX writes SI, and the fields do not share a scale:
+
+| field | range (SI) | `eb=0.01` as a share of it |
+|---|---|---|
+| `j/z` | 2.7e+12 | 3.7e-13 % |
+| `E/z` | 1.5e+11 | 6.9e-12 % |
+| `rho` | 6.9e+06 | 1.5e-07 % |
+| `B/x` | 1.6e+04 | 6.1e-05 % |
+| **`B/y`** | **1.1e-01** | **9.4 %** |
+
+So the bound is far below float32 resolution on almost everything and lands on
+`B` alone. Of the 16.9 MB it saves at `--eb 0.01`, **8.6 MB is `By` and 7.2 MB
+is `Bz`** — 93% — while the E fields, currents and charge density contribute
+0.2 MB between them. A `By` chunk goes from ~730 KB to ~700 B, because the
+entire field is smaller than the bound and quantizes to zero.
+
+That is a 27% ratio gain from 3% of the chunks, and it is not an accuracy
+statement about anything. **An absolute bound is a statement about units.** It
+is the same failure VPIC shows from the other direction: there the diagnostics
+are 1e-07 and the bound annihilates them; here the currents are 1e+12 and the
+bound cannot reach them. Both runs report every chunk inside its bound, and
+both reports are true.
+
+**Each policy is its own WarpX run**, so these are not byte-identical
+comparisons the way Nyx and VPIC are. Measured run-to-run spread on this
+configuration is 0.6% (11.860× vs 11.792× lossless; 15.167× vs 15.197× at
+eb=0.01), well below the 27% the bound moves — but it is why these are quoted
+to three digits.
+
 ## Running
 
 ```bash

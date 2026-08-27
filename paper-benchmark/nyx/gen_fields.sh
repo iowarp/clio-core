@@ -8,7 +8,7 @@
 # thrown away by default: the sweep never reads them, and at 128^3 they cost
 # more than the dumps do. Ask for them when you want to LOOK at the run --
 # they carry the sim time and the derived fields (pressure, Temp) the raw
-# dumps do not, and yt/VisIt/ParaView open them natively. ./viz_fields.py
+# dumps do not, and yt/VisIt/ParaView open them natively. ../viz_fields.py
 # takes --plt <out>-plotfiles to label frames by time instead of by index.
 #
 # A SIBLING of <out>, deliberately, not a directory inside it. run_config.sh
@@ -142,5 +142,5 @@ echo
 echo "now sweep it:  ./run_sweep.sh --fields $OUT"
 if [ "$KEEP_PLT" = 1 ]; then
   echo "   plotfiles: $WORK ($(du -sh "$WORK" | cut -f1)) -- yt/VisIt/ParaView read these"
-  echo "or look at it: ./viz_fields.py --fields $OUT --plt $WORK --out /tmp/nyx-viz"
+  echo "or look at it: ../viz_fields.py --fields $OUT --plt $WORK --out /tmp/nyx-viz"
 fi

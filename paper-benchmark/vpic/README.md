@@ -182,6 +182,66 @@ are still worth running — they are the workload that stresses the *latency*
 path, where the cost model's 1 ms clamps dominate — but their ratio column is a
 flat line by construction, not a result.
 
+### Looking at the data
+
+VPIC dumps the same shape Nyx does, so the shared viewers read both:
+
+```bash
+./gen_fields.sh --ncell 32 --nppc 8 --steps 1000 --dump-int 40 \
+    --clean-div 5 --out /tmp/vpic-quick                    # ~4 s
+../viz_fields.py --fields /tmp/vpic-quick --out /tmp/vpic-viz --field cby --field ex
+```
+
+`--clean-div` is new and matters for anything you intend to *look* at: at 0 the
+four divergence fields hold their initial values, so a quarter of every montage
+is a still image. `--steps 1000` is what reaches the instability rather than the
+noise phase — measured on `cby`, amplitude grows from ±0.045 to ±0.169 and
+0 of 24 consecutive dumps are bit-identical. (`rhob` stays constant at any
+setting; this deck accumulates no bound charge.)
+
+`viz_fields.py` turns its two blast-wave panels off automatically here — shock
+radius and "% off ambient" are defined against a quiet background, and a Weibel
+run has none. It substitutes an amplitude panel.
+
+### A single absolute bound cannot serve sixteen fields
+
+Measured at 34³ × 25 dumps × 16 fields, `dynamic`, all 400 chunks inside their
+bound at every setting:
+
+| | stored ratio | quantize chosen | quantize ran |
+|---|---|---|---|
+| lossless | 1.121× | — | — |
+| `--eb 0.001` | 4.429× | 400/400 | 325 |
+| `--eb 0.01` | **5.214×** | 352/400 | 324 |
+| `--eb 0.1` | **1.325×** | **71/400** | 21 |
+
+**Sharply non-monotone: the loosest bound is the worst by 4×.** At 0.1 the
+selector mostly stops choosing quantize and the run falls back to its lossless
+profile. The reason is that the fields span roughly ±0.2, so 0.1 leaves three
+or four quantization levels and the ranking rejects it — where on Nyx the same
+0.1 is 3.8% of density's range and is worth taking.
+
+And a single bound is not survivable across the state vector. Worst relative
+error (`max|err| / range`) reached at any of the three bounds:
+
+| field | range | worst relative error | |
+|---|---|---|---|
+| `rhof`, `jfz`, `ex` | ~4e-01 | 0.6–5.1% | fine at every bound |
+| `ey`, `ez` | ~3e-01 | 45.8%, 49.8% | degraded |
+| `cbx` | ~3e-01 | 68.6% | degraded |
+| `cby`, `cbz` | 3.2e-01 | **100%, 97.2%** | flattened at some bound |
+| `div_e_err`, `div_b_err`, `rhob` | ~2e-07 | **100%** | annihilated |
+
+`div_b_err` has a range near 2e-07, so *every* bound on this page is between
+five thousand and five hundred thousand times wider than the entire field: it
+collapses to one value and the interface reports success. And because amplitude
+grows over the run, the same bound changes behaviour within a single run —
+`cby` at `--eb 0.1` is flattened at dump 0 (amplitude ±0.045, below the bound)
+and returned **bit-exact** from dump 6 on (amplitude ±0.17, so the selector
+declines).
+
+Read the `relerr` column, not the `rc` column. Every chunk was inside its bound.
+
 ### float32 in; int8 on the wire when lossy
 
 Every blob is 1,149,984 B = 287,496 **float32** elements

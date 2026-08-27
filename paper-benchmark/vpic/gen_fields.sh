@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Phase 1 of 2: run VPIC and dump its field array as flat float32 files.
 #
-#   ./gen_fields.sh [--ncell N] [--nppc N] [--steps N] [--dump-int N] [--out DIR]
+#   ./gen_fields.sh [--ncell N] [--nppc N] [--steps N] [--dump-int N]
+#                   [--clean-div N] [--out DIR]
 #
 # VPIC has no library interface either, and upstream NeuroPress's own VPIC
 # benchmark deck is tightly coupled to it -- it includes gpucompress.h and runs
@@ -21,7 +22,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-NCELL=126 NPPC=8 STEPS=200 DUMP_INT=25
+NCELL=126 NPPC=8 STEPS=200 DUMP_INT=25 CLEAN_DIV=0
 OUT=${OUT:-$HERE/fields}
 BIN=${BIN:-$HERE/weibel_clio.Linux}
 while [ $# -gt 0 ]; do
@@ -30,6 +31,11 @@ while [ $# -gt 0 ]; do
     --nppc) NPPC=$2; shift 2;;
     --steps) STEPS=$2; shift 2;;
     --dump-int) DUMP_INT=$2; shift 2;;
+    # 0 is upstream's default and leaves div_e_err, div_b_err, rhob and rhof
+    # holding their initial values for the whole run -- 25% of the payload that
+    # the simulation never touches. A positive interval makes them real
+    # diagnostics computed from the live state. See README, "VPIC_CLEAN_DIV_INT".
+    --clean-div) CLEAN_DIV=$2; shift 2;;
     --out) OUT=$2; shift 2;;
     --bin) BIN=$2; shift 2;;
     -h|--help) sed -n '2,22p' "$0"; exit 0;;
@@ -50,7 +56,7 @@ echo "   out=$OUT"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 VPIC_NX=$NCELL VPIC_NY=$NCELL VPIC_NZ=$NCELL VPIC_NPPC=$NPPC \
-VPIC_STEPS=$STEPS VPIC_DUMP_INT=$DUMP_INT \
+VPIC_STEPS=$STEPS VPIC_DUMP_INT=$DUMP_INT VPIC_CLEAN_DIV_INT=$CLEAN_DIV \
 VPIC_DUMP_FIELDS=1 VPIC_DUMP_DIR="$OUT" \
     "$BIN" > "$OUT/vpic.log" 2>&1
 RC=$?
@@ -65,7 +71,7 @@ N=$(find "$OUT" -name '*.f32' | wc -l)
 # here: this deck skips step 0 deliberately (the field array is identically
 # zero before the first solve), so deriving it would overcount by one.
 cat > "$OUT/gen.json" <<JSON
-{"ncell":$NCELL,"nppc":$NPPC,"steps":$STEPS,"dump_int":$DUMP_INT,
+{"ncell":$NCELL,"nppc":$NPPC,"steps":$STEPS,"dump_int":$DUMP_INT,"clean_div":$CLEAN_DIV,
  "frames":$(find "$OUT" -mindepth 1 -maxdepth 1 -type d | wc -l),"files":$N}
 JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"

@@ -135,11 +135,11 @@ Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 ```bash
 ./gen_fields.sh --ncell 64 --steps 400 --plot-int 16 --exp-energy 10 \
                 --keep-plt --out /tmp/nyx-quick             # ~2 s, 157 MiB
-./viz_fields.py --fields /tmp/nyx-quick --plt /tmp/nyx-quick-plotfiles \
+../viz_fields.py --fields /tmp/nyx-quick --plt /tmp/nyx-quick-plotfiles \
                 --out /tmp/nyx-viz                          # ~4 s
 ```
 
-`viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
+`../viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
 the point: those files, not Nyx's plotfiles, are what the compressor is handed,
 so what it draws is what the sweep compresses. Per field it writes a montage of
 mid-plane slices across the run and the same slices as a GIF; once per run it
@@ -175,7 +175,7 @@ Two details that are easy to get wrong and quiet when you do:
 
 ### Seeing what a lossy bound costs
 
-`viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
+`../viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
 plate. It needs the decompressed bytes, which the replay driver will write on a
 cold read:
 
@@ -190,7 +190,7 @@ for spec in 0.001:eb001 0.01:eb01 0.1:eb10; do
       --dump-decompressed /tmp/nyx-decomp/$T --tag nyx_$T \
       --dir /tmp/nyx-quick --ext .f32 --chunk 1048576 --check-bound
 done
-./viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
+../viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
     --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
     --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
 ../viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
@@ -320,7 +320,7 @@ inside it, because `run_config.sh` sizes the payload with `du -sb $FIELDS` and
 counts frames with `ls $FIELDS | grep -c ^plt`, and "plotfiles" would corrupt
 both.
 
-Even with `--keep-plt`, `viz_fields.py` opens the plotfiles only to read
+Even with `--keep-plt`, `../viz_fields.py` opens the plotfiles only to read
 `Header` for the simulation time, so frames are labelled `t=0.0236` rather than
 `dump 25`. Without `--plt` it falls back to dump indices and everything else
 still works. (yt is not installed here and there is no `pip`, so the documented

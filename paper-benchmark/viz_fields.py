@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Render the Nyx field dumps that the compression sweep replays.
+"""Render the flat field dumps a compression sweep replays.
 
-    ./viz_fields.py --fields /tmp/nyx-viz/fields --out /tmp/nyx-viz/viz
+    ./viz_fields.py --fields /tmp/nyx-quick --out /tmp/nyx-viz
+    ./viz_fields.py --fields /tmp/vpic-quick --out /tmp/vpic-viz --field ex
+
+Shared by the nyx and vpic benchmarks, which dump the same way: one directory
+per frame, one flat cube per component, named
+<frame>/fab%04d_comp%02d_<field>.<ext>. Nothing here is Nyx-specific except the
+two blast-wave panels, which turn themselves off when the first frame is not a
+uniform background (see below).
 
 The benchmark's two phases (gen_fields.sh -> run_sweep.sh) exchange flat
 float32 files, and those files -- not Nyx's AMReX plotfiles -- are what the
@@ -32,6 +39,8 @@ there are none and frames are labelled by dump index instead.
 import argparse, glob, os, sys, zlib
 import numpy as np
 
+# Nyx's hydro state. VPIC names its own (ex, cbz, jfz, ...) and passes --field;
+# nothing below assumes this list.
 FIELDS = ["density", "xmom", "ymom", "zmom", "rho_E", "rho_e"]
 
 
@@ -52,9 +61,9 @@ def load(path):
     return a.reshape(n, n, n, order="F")
 
 
-def frames_for(fields_dir, field):
+def frames_for(fields_dir, field, ext=".f32"):
     """Dumps are <fields>/plt%05d/fab0000_comp%02d_<field>.f32, one dir a dump."""
-    pat = os.path.join(fields_dir, "plt*", f"fab0000_comp*_{field}.f32")
+    pat = os.path.join(fields_dir, "plt*", f"fab0000_comp*_{field}{ext}")
     return sorted(glob.glob(pat))
 
 
@@ -101,6 +110,9 @@ def main():
     p.add_argument("--fields", required=True, help="dump directory (plt*/ inside)")
     p.add_argument("--out", required=True, help="where the PNGs and GIFs go")
     p.add_argument("--field", action="append", help="repeatable; default density")
+    p.add_argument("--ext", default=".f32", help="dump extension [.f32]")
+    p.add_argument("--evolve-field", help="field for evolution.png "
+                                          "[first --field, or density]")
     p.add_argument("--plt", help="AMReX plotfile dir, for real sim times")
     p.add_argument("--no-ratio", action="store_true", help="skip the zlib curve")
     a = p.parse_args()
@@ -115,7 +127,7 @@ def main():
     times = plot_times(a.plt)
 
     for field in fields:
-        files = frames_for(a.fields, field)
+        files = frames_for(a.fields, field, a.ext)
         if not files:
             sys.exit(f"no {field} dumps under {a.fields}")
         vols = [load(f) for f in files]
@@ -155,7 +167,7 @@ def main():
             ax.set_title(t, fontsize=7); ax.set_xticks([]); ax.set_yticks([])
         for ax in np.atleast_1d(axes).ravel()[len(slices):]:
             ax.axis("off")
-        fig.suptitle(f"Nyx Sedov blast - {field}, z={mid} slice, {n}^3", fontsize=11)
+        fig.suptitle(f"{field}, z={mid} slice, {n}^3", fontsize=11)
         fig.colorbar(im, ax=axes, shrink=0.6, label=field)
         out = os.path.join(a.out, f"{field}_montage.png")
         fig.savefig(out, dpi=110, bbox_inches="tight"); plt.close(fig)
@@ -175,9 +187,20 @@ def main():
         print(f"  {gif}")
 
     # The physics and the compressibility share a time axis, which is the whole
-    # point: the ratio falls because the shock is filling the box.
-    vols = [load(f) for f in frames_for(a.fields, "density")]
-    quiet = float(vols[0].flat[0])
+    # point on a blast wave: the ratio falls because the shock fills the box.
+    ev = a.evolve_field or (fields[0] if fields else "density")
+    vols = [load(f) for f in frames_for(a.fields, ev, a.ext)]
+    if not vols:
+        sys.exit(f"no {ev} dumps under {a.fields} -- pass --evolve-field")
+    # The blast-wave panels need a QUIET BACKGROUND to measure against: shock
+    # radius and "% off ambient" are both defined relative to the undisturbed
+    # value. Sedov starts as a uniform box and has one; a VPIC Weibel run
+    # starts already structured and does not, so those two panels would report
+    # "100% disturbed at every frame" and mean nothing. Detect it rather than
+    # asking the caller which workload this is.
+    v0 = vols[0]
+    sedov = bool(v0.min() == v0.max())
+    quiet = float(v0.flat[0])
     x = times[:len(vols)] if times and len(times) >= len(vols) else list(range(len(vols)))
     xl = "sim time" if times and len(times) >= len(vols) else "dump"
     rad = [shock_radius(v, quiet) for v in vols]
@@ -186,31 +209,40 @@ def main():
     # no predecessor, so the series starts at 1.
     same = [100.0 * float(np.mean(vols[i] == vols[i - 1])) for i in range(1, len(vols))]
 
-    ncol = 3 if a.no_ratio else 4
-    fig, ax = plt.subplots(1, ncol, figsize=(4.3 * ncol, 3.6))
-    ax[0].plot(x, rad, "o-", ms=3)
-    ax[0].set(xlabel=xl, ylabel="shock radius (box units)", title="blast expands")
-    ax[1].plot(x, touched, "o-", ms=3, color="tab:red")
-    ax[1].set(xlabel=xl, ylabel="% of cells off ambient", title="domain disturbed")
-    ax[2].plot(x[1:], same, "o-", ms=3, color="tab:purple")
-    ax[2].set(xlabel=xl, ylabel="% bit-identical to previous dump",
-              title="temporal redundancy falls")
-    if not a.no_ratio:
+    panels = ["range", "same"] + ([] if a.no_ratio else ["ratio"])
+    if sedov:
+        panels = ["radius", "touched"] + panels[1:]   # drop "range" for those two
+    fig, ax = plt.subplots(1, len(panels), figsize=(4.3 * len(panels), 3.6))
+    P = dict(zip(panels, ax))
+    if "radius" in P:
+        P["radius"].plot(x, rad, "o-", ms=3)
+        P["radius"].set(xlabel=xl, ylabel="shock radius (box units)",
+                        title="blast expands")
+        P["touched"].plot(x, touched, "o-", ms=3, color="tab:red")
+        P["touched"].set(xlabel=xl, ylabel="% of cells off ambient",
+                         title="domain disturbed")
+    if "range" in P:
+        P["range"].plot(x, [float(v.max()) for v in vols], "o-", ms=3, label="max")
+        P["range"].plot(x, [float(v.min()) for v in vols], "o-", ms=3, label="min")
+        P["range"].set(xlabel=xl, ylabel=ev, title="amplitude grows")
+        P["range"].legend(fontsize=8)
+    P["same"].plot(x[1:], same, "o-", ms=3, color="tab:purple")
+    P["same"].set(xlabel=xl, ylabel="% bit-identical to previous dump",
+                  title="temporal redundancy", ylim=(0, 105))
+    if "ratio" in P:
         r0 = [ratio(v, 1) for v in vols]
         r4 = [ratio(v, 4) for v in vols]
-        ax[3].plot(x, r0, "o-", ms=3, label="no shuffle")
-        ax[3].plot(x, r4, "s-", ms=3, label="4-byte shuffle")
-        ax[3].set(xlabel=xl, ylabel="zlib ratio (stand-in)", yscale="log",
-                  title="compressibility falls")
-        ax[3].legend(fontsize=8)
-        print(f"density bit-identical to previous dump: "
-              f"{same[0]:.1f}% -> {same[-1]:.1f}%")
-        print(f"density ratio (zlib stand-in): "
-              f"no-shuffle {r0[0]:.1f}x -> {r0[-1]:.1f}x, "
-              f"shuffle-4 {r4[0]:.1f}x -> {r4[-1]:.1f}x")
+        P["ratio"].plot(x, r0, "o-", ms=3, label="no shuffle")
+        P["ratio"].plot(x, r4, "s-", ms=3, label="4-byte shuffle")
+        P["ratio"].set(xlabel=xl, ylabel="zlib ratio (stand-in)", yscale="log",
+                       title="compressibility")
+        P["ratio"].legend(fontsize=8)
+        print(f"{ev} zlib: no-shuffle {r0[0]:.2f}x -> {r0[-1]:.2f}x, "
+              f"shuffle-4 {r4[0]:.2f}x -> {r4[-1]:.2f}x")
+    print(f"{ev} bit-identical to previous dump: {same[0]:.2f}% -> {same[-1]:.2f}%")
     for b in ax:
         b.grid(alpha=0.3)
-    fig.suptitle("Nyx Sedov: what the compressor is being handed", fontsize=11)
+    fig.suptitle(f"{ev}: what the compressor is being handed", fontsize=11)
     fig.tight_layout()
     out = os.path.join(a.out, "evolution.png")
     fig.savefig(out, dpi=120); plt.close(fig)
