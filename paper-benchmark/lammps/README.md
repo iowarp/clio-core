@@ -147,6 +147,20 @@ argument must still be numeric — `fix_langevin.cpp:76`).
 
 ### Looking at the data
 
+**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
+default and renders into `./viz/`, keeping only the figures — the staged bytes
+go to a scratch directory and are deleted when the render finishes.
+
+```bash
+./visualize.sh                       # ~22 s -> ./viz (montage, GIF, evolution.png)
+./visualize.sh --ramp                # in.melt_ramp instead of the hot melt
+./visualize.sh --keep-dumps          # keep the staged bytes too
+```
+
+It computes `--chunk` from `--box` rather than taking it, because `viz_atoms.py`
+assumes one chunk per field per frame and anything else produces fragments that
+will not reshape.
+
 This workload is in situ — LAMMPS runs as a library in the benchmark process
 and no file is ever written — so there is nothing on disk to look at unless the
 run asks for it. `--raw DIR` makes the driver write each staged blob's bytes,

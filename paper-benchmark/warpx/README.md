@@ -26,6 +26,21 @@ study's rankings — are in [`RESULTS.md`](RESULTS.md).**
 
 ## Looking at the data
 
+**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
+default and renders every field into `./viz/`, keeping only the figures — the
+~2 GB of openPMD behind them goes to a scratch directory and is deleted when
+the render finishes.
+
+```bash
+./visualize.sh                       # ~2 min -> ./viz (one montage per field + evolution.png)
+./visualize.sh --steps 200 --int 20  # quicker
+./visualize.sh --keep-dumps          # keep the openPMD too
+```
+
+`--steps` is the only knob that makes a run shorter here; the grid cannot be
+shrunk, for the reason below. `viz_openpmd.py` writes no GIFs, unlike the other
+three viewers.
+
 Nothing needs dumping: WarpX writes openPMD-HDF5 as it always does and the VOL
 compresses on the way past, so the native `.h5` files are in
 `<run>/run/diags/diag1/` afterwards — the same bytes the compressor saw.

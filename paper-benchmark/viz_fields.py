@@ -18,7 +18,7 @@ side length is recovered from the file size and there is nothing to parse.
 
 What it produces, per field:
 
-  <field>_montage.png   mid-plane z slices across the whole run, one panel per
+  <field>_montage.png   mid-plane slices across the whole run, one panel per
                         dump, on a color scale shared by every panel so the
                         blast really is expanding rather than the colorbar
                         moving under it
@@ -111,6 +111,13 @@ def main():
     p.add_argument("--out", required=True, help="where the PNGs and GIFs go")
     p.add_argument("--field", action="append", help="repeatable; default density")
     p.add_argument("--ext", default=".f32", help="dump extension [.f32]")
+    p.add_argument("--axis", default="z", choices=["x", "y", "z"],
+                   help="mid-plane to slice [z]. A vector component is "
+                        "antisymmetric about the plane normal to its own axis, "
+                        "so zmom on the z mid-plane renders blank -- give that "
+                        "field its own plane with --axis-for x:zmom.")
+    p.add_argument("--axis-for", action="append", default=[], metavar="AXIS:FIELD",
+                   help="repeatable per-field slice axis, e.g. x:zmom")
     p.add_argument("--evolve-field", help="field for evolution.png "
                                           "[first --field, or density]")
     p.add_argument("--plt", help="AMReX plotfile dir, for real sim times")
@@ -123,6 +130,13 @@ def main():
     from matplotlib.colors import LogNorm, Normalize
 
     fields = a.field or ["density"]
+    # --axis-for x:zmom -> {"zmom": "x"}
+    axis_for = {}
+    for spec in a.axis_for:
+        ax_, _, fld = spec.partition(":")
+        if not fld or ax_ not in ("x", "y", "z"):
+            sys.exit(f"--axis-for wants AXIS:FIELD with AXIS in x/y/z, got {spec!r}")
+        axis_for[fld] = ax_
     os.makedirs(a.out, exist_ok=True)
     times = plot_times(a.plt)
 
@@ -156,8 +170,22 @@ def main():
         else:
             norm, cmap = Normalize(lo, float(np.percentile(pool, 99.9))), "inferno"
 
+        # WHICH PLANE TO CUT, and it is not cosmetic for a vector component.
+        # A component of a spherically symmetric outflow is ANTISYMMETRIC about
+        # the mid-plane normal to its own axis: zmom on the z mid-plane is ~0
+        # everywhere by symmetry, and the montage comes out blank while the
+        # field itself is perfectly healthy. Measured on the Sedov run at
+        # 128^3: zmom reaches 4.24 globally and 0.048 on the z mid-plane,
+        # against xmom's 4.23 on that same plane. Slice zmom along x or y
+        # instead, with --axis-for, so one invocation can still do all six.
+        axis = axis_for.get(field, a.axis)
         mid = n // 2
-        slices = [v[:, :, mid] for v in vols]
+        if axis == "x":
+            slices = [v[mid, :, :] for v in vols]
+        elif axis == "y":
+            slices = [v[:, mid, :] for v in vols]
+        else:
+            slices = [v[:, :, mid] for v in vols]
 
         cols = min(7, len(slices))
         rows = -(-len(slices) // cols)
@@ -167,7 +195,7 @@ def main():
             ax.set_title(t, fontsize=7); ax.set_xticks([]); ax.set_yticks([])
         for ax in np.atleast_1d(axes).ravel()[len(slices):]:
             ax.axis("off")
-        fig.suptitle(f"{field}, z={mid} slice, {n}^3", fontsize=11)
+        fig.suptitle(f"{field}, {axis}={mid} slice, {n}^3", fontsize=11)
         fig.colorbar(im, ax=axes, shrink=0.6, label=field)
         out = os.path.join(a.out, f"{field}_montage.png")
         fig.savefig(out, dpi=110, bbox_inches="tight"); plt.close(fig)

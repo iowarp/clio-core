@@ -139,6 +139,23 @@ silently running the wrong path.
 
 ## Looking at the data
 
+**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
+default and renders all sixteen field variables into `./viz/`, keeping only the
+figures — the dumps behind them go to a scratch directory and are deleted when
+the render finishes.
+
+```bash
+./visualize.sh                       # ~26 s -> ./viz (16 montages, 16 GIFs, evolution.png)
+./visualize.sh --ncell 126           # the benchmark's own resolution, ~130 s
+./visualize.sh --keep-dumps          # keep the .f32 too
+```
+
+It defaults to `--ncell 64` rather than the benchmark's 126: 126 exists so the
+dumped `(N+2)^3` extent is exactly 128³ voxels = 8 MiB per variable, which is a
+chunk-count property and means nothing to a picture. `rhob`'s panel is a still
+image on purpose — this deck is vacuum and accumulates no bound charge, so no
+cleaning interval can make it move.
+
 VPIC dumps the same shape Nyx does, so the shared viewers read both:
 
 ```bash

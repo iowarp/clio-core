@@ -166,6 +166,24 @@ Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 
 ## Looking at the data
 
+**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
+default and renders every field into `./viz/`, keeping only the figures — the
+~4 GB of dumps behind them go to a scratch directory and are deleted when the
+render finishes.
+
+```bash
+./visualize.sh                       # ~49 s -> ./viz (6 montages, 6 GIFs, evolution.png)
+./visualize.sh --steps 400 --int 16  # quicker
+./visualize.sh --keep-dumps          # keep the .f32 too
+```
+
+`zmom` is sliced on **x**, not z, and that is not cosmetic: a vector component
+is antisymmetric about the mid-plane normal to its own axis, so z-momentum is
+~0 across the whole z mid-plane and the montage comes out blank while the field
+is perfectly healthy. `visualize.sh` passes `--axis-for x:zmom` for you.
+
+The pieces, if you want them separately:
+
 ```bash
 ./gen_fields.sh --ncell 64 --steps 400 --plot-int 16 --exp-energy 10 \
                 --keep-plt --out /tmp/nyx-quick             # ~2 s, 157 MiB
