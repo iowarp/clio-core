@@ -7,6 +7,7 @@
 #   ./run_paper.sh --dry-run                # print the commands and stop
 #   ./run_paper.sh --out /tmp/smoke --steps 80   # smoke: every cell, tiny
 #   ./run_paper.sh --no-verify              # skip the integrity checks
+#   ./run_paper.sh --no-evolution           # skip the evolution measurement
 #
 # Each finished cell is summarised by metrics.py into metrics.json (ratio,
 # compression and decompression time and throughput, codec mix, timesteps,
@@ -55,6 +56,7 @@ K=${K:-31}
 ONLY_W="" ONLY_C="" DRY=0
 OUT_ROOT=$HERE            # --out sends cells elsewhere, e.g. for a smoke pass
 VERIFY=${VERIFY:-1}       # 1 = digest on lossless, bound check on lossy
+EVOLUTION=${EVOLUTION:-1} # 1 = also measure how fast the data evolves
 while [ $# -gt 0 ]; do
   case "$1" in
     --workload) ONLY_W=$2; shift 2;;
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
     --out)      OUT_ROOT=$2; shift 2;;
     --verify)    VERIFY=1; shift;;
     --no-verify) VERIFY=0; shift;;
+    --no-evolution) EVOLUTION=0; shift;;
     --dry-run)  DRY=1; shift;;
     -h|--help)  sed -n '2,30p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
@@ -272,4 +275,12 @@ for w in warpx vpic nyx lammps; do
     [ -n "$ONLY_C" ] && [ "$c" != "$ONLY_C" ] && continue
     run_cell "$w" "$c"
   done
+  # The temporal evolution metric, once per workload, fanned into all six
+  # cells. Last, because WarpX reads the openPMD a cell has just written.
+  # VPIC and LAMMPS have nothing on disk after an in-situ run and each costs
+  # one extra data-producing run; --no-evolution skips the whole pass.
+  if [ "$DRY" = 0 ] && [ "$EVOLUTION" = 1 ] && [ -z "$ONLY_C" ]; then
+    "$HERE/evolution_pass.sh" --workload "$w" --out "$OUT_ROOT" \
+        --scratch "$SCRATCH" --steps "$STEPS" --int "$INT" || true
+  fi
 done
