@@ -73,7 +73,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "bench_memcpy_probe.h"
+#include "../bench_memcpy_probe.h"
 
 /** CTE core pool id, matching pool_id "512.0" in the server config the
  *  benchmark writes. The baseline talks to the core directly. */

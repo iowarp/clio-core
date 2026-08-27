@@ -1,7 +1,7 @@
 name: MD baselines compile gate (MPI + NVSHMEM)
 
 # COMPILE gate for the two distributed eternia-MD baselines,
-# context-transfer-engine/adapter/gpu_vector/benchmark/clio_md_{mpi,nvshmem}_bench.cc.
+# context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_{mpi,nvshmem}_bench.cc.
 #
 # This workflow deliberately does NOT try to run them. GitHub-hosted runners
 # have no GPU, so the distributed test cannot execute here at all; that job
@@ -27,9 +27,9 @@ on:
   pull_request:
     branches: [main, dev]
     paths:
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/clio_md_mpi_bench.cc'
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/clio_md_nvshmem_bench.cc'
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/CMakeLists.txt'
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_mpi_bench.cc'
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_nvshmem_bench.cc'
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/CMakeLists.txt'
       - 'context-transfer-engine/adapter/gpu_vector/test/distributed_md/**'
       - '.github/workflows/ci-md-benches.yml'
   workflow_dispatch:
@@ -81,7 +81,7 @@ jobs:
       # is exactly the sort of thing a single-arch build waves through. (Not
       # sm_70: NVSHMEM's device archive is not guaranteed to carry it, and a
       # missing cubin fails at nvlink for a reason unrelated to this code.)
-      - name: Compile clio_md_nvshmem_bench
+      - name: Compile clio_lammps_md_nvshmem_bench
         run: |
           nvcc -x cu -std=c++17 -O2 \
               -gencode=arch=compute_80,code=sm_80 \
@@ -89,17 +89,17 @@ jobs:
               -rdc=true -DMD_NVSHMEM_USE_MPI \
               -I"$NVSHMEM_HOME/include" \
               -I/usr/lib/x86_64-linux-gnu/openmpi/include \
-              "$BENCH_DIR/clio_md_nvshmem_bench.cc" -o /tmp/clio_md_nvshmem_bench \
+              "$BENCH_DIR/clio_lammps_md_nvshmem_bench.cc" -o /tmp/clio_lammps_md_nvshmem_bench \
               -L"$NVSHMEM_HOME/lib" -lnvshmem_device -lnvshmem_host \
               -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
 
-      - name: Compile clio_md_mpi_bench
+      - name: Compile clio_lammps_md_mpi_bench
         run: |
           nvcc -x cu -std=c++17 -O2 \
               -gencode=arch=compute_80,code=sm_80 \
               -gencode=arch=compute_89,code=sm_89 \
               -I/usr/lib/x86_64-linux-gnu/openmpi/include \
-              "$BENCH_DIR/clio_md_mpi_bench.cc" -o /tmp/clio_md_mpi_bench \
+              "$BENCH_DIR/clio_lammps_md_mpi_bench.cc" -o /tmp/clio_lammps_md_mpi_bench \
               -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
 
       # Both binaries must at least reach argument parsing without a GPU. This
@@ -108,7 +108,7 @@ jobs:
       - name: Both binaries load and reject a bad argument
         run: |
           export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:${LD_LIBRARY_PATH:-}"
-          for b in /tmp/clio_md_mpi_bench /tmp/clio_md_nvshmem_bench; do
+          for b in /tmp/clio_lammps_md_mpi_bench /tmp/clio_lammps_md_nvshmem_bench; do
             if "$b" --not-an-argument 2>&1 | grep -q 'unknown arg'; then
               echo "OK: $b loads and parses"
             else

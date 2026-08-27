@@ -48,7 +48,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "bench_memcpy_probe.h"
+#include "../bench_memcpy_probe.h"
 
 /** The CTE core pool id, matching the pool_id written into the server
  *  config below. Needed by the baseline path, which talks to the core

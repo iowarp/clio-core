@@ -100,12 +100,12 @@ compile_on() {
     /usr/local/cuda/bin/nvcc -x cu -std=c++17 -O2 -arch='"$MD_ARCH"' \
         -DMD_NVSHMEM_USE_MPI -I/opt/nvshmem/include \
         -I/usr/lib/x86_64-linux-gnu/openmpi/include \
-        -rdc=true clio_md_nvshmem_bench.cc -o /tmp/mdbin/clio_md_nvshmem_bench \
+        -rdc=true clio_lammps_md_nvshmem_bench.cc -o /tmp/mdbin/clio_lammps_md_nvshmem_bench \
         -L/opt/nvshmem/lib -lnvshmem_device -lnvshmem_host \
         -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
     /usr/local/cuda/bin/nvcc -x cu -std=c++17 -O2 -arch='"$MD_ARCH"' \
         -I/usr/lib/x86_64-linux-gnu/openmpi/include \
-        clio_md_mpi_bench.cc -o /tmp/mdbin/clio_md_mpi_bench \
+        clio_lammps_md_mpi_bench.cc -o /tmp/mdbin/clio_lammps_md_mpi_bench \
         -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
   '
 }
@@ -187,10 +187,10 @@ NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
 echo
 echo "== host GPUs visible: ${NGPU:-0}"
 
-run_one mpi clio_md_mpi_bench 'halo .* in [1-9][0-9]* exchanges'
+run_one mpi clio_lammps_md_mpi_bench 'halo .* in [1-9][0-9]* exchanges'
 
 if [ "${NGPU:-0}" -ge 2 ]; then
-  run_one nvshmem clio_md_nvshmem_bench 'spans [1-9][0-9]* staged'
+  run_one nvshmem clio_lammps_md_nvshmem_bench 'spans [1-9][0-9]* staged'
 else
   echo
   echo "== nvshmem : $MD_RANKS PEs inside md-node1 (one GPU on this host)"
@@ -202,7 +202,7 @@ else
   docker exec md-node1 bash -c "
     mpirun --allow-run-as-root -n $MD_RANKS \
         -x LD_LIBRARY_PATH -x NVSHMEM_REMOTE_TRANSPORT \
-        /tmp/mdbin/clio_md_nvshmem_bench $MD_ARGS 2>&1
+        /tmp/mdbin/clio_lammps_md_nvshmem_bench $MD_ARGS 2>&1
   " > "$log" 2>&1
   code=$?
   sed 's/^/   | /' "$log"

@@ -4,7 +4,7 @@ We stop extending LAMMPS. This document designs a standalone MD code that
 implements the same physics as the LAMMPS melt benchmark (lj/cut, NVE,
 periodic box) entirely on eternia `gv::Vector` APIs, living in
 `context-transfer-engine/adapter/gpu_vector/benchmark/` as
-`clio_gpu_vector_md_bench`, with correctness validated against stock LAMMPS
+`clio_lammps_md_paged_bench`, with correctness validated against stock LAMMPS
 output. Cache sizes are FULLY CONFIGURABLE throughout; the design assumes
 nothing about them except per-structure lower bounds that make the working
 set residentable.
@@ -187,7 +187,7 @@ Validation is layered so each layer isolates one failure class:
 
 ## 7. Benchmark harness
 
-`clio_gpu_vector_md_bench` (benchmark/) + `test_gpu_vector_md` (test/):
+`clio_lammps_md_paged_bench` (benchmark/) + `test_gpu_vector_md` (test/):
 
 - CLI: box/lattice/temperature or `--init <dump>`; steps, dt, cutoff, skin,
   rebuild cadence; per-vector page/cache/slot configuration; `--dtype
@@ -223,7 +223,7 @@ should be measuring.
 
 ## Status (2026-08-20)
 
-Implemented as `clio_gpu_vector_md_bench` (design above; code in
+Implemented as `clio_lammps_md_paged_bench` (design above; code in
 context-transfer-engine/adapter/gpu_vector/benchmark/). Stages 1-3 are
 done and gated; stage 4 is partly done; stage 5 is not started.
 

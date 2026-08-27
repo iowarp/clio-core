@@ -69,7 +69,7 @@ tree.
 
 ### 3.1 The observation
 
-Measured on the uncapped probe build of `clio_gpu_vector_md_bench`
+Measured on the uncapped probe build of `clio_lammps_md_paged_bench`
 (`cuobjdump -res-usage`, 12 kernels):
 
 | kernel | REG |
@@ -224,7 +224,7 @@ Correctness first. A register win that changes the physics is not a win.
 its Phase 0.2 MAXLIVE. `LOCAL:0` everywhere -- a spill means the collapse was
 done wrong, not that a budget needs raising.
 
-**3.2 Correctness gates.** `clio_gpu_vector_md_bench` statics/resort/NVE gates
+**3.2 Correctness gates.** `clio_lammps_md_paged_bench` statics/resort/NVE gates
 at lattice 100 and 112, resident and out-of-core; PE/atom digit-identical to
 the pre-change build; the gpu_vector ctest suite (14) and the cte suite (45)
 green. GPU tests run **sequentially** -- `-j` produces false failures.
@@ -377,7 +377,7 @@ kernel can actually reach. With `-fgpu-rdc` ptxas runs per TU and nvlink
 combines cubins afterwards, so per-TU partitioning yields per-TU allocation.
 Two candidate mechanisms, to be chosen on measurement:
 
-- *Source-level*: split `clio_gpu_vector_md_bench.cc` so each kernel and its
+- *Source-level*: split `clio_lammps_md_paged_bench.cc` so each kernel and its
   coroutines form a TU. Simple, no tooling, but it is a source restructuring
   and it is the benchmark's layout, not a general fix for consumers.
 - *IR-level (preferred)*: an LLVM module-splitting pass that partitions the

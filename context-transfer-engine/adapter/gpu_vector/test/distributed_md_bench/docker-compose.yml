@@ -3,7 +3,7 @@
 # The other md harnesses gate a focused distributed TEST: distributed_md_paged
 # proves the paged halo exchange is coherent across nodes, and distributed_md
 # runs the MPI/NVSHMEM benches as real multi-rank jobs. Neither runs
-# clio_gpu_vector_md_bench -- the melt deck with the STATICS, RESORT and NVE
+# clio_lammps_md_paged_bench -- the melt deck with the STATICS, RESORT and NVE
 # gates -- against a CTE that spans machines. This does.
 #
 # What it gates: that the full benchmark, gates and all, still produces the
@@ -125,7 +125,7 @@ services:
       # with a cluster.
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/${GVMB_CONF1:-gvmb_conf.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
-    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_gpu_vector_md_bench --md ${GVMB_TAG1---tag-prefix n1_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP1:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_lammps_md_paged_bench --md ${GVMB_TAG1---tag-prefix n1_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP1:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
   gvmb-node2:
@@ -159,7 +159,7 @@ services:
       - GVMB_NODES=${GVMB_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/${GVMB_CONF2:-gvmb_conf.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
-    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_gpu_vector_md_bench --md ${GVMB_TAG2---tag-prefix n2_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP2:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_lammps_md_paged_bench --md ${GVMB_TAG2---tag-prefix n2_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP2:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
   gvmb-node3:
@@ -192,7 +192,7 @@ services:
       - GVMB_NODES=${GVMB_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/${GVMB_CONF3:-gvmb_conf4.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
-    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_gpu_vector_md_bench --md ${GVMB_TAG3---tag-prefix n3_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP3:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_lammps_md_paged_bench --md ${GVMB_TAG3---tag-prefix n3_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP3:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
   gvmb-node4:
@@ -225,7 +225,7 @@ services:
       - GVMB_NODES=${GVMB_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/${GVMB_CONF4:-gvmb_conf4.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
-    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_gpu_vector_md_bench --md ${GVMB_TAG4---tag-prefix n4_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP4:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && sleep $${GVMB_START_DELAY:-0}; /workspace/${BUILD_DIR:-build}/bin/clio_lammps_md_paged_bench --md ${GVMB_TAG4---tag-prefix n4_} ${GVMB_ARGS:---lattice 20 --steps 20 --blocks 16} ${GVMB_DECOMP4:-}; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/.done_* 2>/dev/null | wc -l) -lt $${GVMB_NODES:-2} ] && [ $$w -lt $${GVMB_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
 networks:

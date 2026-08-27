@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../" && pwd)"
 export HOST_WORKSPACE="${HOST_WORKSPACE:-$REPO_ROOT}"
 export HOST_UID=$(id -u) HOST_GID=$(id -g)
 if [ -z "${CUSZP_LIB_DIR:-}" ]; then
-  BIN="$HOST_WORKSPACE/${BUILD_DIR:-build}/bin/clio_gpu_vector_md_bench"
+  BIN="$HOST_WORKSPACE/${BUILD_DIR:-build}/bin/clio_lammps_md_paged_bench"
   CUSZP_LIB="$(ldd "$BIN" 2>/dev/null | awk '/libcuSZp/ {print $3}')"
   [ -n "$CUSZP_LIB" ] && export CUSZP_LIB_DIR="$(dirname "$CUSZP_LIB")"
 fi

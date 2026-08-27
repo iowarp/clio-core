@@ -51,7 +51,7 @@ static constexpr clio::run::u32 kYieldLaneBytes = 4096;
 #include <string>
 #include <thread>
 #include <vector>
-#include "bench_memcpy_probe.h"
+#include "../bench_memcpy_probe.h"
 
 namespace gv = clio::cte::gpu_vector;
 namespace gy = clio::run::gpu;
