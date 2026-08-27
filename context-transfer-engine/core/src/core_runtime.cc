@@ -3884,6 +3884,15 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
   // regime) costs each child the blocked-queue resume cadence (~560us) that
   // inline avoids, which measured as a 7x SLOWDOWN for a single-block flush
   // (954 MB/s vs the historical 6.5 GB/s) and no gain at 16 blocks.
+  // LOCAL RECORDS INLINE, REMOTE RECORDS IN PARALLEL. Serial-inline was
+  // measured right for the all-local flush (dispatch cost a single-block
+  // flush 7x), but a DECOMPOSED batch is ~half remote-owned, and each remote
+  // record is a full network forward -- serialized, four of them stack
+  // ~2 ms each on the critical path of the PEER'S generational stamp-wait.
+  // Issue the remote forwards together and they cost max(), not sum().
+  clio::run::Future<PodPutBlobTask> rem_futs[kPodMultiMax];
+  clio::run::u32 rem_idx[kPodMultiMax];
+  clio::run::u32 n_rem = 0;
   for (clio::run::u32 i = 0; i < n; ++i) {
     auto &req = task->reqs_[i];
     const std::string rec_name = task->GetBlobName(i);
@@ -3892,26 +3901,36 @@ clio::run::TaskResume Runtime::PodMultiPutBlob(
         clio::run::PoolQuery::Local(), task->tag_id_, rec_name.c_str(),
         req.offset_, req.size_, req.data_, req.score_, task->context_,
         task->flags_);
-    sub.get()->BeginRunContext();
     // Level collapse: skip the PodPutBlob wrapper when the record is
-    // node-local (a flush batch always is). Its only other job -- the
-    // "_pi" suffix -- lives inside PutBlobImpl already, and each skipped
-    // nested-coroutine level is ~100us per record.
-    {
-      std::string eff_name = sub->GetBlobName();
-      if (sub->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
-        eff_name += "_pi" + std::to_string(sub->gpu_page_idx_);
-      }
-      const clio::run::PoolQuery owner =
-          HashBlobToContainer(sub->tag_id_, eff_name);
-      if (TargetIsNodeLocal(owner, sub->pool_id_)) {
-        CLIO_CO_AWAIT(PutBlobImpl(sub));
-      } else {
-        CLIO_CO_AWAIT(PodPutBlob(sub));
-      }
+    // node-local. Its only other job -- the "_pi" suffix -- lives inside
+    // PutBlobImpl already, and each skipped nested-coroutine level is
+    // ~100us per record.
+    std::string eff_name = sub->GetBlobName();
+    if (sub->gpu_page_idx_ != PodPutBlobTask::kNoPageIdx) {
+      eff_name += "_pi" + std::to_string(sub->gpu_page_idx_);
     }
-    int rc = sub->GetReturnCode();
-    req.rc_ = static_cast<clio::run::u32>(rc);
+    const clio::run::PoolQuery owner =
+        HashBlobToContainer(sub->tag_id_, eff_name);
+    if (TargetIsNodeLocal(owner, sub->pool_id_)) {
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(PutBlobImpl(sub));
+      int rc = sub->GetReturnCode();
+      req.rc_ = static_cast<clio::run::u32>(rc);
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (first_rc == 0) {
+        first_rc = rc;
+      }
+    } else {
+      rem_idx[n_rem] = i;
+      rem_futs[n_rem] = ipc_manager->Send(sub);
+      ++n_rem;
+    }
+  }
+  for (clio::run::u32 r = 0; r < n_rem; ++r) {
+    CLIO_CO_AWAIT(rem_futs[r]);
+    int rc = rem_futs[r]->GetReturnCode();
+    task->reqs_[rem_idx[r]].rc_ = static_cast<clio::run::u32>(rc);
     if (rc == 0) {
       task->num_ok_++;
     } else if (first_rc == 0) {
