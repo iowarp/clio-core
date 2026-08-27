@@ -205,6 +205,64 @@ LAMMPS is the only float64 workload here, and the only one that is **not
 bit-reproducible** — a Kokkos trajectory differs slightly between runs, so its
 cells do not see byte-identical input the way the two replay workloads do.
 
+### Measuring it rather than asserting it: `evolution.py`
+
+Everything above is a description of what each workload *should* do. `evolution.py`
+measures what it actually did, in one number that is comparable across all four
+despite their fields spanning fifteen orders of magnitude in SI units:
+
+```
+E(B_t, B_t+dt) = ||B_t+dt - B_t||_2 / (||B_t+dt||_2 + ||B_t||_2 + eps)
+```
+
+per **block** — a fixed byte range of a field, the unit Clio actually compresses
+— between consecutively sampled frames. E is 0 for a block bit-identical to its
+predecessor and approaches 1 for one that is unrelated to it. It is scale free,
+which is why an absolute difference could not do this job here.
+
+```bash
+./evolution.py --source f32     --dir /tmp/nyx-e10       --out /tmp/ev/nyx --step-scale 10
+./evolution.py --source openpmd --dir /tmp/wx/run/diags  --out /tmp/ev/wx
+./evolution.py --source raw     --dir /tmp/lmp-raw --f64 --out /tmp/ev/lmp
+./evolution_rank.py /tmp/ev                 # rank a workload's configurations
+```
+
+Three sources, because the four workloads deliver data three different ways:
+`f32` reads the `plt%05d/fab0000_comp%02d_<field>.f32` dumps Nyx and VPIC share,
+`openpmd` reads WarpX's `.h5` through the `h5dump` CLI (no h5py on this machine,
+same reason `viz_openpmd.py` gives), and `raw` reads the blob bytes LAMMPS's
+driver writes under `--raw`, which is the only way to see an in-process workload
+at all.
+
+**`--block` defaults to 1 MiB**, which is WarpX's chunk size exactly and divides
+the other three workloads' chunks evenly, so one number means the same thing in
+all four. The block, not the field, is the unit because the selector's decision
+is per chunk: a field can be busy while every chunk of it is individually static,
+and a whole-field norm cannot see the difference.
+
+**Two numbers, not one.** Alongside E, the tool records the share of **cells
+bit-identical to the previous sampled frame** (`pct_cells_same`). They answer
+different questions and disagree in both directions — a shock front crossing an
+otherwise quiet slab is a large E with most cells untouched; a field nudged
+everywhere in its last mantissa bit is a tiny E with no cell untouched. E says
+how far a block moved; the second says how much of it never moved, and *its
+complement is what the codec has to encode as new*. Bit equality is compared on
+the integer view of the bytes rather than with `==`, because `-0.0 == 0.0` is
+true in float and those are different bytes.
+
+**Reported per configuration:** mean / median / max / min E, the share of blocks
+`active` (E ≥ 1e-3), `pct_cells_same`, and — because a run that jumps once and
+then freezes has the same mean as one that changes steadily — the per-interval
+series plus `p10_interval` (10th percentile of the per-interval means, which a
+single spike cannot lift) and `last_quarter`. `evolution_rank.py` orders on
+`p10_interval × active`, and **disqualifies outright any configuration with a
+NaN/Inf block**, so an unstable run cannot win on a high score.
+
+Section 6 records what the 1,000-timestep study built on this found across the
+four; each workload's README carries its own ranking table, its chosen default
+and the official references behind it, under "Default Evolving Benchmark
+Configuration".
+
 ---
 
 ## 2. What the knobs map to in the code
@@ -653,3 +711,72 @@ instantaneous when they cannot be timed: a chunk stored raw has nothing to
 invert, and a **CPU codec in the action space** (brotli, zlib, ...) reports no
 time at all, because the measurement is a CUDA-event bracket around a GPU
 codec call.
+
+---
+
+## 6. The 1,000-timestep evolution study
+
+Each workload was swept over a small set of physics parameters chosen from its
+upstream documentation, every configuration run for **1,000 timesteps** and
+sampled **every 10**, and scored with `evolution.py` (section 1). Twenty-six
+configurations in total: WarpX 9, LAMMPS 7, Nyx 6, VPIC 4. The winner of each is
+now that workload's default, documented with its parameters and official
+references under "Default Evolving Benchmark Configuration" in the workload's
+own README; each workload's ranking table is in its `RESULTS.md`, and the raw
+per-block measurements, summaries and sweep scripts are in `evolution-study/`.
+
+| workload | default chosen | mean E | active blocks | cells bit-identical | what actually moved it |
+|---|---|---|---|---|---|
+| **VPIC** | `VPIC_CLEAN_DIV_INT=10` | 0.6355 | 93.8% | 8.33% | divergence cleaning; anisotropy inert |
+| **LAMMPS** | `--temp 6.0 --skin 0.8 --every 5` | 0.4368 | 100.0% | 0.00% | temperature, once the neighbour list was fixed |
+| **WarpX** | `laser1.e_max=32.e12` (a0 = 8) | 0.1636 | 88.4% | 21.99% | laser amplitude; density and a plasma ramp inert |
+| **Nyx** | `nyx.cfl=0.8` | 0.1159 | 76.7% | 80.04% | the CFL number; `exp_energy` exactly cancels |
+
+Read the ranking down that table as a property of the *data*, not of the
+configurations: VPIC's PIC fields are shot-noise dominated and decorrelate
+almost completely every 10 steps, LAMMPS's float64 MD state never repeats a bit
+pattern, while Nyx's Sedov blast leaves 80% of cells untouched between dumps
+even at its best setting. That last column is the one that predicts
+compressibility, and it is why Nyx reaches 150x where LAMMPS reaches 1.1x.
+
+**Four findings worth carrying out of it.**
+
+*Three of the four workloads' obvious knob was the wrong one.* Nyx's blast
+energy, VPIC's temperature anisotropy and WarpX's plasma density are each the
+parameter that most obviously controls "how violent is the physics", and each
+of them moved the measured evolution by less than the noise. What moved it
+instead was, respectively, a numerical parameter (`nyx.cfl`), a diagnostic
+setting (`clean_div_*`), and one of three physics knobs (laser `a0`).
+
+*Nyx's cancellation is exact, not approximate.* Sedov is self-similar, so the
+shock advances `cfl*dx/c1` cells per timestep whatever the blast energy: a
+stronger blast moves it faster and shrinks the CFL timestep by the same factor.
+Measured, `exp_energy` 1 -> 100 changes the last decile's cells-identical by 0.3
+points while `nyx.cfl` 0.5 -> 0.8 changes it by 23. This does not contradict
+`nyx/README.md`'s existing `--exp-energy` table, which is measured at fixed
+`stop_time`, where a stronger blast buys more *steps*. Fixed time and fixed
+steps are different questions.
+
+*A configuration can score well by being broken.* Two were caught, and neither
+by the metric:
+
+- WarpX with the moving window off scores 2.2x the winner. Its total field
+  energy is *exactly* conserved while E and B exchange periodically — the pulse
+  is resonating between PEC boundaries. It exits 0 and holds no NaN.
+- LAMMPS at `--temp 6.0` on upstream's neighbour settings loses **3.5%** of its
+  NVE total energy over 1,000 steps, because atoms cross the 0.3 sigma skin
+  between rebuilds and pairs are missed. Widening the skin cut the drift to
+  0.37% *and raised* the score, so the defect was suppressing the measurement
+  as well as corrupting it.
+
+`evolution_rank.py` disqualifies NaN/Inf automatically and nothing else, so a
+study that rules a configuration out on physics writes the reason into its
+`evolution.json` under `disqualified`. Conservation diagnostics — WarpX's
+`FieldEnergy`, Nyx's mass sum, LAMMPS's `TotEng` — are what caught both, and are
+worth running beside the metric rather than after it.
+
+*The best-scoring setting is not always the right default.* Nyx at `cfl = 0.9`
+scores 5% higher than at 0.8 and conserves mass ~1000x worse (-1.09e-04 against
+-1.19e-07), because the scheme produces negative densities that the density
+floor clamps. 0.8 — Nyx's own documented default — gives up 1.4% of the mean and
+keeps mass to float32 roundoff.
