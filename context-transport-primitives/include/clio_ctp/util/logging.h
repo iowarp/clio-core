@@ -140,14 +140,21 @@ class Logger {
     std::string level_env = ctp::SystemInfo::Getenv(
         "CTP_LOG_LEVEL", ctp::Unit<size_t>::Megabytes(1));
     if (!level_env.empty()) {
-      // Parse log level - accept both numeric and string values
+      // Parse log level - accept both numeric and string values.
+      // "warn" is accepted alongside "warning" because it is the spelling
+      // callers reach for, and an unrecognised value silently keeps the
+      // default rather than failing -- so the typo reads as "setting the log
+      // level had no effect". Six of this repo's own benchmark scripts passed
+      // "warn" and logged at kDebug for it.
       if (level_env == "debug" || level_env == "DEBUG" || level_env == "0") {
         runtime_log_level_ = kDebug;
       } else if (level_env == "info" || level_env == "INFO" || level_env == "1") {
         runtime_log_level_ = kInfo;
       } else if (level_env == "success" || level_env == "SUCCESS" || level_env == "2") {
         runtime_log_level_ = kSuccess;
-      } else if (level_env == "warning" || level_env == "WARNING" || level_env == "3") {
+      } else if (level_env == "warning" || level_env == "WARNING" ||
+                 level_env == "warn" || level_env == "WARN" ||
+                 level_env == "3") {
         runtime_log_level_ = kWarning;
       } else if (level_env == "error" || level_env == "ERROR" || level_env == "4") {
         runtime_log_level_ = kError;

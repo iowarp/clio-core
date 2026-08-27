@@ -65,7 +65,7 @@ for D in $DSETS; do
       HDF5_VOL_CONNECTOR=clio HDF5_PLUGIN_PATH="$STORE" \
       CLIO_VOL_COMPRESSOR_POOL=512.0 CLIO_VOL_CHUNK_SIZE="$CHUNK" \
       CLIO_NEUROPRESS_PATH_TRACE=1 \
-      CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
+      CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
       h5dump -d "$D" -b LE -o "$STORE/via_clio.bin" "$REL" ) > /dev/null 2>> "$STORE/read.log"
   RC=$?
   ( cd "$RUNDIR" && env -u HDF5_VOL_CONNECTOR -u HDF5_PLUGIN_PATH \

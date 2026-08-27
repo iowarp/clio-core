@@ -213,7 +213,7 @@ set +e
     CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv" \
     CLIO_NEUROPRESS_PATH_TRACE=1 \
     $( { [ "$NP_EXPLORE" = true ] || [ "$BEST" = true ]; } && echo CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv" ) \
-    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
+    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \
     ${BW:+CLIO_NEUROPRESS_COST_BW=$BW} \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=${MEASURE_DT:-1} \

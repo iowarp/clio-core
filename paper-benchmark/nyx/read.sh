@@ -37,7 +37,7 @@ echo "== cold read from $STORE (writer process is long gone)"
 env CLIO_SERVER_CONF="$STORE/compose.yaml" \
     CLIO_WITH_RUNTIME=1 CLIO_RESTART=1 \
     CLIO_REPLAY_COMPRESSOR_POOL=512.0 \
-    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warn}" \
+    CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
     "$BIN" --readback "$STORE/blobs.csv" --tag "nyx_$RUN" 2> "$STORE/read.log"
 RC=$?
 [ $RC -ne 0 ] && { echo "-- last lines of $STORE/read.log:"; grep -vE "DEBUG|INFO" "$STORE/read.log" | tail -12; }
