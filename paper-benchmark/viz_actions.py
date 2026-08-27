@@ -8,6 +8,15 @@
 `--sel EB:DIR` is repeatable; DIR is a run_config.sh store (it reads
 `selection.csv` inside). Lossless runs are fine too -- pass `0:DIR`.
 
+Workload-agnostic, which is why it lives here rather than under nyx/. It reads
+both blob-name shapes the benchmarks produce:
+
+    nyx      plt00007/fab0000_comp00_density/chunk_0    field second, frame first
+    lammps   position/step_140/chunk_0                  field first, frame second
+
+so `--field density` and `--field position` both work, and a nyx dump index and
+a LAMMPS timestep both become the x axis.
+
 A NeuroPress action is not just a codec. It is the tuple
 (library, byte shuffle, quantize, preset), and this draws all of it at once:
 
@@ -27,19 +36,40 @@ throughout); if that changes the script says so rather than hiding it.
 import argparse, collections, csv, os, re, sys
 
 FIELD_RE = re.compile(r"^fab\d+_comp\d+_")
+FRAME_RE = re.compile(r"^(?:plt|step_)(\d+)$")
 # The reference categorical palette, slots 1-3, in fixed order. Three series is
 # within the count that validates on all pairs in both light and dark.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 
 
 def read_sel(path):
-    """selection.csv -> {field: {dump: row}}. Blob names are
-    plt%05d/fab0000_comp%02d_<field>/chunk_%d."""
+    """selection.csv -> {field: {frame: row}}.
+
+    Two blob-name shapes, told apart by which half looks like a frame counter
+    rather than by which benchmark wrote the file:
+
+        plt00007/fab0000_comp00_density/chunk_0     nyx
+        position/step_140/chunk_0                   lammps
+
+    The frame key is whatever number the counter carries -- a nyx dump index or
+    a LAMMPS timestep -- so it is comparable within a run but not across
+    workloads. Callers plot it as the x axis and label it accordingly.
+    """
     out = collections.defaultdict(dict)
     with open(path) as fh:
         for r in csv.DictReader(fh):
-            frame, stem, _ = r["blob"].split("/")
-            out[FIELD_RE.sub("", stem)][int(frame[3:])] = r
+            parts = r["blob"].split("/")
+            if len(parts) < 2:
+                continue
+            a, b = parts[0], parts[1]
+            ma, mb = FRAME_RE.match(a), FRAME_RE.match(b)
+            if ma and not mb:            # nyx: frame first
+                field, frame = FIELD_RE.sub("", b), int(ma.group(1))
+            elif mb and not ma:          # lammps: field first
+                field, frame = FIELD_RE.sub("", a), int(mb.group(1))
+            else:
+                continue
+            out[field][frame] = r
     return out
 
 
@@ -74,8 +104,11 @@ def main():
         print(f"NOTE: preset varies across these runs ({sorted(presets)}); "
               f"the plate does not encode it.")
 
-    fields = a.field or [f for f in ["density", "xmom", "ymom", "zmom", "rho_E", "rho_e"]
-                         if any(f in sel for _, _, sel in runs)]
+    known = ["density", "xmom", "ymom", "zmom", "rho_E", "rho_e",   # nyx
+             "position", "velocity", "force"]                        # lammps
+    present = [f for f in known if any(f in sel for _, _, sel in runs)]
+    extra = sorted({f for _, _, sel in runs for f in sel} - set(present))
+    fields = a.field or (present + extra)
     # Lanes are shared across every subplot so the plates are comparable, and
     # ordered by how much work the codec does -- roughly fastest to strongest.
     ORDER = ["nvcomp-bitcomp", "nvcomp-lz4", "nvcomp-snappy", "nvcomp-ans",
@@ -85,7 +118,12 @@ def main():
     lane_of = {l: i for i, l in enumerate(lanes)}
 
     os.makedirs(a.out, exist_ok=True)
-    ndump = max(d for _, _, sel in runs for f in sel for d in sel[f]) + 1
+    allframes = sorted({d for _, _, sel in runs for f in sel for d in sel[f]})
+    # LAMMPS frames are TIMESTEPS (0, 20, 40, ...), nyx frames are dump indices
+    # (0, 1, 2, ...). Plot the actual keys rather than an ordinal so the axis
+    # means something in both cases.
+    xlab = "dump  (the blast expanding)" if max(allframes) < len(allframes) * 2 \
+        else "timestep  (the lattice melting)"
 
     fig, axes = plt.subplots(len(fields), 1, squeeze=False,
                              figsize=(11, 1.05 * len(lanes) * len(fields) * 0.55 + 1.6 * len(fields)),
@@ -113,8 +151,9 @@ def main():
                ylim=(-0.7, len(lanes) - 0.3))
         ax.grid(alpha=0.25, axis="both")
         ax.set_ylabel(field, fontsize=10, rotation=0, ha="right", va="center", labelpad=44)
-    axes[-1, 0].set_xlabel("dump  (the blast expanding)")
-    axes[-1, 0].set_xlim(-0.6, ndump - 0.4)
+    axes[-1, 0].set_xlabel(xlab)
+    pad = (max(allframes) - min(allframes)) * 0.03 + 0.5
+    axes[-1, 0].set_xlim(min(allframes) - pad, max(allframes) + pad)
 
     handles = [Line2D([], [], color=SERIES[k % len(SERIES)], marker="o", ls="-",
                       label=f"eb = {eb:g}") for k, (eb, _, _) in enumerate(runs)]

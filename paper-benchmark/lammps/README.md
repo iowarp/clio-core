@@ -121,6 +121,37 @@ shuffle.
 behaviour and Clio keeps it, so the quantizer sees float64 bytes reinterpreted
 as pairs of float32 words.
 
+### Looking at the data
+
+This workload is in situ — LAMMPS runs as a library in the benchmark process
+and no file is ever written — so there is nothing on disk to look at unless the
+run asks for it. `--raw DIR` makes the driver write each staged blob's bytes,
+which are exactly what NeuroPress compressed.
+
+```bash
+./run_config.sh dynamic --box 20 --steps 500 --gap 20 --chunk 768000 \
+    --require-device --raw /tmp/lmp-raw --results /tmp/lmp-lossless --tag ll
+./viz_atoms.py --raw /tmp/lmp-raw --out /tmp/lmp-viz          # ~20 s
+```
+
+`viz_atoms.py` draws a 1.2σ slab through the middle of the box, coloured by
+speed, as a montage and a GIF — a slab and not the whole box, because 32,000
+atoms projected through 33σ of depth is a uniform smear at every timestep and
+the melt is invisible. `evolution.png` carries MSD, g(r), temperature, the
+per-byte redundancy above, and a zlib stand-in for the ratio.
+
+The physics is unambiguous: g(r) goes from sharp fcc shells out to 16σ at step 0
+to a single broad liquid peak by step 260, temperature settles from 3.0 to 1.65,
+and MSD grows linearly — textbook diffusion. **The melt is complete by about
+step 40**, and the compression ratio has finished moving by then too:
+position's zlib stand-in drops 7.58× → 1.06× over the first frame and is flat
+for the remaining 25.
+
+MSD uses minimum-image displacement accumulated frame to frame. LAMMPS wraps
+coordinates into the box, so a plain `x[t] - x[0]` reads an atom crossing a face
+as a box-sized jump — at step 500 that put a real -0.37 displacement in as
++33.2.
+
 ### The data evolves, but its compressibility barely does
 
 The lattice melts -- that is the point of the deck -- and the statistics say so
@@ -140,16 +171,100 @@ the whole run, `velocity` 1.03x, `force` 1.38x, and the aggregate sits near
 high-order bits while the float64 mantissa is effectively random and dominates.
 Same conclusion as VPIC -- see its README -- and no deck parameter changes it.
 
+### The error bound is INERT on float64, and the selection log does not say so
+
+Three bounds at box 20 / 500 steps / `--require-device`, each with its own
+`--raw` (a Kokkos trajectory is not bit-reproducible, so a lossy run must be
+compared against its OWN originals — two runs of this deck diverge to 5e-9 by
+step 500):
+
+| | stored ratio | quantize chosen | quantize APPLIED | worst \|err\| |
+|---|---|---|---|---|
+| lossless | 1.043× | — | — | 0 |
+| `--eb 0.001` | 1.048× | 27/78 | **0** | **0** |
+| `--eb 0.01` | 1.039× | 26/78 | **0** | **0** |
+| `--eb 0.1` | 1.043× | 27/78 | **0** | **0** |
+
+**Every blob came back bit-exact at every bound.** The ratio moves by under a
+percent and not monotonically — `--eb 0.01` is *worse* than lossless. Repeated
+runs give these figures to three decimals, so that is a real selection effect,
+not variance.
+
+`selection.csv`'s `quantize` column records that a quantize action was
+**chosen**, not that quantization **ran**. The tell is `actual_psnr` in the same
+row: it is seeded to -1 and overwritten only inside upstream's
+`if (d_quantized && quant_result.isValid())`, so `actual_psnr > 0` is the only
+evidence the quantizer executed. Read it before reporting a lossy LAMMPS
+number. `../viz_bound.py` plots exactly this comparison:
+
+| | chunks | quantize chosen | applied |
+|---|---|---|---|
+| nyx (float32) eb 0.1 | 156 | 108 | **107** |
+| lammps (float64) eb 0.1 | 78 | 27 | **0** |
+
+The cause is the float32 reinterpretation this README already documents.
+Measured on a real velocity chunk: read as float32, **396 of 192,000 words are
+non-finite** and the finite span is ±3.4e38. `compressor_runtime.cc` gates
+quantization on a finite range and declines cleanly — which is correct, and
+invisible unless you look at `actual_psnr`.
+
+An earlier revision of this section reported 1.174× at `--eb 1e-3` on box 40 /
+100 steps with 6 of 18 rows quantized. Re-run on this build with
+`--require-device`, that configuration gives **1.049×** with 8 chosen and **0
+applied**, against 1.091× lossless — the lossless figure reproduces, the lossy
+one does not. Treat the old number as stale.
+
+### Can LAMMPS be float32? Yes, and the bound wakes up
+
+`--f32` downcasts `x/v/f` to float32 before staging and declares
+`data_type_ = 1`. Host gather only (`--order id`), so `run_config.sh --f32`
+also sets `CLIO_NEUROPRESS_STAGE_H2D=1` — the quantizer needs a device pointer,
+and the host gather does not produce one. Chunk size must halve with the
+element width (`--chunk 384000` at 32,000 atoms) to keep one chunk per field
+per frame.
+
+| | float64 | float32 |
+|---|---|---|
+| payload staged | 57.1 MiB | 28.6 MiB |
+| lossless | 1.043× | 1.065× |
+| `--eb 0.001` | 1.048× | **1.335×** |
+| `--eb 0.01` | 1.039× | **1.378×** |
+| `--eb 0.1` | 1.043× | **1.456×** |
+| quantize chosen → applied | 27 → **0** | 27 → **26** |
+| bytes on the tier, best case | 57.2 MiB | **19.6 MiB** |
+
+Monotone in the bound, which float64 never was. End to end that is **2.8×**
+against float64-lossless, where every float64 configuration sits at 1.04×
+whatever you ask for. At `--eb 0.1` the velocity error reaches 0.095 on 100% of
+elements, `force` moves by 2.7e-13, and `position` is still returned untouched
+because the selector declines to quantize it at any bound.
+
+The narrowing is not free and is not NeuroPress's doing: LAMMPS state is
+`double`, so `--f32` discards ~29 bits of mantissa before the compressor is
+involved. Whether that is acceptable is a question about the trajectory, not
+about compression. What the table shows is only that the bound becomes
+reachable once it is done.
+
+### Temporal redundancy: zero per value, 22.6% per byte
+
+`viz_atoms.py` measures how much of a frame survives the next timestep. Per
+value the answer is **0.00%, at every frame, for every field** — not one of the
+96,000 doubles in a frame is unchanged, where the Nyx blast starts at 99.9% and
+ends at 57%. That number is saturated and on its own misleading. Per byte:
+
+| byte position | 7 (sign+exp) | 6 | 5 | 4..0 |
+|---|---|---|---|---|
+| identical to previous frame | **99.4%** | 78.2% | 1.1% | ~0.4% |
+
+22.6% of bytes overall. **That is the float64 story in one row**: there is real
+structure, it lives in one byte out of eight, and an 8-byte shuffle is what
+puts those bytes next to each other. The 4-byte stride NeuroPress can encode
+splits the double down the middle and puts an exponent byte beside a mantissa
+byte — which is why the shuffle result above is worth only ~1.3% here.
+
 ### `--eb` is an ABSOLUTE bound, and LJ units make it mean three different things
 
-At `--eb 1e-3`, matched runs at box 40 / 100 steps:
-
-| | ratio | adopted rows that quantized |
-|---|---|---|
-| lossless | 1.090 | 0 of 18 |
-| lossy `--eb 1e-3` | 1.174 | 6 of 18 |
-
-Only a third of chunks quantize, because the same absolute bound is wildly
+Even where a quantize action is *chosen*, the same absolute bound is wildly
 mis-scaled across the three fields:
 
 | field | typical MAD | `1e-3` relative to it | quantized |

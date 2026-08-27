@@ -193,7 +193,7 @@ done
 ./viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
     --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
     --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
-./viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
+../viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
     --sel 0.01:/tmp/nyx-lossy/eb01 --sel 0.1:/tmp/nyx-lossy/eb10
 ```
 
@@ -268,9 +268,12 @@ only where the selector took the offer.
 
 ### The action progression
 
-`viz_actions.py` draws what was selected per dump, and it draws the whole
+`../viz_actions.py` draws what was selected per dump, and it draws the whole
 action rather than just the codec: lane is the library, colour is the bound, a
 filled marker means quantize was taken, a square means the 4-byte shuffle.
+
+It lives one level up because it is workload-agnostic: it reads both blob-name
+shapes, so the same script serves the LAMMPS benchmark.
 
 The point is that **the selection moves as the physics does**. On density the
 run walks cascaded/zstd/gdeflate → snappy → bitcomp → cascaded → ans, settling

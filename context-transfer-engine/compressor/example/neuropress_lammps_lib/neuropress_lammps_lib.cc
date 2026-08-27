@@ -130,6 +130,9 @@ struct Options {
   std::string report;            // per-blob CSV
   std::string raw_dir;           // also write every staged blob's bytes here
   std::string readback;          // CSV from --report: read those blobs, no LAMMPS
+  std::string decomp_dir;        // write every DECOMPRESSED blob's bytes here
+  bool expect_lossy = false;     // a positive error bound: do not claim bit-exact
+  bool f32 = false;              // downcast the state to float32 before staging
   bool kokkos = false;    // -k on g 1 -sf kk
   bool verify = false;    // read every blob back through the decompressor
   bool quiet = false;     // LAMMPS -screen none
@@ -177,6 +180,12 @@ void Usage(const char *argv0) {
       << "  --report CSV     per-blob outcome\n"
       << "  --raw DIR        also write each staged blob's raw bytes to DIR "
          "(cross-checks)\n"
+      << "  --dump-decompressed DIR  write each decompressed blob's bytes "
+         "to DIR (pair with --raw to compare)\n"
+      << "  --f32            downcast x/v/f to float32 before staging and "
+         "declare data_type_=1 (halves the payload; --order id only)\n"
+      << "  --expect-lossy   a positive CLIO_NEUROPRESS_ERROR_BOUND was set, so "
+         "the bytes are NOT expected to match; report decode failures only\n"
       << "  --readback CSV   no simulation: read every blob named in a "
          "previous --report CSV back\n"
       << "                   through the decompressor and compare digests "
@@ -218,6 +227,9 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--report") o->report = need("CSV");
     else if (a == "--raw") o->raw_dir = need("DIR");
     else if (a == "--readback") o->readback = need("CSV");
+    else if (a == "--dump-decompressed") o->decomp_dir = need("DIR");
+    else if (a == "--expect-lossy") o->expect_lossy = true;
+    else if (a == "--f32") o->f32 = true;
     else if (a == "--kokkos") o->kokkos = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "--var") {
@@ -362,18 +374,33 @@ int main(int argc, char **argv) {
           clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
           buf.shm_.template Cast<void>(), cte_client->pool_id_);
       get.Wait();
-      const bool ok = get->GetReturnCode() == 0 &&
-                      Fnv1a(buf.ptr_, r.bytes) == r.digest;
+      const int rc_get = get->GetReturnCode();
+      // Under a positive error bound the bytes are SUPPOSED to differ, so a
+      // digest test would report FAILED on a run behaving exactly as asked.
+      // There `bad` counts decode failures only, and the verdict on the data
+      // is whatever compares --raw against --dump-decompressed afterwards.
+      const bool ok = opt.expect_lossy ? (rc_get == 0)
+                                       : (rc_get == 0 &&
+                                          Fnv1a(buf.ptr_, r.bytes) == r.digest);
       if (!ok) {
         ++bad;
-        std::cerr << "  MISMATCH " << r.name << " rc=" << get->GetReturnCode()
-                  << "\n";
+        std::cerr << "  MISMATCH " << r.name << " rc=" << rc_get << "\n";
+      }
+      if (!opt.decomp_dir.empty() && rc_get == 0) {
+        std::string fn = r.name;
+        for (auto &ch : fn) if (ch == '/') ch = '_';
+        std::ofstream(opt.decomp_dir + "/" + fn + ".bin", std::ios::binary)
+            .write(static_cast<const char *>(buf.ptr_),
+                   static_cast<std::streamsize>(r.bytes));
       }
       CLIO_IPC->FreeBuffer(buf);
     }
     std::cout << (bad == 0 ? "VERIFIED: " : "FAILED: ") << (recs.size() - bad)
               << " of " << recs.size()
-              << " blobs round-tripped bit-exact through the decompressor"
+              << (opt.expect_lossy
+                      ? " blobs decompressed without error (lossy: bytes are "
+                        "not expected to match)"
+                      : " blobs round-tripped bit-exact through the decompressor")
               << std::endl;
     return bad == 0;
   };
@@ -531,7 +558,21 @@ int main(int argc, char **argv) {
     if (opt.fields.find(f.blob_name) != std::string::npos) fields.push_back(&f);
   if (fields.empty()) { std::cerr << "no fields selected\n"; return 1; }
 
-  const size_t field_bytes = static_cast<size_t>(natoms) * 3 * sizeof(double);
+  // --f32 stages a DOWNCAST copy. LAMMPS' state is double (Atom::x/v/f are
+  // double**), so this is a lossy narrowing of its own, before NeuroPress sees
+  // anything -- but it is what makes a NeuroPress error bound reachable at all:
+  // the quantizer reads every buffer as float32 regardless of the declared
+  // type, and float64 bytes read that way are largely non-finite, so it
+  // declines. Handing it real float32 is the difference between an error bound
+  // that applies and one that is silently inert.
+  if (opt.f32 && opt.order != "id") {
+    std::cerr << "--f32 is implemented on the host gather only; pass "
+                 "--order id (and CLIO_NEUROPRESS_STAGE_H2D=1 if the "
+                 "compressor must see a device pointer)\n";
+    return 1;
+  }
+  const size_t elem_size = opt.f32 ? sizeof(float) : sizeof(double);
+  const size_t field_bytes = static_cast<size_t>(natoms) * 3 * elem_size;
   const size_t chunk = (opt.chunk == 0 || opt.chunk > field_bytes) ? field_bytes
                                                                     : opt.chunk;
   const size_t chunks_per_field = (field_bytes + chunk - 1) / chunk;
@@ -562,7 +603,7 @@ int main(int argc, char **argv) {
   // clio_context_data_type). error_bound_ is 0 = lossless unless
   // CLIO_NEUROPRESS_ERROR_BOUND asks otherwise; see ErrorBoundFromEnv.
   clio::cte::core::Context ctx;
-  ctx.data_type_ = 2;
+  ctx.data_type_ = opt.f32 ? 1 : 2;
   ctx.error_bound_ = ErrorBoundFromEnv();
   if (ctx.error_bound_ > 0.0)
     std::cout << "  error bound=" << ctx.error_bound_
@@ -570,7 +611,8 @@ int main(int argc, char **argv) {
 
   std::vector<BlobRecord> records;
   std::vector<Pending> pending;
-  std::vector<double> gathered;  // --order id staging, natoms*3
+  std::vector<double> gathered;    // --order id staging, natoms*3
+  std::vector<float> gathered32;   // --f32 downcast of the same
   records.reserve(static_cast<size_t>(nframes) * fields.size() * chunks_per_field);
 
   auto drain = [&]() {
@@ -653,7 +695,9 @@ int main(int argc, char **argv) {
     // only because drain() has already waited for frame N-1's tasks.
     device_slot_next = 0;
     for (const Field *f : fields) {
-      const double *src = nullptr;
+      // const void*, not const double*: under --f32 this points at the
+      // downcast float array. Only ever read as bytes below.
+      const void *src = nullptr;
       // --order device: the field, ID-ordered, sitting in device memory. Set
       // instead of `src`, and the two are never both valid.
       const char *dev_field = nullptr;
@@ -721,6 +765,12 @@ int main(int argc, char **argv) {
                             gathered.data());
         LmpCheck(lmp, "gather_atoms");
         src = gathered.data();
+        if (opt.f32) {
+          gathered32.resize(gathered.size());
+          for (size_t i = 0; i < gathered.size(); ++i)
+            gathered32[i] = static_cast<float>(gathered[i]);
+          src = gathered32.data();
+        }
       } else {
         // Atom::x / v / f themselves: row pointers over one contiguous
         // nlocal*3 block, so [0] is the whole field. Order is whatever

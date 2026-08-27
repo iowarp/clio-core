@@ -96,7 +96,7 @@ VARS=()
 # Without the second, a regression in the first is invisible: the ratios come
 # out identical and only the timings move.
 REQUIRE_DEVICE=0
-BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
+BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0 RAW_DIR="" F32=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --box) BOX=$2; shift 2;;
@@ -117,6 +117,8 @@ while [ $# -gt 0 ]; do
     --tag) TAG=$2; shift 2;;
     --bw) BW=$2; shift 2;;
     --eb) EB=$2; shift 2;;
+    --raw) RAW_DIR=$2; shift 2;;
+    --f32) F32=1; shift;;
     --explore-k) EXPLORE_K_OPT=$2; shift 2;;
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --require-device) REQUIRE_DEVICE=1; shift;;
@@ -226,6 +228,20 @@ ARGS=(--deck "$HERE/in.melt" --box "$BOX" --steps "$STEPS" --gap "$GAP"
       --report "$STORE/blobs.csv" --quiet "${VARS[@]+"${VARS[@]}"}")
 [ "$DEVICE" = gpu ] && ARGS+=(--kokkos)
 [ "$VERIFY" = 1 ]   && ARGS+=(--verify)
+# --raw writes the bytes handed to the compressor, which is the only way to see
+# this workload at all: it is in-situ, so there is no dump file anywhere.
+[ -n "$RAW_DIR" ] && { mkdir -p "$RAW_DIR"; ARGS+=(--raw "$RAW_DIR"); }
+# A positive bound means the decompressed bytes are NOT the bytes staged, so
+# the digest check would report FAILED on a run doing exactly what was asked.
+[ -n "$EB" ] && ARGS+=(--expect-lossy)
+# --f32 stages a float32 downcast of LAMMPS' double state. Host gather only, so
+# the compressor needs STAGE_H2D to see a device pointer -- which is what makes
+# the quantizer reachable at all. See "Can LAMMPS be float32?" in README.md.
+if [ "$F32" = 1 ]; then
+  ARGS+=(--f32)
+  export CLIO_NEUROPRESS_STAGE_H2D=1
+  export CLIO_NEUROPRESS_REQUIRE_DEVICE=1
+fi
 
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 START=$(date +%s.%N)
