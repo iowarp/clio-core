@@ -138,9 +138,13 @@ __device__ u32 g_adm_used = 0u;
  *  "not waiting" and the yield macro's vote broadcasts thread 0's verdict. */
 __device__ bool AdmitWaits(u32 need, u32 pool, u32 slack) {
   if (threadIdx.x != 0) return false;
-  // A demand near or above the pool degrades to run-alone, never to a
-  // budget of zero: cur==0 must always admit or the chunk waits forever.
-  const u32 budget = (pool > need + slack) ? (pool - slack) : need;
+  // A demand near or above the pool degrades to THE WHOLE POOL, not to
+  // `need`: degrading to need requires cur==0 to admit, and the persistent
+  // halo reservation keeps cur at 6 forever -- a small pool then never
+  // admitted anything. Whole-pool is safe because every force-phase pinner
+  // reserves its ENTIRE hold set first: sum(reservations) <= pool means
+  // every admitted party can hold all its pages at once and finish.
+  const u32 budget = (pool > need + slack) ? (pool - slack) : pool;
   const u32 cur = *(volatile u32 *)&g_adm_used;
   if (cur + need <= budget &&
       atomicCAS(&g_adm_used, cur, cur + need) == cur) {
