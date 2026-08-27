@@ -119,7 +119,10 @@ def summarise(cell):
             field, step, chunk = p
         b, stored = num(r["bytes"]), num(r["stored"])
         ct, dt = num(r.get("compress_ms")), num(r.get("decompress_ms"), -1.0)
-        s = sel.get(name, {})
+        # Prefer the runtime's own key when the workload carries it (WarpX
+        # writes runtime_blob for exactly this reason); fall back to the
+        # normalised name for everything else.
+        s = sel.get(r.get("runtime_blob") or "", {}) or sel.get(name, {})
         out_rows.append({
             "blob": name, "field": field,
             "step": "" if step is None else step,

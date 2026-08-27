@@ -168,15 +168,26 @@ def main():
             stored, lib_out, codec_out = cin, 0, "raw"
         ct_ms, dt_ms = times.get(name, (0.0, -1.0))
         rows.append({
-            "blob": normalise(name), "bytes": nbytes, "fnv1a64": "0",
+            # THE PRETTY NAME IS NOT THE NAME THE RUNTIME LOGGED. normalise()
+            # rewrites the VOL's openPMD path so the aggregator can group by
+            # field, but selection.csv records the ORIGINAL blob name -- so the
+            # two files could not be joined at all:
+            #     blobs.csv     Bx/step_0/chunk_0
+            #     selection.csv /data/0/fields/B/x/chunk_0
+            # A join on `blob` silently matched nothing for this workload and
+            # left every model-feature column empty, 240 of 240 rows, with no
+            # error. Carry the runtime's own key alongside so the join is exact
+            # rather than reconstructed by regex on the far side.
+            "blob": normalise(name), "runtime_blob": name,
+            "bytes": nbytes, "fnv1a64": "0",
             "lib": lib_out, "codec": codec_out,
             "ratio": round(nbytes / stored, 6) if stored else 0.0,
             "stored": stored, "compress_ms": ct_ms,
             "decompress_ms": dt_ms, "rc": 0,
         })
 
-    cols = ["blob", "bytes", "fnv1a64", "lib", "codec", "ratio", "stored",
-            "compress_ms", "decompress_ms", "rc"]
+    cols = ["blob", "runtime_blob", "bytes", "fnv1a64", "lib", "codec",
+            "ratio", "stored", "compress_ms", "decompress_ms", "rc"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
