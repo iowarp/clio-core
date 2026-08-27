@@ -121,6 +121,42 @@ shuffle.
 behaviour and Clio keeps it, so the quantizer sees float64 bytes reinterpreted
 as pairs of float32 words.
 
+### `in.melt` is stationary after step 40 — use `in.melt_ramp` to exercise the selector
+
+The stock deck melts in about **40 of its 500 steps** and is a steady-state
+liquid for the rest, so 24 of 26 frames are the same KIND of data. Entropy,
+MAD and the ratio are flat, every frame picks the same action, and the run
+says almost nothing about a selector whose whole job is to notice that the
+data changed.
+
+`in.melt_ramp` drives the thermostat target from a cold crystal to a hot
+disordered fluid across the WHOLE run, so every frame is a different state
+point:
+
+```bash
+./run_config.sh dynamic --deck $PWD/in.melt_ramp --box 20 --steps 2000 \
+    --gap 80 --chunk 768000 --require-device --var NSTEPS=2000 \
+    --raw /tmp/lmpr-raw --results /tmp/lmpr --tag ramp
+```
+
+| | `in.melt` | `in.melt_ramp` |
+|---|---|---|
+| `position` entropy, first → last | 7.03 → 7.02 | **5.42 → 7.07** |
+| `force` MAD, first → last | 9.9e-14 → 18.5 | **5.51 → 78.3** |
+| distinct codecs, `force` | 2 | **3** (brotli → bitcomp → zstd) |
+| distinct codecs, `velocity` | 2 | **3** (brotli → bitcomp → ans) |
+| byte-level same-as-prev spread | 1.0 pt | **5.2 pts** (23.8% → 18.6%) |
+| MSD over the run | 1.41 σ² | **7.60 σ²** |
+
+**THE RAMP IS DRIVEN BY THE GLOBAL `step`, not by `fix nvt`'s own ramp**, and
+that is not a stylistic choice. The driver advances the simulation in GAP-step
+segments (`run GAP pre no post no`), and `fix nvt temp T0 T1` interpolates over
+the *current run command* — so it would sweep the entire range inside every
+80-step segment and reset. An equal-style variable reading `step` is immune to
+how the run is chopped up. `fix nve` + `fix langevin v_Tramp` rather than
+`fix nvt` because langevin accepts a variable for its target (its `Tstop`
+argument must still be numeric — `fix_langevin.cpp:76`).
+
 ### Looking at the data
 
 This workload is in situ — LAMMPS runs as a library in the benchmark process
@@ -244,6 +280,31 @@ The narrowing is not free and is not NeuroPress's doing: LAMMPS state is
 involved. Whether that is acceptable is a question about the trajectory, not
 about compression. What the table shows is only that the bound becomes
 reachable once it is done.
+
+### `quantize` in the selection log is a REQUEST, and the codec is applied either way
+
+Two separate things live in a NeuroPress action, and conflating them is the
+easiest mistake to make here:
+
+- the **library** (zstd, ans, bitcomp, …) is *always* applied. A chunk marked
+  `quantize=1` was still compressed with its chosen codec — losslessly.
+- the **quantize bit** is a request that the quantizer may decline, and on
+  float64 it declines every time.
+
+So **the ratio can move between a lossless run and a lossy one without a single
+byte being approximated.** The bound changes which codec the model ranks first;
+that is all it changes. On the box-20/500-step run, the entire lossless-1.043×
+vs eb-0.01-1.039× gap is **one chunk**:
+
+| blob | lossless | eb 0.01 |
+|---|---|---|
+| `force/step_0/chunk_0` | `lz4`, 495,181 B | fell back to raw, 768,000 B |
+| `velocity` (26 chunks) | — | **0 bytes different** |
+| `position` (26 chunks) | — | 16 bytes different |
+
+That single 272,819-byte swing is the whole thing — the step-0 force field,
+where a perfect lattice makes forces cancel to ~1e-13 and compress 1.55×, and
+where the bound pushed the ranking onto an action that expanded instead.
 
 ### Temporal redundancy: zero per value, 22.6% per byte
 

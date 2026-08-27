@@ -1,0 +1,59 @@
+# LJ melt with a TEMPERATURE RAMP -- a deliberately non-stationary workload.
+#
+# in.melt melts in about 40 of its 500 steps and is a steady-state liquid for
+# the rest, so 24 of 26 frames are statistically identical: entropy, MAD and
+# the compression ratio are flat, and every frame is the same KIND of data.
+# That makes it a poor test of a per-chunk selector, which exists to notice
+# that the data changed.
+#
+# This deck ramps the target temperature across the WHOLE run, from a cold
+# crystal to a hot gas-like liquid, so every frame is a different state point
+# and the block statistics move monotonically from first dump to last.
+#
+# THE RAMP IS DRIVEN BY THE GLOBAL `step`, NOT by fix nvt's own ramp, and that
+# is not a stylistic choice. The driver advances the simulation in GAP-step
+# segments (`run GAP pre no post no`, neuropress_lammps_lib.cc), and fix nvt's
+# `temp T0 T1` interpolates over the CURRENT run command -- so it would sweep
+# the entire range inside every 80-step segment and reset. An equal-style
+# variable reading `step` is immune to how the run is chopped up.
+#
+# fix nve + fix langevin rather than fix nvt for the same reason: langevin
+# accepts an equal-style variable for its target temperature.
+
+variable        BOX      index 20        # lattice cells/side -> 4*BOX^3 atoms
+variable        GAP      index 80        # driver's frame gap
+variable        DENSITY  index 0.8442    # reduced LJ density of the fcc lattice
+variable        T0       index 0.05      # start: cold, ordered crystal
+variable        T1       index 6.0       # end:   hot, strongly disordered
+variable        NSTEPS   index 2000      # ramp horizon (match --steps)
+variable        TDAMP    index 0.5       # langevin damping
+variable        CUTOFF   index 2.5       # lj/cut pair cutoff, sigma
+variable        SKIN     index 0.3       # neighbor-list skin
+variable        EVERY    index 20        # neigh_modify every
+variable        SEED     index 87287     # velocity RNG seed
+variable        SEED2    index 41213     # langevin RNG seed
+variable        DT       index 0.005     # timestep
+
+units           lj
+atom_style      atomic
+lattice         fcc ${DENSITY}
+region          box block 0 ${BOX} 0 ${BOX} 0 ${BOX}
+create_box      1 box
+create_atoms    1 box
+mass            1 1.0
+velocity        all create ${T0} ${SEED} loop geom
+pair_style      lj/cut ${CUTOFF}
+pair_coeff      1 1 1.0 1.0 ${CUTOFF}
+neighbor        ${SKIN} bin
+neigh_modify    every ${EVERY} delay 0 check no
+
+# Linear in the GLOBAL timestep. `step` stays symbolic here -- writing ${step}
+# would substitute 0 once, at parse time, and freeze the target.
+variable        Tramp equal ${T0}+(${T1}-${T0})*step/${NSTEPS}
+
+fix             1 all nve
+fix             2 all langevin v_Tramp ${T1} ${TDAMP} ${SEED2}
+timestep        ${DT}
+
+thermo          ${GAP}
+thermo_style    custom step temp epair etotal press v_Tramp

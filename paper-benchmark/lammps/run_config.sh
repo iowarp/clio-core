@@ -96,7 +96,7 @@ VARS=()
 # Without the second, a regression in the first is invisible: the ratios come
 # out identical and only the timings move.
 REQUIRE_DEVICE=0
-BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0 RAW_DIR="" F32=0
+BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0 RAW_DIR="" F32=0 DECK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --box) BOX=$2; shift 2;;
@@ -119,6 +119,7 @@ while [ $# -gt 0 ]; do
     --eb) EB=$2; shift 2;;
     --raw) RAW_DIR=$2; shift 2;;
     --f32) F32=1; shift;;
+    --deck) DECK=$2; shift 2;;
     --explore-k) EXPLORE_K_OPT=$2; shift 2;;
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --require-device) REQUIRE_DEVICE=1; shift;;
@@ -223,7 +224,7 @@ echo "== $NAME: $NATOMS atoms, $STEPS steps, $FRAMES frames, $(awk -v p=$PAYLOAD
 
 ORDER=id
 [ "$REQUIRE_DEVICE" = 1 ] && ORDER=device
-ARGS=(--deck "$HERE/in.melt" --box "$BOX" --steps "$STEPS" --gap "$GAP"
+ARGS=(--deck "${DECK:-$HERE/in.melt}" --box "$BOX" --steps "$STEPS" --gap "$GAP"
       --chunk "$CHUNK" --order "$ORDER" --log "$STORE/log.lammps"
       --report "$STORE/blobs.csv" --quiet "${VARS[@]+"${VARS[@]}"}")
 [ "$DEVICE" = gpu ] && ARGS+=(--kokkos)
@@ -238,6 +239,14 @@ ARGS=(--deck "$HERE/in.melt" --box "$BOX" --steps "$STEPS" --gap "$GAP"
 # the compressor needs STAGE_H2D to see a device pointer -- which is what makes
 # the quantizer reachable at all. See "Can LAMMPS be float32?" in README.md.
 if [ "$F32" = 1 ]; then
+  # --f32 downcasts on the HOST gather, so it is incompatible with the device
+  # gather --require-device selects. It sets REQUIRE_DEVICE itself and reaches
+  # the device through STAGE_H2D instead, which is what the quantizer needs.
+  if [ "$REQUIRE_DEVICE" = 1 ]; then
+    echo "--f32 and --require-device are mutually exclusive: --f32 gathers on" >&2
+    echo "the host and stages H2D (it sets REQUIRE_DEVICE=1 for you)." >&2
+    exit 2
+  fi
   ARGS+=(--f32)
   export CLIO_NEUROPRESS_STAGE_H2D=1
   export CLIO_NEUROPRESS_REQUIRE_DEVICE=1
