@@ -1,0 +1,9 @@
+{"config":"explore-balance","tag":"insitu20","rc":0,"mode":"lossless",
+ "cost_model":"balance","bw_bytes_per_ms":5e6,
+ "error_bound":0,"explore_k":3,"explore_thresh":0,
+ "device":"gpu","workload":"nyx-sedov","residency":"device","host_refusals":0,
+ "exp_energy":1,"stop_time":1.0,"cfl":0.8,
+ "atoms":0,"steps":2000,"gap":40,"frames":51,"chunk":4194304,
+ "files":4800,"payload_bytes":20132659200,"wall_s":315.99,
+ "verify_result":"n/a",
+ "physics":{"problem":"sedov","precision":"float32","insitu":"yes"}}

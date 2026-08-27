@@ -1,0 +1,11 @@
+== Nyx Sedov: 256^3, 2000 steps, dump every 40 -> ~51 frames
+   nyx.cfl=0.8 (deck ships 0.5; Nyx's own default is 0.8)
+   out=/tmp/nyx-20gb
+   306 field files, 20G
+   fields: density rho_E rho_e xmom ymom zmom 
+
+now sweep it:  ./run_sweep.sh --fields /tmp/nyx-20gb
+
+real	3m52.824s
+user	2m46.759s
+sys	1m8.096s

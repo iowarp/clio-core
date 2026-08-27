@@ -1,0 +1,31 @@
+Initializing AMReX (26.08-16-g6e875b7cc1a4)...
+Initializing CUDA...
+CUDA initialized with 1 device.
+AMReX (26.08-16-g6e875b7cc1a4) initialized
+
+AMReX git describe: 26.08-16-g6e875b7cc1a4
+
+Nyx git describe:   4ecfea2a85b9-dirty
+Nyx::hydro_tile_size unset, using fabarray.mfiter_tile_size default: (1024000,1024000,1024000)
+Suggested default for currently compiled CPU / GPU: nyx.hydro_tile_size=(1048576,1048576,1048576)
+Nyx::sundials_tile_size unset, using fabarray.mfiter_tile_size default: (1024000,1024000,1024000)
+Suggested default for currently compiled CPU / GPU: nyx.sundials_tile_size=(1048576,1048576,1048576)
+Nyx::setting species concentrations to 0.7599999905 and 0.2399999946 in the hydro and in the EOS 
+Nyx::setting init_sb_vels to 0 since do_santa_barbara = 0
+0 Species: 
+Time w/o init: 218.6710663
+Run time = 221.0691223
+Unused ParmParse Variables:
+  [TOP]::amr.probin_file(nvals = 1)  :: []
+  [TOP]::amr.ref_ratio(nvals = 4)  :: [2, 2, 2, 2]
+  [TOP]::amr.regrid_int(nvals = 1)  :: [2]
+
+Total GPU global memory (MB): 40444
+Free  GPU global memory (MB): 9683
+[The         Arena] max space allocated (MB): 30333
+[The         Arena] max space used      (MB): 21647
+[The Managed Arena] max space allocated (MB): 8
+[The Managed Arena] max space used      (MB): 0
+[The  Pinned Arena] max space allocated (MB): 1672
+[The  Pinned Arena] max space used      (MB): 832
+AMReX (26.08-16-g6e875b7cc1a4) finalized

@@ -1,0 +1,7 @@
+== Nyx in situ + Clio in one process: 256^3, 2000 steps, every 40 -> ~50 frames
+   hook=insitu chunk=4194304 ghosts=false max_grid=256  (~384 MiB/frame)
+   learn=true explore=true k=3
+   store=/tmp/nyx-20gb-insitu/insitu20  port=55947  mpi=false
+[clio-nyx-insitu] rank 0/1 up: tag='nyx_insitu' pool=512.0 chunk=4194304 pid=2128392
+[clio-nyx-insitu] rank 0/1 stored 4800 blob(s) from 50 frame(s), 20132659200 B in -> 4600214967 B on the tier  (stored ratio 4.376)
+-- blobs: /tmp/nyx-20gb-insitu/insitu20/blobs.csv   nyx: /tmp/nyx-20gb-insitu/insitu20/nyx.log   runtime: /tmp/nyx-20gb-insitu/insitu20/runtime.log   exit=0

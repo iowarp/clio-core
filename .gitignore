@@ -76,6 +76,10 @@ nanobind.egg-info
 # Temporary and log files
 *.tmp
 *.log
+# ...except where a log IS the committed record. evolution-study/nyx-20gb keeps
+# the Nyx and Clio-runtime logs of a 20 GB run whose 25 GB of field data is
+# deliberately not committed -- the logs are the only evidence it ran clean.
+!paper-benchmark/evolution-study/nyx-20gb/*.log
 *~
 *.swp
 .*.swp

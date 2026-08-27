@@ -16,6 +16,12 @@ warpx/FE_*.txt                      WarpX FieldEnergy, the evidence that
                                     do_moving_window=0 is a resonant cavity
 ```
 
+`nyx-20gb/` is a **separate record, not one of the 26**: how to make Nyx
+produce ~20 GB over its timesteps without leaving the regime the study
+selected, measured with the same tool so it compares directly. It carries the
+in-situ run's `selection`/`explore`/`blobs` CSVs as well, which no study
+configuration does.
+
 Re-rank any workload without re-running anything:
 
 ```bash

@@ -1,0 +1,51 @@
+Initializing AMReX (26.08-16-g6e875b7cc1a4)...
+Initializing CUDA...
+CUDA initialized with 1 device.
+AMReX (26.08-16-g6e875b7cc1a4) initialized
+
+AMReX git describe: 26.08-16-g6e875b7cc1a4
+
+Nyx git describe:   4ecfea2a85b9-dirty
+Nyx::hydro_tile_size unset, using fabarray.mfiter_tile_size default: (1024000,1024000,1024000)
+Suggested default for currently compiled CPU / GPU: nyx.hydro_tile_size=(1048576,1048576,1048576)
+Nyx::sundials_tile_size unset, using fabarray.mfiter_tile_size default: (1024000,1024000,1024000)
+Suggested default for currently compiled CPU / GPU: nyx.sundials_tile_size=(1048576,1048576,1048576)
+Nyx::setting species concentrations to 0.7599999905 and 0.2399999946 in the hydro and in the EOS 
+Nyx::setting init_sb_vels to 0 since do_santa_barbara = 0
+0 Species: 
+[clio-nyx-insitu] rank 0/1 up: tag='nyx_insitu' pool=512.0 chunk=4194304 pid=2128392
+Time w/o init: 312.7705688
+Run time = 312.8704834
+
+[clio-nyx-insitu] rank 0/1 stored 4800 blob(s) from 50 frame(s), 20132659200 B in -> 4600214967 B on the tier  (stored ratio 4.376)
+  compressed: 4800   stored raw: 0   failed: 0
+     density  3355443200 -> 739049531  (4.540x)
+       rho_E  3355443200 -> 751595780  (4.464x)
+       rho_e  3355443200 -> 729564058  (4.599x)
+        xmom  3355443200 -> 815508512  (4.115x)
+        ymom  3355443200 -> 782821244  (4.286x)
+        zmom  3355443200 -> 781675842  (4.293x)
+  codec       nvcomp-lz4 : 4 chunk(s)
+  codec    nvcomp-snappy : 7 chunk(s)
+  codec      nvcomp-zstd : 6 chunk(s)
+  codec  nvcomp-gdeflate : 6 chunk(s)
+  codec   nvcomp-deflate : 1 chunk(s)
+  codec       nvcomp-ans : 386 chunk(s)
+  codec  nvcomp-cascaded : 180 chunk(s)
+  codec   nvcomp-bitcomp : 4210 chunk(s)
+  stage+compress(wait) 154.677 s   in-situ wall 309.661 s
+Unused ParmParse Variables:
+  [TOP]::amr.derive_plot_vars(nvals = 1)  :: [pressure]
+  [TOP]::amr.probin_file(nvals = 1)  :: []
+  [TOP]::amr.ref_ratio(nvals = 4)  :: [2, 2, 2, 2]
+  [TOP]::amr.regrid_int(nvals = 1)  :: [2]
+
+Total GPU global memory (MB): 40444
+Free  GPU global memory (MB): 8581
+[The         Arena] max space allocated (MB): 30333
+[The         Arena] max space used      (MB): 21647
+[The Managed Arena] max space allocated (MB): 8
+[The Managed Arena] max space used      (MB): 0
+[The  Pinned Arena] max space allocated (MB): 8
+[The  Pinned Arena] max space used      (MB): 0
+AMReX (26.08-16-g6e875b7cc1a4) finalized
