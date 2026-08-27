@@ -972,7 +972,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
                                        int eflag, double *acc, int nocompute,
                                        u32 rowchunk, u32 z0, u32 z1,
                                        u32 nblocks, u32 block, u64 hgen,
-                                       bool force_all) {
+                                       bool force_all, u32 band) {
   extern __shared__ char smem_raw[];
   double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
@@ -1017,6 +1017,14 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
   for (u64 ch = ch_lo + block; ch < ch_hi; ch += nblocks) {
     const long long _r0 = clock64();
     const u32 bz = static_cast<u32>(ch / cpz);
+    // BAND SPLIT for comm/compute overlap: interior chunks (band 1) touch no
+    // halo plane -- their stencil stays inside [z0, z1) -- so they can run
+    // WHILE the exchange is still in flight. Boundary chunks (band 2) are
+    // the two z-planes whose stencil reaches the halo; they run after the
+    // exchange lands. band 0 = everything (single node, gates).
+    const bool on_boundary = (bz == z0 || bz + 1u == z1);
+    if (band == 1u && on_boundary) continue;
+    if (band == 2u && !on_boundary) continue;
     const u32 y0 = static_cast<u32>(ch % cpz) * rowchunk;
     if (y0 >= nb) continue;
     const u32 ylast = (y0 + rowchunk - 1 < nb) ? (y0 + rowchunk - 1)
@@ -2037,10 +2045,13 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
 __global__ MD_LAUNCH_BOUNDS void PublishSlabKernel(
     clio::run::IpcManagerGpuInfo info, gv::DeviceVector<float> x,
     gv::DeviceVector<float> v, u32 nb, u32 cap, u32 z0, u32 z1, u64 gen,
-    u32 nblocks, gy::YieldableView<> yv, gy::YieldStackView ys) {
+    u32 nblocks, u32 tbl_base, gy::YieldableView<> yv,
+    gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
-  x.Init(yv.Block());
-  v.Init(yv.Block());
+  // tbl_base separates the ASYNC publish's task tables from the compute
+  // kernels' 0..nblocks-1, so the overlap never shares a task slot.
+  x.Init(tbl_base + yv.Block());
+  v.Init(tbl_base + yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(PublishSlabCoro(x, v, nb, cap, z0, z1, gen, nblocks,
@@ -2102,7 +2113,8 @@ __global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo in
                                 float box, float cutoff, u32 maxneigh,
                                 const u32 *d_cnt, int eflag, double *acc,
                                 int nocompute, u32 rowchunk, u32 z0, u32 z1, u32 nblocks,
-                                u64 hgen, bool force_all, gy::YieldableView<> yv,
+                                u64 hgen, bool force_all, u32 band,
+                                gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   x.Init(yv.Block());
@@ -2112,7 +2124,8 @@ __global__ MD_LAUNCH_BOUNDS void ListForceKernel(clio::run::IpcManagerGpuInfo in
   __syncthreads();
   CLIO_YCORO_RUN(ListForceCoro(x, f, nl, nb, cap, box, cutoff, maxneigh,
                                d_cnt, eflag, acc, nocompute, rowchunk,
-                               z0, z1, nblocks, yv.Block(), hgen, force_all));
+                               z0, z1, nblocks, yv.Block(), hgen, force_all,
+                               band));
 }
 
 __global__ MD_LAUNCH_BOUNDS void RebinWrapKernel(
@@ -2202,6 +2215,30 @@ class YieldRunner {
    *  uses whatever it managed to compute. That is how an out-of-core run
    *  came back with 17 of 22 page iterations done and no error anywhere. */
   bool HitCap() const { return hit_cap_; }
+
+  /** One driver round of an ASYNC sequence: launches whatever is ready,
+   *  returns true while blocks are still parked. BeginSeq resets state; the
+   *  caller then Steps between (or during) other work -- this is the whole
+   *  comm/compute overlap: the publish kernel's CTE tasks make progress on
+   *  the CPU while the interior force owns the GPU. */
+  void BeginSeq() {
+    drv_.ResetTimers();
+    drv_.Reset();
+    stack_.Reset();
+  }
+  template <typename LaunchT>
+  bool Step(LaunchT &&launch) {
+    return drv_.Round(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          launch(g, b, view, stack_.View());
+        },
+        [](u32, u64 tag) -> bool {
+          unsigned int f = 0;
+          ctp::GpuApi::Memcpy(&f, reinterpret_cast<const unsigned int *>(tag),
+                              sizeof(f));
+          return (f & 1u) != 0u;
+        });
+  }
 
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
@@ -3076,17 +3113,27 @@ int main(int argc, char **argv) {
   const u32 md_cap_own = (a.nodes > 1)
       ? static_cast<u32>(zmine * ppp + 2)
       : static_cast<u32>(npages + 2);
-  gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks, x_slots,
+  // +4 TASK TABLES on x and v, reserved for the ASYNC publish kernel.
+  // Tables are per logical block, and the publish overlaps the interior
+  // force -- two kernels using one table means two in-flight tasks in one
+  // slot, which the vector forbids. Tables are cheap (one task set each);
+  // the publish gets 16..19 and the compute kernels keep 0..15.
+  // nsets PINNED EXPLICITLY: nsets=0 defaults to nblocks, so widening the
+  // task tables for the async publish silently moved the cache from 16 to
+  // 20 sets -- hashing, widths and floors all shifted as a side effect of an
+  // unrelated change. Tables are tasks; sets are cache geometry; they were
+  // separated for exactly this reason.
+  gv::Vector<float> vx(tag("md_x"), {0}, page_bytes, tbl_blocks + 4, x_slots,
                        g.nelems, clio::run::PoolId::GetNull(), 0, 1,
-                       /*nsets=*/0, /*capacity_pages=*/md_cap);
+                       /*nsets=*/tbl_blocks, /*capacity_pages=*/md_cap);
   account("x", x_slots, page_bytes, npages, md_cap);
   // v gets its own knob too, so x-paging and v-paging can be separated:
   // x is the only vector read through multi-page SPAN holds that stay live
   // across a park, which is the access pattern no other gate covers.
   const u32 vslots = SharedSlots(npages, nsets);
-  gv::Vector<float> vv(tag("md_v"), {0}, page_bytes, tbl_blocks, vslots,
-                       g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
-                       md_cap);
+  gv::Vector<float> vv(tag("md_v"), {0}, page_bytes, tbl_blocks + 4, vslots,
+                       g.nelems, clio::run::PoolId::GetNull(), 0, 1,
+                       /*nsets=*/tbl_blocks, md_cap);
   account("v", vslots, page_bytes, npages, md_cap);
   vx.EnableStats();
   vv.EnableStats();
@@ -3292,12 +3339,19 @@ int main(int argc, char **argv) {
     // The resort's destinations get their own cache size, so "the scatter
     // is wrong" can be told apart from "the scatter's PAGING is wrong".
     const u32 ppslots = SharedSlots(npages, nsets);
-    gv::Vector<float> vx2(tag("md_x2"), {0}, page_bytes, tbl_blocks, ppslots,
-                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
-                          md_cap);
-    gv::Vector<float> vv2(tag("md_v2"), {0}, page_bytes, tbl_blocks, ppslots,
-                          g.nelems, clio::run::PoolId::GetNull(), 0, 1, 0,
-                          md_cap);
+    // +4 TABLES AND PINNED nsets, SAME AS vx/vv: the resort std::swap()s the
+    // handles, so the async publish runs on THESE vectors every other epoch.
+    // Widening only x/v made Init(16..19) trap with kFatalInitBlock the
+    // first time the publish followed a swap -- and the trap's printf was
+    // eaten by __trap, so it surfaced as a naked CUDA 719 one Synchronize
+    // later. Every bisect arm agreed: gates green (pre-swap), first loop
+    // step red, tbl_base=12 green (fits 16 tables), tbl_base=0 green.
+    gv::Vector<float> vx2(tag("md_x2"), {0}, page_bytes, tbl_blocks + 4,
+                          ppslots, g.nelems, clio::run::PoolId::GetNull(), 0,
+                          1, /*nsets=*/tbl_blocks, md_cap);
+    gv::Vector<float> vv2(tag("md_v2"), {0}, page_bytes, tbl_blocks + 4,
+                          ppslots, g.nelems, clio::run::PoolId::GetNull(), 0,
+                          1, /*nsets=*/tbl_blocks, md_cap);
     account("x2", ppslots, page_bytes, npages, md_cap);
     account("v2", ppslots, page_bytes, npages, md_cap);
     vx2.EnableStats();
@@ -3450,6 +3504,43 @@ int main(int argc, char **argv) {
       }
       return true;
     };
+    // THE PUBLISH RUNS ASYNC AGAINST THE INTERIOR FORCE. Its own runner
+    // (4 blocks: 3 waits + stride) so the main runner's state is free for
+    // the force kernels while the exchange is in flight.
+    YieldRunner pubrunner(4, a.threads);
+    bool pub_pending = false;
+    auto pub_launch = [&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+      PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
+          gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, /*nblocks=*/4,
+          /*tbl_base=*/a.blocks, vw, sv);
+    };
+    auto pub_begin = [&]() {
+      ++halo_gen;
+      pubrunner.BeginSeq();
+      if (pubrunner.Step(pub_launch)) {
+        pub_pending = true;
+      }
+      ++r_kick_pub;
+    };
+    auto pub_drain = [&]() {
+      while (pub_pending) {
+        if (!pubrunner.Step(pub_launch)) pub_pending = false;
+        ++r_kick_pub;
+        // A __trap EATS ITS OWN printf, but the vector's fatal channel is
+        // host-readable memory written BEFORE the trap. Read it HERE, before
+        // the next Synchronize turns the story into "CUDA 719" and aborts.
+        const cudaError_t ce = cudaPeekAtLastError();
+        if (ce != cudaSuccess) {
+          std::fprintf(stderr, "[pub] launch error: %s\n",
+                       cudaGetErrorString(ce));
+          std::fprintf(stderr, "[pub] device fatal: %s\n",
+                       gv::FatalReport().c_str());
+          std::fflush(stderr);
+          std::_Exit(3);
+        }
+      }
+    };
     auto force = [&](int eflag) {
       if (trace) { std::fprintf(stderr, "[md] force eflag=%d\n", eflag);
                    std::fflush(stderr); }
@@ -3457,15 +3548,33 @@ int main(int argc, char **argv) {
       if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
       if (a.use_list) {
         MdMark("ListForce");
+        // COMM/COMPUTE OVERLAP. While the publish is in flight, run the
+        // INTERIOR band first -- its stencil never leaves the slab, so it
+        // needs nothing the exchange delivers -- and let the CTE workers
+        // service the publish's puts and the peer-halo get underneath it.
+        // Drain, then the two BOUNDARY planes run against a warm halo.
+        const bool overlap = pub_pending && !eflag;
+        const u32 band1 = overlap ? 1u : 0u;
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           ListForceKernel<<<gr, b, smem_force>>>(
               gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
               eflag, d_acc, nocompute, a.rowchunk, my_z0, my_z1, a.blocks,
               force_gen ? force_gen : (no_halo ? 0 : halo_gen),
-              force_gen != 0, vw, sv);
+              force_gen != 0, band1, vw, sv);
         });
+        pub_drain();
+        if (overlap) {
+          runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                         gy::YieldStackView sv) {
+            ListForceKernel<<<gr, b, smem_force>>>(
+                gpu, dx, df, dn, g.nb, g.cap, fbox, fcut, a.maxneigh, d_cnt,
+                eflag, d_acc, nocompute, a.rowchunk, my_z0, my_z1, a.blocks,
+                no_halo ? 0 : halo_gen, false, 2u, vw, sv);
+          });
+        }
       } else {
+        pub_drain();
         MdMark("Force");
         runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
@@ -3526,7 +3635,7 @@ int main(int argc, char **argv) {
                      gy::YieldStackView sv) {
         PublishSlabKernel<<<gr, b, CLIO_YIELD_SMEM_BYTES>>>(
             gpu, dx, dv, g.nb, g.cap, my_z0, my_z1, halo_gen, a.blocks,
-            vw, sv);
+            /*tbl_base=*/0, vw, sv);
       });
       ctp::GpuApi::Synchronize();
       // NO BARRIER HERE. THE GENERATION IS THE BARRIER.
@@ -3572,7 +3681,13 @@ int main(int argc, char **argv) {
       // MD_NO_HALO=1 skips the exchange, which must MEASURABLY DEGRADE the
       // run. A distributed gate that passes either way is not testing the
       // exchange, and this is the cheapest way to know which one it is.
-      if (drift) exchange();
+      if (drift && a.nodes > 1 && !no_halo) {
+        pub_begin();
+        // MD_NO_OVERLAP=1: submit-and-drain immediately -- isolates "the
+        // async publish kernel with reserved tables" from "the overlap with
+        // the interior band" when hunting a trap.
+        if (EnvOn("MD_NO_OVERLAP")) pub_drain();
+      }
       t_kick_pub += NowMs() - _t2;
       t_kick += NowMs() - _t;
     };
@@ -3871,6 +3986,9 @@ int main(int argc, char **argv) {
         // resort that runs mid-flight: same physical state, new layout, so PE
         // must be unchanged. Off by default -- it costs two extra force
         // evaluations per resort.
+        // The async publish holds x's boundary pins and reserved task
+        // slots; the resort rewrites x wholesale. Settle it first.
+        pub_drain();
         const bool rchk = EnvOn("MD_RESORT_CHECK");
         double pe_b = 0.0, pr_b = 0.0;
         if (rchk) { force(/*eflag=*/1); pe_b = acc[0]; pr_b = acc[2]; }
