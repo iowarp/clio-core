@@ -29,6 +29,12 @@ case "${1:-}" in -h|--help) sed -n '2,24p' "$0"; exit 0;; esac
 CONFIG=${1:-explore-balance}; shift || true
 
 NCELL=128 STEPS=200 INT=10 CHUNK=4194304
+# nyx.cfl. 0.8 is Nyx's own documented default (NyxInputs.rst); the Sedov deck
+# ships 0.5. It is the ONLY knob that changes how fast this data evolves at a
+# fixed step count -- exp_energy cancels exactly, because the Sedov shock
+# advances cfl*dx/c1 cells per timestep whatever the blast energy. See
+# "Default Evolving Benchmark Configuration" in README.md.
+CFL=0.8
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
 RESULTS="$HERE/results" TAG="" VERIFY=0 CHECK_BOUND=0
 EXP_ENERGY="" STOP_TIME=""
@@ -63,6 +69,7 @@ while [ $# -gt 0 ]; do
     # E=1 -> ~300 steps and a 6.9x ratio range, E=10 -> ~675 and 44x,
     # E=100 -> ~1575 and 114x.
     --exp-energy) EXP_ENERGY=$2; shift 2;;
+    --cfl) CFL=$2; shift 2;;
     --stop-time)  STOP_TIME=$2; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -109,6 +116,7 @@ env "${COST_ENV[@]}" \
         --threshold "$THRESH_OPT" --store "$STORE" \
         ${VERIFY:+$([ "$VERIFY" = 1 ] && echo --verify)} \
         ${CHECK_BOUND:+$([ "$CHECK_BOUND" = 1 ] && echo --check-bound)} \
+        nyx.cfl=$CFL \
         ${EXP_ENERGY:+prob.exp_energy=$EXP_ENERGY} \
         ${STOP_TIME:+stop_time=$STOP_TIME} \
         > "$RESULTS/.$NAME.stdout" 2>&1
@@ -152,7 +160,7 @@ cat > "$STORE/meta.json" <<JSON
  "cost_model":"$COSTMODEL","bw_bytes_per_ms":${BW:-5e6},
  "error_bound":${EB:-0},"explore_k":$EXPLORE_K_OPT,"explore_thresh":$THRESH_OPT,
  "device":"gpu","workload":"nyx-sedov","residency":"device","host_refusals":$HOSTED,
- "exp_energy":${EXP_ENERGY:-1},"stop_time":${STOP_TIME:-0.01},
+ "exp_energy":${EXP_ENERGY:-1},"stop_time":${STOP_TIME:-0.01},"cfl":$CFL,
  "atoms":0,"steps":$STEPS,"gap":$INT,"frames":$FRAMES,"chunk":$CHUNK,
  "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
  "verify_result":"$VERDICT",

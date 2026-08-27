@@ -101,10 +101,27 @@ begin_initialization {
  
   // Physics parameters
   double mi_me   = 1836; //25; //atof(cmdline_argument[1]); // Ion mass / electron mass
-  double vthe = 0.25/sqrt(2.0); //0.0424264068711;       //0.424264068711;       // Electron thermal velocity
-  double vthi = 0.25/sqrt(2.0); //0.0424264068711;       //0.424264068711;       // Ion thermal velocity 
-  double vthex =0.05/sqrt(2.0); //0.0141421356237;      // 0.141421356237;      // Electron thermal velocity in x-direction.
-  double vthix =0.05/sqrt(2.0); //0.0141421356237;      // 0.141421356237;Ion thermal velocity in x-direction. 
+  // THE TEMPERATURE ANISOTROPY IS THE INSTABILITY'S FREE ENERGY, so it is the
+  // one physics knob this deck exposes. Upstream's Weibel.cxx hardcodes
+  // vth_perp = 0.25/sqrt(2) and vth_x = 0.05/sqrt(2), an anisotropy of
+  // (vthe/vthex)^2 = 25; those remain the defaults, so an unset environment
+  // reproduces upstream exactly. VPIC_VTHE and VPIC_VTHEX override them.
+  //
+  // Weibel grows because the distribution is hotter across x than along it:
+  // the linear growth rate rises with both the perpendicular thermal velocity
+  // and the anisotropy, so raising VPIC_VTHE or lowering VPIC_VTHEX makes the
+  // magnetic filaments emerge from the noise sooner and the field arrays
+  // change faster per timestep. See ../vpic/README.md and the growth-rate
+  // measurements there.
+  //
+  // Ions track the electrons, as upstream sets them: vthi = vthe and
+  // vthix = vthex. At mi/me = 1836 they are effectively immobile and the
+  // instability is electron driven either way; keeping the coupling means the
+  // deck stays a two-line change from upstream's.
+  double vthe = getenv("VPIC_VTHE")  ? atof(getenv("VPIC_VTHE"))  : 0.25/sqrt(2.0);
+  double vthex = getenv("VPIC_VTHEX") ? atof(getenv("VPIC_VTHEX")) : 0.05/sqrt(2.0);
+  double vthi = vthe;   // Ion thermal velocity
+  double vthix = vthex; // Ion thermal velocity in x-direction.
  
   double n0      = 1.0;    //  Background plasma density
   double b0 = 0.0;         // In plane magnetic field.

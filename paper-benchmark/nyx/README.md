@@ -11,6 +11,11 @@ float64 and nearly incompressible (~1.1×), Sedov is float32 and highly
 structured (up to 156×). Two of this project's findings only become visible
 by holding the method fixed and changing the data that way.
 
+This file is the operational document: how to build and run the workload, how
+to get its data out, and the parameters that make that data evolve.
+**Measurements — compression ratios, error-bound behaviour, the evolution
+study's rankings — are in [`RESULTS.md`](RESULTS.md).**
+
 ## Why two phases
 
 Nyx is an AMReX application with no library interface to embed, so the LAMMPS
@@ -93,8 +98,8 @@ ls -la ~/src/Nyx/Source/Driver/comoving.cpp ~/src/Nyx/build-clio/Exec/*/nyx_*
 ```
 
 `AMReX_PRECISION=SINGLE` is upstream's recommendation for compression
-benchmarks and matters here for a specific reason — see the shuffle result
-below. `Nyx_MPI=NO` keeps a single-rank benchmark from needing a parallel HDF5
+benchmarks and matters here for a specific reason — see the shuffle result in
+`RESULTS.md`. `Nyx_MPI=NO` keeps a single-rank benchmark from needing a parallel HDF5
 build; nothing in this path writes HDF5 anyway.
 
 The Clio side is `bin/neuropress_field_replay`
@@ -107,6 +112,29 @@ cmake --build <clio>/build --target neuropress_field_replay
 
 ## Running
 
+There are **two routes**, and they are not interchangeable.
+
+**In situ** — the simulation hands the compressor `fab.dataPtr(comp)`, AMReX
+DEVICE memory, uncopied, from inside `Nyx::updateInSitu()`, so quantization,
+byte shuffle and codec selection all take their GPU paths. This is the route
+`run_benchmark.sh` uses, and the one to prefer:
+
+```bash
+./run_config_insitu.sh explore-balance --ncell 128 --steps 1000 --int 10 \
+    --chunk 8388608 --verify --results /tmp/nyx --tag base
+```
+
+It sets `CLIO_NEUROPRESS_REQUIRE_DEVICE=1` unconditionally, so a host-resident
+chunk is REFUSED rather than quietly computed on the CPU — a silent fallback is
+indistinguishable from success in the results, since the ratios come out
+identical and only the timings move. Configs are `explore-balance`,
+`explore-ratio`, `explore-speed`; `--check-bound` replaces `--verify` on a
+lossy run.
+
+**Replay** — dump the fields to disk, then sweep the files offline. Every
+policy replays byte-identical input, which the in-situ route cannot promise
+because each configuration re-runs the simulation:
+
 ```bash
 ./gen_fields.sh                              # Nyx -> ./fields (~1 GB, a few min)
 ./run_sweep.sh                               # every policy over those files
@@ -114,6 +142,12 @@ cmake --build <clio>/build --target neuropress_field_replay
 ./read.sh --run dynamic                      # cold read-back, separate process
 ../collect.py results/                       # re-aggregate
 ```
+
+**`CLIO_NEUROPRESS_STAGE_H2D=1` is required for the replay route and nothing
+sets it.** `CLIO_NEUROPRESS_REQUIRE_DEVICE` defaults *on*, NeuroPress
+preprocessing is CUDA-only, and a file-replay driver hands the compressor host
+memory by construction — so without the stage every chunk is refused and every
+blob fails `rc=11` with `0 B in -> 0 B on the tier`.
 
 Every run verifies itself: each blob is read back through the decompressor and
 its FNV-1a-64 digest compared with the digest of the bytes staged. `read.sh`
@@ -146,20 +180,13 @@ mid-plane slices across the run and the same slices as a GIF; once per run it
 writes `evolution.png`, which puts shock radius, fraction of the domain off
 ambient, and a zlib stand-in for the compression ratio on one time axis.
 
-**Two things it is worth pointing at a dataset for.**
-
-*Does this run actually evolve?* Point it at the default `./fields` and the
-answer is visibly no — shock radius reaches 0.18 of the box and **1.8% of cells
-are off ambient at the last dump**. That is the deck default `exp_energy=1`
-described under "`--exp-energy` is the knob that makes the data evolve", and it
-is much faster to see than to infer from a ratio table. The 64³ recipe above
-reaches 0.48 and 40%.
-
-*Is the shuffle result real?* The ratio panel reproduces it in three lines of
-python: on the quick run, density goes 1005× → 3.8× unshuffled against
-1005× → 5.1× with a 4-byte shuffle, the same ordering the nvcomp-zstd sweep
-finds at 132.6× vs 162.9×. zlib is not nvcomp-zstd and the magnitudes do not
-transfer; the shape and the ordering do.
+**Does this run actually evolve?** Point `viz_fields.py` at a dataset and the
+answer is visible rather than inferred — the `evolution.png` panel carries shock
+radius, the fraction of the domain off ambient, and the share of cells
+bit-identical to the previous dump. At the deck's `exp_energy=1` and a short
+run, the shock barely leaves the centre and most of the box never changes; the
+64³ recipe above reaches roughly half the box. `RESULTS.md` has the measured
+version of both.
 
 Two details that are easy to get wrong and quiet when you do:
 
@@ -172,136 +199,6 @@ Two details that are easy to get wrong and quiet when you do:
 - **Signed fields need a percentile color scale, not a max.** The initial
   energy deposit puts |xmom| ≈ 100 into two cells while the shell that matters
   carries ≈ 10; scale to the max and 24 of 26 frames are blank.
-
-### Seeing what a lossy bound costs
-
-`../viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
-plate. It needs the decompressed bytes, which the replay driver will write on a
-cold read:
-
-```bash
-# Tag explicitly. Deriving one by stripping '0' and '.' collapses 0.001, 0.01
-# and 0.1 to the same string, and the second run silently overwrites the first.
-for spec in 0.001:eb001 0.01:eb01 0.1:eb10; do
-  EB=${spec%%:*}; T=${spec##*:}
-  CLIO_NEUROPRESS_STAGE_H2D=1 ./run_config.sh dynamic --fields /tmp/nyx-quick \
-      --chunk 1048576 --eb $EB --check-bound --results /tmp/nyx-lossy --tag $T
-  $BUILD/bin/neuropress_field_replay --readback /tmp/nyx-lossy/$T/blobs.csv \
-      --dump-decompressed /tmp/nyx-decomp/$T --tag nyx_$T \
-      --dir /tmp/nyx-quick --ext .f32 --chunk 1048576 --check-bound
-done
-../viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
-    --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
-    --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
-../viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
-    --sel 0.01:/tmp/nyx-lossy/eb01 --sel 0.1:/tmp/nyx-lossy/eb10
-```
-
-`--compare EB:DIR` is repeatable. The plate is original on top, one decompressed
-row per bound, then one `|error|` row per bound. Every field row shares one
-color scale so the rows are comparable; each error row is scaled to ITS OWN
-bound, so across bounds compare the decompressed rows, not the error rows.
-
-Three things that will otherwise cost an hour:
-
-- **`CLIO_NEUROPRESS_STAGE_H2D=1` is required for the offline sweep, and
-  nothing here sets it.** `CLIO_NEUROPRESS_REQUIRE_DEVICE` defaults *on*
-  (`compressor_runtime.cc`), NeuroPress preprocessing is CUDA-only, and a
-  file-replay driver hands the compressor host memory by construction. Without
-  the stage every chunk is refused and every blob fails `rc=11` with
-  `0 B in -> 0 B on the tier`. `run_config_insitu.sh` sets residency
-  deliberately; `run_config.sh` sets neither, so the offline path is broken
-  out of the box on this build.
-- **`--chunk` must equal one component** (`ncell^3 x 4`, so 1048576 at 64³),
-  or a dumped `.bin` is a fragment spanning field boundaries and will not
-  reshape.
-- **The readback `--tag` must match the writer's**, which is `nyx_$NAME`, not
-  the config name. A wrong tag finds no blobs and reports `rc=11` — the same
-  symptom as the residency failure, from an unrelated cause.
-
-Measured on the 64³ quick run, `dynamic`, over the same 156 MiB. Every chunk
-landed inside its bound at both settings:
-
-| | stored ratio | worst `max|err|` |
-|---|---|---|
-| lossless | 4.114× | 0 (bit-exact) |
-| `--eb 0.001` | **6.470×** | 0.000949 |
-| `--eb 0.01` | 6.198× | 0.00949 |
-| `--eb 0.1` | 10.975× | 0.0950 |
-
-**The ratio is not monotone in the bound.** `0.001` stores BETTER than `0.01`
-(6.470× against 6.198×) on identical input. The cause is visible in
-`viz_actions.py`: under the balanced cost model the two bounds pick different
-codecs for the same chunk — on density, `0.01` sits on `zstd` for the first
-four dumps and reaches a mean 471.7×, while `0.001` sits on `cascaded` at
-26.2×, and the ordering reverses again once both settle on `ans`. Selection,
-not quantization, is what moves the total. Do not assume a looser bound is a
-smaller file.
-
-The pictures say something the ratio does not. The bound is **absolute**, so
-what it costs depends entirely on local magnitude:
-
-| field | eb 0.001 | eb 0.01 | eb 0.1 | 0.1 as % of peak | outcome |
-|---|---|---|---|---|---|
-| `density` | 25/26 | 26/26 | 24/26 | 3.8% | flattened at 0.01, obliterated at 0.1 |
-| `xmom` `ymom` `zmom` | 17–19/26 | 23–24/26 | 25/26 | 0.10% | shell intact at every bound |
-| `rho_E` | **0/26** | **0/26** | **0/26** | 0.0057% | **bit-exact at all three** |
-| `rho_e` | **0/26** | **0/26** | 9/26 | 0.0085% | **bit-exact below 0.1** |
-
-(chunks quantized, out of 26)
-
-On density the ambient is 1.0 and the evacuated centre reaches 0.002. At 0.001
-the reconstruction is visually indistinguishable from the original. At 0.01 the
-bound is a 1% perturbation outside the shock but already larger than the value
-inside it, so the front is untouched while the interior gradient collapses to a
-slab. At 0.1 the interior becomes a single flat level and the quantizer's
-Cartesian grid shows through as a **diamond** — the clearest picture of the
-effect in the whole set, and still invisible at the shock front. The three
-bounds as a ladder are what makes that legible; any one of them alone is
-ambiguous.
-
-And the bound is a **ceiling, not an instruction**. NeuroPress decides per chunk
-whether quantizing is worth it: `rho_E` declined at all three bounds, `rho_e`
-declined twice and then accepted 0.1 on 9 of 26 chunks, and density actually
-quantizes FEWER chunks at 0.1 (24) than at 0.01 (26). A "lossy run" is lossy
-only where the selector took the offer.
-
-### The action progression
-
-`../viz_actions.py` draws what was selected per dump, and it draws the whole
-action rather than just the codec: lane is the library, colour is the bound, a
-filled marker means quantize was taken, a square means the 4-byte shuffle.
-
-It lives one level up because it is workload-agnostic: it reads both blob-name
-shapes, so the same script serves the LAMMPS benchmark.
-
-The point is that **the selection moves as the physics does**. On density the
-run walks cascaded/zstd/gdeflate → snappy → bitcomp → cascaded → ans, settling
-only once the blast has filled enough of the box that the block stops changing
-character. Measured switches over 26 dumps: density 7 (eb 0.001), 3 (0.01),
-6 (0.1); `xmom` 5 / 10 / 4. `rho_e` never leaves `lz4` — its lane is a flat
-line, and at eb=0.1 the marker simply fills in from dump 19 onward.
-
-Preset is not drawn: it is 2 throughout these runs, and the script says so
-rather than hiding it if that ever changes.
-
-### Temporal redundancy is the number that explains all of it
-
-`evolution.png` now carries a fourth panel: the share of cells **bit-identical
-to the previous dump**.
-
-| dump | 1 | 12 | 25 |
-|---|---|---|---|
-| `density` | 99.9% | 86.5% | 57.1% |
-| `xmom` `ymom` `zmom` | 99.7% | 83.5% | 50.9% |
-| `rho_E` `rho_e` | 99.9% | 86.3% | 56.7% |
-
-It falls almost linearly across the run. That single column is the clearest
-statement of why a fixed codec is the wrong answer here: the block genuinely
-stops being the same kind of data, and every other curve on the page —
-compressibility, the chosen action, the cost of a given bound — is downstream
-of it. It is also the metric `gen_fields.sh` reasons about when it argues for
-raising `--exp-energy`, now measured rather than asserted.
 
 ### The tools Nyx itself documents
 
@@ -325,6 +222,85 @@ Even with `--keep-plt`, `../viz_fields.py` opens the plotfiles only to read
 `dump 25`. Without `--plt` it falls back to dump indices and everything else
 still works. (yt is not installed here and there is no `pip`, so the documented
 route was not exercised on this machine.)
+
+## Default Evolving Benchmark Configuration
+
+Selected by a 1,000-timestep hyperparameter study (`../evolution.py`, six
+configurations, 101 dumps each, 4,800 block samples per configuration).
+
+Parameters:
+
+- `nyx.cfl = 0.8`  (`--cfl`, Nyx's own documented default; the Sedov deck ships 0.5)
+- `prob.exp_energy` — left at the deck's 1.0; it does not matter, see below
+- `--ncell 128`, `stop_time = 1.0` so `max_step` is what ends the run
+
+Evolution sampling interval: 10 timesteps
+
+### Parameters tested
+
+Two, chosen because Nyx's own documentation says they are what sets the
+timestep and what sets the blast. Everything else in the deck was left alone.
+
+| | `nyx.cfl` | `prob.exp_energy` |
+|---|---|---|
+| **controls** | the timestep as a fraction of the CFL limit: "defines the timestep as dt = cfl \* dx / umax_hydro" | the energy deposited in the initial sphere: `p_exp = (gamma-1) * exp_energy / vctr`, `vctr = 4/3 pi r_init^3` |
+| **why it should matter** | a larger timestep moves the shock further per step, so a fixed block sees more change between dumps | Sedov-Taylor gives `R = 1.033 (E t^2 / rho)^(1/5)`, so a stronger blast sweeps more of the domain |
+| **official reference** | `NyxInputs.rst` — "CFL number for hydro", `Real > 0 and <= 1`, **default 0.8** | `Exec/HydroTests/Prob.cpp`; deck value in `inputs.3d.sph.sedov` |
+| **values tested** | 0.5 (deck), 0.8, 0.9 | 1.0 (deck), 10.0, 100.0 |
+| **outcome** | **decisive** — 0.5 -> 0.8 moves last-decile cells-identical from 76.3% to 53.2% | **exactly inert** at a fixed step count; moves the same number by 0.3 points over a 100x range |
+
+Not varied, and why: `--ncell` is payload sizing rather than evolution rate, and
+the chunk shape depends on it (`--chunk` must be `ncell^3 x 4`);
+`prob.dens_ambient` enters `R` through the same `(E/rho)^(1/5)` as `exp_energy`
+and so cancels for the same reason; `prob.r_init` changes the initial condition
+rather than the rate.
+
+### Why these parameters
+
+**At a fixed step count `exp_energy` does nothing, and that is exact rather than
+approximate.** Sedov is self-similar. With `R(t) = 1.033 (E t^2 / rho)^(1/5)` the
+shock speed is `u_s = (2/5) R/t`, and the timestep is CFL-limited to
+`dt = cfl * dx / (c1 * u_s)` for a `c1` set by the post-shock sound speed. So
+
+```
+dR per step = u_s * dt = cfl * dx / c1
+```
+
+— **a fixed number of cells per timestep, independent of E, rho and t.** A
+stronger blast moves the shock faster and shrinks the timestep by exactly the
+same factor. `--exp-energy` therefore buys reach per unit *time* and nothing per
+unit *step*, and the measurements bear that out over a hundredfold range in E
+while `--cfl` moves the same quantity substantially.
+
+This does not contradict `RESULTS.md`'s `--exp-energy` table, which is measured
+at the deck's fixed `stop_time = 0.01`: there a stronger blast buys more *steps*
+and the ratio spread follows. Both are true and they answer different questions.
+**If the run is ended by `stop_time`, raise `--exp-energy`; if it is ended by
+`--steps`, raise `--cfl`.**
+
+**Why not `cfl = 0.9`,** which scores slightly higher. Nyx's own mass sum over
+1,000 steps drifts by roughly a thousand times more at 0.9 than at 0.8, because
+the scheme produces negative densities that Nyx's `Enforce minimum density`
+floor clamps, and the clamping shows up as mass that is not conserved. The run
+still exits 0 and holds no NaN, so the evolution metric cannot see it — this had
+to be checked separately. 0.8 is Nyx's own documented default and keeps mass to
+float32 roundoff.
+
+Rankings, per-decile curves and the mass-conservation figures are in
+`RESULTS.md`.
+
+### References
+
+- [`AMReX-Astro/Nyx`](https://github.com/AMReX-Astro/Nyx) (pinned at `4ecfea2`),
+  `Docs/sphinx_documentation/source/NyxInputs.rst`: **`nyx.cfl`** — "CFL number
+  for hydro", `Real > 0 and <= 1`, **default 0.8**; "defines the timestep as
+  dt = cfl \* dx / umax_hydro".
+- `Exec/HydroTests/inputs.3d.sph.sedov` — the deck, which sets `nyx.cfl = 0.5`,
+  `prob.exp_energy = 1.0`, `prob.r_init = 0.01`, `prob.dens_ambient = 1.0`,
+  `prob.p_ambient = 1.e-5`, `stop_time = 0.01`.
+- `Exec/HydroTests/Prob.cpp` — `exp_energy` enters as
+  `p_exp = (gamma - 1) * exp_energy / vctr` over `vctr = 4/3 pi r_init^3`, i.e.
+  the energy deposited in the initial sphere.
 
 ## Choosing the parameters
 
@@ -361,37 +337,6 @@ So a profile that specifies 1000 steps does not get them. Use `--stop-time` to
 extend the run, or `--exp-energy` (below), which raises the step count as a
 side effect.
 
-### `--exp-energy` is the knob that makes the data evolve
-
-The Sedov shock radius goes as `R = 1.033 (E t^2 / rho)^(1/5)`, so at the deck's
-`E=1` and `t=0.01` it reaches only **~0.16 of a unit box** — most of the domain
-never changes and consecutive dumps are nearly identical.
-
-Raising `E` fixes two things at once, which is not obvious: a wider shock also
-means higher velocities, so the CFL timestep shrinks and the *same* `stop_time`
-now takes **more** steps. Measured at 128³, `density` ratio range over the run:
-
-| `--exp-energy` | steps | ratio range | spread |
-|---|---|---|---|
-| 1 (deck default) | ~300 | 12.7x .. 87.5x | 6.9x |
-| **10** | ~675 | 4.6x .. 205.3x | **44.4x** |
-| 100 | ~1575 | 1.8x .. 205.8x | 113.9x |
-
-A validated 1 GB configuration:
-
-```bash
-./run_config_insitu.sh explore-balance   --ncell 128 --steps 2000 --int 32 --chunk 8388608   --exp-energy 10 --explore-k 3 --explore-thresh -1 --verify   --results /tmp/nyx1g --tag e10
-```
-
-21 frames, 671 steps, 126/126 blobs verified bit-exact, and **no frame
-bit-identical to its predecessor on any field**. Compressibility falls
-monotonically from ~86x to ~4.6x as the blast fills the domain, and the
-selector moves cascaded -> bitcomp -> ans along the way. Both knobs are
-recorded in `meta.json`, so a run stays self-describing.
-
-`--steps 2000` there is deliberately generous: the run stops on `stop_time`, so
-the step count is an outcome, not an input.
-
 ### `--deck`: Sedov is a hydro unit problem, not Nyx's science
 
 `inputs.3d.sph.sedov` comes from `Exec/HydroTests` and runs with
@@ -410,96 +355,6 @@ But its compression ratio sits at **1.0005 .. 1.0022 for the entire history**:
 cosmological float32 fields are incompressible losslessly at every redshift, so
 there is no signal to measure. Sedov with a raised blast energy is the
 configuration that produces one.
-
-## Results
-
-Sedov blast, 128³, 21 frames, 1,008 MiB float32, 252 chunks, A100, lossless.
-All 252 blobs verified bit-exact in every configuration, in process and on a
-cold read from a separate process.
-
-Regenerated after `775dd9b4` fixed the dump: it had been writing the first
-`validbox().numPts()` elements of the GROWN FArrayBox — a mixture of valid and
-ghost cells — instead of the valid box. Every number in this section is from
-the corrected dump (each file is exactly 128³ × 4 B).
-
-| config | ratio | stored | density | rho_E | rho_e | xmom | ymom | zmom | Σ ms | wall |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **`static-zstd-s4`** | **162.9×** | 6.2 MiB | 222× | 192× | 194× | 145× | 123× | 144× | 720 | 33.8 s |
-| `static-zstd-s8` | 141.2× | 7.1 MiB | 192× | 166× | 167× | 127× | 107× | 124× | 813 | 32.0 s |
-| `best` | 134.1× | 7.5 MiB | 139× | 192× | 184× | 118× | 103× | 115× | 628 | 111.9 s |
-| `static-zstd` | 132.6× | 7.6 MiB | 184× | 159× | 160× | 109× | 104× | 117× | 895 | 13.8 s |
-| `explore` | 126.9× | 7.9 MiB | 147× | 139× | 164× | 116× | 102× | 114× | 678 | 94.9 s |
-| `dynamic-ratio` | 75.3× | 13.4 MiB | 109× | 52× | 51× | 96× | 90× | 100× | 791 | 45.8 s |
-| `dynamic` | 23.7× | 42.6 MiB | 29× | 36× | 18× | 19× | 20× | 31× | 245 | 54.9 s |
-| `learn` | 20.8× | 48.4 MiB | 29× | 14× | 14× | 26× | 31× | 25× | 151 | 93.8 s |
-
-The mis-sliced data changed more than the magnitudes: `static-zstd` (no
-shuffle) moves from 79.1× to 132.6×, from below `dynamic-ratio` to above
-`explore`, and `dynamic`/`learn` roughly double. The ORDER of the top result is
-unchanged — a fixed zstd with the 4-byte stride still wins — but any statement
-about *how far* the others trail had to be re-derived, which is what the rest
-of this section does.
-
-### The shuffle stride is the headline, and it flips with the element width
-
-Nyx can be built at either precision, so this is a **controlled** result:
-identical problem, identical code, identical timesteps — only `AMReX_PRECISION`
-changes. (`gen_fields.sh` with a double build and `NYX_DUMP_NATIVE=1` emits
-`.f64`; replay with `--f64`.)
-
-| fixed nvcomp-zstd | Nyx float32 (1,008 MiB) | Nyx float64 (2,016 MiB) |
-|---|---|---|
-| no shuffle | 132.6× | 94.3× |
-| **4-byte** shuffle | **162.9×** | 104.4× |
-| **8-byte** shuffle | 141.2× | **110.8×** |
-| best stride | **4** | **8** |
-
-(The float64 column was re-measured from the corrected dump too and came back
-unchanged to three digits — 94.321 / 104.406 / 110.804 — so only the float32
-column moved.)
-
-The preference flips with the width, on the same physics. The cross-workload
-comparison points the same way — LAMMPS float64 prefers 8 (1.198× against
-1.159×) — but that one confounds data and width; this one does not.
-
-The stride has to match the element width, and getting it wrong costs more
-than any codec choice. NeuroPress encodes byte-shuffle as a **single bit**
-meaning `GPUCOMPRESS_PREPROC_SHUFFLE_4` — a 4-byte stride. That is exactly
-right for float32 Nyx, and it is why upstream's benchmarks never surfaced the
-limitation: their recommended Nyx build is single precision. On float64 LAMMPS
-the same bit is the wrong width, and no action in the searched space can ask
-for 8.
-
-Upstream is aware of the gap without having closed it. Its own Nyx bridge
-(`examples/nyx_amrex_bridge.hpp:255`) asks for 8 on double data —
-`shuffle_size = (h5type == H5T_NATIVE_DOUBLE) ? 8 : 4` — but the filter accepts
-only 0 and 4 (`src/hdf5/H5Zgpucompress.c:258`), prints
-`"only 0 and 4 are supported), ignoring shuffle"`, and falls back to **no
-shuffle at all** rather than to 4.
-
-### The default cost model is badly wrong on this data
-
-`dynamic` — NeuroPress inference under the default balanced cost — reaches
-**23.7× where 162.9× was available**, a 6.9× miss, and `learn` is worse still
-at 20.8×. The balanced objective charges compression time, so it picks the fast
-codecs (bitcomp ×168, ans ×26, cascaded ×20) on data whose whole value is in
-the slow entropy coders; `best` and `explore`, which do not, pick zstd for
-158–183 of the 252 chunks. Zeroing the two latency weights (`dynamic-ratio`)
-recovers 75.3× immediately — still less than a fixed zstd, because the
-ratio-only objective ranks on a predicted ratio that is itself wrong.
-
-This is the same failure mode as in the LAMMPS benchmark but far larger:
-there, inference reached 1.074× against 1.198× achievable (an 11% miss); here
-it forfeits most of an order of magnitude. Highly compressible data punishes a
-selector that optimises for speed.
-
-### Exploration does not reach the fixed codec
-
-`explore` and `best` measure every alternative and still land at 127–134×,
-below a fixed zstd with the right stride (162.9×) that costs a third of the
-wall clock — and below a fixed zstd with NO shuffle at all (132.6×). Both facts have the same cause as in the LAMMPS run: the shuffle the
-search can request is chosen per action from a space that pairs it with the
-codec, and the search is bounded by what the action space can express.
 
 ## Notes
 

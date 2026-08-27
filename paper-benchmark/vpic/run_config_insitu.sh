@@ -26,6 +26,11 @@ case "${1:-}" in -h|--help) sed -n '2,24p' "$0"; exit 0;; esac
 CONFIG=${1:-explore-balance}; shift || true
 
 NCELL=126 STEPS=200 INT=25 CHUNK=4194304
+# clean_div_e_interval / clean_div_b_interval. 10, not upstream's 0: with
+# cleaning off, div_e_err, div_b_err, rhob and rhof are never recomputed and a
+# quarter of the payload is dumped unchanged every frame. See "Default Evolving
+# Benchmark Configuration" in README.md.
+CLEAN_DIV=10
 BW="" EB="" EXPLORE_K_OPT=3 THRESH_OPT=0
 RESULTS="$HERE/results" TAG="" VERIFY=0 CHECK_BOUND=0
 while [ $# -gt 0 ]; do
@@ -33,6 +38,7 @@ while [ $# -gt 0 ]; do
     --ncell) NCELL=$2; shift 2;;
     --steps) STEPS=$2; shift 2;;
     --int|--dump-int) INT=$2; shift 2;;
+    --clean-div) CLEAN_DIV=$2; shift 2;;
     --chunk) CHUNK=$2; shift 2;;
     --bw) BW=$2; shift 2;;
     --eb) EB=$2; shift 2;;
@@ -89,6 +95,7 @@ env "${COST_ENV[@]}" \
     ${BW:+CLIO_NEUROPRESS_COST_BW=$BW} \
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \
     CLIO_NEUROPRESS_REQUIRE_DEVICE=1 \
+    VPIC_CLEAN_DIV_INT="$CLEAN_DIV" \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=${MEASURE_DT:-1} \
     CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv" \
     CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv" \
@@ -139,7 +146,8 @@ cat > "$STORE/meta.json" <<JSON
  "atoms":0,"steps":$STEPS,"gap":$INT,"frames":$FRAMES,"chunk":$CHUNK,
  "files":$NCHUNKS,"payload_bytes":$PAYLOAD,"wall_s":$WALL,
  "verify_result":"$VERDICT",
- "physics":{"problem":"weibel","precision":"float32","insitu":"yes"}}
+ "physics":{"problem":"weibel","precision":"float32","insitu":"yes",
+            "clean_div_interval":$CLEAN_DIV}}
 JSON
 grep -E "stored [0-9]+ blob" "$STORE/stdout.log" | sed 's/^/   /' || true
 exit $RC

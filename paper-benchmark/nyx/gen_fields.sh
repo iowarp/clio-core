@@ -2,7 +2,7 @@
 # Phase 1 of 2: run Nyx and dump its raw fields as flat float32 files.
 #
 #   ./gen_fields.sh [--ncell N] [--steps N] [--plot-int N] [--stop-time T]
-#                   [--exp-energy E] [--out DIR] [--keep-plt]
+#                   [--exp-energy E] [--cfl X] [--out DIR] [--keep-plt]
 #
 # --keep-plt keeps Nyx's own AMReX plotfiles, in <out>-plotfiles. They are
 # thrown away by default: the sweep never reads them, and at 128^3 they cost
@@ -42,7 +42,15 @@
 # for more than half the domain at every dump, and the median block never
 # changes at all. Keep that when you want a mix of frozen and active chunks,
 # which is what makes the selector see genuinely different work; raise --steps
-# (and --exp-energy, since R ~ E^(1/5)) when you want the whole domain live.
+# when you want the whole domain live.
+#
+# NOT --exp-energy, if the run is ended by --steps. R ~ E^(1/5) is a statement
+# about TIME, and a stronger blast shrinks the CFL timestep by exactly the
+# factor it speeds the shock up, so at a fixed step count the two cancel: the
+# 1,000-step study measured E = 1, 10 and 100 as indistinguishable (last-decile
+# cells-identical 76.3 / 76.2 / 76.0%) while --cfl 0.5 -> 0.8 moved it to 53.2%.
+# --exp-energy is the right knob only when stop_time is what ends the run. See
+# "Default Evolving Benchmark Configuration" in README.md.
 #
 # stop_time DEFAULTS HIGH SO --steps IS THE CONTROL. Both bound the run; only
 # one of them should be doing the work, and step count is what --plot-int is
@@ -60,6 +68,11 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 NCELL=128 STEPS=200 PLOT_INT=10 EXP_ENERGY= KEEP_PLT=0
+# nyx.cfl, and it is the ONLY knob that changes how fast this data evolves at a
+# fixed step count -- see "Default Evolving Benchmark Configuration" in
+# README.md. 0.8 is Nyx's own documented default (NyxInputs.rst); the Sedov
+# deck ships 0.5, which is the outlier.
+CFL=0.8
 # Parked above any time these step counts can reach; see the note above.
 STOP_TIME=1.0
 OUT=${OUT:-$HERE/fields}
@@ -71,6 +84,7 @@ while [ $# -gt 0 ]; do
     --plot-int) PLOT_INT=$2; shift 2;;
     --stop-time) STOP_TIME=$2; shift 2;;
     --exp-energy) EXP_ENERGY=$2; shift 2;;
+    --cfl) CFL=$2; shift 2;;
     --out) OUT=$2; shift 2;;
     --bin) NYX_BIN=$2; shift 2;;
     --keep-plt) KEEP_PLT=1; shift;;
@@ -103,6 +117,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 FRAMES=$(( STEPS / PLOT_INT + 1 ))
 echo "== Nyx Sedov: ${NCELL}^3, $STEPS steps, dump every $PLOT_INT -> ~$FRAMES frames"
 [ -n "$EXP_ENERGY" ] && echo "   exp_energy=$EXP_ENERGY (deck default is 1.0)"
+echo "   nyx.cfl=$CFL (deck ships 0.5; Nyx's own default is 0.8)"
 echo "   out=$OUT"
 
 # Nyx writes its own plotfiles into the working directory; keep them out of the
@@ -120,6 +135,7 @@ NYX_DUMP_FIELDS=1 NYX_DUMP_DIR="$OUT" "$NYX_BIN" "$DECK" \
     amr.max_grid_size="$NCELL" \
     max_step="$STEPS" amr.plot_int="$PLOT_INT" amr.check_int=0 \
     stop_time="$STOP_TIME" \
+    nyx.cfl="$CFL" \
     ${EXP_ENERGY:+prob.exp_energy="$EXP_ENERGY"} \
     nyx.v=0 amr.v=0 > "$OUT/nyx.log" 2>&1
 RC=$?
@@ -134,7 +150,7 @@ N=$(find "$OUT" -name '*.f32' | wc -l)
 cat > "$OUT/gen.json" <<JSON
 {"ncell":$NCELL,"steps":$STEPS,"plot_int":$PLOT_INT,
  "frames":$(( STEPS / PLOT_INT + 1 )),"files":$N,
- "exp_energy":"${EXP_ENERGY:-deck}","plotfiles":$KEEP_PLT}
+ "exp_energy":"${EXP_ENERGY:-deck}","cfl":$CFL,"plotfiles":$KEEP_PLT}
 JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   fields: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"

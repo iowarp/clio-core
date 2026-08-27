@@ -16,10 +16,10 @@
 # Physics options -- passed through to the deck as LAMMPS -var, which takes
 # precedence over its `variable ... index` defaults:
 #   --density X    fcc lattice reduced density               (default 0.8442)
-#   --temp X       initial temperature                       (default 3.0)
+#   --temp X       initial temperature                       (default 6.0)
 #   --cutoff X     lj/cut pair cutoff, sigma                 (default 2.5)
-#   --skin X       neighbor-list skin                        (default 0.3)
-#   --every N      neigh_modify every                        (default 20)
+#   --skin X       neighbor-list skin                        (default 0.8)
+#   --every N      neigh_modify every                        (default 5)
 #   --seed N       velocity RNG seed                         (default 87287)
 #   --dt X         timestep                                  (default 0.005)
 #   --var K=V      any other deck variable (repeatable)
@@ -51,7 +51,22 @@ BOX=80 STEPS=300 GAP=50 CHUNK=4194304
 DEVICE=gpu VERIFY=1 RESULTS="$HERE/results" TAG=""
 # Physics: empty means "let the deck's own default stand", so an unset knob
 # never has to be duplicated here and drift from the deck.
-DENSITY="" TEMP="" CUTOFF="" SKIN="" EVERY="" SEED="" DT=""
+# Physics: empty means "let the deck's own default stand". TEMP, SKIN and EVERY
+# are NOT empty, and the deck is not changed to match -- in.melt stays exactly
+# upstream's melt example so it still runs standalone as upstream wrote it, and
+# the benchmark's chosen operating point lives here instead.
+#
+# TEMP 6.0 rather than upstream's 3.0: the 1,000-step evolution study measured
+# 0.4368 mean block evolution with 100% of blocks active against 0.3892 / 83.6%
+# at 3.0.
+#
+# SKIN 0.8 and EVERY 5 rather than 0.3 / 20 are a CORRECTNESS condition for that
+# temperature, not tuning. Upstream's skin is sized for T=3.0, where an atom
+# moves ~0.22 sigma between rebuilds; at T=6.0 it moves ~0.33 sigma, crosses the
+# 0.3 sigma skin, and pairs are missed -- NVE then loses 3.5% of its total
+# energy over 1,000 steps against 0.37% here. See "Default Evolving Benchmark
+# Configuration" in README.md.
+DENSITY="" TEMP=6.0 CUTOFF="" SKIN=0.8 EVERY=5 SEED="" DT=""
 VARS=()
 # --- Cost-model bandwidth, error bound, exploration policy ----------------
 # BW is CLIO_NEUROPRESS_COST_BW in BYTES PER MILLISECOND -- the unit of

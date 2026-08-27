@@ -19,6 +19,11 @@ $ ldd $(which warpx.3d...) | grep -c clio
 Upstream NeuroPress reaches WarpX through a **636-line patch** adding a whole
 `FlushFormatGPUCompress` diagnostic backend. Clio needs **zero lines** in WarpX.
 
+This file is the operational document: how to build and run the workload, how
+to get its data out, and the parameters that make that data evolve.
+**Measurements — compression ratios, error-bound behaviour, the evolution
+study's rankings — are in [`RESULTS.md`](RESULTS.md).**
+
 ## Looking at the data
 
 Nothing needs dumping: WarpX writes openPMD-HDF5 as it always does and the VOL
@@ -44,41 +49,6 @@ reports a problem. 64×64×512 is the smallest grid that stages anything. This i
 the same failure the `CLIO_VOL_CHUNK_SIZE` note at the top of `run_config.sh`
 describes, reached from the other direction.
 
-## The state vector spans fifteen orders of magnitude, and the bound only reaches one field
-
-Measured at 64×64×512, 40 steps, 11 diagnostics, 880 chunks, `dynamic`:
-
-| | stored ratio | quantize chosen | quantize ran |
-|---|---|---|---|
-| lossless | 11.536× | 0 / 880 | 0 |
-| `--eb 0.001` | 14.631× | 39 | 30 |
-| `--eb 0.01` | 14.676× | 39 | 26 |
-| `--eb 0.1` | 15.004× | 40 | 23 |
-
-Monotone, unlike Nyx and VPIC — but for a reason that makes the number almost
-meaningless. WarpX writes SI, and the fields do not share a scale:
-
-| field | range (SI) | `eb=0.01` as a share of it |
-|---|---|---|
-| `j/z` | 2.7e+12 | 3.7e-13 % |
-| `E/z` | 1.5e+11 | 6.9e-12 % |
-| `rho` | 6.9e+06 | 1.5e-07 % |
-| `B/x` | 1.6e+04 | 6.1e-05 % |
-| **`B/y`** | **1.1e-01** | **9.4 %** |
-
-So the bound is far below float32 resolution on almost everything and lands on
-`B` alone. Of the 16.9 MB it saves at `--eb 0.01`, **8.6 MB is `By` and 7.2 MB
-is `Bz`** — 93% — while the E fields, currents and charge density contribute
-0.2 MB between them. A `By` chunk goes from ~730 KB to ~700 B, because the
-entire field is smaller than the bound and quantizes to zero.
-
-That is a 27% ratio gain from 3% of the chunks, and it is not an accuracy
-statement about anything. **An absolute bound is a statement about units.** It
-is the same failure VPIC shows from the other direction: there the diagnostics
-are 1e-07 and the bound annihilates them; here the currents are 1e+12 and the
-bound cannot reach them. Both runs report every chunk inside its bound, and
-both reports are true.
-
 ### Reading the fields back: `read_fields.sh`
 
 `read.sh` proves the tier answered and the bytes are right. It does not write
@@ -99,34 +69,8 @@ WarpX's own 0.6% run-to-run spread instead of the codec.
 the tier returns correct bytes and looks exactly like perfect lossless
 compression.** Every read therefore records its `inverting codec` count into
 `inversions.csv`, and a pair whose read reported zero must be discarded, not
-published as bit-exact. That is the one way this comparison can lie. On the
-measurements below all 66 reads inverted at least one codec.
-
-### Read back, one bound annihilates one field and never touches another
-
-`B/y` grows from 0 to 0.11 over the run, so an absolute bound is first wider
-than the entire field and later a small fraction of it. Error as a share of
-`B/y`'s own range, per diagnostic:
-
-| step | 4 | 12 | 20 | 28 | 36 | 40 |
-|---|---|---|---|---|---|---|
-| `B/y` range | 3.7e-06 | 5.6e-05 | 4.7e-04 | 3.9e-03 | 4.1e-02 | 1.1e-01 |
-| `--eb 0.001` | **100%** | **100%** | **100%** | 24% | 2% | 1% |
-| `--eb 0.01` | **100%** | **100%** | **100%** | **100%** | 23% | 9% |
-| `--eb 0.1` | **100%** | **100%** | **100%** | **100%** | **100%** | 89% |
-| `E/z`, any bound | 0% | 0% | 0% | 0% | 0% | 0% |
-
-`E/z` reaches 1.5e+11, so even `--eb 0.1` — whose largest measured error on it
-is 1.0 — rounds to **0.0% of its range at every diagnostic**. One bound, one
-file, one run: total loss on one field and invisible on the other. The same
-bound also changes behaviour *within* the run as the field amplifies, which no
-per-run summary number can show.
-
-**Each policy is its own WarpX run**, so these are not byte-identical
-comparisons the way Nyx and VPIC are. Measured run-to-run spread on this
-configuration is 0.6% (11.860× vs 11.792× lossless; 15.167× vs 15.197× at
-eb=0.01), well below the 27% the bound moves — but it is why these are quoted
-to three digits.
+published as bit-exact. That is the one way this comparison can lie; every
+read in the measurements recorded in `RESULTS.md` inverted at least one codec.
 
 ## Running
 
@@ -151,6 +95,108 @@ cmake --build build-clio -j
 Defaults: 64×64×512 cells, 40 steps, diagnostics every 10 → 5 openPMD dumps ×
 10 field components × 8 MiB = 400 MiB in 400 chunks of 1 MiB.
 
+## Default Evolving Benchmark Configuration
+
+Selected by a 1,000-timestep hyperparameter study (`../evolution.py`, eight
+configurations, 101 dumps each, 8,000 block samples per configuration).
+
+Parameters:
+
+- `laser1.e_max = 32.e12` V/m — `a0 = 8` at 0.8 um (`--e-max`; the deck ships
+  `16.e12`, `a0 = 4`)
+- `electrons.density = 2.e23` m^-3 — upstream's value, kept (`--density`)
+- `warpx.do_moving_window = 1` — upstream's, and **not** optional here
+- `amr.n_cell = 64 64 512`, `max_step = 1000` — upstream's own production
+  recommendation, and 64x64x512 is already the smallest grid that stages any
+  chunk at all
+
+Evolution sampling interval: 10 timesteps
+
+### Parameters tested
+
+Three, plus one profile shape. `amr.n_cell` and `max_step` were held at
+upstream's own production recommendation and are not part of the search.
+
+| | `laser1.e_max` | `electrons.density` | `warpx.do_moving_window` | `electrons.profile` |
+|---|---|---|---|---|
+| **controls** | "Peak amplitude of the laser field, in the focal plane", V/m | "the plasma density in m^-3" | "Whether to use a moving window for the simulation" | `constant` against `parse_density_function`, i.e. a z-dependent plasma |
+| **why it should matter** | sets `a0` and so how nonlinear the wake is; a deeper blowout bubble keeps evolving instead of settling | sets `w_p` and the plasma wavelength, so more structure per box and a faster-oscillating wake | with the window co-moving at c the wake is quasi-static in grid index space; off, the structure sweeps through fixed blocks | if the plasma the pulse meets keeps changing, the wake it drives should keep changing |
+| **official reference** | `parameters.rst`, `<laser_name>.e_max`; `E_max = a0 * 4.0e12 V/m` at 0.8 um | `parameters.rst`, `<species_name>.profile` / `density` | `parameters.rst`, `warpx.do_moving_window`, `warpx.moving_window_v` | `parameters.rst`, `parse_density_function` and the `(x>0)` interval idiom |
+| **values tested** | 16.e12 (deck, `a0` 4), 32.e12 (`a0` 8) | 2.e23 (deck), 8.e23, 32.e23 | 1 (deck), 0 | constant (deck); ramp 2e23 -> 1e24 over 141 um, raw and `z > 0`-guarded, alone and combined with `a0` 8 |
+| **outcome** | **the only knob that worked** | **inert and non-monotonic** — 4x is worse than the deck, 16x marginally better | **disqualified** — a resonant PEC cavity, not wakefield physics | **no help**, from both directions |
+
+`amr.n_cell = 64 64 512` is not free to vary here for two independent reasons:
+it is upstream's own production recommendation, and it is already the smallest
+grid on which any chunk completes at all (at 64x64x128 a field is 512 KB against
+the 1 MiB chunk and **zero** field bytes reach the tier). `warpx.cfl` is already
+1.0 in the deck, its stable maximum, so there is no headroom of the kind Nyx
+turned out to have.
+
+### Why these parameters
+
+**This is the workload where the search mostly failed, and that is the result.**
+Every valid configuration has the same shape: a large transient over the first
+third of the run while the laser enters and the wake forms, then a flat plateau.
+The plateau is not an artefact — WarpX's own `FieldEnergy` reduced diagnostic
+shows total field energy constant to five digits from step 400 on — it is what a
+**quasi-static wake in a co-moving window** looks like. The window follows the
+pulse at exactly c, so a fixed block sees nearly the same structure every dump,
+and the residual evolution is the wake pattern slipping backward relative to the
+frame because its phase velocity is below c.
+
+Against that, the knobs available do very little:
+
+- **Plasma density is inert and not even monotonic** — 4x is *worse* than the
+  deck, 16x marginally better, all three within a few percent.
+- **A longitudinal density ramp does not help**, which was the hypothesis this
+  study was extended to test: if the plasma the pulse meets keeps changing, the
+  wake should keep changing. It does not. Re-running it guarded to `z > 0` — the
+  first attempt's profile went negative below z = -35 um — reproduced the same
+  numbers to four decimals, and adding the ramp to the *winning* run lowers it
+  too, so the hypothesis is falsified from both directions rather than merely
+  unsupported.
+- **Laser amplitude is the only knob that moved the plateau.** `a0` 4 -> 8
+  drives a deeper blowout, so the bubble evolves rather than settling.
+
+**`warpx.do_moving_window = 0` scores far higher than the winner and is
+disqualified on physics the metric cannot see.** With the window off, the pulse —
+injected at z = 9 um, 3 um below a `pec` boundary — reflects instead of
+propagating, and the box becomes a resonant cavity. Field energy is *exactly*
+conserved (PEC walls absorb nothing) while E and B exchange periodically: a
+standing wave, not laser-wakefield acceleration. Its evolution *rises* through
+the run, which is the tell. The run exits 0 and holds no NaN, so
+`evolution_rank.py` cannot reject it automatically; the reason is recorded in
+its `evolution.json` under `disqualified` and honoured by the ranking, with the
+raw diagnostic in `../evolution-study/warpx/FE_nomovingwindow.txt`.
+
+**About a tenth of `E`/`B` blocks and an eighth of `j`/`rho` blocks never change
+in any configuration** — the vacuum region ahead of the pulse, where the fields
+are identically zero. That ceiling is why no configuration reaches full
+coverage.
+
+Rankings, per-decile curves and the field-energy figures are in `RESULTS.md`.
+
+### References
+
+- [`BLAST-WarpX/warpx`](https://github.com/BLAST-WarpX/warpx) (pinned at
+  `bd8c12f`), `Docs/source/usage/parameters.rst`:
+  - **`<laser_name>.e_max`** — "Peak amplitude of the laser field, in the focal
+    plane", with `E_max = a0 * 2 pi m_e c^2 / (e lambda) = a0 * 4.0e12 V/m` at
+    `lambda = 0.8 um`.
+  - **`<species_name>.profile`** / `density` — "the plasma density in m^-3";
+    `parse_density_function` for the ramp, whose `(z>0)` factor is upstream's
+    own idiom ("The factor `(x>0)` equals 1 where x>0 and 0 where x<=0").
+  - **`warpx.do_moving_window`** / **`warpx.moving_window_v`** — "Whether to use
+    a moving window for the simulation"; "The speed of moving window, in units
+    of the speed of light".
+- `Examples/Physics_applications/laser_acceleration/inputs_base_3d` — the deck,
+  whose own comments give this study's grid and step count: "for production, run
+  for longer time, e.g. max_step = 1000" and "for production, run with finer
+  mesh, e.g. amr.n_cell = 64 64 512".
+- [LWFA example](https://warpx.readthedocs.io/en/latest/usage/examples/lwfa/README.html)
+  — the physics being modelled, "laser diffraction, beamloading, and bubble
+  dynamics in the blowout regime".
+
 ## The chunk size is a correctness condition, not a tuning knob
 
 `CLIO_VOL_CHUNK_SIZE` is **1 MiB** here, not the 4 MiB the other workloads use,
@@ -171,62 +217,6 @@ At 4 MiB the run still succeeds, the native `.h5` is perfect, exit status is 0,
 and nothing anywhere reports a problem — the tier is simply empty of field data.
 The rule is that the chunk must be **≤ the writer's contiguous write
 granularity**, and this is the first workload here where that binds.
-
-## Results
-
-Laser acceleration, 64×64×512, 5 dumps, 400 MiB float32, 400 chunks, A100,
-lossless.
-
-| config | ratio | stored | wall | verified |
-|---|---|---|---|---|
-| **`static-zstd-s4`** | **17.434×** | 22.9 MiB | 13.1 s | pass |
-| `explore` | 17.044× | 23.5 MiB | 22.1 s | pass |
-| `best` | 16.544× | 24.2 MiB | 42.1 s | pass |
-| `static-zstd-s8` | 16.368× | 24.4 MiB | 12.1 s | pass |
-| `static-zstd` | 13.214× | 30.3 MiB | 9.1 s | pass |
-| `dynamic-ratio` | 12.069× | 33.1 MiB | 13.1 s | pass |
-| `dynamic` | 11.785× | 33.9 MiB | 12.1 s | pass |
-| `learn` | 7.107× | 56.3 MiB | 16.1 s | pass |
-
-Every run is verified: `run_sweep.sh` passes `--verify`, so each configuration
-reads three field datasets back through the VOL from a separate process and
-requires both byte-equality with a native read and trace evidence that the tier
-served them. Across the eight runs: **192 chunk inversions, 0 cache misses.**
-
-Consistent with the other three workloads: **the 4-byte stride wins on float32**
-(17.43× against 16.37× for 8-byte), inference under the balanced cost model
-leaves most of the ratio on the table (11.79×), and online learning is the worst
-option (8.76×).
-
-Unlike the other workloads, exploration here **does** essentially reach the best
-fixed codec — 17.04× against 17.43×, and 17.44× once the ratio cap is raised.
-
-### What the ratio cap does to exploration
-
-`RATIO_CAP` (default 100, upstream's `nn_gpu.cu` constant, overridable with
-`CLIO_NEUROPRESS_RATIO_CAP` or this harness's `RATIO_CAP=`) turns out to gate
-*whether exploration runs at all*, not just how candidates rank.
-
-The exploration gate fires on `error_pct > threshold`, where
-
-```
-error_pct = |actual_cost − predicted_cost| / actual_cost
-cost      = w_io · bytes / (min(ratio, RATIO_CAP) · bandwidth)      [ratio-only]
-```
-
-When a chunk's predicted *and* actual ratio both exceed the cap, both clamp to
-100, the two costs are numerically identical, `error_pct` is exactly **0**, and
-the gate cannot fire at **any** threshold — including 0. Measured:
-
-| | chunks explored | ratio |
-|---|---|---|
-| cap 100 (default) | 78 / 400 | 17.04× |
-| cap 10⁶ | 400 / 400 | 17.44× |
-
-and every one of the 322 unexplored chunks at the default cap was one whose
-ratio exceeded 100, while not a single chunk below the cap was skipped. So the
-mechanism is certain; the *cost* of it here is only ~3% of ratio, because the 78
-chunks the gate did select were the ones that mattered.
 
 ## Verification
 

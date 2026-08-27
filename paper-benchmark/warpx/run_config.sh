@@ -3,7 +3,12 @@
 #
 #   ./run_config.sh <config> [--ncell "NX NY NZ"] [--steps N] [--interval N]
 #                            [--chunk BYTES] [--results DIR] [--tag NAME]
-#                            [--verify]
+#                            [--verify] [--e-max V/m] [--density m^-3]
+#
+# --e-max and --density are the deck's physics, reaching it as ParmParse
+# overrides. Defaults are the operating point the 1,000-step evolution study
+# chose -- e_max 32e12 (a0 = 8), density upstream's 2e23. See "Default Evolving
+# Benchmark Configuration" in README.md.
 #
 # --verify runs read.sh afterwards: reads field datasets back through the VOL
 # from a separate process and requires BOTH that the bytes match a native read
@@ -41,6 +46,15 @@ CONFIG=${1:-dynamic}; shift || true
 
 NCELL=${NCELL:-"64 64 512"}
 STEPS=${STEPS:-40} INTERVAL=${INTERVAL:-10}
+# laser1.e_max in V/m. At 0.8 um, E_max = a0 * 4.0e12 V/m (WarpX
+# parameters.rst, <laser_name>.e_max), so 32e12 is a0 = 8 against the deck's
+# a0 = 4. The evolution study measured 0.1636 mean block evolution against
+# 0.1498 at the deck value, and it is the only knob of the three tested that
+# moved the co-moving wake's plateau.
+EMAX=${EMAX:-32.e12}
+# electrons.density in m^-3. Upstream's value, kept: 4x and 16x were measured
+# and are non-monotonic and within noise of the deck value.
+DENSITY=${DENSITY:-2.e23}
 CHUNK=${CHUNK:-1048576}
 RESULTS="$HERE/results" TAG="" VERIFY=0
 WARPX_BIN=${WARPX_BIN:-$(ls "$HOME"/src/warpx/build-clio/bin/warpx.3d.* 2>/dev/null | head -1)}
@@ -111,6 +125,8 @@ while [ $# -gt 0 ]; do
     --stage-h2d) STAGE_H2D=1; REQUIRE_DEVICE=1; shift;;
     --bin) WARPX_BIN=$2; shift 2;;
     --deck) DECK=$2; shift 2;;
+    --e-max) EMAX=$2; shift 2;;
+    --density) DENSITY=$2; shift 2;;
     --verify) VERIFY=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -223,7 +239,8 @@ set +e
     "${COST_ENV[@]}" \
     "$WARPX_BIN" "$DECK" \
         max_step="$STEPS" diag1.intervals="$INTERVAL" \
-        amr.n_cell="$NCELL" diag1.openpmd_backend=h5 ) \
+        amr.n_cell="$NCELL" diag1.openpmd_backend=h5 \
+        laser1.e_max="$EMAX" electrons.density="$DENSITY" ) \
   > "$STORE/stdout.log" 2> "$STORE/runtime.log"
 RC=$?
 set -e
@@ -296,7 +313,8 @@ cat > "$STORE/meta.json" <<JSON
  "frames":$(( STEPS / INTERVAL + 1 )),"chunk":$CHUNK,"files":$NCHUNKS,
  "payload_bytes":$PAYLOAD,"native_h5_bytes":$NATIVE,"wall_s":$WALL,
  "verified":$VERIFY,"verify_result":"$VERIFY_RESULT","port":$PORT,
- "physics":{"problem":"laser_acceleration","precision":"float32","insitu":"yes"}}
+ "physics":{"problem":"laser_acceleration","precision":"float32","insitu":"yes",
+            "e_max":"$EMAX","density":"$DENSITY"}}
 JSON
 cat "$STORE/convert.log" | sed 's/^/   /'
 exit $RC

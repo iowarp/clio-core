@@ -22,7 +22,14 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-NCELL=126 NPPC=8 STEPS=200 DUMP_INT=25 CLEAN_DIV=0
+NCELL=126 NPPC=8 STEPS=200 DUMP_INT=25
+# 10, not upstream's 0. With cleaning off, div_e_err, div_b_err, rhob and rhof
+# are never recomputed: four of sixteen variables, 25% of the payload, that the
+# simulation dumps unchanged every frame. The 1,000-step evolution study
+# measured them at mean E = 0.0000 and 100% of cells bit-identical, and turning
+# cleaning on moves the run from 75.0% to 93.8% of blocks active. See
+# "Default Evolving Benchmark Configuration" in README.md.
+CLEAN_DIV=10
 OUT=${OUT:-$HERE/fields}
 BIN=${BIN:-$HERE/weibel_clio.Linux}
 while [ $# -gt 0 ]; do
