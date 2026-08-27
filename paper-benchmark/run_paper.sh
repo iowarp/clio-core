@@ -8,6 +8,12 @@
 #   ./run_paper.sh --out /tmp/smoke --steps 80   # smoke: every cell, tiny
 #   ./run_paper.sh --no-verify              # skip the integrity checks
 #
+# Each finished cell is summarised by metrics.py into metrics.json (ratio,
+# compression and decompression time and throughput, codec mix, timesteps,
+# chunk geometry, total data processed, wall clock) and results.csv (one
+# normalised row per chunk). Re-run ./metrics.py <cell> any time to rebuild
+# both from the raw CSVs.
+#
 # Each cell lands in <workload>/<config>/ as CSV, JSON and logs. THE FIELD
 # DATA IS NEVER COPIED THERE -- it is tens of GB per workload, it is identical
 # across the six configurations, and every generator regenerates it.
@@ -188,7 +194,6 @@ run_cell () {
   done
   [ -f "$store/run/stdout.log" ] && cp "$store/run/stdout.log" "$out/run.stdout.log"
   [ -f "$store/run/runtime.log" ] && cp "$store/run/runtime.log" "$out/runtime.log"
-  [ -f "$out/blobs.csv" ] && cp "$out/blobs.csv" "$out/results.csv"
 
   # What the check concluded, as the runner recorded it: pass / bound-ok /
   # BOUND-FAIL / FAIL / n/a. Scraped rather than re-derived so this file never
@@ -199,12 +204,26 @@ run_cell () {
   # all four share, so it is what gets scraped.
   local vres=n/a vlog="$out/run.stdout.log"
   [ -f "$vlog" ] || vlog="$out/stdout.log"
-  # UNANCHORED: the in-situ runners indent their output, so "^VERIFIED:" misses
-  # a line that is really "   VERIFIED: 64 of 64 blobs ...".
-  if   grep -q  "BOUND FAILED:"              "$vlog" 2>/dev/null; then vres=BOUND-FAIL
-  elif grep -q  "BOUND OK:"                  "$vlog" 2>/dev/null; then vres=bound-ok
-  elif grep -qE "(^|[[:space:]])VERIFIED:"   "$vlog" 2>/dev/null; then vres=pass
+  # MATCH THE CLAIM, NOT THE WORD "VERIFIED". Two different checks print it:
+  #   "... round-tripped bit-exact through the decompressor"  -> a real digest
+  #   "... decompressed without error (lossy: bytes are not expected to match)"
+  # The second only says the codec produced output; on a lossy run that is all
+  # it CAN say. Recording it as "pass" would claim bit-exactness that was never
+  # tested, so it gets its own verdict.
+  # Unanchored because the in-situ runners indent their output.
+  if   grep -q  "BOUND FAILED:"                "$vlog" 2>/dev/null; then vres=BOUND-FAIL
+  elif grep -q  "BOUND OK:"                    "$vlog" 2>/dev/null; then vres=bound-ok
+  elif grep -q  "round-tripped bit-exact"      "$vlog" 2>/dev/null; then vres=pass
+  elif grep -q  "decompressed without error"   "$vlog" 2>/dev/null; then vres=decoded-ok
   elif grep -qE "(^|[[:space:]])FAILED:|MISMATCH" "$vlog" 2>/dev/null; then vres=FAIL
+  fi
+  # WarpX prints no verification line at all -- its verdict exists only in
+  # meta.json -- so fall back to that rather than reporting n/a on a pass.
+  if [ "$vres" = n/a ] && [ -f "$out/meta.json" ]; then
+    vres=$(python3 -c "import json
+d=json.load(open('$out/meta.json'))
+v=d.get('verify_result')
+print(v if v else ('pass' if d.get('verified')==1 else 'n/a'))" 2>/dev/null || echo n/a)
   fi
   # What the check actually covered, for the size question: every blob is read
   # back at its own recorded original length into a pre-zeroed buffer, so
@@ -236,6 +255,11 @@ JSON
   if [ $rc = 0 ]; then verdict=OK
   elif [ "$vres" = BOUND-FAIL ]; then verdict="BOUND-UNREACHABLE"
   else verdict="FAIL rc=$rc"; fi
+  # Aggregate into metrics.json and normalise blobs.csv into results.csv.
+  # Derived entirely from files already written, so it can be re-run later
+  # without the GPU -- and re-running it cannot change what was measured.
+  "$HERE/metrics.py" "$out" > /dev/null 2>> "$out/stderr.log" || true
+
   printf '%-8s %-20s %-18s %ss\n' "$w" "$c" "$verdict" "$((t1-t0))"
 }
 
