@@ -143,8 +143,8 @@ point:
 |---|---|---|
 | `position` entropy, first → last | 7.03 → 7.02 | **5.42 → 7.07** |
 | `force` MAD, first → last | 9.9e-14 → 18.5 | **5.51 → 78.3** |
-| distinct codecs, `force` | 2 | **3** (brotli → bitcomp → zstd) |
-| distinct codecs, `velocity` | 2 | **3** (brotli → bitcomp → ans) |
+| distinct codecs, `force` | 2 | **3** (bitcomp → zstd, some stored raw) |
+| distinct codecs, `velocity` | 2 | **3** (bitcomp → ans, some stored raw) |
 | byte-level same-as-prev spread | 1.0 pt | **5.2 pts** (23.8% → 18.6%) |
 | MSD over the run | 1.41 σ² | **7.60 σ²** |
 
@@ -281,6 +281,42 @@ involved. Whether that is acceptable is a question about the trajectory, not
 about compression. What the table shows is only that the bound becomes
 reachable once it is done.
 
+### `brotli` in a blobs.csv is NOT brotli — it is "stored raw"
+
+NeuroPress's action space is nvcomp codecs only; brotli is not in it, and a
+`brotli` row in `blobs.csv` never meant one ran. Two facts collided:
+
+- `compress_lib_ == 0` is how the compressor marks **stored raw** — the chosen
+  codec did not shrink the chunk, so the caller's bytes went to the tier as
+  they were (`compressor_runtime.cc`, "Compression not beneficial").
+- **brotli occupies wire id 0** in Clio's registry
+  (`compress_factory.h:492`), so `NameForWireId(0)` answers `"brotli"`.
+
+A chunk no codec ever ran on therefore read as a codec that never ran. The
+`stored` column was always right — the drivers already guard it with
+`(lib != 0) ? compressed : bytes` — only the NAME was wrong.
+`neuropress_lammps_step_trace` and `neuropress_data_path_trace` already named
+the outcome instead; the lammps, field-replay, nyx-insitu, vpic-insitu and
+gpu-static drivers did not, and now do:
+
+```
+velocity/step_0/chunk_0  lib=0   codec=raw(not-beneficial)  stored=768000
+position/step_0/chunk_0  lib=22  codec=nvcomp-bitcomp       stored=644392
+```
+
+**`selection.csv` was never affected.** Its `lib_name` records what NeuroPress
+*chose*, and that is always a real nvcomp codec — on the ramped run, wire ids
+13/16/21/22 only, never 0. So "what was chosen" and "what was stored" are
+different questions and live in different files:
+
+| file | column | answers |
+|---|---|---|
+| `selection.csv` | `lib_name` | which codec the model ranked first |
+| `blobs.csv` | `codec` | what actually landed on the tier, `raw(not-beneficial)` if nothing shrank |
+
+A stored `ratio` below 1.0 in `blobs.csv` is the tell: the codec ran, expanded
+the chunk, and was discarded.
+
 ### `quantize` in the selection log is a REQUEST, and the codec is applied either way
 
 Two separate things live in a NeuroPress action, and conflating them is the
@@ -298,7 +334,7 @@ vs eb-0.01-1.039× gap is **one chunk**:
 
 | blob | lossless | eb 0.01 |
 |---|---|---|
-| `force/step_0/chunk_0` | `lz4`, 495,181 B | fell back to raw, 768,000 B |
+| `force/step_0/chunk_0` | `lz4`, 495,181 B | stored raw, 768,000 B |
 | `velocity` (26 chunks) | — | **0 bytes different** |
 | `position` (26 chunks) | — | 16 bytes different |
 

@@ -766,7 +766,9 @@ int clio_vpic_insitu_end(void) {
   }
   for (const auto &kv : lib_hist) {
     std::cout << "  codec " << std::setw(16)
-              << ctp::CompressionFactory::NameForWireId(kv.first) << " : "
+              << (kv.first == 0 ? std::string("raw(not-beneficial)")
+                                : ctp::CompressionFactory::NameForWireId(kv.first))
+              << " : "
               << kv.second << " chunk(s)\n";
   }
   std::cout << "  stage+compress(wait) " << a.stage_s << " s   in-situ wall "
@@ -804,7 +806,9 @@ int clio_vpic_insitu_end(void) {
       for (const auto &r : a.records) {
         csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest
             << std::dec << ',' << r.lib << ','
-            << ctp::CompressionFactory::NameForWireId(r.lib) << ',' << r.ratio
+            << (r.lib == 0 ? std::string("raw(not-beneficial)")
+                           : ctp::CompressionFactory::NameForWireId(r.lib))
+            << ',' << r.ratio
             << ',' << r.stored << ',' << r.ms << ',' << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
             << a.rank << ','
             << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';

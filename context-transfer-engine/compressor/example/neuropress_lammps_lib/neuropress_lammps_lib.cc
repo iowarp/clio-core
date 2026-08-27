@@ -1024,7 +1024,9 @@ int main(int argc, char **argv) {
               << "x)\n";
   for (const auto &[lib, n] : per_lib)
     std::cout << "  codec " << std::setw(16)
-              << ctp::CompressionFactory::NameForWireId(lib) << " : " << n
+              << (lib == 0 ? std::string("raw(not-beneficial)")
+                           : ctp::CompressionFactory::NameForWireId(lib))
+              << " : " << n
               << " chunk(s)\n";
   std::cout << "  time: simulate " << sim_s << " s   stage+compress(wait) "
             << stage_s << " s   total "
@@ -1033,11 +1035,17 @@ int main(int argc, char **argv) {
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);
+    // wire 0 is NOT brotli here. It is how the compressor marks "stored raw",
+    // and brotli merely happens to occupy wire id 0 in the factory registry --
+    // so NameForWireId(0) answers "brotli" and a chunk that was never
+    // compressed reads as a codec that never ran. Name the outcome instead.
     csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
            "decompress_ms,rc\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
-          << ',' << r.lib << ',' << ctp::CompressionFactory::NameForWireId(r.lib)
+          << ',' << r.lib << ','
+          << (r.lib == 0 ? std::string("raw(not-beneficial)")
+                         : ctp::CompressionFactory::NameForWireId(r.lib))
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
           << r.dt_ms << ',' << (r.ok ? 0 : 1) << '\n';
   }

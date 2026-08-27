@@ -540,7 +540,9 @@ int main(int argc, char **argv) {
               << (io.second ? double(io.first) / io.second : 0.0) << "x)\n";
   for (const auto &[lib, n] : per_lib)
     std::cout << "  codec " << std::setw(16)
-              << ctp::CompressionFactory::NameForWireId(lib) << " : " << n
+              << (lib == 0 ? std::string("raw(not-beneficial)")
+                           : ctp::CompressionFactory::NameForWireId(lib))
+              << " : " << n
               << " chunk(s)\n";
   std::cout << "  time: read " << read_s << " s   stage+compress " << stage_s
             << " s   total "
@@ -564,11 +566,17 @@ int main(int argc, char **argv) {
     // sum(bytes)/sum(stored) never equals the mean of the `ratio` column.
     // Appended, never inserted: the first three columns are the cold
     // reader's contract.
+    // wire 0 is NOT brotli here. It is how the compressor marks "stored raw",
+    // and brotli merely happens to occupy wire id 0 in the factory registry --
+    // so NameForWireId(0) answers "brotli" and a chunk that was never
+    // compressed reads as a codec that never ran. Name the outcome instead.
     csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
            "decompress_ms,rc,stored_ratio\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
-          << ',' << r.lib << ',' << ctp::CompressionFactory::NameForWireId(r.lib)
+          << ',' << r.lib << ','
+          << (r.lib == 0 ? std::string("raw(not-beneficial)")
+                         : ctp::CompressionFactory::NameForWireId(r.lib))
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
           << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
           << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';
