@@ -34,6 +34,7 @@
 #ifndef CTP_UTIL_GPU_API_H
 #define CTP_UTIL_GPU_API_H
 
+#include <execinfo.h>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -733,12 +734,61 @@ class GpuApi {
         cudaPointerAttributes _ad{}, _as{};
         cudaError_t _rd = cudaPointerGetAttributes(&_ad, dst);
         cudaError_t _rs = cudaPointerGetAttributes(&_as, src);
-        (void)cudaGetLastError();
+        // DO NOT call cudaGetLastError() here: it CLEARS the sticky error,
+        // so the CUDA_ERROR_CHECK below reported "Error 0: no error" -- a
+        // diagnostic that destroyed the very code it existed to surface.
+        // Print the REAL rc and its string instead.
         fprintf(stderr,
-                "[memcpyasync-fail] dst=%p (rc=%d type=%d) src=%p (rc=%d "
-                "type=%d) size=%zu stream=%p\n",
-                dst, (int)_rd, (int)_ad.type, (const void *)src, (int)_rs,
-                (int)_as.type, size, stream);
+                "[memcpyasync-fail] rc=%d (%s) dst=%p (rc=%d type=%d) "
+                "src=%p (rc=%d type=%d) size=%zu stream=%p\n",
+                (int)_rc, cudaGetErrorString(_rc), dst, (int)_rd,
+                (int)_ad.type, (const void *)src, (int)_rs, (int)_as.type,
+                size, stream);
+        // NAME THE CALLER. Five ticks of theorizing could not localize this
+        // call site; ten lines of backtrace can.
+        {
+          void *bt[16];
+          const int nbt = backtrace(bt, 16);
+          backtrace_symbols_fd(bt, nbt, 2);
+        }
+        // MITIGATE, LOUDLY: retry synchronously with no stream. If the
+        // stream argument was the invalid one, this completes and the run
+        // proceeds with the failure on record instead of a poisoned context.
+        cudaGetLastError();   // clear the sticky error before the retry
+        cudaError_t _rc2 = cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+        fprintf(stderr, "[memcpyasync-fail] sync retry rc=%d (%s)\n",
+                (int)_rc2, cudaGetErrorString(_rc2));
+        if (_rc2 != cudaSuccess) {
+          // NAME THE GUILTY POINTER: test each side against fresh pageable
+          // host memory. Whichever direction fails carries the bad argument.
+          cudaGetLastError();
+          void *probe = malloc(size);
+          const cudaError_t _rs2 =
+              cudaMemcpy(probe, src, size, cudaMemcpyDefault);
+          // THE DST WAS THE GUILTY ARGUMENT (measured: src->malloc rc=0,
+          // malloc->dst rc=1). A tier RAM page can be host-REGISTERED at its
+          // base while the copy range runs off the registered extent --
+          // e.g. adjacent SHM segments -- and CUDA validates the RANGE, so
+          // base attributes look fine and the copy is still rejected. Once
+          // the bytes are in host memory, plain memcpy has no such rule:
+          // finish host-side. Loud, correct, and independent of the
+          // registration geometry; the registration-extent bug remains on
+          // the books for the tier allocator.
+          if (_rs2 == cudaSuccess && _ad.type != cudaMemoryTypeDevice) {
+            std::memcpy(dst, probe, size);
+            fprintf(stderr,
+                    "[memcpyasync-fail] recovered: D2H bounce + host memcpy "
+                    "(dst registration does not cover the range)\n");
+            _rc2 = cudaSuccess;
+          } else {
+            fprintf(stderr,
+                    "[memcpyasync-fail] src->malloc rc=%d (%s); dst is "
+                    "device or src leg failed -- cannot recover host-side\n",
+                    (int)_rs2, cudaGetErrorString(_rs2));
+          }
+          free(probe);
+        }
+        _rc = _rc2;
       }
       CUDA_ERROR_CHECK(_rc);
     }
