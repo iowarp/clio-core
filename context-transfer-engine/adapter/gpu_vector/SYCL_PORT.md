@@ -96,14 +96,21 @@ None of these had ever been executed. Each one was silent.
 Where each workload stands. "paged" is the gpu_vector row; MPI/Kokkos are
 baselines that link nothing from clio.
 
-| workload  | paged CUDA | paged SYCL | MPI | Kokkos | validated at |
-|-----------|-----------|-----------|-----|--------|--------------|
-| kmeans    | yes | yes | yes | yes | 1 + 2 ranks |
-| grayscott | yes | yes | yes | yes | 1 + 2 ranks |
-| weights   | yes | yes | yes | yes | 1 + 2 ranks |
-| lbann     | yes | yes | yes | yes | 1 + 2 ranks |
-| gmx       | yes | yes | yes | yes | 1 + 2 + 4 ranks |
-| lammps_md | yes | yes | yes | yes | 1 + 2 nodes, BOTH backends |
+| workload  | paged CUDA | paged SYCL | MPI | Kokkos | paged: multi-node | baselines: ranks |
+|-----------|-----------|-----------|-----|--------|-------------------|------------------|
+| kmeans    | yes | yes | yes | yes | n/a -- single-node bench | 1 + 2 |
+| grayscott | yes | yes | yes | yes | n/a -- single-node bench | 1 + 2 |
+| weights   | yes | yes | yes | yes | n/a -- single-node bench | 1 + 2 |
+| lbann     | yes | yes | yes | yes | n/a -- single-node bench | 1 + 2 |
+| gmx       | yes | yes | yes | yes | n/a -- single-node bench | 1 + 2 + 4 |
+| lammps_md | yes | yes | yes | yes | **2 nodes, BOTH backends** | 1 + 2 + 4 |
+
+READ THE TWO RIGHT-HAND COLUMNS SEPARATELY. Only lammps_md's paged bench has
+`--nodes/--node`; the other five paged benches are single-node BY DESIGN, on
+CUDA as much as on SYCL, so "no distributed SYCL row" there is not a porting
+gap and nothing is missing. The rank counts in the last column belong to the
+MPI and Kokkos BASELINES, which are separate programs that link nothing from
+clio -- they say nothing about the paged rows.
 
 All six workloads now build and run on both backends. lammps_md was the last,
 and it needed a seam split of its own (md_common.h / md_kernels.h /
