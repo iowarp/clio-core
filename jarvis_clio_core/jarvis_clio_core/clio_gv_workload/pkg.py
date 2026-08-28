@@ -207,6 +207,11 @@ class ClioGvWorkload(Application):
             {'name': 'cap', 'msg': 'per-bin capacity (lammps_md/gmx paged)',
              'type': int, 'default': 0},
             # ---- harness ---------------------------------------------
+            {'name': 'lr',
+             'msg': 'lbann learning rate (0 = binary default). At 6GB-class '
+                    'H the default 0.01 diverges to NaN losses (the loss '
+                    'gate then fails on nan != nan); 0.0001 stays finite',
+             'type': float, 'default': 0.0},
             {'name': 'no_dense',
              'msg': 'gmx paged: skip the dense in-VRAM reference (needed '
                     'for 6GB-class meshes; conservation gate still runs)',
@@ -273,11 +278,12 @@ class ClioGvWorkload(Application):
                 opt('--ckpt-dir', 'ckpt_dir')
             if var == 'paged':
                 opt('--page-kb', 'page_kb')
-                # cache_mb is the cross-workload cache axis; lammps_md's
-                # native knob for the same budget is --vram-mb.
-                if c['cache_mb'] and not c['vram_mb']:
-                    a.append('--vram-mb %d' % c['cache_mb'])
-                opt('--vram-mb', 'vram_mb')
+                # --vram-mb is GONE (per-block caches no longer exist; one
+                # shared cache per vector, sized for residency). The
+                # sweepable cache knob is --slots for the x/v caches; the
+                # neighbor-list cache is residency-sized by design.
+                if c['slots']:
+                    a.append('--slots %d' % c['slots'])
         elif wl == 'gmx':
             opt('--k', 'mesh_k')
             opt('--atoms', 'atoms')
@@ -301,6 +307,8 @@ class ClioGvWorkload(Application):
             opt('--out', 'out_dim')
             opt('--batch', 'batch')
             opt('--steps', 'steps')
+            if c.get('lr'):
+                a.append('--lr %g' % c['lr'])
             if var == 'paged':
                 if c['cache_mb'] and not c['cap']:
                     a.append('--cap %d'

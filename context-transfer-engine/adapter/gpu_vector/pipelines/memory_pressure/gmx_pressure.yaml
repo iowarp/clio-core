@@ -7,6 +7,11 @@
 #   1. the page cache is swept 1-6 GB (cap = cache / 6.35 MB planes);
 #   2. blocks are swept 1 .. 67 = 80% of the 84 concurrent blocks an
 #      RTX 5080 carries at the one-block-per-SM scale of these kernels.
+# FEASIBILITY FLOOR (measured): the gather holds 4 planes per block, so
+# the cache must cover 4 x blocks planes + slack -- at 67 blocks that is
+# >= 270 planes (~1.7 GB), and the 1 GB x 67-block corner REFUSES to run
+# ("--cap 161 < 270"). The hole in the figure is that floor, not a bug:
+# the working-set minimum scales with parallelism.
 # Full CTE stack per cell (hbm-resident cache + RAM tier + file tier
 # where the bench supports it); CLIO_PREFAULT=0 for warmed memory.
 

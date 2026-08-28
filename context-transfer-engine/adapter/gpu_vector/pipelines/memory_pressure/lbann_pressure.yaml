@@ -7,6 +7,15 @@
 #   1. the page cache is swept 0.5-2.9 GB (the weights vector size);
 #   2. blocks are swept 1 .. 67 = 80% of the 84 concurrent blocks an
 #      RTX 5080 carries at the one-block-per-SM scale of these kernels.
+# page_kb=672: a page must hold WHOLE rows of both W1 (in=4096 -> 16 KB
+# rows) and W2 (rows of H floats = 672 KB exactly); 672 KB is their LCM.
+# lr=0.0001: the default 0.01 diverges to NaN losses at this H and the
+# loss gate fails on nan != nan (the weight gate still passes bit-equal:
+# paging is fine, the optimizer is not).
+# blocks top out at 64, not 67: the model-parallel split needs blocks to
+# divide H and O into whole pages (same constraint class as the MPI
+# edition's H %% nranks == 0), and 67 divides neither 4096 W1-pages nor
+# 64 W2-pages.
 # Full CTE stack per cell (hbm-resident cache + RAM tier + file tier
 # where the bench supports it); CLIO_PREFAULT=0 for warmed memory.
 
@@ -22,7 +31,8 @@ config:
       out_dim: 64
       batch: 256
       steps: 5
-      page_kb: 1024
+      lr: 0.0001
+      page_kb: 672
       prefault: "0"
       timeout_sec: 1800
       output_dir: /tmp/clio_gv/lbann_pressure
@@ -31,7 +41,7 @@ config:
 
 vars:
   wl.cache_mb: [512, 1024, 2048, 2944]
-  wl.blocks: [1, 16, 32, 67]
+  wl.blocks: [1, 16, 32, 64]
 
 loop:
   - [wl.cache_mb]
