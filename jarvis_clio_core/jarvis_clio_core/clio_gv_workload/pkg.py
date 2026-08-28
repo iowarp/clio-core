@@ -207,6 +207,27 @@ class ClioGvWorkload(Application):
             {'name': 'cap', 'msg': 'per-bin capacity (lammps_md/gmx paged)',
              'type': int, 'default': 0},
             # ---- harness ---------------------------------------------
+            # ---- normalized sweep ladders (combined pipelines) -------
+            # A COMBINED sweep needs per-workload axis values (lbann's
+            # blocks cap at 64, lammps_md sweeps slots not cache_mb), but
+            # jarvis vars are zipped or cartesian, never conditional. The
+            # ladder is zipped WITH the workload; the LEVEL is the
+            # cartesian axis; the pkg indexes ladder[level-1] and applies
+            # it. Cache ladder tokens: plain int = cache_mb, 's<N>' =
+            # slots (lammps_md's knob).
+            {'name': 'cache_ladder',
+             'msg': 'comma list of cache settings, indexed by cache_level '
+                    '(e.g. "1024,2048,4096,6144" or "s128,s256,s512,s896")',
+             'type': str, 'default': ''},
+            {'name': 'cache_level',
+             'msg': '1-based index into cache_ladder (0 = ladder unused)',
+             'type': int, 'default': 0},
+            {'name': 'blocks_ladder',
+             'msg': 'comma list of block counts, indexed by blocks_level',
+             'type': str, 'default': ''},
+            {'name': 'blocks_level',
+             'msg': '1-based index into blocks_ladder (0 = unused)',
+             'type': int, 'default': 0},
             {'name': 'lr',
              'msg': 'lbann learning rate (0 = binary default). At 6GB-class '
                     'H the default 0.01 diverges to NaN losses (the loss '
@@ -234,6 +255,27 @@ class ClioGvWorkload(Application):
         c = self.config
         return 'clio_%s_%s_bench' % (c['workload'], c['variant'])
 
+    def _apply_ladders(self):
+        """Resolve cache_level/blocks_level through their ladders into the
+        concrete cache_mb/slots/blocks settings. Idempotent, and called
+        from every entry point that reads the config (start, _tag,
+        _get_stat run on SEPARATE pkg instances)."""
+        c = self.config
+        if c.get('_ladders_applied'):
+            return
+        c['_ladders_applied'] = True
+        if c.get('cache_ladder') and c.get('cache_level'):
+            toks = [t.strip() for t in str(c['cache_ladder']).split(',')]
+            tok = toks[int(c['cache_level']) - 1]
+            if tok.startswith('s'):
+                c['slots'] = int(tok[1:])
+                c['cache_mb'] = 0
+            else:
+                c['cache_mb'] = int(tok)
+        if c.get('blocks_ladder') and c.get('blocks_level'):
+            toks = [t.strip() for t in str(c['blocks_ladder']).split(',')]
+            c['blocks'] = int(toks[int(c['blocks_level']) - 1])
+
     def _slots(self):
         """slots from the total-cache budget when one is given (total is
         what costs VRAM, so it is the swept axis; refuse a share under one
@@ -255,6 +297,7 @@ class ClioGvWorkload(Application):
         """The benchmark argv for this (workload, variant), from the recon
         of every binary's parser. Options at their 0/'' sentinel are NOT
         passed, so the binary's own defaults hold."""
+        self._apply_ladders()
         c = self.config
         wl, var = c['workload'], c['variant']
         a = []
@@ -390,6 +433,7 @@ class ClioGvWorkload(Application):
     # ------------------------------------------------------------------
 
     def _tag(self):
+        self._apply_ladders()
         c = self.config
         keys = ('workload', 'variant', 'nprocs', 'blocks', 'threads',
                 'steps', 'ckpt', 'lattice', 'mesh_k', 'atoms', 'hidden',
@@ -451,8 +495,16 @@ class ClioGvWorkload(Application):
     _GATE_FAIL = ('GATE: FAIL', 'FAIL (')
 
     def _get_stat(self, stats):
+        self._apply_ladders()
         c = self.config
         stats['binary'] = self._binary()
+        # The resolved axis values, so a combined sweep's CSV carries the
+        # concrete settings next to the abstract levels.
+        stats['blocks_resolved'] = c.get('blocks') or 0
+        if c.get('slots') and not c.get('cache_mb'):
+            stats['cache_setting'] = 'slots=%d' % c['slots']
+        elif c.get('cache_mb'):
+            stats['cache_setting'] = 'cache_mb=%d' % c['cache_mb']
         out = self._output_file()
         # VRAM peak (empirical, nvidia-smi): "<peak> <baseline>".
         try:

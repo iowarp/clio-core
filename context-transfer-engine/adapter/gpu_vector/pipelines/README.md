@@ -69,13 +69,23 @@ the CTE-free baselines.
 
 ### memory_pressure/ — cache size × parallelism at a 6 GB problem
 
-Per workload: the problem size was CALIBRATED (calibrate_6gb.py, real
-runs, nvidia-smi-sampled) so the MPI baseline peaks at ~6 GB VRAM; the
-paged edition then runs that SAME problem with the page cache swept
-1–6 GB and blocks swept from 1 up to 80% of the maximum concurrent
-blocks of an RTX 5080 (84 SMs → 67 blocks at the one-block-per-SM
-scale of these persistent-style kernels; on smaller GPUs the same
-block counts simply oversubscribe, which is part of the measurement).
+ONE combined pipeline (`memory_pressure.yaml`) covers all six
+workloads: the per-workload anchor problems ride a ZIPPED vars group,
+and because the concrete axis values differ per workload (lbann's
+blocks must divide both weight matrices' page counts → 64 not 67;
+lammps_md sweeps `--slots` since `--vram-mb` is gone), the swept axes
+are abstract LEVELS 1..4 resolved through per-workload `cache_ladder` /
+`blocks_ladder` strings by the pkg. The resolved settings land in
+results.csv as `cache_setting` / `blocks_resolved`.
+
+The anchors were CALIBRATED (calibrate_6gb.py, real runs,
+nvidia-smi-sampled) so each MPI baseline peaks at ~6 GB VRAM; the paged
+edition then runs the SAME problem with the cache ladder spanning
+1–6 GB (or the workload's residency ceiling) and blocks from 1 up to
+80% of an RTX 5080's 84 SMs (67; on smaller GPUs the same counts
+simply oversubscribe, which is part of the measurement). Known
+feasibility hole: gmx at 1 GB × 67 blocks (the gather's 4-planes-per-
+block working-set floor).
 
 ## GPU notes
 
