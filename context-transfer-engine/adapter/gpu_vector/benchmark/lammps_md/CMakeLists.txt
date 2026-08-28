@@ -291,6 +291,34 @@ if(Kokkos_FOUND)
         set_target_properties(clio_lammps_md_kokkos_bench PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         install(TARGETS clio_lammps_md_kokkos_bench RUNTIME DESTINATION bin)
+
+        # REGRESSION COVERAGE. These gates are self-checking (integer-exact
+        # counts, or a host reference), so an entry here is worth having even
+        # though the other baselines in this directory have none: without it
+        # the row is only as correct as the last time someone ran it by hand.
+        # No cleanup fixture -- a Kokkos baseline links nothing from clio and
+        # so binds no runtime port. RUN_SERIAL only because they share a GPU.
+        add_test(NAME bench_lammps_md_kokkos
+            COMMAND clio_lammps_md_kokkos_bench --md --lattice 40 --steps 100 --rebin 10 --temp 3.0 --cap 48 --blocks 529 --threads 128 --rowchunk 1 --drift-tol 5e-3
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+        set_tests_properties(bench_lammps_md_kokkos PROPERTIES
+            TIMEOUT 900 LABELS "bench;gpu;kokkos" RUN_SERIAL TRUE)
+
+        # ...and the same deck across 2 ranks. The gates that matter here are
+        # rank-count INVARIANT by construction (integer reductions), so a
+        # divergence between these two entries is a real defect rather than
+        # float noise.
+        if(MPIEXEC_EXECUTABLE)
+            add_test(NAME bench_lammps_md_kokkos_2rank
+                COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                        ${MPIEXEC_NUMPROC_FLAG} 2
+                        $<TARGET_FILE:clio_lammps_md_kokkos_bench> --md --lattice 40 --steps 100 --rebin 10 --temp 3.0 --cap 48 --blocks 529 --threads 128 --rowchunk 1 --drift-tol 5e-3
+                WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+            )
+            set_tests_properties(bench_lammps_md_kokkos_2rank PROPERTIES
+                TIMEOUT 900 LABELS "bench;gpu;kokkos;distributed" RUN_SERIAL TRUE)
+        endif()
         message(STATUS "lammps_md Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
     endif()
 endif()

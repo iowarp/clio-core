@@ -97,6 +97,15 @@ struct Net {
   DView lp;
   u64 I, H, O, B, h0, h1, o0, o1, rpp;
   u64 nshard;   // how many partials Bwd1Combine sums (nranks, or 1)
+  // THE REFERENCE MUST REASSOCIATE EXACTLY AS THE SHARDED PATH DOES.
+  // (blk0+blk1)+(blk2+blk3) is not ((blk0+blk1)+blk2)+blk3 in floats, so a
+  // reference that sums its whole o-range in one go does NOT reproduce what
+  // N ranks compute -- it drifts by ~1 ulp per step, which the exact LOSS
+  // gate then reports as a failure at 2 ranks and not at 1. So in ref_mode
+  // the reference computes one partial per RANK-RANGE of `oper` outputs and
+  // combines them in rank order, exactly like the distributed path.
+  u64 oper;     // outputs per rank-range (ref_mode only)
+  int ref_mode; // 1 = compute all nshard partials here, not just one
   float lr;
 };
 
@@ -142,22 +151,31 @@ void TrainStep(const Net &n, u64 my_shard, GatherA1 ga1, GatherD2 gd2,
   //      the paged bwd1 so the float order matches on combine ----
   {
     const u64 rpp = n.rpp;
-    const u64 base = my_shard * H * B;
-    Kokkos::parallel_for(
-        "lb_bwd1_partial", Kokkos::RangePolicy<DevSpace>(0, H * B),
-        KOKKOS_LAMBDA(const u64 t) {
-          const u64 h = t / B, b = t % B;
-          float acc = 0.0f;
-          for (u64 op = o0; op < o1; op += rpp) {
-            const u64 oend = (op + rpp < o1) ? op + rpp : o1;
-            float blk = 0.0f;
-            for (u64 o = op; o < oend; ++o) {
-              blk += w2((o - o0) * H + h) * d2(o * B + b);
+    // One partial per rank-range. The sharded path has exactly one (its own);
+    // the reference walks all of them so the float association matches.
+    const u64 nsp = n.ref_mode ? n.nshard : 1;
+    for (u64 r = 0; r < nsp; ++r) {
+      const u64 ro0 = n.ref_mode ? r * n.oper : o0;
+      const u64 ro1r = n.ref_mode ? (r + 1) * n.oper : o1;
+      const u64 ro1 = (ro1r < O) ? ro1r : O;
+      const u64 wbase = n.ref_mode ? r * n.oper * H : 0;
+      const u64 base = (n.ref_mode ? r : my_shard) * H * B;
+      Kokkos::parallel_for(
+          "lb_bwd1_partial", Kokkos::RangePolicy<DevSpace>(0, H * B),
+          KOKKOS_LAMBDA(const u64 t) {
+            const u64 h = t / B, b = t % B;
+            float acc = 0.0f;
+            for (u64 op = ro0; op < ro1; op += rpp) {
+              const u64 oend = (op + rpp < ro1) ? op + rpp : ro1;
+              float blk = 0.0f;
+              for (u64 o = op; o < oend; ++o) {
+                blk += w2(wbase + (o - ro0) * H + h) * d2(o * B + b);
+              }
+              acc += blk;
             }
-            acc += blk;
-          }
-          d1p(base + t) = acc;
-        });
+            d1p(base + t) = acc;
+          });
+    }
     Kokkos::fence();
   }
   gd1p();
@@ -331,7 +349,7 @@ int main(int argc, char **argv) {
 
     Net net{d_w1, d_b1, d_w2, d_b2, d_a1, d_d1, d_d2, d_d1p, d_x, d_y, d_lp,
             I,    H,    O,    B,    h0,   h1,   o0,   o1,    rpp,
-            static_cast<u64>(nranks), lr};
+            static_cast<u64>(nranks), oper, /*ref_mode=*/0, lr};
 
     // The four gathers. Host-staged, the same choice the CUDA baseline makes.
     auto ga1 = [&]() {
@@ -405,11 +423,13 @@ int main(int argc, char **argv) {
         Upload(r_b2, t3);
       }
       FView r_a1("ra1", H * B), r_d1("rd1", H * B), r_d2("rd2", O * B);
-      FView r_d1p("rd1p", H * B);
+      // nranks partials now, not one: the reference mirrors the sharded
+      // split so the float association matches.
+      FView r_d1p("rd1p", static_cast<u64>(nranks) * H * B);
       DView r_lp("rlp", O * B);
       Net ref{r_w1, r_b1, r_w2, r_b2, r_a1, r_d1, r_d2, r_d1p, d_x, d_y,
               r_lp, I,   H,    O,    B,    0,    H,    0,     O,   rpp,
-              1,    lr};
+              static_cast<u64>(nranks), oper, /*ref_mode=*/1, lr};
       std::vector<double> rloss(steps);
       auto noop = []() {};
       std::vector<double> rlp_host(O * B);
