@@ -1,7 +1,7 @@
 #------------------------------------------------------------------------------
 # lammps_md: the from-scratch LAMMPS-melt reimplementation, on five substrates.
 #
-#   paged    all state device-canonical on paged vectors (design: core/eternia.md)
+#   paged    all state device-canonical on paged vectors (design: adapter/gpu_vector/eternia.md)
 #   nvshmem  symmetric heap, one-sided in-kernel RMA        (links nothing from clio)
 #   mpi      two-sided, host-staged halo exchange           (links nothing from clio)
 #   nccl     halo + migrants via ncclSend/Recv on device ptrs

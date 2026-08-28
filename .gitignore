@@ -181,3 +181,7 @@ results/
 # (llvm.sh, plus llvm.sh.1/.2 from repeated downloads). Third-party tooling
 # pulled down on demand, never source -- it was committed by accident once.
 llvm.sh*
+
+# Runtime configs the gpu_vector tests/benches write into their CWD --
+# committed once by accident from repo-root runs; never sources.
+/gpu_vector_*.yaml

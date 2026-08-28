@@ -2,7 +2,7 @@
 /**
  * eternia-MD: a from-scratch reimplementation of the LAMMPS melt benchmark
  * (lj/cut, NVE, periodic box) with ALL simulation state device-canonical on
- * paged gv::Vectors. Design: core/eternia.md. LAMMPS itself is only the
+ * paged gv::Vectors. Design: ../eternia.md (adapter/gpu_vector). LAMMPS itself is only the
  * correctness oracle.
  *
  * STAGE 1 (this file today): the layout and the integrator.
