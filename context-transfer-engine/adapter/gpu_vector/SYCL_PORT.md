@@ -154,6 +154,33 @@ machine only"), so 127.0.0.1/127.0.0.2 aliases collapse to a single-node run
 rather than a two-node one. Non-loopback local addresses need root. Docker is
 the route.
 
+**Re-verified after the shared compat header changed.** Adding `__fmaf_rn`
+and turning `__ldcg`/`__ldcv` into volatile loads touched a header ALL SIX
+rows include, so all five previously-validated rows were rebuilt and re-run
+against their CUDA twins on identical flags:
+
+| row | result |
+|-----|--------|
+| grayscott | `v_checksum=12381560.488928` bit-identical |
+| lbann     | LOSS and WEIGHT gates pass on both |
+| gmx       | CONSERVATION, MESH and GATHER pass on both |
+| weights   | `checksum=OK`, `get_errors=0 put_errors=0` on both |
+| kmeans    | counters exact; checksum not reproducible -- see below |
+
+**DO NOT COMPARE kmeans BY ITS CENTROID CHECKSUM.** It is not reproducible
+run to run on a SINGLE binary: the CUDA build alone gave `30720.001988` then
+`30720.000665` on two consecutive runs, because centroid accumulation is
+atomic-ordered. Comparing that number across backends manufactures a
+"regression" that is not there. Compare `faults`/`evicts`/`get_errors`/
+`put_errors`, which are exact (131072/131072/0/0 on both). weights'
+fault/evict counts likewise track the paging schedule and drift a little
+(410/346 vs 401/338); its correctness signal is `checksum=OK` with zero
+errors.
+
+**Eviction IS exercised on SYCL** -- kmeans evicts 131072 pages and weights
+346, both with zero get/put errors. The eviction gap noted below is specific
+to the MD deck's block geometry, not a property of the port.
+
 **What it is NOT validated against, and why.** EVICTION. The ctest entry named
 `_ooc` does not exercise it: `--slots 8` is clamped up to the 28-frame pin
 floor, so both backends report `evicts=0` and "resident contract HELD". Real
