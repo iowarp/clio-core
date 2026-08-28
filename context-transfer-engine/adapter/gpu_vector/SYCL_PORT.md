@@ -103,7 +103,7 @@ baselines that link nothing from clio.
 | weights   | yes | yes | yes | yes | 1 + 2 ranks |
 | lbann     | yes | yes | yes | yes | 1 + 2 ranks |
 | gmx       | yes | yes | yes | yes | 1 + 2 + 4 ranks |
-| lammps_md | yes | yes | yes | yes | 1 + 2 + 4 ranks (MPI/Kokkos) |
+| lammps_md | yes | yes | yes | yes | 1 + 2 nodes, BOTH backends |
 
 All six workloads now build and run on both backends. lammps_md was the last,
 and it needed a seam split of its own (md_common.h / md_kernels.h /
@@ -116,6 +116,36 @@ four gates pass and every number matches digit for digit, including the paging
 counters -- `PE/atom -6.7733683`, `pairs 864000`, `W -709062`, resort PE
 `-216747.785344` at `rel=0.00e+00`, `E0=-215787.790233 En=-215787.666467
 drift=5.74e-07`, `x faults=22 evicts=0, x puts=493`.
+
+**Distributed, both backends.** The decomposed 2-node harness (one domain
+split across nodes, halo carried by the generational exchange -- not two
+independent decks) passes on CUDA and on SYCL with IDENTICAL numbers, and both
+match the harness's own documented reference:
+
+    E0 = -592121.595111  En = -592121.125973  drift 7.92e-07
+    pairs 2370816        RESORT PE -594755.829466 at rel=0.00e+00
+
+    GVMB_TAG1= GVMB_TAG2= GVMB_DECOMP1="--nodes 2 --node 0" \
+    GVMB_DECOMP2="--nodes 2 --node 1" \
+    GVMB_ARGS="--lattice 28 --steps 20 --blocks 8" \
+    BUILD_DIR=build-cuda ./run_md_bench_distributed.sh
+
+**RUNNING THE SYCL BUILD IN THAT HARNESS**, which the deps-cpu image cannot do
+on its own -- it has no DPC++ -- WITHOUT editing the compose file:
+
+    ln -sf clio_lammps_md_paged_bench_sycl \
+           build-sycl/bin/clio_lammps_md_paged_bench     # the command hardcodes the name
+    CUSZP_LIB_DIR=$HOME/opt/dpcpp/lib BUILD_DIR=build-sycl ...same as above...
+
+`/opt/cuszp-lib` is already on the container's LD_LIBRARY_PATH, so pointing
+CUSZP_LIB_DIR at the DPC++ lib dir mounts libsycl AND libur_adapter_cuda.so
+where the loader finds them. Reusing an existing mount slot beats adding one.
+
+**Why two nodes on ONE host is not an option.** The runtime deliberately drops
+a configured hostfile when the bind address is loopback ("single node, this
+machine only"), so 127.0.0.1/127.0.0.2 aliases collapse to a single-node run
+rather than a two-node one. Non-loopback local addresses need root. Docker is
+the route.
 
 **What it is NOT validated against, and why.** EVICTION. The ctest entry named
 `_ooc` does not exercise it: `--slots 8` is clamped up to the 28-frame pin
