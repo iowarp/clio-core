@@ -76,27 +76,6 @@
 // Global pointer variable definition for IPC manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
 
-/* Interruptible wait between liveness probes.
- *
- * The probe used to nap with a plain 1s sleep, which ClientFinalize's join()
- * then had to sit through: EVERY client process paid up to a full second at
- * exit, no matter how little work it did. That is invisible in a long-running
- * application and lethal in a fan-out of short ones -- the netCDF-C tool tests
- * spawn hundreds of one-file ncgen/ncdump processes, and a ~1s floor per
- * process turned a 10s test into a ctest timeout (ncdump/tst_ncgen4 and
- * friends). The condition variable lets the shutdown store wake the probe
- * immediately while keeping the idle cost at one wakeup per second.
- *
- * Deliberately file-scope rather than IpcManager members: ipc_manager.h is
- * included by every client of the runtime, and growing the class changes its
- * layout -- any .so not rebuilt in the same pass then disagrees about where
- * every following member lives, which shows up as a lock taken on the wrong
- * address and a hang that looks nothing like its cause. There is one
- * IpcManager per process (the g_ipc_manager global), so a process-wide pair is
- * exactly as precise as members would be. */
-static std::mutex g_heartbeat_mtx;
-static std::condition_variable g_heartbeat_cv;
-
 namespace clio::run {
 
 // Bind address for the local server sockets (client ROUTER, response listener,
@@ -656,16 +635,9 @@ void IpcManager::ClientFinalize() {
                               static_cast<TaskCounter *>(nullptr));
   }
 
-  // Stop heartbeat thread. The store must be published under the same mutex
-  // the probe waits on, or the notify can slip into the gap between the
-  // predicate check and the wait and be missed -- which would put the full
-  // interval back into every process's exit path.
+  // Stop heartbeat thread
   if (heartbeat_running_.load()) {
-    {
-      std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
-      heartbeat_running_.store(false);
-    }
-    g_heartbeat_cv.notify_all();
+    heartbeat_running_.store(false);
     if (heartbeat_thread_.joinable()) {
       heartbeat_thread_.join();
     }
@@ -3873,11 +3845,7 @@ void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
     server_alive_.store(alive, std::memory_order_release);
-    // ClientFinalize clears heartbeat_running_ and notifies, so the join that
-    // follows returns at once instead of waiting out the probe interval.
-    std::unique_lock<std::mutex> lk(g_heartbeat_mtx);
-    g_heartbeat_cv.wait_for(lk, std::chrono::seconds(1),
-                            [this]() { return !heartbeat_running_.load(); });
+    CTP_THREAD_MODEL->SleepForUs(1000000);
   }
 }
 
