@@ -1540,6 +1540,14 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         tag_info_ptr->last_read_ = now;
+        // FAULT HANDLER registration (checkpointing / lazy copy): remember
+        // which pool resolves this tag's missing blobs and with what params.
+        // Re-registering overwrites -- the tag has ONE handler.
+        if (!task->fault_pool_id_.IsNull()) {
+          tag_info_ptr->fault_pool_id_ = task->fault_pool_id_;
+          tag_info_ptr->fault_pool_name_ = task->fault_pool_name_;
+          tag_info_ptr->fault_params_ = task->fault_params_;
+        }
         task->tag_size_ = tag_info_ptr->total_size_;
         MirrorTagShm(tag_id, *tag_info_ptr);
         LogTelemetry(CteOp::kGetOrCreateTag, 0, 0, tag_id,
@@ -1745,6 +1753,43 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // cannot double-create it: whichever runs its synchronous prefix second
     // sees the winner's freshly-inserted blob on its own CheckBlobExists.
     clio::run::u64 old_blob_size = 0;
+    if (!blob_found && (task->context_.op_flags_ & Context::kNoFault) == 0) {
+      // FAULT HANDLER (checkpointing / lazy copy): a put into a blob this
+      // tag does not hold yet must materialise the source content FIRST, or
+      // a partial write would leave the untouched remainder of the page
+      // zero instead of carrying the copied-from bytes. A size-0 fault get
+      // asks the handler to materialise without serving data; the put then
+      // proceeds against whatever now exists. NOTE the await breaks the
+      // no-co_await double-create guarantee above, so existence is
+      // re-probed afterwards.
+      clio::run::PoolId fault_pool = clio::run::PoolId::GetNull();
+      std::string fault_params;
+      {
+        std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(tag_id);
+        if (ti != nullptr && !ti->fault_pool_id_.IsNull()) {
+          fault_pool = ti->fault_pool_id_;
+          fault_params = ti->fault_params_.str();
+        }
+      }
+      if (!fault_pool.IsNull()) {
+        Context fault_ctx = task->context_;
+        // The sub-task carries the DECODED blob name (incl. any _pi suffix),
+        // so the raw-int32 name flag must not survive into it -- a forwarded
+        // decimal name with the flag still set gets decoded a second time.
+        fault_ctx.op_flags_ &= ~Context::kBlobNameRawInt32;
+        std::snprintf(fault_ctx.fault_params_, Context::kFaultParamsSize,
+                      "%s", fault_params.c_str());
+        auto *fault_ipc = CLIO_CPU_IPC;
+        auto sub = fault_ipc->NewTask<GetBlobTask>(
+            clio::run::CreateTaskId(), fault_pool,
+            clio::run::PoolQuery::Local(), tag_id, blob_name, 0, 0, 0,
+            ctp::ipc::ShmPtr<>::GetNull(), fault_ctx);
+        auto fault_fut = fault_ipc->Send(sub);
+        CLIO_CO_AWAIT(fault_fut);
+        blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+        blob_found = (blob_info_ptr != nullptr);
+      }
+    }
     if (!blob_found) {
       blob_info_ptr = CreateNewBlob(blob_name, tag_id, blob_score);
       if (!blob_info_ptr) {
@@ -2701,6 +2746,43 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                     (unsigned)CLIO_IPC->GetNodeId());
           }
         }
+      }
+    }
+
+    // If blob doesn't exist and the TAG has a fault handler registered
+    // (checkpointing / lazy copy), dispatch the whole request to that pool:
+    // the handler materialises the blob (typically from a source tag named
+    // in the params) and serves the read. kNoFault marks the handler's own
+    // core operations so they cannot re-enter here.
+    if (blob_info_ptr == nullptr &&
+        (task->context_.op_flags_ & Context::kNoFault) == 0) {
+      clio::run::PoolId fault_pool = clio::run::PoolId::GetNull();
+      std::string fault_params;
+      {
+        std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(tag_id);
+        if (ti != nullptr && !ti->fault_pool_id_.IsNull()) {
+          fault_pool = ti->fault_pool_id_;
+          fault_params = ti->fault_params_.str();
+        }
+      }
+      if (!fault_pool.IsNull()) {
+        Context fault_ctx = task->context_;
+        // The sub-task carries the DECODED blob name (incl. any _pi suffix),
+        // so the raw-int32 name flag must not survive into it -- a forwarded
+        // decimal name with the flag still set gets decoded a second time.
+        fault_ctx.op_flags_ &= ~Context::kBlobNameRawInt32;
+        std::snprintf(fault_ctx.fault_params_, Context::kFaultParamsSize,
+                      "%s", fault_params.c_str());
+        auto *fault_ipc = CLIO_CPU_IPC;
+        auto sub = fault_ipc->NewTask<GetBlobTask>(
+            clio::run::CreateTaskId(), fault_pool,
+            clio::run::PoolQuery::Local(), tag_id, blob_name, offset, size,
+            task->flags_, task->blob_data_, fault_ctx);
+        auto fault_fut = fault_ipc->Send(sub);
+        CLIO_CO_AWAIT(fault_fut);
+        task->return_code_ = fault_fut->GetReturnCode();
+        clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+        CLIO_CO_RETURN;
       }
     }
 

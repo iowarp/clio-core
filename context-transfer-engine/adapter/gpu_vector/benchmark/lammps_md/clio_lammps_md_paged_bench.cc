@@ -4471,15 +4471,27 @@ int main(int argc, char **argv) {
       d_ckpt_stock = ctp::GpuApi::Malloc<float>(2 * g.nelems * sizeof(float));
       cudaMallocHost(&h_ckpt_stock, 2 * g.nelems * sizeof(float));
     }
+    // The persisted-and-isolated snapshot each checkpoint keeps: a LAZY
+    // vector.Copy of positions and velocities. Only the newest pair is held
+    // (a real run would name them per step and keep them all -- the tags are
+    // cheap, it is the device views that are not, so the handles are
+    // host-only).
+    std::unique_ptr<gv::Vector<float>> ck_x, ck_v;
     auto checkpoint = [&]() {
       // NO SEPARATE CHECKPOINT PASS EXISTS ANY MORE, and that is the result,
       // not a measurement bug. Every kernel publishes each page as it writes
       // it -- it has to, because the other blocks read those pages -- so the
       // live state is already in the tier stack at every step boundary. The
-      // paged checkpoint cost is therefore folded into the step, and what is
-      // timed here is only the barrier that proves it landed.
+      // barrier proves it landed; vector.Copy then pins THIS step's bytes
+      // under a snapshot tag the next steps cannot overwrite. The copy is
+      // lazy (fault-materialised), so its cost here is two tag registrations,
+      // and the bytes are only duplicated for pages a later step dirties or
+      // a restore reads.
       const double _t = NowMs();
       ctp::GpuApi::Synchronize();
+      gv::Vector<float> *cvv = (cvx == &vx) ? &vv : &vv2;
+      ck_x = cvx->Copy("md_ckpt_x_" + std::to_string(n_ckpt));
+      ck_v = cvv->Copy("md_ckpt_v_" + std::to_string(n_ckpt));
       t_ckpt += NowMs() - _t;
       const double _t2 = NowMs();
       ctp::GpuApi::Memcpy(h_ckpt_stock, d_ckpt_stock, 2 * g.nelems);
@@ -4658,17 +4670,18 @@ int main(int argc, char **argv) {
                 static_cast<double>(g.natoms) * a.steps / run_ms / 1000.0);
     if (n_ckpt != 0) {
       // A checkpoint is only worth anything if it can be read back, so the
-      // last one is verified against the live device state.
+      // LAST SNAPSHOT TAG is read -- through the checkpoint fault handler,
+      // exactly the path a restore would take -- not the live vector.
       std::vector<float> ck(g.nelems);
-      const u64 got = cvx->Download(ck.data(), g.nelems);
+      const u64 got = ck_x->Download(ck.data(), g.nelems);
       u64 bad = 0;
       for (u64 e = 0; e < g.nelems; e += kStride) {
         if (ck[e + 3] >= 0.0f && !(ck[e] == ck[e])) ++bad;   // NaN check
       }
-      std::printf("  checkpoints: %llu | eternia flush %.2f ms each "
-                  "(page-granular into the tier stack) | host staging a "
-                  "non-paged code would pay first: %.2f ms each | readback "
-                  "%llu/%llu pages, %llu bad\n",
+      std::printf("  checkpoints: %llu | flush + vector.Copy %.2f ms each "
+                  "(page-granular publish + lazy snapshot tag) | host "
+                  "staging a non-paged code would pay first: %.2f ms each | "
+                  "snapshot readback %llu/%llu pages, %llu bad\n",
                   (unsigned long long)n_ckpt, t_ckpt / n_ckpt,
                   t_ckpt_stock / n_ckpt, (unsigned long long)got,
                   (unsigned long long)npages, (unsigned long long)bad);

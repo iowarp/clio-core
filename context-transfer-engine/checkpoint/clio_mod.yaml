@@ -1,0 +1,15 @@
+# Checkpoint ChiMod -- the FAULT HANDLER behind vector.Copy's lazy copies.
+# A tag created with this pool registered as its fault handler resolves any
+# missing blob by materialising it from a SOURCE tag (named in the fault
+# params) before the faulting Get/Put proceeds. Speaks the core's task
+# interface: the core dispatches its own GetBlobTask here on a fault.
+module_name: checkpoint
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core data verb (MUST equal the core's id)
+kGetBlob: 16

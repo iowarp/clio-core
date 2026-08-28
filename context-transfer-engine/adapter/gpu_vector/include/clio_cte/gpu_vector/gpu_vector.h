@@ -15,11 +15,16 @@
 #include <clio_runtime/types.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
+#if !CTP_IS_DEVICE_PASS
+// Vector::Copy (host-only) creates the checkpoint fault-handler pool.
+#include <clio_cte/checkpoint/checkpoint_client.h>
+#endif
 #include <clio_cte/gpu_vector/device_vector.h>
 #include <clio_cte/gpu_vector/page.h>
 
 #include <cstring>
 #include <map>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -174,7 +179,9 @@ class Vector {
         capacity_pages_(capacity_pages != 0
                             ? capacity_pages
                             : (nsets != 0 ? nsets : nblocks) * set_size),
-        num_elems_(num_elems) {
+        num_elems_(num_elems),
+        tag_name_(tag_name),
+        gpu_ids_(gpu_ids) {
     if (page_bytes_ == 0 || nblocks_ == 0 || set_size_ == 0 || nsets_ == 0) {
       throw std::runtime_error("gpu_vector: zero page size / blocks / sets");
     }
@@ -208,6 +215,101 @@ class Vector {
       throw std::runtime_error("gpu_vector: no device view for this GPU");
     }
     return it->second.view;
+  }
+
+  /**
+   * Lazily-initialised copy of this vector: the checkpoint primitive.
+   *
+   * First publishes every GPU's resident state to the CTE (the copy must
+   * snapshot what the vector holds NOW, not what happened to be flushed),
+   * then creates tag `new_name` with the checkpoint chimod registered as
+   * its fault handler and THIS vector's tag as the source. No page bytes
+   * are duplicated here -- a page of the copy materialises from the source
+   * the first time anything touches it (get OR put), so the checkpoint
+   * costs I/O only for pages that are later read back or overwritten.
+   *
+   * The returned handle is CTE-ONLY: it builds NO device views (those cost
+   * a full page-cache allocation in VRAM). Host Download/Preload work; a
+   * kernel that must read the snapshot binds its own Vector to `new_name`.
+   */
+  std::unique_ptr<Vector<T>> Copy(const std::string &new_name) {
+    using clio::cte::core::Context;
+    if (tag_name_.size() >= Context::kFaultParamsSize) {
+      // The registration would be silently truncated at fault time and the
+      // handler would resolve a DIFFERENT source tag.
+      throw std::runtime_error("gpu_vector: source tag name too long for "
+                               "fault params: " + tag_name_);
+    }
+    // The snapshot is of the vector's CURRENT bytes, so anything resident
+    // only in GPU caches goes to the CTE first.
+    FlushResidentToCte();
+    // The chimod pool that services the faults (idempotent create).
+    {
+      clio::cte::checkpoint::Client ckpt(
+          clio::cte::checkpoint::kCheckpointPoolId, storage_pool_id_);
+      clio::cte::checkpoint::CheckpointConfig params;
+      params.next_pool_id_ = storage_pool_id_;
+      auto cf = ckpt.AsyncCreateCheckpoint(
+          clio::run::PoolQuery::Local(),
+          clio::cte::checkpoint::kCheckpointPoolName,
+          clio::cte::checkpoint::kCheckpointPoolId, params);
+      cf.Wait();
+      if (cf->GetReturnCode() != 0) {
+        throw std::runtime_error("gpu_vector: checkpoint pool create failed");
+      }
+    }
+    // Register the fault handler on the copy's tag BEFORE the Vector ctor
+    // resolves it. GetOrCreateTag without fault arguments leaves an existing
+    // registration alone, so the ctor's own lookup cannot clobber this.
+    {
+      clio::cte::core::Client core(storage_pool_id_);
+      auto tf = core.AsyncGetOrCreateTag(
+          new_name, clio::cte::checkpoint::kCheckpointPoolId,
+          clio::cte::checkpoint::kCheckpointPoolName, tag_name_);
+      tf.Wait();
+      if (tf->GetReturnCode() != 0) {
+        throw std::runtime_error("gpu_vector: could not create copy tag " +
+                                 new_name);
+      }
+    }
+    return std::unique_ptr<Vector<T>>(new Vector<T>(
+        new_name, std::vector<int>{}, page_bytes_, nblocks_, set_size_,
+        num_elems_, storage_pool_id_, compress_lib_, compress_preset_,
+        nsets_, capacity_pages_));
+  }
+
+  /**
+   * HOST-SIDE writeback of every resident frame's valid elements, on every
+   * GPU this vector has views for. There is no dirty bit (write-site publish
+   * is the kernel-side contract), so this publishes ALL resident valid
+   * ranges: for pages the kernels already flushed the put is byte-identical,
+   * and for anything they had not yet published this is what makes the CTE
+   * current. No-op with no device views or an empty cache.
+   */
+  void FlushResidentToCte() {
+#if CTP_ENABLE_CUDA
+    clio::cte::core::Client core(storage_pool_id_);
+    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    for (auto &kv : devs_) {
+      const std::vector<Page> tbl = ReadTable(kv.first);
+      for (const Page &p : tbl) {
+        if (p.page_num == kNoPage || p.data == nullptr) continue;
+        if (p.valid_hi <= p.valid_lo) continue;
+        const clio::run::u64 lo_b =
+            static_cast<clio::run::u64>(p.valid_lo) * sizeof(T);
+        const clio::run::u64 hi_b =
+            static_cast<clio::run::u64>(p.valid_hi) * sizeof(T);
+        ctp::GpuApi::Memcpy(buf.data(),
+                            static_cast<const char *>(p.data) + lo_b,
+                            static_cast<size_t>(hi_b - lo_b));
+        auto f = core.AsyncPutBlob(tag_id_, PageName(p.page_num), lo_b,
+                                   hi_b - lo_b, buf.data(), 0.5f,
+                                   PageContext(), 0u,
+                                   clio::run::PoolQuery::Dynamic());
+        f.Wait();
+      }
+    }
+#endif
   }
 
   clio::cte::core::TagId TagId() const { return tag_id_; }
@@ -818,6 +920,8 @@ class Vector {
   clio::run::u32 capacity_pages_ = 0;  // page-sized regions in the allocator
   clio::run::u64 num_elems_ = 0;
   clio::cte::core::TagId tag_id_;
+  std::string tag_name_;
+  std::vector<int> gpu_ids_;
   std::map<int, DevState> devs_;
 };
 

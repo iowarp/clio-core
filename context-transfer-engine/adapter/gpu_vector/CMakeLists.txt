@@ -10,8 +10,10 @@ target_include_directories(clio_cte_gpu_vector INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
+# Vector::Copy creates the checkpoint fault-handler pool.
 target_link_libraries(clio_cte_gpu_vector INTERFACE
     clio_cte_core_client
+    clio_cte_checkpoint_client
 )
 
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/

@@ -1117,6 +1117,41 @@ set_tests_properties(
 endif()  # TARGET clio_cte_cache_client
 
 #------------------------------------------------------------------------------
+# Checkpoint chimod (vector.Copy lazy copies): a fault-handled tag resolves
+# missing blobs from its source tag -- get fault, put-side materialise-then-
+# merge, copy/source independence, and the source-absent fallback.
+if(TARGET clio_cte_checkpoint_client)
+add_executable(test_checkpoint_fault test_checkpoint_fault.cc)
+target_include_directories(test_checkpoint_fault PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/checkpoint/include
+)
+target_link_libraries(test_checkpoint_fault
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_checkpoint_runtime
+    clio_cte_checkpoint_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_checkpoint_fault
+    COMMAND test_checkpoint_fault)
+
+set_tests_properties(
+    cte_checkpoint_fault
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;checkpoint;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_checkpoint_client
+
+#------------------------------------------------------------------------------
 # Indexer chimod behavioral coverage (issue #905): scope, async drain +
 # search barrier, maintenance verbs, kReindexScan, first-insertion backfill.
 #------------------------------------------------------------------------------

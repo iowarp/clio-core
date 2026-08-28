@@ -570,6 +570,27 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * GetOrCreateTag WITH a fault handler (checkpointing / lazy copy): blobs
+   * this tag does not hold are resolved by `fault_pool_id` (e.g. the
+   * checkpoint chimod), which receives `fault_params` -- for checkpoint,
+   * the SOURCE tag name -- in Context::fault_params_ on every fault.
+   */
+  clio::run::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
+      const std::string &tag_name, const clio::run::PoolId &fault_pool_id,
+      const std::string &fault_pool_name, const std::string &fault_params,
+      const TagId &tag_id = TagId::GetNull(),
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagTask<CreateParams>>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
+    task->fault_pool_id_ = fault_pool_id;
+    task->fault_pool_name_ = fault_pool_name.c_str();
+    task->fault_params_ = fault_params.c_str();
+    return CLIO_RUN_INLINE(task);
+  }
+
+  /**
    * Asynchronous put blob with optional compression context - returns immediately
    * @param tag_id Tag ID
    * @param blob_name Name of the blob

@@ -759,6 +759,16 @@ struct TagInfo {
   // the canonical tag is deleted, all of these bindings are removed too.
   clio::run::priv::vector<clio::run::priv::string> aliases_;
 
+  // FAULT HANDLER (checkpointing / lazy copy). When set, a Get or Put that
+  // finds NO blob under this tag is first dispatched as a GetBlob to
+  // fault_pool_id_ with fault_params_ in the context; the handler (e.g.
+  // the checkpoint chimod) materialises the blob -- typically from a source
+  // tag named in the params -- before the operation proceeds. Null pool id
+  // means no handler; empty blobs then behave exactly as before.
+  clio::run::PoolId fault_pool_id_;
+  clio::run::priv::string fault_pool_name_;
+  clio::run::priv::string fault_params_;
+
   CTP_CROSS_FUN TagInfo()
       : tag_name_(CLIO_PRIV_ALLOC),
         tag_id_(TagId::GetNull()),
@@ -766,7 +776,10 @@ struct TagInfo {
         last_modified_(0),
         last_read_(0),
         last_changed_(0),
-        aliases_(CLIO_PRIV_ALLOC) {}
+        aliases_(CLIO_PRIV_ALLOC),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
 
   CTP_CROSS_FUN TagInfo(const clio::run::priv::string &tag_name, const TagId &tag_id)
       : tag_name_(tag_name),
@@ -775,7 +788,10 @@ struct TagInfo {
         last_modified_(0),
         last_read_(0),
         last_changed_(0),
-        aliases_(CLIO_PRIV_ALLOC) {}
+        aliases_(CLIO_PRIV_ALLOC),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
 
 #if CTP_IS_HOST
   TagInfo(const std::string &tag_name, const TagId &tag_id)
@@ -785,7 +801,10 @@ struct TagInfo {
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
         last_changed_(GetCurrentTimeNs()),
-        aliases_(CLIO_PRIV_ALLOC) {}
+        aliases_(CLIO_PRIV_ALLOC),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
 #endif
 
   CTP_CROSS_FUN TagInfo(const TagInfo &other)
@@ -795,7 +814,10 @@ struct TagInfo {
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
         last_changed_(other.last_changed_),
-        aliases_(other.aliases_) {}
+        aliases_(other.aliases_),
+        fault_pool_id_(other.fault_pool_id_),
+        fault_pool_name_(other.fault_pool_name_),
+        fault_params_(other.fault_params_) {}
 
   CTP_CROSS_FUN TagInfo &operator=(const TagInfo &other) {
     if (this != &other) {
@@ -806,6 +828,9 @@ struct TagInfo {
       last_read_ = other.last_read_;
       last_changed_ = other.last_changed_;
       aliases_ = other.aliases_;
+      fault_pool_id_ = other.fault_pool_id_;
+      fault_pool_name_ = other.fault_pool_name_;
+      fault_params_ = other.fault_params_;
     }
     return *this;
   }
@@ -1717,6 +1742,24 @@ struct Context {
   clio::run::u32 op_flags_;
   static constexpr clio::run::u32 kBlobNameRawInt32 = 1u << 0;
   static constexpr clio::run::u32 kGenerational = 1u << 1;
+  /** kNoFault -- suppress tag fault-handler dispatch for THIS operation.
+   *  Set by a fault handler on every core op it issues while resolving a
+   *  fault, or the handler's own materialising get/put would re-fault and
+   *  recurse forever. */
+  static constexpr clio::run::u32 kNoFault = 1u << 2;
+
+  /**
+   * Fault-handler parameters (checkpointing / lazy copy). When the core
+   * faults a missing blob to a tag's registered fault pool, it copies the
+   * tag's stored fault_params_ here so the handler learns its resolution
+   * context (for the checkpoint chimod: the SOURCE tag name) without a
+   * second metadata round trip. A fixed POD array, not a string: Context
+   * must keep ONE layout, and its serialize() is an address-range copy, so
+   * a field placed between the first and last ranged members rides the
+   * existing wire format automatically.
+   */
+  static constexpr clio::run::u32 kFaultParamsSize = 64;
+  char fault_params_[kFaultParamsSize];
 
   /**
    * GENERATIONAL PUT/GET (readiness, not recency).
@@ -1776,6 +1819,7 @@ struct Context {
         version_(0),
         create_on_get_(false),
         op_flags_(0),
+        fault_params_{},
         generation_(0),
         dynamic_compress_(0),
         compress_lib_(0),
@@ -1979,6 +2023,14 @@ template <typename CreateParamsT = CreateParams>
 struct GetOrCreateTagTask : public clio::run::Task {
   IN clio::run::priv::string tag_name_;  // Tag name (required)
   INOUT TagId tag_id_;  // Tag unique ID (default null, output on creation)
+  // Optional FAULT HANDLER registration (checkpointing / lazy copy): a pool
+  // that resolves gets/puts of blobs this tag does not hold yet, plus the
+  // opaque params handed to it in Context::fault_params_. The name is kept
+  // for listing/debugging; the id is what dispatch uses (the caller knows
+  // it -- fault pools are well-known chimods it created).
+  IN clio::run::PoolId fault_pool_id_;
+  IN clio::run::priv::string fault_pool_name_;
+  IN clio::run::priv::string fault_params_;
   // Fused metadata (one round trip instead of three for callers like the
   // clio-fs Open, which needed existence + id + size):
   OUT clio::run::u32 created_;    // 1 = this call created the tag
@@ -1987,6 +2039,8 @@ struct GetOrCreateTagTask : public clio::run::Task {
   // SHM constructor
   CTP_CROSS_FUN GetOrCreateTagTask()
       : clio::run::Task(), tag_name_(CLIO_PRIV_ALLOC), tag_id_(TagId::GetNull()),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC), fault_params_(CLIO_PRIV_ALLOC),
         created_(0), tag_size_(0) {}
 
   // Emplace constructor
@@ -1996,7 +2050,10 @@ struct GetOrCreateTagTask : public clio::run::Task {
       const TagId &tag_id = TagId::GetNull())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetOrCreateTag),
         tag_name_(CLIO_PRIV_ALLOC, tag_name),
-        tag_id_(tag_id), created_(0), tag_size_(0) {
+        tag_id_(tag_id),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC), fault_params_(CLIO_PRIV_ALLOC),
+        created_(0), tag_size_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetOrCreateTag;
@@ -2010,7 +2067,7 @@ struct GetOrCreateTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_name_, tag_id_);
+    ar(tag_name_, tag_id_, fault_pool_id_, fault_pool_name_, fault_params_);
   }
 
   /**
@@ -2030,6 +2087,9 @@ struct GetOrCreateTagTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_name_ = other->tag_name_;
     tag_id_ = other->tag_id_;
+    fault_pool_id_ = other->fault_pool_id_;
+    fault_pool_name_ = other->fault_pool_name_;
+    fault_params_ = other->fault_params_;
     created_ = other->created_;
     tag_size_ = other->tag_size_;
   }
