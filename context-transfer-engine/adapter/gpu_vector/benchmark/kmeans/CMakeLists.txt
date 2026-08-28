@@ -236,6 +236,37 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
 endif()
 
 #------------------------------------------------------------------------------
+# kmeans, Kokkos edition: the performance-portability baseline.
+#
+# ONE SOURCE, WHICHEVER BACKEND KOKKOS WAS BUILT FOR. Point CMake at a Kokkos
+# install with -DKokkos_ROOT=/path (CUDA-backend or SYCL-backend); the source
+# is identical either way, which is the claim being measured.
+#
+# Built as a normal target rather than a custom nvcc command like its CUDA
+# siblings, because Kokkos ships its own CMake package and choosing the
+# compiler is Kokkos's job -- but it still links NOTHING from clio.
+#------------------------------------------------------------------------------
+find_package(Kokkos QUIET)
+if(Kokkos_FOUND)
+    find_package(MPI QUIET COMPONENTS CXX)
+    if(MPI_CXX_FOUND)
+        add_executable(clio_kmeans_kokkos_bench
+            kokkos/clio_kmeans_kokkos_bench.cc)
+        target_link_libraries(clio_kmeans_kokkos_bench PRIVATE
+            Kokkos::kokkos MPI::MPI_CXX)
+        set_target_properties(clio_kmeans_kokkos_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        install(TARGETS clio_kmeans_kokkos_bench RUNTIME DESTINATION bin)
+        message(STATUS "kmeans Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
+    else()
+        message(STATUS "MPI not found; skipping clio_kmeans_kokkos_bench")
+    endif()
+else()
+    message(STATUS "Kokkos not found; skipping clio_kmeans_kokkos_bench "
+                   "(set -DKokkos_ROOT=<install>)")
+endif()
+
+#------------------------------------------------------------------------------
 # kmeans, BaM edition: compiles BaM's sources itself with nvcc (clang rejects
 # --expt-relaxed-constexpr, see the lammps_md sibling).
 #------------------------------------------------------------------------------
