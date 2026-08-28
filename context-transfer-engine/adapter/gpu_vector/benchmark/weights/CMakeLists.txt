@@ -8,6 +8,7 @@ if(CLIO_CORE_ENABLE_CUDA)
   if(TARGET clio_cte_compressor_runtime)
     add_cuda_executable(clio_weights_paged_bench FALSE
         clio_weights_paged_bench.cc
+        cuda/weights_launch_cuda.cc
         INCLUDE_DIRS
             ${CMAKE_SOURCE_DIR}/context-runtime/include
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
@@ -28,6 +29,8 @@ if(CLIO_CORE_ENABLE_CUDA)
             ctp::cuda_cxx
             ${CMAKE_THREAD_LIBS_INIT}
     )
+    target_compile_definitions(clio_weights_paged_bench PRIVATE
+        CLIO_CTE_HAVE_COMPRESSOR=1)
     set_target_properties(clio_weights_paged_bench PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
@@ -184,4 +187,49 @@ if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.c
         install(PROGRAMS ${_out} DESTINATION bin)
         message(STATUS "weights BaM baseline: ON")
     endif()
+endif()
+
+
+#------------------------------------------------------------------------------
+# weights over a paged model -- SYCL.
+#
+# Same host driver source as the CUDA target, compiled once as ordinary C++.
+# Only sycl/weights_launch_sycl.cc is built with -fsycl; the workload
+# (weights_kernels.h over weights_math.h) is one copy shared by both. SHARED
+# library for the launches -- device code in a static archive does not reach
+# the executable's device image. SPIR-V is refused: DPC++ cannot compile a
+# coroutine for it.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
+    set(_wt_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(weights_sycl_launch SHARED sycl/weights_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(weights_sycl_launch)
+    set_target_properties(weights_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(weights_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_wt_inc})
+    target_link_libraries(weights_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_weights_paged_bench_sycl clio_weights_paged_bench.cc)
+    target_link_options(clio_weights_paged_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_weights_paged_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_wt_inc})
+    target_link_libraries(clio_weights_paged_bench_sycl PRIVATE
+        weights_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_weights_paged_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_weights_paged_bench_sycl RUNTIME DESTINATION bin)
+    message(STATUS "weights paged bench (SYCL): ON")
 endif()
