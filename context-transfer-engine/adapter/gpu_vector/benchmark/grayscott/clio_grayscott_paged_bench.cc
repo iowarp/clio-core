@@ -91,324 +91,27 @@ static constexpr u32 kYieldLaneBytes = 4096;
 static constexpr u32 kYieldLaneBytes = 256;
 #endif
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
-#define GV_GS_CORO 1
-#endif
 
-/** Initial condition: v seeded in a centred cube, u elsewhere. Deterministic,
- *  so every configuration starts from the identical field. */
-CTP_INLINE_CROSS_FUN float InitU(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
-  const bool in = (x > nx / 3 && x < 2 * nx / 3 && y > ny / 3 &&
-                   y < 2 * ny / 3 && z > nz / 3 && z < 2 * nz / 3);
-  return in ? 0.5f : 1.0f;
-}
-CTP_INLINE_CROSS_FUN float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
-  const bool in = (x > nx / 3 && x < 2 * nx / 3 && y > ny / 3 &&
-                   y < 2 * ny / 3 && z > nz / 3 && z < 2 * nz / 3);
-  return in ? 0.25f : 0.0f;
-}
-
-#if defined(GV_GS_CORO)
-/**
- * Wait for this block's outstanding writebacks by PARKING, not spinning.
+/*
+ * THE DEVICE CODE IS NOT HERE ANY MORE.
  *
- * REQUIRED FOR CORRECTNESS ACROSS STEPS, not just for timing. Page caches are
- * PER BLOCK: block A writes plane z into its own cache and FlushAsync only
- * *issues* the put. On the next step those regions swap, and block B -- which
- * owns a neighbouring z-slab -- faults on plane z, misses its own cache, and
- * fetches from the tier. If A's put has not landed, B reads a STALE plane.
- * Nothing crashes; the field is quietly wrong.
+ * The workload -- the initial condition, the reaction term, the three
+ * coroutines and the staged-plane baseline -- lives in grayscott_kernels.h
+ * (over grayscott_math.h), in ONE copy compiled by both backends. The
+ * launches live in cuda/ and sycl/ and differ only in how a grid is
+ * submitted. This file is the host driver and is now ordinary C++.
  *
- * Measured before this wait existed: the same grid gave field checksums
- * differing by 7.7e-03 between 16 and 64 blocks, where a double-precision
- * reduction reassociates at ~1e-12. The block count changed which planes
- * crossed a cache boundary, so it changed the answer.
+ * See grayscott_launch.h for why the seam is at the launch.
  */
-/**
- * BASELINE KERNEL -- the out-of-core model WITHOUT in-kernel faulting.
- *
- * Same stencil as StepKernel, but every plane arrives as a plain device
- * pointer the HOST staged there. The kernel computes one z and exits; the
- * host does all I/O around it, synchronously, in both directions:
- *
- *   read  : blocking CTE GetBlob per input plane
- *   write : blocking CTE PutBlob per output plane  <-- writes are synchronous
- *           too, not just reads. The paged path submits its writebacks with
- *           FlushAsync and keeps going; the baseline cannot, so the put lands
- *           on the critical path of every z-iteration.
- *   copy  : blocking cudaMemcpy each way
- *   kernel: torn down and relaunched for every single z
- *
- * Nothing overlaps. This is the cost the vector's in-kernel faulting and
- * async writeback are there to remove, and it is the only one of the four
- * baselines that exercises the WRITE path at all -- weights and k-means are
- * read-only in their timed regions, so for them there is nothing to make
- * synchronous.
- */
-__global__ void GrayscottBaselineKernel(const float *uzm, const float *uz,
-                                        const float *uzp, const float *vzm,
-                                        const float *vz, const float *vzp,
-                                        float *unx, float *vnx, u64 plane,
-                                        u64 nx, u64 ny, int interior, float Du,
-                                        float Dv, float F, float K, float dt) {
-  for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-    const u64 x = i % nx, y = i / nx;
-    const float u = uz[i];
-    const float v = vz[i];
-    float lu, lv;
-    if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
-      lu = 0.0f; lv = 0.0f;      // fixed boundary, as in StepKernel
-    } else {
-      lu = uz[i - 1] + uz[i + 1] + uz[i - nx] + uz[i + nx] + uzm[i] + uzp[i] -
-           6.0f * u;
-      lv = vz[i - 1] + vz[i + 1] + vz[i - nx] + vz[i + nx] + vzm[i] + vzp[i] -
-           6.0f * v;
-    }
-    const float uvv = u * v * v;
-    unx[i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
-    vnx[i] = v + dt * (Dv * lv + uvv - (F + K) * v);
-  }
-}
+#include "grayscott_kernels.h"
+#include "grayscott_launch.h"
 
-/** Seed u and v for this block's z-range, one plane (= one page) at a time. */
-__device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
-                                  u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
-                                  u64 ubase, u64 vbase) {
-  for (u64 z = z0; z < z1; ++z) {
-    {
-      co_await vec.Fetch(0, ubase + z * plane, plane);
-      auto h = co_await vec.HoldPage(ubase + z * plane, plane, /*write=*/true);
-      for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-        h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
-      }
-      // Collective: name the plane just written.
-      co_await vec.BeginFlush(0, ubase + z * plane, plane);
-      // Fetch is the pinner; UnpinRange is the releaser, after the flush.
-      vec.UnpinRange(ubase + z * plane, plane);
-    }
-    {
-      co_await vec.Fetch(0, vbase + z * plane, plane);
-      auto h = co_await vec.HoldPage(vbase + z * plane, plane, /*write=*/true);
-      for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-        h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
-      }
-      // Collective: name the plane just written.
-      co_await vec.BeginFlush(0, vbase + z * plane, plane);
-      vec.UnpinRange(vbase + z * plane, plane);
-    }
-  }
-  // The first step reads planes seeded by OTHER blocks, so the seed must be
-  // durable before this kernel returns.
-  co_await vec.EndFlush();
-}
+namespace gs = clio::gv_bench::grayscott;
 
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<float> vec, u64 plane, u64 nx,
-                           u64 ny, u64 nz, u64 zper, u64 ubase, u64 vbase,
-                           gy::YieldableView<> yv, gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  vec.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < nz) ? (z0 + zper) : nz;
-  CLIO_YCORO_RUN(SeedCoro(vec, plane, nx, ny, nz, z0, z1, ubase, vbase));
-}
-
-/**
- * One Gray-Scott step over this block's z-range.
- *
- * Holds z-1, z and z+1 for BOTH fields, then the output plane. The holds are
- * issued back to back so all of them are resident together -- which is why
- * slots >= 4 is enforced on the host. Boundary planes (z=0, z=nz-1) are copied
- * through rather than computed, the usual fixed-boundary treatment.
- */
-__device__ gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
-                                  u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
-                                  u64 ubase, u64 vbase, u64 unext, u64 vnext,
-                                  float Du, float Dv, float F, float K,
-                                  float dt) {
-  // One guard per concurrently-needed plane; declared OUTSIDE the loop and
-  // move-assigned each iteration, so the assignment releases the previous
-  // plane's pin instead of leaking it.
-  gv::Held<float> uzm, uz, uzp;
-  gv::Held<float> vzm, vz, vzp;
-  gv::Held<float> unx, vnx;
-  for (u64 z = z0; z < z1; ++z) {
-    const bool interior = (z > 0 && z + 1 < nz);
-    const u64 zm = interior ? (z - 1) : z;
-    const u64 zp = interior ? (z + 1) : z;
-
-    co_await vec.Fetch(0, ubase + zm * plane, plane);
-    // Three input planes of u, then three of v, then the two outputs -- ONE
-    // GUARD PER PLANE, because a guard indexes only its own held page.
-    // THE HOLD IS THE PIN: each guard's plane stays resident until the
-    // guard is re-assigned past it, so the sliding window (z and z+1 are
-    // re-held next iteration) is expressed by the pins themselves and needs
-    // no score hints.
-    uzm = co_await vec.HoldPage(ubase + zm * plane, plane);
-    co_await vec.Fetch(0, ubase + z * plane, plane);
-    uz = co_await vec.HoldPage(ubase + z * plane, plane);
-    co_await vec.Fetch(0, ubase + zp * plane, plane);
-    uzp = co_await vec.HoldPage(ubase + zp * plane, plane);
-    co_await vec.Fetch(0, vbase + zm * plane, plane);
-    vzm = co_await vec.HoldPage(vbase + zm * plane, plane);
-    co_await vec.Fetch(0, vbase + z * plane, plane);
-    vz = co_await vec.HoldPage(vbase + z * plane, plane);
-    co_await vec.Fetch(0, vbase + zp * plane, plane);
-    vzp = co_await vec.HoldPage(vbase + zp * plane, plane);
-    co_await vec.Fetch(0, unext + z * plane, plane);
-    unx = co_await vec.HoldPage(unext + z * plane, plane, /*write=*/true);
-    co_await vec.Fetch(0, vnext + z * plane, plane);
-    vnx = co_await vec.HoldPage(vnext + z * plane, plane, /*write=*/true);
-
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      const u64 x = i % nx, y = i / nx;
-      const float u = uz[ubase + z * plane + i];
-      const float v = vz[vbase + z * plane + i];
-      float lu, lv;
-      if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
-        lu = 0.0f; lv = 0.0f;      // fixed boundary
-      } else {
-        lu = uz[ubase + z * plane + i - 1] +
-             uz[ubase + z * plane + i + 1] +
-             uz[ubase + z * plane + i - nx] +
-             uz[ubase + z * plane + i + nx] +
-             uzm[ubase + zm * plane + i] +
-             uzp[ubase + zp * plane + i] - 6.0f * u;
-        lv = vz[vbase + z * plane + i - 1] +
-             vz[vbase + z * plane + i + 1] +
-             vz[vbase + z * plane + i - nx] +
-             vz[vbase + z * plane + i + nx] +
-             vzm[vbase + zm * plane + i] +
-             vzp[vbase + zp * plane + i] - 6.0f * v;
-      }
-      const float uvv = u * v * v;
-      unx[unext + z * plane + i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
-      vnx[vnext + z * plane + i] = v + dt * (Dv * lv + uvv - (F + K) * v);
-    }
-    __syncthreads();
-    // Flush the write-once outputs; the drop below is best-effort (a page
-    // still flushing or pinned is refused and reclaimed by ordinary eviction
-    // once it settles).
-    co_await vec.BeginFlush(0, unext + z * plane, plane);
-    co_await vec.BeginFlush(0, vnext + z * plane, plane);
-    // ONE UNPIN PER FETCH, all eight planes of this step. The sliding window
-    // is expressed by re-fetching z and z+1 next iteration, not by holding
-    // their pins across it: a pin held across the step would accumulate one
-    // per plane per z and fill the set.
-    vec.UnpinRange(ubase + zm * plane, plane);
-    vec.UnpinRange(ubase + z * plane, plane);
-    vec.UnpinRange(ubase + zp * plane, plane);
-    vec.UnpinRange(vbase + zm * plane, plane);
-    vec.UnpinRange(vbase + z * plane, plane);
-    vec.UnpinRange(vbase + zp * plane, plane);
-    vec.UnpinRange(unext + z * plane, plane);
-    vec.UnpinRange(vnext + z * plane, plane);
-    if (interior) {
-      // Plane z-1 leaves the sliding window for good: empty the guard so the
-      // drop can take it. (zm == z when not interior, so releasing it there
-      // would release the plane the next iteration still needs.)
-      uzm = {};
-      vzm = {};
-      const u64 d0 = vec.PageOf(ubase + zm * plane);
-      const u64 d1 = vec.PageOf(vbase + zm * plane);
-      const u64 d2 = vec.PageOf(unext + z * plane);
-      const u64 d3 = vec.PageOf(vnext + z * plane);
-      const u64 drops[4] = {d0, d1, d2, d3};
-    }
-  }
-  // Drain before returning: the next step swaps the regions and other blocks
-  // will fault on the planes written here. Waiting once per block per step,
-  // rather than once per plane, keeps the puts pipelined while still making
-  // them durable at the step boundary. Every guard empties first so nothing
-  // stays pinned when the drops below run.
-  uzm = {}; uz = {}; uzp = {};
-  vzm = {}; vz = {}; vzp = {};
-  unx = {}; vnx = {};
-  co_await vec.EndFlush();
-  // ...and then DROP THE CACHE. Durability alone is not enough. A block reads
-  // planes owned by its NEIGHBOURS (z-1 at the bottom of its slab, z+1 at the
-  // top), and those pages stay resident in this block's cache. The regions
-  // swap every step, so an address read in step N is read again in step N+2 --
-  // and a resident stale copy would be served instead of the value another
-  // block has since written. Nothing invalidates one block's cache when
-  // another block writes, because the caches are per block by design.
-  //
-  // The residual scaled with the PLANE COUNT, which is the signature: 1.70e-03
-  // at 64KB pages (65536 planes) down to nothing measurable at 4MB (1024
-  // planes) -- more planes, more block-boundary sharing, more stale hits.
-  // Everything this block touched is clean (flushed and awaited above) and
-  // unpinned, so the batched score-0 drop takes it all.
-  {
-    const u64 zlo = (z0 > 0) ? (z0 - 1) : 0;
-    const u64 zhi = (z1 + 1 < nz) ? (z1 + 1) : nz;
-    const u64 bases[4] = {ubase, vbase, unext, vnext};
-    for (u64 b = 0; b < 4; ++b) {
-      for (u64 pg = zlo; pg < zhi; pg += 64) {
-        const u32 nb = (zhi - pg < 64) ? static_cast<u32>(zhi - pg) : 64u;
-        const u64 pbase = vec.PageOf(bases[b]);
-      }
-    }
-  }
-}
-
-__global__ void StepKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<float> vec, u64 plane, u64 nx,
-                           u64 ny, u64 nz, u64 zper, u64 ubase, u64 vbase,
-                           u64 unext, u64 vnext, float Du, float Dv, float F,
-                           float K, float dt, gy::YieldableView<> yv,
-                           gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  vec.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < nz) ? (z0 + zper) : nz;
-  CLIO_YCORO_RUN(StepCoro(vec, plane, nx, ny, nz, z0, z1, ubase, vbase, unext,
-                          vnext, Du, Dv, F, K, dt));
-}
-
-/** Sum of v over this block's range, for the correctness checksum. */
-__device__ gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
-                                 u64 z0, u64 z1, u64 vbase, double *out) {
-  for (u64 z = z0; z < z1; ++z) {
-    co_await vec.Fetch(0, vbase + z * plane, plane);
-    auto h = co_await vec.HoldPage(vbase + z * plane, plane);
-    double acc = 0.0;
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      acc += static_cast<double>(h[vbase + z * plane + i]);
-    }
-    atomicAdd(out, acc);
-    __syncthreads();
-    vec.UnpinRange(vbase + z * plane, plane);
-  }
-}
-
-__global__ void SumKernel(clio::run::IpcManagerGpuInfo info,
-                          gv::DeviceVector<float> vec, u64 plane, u64 nz,
-                          u64 zper, u64 vbase, double *out,
-                          gy::YieldableView<> yv, gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  vec.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < nz) ? (z0 + zper) : nz;
-  CLIO_YCORO_RUN(SumCoro(vec, plane, z0, z1, vbase, out));
-}
-#else
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo, gv::DeviceVector<float>,
-                           u64, u64, u64, u64, u64, u64, u64,
-                           gy::YieldableView<>, gy::YieldStackView) {}
-__global__ void StepKernel(clio::run::IpcManagerGpuInfo, gv::DeviceVector<float>,
-                           u64, u64, u64, u64, u64, u64, u64, u64, u64, float,
-                           float, float, float, float, gy::YieldableView<>,
-                           gy::YieldStackView) {}
-__global__ void SumKernel(clio::run::IpcManagerGpuInfo, gv::DeviceVector<float>,
-                          u64, u64, u64, u64, double *, gy::YieldableView<>,
-                          gy::YieldStackView) {}
-#endif  // GV_GS_CORO
+// HOST DRIVER ONLY BELOW THIS LINE. Under CUDA this file is still compiled
+// BY the CUDA compiler, whose device pass member-checks host bodies -- and
+// gv::Vector is #if !CTP_IS_DEVICE_PASS. Under SYCL the guard is
+// transparent: the driver is a plain C++ TU.
 
 #if !CTP_IS_DEVICE_PASS
 
@@ -493,14 +196,9 @@ int main(int argc, char **argv) {
     }
   }
 
-#if !defined(GV_GS_CORO)
-  std::fprintf(stderr,
-               "GRAYSCOTT ERROR: built without C++20 device coroutines. This "
-               "benchmark only implements the coroutine paging path. Rebuild "
-               "with -DCLIO_GPU_YIELD_CORO=ON and CMAKE_CUDA_COMPILER="
-               "clang++.\n");
-  return 2;
-#else
+  // The coroutine-mode refusal that used to be here moved with the kernels:
+  // a build that cannot compile them does not produce this target at all now
+  // (see the CMake guards, and adapter/CMakeLists.txt).
   // The kernel holds 6 input planes + 2 output planes at once. A smaller cache
   // could evict a plane the kernel is still reading -- that would not crash,
   // it would silently read whatever replaced it, so it is refused.
@@ -598,6 +296,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+  // Per-block device state the SYCL backend allocates once; no-op on CUDA.
+  gs::InitBackend(blocks, gpu);
 
   std::printf("Gray-Scott over a GPU vector\n"
               "  grid=%llux%llux%llu (page = one %lluKB plane)\n"
@@ -625,8 +325,8 @@ int main(int argc, char **argv) {
   const u64 ubase = 0, vbase = region, unext = 2 * region, vnext = 3 * region;
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-    SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nx, ny, nz,
-                                                zper, ubase, vbase, vw, sv);
+    gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase, vw,
+                   sv);
   });
   ctp::GpuApi::Synchronize();
 
@@ -703,9 +403,9 @@ int main(int argc, char **argv) {
           !bl_read(3, cv_, zm) || !bl_read(4, cv_, z) || !bl_read(5, cv_, zp)) {
         return false;
       }
-      GrayscottBaselineKernel<<<1, threads>>>(
-          bl_d[0], bl_d[1], bl_d[2], bl_d[3], bl_d[4], bl_d[5], bl_dout[0],
-          bl_dout[1], plane, nx, ny, interior ? 1 : 0, Du, Dv, F, K, dt);
+      gs::LaunchBaseline(threads, bl_d[0], bl_d[1], bl_d[2], bl_d[3], bl_d[4],
+                         bl_d[5], bl_dout[0], bl_dout[1], plane, nx, ny,
+                         interior ? 1 : 0, Du, Dv, F, K, dt);
       ctp::GpuApi::Synchronize();
       if (!bl_write(0, nu_, z) || !bl_write(1, nv_, z)) return false;
     }
@@ -721,8 +421,8 @@ int main(int argc, char **argv) {
     if (r > 0) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nx, ny, nz,
-                                                    zper, ubase, vbase, vw, sv);
+        gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
+                       vw, sv);
       });
       ctp::GpuApi::Synchronize();
     }
@@ -739,9 +439,8 @@ int main(int argc, char **argv) {
       } else {
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
-          StepKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu, nv, Du, Dv, F, K,
-              dt, vw, sv);
+          gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu,
+                         nv, Du, Dv, F, K, dt, vw, sv);
         });
       }
       std::swap(cu, nu);
@@ -754,8 +453,7 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      SumKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, plane, nz, zper, cv,
-                                                 d_sum, vw, sv);
+      gs::LaunchSum(g, b, gpu, dev, plane, nz, zper, cv, d_sum, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     ctp::GpuApi::Memcpy(&checksum, d_sum, sizeof(double));
@@ -832,7 +530,6 @@ int main(int argc, char **argv) {
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
-#endif  // GV_GS_CORO
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
