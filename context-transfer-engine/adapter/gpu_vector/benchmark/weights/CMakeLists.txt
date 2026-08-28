@@ -233,3 +233,23 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
     install(TARGETS clio_weights_paged_bench_sycl RUNTIME DESTINATION bin)
     message(STATUS "weights paged bench (SYCL): ON")
 endif()
+
+
+#------------------------------------------------------------------------------
+# weights, Kokkos edition: the performance-portability baseline.
+# ONE SOURCE, whichever backend Kokkos was built for (-DKokkos_ROOT).
+#------------------------------------------------------------------------------
+find_package(Kokkos QUIET)
+if(Kokkos_FOUND)
+    find_package(MPI QUIET COMPONENTS CXX)
+    if(MPI_CXX_FOUND)
+        add_executable(clio_weights_kokkos_bench
+            kokkos/clio_weights_kokkos_bench.cc)
+        target_link_libraries(clio_weights_kokkos_bench PRIVATE
+            Kokkos::kokkos MPI::MPI_CXX)
+        set_target_properties(clio_weights_kokkos_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        install(TARGETS clio_weights_kokkos_bench RUNTIME DESTINATION bin)
+        message(STATUS "weights Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
+    endif()
+endif()

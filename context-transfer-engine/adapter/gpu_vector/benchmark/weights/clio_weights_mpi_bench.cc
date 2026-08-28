@@ -33,28 +33,25 @@
 using u32 = unsigned int;
 using u64 = unsigned long long;
 
-/** The paged bench's weight generator, verbatim: runs of 8 identical values
- *  with a hashed sprinkling of flat 64KB granules (--flat-pct). */
-static constexpr u64 kFlatGranuleElems = (64 * 1024) / sizeof(u32);
-__host__ __device__ inline bool PageIsFlat(u64 page, u32 pct) {
-  u64 h = page * 0x9E3779B97F4A7C15ull;
-  h ^= h >> 33;
-  return (h % 100u) < pct;
-}
-__host__ __device__ inline u32 WeightRaw(u64 i) {
-  constexpr u64 kRun = 8;
-  u32 r = static_cast<u32>((i / kRun) * 2654435761u);
-  r ^= r >> 13;
-  return (r & 0x3F3F3F3Fu) |
-         (static_cast<u32>((i / 4096) % 13) * 0x40404040u);
-}
-__host__ __device__ inline u32 Weight(u64 i, u32 flat_pct) {
-  if (PageIsFlat(i / kFlatGranuleElems, flat_pct)) return 0x01010101u;
-  return WeightRaw(i);
-}
-__host__ __device__ inline u32 Activation(u64 i) {
-  return static_cast<u32>((i % 7) + 1);
-}
+// THE GENERATOR IS SHARED NOW, NOT COPIED.
+//
+// What was here claimed to be "the paged bench's weight generator, verbatim"
+// and was not: its PageIsFlat used a different hash (64-bit 0x9E37... >> 33
+// against the paged bench's 32-bit 2654435761 >> 15). At --flat-pct 25 the
+// two disagreed about 37% of pages, so this baseline and the thing it is a
+// baseline FOR were compressing different datasets, and their stored-size
+// and residency numbers were not comparable.
+//
+// It went unnoticed because the default is --flat-pct 0, where both hashes
+// select nothing and the data is identical. The divergence appears only in
+// the compression sweep -- which is the measurement this benchmark exists to
+// make.
+#include "weights_math.h"
+
+using clio_wt::Activation;
+using clio_wt::PageIsFlat;
+using clio_wt::Weight;
+
 
 __global__ void SeedKernel(u32 *w, u64 base, u64 n, u32 flat_pct) {
   for (u64 i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
