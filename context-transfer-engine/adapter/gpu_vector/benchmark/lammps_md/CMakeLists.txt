@@ -272,3 +272,23 @@ if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.c
         message(STATUS "lammps_md BaM baseline: ON")
     endif()
 endif()
+
+
+#------------------------------------------------------------------------------
+# eternia-MD, Kokkos edition: the performance-portability baseline.
+# ONE SOURCE, whichever backend Kokkos was built for (-DKokkos_ROOT).
+#------------------------------------------------------------------------------
+find_package(Kokkos QUIET)
+if(Kokkos_FOUND)
+    find_package(MPI QUIET COMPONENTS CXX)
+    if(MPI_CXX_FOUND)
+        add_executable(clio_lammps_md_kokkos_bench
+            kokkos/clio_lammps_md_kokkos_bench.cc)
+        target_link_libraries(clio_lammps_md_kokkos_bench PRIVATE
+            Kokkos::kokkos MPI::MPI_CXX)
+        set_target_properties(clio_lammps_md_kokkos_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        install(TARGETS clio_lammps_md_kokkos_bench RUNTIME DESTINATION bin)
+        message(STATUS "lammps_md Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
+    endif()
+endif()
