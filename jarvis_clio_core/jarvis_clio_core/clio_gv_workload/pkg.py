@@ -81,6 +81,35 @@ def _reap_stale(log, binary):
         time.sleep(1)
 
 
+def _wait_for_gpu_idle(log, max_used_mb=700, timeout_s=240):
+    """Block until the GPU has released the PREVIOUS cell's memory.
+
+    A finished process releases its VRAM LAZILY, and back-to-back sweep
+    cells at ~6 GB footprints can otherwise start against a GPU that
+    still holds most of the last cell's allocations. Measured in the
+    combined memory-pressure sweep: two lammps_md blocks=1 cells ran 2x
+    slow AND failed their physics gates mid-sweep, then passed cleanly
+    standalone -- the squeeze, not the vector. (The per-workload kmeans
+    pkg documented the same pathology for a GNN sweep.)"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.used',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=15)
+            used = int(out.stdout.strip().splitlines()[0])
+        except Exception:
+            return
+        if used <= max_used_mb:
+            return
+        log('  waiting for GPU to drain: %d MB still in use '
+            '(previous cell releasing lazily)' % used)
+        time.sleep(5)
+    log('  WARNING: GPU still holds %d MB after %ds -- this cell may '
+        'run squeezed' % (used, timeout_s))
+
+
 class _VramSampler:
     """Poll nvidia-smi memory.used while the benchmark runs; persist the
     peak to a file so the FRESH pkg instance jarvis builds for _get_stat
@@ -459,6 +488,7 @@ class ClioGvWorkload(Application):
     def start(self):
         c = self.config
         _reap_stale(self.log, self._binary())
+        _wait_for_gpu_idle(self.log)
         os.makedirs(c['output_dir'], exist_ok=True)
         out = self._output_file()
         # Warmed memory: CLIO_PREFAULT=0 pre-faults the WHOLE RAM tier at
