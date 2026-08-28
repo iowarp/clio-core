@@ -35,6 +35,21 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_weights_paged_bench RUNTIME DESTINATION bin)
+
+    # The CUDA paged row had NO ctest entry while its SYCL twin did -- so a
+    # break here would have been caught only on the backend that is harder to
+    # build. Same flags as cte_gpu_vector_weights_sycl on purpose: the pair is
+    # meant to be compared, not just to exist.
+    add_test(NAME cte_gpu_vector_weights
+        COMMAND clio_weights_paged_bench --blocks 8
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_weights PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
   endif()
 endif()
 
