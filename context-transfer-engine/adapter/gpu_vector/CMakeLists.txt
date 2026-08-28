@@ -19,15 +19,12 @@ target_link_libraries(clio_cte_gpu_vector INTERFACE
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
         DESTINATION include)
 
-# The benchmarks and the CUDA tests are CUDA/ROCm sources -- __global__
-# functions launched with <<<>>>. sycl_cuda_compat.h makes them PARSE under a
-# SYCL build (it supplies the CUDA spellings), which is worse than useless:
-# they would link against libsycl and then launch nothing, because a
-# __global__ function is not a SYCL kernel. Build them only where they mean
-# something.
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-    add_subdirectory(benchmark)
-endif()
+# Each workload's CMakeLists guards its own targets, so a SYCL build only
+# gets the ones that have been ported. The rest are CUDA sources -- __global__
+# functions launched with <<<>>> -- and sycl_cuda_compat.h making them PARSE
+# under SYCL is worse than useless: they would link against libsycl and then
+# launch nothing, because a __global__ function is not a SYCL kernel.
+add_subdirectory(benchmark)
 
 if(CLIO_CORE_ENABLE_TESTS)
     if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)

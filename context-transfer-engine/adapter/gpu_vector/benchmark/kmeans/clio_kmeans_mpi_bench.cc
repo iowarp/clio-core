@@ -32,6 +32,11 @@
 
 #include <cuda_runtime.h>
 
+// The science, shared with the paged bench and the SYCL baseline. Carries no
+// clio dependency, so including it does not compromise "a baseline links
+// nothing from clio".
+#include "kmeans_math.h"
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -53,19 +58,11 @@ using u64 = unsigned long long;
     }                                                                        \
   } while (0)
 
-/** Deterministic synthetic coordinate -- IDENTICAL to the paged bench, so
- *  every substrate clusters the same data. */
-__host__ __device__ inline float PointVal(u64 idx, u32 dims, u32 k) {
-  const u64 point = idx / dims;
-  const u64 dim = idx % dims;
-  const u64 cluster = point % k;
-  const float centre = static_cast<float>(cluster) * 8.0f;
-  const u64 h = (point * 6364136223846793005ull + dim * 1442695040888963407ull);
-  const float jitter =
-      static_cast<float>(static_cast<u32>(h >> 40)) * (2.0f / 16777216.0f) -
-      1.0f;
-  return centre + jitter;
-}
+// IDENTICAL to the paged bench and the SYCL baseline because it is the SAME
+// CODE now, not a copy with a comment claiming so.
+using clio_km::NearestCentroid;
+using clio_km::PointVal;
+using clio_km::UpdateCentroid;
 
 __global__ void SeedKernel(float *pts, u64 base_idx, u64 n, u32 dims, u32 k) {
   for (u64 i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -81,16 +78,7 @@ __global__ void AssignKernel(const float *pts, u64 npts, u32 dims, u32 k,
   for (u64 p = blockIdx.x * blockDim.x + threadIdx.x; p < npts;
        p += static_cast<u64>(gridDim.x) * blockDim.x) {
     const float *pt = pts + p * dims;
-    float best = 3.4e38f;
-    u32 bestk = 0;
-    for (u32 c = 0; c < k; ++c) {
-      float d = 0.0f;
-      for (u32 i = 0; i < dims; ++i) {
-        const float x = pt[i] - cent[c * dims + i];
-        d += x * x;
-      }
-      if (d < best) { best = d; bestk = c; }
-    }
+    const u32 bestk = NearestCentroid(pt, cent, dims, k);
     for (u32 i = 0; i < dims; ++i) {
       atomicAdd(&sums[bestk * dims + i], pt[i]);
     }
@@ -103,11 +91,7 @@ __global__ void UpdateKernel(float *cent, const float *sums,
                              const unsigned *counts, u32 dims, u32 k) {
   const u32 c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= k) return;
-  const unsigned n = counts[c];
-  if (n == 0) return;
-  for (u32 i = 0; i < dims; ++i) {
-    cent[c * dims + i] = sums[c * dims + i] / static_cast<float>(n);
-  }
+  UpdateCentroid(cent, sums, counts, dims, c);
 }
 
 static double NowMs() {

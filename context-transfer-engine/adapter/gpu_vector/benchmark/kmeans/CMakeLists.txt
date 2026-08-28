@@ -8,6 +8,7 @@ if(CLIO_CORE_ENABLE_CUDA)
   if(TARGET clio_cte_compressor_runtime)
     add_cuda_executable(clio_kmeans_paged_bench FALSE
         clio_kmeans_paged_bench.cc
+        cuda/kmeans_launch_cuda.cc
         INCLUDE_DIRS
             ${CMAKE_SOURCE_DIR}/context-runtime/include
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
@@ -33,6 +34,55 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS clio_kmeans_paged_bench RUNTIME DESTINATION bin)
   endif()
+endif()
+
+#------------------------------------------------------------------------------
+# kmeans over a paged point set -- SYCL.
+#
+# Same host driver source as the CUDA target above, compiled once as ordinary
+# C++. Only sycl/kmeans_launch_sycl.cc is built with -fsycl, and only it
+# differs from cuda/kmeans_launch_cuda.cc; the workload itself
+# (kmeans_kernels.h) is one copy shared by both.
+#
+# SHARED library for the launches, not static: device code in a static
+# archive does not reach the executable's device image, and the first kernel
+# then aborts in ProgramManager. SPIR-V is refused outright -- DPC++ cannot
+# compile a coroutine for it (see the gpu_vector SYCL_PORT.md).
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
+    set(_km_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(kmeans_sycl_launch SHARED sycl/kmeans_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(kmeans_sycl_launch)
+    set_target_properties(kmeans_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(kmeans_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_km_inc})
+    target_link_libraries(kmeans_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_kmeans_paged_bench_sycl clio_kmeans_paged_bench.cc)
+    # Not compiled with -fsycl, but linked with it: that is what pulls in the
+    # SYCL runtime and the device image from the launch library.
+    target_link_options(clio_kmeans_paged_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_kmeans_paged_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_km_inc})
+    target_link_libraries(clio_kmeans_paged_bench_sycl PRIVATE
+        kmeans_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_kmeans_paged_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_kmeans_paged_bench_sycl RUNTIME DESTINATION bin)
+    message(STATUS "kmeans paged bench (SYCL): ON")
 endif()
 
 #------------------------------------------------------------------------------
@@ -76,6 +126,50 @@ if(CLIO_CORE_ENABLE_CUDA)
         message(STATUS "kmeans MPI baseline: ON")
     else()
         message(STATUS "MPI not found; skipping clio_kmeans_mpi_bench")
+    endif()
+endif()
+
+#------------------------------------------------------------------------------
+# kmeans, MPI edition on SYCL: baseline, links nothing from clio.
+#
+# Built by a custom command with the SYCL compiler directly, exactly as the
+# CUDA baseline is built by nvcc: a baseline must not pick up this project's
+# targets, its flags or its libraries.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
+    find_package(MPI QUIET COMPONENTS CXX)
+    if(MPI_CXX_FOUND)
+        set(_km_sy_cflags "")
+        foreach(_dir IN LISTS MPI_CXX_INCLUDE_DIRS)
+            list(APPEND _km_sy_cflags -I${_dir})
+        endforeach()
+        # Two separate arguments, not a SHELL: string -- that form is only
+        # understood by target_compile_options, and add_custom_command passes
+        # it through as one literal filename.
+        set(_km_sy_backend "")
+        if(SYCL_TARGET MATCHES "nvptx64")
+            set(_km_sy_backend
+                -Xsycl-target-backend=nvptx64-nvidia-cuda
+                --cuda-gpu-arch=${SYCL_CUDA_ARCH})
+        endif()
+        set(_out ${CMAKE_BINARY_DIR}/bin/clio_kmeans_mpi_bench_sycl)
+        set(_src ${CMAKE_CURRENT_SOURCE_DIR}/sycl/clio_kmeans_mpi_bench_sycl.cc)
+        add_custom_command(
+            OUTPUT ${_out}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+            COMMAND ${CMAKE_CXX_COMPILER}
+                -fsycl -fsycl-targets=${SYCL_TARGET} ${_km_sy_backend}
+                -std=c++20 -O3 ${_km_sy_cflags}
+                ${_src} -o ${_out} ${MPI_CXX_LIBRARIES}
+            DEPENDS ${_src} ${CMAKE_CURRENT_SOURCE_DIR}/kmeans_math.h
+            COMMENT "Building clio_kmeans_mpi_bench_sycl (DPC++ + MPI)"
+            COMMAND_EXPAND_LISTS
+            VERBATIM)
+        add_custom_target(clio_kmeans_mpi_bench_sycl ALL DEPENDS ${_out})
+        install(PROGRAMS ${_out} DESTINATION bin)
+        message(STATUS "kmeans MPI baseline (SYCL): ON")
+    else()
+        message(STATUS "MPI not found; skipping clio_kmeans_mpi_bench_sycl")
     endif()
 endif()
 

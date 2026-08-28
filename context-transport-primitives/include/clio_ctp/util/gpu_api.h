@@ -680,6 +680,18 @@ class GpuApi {
 #if CTP_ENABLE_CUDA
       CUDA_ERROR_CHECK(cudaMemset(dst, value, size));
 #endif
+#if CTP_ENABLE_SYCL && !CTP_ENABLE_CUDA && !CTP_ENABLE_ROCM
+      // Without this branch the device arm had NO body under SYCL, so this
+      // silently did nothing on exactly the pointers it was called for.
+      // It is not a rare path: Vector::ResetStats, the yield stack's zeroing,
+      // and every `Memset(d_sums, 0, ...)` in a benchmark go through here.
+      // The kmeans centroids still looked right because sums and counts
+      // accumulated together and their RATIO survived -- which is the kind of
+      // failure that reports a plausible number instead of an error.
+      if (size != 0) {
+        SyclQueue().memset(dst, value, size).wait();
+      }
+#endif
     } else {
       memset(dst, value, size);
     }

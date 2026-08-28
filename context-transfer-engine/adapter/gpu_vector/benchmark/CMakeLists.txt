@@ -18,13 +18,20 @@
 # flush, overlap, stream) and the register-cap probes.
 #------------------------------------------------------------------------------
 
-add_subdirectory(lammps_md)
-add_subdirectory(gnn)
-add_subdirectory(gmx)
-add_subdirectory(lbann)
-add_subdirectory(grayscott)
+# kmeans is the workload that has been split into shared kernels plus
+# per-backend launches (kmeans/kmeans_kernels.h + kmeans/cuda + kmeans/sycl),
+# so it is the only one a SYCL build can descend into today. The others are
+# still CUDA-only sources; porting each is the same mechanical split.
 add_subdirectory(kmeans)
-add_subdirectory(weights)
+
+if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
+    add_subdirectory(lammps_md)
+    add_subdirectory(gnn)
+    add_subdirectory(gmx)
+    add_subdirectory(lbann)
+    add_subdirectory(grayscott)
+    add_subdirectory(weights)
+endif()
 
 if(CLIO_CORE_ENABLE_CUDA)
   # The stream bench exercises COMPRESSED tiers, so it links the compressor
