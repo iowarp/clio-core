@@ -33,3 +33,22 @@ bytes is `blocks × slots × page_kb` — sweep the TOTAL, not `slots`, when
 
 - `../../pipelines/workload_understanding/kmeans_mpi_sweep.yaml`
 - `../../pipelines/memory_pressure/kmeans_pressure.yaml`
+
+## The centroid checksum is NOT a comparison key
+
+`centroid_checksum` is **not reproducible run to run**, on any substrate, at
+any rank count. Measured back to back on one binary:
+
+    kokkos n=1 : 30719.999734 / 30719.999501 / 30719.999658
+    mpi    n=1 : 30719.999983 / 30719.999768 / 30720.000128
+    paged (cuda): 30720.001988 / 30720.000665
+
+Centroid accumulation is atomic, so the summation order varies between runs.
+Comparing this number -- across backends, across rank counts, or against a
+value written down last week -- manufactures a "regression" that is not there.
+That is not a defect to fix: the MPI, Kokkos and paged editions all behave
+this way, so it is the deck, not any one port.
+
+What IS exact, and what the gate actually checks: the integer assignment
+COUNT, plus `faults`/`evicts`/`get_errors`/`put_errors` on the paged rows
+(131072/131072/0/0 for the default deck on both CUDA and SYCL). Compare those.
