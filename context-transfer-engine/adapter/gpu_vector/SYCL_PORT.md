@@ -91,6 +91,36 @@ None of these had ever been executed. Each one was silent.
 | `gpu_device_ring.h` | `Push` was `CTP_IS_GPU_COMPILER`-only; rewritten against the portable intrinsics so one body serves all three backends. |
 | build | `CTP_ENABLE_SYCL` was per-target. It selects between two bodies of the same inline functions in `gpu_api.h`, so an uneven definition is an ODR violation -- and that is exactly how `mem_bdev_transport.cc` got the no-op `MemcpyAsync`. It is now global, with `libsycl` linked globally to match. |
 
+## The device vector was not changed -- measured, not asserted
+
+The whole point of the compat-shim approach is that porting a workload to a
+second backend must not perturb the vector. For the run that completed the
+matrix and added the regression coverage, that is a diff, not a claim:
+
+    context-transfer-engine/adapter/gpu_vector/include/   0 files changed
+    context-runtime/include/clio_runtime/gpu/             0 files changed
+    context-transport-primitives/include/                 1 file, +40 lines
+
+The vector's own headers and the runtime's yield machinery are untouched. The
+only shared-header change is +40 lines in `sycl_cuda_compat.h` -- `__fmaf_rn`,
+`__fma_rn`, `__ldcg`, `__ldcv` -- which is precisely the file whose job is to
+supply CUDA spellings to SYCL. Everything else lives in per-benchmark launch
+seams.
+
+Re-run the check with:
+
+    git diff --stat <base>..HEAD -- \
+        context-transfer-engine/adapter/gpu_vector/include/ \
+        context-runtime/include/clio_runtime/gpu/
+
+## Scope: six workloads, not seven
+
+`gnn` is not in the matrix and does not belong in it. `gnn_aggregate.cc` and
+`gnn_ingest.cc` contain ZERO `__global__` kernels and zero coroutines -- they
+are host-side CTE tools (1-hop mean neighbour aggregation over a feature
+matrix, and an ingest path), not paged-vector GPU workloads. There is no
+device code to give a second backend.
+
 ## Backend matrix
 
 Where each workload stands. "paged" is the gpu_vector row; MPI/Kokkos are
