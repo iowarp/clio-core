@@ -1232,20 +1232,42 @@ CTP_INLINE static void threadfence_system() {
 #endif
 
 /**
+ * Lane mask for warp/wavefront collectives.
+ *
+ * A CUDA warp is 32 lanes and takes a 32-bit mask; an AMD wavefront is 64 and
+ * HIP requires a 64-bit one. ROCm 7.x static_asserts on this rather than
+ * silently promoting -- "The mask must be a 64-bit integer. Implicitly
+ * promoting a smaller integer is almost always an error" -- which is how the
+ * hardcoded `unsigned` below was found. It broke EVERY ROCm compile of any TU
+ * that reached this header, which is most of them.
+ */
+#if CTP_ENABLE_ROCM
+using warp_mask_t = unsigned long long;
+static constexpr warp_mask_t kWarpFullMask = ~0ull;
+#else
+using warp_mask_t = unsigned;
+static constexpr warp_mask_t kWarpFullMask = 0xffffffffu;
+#endif
+
+/**
  * Safe 64-bit warp shuffle broadcast.
  * Splits into two 32-bit shuffles to avoid potential issues with
  * __shfl_sync for 64-bit types on some GPU architectures.
+ *
+ * NOTE: currently has no callers. Kept and made portable rather than deleted,
+ * because a deliberately-written helper is worth more correct than absent --
+ * but do not assume it is exercised anywhere.
  */
 #if CTP_IS_DEVICE_PASS
 CTP_GPU_FUN static unsigned long long shfl_sync_u64(
-    unsigned mask, unsigned long long val, int src_lane) {
+    warp_mask_t mask, unsigned long long val, int src_lane) {
   unsigned int lo = __shfl_sync(mask, static_cast<unsigned int>(val), src_lane);
   unsigned int hi = __shfl_sync(mask, static_cast<unsigned int>(val >> 32), src_lane);
   return (static_cast<unsigned long long>(hi) << 32) | lo;
 }
 #else
 CTP_INLINE static unsigned long long shfl_sync_u64(
-    unsigned mask, unsigned long long val, int src_lane) {
+    warp_mask_t mask, unsigned long long val, int src_lane) {
   (void)mask; (void)src_lane;
   return val;
 }

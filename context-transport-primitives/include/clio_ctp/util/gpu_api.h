@@ -214,6 +214,157 @@ class GpuApi {
 #endif
   }
 
+  /* ----------------------------------------------------------------------
+   * TIMING EVENTS.
+   *
+   * Added so the GPU tests can stop calling cudaEvent* directly -- a test
+   * that names the CUDA API cannot run on ROCm no matter how portable the
+   * code under test is.
+   *
+   * SEMANTICS DIFFER ON SYCL, and the difference is worth knowing before
+   * trusting a number. CUDA and HIP events are stamped ON THE DEVICE
+   * TIMELINE, so they measure the GPU work itself even when the host runs
+   * ahead. SYCL here stamps a HOST clock after draining the queue, so it
+   * measures wall time around the work. For the synchronous
+   * record/sync/elapsed pattern these tests use the two agree; for
+   * overlapped async work they do not, and the SYCL number would include
+   * host-side scheduling.
+   * -------------------------------------------------------------------- */
+
+  /** Create a timing event. */
+  static void *CreateEvent() {
+#if CTP_ENABLE_ROCM
+    hipEvent_t e;
+    HIP_ERROR_CHECK(hipEventCreate(&e));
+    return e;
+#elif CTP_ENABLE_CUDA
+    cudaEvent_t e;
+    CUDA_ERROR_CHECK(cudaEventCreate(&e));
+    return e;
+#elif CTP_ENABLE_SYCL
+    return new std::chrono::steady_clock::time_point{};
+#else
+    return nullptr;
+#endif
+  }
+
+  /** Stamp `event` on `stream` (nullptr = the default stream). */
+  static void RecordEvent(void *event, void *stream = nullptr) {
+    if (event == nullptr) return;
+#if CTP_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipEventRecord(static_cast<hipEvent_t>(event),
+                                   static_cast<hipStream_t>(stream)));
+#elif CTP_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaEventRecord(static_cast<cudaEvent_t>(event),
+                                     static_cast<cudaStream_t>(stream)));
+#elif CTP_ENABLE_SYCL
+    // Drain first: a host timestamp taken while work is still queued would
+    // measure submission, not execution.
+    if (stream != nullptr) {
+      static_cast<sycl::queue *>(stream)->wait();
+    } else {
+      SyclQueue().wait();
+    }
+    *static_cast<std::chrono::steady_clock::time_point *>(event) =
+        std::chrono::steady_clock::now();
+#else
+    (void)stream;
+#endif
+  }
+
+  /** Block until `event` has been reached. */
+  static void SyncEvent(void *event) {
+    if (event == nullptr) return;
+#if CTP_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipEventSynchronize(static_cast<hipEvent_t>(event)));
+#elif CTP_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaEventSynchronize(static_cast<cudaEvent_t>(event)));
+#endif
+    // SYCL: RecordEvent already drained the queue, so there is nothing left
+    // to wait for.
+  }
+
+  /** Milliseconds between two recorded events. */
+  static float ElapsedMs(void *start, void *end) {
+    if (start == nullptr || end == nullptr) return 0.0f;
+    float ms = 0.0f;
+#if CTP_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipEventElapsedTime(&ms, static_cast<hipEvent_t>(start),
+                                        static_cast<hipEvent_t>(end)));
+#elif CTP_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaEventElapsedTime(&ms, static_cast<cudaEvent_t>(start),
+                                          static_cast<cudaEvent_t>(end)));
+#elif CTP_ENABLE_SYCL
+    using tp = std::chrono::steady_clock::time_point;
+    ms = std::chrono::duration<float, std::milli>(
+             *static_cast<tp *>(end) - *static_cast<tp *>(start)).count();
+#endif
+    return ms;
+  }
+
+  /** Destroy a timing event. */
+  static void DestroyEvent(void *event) {
+    if (event == nullptr) return;
+#if CTP_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipEventDestroy(static_cast<hipEvent_t>(event)));
+#elif CTP_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
+#elif CTP_ENABLE_SYCL
+    delete static_cast<std::chrono::steady_clock::time_point *>(event);
+#endif
+  }
+
+  /** Free/total device memory. False when the backend cannot report it --
+   *  SYCL exposes a total but no free-memory query, and reporting the total
+   *  as "free" would make a caller's VRAM accounting silently wrong. */
+  static bool MemInfo(size_t *free_bytes, size_t *total_bytes) {
+    if (free_bytes != nullptr) *free_bytes = 0;
+    if (total_bytes != nullptr) *total_bytes = 0;
+#if CTP_ENABLE_ROCM
+    return hipMemGetInfo(free_bytes, total_bytes) == hipSuccess;
+#elif CTP_ENABLE_CUDA
+    return cudaMemGetInfo(free_bytes, total_bytes) == cudaSuccess;
+#elif CTP_ENABLE_SYCL
+    if (total_bytes != nullptr) {
+      *total_bytes = SyclQueue().get_device()
+                         .get_info<sycl::info::device::global_mem_size>();
+    }
+    return false;
+#else
+    return false;
+#endif
+  }
+
+  /** Per-thread device stack, in bytes. A no-op where the backend has no
+   *  equivalent knob rather than an error: callers raise it as a hint. */
+  static void SetDeviceStackLimit(size_t bytes) {
+#if CTP_ENABLE_ROCM
+    hipDeviceSetLimit(hipLimitStackSize, bytes);
+#elif CTP_ENABLE_CUDA
+    cudaDeviceSetLimit(cudaLimitStackSize, bytes);
+#else
+    (void)bytes;
+#endif
+  }
+
+  /** Message for the last failed launch, or nullptr when clean.
+   *
+   *  PEEKS -- it does not clear the sticky error, because callers read a
+   *  device-side diagnostic channel afterwards and that only says anything
+   *  while the error stands. */
+  static const char *LastError() {
+#if CTP_ENABLE_ROCM
+    const hipError_t e = hipPeekAtLastError();
+    return (e == hipSuccess) ? nullptr : hipGetErrorString(e);
+#elif CTP_ENABLE_CUDA
+    const cudaError_t e = cudaPeekAtLastError();
+    return (e == cudaSuccess) ? nullptr : cudaGetErrorString(e);
+#else
+    // SYCL reports failures as exceptions from the queue, not a sticky flag.
+    return nullptr;
+#endif
+  }
+
   /** Device the calling thread is currently bound to (0 when not applicable). */
   static int CurrentDevice() {
     int dev = 0;
