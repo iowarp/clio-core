@@ -36,12 +36,14 @@
 using u32 = unsigned int;
 using u64 = unsigned long long;
 
-__host__ __device__ inline u64 Lcg(u64 s) {
-  return s * 6364136223846793005ull + 1442695040888963407ull;
-}
-__host__ __device__ inline float Sym01(u64 s) {
-  return (static_cast<float>((s >> 40) & 0xFFFFFF) / 8388608.0f) - 1.0f;
-}
+// Shared with the paged bench and every other substrate. These matched
+// already -- unlike the weights baseline's, which had silently drifted -- but
+// sharing them is what keeps that true: all substrates must start from
+// byte-identical weights or the loss curves are not comparable.
+#include "lbann_math.h"
+
+using clio_lb::Lcg;
+using clio_lb::Sym01;
 
 /** Weight/batch seeding and every training loop below are the paged
  *  bench's, verbatim: one thread per output element, fixed-order sums, no
