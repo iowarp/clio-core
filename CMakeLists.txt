@@ -1389,6 +1389,15 @@ if(NOT CLIO_CORE_MSVC_LIKE)
                                    "${CLIO_SYCL_INCLUDE_DIR}" DIRECTORY)
             if(EXISTS "${_clio_sycl_root}/lib")
                 link_directories("${_clio_sycl_root}/lib")
+                # ...and put it on the RUNPATH, not just the LINK path.
+                # Without this every binary in a SYCL build dies at startup
+                # with "libsycl.so.9: cannot open shared object file" unless
+                # the caller exported LD_LIBRARY_PATH by hand -- which made
+                # cte_gpu_vector_smoke_sycl a test that passes or fails
+                # depending on the developer's shell, and would have made
+                # every SYCL bench ctest entry do the same.
+                list(APPEND CMAKE_BUILD_RPATH "${_clio_sycl_root}/lib")
+                list(APPEND CMAKE_INSTALL_RPATH "${_clio_sycl_root}/lib")
             endif()
         endif()
         link_libraries(sycl)

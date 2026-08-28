@@ -82,6 +82,20 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
     set_target_properties(clio_kmeans_paged_bench_sycl PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     install(TARGETS clio_kmeans_paged_bench_sycl RUNTIME DESTINATION bin)
+
+    # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
+    # only ever as correct as the last time someone ran it by hand.
+    # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    add_test(NAME cte_gpu_vector_kmeans_sycl
+        COMMAND clio_kmeans_paged_bench_sycl --blocks 8 --iters 2
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_kmeans_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
     message(STATUS "kmeans paged bench (SYCL): ON")
 endif()
 
