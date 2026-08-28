@@ -499,6 +499,14 @@ class YieldRunner {
 
 int main(int argc, char **argv) {
   u32 blocks = 16, threads = 256, cap = 0;
+  // Skip the dense in-VRAM reference: a 6 GB-class mesh cannot hold a
+  // second full copy beside the paged one, and the reference exists only
+  // for the two bit-equality gates. CONSERVATION stays enforced -- it is
+  // self-contained (mesh total == input charge, exact).
+  bool no_dense = false;
+  // Optional file tier (full CTE stack: hbm-resident cache + RAM + file).
+  u64 nvme_mb = 0;
+  std::string nvme_path = "/tmp/gv_gmx_tier.dat";
   u64 page_kb = 64, atoms = 200000;
   int repeat = 1;
   for (int i = 1; i < argc; ++i) {
@@ -512,6 +520,9 @@ int main(int argc, char **argv) {
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--atoms") atoms = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
+    else if (a == "--no-dense") no_dense = true;
+    else if (a == "--nvme-mb") nvme_mb = next();
+    else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
                   "[--page-kb N] [--atoms N] [--repeat N]\n", argv[0]);
@@ -523,13 +534,20 @@ int main(int argc, char **argv) {
   std::fprintf(stderr, "GMX ERROR: built without C++20 device coroutines.\n");
   return 2;
 #else
-  // One page = one XY plane of u64 mesh points: K^2 * 8 bytes.
+  // One page = one XY plane of u64 mesh points: K^2 * 8 bytes. ANY K whose
+  // plane is exactly the page works, not just powers of two -- the MPI
+  // edition takes arbitrary K, and matching its 6 GB-class meshes (e.g.
+  // K=912 -> page-kb 6498) needs the same freedom here. The exactness
+  // check stays: a page that is not exactly one plane breaks the
+  // one-writer-per-plane decomposition the digit-exact gates rely on.
   const u64 page_bytes = page_kb * 1024;
-  u64 K = 1;
-  while ((K * 2) * (K * 2) * sizeof(unsigned long long) <= page_bytes) K *= 2;
+  u64 K = static_cast<u64>(std::sqrt(
+      static_cast<double>(page_bytes / sizeof(unsigned long long))));
+  while (K * K * sizeof(unsigned long long) < page_bytes) ++K;
   if (K * K * sizeof(unsigned long long) != page_bytes) {
     std::fprintf(stderr, "GMX ERROR: --page-kb %llu is not a square u64 "
-                 "plane; use 8, 32, 128, 512...\n",
+                 "plane (K^2*8 must equal the page exactly); e.g. 8, 32, "
+                 "128, 512, 6498 (K=912)...\n",
                  (unsigned long long)page_kb);
     return 2;
   }
@@ -547,6 +565,12 @@ int main(int argc, char **argv) {
 
   {
     std::ofstream cfg("gv_gmx_bench.yaml");
+    // The RAM tier must hold the WHOLE mesh: a fixed capacity under
+    // K^3*8B makes writebacks fail (put_errors > 0) and the conservation
+    // gate then reports the lost planes. Derived with a 1 GB margin.
+    const u64 ram_mb =
+        K * K * K * sizeof(unsigned long long) / (1024ull * 1024ull) +
+        1024ull;
     cfg << "networking:\n  port: 9447\n\n"
         << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
         << "  first_busy_wait: 10000000\n\n"
@@ -558,8 +582,16 @@ int main(int argc, char **argv) {
         << "  - mod_name: clio_cte_core\n    pool_name: cte_core\n"
         << "    pool_query: local\n    pool_id: \"512.0\"\n    storage:\n"
         << "      - path: \"ram::gv_gmx_ram\"\n        bdev_type: \"ram\"\n"
-        << "        capacity_limit: \"4GB\"\n        score: 1.0\n"
-        << "    dpe:\n      dpe_type: \"max_bw\"\n";
+        << "        capacity_limit: \"" << ram_mb << "MB\"\n"
+        << "        score: 1.0\n";
+    if (nvme_mb > 0) {
+      cfg << "      - path: \"" << nvme_path << "\"\n"
+          << "        bdev_type: \"file\"\n"
+          << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
+          << "        score: 0.0\n"
+          << "        persistence_level: \"temporary\"\n";
+    }
+    cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
     cfg.close();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gv_gmx_bench.yaml", 1);
   }
@@ -637,24 +669,28 @@ int main(int argc, char **argv) {
   ctp::GpuApi::Memcpy(d_bs, bin_count.data(), (K + 1) * sizeof(u32));
 
   // ---- Dense reference: same kernels, plain memory. ----------------------
-  auto *d_mesh = ctp::GpuApi::Malloc<unsigned long long>(
-      nmesh * sizeof(unsigned long long));
-  ctp::GpuApi::Memset(d_mesh, 0, nmesh * sizeof(unsigned long long));
+  double t_ref_spread = 0.0;
+  unsigned long long ref[4] = {0, 0, 0, 0};
   auto *d_out = ctp::GpuApi::Malloc<unsigned long long>(
       4 * sizeof(unsigned long long));
   ctp::GpuApi::Memset(d_out, 0, 4 * sizeof(unsigned long long));
-  const double t_ref0 = NowMs();
-  DenseSpreadKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq, d_bs,
-                                         K, plane, zper);
-  ctp::GpuApi::Synchronize();
-  const double t_ref_spread = NowMs() - t_ref0;
-  DenseSumKernel<<<64, 256>>>(d_mesh, nmesh, d_out);
   const u64 bper = (K + blocks - 1) / blocks;
-  DenseGatherKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq, d_bs,
-                                         K, plane, bper, &d_out[2]);
-  ctp::GpuApi::Synchronize();
-  unsigned long long ref[4] = {0, 0, 0, 0};
-  ctp::GpuApi::Memcpy(ref, d_out, sizeof(ref));
+  if (!no_dense) {
+    auto *d_mesh = ctp::GpuApi::Malloc<unsigned long long>(
+        nmesh * sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_mesh, 0, nmesh * sizeof(unsigned long long));
+    const double t_ref0 = NowMs();
+    DenseSpreadKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq,
+                                           d_bs, K, plane, zper);
+    ctp::GpuApi::Synchronize();
+    t_ref_spread = NowMs() - t_ref0;
+    DenseSumKernel<<<64, 256>>>(d_mesh, nmesh, d_out);
+    DenseGatherKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq,
+                                           d_bs, K, plane, bper, &d_out[2]);
+    ctp::GpuApi::Synchronize();
+    ctp::GpuApi::Memcpy(ref, d_out, sizeof(ref));
+    ctp::GpuApi::Free(d_mesh);
+  }
 
   // ---- Paged path. -------------------------------------------------------
   const u32 tags = 24;
@@ -733,19 +769,25 @@ int main(int argc, char **argv) {
     std::printf("  CONSERVATION GATE: PASS (mesh total == input charge, "
                 "exact)\n");
   }
-  if (got[0] != ref[0] || got[1] != ref[1]) {
-    std::printf("  MESH GATE: FAIL (paged q=%llu ck=%llu vs dense q=%llu "
-                "ck=%llu)\n", got[0], got[1], ref[0], ref[1]);
-    rc = 1;
+  if (no_dense) {
+    std::printf("  MESH/GATHER GATES: SKIPPED (--no-dense; conservation "
+                "only)\n");
   } else {
-    std::printf("  MESH GATE: PASS (checksum bit-equal to dense reference)\n");
-  }
-  if (got[2] != ref[2]) {
-    std::printf("  GATHER GATE: FAIL (paged %llu vs dense %llu)\n", got[2],
-                ref[2]);
-    rc = 1;
-  } else {
-    std::printf("  GATHER GATE: PASS (interpolation energy bit-equal)\n");
+    if (got[0] != ref[0] || got[1] != ref[1]) {
+      std::printf("  MESH GATE: FAIL (paged q=%llu ck=%llu vs dense q=%llu "
+                  "ck=%llu)\n", got[0], got[1], ref[0], ref[1]);
+      rc = 1;
+    } else {
+      std::printf("  MESH GATE: PASS (checksum bit-equal to dense "
+                  "reference)\n");
+    }
+    if (got[2] != ref[2]) {
+      std::printf("  GATHER GATE: FAIL (paged %llu vs dense %llu)\n", got[2],
+                  ref[2]);
+      rc = 1;
+    } else {
+      std::printf("  GATHER GATE: PASS (interpolation energy bit-equal)\n");
+    }
   }
   std::printf("%s\n", rc == 0 ? "GMX BENCH: ALL GATES PASS"
                               : "GMX BENCH: GATE FAILURE");

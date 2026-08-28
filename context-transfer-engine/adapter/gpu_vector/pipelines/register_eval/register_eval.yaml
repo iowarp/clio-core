@@ -1,0 +1,70 @@
+# Register usage of every (workload x substrate) benchmark binary.
+#
+# Static fatbin analysis (cuobjdump --dump-resource-usage): per kernel
+# REG/STACK/SHARED, reported as the per-binary max (the occupancy-binding
+# kernel), mean, and heaviest-kernel name. No GPU is used.
+#
+# nccl exists only for lammps_md; the other workloads' nccl cells report
+# completed=0 and appear as holes in the figure, not failures.
+#
+# Run:   ../run.sh register_eval.yaml
+# Post:  jarvis ppl post yaml register_eval.yaml
+config:
+  name: gv_register_eval
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_register_eval
+      pkg_name: reg
+      workload: kmeans
+      variant: mpi
+      output_dir: /tmp/clio_gv/register_eval
+
+vars:
+  reg.workload: [lammps_md, gmx, lbann, grayscott, kmeans, weights]
+  reg.variant: [mpi, nccl, nvshmem, bam, paged]
+
+loop:
+  - [reg.workload]
+  - [reg.variant]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/register_eval"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import numpy as np
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  df = df[df.completed == 1]
+  workloads = ['lammps_md', 'gmx', 'lbann', 'grayscott', 'kmeans', 'weights']
+  variants = ['mpi', 'nccl', 'nvshmem', 'bam', 'paged']
+  fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+  width = 0.16
+  x = np.arange(len(workloads))
+  for i, var in enumerate(variants):
+      ys = []
+      for wl in workloads:
+          row = df[(df['reg.workload'] == wl) & (df['reg.variant'] == var)]
+          ys.append(float(row['max_regs'].iloc[0]) if len(row) else 0.0)
+      axes[0].bar(x + (i - 2) * width, ys, width, label=var)
+  axes[0].set_xticks(x); axes[0].set_xticklabels(workloads, rotation=20)
+  axes[0].set_ylabel('registers (heaviest kernel)')
+  axes[0].set_title('register ceiling per substrate')
+  axes[0].axhline(255, color='gray', ls='--', lw=0.8)
+  axes[0].legend(ncol=5, fontsize=8)
+  for i, var in enumerate(variants):
+      ys = []
+      for wl in workloads:
+          row = df[(df['reg.workload'] == wl) & (df['reg.variant'] == var)]
+          ys.append(float(row['mean_regs'].iloc[0]) if len(row) else 0.0)
+      axes[1].bar(x + (i - 2) * width, ys, width, label=var)
+  axes[1].set_xticks(x); axes[1].set_xticklabels(workloads, rotation=20)
+  axes[1].set_ylabel('registers (mean over kernels)')
+  axes[1].set_title('mean register usage per substrate')
+  fig.tight_layout(); fig.savefig('register_eval.png', dpi=130)
+  # The heaviest kernel per (workload, variant), for the writeup.
+  cols = ['reg.workload', 'reg.variant', 'max_regs', 'max_stack',
+          'max_reg_kernel', 'n_kernels', 'mean_regs']
+  df[cols].to_csv('register_eval_summary.csv', index=False)
+  logger.info('wrote register_eval.png + register_eval_summary.csv')

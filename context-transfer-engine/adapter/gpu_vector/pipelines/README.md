@@ -1,227 +1,85 @@
-# GPU vector benchmark pipelines
+# gpu_vector Jarvis pipelines
 
-Jarvis pipelines over eight workloads, each driving a GPU vector whose data
-does not fit on the device: five gpu_vector benchmarks, and the three eternia
-application workloads (LAMMPS, GROMACS, LBANN) that run the same paging path
-inside a real application. All of them write to
-`/home/llogan/Documents/Projects/iowarp/core/results/<pipeline>/`, which is
-gitignored — results are data, not source.
+Single-node experiment pipelines for the science-workload benchmarks in
+`../benchmark/` (lammps_md, gmx, lbann, grayscott, kmeans, weights),
+driven by [jarvis](../../../../external/jarvis-cd) pipeline tests.
 
-    export PATH=$PWD/build-coro/bin:$PATH
-    export LD_LIBRARY_PATH=/home/llogan/gnn/cuszp/lib:$LD_LIBRARY_PATH
-    jarvis repo add ./jarvis_clio_core
-    jarvis ppl run yaml context-transfer-engine/adapter/gpu_vector/pipelines/<file>.yaml
+## Running
 
-`jarvis ppl post yaml <file>` re-runs only the post-processing over results
-already collected.
+```bash
+# one pipeline (env + jarvis + post figures, all handled):
+./run.sh workload_understanding/kmeans_mpi_sweep.yaml
+# a whole family:
+./run.sh workload_understanding
+# re-render figures from stored results without re-running:
+../../../../.venv/bin/jarvis ppl run yaml <file>   # is what run.sh calls
+../../../../.venv/bin/jarvis ppl post yaml <file>  # post: section only
+```
 
-## The workloads, and why there are five
+Every sweep writes `results.csv` / `results.yaml` + its figures to
+`$HOME/gv_pipeline_results/<name>/`. Per-cell benchmark logs go to
+`/tmp/clio_gv/<name>/` with one uniquely-named log per parameter
+combination.
 
-Each exercises a different **access pattern**, which is what makes the set
-worth having — the page-size result below is entirely explained by them.
+## The harness contract
 
-| pipeline | workload | pattern | reuse |
-|---|---|---|---|
-| `gv_weights_page_sweep` | model weights | re-read the whole matrix each pass | full |
-| `gv_kmeans_page_block_sweep` | k-means | stream the point set once per pass | none within a pass |
-| `gv_gnn_page_block_sweep` | GNN training | gather scattered node rows | scattered |
-| `gv_grayscott_page_block_sweep` | Gray-Scott | sliding 3-plane stencil window | partial (2 of 3) |
-| `gv_tiered_flush_sweep` | block flush | write a region and flush it | none |
-| `gv_cache_page_block_sweep` | all four + the 3 apps | page size × block count; the four benchmarks at 2× VRAM with cache pinned at half of VRAM, the apps at their own scale | all patterns |
-| `gv_grayscott_pressure` | Gray-Scott + the 3 apps | cache driven from full residency to the floor | pressure |
-| `gv_eternia_baseline` | the 3 apps | paged path vs the application's own kernel, one env var | overhead |
+- **Packages**: `jarvis_clio_core.clio_gv_workload` (one cell = one
+  benchmark run; builds the argv for any (workload, variant) pair) and
+  `jarvis_clio_core.clio_gv_register_eval` (static fatbin analysis).
+- **Full CTE stack**: the paged benches host the clio runtime
+  IN-PROCESS (an external daemon cannot service another process's
+  in-kernel page faults) and compose their own tier stack; passing
+  `nvme_mb > 0` gives the full three-tier stack hbm + host-RAM + file.
+  The MPI/NVSHMEM/NCCL baselines are CTE-free by design — that is the
+  substrate comparison.
+- **Warmed memory**: every cell exports `CLIO_PREFAULT=0`, which
+  pre-faults the WHOLE RAM tier at compose (mem_bdev_transport.cc), so
+  timings never include first-touch page population.
+- **Validation**: `gates_pass=1` in results.csv only when the binary
+  printed its ALL-GATES-PASS / per-gate PASS markers; post scripts
+  exclude failed cells and warn.
+- **VRAM**: `vram_peak_mb`/`vram_delta_mb` are sampled from
+  `nvidia-smi memory.used` at 50 ms during the run — empirical, not
+  analytic. Runs shorter than ~100 ms can be missed; the sweeps keep
+  cells long enough where VRAM is the question.
+- **post: sections**: each yaml carries an inline `post:` script (the
+  jarvis pipeline-test feature) that renders PNG figures next to
+  results.csv after the sweep, and can be re-run alone with
+  `jarvis ppl post yaml <file>`.
 
-## The three application workloads
+## Families
 
-`gv_cache_page_block_sweep` and `gv_grayscott_pressure` also run the eternia
-application workloads — LAMMPS, GROMACS and LBANN — through the jarvis packages
-`clio_eternia_{lammps,gromacs,lbann}`. They need the forked builds, which are
-not in this repo:
+### workload_understanding/ — what moves VRAM, I/O, runtime
 
-    export ETERNIA_BIN_DIR=<root holding lmp-build/, gmx-build/, lbann-build/, clio-inst/>
+One MPI sweep per workload over its size knob (VRAM axis), its steps
+knob (runtime axis), and — for lammps_md, the one workload with a real
+checkpoint phase — the checkpoint period (I/O axis, stage-D2H + durable
+file write per checkpoint). Findings are written into each benchmark
+subdirectory's README with the measured numbers.
 
-Two things to know before reading their numbers.
+### register_eval/ — register pressure per substrate
 
-**They are not at 2× VRAM and cannot be.** Their paged datasets are whatever
-the application's data structures come to — LBANN's W is `width² × 4B`, LAMMPS
-is ~745 B/atom, GROMACS ~21 B/atom — and GROMACS would need 818 million atoms
-to reach 16 GB. They are sized to what runs in a 20-cell sweep and carry a
-cache set as a fraction of their own dataset. Compare them to each other and to
-themselves across the axes, not to the four benchmarks.
+`cuobjdump --dump-resource-usage` over every built
+(workload × {mpi,nccl,nvshmem,bam,paged}) binary; reports the
+occupancy-binding kernel (max regs), mean regs, and worst stack frame.
+No GPU needed. Headline (RTX 4070, sm_89 fatbins): every paged
+workload's coroutine kernels sit at the 169-register module ceiling
+(except lammps_md paged, capped at 64 by maxrregcount), vs 22–90 for
+the CTE-free baselines.
 
-**Every cell reports `correct`.** These three have a known exact answer, so a
-cell that computes the wrong one is visible in the table rather than being
-ranked on its speed. GROMACS is checked against a double-precision lattice sum
-computed at configure time; LAMMPS against an E_pair that must not move with
-the paging geometry; LBANN against its objective.
+### memory_pressure/ — cache size × parallelism at a 6 GB problem
 
-### Paged vs stock: `ETERNIA_BASELINE`
+Per workload: the problem size was CALIBRATED (calibrate_6gb.py, real
+runs, nvidia-smi-sampled) so the MPI baseline peaks at ~6 GB VRAM; the
+paged edition then runs that SAME problem with the page cache swept
+1–6 GB and blocks swept from 1 up to 80% of the maximum concurrent
+blocks of an RTX 5080 (84 SMs → 67 blocks at the one-block-per-SM
+scale of these persistent-style kernels; on smaller GPUs the same
+block counts simply oversubscribe, which is part of the measurement).
 
-All three applications take `ETERNIA_BASELINE=1`, which switches them to their
-own stock kernel and changes nothing else — same binary, same input, one
-variable. `gv_eternia_baseline` runs both paths and compares.
+## GPU notes
 
-At sizes that FIT, the stock path wins by one to two orders of magnitude, and
-should: it holds its data resident and pays nothing for capacity, while the
-paged path pays for out-of-core machinery it does not need there.
-
-| workload | paged | stock | ratio |
-|---|---|---|---|
-| LAMMPS pair kernel | 2.38 s | 0.31 s *(CPU)* | 7.6× |
-| LBANN fwd+bwd GEMM | 20.67 s | 0.088 s | 234× |
-| GROMACS paged kernel | 241 ms | runs alongside, see below | — |
-
-Correctness is identical on both paths in all three.
-
-Read those with the caveats attached: LAMMPS's baseline is its **CPU** kernel
-because this build has no GPU package; GROMACS's paged kernel runs *alongside*
-nbnxm rather than instead of it, so compare `kernel_ms` and not run wall clock;
-and LBANN's 234× is measured where the weights fit, which is precisely where
-the paged path has nothing to offer. Where they do not fit — a 1 GiB weight
-matrix — the paged path peaks at 366 MiB of VRAM against 4298 MiB resident.
-
-A ratio taken where the baseline still runs measures overhead, not value.
-
-### LBANN's cache axis is inert, and that is the result
-
-Measured flat at 4100 faults from 64 slots per block down to 2. Every LBANN
-kernel calls `DropAll()` on entry — the host may have rewritten the backing
-store between launches, so a resident page could be stale — and each kernel
-then makes a single pass over W. There is no reuse for a cache to capture,
-within a call or across them. Included because "this workload cannot benefit
-from a larger cache" is worth knowing, and is the opposite of what a reader
-would assume.
-
-## Headline result: page size dominates, and locality explains the ordering
-
-All measured at **2× VRAM** (16 GB/GiB datasets against an 8188 MB card),
-uncompressed, with the dataset held constant across the page axis.
-
-| workload | pattern | page-size effect | block-count effect | cache effect |
-|---|---|---|---|---|
-| weights | re-read | **33.6×** (35288 → 1050 ms) | ~1.9× | inert |
-| k-means | stream | **16.9×** (65501 → 3880 ms) | 2–3× | — |
-| Gray-Scott | sliding window | 5.5× *(indicative only)* | ~2.8× | — |
-| GNN | gather | 4.8× (48.90 → 10.15 s) | **~1.0×** | — |
-| flush | write | — | — | 1.6×, noise-limited |
-
-Block count is a secondary axis with clear diminishing returns: on weights at
-16 GB the gain per doubling runs +42%, +14%, +19%, −11%, +7%, so only 8→64
-clears the noise.
-
-The page CACHE is close to irrelevant at these sizes, which is worth stating
-because it is counter-intuitive. The largest cache the device budget allows
-(512 MB against a 16 GB dataset, 3%) removes only **2%** of faults
-(1,048,576 → 1,027,680). With no leverage on the fault count, the cache's
-lookup cost can dominate its benefit: at 8 blocks, going from 1 to 32
-pages/block made the run 20% SLOWER.
-
-Page size pays most where every fetched byte is eventually used (weights) and
-least where rows are scattered so a large page over-fetches (GNN). Faults
-scale almost exactly inversely with page size — weights: 4,193,065 → 15,175
-for a 256× page increase.
-
-Block count is a minor axis everywhere, and for the GNN gather it is worth
-essentially nothing (48.90 s vs 52.00 s at 16 KB).
-
-## Reading the results honestly
-
-Each pipeline's `post:` block runs trust checks *before* reporting any timing,
-because several failure modes here produce plausible numbers rather than
-errors:
-
-- **`logical_mb` must be constant** across a page sweep. A run where the
-  package failed to pass `--page-kb` shrank the dataset from 16 GB to 256 MB
-  across the axis and reported a spurious **92×** "page-size effect".
-- **`fits_in_hbm` / `hbm_used_ok`** — a kHBM tier that received nothing is a
-  misconfiguration, not a result. The DPE ranks by a predicted bandwidth model
-  and has been measured leaving a correctly sized HBM tier empty.
-- **checksums compare with a RELATIVE TOLERANCE**, never for equality:
-  `atomicAdd` makes float summation order follow the page and block layout.
-  GNN is the exception — its `final_loss` is bit-identical (3.703790, spread
-  0.0000%) across every page size and block count, which is the strongest
-  correctness evidence in the set.
-- **jarvis's `status` and exit code are not trustworthy.** It has reported
-  "36 successful, 0 failed" for a sweep in which two cells hung and were
-  killed, and exits 0 on an unknown subcommand. Trust the per-cell logs and
-  the `completed` flag.
-- **jarvis's `runtime` column is whole-process wall clock** and is 44–55%
-  setup on these workloads; every pipeline reports the benchmark's own
-  measured time instead.
-
-## Resource guards, one per thing that actually cost runs
-
-The packages refuse a cell up front rather than letting it die mid-run,
-because every one of these failures looked like a hang (a truncated header, no
-error):
-
-| guard | what it caught |
-|---|---|
-| device memory: `blocks × slots × page_kb` + tier | 3 k-means cells (16 GB of cache on an 8 GB card) |
-| host memory: matrix + pinned tier vs `MemAvailable` | GNN OOM-killed (exit 137, no message) |
-| `run_timeout` per cell | a wedged cell stalling an entire 36-cell sweep |
-| pre-flight wait for free VRAM | 3 GNN cells started inside the previous cell's teardown window |
-| window sized in **bytes**, not pages | 2 GNN cells (a 256-page window is 2 GiB at 4 MB pages) |
-
-Sweeps must not run concurrently: a second runtime does not error, it stalls
-on a fraction of the card.
-
-## Known issues
-
-- **Gray-Scott is indicative, not validated.** Its field checksum is not
-  reproducible run to run (3.37e-04 spread on identical settings), which
-  indicates a remaining data race or stale read. Two real defects were found
-  and fixed along the way — missing cross-step flush waits, and per-block
-  caches holding stale copies of neighbours' planes — taking it from 7.71e-03
-  to 8.39e-04, but neither closed it.
-- **Gray-Scott's page axis is confounded**: one page is one XY plane, so page
-  size also changes the grid geometry. Unlike the other workloads it is not a
-  pure paging comparison.
-- **GNN's host tier is `ram`, not `pinned`**, because the trainer transiently
-  holds two host copies of the matrix and pinned pages are unswappable. That
-  penalises its host tier for its allocation type rather than its speed, so
-  GNN's absolute host-tier numbers are not directly comparable with the
-  others'.
-- Two GNN cells at 64 blocks fail sporadically to the VRAM teardown window;
-  the same cells pass on other runs.
-
-## Reaching a checkpoint target faster: capacity, not timesteps
-
-Checkpoint bytes scale with the workload's MEMORY FOOTPRINT, so a fixed I/O
-target can be reached with few large checkpoints instead of many small ones.
-Whether that is *faster* depends on how each paged kernel scales, which is not
-the same across the three.
-
-Measured paged efficiency against problem size:
-
-| workload | small | large | change |
-|---|---|---|---|
-| LAMMPS | 19.6 us/atom-step @ 13.5k | 1.73 @ 665k | **11x better** |
-| LBANN | 55738 us/MiB-epoch @ 64 MiB | 37483 @ 1 GiB | 1.5x better |
-| GROMACS | 0.78 us/atom-step @ 27k | 1.12 @ 216k | slightly **worse** |
-
-Time to generate 50 GB of checkpoints on the paged path:
-
-| workload | small config | large config |
-|---|---|---|
-| LAMMPS | 206 min @ 13.5k atoms | **18 min @ 665k atoms** |
-| LBANN | 15 min @ width 4096 | **10 min @ width 16384** |
-| GROMACS | 58 min @ 27k atoms | 83 min @ 216k atoms |
-
-**LAMMPS: scale up.** It carries a large fixed per-step cost — kernel launch,
-cache drop, list re-upload — that amortizes over a bigger system, so the same
-50 GB costs 18 minutes instead of 206.
-
-**LBANN: scale up modestly.** Its paged cost is mostly per-page fault work, so
-efficiency improves only 1.5x, and most of the win is simply needing 15 epochs
-instead of 248.
-
-**GROMACS: do not.** Its paged kernel is pair work with almost no fixed
-overhead, so per-atom cost is flat and the largest configuration is the
-slowest. Reach the target with more steps at a small size, not fewer at a
-large one.
-
-For the STOCK path none of this matters: compute scales with atoms x steps
-while steps scale as 1/atoms, so compute to a fixed I/O target is invariant
-(~220 s for LAMMPS across a 50x size range) and the I/O itself is a flat
-~76 MB/s regardless of checkpoint size.
+Collected on: NVIDIA GeForce RTX 4070 Laptop (8 GB, sm_89). The 6 GB
+target leaves ~2 GB for context + allocator slack on this card. Block
+caps reference the RTX 5080 spec as the paper target; block counts are
+plain pipeline vars — edit `vars:` to resweep for another card.

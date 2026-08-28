@@ -1,0 +1,62 @@
+# gmx (PME spread+gather) MPI baseline.
+#
+# Axes: mesh K (VRAM axis: the K^3 fixed-point mesh dominates the
+# footprint, and atoms are REPLICATED on every rank) x atom count
+# (runtime axis for spread/gather work). One-shot kernels -- there is no
+# steps knob and no checkpoint phase in this workload.
+config:
+  name: gv_gmx_mpi_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: gmx
+      variant: mpi
+      nprocs: 1
+      mesh_k: 128
+      atoms: 200000
+      prefault: "0"
+      timeout_sec: 600
+      output_dir: /tmp/clio_gv/gmx_mpi_sweep
+
+vars:
+  wl.mesh_k: [64, 128, 192, 256]
+  wl.atoms: [100000, 200000, 400000]
+
+loop:
+  - [wl.mesh_k]
+  - [wl.atoms]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/gmx_mpi_sweep"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      logger.warning(f'{len(bad)} cells failed gates -- excluded from figures')
+  df = df[df.gates_pass == 1]
+  fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+  for atoms, g in df.groupby('wl.atoms'):
+      g = g.sort_values('wl.mesh_k')
+      axes[0].plot(g['wl.mesh_k'], g['bench_ms'], 'o-',
+                   label=f'{atoms//1000}k atoms')
+  axes[0].set_xlabel('mesh K (K^3 nodes)')
+  axes[0].set_ylabel('spread+gather (ms)')
+  axes[0].set_title('gmx MPI: runtime vs mesh x atoms')
+  axes[0].legend()
+  one = df[df['wl.atoms'] == sorted(df['wl.atoms'].unique())[0]]
+  one = one.sort_values('wl.mesh_k')
+  mesh_mb = (one['wl.mesh_k'] ** 3) * 8 / (1 << 20)
+  axes[1].plot(one['wl.mesh_k'], one['vram_delta_mb'], 's-',
+               color='tab:red', label='measured')
+  axes[1].plot(one['wl.mesh_k'], mesh_mb, '--', color='gray',
+               label='K^3 x 8B mesh')
+  axes[1].set_xlabel('mesh K'); axes[1].set_ylabel('VRAM delta (MB)')
+  axes[1].set_title('gmx MPI: peak VRAM vs mesh (nvidia-smi)')
+  axes[1].legend()
+  fig.tight_layout(); fig.savefig('gmx_mpi_sweep.png', dpi=130)
+  logger.info('wrote gmx_mpi_sweep.png')
