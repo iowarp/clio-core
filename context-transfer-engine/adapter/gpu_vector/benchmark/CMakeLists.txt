@@ -27,6 +27,7 @@
 # the ones a SYCL build can descend into.
 add_subdirectory(kmeans)
 add_subdirectory(grayscott)
+add_subdirectory(gmx)
 
 # Still CUDA-only sources. Porting each is the same mechanical split;
 # lammps_md is the outlier, with real __shared__ usage that needs
@@ -34,7 +35,6 @@ add_subdirectory(grayscott)
 if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     add_subdirectory(lammps_md)
     add_subdirectory(gnn)
-    add_subdirectory(gmx)
     add_subdirectory(lbann)
     add_subdirectory(weights)
 endif()

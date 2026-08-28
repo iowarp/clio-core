@@ -8,7 +8,7 @@
  * device_vector.h) are ~4000 lines whose CUDA surface is, when you actually
  * enumerate it, TWELVE NAMES:
  *
- *     threadIdx blockIdx blockDim  __syncthreads __syncthreads_or
+ *     threadIdx blockIdx blockDim gridDim  __syncthreads __syncthreads_or
  *     atomicAdd atomicCAS atomicSub atomicExch
  *     __threadfence __threadfence_system __trap  (+ printf, __nanosleep)
  *
@@ -92,6 +92,13 @@ inline Dim3Ref BlockIdx() {
 inline Dim3Ref BlockDim() {
   return Dim3Ref{
       static_cast<unsigned>(twi::get_nd_item<1>().get_local_range(0)), 1u, 1u};
+}
+/** gridDim: work-GROUPS in the launch, i.e. CUDA blocks. Needed by every
+ *  grid-stride loop (`i += gridDim.x * blockDim.x`), which is how the dense
+ *  reference kernels in the benchmarks walk their arrays. */
+inline Dim3Ref GridDim() {
+  return Dim3Ref{
+      static_cast<unsigned>(twi::get_nd_item<1>().get_group_range(0)), 1u, 1u};
 }
 
 inline void SyncThreads() {
@@ -318,6 +325,7 @@ inline long long Clock64() {
 #define threadIdx (::clio::run::gpu::sycl_compat::ThreadIdx())
 #define blockIdx (::clio::run::gpu::sycl_compat::BlockIdx())
 #define blockDim (::clio::run::gpu::sycl_compat::BlockDim())
+#define gridDim (::clio::run::gpu::sycl_compat::GridDim())
 
 #define __syncthreads() ::clio::run::gpu::sycl_compat::SyncThreads()
 #define __syncthreads_or(p) ::clio::run::gpu::sycl_compat::SyncThreadsOr(p)

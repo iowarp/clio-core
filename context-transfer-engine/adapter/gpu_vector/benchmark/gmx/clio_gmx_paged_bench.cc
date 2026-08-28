@@ -72,395 +72,26 @@ using clio::run::u64;
 static constexpr u32 kYieldLaneBytes = 4096;
 #endif
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
-#define GV_GMX_CORO 1
-#endif
 
-/** Q40.24 fixed point: integer addition commutes, so every sum below is
- *  order-independent and the gates can demand bit equality. */
-static constexpr double kFxScale = 16777216.0;   // 2^24
-
-/** Deterministic pseudo-random atom cloud: same atoms for every path. */
-CTP_INLINE_CROSS_FUN u64 Lcg(u64 s) { return s * 6364136223846793005ull + 1442695040888963407ull; }
-CTP_INLINE_CROSS_FUN float Frac01(u64 s) {
-  return static_cast<float>((s >> 40) & 0xFFFFFF) / 16777216.0f;
-}
-
-/** Cardinal cubic B-spline weights for fractional offset t in [0,1): the
- *  four grid nodes i0..i0+3 with i0 = floor(x) - 1 get M4(t+1..t-2). */
-CTP_INLINE_CROSS_FUN void Spline4(float t, float w[4]) {
-  const float t2 = t * t, t3 = t2 * t;
-  w[0] = (1.0f - 3.0f * t + 3.0f * t2 - t3) / 6.0f;   // node i0,   dist 1+t
-  w[1] = (4.0f - 6.0f * t2 + 3.0f * t3) / 6.0f;       // node i0+1, dist t
-  w[2] = (1.0f + 3.0f * t + 3.0f * t2 - 3.0f * t3) / 6.0f;  // dist 1-t
-  w[3] = t3 / 6.0f;                                    // node i0+3, dist 2-t
-}
-
-#if defined(GV_GMX_CORO)
-
-/**
- * Spread this block's planes. For plane z the contributing atoms are those
- * whose spline base bin b satisfies b <= z <= b+3, i.e. bins z-3..z (mod K).
- * The plane is fetched, written by THIS BLOCK ONLY, published, released.
- * Partial sums are durable at every unpin: if the plane is evicted between
- * two owner visits (it is not -- one visit per plane -- but the rule is what
- * matters), the refault reads the published partials back and accumulation
- * continues, which is the write-site-publish contract the md workload
- * bled for.
+/*
+ * THE DEVICE CODE IS NOT HERE ANY MORE.
+ *
+ * The workload -- the atom generator, the spline weights, the four
+ * coroutines and the dense reference bodies -- lives in gmx_kernels.h (over
+ * gmx_math.h), in ONE copy compiled by both backends. The launches live in
+ * cuda/ and sycl/ and differ only in how a grid is submitted. This file is
+ * the host driver and is now ordinary C++.
+ *
+ * See gmx_launch.h for why the seam is at the launch.
  */
-__device__ gy::YCoroMain SpreadCoro(gv::DeviceVector<unsigned long long> mesh,
-                                    const float *ax, const float *ay,
-                                    const float *az, const long long *aq,
-                                    const u32 *bin_start, u64 K, u64 plane,
-                                    u64 z0, u64 z1) {
-  for (u64 z = z0; z < z1; ++z) {
-    co_await mesh.Fetch(0, z * plane, plane);
-    auto h = co_await mesh.HoldPage(z * plane, plane, /*write=*/true);
-    // Four source bins feed plane z; threads stride the atoms of each bin.
-    for (int db = -3; db <= 0; ++db) {
-      const u64 b = (z + K + static_cast<u64>(db + static_cast<int>(K))) % K;
-      const u32 a0 = bin_start[b];
-      const u32 a1 = bin_start[b + 1];
-      for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-        const float x = ax[a], y = ay[a], zz = az[a];
-        const int ix0 = static_cast<int>(floorf(x)) - 1;
-        const int iy0 = static_cast<int>(floorf(y)) - 1;
-        // Which of the atom's four z-nodes is THIS plane? The bin choice
-        // already guarantees (z - b) mod K lands in 0..3.
-        const int dzw = static_cast<int>((z + K - b) % K);
-        float wx[4], wy[4], wz[4];
-        Spline4(x - floorf(x), wx);
-        Spline4(y - floorf(y), wy);
-        Spline4(zz - floorf(zz), wz);
-        // EXACTLY-CONSERVING SPLIT. Rounding each of the 64 pieces
-        // independently leaves a per-atom residue (measured: 809 fixed-point
-        // units over 200k atoms), so the LAST piece at each level absorbs
-        // the remainder: the four z-pieces sum to q exactly, and the 16
-        // xy-pieces of each z-piece sum to it exactly. Deterministic, so
-        // the dense reference computes the identical values.
-        long long qz4[4];
-        {
-          long long run = 0;
-          for (int j = 0; j < 3; ++j) {
-            qz4[j] = static_cast<long long>(
-                llrint(static_cast<double>(aq[a]) * wz[j]));
-            run += qz4[j];
-          }
-          qz4[3] = aq[a] - run;
-        }
-        const long long qz = qz4[dzw];
-        long long xy_run = 0;
-        for (int jy = 0; jy < 4; ++jy) {
-          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
-                                           static_cast<int>(K));
-          for (int jx = 0; jx < 4; ++jx) {
-            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
-                                            static_cast<int>(K));
-            const long long v =
-                (jy == 3 && jx == 3)
-                    ? qz - xy_run
-                    : static_cast<long long>(llrint(
-                          static_cast<double>(qz) * wy[jy] * wx[jx]));
-            xy_run += v;
-            atomicAdd(reinterpret_cast<unsigned long long *>(
-                          &h[z * plane + gy_ * K + gx]),
-                      static_cast<unsigned long long>(v));
-          }
-        }
-      }
-      __syncthreads();
-    }
-    // PUBLISH AT THE WRITE SITE, then release. One writer per page makes
-    // this ordering sound; eviction after the unpin costs a refault, never
-    // data.
-    co_await mesh.BeginFlush(0, z * plane, plane);
-    mesh.UnpinRange(z * plane, plane);
-  }
-  co_await mesh.EndFlush();
-}
+#include "gmx_kernels.h"
+#include "gmx_launch.h"
 
-__global__ void SpreadKernel(clio::run::IpcManagerGpuInfo info,
-                             gv::DeviceVector<unsigned long long> mesh,
-                             const float *ax, const float *ay, const float *az,
-                             const long long *aq, const u32 *bin_start, u64 K,
-                             u64 plane, u64 zper, gy::YieldableView<> yv,
-                             gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  mesh.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
-  CLIO_YCORO_RUN(SpreadCoro(mesh, ax, ay, az, aq, bin_start, K, plane, z0, z1));
-}
-
-/** Mesh checksum + exact charge total, striding planes across blocks. */
-__device__ gy::YCoroMain SumCoro(gv::DeviceVector<unsigned long long> mesh,
-                                 u64 K, u64 plane, u64 z0, u64 z1,
-                                 unsigned long long *out) {
-  for (u64 z = z0; z < z1; ++z) {
-    co_await mesh.Fetch(0, z * plane, plane);
-    auto h = co_await mesh.HoldPage(z * plane, plane);
-    unsigned long long q = 0, ck = 0;
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      const unsigned long long v = h[z * plane + i];
-      q += v;
-      // Position-dependent mixing so a value landing on the WRONG grid
-      // point cannot cancel: checksum(v at i) != checksum(v at j).
-      ck += v * (2ull * (z * plane + i) + 1ull);
-    }
-    atomicAdd(&out[0], q);
-    atomicAdd(&out[1], ck);
-    __syncthreads();
-    mesh.UnpinRange(z * plane, plane);
-  }
-}
-
-__global__ void SumKernel(clio::run::IpcManagerGpuInfo info,
-                          gv::DeviceVector<unsigned long long> mesh, u64 K,
-                          u64 plane, u64 zper, unsigned long long *out,
-                          gy::YieldableView<> yv, gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  mesh.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
-  CLIO_YCORO_RUN(SumCoro(mesh, K, plane, z0, z1, out));
-}
-
-/**
- * The force-stage read pattern: interpolate the mesh back at every atom
- * position (the potential/force gather of PME, minus the convolution the
- * FFT would have applied). A block owns atom bins; an atom's stencil spans
- * planes iz0..iz0+3, held as a sliding window exactly like the md force
- * stencil. Accumulation is fixed point again, so the result is bit-equal to
- * the dense path.
- */
-__device__ gy::YCoroMain GatherCoro(gv::DeviceVector<unsigned long long> mesh,
-                                    const float *ax, const float *ay,
-                                    const float *az, const long long *aq,
-                                    const u32 *bin_start, u64 K, u64 plane,
-                                    u64 b0, u64 b1, unsigned long long *out) {
-  gv::Held<unsigned long long> hz[4];
-  unsigned long long acc = 0;
-  for (u64 b = b0; b < b1; ++b) {
-    // Atoms in bin b have iz0 == b: hold planes b..b+3 (mod K).
-    for (int j = 0; j < 4; ++j) {
-      const u64 z = (b + static_cast<u64>(j)) % K;
-      co_await mesh.Fetch(0, z * plane, plane);
-      hz[j] = co_await mesh.HoldPage(z * plane, plane);
-    }
-    const u32 a0 = bin_start[b];
-    const u32 a1 = bin_start[b + 1];
-    for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-      const float x = ax[a], y = ay[a], zz = az[a];
-      const int ix0 = static_cast<int>(floorf(x)) - 1;
-      const int iy0 = static_cast<int>(floorf(y)) - 1;
-      float wx[4], wy[4], wzS[4];
-      Spline4(x - floorf(x), wx);
-      Spline4(y - floorf(y), wy);
-      Spline4(zz - floorf(zz), wzS);
-      double phi = 0.0;
-      for (int jz = 0; jz < 4; ++jz) {
-        const u64 z = (b + static_cast<u64>(jz)) % K;
-        double pl = 0.0;
-        for (int jy = 0; jy < 4; ++jy) {
-          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
-                                           static_cast<int>(K));
-          double row = 0.0;
-          for (int jx = 0; jx < 4; ++jx) {
-            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
-                                            static_cast<int>(K));
-            const long long v = static_cast<long long>(
-                hz[jz][z * plane + gy_ * K + gx]);
-            row += static_cast<double>(v) * wx[jx];
-          }
-          pl += row * wy[jy];
-        }
-        phi += pl * wzS[jz];
-      }
-      // q_a * phi(x_a), requantized: exact and order-independent.
-      acc += static_cast<unsigned long long>(static_cast<long long>(
-          llrint(phi * (static_cast<double>(aq[a]) / kFxScale))));
-    }
-    __syncthreads();
-    for (int j = 0; j < 4; ++j) {
-      const u64 z = (b + static_cast<u64>(j)) % K;
-      hz[j] = {};
-      mesh.UnpinRange(z * plane, plane);
-    }
-  }
-  atomicAdd(out, acc);
-}
-
-__global__ void GatherKernel(clio::run::IpcManagerGpuInfo info,
-                             gv::DeviceVector<unsigned long long> mesh,
-                             const float *ax, const float *ay, const float *az,
-                             const long long *aq, const u32 *bin_start, u64 K,
-                             u64 plane, u64 bper, unsigned long long *out,
-                             gy::YieldableView<> yv, gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  mesh.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 b0 = static_cast<u64>(yv.Block()) * bper;
-  const u64 b1 = (b0 + bper < K) ? (b0 + bper) : K;
-  CLIO_YCORO_RUN(GatherCoro(mesh, ax, ay, az, aq, bin_start, K, plane, b0, b1,
-                            out));
-}
-
-/** Zero this block's planes and publish, so a fault after eviction reads
- *  zeros rather than "blob not found". */
-__device__ gy::YCoroMain ZeroCoro(gv::DeviceVector<unsigned long long> mesh,
-                                  u64 plane, u64 z0, u64 z1) {
-  for (u64 z = z0; z < z1; ++z) {
-    co_await mesh.Fetch(0, z * plane, plane);
-    auto h = co_await mesh.HoldPage(z * plane, plane, /*write=*/true);
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) h[z * plane + i] = 0;
-    __syncthreads();
-    co_await mesh.BeginFlush(0, z * plane, plane);
-    mesh.UnpinRange(z * plane, plane);
-  }
-  co_await mesh.EndFlush();
-}
-
-__global__ void ZeroKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<unsigned long long> mesh, u64 K,
-                           u64 plane, u64 zper, gy::YieldableView<> yv,
-                           gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  mesh.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
-  CLIO_YCORO_RUN(ZeroCoro(mesh, plane, z0, z1));
-}
-
-// ---------------- DENSE REFERENCE (plain cudaMalloc, no paging) -----------
-
-__global__ void DenseSpreadKernel(unsigned long long *mesh, const float *ax,
-                                  const float *ay, const float *az,
-                                  const long long *aq, const u32 *bin_start,
-                                  u64 K, u64 plane, u64 zper) {
-  const u64 z0 = static_cast<u64>(blockIdx.x) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
-  for (u64 z = z0; z < z1; ++z) {
-    for (int db = -3; db <= 0; ++db) {
-      const u64 b = (z + K + static_cast<u64>(db + static_cast<int>(K))) % K;
-      const u32 a0 = bin_start[b];
-      const u32 a1 = bin_start[b + 1];
-      for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-        const float x = ax[a], y = ay[a], zz = az[a];
-        const int ix0 = static_cast<int>(floorf(x)) - 1;
-        const int iy0 = static_cast<int>(floorf(y)) - 1;
-        // Which of the atom's four z-nodes is THIS plane? The bin choice
-        // already guarantees (z - b) mod K lands in 0..3.
-        const int dzw = static_cast<int>((z + K - b) % K);
-        float wx[4], wy[4], wz[4];
-        Spline4(x - floorf(x), wx);
-        Spline4(y - floorf(y), wy);
-        Spline4(zz - floorf(zz), wz);
-        // EXACTLY-CONSERVING SPLIT. Rounding each of the 64 pieces
-        // independently leaves a per-atom residue (measured: 809 fixed-point
-        // units over 200k atoms), so the LAST piece at each level absorbs
-        // the remainder: the four z-pieces sum to q exactly, and the 16
-        // xy-pieces of each z-piece sum to it exactly. Deterministic, so
-        // the dense reference computes the identical values.
-        long long qz4[4];
-        {
-          long long run = 0;
-          for (int j = 0; j < 3; ++j) {
-            qz4[j] = static_cast<long long>(
-                llrint(static_cast<double>(aq[a]) * wz[j]));
-            run += qz4[j];
-          }
-          qz4[3] = aq[a] - run;
-        }
-        const long long qz = qz4[dzw];
-        long long xy_run = 0;
-        for (int jy = 0; jy < 4; ++jy) {
-          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
-                                           static_cast<int>(K));
-          for (int jx = 0; jx < 4; ++jx) {
-            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
-                                            static_cast<int>(K));
-            const long long v =
-                (jy == 3 && jx == 3)
-                    ? qz - xy_run
-                    : static_cast<long long>(llrint(
-                          static_cast<double>(qz) * wy[jy] * wx[jx]));
-            xy_run += v;
-            atomicAdd(&mesh[z * plane + gy_ * K + gx],
-                      static_cast<unsigned long long>(v));
-          }
-        }
-      }
-      __syncthreads();
-    }
-  }
-}
-
-__global__ void DenseSumKernel(const unsigned long long *mesh, u64 n,
-                               unsigned long long *out) {
-  unsigned long long q = 0, ck = 0;
-  for (u64 i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-       i += static_cast<u64>(gridDim.x) * blockDim.x) {
-    q += mesh[i];
-    ck += mesh[i] * (2ull * i + 1ull);
-  }
-  atomicAdd(&out[0], q);
-  atomicAdd(&out[1], ck);
-}
-
-__global__ void DenseGatherKernel(const unsigned long long *mesh,
-                                  const float *ax, const float *ay,
-                                  const float *az, const long long *aq,
-                                  const u32 *bin_start, u64 K, u64 plane,
-                                  u64 bper, unsigned long long *out) {
-  const u64 b0 = static_cast<u64>(blockIdx.x) * bper;
-  const u64 b1 = (b0 + bper < K) ? (b0 + bper) : K;
-  unsigned long long acc = 0;
-  for (u64 b = b0; b < b1; ++b) {
-    const u32 a0 = bin_start[b];
-    const u32 a1 = bin_start[b + 1];
-    for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-      const float x = ax[a], y = ay[a], zz = az[a];
-      const int ix0 = static_cast<int>(floorf(x)) - 1;
-      const int iy0 = static_cast<int>(floorf(y)) - 1;
-      float wx[4], wy[4], wzS[4];
-      Spline4(x - floorf(x), wx);
-      Spline4(y - floorf(y), wy);
-      Spline4(zz - floorf(zz), wzS);
-      double phi = 0.0;
-      for (int jz = 0; jz < 4; ++jz) {
-        const u64 z = (b + static_cast<u64>(jz)) % K;
-        double pl = 0.0;
-        for (int jy = 0; jy < 4; ++jy) {
-          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
-                                           static_cast<int>(K));
-          double row = 0.0;
-          for (int jx = 0; jx < 4; ++jx) {
-            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
-                                            static_cast<int>(K));
-            const long long v =
-                static_cast<long long>(mesh[z * plane + gy_ * K + gx]);
-            row += static_cast<double>(v) * wx[jx];
-          }
-          pl += row * wy[jy];
-        }
-        phi += pl * wzS[jz];
-      }
-      acc += static_cast<unsigned long long>(static_cast<long long>(
-          llrint(phi * (static_cast<double>(aq[a]) / kFxScale))));
-    }
-    __syncthreads();
-  }
-  atomicAdd(out, acc);
-}
-
-#endif  // GV_GMX_CORO
+namespace gx = clio::gv_bench::gmx;
+using gx::Frac01;
+using gx::kFxScale;
+using gx::Lcg;
+using gx::Spline4;
 
 #if !CTP_IS_DEVICE_PASS
 
@@ -473,7 +104,6 @@ double NowMs() {
       .count();
 }
 
-#if defined(GV_GMX_CORO)
 class YieldRunner {
  public:
   YieldRunner(unsigned nblocks, unsigned nthreads)
@@ -493,7 +123,6 @@ class YieldRunner {
   gy::Yieldable<> drv_;
   gy::YieldStack stack_;
 };
-#endif
 
 }  // namespace
 
@@ -530,10 +159,8 @@ int main(int argc, char **argv) {
     }
   }
 
-#if !defined(GV_GMX_CORO)
-  std::fprintf(stderr, "GMX ERROR: built without C++20 device coroutines.\n");
-  return 2;
-#else
+  // The coroutine-mode refusal moved with the kernels: a build that cannot
+  // compile them does not produce this target at all now.
   // One page = one XY plane of u64 mesh points: K^2 * 8 bytes. ANY K whose
   // plane is exactly the page works, not just powers of two -- the MPI
   // edition takes arbitrary K, and matching its 6 GB-class meshes (e.g.
@@ -605,6 +232,10 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+  // Per-block device state the SYCL backend allocates once; no-op on CUDA.
+  // WITHOUT THIS the first paged launch reads a null IpcManager and faults
+  // inside BeginFetch -- memcheck: "Invalid __global__ read ... Access to 0x0".
+  gx::InitBackend(blocks, gpu);
 
   std::printf("PME spread+gather over a GPU vector\n"
               "  mesh=%llu^3 (page = one %lluKB plane, %llu planes)\n"
@@ -680,13 +311,13 @@ int main(int argc, char **argv) {
         nmesh * sizeof(unsigned long long));
     ctp::GpuApi::Memset(d_mesh, 0, nmesh * sizeof(unsigned long long));
     const double t_ref0 = NowMs();
-    DenseSpreadKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq,
-                                           d_bs, K, plane, zper);
+    gx::LaunchDenseSpread(blocks, threads, d_mesh, d_ax, d_ay, d_az, d_aq,
+                          d_bs, K, plane, zper);
     ctp::GpuApi::Synchronize();
     t_ref_spread = NowMs() - t_ref0;
-    DenseSumKernel<<<64, 256>>>(d_mesh, nmesh, d_out);
-    DenseGatherKernel<<<blocks, threads>>>(d_mesh, d_ax, d_ay, d_az, d_aq,
-                                           d_bs, K, plane, bper, &d_out[2]);
+    gx::LaunchDenseSum(d_mesh, nmesh, d_out);
+    gx::LaunchDenseGather(blocks, threads, d_mesh, d_ax, d_ay, d_az, d_aq,
+                          d_bs, K, plane, bper, &d_out[2]);
     ctp::GpuApi::Synchronize();
     ctp::GpuApi::Memcpy(ref, d_out, sizeof(ref));
     ctp::GpuApi::Free(d_mesh);
@@ -704,7 +335,7 @@ int main(int argc, char **argv) {
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                  gy::YieldStackView sv) {
-    ZeroKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dmesh, K, plane, zper, vw,
+    gx::LaunchZero(g, b, gpu, dmesh, K, plane, zper, vw,
                                                 sv);
   });
   ctp::GpuApi::Synchronize();
@@ -715,7 +346,7 @@ int main(int argc, char **argv) {
     if (r != 0) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
-        ZeroKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dmesh, K, plane, zper,
+        gx::LaunchZero(g, b, gpu, dmesh, K, plane, zper,
                                                     vw, sv);
       });
       ctp::GpuApi::Synchronize();
@@ -723,9 +354,8 @@ int main(int argc, char **argv) {
     const double t0 = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      SpreadKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dmesh, d_ax, d_ay,
-                                                    d_az, d_aq, d_bs, K, plane,
-                                                    zper, vw, sv);
+      gx::LaunchSpread(g, b, gpu, dmesh, d_ax, d_ay, d_az, d_aq, d_bs, K,
+                       plane, zper, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     const double t1 = NowMs();
@@ -733,15 +363,13 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Memset(d_out, 0, 4 * sizeof(unsigned long long));
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      SumKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dmesh, K, plane, zper,
-                                                 d_out, vw, sv);
+      gx::LaunchSum(g, b, gpu, dmesh, K, plane, zper, d_out, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      GatherKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dmesh, d_ax, d_ay,
-                                                    d_az, d_aq, d_bs, K, plane,
-                                                    bper, &d_out[2], vw, sv);
+      gx::LaunchGather(g, b, gpu, dmesh, d_ax, d_ay, d_az, d_aq, d_bs, K,
+                       plane, bper, &d_out[2], vw, sv);
     });
     ctp::GpuApi::Synchronize();
     t_gather += NowMs() - t1;
@@ -793,6 +421,5 @@ int main(int argc, char **argv) {
                               : "GMX BENCH: GATE FAILURE");
   BenchFlushData();
   return rc;
-#endif  // GV_GMX_CORO
 }
 #endif  // !CTP_IS_DEVICE_PASS
