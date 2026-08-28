@@ -29,7 +29,10 @@
  * Runs before the runtime starts, so it measures an otherwise idle device.
  */
 
-#include <cuda_runtime.h>
+// ctp::GpuApi, not cuda_runtime.h: this probe is a reference measurement for
+// the paging path, and the paging path now has more than one backend. Every
+// call below dispatches to CUDA, ROCm or SYCL.
+#include <clio_ctp/util/gpu_api.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -46,20 +49,16 @@ static inline double ProbeOne(void *dev, void *host, size_t page_bytes,
   // Warm up: the first copies pay context and mapping costs that have nothing
   // to do with the steady-state rate.
   for (int i = 0; i < 8; ++i) {
-    if (cudaMemcpy(dev, host, page_bytes, cudaMemcpyHostToDevice) !=
-        cudaSuccess) {
-      return 0.0;
-    }
+    ctp::GpuApi::Memcpy(static_cast<char *>(dev),
+                        static_cast<const char *>(host), page_bytes);
   }
-  if (cudaDeviceSynchronize() != cudaSuccess) return 0.0;
+  ctp::GpuApi::Synchronize();
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i) {
-    if (cudaMemcpy(dev, host, page_bytes, cudaMemcpyHostToDevice) !=
-        cudaSuccess) {
-      return 0.0;
-    }
+    ctp::GpuApi::Memcpy(static_cast<char *>(dev),
+                        static_cast<const char *>(host), page_bytes);
   }
-  if (cudaDeviceSynchronize() != cudaSuccess) return 0.0;
+  ctp::GpuApi::Synchronize();
   const double s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
           .count();
@@ -80,14 +79,14 @@ static inline MemcpyProbe ProbeMemcpyBandwidth(size_t page_bytes) {
   if (iters < 16) iters = 16;
   if (iters > 512) iters = 512;
 
-  void *dev = nullptr;
-  if (cudaMalloc(&dev, page_bytes) != cudaSuccess) return r;
+  char *dev = ctp::GpuApi::Malloc<char>(page_bytes);
+  if (dev == nullptr) return r;
 
-  void *hp = nullptr;
-  if (cudaHostAlloc(&hp, page_bytes, cudaHostAllocDefault) == cudaSuccess) {
+  char *hp = ctp::GpuApi::MallocHost<char>(page_bytes);
+  if (hp != nullptr) {
     std::memset(hp, 1, page_bytes);
     r.pinned_gbps = ProbeOne(dev, hp, page_bytes, iters);
-    cudaFreeHost(hp);
+    ctp::GpuApi::FreeHost(hp);
   }
 
   void *hq = std::malloc(page_bytes);
@@ -97,7 +96,7 @@ static inline MemcpyProbe ProbeMemcpyBandwidth(size_t page_bytes) {
     std::free(hq);
   }
 
-  cudaFree(dev);
+  ctp::GpuApi::Free(dev);
   return r;
 }
 

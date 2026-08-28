@@ -69,202 +69,35 @@ static constexpr u32 kYieldLaneBytes = 4096;
 static constexpr u32 kYieldLaneBytes = 256;
 #endif
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
-#define GV_KM_CORO 1
-#endif
 
-/** Deterministic synthetic coordinate: cluster-structured, so the assignment
- *  step does real work instead of every point landing on one centroid. */
-CTP_INLINE_CROSS_FUN float PointVal(u64 idx, u32 dims, u32 k) {
-  const u64 point = idx / dims;
-  const u64 dim = idx % dims;
-  const u64 cluster = point % k;            // ground-truth cluster
-  const float centre = static_cast<float>(cluster) * 8.0f;
-  // Deterministic jitter in [-1, 1]; cheap hash so it is reproducible on host
-  // and device without a RNG state.
-  const u64 h = (point * 6364136223846793005ull + dim * 1442695040888963407ull);
-  const float jitter =
-      static_cast<float>(static_cast<u32>(h >> 40)) * (2.0f / 16777216.0f) - 1.0f;
-  return centre + jitter;
-}
-
-/** Squared distance from a point to a centroid, over `dims`. */
-CTP_GPU_FUN float DistSq(const float *pt, const float *cent, u32 dims) {
-  float d = 0.0f;
-  for (u32 i = 0; i < dims; ++i) {
-    const float x = pt[i] - cent[i];
-    d += x * x;
-  }
-  return d;
-}
-
-// ---------------------------------------------------------------------------
-// Seed: write the point set into the vector, one page at a time.
-// ---------------------------------------------------------------------------
-#if defined(GV_KM_CORO)
-__device__ gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
-                                  u64 page_elems, u32 dims, u32 k, u32 block) {
-  const u64 base = static_cast<u64>(block) * per;
-  for (u64 off = 0; off < per; off += page_elems) {
-    const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.Fetch(0, base + off, n);
-    auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
-    for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      h[base + off + i] = PointVal(base + off + i, dims, k);
-    }
-    // Collective: name the page just written.
-    co_await v.BeginFlush(0, base + off, n);
-    // Fetch is the pinner; UnpinRange is the releaser.
-    v.UnpinRange(base + off, n);
-  }
-  // Collect every flush started above: only explicit flushes write data back
-  // now (drops refuse dirty pages), so a seeded page left in flight or left
-  // to eviction would simply be lost.
-  co_await v.EndFlush();
-}
-
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<float> v, u64 per, u64 page_elems,
-                           u32 dims, u32 k, gy::YieldableView<> yv,
-                           gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(SeedCoro(v, per, page_elems, dims, k, yv.Block()));
-}
-
-/**
- * One Lloyd assignment pass over this block's slice.
+/*
+ * THE DEVICE CODE IS NOT HERE ANY MORE.
  *
- * Centroid sums are accumulated with global atomics rather than a shared-memory
- * reduction: k*dims is small, the loop is dominated by paging, and a shared
- * tile would have to be sized at compile time for the largest k this accepts.
+ * The workload -- PointVal, SeedCoro, AssignCoro, the baseline body, the
+ * centroid update -- lives in kmeans_kernels.h, in ONE copy compiled by both
+ * backends. The launches live in cuda/ and sycl/, which differ only in how a
+ * grid is submitted. This file is the host driver and is now ordinary C++:
+ * no kernels, no `<<<>>>`, no device pass to keep out of.
+ *
+ * See kmeans_launch.h for why the seam is at the launch and not somewhere
+ * tidier.
  */
-__device__ gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
-                                    u64 page_elems, u32 dims, u32 k,
-                                    const float *cent, float *sums,
-                                    unsigned *counts, u32 block) {
-  const u64 base = static_cast<u64>(block) * per;
-  for (u64 off = 0; off < per; off += page_elems) {
-    const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
-    co_await v.Fetch(0, base + off, n);
-    // Read-only pass: no write intent, so every page stays clean and the
-    // oversubscribed streaming read sheds pages without writeback.
-    auto h = co_await v.HoldPage(base + off, n);
-    // Whole pages hold whole points (enforced on the host), so a page is
-    // exactly n/dims points and no point straddles a page boundary.
-    const u64 npts = n / dims;
-    for (u64 p = threadIdx.x; p < npts; p += blockDim.x) {
-      const u64 pbase = base + off + p * dims;
-      float best = 3.4e38f;
-      u32 bestk = 0;
-      for (u32 c = 0; c < k; ++c) {
-        float d = 0.0f;
-        for (u32 i = 0; i < dims; ++i) {
-          const float x = h[pbase + i] - cent[c * dims + i];
-          d += x * x;
-        }
-        if (d < best) { best = d; bestk = c; }
-      }
-      for (u32 i = 0; i < dims; ++i) {
-        atomicAdd(&sums[bestk * dims + i], h[pbase + i]);
-      }
-      atomicAdd(&counts[bestk], 1u);
-    }
-    __syncthreads();
-    // NO RELEASE HINT HERE. Telling the cache "this page is dead after use"
-    // was measured to be actively WRONG: the page IS re-read on the next
-    // Lloyd pass, and the frequency policy was retaining ~10% of them across
-    // passes. Releasing guaranteed a 0% hit rate and cost ~6% in rescore
-    // traffic on top. The unpin below is NOT that hint -- it gives back the
-    // fetch's reservation and leaves the page resident.
-    v.UnpinRange(base + off, n);
-  }
-}
+#include "kmeans_kernels.h"
+#include "kmeans_launch.h"
 
-__global__ void AssignKernel(clio::run::IpcManagerGpuInfo info,
-                             gv::DeviceVector<float> v, u64 per, u64 page_elems,
-                             u32 dims, u32 k, const float *cent, float *sums,
-                             unsigned *counts, gy::YieldableView<> yv,
-                             gy::YieldStackView ys) {
-  CLIO_GPU_INIT(info, nullptr);
-  v.Init(yv.Block());
-  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
-  __syncthreads();
-  CLIO_YCORO_RUN(AssignCoro(v, per, page_elems, dims, k, cent, sums, counts,
-                            yv.Block()));
-}
-#else
-// The macro/Duff's-device mechanism is not implemented for this benchmark.
-// It exists only so the file still compiles under nvcc; the run refuses to
-// proceed (see main), rather than silently measuring a different code path.
-__global__ void SeedKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector<float> v, u64 per, u64 page_elems,
-                           u32 dims, u32 k, gy::YieldableView<> yv,
-                           gy::YieldStackView ys) {
-  (void)info; (void)v; (void)per; (void)page_elems; (void)dims; (void)k;
-  (void)yv; (void)ys;
-}
-__global__ void AssignKernel(clio::run::IpcManagerGpuInfo info,
-                             gv::DeviceVector<float> v, u64 per, u64 page_elems,
-                             u32 dims, u32 k, const float *cent, float *sums,
-                             unsigned *counts, gy::YieldableView<> yv,
-                             gy::YieldStackView ys) {
-  (void)info; (void)v; (void)per; (void)page_elems; (void)dims; (void)k;
-  (void)cent; (void)sums; (void)counts; (void)yv; (void)ys;
-}
-#endif  // GV_KM_CORO
+namespace kb = clio::gv_bench::kmeans;
+using kb::PointVal;
 
-/**
- * BASELINE KERNEL -- the out-of-core model WITHOUT in-kernel faulting.
- *
- * The control for the GPU vector's claim: storage I/O synchronous, HBM<->DRAM
- * copy synchronous, and the kernel torn down for every transfer. One launch
- * per tile, nothing overlapped.
- *
- * Reads its points from a STAGED TILE rather than through the vector, but
- * performs the identical assignment and the identical atomicAdds, so the
- * centroid checksum is directly comparable with the paged path -- with the
- * usual relative tolerance, since atomicAdd makes float summation order
- * follow the launch layout.
- */
-__global__ void KmeansBaselineKernel(const float *tile, u64 n, u32 dims, u32 k,
-                                     const float *cent, float *sums,
-                                     unsigned *counts) {
-  const u64 npts = n / dims;
-  for (u64 p = threadIdx.x; p < npts; p += blockDim.x) {
-    const float *pt = tile + p * dims;
-    float best = 3.4e38f;
-    u32 bestk = 0;
-    for (u32 c = 0; c < k; ++c) {
-      float d = 0.0f;
-      for (u32 i = 0; i < dims; ++i) {
-        const float x = pt[i] - cent[c * dims + i];
-        d += x * x;
-      }
-      if (d < best) { best = d; bestk = c; }
-    }
-    for (u32 i = 0; i < dims; ++i) {
-      atomicAdd(&sums[bestk * dims + i], pt[i]);
-    }
-    atomicAdd(&counts[bestk], 1u);
-  }
-}
-
-/** centroid = sum / count, leaving an empty cluster where it was. */
-__global__ void UpdateKernel(float *cent, const float *sums,
-                             const unsigned *counts, u32 dims, u32 k) {
-  const u32 c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= k) return;
-  const unsigned n = counts[c];
-  if (n == 0) return;
-  for (u32 i = 0; i < dims; ++i) {
-    cent[c * dims + i] = sums[c * dims + i] / static_cast<float>(n);
-  }
-}
-
+// HOST DRIVER ONLY BELOW THIS LINE.
+//
+// There is no device code left in this file, but under CUDA it is still
+// compiled BY the CUDA compiler (add_cuda_executable compiles every source
+// as CUDA), and that device pass member-checks host bodies -- gv::Vector and
+// the CTE client are `#if !CTP_IS_DEVICE_PASS` and simply do not exist
+// there. Under SYCL this guard is transparent: the driver is a plain C++ TU,
+// so CTP_IS_DEVICE_PASS is 0 and everything below compiles once.
 #if !CTP_IS_DEVICE_PASS
+
 
 namespace {
 
@@ -342,14 +175,6 @@ int main(int argc, char **argv) {
     }
   }
 
-#if !defined(GV_KM_CORO)
-  std::fprintf(stderr,
-               "KMEANS ERROR: built without C++20 device coroutines. This "
-               "benchmark only implements the coroutine paging path; running "
-               "it under nvcc would measure nothing. Rebuild with "
-               "-DCLIO_GPU_YIELD_CORO=ON and CMAKE_CUDA_COMPILER=clang++.\n");
-  return 2;
-#else
   const u64 page_bytes = page_kb * 1024;
   // REFERENCE CEILING for the paging path: a bare H2D cudaMemcpy at exactly
   // this page size, on an idle device before the runtime starts. The gap
@@ -447,6 +272,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+  // Per-block device state the SYCL backend allocates once; no-op on CUDA.
+  kb::InitBackend(blocks, gpu);
 
   std::printf("kmeans over a GPU vector\n"
               "  blocks=%u threads=%u dims=%u k=%u iters=%u\n"
@@ -471,8 +298,7 @@ int main(int argc, char **argv) {
 
   // ---- seed the point set -------------------------------------------------
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-    SeedKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dev, per, page_elems,
-                                                dims, k, vw, sv);
+    kb::LaunchSeed(g, b, gpu, dev, per, page_elems, dims, k, vw, sv);
   });
   ctp::GpuApi::Synchronize();
 
@@ -520,8 +346,8 @@ int main(int argc, char **argv) {
       if (gf->GetReturnCode() != 0) continue;
       ctp::GpuApi::Memcpy(reinterpret_cast<char *>(bl_dev), bl_host.ptr_,
                           static_cast<size_t>(page_bytes));
-      KmeansBaselineKernel<<<1, threads>>>(bl_dev, page_elems, dims, k, d_cent,
-                                           d_sums, d_counts);
+      kb::LaunchBaseline(threads, bl_dev, page_elems, dims, k, d_cent, d_sums,
+                         d_counts);
       ctp::GpuApi::Synchronize();
     }
     return true;
@@ -545,12 +371,11 @@ int main(int argc, char **argv) {
       } else {
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
-          AssignKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-              gpu, dev, per, page_elems, dims, k, d_cent, d_sums, d_counts, vw,
-              sv);
+          kb::LaunchAssign(g, b, gpu, dev, per, page_elems, dims, k, d_cent,
+                           d_sums, d_counts, vw, sv);
         });
       }
-      UpdateKernel<<<(k + 63) / 64, 64>>>(d_cent, d_sums, d_counts, dims, k);
+      kb::LaunchUpdate(d_cent, d_sums, d_counts, dims, k);
     }
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
@@ -635,7 +460,6 @@ int main(int argc, char **argv) {
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
-#endif  // GV_KM_CORO
 }
 
 #endif  // !CTP_IS_DEVICE_PASS

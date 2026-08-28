@@ -49,8 +49,16 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   auto handles = PlaceTaskSlots(base, alloc_id, gpu_id);
   REQUIRE(handles.size() == kNumTasks);
 
-  clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
+  // GetGpuInfo is a HOST-ONLY IpcManager member, and this translation unit
+  // is compiled twice -- DPC++ member-checks the whole TU in its device pass
+  // as well, because the kernels below live inside this function. So the
+  // call is guarded while the variable is not: the kernel-argument layout
+  // must be identical in both passes (see the capture note further down).
+  clio::run::IpcManagerGpuInfo gpu_info{};
+#if CTP_IS_HOST
+  gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
   REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
+#endif
 
   // Stage gpu_info, kernel-scope IpcManager, and the FullPtr array in
   // shared USM so each kernel functor can capture pointers by value.

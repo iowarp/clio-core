@@ -61,7 +61,12 @@ endif()
 #
 # Not built at all unless the GPU toolchain is clang. A build that cannot
 # compile the vector should not offer its targets.
-if ((CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM) AND CLIO_GPU_CLANG)
+# SYCL qualifies for the same reason clang-CUDA does, and needs no flag to
+# say so: a SYCL device compiler is always clang (DPC++) or AdaptiveCpp, so
+# the toolchain question CLIO_GPU_CLANG answers for CUDA has only one
+# possible answer here.
+if (((CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM) AND CLIO_GPU_CLANG)
+    OR CLIO_CORE_ENABLE_SYCL)
     add_subdirectory(gpu_vector)
 elseif (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     message(STATUS

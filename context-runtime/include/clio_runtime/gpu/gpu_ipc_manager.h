@@ -39,6 +39,8 @@
 #include "clio_runtime/task.h"
 #include "clio_runtime/gpu/gpu_info.h"
 #include "clio_runtime/gpu/gpu_device_ring.h"
+// blockIdx, for the per-block GetBlockIpcManager under SYCL. Inert on CUDA.
+#include "clio_ctp/util/sycl_cuda_compat.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 
@@ -50,6 +52,25 @@
 
 namespace clio::run {
 namespace gpu {
+
+#if CTP_ENABLE_SYCL
+/** Base of the per-block IpcManager array; see GetBlockIpcManager below.
+ *  Installed by the host with SyclInitBlockIpcManagers.
+ *
+ *  Defined only by the TU that owns the kernels -- see the same rule, and
+ *  the DPC++ double-registration abort that motivates it, in yield_stack.h. */
+#if defined(CLIO_SYCL_KERNEL_TU)
+// device_image_scope for the same reason as the yield globals; see
+// yield_stack.h.
+inline ::sycl::ext::oneapi::experimental::device_global<
+    char *, decltype(::sycl::ext::oneapi::experimental::properties(
+                ::sycl::ext::oneapi::experimental::device_image_scope))>
+    g_sycl_block_ipc;
+inline char *SyclBlockIpcBase() { return g_sycl_block_ipc.get(); }
+#else
+inline char *SyclBlockIpcBase() { return nullptr; }
+#endif
+#endif
 
 /**
  * Producer-only GPU IPC infrastructure manager.
@@ -142,6 +163,24 @@ class IpcManager {
   static CTP_GPU_FUN __noinline__ IpcManager *GetBlockIpcManager() {
     __shared__ char s_ipc_bytes[sizeof(IpcManager)];
     return reinterpret_cast<IpcManager *>(s_ipc_bytes);
+  }
+#elif CTP_ENABLE_SYCL
+  /**
+   * SYCL: the same PER-BLOCK IpcManager, in global memory.
+   *
+   * Callers reachable from a kernel (IpcGpu2Cpu::SendIn, and every submit
+   * site in device_vector.h) resolve it by plain symbol lookup with no
+   * parameter, which is the whole reason the CUDA version is `__shared__`
+   * rather than a kernel argument. SYCL has no `__shared__` a free function
+   * can name, so the array lives in USM and the host installs its base --
+   * exactly the arrangement YieldTls uses for YieldSmem.
+   *
+   * ONE PER BLOCK, not one global: `probe_slot_` is per-block mutable state
+   * that SendIn stamps for the submission in flight. Sharing a single record
+   * across the grid would let blocks overwrite each other's probe slot.
+   */
+  static IpcManager *GetBlockIpcManager() {
+    return reinterpret_cast<IpcManager *>(SyclBlockIpcBase()) + blockIdx.x;
   }
 #endif  // CTP_IS_GPU_COMPILER
 
@@ -332,9 +371,50 @@ class IpcManager {
 
 #if CTP_IS_SYCL_COMPILER
 
-#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                  \
-  clio::run::gpu::IpcManager *g_ipc_manager_ptr = (ipc_ptr);                        \
-  g_ipc_manager_ptr->ClientInitGpu(gpu_info);                                 \
+/**
+ * Allocate and publish the per-block IpcManager array. Call ONCE on the host
+ * before launching any kernel that submits tasks, with the widest grid those
+ * kernels will use.
+ *
+ * gpu_info is stamped here rather than at kernel entry: it is the same value
+ * for every block and every launch, so writing it once on the host removes a
+ * store and a barrier from the kernel prologue. The CUDA path cannot do this
+ * -- its IpcManager is __shared__ and therefore born fresh, and uninitialized,
+ * at every launch.
+ */
+namespace clio::run::gpu {
+inline void SyclInitBlockIpcManagers(clio::run::u32 nblocks,
+                                     const clio::run::IpcManagerGpuInfo &gpu_info) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t bytes = static_cast<size_t>(nblocks) * sizeof(IpcManager);
+  char *base = static_cast<char *>(sycl::malloc_device(bytes, q));
+  q.memset(base, 0, bytes).wait();
+  clio::run::IpcManagerGpuInfo info = gpu_info;
+  q.parallel_for(sycl::range<1>(nblocks), [=](sycl::id<1> i) {
+     reinterpret_cast<IpcManager *>(base)[i[0]].gpu_info_ = info;
+     reinterpret_cast<IpcManager *>(base)[i[0]].probe_slot_ = kProbeNoSlot;
+   }).wait();
+#if defined(CLIO_SYCL_KERNEL_TU)
+  q.copy(&base, g_sycl_block_ipc, 1).wait();
+#else
+  // Unreachable in practice: this function submits kernels, so only a
+  // -fsycl TU can call it, and the one that does owns the device global.
+  (void)base;
+#endif
+}
+}  // namespace clio::run::gpu
+
+/**
+ * SYCL: nothing to do at kernel entry -- SyclInitBlockIpcManagers already
+ * stamped gpu_info into every block's record on the host, and
+ * GetBlockIpcManager finds this block's by symbol lookup. The names are kept
+ * so a kernel body reads the same as its CUDA twin.
+ */
+#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                      \
+  (void)(gpu_info);                                                           \
+  (void)(ipc_ptr);                                                            \
+  clio::run::gpu::IpcManager *g_ipc_manager_ptr =                             \
+      clio::run::gpu::IpcManager::GetBlockIpcManager();                       \
   clio::run::gpu::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
 
 #else  // CUDA / ROCm

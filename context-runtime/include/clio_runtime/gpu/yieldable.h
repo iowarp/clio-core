@@ -126,10 +126,10 @@ struct YieldableView {
   clio::run::u32 num_pending_ = 0;
   clio::run::u32 num_blocks_ = 0;
 
-#if defined(__CUDACC__)
-  __device__ clio::run::u32 Block() const { return pending_[blockIdx.x]; }
-  __device__ YieldBlockState *Y() const { return &yield_[Block()]; }
-  __device__ StateT *State() const { return &user_[Block()]; }
+#if defined(__CUDACC__) || CTP_IS_SYCL_COMPILER
+  CTP_GPU_FUN clio::run::u32 Block() const { return pending_[blockIdx.x]; }
+  CTP_GPU_FUN YieldBlockState *Y() const { return &yield_[Block()]; }
+  CTP_GPU_FUN StateT *State() const { return &user_[Block()]; }
 #endif
 };
 

@@ -2132,6 +2132,16 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
 }
 
 // GetFutureShm() - converts internal ShmPtr to FullPtr
+//
+// CTP_IS_HOST for the same reason as Future::await_suspend_impl in task.h:
+// this body reads Task::RunCtxPtr(), which is itself #if CTP_IS_HOST, and a
+// device pass member-checks the whole translation unit.
+//
+// CTP_HOST_FUN alone is not enough. Under clang-CUDA it nearly is -- wrong-
+// side calls are diagnosed lazily, so an unused host function with a
+// device-invalid body survives -- but SYCL has no deferred diagnostics and
+// rejects it outright. The GPU path uses gpu::Future and never this.
+#if CTP_IS_HOST
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
@@ -2143,6 +2153,7 @@ Future<TaskT, AllocT>::GetFutureShm() const {
   }
   return ctp::ipc::FullPtr<FutureT>(t->RunCtxPtr());
 }
+#endif  // CTP_IS_HOST
 
 // ----------------------------------------------------------------
 // IsComplete variants

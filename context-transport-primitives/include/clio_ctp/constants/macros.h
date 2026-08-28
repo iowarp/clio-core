@@ -160,6 +160,26 @@
 #define CTP_IS_DEVICE_PASS 0
 #endif
 
+/** CTP_IS_HOST means "this pass compiles host code", and the SYCL device pass
+ *  does not -- so it has to be re-derived here, once CTP_IS_SYCL_DEVICE is
+ *  known. It is first defined further up from CTP_IS_GPU alone, which was
+ *  right when CUDA and ROCm were the only device passes.
+ *
+ *  This is not cosmetic. `#if !CTP_IS_HOST` is how a dozen headers elide
+ *  host-only bodies from the device pass -- ShmMetadataCache::Create,
+ *  CoreClient's staging allocator, the host half of IpcManager. nvcc and
+ *  clang-CUDA fully type-check host function bodies in the device pass, so
+ *  those guards are load-bearing there and the code compiles only because
+ *  CTP_IS_HOST is 0. DPC++ type-checks them too, but saw CTP_IS_HOST as 1
+ *  and so parsed bodies that resolve CLIO_IPC to the GPU IpcManager and then
+ *  call host-only members on it. Every one of those failures is this macro. */
+#undef CTP_IS_HOST
+#if CTP_IS_DEVICE_PASS
+#define CTP_IS_HOST 0
+#else
+#define CTP_IS_HOST 1
+#endif
+
 /** Throw on host; drop on any device pass. CUDA/ROCm/SYCL device code cannot do
  *  exception handling, so a bare `throw` in CTP_CROSS_FUN data-structure code
  *  makes nvcc/hipcc/DPC++ fail with "device code does not support exception
@@ -356,7 +376,11 @@
 #define CLS_CROSS_CONST CLS_CONST
 
 /** Class constant macro */
-#if CTP_IS_HOST
+#if CTP_IS_HOST || CTP_IS_SYCL_DEVICE
+// SYCL has no __constant__ address-space keyword, and needs none: a
+// `const` namespace-scope scalar with a constant initializer is usable
+// from a kernel as-is (it is not device-mutable state, which is the thing
+// SYCL actually forbids).
 #define GLOBAL_CONST inline const
 #define GLOBAL_CROSS_CONST inline const
 #else
@@ -411,5 +435,13 @@ class assert_hack {
 /** A hack for static asserts */
 #define STATIC_ASSERT(TRUTH, MSG, T) \
   static_assert(assert_hack<TRUTH, __TU(T)>::value, MSG)
+
+
+/* The CUDA device-code spellings, for SYCL. LAST in this file on purpose:
+ * it includes macros.h itself (for CTP_IS_SYCL_COMPILER), so it has to come
+ * after everything it tests, and every TU needs it before ctp/types/atomic.h
+ * -- the first header that spells `atomicAdd` in device code. Inert unless a
+ * SYCL compiler is driving. */
+#include "clio_ctp/util/sycl_cuda_compat.h"
 
 #endif  // CTP_MACROS_H

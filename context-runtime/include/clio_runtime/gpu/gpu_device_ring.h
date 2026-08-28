@@ -114,7 +114,7 @@ struct GpuDeviceRing {
   unsigned int *ready_ = nullptr;
   GpuRingEntry *entries_ = nullptr;
 
-#if CTP_IS_GPU_COMPILER
+#if CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
   /**
    * Claim a slot and publish an entry. Returns false only if the ring stayed
    * full for the whole spin budget, which the caller must treat as fatal --
@@ -124,10 +124,17 @@ struct GpuDeviceRing {
    * previous implementation had one and silently discarded every submission
    * from a non-zero lane, corrupting 75% of pages once more than one warp was
    * in play.
+   *
+   * Written against the gpu_intrinsics.h macros rather than atomicAdd /
+   * __threadfence_system directly, so ONE body serves CUDA, ROCm and SYCL.
+   * Nothing here is CUDA-shaped: a device-scope fetch_add on the claim
+   * counter, a plain load of the host-published tail, and a system-scope
+   * fence before the stamp.
    */
   CTP_GPU_FUN bool Push(const GpuRingEntry &e) {
-    const unsigned long long slot =
-        atomicAdd(&head_, 1ull);              // device-scope: no PCIe, no .sys
+    // device-scope: no PCIe, no .sys
+    const unsigned long long slot = static_cast<unsigned long long>(
+        CTP_DEVICE_ATOMIC_ADD_U64_DEVICE(&head_, 1ull));
     const u32 idx = static_cast<u32>(slot) & kGpuRingMask;
     const unsigned int stamp =
         static_cast<unsigned int>(slot / kGpuRingCapacity) + 1u;
@@ -145,15 +152,15 @@ struct GpuDeviceRing {
 
     entries_[idx] = e;
     // SYSTEM scope, not device scope: the reader is the CPU, and a plain
-    // __threadfence() only orders against other device threads. This is a
+    // device fence only orders against other device threads. This is a
     // FENCE, not an atomic, so it is well defined regardless of whether the
     // GPU supports native atomics on host memory -- which is the property that
     // lets the payload live in host memory at all.
-    __threadfence_system();                   // entry visible before its stamp
+    CTP_DEVICE_FENCE_SYSTEM();                // entry visible before its stamp
     *const_cast<volatile unsigned int *>(&ready_[idx]) = stamp;
     return true;
   }
-#endif  // CTP_IS_GPU_COMPILER
+#endif  // CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
 };
 
 }  // namespace clio::run
