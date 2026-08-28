@@ -29,6 +29,7 @@ add_subdirectory(kmeans)
 add_subdirectory(grayscott)
 add_subdirectory(gmx)
 add_subdirectory(weights)
+add_subdirectory(lbann)
 
 # Still CUDA-only sources. Porting each is the same mechanical split;
 # lammps_md is the outlier, with real __shared__ usage that needs
@@ -36,7 +37,6 @@ add_subdirectory(weights)
 if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     add_subdirectory(lammps_md)
     add_subdirectory(gnn)
-    add_subdirectory(lbann)
 endif()
 
 if(CLIO_CORE_ENABLE_CUDA)

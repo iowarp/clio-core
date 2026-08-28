@@ -10,7 +10,8 @@
  *
  *     threadIdx blockIdx blockDim gridDim  __syncthreads __syncthreads_or
  *     atomicAdd atomicCAS atomicSub atomicExch
- *     __threadfence __threadfence_system __trap  (+ printf, __nanosleep)
+ *     __threadfence __threadfence_system __trap
+ *     (+ printf, __nanosleep, clock64, __shfl_sync, the bit-cast intrinsics)
  *
  * Everything else in those files is ordinary C++. Porting by rewriting each
  * call site into a neutral macro would touch several hundred lines of the
@@ -278,6 +279,25 @@ inline void Trap() {
 inline void NanoSleep(unsigned) { /* no SYCL equivalent; spin */ }
 
 /**
+ * CUDA's bit-cast intrinsics.
+ *
+ * These are not conversions -- they reinterpret the bits -- and the
+ * benchmarks use them to build EXACT checksums over float arrays, where
+ * summing the values themselves would reassociate and defeat the gate. So
+ * the replacement has to be a true bit-cast, not a numeric one.
+ * __builtin_bit_cast is exactly that and is available on every compiler
+ * that gets this far.
+ */
+inline unsigned FloatAsUint(float f) {
+  return __builtin_bit_cast(unsigned, f);
+}
+inline float UintAsFloat(unsigned u) {
+  return __builtin_bit_cast(float, u);
+}
+inline int FloatAsInt(float f) { return __builtin_bit_cast(int, f); }
+inline float IntAsFloat(int i) { return __builtin_bit_cast(float, i); }
+
+/**
  * CUDA's __shfl_sync: broadcast one lane's value to the whole warp.
  *
  * SYCL's sub_group is CUDA's warp (32 lanes on NVPTX), and
@@ -347,6 +367,10 @@ inline long long Clock64() {
 #define __trap() ::clio::run::gpu::sycl_compat::Trap()
 #define __nanosleep(n) ::clio::run::gpu::sycl_compat::NanoSleep(n)
 #define clock64() ::clio::run::gpu::sycl_compat::Clock64()
+#define __float_as_uint(f) ::clio::run::gpu::sycl_compat::FloatAsUint(f)
+#define __uint_as_float(u) ::clio::run::gpu::sycl_compat::UintAsFloat(u)
+#define __float_as_int(f) ::clio::run::gpu::sycl_compat::FloatAsInt(f)
+#define __int_as_float(i) ::clio::run::gpu::sycl_compat::IntAsFloat(i)
 #define __shfl_sync(m, v, l) ::clio::run::gpu::sycl_compat::ShflSync(m, v, l)
 
 /**
