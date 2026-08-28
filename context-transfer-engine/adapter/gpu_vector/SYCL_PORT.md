@@ -103,13 +103,29 @@ baselines that link nothing from clio.
 | weights   | yes | yes | yes | yes | 1 + 2 ranks |
 | lbann     | yes | yes | yes | yes | 1 + 2 ranks |
 | gmx       | yes | yes | yes | yes | 1 + 2 + 4 ranks |
-| lammps_md | yes | **no** | yes | yes | 1 + 2 + 4 ranks |
+| lammps_md | yes | yes | yes | yes | 1 + 2 + 4 ranks (MPI/Kokkos) |
 
-The single remaining gap is the **SYCL paged row for lammps_md**. It is the
-only one of the six that is a genuine port rather than a launch-seam split:
-`clio_lammps_md_paged_bench.cc` is ~4900 lines with nine real `__shared__`
-sites that need `group_local_memory`, where the other five workloads reduced
-to a `<wl>_kernels.h` shared by a CUDA and a SYCL launch TU.
+All six workloads now build and run on both backends. lammps_md was the last,
+and it needed a seam split of its own (md_common.h / md_kernels.h /
+md_launch.h + cuda/ + sycl/) because its `__global__` trampolines were
+interleaved among the device coroutines.
+
+**What the lammps_md SYCL row is validated against.** The CUDA row on
+identical flags (`--md --lattice 20 --steps 20 --blocks 8 --slots 8`): all
+four gates pass and every number matches digit for digit, including the paging
+counters -- `PE/atom -6.7733683`, `pairs 864000`, `W -709062`, resort PE
+`-216747.785344` at `rel=0.00e+00`, `E0=-215787.790233 En=-215787.666467
+drift=5.74e-07`, `x faults=22 evicts=0, x puts=493`.
+
+**What it is NOT validated against, and why.** EVICTION. The ctest entry named
+`_ooc` does not exercise it: `--slots 8` is clamped up to the 28-frame pin
+floor, so both backends report `evicts=0` and "resident contract HELD". Real
+eviction needs a larger working set, and at `--blocks 8` the CUDA row itself
+dies with `FATAL set full` for lattice 24, 26, 28 and 32 -- a shared
+set-associativity limit at that block count, not a SYCL gap. Faults are
+exercised (22 of them, plus 493 puts); eviction is not, on EITHER backend, at
+8 blocks. Raising the SYCL block ceiling (see Known limits) is what would let
+this be tested.
 
 Two facts about the Kokkos rows that are easy to misread:
 
