@@ -1337,6 +1337,63 @@ if(NOT CLIO_CORE_MSVC_LIKE)
         message(STATUS "Yieldable GPU kernels: C++20 device coroutines (clang)")
     endif()
 
+    # SYCL has no second mechanism to choose between. The macro yield system
+    # reaches its per-block state through `extern __shared__`, which SYCL does
+    # not have, so coroutines are not the opt-in there -- they are the only
+    # implementation. Not gated on CLIO_GPU_CLANG: a SYCL device compiler is
+    # always clang (DPC++) or AdaptiveCpp, never nvcc, so the reason that
+    # option exists does not apply.
+    if(CLIO_CORE_ENABLE_SYCL)
+        add_compile_definitions(CLIO_YIELD_CORO)
+        message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+
+        # CTP_ENABLE_SYCL GLOBALLY, and this is a correctness requirement
+        # rather than convenience.
+        #
+        # CUDA can afford to scope CTP_ENABLE_CUDA to the targets that link
+        # ctp::cuda_cxx, because host and device TUs are compiled by
+        # different compilers and a host-only consumer genuinely wants the
+        # non-GPU behaviour. Under SYCL every TU is built by the SAME
+        # compiler, and CTP_ENABLE_SYCL selects between two bodies of the
+        # SAME inline functions in gpu_api.h -- IsDeviceAccessiblePointer,
+        # DeviceAwareMemcpy. Defining it unevenly is an ODR violation whose
+        # symptom is that the linker keeps whichever body it saw first.
+        #
+        # Measured: mem_bdev_transport.cc did not get the define, so its
+        # DeviceAwareMemcpy was a plain std::memcpy, and the CTE's writeback
+        # of a page from device memory segfaulted the runtime worker in
+        # MemBdevTransport::DirectWrite.
+        #
+        # -fsycl stays per-target: only TUs that actually contain kernels
+        # need the device pass, and it is expensive.
+        add_compile_definitions(CTP_ENABLE_SYCL=1)
+        # <sycl/sycl.hpp> is pulled in by macros.h whenever CTP_ENABLE_SYCL
+        # is set, so every TU now needs the header path -- the driver only
+        # adds it under -fsycl, which most TUs do not get.
+        if(CLIO_SYCL_INCLUDE_DIR)
+            include_directories(SYSTEM ${CLIO_SYCL_INCLUDE_DIR})
+        endif()
+        # Silence the "<sycl/sycl.hpp> included without -fsycl" pragma in
+        # exactly the TUs where that is deliberate.
+        add_compile_definitions(SYCL_DISABLE_FSYCL_SYCLHPP_WARNING)
+
+        # ...and link libsycl everywhere, for the same reason the define is
+        # global. With CTP_ENABLE_SYCL set, gpu_api.h's inline helpers
+        # (IsDevicePointer, DeviceAwareMemcpy, HasSyclGpuDevice) reference
+        # sycl:: symbols, so any target that touches them needs the library
+        # -- not just the ones compiled with -fsycl. Without this the build
+        # fails late, at link, with "DSO missing from command line" on
+        # whichever unrelated test happened to include gpu_api.h.
+        if(CLIO_SYCL_INCLUDE_DIR)
+            get_filename_component(_clio_sycl_root
+                                   "${CLIO_SYCL_INCLUDE_DIR}" DIRECTORY)
+            if(EXISTS "${_clio_sycl_root}/lib")
+                link_directories("${_clio_sycl_root}/lib")
+            endif()
+        endif()
+        link_libraries(sycl)
+    endif()
+
     # AddressSanitizer + LeakSanitizer configuration
     if(CLIO_CORE_ENABLE_ASAN)
         message(STATUS "AddressSanitizer + LeakSanitizer (ASan/LSan) enabled for iowarp-core")

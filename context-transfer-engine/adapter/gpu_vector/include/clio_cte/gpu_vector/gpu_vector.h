@@ -32,6 +32,20 @@
 
 namespace clio::cte::gpu_vector {
 
+/*
+ * The host side is guarded on CTP_ENABLE_GPU, not CTP_ENABLE_CUDA.
+ *
+ * Every one of these bodies is written against ctp::GpuApi, which already
+ * dispatches to CUDA, ROCm or SYCL -- there is not a raw cuda* call in this
+ * file. The narrower guard was silently compiling the host half of the
+ * vector to NOTHING on a SYCL build: PublishHeader never allocated the
+ * device VecHeader, so every kernel got a DeviceVector whose h_ was null and
+ * the first launch died with CUDA_ERROR_ILLEGAL_ADDRESS. UploadBytes was a
+ * no-op for the same reason, so the page table and task slots were never
+ * uploaded either. Widening changes nothing for CUDA (CTP_ENABLE_GPU is
+ * implied by it).
+ */
+
 /**
  * Resume a parked block ONLY when the completion word its wait tag names has
  * flipped.
@@ -45,7 +59,7 @@ namespace clio::cte::gpu_vector {
  * A wait tag of 0 means "no condition", so those blocks always resume.
  */
 inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
   if (tag == 0) return true;
   unsigned int done = 0;
   ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
@@ -77,7 +91,7 @@ inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
  * the first one matters, and every vector can point at the same slots.
  */
 inline unsigned long long *FatalSlots() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
   static unsigned long long *slots = [] {
     auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
         8 * sizeof(unsigned long long));
@@ -287,7 +301,7 @@ class Vector {
    * current. No-op with no device views or an empty cache.
    */
   void FlushResidentToCte() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     clio::cte::core::Client core(storage_pool_id_);
     std::vector<char> buf(static_cast<size_t>(page_bytes_));
     for (auto &kv : devs_) {
@@ -321,7 +335,7 @@ class Vector {
   }
 
   void EnableStats() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
       const size_t bytes = 9 * sizeof(unsigned long long);
@@ -374,7 +388,7 @@ class Vector {
    */
   void Prefetch(clio::run::u64 pg_lo, clio::run::u64 pg_hi, int gpu_id = 0,
                 clio::run::u32 tables = 0) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     (void) tables;
     auto it = devs_.find(gpu_id);
     if (it == devs_.end()) return;
@@ -387,7 +401,7 @@ class Vector {
 
   /** Drop every resident page. Dirty pages are DISCARDED -- flush first. */
   void ClearCache(int gpu_id = 0) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end()) return;
     const clio::run::u64 nslots =
@@ -478,7 +492,7 @@ class Vector {
 
   /** Zero the counters, for benches that measure per-round. */
   void ResetStats() {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats == nullptr) continue;
       ctp::GpuApi::Memset(kv.second.stats, 0, 5 * sizeof(unsigned long long));
@@ -529,7 +543,7 @@ class Vector {
 
   Stats ReadStats(int gpu_id) const {
     Stats s;
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
     unsigned long long h[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -685,7 +699,7 @@ class Vector {
    */
   void PrefetchShared(DevState &st, clio::run::u64 pg_lo, clio::run::u64 pg_hi,
                       clio::cte::core::Client &core) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     const clio::run::u64 nslots =
         static_cast<clio::run::u64>(nsets_) * set_size_;
     std::vector<Page> tbl(static_cast<size_t>(nslots));
@@ -740,7 +754,7 @@ class Vector {
    */
   void InitFreeLists(DevState &st, clio::run::u32 nregions,
                      clio::run::u32 per_block) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     std::vector<clio::run::u32> q(nregions);
     for (clio::run::u32 i = 0; i < nregions; ++i) q[i] = i;
     std::vector<clio::run::u32> head(nblocks_, 0), tail(nblocks_, per_block);
@@ -762,7 +776,7 @@ class Vector {
    * held by slots. A block keeps the ones it owns that nobody took.
    */
   void RebuildFreeLists(DevState &st, clio::run::u32 used) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     if (st.count_base == nullptr || st.per_block == 0) return;
     std::vector<clio::run::u32> q(st.nregions, 0);
     std::vector<clio::run::u32> head(nblocks_, 0), tail(nblocks_, 0);
@@ -845,7 +859,7 @@ class Vector {
   }
 
   void PublishHeader(DevState &st) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     if (st.d_hdr == nullptr) {
       st.d_hdr = ctp::GpuApi::Malloc<VecHeader>(sizeof(VecHeader));
       if (st.d_hdr == nullptr) {
@@ -878,7 +892,7 @@ class Vector {
   }
 
   static void UploadBytes(const void *src, void *dst, clio::run::u64 bytes) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     ctp::GpuApi::Memcpy(dst, src, static_cast<size_t>(bytes));
 #else
     (void) src; (void) dst; (void) bytes;
@@ -898,7 +912,7 @@ class Vector {
     st.table_alloc = ctp::ipc::AllocatorId::GetNull();
     st.tasks_alloc = ctp::ipc::AllocatorId::GetNull();
     st.btbl_alloc = ctp::ipc::AllocatorId::GetNull();
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_GPU
     if (st.stats != nullptr) {
       ctp::GpuApi::Free(st.stats);
       st.stats = nullptr;

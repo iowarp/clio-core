@@ -35,6 +35,55 @@ namespace {
 class clio_sycl_init_queue_kernel;
 }
 
+/**
+ * Construct the GpuTaskQueue inside a pinned-host backend, on the device.
+ *
+ * OUTSIDE THE CTP_IS_HOST GUARD BELOW, and that is the whole point.
+ *
+ * In CUDA, a kernel is a __global__ function at namespace scope and the
+ * launch is ordinary host code, so host-only regions may freely contain
+ * launches. In SYCL the kernel BODY is a lambda inside the submitting
+ * function -- so a `#if CTP_IS_HOST` around the submitter deletes the
+ * kernel from the device pass, no device code is emitted for it, and the
+ * host pass then submits a kernel the runtime has never heard of:
+ *
+ *   Assertion `It != m_DeviceKernelInfoMap.end()' failed.
+ *   ProgramManager::getDeviceKernelInfo(...)
+ *
+ * which is what `clio_run start` did. Splitting the kernel out into a
+ * function that touches no host-only state lets both passes see it, while
+ * ServerInitGpuQueues -- which does reach host-only IpcManager members --
+ * stays guarded.
+ *
+ * @return the queue's offset within `backend`, or size_t(-1) on failure.
+ */
+static size_t SyclBuildQueueInBackend(sycl::queue &q, char *backend,
+                                      size_t backend_bytes, u32 queue_depth) {
+  size_t *out_off = sycl::malloc_shared<size_t>(1, q);
+  if (!out_off) return static_cast<size_t>(-1);
+  *out_off = static_cast<size_t>(-1);
+  q.submit([&](sycl::handler &cgh) {
+    cgh.single_task<clio_sycl_init_queue_kernel>([=]() {
+      ctp::ipc::MemoryBackend proxy;
+      proxy.data_ = backend;
+      proxy.data_capacity_ = backend_bytes;
+      CLIO_QUEUE_ALLOC_T *alloc = proxy.MakeAlloc<CLIO_QUEUE_ALLOC_T>();
+      if (!alloc) {
+        *out_off = static_cast<size_t>(-1);
+        return;
+      }
+      ctp::ipc::FullPtr<clio::run::GpuTaskQueue> queue =
+          alloc->NewObj<clio::run::GpuTaskQueue>(
+              alloc, /*num_lanes=*/1u, /*num_prio=*/2u, queue_depth);
+      *out_off = queue.IsNull() ? static_cast<size_t>(-1)
+                                : queue.shm_.off_.load();
+    });
+  }).wait_and_throw();
+  const size_t off = *out_off;
+  sycl::free(out_off, q);
+  return off;
+}
+
 #if CTP_IS_HOST
 
 bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
@@ -66,36 +115,8 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
 
-    size_t *out_off = sycl::malloc_shared<size_t>(1, q);
-    if (!out_off) {
-      HLOG(kError, "ServerInitGpuQueues (SYCL): malloc_shared(out_off) failed");
-      FinalizeGpuQueues();
-      return false;
-    }
-    *out_off = static_cast<size_t>(-1);
-
-    char *queue_backend_ptr = dev.queue_backend;
-    size_t queue_backend_size = kQueueBackendBytes;
-    q.submit([&](sycl::handler &cgh) {
-      cgh.single_task<clio_sycl_init_queue_kernel>([=]() {
-        ctp::ipc::MemoryBackend proxy;
-        proxy.data_ = queue_backend_ptr;
-        proxy.data_capacity_ = queue_backend_size;
-        CLIO_QUEUE_ALLOC_T *alloc = proxy.MakeAlloc<CLIO_QUEUE_ALLOC_T>();
-        if (!alloc) {
-          *out_off = static_cast<size_t>(-1);
-          return;
-        }
-        ctp::ipc::FullPtr<clio::run::GpuTaskQueue> queue =
-            alloc->NewObj<clio::run::GpuTaskQueue>(
-                alloc, /*num_lanes=*/1u, /*num_prio=*/2u, queue_depth);
-        *out_off = queue.IsNull() ? static_cast<size_t>(-1)
-                                  : queue.shm_.off_.load();
-      });
-    }).wait_and_throw();
-
-    size_t queue_off = *out_off;
-    sycl::free(out_off, q);
+    const size_t queue_off = SyclBuildQueueInBackend(
+        q, dev.queue_backend, kQueueBackendBytes, queue_depth);
     if (queue_off == static_cast<size_t>(-1)) {
       HLOG(kError, "ServerInitGpuQueues (SYCL): device queue construction "
            "failed (gpu_id={})", gpu_id);
@@ -149,6 +170,28 @@ void gpu::IpcManager::UnregisterClientBackend(
 }
 
 // FindClientBackend is now inline in gpu_ipc_manager.h.
+
+/**
+ * The batched device-ring transport is not built on the SYCL path.
+ *
+ * ServerInitGpuQueues above leaves `ring.dev_ring` null, so GetGpuInfo hands
+ * the kernel a null `gpu2cpu_ring` and IpcGpu2Cpu::SendIn takes the legacy
+ * per-task GpuTaskQueue path instead. Nothing ever pushes to a ring here, so
+ * there is nothing for the worker to drain -- but the symbol is referenced
+ * unconditionally by the worker poll loop in libclio_run_cxx, so it has to
+ * exist.
+ *
+ * This costs the SYCL path the ring's whole point: one D2H copy per BATCH of
+ * submissions rather than per submission. Porting it is mechanical (SYCL's
+ * malloc_host is directly device-addressable, so it needs no
+ * cudaHostGetDevicePointer step at all) and worth doing before any SYCL
+ * performance claim -- but a correctness bring-up does not need it.
+ */
+bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
+  (void)gpu_id;
+  (void)out;
+  return false;
+}
 
 CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
                                                 clio::run::u32 queue_depth,

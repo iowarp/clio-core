@@ -109,6 +109,7 @@
 #define CLIO_RUNTIME_GPU_YIELD_STACK_H_
 
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/util/sycl_cuda_compat.h>
 #include <clio_runtime/gpu/yieldable.h>
 #include <clio_runtime/types.h>
 
@@ -177,13 +178,69 @@ enum YieldFatal : unsigned long long {
  * is installed by the host (YieldSetFatalSlots) and is null until then, so
  * this costs nothing when unused.
  */
+#if CTP_ENABLE_SYCL
+/**
+ * SYCL has no __device__ variables: a mutable namespace-scope global is not
+ * addressable from a kernel. device_global is the sanctioned replacement --
+ * program-scope device storage the host writes with queue::copy. Same role,
+ * same "null until the host installs it" contract.
+ *
+ * The same mechanism carries the per-block YieldSmem base, because
+ * `extern __shared__` has no SYCL equivalent either; see YieldTls below.
+ *
+ * ONLY THE OWNING TRANSLATION UNIT MAY DEFINE THESE, and it says so by
+ * defining CLIO_SYCL_KERNEL_TU before including this header. A device_global
+ * is registered with the SYCL runtime once per DEVICE IMAGE, and every TU
+ * compiled with -fsycl produces an image of its own -- so leaving these
+ * inline in a widely-included header made the second image re-register them
+ * and DPC++ aborted at startup:
+ *
+ *   Assertion `!MDeviceGlobalPtr && "Device global pointer has already been
+ *   initialized."' failed.
+ *
+ * A TU with no yieldable kernels needs the accessors only to PARSE (host
+ * code reaches them through device_vector.h's verbs), so it gets a null
+ * base rather than a definition. Any kernel that actually ran there would
+ * dereference null immediately, which is the loudest failure available.
+ */
+#if defined(CLIO_SYCL_KERNEL_TU)
+/* device_image_scope, not the default USM-backed form.
+ *
+ * A default device_global is backed by a USM allocation the SYCL runtime
+ * frees from a static destructor -- after the CUDA context has already gone
+ * away at process exit, which aborted every run at:
+ *
+ *   exception in ~DeviceGlobalUSMMem cuda backend failed with error ...
+ *   DeviceGlobalUSMMem::~DeviceGlobalUSMMem(): Assertion `false' failed.
+ *
+ * device_image_scope puts the variable in the device image instead, so
+ * there is no USM allocation to outlive anything. It also states the
+ * constraint that is already true here: only the owning image reads it. */
+using SyclImageScope = decltype(::sycl::ext::oneapi::experimental::properties(
+    ::sycl::ext::oneapi::experimental::device_image_scope));
+inline ::sycl::ext::oneapi::experimental::device_global<unsigned long long *,
+                                                        SyclImageScope>
+    g_yield_fatal_dg;
+inline ::sycl::ext::oneapi::experimental::device_global<char *, SyclImageScope>
+    g_yield_smem_dg;
+inline unsigned long long *YieldFatalBase() { return g_yield_fatal_dg.get(); }
+inline char *YieldSmemBase() { return g_yield_smem_dg.get(); }
+#else
+inline unsigned long long *YieldFatalBase() { return nullptr; }
+inline char *YieldSmemBase() { return nullptr; }
+#endif
+#define CLIO_YIELD_FATAL_PTR (::clio::run::gpu::YieldFatalBase())
+#else
 __device__ inline unsigned long long *g_yield_fatal = nullptr;
+#define CLIO_YIELD_FATAL_PTR (::clio::run::gpu::g_yield_fatal)
+#endif
 
 CTP_GPU_FUN inline void YieldFatalNote(unsigned long long code,
                                        unsigned long long a1,
                                        unsigned long long a2,
                                        unsigned long long a3) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || CTP_IS_SYCL_COMPILER
+  unsigned long long *g_yield_fatal = CLIO_YIELD_FATAL_PTR;
   if (g_yield_fatal == nullptr) return;
   if (atomicCAS(g_yield_fatal, kYieldFatalNone, code) != kYieldFatalNone) {
     return;   // first writer wins: it is the one that explains the rest
@@ -231,16 +288,16 @@ struct YieldStackView {
    *  the grid between rounds, so a block resumes on different hardware. */
   char *persist_base_ = nullptr;
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || CTP_ENABLE_SYCL
   /** Region for one lane of one LOGICAL block. */
-  __device__ char *Lane(clio::run::u32 logical_block,
+  CTP_GPU_FUN char *Lane(clio::run::u32 logical_block,
                         clio::run::u32 lane) const {
     const clio::run::u64 idx =
         static_cast<clio::run::u64>(logical_block) * lanes_per_block_ + lane;
     return base_ + idx * bytes_per_lane_;
   }
   /** This logical block's persistent-arena backing store. */
-  __device__ char *PersistLane(clio::run::u32 logical_block) const {
+  CTP_GPU_FUN char *PersistLane(clio::run::u32 logical_block) const {
     return persist_base_ +
            static_cast<clio::run::u64>(logical_block) * CLIO_PERSIST_STRIDE;
   }
@@ -303,10 +360,44 @@ struct YieldSmem {
 #define CLIO_YIELD_CHECKS 1
 #endif
 
-#if defined(__CUDACC__)
+/* CTP_ENABLE_SYCL, not CTP_IS_SYCL_COMPILER: the host TUs of a SYCL program
+ * are compiled without -fsycl but still include device_vector.h, whose verbs
+ * name YieldLane/YieldTls. They only need the declarations. See the same
+ * widening in yield_coro.h and sycl_cuda_compat.h. */
+#if defined(__CUDACC__) || CTP_ENABLE_SYCL
 
 namespace clio::run::gpu {
 
+#if CTP_ENABLE_SYCL
+/**
+ * SYCL: the block's YieldSmem lives in GLOBAL memory, one per PHYSICAL
+ * block, at a base the host installs in g_yield_smem_dg.
+ *
+ * WHY NOT SHARED. `extern __shared__` is what makes the CUDA version
+ * reachable from any function without a parameter, and SYCL has no
+ * equivalent: local memory arrives through a local_accessor the kernel was
+ * given, or through group_local_memory, which allocates a DISTINCT block
+ * per call site -- so twenty callers would get twenty arenas, not one view
+ * of the block's state. Global memory has one address per block and no such
+ * ambiguity.
+ *
+ * PHYSICAL block, not logical, and that is not a bug: YieldSmem is
+ * per-LAUNCH scratch that YieldTlsPublish rewrites at every kernel entry.
+ * The only thing in it that must outlive the launch is the persist arena,
+ * and that is already copied to and from persist_base_[LOGICAL block] by
+ * PersistSave/PersistRestore -- which is exactly why those two functions
+ * need no SYCL branch at all.
+ *
+ * The cost is that the persist arena is global rather than shared. It is
+ * block-uniform and L2-resident, and it buys the same guarantee CUDA gets
+ * from copying it out on every park.
+ */
+inline YieldSmem &YieldTls() {
+  char *base = YieldSmemBase();
+  return *reinterpret_cast<YieldSmem *>(
+      base + static_cast<size_t>(blockIdx.x) * sizeof(YieldSmem));
+}
+#else
 /**
  * The published handle. Every yieldable device function reaches the stack
  * through this, which is why none of them take it as a parameter.
@@ -318,6 +409,7 @@ __device__ __forceinline__ YieldSmem &YieldTls() {
   extern __shared__ char clio_yield_smem[];
   return *reinterpret_cast<YieldSmem *>(clio_yield_smem);
 }
+#endif
 
 /**
  * PERSISTENT SHARED STATE ACROSS A PARK.
@@ -698,6 +790,23 @@ __global__ inline void YieldStackInitKernel(YieldStackView v,
 
 namespace clio::run::gpu {
 
+#if CTP_ENABLE_SYCL
+/**
+ * Reset a stack's lane headers and publish its YieldSmem base.
+ *
+ * DEFINED BY THE TU THAT OWNS THE YIELDABLE KERNELS (the one that defines
+ * CLIO_SYCL_KERNEL_TU), because both halves need -fsycl: the lane-header
+ * initialization is a kernel, and the base pointer goes into a
+ * device_global that only that TU's device image contains. A YieldStack
+ * itself is constructed in ordinary host code, which can do neither.
+ *
+ * It is NOT a memset: sp_ starts at sizeof(YieldLaneHeader), because the
+ * header is not frame space.
+ */
+void SyclYieldStackReset(const YieldStackView &view, clio::run::u32 nlanes,
+                         char *smem_base);
+#endif
+
 /**
  * Host owner of the lane-divided stack.
  *
@@ -729,6 +838,22 @@ class YieldStack {
     d_persist_ = ctp::GpuApi::Malloc<char>(ptotal);
     ctp::GpuApi::Memset(d_persist_, 0, ptotal);
 #endif
+#if CTP_ENABLE_SYCL
+    // CTP_ENABLE_SYCL, not CTP_IS_SYCL_COMPILER: a YieldStack is constructed
+    // in ORDINARY host code, which is not compiled with -fsycl. Under the
+    // narrower guard d_smem_ stayed null, SyclYieldStackReset published a
+    // null base, and the first kernel's YieldTlsPublish wrote through it --
+    // memcheck: "Invalid __global__ write of size 8 bytes ... Access to 0x10".
+    //
+    // SYCL only: the per-block YieldSmem the CUDA build gets from dynamic
+    // shared memory. One per PHYSICAL block, so it is sized by the widest
+    // grid this stack will ever back -- which is nblocks_, since the driver
+    // only ever COMPACTS the grid between rounds.
+    d_smem_ = ctp::GpuApi::Malloc<char>(static_cast<size_t>(nblocks_) *
+                                        sizeof(YieldSmem));
+    ctp::GpuApi::Memset(d_smem_, 0,
+                        static_cast<size_t>(nblocks_) * sizeof(YieldSmem));
+#endif
     Reset();
   }
 
@@ -740,9 +865,13 @@ class YieldStack {
     if (d_persist_ != nullptr) {
       ctp::GpuApi::Free(d_persist_);
     }
+    if (d_smem_ != nullptr) {
+      ctp::GpuApi::Free(d_smem_);
+    }
 #endif
     d_base_ = nullptr;
     d_persist_ = nullptr;
+    d_smem_ = nullptr;
   }
 
   YieldStack(const YieldStack &) = delete;
@@ -764,6 +893,12 @@ class YieldStack {
     const clio::run::u32 blocks = (nlanes + threads - 1) / threads;
     YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
     ctp::GpuApi::Synchronize();
+#elif CTP_ENABLE_SYCL
+    // Out of line, into the kernel-owning TU. Both halves of this -- the
+    // lane-header init kernel and the device_global publish -- are things
+    // only a -fsycl TU can do, and a YieldStack is constructed in ORDINARY
+    // host code. See SyclYieldStackReset's declaration above.
+    SyclYieldStackReset(View(), nblocks_ * lanes_per_block_, d_smem_);
 #endif
   }
 
@@ -773,6 +908,7 @@ class YieldStack {
   clio::run::u32 bytes_per_lane_;
   char *d_base_ = nullptr;
   char *d_persist_ = nullptr;
+  char *d_smem_ = nullptr;
 };
 
 #if !CTP_IS_DEVICE_PASS

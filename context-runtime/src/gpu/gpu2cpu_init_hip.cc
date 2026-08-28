@@ -16,6 +16,12 @@
  * register them through admin RegisterMemory.
  */
 
+// Outside the guard: everything below it is compiled out under SYCL EXCEPT
+// the ctp_copy_kernel_launch shim at the end of the file, whose signature
+// names size_t. Without this the SYCL build fails on that one declaration
+// with no other error in the file.
+#include <cstddef>
+
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
 
 #include "clio_runtime/ipc_manager.h"

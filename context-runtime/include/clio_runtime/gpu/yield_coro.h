@@ -57,7 +57,26 @@
 #ifndef CLIO_RUNTIME_GPU_YIELD_CORO_H_
 #define CLIO_RUNTIME_GPU_YIELD_CORO_H_
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
+/* SYCL reaches this file too. The gate is "clang, compiling for a device":
+ * clang-CUDA (__CUDA__) or a SYCL compiler. Both lower coroutines the same
+ * way and both provide __builtin_coro_*; what differs is only that SYCL has
+ * no host/device attributes, so <coroutine> works there as written and the
+ * __device__ spellings below vanish (CTP_GPU_FUN). nvcc still cannot come
+ * anywhere near this file. */
+#include <clio_ctp/constants/macros.h>
+
+/* CTP_ENABLE_SYCL rather than CTP_IS_SYCL_COMPILER: a SYCL program's HOST
+ * translation units are compiled without -fsycl, yet they include
+ * device_vector.h (through gpu_vector.h) and so must PARSE the YCoroTask
+ * return types on its verbs. They never instantiate a coroutine -- these are
+ * only names to them. Under CUDA nothing changes: those TUs are compiled by
+ * clang-CUDA, so __CUDA__ already covers them.
+ *
+ * Requires clang either way. That is not a new constraint for SYCL, where
+ * the device compiler is always clang (DPC++) or AdaptiveCpp -- but it does
+ * mean the HOST compiler has to be the SYCL one too, not a stray g++. */
+#if defined(CLIO_YIELD_CORO) && defined(__clang__) && \
+    (defined(__CUDA__) || CTP_ENABLE_SYCL)
 
 /* ------------------------------------------------------------------ */
 /* MEASUREMENT MODE: -DCLIO_YIELD_SYNC                                  */

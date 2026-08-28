@@ -654,6 +654,17 @@ class GpuApi {
       return false;
     }
     return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+#elif CTP_ENABLE_SYCL
+    // Same question as IsDevicePointer above, one category wider: SHARED
+    // (managed) USM is device-accessible too. Without this branch the SYCL
+    // build answered "false" for real device memory, and every caller that
+    // uses it to decide whether to take a GPU path took the host one.
+    if (!HasSyclGpuDevice()) return false;
+    auto kind = sycl::get_pointer_type(const_cast<const void *>(
+                                           static_cast<const void *>(ptr)),
+                                       GpuApi::SyclQueue().get_context());
+    return kind == sycl::usm::alloc::device ||
+           kind == sycl::usm::alloc::shared;
 #else
     (void)ptr;
     return false;
@@ -793,6 +804,25 @@ class GpuApi {
       CUDA_ERROR_CHECK(_rc);
     }
 #endif
+#if CTP_ENABLE_SYCL && !CTP_ENABLE_CUDA && !CTP_ENABLE_ROCM
+    // SYNCHRONOUS, and `stream` is ignored: SYCL has no stream handle this
+    // API can carry, and a queue submitted here would complete on nobody's
+    // schedule but its own.
+    //
+    // It must not stay a no-op, which is what the missing branch made it.
+    // MemBdevTransport::DirectWrite copies a page out of device memory with
+    // this call, so on SYCL the RAM tier silently kept whatever it had:
+    // every gpu_vector page that went through a writeback read back as
+    // garbage, with rc=0 and put_errors=0 all the way down.
+    //
+    // Blocking here is a real cost -- the CUDA path deliberately overlaps
+    // these -- so this is where to start when the SYCL writeback pipeline
+    // needs to go faster, not where to stop.
+    (void)stream;
+    if (size != 0) {
+      SyclQueue().memcpy(dst, src, size).wait();
+    }
+#endif
   }
 
   /** Async memset on a stream. */
@@ -805,9 +835,15 @@ class GpuApi {
     CUDA_ERROR_CHECK(cudaMemsetAsync(dst, value, size,
                                      static_cast<cudaStream_t>(stream)));
 #endif
-#if CTP_ENABLE_SYCL
-    if (stream) {
-      static_cast<sycl::queue *>(stream)->memset(dst, value, size);
+#if CTP_ENABLE_SYCL && !CTP_ENABLE_CUDA && !CTP_ENABLE_ROCM
+    // .wait(), which the previous version omitted: callers treat this the way
+    // they treat the CUDA form, i.e. ordered with respect to the stream they
+    // passed, and a SYCL queue op that nobody waits on is ordered with
+    // respect to nothing. Also falls back to the default queue rather than
+    // silently doing nothing when `stream` is null.
+    if (size != 0) {
+      auto *q = stream ? static_cast<sycl::queue *>(stream) : &SyclQueue();
+      q->memset(dst, value, size).wait();
     }
 #endif
   }
@@ -910,6 +946,10 @@ class GpuApi {
  * Header-only, CUDA-free-at-the-call-site replacement for the old runtime
  * g_device_aware_memcpy hook: CPU-only callers (bdev, worker) just call this.
  */
+/** Declared here because DeviceAwareMemcpy's SYCL branch needs it and the
+ *  definition sits below. */
+inline bool IsDeviceAccessible(const void *ptr);
+
 inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   if (n == 0) return;
 #if CTP_ENABLE_CUDA
@@ -1058,6 +1098,27 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   }
   HIP_ERROR_CHECK(hipMemcpyAsync(dst, src, n, hipMemcpyDefault, s));
   HIP_ERROR_CHECK(hipStreamSynchronize(s));
+#elif CTP_ENABLE_SYCL
+  // Without this branch the SYCL build fell through to the std::memcpy
+  // below and dereferenced device pointers on the host: the CPU worker
+  // segfaulted in memcpy while staging a task out of a device backend
+  // (IpcGpu2Cpu::RecvIn -> Worker::ProcessNewTasksGpu).
+  //
+  // HOST-HOST STAYS ON std::memcpy, for the same reason the CUDA path
+  // above says so: routing it through the SYCL queue costs a submission
+  // and a wait for a copy the CPU can do at memory bandwidth.
+  //
+  // Everything else goes through queue::memcpy, which the CUDA backend
+  // lowers to cuMemcpyAsync -- a COPY ENGINE, not a kernel. That is the
+  // property this path depends on: it runs on the fault-service side while
+  // the faulting kernel is still resident, and a copy kernel cannot be
+  // scheduled behind a kernel that never exits.
+  if (!IsDeviceAccessible(dst) && !IsDeviceAccessible(src)) {
+    std::memcpy(dst, src, n);
+    return;
+  }
+  auto &q = GpuApi::SyclQueue();
+  q.memcpy(dst, src, n).wait();
 #else
   std::memcpy(dst, src, n);
 #endif
