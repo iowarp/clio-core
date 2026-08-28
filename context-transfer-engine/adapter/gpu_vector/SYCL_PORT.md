@@ -91,6 +91,40 @@ None of these had ever been executed. Each one was silent.
 | `gpu_device_ring.h` | `Push` was `CTP_IS_GPU_COMPILER`-only; rewritten against the portable intrinsics so one body serves all three backends. |
 | build | `CTP_ENABLE_SYCL` was per-target. It selects between two bodies of the same inline functions in `gpu_api.h`, so an uneven definition is an ODR violation -- and that is exactly how `mem_bdev_transport.cc` got the no-op `MemcpyAsync`. It is now global, with `libsycl` linked globally to match. |
 
+## Backend matrix
+
+Where each workload stands. "paged" is the gpu_vector row; MPI/Kokkos are
+baselines that link nothing from clio.
+
+| workload  | paged CUDA | paged SYCL | MPI | Kokkos | validated at |
+|-----------|-----------|-----------|-----|--------|--------------|
+| kmeans    | yes | yes | yes | yes | 1 + 2 ranks |
+| grayscott | yes | yes | yes | yes | 1 + 2 ranks |
+| weights   | yes | yes | yes | yes | 1 + 2 ranks |
+| lbann     | yes | yes | yes | yes | 1 + 2 ranks |
+| gmx       | yes | yes | yes | yes | 1 + 2 + 4 ranks |
+| lammps_md | yes | **no** | yes | yes | 1 + 2 + 4 ranks |
+
+The single remaining gap is the **SYCL paged row for lammps_md**. It is the
+only one of the six that is a genuine port rather than a launch-seam split:
+`clio_lammps_md_paged_bench.cc` is ~4900 lines with nine real `__shared__`
+sites that need `group_local_memory`, where the other five workloads reduced
+to a `<wl>_kernels.h` shared by a CUDA and a SYCL launch TU.
+
+Two facts about the Kokkos rows that are easy to misread:
+
+- **Kokkos is a programming model here, not a transport.** Every Kokkos row
+  still moves its halo over two-sided host-staged MPI, exactly as its MPI
+  sibling does. What changes is how the device side is expressed.
+- **Kokkos rows do not match the nvcc rows bit for bit, and should not be
+  expected to.** gmx makes this concrete: its mesh checksum differs from the
+  nvcc baseline in a handful of last units purely because nvcc defaults to
+  `-fmad=true` and clang-CUDA contracts differently. Rebuilding the baseline
+  with `nvcc -fmad=false` and the Kokkos row with `-ffp-contract=off` makes
+  the two agree bit for bit -- measured, not assumed. Use integer-exact gates
+  (conservation, pair counts, migrant counts) and rank-count invariance for
+  cross-build comparison; use float checksums only within one build.
+
 ## Known limits
 
 - **8 blocks.** At 32 the multi-block phase wedges: the driver relaunches and
