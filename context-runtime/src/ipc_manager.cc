@@ -657,6 +657,21 @@ void IpcManager::ClientFinalize() {
     if (heartbeat_thread_.joinable()) {
       heartbeat_thread_.join();
     }
+    // EXPERIMENT (cluster coherence bisect, ddeb20d0). Restore ONLY the
+    // wall-clock delay that commit removed, while keeping its CV mechanism.
+    //
+    // Before ddeb20d0 this join sat through up to a full second of the probe's
+    // nap, and every client process paid it on the way out. The heartbeat
+    // instrumentation showed server_alive_ behaves IDENTICALLY in the passing
+    // and failing configs, so the CV mechanism is not the differentiator --
+    // which leaves the timing. If that nap was accidentally load-bearing (a
+    // drain window for in-flight work at client exit), putting it back should
+    // make Cluster Tests green WITHOUT reverting the fix, and the real defect
+    // is a missing drain in client shutdown rather than anything about the CV.
+    //
+    // If this run still fails, the differentiator is neither the mechanism nor
+    // the delay, and the bisect needs to look inside ddeb20d0 again.
+    CTP_THREAD_MODEL->SleepForUs(1000000);
   }
 
   // Stop recv thread
