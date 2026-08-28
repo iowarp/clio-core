@@ -3870,8 +3870,28 @@ void IpcManager::StopShmServerSendThread() {
 }
 
 void IpcManager::HeartbeatThread() {
+  // TEMPORARY INSTRUMENTATION (cluster coherence regression, bisected to
+  // ddeb20d0). Log every TRANSITION of server_alive_ plus the inputs that
+  // decide it, so we can see whether the flag is going false spuriously and
+  // what IsServerAlive() saw when it did. Transitions only -- a per-second
+  // line would drown the 4-node logs.
+  bool first = true;
+  bool prev = true;
+  int iters = 0;
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
+    if (first || alive != prev) {
+      HLOG(kWarning,
+           "[HB] server_alive {} -> {} (iter={}, zmq_transport_={}, "
+           "ipc_mode={}, runtime_pid={}, reconnecting={})",
+           prev ? 1 : 0, alive ? 1 : 0, iters,
+           zmq_transport_ ? 1 : 0, static_cast<int>(ipc_mode_),
+           static_cast<long long>(runtime_pid_),
+           reconnecting_.load() ? 1 : 0);
+      first = false;
+      prev = alive;
+    }
+    ++iters;
     server_alive_.store(alive, std::memory_order_release);
     // ClientFinalize clears heartbeat_running_ and notifies, so the join that
     // follows returns at once instead of waiting out the probe interval.
@@ -3879,6 +3899,8 @@ void IpcManager::HeartbeatThread() {
     g_heartbeat_cv.wait_for(lk, std::chrono::seconds(1),
                             [this]() { return !heartbeat_running_.load(); });
   }
+  HLOG(kWarning, "[HB] heartbeat loop exiting after {} iters (last alive={})",
+       iters, prev ? 1 : 0);
 }
 
 void IpcManager::CleanupResponseArchive(size_t net_key) {
