@@ -91,12 +91,33 @@ def summarise(cell):
 
     # The model's own view of each chunk, when the run recorded one. Keyed by
     # blob name so a missing selection.csv simply leaves the columns empty.
-    sel = {}
+    # TWO MAPS, BECAUSE A CHUNK NOW APPEARS TWICE. 75442318 made the selection
+    # log emit a second row at the adopt site: `role=primary` is what the model
+    # ranked first, `role=adopted` is what the sweep actually kept, and the LAST
+    # row for a blob wins. So:
+    #   sel          last row -> the ADOPTED action. Right for the feature
+    #                columns, since quantize/shuffle must describe what really
+    #                ran.
+    #   sel_primary  the `role=primary` row -> the MODEL'S OWN PICK, which is
+    #                the only thing "was the model overridden?" can be asked of.
+    # Keying both identically matters: reading the override count off `sel`
+    # alone compares the adopted row with blobs.csv, and those agree BY
+    # CONSTRUCTION, so the count was structurally 0 on every workload that
+    # emits adopted rows. Measured on nyx/explore-balance at K=3: 0 reported
+    # where 45 of 66 chunks (68.2%) had genuinely been overridden.
+    # Logs written before that commit have no `role` column; there the first
+    # row seen is the primary, which is what setdefault gives.
+    sel, sel_primary = {}, {}
+    has_adopted = False          # does this log predate 75442318?
     sel_path = os.path.join(cell, "selection.csv")
     if os.path.exists(sel_path):
         for s in csv.DictReader(open(sel_path)):
+            if s.get("role") == "adopted":
+                has_adopted = True
             k = s.get("blob", "")
             sel[k] = s
+            if s.get("role", "primary") == "primary":
+                sel_primary.setdefault(k, s)
             # THE TWO LOGS DO NOT AGREE ON BLOB KEYS. WarpX's selection log
             # names a chunk by its HDF5 dataset path while blobs.csv names it
             # by field and step:
@@ -107,6 +128,8 @@ def summarise(cell):
             nk = normalise_selection_key(k)
             if nk != k:
                 sel.setdefault(nk, s)
+                if s.get("role", "primary") == "primary":
+                    sel_primary.setdefault(nk, s)
 
     out_rows, unparsed = [], 0
     for r in rows:
@@ -123,6 +146,8 @@ def summarise(cell):
         # writes runtime_blob for exactly this reason); fall back to the
         # normalised name for everything else.
         s = sel.get(r.get("runtime_blob") or "", {}) or sel.get(name, {})
+        sp = (sel_primary.get(r.get("runtime_blob") or "", {})
+              or sel_primary.get(name, {}))
         out_rows.append({
             "blob": name, "field": field,
             "step": "" if step is None else step,
@@ -135,6 +160,31 @@ def summarise(cell):
             # module docstring for why it is bytes-IN on the decompress side.
             "compress_MBps": round(b / 1e6 / (ct / 1e3), 3) if ct > 0 else "",
             "decompress_MBps": round(b / 1e6 / (dt / 1e3), 3) if dt > 0 else "",
+            # What the MODEL ranked first, beside what was stored. Kept per
+            # chunk so anyone can recompute the override rate from results.csv
+            # instead of trusting the aggregate.
+            "model_codec": sp.get("lib_name", ""),
+            "adopted_codec": s.get("lib_name", ""),
+            # THE ACTION, NOT JUST THE CODEC. NeuroPress's action is the tuple
+            # (library, shuffle, quantize, preset) -- viz_actions.py draws all
+            # four for exactly this reason -- so a sweep that keeps the library
+            # and changes the stride HAS overridden the model. Measured on
+            # nyx/explore-balance: 36 chunks were stored by exploration but
+            # only 33 changed library, so comparing lib_name alone lost 3.
+            "model_action": "|".join((sp.get("lib_name", ""),
+                                      sp.get("quantize", ""),
+                                      sp.get("shuffle", ""),
+                                      sp.get("preset", ""))) if sp else "",
+            "adopted_action": "|".join((s.get("lib_name", ""),
+                                        s.get("quantize", ""),
+                                        s.get("shuffle", ""),
+                                        s.get("preset", ""))) if s else "",
+            # Ground truth from the runtime rather than inferred: the adopted
+            # row is emitted ONLY in compressor_runtime.cc's
+            # `stored_by_exploration = true` branch, so its presence IS the
+            # statement that the sweep superseded the primary. Carried so the
+            # comparison below can be cross-checked against it.
+            "explored_adopted": 1 if s.get("role") == "adopted" else 0,
             "entropy": s.get("entropy", ""), "mad": s.get("mad", ""),
             "quantize": s.get("quantize", ""), "shuffle": s.get("shuffle", ""),
             "rc": r.get("rc", ""),
@@ -178,14 +228,48 @@ def summarise(cell):
         "timesteps": steps, "n_timesteps": len(steps),
         "chunks_per_field_frame": len(chunks),
         "unparsed_blob_names": unparsed,
-        # selection.csv records the MODEL'S pick; blobs.csv records what was
-        # actually stored after exploration. They disagree whenever a sweep
-        # overrode the model -- 43% of chunks measured across the smoke matrix,
-        # up to 100% on LAMMPS lossy. Counted here so no analysis silently
-        # attributes a chunk to the codec that lost.
+        # HOW OFTEN THE SWEEP BEAT THE MODEL: the `role=primary` row against
+        # the `role=adopted` one, BOTH FROM selection.csv. Comparing the
+        # primary against blobs.csv instead would miscount every chunk stored
+        # raw -- lib==0 is "Compression not beneficial" and reads as
+        # `raw(not-beneficial)` in the codec column (4d8024c8), which is the
+        # chunk being DECLINED, not the model being overridden.
+        # Rows that did not join contribute nothing rather than counting as a
+        # disagreement; selection_features_joined below is what exposes those.
+        # A CELL WRITTEN BEFORE 75442318 HAS NO ADOPTED ROW to compare against
+        # -- its single row per blob IS the primary -- so there the only
+        # available comparison is the primary against what the tier holds, and
+        # that is what the counter meant at the time. Raw-stored chunks are
+        # still excluded: "Compression not beneficial" is the chunk being
+        # declined, not the sweep overriding anything. Without this branch every
+        # archived cell would silently read 0.
         "selection_overridden_by_explore": sum(
             1 for r in out_rows
-            if sel.get(r["blob"], {}).get("lib_name", r["codec"]) != r["codec"]),
+            if r["model_action"] and (
+                (r["adopted_action"] and r["model_action"] != r["adopted_action"])
+                if has_adopted else
+                (not str(r["codec"]).startswith("raw")
+                 and r["model_codec"] != r["codec"]))),
+        # The same fact counted a second way, from the runtime's own emission
+        # site rather than by comparing fields. These two MUST agree; if they
+        # do not, the action tuple is missing something the sweep changed.
+        "selection_explored_adopted": sum(r["explored_adopted"] for r in out_rows),
+        # How many of the overrides are visible as a codec change alone. Lower
+        # than the above by exactly the chunks where only the stride, preset or
+        # quantize bit moved.
+        "selection_codec_changed": sum(
+            1 for r in out_rows
+            if r["model_codec"] and r["adopted_codec"]
+            and r["model_codec"] != r["adopted_codec"]),
+        # The cross-log guard the old counter used to be, kept because it is
+        # still worth checking -- it just is not the override rate. The adopted
+        # row must name what landed on the tier, so anything but 0 means the
+        # log and the tier disagree about a chunk. Raw-stored chunks are
+        # excluded: nothing ran on them to name.
+        "selection_stored_mismatch": sum(
+            1 for r in out_rows
+            if r["adopted_codec"] and not str(r["codec"]).startswith("raw")
+            and r["adopted_codec"] != r["codec"]),
         "selection_features_joined": sum(1 for r in out_rows if r["entropy"] != ""),
 
         "ratio_mean": round(st.mean(ratios), 4) if ratios else None,
