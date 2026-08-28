@@ -49,6 +49,34 @@ struct PayloadLog {
   std::FILE *fp = nullptr;
 };
 
+struct QualityLog {
+  std::FILE *fp = nullptr;
+  std::mutex mutex;
+  long seq = 0;
+};
+
+QualityLog *QualityLogInstance() {
+  static QualityLog *log = [] {
+    auto *l = new QualityLog();  // leaked on purpose, see SelectionLogInstance
+    const char *path = std::getenv("CLIO_NEUROPRESS_SELECTION_LOG");
+    if (path && *path) {
+      std::string p = std::string(path) + ".quality";
+      l->fp = std::fopen(p.c_str(), "w");
+      if (l->fp) {
+        // MEASURED, every one of them -- by reconstructing the stored chunk
+        // and comparing with the original. Distinct from selection.csv's
+        // actual_psnr, which is ANALYTICAL: derived from (range, error_bound),
+        // capped at 120 dB, and structurally unable to see a bound violation.
+        std::fprintf(l->fp,
+                     "seq,blob,orig_bytes,elements,shuffle,quantized,"
+                     "rmse,max_error,psnr_db,ssim,data_range\n");
+      }
+    }
+    return l;
+  }();
+  return log;
+}
+
 PayloadLog *PayloadLogInstance() {
   static PayloadLog *log = [] {
     auto *l = new PayloadLog();  // leaked on purpose, see SelectionLogInstance
@@ -93,7 +121,15 @@ ExploreLog *ExploreLogInstance() {
                      "seq,blob,chunk_bytes,role,rank,lib_name,algo_idx,preset,"
                      "quantize,shuffle,pred_ratio,pred_ct_ms,pred_dt_ms,"
                      "ratio,ct_ms,"
-                     "dt_ms,psnr_db,cost,primary_cost,adopted\n");
+                     "dt_ms,psnr_db,cost,primary_cost,adopted,"
+                     // MEASURED, by reconstructing the candidate all the way
+                     // back and comparing with the original. psnr_db above is
+                     // ANALYTICAL and is a different quantity; meas_psnr_db is
+                     // the one that can see a bound violation.
+                     // quality_measured disambiguates: ssim's valid range
+                     // includes -1, so a bare sentinel could not.
+                     "quality_measured,meas_rmse,meas_max_error,"
+                     "meas_psnr_db,meas_ssim\n");
       }
     }
     return l;
@@ -195,6 +231,19 @@ void LogCompressedPayload(const std::string &blob_name, const char *payload,
   }
 }
 
+void LogMeasuredQuality(const std::string &blob_name, size_t orig_bytes,
+                        uint32_t shuffle, bool quantized,
+                        const ctp::compress::preprocess::QualityMetrics &q) {
+  QualityLog *log = QualityLogInstance();
+  if (!log->fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  std::fprintf(log->fp, "%ld,%s,%zu,%zu,%u,%d,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+               log->seq++, blob_name.c_str(), orig_bytes, q.n, shuffle,
+               quantized ? 1 : 0, q.rmse, q.max_error, q.psnr_db, q.ssim,
+               q.data_range);
+  std::fflush(log->fp);
+}
+
 void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           int rank, const std::string &lib_name,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,
@@ -202,7 +251,9 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double pred_dt_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
                           double primary_cost, bool adopted, bool is_primary,
-                          double dt_ms) {
+                          double dt_ms,
+                          const ctp::compress::preprocess::QualityMetrics
+                              *quality) {
   ExploreLog *log = ExploreLogInstance();
   if (!log->fp) return;
 
@@ -234,12 +285,18 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
   // and it is what dt_ms should be compared against.
   std::fprintf(log->fp,
                "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
-               "%.10g,%.10g,%.10g,%.10g,%.10g,%d\n",
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%d,"
+               "%d,%.10g,%.10g,%.10g,%.10g\n",
                log->seq++, blob_name.c_str(), chunk_size,
                is_primary ? "primary" : "alt", rank,
                lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
                shuffle, pred_ratio, pred_ct_ms, pred_dt_ms, ratio, ct_ms,
-               dt_ms, psnr_db, cost, primary_cost, adopted ? 1 : 0);
+               dt_ms, psnr_db, cost, primary_cost, adopted ? 1 : 0,
+               quality ? 1 : 0,
+               quality ? quality->rmse : -1.0,
+               quality ? quality->max_error : -1.0,
+               quality ? quality->psnr_db : -1.0,
+               quality ? quality->ssim : -1.0);
   std::fflush(log->fp);
 }
 

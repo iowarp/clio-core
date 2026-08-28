@@ -595,6 +595,57 @@ class NvComp : public Compressor {
   }
 
   /**
+   * @brief Decompress into a caller-owned DEVICE buffer, untimed.
+   *
+   * DecompressMeasureOn frees its destination as soon as it has read the
+   * timing -- correct for a timing call, useless when the bytes themselves are
+   * the point. This keeps them.
+   *
+   * Codec-agnostic by construction: the NVCOMP_NATIVE bitstream is
+   * self-describing, so create_manager derives the algorithm from the buffer
+   * and the caller does not have to know which candidate produced it.
+   *
+   * @param compressed  device pointer to codec output (no Clio header)
+   * @param expect_size expected decompressed size; a header claiming anything
+   *   else means these are not the bytes we think and the call is refused
+   * @param d_dst       device destination, at least expect_size bytes
+   */
+  static bool DecompressInto(const void *compressed, size_t expect_size,
+                             void *d_dst, cudaStream_t stream) {
+    // A null stream is the DEFAULT stream, not an error. CachedStream() is
+    // private to this class, so a caller outside it has no per-thread stream
+    // to offer; the default stream synchronizes with everything, which for a
+    // diagnostic reconstruction is the conservative choice rather than a
+    // limitation.
+    if (!compressed || !d_dst || expect_size == 0) return false;
+    void *src = const_cast<void *>(compressed);
+    bool ok = false;
+    try {
+      std::shared_ptr<nvcomp::nvcompManagerBase> dmgr =
+          nvcomp::create_manager(static_cast<uint8_t *>(src), stream);
+      if (dmgr) {
+        InstallScratchAllocators(dmgr);
+        nvcomp::DecompressionConfig dcfg =
+            dmgr->configure_decompression(static_cast<uint8_t *>(src));
+        if (dcfg.decomp_data_size == expect_size) {
+          cudaGetLastError();
+          ScratchOom();
+          dmgr->decompress(static_cast<uint8_t *>(d_dst),
+                           static_cast<uint8_t *>(src), dcfg);
+          // Same launch check the timed paths make: kernels that never ran
+          // would leave the destination untouched and still report success.
+          ok = cudaPeekAtLastError() == cudaSuccess && !ScratchOom() &&
+               cudaStreamSynchronize(stream) == cudaSuccess;
+        }
+      }
+    } catch (...) {
+      // nvcomp signals failure by throwing; decompress() is void.
+      ok = false;
+    }
+    return ok;
+  }
+
+  /**
    * @brief Measure decompression of a buffer that may be host or device
    * memory, creating and destroying everything it needs.
    *

@@ -12,6 +12,10 @@
 
 #include "clio_cte/compressor/neuropress_explore.h"
 
+#include <clio_ctp/compress/preprocess/byte_shuffle.h>
+#include <clio_ctp/compress/preprocess/quality_metrics_gpu.h>
+#include <clio_ctp/compress/preprocess/quantization.h>
+
 #include <chrono>
 #include <cstdlib>
 
@@ -39,6 +43,102 @@ bool MeasureExploreDecompTime() {
   }();
   return on;
 }
+
+bool MeasureExploreQuality() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_MEASURE_QUALITY");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
+bool MeasureStoredChunkQuality(
+    const void *orig_device, size_t orig_bytes, const void *compressed,
+    size_t compressed_size, size_t post_transform_size, uint32_t shuffle,
+    const ctp::compress::preprocess::DeviceQuantizeParams *quant,
+    ctp::compress::preprocess::QualityMetrics *out) {
+  namespace pp = ctp::compress::preprocess;
+  if (!orig_device || !compressed || !out) return false;
+  if (orig_bytes == 0 || compressed_size == 0 || post_transform_size == 0) {
+    return false;
+  }
+  if ((orig_bytes % sizeof(float)) != 0) return false;
+
+  // The default stream: NvComp::CachedStream() is private, and this is a
+  // diagnostic path where synchronizing with everything is acceptable.
+  cudaStream_t stream = nullptr;
+
+  void *d_a = nullptr, *d_b = nullptr, *d_q = nullptr;
+  auto cleanup = [&] {
+    if (d_a) cudaFree(d_a);
+    if (d_b) cudaFree(d_b);
+    if (d_q) cudaFree(d_q);
+  };
+
+  // 1. Codec inverse, into a buffer the size the codec was FED.
+  if (cudaMalloc(&d_a, post_transform_size) != cudaSuccess) return false;
+  if (!ctp::NvComp::DecompressInto(compressed, post_transform_size, d_a,
+                                   stream)) {
+    cleanup();
+    return false;
+  }
+  const void *cur = d_a;
+
+  // 2. Byte-shuffle inverse. `shuffle` is the WIDTH, not a flag.
+  if (shuffle > 0) {
+    if (cudaMalloc(&d_b, post_transform_size) != cudaSuccess) {
+      cleanup();
+      return false;
+    }
+    if (!pp::ByteUnshuffleDevice(cur, d_b, post_transform_size, shuffle)) {
+      cleanup();
+      return false;
+    }
+    cur = d_b;
+  }
+
+  // 3. Quantizer inverse -- the step that returns the data to float32 in the
+  //    original domain, and the only one that can carry real error.
+  if (quant != nullptr) {
+    if (cudaMalloc(&d_q, orig_bytes) != cudaSuccess) { cleanup(); return false; }
+    if (!pp::DequantizeDevice(cur, orig_bytes / sizeof(float), *quant, d_q)) {
+      cleanup();
+      return false;
+    }
+    cur = d_q;
+  }
+
+  pp::QualityMetrics m;
+  const bool ok = pp::ComputeQualityDevice(orig_device, cur,
+                                           orig_bytes / sizeof(float), stream,
+                                           &m);
+  if (ok) *out = m;
+  cleanup();
+  return ok;
+}
+
+namespace {
+
+/** The sweep's per-candidate wrapper: pull the slot's transforms and defer to
+ *  the shared chain above. */
+void MeasureCandidateQuality(ExploreSlot *s) {
+  if (!s || !s->ok || s->compressed_size == 0) return;
+  if (!s->orig_device || s->orig_bytes == 0) return;
+  if (!s->gpu || !s->async.d_out) return;
+  ctp::compress::preprocess::QualityMetrics m;
+  if (MeasureStoredChunkQuality(s->orig_device, s->orig_bytes, s->async.d_out,
+                                s->compressed_size, s->compress_size,
+                                s->applied_shuffle,
+                                s->applied_quant ? &s->quant_params : nullptr,
+                                &m)) {
+    s->quality = m;
+    s->have_quality = true;
+  }
+}
+
+}  // namespace
+#endif
 
 /** Sweep step 2: finish every launched slot. Kept separate from the launch
  *  step -- every slot must be in flight before any is waited on, or the sweep
@@ -83,6 +183,11 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots) {
       if (s->gpu->DecompressMeasure(&s->async, s->compress_size)) {
         s->decomp_time_ms = s->async.decomp_ms;
       }
+    }
+    // Quality is measured independently of dt: the two answer different
+    // questions and one being off must not silence the other.
+    if (s->ok && s->compressed_size > 0 && MeasureExploreQuality()) {
+      MeasureCandidateQuality(s);
     }
   }
 #endif

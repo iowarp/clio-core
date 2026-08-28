@@ -302,7 +302,13 @@ int main(int argc, char **argv) {
               bound_worst = std::max(bound_worst, worst);
               if (worst > verify_eb) {
                 ++bound_exceeded;
-                std::cerr << "  BOUND EXCEEDED " << r.name << " max|err|="
+                // Scientific, and NOT the stream's inherited precision:
+                // the summary block below sets fixed/3dp for ratios ("5.370x"),
+                // which is sticky and would round an error of 9.49e-04 to
+                // "0.001" -- indistinguishable from the bound it is being
+                // checked against.
+                std::cerr << std::scientific << std::setprecision(6)
+                          << "  BOUND EXCEEDED " << r.name << " max|err|="
                           << worst << " > eb=" << verify_eb << "\n";
               }
             } else {
@@ -356,6 +362,16 @@ int main(int argc, char **argv) {
   auto report_bound = [&]() {
     if (!(opt.check_bound && verify_eb > 0.0)) return true;
     const bool ok = bound_exceeded == 0 && bound_checked > 0;
+    // AN ERROR MAGNITUDE IS NOT A RATIO. The summary block sets
+    // fixed/setprecision(3) for ratio display and that setting is sticky, so
+    // this line inherited it and printed a worst error of 9.494e-04 as
+    // "0.001" -- exactly the bound, so a cross-check could not tell agreement
+    // from a violation, and at eb=1e-3 the rounding alone was 5% of the value.
+    // Errors here span 1e-7 to 1e0; scientific with 6 significant digits
+    // covers that range and the eb beside it.
+    const std::ios_base::fmtflags saved_flags = std::cout.flags();
+    const std::streamsize saved_prec = std::cout.precision();
+    std::cout << std::scientific << std::setprecision(6);
     std::cout << (ok ? "BOUND OK: " : "BOUND FAILED: ") << bound_checked
               << " chunk(s) checked against eb=" << verify_eb
               << ", " << bound_exceeded << " exceeded, worst max|err|="
@@ -363,6 +379,8 @@ int main(int argc, char **argv) {
     if (bound_unreadable) std::cout << ", " << bound_unreadable
                                     << " source(s) unreadable";
     std::cout << std::endl;
+    std::cout.flags(saved_flags);
+    std::cout.precision(saved_prec);
     return ok;
   };
 

@@ -2029,6 +2029,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             char* alt_input = ctp::CompressionFactory::StageInputIfNeeded(
                 static_cast<char*>(chunk_data), chunk_size,
                 alt->compress_lib_, alt_device_staging);
+            // The ORIGINAL bytes, before this candidate's quantize/shuffle
+            // replace alt_input. Captured here and nowhere later because both
+            // transforms overwrite the pointer: measured quality is only
+            // meaningful against the pre-transform data, and comparing with
+            // the codec's own input would report a lossless codec as a
+            // perfect reconstruction at every error bound.
+            const void* alt_orig_device = alt_input;
 
             // Apply the alternative's OWN quantization first, exactly as the
             // primary does and as upstream does per explored slot
@@ -2143,6 +2150,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             slot->preset_id = alt_preset_id;
             slot->applied_shuffle = alt_applied_shuffle;
             slot->applied_quant = alt_applied_quant;
+            // Only useful when it really is device memory: ComputeQualityDevice
+            // refuses a host pointer outright rather than measuring on the CPU.
+            slot->orig_device =
+                ctp::IsDevicePointer(alt_orig_device) ? alt_orig_device : nullptr;
+            slot->orig_bytes = chunk_size;
             slot->quant_params = alt_quant_params;
             slot->compressor = std::move(alt_compressor);
             slot->device_staging = std::move(alt_device_staging);
@@ -2291,7 +2303,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                            alt_quant_params.data_min,
                                        alt_quant_params.effective_error_bound)
                       : -1.0,
-                  alt_cost, explore_rank, slot_ref.decomp_time_ms});
+                  alt_cost, explore_rank, slot_ref.decomp_time_ms,
+                  slot_ref.quality, slot_ref.have_quality});
             }
             ++explore_rank;
 
@@ -2387,7 +2400,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 // reported, and 2 adopted alternatives were logged looking
                 // WORSE than the primary they beat.
                 primary_rank_cost, static_cast<int>(ri) == winner.row,
-                /*is_primary=*/false, row.dt_ms);
+                /*is_primary=*/false, row.dt_ms,
+                row.have_quality ? &row.quality : nullptr);
           }
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
@@ -2888,8 +2902,18 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // pay. False when off, and only ever read from inside the trace.
     const bool np_dev_pre_stage =
         NpTraceEnabled() && ctp::IsDevicePointer(input_ptr);
+    // The ORIGINAL bytes for the PRIMARY, captured before quantize (:2985) and
+    // shuffle (:3047) reassign input_ptr. Same reasoning as the sweep's
+    // orig_device: measured quality is only meaningful against the
+    // pre-transform data.
+    const void* primary_orig_device = nullptr;
     input_ptr = ctp::CompressionFactory::StageInputIfNeeded(
         input_ptr, input_size, context.compress_lib_, device_staging);
+    // Only when it really is device memory: ComputeQualityDevice refuses a
+    // host pointer rather than measuring on the CPU, so a staged host buffer
+    // correctly yields no measurement instead of a CPU-computed one.
+    primary_orig_device =
+        ctp::IsDevicePointer(input_ptr) ? input_ptr : nullptr;
     CLIO_PATH_TRACE(
         "WRITE  StageInputIfNeeded lib=%d (%s) device_in=%d device_out=%d %s",
         context.compress_lib_,
@@ -3184,6 +3208,33 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         if (ctp::NvComp::DecompressMeasureAnyPtr(compress_dst, compressed_size,
                                                  compress_input_size, &dt_ms)) {
           context.actual_decompress_time_ms_ = dt_ms;
+        }
+      }
+      // MEASURED reconstruction quality for the PRIMARY, here for the same
+      // reason the dt measurement above is here: this is the one site every
+      // write passes through. Measuring only the sweep's candidates left two
+      // gaps -- a chunk whose primary was kept is STORED but never measured,
+      // and a static-codec or inference-only run never explores at all, so it
+      // could produce no quality figure whatsoever.
+      //
+      // It also cost a real disagreement: --check-bound reported a worst
+      // max|err| of 9.499836e-02 on a 64^3 eb=0.1 run while the adopted
+      // candidates topped out at 9.499615e-02, because the worst chunk was one
+      // that kept its primary. Two correct implementations, different
+      // coverage, and the mismatch looked like an arithmetic bug.
+      if (MeasureExploreQuality() && primary_orig_device != nullptr) {
+        ctp::compress::preprocess::QualityMetrics qm;
+        if (MeasureStoredChunkQuality(
+                primary_orig_device, input_size, compress_dst, compressed_size,
+                compress_input_size, applied_shuffle,
+                applied_quant ? &quant_params : nullptr, &qm)) {
+          // Its own log, not Context: Context is serialized (core_tasks.h),
+          // so carrying it there would change the wire format for a
+          // diagnostic. And every per-chunk file that already exists was
+          // written before this point -- the selection and explore rows in
+          // DynamicSchedule, the payload row earlier in this function.
+          LogMeasuredQuality(task->blob_name_.str(), input_size,
+                             applied_shuffle, applied_quant, qm);
         }
       }
 #endif

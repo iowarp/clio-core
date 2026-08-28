@@ -46,6 +46,14 @@ if(CLIO_CORE_ENABLE_CUDA)
     # stats are computed from, on the same per-thread stream.
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/block_evolution_gpu_kernels.cu)
+    # MEASURED reconstruction quality (RMSE / max error / PSNR / SSIM), by
+    # comparing decoded bytes against the originals. Same target and the same
+    # rationale as the two above; it reduces over exactly those buffers. This
+    # is the counterpart to the ANALYTICAL psnr NeuroPress already reports,
+    # which is derived from (range, error_bound) and cannot see a bound
+    # violation at all.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/quality_metrics_gpu_kernels.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -61,6 +69,9 @@ if(CLIO_CORE_ENABLE_CUDA)
         PROPERTIES LANGUAGE CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/block_evolution_gpu_kernels.cu
+        PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/quality_metrics_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
     # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
     # here, instead of once per consumer.

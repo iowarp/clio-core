@@ -77,6 +77,91 @@ def num(x, default=0.0):
         return default
 
 
+
+def prediction_error(cell, cfg):
+    """MAPE of the model's predictions against what the sweep MEASURED.
+
+    Upstream computes exactly this (diagnostics_store.hpp:337-343) and does not
+    merely report it: mape_cost drives a three-band exploration policy
+    (:347-348). Clio has neither, so this is the missing half of the
+    comparison -- the benchmark could say WHICH candidate the model got wrong
+    but never BY HOW MUCH.
+
+    THE SOURCE IS explore.csv, NOT selection.csv, and that is the whole
+    correctness argument. A prediction and a measurement may only be compared
+    when they describe the SAME ACTION. selection.csv's primary row carries the
+    model's prediction for the PRIMARY action while its adopted row carries the
+    measurement for the ADOPTED one -- different actions whenever exploration
+    overrode, which is 20-89% of chunks. Pairing those would report the model's
+    error against a codec it never predicted. explore.csv has both halves on
+    one row, per candidate.
+
+    mape_of is upstream's, including its degenerate branch: it returns 0 --
+    "perfect prediction" -- whenever the MEASURED value is <= 1e-6. That is a
+    silent zero, so `*_degenerate` counts how often it fired. A mape of 0 with
+    a high degenerate count is not accuracy.
+    """
+    ep = os.path.join(cell, "explore.csv")
+    if not os.path.exists(ep):
+        return {}
+    rows = list(csv.DictReader(open(ep)))
+    if not rows:
+        return {}
+
+    def mape_of(pred, real):
+        return abs(pred - real) / real if real > 1e-6 else None  # None = degenerate
+
+    acc = {k: [] for k in ("ratio", "ct_ms", "dt_ms", "cost")}
+    degen = {k: 0 for k in acc}
+
+    # The cost model's own weights, so predicted and measured cost are formed
+    # the same way the selector formed them. balance = (1,1,1); ratio zeroes
+    # the two latency terms. Times are floored at 1 ms and the ratio capped at
+    # 100 BEFORE the cost -- on megabyte chunks those clamps dominate, so
+    # omitting them would not be a rounding difference.
+    model = (cfg.get("cost_model") or "").lower()
+    w_ct = w_dt = 0.0 if model == "ratio" else 1.0
+    w_io = 0.0 if model == "speed" else 1.0
+    bw = num(cfg.get("bw_bytes_per_ms"), 5e6) or 5e6
+
+    def cost_of(nbytes, ratio, ct, dt):
+        if ratio <= 0:
+            return None
+        return (w_ct * max(ct, 1.0) + w_dt * max(dt, 1.0)
+                + w_io * nbytes / (min(ratio, 100.0) * bw))
+
+    for r in rows:
+        nbytes = num(r.get("chunk_bytes"))
+        pairs = [("ratio", num(r.get("pred_ratio")), num(r.get("ratio"))),
+                 ("ct_ms", num(r.get("pred_ct_ms")), num(r.get("ct_ms")))]
+        # dt is measured only under CLIO_NEUROPRESS_EXPLORE_MEASURE_DT; -1
+        # means not measured, which is not the same as a measured zero.
+        mdt = num(r.get("dt_ms"), -1.0)
+        if mdt >= 0:
+            pairs.append(("dt_ms", num(r.get("pred_dt_ms")), mdt))
+        for key, pred, real in pairs:
+            v = mape_of(pred, real)
+            if v is None: degen[key] += 1
+            else: acc[key].append(v)
+        pc = cost_of(nbytes, num(r.get("pred_ratio")), num(r.get("pred_ct_ms")),
+                     num(r.get("pred_dt_ms")))
+        rc = cost_of(nbytes, num(r.get("ratio")), num(r.get("ct_ms")),
+                     mdt if mdt >= 0 else num(r.get("pred_dt_ms")))
+        if pc is not None and rc is not None:
+            v = mape_of(pc, rc)
+            if v is None: degen["cost"] += 1
+            else: acc["cost"].append(v)
+
+    out = {"mape_candidates": len(rows)}
+    for k, vals in acc.items():
+        # A FRACTION, not a percentage: 0.0 is perfect, 1.0 is 100% off.
+        out["mape_" + k] = round(st.mean(vals), 6) if vals else None
+        out["mape_" + k + "_median"] = round(st.median(vals), 6) if vals else None
+        out["mape_" + k + "_n"] = len(vals)
+        out["mape_" + k + "_degenerate"] = degen[k]
+    return out
+
+
 def summarise(cell):
     cfg_path = os.path.join(cell, "config.json")
     cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
@@ -298,6 +383,7 @@ def summarise(cell):
         # when comparing configurations end to end rather than kernel to kernel.
         "end_to_end_MBps": round(tot_in / 1e6 / wall, 2) if wall > 0 else None,
     }
+    m.update(prediction_error(cell, cfg))
     json.dump(m, open(os.path.join(cell, "metrics.json"), "w"), indent=1)
     return m
 

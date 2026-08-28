@@ -17,6 +17,7 @@
 
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
+#include "clio_ctp/compress/preprocess/quality_metrics_gpu.h"
 #include "clio_ctp/compress/preprocess/quantization.h"
 
 #if !defined(CTP_ENABLE_CUDA) || !CTP_ENABLE_CUDA
@@ -35,6 +36,14 @@ bool QuantizeDevice(const void *, size_t, double, void *, size_t *,
 }
 bool DequantizeDevice(const void *, size_t, const DeviceQuantizeParams &,
                       void *) {
+  return false;
+}
+
+/** Same contract again: reconstruction quality is measured on the GPU or not
+ *  measured. There is no host implementation to fall back to -- a CPU-computed
+ *  RMSE/PSNR/SSIM would be indistinguishable in the logs from a real one. */
+bool ComputeQualityDevice(const void *, const void *, std::size_t, void *,
+                          QualityMetrics *) {
   return false;
 }
 

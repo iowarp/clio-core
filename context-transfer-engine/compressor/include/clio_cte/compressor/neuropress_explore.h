@@ -15,6 +15,7 @@
 
 #include <clio_ctp/compress/compress.h>
 #include <clio_ctp/compress/nvcomp.h>
+#include <clio_ctp/compress/preprocess/quality_metrics.h>
 #include <clio_ctp/compress/preprocess/quantization.h>
 
 #include <cstdint>
@@ -40,6 +41,11 @@ struct ExploreRow {
   int rank;
   /** MEASURED decompression time, or <0 when the sweep did not take one. */
   double dt_ms = -1.0;
+  /** MEASURED reconstruction quality, valid only when have_quality. Distinct
+   *  from `psnr` above, which is ANALYTICAL -- derived from (range, bound) and
+   *  therefore unable to see a bound violation at all. */
+  ctp::compress::preprocess::QualityMetrics quality;
+  bool have_quality = false;
 };
 
 /** Best alternative so far, plus what is needed to store it. One object, not
@@ -99,6 +105,21 @@ struct ExploreSlot {
    *  primary's predicted dt when this is negative, so the two paths differ in
    *  exactly one term. */
   double decomp_time_ms = -1.0;
+
+  // ---- MEASURED reconstruction quality (opt-in) --------------------------
+  // The ORIGINAL device bytes, captured BEFORE this candidate's quantize and
+  // shuffle. Measuring against `input` instead would compare the codec with
+  // itself: every nvcomp codec is lossless, so the error would be identically
+  // zero for every candidate and the column would read as a perfect
+  // reconstruction. Quality is only meaningful against the pre-transform
+  // data, which is what upstream compares (it hands gpucompress_compress_gpu
+  // the raw buffer and lets the API quantize internally).
+  const void* orig_device = nullptr;
+  size_t orig_bytes = 0;
+  /** Valid only when have_quality; left untouched otherwise, never zeroed --
+   *  a zeroed QualityMetrics reads as rmse 0, i.e. a perfect round trip. */
+  ctp::compress::preprocess::QualityMetrics quality;
+  bool have_quality = false;
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
   ctp::NvComp* gpu = nullptr;   ///< non-null when the async path ran
   ctp::NvComp::AsyncSlot async;  ///< this slot's stream + events
@@ -113,6 +134,55 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots);
  *  each candidate back for a real decompression time instead of substituting
  *  the NN's prediction. Read once. Off by default -- upstream never
  *  decompresses at write time, and turning this on makes selection diverge. */
+/**
+ * @brief Is per-candidate reconstruction quality measured? (env, default OFF)
+ *
+ * CLIO_NEUROPRESS_MEASURE_QUALITY. Off by default and that is not caution:
+ * measuring quality means DECOMPRESSING and then INVERTING both preprocessing
+ * transforms for every candidate, so at K=31 the sweep pays 31 full inverse
+ * chains per chunk on top of a decompression that already runs 1.2-30x the
+ * codec's compression time. Upstream gates the equivalent behind a whole
+ * separate VOL mode ("trace"), whose own comment calls it "intentionally
+ * sequential and slow -- for offline analysis only".
+ *
+ * It also changes nothing about selection: the metrics are recorded, never
+ * scored on. Turning it on must not move which candidate is adopted.
+ */
+bool MeasureExploreQuality();
+
+/**
+ * @brief Reconstruct one stored chunk and MEASURE it against the original.
+ *
+ * ONE copy of the inverse chain, shared by the sweep's candidates and by the
+ * primary. Two copies would be worse than duplication: both would print
+ * plausible numbers, so a divergence between them would be invisible in the
+ * results -- the same failure mode the shared QualityFromAccumulators exists
+ * to prevent on the derivation side.
+ *
+ * The chain is codec inverse -> byte unshuffle -> dequantize, and all three
+ * steps are required. Decompressing alone returns the QUANTIZED, SHUFFLED
+ * bytes; every nvcomp codec is lossless, so comparing those against the
+ * codec's own input reports rmse 0 for every candidate at every error bound.
+ *
+ * @param orig_device   ORIGINAL bytes, device-resident, pre-transform. A host
+ *   pointer yields false: quality is measured on the GPU or not at all.
+ * @param orig_bytes    size of the original (float32 assumed, as upstream does)
+ * @param compressed    device pointer to the codec's output, no Clio header
+ * @param compressed_size  bytes at `compressed`
+ * @param post_transform_size  what the CODEC was fed -- smaller than
+ *   orig_bytes whenever quantization ran
+ * @param shuffle       applied shuffle WIDTH, 0 for none
+ * @param quant         applied quantizer parameters, or nullptr if none ran
+ * @return false on any failure, leaving *out untouched. Never a partial
+ *   reconstruction and never a host fallback: unmeasured must read as
+ *   unmeasured, not as a perfect round trip.
+ */
+bool MeasureStoredChunkQuality(
+    const void *orig_device, size_t orig_bytes, const void *compressed,
+    size_t compressed_size, size_t post_transform_size, uint32_t shuffle,
+    const ctp::compress::preprocess::DeviceQuantizeParams *quant,
+    ctp::compress::preprocess::QualityMetrics *out);
+
 bool MeasureExploreDecompTime();
 
 }  // namespace clio::cte::compressor

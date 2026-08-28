@@ -13,6 +13,7 @@
 #ifndef CLIO_CTE_COMPRESSOR_NEUROPRESS_TELEMETRY_H_
 #define CLIO_CTE_COMPRESSOR_NEUROPRESS_TELEMETRY_H_
 
+#include <clio_ctp/compress/preprocess/quality_metrics.h>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -47,7 +48,25 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double pred_dt_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
                           double primary_cost, bool adopted,
-                          bool is_primary = false, double dt_ms = -1.0);
+                          bool is_primary = false, double dt_ms = -1.0,
+                          /**
+                           * MEASURED reconstruction quality, or nullptr when
+                           * the candidate was not measured -- which is the
+                           * default, since CLIO_NEUROPRESS_MEASURE_QUALITY is
+                           * off and measuring costs a full inverse chain per
+                           * candidate.
+                           *
+                           * NOT the same quantity as the psnr_db argument
+                           * above, which is ANALYTICAL: derived from
+                           * (range, error_bound), capped at 120 dB, and blind
+                           * to whether the bound was met. These come from
+                           * comparing the reconstruction with the original,
+                           * so they can disagree with it -- and a disagreement
+                           * is the finding, not an error. The columns are
+                           * named meas_* for that reason.
+                           */
+                          const ctp::compress::preprocess::QualityMetrics
+                              *quality = nullptr);
 
 /** Hash of codec output, from Compress(); joined by blob name. stage is
  *  "primary" or "adopted" -- a chunk can appear twice and the LAST row is the
@@ -55,6 +74,30 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
 void LogCompressedPayload(const std::string &blob_name, const char *payload,
                           size_t payload_size, bool on_device, bool beneficial,
                           double compress_kernel_ms, const char *stage);
+
+/**
+ * @brief One row per STORED chunk: measured reconstruction quality.
+ *
+ * Its own file (<CLIO_NEUROPRESS_SELECTION_LOG>.quality, the same sibling
+ * convention as .payload) rather than a column on an existing one, because
+ * none of them is written late enough. The selection log's primary row is
+ * emitted in DynamicSchedule, BEFORE Compress runs; explore.csv is written in
+ * the same place; and the payload row is written before the reconstruction
+ * exists. A measurement that only happens after the codec has run cannot be
+ * carried by a file that has already been written.
+ *
+ * COVERAGE IS THE POINT. The sweep measures only its own candidates, so a
+ * chunk whose PRIMARY was kept -- and a static-codec or inference-only run,
+ * which never explores at all -- had no quality figure. Measured on a 64^3
+ * eb=0.1 run, --check-bound's worst chunk was exactly such a chunk:
+ * 9.499836e-02 against the adopted candidates' 9.499615e-02, a disagreement
+ * that looked like an arithmetic bug and was a coverage hole.
+ *
+ * Joins to blobs.csv / selection.csv / explore.csv on `blob`.
+ */
+void LogMeasuredQuality(const std::string &blob_name, size_t orig_bytes,
+                        uint32_t shuffle, bool quantized,
+                        const ctp::compress::preprocess::QualityMetrics &q);
 
 }  // namespace clio::cte::compressor
 
