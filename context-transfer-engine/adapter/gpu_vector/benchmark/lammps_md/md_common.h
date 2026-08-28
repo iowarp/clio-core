@@ -79,4 +79,25 @@ CTP_INLINE_CROSS_FUN Slab SlabOf(u32 nb, u32 cap, u32 z0, u32 z1, u64 epp) {
 }
 
 
+/**
+ * Is a device-coroutine backend available?
+ *
+ * main() branches on this: without it the bench refuses to run rather than
+ * silently measuring nothing. It lived in the device header, which was wrong
+ * once the driver became a separate TU -- the driver could not see it, and
+ * under SYCL (where the driver is plain C++ with no __CUDA__) it would have
+ * evaluated FALSE and the benchmark would have printed "requires the clang
+ * device-coroutine build" and returned 2. That is a silent no-op dressed as a
+ * clean exit, which is why the condition now names both backends.
+ */
+#if defined(CLIO_YIELD_CORO) && \
+    (defined(__CUDA__) || CTP_ENABLE_SYCL)
+#define GV_MD_CORO 1
+#endif
+
+/** CUDA puts ::min in the global namespace in device code; SYCL does not, and
+ *  a `min` MACRO would rewrite host std::min. Two call sites want it, so they
+ *  get a named function instead of a compat entry with no other consumer. */
+CTP_INLINE_CROSS_FUN u32 MdMinU32(u32 a, u32 b) { return a < b ? a : b; }
+
 #endif  // CLIO_GV_BENCH_MD_COMMON_H_

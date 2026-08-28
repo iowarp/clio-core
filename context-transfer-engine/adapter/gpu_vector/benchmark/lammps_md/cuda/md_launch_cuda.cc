@@ -289,122 +289,89 @@ const char *LaunchError() {
   return (e == cudaSuccess) ? nullptr : cudaGetErrorString(e);
 }
 
+const char *DeviceSyncCheck() {
+  cudaError_t e = cudaDeviceSynchronize();
+  if (e == cudaSuccess) e = cudaGetLastError();
+  return (e == cudaSuccess) ? nullptr : cudaGetErrorString(e);
+}
+
 u32 DeviceClockKHz() {
   int khz = 0;
   cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0);
   return static_cast<u32>(khz);
 }
 
-void SymbolWrite(MdSym sym, const void *src, size_t bytes) {
+/**
+ * Byte offset of each symbol inside MdGlobals.
+ *
+ * Every entry is offsetof/sizeof on the real field rather than a literal, so
+ * reordering or resizing a field in md_kernels.h cannot desynchronise this
+ * table -- which matters because the failure mode of a stale offset is not a
+ * crash, it is the benchmark reporting some other field's contents as if they
+ * were the counter you asked for.
+ */
+namespace {
+
+struct SymLoc { size_t off, size; };
+
+SymLoc Locate(MdSym sym) {
   switch (sym) {
     case MdSym::kYieldFatal:
-      cudaMemcpyToSymbol(gy::g_yield_fatal, src, bytes);
-      return;
-    case MdSym::kReadBad:
-      cudaMemcpyToSymbol(g_read_bad, src, bytes);
-      return;
-    case MdSym::kReadSample:
-      cudaMemcpyToSymbol(g_read_sample, src, bytes);
-      return;
-    case MdSym::kProbeLdcg:
-      cudaMemcpyToSymbol(kProbeLdcg, src, bytes);
-      return;
-    case MdSym::kReadGeom:
-      cudaMemcpyToSymbol(g_read_geom, src, bytes);
-      return;
-    case MdSym::kGatherWrote:
-      cudaMemcpyToSymbol(g_gather_wrote, src, bytes);
-      return;
-    case MdSym::kPublish:
-      cudaMemcpyToSymbol(g_publish, src, bytes);
-      return;
-    case MdSym::kPubInterior:
-      cudaMemcpyToSymbol(g_pub_interior, src, bytes);
-      return;
-    case MdSym::kMdFlush:
-      cudaMemcpyToSymbol(g_md_flush, src, bytes);
-      return;
-    case MdSym::kXMask:
-      cudaMemcpyToSymbol(g_xmask, src, bytes);
-      return;
-    case MdSym::kNlMask:
-      cudaMemcpyToSymbol(g_nlmask, src, bytes);
-      return;
-    case MdSym::kPubFlushCyc:
-      cudaMemcpyToSymbol(g_pub_flush_cyc, src, bytes);
-      return;
-    case MdSym::kPubFetchCyc:
-      cudaMemcpyToSymbol(g_pub_fetch_cyc, src, bytes);
-      return;
+      return {0, 0};   // not in MdGlobals; handled by the caller
     case MdSym::kMdCyc:
-      cudaMemcpyToSymbol(g_md_cyc, src, bytes);
-      return;
+      return {offsetof(MdGlobals, md_cyc), sizeof(MdGlobals::md_cyc)};
+    case MdSym::kPublish:
+      return {offsetof(MdGlobals, publish), sizeof(MdGlobals::publish)};
+    case MdSym::kPubInterior:
+      return {offsetof(MdGlobals, pub_interior), sizeof(MdGlobals::pub_interior)};
+    case MdSym::kMdFlush:
+      return {offsetof(MdGlobals, md_flush), sizeof(MdGlobals::md_flush)};
+    case MdSym::kGatherWrote:
+      return {offsetof(MdGlobals, gather_wrote), sizeof(MdGlobals::gather_wrote)};
+    case MdSym::kPubFlushCyc:
+      return {offsetof(MdGlobals, pub_flush_cyc), sizeof(MdGlobals::pub_flush_cyc)};
+    case MdSym::kPubFetchCyc:
+      return {offsetof(MdGlobals, pub_fetch_cyc), sizeof(MdGlobals::pub_fetch_cyc)};
+    case MdSym::kXMask:
+      return {offsetof(MdGlobals, xmask), sizeof(MdGlobals::xmask)};
+    case MdSym::kNlMask:
+      return {offsetof(MdGlobals, nlmask), sizeof(MdGlobals::nlmask)};
     case MdSym::kPagesDone:
-      cudaMemcpyToSymbol(g_pages_done, src, bytes);
-      return;
+      return {offsetof(MdGlobals, pages_done), sizeof(MdGlobals::pages_done)};
+    case MdSym::kReadBad:
+      return {offsetof(MdGlobals, read_bad), sizeof(MdGlobals::read_bad)};
+    case MdSym::kReadSample:
+      return {offsetof(MdGlobals, read_sample), sizeof(MdGlobals::read_sample)};
+    case MdSym::kProbeLdcg:
+      return {offsetof(MdGlobals, probe_ldcg), sizeof(MdGlobals::probe_ldcg)};
+    case MdSym::kReadGeom:
+      return {offsetof(MdGlobals, read_geom), sizeof(MdGlobals::read_geom)};
     case MdSym::kBlkDone:
-      cudaMemcpyToSymbol(g_blk_done, src, bytes);
-      return;
+      return {offsetof(MdGlobals, blk_done), sizeof(MdGlobals::blk_done)};
     case MdSym::kBlkLast:
-      cudaMemcpyToSymbol(g_blk_last, src, bytes);
-      return;
+      return {offsetof(MdGlobals, blk_last), sizeof(MdGlobals::blk_last)};
   }
+  return {0, 0};
+}
+
+}  // namespace
+
+void SymbolWrite(MdSym sym, const void *src, size_t bytes) {
+  if (sym == MdSym::kYieldFatal) {
+    cudaMemcpyToSymbol(gy::g_yield_fatal, src, bytes);
+    return;
+  }
+  const SymLoc l = Locate(sym);
+  cudaMemcpyToSymbol(g_md_globals, src, bytes, l.off);
 }
 
 void SymbolRead(void *dst, MdSym sym, size_t bytes) {
-  switch (sym) {
-    case MdSym::kYieldFatal:
-      cudaMemcpyFromSymbol(dst, gy::g_yield_fatal, bytes);
-      return;
-    case MdSym::kReadBad:
-      cudaMemcpyFromSymbol(dst, g_read_bad, bytes);
-      return;
-    case MdSym::kReadSample:
-      cudaMemcpyFromSymbol(dst, g_read_sample, bytes);
-      return;
-    case MdSym::kProbeLdcg:
-      cudaMemcpyFromSymbol(dst, kProbeLdcg, bytes);
-      return;
-    case MdSym::kReadGeom:
-      cudaMemcpyFromSymbol(dst, g_read_geom, bytes);
-      return;
-    case MdSym::kGatherWrote:
-      cudaMemcpyFromSymbol(dst, g_gather_wrote, bytes);
-      return;
-    case MdSym::kPublish:
-      cudaMemcpyFromSymbol(dst, g_publish, bytes);
-      return;
-    case MdSym::kPubInterior:
-      cudaMemcpyFromSymbol(dst, g_pub_interior, bytes);
-      return;
-    case MdSym::kMdFlush:
-      cudaMemcpyFromSymbol(dst, g_md_flush, bytes);
-      return;
-    case MdSym::kXMask:
-      cudaMemcpyFromSymbol(dst, g_xmask, bytes);
-      return;
-    case MdSym::kNlMask:
-      cudaMemcpyFromSymbol(dst, g_nlmask, bytes);
-      return;
-    case MdSym::kPubFlushCyc:
-      cudaMemcpyFromSymbol(dst, g_pub_flush_cyc, bytes);
-      return;
-    case MdSym::kPubFetchCyc:
-      cudaMemcpyFromSymbol(dst, g_pub_fetch_cyc, bytes);
-      return;
-    case MdSym::kMdCyc:
-      cudaMemcpyFromSymbol(dst, g_md_cyc, bytes);
-      return;
-    case MdSym::kPagesDone:
-      cudaMemcpyFromSymbol(dst, g_pages_done, bytes);
-      return;
-    case MdSym::kBlkDone:
-      cudaMemcpyFromSymbol(dst, g_blk_done, bytes);
-      return;
-    case MdSym::kBlkLast:
-      cudaMemcpyFromSymbol(dst, g_blk_last, bytes);
-      return;
+  if (sym == MdSym::kYieldFatal) {
+    cudaMemcpyFromSymbol(dst, gy::g_yield_fatal, bytes);
+    return;
   }
+  const SymLoc l = Locate(sym);
+  cudaMemcpyFromSymbol(dst, g_md_globals, bytes, l.off);
 }
 
 void LaunchReadProbe(dim3 grid,

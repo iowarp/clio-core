@@ -312,6 +312,42 @@ inline T ShflSync(unsigned /*mask*/, T val, int src_lane) {
 }
 
 /**
+ * CUDA's __fmaf_rn: single-rounding fused multiply-add, round-to-nearest.
+ *
+ * NOT a plain `a * b + c`. Callers spell this out precisely because they want
+ * ONE rounding and want it independent of whatever the compiler decides to
+ * contract -- eternia-MD's integrator uses it so its trajectory is
+ * reproducible across backends. sycl::fma is the same operation with the same
+ * guarantee; writing the multiply out would quietly reintroduce the
+ * compiler's discretion.
+ */
+inline float FmafRn(float a, float b, float c) { return ::sycl::fma(a, b, c); }
+inline double FmaRn(double a, double b, double c) {
+  return ::sycl::fma(a, b, c);
+}
+
+/**
+ * CUDA's cache-hint loads: __ldcg (bypass the non-coherent per-SM L1, keep
+ * L2) and __ldcv (don't cache at all; treat the line as volatile).
+ *
+ * SYCL names no cache hint, so both map to a VOLATILE load. That is not a
+ * cosmetic stand-in: on NVPTX a volatile load lowers to `ld.volatile.global`,
+ * which does bypass the non-coherent L1 -- so on the backend this port
+ * actually targets, the probe below keeps its meaning. On any other SYCL
+ * backend it degrades to "not cached in a register", which is weaker than
+ * either intrinsic.
+ *
+ * Both consumers are DIAGNOSTIC (gpu_vector's read probe, asking whether a
+ * mismatch is a stale cached line rather than missing data), so a weaker
+ * mapping costs diagnostic resolution, not correctness. If either ever lands
+ * on a correctness path it must grow inline PTX instead.
+ */
+template <typename T>
+inline T LdCg(const T *p) { return *static_cast<const volatile T *>(p); }
+template <typename T>
+inline T LdCv(const T *p) { return *static_cast<const volatile T *>(p); }
+
+/**
  * clock64(). SYCL has no portable cycle counter, but this one is not
  * optional: gpu_vector stamps `last_access` with it and the eviction policy
  * uses that to break score ties (LRU). A constant would not fail to
@@ -372,6 +408,10 @@ inline long long Clock64() {
 #define __float_as_int(f) ::clio::run::gpu::sycl_compat::FloatAsInt(f)
 #define __int_as_float(i) ::clio::run::gpu::sycl_compat::IntAsFloat(i)
 #define __shfl_sync(m, v, l) ::clio::run::gpu::sycl_compat::ShflSync(m, v, l)
+#define __fmaf_rn(a, b, c) ::clio::run::gpu::sycl_compat::FmafRn(a, b, c)
+#define __fma_rn(a, b, c) ::clio::run::gpu::sycl_compat::FmaRn(a, b, c)
+#define __ldcg(p) ::clio::run::gpu::sycl_compat::LdCg(p)
+#define __ldcv(p) ::clio::run::gpu::sycl_compat::LdCv(p)
 
 /**
  * Device printf, injected by USING-DECLARATION rather than by a macro.

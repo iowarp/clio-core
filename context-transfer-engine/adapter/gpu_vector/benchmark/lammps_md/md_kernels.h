@@ -15,7 +15,107 @@
 #include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/gpu/yieldable.h>
 
-__device__ unsigned long long g_md_cyc[8];
+/**
+ * EVERY MD DEVICE GLOBAL, IN ONE STRUCT.
+ *
+ * SYCL has no __device__ variables -- a mutable namespace-scope global is not
+ * addressable from a kernel -- so the SYCL backend holds a device_global
+ * POINTER to storage the host allocates, exactly as the runtime's yield
+ * machinery does in yield_stack.h. Gathering all nineteen into one struct is
+ * what makes that affordable: one pointer, one allocation, and the seam's
+ * symbol accessors become a memcpy at an offset instead of nineteen
+ * per-backend switch arms.
+ *
+ * CUDA keeps a DIRECT instance rather than a pointer, on purpose. This
+ * benchmark is register-pressure sensitive (clio_coro_regcap, explicit launch
+ * bounds), and putting a pointer load in front of every read of `md_flush` --
+ * which the publish decision consults at write sites -- would change codegen
+ * in the row that is already validated. The indirection is a SYCL cost, paid
+ * only by SYCL.
+ *
+ * Field order is the seam's ABI: md_launch.h maps MdSym to offsetof here.
+ */
+/**
+ * THE BLOCK'S REDUCTION SCRATCH, and the only shared memory left in this
+ * benchmark.
+ *
+ * The block-uniform tables moved to CLIO_SHARED_PERSIST long ago -- that arena
+ * is global-backed and survives a park -- so what remains is `red`, used only
+ * inside the tree reduction at the end of a pass. That window contains no
+ * co_await, which is what makes real local memory safe here: the yield driver
+ * exits the kernel to suspend, so anything in __shared__ across a suspension
+ * would be garbage.
+ *
+ * CUDA carves it out of the dynamic shared block, past the yield machinery's
+ * own bytes. SYCL has no `extern __shared__`, so it takes a fixed-size group
+ * local allocation instead -- MD_LB_THREADS is the launch-bounds maximum, so
+ * it is exactly as large as the block can ever be.
+ */
+#if CTP_ENABLE_SYCL
+#define MD_RED_SCRATCH(name)                                                  \
+  double *name = *::sycl::ext::oneapi::group_local_memory_for_overwrite<      \
+      double[MD_LB_THREADS]>(                                                 \
+      ::sycl::ext::oneapi::this_work_item::get_nd_item<1>().get_group())
+#else
+#define MD_RED_SCRATCH(name)                                                  \
+  extern __shared__ char smem_raw[];                                          \
+  double *name = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES)
+#endif
+
+/**
+ * The one device printf in this file. SYCL device code cannot call a
+ * C-variadic function, and the compat header's replacement is injected into
+ * clio::run::gpu -- which unqualified lookup at THIS file's global scope
+ * would never reach. One call site, so it is spelled out rather than given a
+ * global using-declaration that would put a variadic template in the same
+ * overload set as the C library's printf for the whole TU.
+ */
+#if CTP_ENABLE_SYCL
+#define MD_DEV_PRINTF ::clio::run::gpu::printf
+#else
+#define MD_DEV_PRINTF printf
+#endif
+
+struct MdGlobals {
+  unsigned long long md_cyc[8];
+  u32 publish;
+  u32 pub_interior;
+  u32 md_flush;
+  unsigned long long gather_wrote;
+  unsigned long long pub_flush_cyc;
+  unsigned long long pub_fetch_cyc;
+  unsigned long long gather_sample;
+  u32 adm_used;
+  u32 xmask[8192];
+  u32 nlmask[8192];
+  unsigned long long pages_done;
+  unsigned long long third_sink;
+  unsigned long long read_bad[4];
+  unsigned long long read_sample[8];
+  bool probe_ldcg;
+  unsigned long long read_geom[12];
+  unsigned long long blk_done[64];
+  unsigned long long blk_last[64];
+};
+
+#if CTP_ENABLE_SYCL
+/* The owning TU defines it; see the same rule in yield_stack.h. */
+#if defined(CLIO_SYCL_KERNEL_TU)
+inline ::sycl::ext::oneapi::experimental::device_global<
+    MdGlobals *, ::clio::run::gpu::SyclImageScope> g_md_dg;
+CTP_GPU_FUN inline MdGlobals &MdG() { return *g_md_dg.get(); }
+#else
+CTP_GPU_FUN inline MdGlobals &MdG() {
+  // Parse-only: a kernel here would dereference null immediately, which is
+  // the loudest failure available.
+  return *static_cast<MdGlobals *>(nullptr);
+}
+#endif
+#else
+__device__ inline MdGlobals g_md_globals;
+CTP_GPU_FUN inline MdGlobals &MdG() { return g_md_globals; }
+#endif
+
 
 /** Page iterations actually completed by the integrator, summed over
  *  blocks. Distinguishes WORK DROPPED (driver/park bookkeeping) from DATA
@@ -24,14 +124,12 @@ __device__ unsigned long long g_md_cyc[8];
  *  read each other's stale pages); it exists only so the device-side cost of
  *  publishing can be measured as a difference against a correct run. Uniform
  *  across all threads, so the co_await stays out of a divergent branch. */
-__device__ u32 g_publish = 1u;
 /** Publish the slab INTERIOR (gen-0 track-the-store flushes). Single node
  *  needs it -- OOC eviction performs no I/O and --ckpt reads the store.
  *  Decomposed runs are resident, and a peer only ever reads the BOUNDARY
  *  planes, which exchange() publishes generationally -- so the interior
  *  flush there was per-step traffic with no reader: measured 12 puts/step
  *  on x alone against MPI's 0.53 MB/step ledger. */
-__device__ u32 g_pub_interior = 1u;
 /** OUT-OF-CORE MD: publish every x/v/dst write at the write site. The md
  *  path treats x and v as device-canonical -- no flushes, the frames ARE the
  *  data -- which is only sound while nothing is ever evicted. Under a
@@ -41,14 +139,9 @@ __device__ u32 g_pub_interior = 1u;
  *  conservation (KE 8270.5 -> 8270.4 over 20 steps while the resident run
  *  melted to 4945). Host sets this whenever the cache is capped below the
  *  working set; resident runs keep the flush-free fast path. */
-__device__ u32 g_md_flush = 0u;
 /** MD_RESORT_DEBUG: slots the gather actually wrote, plus one sample. */
-__device__ unsigned long long g_gather_wrote = 0ull;
 /** Publish-kernel latency split, in device cycles: the flush await vs the
  *  peer-halo fetch await. The host round counter cannot tell them apart. */
-__device__ unsigned long long g_pub_flush_cyc = 0ull;
-__device__ unsigned long long g_pub_fetch_cyc = 0ull;
-__device__ unsigned long long g_gather_sample = 0ull;
 
 /** HOLD-SET ADMISSION for the force chunks. A chunk pins its whole x
  *  stencil before computing, chunks drift apart (no inter-chunk barrier), so
@@ -63,7 +156,6 @@ __device__ unsigned long long g_gather_sample = 0ull;
  *  reserve: the async publish's fetch-pins and a peer's generational refetch.
  *  Costs nothing when the pool dwarfs the demand -- the CAS succeeds first
  *  try -- so the gate is always on. */
-__device__ u32 g_adm_used = 0u;
 
 /** One admission attempt. Thread 0 owns the CAS; every other thread reports
  *  "not waiting" and the yield macro's vote broadcasts thread 0's verdict. */
@@ -76,9 +168,9 @@ __device__ bool AdmitWaits(u32 need, u32 pool, u32 slack) {
   // reserves its ENTIRE hold set first: sum(reservations) <= pool means
   // every admitted party can hold all its pages at once and finish.
   const u32 budget = (pool > need + slack) ? (pool - slack) : pool;
-  const u32 cur = *(volatile u32 *)&g_adm_used;
+  const u32 cur = *(volatile u32 *)&MdG().adm_used;
   if (cur + need <= budget &&
-      atomicCAS(&g_adm_used, cur, cur + need) == cur) {
+      atomicCAS(&MdG().adm_used, cur, cur + need) == cur) {
     return false;                    // admitted -- the reservation is taken
   }
   return true;
@@ -120,8 +212,9 @@ __device__ gy::YCoroTask AdmitSpans(u32 need, u32 pool, u32 slack) {
       // the context. Purely diagnostic; the wait itself never gives up.
       if (wait && ++rounds == 100000u) {
         rounds = 0;
-        printf("[gpu_vector] admit stall: need=%u pool=%u slack=%u used=%u\n",
-               need, pool, slack, *(volatile u32 *)&g_adm_used);
+        MD_DEV_PRINTF(
+            "[gpu_vector] admit stall: need=%u pool=%u slack=%u used=%u\n",
+               need, pool, slack, *(volatile u32 *)&MdG().adm_used);
       }
     }
     __syncthreads();
@@ -139,18 +232,16 @@ __device__ void ReleaseSpans(u32 need) {
     // nothing), and that presents as a silent whole-run wedge with every
     // cache counter clean.
     for (;;) {
-      const u32 cur = *(volatile u32 *)&g_adm_used;
+      const u32 cur = *(volatile u32 *)&MdG().adm_used;
       const u32 sub = cur < need ? cur : need;
       if (sub == 0u) break;
-      if (atomicCAS(&g_adm_used, cur, cur - sub) == cur) break;
+      if (atomicCAS(&MdG().adm_used, cur, cur - sub) == cur) break;
     }
   }
 }
 
 /** SHARING PROBE: bit b set means block b held that page at least once.
  *  16 blocks fit a u32; the popcount per page is the sharing degree. */
-__device__ u32 g_xmask[8192];
-__device__ u32 g_nlmask[8192];
 __device__ void MarkPages(u32 *mask, u64 p0, u64 p1, u32 block) {
   if (threadIdx.x != 0 || block >= 32) return;
   for (u64 p = p0; p <= p1 && p < 8192; ++p) {
@@ -158,26 +249,18 @@ __device__ void MarkPages(u32 *mask, u64 p0, u64 p1, u32 block) {
   }
 }
 
-__device__ unsigned long long g_pages_done;
 /** Sink for the ballistic path's optional THIRD vector read, so the load
  *  cannot be optimised away while the physics stays untouched. */
-__device__ unsigned long long g_third_sink;
 /** READ-ONLY PROBE (--readprobe). Every experiment so far assumed writes
  *  were being lost; this asks the other half of the question -- does the
  *  FAULT PATH ever deliver wrong bytes? The vector is seeded with a value
  *  that is unique per element and exact in float, then only READ.
  *  [0] mismatches [1] first bad page [2] first bad index. */
-__device__ unsigned long long g_read_bad[4];
 /** First bad sample: {claimed, page, elem, observed-value-as-u32-bits}. */
-__device__ unsigned long long g_read_sample[8];
 /** Set from MD_PROBE_LDCG: read the probe's elements bypassing L1. */
-__device__ bool kProbeLdcg;
 /** {frame0, pages_per_block, page_bytes, elems_per_page} of the probe's table. */
-__device__ unsigned long long g_read_geom[12];
 /** Per LOGICAL block: page iterations completed, and the last page index
  *  reached. Says WHICH block loses work, and where it stopped. */
-__device__ unsigned long long g_blk_done[64];
-__device__ unsigned long long g_blk_last[64];
 
 /** Guards a block may hold over one row of the paged list. Deliberately
  *  small: this array lives in the per-thread coroutine FRAME, so every
@@ -228,9 +311,7 @@ struct MdTables {
  * nl   kMaxNlGuards, +2 to fetch against.
  */
 
-#if defined(CLIO_YIELD_CORO) && defined(__clang__) && defined(__CUDA__)
-#define GV_MD_CORO 1
-#endif
+/* GV_MD_CORO now lives in md_common.h; the driver needs it too. */
 
 
 /** Pages a range touches -- the vector no longer exposes this. */
@@ -255,8 +336,7 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
                                    int eflag, double *acc, u32 z0, u32 z1,
                                    u32 nblocks, u32 block, u64 hgen,
                                    bool force_all) {
-  extern __shared__ char smem_raw[];
-  double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  MD_RED_SCRATCH(red);
   const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
   // THIS NODE'S SLAB, in z-planes. The nine-row stencil still reaches one
   // plane either side, so the rows it READS run past [z0, z1) -- those are
@@ -422,7 +502,6 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
                                        u32 maxneigh, u32 *d_cnt, int *d_err,
                                        u32 rowchunk, u32 z0, u32 z1,
                                        u32 nblocks, u32 block, u64 hgen) {
-  extern __shared__ char smem_raw[];
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
   // holds the same rows and the same list guards, but a thread-local array
   // indexed by a runtime value (rp0[q], np[gi]) cannot be a register: it
@@ -537,7 +616,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
           hg[nspans][1] =
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
-        MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
+        MarkPages(MdG().xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
         sxrb[nspans] = rb;
         sxlen[nspans] = len;
         sp0[nspans] = hg[nspans][0].ptr();
@@ -563,7 +642,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
         co_await nl.Fetch(0, nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         hn[nguards] =
             co_await nl.HoldPage(nb0 + off, rowlist - off, /*write=*/true);
-        MarkPages(g_nlmask, nl.PageOf(nb0 + off),
+        MarkPages(MdG().nlmask, nl.PageOf(nb0 + off),
                   nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
@@ -712,8 +791,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
                                        u32 rowchunk, u32 z0, u32 z1,
                                        u32 nblocks, u32 block, u64 hgen,
                                        bool force_all, u32 band) {
-  extern __shared__ char smem_raw[];
-  double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  MD_RED_SCRATCH(red);
   // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
   // holds the same rows and the same list guards, but a thread-local array
   // indexed by a runtime value (rp0[q], np[gi]) cannot be a register: it
@@ -863,7 +941,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
           hg[nspans][1] =
               co_await x.HoldPage(rb + srun[nspans], len - srun[nspans]);
         }
-        MarkPages(g_xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
+        MarkPages(MdG().xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
         sxrb[nspans] = rb;
         sxlen[nspans] = len;
         sp0[nspans] = hg[nspans][0].ptr();
@@ -874,7 +952,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
         ++nspans;
       }
     }
-    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[0], (unsigned long long)(clock64() - _r0));
+    if (threadIdx.x == 0) atomicAdd(&MdG().md_cyc[0], (unsigned long long)(clock64() - _r0));
     for (u32 by = y0; by <= ylast; ++by) {
     const u64 row = static_cast<u64>(bz) * nb + by;
     // Which span holds each stencil row, and at what offset. Block-uniform
@@ -901,7 +979,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       (e < frun0 ? fp0[e] : fp1[e - frun0]) = 0.0f;
     }
     __syncthreads();
-    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[1], (unsigned long long)(clock64() - _f0));
+    if (threadIdx.x == 0) atomicAdd(&MdG().md_cyc[1], (unsigned long long)(clock64() - _f0));
     const long long _l0 = clock64();
     // Read-hold this row's whole list region.
     gv::Held<int> hn[kMaxNlGuards];
@@ -914,7 +992,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       while (off < rowlist && nguards < kMaxNlGuards) {
         co_await nl.Fetch(0, nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1));
         hn[nguards] = co_await nl.HoldPage(nb0 + off, rowlist - off);
-        MarkPages(g_nlmask, nl.PageOf(nb0 + off),
+        MarkPages(MdG().nlmask, nl.PageOf(nb0 + off),
                   nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
         np[nguards] = hn[nguards].ptr();
         gstart[nguards] = off;
@@ -956,7 +1034,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
       }
     }
     __syncthreads();
-    if (threadIdx.x == 0) atomicAdd(&g_md_cyc[2], (unsigned long long)(clock64() - _l0));
+    if (threadIdx.x == 0) atomicAdd(&MdG().md_cyc[2], (unsigned long long)(clock64() - _l0));
     const long long _p0 = clock64();
     const u64 slotbase = row * islots;
     const u32 sp4 = s_qspan[4];
@@ -1010,14 +1088,14 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-      atomicAdd(&g_md_cyc[3], (unsigned long long)(clock64() - _p0));
+      atomicAdd(&MdG().md_cyc[3], (unsigned long long)(clock64() - _p0));
       // NOT the chunk total here. _r0 is stamped once per CHUNK, so
       // accumulating (now - _r0) once per ROW sums rowchunk overlapping
       // spans and inflates the total by ~rowchunk -- which made the named
       // phases look like a quarter of the kernel and invented a 74%
       // "unattributed" gap that does not exist. The chunk total is taken
       // once, after the row loop.
-      atomicAdd(&g_md_cyc[5], 1ull);
+      atomicAdd(&MdG().md_cyc[5], 1ull);
     }
     // The row's own pins go back here; the chunk's x spans go back below.
     // f is written and never flushed by design -- the next kernel reads it
@@ -1029,9 +1107,9 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     }
     f.UnpinRange(fbase, row_elems);
     }   // per-row loop
-    // The chunk total, taken ONCE. See the note at g_md_cyc[5].
+    // The chunk total, taken ONCE. See the note at MdG().md_cyc[5].
     if (threadIdx.x == 0) {
-      atomicAdd(&g_md_cyc[4], (unsigned long long)(clock64() - _r0));
+      atomicAdd(&MdG().md_cyc[4], (unsigned long long)(clock64() - _r0));
     }
     // Every span guard above is dead here (the chunk body scope ends with
     // this brace), so the reservation is given back exactly once per
@@ -1102,12 +1180,12 @@ __device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
     // page evicted before the flush refaults to its PRE-WRAP positions and
     // the resort bins atoms a box-length away. Resident runs never noticed:
     // the frame was the only copy anyone read.
-    if (g_md_flush) {
+    if (MdG().md_flush) {
       co_await x.BeginFlush(0, e0, e1 - e0);
     }
     x.UnpinRange(pg * epp, epp);
   }
-  if (g_md_flush) co_await x.EndFlush();
+  if (MdG().md_flush) co_await x.EndFlush();
 }
 
 /**
@@ -1189,8 +1267,8 @@ __device__ gy::YCoroMain RebinAssignCoro(gv::DeviceVector<float> x, u32 nb,
         const u64 srow = (slot0 + s) / islots_r;
         const u32 sby = static_cast<u32>(srow % nb);
         const u32 sbz = static_cast<u32>(srow / nb);
-        const u32 dy = min((by + nb - sby) % nb, (sby + nb - by) % nb);
-        const u32 dz = min((bz + nb - sbz) % nb, (sbz + nb - bz) % nb);
+        const u32 dy = MdMinU32((by + nb - sby) % nb, (sby + nb - by) % nb);
+        const u32 dz = MdMinU32((bz + nb - sbz) % nb, (sbz + nb - bz) % nb);
         if (dy > 1u || dz > 1u) *d_err = 2;
       }
       __syncthreads();
@@ -1356,7 +1434,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
       const u32 dest = d_dest[srow[q] * islots + sslot];
       if (dest == ~0u) continue;               // overflow victim
       if (static_cast<u64>(dest) / islots != row) continue;   // not ours
-      atomicAdd(&g_gather_wrote, 1ull);
+      atomicAdd(&MdG().gather_wrote, 1ull);
       const u64 de = (static_cast<u64>(dest) % islots) * kStride;
       float *const dp = (de < drun) ? dp0 + de : dp1 + (de - drun);
       const float *const sv =
@@ -1371,7 +1449,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     // in this block's cache is invisible to every other block. Flush exactly
     // the row -- a whole-page flush would also send this block's stale copy
     // of the ~11 OTHER rows sharing the page and clobber their owners.
-    if (g_publish && g_pub_interior) {
+    if (MdG().publish && MdG().pub_interior) {
       co_await dst.Flush(0, row * row_elems, row_elems);
     }
     // One unpin per fetch, in the same shape the fetches were issued: the
@@ -1413,7 +1491,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
         }
       }
     }
-    if (g_md_flush) {
+    if (MdG().md_flush) {
       co_await dst.BeginFlush(0, row * row_elems, row_elems);
     }
     dst.UnpinRange(row * row_elems, row_elems);
@@ -1425,7 +1503,7 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
     if (false) {
     }
   }     // per-row loop
-  if (g_md_flush) co_await dst.EndFlush();
+  if (MdG().md_flush) co_await dst.EndFlush();
 }
 
 /** Pre-sentinel every slot of a ping-pong destination vector. */
@@ -1447,10 +1525,10 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst, u32 nb,
       p[s * kStride + 3] = -1.0f;
     }
     __syncthreads();
-    if (g_md_flush) co_await dst.BeginFlush(0, e0, e1 - e0);
+    if (MdG().md_flush) co_await dst.BeginFlush(0, e0, e1 - e0);
     dst.UnpinRange(pg * epp, epp);
   }
-  if (g_md_flush) co_await dst.EndFlush();
+  if (MdG().md_flush) co_await dst.EndFlush();
 }
 
 /** K1/K4 for real MD: the kick reads the FORCE VECTOR (mass = 1). Same
@@ -1502,7 +1580,7 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
     // I/O, so an unflushed kick is silently undone by the next fault of
     // this page. Clipped to the slab's own elements -- the seam page
     // belongs to two nodes and each may flush only its own half.
-    if (g_md_flush) {
+    if (MdG().md_flush) {
       if (drift) co_await x.BeginFlush(0, e0, e1 - e0);
       co_await v.BeginFlush(0, e0, e1 - e0);
     }
@@ -1510,7 +1588,7 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
     v.UnpinRange(pg * epp, epp);
     f.UnpinRange(pg * epp, epp);
   }
-  if (g_md_flush) {
+  if (MdG().md_flush) {
     if (drift) co_await x.EndFlush();
     co_await v.EndFlush();
   }
@@ -1533,9 +1611,9 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
   // converted to an actual slot index instead of being guessed at from raw
   // addresses (which are only comparable within one process).
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    g_read_geom[1] = x.SetSize();
-    g_read_geom[2] = x.PageBytes();
-    g_read_geom[3] = epp;
+    MdG().read_geom[1] = x.SetSize();
+    MdG().read_geom[2] = x.PageBytes();
+    MdG().read_geom[3] = epp;
   }
   for (u64 it = 0; it < passes; ++it) {
     for (u64 pg = block; pg < npages; pg += nblocks) {
@@ -1551,16 +1629,16 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
         // mismatches vanish only under this, the bytes were always in the
         // frame and the kernel was reading a stale cached line -- host DMA
         // that lands mid-kernel is not visible to an ordinary ld.global.
-        const float seen = kProbeLdcg ? __ldcg(&p[i]) : p[i];
+        const float seen = MdG().probe_ldcg ? __ldcg(&p[i]) : p[i];
         if (seen != ProbeVal(pg * epp + i)) {
-          atomicAdd(&g_read_bad[0], 1ull);
+          atomicAdd(&MdG().read_bad[0], 1ull);
           // IS THE DATA ACTUALLY THERE? Re-read the SAME element fully
           // uncached (ld.global.cv bypasses L1 AND treats L2 as volatile),
           // with no delay -- this is a pure cache question, not a timing
           // one. A match here means the bytes were in the frame all along
           // and the kernel was reading a stale cached line.
           if (__ldcv(&p[i]) == ProbeVal(pg * epp + i)) {
-            atomicAdd(&g_read_bad[1], 1ull);
+            atomicAdd(&MdG().read_bad[1], 1ull);
           }
           // DOES IT HEAL? Wait, re-read the SAME address through the SAME
           // guard, and see whether the value arrives late. If it does, the
@@ -1605,7 +1683,7 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
     float *const px = hx.ptr();
     float *const pv = hv.ptr();
     if (use_third && threadIdx.x == 0) {
-      atomicAdd(&g_third_sink,
+      atomicAdd(&MdG().third_sink,
                 static_cast<unsigned long long>(__float_as_uint(ht.ptr()[0])));
     }
     const u64 nslots = epp / kStride;
@@ -1629,10 +1707,10 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-      atomicAdd(&g_pages_done, 1ull);
+      atomicAdd(&MdG().pages_done, 1ull);
       if (block < 64) {
-        atomicAdd(&g_blk_done[block], 1ull);
-        g_blk_last[block] = pg;
+        atomicAdd(&MdG().blk_done[block], 1ull);
+        MdG().blk_last[block] = pg;
       }
     }
     // PUBLISH THIS PAGE, BY NAME. A block's table is private, so a page left
@@ -1642,7 +1720,7 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
     // same range, which is precisely what a whole-table flush could not
     // promise. Async, so the put overlaps the next page's integration.
     const u64 cnt = (x.size() - pg * epp < epp) ? x.size() - pg * epp : epp;
-    if (g_publish && g_pub_interior) {
+    if (MdG().publish && MdG().pub_interior) {
       co_await x.BeginFlush(0, pg * epp, cnt);
       co_await v.BeginFlush(0, pg * epp, cnt);
     }
@@ -1663,8 +1741,7 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
                                     gv::DeviceVector<float> v,
                                     double *out, u32 nb, u32 cap, u32 z0,
                                     u32 z1, u32 nblocks, u32 block) {
-  extern __shared__ char smem_raw[];
-  double *red = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  MD_RED_SCRATCH(red);
   const u64 epp = x.ElemsPerPage();
   const Slab sl = SlabOf(nb, cap, z0, z1, epp);
   double ke = 0.0, mx = 0.0, my = 0.0, mz = 0.0;
@@ -1761,7 +1838,7 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     co_await x.BeginFlush(gen, lo_pl, plane_elems_p, hi_pl, plane_elems_p);
     co_await x.EndFlush();
     if (threadIdx.x == 0) {
-      atomicAdd(&g_pub_flush_cyc,
+      atomicAdd(&MdG().pub_flush_cyc,
                 (unsigned long long)(clock64() - _c0));
     }
     x.UnpinRange(lo_pl, plane_elems_p);
@@ -1793,7 +1870,7 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     const long long _c1 = clock64();
     co_await x.Fetch(gen, below, plane_elems_p, above, plane_elems_p);
     if (threadIdx.x == 0) {
-      atomicAdd(&g_pub_fetch_cyc,
+      atomicAdd(&MdG().pub_fetch_cyc,
                 (unsigned long long)(clock64() - _c1));
     }
     if (halo_first == 0u) {

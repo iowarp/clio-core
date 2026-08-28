@@ -124,11 +124,9 @@ static void MdMark(const char *what) {
   // where it happened. Syncing here pins it down without the full
   // serialization of CUDA_LAUNCH_BLOCKING, which hides the race entirely.
   static const char *prev = "(none)";
-  cudaError_t e = cudaDeviceSynchronize();
-  if (e == cudaSuccess) e = cudaGetLastError();
-  if (e != cudaSuccess) {
-    std::fprintf(stderr, "[mdtrace] *** FAILED IN %s: %s\n", prev,
-                 cudaGetErrorString(e));
+  const char *e = md::DeviceSyncCheck();
+  if (e != nullptr) {
+    std::fprintf(stderr, "[mdtrace] *** FAILED IN %s: %s\n", prev, e);
     std::fflush(stderr);
     std::_Exit(9);
   }
@@ -271,7 +269,25 @@ void HostForceReference(const Geometry &g, const std::vector<float> &hx,
   *pairs_out = pairs / 2;   // full-list double count -> unique pairs
 }
 
+/**
+ * A boolean env flag that survives docker-compose.
+ *
+ * `getenv(x) != nullptr` is TRUE for an EMPTY value, and the harness declares
+ * `MD_NO_HALO=${MD_NO_HALO:-}` unconditionally, so the variable is always
+ * present in the container and every such flag read as ON -- including in the
+ * "halo enabled" arm of the A/B, which is why both arms produced identical
+ * numbers. Empty, "0", "false" and "no" all mean OFF.
+ */
+static bool EnvOn(const char *name) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+           std::strcmp(v, "no") == 0);
+}
+
 }  // namespace
+
+#if defined(GV_MD_CORO)
 
 #if !CTP_IS_DEVICE_PASS
 namespace {
@@ -954,6 +970,11 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+
+  // Per-block device state the SYCL backend allocates once (its IpcManagers
+  // and the MdGlobals block); a no-op under CUDA, where both are __shared__ or
+  // __device__ storage born fresh at each launch. Must precede every launch.
+  md::InitBackend(a.blocks, gpu);
 
   // WATCH THE FATAL CHANNEL. A device trap kills the context, and the
   // runtime's own error path then aborts the process, so nothing the bench

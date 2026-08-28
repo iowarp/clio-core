@@ -59,6 +59,9 @@ bool DevMemInfo(size_t *free_bytes, size_t *total_bytes);
  *  Must NOT clear a sticky error: the driver reads the device fatal channel
  *  after this and a clear would turn the story into a bare error code. */
 const char *LaunchError();
+/** Synchronize and report the first error, or nullptr if clean. Used by the
+ *  GV_MD_TRACE marker to pin an async failure on the launch that caused it. */
+const char *DeviceSyncCheck();
 /** Device clock in kHz, for turning clock64() deltas into microseconds. */
 u32 DeviceClockKHz();
 

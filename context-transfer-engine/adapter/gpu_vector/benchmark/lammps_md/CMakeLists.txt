@@ -294,3 +294,48 @@ if(Kokkos_FOUND)
         message(STATUS "lammps_md Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
     endif()
 endif()
+
+
+#------------------------------------------------------------------------------
+# eternia-MD over a paged vector -- SYCL.
+#
+# Same host driver source as the CUDA target, compiled once as ordinary C++.
+# Only sycl/md_launch_sycl.cc is built with -fsycl; the workload
+# (md_kernels.h over md_common.h) is one copy shared by both, and the SYCL
+# launchers are GENERATED from the CUDA trampolines. SHARED library for the
+# launches -- device code in a static archive does not reach the executable's
+# device image. SPIR-V is refused: DPC++ cannot compile a coroutine for it.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
+    set(_md_inc
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(md_sycl_launch SHARED sycl/md_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(md_sycl_launch)
+    set_target_properties(md_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(md_sycl_launch PUBLIC ${_md_inc})
+    target_link_libraries(md_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_lammps_md_paged_bench_sycl clio_lammps_md_paged_bench.cc)
+    target_link_options(clio_lammps_md_paged_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_lammps_md_paged_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${_md_inc})
+    target_link_libraries(clio_lammps_md_paged_bench_sycl PRIVATE
+        md_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_lammps_md_paged_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_lammps_md_paged_bench_sycl RUNTIME DESTINATION bin)
+    message(STATUS "lammps_md paged bench (SYCL): ON")
+endif()

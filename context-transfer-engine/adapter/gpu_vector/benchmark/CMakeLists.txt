@@ -18,24 +18,24 @@
 # flush, overlap, stream) and the register-cap probes.
 #------------------------------------------------------------------------------
 
-# kmeans is the workload that has been split into shared kernels plus
-# per-backend launches (kmeans/kmeans_kernels.h + kmeans/cuda + kmeans/sycl),
-# so it is the only one a SYCL build can descend into today. The others are
-# still CUDA-only sources; porting each is the same mechanical split.
 # Workloads split into shared kernels plus per-backend launches
 # (<wl>_kernels.h over <wl>_math.h, plus <wl>/cuda and <wl>/sycl). These are
-# the ones a SYCL build can descend into.
+# the ones a SYCL build can descend into -- which is now all six.
 add_subdirectory(kmeans)
 add_subdirectory(grayscott)
 add_subdirectory(gmx)
 add_subdirectory(weights)
 add_subdirectory(lbann)
+# lammps_md joined them: its seam split (md_kernels.h over md_common.h, plus
+# lammps_md/cuda and lammps_md/sycl) was the last one, and the __shared__ usage
+# that made it the outlier turned out to be only the reduction scratch -- the
+# block-uniform tables were already on the global-backed CLIO_SHARED_PERSIST
+# arena, which SYCL supports unchanged.
+add_subdirectory(lammps_md)
 
-# Still CUDA-only sources. Porting each is the same mechanical split;
-# lammps_md is the outlier, with real __shared__ usage that needs
-# group_local_memory rather than a move.
+# gnn is not a paged-vector workload at all -- it is an ingest/aggregate tool
+# with a different shape -- so it has no SYCL row to port and stays here.
 if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-    add_subdirectory(lammps_md)
     add_subdirectory(gnn)
 endif()
 
