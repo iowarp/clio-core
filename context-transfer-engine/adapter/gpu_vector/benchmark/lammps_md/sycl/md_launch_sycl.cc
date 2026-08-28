@@ -61,7 +61,13 @@ void InitBackend(u32 max_blocks, const clio::run::IpcManagerGpuInfo &info) {
   q.copy(&one, reinterpret_cast<u32 *>(
                    reinterpret_cast<char *>(g_md_host_view) +
                    offsetof(MdGlobals, pub_interior)), 1).wait();
-  q.copy(g_md_dg, &g_md_host_view, 1).wait();
+  // INSTALL, not read: queue::copy has BOTH directions as overloads
+  // (device_global -> host and host -> device_global), so writing the
+  // arguments the wrong way round compiles clean and merely leaves the
+  // device_global null -- MdG() then dereferences null in every kernel, and
+  // this also clobbers g_md_host_view with the uninitialised device value so
+  // every later SymbolWrite/SymbolRead targets garbage too. Source first.
+  q.copy(&g_md_host_view, g_md_dg, 1).wait();
 }
 
 namespace {
@@ -626,3 +632,33 @@ void LaunchMDIntegrate(dim3 grid,
 }
 
 }  // namespace clio::gv_bench::md
+
+namespace clio::run::gpu {
+
+/**
+ * The out-of-line half of YieldStack::Reset; see yield_stack.h. Exactly one
+ * -fsycl TU per linked program may define this, for the same reason it owns
+ * the device_globals: every -fsycl TU produces its own device image, and the
+ * yield smem base has to be installed in the image the kernels actually run
+ * from.
+ */
+void SyclYieldStackReset(const YieldStackView &view, clio::run::u32 nlanes,
+                         char *smem_base) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  YieldStackView v = view;
+  q.parallel_for(sycl::range<1>(nlanes), [=](sycl::id<1> i) {
+     auto *h = reinterpret_cast<YieldLaneHeader *>(
+         v.base_ + static_cast<clio::run::u64>(i[0]) * v.bytes_per_lane_);
+     h->sp_ = sizeof(YieldLaneHeader);   // the header is not frame space
+     h->live_depth_ = 0;
+     h->cur_depth_ = 0;
+     h->error_ = kYieldErrNone;
+     h->coro_resume_ = 0;
+     h->coro_top_ = 0;
+     h->coro_park_ = 0;
+   }).wait();
+  char *base = smem_base;
+  q.copy(&base, g_yield_smem_dg, 1).wait();
+}
+
+}  // namespace clio::run::gpu
