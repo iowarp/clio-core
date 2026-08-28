@@ -50,6 +50,28 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double primary_cost, bool adopted,
                           bool is_primary = false, double dt_ms = -1.0,
                           /**
+                           * The MODEL'S OWN INPUTS for this row, so the eight
+                           * numbers NeuroPress was fed are recoverable from
+                           * one line instead of a join against selection.csv.
+                           *
+                           * entropy/mad/second_deriv describe the CHUNK, so
+                           * they repeat across a chunk's candidates; that
+                           * redundancy is the price of the row being
+                           * self-contained.
+                           *
+                           * eb_encoded is NOT --eb. FeaturesTo8Input feeds
+                           * input 3 a SENTINEL of 1e-7 for a lossless
+                           * candidate rather than 0, because that is how the
+                           * net was trained (configs.py:44,
+                           * `eb_val = eb if quant else 1e-7`). Logging the raw
+                           * bound would misreport input 3 on every lossless
+                           * candidate -- which is every candidate in a
+                           * lossless run.
+                           */
+                          double entropy = -1.0, double mad = -1.0,
+                          double second_deriv = -1.0,
+                          double eb_encoded = -1.0,
+                          /**
                            * MEASURED reconstruction quality, or nullptr when
                            * the candidate was not measured -- which is the
                            * default, since CLIO_NEUROPRESS_MEASURE_QUALITY is

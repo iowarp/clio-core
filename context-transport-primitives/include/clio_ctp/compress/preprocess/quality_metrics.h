@@ -73,6 +73,26 @@ struct QualityMetrics {
   double max_error = 0.0;
   double psnr_db = 120.0;   ///< capped at 120, upstream's convention
   double ssim = 1.0;        ///< in [-1, 1]; 1.0 for a bit-exact round trip
+  /**
+   * 1 - ssim, computed WITHOUT the subtraction, because ssim saturates.
+   *
+   * For a good reconstruction ssim approaches 1 and every digit that matters
+   * is in the tail: rho_E at eb=0.1 has a true deviation near 1e-14, which
+   * prints as "1" at any sane precision and reads as a perfect match on data
+   * that was quantized. The deviation is the informative quantity and it
+   * cannot survive being recovered as 1 - ssim afterwards -- double rounding
+   * near 1 destroys anything below ~1e-16, and the direct form is already
+   * polluted well above that.
+   *
+   * Derived from an exact rearrangement rather than measured separately:
+   *   A = mu_x^2+mu_y^2+C1   B = 2 mu_x mu_y + C1
+   *   C = var_x+var_y+C2     D = 2 cov + C2
+   *   A - B = (mu_x-mu_y)^2 = dmu^2      C - D = var_x+var_y-2cov = var(x-y)
+   *   1 - BD/AC = [A*dvar + dmu^2*C - dmu^2*dvar] / (A*C)
+   * and both differences come from accumulators the reduction already has:
+   * dmu from slots 4 and 6, dvar from slot 0. No extra pass, no new slot.
+   */
+  double ssim_deviation = 0.0;
   double data_range = 0.0;  ///< max(orig) - min(orig); PSNR/SSIM scale
   std::size_t n = 0;        ///< elements compared
 };
@@ -158,6 +178,19 @@ inline QualityMetrics QualityFromAccumulators(const QualityAccumulators &a,
   const double num = (2.0 * mu_x * mu_y + c1) * (2.0 * cov + c2);
   const double den = (mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2);
   m.ssim = (den > 0.0) ? std::fmax(-1.0, std::fmin(1.0, num / den)) : 1.0;
+
+  // 1 - ssim, from the rearrangement documented on the field. dmu is exact
+  // (the shift cancels in the difference of the two shifted sums) and dvar is
+  // the error variance, straight from the squared-error slot.
+  const double dmu = dmu_x - dmu_y;
+  const double dvar = std::fmax(0.0, a.sq_err / dn - dmu * dmu);
+  const double aa = mu_x * mu_x + mu_y * mu_y + c1;
+  const double cc = var_x + var_y + c2;
+  m.ssim_deviation =
+      (aa * cc > 0.0)
+          ? std::fmax(0.0, (aa * dvar + dmu * dmu * cc - dmu * dmu * dvar) /
+                               (aa * cc))
+          : 0.0;
   return m;
 }
 

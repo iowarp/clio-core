@@ -69,7 +69,13 @@ QualityLog *QualityLogInstance() {
         // capped at 120 dB, and structurally unable to see a bound violation.
         std::fprintf(l->fp,
                      "seq,blob,orig_bytes,elements,shuffle,quantized,"
-                     "rmse,max_error,psnr_db,ssim,data_range\n");
+                     // psnr_db keeps upstream's 120 dB cap. ssim_deviation
+                     // is 1-ssim computed WITHOUT the subtraction: ssim
+                     // saturates to 1 for any good reconstruction, so the
+                     // deviation is where the information is and it cannot be
+                     // recovered afterwards.
+                     "rmse,max_error,psnr_db,ssim,ssim_deviation,"
+                     "data_range\n");
       }
     }
     return l;
@@ -129,7 +135,11 @@ ExploreLog *ExploreLogInstance() {
                      // quality_measured disambiguates: ssim's valid range
                      // includes -1, so a bare sentinel could not.
                      "quality_measured,meas_rmse,meas_max_error,"
-                     "meas_psnr_db,meas_ssim\n");
+                     "meas_psnr_db,meas_ssim,meas_ssim_deviation,"
+                     // The model's own eight inputs, so a row explains the
+                     // prediction beside it. algo_idx/quantize/shuffle and
+                     // chunk_bytes are already above; these are the rest.
+                     "entropy,mad,second_deriv,eb_encoded\n");
       }
     }
     return l;
@@ -237,10 +247,14 @@ void LogMeasuredQuality(const std::string &blob_name, size_t orig_bytes,
   QualityLog *log = QualityLogInstance();
   if (!log->fp) return;
   std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(log->fp, "%ld,%s,%zu,%zu,%u,%d,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+  std::fprintf(log->fp,
+               "%ld,%s,%zu,%zu,%u,%d,%.10g,%.10g,%.10g,%.17g,%.10g,%.10g\n",
                log->seq++, blob_name.c_str(), orig_bytes, q.n, shuffle,
-               quantized ? 1 : 0, q.rmse, q.max_error, q.psnr_db, q.ssim,
-               q.data_range);
+               quantized ? 1 : 0, q.rmse, q.max_error, q.psnr_db,
+               // 17 digits: ssim near 1 needs every one of them to be
+               // reconstructible, and ssim_deviation beside it is the value
+               // that does not need them.
+               q.ssim, q.ssim_deviation, q.data_range);
   std::fflush(log->fp);
 }
 
@@ -251,7 +265,8 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double pred_dt_ms, double ratio,
                           double ct_ms, double psnr_db, double cost,
                           double primary_cost, bool adopted, bool is_primary,
-                          double dt_ms,
+                          double dt_ms, double entropy, double mad,
+                          double second_deriv, double eb_encoded,
                           const ctp::compress::preprocess::QualityMetrics
                               *quality) {
   ExploreLog *log = ExploreLogInstance();
@@ -286,7 +301,8 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
   std::fprintf(log->fp,
                "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
                "%.10g,%.10g,%.10g,%.10g,%.10g,%d,"
-               "%d,%.10g,%.10g,%.10g,%.10g\n",
+               "%d,%.10g,%.10g,%.10g,%.17g,%.10g,"
+               "%.10g,%.10g,%.10g,%.10g\n",
                log->seq++, blob_name.c_str(), chunk_size,
                is_primary ? "primary" : "alt", rank,
                lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
@@ -296,7 +312,9 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                quality ? quality->rmse : -1.0,
                quality ? quality->max_error : -1.0,
                quality ? quality->psnr_db : -1.0,
-               quality ? quality->ssim : -1.0);
+               quality ? quality->ssim : -1.0,
+               quality ? quality->ssim_deviation : -1.0,
+               entropy, mad, second_deriv, eb_encoded);
   std::fflush(log->fp);
 }
 

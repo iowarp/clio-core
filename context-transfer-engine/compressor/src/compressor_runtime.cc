@@ -2364,6 +2364,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             explore_costs.push_back(alt_cost);
           }
 
+          // Input 3 as the MODEL sees it. FeaturesTo8Input substitutes a
+          // 1e-7 sentinel for a lossless candidate instead of 0, because the
+          // net was trained that way; logging --eb here would misreport the
+          // input on every lossless row.
+          auto eb_for_log = [&](bool quant) {
+            return quant ? context.error_bound_ : 1e-7;
+          };
           // The model's own pick, logged alongside the alternatives so every
           // action for a chunk sits in one file. It has no sweep rank -- it
           // was never one of the measured slots -- hence -1.
@@ -2379,7 +2386,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 context.actual_compression_ratio_,
                 context.actual_compress_time_ms_, context.actual_psnr_db_,
                 primary_rank_cost, primary_rank_cost,
-                /*adopted=*/!winner.have, /*is_primary=*/true, primary_dt_ms);
+                /*adopted=*/!winner.have, /*is_primary=*/true, primary_dt_ms,
+                neuropress_entropy, neuropress_mad, neuropress_second_deriv,
+                eb_for_log(UnpackQuantEnabled(p_packed)));
           }
           for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
             const ExploreRow& row = explore_rows[ri];
@@ -2401,6 +2410,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 // WORSE than the primary they beat.
                 primary_rank_cost, static_cast<int>(ri) == winner.row,
                 /*is_primary=*/false, row.dt_ms,
+                neuropress_entropy, neuropress_mad, neuropress_second_deriv,
+                eb_for_log(row.quant),
                 row.have_quality ? &row.quality : nullptr);
           }
 
