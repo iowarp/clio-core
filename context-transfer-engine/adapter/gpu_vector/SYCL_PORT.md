@@ -167,6 +167,21 @@ match the harness's own documented reference:
     GVMB_ARGS="--lattice 28 --steps 20 --blocks 8" \
     BUILD_DIR=build-cuda ./run_md_bench_distributed.sh
 
+**HOW TO TELL THE DISTRIBUTED RUN ACTUALLY CROSSED THE WIRE.** A 2-node run
+that passes its gates has not necessarily moved anything between nodes -- each
+node can be working entirely out of its own slab, and the gates would still be
+green. The generational counters are what distinguish the two:
+
+    single node        gen: resident_ok=0   refetch=0
+    2-node CUDA        gen: resident_ok=368 refetch=80  busy=0 flush_dropped=0
+    2-node SYCL        gen: resident_ok=368 refetch=80  busy=0 flush_dropped=0
+
+`refetch` counts halo a node demanded AT a generation and had to pull from its
+peer. Eighty of them, and the two backends agree exactly -- so the generational
+exchange itself behaves identically under SYCL, not merely the local physics.
+Check these before believing any "distributed validated" claim, including the
+ones in this file.
+
 **RUNNING THE SYCL BUILD IN THAT HARNESS**, which the deps-cpu image cannot do
 on its own -- it has no DPC++ -- WITHOUT editing the compose file:
 
