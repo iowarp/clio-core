@@ -232,3 +232,26 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
     message(STATUS "grayscott paged bench (SYCL): ON")
 endif()
 
+
+
+#------------------------------------------------------------------------------
+# Gray-Scott, Kokkos edition: the performance-portability baseline.
+#
+# ONE SOURCE, WHICHEVER BACKEND KOKKOS WAS BUILT FOR -- point CMake at an
+# install with -DKokkos_ROOT=<path>. Links nothing from clio, like every
+# other baseline here.
+#------------------------------------------------------------------------------
+find_package(Kokkos QUIET)
+if(Kokkos_FOUND)
+    find_package(MPI QUIET COMPONENTS CXX)
+    if(MPI_CXX_FOUND)
+        add_executable(clio_grayscott_kokkos_bench
+            kokkos/clio_grayscott_kokkos_bench.cc)
+        target_link_libraries(clio_grayscott_kokkos_bench PRIVATE
+            Kokkos::kokkos MPI::MPI_CXX)
+        set_target_properties(clio_grayscott_kokkos_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        install(TARGETS clio_grayscott_kokkos_bench RUNTIME DESTINATION bin)
+        message(STATUS "grayscott Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
+    endif()
+endif()
