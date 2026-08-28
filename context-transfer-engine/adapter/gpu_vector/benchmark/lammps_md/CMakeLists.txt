@@ -18,7 +18,9 @@
 if(CLIO_CORE_ENABLE_CUDA)
     add_cuda_executable(clio_lammps_md_paged_bench FALSE
         clio_lammps_md_paged_bench.cc
+        cuda/md_launch_cuda.cc
         INCLUDE_DIRS
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_SOURCE_DIR}/context-runtime/include
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
