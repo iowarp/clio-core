@@ -211,15 +211,29 @@ errors.
 346, both with zero get/put errors. The eviction gap noted below is specific
 to the MD deck's block geometry, not a property of the port.
 
-**What it is NOT validated against, and why.** EVICTION. The ctest entry named
-`_ooc` does not exercise it: `--slots 8` is clamped up to the 28-frame pin
-floor, so both backends report `evicts=0` and "resident contract HELD". Real
-eviction needs a larger working set, and at `--blocks 8` the CUDA row itself
-dies with `FATAL set full` for lattice 24, 26, 28 and 32 -- a shared
-set-associativity limit at that block count, not a SYCL gap. Faults are
-exercised (22 of them, plus 493 puts); eviction is not, on EITHER backend, at
-8 blocks. Raising the SYCL block ceiling (see Known limits) is what would let
-this be tested.
+**Eviction IS validated, on both backends.** An earlier version of this file
+said it was unreachable at `--blocks 8`. That was wrong, and wrong for a
+careless reason: it rested on ONE `--slots` value (8, which is clamped up to
+the 28-frame pin floor) that happened to hit set-associativity exhaustion, and
+I generalised from it. Sweeping the parameter finds the regime immediately --
+
+    --md --lattice 32 --steps 10 --blocks 8 --slots 32
+
+54 pages against a 32-slot cache. CUDA faults 2738 times and evicts 2666;
+SYCL faults 2931 and evicts 2859 (the counts track the paging schedule). Both
+report `get_errors=0 put_errors=0`, and the physics is BIT-IDENTICAL:
+
+    E0 = -883866.683685  En = -883866.557173  drift 1.43e-07
+    KE 3932.164 -> 3417.846   x puts = 1418
+    RESORT PE -887798.847731 -> -887798.847731 at rel=0.00e+00
+
+Covered by `cte_gpu_vector_lammps_md_evict` and
+`cte_gpu_vector_lammps_md_evict_sycl`.
+
+NOTE that the entry named `_ooc` does NOT evict: `--slots 8` is clamped to the
+pin floor and the working set fits, so it prints "resident contract HELD: no
+evictions". It exercises the clamp path, which is worth having, but it is not
+an out-of-core test despite the name. Both entries are kept.
 
 Two facts about the Kokkos rows that are easy to misread:
 

@@ -73,6 +73,24 @@ if(CLIO_CORE_ENABLE_CUDA)
                 --slots 8
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    # THE _ooc ENTRY ABOVE DOES NOT EVICT. --slots 8 is clamped up to the
+    # 28-frame pin floor and the working set fits, so it reports
+    # "resident contract HELD: no evictions" -- it tests the clamp path, not
+    # the paging path. THIS entry does: lattice 32 needs 54 pages against a
+    # 32-slot cache, which faults ~2700 times and evicts ~2650, and the gates
+    # still pass. Keep both; they cover different things.
+    add_test(NAME cte_gpu_vector_lammps_md_evict
+        COMMAND clio_lammps_md_paged_bench --md --lattice 32 --steps 10
+                --blocks 8 --slots 32
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_lammps_md_evict PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+
     set_tests_properties(cte_gpu_vector_lammps_md_ooc PROPERTIES
         TIMEOUT 900
         LABELS "cte;gpu;gpu_vector;lammps_md"
@@ -373,6 +391,21 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
         COMMAND clio_lammps_md_paged_bench_sycl --md --lattice 20 --steps 20 --blocks 8
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    # Same eviction geometry as cte_gpu_vector_lammps_md_evict. This is the
+    # entry that puts the SYCL paging path under real pressure -- ~2900
+    # faults and ~2850 evictions -- rather than merely faulting.
+    add_test(NAME cte_gpu_vector_lammps_md_evict_sycl
+        COMMAND clio_lammps_md_paged_bench_sycl --md --lattice 32 --steps 10
+                --blocks 8 --slots 32
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_lammps_md_evict_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+
     set_tests_properties(cte_gpu_vector_lammps_md_sycl PROPERTIES
         TIMEOUT 900
         LABELS "cte;gpu;gpu_vector;sycl"
