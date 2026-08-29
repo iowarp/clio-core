@@ -266,6 +266,30 @@ Two facts about the Kokkos rows that are easy to misread:
 
 ## Known limits
 
+- **`cr_gpu_kernel_stress_sycl` FAILS, and it is not this port's doing.**
+  Recorded because a green-looking SYCL suite has one red in it and the reason
+  is worth knowing before someone bisects for it:
+
+        [STRESS] sanity marker=48879 (expected 48879)   <- passes
+        [STRESS] slot=0 marker=99 (expected 5)          <- fails
+
+  The sanity marker proves the kernel machinery works at all; the per-slot
+  markers come back as the INITIALISED SENTINEL, so the `single_task`
+  submissions are not landing their writes. That is a gap in the SYCL GPU-lane
+  path, distinct from the 8-block ceiling below. The CUDA twin
+  (`cr_gpu_kernel_stress_cuda`) passes on the same deck.
+
+  PRE-EXISTING, established rather than assumed: reverting BOTH shared headers
+  (`gpu_api.h`, `atomic.h`) to the branch base and rebuilding reproduces the
+  identical failure.
+
+  TWO TRAPS when reproducing it. Run it through ctest, not by hand: the
+  standalone binary fails EARLIER and DIFFERENTLY (`ChiMod 'clio_cae_core' not
+  found` -> `CLIO_INIT failed`) because ctest sets `CLIO_REPO_PATH` and the
+  developer's `~/.clio/clio.yaml` composes a CAE pool this build does not
+  have. And the ctest output shows nothing useful without
+  `--output-on-failure`; the marker lines are the whole diagnosis.
+
 - **8 blocks.** At 32 the multi-block phase wedges: the driver relaunches and
   no block completes. The CUDA build carries the same workload to 128, but it
   submits through the **batched device ring**, and that transport is not
