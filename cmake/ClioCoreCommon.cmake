@@ -115,8 +115,24 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     endif()
     message(STATUS "ROCm enabled: HIP_PLATFORM=${CLIO_ROCM_HIP_PLATFORM}")
 
+    # Honour ROCM_PATH (the variable hipcc, hipconfig and the ROCm CMake
+    # packages all use) before falling back to the default location. Without
+    # this, pointing every other ROCm variable at a relocated install still
+    # left ROCM_ROOT on /opt/rocm, and the include directory below silently
+    # resolved to a path that does not exist.
+    if(NOT DEFINED ROCM_ROOT)
+        if(DEFINED ROCM_PATH)
+            set(_wrp_rocm_default "${ROCM_PATH}")
+        elseif(DEFINED ENV{ROCM_PATH})
+            set(_wrp_rocm_default "$ENV{ROCM_PATH}")
+        else()
+            set(_wrp_rocm_default "/opt/rocm")
+        endif()
+    else()
+        set(_wrp_rocm_default "${ROCM_ROOT}")
+    endif()
     set(ROCM_ROOT
-        "/opt/rocm"
+        "${_wrp_rocm_default}"
         CACHE PATH
         "Root directory of the ROCm installation"
     )
@@ -139,7 +155,12 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
             "CUDA C++ standard" FORCE)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON CACHE BOOL
             "Require CUDA standard" FORCE)
+        # Same substitution trap as the HIP-AMD branch below: this line reads
+        # `set(HIP "CUDA")` after expansion. The cache variable is what the
+        # rest of the build actually consumes.
         set(GPU_RUNTIME "CUDA")
+        set(CLIO_ROCM_GPU_LANG "CUDA" CACHE INTERNAL
+            "CMake language used to compile ROCm/HIP sources" FORCE)
         # Mirror the cuda-language platform-variable cache from
         # wrp_core_enable_cuda — without this, generate-time fails with
         # "Error required internal CMake variable not set" once a nested
@@ -170,11 +191,65 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
         endforeach()
     else()
         # HIP-AMD: hipcc invokes clang/Clang. Use CMake's HIP language.
-        set(GPU_RUNTIME ${GPU_RUNTIME})
+        #
+        # `set(GPU_RUNTIME ${GPU_RUNTIME})` was a no-op with a trap in it. This
+        # is a MACRO and GPU_RUNTIME is its PARAMETER, so the name is
+        # text-substituted before evaluation: called as
+        # wrp_core_enable_rocm(HIP 17) that line expanded to `set(HIP HIP)`,
+        # defining a variable named HIP and never defining GPU_RUNTIME at all.
+        # set_rocm_sources() (a function, so a real scope) then read
+        # ${GPU_RUNTIME}, got the empty string, and every ROCm configure died
+        # in set_source_files_properties with "incorrect number of arguments"
+        # -- a message that names neither the variable nor this macro.
+        set(CLIO_ROCM_GPU_LANG "${GPU_RUNTIME}" CACHE INTERNAL
+            "CMake language used to compile ROCm/HIP sources" FORCE)
+        # macros.h pulls in <hip/hip_runtime_api.h> for ANY TU with
+        # CTP_ENABLE_ROCM set -- including the many compiled by the plain C++
+        # compiler, which knows nothing about ROCm. The NVIDIA branch adds its
+        # include directory per-target; the AMD branch never did, so every
+        # host TU failed with "hip_runtime_api.h: No such file or directory".
+        if(EXISTS "${ROCM_ROOT}/include")
+            include_directories(SYSTEM "${ROCM_ROOT}/include")
+        endif()
+        # ...and say WHICH HIP platform. hip_runtime_api.h ends in
+        #   #error "Must define exactly one of __HIP_PLATFORM_AMD__ or
+        #           __HIP_PLATFORM_NVIDIA__"
+        # and guards its entire body on that choice. amdclang++ defines the
+        # AMD macro implicitly for -x hip, but the ordinary C++ compiler
+        # building the host TUs does not -- so those TUs included the header,
+        # got a body that was #if'd out, and failed with a wall of
+        # "hipSetDevice was not declared in this scope". The NVIDIA branch has
+        # always set its counterpart per-target; this is the AMD equivalent.
+        add_compile_definitions(__HIP_PLATFORM_AMD__=1)
         enable_language(${GPU_RUNTIME})
         set(CMAKE_${GPU_RUNTIME}_STANDARD ${CXX_STANDARD})
         set(CMAKE_${GPU_RUNTIME}_EXTENSIONS OFF)
         set(CMAKE_${GPU_RUNTIME}_STANDARD_REQUIRED ON)
+        # Same nested-scope problem the CUDA branch above documents, and the
+        # same cure. enable_language() populates these in the CALLING scope;
+        # a later nested project() resets it, and generate-time then fails
+        # with "Error required internal CMake variable not set /
+        # CMAKE_HIP_COMPILE_OBJECT". Caching them makes them survive.
+        foreach(_hip_var
+                CMAKE_INCLUDE_FLAG_${GPU_RUNTIME}
+                _CMAKE_${GPU_RUNTIME}_WHOLE_FLAG
+                _CMAKE_${GPU_RUNTIME}_RDC_FLAG
+                _CMAKE_${GPU_RUNTIME}_EXTRA_FLAGS
+                _CMAKE_COMPILE_AS_${GPU_RUNTIME}_FLAG
+                CMAKE_${GPU_RUNTIME}_COMPILE_OBJECT
+                CMAKE_${GPU_RUNTIME}_COMPILE_WHOLE_COMPILATION
+                CMAKE_${GPU_RUNTIME}_LINK_EXECUTABLE
+                CMAKE_${GPU_RUNTIME}_CREATE_SHARED_LIBRARY
+                CMAKE_${GPU_RUNTIME}_CREATE_SHARED_MODULE
+                CMAKE_${GPU_RUNTIME}_DEVICE_LINK_LIBRARY
+                CMAKE_${GPU_RUNTIME}_DEVICE_LINK_EXECUTABLE
+                CMAKE_${GPU_RUNTIME}_HOST_LINK_LAUNCHER
+                CMAKE_SHARED_LIBRARY_${GPU_RUNTIME}_FLAGS
+                CMAKE_SHARED_LIBRARY_CREATE_${GPU_RUNTIME}_FLAGS)
+            if(DEFINED ${_hip_var})
+                set(${_hip_var} "${${_hip_var}}" CACHE INTERNAL "" FORCE)
+            endif()
+        endforeach()
         if(GPU_RUNTIME STREQUAL "CUDA")
             include_directories("${ROCM_ROOT}/include")
         endif()
@@ -361,7 +436,14 @@ function(set_rocm_sources MODE DO_COPY SRC_FILES ROCM_SOURCE_FILES_VAR)
     if(CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia")
         set(_wrp_rocm_lang CUDA)
     else()
-        set(_wrp_rocm_lang ${GPU_RUNTIME})
+        set(_wrp_rocm_lang ${CLIO_ROCM_GPU_LANG})
+    endif()
+    if(NOT _wrp_rocm_lang)
+        message(FATAL_ERROR
+            "set_rocm_sources: no GPU language. wrp_core_enable_rocm(<LANG> "
+            "<STD>) must run before any add_rocm_* target is declared. "
+            "Failing here rather than in set_source_files_properties, which "
+            "reports only 'incorrect number of arguments'.")
     endif()
 
     foreach(SOURCE IN LISTS SRC_FILES)
@@ -440,8 +522,15 @@ function(_wrp_apply_rocm_flags TARGET)
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared)
     else()
-        target_link_libraries(${TARGET} PUBLIC -fgpu-rdc)
-        target_compile_options(${TARGET} PUBLIC -fgpu-rdc)
+        # -fgpu-rdc is a HIP-ONLY flag, and both of these lines used to hand
+        # it to every language and every dependent: PUBLIC propagation put it
+        # on g++'s command line for ordinary C++ TUs, which fails with
+        # "unrecognized command-line option '-fgpu-rdc'". Scope it to the HIP
+        # language, and keep the link flag PRIVATE so a plain-C++ consumer of
+        # this target does not inherit a device-link flag it cannot use.
+        target_compile_options(${TARGET} PUBLIC
+            $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+        target_link_options(${TARGET} PRIVATE -fgpu-rdc)
         set_target_properties(${TARGET} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
     endif()

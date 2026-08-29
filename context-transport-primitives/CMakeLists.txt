@@ -136,7 +136,8 @@ if(CLIO_CORE_ENABLE_CUDA)
 endif()
 
 if(CLIO_CORE_ENABLE_ROCM)
-    wrp_core_enable_rocm("HIP" 17)
+    # C++20 for the same reason as context-runtime: coroutines.
+    wrp_core_enable_rocm("HIP" 20)
 endif()
 
 if(CLIO_CORE_ENABLE_SYCL)

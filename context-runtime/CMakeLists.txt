@@ -11,7 +11,11 @@ endif()
 
 # Enable ROCm if requested
 if(CLIO_CORE_ENABLE_ROCM)
-    wrp_core_enable_rocm(HIP 17)
+    # C++20, not 17: the runtime's yield machinery IS std::coroutine_handle,
+    # so a C++17 HIP build fails in <coroutine> with "requires -fcoroutines"
+    # before it reaches any of our code. CUDA has always been enabled at 20
+    # here; the ROCm line was simply never updated with it.
+    wrp_core_enable_rocm(HIP 20)
 endif()
 
 # Enable SYCL if requested
