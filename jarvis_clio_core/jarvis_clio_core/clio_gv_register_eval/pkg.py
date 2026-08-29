@@ -19,6 +19,17 @@ parses every kernel's REG/STACK/SHARED, and exports:
 The full per-kernel table is written to <output_dir>/<wl>_<variant>.regs
 for the post: figure and for by-hand inspection. No GPU is touched --
 this is fatbin analysis, safe to run alongside anything.
+
+TWO BINARY SHAPES. Most variants are clio_<workload>_<variant>_bench and
+carry a CUDA fatbin cuobjdump can read. SYCL is neither: its executable is
+clio_<workload>_paged_bench_sycl, and its device code is a clang offload
+bundle, NOT a fatbin -- cuobjdump reports "does not contain device code"
+and exits 0, so it must not be used as the reader or the SYCL row silently
+comes back empty. For that variant the numbers come from `ptxas -v` on the
+device module, which is what the SYCL toolchain itself runs. Point
+sycl_ptxas_dir at a directory of ptxv_<workload>.txt logs; producing them
+needs the SYCL build tree, so it is a separate step rather than something
+this package shells out to.
 """
 from jarvis_cd.core.pkg import Application
 import os
@@ -46,6 +57,46 @@ def _demangle(names):
         return names
 
 
+def _sycl_name(sym):
+    """Readable name for a SYCL kernel symbol.
+
+    The entry point is the mangled type of a lambda, so the workload's own
+    name only survives as the enclosing Launch<Name> function. Itanium
+    mangling writes identifiers as <length><chars>, so the name ends after
+    exactly <length> characters -- matching [A-Za-z0-9_]* instead runs
+    straight through the following components and yields a 200-char blob.
+    """
+    for pat in (r'(\d+)(Launch[A-Z])', r'(\d+)([A-Z][A-Za-z0-9_]{3,})'):
+        m = re.search(pat, sym)
+        if m:
+            n = int(m.group(1))
+            start = m.start(2)
+            return sym[start:start + n]
+    return sym[:48]
+
+
+def _parse_ptxas(path):
+    """Rows of (kernel, regs, stack, shared, local) from a `ptxas -v` log."""
+    rows, sym = [], None
+    with open(path, errors='replace') as f:
+        for ln in f:
+            m = re.search(r"Compiling entry function '([^']+)'", ln)
+            if m:
+                sym = m.group(1)
+                continue
+            m = re.search(r'Used (\d+) registers', ln)
+            if m and sym:
+                stack = re.search(r'(\d+) bytes cumulative stack size', ln)
+                smem = re.search(r'(\d+) bytes smem', ln)
+                spill = re.search(r'(\d+) bytes spill stores', ln)
+                rows.append((_sycl_name(sym), int(m.group(1)),
+                             int(stack.group(1)) if stack else 0,
+                             int(smem.group(1)) if smem else 0,
+                             int(spill.group(1)) if spill else 0))
+                sym = None
+    return rows
+
+
 class ClioGvRegisterEval(Application):
     """Per-kernel register usage of one workload/variant binary."""
 
@@ -57,18 +108,27 @@ class ClioGvRegisterEval(Application):
             {'name': 'workload',
              'msg': 'lammps_md | gmx | lbann | grayscott | kmeans | weights',
              'type': str, 'default': 'kmeans'},
-            {'name': 'variant', 'msg': 'mpi | nccl | nvshmem | bam | paged',
+            {'name': 'variant',
+             'msg': 'mpi | nccl | nvshmem | bam | kokkos | paged | sycl',
              'type': str, 'default': 'mpi'},
             {'name': 'bin_dir',
              'msg': 'directory holding the benchmark binaries (empty = '
                     'resolve from PATH)', 'type': str, 'default': ''},
+            {'name': 'sycl_ptxas_dir',
+             'msg': 'directory of ptxv_<workload>.txt `ptxas -v` logs; only '
+                    'read when variant=sycl', 'type': str, 'default': ''},
             {'name': 'output_dir', 'msg': 'where the per-kernel tables go',
              'type': str, 'default': '/tmp/clio_gv_register_eval'},
         ]
 
     def _binary(self):
         c = self.config
-        name = 'clio_%s_%s_bench' % (c['workload'], c['variant'])
+        if c['variant'] == 'sycl':
+            # The SYCL edition is the paged driver relinked against the SYCL
+            # launch TU, so it keeps the paged name with a suffix.
+            name = 'clio_%s_paged_bench_sycl' % c['workload']
+        else:
+            name = 'clio_%s_%s_bench' % (c['workload'], c['variant'])
         if c['bin_dir']:
             return os.path.join(c['bin_dir'], name)
         return name
@@ -84,6 +144,8 @@ class ClioGvRegisterEval(Application):
     def start(self):
         c = self.config
         os.makedirs(c['output_dir'], exist_ok=True)
+        if c['variant'] == 'sycl':
+            return self._start_sycl()
         binary = self._binary()
         if c['bin_dir'] == '':
             from shutil import which
@@ -130,6 +192,29 @@ class ClioGvRegisterEval(Application):
         self.log('  %s: %d kernels -> %s'
                  % (os.path.basename(binary), len(best),
                     self._table_file()))
+
+    def _start_sycl(self):
+        c = self.config
+        log = os.path.join(c['sycl_ptxas_dir'] or '',
+                           'ptxv_%s.txt' % c['workload'])
+        if not c['sycl_ptxas_dir'] or not os.path.exists(log):
+            # Same contract as an unbuilt variant: an empty table becomes a
+            # hole in the figure rather than killing the sweep.
+            self.log('  no ptxas log at %s -- writing empty table' % log)
+            open(self._table_file(), 'w').close()
+            return
+        rows = _parse_ptxas(log)
+        best = {}
+        for name, reg, stack, shared, local in rows:
+            if name not in best or reg > best[name][0]:
+                best[name] = (reg, stack, shared, local)
+        with open(self._table_file(), 'w') as f:
+            f.write('# kernel\tregs\tstack\tshared\tlocal\n')
+            for name, (reg, stack, shared, local) in best.items():
+                f.write('%s\t%d\t%d\t%d\t%d\n'
+                        % (name, reg, stack, shared, local))
+        self.log('  %s: %d kernels -> %s'
+                 % (os.path.basename(log), len(best), self._table_file()))
 
     def stop(self):
         pass

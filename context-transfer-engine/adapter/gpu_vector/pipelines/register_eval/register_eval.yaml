@@ -7,6 +7,12 @@
 # nccl exists only for lammps_md; the other workloads' nccl cells report
 # completed=0 and appear as holes in the figure, not failures.
 #
+# SYCL is read from `ptxas -v` logs, not the binary: its device code is a
+# clang offload bundle rather than a CUDA fatbin, and cuobjdump reports
+# "does not contain device code" while still exiting 0. Generate the logs
+# from a SYCL build first (see register_eval/README.md); without
+# sycl_ptxas_dir the sycl cells are holes like any unbuilt variant.
+#
 # Run:   ../run.sh register_eval.yaml
 # Post:  jarvis ppl post yaml register_eval.yaml
 config:
@@ -16,11 +22,12 @@ config:
       pkg_name: reg
       workload: kmeans
       variant: mpi
+      sycl_ptxas_dir: /tmp/clio_gv/sycl_ptxas
       output_dir: /tmp/clio_gv/register_eval
 
 vars:
   reg.workload: [lammps_md, gmx, lbann, grayscott, kmeans, weights]
-  reg.variant: [mpi, nccl, nvshmem, bam, paged]
+  reg.variant: [mpi, nccl, nvshmem, bam, kokkos, paged, sycl]
 
 loop:
   - [reg.workload]
@@ -38,27 +45,34 @@ post: |
   df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
   df = df[df.completed == 1]
   workloads = ['lammps_md', 'gmx', 'lbann', 'grayscott', 'kmeans', 'weights']
-  variants = ['mpi', 'nccl', 'nvshmem', 'bam', 'paged']
-  fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-  width = 0.16
+  variants = ['mpi', 'nccl', 'nvshmem', 'bam', 'kokkos', 'paged', 'sycl']
+  fig, axes = plt.subplots(1, 2, figsize=(15, 4.8))
+  # Centre the group on the tick whatever the variant count is; a hardcoded
+  # offset silently skews every bar when a variant is added.
+  width = 0.8 / len(variants)
+  off = (len(variants) - 1) / 2.0
   x = np.arange(len(workloads))
-  for i, var in enumerate(variants):
-      ys = []
-      for wl in workloads:
-          row = df[(df['reg.workload'] == wl) & (df['reg.variant'] == var)]
-          ys.append(float(row['max_regs'].iloc[0]) if len(row) else 0.0)
-      axes[0].bar(x + (i - 2) * width, ys, width, label=var)
+  def series(col):
+      out = {}
+      for var in variants:
+          ys = []
+          for wl in workloads:
+              row = df[(df['reg.workload'] == wl) &
+                       (df['reg.variant'] == var)]
+              ys.append(float(row[col].iloc[0]) if len(row) else 0.0)
+          out[var] = ys
+      return out
+  for i, (var, ys) in enumerate(series('max_regs').items()):
+      axes[0].bar(x + (i - off) * width, ys, width, label=var)
   axes[0].set_xticks(x); axes[0].set_xticklabels(workloads, rotation=20)
   axes[0].set_ylabel('registers (heaviest kernel)')
   axes[0].set_title('register ceiling per substrate')
   axes[0].axhline(255, color='gray', ls='--', lw=0.8)
-  axes[0].legend(ncol=5, fontsize=8)
-  for i, var in enumerate(variants):
-      ys = []
-      for wl in workloads:
-          row = df[(df['reg.workload'] == wl) & (df['reg.variant'] == var)]
-          ys.append(float(row['mean_regs'].iloc[0]) if len(row) else 0.0)
-      axes[1].bar(x + (i - 2) * width, ys, width, label=var)
+  # 64 registers = 4 blocks/SM at 256 threads, the coroutine occupancy budget.
+  axes[0].axhline(64, color='gray', ls=':', lw=0.8)
+  axes[0].legend(ncol=4, fontsize=8)
+  for i, (var, ys) in enumerate(series('mean_regs').items()):
+      axes[1].bar(x + (i - off) * width, ys, width, label=var)
   axes[1].set_xticks(x); axes[1].set_xticklabels(workloads, rotation=20)
   axes[1].set_ylabel('registers (mean over kernels)')
   axes[1].set_title('mean register usage per substrate')
