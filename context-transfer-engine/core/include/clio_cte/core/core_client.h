@@ -1374,7 +1374,17 @@ class Client : public clio::run::ContainerClient {
   /** Await every deferred write registered under `key`. */
   static void DeferAwaitKey(clio::run::u64 key) {
     DeferRegistry &reg = DeferRegistry::Get();
-    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+    // Dirty data lives in TWO places, and an await has to cover both:
+    // submitted-but-unawaited puts (pending_count_) and bytes still
+    // coalescing in open sieve pages (sieve_pages_). Guarding on
+    // pending_count_ alone returned before the sieve drain below, so a file
+    // whose writes were all still in open pages -- the common case for a
+    // short write followed straight by fsync, since the flusher's cadence is
+    // 500 us -- was reported durable while nothing had been submitted at all.
+    // Both counters are lock-free emptiness signals, so the fast path for
+    // "genuinely nothing outstanding" costs the same two relaxed loads.
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0 &&
+        reg.sieve_pages_.load(std::memory_order_acquire) == 0) {
       return;
     }
     // Targeted sieve drain FIRST (issue #1007): this key's open pages must
@@ -2570,8 +2580,15 @@ class Client : public clio::run::ContainerClient {
   static void AwaitPendingPuts(const TagId &tag_id,
                                const std::string &blob_name) {
     DeferRegistry &reg = DeferRegistry::Get();
-    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
-      return;  // nothing deferred anywhere -> no key can be pending
+    // pending_count_ == 0 does NOT mean "nothing to wait for": bytes sitting
+    // in an open sieve page have not been submitted yet, so they are counted
+    // by sieve_pages_ and by nothing else. Returning here on pending_count_
+    // alone skipped DeferAwaitKey entirely, and with it the targeted sieve
+    // drain that turns those pages into awaitable tasks -- which is how
+    // fsync() came back before the file's data had been submitted.
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0 &&
+        reg.sieve_pages_.load(std::memory_order_acquire) == 0) {
+      return;  // nothing deferred and nothing coalescing -> genuinely idle
     }
     DeferAwaitKey(DeferKeyHash(tag_id, blob_name));
   }
