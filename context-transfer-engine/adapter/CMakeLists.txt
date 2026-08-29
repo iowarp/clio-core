@@ -65,13 +65,38 @@ endif()
 # say so: a SYCL device compiler is always clang (DPC++) or AdaptiveCpp, so
 # the toolchain question CLIO_GPU_CLANG answers for CUDA has only one
 # possible answer here.
+# HIP-AMD qualifies for the SAME REASON SYCL does, and the old condition could
+# never admit it: CLIO_GPU_CLANG is rejected unless CLIO_CORE_ENABLE_CUDA=ON
+# (see the FATAL_ERROR in the top-level CMakeLists), so a ROCm-only build could
+# not set the flag its own gate demanded -- gpu_vector was unreachable on ROCm
+# by construction, not by choice. The HIP-AMD device compiler is always clang
+# (hipcc wraps it; amdclang++ IS it), so the toolchain question CLIO_GPU_CLANG
+# exists to answer has only one possible answer here. HIP_PLATFORM=nvidia is
+# excluded because that route goes through nvcc, which is the case the flag
+# was invented for.
 if (((CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM) AND CLIO_GPU_CLANG)
-    OR CLIO_CORE_ENABLE_SYCL)
+    OR CLIO_CORE_ENABLE_SYCL
+    OR (CLIO_CORE_ENABLE_ROCM
+        AND NOT CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia"))
     add_subdirectory(gpu_vector)
 elseif (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     message(STATUS
             "gpu_vector: DISABLED -- needs CLIO_GPU_CLANG=ON (its device API "
             "is C++20 coroutines, which only clang compiles for the device)")
+endif()
+
+# HONEST STATUS for ROCm. The adapter's headers are reachable now, but every
+# workload under benchmark/ and test/ guards its targets on
+# CLIO_CORE_ENABLE_CUDA or CLIO_CORE_ENABLE_SYCL, so a ROCm build descends
+# here and produces NOTHING. Say so rather than let an empty descent read as
+# success -- porting a workload means giving it a rocm/ launch TU (or
+# compiling its cuda/ one as HIP, which is plausible since HIP supports
+# __global__ and <<<>>>), not flipping a flag.
+if (CLIO_CORE_ENABLE_ROCM AND NOT CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia")
+    message(STATUS
+            "gpu_vector: headers available on HIP-AMD, but NO workload has a "
+            "ROCm launch target yet (each guards on CUDA or SYCL) -- nothing "
+            "under benchmark/ or test/ will be built")
 endif()
 
 # kvhdf5 adapter (CUDA only; HDF5-like producer surface over the CTE KV store)
