@@ -848,6 +848,40 @@ class GpuApi {
     }
   }
 
+  /**
+   * Allocate, or return nullptr -- WITHOUT aborting.
+   *
+   * Malloc() treats a failed allocation as fatal, which is right for code that
+   * cannot continue without the memory. It is wrong for a probe that is ASKING
+   * whether an allocation fits: the gnn_train in-core baseline is optional and
+   * wants a graceful OOM, and before this existed it had to call cudaMalloc
+   * directly and say so in a comment -- which is exactly the kind of thing
+   * that pins a test to one vendor.
+   *
+   * Clears the sticky error on failure, so a later unrelated check does not
+   * inherit this one.
+   */
+  template <typename T>
+  static T *TryMalloc(size_t size) {
+    void *ptr = nullptr;
+#if CTP_ENABLE_ROCM
+    if (hipMalloc(&ptr, size) != hipSuccess) {
+      (void)hipGetLastError();
+      return nullptr;
+    }
+#elif CTP_ENABLE_CUDA
+    if (cudaMalloc(&ptr, size) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return nullptr;
+    }
+#elif CTP_ENABLE_SYCL
+    ptr = sycl::malloc_device(size, SyclQueue());
+#else
+    (void)size;
+#endif
+    return static_cast<T *>(ptr);
+  }
+
   template <typename T>
   static void Free(T *ptr) {
 #if CTP_ENABLE_ROCM

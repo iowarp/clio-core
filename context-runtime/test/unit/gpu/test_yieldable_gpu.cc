@@ -16,6 +16,8 @@
  *      kernels. That is exactly what a spinning kernel makes impossible.
  */
 
+#include "clio_ctp/util/gpu_api.h"
+#include <type_traits>
 #include <clio_runtime/gpu/yieldable.h>
 
 #include <cstdio>
@@ -89,18 +91,19 @@ TEST_CASE("Yieldable - blocks suspend, resume, and finish independently",
     init[b].block_seen_ = 0xFFFFFFFFu;
     init[b].pad_ = 0;
   }
-  REQUIRE(cudaMemcpy(y.DeviceState(), init.data(),
-                     kBlocks * sizeof(CountState),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
+  ctp::GpuApi::Memcpy(y.DeviceState(), init.data(), kBlocks * sizeof(CountState));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   unsigned long long *d_work = nullptr;
   unsigned long long *d_service = nullptr;
-  REQUIRE(cudaMalloc(&d_work, kBlocks * sizeof(unsigned long long)) ==
-          cudaSuccess);
-  REQUIRE(cudaMemset(d_work, 0, kBlocks * sizeof(unsigned long long)) ==
-          cudaSuccess);
-  REQUIRE(cudaMalloc(&d_service, sizeof(unsigned long long)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_service, 0, sizeof(unsigned long long)) == cudaSuccess);
+  d_work = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_work)>>(kBlocks * sizeof(unsigned long long));
+  REQUIRE(d_work != nullptr);
+  ctp::GpuApi::Memset(d_work, 0, kBlocks * sizeof(unsigned long long));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_service = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_service)>>(sizeof(unsigned long long));
+  REQUIRE(d_service != nullptr);
+  ctp::GpuApi::Memset(d_service, 0, sizeof(unsigned long long));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   // Observed pending counts, to prove blocks drop out as they finish.
   std::vector<u32> pending_trace;
@@ -117,21 +120,20 @@ TEST_CASE("Yieldable - blocks suspend, resume, and finish independently",
         // blocks every later launch in the context.
         ++service_calls;
         ServiceKernel<<<1, 32>>>(d_service);
-        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
       },
       /*max_rounds=*/64);
 
   std::vector<CountState> out(kBlocks);
-  REQUIRE(cudaMemcpy(out.data(), y.DeviceState(),
-                     kBlocks * sizeof(CountState),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(out.data(), y.DeviceState(), kBlocks * sizeof(CountState));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   std::vector<unsigned long long> work(kBlocks, 0);
-  REQUIRE(cudaMemcpy(work.data(), d_work,
-                     kBlocks * sizeof(unsigned long long),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(work.data(), d_work, kBlocks * sizeof(unsigned long long));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   unsigned long long service_ran = 0;
-  REQUIRE(cudaMemcpy(&service_ran, d_service, sizeof(service_ran),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(&service_ran, d_service, sizeof(service_ran));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::fprintf(stderr, "[yieldable] rounds=%u service_calls=%u service_ran=%llu\n",
                rounds, service_calls, service_ran);
@@ -175,8 +177,8 @@ TEST_CASE("Yieldable - blocks suspend, resume, and finish independently",
   REQUIRE(service_calls > 0);
   REQUIRE(service_ran == service_calls);
 
-  cudaFree(d_work);
-  cudaFree(d_service);
+  ctp::GpuApi::Free(d_work);
+  ctp::GpuApi::Free(d_service);
 }
 
 TEST_CASE("Yieldable - a kernel that never yields completes in one round",
@@ -190,15 +192,14 @@ TEST_CASE("Yieldable - a kernel that never yields completes in one round",
     init[b].block_seen_ = 0xFFFFFFFFu;
     init[b].pad_ = 0;
   }
-  REQUIRE(cudaMemcpy(y.DeviceState(), init.data(),
-                     kBlocks * sizeof(CountState),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
+  ctp::GpuApi::Memcpy(y.DeviceState(), init.data(), kBlocks * sizeof(CountState));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   unsigned long long *d_work = nullptr;
-  REQUIRE(cudaMalloc(&d_work, kBlocks * sizeof(unsigned long long)) ==
-          cudaSuccess);
-  REQUIRE(cudaMemset(d_work, 0, kBlocks * sizeof(unsigned long long)) ==
-          cudaSuccess);
+  d_work = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_work)>>(kBlocks * sizeof(unsigned long long));
+  REQUIRE(d_work != nullptr);
+  ctp::GpuApi::Memset(d_work, 0, kBlocks * sizeof(unsigned long long));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   u32 launches = 0;
   y.RunToCompletion(
@@ -211,7 +212,7 @@ TEST_CASE("Yieldable - a kernel that never yields completes in one round",
   // One launch, everything done: yielding costs nothing when unused.
   REQUIRE(launches == 1);
   REQUIRE(y.NumPending() == 0);
-  cudaFree(d_work);
+  ctp::GpuApi::Free(d_work);
 }
 
 SIMPLE_TEST_MAIN()

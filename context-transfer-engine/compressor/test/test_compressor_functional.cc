@@ -46,6 +46,7 @@
  * These tests require a fully initialized CTE environment with core pool.
  */
 
+#include "clio_ctp/util/gpu_api.h"
 #include "simple_test.h"
 #include <algorithm>
 #include <cstring>
@@ -519,7 +520,7 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
  */
 TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     INFO("No CUDA device available; skipping nvcomp functional test");
     return;
   }

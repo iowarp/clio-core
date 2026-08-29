@@ -891,7 +891,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   const clio::run::u64 total_elems = N * (clio::run::u64)F;
   const clio::run::u64 dataset_bytes = total_elems * sizeof(float);
 
-  size_t gfree = 0, gtot = 0; cudaMemGetInfo(&gfree, &gtot);
+  size_t gfree = 0, gtot = 0; ctp::GpuApi::MemInfo(&gfree, &gtot);
   // Device-wide free memory BEFORE this test allocates anything. The GPU is
   // exclusive to this job, so (g_gpu_free0 - free_now) is this process's total
   // device footprint -- not just the feature window, but weights, labels, page
@@ -900,7 +900,7 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   size_t g_peak_gpu = 0;
   auto track_peak = [&]() {
     size_t fnow = 0, tnow = 0;
-    if (cudaMemGetInfo(&fnow, &tnow) == cudaSuccess && g_gpu_free0 > fnow) {
+    if (ctp::GpuApi::MemInfo(&fnow, &tnow) && g_gpu_free0 > fnow) {
       size_t used = g_gpu_free0 - fnow;
       if (used > g_peak_gpu) g_peak_gpu = used;
     }
@@ -1044,11 +1044,11 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
       // A launch that fails leaves loss_buf untouched, and the test then
       // compares two runs of zeros and calls them BIT-EXACT. Check it.
       {
-        const cudaError_t le = cudaGetLastError();
-        if (le != cudaSuccess) {
+        const char *le = ctp::GpuApi::LastError();
+        if (le != nullptr) {
           std::fprintf(stderr, "[TRAIN] TrainNodeKernel launch FAILED: %s\n",
-                       cudaGetErrorString(le));
-          REQUIRE(le == cudaSuccess);
+                       le);
+          REQUIRE(le == nullptr);
         }
       }
       LossPartialKernel<<<kLossBlocks, 256>>>(loss_buf, nn, loss_part);
@@ -1129,20 +1129,20 @@ TEST_CASE("gpu_vector: GNN training over a compressed/streamed feature matrix "
   std::string base_status = (ingest_file != nullptr) ? "N/A(stream)" : "OOM";
   double base_time = -1.0;
   {
-    size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
-    float *d_all = nullptr; cudaError_t al = cudaErrorMemoryAllocation;
+    size_t fb = 0, tb = 0; ctp::GpuApi::MemInfo(&fb, &tb);
+    float *d_all = nullptr; bool al_ok = false;
     // In stream mode there is no host copy to upload from, so the in-core
     // baseline is not merely too big -- it is unavailable. Report it as such
     // rather than pretending it OOM'd on GPU memory.
     if (A0.empty()) {
-      al = cudaErrorMemoryAllocation;
+      al_ok = false;
     } else if (dataset_bytes + (size_t(384) << 20) < fb) {
-      // RAW cudaMalloc on purpose: this probe WANTS a graceful OOM (the
-      // in-core baseline is optional), and GpuApi::Malloc fails fatally.
-      al = cudaMalloc(&d_all, dataset_bytes);
+      // TryMalloc, not Malloc: this probe WANTS a graceful OOM (the in-core
+      // baseline is optional) and Malloc treats failure as fatal.
+      d_all = ctp::GpuApi::TryMalloc<float>(dataset_bytes);
+      al_ok = (d_all != nullptr);
     }
-    if (al != cudaSuccess) {
-      cudaGetLastError();
+    if (!al_ok) {
       if (ingest_file != nullptr) {
         std::fprintf(stderr,
                      "[TRAIN] IN-CORE: SKIPPED -- stream mode keeps no host "

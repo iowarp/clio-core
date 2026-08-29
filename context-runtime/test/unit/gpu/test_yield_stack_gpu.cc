@@ -18,6 +18,8 @@
  * counts around a yield would diverge __syncthreads and are not allowed.
  */
 
+#include "clio_ctp/util/gpu_api.h"
+#include <type_traits>
 #include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/gpu/yieldable.h>
 
@@ -212,20 +214,27 @@ TEST_CASE("YieldStack - per-lane locals survive a nested yield",
     h_iters[b] = b + 1;
   }
   u32 *d_iters = nullptr;
-  REQUIRE(cudaMalloc(&d_iters, kBlocks * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemcpy(d_iters, h_iters.data(), kBlocks * sizeof(u32),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
+  d_iters = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_iters)>>(kBlocks * sizeof(u32));
+  REQUIRE(d_iters != nullptr);
+  ctp::GpuApi::Memcpy(d_iters, h_iters.data(), kBlocks * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   u64 *d_acc = nullptr;
   u32 *d_tag = nullptr;
   u32 *d_entries = nullptr;
   const size_t nlane = static_cast<size_t>(kBlocks) * kThreads;
-  REQUIRE(cudaMalloc(&d_acc, nlane * sizeof(u64)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_acc, 0, nlane * sizeof(u64)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_tag, nlane * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_tag, 0, nlane * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_entries, kBlocks * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_entries, 0, kBlocks * sizeof(u32)) == cudaSuccess);
+  d_acc = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_acc)>>(nlane * sizeof(u64));
+  REQUIRE(d_acc != nullptr);
+  ctp::GpuApi::Memset(d_acc, 0, nlane * sizeof(u64));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_tag = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_tag)>>(nlane * sizeof(u32));
+  REQUIRE(d_tag != nullptr);
+  ctp::GpuApi::Memset(d_tag, 0, nlane * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_entries = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_entries)>>(kBlocks * sizeof(u32));
+  REQUIRE(d_entries != nullptr);
+  ctp::GpuApi::Memset(d_entries, 0, kBlocks * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::vector<u32> pending_trace;
   const u32 rounds = y.RunToCompletion(
@@ -235,17 +244,18 @@ TEST_CASE("YieldStack - per-lane locals survive a nested yield",
             view, stack.View(), d_iters, d_acc, d_tag, d_entries);
       },
       [&]() {}, /*max_rounds=*/64);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::vector<u64> acc(nlane, 0);
   std::vector<u32> tag(nlane, 0);
   std::vector<u32> entries(kBlocks, 0);
-  REQUIRE(cudaMemcpy(acc.data(), d_acc, nlane * sizeof(u64),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
-  REQUIRE(cudaMemcpy(tag.data(), d_tag, nlane * sizeof(u32),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
-  REQUIRE(cudaMemcpy(entries.data(), d_entries, kBlocks * sizeof(u32),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(acc.data(), d_acc, nlane * sizeof(u64));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  ctp::GpuApi::Memcpy(tag.data(), d_tag, nlane * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  ctp::GpuApi::Memcpy(entries.data(), d_entries, kBlocks * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::fprintf(stderr, "[yield-stack] rounds=%u pending:", rounds);
   for (u32 p : pending_trace) std::fprintf(stderr, " %u", p);
@@ -291,13 +301,18 @@ TEST_CASE("YieldStack - YIELD_IF suspends the block if ANY lane must wait",
   u32 *d_need = nullptr;
   u32 *d_out = nullptr;
   u32 *d_entries = nullptr;
-  REQUIRE(cudaMalloc(&d_need, n * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemcpy(d_need, h_need.data(), n * sizeof(u32),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_out, n * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_out, 0, n * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_entries, kB * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_entries, 0, kB * sizeof(u32)) == cudaSuccess);
+  d_need = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_need)>>(n * sizeof(u32));
+  REQUIRE(d_need != nullptr);
+  ctp::GpuApi::Memcpy(d_need, h_need.data(), n * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_out = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_out)>>(n * sizeof(u32));
+  REQUIRE(d_out != nullptr);
+  ctp::GpuApi::Memset(d_out, 0, n * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_entries = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_entries)>>(kB * sizeof(u32));
+  REQUIRE(d_entries != nullptr);
+  ctp::GpuApi::Memset(d_entries, 0, kB * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::vector<u32> pending_trace;
   u32 services = 0;
@@ -313,17 +328,19 @@ TEST_CASE("YieldStack - YIELD_IF suspends the block if ANY lane must wait",
         ++services;
         ServiceFaultsKernel<<<(n + 127) / 128, 128>>>(d_need,
                                                       static_cast<u32>(n));
-        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
       },
       /*max_rounds=*/32);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::vector<u32> out(n, 0);
   std::vector<u32> entries(kB, 0);
-  REQUIRE(cudaMemcpy(out.data(), d_out, n * sizeof(u32),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
-  REQUIRE(cudaMemcpy(entries.data(), d_entries, kB * sizeof(u32),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(out.data(), d_out, n * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  ctp::GpuApi::Memcpy(entries.data(), d_entries, kB * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   std::fprintf(stderr, "[yield-if] services=%u entries=%u %u %u %u pending:",
                services, entries[0], entries[1], entries[2], entries[3]);
@@ -355,9 +372,9 @@ TEST_CASE("YieldStack - YIELD_IF suspends the block if ANY lane must wait",
     }
   }
 
-  cudaFree(d_need);
-  cudaFree(d_out);
-  cudaFree(d_entries);
+  ctp::GpuApi::Free(d_need);
+  ctp::GpuApi::Free(d_out);
+  ctp::GpuApi::Free(d_entries);
 }
 
 TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
@@ -367,8 +384,10 @@ TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
   gy::YieldStack stack(1, 32, kLaneBytes);
 
   u32 *d_c = nullptr;
-  REQUIRE(cudaMalloc(&d_c, 8 * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_c, 0, 8 * sizeof(u32)) == cudaSuccess);
+  d_c = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_c)>>(8 * sizeof(u32));
+  REQUIRE(d_c != nullptr);
+  ctp::GpuApi::Memset(d_c, 0, 8 * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   y.RunToCompletion(
       [&](dim3 grid, dim3 block, gy::YieldableView<> view) {
@@ -376,11 +395,12 @@ TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
                                                             kIters, d_c);
       },
       [&]() {}, /*max_rounds=*/32);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   u32 c[8] = {0};
-  REQUIRE(cudaMemcpy(c, d_c, 8 * sizeof(u32), cudaMemcpyDeviceToHost) ==
-          cudaSuccess);
+  ctp::GpuApi::Memcpy(c, d_c, 8 * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   std::fprintf(stderr,
                "[resume] callee_prologue=%u loop_before=%u loop_after=%u "
                "ycall_arg=%u kernel_prologue=%u switch_head=%u after_call=%u\n",
@@ -402,7 +422,7 @@ TEST_CASE("YieldStack - resume lands AT the yield, it does not re-run work",
   REQUIRE(c[4] == kEntries);  // everything before CLIO_YBEGIN
   REQUIRE(c[3] == kEntries);  // CLIO_YCALL argument expressions
 
-  cudaFree(d_c);
+  ctp::GpuApi::Free(d_c);
 }
 
 TEST_CASE("YieldStack - subfunction yields inside a caller's loop",
@@ -413,10 +433,14 @@ TEST_CASE("YieldStack - subfunction yields inside a caller's loop",
 
   u32 *d_log = nullptr;
   u32 *d_n = nullptr;
-  REQUIRE(cudaMalloc(&d_log, 64 * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_log, 0, 64 * sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMalloc(&d_n, sizeof(u32)) == cudaSuccess);
-  REQUIRE(cudaMemset(d_n, 0, sizeof(u32)) == cudaSuccess);
+  d_log = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_log)>>(64 * sizeof(u32));
+  REQUIRE(d_log != nullptr);
+  ctp::GpuApi::Memset(d_log, 0, 64 * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
+  d_n = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_n)>>(sizeof(u32));
+  REQUIRE(d_n != nullptr);
+  ctp::GpuApi::Memset(d_n, 0, sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   u32 entries = 0;
   y.RunToCompletion(
@@ -426,14 +450,15 @@ TEST_CASE("YieldStack - subfunction yields inside a caller's loop",
             view, stack.View(), kPages, d_log, d_n);
       },
       [&]() {}, /*max_rounds=*/32);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  ctp::GpuApi::Synchronize();
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   u32 n = 0;
-  REQUIRE(cudaMemcpy(&n, d_n, sizeof(u32), cudaMemcpyDeviceToHost) ==
-          cudaSuccess);
+  ctp::GpuApi::Memcpy(&n, d_n, sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   std::vector<u32> log(n);
-  REQUIRE(cudaMemcpy(log.data(), d_log, n * sizeof(u32),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  ctp::GpuApi::Memcpy(log.data(), d_log, n * sizeof(u32));
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
   const char *name[] = {"?", "inner-begin", "inner-end", "after-call",
                         "outer-done", "ENTRY"};
@@ -460,8 +485,8 @@ TEST_CASE("YieldStack - subfunction yields inside a caller's loop",
     REQUIRE(log[i] == want[i]);
   }
 
-  cudaFree(d_log);
-  cudaFree(d_n);
+  ctp::GpuApi::Free(d_log);
+  ctp::GpuApi::Free(d_n);
 }
 
 SIMPLE_TEST_MAIN()

@@ -42,6 +42,7 @@
 
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
 
+#include <type_traits>
 #include "simple_test.h"
 
 #include <clio_runtime/clio_runtime.h>
@@ -323,7 +324,7 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   const clio::run::u64 dataset_bytes = total_elems * sizeof(float);
 
   size_t gpu_free = 0, gpu_total = 0;
-  cudaMemGetInfo(&gpu_free, &gpu_total);
+  ctp::GpuApi::MemInfo(&gpu_free, &gpu_total);
   std::fprintf(stderr,
       "\n============== GNN CAPACITY COMPARISON ==============\n"
       "[GCAP] features=%lluMiB (%llu nodes x %d-d, %s tiled)  GPU=%zuMiB "
@@ -374,15 +375,13 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   std::vector<double> pool_trad(F, 0.0);
   bool trad_ran = false;
   {
-    size_t free_b = 0, total_b = 0; cudaMemGetInfo(&free_b, &total_b);
+    size_t free_b = 0, total_b = 0; ctp::GpuApi::MemInfo(&free_b, &total_b);
     float *d_all = nullptr;
-    cudaError_t alloc = cudaErrorMemoryAllocation;
     if (dataset_bytes + (size_t(384) << 20) < free_b)
-      // RAW cudaMalloc on purpose: this probe WANTS a graceful OOM (the
-      // in-core comparison is optional), and GpuApi::Malloc fails fatally.
-      alloc = cudaMalloc(&d_all, dataset_bytes);
-    if (alloc != cudaSuccess) {
-      cudaGetLastError();
+      // TryMalloc, not Malloc: this probe WANTS a graceful OOM (the in-core
+      // comparison is optional) and Malloc treats failure as fatal.
+      d_all = ctp::GpuApi::TryMalloc<float>(dataset_bytes);
+    if (d_all == nullptr) {
       std::fprintf(stderr,
           "[GCAP] TRADITIONAL: *** OOM *** cannot place %lluMiB feature matrix in "
           "%zuMiB free HBM -> in-core GNN CANNOT run this graph.\n",
@@ -429,7 +428,7 @@ TEST_CASE("gpu_vector: GNN capacity comparison (traditional in-core vs Eternia "
   auto r0 = dram_bdev.AsyncGetStats(); r0.Wait();
   clio::run::u64 hbm_rem0 = h0->remaining_size_, dram_rem0 = r0->remaining_size_;
 
-  auto free_mib = []{ size_t f=0,t=0; cudaMemGetInfo(&f,&t); return (long long)(f>>20); };
+  auto free_mib = []{ size_t f=0,t=0; ctp::GpuApi::MemInfo(&f,&t); return (long long)(f>>20); };
   const long long mem_base = free_mib();
 
   // Store one page at a time from a HOST buffer -- zstd is a CPU codec, so it
