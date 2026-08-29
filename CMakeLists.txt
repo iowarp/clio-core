@@ -440,6 +440,52 @@ if(CLIO_CORE_ENABLE_ROCM)
     endif()
     if(NOT CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia")
         find_package(HIP REQUIRED)
+        # THESE MUST BE TOP-LEVEL, not inside wrp_core_enable_rocm().
+        #
+        # macros.h includes <hip/hip_runtime_api.h> for every TU with
+        # CTP_ENABLE_ROCM set, and that header guards its whole body on
+        # __HIP_PLATFORM_AMD__. amdclang++ defines it implicitly for -x hip;
+        # the plain C++ compiler does not. Setting it inside the macro looked
+        # right and was not: add_compile_definitions/include_directories are
+        # DIRECTORY-scoped, and the macro is called from context-runtime/ and
+        # context-transport-primitives/ -- so context-transfer-engine and
+        # everything else got neither, and failed with ~470 errors of the form
+        # "hipGetLastError was not declared in this scope" the moment the
+        # build got far enough to reach them.
+        if(NOT DEFINED ROCM_ROOT)
+            if(DEFINED ROCM_PATH)
+                set(ROCM_ROOT "${ROCM_PATH}" CACHE PATH "ROCm root")
+            elseif(DEFINED ENV{ROCM_PATH})
+                set(ROCM_ROOT "$ENV{ROCM_PATH}" CACHE PATH "ROCm root")
+            else()
+                set(ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm root")
+            endif()
+        endif()
+        if(EXISTS "${ROCM_ROOT}/include")
+            include_directories(SYSTEM "${ROCM_ROOT}/include")
+        endif()
+        # The HIP toolchain emits a bare `-lamdhip64` for HIP-linked targets.
+        # That resolves for an install at the default prefix and not for one
+        # anywhere else, failing with "unable to find library -lamdhip64", so
+        # give the linker the search path explicitly. RPATH too, otherwise the
+        # binaries link and then cannot start.
+        if(EXISTS "${ROCM_ROOT}/lib")
+            link_directories("${ROCM_ROOT}/lib")
+            list(APPEND CMAKE_BUILD_RPATH "${ROCM_ROOT}/lib")
+            list(APPEND CMAKE_INSTALL_RPATH "${ROCM_ROOT}/lib")
+        endif()
+        add_compile_definitions(__HIP_PLATFORM_AMD__=1)
+        # ...and link the HIP runtime everywhere, for exactly the reason the
+        # SYCL block below says of libsycl: gpu_api.h's inline helpers call
+        # hipPointerGetAttributes, hipMemcpy and friends, so ANY target that
+        # merely includes it needs the library -- not just the ones compiled
+        # as HIP. Without this the build fails late, at link, with
+        # "undefined reference to hipPointerGetAttributes ... DSO missing from
+        # command line" on whichever unrelated benchmark happened to include
+        # gpu_api.h.
+        if(TARGET hip::host)
+            link_libraries(hip::host)
+        endif()
     endif()
     message(STATUS "found ROCm/HIP support (HIP_PLATFORM=${CLIO_ROCM_HIP_PLATFORM})")
 endif()

@@ -530,7 +530,12 @@ function(_wrp_apply_rocm_flags TARGET)
         # this target does not inherit a device-link flag it cannot use.
         target_compile_options(${TARGET} PUBLIC
             $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
-        target_link_options(${TARGET} PRIVATE -fgpu-rdc)
+        # -fgpu-rdc splits device code out of the object, so the final link
+        # must run the HIP DEVICE LINK to gather it back. Without --hip-link
+        # the host link succeeds at finding libamdhip64 and then fails on
+        # "undefined symbol: __hip_fatbin_<hash>" / "__hip_gpubin_handle_
+        # <hash>" -- the fatbin the device link would have produced.
+        target_link_options(${TARGET} PRIVATE -fgpu-rdc --hip-link)
         set_target_properties(${TARGET} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
     endif()

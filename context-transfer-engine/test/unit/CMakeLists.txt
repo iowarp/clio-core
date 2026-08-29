@@ -1564,11 +1564,26 @@ if(CLIO_CORE_ENABLE_ROCM)
   )
   target_compile_options(test_cte_devmem_putget PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    # HIP_STANDARD 20 on the target does NOT reach the command line here (the
+    # source gets its language from set_source_files_properties, and no -std
+    # was emitted at all -- verified in compile_commands.json). Say it
+    # outright: without C++20 this TU pulls in task.h -> <coroutine> and dies
+    # with "the <coroutine> header requires -fcoroutines".
+    "$<$<COMPILE_LANGUAGE:HIP>:-std=c++20>"
   )
+  # CUDA_STANDARD 17 here was a copy-paste from the CUDA branch above and was
+  # wrong twice over: it names the CUDA language on a HIP target, and 17 is
+  # too old for a runtime whose task/ipc headers are C++20 coroutines -- this
+  # target failed with "<coroutine> requires -fcoroutines" while the rest of
+  # the ROCm build was clean. HIP_STANDARD is the property that actually
+  # applies under HIP_PLATFORM=amd; the CUDA_* ones are kept (at 20) because
+  # HIP_PLATFORM=nvidia really does route this through the CUDA language.
   set_target_properties(test_cte_devmem_putget PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-    CUDA_STANDARD 17
+    CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   target_include_directories(test_cte_devmem_putget PUBLIC
