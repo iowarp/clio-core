@@ -49,6 +49,7 @@
 #include "clio_ctp/util/gpu_api.h"
 #include "simple_test.h"
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <vector>
 #include <random>
@@ -83,6 +84,28 @@ namespace CompLib {
   constexpr int ZLIB = 9;
   constexpr int ZSTD = 10;
   constexpr int NVCOMP_LZ4 = 11;  // GPU compressor (requires nvcomp build)
+}
+
+/**
+ * Is a codec actually COMPILED INTO this build?
+ *
+ * The registry's `make` returns nullptr when a backend was not built, which is
+ * how CompressorFactory already reports "unavailable" everywhere else. These
+ * tests used to hardcode CompLib::LZ4 and REQUIRE a zero return code, so on a
+ * machine with liblz4 installed but liblz4-DEV missing (the runtime .so is
+ * there, the header is not, so CMake sets CLIO_CTP_ENABLE_LZ4=OFF) three test
+ * cases failed. They were reporting the absence of an OPTIONAL dependency as a
+ * product defect.
+ *
+ * Skipping is the honest behaviour: an optional codec that was not built is
+ * not a failing codec. The GPU cases in this file already do exactly this for
+ * a missing CUDA device.
+ */
+bool CodecBuiltIn(const std::string &name) {
+  // GetPreset is the factory's PUBLIC availability check: it returns nullptr
+  // when the backend was not compiled in (FindByBaseId is private).
+  return ctp::CompressionFactory::GetPreset(
+             name, ctp::CompressionPreset::BALANCED) != nullptr;
 }
 
 /**
@@ -242,6 +265,10 @@ TEST_CASE("Basic Compress and Store", "[compressor][functional][basic]") {
   ctp::ipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
 
   Context context;
+  if (!CodecBuiltIn("lz4")) {
+    INFO("lz4 not built into this CTP (liblz4-dev missing); skipping");
+    return;
+  }
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
@@ -282,6 +309,10 @@ TEST_CASE("Decompress and Retrieve", "[compressor][functional][basic]") {
   ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
 
   Context context;
+  if (!CodecBuiltIn("lz4")) {
+    INFO("lz4 not built into this CTP (liblz4-dev missing); skipping");
+    return;
+  }
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
@@ -384,6 +415,16 @@ TEST_CASE("Multiple Compression Libraries", "[compressor][functional][libraries]
 
   for (const auto& [lib_id, lib_name] : libraries) {
     SECTION(lib_name) {
+      // Same reasoning as the single-codec cases: a codec that was not built
+      // is not a codec that fails. Without this, "Multiple Compression
+      // Libraries" reported a red for LZ4 on any machine lacking liblz4-dev.
+      std::string lib_lower = lib_name;
+      std::transform(lib_lower.begin(), lib_lower.end(), lib_lower.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (!CodecBuiltIn(lib_lower)) {
+        INFO(lib_name + " not built into this CTP; skipping");
+        continue;
+      }
       auto shm_buffer = fixture.AllocateAndCopyData(test_data);
       REQUIRE(!shm_buffer.IsNull());
 

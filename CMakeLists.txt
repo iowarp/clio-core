@@ -1612,9 +1612,14 @@ if(CLIO_CORE_ENABLE_TESTS)
         # 10620 is the HDF5 VOL I/O suite. Any test moved off the default port
         # has to be listed here too, or it silently loses the stray-listener
         # sweep that moving off the default was meant to make unnecessary.
-        # Still missing: 10500/10613/10615/10617 and the 10596-10599 range,
-        # whose suites moved off 9413 without being added here.
-        "_clio_ports='5555 5558 9413 9414 9416 10620'; \
+        #
+        # The ports this comment used to list as "still missing" are now here.
+        # That gap was not cosmetic: 10500 is the GPU stress suite's port
+        # (CLIO_PORT=10500 in its ctest ENVIRONMENT), so a runtime that
+        # outlived its test kept the port and every later test that needed it
+        # failed to bind. In a full run that presents as a CASCADE of dozens of
+        # unrelated red tests, each of which passes when run on its own.
+        "_clio_ports='5555 5558 9413 9414 9416 10500 10596 10597 10598 10599 10613 10615 10617 10620'; \
          if command -v fuser >/dev/null 2>&1; then \
            for _p in \$_clio_ports; do fuser -k \$_p/tcp >/dev/null 2>&1; done; \
          elif command -v ss >/dev/null 2>&1; then \
@@ -1629,8 +1634,30 @@ if(CLIO_CORE_ENABLE_TESTS)
            echo 'clio cleanup: no fuser/ss/lsof; cannot free runtime ports -- back-to-back embedded-runtime tests may fail to bind' >&2; \
          fi")
 
+    # A port sweep only finds processes that still HOLD a port. A leaked daemon
+    # keeps its SHM segments and poisons later tests just as effectively, so
+    # also reap it by name.
+    #
+    # EXACT match, never a prefix. Every test executable here is named
+    # clio_run_<something> and `comm` is truncated to 15 chars, so a
+    # /^clio_run/ pattern also matches clio_run_shutdown_battletest (as
+    # "clio_run_shutdo") and kills the test that is currently running -- that
+    # mistake turned 7 green shutdown battletests red. `pkill -f clio_run` is
+    # worse still: it matches the cleanup shell itself.
+    # NOTE ON THE DOLLARS: CMake passes $ through this string LITERALLY, so
+    # what is written here is what bash receives. awk's field refs must
+    # therefore be $1/$2 (writing $$2 emits $$2, which awk reads as $($2)),
+    # the shell variable must be $_pid (writing $$_pid emits bash's PID glued
+    # to "_pid"), and bash's own PID must be $$. Both mistakes were made here
+    # first and neither is visible in the CMake source -- they were found by
+    # reading the GENERATED command with `ctest -N -V`.
+    set(_clio_proc_kill
+        "ps -eo pid,comm 2>/dev/null \
+           | awk -v self=$$ '($2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
+           | while read -r _pid; do kill -9 \"$_pid\" 2>/dev/null; done; \
+         true")
     set(_clio_cleanup_cmd
-        "${_clio_port_kill}; \
+        "${_clio_port_kill}; ${_clio_proc_kill}; \
          rm -f /tmp/clio_*.ipc 2>/dev/null; \
          rm -f /tmp/clio_server_timing.log 2>/dev/null; \
          rm -rf /tmp/clio_memfd 2>/dev/null; \
