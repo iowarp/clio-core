@@ -122,6 +122,15 @@ MANIFEST
 # CTest temporary output
 Testing/Temporary/
 
+# In-source CMake/CTest configures. Running `cmake` from inside a source
+# directory (rather than a build dir) scatters these through the tree; they
+# were committed twice before under adapter/gpu_vector/.
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Testing/
+
 # Test files
 tests/main.cpp
 
