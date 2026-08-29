@@ -1,0 +1,13 @@
+method,size_gib,ran,peak_gpu_mib,throughput_mibps,time_per_iter_s,inertia,iters
+eternia,128,ran,2942,809.3,161.952,394473379.3,1
+traditional_incore,128,OOM,-1,0.0,-1.000,0.0,1
+uvm,128,OVERSUB_IMPRACTICAL,-1,0.0,-1.000,0.0,1
+staged,128,ran,3006,1881.4,69.667,394473379.3,1
+eternia,256,ran,2942,837.4,313.057,788943048.3,1
+traditional_incore,256,OOM,-1,0.0,-1.000,0.0,1
+uvm,256,OVERSUB_IMPRACTICAL,-1,0.0,-1.000,0.0,1
+staged,256,ran,3006,1883.8,139.156,788943048.3,1
+eternia,320,ran,2944,302.6,1082.729,986180952.6,1
+traditional_incore,320,OOM,-1,0.0,-1.000,0.0,1
+uvm,320,OVERSUB_IMPRACTICAL,-1,0.0,-1.000,0.0,1
+staged,320,OOM_HOSTRAM,-1,0.0,-1.000,0.0,1

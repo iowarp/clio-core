@@ -1,0 +1,4 @@
+dataset_mib,page_kib,window_pages,window_mib,mode,iters,hbm_cap_mib,dram_cap_mib,traditional_status,traditional_runtime_s,traditional_peak_gpu_mib,eternia_store_s,eternia_km_runtime_s,eternia_stored_mib,eternia_ratio,hbm_used_mib,dram_used_mib,nvme_used_mib,pfs_used_mib,eternia_peak_gpu_mib
+131072,1024,64,128,eternia,1,2048,30720,OOM,-1.00,-1,776.97,161.95,38948,3.37,2047,30719,6181,0,2942
+262144,1024,64,128,eternia,1,2048,30720,OOM,-1.00,-1,1579.84,313.06,78084,3.36,2047,30719,45316,0,2942
+327680,1024,64,128,eternia,1,2048,30720,OOM,-1.00,-1,1953.61,1082.73,97651,3.36,2047,30719,51199,13684,2944

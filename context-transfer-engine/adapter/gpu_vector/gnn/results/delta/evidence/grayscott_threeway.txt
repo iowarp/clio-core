@@ -1,0 +1,50 @@
+=== Gray-Scott three-way checkpoint I/O (raw disk vs CLIO sync vs async) ===
+>>> arm: raw
+[raw] total=1094.1 ms  writer-busy=959.1 ms (overlapped with compute)  nbuf=3
+GSBENCH_RESULT arm=raw_threaded N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1094.09 MBps=1713.7 io_buf_mb=468.8 checksum=10089923039461909779
+    (exit 0)
+>>> arm: hdf5_inline
+[hdf5] tuned: vfd=sec2 rdcc=0MB early_alloc=1 direct_chunk=0 precreate=1 metablk=2048KB fsync=1 chunk=1600x6400
+[hdf5] total=1590.2 ms  write=1219.7 ms  (inline, GPU idle)
+GSBENCH_RESULT arm=hdf5_inline N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1590.22 MBps=1179.1 io_buf_mb=156.2 checksum=10089923039461909779
+    (exit 0)
+>>> arm: hdf5_threaded
+[hdf5] tuned: vfd=sec2 rdcc=0MB early_alloc=1 direct_chunk=0 precreate=1 metablk=2048KB fsync=1 chunk=1600x6400
+[hdf5] total=1372.7 ms  writer-busy=1235.5 ms (overlapped with compute)  nbuf=3
+GSBENCH_RESULT arm=hdf5_threaded N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1372.67 MBps=1365.9 io_buf_mb=468.8 checksum=10089923039461909779
+    (exit 0)
+>>> arm: hostclio
+[bench] bringing up server (bdev=file cap=3072MB)
+[bench] server ready
+GSBENCH_RESULT arm=hostclio N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=2233.45 MBps=839.5 io_buf_mb=156.2 checksum=10089923039461909779
+    (exit 0)
+>>> arm: gpuh5_sync
+[bench] bringing up server (bdev=file cap=3072MB)
+[bench] server ready
+GSBENCH_RESULT arm=gpuh5_sync_relaunch N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1929.52 MBps=971.7 io_buf_mb=156.2 checksum=10089923039461909779
+    (exit 0)
+>>> arm: gpuh5_noreuse
+[bench] bringing up server (bdev=file cap=3072MB)
+[bench] server ready
+GSBENCH_RESULT arm=gpuh5_noreuse N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1707.29 MBps=1098.2 io_buf_mb=1875.0 checksum=10089923039461909779
+    (exit 0)
+>>> arm: gpuh5
+[bench] bringing up server (bdev=file cap=3072MB)
+[bench] server ready
+GSBENCH_RESULT arm=gpuh5_relaunch N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1725.85 MBps=1086.4 io_buf_mb=312.5 checksum=10089923039461909779
+    (exit 0)
+>>> arm: persistent
+[bench] bringing up server (bdev=file cap=3072MB)
+[bench] server ready
+GSBENCH_RESULT arm=gpuh5 N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=1 durable=1 MB=1875.0 ms=861.14 MBps=2177.3 io_buf_mb=312.5 checksum=10089923039461909779
+    (exit 0)
+
+================ BENCHMARK RESULT ================
+GSBENCH_RESULT arm=gpuh5_relaunch N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1725.85 MBps=1086.4 io_buf_mb=312.5 checksum=10089923039461909779
+GSBENCH_RESULT arm=gpuh5_noreuse N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1707.29 MBps=1098.2 io_buf_mb=1875.0 checksum=10089923039461909779
+GSBENCH_RESULT arm=gpuh5_sync_relaunch N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1929.52 MBps=971.7 io_buf_mb=156.2 checksum=10089923039461909779
+GSBENCH_RESULT arm=hdf5_inline N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1590.22 MBps=1179.1 io_buf_mb=156.2 checksum=10089923039461909779
+GSBENCH_RESULT arm=hdf5_threaded N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1372.67 MBps=1365.9 io_buf_mb=468.8 checksum=10089923039461909779
+GSBENCH_RESULT arm=hostclio N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=2233.45 MBps=839.5 io_buf_mb=156.2 checksum=10089923039461909779
+GSBENCH_RESULT arm=gpuh5 N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=1 durable=1 MB=1875.0 ms=861.14 MBps=2177.3 io_buf_mb=312.5 checksum=10089923039461909779
+GSBENCH_RESULT arm=raw_threaded N=6400 chunks=4 blocks=1 snaps=12 steps=576 bdev=file pinned=0 durable=1 MB=1875.0 ms=1094.09 MBps=1713.7 io_buf_mb=468.8 checksum=10089923039461909779
