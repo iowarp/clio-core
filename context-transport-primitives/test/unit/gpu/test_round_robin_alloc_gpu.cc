@@ -192,7 +192,7 @@ void RunConcurrentChildren(int num_partitions, int num_children,
   RrChildKernel<<<num_children, 32>>>(
       reinterpret_cast<RoundRobinAllocator *>(d_alloc), alloc_size,
       h_results);
-  REQUIRE(cudaGetLastError() == cudaSuccess);
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   ctp::GpuApi::Synchronize();
 
   int pass_count = 0;

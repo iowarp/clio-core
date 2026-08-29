@@ -43,6 +43,7 @@
  * 5. CPU verifies the transferred data
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/lightbeam/shm_transport.h"
@@ -180,7 +181,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
 
     // Step 4: Allocate GPU source buffer (pinned so both GPU and CPU can access)
     char *gpu_buffer;
-    cudaMallocHost(&gpu_buffer, kDataSize);
+    gpu_buffer = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(gpu_buffer)>>(kDataSize);
     REQUIRE(gpu_buffer != nullptr);
 
     // Step 5: Fill the buffer with pattern (value = 1) using GPU kernel
@@ -188,8 +189,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     int blockSize = 256;
     int numBlocks = (kDataSize + blockSize - 1) / blockSize;
     FillBufferKernel<<<numBlocks, blockSize>>>(gpu_buffer, kDataSize, kPattern);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 6: GPU sends data via ShmTransport::Send (SPSC ring buffer)
     GpuSendSimpleKernel<<<1, 1>>>(alloc_ptr, gpu_buffer, kDataSize, copy_space,
@@ -203,8 +204,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     ShmTransport::Recv(recv_meta, ctx);
 
     // Wait for GPU kernel to complete
-    err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 8: Verify all data was transferred
     REQUIRE(recv_meta.recv.size() == 1);
@@ -222,7 +223,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
 
     // Cleanup
     std::free(recv_meta.recv[0].data.ptr_);
-    cudaFreeHost(gpu_buffer);
+    ctp::GpuApi::FreeHost(gpu_buffer);
   }
 
   SECTION("ChunkedTransferWithPattern") {
@@ -249,7 +250,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
 
     // Allocate and initialize GPU buffer with pattern
     char *gpu_buffer;
-    cudaMallocHost(&gpu_buffer, kDataSize);
+    gpu_buffer = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(gpu_buffer)>>(kDataSize);
     REQUIRE(gpu_buffer != nullptr);
 
     // Initialize with pattern on CPU (index % 256)
@@ -268,8 +269,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     ctx.shm_info_ = shm_info;
     ShmTransport::Recv(recv_meta, ctx);
 
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Verify data integrity
     REQUIRE(recv_meta.recv.size() == 1);
@@ -285,7 +286,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     REQUIRE(pattern_correct);
 
     std::free(recv_meta.recv[0].data.ptr_);
-    cudaFreeHost(gpu_buffer);
+    ctp::GpuApi::FreeHost(gpu_buffer);
   }
 
   SECTION("DirectGpuMemoryAccess") {
@@ -314,8 +315,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     SetValueKernel<<<1, 1>>>(buffer, 500, 'C');
     SetValueKernel<<<1, 1>>>(buffer, 1023, 'D');
 
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // CPU reads and verifies
     REQUIRE(buffer[0] == 'A');
@@ -355,7 +356,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
 
     // Allocate GPU buffer
     char *gpu_buffer;
-    cudaMallocHost(&gpu_buffer, kLargeDataSize);
+    gpu_buffer = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(gpu_buffer)>>(kLargeDataSize);
     REQUIRE(gpu_buffer != nullptr);
 
     // Fill with pattern
@@ -364,8 +365,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     int numBlocks = (kLargeDataSize + blockSize - 1) / blockSize;
     FillBufferKernel<<<numBlocks, blockSize>>>(gpu_buffer, kLargeDataSize,
                                                kPattern);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // GPU sends via SPSC ring buffer
     GpuSendSimpleKernel<<<1, 1>>>(alloc_ptr, gpu_buffer, kLargeDataSize,
@@ -378,8 +379,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     ctx.shm_info_ = shm_info;
     ShmTransport::Recv(recv_meta, ctx);
 
-    err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Verify
     REQUIRE(recv_meta.recv.size() == 1);
@@ -396,7 +397,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     REQUIRE(pattern_correct);
 
     std::free(recv_meta.recv[0].data.ptr_);
-    cudaFreeHost(gpu_buffer);
+    ctp::GpuApi::FreeHost(gpu_buffer);
   }
 }
 
@@ -519,7 +520,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
 
     // Step 5: Allocate data buffer in pinned memory and fill with pattern
     char *data_buf;
-    cudaMallocHost(&data_buf, kDataSize);
+    data_buf = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(data_buf)>>(kDataSize);
     REQUIRE(data_buf != nullptr);
     for (size_t i = 0; i < kDataSize; ++i) {
       data_buf[i] = static_cast<char>(i % 251);  // Prime modulus for pattern
@@ -538,8 +539,8 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
     int recv_rc = recv_info.rc;
 
     // Wait for GPU
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 8: Verify results
     REQUIRE(*send_result == 0);
@@ -562,7 +563,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
 
     // Cleanup
     std::free(recv_meta.recv[0].data.ptr_);
-    cudaFreeHost(data_buf);
+    ctp::GpuApi::FreeHost(data_buf);
   }
 
   SECTION("GpuSendCpuRecvLargeData") {
@@ -595,7 +596,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
 
     // Allocate and fill large data buffer
     char *data_buf;
-    cudaMallocHost(&data_buf, kLargeDataSize);
+    data_buf = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(data_buf)>>(kLargeDataSize);
     REQUIRE(data_buf != nullptr);
     constexpr char kPattern = 0xAB;
     for (size_t i = 0; i < kLargeDataSize; ++i) {
@@ -614,8 +615,8 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
     auto recv_info = ShmTransport::Recv(recv_meta, ctx);
     int recv_rc = recv_info.rc;
 
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     REQUIRE(*send_result == 0);
     REQUIRE(recv_rc == 0);
@@ -634,7 +635,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
     REQUIRE(data_correct);
 
     std::free(recv_meta.recv[0].data.ptr_);
-    cudaFreeHost(data_buf);
+    ctp::GpuApi::FreeHost(data_buf);
   }
 
   SECTION("GpuSendGpuRecv") {
@@ -689,21 +690,20 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
 
     // Step 5: Allocate data buffer and output buffer in pinned memory
     char *data_buf;
-    cudaMallocHost(&data_buf, kDataSize);
+    data_buf = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(data_buf)>>(kDataSize);
     REQUIRE(data_buf != nullptr);
     for (size_t i = 0; i < kDataSize; ++i) {
       data_buf[i] = static_cast<char>(i % 251);
     }
 
     char *output_buf;
-    cudaMallocHost(&output_buf, kDataSize);
+    output_buf = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(output_buf)>>(kDataSize);
     REQUIRE(output_buf != nullptr);
     std::memset(output_buf, 0, kDataSize);
 
     // Step 6: Create two CUDA streams for concurrent send/recv
-    cudaStream_t send_stream, recv_stream;
-    cudaStreamCreate(&send_stream);
-    cudaStreamCreate(&recv_stream);
+    void *send_stream = ctp::GpuApi::CreateStream();
+    void *recv_stream = ctp::GpuApi::CreateStream();
 
     // Step 7: Launch recv kernel first (will spinwait for data)
     // Uses recv_alloc for its internal allocations
@@ -718,10 +718,10 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
                                              send_result);
 
     // Step 9: Synchronize both streams
-    cudaError_t err = cudaStreamSynchronize(send_stream);
-    REQUIRE(err == cudaSuccess);
-    err = cudaStreamSynchronize(recv_stream);
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize(send_stream);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
+    ctp::GpuApi::Synchronize(recv_stream);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 10: Verify results
     REQUIRE(*send_result == 0);
@@ -738,10 +738,10 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
     REQUIRE(data_correct);
 
     // Cleanup
-    cudaStreamDestroy(send_stream);
-    cudaStreamDestroy(recv_stream);
-    cudaFreeHost(data_buf);
-    cudaFreeHost(output_buf);
+    ctp::GpuApi::DestroyStream(send_stream);
+    ctp::GpuApi::DestroyStream(recv_stream);
+    ctp::GpuApi::FreeHost(data_buf);
+    ctp::GpuApi::FreeHost(output_buf);
   }
 }
 
@@ -771,7 +771,9 @@ TEST_CASE("ContainsPtr GPU Diagnostic", "[gpu][contains_ptr]") {
 
   // Allocate the diag struct from managed memory so GPU can write to it
   ContainsPtrDiag *diag = nullptr;
-  REQUIRE(cudaMallocManaged(&diag, sizeof(ContainsPtrDiag)) == cudaSuccess);
+  diag = ctp::GpuApi::MallocManaged<std::remove_pointer_t<decltype(diag)>>(
+      sizeof(ContainsPtrDiag));
+  REQUIRE(diag != nullptr);
   memset(diag, 0, sizeof(ContainsPtrDiag));
 
   // Use a known-valid offset: sizeof(_BuddyAllocator) is the first allocation
@@ -784,7 +786,7 @@ TEST_CASE("ContainsPtr GPU Diagnostic", "[gpu][contains_ptr]") {
   INFO("data_capacity from CPU = " << alloc_ptr->GetBackendDataCapacity());
 
   DiagnoseContainsPtrKernel<<<1, 1>>>(alloc_ptr, valid_offset, diag);
-  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  REQUIRE((ctp::GpuApi::Synchronize(), true));
 
   INFO("GPU data_capacity = " << diag->data_capacity);
   INFO("GPU test_offset   = " << diag->test_offset);
@@ -803,5 +805,5 @@ TEST_CASE("ContainsPtr GPU Diagnostic", "[gpu][contains_ptr]") {
   REQUIRE(diag->fullptr_offset_null == false);
   REQUIRE(diag->fullptr_size_null   == false);
 
-  cudaFree(diag);
+  ctp::GpuApi::Free(diag);
 }

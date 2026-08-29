@@ -80,7 +80,7 @@ int CopiesWhileKernelSpins(void *src, void *dst) {
   unsigned long long *iters = GpuApi::Malloc<unsigned long long>(1);
 
   SpinOnHostFlagKernel<<<1, 256>>>(flag, iters);
-  REQUIRE(cudaGetLastError() == cudaSuccess);
+  REQUIRE(ctp::GpuApi::LastError() == nullptr);
   // Give the kernel time to actually become resident on the device.
   std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
@@ -89,17 +89,17 @@ int CopiesWhileKernelSpins(void *src, void *dst) {
   std::thread copier([&] {
     // Exactly ctp::DeviceAwareMemcpy: a dedicated non-blocking stream, an async
     // copy, then a synchronize.
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    void *s = ctp::GpuApi::CreateStream();
     for (int i = 0; i < 8; ++i) {
-      if (cudaMemcpyAsync(dst, src, kCopyBytes, cudaMemcpyDefault, s) !=
-          cudaSuccess) {
+      ctp::GpuApi::MemcpyAsync(dst, src, kCopyBytes, s);
+      if (ctp::GpuApi::LastError() != nullptr) {
         break;
       }
-      if (cudaStreamSynchronize(s) != cudaSuccess) break;
+      ctp::GpuApi::Synchronize(s);
+      if (ctp::GpuApi::LastError() != nullptr) break;
       copies.fetch_add(1);
     }
-    cudaStreamDestroy(s);
+    ctp::GpuApi::DestroyStream(s);
     done = true;
   });
 

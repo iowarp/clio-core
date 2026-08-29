@@ -54,6 +54,7 @@
  *   the orchestrator's runtime setting.
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/memory/allocator/buddy_allocator.h"
@@ -185,7 +186,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
     // ptxas -v shows this kernel compiles to 0 bytes stack frame (fully
     // register-allocated).  4 096 B matches the CLIO Runtime orchestrator setting
     // and is generous for this test; even 2 048 B passes in practice.
-    cudaDeviceSetLimit(cudaLimitStackSize, 4096);
+    ctp::GpuApi::SetDeviceStackLimit(4096);
 
     // Allocate 32 MB of pinned, device-accessible memory.
     GpuShmMmap   backend;
@@ -195,7 +196,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
 
     // Per-thread result array in pinned host memory (readable after sync).
     int *d_results = nullptr;
-    cudaMallocHost(&d_results, kNumThreads * sizeof(int));
+    d_results = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(d_results)>>(kNumThreads * sizeof(int));
     REQUIRE(d_results != nullptr);
     memset(d_results, 0, kNumThreads * sizeof(int));
 
@@ -206,8 +207,8 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
         backend_id,
         d_results);
 
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     for (int i = 0; i < kNumThreads; ++i) {
       INFO("Thread " << i << " result: " << d_results[i]);
@@ -219,7 +220,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
       REQUIRE(d_results[i] >= 100);
     }
 
-    cudaFreeHost(d_results);
+    ctp::GpuApi::FreeHost(d_results);
     // backend destructor cleans up GpuShmMmap
   }
 }
