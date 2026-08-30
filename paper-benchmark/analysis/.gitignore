@@ -1,0 +1,8 @@
+# Analysis OUTPUT, not source. Every run writes REPORT.md, summary.json, the
+# per-stage CSVs and the figures under here; they are reproducible from the
+# exploration logs by analyze_exploration.py and are far larger than the code
+# that produces them.
+results/
+
+__pycache__/
+*.pyc

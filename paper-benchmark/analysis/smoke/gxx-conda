@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# g++ with Clio's OWN libstdc++ on the link path.
+#
+# Clio is built against the conda env's libstdc++ 6.0.36 (GLIBCXX up to
+# 3.4.36); the system libstdc++ on these nodes stops at 3.4.29, so linking the
+# VPIC deck against libclio_*.so fails on _M_replace_cold@GLIBCXX_3.4.31,
+# ios_base_library_init@GLIBCXX_3.4.32 and __cxa_call_terminate@CXXABI_1.3.15.
+#
+# LIBRARY_PATH does NOT fix it -- GCC searches its own built-in directories
+# for the implicit -lstdc++ before honouring LIBRARY_PATH. An explicit -L on
+# the command line does win, which is all this wrapper adds. It is passed to
+# nvcc_wrapper as NVCC_WRAPPER_DEFAULT_COMPILER, so it lands as nvcc's -ccbin
+# and leaves both VPIC's tree and build_deck.sh untouched.
+CONDA_LIB=/u/imuradli/np-env/np/lib
+# Compile-only invocations take no linker flags; adding them there only earns
+# an "unused during linking" warning on every translation unit.
+for a in "$@"; do
+  case "$a" in -c|-E|-M|-MM) exec g++ "$@" ;; esac
+done
+exec g++ -L"$CONDA_LIB" -Wl,-rpath,"$CONDA_LIB" "$@"
