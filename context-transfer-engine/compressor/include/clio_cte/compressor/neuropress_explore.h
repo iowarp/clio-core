@@ -137,7 +137,13 @@ void CollectExploreSlots(std::vector<std::unique_ptr<ExploreSlot>> &slots);
 /**
  * @brief Is per-candidate reconstruction quality measured? (env, default OFF)
  *
- * CLIO_NEUROPRESS_MEASURE_QUALITY. Off by default and that is not caution:
+ * CLIO_NEUROPRESS_MEASURE_QUALITY. Off by default in the LIBRARY, but the
+ * paper benchmark turns it ON in every run_config.sh -- an exploration run
+ * that reports ratio and speed against a merely PREDICTED psnr_db answers
+ * half the lossy question, and psnr_db is easily mistaken for a measurement
+ * when meas_psnr_db beside it is empty. Set MEASURE_QUALITY=0 to opt out.
+ *
+ * Off by default HERE and that is not caution:
  * measuring quality means DECOMPRESSING and then INVERTING both preprocessing
  * transforms for every candidate, so at K=31 the sweep pays 31 full inverse
  * chains per chunk on top of a decompression that already runs 1.2-30x the

@@ -194,6 +194,11 @@ if [ "$RATIO_COST" = true ]; then
 fi
 if [ "$MEASURE_DT" = true ]; then
   NP_ENV+=(CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=1)
+  # Measured reconstruction quality, on for the same reason: an
+  # exploration run that reports ratio and speed but only a PREDICTED
+  # psnr_db answers half the lossy question. Off it, meas_rmse /
+  # meas_psnr_db / meas_ssim are empty and psnr_db is the model's guess.
+  NP_ENV+=(CLIO_NEUROPRESS_MEASURE_QUALITY=${MEASURE_QUALITY:-1})
 fi
 if [ -n "$SGD_RULE" ]; then
   NP_ENV+=(CLIO_NEUROPRESS_SGD_RULE="$SGD_RULE")
