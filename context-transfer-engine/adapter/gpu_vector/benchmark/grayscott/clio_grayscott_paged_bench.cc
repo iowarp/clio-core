@@ -259,6 +259,28 @@ int main(int argc, char **argv) {
   // a vector's pages are CTE blobs and blobs hash across the cluster, so
   // the paging path IS the halo exchange. Per-node namespaces would give
   // each node a private field and silently decouple the physics.
+  // THE MECHANISM IS IDENTIFIED; MAKING IT WORK IS NOT DONE.
+  //
+  // Every Fetch and BeginFlush in grayscott_kernels.h passes generation 0,
+  // and per device_vector.h generation 0 means ANY VERSION IS ACCEPTABLE.
+  // That is exactly why a node takes a stale halo plane: it never demands
+  // a current one. DeviceVector::Fetch(generation, ...) is the mechanism
+  // md uses -- publish your slab AS a generation, demand the neighbour's
+  // halo AT it, and let the generation be the barrier.
+  //
+  // Threading a generation through (seed publishes 1; step s reads s+1 and
+  // publishes s+2) was tried and REVERTED, because it hangs:
+  //
+  //   [gpu_vector] gen stall: page 39 at gen 0 want 4 fetching=0 pins=2
+  //
+  // The input pages sit at generation 0 while the reader demands 4, so the
+  // publishes are not stamping a generation onto the page at all. Until
+  // that is understood, threading generations here only converts a wrong
+  // answer into a hang. One thing the attempt did settle: the OUTPUT
+  // planes (unext/vnext) must keep generation 0 -- nobody publishes them
+  // at the demanded generation because this node is about to, so demanding
+  // one waits forever. The demand belongs on the consumer of a value.
+  //
   // MULTI-NODE IS REFUSED. The exchange is built -- per-step flush, cross-
   // node barrier, settle-then-invalidate, and the same after the sharded
   // seed -- but a 2-node run is still WRONG and, worse, NONDETERMINISTIC:
