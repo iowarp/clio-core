@@ -18,44 +18,51 @@
 # Only the paged cache/tier stack, because a resident substrate has no
 # counterpart to it. That asymmetry IS the measurement.
 #
-# THE BLOCKS SWEEP, AND WHY IT REACHES BELOW ONE BLOCK PER SM.
-# The gpu_vector block ladders top out at 67, chosen as 80% of an RTX
-# 5080's 84 SMs; on a 108-SM A100 that measures launch width rather than
-# anything interesting. But the first 3-rung run (108/216/432) found
-# something that says the sweep must go DOWN, not just up: per-iteration
-# cost does not fall as blocks rise, and the best paged number on record
-# is still the 32-block one. Measured, paged:
+# THE BLOCKS SWEEP: POWERS OF TWO, SWEPT DIRECTLY.
+# blocks is now given as an absolute count rather than blocks_per_sm.
+# Deriving it as a fraction of 108 SMs produced 27/54 -- values that carry
+# no meaning of their own and divide the dataset and the per-block cache
+# raggedly. Powers of two divide both cleanly and are what anyone reading
+# a GPU sweep expects.
 #
-#     32 blocks   4949 ms/iter   (earlier run, iters=4)
-#    108 blocks   7862 ms/iter
-#    216 blocks   8655 ms/iter
-#    432 blocks   7343 ms/iter
+#   blocks   32    64   128   256   512
+#   /SM     0.30  0.59  1.19  2.37  4.74
 #
-# MPI is flat within 3% over that whole 4x range (6062 / 6039 / 6208), so
-# at 32 GB this workload is memory-bound and the parallelism axis was
-# sampled entirely on its flat shoulder. The sweep now spans a 16x range
-# and brackets the apparent optimum:
+# 512 sits just past the 4-blocks-per-SM occupancy target; 32 and 64 sit
+# below one block per SM, which is where the best paged number so far
+# lives (4949 ms/iter at 32 blocks, against 7862 at 108).
 #
-#   blocks_per_sm 0.25 ->  27 blocks   (SMs deliberately idle)
-#                 0.5  ->  54 blocks
-#                 1    -> 108 blocks   (one block per SM)
-#                 2    -> 216 blocks   (latency hiding)
-#                 4    -> 432 blocks   (oversubscribed)
+# 4 BLOCKS/SM IS NOT REACHABLE BY THE PAGED KERNELS, AND THAT IS THE POINT.
+# Occupancy here is capped by REGISTERS, not by how many blocks we ask
+# for. From cuobjdump --dump-resource-usage on the built binaries:
 #
-# blocks_per_sm is a FLOAT for exactly this reason -- an integer-only knob
-# cannot express the region where the optimum appears to live.
+#   clio_kmeans_paged_bench     REG=192  -> 1 block/SM, 12.5% occupancy
+#   clio_kmeans_mpi_bench       REG= 32  -> 8 block/SM,  100% occupancy
+#   clio_kmeans_nvshmem_bench   REG= 32  -> 8 block/SM,  100% occupancy
 #
-# sm_count IS SET EXPLICITLY (108) rather than detected. The package can
-# detect it from the GPU name, but detection needs a GPU, and this file has
-# to be loadable on the login node for `jarvis ppl submit`. Stating it also
-# makes the geometry reproducible from the YAML alone.
+# On an A100 (65536 regs/SM) resident threads per SM = 65536/regs, so the
+# paged coroutine kernels are hard-limited to 341 threads/SM whatever the
+# block size: at 256 threads/block that is ONE block per SM, i.e. 108
+# blocks resident and everything above that merely QUEUED. That is what
+# the flat, non-monotonic paged curve (7862 / 8655 / 7343 at 108/216/432)
+# was showing, and it means the lever for paged occupancy is register
+# pressure or threads/block -- not more blocks.
+#
+# The package records regs_per_thread, max_blocks_per_sm, occupancy_pct,
+# blocks_resident and blocks_queued on every row, so this is visible in
+# results.csv rather than something a reader has to reconstruct.
+#
+# sm_count IS STILL SET (108) even though blocks is now absolute: the
+# package uses it to report blocks_per_sm_req, blocks_resident and
+# blocks_queued. It is stated rather than detected because detection needs
+# a GPU and this file must load on the login node.
 #
 # CACHE HELD CONSTANT WHILE BLOCKS VARY. cache_mb is a TOTAL, resolved to
 # per-block slots as cache_mb/blocks/page_kb, so sweeping blocks does not
 # quietly change the VRAM budget -- otherwise a blocks sweep is confounded
-# by a cache sweep. Resolved across the five rungs:
-#     27 x 1213,  54 x 606,  108 x 303,  216 x 151,  432 x 75 slots of 1 MB
-#   = 32751 / 32724 / 32724 / 32616 / 32400 MB -- constant to within 1%,
+# by a cache sweep. Powers of two divide it exactly:
+#     32 x 1024,  64 x 512,  128 x 256,  256 x 128,  512 x 64 slots of 1 MB
+#   = 32768 MB at EVERY rung -- exactly constant, not merely close,
 # and covering the 32 GB problem at every rung, i.e. residency throughout.
 # What DOES change is per-block cache fragmentation, and it shows: paged
 # faults ran 147 -> 4625 -> 5890 at 108 -> 216 -> 432 blocks, with
@@ -123,7 +130,7 @@ config:
       clusters: 16
       iters: 20
       # ---- the geometry, identical for every cell at a given rung ----
-      blocks_per_sm: 1
+      blocks: 128
       sm_count: 108
       threads: 256
       # ---- paged-only ----
@@ -141,11 +148,11 @@ config:
 
 vars:
   km.variant: [paged, mpi, nvshmem]
-  km.blocks_per_sm: [0.25, 0.5, 1, 2, 4]
+  km.blocks: [32, 64, 128, 256, 512]
 
 loop:
   - [km.variant]
-  - [km.blocks_per_sm]
+  - [km.blocks]
 
 repeat: 1
 output: "${HOME}/gv_pipeline_results/kmeans_substrate_blocks"
@@ -161,7 +168,7 @@ post: |
   for _, r in bad.iterrows():
       logger.warning('GEOMETRY MISMATCH %s bps=%s: asked b=%s t=%s, '
                      'used b=%s t=%s'
-                     % (r['km.variant'], r['km.blocks_per_sm'],
+                     % (r['km.variant'], r['km.blocks'],
                         r.get('blocks_req'), r.get('threads_req'),
                         r.get('blocks_used'), r.get('threads_used')))
   if len(bad):
@@ -170,15 +177,16 @@ post: |
   df = df[df.get('geometry_ok', -1) != 0]
 
   ok = df[df.gates_pass == 1]
-  cols = ['km.variant', 'km.blocks_per_sm', 'blocks_req', 'threads_total',
-          'iters', 'bench_ms', 'ms_per_iter', 'gbps', 'vram_peak_mb',
-          'faults', 'evicts', 'centroid_checksum']
+  cols = ['km.variant', 'km.blocks', 'threads_total', 'regs_per_thread',
+          'occupancy_pct', 'blocks_resident', 'blocks_queued', 'iters',
+          'ms_per_iter', 'gbps', 'vram_peak_mb', 'faults', 'evicts',
+          'centroid_checksum']
   logger.info('\n' + ok[[c for c in cols if c in ok.columns]]
               .to_string(index=False))
 
   # 2. THE COMPARISON, per rung, normalised per iteration.
   if 'ms_per_iter' in ok.columns:
-      piv = ok.pivot_table(index='km.blocks_per_sm', columns='km.variant',
+      piv = ok.pivot_table(index='km.blocks', columns='km.variant',
                            values='ms_per_iter', aggfunc='min')
       logger.info('\nms_per_iter by (blocks_per_sm x substrate):\n'
                   + piv.to_string())
@@ -189,7 +197,7 @@ post: |
   # 3. SAME INPUTS IS NOT SAME ANSWER. The substrates must agree
   #    numerically or the timings compare two different computations.
   if 'centroid_checksum' in ok.columns:
-      for bps, g in ok.groupby('km.blocks_per_sm'):
+      for bps, g in ok.groupby('km.blocks'):
           cs = g['centroid_checksum'].dropna().unique()
           if len(cs) > 1:
               spread = (max(cs) - min(cs)) / max(abs(max(cs)), 1e-30)

@@ -91,6 +91,28 @@ def _detect_sm_count():
     return 0
 
 
+def _max_regs(binary):
+    """Max registers/thread over the binary's kernels, via cuobjdump.
+
+    Static, no GPU needed. This is recorded on every row because register
+    pressure -- not block count -- is what caps occupancy here, and a
+    sweep that does not show it invites the reader to conclude that adding
+    blocks should have helped. Measured for kmeans: paged 192, mpi 32,
+    nvshmem 32.
+    """
+    try:
+        path = subprocess.run(['which', binary], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+        if not path:
+            return 0
+        out = subprocess.run(['cuobjdump', '--dump-resource-usage', path],
+                             capture_output=True, text=True, timeout=120)
+        regs = [int(m) for m in re.findall(r'REG:(\d+)', out.stdout)]
+        return max(regs) if regs else 0
+    except Exception:
+        return 0
+
+
 class _VramSampler:
     """Peak nvidia-smi memory.used while the benchmark runs, persisted to a
     file because _get_stat runs on a FRESH pkg instance that shares no
@@ -206,6 +228,13 @@ class ClioGvKmeans(Application):
              'type': int, 'default': 0},
             {'name': 'threads', 'msg': 'threads per block. REQUIRED',
              'type': int, 'default': 256},
+            {'name': 'regs_per_sm',
+             'msg': 'register file per SM, used to report the occupancy a '
+                    'launch can actually reach (A100/A40: 65536)',
+             'type': int, 'default': 65536},
+            {'name': 'max_threads_per_sm',
+             'msg': 'resident-thread limit per SM, for the same purpose '
+                    '(A100: 2048)', 'type': int, 'default': 2048},
 
             # ---- paged-only: the cache and tier stack ----------------
             {'name': 'cache_mb',
@@ -467,9 +496,30 @@ class ClioGvKmeans(Application):
         try:
             sms = self._sm_count()
             stats['sm_count'] = sms
-            stats['blocks_per_sm_eff'] = round(blocks / float(sms), 3)
+            stats['blocks_per_sm_req'] = round(blocks / float(sms), 3)
         except Exception:
-            pass
+            sms = 0
+
+        # OCCUPANCY THE LAUNCH CAN ACTUALLY REACH. Asking for more blocks
+        # than the register file admits does not raise occupancy, it just
+        # queues them -- which is why the paged curve is flat past 1
+        # block/SM while mpi's is flat for a different reason (it was
+        # already saturated). Recording it keeps that distinction visible
+        # in results.csv instead of leaving it to be inferred.
+        regs = _max_regs(self._binary())
+        if regs:
+            stats['regs_per_thread'] = regs
+            rps, mts = int(c['regs_per_sm']), int(c['max_threads_per_sm'])
+            by_regs = rps // (regs * threads)          # blocks/SM by regs
+            by_thr = mts // threads                    # blocks/SM by threads
+            resident_bps = max(0, min(by_regs, by_thr))
+            stats['max_blocks_per_sm'] = resident_bps
+            stats['occupancy_pct'] = round(
+                100.0 * resident_bps * threads / mts, 1)
+            if sms:
+                # Blocks beyond this are queued, not concurrent.
+                stats['blocks_resident'] = min(blocks, resident_bps * sms)
+                stats['blocks_queued'] = max(0, blocks - resident_bps * sms)
 
         out = self._output_file()
         try:
