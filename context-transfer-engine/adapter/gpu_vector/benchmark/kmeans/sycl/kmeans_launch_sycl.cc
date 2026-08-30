@@ -71,12 +71,13 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
-                u64 page_elems, u32 dims, u32 k, View vw, StackView sv) {
+                u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
+                StackView sv) {
   // gpu_info is already stamped into every block's record by InitBackend, so
   // unlike CUDA there is no per-launch CLIO_GPU_INIT store.
   (void)info;
   SubmitYieldable(grid, block, v, vw, sv, [=](DevF32 dev, u32 blk) {
-    return SeedCoro(dev, per, page_elems, dims, k, blk);
+    return SeedCoro(dev, per, page_elems, dims, k, base_idx, blk);
   });
 }
 

@@ -53,16 +53,25 @@ using ::clio_km::PointVal;
 /* were already portable, which is the whole point.                     */
 /* ------------------------------------------------------------------ */
 
-/** Seed: write the point set into the vector, one page at a time. */
+/** Seed: write the point set into the vector, one page at a time.
+ *
+ *  `base_idx` is this node's offset into the GLOBAL point set. The vector
+ *  index stays local -- each node's vector holds only its own shard -- but the
+ *  VALUE written must come from the global index, or the union of the shards
+ *  is not the single-node point set and the distributed run is solving a
+ *  different problem than the reference it is gated against. Zero for a
+ *  single-node run, which is therefore unchanged.
+ */
 CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
-                              u64 page_elems, u32 dims, u32 k, u32 block) {
+                              u64 page_elems, u32 dims, u32 k, u64 base_idx,
+                              u32 block) {
   const u64 base = static_cast<u64>(block) * per;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
     co_await v.Fetch(0, base + off, n);
     auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      h[base + off + i] = PointVal(base + off + i, dims, k);
+      h[base + off + i] = PointVal(base_idx + base + off + i, dims, k);
     }
     // Collective: name the page just written.
     co_await v.BeginFlush(0, base + off, n);

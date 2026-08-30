@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -98,6 +99,11 @@ using kb::PointVal;
 // so CTP_IS_DEVICE_PASS is 0 and everything below compiles once.
 #if !CTP_IS_DEVICE_PASS
 
+// Cross-node reduction. Included INSIDE the device-pass guard: it uses the
+// CTE client, whose members are compiled out of the device pass, so at file
+// scope it breaks the CUDA build of this driver and not the SYCL one.
+#include "../bench_dist.h"
+
 
 namespace {
 
@@ -145,6 +151,16 @@ int main(int argc, char **argv) {
   unsigned long long nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;
+  // DATA-PARALLEL DECOMPOSITION. --nodes N --node i gives this process the
+  // i'th contiguous shard of the SAME global point set --data-mb describes,
+  // matching the MPI baseline's split exactly (last node absorbs the
+  // remainder). One node, the default, is the whole set, so a single-process
+  // run is unchanged -- and is the reference a distributed run must reproduce.
+  //
+  // Only the centroid reduction crosses nodes. Each node's points are private,
+  // so its vector gets its own tag namespace; two processes sharing one CTE
+  // would otherwise both create "gv_kmeans" and page into each other's blobs.
+  u32 nodes = 1, node = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -166,10 +182,13 @@ int main(int argc, char **argv) {
     // next() parses a number; the path needs the raw argv token.
     else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--baseline") baseline = true;
+    else if (a == "--nodes") nodes = static_cast<u32>(next());
+    else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--dims N] "
                   "[--clusters N] [--slots N] [--iters N] [--page-kb N] "
-                  "[--data-mb N] [--hbm-mb N] [--repeat N] [--hbm-only]\n",
+                  "[--data-mb N] [--hbm-mb N] [--repeat N] [--hbm-only] "
+                  "[--nodes N --node I]\n",
                   argv[0]);
       return 0;
     }
@@ -196,7 +215,23 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  const u64 total_elems = (data_mb * 1024ull * 1024ull) / sizeof(float);
+  if (node >= nodes) {
+    std::fprintf(stderr, "KMEANS ERROR: --node %u is out of range for "
+                 "--nodes %u\n", node, nodes);
+    return 2;
+  }
+  // --data-mb is the GLOBAL problem, split across the nodes; this is strong
+  // scaling, like the MPI baseline. Required to divide evenly: a rounded shard
+  // makes the union of the shards something other than the single-node point
+  // set, and the gate would then be comparing two different problems.
+  const u64 global_elems = (data_mb * 1024ull * 1024ull) / sizeof(float);
+  if (nodes > 1 && (data_mb % nodes) != 0) {
+    std::fprintf(stderr, "KMEANS ERROR: --data-mb %llu does not divide evenly "
+                 "across --nodes %u; choose a multiple.\n",
+                 (unsigned long long)data_mb, nodes);
+    return 2;
+  }
+  const u64 total_elems = global_elems / nodes;
   const u64 per = (total_elems / blocks / page_elems) * page_elems;  // page-aligned
   if (per == 0) {
     std::fprintf(stderr, "KMEANS ERROR: %lluMB over %u blocks leaves less than "
@@ -207,10 +242,26 @@ int main(int argc, char **argv) {
   }
   const u64 n = per * blocks;
   const u64 npoints = n / dims;
+  // `per` is truncated to a whole number of pages, so n can be less than
+  // total_elems -- but it is the SAME n on every node, which makes the shards
+  // contiguous and non-overlapping at exactly node*n. Deriving the base from
+  // the requested size instead of the realised one would leave a gap at every
+  // node boundary and quietly change the point set.
+  const u64 base_idx = static_cast<u64>(node) * n;
   const double logical_mb =
       static_cast<double>(n * sizeof(float)) / (1024.0 * 1024.0);
 
-  {
+  // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
+  // one and Setenv-ing it with overwrite=1 unconditionally makes it
+  // impossible to point this bench at a cluster: any CLIO_SERVER_CONF the
+  // caller exported is clobbered a line later, so every node stands up its
+  // own single-host runtime and the reduction can never meet. A distributed
+  // harness needs exactly that config -- one naming a hostfile and the other
+  // nodes -- so an already-set CLIO_SERVER_CONF is left alone.
+  if (getenv("CLIO_SERVER_CONF") != nullptr) {
+    std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
+                getenv("CLIO_SERVER_CONF"));
+  } else {
     std::ofstream cfg("gv_kmeans_bench.yaml");
     cfg << "networking:\n  port: 9439\n\n"
         // Workers that sleep add their sleep to every fault, and a fault is a
@@ -290,7 +341,11 @@ int main(int argc, char **argv) {
   // giant set costs O(frames) per probe -- kmeans went 4.7 s -> 42 s as a
   // 512-way cache. Keep a set per block and floor the width at 8, which is
   // what covers several blocks colliding on one set.
-  gv::Vector<float> vec("gv_kmeans", {0}, page_bytes, blocks,
+  // Per-node tag namespace: the points are private to this node, and two
+  // processes on one CTE would otherwise share the blob names.
+  const std::string region =
+      (nodes > 1) ? ("gv_kmeans_n" + std::to_string(node)) : "gv_kmeans";
+  gv::Vector<float> vec(region.c_str(), {0}, page_bytes, blocks,
                         slots < 16u ? 16u : slots, n);
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
@@ -298,7 +353,8 @@ int main(int argc, char **argv) {
 
   // ---- seed the point set -------------------------------------------------
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-    kb::LaunchSeed(g, b, gpu, dev, per, page_elems, dims, k, vw, sv);
+    kb::LaunchSeed(g, b, gpu, dev, per, page_elems, dims, k, base_idx, vw,
+                   sv);
   });
   ctp::GpuApi::Synchronize();
 
@@ -353,6 +409,63 @@ int main(int argc, char **argv) {
     return true;
   };
 
+  // ---- cross-node centroid reduction ------------------------------------
+  // Built AFTER the runtime is up (a client constructed before CLIO_INIT
+  // dereferences a runtime that does not exist) and ONLY when there is a
+  // reduction to do -- an unconditional second CTE client crashes the
+  // single-node run.
+  //
+  // The reduction tag is deliberately NOT per-node: the point shards are
+  // private, but the partial sums have to meet somewhere.
+  std::unique_ptr<clio::cte::core::Client> cte_red;
+  clio::cte::core::TagId red_tag{};
+  if (nodes > 1) {
+    cte_red = std::make_unique<clio::cte::core::Client>(
+        clio::cte::core::kCtePoolId);
+    auto t = cte_red->AsyncGetOrCreateTag("gv_kmeans_red");
+    t.Wait();
+    if (t->GetReturnCode() != 0) {
+      std::fprintf(stderr, "KMEANS ERROR: could not create the reduction "
+                   "tag\n");
+      return 1;
+    }
+    red_tag = t->tag_id_;
+  }
+  // Lloyd's update needs the sums and counts over the WHOLE point set, not
+  // this node's shard, or every node converges to its own shard's centroids
+  // and the run silently solves a different problem. Reduced as doubles: the
+  // partials are float on the device, but summing N nodes' partials in float
+  // would add a node-count-dependent rounding term to a value the gate
+  // compares against a single-node reference.
+  std::vector<double> red_buf(static_cast<size_t>(k) * dims + k);
+  std::vector<float> h_sums(static_cast<size_t>(k) * dims);
+  std::vector<unsigned> h_counts(k);
+  u64 red_round = 0;
+  const auto reduce_centroids = [&]() -> bool {
+    if (nodes <= 1) return true;
+    ctp::GpuApi::Memcpy(h_sums.data(), d_sums, h_sums.size() * sizeof(float));
+    ctp::GpuApi::Memcpy(h_counts.data(), d_counts,
+                        h_counts.size() * sizeof(unsigned));
+    for (size_t i = 0; i < h_sums.size(); ++i) red_buf[i] = h_sums[i];
+    for (u32 c = 0; c < k; ++c) red_buf[h_sums.size() + c] = h_counts[c];
+    if (!clio_bench_dist::ReduceSum(*cte_red, red_tag, node, nodes,
+                                    red_round++, red_buf.data(),
+                                    static_cast<int>(red_buf.size()),
+                                    "kmred")) {
+      return false;
+    }
+    for (size_t i = 0; i < h_sums.size(); ++i) {
+      h_sums[i] = static_cast<float>(red_buf[i]);
+    }
+    for (u32 c = 0; c < k; ++c) {
+      h_counts[c] = static_cast<unsigned>(red_buf[h_sums.size() + c]);
+    }
+    ctp::GpuApi::Memcpy(d_sums, h_sums.data(), h_sums.size() * sizeof(float));
+    ctp::GpuApi::Memcpy(d_counts, h_counts.data(),
+                        h_counts.size() * sizeof(unsigned));
+    return true;
+  };
+
   double best_ms = 1e30;
   std::vector<float> h_final(static_cast<size_t>(k) * dims);
   for (int r = 0; r < repeat; ++r) {
@@ -374,6 +487,13 @@ int main(int argc, char **argv) {
           kb::LaunchAssign(g, b, gpu, dev, per, page_elems, dims, k, d_cent,
                            d_sums, d_counts, vw, sv);
         });
+      }
+      // Combine the shards BEFORE the update, so every node divides the same
+      // global sums by the same global counts and they stay in lockstep.
+      ctp::GpuApi::Synchronize();
+      if (!reduce_centroids()) {
+        std::fprintf(stderr, "KMEANS ERROR: centroid reduction failed\n");
+        return 1;
       }
       kb::LaunchUpdate(d_cent, d_sums, d_counts, dims, k);
     }

@@ -20,13 +20,15 @@ namespace {
 /** The prologue every yieldable kernel repeats: bind this block to its page
  *  table, publish the lane stack, then run the chain. Identical to the SYCL
  *  side's, which is the point. */
-__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
-                           u32 dims, u32 k, View yv, StackView ys) {
+__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 v, u64 per,
+                                            u64 page_elems, u32 dims, u32 k,
+                                            u64 base_idx, View yv,
+                                            StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(SeedCoro(v, per, page_elems, dims, k, yv.Block()));
+  CLIO_YCORO_RUN(SeedCoro(v, per, page_elems, dims, k, base_idx, yv.Block()));
 }
 
 __global__ GV_LAUNCH_BOUNDS void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
@@ -61,9 +63,10 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
-                u64 page_elems, u32 dims, u32 k, View vw, StackView sv) {
-  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, v, per, page_elems,
-                                                     dims, k, vw, sv);
+                u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
+                StackView sv) {
+  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, v, per, page_elems, dims, k, base_idx, vw, sv);
 }
 
 void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
