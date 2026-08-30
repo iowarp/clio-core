@@ -71,6 +71,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -115,6 +116,10 @@ namespace gs = clio::gv_bench::grayscott;
 
 #if !CTP_IS_DEVICE_PASS
 
+// Cross-node reduction. Included INSIDE the device-pass guard: it uses the
+// CTE client, whose members are compiled out of the CUDA device pass.
+#include "../bench_dist.h"
+
 namespace {
 
 double NowMs() {
@@ -150,6 +155,12 @@ class YieldRunner {
 
 int main(int argc, char **argv) {
   u32 blocks = 64, threads = 256, slots = 12, steps = 4;
+  // Z-SLAB DECOMPOSITION, like the MPI edition. --nodes N --node i gives
+  // this process a contiguous slab of the SAME global field; nz stays
+  // global so the fixed boundary (z == 0, z == nz-1) is honoured however
+  // the domain is cut. One node is the whole field, so a single-process run
+  // is unchanged and is the reference a distributed run must reproduce.
+  u32 nodes = 1, node = 0;
   u64 page_kb = 1024, data_mb = 16384, hbm_mb = 4096;
   int repeat = 3;
   // Out-of-core WITHOUT in-kernel faulting: synchronous CTE reads AND
@@ -173,6 +184,8 @@ int main(int argc, char **argv) {
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--slots") slots = static_cast<u32>(next());
     else if (a == "--steps") steps = static_cast<u32>(next());
+    else if (a == "--nodes") nodes = static_cast<u32>(next());
+    else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--data-mb") data_mb = next();
     else if (a == "--hbm-mb") hbm_mb = next();
@@ -232,7 +245,45 @@ int main(int argc, char **argv) {
                  (unsigned long long)nz);
     return 2;
   }
-  const u64 zper = (nz + blocks - 1) / blocks;
+  if (node >= nodes) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --node %u out of range for "
+                 "--nodes %u\n", node, nodes);
+    return 2;
+  }
+  // This node's slab of the global z range. The halo planes it reads are
+  // its neighbours' pages, which is why the tag namespace below is SHARED:
+  // a vector's pages are CTE blobs and blobs hash across the cluster, so
+  // the paging path IS the halo exchange. Per-node namespaces would give
+  // each node a private field and silently decouple the physics.
+  // HALO EXCHANGE IS NOT IMPLEMENTED YET, so --nodes > 1 is REFUSED rather
+  // than run. The decomposition below (slab bounds, shared namespace,
+  // checksum reduction) is in place, but a step reads its neighbours'
+  // boundary planes and a page the neighbour still holds DIRTY in its own
+  // cache is never written back -- a flush only writes back frames it can
+  // Find. Without an explicit publish and a generational fetch at each step
+  // boundary a multi-node run reads STALE halo planes and produces wrong
+  // physics with every counter clean and no error anywhere. That is the
+  // worst failure this bench could have, so it does not get to happen by
+  // default. Remove this once the exchange lands and the 2-node checksum is
+  // gated against the single-node one.
+  if (nodes > 1) {
+    std::fprintf(stderr,
+                 "GRAYSCOTT ERROR: --nodes %u requested, but the halo "
+                 "exchange is not implemented; a multi-node run would read "
+                 "stale boundary planes and report a plausible, wrong "
+                 "checksum. Refusing.\n", nodes);
+    return 2;
+  }
+  const u64 nz_local = (nz + nodes - 1) / nodes;
+  const u64 zbase = static_cast<u64>(node) * nz_local;
+  const u64 zend = (zbase + nz_local < nz) ? (zbase + nz_local) : nz;
+  if (nodes > 1 && zbase >= nz) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --nodes %u leaves node %u with "
+                 "no planes of nz=%llu\n", nodes, node,
+                 (unsigned long long)nz);
+    return 2;
+  }
+  const u64 zper = ((zend - zbase) + blocks - 1) / blocks;
   const u64 region = plane * nz;
   const u64 n = 4 * region;
   const double logical_mb =
@@ -326,6 +377,24 @@ int main(int argc, char **argv) {
   // what covers several blocks colliding on one set.
   // This kernel holds eight planes per step per block, so the set must be
   // wide enough for several blocks' worth of those.
+  // ---- cross-node reduction client -------------------------------------
+  // After the runtime is up, and only when there is a reduction to do.
+  std::unique_ptr<clio::cte::core::Client> cte_red;
+  clio::cte::core::TagId red_tag{};
+  u64 red_round = 0;
+  if (nodes > 1) {
+    cte_red = std::make_unique<clio::cte::core::Client>(
+        clio::cte::core::kCtePoolId);
+    auto t = cte_red->AsyncGetOrCreateTag("gv_grayscott_red");
+    t.Wait();
+    if (t->GetReturnCode() != 0) {
+      std::fprintf(stderr, "GRAYSCOTT ERROR: could not create reduction "
+                   "tag\n");
+      return 1;
+    }
+    red_tag = t->tag_id_;
+  }
+
   gv::Vector<float> vec("gv_grayscott", {0}, page_bytes, blocks,
                         slots < 24u ? 24u : slots, n);
   vec.EnableStats();
@@ -335,8 +404,8 @@ int main(int argc, char **argv) {
   const u64 ubase = 0, vbase = region, unext = 2 * region, vnext = 3 * region;
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-    gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase, vw,
-                   sv);
+    gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
+                   zbase, zend, vw, sv);
   });
   ctp::GpuApi::Synchronize();
 
@@ -432,7 +501,7 @@ int main(int argc, char **argv) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
-                       vw, sv);
+                       zbase, zend, vw, sv);
       });
       ctp::GpuApi::Synchronize();
     }
@@ -450,7 +519,7 @@ int main(int argc, char **argv) {
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu,
-                         nv, Du, Dv, F, K, dt, vw, sv);
+                         nv, Du, Dv, F, K, dt, zbase, zend, vw, sv);
         });
       }
       std::swap(cu, nu);
@@ -463,10 +532,20 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      gs::LaunchSum(g, b, gpu, dev, plane, nz, zper, cv, d_sum, vw, sv);
+      gs::LaunchSum(g, b, gpu, dev, plane, nz, zper, cv, d_sum, zbase, zend,
+                    vw, sv);
     });
     ctp::GpuApi::Synchronize();
     ctp::GpuApi::Memcpy(&checksum, d_sum, sizeof(double));
+    // Each node summed only its own slab; the gate compares a checksum of
+    // the WHOLE field against a single-node reference, so the partials
+    // have to be combined before it is reported.
+    if (nodes > 1 &&
+        !clio_bench_dist::ReduceSum(*cte_red, red_tag, node, nodes,
+                                    red_round++, &checksum, 1, "gsred")) {
+      std::fprintf(stderr, "GRAYSCOTT ERROR: checksum reduction failed\n");
+      return 1;
+    }
   }
 
   const auto st = vec.ReadStats(0);
