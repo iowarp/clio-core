@@ -13,25 +13,29 @@ namespace clio::gv_bench::weights {
 
 namespace {
 
-__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
-                           u32 flat_pct, View yv, StackView ys) {
+__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevU32 v, u64 per,
+                                            u64 page_elems, u32 flat_pct,
+                                            u64 base_idx, View yv,
+                                            StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(SeedLaneCoro(v, per, page_elems, flat_pct, yv.Block()));
+  CLIO_YCORO_RUN(SeedLaneCoro(v, per, page_elems, flat_pct, base_idx,
+                              yv.Block()));
 }
 
 __global__ GV_LAUNCH_BOUNDS void WeightsKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
                               unsigned long long *sum,
                               unsigned long long *page_sum,
-                              unsigned *page_visits, View yv, StackView ys) {
+                              unsigned *page_visits, u64 base_idx, View yv,
+                              StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(WeightsLaneCoro(v, per, page_elems, sum, page_sum,
-                                 page_visits, yv.Block()));
+                                 page_visits, base_idx, yv.Block()));
 }
 
 __global__ GV_LAUNCH_BOUNDS void BaselineKernel(const u32 *tile, u64 gbase, u64 n,
@@ -51,17 +55,18 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v, u64 per,
-                u64 page_elems, u32 flat_pct, View vw, StackView sv) {
-  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, v, per, page_elems,
-                                                     flat_pct, vw, sv);
+                u64 page_elems, u32 flat_pct, u64 base_idx, View vw,
+                StackView sv) {
+  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, v, per, page_elems, flat_pct, base_idx, vw, sv);
 }
 
 void LaunchWeights(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v,
                    u64 per, u64 page_elems, unsigned long long *sum,
                    unsigned long long *page_sum, unsigned *page_visits,
-                   View vw, StackView sv) {
+                   u64 base_idx, View vw, StackView sv) {
   WeightsKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
-      info, v, per, page_elems, sum, page_sum, page_visits, vw, sv);
+      info, v, per, page_elems, sum, page_sum, page_visits, base_idx, vw, sv);
 }
 
 void LaunchBaseline(u32 threads, const u32 *tile, u64 gbase, u64 n,

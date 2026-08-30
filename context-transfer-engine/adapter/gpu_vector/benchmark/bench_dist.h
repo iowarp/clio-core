@@ -101,9 +101,20 @@ inline bool ReduceSum(clio::cte::core::Client &cte,
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
-  std::vector<double> total(vals, vals + n);
+  // ACCUMULATE IN STRICT ASCENDING NODE ORDER, including this node's own
+  // partial in its proper place. Seeding `total` with the local value and then
+  // adding peers 0,1,2... makes node 2 sum in the order 2,0,1 -- so each node
+  // reduces the same set of doubles in a DIFFERENT order, and float addition
+  // is not associative. Every node then computes a slightly different total
+  // and they drift apart over iterations, which is both a correctness bug and
+  // one that hides as "nondeterminism". Ascending order also matches the MPI
+  // baselines, which combine partials in rank order on purpose.
+  std::vector<double> total(static_cast<size_t>(n), 0.0);
   for (u32 peer = 0; peer < nodes; ++peer) {
-    if (peer == node) continue;
+    if (peer == node) {
+      for (int i = 0; i < n; ++i) total[i] += vals[i];
+      continue;
+    }
     const std::string name = stem + std::to_string(peer);
     std::vector<double> got(static_cast<size_t>(n), 0.0);
     for (;;) {
@@ -114,6 +125,74 @@ inline bool ReduceSum(clio::cte::core::Client &cte,
       if (f->GetReturnCode() == 0) break;
       if (expired()) {
         std::fprintf(stderr, "  reduce[%s]: timed out waiting for node %u\n",
+                     prefix, peer);
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    for (int i = 0; i < n; ++i) total[i] += got[i];
+  }
+  for (int i = 0; i < n; ++i) vals[i] = total[i];
+  return true;
+}
+
+/**
+ * Sum `n` u64s across the nodes, exactly.
+ *
+ * NOT ReduceSum with a cast. A double holds only 53 bits of mantissa, so a
+ * checksum over a large weight set silently loses its low bits above 2^53 --
+ * and the gates that consume these are integer-exact BECAUSE integer addition
+ * commutes, which is the whole reason those benchmarks can claim bit-equality
+ * at any node count. Rounding that to double would throw away the property
+ * being tested.
+ *
+ * Order does not matter here (integer addition is associative), so unlike the
+ * double version this does not need to fix an accumulation order.
+ */
+inline bool ReduceSumU64(clio::cte::core::Client &cte,
+                         const clio::cte::core::TagId &tag, u32 node, u32 nodes,
+                         u64 round, u64 *vals, int n,
+                         const char *prefix = "gvred64", int timeout_s = 120) {
+  if (nodes <= 1) return true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto expired = [&] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count() > timeout_s;
+  };
+  const std::string stem =
+      std::string(prefix) + "_" + std::to_string(round) + "_";
+  const std::string mine = stem + std::to_string(node);
+
+  clio::cte::core::Context ctx;
+  ctx.op_flags_ |= clio::cte::core::Context::kGenerational;
+  ctx.generation_ = 1;
+
+  for (;;) {
+    auto f = cte.AsyncPutBlob(tag, mine, 0, n * sizeof(u64),
+                              reinterpret_cast<char *>(vals), 1.0f, ctx);
+    f.Wait();
+    if (f->GetReturnCode() == 0) break;
+    if (expired()) {
+      std::fprintf(stderr, "  reduce64[%s]: timed out publishing node %u\n",
+                   prefix, node);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  std::vector<u64> total(vals, vals + n);
+  for (u32 peer = 0; peer < nodes; ++peer) {
+    if (peer == node) continue;
+    const std::string name = stem + std::to_string(peer);
+    std::vector<u64> got(static_cast<size_t>(n), 0ull);
+    for (;;) {
+      auto f = cte.AsyncGetBlob(tag, name, 0, n * sizeof(u64), 0u,
+                                reinterpret_cast<char *>(got.data()),
+                                clio::run::PoolQuery::Dynamic(), ctx);
+      f.Wait();
+      if (f->GetReturnCode() == 0) break;
+      if (expired()) {
+        std::fprintf(stderr, "  reduce64[%s]: timed out waiting for node %u\n",
                      prefix, peer);
         return false;
       }

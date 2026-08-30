@@ -190,7 +190,17 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  {
+  // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
+  // one and Setenv-ing it with overwrite=1 unconditionally makes it
+  // impossible to point this bench at a cluster: any CLIO_SERVER_CONF the
+  // caller exported is clobbered a line later, so every node stands up its
+  // own single-host runtime on the same port and they collide. A distributed
+  // harness needs exactly that config -- one naming a hostfile and the other
+  // nodes -- so an already-set CLIO_SERVER_CONF is left alone.
+  if (getenv("CLIO_SERVER_CONF") != nullptr) {
+    std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
+                getenv("CLIO_SERVER_CONF"));
+  } else {
     std::ofstream cfg("gv_gmx_bench.yaml");
     // The RAM tier must hold the WHOLE mesh: a fixed capacity under
     // K^3*8B makes writebacks fail (put_errors > 0) and the conservation

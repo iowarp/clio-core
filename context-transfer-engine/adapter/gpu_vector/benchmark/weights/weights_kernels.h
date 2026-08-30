@@ -88,6 +88,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedLaneCoro(gv::DeviceVector<::clio::run::u32>
                                       ::clio::run::u64 per,
                                       ::clio::run::u64 page_elems,
                                       ::clio::run::u32 flat_pct,
+                                      ::clio::run::u64 base_idx,
                                       ::clio::run::u32 block) {
   const ::clio::run::u64 base = static_cast<::clio::run::u64>(block) * per;
   for (::clio::run::u64 off = 0; off < per; off += page_elems) {
@@ -98,7 +99,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedLaneCoro(gv::DeviceVector<::clio::run::u32>
     {
       auto h = co_await v.HoldPage(base + off, n, /*write=*/true);
     for (::clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
-      h[base + off + i] = Weight(base + off + i, flat_pct);
+      h[base + off + i] = Weight(base_idx + base + off + i, flat_pct);
     }
     __syncthreads();
     }
@@ -126,6 +127,7 @@ CTP_GPU_FUN inline gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<::clio::run::u
                                          unsigned long long *sum,
                                          unsigned long long *page_sum,
                                          unsigned *page_visits,
+                                         ::clio::run::u64 base_idx,
                                          ::clio::run::u32 block) {
   const ::clio::run::u64 base = static_cast<::clio::run::u64>(block) * per;
   unsigned long long acc = 0;
@@ -139,7 +141,7 @@ CTP_GPU_FUN inline gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<::clio::run::u
     unsigned long long r = 0;                     // register, not the frame
     for (::clio::run::u64 i = threadIdx.x; i < n; i += blockDim.x) {
       r += static_cast<unsigned long long>(h[base + off + i]) *
-           Activation(base + off + i);
+           Activation(base_idx + base + off + i);
     }
     acc += r;
     atomicAdd(&page_sum[(base + off) / page_elems], r);

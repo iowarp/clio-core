@@ -49,6 +49,7 @@ static constexpr clio::run::u32 kYieldLaneBytes = 4096;
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -119,8 +120,13 @@ using wt::Weight;
 
 #if !CTP_IS_DEVICE_PASS
 
+// Cross-node reduction. Included INSIDE the device-pass guard: it uses the
+// CTE client, whose members are compiled out of the CUDA device pass.
+#include "../bench_dist.h"
+
 int main(int argc, char **argv) {
   unsigned blocks = 16;
+  clio::run::u32 nodes = 1, node = 0;
   clio::run::u64 hbm_mb = 64;
   // Storage tier: without it no workload ever touches a disk.
   unsigned long long nvme_mb = 0;
@@ -165,6 +171,13 @@ int main(int argc, char **argv) {
     else if (a == "--flat-pct") flat_pct = static_cast<clio::run::u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
+    // MODEL SHARD. --nodes N --node i gives this process the i'th
+    // contiguous slice of a model N times the size of a single-node run,
+    // matching the MPI edition. Integer accumulation commutes, so the
+    // combined checksum is bit-exact at any node count -- this gate does
+    // not need a tolerance and must not be given one.
+    else if (a == "--nodes") nodes = static_cast<clio::run::u32>(next());
+    else if (a == "--node") node = static_cast<clio::run::u32>(next());
     else if (a == "--help") {
       std::fprintf(stderr,
                    "usage: %s [--blocks N] [--hbm-mb M] [--hbm-only] [--threads T] [--pages P] "
@@ -186,7 +199,17 @@ int main(int argc, char **argv) {
   const MemcpyProbe mcp = ProbeMemcpyBandwidth(static_cast<size_t>(page_bytes));
   const clio::run::u64 page_elems = page_bytes / sizeof(clio::run::u32);
 
-  {
+  // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
+  // one and Setenv-ing it with overwrite=1 unconditionally makes it
+  // impossible to point this bench at a cluster: any CLIO_SERVER_CONF the
+  // caller exported is clobbered a line later, so every node stands up its
+  // own single-host runtime on the same port and they collide. A distributed
+  // harness needs exactly that config -- one naming a hostfile and the other
+  // nodes -- so an already-set CLIO_SERVER_CONF is left alone.
+  if (getenv("CLIO_SERVER_CONF") != nullptr) {
+    std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
+                getenv("CLIO_SERVER_CONF"));
+  } else {
     std::ofstream cfg("gv_weights_bench.yaml");
     cfg << "networking:\n  port: 9435\n\n"
         // first_busy_wait: workers that fall back to sleeping add their sleep to
@@ -257,8 +280,9 @@ int main(int argc, char **argv) {
       }
 
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
+    ctp::SystemInfo::Setenv("CLIO_SERVER_CONF",
+                            "gv_weights_bench.yaml", 1);
   }
-  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gv_weights_bench.yaml", 1);
 
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     std::fprintf(stderr, "bench: runtime init failed\n");
@@ -285,8 +309,13 @@ int main(int argc, char **argv) {
   const clio::run::u64 per = pages_per_block * page_elems;
   const clio::run::u64 n = per * blocks;
   const clio::run::u64 logical = n * sizeof(clio::run::u32);
+  // This node's offset into the GLOBAL model. Every node holds the same
+  // number of elements, so the slices are contiguous and non-overlapping.
+  const clio::run::u64 base_idx = static_cast<clio::run::u64>(node) * n;
   const std::string tag =
-      std::string("gvw_") + (compressed ? "lz4_" : "raw_") +
+      std::string("gvw_") + (nodes > 1 ? ("n" + std::to_string(node) + "_")
+                                       : std::string()) +
+      (compressed ? "lz4_" : "raw_") +
       std::to_string(blocks) + "_" + std::to_string(hbm_mb) + "_" +
       std::to_string(pages_per_block);
 
@@ -313,7 +342,7 @@ int main(int argc, char **argv) {
     const clio::run::u32 seed_rounds = sdrv.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           wt::LaunchSeed(g, b, gpu_info, vec.GetDevice(0), per, page_elems,
-                         flat_pct, view, sstack.View());
+                         flat_pct, base_idx, view, sstack.View());
         },
         // Abort the moment a writeback FAILS, rather than waiting out a
         // round cap. A failed put means the tier is full and the page stays
@@ -421,8 +450,33 @@ int main(int argc, char **argv) {
   unsigned *d_page_visits = nullptr;
   d_page_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_page_sum)>>(total_pages * sizeof(unsigned long long));
   d_page_visits = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_page_visits)>>(total_pages * sizeof(unsigned));
+  // This node's PARTIAL of the reference, over its own global slice. The
+  // per-node checksums are combined below and compared against the sum of
+  // the partials, so the gate covers the whole model rather than each
+  // node's shard in isolation.
+  // ---- cross-node reduction client ------------------------------------
+  // Built AFTER the runtime is up and ONLY when there is a reduction to do:
+  // a client constructed before CLIO_INIT dereferences a runtime that does
+  // not exist, and an unconditional second CTE client breaks single-node.
+  // The reduction tag is deliberately NOT per-node -- the model shards are
+  // private, but the partial checksums have to meet somewhere.
+  std::unique_ptr<clio::cte::core::Client> cte_red;
+  clio::cte::core::TagId red_tag{};
+  clio::run::u64 red_round = 0;
+  if (nodes > 1) {
+    cte_red = std::make_unique<clio::cte::core::Client>(
+        clio::cte::core::kCtePoolId);
+    auto t = cte_red->AsyncGetOrCreateTag("gv_weights_red");
+    t.Wait();
+    if (t->GetReturnCode() != 0) {
+      std::fprintf(stderr, "WEIGHTS ERROR: could not create reduction tag\n");
+      return 1;
+    }
+    red_tag = t->tag_id_;
+  }
+
   unsigned long long want = 0;
-  for (clio::run::u64 i = 0; i < n; ++i) {
+  for (clio::run::u64 i = base_idx; i < base_idx + n; ++i) {
     want += static_cast<unsigned long long>(Weight(i, flat_pct)) * Activation(i);
   }
 
@@ -492,7 +546,7 @@ int main(int argc, char **argv) {
           [&](dim3 g, dim3 b, gy::YieldableView<> view) {
             wt::LaunchWeights(g, b, gpu_info, vec.GetDevice(0), per,
                               page_elems, d_sum, d_page_sum, d_page_visits,
-                              view, ystack.View());
+                              base_idx, view, ystack.View());
           },
           []{},
           /*max_rounds=*/200000,
@@ -510,11 +564,30 @@ int main(int argc, char **argv) {
     const clio::run::u64 ms = NowMs() - t0;
     unsigned long long got = 0;
     ctp::GpuApi::Memcpy(&got, d_sum, sizeof(got));
-    if (got != want) {
+    // Combine the shards. `want` is this node's partial of the same
+    // global range, reduced the same way, so the comparison below covers
+    // the WHOLE model. Exact u64: a double would drop the low bits of a
+    // large checksum above 2^53 and quietly weaken the gate.
+    // `want` itself must NOT be overwritten: this block runs once per
+    // --repeat pass, and a reduced value fed back in would be reduced
+    // again on the next pass and fail a run that is correct.
+    unsigned long long got_all = got, want_all = want;
+    if (nodes > 1) {
+      unsigned long long pair[2] = {got, want};
+      if (!clio_bench_dist::ReduceSumU64(*cte_red, red_tag, node, nodes,
+                                         red_round++, pair, 2, "wtred")) {
+        std::fprintf(stderr, "WEIGHTS ERROR: checksum reduction failed\n");
+        return 1;
+      }
+      got_all = pair[0];
+      want_all = pair[1];
+    }
+    if (got_all != want_all) {
       ok = false;
       std::fprintf(stderr, "[cmp] got=%llu want=%llu ratio=%.4f\n",
-                   (unsigned long long) got, (unsigned long long) want,
-                   want ? (double) got / (double) want : 0.0);
+                   (unsigned long long) got_all,
+                   (unsigned long long) want_all,
+                   want_all ? (double) got_all / (double) want_all : 0.0);
       std::vector<unsigned long long> ps(total_pages);
       std::vector<unsigned> pv(total_pages);
       ctp::GpuApi::Memcpy(ps.data(), d_page_sum,

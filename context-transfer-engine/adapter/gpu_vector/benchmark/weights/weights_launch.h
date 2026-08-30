@@ -31,13 +31,14 @@ void InitBackend(u32 max_blocks, const GpuInfo &info);
 /** Write the synthetic model into the vector. Yieldable -- seeding is the
  *  phase that actually wedges, because every page it writes is dirty. */
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v, u64 per,
-                u64 page_elems, u32 flat_pct, View vw, StackView sv);
+                u64 page_elems, u32 flat_pct, u64 base_idx, View vw,
+                StackView sv);
 
 /** One inference sweep over the paged model. Yieldable. */
 void LaunchWeights(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v,
                    u64 per, u64 page_elems, unsigned long long *sum,
                    unsigned long long *page_sum, unsigned *page_visits,
-                   View vw, StackView sv);
+                   u64 base_idx, View vw, StackView sv);
 
 /** The staged-tile control: one launch per tile, nothing overlapped. */
 void LaunchBaseline(u32 threads, const u32 *tile, u64 gbase, u64 n,

@@ -50,21 +50,22 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v, u64 per,
-                u64 page_elems, u32 flat_pct, View vw, StackView sv) {
+                u64 page_elems, u32 flat_pct, u64 base_idx, View vw,
+                StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, v, vw, sv, [=](DevU32 dev, u32 blk) {
-    return SeedLaneCoro(dev, per, page_elems, flat_pct, blk);
+    return SeedLaneCoro(dev, per, page_elems, flat_pct, base_idx, blk);
   });
 }
 
 void LaunchWeights(dim3 grid, dim3 block, const GpuInfo &info, DevU32 v,
                    u64 per, u64 page_elems, unsigned long long *sum,
                    unsigned long long *page_sum, unsigned *page_visits,
-                   View vw, StackView sv) {
+                   u64 base_idx, View vw, StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, v, vw, sv, [=](DevU32 dev, u32 blk) {
     return WeightsLaneCoro(dev, per, page_elems, sum, page_sum, page_visits,
-                           blk);
+                           base_idx, blk);
   });
 }
 

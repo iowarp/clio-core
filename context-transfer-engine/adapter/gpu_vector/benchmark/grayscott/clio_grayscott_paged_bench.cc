@@ -238,7 +238,17 @@ int main(int argc, char **argv) {
   const double logical_mb =
       static_cast<double>(n * sizeof(float)) / (1024.0 * 1024.0);
 
-  {
+  // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
+  // one and Setenv-ing it with overwrite=1 unconditionally makes it
+  // impossible to point this bench at a cluster: any CLIO_SERVER_CONF the
+  // caller exported is clobbered a line later, so every node stands up its
+  // own single-host runtime on the same port and they collide. A distributed
+  // harness needs exactly that config -- one naming a hostfile and the other
+  // nodes -- so an already-set CLIO_SERVER_CONF is left alone.
+  if (getenv("CLIO_SERVER_CONF") != nullptr) {
+    std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
+                getenv("CLIO_SERVER_CONF"));
+  } else {
     std::ofstream cfg("gv_grayscott_bench.yaml");
     cfg << "networking:\n  port: 9441\n\n"
         << "runtime:\n  num_threads: 8\n  queue_depth: 8192\n"
