@@ -258,17 +258,23 @@ ARGS=(--deck "${DECK:-$HERE/in.melt}" --box "$BOX" --steps "$STEPS" --gap "$GAP"
 # the compressor needs STAGE_H2D to see a device pointer -- which is what makes
 # the quantizer reachable at all. See "Can LAMMPS be float32?" in README.md.
 if [ "$F32" = 1 ]; then
-  # --f32 downcasts on the HOST gather, so it is incompatible with the device
-  # gather --require-device selects. It sets REQUIRE_DEVICE itself and reaches
-  # the device through STAGE_H2D instead, which is what the quantizer needs.
-  if [ "$REQUIRE_DEVICE" = 1 ]; then
-    echo "--f32 and --require-device are mutually exclusive: --f32 gathers on" >&2
-    echo "the host and stages H2D (it sets REQUIRE_DEVICE=1 for you)." >&2
-    exit 2
-  fi
   ARGS+=(--f32)
-  export CLIO_NEUROPRESS_STAGE_H2D=1
-  export CLIO_NEUROPRESS_REQUIRE_DEVICE=1
+  if [ "$REQUIRE_DEVICE" = 1 ]; then
+    # GPU-RESIDENT float32. The gather kernel itself writes float
+    # (clio_lmp_device_gather_id_window_f32), so the payload is narrowed on
+    # the device, in the same store that was already writing the element.
+    # Nothing crosses PCIe and no STAGE_H2D is needed -- REQUIRE_DEVICE stays
+    # on and still refuses a host-resident chunk at the compressor.
+    :
+  else
+    # HOST float32, the original route: downcast during lammps_gather_atoms,
+    # then stage H2D so the compressor still sees a device pointer. Kept
+    # because it is the only float32 path for --order id, but it pays a real
+    # H2D per chunk that the device gather does not -- so its TIMINGS are not
+    # comparable with the device route's. Prefer --require-device.
+    export CLIO_NEUROPRESS_STAGE_H2D=1
+    export CLIO_NEUROPRESS_REQUIRE_DEVICE=1
+  fi
 fi
 
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
@@ -283,6 +289,7 @@ env CLIO_SERVER_CONF="$STORE/compose.yaml" \
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \
     ${BW:+CLIO_NEUROPRESS_COST_BW=$BW} \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=${MEASURE_DT:-1} \
+    CLIO_NEUROPRESS_MEASURE_QUALITY=${MEASURE_QUALITY:-1} \
     ${REQUIRE_DEVICE:+CLIO_NEUROPRESS_REQUIRE_DEVICE=$REQUIRE_DEVICE} \
     "${COST_ENV[@]}" \
     "$BIN" "${ARGS[@]}" > "$STORE/stdout.log" 2> "$STORE/runtime.log"

@@ -266,9 +266,26 @@ int clio_lmp_tags_consecutive(void *handle) {
  * a whole extra field of device memory. Device bandwidth either way -- nothing
  * here crosses PCIe.
  */
-int clio_lmp_device_gather_id_window(void *handle, const char *field,
-                                     double *dst_dev, long natoms,
-                                     long dst_elem_off, long dst_elem_count) {
+}  // extern "C" -- a template cannot have C linkage, so the generic gather
+   // below sits outside the block; the entry points that instantiate it
+   // reopen it.
+
+/* Generic in the DESTINATION element type so float32 costs no second copy.
+ *
+ * LAMMPS' state is double and stays double; `Dst` is what the compressor will
+ * read. With Dst=float the narrowing happens inside the gather kernel, on the
+ * device, in the same store that was already writing the element -- so a
+ * float32 run reads the same atom arrays, writes half the bytes, and never
+ * leaves the GPU. The alternative in this file's caller (--f32) downcasts
+ * during a HOST gather and then stages H2D, which is a round trip this avoids
+ * entirely.
+ *
+ * The `extern "C"` entry points below instantiate it; nothing else may, since
+ * the KOKKOS_LAMBDA bodies must be compiled by LAMMPS' own nvcc wrapper. */
+template <class Dst>
+static int GatherIdWindowT(void *handle, const char *field, Dst *dst_dev,
+                           long natoms, long dst_elem_off,
+                           long dst_elem_count) {
   LAMMPS *lmp = KokkosLammps(handle);
   if (!lmp || !field || !dst_dev || natoms <= 0) return 1;
   if (!clio_lmp_tags_consecutive(handle)) return 2;
@@ -286,7 +303,7 @@ int clio_lmp_device_gather_id_window(void *handle, const char *field,
 
   // Unmanaged: Clio owns these bytes (a registered kDeviceMem backend), so the
   // View must never take a reference to them.
-  using DstView = Kokkos::View<double *, LMPDeviceType,
+  using DstView = Kokkos::View<Dst *, LMPDeviceType,
                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   DstView dst(dst_dev, static_cast<size_t>(dst_elem_count));
 
@@ -300,12 +317,12 @@ int clio_lmp_device_gather_id_window(void *handle, const char *field,
   Kokkos::parallel_for(
       "clio_gather_zero",
       Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<size_t>(dst_elem_count)),
-      KOKKOS_LAMBDA(const size_t k) { dst(k) = 0.0; });
+      KOKKOS_LAMBDA(const size_t k) { dst(k) = static_cast<Dst>(0); });
 
   // One body, three fields. A macro rather than three copies of the window
   // arithmetic: getting the bound test wrong in one of them would corrupt a
   // single field in a way only a digest catches.
-#define CLIO_LMP_GATHER_WINDOW(SRCVIEW, NAME)                                do {                                                                         auto src = (SRCVIEW);                                                      Kokkos::parallel_for(                                                          NAME, Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),                       KOKKOS_LAMBDA(const int i) {                                                 const size_t off = static_cast<size_t>(tag(i) - 1) * 3;                    for (int c = 0; c < 3; ++c) {                                                const size_t g = off + static_cast<size_t>(c);                             if (g >= lo && g < hi) dst(g - lo) = src(i, c);                          }                                                                        });                                                                  } while (0)
+#define CLIO_LMP_GATHER_WINDOW(SRCVIEW, NAME)                                do {                                                                         auto src = (SRCVIEW);                                                      Kokkos::parallel_for(                                                          NAME, Kokkos::RangePolicy<LMPDeviceType>(0, nlocal),                       KOKKOS_LAMBDA(const int i) {                                                 const size_t off = static_cast<size_t>(tag(i) - 1) * 3;                    for (int c = 0; c < 3; ++c) {                                                const size_t g = off + static_cast<size_t>(c);                             if (g >= lo && g < hi)                                                       dst(g - lo) = static_cast<Dst>(src(i, c));                          }                                                                        });                                                                  } while (0)
 
   if (std::strcmp(field, "x") == 0) {
     CLIO_LMP_GATHER_WINDOW(lmp->atomKK->k_x.view<LMPDeviceType>(), "clio_gather_x");
@@ -326,13 +343,39 @@ int clio_lmp_device_gather_id_window(void *handle, const char *field,
   return 0;
 }
 
+extern "C" {
+
+/** Windowed gather, float64 -- the original entry point, unchanged. */
+int clio_lmp_device_gather_id_window(void *handle, const char *field,
+                                     double *dst_dev, long natoms,
+                                     long dst_elem_off, long dst_elem_count) {
+  return GatherIdWindowT<double>(handle, field, dst_dev, natoms, dst_elem_off,
+                                 dst_elem_count);
+}
+
+/** Windowed gather, float32. Same kernel, narrowing on the device. */
+int clio_lmp_device_gather_id_window_f32(void *handle, const char *field,
+                                         float *dst_dev, long natoms,
+                                         long dst_elem_off,
+                                         long dst_elem_count) {
+  return GatherIdWindowT<float>(handle, field, dst_dev, natoms, dst_elem_off,
+                                dst_elem_count);
+}
+
 /** Whole-field gather: the window is the field. Kept because the sibling
  *  step-trace example and the staged path still ask for one. */
 int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
                               long natoms) {
-  return clio_lmp_device_gather_id_window(handle, field, dst_dev, natoms,
-                                          /*dst_elem_off=*/0,
-                                          /*dst_elem_count=*/natoms * 3);
+  return GatherIdWindowT<double>(handle, field, dst_dev, natoms,
+                                 /*dst_elem_off=*/0,
+                                 /*dst_elem_count=*/natoms * 3);
+}
+
+int clio_lmp_device_gather_id_f32(void *handle, const char *field,
+                                  float *dst_dev, long natoms) {
+  return GatherIdWindowT<float>(handle, field, dst_dev, natoms,
+                                /*dst_elem_off=*/0,
+                                /*dst_elem_count=*/natoms * 3);
 }
 
 }  // extern "C"

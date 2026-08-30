@@ -102,6 +102,15 @@ int clio_lmp_device_gather_id(void *handle, const char *field, double *dst_dev,
 int clio_lmp_device_gather_id_window(void *handle, const char *field,
                                      double *dst_dev, long natoms,
                                      long dst_elem_off, long dst_elem_count);
+/* The same two gathers writing float32. LAMMPS' state stays double; the
+   narrowing happens inside the gather kernel, so --f32 --order device reads
+   the same atom arrays, writes half the bytes and never leaves the GPU. */
+int clio_lmp_device_gather_id_f32(void *handle, const char *field,
+                                  float *dst_dev, long natoms);
+int clio_lmp_device_gather_id_window_f32(void *handle, const char *field,
+                                         float *dst_dev, long natoms,
+                                         long dst_elem_off,
+                                         long dst_elem_count);
 }
 
 namespace {
@@ -565,10 +574,13 @@ int main(int argc, char **argv) {
   // type, and float64 bytes read that way are largely non-finite, so it
   // declines. Handing it real float32 is the difference between an error bound
   // that applies and one that is silently inert.
-  if (opt.f32 && opt.order != "id") {
-    std::cerr << "--f32 is implemented on the host gather only; pass "
-                 "--order id (and CLIO_NEUROPRESS_STAGE_H2D=1 if the "
-                 "compressor must see a device pointer)\n";
+  // --order device now downcasts IN THE GATHER KERNEL, so --f32 no longer
+  // implies a host round trip. `raw` is still incompatible: it hands over
+  // Atom::x/v/f themselves, which are double and are not ours to narrow.
+  if (opt.f32 && opt.order == "raw") {
+    std::cerr << "--f32 cannot be combined with --order raw: that order hands "
+                 "the compressor LAMMPS' own double arrays, with no gather to "
+                 "narrow in. Use --order device (GPU) or --order id (host).\n";
     return 1;
   }
   const size_t elem_size = opt.f32 ? sizeof(float) : sizeof(double);
@@ -729,8 +741,7 @@ int main(int argc, char **argv) {
           // The OLD path, kept only so it can be measured against the new
           // one: gather the whole field into scratch, then copy each chunk
           // out of it below. That copy is payload-sized and does no work.
-          auto *scratch =
-              static_cast<double *>(clio_lmp_device_scratch(field_bytes));
+          auto *scratch = clio_lmp_device_scratch(field_bytes);
           if (scratch == nullptr) {
             std::cerr << "--order device: could not allocate " << field_bytes
                       << " B of device scratch for the ID gather\n";
@@ -742,7 +753,12 @@ int main(int argc, char **argv) {
           // host bytes. This is what keeps crosscheck_h5md.sh meaningful for
           // this order.
           const int grc =
-              clio_lmp_device_gather_id(lmp, f->lmp_name, scratch, natoms);
+              opt.f32 ? clio_lmp_device_gather_id_f32(
+                            lmp, f->lmp_name, static_cast<float *>(scratch),
+                            natoms)
+                      : clio_lmp_device_gather_id(
+                            lmp, f->lmp_name, static_cast<double *>(scratch),
+                            natoms);
           if (grc != 0) {
             std::cerr << "--order device: ID gather of '" << f->lmp_name
                       << "' failed (rc=" << grc << ") at step " << step << "\n";
@@ -839,14 +855,22 @@ int main(int argc, char **argv) {
             // any. Naming the destination window removes both the copy and
             // the scratch field.
             //
-            // The window is in field ELEMENTS (doubles), not bytes: `off` and
-            // `n` are byte quantities and a chunk boundary is always a
-            // multiple of sizeof(double) because the chunk size is and the
-            // field is an array of doubles.
-            const int grc = clio_lmp_device_gather_id_window(
-                lmp, f->lmp_name, reinterpret_cast<double *>(registered),
-                natoms, static_cast<long>(off / sizeof(double)),
-                static_cast<long>(n / sizeof(double)));
+            // The window is in field ELEMENTS, not bytes: `off` and `n` are
+            // byte quantities and a chunk boundary is always a multiple of
+            // the element size because the chunk size is and the field is an
+            // array of them. elem_size, not sizeof(double), because --f32
+            // makes the field an array of floats.
+            const long win_off = static_cast<long>(off / elem_size);
+            const long win_n = static_cast<long>(n / elem_size);
+            const int grc =
+                opt.f32 ? clio_lmp_device_gather_id_window_f32(
+                              lmp, f->lmp_name,
+                              reinterpret_cast<float *>(registered), natoms,
+                              win_off, win_n)
+                        : clio_lmp_device_gather_id_window(
+                              lmp, f->lmp_name,
+                              reinterpret_cast<double *>(registered), natoms,
+                              win_off, win_n);
             if (grc != 0) {
               std::cerr << "--order device: windowed ID gather of '"
                         << f->lmp_name << "' chunk " << ci << " failed (rc="
