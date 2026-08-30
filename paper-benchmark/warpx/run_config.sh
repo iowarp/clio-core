@@ -212,7 +212,12 @@ STORE=$RESULTS/$NAME
 rm -rf "$STORE"; mkdir -p "$STORE"
 bench_compose "$STORE"
 # HDF5 finds the connector by name under HDF5_PLUGIN_PATH.
-ln -sf "$VOL_SO" "$STORE/"
+# NOT `ln -sf "$VOL_SO" "$STORE/"`. GNU ln resolves a trailing-slash
+# destination to <dir>/<basename src> on xfs/ext4, but on LUSTRE it
+# refuses with "cannot overwrite directory" -- so the workload ran from
+# /tmp and failed wherever results actually belong on this machine.
+# Naming the link explicitly behaves the same everywhere.
+ln -sf "$VOL_SO" "$STORE/$(basename "$VOL_SO")"
 
 echo "== $NAME: WarpX ${NCELL// /x}, $STEPS steps, diag every $INTERVAL, chunk $CHUNK, port $PORT"
 
@@ -233,6 +238,7 @@ set +e
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \
     ${BW:+CLIO_NEUROPRESS_COST_BW=$BW} \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT=${MEASURE_DT:-1} \
+    CLIO_NEUROPRESS_MEASURE_QUALITY=${MEASURE_QUALITY:-1} \
     ${REQUIRE_DEVICE:+CLIO_NEUROPRESS_REQUIRE_DEVICE=$REQUIRE_DEVICE} \
     ${STAGE_H2D:+CLIO_NEUROPRESS_STAGE_H2D=$STAGE_H2D} \
     ${RATIO_CAP:+CLIO_NEUROPRESS_RATIO_CAP=$RATIO_CAP} \
