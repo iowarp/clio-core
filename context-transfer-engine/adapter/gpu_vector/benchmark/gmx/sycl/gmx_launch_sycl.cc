@@ -50,11 +50,12 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
-                u64 K, u64 plane, u64 zper, View vw, StackView sv) {
+                u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, mesh, vw, sv, [=](DevMesh dev, u32 blk) {
-    const u64 z0 = static_cast<u64>(blk) * zper;
-    const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
     return ZeroCoro(dev, plane, z0, z1);
   });
 }
@@ -62,22 +63,23 @@ void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
 void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
-                  u64 zper, View vw, StackView sv) {
+                  u64 zper, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, mesh, vw, sv, [=](DevMesh dev, u32 blk) {
-    const u64 z0 = static_cast<u64>(blk) * zper;
-    const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
     return SpreadCoro(dev, ax, ay, az, aq, bin_start, K, plane, z0, z1);
   });
 }
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
-               u64 plane, u64 zper, unsigned long long *out, View vw,
+               u64 plane, u64 zper, unsigned long long *out, u64 zbase, u64 zend, View vw,
                StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, mesh, vw, sv, [=](DevMesh dev, u32 blk) {
-    const u64 z0 = static_cast<u64>(blk) * zper;
-    const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
     return SumCoro(dev, K, plane, z0, z1, out);
   });
 }
@@ -85,11 +87,12 @@ void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
 void LaunchGather(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
-                  u64 bper, unsigned long long *out, View vw, StackView sv) {
+                  u64 bper, unsigned long long *out, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, mesh, vw, sv, [=](DevMesh dev, u32 blk) {
-    const u64 b0 = static_cast<u64>(blk) * bper;
-    const u64 b1 = (b0 + bper < K) ? (b0 + bper) : K;
+    const u64 b0 = zbase + static_cast<u64>(blk) * bper;
+    const u64 b1 = (b0 + bper < zend) ? (b0 + bper) : zend;
     return GatherCoro(dev, ax, ay, az, aq, bin_start, K, plane, b0, b1, out);
   });
 }

@@ -16,38 +16,40 @@ namespace clio::gv_bench::gmx {
 namespace {
 
 __global__ GV_LAUNCH_BOUNDS void ZeroKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
-                           u64 zper, View yv, StackView ys) {
+                           u64 zper, u64 zbase, u64 zend, View yv,
+                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+  const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
+  const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
   CLIO_YCORO_RUN(ZeroCoro(mesh, plane, z0, z1));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SpreadKernel(GpuInfo info, DevMesh mesh, const float *ax,
                              const float *ay, const float *az,
                              const long long *aq, const u32 *bin_start, u64 K,
-                             u64 plane, u64 zper, View yv, StackView ys) {
+                             u64 plane, u64 zper, u64 zbase, u64 zend, View yv,
+                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+  const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
+  const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
   CLIO_YCORO_RUN(SpreadCoro(mesh, ax, ay, az, aq, bin_start, K, plane, z0, z1));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SumKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
-                          u64 zper, unsigned long long *out, View yv,
+                          u64 zper, unsigned long long *out, u64 zbase, u64 zend, View yv,
                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  const u64 z0 = static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+  const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
+  const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
   CLIO_YCORO_RUN(SumCoro(mesh, K, plane, z0, z1, out));
 }
 
@@ -55,13 +57,14 @@ __global__ GV_LAUNCH_BOUNDS void GatherKernel(GpuInfo info, DevMesh mesh, const 
                              const float *ay, const float *az,
                              const long long *aq, const u32 *bin_start, u64 K,
                              u64 plane, u64 bper, unsigned long long *out,
-                             View yv, StackView ys) {
+                             u64 zbase, u64 zend, View yv,
+                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  const u64 b0 = static_cast<u64>(yv.Block()) * bper;
-  const u64 b1 = (b0 + bper < K) ? (b0 + bper) : K;
+  const u64 b0 = zbase + static_cast<u64>(yv.Block()) * bper;
+  const u64 b1 = (b0 + bper < zend) ? (b0 + bper) : zend;
   CLIO_YCORO_RUN(GatherCoro(mesh, ax, ay, az, aq, bin_start, K, plane, b0, b1,
                             out));
 }
@@ -96,32 +99,37 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
-                u64 K, u64 plane, u64 zper, View vw, StackView sv) {
-  ZeroKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, mesh, K, plane,
-                                                     zper, vw, sv);
+                u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
+  ZeroKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, mesh, K, plane, zper, zbase, zend, vw, sv);
 }
 
 void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
-                  u64 zper, View vw, StackView sv) {
+                  u64 zper, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
   SpreadKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
-      info, mesh, ax, ay, az, aq, bin_start, K, plane, zper, vw, sv);
+      info, mesh, ax, ay, az, aq, bin_start, K, plane, zper, zbase, zend,
+      vw, sv);
 }
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
-               u64 plane, u64 zper, unsigned long long *out, View vw,
+               u64 plane, u64 zper, unsigned long long *out, u64 zbase, u64 zend, View vw,
                StackView sv) {
-  SumKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, mesh, K, plane, zper,
-                                                    out, vw, sv);
+  SumKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, mesh, K, plane, zper, out, zbase, zend, vw, sv);
 }
 
 void LaunchGather(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
-                  u64 bper, unsigned long long *out, View vw, StackView sv) {
+                  u64 bper, unsigned long long *out, u64 zbase, u64 zend, View vw,
+                  StackView sv) {
   GatherKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
-      info, mesh, ax, ay, az, aq, bin_start, K, plane, bper, out, vw, sv);
+      info, mesh, ax, ay, az, aq, bin_start, K, plane, bper, out, zbase,
+      zend, vw, sv);
 }
 
 void LaunchDenseSpread(u32 blocks, u32 threads, unsigned long long *mesh,

@@ -47,6 +47,14 @@ deck() {
       # Measured 2-node/1-node ratio for this deck: 2.00002 -- not 1.0 (no
       # reduction) and not exactly 2.0 (both nodes on the same shard).
       WITNESS='checksum_total=([0-9]+)' ;;
+    gmx)
+      BENCH=clio_gmx_paged_bench
+      ARGS="--page-kb 32 --atoms 20000 --repeat 1"
+      # Fixed-point science: CONSERVATION, MESH and GATHER are all bit-exact,
+      # so this gate needs no tolerance at any node count. That also makes it
+      # the loudest of the three -- a stale mesh page or a double-counted bin
+      # fails outright rather than drifting.
+      KEY='(ALL GATES PASS)'; TOL=exact ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
@@ -116,7 +124,7 @@ run_one() {
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
-  for wl in kmeans weights; do run_one "$wl" || rc=1; done
+  for wl in kmeans weights gmx; do run_one "$wl" || rc=1; done
   exit $rc
 fi
 run_one "$TARGET"
