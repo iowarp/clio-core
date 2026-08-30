@@ -98,6 +98,16 @@ run_one() {
   done
   kill "$logs_pid" 2>/dev/null || true
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  # A workload whose multi-node path is deliberately refused is NOT a pass and
+  # NOT a failure: it is an uncovered gap, and it has to read as one. Counting
+  # it green would hide it; counting it red would make the suite permanently
+  # noisy and train people to ignore it.
+  if grep -q 'Refusing' "/tmp/gvw_${wl}_dist.log" 2>/dev/null; then
+    echo "  $wl NOT YET SUPPORTED -- the bench refuses --nodes > 1:"
+    grep -h 'ERROR:' "/tmp/gvw_${wl}_dist.log" | head -1 | sed 's/^/    /'
+    UNSUPPORTED="$UNSUPPORTED $wl"
+    return 0
+  fi
   [ "$rc" -eq 0 ] || { echo "  DISTRIBUTED RUN FAILED"; tail -25 "/tmp/gvw_${wl}_dist.log"; return 1; }
 
   local got; got="$(extract "$KEY" "/tmp/gvw_${wl}_dist.log")"
@@ -131,10 +141,16 @@ run_one() {
   echo "  $wl OK"
 }
 
+UNSUPPORTED=""
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
   for wl in kmeans weights gmx grayscott; do run_one "$wl" || rc=1; done
+  echo
+  echo "=== summary"
+  echo "  validated distributed: kmeans weights gmx"
+  [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
+  echo "  no --nodes at all:     lbann"
   exit $rc
 fi
 run_one "$TARGET"

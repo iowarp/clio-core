@@ -120,6 +120,10 @@ class YieldRunner {
 
 int main(int argc, char **argv) {
   u32 blocks = 8, threads = 256, cap = 0;
+  // MODEL-PARALLEL, like the MPI edition: a node owns a contiguous band of
+  // h-rows of W1 and o-rows of W2, and updates only those in place. What
+  // crosses the wire is the activations and deltas, not the weights.
+  u32 nodes = 1, node = 0;
   u64 page_kb = 64, I = 256, H = 4096, O = 64, B = 64, steps = 5;
   float lr = 0.01f;
   for (int i = 1; i < argc; ++i) {
@@ -128,6 +132,8 @@ int main(int argc, char **argv) {
       return (i + 1 < argc) ? std::strtoull(argv[++i], nullptr, 10) : 0;
     };
     if (a == "--blocks") blocks = static_cast<u32>(next());
+    else if (a == "--nodes") nodes = static_cast<u32>(next());
+    else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--cap") cap = static_cast<u32>(next());
     else if (a == "--page-kb") page_kb = next();
@@ -177,7 +183,43 @@ int main(int argc, char **argv) {
                  (unsigned long long)rpp1, (unsigned long long)rpp2, blocks);
     return 2;
   }
-  const u64 hper = H / blocks, oper = O / blocks;
+  if (node >= nodes) {
+    std::fprintf(stderr, "LBANN ERROR: --node %u out of range for "
+                 "--nodes %u\n", node, nodes);
+    return 2;
+  }
+  // The node's band. H and O must split evenly across nodes AND blocks, or
+  // a row belongs to nobody and the layer is silently smaller than it says.
+  if (nodes > 1 && (H % nodes != 0 || O % nodes != 0)) {
+    std::fprintf(stderr, "LBANN ERROR: H=%llu and O=%llu must divide "
+                 "--nodes %u\n", (unsigned long long)H,
+                 (unsigned long long)O, nodes);
+    return 2;
+  }
+  // MULTI-NODE IS REFUSED until the three exchanges exist. The band split
+  // below is in place and single-node is byte-identical through it (h0=0,
+  // h1=H collapses to the old expression), but model parallelism here also
+  // needs, every step:
+  //   a1  all-gathered after Fwd1 -- Fwd2 reads every h-row, not just ours
+  //   d2  all-gathered after Fwd2 -- Bwd1 reads every o-row
+  //   d1  all-REDUCED after Bwd1  -- it is a sum over o-rows, so each node
+  //       holds a partial, not a slice
+  // Without them each node trains on a third of a network and the WEIGHT
+  // gate would compare against a dense reference that saw all of it.
+  // Gathering via ReduceSum needs the non-owned rows zeroed first, so it
+  // is not a one-liner and is not worth guessing at.
+  if (nodes > 1) {
+    std::fprintf(stderr,
+                 "LBANN ERROR: --nodes %u requested, but the a1/d2 "
+                 "all-gather and d1 all-reduce are not implemented; each "
+                 "node would train on its own band only. Refusing.\n",
+                 nodes);
+    return 2;
+  }
+  const u64 h0 = (H / nodes) * node, h1 = h0 + H / nodes;
+  const u64 o0 = (O / nodes) * node, o1 = o0 + O / nodes;
+  // Blocks subdivide this node's band, not the whole layer.
+  const u64 hper = (h1 - h0) / blocks, oper = (o1 - o0) / blocks;
 
   // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
   // one and Setenv-ing it with overwrite=1 unconditionally makes it
@@ -301,32 +343,34 @@ int main(int argc, char **argv) {
                    gy::YieldStackView sv) {
       lb::LaunchFwd1(g, b, gpu, dw, w1_off, b1_off, I,
                                                   H, B, d_x, d_a1, hper, rpp1,
-                                                  vw, sv);
+                                                  h0, h1, vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchFwd2(g, b, gpu, dw, w2_off, b2_off, H,
                                                   O, B, d_a1, d_y, d_d2, d_lp,
-                                                  oper, rpp2 ? rpp2 : 1, vw,
-                                                  sv);
+                                                  oper, rpp2 ? rpp2 : 1, o0, o1,
+                                                  vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchBwd1(g, b, gpu, dw, w2_off, H, O, B,
                                                   d_a1, d_d2, d_d1, hper,
-                                                  rpp2 ? rpp2 : 1, vw, sv);
+                                                  rpp2 ? rpp2 : 1, h0, h1,
+                                                  vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd2(g, b, gpu, dw, w2_off, b2_off, H,
                                                   O, B, d_a1, d_d2, lr, oper,
-                                                  rpp2 ? rpp2 : 1, vw, sv);
+                                                  rpp2 ? rpp2 : 1, o0, o1,
+                                                  vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd1(g, b, gpu, dw, w1_off, b1_off, I,
                                                   H, B, d_x, d_d1, lr, hper,
-                                                  rpp1, vw, sv);
+                                                  rpp1, h0, h1, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     loss_got[s] = host_loss();

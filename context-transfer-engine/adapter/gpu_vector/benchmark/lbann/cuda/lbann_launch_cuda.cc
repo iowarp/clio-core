@@ -26,29 +26,29 @@ namespace {
   }
 
 LB_KERNEL(Fwd1,
-          Fwd1Coro(w, w1_off, b1_off, I, H, B, x, a1, static_cast<u64>(yv.Block()) * hper,
-                          ((static_cast<u64>(yv.Block()) + 1) * hper < H) ? (static_cast<u64>(yv.Block()) + 1) * hper : H, rpp),
-          u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp)
+          Fwd1Coro(w, w1_off, b1_off, I, H, B, x, a1, rbase + static_cast<u64>(yv.Block()) * hper,
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp),
+          u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Fwd2,
-          Fwd2Coro(w, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, static_cast<u64>(yv.Block()) * oper,
-                          ((static_cast<u64>(yv.Block()) + 1) * oper < O) ? (static_cast<u64>(yv.Block()) + 1) * oper : O, rpp),
-          u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp)
+          Fwd2Coro(w, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, rbase + static_cast<u64>(yv.Block()) * oper,
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * oper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * oper) : rend, rpp),
+          u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Bwd1,
-          Bwd1Coro(w, w2_off, H, O, B, a1, d2, d1, static_cast<u64>(yv.Block()) * hper,
-                          ((static_cast<u64>(yv.Block()) + 1) * hper < H) ? (static_cast<u64>(yv.Block()) + 1) * hper : H, rpp),
-          u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp)
+          Bwd1Coro(w, w2_off, H, O, B, a1, d2, d1, rbase + static_cast<u64>(yv.Block()) * hper,
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp),
+          u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Upd2,
-          Upd2Coro(w, w2_off, b2_off, H, O, B, a1, d2, lr, static_cast<u64>(yv.Block()) * oper,
-                          ((static_cast<u64>(yv.Block()) + 1) * oper < O) ? (static_cast<u64>(yv.Block()) + 1) * oper : O, rpp),
-          u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp)
+          Upd2Coro(w, w2_off, b2_off, H, O, B, a1, d2, lr, rbase + static_cast<u64>(yv.Block()) * oper,
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * oper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * oper) : rend, rpp),
+          u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Upd1,
-          Upd1Coro(w, w1_off, b1_off, I, H, B, x, d1, lr, static_cast<u64>(yv.Block()) * hper,
-                          ((static_cast<u64>(yv.Block()) + 1) * hper < H) ? (static_cast<u64>(yv.Block()) + 1) * hper : H, rpp),
-          u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp)
+          Upd1Coro(w, w1_off, b1_off, I, H, B, x, d1, lr, rbase + static_cast<u64>(yv.Block()) * hper,
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp),
+          u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Seed,
           SeedCoro(w, n, static_cast<u64>(yv.Block()) * eper,
@@ -102,37 +102,37 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp,
+                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend,
                  View vw, StackView sv) {
-  Fwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1_off, I, H, B, x, a1, hper, rpp, vw,
+  Fwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1_off, I, H, B, x, a1, hper, rpp, rbase, rend, vw,
                                                   sv);
 }
 
 void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp,
+                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend,
                  View vw, StackView sv) {
-  Fwd2Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, oper, rpp, vw,
+  Fwd2Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, oper, rpp, rbase, rend, vw,
                                                   sv);
 }
 
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp,
+                 u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend,
                  View vw, StackView sv) {
-  Bwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, H, O, B, a1, d2, d1, hper, rpp, vw,
+  Bwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, H, O, B, a1, d2, d1, hper, rpp, rbase, rend, vw,
                                                   sv);
 }
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp,
+                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend,
                  View vw, StackView sv) {
-  Upd2Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, b2_off, H, O, B, a1, d2, lr, oper, rpp, vw,
+  Upd2Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, b2_off, H, O, B, a1, d2, lr, oper, rpp, rbase, rend, vw,
                                                   sv);
 }
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp,
+                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend,
                  View vw, StackView sv) {
-  Upd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1_off, I, H, B, x, d1, lr, hper, rpp, vw,
+  Upd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1_off, I, H, B, x, d1, lr, hper, rpp, rbase, rend, vw,
                                                   sv);
 }
 
