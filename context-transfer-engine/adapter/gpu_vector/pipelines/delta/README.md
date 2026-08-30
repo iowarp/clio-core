@@ -167,6 +167,111 @@ Three separate things had to be true, and none is the default:
 **nccl** — measured 6/6 and 1/1. It is only NVSHMEM that forces OpenMPI, and
 running the whole matrix on one MPI is worth more than mixing two.)
 
+## Substrate comparison: kmeans at 32 GB
+
+Driven by `clio_gv_kmeans` (one package per benchmark) through
+`gv_kmeans_substrate_a100.yaml`, at MATCHED geometry -- same problem, same
+blocks, same threads, `--repeat 1`, `iters=20` -- on one A100.
+
+ms per iteration:
+
+| blocks | paged | mpi | nvshmem | paged/mpi |
+|---|---|---|---|---|
+| 32 | 7740.5 | 6988.0 | 6741.1 | 1.11 |
+| **64** | **6160.3** | **6142.1** | 5941.1 | **1.003** |
+| 128 | 11708.7 | 6528.3 | 6441.0 | 1.79 |
+| 256 | 8940.9 | 5801.2 | 5676.4 | 1.54 |
+| 512 | 7190.5 | 5996.7 | 5723.7 | 1.20 |
+
+**At 64 blocks the paged vector is within 0.3% of MPI**; best-to-best it is
+6% (6160 vs 5801). Earlier figures of 3.9x / 18.9x / 40x came from an
+UNCONTROLLED comparison in which the paged side was pinned to 32 blocks by
+a sweep ladder while each baseline used its own default (the MPI editions
+default to `blocks=64, threads=256`). Those numbers were launch geometry,
+not the vector. That is the whole reason `clio_gv_workload` was replaced
+here.
+
+### Why paged degrades above 108 blocks: wave quantization
+
+The paged coroutine kernels measure REG=192, so on a 65536-register SM only
+`65536/(192*256) = 1` block per SM is resident -- 108 blocks on this GPU,
+12.5% occupancy. Asking for more does not raise occupancy, it adds WAVES,
+and a partial final wave idles most of the device. Total work is fixed, so
+time should scale as `waves/blocks`:
+
+| blocks | waves | waves/blocks (norm 512) | measured (norm 512) |
+|---|---|---|---|
+| 128 | 2 | 1.600 | 1.628 |
+| 256 | 3 | 1.200 | 1.243 |
+| 512 | 5 | 1.000 | 1.000 |
+
+Within 3.6% -- that is the entire >108 curve, including why 128 blocks is
+the WORST point (its second wave carries 20 blocks on 108 SMs) and why it
+recovers monotonically to 512. Faults are not the driver: they FALL
+(4439 -> 3144 -> 2256) while time falls, at ~0.7% of page touches.
+
+MPI shows no such effect because REG=32 gives it 8 blocks/SM = 864
+resident, so 128-512 blocks all fit one wave. Same workload, same geometry;
+the difference is register pressure.
+
+Below 108 blocks something else dominates -- 64 blocks (59% of SMs) BEATS
+108 (100% of SMs) with zero faults at both, which the wave model does not
+explain. For k-means the likely cause is contention on the shared 16
+centroids x 32 dims reduction, but that is unconfirmed.
+
+### Register pressure, and what `__launch_bounds__` does about it
+
+`cmake/ClioCoroRegCap.cmake` explains the mechanism: NVPTX has no tail
+calls, so CoroSplit merges every resume segment into one function and the
+register allocator takes the LIVENESS UNION across all suspend points. The
+count is therefore near-independent of the kernel body.
+
+`clio_lammps_md_paged_bench` is the only paged bench at 64 registers, and
+the only one whose kernels carry `__launch_bounds__` (md_common.h:
+`MD_LB_THREADS=256`, `MD_LB_BLOCKS=4`). An A/B on that single TU, with the
+regcap pass stripped so the annotation is isolated:
+
+```
+MD_LB_BLOCKS=4  (__launch_bounds__(256,4))  ->  REG=64    STACK:16  LOCAL:0
+MD_LB_BLOCKS=0  (compiled out)              ->  REG=192   STACK:16  LOCAL:0
+```
+
+So 192 is what the coroutine lowering produces for BOTH workloads, and the
+annotation is what cuts it -- to exactly `65536/(256*4) = 64`, with no
+local-memory spill. It is not a guarantee: `__launch_bounds__` lowers to
+`.maxntid`/`.minnctapersm` and ptxas may exceed the request, and the cap is
+architecture-relative (it fixes an OCCUPANCY target, which is 64 registers
+only on a 65536-register SM).
+
+`clio_coro_regcap()` is the measured belt-and-braces version, also wired
+only to lammps_md. It is a silent no-op unless `llvm-config` is findable,
+which it was not here until env.sh started exporting
+`CLIO_DELTA_LLVM_CONFIG` -- clang is referenced by absolute path precisely
+so LLVM's bin stays off PATH.
+
+Untried: `__launch_bounds__(256, 4)` on the other five paged benches.
+Registers are verifiable statically in seconds; whether it makes anything
+FASTER is a separate question, since kmeans at 32 GB looks
+bandwidth-bound (all three substrates converge to 5700-6200 ms/iter at
+their best). The confident prediction is only that it removes the
+128-block cliff, by taking residency from 108 to 432.
+
+### Checksums are block-count sensitive on EVERY substrate
+
+| blocks | mpi | nvshmem | paged |
+|---|---|---|---|
+| 32 | 5601.878 | 5744.866 | 5841.250 |
+| 64 | 5744.866 | 5744.866 | 5756.924 |
+| 128 | 5799.815 | 5744.866 | 5809.408 |
+| 256 | 6267.482 | 6085.158 | 5807.762 |
+| 512 | 5718.794 | 6020.632 | 5858.314 |
+
+MPI varies as much as anything else (5602-6267, +-5.6%), so this is NOT an
+NVSHMEM defect as an earlier partial dataset suggested. Reduction order and
+seeding evidently depend on block count. Until that is understood,
+`centroid_checksum` cannot gate correctness ACROSS block counts -- only
+within one.
+
 ## Status
 
 Built and run against clang 19.1.7 / CUDA 12.6.3 / sm_80, on an

@@ -1,0 +1,96 @@
+# The paged half of the 32 GB substrate comparison, at 100 steps.
+#
+# Pairs with gv_anchor32_mpi_a100.yaml: same problems, same GPU, same step
+# count, so the two results.csv files can be read side by side.
+#
+# WHY 100 STEPS. At 1-4 steps the paged numbers were dominated by a ONE-SHOT
+# 32 GB ingest that MPI never pays. The counters said so unambiguously:
+#
+#   weights    faults=32000  evicts=0  puts=0      (32000 pages -> 1 fault each)
+#   grayscott  faults=16000  evicts=0  puts=64000
+#   kmeans     faults=0      evicts=0  puts=0
+#
+# evicts=0 EVERYWHERE means there was no capacity pressure at all -- the
+# cache is 32768 MB against a 32 GB problem, i.e. exactly residency, so
+# every fault is a compulsory first-touch miss rather than a capacity miss.
+# 100 steps amortises that cold ingest and leaves the steady-state cost,
+# which is the number worth comparing.
+#
+# ONE WORKLOAD PER JOB. At 100 steps a single cell runs ~8 min (kmeans was
+# 4949 ms/iter, grayscott 5135 ms/step), so four cells cannot share a
+# 10-minute allocation. Select the workload by editing wl.workload below --
+# and since the scheduler charges the REQUEST, not the usage, keep `time`
+# matched to the one workload you are running rather than the worst of four.
+#
+# NOTE the cache ladder is pinned at its top rung here (cache_level 4 =
+# 32768 MB = residency). That is deliberate for a substrate comparison, but
+# it is also the LEAST interesting rung of the memory-pressure sweep: it is
+# the one setting where the vector never has to make a replacement decision.
+# The tighter rungs are what gv_memory_pressure_a100_1n.yaml is for.
+#
+# Submit:  jarvis ppl submit gv_anchor32_paged_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:12:00"
+  job_name: gv_anchor32_paged
+  output: /u/llogan/gv_job_logs/gv_anchor32_paged-%j.out
+  error: /u/llogan/gv_job_logs/gv_anchor32_paged-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_anchor32_paged_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: weights
+      variant: paged
+      cache_level: 4
+      blocks_level: 3
+      prefault: "0"
+      # Below the 12 min request by enough to leave room for the 32.5 GB
+      # RAM-tier prefault (~40-65 s measured) and teardown.
+      timeout_sec: 600
+      output_dir: /tmp/clio_gv/anchor32_paged
+
+vars:
+  # EDIT THIS LIST to pick the workload for this job. All four rows stay
+  # zipped so the anchors travel together and cannot be mismatched.
+  wl.workload:   [weights]
+  wl.steps:      [100]
+  wl.data_mb:    [32000]
+  wl.page_kb:    [1024]
+  wl.atoms:      [0]
+  wl.mesh_k:     [0]
+  wl.hbm_mb:     [256]
+  wl.nvme_mb:    [8192]
+  wl.repeat:     [0]
+  wl.no_dense:   [false]
+  wl.cache_ladder:  ["5461,10923,21845,32768"]
+  wl.blocks_ladder: ["1,16,32,67"]
+
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.page_kb, wl.atoms, wl.mesh_k,
+     wl.hbm_mb, wl.nvme_mb, wl.repeat, wl.no_dense, wl.cache_ladder,
+     wl.blocks_ladder]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/anchor32_paged"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  cols = [c for c in ['wl.workload', 'cache_setting', 'blocks_resolved',
+                      'completed', 'gates_pass', 'bench_ms', 'runtime',
+                      'vram_peak_mb', 'faults', 'evicts', 'puts']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
