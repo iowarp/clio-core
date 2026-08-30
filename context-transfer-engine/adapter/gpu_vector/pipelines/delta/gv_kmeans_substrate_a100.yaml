@@ -18,15 +18,32 @@
 # Only the paged cache/tier stack, because a resident substrate has no
 # counterpart to it. That asymmetry IS the measurement.
 #
-# GEOMETRY SIZED FOR THIS GPU, NOT THE ONE THE STUDY WAS WRITTEN ON.
+# THE BLOCKS SWEEP, AND WHY IT REACHES BELOW ONE BLOCK PER SM.
 # The gpu_vector block ladders top out at 67, chosen as 80% of an RTX
-# 5080's 84 SMs. An A100 has 108 SMs, so 67 blocks leaves ~40% of the
-# device idle and both substrates end up measuring launch width. Here
-# blocks is expressed as blocks_per_sm and resolved against sm_count, so
-# the sweep spans genuinely under-, exactly- and over-subscribed:
-#   blocks_per_sm 1 -> 108 blocks   (one block per SM)
-#                 2 -> 216 blocks   (latency hiding)
-#                 4 -> 432 blocks   (oversubscribed)
+# 5080's 84 SMs; on a 108-SM A100 that measures launch width rather than
+# anything interesting. But the first 3-rung run (108/216/432) found
+# something that says the sweep must go DOWN, not just up: per-iteration
+# cost does not fall as blocks rise, and the best paged number on record
+# is still the 32-block one. Measured, paged:
+#
+#     32 blocks   4949 ms/iter   (earlier run, iters=4)
+#    108 blocks   7862 ms/iter
+#    216 blocks   8655 ms/iter
+#    432 blocks   7343 ms/iter
+#
+# MPI is flat within 3% over that whole 4x range (6062 / 6039 / 6208), so
+# at 32 GB this workload is memory-bound and the parallelism axis was
+# sampled entirely on its flat shoulder. The sweep now spans a 16x range
+# and brackets the apparent optimum:
+#
+#   blocks_per_sm 0.25 ->  27 blocks   (SMs deliberately idle)
+#                 0.5  ->  54 blocks
+#                 1    -> 108 blocks   (one block per SM)
+#                 2    -> 216 blocks   (latency hiding)
+#                 4    -> 432 blocks   (oversubscribed)
+#
+# blocks_per_sm is a FLOAT for exactly this reason -- an integer-only knob
+# cannot express the region where the optimum appears to live.
 #
 # sm_count IS SET EXPLICITLY (108) rather than detected. The package can
 # detect it from the GPU name, but detection needs a GPU, and this file has
@@ -36,8 +53,13 @@
 # CACHE HELD CONSTANT WHILE BLOCKS VARY. cache_mb is a TOTAL, resolved to
 # per-block slots as cache_mb/blocks/page_kb, so sweeping blocks does not
 # quietly change the VRAM budget -- otherwise a blocks sweep is confounded
-# by a cache sweep. At 32768 MB the cache covers the 32 GB problem at every
-# rung (108x303, 216x151, 432x75 slots of 1 MB), i.e. residency throughout.
+# by a cache sweep. Resolved across the five rungs:
+#     27 x 1213,  54 x 606,  108 x 303,  216 x 151,  432 x 75 slots of 1 MB
+#   = 32751 / 32724 / 32724 / 32616 / 32400 MB -- constant to within 1%,
+# and covering the 32 GB problem at every rung, i.e. residency throughout.
+# What DOES change is per-block cache fragmentation, and it shows: paged
+# faults ran 147 -> 4625 -> 5890 at 108 -> 216 -> 432 blocks, with
+# faults == evicts exactly (capacity churn at the margin, not cold misses).
 #
 # NO REPEATS -- MORE ITERATIONS INSTEAD. The paged bench defaults to
 # `int repeat = 3` and reports the BEST of the three, while the resident
@@ -48,11 +70,14 @@
 #
 # ITERS=20. MEASURED cost per cell: ~140 s of timed work plus ~40 s of
 # 32 GB dataset build (and RAM-tier prefault on the paged cells) = ~3 min,
-# so a 10-minute request holds THREE cells and the 9-cell sweep needs
-# three submissions. That is fine and intended: jarvis resumes a pipeline
-# test by row count, so resubmitting this same file continues where the
-# last job stopped (clear $HOME/gv_pipeline_results/kmeans_substrate to
-# start over).
+# so a 10-minute request holds THREE cells. 15 cells therefore need FIVE
+# submissions of this same file: jarvis resumes a pipeline test by row
+# count, so each resubmission continues where the last job stopped.
+#
+# THE OUTPUT DIRECTORY IS NEW (kmeans_substrate_blocks). Resume counts
+# ROWS, not parameters, so pointing a reshaped sweep at the old 9-row
+# directory would silently map those rows onto the wrong cells. The
+# 3-rung results stay intact under kmeans_substrate/.
 #
 # Do NOT size this from an assumed scaling law. Per-iteration cost does
 # NOT fall as blocks rise here -- measured 7862 / 8655 / 7343 ms/iter at
@@ -65,12 +90,8 @@
 # is a different question, answered separately by
 # gv_variant_matrix_a100.yaml at 2 ranks.
 #
-# SIZING: 9 cells. Each pays a 32 GB dataset build; the paged cells also
-# pay a ~32.5 GB RAM-tier prefault (40-65 s measured). Budget ~60-90 s per
-# paged cell and ~30-40 s per resident cell -> ~8 min. timeout_sec 300
-# bounds any single cell well inside the request.
-#
-# NOT YET RUN -- review before submitting.
+# 15 cells = 3 substrates x 5 block rungs. timeout_sec 300 bounds any one
+# cell well inside the 10-minute request.
 # Submit:  jarvis ppl submit gv_kmeans_substrate_a100.yaml
 
 scheduler:
@@ -120,14 +141,14 @@ config:
 
 vars:
   km.variant: [paged, mpi, nvshmem]
-  km.blocks_per_sm: [1, 2, 4]
+  km.blocks_per_sm: [0.25, 0.5, 1, 2, 4]
 
 loop:
   - [km.variant]
   - [km.blocks_per_sm]
 
 repeat: 1
-output: "${HOME}/gv_pipeline_results/kmeans_substrate"
+output: "${HOME}/gv_pipeline_results/kmeans_substrate_blocks"
 
 post: |
   import pandas as pd, os

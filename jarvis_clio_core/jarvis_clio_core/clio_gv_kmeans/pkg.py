@@ -192,10 +192,14 @@ class ClioGvKmeans(Application):
                     'there is deliberately no "binary default" path',
              'type': int, 'default': 0},
             {'name': 'blocks_per_sm',
-             'msg': 'resolve blocks as blocks_per_sm * sm_count, so a '
-                    'sweep is portable across GPUs instead of pinned to '
-                    'the SM count of the card it was written on',
-             'type': int, 'default': 0},
+             'msg': 'resolve blocks as round(blocks_per_sm * sm_count), so '
+                    'a sweep is portable across GPUs instead of pinned to '
+                    'the SM count of the card it was written on. '
+                    'FRACTIONAL values are the point: 0.25/0.5 leave SMs '
+                    'idle, 1 is one block per SM, 2/4 oversubscribe -- and '
+                    'the measured optimum for kmeans is below 1, so an '
+                    'integer-only knob cannot reach it',
+             'type': float, 'default': 0.0},
             {'name': 'sm_count',
              'msg': 'SMs on the target GPU (0 = detect from the GPU name; '
                     'an unrecognised GPU is an error, not a guess)',
@@ -284,7 +288,12 @@ class ClioGvKmeans(Application):
         if c['blocks']:
             return int(c['blocks'])
         if c['blocks_per_sm']:
-            return int(c['blocks_per_sm']) * self._sm_count()
+            n = int(round(float(c['blocks_per_sm']) * self._sm_count()))
+            if n < 1:
+                raise Exception(
+                    'blocks_per_sm=%s on %d SMs resolves to %d blocks'
+                    % (c['blocks_per_sm'], self._sm_count(), n))
+            return n
         raise Exception(
             'blocks is REQUIRED: set blocks, or blocks_per_sm. This '
             'package has no "binary default" path on purpose -- letting '
