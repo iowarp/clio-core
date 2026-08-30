@@ -259,31 +259,29 @@ int main(int argc, char **argv) {
   // a vector's pages are CTE blobs and blobs hash across the cluster, so
   // the paging path IS the halo exchange. Per-node namespaces would give
   // each node a private field and silently decouple the physics.
-  // MULTI-NODE IS STILL REFUSED, and the exchange below is why it is close
-  // rather than done. Slab bounds, shared namespace, per-step flush +
-  // barrier + ClearCache and the checksum reduction are all in place, and
-  // a 2-node run is BIT-EXACT against the single-node reference for steps
-  // 0, 1 and 2. It diverges at step 3 (rel 4.6e-3, growing to 8.4e-3 by
-  // step 4).
+  // MULTI-NODE IS REFUSED. The exchange is built -- per-step flush, cross-
+  // node barrier, settle-then-invalidate, and the same after the sharded
+  // seed -- but a 2-node run is still WRONG and, worse, NONDETERMINISTIC:
+  // measured 36104.119147, 36104.119147, 36255.928230 on identical runs
+  // against a single-node reference of 36410.579344 that does not move.
+  // Both nodes agree with each other within a run, so the two are staying
+  // in step with one another while both drift from the truth.
   //
-  // WHERE IT GOES WRONG. ClearCache does not refuse a page whose flush is
-  // still in flight -- it zeroes `flushing` and drops `data` outright, so
-  // an outstanding device-side BeginFlush is discarded, and a task that
-  // completes afterwards can land in a frame already reassigned to another
-  // page. The first two steps survive because nothing is still in flight
-  // when the clear runs; step 3 is where they start to overlap. The fix is
-  // to settle outstanding flushes before invalidating, which needs a
-  // primitive the vector does not currently expose.
+  // TREAT EARLIER A/B NUMBERS IN THE HISTORY OF THIS FILE WITH SUSPICION.
+  // The "5.98% without the host flush vs 0.84% with it" comparison was
+  // single runs of a quantity that varies between runs, so it does not
+  // support the causal claim made from it. What IS solid: steps 0-2 came
+  // back bit-exact repeatedly, and the divergence starts at step 3.
   //
-  // This bench's checksum has a TOLERANCE, so unlike gmx it cannot fail
-  // loudly on a stale plane -- which is exactly why it must not run
-  // multi-node until it is right.
+  // This bench's checksum has a TOLERANCE, so unlike gmx's fixed-point
+  // gates it cannot fail loudly on a stale plane. A run that is quietly
+  // 0.4% out is exactly the outcome worth refusing.
   if (nodes > 1) {
     std::fprintf(stderr,
                  "GRAYSCOTT ERROR: --nodes %u requested, but the halo "
-                 "exchange diverges from step 3 (ClearCache discards "
-                 "in-flight flushes). Refusing rather than reporting a "
-                 "plausible, wrong checksum.\n", nodes);
+                 "exchange is still wrong and nondeterministic past step "
+                 "2. Refusing rather than reporting a plausible, wrong "
+                 "checksum.\n", nodes);
     return 2;
   }
   const u64 nz_local = (nz + nodes - 1) / nodes;
@@ -429,7 +427,10 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "GRAYSCOTT ERROR: seed barrier failed\n");
       return 1;
     }
-    vec.ClearCache();
+    if (!clio_bench_dist::SettleAndInvalidate(vec)) {
+      std::fprintf(stderr, "GRAYSCOTT ERROR: cache never settled\n");
+      return 1;
+    }
   }
 
   double *d_sum = nullptr;
@@ -573,7 +574,10 @@ int main(int argc, char **argv) {
         // single-node 36410.579344 -- 5.9% off, silently. Drop every frame
         // so the next step refaults from the CTE. Ordering matters: flush
         // (publish mine), barrier (everyone has published), THEN clear.
-        vec.ClearCache();
+        if (!clio_bench_dist::SettleAndInvalidate(vec)) {
+          std::fprintf(stderr, "GRAYSCOTT ERROR: cache never settled\n");
+          return 1;
+        }
       }
       std::swap(cu, nu);
       std::swap(cv, nv);

@@ -205,6 +205,44 @@ inline bool ReduceSumU64(clio::cte::core::Client &cte,
 }
 
 /**
+ * Wait for every outstanding put to land, THEN drop the cache.
+ *
+ * ClearCache on its own is not an invalidate here: it zeroes `flushing` and
+ * drops `data` unconditionally, so a page whose put is still outstanding has
+ * that put discarded, and a task completing afterwards can land in a frame
+ * already reassigned to another page. In grayscott that was invisible for two
+ * steps -- nothing is in flight when the clear runs early on -- and then
+ * diverged at step 3, as a rel 4.6e-3 checksum error with every counter clean.
+ *
+ * A node that faulted in a peer's page keeps that frame resident and will
+ * happily re-read its own stale copy forever, so SOME invalidation is
+ * required; it just has to wait its turn. Returns false if the cache never
+ * quiesces, which is a real failure and not something to page over.
+ */
+template <typename VecT>
+inline bool SettleAndInvalidate(VecT &vec, int gpu_id = 0,
+                                int timeout_ms = 30000) {
+  const auto t0 = std::chrono::steady_clock::now();
+  for (;;) {
+    const auto tbl = vec.ReadTable(gpu_id);
+    bool busy = false;
+    for (const auto &p : tbl) {
+      if (p.flushing || p.fetching) { busy = true; break; }
+    }
+    if (!busy) break;
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
+      std::fprintf(stderr, "  settle: cache still busy after %d ms\n",
+                   timeout_ms);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  vec.ClearCache(gpu_id);
+  return true;
+}
+
+/**
  * Barrier across the nodes. A zero-length ReduceSum would be a no-op, so this
  * reduces one dummy value; the cost is one blob per node per call.
  */
