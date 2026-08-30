@@ -141,25 +141,40 @@ COLUMNS: List[Column] = [
            "primary is adopted unless an alternative beat it AND fit."),
 
     # ---- measured reconstruction quality (opt-in) ------------------------
-    Column("quality_measured", "outcome", False, "int64",
+    # These six read NA -- not a number -- on every row where a measured
+    # quality is not DEFINED, which pandas loads as NaN. That is why
+    # quality_measured is float64 and not int64.
+    #
+    # NA on a lossless row (quantize=0) is the normal case and is not a gap in
+    # the data: every nvcomp codec is lossless and the byte shuffle is a
+    # permutation, so the round trip is exact by construction. A number there
+    # would measure the codec against its own input rather than the data
+    # against its original. NA on a QUANTIZING row is a real failure to
+    # measure -- read quality_measured==0 with quantize==1 to find those.
+    #
+    # Older logs use a -1 sentinel here instead, including on the primary row
+    # of every chunk, whose measurement went only to selection.csv.quality.
+    Column("quality_measured", "outcome", False, "float64",
            "1 when the candidate was reconstructed and compared against the "
-           "original. Disambiguates the -1 sentinels below, which SSIM's "
-           "valid range ([-1,1]) could not do on its own."),
+           "original, 0 when a quantizing candidate could not be, NA when the "
+           "candidate did not quantize and so has nothing to measure."),
     Column("meas_rmse", "outcome", False, "float64",
-           "MEASURED RMSE against the pre-transform original.", sentinel=-1.0),
+           "MEASURED RMSE against the pre-transform original."),
     Column("meas_max_error", "outcome", False, "float64",
            "MEASURED max absolute error -- the one that can witness an error "
-           "bound violation.", sentinel=-1.0),
+           "bound violation."),
     Column("meas_psnr_db", "outcome", False, "float64",
-           "MEASURED PSNR, still carrying upstream's 120 dB cap.",
-           sentinel=-1.0),
+           "MEASURED PSNR, still carrying upstream's 120 dB cap. The cap is "
+           "reached both by an exact round trip (rmse 0) and by a real "
+           "reconstruction whose true PSNR exceeds 120 dB; meas_rmse "
+           "separates them, and 20*log10(range/rmse) recovers the true "
+           "value."),
     Column("meas_ssim", "outcome", False, "float64",
-           "MEASURED SSIM. Saturates at 1 for any good reconstruction.",
-           sentinel=-1.0),
+           "MEASURED SSIM. Saturates at 1 for any good reconstruction."),
     Column("meas_ssim_deviation", "outcome", False, "float64",
            "1 - ssim computed WITHOUT the subtraction, so the information "
            "that saturates out of `meas_ssim` survives. Prefer this over "
-           "1 - meas_ssim, which loses it to cancellation.", sentinel=-1.0),
+           "1 - meas_ssim, which loses it to cancellation."),
 ]
 
 BY_NAME: Dict[str, Column] = {c.name: c for c in COLUMNS}

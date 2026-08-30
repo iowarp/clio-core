@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -106,10 +107,43 @@ PayloadLog *PayloadLogInstance() {
 /** Per-candidate sweep record (CLIO_NEUROPRESS_EXPLORE_LOG). Off means the
  *  measurement is not taken at all -- this must not add work to the gated
  *  path the sweep already runs on. */
+/** The scalar fields of one explore row, bundled so the writer takes a single
+ *  argument instead of twenty-two. Nothing is deferred: every row is written
+ *  as soon as it is built. */
+struct ExploreRowFields {
+  std::string blob_name;
+  size_t chunk_size = 0;
+  int rank = -1;
+  std::string lib_name;
+  uint32_t preset_id = 0;
+  bool quantize = false;
+  uint32_t shuffle = 0;
+  double pred_ratio = 0, pred_ct_ms = 0, pred_dt_ms = 0;
+  double ratio = 0, ct_ms = 0, psnr_db = 0, cost = 0, primary_cost = 0;
+  bool adopted = false;
+  bool is_primary = false;
+  double dt_ms = -1.0;
+  double entropy = -1.0, mad = -1.0, second_deriv = -1.0, eb_encoded = -1.0;
+};
+
 struct ExploreLog {
   std::mutex mutex;
   std::FILE *fp = nullptr;
   long seq = 0;
+  /** The primary's measured quality, parked by Runtime::Compress for the
+   *  Runtime::DynamicSchedule site that writes its row.
+   *
+   *  The direction matters and is easy to get backwards: DynamicSchedule
+   *  AWAITS Compress (compressor_runtime.cc:1388) and only logs afterwards, so
+   *  the measurement exists BEFORE the row is written -- it just exists in a
+   *  different function. Parking the quality is therefore enough; deferring
+   *  the row instead would park it forever, since nothing runs after the
+   *  logging site to release it.
+   *
+   *  Keyed by blob name, which is unique per chunk. Erased on take, so at most
+   *  one entry per chunk in flight. */
+  std::map<std::string, ctp::compress::preprocess::QualityMetrics>
+      primary_quality;
 };
 
 
@@ -258,23 +292,31 @@ void LogMeasuredQuality(const std::string &blob_name, size_t orig_bytes,
   std::fflush(log->fp);
 }
 
-void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
-                          int rank, const std::string &lib_name,
-                          uint32_t preset_id, bool quantize, uint32_t shuffle,
-                          double pred_ratio, double pred_ct_ms,
-                          double pred_dt_ms, double ratio,
-                          double ct_ms, double psnr_db, double cost,
-                          double primary_cost, bool adopted, bool is_primary,
-                          double dt_ms, double entropy, double mad,
-                          double second_deriv, double eb_encoded,
-                          const ctp::compress::preprocess::QualityMetrics
-                              *quality) {
-  ExploreLog *log = ExploreLogInstance();
-  if (!log->fp) return;
+namespace {
 
+/** Write one row. Caller holds log->mutex.
+ *
+ * The five quality columns and quality_measured are NA whenever a measured
+ * quality is not DEFINED for the row, and that is not the same as zero:
+ *
+ *   quantize=0            -> NA. Every nvcomp codec is lossless and the byte
+ *                            shuffle is a permutation, so the round trip is
+ *                            exact by construction. A 0 here would look like a
+ *                            measurement of the data when it is really a
+ *                            tautology about the codec.
+ *   quantize=1, measured  -> the measured value.
+ *   quantize=1, no value  -> NA with quality_measured=0. A real failure, and
+ *                            the quantize column keeps it distinguishable from
+ *                            the not-applicable case above.
+ *
+ * NA rather than the old -1 sentinel because -1 is inside SSIM's valid range,
+ * and because every CSV reader already treats NA as missing. */
+void WriteExploreRowLocked(ExploreLog *log, const ExploreRowFields &r,
+                           const ctp::compress::preprocess::QualityMetrics
+                               *quality) {
   int algo_idx = -1;
   for (const auto &entry : ctp::compress::model::KnownCompressors()) {
-    if (lib_name == entry.name) {
+    if (r.lib_name == entry.name) {
       switch (entry.base_id) {
         case 13: algo_idx = 0; break;
         case 14: algo_idx = 1; break;
@@ -290,7 +332,22 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
     }
   }
 
-  std::lock_guard<std::mutex> lock(log->mutex);
+  const bool measured = r.quantize && quality != nullptr;
+  char q[5][40];
+  const char *qc[5] = {"NA", "NA", "NA", "NA", "NA"};
+  if (measured) {
+    std::snprintf(q[0], sizeof(q[0]), "%.10g", quality->rmse);
+    std::snprintf(q[1], sizeof(q[1]), "%.10g", quality->max_error);
+    std::snprintf(q[2], sizeof(q[2]), "%.10g", quality->psnr_db);
+    // 17 digits: ssim near 1 needs every one of them to be reconstructible.
+    std::snprintf(q[3], sizeof(q[3]), "%.17g", quality->ssim);
+    std::snprintf(q[4], sizeof(q[4]), "%.10g", quality->ssim_deviation);
+    for (int i = 0; i < 5; ++i) qc[i] = q[i];
+  }
+  // NA, not 0, when the row cannot have one: a lossless action has no
+  // measurement to report, which is different from having failed to take one.
+  const char *qmeas = r.quantize ? (quality != nullptr ? "1" : "0") : "NA";
+
   // dt_ms is -1 unless CLIO_NEUROPRESS_EXPLORE_MEASURE_DT made the sweep
   // decompress each candidate back. -1 means "not measured", which is the
   // default and upstream's only behaviour -- distinct from a measured 0.
@@ -301,21 +358,83 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
   std::fprintf(log->fp,
                "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
                "%.10g,%.10g,%.10g,%.10g,%.10g,%d,"
-               "%d,%.10g,%.10g,%.10g,%.17g,%.10g,"
+               "%s,%s,%s,%s,%s,%s,"
                "%.10g,%.10g,%.10g,%.10g\n",
-               log->seq++, blob_name.c_str(), chunk_size,
-               is_primary ? "primary" : "alt", rank,
-               lib_name.c_str(), algo_idx, preset_id, quantize ? 1 : 0,
-               shuffle, pred_ratio, pred_ct_ms, pred_dt_ms, ratio, ct_ms,
-               dt_ms, psnr_db, cost, primary_cost, adopted ? 1 : 0,
-               quality ? 1 : 0,
-               quality ? quality->rmse : -1.0,
-               quality ? quality->max_error : -1.0,
-               quality ? quality->psnr_db : -1.0,
-               quality ? quality->ssim : -1.0,
-               quality ? quality->ssim_deviation : -1.0,
-               entropy, mad, second_deriv, eb_encoded);
+               log->seq++, r.blob_name.c_str(), r.chunk_size,
+               r.is_primary ? "primary" : "alt", r.rank,
+               r.lib_name.c_str(), algo_idx, r.preset_id, r.quantize ? 1 : 0,
+               r.shuffle, r.pred_ratio, r.pred_ct_ms, r.pred_dt_ms, r.ratio,
+               r.ct_ms, r.dt_ms, r.psnr_db, r.cost, r.primary_cost,
+               r.adopted ? 1 : 0,
+               qmeas, qc[0], qc[1], qc[2], qc[3], qc[4],
+               r.entropy, r.mad, r.second_deriv, r.eb_encoded);
   std::fflush(log->fp);
+}
+
+ExploreRowFields MakeRow(const std::string &blob_name, size_t chunk_size,
+                          int rank, const std::string &lib_name,
+                          uint32_t preset_id, bool quantize, uint32_t shuffle,
+                          double pred_ratio, double pred_ct_ms,
+                          double pred_dt_ms, double ratio, double ct_ms,
+                          double psnr_db, double cost, double primary_cost,
+                          bool adopted, bool is_primary, double dt_ms,
+                          double entropy, double mad, double second_deriv,
+                          double eb_encoded) {
+  ExploreRowFields r;
+  r.blob_name = blob_name; r.chunk_size = chunk_size; r.rank = rank;
+  r.lib_name = lib_name; r.preset_id = preset_id; r.quantize = quantize;
+  r.shuffle = shuffle; r.pred_ratio = pred_ratio; r.pred_ct_ms = pred_ct_ms;
+  r.pred_dt_ms = pred_dt_ms; r.ratio = ratio; r.ct_ms = ct_ms;
+  r.psnr_db = psnr_db; r.cost = cost; r.primary_cost = primary_cost;
+  r.adopted = adopted; r.is_primary = is_primary; r.dt_ms = dt_ms;
+  r.entropy = entropy; r.mad = mad; r.second_deriv = second_deriv;
+  r.eb_encoded = eb_encoded;
+  return r;
+}
+
+}  // namespace
+
+void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
+                          int rank, const std::string &lib_name,
+                          uint32_t preset_id, bool quantize, uint32_t shuffle,
+                          double pred_ratio, double pred_ct_ms,
+                          double pred_dt_ms, double ratio,
+                          double ct_ms, double psnr_db, double cost,
+                          double primary_cost, bool adopted, bool is_primary,
+                          double dt_ms, double entropy, double mad,
+                          double second_deriv, double eb_encoded,
+                          const ctp::compress::preprocess::QualityMetrics
+                              *quality) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp) return;
+  const ExploreRowFields r = MakeRow(
+      blob_name, chunk_size, rank, lib_name, preset_id, quantize, shuffle,
+      pred_ratio, pred_ct_ms, pred_dt_ms, ratio, ct_ms, psnr_db, cost,
+      primary_cost, adopted, is_primary, dt_ms, entropy, mad, second_deriv,
+      eb_encoded);
+  std::lock_guard<std::mutex> lock(log->mutex);
+  WriteExploreRowLocked(log, r, quality);
+}
+
+void RecordPrimaryQuality(
+    const std::string &blob_name,
+    const ctp::compress::preprocess::QualityMetrics &quality) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  log->primary_quality[blob_name] = quality;
+}
+
+bool TakePrimaryQuality(const std::string &blob_name,
+                        ctp::compress::preprocess::QualityMetrics *out) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp || !out) return false;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  auto it = log->primary_quality.find(blob_name);
+  if (it == log->primary_quality.end()) return false;
+  *out = it->second;
+  log->primary_quality.erase(it);
+  return true;
 }
 
 void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,

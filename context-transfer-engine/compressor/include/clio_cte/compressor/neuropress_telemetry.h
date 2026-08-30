@@ -41,6 +41,28 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 /** One row of a sweep. is_primary marks the model's own pick, logged alongside
  *  the alternatives so all actions for a chunk sit in one file. `adopted` marks
  *  whichever row's bytes are stored -- exactly one per chunk. */
+/**
+ * @brief Park the PRIMARY's measured quality for the site that logs its row.
+ *
+ * The primary is compressed and measured in Runtime::Compress, but its explore
+ * row is written in Runtime::DynamicSchedule -- which AWAITS Compress
+ * (compressor_runtime.cc:1388) and logs afterwards. So the measurement always
+ * exists by the time the row is written; it just lives in another function.
+ * Compress calls Record, the logging site calls Take.
+ *
+ * Without this the primary's five measured columns were the -1 sentinel on
+ * every chunk, while its 31 swept alternatives carried real numbers -- the
+ * measurement was being written only to selection.csv.quality.
+ */
+void RecordPrimaryQuality(
+    const std::string &blob_name,
+    const ctp::compress::preprocess::QualityMetrics &quality);
+
+/** Retrieve and erase what RecordPrimaryQuality parked for `blob_name`.
+ *  False when there is nothing, leaving *out untouched. */
+bool TakePrimaryQuality(const std::string &blob_name,
+                        ctp::compress::preprocess::QualityMetrics *out);
+
 void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           int rank, const std::string &lib_name,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,

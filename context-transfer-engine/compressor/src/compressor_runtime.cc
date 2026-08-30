@@ -2376,6 +2376,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // was never one of the measured slots -- hence -1.
           if (ExploreLogEnabled()) {
             const uint32_t p_packed = static_cast<uint32_t>(best_preset);
+            // The measurement Runtime::Compress took, which this function
+            // already awaited (line 1388). Without it the primary's five
+            // measured columns were -1 on every chunk while its 31 swept
+            // alternatives carried real values.
+            ctp::compress::preprocess::QualityMetrics primary_qm;
+            const bool have_primary_qm =
+                TakePrimaryQuality(task->blob_name_.str(), &primary_qm);
             LogNeuroPressExplore(
                 task->blob_name_.str(), chunk_size, /*rank=*/-1,
                 ctp::CompressionFactory::NameForWireId(best_lib),
@@ -2388,7 +2395,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 primary_rank_cost, primary_rank_cost,
                 /*adopted=*/!winner.have, /*is_primary=*/true, primary_dt_ms,
                 neuropress_entropy, neuropress_mad, neuropress_second_deriv,
-                eb_for_log(UnpackQuantEnabled(p_packed)));
+                eb_for_log(UnpackQuantEnabled(p_packed)),
+                have_primary_qm ? &primary_qm : nullptr);
           }
           for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
             const ExploreRow& row = explore_rows[ri];
@@ -3239,11 +3247,23 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
                 primary_orig_device, input_size, compress_dst, compressed_size,
                 compress_input_size, applied_shuffle,
                 applied_quant ? &quant_params : nullptr, &qm)) {
+          // Parked for the explore row DynamicSchedule writes after it
+          // awaits this call, so the primary reports the same measurement the
+          // sidecar does instead of a sentinel.
+          RecordPrimaryQuality(task->blob_name_.str(), qm);
           // Its own log, not Context: Context is serialized (core_tasks.h),
           // so carrying it there would change the wire format for a
-          // diagnostic. And every per-chunk file that already exists was
-          // written before this point -- the selection and explore rows in
-          // DynamicSchedule, the payload row earlier in this function.
+          // diagnostic.
+          //
+          // ORDERING, which the line numbers actively mislead about:
+          // DynamicSchedule AWAITS this function at :1388 and only then writes
+          // the selection row (:1484) and the explore rows (:2386, :2403), so
+          // all three land AFTER this point despite sitting above it in the
+          // file. Only the payload row (:3169) is genuinely earlier. That is
+          // why the primary's quality is PARKED above for the explore row to
+          // collect, rather than the row being deferred down to here --
+          // deferring it would park it forever, because nothing runs after the
+          // logging site to release it.
           LogMeasuredQuality(task->blob_name_.str(), input_size,
                              applied_shuffle, applied_quant, qm);
         }

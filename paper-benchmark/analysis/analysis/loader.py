@@ -345,6 +345,11 @@ def load_exploration(path: str, name: Optional[str] = None) -> Dataset:
     df["dt_ms_measured"] = df["dt_ms"].where(df["dt_ms"] >= 0)
     df["psnr_db_analytical"] = df["psnr_db"].where(df["psnr_db"] >= 0)
 
+    # Current logs write NA where a measured quality is not defined, which
+    # arrives here as NaN already; older ones write a -1 sentinel. Both must
+    # end as NaN in the _ok columns, so the >= 0 test is kept for the old form
+    # and NaN falls through it. quality_measured == 1 is the authority in
+    # either case, and it is itself NA on lossless rows in current logs.
     qm = df["quality_measured"] if "quality_measured" in df.columns else None
     for col in ("meas_rmse", "meas_max_error", "meas_psnr_db", "meas_ssim",
                 "meas_ssim_deviation"):
