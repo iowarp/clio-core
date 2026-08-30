@@ -86,11 +86,26 @@ EXPLORE_K=31
 # refused below rather than quietly producing a half-covered run.
 #
 # This is an ABSOLUTE bound, so it has to be read against each field's own
-# magnitude, not against the dataset as a whole. At upstream NeuroPress's 1e-3
-# the 30 GiB VPIC run put 720 of 3840 chunks (18.8%) BELOW the bound entirely
-# -- div_e_err, div_b_err and rhob have data ranges of 1e-6..1e-8, so the
-# quantizer flattened them to a constant and measured SSIM ~0 at PSNR ~5 dB.
-LOSSY_EB=0.01
+# magnitude, not against the dataset as a whole. One value cannot suit four
+# workloads whose magnitudes span nine orders, and 0.05 is chosen for Nyx:
+#
+#   nyx    rho_E reaches 2.1e5. The quantizer relaxes when
+#          eb - max|v|*2.4e-7 - 0.05*eb <= 0, per CHUNK, so the relaxation
+#          ceiling is max|v| > 0.95*eb/2.4e-7. At 0.05 that is ~197900, so
+#          only the peak chunks relax; at 0.01 it was ~39600 and far more did.
+#          A prior sweep measured 0.05 clean: 0 of 1898 rows over the bound,
+#          worst 4.750e-02.
+#   vpic   fields are order 0.1-1 (MAD 7.9e-09..2.0e-01, cby amplitude
+#          +/-0.169). 0.05 is ~30% of that range -- roughly 7 quantization
+#          levels across cby, and every field below ~0.05 range flattened to a
+#          constant. The 720 of 3840 chunks (18.8%) already destroyed at 1e-3
+#          stay destroyed, and more join them. VPIC numbers taken at this bound
+#          measure the bound, not the compressor: check meas_ssim and the
+#          data_range column before quoting them.
+#
+# Override per workload with --eb rather than editing this if the two need to
+# differ; the two are not physically reconcilable in one absolute number.
+LOSSY_EB=0.05
 
 # 3, and not out of caution: exploration adopts on MEASURED cost, so repeated
 # runs on byte-identical input disagree -- 23% spread at 5 GB/s, and it widens

@@ -23,17 +23,23 @@
 # the new defaults bandwidth cannot change a MEASURED value anyway, only the
 # cost the model computes from it.
 #
-# eb=0.01, matching run_benchmark.sh's LOSSY_EB.
+# eb=0.05, matching run_benchmark.sh's LOSSY_EB, and it is the value this
+# workload wants. The quantizer relaxes when
+#   eb - max|v|*2.4e-7 - 0.05*eb <= 0
+# evaluated per CHUNK, so the relaxation ceiling is max|v| > 0.95*eb/2.4e-7:
+# ~197900 at 0.05 against ~39600 at 0.01. Nyx rho_E reaches 2.1e5, so at 0.05
+# only chunks holding the very peak relax, where at 0.01 a large share did --
+# that run reported an effective bound of 0.00504203.
 #
-# WARNING, measured not assumed: 0.01 is BELOW Nyx's achievability threshold.
-# The quantizer relaxes when eb - max|v|*2.4e-7 - 0.05*eb <= 0, evaluated per
-# CHUNK, so at eb=0.01 any chunk with max|v| > ~39583 has its bound silently
-# widened. Nyx rho_E reaches 2.1e5, so the peak chunks will relax. The sweep
-# that preceded this measured it directly: at 1e-3 rho_E/rho_e were relaxed to
-# 5.042e-3 (four of six fields got the bound asked for, two did not), and 0.05
-# was the smallest value that cleared it -- 0 of 1898 measured rows exceeded
-# the bound, worst 4.750e-02. Check meta.json and the relax warnings in
-# runtime.log before quoting Nyx numbers taken at 0.01.
+# Measured, not assumed. Three points on the curve:
+#   1e-3   rho_E/rho_e relaxed to 5.042e-3; four of six fields got the bound
+#          asked for, two did not
+#   0.01   relaxation warning fired, effective bound 0.00504203; it relaxed
+#          TIGHTER so nothing exceeded 0.01, but the ratios are those of 0.005
+#   0.05   0 of 1898 measured rows over the bound, worst 4.750e-02
+#
+# Still check meta.json and the relax warnings in runtime.log before quoting
+# ratios: a relaxed bound makes the ratio belong to a bound nobody asked for.
 set -uo pipefail
 REPO=/u/imuradli/clio-core; PB=$REPO/paper-benchmark
 export BUILD=/u/imuradli/np-build/clio
@@ -65,11 +71,11 @@ say "   $NF field files, $(du -sh "$FIELDS" | cut -f1)"
 [ "$NF" -gt 0 ] || { say "no dumps"; exit 1; }
 
 # ---- phase 2 --------------------------------------------------------------
-say "phase 2: exploration replay (K=31, thresh -1, eb=0.01, balance, quality on)"
+say "phase 2: exploration replay (K=31, thresh -1, eb=0.05, balance, quality on)"
 t0=$(date +%s)
 env CLIO_NEUROPRESS_STAGE_H2D=1 \
     "$PB/nyx/run_config.sh" explore-balance --fields "$FIELDS" \
-      --bw 5e6 --eb 0.01 --explore-k 31 --explore-thresh -1 --chunk 8388608 \
+      --bw 5e6 --eb 0.05 --explore-k 31 --explore-thresh -1 --chunk 8388608 \
       --results "$RESULTS" --tag "$tag" 2>&1 | sed 's/^/       /'
 rc=${PIPESTATUS[0]}
 say "   phase 2 took $(( $(date +%s) - t0 )) s, rc=$rc"

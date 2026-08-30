@@ -27,7 +27,7 @@ export BUILD=/u/imuradli/np-build/clio
 export NYX_BIN=/u/imuradli/np-build/nyx/Exec/HydroTests/nyx_HydroTests
 export LD_LIBRARY_PATH=/u/imuradli/np-env/np/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
-EB=${EB:-0.01}
+EB=${EB:-0.05}
 ROOT=${ROOT:-/projects/bekn/imuradli/np-nyx-validate}
 FIELDS=$ROOT/fields; RESULTS=$ROOT/results
 mkdir -p "$RESULTS"

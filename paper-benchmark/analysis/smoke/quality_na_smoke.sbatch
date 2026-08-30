@@ -48,10 +48,10 @@ NF=$(find -L "$FIELDS" -name '*.f32' | wc -l)
 say "fields: $(ls -d "$FIELDS"/plt* 2>/dev/null | wc -l) frames, $NF files"
 [ "$NF" -gt 0 ] || { say "no field files"; exit 1; }
 
-say "replay: K=31, thresh -1, eb=0.01, balance, quality on"
+say "replay: K=31, thresh -1, eb=0.05, balance, quality on"
 env CLIO_NEUROPRESS_STAGE_H2D=1 \
     "$PB/nyx/run_config.sh" explore-balance --fields "$FIELDS" \
-      --bw 5e6 --eb 0.01 --explore-k 31 --explore-thresh -1 --chunk 8388608 \
+      --bw 5e6 --eb 0.05 --explore-k 31 --explore-thresh -1 --chunk 8388608 \
       --results "$RESULTS" --tag "$tag" 2>&1 | sed 's/^/       /'
 rc=${PIPESTATUS[0]}
 say "replay rc=$rc"

@@ -16,16 +16,28 @@
 # same process and no file is ever written. Profiling confirmed this is real --
 # zero payload-sized HtoD copies, against Nyx's two per chunk.
 #
-# eb=0.01, matching run_benchmark.sh's LOSSY_EB. VPIC's fields are order 0.1-1
-# (MAD 7.9e-09 .. 2.0e-01, cby amplitude +/-0.169), so 0.01 is ~6% of the full
-# dynamic range -- coarser than the 1e-3 (~0.5%) this cell used before, but
-# still achievable: the quantizer only relaxes above max|v| ~ 39583.
+# eb=0.05, matching run_benchmark.sh's LOSSY_EB. READ THE RESULTS OF THIS CELL
+# WITH THAT IN MIND: 0.05 is chosen for Nyx, whose fields reach 2.1e5, and it
+# is far too coarse for VPIC, whose fields are order 0.1-1 (MAD 7.9e-09 ..
+# 2.0e-01, cby amplitude +/-0.169).
 #
-# What 0.01 does NOT fix is the low-magnitude fields. At 1e-3 the 30 GiB run
-# already had 720 of 3840 chunks (18.8%) whose ENTIRE data range sat under the
-# bound -- div_e_err ~1e-6, div_b_err ~8e-8, rhob ~2e-6 -- so the quantizer
-# flattened them to a constant (max_error == data_range, SSIM ~0, PSNR ~5 dB).
-# Raising the bound cannot help those; they need a relative or per-field bound.
+#   0.05 is ~30% of cby's full dynamic range. The grid step is 2*eb = 0.1
+#   against a range of ~0.338, so roughly 3 quantization levels survive across
+#   the entire field, and every VPIC field whose range is under ~0.05 collapses
+#   to a single level.
+#
+# For scale, at 1e-3 -- fifty times tighter -- this run already had 720 of 3840
+# chunks (18.8%) whose ENTIRE data range sat below the bound: div_e_err ~1e-6,
+# div_b_err ~8e-8, rhob ~2e-6, all flattened to a constant with
+# max_error == data_range, SSIM ~0 and PSNR ~5 dB. At 0.05 those stay flattened
+# and many more join them.
+#
+# So a ratio from this cell is largely a measure of the bound, not of the
+# compressor. Before quoting anything from it, check meas_ssim and the
+# data_range column in selection.csv.quality and report how many chunks were
+# flattened. If VPIC needs a bound its own data can carry, pass --eb explicitly
+# (1e-3 was the previous value) rather than taking the shared default -- one
+# absolute number cannot serve both workloads.
 #
 # clean_div stays at run_config_insitu.sh's default 10, the value the
 # 1000-timestep hyperparameter study selected -- at upstream's 0, four of the
@@ -45,11 +57,11 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/      
 df -BG --output=avail "$ROOT" | tail -1 | sed 's/^/       free: /;s/$/ GiB/'
 [ -x "$PB/vpic/weibel_clio.Linux" ] || { say "no deck binary"; exit 1; }
 
-say "in-situ run: 126^3, 6000 steps, dump every 25 (K=31, thresh -1, eb=0.01)"
+say "in-situ run: 126^3, 6000 steps, dump every 25 (K=31, thresh -1, eb=0.05)"
 t0=$(date +%s)
 "$PB/vpic/run_config_insitu.sh" explore-balance \
     --ncell 126 --steps 6000 --int 25 \
-    --chunk 8388608 --bw 5e6 --eb 0.01 \
+    --chunk 8388608 --bw 5e6 --eb 0.05 \
     --explore-k 31 --explore-thresh -1 \
     --results "$RESULTS" --tag "$tag" 2>&1 | sed 's/^/       /'
 rc=${PIPESTATUS[0]}
