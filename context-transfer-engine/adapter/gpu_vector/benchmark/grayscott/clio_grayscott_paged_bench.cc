@@ -161,6 +161,10 @@ int main(int argc, char **argv) {
   // the domain is cut. One node is the whole field, so a single-process run
   // is unchanged and is the reference a distributed run must reproduce.
   u32 nodes = 1, node = 0;
+  // NEGATIVE CONTROL. With the exchange off a multi-node run must produce
+  // a DIFFERENT checksum; if it does not, the exchange is not doing
+  // anything and the passing run proves nothing.
+  const bool halo_off = getenv("GS_NO_HALO") != nullptr;
   u64 page_kb = 1024, data_mb = 16384, hbm_mb = 4096;
   int repeat = 3;
   // Out-of-core WITHOUT in-kernel faulting: synchronous CTE reads AND
@@ -255,23 +259,31 @@ int main(int argc, char **argv) {
   // a vector's pages are CTE blobs and blobs hash across the cluster, so
   // the paging path IS the halo exchange. Per-node namespaces would give
   // each node a private field and silently decouple the physics.
-  // HALO EXCHANGE IS NOT IMPLEMENTED YET, so --nodes > 1 is REFUSED rather
-  // than run. The decomposition below (slab bounds, shared namespace,
-  // checksum reduction) is in place, but a step reads its neighbours'
-  // boundary planes and a page the neighbour still holds DIRTY in its own
-  // cache is never written back -- a flush only writes back frames it can
-  // Find. Without an explicit publish and a generational fetch at each step
-  // boundary a multi-node run reads STALE halo planes and produces wrong
-  // physics with every counter clean and no error anywhere. That is the
-  // worst failure this bench could have, so it does not get to happen by
-  // default. Remove this once the exchange lands and the 2-node checksum is
-  // gated against the single-node one.
+  // MULTI-NODE IS STILL REFUSED, and the exchange below is why it is close
+  // rather than done. Slab bounds, shared namespace, per-step flush +
+  // barrier + ClearCache and the checksum reduction are all in place, and
+  // a 2-node run is BIT-EXACT against the single-node reference for steps
+  // 0, 1 and 2. It diverges at step 3 (rel 4.6e-3, growing to 8.4e-3 by
+  // step 4).
+  //
+  // WHERE IT GOES WRONG. ClearCache does not refuse a page whose flush is
+  // still in flight -- it zeroes `flushing` and drops `data` outright, so
+  // an outstanding device-side BeginFlush is discarded, and a task that
+  // completes afterwards can land in a frame already reassigned to another
+  // page. The first two steps survive because nothing is still in flight
+  // when the clear runs; step 3 is where they start to overlap. The fix is
+  // to settle outstanding flushes before invalidating, which needs a
+  // primitive the vector does not currently expose.
+  //
+  // This bench's checksum has a TOLERANCE, so unlike gmx it cannot fail
+  // loudly on a stale plane -- which is exactly why it must not run
+  // multi-node until it is right.
   if (nodes > 1) {
     std::fprintf(stderr,
                  "GRAYSCOTT ERROR: --nodes %u requested, but the halo "
-                 "exchange is not implemented; a multi-node run would read "
-                 "stale boundary planes and report a plausible, wrong "
-                 "checksum. Refusing.\n", nodes);
+                 "exchange diverges from step 3 (ClearCache discards "
+                 "in-flight flushes). Refusing rather than reporting a "
+                 "plausible, wrong checksum.\n", nodes);
     return 2;
   }
   const u64 nz_local = (nz + nodes - 1) / nodes;
@@ -408,6 +420,17 @@ int main(int argc, char **argv) {
                    zbase, zend, vw, sv);
   });
   ctp::GpuApi::Synchronize();
+  // THE SEED IS SHARDED TOO, so the first step's halo planes belong to a
+  // peer and must be published before anyone reads them.
+  if (nodes > 1) {
+    vec.FlushResidentToCte();
+    if (!clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes,
+                                  red_round++, "gsseed")) {
+      std::fprintf(stderr, "GRAYSCOTT ERROR: seed barrier failed\n");
+      return 1;
+    }
+    vec.ClearCache();
+  }
 
   double *d_sum = nullptr;
   d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(double));
@@ -521,6 +544,36 @@ int main(int argc, char **argv) {
           gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu,
                          nv, Du, Dv, F, K, dt, zbase, zend, vw, sv);
         });
+      }
+      // THIS IS THE HALO EXCHANGE. Computing plane z needs z-1 and z+1, so
+      // at a slab edge a node reads a plane its NEIGHBOUR just wrote. A
+      // page the neighbour still holds resident is invisible to everyone
+      // else, so without this the next step reads a stale boundary plane
+      // and the field quietly diverges -- and unlike gmx, whose gates are
+      // bit-exact, this bench's checksum has a tolerance that would absorb
+      // the error rather than fail. The flush publishes this slab; the
+      // barrier stops any node starting the next step before every peer
+      // has published. GS_NO_HALO=1 skips both, as the negative control.
+      if (nodes > 1 && !halo_off) {
+        ctp::GpuApi::Synchronize();
+        // StepCoro BeginFlush-es the planes it writes and EndFlush-es at
+        // the end, but dropping this whole-table publish measured WORSE
+        // (5.98% vs 0.84%), so some writes are not reaching the CTE by
+        // kernel exit alone. Keep it until that is understood.
+        vec.FlushResidentToCte();
+        if (!clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes,
+                                      red_round++, "gsbar")) {
+          std::fprintf(stderr, "GRAYSCOTT ERROR: halo barrier failed\n");
+          return 1;
+        }
+        // FLUSHING IS ONLY HALF OF IT. A node that faulted in a peer's
+        // boundary plane KEEPS that frame resident, so next step it reads
+        // its own stale copy and never notices the peer rewrote the plane.
+        // Publishing without invalidating measured 34251.995658 against a
+        // single-node 36410.579344 -- 5.9% off, silently. Drop every frame
+        // so the next step refaults from the CTE. Ordering matters: flush
+        // (publish mine), barrier (everyone has published), THEN clear.
+        vec.ClearCache();
       }
       std::swap(cu, nu);
       std::swap(cv, nv);

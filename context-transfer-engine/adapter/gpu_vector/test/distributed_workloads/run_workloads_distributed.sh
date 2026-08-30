@@ -26,6 +26,7 @@ BIN_DIR="$HOST_WORKSPACE/${BUILD_DIR:-build}/bin"
 # the cross-node path, not throughput.
 deck() {
   WITNESS=""
+  CONTROL_ENV=""
   case "$1" in
     kmeans)
       BENCH=clio_kmeans_paged_bench
@@ -55,6 +56,15 @@ deck() {
       # the loudest of the three -- a stale mesh page or a double-counted bin
       # fails outright rather than drifting.
       KEY='(ALL GATES PASS)'; TOL=exact ;;
+    grayscott)
+      BENCH=clio_grayscott_paged_bench
+      ARGS="--blocks 8 --steps 4 --data-mb 64 --repeat 1"
+      # A 3D stencil: the only workload here whose slabs must exchange a halo
+      # every step. Its checksum has a tolerance (float, atomicAdd), so unlike
+      # gmx it cannot fail loudly on a stale plane -- hence the negative
+      # control below.
+      KEY='v_checksum=([0-9.]+)'; TOL=1e-6
+      CONTROL_ENV='GS_NO_HALO=1' ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
@@ -124,7 +134,7 @@ run_one() {
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
-  for wl in kmeans weights gmx; do run_one "$wl" || rc=1; done
+  for wl in kmeans weights gmx grayscott; do run_one "$wl" || rc=1; done
   exit $rc
 fi
 run_one "$TARGET"

@@ -60,6 +60,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - GVW_BARRIER=${GVW_BARRIER:-600}
+      # Negative controls, passed through so the harness can prove an
+      # exchange is load-bearing rather than incidentally correct.
+      - GS_NO_HALO=${GS_NO_HALO:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
@@ -79,6 +82,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - GVW_BARRIER=${GVW_BARRIER:-600}
+      # Negative controls, passed through so the harness can prove an
+      # exchange is load-bearing rather than incidentally correct.
+      - GS_NO_HALO=${GS_NO_HALO:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
