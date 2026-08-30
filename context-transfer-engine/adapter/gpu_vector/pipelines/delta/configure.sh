@@ -10,6 +10,9 @@
 # llvm/19.1.7 clang wired in explicitly (see env.sh for why each), and
 # compression ON -- five of the six paged benches guard on TARGET
 # clio_cte_compressor_runtime, so with it off only lammps_md_paged gets built.
+# NVSHMEM ON so the nvshmem baselines are configured; they resolve through
+# NVSHMEM_HOME (env.sh). NCCL needs no flag -- its targets probe NCCL_HOME
+# directly inside the MPI block, since the NCCL edition bootstraps over MPI.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../../.." && pwd)"
@@ -32,8 +35,12 @@ cmake -S "$REPO" -B "$BUILD_DIR" \
   -DCMAKE_CUDA_ARCHITECTURES=80-real \
   -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS" \
   -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DMPI_HOME="$CLIO_DELTA_OMPI" \
+  -DMPI_CXX_COMPILER="$CLIO_DELTA_OMPI/bin/mpicxx" \
+  -DMPI_C_COMPILER="$CLIO_DELTA_OMPI/bin/mpicc" \
   -DCLIO_GPU_CLANG=ON \
   -DCLIO_CORE_ENABLE_CUDA=ON \
+  -DCLIO_CORE_ENABLE_NVSHMEM=ON \
   -DCLIO_CORE_ENABLE_RUNTIME=ON \
   -DCLIO_CORE_ENABLE_CTE=ON \
   -DCLIO_CORE_ENABLE_CAE=ON \

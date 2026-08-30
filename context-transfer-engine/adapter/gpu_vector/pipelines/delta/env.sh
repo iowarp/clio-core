@@ -90,3 +90,65 @@ fi
 # include first-touch page population. The pkg sets this per cell too;
 # exporting here covers anything jarvis spawns besides.
 export CLIO_PREFAULT="${CLIO_PREFAULT:-0}"
+
+# nvcc FOR THE MPI/NCCL/NVSHMEM BASELINES. Those benches are NOT clang
+# targets -- each workload's CMakeLists builds them with a custom nvcc
+# command, because they are CTE-free plain CUDA (a baseline that linked
+# clio would not be a baseline). nvcc 12.6 refuses gcc > 13
+# ("unsupported GNU version!"), and the host toolchain here is
+# gcc-toolset-14, so point nvcc at gcc-toolset-13.
+#
+# NVCC_PREPEND_FLAGS rather than -ccbin in six CMakeLists: nvcc reads it
+# from the environment, so it reaches every nvcc invocation the build
+# makes without touching the build files. Safe precisely because these
+# binaries link nothing from clio -- no ABI is shared with the gcc-14
+# objects the rest of the tree produces.
+export CLIO_DELTA_NVCC_CCBIN="${CLIO_DELTA_NVCC_CCBIN:-/opt/rh/gcc-toolset-13/root/usr/bin/g++}"
+if [ -x "$CLIO_DELTA_NVCC_CCBIN" ]; then
+  export NVCC_PREPEND_FLAGS="-ccbin $CLIO_DELTA_NVCC_CCBIN ${NVCC_PREPEND_FLAGS:-}"
+fi
+
+# NCCL and NVSHMEM for the GPU-communication baselines. Both ship inside the
+# nvhpc 26.5 tree rather than as standalone modules, and the workload
+# CMakeLists look for them through NCCL_HOME / NVSHMEM_HOME, so nothing finds
+# them unless these are exported.
+#
+# The comm_libs are the CUDA 12.9 flavour while we build against 12.6.3.
+# That is fine and deliberate: NCCL/NVSHMEM have a stable ABI across CUDA
+# 12.x, they carry their own runtime linkage, and 12.9 is the oldest flavour
+# nvhpc 26.5 ships (the alternative is 13.2, which the clang side cannot use
+# at all). Delta's driver (595.x) is newer than both.
+export NCCL_HOME="${NCCL_HOME:-/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/comm_libs/12.9/nccl}"
+export NVSHMEM_HOME="${NVSHMEM_HOME:-/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/comm_libs/12.9/nvshmem}"
+for _d in "$NCCL_HOME/lib" "$NVSHMEM_HOME/lib"; do
+  [ -d "$_d" ] && export LD_LIBRARY_PATH="$_d:${LD_LIBRARY_PATH:-}"
+done
+unset _d
+
+# OpenMPI FOR THE BASELINES, and specifically for NVSHMEM.
+#
+# Delta's system MPI is cray-mpich, which has no mpirun and whose library is
+# libmpich.so. NVSHMEM's MPI bootstrap is a dlopen'd PLUGIN
+# (nvshmem_bootstrap_mpi.so.3) that NVIDIA built against OpenMPI, so it hard
+# requires libmpi.so.40:
+#
+#   bootstrap_loader.cpp:65: Bootstrap unable to load
+#   'nvshmem_bootstrap_mpi.so.3' -- libmpi.so.40: cannot open shared object
+#
+# and the non-MPI path in the benches is single-PE by construction
+# (nvshmemx_set_attr_uniqueid_args(0, 1, ...)), so it cannot answer whether
+# NVSHMEM actually communicates. Putting cray-mpich in the process AND
+# letting the plugin pull in OpenMPI would load two MPIs at once.
+#
+# So the CTE-free baselines (mpi / nccl / nvshmem -- none of which link
+# anything from clio) build and run against the HPC-X OpenMPI that ships
+# inside nvhpc, which is the MPI NVSHMEM and NCCL were built alongside.
+# Use the CONCRETE path, not comm_libs/hpcx: that dispatcher resolves by
+# matching the CUDA driver version and fails outright on a login node with
+# no driver ("MPI matching the current driver version (0) ... was not
+# installed").
+export CLIO_DELTA_OMPI="${CLIO_DELTA_OMPI:-/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/comm_libs/12.9/hpcx/hpcx-2.50/ompi4}"
+if [ -d "$CLIO_DELTA_OMPI" ]; then
+  export PATH="$CLIO_DELTA_OMPI/bin:$PATH"
+  export LD_LIBRARY_PATH="$CLIO_DELTA_OMPI/lib:${LD_LIBRARY_PATH:-}"
+fi

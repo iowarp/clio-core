@@ -1,0 +1,120 @@
+# Does every SUBSTRATE actually run on Delta? -- the functional matrix.
+#
+# Six workloads x the four CTE-free baselines (mpi, nvshmem, bam, nccl) at
+# deliberately tiny problem sizes. This is a "does it work" check, not a
+# measurement: nothing here is an anchor, and the numbers are not comparable
+# to anything.
+#
+# paged is NOT in the matrix -- it is already validated at both the 6 GB and
+# the 32 GB anchors (see gv_memory_pressure_a100_smoke.yaml and the README),
+# and its cells need per-workload page geometry that has nothing to do with
+# whether a baseline links and launches.
+#
+# EXPECTED HOLES. nccl exists ONLY for lammps_md; the other five nccl cells
+# have no binary and report completed=0. That is the documented shape of the
+# matrix (see ../register_eval/register_eval.yaml), not a failure.
+#
+# KNOWN FAILURE: grayscott x bam HANGS -- it produces no output at all and is
+# killed by timeout_sec (measured twice, at 120 s and at 240 s, while the
+# other five bam cells finish in 1.4-143 s). timeout_sec below is set to 180,
+# which is above the slowest passing cell (weights/bam, 143 s) and well
+# under the wall clock, so the hang costs one cell rather than the job.
+#
+# TWO GPUs, and two ranks. nccl and nvshmem are COMMUNICATION substrates: at
+# -n 1 they initialise and then talk to nobody, which would prove almost
+# nothing about whether they work. nprocs=2 on 2 A100s makes them actually
+# move bytes between devices. mpi rides the same 2 ranks; bam is
+# single-rank by construction (its contract is capacity, not transport) and
+# ignores the launcher.
+#
+# THE MPI HERE IS NOT cray-mpich. Delta's system MPI has no mpirun and is
+# libmpich; NVSHMEM's MPI bootstrap is a dlopen'd plugin NVIDIA built against
+# OpenMPI and hard-requires libmpi.so.40. So the baselines build and launch
+# against the HPC-X OpenMPI inside nvhpc (env.sh puts it on PATH and
+# LD_LIBRARY_PATH), which is the MPI NVSHMEM and NCCL ship alongside. That
+# makes the pkg's default launcher ALMOST right -- but OpenMPI binds
+# processes itself, and inside a Slurm cgroup cpuset that fails outright:
+#
+#   hwloc_set_cpubind returned "Error" for bitmap "0"
+#   ... The specified application failed to start (code -125)
+#
+# so the launcher below adds --bind-to none and lets Slurm own the affinity.
+# (Against cray-mpich the launcher would instead be "srun -n {n}", which
+# also works for mpi and nccl -- but not for nvshmem, per the paragraph
+# above. That is why the whole matrix rides OpenMPI.)
+#
+# Submit:  jarvis ppl submit gv_variant_matrix_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 2      # srun -n 2 needs two task slots
+  cpus_per_task: 8
+  mem: 60g
+  gpus_per_node: 2        # one per rank, so nccl/nvshmem have a real peer
+  time: "00:10:00"
+  job_name: gv_variant_matrix
+  output: /u/llogan/gv_job_logs/gv_variant_matrix-%j.out
+  error: /u/llogan/gv_job_logs/gv_variant_matrix-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=index,name --format=csv,noheader"
+    # Prove the comm libraries resolve BEFORE any cell runs: a missing
+    # libnvshmem_host.so.3 otherwise shows up as an opaque per-cell failure.
+    - "which mpirun"
+    - "ldd $(which clio_lammps_md_nvshmem_bench) | grep -iE 'libmpi|nvshmem|not found' || true"
+    - "ldd $(which clio_lammps_md_nccl_bench) | grep -iE 'nccl|not found' || true"
+
+config:
+  name: gv_variant_matrix_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: mpi
+      nprocs: 2
+      mpi_launcher: "mpirun -n {n} --oversubscribe --bind-to none"
+      prefault: "0"
+      timeout_sec: 180
+      output_dir: /tmp/clio_gv/variant_matrix
+
+vars:
+  # Tiny problems, zipped per workload. Sized so a cell is seconds, not
+  # minutes -- the question is "does this substrate run", nothing more.
+  wl.workload: [kmeans, weights, grayscott, gmx, lbann, lammps_md]
+  wl.steps:    [2,      1,       2,         0,   2,     10]
+  wl.data_mb:  [512,    512,     512,       0,   0,     0]
+  wl.atoms:    [0,      0,       0,         200000, 0,  0]
+  wl.mesh_k:   [0,      0,       0,         128, 0,     0]
+  wl.in_dim:   [0,      0,       0,         0,   1024,  0]
+  wl.hidden:   [0,      0,       0,         0,   4096,  0]
+  wl.out_dim:  [0,      0,       0,         0,   64,    0]
+  wl.batch:    [0,      0,       0,         0,   128,   0]
+  wl.lattice:  [0,      0,       0,         0,   0,     40]
+  # The substrate axis.
+  wl.variant:  [mpi, nvshmem, bam, nccl]
+
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.atoms, wl.mesh_k, wl.in_dim,
+     wl.hidden, wl.out_dim, wl.batch, wl.lattice]
+  - [wl.variant]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/variant_matrix"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  piv = df.pivot_table(index='wl.workload', columns='wl.variant',
+                       values='gates_pass', aggfunc='max')
+  logger.info('\ngates_pass by (workload x substrate):\n' + piv.to_string())
+  # nccl legitimately exists only for lammps_md; everything else that is 0
+  # is a real failure worth naming.
+  bad = df[(df.get('completed', 0) != 1) &
+           ~((df['wl.variant'] == 'nccl') & (df['wl.workload'] != 'lammps_md'))]
+  for _, r in bad.iterrows():
+      logger.warning('DID NOT RUN: %s %s' % (r['wl.workload'], r['wl.variant']))
+  if not len(bad):
+      logger.info('every substrate that has a binary ran and passed')

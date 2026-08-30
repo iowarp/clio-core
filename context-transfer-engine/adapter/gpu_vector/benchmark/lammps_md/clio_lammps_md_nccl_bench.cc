@@ -56,6 +56,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using u32 = unsigned int;

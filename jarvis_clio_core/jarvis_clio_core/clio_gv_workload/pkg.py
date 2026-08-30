@@ -266,6 +266,13 @@ class ClioGvWorkload(Application):
              'msg': 'gmx paged: skip the dense in-VRAM reference (needed '
                     'for 6GB-class meshes; conservation gate still runs)',
              'type': bool, 'default': False},
+            {'name': 'mpi_launcher',
+             'msg': 'launcher for the mpi/nccl/nvshmem variants; "{n}" is '
+                    'substituted with nprocs. The default is OpenMPI '
+                    '(--oversubscribe is an OpenMPI-only flag). A Cray '
+                    'site has no mpirun at all -- cray-mpich launches '
+                    'through slurm -- so there use "srun -n {n}"',
+             'type': str, 'default': 'mpirun -n {n} --oversubscribe'},
             {'name': 'prefault',
              'msg': 'CLIO_PREFAULT value ("0" = pre-fault the whole RAM '
                     'tier: warmed memory; "" = leave population lazy)',
@@ -451,7 +458,7 @@ class ClioGvWorkload(Application):
             # hold the port against every later cell of the sweep.
             parts.append('timeout -k 30 %d' % c['timeout_sec'])
         if c['variant'] in ('mpi', 'nccl', 'nvshmem'):
-            parts.append('mpirun -n %d --oversubscribe' % c['nprocs'])
+            parts.append(c['mpi_launcher'].format(n=c['nprocs']))
         parts.append(self._binary())
         parts += self._args()
         return ' '.join(parts)
