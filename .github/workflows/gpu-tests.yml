@@ -228,12 +228,14 @@ jobs:
           set -e
           base=context-transfer-engine/adapter/gpu_vector/test
           for d in distributed distributed_generation distributed_md \
-                   distributed_md_paged distributed_md_bench; do
+                   distributed_md_paged distributed_md_bench \
+                   distributed_workloads; do
             echo "== $d"
             bash -n "$base/$d"/run_*.sh
             # The harnesses require these to be set; the values are irrelevant
             # to a parse and a missing one is a hard error, not a warning.
             ( cd "$base/$d" && \
               HOST_WORKSPACE=/tmp CUDA_HOME=/tmp NVSHMEM_HOME=/tmp \
-              MD_SSH_DIR=/tmp docker compose config -q )
+              MD_SSH_DIR=/tmp GVW_BENCH=parse-only \
+              docker compose config -q )
           done
