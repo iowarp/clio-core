@@ -5,6 +5,7 @@
  */
 
 #include "../weights_launch.h"
+#include "../../gv_launch_bounds.h"
 
 #include "../weights_kernels.h"
 
@@ -12,7 +13,7 @@ namespace clio::gv_bench::weights {
 
 namespace {
 
-__global__ void SeedKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
+__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
                            u32 flat_pct, View yv, StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
@@ -21,7 +22,7 @@ __global__ void SeedKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
   CLIO_YCORO_RUN(SeedLaneCoro(v, per, page_elems, flat_pct, yv.Block()));
 }
 
-__global__ void WeightsKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
+__global__ GV_LAUNCH_BOUNDS void WeightsKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
                               unsigned long long *sum,
                               unsigned long long *page_sum,
                               unsigned *page_visits, View yv, StackView ys) {
@@ -33,7 +34,7 @@ __global__ void WeightsKernel(GpuInfo info, DevU32 v, u64 per, u64 page_elems,
                                  page_visits, yv.Block()));
 }
 
-__global__ void BaselineKernel(const u32 *tile, u64 gbase, u64 n,
+__global__ GV_LAUNCH_BOUNDS void BaselineKernel(const u32 *tile, u64 gbase, u64 n,
                                unsigned long long *sum,
                                unsigned long long *page_sum,
                                unsigned *page_visits, u64 page_elems) {

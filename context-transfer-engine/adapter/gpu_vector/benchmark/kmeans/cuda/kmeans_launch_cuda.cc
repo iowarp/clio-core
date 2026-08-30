@@ -9,6 +9,7 @@
  */
 
 #include "../kmeans_launch.h"
+#include "../../gv_launch_bounds.h"
 
 #include "../kmeans_kernels.h"
 
@@ -19,7 +20,7 @@ namespace {
 /** The prologue every yieldable kernel repeats: bind this block to its page
  *  table, publish the lane stack, then run the chain. Identical to the SYCL
  *  side's, which is the point. */
-__global__ void SeedKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
+__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
                            u32 dims, u32 k, View yv, StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
@@ -28,7 +29,7 @@ __global__ void SeedKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
   CLIO_YCORO_RUN(SeedCoro(v, per, page_elems, dims, k, yv.Block()));
 }
 
-__global__ void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
+__global__ GV_LAUNCH_BOUNDS void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
                              u32 dims, u32 k, const float *cent, float *sums,
                              unsigned *counts, View yv, StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -39,13 +40,13 @@ __global__ void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
                             yv.Block()));
 }
 
-__global__ void BaselineKernel(const float *tile, u64 n, u32 dims, u32 k,
+__global__ GV_LAUNCH_BOUNDS void BaselineKernel(const float *tile, u64 n, u32 dims, u32 k,
                                const float *cent, float *sums,
                                unsigned *counts) {
   BaselineBody(tile, n, dims, k, cent, sums, counts);
 }
 
-__global__ void UpdateKernel(float *cent, const float *sums,
+__global__ GV_LAUNCH_BOUNDS void UpdateKernel(float *cent, const float *sums,
                              const unsigned *counts, u32 dims, u32 k) {
   UpdateBody(cent, sums, counts, dims, k);
 }

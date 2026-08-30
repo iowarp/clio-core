@@ -9,6 +9,7 @@
  */
 
 #include "../grayscott_launch.h"
+#include "../../gv_launch_bounds.h"
 
 #include "../grayscott_kernels.h"
 
@@ -16,7 +17,7 @@ namespace clio::gv_bench::grayscott {
 
 namespace {
 
-__global__ void SeedKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
+__global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, View yv,
                            StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -28,7 +29,7 @@ __global__ void SeedKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
   CLIO_YCORO_RUN(SeedCoro(vec, plane, nx, ny, nz, z0, z1, ubase, vbase));
 }
 
-__global__ void StepKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
+__global__ GV_LAUNCH_BOUNDS void StepKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, u64 unext,
                            u64 vnext, float Du, float Dv, float F, float K,
                            float dt, View yv, StackView ys) {
@@ -42,7 +43,7 @@ __global__ void StepKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                           vnext, Du, Dv, F, K, dt));
 }
 
-__global__ void SumKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nz,
+__global__ GV_LAUNCH_BOUNDS void SumKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nz,
                           u64 zper, u64 vbase, double *out, View yv,
                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -54,7 +55,7 @@ __global__ void SumKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nz,
   CLIO_YCORO_RUN(SumCoro(vec, plane, z0, z1, vbase, out));
 }
 
-__global__ void BaselineKernel(const float *uzm, const float *uz,
+__global__ GV_LAUNCH_BOUNDS void BaselineKernel(const float *uzm, const float *uz,
                                const float *uzp, const float *vzm,
                                const float *vz, const float *vzp, float *unx,
                                float *vnx, u64 plane, u64 nx, u64 ny,

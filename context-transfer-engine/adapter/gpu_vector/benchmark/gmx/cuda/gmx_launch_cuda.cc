@@ -7,6 +7,7 @@
  */
 
 #include "../gmx_launch.h"
+#include "../../gv_launch_bounds.h"
 
 #include "../gmx_kernels.h"
 
@@ -14,7 +15,7 @@ namespace clio::gv_bench::gmx {
 
 namespace {
 
-__global__ void ZeroKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
+__global__ GV_LAUNCH_BOUNDS void ZeroKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
                            u64 zper, View yv, StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
@@ -25,7 +26,7 @@ __global__ void ZeroKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
   CLIO_YCORO_RUN(ZeroCoro(mesh, plane, z0, z1));
 }
 
-__global__ void SpreadKernel(GpuInfo info, DevMesh mesh, const float *ax,
+__global__ GV_LAUNCH_BOUNDS void SpreadKernel(GpuInfo info, DevMesh mesh, const float *ax,
                              const float *ay, const float *az,
                              const long long *aq, const u32 *bin_start, u64 K,
                              u64 plane, u64 zper, View yv, StackView ys) {
@@ -38,7 +39,7 @@ __global__ void SpreadKernel(GpuInfo info, DevMesh mesh, const float *ax,
   CLIO_YCORO_RUN(SpreadCoro(mesh, ax, ay, az, aq, bin_start, K, plane, z0, z1));
 }
 
-__global__ void SumKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
+__global__ GV_LAUNCH_BOUNDS void SumKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
                           u64 zper, unsigned long long *out, View yv,
                           StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -50,7 +51,7 @@ __global__ void SumKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
   CLIO_YCORO_RUN(SumCoro(mesh, K, plane, z0, z1, out));
 }
 
-__global__ void GatherKernel(GpuInfo info, DevMesh mesh, const float *ax,
+__global__ GV_LAUNCH_BOUNDS void GatherKernel(GpuInfo info, DevMesh mesh, const float *ax,
                              const float *ay, const float *az,
                              const long long *aq, const u32 *bin_start, u64 K,
                              u64 plane, u64 bper, unsigned long long *out,
@@ -65,19 +66,19 @@ __global__ void GatherKernel(GpuInfo info, DevMesh mesh, const float *ax,
                             out));
 }
 
-__global__ void DenseSpreadKernel(unsigned long long *mesh, const float *ax,
+__global__ GV_LAUNCH_BOUNDS void DenseSpreadKernel(unsigned long long *mesh, const float *ax,
                                   const float *ay, const float *az,
                                   const long long *aq, const u32 *bin_start,
                                   u64 K, u64 plane, u64 zper) {
   DenseSpreadBody(mesh, ax, ay, az, aq, bin_start, K, plane, zper);
 }
 
-__global__ void DenseSumKernel(const unsigned long long *mesh, u64 n,
+__global__ GV_LAUNCH_BOUNDS void DenseSumKernel(const unsigned long long *mesh, u64 n,
                                unsigned long long *out) {
   DenseSumBody(mesh, n, out);
 }
 
-__global__ void DenseGatherKernel(const unsigned long long *mesh,
+__global__ GV_LAUNCH_BOUNDS void DenseGatherKernel(const unsigned long long *mesh,
                                   const float *ax, const float *ay,
                                   const float *az, const long long *aq,
                                   const u32 *bin_start, u64 K, u64 plane,
