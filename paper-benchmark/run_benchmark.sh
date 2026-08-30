@@ -81,11 +81,16 @@ COST_MODELS="balance"
 # BENCHMARK.md.
 EXPLORE_K=31
 
-# upstream NeuroPress's own benchmark value. MANDATORY, not a default to be
-# switched off: at 0 the 16 quantize actions are masked and half the action
-# space cannot be measured at all. --eb 0 is refused below rather than quietly
-# producing a half-covered run.
-LOSSY_EB=1e-3
+# MANDATORY, not a default to be switched off: at 0 the 16 quantize actions
+# are masked and half the action space cannot be measured at all. --eb 0 is
+# refused below rather than quietly producing a half-covered run.
+#
+# This is an ABSOLUTE bound, so it has to be read against each field's own
+# magnitude, not against the dataset as a whole. At upstream NeuroPress's 1e-3
+# the 30 GiB VPIC run put 720 of 3840 chunks (18.8%) BELOW the bound entirely
+# -- div_e_err, div_b_err and rhob have data ranges of 1e-6..1e-8, so the
+# quantizer flattened them to a constant and measured SSIM ~0 at PSNR ~5 dB.
+LOSSY_EB=0.01
 
 # 3, and not out of caution: exploration adopts on MEASURED cost, so repeated
 # runs on byte-identical input disagree -- 23% spread at 5 GB/s, and it widens
