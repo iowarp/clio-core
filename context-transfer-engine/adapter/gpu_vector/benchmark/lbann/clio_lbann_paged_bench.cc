@@ -196,26 +196,33 @@ int main(int argc, char **argv) {
                  (unsigned long long)O, nodes);
     return 2;
   }
-  // MULTI-NODE IS REFUSED until the three exchanges exist. The band split
-  // below is in place and single-node is byte-identical through it (h0=0,
-  // h1=H collapses to the old expression), but model parallelism here also
-  // needs, every step:
-  //   a1  all-gathered after Fwd1 -- Fwd2 reads every h-row, not just ours
-  //   d2  all-gathered after Fwd2 -- Bwd1 reads every o-row
-  //   d1  all-REDUCED after Bwd1  -- it is a sum over o-rows, so each node
-  //       holds a partial, not a slice
-  // Without them each node trains on a third of a network and the WEIGHT
-  // gate would compare against a dense reference that saw all of it.
-  // Gathering via ReduceSum needs the non-owned rows zeroed first, so it
-  // is not a one-liner and is not worth guessing at.
-  if (nodes > 1) {
-    std::fprintf(stderr,
-                 "LBANN ERROR: --nodes %u requested, but the a1/d2 "
-                 "all-gather and d1 all-reduce are not implemented; each "
-                 "node would train on its own band only. Refusing.\n",
-                 nodes);
-    return 2;
-  }
+  // MULTI-NODE IS REFUSED. The band split below is in place and single
+  // node is byte-identical through it (h0=0, h1=H collapses to the old
+  // expression), but the exchanges are not, and working out WHICH ones are
+  // needed turned up a blocker.
+  //
+  // With the band split as written (a node owns h-rows), the data flow is:
+  //   a1  MUST be all-gathered after Fwd1 -- Fwd2 sums over every h, and
+  //       Upd2 reads every h as well, so a node's own band is not enough.
+  //   d2  MUST be all-gathered after Fwd2 -- Bwd1 sums over every o.
+  //   d1  needs NOTHING. Bwd1 computes d1 for the node's own h-rows and
+  //       Upd1 consumes exactly those, so it never leaves the node. (An
+  //       earlier note here claimed d1 needed an all-reduce; that is wrong
+  //       for this partition and is corrected.)
+  //
+  // THE BLOCKER is not a missing collective. Bwd1's own comment says it:
+  // "This block owns d1 rows h0..h1 and must read ALL of W2 for them."
+  // W2 lives in the shared paged vector, and with an o-row band split the
+  // rows outside this node's band are written by PEERS -- so Bwd1 does a
+  // cross-node read of weights a peer updated last step, which is the same
+  // stale-page problem that currently blocks grayscott, and it is blocked
+  // on the same generational-publish defect.
+  //
+  // The MPI edition sidesteps this by partitioning Bwd1 BY O instead: each
+  // rank forms a PARTIAL d1 from its own o-rows and the partials are
+  // combined in rank order. No rank ever reads another's W2. Doing that
+  // here means re-partitioning the kernel, not just narrowing a range, so
+  // it is a real change rather than the finish of this one.
   const u64 h0 = (H / nodes) * node, h1 = h0 + H / nodes;
   const u64 o0 = (O / nodes) * node, o1 = o0 + O / nodes;
   // Blocks subdivide this node's band, not the whole layer.
