@@ -1,7 +1,7 @@
 # Does every SUBSTRATE actually run on Delta? -- the functional matrix.
 #
-# Six workloads x the four CTE-free baselines (mpi, nvshmem, bam, nccl) at
-# deliberately tiny problem sizes. This is a "does it work" check, not a
+# Six workloads x the CTE-free baselines (mpi, nvshmem, nccl) at deliberately
+# tiny problem sizes. This is a "does it work" check, not a
 # measurement: nothing here is an anchor, and the numbers are not comparable
 # to anything.
 #
@@ -10,22 +10,22 @@
 # and its cells need per-workload page geometry that has nothing to do with
 # whether a baseline links and launches.
 #
-# EXPECTED HOLES. nccl exists ONLY for lammps_md; the other five nccl cells
-# have no binary and report completed=0. That is the documented shape of the
-# matrix (see ../register_eval/register_eval.yaml), not a failure.
+# bam IS NOT IN THE STUDY. It was measured once (5/6 passing, grayscott
+# hanging with no output at both 120 s and 240 s) and then dropped by
+# decision, not by defect -- so nothing here waits on it and timeout_sec is
+# sized for the comm substrates alone.
 #
-# KNOWN FAILURE: grayscott x bam HANGS -- it produces no output at all and is
-# killed by timeout_sec (measured twice, at 120 s and at 240 s, while the
-# other five bam cells finish in 1.4-143 s). timeout_sec below is set to 180,
-# which is above the slowest passing cell (weights/bam, 143 s) and well
-# under the wall clock, so the hang costs one cell rather than the job.
+# EXPECTED HOLES. nccl has an edition for ONLY lammps_md -- there is no
+# clio_<wl>_nccl_bench.cc for the other five, so those cells have no binary
+# and report completed=0. Every one of those five workloads uses collectives
+# that map straight onto NCCL (kmeans/weights/gmx: Allreduce+Bcast;
+# grayscott: +Sendrecv halo; lbann: +Allgather), so the holes are unwritten
+# code rather than anything NCCL cannot express.
 #
 # TWO GPUs, and two ranks. nccl and nvshmem are COMMUNICATION substrates: at
 # -n 1 they initialise and then talk to nobody, which would prove almost
 # nothing about whether they work. nprocs=2 on 2 A100s makes them actually
-# move bytes between devices. mpi rides the same 2 ranks; bam is
-# single-rank by construction (its contract is capacity, not transport) and
-# ignores the launcher.
+# move bytes between devices. mpi rides the same 2 ranks.
 #
 # THE MPI HERE IS NOT cray-mpich. Delta's system MPI has no mpirun and is
 # libmpich; NVSHMEM's MPI bootstrap is a dlopen'd plugin NVIDIA built against
@@ -54,7 +54,7 @@ scheduler:
   cpus_per_task: 8
   mem: 60g
   gpus_per_node: 2        # one per rank, so nccl/nvshmem have a real peer
-  time: "00:10:00"
+  time: "00:06:00"
   job_name: gv_variant_matrix
   output: /u/llogan/gv_job_logs/gv_variant_matrix-%j.out
   error: /u/llogan/gv_job_logs/gv_variant_matrix-%j.err
@@ -77,7 +77,7 @@ config:
       nprocs: 2
       mpi_launcher: "mpirun -n {n} --oversubscribe --bind-to none"
       prefault: "0"
-      timeout_sec: 180
+      timeout_sec: 120
       output_dir: /tmp/clio_gv/variant_matrix
 
 vars:
@@ -94,7 +94,7 @@ vars:
   wl.batch:    [0,      0,       0,         0,   128,   0]
   wl.lattice:  [0,      0,       0,         0,   0,     40]
   # The substrate axis.
-  wl.variant:  [mpi, nvshmem, bam, nccl]
+  wl.variant:  [mpi, nvshmem, nccl]
 
 loop:
   - [wl.workload, wl.steps, wl.data_mb, wl.atoms, wl.mesh_k, wl.in_dim,

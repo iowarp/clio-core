@@ -91,20 +91,38 @@ Two things that will bite you:
 
 ## Substrates
 
-All 25 (workload × substrate) binaries build, and every one that exists runs
-on Delta. Measured by `gv_variant_matrix_a100.yaml` on 2 A100s (job
-21606871):
+All 25 (workload × substrate) binaries build. Measured by
+`gv_variant_matrix_a100.yaml` on 2 A100s (job 21606871):
 
-| workload | paged | mpi | nvshmem | bam | nccl |
-|---|---|---|---|---|---|
-| kmeans | ✅ | ✅ | ✅ | ✅ | — |
-| weights | ✅ | ✅ | ✅ | ✅ | — |
-| grayscott | ✅ | ✅ | ✅ | **hangs** | — |
-| gmx | ✅ | ✅ | ✅ | ✅ | — |
-| lbann | ✅ | ✅ | ✅ | ✅ | — |
-| lammps_md | ✅ | ✅ | ✅ | ✅ | ✅ |
+| workload | paged | mpi | nvshmem | nccl |
+|---|---|---|---|---|
+| kmeans | ✅ | ✅ | ✅ | — |
+| weights | ✅ | ✅ | ✅ | — |
+| grayscott | ✅ | ✅ | ✅ | — |
+| gmx | ✅ | ✅ | ✅ | — |
+| lbann | ✅ | ✅ | ✅ | — |
+| lammps_md | ✅ | ✅ | ✅ | ✅ |
 
-`—` is by design: NCCL has an edition only for lammps_md.
+**BaM is not in the study** — dropped by decision. For the record it built
+for all six and passed five (kmeans 6.6 s, gmx 1.4 s, lbann 1.9 s,
+lammps_md 2.4 s, weights 143 s); `grayscott × bam` hung, emitting no output
+and dying on the timeout at both 120 s and 240 s. Undiagnosed, and now moot.
+
+### The NCCL holes are missing code, not missing capability
+
+`—` above means there is no `clio_<wl>_nccl_bench.cc` at all: lammps_md is
+the only workload with an NCCL edition in the tree. That is not because the
+others cannot use NCCL — every one of their MPI editions is built from
+collectives with a direct NCCL equivalent:
+
+| workload | MPI primitives used | NCCL equivalent |
+|---|---|---|
+| kmeans / weights / gmx | Allreduce, Bcast | `ncclAllReduce`, `ncclBroadcast` |
+| grayscott | + Sendrecv (halo) | + `ncclSend`/`ncclRecv` |
+| lbann | + Allgather | + `ncclAllGather` |
+| lammps_md | Allreduce, Sendrecv | already implemented |
+
+So five NCCL editions are writable against the existing MPI siblings.
 
 NVSHMEM runs 2 real PEs on 2 GPUs (`PEs=2` in the bench output), not the
 single-PE degenerate case — see the bootstrap note below for why that
