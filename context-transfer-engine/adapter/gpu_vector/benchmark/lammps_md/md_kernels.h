@@ -1603,6 +1603,42 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
  *  vector is well under 2^24 elements). */
 CTP_INLINE_CROSS_FUN float ProbeVal(u64 i) { return static_cast<float>(i); }
 
+/** ld.global.cg / ld.global.cv, SPELLED OUT RATHER THAN NAMED.
+ *
+ *  nvcc gets these as __ldcg/__ldcv from sm_32_intrinsics.h. Clang's CUDA
+ *  headers DELIBERATELY do not include that header (see the comment in
+ *  __clang_cuda_runtime_wrapper.h: it defines __shfl and __ldg with inline
+ *  asm, and clang wants its own intrinsics for those), so under clang the
+ *  names do not exist for scalar types -- only the __half / __nv_bfloat16
+ *  overloads cuda_fp16.hpp brings in, which is what the overload resolution
+ *  error listed. Since clang IS the toolchain here (gpu_vector is device
+ *  coroutines end to end, CLIO_GPU_CLANG), calling __ldcg is calling nothing.
+ *
+ *  The INSTRUCTIONS are available on every arch this builds for; only the
+ *  declarations are missing. Emit them. The non-NVPTX arm is the host pass
+ *  (and a SYCL host compile), where the probe's cache semantics are moot. */
+__device__ inline float ProbeLoadCG(const float *p) {
+#if defined(__CUDA_ARCH__) || defined(__NVPTX__)
+  float v;
+  asm volatile("ld.global.cg.f32 %0, [%1];" : "=f"(v) : "l"(p) : "memory");
+  return v;
+#else
+  return *p;
+#endif
+}
+
+/** ld.global.cv: bypasses L1 AND treats L2 as volatile -- the "is the data
+ *  actually there" read below. Same missing-declaration story as CG. */
+__device__ inline float ProbeLoadCV(const float *p) {
+#if defined(__CUDA_ARCH__) || defined(__NVPTX__)
+  float v;
+  asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(p) : "memory");
+  return v;
+#else
+  return *p;
+#endif
+}
+
 __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
                                        u32 nblocks, u32 block) {
   const u64 epp = x.ElemsPerPage();
@@ -1629,7 +1665,7 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
         // mismatches vanish only under this, the bytes were always in the
         // frame and the kernel was reading a stale cached line -- host DMA
         // that lands mid-kernel is not visible to an ordinary ld.global.
-        const float seen = MdG().probe_ldcg ? __ldcg(&p[i]) : p[i];
+        const float seen = MdG().probe_ldcg ? ProbeLoadCG(&p[i]) : p[i];
         if (seen != ProbeVal(pg * epp + i)) {
           atomicAdd(&MdG().read_bad[0], 1ull);
           // IS THE DATA ACTUALLY THERE? Re-read the SAME element fully
@@ -1637,7 +1673,7 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
           // with no delay -- this is a pure cache question, not a timing
           // one. A match here means the bytes were in the frame all along
           // and the kernel was reading a stale cached line.
-          if (__ldcv(&p[i]) == ProbeVal(pg * epp + i)) {
+          if (ProbeLoadCV(&p[i]) == ProbeVal(pg * epp + i)) {
             atomicAdd(&MdG().read_bad[1], 1ull);
           }
           // DOES IT HEAL? Wait, re-read the SAME address through the SAME

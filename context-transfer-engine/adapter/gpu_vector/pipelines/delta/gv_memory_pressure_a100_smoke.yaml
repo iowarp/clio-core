@@ -1,0 +1,128 @@
+# SMOKE version of gv_memory_pressure_a100_1n.yaml -- one cell per workload,
+# sized to fit a 10-minute A100 allocation.
+#
+# This is not an experiment; it is the plumbing check that has to pass before
+# the 96-cell sweep is worth a 24-hour job:
+#   - the sbatch script's pre_cmds put build-clang/bin on PATH and the
+#     benchmarks actually start,
+#   - the single requested A100 is visible to CUDA and to the pkg's
+#     nvidia-smi VRAM sampler,
+#   - all six paged binaries reach their ALL-GATES-PASS marker at the 6 GB
+#     anchors on sm_80.
+#
+# It doubles as the timing probe that sizes the full sweep's wall clock --
+# see the measured per-cell numbers quoted in gv_memory_pressure_a100_1n.yaml.
+#
+# Every cell rides the TOP of both ladders (cache_level 4 = the most
+# permissive cache, blocks_level 3 = 32 blocks), because a plumbing check
+# should fail on plumbing, not on the tightest corner of the sweep.
+#
+# RESUME, AND THE FOOT-GUN INSIDE IT. jarvis's pipeline-test runner counts
+# the rows already in `<output>/results.csv` and skips that many runs
+# (pipeline_test.py: "Skip already-completed runs" -- it compares a COUNT, not
+# the parameters). For a 24-hour job that is exactly what you want: if the
+# allocation dies at cell 60, resubmitting the same YAML picks up at 61.
+# But it also means a results.csv left over from a DIFFERENT sweep silently
+# eats the first N cells of this one and still reports "N successful". Before
+# a fresh run, clear the directory:
+#     rm -rf $HOME/gv_pipeline_results/memory_pressure_a100_smoke
+# (Observed: a gmx-only 8-cell test pointed at the smoke run's output dir ran
+# 2 cells, inherited 6, and reported 8 successes.)
+#
+# Submit:  jarvis ppl submit gv_memory_pressure_a100_smoke.yaml
+# Script only (no sbatch):
+#          jarvis ppl submit gv_memory_pressure_a100_smoke.yaml +no_submit
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 1
+  # A quarter node: gpuA100x4 nodes are 64 cores / 256 GB / 4 A100s, and we
+  # are taking one of the four GPUs.
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_mp_a100_smoke
+  output: gv_mp_a100_smoke-%j.out
+  error: gv_mp_a100_smoke-%j.err
+  pre_cmds:
+    # env.sh is what makes the benchmarks runnable: it puts
+    # ${CLIO_GV_BUILD}/bin on PATH and LD_LIBRARY_PATH, and exports
+    # CLIO_PREFAULT=0. It is `set -u`-safe and re-sources the lmod init
+    # itself, because the generated script runs under `set -euo pipefail`
+    # in a non-login shell.
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv"
+    - "which clio_kmeans_paged_bench"
+
+config:
+  name: gv_memory_pressure_a100_smoke
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      cache_level: 4
+      blocks_level: 3
+      prefault: "0"
+      timeout_sec: 420
+      output_dir: /tmp/clio_gv/memory_pressure_a100_smoke
+
+vars:
+  # Same zipped anchor group as the full sweep -- see
+  # gv_memory_pressure_a100_1n.yaml for what each anchor is and why.
+  wl.workload:   [kmeans, weights, grayscott, gmx, lbann, lammps_md]
+  wl.steps:      [4, 3, 4, 0, 5, 20]
+  wl.data_mb:    [6000, 6000, 6000, 0, 0, 0]
+  wl.page_kb:    [1024, 1024, 1024, 6498, 672, 256]
+  wl.atoms:      [0, 0, 0, 200000, 0, 0]
+  wl.in_dim:     [0, 0, 0, 0, 4096, 0]
+  wl.hidden:     [0, 0, 0, 0, 172032, 0]
+  wl.out_dim:    [0, 0, 0, 0, 64, 0]
+  wl.batch:      [0, 0, 0, 0, 256, 0]
+  wl.lr:         [0, 0, 0, 0, 0.0001, 0]
+  wl.lattice:    [0, 0, 0, 0, 0, 126]
+  wl.ckpt:       [0, 0, 0, 0, 0, 5]
+  wl.hbm_mb:     [256, 256, 256, 0, 0, 0]
+  wl.nvme_mb:    [8192, 8192, 8192, 0, 0, 0]
+  wl.repeat:     [1, 0, 1, 1, 0, 0]
+  wl.no_dense:   [false, false, false, true, false, false]
+  wl.cache_ladder:
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "512,1024,2048,2944"
+    - "s128,s256,s512,s896"
+  wl.blocks_ladder:
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,64"
+    - "1,16,32,67"
+
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.page_kb, wl.atoms, wl.in_dim,
+     wl.hidden, wl.out_dim, wl.batch, wl.lr, wl.lattice, wl.ckpt,
+     wl.hbm_mb, wl.nvme_mb, wl.repeat, wl.no_dense, wl.cache_ladder,
+     wl.blocks_ladder]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/memory_pressure_a100_smoke"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  cols = [c for c in ['wl.workload', 'completed', 'gates_pass', 'bench_ms',
+                      'vram_peak_mb', 'faults', 'evicts'] if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      for _, r in bad.iterrows():
+          logger.warning('FAILED: %s' % r['wl.workload'])
+  else:
+      logger.info('all %d smoke cells passed their gates' % len(df))
