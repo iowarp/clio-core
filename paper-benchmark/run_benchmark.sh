@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Clio-NeuroPress benchmark: four simulation workloads, exploration mode, the
-# two cost models, lossless and lossy, across a bandwidth ladder.
+# Clio-NeuroPress benchmark: four simulation workloads, exploration mode,
+# lossy, across a bandwidth ladder.
 #
 #   ./run_benchmark.sh [--smoke] [--profile quick|mid|full] [--workloads "a b c"]
 #                      [--cost-models "balance ratio speed"] [--explore-k N]
@@ -9,7 +9,23 @@
 #
 # Every run is one cell of
 #
-#     workload  x  {lossless, lossy}  x  cost model  x  bandwidth
+#     workload  x  cost model  x  bandwidth
+#
+# LOSSY ONLY, AND EXHAUSTIVE. The point of this benchmark is the MEASURED
+# per-candidate metrics in explore.csv, not which candidate the model adopted,
+# and those two want opposite settings:
+#
+#   * K=31 measures the whole 32-action space per chunk. At NeuroPress's
+#     ranked window of 3 the cost model chooses WHICH 4 of the 32 get measured,
+#     so it is confounded into the observation -- measured on VPIC 126^3, one
+#     cell saw 15 of 32 actions, another 11, another 13, another 23. At 31 the
+#     window is the space, ranking cannot bias it, and the cost model affects
+#     only `cost` and `adopted`.
+#   * An error bound is MANDATORY because 16 of those 32 actions are quantize
+#     actions and they are masked at eb=0. A lossless pass measures at most
+#     half the space, and a lossy pass measures BOTH halves -- a K=31 run logs
+#     exactly 32 rows per chunk, 16 with quantize=0 and 16 with quantize=1 --
+#     so the lossless mode is redundant rather than complementary, and is gone.
 #
 # named for the cell it occupies (nyx_lossy_balance_nvme_10GBs), keeping its
 # raw per-chunk measurements -- blobs.csv, selection.csv, explore.csv. Nothing
@@ -17,8 +33,8 @@
 # and audit_run.py reconciles one run's CSVs against what reached the tier.
 #
 # --smoke is the "does every path still work" pass: quick profile, one repeat,
-# one bandwidth, so each workload contributes the four cells that cover both
-# modes and both cost models. 16 runs. Use it before starting a campaign.
+# one bandwidth, so each workload contributes one cell per cost model. Use it
+# before starting a campaign.
 #
 # WHY THE KNOBS ARE SET THE WAY THEY ARE -- the bandwidth ladder, why repeats
 # are mandatory, why the exploration threshold is not upstream's 0.5, what an
@@ -42,16 +58,34 @@ BW_REDUCED=(nvme_5GBs dram)     # control set for the ratio model
 # decompress time and I/O equally; ratio zeroes the two latency weights so cost
 # collapses to bytes/(ratio*bw); speed zeroes the I/O weight so only latency
 # counts. Override with --cost-models to run a subset or add speed.
-COST_MODELS="balance ratio"
+#
+# ONE model by default, and `balance` rather than `ratio`. At K=31 the cost
+# model cannot change what is measured, so a second one buys no candidates --
+# and `ratio` actively costs coverage: ratio-only cost is
+# bytes/(min(ratio,100)*bw) and nothing else, so once the predicted AND actual
+# ratio both clear the 100x cap the two costs are the same number, error_pct
+# is 0, and the strict gate never fires however low the threshold. Measured on
+# Nyx: 35 of 128 chunks explored under lossy-ratio against 103 of 128 under
+# lossy-balance.
+COST_MODELS="balance"
 
 # Alternatives MEASURED per chunk. Passed through to each workload's
 # --explore-k; 3 is NeuroPress's own ranked window, 31 the exhaustive action
-# space minus the primary. Wider is not automatically better: on the three
-# workloads whose data barely compresses, a wider sweep measures more
-# candidates under more GPU contention and adopts worse ones. BENCHMARK.md.
-EXPLORE_K=3
+# space minus the primary.
+#
+# 31, because this benchmark reports MEASUREMENTS rather than adoptions. The
+# caveat that argued for 3 still holds and is now a deliberate trade: a wider
+# sweep measures more candidates under more GPU contention and ADOPTS worse
+# ones, so `adopted`, the cost columns and the stored ratio are all worse at 31
+# than at 3. Read explore.csv, not summary.csv's ratio, when K is 31.
+# BENCHMARK.md.
+EXPLORE_K=31
 
-LOSSY_EB=1e-3                   # upstream NeuroPress's own benchmark value
+# upstream NeuroPress's own benchmark value. MANDATORY, not a default to be
+# switched off: at 0 the 16 quantize actions are masked and half the action
+# space cannot be measured at all. --eb 0 is refused below rather than quietly
+# producing a half-covered run.
+LOSSY_EB=1e-3
 
 # 3, and not out of caution: exploration adopts on MEASURED cost, so repeated
 # runs on byte-identical input disagree -- 23% spread at 5 GB/s, and it widens
@@ -88,6 +122,18 @@ for m in $COST_MODELS; do
   case "$m" in balance|ratio|speed) ;;
     *) echo "unknown cost model: $m (balance|ratio|speed)" >&2; exit 2;; esac
 done
+# The error bound is what unmasks the 16 quantize actions. Without it a run
+# measures at most half the action space, which is exactly the failure this
+# benchmark exists to avoid -- and it would do so silently, since a lossless
+# run looks entirely healthy. Refuse instead.
+if ! awk -v e="$LOSSY_EB" 'BEGIN{exit !(e+0>0)}'; then
+  echo "REFUSING TO START: --eb must be POSITIVE (got '$LOSSY_EB')." >&2
+  echo "This benchmark is lossy-only: 16 of the 32 actions are quantize" >&2
+  echo "actions and they are masked at eb=0, so a run without a bound can" >&2
+  echo "measure at most half the action space. Use run_sweep.sh for the" >&2
+  echo "lossless policy comparison." >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Profiles -- the three targets in the brief are not simultaneously reachable
@@ -252,7 +298,12 @@ FAILED=0 RAN=0
 for w in $WORKLOADS; do
   [ -d "$HERE/$w" ] || { echo "!! no such workload: $w" >&2; FAILED=$((FAILED+1)); continue; }
   workload_spec "$w"
-  for mode in lossless lossy; do
+  # Lossy only. The lossless pass used to sit beside this one; it measured a
+  # strict SUBSET of what a lossy pass measures (16 of the same 32 actions),
+  # so it doubled the campaign for no additional candidate. `mode` is kept as
+  # a variable rather than inlined because the cell tag, meta.json and
+  # collect.py all still carry it.
+  for mode in lossy; do
     for model in $COST_MODELS; do
       while read -r bwname; do
         [ -z "$bwname" ] && continue
