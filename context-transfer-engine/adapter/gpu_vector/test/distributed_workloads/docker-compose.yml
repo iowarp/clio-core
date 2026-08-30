@@ -1,0 +1,97 @@
+# Generic 2-node distributed run of ANY paged workload benchmark.
+#
+# The md harnesses are md-specific: distributed_md_bench hardcodes
+# clio_lammps_md_paged_bench and its --lattice/--steps deck. kmeans, weights,
+# gmx, grayscott and lbann had no distributed harness of any kind, so their
+# --nodes support could be written but never exercised. This runs whichever
+# one GVW_BENCH names.
+#
+# WHY THIS CAN EXIST NOW. Every paged bench used to write its own config and
+# Setenv CLIO_SERVER_CONF with overwrite=1, so a harness-supplied cluster
+# config was clobbered a line later and each node stood up its own single-host
+# runtime on the same port -- two of them on one network collide with
+# "Address already in use" and the survivor waits forever for a peer that
+# never arrives. All six now leave an already-set CLIO_SERVER_CONF alone.
+#
+# Run:
+#   GVW_BENCH=clio_kmeans_paged_bench \
+#   GVW_ARGS="--data-mb 64 --blocks 8 --iters 3 --repeat 1" \
+#   ./run_workloads_distributed.sh
+#
+# NEITHER NODE MAY LEAVE WHILE THE OTHER IS STILL PAGING. The runtime dies
+# with the process, and a peer whose pages live on the departing node then
+# waits forever. Each node touches .done_<id> on the shared mount and waits
+# for its peer's, up to GVW_BARRIER seconds -- a fixed sleep is not enough,
+# because node2 starts later and contends with node1.
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  # UNLIMITED memlock. cudaHostRegister charges against RLIMIT_MEMLOCK and
+  # docker's 64 MB default makes the RAM tier's span pinning fail SILENTLY,
+  # leaving holes in the pinned tiling; a copy crossing a pinned/unpinned seam
+  # then fails with "invalid argument".
+  ulimits:
+    memlock: -1
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:rw
+    - ${CUDA_HOME:-/usr/local/cuda-13.3}:/usr/local/cuda:ro
+    # The benches link libnvcomp (the compressed weights path), which is
+    # NOT in the deps image -- without this the container dies at exec with
+    # "libnvcomp.so.5: cannot open shared object file" and exit 127.
+    - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+  working_dir: /workspace
+  mem_limit: 8g
+
+services:
+  gvw-node1:
+    <<: *node
+    container_name: gvw-node1
+    hostname: gvw-node1
+    networks:
+      gvw-cluster: { ipv4_address: 172.26.0.10 }
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.26.0.10
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GVW_BARRIER=${GVW_BARRIER:-600}
+      - GVW_NODES=${GVW_NODES:-2}
+      - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    command: ["sh", "-c", "cd /tmp && /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 0; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    entrypoint: []
+
+  gvw-node2:
+    <<: *node
+    container_name: gvw-node2
+    hostname: gvw-node2
+    networks:
+      gvw-cluster: { ipv4_address: 172.26.0.11 }
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.26.0.11
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GVW_BARRIER=${GVW_BARRIER:-600}
+      - GVW_NODES=${GVW_NODES:-2}
+      - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    # Node 2 starts a moment later so node 1 wins the bind race for the
+    # cluster's main server; both orders work, but a deterministic one makes
+    # a failed run easier to read.
+    command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 1; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    entrypoint: []
+
+networks:
+  gvw-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24

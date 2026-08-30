@@ -475,6 +475,10 @@ int main(int argc, char **argv) {
     red_tag = t->tag_id_;
   }
 
+  // The reduced, whole-model checksum, reported so a distributed run can be
+  // told apart from N independent single-node runs: with --nodes 2 this must
+  // be twice the single-node value. checksum=OK alone cannot show that.
+  unsigned long long checksum_total = 0;
   unsigned long long want = 0;
   for (clio::run::u64 i = base_idx; i < base_idx + n; ++i) {
     want += static_cast<unsigned long long>(Weight(i, flat_pct)) * Activation(i);
@@ -582,6 +586,7 @@ int main(int argc, char **argv) {
       got_all = pair[0];
       want_all = pair[1];
     }
+    checksum_total = got_all;
     if (got_all != want_all) {
       ok = false;
       std::fprintf(stderr, "[cmp] got=%llu want=%llu ratio=%.4f\n",
@@ -685,7 +690,8 @@ int main(int argc, char **argv) {
   std::fprintf(stderr,
                "GVW mode=%s%s blocks=%u thr=%u hbm=%lluMB slots=%u pages=%llu "
                "flat=%u%% logical=%.1fMB stored=%.1fMB fits=%s ms=%llu GB/s=%.2f "
-               "checksum=%s put_errors=%llu faults=%llu get_errors=%llu "
+               "checksum=%s checksum_total=%llu put_errors=%llu faults=%llu "
+               "get_errors=%llu "
                "evicts=%llu rounds=%u memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
                baseline ? "baseline" : (compressed ? (gpu_codec ? "nvcomp" : "lz4") : "raw"),
                baseline ? "" : "+yield", blocks, nthreads,
@@ -694,6 +700,7 @@ int main(int argc, char **argv) {
                logical / (1024.0 * 1024.0), stored / (1024.0 * 1024.0),
                (stored <= hbm_mb * 1024ull * 1024ull) ? "yes" : "no",
                (unsigned long long) best_ms, best_gbps, ok ? "OK" : "MISMATCH",
+               checksum_total,
                (unsigned long long) stats.put_errors,
                (unsigned long long) stats.faults,
                (unsigned long long) stats.get_errors,
