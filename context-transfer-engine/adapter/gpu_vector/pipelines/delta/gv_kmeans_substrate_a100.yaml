@@ -1,0 +1,177 @@
+# k-means across substrates on ONE A100, at MATCHED launch geometry.
+#
+# This replaces the earlier substrate comparison, which was not controlled:
+# the paged side was pinned to 32 blocks by a sweep ladder while the MPI
+# side silently used its own 64x256 default, so "paged is 18.9x slower"
+# was mostly a 16x thread deficit on one side. Everything below exists to
+# make that class of error impossible rather than unlikely.
+#
+# WHAT IS HELD IDENTICAL ACROSS SUBSTRATES
+#   problem   data_mb, dims, clusters, iters
+#   geometry  blocks (via blocks_per_sm x sm_count), threads
+# clio_gv_kmeans REQUIRES both blocks and threads and passes them to every
+# variant -- it has no "0 = binary default" path -- and it reads the
+# geometry back out of each run's output (geometry_ok) so a flag that is
+# ignored or clamped fails the cell instead of producing a number.
+#
+# WHAT IS ALLOWED TO DIFFER
+# Only the paged cache/tier stack, because a resident substrate has no
+# counterpart to it. That asymmetry IS the measurement.
+#
+# GEOMETRY SIZED FOR THIS GPU, NOT THE ONE THE STUDY WAS WRITTEN ON.
+# The gpu_vector block ladders top out at 67, chosen as 80% of an RTX
+# 5080's 84 SMs. An A100 has 108 SMs, so 67 blocks leaves ~40% of the
+# device idle and both substrates end up measuring launch width. Here
+# blocks is expressed as blocks_per_sm and resolved against sm_count, so
+# the sweep spans genuinely under-, exactly- and over-subscribed:
+#   blocks_per_sm 1 -> 108 blocks   (one block per SM)
+#                 2 -> 216 blocks   (latency hiding)
+#                 4 -> 432 blocks   (oversubscribed)
+#
+# sm_count IS SET EXPLICITLY (108) rather than detected. The package can
+# detect it from the GPU name, but detection needs a GPU, and this file has
+# to be loadable on the login node for `jarvis ppl submit`. Stating it also
+# makes the geometry reproducible from the YAML alone.
+#
+# CACHE HELD CONSTANT WHILE BLOCKS VARY. cache_mb is a TOTAL, resolved to
+# per-block slots as cache_mb/blocks/page_kb, so sweeping blocks does not
+# quietly change the VRAM budget -- otherwise a blocks sweep is confounded
+# by a cache sweep. At 32768 MB the cache covers the 32 GB problem at every
+# rung (108x303, 216x151, 432x75 slots of 1 MB), i.e. residency throughout.
+#
+# NO REPEATS -- MORE ITERATIONS INSTEAD. The paged bench defaults to
+# `int repeat = 3` and reports the BEST of the three, while the resident
+# substrates get exactly one shot, so simply not passing --repeat would
+# have left a silent best-of-3 bias in paged's favour. The package now
+# passes --repeat 1 unconditionally and exposes no knob for it. Stability
+# comes from ITERATIONS, which cost every substrate equally.
+#
+# ITERS=20. MEASURED cost per cell: ~140 s of timed work plus ~40 s of
+# 32 GB dataset build (and RAM-tier prefault on the paged cells) = ~3 min,
+# so a 10-minute request holds THREE cells and the 9-cell sweep needs
+# three submissions. That is fine and intended: jarvis resumes a pipeline
+# test by row count, so resubmitting this same file continues where the
+# last job stopped (clear $HOME/gv_pipeline_results/kmeans_substrate to
+# start over).
+#
+# Do NOT size this from an assumed scaling law. Per-iteration cost does
+# NOT fall as blocks rise here -- measured 7862 / 8655 / 7343 ms/iter at
+# 108 / 216 / 432 blocks paged -- and two earlier wall-clock estimates
+# were wrong precisely because they assumed it would.
+#
+# ONE RANK. The paged edition is single-process on one GPU, so mpi and
+# nvshmem run at -n 1 on the same GPU. This measures the SUBSTRATE on
+# identical hardware. It does NOT exercise inter-GPU communication -- that
+# is a different question, answered separately by
+# gv_variant_matrix_a100.yaml at 2 ranks.
+#
+# SIZING: 9 cells. Each pays a 32 GB dataset build; the paged cells also
+# pay a ~32.5 GB RAM-tier prefault (40-65 s measured). Budget ~60-90 s per
+# paged cell and ~30-40 s per resident cell -> ~8 min. timeout_sec 300
+# bounds any single cell well inside the request.
+#
+# NOT YET RUN -- review before submitting.
+# Submit:  jarvis ppl submit gv_kmeans_substrate_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_kmeans_substrate
+  output: /u/llogan/gv_job_logs/gv_kmeans_substrate-%j.out
+  error: /u/llogan/gv_job_logs/gv_kmeans_substrate-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_kmeans_substrate_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_kmeans
+      pkg_name: km
+      variant: paged
+      # ---- the problem, identical for every cell ----
+      data_mb: 32000
+      dims: 32
+      clusters: 16
+      iters: 20
+      # ---- the geometry, identical for every cell at a given rung ----
+      blocks_per_sm: 1
+      sm_count: 108
+      threads: 256
+      # ---- paged-only ----
+      cache_mb: 32768
+      page_kb: 1024
+      hbm_mb: 256
+      nvme_mb: 8192
+      nvme_path: /tmp/gv_kmeans_tier.dat
+      # ---- harness ----
+      nprocs: 1
+      mpi_launcher: "mpirun -n {n} --oversubscribe --bind-to none"
+      prefault: "0"
+      timeout_sec: 300
+      output_dir: /tmp/clio_gv/kmeans_substrate
+
+vars:
+  km.variant: [paged, mpi, nvshmem]
+  km.blocks_per_sm: [1, 2, 4]
+
+loop:
+  - [km.variant]
+  - [km.blocks_per_sm]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/kmeans_substrate"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+
+  # 1. REFUSE TO REPORT AN UNCONTROLLED COMPARISON. geometry_ok is 0 when a
+  #    binary did not use the geometry it was given, and -1 when the
+  #    edition does not echo it (mpi/nvshmem) so no check was possible.
+  bad = df[df.get('geometry_ok', -1) == 0]
+  for _, r in bad.iterrows():
+      logger.warning('GEOMETRY MISMATCH %s bps=%s: asked b=%s t=%s, '
+                     'used b=%s t=%s'
+                     % (r['km.variant'], r['km.blocks_per_sm'],
+                        r.get('blocks_req'), r.get('threads_req'),
+                        r.get('blocks_used'), r.get('threads_used')))
+  if len(bad):
+      logger.warning('%d cells ran at the wrong geometry -- excluded'
+                     % len(bad))
+  df = df[df.get('geometry_ok', -1) != 0]
+
+  ok = df[df.gates_pass == 1]
+  cols = ['km.variant', 'km.blocks_per_sm', 'blocks_req', 'threads_total',
+          'iters', 'bench_ms', 'ms_per_iter', 'gbps', 'vram_peak_mb',
+          'faults', 'evicts', 'centroid_checksum']
+  logger.info('\n' + ok[[c for c in cols if c in ok.columns]]
+              .to_string(index=False))
+
+  # 2. THE COMPARISON, per rung, normalised per iteration.
+  if 'ms_per_iter' in ok.columns:
+      piv = ok.pivot_table(index='km.blocks_per_sm', columns='km.variant',
+                           values='ms_per_iter', aggfunc='min')
+      logger.info('\nms_per_iter by (blocks_per_sm x substrate):\n'
+                  + piv.to_string())
+      if 'paged' in piv.columns and 'mpi' in piv.columns:
+          logger.info('\npaged/mpi at matched geometry:\n'
+                      + (piv['paged'] / piv['mpi']).to_string())
+
+  # 3. SAME INPUTS IS NOT SAME ANSWER. The substrates must agree
+  #    numerically or the timings compare two different computations.
+  if 'centroid_checksum' in ok.columns:
+      for bps, g in ok.groupby('km.blocks_per_sm'):
+          cs = g['centroid_checksum'].dropna().unique()
+          if len(cs) > 1:
+              spread = (max(cs) - min(cs)) / max(abs(max(cs)), 1e-30)
+              logger.warning('bps=%s: substrates DISAGREE on the answer, '
+                             'checksums %s (rel spread %.3e)'
+                             % (bps, list(cs), spread))
