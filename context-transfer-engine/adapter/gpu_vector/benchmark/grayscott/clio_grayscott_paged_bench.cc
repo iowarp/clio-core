@@ -276,7 +276,10 @@ int main(int argc, char **argv) {
   // This bench's checksum has a TOLERANCE, so unlike gmx's fixed-point
   // gates it cannot fail loudly on a stale plane. A run that is quietly
   // 0.4% out is exactly the outcome worth refusing.
-  if (nodes > 1) {
+  // GS_FORCE_DIST=1 bypasses the refusal FOR DEBUGGING ONLY -- it is how the
+  // per-plane dump above gets a 2-node run to compare against. It is not a
+  // supported mode and the result is known to be wrong.
+  if (nodes > 1 && getenv("GS_FORCE_DIST") == nullptr) {
     std::fprintf(stderr,
                  "GRAYSCOTT ERROR: --nodes %u requested, but the halo "
                  "exchange is still wrong and nondeterministic past step "
@@ -586,6 +589,26 @@ int main(int argc, char **argv) {
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
 
+    // GS_PLANE_DUMP=1 prints a per-plane sum of v. Diffing that between a
+    // 1-node and a 2-node run says WHICH planes are wrong, which is the
+    // question -- a whole-field checksum only says that something is. Uses
+    // the existing sum kernel one plane at a time, so it measures the same
+    // bytes the gate does rather than a second path that could differ.
+    if (getenv("GS_PLANE_DUMP") != nullptr) {
+      for (u64 z = zbase; z < zend; ++z) {
+        ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
+        runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                       gy::YieldStackView sv) {
+          gs::LaunchSum(g, b, gpu, dev, plane, nz, 1, cv, d_sum, z, z + 1,
+                        vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+        double pz = 0.0;
+        ctp::GpuApi::Memcpy(&pz, d_sum, sizeof(double));
+        std::printf("  PLANE %llu %.6f\n", (unsigned long long)z, pz);
+      }
+      std::fflush(stdout);
+    }
     ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
