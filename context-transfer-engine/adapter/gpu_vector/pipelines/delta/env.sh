@@ -152,3 +152,21 @@ if [ -d "$CLIO_DELTA_OMPI" ]; then
   export PATH="$CLIO_DELTA_OMPI/bin:$PATH"
   export LD_LIBRARY_PATH="$CLIO_DELTA_OMPI/lib:${LD_LIBRARY_PATH:-}"
 fi
+
+# llvm-config FOR THE COROUTINE REGISTER CAP.
+#
+# cmake/ClioCoroRegCap.cmake builds an LLVM pass plugin (NVPTXCoroCap) that
+# stamps nvvm.maxnreg on the kernels which transitively execute a device
+# coroutine AND measured over budget. Its budget is
+# CLIO_CORO_REGS_PER_SM / (CLIO_CORO_REF_THREADS * CLIO_CORO_TARGET_BLOCKS)
+# = 65536 / (256 * 4) = 64 registers -- i.e. 4 blocks/SM.
+#
+# It is a NO-OP unless llvm-config is findable, and clang is referenced here
+# by absolute path (so LLVM's bin is deliberately NOT on PATH), which left
+# CLIO_LLVM_CONFIG-NOTFOUND and the cap silently inactive: the kmeans
+# coroutine kernels came out at REG=192, i.e. ONE block/SM and 12.5%
+# occupancy, against REG=32 and 100% for the CTE-free baselines.
+#
+# Pointed at explicitly rather than added to PATH, so nothing else in the
+# build starts resolving through the LLVM prefix.
+export CLIO_DELTA_LLVM_CONFIG="${CLIO_DELTA_LLVM_CONFIG:-$(dirname "$CLIO_DELTA_CLANGXX")/llvm-config}"
