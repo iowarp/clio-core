@@ -796,3 +796,34 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
         RUN_SERIAL TRUE
         ENVIRONMENT "BUILD_DIR=${_gv_build_name};BL_RANKS=4")
 endif()
+
+# ---------------------------------------------------------------------------
+# The SYCL editions of the paged gates.
+#
+# They need their OWN build tree -- DPC++ and nvcc cannot share one -- so
+# these only register when told where it is:
+#   -DCLIO_GV_SYCL_BUILD_DIR=build-syclreg
+# A directory name relative to the source root, not a path: the containers
+# mount the repo and resolve it inside.
+#
+# Same driver, same decks, same gates as the CUDA entries -- only the launch
+# TU differs -- so a divergence between the two is a real backend difference
+# rather than a differently-configured run.
+# ---------------------------------------------------------------------------
+set(CLIO_GV_SYCL_BUILD_DIR "" CACHE STRING
+    "Build dir holding the SYCL paged benches; enables the SYCL docker gates")
+
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
+   AND CLIO_GV_SYCL_BUILD_DIR)
+    foreach(_wl kmeans weights gmx grayscott lbann)
+        add_test(NAME cte_gv_distributed_sycl_${_wl}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+        )
+        set_tests_properties(cte_gv_distributed_sycl_${_wl} PROPERTIES
+            TIMEOUT 2400
+            LABELS "cte;gpu;gpu_vector;gv_dist_sycl;distributed;docker"
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_VARIANT=sycl")
+    endforeach()
+    message(STATUS "gpu_vector SYCL docker gates: ON (${CLIO_GV_SYCL_BUILD_DIR})")
+endif()

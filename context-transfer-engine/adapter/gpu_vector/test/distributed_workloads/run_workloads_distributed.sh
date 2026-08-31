@@ -90,22 +90,39 @@ deck() {
   esac
 }
 
+# GVW_VARIANT=sycl runs the SYCL editions instead of the CUDA ones. They are
+# the same driver and the same gates -- only the launch TU differs -- so the
+# decks and tolerances above apply unchanged. They live in their OWN build
+# tree (DPC++ cannot share one with nvcc), hence BUILD_DIR pointing
+# elsewhere, and they need the DPC++ prefix mounted for libsycl.
+if [ "${GVW_VARIANT:-}" = sycl ]; then
+  export DPCPP_HOME="${DPCPP_HOME:-$HOME/opt/dpcpp}"
+  if [ ! -d "$DPCPP_HOME/lib" ]; then
+    echo "GVW_VARIANT=sycl but no DPC++ at $DPCPP_HOME; set DPCPP_HOME" >&2
+    exit 2
+  fi
+fi
+bench_name() {   # deck() sets BENCH for the CUDA edition; adjust for SYCL
+  [ "${GVW_VARIANT:-}" = sycl ] && echo "${1}_sycl" || echo "$1"
+}
+
 extract() { sed -nE "s/.*${1}.*/\\1/p" "$2" | head -1; }
 
 run_one() {
   local wl="$1"; deck "$wl"
-  echo "=== $wl: single-node reference"
+  echo "=== $wl${GVW_VARIANT:+ [$GVW_VARIANT]}: single-node reference"
   local ref_log="/tmp/gvw_${wl}_ref.log"
-  ( cd "$BIN_DIR" && ./"$BENCH" $ARGS ) > "$ref_log" 2>&1 || {
+  ( cd "$BIN_DIR" && LD_LIBRARY_PATH="${DPCPP_HOME:-/nonexistent}/lib:$BIN_DIR:$LD_LIBRARY_PATH" \
+      ./"$(bench_name "$BENCH")" $ARGS ) > "$ref_log" 2>&1 || {
     echo "  reference run FAILED"; tail -5 "$ref_log"; return 1; }
   local ref; ref="$(extract "$KEY" "$ref_log")"
   echo "  reference: $ref"
 
-  echo "=== $wl: ${GVW_NODES}-node distributed"
+  echo "=== $wl${GVW_VARIANT:+ [$GVW_VARIANT]}: ${GVW_NODES}-node distributed"
   cd "$SCRIPT_DIR"
   # A leftover barrier file would let a node skip the wait entirely.
   rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
-  export GVW_BENCH="$BENCH" GVW_ARGS="$ARGS"
+  export GVW_BENCH="$(bench_name "$BENCH")" GVW_ARGS="$ARGS"
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose up -d $SVCS
   docker compose logs -f --no-color > "/tmp/gvw_${wl}_dist.log" 2>&1 &
@@ -189,7 +206,7 @@ if [ "$TARGET" = all ]; then
   done
   echo
   echo "=== summary"
-  echo "  validated distributed: kmeans weights gmx grayscott"
+  echo "  validated distributed: kmeans weights gmx grayscott lbann"
   [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
   [ -n "$FAILED" ] && echo "  FAILING:              $FAILED"
   exit $rc
