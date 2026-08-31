@@ -60,23 +60,35 @@ EPS = 1e-30
 # Sources. Each yields (step, {field_name: 1-D numpy array}) in step order.
 # ---------------------------------------------------------------------------
 def frames_f32(d, dtype, want=None):
-    """Nyx and VPIC: <dir>/plt%05d/fab0000_comp%02d_<field>.f32, one dir a dump.
+    """One directory per dump, one flat file per field. Two naming schemes:
 
-    Both dump through the same code shape, so one reader serves both. The
-    component index is part of the name but the field name is what identifies
-    a series across frames -- comp numbering is stable within a run and not
-    worth depending on across them.
+        Nyx, VPIC:  <dir>/plt%05d/fab0000_comp%02d_<field>.f32
+        WarpX:      <dir>/step%05d/<field>.f32
+
+    Nyx and VPIC dump through the same code shape, so one reader serves both;
+    the component index is part of the name but the FIELD NAME is what
+    identifies a series across frames, because comp numbering is stable within
+    a run and not worth depending on across them. WarpX's .f32 come from
+    warpx_gen_fields.sh, which h5dumps the openPMD output and names each file
+    after the dataset -- no fab/comp prefix to strip. Accepting both here is
+    what lets the block metric run on a replay workload's own dumps rather
+    than only on the openPMD it was extracted from.
     """
-    for fdir in sorted(glob.glob(os.path.join(d, "plt*"))):
+    dirs = sorted(glob.glob(os.path.join(d, "plt*"))) or \
+        sorted(glob.glob(os.path.join(d, "step*")))
+    for fdir in dirs:
         if not os.path.isdir(fdir):
             continue
-        step = int(re.search(r"plt(\d+)", os.path.basename(fdir)).group(1))
+        m = re.search(r"(?:plt|step)(\d+)", os.path.basename(fdir))
+        if not m:
+            continue
+        step = int(m.group(1))
         fields = {}
-        for p in sorted(glob.glob(os.path.join(fdir, "fab*_comp*_*"))):
-            m = re.match(r"fab\d+_comp\d+_(.+)\.(f32|f64)$", os.path.basename(p))
-            if not m:
-                continue
-            name = m.group(1)
+        for p in sorted(glob.glob(os.path.join(fdir, "*.f32")) +
+                        glob.glob(os.path.join(fdir, "*.f64"))):
+            base = os.path.basename(p)
+            mm = re.match(r"fab\d+_comp\d+_(.+)\.(f32|f64)$", base)
+            name = mm.group(1) if mm else os.path.splitext(base)[0]
             if want and name not in want:
                 continue
             fields[name] = np.fromfile(p, dtype=dtype)

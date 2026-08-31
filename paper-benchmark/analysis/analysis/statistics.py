@@ -361,3 +361,86 @@ def describe(series: pd.Series) -> dict:
             "median": float(v.median()), "std": float(v.std()),
             "min": float(v.min()), "p10": float(v.quantile(0.10)),
             "p90": float(v.quantile(0.90)), "max": float(v.max())}
+
+
+# --------------------------------------------------------------------------
+# The property x outcome matrix
+# --------------------------------------------------------------------------
+
+#: What the simulation hands the compressor, per chunk, before any transform.
+PROPERTY_COLS = ["entropy", "mad", "second_deriv", "data_range", "timestep"]
+#: What came out. Lossless and quantized ratio are kept APART: they answer
+#: different questions and mixing them lets the bound masquerade as a data
+#: property.
+OUTCOME_COLS = ["best_lossless_ratio", "best_quantized_ratio",
+                "fastest_ct_ms", "fastest_dt_ms", "quantized_ssim"]
+
+_MATRIX_LABELS = {
+    "entropy": "byte entropy", "mad": "MAD", "second_deriv": "2nd difference",
+    "data_range": "data range", "timestep": "timestep",
+    "best_lossless_ratio": "best lossless ratio",
+    "best_quantized_ratio": "best quantized ratio",
+    "fastest_ct_ms": "fastest compress (ms)",
+    "fastest_dt_ms": "fastest decompress (ms)",
+    "quantized_ssim": "SSIM (quantized)",
+}
+
+
+def property_outcome_frame(chunks: pd.DataFrame,
+                           rows: pd.DataFrame) -> pd.DataFrame:
+    """One row per chunk: every property beside every outcome.
+
+    Outcomes come from the ROW frame so lossless and quantized can be split:
+    `best_ratio_value` on the chunk frame is the best over all 32 candidates
+    and would let a quantized 6000x stand in for the data's compressibility.
+    """
+    if "chunk_uid" not in chunks.columns or "chunk_uid" not in rows.columns:
+        return pd.DataFrame()
+    props = [c for c in PROPERTY_COLS if c in chunks.columns]
+    d = chunks[["chunk_uid"] + props].copy()
+    r = rows.replace([np.inf, -np.inf], np.nan)
+    if "quantize" in r.columns and "ratio" in r.columns:
+        ll = r[r["quantize"] == 0].groupby("chunk_uid")["ratio"].max()
+        qz = r[r["quantize"] == 1].groupby("chunk_uid")["ratio"].max()
+        d["best_lossless_ratio"] = d["chunk_uid"].map(ll)
+        d["best_quantized_ratio"] = d["chunk_uid"].map(qz)
+    for src, dst in (("fastest_ct_value", "fastest_ct_ms"),
+                     ("fastest_dt_value", "fastest_dt_ms")):
+        if src in chunks.columns:
+            d[dst] = chunks[src].to_numpy()
+    if "meas_ssim" in r.columns and "quantize" in r.columns:
+        ss = pd.to_numeric(r.loc[r["quantize"] == 1, "meas_ssim"],
+                           errors="coerce")
+        d["quantized_ssim"] = d["chunk_uid"].map(
+            ss.groupby(r.loc[ss.index, "chunk_uid"]).median())
+    return d
+
+
+def property_outcome_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+    """Spearman over every pair, long form, with the support of each pair.
+
+    Spearman throughout: every one of these relationships is monotone and
+    heavy-tailed (ratio spans four decades, MAD seven), so a Pearson r would
+    be set by the handful of extreme chunks and read as a fit to outliers.
+    """
+    cols = [c for c in PROPERTY_COLS + OUTCOME_COLS if c in frame.columns]
+    recs = []
+    for i, a in enumerate(cols):
+        for b in cols[i:]:
+            x = pd.to_numeric(frame[a], errors="coerce")
+            y = pd.to_numeric(frame[b], errors="coerce")
+            m = x.notna() & y.notna()
+            n = int(m.sum())
+            if a == b:
+                rho, p = 1.0, 0.0
+            elif n < 8 or x[m].nunique() < 2 or y[m].nunique() < 2:
+                rho, p = float("nan"), float("nan")
+            else:
+                res = sps.spearmanr(x[m], y[m])
+                rho, p = float(res.correlation), float(res.pvalue)
+            recs.append({"a": a, "b": b, "a_label": _MATRIX_LABELS.get(a, a),
+                         "b_label": _MATRIX_LABELS.get(b, b),
+                         "a_kind": "property" if a in PROPERTY_COLS else "outcome",
+                         "b_kind": "property" if b in PROPERTY_COLS else "outcome",
+                         "spearman_rho": rho, "p": p, "n": n})
+    return pd.DataFrame(recs)
