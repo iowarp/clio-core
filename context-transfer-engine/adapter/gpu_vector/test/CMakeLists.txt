@@ -862,3 +862,39 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
             ENVIRONMENT "BUILD_DIR=${_gv_build_name}")
     endforeach()
 endif()
+
+# ---------------------------------------------------------------------------
+# The SYCL edition of the MPI baseline, at 2 ranks.
+#
+# kmeans is the ONLY workload that has one -- the other five have CUDA MPI
+# baselines and no SYCL counterpart. Stated rather than papered over: this is
+# one gate, not a sixth of a matrix.
+#
+# It is declared with ALL in the benchmark CMakeLists and still had never been
+# built or run, because nothing ever asked for that target in a SYCL tree.
+# It builds clean and passes: checksum 30719.999684 against the CUDA MPI
+# baseline's 30719.999107, inside the atomicAdd tolerance kmeans documents.
+#
+# Needs the DPC++ runtime on the library path, like the SYCL paged gates.
+# ---------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
+   AND CLIO_GV_SYCL_BUILD_DIR AND MPIEXEC_EXECUTABLE)
+    if(NOT DEFINED ENV{DPCPP_HOME})
+        set(_dpcpp "$ENV{HOME}/opt/dpcpp")
+    else()
+        set(_dpcpp "$ENV{DPCPP_HOME}")
+    endif()
+    set(_sy_bin ${CMAKE_SOURCE_DIR}/${CLIO_GV_SYCL_BUILD_DIR}/bin)
+    add_test(NAME bench_kmeans_mpi_sycl_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                ${_sy_bin}/clio_kmeans_mpi_bench_sycl
+                --data-mb 64 --iters 3
+        WORKING_DIRECTORY ${_sy_bin}
+    )
+    set_tests_properties(bench_kmeans_mpi_sycl_2rank PROPERTIES
+        TIMEOUT 900
+        LABELS "bench;gpu;mpi;sycl;distributed"
+        RUN_SERIAL TRUE
+        ENVIRONMENT "LD_LIBRARY_PATH=${_dpcpp}/lib:${_sy_bin}")
+endif()
