@@ -898,3 +898,25 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
         RUN_SERIAL TRUE
         ENVIRONMENT "LD_LIBRARY_PATH=${_dpcpp}/lib:${_sy_bin}")
 endif()
+
+# COVERAGE AUDIT, so the next person can redo it in one command.
+#
+# Comparing every bench target declared under benchmark/ against everything
+# `ctest -N -V` shows a test invoking leaves 12 apparently uncovered:
+#
+#   clio_*_bam_bench          (6)  excluded from the distributed gates by
+#                                  decision -- BaM is a storage baseline
+#   clio_*_paged_bench_sycl   (6)  FALSE POSITIVE. The SYCL gates build the
+#                                  binary name at RUNTIME (GVW_VARIANT=sycl
+#                                  appends _sycl), so ctest -N -V cannot see
+#                                  it. They are covered: build-syclreg/bin
+#                                  contains ONLY _sycl binaries and no plain
+#                                  ones, so a gate passing with
+#                                  BUILD_DIR=build-syclreg can only have run
+#                                  them.
+#
+# The audit is worth keeping because it is what found three targets that were
+# declared and never run: the four legacy cluster harnesses and
+# clio_kmeans_mpi_bench_sycl, which was declared ALL and had never once been
+# built. Any name that appears here in future is either a deliberate
+# exclusion or a gap.
