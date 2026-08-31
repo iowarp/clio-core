@@ -194,8 +194,11 @@ if [ "${NGPU:-0}" -ge 2 ]; then
 else
   echo
   echo "== nvshmem : $MD_RANKS PEs inside md-node1 (one GPU on this host)"
-  echo "   .. cross-container NVSHMEM needs a GPU per node plus an RDMA"
-  echo "      fabric; with one GPU the single-node placement is the only"
+  echo "   .. cross-container NVSHMEM needs a GPU per node. It does NOT"
+  echo "      need RDMA -- ucx/libfabric run over TCP -- but this image"
+  echo "      ships UCX 1.16 and NVSHMEM 3.7 wants UCP >= 1.19, so the"
+  echo "      ucx transport falls back to shm and cannot cross a"
+  echo "      container. With one GPU the single-node placement is the only"
   echo "      valid one. Run this harness on a multi-GPU host for the"
   echo "      across-containers configuration."
   log=/tmp/md_nvshmem.log

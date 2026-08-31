@@ -10,11 +10,33 @@
 # transport. It is the same thing distributed_md/ does for eternia-MD, applied
 # to the other five workloads.
 #
-# WHY ONLY MPI. NVSHMEM cross-container needs a GPU per node plus an RDMA
-# fabric -- with one GPU the only valid placement is both PEs inside one
-# container, which distributed_md/ already documents and does. NCCL needs a GPU
-# per rank and cannot share a device at all. Neither is a software gap this
-# script could close, so neither is pretended at.
+# WHY ONLY MPI AND KOKKOS -- and the NVSHMEM reason is NOT what it looks like.
+#
+# NVSHMEM DOES NOT REQUIRE RDMA. It ships ucx and libfabric transports
+# alongside the ib* ones, and UCX runs perfectly well over TCP. The blocker
+# here is a VERSION MISMATCH in the deps image:
+#
+#   UCP API version is incompatible: required >= 1.19, actual 1.16.0
+#
+# NVSHMEM 3.7.2's UCX transport wants UCP >= 1.19; the image has 1.16. The
+# module loads, warns, then ignores UCX_TLS and selects posix/memory --
+# shared memory, which cannot reach another container -- and the endpoint
+# connect fails with "Destination is unreachable". Forcing UCX_TLS=tcp and
+# UCX_NET_DEVICES=eth0 does not change it, which is what an incompatible
+# module looks like. `ipc: host` in the md compose is likely why shm appears
+# viable to UCX in the first place.
+#
+# So the transport is a fixable IMAGE problem (ship UCX >= 1.19), not RDMA
+# hardware. WHAT IS STILL UNKNOWN: distributed_md/ argues separately that two
+# containers each look like a NODE to NVSHMEM and so need a GPU each, which
+# with one physical GPU fails when it builds the peer transport map. That may
+# well be true -- this test never got that far, because the UCX connect fails
+# first. Fixing UCX would tell us which of the two actually binds. Left undone
+# rather than mislabelled as an RDMA requirement.
+#
+# NCCL is genuinely different: it needs one GPU PER RANK and cannot share a
+# device. The bench says so itself and exits 77 for ctest to skip. That one
+# is hardware.
 #
 # THE CLUSTER IS distributed_md/'s. It already has sshd, key exchange and an
 # mpirun that works across containers; duplicating that would mean maintaining
