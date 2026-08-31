@@ -10,33 +10,36 @@
 # transport. It is the same thing distributed_md/ does for eternia-MD, applied
 # to the other five workloads.
 #
-# WHY ONLY MPI AND KOKKOS -- and for NVSHMEM the answer is DEPENDENCIES, not
-# hardware. Every step below is measured.
+# WHY ONLY MPI AND KOKKOS. For NVSHMEM the honest answer is: cross-container
+# does not work here and FOUR plausible causes have each been TESTED AND
+# RULED OUT. Recorded so the next person does not re-run them.
 #
-# NVSHMEM DOES NOT REQUIRE RDMA: it ships ucx and libfabric transports beside
-# the ib* ones, and both can run over TCP.
+#   RDMA?           No. NVSHMEM ships ucx and libfabric transports beside the
+#                   ib* ones. libfabric gets past transport selection over
+#                   plain TCP, so a fabric is not required.
+#   GPU per node?   Not by itself. The famous error
+#                     [GPU 0] Peer GPU 1 is not accessible
+#                   is CLEARED by NVSHMEM_DISABLE_P2P=1, with one physical
+#                   GPU behind both containers.
+#   UCX too old?    No. The image ships 1.16 and NVSHMEM 3.7 warns it wants
+#                   >= 1.19 -- so UCX 1.19.0 was BUILT and mounted at
+#                   /opt/ucx. The version warning goes away and the failure
+#                   is bit-for-bit identical.
+#   ipc: host?      No. Sharing an IPC namespace looked like it would make
+#                   UCX believe a peer was shm-reachable; ipc: private
+#                   changes nothing.
 #
-# The GPU-per-node error everyone quotes --
-#     [GPU 0] Peer GPU 1 is not accessible / building transport map failed
-# -- IS BYPASSABLE. NVSHMEM_DISABLE_P2P=1 clears it: the run gets past the
-# topology check with one physical GPU behind both containers. So the GPU
-# count is not the binding limit, which is what the notes here used to say.
+# WHAT ACTUALLY HAPPENS, unchanged through all four:
+#     no active messages transport to <no debug data>:
+#         posix/memory - Destination is unreachable
+#     Failed to connect endpoint in UCX transport / connect EPS failed
 #
-# What is left after that is purely the transport libraries in the image:
-#   ucx        UCP API version is incompatible: required >= 1.19, actual
-#              1.16.0 -- the module then ignores UCX_TLS and selects
-#              posix/memory, shared memory, which cannot reach another
-#              container: "Destination is unreachable".
-#   libfabric  image has libfabric1 1.17 runtime only, no fi_info and no
-#              provider directory; NVSHMEM's transport fails at init.
+# NVSHMEM's ucx module selects posix/memory and ignores UCX_TLS entirely, and
+# the empty "<no debug data>" peer suggests the worker address it exchanged
+# through its bootstrap is not usable. That is inside NVSHMEM, past what an
+# image change reaches. NOT SOLVED, and no longer guessed at.
 #
-# SO THE CONCRETE FIX IS AN IMAGE ONE: put UCX >= 1.19 (or a full libfabric
-# with its providers) in iowarp/deps-cpu, then run with
-#     NVSHMEM_REMOTE_TRANSPORT=ucx NVSHMEM_DISABLE_P2P=1 UCX_TLS=tcp
-# NOT PROVEN TO WORK -- no newer UCX exists on this host to try, and the host
-# package is 1.16 too. It is the remaining blocker, not a guaranteed cure.
-#
-# NCCL is genuinely different: one GPU PER RANK, cannot share a device, says
+# NCCL is separate and simple: one GPU PER RANK, cannot share a device, says
 # so itself, exits 77 for ctest to skip.
 #
 # THE CLUSTER IS distributed_md/'s. It already has sshd, key exchange and an

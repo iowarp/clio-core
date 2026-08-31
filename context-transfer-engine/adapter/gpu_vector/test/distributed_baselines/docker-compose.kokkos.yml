@@ -17,10 +17,14 @@
 # because the container's Open MPI is the same 4.1.6 as the host's; if that
 # ever diverges the mount is the wrong answer and it should compile in-container
 # like the others.
+# UCX_HOME lets a newer UCX be mounted over the image's: NVSHMEM 3.7 needs
+# UCP >= 1.19 and the image ships 1.16. Defaults somewhere harmless.
 services:
   md-node1:
     volumes:
       - ${KOKKOS_HOME:-/opt/kokkos}:/opt/kokkos:ro
+      - ${UCX_HOME:-/opt/kokkos}:/opt/ucx:ro
   md-node2:
     volumes:
       - ${KOKKOS_HOME:-/opt/kokkos}:/opt/kokkos:ro
+      - ${UCX_HOME:-/opt/kokkos}:/opt/ucx:ro
