@@ -726,7 +726,7 @@ option(CLIO_CORE_ENABLE_DOCKER_TESTS
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
     get_filename_component(_gv_build_name "${CMAKE_BINARY_DIR}" NAME)
-    foreach(_wl kmeans weights gmx grayscott lbann)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
         add_test(NAME cte_gv_distributed_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )
@@ -815,7 +815,7 @@ set(CLIO_GV_SYCL_BUILD_DIR "" CACHE STRING
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
    AND CLIO_GV_SYCL_BUILD_DIR)
-    foreach(_wl kmeans weights gmx grayscott lbann)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
         add_test(NAME cte_gv_distributed_sycl_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )

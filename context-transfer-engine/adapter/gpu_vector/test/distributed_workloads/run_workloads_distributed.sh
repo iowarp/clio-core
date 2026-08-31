@@ -86,6 +86,16 @@ deck() {
       # Fixed reference: the bench trains against its own dense in-VRAM copy
       # and asserts bit-equality, so this gate has no tolerance at all.
       KEY='(ALL GATES PASS)'; TOL=exact ;;
+    lammps_md)
+      BENCH=clio_lammps_md_paged_bench
+      # --lattice 28, not 20: a slab must END ON A PAGE BOUNDARY because the
+      # cache transfers whole pages, and only nb a multiple of 16 gives a
+      # z-plane that is a whole number of them. The bench refuses anything else
+      # rather than corrupt quietly. (distributed_md_bench/ documents the same
+      # constraint; this entry exists to cover the SYCL edition, which that
+      # harness does not build.)
+      ARGS="--md --lattice 28 --steps 20"
+      KEY='E0=(-?[0-9.]+)'; TOL=1e-6 ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
@@ -201,12 +211,12 @@ FAILED=""
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
-  for wl in kmeans weights gmx grayscott lbann; do
+  for wl in kmeans weights gmx grayscott lbann lammps_md; do
     run_one "$wl" || { rc=1; FAILED="$FAILED $wl"; }
   done
   echo
   echo "=== summary"
-  echo "  validated distributed: kmeans weights gmx grayscott lbann"
+  echo "  validated distributed: kmeans weights gmx grayscott lbann lammps_md"
   [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
   [ -n "$FAILED" ] && echo "  FAILING:              $FAILED"
   exit $rc
