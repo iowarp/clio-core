@@ -743,3 +743,17 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
     message(STATUS "gpu_vector distributed docker gates: ON "
                    "(ctest -L gv_distributed, BUILD_DIR=${_gv_build_name})")
 endif()
+
+# The MPI baselines as CROSS-CONTAINER jobs, one entry for all six workloads.
+# The bench_*_mpi_2rank entries run 2 ranks on one host; this puts the ranks
+# in separate containers on a real network, so the transport is a transport.
+# Same opt-in as the paged gates -- it needs docker and a GPU.
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
+    add_test(NAME cte_gv_distributed_mpi_baselines
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_baselines/run_baselines_distributed.sh all
+    )
+    set_tests_properties(cte_gv_distributed_mpi_baselines PROPERTIES
+        TIMEOUT 2400
+        LABELS "cte;gpu;gpu_vector;gv_distributed;distributed;docker"
+        RUN_SERIAL TRUE)
+endif()
