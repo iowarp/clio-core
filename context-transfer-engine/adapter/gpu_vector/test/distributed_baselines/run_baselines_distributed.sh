@@ -35,8 +35,17 @@ export NVSHMEM_HOME="${NVSHMEM_HOME:-$HOME/opt/nvshmem-pkg/nvidia/nvshmem}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export KOKKOS_HOME="${KOKKOS_HOME:-$HOME/opt/kokkos-cuda}"
 # distributed_md/ supplies the cluster; the overlay adds the Kokkos mount.
+BL_RANKS="${BL_RANKS:-2}"
+NODES="md-node1 md-node2"
 COMPOSE=(docker compose -f "$MD_DIR/docker-compose.yml"
                         -f "$SCRIPT_DIR/docker-compose.kokkos.yml")
+if [ "$BL_RANKS" -ge 3 ]; then
+  COMPOSE+=(-f "$SCRIPT_DIR/docker-compose.four.yml")
+  NODES="$NODES md-node3"
+fi
+[ "$BL_RANKS" -ge 4 ] && NODES="$NODES md-node4"
+# --host wants one slot per container.
+HOSTARG="$(echo $NODES | tr ' ' '\n' | sed 's/$/:1/' | paste -sd,)"
 ARCH="${BL_ARCH:-sm_89}"
 BENCH_DIR=context-transfer-engine/adapter/gpu_vector/benchmark
 # PORT 2222, not 22. The md compose starts sshd with -p 2222, so a default
@@ -52,7 +61,12 @@ deck() {
     gmx)       ARGS="--k 32 --atoms 20000" ;;
     grayscott) ARGS="" ;;
     lbann)     ARGS="" ;;
-    lammps_md) ARGS="--lattice 20 --steps 20" ;;
+    lammps_md)
+      # The z-slab decomposition needs >= 3 planes per rank, and --lattice 20
+      # gives 11 -- enough for 2 ranks, one short for 4. The bench says so
+      # rather than guessing, so scale the deck instead of loosening it.
+      if [ "$BL_RANKS" -ge 4 ]; then ARGS="--lattice 32 --steps 20"
+      else ARGS="--lattice 20 --steps 20"; fi ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
@@ -65,17 +79,19 @@ trap cleanup EXIT
 
 echo "== bringing up the 2-container cluster (distributed_md/)"
 ( cd "$MD_DIR" && "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 ) || true
-( cd "$MD_DIR" && "${COMPOSE[@]}" up -d md-node1 md-node2 >/dev/null )
+( cd "$MD_DIR" && "${COMPOSE[@]}" up -d $NODES >/dev/null )
 
 # sshd is up when node1 can actually open a connection to node2 -- a `ready`
 # file only says the process started.
-for _ in $(seq 1 60); do
-  docker exec md-node1 ssh $SSH_OPTS -o ConnectTimeout=2 md-node2 true >/dev/null 2>&1 && break
-  sleep 1
+for peer in $(echo $NODES | tr " " "\n" | grep -v md-node1); do
+  for _ in $(seq 1 60); do
+    docker exec md-node1 ssh $SSH_OPTS -o ConnectTimeout=2 "$peer" true >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ! docker exec md-node1 ssh $SSH_OPTS -o ConnectTimeout=2 "$peer" true >/dev/null 2>&1; then
+    echo "!! node1 cannot ssh to $peer; aborting"; exit 1
+  fi
 done
-if ! docker exec md-node1 ssh $SSH_OPTS -o ConnectTimeout=2 md-node2 true >/dev/null 2>&1; then
-  echo "!! node1 cannot ssh to node2; aborting"; exit 1
-fi
 echo "== cluster up"
 
 rc=0
@@ -83,7 +99,7 @@ run_one() {
   local wl="$1"; deck "$wl" || return 2
   local src="clio_${wl}_mpi_bench.cc" bin="clio_${wl}_mpi_bench"
   echo
-  echo "== $wl : MPI, 2 ranks across md-node1,md-node2"
+  echo "== $wl : MPI, $BL_RANKS ranks across $NODES"
 
   # EVERY node compiles its own copy into container-local /tmp: the workspace
   # is mounted READ-ONLY, and per-node compilation is what makes each rank's
@@ -97,16 +113,20 @@ run_one() {
         '"$src"' -o /tmp/blbin/'"$bin"' \
         -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
   '
-  docker exec md-node1 bash -c "$compile" >/tmp/bl_${wl}_c1.log 2>&1 & local p1=$!
-  docker exec md-node2 bash -c "$compile" >/tmp/bl_${wl}_c2.log 2>&1 & local p2=$!
-  if ! wait $p1 || ! wait $p2; then
-    echo "   !! compile failed"; tail -5 /tmp/bl_${wl}_c1.log /tmp/bl_${wl}_c2.log
+    local pids=""
+  for nd in $NODES; do
+    docker exec "$nd" bash -c "$compile" >/tmp/bl_${wl}_${nd}.log 2>&1 &
+    pids="$pids $!"
+  done
+  local ok=1; for p in $pids; do wait $p || ok=0; done
+  if [ $ok -eq 0 ]; then
+    echo "   !! compile failed"; tail -5 /tmp/bl_${wl}_md-node*.log
     rc=1; return 1
   fi
 
   local log="/tmp/bl_${wl}.log"
   docker exec md-node1 bash -c "
-    mpirun --allow-run-as-root -n 2 --host md-node1:1,md-node2:1 \
+    mpirun --allow-run-as-root -n $BL_RANKS --host $HOSTARG \
         --mca plm_rsh_agent 'ssh $SSH_OPTS' \
         --mca btl tcp,self --mca btl_tcp_if_include eth0 \
         -x LD_LIBRARY_PATH \
@@ -124,10 +144,10 @@ run_one() {
   # BOTH SPELLINGS. These benches are not consistent: kmeans and lammps_md
   # print "ranks=2", the other four print "2 ranks". Matching only the first
   # form reported four passing cross-container runs as failures.
-  if ! grep -qE '(ranks|PEs)=2|\b2 (ranks|PEs)\b' "$log"; then
-    echo "   !! $wl: ran, but not as 2 ranks"; rc=1; return 1
+  if ! grep -qE "(ranks|PEs)=$BL_RANKS|\b$BL_RANKS (ranks|PEs)\b" "$log"; then
+    echo "   !! $wl: ran, but not as $BL_RANKS ranks"; rc=1; return 1
   fi
-  echo "   $wl OK (2 ranks, separate containers)"
+  echo "   $wl OK ($BL_RANKS ranks, separate containers)"
 }
 
 # The Kokkos baselines run cross-container too, but from the HOST BUILD rather
@@ -139,13 +159,13 @@ run_kokkos() {
   local wl="$1"; deck "$wl" || return 2
   local bin="/workspace/${BUILD_DIR:-build-gv}/bin/clio_${wl}_kokkos_bench"
   echo
-  echo "== $wl : Kokkos, 2 ranks across md-node1,md-node2"
+  echo "== $wl : Kokkos, $BL_RANKS ranks across $NODES"
   if ! docker exec md-node1 test -x "$bin"; then
     echo "   .. not built ($bin); skipping"; return 0
   fi
   local log="/tmp/blk_${wl}.log"
   docker exec md-node1 bash -c "
-    mpirun --allow-run-as-root -n 2 --host md-node1:1,md-node2:1 \
+    mpirun --allow-run-as-root -n $BL_RANKS --host $HOSTARG \
         --mca plm_rsh_agent 'ssh $SSH_OPTS' \
         --mca btl tcp,self --mca btl_tcp_if_include eth0 \
         -x LD_LIBRARY_PATH=/opt/kokkos/lib:/opt/kokkos/lib64:/usr/local/cuda/lib64 \
@@ -157,7 +177,7 @@ run_kokkos() {
   if ! grep -qE 'ALL GATES PASS|GATE: PASS|PASS' "$log"; then
     echo "   !! $wl kokkos: no passing gate line"; rc=1; return 1
   fi
-  echo "   $wl kokkos OK (2 ranks, separate containers)"
+  echo "   $wl kokkos OK ($BL_RANKS ranks, separate containers)"
 }
 
 # An Open MPI mismatch would corrupt results rather than crash, so it is
