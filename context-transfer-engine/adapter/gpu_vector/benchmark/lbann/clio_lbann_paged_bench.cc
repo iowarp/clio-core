@@ -236,6 +236,24 @@ int main(int argc, char **argv) {
   const u64 o0 = (O / nodes) * node, o1 = o0 + O / nodes;
   // Blocks subdivide this node's band, not the whole layer.
   const u64 hper = (h1 - h0) / blocks, oper = (o1 - o0) / blocks;
+  // A NODE'S BAND MUST OWN WHOLE PAGES. With the band split, the existing
+  // (H/blocks) % rpp check is about the single-node geometry and no longer
+  // covers this: at 4 nodes the default deck gives oper = 2 against 4 W2
+  // rows per page, so two nodes share a page and clobber each other exactly
+  // as the biases did. Worse, it HANGS rather than complaining. Reject it.
+  if (nodes > 1) {
+    const u64 r1 = rpp1, r2 = rpp2 ? rpp2 : 1;
+    if ((hper % r1) != 0 || (oper % r2) != 0) {
+      std::fprintf(stderr,
+                   "LBANN ERROR: --nodes %u gives hper=%llu (rows/page %llu) "
+                   "and oper=%llu (rows/page %llu); a node's band must be a "
+                   "whole number of pages or nodes share a page and clobber "
+                   "each other. Use fewer --blocks or a larger --out.\n",
+                   nodes, (unsigned long long)hper, (unsigned long long)r1,
+                   (unsigned long long)oper, (unsigned long long)r2);
+      return 2;
+    }
+  }
   // THE DENSE REFERENCE IS NOT SHARDED. It is a plain in-VRAM copy of the
   // whole network and takes no row base, so a node-local hper makes every
   // node compute rows [0, H/nodes) -- the same wrong reference on each,

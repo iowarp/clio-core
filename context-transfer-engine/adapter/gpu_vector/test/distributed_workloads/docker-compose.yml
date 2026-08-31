@@ -68,7 +68,7 @@ services:
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
-      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
     command: ["sh", "-c", "cd /tmp && /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 0; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
@@ -93,12 +93,70 @@ services:
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
-      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
     # Node 2 starts a moment later so node 1 wins the bind race for the
     # cluster's main server; both orders work, but a deterministic one makes
     # a failed run easier to read.
     command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 1; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    entrypoint: []
+
+  gvw-node3:
+    <<: *node
+    profiles: ["four"]
+    container_name: gvw-node3
+    hostname: gvw-node3
+    networks:
+      gvw-cluster: { ipv4_address: 172.26.0.12 }
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.26.0.12
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GVW_BARRIER=${GVW_BARRIER:-240}
+      # Negative controls, passed through so the harness can prove an
+      # exchange is load-bearing rather than incidentally correct.
+      - GS_NO_HALO=${GS_NO_HALO:-}
+      - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
+      - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - GS_FORCE_DIST=${GS_FORCE_DIST:-}
+      - GVW_NODES=${GVW_NODES:-2}
+      - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    # Node 2 starts a moment later so node 1 wins the bind race for the
+    # cluster's main server; both orders work, but a deterministic one makes
+    # a failed run easier to read.
+    command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 2; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    entrypoint: []
+
+  gvw-node4:
+    <<: *node
+    profiles: ["four"]
+    container_name: gvw-node4
+    hostname: gvw-node4
+    networks:
+      gvw-cluster: { ipv4_address: 172.26.0.13 }
+    environment:
+      - NODE_ID=4
+      - NODE_IP=172.26.0.13
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GVW_BARRIER=${GVW_BARRIER:-240}
+      # Negative controls, passed through so the harness can prove an
+      # exchange is load-bearing rather than incidentally correct.
+      - GS_NO_HALO=${GS_NO_HALO:-}
+      - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
+      - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - GS_FORCE_DIST=${GS_FORCE_DIST:-}
+      - GVW_NODES=${GVW_NODES:-2}
+      - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+    # Node 2 starts a moment later so node 1 wins the bind race for the
+    # cluster's main server; both orders work, but a deterministic one makes
+    # a failed run easier to read.
+    command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 3; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
 networks:

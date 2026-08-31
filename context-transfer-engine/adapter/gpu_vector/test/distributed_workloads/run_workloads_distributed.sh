@@ -19,6 +19,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../" && pwd)"
 export HOST_WORKSPACE="${HOST_WORKSPACE:-$REPO_ROOT}"
 export HOST_UID=$(id -u) HOST_GID=$(id -g)
 export GVW_NODES="${GVW_NODES:-2}"
+SVCS="gvw-node1 gvw-node2"
+if [ "$GVW_NODES" -ge 3 ]; then
+  # Nodes 3 and 4 live behind a profile so a 2-node run does not start them.
+  export COMPOSE_PROFILES=four
+  # EVERY node must read the 4-entry hostfile, not just the new ones: a node
+  # on the 2-entry file never learns the others exist.
+  export GVW_CONF=gvw_conf4.yaml
+  SVCS="$SVCS gvw-node3"
+fi
+[ "$GVW_NODES" -ge 4 ] && SVCS="$SVCS gvw-node4"
 BIN_DIR="$HOST_WORKSPACE/${BUILD_DIR:-build}/bin"
 
 # Per-workload: the binary, the deck, and how to pull the gated number out of
@@ -69,7 +79,10 @@ deck() {
       CONTROL_ENV='GS_NO_HALO=1' ;;
     lbann)
       BENCH=clio_lbann_paged_bench
-      ARGS="--blocks 8"
+      # --blocks 4, not 8: a node's W2 band must be a whole number of pages,
+      # and at 4 nodes 8 blocks gives half a page per band. 4 blocks holds
+      # for 1, 2 and 4 nodes alike.
+      ARGS="--blocks 4"
       # Fixed reference: the bench trains against its own dense in-VRAM copy
       # and asserts bit-equality, so this gate has no tolerance at all.
       KEY='(ALL GATES PASS)'; TOL=exact ;;
@@ -88,19 +101,19 @@ run_one() {
   local ref; ref="$(extract "$KEY" "$ref_log")"
   echo "  reference: $ref"
 
-  echo "=== $wl: 2-node distributed"
+  echo "=== $wl: ${GVW_NODES}-node distributed"
   cd "$SCRIPT_DIR"
   # A leftover barrier file would let a node skip the wait entirely.
   rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
   export GVW_BENCH="$BENCH" GVW_ARGS="$ARGS"
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose up -d gvw-node1 gvw-node2
+  docker compose up -d $SVCS
   docker compose logs -f --no-color > "/tmp/gvw_${wl}_dist.log" 2>&1 &
   local logs_pid=$!
   local rc=0 code
   # Wait for EVERY node rather than the first exit: --abort-on-container-exit
   # turns a passing run into rc=143.
-  for n in gvw-node1 gvw-node2; do
+  for n in $SVCS; do
     code=$(docker wait "$n"); echo "  == $n exited $code"
     [ "$code" -eq 0 ] || rc=1
   done
@@ -152,8 +165,8 @@ run_one() {
   if [ -n "$CONTROL_ENV" ]; then
     rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-    env $CONTROL_ENV docker compose up -d gvw-node1 gvw-node2 >/dev/null 2>&1
-    for n in gvw-node1 gvw-node2; do docker wait "$n" >/dev/null; done
+    env $CONTROL_ENV docker compose up -d $SVCS >/dev/null 2>&1
+    for n in $SVCS; do docker wait "$n" >/dev/null; done
     docker compose logs --no-color > "/tmp/gvw_${wl}_ctrl.log" 2>&1
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
     local cgot; cgot="$(extract "$KEY" "/tmp/gvw_${wl}_ctrl.log")"
