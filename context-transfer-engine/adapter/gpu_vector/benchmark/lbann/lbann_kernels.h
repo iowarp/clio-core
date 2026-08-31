@@ -297,7 +297,13 @@ CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u
  */
 CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
                                      u64 e1, u64 chunk, const float *ref,
-                                     unsigned long long *out) {
+                                     unsigned long long *out, u64 rlo,
+                                     u64 rhi) {
+  // Clamp to a REGION so the probe can say which of W1/b1/W2/b2 drifts, not
+  // merely that something does. A whole-vector maximum names no suspect.
+  if (e0 < rlo) e0 = rlo;
+  if (e1 > rhi) e1 = rhi;
+  if (e0 >= e1) { co_return; }
   unsigned long long acc = 0;
   for (u64 lo = e0; lo < e1; lo += chunk) {
     const u64 hi = (lo + chunk < e1) ? lo + chunk : e1;

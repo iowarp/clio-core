@@ -578,13 +578,37 @@ int main(int argc, char **argv) {
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
-                        d_md, vw, sv);
+                        d_md, 0, n, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     unsigned long long md = 0;
     ctp::GpuApi::Memcpy(&md, d_md, sizeof(md));
     ctp::GpuApi::Free(d_md);
     const double maxdiff = static_cast<double>(md) / 1e9;
+    // WHICH region drifts. A whole-vector maximum says only that one does.
+    if (const char *e = getenv("LB_REGION_DIFF")) {
+      if (e[0] != '\0') {
+        const struct { const char *nm; u64 lo, hi; } regs[] = {
+            {"W1", w1_off, w1_off + I * H}, {"b1", b1_off, b1_off + H},
+            {"W2", w2_off, w2_off + H * O}, {"b2", b2_off, b2_off + O}};
+        for (const auto &r : regs) {
+          auto *d_r = ctp::GpuApi::Malloc<unsigned long long>(
+              sizeof(unsigned long long));
+          ctp::GpuApi::Memset(d_r, 0, sizeof(unsigned long long));
+          runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                         gy::YieldStackView sv) {
+            lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page,
+                              d_wref, d_r, r.lo, r.hi, vw, sv);
+          });
+          ctp::GpuApi::Synchronize();
+          unsigned long long rv = 0;
+          ctp::GpuApi::Memcpy(&rv, d_r, sizeof(rv));
+          ctp::GpuApi::Free(d_r);
+          std::printf("  REGION %s max|diff| = %.6g\n", r.nm,
+                      static_cast<double>(rv) / 1e9);
+        }
+      }
+    }
     // 1e-5 absolute on weights that start at O(1) and are stepped by an
     // lr-scaled gradient: loose enough for a reordered sum over 5 steps
     // (measured drift 2.4e-8 in the loss), tight enough that a stale or

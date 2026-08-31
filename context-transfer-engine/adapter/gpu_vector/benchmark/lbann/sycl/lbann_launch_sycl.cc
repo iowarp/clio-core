@@ -131,7 +131,8 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 
 void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk, const float *ref,
-                 unsigned long long *out, View vw, StackView sv) {
+                 unsigned long long *out, u64 rlo, u64 rhi, View vw,
+                 StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
@@ -139,7 +140,7 @@ void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const bool bias0 = (blk == 0);
                     (void)bias0;
                     return MaxDiffCoro(dev, blk * eper,
-                          ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk, ref, out);
+                          ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk, ref, out, rlo, rhi);
                   });
 }
 
