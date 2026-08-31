@@ -700,3 +700,43 @@ set_target_properties(eternia_cluster_node PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 install(TARGETS eternia_cluster_node RUNTIME DESTINATION bin)
+
+#------------------------------------------------------------------------------
+# Distributed paged-workload gates, as LOCAL ctest entries.
+#
+# These stand up a 2-node docker cluster and check each workload's distributed
+# result against its own single-node reference. They are real tests, not a
+# parse: kmeans, weights, gmx and grayscott all pass, and grayscott's is backed
+# by a negative control that fails the gate if disabling the halo exchange
+# leaves the answer unchanged.
+#
+# OPT-IN, because they need docker, the nvidia container toolkit and a GPU, and
+# a machine without those should skip rather than fail. Turn them on with
+#   -DCLIO_CORE_ENABLE_DOCKER_TESTS=ON
+# and run with     ctest -L gv_distributed
+#
+# BUILD_DIR must name the build tree the containers mount, which is why it is
+# passed explicitly rather than assumed to be "build".
+#------------------------------------------------------------------------------
+option(CLIO_CORE_ENABLE_DOCKER_TESTS
+       "Run the 2-node docker distributed workload gates from ctest" OFF)
+
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
+    get_filename_component(_gv_build_name "${CMAKE_BINARY_DIR}" NAME)
+    foreach(_wl kmeans weights gmx grayscott)
+        add_test(NAME cte_gv_distributed_${_wl}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+        )
+        set_tests_properties(cte_gv_distributed_${_wl} PROPERTIES
+            # Two containers, a single-node reference run, and for grayscott a
+            # control run as well -- the slowest is a few minutes.
+            TIMEOUT 1800
+            LABELS "cte;gpu;gpu_vector;gv_distributed;docker"
+            # One cluster at a time: they share a fixed subnet and port.
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${_gv_build_name}"
+        )
+    endforeach()
+    message(STATUS "gpu_vector distributed docker gates: ON "
+                   "(ctest -L gv_distributed, BUILD_DIR=${_gv_build_name})")
+endif()
