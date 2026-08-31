@@ -373,7 +373,20 @@ int main(int argc, char **argv) {
   MPI_Allreduce(loc, tot, 3, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
                 MPI_COMM_WORLD);
 #else
-  for (int i = 0; i < 3; ++i) tot[i] = loc[i];   // single PE
+  {
+      // NOT "single PE" ANY MORE. This branch was only reachable under
+      // the hardcoded 1-PE unique-id bootstrap, so copying the local value
+      // was correct. Switching the bootstrap to nvshmem_init() made it the
+      // MULTI-PE path, and the copy then reported one shard as the whole
+      // problem. Reduce on the symmetric heap, as the MPI arm does.
+    uint64_t *s = (uint64_t *)nvshmem_malloc(3 * sizeof(uint64_t));
+    uint64_t *d = (uint64_t *)nvshmem_malloc(3 * sizeof(uint64_t));
+    GX_CUDA_CHECK(cudaMemcpy(s, loc, sizeof(loc), cudaMemcpyHostToDevice));
+    nvshmem_uint64_sum_reduce(NVSHMEM_TEAM_WORLD, d, s, 3);
+    GX_CUDA_CHECK(cudaMemcpy(tot, d, sizeof(tot), cudaMemcpyDeviceToHost));
+    nvshmem_free(s);
+    nvshmem_free(d);
+  }
 #endif
 
   int rc = 0;

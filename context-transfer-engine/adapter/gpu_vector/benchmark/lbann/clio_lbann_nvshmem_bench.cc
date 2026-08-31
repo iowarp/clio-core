@@ -357,6 +357,20 @@ int main(int argc, char **argv) {
   std::vector<double> loss(steps);
 
   nvshmem_barrier_all();
+#if !defined(MD_NVSHMEM_USE_MPI)
+  // SYMMETRIC SCRATCH FOR THE GATHERS. Without MPI these were previously
+  // #if'd out with NO #else at all, so each PE kept only its own shard's
+  // rows and the model-parallel forward/backward silently used stale data
+  // for every other shard -- the loss and weight gates then failed at >1 PE.
+  // fcollect concatenates each PE's chunk in PE ORDER, which is exactly the
+  // layout MPI_Allgather produced and which the shard bounds assume
+  // (h0 = rank*hper, o0 = rank*oper).
+  float *g_fsrc = (float *)nvshmem_malloc(H * B * sizeof(float));
+  float *g_fdst =
+      (float *)nvshmem_malloc((size_t)nranks * H * B * sizeof(float));
+  double *g_dsrc = (double *)nvshmem_malloc(O * B * sizeof(double));
+  double *g_ddst = (double *)nvshmem_malloc(O * B * sizeof(double));
+#endif
   const double t0 = NowMs();
   for (u64 s = 0; s < steps; ++s) {
     // fwd1 own rows -> allgather a1.
@@ -368,6 +382,12 @@ int main(int argc, char **argv) {
 #if defined(MD_NVSHMEM_USE_MPI)
     MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, h_gath.data(),
                   static_cast<int>(hper * B), MPI_FLOAT, MPI_COMM_WORLD);
+#else
+    LB_CUDA_CHECK(cudaMemcpy(g_fsrc, h_gath.data() + h0 * B,
+                             hper * B * sizeof(float), cudaMemcpyHostToDevice));
+    nvshmem_float_fcollect(NVSHMEM_TEAM_WORLD, g_fdst, g_fsrc, hper * B);
+    LB_CUDA_CHECK(cudaMemcpy(h_gath.data(), g_fdst,
+                             H * B * sizeof(float), cudaMemcpyDeviceToHost));
 #endif
     LB_CUDA_CHECK(cudaMemcpy(d_a1, h_gath.data(), H * B * sizeof(float),
                              cudaMemcpyHostToDevice));
@@ -381,6 +401,12 @@ int main(int argc, char **argv) {
 #if defined(MD_NVSHMEM_USE_MPI)
     MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, h_gath_o.data(),
                   static_cast<int>(oper * B), MPI_FLOAT, MPI_COMM_WORLD);
+#else
+    LB_CUDA_CHECK(cudaMemcpy(g_fsrc, h_gath_o.data() + o0 * B,
+                             oper * B * sizeof(float), cudaMemcpyHostToDevice));
+    nvshmem_float_fcollect(NVSHMEM_TEAM_WORLD, g_fdst, g_fsrc, oper * B);
+    LB_CUDA_CHECK(cudaMemcpy(h_gath_o.data(), g_fdst,
+                             O * B * sizeof(float), cudaMemcpyDeviceToHost));
 #endif
     LB_CUDA_CHECK(cudaMemcpy(d_d2, h_gath_o.data(), O * B * sizeof(float),
                              cudaMemcpyHostToDevice));
@@ -393,6 +419,12 @@ int main(int argc, char **argv) {
 #if defined(MD_NVSHMEM_USE_MPI)
     MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, h_lp.data(),
                   static_cast<int>(oper * B), MPI_DOUBLE, MPI_COMM_WORLD);
+#else
+    LB_CUDA_CHECK(cudaMemcpy(g_dsrc, h_lp.data() + o0 * B,
+                             oper * B * sizeof(double), cudaMemcpyHostToDevice));
+    nvshmem_double_fcollect(NVSHMEM_TEAM_WORLD, g_ddst, g_dsrc, oper * B);
+    LB_CUDA_CHECK(cudaMemcpy(h_lp.data(), g_ddst,
+                             O * B * sizeof(double), cudaMemcpyDeviceToHost));
 #endif
     double l = 0.0;
     for (u64 i = 0; i < O * B; ++i) l += h_lp[i];
@@ -407,6 +439,12 @@ int main(int argc, char **argv) {
 #if defined(MD_NVSHMEM_USE_MPI)
     MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, h_d1p.data(),
                   static_cast<int>(H * B), MPI_FLOAT, MPI_COMM_WORLD);
+#else
+    LB_CUDA_CHECK(cudaMemcpy(g_fsrc, h_d1p.data() + (size_t)rank * H * B,
+                             H * B * sizeof(float), cudaMemcpyHostToDevice));
+    nvshmem_float_fcollect(NVSHMEM_TEAM_WORLD, g_fdst, g_fsrc, H * B);
+    LB_CUDA_CHECK(cudaMemcpy(h_d1p.data(), g_fdst,
+                             (size_t)nranks * H * B * sizeof(float), cudaMemcpyDeviceToHost));
 #endif
     LB_CUDA_CHECK(cudaMemcpy(d_d1p, h_d1p.data(),
                              h_d1p.size() * sizeof(float),
@@ -436,7 +474,20 @@ int main(int argc, char **argv) {
   MPI_Allreduce(&dg_loc, &dg, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
                 MPI_COMM_WORLD);
 #else
-  dg = dg_loc;
+  {
+      // NOT "single PE" ANY MORE. This branch was only reachable under
+      // the hardcoded 1-PE unique-id bootstrap, so copying the local value
+      // was correct. Switching the bootstrap to nvshmem_init() made it the
+      // MULTI-PE path, and the copy then reported one shard as the whole
+      // problem. Reduce on the symmetric heap, as the MPI arm does.
+    uint64_t *s = (uint64_t *)nvshmem_malloc(sizeof(uint64_t));
+    uint64_t *d = (uint64_t *)nvshmem_malloc(sizeof(uint64_t));
+    LB_CUDA_CHECK(cudaMemcpy(s, &dg_loc, sizeof(dg_loc), cudaMemcpyHostToDevice));
+    nvshmem_uint64_sum_reduce(NVSHMEM_TEAM_WORLD, d, s, 1);
+    LB_CUDA_CHECK(cudaMemcpy(&dg, d, sizeof(dg), cudaMemcpyDeviceToHost));
+    nvshmem_free(s);
+    nvshmem_free(d);
+  }
 #endif
 
   int rc = 0;

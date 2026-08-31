@@ -146,23 +146,44 @@ Our benches, `--steps/--iters 20`:
 | grayscott | 27.7 ms | ALL GATES PASS |
 | weights | 114.5 ms | ALL GATES PASS |
 | lammps_md | 21.7 ms (1.086 ms/step) | gates pass; ledger shows 3.30 MB/step, **100% from a PEER** |
-| gmx | ran | **CONSERVATION GATE FAIL** |
-| lbann | ran | **LOSS + WEIGHT GATE FAIL** |
+| gmx | ran | ALL GATES PASS *(after the fix below)* |
+| lbann | ran | ALL GATES PASS *(after the fix below)* |
 
-### Two real bugs this immediately exposed
+### The three collectives that were never written
 
-All six initialise and run multi-node; two are numerically wrong once there
-is more than one PE, which nothing could have caught while NVSHMEM was
-single-node only.
+Turning the bootstrap on exposed that the non-MPI arm of these benches was
+written for the ONE PE it could previously have. Every cross-PE combine was
+either stubbed or absent, and became wrong the moment there was a second PE:
 
-- **gmx**: `CONSERVATION GATE: PASS (exact)` at **1 PE**, `FAIL` at **2 and
-  4 PEs**. Not the transport and not the parameters -- a multi-PE bug in
-  `clio_gmx_nvshmem_bench`.
-- **lbann**: fails at 4 PEs on both the loss gate (0.41861 vs 0.42488) and
-  the weight digest. The default `--lr 0.01` also diverges to NaN at this
-  size, as the memory-pressure notes already warned; `--lr 0.0001` gives the
-  finite-but-wrong numbers above, so the divergence and the multi-PE bug are
-  two separate things.
+| bench | non-MPI arm was | now |
+|---|---|---|
+| gmx | `for (i) tot[i] = loc[i];  // single PE` | `nvshmem_uint64_sum_reduce` over the 3 totals |
+| grayscott | `csum = local;  // single PE` | `nvshmem_double_sum_reduce` |
+| lbann | 4x `MPI_Allgather` under `#if` with **no `#else` at all** | 4x `nvshmem_float/double_fcollect` on symmetric scratch |
+| kmeans, weights, lammps_md | already had real nvshmem reductions | unchanged |
+
+lbann was the serious one: its model-parallel forward/backward gathers
+simply did not happen, so every PE computed with stale rows for all shards
+but its own. `fcollect` concatenates in PE order, which is the layout
+`MPI_Allgather` produced and which the shard bounds already assume
+(`h0 = rank*hper`, `o0 = rank*oper`).
+
+Verified at 1, 2 and 4 PEs:
+
+```
+gmx        CONSERVATION GATE: PASS (exact)           at 1, 2, 4 PEs
+lbann      LOSS GATE: PASS (bit-equal; -> 0.424880)  at 1, 2, 4 PEs
+           WEIGHT GATE: PASS (bit-equal to dense reference)
+grayscott  v_checksum 572978.909451 at 4 PEs == 572978.909451 at 1 PE
+```
+
+lbann now converges to exactly the 0.424880 it previously missed (0.41861).
+grayscott is the cautionary one: it **passed its gate** while reporting
+`v_checksum=0.000112` -- one shard's sum presented as the whole domain. A
+silently wrong number, not a failure, which is why nothing caught it.
+
+The `--lr 0.01` NaN divergence is separate and pre-existing: the
+memory-pressure notes already require `--lr 0.0001` at this size.
 
 ## Substrates
 
