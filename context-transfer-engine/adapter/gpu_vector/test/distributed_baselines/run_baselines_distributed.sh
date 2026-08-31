@@ -10,33 +10,34 @@
 # transport. It is the same thing distributed_md/ does for eternia-MD, applied
 # to the other five workloads.
 #
-# WHY ONLY MPI AND KOKKOS -- and the NVSHMEM reason is NOT what it looks like.
+# WHY ONLY MPI AND KOKKOS. Both NVSHMEM blockers below are MEASURED, not
+# assumed, and the first one is not what the comments here used to say.
 #
-# NVSHMEM DOES NOT REQUIRE RDMA. It ships ucx and libfabric transports
-# alongside the ib* ones, and UCX runs perfectly well over TCP. The blocker
-# here is a VERSION MISMATCH in the deps image:
+# 1. NVSHMEM DOES NOT REQUIRE RDMA. It ships ucx and libfabric transports
+#    beside the ib* ones. With ucx the run dies early on a version mismatch --
+#    NVSHMEM 3.7.2 wants UCP >= 1.19, the image has 1.16 -- after which the
+#    module ignores UCX_TLS and picks posix/memory, shared memory that cannot
+#    reach another container. That is an IMAGE problem, not hardware.
 #
-#   UCP API version is incompatible: required >= 1.19, actual 1.16.0
+#    NVSHMEM_REMOTE_TRANSPORT=libfabric skips it entirely: the image has
+#    libfabric 1.20 and NVSHMEM ships nvshmem_transport_libfabric.so, and the
+#    run gets past transport selection.
 #
-# NVSHMEM 3.7.2's UCX transport wants UCP >= 1.19; the image has 1.16. The
-# module loads, warns, then ignores UCX_TLS and selects posix/memory --
-# shared memory, which cannot reach another container -- and the endpoint
-# connect fails with "Destination is unreachable". Forcing UCX_TLS=tcp and
-# UCX_NET_DEVICES=eth0 does not change it, which is what an incompatible
-# module looks like. `ipc: host` in the md compose is likely why shm appears
-# viable to UCX in the first place.
+# 2. THE BINDING LIMIT IS ONE GPU PER NODE, and it is what stops it here:
 #
-# So the transport is a fixable IMAGE problem (ship UCX >= 1.19), not RDMA
-# hardware. WHAT IS STILL UNKNOWN: distributed_md/ argues separately that two
-# containers each look like a NODE to NVSHMEM and so need a GPU each, which
-# with one physical GPU fails when it builds the peer transport map. That may
-# well be true -- this test never got that far, because the UCX connect fails
-# first. Fixing UCX would tell us which of the two actually binds. Left undone
-# rather than mislabelled as an RDMA requirement.
+#      [GPU 0] Peer GPU 1 is not accessible, exiting ...
+#      building transport map failed
 #
-# NCCL is genuinely different: it needs one GPU PER RANK and cannot share a
-# device. The bench says so itself and exits 77 for ctest to skip. That one
-# is hardware.
+#    NVSHMEM decides node identity by hostname, so two containers are two
+#    NODES and it expects a GPU for each. With one physical GPU behind both,
+#    the peer transport map cannot be built. No transport choice fixes that,
+#    and lying about hostnames would only move the failure.
+#
+# So: fixing UCX would NOT make this work -- it only changes which of the two
+# errors you see first. A second GPU would.
+#
+# NCCL is the same shape and says so itself: one GPU per rank, cannot share a
+# device, exits 77 for ctest to skip.
 #
 # THE CLUSTER IS distributed_md/'s. It already has sshd, key exchange and an
 # mpirun that works across containers; duplicating that would mean maintaining

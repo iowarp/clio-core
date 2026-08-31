@@ -194,13 +194,15 @@ if [ "${NGPU:-0}" -ge 2 ]; then
 else
   echo
   echo "== nvshmem : $MD_RANKS PEs inside md-node1 (one GPU on this host)"
-  echo "   .. cross-container NVSHMEM needs a GPU per node. It does NOT"
-  echo "      need RDMA -- ucx/libfabric run over TCP -- but this image"
-  echo "      ships UCX 1.16 and NVSHMEM 3.7 wants UCP >= 1.19, so the"
-  echo "      ucx transport falls back to shm and cannot cross a"
-  echo "      container. With one GPU the single-node placement is the only"
-  echo "      valid one. Run this harness on a multi-GPU host for the"
-  echo "      across-containers configuration."
+  echo "   .. cross-container NVSHMEM needs a GPU PER NODE. It does not"
+  echo "      need RDMA: with NVSHMEM_REMOTE_TRANSPORT=libfabric the run"
+  echo "      gets past transport selection over plain TCP, and then"
+  echo "      fails with \"[GPU 0] Peer GPU 1 is not accessible /"
+  echo "      building transport map failed\" -- one physical GPU cannot"
+  echo "      back two nodes. (The ucx path dies earlier still, on UCP"
+  echo "      1.16 vs the >= 1.19 NVSHMEM wants, but fixing that only"
+  echo "      changes which error you see.) A second GPU is what this"
+  echo "      configuration needs."
   log=/tmp/md_nvshmem.log
   docker exec md-node1 bash -c "
     mpirun --allow-run-as-root -n $MD_RANKS \
