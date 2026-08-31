@@ -428,14 +428,19 @@ int main(int argc, char **argv) {
       lb::LaunchBwd1(g, b, gpu, dw, w2_off, H, O, B,
                                                   d_a1, d_d2, d_d1, hper,
                                                   rpp2 ? rpp2 : 1, h0, h1,
-                                                  vw, sv);
+                                                  // Bwd1 reads W2 PRE-update, i.e. as the
+                                                  // peers left it at the end of the last
+                                                  // step. Seed publishes 1, Upd2 at step s
+                                                  // publishes s+2, so step s demands s+1.
+                                                  o0, o1,
+                                                  static_cast<u64>(s) + 1, vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd2(g, b, gpu, dw, w2_off, b2_off, H,
                                                   O, B, d_a1, d_d2, lr, oper,
                                                   rpp2 ? rpp2 : 1, o0, o1,
-                                                  vw, sv);
+                                                  static_cast<u64>(s) + 2, vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {

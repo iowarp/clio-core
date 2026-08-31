@@ -70,26 +70,26 @@ void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 }
 
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
                     return Bwd1Coro(dev, w2_off, H, O, B, a1, d2, d1, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp);
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, o0, o1, gen);
                   });
 }
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
                     return Upd2Coro(dev, w2_off, b2_off, H, O, B, a1, d2, lr, rbase + blk * oper,
-                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp);
+                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp, gen);
                   });
 }
 
@@ -167,7 +167,7 @@ void LaunchDenseFwd2(u32 blocks, u32 threads, const float *w, u64 w2_off, u64 b2
   SubmitPlain(blocks, threads, [=]() { DenseFwd2(w, w2_off, b2_off, H, O, B, a1, y, d2, lp, oper); });
 }
 
-void LaunchDenseBwd1(u32 blocks, u32 threads, const float *w, u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 rbase, u64 rend) {
+void LaunchDenseBwd1(u32 blocks, u32 threads, const float *w, u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp) {
   SubmitPlain(blocks, threads, [=]() { DenseBwd1(w, w2_off, H, O, B, a1, d2, d1, hper, rpp); });
 }
 

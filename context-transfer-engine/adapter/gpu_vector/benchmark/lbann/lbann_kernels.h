@@ -112,7 +112,8 @@ CTP_GPU_FUN inline gy::YCoroMain Fwd2Coro(gv::DeviceVector<float> w, u64 w2_off,
 CTP_GPU_FUN inline gy::YCoroMain Bwd1Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   u64 H, u64 O, u64 B, const float *a1,
                                   const float *d2, float *d1, u64 h0, u64 h1,
-                                  u64 rows_per_page) {
+                                  u64 rows_per_page, u64 o0, u64 o1,
+                                  u64 gen) {
   // This block owns d1 rows h0..h1 and must read ALL of W2 for them. Pages
   // slide over the whole of W2; the o-sum stays sequential per element by
   // accumulating across page visits in registers is impossible (o spans
@@ -125,7 +126,14 @@ CTP_GPU_FUN inline gy::YCoroMain Bwd1Coro(gv::DeviceVector<float> w, u64 w2_off,
     const u64 oend = (op + rows_per_page < O) ? op + rows_per_page : O;
     const u64 page_lo = w2_off + op * H;
     const u64 count = (oend - op) * H;
-    co_await w.Fetch(0, page_lo, count);
+    // A GENERATION IS DEMANDED ONLY OF A PEER'S W2 ROWS. This block reads
+    // every o-row, but only [o0,o1) are its own -- those it wrote and never
+    // re-fetched, so they sit at generation 0 and demanding one would hang.
+    // A peer's rows it MUST demand, or it sums against the copy it cached
+    // before that peer's Upd2: the weights drift while the loss, computed
+    // earlier in Fwd2, still looks right.
+    const bool peer_rows = (op < o0 || op >= o1);
+    co_await w.Fetch(peer_rows ? gen : 0, page_lo, count);
     auto hw = co_await w.HoldPage(page_lo, count);
     for (u64 t = threadIdx.x; t < (h1 - h0) * B; t += blockDim.x) {
       const u64 h = h0 + t / B;
@@ -151,7 +159,8 @@ CTP_GPU_FUN inline gy::YCoroMain Bwd1Coro(gv::DeviceVector<float> w, u64 w2_off,
 CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   u64 b2_off, u64 H, u64 O, u64 B,
                                   const float *a1, const float *d2, float lr,
-                                  u64 o0, u64 o1, u64 rows_per_page) {
+                                  u64 o0, u64 o1, u64 rows_per_page,
+                                  u64 gen) {
   for (u64 op = o0; op < o1; op += rows_per_page) {
     const u64 page_lo = w2_off + op * H;
     const u64 oend = (op + rows_per_page < o1) ? op + rows_per_page : o1;
@@ -177,8 +186,8 @@ CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
       hb[b2_off + o] -= lr * g;
     }
     __syncthreads();
-    co_await w.BeginFlush(0, page_lo, count);
-    co_await w.BeginFlush(0, b2_off + op, oend - op);
+    co_await w.BeginFlush(gen, page_lo, count);
+    co_await w.BeginFlush(gen, b2_off + op, oend - op);
     w.UnpinRange(page_lo, count);
     w.UnpinRange(b2_off + op, oend - op);
   }
@@ -234,7 +243,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> w, u64 n, u64 
       h[i] = Sym01(Lcg(0xB5297A4D3F84D5B5ull + i)) * 0.05f;
     }
     __syncthreads();
-    co_await w.BeginFlush(0, lo, hi - lo);
+    co_await w.BeginFlush(1, lo, hi - lo);
     w.UnpinRange(lo, hi - lo);
   }
   co_await w.EndFlush();
