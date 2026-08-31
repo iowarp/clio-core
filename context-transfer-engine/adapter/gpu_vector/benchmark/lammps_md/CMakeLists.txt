@@ -440,3 +440,48 @@ if(TARGET clio_lammps_md_mpi_bench AND MPIEXEC_EXECUTABLE)
     set_tests_properties(bench_lammps_md_mpi_2rank PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;mpi;distributed" RUN_SERIAL TRUE)
 endif()
+
+# ---------------------------------------------------------------------------
+# The NVSHMEM baseline, RUN at 2 PEs.
+#
+# Built and never executed, like the MPI edition was. Verified to run and
+# self-gate at 2 PEs on this host before being registered -- NVSHMEM needs a
+# working bootstrap, so an entry that cannot launch would be worse than none.
+#
+# Invoked by OUTPUT PATH, not $<TARGET_FILE:>: like the MPI baselines these
+# are add_custom_target (nvcc + NVSHMEM rdc), and the generator expression
+# fails at CONFIGURE time on a non-executable target, breaking the build for
+# everyone rather than just this test.
+# ---------------------------------------------------------------------------
+if(TARGET clio_lammps_md_nvshmem_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_lammps_md_nvshmem_2pe
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                ${CMAKE_BINARY_DIR}/bin/clio_lammps_md_nvshmem_bench
+                --lattice 20 --steps 20
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_lammps_md_nvshmem_2pe PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;nvshmem;distributed" RUN_SERIAL TRUE)
+endif()
+
+# ---------------------------------------------------------------------------
+# The NCCL baseline, RUN at 2 ranks. lammps_md is the only workload with one.
+#
+# NCCL requires ONE GPU PER RANK -- it cannot share a device the way the MPI
+# and NVSHMEM editions can -- so on a single-GPU host the bench exits 77 and
+# ctest reports SKIP rather than failure. Verified: on this host it skips; the
+# gate is real wherever there are 2+ visible devices.
+# ---------------------------------------------------------------------------
+if(TARGET clio_lammps_md_nccl_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_lammps_md_nccl_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                ${CMAKE_BINARY_DIR}/bin/clio_lammps_md_nccl_bench
+                --lattice 20 --steps 20
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_lammps_md_nccl_2rank PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+endif()

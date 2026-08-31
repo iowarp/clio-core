@@ -1020,7 +1020,11 @@ int main(int argc, char **argv) {
                      "share a device.\n", npes, ndev);
       }
       MPI_Finalize();
-      return 1;
+      // 77, not 1: this is a MISSING CAPABILITY, not a failure. ctest maps
+      // it to SKIP via SKIP_RETURN_CODE, so a single-GPU host reports the
+      // gate as skipped instead of red -- a permanently failing test is one
+      // people learn to ignore, which costs more than the coverage is worth.
+      return 77;
     }
     ncclUniqueId nccl_id;
     if (root) MD_NCCL_CHECK(ncclGetUniqueId(&nccl_id));

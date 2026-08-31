@@ -393,3 +393,27 @@ if(TARGET clio_kmeans_mpi_bench AND MPIEXEC_EXECUTABLE)
     set_tests_properties(bench_kmeans_mpi_2rank PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;mpi;distributed" RUN_SERIAL TRUE)
 endif()
+
+# ---------------------------------------------------------------------------
+# The NVSHMEM baseline, RUN at 2 PEs.
+#
+# Built and never executed, like the MPI edition was. Verified to run and
+# self-gate at 2 PEs on this host before being registered -- NVSHMEM needs a
+# working bootstrap, so an entry that cannot launch would be worse than none.
+#
+# Invoked by OUTPUT PATH, not $<TARGET_FILE:>: like the MPI baselines these
+# are add_custom_target (nvcc + NVSHMEM rdc), and the generator expression
+# fails at CONFIGURE time on a non-executable target, breaking the build for
+# everyone rather than just this test.
+# ---------------------------------------------------------------------------
+if(TARGET clio_kmeans_nvshmem_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_kmeans_nvshmem_2pe
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                ${CMAKE_BINARY_DIR}/bin/clio_kmeans_nvshmem_bench
+                --data-mb 64 --iters 3
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_kmeans_nvshmem_2pe PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;nvshmem;distributed" RUN_SERIAL TRUE)
+endif()
