@@ -91,7 +91,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane
         h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      co_await vec.BeginFlush(0, ubase + z * plane, plane);
+      co_await vec.BeginFlush(1, ubase + z * plane, plane);
       // Fetch is the pinner; UnpinRange is the releaser, after the flush.
       vec.UnpinRange(ubase + z * plane, plane);
     }
@@ -102,7 +102,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane
         h[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      co_await vec.BeginFlush(0, vbase + z * plane, plane);
+      co_await vec.BeginFlush(1, vbase + z * plane, plane);
       vec.UnpinRange(vbase + z * plane, plane);
     }
   }
@@ -121,6 +121,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane
  */
 CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
+                                  u64 nlo, u64 nhi, u64 gen,
                                   u64 ubase, u64 vbase, u64 unext, u64 vnext,
                                   float Du, float Dv, float F, float K,
                                   float dt) {
@@ -135,7 +136,16 @@ CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane
     const u64 zm = interior ? (z - 1) : z;
     const u64 zp = interior ? (z + 1) : z;
 
-    co_await vec.Fetch(0, ubase + zm * plane, plane);
+    // A GENERATION IS DEMANDED ONLY OF A NEIGHBOUR'S PLANE. Page generation
+    // is stamped by the FETCH that delivers it, not by the flush that
+    // publishes it, so a plane this node wrote locally and never re-fetched
+    // sits at generation 0 forever -- demanding one on it stalls the block
+    // with "gen stall: page N at gen 0 want G" and never resolves. Own
+    // planes are current by construction and take 0 (any version); only
+    // the halo, which a PEER produced, needs the demand.
+    const u64 gzm = (zm < nlo || zm >= nhi) ? gen : 0;
+    const u64 gzp = (zp < nlo || zp >= nhi) ? gen : 0;
+    co_await vec.Fetch(gzm, ubase + zm * plane, plane);
     // Three input planes of u, then three of v, then the two outputs -- ONE
     // GUARD PER PLANE, because a guard indexes only its own held page.
     // THE HOLD IS THE PIN: each guard's plane stays resident until the
@@ -145,13 +155,13 @@ CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane
     uzm = co_await vec.HoldPage(ubase + zm * plane, plane);
     co_await vec.Fetch(0, ubase + z * plane, plane);
     uz = co_await vec.HoldPage(ubase + z * plane, plane);
-    co_await vec.Fetch(0, ubase + zp * plane, plane);
+    co_await vec.Fetch(gzp, ubase + zp * plane, plane);
     uzp = co_await vec.HoldPage(ubase + zp * plane, plane);
-    co_await vec.Fetch(0, vbase + zm * plane, plane);
+    co_await vec.Fetch(gzm, vbase + zm * plane, plane);
     vzm = co_await vec.HoldPage(vbase + zm * plane, plane);
     co_await vec.Fetch(0, vbase + z * plane, plane);
     vz = co_await vec.HoldPage(vbase + z * plane, plane);
-    co_await vec.Fetch(0, vbase + zp * plane, plane);
+    co_await vec.Fetch(gzp, vbase + zp * plane, plane);
     vzp = co_await vec.HoldPage(vbase + zp * plane, plane);
     co_await vec.Fetch(0, unext + z * plane, plane);
     unx = co_await vec.HoldPage(unext + z * plane, plane, /*write=*/true);
@@ -187,8 +197,8 @@ CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane
     // Flush the write-once outputs; the drop below is best-effort (a page
     // still flushing or pinned is refused and reclaimed by ordinary eviction
     // once it settles).
-    co_await vec.BeginFlush(0, unext + z * plane, plane);
-    co_await vec.BeginFlush(0, vnext + z * plane, plane);
+    co_await vec.BeginFlush(gen + 1, unext + z * plane, plane);
+    co_await vec.BeginFlush(gen + 1, vnext + z * plane, plane);
     // ONE UNPIN PER FETCH, all eight planes of this step. The sliding window
     // is expressed by re-fetching z and z+1 next iteration, not by holding
     // their pins across it: a pin held across the step would accumulate one

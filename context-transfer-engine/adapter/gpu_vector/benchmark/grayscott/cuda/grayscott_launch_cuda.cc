@@ -34,14 +34,14 @@ __global__ GV_LAUNCH_BOUNDS void StepKernel(GpuInfo info, DevF32 vec, u64 plane,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, u64 zbase,
                            u64 zend, u64 unext,
                            u64 vnext, float Du, float Dv, float F, float K,
-                           float dt, View yv, StackView ys) {
+                           float dt, u64 gen, View yv, StackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   vec.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_YCORO_RUN(StepCoro(vec, plane, nx, ny, nz, z0, z1, ubase, vbase, unext,
+  CLIO_YCORO_RUN(StepCoro(vec, plane, nx, ny, nz, z0, z1, zbase, zend, gen, ubase, vbase, unext,
                           vnext, Du, Dv, F, K, dt));
 }
 
@@ -87,11 +87,11 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
                 u64 vbase, u64 unext, u64 vnext, float Du, float Dv, float F,
-                float K, float dt, u64 zbase, u64 zend, View vw,
+                float K, float dt, u64 zbase, u64 zend, u64 gen, View vw,
                 StackView sv) {
   StepKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, vec, plane, nx, ny, nz, zper, ubase, vbase, zbase, zend, unext,
-      vnext, Du, Dv, F, K, dt, vw, sv);
+      vnext, Du, Dv, F, K, dt, gen, vw, sv);
 }
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,

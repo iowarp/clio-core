@@ -164,7 +164,13 @@ int main(int argc, char **argv) {
   // NEGATIVE CONTROL. With the exchange off a multi-node run must produce
   // a DIFFERENT checksum; if it does not, the exchange is not doing
   // anything and the passing run proves nothing.
-  const bool halo_off = getenv("GS_NO_HALO") != nullptr;
+  // NON-EMPTY, not merely present. docker-compose passes an unset variable
+  // through as GS_NO_HALO= (empty), and getenv returns a non-null empty
+  // string for that -- so a presence test silently enables the control in
+  // every harness run, which is exactly how a correct build reported the
+  // control's wrong answer.
+  const char *const gs_no_halo = getenv("GS_NO_HALO");
+  const bool halo_off = gs_no_halo != nullptr && gs_no_halo[0] != '\0';
   u64 page_kb = 1024, data_mb = 16384, hbm_mb = 4096;
   int repeat = 3;
   // Out-of-core WITHOUT in-kernel faulting: synchronous CTE reads AND
@@ -259,56 +265,31 @@ int main(int argc, char **argv) {
   // a vector's pages are CTE blobs and blobs hash across the cluster, so
   // the paging path IS the halo exchange. Per-node namespaces would give
   // each node a private field and silently decouple the physics.
-  // THE MECHANISM IS IDENTIFIED; MAKING IT WORK IS NOT DONE.
+  // HOW THE HALO EXCHANGE WORKS, now that it does.
   //
-  // Every Fetch and BeginFlush in grayscott_kernels.h passes generation 0,
-  // and per device_vector.h generation 0 means ANY VERSION IS ACCEPTABLE.
-  // That is exactly why a node takes a stale halo plane: it never demands
-  // a current one. DeviceVector::Fetch(generation, ...) is the mechanism
-  // md uses -- publish your slab AS a generation, demand the neighbour's
-  // halo AT it, and let the generation be the barrier.
+  // Every Fetch used to pass generation 0, and generation 0 means ANY
+  // VERSION IS ACCEPTABLE -- so a node never demanded a current halo
+  // plane and was content with a stale one. Steps 0-2 happened to come
+  // out right; the divergence started at step 3 and was nondeterministic.
   //
-  // Threading a generation through (seed publishes 1; step s reads s+1 and
-  // publishes s+2) was tried and REVERTED, because it hangs:
+  // The fix is to demand a generation, but ONLY of a neighbour's plane.
+  // A page's generation is stamped by the FETCH that delivers it, not by
+  // the flush that publishes it, so a plane this node wrote locally and
+  // never re-fetched sits at generation 0 forever -- demanding one on it
+  // hangs the block with "gen stall: page N at gen 0 want G". Own planes
+  // are current by construction and pass 0; the halo passes the step's
+  // generation. The seed publishes AS generation 1, which is what step 0
+  // demands; step s reads at s+1 and publishes as s+2.
   //
-  //   [gpu_vector] gen stall: page 39 at gen 0 want 4 fetching=0 pins=2
-  //
-  // The input pages sit at generation 0 while the reader demands 4, so the
-  // publishes are not stamping a generation onto the page at all. Until
-  // that is understood, threading generations here only converts a wrong
-  // answer into a hang. One thing the attempt did settle: the OUTPUT
-  // planes (unext/vnext) must keep generation 0 -- nobody publishes them
-  // at the demanded generation because this node is about to, so demanding
-  // one waits forever. The demand belongs on the consumer of a value.
-  //
-  // MULTI-NODE IS REFUSED. The exchange is built -- per-step flush, cross-
-  // node barrier, settle-then-invalidate, and the same after the sharded
-  // seed -- but a 2-node run is still WRONG and, worse, NONDETERMINISTIC:
-  // measured 36104.119147, 36104.119147, 36255.928230 on identical runs
-  // against a single-node reference of 36410.579344 that does not move.
-  // Both nodes agree with each other within a run, so the two are staying
-  // in step with one another while both drift from the truth.
-  //
-  // TREAT EARLIER A/B NUMBERS IN THE HISTORY OF THIS FILE WITH SUSPICION.
-  // The "5.98% without the host flush vs 0.84% with it" comparison was
-  // single runs of a quantity that varies between runs, so it does not
-  // support the causal claim made from it. What IS solid: steps 0-2 came
-  // back bit-exact repeatedly, and the divergence starts at step 3.
-  //
-  // This bench's checksum has a TOLERANCE, so unlike gmx's fixed-point
-  // gates it cannot fail loudly on a stale plane. A run that is quietly
-  // 0.4% out is exactly the outcome worth refusing.
-  // GS_FORCE_DIST=1 bypasses the refusal FOR DEBUGGING ONLY -- it is how the
-  // per-plane dump above gets a 2-node run to compare against. It is not a
-  // supported mode and the result is known to be wrong.
-  if (nodes > 1 && getenv("GS_FORCE_DIST") == nullptr) {
-    std::fprintf(stderr,
-                 "GRAYSCOTT ERROR: --nodes %u requested, but the halo "
-                 "exchange is still wrong and nondeterministic past step "
-                 "2. Refusing rather than reporting a plausible, wrong "
-                 "checksum.\n", nodes);
-    return 2;
-  }
+  // MEASURED, 2 nodes vs the single-node reference of 36410.579344:
+  //   demand on  -> 36410.579344, bit-exact, three consecutive runs
+  //   demand off -> 36104.119147 (GS_NO_HALO=1, the negative control)
+  // The control disables the DEMAND, not the barrier, because an earlier
+  // version disabled only the barrier and still came out exact -- which
+  // is its own result: the generation IS the barrier, as md's harness
+  // says. The explicit flush/barrier/ClearCache below may now be
+  // redundant; that is an optimisation, not a correctness question, and
+  // has not been tested on its own.
   const u64 nz_local = (nz + nodes - 1) / nodes;
   const u64 zbase = static_cast<u64>(node) * nz_local;
   const u64 zend = (zbase + nz_local < nz) ? (zbase + nz_local) : nz;
@@ -568,7 +549,11 @@ int main(int argc, char **argv) {
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu,
-                         nv, Du, Dv, F, K, dt, zbase, zend, vw, sv);
+                         nv, Du, Dv, F, K, dt, zbase, zend,
+                         // GS_NO_HALO=1 forces generation 0 -- "any
+                         // version" -- which is the control: it disables
+                         // the DEMAND itself, not merely the barrier.
+                         halo_off ? 0 : static_cast<u64>(s) + 1, vw, sv);
         });
       }
       // THIS IS THE HALO EXCHANGE. Computing plane z needs z-1 and z+1, so
@@ -616,7 +601,8 @@ int main(int argc, char **argv) {
     // question -- a whole-field checksum only says that something is. Uses
     // the existing sum kernel one plane at a time, so it measures the same
     // bytes the gate does rather than a second path that could differ.
-    if (getenv("GS_PLANE_DUMP") != nullptr) {
+    const char *const gs_dump = getenv("GS_PLANE_DUMP");
+    if (gs_dump != nullptr && gs_dump[0] != '\0') {
       for (u64 z = zbase; z < zend; ++z) {
         ctp::GpuApi::Memset(d_sum, 0, sizeof(double));
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,

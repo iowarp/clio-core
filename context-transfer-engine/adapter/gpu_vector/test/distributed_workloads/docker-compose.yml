@@ -59,7 +59,7 @@ services:
       - NODE_IP=172.26.0.10
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - GVW_BARRIER=${GVW_BARRIER:-600}
+      - GVW_BARRIER=${GVW_BARRIER:-240}
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
@@ -69,7 +69,7 @@ services:
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/gvw_conf.yaml
       - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
-    command: ["sh", "-c", "cd /tmp && /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 0; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 0; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
   gvw-node2:
@@ -83,7 +83,7 @@ services:
       - NODE_IP=172.26.0.11
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - GVW_BARRIER=${GVW_BARRIER:-600}
+      - GVW_BARRIER=${GVW_BARRIER:-240}
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
@@ -96,7 +96,7 @@ services:
     # Node 2 starts a moment later so node 1 wins the bind race for the
     # cluster's main server; both orders work, but a deterministic one makes
     # a failed run easier to read.
-    command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 1; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-600} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
+    command: ["sh", "-c", "cd /tmp && sleep $${GVW_START_DELAY:-3}; /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 1; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
 networks:

@@ -72,13 +72,13 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
                 u64 vbase, u64 unext, u64 vnext, float Du, float Dv, float F,
-                float K, float dt, u64 zbase, u64 zend, View vw,
+                float K, float dt, u64 zbase, u64 zend, u64 gen, View vw,
                 StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, vec, vw, sv, [=](DevF32 dev, u32 blk) {
     const u64 z0 = zbase + static_cast<u64>(blk) * zper;
     const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-    return StepCoro(dev, plane, nx, ny, nz, z0, z1, ubase, vbase, unext, vnext,
+    return StepCoro(dev, plane, nx, ny, nz, z0, z1, zbase, zend, gen, ubase, vbase, unext, vnext,
                     Du, Dv, F, K, dt);
   });
 }

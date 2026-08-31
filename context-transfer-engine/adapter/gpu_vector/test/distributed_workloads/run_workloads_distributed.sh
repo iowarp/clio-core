@@ -63,7 +63,9 @@ deck() {
       # every step. Its checksum has a tolerance (float, atomicAdd), so unlike
       # gmx it cannot fail loudly on a stale plane -- hence the negative
       # control below.
-      KEY='v_checksum=([0-9.]+)'; TOL=1e-6
+      # Now bit-exact at 2 nodes, so the tolerance is only here to absorb the
+      # float summation order the bench documents -- it should never be needed.
+      KEY='v_checksum=([0-9.]+)'; TOL=1e-9
       CONTROL_ENV='GS_NO_HALO=1' ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
@@ -138,6 +140,23 @@ run_one() {
       return 1
     fi
   fi
+  # NEGATIVE CONTROL. If disabling the exchange leaves the answer unchanged,
+  # the exchange is not load-bearing and the pass above proves nothing. Only
+  # run it after a pass, and only where a control is defined.
+  if [ -n "$CONTROL_ENV" ]; then
+    rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+    env $CONTROL_ENV docker compose up -d gvw-node1 gvw-node2 >/dev/null 2>&1
+    for n in gvw-node1 gvw-node2; do docker wait "$n" >/dev/null; done
+    docker compose logs --no-color > "/tmp/gvw_${wl}_ctrl.log" 2>&1
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+    local cgot; cgot="$(extract "$KEY" "/tmp/gvw_${wl}_ctrl.log")"
+    echo "  control ($CONTROL_ENV): $cgot"
+    if [ "$cgot" = "$got" ]; then
+      echo "  GATE FAIL: control matches the real run -- the exchange is a no-op"
+      return 1
+    fi
+  fi
   echo "  $wl OK"
 }
 
@@ -148,9 +167,9 @@ if [ "$TARGET" = all ]; then
   for wl in kmeans weights gmx grayscott; do run_one "$wl" || rc=1; done
   echo
   echo "=== summary"
-  echo "  validated distributed: kmeans weights gmx"
+  echo "  validated distributed: kmeans weights gmx grayscott"
   [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
-  echo "  no --nodes at all:     lbann"
+  echo "  gated (needs a1/d2 gather + Bwd1 re-partition): lbann"
   exit $rc
 fi
 run_one "$TARGET"
