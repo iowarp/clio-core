@@ -205,6 +205,73 @@ inline bool ReduceSumU64(clio::cte::core::Client &cte,
 }
 
 /**
+ * All-gather a contiguous float slice.
+ *
+ * Every node owns [lo, hi) of the same array and needs the whole thing. Each
+ * publishes its own slice under its own name and reads every peer's straight
+ * into that peer's offset -- a slice exchange, NOT a zero-padded ReduceSum.
+ * The sum trick would work (zero what you do not own, add), but it moves the
+ * whole array per node instead of one slice, and it silently produces garbage
+ * if a caller forgets to zero, which is not a failure mode worth inviting.
+ *
+ * Generational for the same reason the reductions are: a plain put/get pair
+ * has no readiness gate, so a peer's get can be served before its writer's put
+ * has landed and read whatever was there before.
+ */
+inline bool AllGatherF32(clio::cte::core::Client &cte,
+                         const clio::cte::core::TagId &tag, u32 node, u32 nodes,
+                         u64 round, float *data, u64 lo, u64 hi,
+                         const u64 *los, const u64 *his,
+                         const char *prefix = "gvgat", int timeout_s = 120) {
+  if (nodes <= 1) return true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto expired = [&] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count() > timeout_s;
+  };
+  const std::string stem =
+      std::string(prefix) + "_" + std::to_string(round) + "_";
+
+  clio::cte::core::Context ctx;
+  ctx.op_flags_ |= clio::cte::core::Context::kGenerational;
+  ctx.generation_ = 1;
+
+  const u64 mine_bytes = (hi - lo) * sizeof(float);
+  for (;;) {
+    auto f = cte.AsyncPutBlob(tag, stem + std::to_string(node), 0, mine_bytes,
+                              reinterpret_cast<char *>(data + lo), 1.0f, ctx);
+    f.Wait();
+    if (f->GetReturnCode() == 0) break;
+    if (expired()) {
+      std::fprintf(stderr, "  gather[%s]: timed out publishing node %u\n",
+                   prefix, node);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  for (u32 peer = 0; peer < nodes; ++peer) {
+    if (peer == node) continue;
+    const u64 plo = los[peer], phi = his[peer];
+    const u64 bytes = (phi - plo) * sizeof(float);
+    for (;;) {
+      auto f = cte.AsyncGetBlob(tag, stem + std::to_string(peer), 0, bytes, 0u,
+                                reinterpret_cast<char *>(data + plo),
+                                clio::run::PoolQuery::Dynamic(), ctx);
+      f.Wait();
+      if (f->GetReturnCode() == 0) break;
+      if (expired()) {
+        std::fprintf(stderr, "  gather[%s]: timed out waiting for node %u\n",
+                     prefix, peer);
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  return true;
+}
+
+/**
  * Wait for every outstanding put to land, THEN drop the cache.
  *
  * ClearCache on its own is not an invalidate here: it zeroes `flushing` and

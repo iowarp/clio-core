@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,6 +87,10 @@ using lb::Sym01;
 
 
 #if !CTP_IS_DEVICE_PASS
+
+// Cross-node collectives. Included INSIDE the device-pass guard: it uses
+// the CTE client, whose members are compiled out of the CUDA device pass.
+#include "../bench_dist.h"
 
 namespace {
 
@@ -196,37 +201,30 @@ int main(int argc, char **argv) {
                  (unsigned long long)O, nodes);
     return 2;
   }
-  // MULTI-NODE IS REFUSED. The band split below is in place and single
-  // node is byte-identical through it (h0=0, h1=H collapses to the old
-  // expression), but the exchanges are not, and working out WHICH ones are
-  // needed turned up a blocker.
+  // MODEL-PARALLEL BAND SPLIT. A node owns h-rows of W1 and o-rows of W2.
+  // a1 and d2 are laid out [feature][batch] (a1[h*B+b], d2[o*B+b]), so a
+  // band is a CONTIGUOUS slice and the exchange is a slice gather.
   //
-  // With the band split as written (a node owns h-rows), the data flow is:
-  //   a1  MUST be all-gathered after Fwd1 -- Fwd2 sums over every h, and
-  //       Upd2 reads every h as well, so a node's own band is not enough.
-  //   d2  MUST be all-gathered after Fwd2 -- Bwd1 sums over every o.
-  //   d1  needs NOTHING. Bwd1 computes d1 for the node's own h-rows and
-  //       Upd1 consumes exactly those, so it never leaves the node. (An
-  //       earlier note here claimed d1 needed an all-reduce; that is wrong
-  //       for this partition and is corrected.)
+  //   a1  all-gathered after Fwd1 -- Fwd2 sums over every h, Upd2 reads
+  //       every h.
+  //   d2  all-gathered after Fwd2 -- Bwd1 sums over every o.
+  //   d1  needs nothing: Bwd1 computes this node's own h-rows and Upd1
+  //       consumes exactly those.
   //
-  // THE BLOCKER is not a missing collective. Bwd1's own comment says it:
-  // "This block owns d1 rows h0..h1 and must read ALL of W2 for them."
-  // W2 lives in the shared paged vector, and with an o-row band split the
-  // rows outside this node's band are written by PEERS -- so Bwd1 does a
-  // cross-node read of weights a peer updated last step, which is the same
-  // stale-page problem that currently blocks grayscott, and it is blocked
-  // on the same generational-publish defect.
-  //
-  // The MPI edition sidesteps this by partitioning Bwd1 BY O instead: each
-  // rank forms a PARTIAL d1 from its own o-rows and the partials are
-  // combined in rank order. No rank ever reads another's W2. Doing that
-  // here means re-partitioning the kernel, not just narrowing a range, so
-  // it is a real change rather than the finish of this one.
+  // Bwd1 also reads ALL of W2, including o-rows a PEER updates, which is
+  // a cross-node read of the shared paged vector. That is the same shape
+  // as grayscott's halo and is handled the same way -- see the note there
+  // on demanding a generation only of a peer's page.
   const u64 h0 = (H / nodes) * node, h1 = h0 + H / nodes;
   const u64 o0 = (O / nodes) * node, o1 = o0 + O / nodes;
   // Blocks subdivide this node's band, not the whole layer.
   const u64 hper = (h1 - h0) / blocks, oper = (o1 - o0) / blocks;
+  // THE DENSE REFERENCE IS NOT SHARDED. It is a plain in-VRAM copy of the
+  // whole network and takes no row base, so a node-local hper makes every
+  // node compute rows [0, H/nodes) -- the same wrong reference on each,
+  // which is why both nodes agreed on a dense loss while disagreeing on
+  // the paged one. It must span the full layer.
+  const u64 hper_all = H / blocks, oper_all = O / blocks;
 
   // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
   // one and Setenv-ing it with overwrite=1 unconditionally makes it
@@ -297,12 +295,20 @@ int main(int argc, char **argv) {
       2 * sizeof(unsigned long long));
 
   std::vector<double> loss_ref(steps), loss_got(steps);
-  auto host_loss = [&]() {
+  // `lo`/`hi` bound which of d_lp this caller actually wrote. The dense
+  // reference spans the whole array; a paged node writes only its own
+  // o-band, and summing the rest would fold in whatever the dense pass
+  // left there -- which is exactly how the distributed loss came out
+  // node-dependent and too low.
+  auto host_loss_range = [&](u64 lo, u64 hi) {
     std::vector<double> lp(O * B);
     ctp::GpuApi::Memcpy(lp.data(), d_lp, O * B * sizeof(double));
     double s = 0.0;                 // fixed order: one deterministic sum
-    for (u64 i = 0; i < O * B; ++i) s += lp[i];
-    return s / static_cast<double>(B * O);
+    for (u64 i = lo; i < hi; ++i) s += lp[i];
+    return s;
+  };
+  auto host_loss = [&]() {
+    return host_loss_range(0, O * B) / static_cast<double>(B * O);
   };
 
   // ---- Dense reference training. -----------------------------------------
@@ -312,15 +318,15 @@ int main(int argc, char **argv) {
   const double t_ref0 = NowMs();
   for (u64 s = 0; s < steps; ++s) {
     lb::LaunchDenseFwd1(blocks, threads, d_wref, w1_off, b1_off, I, H, B, d_x,
-                        d_a1, hper);
+                        d_a1, hper_all);
     lb::LaunchDenseFwd2(blocks, threads, d_wref, w2_off, b2_off, H, O, B, d_a1,
-                        d_y, d_d2, d_lp, oper);
+                        d_y, d_d2, d_lp, oper_all);
     lb::LaunchDenseBwd1(blocks, threads, d_wref, w2_off, H, O, B, d_a1, d_d2,
-                        d_d1, hper, rpp2 ? rpp2 : 1);
+                        d_d1, hper_all, rpp2 ? rpp2 : 1);
     lb::LaunchDenseUpd2(blocks, threads, d_wref, w2_off, b2_off, H, O, B, d_a1,
-                        d_d2, lr, oper);
+                        d_d2, lr, oper_all);
     lb::LaunchDenseUpd1(blocks, threads, d_wref, w1_off, b1_off, I, H, B, d_x,
-                        d_d1, lr, hper);
+                        d_d1, lr, hper_all);
     ctp::GpuApi::Synchronize();
     loss_ref[s] = host_loss();
   }
@@ -344,6 +350,50 @@ int main(int argc, char **argv) {
   });
   ctp::GpuApi::Synchronize();
 
+  // ---- cross-node collectives ------------------------------------------
+  // Built after the runtime is up and only when there is an exchange to do.
+  // The tag is NOT per-node: the slices have to meet.
+  std::unique_ptr<clio::cte::core::Client> cte_x;
+  clio::cte::core::TagId x_tag{};
+  u64 x_round = 0;
+  // clio::run::u64 is unsigned long; bench_dist speaks unsigned long long.
+  using dist_u64 = clio_bench_dist::u64;
+  std::vector<dist_u64> a1_lo(nodes), a1_hi(nodes), d2_lo(nodes),
+      d2_hi(nodes);
+  for (u32 nd = 0; nd < nodes; ++nd) {
+    a1_lo[nd] = (H / nodes) * nd * B;  a1_hi[nd] = a1_lo[nd] + (H / nodes) * B;
+    d2_lo[nd] = (O / nodes) * nd * B;  d2_hi[nd] = d2_lo[nd] + (O / nodes) * B;
+  }
+  if (nodes > 1) {
+    cte_x = std::make_unique<clio::cte::core::Client>(
+        clio::cte::core::kCtePoolId);
+    auto t = cte_x->AsyncGetOrCreateTag("gv_lbann_x");
+    t.Wait();
+    if (t->GetReturnCode() != 0) {
+      std::fprintf(stderr, "LBANN ERROR: could not create exchange tag\n");
+      return 1;
+    }
+    x_tag = t->tag_id_;
+  }
+  // Staging for the gathers: the arrays live on the device.
+  std::vector<float> h_a1(static_cast<size_t>(H) * B);
+  std::vector<float> h_d2(static_cast<size_t>(O) * B);
+  const auto gather = [&](float *dev, std::vector<float> &host,
+                          const std::vector<dist_u64> &los,
+                          const std::vector<dist_u64> &his,
+                          const char *what) -> bool {
+    if (nodes <= 1) return true;
+    ctp::GpuApi::Memcpy(host.data(), dev, host.size() * sizeof(float));
+    if (!clio_bench_dist::AllGatherF32(*cte_x, x_tag, node, nodes,
+                                       x_round++, host.data(), los[node],
+                                       his[node], los.data(), his.data(),
+                                       what)) {
+      return false;
+    }
+    ctp::GpuApi::Memcpy(dev, host.data(), host.size() * sizeof(float));
+    return true;
+  };
+
   const double t0 = NowMs();
   for (u64 s = 0; s < steps; ++s) {
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
@@ -352,6 +402,14 @@ int main(int argc, char **argv) {
                                                   H, B, d_x, d_a1, hper, rpp1,
                                                   h0, h1, vw, sv);
     });
+    // Fwd2 sums over EVERY h, so it needs the whole a1, not this node's
+    // band. Without this each node forward-propagates a fraction of the
+    // hidden layer and the loss is quietly wrong rather than failing.
+    ctp::GpuApi::Synchronize();
+    if (!gather(d_a1, h_a1, a1_lo, a1_hi, "lba1")) {
+      std::fprintf(stderr, "LBANN ERROR: a1 gather failed\n");
+      return 1;
+    }
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchFwd2(g, b, gpu, dw, w2_off, b2_off, H,
@@ -359,6 +417,12 @@ int main(int argc, char **argv) {
                                                   oper, rpp2 ? rpp2 : 1, o0, o1,
                                                   vw, sv);
     });
+    // Bwd1 sums over EVERY o, so d2 has to be whole before it runs.
+    ctp::GpuApi::Synchronize();
+    if (!gather(d_d2, h_d2, d2_lo, d2_hi, "lbd2")) {
+      std::fprintf(stderr, "LBANN ERROR: d2 gather failed\n");
+      return 1;
+    }
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchBwd1(g, b, gpu, dw, w2_off, H, O, B,
@@ -380,9 +444,37 @@ int main(int argc, char **argv) {
                                                   rpp1, h0, h1, vw, sv);
     });
     ctp::GpuApi::Synchronize();
-    loss_got[s] = host_loss();
+    // Each node summed only its own o-band; the loss is over the whole
+    // output layer, so the partials are combined before the divide.
+    double lpart = host_loss_range(o0 * B, o1 * B);
+    if (nodes > 1 &&
+        !clio_bench_dist::ReduceSum(*cte_x, x_tag, node, nodes, x_round++,
+                                    &lpart, 1, "lbloss")) {
+      std::fprintf(stderr, "LBANN ERROR: loss reduction failed\n");
+      return 1;
+    }
+    loss_got[s] = lpart / static_cast<double>(B * O);
   }
   const double t_paged = NowMs() - t0;
+  // THE DIGEST READS EVERY WEIGHT, including the bands this node's peers
+  // updated. A page a peer still holds resident is invisible here, and a
+  // page this node cached earlier is stale -- measured as the two nodes
+  // reporting DIFFERENT digests, each correct only on its own band.
+  // Publish, wait for every peer to publish, then drop the cache so the
+  // digest pass refaults the whole vector from the CTE.
+  if (nodes > 1) {
+    ctp::GpuApi::Synchronize();
+    w.FlushResidentToCte();
+    if (!clio_bench_dist::Barrier(*cte_x, x_tag, node, nodes, x_round++,
+                                  "lbdg")) {
+      std::fprintf(stderr, "LBANN ERROR: digest barrier failed\n");
+      return 1;
+    }
+    if (!clio_bench_dist::SettleAndInvalidate(w)) {
+      std::fprintf(stderr, "LBANN ERROR: cache never settled\n");
+      return 1;
+    }
+  }
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                  gy::YieldStackView sv) {
     lb::LaunchDigest(g, b, gpu, dw, n, eper,

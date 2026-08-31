@@ -67,6 +67,12 @@ deck() {
       # float summation order the bench documents -- it should never be needed.
       KEY='v_checksum=([0-9.]+)'; TOL=1e-9
       CONTROL_ENV='GS_NO_HALO=1' ;;
+    lbann)
+      BENCH=clio_lbann_paged_bench
+      ARGS="--blocks 8"
+      # Fixed reference: the bench trains against its own dense in-VRAM copy
+      # and asserts bit-equality, so this gate has no tolerance at all.
+      KEY='(ALL GATES PASS)'; TOL=exact ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
