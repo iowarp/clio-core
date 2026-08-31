@@ -827,3 +827,38 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
     endforeach()
     message(STATUS "gpu_vector SYCL docker gates: ON (${CLIO_GV_SYCL_BUILD_DIR})")
 endif()
+
+# ---------------------------------------------------------------------------
+# The pre-existing cluster harnesses, as ctest entries.
+#
+# These predate distributed_workloads/ and were hand-run only -- real gates
+# that nothing invoked, so nothing noticed them rotting. Each was executed
+# before being registered; all four pass on this host.
+#
+#   distributed            4-node paging stress
+#   distributed_generation cross-node generation exchange
+#   distributed_md_paged   the md halo exchange, coherent across nodes
+#   distributed_md_bench   the md BENCHMARK with its physics gates, 2 nodes
+#
+# distributed_md/ is deliberately NOT here: it also runs the NVSHMEM edition,
+# whose cross-container placement depends on the GPU count, so what it
+# actually exercises varies by host. It stays a script you invoke knowing that.
+# ---------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
+    foreach(_h distributed:run_distributed
+               distributed_generation:run_generation_distributed
+               distributed_md_paged:run_md_paged_distributed
+               distributed_md_bench:run_md_bench_distributed)
+        string(REPLACE ":" ";" _parts ${_h})
+        list(GET _parts 0 _dir)
+        list(GET _parts 1 _script)
+        add_test(NAME cte_gv_harness_${_dir}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/${_dir}/${_script}.sh
+        )
+        set_tests_properties(cte_gv_harness_${_dir} PROPERTIES
+            TIMEOUT 2400
+            LABELS "cte;gpu;gpu_vector;gv_harness;distributed;docker"
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${_gv_build_name}")
+    endforeach()
+endif()
