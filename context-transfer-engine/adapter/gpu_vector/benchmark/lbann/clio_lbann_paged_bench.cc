@@ -215,6 +215,23 @@ int main(int argc, char **argv) {
   // a cross-node read of the shared paged vector. That is the same shape
   // as grayscott's halo and is handled the same way -- see the note there
   // on demanding a generation only of a peer's page.
+  // THE RESIDUAL DISTRIBUTED ERROR IS THE BIASES, AND IT IS PAGE-GRANULAR
+  // FALSE SHARING. W1 and W2 split cleanly: a node's rows are contiguous
+  // and, for the default geometry, land on page boundaries (W1 row = I =
+  // 256 elems, 64 rows/page, H/2 = 2048 rows -- aligned; W2 row = H, 4
+  // rows/page, O/2 = 32 -- aligned). The BIASES do not: b1 is 4096 floats
+  // and b2 is 64, so each fits ENTIRELY INSIDE ONE PAGE. Node 0 writes the
+  // lower half of that page and node 1 the upper, and writeback is
+  // page-granular -- so each node writes the whole page and clobbers the
+  // other's half. Nothing reports an error; the weights simply end up
+  // wrong by roughly one accumulated bias update, which is the measured
+  // max |paged - dense| = 4.7e-4.
+  //
+  // This is the same hazard as splitting any paged work off a page
+  // boundary, and the fix is not another collective: either the biases are
+  // padded so each node's slice owns whole pages, or their update is
+  // replicated so every node writes identical bytes and the clobber is
+  // harmless (which needs d1 gathered, as a1 and d2 already are).
   const u64 h0 = (H / nodes) * node, h1 = h0 + H / nodes;
   const u64 o0 = (O / nodes) * node, o1 = o0 + O / nodes;
   // Blocks subdivide this node's band, not the whole layer.
