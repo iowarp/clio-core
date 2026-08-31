@@ -55,6 +55,11 @@ LB_KERNEL(Seed,
                           ((static_cast<u64>(yv.Block()) + 1) * eper < n) ? (static_cast<u64>(yv.Block()) + 1) * eper : n, chunk),
           u64 n, u64 eper, u64 chunk)
 
+LB_KERNEL(MaxDiff,
+          MaxDiffCoro(w, static_cast<u64>(yv.Block()) * eper,
+                          ((static_cast<u64>(yv.Block()) + 1) * eper < n) ? (static_cast<u64>(yv.Block()) + 1) * eper : n, chunk, ref, out),
+          u64 n, u64 eper, u64 chunk, const float *ref, unsigned long long *out)
+
 LB_KERNEL(Digest,
           DigestCoro(w, static_cast<u64>(yv.Block()) * eper,
                           ((static_cast<u64>(yv.Block()) + 1) * eper < n) ? (static_cast<u64>(yv.Block()) + 1) * eper : n, chunk, out),
@@ -141,6 +146,13 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  View vw, StackView sv) {
   SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, n, eper, chunk, vw,
                                                   sv);
+}
+
+void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                 u64 n, u64 eper, u64 chunk, const float *ref,
+                 unsigned long long *out, View vw, StackView sv) {
+  MaxDiffKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, n, eper, chunk,
+                                                        ref, out, vw, sv);
 }
 
 void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,

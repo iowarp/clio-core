@@ -167,15 +167,18 @@ run_one() {
 }
 
 UNSUPPORTED=""
+FAILED=""
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
-  for wl in kmeans weights gmx grayscott; do run_one "$wl" || rc=1; done
+  for wl in kmeans weights gmx grayscott lbann; do
+    run_one "$wl" || { rc=1; FAILED="$FAILED $wl"; }
+  done
   echo
   echo "=== summary"
   echo "  validated distributed: kmeans weights gmx grayscott"
   [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
-  echo "  gated (needs a1/d2 gather + Bwd1 re-partition): lbann"
+  [ -n "$FAILED" ] && echo "  FAILING:              $FAILED"
   exit $rc
 fi
 run_one "$TARGET"

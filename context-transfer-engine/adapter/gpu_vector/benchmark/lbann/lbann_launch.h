@@ -60,6 +60,12 @@ void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk, unsigned long long *out,
                  View vw, StackView sv);
 
+/** Max |paged - dense| over the weights, scaled by 1e9. The distributed
+ *  gate: a bit-exact digest cannot survive a cross-node summation order. */
+void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                 u64 n, u64 eper, u64 chunk, const float *ref,
+                 unsigned long long *out, View vw, StackView sv);
+
 
 /* ---- dense reference: the whole model resident, no paging ---- */
 

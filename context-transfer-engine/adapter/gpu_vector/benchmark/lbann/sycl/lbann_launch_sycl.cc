@@ -117,6 +117,18 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                   });
 }
 
+void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                 u64 n, u64 eper, u64 chunk, const float *ref,
+                 unsigned long long *out, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, w, vw, sv,
+                  [=](DevF32 dev, u32 blk_) {
+                    const u64 blk = static_cast<u64>(blk_);
+                    return MaxDiffCoro(dev, blk * eper,
+                          ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk, ref, out);
+                  });
+}
+
 void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk, unsigned long long *out,
                  View vw, StackView sv) {

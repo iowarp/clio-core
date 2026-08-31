@@ -454,6 +454,18 @@ int main(int argc, char **argv) {
       return 1;
     }
     loss_got[s] = lpart / static_cast<double>(B * O);
+    // WHY THERE IS NO PER-STEP WEIGHT EXCHANGE HERE. Bwd1 reads ALL of W2,
+    // including o-rows a peer just updated, so next step it sums against a
+    // stale cached copy -- that is the residual 1e-3 the weight gate
+    // reports. The obvious patch, FlushResidentToCte + barrier +
+    // invalidate every step, was tried and made it far WORSE (loss
+    // diverging from step 1, 1.08 vs 0.47): a whole-table flush also
+    // republishes the peer's rows this node merely READ, clobbering their
+    // newer values with a stale cached copy. The correct fix is the one
+    // that worked for grayscott -- demand a generation on a PEER's page
+    // and leave your own alone -- which needs generations threaded
+    // through Bwd1's weight fetches, distinguishing own o-rows from a
+    // peer's. That is real work, not a line here.
   }
   const double t_paged = NowMs() - t0;
   // THE DIGEST READS EVERY WEIGHT, including the bands this node's peers
@@ -496,22 +508,64 @@ int main(int argc, char **argv) {
 
   int rc = 0;
   bool loss_ok = true;
+  // ACROSS NODES THE COMPARISON IS BOUNDED, NOT BIT-EQUAL. Combining
+  // partials changes the summation order and float addition is not
+  // associative, so a distributed run cannot reproduce the single-node
+  // bits however correct it is. Measured drift over 5 steps: 6e-15 at step
+  // 0 growing to 2.4e-8 at step 4. The single-node path keeps the exact
+  // comparison -- there is no reordering there to excuse a difference.
+  const double loss_tol = (nodes > 1) ? 1e-6 : 0.0;
   for (u64 s = 0; s < steps; ++s) {
-    if (loss_got[s] != loss_ref[s]) {
+    const double diff = loss_got[s] - loss_ref[s];
+    const double adiff = diff < 0 ? -diff : diff;
+    const double scale = loss_ref[s] != 0.0 ?
+        (loss_ref[s] < 0 ? -loss_ref[s] : loss_ref[s]) : 1.0;
+    if (adiff > loss_tol * scale) {
       std::printf("  LOSS GATE: step %llu paged %.17g != dense %.17g\n",
                   (unsigned long long)s, loss_got[s], loss_ref[s]);
       loss_ok = false;
     }
   }
   if (loss_ok) {
-    std::printf("  LOSS GATE: PASS (all %llu steps bit-equal; final loss "
+    std::printf("  LOSS GATE: PASS (all %llu steps within tolerance; final loss "
                 "%.6f -> %.6f)\n",
                 (unsigned long long)steps, loss_ref[0],
                 loss_ref[steps - 1]);
   } else {
     rc = 1;
   }
-  if (dg[0] != dg[1]) {
+  if (nodes > 1) {
+    // ELEMENTWISE, not the digest. The digest is a bit-exact hash, so one
+    // differing low bit rehashes to something completely unrelated and it
+    // cannot express "close". This walks the same weights and takes the
+    // largest absolute difference, so it still fails on a SINGLE wrong
+    // element -- a sum or a looser hash would average one away.
+    auto *d_md = ctp::GpuApi::Malloc<unsigned long long>(
+        sizeof(unsigned long long));
+    ctp::GpuApi::Memset(d_md, 0, sizeof(unsigned long long));
+    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
+                        d_md, vw, sv);
+    });
+    ctp::GpuApi::Synchronize();
+    unsigned long long md = 0;
+    ctp::GpuApi::Memcpy(&md, d_md, sizeof(md));
+    ctp::GpuApi::Free(d_md);
+    const double maxdiff = static_cast<double>(md) / 1e9;
+    // 1e-5 absolute on weights that start at O(1) and are stepped by an
+    // lr-scaled gradient: loose enough for a reordered sum over 5 steps
+    // (measured drift 2.4e-8 in the loss), tight enough that a stale or
+    // dropped page -- which moves a weight by its whole update -- fails.
+    if (maxdiff > 1e-5) {
+      std::printf("  WEIGHT GATE: FAIL (max |paged - dense| = %.3g > "
+                  "1e-5)\n", maxdiff);
+      rc = 1;
+    } else {
+      std::printf("  WEIGHT GATE: PASS (max |paged - dense| = %.3g, "
+                  "%u nodes)\n", maxdiff, nodes);
+    }
+  } else if (dg[0] != dg[1]) {
     std::printf("  WEIGHT GATE: FAIL (digest paged %llu != dense %llu)\n",
                 dg[1], dg[0]);
     rc = 1;

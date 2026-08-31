@@ -258,6 +258,39 @@ CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u
   atomicAdd(out, acc);
 }
 
+/** Largest absolute elementwise difference between the paged weights and the
+ *  dense reference, scaled to 1e9 so it fits an integer atomic.
+ *
+ *  The digest above is a bit-exact hash and is the right gate for a single
+ *  node, where the paged and dense paths must agree to the last bit. Across
+ *  NODES they cannot: combining partials changes the summation order, float
+ *  addition is not associative, and one differing low bit rehashes to a
+ *  completely different digest. This compares the values themselves, so a
+ *  distributed run can be held to a numerical bound instead of an
+ *  unachievable one -- and unlike a looser hash or a sum-of-weights check,
+ *  it still fails on a SINGLE wrong element rather than averaging it away.
+ */
+CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
+                                     u64 e1, u64 chunk, const float *ref,
+                                     unsigned long long *out) {
+  unsigned long long acc = 0;
+  for (u64 lo = e0; lo < e1; lo += chunk) {
+    const u64 hi = (lo + chunk < e1) ? lo + chunk : e1;
+    co_await w.Fetch(0, lo, hi - lo);
+    auto h = co_await w.HoldPage(lo, hi - lo);
+    for (u64 i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+      const float d = h[i] - ref[i];
+      const float a = d < 0.0f ? -d : d;
+      const unsigned long long q =
+          static_cast<unsigned long long>(a * 1e9f);
+      if (q > acc) acc = q;
+    }
+    __syncthreads();
+    w.UnpinRange(lo, hi - lo);
+  }
+  atomicMax(out, acc);
+}
+
 // -------------------- DENSE REFERENCE (same loops, plain memory) ----------
 
 CTP_GPU_FUN inline void DenseSeed(float *w, u64 n) {
