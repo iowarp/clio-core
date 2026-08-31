@@ -170,3 +170,44 @@ fi
 # Pointed at explicitly rather than added to PATH, so nothing else in the
 # build starts resolving through the LLVM prefix.
 export CLIO_DELTA_LLVM_CONFIG="${CLIO_DELTA_LLVM_CONFIG:-$(dirname "$CLIO_DELTA_CLANGXX")/llvm-config}"
+
+# ---------------------------------------------------------------------------
+# NVSHMEM MULTI-NODE. Source this and `srun --mpi=pmi2` and it works; every
+# line below is load-bearing, and each was a separate failure.
+#
+# BOOTSTRAP THROUGH THE LAUNCHER, NOT MPI. NVSHMEM's MPI bootstrap is a
+# dlopen'd plugin NVIDIA built against OpenMPI, so it needs libmpi.so.40 --
+# but Delta's system MPI is cray-mpich, and the HPC-X OpenMPI inside nvhpc
+# cannot connect across Slingshot at all ("ucp_ep_create failed: Destination
+# is unreachable" from its UCX PML). PMI sidesteps both. NVSHMEM_BOOTSTRAP
+# takes the FAMILY and NVSHMEM_BOOTSTRAP_PMI the VARIANT -- putting "PMI2"
+# in the first one fails with "bootstrap_preinit failed". PMIX is not usable
+# here: nvshmem_bootstrap_pmix.so needs HPC-X's libpmix, which has an
+# undefined opal_libevent2022_evthread_use_pthreads.
+export NVSHMEM_BOOTSTRAP="${NVSHMEM_BOOTSTRAP:-PMI}"
+export NVSHMEM_BOOTSTRAP_PMI="${NVSHMEM_BOOTSTRAP_PMI:-PMI2}"
+
+# THE TRANSPORT MUST BE NAMED. Left alone, NVSHMEM defaults to ibrc,
+# enumerates InfiniBand devices, finds none on a Slingshot machine, and dies
+# with "building transport map failed". Delta's fabric is CXI through
+# libfabric 2.3.1 (fi_info -p cxi resolves on the compute nodes).
+export NVSHMEM_REMOTE_TRANSPORT="${NVSHMEM_REMOTE_TRANSPORT:-libfabric}"
+export NVSHMEM_LIBFABRIC_PROVIDER="${NVSHMEM_LIBFABRIC_PROVIDER:-cxi}"
+
+# CXI TUNING NVSHMEM ASKS FOR IN ITS OWN STRINGS. The libfabric transport
+# carries the warnings "FI_CXI_OPTIMIZED_MRS is set. This may cause a hang at
+# runtime if the value is not 0" and "FI_CXI_DISABLE_HMEM_DEV_REGISTER ... may
+# cause issues with initialization if the value is not 1". Without them the
+# run reaches the data path and then hangs in nvshmemt_libfabric_quiet with
+# "Connection timed out".
+export FI_CXI_OPTIMIZED_MRS="${FI_CXI_OPTIMIZED_MRS:-0}"
+export FI_CXI_DISABLE_HMEM_DEV_REGISTER="${FI_CXI_DISABLE_HMEM_DEV_REGISTER:-1}"
+
+# MEASURED with this recipe: NVIDIA's own shmem_put_bw across 2 nodes reaches
+# 11.3 GB/s at 4 MiB; clio_kmeans_nvshmem_bench passes its gates at 2 PEs on
+# 2 nodes (455.6 ms / 20 iters) and 4 PEs on 4 nodes (294.7 ms), and
+# clio_grayscott_nvshmem_bench's halo exchange passes at 4 PEs on 4 nodes.
+#
+# The benches must be built with CLIO_GV_NVSHMEM_MPI_BOOTSTRAP=OFF, which
+# makes them call nvshmem_init() and honour the variables above instead of
+# bootstrapping through MPI.

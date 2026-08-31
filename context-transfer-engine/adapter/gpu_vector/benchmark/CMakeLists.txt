@@ -21,6 +21,19 @@
 # Workloads split into shared kernels plus per-backend launches
 # (<wl>_kernels.h over <wl>_math.h, plus <wl>/cuda and <wl>/sycl). These are
 # the ones a SYCL build can descend into -- which is now all six.
+# NVSHMEM BOOTSTRAP. The MPI bootstrap is a dlopen'd plugin NVIDIA builds
+# against OpenMPI, so it needs libmpi.so.40 and an MPI that can actually run
+# multi-node. On a Cray machine neither holds: the system MPI is cray-mpich,
+# and the HPC-X OpenMPI that ships with nvhpc cannot connect its UCX PML
+# across Slingshot ("ucp_ep_create failed: Destination is unreachable").
+# Turning this OFF builds the benches to call nvshmem_init() instead, which
+# bootstraps through the LAUNCHER (NVSHMEM_BOOTSTRAP=PMI + srun --mpi=pmi2)
+# -- the path NVIDIA's own perftest binaries use, and the one measured
+# working multi-node on Delta at 11.3 GB/s put bandwidth over 2 nodes.
+option(CLIO_GV_NVSHMEM_MPI_BOOTSTRAP
+       "Bootstrap the NVSHMEM baselines through MPI (OFF = through the launcher, via nvshmem_init)"
+       ON)
+
 add_subdirectory(kmeans)
 add_subdirectory(grayscott)
 add_subdirectory(gmx)

@@ -89,6 +89,81 @@ Two things that will bite you:
   ROW COUNT, not by parameters — see the RESUME note at the top of either
   YAML.
 
+## NVSHMEM multi-node (the thing docker CI could not do)
+
+`753798ef` recorded NVSHMEM multi-node as NOT SOLVED in containers, with four
+causes eliminated. It works here, and the container dead-ends were not the
+reason. Full recipe, all of it load-bearing, in `env.sh`:
+
+```bash
+NVSHMEM_BOOTSTRAP=PMI  NVSHMEM_BOOTSTRAP_PMI=PMI2
+NVSHMEM_REMOTE_TRANSPORT=libfabric  NVSHMEM_LIBFABRIC_PROVIDER=cxi
+FI_CXI_OPTIMIZED_MRS=0  FI_CXI_DISABLE_HMEM_DEV_REGISTER=1
+srun --mpi=pmi2 -n N --ntasks-per-node=1 <bench>
+```
+
+Four separate failures had to be cleared, each with its own signature:
+
+1. **MPI cannot bootstrap it here.** NVSHMEM's MPI bootstrap is a dlopen'd
+   plugin built against OpenMPI (needs `libmpi.so.40`), but Delta's MPI is
+   cray-mpich; and the HPC-X OpenMPI inside nvhpc cannot connect across
+   Slingshot at all -- `ucp_ep_create failed: Destination is unreachable`
+   from its UCX PML. PMI sidesteps both.
+2. **`NVSHMEM_BOOTSTRAP` takes the FAMILY, not the variant.** Passing `PMI2`
+   to it fails with `bootstrap_preinit failed`; the variant belongs in
+   `NVSHMEM_BOOTSTRAP_PMI`. PMIX is unusable -- its plugin needs HPC-X's
+   libpmix, which has an undefined `opal_libevent2022_evthread_use_pthreads`.
+3. **The transport must be named.** Left alone NVSHMEM defaults to `ibrc`,
+   enumerates InfiniBand devices, finds none on a Slingshot machine, and
+   fails with `building transport map failed`.
+4. **CXI needs the tuning NVSHMEM asks for in its own strings** -- the
+   libfabric transport literally carries "FI_CXI_OPTIMIZED_MRS is set. This
+   may cause a hang at runtime if the value is not 0". Without it the run
+   reaches the data path and hangs in `nvshmemt_libfabric_quiet` with
+   `Connection timed out`.
+
+The benches must be built with `-DCLIO_GV_NVSHMEM_MPI_BOOTSTRAP=OFF`, which
+makes them call `nvshmem_init()` and honour the above. Their previous
+non-MPI path was hardcoded to ONE PE
+(`nvshmemx_set_attr_uniqueid_args(0, 1, ...)`), so the only build that could
+be distributed was the MPI one -- which is the build that cannot run here.
+
+### Measured
+
+NVIDIA's own `shmem_put_bw`, 2 nodes over Slingshot:
+
+| size | GB/s | size | GB/s |
+|---|---|---|---|
+| 4 B | 0.00048 | 256 KiB | 10.25 |
+| 16 KiB | 0.636 | 1 MiB | 10.57 |
+| 64 KiB | 2.639 | 4 MiB | **11.33** |
+
+Our benches, `--steps/--iters 20`:
+
+| workload | 4 PEs / 4 nodes | result |
+|---|---|---|
+| kmeans | 294.7 ms (2 nodes: 455.6 ms) | ALL GATES PASS |
+| grayscott | 27.7 ms | ALL GATES PASS |
+| weights | 114.5 ms | ALL GATES PASS |
+| lammps_md | 21.7 ms (1.086 ms/step) | gates pass; ledger shows 3.30 MB/step, **100% from a PEER** |
+| gmx | ran | **CONSERVATION GATE FAIL** |
+| lbann | ran | **LOSS + WEIGHT GATE FAIL** |
+
+### Two real bugs this immediately exposed
+
+All six initialise and run multi-node; two are numerically wrong once there
+is more than one PE, which nothing could have caught while NVSHMEM was
+single-node only.
+
+- **gmx**: `CONSERVATION GATE: PASS (exact)` at **1 PE**, `FAIL` at **2 and
+  4 PEs**. Not the transport and not the parameters -- a multi-PE bug in
+  `clio_gmx_nvshmem_bench`.
+- **lbann**: fails at 4 PEs on both the loss gate (0.41861 vs 0.42488) and
+  the weight digest. The default `--lr 0.01` also diverges to NaN at this
+  size, as the memory-pressure notes already warned; `--lr 0.0001` gives the
+  finite-but-wrong numbers above, so the divergence and the multi-PE bug are
+  two separate things.
+
 ## Substrates
 
 All 25 (workload × substrate) binaries build. Measured by

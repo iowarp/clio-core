@@ -101,14 +101,31 @@ int main(int argc, char **argv) {
 #else
   WB_CUDA_CHECK(cudaSetDevice(0));
   {
-    nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
-    nvshmemx_uniqueid_t uid = NVSHMEMX_UNIQUEID_INITIALIZER;
-    nvshmemx_get_uniqueid(&uid);
-    nvshmemx_set_attr_uniqueid_args(0, 1, &uid, &attr);
-    if (nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr) != 0) {
-      std::fprintf(stderr, "nvshmem uniqueid bootstrap failed\n");
-      return 1;
-    }
+    // BOOTSTRAP THROUGH THE LAUNCHER, not through a hardcoded 1-PE
+
+    // unique ID. set_attr_uniqueid_args(0, 1, ...) pinned this path to a
+
+    // SINGLE PE, so a build without MPI could never be distributed --
+
+    // which is the only build that runs on a Cray machine, because
+
+    // NVSHMEM\'s MPI bootstrap plugin is built against OpenMPI and
+
+    // Delta\'s system MPI is cray-mpich.
+
+    //
+
+    // nvshmem_init() honours NVSHMEM_BOOTSTRAP, so the launcher decides:
+
+    //   NVSHMEM_BOOTSTRAP=PMI NVSHMEM_BOOTSTRAP_PMI=PMI2 + srun --mpi=pmi2
+
+    // is what works multi-node here, and is what NVIDIA\'s own perftest
+
+    // binaries use. A bare run with no launcher still gets 1 PE, which
+
+    // is what the old code hardcoded.
+
+    nvshmem_init();
   }
 #endif
   const int mype = nvshmem_my_pe();
