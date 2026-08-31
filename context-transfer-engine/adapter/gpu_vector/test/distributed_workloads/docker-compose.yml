@@ -44,6 +44,10 @@ x-node: &node
     # NOT in the deps image -- without this the container dies at exec with
     # "libnvcomp.so.5: cannot open shared object file" and exit 127.
     - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+    # The SYCL editions link libsycl from the DPC++ prefix, which is not in
+    # the deps image. Harmless when unset -- the default path just is not
+    # used by the CUDA binaries.
+    - ${DPCPP_HOME:-/opt/dpcpp}:/opt/dpcpp:ro
   working_dir: /workspace
   mem_limit: 8g
 
@@ -69,7 +73,7 @@ services:
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/dpcpp/lib:/usr/local/lib
     command: ["sh", "-c", "cd /tmp && /workspace/${BUILD_DIR:-build}/bin/${GVW_BENCH:?set GVW_BENCH} ${GVW_ARGS:-} --nodes $${GVW_NODES:-2} --node 0; rc=$$?; touch /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_$$NODE_ID; w=0; while [ $$(ls /workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/.done_* 2>/dev/null | wc -l) -lt $${GVW_NODES:-2} ] && [ $$w -lt $${GVW_BARRIER:-240} ]; do sleep 1; w=$$((w+1)); done; exit $$rc"]
     entrypoint: []
 
@@ -94,7 +98,7 @@ services:
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/dpcpp/lib:/usr/local/lib
     # Node 2 starts a moment later so node 1 wins the bind race for the
     # cluster's main server; both orders work, but a deterministic one makes
     # a failed run easier to read.
@@ -123,7 +127,7 @@ services:
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/dpcpp/lib:/usr/local/lib
     # Node 2 starts a moment later so node 1 wins the bind race for the
     # cluster's main server; both orders work, but a deterministic one makes
     # a failed run easier to read.
@@ -152,7 +156,7 @@ services:
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_workloads/${GVW_CONF:-gvw_conf.yaml}
-      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/dpcpp/lib:/usr/local/lib
     # Node 2 starts a moment later so node 1 wins the bind race for the
     # cluster's main server; both orders work, but a deterministic one makes
     # a failed run easier to read.

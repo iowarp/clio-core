@@ -323,7 +323,15 @@ CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
     __syncthreads();
     w.UnpinRange(lo, hi - lo);
   }
-  atomicMax(out, acc);
+  // CAS LOOP, not atomicMax: the SYCL compatibility shim provides atomicAdd,
+  // atomicCAS, atomicSub and atomicExch -- not atomicMax -- so the direct
+  // call compiles under CUDA and breaks the SYCL build of this same header.
+  unsigned long long old = *out;
+  while (acc > old) {
+    const unsigned long long prev = atomicCAS(out, old, acc);
+    if (prev == old) break;    // we won
+    old = prev;                // someone raised it; re-test against theirs
+  }
 }
 
 // -------------------- DENSE REFERENCE (same loops, plain memory) ----------
