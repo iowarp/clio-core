@@ -414,3 +414,29 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
     )
     message(STATUS "lammps_md paged bench (SYCL): ON")
 endif()
+
+# ---------------------------------------------------------------------------
+# The MPI baseline, RUN at 2 ranks.
+#
+# It was built and never executed by ctest -- so nothing caught it rotting,
+# and "the MPI edition works" rested on someone having run it by hand. It
+# gates itself (see the bench), so an entry here is worth having.
+#
+# 2 ranks on one host: this is the baseline's PARALLEL path, not a cluster
+# test -- the cross-machine gate for the paged edition lives in
+# test/distributed_workloads/. RUN_SERIAL because the ranks want the GPU.
+# ---------------------------------------------------------------------------
+if(TARGET clio_lammps_md_mpi_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_lammps_md_mpi_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                # NOT $<TARGET_FILE:>: the MPI baselines are custom targets
+                # (nvcc + MPI driven by hand), not add_executable, so the
+                # generator expression errors out at configure time.
+                ${CMAKE_BINARY_DIR}/bin/clio_lammps_md_mpi_bench
+                --lattice 20 --steps 20
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_lammps_md_mpi_2rank PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;mpi;distributed" RUN_SERIAL TRUE)
+endif()

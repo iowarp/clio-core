@@ -312,3 +312,28 @@ if(Kokkos_FOUND)
         message(STATUS "grayscott Kokkos baseline: ON (backends: ${Kokkos_DEVICES})")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# The MPI baseline, RUN at 2 ranks.
+#
+# It was built and never executed by ctest -- so nothing caught it rotting,
+# and "the MPI edition works" rested on someone having run it by hand. It
+# gates itself (see the bench), so an entry here is worth having.
+#
+# 2 ranks on one host: this is the baseline's PARALLEL path, not a cluster
+# test -- the cross-machine gate for the paged edition lives in
+# test/distributed_workloads/. RUN_SERIAL because the ranks want the GPU.
+# ---------------------------------------------------------------------------
+if(TARGET clio_grayscott_mpi_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_grayscott_mpi_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                # NOT $<TARGET_FILE:>: the MPI baselines are custom targets
+                # (nvcc + MPI driven by hand), not add_executable, so the
+                # generator expression errors out at configure time.
+                ${CMAKE_BINARY_DIR}/bin/clio_grayscott_mpi_bench
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_grayscott_mpi_2rank PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;mpi;distributed" RUN_SERIAL TRUE)
+endif()

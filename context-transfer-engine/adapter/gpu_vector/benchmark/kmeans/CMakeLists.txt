@@ -367,3 +367,29 @@ if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.c
         message(STATUS "kmeans BaM baseline: ON")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# The MPI baseline, RUN at 2 ranks.
+#
+# It was built and never executed by ctest -- so nothing caught it rotting,
+# and "the MPI edition works" rested on someone having run it by hand. It
+# gates itself (see the bench), so an entry here is worth having.
+#
+# 2 ranks on one host: this is the baseline's PARALLEL path, not a cluster
+# test -- the cross-machine gate for the paged edition lives in
+# test/distributed_workloads/. RUN_SERIAL because the ranks want the GPU.
+# ---------------------------------------------------------------------------
+if(TARGET clio_kmeans_mpi_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_kmeans_mpi_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                # NOT $<TARGET_FILE:>: the MPI baselines are custom targets
+                # (nvcc + MPI driven by hand), not add_executable, so the
+                # generator expression errors out at configure time.
+                ${CMAKE_BINARY_DIR}/bin/clio_kmeans_mpi_bench
+                --data-mb 64 --iters 3
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_kmeans_mpi_2rank PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;mpi;distributed" RUN_SERIAL TRUE)
+endif()
