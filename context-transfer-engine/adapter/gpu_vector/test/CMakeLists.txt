@@ -760,3 +760,39 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
         LABELS "cte;gpu;gpu_vector;gv_distributed;distributed;docker"
         RUN_SERIAL TRUE)
 endif()
+
+# ---------------------------------------------------------------------------
+# The same gates at 4 nodes / 4 ranks.
+#
+# Not redundant with the 2-node entries: grayscott's halo gets a second
+# interior seam, lbann's bands get small enough to expose the page-ownership
+# constraint (which used to HANG rather than complain), and lammps_md needs a
+# bigger deck to keep 3 z-planes per rank. Every one of those was found by
+# running at 4 and none of them shows up at 2.
+#
+# Separately labelled so a quick pass can stay on the 2-node set:
+#   ctest -L gv_distributed      # 2 nodes
+#   ctest -L gv_dist4            # 4 nodes
+#   ctest -L distributed         # everything
+# ---------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
+    foreach(_wl kmeans weights gmx grayscott lbann)
+        add_test(NAME cte_gv_distributed4_${_wl}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+        )
+        set_tests_properties(cte_gv_distributed4_${_wl} PROPERTIES
+            TIMEOUT 2400
+            LABELS "cte;gpu;gpu_vector;gv_dist4;distributed;docker"
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_NODES=4")
+    endforeach()
+
+    add_test(NAME cte_gv_distributed4_mpi_baselines
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_baselines/run_baselines_distributed.sh all
+    )
+    set_tests_properties(cte_gv_distributed4_mpi_baselines PROPERTIES
+        TIMEOUT 3600
+        LABELS "cte;gpu;gpu_vector;gv_dist4;distributed;docker"
+        RUN_SERIAL TRUE
+        ENVIRONMENT "BUILD_DIR=${_gv_build_name};BL_RANKS=4")
+endif()
