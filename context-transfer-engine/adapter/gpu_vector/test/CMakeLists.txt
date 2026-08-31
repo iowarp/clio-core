@@ -710,6 +710,9 @@ install(TARGETS eternia_cluster_node RUNTIME DESTINATION bin)
 # by a negative control that fails the gate if disabling the halo exchange
 # leaves the answer unchanged.
 #
+# All six paged workloads now pass here (lammps_md has its own harness under
+# distributed_md_bench/).
+#
 # OPT-IN, because they need docker, the nvidia container toolkit and a GPU, and
 # a machine without those should skip rather than fail. Turn them on with
 #   -DCLIO_CORE_ENABLE_DOCKER_TESTS=ON
@@ -723,7 +726,7 @@ option(CLIO_CORE_ENABLE_DOCKER_TESTS
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
     get_filename_component(_gv_build_name "${CMAKE_BINARY_DIR}" NAME)
-    foreach(_wl kmeans weights gmx grayscott)
+    foreach(_wl kmeans weights gmx grayscott lbann)
         add_test(NAME cte_gv_distributed_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )

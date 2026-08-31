@@ -64,7 +64,7 @@ void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
  *  gate: a bit-exact digest cannot survive a cross-node summation order. */
 void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk, const float *ref,
-                 unsigned long long *out, u64 rlo, u64 rhi, View vw,
+                 unsigned long long *out, u64 rlo, u64 rhi, u64 gen, View vw,
                  StackView sv);
 
 

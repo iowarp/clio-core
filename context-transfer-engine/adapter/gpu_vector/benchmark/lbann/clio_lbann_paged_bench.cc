@@ -578,7 +578,7 @@ int main(int argc, char **argv) {
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
-                        d_md, 0, n, vw, sv);
+                        d_md, 0, n, static_cast<u64>(steps) + 2, vw, sv);
     });
     ctp::GpuApi::Synchronize();
     unsigned long long md = 0;
@@ -590,7 +590,14 @@ int main(int argc, char **argv) {
       if (e[0] != '\0') {
         const struct { const char *nm; u64 lo, hi; } regs[] = {
             {"W1", w1_off, w1_off + I * H}, {"b1", b1_off, b1_off + H},
-            {"W2", w2_off, w2_off + H * O}, {"b2", b2_off, b2_off + O}};
+            {"W2", w2_off, w2_off + H * O}, {"b2", b2_off, b2_off + O},
+            // W2 split by ownership. If the drift is in the PEER band the
+            // generational demand is not landing; if it is in this node's
+            // OWN band then Upd2 is subtracting from a stale W2. The two
+            // have different fixes, so the probe has to tell them apart.
+            {"W2-own", w2_off + o0 * H, w2_off + o1 * H},
+            {"W2-peer-lo", w2_off, w2_off + o0 * H},
+            {"W2-peer-hi", w2_off + o1 * H, w2_off + H * O}};
         for (const auto &r : regs) {
           auto *d_r = ctp::GpuApi::Malloc<unsigned long long>(
               sizeof(unsigned long long));
@@ -598,7 +605,8 @@ int main(int argc, char **argv) {
           runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                          gy::YieldStackView sv) {
             lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page,
-                              d_wref, d_r, r.lo, r.hi, vw, sv);
+                              d_wref, d_r, r.lo, r.hi,
+                              static_cast<u64>(steps) + 2, vw, sv);
           });
           ctp::GpuApi::Synchronize();
           unsigned long long rv = 0;

@@ -298,7 +298,7 @@ CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u
 CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
                                      u64 e1, u64 chunk, const float *ref,
                                      unsigned long long *out, u64 rlo,
-                                     u64 rhi) {
+                                     u64 rhi, u64 gen) {
   // Clamp to a REGION so the probe can say which of W1/b1/W2/b2 drifts, not
   // merely that something does. A whole-vector maximum names no suspect.
   if (e0 < rlo) e0 = rlo;
@@ -307,7 +307,11 @@ CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
   unsigned long long acc = 0;
   for (u64 lo = e0; lo < e1; lo += chunk) {
     const u64 hi = (lo + chunk < e1) ? lo + chunk : e1;
-    co_await w.Fetch(0, lo, hi - lo);
+    // DEMAND THE FINAL GENERATION. Generation 0 means any version is
+    // acceptable, so after the pre-digest invalidate this fetch can be
+    // served a PRE-update blob -- the verification would then report a
+    // whole weight update as error while the vector itself is correct.
+    co_await w.Fetch(gen, lo, hi - lo);
     auto h = co_await w.HoldPage(lo, hi - lo);
     for (u64 i = lo + threadIdx.x; i < hi; i += blockDim.x) {
       const float d = h[i] - ref[i];
