@@ -1,0 +1,26 @@
+# Overlay that mounts a Kokkos prefix into distributed_md/'s cluster.
+#
+# The Kokkos baselines are add_executable and link libkokkoscontainers /
+# libkokkoscore, which are not in the deps image -- without them the binary
+# dies at exec with "cannot open shared object file" before any MPI runs.
+#
+# An OVERRIDE rather than an edit to distributed_md/docker-compose.yml: that
+# file is the proven cluster used by three harnesses, and it should not grow a
+# mount that only one of them needs. Compose merges these:
+#
+#   docker compose -f ../distributed_md/docker-compose.yml \
+#                  -f docker-compose.kokkos.yml up -d md-node1 md-node2
+#
+# Unlike the MPI baselines, the Kokkos ones are NOT recompiled inside the
+# container -- building Kokkos there would mean shipping a toolchain and a
+# multi-minute build per node. Running the host binary is safe here only
+# because the container's Open MPI is the same 4.1.6 as the host's; if that
+# ever diverges the mount is the wrong answer and it should compile in-container
+# like the others.
+services:
+  md-node1:
+    volumes:
+      - ${KOKKOS_HOME:-/opt/kokkos}:/opt/kokkos:ro
+  md-node2:
+    volumes:
+      - ${KOKKOS_HOME:-/opt/kokkos}:/opt/kokkos:ro

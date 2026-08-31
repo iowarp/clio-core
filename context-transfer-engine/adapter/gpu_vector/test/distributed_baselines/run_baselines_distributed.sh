@@ -33,6 +33,10 @@ chmod 777 "$MD_SSH_DIR" 2>/dev/null || true
 # caller has no reason to think is relevant.
 export NVSHMEM_HOME="${NVSHMEM_HOME:-$HOME/opt/nvshmem-pkg/nvidia/nvshmem}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export KOKKOS_HOME="${KOKKOS_HOME:-$HOME/opt/kokkos-cuda}"
+# distributed_md/ supplies the cluster; the overlay adds the Kokkos mount.
+COMPOSE=(docker compose -f "$MD_DIR/docker-compose.yml"
+                        -f "$SCRIPT_DIR/docker-compose.kokkos.yml")
 ARCH="${BL_ARCH:-sm_89}"
 BENCH_DIR=context-transfer-engine/adapter/gpu_vector/benchmark
 # PORT 2222, not 22. The md compose starts sshd with -p 2222, so a default
@@ -54,14 +58,14 @@ deck() {
 }
 
 cleanup() {
-  ( cd "$MD_DIR" && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
+  ( cd "$MD_DIR" && "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 ) || true
   [ -n "${MD_SSH_DIR:-}" ] && rm -rf "$MD_SSH_DIR"
 }
 trap cleanup EXIT
 
 echo "== bringing up the 2-container cluster (distributed_md/)"
-( cd "$MD_DIR" && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
-( cd "$MD_DIR" && docker compose up -d md-node1 md-node2 >/dev/null )
+( cd "$MD_DIR" && "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 ) || true
+( cd "$MD_DIR" && "${COMPOSE[@]}" up -d md-node1 md-node2 >/dev/null )
 
 # sshd is up when node1 can actually open a connection to node2 -- a `ready`
 # file only says the process started.
@@ -126,11 +130,55 @@ run_one() {
   echo "   $wl OK (2 ranks, separate containers)"
 }
 
+# The Kokkos baselines run cross-container too, but from the HOST BUILD rather
+# than compiled in-container: building Kokkos inside each node would mean
+# shipping a toolchain and a multi-minute build per node. Safe only because the
+# container's Open MPI is the same 4.1.6 as the host's -- checked below, because
+# an ABI mismatch here would surface as a corrupt result rather than a crash.
+run_kokkos() {
+  local wl="$1"; deck "$wl" || return 2
+  local bin="/workspace/${BUILD_DIR:-build-gv}/bin/clio_${wl}_kokkos_bench"
+  echo
+  echo "== $wl : Kokkos, 2 ranks across md-node1,md-node2"
+  if ! docker exec md-node1 test -x "$bin"; then
+    echo "   .. not built ($bin); skipping"; return 0
+  fi
+  local log="/tmp/blk_${wl}.log"
+  docker exec md-node1 bash -c "
+    mpirun --allow-run-as-root -n 2 --host md-node1:1,md-node2:1 \
+        --mca plm_rsh_agent 'ssh $SSH_OPTS' \
+        --mca btl tcp,self --mca btl_tcp_if_include eth0 \
+        -x LD_LIBRARY_PATH=/opt/kokkos/lib:/opt/kokkos/lib64:/usr/local/cuda/lib64 \
+        $bin $ARGS 2>&1
+  " > "$log" 2>&1
+  local code=$?
+  sed 's/^/   | /' "$log" | tail -6
+  if [ $code -ne 0 ]; then echo "   !! $wl kokkos exited $code"; rc=1; return 1; fi
+  if ! grep -qE 'ALL GATES PASS|GATE: PASS|PASS' "$log"; then
+    echo "   !! $wl kokkos: no passing gate line"; rc=1; return 1
+  fi
+  echo "   $wl kokkos OK (2 ranks, separate containers)"
+}
+
+# An Open MPI mismatch would corrupt results rather than crash, so it is
+# checked rather than assumed.
+HOST_MPI="$(mpirun --version 2>/dev/null | head -1)"
+CONT_MPI="$(docker exec md-node1 mpirun --version 2>/dev/null | head -1)"
+if [ "$HOST_MPI" != "$CONT_MPI" ]; then
+  echo "!! Open MPI differs (host: $HOST_MPI / container: $CONT_MPI)"
+  echo "   the prebuilt Kokkos binaries cannot be trusted across that; skipping them"
+  KOKKOS_OK=0
+else
+  KOKKOS_OK=1
+fi
+
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   for wl in kmeans weights gmx grayscott lbann lammps_md; do run_one "$wl" || true; done
+  [ "$KOKKOS_OK" = 1 ] && for wl in kmeans weights gmx grayscott lbann lammps_md; do run_kokkos "$wl" || true; done
 else
   run_one "$TARGET" || true
+  [ "$KOKKOS_OK" = 1 ] && { run_kokkos "$TARGET" || true; }
 fi
 echo
 echo "== cross-container MPI baselines: $([ $rc -eq 0 ] && echo ALL PASS || echo FAILURES)"

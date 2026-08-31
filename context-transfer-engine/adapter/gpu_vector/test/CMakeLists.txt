@@ -752,8 +752,11 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
     add_test(NAME cte_gv_distributed_mpi_baselines
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_baselines/run_baselines_distributed.sh all
     )
+    # BUILD_DIR: the Kokkos half runs the prebuilt host binaries out of the
+    # mounted workspace, so it has to know which build tree they are in.
     set_tests_properties(cte_gv_distributed_mpi_baselines PROPERTIES
-        TIMEOUT 2400
+        ENVIRONMENT "BUILD_DIR=${_gv_build_name}"
+        TIMEOUT 3000
         LABELS "cte;gpu;gpu_vector;gv_distributed;distributed;docker"
         RUN_SERIAL TRUE)
 endif()
