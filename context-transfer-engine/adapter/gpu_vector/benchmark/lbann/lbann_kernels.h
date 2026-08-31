@@ -160,15 +160,13 @@ CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   u64 b2_off, u64 H, u64 O, u64 B,
                                   const float *a1, const float *d2, float lr,
                                   u64 o0, u64 o1, u64 rows_per_page,
-                                  u64 gen) {
+                                  u64 gen, bool do_bias) {
   for (u64 op = o0; op < o1; op += rows_per_page) {
     const u64 page_lo = w2_off + op * H;
     const u64 oend = (op + rows_per_page < o1) ? op + rows_per_page : o1;
     const u64 count = (oend - op) * H;
     co_await w.Fetch(0, page_lo, count);
     auto hw = co_await w.HoldPage(page_lo, count, /*write=*/true);
-    co_await w.Fetch(0, b2_off + op, oend - op);
-    auto hb = co_await w.HoldPage(b2_off + op, oend - op, /*write=*/true);
     const u64 nout = (oend - op) * H;
     for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
       const u64 o = op + t / H;
@@ -179,17 +177,29 @@ CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
       }
       hw[w2_off + o * H + h] -= lr * g;
     }
-    for (u64 t = threadIdx.x; t < (oend - op); t += blockDim.x) {
-      const u64 o = op + t;
+    __syncthreads();
+    co_await w.BeginFlush(gen, page_lo, count);
+    w.UnpinRange(page_lo, count);
+  }
+  // THE BIAS UPDATE IS REPLICATED, NOT PARTITIONED. b2 is O floats and
+  // fits inside a SINGLE page, so a per-node split has both nodes writing
+  // the same page -- and writeback is page-granular, so each clobbers the
+  // other's half with no error anywhere. Every node instead computes the
+  // WHOLE bias from the gathered d2 and writes identical bytes, which
+  // makes the shared page harmless. Exactly one block does it: `-=` is not
+  // idempotent, so every block running it would apply the update
+  // gridDim times.
+  if (do_bias) {
+    co_await w.Fetch(0, b2_off, O);
+    auto hb = co_await w.HoldPage(b2_off, O, /*write=*/true);
+    for (u64 o = threadIdx.x; o < O; o += blockDim.x) {
       float g = 0.0f;
       for (u64 b = 0; b < B; ++b) g += d2[o * B + b];
       hb[b2_off + o] -= lr * g;
     }
     __syncthreads();
-    co_await w.BeginFlush(gen, page_lo, count);
-    co_await w.BeginFlush(gen, b2_off + op, oend - op);
-    w.UnpinRange(page_lo, count);
-    w.UnpinRange(b2_off + op, oend - op);
+    co_await w.BeginFlush(gen, b2_off, O);
+    w.UnpinRange(b2_off, O);
   }
   co_await w.EndFlush();
 }
@@ -198,15 +208,14 @@ CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
 CTP_GPU_FUN inline gy::YCoroMain Upd1Coro(gv::DeviceVector<float> w, u64 w1_off,
                                   u64 b1_off, u64 I, u64 H, u64 B,
                                   const float *x, const float *d1, float lr,
-                                  u64 h0, u64 h1, u64 rows_per_page) {
+                                  u64 h0, u64 h1, u64 rows_per_page,
+                                  bool do_bias) {
   for (u64 hp = h0; hp < h1; hp += rows_per_page) {
     const u64 page_lo = w1_off + hp * I;
     const u64 hend = (hp + rows_per_page < h1) ? hp + rows_per_page : h1;
     const u64 count = (hend - hp) * I;
     co_await w.Fetch(0, page_lo, count);
     auto hw = co_await w.HoldPage(page_lo, count, /*write=*/true);
-    co_await w.Fetch(0, b1_off + hp, hend - hp);
-    auto hb = co_await w.HoldPage(b1_off + hp, hend - hp, /*write=*/true);
     const u64 nout = (hend - hp) * I;
     for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
       const u64 h = hp + t / I;
@@ -217,17 +226,24 @@ CTP_GPU_FUN inline gy::YCoroMain Upd1Coro(gv::DeviceVector<float> w, u64 w1_off,
       }
       hw[w1_off + h * I + i] -= lr * g;
     }
-    for (u64 t = threadIdx.x; t < (hend - hp); t += blockDim.x) {
-      const u64 h = hp + t;
+    __syncthreads();
+    co_await w.BeginFlush(0, page_lo, count);
+    w.UnpinRange(page_lo, count);
+  }
+  // REPLICATED, like b2 -- b1 is H floats in a single page, so a per-node
+  // split has both nodes writing it and page-granular writeback makes each
+  // clobber the other's half. Needs the gathered d1.
+  if (do_bias) {
+    co_await w.Fetch(0, b1_off, H);
+    auto hb = co_await w.HoldPage(b1_off, H, /*write=*/true);
+    for (u64 h = threadIdx.x; h < H; h += blockDim.x) {
       float g = 0.0f;
       for (u64 b = 0; b < B; ++b) g += d1[h * B + b];
       hb[b1_off + h] -= lr * g;
     }
     __syncthreads();
-    co_await w.BeginFlush(0, page_lo, count);
-    co_await w.BeginFlush(0, b1_off + hp, hend - hp);
-    w.UnpinRange(page_lo, count);
-    w.UnpinRange(b1_off + hp, hend - hp);
+    co_await w.BeginFlush(0, b1_off, H);
+    w.UnpinRange(b1_off, H);
   }
   co_await w.EndFlush();
 }

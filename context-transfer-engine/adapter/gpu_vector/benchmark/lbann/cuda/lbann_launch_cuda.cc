@@ -22,6 +22,10 @@ namespace {
     w.Init(yv.Block());                                                       \
     gy::YieldTlsPublish(ys, yv.Y(), yv.Block());                              \
     __syncthreads();                                                          \
+    /* One block per node does the replicated bias update: -= is not */       \
+    /* idempotent, so every block running it would apply it gridDim times. */ \
+    const bool bias0 = (yv.Block() == 0);                                     \
+    (void)bias0;                                                              \
     CLIO_YCORO_RUN(CORO_CALL);                                                \
   }
 
@@ -42,12 +46,12 @@ LB_KERNEL(Bwd1,
 
 LB_KERNEL(Upd2,
           Upd2Coro(w, w2_off, b2_off, H, O, B, a1, d2, lr, rbase + static_cast<u64>(yv.Block()) * oper,
-                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * oper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * oper) : rend, rpp, gen),
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * oper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * oper) : rend, rpp, gen, bias0),
           u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen)
 
 LB_KERNEL(Upd1,
           Upd1Coro(w, w1_off, b1_off, I, H, B, x, d1, lr, rbase + static_cast<u64>(yv.Block()) * hper,
-                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp),
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, bias0),
           u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend)
 
 LB_KERNEL(Seed,

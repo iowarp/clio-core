@@ -52,6 +52,8 @@ void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return Fwd1Coro(dev, w1_off, b1_off, I, H, B, x, a1, rbase + blk * hper,
                           ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp);
                   });
@@ -64,6 +66,8 @@ void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return Fwd2Coro(dev, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, rbase + blk * oper,
                           ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp);
                   });
@@ -76,6 +80,8 @@ void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return Bwd1Coro(dev, w2_off, H, O, B, a1, d2, d1, rbase + blk * hper,
                           ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, o0, o1, gen);
                   });
@@ -88,8 +94,10 @@ void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return Upd2Coro(dev, w2_off, b2_off, H, O, B, a1, d2, lr, rbase + blk * oper,
-                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp, gen);
+                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp, gen, bias0);
                   });
 }
 
@@ -100,8 +108,10 @@ void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return Upd1Coro(dev, w1_off, b1_off, I, H, B, x, d1, lr, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp);
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, bias0);
                   });
 }
 
@@ -112,6 +122,8 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return SeedCoro(dev, n, blk * eper,
                           ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk);
                   });
@@ -124,6 +136,8 @@ void LaunchMaxDiff(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return MaxDiffCoro(dev, blk * eper,
                           ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk, ref, out);
                   });
@@ -136,6 +150,8 @@ void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
+                    const bool bias0 = (blk == 0);
+                    (void)bias0;
                     return DigestCoro(dev, blk * eper,
                           ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk, out);
                   });

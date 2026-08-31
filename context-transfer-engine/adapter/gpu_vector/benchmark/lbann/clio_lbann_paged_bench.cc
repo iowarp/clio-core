@@ -395,6 +395,9 @@ int main(int argc, char **argv) {
   // Staging for the gathers: the arrays live on the device.
   std::vector<float> h_a1(static_cast<size_t>(H) * B);
   std::vector<float> h_d2(static_cast<size_t>(O) * B);
+  // d1 is only needed whole for the REPLICATED b1 update; the weight
+  // update still uses this node's own rows.
+  std::vector<float> h_d1(static_cast<size_t>(H) * B);
   const auto gather = [&](float *dev, std::vector<float> &host,
                           const std::vector<dist_u64> &los,
                           const std::vector<dist_u64> &his,
@@ -452,6 +455,13 @@ int main(int argc, char **argv) {
                                                   o0, o1,
                                                   static_cast<u64>(s) + 1, vw, sv);
     });
+    // b1 is computed from the WHOLE d1 on every node, so gather it before
+    // the updates run.
+    ctp::GpuApi::Synchronize();
+    if (!gather(d_d1, h_d1, a1_lo, a1_hi, "lbd1")) {
+      std::fprintf(stderr, "LBANN ERROR: d1 gather failed\n");
+      return 1;
+    }
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd2(g, b, gpu, dw, w2_off, b2_off, H,
