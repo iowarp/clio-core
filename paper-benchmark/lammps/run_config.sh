@@ -237,7 +237,12 @@ bench_compose "$STORE"
 
 NATOMS=$(( 4 * BOX * BOX * BOX ))
 FRAMES=$(( STEPS / GAP + 1 ))
-PAYLOAD=$(( NATOMS * 3 * 8 * 3 * FRAMES ))
+# 4 bytes per element under --f32, not 8: the gather kernel narrows on the
+# device (lammps_device_view.cc, GatherIdWindowT<float>), so the payload the
+# compressor sees is float32. Sizing it as double over-reported the 30 GiB
+# cell as 61,523 MiB and wrote the same 2x error into meta.json.
+ELEM_BYTES=8; [ "$F32" = 1 ] && ELEM_BYTES=4
+PAYLOAD=$(( NATOMS * 3 * ELEM_BYTES * 3 * FRAMES ))
 echo "== $NAME: $NATOMS atoms, $STEPS steps, $FRAMES frames, $(awk -v p=$PAYLOAD "BEGIN{printf \"%.1f\", p/1048576}") MiB payload, ${DEVICE^^}, chunk $CHUNK, port $PORT"
 
 ORDER=id

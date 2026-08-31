@@ -53,7 +53,18 @@ mkdir -p "$RESULTS"
 say(){ echo; echo "[$(date +%H:%M:%S)] $*"; }
 
 say "node=$(hostname) job=${SLURM_JOB_ID:-none}"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/       gpu: /'
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader | sed 's/^/       gpu: /'
+# The 30 GiB cell died once at frame 11 with CUDA OOM preceded by scheduler
+# stalls ("ALL compute workers stalled"), while the same binary, grid, chunk
+# and both bounds ran 16 frames clean. The failure needs a backlog to build, so
+# sample the card while it runs: a climbing memory.used against a flat blob
+# count is the backlog, and distinguishes that from a plain leak.
+( while :; do
+    printf "       [gpumon %s] %s MiB used\n" "$(date +%H:%M:%S)" \
+      "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)"
+    sleep 60
+  done ) & GPUMON=$!
+trap 'kill $GPUMON 2>/dev/null' EXIT
 df -BG --output=avail "$ROOT" | tail -1 | sed 's/^/       free: /;s/$/ GiB/'
 [ -x "$PB/vpic/weibel_clio.Linux" ] || { say "no deck binary"; exit 1; }
 
