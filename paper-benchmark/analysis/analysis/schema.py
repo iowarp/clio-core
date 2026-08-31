@@ -175,6 +175,14 @@ COLUMNS: List[Column] = [
            "1 - ssim computed WITHOUT the subtraction, so the information "
            "that saturates out of `meas_ssim` survives. Prefer this over "
            "1 - meas_ssim, which loses it to cancellation."),
+
+    # ---- joined from selection.csv.quality when it is beside the log -----
+    Column("data_range", "property", False, "float64",
+           "max - min of the ORIGINAL chunk, from the quality sidecar. Not "
+           "written to explore.csv by the runtime; the loader joins it by "
+           "blob. It is the one property that, with the error bound, gives "
+           "the post-quantization level count L = range / (2 * 0.95 * eb) "
+           "in closed form -- see quantization_mechanism.py."),
 ]
 
 BY_NAME: Dict[str, Column] = {c.name: c for c in COLUMNS}
@@ -182,7 +190,8 @@ REQUIRED = [c.name for c in COLUMNS if c.required]
 OPTIONAL = [c.name for c in COLUMNS if not c.required]
 
 #: Intrinsic per-chunk properties. Constant across a chunk's candidate rows.
-CHUNK_PROPERTY_COLS = ["chunk_bytes", "entropy", "mad", "second_deriv"]
+CHUNK_PROPERTY_COLS = ["chunk_bytes", "entropy", "mad", "second_deriv",
+                       "data_range"]
 #: The three features whose sufficiency is the research question.
 FEATURES = ["entropy", "mad", "second_deriv"]
 #: What identifies a compression configuration.

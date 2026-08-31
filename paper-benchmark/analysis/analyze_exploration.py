@@ -48,6 +48,8 @@ LAYOUT: Dict[str, str] = {
     "correlations_per_config": "summary/feature_correlations.csv",
     "correlations_within_field": "summary/feature_correlations_within_field.csv",
     "correlations_chunk_level": "summary/feature_correlations_chunk_level.csv",
+    "property_correlations": "summary/property_correlations.csv",
+    "property_outcome_frame": "processed/property_outcome_frame.csv",
     "feature_ablation": "summary/feature_ablation.csv",
     "feature_ablation_marginal": "summary/feature_ablation_marginal.csv",
     "feature_importance": "summary/feature_importance.csv",
@@ -63,6 +65,13 @@ LAYOUT: Dict[str, str] = {
     "confounder_power": "confounds/confounder_power.csv",
     # mechanism/ -- WHY, not how much; see analysis/mechanism.py
     "entropy_bound": "mechanism/entropy_bound.csv",
+    "quantization_levels_per_chunk":
+        "mechanism/quantization_levels_per_chunk.csv",
+    "quantization_regimes": "mechanism/quantization_regimes.csv",
+    "quantization_levels_by_field":
+        "mechanism/quantization_levels_by_field.csv",
+    "quantization_levels_drive_outcomes":
+        "mechanism/quantization_levels_drive_outcomes.csv",
     "codec_order_sensitivity": "mechanism/codec_order_sensitivity.csv",
     "shuffle_decomposition": "mechanism/shuffle_decomposition.csv",
     "locality_probe": "mechanism/locality_probe.csv",

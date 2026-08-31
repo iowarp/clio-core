@@ -73,6 +73,31 @@ def _finish(ax) -> None:
         ax.spines[side].set_linewidth(0.8)
 
 
+#: A feature axis goes log when the feature's positive values span more than
+#: this many decades. Motivated by a real figure: VPIC's second_deriv runs
+#: 1.4e-08 .. 0.42, and on a linear axis 93.3% of 3840 chunks pile into the
+#: first tenth while a single field (rhof, 240 chunks at ~0.42) sits alone at
+#: the right edge -- the plot reads as two or three distinct x values when
+#: there are 3601. mad has the same shape. 2 decades is chosen to leave
+#: genuinely narrow features (entropy, always ~7.3 bits) on a linear axis,
+#: where log would just flatten them.
+LOG_X_DECADES = 2.0
+
+
+def _wants_log_x(v: "pd.Series") -> bool:
+    """True when a log x-axis is the readable choice for these values.
+
+    Requires strictly positive values -- a log axis silently DROPS zero and
+    negative points, so a feature that has any would lose data rather than
+    become legible, and stays linear.
+    """
+    x = pd.to_numeric(v, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if x.empty or (x <= 0).any():
+        return False
+    lo, hi = float(x.min()), float(x.max())
+    return lo > 0 and hi / lo >= 10.0 ** LOG_X_DECADES
+
+
 class Figures:
     """Collects what was drawn and what was skipped, and why."""
 
@@ -123,11 +148,169 @@ class Figures:
                        color=SERIES[0], edgecolor=SURFACE, linewidth=0.8)
         if logy:
             ax.set_yscale("log")
-        ax.set_xlabel(_axis_label(feature))
+        # Log x when the feature spans decades, for the reason at
+        # LOG_X_DECADES: a linear axis on a heavy-tailed feature collapses
+        # thousands of distinct values onto the left edge and reads as though
+        # the chunks share two or three values.
+        logx = _wants_log_x(d[feature])
+        if logx:
+            ax.set_xscale("log")
+        ax.set_xlabel(_axis_label(feature) + ("  (log scale)" if logx else ""))
         ax.set_ylabel(ylabel)
         ax.set_title(f"{_axis_label(feature)} vs {ylabel}\n"
                      f"n = {len(d)} chunks")
         _finish(ax)
+        self._save(fig, name)
+
+    def levels_vs_outcome(self, pc: pd.DataFrame, target: str, name: str,
+                          ylabel: str, logy: bool,
+                          xcol: str = "levels") -> None:
+        """Outcome against the post-quantization level count L.
+
+        L is closed-form in (data_range, eb) and codec-free, so a tight
+        monotone band here is the quantization mechanism made visible: one
+        number, derived before any codec runs, sets the outcome. Regime
+        boundaries are drawn so the reader can see where the field stops
+        being representable. Chunks whose bound was relaxed are hollow --
+        their L is an upper bound and they must not be read as on-curve.
+        """
+        if pc.empty or target not in pc.columns or xcol not in pc.columns:
+            return self._skip(name, "no per-chunk quantization table")
+        d = pc[[xcol, target, "bound_relaxed"]].replace(
+            [np.inf, -np.inf], np.nan).dropna(subset=[xcol, target])
+        d = d.rename(columns={xcol: "levels"})
+        if logy:
+            d = d[d[target] > 0]
+        if len(d) < MIN_POINTS:
+            return self._skip(name, f"only {len(d)} chunks")
+        fig, ax = plt.subplots(figsize=(6.0, 3.9))
+        ok, rl = d[~d["bound_relaxed"]], d[d["bound_relaxed"]]
+        ax.scatter(ok["levels"], ok[target], s=22, alpha=0.75,
+                   color=SERIES[0], edgecolor=SURFACE, linewidth=0.7,
+                   label="bound honoured")
+        if not rl.empty:
+            ax.scatter(rl["levels"], rl[target], s=26, alpha=0.9,
+                       facecolor="none", edgecolor=SERIES[1], linewidth=1.0,
+                       label="bound RELAXED (L is an upper bound)")
+        # Regime edges are defined on L (the range's rungs); on the bulk
+        # axis they would mislead, so they are drawn only there.
+        if xcol == "levels":
+            from .quantization_mechanism import REGIMES
+            for lo, _hi, label, _m in REGIMES[1:]:
+                ax.axvline(lo, color=INK_2, lw=0.8, ls=":")
+                ax.text(lo, 1.0, f" {label} →",
+                        transform=ax.get_xaxis_transform(),
+                        fontsize=7, color=INK_2, va="top")
+        ax.set_xscale("log")
+        if logy:
+            ax.set_yscale("log")
+        ax.set_xlabel(_axis_label(xcol) + "  (log scale)")
+        ax.set_ylabel(ylabel)
+        what = ("how many levels survive quantization" if xcol == "levels"
+                else "how many grid steps the bulk of the data spans")
+        ax.set_title(f"{ylabel} is set by {what}\nn = {len(d)} chunks; "
+                     f"closed-form in the data and eb, no codec in it")
+        if not rl.empty or True:
+            ax.legend(loc="best", fontsize=7)
+        _finish(ax)
+        self._save(fig, name)
+
+    def regime_bars(self, reg: pd.DataFrame, name: str) -> None:
+        """Share of chunks, median ratio and median SSIM per L regime, side
+        by side, so the trade the bound is making is one picture."""
+        if reg.empty:
+            return self._skip(name, "no regime table")
+        cols = ["pct_of_chunks", "median_best_ratio"] + \
+               [c for c in ("median_meas_ssim",) if c in reg.columns]
+        labels = {"pct_of_chunks": "% of chunks",
+                  "median_best_ratio": "median best ratio (log)",
+                  "median_meas_ssim": "median SSIM"}
+        fig, axes = plt.subplots(1, len(cols), figsize=(3.2 * len(cols), 3.4))
+        axes = np.atleast_1d(axes)
+        x = np.arange(len(reg))
+        for ax, c in zip(axes, cols):
+            v = reg[c].to_numpy(dtype=float)
+            ax.bar(x, v, color=SERIES[0], edgecolor=SURFACE)
+            if c == "median_best_ratio":
+                ax.set_yscale("log")
+            if c == "median_meas_ssim":
+                ax.set_ylim(0, 1.02)
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"{r}\n(L {lo:g}–{hi:g})" for r, lo, hi in
+                                zip(reg["regime"], reg["levels_from"],
+                                    reg["levels_to"])], fontsize=7)
+            ax.set_title(labels[c], fontsize=9)
+            for xi, vi in zip(x, v):
+                if np.isfinite(vi):
+                    ax.text(xi, vi, f"{vi:.3g}", ha="center", va="bottom",
+                            fontsize=7, color=INK_2)
+            _finish(ax)
+        fig.suptitle("Regimes by levels after quantization: what each one "
+                     "costs and buys", fontsize=10)
+        fig.tight_layout()
+        self._save(fig, name)
+
+    def property_correlation_matrix(self, mat: pd.DataFrame, name: str,
+                                    title: str = "") -> None:
+        """The whole story in one square: every data property against every
+        outcome, Spearman, with the property/outcome boundary drawn.
+
+        The upper-left block is feature collinearity (what the features know
+        about each other), the off-diagonal block is what a reader actually
+        wants -- which property moves which metric, and in which direction --
+        and the lower-right block is how the outcomes move together. Diverging
+        colour around a neutral midpoint: sign is the message, so the eye must
+        read zero as "nothing". Every cell prints its rho; a cell with too
+        little support prints nothing rather than a colour.
+        """
+        if mat.empty:
+            return self._skip(name, "no property/outcome matrix")
+        order = [c for c in
+                 ["entropy", "mad", "second_deriv", "data_range", "timestep",
+                  "best_lossless_ratio", "best_quantized_ratio",
+                  "fastest_ct_ms", "fastest_dt_ms", "quantized_ssim"]
+                 if c in set(mat["a"]) | set(mat["b"])]
+        labels = {**dict(zip(mat["a"], mat["a_label"])),
+                  **dict(zip(mat["b"], mat["b_label"]))}
+        k = len(order)
+        M = np.full((k, k), np.nan)
+        for _, r in mat.iterrows():
+            i, j = order.index(r["a"]), order.index(r["b"])
+            M[i, j] = M[j, i] = r["spearman_rho"]
+        n_props = sum(1 for c in order if c in
+                      ("entropy", "mad", "second_deriv", "data_range",
+                       "timestep"))
+        fig, ax = plt.subplots(figsize=(0.62 * k + 2.2, 0.62 * k + 1.4))
+        ax.imshow(M, cmap=DIV, vmin=-1, vmax=1, aspect="equal")
+        for i in range(k):
+            for j in range(k):
+                v = M[i, j]
+                if np.isfinite(v):
+                    ax.text(j, i, f"{v:+.2f}", ha="center", va="center",
+                            fontsize=7.5,
+                            color=SURFACE if abs(v) > 0.6 else INK)
+        # The boundary between "what went in" and "what came out".
+        ax.axhline(n_props - 0.5, color=INK_2, lw=1.1)
+        ax.axvline(n_props - 0.5, color=INK_2, lw=1.1)
+        ax.set_xticks(range(k)); ax.set_yticks(range(k))
+        ax.set_xticklabels([labels.get(c, c) for c in order], rotation=40,
+                           ha="right", fontsize=8)
+        ax.set_yticklabels([labels.get(c, c) for c in order], fontsize=8)
+        ax.grid(False)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.tick_params(length=0)
+        ax.text(-0.5, -0.9, "properties", color=INK_2, fontsize=8, va="bottom")
+        ax.text(n_props - 0.5, -0.9, "outcomes", color=INK_2, fontsize=8,
+                va="bottom")
+        n = int(mat["n"].max()) if "n" in mat.columns else 0
+        ax.set_title((title or "data properties vs outcomes") +
+                     f"\nSpearman rho, {n} chunks; blue = together, "
+                     f"red = opposite", pad=22)
+        cb = fig.colorbar(plt.cm.ScalarMappable(cmap=DIV,
+                          norm=plt.Normalize(-1, 1)), ax=ax, shrink=0.72)
+        cb.set_label("Spearman rho", color=INK_2)
+        cb.outline.set_visible(False)
         self._save(fig, name)
 
     def facet_by_codec(self, rows: pd.DataFrame, feature: str, target: str,
@@ -297,7 +480,8 @@ class Figures:
                        color=c, edgecolor=SURFACE, linewidth=0.5, label=lab)
         ax.axhline(0.0, color=INK_2, linewidth=1.2, zorder=1)
         ax.set_xlabel(_axis_label(feature))
-        ax.set_ylabel(f"delta {target}  (treatment - control)")
+        ax.set_ylabel(f"change in {target}  (setting on - setting off,\n"
+                  f"same chunk)")
         helps = float(100.0 * (v > 0).mean())
         ax.set_title(f"{label}: change in {target} vs {_axis_label(feature)}\n"
                      f"{helps:.0f}% of {len(d)} controlled pairs improve")
@@ -797,6 +981,10 @@ _LABELS = {
     "ratio": "compression ratio",
     "ct_ms": "compression time (ms)",
     "dt_ms_measured": "decompression time (ms)",
+    "levels": "levels after quantization  L = range / (2 * 0.95 * eb)",
+    "bulk_levels": "bulk levels  L_bulk = MAD / (2 * 0.95 * eb)",
+    "best_quantized_ratio": "best quantized compression ratio",
+    "meas_ssim": "measured SSIM",
 }
 
 

@@ -20,7 +20,8 @@ import pandas as pd
 
 from . import (anisotropy, codec_analysis, confounds, cost_analysis,
                counterexamples, mechanism, modeling, paired_analysis,
-               prediction_analysis, statistics, temporal_analysis)
+               prediction_analysis, quantization_mechanism, statistics,
+               temporal_analysis)
 from .loader import Dataset, load_evolution
 from .plotting import Figures
 
@@ -154,6 +155,25 @@ def run(ds: Dataset, outdir: str, seed: int = 0,
     if not mech.get("available"):
         a.na("mechanism", str(mech.get("reason", "no entropy column")))
 
+    # ---- 2e. WHY, for the QUANTIZED rows -------------------------------
+    # 2d stops at the lossless rows because the logged stats describe the
+    # original buffer. This stage explains the other half from the
+    # quantizer's own arithmetic: the level count L = range / (2*0.95*eb) is
+    # closed-form and codec-free, and it sets ratio and quality together.
+    # See quantization_mechanism.py.
+    qpc = a.put("quantization_levels_per_chunk",
+                quantization_mechanism.per_chunk(rows, cw))
+    qreg = a.put("quantization_regimes",
+                 quantization_mechanism.regime_table(qpc))
+    qfld = a.put("quantization_levels_by_field",
+                 quantization_mechanism.by_field(qpc))
+    qdrv = a.put("quantization_levels_drive_outcomes",
+                 quantization_mechanism.levels_drive_outcomes(qpc, rows))
+    qm = quantization_mechanism.summarize(qpc, qreg, qdrv, qfld)
+    a.facts["quantization_mechanism"] = qm
+    if not qm.get("available"):
+        a.na("quantization_mechanism", str(qm.get("reason", "no rows")))
+
     # ---- 3. correlations --------------------------------------------------
     if not feats:
         a.na("correlations", "the log carries no usable data-property "
@@ -170,6 +190,13 @@ def run(ds: Dataset, outdir: str, seed: int = 0,
               statistics.correlation_table(
                   cw, feats, [CHUNK_TARGET, "fastest_ct_value"],
                   label="chunk_level"))
+        # Every property against every outcome in one matrix, with lossless
+        # and quantized ratio kept apart so the bound cannot pose as a data
+        # property. This is the figure a reader looks at first.
+        pof = statistics.property_outcome_frame(cw, rows)
+        a.put("property_outcome_frame", pof)
+        a.put("property_correlations",
+              statistics.property_outcome_matrix(pof))
         # Binned trends, at chunk level, for the saturation question.
         trends, mono = [], []
         for f in feats:
@@ -401,6 +428,24 @@ def _draw(a: Analysis, figdir: str) -> Figures:
                         "excess_over_entropy_bound.png")
     f.timing_mediation(a.tables.get("timing_mediation", pd.DataFrame()),
                        "timing_follows_output_size.png")
+    f.property_correlation_matrix(
+        a.tables.get("property_correlations", pd.DataFrame()),
+        "property_correlations.png",
+        f"{ds.name}: data properties vs outcomes")
+    qpc = a.tables.get("quantization_levels_per_chunk", pd.DataFrame())
+    f.levels_vs_outcome(qpc, "best_quantized_ratio",
+                        "levels_vs_quantized_ratio.png",
+                        "best quantized compression ratio", logy=True)
+    f.levels_vs_outcome(qpc, "meas_ssim", "levels_vs_ssim.png",
+                        "measured SSIM", logy=False)
+    f.levels_vs_outcome(qpc, "best_quantized_ratio",
+                        "bulk_levels_vs_quantized_ratio.png",
+                        "best quantized compression ratio", logy=True,
+                        xcol="bulk_levels")
+    f.levels_vs_outcome(qpc, "meas_ssim", "bulk_levels_vs_ssim.png",
+                        "measured SSIM", logy=False, xcol="bulk_levels")
+    f.regime_bars(a.tables.get("quantization_regimes", pd.DataFrame()),
+                  "quantization_regimes.png")
     f.matched_pair_spread(a.tables.get("matched_pairs", pd.DataFrame()),
                           "matched_pair_spread.png")
     f.component_ratio_over_time(cw,
@@ -943,6 +988,77 @@ def _answer(a: Analysis) -> Dict[str, dict]:
         + _anisotropy_caveats(an))
     ans("Q15", "see the Missing Features section of the report",
         {"proposals": _propose_features(a)}, "moderate")
+
+    # ---- Q16 / Q17: the quantized half, explained -------------------------
+    qm = a.facts.get("quantization_mechanism", {})
+    if not qm.get("available"):
+        for q in ("Q16", "Q17"):
+            ans(q, "unavailable", {}, "unavailable",
+                unavailable=a.unavailable.get("quantization_mechanism",
+                                              qm.get("reason", "")))
+    else:
+        n = int(qm.get("n_chunks", 0))
+        rr = qm.get("rho_levels_vs_ratio")
+        rs = qm.get("rho_levels_vs_ssim")
+        relaxed = float(qm.get("pct_bound_relaxed", 0.0))
+        caveats = [
+            "L assumes the effective bound is 0.95*eb, which holds whenever "
+            "float32 can represent the bound at the field's magnitude. Where "
+            "it cannot, the quantizer relaxes it; those chunks are flagged "
+            "bound_relaxed and excluded from the correlations.",
+            f"data_range came from the quality sidecar for "
+            f"{float(qm.get('pct_range_from_sidecar', 0)):.0f}% of chunks and "
+            f"was recovered from psnr/rmse for the rest."]
+        if relaxed > 0:
+            caveats.append(
+                f"{relaxed:.0f}% of chunks had their bound relaxed, so the "
+                f"requested eb was not the one applied and their stored error "
+                f"exceeds it. For a bound that holds, it must clear "
+                f"max|v|*2.4e-7 / 0.95 at the field's magnitude.")
+        br = qm.get("rho_bulk_levels_vs_ratio")
+        bulk_note = (f" Counting only the rungs the bulk of the data occupies "
+                     f"(L_bulk = mad / (2*0.95*eb), the MAD in grid steps) "
+                     f"tightens the ratio correlation to {br:+.2f}, because a "
+                     f"rare extreme widens the range without filling the grid."
+                     if br is not None and np.isfinite(br) else "")
+        ans("Q16",
+            f"yes, in closed form. L = data_range / (2*0.95*eb) has no codec "
+            f"in it and tracks the best quantized ratio at Spearman rho = "
+            f"{rr:+.2f}" + (f" and SSIM at rho = {rs:+.2f}" if rs is not None
+                            and np.isfinite(rs) else "") +
+            f" over {n} chunks." + bulk_note +
+            f" The ratio splits into an exact width gain "
+            f"(4/width_bytes, set by L), an alphabet floor of 32/log2(L) that "
+            f"an entropy coder reaches before reading any order, and an "
+            f"excess above that from level skew and order.",
+            {k: qm.get(k) for k in ("n_chunks", "median_levels",
+                                    "rho_levels_vs_ratio", "rho_levels_vs_ssim",
+                                    "rho_bulk_levels_vs_ratio",
+                                    "rho_bulk_levels_vs_ssim",
+                                    "rho_levels_vs_psnr", "pct_bound_relaxed",
+                                    "regimes")},
+            "high" if (rr is not None and np.isfinite(rr) and abs(rr) >= 0.6
+                       and n >= 100) else "moderate",
+            caveats)
+        few = float(qm.get("pct_under_few_levels", 0.0))
+        destroyed = qm.get("fields_destroyed", [])
+        ans("Q17",
+            f"where L falls below ~{quantization_mechanism.FEW_LEVELS:.0f}. "
+            f"{few:.0f}% of quantized chunks are left with fewer than "
+            f"{quantization_mechanism.FEW_LEVELS:.0f} distinct values at "
+            f"this bound" +
+            (f", and that is the majority in {len(destroyed)} of "
+             f"{qm.get('n_fields', '?')} fields ({', '.join(destroyed[:8])})"
+             if destroyed else "") +
+            f". Below that the field's structure no longer fits between the "
+            f"grid rungs and SSIM collapses regardless of codec; above a few "
+            f"hundred the loss is invisible at SSIM's resolution. The same L "
+            f"that raised the ratio destroyed the quality -- an absolute "
+            f"bound is a per-field decision, not a per-run one.",
+            {"pct_under_few_levels": few, "fields_destroyed": destroyed,
+             "pct_constant": qm.get("pct_constant")},
+            "high" if n >= 100 else "moderate",
+            caveats[:1])
     return out
 
 

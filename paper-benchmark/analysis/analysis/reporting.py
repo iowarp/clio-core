@@ -42,6 +42,8 @@ Q_TEXT = {
     "Q13": "When does the cost model select the wrong configuration?",
     "Q14": "Are entropy, MAD and second derivative sufficient?",
     "Q15": "What additional inexpensive statistics should we collect?",
+    "Q16": "Why does a quantized chunk reach the ratio it reaches?",
+    "Q17": "Why does quality collapse where it collapses?",
 }
 
 
@@ -79,6 +81,49 @@ def section_ref(title: str) -> str:
     return f"Section {SECTION_NO[title]}"
 
 
+#: Display names for the paired-analysis columns. The internal names stay as
+#: they are -- pipeline.py, crossworkload.py and counterexamples.py select on
+#: them -- and only the RENDERED header changes, so a reader never has to know
+#: that "treatment/control" is A/B vocabulary or that "delta" means a
+#: subtraction. Applied by _md_table, so every table in every report and the
+#: cross-workload section pick it up from one place.
+#:
+#: A paired row holds (chunk, codec, preset, quantize, error bound) fixed and
+#: varies ONE knob, so every quantity below is "same chunk, setting on, minus
+#: same chunk, setting off".
+FRIENDLY_COLS = {
+    "treatment": "setting changed",
+    "control_value": "value when off",
+    "treat_value": "value when on",
+    "n_pairs": "pairs compared",
+    "n_chunks": "chunks",
+}
+#: Per-outcome suffixes, expanded for each measured column (ratio, ct_ms, ...).
+FRIENDLY_SUFFIX = {
+    "_median_delta": " change (median)",
+    "_mean_delta": " change (mean)",
+    "_median_rel": " change % (median)",
+    "_pct_helps": " % of pairs improved",
+    "_pct_chunks_helped": " % of chunks improved",
+    "_p10_delta": " change (10th pct)",
+    "_p90_delta": " change (90th pct)",
+    "_sign_test_k_chunks": " chunks improved (k)",
+    "_sign_test_n_chunks": " chunks tested (n)",
+    "_sign_test_p": " sign-test p",
+    "_n": " n",
+}
+
+
+def friendly(col: str) -> str:
+    """Header text for one column. Unknown columns pass through unchanged."""
+    if col in FRIENDLY_COLS:
+        return FRIENDLY_COLS[col]
+    for suf, nice in FRIENDLY_SUFFIX.items():
+        if col.endswith(suf):
+            return col[:-len(suf)] + nice
+    return col
+
+
 def _md_table(df: pd.DataFrame, cols: Optional[Sequence[str]] = None,
               n: int = 20, floatfmt: str = "{:.4g}",
               drop_empty: bool = False) -> str:
@@ -104,7 +149,7 @@ def _md_table(df: pd.DataFrame, cols: Optional[Sequence[str]] = None,
         s = str(v)
         return s.replace("|", "\\|")[:120]
 
-    head = "| " + " | ".join(str(c) for c in d.columns) + " |"
+    head = "| " + " | ".join(friendly(str(c)) for c in d.columns) + " |"
     rule = "|" + "|".join("---" for _ in d.columns) + "|"
     body = "\n".join("| " + " | ".join(cell(v) for v in row) + " |"
                      for row in d.itertuples(index=False))
@@ -464,6 +509,122 @@ def write_report(a: Analysis, outdir: str, prov: dict) -> str:
             w(_md_table(tp, n=20))
 
     # ----------------------------------------------- matched controls
+    # ------------------------------------------- quantization mechanism
+    # Part of the WHY section rather than its own: it is the same question
+    # asked of the other half of the rows, and the reader should meet the two
+    # halves together.
+    qm = f.get("quantization_mechanism", {})
+    w("\n### Why, for the quantized rows: the level count\n")
+    if "quantization_mechanism" in a.unavailable:
+        w(_unavailable(a, "quantization_mechanism"))
+    elif not qm.get("available"):
+        w("_Not computed._\n")
+    else:
+        w("The bound above stops at the lossless rows, because the logged "
+          "stats describe the ORIGINAL buffer and quantization replaces it. "
+          "The quantized rows have a mechanism of their own, and it needs no "
+          "new measurement: the quantizer snaps every value onto a grid of "
+          "spacing `2 * eb_eff` anchored at the chunk's minimum "
+          "(`QuantizeDevice`, data_stats_gpu_kernels.cu), so the number of "
+          "distinct values a chunk can still take afterwards is\n")
+        w("```\n"
+          "L  =  data_range / (2 * 0.95 * eb)        levels after quantization\n"
+          "```\n")
+        w("`L` is a closed-form function of the chunk's range and the "
+          "configured bound. **No codec appears in it**, and it sets both "
+          "outcomes at once, in opposite directions:\n")
+        w("- **ratio.** An alphabet of `L` symbols carries at most `log2(L)` "
+          "bits per element against the original 32, so an ideal entropy "
+          "coder reaches **at least** `32 / log2(L)` from the alphabet alone "
+          "(a floor: equiprobable levels maximise entropy, and real fields "
+          "are peaked). The quantizer also chooses the storage width from `L` "
+          "-- int8 below ~115 levels, int16 below ~29,800, else int32 -- so "
+          "`4 / width_bytes` is an exact, separately attributable part of "
+          "the ratio.\n"
+          "- **quality.** With `L` levels the reconstruction can distinguish "
+          "at most `L` states of the field. Below ~10 a wave cannot be drawn "
+          "between the rungs and SSIM collapses whatever the codec; above a "
+          "few hundred the loss is below SSIM's resolution.\n")
+        w("`L` counts the rungs the chunk's **range** spans. The ratio is set "
+          "by how many rungs the **bulk** of the values occupy, and on a field "
+          "whose range is made by a rare extreme those differ by orders of "
+          "magnitude. The log carries the bulk's spread too, so a second "
+          "quantity falls out of the same arithmetic:\n")
+        w("```\n"
+          "L_bulk  =  L * (mad / range)  =  mad / (2 * 0.95 * eb)     "
+          "bulk levels: the MAD in grid steps\n"
+          "```\n")
+        w("Still closed-form, still codec-free. `L` owns what the range "
+          "decides -- the storage width, the PSNR, the regime edges -- and "
+          "`L_bulk` owns the ratio.\n")
+        w(f"\n{qm.get('verdict', '')}\n")
+        drv = t.get("quantization_levels_drive_outcomes", pd.DataFrame())
+        if not drv.empty:
+            w("\n**How tightly each quantity sets each outcome** (Spearman, "
+              "on chunks whose bound was honoured):\n")
+            cols = [c for c in ("scope", "lib_name", "target", "n_chunks",
+                                "spearman_rho_vs_levels",
+                                "spearman_rho_vs_bulk_levels")
+                    if c in drv.columns]
+            w(_md_table(drv, cols, n=16))
+            w("\n*PSNR is listed for completeness, not as evidence. The "
+              "quantizer's max error saturates at 0.95·eb (measured: median "
+              "0.950, p95 0.950), so rmse is ~constant·eb and "
+              "psnr = 20·log10(range/rmse) is a function of `L` by "
+              "construction. Its correlation checks the arithmetic; SSIM is "
+              "the informative quality number.*\n")
+        w("\n![best quantized ratio against levels]"
+          "(figures/levels_vs_quantized_ratio.png)\n")
+        w("![SSIM against levels](figures/levels_vs_ssim.png)\n")
+        w("*The same x-axis in both: one number, computed before any codec "
+          "runs, and the two outcomes it moves in opposite directions. Hollow "
+          "points had their bound relaxed and sit off-curve by construction. "
+          "Where the ratio climbs back UP at high `L`, the range is being set "
+          "by a rare extreme while the bulk sits on a few rungs -- the next "
+          "pair of figures, on `L_bulk`, straightens that tail out.*\n")
+        w("\n![best quantized ratio against bulk levels]"
+          "(figures/bulk_levels_vs_quantized_ratio.png)\n")
+        w("![SSIM against bulk levels](figures/bulk_levels_vs_ssim.png)\n")
+        reg = t.get("quantization_regimes", pd.DataFrame())
+        if not reg.empty:
+            w("\n#### The regimes, with their mechanism\n")
+            w("Chunks binned by `L`. Each row is a population, its outcomes, "
+              "and the one sentence that produces them.\n")
+            w("![regimes](figures/quantization_regimes.png)\n")
+            cols = [c for c in ("regime", "levels_from", "levels_to",
+                                "n_chunks", "pct_of_chunks", "median_levels",
+                                "median_width_bytes", "median_alphabet_floor",
+                                "median_best_ratio", "median_meas_ssim",
+                                "dominant_codec", "dominant_codec_share",
+                                "pct_bound_relaxed") if c in reg.columns]
+            w(_md_table(reg, cols, n=8))
+            for _, r in reg.iterrows():
+                w(f"- **{r['regime']}** ({int(r['n_chunks'])} chunks, "
+                  f"{float(r['pct_of_chunks']):.0f}%): {r['mechanism']}")
+        fld = t.get("quantization_levels_by_field", pd.DataFrame())
+        if not fld.empty:
+            w("\n#### Which fields the bound destroys, before any codec runs\n")
+            w("Median `L` per field. A field whose median is under 10 is being "
+              "stored as a few plateaus; its ratio measures the bound, not "
+              "the compressor. This table is computable from the data and "
+              "the bound alone, so it is the check to run BEFORE a sweep.\n")
+            cols = [c for c in ("field", "error_bound", "n_chunks",
+                                "median_data_range", "median_levels",
+                                "pct_under_few_levels", "median_best_ratio",
+                                "median_meas_ssim", "pct_bound_relaxed")
+                    if c in fld.columns]
+            w(_md_table(fld, cols, n=40))
+        if float(qm.get("pct_bound_relaxed", 0)) > 0:
+            w(f"\n> :warning: **The bound was relaxed on "
+              f"{float(qm['pct_bound_relaxed']):.0f}% of chunks.** The "
+              f"quantizer widens `eb` when float32 cannot represent it at "
+              f"the field's magnitude (`eb - max|v|*2.4e-7 - 0.05*eb <= 0`), "
+              f"and the log records only the requested value. Those chunks "
+              f"are detected from the MEASURED error exceeding the request, "
+              f"drawn hollow above, excluded from the correlations, and their "
+              f"`L` is an upper bound. Their stored error is not the one that "
+              f"was asked for.\n")
+
     sec("Same moment, different field")
     an = f.get("anisotropy", {})
     if "anisotropy" in a.unavailable:
@@ -782,12 +943,16 @@ def write_report(a: Analysis, outdir: str, prov: dict) -> str:
     _q(w, a, "Q7")
     ss = t.get("shuffle_summary", pd.DataFrame())
     if not ss.empty:
-        w("\nControlled pairs hold *(chunk, codec, preset, quantize, error "
-          "bound)* constant and vary only the shuffle width. `shuffle` is a "
-          "WIDTH, not a flag, so each width is compared against 0 "
-          "separately.\n")
-        w("`ratio_pct_helps` is over PAIRS; the sign test is over CHUNKS "
-          "(each chunk votes once, with the sign of its median delta), "
+        w("\nEach row compares the SAME chunk with the setting on and with it "
+          "off, holding *(chunk, codec, preset, quantize, error bound)* "
+          "constant and varying only the shuffle width. A `change` column "
+          "is therefore `with - without` on one chunk, so the chunk's own "
+          "difficulty cancels and what is left is the setting's effect. "
+          "`shuffle` is a WIDTH, not a flag, so each width is compared "
+          "against 0 separately.\n")
+        w("`ratio % of pairs improved` counts PAIRS; the sign test counts "
+          "CHUNKS "
+          "(each chunk votes once, with the sign of its median change), "
           "because a chunk contributes one pair per codec and quantize "
           "level and those are not independent. `k`/`n` are the sign test's "
           "own counts, so the printed p is reproducible from them.\n")
@@ -809,7 +974,8 @@ def write_report(a: Analysis, outdir: str, prov: dict) -> str:
     _q(w, a, "Q8")
     qs = t.get("quantization_summary", pd.DataFrame())
     if not qs.empty:
-        w("\n`ratio_pct_helps` is over pairs; the sign test is over chunks "
+        w("\n`ratio % of pairs improved` counts pairs; the sign test counts "
+          "chunks "
           "-- see the note in the shuffle section.\n")
         w(_md_table(qs, ["treatment", "lib_name", "n_pairs",
                          "ratio_median_delta", "ratio_median_rel",
@@ -989,7 +1155,7 @@ def write_report(a: Analysis, outdir: str, prov: dict) -> str:
 
     # ---------------------------------------------------- the questions
     sec("The fifteen questions, answered")
-    for q in [f"Q{i}" for i in range(1, 16)]:
+    for q in [f"Q{i}" for i in range(1, 18)]:
         ansd = a.answers.get(q, {})
         w(f"\n**{q}. {Q_TEXT[q]}**\n")
         if ansd.get("unavailable"):

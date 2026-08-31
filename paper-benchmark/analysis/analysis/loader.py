@@ -314,6 +314,27 @@ def load_exploration(path: str, name: Optional[str] = None) -> Dataset:
         if s:
             sidecars[kind] = s
 
+    # data_range is a property of the ORIGINAL chunk that the runtime writes
+    # only to the quality sidecar, one row per chunk keyed by blob. It is what
+    # turns the error bound into a level count (quantization_mechanism.py),
+    # so it is joined here as a chunk property rather than left in a file the
+    # analysis never opens. A chunk the sidecar does not cover -- the sidecar
+    # is written per PRIMARY, and a primary that did not compress has no row
+    # -- gets NaN, and the mechanism module recovers the range from psnr/rmse
+    # for it and says so.
+    if "quality" in sidecars:
+        try:
+            qs = pd.read_csv(sidecars["quality"], usecols=["blob", "data_range"])
+            qs = qs.drop_duplicates("blob").set_index("blob")["data_range"]
+            df["data_range"] = pd.to_numeric(df["blob"].map(qs),
+                                             errors="coerce")
+            cov = float(df.groupby("blob")["data_range"].first().notna().mean())
+            audit.note(f"data_range joined from {os.path.basename(sidecars['quality'])} "
+                       f"for {100 * cov:.1f}% of chunks")
+        except Exception as e:  # a malformed sidecar must not take the run down
+            audit.note(f"quality sidecar present but data_range could not be "
+                       f"joined: {e}")
+
     df = attach_metadata(df)
     df["workload"] = name
 
@@ -426,7 +447,7 @@ def build_chunk_table(rows: pd.DataFrame, features: List[str]) -> pd.DataFrame:
     """
     keep = ["chunk_uid", "blob", "workload", "chunk_bytes", "timestep",
             "plotfile", "fab", "component", "field", "field_path", "chunk_id",
-            "parse_ok"] + features
+            "parse_ok", "data_range"] + features
     keep = [c for c in keep if c in rows.columns]
     g = rows.groupby("chunk_uid", as_index=False)[keep].first()
 
