@@ -78,7 +78,23 @@ constexpr bool kHaveCompressor = true;
 constexpr bool kHaveCompressor = false;
 #endif
 const clio::run::PoolId kCompressorPool(512, 0);
-const clio::run::PoolId kCorePool(513, 0);
+// cte_core is 512.0 -- clio::cte::core::kCtePoolId, and what every generated
+// cluster config declares (`pool_id: "512.0"`). This said (513, 0), which is
+// not a pool at all: the tier bdevs take major 513 but with a PER-NODE minor
+// (513.1, 513.2 for ram::gvw_ram_node0/node1), so 513.0 never exists.
+//
+// It survived because the only user that matters is the stored-footprint
+// loop below, whose GetBlobSize failures are silently skipped
+// (`if (rc == 0) stored += ...`) -- and because the Vector takes
+// kCompressorPool, not this, whenever a compressor is built in. So the run
+// still produced correct numbers and merely reported stored=0.
+//
+// Distributed, it stopped being cosmetic: routing to a pool with no local
+// container returns RouteResult::Dne, and RouteTask then burns its FULL
+// 5000 ms inline retry budget before failing -- once per page. At 2 nodes
+// every weights cell in the cache sweep hit the 900 s cap having done no
+// useful work, at every cache and block rung.
+const clio::run::PoolId kCorePool = clio::cte::core::kCtePoolId;
 constexpr int kLz4WireId = 4;      // registry: {"lz4", 4, ...}   CPU codec
 // GPU codec. This is the one that matters here: decompressing on the device
 // is impossible while a kernel spins on its fault, because the codec is itself
