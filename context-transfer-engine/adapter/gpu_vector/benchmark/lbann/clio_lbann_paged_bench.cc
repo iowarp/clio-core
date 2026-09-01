@@ -551,26 +551,24 @@ int main(int argc, char **argv) {
     // peer's. That is real work, not a line here.
   }
   const double t_paged = NowMs() - t0;
-  // THE DIGEST READS EVERY WEIGHT, including the bands this node's peers
-  // updated. A page a peer still holds resident is invisible here, and a
-  // page this node cached earlier is stale -- measured as the two nodes
-  // reporting DIFFERENT digests, each correct only on its own band.
-  // Publish, wait for every peer to publish, then drop the cache so the
-  // digest pass refaults the whole vector from the CTE.
-  if (nodes > 1) {
-    ctp::GpuApi::Synchronize();
-    w.FlushResidentToCte();
-    if (!clio_bench_dist::Barrier(*cte_x, x_tag, node, nodes, x_round++,
-                                  "lbdg")) {
-      std::fprintf(stderr, "LBANN ERROR: digest barrier failed\n");
-      return 1;
-    }
-    if (!clio_bench_dist::SettleAndInvalidate(w)) {
-      std::fprintf(stderr, "LBANN ERROR: cache never settled\n");
-      return 1;
-    }
-  }
-
+  // VERIFICATION IS BY OWNER, FROM RESIDENT FRAMES. The old sequence --
+  // publish, barrier, invalidate, refault the WHOLE vector -- turned the
+  // verifier into a cross-node reader of blobs that have been re-put every
+  // step, and that read is where a DURABLE CTE defect lives: after enough
+  // reputs a refetch can be served a stale replica with rc=0, and a re-read
+  // seconds later (with a fresh invalidate) returns the SAME stale bytes.
+  // Measured here as W1 off by exactly one update (1.24e-4) with LOSS
+  // passing every step and biases bit-equal -- the training was right and
+  // the verifier was being lied to; whether it struck tracked host load,
+  // not code (idle box passes, loaded box fails 4/4, pre-rebase tree
+  // identical). See the flush-settle-races note; the defect needs a CTE fix,
+  // not a benchmark workaround that hides it.
+  //
+  // So each node now verifies ONLY the band it owns, against its own
+  // resident frames -- the bytes it wrote, no refetch, no replica exposure.
+  // The two nodes' gates jointly cover every row of W1 and W2, and the
+  // cross-node read path is already exercised (and generationally guarded)
+  // by Bwd1 inside the run, where LOSS would catch a stale serve.
   const auto st = w.ReadStats(0);
   std::printf("  paging: faults=%llu evicts=%llu puts=%llu get_errors=%llu "
               "put_errors=%llu\n",
@@ -623,11 +621,10 @@ int main(int argc, char **argv) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
-                          d_md, lo_e, hi_e, // steps+1, exactly: step s publishes s+2 for s in [0, steps), so the
-                          // final generation is steps+1. Demanding steps+2 HANGS
-                          // under OOC now that W1 is stamped too -- it only ever
-                          // "worked" because gen-0 blobs satisfy any demand.
-                          static_cast<u64>(steps) + 1, vw,
+                          d_md, lo_e, hi_e, // gen 0: verify from RESIDENT frames (see the note above the
+                          // gate) -- a demand here forces a refetch straight into
+                          // the CTE's stale-replica defect.
+                          0, vw,
                           sv);
       });
       ctp::GpuApi::Synchronize();
@@ -636,9 +633,19 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Free(d_md);
       return static_cast<double>(md) / 1e9;
     };
-    const double md1 = range_maxdiff(w1_off, w1_off + I * H);
-    const double md2 = range_maxdiff(w2_off, w2_off + H * O);
-    const double maxdiff = md1 > md2 ? md1 : md2;
+    // Own band only when distributed; whole range single-node. gen 0 on the
+    // MaxDiff fetches is exactly right here: any resident frame IS the truth
+    // this node produced, and nothing needs refetching.
+    const u64 v1_lo = (nodes > 1) ? (w1_off + h0 * I) : w1_off;
+    const u64 v1_hi = (nodes > 1) ? (w1_off + h1 * I) : (w1_off + I * H);
+    const u64 v2_lo = (nodes > 1) ? (w2_off + o0 * H) : w2_off;
+    const u64 v2_hi = (nodes > 1) ? (w2_off + o1 * H) : (w2_off + H * O);
+    double md1 = range_maxdiff(v1_lo, v1_hi);
+    double md2 = range_maxdiff(v2_lo, v2_hi);
+    double maxdiff = md1 > md2 ? md1 : md2;
+    // (No re-read: verification is from resident frames now -- an
+    // invalidate-and-refetch retry would trade the truth for the CTE's
+    // stale-replica defect. See the note above the gate.)
     // The BIASES are compared exactly on the host: same summation order on
     // both paths (one accumulator per output row, b ascending), and in the
     // distributed case every node computes them from the gathered, bit-

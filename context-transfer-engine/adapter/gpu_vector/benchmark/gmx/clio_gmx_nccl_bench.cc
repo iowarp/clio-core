@@ -239,6 +239,22 @@ int main(int argc, char **argv) {
   // BOOTSTRAP: the only place MPI carries anything. NCCL has no launcher of
   // its own -- rank 0 makes the unique id, MPI_Bcast distributes it, and
   // ncclCommInitRank is collective so every rank must reach it.
+  // ONE GPU PER RANK, checked BEFORE ncclCommInitRank rather than letting it
+  // die inside NCCL with "invalid usage" and an MPI_ABORT of 1. Exit 77: the
+  // ctest entries carry SKIP_RETURN_CODE 77, so a single-GPU host reports
+  // SKIP instead of a permanent failure -- the md edition has done this from
+  // the start, and these five were red on every 1-GPU machine without it.
+  int guard_ndev = 0;
+  cudaGetDeviceCount(&guard_ndev);
+  if (nranks > 1 && guard_ndev < nranks) {
+    if (rank == 0) {
+      std::fprintf(stderr,
+                   "NCCL needs one GPU per rank: %d ranks but %d visible "
+                   "device(s); skipping (77).\n", nranks, guard_ndev);
+    }
+    MPI_Finalize();
+    return 77;
+  }
   ncclUniqueId nccl_id;
   if (rank == 0) GX_NCCL_CHECK(ncclGetUniqueId(&nccl_id));
   MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
