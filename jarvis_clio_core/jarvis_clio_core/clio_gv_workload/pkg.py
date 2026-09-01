@@ -7,6 +7,26 @@ context-transfer-engine/adapter/gpu_vector/benchmark/:
   workload:  lammps_md | gmx | lbann | grayscott | kmeans | weights
   variant:   mpi | nccl | nvshmem | bam | paged
 
+DISTRIBUTED. Two different mechanisms, and they are not interchangeable:
+
+  mpi / nccl / nvshmem   `nprocs` ranks under `mpi_launcher`. These ARE
+                         MPI programs; across nodes use `srun -n {n}
+                         --ntasks-per-node=1` inside a multi-node
+                         allocation.
+  paged                  `nodes` PROCESSES, one per node, placed by
+                         `node_launcher` (srun) and joined into one clio
+                         cluster through a generated CLIO_SERVER_CONF.
+                         They are not MPI programs -- each hosts the
+                         runtime in-process and they meet through the CTE.
+
+The declared problem size is GLOBAL and split, for every workload except
+weights (whose --pages is per block per node, so its model grows with the
+node count). 32 GB per node therefore means --data-mb 64000 at 2 nodes for
+kmeans/grayscott, and --data-mb 32000 for weights.
+
+vram_peak_mb in a distributed cell is the HEAD NODE's GPU only -- nothing
+samples the peers.
+
 The binary is clio_<workload>_<variant>_bench in <build>/bin. The mpi /
 nccl / nvshmem variants are SELF-CONTAINED (CUDA + launcher, no clio
 runtime); they run under `mpirun -n {nprocs}`. The paged variants host the
@@ -174,6 +194,36 @@ class ClioGvWorkload(Application):
              'msg': 'mpirun ranks (mpi/nccl/nvshmem variants only; all '
                     'ranks share this GPU via cudaSetDevice(rank%%ndev))',
              'type': int, 'default': 1},
+            # ---- paged distributed (one process per NODE) -------------
+            {'name': 'nodes',
+             'msg': 'paged: run distributed across N nodes (--nodes N, one '
+                    'process per node, --node from the launcher). 1 keeps '
+                    'the historic single-process behavior',
+             'type': int, 'default': 1},
+            {'name': 'node_launcher',
+             'msg': 'paged distributed: how to place ONE process per node; '
+                    '"{n}" is substituted with `nodes`. srun is the only '
+                    'launcher that works here -- the paged benches host the '
+                    'runtime in-process and are not MPI programs, so mpirun '
+                    'has nothing to bootstrap',
+             'type': str,
+             'default': 'srun -N {n} --ntasks-per-node=1 --gpus-per-node=1'},
+            {'name': 'cluster_port',
+             'msg': 'paged distributed: port for the generated cluster '
+                    'config. Must not collide with anything else in the '
+                    'allocation',
+             'type': int, 'default': 9425},
+            {'name': 'ram_mb',
+             'msg': 'paged distributed: host RAM tier MB in the generated '
+                    'cluster config (0 = this node SHARE of data_mb, plus '
+                    'slack -- see _ram_tier_mb)',
+             'type': int, 'default': 0},
+            {'name': 'barrier_sec',
+             'msg': 'paged distributed: seconds a finished node waits for '
+                    'its peers before leaving. A node that exits early '
+                    'takes its runtime with it and a peer still paging '
+                    'against it waits forever',
+             'type': int, 'default': 300},
             # ---- common kernel geometry ------------------------------
             {'name': 'blocks', 'msg': 'CUDA blocks', 'type': int,
              'default': 0},  # 0 = binary default
@@ -273,6 +323,21 @@ class ClioGvWorkload(Application):
                     'site has no mpirun at all -- cray-mpich launches '
                     'through slurm -- so there use "srun -n {n}"',
              'type': str, 'default': 'mpirun -n {n} --oversubscribe'},
+            {'name': 'bin_dir',
+             'msg': 'directory holding the benchmark binary. Empty = '
+                    'resolve the bare name through PATH. REQUIRED for '
+                    'multi-node mpi/nccl cells, which must come from '
+                    '<build>/bin-cray (cray-mpich); the PATH build in '
+                    'bin/ is HPC-X OpenMPI and cannot cross Slingshot -- '
+                    'it degrades to one 1-rank job per task and PASSES, '
+                    'so the wrong build is not visible in the output. '
+                    'See _binary and build_baselines_cray.sh',
+             'type': str, 'default': ''},
+            {'name': 'ld_preload',
+             'msg': 'LD_PRELOAD for this cell. NCCL over Slingshot needs '
+                    'libfabric preloaded ($CLIO_DELTA_NCCL_PRELOAD from '
+                    'env.sh) alongside NCCL_NET_PLUGIN=ofi/FI_PROVIDER=cxi',
+             'type': str, 'default': ''},
             {'name': 'prefault',
              'msg': 'CLIO_PREFAULT value ("0" = pre-fault the whole RAM '
                     'tier: warmed memory; "" = leave population lazy)',
@@ -287,9 +352,253 @@ class ClioGvWorkload(Application):
     # command construction
     # ------------------------------------------------------------------
 
-    def _binary(self):
+    def _binary_name(self):
+        """Bare executable name. This is what `pkill -x` matches and what
+        /proc/<pid>/exe basenames to, so the reaper and the pre-cell kill
+        MUST use this and not the path below."""
         c = self.config
         return 'clio_%s_%s_bench' % (c['workload'], c['variant'])
+
+    def _binary(self):
+        """What actually goes on the command line.
+
+        WHY bin_dir EXISTS. Delta needs TWO builds of the CTE-free
+        baselines and only one can be on PATH:
+
+          bin/       HPC-X OpenMPI -- single node only; its UCX PML cannot
+                     cross Slingshot ("ucp_ep_create failed: Destination is
+                     unreachable"), so a MULTI-NODE cell that picks this up
+                     does not fail, it runs every rank as its own 1-rank
+                     job and passes every gate while measuring nothing.
+          bin-cray/  cray-mpich + the aws-ofi-nccl plugin -- multi-node,
+                     under `srun --mpi=cray_shasta`.
+
+        Resolving by name from PATH therefore silently produces the WRONG
+        answer at 2 nodes rather than an error. Naming the directory is the
+        only way to be sure which build a cell measured; see
+        build_baselines_cray.sh."""
+        c = self.config
+        d = (c.get('bin_dir') or '').strip()
+        if not d:
+            return self._binary_name()
+        d = os.path.expanduser(os.path.expandvars(d))
+        return os.path.join(d, self._binary_name())
+
+    # ------------------------------------------------------------------
+    # paged distributed
+    #
+    # The paged benches are NOT MPI programs: each hosts the clio runtime
+    # in-process, and they find each other through a cluster config naming
+    # a hostfile -- the same mechanism test/distributed_workloads/ drives
+    # with docker-compose. Three things have to be true, and none of them
+    # is a launcher flag:
+    #
+    #   1. CLIO_SERVER_CONF must be set BEFORE the bench starts. Every
+    #      paged bench writes its own config only when nobody else
+    #      supplied one, so the cluster config has to be exported.
+    #   2. That config must declare the TIERS. The per-bench config is
+    #      what sizes hbm/ram/file from --hbm-mb/--data-mb/--nvme-mb; once
+    #      we supply our own, that sizing is ours to reproduce, and the
+    #      2 GB the docker harness declares is nowhere near a 32 GB deck.
+    #   3. No node may LEAVE while a peer is still paging. The runtime
+    #      dies with the process and a peer whose pages live on the
+    #      departing node waits forever -- hence the done-file barrier,
+    #      copied from the compose harness for the same reason.
+    # ------------------------------------------------------------------
+
+    def _dist(self):
+        """A distributed paged cell. mpi/nccl scale with `nprocs` through
+        their own launcher and never come through here."""
+        c = self.config
+        return c['variant'] == 'paged' and int(c.get('nodes') or 1) > 1
+
+    def _dist_dir(self):
+        """Cluster config, per-node logs and barrier files. MUST be the
+        SHARED dir: the node logs are written on the node that produced
+        them and read back on the head node, and output_dir is node-local
+        /tmp by design."""
+        return os.path.join(self.shared_dir, 'gvw_dist')
+
+    def _ram_tier_mb(self):
+        """Host RAM tier for the generated config.
+
+        THE DECLARED PROBLEM SIZE IS GLOBAL FOR EVERY WORKLOAD BUT
+        weights. kmeans/grayscott split --data-mb, gmx splits K, lbann
+        splits H and O, lammps_md splits the lattice -- so a node holds
+        data_mb/nodes. weights is the exception: --pages is per block PER
+        NODE, so its model is nodes x bigger and data_mb is already the
+        per-node figure. Sizing the tier off the global number instead
+        would prefault N times the memory a node actually uses, which on
+        a 32 GB deck is minutes of wall clock spent on nothing."""
+        c = self.config
+        if c.get('ram_mb'):
+            return int(c['ram_mb'])
+        per_node = int(c.get('data_mb') or 0)
+        if per_node and c['workload'] != 'weights':
+            per_node //= max(1, int(c.get('nodes') or 1))
+        return (per_node + 512) if per_node else 4096
+
+    def _nvme_tier_mb(self):
+        """File tier MB per node -- the only NON-VOLATILE tier in the stack.
+
+        hbm and ram are declared without a persistence_level, so the core
+        registers them kVolatile and FlushData will not accept them as
+        targets. The file tier alone is `temporary`, which makes it the
+        sole destination for the end-of-run BenchFlushData() -- and that
+        flush moves EVERY volatile block, i.e. this node's whole share of
+        the deck.
+
+        Undersized, the flush fills the tier and then fails per blob with
+        rc 10 + kCteAllocNoHealthyTarget = 12, and (before the FlushData
+        fix that accompanies this change) each failure had already freed
+        the blob's volatile blocks. So this is sized off the SAME per-node
+        share as _ram_tier_mb, for the same reason and by the same rule.
+
+        -1 sizes it from the problem; a too-small explicit value is
+        refused rather than run.
+        """
+        c = self.config
+        want = int(c.get('nvme_mb') or 0)
+        if want == 0:
+            return 0  # RAM-only stack: the flush is a clean no-op
+        per_node = int(c.get('data_mb') or 0)
+        if per_node and c['workload'] != 'weights':
+            per_node //= max(1, int(c.get('nodes') or 1))
+        need = per_node + max(512, per_node // 20) if per_node else 0
+        if want < 0:
+            return need or 4096
+        if need and want < need:
+            raise Exception(
+                'nvme_mb=%d is too small: this node holds %d MB and the file '
+                'tier is the only non-volatile tier, so the end-of-run flush '
+                'pushes all of it there and dies partway once the tier fills '
+                '(rc 12). Use nvme_mb >= %d, nvme_mb=-1 to size it '
+                'automatically, or nvme_mb=0 for a RAM-only stack.'
+                % (want, per_node, need))
+        return want
+
+    def _cluster_conf_path(self):
+        return os.path.join(self._dist_dir(), 'gvw_cluster.yaml')
+
+    def _launcher_path(self):
+        return os.path.join(self._dist_dir(), 'gvw_node.sh')
+
+    def _write_cluster_conf(self):
+        """The config the benches would otherwise write for themselves,
+        with a hostfile bolted on. Schema notes that cost a run each:
+        pool ids are "major.minor" STRINGS (a bare 512 is rejected at load
+        with `Invalid UniqueId format`), and a core pool declares
+        `storage:`, not `tiers:`."""
+        c = self.config
+        os.makedirs(self._dist_dir(), exist_ok=True)
+        hostfile = self.hostfile.path if self.hostfile else ''
+        if not hostfile or not os.path.exists(hostfile):
+            # A PIPELINE TEST DOES NOT INHERIT THE SCHEDULER'S HOSTFILE.
+            # `scheduler:` binds self.hostfile on the pipeline it loads, but
+            # a sweep builds a FRESH pipeline per cell (<name>_runN) and
+            # those bind nothing -- self.hostfile comes back None and every
+            # cell fails identically. Name the file on the package instead:
+            # the scheduler writes it to
+            # ${HOME}/.ppi-jarvis/shared/<pipeline>/hostfile.txt at job
+            # start, and `hostfile:` on the pkg is read first by
+            # Pkg.get_hostfile().
+            raise Exception(
+                'paged distributed needs an allocation hostfile; '
+                'self.hostfile=%r. In a pipeline TEST the scheduler block '
+                'does not reach the per-cell pipelines -- set `hostfile:` '
+                'on this package to the scheduler hostfile, e.g. '
+                '%s/.ppi-jarvis/shared/<pipeline>/hostfile.txt'
+                % (hostfile, os.path.expanduser('~')))
+        lines = [
+            'networking:',
+            '  port: %d' % c['cluster_port'],
+            '  hostfile: "%s"' % hostfile,
+            '',
+            'runtime:',
+            '  num_threads: 8',
+            '  queue_depth: 8192',
+            # A worker that falls back to sleeping adds its sleep to every
+            # fault, and a fault here is a round trip that may cross the
+            # wire. Keep them spinning.
+            '  first_busy_wait: 2000000000',
+            '',
+            'gpu:',
+            '  queue_depth: 8192',
+            '',
+            'compose:',
+            '  - mod_name: clio_bdev',
+            '    pool_name: "ram::chi_default_bdev"',
+            '    pool_query: local',
+            '    pool_id: "301.0"',
+            '    bdev_type: ram',
+            '    capacity: "1GB"',
+            '',
+            '  - mod_name: clio_cte_core',
+            '    pool_name: cte_core',
+            '    pool_query: local',
+            '    pool_id: "512.0"',
+            '    storage:',
+            # MaxBwDpe splits on target_score <= blob_score and sorts the
+            # preferred group DESCENDING; the vector puts pages at blob
+            # score 1.0, so the HIGHER score is the preferred tier. HBM
+            # must sit ABOVE the host tier, not below it.
+            '      - path: "hbm::gvw_hbm"',
+            '        bdev_type: "hbm"',
+            '        capacity_limit: "%dMB"' % (c['hbm_mb'] or 256),
+            '        score: 1.0',
+            '      - path: "ram::gvw_ram"',
+            '        bdev_type: "ram"',
+            '        capacity_limit: "%dMB"' % self._ram_tier_mb(),
+            '        score: 0.2',
+        ]
+        nvme_mb = self._nvme_tier_mb()
+        if nvme_mb:
+            # score BELOW the host tier, for the same reason: higher score
+            # = preferred, so storage must be last or it becomes the
+            # FIRST-choice tier.
+            lines += [
+                '      - path: "%s"' % c['nvme_path'],
+                '        bdev_type: "file"',
+                '        persistence_level: "temporary"',
+                '        capacity_limit: "%dMB"' % nvme_mb,
+                '        score: 0.0',
+            ]
+        lines += ['    dpe:', '      dpe_type: "max_bw"', '']
+        path = self._cluster_conf_path()
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
+        return path
+
+    def _write_node_launcher(self):
+        """One process per node needs a DIFFERENT --node on each, and
+        srun hands out no such thing to a non-MPI program -- only
+        SLURM_PROCID. This wrapper turns that into --node, keeps each
+        node's output in its own file on the shared FS (the head node
+        cannot read a peer's /tmp), and holds the barrier."""
+        os.makedirs(self._dist_dir(), exist_ok=True)
+        path = self._launcher_path()
+        with open(path, 'w') as f:
+            f.write(
+                '#!/bin/sh\n'
+                '# generated by jarvis_clio_core.clio_gv_workload\n'
+                'i="${SLURM_PROCID:-0}"\n'
+                'log="${GVW_LOGBASE}.node${i}.log"\n'
+                'echo "host=$(hostname) node=$i nodes=${GVW_NODES}" > "$log"\n'
+                '"$@" --node "$i" >> "$log" 2>&1\n'
+                'rc=$?\n'
+                'touch "${GVW_DONEDIR}/done_${i}"\n'
+                'w=0\n'
+                'while [ "$(ls "${GVW_DONEDIR}"/done_* 2>/dev/null | wc -l)"'
+                ' -lt "${GVW_NODES}" ] && [ "$w" -lt "${GVW_BARRIER}" ]; do\n'
+                '  sleep 1; w=$((w+1))\n'
+                'done\n'
+                'exit $rc\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def _node_log(self, i):
+        return os.path.join(self._dist_dir(),
+                            '%s.node%d.log' % (self._tag(), i))
 
     def _apply_ladders(self):
         """Resolve cache_level/blocks_level through their ladders into the
@@ -344,8 +653,21 @@ class ClioGvWorkload(Application):
                 return
             a.append('%s %s' % (flag, transform(v) if transform else v))
 
+        def opt_nvme():
+            """--nvme-mb via _nvme_tier_mb, which resolves the -1 sentinel
+            and refuses a tier too small to hold the end-of-run flush.
+            opt() cannot be used: it treats -1 as "unset" and would drop
+            the flag silently."""
+            n = self._nvme_tier_mb()
+            if n:
+                a.append('--nvme-mb %d' % n)
+
         opt('--blocks', 'blocks')
         opt('--threads', 'threads')
+        # --node is PER PROCESS and is appended by the node launcher; only
+        # the node COUNT is the same on every process.
+        if self._dist():
+            a.append('--nodes %d' % c['nodes'])
         if wl == 'lammps_md':
             opt('--lattice', 'lattice')
             opt('--steps', 'steps')
@@ -376,7 +698,7 @@ class ClioGvWorkload(Application):
                 opt('--cap', 'cap')
                 opt('--page-kb', 'page_kb')
                 opt('--repeat', 'repeat')
-                opt('--nvme-mb', 'nvme_mb')
+                opt_nvme()
                 opt('--nvme-path', 'nvme_path')
                 if c.get('no_dense'):
                     a.append('--no-dense')
@@ -403,7 +725,7 @@ class ClioGvWorkload(Application):
                 if self._slots():
                     a.append('--slots %d' % self._slots())
                 opt('--hbm-mb', 'hbm_mb')
-                opt('--nvme-mb', 'nvme_mb')
+                opt_nvme()
                 opt('--nvme-path', 'nvme_path')
                 opt('--repeat', 'repeat')
         elif wl == 'kmeans':
@@ -416,7 +738,7 @@ class ClioGvWorkload(Application):
                     a.append('--slots %d' % self._slots())
                 opt('--page-kb', 'page_kb')
                 opt('--hbm-mb', 'hbm_mb')
-                opt('--nvme-mb', 'nvme_mb')
+                opt_nvme()
                 opt('--nvme-path', 'nvme_path')
                 opt('--repeat', 'repeat')
         elif wl == 'weights':
@@ -444,7 +766,7 @@ class ClioGvWorkload(Application):
                     a.append('--slots %d' % self._slots())
                 opt('--page-kb', 'page_kb')
                 opt('--hbm-mb', 'hbm_mb')
-                opt('--nvme-mb', 'nvme_mb')
+                opt_nvme()
                 opt('--repeat', 'repeat')
         else:
             raise Exception('unknown workload %r' % wl)
@@ -459,6 +781,9 @@ class ClioGvWorkload(Application):
             parts.append('timeout -k 30 %d' % c['timeout_sec'])
         if c['variant'] in ('mpi', 'nccl', 'nvshmem'):
             parts.append(c['mpi_launcher'].format(n=c['nprocs']))
+        if self._dist():
+            parts.append(c['node_launcher'].format(n=c['nodes']))
+            parts.append(self._launcher_path())
         parts.append(self._binary())
         parts += self._args()
         return ' '.join(parts)
@@ -471,15 +796,15 @@ class ClioGvWorkload(Application):
     def _tag(self):
         self._apply_ladders()
         c = self.config
-        keys = ('workload', 'variant', 'nprocs', 'blocks', 'threads',
+        keys = ('workload', 'variant', 'nprocs', 'nodes', 'blocks', 'threads',
                 'steps', 'ckpt', 'lattice', 'mesh_k', 'atoms', 'hidden',
                 'batch', 'data_mb', 'dims', 'clusters', 'flat_pct',
                 'page_kb', 'slots', 'cache_mb', 'vram_mb', 'hbm_mb',
                 'nvme_mb', 'repeat', 'cap', 'rebin')
         blob = '|'.join('%s=%s' % (k, c.get(k)) for k in keys)
         h = hashlib.md5(blob.encode()).hexdigest()[:8]
-        return '%s_%s_np%s_%s' % (c['workload'], c['variant'],
-                                  c['nprocs'], h)
+        return '%s_%s_np%s_nd%s_%s' % (c['workload'], c['variant'],
+                                       c['nprocs'], c.get('nodes') or 1, h)
 
     def _output_file(self):
         return os.path.join(self.config['output_dir'],
@@ -494,16 +819,23 @@ class ClioGvWorkload(Application):
 
     def start(self):
         c = self.config
-        _reap_stale(self.log, self._binary())
+        _reap_stale(self.log, self._binary_name())
         _wait_for_gpu_idle(self.log)
         os.makedirs(c['output_dir'], exist_ok=True)
         out = self._output_file()
+        if self._dist():
+            self._dist_setup(out)
         # Warmed memory: CLIO_PREFAULT=0 pre-faults the WHOLE RAM tier at
         # compose (mem_bdev_transport.cc), so timings exclude first-touch
         # page population. Exported for every variant; the CTE-free
         # baselines simply ignore it.
         if c['prefault'] != '':
             self.setenv('CLIO_PREFAULT', str(c['prefault']))
+        # NCCL's Slingshot path: the aws-ofi-nccl plugin needs libfabric in
+        # the process. Expanded here because the value comes from env.sh as
+        # $CLIO_DELTA_NCCL_PRELOAD and the sweep YAML carries it verbatim.
+        if c.get('ld_preload'):
+            self.setenv('LD_PRELOAD', os.path.expandvars(c['ld_preload']))
         cmd = self._cmd()
         self.log('Running: %s' % cmd)
         sampler = _VramSampler(out + '.vram')
@@ -514,7 +846,90 @@ class ClioGvWorkload(Application):
                  LocalExecInfo(env=self.mod_env, cwd=c['output_dir'])).run()
         finally:
             sampler.stop()
+        if self._dist():
+            self._dist_collect(out)
         self.log('cell done -> %s' % out)
+
+    def _dist_setup(self, out):
+        """Config, launcher, and a CLEAN barrier directory. A leftover
+        done_* file from the previous cell lets a node skip the wait
+        entirely, which is exactly the failure the barrier exists to
+        stop -- and it would show up as an unrelated cell hanging."""
+        c = self.config
+        d = self._dist_dir()
+        os.makedirs(d, exist_ok=True)
+        for name in os.listdir(d):
+            if name.startswith('done_'):
+                os.remove(os.path.join(d, name))
+        for i in range(int(c['nodes'])):
+            try:
+                os.remove(self._node_log(i))
+            except OSError:
+                pass
+        # _reap_stale only sees the HEAD node's /proc. A cell that timed
+        # out leaves an orphan on every node, and an orphan still holds
+        # the cluster port -- so the next cell dies at bind on a node
+        # whose log the head node never looks at. Sweep them all.
+        #
+        # THE PATTERN MUST BE TRUNCATED TO 15 CHARACTERS. pkill matches
+        # against /proc/<pid>/comm, which the kernel caps at
+        # TASK_COMM_LEN-1 = 15, so `pkill -x clio_kmeans_paged_bench` (23
+        # chars) matched NOTHING and this reap was a silent no-op. The
+        # cost was not one bad cell: the first cell to hit timeout_sec
+        # left a runtime holding the cluster port, and every cell after it
+        # died instantly at bind on the peer while the head node sat out
+        # its full timeout at the barrier -- a 96-cell sweep that produced
+        # three rows of completed=0 and would have burned its whole wall.
+        #
+        # `-f` is NOT the fix: it matches the full command line, and the
+        # `sh -c` string below contains the binary name, so pkill -f would
+        # match and kill its own launcher.
+        #
+        # output_dir is the cwd every cell runs in, and it exists only on
+        # the head node -- srun then prints "couldn't chdir ... going to
+        # /tmp instead" on every peer, which silently moves that node's
+        # relative paths somewhere else. Make it everywhere.
+        Exec('%s sh -c \'mkdir -p %s; pkill -9 -x %s || true; sleep 2\''
+             % (c['node_launcher'].format(n=c['nodes']), c['output_dir'],
+                self._binary_name()[:15]),
+             LocalExecInfo(env=self.mod_env)).run()
+        conf = self._write_cluster_conf()
+        self._write_node_launcher()
+        self.setenv('CLIO_SERVER_CONF', conf)
+        self.setenv('CLIO_NUM_CONTAINERS', str(c['nodes']))
+        self.setenv('GVW_NODES', str(c['nodes']))
+        self.setenv('GVW_BARRIER', str(c['barrier_sec']))
+        self.setenv('GVW_DONEDIR', d)
+        self.setenv('GVW_LOGBASE', os.path.join(d, self._tag()))
+        self.log('  distributed: %d nodes, conf=%s, hosts=%s'
+                 % (c['nodes'], conf,
+                    ','.join(self.hostfile.hosts[:int(c['nodes'])])))
+
+    def _dist_collect(self, out):
+        """Fold every node's log into the cell log.
+
+        srun's own stdout would interleave the nodes line by line, and
+        these benches print multi-line summaries -- a machine line spliced
+        through another node's is unparseable and, worse, parses WRONG.
+        Each node therefore writes its own file and they are concatenated
+        in node order here."""
+        c = self.config
+        parts = []
+        try:
+            with open(out, errors='replace') as f:
+                parts.append(f.read())
+        except OSError:
+            pass
+        for i in range(int(c['nodes'])):
+            path = self._node_log(i)
+            parts.append('\n===== NODE %d (%s) =====\n' % (i, path))
+            try:
+                with open(path, errors='replace') as f:
+                    parts.append(f.read())
+            except OSError:
+                parts.append('(no log -- this node produced no output)\n')
+        with open(out, 'w') as f:
+            f.write(''.join(parts))
 
     def stop(self):
         pass
@@ -534,7 +949,8 @@ class ClioGvWorkload(Application):
     def _get_stat(self, stats):
         self._apply_ladders()
         c = self.config
-        stats['binary'] = self._binary()
+        stats['binary'] = self._binary_name()
+        stats['nodes'] = int(c.get('nodes') or 1)
         # The resolved axis values, so a combined sweep's CSV carries the
         # concrete settings next to the abstract levels.
         stats['blocks_resolved'] = c.get('blocks') or 0
@@ -591,6 +1007,53 @@ class ClioGvWorkload(Application):
                          (pe is None or pe.group(1) == '0'))
                 stats['gates_pass'] = int(clean)
                 stats['completed'] = 1
+
+        # EVERY NODE MUST HAVE FINISHED, and the check has to be PER NODE
+        # and LAST. Per node, because the cell log is the concatenation of
+        # N node logs: a single surviving node's marker satisfies every
+        # `in text` test above, so a run whose peer died reads as a clean
+        # pass. (Counting markers in the concatenation does not fix it --
+        # lammps_md prints four gate lines per node, so one node alone
+        # clears a threshold of two.) Last, because the clean-counters
+        # fallback directly above sets completed=1 unconditionally and
+        # would otherwise undo the veto.
+        #
+        # THE MARKER IS THE MACHINE LINE, not prose. paged kmeans,
+        # grayscott and weights print no "N iters in ..." line at all --
+        # only `KMEANS mode=... ms=... get_errors=...` -- so a prose-only
+        # marker scored every one of them as zero nodes finished.
+        if self._dist():
+            n = int(c['nodes'])
+            fin = re.compile(r'(?:KMEANS|GRAYSCOTT|GVW) \S*mode=|'
+                             r'ALL GATES PASS|GATE: (?:PASS|FAIL)|'
+                             r'iters in|steps in|passes,')
+            ok, per_node_ms = 0, []
+            for i in range(n):
+                try:
+                    with open(self._node_log(i), errors='replace') as f:
+                        node_text = ansi.sub('', f.read())
+                except OSError:
+                    continue
+                if not fin.search(node_text):
+                    continue
+                ok += 1
+                mm = re.findall(r'(?:^|\s)ms=([0-9.]+)', node_text)
+                if not mm:
+                    mm = re.findall(r'in ([0-9.]+) ms', node_text)
+                if mm:
+                    per_node_ms.append(float(mm[-1]))
+            stats['nodes_finished'] = ok
+            # THE CELL IS AS SLOW AS ITS SLOWEST NODE. The concatenated
+            # parse takes the LAST machine line, which is whichever node
+            # happens to be appended last -- measured 583.7 ms on node 0
+            # against 251.5 on node 1 for the same cell, a 2.3x difference
+            # decided by nothing. The run is not over until both are.
+            if len(per_node_ms) == n:
+                stats['bench_ms'] = max(per_node_ms)
+                stats['bench_ms_fastest_node'] = min(per_node_ms)
+            if ok < n:
+                stats['completed'] = 0
+                stats['gates_pass'] = 0
 
         def grab(pattern, key, cast=float, last=True):
             ms = re.findall(pattern, text)

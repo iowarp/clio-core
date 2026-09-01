@@ -253,7 +253,12 @@ class ClioGvKmeans(Application):
              'type': int, 'default': 256},
             {'name': 'nvme_mb',
              'msg': 'paged: file tier MB (>0 gives the full three-tier '
-                    'stack hbm+ram+file)', 'type': int, 'default': 0},
+                    'stack hbm+ram+file; -1 sizes it from data_mb). The '
+                    'file tier is the ONLY non-volatile tier in this '
+                    'stack, so the end-of-run flush pushes the WHOLE '
+                    'dataset into it -- it must be at least data_mb or '
+                    'the flush dies partway. See _nvme_tier_mb',
+             'type': int, 'default': 0},
             {'name': 'nvme_path', 'msg': 'paged: file tier path',
              'type': str, 'default': '/tmp/gv_kmeans_tier.dat'},
 
@@ -353,6 +358,44 @@ class ClioGvKmeans(Application):
                 'page per block' % (c['cache_mb'], blocks, page_kb))
         return slots
 
+    def _nvme_tier_mb(self):
+        """File tier MB, and the one tier that has to hold the whole deck.
+
+        hbm and ram are declared WITHOUT a persistence_level, so the core
+        registers them kVolatile (GetPersistenceLevelForTarget defaults
+        there). The file tier is `temporary` and therefore the only target
+        FlushData will accept at level >= 1 -- so the end-of-run
+        BenchFlushData() tries to move the ENTIRE dataset into it.
+
+        Sized under data_mb, the flush fills the tier and then fails on
+        every remaining blob with rc 10 + kCteAllocNoHealthyTarget = 12.
+        That was not cosmetic: until the FlushData fix that accompanies
+        this change, each of those failures had already freed the blob's
+        volatile blocks, so the run ended with a partly destroyed dataset
+        and megabytes of `PutBlob failed ... (error 12)`.
+
+        -1 sizes the tier from the problem. The slack covers page
+        rounding and per-blob metadata; 5% or 512 MB, whichever is more.
+        """
+        c = self.config
+        want = int(c['nvme_mb'] or 0)
+        data_mb = int(c['data_mb'] or 0)
+        if want == 0:
+            return 0  # no file tier: RAM-only stack, flush is a clean no-op
+        need = data_mb + max(512, data_mb // 20)
+        if want < 0:
+            return need
+        if data_mb and want < need:
+            raise Exception(
+                'nvme_mb=%d is too small for data_mb=%d. The file tier is '
+                'the only non-volatile tier, so the end-of-run flush pushes '
+                'the whole %d MB dataset into it and dies partway once the '
+                'tier fills (rc 12). Use nvme_mb >= %d, or nvme_mb=-1 to '
+                'size it automatically, or nvme_mb=0 for a RAM-only stack '
+                'where the flush is a no-op.'
+                % (want, data_mb, data_mb, need))
+        return want
+
     # ------------------------------------------------------------------
     # command construction
     # ------------------------------------------------------------------
@@ -387,8 +430,9 @@ class ClioGvKmeans(Application):
             a.append('--page-kb %d' % int(c['page_kb']))
             if c['hbm_mb']:
                 a.append('--hbm-mb %d' % int(c['hbm_mb']))
-            if c['nvme_mb']:
-                a += ['--nvme-mb %d' % int(c['nvme_mb']),
+            nvme_mb = self._nvme_tier_mb()
+            if nvme_mb:
+                a += ['--nvme-mb %d' % nvme_mb,
                       '--nvme-path %s' % c['nvme_path']]
             # --repeat 1, ALWAYS AND EXPLICITLY. The paged bench defaults
             # to `int repeat = 3` and reports the BEST of them, while the
