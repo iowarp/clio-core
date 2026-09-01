@@ -985,22 +985,12 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
         add_test(NAME cte_gv_ooc_sycl_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )
-        # KNOWN FAILURE, deliberately visible: cte_gv_ooc_sycl_weights.
-        # Under eviction the SYCL edition reads pages holding OTHER pages'
-        # bytes -- every page visited once, every sum wrong by a plausible
-        # magnitude, deterministic, both nodes, resident SYCL and OOC CUDA
-        # both fine. Same family as the gpu-vector OOC read corruption fixed
-        # for CUDA (stale slot moving a hold by whole pages); the SYCL arm
-        # needs the same audit. Reproduce:
-        #   GVW_OOC=1 GVW_VARIANT=sycl BUILD_DIR=build-syclreg \
-        #     ./distributed_workloads/run_workloads_distributed.sh weights
         set_tests_properties(cte_gv_ooc_sycl_${_wl} PROPERTIES
             TIMEOUT 2400
             LABELS "cte;gpu;gpu_vector;gv_dist_ooc_sycl;distributed;docker"
             RUN_SERIAL TRUE
             ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_OOC=1;GVW_VARIANT=sycl")
     endforeach()
-    set_tests_properties(cte_gv_ooc_sycl_weights PROPERTIES DISABLED TRUE)
 
     # CTE stale-replica regression guard. Proves the CTE core does NOT serve
     # stale bytes on a cross-node reput+refetch under eviction and load -- the
