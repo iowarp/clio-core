@@ -14,6 +14,7 @@
 #define CLIO_CTE_COMPRESSOR_NEUROPRESS_TELEMETRY_H_
 
 #include <clio_ctp/compress/preprocess/quality_metrics.h>
+#include <clio_ctp/compress/preprocess/quantization.h>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -63,6 +64,17 @@ void RecordPrimaryQuality(
 bool TakePrimaryQuality(const std::string &blob_name,
                         ctp::compress::preprocess::QualityMetrics *out);
 
+/** @brief Same hand-off as RecordPrimaryQuality, for the refusal reason.
+ *  Separate because a refused chunk has no quality to record. */
+void RecordPrimaryQuantizeRefusal(
+    const std::string &blob_name,
+    ctp::compress::preprocess::QuantizeRefusal refusal);
+
+/** Retrieve and erase; one primary row per chunk, which bounds the map. */
+bool TakePrimaryQuantizeRefusal(
+    const std::string &blob_name,
+    ctp::compress::preprocess::QuantizeRefusal *out);
+
 void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           int rank, const std::string &lib_name,
                           uint32_t preset_id, bool quantize, uint32_t shuffle,
@@ -93,6 +105,11 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double entropy = -1.0, double mad = -1.0,
                           double second_deriv = -1.0,
                           double eb_encoded = -1.0,
+                          /** Why quantization was declined for THIS action,
+                           *  which tells a quantize=0 row whether the model
+                           *  chose lossless or the bound was unmeetable. */
+                          ctp::compress::preprocess::QuantizeRefusal refusal =
+                              ctp::compress::preprocess::QuantizeRefusal::kNone,
                           /**
                            * MEASURED reconstruction quality, or nullptr when
                            * the candidate was not measured -- which is the

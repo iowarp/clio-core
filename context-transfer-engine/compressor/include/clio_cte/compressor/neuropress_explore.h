@@ -46,6 +46,10 @@ struct ExploreRow {
    *  therefore unable to see a bound violation at all. */
   ctp::compress::preprocess::QualityMetrics quality;
   bool have_quality = false;
+  /** Why quantization was declined, or kNone if it succeeded or was never
+   *  requested. Tells a quantize=0 row which of the two it is. */
+  ctp::compress::preprocess::QuantizeRefusal refusal =
+      ctp::compress::preprocess::QuantizeRefusal::kNone;
 };
 
 /** Best alternative so far, plus what is needed to store it. One object, not

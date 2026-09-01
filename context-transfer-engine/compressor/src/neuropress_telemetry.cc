@@ -124,6 +124,8 @@ struct ExploreRowFields {
   bool is_primary = false;
   double dt_ms = -1.0;
   double entropy = -1.0, mad = -1.0, second_deriv = -1.0, eb_encoded = -1.0;
+  ctp::compress::preprocess::QuantizeRefusal refusal =
+      ctp::compress::preprocess::QuantizeRefusal::kNone;
 };
 
 struct ExploreLog {
@@ -144,6 +146,9 @@ struct ExploreLog {
    *  one entry per chunk in flight. */
   std::map<std::string, ctp::compress::preprocess::QualityMetrics>
       primary_quality;
+  /** Same parking for the refusal reason; a refused chunk has no quality. */
+  std::map<std::string, ctp::compress::preprocess::QuantizeRefusal>
+      primary_refusal;
 };
 
 
@@ -173,7 +178,10 @@ ExploreLog *ExploreLogInstance() {
                      // The model's own eight inputs, so a row explains the
                      // prediction beside it. algo_idx/quantize/shuffle and
                      // chunk_bytes are already above; these are the rest.
-                     "entropy,mad,second_deriv,eb_encoded\n");
+                     "entropy,mad,second_deriv,eb_encoded,"
+                     // Which kind of quantize=0 this row is: the model ranked
+                     // a lossless action, or the bound could not be honored.
+                     "quant_refusal\n");
       }
     }
     return l;
@@ -359,7 +367,7 @@ void WriteExploreRowLocked(ExploreLog *log, const ExploreRowFields &r,
                "%ld,%s,%zu,%s,%d,%s,%d,%u,%d,%u,%.10g,%.10g,%.10g,%.10g,"
                "%.10g,%.10g,%.10g,%.10g,%.10g,%d,"
                "%s,%s,%s,%s,%s,%s,"
-               "%.10g,%.10g,%.10g,%.10g\n",
+               "%.10g,%.10g,%.10g,%.10g,%s\n",
                log->seq++, r.blob_name.c_str(), r.chunk_size,
                r.is_primary ? "primary" : "alt", r.rank,
                r.lib_name.c_str(), algo_idx, r.preset_id, r.quantize ? 1 : 0,
@@ -367,7 +375,8 @@ void WriteExploreRowLocked(ExploreLog *log, const ExploreRowFields &r,
                r.ct_ms, r.dt_ms, r.psnr_db, r.cost, r.primary_cost,
                r.adopted ? 1 : 0,
                qmeas, qc[0], qc[1], qc[2], qc[3], qc[4],
-               r.entropy, r.mad, r.second_deriv, r.eb_encoded);
+               r.entropy, r.mad, r.second_deriv, r.eb_encoded,
+               ctp::compress::preprocess::QuantizeRefusalToken(r.refusal));
   std::fflush(log->fp);
 }
 
@@ -379,7 +388,8 @@ ExploreRowFields MakeRow(const std::string &blob_name, size_t chunk_size,
                           double psnr_db, double cost, double primary_cost,
                           bool adopted, bool is_primary, double dt_ms,
                           double entropy, double mad, double second_deriv,
-                          double eb_encoded) {
+                          double eb_encoded,
+                          ctp::compress::preprocess::QuantizeRefusal refusal) {
   ExploreRowFields r;
   r.blob_name = blob_name; r.chunk_size = chunk_size; r.rank = rank;
   r.lib_name = lib_name; r.preset_id = preset_id; r.quantize = quantize;
@@ -388,7 +398,7 @@ ExploreRowFields MakeRow(const std::string &blob_name, size_t chunk_size,
   r.psnr_db = psnr_db; r.cost = cost; r.primary_cost = primary_cost;
   r.adopted = adopted; r.is_primary = is_primary; r.dt_ms = dt_ms;
   r.entropy = entropy; r.mad = mad; r.second_deriv = second_deriv;
-  r.eb_encoded = eb_encoded;
+  r.eb_encoded = eb_encoded; r.refusal = refusal;
   return r;
 }
 
@@ -403,6 +413,7 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
                           double primary_cost, bool adopted, bool is_primary,
                           double dt_ms, double entropy, double mad,
                           double second_deriv, double eb_encoded,
+                          ctp::compress::preprocess::QuantizeRefusal refusal,
                           const ctp::compress::preprocess::QualityMetrics
                               *quality) {
   ExploreLog *log = ExploreLogInstance();
@@ -411,7 +422,7 @@ void LogNeuroPressExplore(const std::string &blob_name, size_t chunk_size,
       blob_name, chunk_size, rank, lib_name, preset_id, quantize, shuffle,
       pred_ratio, pred_ct_ms, pred_dt_ms, ratio, ct_ms, psnr_db, cost,
       primary_cost, adopted, is_primary, dt_ms, entropy, mad, second_deriv,
-      eb_encoded);
+      eb_encoded, refusal);
   std::lock_guard<std::mutex> lock(log->mutex);
   WriteExploreRowLocked(log, r, quality);
 }
@@ -434,6 +445,28 @@ bool TakePrimaryQuality(const std::string &blob_name,
   if (it == log->primary_quality.end()) return false;
   *out = it->second;
   log->primary_quality.erase(it);
+  return true;
+}
+
+void RecordPrimaryQuantizeRefusal(
+    const std::string &blob_name,
+    ctp::compress::preprocess::QuantizeRefusal refusal) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  log->primary_refusal[blob_name] = refusal;
+}
+
+bool TakePrimaryQuantizeRefusal(
+    const std::string &blob_name,
+    ctp::compress::preprocess::QuantizeRefusal *out) {
+  ExploreLog *log = ExploreLogInstance();
+  if (!log->fp || !out) return false;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  auto it = log->primary_refusal.find(blob_name);
+  if (it == log->primary_refusal.end()) return false;
+  *out = it->second;
+  log->primary_refusal.erase(it);
   return true;
 }
 
@@ -493,5 +526,6 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                role ? role : "primary");
   std::fflush(fp);
 }
+
 
 }  // namespace clio::cte::compressor

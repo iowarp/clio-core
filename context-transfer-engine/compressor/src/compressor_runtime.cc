@@ -130,25 +130,14 @@ inline uint32_t UnpackVersion(uint32_t packed) {
  * undefined" sentinel and the value that makes the SGD skip the head.
  */
 /**
- * Say so when the quantizer declined a chunk, and say which reason.
+ * Say which reason the quantizer declined a chunk for.
  *
- * This replaces WarnIfBoundUnachievable, which fired when QuantizeDevice
- * quantized against a bound it had SUBSTITUTED for the requested one. That
- * state no longer exists -- the quantizer now honours the bound or refuses --
- * so the warning it emitted became unreachable, and the condition worth
- * reporting inverted: a refusal.
+ * A refusal is not an error -- the chunk is stored losslessly, so the bound
+ * holds at zero error -- but it is otherwise invisible, since the success
+ * trace and kDebug line both sit inside the success branch.
  *
- * A refusal is not an error. The chunk is stored losslessly, so the bound
- * still holds, at zero error. But it is otherwise INVISIBLE: the success
- * trace and the kDebug line below both sit inside the success branch, so
- * before this the only evidence a bound had gone unmet was a compression
- * ratio that got worse with nothing saying why.
- *
- * Per-chunk detail goes to the path trace and to kDebug. The kWarning fires
- * once per distinct reason, because a workload that refuses one chunk
- * generally refuses thousands of them for the same reason -- WarpX's E and j
- * fields refuse every chunk at eb=0.05 -- and repeating it per chunk would
- * bury the run's other output.
+ * Detail goes to the trace and kDebug; the kWarning fires once per distinct
+ * reason, since a workload that refuses one chunk refuses thousands alike.
  */
 /**
  * True when CLIO_NEUROPRESS_REQUIRE_DEVICE demands that every chunk reach the
@@ -1172,6 +1161,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       ctp::GpuApi::Memcpy(staged, static_cast<const char *>(chunk_data),
                           chunk_size);
       chunk_data = staged;
+      // Same convention Compress uses to hand a device-resident output back
+      // (see where compressed_shm_ptr is built): a GPU backend minted by this
+      // process carries its raw device pointer in off_, and ToFullPtr
+      // resolves it either by PID or through the registered backend. Compress
+      // runs on this container, in this process, so both routes apply.
       CLIO_PATH_TRACE("WRITE  staged H2D %llu bytes -> device",
                       (unsigned long long)chunk_size);
     }
@@ -1249,7 +1243,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
-
     // Log predicted compression stats if tracing enabled
     if (context.trace_ && !stats.empty()) {
       for (const auto& stat : stats) {
@@ -1943,11 +1936,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // Device shuffle scratch for the explored candidates; released
           // together once the loop is done.
           std::vector<ctp::ipc::AllocatorId> explore_gpu_scratch;
-          // Exploration is where quantization is usually decided: when the
-          // NN ranks a lossless action first, the primary path never calls
-          // QuantizeDevice at all, and a refusal would otherwise go
-          // unreported. Once per chunk, not once per candidate -- 16 of the
-          // 32 actions request quantization and they all refuse together.
+          // The NN often ranks a lossless action first, so the primary path
+          // never calls QuantizeDevice and only exploration sees the refusal.
+          // Once per chunk: the 16 quantize actions all refuse together.
           bool alt_refusal_reported = false;
 
           // Best explored alternative so far, if any beat the primary.
@@ -2322,7 +2313,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                                        alt_quant_params.effective_error_bound)
                       : -1.0,
                   alt_cost, explore_rank, slot_ref.decomp_time_ms,
-                  slot_ref.quality, slot_ref.have_quality});
+                  slot_ref.quality, slot_ref.have_quality,
+                  alt_quant_params.refusal});
             }
             ++explore_rank;
 
@@ -2401,6 +2393,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             ctp::compress::preprocess::QualityMetrics primary_qm;
             const bool have_primary_qm =
                 TakePrimaryQuality(task->blob_name_.str(), &primary_qm);
+            // Parked by Compress when it declined the primary's quantize.
+            ctp::compress::preprocess::QuantizeRefusal primary_refusal =
+                ctp::compress::preprocess::QuantizeRefusal::kNone;
+            TakePrimaryQuantizeRefusal(task->blob_name_.str(),
+                                       &primary_refusal);
             LogNeuroPressExplore(
                 task->blob_name_.str(), chunk_size, /*rank=*/-1,
                 ctp::CompressionFactory::NameForWireId(best_lib),
@@ -2413,7 +2410,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 primary_rank_cost, primary_rank_cost,
                 /*adopted=*/!winner.have, /*is_primary=*/true, primary_dt_ms,
                 neuropress_entropy, neuropress_mad, neuropress_second_deriv,
-                eb_for_log(UnpackQuantEnabled(p_packed)),
+                eb_for_log(UnpackQuantEnabled(p_packed)), primary_refusal,
                 have_primary_qm ? &primary_qm : nullptr);
           }
           for (size_t ri = 0; ri < explore_rows.size(); ++ri) {
@@ -2437,7 +2434,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 primary_rank_cost, static_cast<int>(ri) == winner.row,
                 /*is_primary=*/false, row.dt_ms,
                 neuropress_entropy, neuropress_mad, neuropress_second_deriv,
-                eb_for_log(row.quant),
+                eb_for_log(row.quant), row.refusal,
                 row.have_quality ? &row.quality : nullptr);
           }
 
@@ -3044,11 +3041,11 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
              input_size, quant_bytes, quant_params.precision,
              context.error_bound_, quant_params.effective_error_bound);
       } else if (!quant_device_alloc.IsNull()) {
-        // QuantizeDevice ran and declined -- the only branch that knows it,
-        // since the chunk is about to be compressed losslessly and nothing
-        // downstream records that quantization was ever asked for.
         ReportQuantizeRefusal(quant_params.refusal, context.error_bound_,
                               input_size);
+        // For the explore row, written by DynamicSchedule after this returns.
+        RecordPrimaryQuantizeRefusal(task->blob_name_.str(),
+                                     quant_params.refusal);
         CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, quant_device_alloc);
         quant_device_alloc = ctp::ipc::AllocatorId();
       }
