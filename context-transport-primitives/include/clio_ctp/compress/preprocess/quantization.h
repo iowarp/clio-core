@@ -120,29 +120,22 @@ inline int ComputeRequiredPrecision(double data_range,
 
 
 /**
- * @brief Why QuantizeDevice() declined to quantize a chunk.
- *
- * A refusal is a routine outcome, not an error: the caller stores the chunk
- * losslessly, which honours any bound at zero error. It still has to be
- * reportable, because otherwise the single symptom is a compression ratio
- * that quietly got worse, with nothing saying the bound was the cause.
+ * @brief Why QuantizeDevice() declined a chunk. A refusal is routine, not an
+ *        error: the caller stores losslessly, honouring any bound at zero
+ *        error. Reported so the only symptom is not a worse ratio.
  */
 enum class QuantizeRefusal : int {
-  kNone = 0,           /**< Quantized; the requested bound holds */
-  kNonFiniteRange,     /**< min/max not finite, so no grid is definable */
-  kStepNotPositive,    /**< No positive step exists (defensive; eb > 0 is
-                            checked on entry, so this should be unreachable) */
-  kIndexExceedsInt32,  /**< The bound needs a finer grid than int32 indexes */
-  kIndexLeftWidth,     /**< An index left the chosen width -- a planner bug,
-                            impossible by construction, reported not clamped */
-  kElementMissedBound, /**< An element missed the bound through the decoder
-                            this build actually ships */
-  kDeviceError,        /**< CUDA allocation, launch or copy failed. A property
-                            of the machine, not of the data or the bound */
-  kNoCudaSupport,      /**< Built without CUDA; there is no device path */
+  kNone = 0,
+  kNonFiniteRange,     /**< min/max not finite */
+  kStepNotPositive,    /**< defensive; eb > 0 is checked on entry */
+  kIndexExceedsInt32,  /**< bound needs a finer grid than int32 indexes */
+  kIndexLeftWidth,     /**< planner bug: impossible by construction */
+  kElementMissedBound, /**< an element missed the bound through the decoder */
+  kDeviceError,        /**< CUDA failed; not a property of the data */
+  kNoCudaSupport,
 };
 
-/** @brief Human-readable form of a QuantizeRefusal, for logs. */
+/** @brief Prose form, for logs. */
 inline const char *QuantizeRefusalName(QuantizeRefusal reason) {
   switch (reason) {
     case QuantizeRefusal::kNone:
@@ -165,6 +158,21 @@ inline const char *QuantizeRefusalName(QuantizeRefusal reason) {
   return "unknown";
 }
 
+/** @brief Token form, for the explore.csv column: no spaces or commas. */
+inline const char *QuantizeRefusalToken(QuantizeRefusal reason) {
+  switch (reason) {
+    case QuantizeRefusal::kNone:               return "none";
+    case QuantizeRefusal::kNonFiniteRange:     return "nonfinite_range";
+    case QuantizeRefusal::kStepNotPositive:    return "step_not_positive";
+    case QuantizeRefusal::kIndexExceedsInt32:  return "index_exceeds_int32";
+    case QuantizeRefusal::kIndexLeftWidth:     return "index_left_width";
+    case QuantizeRefusal::kElementMissedBound: return "element_missed_bound";
+    case QuantizeRefusal::kDeviceError:        return "device_error";
+    case QuantizeRefusal::kNoCudaSupport:      return "no_cuda_support";
+  }
+  return "unknown";
+}
+
 /**
  * @brief Parameters a reader needs to invert a device quantization.
  *
@@ -180,12 +188,9 @@ struct DeviceQuantizeParams {
   double data_min = 0.0;         /**< Minimum of the original data */
   double data_max = 0.0;         /**< Maximum of the original data */
   int precision = 0;             /**< 8, 16 or 32 bits per value */
-  bool bound_achievable = true;  /**< Always true on success: QuantizeDevice
-                                      no longer has a state in which it
-                                      quantizes against a substituted bound */
+  bool bound_achievable = true;  /**< Always true on success */
   QuantizeRefusal refusal = QuantizeRefusal::kNone; /**< Set on every false
-                                      return, so a caller can log WHY a chunk
-                                      fell back to lossless */
+                                      return */
 };
 
 /**
@@ -218,11 +223,9 @@ struct DeviceQuantizeParams {
  *                    only this candidate -- slots already launched keep
  *                    running.
  * @return true only if EVERY element round-trips through DequantizeDevice
- *         within error_bound -- the kernel checks each one rather than
- *         trusting the step arithmetic. False if the bound cannot be honored,
- *         if CUDA failed, or if CUDA is not compiled in; in every false case
- *         out_params->refusal says which, and the caller is expected to store
- *         the chunk losslessly, honouring the bound at zero error.
+ *         within error_bound; the kernel checks each one. False if the bound
+ *         cannot be honored or CUDA failed -- out_params->refusal says which,
+ *         and the caller should store the chunk losslessly.
  */
 bool QuantizeDevice(const void *device_in, size_t num_elements,
                     double error_bound, void *device_out, size_t *out_bytes,

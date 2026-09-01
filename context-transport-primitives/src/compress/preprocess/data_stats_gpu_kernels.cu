@@ -725,37 +725,26 @@ __global__ void QuantizeKernel(const float *__restrict__ in,
   for (; i < n; i += stride) {
     const double centered = static_cast<double>(in[i]) - offset;
     const double q = round(centered * scale);
-    // NO CLAMP. The planner sizes the width from the grid it actually
-    // encodes, so this is an invariant rather than a hope -- and a clamp
-    // turns a planner mistake into output that is corrupt but looks valid,
-    // which is how a 60% error-bound violation crossed a whole benchmark
-    // campaign unnoticed. Refuse the chunk instead.
-    if (q < lo || q > hi) { atomicExch(fail, 1); return; }  // 1 = width
+    // No clamp: the planner sizes the width from the grid it encodes, so an
+    // index outside it is a bug to report, not to hide.
+    if (q < lo || q > hi) { atomicExch(fail, 1); return; }
     out[i] = static_cast<OutT>(q);
-    // DequantizeKernel's expression verbatim -- multiply, add, then the float
-    // cast. NOT fma(): that is one rounding instead of two, so it is a
-    // different function, and verifying a decoder we do not ship proves
-    // nothing about the one we do. This check, not the step formula, is what
-    // makes a `true` return mean every element is inside error_bound.
+    // DequantizeKernel's expression verbatim, NOT fma() -- one rounding
+    // instead of two would verify a decoder we do not ship. This check, not
+    // the step formula, is what makes `true` mean every element is in bound.
     const float decoded = static_cast<float>(q * inv_scale + offset);
     if (fabs(static_cast<double>(decoded) - static_cast<double>(in[i])) >
         error_bound) {
-      atomicExch(fail, 2);  // 2 = bound; kept distinct from the width failure
-      return;               // because a width failure is a planner bug and a
-    }                       // bound failure is a property of the data
+      atomicExch(fail, 2);
+      return;
+    }
   }
 }
 
 /**
  * Half the float32 spacing at |x| -- the most a (float) cast can move a double
- * of that magnitude.
- *
- * From nextafterf rather than a fixed multiplier. `max_abs * 2.4e-7`, which
- * this replaces, is roughly 4x the true value at a typical magnitude and,
- * worse, is a fixed RATIO where the real quantity doubles at every binade
- * boundary. Callers pass a bound on the RECONSTRUCTION magnitude, not the
- * source magnitude: a reconstruction can land up to delta/2 outside the data
- * and cross into the next binade, where the spacing has already doubled.
+ * of that magnitude. From nextafterf, not a fixed ratio: the real quantity
+ * doubles at every binade boundary.
  */
 inline double HalfUlpFloat32(double x) {
   const float f = static_cast<float>(std::fabs(x));
@@ -885,9 +874,6 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
       num_elements == 0 || error_bound <= 0.0) {
     return false;
   }
-  // Every `return false` below records WHY. A refusal is routine -- the
-  // caller stores the chunk losslessly -- so without a reason the only symptom
-  // is a compression ratio that quietly got worse.
   out_params->refusal = QuantizeRefusal::kNone;
   const float *in = static_cast<const float *>(device_in);
   // Same per-thread stream the rest of this path uses; upstream's
@@ -903,11 +889,8 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
-  // Non-finite data has no usable min/max, and every guard below is blind to
-  // it: `range <= 0` is false for NaN, fmax IGNORES a NaN operand, and every
-  // comparison in the width ladder is false -- so a NaN used to pass the
-  // planner untouched and be clamped to the type maximum, arriving in the
-  // decoded output as a large finite number. Refuse instead.
+  // NaN defeats every guard below: `range <= 0` is false, fmax ignores a NaN
+  // operand, and the width comparisons are all false.
   if (!std::isfinite(data_min) || !std::isfinite(data_max)) {
     out_params->refusal = QuantizeRefusal::kNonFiniteRange;
     return false;
@@ -916,44 +899,21 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   const double data_range = data_max - data_min;
   const double max_abs = fmax(fabs(data_min), fabs(data_max));
 
-  // ---- The step, and why the bound can no longer be silently relaxed -----
-  //
-  // What this replaces subtracted a float32 representation reserve from the
-  // requested bound, and when the remainder went negative it INVENTED A
-  // LOOSER BOUND and quantized against that (`bound_achievable = false`, then
-  // carry on). That branch is the whole defect: on WarpX's E and j fields it
-  // substituted bounds up to 8,710x what the caller asked for, and 60.1% of
-  // stored chunks missed the guarantee while PSNR and SSIM both reported a
-  // perfect reconstruction.
-  //
-  // Here the step is chosen so the bound holds, or the chunk is refused. Two
-  // bounds on the reconstruction error are available and they are strongest in
-  // opposite regimes, so take the LARGER step the two of them permit:
-  //
-  //   delta_a = 2*(0.95*eb - ULP/2)   rounding contributes delta/2 and the
-  //                                   float cast at most ULP/2. Wins wherever
-  //                                   the spacing is small against the bound,
-  //                                   which is ordinary data -- and there it
-  //                                   reproduces the step this code already
-  //                                   used, so nothing that works today moves.
-  //
-  //   delta_b = 0.95*eb               the source x IS a float32 and the decoder
-  //                                   returns the NEAREST float32 to y, so it
-  //                                   cannot land further from y than x is:
-  //                                   |z-y| <= |x-y|, hence |z-x| <= 2|x-y| <=
-  //                                   delta. Holds at any spacing, which is
-  //                                   what keeps large-magnitude data
-  //                                   quantizable instead of relaxed.
-  //
-  // The reserve is taken at max_abs + error_bound rather than at max_abs: a
-  // reconstruction can land up to delta/2 outside the data and cross into the
-  // next binade, where the float32 spacing has already doubled.
+  // The step holds the bound, or the chunk is refused -- what this replaced
+  // substituted a looser bound and quantized against that. Two bounds on the
+  // reconstruction error apply, strongest in opposite regimes, so take the
+  // larger step they permit:
+  //   2*(0.95*eb - ULP/2)  rounding contributes delta/2, the float cast at
+  //                        most ULP/2. Wins where spacing is small.
+  //   0.95*eb              the decoder returns the nearest float32 to y, so
+  //                        it cannot land further from y than the float32
+  //                        source x is: |z-x| <= 2|x-y| <= delta. Holds at
+  //                        any spacing, which keeps large data quantizable.
+  // The reserve is taken at max_abs + eb, not max_abs: a reconstruction can
+  // land delta/2 outside the data and cross into the next binade.
   double delta;
   if (data_range == 0.0) {
-    // Constant chunk: every value IS data_min, so q = 0 reproduces it exactly
-    // and the step is arbitrary. The fictitious range of 1.0 substituted here
-    // before inflated the width and could report an achievable bound as
-    // unachievable -- for the commonest shape scientific data has.
+    // Every value IS data_min, so q = 0 reproduces it exactly.
     delta = 1.0;
   } else {
     const double half_ulp = HalfUlpFloat32(max_abs + error_bound);
@@ -964,9 +924,7 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     return false;
   }
 
-  // Width from the grid ACTUALLY encoded, so no clamp can occur. The 10% fudge
-  // this replaces existed to cover the gap between the requested bound and the
-  // effective one; with the step known there is no gap left to cover.
+  // Width from the grid actually encoded, so no clamp can occur.
   const double q_max_required = std::ceil(data_range / delta);
   int precision;
   if (q_max_required <= 127.0) {
@@ -976,20 +934,17 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   } else if (q_max_required <= 2147483647.0) {
     precision = 32;
   } else {
-    // The requested bound needs more index than int32 holds. Refuse: the
-    // caller's lossless path honours any bound at zero error, and a grid this
-    // fine costs more bits per value than the float32 it would replace.
+    // Finer than int32 can index, and finer than the float32 it replaces:
+    // the caller's lossless path is both smaller and exact.
     out_params->refusal = QuantizeRefusal::kIndexExceedsInt32;
     return false;
   }
   const double scale = 1.0 / delta;
-  // Derived exactly as DequantizeDevice derives it from the stored scale, so
-  // the in-kernel check below verifies the decoder we actually ship.
+  // As DequantizeDevice derives it, so the kernel checks the shipped decoder.
   const double inv_scale = 1.0 / scale;
   const size_t width = PrecisionToBytes(precision);
 
-  // Raised by the kernel when an index leaves the chosen width, or when a
-  // reconstructed element misses the bound. Either way the chunk is refused.
+  // 1 = an index left the width, 2 = an element missed the bound.
   int *d_fail = nullptr;
   if (cudaMallocAsync(&d_fail, sizeof(int), qstream) != cudaSuccess) {
     out_params->refusal = QuantizeRefusal::kDeviceError;
@@ -1039,10 +994,6 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     return false;
   }
 
-  // The contract, enforced rather than argued: some element did not survive
-  // its own decoder inside the bound, or an index left the chosen width. Say
-  // so, and let the caller store the chunk losslessly -- which honours any
-  // bound, at zero error.
   if (h_fail != 0) {
     out_params->refusal = (h_fail == 1) ? QuantizeRefusal::kIndexLeftWidth
                                         : QuantizeRefusal::kElementMissedBound;
@@ -1051,15 +1002,12 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
 
   *out_bytes = num_elements * width;
   out_params->error_bound = error_bound;
-  // Half the step: the quantization half-width, which is exactly what
-  // `scale = 1/(2*eff)` has always meant, so readers are unaffected.
+  // Half the step -- the half-width `scale = 1/(2*eff)` always meant.
   out_params->effective_error_bound = 0.5 * delta;
   out_params->scale = scale;
   out_params->data_min = data_min;
   out_params->data_max = data_max;
   out_params->precision = precision;
-  // Every success now honours the REQUESTED bound; there is no longer a
-  // state in which this function quantizes against one it substituted.
   out_params->bound_achievable = true;
   return true;
 }
