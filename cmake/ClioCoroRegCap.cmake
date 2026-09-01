@@ -190,9 +190,22 @@ function(clio_coro_regcap tgt)
   # recompile the real target rather than silently keeping the old ceiling.
   add_dependencies(${tgt} ${tgt}_regcaps)
   target_compile_options(${tgt} PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:-fpass-plugin=${_so}>
-      $<$<COMPILE_LANGUAGE:CUDA>:-mllvm>
-      $<$<COMPILE_LANGUAGE:CUDA>:-clio-coro-cap-file=${_caps}>)
+      $<$<COMPILE_LANGUAGE:CUDA>:-fpass-plugin=${_so}>)
+  # THE CAP FILE TRAVELS IN THE ENVIRONMENT, NOT IN -mllvm. clang loads an
+  # -fpass-plugin library in the backend but parses -mllvm into LLVM's cl
+  # registry before that, so on clang <= 19 the plugin's own option does not
+  # exist yet when the driver reads it and every TU dies with "Unknown command
+  # line argument '-clio-coro-cap-file=...'". A compiler launcher sets the
+  # variable for exactly this target's CUDA compiles instead; the plugin reads
+  # the option first and the variable second, so a newer clang is unaffected.
+  get_target_property(_launcher ${tgt} CUDA_COMPILER_LAUNCHER)
+  if(_launcher STREQUAL "_launcher-NOTFOUND" OR NOT _launcher)
+    set(_launcher "")   # an EMPTY leading element becomes `sh -c ""`: exit 127
+  else()
+    set(_launcher "${_launcher};")
+  endif()
+  set_target_properties(${tgt} PROPERTIES CUDA_COMPILER_LAUNCHER
+      "${_launcher}${CMAKE_COMMAND};-E;env;CLIO_CORO_CAP_FILE=${_caps}")
   foreach(_s IN LISTS _srcs)
     set_source_files_properties("${_s}" TARGET_DIRECTORY ${tgt}
                                 PROPERTIES OBJECT_DEPENDS "${_caps}")

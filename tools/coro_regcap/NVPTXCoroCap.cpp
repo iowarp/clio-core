@@ -33,9 +33,15 @@
 // that already declares an explicit nvvm.maxnreg keeps its own setting.
 //
 // Options (set by the CMake module, never by a user):
-//   -mllvm -clio-coro-cap-file=<path>   per-kernel caps, "<mangled> <n>" lines
-//   -mllvm -clio-coro-maxnreg=<n>       fallback for kernels absent from the
+//   CLIO_CORO_CAP_FILE=<path>           per-kernel caps, "<mangled> <n>" lines
+//   CLIO_CORO_MAXNREG=<n>               fallback for kernels absent from the
 //                                       file (0 = leave them alone)
+//
+// Both also exist as -mllvm options (-clio-coro-cap-file / -clio-coro-maxnreg)
+// and those win where they can be passed -- but only a clang new enough to
+// load an -fpass-plugin library BEFORE it parses -mllvm can pass them at all,
+// so the environment is what the build actually uses. See the note at the
+// read site.
 //
 // Usage: -fpass-plugin=/path/to/libNVPTXCoroCap.so (applies to the device
 // compilation of every -x cuda TU; host modules are skipped by triple).
@@ -50,8 +56,23 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 
-// The llvm-22-dev snapshot packages omit llvm/Passes/PassPlugin.h, so the
-// (ABI-stable since LLVM 8) plugin entry contract is declared here verbatim.
+// USE THE REAL HEADER WHEN THERE IS ONE. The struct layout has been stable
+// since LLVM 8, but LLVM_PLUGIN_API_VERSION IS NOT A CONSTANT: it is 1 up to
+// and including LLVM 19 and 2 from LLVM 20 on, and clang REFUSES a plugin
+// whose number does not match its own --
+//
+//   error: unable to load plugin '.../libNVPTXCoroCap.so': 'Wrong API version
+//   on plugin ... Got version 2, supported version is 1.'
+//
+// which is what a hardcoded 2 does to every clang 19 site (Delta builds this
+// tree with llvm/19.1.7 -- see
+// context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh). The
+// verbatim declaration below exists only because the llvm-22-dev snapshot
+// packages ship no llvm/Passes/PassPlugin.h at all; where the header is
+// present it is authoritative and carries the right version for that LLVM.
+#if __has_include("llvm/Passes/PassPlugin.h")
+#include "llvm/Passes/PassPlugin.h"
+#else
 #define LLVM_PLUGIN_API_VERSION 2
 extern "C" {
 struct PassPluginLibraryInfo {
@@ -61,6 +82,7 @@ struct PassPluginLibraryInfo {
   void (*RegisterPassBuilderCallbacks)(llvm::PassBuilder &);
 };
 }
+#endif
 
 #include <cstdlib>
 #include <deque>
@@ -116,8 +138,27 @@ struct NVPTXCoroCapPass : PassInfoMixin<NVPTXCoroCapPass> {
     if (!T.isNVPTX())
       return PreservedAnalyses::all();
 
-    const StringMap<unsigned> Caps = loadCaps(CoroCapFile);
-    const unsigned Fallback = CoroMaxNReg;
+    // THE ENVIRONMENT IS THE PRIMARY CHANNEL, not -mllvm. clang loads an
+    // -fpass-plugin library in the BACKEND, but parses -mllvm options into
+    // LLVM's cl registry long before that -- so up to and including clang
+    // 19 the option this plugin registers does not exist yet when the
+    // driver reads it, and the compile dies with
+    //
+    //   clang (LLVM option parsing): Unknown command line argument
+    //   '-clio-coro-cap-file=...'
+    //
+    // Newer clang loads pass plugins early enough for -mllvm to work,
+    // which is why the option is still registered and still wins when it
+    // is set. The env vars are what ClioCoroRegCap.cmake actually uses.
+    const char *EnvFile = std::getenv("CLIO_CORO_CAP_FILE");
+    const StringMap<unsigned> Caps = loadCaps(
+        !CoroCapFile.empty() ? StringRef(CoroCapFile)
+                             : StringRef(EnvFile ? EnvFile : ""));
+    unsigned Fallback = CoroMaxNReg;
+    if (Fallback == 0) {
+      if (const char *EnvReg = std::getenv("CLIO_CORO_MAXNREG"))
+        Fallback = static_cast<unsigned>(std::atoi(EnvReg));
+    }
     if (Caps.empty() && Fallback == 0)
       return PreservedAnalyses::all();
 
