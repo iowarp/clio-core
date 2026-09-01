@@ -6105,6 +6105,33 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     CLIO_CO_RETURN;
   }
 
+  // CAPACITY BUDGET FOR THE WHOLE FLUSH.
+  //
+  // Step 2 below FREES a blob's volatile blocks and republishes the blob
+  // BEFORE Step 3 re-puts the bytes to a persistent tier. Nothing rolls that
+  // back: the only remaining copy is the scratch buffer, which is freed at the
+  // end of the iteration. So a re-put that fails -- and on a tier with no room
+  // it fails with 10 + kCteAllocNoHealthyTarget = 12 -- DESTROYS the blob and
+  // reports it as a log line. A flush must therefore never begin on a blob the
+  // target tiers cannot be shown to have room for.
+  //
+  // (The re-put also cannot rescue itself: PlaceBlobBytes' make-room eviction
+  // retry is gated on kCtePutDroppable, which the flush context does not set.)
+  //
+  // registered_targets_ is the canonical map -- the put/free data path debits
+  // and credits remaining_space_ there, while target_list_ is a lazily
+  // refreshed mirror that lags real usage (see GetCapacity).
+  clio::run::u64 flush_budget = 0;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    for (const auto &pool_id : nonvolatile_targets) {
+      TargetInfo *tinfo = registered_targets_.find(pool_id);
+      if (tinfo != nullptr) {
+        flush_budget += tinfo->remaining_space_;
+      }
+    }
+  }
+
   // Collect blobs that have volatile blocks
   struct FlushEntry {
     std::string composite_key;
@@ -6158,12 +6185,35 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
        blobs_to_flush.size());
 
   // Flush each blob: read data, free volatile blocks, re-put with persistence
-  for (const auto &entry : blobs_to_flush) {
+  for (size_t entry_idx = 0; entry_idx < blobs_to_flush.size(); ++entry_idx) {
+    const auto &entry = blobs_to_flush[entry_idx];
     std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(entry.composite_key);
     if (!blob_info_ptr || blob_info_ptr->blocks_.empty()) continue;
 
     clio::run::u64 total_size = entry.total_size;
     if (total_size == 0) continue;
+
+    // Out of room on the persistent tiers. STOP -- do not attempt the blob and
+    // do not walk the rest. The budget only shrinks from here, so every
+    // further attempt is one more blob destroyed for one more failed put; the
+    // old behavior was to keep going and emit an error per blob, which is how
+    // a single undersized tier produced megabytes of log and a truncated
+    // dataset. One line naming the shortfall is what an operator can act on.
+    if (total_size > flush_budget) {
+      clio::run::u64 bytes_declined = 0;
+      for (size_t j = entry_idx; j < blobs_to_flush.size(); ++j) {
+        bytes_declined += blobs_to_flush[j].total_size;
+      }
+      HLOG(kError,
+           "FlushData: persistent tier(s) at level >= {} are full -- declined "
+           "{} of {} blob(s) ({} byte(s)); {} byte(s) free, next blob needs "
+           "{}. Flushed {} blob(s) ({} byte(s)) before stopping. The tier must "
+           "be at least as large as the data being flushed.",
+           target_level, blobs_to_flush.size() - entry_idx,
+           blobs_to_flush.size(), bytes_declined, flush_budget, total_size,
+           task->blobs_flushed_, task->bytes_flushed_);
+      break;
+    }
 
     // Step 1: Allocate buffer and read data from current blocks
     auto *ipc_manager = CLIO_IPC;
@@ -6290,11 +6340,26 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     CLIO_CO_AWAIT(put_task);
 
     if (put_task->GetReturnCode() != 0) {
-      HLOG(kError, "FlushData: PutBlob failed for blob {} (error {})",
-           entry.blob_name, put_task->GetReturnCode());
+      // The budget check above should have kept us out of here, so reaching
+      // this means the tier accounting was optimistic (a concurrent writer, or
+      // per-target fragmentation the summed remaining_space_ cannot see).
+      // Step 2 has already freed this blob's volatile blocks, so THE BYTES ARE
+      // GONE -- say so, and stop rather than feed the rest of the list to the
+      // same failure.
+      HLOG(kError,
+           "FlushData: PutBlob failed for blob {} (error {}) AFTER its volatile "
+           "blocks were freed -- {} byte(s) lost. Stopping the flush; {} blob(s) "
+           "remain unflushed.",
+           entry.blob_name, put_task->GetReturnCode(), total_size,
+           blobs_to_flush.size() - entry_idx - 1);
+      ipc_manager->FreeBuffer(buffer);
+      break;
     } else {
       task->blobs_flushed_++;
       task->bytes_flushed_ += total_size;
+      // Debit what this blob took, so the budget tracks the tier as the flush
+      // consumes it rather than only as it looked at the start.
+      flush_budget -= std::min(flush_budget, total_size);
     }
 
     ipc_manager->FreeBuffer(buffer);
