@@ -36,9 +36,24 @@ INK_2 = "#52514e"
 MUTED = "#898781"
 GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
-#: Categorical slots, fixed order. Never cycled: a fourth series folds into
-#: small multiples instead.
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]
+#: Categorical slots, FIXED ORDER, never cycled: a ninth series folds into
+#: "other" or small multiples rather than getting a generated hue.
+#:
+#: Validated as a 6-slot palette against this surface with the dataviz
+#: validator (scripts/validate_palette.js, --mode light):
+#:   lightness band   all inside L 0.43-0.77          PASS
+#:   chroma floor     all >= 0.1                      PASS
+#:   CVD separation   worst adjacent 9.1 protan, 5.8 tritan
+#:   normal vision    worst adjacent 19.6             PASS
+#:   contrast         aqua/yellow/magenta below 3:1 vs the surface
+#:
+#: The tritan 5.8 sits in the 6-8 floor band and the contrast check WARNs, so
+#: BOTH are conditional passes: a figure using more than three of these owes
+#: the reader a secondary identity channel. over_time() pays that with direct
+#: end labels on every line, which is why they are drawn even when a legend is
+#: present. Do not use four or more of these hues without one.
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+          "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 SEQ = LinearSegmentedColormap.from_list(
     "clio_blue", ["#cde2fb", "#86b6ef", "#3987e5", "#256abf", "#0d366b"])
 DIV = LinearSegmentedColormap.from_list(
@@ -457,16 +472,28 @@ class Figures:
     def benefit_vs_feature(self, pairs: pd.DataFrame, feature: str,
                            name: str, label: str,
                            target: str = "ratio") -> None:
-        """Signed delta against a property. Diverging colour, zero at neutral
-        gray, so help and harm are separable without reading the axis."""
-        col = f"d_{target}"
+        """Signed change against a property, as a FRACTION of the chunk's own
+        ratio -- not the absolute difference.
+
+        The absolute delta is the right statistic for the summary table, where
+        pairing cancels chunk difficulty. On a scatter ACROSS chunks it is
+        not: these ratios span 1x to 6223x, so an absolute axis is set
+        entirely by the handful of near-constant chunks. On the Nyx log a
+        quantized chunk going 4120x -> 3173x plots at -947 and drags every
+        ordinary chunk into a flat band at zero, reading as catastrophic
+        damage when the change is -23%. rel_ratio is the same measurement in
+        units that do not depend on how compressible the chunk happens to be;
+        paired_analysis computes it already.
+        """
+        col = f"rel_{target}" if f"rel_{target}" in pairs else f"d_{target}"
+        relative = col.startswith("rel_")
         if pairs.empty or col not in pairs or feature not in pairs:
             return self._skip(name, "no paired comparison available")
         d = pairs[[feature, col, "lib_name"]].replace(
             [np.inf, -np.inf], np.nan).dropna()
         if len(d) < MIN_POINTS:
             return self._skip(name, f"only {len(d)} pairs")
-        v = d[col].to_numpy(dtype=float)
+        v = d[col].to_numpy(dtype=float) * (100.0 if relative else 1.0)
         fig, ax = plt.subplots(figsize=(5.8, 3.8))
         # Sign is the question ("does it help?"), so sign is what carries the
         # colour -- two categorical slots with a legend. A continuous
@@ -479,12 +506,22 @@ class Figures:
             ax.scatter(d[feature].to_numpy()[m], v[m], s=24, alpha=0.75,
                        color=c, edgecolor=SURFACE, linewidth=0.5, label=lab)
         ax.axhline(0.0, color=INK_2, linewidth=1.2, zorder=1)
+        if relative:
+            # Symlog: the gains run to thousands of percent on chunks the
+            # setting rescues, the losses are bounded below by -100%, and the
+            # bulk sits within a few percent of zero. A linear axis shows one
+            # of those three; a plain log cannot cross zero.
+            ax.set_yscale("symlog", linthresh=10, linscale=0.6)
         ax.set_xlabel(_axis_label(feature))
-        ax.set_ylabel(f"change in {target}  (setting on - setting off,\n"
-                  f"same chunk)")
+        ax.set_ylabel(f"change in {target}, % of the chunk's own {target}\n"
+                      f"(setting on vs off, same chunk)" if relative else
+                      f"change in {target}  (setting on - setting off,\n"
+                      f"same chunk)")
         helps = float(100.0 * (v > 0).mean())
+        med = float(np.median(v))
         ax.set_title(f"{label}: change in {target} vs {_axis_label(feature)}\n"
-                     f"{helps:.0f}% of {len(d)} controlled pairs improve")
+                     f"{helps:.0f}% of {len(d)} controlled pairs improve"
+                     + (f"; median {med:+.1f}%" if relative else ""))
         ax.legend(loc="best")
         _finish(ax)
         self._save(fig, name)
@@ -559,6 +596,14 @@ class Figures:
     #: Fixed hue order for the three codec classes. Assigned by CLASS, never
     #: cycled, so a codec keeps its colour when the set of codecs changes.
     CLASS_ORDER = ("order-blind", "at the bound", "order-sensitive")
+    #: The same three classes said in words a reader does not have to look up.
+    #: The short names are what the TABLES use and what the code selects on;
+    #: a legend is read once, in isolation, so it gets the long form.
+    CLASS_LEGEND = {
+        "order-blind": "never beats the prediction\n(reads the histogram only)",
+        "at the bound": "beats it slightly\n(order buys a few percent)",
+        "order-sensitive": "beats it substantially\n(order is worth a lot)",
+    }
 
     def entropy_bound_scatter(self, bound_rows: pd.DataFrame,
                               order: pd.DataFrame, name: str) -> None:
@@ -587,7 +632,7 @@ class Figures:
         d = d.assign(_cls=d["lib_name"].map(cls).fillna("order-sensitive"))
         d["_bound"] = 8.0 / d["entropy"]
 
-        fig, ax = plt.subplots(figsize=(6.0, 4.4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.0))
         # Independent limits, not a forced square. The bound spans ~1 decade
         # here and the ratio ~3, so equal ranges would leave most of the
         # canvas empty; the diagonal is still exactly the locus ratio = 8/H,
@@ -602,41 +647,64 @@ class Figures:
             g = d[d["_cls"] == c]
             if g.empty:
                 continue
-            ax.scatter(g["_bound"], g["ratio"], s=30, alpha=0.75,
-                       color=SERIES[i], edgecolor=SURFACE, linewidth=0.9,
-                       label=c, zorder=3)
+            ax.scatter(g["_bound"], g["ratio"], s=22, alpha=0.45,
+                       color=SERIES[i], edgecolor="none",
+                       label=self.CLASS_LEGEND.get(c, c), zorder=3)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlim(xlo, xhi)
         ax.set_ylim(ylo, yhi)
-        ax.set_xlabel("entropy bound  8 / H   (H = bits per byte)")
-        ax.set_ylabel("achieved compression ratio")
-        ax.set_title("Everything above the line is contributed by ORDER\n"
-                     f"lossless, unshuffled · n = {len(d)} (chunk, codec) "
-                     f"measurements")
+        rel = d["ratio"] / d["_bound"]
+        med = float(np.median(rel))
+        q1, q3 = (float(rel.quantile(0.25)), float(rel.quantile(0.75)))
+        ax.set_xlabel("ratio ENTROPY PREDICTS for this chunk   "
+                      "(8 / H, H = bits per byte)")
+        ax.set_ylabel("ratio the codec ACTUALLY ACHIEVED")
+        ax.set_title("What entropy predicts is what the codec gets"
+                     f"\nachieved / predicted: median {med:.2f}, "
+                     f"half of the rows in {q1:.2f}-{q3:.2f} · "
+                     f"n = {len(d):,} (chunk, codec) rows")
         # Direct label ON the reference line, anchored to a point of the line
         # itself rather than floating in a corner, so the dashed guide is not
         # something the reader has to decode from the legend.
         xa = float(np.sqrt(xlo * xhi))
         if ylo < xa < yhi:
-            # A leader to the line itself: parking the caption in free space
-            # and pointing at the guide beats hunting for a gap in the cloud
-            # big enough to hold three words.
-            ax.annotate("ratio = 8 / H\nthe limit for a coder\n"
-                        "that reads no order",
-                        xy=(xa, xa), xycoords="data",
-                        xytext=(0.58, 0.06), textcoords="axes fraction",
-                        fontsize=8, color=INK_2, va="bottom", ha="left",
-                        arrowprops=dict(arrowstyle="-", color=INK_2,
-                                        linewidth=0.8, alpha=0.6,
-                                        shrinkA=2, shrinkB=2))
-        ax.annotate("ORDER contributes\neverything up here",
-                    xy=(0.03, 0.97), xycoords="axes fraction", fontsize=8,
-                    color=INK_2, va="top", ha="left")
+            # Label the diagonal ON the diagonal, rotated to lie along it.
+            # A leader line from a corner had to cross the point cloud, so
+            # the reader traced an arrow before the line meant anything.
+            # The angle is measured in DISPLAY space: the axes are log-log
+            # but not square, so the diagonal is not drawn at 45 degrees.
+            fig.canvas.draw()
+            p0 = ax.transData.transform((xa, xa))
+            p1 = ax.transData.transform((xa * 4, xa * 4))
+            ang = float(np.degrees(np.arctan2(p1[1] - p0[1], p1[0] - p0[0])))
+            ax.text(xa, xa, " achieved = predicted ",
+                    rotation=ang, rotation_mode="anchor", ha="center",
+                    va="center", fontsize=8.5, color=INK_2, zorder=4,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor=SURFACE,
+                              edgecolor="none", alpha=0.85))
+        # Say what each HALF of the plot means. Without this a reader has to
+        # derive "above the line = the codec found structure entropy cannot
+        # see" from the axis names, which is the step that was being skipped.
+        # Boxed, because both halves are occupied by points -- there is no
+        # empty corner to retreat to.
+        box = dict(boxstyle="round,pad=0.3", facecolor=SURFACE,
+                   edgecolor=GRID, alpha=0.88)
+        ax.annotate("ABOVE: the codec beat the prediction\n"
+                    "by finding repeated SEQUENCES,\n"
+                    "which a byte histogram cannot see",
+                    xy=(0.02, 0.98), xycoords="axes fraction", fontsize=7.8,
+                    color=INK, va="top", ha="left", zorder=5, bbox=box)
+        ax.annotate("BELOW: it fell short of the prediction",
+                    xy=(0.98, 0.03), xycoords="axes fraction", fontsize=7.8,
+                    color=INK, va="bottom", ha="right", zorder=5, bbox=box)
         # Legend below the axes: the lower-right corner is where the reference
         # line's own caption has to go, and the two collided there.
-        ax.legend(title="codec behaviour", title_fontsize=8, ncol=3,
-                  loc="upper center", bbox_to_anchor=(0.5, -0.17))
+        leg = ax.legend(title="codec behaviour", title_fontsize=8, ncol=3,
+                        loc="upper center", bbox_to_anchor=(0.5, -0.17))
+        for h in leg.legend_handles:
+            h.set_alpha(1.0)
+            h.set_sizes([44])
         _finish(ax)
         self._save(fig, name)
 
@@ -663,16 +731,25 @@ class Figures:
                         solid_capstyle="round", zorder=2)
             ax.scatter([lo], [i], s=64, color=c, edgecolor=SURFACE,
                        linewidth=1.0, zorder=3)
-            ax.annotate(f"{lo:.2f}x", xy=(lo, i), xytext=(0, 9),
-                        textcoords="offset points", fontsize=8, color=INK_2,
-                        ha="center")
+            # Above the dot, on an opaque chip. Every median sits within a
+            # few percent of 1.0, so the label lands on the reference line
+            # whatever the offset; masking the line under the text is what
+            # keeps it readable. (Sideways instead runs it into the codec
+            # names on the y axis.)
+            ax.annotate(f"{lo:.2f}x", xy=(lo, i), xytext=(0, 10),
+                        textcoords="offset points", fontsize=8, color=INK,
+                        ha="center", va="center", zorder=5,
+                        bbox=dict(boxstyle="round,pad=0.16",
+                                  facecolor=SURFACE, edgecolor="none"))
         ax.set_yticks(y)
         ax.set_yticklabels(d["lib_name"])
         ax.set_xscale("log")
-        ax.set_xlabel("achieved ratio / entropy bound   "
-                      "(dot = median, bar to this codec's maximum)")
-        ax.set_title("How far past the byte histogram each codec reaches\n"
-                     "left of the dashed line = never beats 8/H")
+        ax.set_xlabel("how many times its OWN entropy prediction the codec "
+                      "reached\n(dot = typical chunk, bar out to its best "
+                      "chunk)")
+        ax.set_title("Can a codec beat what entropy predicts?  Barely.\n"
+                     "1.0 = exactly the prediction · left of it = never "
+                     "beats it · right = beats it")
         ax.margins(y=0.06)
         # Hue carries the class, so it needs a key: without one, identity
         # would rest on colour alone.
@@ -681,10 +758,12 @@ class Figures:
             ax.legend(handles=[
                 plt.Line2D([], [], marker="o", linestyle="none", markersize=7,
                            markerfacecolor=SERIES[self.CLASS_ORDER.index(c)],
-                           markeredgecolor=SURFACE, label=c)
+                           markeredgecolor=SURFACE,
+                           label=self.CLASS_LEGEND.get(c, c))
                 for c in present],
                 title="codec behaviour", title_fontsize=8, ncol=len(present),
-                loc="upper center", bbox_to_anchor=(0.5, -0.14))
+                loc="upper center", bbox_to_anchor=(0.5, -0.20),
+                fontsize=7.5)
         _finish(ax)
         self._save(fig, name)
 
@@ -869,21 +948,27 @@ class Figures:
         flds = sorted(d["field"].dropna().unique())
         if d["timestep"].nunique() < 3 or not flds:
             return self._skip(name, "fewer than three timesteps")
-        fig, ax = plt.subplots(figsize=(5.8, 3.6))
-        # More fields than validated hues: one hue, direct end labels for
-        # identity. That is the documented relief for a capped palette.
-        one_hue = len(flds) > 3
+        fig, ax = plt.subplots(figsize=(6.6, 3.8))
+        # One hue per field while the validated palette lasts; past it, a
+        # single hue, because a generated ninth colour is not validated
+        # against the others for CVD separation.
+        one_hue = len(flds) > len(SERIES)
+        # End labels are NOT optional above three hues: the palette's worst
+        # adjacent pair is 5.8 tritan and three of its slots warn on contrast,
+        # so colour alone is not a sufficient identity channel there.
+        want_ends = one_hue or len(flds) > 3
         ends = []
         for i, f in enumerate(flds):
             s = d[d["field"] == f].sort_values("timestep")
             color = SERIES[0] if one_hue else SERIES[i]
             ax.plot(s["timestep"], s[col], color=color, linewidth=2.0,
                     marker="o", markersize=4, markeredgecolor=SURFACE,
-                    alpha=0.85 if not one_hue else 0.7,
+                    alpha=0.7 if one_hue else 0.9,
                     label=None if one_hue else str(f))
-            if one_hue and len(s):
+            if want_ends and len(s):
                 ends.append((float(s["timestep"].iloc[-1]),
-                             float(s[col].iloc[-1]), str(f)))
+                             float(s[col].iloc[-1]), str(f),
+                             SERIES[0] if one_hue else SERIES[i]))
         if logy:
             ax.set_yscale("log")
         # Direct end labels are the identity channel once there are more
@@ -894,7 +979,8 @@ class Figures:
         if ends:
             _label_ends(ax, ends)
         if not one_hue and len(flds) >= 2:
-            ax.legend(title="field", loc="best", title_fontsize=8)
+            ax.legend(title="field", loc="best", title_fontsize=8,
+                      ncol=2 if len(flds) > 4 else 1, fontsize=7)
         ax.set_xlabel("timestep")
         ax.set_ylabel(ylabel)
         ax.set_title(f"{ylabel} over simulation time")
@@ -947,17 +1033,23 @@ def _label_ends(ax, ends, min_gap_px: float = 14.0) -> None:
     """
     ax.figure.canvas.draw()
     tr = ax.transData
-    pts = sorted(((tr.transform((x, y))[1], x, y, t) for x, y, t in ends),
-                 key=lambda p: p[0])
+    # An entry may carry its line's colour. When it does the label is drawn in
+    # that colour and its leader matches, so the label is a real second
+    # identity channel rather than grey text that still has to be traced back
+    # to a line by eye -- which is the whole point of drawing it at all when
+    # the palette's CVD separation is only a conditional pass.
+    norm = [(e[0], e[1], e[2], e[3] if len(e) > 3 else None) for e in ends]
+    pts = sorted(((tr.transform((x, y))[1], x, y, t, c)
+                  for x, y, t, c in norm), key=lambda p: p[0])
     prev = -1e9
-    for dy, x, y, t in pts:
+    for dy, x, y, t, c in pts:
         ny = max(dy, prev + min_gap_px)
         prev = ny
         shift = ny - dy
         ax.annotate(t, xy=(x, y), xytext=(9, shift),
-                    textcoords="offset points", fontsize=7.5, color=INK_2,
-                    va="center", annotation_clip=False,
-                    arrowprops=(dict(arrowstyle="-", color=MUTED,
+                    textcoords="offset points", fontsize=7.5,
+                    color=c or INK_2, va="center", annotation_clip=False,
+                    arrowprops=(dict(arrowstyle="-", color=c or MUTED,
                                      linewidth=0.6, shrinkA=0, shrinkB=2)
                                 if shift > 1.0 else None))
     ax.margins(x=0.18)
