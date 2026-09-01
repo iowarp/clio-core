@@ -730,7 +730,7 @@ __global__ void QuantizeKernel(const float *__restrict__ in,
     // turns a planner mistake into output that is corrupt but looks valid,
     // which is how a 60% error-bound violation crossed a whole benchmark
     // campaign unnoticed. Refuse the chunk instead.
-    if (q < lo || q > hi) { atomicExch(fail, 1); return; }
+    if (q < lo || q > hi) { atomicExch(fail, 1); return; }  // 1 = width
     out[i] = static_cast<OutT>(q);
     // DequantizeKernel's expression verbatim -- multiply, add, then the float
     // cast. NOT fma(): that is one rounding instead of two, so it is a
@@ -740,9 +740,9 @@ __global__ void QuantizeKernel(const float *__restrict__ in,
     const float decoded = static_cast<float>(q * inv_scale + offset);
     if (fabs(static_cast<double>(decoded) - static_cast<double>(in[i])) >
         error_bound) {
-      atomicExch(fail, 1);
-      return;
-    }
+      atomicExch(fail, 2);  // 2 = bound; kept distinct from the width failure
+      return;               // because a width failure is a planner bug and a
+    }                       // bound failure is a property of the data
   }
 }
 
@@ -885,6 +885,10 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
       num_elements == 0 || error_bound <= 0.0) {
     return false;
   }
+  // Every `return false` below records WHY. A refusal is routine -- the
+  // caller stores the chunk losslessly -- so without a reason the only symptom
+  // is a compression ratio that quietly got worse.
+  out_params->refusal = QuantizeRefusal::kNone;
   const float *in = static_cast<const float *>(device_in);
   // Same per-thread stream the rest of this path uses; upstream's
   // quantize_simple likewise takes a stream and waits only on it.
@@ -896,6 +900,7 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   // On the caller's stream too, so a sweep's reductions do not all queue up
   // behind one another on the shared per-thread stream.
   if (!DeviceMinMax(in, num_elements, &data_min, &data_max, qstream)) {
+    out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
   // Non-finite data has no usable min/max, and every guard below is blind to
@@ -903,7 +908,10 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   // comparison in the width ladder is false -- so a NaN used to pass the
   // planner untouched and be clamped to the type maximum, arriving in the
   // decoded output as a large finite number. Refuse instead.
-  if (!std::isfinite(data_min) || !std::isfinite(data_max)) return false;
+  if (!std::isfinite(data_min) || !std::isfinite(data_max)) {
+    out_params->refusal = QuantizeRefusal::kNonFiniteRange;
+    return false;
+  }
 
   const double data_range = data_max - data_min;
   const double max_abs = fmax(fabs(data_min), fabs(data_max));
@@ -951,7 +959,10 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     const double half_ulp = HalfUlpFloat32(max_abs + error_bound);
     delta = fmax(2.0 * (0.95 * error_bound - half_ulp), 0.95 * error_bound);
   }
-  if (!(delta > 0.0)) return false;
+  if (!(delta > 0.0)) {
+    out_params->refusal = QuantizeRefusal::kStepNotPositive;
+    return false;
+  }
 
   // Width from the grid ACTUALLY encoded, so no clamp can occur. The 10% fudge
   // this replaces existed to cover the gap between the requested bound and the
@@ -968,6 +979,7 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
     // The requested bound needs more index than int32 holds. Refuse: the
     // caller's lossless path honours any bound at zero error, and a grid this
     // fine costs more bits per value than the float32 it would replace.
+    out_params->refusal = QuantizeRefusal::kIndexExceedsInt32;
     return false;
   }
   const double scale = 1.0 / delta;
@@ -980,10 +992,12 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   // reconstructed element misses the bound. Either way the chunk is refused.
   int *d_fail = nullptr;
   if (cudaMallocAsync(&d_fail, sizeof(int), qstream) != cudaSuccess) {
+    out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
   if (cudaMemsetAsync(d_fail, 0, sizeof(int), qstream) != cudaSuccess) {
     cudaFreeAsync(d_fail, qstream);
+    out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
 
@@ -1007,24 +1021,33 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   }
   if (cudaGetLastError() != cudaSuccess) {
     cudaFreeAsync(d_fail, qstream);
+    out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
   int h_fail = 0;
   if (cudaMemcpyAsync(&h_fail, d_fail, sizeof(int), cudaMemcpyDeviceToHost,
                       qstream) != cudaSuccess) {
     cudaFreeAsync(d_fail, qstream);
+    out_params->refusal = QuantizeRefusal::kDeviceError;
     return false;
   }
   cudaFreeAsync(d_fail, qstream);
   // Stream-scoped, matching upstream's quantize_simple, which takes a stream
   // and synchronizes only it (quantization_kernels.cu).
-  if (cudaStreamSynchronize(qstream) != cudaSuccess) return false;
+  if (cudaStreamSynchronize(qstream) != cudaSuccess) {
+    out_params->refusal = QuantizeRefusal::kDeviceError;
+    return false;
+  }
 
   // The contract, enforced rather than argued: some element did not survive
   // its own decoder inside the bound, or an index left the chosen width. Say
   // so, and let the caller store the chunk losslessly -- which honours any
   // bound, at zero error.
-  if (h_fail != 0) return false;
+  if (h_fail != 0) {
+    out_params->refusal = (h_fail == 1) ? QuantizeRefusal::kIndexLeftWidth
+                                        : QuantizeRefusal::kElementMissedBound;
+    return false;
+  }
 
   *out_bytes = num_elements * width;
   out_params->error_bound = error_bound;

@@ -120,6 +120,52 @@ inline int ComputeRequiredPrecision(double data_range,
 
 
 /**
+ * @brief Why QuantizeDevice() declined to quantize a chunk.
+ *
+ * A refusal is a routine outcome, not an error: the caller stores the chunk
+ * losslessly, which honours any bound at zero error. It still has to be
+ * reportable, because otherwise the single symptom is a compression ratio
+ * that quietly got worse, with nothing saying the bound was the cause.
+ */
+enum class QuantizeRefusal : int {
+  kNone = 0,           /**< Quantized; the requested bound holds */
+  kNonFiniteRange,     /**< min/max not finite, so no grid is definable */
+  kStepNotPositive,    /**< No positive step exists (defensive; eb > 0 is
+                            checked on entry, so this should be unreachable) */
+  kIndexExceedsInt32,  /**< The bound needs a finer grid than int32 indexes */
+  kIndexLeftWidth,     /**< An index left the chosen width -- a planner bug,
+                            impossible by construction, reported not clamped */
+  kElementMissedBound, /**< An element missed the bound through the decoder
+                            this build actually ships */
+  kDeviceError,        /**< CUDA allocation, launch or copy failed. A property
+                            of the machine, not of the data or the bound */
+  kNoCudaSupport,      /**< Built without CUDA; there is no device path */
+};
+
+/** @brief Human-readable form of a QuantizeRefusal, for logs. */
+inline const char *QuantizeRefusalName(QuantizeRefusal reason) {
+  switch (reason) {
+    case QuantizeRefusal::kNone:
+      return "none";
+    case QuantizeRefusal::kNonFiniteRange:
+      return "data range is not finite";
+    case QuantizeRefusal::kStepNotPositive:
+      return "no positive quantization step exists for this bound";
+    case QuantizeRefusal::kIndexExceedsInt32:
+      return "bound needs a finer grid than int32 can index";
+    case QuantizeRefusal::kIndexLeftWidth:
+      return "an index left the chosen width (planner bug)";
+    case QuantizeRefusal::kElementMissedBound:
+      return "an element missed the bound through its own decoder";
+    case QuantizeRefusal::kDeviceError:
+      return "CUDA error";
+    case QuantizeRefusal::kNoCudaSupport:
+      return "built without CUDA support";
+  }
+  return "unknown";
+}
+
+/**
  * @brief Parameters a reader needs to invert a device quantization.
  *
  * Mirrors the fields NeuroPress stores in its own header
@@ -134,7 +180,12 @@ struct DeviceQuantizeParams {
   double data_min = 0.0;         /**< Minimum of the original data */
   double data_max = 0.0;         /**< Maximum of the original data */
   int precision = 0;             /**< 8, 16 or 32 bits per value */
-  bool bound_achievable = true;  /**< False if eb was below float32 precision */
+  bool bound_achievable = true;  /**< Always true on success: QuantizeDevice
+                                      no longer has a state in which it
+                                      quantizes against a substituted bound */
+  QuantizeRefusal refusal = QuantizeRefusal::kNone; /**< Set on every false
+                                      return, so a caller can log WHY a chunk
+                                      fell back to lossless */
 };
 
 /**
@@ -166,7 +217,12 @@ struct DeviceQuantizeParams {
  *                    computed. The wait is scoped to `stream`, so it blocks
  *                    only this candidate -- slots already launched keep
  *                    running.
- * @return false if unsupported, if CUDA failed, or if CUDA is not compiled in.
+ * @return true only if EVERY element round-trips through DequantizeDevice
+ *         within error_bound -- the kernel checks each one rather than
+ *         trusting the step arithmetic. False if the bound cannot be honored,
+ *         if CUDA failed, or if CUDA is not compiled in; in every false case
+ *         out_params->refusal says which, and the caller is expected to store
+ *         the chunk losslessly, honouring the bound at zero error.
  */
 bool QuantizeDevice(const void *device_in, size_t num_elements,
                     double error_bound, void *device_out, size_t *out_bytes,

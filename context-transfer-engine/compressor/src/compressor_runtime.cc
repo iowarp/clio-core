@@ -130,22 +130,25 @@ inline uint32_t UnpackVersion(uint32_t packed) {
  * undefined" sentinel and the value that makes the SGD skip the head.
  */
 /**
- * Say so, ONCE, when the quantizer could not honour the requested bound.
+ * Say so when the quantizer declined a chunk, and say which reason.
  *
- * `bound_achievable` goes false when eb - max|v|*2.4e-7 - 0.05*eb <= 0: the
- * allowance for float32 representation error is derived from the chunk's
- * LARGEST magnitude, so a chunk that mixes large values with a tight bound
- * lands here even where the individual values are finely representable. The
- * quantizer then relaxes the bound instead of failing, which is upstream's
- * behaviour ("Using maximum precision quantization (error may exceed bound)").
+ * This replaces WarnIfBoundUnachievable, which fired when QuantizeDevice
+ * quantized against a bound it had SUBSTITUTED for the requested one. That
+ * state no longer exists -- the quantizer now honours the bound or refuses --
+ * so the warning it emitted became unreachable, and the condition worth
+ * reporting inverted: a refusal.
  *
- * Until this existed the condition was recorded at kDebug only, so a run at a
- * normal log level applied a bound several times looser than asked for and
- * said nothing -- and the PSNR beside it could not reveal that either, being
- * derived from the REQUESTED bound rather than from the decoded values.
+ * A refusal is not an error. The chunk is stored losslessly, so the bound
+ * still holds, at zero error. But it is otherwise INVISIBLE: the success
+ * trace and the kDebug line below both sit inside the success branch, so
+ * before this the only evidence a bound had gone unmet was a compression
+ * ratio that got worse with nothing saying why.
  *
- * Both quantize paths (device and host fallback) call this, so the warning
- * does not depend on which one a chunk happened to take.
+ * Per-chunk detail goes to the path trace and to kDebug. The kWarning fires
+ * once per distinct reason, because a workload that refuses one chunk
+ * generally refuses thousands of them for the same reason -- WarpX's E and j
+ * fields refuse every chunk at eb=0.05 -- and repeating it per chunk would
+ * bury the run's other output.
  */
 /**
  * True when CLIO_NEUROPRESS_REQUIRE_DEVICE demands that every chunk reach the
@@ -231,23 +234,28 @@ inline bool NeuroPressRequireDevice() {
   return on;
 }
 
-inline void WarnIfBoundUnachievable(bool achievable, double requested,
-                                    double effective) {
-  if (achievable) return;
-  static std::atomic<bool> warned{false};
-  if (warned.exchange(true)) return;  // per process; this fires per chunk
-  // Deliberately NOT phrased as "exceeds by Nx": the fallback picks
-  // max(range/4e9, float_repr_error*0.1), which can land either side of the
-  // requested bound. What is true in every case is that the guarantee no
-  // longer holds -- so report both numbers and say that, rather than a ratio
-  // that reads as nonsense when the effective bound is the tighter one.
+inline void ReportQuantizeRefusal(
+    ctp::compress::preprocess::QuantizeRefusal reason, double requested,
+    size_t chunk_bytes) {
+  const char *why =
+      ctp::compress::preprocess::QuantizeRefusalName(reason);
+  CLIO_PATH_TRACE("WRITE  QuantizeDevice REFUSED %llu bytes eb=%g reason=%s",
+                  (unsigned long long)chunk_bytes, requested, why);
+  HLOG(kDebug,
+       "NeuroPress quantize: refused a {}-byte chunk at eb={} ({}); storing it "
+       "losslessly",
+       chunk_bytes, requested, why);
+  // One bit per reason, so a second reason still gets its own line.
+  static std::atomic<uint32_t> seen{0};
+  const uint32_t bit = 1u << static_cast<int>(reason);
+  if (seen.fetch_or(bit) & bit) return;
   HLOG(kWarning,
-       "NeuroPress quantize: the requested error bound {} is NOT achievable on "
-       "this data; quantizing to an effective bound of {} instead, so the "
-       "round trip is NO LONGER GUARANTEED to stay within what was asked for. "
-       "Measure it with the field-replay driver's --check-bound. Further "
-       "occurrences suppressed.",
-       requested, effective);
+       "NeuroPress quantize: the requested error bound {} cannot be honored on "
+       "this data ({}). Those chunks are stored LOSSLESSLY instead -- the "
+       "bound still holds, at zero error -- but their compression ratio is the "
+       "lossless one. Further chunks refused for this reason are logged at "
+       "debug level only.",
+       requested, why);
 }
 
 inline double AnalyticalPsnr(double data_range, double error_bound) {
@@ -1935,6 +1943,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // Device shuffle scratch for the explored candidates; released
           // together once the loop is done.
           std::vector<ctp::ipc::AllocatorId> explore_gpu_scratch;
+          // Exploration is where quantization is usually decided: when the
+          // NN ranks a lossless action first, the primary path never calls
+          // QuantizeDevice at all, and a refusal would otherwise go
+          // unreported. Once per chunk, not once per candidate -- 16 of the
+          // 32 actions request quantization and they all refuse together.
+          bool alt_refusal_reported = false;
 
           // Best explored alternative so far, if any beat the primary.
           // Upstream rewrites the output buffer in place each time it finds
@@ -2072,6 +2086,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   alt_input = alt_q_buf;
                   alt_compress_size = alt_q_bytes;
                   alt_applied_quant = true;
+                } else if (!alt_refusal_reported) {
+                  alt_refusal_reported = true;
+                  ReportQuantizeRefusal(alt_quant_params.refusal,
+                                        context.error_bound_, chunk_size);
                 }
               }
             } else if (alt_want_quant) {
@@ -3022,14 +3040,15 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
             quant_params.effective_error_bound);
         HLOG(kDebug,
              "NeuroPress quantize: {} -> {} bytes (precision={} eb={} "
-             "effective_eb={} achievable={})",
+             "effective_eb={})",
              input_size, quant_bytes, quant_params.precision,
-             context.error_bound_, quant_params.effective_error_bound,
-             quant_params.bound_achievable);
-        WarnIfBoundUnachievable(quant_params.bound_achievable,
-                                context.error_bound_,
-                                quant_params.effective_error_bound);
+             context.error_bound_, quant_params.effective_error_bound);
       } else if (!quant_device_alloc.IsNull()) {
+        // QuantizeDevice ran and declined -- the only branch that knows it,
+        // since the chunk is about to be compressed losslessly and nothing
+        // downstream records that quantization was ever asked for.
+        ReportQuantizeRefusal(quant_params.refusal, context.error_bound_,
+                              input_size);
         CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, quant_device_alloc);
         quant_device_alloc = ctp::ipc::AllocatorId();
       }

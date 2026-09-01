@@ -31,7 +31,8 @@ bool ByteUnshuffleDevice(const void *, void *, size_t, size_t) { return false; }
 
 /** Same contract: no device, so no device quantization. */
 bool QuantizeDevice(const void *, size_t, double, void *, size_t *,
-                    DeviceQuantizeParams *, void *) {
+                    DeviceQuantizeParams *out_params, void *) {
+  if (out_params) out_params->refusal = QuantizeRefusal::kNoCudaSupport;
   return false;
 }
 bool DequantizeDevice(const void *, size_t, const DeviceQuantizeParams &,
