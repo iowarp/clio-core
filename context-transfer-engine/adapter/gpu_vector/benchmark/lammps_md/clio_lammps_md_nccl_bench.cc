@@ -1007,17 +1007,36 @@ int main(int argc, char **argv) {
   u64 n_halo = 0;
   const bool need_halo = (npes > 1) || a.force_halo;
   {
-    // One GPU per rank, checked before NCCL can deadlock on it. NCCL refuses
-    // two ranks naming the same device, and on a single-GPU host that is
-    // every multi-rank configuration -- so say so plainly here rather than
-    // let ncclCommInitRank fail with "Duplicate GPU" several frames deeper.
-    if (npes > 1 && ndev < npes) {
+    // One GPU per rank ON A NODE, checked before NCCL can deadlock on it.
+    // NCCL refuses two ranks naming the same device, and on a single-GPU
+    // host that is every multi-rank configuration -- so say so plainly here
+    // rather than let ncclCommInitRank fail with "Duplicate GPU" several
+    // frames deeper.
+    //
+    // THE COMPARISON IS NODE-LOCAL, and getting that wrong is why this bench
+    // was skipped rather than run for the whole distributed campaign. `ndev`
+    // counts the devices visible on THIS node; comparing it against the
+    // GLOBAL rank count made 2 nodes x 1 rank x 1 GPU look like an
+    // oversubscribed single host, and the bench returned 77 (skip) on a
+    // configuration that is perfectly valid -- each rank owning the only GPU
+    // on its own node. Split the communicator by shared memory and compare
+    // like with like.
+    int local_ranks = 1;
+    {
+      MPI_Comm node_comm = MPI_COMM_NULL;
+      MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0,
+                          MPI_INFO_NULL, &node_comm);
+      MPI_Comm_size(node_comm, &local_ranks);
+      MPI_Comm_free(&node_comm);
+    }
+    if (local_ranks > 1 && ndev < local_ranks) {
       if (root) {
         std::fprintf(stderr,
-                     "NCCL needs one GPU per rank: %d ranks but %d visible "
-                     "device(s). Run on a multi-GPU host, or use "
-                     "clio_md_mpi_bench / clio_md_nvshmem_bench, which can "
-                     "share a device.\n", npes, ndev);
+                     "NCCL needs one GPU per rank on a node: %d rank(s) on "
+                     "this node but %d visible device(s) (%d ranks total). "
+                     "Run one rank per GPU, or use clio_md_mpi_bench / "
+                     "clio_md_nvshmem_bench, which can share a device.\n",
+                     local_ranks, ndev, npes);
       }
       MPI_Finalize();
       // 77, not 1: this is a MISSING CAPABILITY, not a failure. ctest maps
@@ -1338,6 +1357,32 @@ int main(int argc, char **argv) {
     t_halo = 0.0; halo_bytes = 0.0; n_halo = 0; mig_bytes = 0.0;
     MD_CUDA_CHECK(cudaMemset(d_ctr, 0,
                              kCtrNumCtrs * sizeof(unsigned long long)));
+    // NCCL WARMUP -- deliberately OUTSIDE the timed region.
+    //
+    // NCCL brings up its channels, starts its proxy threads and registers
+    // buffers LAZILY, on the FIRST collective. The MPI_Barrier below warms
+    // MPI's connections, so the MPI edition's setup already falls outside ITS
+    // timer -- but a barrier does nothing for NCCL, and without this warmup
+    // the first collective inside the timed loop carries all of that setup.
+    // That is a property of where the timer starts, not of the substrate.
+    //
+    // MEASURED on weights (3 passes, 2 nodes, cray-mpich + aws-ofi-nccl):
+    // a FLAT ~78 ms per run at EVERY --blocks rung -- 10% of the blocks=32
+    // cell and 72% of the blocks=256 one. It made NCCL read 1.10x -> 1.70x
+    // slower than MPI across the blocks sweep while the steady-state rates
+    // were within a few percent; the ratio only "widened" because the fixed
+    // cost stayed put while the compute shrank. kmeans and lbann hid it
+    // entirely -- against 40-180 s runs of hundreds-of-MB collectives it is
+    // noise, and there NCCL comes out slightly AHEAD of MPI.
+    {
+      unsigned long long *d_nccl_warm = nullptr;
+      MD_CUDA_CHECK(cudaMalloc(&d_nccl_warm, sizeof(unsigned long long)));
+      MD_CUDA_CHECK(cudaMemset(d_nccl_warm, 0, sizeof(unsigned long long)));
+      MD_NCCL_CHECK(ncclAllReduce(d_nccl_warm, d_nccl_warm, 1, ncclUint64, ncclSum,
+                        nccl_comm, 0));
+      MD_CUDA_CHECK(cudaStreamSynchronize(0));
+      MD_CUDA_CHECK(cudaFree(d_nccl_warm));
+    }
     MPI_Barrier(MPI_COMM_WORLD);
     const double t0 = NowMs();
     // ---- CHECKPOINT ------------------------------------------------------

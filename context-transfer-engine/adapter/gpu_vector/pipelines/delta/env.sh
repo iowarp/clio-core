@@ -211,3 +211,72 @@ export FI_CXI_DISABLE_HMEM_DEV_REGISTER="${FI_CXI_DISABLE_HMEM_DEV_REGISTER:-1}"
 # The benches must be built with CLIO_GV_NVSHMEM_MPI_BOOTSTRAP=OFF, which
 # makes them call nvshmem_init() and honour the variables above instead of
 # bootstrapping through MPI.
+
+# ---------------------------------------------------------------------------
+# THE MPI AND NCCL BASELINES MULTI-NODE.
+#
+# Everything above concerns NVSHMEM. The other two CTE-free baselines have
+# their own multi-node story, and both were silently broken until they were
+# checked against the mechanism rather than the exit code.
+#
+# THE MPI BASELINES NEED CRAY-MPICH, NOT HPC-X. find_package(MPI) resolves to
+# the HPC-X OpenMPI inside nvhpc (it is on PATH for NVSHMEM's sake, see
+# above), and that MPI cannot connect across Slingshot at all:
+#
+#   ucp_ep_create(proc=1) failed: Destination is unreachable
+#   Failed to resolve UCX endpoint for rank 1
+#
+# so an mpirun across two nodes dies in MPI_Init or the first collective. The
+# system MPI is cray-mpich and it speaks CXI natively. Baselines built
+# against it are produced by build_baselines_cray.sh into build*/bin-cray.
+export CLIO_DELTA_CRAY_MPI="${CLIO_DELTA_CRAY_MPI:-/opt/cray/pe/mpich/9.1.0/ofi/GNU/11.2}"
+export CLIO_DELTA_CRAY_PMI="${CLIO_DELTA_CRAY_PMI:-/opt/cray/pe/pmi/default}"
+if [ -d "$CLIO_DELTA_CRAY_MPI/lib" ]; then
+  export LD_LIBRARY_PATH="$CLIO_DELTA_CRAY_MPI/lib:$CLIO_DELTA_CRAY_PMI/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+# THE LAUNCHER DIFFERS BY SUBSTRATE, and this is not cosmetic:
+#
+#   cray-mpich (mpi, nccl)   srun --mpi=cray_shasta
+#   NVSHMEM                  srun --mpi=pmi2   (NVSHMEM_BOOTSTRAP_PMI=PMI2)
+#
+# Launching a cray-mpich binary under --mpi=pmi2 does NOT fail. It gets no
+# PMI info, does a SINGLETON MPI_Init, and every task runs as its own 1-rank
+# job -- two independent serial runs that print "ranks=1" twice and pass
+# every science gate, because a gate checks the answer and nothing checks
+# that the run was distributed. Assert the rank count in any harness.
+export CLIO_DELTA_SRUN_MPI="${CLIO_DELTA_SRUN_MPI:-cray_shasta}"
+export CLIO_DELTA_SRUN_NVSHMEM="${CLIO_DELTA_SRUN_NVSHMEM:-pmi2}"
+
+# NCCL NEEDS THE SLINGSHOT PLUGIN OR IT SILENTLY USES TCP. NCCL's built-in
+# transports are NVLink/PCIe and IB verbs; on Slingshot it finds no IB device
+# and falls back to sockets with GPU Direct RDMA disabled:
+#
+#   NET/Plugin: Could not find: libnccl-net.so
+#   NET/IB : No device found.
+#   Using network Socket
+#
+# which still runs, still passes gates, and is not a Slingshot number.
+#
+# NEVER `module load aws-ofi-nccl ... | sed`. A pipe runs module in a
+# SUBSHELL, so every setenv and prepend_path in the modulefile is discarded
+# when it exits -- the banner prints, NCCL_NET_PLUGIN comes back unset, and
+# NCCL quietly takes the socket path. These four are what `module show
+# aws-ofi-nccl/1.19.2` sets, applied directly so there is no subshell to lose
+# them in.
+export CLIO_DELTA_OFI_NCCL="${CLIO_DELTA_OFI_NCCL:-/sw/rh9.4/user/aws-ofi-nccl-1.19.2-lf2.3.1-cu13.2}"
+export CLIO_DELTA_LIBFABRIC="${CLIO_DELTA_LIBFABRIC:-/opt/cray/libfabric/2.3.1}"
+if [ -d "$CLIO_DELTA_OFI_NCCL/lib" ]; then
+  export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-ofi}"
+  export FI_PROVIDER="${FI_PROVIDER:-cxi}"
+  export LD_LIBRARY_PATH="$CLIO_DELTA_OFI_NCCL/lib:$CLIO_DELTA_LIBFABRIC/lib64:${LD_LIBRARY_PATH:-}"
+  # The plugin needs this libfabric ahead of any other in the process.
+  export CLIO_DELTA_NCCL_PRELOAD="$CLIO_DELTA_LIBFABRIC/lib64/libfabric.so.1"
+fi
+# CONFIRMED with NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET:
+#   NET/Plugin: Loaded net plugin Libfabric (v11)
+#   NET/OFI Selected provider is cxi, fabric is cxi (found 1 nics)
+#   Using network Libfabric      <-- NOT "Using network Socket"
+# and all six NCCL baselines pass their gates at 2 ranks on 2 nodes over it.
+# NOTE the confirming string is "Using network Libfabric"; a probe grepping
+# for "OFI" finds nothing and looks like a failure.

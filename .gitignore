@@ -194,3 +194,11 @@ llvm.sh*
 # Runtime configs the gpu_vector tests/benches write into their CWD --
 # committed once by accident from repo-root runs; never sources.
 /gpu_vector_*.yaml
+
+# Crash artifacts and batch logs. core_pattern on Delta is
+# `core.%e.%t.%u.%p.%h`, so a segfaulting bench drops a ~470 MB core in
+# whatever directory it ran from -- four of them appeared in the tree root
+# during the 2-node paged debugging alone.
+core.*
+slurm-*.out
+slurm-*.err

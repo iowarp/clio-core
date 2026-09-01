@@ -100,6 +100,43 @@ if(CLIO_CORE_ENABLE_CUDA)
         add_custom_target(clio_gmx_mpi_bench ALL DEPENDS ${_out})
         install(PROGRAMS ${_out} DESTINATION bin)
         message(STATUS "gmx MPI baseline: ON")
+
+        # ----------------------------------------------------------------
+        # gmx, NCCL edition: the GPU-direct sibling of the MPI baseline.
+        #
+        # Same nvcc invocation plus NCCL. MPI stays linked because NCCL has
+        # no launcher of its own -- the unique id is broadcast with MPI
+        # before ncclCommInitRank, and nothing else crosses MPI.
+        # ----------------------------------------------------------------
+        find_path(NCCL_INCLUDE_DIR nccl.h
+            HINTS ENV NCCL_HOME ENV NCCL_PREFIX
+            PATH_SUFFIXES include nccl/include)
+        find_library(NCCL_LIB NAMES nccl libnccl.so.2
+            HINTS ENV NCCL_HOME ENV NCCL_PREFIX
+            PATH_SUFFIXES lib lib64 nccl/lib)
+        if(NCCL_INCLUDE_DIR AND NCCL_LIB)
+            get_filename_component(NCCL_LIB_DIR ${NCCL_LIB} DIRECTORY)
+            set(_nccl_out ${CMAKE_BINARY_DIR}/bin/clio_gmx_nccl_bench)
+            set(_nccl_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_gmx_nccl_bench.cc)
+            add_custom_command(
+                OUTPUT ${_nccl_out}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+                COMMAND ${MD_MPI_NVCC}
+                    -x cu -std=c++17 -O3 ${_arch_flags} ${_mpi_cflags}
+                    -I${NCCL_INCLUDE_DIR}
+                    ${_nccl_src} -o ${_nccl_out}
+                    -L${NCCL_LIB_DIR} -lnccl ${_mpi_libs}
+                    -Xlinker -rpath -Xlinker ${NCCL_LIB_DIR}
+                DEPENDS ${_nccl_src}
+                COMMENT "Building clio_gmx_nccl_bench (nvcc + NCCL + MPI)"
+                VERBATIM)
+            add_custom_target(clio_gmx_nccl_bench ALL DEPENDS ${_nccl_out})
+            install(PROGRAMS ${_nccl_out} DESTINATION bin)
+            message(STATUS "gmx NCCL baseline: ON (${NCCL_INCLUDE_DIR})")
+        else()
+            message(STATUS
+                "NCCL not found (set NCCL_HOME); skipping clio_gmx_nccl_bench")
+        endif()
     else()
         message(STATUS "MPI not found; skipping clio_gmx_mpi_bench")
     endif()
@@ -369,4 +406,21 @@ if(TARGET clio_gmx_nvshmem_bench AND MPIEXEC_EXECUTABLE)
     )
     set_tests_properties(bench_gmx_nvshmem_2pe PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;nvshmem;distributed" RUN_SERIAL TRUE)
+endif()
+
+# ---------------------------------------------------------------------------
+# The NCCL baseline at 2 ranks. Same shape as bench_gmx_mpi_2rank, and it
+# needs one GPU PER RANK -- NCCL refuses two ranks naming the same device --
+# so on a single-GPU host this is expected to be skipped, not red.
+# ---------------------------------------------------------------------------
+if(TARGET clio_gmx_nccl_bench AND MPIEXEC_EXECUTABLE)
+    add_test(NAME bench_gmx_nccl_2rank
+        COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe
+                ${MPIEXEC_NUMPROC_FLAG} 2
+                ${CMAKE_BINARY_DIR}/bin/clio_gmx_nccl_bench --atoms 20000
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(bench_gmx_nccl_2rank PROPERTIES
+        TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
 endif()

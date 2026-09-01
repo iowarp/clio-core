@@ -7,11 +7,18 @@
 # clio, or it is not a baseline):
 #
 #   lammps_md/   LAMMPS melt        paged + mpi + nvshmem + nccl + bam
-#   gmx/         PME spread+gather  paged
-#   lbann/       MLP training       paged
-#   grayscott/   reaction-diffusion paged
-#   kmeans/      k-means            paged
-#   weights/     weight streaming   paged
+#   gmx/         PME spread+gather  paged + mpi + nvshmem + nccl + bam
+#   lbann/       MLP training       paged + mpi + nvshmem + nccl + bam
+#   grayscott/   reaction-diffusion paged + mpi + nvshmem + nccl + bam
+#   kmeans/      k-means            paged + mpi + nvshmem + nccl + bam
+#   weights/     weight streaming   paged + mpi + nvshmem + nccl + bam
+#
+# ALL SIX CARRY ALL FIVE SUBSTRATES. This list said "paged" only for five of
+# them long after the mpi/nvshmem/bam editions landed, and the nccl column
+# was genuinely lammps_md-only until the five NCCL editions were written --
+# which is how a "compare paged against MPI/NVSHMEM/NCCL" campaign ran for
+# weeks with no NCCL number for five of its six workloads. Keep this table
+# honest; it is the only place the matrix is written down.
 #   gnn/         GNN ingest + 1-hop aggregation tooling (host-side)
 #
 # The files remaining here are the vector's own micro-benchmarks (access,
