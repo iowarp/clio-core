@@ -94,7 +94,25 @@ const clio::run::PoolId kCompressorPool(512, 0);
 // 5000 ms inline retry budget before failing -- once per page. At 2 nodes
 // every weights cell in the cache sweep hit the 900 s cap having done no
 // useful work, at every cache and block rung.
-const clio::run::PoolId kCorePool = clio::cte::core::kCtePoolId;
+// THE CORE POOL'S ID DEPENDS ON WHICH CONFIG IS LIVE, and hardcoding either
+// choice breaks the other mode -- both have now happened:
+//
+//   self-written config (single-node):  compressor 512.0 -> cte_core 513.0
+//   cluster config (gvw_conf.yaml):     cte_core 512.0, no compressor
+//
+// (513, 0) broke distributed -- routing to a pool with no container burns the
+// full 5000 ms inline retry per page (the previous fix's finding, which
+// stands). kCtePoolId (512.0) broke the single-node NO-COMPRESSOR build: its
+// puts went to a pool its own config declares as the COMPRESSOR slot, which
+// does not exist there, and the seed failed every put (put_errors=32,
+// "SEED DID NOT CONVERGE"). The CUDA build dodged that only because it
+// routes via kCompressorPool -- the same 512.0, which under the CLUSTER
+// config happens to alias cte_core.
+//
+// So the ids are chosen at runtime, from the same fact the config guard
+// already keys on: whether CLIO_SERVER_CONF was supplied.
+static clio::run::PoolId g_core_pool = clio::cte::core::kCtePoolId;
+static clio::run::PoolId g_storage_pool = clio::cte::core::kCtePoolId;
 constexpr int kLz4WireId = 4;      // registry: {"lz4", 4, ...}   CPU codec
 // GPU codec. This is the one that matters here: decompressing on the device
 // is impossible while a kernel spins on its fault, because the codec is itself
@@ -225,6 +243,10 @@ int main(int argc, char **argv) {
   if (getenv("CLIO_SERVER_CONF") != nullptr) {
     std::printf("  runtime: using CLIO_SERVER_CONF=%s (not writing one)\n",
                 getenv("CLIO_SERVER_CONF"));
+    // Cluster config: cte_core is 512.0 and there is no compressor, so both
+    // the core client and the vector's storage route straight to it.
+    g_core_pool = clio::cte::core::kCtePoolId;
+    g_storage_pool = clio::cte::core::kCtePoolId;
   } else {
     std::ofstream cfg("gv_weights_bench.yaml");
     cfg << "networking:\n  port: 9435\n\n"
@@ -298,6 +320,11 @@ int main(int argc, char **argv) {
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF",
                             "gv_weights_bench.yaml", 1);
+    // Self-written config: cte_core is 513.0; the vector's puts go through
+    // the compressor at 512.0 when one is built, else straight to core.
+    g_core_pool = clio::run::PoolId(513, 0);
+    g_storage_pool = kHaveCompressor ? kCompressorPool
+                                     : clio::run::PoolId(513, 0);
   }
 
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
@@ -342,7 +369,7 @@ int main(int argc, char **argv) {
   // Straight to the core when there is no compressor to sit in front of it.
   gv::Vector<clio::run::u32> vec(tag, {0}, page_bytes, blocks,
                                  slots < 8u ? 8u : slots, n,
-                                 kHaveCompressor ? kCompressorPool : kCorePool,
+                                 g_storage_pool,
                                  compressed ? (gpu_codec ? kNvcompLz4WireId
                                                         : kLz4WireId)
                                             : 0);
@@ -430,7 +457,7 @@ int main(int argc, char **argv) {
   // what decides whether it fits the GPU tier.
   clio::run::u64 stored = 0;
   {
-    clio::cte::core::Client core(kCorePool);
+    clio::cte::core::Client core(g_core_pool);
     for (clio::run::u64 p = 0; p < n / page_elems; ++p) {
       const std::string name = std::to_string(p);
       auto sz = core.AsyncGetBlobSize(vec.TagId(), name);
@@ -516,7 +543,7 @@ int main(int argc, char **argv) {
     // GpuApi::Malloc fails fatally, which is the same abort with less code.
     bl_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(bl_dev)>>(
         static_cast<size_t>(page_bytes));
-    bl_core = new clio::cte::core::Client(kCorePool);
+    bl_core = new clio::cte::core::Client(g_core_pool);
     std::fprintf(stderr, "[baseline] staging ready, %llu tiles of %lluB\n",
                  (unsigned long long)total_pages,
                  (unsigned long long)page_bytes);
