@@ -137,7 +137,16 @@ config:
       cache_mb: 32768
       page_kb: 1024
       hbm_mb: 256
-      nvme_mb: 8192
+      # -1 = size the file tier from data_mb. It was 8192 against a 32000 MB
+      # deck, and the file tier is the ONLY non-volatile tier here, so the
+      # end-of-run flush pushed all 32 GB at an 8 GB target: it filled, then
+      # failed on every remaining blob with rc 12 (10 +
+      # kCteAllocNoHealthyTarget) -- and the flush frees a blob's volatile
+      # blocks BEFORE re-putting them, so those blobs were destroyed, not
+      # merely skipped. Megabytes of `PutBlob failed ... (error 12)` in the
+      # job logs are that. /tmp on these nodes is 1.3 TB, so an honest ~33 GB
+      # tier costs nothing worth saving.
+      nvme_mb: -1
       nvme_path: /tmp/gv_kmeans_tier.dat
       # ---- harness ----
       nprocs: 1

@@ -72,7 +72,12 @@ vars:
   wl.atoms:      [0]
   wl.mesh_k:     [0]
   wl.hbm_mb:     [256]
-  wl.nvme_mb:    [8192]
+  # -1 = size the file tier from data_mb. 8192 against a 32000 MB deck left
+  # the end-of-run flush (whose ONLY target is this tier -- hbm and ram are
+  # volatile) filling the tier and then failing per blob with rc 12, after it
+  # had already freed each blob's volatile blocks. See the same note in
+  # gv_kmeans_substrate_a100.yaml.
+  wl.nvme_mb:    [-1]
   wl.repeat:     [0]
   wl.no_dense:   [false]
   wl.cache_ladder:  ["5461,10923,21845,32768"]

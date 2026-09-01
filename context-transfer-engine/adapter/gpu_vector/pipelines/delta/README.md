@@ -289,6 +289,13 @@ here.
 
 ### Why paged degrades above 108 blocks: wave quantization
 
+> **SUPERSEDED -- the fit below is a coincidence.** Raising residency from
+> 108 to 432 with `__launch_bounds__` leaves the curve essentially
+> unchanged, so waves cannot be what produces it. Kept because the
+> arithmetic and the REG=192 measurements are still correct, and because
+> the refutation only makes sense next to it. See "MEASURED:
+> `__launch_bounds__` on kmeans does NOT remove the cliff" below.
+
 The paged coroutine kernels measure REG=192, so on a 65536-register SM only
 `65536/(192*256) = 1` block per SM is resident -- 108 blocks on this GPU,
 12.5% occupancy. Asking for more does not raise occupancy, it adds WAVES,
@@ -345,12 +352,47 @@ which it was not here until env.sh started exporting
 `CLIO_DELTA_LLVM_CONFIG` -- clang is referenced by absolute path precisely
 so LLVM's bin stays off PATH.
 
-Untried: `__launch_bounds__(256, 4)` on the other five paged benches.
-Registers are verifiable statically in seconds; whether it makes anything
-FASTER is a separate question, since kmeans at 32 GB looks
-bandwidth-bound (all three substrates converge to 5700-6200 ms/iter at
-their best). The confident prediction is only that it removes the
-128-block cliff, by taking residency from 108 to 432.
+### MEASURED: `__launch_bounds__` on kmeans does NOT remove the cliff
+
+This section previously predicted, confidently, that putting
+`__launch_bounds__(256, 4)` on the other five paged benches would remove the
+128-block cliff "by taking residency from 108 to 432". That prediction was
+run on kmeans and it is WRONG. `gv_kmeans_lb_after.yaml`, same problem and
+geometry as the substrate sweep, paged only, REG confirmed 64 on every row:
+
+| blocks | REG=192 ms/iter | REG=64 ms/iter | resident | queued | faults |
+|---|---|---|---|---|---|
+| 32 | 7740.5 | 7832.1 | 32 | 0 | 0 |
+| 64 | 6160.3 | 6277.5 | 64 | 0 | 0 |
+| **128** | **11708.7** | **12438.5** | **128** | **0** | **3835** |
+| 256 | 8940.9 | 9188.5 | 256 | 0 | 3411 |
+| 512 | 7190.5 | 6915.8 | 432 | 80 | 4411 |
+
+The annotation did what it was supposed to do to OCCUPANCY -- 64 registers,
+4 blocks/SM, 432 resident, and at 128 blocks every block is resident with
+nothing queued. The cliff is still there, still at 128, and still the worst
+point of the curve by roughly 2x. It is also slightly SLOWER at four of the
+five rungs; only 512 improved (7190 -> 6916), which is the one rung that
+still queues.
+
+**So wave quantization is not the mechanism.** The model in the previous
+section fits the REG=192 curve to 3.6%, but it fits for the wrong reason:
+raising residency to 432 leaves the curve essentially unchanged. Whatever
+128 blocks does to this workload, it does with every block resident.
+
+What tracks the slowdown instead is FAULTS, which are zero at 32 and 64 and
+appear exactly where the time does (3835 / 3411 / 4411 at 128 / 256 / 512).
+That is a per-block CACHE effect, not an occupancy one: `cache_mb` is a
+total, so the per-block share falls as blocks rise (1024 / 512 / 256 / 128 /
+64 slots of 1 MB) even though the total stays at 32768 MB. Note the total is
+a constant 1.024x the 32000 MB deck at EVERY rung, so a simple
+cache-to-working-set ratio does not explain why faults begin only at 128 --
+that part is still open.
+
+Untried, and now much less interesting: the annotation on the other four
+paged benches. Registers are still verifiable statically in seconds, but the
+one workload where it was actually measured got slightly slower, so there is
+no longer a reason to expect a win.
 
 ### Checksums are block-count sensitive on EVERY substrate
 

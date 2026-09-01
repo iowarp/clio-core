@@ -1,0 +1,169 @@
+# CACHE SIZE x GPU BLOCKS, distributed, at 32 GB PER NODE.
+#
+# The paged vector's two tuning knobs, swept together on a problem too big to
+# be resident, across two A100 nodes. 4 cache sizes x 4 block counts x 4
+# workloads = 64 cells.
+#
+# WHY THESE TWO AXES ARE NOT INDEPENDENT. The per-block cache is
+# `cache_mb / blocks / page_kb` slots, so raising `blocks` at a fixed cache
+# budget SHRINKS every block's share. A sweep that fixed slots instead would
+# grow the total cache with the block count and confound the two effects --
+# `cache_mb` is the axis because total VRAM is what actually costs something.
+#
+# THE BLOCK LADDER STRADDLES THE RESIDENCY LIMIT. The paged coroutine kernels
+# measure REG=192, so an A100's 65536-register SM holds ONE block: 108
+# resident blocks, 12.5% occupancy. Past that, extra blocks buy WAVES rather
+# than parallelism, and on one node kmeans time tracked `waves/blocks` to
+# within 3.6% -- 128 blocks being the worst point of the whole curve, its
+# second wave carrying 20 blocks across 108 SMs. 32/64/128/256 puts two rungs
+# either side of that cliff. (lammps_md is the only paged bench carrying
+# __launch_bounds__ and so the only one at REG=64; the other five are all
+# expected on the 108-block curve.)
+#
+# 32 GB PER NODE, AND THE SIZE KNOB IS GLOBAL. kmeans and grayscott split
+# --data-mb across the nodes and gmx splits K, so 32 GB/node is 64 GB
+# declared. weights is the exception -- its --pages is per block PER NODE, so
+# its model already grows with the node count and 32000 is the per-node
+# figure. Getting this backwards gives half the intended problem on one
+# workload and twice it on another, with nothing in the output to say so.
+#
+#   kmeans     --data-mb 64000  -> 32000/node
+#   grayscott  --data-mb 64000  -> 32000/node
+#   weights    --data-mb 32000  =  32000/node (per-node semantics)
+#   gmx        K=2048, mesh K^3*8 B = 68.7 GB -> 1024 planes = 34.4 GB/node.
+#              K MUST BE A MULTIPLE OF 16 or --page-kb (K^2*8/1024 = 32768)
+#              is not an integer and the bench refuses ("not a square u64
+#              plane").
+#
+# WHY ONLY THESE FOUR. They are the workloads with a calibrated 32 GB anchor
+# (gv_anchor32_mpi_a100.yaml). lbann and lammps_md have none -- lbann's
+# H=921600 reached 17763 MB rather than 32 GB, so VRAM is not linear in H the
+# way the 6 GB point suggested, and both blew their caps at their previous
+# step counts. They get their own pipelines:
+# gv_dist2_lbann_a100.yaml and gv_dist2_lammps_md_a100.yaml.
+#
+# 10 MINUTES PER CELL, HARD. timeout_sec kills a cell at 600 s and the row
+# lands with completed=0 rather than eating the allocation. Step counts are
+# picked to sit well inside that at the LOOSE cache rungs; a workload whose
+# tight-cache rungs cannot make it is exactly what the split-out pipelines
+# are for, and the post block below names any such cell.
+#
+# STEPS=20, not the anchor's 100. At 100 steps a single 32 GB cell ran ~8
+# minutes on ONE node, which leaves no room for a 16-cell grid under a
+# 10-minute cap. 20 still amortises the one-shot 32 GB ingest that dominated
+# the 1-4 step runs (where evicts=0 everywhere proved every fault was a
+# compulsory first-touch miss, not capacity pressure) while fitting the grid.
+#
+# RESUME. jarvis resumes a pipeline test by ROW COUNT, so a job that hits the
+# wall clock continues where it stopped if you resubmit the same YAML. For a
+# FRESH sweep, `rm -rf $HOME/gv_pipeline_results/dist2_cache_blocks` first --
+# otherwise a stale results.csv silently eats the first N cells and the run
+# still reports success.
+#
+# Submit:  jarvis ppl submit gv_dist2_cache_blocks_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  # The RAM tier is ~32.5 GB per node and CLIO_PREFAULT=0 touches all of it.
+  mem: 80g
+  gpus_per_node: 1
+  time: "08:00:00"
+  job_name: gv_dist2_cache_blocks
+  output: /u/llogan/gv_job_logs/gv_dist2_cache_blocks-%j.out
+  error: /u/llogan/gv_job_logs/gv_dist2_cache_blocks-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_dist2_cache_blocks_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      # A pipeline TEST builds a fresh pipeline per cell and the `scheduler:`
+      # block binds self.hostfile only on the one it loaded, so the per-cell
+      # pipelines see None. Name the scheduler's own file.
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_dist2_cache_blocks_a100/hostfile.txt
+      cluster_port: 9425
+      # Threads pinned on every cell. Left unset each binary uses its own
+      # default (the paged benches disagree: kmeans 256, weights 32), and a
+      # comparison across cells then measures launch geometry instead of the
+      # axis under test.
+      threads: 256
+      prefault: "0"
+      timeout_sec: 600
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/dist2_cache_blocks
+
+vars:
+  # ---- zipped per workload -------------------------------------------
+  wl.workload: [kmeans, weights, grayscott, gmx]
+  wl.data_mb:  [64000,  32000,   64000,     0]
+  wl.page_kb:  [1024,   1024,    1024,      32768]
+  # The host RAM tier the generated cluster config declares. 0 would derive
+  # it from data_mb, which gmx does not use at all.
+  wl.ram_mb:   [33280,  33280,   33280,     35840]
+  wl.steps:    [20,     0,       20,        0]
+  wl.repeat:   [1,      20,      1,         1]
+  wl.dims:     [32,     0,       0,         0]
+  wl.clusters: [16,     0,       0,         0]
+  wl.mesh_k:   [0,      0,       0,         2048]
+  wl.atoms:    [0,      0,       0,         200000]
+  # gmx: skip the dense in-VRAM reference. There is no room for a second
+  # 34 GB copy; the conservation gate still runs.
+  wl.no_dense: [false,  false,   false,     true]
+  # ---- the two swept axes (cartesian) --------------------------------
+  wl.cache_mb: [4096, 8192, 16384, 32768]
+  wl.blocks:   [32, 64, 128, 256]
+
+loop:
+  - [wl.workload, wl.data_mb, wl.page_kb, wl.ram_mb, wl.steps, wl.repeat,
+     wl.dims, wl.clusters, wl.mesh_k, wl.atoms, wl.no_dense]
+  - [wl.cache_mb]
+  - [wl.blocks]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/dist2_cache_blocks"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 220)
+  cols = [c for c in ['wl.workload', 'wl.cache_mb', 'wl.blocks', 'nodes',
+                      'nodes_finished', 'completed', 'gates_pass', 'bench_ms',
+                      'runtime', 'vram_peak_mb', 'faults', 'evicts', 'puts',
+                      'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+  for wl, g in df.groupby('wl.workload'):
+      if 'bench_ms' in g:
+          piv = g.pivot_table(index='wl.cache_mb', columns='wl.blocks',
+                              values='bench_ms', aggfunc='min')
+          logger.info('\n%s -- bench_ms by (cache_mb x blocks):\n%s'
+                      % (wl, piv.to_string()))
+  # A cell the 600 s cap killed is the finding this sweep is meant to
+  # surface: that (workload, cache, blocks) belongs in its own pipeline
+  # with a longer wall, not in a 10-minute grid.
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('OVER THE 10 MIN CAP or FAILED: %s cache=%s blocks=%s '
+                     '(runtime=%s, nodes_finished=%s)'
+                     % (r['wl.workload'], r.get('wl.cache_mb'),
+                        r.get('wl.blocks'), r.get('runtime'),
+                        r.get('nodes_finished')))
+  if not len(bad):
+      logger.info('all %d cells completed inside the 10 min cap' % len(df))
+  else:
+      over = sorted(set(bad['wl.workload']))
+      logger.warning('workloads with cells over the cap: %s -- move these to '
+                     'their own pipelines' % ', '.join(over))

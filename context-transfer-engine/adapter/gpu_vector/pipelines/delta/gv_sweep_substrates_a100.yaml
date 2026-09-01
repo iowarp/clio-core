@@ -1,0 +1,167 @@
+# BLOCKS x SUBSTRATE, mpi / nccl / nvshmem, ALL SIX WORKLOADS, 2 nodes.
+#
+# Half two of the substrate sweep; gv_sweep_paged_a100.yaml is the paged
+# half. Cache is absent here because a RESIDENT substrate has no page
+# cache -- there is nothing to sweep, and sweeping it anyway would run 216
+# cells that differ in nothing. blocks is the shared axis and uses the SAME
+# per-workload ladder as the paged file, so the two results.csv join on
+# (wl.workload, wl.blocks_level).
+#
+# THE BINARY IS NOT THE ONE ON PATH, AND THIS IS THE WHOLE POINT.
+# Delta has two builds of these baselines and only one can be on PATH:
+#
+#   <build>/bin/       HPC-X OpenMPI. SINGLE NODE ONLY -- its UCX PML
+#                      cannot cross Slingshot ("ucp_ep_create failed:
+#                      Destination is unreachable").
+#   <build>/bin-cray/  cray-mpich + aws-ofi-nccl. MULTI-NODE, under
+#                      `srun --mpi=cray_shasta`. Built by
+#                      build_baselines_cray.sh.
+#
+# A 2-node cell that picks up bin/ does not fail. Every rank does a
+# singleton MPI_Init, becomes its own 1-rank job, and PASSES ITS GATES
+# while measuring nothing distributed. That silence is why `bin_dir` is
+# named explicitly on every row rather than left to PATH.
+#
+# nvshmem is the exception: it bootstraps through PMI (NVSHMEM_BOOTSTRAP=PMI,
+# NVSHMEM_BOOTSTRAP_PMI=PMI2 from env.sh, benches built with
+# CLIO_GV_NVSHMEM_MPI_BOOTSTRAP=OFF) and needs no MPI at all, so it runs the
+# nvhpc build in bin/ under `srun --mpi=pmi2`. cray_shasta is NOT
+# interchangeable here, nor pmi2 for the cray-mpich binaries -- cray-mpich
+# under --mpi=pmi2 does the singleton MPI_Init described above.
+#
+# NCCL NEEDS libfabric PRELOADED. The aws-ofi-nccl plugin selects the cxi
+# provider (NCCL_NET_PLUGIN=ofi, FI_PROVIDER=cxi, both from env.sh) and
+# wants libfabric in the process. Measured 6/6 at 2 real ranks with gates
+# passing under exactly this combination.
+#
+# ALWAYS ASSERT THE RANK COUNT. These six benches announce it five
+# different ways ("ranks=2", "2 ranks", "PEs=2", "2 PEs", "2 ranks
+# (model-parallel)"), so a checker grepping one spelling reports the other
+# five as NOT-DISTRIBUTED when they were fine. The post block below counts
+# gates_pass instead and leaves rank assertion to the bench logs.
+#
+# CALIBRATION CAVEAT, same as the paged file: kmeans/weights/grayscott/gmx
+# carry measured 32 GB/node anchors; lbann and lammps_md have none and use
+# the largest sizes observed to run, so their decks are smaller and their
+# absolute times are not comparable ACROSS workloads. Within a workload,
+# across blocks and against the paged half, they are.
+#
+# RESUME by row count. For a FRESH sweep,
+# `rm -rf $HOME/gv_pipeline_results/sweep_substrates` first.
+#
+# Submit:  jarvis ppl submit gv_sweep_substrates_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 80g
+  gpus_per_node: 1
+  time: "08:00:00"
+  job_name: gv_sweep_substrates
+  output: /u/llogan/gv_job_logs/gv_sweep_substrates-%j.out
+  error: /u/llogan/gv_job_logs/gv_sweep_substrates-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_sweep_substrates_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: mpi
+      # 2 RANKS, ONE PER NODE. `nodes` is the PAGED mechanism (one process
+      # per node joined through a cluster config); these are ordinary MPI
+      # programs and scale with nprocs under mpi_launcher, so nodes stays 1.
+      nprocs: 2
+      nodes: 1
+      # Matched geometry with the paged half.
+      threads: 256
+      prefault: "0"
+      timeout_sec: 600
+      output_dir: /tmp/clio_gv/sweep_substrates
+
+vars:
+  # ---- zipped per workload (same problems as the paged half) ---------
+  wl.workload: [kmeans, weights, grayscott, gmx,    lbann,  lammps_md]
+  wl.data_mb:  [64000,  32000,   64000,     0,      0,      0]
+  wl.steps:    [20,     0,       20,        0,      5,      20]
+  wl.repeat:   [1,      20,      1,         1,      0,      0]
+  wl.dims:     [32,     0,       0,         0,      0,      0]
+  wl.clusters: [16,     0,       0,         0,      0,      0]
+  wl.mesh_k:   [0,      0,       0,         2048,   0,      0]
+  wl.atoms:    [0,      0,       0,         200000, 0,      0]
+  wl.lattice:  [0,      0,       0,         0,      0,      126]
+  wl.ckpt:     [0,      0,       0,         0,      0,      5]
+  wl.in_dim:   [0,      0,       0,         0,      4096,   0]
+  wl.hidden:   [0,      0,       0,         0,      921600, 0]
+  wl.out_dim:  [0,      0,       0,         0,      64,     0]
+  wl.batch:    [0,      0,       0,         0,      256,    0]
+  wl.lr:       [0,      0,       0,         0,      0.0001, 0]
+  wl.blocks_ladder:
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "16,32,64,128"
+    - "32,64,128,256"
+  # ---- zipped per substrate: binary, launcher and preload move together
+  wl.variant:      [mpi, nccl, nvshmem]
+  wl.bin_dir:
+    - /u/llogan/clio-core/build-clang/bin-cray
+    - /u/llogan/clio-core/build-clang/bin-cray
+    - /u/llogan/clio-core/build-clang/bin
+  wl.mpi_launcher:
+    - "srun --mpi=cray_shasta -n {n} --ntasks-per-node=1"
+    - "srun --mpi=cray_shasta -n {n} --ntasks-per-node=1"
+    - "srun --mpi=pmi2 -n {n} --ntasks-per-node=1"
+  wl.ld_preload:
+    - ""
+    - "$CLIO_DELTA_NCCL_PRELOAD"
+    - ""
+  # ---- the swept axis ------------------------------------------------
+  wl.blocks_level: [1, 2, 3, 4]
+
+loop:
+  - [wl.workload, wl.data_mb, wl.steps, wl.repeat, wl.dims, wl.clusters,
+     wl.mesh_k, wl.atoms, wl.lattice, wl.ckpt, wl.in_dim, wl.hidden,
+     wl.out_dim, wl.batch, wl.lr, wl.blocks_ladder]
+  - [wl.variant, wl.bin_dir, wl.mpi_launcher, wl.ld_preload]
+  - [wl.blocks_level]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/sweep_substrates"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+  cols = [c for c in ['wl.workload', 'wl.variant', 'blocks', 'binary',
+                      'completed', 'gates_pass', 'bench_ms', 'runtime',
+                      'vram_peak_mb']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  for wl, g in df.groupby('wl.workload'):
+      if 'bench_ms' in g and g['bench_ms'].notna().any():
+          piv = g.pivot_table(index='wl.blocks_level', columns='wl.variant',
+                              values='bench_ms', aggfunc='min')
+          logger.info('\n%s -- bench_ms by (blocks_level x substrate):\n%s'
+                      % (wl, piv.to_string()))
+
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('FAILED or OVER THE CAP: %s %s blocks_level=%s '
+                     '(runtime=%s)'
+                     % (r['wl.workload'], r.get('wl.variant'),
+                        r.get('wl.blocks_level'), r.get('runtime')))
+  if not len(bad):
+      logger.info('all %d cells completed' % len(df))
+  else:
+      logger.warning('%d/%d cells failed or timed out' % (len(bad), len(df)))
