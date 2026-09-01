@@ -96,6 +96,12 @@ deck() {
       # harness does not build.)
       ARGS="--md --lattice 28 --steps 20"
       KEY='E0=(-?[0-9.]+)'; TOL=1e-6 ;;
+    reput_stale)
+      # Self-checking CTE probe: no single-node reference, no checksum math.
+      # Runs both containers, each exits nonzero on a stale serve.
+      BENCH=test_cte_reput_stale
+      ARGS="--rounds 200 --burners 6"
+      KEY=''; TOL=selfcheck ;;
     *) echo "unknown workload: $1" >&2; return 2 ;;
   esac
 }
@@ -152,6 +158,21 @@ extract() { sed -nE "s/.*${1}.*/\\1/p" "$2" | head -1; }
 
 run_one() {
   local wl="$1"; REQUIRE_EVICTS=""; deck "$wl"
+  if [ "${TOL:-}" = selfcheck ]; then
+    echo "=== $wl: 2-node self-checking probe"
+    cd "$SCRIPT_DIR"; rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
+    export GVW_BENCH="$BENCH" GVW_ARGS="$ARGS"
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+    docker compose up -d gvw-node1 gvw-node2 >/dev/null 2>&1
+    docker compose logs -f --no-color > "/tmp/gvw_${wl}_dist.log" 2>&1 &
+    local lp=$!; local rc2=0 code
+    for n in gvw-node1 gvw-node2; do code=$(docker wait "$n"); echo "  == $n exited $code"; [ "$code" -eq 0 ] || rc2=1; done
+    kill "$lp" 2>/dev/null || true
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+    grep -E "STALE SERVE|PASS:|FAIL:" "/tmp/gvw_${wl}_dist.log" | sed "s/^/  /" | head -4
+    [ "$rc2" -eq 0 ] && echo "  $wl OK" || echo "  $wl FAILED"
+    return $rc2
+  fi
   # The OOC override replaces only the deck; keys, tolerances and the
   # reference-comparison logic are unchanged -- the reference run recomputes
   # its value from the same deck, so nothing here hardcodes a resident answer.

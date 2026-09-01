@@ -434,6 +434,34 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS test_cte_generation_distributed RUNTIME DESTINATION bin)
 
+    # MINIMAL REPRODUCER for the durable stale-replica serve: a re-put blob's
+    # cross-node plain get returns OLD bytes with rc=0 (see the file header).
+    # CTE only, no GPU vector. Run via distributed_workloads/'s compose:
+    #   GVW_BENCH=test_cte_reput_stale BUILD_DIR=<b> ./run_workloads_distributed.sh ...
+    add_cuda_executable(test_cte_reput_stale FALSE
+        test_cte_reput_stale.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(test_cte_reput_stale PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS test_cte_reput_stale RUNTIME DESTINATION bin)
+
 
     # Compressed-tier tests link the compressor pool; with
     # CLIO_CTE_ENABLE_COMPRESS=OFF (the GPU conda job's cuda-release preset)
@@ -973,4 +1001,17 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
             ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_OOC=1;GVW_VARIANT=sycl")
     endforeach()
     set_tests_properties(cte_gv_ooc_sycl_weights PROPERTIES DISABLED TRUE)
+
+    # CTE stale-replica regression guard. Proves the CTE core does NOT serve
+    # stale bytes on a cross-node reput+refetch under eviction and load -- the
+    # thing lbann's failure was wrongly blamed on. If a real CTE stale-serve
+    # is ever introduced, this goes red with a specific "STALE SERVE" line.
+    add_test(NAME cte_reput_stale
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh reput_stale
+    )
+    set_tests_properties(cte_reput_stale PROPERTIES
+        TIMEOUT 1200
+        LABELS "cte;gpu;gpu_vector;gv_dist_ooc;distributed;docker"
+        RUN_SERIAL TRUE
+        ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_CONF=gvw_conf_tiered.yaml")
 endif()
