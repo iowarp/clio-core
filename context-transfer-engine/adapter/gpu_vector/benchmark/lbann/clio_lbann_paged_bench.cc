@@ -350,6 +350,13 @@ int main(int argc, char **argv) {
   auto *d_wref = ctp::GpuApi::Malloc<float>(n * sizeof(float));
   lb::LaunchDenseSeed(d_wref, n);
   ctp::GpuApi::Synchronize();
+  // The paged path's biases live in PLAIN DEVICE ARRAYS, not the vector (see
+  // the note above Fwd1Coro). Captured here, after the dense seed and before
+  // dense training mutates d_wref, so both paths start from identical bits.
+  auto *d_b1 = ctp::GpuApi::Malloc<float>(H * sizeof(float));
+  auto *d_b2 = ctp::GpuApi::Malloc<float>(O * sizeof(float));
+  ctp::GpuApi::Memcpy(d_b1, d_wref + b1_off, H * sizeof(float));
+  ctp::GpuApi::Memcpy(d_b2, d_wref + b2_off, O * sizeof(float));
   const double t_ref0 = NowMs();
   for (u64 s = 0; s < steps; ++s) {
     lb::LaunchDenseFwd1(blocks, threads, d_wref, w1_off, b1_off, I, H, B, d_x,
@@ -366,8 +373,6 @@ int main(int argc, char **argv) {
     loss_ref[s] = host_loss();
   }
   const double t_ref = NowMs() - t_ref0;
-  ctp::GpuApi::Memset(d_dg, 0, 2 * sizeof(unsigned long long));
-  lb::LaunchDenseDigest(d_wref, n, &d_dg[0]);
   ctp::GpuApi::Synchronize();
 
   // ---- Paged training. ---------------------------------------------------
@@ -436,9 +441,14 @@ int main(int argc, char **argv) {
   for (u64 s = 0; s < steps; ++s) {
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      lb::LaunchFwd1(g, b, gpu, dw, w1_off, b1_off, I,
+      // Step s reads the weights the previous step published (gen s+1) and
+      // the updates republish them as s+2 -- the same discipline as the
+      // grayscott halo, applied to every paged read in the loop.
+      lb::LaunchFwd1(g, b, gpu, dw, w1_off, d_b1, I,
                                                   H, B, d_x, d_a1, hper, rpp1,
-                                                  h0, h1, vw, sv);
+                                                  h0, h1,
+                                                  static_cast<u64>(s) + 1,
+                                                  vw, sv);
     });
     // Fwd2 sums over EVERY h, so it needs the whole a1, not this node's
     // band. Without this each node forward-propagates a fraction of the
@@ -450,9 +460,10 @@ int main(int argc, char **argv) {
     }
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      lb::LaunchFwd2(g, b, gpu, dw, w2_off, b2_off, H,
+      lb::LaunchFwd2(g, b, gpu, dw, w2_off, d_b2, H,
                                                   O, B, d_a1, d_y, d_d2, d_lp,
                                                   oper, rpp2 ? rpp2 : 1, o0, o1,
+                                                  static_cast<u64>(s) + 1,
                                                   vw, sv);
     });
     // Bwd1 sums over EVERY o, so d2 has to be whole before it runs.
@@ -482,16 +493,18 @@ int main(int argc, char **argv) {
     }
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      lb::LaunchUpd2(g, b, gpu, dw, w2_off, b2_off, H,
+      lb::LaunchUpd2(g, b, gpu, dw, w2_off, d_b2, H,
                                                   O, B, d_a1, d_d2, lr, oper,
                                                   rpp2 ? rpp2 : 1, o0, o1,
                                                   static_cast<u64>(s) + 2, vw, sv);
     });
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
-      lb::LaunchUpd1(g, b, gpu, dw, w1_off, b1_off, I,
+      lb::LaunchUpd1(g, b, gpu, dw, w1_off, d_b1, I,
                                                   H, B, d_x, d_d1, lr, hper,
-                                                  rpp1, h0, h1, vw, sv);
+                                                  rpp1, h0, h1,
+                                                  static_cast<u64>(s) + 2,
+                                                  vw, sv);
     });
     ctp::GpuApi::Synchronize();
     // Each node summed only its own o-band; the loss is over the whole
@@ -504,6 +517,26 @@ int main(int argc, char **argv) {
       return 1;
     }
     loss_got[s] = lpart / static_cast<double>(B * O);
+    // LB_TRACE=1: per-step checksums of every exchanged array, so a loss
+    // divergence can be attributed to ONE producer instead of theorised
+    // about. Sums in fixed index order; the arrays are already on the host
+    // from the gathers.
+    if (const char *lt = getenv("LB_TRACE"); lt && lt[0]) {
+      double sa = 0, sd2 = 0, sd1 = 0, slp = 0;
+      ctp::GpuApi::Memcpy(h_a1.data(), d_a1, h_a1.size() * sizeof(float));
+      ctp::GpuApi::Memcpy(h_d2.data(), d_d2, h_d2.size() * sizeof(float));
+      ctp::GpuApi::Memcpy(h_d1.data(), d_d1, h_d1.size() * sizeof(float));
+      for (float v : h_a1) sa += v;
+      for (float v : h_d2) sd2 += v;
+      for (float v : h_d1) sd1 += v;
+      {
+        std::vector<double> lp(O * B);
+        ctp::GpuApi::Memcpy(lp.data(), d_lp, O * B * sizeof(double));
+        for (u64 i = o0 * B; i < o1 * B; ++i) slp += lp[i];
+      }
+      std::printf("  TRACE s=%llu a1=%.17g d2=%.17g d1=%.17g lp_own=%.17g\n",
+                  (unsigned long long)s, sa, sd2, sd1, slp);
+    }
     // WHY THERE IS NO PER-STEP WEIGHT EXCHANGE HERE. Bwd1 reads ALL of W2,
     // including o-rows a peer just updated, so next step it sums against a
     // stale cached copy -- that is the residual 1e-3 the weight gate
@@ -537,15 +570,6 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                 gy::YieldStackView sv) {
-    lb::LaunchDigest(g, b, gpu, dw, n, eper,
-                                                  elems_per_page, &d_dg[1],
-                                                  vw, sv);
-  });
-  ctp::GpuApi::Synchronize();
-  unsigned long long dg[2] = {0, 0};
-  ctp::GpuApi::Memcpy(dg, d_dg, sizeof(dg));
 
   const auto st = w.ReadStats(0);
   std::printf("  paging: faults=%llu evicts=%llu puts=%llu get_errors=%llu "
@@ -584,76 +608,59 @@ int main(int argc, char **argv) {
   } else {
     rc = 1;
   }
-  if (nodes > 1) {
-    // ELEMENTWISE, not the digest. The digest is a bit-exact hash, so one
-    // differing low bit rehashes to something completely unrelated and it
-    // cannot express "close". This walks the same weights and takes the
-    // largest absolute difference, so it still fails on a SINGLE wrong
-    // element -- a sum or a looser hash would average one away.
-    auto *d_md = ctp::GpuApi::Malloc<unsigned long long>(
-        sizeof(unsigned long long));
-    ctp::GpuApi::Memset(d_md, 0, sizeof(unsigned long long));
-    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                   gy::YieldStackView sv) {
-      lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
-                        d_md, 0, n, static_cast<u64>(steps) + 2, vw, sv);
-    });
-    ctp::GpuApi::Synchronize();
-    unsigned long long md = 0;
-    ctp::GpuApi::Memcpy(&md, d_md, sizeof(md));
-    ctp::GpuApi::Free(d_md);
-    const double maxdiff = static_cast<double>(md) / 1e9;
-    // WHICH region drifts. A whole-vector maximum says only that one does.
-    if (const char *e = getenv("LB_REGION_DIFF")) {
-      if (e[0] != '\0') {
-        const struct { const char *nm; u64 lo, hi; } regs[] = {
-            {"W1", w1_off, w1_off + I * H}, {"b1", b1_off, b1_off + H},
-            {"W2", w2_off, w2_off + H * O}, {"b2", b2_off, b2_off + O},
-            // W2 split by ownership. If the drift is in the PEER band the
-            // generational demand is not landing; if it is in this node's
-            // OWN band then Upd2 is subtracting from a stale W2. The two
-            // have different fixes, so the probe has to tell them apart.
-            {"W2-own", w2_off + o0 * H, w2_off + o1 * H},
-            {"W2-peer-lo", w2_off, w2_off + o0 * H},
-            {"W2-peer-hi", w2_off + o1 * H, w2_off + H * O}};
-        for (const auto &r : regs) {
-          auto *d_r = ctp::GpuApi::Malloc<unsigned long long>(
-              sizeof(unsigned long long));
-          ctp::GpuApi::Memset(d_r, 0, sizeof(unsigned long long));
-          runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                         gy::YieldStackView sv) {
-            lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page,
-                              d_wref, d_r, r.lo, r.hi,
-                              static_cast<u64>(steps) + 2, vw, sv);
-          });
-          ctp::GpuApi::Synchronize();
-          unsigned long long rv = 0;
-          ctp::GpuApi::Memcpy(&rv, d_r, sizeof(rv));
-          ctp::GpuApi::Free(d_r);
-          std::printf("  REGION %s max|diff| = %.6g\n", r.nm,
-                      static_cast<double>(rv) / 1e9);
-        }
-      }
-    }
-    // 1e-5 absolute on weights that start at O(1) and are stepped by an
-    // lr-scaled gradient: loose enough for a reordered sum over 5 steps
-    // (measured drift 2.4e-8 in the loss), tight enough that a stale or
-    // dropped page -- which moves a weight by its whole update -- fails.
-    if (maxdiff > 1e-5) {
-      std::printf("  WEIGHT GATE: FAIL (max |paged - dense| = %.3g > "
-                  "1e-5)\n", maxdiff);
+  {
+    // ONE WEIGHT GATE FOR BOTH MODES, elementwise over the two weight
+    // regions. The digest is gone: it hashed the whole vector including the
+    // bias pages, which are dead now that the biases live outside it -- and
+    // its bit-exactness quantum was ALSO the reason a real distributed error
+    // hid for a round: a drift of ~5e-10/element sat below the 1e-9
+    // reporting floor and printed as "max = 0". The floor is now stated in
+    // the message instead of implied.
+    auto range_maxdiff = [&](u64 lo_e, u64 hi_e) -> double {
+      auto *d_md = ctp::GpuApi::Malloc<unsigned long long>(
+          sizeof(unsigned long long));
+      ctp::GpuApi::Memset(d_md, 0, sizeof(unsigned long long));
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchMaxDiff(g, b, gpu, dw, n, eper, elems_per_page, d_wref,
+                          d_md, lo_e, hi_e, // steps+1, exactly: step s publishes s+2 for s in [0, steps), so the
+                          // final generation is steps+1. Demanding steps+2 HANGS
+                          // under OOC now that W1 is stamped too -- it only ever
+                          // "worked" because gen-0 blobs satisfy any demand.
+                          static_cast<u64>(steps) + 1, vw,
+                          sv);
+      });
+      ctp::GpuApi::Synchronize();
+      unsigned long long md = 0;
+      ctp::GpuApi::Memcpy(&md, d_md, sizeof(md));
+      ctp::GpuApi::Free(d_md);
+      return static_cast<double>(md) / 1e9;
+    };
+    const double md1 = range_maxdiff(w1_off, w1_off + I * H);
+    const double md2 = range_maxdiff(w2_off, w2_off + H * O);
+    const double maxdiff = md1 > md2 ? md1 : md2;
+    // The BIASES are compared exactly on the host: same summation order on
+    // both paths (one accumulator per output row, b ascending), and in the
+    // distributed case every node computes them from the gathered, bit-
+    // identical d1/d2 -- so equality is the expectation, not a hope.
+    std::vector<float> pb1(H), pb2(O), rb1(H), rb2(O);
+    ctp::GpuApi::Memcpy(pb1.data(), d_b1, H * sizeof(float));
+    ctp::GpuApi::Memcpy(pb2.data(), d_b2, O * sizeof(float));
+    ctp::GpuApi::Memcpy(rb1.data(), d_wref + b1_off, H * sizeof(float));
+    ctp::GpuApi::Memcpy(rb2.data(), d_wref + b2_off, O * sizeof(float));
+    u64 bias_bad = 0;
+    for (u64 i = 0; i < H; ++i) bias_bad += (pb1[i] != rb1[i]);
+    for (u64 i = 0; i < O; ++i) bias_bad += (pb2[i] != rb2[i]);
+    const double wtol = (nodes > 1) ? 1e-5 : 0.0;
+    if (maxdiff > wtol || bias_bad != 0) {
+      std::printf("  WEIGHT GATE: FAIL (W1 %.3g W2 %.3g vs tol %.3g at 1e-9 "
+                  "resolution; %llu bias elements differ)\n",
+                  md1, md2, wtol, (unsigned long long)bias_bad);
       rc = 1;
     } else {
-      std::printf("  WEIGHT GATE: PASS (max |paged - dense| = %.3g, "
-                  "%u nodes)\n", maxdiff, nodes);
+      std::printf("  WEIGHT GATE: PASS (W1 %.3g W2 %.3g at 1e-9 resolution, "
+                  "biases bit-equal, %u nodes)\n", md1, md2, nodes);
     }
-  } else if (dg[0] != dg[1]) {
-    std::printf("  WEIGHT GATE: FAIL (digest paged %llu != dense %llu)\n",
-                dg[1], dg[0]);
-    rc = 1;
-  } else {
-    std::printf("  WEIGHT GATE: PASS (final weights bit-equal to dense "
-                "reference)\n");
   }
   std::printf("%s\n", rc == 0 ? "LBANN BENCH: ALL GATES PASS"
                               : "LBANN BENCH: GATE FAILURE");

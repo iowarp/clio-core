@@ -116,10 +116,46 @@ bench_name() {   # deck() sets BENCH for the CUDA edition; adjust for SYCL
   [ "${GVW_VARIANT:-}" = sycl ] && echo "${1}_sycl" || echo "$1"
 }
 
+# GVW_OOC=1 swaps every deck for an OUT-OF-CORE one: the working set exceeds
+# the paged cache, so pages evict to the CTE RAM tier and refault -- while the
+# nodes are ALSO exchanging across the wire. The resident decks above never
+# touch this path, and it is where this codebase's historical bugs live
+# (eviction undoing writes, stale refetch, hold-set livelock).
+#
+# Every deck was calibrated single-node and its evict count recorded; run_one
+# REQUIRES evicts > 0 in both the reference and the distributed log, so a deck
+# that silently stops evicting FAILS rather than quietly proving nothing.
+ooc_deck() {
+  REQUIRE_EVICTS=1
+  case "$1" in
+    kmeans)    ARGS="--data-mb 256 --blocks 8 --iters 3 --repeat 1 --slots 4" ;;   # 12288 evicts
+    weights)   ARGS="--blocks 8 --pages 32 --slots 4 --repeat 1" ;;                # 449 evicts
+    gmx)       ARGS="--page-kb 32 --atoms 20000 --repeat 1 --blocks 4 --cap 20" ;; # 248 evicts; cap floor = 4 holds/block x blocks
+    # 512, not 256: --data-mb is the GLOBAL field, so at 2 nodes each slab is
+    # half of it -- 256 gave a per-node slab whose sliding window fit the
+    # cache and the distributed run evicted ZERO (the witness caught it).
+    # 512 makes the per-node shape match the single-node one that evicts.
+    grayscott) ARGS="--data-mb 512 --blocks 8 --steps 4 --repeat 1" ;;
+    lbann)     ARGS="--blocks 4 --cap 24" ;;                                       # 870 evicts (~82 weight pages through 24)
+    # lattice 28 (nb=16), NOT 32: the distributed split needs a z-plane that
+    # is a whole number of pages, and nb=19's plane (nb^2*512 B) has no sane
+    # power-of-two divisor -- the bench refuses it at --nodes 2. Pressure comes
+    # from the PAGE SIZE instead: 32KB pages double the page count to 64
+    # against 28 slots. --rowchunk 1 because a 6-row held span needs 48KB.
+    lammps_md) ARGS="--md --lattice 28 --steps 10 --blocks 8 --slots 28 --page-kb 32 --rowchunk 1" ;; # 3313 evicts, E0 = documented -592121.595111
+  esac
+}
+
+max_evicts() { grep -ohE 'evicts=[0-9]+' "$1" 2>/dev/null | sed 's/evicts=//' | sort -n | tail -1; }
+
 extract() { sed -nE "s/.*${1}.*/\\1/p" "$2" | head -1; }
 
 run_one() {
-  local wl="$1"; deck "$wl"
+  local wl="$1"; REQUIRE_EVICTS=""; deck "$wl"
+  # The OOC override replaces only the deck; keys, tolerances and the
+  # reference-comparison logic are unchanged -- the reference run recomputes
+  # its value from the same deck, so nothing here hardcodes a resident answer.
+  [ -n "${GVW_OOC:-}" ] && ooc_deck "$wl"
   echo "=== $wl${GVW_VARIANT:+ [$GVW_VARIANT]}: single-node reference"
   local ref_log="/tmp/gvw_${wl}_ref.log"
   ( cd "$BIN_DIR" && LD_LIBRARY_PATH="${DPCPP_HOME:-/nonexistent}/lib:$BIN_DIR:$LD_LIBRARY_PATH" \
@@ -169,6 +205,18 @@ run_one() {
       if (r > t) { printf "  GATE FAIL: rel %.3g > %s\n", r, t; exit 1 }
       printf "  GATE PASS: rel %.3g <= %s\n", r, t }' || return 1
   fi
+  # PRESSURE WITNESS. An OOC gate that stopped evicting proves nothing: the
+  # deck has quietly become resident and every eviction-path bug is invisible.
+  if [ -n "${REQUIRE_EVICTS:-}" ]; then
+    local rev dev
+    rev="$(max_evicts "$ref_log")"; dev="$(max_evicts "/tmp/gvw_${wl}_dist.log")"
+    echo "  evictions: 1-node=${rev:-0} distributed=${dev:-0}"
+    if [ "${rev:-0}" -eq 0 ] || [ "${dev:-0}" -eq 0 ]; then
+      echo "  GATE FAIL: the OOC deck did not evict -- the pressure this gate"
+      echo "             exists to apply is not being applied"
+      return 1
+    fi
+  fi
   # The load-bearing check: with a witness declared, the distributed value
   # must differ from the single-node one. Equality means the extra nodes
   # changed nothing, which is the failure this whole harness exists to catch.
@@ -189,7 +237,14 @@ run_one() {
   # NEGATIVE CONTROL. If disabling the exchange leaves the answer unchanged,
   # the exchange is not load-bearing and the pass above proves nothing. Only
   # run it after a pass, and only where a control is defined.
-  if [ -n "$CONTROL_ENV" ]; then
+  # The control is meaningful only on the RESIDENT deck. Under OOC, eviction
+  # invalidates every frame between steps anyway, so the refault fetches the
+  # peer's published plane even with the generational demand disabled -- each
+  # boundary blob has a single writer, so there is no wrong replica to be
+  # served. Measured: at --data-mb 512 the control matches the real run
+  # exactly, while the resident control still moves (36410.579344 vs
+  # 36104.119147). Running it here would fail every correct OOC run.
+  if [ -n "$CONTROL_ENV" ] && [ -z "${GVW_OOC:-}" ]; then
     rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
     env $CONTROL_ENV docker compose up -d $SVCS >/dev/null 2>&1
@@ -203,6 +258,8 @@ run_one() {
       return 1
     fi
   fi
+  [ -n "$CONTROL_ENV" ] && [ -n "${GVW_OOC:-}" ] && \
+    echo "  (control skipped: eviction invalidates frames regardless, see note)"
   echo "  $wl OK"
 }
 

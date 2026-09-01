@@ -920,3 +920,47 @@ endif()
 # clio_kmeans_mpi_bench_sycl, which was declared ALL and had never once been
 # built. Any name that appears here in future is either a deliberate
 # exclusion or a gap.
+
+# ---------------------------------------------------------------------------
+# OUT-OF-CORE distributed gates -- the configuration the resident gates never
+# touch, and the one that matters.
+#
+# GVW_OOC=1 swaps each workload's deck for one whose working set exceeds the
+# paged cache: pages EVICT to the CTE RAM tier and refault while the nodes are
+# simultaneously exchanging across the wire. Historically every hard gpu_vector
+# bug lived on exactly this path (eviction undoing writes, stale refetch,
+# hold-set livelock) -- a green resident gate says nothing about any of them.
+#
+# The harness asserts evicts > 0 in BOTH the single-node reference and the
+# distributed run, so a deck that quietly becomes resident FAILS the gate
+# instead of hollowing it out.
+#
+#   ctest -L gv_dist_ooc         # CUDA, 2 nodes, under eviction
+#   ctest -L gv_dist_ooc_sycl    # the SYCL editions of the same
+# ---------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+        add_test(NAME cte_gv_ooc_${_wl}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+        )
+        set_tests_properties(cte_gv_ooc_${_wl} PROPERTIES
+            TIMEOUT 2400
+            LABELS "cte;gpu;gpu_vector;gv_dist_ooc;distributed;docker"
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_OOC=1")
+    endforeach()
+endif()
+
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
+   AND CLIO_GV_SYCL_BUILD_DIR)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+        add_test(NAME cte_gv_ooc_sycl_${_wl}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+        )
+        set_tests_properties(cte_gv_ooc_sycl_${_wl} PROPERTIES
+            TIMEOUT 2400
+            LABELS "cte;gpu;gpu_vector;gv_dist_ooc_sycl;distributed;docker"
+            RUN_SERIAL TRUE
+            ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_OOC=1;GVW_VARIANT=sycl")
+    endforeach()
+endif()

@@ -424,20 +424,12 @@ int main(int argc, char **argv) {
                    zbase, zend, vw, sv);
   });
   ctp::GpuApi::Synchronize();
-  // THE SEED IS SHARDED TOO, so the first step's halo planes belong to a
-  // peer and must be published before anyone reads them.
-  if (nodes > 1) {
-    vec.FlushResidentToCte();
-    if (!clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes,
-                                  red_round++, "gsseed")) {
-      std::fprintf(stderr, "GRAYSCOTT ERROR: seed barrier failed\n");
-      return 1;
-    }
-    if (!clio_bench_dist::SettleAndInvalidate(vec)) {
-      std::fprintf(stderr, "GRAYSCOTT ERROR: cache never settled\n");
-      return 1;
-    }
-  }
+  // NO seed-side flush/barrier/invalidate. SeedCoro publishes its own
+  // planes AS generation 1 (BeginFlush(1) + EndFlush), and step 0's halo
+  // fetch DEMANDS generation 1 -- the demand polls until the peer's
+  // publish is served, so the generation is the barrier. A whole-table
+  // flush here republishes nothing new, and an invalidate drops frames
+  // that were never stale (the seed touches only this node's slab).
 
   double *d_sum = nullptr;
   d_sum = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sum)>>(sizeof(double));
@@ -556,39 +548,21 @@ int main(int argc, char **argv) {
                          halo_off ? 0 : static_cast<u64>(s) + 1, vw, sv);
         });
       }
-      // THIS IS THE HALO EXCHANGE. Computing plane z needs z-1 and z+1, so
-      // at a slab edge a node reads a plane its NEIGHBOUR just wrote. A
-      // page the neighbour still holds resident is invisible to everyone
-      // else, so without this the next step reads a stale boundary plane
-      // and the field quietly diverges -- and unlike gmx, whose gates are
-      // bit-exact, this bench's checksum has a tolerance that would absorb
-      // the error rather than fail. The flush publishes this slab; the
-      // barrier stops any node starting the next step before every peer
-      // has published. GS_NO_HALO=1 skips both, as the negative control.
-      if (nodes > 1 && !halo_off) {
-        ctp::GpuApi::Synchronize();
-        // StepCoro BeginFlush-es the planes it writes and EndFlush-es at
-        // the end, but dropping this whole-table publish measured WORSE
-        // (5.98% vs 0.84%), so some writes are not reaching the CTE by
-        // kernel exit alone. Keep it until that is understood.
-        vec.FlushResidentToCte();
-        if (!clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes,
-                                      red_round++, "gsbar")) {
-          std::fprintf(stderr, "GRAYSCOTT ERROR: halo barrier failed\n");
-          return 1;
-        }
-        // FLUSHING IS ONLY HALF OF IT. A node that faulted in a peer's
-        // boundary plane KEEPS that frame resident, so next step it reads
-        // its own stale copy and never notices the peer rewrote the plane.
-        // Publishing without invalidating measured 34251.995658 against a
-        // single-node 36410.579344 -- 5.9% off, silently. Drop every frame
-        // so the next step refaults from the CTE. Ordering matters: flush
-        // (publish mine), barrier (everyone has published), THEN clear.
-        if (!clio_bench_dist::SettleAndInvalidate(vec)) {
-          std::fprintf(stderr, "GRAYSCOTT ERROR: cache never settled\n");
-          return 1;
-        }
-      }
+      // NO per-step flush/barrier/invalidate: the generational demand IS
+      // the halo exchange. A halo fetch names generation s+1 and a stale
+      // RESIDENT peer frame takes the gen-stale refetch path, so neither
+      // an explicit barrier nor a cache clear is needed -- and the clear
+      // was actively harmful: SettleAndInvalidate dropped EVERY frame
+      // each step, so the eviction path never engaged in a distributed
+      // run (the OOC gate measured evicts=0 against 844 single-node,
+      // which is what exposed this). The "removing the flush measured
+      // 5.98% worse" note that used to justify this block was measured
+      // BEFORE generations were threaded through, on single runs of a
+      // quantity later shown to vary run-to-run.
+      //
+      // GS_NO_HALO=1 remains the negative control, applied where it now
+      // belongs: it forces the step's halo demand back to generation 0
+      // at the launch site.
       std::swap(cu, nu);
       std::swap(cv, nv);
     }

@@ -46,7 +46,7 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 }
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
@@ -54,13 +54,13 @@ void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const u64 blk = static_cast<u64>(blk_);
                     const bool bias0 = (blk == 0);
                     (void)bias0;
-                    return Fwd1Coro(dev, w1_off, b1_off, I, H, B, x, a1, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp);
+                    return Fwd1Coro(dev, w1_off, b1v, I, H, B, x, a1, rbase + blk * hper,
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen);
                   });
 }
 
 void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w2_off, const float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
@@ -68,8 +68,8 @@ void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const u64 blk = static_cast<u64>(blk_);
                     const bool bias0 = (blk == 0);
                     (void)bias0;
-                    return Fwd2Coro(dev, w2_off, b2_off, H, O, B, a1, y, d2, loss_parts, rbase + blk * oper,
-                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp);
+                    return Fwd2Coro(dev, w2_off, b2v, H, O, B, a1, y, d2, loss_parts, rbase + blk * oper,
+                          ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp, gen);
                   });
 }
 
@@ -88,7 +88,7 @@ void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 }
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
+                 u64 w2_off, float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
@@ -96,13 +96,13 @@ void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const u64 blk = static_cast<u64>(blk_);
                     const bool bias0 = (blk == 0);
                     (void)bias0;
-                    return Upd2Coro(dev, w2_off, b2_off, H, O, B, a1, d2, lr, rbase + blk * oper,
+                    return Upd2Coro(dev, w2_off, b2v, H, O, B, a1, d2, lr, rbase + blk * oper,
                           ((rbase + (blk + 1) * oper) < rend) ? (rbase + (blk + 1) * oper) : rend, rpp, gen, bias0);
                   });
 }
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
@@ -110,8 +110,8 @@ void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const u64 blk = static_cast<u64>(blk_);
                     const bool bias0 = (blk == 0);
                     (void)bias0;
-                    return Upd1Coro(dev, w1_off, b1_off, I, H, B, x, d1, lr, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, bias0);
+                    return Upd1Coro(dev, w1_off, b1v, I, H, B, x, d1, lr, rbase + blk * hper,
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen, bias0);
                   });
 }
 

@@ -33,11 +33,11 @@ using GpuInfo = ::clio::run::IpcManagerGpuInfo;
 void InitBackend(u32 max_blocks, const GpuInfo &info);
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv);
 
 void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w2_off, const float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv);
 
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
@@ -45,11 +45,11 @@ void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  View vw, StackView sv);
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w2_off, u64 b2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
+                 u64 w2_off, float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv);
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
-                 u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend,
+                 u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv);
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,

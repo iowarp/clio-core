@@ -69,6 +69,7 @@ services:
       - GS_NO_HALO=${GS_NO_HALO:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - LB_TRACE=${LB_TRACE:-}
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
@@ -94,6 +95,7 @@ services:
       - GS_NO_HALO=${GS_NO_HALO:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - LB_TRACE=${LB_TRACE:-}
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
@@ -123,6 +125,7 @@ services:
       - GS_NO_HALO=${GS_NO_HALO:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - LB_TRACE=${LB_TRACE:-}
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
@@ -152,6 +155,7 @@ services:
       - GS_NO_HALO=${GS_NO_HALO:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
+      - LB_TRACE=${LB_TRACE:-}
       - GS_FORCE_DIST=${GS_FORCE_DIST:-}
       - GVW_NODES=${GVW_NODES:-2}
       - CLIO_NUM_CONTAINERS=${GVW_NODES:-2}
