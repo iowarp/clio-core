@@ -15,6 +15,7 @@
  *
  * MainPretest()/MainPosttest() are defined once per binary in test_models.cc.
  */
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -156,4 +157,30 @@ TEST_CASE("PredictionReuseRegistryIsStableUnderConcurrentCallers") {
     REQUIRE_FALSE(used[seen[0][i]]);
     used[seen[0][i]] = true;
   }
+}
+
+/* A large ceiling must not cost anything until it is used. `capacity` is an
+   upper bound most runs never approach, so the registry reserves for a
+   working set rather than for the bound -- and a registry declared with a
+   million slots still behaves exactly like a small one for the ten lineages
+   a mesh code actually has. */
+TEST_CASE("PredictionReuseRegistryLargeCapacityBehavesLikeASmallOne") {
+  LineageSlotRegistry big(/*capacity=*/1u << 20);
+  REQUIRE(big.capacity() == (1u << 20));
+  REQUIRE(big.size() == 0);
+
+  std::vector<uint32_t> slots;
+  for (int i = 0; i < 10; ++i) {
+    const uint32_t s = big.SlotFor("field/chunk_" + std::to_string(i));
+    REQUIRE(s != kNoLineageSlot);
+    slots.push_back(s);
+  }
+  // Dense from zero, whatever the ceiling: the slot is the insertion index,
+  // so the device array is used from the front and a big ceiling wastes
+  // device memory but never scatters the slots that are in use.
+  std::sort(slots.begin(), slots.end());
+  for (int i = 0; i < 10; ++i) REQUIRE(slots[i] == static_cast<uint32_t>(i));
+  REQUIRE(big.size() == 10);
+  // Stable, as for any other capacity.
+  REQUIRE(big.SlotFor("field/chunk_3") == 3);
 }

@@ -468,8 +468,31 @@ void Runtime::InitPredictionReuse() {
       "CLIO_NEUROPRESS_REUSE_REFRESH_STEPS",
       static_cast<double>(np_reuse_thresholds_.refresh_interval)));
 
-  const uint32_t capacity = static_cast<uint32_t>(
-      env_num("CLIO_NEUROPRESS_REUSE_MAX_LINEAGES", 4096));
+  /* Distinct (field, chunk index) pairs the run may track. Sized to be a
+     ceiling nobody has to think about rather than a budget: at 1032 bytes a
+     slot the default is 258 MiB, 0.6% of an A100, against mesh codes that
+     use tens of lineages and finely chunked particle codes that use tens of
+     thousands. A run that exceeds it still works -- lineages past the bound
+     simply run the model every time (see LineageSlotRegistry) -- so the cost
+     of setting it too low is lost reuse, and of too high, device memory.
+     The registry does NOT reserve host memory for this bound.
+
+     Clamped before the narrowing cast: converting an out-of-range double to
+     uint32_t is undefined, so a fat-fingered 1e12 must not become a garbage
+     capacity. Above the clamp the allocation would fail anyway, which is
+     handled below, but failing predictably beats failing by luck. */
+  constexpr double kMaxLineageSlots = 1048576.0;  // ~1 GiB of device state
+  const double requested =
+      env_num("CLIO_NEUROPRESS_REUSE_MAX_LINEAGES", 262144);
+  double clamped = requested;
+  if (!(clamped >= 1.0)) clamped = 1.0;
+  if (clamped > kMaxLineageSlots) clamped = kMaxLineageSlots;
+  if (clamped != requested) {
+    HLOG(kWarning,
+         "CLIO_NEUROPRESS_REUSE_MAX_LINEAGES={} is out of range; using {}",
+         requested, clamped);
+  }
+  const uint32_t capacity = static_cast<uint32_t>(clamped);
   np_reuse_states_ =
       ctp::compress::preprocess::ReuseStatesAlloc(capacity);
   if (np_reuse_states_ == nullptr) {
@@ -487,11 +510,12 @@ void Runtime::InitPredictionReuse() {
   np_reuse_enabled_ = true;
   HLOG(kInfo,
        "NeuroPress prediction reuse ON: step={} anchor={} refresh={} "
-       "capacity={} lineages ({} KiB on the device)",
+       "capacity={} lineages ({} MiB on the device)",
        np_reuse_thresholds_.step, np_reuse_thresholds_.anchor,
        np_reuse_thresholds_.refresh_interval, capacity,
-       (capacity * sizeof(ctp::compress::preprocess::DevicePredictionReuseState))
-           / 1024);
+       (static_cast<size_t>(capacity) *
+        sizeof(ctp::compress::preprocess::DevicePredictionReuseState)) /
+           (1024 * 1024));
 }
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {

@@ -168,7 +168,12 @@ struct DevicePredictionReuseState {
 class LineageSlotRegistry {
  public:
   explicit LineageSlotRegistry(uint32_t capacity) : capacity_(capacity) {
-    slots_.reserve(capacity);
+    // Reserve for a plausible working set, NOT for the ceiling. `capacity` is
+    // an upper bound that most runs never approach -- a field-per-chunk mesh
+    // code uses tens of lineages -- and reserving it outright would allocate
+    // a bucket array sized for the bound before a single key exists. The map
+    // grows on demand; this only avoids rehashing in the common case.
+    slots_.reserve(capacity < 1024u ? capacity : 1024u);
   }
 
   /** @return dense slot in [0, capacity), or kNoLineageSlot when the key is
