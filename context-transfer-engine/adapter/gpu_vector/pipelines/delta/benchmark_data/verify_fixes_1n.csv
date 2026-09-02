@@ -1,0 +1,9 @@
+workload,blocks,bench_ms,peak_gpu_mb,gates
+weights,22,2139.2,32429,1
+weights,43,1102.9,32429,1
+weights,65,733.2,32429,1
+weights,86,557.7,32429,1
+lbann,16,,29921,0
+lbann,32,,29921,0
+lbann,64,,29921,0
+lbann,86,,29921,0

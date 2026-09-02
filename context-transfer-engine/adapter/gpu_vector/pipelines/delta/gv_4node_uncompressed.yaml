@@ -1,0 +1,59 @@
+# 4-node UNCOMPRESSED sweep: 6 workloads x blocks{20,40,60,80% of 108 SMs}=22/43/65/86,
+# mpi variant, 16 ranks (4 nodes x 4 A100), per-GPU peak ~32 GB. No page-cache axis
+# (mpi variant has no page cache). Launched via native jarvis -> srun+pmix -> apptainer.
+config:
+  name: gv_4node_uncompressed
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: mpi
+      nprocs: 16
+      steps: 4
+      blocks_level: 1
+      timeout_sec: 2400
+      mpi_launcher: "srun --mpi=pmix -n {n} apptainer exec --nv --bind /u/rpawar /u/rpawar/containers/deps-nvidia.sif /u/rpawar/gsbench/bench_env_wrapper.sh"
+      output_dir: /u/rpawar/eternia_logs/gv4n_cells
+vars:
+  wl.workload:  [kmeans,  weights, grayscott, gmx,    lbann,     lammps_md]
+  wl.steps:     [4,       3,       4,         0,      2,         10]
+  wl.data_mb:   [512000,  512000,  512000,    0,      0,         0]
+  wl.mesh_k:    [0,       0,       0,         4158,   0,         0]
+  wl.atoms:     [0,       0,       0,         200000, 0,         0]
+  wl.hidden:    [0,       0,       0,         0,      12582912,  0]
+  wl.in_dim:    [0,       0,       0,         0,      4096,      0]
+  wl.out_dim:   [0,       0,       0,         0,      64,        0]
+  wl.batch:     [0,       0,       0,         0,      256,       0]
+  wl.lr:        [0,       0,       0,         0,      0.00001,   0]
+  wl.lattice:   [0,       0,       0,         0,      0,         542]
+  wl.ckpt:      [0,       0,       0,         0,      0,         5]
+  wl.blocks_ladder:
+    - "22,43,65,86"
+    - "22,43,65,86"
+    - "22,43,65,86"
+    - "22,43,65,86"
+    - "16,32,64,86"
+    - "22,43,65,86"
+  wl.blocks_level: [1, 2, 3, 4]
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.mesh_k, wl.atoms, wl.hidden,
+     wl.in_dim, wl.out_dim, wl.batch, wl.lr, wl.lattice, wl.ckpt, wl.blocks_ladder]
+  - [wl.blocks_level]
+repeat: 1
+output: "${HOME}/gv_pipeline_results/gv_4node_uncompressed"
+post: |
+  import matplotlib; matplotlib.use('Agg')
+  import matplotlib.pyplot as plt, pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  ok = df[df.get('gates_pass',0)==1]
+  logger.info(f"{len(ok)}/{len(df)} cells passed gates")
+  ORDER=['kmeans','weights','grayscott','gmx','lbann','lammps_md']
+  fig,ax=plt.subplots(1,2,figsize=(14,5))
+  for wl in ORDER:
+      g=ok[ok['wl.workload']==wl].sort_values('blocks_resolved')
+      if len(g): ax[0].plot(g['blocks_resolved'], g['bench_ms'],'o-',label=wl)
+      if len(g): ax[1].plot(g['blocks_resolved'], g['vram_peak_mb'],'o-',label=wl)
+  ax[0].set_xlabel('CUDA blocks (20-80% of 108 SMs)'); ax[0].set_ylabel('bench_ms'); ax[0].set_title('4-node uncompressed: runtime vs blocks'); ax[0].legend(fontsize=8); ax[0].set_yscale('log')
+  ax[1].set_xlabel('CUDA blocks'); ax[1].set_ylabel('peak GPU MB/rank'); ax[1].set_title('per-GPU peak (~32GB target)'); ax[1].legend(fontsize=8)
+  fig.tight_layout(); fig.savefig(os.path.join(output_dir,'gv_4node_uncompressed.png'),dpi=130)
+  logger.info('wrote gv_4node_uncompressed.png')

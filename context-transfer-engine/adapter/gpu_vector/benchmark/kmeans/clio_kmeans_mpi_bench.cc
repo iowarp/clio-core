@@ -39,9 +39,11 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -63,6 +65,40 @@ using u64 = unsigned long long;
 using clio_km::NearestCentroid;
 using clio_km::PointVal;
 using clio_km::UpdateCentroid;
+
+// Load a REAL feature file into a flat [n0*dims] host array. Dispatches on
+// extension: ".f32" = raw [N x dims] float32 (e.g. papers100M agg_features,
+// no normalization); otherwise SIFT .fvecs (int32 dim header per record,
+// normalized /255). Returns n0 (0 on failure). The MPI bench then TILES this
+// real data to reach the requested per-rank size -- same real-data-tiled
+// methodology as the capacity/eviction tests.
+static u64 LoadRealFeatures(const std::string &path, u32 dims,
+                            std::vector<float> &out) {
+  const bool raw = path.size() > 4 && path.substr(path.size() - 4) == ".f32";
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return 0;
+  f.seekg(0, std::ios::end);
+  const long long bytes = f.tellg();
+  f.seekg(0, std::ios::beg);
+  if (raw) {
+    const u64 n0 = (u64)bytes / ((u64)dims * sizeof(float));
+    out.resize(n0 * (u64)dims);
+    f.read(reinterpret_cast<char *>(out.data()),
+           (std::streamsize)(out.size() * sizeof(float)));
+    return f ? n0 : 0;
+  }
+  const u64 rec = 4 + (u64)dims * 4;  // int32 dim + dims float32
+  const u64 n0 = (u64)bytes / rec;
+  out.resize(n0 * (u64)dims);
+  for (u64 p = 0; p < n0; ++p) {
+    std::int32_t d = 0;
+    f.read(reinterpret_cast<char *>(&d), 4);
+    if (!f || (u32)d != dims) return 0;
+    f.read(reinterpret_cast<char *>(out.data() + p * dims), 4ll * dims);
+    for (u32 j = 0; j < dims; ++j) out[p * dims + j] *= (1.0f / 255.0f);
+  }
+  return n0;
+}
 
 __global__ void SeedKernel(float *pts, u64 base_idx, u64 n, u32 dims, u32 k) {
   for (u64 i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -116,6 +152,7 @@ int main(int argc, char **argv) {
   u64 data_mb = 256;
   double check_csum = 0.0, check_tol = 1e-4;
   bool do_check = false;
+  std::string data_file;  // REAL dataset (.fvecs SIFT / .f32 raw); tiled to size
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -127,6 +164,7 @@ int main(int argc, char **argv) {
     else if (a == "--clusters") k = static_cast<u32>(next());
     else if (a == "--iters") iters = static_cast<u32>(next());
     else if (a == "--data-mb") data_mb = next();
+    else if (a == "--data-file" && i + 1 < argc) data_file = argv[++i];
     else if (a == "--check-csum" && i + 1 < argc) {
       check_csum = std::strtod(argv[++i], nullptr);
       do_check = true;
@@ -163,14 +201,39 @@ int main(int argc, char **argv) {
 
   float *d_pts = nullptr;
   KM_CUDA_CHECK(cudaMalloc(&d_pts, my_elems * sizeof(float)));
-  SeedKernel<<<256, 256>>>(d_pts, p0 * dims, my_elems, dims, k);
-  KM_CUDA_CHECK(cudaDeviceSynchronize());
+  // REAL data (--data-file): every rank loads the shared file once and TILES
+  // its global-index shard from the real vectors; else the deterministic
+  // generator. Real-data-tiled is the same methodology as the capacity tests.
+  std::vector<float> feat;
+  u64 file_elems = 0;
+  if (!data_file.empty()) {
+    const u64 n0 = LoadRealFeatures(data_file, dims, feat);
+    if (!n0) {
+      if (!rank)
+        std::fprintf(stderr, "[KM] cannot load real data %s (dims=%u)\n",
+                     data_file.c_str(), dims);
+      MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    file_elems = n0 * static_cast<u64>(dims);
+    if (rank == 0)
+      std::printf("  REAL data: %s (%llu vecs x %u-d, tiled)\n",
+                  data_file.c_str(), (unsigned long long)n0, dims);
+    std::vector<float> h(my_elems);
+    const u64 base = p0 * dims;
+    for (u64 j = 0; j < my_elems; ++j) h[j] = feat[(base + j) % file_elems];
+    KM_CUDA_CHECK(cudaMemcpy(d_pts, h.data(), my_elems * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  } else {
+    SeedKernel<<<256, 256>>>(d_pts, p0 * dims, my_elems, dims, k);
+    KM_CUDA_CHECK(cudaDeviceSynchronize());
+  }
 
-  // Initial centroids: the first k points -- identical on every rank and to
-  // the paged bench, computed straight from the generator.
+  // Initial centroids: the first k points -- from the real data when tiling,
+  // else the generator; identical on every rank.
   std::vector<float> h_cent(static_cast<size_t>(k) * dims);
   for (u64 i = 0; i < static_cast<u64>(k) * dims; ++i) {
-    h_cent[i] = PointVal(i, dims, k);
+    h_cent[i] = data_file.empty() ? PointVal(i, dims, k)
+                                  : feat[i % file_elems];
   }
   float *d_cent = nullptr, *d_sums = nullptr;
   unsigned *d_counts = nullptr;

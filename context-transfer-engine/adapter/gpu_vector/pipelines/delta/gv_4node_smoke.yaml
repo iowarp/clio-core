@@ -1,0 +1,22 @@
+# SMOKE: validates the native-jarvis -> srun -> apptainer -> container-MPI chain.
+# kmeans, 1 node x 4 A100 (nprocs=4), per-GPU 32GB (data_mb=32000*4), 2 blocks levels.
+config:
+  name: gv_4node_smoke
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: mpi
+      nprocs: 4
+      steps: 2
+      data_mb: 128000
+      blocks: 64
+      timeout_sec: 900
+      mpi_launcher: "srun --mpi=pmix -n {n} apptainer exec --nv --bind /u/rpawar /u/rpawar/containers/deps-nvidia.sif /u/rpawar/gsbench/bench_env_wrapper.sh"
+      output_dir: /tmp/clio_gv/4node_smoke
+vars:
+  wl.blocks: [22, 86]
+loop:
+  - [wl.blocks]
+repeat: 1
+output: "${HOME}/gv_pipeline_results/gv_4node_smoke"

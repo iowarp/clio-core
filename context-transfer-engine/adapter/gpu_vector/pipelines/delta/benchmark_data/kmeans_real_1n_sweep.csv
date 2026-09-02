@@ -1,0 +1,5 @@
+blocks,bench_ms,peak_gpu_mb,gates,data
+22,21684.0,32429,1,real_sift_128d
+43,11133.8,32429,1,real_sift_128d
+65,7632.9,32429,1,real_sift_128d
+86,6363.3,32429,1,real_sift_128d

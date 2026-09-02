@@ -1,0 +1,30 @@
+# PAGE-CACHE smoke: paged (single-GPU) kmeans, uncompressed tiers. Recovers the
+# original page-cache axis: cache 4-32 GB x blocks 20-80%. Dataset 36 GB > max
+# cache so paging happens at every cache level; peak GPU ~= page cache.
+config:
+  name: gv_pagecache_smoke
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      iters: 2
+      page_kb: 1024
+      data_mb: 36000
+      hbm_mb: 2048
+      nvme_mb: 48000
+      nvme_path: /tmp/gv_pagecache.dat
+      cache_level: 1
+      blocks_level: 1
+      timeout_sec: 1800
+      output_dir: /u/rpawar/eternia_logs/gv_pc_cells
+      cache_ladder: "4096,32768"
+      blocks_ladder: "22,86"
+vars:
+  wl.cache_level: [1, 2]
+  wl.blocks_level: [1, 2]
+loop:
+  - [wl.cache_level]
+  - [wl.blocks_level]
+repeat: 1
+output: "/u/rpawar/eternia_logs/gv_pagecache_smoke"

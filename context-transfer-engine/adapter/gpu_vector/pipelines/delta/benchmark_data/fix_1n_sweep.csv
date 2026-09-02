@@ -1,0 +1,9 @@
+workload,blocks,bench_ms,peak_gpu_mb,gates
+lammps_md,22,,31201,0
+lammps_md,43,,31201,0
+lammps_md,65,,31201,0
+lammps_md,86,,31201,0
+lbann,16,,29921,0
+lbann,32,,29921,0
+lbann,64,,29921,0
+lbann,86,,29921,0
