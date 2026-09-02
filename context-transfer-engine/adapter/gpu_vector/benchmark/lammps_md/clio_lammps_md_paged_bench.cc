@@ -861,6 +861,28 @@ int main(int argc, char **argv) {
                 "at once; raising to %u\n",
                 slots, kMinSlotsX, kMinSlotsX);
     slots = kMinSlotsX;
+    // THE FLOOR HAS TO REACH THE ALLOCATOR. `slots` here is a LOCAL copy;
+    // the REGION capacity is clamped by a.slots further down
+    // (`if (a.slots < md_cap) md_cap = a.slots;`), so raising only the local
+    // announced a floor and then built a pool underneath it. Measured, job
+    // 21718877 at lattice 108 / 16 blocks / --slots 16: the banner printed
+    // "raising to 28" and the x cache came out at 20 regions -- a.slots was
+    // still 16, and the pool rounds to one region per task table
+    // (ceil(16/20)*20 = 20). The kernels then pinned 14 with 6 flushing,
+    // exhausted all 20, and died in AllocatePage with 2044 tags still empty,
+    // because a page's home set is fixed by its hash and spare capacity in
+    // another set cannot be used:
+    //
+    //   [gpu_vector] DEVICE FATAL 5 (AllocatePage: set full)
+    //   CUDA Error 719: unspecified launch failure -> terminate called
+    //
+    // ONLY WHEN THE USER ASKED. a.slots == 0 is the sentinel for "resident
+    // default" and is read as such in three other places (the :783
+    // initialiser, the out-of-core branch that owns md_cap, and the
+    // md_flush selector). Writing the floor into it unconditionally would
+    // flip a small RESIDENT deck -- one whose npages+2 is itself under the
+    // floor -- into the explicit out-of-core path it never asked for.
+    if (a.slots != 0) a.slots = kMinSlotsX;
   }
   // Which regime this configuration is IN: the cache either can hold every
   // page of the working set or it cannot. The gates below key off this

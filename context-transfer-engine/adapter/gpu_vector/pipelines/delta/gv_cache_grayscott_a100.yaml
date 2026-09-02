@@ -1,0 +1,171 @@
+# grayscott, PAGED, 2 NODES: PAGE CACHE RESIDENCY SWEEP AT A FIXED BLOCK COUNT.
+#
+#   1 workload x 5 residency rungs = 5 cells
+#
+# The general rationale (why blocks are fixed, and the REG:64 measurement
+# behind 432 = one A100 wave) is in gv_cache_kmeans_a100.yaml.
+#
+# 256 BLOCKS, NOT 432 -- AND THE STENCIL IS WHY. grayscott is the workload
+# with the widest pinned window in this set. Its step kernel holds EIGHT
+# pages at once per block:
+#
+#     u{z-1, z, z+1}   v{z-1, z, z+1}   u_next{z}   v_next{z}
+#
+# and the bench refuses slots < 10 outright ("a smaller cache would let a
+# plane still being read be evicted" -- it would not crash, it would
+# silently read whatever replaced it, so it is rejected rather than run).
+#
+# That floor is PER BLOCK, so the smallest legal cache is 10*blocks pages,
+# and it collides with the tight end of a residency ladder:
+#
+#     10% of 32000 pages / blocks >= 10   ->   blocks <= 320
+#
+# 432 blocks would need slots 7 at the 10% rung and the cell would be
+# refused, not slow. 256 leaves slots 12 -- clear of the floor with margin,
+# at 59% of a full wave. This is the one place in this collection where the
+# cache axis costs occupancy, and it is a property of the stencil, not of
+# the runtime: an eight-plane window simply cannot be run at one full wave
+# against a tenth of its own deck.
+#
+#   rung   cache_mb   slots/block   of 125 pages/block   true residency
+#    10%      3200         12   (floor 10)     125             9.6%
+#    25%      8000         31                  125            24.8%
+#    50%     16000         62                  125            49.6%
+#    80%     25600        100                  125            80.0%
+#   100%     32000        125                  125           100.0%  (resident)
+#
+# GEOMETRY. --data-mb is GLOBAL and split, so 64000 is 32000 MB/node, the
+# same anchor deck as kmeans and weights. One page is one XY plane
+# (262144 floats at 1024 KB), FOUR regions share the budget (u, v, u_next,
+# v_next), so nz = 16000 planes global, 8000/node, and 4*8000 = 32000 pages
+# per node. At 256 blocks a block owns ~31 planes.
+#
+# NO FILE TIER (nvme_mb 0): the end-of-run flush is a clean no-op without
+# one. 20 min wall, resumable. FRESH RUN:
+# rm -rf $HOME/gv_pipeline_results/cache_grayscott first.
+#
+# Submit:  jarvis ppl submit gv_cache_grayscott_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 80g
+  gpus_per_node: 1
+  time: "00:40:00"
+  job_name: gv_cache_gs
+  output: /u/llogan/gv_job_logs/gv_cache_gs-%j.out
+  error: /u/llogan/gv_job_logs/gv_cache_gs-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_cache_grayscott_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: grayscott
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_cache_grayscott_a100/hostfile.txt
+      cluster_port: 9437
+      # ---- FIXED: everything that is not the cache -------------------
+      blocks: 256          # stencil floor caps this at 320; see header
+      threads: 256
+      data_mb: 64000       # GLOBAL, split -> 32000 MB/node
+      page_kb: 1024        # one page == one 262144-float XY plane
+      # ITERATIONS SIZED SO THE CACHE CAN ACTUALLY SHOW UP. Measured on
+      # job 21721196 at steps=2: faults fell 3.2x across the ladder
+      # (56896 -> 17842) while bench_ms did not move at all
+      # (16887/17470/13406/16573 ms). The reason is compulsory misses --
+      # at 2 iterations ONE of them is unavoidably cold however large the
+      # cache is, so at most half the accesses were ever cacheable, and
+      # that thin signal sat under a fixed ~40 s 32 GB ingest. At 8 the
+      # ratio is 1 cold to 7 warm and the dynamic range is ~8x. The cells
+      # ran 70-80 s against a 480 s cap, so this is spending headroom that
+      # was already there, not risking it.
+      steps: 8
+      repeat: 1
+      ram_mb: 33280
+      nvme_mb: 0
+      prefault: "0"
+      timeout_sec: 900
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/cache_grayscott
+
+vars:
+  # THE ONLY AXIS. Note the 10% rung sits just above the slots>=10 floor
+  # (12 slots): do NOT lower it without lowering `blocks` with it, or the
+  # bench refuses the cell rather than running a smaller cache.
+  wl.cache_mb: [3200, 8000, 16000, 25600, 32000]
+
+loop:
+  - [wl.cache_mb]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/cache_grayscott"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  DECK_MB_PER_NODE = 32000
+  if 'wl.cache_mb' in df.columns:
+      df['residency_pct'] = (100.0 * df['wl.cache_mb']
+                             / DECK_MB_PER_NODE).round(1)
+
+  cols = [c for c in ['residency_pct', 'wl.cache_mb', 'cache_setting',
+                      'blocks_resolved', 'nodes', 'nodes_finished',
+                      'completed', 'gates_pass', 'bench_ms', 'runtime',
+                      'vram_peak_mb', 'faults', 'evicts', 'puts',
+                      'get_errors', 'put_errors', 'v_checksum']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  ok = df[(df.get('completed', 0) == 1) & df['bench_ms'].notna()]
+  if len(ok) and 'residency_pct' in ok.columns:
+      full = ok[ok['residency_pct'] >= 100.0]
+      if len(full):
+          base = float(full['bench_ms'].min())
+          curve = ok[['residency_pct', 'bench_ms']].copy()
+          curve['x_resident'] = (curve['bench_ms'] / base).round(2)
+          logger.info('\ngrayscott paged, 256 blocks, 32 GB/node -- cost of a '
+                      'smaller cache:\n'
+                      + curve.sort_values('residency_pct').to_string(index=False))
+      else:
+          logger.warning('the 100%% rung produced no number -- no resident '
+                         'baseline to divide by')
+
+  if 'faults' in df.columns:
+      for _, r in df.iterrows():
+          if r.get('completed', 0) != 1:
+              continue
+          f = r.get('faults')
+          pct = r.get('residency_pct', 0)
+          if pct < 100.0 and (pd.isna(f) or float(f or 0) == 0):
+              logger.warning('NO FAULTS at the %s%% rung -- not storage-bound' % pct)
+
+  # A REFUSED CELL LOOKS LIKE A FAILED CELL. If a rung comes back with
+  # completed=0 and no runtime to speak of, suspect the slots>=10 floor
+  # before suspecting the runtime -- the bench exits 2 immediately.
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('DID NOT COMPLETE at the %s%% rung (cache_mb=%s, '
+                     'runtime=%s). If runtime is near zero, the bench REFUSED '
+                     'the cell -- check slots against the 10-plane floor, not '
+                     'the cluster.'
+                     % (r.get('residency_pct'), r.get('wl.cache_mb'),
+                        r.get('runtime')))
+
+  if len(df) < 5:
+      logger.warning('only %d of 5 rungs have rows -- RESUBMIT THIS FILE to '
+                     'continue' % len(df))
+  elif not len(bad):
+      logger.info('all 5 residency rungs completed')
