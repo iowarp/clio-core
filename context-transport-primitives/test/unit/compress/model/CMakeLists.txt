@@ -45,5 +45,8 @@ install(TARGETS test_compress_model_exec
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-# Cross-project NeuroPress differential parity (skipped without the tree).
-add_subdirectory(parity)
+# Cross-project NeuroPress differential parity, skipped when the tree is
+# absent -- it is not part of this repository.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/parity/CMakeLists.txt")
+    add_subdirectory(parity)
+endif()
