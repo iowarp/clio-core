@@ -45,6 +45,15 @@
 
 #include <fcntl.h>
 
+/* MSVC's <fcntl.h> provides the O_* open flags but not O_ACCMODE, the POSIX
+ * mask that isolates the access-mode bits (O_RDONLY/O_WRONLY/O_RDWR) of a flag
+ * word. The CTE cache-tier path uses `flags & ~O_ACCMODE` to re-choose the
+ * access mode while preserving every other bit, so define the standard value
+ * where the platform omits it. */
+#ifndef O_ACCMODE
+#define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
+#endif
+
 #ifndef _WIN32
 #include <sys/file.h>
 #include <unistd.h>
