@@ -449,7 +449,9 @@ std::vector<CompressionPrediction>
 NeuroPressNNPredictor::PredictBatchDeviceStats(
     const void* device_stats, const std::vector<CompressionFeatures>& batch,
     void* stream, const RankingWeights* weights, std::vector<int>* out_order,
-    double min_psnr, std::vector<double>* out_scores, FullOutputs* out_full) {
+    double min_psnr, std::vector<double>* out_scores, FullOutputs* out_full,
+    const ctp::compress::preprocess::PredictionReuseContext* reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome* out_outcome) {
 #if CTP_ENABLE_NEUROPRESS_GPU
   // Same lock PredictBatch takes, for the same reason: TrainDecompHead()
   // downloads every parameter, edits two and uploads them all back, so an
@@ -566,7 +568,8 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
           static_cast<float>(batch[0].chunk_size_bytes),
           static_cast<float>(chunk_error_bound_for_kernel), stream,
           comp_time.data(), decomp_time.data(), ratio.data(), psnr.data(),
-          rank_ptr, order_ptr, scores_ptr, q_rmse, q_maxe, q_mae, q_ssim)) {
+          rank_ptr, order_ptr, scores_ptr, q_rmse, q_maxe, q_mae, q_ssim,
+          reuse, out_outcome)) {
     if (out_full != nullptr) *out_full = FullOutputs{};
     if (out_order != nullptr) out_order->clear();
     if (out_scores != nullptr) out_scores->clear();

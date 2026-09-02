@@ -97,7 +97,9 @@ std::vector<CompressionStats> RankIntoStats(
     clio::run::u64 chunk_size, double entropy, double mad,
     double second_derivative_mean, bool data_type_float, double error_bound,
     const void *device_stats, void *stream, double min_psnr,
-    bool *out_inference_failed, bool ratio_only) {
+    bool *out_inference_failed, bool ratio_only,
+    const ctp::compress::preprocess::PredictionReuseContext *reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome *out_outcome) {
   using ctp::compress::model::CandidateConfig;
   using ctp::compress::model::DataFeatures;
   using ctp::compress::model::DefaultCandidates;
@@ -248,7 +250,8 @@ std::vector<CompressionStats> RankIntoStats(
     std::vector<double> scores;
     auto preds = np->PredictBatchDeviceStats(device_stats, feats, stream,
                                              &weights, &order, min_psnr,
-                                             &scores);
+                                             &scores, /*out_full=*/nullptr,
+                                             reuse, out_outcome);
     if (preds.empty() && !candidates.empty()) {
       // Inference FAILED, as distinct from nothing to rank: an empty candidate
       // set is a build configuration, and must not fail a write.
@@ -328,20 +331,24 @@ std::vector<CompressionStats> NeuroPressCandidateStats(
                        second_derivative_mean, data_type_float, error_bound,
                        /*device_stats=*/nullptr, /*stream=*/nullptr,
                        /*min_psnr=*/0.0, /*out_inference_failed=*/nullptr,
-                       ratio_only);
+                       ratio_only, /*reuse=*/nullptr,
+                       /*out_outcome=*/nullptr);
 }
 
 std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
     bool data_type_float, double error_bound, double min_psnr,
-    bool *out_inference_failed, bool ratio_only) {
+    bool *out_inference_failed, bool ratio_only,
+    const ctp::compress::preprocess::PredictionReuseContext *reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome *out_outcome) {
   // Zeros: on this path the statistics reach neither the network (it reads
   // device_stats) nor the score. Fetching them here would mean synchronizing
   // before the inference rather than after.
   return RankIntoStats(predictor, chunk_size, 0.0, 0.0, 0.0, data_type_float,
                        error_bound, device_stats, stream, min_psnr,
-                       out_inference_failed, ratio_only);
+                       out_inference_failed, ratio_only, reuse,
+                       out_outcome);
 }
 
 }  // namespace clio::cte::compressor

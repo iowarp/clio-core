@@ -19,6 +19,7 @@
  */
 
 #include "clio_ctp/compress/model/neuropress_nn_gpu_kernels.h"
+#include "clio_ctp/compress/preprocess/prediction_reuse_gpu.h"
 // For ctp::DeviceFeatureStats -- the device-resident feature triple the
 // device-stats inference kernel reads instead of a host-built matrix.
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
@@ -714,9 +715,49 @@ __global__ void InferKernelDeviceStats(
     float *__restrict__ out_rmse = nullptr,
     float *__restrict__ out_max_error = nullptr,
     float *__restrict__ out_mae = nullptr,
-    float *__restrict__ out_ssim = nullptr, float ratio_cap = 100.0f) {
+    float *__restrict__ out_ssim = nullptr, float ratio_cap = 100.0f,
+    /* Prediction reuse. Null states, or a slot of kNoLineageSlot, means this
+       kernel runs the model, as it does with reuse disabled. */
+    const ctp::compress::preprocess::DevicePredictionReuseState
+        *__restrict__ reuse_states = nullptr,
+    uint32_t reuse_slot = ctp::compress::preprocess::kNoLineageSlot) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
+
+  // The verdict was written to device memory by ReuseDecisionKernel earlier
+  // on this stream. Reading it here is what makes the skip GPU-resident: the
+  // host has not been told, and will not be until the transfer at the end.
+  //
+  // Replaying the cached block rather than recomputing is the entire saving --
+  // the four hidden layers below are 64x64 each, per candidate.
+  if (reuse_states != nullptr &&
+      reuse_slot != ctp::compress::preprocess::kNoLineageSlot) {
+    const ctp::compress::preprocess::DevicePredictionReuseState &ts =
+        reuse_states[reuse_slot];
+    // ALL of the candidates or none: a cache that covers fewer than this call
+    // asks for would leave the ranking mixing replayed and freshly computed
+    // scores, which are not on the same footing. The candidate set is fixed at
+    // 32 on this path so it does not arise, but "does not arise" is a caller
+    // property and this kernel should not depend on one.
+    if (!ctp::compress::preprocess::MustRunModel(ts.decision_flags) &&
+        ts.has_prediction != 0 &&
+        ts.cached_count >= static_cast<int>(gridDim.x)) {
+      if (t == 0) {
+        out_comp_time[cand] = ts.comp_time_ms[cand];
+        out_decomp_time[cand] = ts.decomp_time_ms[cand];
+        out_ratio[cand] = ts.ratio[cand];
+        out_psnr[cand] = ts.psnr_db[cand];
+        // Outputs 4-7 are not cached: the ranking path never requests them,
+        // so a caller that wants them must run the model. Zeroing here would
+        // hand it numbers no forward pass produced.
+        if (out_rmse != nullptr) out_rmse[cand] = 0.0f;
+        if (out_max_error != nullptr) out_max_error[cand] = 0.0f;
+        if (out_mae != nullptr) out_mae[cand] = 0.0f;
+        if (out_ssim != nullptr) out_ssim[cand] = 0.0f;
+      }
+      return;
+    }
+  }
 
   __shared__ float s_x[kInputDim];
   __shared__ float s_h1[kHiddenDim], s_h2[kHiddenDim], s_h3[kHiddenDim],
@@ -809,8 +850,34 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
                            double w_io, double bw, double error_bound,
                            double min_psnr, double ratio_cap,
                            int *__restrict__ out_order,
-                           double *__restrict__ out_scores) {
+                           double *__restrict__ out_scores,
+                           /* See InferKernelDeviceStats: null means unchanged
+                              behaviour. */
+                           const ctp::compress::preprocess::
+                               DevicePredictionReuseState
+                                   *__restrict__ reuse_states = nullptr,
+                           uint32_t reuse_slot =
+                               ctp::compress::preprocess::kNoLineageSlot) {
   const int tid = static_cast<int>(threadIdx.x);
+
+  // Replay the cached ORDER as well as the cached predictions. Re-sorting
+  // replayed predictions would usually reproduce the same permutation, but
+  // "usually" is not a guarantee: ties in this cost model are common (the
+  // ratio saturates at the cap) and are broken by slot, so a re-sort is only
+  // identical if every input is bit-identical. Storing the permutation makes
+  // reuse exact by construction instead of by argument.
+  if (reuse_states != nullptr &&
+      reuse_slot != ctp::compress::preprocess::kNoLineageSlot) {
+    const ctp::compress::preprocess::DevicePredictionReuseState &ts =
+        reuse_states[reuse_slot];
+    if (!ctp::compress::preprocess::MustRunModel(ts.decision_flags) &&
+        ts.has_prediction != 0 && ts.cached_count >= n && tid < n) {
+      out_order[tid] = ts.order[tid];
+      out_scores[tid] = ts.score[tid];
+      return;
+    }
+  }
+
   double score = -CUDART_INF;
   int idx = tid;
   // The tie key is the ACTION index, which is what upstream's network orders
@@ -1303,7 +1370,9 @@ bool NeuroPressGpuInferBatchDeviceStats(
     float error_bound, void *stream, float *out_comp_time_ms,
     float *out_decomp_time_ms, float *out_ratio, float *out_psnr_db,
     const GpuRankParams *rank, int *out_order, double *out_scores,
-    float *out_rmse, float *out_max_error, float *out_mae, float *out_ssim) {
+    float *out_rmse, float *out_max_error, float *out_mae, float *out_ssim,
+    const ctp::compress::preprocess::PredictionReuseContext *reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome *out_outcome) {
   if (!w || !device_stats || !action_ids || num_candidates <= 0 ||
       num_candidates > kMaxCandidates) {
     return false;
@@ -1354,6 +1423,13 @@ bool NeuroPressGpuInferBatchDeviceStats(
        lets the SGD path be fire-and-forget -- the ordering is enforced on the
        device, so neither host thread blocks for it. */
     SgdWaitIfEverFired(st);
+    /* The decision goes here, AFTER the SGD barrier and BEFORE the forward
+       pass, so its verdict is in device memory by the time the next kernel
+       reads it -- ordering the stream gives for free. Nothing is waited on. */
+    if (reuse != nullptr) {
+      ctp::compress::preprocess::LaunchReuseDecision(*reuse, device_stats,
+                                                       st, &w->sgd_call_count);
+    }
   InferKernelDeviceStats<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_actions,
         static_cast<const ctp::DeviceFeatureStats *>(device_stats),
@@ -1367,7 +1443,13 @@ bool NeuroPressGpuInferBatchDeviceStats(
            on different scales and inflates the MAPE that gates SGD and
            exploration, so the ranking parameters carry the value the caller
            chose and the forward pass uses the same one. */
-        rank != nullptr ? static_cast<float>(rank->ratio_cap) : 100.0f);
+        rank != nullptr ? static_cast<float>(rank->ratio_cap) : 100.0f,
+        reuse != nullptr
+            ? static_cast<const ctp::compress::preprocess::
+                              DevicePredictionReuseState *>(reuse->states)
+            : nullptr,
+        reuse != nullptr ? reuse->slot
+                         : ctp::compress::preprocess::kNoLineageSlot);
     ok = cudaGetLastError() == cudaSuccess;
   }
   // Cost model and ordering, still on the device and still on this stream --
@@ -1380,12 +1462,35 @@ bool NeuroPressGpuInferBatchDeviceStats(
         s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_actions, num_candidates,
         rank->data_size_bytes, rank->w_compress_time, rank->w_decompress_time,
         rank->w_io, rank->bandwidth_bytes_per_ms, rank->error_bound,
-        rank->min_psnr, rank->ratio_cap, s.d_order, s.d_scores);
+        rank->min_psnr, rank->ratio_cap, s.d_order, s.d_scores,
+        reuse != nullptr
+            ? static_cast<const ctp::compress::preprocess::
+                              DevicePredictionReuseState *>(reuse->states)
+            : nullptr,
+        reuse != nullptr ? reuse->slot
+                         : ctp::compress::preprocess::kNoLineageSlot);
     ok = cudaGetLastError() == cudaSuccess;
     // The ranking is NOT fetched here: it shares one allocation with the
     // predictions, so FetchPredictionsSync below brings back scores, order and
     // all four prediction arrays in a single transfer.
     ranked = ok;
+  }
+
+  /* Cache the result and advance the state -- AFTER the ranking has produced
+     it and after both kernels have read the state the divergence was measured
+     against. Still on the same stream, still no host involvement. The commit
+     kernel reads "did the model run" from the flags rather than being told,
+     so the host never learns the decision before acting on it. */
+  if (ok && reuse != nullptr && ranked) {
+    ok = ctp::compress::preprocess::LaunchReuseCommit(
+        *reuse, device_stats, s.d_scores, s.d_order, s.d_ct, s.d_dt, s.d_r,
+        s.d_p, num_candidates, st, &w->sgd_call_count);
+    /* The outcome rides the transfer the fetch below already performs: one
+       extra async copy on the same stream, and no extra synchronize. */
+    if (ok && out_outcome != nullptr) {
+      ctp::compress::preprocess::EnqueueReuseOutcome(*reuse, out_outcome,
+                                                        st);
+    }
   }
 
   if (ok) {

@@ -42,7 +42,9 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     double* entropy, double* mad, double* second_derivative_mean,
     double* out_entropy, double* out_mad, double* out_second_deriv,
-    bool* out_neuropress_gpu_failed, const void** out_device_stats) {
+    bool* out_neuropress_gpu_failed, const void** out_device_stats,
+    const ctp::compress::preprocess::PredictionReuseContext* reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome* out_outcome) {
   // float32 always: the stats kernel is typed `const float*` and model.nnwt
   // was normalized against float32. Reading as uint8 puts MAD hundreds of
   // sigma outside the training range.
@@ -129,7 +131,8 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
       neuropress_stats = NeuroPressCandidateStatsDevice(
           *neuropress_predictor_, chunk_size, device_stats, np_stream,
           data_type_float, context.error_bound_, context.target_psnr_,
-          &np_infer_failed, config_.neuropress_best_mode_);
+          &np_infer_failed, config_.neuropress_best_mode_, reuse,
+          out_outcome);
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
@@ -148,6 +151,28 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
           *second_derivative_mean, data_type_float, context.error_bound_,
           config_.neuropress_best_mode_);
     }
+    /* The trace claims a forward pass per action. With prediction reuse that
+       is no longer unconditional, and a log that says the model ran when it
+       did not would make the NN-invocation counts unauditable. */
+    if (reuse != nullptr && out_outcome != nullptr &&
+        !ctp::compress::preprocess::MustRunModel(out_outcome->flags)) {
+      CLIO_PATH_TRACE(
+          "2 infer    [GPU] REUSED the cached prediction -- no forward pass "
+          "(d_step=%.6f d_anchor=%.6f d_path=%.6f, decided on device)",
+          out_outcome->step_divergence, out_outcome->anchor_divergence,
+          out_outcome->path_divergence);
+    } else if (reuse != nullptr && out_outcome != nullptr) {
+      /* Ran with reuse armed. The divergences are logged on this branch too,
+         so the full distribution -- not only the chunks that reused -- is
+         recoverable from the log. */
+      CLIO_PATH_TRACE(
+          "2 infer    [GPU] %zu actions, ONE NN forward pass EACH "
+          "(8->64->64->64->64->8) -- RAN (d_step=%.6f d_anchor=%.6f "
+          "d_path=%.6f reason=0x%x)",
+          neuropress_stats.size(), out_outcome->step_divergence,
+          out_outcome->anchor_divergence, out_outcome->path_divergence,
+          out_outcome->flags);
+    } else
     CLIO_PATH_TRACE(
         "2 infer    %s %zu actions, ONE NN forward pass EACH "
         "(8->64->64->64->64->8) -- %s",

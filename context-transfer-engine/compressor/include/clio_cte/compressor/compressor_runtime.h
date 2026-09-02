@@ -61,6 +61,10 @@
 #include <clio_cte/compressor/models/dense_nn_predictor.h>
 #endif
 
+#include <clio_ctp/compress/preprocess/chunk_lineage.h>
+#include <clio_ctp/compress/preprocess/prediction_reuse_gpu.h>
+#include <mutex>
+
 namespace clio::cte::compressor {
 
 /**
@@ -276,6 +280,31 @@ private:
   std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
       neuropress_predictor_;
 
+  /* ---- prediction reuse across timesteps ------------------------------
+     On by default; CLIO_NEUROPRESS_REUSE_PREDICTIONS=0 opts out, and it is
+     never used while exploration is enabled. The registry maps a lineage key
+     to a dense slot in the device state array; the array itself is device
+     memory and is read only by kernels.
+
+     The mutex covers the REGISTRY, a host hash map that runtime worker
+     threads reach concurrently. It does NOT cover the device state: each
+     chunk touches one slot, and two chunks of the same lineage are not in
+     flight together (the drivers drain per file). Guarding the device side
+     here would serialise the workers. */
+  bool np_reuse_enabled_ = false;
+  ctp::compress::preprocess::PredictionReuseThresholds np_reuse_thresholds_;
+  std::unique_ptr<ctp::compress::preprocess::LineageSlotRegistry>
+      np_reuse_registry_;
+  void *np_reuse_states_ = nullptr;
+  std::mutex np_reuse_mutex_;
+  /** Resolve a blob name to a reuse context; disabled context when the
+   *  feature is off, the lineage is unresolvable, or the registry is full. */
+  ctp::compress::preprocess::PredictionReuseContext PredictionReuseContextFor(
+      const std::string &blob_name);
+  /** Read the CLIO_NEUROPRESS_REUSE_* knobs and allocate the device state.
+   *  On unless opted out, and off for an exploring run. */
+  void InitPredictionReuse();
+
   /** Is NeuroPress deciding for this chunk? All three conditions gate every
    *  NeuroPress path; spelled out separately they drift apart silently. */
   bool NeuroPressActive(const Context& context) const {
@@ -424,7 +453,14 @@ private:
       bool* out_ranked_by_cost = nullptr, double* out_entropy = nullptr,
       double* out_mad = nullptr, double* out_second_deriv = nullptr,
       bool* out_neuropress_gpu_failed = nullptr,
-      const void** out_device_stats = nullptr);
+      const void** out_device_stats = nullptr,
+      /* Prediction reuse for THIS chunk. Null runs the model. Passed in rather
+         than derived here because the blob name, the only thing carrying a
+         lineage, lives in the task two frames up. */
+      const ctp::compress::preprocess::PredictionReuseContext* reuse =
+          nullptr,
+      ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
+          nullptr);
 
   /** NeuroPress's half of EstCompressionStats (neuropress_selection.cc). Best
    *  first, or empty when it declined -- not an error, the caller's heuristics
@@ -433,7 +469,11 @@ private:
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
       double* entropy, double* mad, double* second_derivative_mean,
       double* out_entropy, double* out_mad, double* out_second_deriv,
-      bool* out_neuropress_gpu_failed, const void** out_device_stats);
+      bool* out_neuropress_gpu_failed, const void** out_device_stats,
+      const ctp::compress::preprocess::PredictionReuseContext* reuse =
+          nullptr,
+      ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
+          nullptr);
 
   /**
    * Estimate workflow compression time for a specific tier

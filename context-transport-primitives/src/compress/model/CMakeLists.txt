@@ -54,6 +54,12 @@ if(CLIO_CORE_ENABLE_CUDA)
     # violation at all.
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/quality_metrics_gpu_kernels.cu)
+    # Prediction reuse: decides on-device whether a chunk needs a fresh NN run.
+    # Same target and rationale as the four above -- it reads the very
+    # DeviceFeatureStats they produce, on the same stream, and is called from
+    # the inference kernels without a host round trip.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/prediction_reuse_gpu.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -72,6 +78,9 @@ if(CLIO_CORE_ENABLE_CUDA)
         PROPERTIES LANGUAGE CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/quality_metrics_gpu_kernels.cu
+        PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/prediction_reuse_gpu.cu
         PROPERTIES LANGUAGE CUDA)
     # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
     # here, instead of once per consumer.

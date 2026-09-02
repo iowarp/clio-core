@@ -8,6 +8,10 @@ add_executable(test_compress_model_exec
         test_models.cc
         test_data_stats_gpu.cc
         test_block_evolution.cc
+        test_chunk_lineage.cc
+        test_prediction_reuse_state.cc
+        test_prediction_reuse.cc
+        test_prediction_reuse_gpu.cc
         test_compress_factory_gpu.cc)
 
 add_dependencies(test_compress_model_exec clio_ctp_compress_model)

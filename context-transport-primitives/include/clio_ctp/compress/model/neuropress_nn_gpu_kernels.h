@@ -21,6 +21,8 @@
 
 #include <cstddef>
 
+#include "clio_ctp/compress/preprocess/prediction_reuse_gpu.h"
+
 namespace ctp::compress::model::gpu {
 
 /** @brief Opaque device-resident weight handle (defined in the .cu TU). */
@@ -187,7 +189,14 @@ bool NeuroPressGpuInferBatchDeviceStats(
        and the D2H copy stops after output 3, so ranking moves exactly the
        bytes it did before these existed. */
     float *out_rmse = nullptr, float *out_max_error = nullptr,
-    float *out_mae = nullptr, float *out_ssim = nullptr);
+    float *out_mae = nullptr, float *out_ssim = nullptr,
+    /* Prediction reuse. Null runs the model unconditionally; non-null
+       brackets the inference with a decision and a commit kernel on the SAME
+       stream, so whether the forward pass runs is decided on the device and
+       the host finds out only from the transfer it was already going to make.
+       `out_outcome` must outlive the caller's synchronize. */
+    const ctp::compress::preprocess::PredictionReuseContext *reuse = nullptr,
+    ctp::compress::preprocess::PredictionReuseOutcome *out_outcome = nullptr);
 
 /**
  * @brief One deferred decompression-time observation.

@@ -416,6 +416,84 @@ static_assert(sizeof(CompressionHeader) == 24,
 static_assert(offsetof(CompressionHeader, original_size_) == 16,
               "compressed_size_ must occupy the former padding at offset 12");
 
+/**
+ * Bring up prediction reuse: on by default, CLIO_NEUROPRESS_REUSE_PREDICTIONS=0
+ * opts out, and an exploring run never uses it.
+ *
+ * Reuse trades selection quality for NN calls. A reused decision is never a
+ * correctness problem -- the chunk is still stored with a valid codec and the
+ * error bound still holds -- but it can be a compression-ratio one. The
+ * decision refuses to reuse whenever anything is uncertain (unresolvable
+ * lineage, registry full, timestep not advancing, chunk size or error bound
+ * changed, weights changed since the cache was made), and the periodic
+ * refresh re-runs the model every refresh_interval observations regardless.
+ */
+void Runtime::InitPredictionReuse() {
+  auto env_num = [](const char *name, double fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    char *end = nullptr;
+    const double parsed = std::strtod(v, &end);
+    return end == v ? fallback : parsed;
+  };
+  // An exploring run never consults reuse (PredictionReuseAllowed), so do not
+  // reserve the device state for it either -- and say so in the log.
+  if (config_.neuropress_exploration_enabled_) {
+    HLOG(kInfo,
+         "NeuroPress prediction reuse is OFF for this run because exploration "
+         "is enabled: an exploring run ranks and measures the full action "
+         "space every timestep, whatever the divergence between them");
+    return;
+  }
+
+  // Opt out, not in: absent means on. An explicit 0/false/no/off runs the
+  // model for every chunk.
+  {
+    const char *v = std::getenv("CLIO_NEUROPRESS_REUSE_PREDICTIONS");
+    if (v != nullptr && (*v == '0' || *v == 'f' || *v == 'F' || *v == 'n' ||
+                         *v == 'N' || (*v == 'o' && v[1] == 'f'))) {
+      HLOG(kInfo,
+           "NeuroPress prediction reuse DISABLED by "
+           "CLIO_NEUROPRESS_REUSE_PREDICTIONS={}; the model runs for every chunk",
+           v);
+      return;
+    }
+  }
+
+  np_reuse_thresholds_.step =
+      env_num("CLIO_NEUROPRESS_REUSE_STEP_THRESHOLD", np_reuse_thresholds_.step);
+  np_reuse_thresholds_.anchor = env_num("CLIO_NEUROPRESS_REUSE_ANCHOR_THRESHOLD",
+                                           np_reuse_thresholds_.anchor);
+  np_reuse_thresholds_.refresh_interval = static_cast<long long>(env_num(
+      "CLIO_NEUROPRESS_REUSE_REFRESH_STEPS",
+      static_cast<double>(np_reuse_thresholds_.refresh_interval)));
+
+  const uint32_t capacity = static_cast<uint32_t>(
+      env_num("CLIO_NEUROPRESS_REUSE_MAX_LINEAGES", 4096));
+  np_reuse_states_ =
+      ctp::compress::preprocess::ReuseStatesAlloc(capacity);
+  if (np_reuse_states_ == nullptr) {
+    // Report and stay off rather than fail the pool: this is an optimisation,
+    // and a run that cannot have it should still compress.
+    HLOG(kWarning,
+         "NeuroPress prediction reuse: {} lineage slots could "
+         "not be allocated on the device; continuing with it OFF, so the "
+         "model runs for every chunk as usual",
+         capacity);
+    return;
+  }
+  np_reuse_registry_ = std::make_unique<
+      ctp::compress::preprocess::LineageSlotRegistry>(capacity);
+  np_reuse_enabled_ = true;
+  HLOG(kInfo,
+       "NeuroPress prediction reuse ON: step={} anchor={} refresh={} "
+       "capacity={} lineages ({} KiB on the device)",
+       np_reuse_thresholds_.step, np_reuse_thresholds_.anchor,
+       np_reuse_thresholds_.refresh_interval, capacity,
+       (capacity * sizeof(ctp::compress::preprocess::DevicePredictionReuseState))
+           / 1024);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
@@ -517,6 +595,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       neuropress_predictor_->SetLearningRate(config_.neuropress_learning_rate_);
       if (neuropress_predictor_->Load(config_.neuropress_model_path_)) {
         HLOG(kDebug, "NeuroPress NN model loaded successfully");
+        InitPredictionReuse();
       } else {
         // NeuroPress has no CPU path -- upstream's network exists only as CUDA
         // kernels -- so a load failure means the requested model cannot run.
@@ -713,6 +792,51 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 // Compression Statistics Estimation
 // ==============================================================================
 
+/**
+ * Resolve one blob name to a reuse slot.
+ *
+ * Returns a DISABLED context -- states null, slot kNoLineageSlot -- whenever
+ * anything is uncertain: the feature is off, the name carries no identifiable
+ * timestep, or the registry is full. In every one of those cases the model
+ * runs rather than reusing state that might belong to a different block.
+ *
+ * The lock covers the host registry only. It is not on the device path: what
+ * leaves this function is an integer.
+ */
+ctp::compress::preprocess::PredictionReuseContext Runtime::PredictionReuseContextFor(
+    const std::string &blob_name) {
+  ctp::compress::preprocess::PredictionReuseContext ctx;
+  if (!np_reuse_enabled_ || np_reuse_states_ == nullptr ||
+      !np_reuse_registry_) {
+    return ctx;
+  }
+  /* Exploration is never served a reused prediction. It is gated on how
+   * wrong the prediction turned out to be and draws the alternatives it
+   * measures from the ranked list, so a replayed ranking would change both
+   * whether a chunk explores and what it explores. The cost of the exemption
+   * is one forward pass per chunk, next to K real compressions. */
+  if (!ctp::compress::preprocess::PredictionReuseAllowed(
+          np_reuse_enabled_, config_.neuropress_exploration_enabled_)) {
+    return ctx;
+  }
+
+  const auto lineage = ctp::compress::preprocess::ParseBlobLineage(blob_name);
+  if (!lineage.resolved) return ctx;
+
+  uint32_t slot;
+  {
+    std::lock_guard<std::mutex> lock(np_reuse_mutex_);
+    slot = np_reuse_registry_->SlotFor(lineage.key);
+  }
+  if (slot == ctp::compress::preprocess::kNoLineageSlot) return ctx;
+
+  ctx.states = np_reuse_states_;
+  ctx.slot = slot;
+  ctx.timestep = lineage.timestep;
+  ctx.thresholds = np_reuse_thresholds_;
+  return ctx;
+}
+
 /** Defined with the selection log below; used here to skip work it alone reads.
  *  Declared in the same anonymous namespace as the definition, or this would
  *  be a different function and the call would be ambiguous. */
@@ -720,7 +844,9 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context,
     bool* out_ranked_by_cost, double* out_entropy, double* out_mad,
     double* out_second_deriv, bool* out_neuropress_gpu_failed,
-    const void** out_device_stats) {
+    const void** out_device_stats,
+    const ctp::compress::preprocess::PredictionReuseContext* reuse,
+    ctp::compress::preprocess::PredictionReuseOutcome* out_outcome) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
@@ -735,7 +861,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     std::vector<CompressionStats> neuropress_stats = NeuroPressRankChunk(
         chunk, chunk_size, context, &entropy, &mad, &second_derivative_mean,
         out_entropy, out_mad, out_second_deriv, out_neuropress_gpu_failed,
-        out_device_stats);
+        out_device_stats, reuse, out_outcome);
     if (!neuropress_stats.empty()) {
       // Already best-first under NeuroPress's cost model; saying so is what
       // stops the caller re-selecting on ratio alone and discarding it.
@@ -1192,6 +1318,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // on, in every mode.
     bool ranked_by_cost = false;
     double sel_entropy = 0.0, sel_mad = 0.0, sel_second_deriv = 0.0;
+    /* Outlives the inference call: the outcome copy is asynchronous and is
+       only readable after the synchronize inside it. */
+    ctp::compress::preprocess::PredictionReuseContext np_reuse_ctx;
+    ctp::compress::preprocess::PredictionReuseOutcome np_reuse_outcome;
     bool neuropress_gpu_failed = false;
     // Statistics the selection ranked on; see out_device_stats.
     const void* sel_device_stats = nullptr;
@@ -1214,10 +1344,23 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       stats.push_back(fixed);
       ranked_by_cost = true;  // take stats.front() verbatim below
     } else {
+      /* Prediction reuse for THIS chunk. Resolved here because this is the
+         first frame that has the blob name, the only thing carrying a
+         lineage. A disabled context -- feature off, name without a timestep,
+         registry full -- leaves everything below as it is with reuse off. */
+      np_reuse_ctx = PredictionReuseContextFor(task->blob_name_.str());
+      /* NN inputs 4 and 3. Without these a cache made for one chunk size
+         would be replayed for another, and the signature cannot detect it. */
+      np_reuse_ctx.chunk_bytes = static_cast<double>(chunk_size);
+      np_reuse_ctx.error_bound = context.error_bound_;
+      const bool np_reuse_on =
+          np_reuse_ctx.slot != ctp::compress::preprocess::kNoLineageSlot;
       stats =
           EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
                               &sel_entropy, &sel_mad, &sel_second_deriv,
-                              &neuropress_gpu_failed, &sel_device_stats);
+                              &neuropress_gpu_failed, &sel_device_stats,
+                              np_reuse_on ? &np_reuse_ctx : nullptr,
+                              np_reuse_on ? &np_reuse_outcome : nullptr);
     }
 
     if (neuropress_gpu_failed) {

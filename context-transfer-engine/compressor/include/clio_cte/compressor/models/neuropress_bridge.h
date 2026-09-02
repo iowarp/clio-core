@@ -66,7 +66,12 @@ std::vector<CompressionStats> NeuroPressCandidateStatsDevice(
     ctp::compress::model::CompressionPredictor &predictor,
     clio::run::u64 chunk_size, const void *device_stats, void *stream,
     bool data_type_float, double error_bound = 0.0, double min_psnr = 0.0,
-    bool *out_inference_failed = nullptr, bool ratio_only = false);
+    bool *out_inference_failed = nullptr, bool ratio_only = false,
+    /* Prediction reuse, passed straight to the predictor. Null runs the
+       model. */
+    const ctp::compress::preprocess::PredictionReuseContext *reuse =
+        nullptr,
+    ctp::compress::preprocess::PredictionReuseOutcome *out_outcome = nullptr);
 
 }  // namespace clio::cte::compressor
 

@@ -240,7 +240,15 @@ class NeuroPressNNPredictor : public CompressionPredictor {
          could not, and a caller wanting them had to route the chunk's
          statistics through host memory to reach PredictBatchFull. Null on the
          ranking path, which then skips the transforms and shortens the copy. */
-      FullOutputs* out_full = nullptr);
+      FullOutputs* out_full = nullptr,
+      /* Prediction reuse, threaded straight through to the kernel entry
+         point. Null runs the model for every chunk. See
+         prediction_reuse_gpu.h for what non-null costs and what it skips.
+         `out_outcome` must outlive the call. */
+      const ctp::compress::preprocess::PredictionReuseContext* reuse =
+          nullptr,
+      ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
+          nullptr);
 
   /**
    * @brief Set the online-SGD learning rate.
