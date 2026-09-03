@@ -24,13 +24,16 @@
  *                the four. Two runtimes on a port is the failure this issue
  *                exists to prevent, and "all eight attached to nothing" is the
  *                opposite failure — both are caught here.
- *   3. put/get   Each rank PutBlobs a rank-stamped payload under a shared tag,
- *                barrier, then GetBlobs the payload written by its node-local
- *                predecessor — a rank that STARTED the runtime reads what a
- *                rank that ATTACHED wrote and vice versa, so the two bring-up
- *                paths are proven to land in the same runtime. Each rank also
- *                reads its own blob back, and rank 0 additionally reads a blob
- *                written on the other node.
+ *   3. put/get   Fenced off from the bring-up race by a cluster-wide barrier,
+ *                so no rank writes into a peer node's runtime while that
+ *                runtime is still composing its pools (see the barrier's
+ *                comment). Each rank PutBlobs a rank-stamped payload under a
+ *                shared tag, barrier, then GetBlobs the payload written by
+ *                its node-local predecessor — a rank that STARTED the runtime
+ *                reads what a rank that ATTACHED wrote and vice versa, so the
+ *                two bring-up paths are proven to land in the same runtime.
+ *                Each rank also reads its own blob back, and rank 0
+ *                additionally reads a blob written on the other node.
  *
  * Exit code 0 == every rank's checks passed (max-reduced onto rank 0).
  */
@@ -179,6 +182,28 @@ int main(int argc, char **argv) {
                   " runtime owners (expected exactly 1)");
     if (local_rc == 0) local_rc = 3;
   }
+
+  // The bring-up race ends here. Phase 1 is deliberately unsynchronized --
+  // that race IS issue #1015 -- but phase 3 is about where the blobs land, not
+  // about who started what, and it must not begin until EVERY node's runtime
+  // has finished composing.
+  //
+  // Without this barrier the node-0 ranks are structurally the early ones: they
+  // reach phase 3 as soon as rank 0's own runtime is up and its tag is created,
+  // while the node-1 ranks cannot start until rank 0's MPI_Bcast reaches them.
+  // A node-0 rank whose blob hashes to the container on node 1 then issues its
+  // PutBlob into a runtime that is listening but whose clio_cte_core Create has
+  // not yet run RegisterTarget, so ExtendBlob finds an empty target list and
+  // the put fails "no target has remaining space" (PutBlob rc=11 = 10 + the
+  // allocator's code 1). That is what the CI flake was: the failing ranks were
+  // always node-0 ranks, and which of them failed moved with the tag id,
+  // because the tag id feeds HashBlobToContainer.
+  //
+  // Every rank's CLIO_INIT has returned once this barrier releases, and a
+  // node's losing ranks only return from CLIO_INIT after the rank that won the
+  // start lock has finished ServerInit (compose included) -- so both nodes'
+  // targets are registered before the first blob op.
+  MPI_Barrier(MPI_COMM_WORLD);
 
   // --- phase 3: PutBlob / GetBlob through the (possibly shared) runtime ---
   std::uint64_t tag_u64 = 0;
