@@ -218,6 +218,48 @@ TEST_CASE("TestSyclZfpRoundTrip") {
 }
 #endif  // CTP_ENABLE_SYCL
 
+#if CTP_ENABLE_SYCL_LZ4
+// sycl-lz4 is the portable (SYCL) LOSSLESS nvcomp-lz4 equivalent. Requires a
+// SYCL GPU device at runtime. Unlike zfp-sycl this is lossless, so the
+// roundtrip must be BIT-EXACT.
+TEST_CASE("TestSyclLz4RoundTrip") {
+  using ctp::CompressionFactory;
+  using ctp::CompressionPreset;
+
+  // 1 MiB of compressible bytes: repeated tokens with occasional noise so LZ4
+  // finds real matches but the stream is not trivially all-runs.
+  const size_t n = 1u << 20;
+  std::vector<char> orig(n), deco(n, 0);
+  const char *words[] = {"the ", "quick ", "sycl ", "lz4 ", "gpu ", "data "};
+  for (size_t i = 0; i < n;) {
+    const char *w = words[(i / 7) % 6];
+    for (size_t k = 0; w[k] && i < n; ++k) orig[i++] = w[k];
+    if ((i & 127) == 0 && i < n)
+      orig[i++] = static_cast<char>((i * 2654435761u) >> 24);
+  }
+  std::vector<char> compressed(n + 4096);
+
+  PAGE_DIVIDE("lossless GPU roundtrip is bit-exact") {
+    auto comp =
+        CompressionFactory::GetPreset("sycl-lz4", CompressionPreset::BALANCED);
+    REQUIRE(comp != nullptr);
+    size_t cmpr_size = compressed.size();
+    REQUIRE(comp->Compress(compressed.data(), cmpr_size, orig.data(), n));
+    REQUIRE(cmpr_size > 0);
+    REQUIRE(cmpr_size < n);  // redundant data must actually shrink
+
+    auto dcmp =
+        CompressionFactory::GetPreset("sycl-lz4", CompressionPreset::BALANCED);
+    REQUIRE(dcmp != nullptr);
+    size_t deco_size = n;
+    REQUIRE(dcmp->Decompress(deco.data(), deco_size, compressed.data(),
+                             cmpr_size));
+    REQUIRE(deco_size == n);
+    REQUIRE(std::memcmp(orig.data(), deco.data(), n) == 0);  // LOSSLESS
+  }
+}
+#endif  // CTP_ENABLE_SYCL_LZ4
+
 // Characterization test for the compressor registry's frozen ID mappings.
 // These values are the on-disk wire protocol and the ML id scheme; renumbering
 // any of them silently breaks stored blobs / trained models. The expected
@@ -249,10 +291,11 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(18) == "cusz");
     REQUIRE(CompressionFactory::NameForWireId(19) == "ndzip");
     REQUIRE(CompressionFactory::NameForWireId(20) == "cuszp");
+    REQUIRE(CompressionFactory::NameForWireId(21) == "sycl-lz4");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(21) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(22) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -315,6 +358,10 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", FAST) == 221);
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", BAL) == 222);
     REQUIRE(CompressionFactory::GetLibraryId("cuszp", BEST) == 223);
+
+    // sycl-lz4: single-mode lossless GPU (base_id 23), preset forced to 2.
+    REQUIRE(CompressionFactory::GetLibraryId("sycl-lz4", FAST) == 232);
+    REQUIRE(CompressionFactory::GetLibraryId("sycl-lz4", BEST) == 232);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -345,6 +392,7 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(201).second ==
             CompressionPreset::FAST);
     REQUIRE(CompressionFactory::GetLibraryInfo(212).first == "ndzip");
+    REQUIRE(CompressionFactory::GetLibraryInfo(232).first == "sycl-lz4");
   }
 
   PAGE_DIVIDE("GetPreset constructs the CPU compressors this build HAS") {

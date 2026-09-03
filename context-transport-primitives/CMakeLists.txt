@@ -319,6 +319,12 @@ endif()
 # ------------------------------------------------------------------------------
 add_subdirectory(src)
 
+# SYCL LZ4 codec (nvcomp-equivalent). OFF by default: it needs a SYCL compiler
+# (DPC++/AdaptiveCpp), generally distinct from the clang-CUDA driving the rest
+# of the GPU codecs, so it is built by a dedicated rule (src/compress/sycl_lz4).
+option(CLIO_CTP_ENABLE_SYCL_LZ4
+       "Build the SYCL LZ4 GPU codec (portable nvcomp-lz4 equivalent)" OFF)
+
 # ctp::compress - Compression support
 add_library(compress INTERFACE)
 if(CLIO_CTE_ENABLE_COMPRESS)
@@ -363,7 +369,25 @@ target_compile_definitions(compress INTERFACE
     CTP_ENABLE_CUSZ=$<BOOL:${CLIO_CTP_ENABLE_CUSZ}>
     CTP_ENABLE_NDZIP=$<BOOL:${CLIO_CTP_ENABLE_NDZIP}>
     CTP_ENABLE_CUSZP=$<BOOL:${CLIO_CTP_ENABLE_CUSZP}>
+    CTP_ENABLE_SYCL_LZ4=$<BOOL:${CLIO_CTP_ENABLE_SYCL_LZ4}>
 )
+
+# Build + link the SYCL LZ4 kernels object (its own SYCL-compiler rule) and let
+# it export CTP_ENABLE_SYCL_LZ4=1 + the extern "C" ABI ctp::SyclLz4 calls.
+if(CLIO_CTP_ENABLE_SYCL_LZ4)
+    add_subdirectory(src/compress/sycl_lz4)
+    # Embed the kernels object -- WITH its SYCL device image -- directly into
+    # every consumer of ctp::compress via $<TARGET_OBJECTS>. A static/interface
+    # link drops the device image (kernel-launch SIGABRT); the objects do not.
+    # target_link_libraries carries the usage requirements (-fsycl compile/link
+    # flags); target_sources carries the actual objects. Both BUILD_INTERFACE:
+    # the codec is rebuilt by an installed consumer's own SYCL toolchain.
+    target_link_libraries(compress INTERFACE
+        $<BUILD_INTERFACE:clio_ctp_sycl_lz4>)
+    target_sources(compress INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:clio_ctp_sycl_lz4>>)
+endif()
+
 add_library(ctp::compress ALIAS compress)
 
 # ctp::aio - Async I/O support

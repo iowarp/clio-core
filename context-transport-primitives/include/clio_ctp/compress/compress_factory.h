@@ -57,6 +57,10 @@
 #include "sycl_zfp.h"
 #endif
 
+#if CTP_ENABLE_SYCL_LZ4
+#include "sycl_lz4.h"
+#endif
+
 #if CTP_ENABLE_CUSZ
 #include "cusz.h"
 #endif
@@ -511,6 +515,16 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPU (SYCL) LZ4: portable LOSSLESS analog of nvcomp-lz4. Single-mode (LZ4
+  // has no preset levels here), like snappy/blosc2. Returns nullptr when the
+  // SYCL LZ4 kernels library is not compiled into this build.
+  static std::unique_ptr<Compressor> MakeSyclLz4(CompressionPreset) {
+#if CTP_ENABLE_SYCL_LZ4
+    return std::make_unique<SyclLz4>();
+#else
+    return nullptr;
+#endif
+  }
   // cuSZ: GPU error-bounded LOSSY float compressor. Multi-mode like the lossy
   // CPU entries -- presets map to error bounds (FAST=1e-2 loose, BALANCED=1e-3,
   // BEST=1e-4 tight); higher fidelity -> lower compression. Returns nullptr when
@@ -592,6 +606,7 @@ class CompressionFactory {
         CompressorInfo{"cusz",            18, 20, false, &MakeCusz, true},
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip, false},
         CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp, true},
+        CompressorInfo{"sycl-lz4",        21, 23, true,  &MakeSyclLz4, true},
     };
     return kRegistry;
   }
