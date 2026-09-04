@@ -664,8 +664,13 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   end.QuadPart = static_cast<LONGLONG>(size);
   if (!SetFilePointerEx(hfile, end, nullptr, FILE_BEGIN) ||
       !SetEndOfFile(hfile)) {
+    // Same reason as the CreateFileMappingA path below: preserve the error
+    // across the cleanup call so the caller reports this failure, not
+    // CloseHandle's.
+    const DWORD size_err = GetLastError();
     CloseHandle(hfile);
     fd.windows_fd_ = nullptr;
+    SetLastError(size_err);
     return false;
   }
 
@@ -676,6 +681,7 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
       static_cast<DWORD>(size >> 32),              // size, high-order DWORD
       static_cast<DWORD>(size & 0xFFFFFFFFull),    // size, low-order DWORD
       win_name.c_str());                           // mapping object name
+  const DWORD map_err = GetLastError();
 
   // The section holds its own reference to the file, so the file handle has
   // done its job. Closing it here keeps File a union of one handle and leaves
@@ -683,7 +689,14 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   CloseHandle(hfile);
 
   if (fd.windows_fd_ == nullptr) {
+    // Restore the error AFTER the cleanup call. The caller reports the failure
+    // with GetLastSharedMemoryError(), which reads GetLastError() -- so the
+    // DeleteFileA below would otherwise be what gets reported, and the real
+    // reason would be lost. That is how a create failure came to be blamed on
+    // "Win32 error 203" (ERROR_ENVVAR_NOT_FOUND), a code nothing in this
+    // function can produce.
     DeleteFileA(shm_path.c_str());
+    SetLastError(map_err);
     return false;
   }
   return true;
@@ -866,7 +879,38 @@ void SystemInfo::UnmapMemory(void *ptr, size_t size) {
 #if CTP_ENABLE_PROCFS_SYSINFO
   munmap(ptr, size);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
-  VirtualFree(ptr, size, MEM_RELEASE);
+  // This is the counterpart of TWO allocators, because on POSIX one munmap()
+  // serves both: MapSharedMemory() (MapViewOfFile) and MapPrivateMemory()
+  // (VirtualAlloc). Win32 has a separate deallocator for each, and the one
+  // that used to be here -- VirtualFree(ptr, size, MEM_RELEASE) -- was wrong
+  // for both:
+  //
+  //   * A MapViewOfFile region is MEM_MAPPED. VirtualFree cannot free it at
+  //     all; only UnmapViewOfFile can.
+  //   * For a VirtualAlloc region, MEM_RELEASE REQUIRES dwSize to be 0.
+  //     Passing the region's size fails with ERROR_INVALID_PARAMETER.
+  //
+  // Both failures were silent -- the return value is discarded -- so every
+  // view and every private mapping leaked for the life of the process. That
+  // was invisible while Windows segments were pagefile-backed, but once they
+  // gained a sparse backing file (#1063) a leaked view keeps a live section on
+  // that file, and CreateNewSharedMemory's CREATE_ALWAYS cannot truncate a
+  // file with a mapped section: ERROR_USER_MAPPED_FILE. See #1069.
+  //
+  // Ask the OS which kind of region this is rather than threading a flag
+  // through every caller: the callers are shared with the POSIX build, where
+  // the distinction does not exist.
+  if (ptr == nullptr) {
+    return;
+  }
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+      mbi.Type == MEM_MAPPED) {
+    UnmapViewOfFile(ptr);
+    return;
+  }
+  VirtualFree(ptr, 0, MEM_RELEASE);
+  (void)size;
 #endif
 }
 

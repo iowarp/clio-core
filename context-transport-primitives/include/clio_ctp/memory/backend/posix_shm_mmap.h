@@ -94,8 +94,21 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
       // shm_open(), and the Win32 one does not set errno at all, so this used
       // to report a commit-limit failure as "Resource temporarily
       // unavailable". Ask the platform what actually went wrong.
+      //
+      // Read it into a local BEFORE logging, and not as an argument to HLOG.
+      // GetLastError() is thread-global, and HLOG's first use in a process
+      // constructs the Logger singleton, which looks up CTP_LOG_LEVEL and
+      // CTP_LOG_OUT -- leaving ERROR_ENVVAR_NOT_FOUND behind when they are
+      // unset, as they normally are. The order of the two is unspecified, and
+      // in practice the singleton wins, so the FIRST shm failure in a process
+      // was reported as "could not find the environment option that was
+      // entered (Win32 error 203)" -- a code nothing in the create path can
+      // produce -- while later ones reported the truth. That is exactly what
+      // the two failures in CDash build 4029381 look like: 203 from the first,
+      // the real ERROR_USER_MAPPED_FILE from the second.
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
       HLOG(kError, "could not create shared memory segment {} of {} bytes: {}",
-           url, backend_size, SystemInfo::GetLastSharedMemoryError());
+           url, backend_size, shm_err);
       return false;
     }
     url_ = url;
