@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Pool</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="index.html">Cluster</a></li>
+      <li><a href="pools.html">Pools</a></li>
+      <li><a href="config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1 id="title">Pool</h1>
+    <p class="sub"><a href="pools.html">&larr; back to pools</a></p>
+    <div id="errors"></div>
+
+    <h2>Identity</h2>
+    <div class="grid" id="identity"></div>
+
+    <h2>Task predictions</h2>
+    <p class="sub">
+      The learned per-method cost model the scheduler routes with: predicted
+      time = coefficient &times; task size, and the error columns say how far
+      those predictions are off on average.
+    </p>
+    <div id="predictions"></div>
+
+    <h2>Monitor</h2>
+    <p class="sub">This pool's own <code>Monitor()</code> queries.</p>
+    <div class="row">
+      <input id="query" size="18" placeholder="query" value="stats">
+      <button id="run">Query</button>
+    </div>
+    <pre id="result"></pre>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/pool.js"></script>
+</body>
+</html>

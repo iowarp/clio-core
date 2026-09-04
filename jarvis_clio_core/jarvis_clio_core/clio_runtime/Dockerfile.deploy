@@ -43,9 +43,14 @@ RUN ldconfig && mkdir -p /run/sshd
 # Install jarvis-cd inside the deploy image so pipeline orchestration
 # (SSH/MPI) can happen from the host into the container.
 RUN pip3 install --break-system-packages pyyaml pandas podman-compose
+# PINNED to a commit, not --branch dev: an upstream push otherwise changes what
+# this image ships with no commit of ours. Keep in step with the pin in
+# context-runtime/test/integration/chimaera_stop/run_tests.sh -- bump both.
+ARG JARVIS_CD_REF=1d2cf925d36da3a1d62730fbc6c65b5001efe43b
 RUN cd /tmp \
-    && git clone --depth 1 --branch dev https://github.com/grc-iit/jarvis-cd.git \
+    && git clone --filter=blob:none https://github.com/grc-iit/jarvis-cd.git \
     && cd jarvis-cd \
+    && git checkout "$JARVIS_CD_REF" \
     && git config submodule.awesome-scienctific-applications.update none \
     && pip3 install --break-system-packages . \
     && cd / && rm -rf /tmp/jarvis-cd

@@ -32,14 +32,14 @@ services:
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     networks:
       cc-cluster:
-        ipv4_address: 172.30.0.10
+        ipv4_address: 172.31.2.10
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
       - /mnt:mode=1777
     environment:
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/client_crash/clio_config.yaml
-      - CLIO_BIND_ADDR=172.30.0.10
+      - CLIO_BIND_ADDR=172.31.2.10
       - CLIO_PORT=8080
       - CTP_LOG_LEVEL=info
       - CLIO_REPO_PATH=/workspace/build/bin
@@ -66,14 +66,14 @@ services:
       - cc-daemon
     networks:
       cc-cluster:
-        ipv4_address: 172.30.0.11
+        ipv4_address: 172.31.2.11
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     environment:
       - CLIO_WITH_RUNTIME=0
       - CLIO_IPC_MODE=tcp
-      - CLIO_SERVER_ADDR=172.30.0.10
-      - CLIO_BIND_ADDR=172.30.0.11
+      - CLIO_SERVER_ADDR=172.31.2.10
+      - CLIO_BIND_ADDR=172.31.2.11
       - CLIO_PORT=8080
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/client_crash/clio_config.yaml
       - CLIO_WAIT_SERVER=40
@@ -106,4 +106,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: 172.31.2.0/24

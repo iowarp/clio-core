@@ -233,6 +233,16 @@ public:
   void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Register the web dashboard's endpoints and claim its home page
+   * (issue #990). Called on a prototype instance at module-load time (see
+   * Container::RegisterViz), so every handler is stateless -- Monitor
+   * forwarding constructs a local admin Client per request. Defined in
+   * admin_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
+  /**
    * Handle AnnounceShutdown - Mark a departing node as dead immediately
    * and trigger recovery if this node is the new leader.
    */

@@ -11,14 +11,12 @@
 
 #include <chrono>
 #include <cstdlib>
-#if !defined(_WIN32)
-// The descriptor layer below is POSIX-shaped (ssize_t/off_t/O_SYNC/S_IFREG)
-// and has no Windows port -- this is the same constraint that kept the old
-// adapter/cfs out of Windows builds at the CMake level. The rest of this
-// client (tasks, deferred writes, the SHM caches) is portable and still
-// compiles there, so guard the descriptor layer rather than the whole header.
-#include <fcntl.h>
-#include <sys/stat.h>
+// The descriptor layer below is POSIX-SHAPED but not POSIX-only: nothing
+// in it makes a system call. posix_compat.h supplies the vocabulary it is
+// written in (FsSsize/FsOff/FsSsize) on every platform.
+#include "clio_cte/filesystem/api.h"
+#include "clio_cte/filesystem/posix_compat.h"
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #include <cerrno>
@@ -70,14 +68,12 @@ inline std::string StripClioPrefix(const std::string &path) {
   return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
 }
 
-#if !defined(_WIN32)
 /** CTE-issued descriptors start here so they never collide with kernel fds. */
 static constexpr int kCfsFdBase = 8192;
 /** Preferred block size reported by stat (matches the chimod page size). */
 static constexpr size_t kCfsBlkSize = 1024 * 1024;
 /** Synthetic device id -- same for every clio:: file. */
 static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
-#endif  // !_WIN32
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -91,7 +87,7 @@ class Client : public clio::cte::core::Client {
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
 
-#if CTP_IS_HOST && !defined(_WIN32)
+#if CTP_IS_HOST
   // Copyable by hand, because the descriptor table below carries a std::mutex
   // and the compiler-generated copies would be deleted. The base client is
   // copyable by contract (its deferred-write registry is process-wide for
@@ -182,12 +178,37 @@ class Client : public clio::cte::core::Client {
    * @return true if a consistent record was read. false means "not cached /
    *         could not read consistently" -- fall back to the RPC path.
    */
+  /** True once the runtime's mirror dropped ANY record for capacity: a miss
+   *  then proves nothing and authoritative negatives must not fire. */
+  bool MirrorSaturated() const {
+    return shm_fs_root_ != nullptr &&
+           shm_fs_root_->overflow_.load(std::memory_order_acquire) != 0;
+  }
+
   bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    return shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
-                                                   out);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
+                                                 out)) {
+      return false;
+    }
+    // A FILE record from an older namespace generation may sit under a stale
+    // path key (its directory was renamed): treat as absent. Directory
+    // records stay for IsDir purposes (a moved-away dir name SHOULD read
+    // negative, and dir self-stats never serve from the mirror) — but their
+    // COMPLETE claim dies with the generation: after the bump every file
+    // record reads absent, so a still-complete parent would turn that into
+    // authoritative ENOENT for REAL files across the whole tree (fsstress's
+    // one dir rename made rm -r skip everything it then could not rmdir).
+    if (out->nsgen_ !=
+        shm_fs_root_->nsgen_.load(std::memory_order_relaxed)) {
+      if (!(out->flags_ & kShmFileIsDir)) {
+        return false;
+      }
+      out->flags_ &= ~kShmDirComplete;
+    }
+    return true;
   }
 #endif  // CTP_IS_HOST
 
@@ -214,11 +235,53 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle) {
+  /** Tag-keyed size advance (see AdvanceSizeTask). */
+  clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
+      clio::run::u64 tag_packed, clio::run::u64 size) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              tag_packed, size);
+    return ipc->Send(task);
+  }
+
+  /** Batched sieve-flushed creation (see MultiCreateTask). */
+  clio::run::Future<MultiCreateTask> AsyncMultiCreate(
+      const std::string &packed) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MultiCreateTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              packed);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle,
+                                          clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle);
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
     return ipc->Send(task);
+  }
+
+  /** Fire-and-forget close: the task carries TASK_FIRE_AND_FORGET, so no
+   *  response is produced and the returned future is complete immediately.
+   *  close(2) is not a durability point — data durability lives in the
+   *  awaited writes / fsync — and Close's only output is server-side handle
+   *  bookkeeping, so metadata-heavy workloads (one close per file) need not
+   *  pay a full round trip for it. */
+  void AsyncCloseDetached(clio::run::u64 handle,
+                          clio::run::u64 advance_size = 0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
+    // Flag must be set before Send (same ordering rule as the PutBlob
+    // staging flags).
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
   }
 
   clio::run::Future<ReadTask> AsyncRead(clio::run::u64 handle, clio::run::u64 offset,
@@ -256,11 +319,13 @@ class Client : public clio::cte::core::Client {
   }
 
   clio::run::Future<TruncateTask> AsyncTruncate(const std::string &path,
-                                          clio::run::u64 new_size) {
+                                          clio::run::u64 new_size,
+                                          clio::run::u64 tag_packed = 0,
+                                          clio::run::u64 old_extent = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
                                            clio::run::PoolQuery::Local(), path,
-                                           new_size);
+                                           new_size, tag_packed, old_extent);
     return ipc->Send(task);
   }
 
@@ -280,6 +345,20 @@ class Client : public clio::cte::core::Client {
                                           clio::run::PoolQuery::Local(), path,
                                           atime_ns, mtime_ns, flags);
     return ipc->Send(task);
+  }
+
+  /** Fire-and-forget utimens (TASK_FIRE_AND_FORGET; see AsyncCloseDetached).
+   *  Timestamp stamping is pure metadata with no caller-visible output — the
+   *  kernel's writeback SETATTR issues one per dirtied file, and paying a
+   *  round trip for each put a wait on every file of a checkout. */
+  void AsyncUtimensDetached(const std::string &path, clio::run::u64 atime_ns,
+                            clio::run::u64 mtime_ns, clio::run::u32 flags) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), path,
+                                          atime_ns, mtime_ns, flags);
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
   }
 
   clio::run::Future<ChownTask> AsyncChown(const std::string &path,
@@ -443,14 +522,16 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-#if !defined(_WIN32)
   // =========================================================================
   // Byte-oriented filesystem I/O with POSIX semantics (issues #817, #862).
   //
-  // POSIX-only: these return ssize_t and the descriptor layer below adds
-  // off_t/O_SYNC/S_IFREG. Windows builds get the task API (AsyncRead/
-  // AsyncWrite/...) which is portable; the old adapter/cfs was excluded from
-  // Windows at the CMake level for exactly this reason.
+  // POSIX-SHAPED, but not POSIX-only: nothing here makes a system call. The
+  // layer is a descriptor table and a set of seek offsets over the task API,
+  // so what tied it to POSIX was its vocabulary -- ssize_t, off_t, O_SYNC --
+  // rather than its behaviour. That vocabulary comes from posix_compat.h now
+  // (FsSsize/FsOff), and the layer builds on Windows too. Offsets are FsOff
+  // and deliberately not off_t: MSVC's off_t is 32 bits and would cap every
+  // offset here at 2 GiB.
   //
   // THIS is the interface an interceptor calls. An adapter (POSIX, STDIO,
   // MPI-IO, libfuse) should own nothing but its handle table and its seek
@@ -553,7 +634,7 @@ class Client : public clio::cte::core::Client {
    *        durability over latency and honouring that is the point of the flag.
    * @return bytes accepted, or -1 with errno set.
    */
-  ssize_t Write(clio::run::u64 handle, const std::string &path,
+  FsSsize Write(clio::run::u64 handle, const std::string &path,
                 clio::run::u64 off, const void *buf, size_t count,
                 bool sync = false) {
     if (count == 0) {
@@ -599,9 +680,9 @@ class Client : public clio::cte::core::Client {
     auto t3 = prof ? tick() : std::chrono::steady_clock::time_point{};
     if (blocking) {
       fut.Wait();
-      ssize_t ret;
+      FsSsize ret;
       if (fut->GetReturnCode() == 0) {
-        ret = static_cast<ssize_t>(fut->bytes_written_);
+        ret = static_cast<FsSsize>(fut->bytes_written_);
       } else {
         errno = EIO;
         ret = -1;
@@ -643,7 +724,7 @@ class Client : public clio::cte::core::Client {
       p.window_ns.fetch_add(std::chrono::duration_cast<ns>(t5 - t4).count(),
                             std::memory_order_relaxed);
     }
-    return static_cast<ssize_t>(count);
+    return static_cast<FsSsize>(count);
   }
 
   /**
@@ -655,7 +736,7 @@ class Client : public clio::cte::core::Client {
    *
    * @return bytes read (possibly 0 at EOF), or -1 with errno set.
    */
-  ssize_t Read(clio::run::u64 handle, const std::string &path,
+  FsSsize Read(clio::run::u64 handle, const std::string &path,
                clio::run::u64 off, void *buf, size_t count) {
     if (count == 0) {
       return 0;
@@ -665,7 +746,7 @@ class Client : public clio::cte::core::Client {
     if (served > 0) {
       // Fully covered by in-flight writes: those bytes ARE the current value,
       // and the file is necessarily at least this long.
-      return static_cast<ssize_t>(count);
+      return static_cast<FsSsize>(count);
     }
     if (served == -1) {
       // PARTIAL coverage: the bytes outside the in-flight writes are stale in
@@ -676,7 +757,7 @@ class Client : public clio::cte::core::Client {
       // of the same file.
       DeferAwaitKey(key);
     }
-    ssize_t fast = TryReadShm(path, off, buf, count);
+    FsSsize fast = TryReadShm(path, off, buf, count);
     if (fast >= 0) {
       return fast;
     }
@@ -688,13 +769,13 @@ class Client : public clio::cte::core::Client {
     }
     auto t = AsyncRead(handle, off, count, ctp::ipc::ShmPtr<>(shm.shm_));
     t.Wait();
-    ssize_t ret;
+    FsSsize ret;
     if (t->GetReturnCode() == 0) {
       size_t got = static_cast<size_t>(t->bytes_read_);
       if (got > 0) {
         std::memcpy(buf, shm.ptr_, got);
       }
-      ret = static_cast<ssize_t>(got);
+      ret = static_cast<FsSsize>(got);
     } else {
       errno = EIO;
       ret = -1;
@@ -841,7 +922,13 @@ class Client : public clio::cte::core::Client {
 #ifdef O_DSYNC
     if (flags & O_DSYNC) return true;
 #endif
+#ifdef O_SYNC
     return (flags & O_SYNC) != 0;
+#else
+    /* MSVC defines neither, so no caller there can have requested it. */
+    (void)flags;
+    return false;
+#endif
   }
 
   /** Whether fd was issued by us (and is still open). */
@@ -885,19 +972,19 @@ class Client : public clio::cte::core::Client {
   static bool EnsureInit();
 
   int OpenFd(const std::string &raw_path, int flags, int mode);
-  ssize_t ReadFd(int fd, void *buf, size_t count);
-  ssize_t WriteFd(int fd, const void *buf, size_t count);
-  ssize_t PreadFd(int fd, void *buf, size_t count, off_t offset);
-  ssize_t PwriteFd(int fd, const void *buf, size_t count, off_t offset);
-  off_t SeekFd(int fd, off_t offset, int whence);
-  off_t TellFd(int fd);
-  off_t SizeFd(int fd);
+  FsSsize ReadFd(int fd, void *buf, size_t count);
+  FsSsize WriteFd(int fd, const void *buf, size_t count);
+  FsSsize PreadFd(int fd, void *buf, size_t count, FsOff offset);
+  FsSsize PwriteFd(int fd, const void *buf, size_t count, FsOff offset);
+  FsOff SeekFd(int fd, FsOff offset, int whence);
+  FsOff TellFd(int fd);
+  FsOff SizeFd(int fd);
   int CloseFd(int fd);
   /** fsync(2): drain this file's deferred writes, reporting a latched
    *  failure exactly once. */
   int SyncFd(int fd);
-  int FtruncateFd(int fd, off_t length);
-  int TruncatePath(const std::string &raw_path, off_t length);
+  int FtruncateFd(int fd, FsOff length);
+  int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);
   int RenamePath(const std::string &raw_src, const std::string &raw_dst);
   int ReaddirPath(const std::string &raw_path, std::vector<std::string> *out);
@@ -918,10 +1005,21 @@ class Client : public clio::cte::core::Client {
     buf->st_nlink = 1;
     buf->st_uid = CTP_SYSTEM_INFO->uid_;
     buf->st_gid = CTP_SYSTEM_INFO->gid_;
-    buf->st_size = static_cast<off_t>(size);
-    buf->st_blksize = static_cast<blksize_t>(kCfsBlkSize);
-    // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
-    buf->st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
+    // Cast to whatever the caller's own struct declares rather than to fixed
+    // POSIX types: this is a template instantiated with their stat struct.
+    buf->st_size = static_cast<decltype(buf->st_size)>(size);
+    // st_blksize/st_blocks are POSIX extensions that MSVC's struct stat simply
+    // does not have. Detected on the caller's struct rather than on _WIN32,
+    // because this is a template: a caller passing a struct that DOES declare
+    // them still gets them filled, whatever the platform.
+    if constexpr (requires { buf->st_blksize; }) {
+      buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
+    }
+    if constexpr (requires { buf->st_blocks; }) {
+      // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
+      buf->st_blocks =
+          static_cast<decltype(buf->st_blocks)>((size + 511) / 512);
+    }
   }
 
   /** fstat(2): fill *buf from the fd's chimod metadata. */
@@ -957,8 +1055,86 @@ class Client : public clio::cte::core::Client {
     return 0;
   }
 
-  ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
+  /** Kill switch for the zero-IPC read fast path (diagnostics: forces every
+   *  read through the authoritative RPC so mirror-record corruption can be
+   *  discriminated from store corruption). */
+  static bool ShmReadFastPathEnabled() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CFS_SHM_READ");
+      return e == nullptr || *e != '0';
+    }();
+    return v;
+  }
+
+  /**
+   * What a caller wants done about a byte range the tier does not hold.
+   *
+   * The two consumers need OPPOSITE answers from the same lookup, and getting
+   * it backwards is silent data corruption rather than an error:
+   *
+   *   kZeroFillHoles -- POSIX filesystem semantics. This client IS the
+   *     filesystem, so a range inside the file with nothing behind it was
+   *     never written and reads as zeros. Correct for CfsIo.
+   *
+   *   kRefuseHoles -- cache-over-authoritative semantics. The tier is a cache
+   *     in front of a file that holds the real bytes, so "not here" means "ask
+   *     the authoritative copy", NEVER "the answer is zeros". Correct for the
+   *     HDF5 VFD, which write-throughs to a native file.
+   */
+  enum class ShmHolePolicy { kZeroFillHoles, kRefuseHoles };
+
+  /**
+   * Read committed bytes from shared memory, refusing rather than inventing
+   * anything the tier does not hold. See ShmHolePolicy::kRefuseHoles.
+   *
+   * @return bytes read, or -1 meaning "not fast-pathable, use the
+   *         authoritative source" -- which for this policy also covers "some
+   *         of that range is not cached".
+   */
+  FsSsize TryReadShmResident(const std::string &path, clio::run::u64 off,
+                             void *buf, size_t count) {
+    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kRefuseHoles);
+  }
+
+  // FsSsize, not ssize_t: MSVC has no ssize_t, and this layer's whole
+  // vocabulary was ported to FsSsize/FsOff so it builds on Windows.
+  FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
+    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kZeroFillHoles);
+  }
+
+  FsSsize TryReadShmImpl(const std::string &path, clio::run::u64 off, void *buf,
+                         size_t count, ShmHolePolicy policy) {
+    // Read-your-own-writes, here rather than only in Read().
+    //
+    // CFS writes defer by default, and in-flight bytes are visible ONLY
+    // through this registry -- the page blob still holds the previously
+    // committed content until they land. Read() consults it before calling
+    // this function, so for that caller the check below costs an atomic load
+    // and returns 0. But TryReadShmResident is a PUBLIC entry point the VFD
+    // calls directly, and it never runs Read(): an in-place rewrite followed
+    // by a read in the same session would otherwise find the stale committed
+    // page, succeed, and hand back pre-write bytes. kShmFilePendingAppend does
+    // not cover it either, because an in-place rewrite is not an append.
+    //
+    // Depending on the caller for a correctness precondition is what made that
+    // reachable, so the function now establishes it itself.
+    const clio::run::u64 defer_key = FileKey(path);
+    const int served =
+        DeferTryServe(defer_key, off, static_cast<char *>(buf), count);
+    if (served > 0) {
+      // Fully covered by in-flight writes: those bytes ARE the current value.
+      return static_cast<FsSsize>(count);
+    }
+    if (served == -1) {
+      // Partial coverage: the bytes outside the in-flight writes are stale
+      // until those writes land, so this is the one case that has to wait.
+      DeferAwaitKey(defer_key);
+    }
+
+    if (!ShmReadFastPathEnabled()) {
+      return -1;
+    }
     // Attach lazily, and RETRY when not yet attached, rather than latching
     // the result of one attempt at init. A client can legitimately come up
     // before its pool has been composed (or before the chimod has registered
@@ -1002,6 +1178,12 @@ class Client : public clio::cte::core::Client {
     char *dst = static_cast<char *>(buf);
     clio::run::u64 done = 0;
     clio::run::u64 cur = off;
+    // Bound on residency probes per request. Each probe is metadata-only and
+    // replaces a whole-request data RPC, so a few are a clear win -- but they
+    // are still round trips, and a heavily perforated range would spend more
+    // on asking than the single RPC it is trying to avoid. Past the bound,
+    // take the RPC, which answers everything in one go.
+    unsigned residency_probes = 0;
     while (done < want) {
       clio::run::u64 page_off = cur % kFsPageSize;
       clio::run::u64 to_read = kFsPageSize - page_off;
@@ -1011,10 +1193,44 @@ class Client : public clio::cte::core::Client {
       if (!cte->TryReadBlobShm(rec.tag_id_, PageName(cur), dst + done,
                                static_cast<size_t>(to_read),
                                static_cast<size_t>(page_off))) {
-        // Abandon the WHOLE request rather than mixing sources. A hole reads
-        // as zeros and a missing page is indistinguishable from an uncached
-        // one, so the only safe reading of a failure here is "let the runtime
-        // answer".
+        // A miss here used to abandon the WHOLE request, because "hole" and
+        // "cached elsewhere" were indistinguishable from this side and only
+        // one of them can be answered with zeros. GetResidency draws that
+        // distinction at the tier, which is the only place that knows it.
+        //
+        // Zeroing is correct for an absent page, and specifically here:
+        //   * the range is already clamped to the LOGICAL size above, so this
+        //     page lies inside the file, and a page inside the file with no
+        //     blob behind it was never written -- POSIX says zeros. This is
+        //     the same rule the runtime's own read path applies when it
+        //     pre-zeros before GetBlob.
+        //   * uncommitted writes cannot be hiding here. Read() serves or
+        //     awaits the deferred registry BEFORE calling this path, and
+        //     IsFastPathable() refuses a record carrying kShmFilePendingAppend.
+        //
+        // Anything other than a definite absence -- present but unreachable,
+        // or a failed probe -- still falls back, because those are exactly the
+        // cases where zeros would be wrong.
+        // kRefuseHoles: the authoritative copy has these bytes, so there is
+        // nothing to decide -- do not probe, do not invent, just refuse.
+        if (policy == ShmHolePolicy::kRefuseHoles) {
+          ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
+          return -1;
+        }
+        if (residency_probes < kMaxResidencyProbes) {
+          ++residency_probes;
+          auto res = cte->AsyncGetResidency(rec.tag_id_, PageName(cur),
+                                            static_cast<clio::run::u64>(page_off),
+                                            static_cast<clio::run::u64>(to_read));
+          res.Wait();
+          if (res->GetReturnCode() == 0 && res->exists_ == 0) {
+            std::memset(dst + done, 0, static_cast<size_t>(to_read));
+            ShmReadHoles().fetch_add(1, std::memory_order_relaxed);
+            done += to_read;
+            cur += to_read;
+            continue;
+          }
+        }
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
       }
@@ -1034,7 +1250,19 @@ class Client : public clio::cte::core::Client {
            "active)");
     });
     ShmReadHits().fetch_add(1, std::memory_order_relaxed);
-    return static_cast<ssize_t>(done);
+    return static_cast<FsSsize>(done);
+  }
+
+  /** Max GetResidency probes in one ShmRead (see the call site). */
+  static constexpr unsigned kMaxResidencyProbes = 8;
+
+  /** Pages served as holes: absent at the tier, so zeros are the answer and no
+   *  data round trip was needed. Counted apart from hits because they are a
+   *  different thing -- bytes produced locally, not bytes read from the tier --
+   *  and folding them into hits would overstate what the cache served. */
+  static std::atomic<clio::run::u64> &ShmReadHoles() {
+    static std::atomic<clio::run::u64> n{0};
+    return n;
   }
 
   // Zero-IPC read accounting. A silently-disabled fast path and a working one
@@ -1082,7 +1310,6 @@ class Client : public clio::cte::core::Client {
     }();
     return v;
   }
-#endif  // !_WIN32
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
@@ -1092,7 +1319,6 @@ class Client : public clio::cte::core::Client {
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
 
-#if !defined(_WIN32)
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
   // across a task Wait, so a slow chimod call cannot block an unrelated
@@ -1100,7 +1326,6 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
-#endif  // !_WIN32
 #endif
 };
 

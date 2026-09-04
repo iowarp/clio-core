@@ -66,6 +66,12 @@ using cte_timespec_t = struct fuse_timespec;
 // platforms (the bare `struct statvfs` spelling is not declared on MSVC).
 using cte_statvfs_t = struct fuse_statvfs;
 
+// MSVC's <fcntl.h> has O_RDONLY/O_WRONLY/O_RDWR but no O_ACCMODE mask; the
+// POSIX low-two-bits definition matches how the shared callbacks use it.
+#ifndef O_ACCMODE
+#define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
+#endif
+
 // Integer field types the shared callback bodies spell the POSIX way, but which
 // WinFsp only provides under fuse_-prefixed names (MSVC has no <sys/stat.h> /
 // <sys/statvfs.h> to declare the bare spellings).

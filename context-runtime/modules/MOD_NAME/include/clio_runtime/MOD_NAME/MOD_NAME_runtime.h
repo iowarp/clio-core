@@ -168,6 +168,21 @@ public:
   clio::run::TaskResume ManyToOneSum(clio::run::shared_ptr<ManyToOneSumTask> &task);
 
   /**
+   * Handle AllReduce task — the MPI_Allreduce(SUM) analogue. The aggregate's
+   * value_ already holds the summed contribution of every container in the pool
+   * (folded by AggregateIn once the AllToOne barrier released); echo it into
+   * sum_, which is broadcast back to every participant.
+   */
+  clio::run::TaskResume AllReduce(clio::run::shared_ptr<AllReduceTask> &task);
+
+  /**
+   * Handle Barrier task — the MPI_Barrier analogue. Intentionally empty: the
+   * synchronization is entirely the AllToOne count-based release, so the body
+   * does no work and only its completion (broadcast 1->N) is observable.
+   */
+  clio::run::TaskResume Barrier(clio::run::shared_ptr<BarrierTask> &task);
+
+  /**
    * Handle Monitor task - return msgpack-encoded test data
    * Part of the unified kMonitor:9 interface
    */

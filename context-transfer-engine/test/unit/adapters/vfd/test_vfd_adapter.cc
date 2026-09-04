@@ -27,9 +27,19 @@
 #include <hdf5.h>
 
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/stat.h>
+
+// The descriptor calls below go through the driver's own platform shims
+// (H5FDclio_compat.h) rather than POSIX directly, so this test builds on
+// Windows for the same reason the driver does. sys/file.h and unistd.h do not
+// exist on MSVC; on POSIX the shims are thin inline wrappers over flock/pread.
+#ifndef _WIN32
+#include <sys/file.h>
 #include <unistd.h>
+#endif
+
+#include <filesystem>
+#include <system_error>
 
 #include <algorithm>
 #include <cerrno>
@@ -37,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "clio_runtime/clio_runtime.h"
@@ -44,8 +55,29 @@
 #include "clio_cte/core/core_client.h"
 #include <clio_cte/filesystem/filesystem_client.h>
 #include "adapter/vfd/H5FDclio.h"
+#include "adapter/vfd/H5FDclio_compat.h"
 
 namespace {
+
+/** setenv(3) is POSIX; MSVC spells it _putenv_s and has no "don't overwrite"
+ *  mode, so honor overwrite=0 by checking first. */
+inline void TestSetenv(const char *name, const char *value, int overwrite) {
+#ifdef _WIN32
+  if (!overwrite && std::getenv(name) != nullptr) return;
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, overwrite);
+#endif
+}
+
+/** access(path, F_OK) stand-in. The error_code overload is deliberate: one
+ *  call site probes a "clio::"-marked name, and a bare colon in a path makes
+ *  the throwing overload unhappy on Windows. */
+inline bool TestPathExists(const char *path) {
+  std::error_code ec;
+  return std::filesystem::exists(path, ec);
+}
+
 const char *kBackend = "/tmp/clio_cte_vfd_test.dat";
 const char *kClioFile = "/tmp/clio_cte_vfd_suite.h5";
 const char *kNativeFile = "/tmp/clio_cte_vfd_suite.h5";
@@ -241,14 +273,97 @@ bool VerifyRich(hid_t file) {
   return VerifyAttr(file);
 }
 
+/** std::system() runs the platform shell -- /bin/sh on POSIX, cmd.exe on
+ *  Windows -- and none of the three pieces these helpers need spell the same
+ *  way in both. Naming the differences once here rather than at each call site
+ *  matters more than usual: getting any of them wrong makes the tool matrix
+ *  *skip* rather than fail, and by this test's own reckoning the matrix is the
+ *  only evidence in this binary for native compatibility as external readers
+ *  see it. It silently did exactly that on Windows.
+ *
+ *  - `command -v` is a POSIX shell builtin. cmd.exe's equivalent is `where`.
+ *  - The bit bucket is `/dev/null` vs `nul`. cmd.exe treats `/dev/null` as a
+ *    path and fails the redirect outright.
+ *  - cmd.exe does not recognize single quotes as quoting at all; it passes them
+ *    through as literal characters, so a 'quoted' path reaches h5dump with the
+ *    quotes still attached. */
+#ifdef _WIN32
+constexpr const char *kToolProbe = "where ";
+constexpr const char *kDevNull = ">nul 2>&1";
+constexpr char kShellQuote = '"';
+#else
+constexpr const char *kToolProbe = "command -v ";
+constexpr const char *kDevNull = ">/dev/null 2>&1";
+constexpr char kShellQuote = '\'';
+#endif
+
+/** Quote a path for whichever shell std::system() will hand it to. */
+std::string ShQuote(const std::string &path) {
+  return kShellQuote + path + kShellQuote;
+}
+
 bool HasTool(const char *tool) {
-  std::string cmd = "command -v ";
+  std::string cmd = kToolProbe;
   cmd += tool;
-  cmd += " >/dev/null 2>&1";
+  cmd += " ";
+  cmd += kDevNull;
   return std::system(cmd.c_str()) == 0;
 }
 int RunCmd(const std::string &cmd) {
-  return std::system((cmd + " >/dev/null 2>&1").c_str());
+  return std::system((cmd + " " + kDevNull).c_str());
+}
+
+/** Prefix a command with environment settings for the child it launches.
+ *  `VAR=value cmd` is sh syntax with no cmd.exe equivalent; cmd.exe needs
+ *  separate `set` commands chained with && inside the one shell std::system()
+ *  starts. The quoted `set "K=V"` form is deliberate -- unquoted, every space
+ *  before the && lands inside the value. */
+std::string WithEnv(const std::vector<std::pair<std::string, std::string>> &env,
+                    const std::string &cmd) {
+  std::string out;
+  for (const auto &kv : env) {
+#ifdef _WIN32
+    out += "set \"" + kv.first + "=" + kv.second + "\"&&";
+#else
+    out += kv.first + "='" + kv.second + "' ";
+#endif
+  }
+  return out + cmd;
+}
+
+/** Paths in `dir` ending in `suffix`. Replaces `ls dir/*.suffix` and the
+ *  shell globbing it depends on -- neither of which cmd.exe provides. */
+std::vector<std::string> FilesEndingIn(const std::string &dir,
+                                       const std::string &suffix) {
+  std::vector<std::string> out;
+  std::error_code ec;
+  for (const auto &e : std::filesystem::directory_iterator(dir, ec)) {
+    const std::string p = e.path().string();
+    if (p.size() >= suffix.size() &&
+        p.compare(p.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      out.push_back(p);
+    }
+  }
+  return out;
+}
+
+/** Does any of `files` contain `needle`? Stands in for `grep -q needle files`,
+ *  matching grep's plain-substring semantics (the patterns here are literals).
+ *  Reading the files directly is not just portability: it also removes the
+ *  ambiguity where a missing file and a genuine no-match both exit non-zero. */
+bool AnyFileContains(const std::vector<std::string> &files,
+                     const std::string &needle) {
+  for (const std::string &f : files) {
+    std::FILE *fp = std::fopen(f.c_str(), "rb");
+    if (!fp) continue;
+    std::string body;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) body.append(buf, n);
+    std::fclose(fp);
+    if (body.find(needle) != std::string::npos) return true;
+  }
+  return false;
 }
 
 // Is a missing HDF5 CLI tool an environment gap (skip) or a broken build (fail)?
@@ -288,7 +403,7 @@ int main() {
   // every section exercises splitting and resuming, while the constant stream
   // of sub-4 KiB metadata I/O still covers the single-pass case. Must be set
   // before the driver's first use -- it is read once.
-  setenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
+  TestSetenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
 
   if (!InitRuntime()) {
     std::fprintf(stderr, "[vfd-suite] FAIL: runtime/CTE init\n");
@@ -374,8 +489,7 @@ int main() {
                   "VFD-vs-sec2 file comparison (the differential half of this "
                   "section is NOT verified here)\n");
     } else {
-      CHECK(RunCmd(std::string("h5diff '") + kNativeDiff + "' '" + kSec2 +
-                   "'") == 0,
+      CHECK(RunCmd("h5diff " + ShQuote(kNativeDiff) + " " + ShQuote(kSec2)) == 0,
             "3: h5diff(VFD-produced, sec2-produced) reports no differences");
       std::printf("[vfd-suite] ok 3: h5diff VFD-produced == sec2-produced\n");
     }
@@ -461,32 +575,69 @@ int main() {
     const char *kClioFl = "/tmp/clio_cte_vfd_flush.h5";
     const char *kNativeFl = "/tmp/clio_cte_vfd_flush.h5";
     std::remove(kNativeFl);
-    hid_t f = H5Fcreate(kClioFl, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    // File locking is ON by default, so H5Fcreate takes an exclusive whole-file
+    // lock through the driver's lock callback. That callback is case 8's
+    // subject; here it is purely in the way, and on Windows it is fatal to the
+    // read below. flock(2) is ADVISORY -- an unrelated pread on POSIX ignores
+    // it -- but Windows file locks are MANDATORY: a locked range fails ReadFile
+    // from every other handle with ERROR_LOCK_VIOLATION, which the driver's
+    // shim reports as EWOULDBLOCK. That is not a driver defect and not
+    // something the shim should paper over: HDF5's own Wflock() takes the very
+    // same whole-file LockFileEx(MAXDWORD, MAXDWORD), so sec2 is affected
+    // identically. Turn locking off for this fapl alone, so the assertion is
+    // about the flush reaching the fd -- its actual subject -- and not about
+    // lock semantics that differ by platform.
+    hid_t fapl_fl = H5Pcopy(fapl);
+    CHECK(fapl_fl >= 0, "7: H5Pcopy fapl");
+    CHECK(H5Pset_file_locking(fapl_fl, /*use*/ false,
+                              /*ignore_disabled*/ true) >= 0,
+          "7: disable file locking for the independent-read check");
+    hid_t f = H5Fcreate(kClioFl, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_fl);
     CHECK(f >= 0, "7: create");
     CHECK(WriteDset(f, "d", H5T_NATIVE_INT32, MakeI32(kSmall)), "7: write");
     CHECK(H5Fflush(f, H5F_SCOPE_GLOBAL) >= 0, "7: H5Fflush (flush callback)");
     // The HDF5 superblock signature must be on the fd now, read via plain POSIX.
-    int rfd = ::open(kNativeFl, O_RDONLY);
+    int rfd = clio_vfd_open(kNativeFl, O_RDONLY, 0);
     CHECK(rfd >= 0, "7: POSIX-open native file mid-session");
     unsigned char sig[8] = {0};
-    ssize_t n = ::pread(rfd, sig, sizeof(sig), 0);
-    ::close(rfd);
+    errno = 0;
+    clio_vfd_ssize_t n = clio_vfd_pread(rfd, sig, sizeof(sig), 0);
+    // Report the short/failed read itself, not just the signature mismatch it
+    // causes. A bare "wrong superblock" says nothing about a read that returned
+    // -1, and distinguishing the two is what identified the lock above.
+    if (n != static_cast<clio_vfd_ssize_t>(sizeof(sig))) {
+      std::fprintf(stderr,
+                   "[vfd-suite] 7: pread of the superblock returned %lld "
+                   "(expected 8), errno=%d\n",
+                   (long long)n, errno);
+    }
+    clio_vfd_close(rfd);
     const unsigned char kHdf5Sig[8] = {0x89, 'H', 'D', 'F',  '\r',
                                        '\n', 0x1a, '\n'};
     CHECK(n == 8 && std::memcmp(sig, kHdf5Sig, 8) == 0,
           "7: valid HDF5 superblock on disk after H5Fflush");
     // get_handle returns the authoritative POSIX fd -- verify it is THIS file's
-    // fd (same device+inode as the native path), not merely some valid fd.
+    // fd, not merely some valid fd. Identity comes from clio_vfd_fstat rather
+    // than st_dev/st_ino for the same reason the driver's cmp() was changed to
+    // use it: MSVC's struct stat leaves BOTH fields zero on every file, so the
+    // comparison would hold vacuously on Windows and assert nothing at all.
+    // The shim reports the volume serial plus the NTFS file index instead.
     void *vh = nullptr;
     CHECK(H5Fget_vfd_handle(f, H5P_DEFAULT, &vh) >= 0, "7: H5Fget_vfd_handle");
     CHECK(vh != nullptr, "7: handle non-null");
     int gfd = *static_cast<int *>(vh);
-    struct stat gst, nst;
-    CHECK(gfd >= 0 && ::fstat(gfd, &gst) == 0, "7: get_handle fd is valid");
-    CHECK(::stat(kNativeFl, &nst) == 0 && gst.st_dev == nst.st_dev &&
-              gst.st_ino == nst.st_ino,
+    clio_vfd_file_id_t gid, nid;
+    clio_vfd_off_t gsz = 0, nsz = 0;
+    CHECK(gfd >= 0 && clio_vfd_fstat(gfd, &gid, &gsz) == 0,
+          "7: get_handle fd is valid");
+    int nfd = clio_vfd_open(kNativeFl, O_RDONLY, 0);
+    CHECK(nfd >= 0, "7: POSIX-open the native path for identity comparison");
+    int nrc = clio_vfd_fstat(nfd, &nid, &nsz);
+    clio_vfd_close(nfd);
+    CHECK(nrc == 0 && clio_vfd_cmp_file_id(&gid, &nid) == 0,
           "7: get_handle fd points at the authoritative native file");
     CHECK(H5Fclose(f) >= 0, "7: close");
+    H5Pclose(fapl_fl);
     std::printf("[vfd-suite] ok 7: flush callback + get_handle\n");
   }
 
@@ -513,17 +664,17 @@ int main() {
           "8: force file locking on");
     hid_t f = H5Fcreate(kClioLk, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_lk);
     CHECK(f >= 0, "8: create (VFD takes exclusive lock)");
-    int p = ::open(kNativeLk, O_RDWR);
+    int p = clio_vfd_open(kNativeLk, O_RDWR, 0);
     CHECK(p >= 0, "8: POSIX-open native file");
     errno = 0;
-    int held = ::flock(p, LOCK_EX | LOCK_NB);
+    int held = clio_vfd_lock(p, /*exclusive*/1);
     CHECK(held < 0 && (errno == EWOULDBLOCK || errno == EAGAIN),
           "8: independent flock denied while the VFD holds the lock");
     CHECK(H5Fclose(f) >= 0, "8: close (VFD unlocks)");
-    int freed = ::flock(p, LOCK_EX | LOCK_NB);
+    int freed = clio_vfd_lock(p, /*exclusive*/1);
     CHECK(freed == 0, "8: independent flock granted after the VFD unlocks");
-    ::flock(p, LOCK_UN);
-    ::close(p);
+    clio_vfd_unlock(p);
+    clio_vfd_close(p);
     H5Pclose(fapl_lk);
     std::printf("[vfd-suite] ok 8: lock excludes a concurrent opener; unlock releases\n");
   }
@@ -714,8 +865,6 @@ int main() {
   // Confirm the vector callbacks actually ran (exported counters advanced) AND
   // the data round-trips byte-clean.
   {
-    extern unsigned long H5FDclio_read_vector_calls_g;
-    extern unsigned long H5FDclio_write_vector_calls_g;
     const char *kClioVec = "/tmp/clio_cte_vfd_vec.h5";
     std::remove("/tmp/clio_cte_vfd_vec.h5");
     hid_t dxpl = H5Pcreate(H5P_DATASET_XFER);
@@ -866,7 +1015,13 @@ int main() {
   // unchanged: cmp() must answer on dev/ino, not on the string.
   {
     const char *kClioId = "/tmp/clio_cte_vfd_ident.h5";
-    const char *kNativeId = "//tmp/clio_cte_vfd_ident.h5";
+    // The doubled separator is INTERIOR on purpose. A LEADING "//" is not a
+    // redundant separator on Windows -- it introduces a UNC path, so
+    // "//tmp/clio_cte_vfd_ident.h5" names share "clio_cte_vfd_ident.h5" on a
+    // host called "tmp" and fails to open with ENOENT rather than resolving to
+    // the same file. Interior doubling collapses on both platforms, which is
+    // the property this spelling is here to exercise.
+    const char *kNativeId = "/tmp//clio_cte_vfd_ident.h5";
     const char *kDotted = "/tmp/../tmp/clio_cte_vfd_ident.h5";
     std::remove(kNativeId);
     hid_t fapl_id_ = H5Pcopy(fapl);
@@ -1071,8 +1226,8 @@ int main() {
     CHECK(marker_only < 0, "20: a bare marker with no path is refused");
     CHECK(marked < 0, "20: a clio::-marked path is refused (marker is internal)");
     // ...and nothing was created behind our back at either spelling.
-    CHECK(::access("/tmp/clio_cte_vfd_marked.h5", F_OK) != 0 &&
-              ::access("clio::/tmp/clio_cte_vfd_marked.h5", F_OK) != 0,
+    CHECK(!TestPathExists("/tmp/clio_cte_vfd_marked.h5") &&
+              !TestPathExists("clio::/tmp/clio_cte_vfd_marked.h5"),
           "20: a refused marked name creates no file");
     if (empty >= 0) H5Fclose(empty);
     if (marker_only >= 0) H5Fclose(marker_only);
@@ -1099,8 +1254,8 @@ int main() {
           "21: seed the file");
 
     // An unrelated process-level lock holder.
-    int holder = ::open(kNativeBusy, O_RDWR);
-    CHECK(holder >= 0 && ::flock(holder, LOCK_EX | LOCK_NB) == 0,
+    int holder = clio_vfd_open(kNativeBusy, O_RDWR, 0);
+    CHECK(holder >= 0 && clio_vfd_lock(holder, /*exclusive*/1) == 0,
           "21: take an exclusive lock outside HDF5");
 
     H5E_auto2_t of = nullptr;
@@ -1116,8 +1271,8 @@ int main() {
     CHECK(blocked < 0, "21: opening a file locked by another holder fails");
     CHECK(found_clio_err,
           "21: the driver explains WHY the locked open failed");
-    ::flock(holder, LOCK_UN);
-    ::close(holder);
+    clio_vfd_unlock(holder);
+    clio_vfd_close(holder);
     H5Pclose(fapl_lk);
     std::printf("[vfd-suite] ok 21: a file locked elsewhere fails with a "
                 "diagnosable error\n");
@@ -1138,12 +1293,13 @@ int main() {
                    "Install hdf5-tools to exercise this.\n");
     } else {
       std::string f = kNativeFile;
-      CHECK(RunCmd("h5dump -H '" + f + "'") == 0, "4: h5dump -H");
-      CHECK(RunCmd("h5ls -r '" + f + "'") == 0, "4: h5ls -r");
+      CHECK(RunCmd("h5dump -H " + ShQuote(f)) == 0, "4: h5dump -H");
+      CHECK(RunCmd("h5ls -r " + ShQuote(f)) == 0, "4: h5ls -r");
       std::string rp = "/tmp/clio_cte_vfd_repacked.h5";
       std::remove(rp.c_str());
-      CHECK(RunCmd("h5repack '" + f + "' '" + rp + "'") == 0, "4: h5repack");
-      CHECK(RunCmd("h5diff '" + f + "' '" + rp + "'") == 0,
+      CHECK(RunCmd("h5repack " + ShQuote(f) + " " + ShQuote(rp)) == 0,
+            "4: h5repack");
+      CHECK(RunCmd("h5diff " + ShQuote(f) + " " + ShQuote(rp)) == 0,
             "4: h5diff repacked == original");
       std::printf("[vfd-suite] ok 4: native tool matrix (h5dump/h5ls/h5repack/h5diff)\n");
     }
@@ -1176,6 +1332,18 @@ int main() {
       {"bogus=1",           false, "22: unknown key REFUSED, not ignored"},
       {"cache=maybe",       false, "22: non-boolean cache value REFUSED"},
       {"cache",             false, "22: entry with no '=' REFUSED"},
+      {"sieve=0",           true,  "22: sieve=0 accepted (coalescing off)"},
+      {"sieve=4096",        true,  "22: explicit sieve window accepted"},
+      {"cache=1;sieve=8192", true, "22: both keys in one string"},
+      // strtoull WRAPS a negative rather than rejecting it, so "-1" would
+      // otherwise install a SIZE_MAX coalescing window -- i.e. an unbounded
+      // scratch allocation -- from a string that looks like a typo.
+      {"sieve=-1",          false, "22: negative sieve REFUSED (no SIZE_MAX wrap)"},
+      // The window sizes a per-call scratch buffer, so an absurd value is an
+      // out-of-memory rather than a slow open. 1 GiB is the stated maximum.
+      {"sieve=1073741825",  false, "22: sieve above the 1 GiB maximum REFUSED"},
+      {"sieve=abc",         false, "22: non-numeric sieve REFUSED"},
+      {"sieve=",            false, "22: empty sieve value REFUSED"},
     };
     for (auto &c : cases) {
       std::remove(kCfgFile);
@@ -1213,8 +1381,10 @@ int main() {
   // yet: until `hdf5 diagnose` exists, a wrong field would sit wrong for months.
   {
     const char *kTraceDir = "/tmp/clio_cte_vfd_trace_t";
-    RunCmd(std::string("rm -rf '") + kTraceDir + "'");
-    RunCmd(std::string("mkdir -p '") + kTraceDir + "'");
+    // std::filesystem rather than `rm -rf` / `mkdir -p`: cmd.exe has neither.
+    std::error_code dec;
+    std::filesystem::remove_all(kTraceDir, dec);
+    std::filesystem::create_directories(kTraceDir, dec);
     // The trace directory is read once per process, so exercising it needs a
     // fresh process: re-run this same binary's workload under a child that has
     // CLIO_VFD_TRACE set. h5cc-free -- we just need SOME HDF5 traffic.
@@ -1225,37 +1395,130 @@ int main() {
     // driver's class, would then look for the wrong id and fail. That cost an
     // hour once; keep the parent environment clean.
     const char *repo = std::getenv("CLIO_REPO_PATH");
-    const std::string child =
-        std::string("CLIO_VFD_TRACE='") + kTraceDir + "' " +
-        "HDF5_PLUGIN_PATH='" + (repo ? repo : ".") + "' " +
-        "HDF5_DRIVER=clio_vfd CLIO_VFD_CACHE=0 " +
-        "h5dump -H '" + kNativeFile + "' >/dev/null 2>&1";
+    const std::string child = WithEnv(
+        {{"CLIO_VFD_TRACE", kTraceDir},
+         {"HDF5_PLUGIN_PATH", repo ? repo : "."},
+         {"HDF5_DRIVER", "clio_vfd"},
+         {"CLIO_VFD_CACHE", "0"}},
+        "h5dump -H " + ShQuote(kNativeFile) + " " + kDevNull);
     const int rc = RunCmd(child);
     (void)rc;  /* h5dump may be absent; the assertions below handle that */
 
-    const bool produced =
-        RunCmd(std::string("ls '") + kTraceDir + "'/*.access.json >/dev/null 2>&1") == 0;
-    if (!produced) {
+    const std::vector<std::string> summaries =
+        FilesEndingIn(kTraceDir, ".access.json");
+    if (summaries.empty()) {
       std::printf("[vfd-suite] WARN 23: no trace produced (h5dump absent?); "
                   "skipping telemetry assertions\n");
     } else {
       // (a) the absent-field guarantee, checked against the raw records.
-      CHECK(RunCmd(std::string("grep -q dataset '") + kTraceDir +
-                   "'/*.access.jsonl") != 0,
+      CHECK(!AnyFileContains(FilesEndingIn(kTraceDir, ".access.jsonl"),
+                             "dataset"),
             "23: byte-altitude records carry NO dataset key (absent==absent)");
       // The envelope and the self-describing limits must both be present.
-      CHECK(RunCmd(std::string("grep -q '\"altitude\":\"byte\"' '") + kTraceDir +
-                   "'/*.access.json") == 0,
+      CHECK(AnyFileContains(summaries, "\"altitude\":\"byte\""),
             "23: summary declares its altitude");
-      CHECK(RunCmd(std::string("grep -q 'cannot_see' '") + kTraceDir +
-                   "'/*.access.json") == 0,
+      CHECK(AnyFileContains(summaries, "cannot_see"),
             "23: summary states what it cannot see");
-      CHECK(RunCmd(std::string("grep -q 'mem_class' '") + kTraceDir +
-                   "'/*.access.json") == 0,
+      CHECK(AnyFileContains(summaries, "mem_class"),
             "23: metadata-vs-raw split present (the VOL cannot produce this)");
       std::printf("[vfd-suite] ok 23: byte-altitude telemetry contract\n");
     }
     RunCmd(std::string("rm -rf '") + kTraceDir + "'");
+  }
+
+  // === 24. The coalescing window is a bound, not a suggestion =============
+  // The window (`sieve=`, 64 KiB by default) exists to cap the scratch buffer
+  // the coalescing path allocates. Two shapes break a naive cap check, and both
+  // are reachable through H5FDread_vector, which -- unlike a write vector --
+  // may legitimately carry overlapping elements:
+  //
+  //   (a) a first element already larger than the window. Nothing can be
+  //       coalesced around it without exceeding the window, so it has to stay
+  //       a group of one.
+  //   (b) a later element CONTAINED in the span accumulated so far. Its own end
+  //       is small, so testing that instead of the group's span admits it while
+  //       the span -- and the allocation -- stays above the window.
+  //
+  // Driven through the H5FD* API rather than H5Dread: the library never emits
+  // a vector this shape, which is exactly why the arithmetic has to be pinned
+  // here. H5FDclio_vec_max_span_g reports the largest span serviced as one
+  // coalesced I/O, so the assertion is on the bound itself rather than on data
+  // that round-trips either way.
+  {
+    const char *kVecCap = "/tmp/clio_cte_vfd_veccap.h5";
+    std::remove(kVecCap);
+    const size_t kWindow = 4096;
+    const size_t kBig = 8192;   /* deliberately larger than the window */
+
+    hid_t vfapl = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(H5Pset_driver_by_name(vfapl, "clio_vfd", "cache=0;sieve=4096") >= 0,
+          "24: FAPL with a 4 KiB coalescing window");
+
+    H5FD_t *raw = H5FDopen(kVecCap, H5F_ACC_RDWR | H5F_ACC_CREAT | H5F_ACC_TRUNC,
+                           vfapl, HADDR_UNDEF);
+    CHECK(raw != nullptr, "24: H5FDopen");
+    if (raw) {
+      const haddr_t kEnd = (haddr_t)(kBig * 4);
+      CHECK(H5FDset_eoa(raw, H5FD_MEM_DEFAULT, kEnd) >= 0, "24: set EOA");
+
+      // Seed the range so the reads below have something defined to return.
+      std::vector<char> seed(kEnd, 0x5a);
+      CHECK(H5FDwrite(raw, H5FD_MEM_DEFAULT, H5P_DEFAULT, 0, seed.size(),
+                      seed.data()) >= 0, "24: seed the file");
+
+      H5FDclio_vec_max_span_g = 0;
+
+      // (a) big first element, then a small adjacent one.
+      {
+        std::vector<char> b0(kBig, 0), b1(16, 0);
+        H5FD_mem_t types[2] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW};
+        haddr_t addrs[2] = {0, (haddr_t)kBig};
+        size_t sizes[2] = {kBig, 16};
+        void *bufs[2] = {b0.data(), b1.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 2, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector with an oversized first element");
+      }
+
+      // (b) big first element, then one contained inside its span.
+      {
+        std::vector<char> b0(kBig, 0), b1(16, 0);
+        H5FD_mem_t types[2] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW};
+        haddr_t addrs[2] = {0, 8};
+        size_t sizes[2] = {kBig, 16};
+        void *bufs[2] = {b0.data(), b1.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 2, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector with a contained element");
+        CHECK(std::memcmp(b1.data(), seed.data() + 8, 16) == 0,
+              "24: the contained element still reads the right bytes");
+      }
+
+      // (c) a run that SHOULD coalesce, so the assertion below is not
+      // vacuously satisfied by a driver that never groups anything.
+      {
+        std::vector<char> b(64, 0);
+        H5FD_mem_t types[4] = {H5FD_MEM_DRAW, H5FD_MEM_DRAW, H5FD_MEM_DRAW,
+                               H5FD_MEM_DRAW};
+        haddr_t addrs[4] = {0, 64, 128, 192};
+        size_t sizes[4] = {64, 64, 64, 64};
+        std::vector<char> b0(64), b1(64), b2(64), b3(64);
+        void *bufs[4] = {b0.data(), b1.data(), b2.data(), b3.data()};
+        CHECK(H5FDread_vector(raw, H5P_DEFAULT, 4, types, addrs, sizes, bufs) >= 0,
+              "24: read_vector over four adjacent elements");
+        CHECK(std::memcmp(b2.data(), seed.data() + 128, 64) == 0,
+              "24: a coalesced element reads the right bytes");
+      }
+
+      CHECK(H5FDclio_vec_max_span_g > 0,
+            "24: elements within the window were actually coalesced");
+      CHECK(H5FDclio_vec_max_span_g <= (unsigned long)kWindow,
+            "24: no coalesced span exceeded the configured window");
+
+      CHECK(H5FDclose(raw) >= 0, "24: H5FDclose");
+    }
+    H5Pclose(vfapl);
+    std::remove(kVecCap);
+    std::printf("[vfd-suite] ok 24: coalescing window enforced (max span %lu <= %zu)\n",
+                H5FDclio_vec_max_span_g, kWindow);
   }
 
   std::printf("[vfd-suite] PASS: native write-through verified\n");

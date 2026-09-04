@@ -100,6 +100,9 @@ class BatchManager {
   struct Group {
     std::vector<clio::run::shared_ptr<Task>> members;
     u64 deadline_ns = 0;  /**< steady-clock ns of the first arrival + window */
+    // CLIO_COLL_PROF stage profiling (zero cost when the env var is unset).
+    u64 first_add_ns = 0; /**< arrival of the first member */
+    u64 last_add_ns = 0;  /**< arrival of the most recent member */
     // AllToOne (count-based barrier): the aggregate does not run until tasks
     // from every container in the pool have arrived. When set, FlushDue ignores
     // deadline_ns and instead flushes once the accumulated member count reaches
@@ -127,6 +130,19 @@ class BatchManager {
   /** agg task unique id → its batched originals, awaiting broadcast. */
   std::mutex pending_mu_;
   std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> pending_;
+  /**
+   * CLIO_COLL_PROF: per-aggregate stage timestamps, so a slow collective can be
+   * attributed to a stage instead of guessed at. Keyed by aggregate unique id
+   * and erased in OnAggregateComplete alongside pending_.
+   */
+  struct AggTiming {
+    u64 first_add_ns = 0;   /**< first member arrived at the leader */
+    u64 last_add_ns = 0;    /**< last member arrived (barrier now satisfiable) */
+    u64 ready_ns = 0;       /**< the flusher NOTICED it was satisfiable */
+    u64 submitted_ns = 0;   /**< aggregate built and handed to ipc_->Send */
+  };
+  std::mutex prof_mu_;
+  std::unordered_map<u64, AggTiming> prof_;
 };
 
 }  // namespace clio::run

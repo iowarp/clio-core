@@ -100,14 +100,44 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
     }
   }
 
-  // Sort low_score targets by performance (already correct order for placement)
-  std::sort(low_score_targets.begin(), low_score_targets.end(), perf_comparator);
+  // Rank the PREFERRED bucket by target_score_ (hottest tier first), using
+  // measured performance only to break ties.
+  //
+  // Ranking this bucket on predicted bandwidth alone -- as it did until now --
+  // makes the operator's declared tiering irrelevant whenever the numbers
+  // disagree with it. Concretely: a config with a volatile RAM tier at
+  // score 1.0 and a file tier at 0.2 admits BOTH to this bucket for a hot blob
+  // (score 1.0), and if the file's measured/predicted write bandwidth happens
+  // to exceed the RAM tier's, the file wins and a "DRAM cache" copy is written
+  // to durable storage. That was observed on Vista (RAM predicted at 476 MB/s
+  // vs the file at 741 MB/s), where it put the cache primary on disk, made it
+  // survive a reboot, and broke cte_replication_persist_integration.
+  //
+  // The scores in the YAML are an explicit statement about which tier data of
+  // a given temperature belongs on. Bandwidth is an estimate -- sometimes a
+  // cold-model one. When they disagree, the declared intent wins; among tiers
+  // the operator scored the SAME, the faster device is the better choice, so
+  // performance still decides.
+  auto score_then_perf = [&perf_comparator](const TargetInfo& a,
+                                            const TargetInfo& b) {
+    if (a.target_score_ != b.target_score_) {
+      return a.target_score_ > b.target_score_;  // hottest tier first
+    }
+    return perf_comparator(a, b);
+  };
+  std::sort(low_score_targets.begin(), low_score_targets.end(), score_then_perf);
 
-  // Sort high_score targets by performance in REVERSE order
-  // (when falling back to higher tiers, prefer lower-performing ones first)
+  // The FALLBACK bucket holds tiers HOTTER than this blob was scored for, so
+  // the pick is "least over-provisioned first": closest score to the blob's,
+  // i.e. ascending target_score_, again with performance breaking ties. This
+  // keeps the previous intent -- do not burn the hottest tier on cold data --
+  // while expressing it in the same currency as the bucket above.
   std::sort(high_score_targets.begin(), high_score_targets.end(),
             [&perf_comparator](const TargetInfo& a, const TargetInfo& b) {
-              return perf_comparator(b, a);  // Reverse by swapping arguments
+              if (a.target_score_ != b.target_score_) {
+                return a.target_score_ < b.target_score_;  // closest first
+              }
+              return perf_comparator(a, b);
             });
 
   // Build result: low_score targets first (preferred), then high_score (fallback)

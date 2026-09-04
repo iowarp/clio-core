@@ -71,7 +71,19 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
 // registered node's copy (write-invalidate) before completing.
 GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 50;
+/**
+ * Residency (issue #980 follow-on / VFD_VOL_PLAN §1): "is this byte range
+ * actually PRESENT in the tier, or a hole the tier would silently zero-fill?"
+ *
+ * Distinct from coherence, which asks whether the tier's copy still matches
+ * the authoritative native file — only an adapter can answer that, because
+ * only it knows which POSIX file a tag stands for. Residency is the opposite:
+ * only the TIER can answer it, which is why this is a chimod op and not
+ * per-adapter interval bookkeeping repeated in the VFD, the VOL and CFS.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kGetResidency = 50;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 51;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -115,6 +127,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[47] = "Evict";
     v[48] = "MultiPutBlob";
     v[49] = "RegisterReplicaContainer";
+    v[50] = "GetResidency";
     return v;
   }();
   return names;

@@ -41,8 +41,14 @@
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
+#include <clio_ctp/data_structures/priv/unordered_map_ll.h>
+#include <clio_ctp/thread/lock/rwlock.h>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -364,6 +370,16 @@ class Client : public clio::run::ContainerClient {
     return shm_root_->tag_name_to_id_.TryGetBytes(tag_name.data(),
                                                   tag_name.size(), out);
   }
+
+  /** Zero-IPC tag metadata (size + timestamps) lookup — lets adapters build
+   *  a full stat from shared memory (mirror-first getattr). */
+  bool TryGetTagRecordShm(const TagId &tag_id, ShmTagRecord *out) const {
+    if (shm_root_ == nullptr || out == nullptr) {
+      return false;
+    }
+    return shm_root_->tag_id_to_info_.TryGet(
+        tag_id, ShmTagInfoMap::Hash(tag_id), out);
+  }
 #endif
 
 #if CTP_IS_HOST
@@ -538,7 +554,11 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_name,
         tag_id);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -947,11 +967,146 @@ class Client : public clio::run::ContainerClient {
     clio::run::u64 batch_used_ = 0;
     std::vector<MultiPutDesc> batch_descs_;
     std::vector<DeferredPut::Ent> batch_ents_;
+    // ---- Client-side data sieving (issue #1007) ----
+    // Small sustained writes coalesce into per-blob 64 KiB PAGES before they
+    // ever become tasks: 128 sequential 512 B writes cost ONE PutBlob instead
+    // of 128 batch descs (each of which the runtime executes as its own
+    // nested PutBlob — see Runtime::MultiPutBlob). A page is a pool-recycled
+    // SHM slice, so a page that fills ships as a DIRECT SHM-pointer put with
+    // zero further copies. Pages that stall partially full are swept into the
+    // accumulating batch by a background flusher (500 us cadence, signalled
+    // awake on the empty->non-empty transition — NEVER per write, see the
+    // #807 self-wake collapse) or by any drain that needs them.
+    static constexpr clio::run::u64 kSievePage = 64 * 1024;
+    // Per-blob sieve budget: 16 open pages = 1 MiB PER BLOB (the buffer
+    // budget is per blob by design — issue #1007 discussion; the 17th page
+    // for a blob sweeps that blob's oldest). Open-page bytes are bounded by
+    // this cap and the global one below, and are therefore EXEMPT from any
+    // nonzero AwaitPutsUntilSpace pacing wall — see the wall's comment.
+    static constexpr size_t kSieveMaxBlobPages = 16;
+    // Global cap on dirty sieve pages (1024 * 64 KiB = 64 MiB, the same
+    // order as the pipeline's default 64 MiB write window): a writer that
+    // would exceed it sweeps a victim page inline first, so scattered
+    // patterns cannot grow the sieve without bound.
+    static constexpr size_t kSieveMaxPages = 1024;
+    struct SievePage {
+      TagId tag_id_;
+      std::string blob_name_;
+      clio::run::u64 key_ = 0;
+      clio::run::u64 seq_ = 0;       // registry seq of this page's extent
+      clio::run::u64 page_off_ = 0;  // blob offset of buf_[0] (page-aligned)
+      clio::run::u64 lo_ = 0;        // dirty extent [lo_, hi_), absolute
+      clio::run::u64 hi_ = 0;        //   blob offsets (v1: ONE per page)
+      ctp::ipc::FullPtr<char> buf_;  // kSievePage SHM slice (staging pool)
+      // Written since the last flusher tick. Atomic because the flusher's
+      // SHARED probe ages it while read-locked writers set it; both relaxed
+      // (a lost race only re-marks a page hot for one extra tick).
+      std::atomic<bool> touched_{true};
+      SievePage() = default;
+      SievePage(SievePage &&o) noexcept
+          : tag_id_(std::move(o.tag_id_)),
+            blob_name_(std::move(o.blob_name_)),
+            key_(o.key_),
+            seq_(o.seq_),
+            page_off_(o.page_off_),
+            lo_(o.lo_),
+            hi_(o.hi_),
+            buf_(o.buf_),
+            touched_(o.touched_.load(std::memory_order_relaxed)) {}
+      SievePage &operator=(SievePage &&o) noexcept {
+        tag_id_ = std::move(o.tag_id_);
+        blob_name_ = std::move(o.blob_name_);
+        key_ = o.key_;
+        seq_ = o.seq_;
+        page_off_ = o.page_off_;
+        lo_ = o.lo_;
+        hi_ = o.hi_;
+        buf_ = o.buf_;
+        touched_.store(o.touched_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        return *this;
+      }
+    };
+    // One blob's open pages. Its mtx_ serializes SAME-blob writers only —
+    // taken nested inside sieve_rw_ (read on the put path, write in the
+    // flusher/drains), never the other way around.
+    struct SieveBlob {
+      std::mutex mtx_;
+      std::vector<SievePage> pages_;
+    };
+    // Sieve concurrency (issue #1007 scaling): the put path is a READER of
+    // sieve_rw_ — writers to different blobs share it and find their blob in
+    // the self-locking per-bucket map — while the background flusher and the
+    // drains take it in WRITE mode to detach pages and reap blob entries.
+    // That exclusivity is the lifetime rule: a SieveBlob* obtained from the
+    // map is valid for as long as the reader holds the lock, because entries
+    // are deleted only under the write lock. The old single mutex serialized
+    // every 512 B write in the process; this fans the hot path out to
+    // shared-lock + per-bucket + per-blob + per-shard.
+    ctp::RwLock sieve_rw_;
+    ctp::priv::unordered_map_ll<clio::run::u64, SieveBlob *> sieve_{256};
+    // Lock-free emptiness signal, exactly like pending_count_: drains and
+    // the flusher's idle check read this without touching any sieve lock.
+    std::atomic<size_t> sieve_pages_{0};
+    // Dirty bytes currently held in OPEN pages (read lock-free by the
+    // pacing wall to exempt them from it).
+    std::atomic<clio::run::u64> sieve_bytes_{0};
+    // Flusher lifecycle only (the CV needs a plain mutex); never held while
+    // sweeping.
+    std::mutex sieve_lc_mtx_;
+    std::condition_variable sieve_cv_;
+    std::thread sieve_thread_;
+    std::atomic<bool> sieve_thread_started_{false};
+    bool sieve_stop_ = false;
+    ~DeferRegistry() {
+      // Function-local statics destroy in reverse construction order and the
+      // registry is first constructed DURING a put (IPC already up), so the
+      // IPC singletons the flusher uses outlive this join.
+      std::thread t;
+      {
+        std::lock_guard<std::mutex> lk(sieve_lc_mtx_);
+        sieve_stop_ = true;
+        t = std::move(sieve_thread_);
+      }
+      sieve_cv_.notify_all();
+      if (t.joinable()) {
+        t.join();
+      }
+      // Single-threaded from here: reap the blob objects (any still-open
+      // page slices go down with the process's shared memory).
+      sieve_.for_each(
+          [](const clio::run::u64 &, SieveBlob *&b) { delete b; });
+    }
     Shard &ShardFor(clio::run::u64 key) { return shards_[key % kShards]; }
     bool IsKeyPending(clio::run::u64 key) {
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       return sh.per_key_.find(key) != sh.per_key_.end();
+    }
+    /** True iff a put still in flight for `key` (other than `excl_seq`)
+     *  overlaps [lo, hi). Conservative: an in-flight put whose payload
+     *  pointer was retired (no extent listed) reports overlap regardless of
+     *  range, because its range is unknowable here. */
+    bool KeyOverlapsPending(clio::run::u64 key, clio::run::u64 lo,
+                            clio::run::u64 hi, clio::run::u64 excl_seq) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      if (it == sh.per_key_.end()) {
+        return false;
+      }
+      const KeyPending &kp = it->second;
+      for (const auto &e : kp.extents_) {
+        if (e.seq_ == excl_seq) {
+          continue;
+        }
+        if (e.offset_ < hi && lo < e.offset_ + e.size_) {
+          return true;
+        }
+      }
+      // Pending puts beyond the listed extents (payload retired): range
+      // unknown, assume overlap.
+      return kp.count_ > kp.extents_.size();
     }
     void KeyAdd(clio::run::u64 key, clio::run::u64 seq, const char *data,
                 clio::run::u64 offset, clio::run::u64 size) {
@@ -987,6 +1142,50 @@ class Client : public clio::run::ContainerClient {
       }
       if (--(it->second.count_) == 0) {
         sh.per_key_.erase(it);
+      }
+    }
+    /** Sieve write into an OPEN page (issue #1007): copy the bytes AND grow
+     *  (key,seq)'s registered extent in one shard-lock hold. The copy may
+     *  overwrite bytes the extent already serves, and TryServe composes
+     *  reads from extents under this same lock — fusing them is what makes
+     *  a concurrent read see entirely-old or entirely-new bytes, never a
+     *  torn mix. */
+    void KeyExtendCopy(clio::run::u64 key, clio::run::u64 seq, char *dst,
+                       const char *src, clio::run::u64 size,
+                       const char *ext_data, clio::run::u64 ext_off,
+                       clio::run::u64 ext_size) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      std::memcpy(dst, src, size);
+      auto it = sh.per_key_.find(key);
+      if (it == sh.per_key_.end()) return;  // page open => extent listed
+      if (ext_off + ext_size > it->second.max_end_) {
+        it->second.max_end_ = ext_off + ext_size;
+      }
+      for (auto &e : it->second.extents_) {
+        if (e.seq_ == seq) {
+          e.data_ = ext_data;
+          e.offset_ = ext_off;
+          e.size_ = ext_size;
+          break;
+        }
+      }
+    }
+    /** Repoint (key,seq)'s extent at the batch-chunk copy of its bytes, so
+     *  a swept sieve page's buffer can be recycled while its put is still
+     *  pending. After this returns no reader holds the old pointer: TryServe
+     *  copies under this same shard lock. */
+    void KeyRepoint(clio::run::u64 key, clio::run::u64 seq,
+                    const char *data) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      if (it == sh.per_key_.end()) return;
+      for (auto &e : it->second.extents_) {
+        if (e.seq_ == seq) {
+          e.data_ = data;
+          break;
+        }
       }
     }
     /** Highest end offset any write pending for `key` will reach, or 0 when
@@ -1178,6 +1377,17 @@ class Client : public clio::run::ContainerClient {
     if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
       return;
     }
+    // Targeted sieve drain FIRST (issue #1007): this key's open pages must
+    // become awaitable tasks, and sweeping only them leaves every other
+    // blob's hot page coalescing. (A racing writer can re-open a page for
+    // this key mid-drain; DeferAwaitOldest's global sweep is the backstop
+    // that keeps the loop below converging.)
+    if (reg.sieve_pages_.load(std::memory_order_acquire) != 0) {
+      Client *fc = reg.flush_client_.load(std::memory_order_acquire);
+      if (fc != nullptr) {
+        fc->SieveFlushKey(key);
+      }
+    }
     while (true) {
       if (!reg.IsKeyPending(key)) {
         return;
@@ -1308,7 +1518,15 @@ class Client : public clio::run::ContainerClient {
         have_batch = !reg.batch_descs_.empty();
       }
       if (!have_batch) {
-        return false;
+        // Batch also empty: the awaited bytes may still sit in SIEVE PAGES
+        // (issue #1007). Sweep them into the batch — which flushes into the
+        // fifo — and retry the claim. Only when the sieve is empty too is
+        // there genuinely nothing to await.
+        if (reg.sieve_pages_.load(std::memory_order_acquire) == 0) {
+          return false;
+        }
+        fc->SieveSweepAll();
+        continue;
       }
       fc->FlushDeferBatch();
     }
@@ -1443,6 +1661,19 @@ class Client : public clio::run::ContainerClient {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
     if (size >= DeferRegistry::kBatchChunk) {
+      // Ordering vs in-flight puts (see SievePutOne's -4): an overlapping
+      // put already in flight for this blob must complete BEFORE this one
+      // is issued, or the server's un-ordered write token can land the old
+      // bytes last (fsx O_DIRECT: a stale batch resurrecting overwritten
+      // data). Same rule on every deferred path — sieve, batch, and here.
+      {
+        DeferRegistry &oreg = DeferRegistry::Get();
+        clio::run::u64 okey = DeferKeyHash(tag_id, blob_name);
+        while (oreg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+               oreg.KeyOverlapsPending(okey, offset, offset + size, 0)) {
+          DeferAwaitKey(okey);
+        }
+      }
       // Recycle completed puts' staging FIRST (non-blocking), so a burst
       // feeds its own pool instead of allocating fault-cold buffers.
       DeferReapCompleted();
@@ -1474,9 +1705,33 @@ class Client : public clio::run::ContainerClient {
     (void)score;
     (void)context;
     (void)flags;
+    // Client-side data sieving (issue #1007): small writes coalesce into
+    // 64 KiB pages before they become tasks. Gated to keys that LOOK like
+    // partial-object streams — a non-zero offset, or a key with a write
+    // already in flight. A one-shot whole-value put (the KV pattern, and
+    // the pattern YCSB throughput lives on) would pay a page slice and a
+    // flush tick for zero coalescing, so it keeps the batch path.
+    // CLIO_CTE_PUT_SIEVE=0 disables sieving entirely.
+    if (SievePutEnabled() && size < DeferRegistry::kSievePage) {
+      DeferRegistry &sreg = DeferRegistry::Get();
+      clio::run::u64 skey = DeferKeyHash(tag_id, blob_name);
+      if (offset != 0 || sreg.IsKeyPending(skey)) {
+        int src = SievePut(tag_id, blob_name, offset, size, priv_data, skey);
+        if (src != -3) {
+          return src;  // -3: no page slice right now -> batch path below
+        }
+      }
+    }
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    // Ordering vs in-flight puts — same rule as the sieve's -4 and the
+    // large path above. Checked BEFORE batch_mtx_; a same-batch overlap is
+    // drained too (the await flushes the batch), which keeps it simple.
+    while (reg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+           reg.KeyOverlapsPending(key, offset, offset + size, 0)) {
+      DeferAwaitKey(key);
+    }
     clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
     const char *copied = nullptr;
     {
@@ -1496,14 +1751,19 @@ class Client : public clio::run::ContainerClient {
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, size});
       reg.batch_used_ += size;
-    }
-    // Extent registered as soon as the bytes are copied: reads serve
-    // read-your-writes from the ACCUMULATING batch, before it even ships.
-    reg.KeyAdd(key, seq, copied, offset, size);
-    {
-      std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
+      // Register BEFORE batch_mtx_ releases. The ent above is claimable the
+      // moment the lock drops: a concurrent flush ships the batch, the SHM
+      // server completes it in ~µs, and the reap's KeyRelease(key, seq)
+      // no-ops on the absent key — the late KeyAdd then plants an extent
+      // NOTHING will ever release, and every subsequent drain of this key
+      // spin-yields forever (the checkout-stress mount wedge). batch_mtx_ →
+      // shard.mtx_ is established nesting (SieveSweepPages' KeyRepoint).
+      reg.KeyAdd(key, seq, copied, offset, size);
+      {
+        std::lock_guard<std::mutex> flk(reg.mtx_);
+        reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+        reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
+      }
     }
     return 0;
   }
@@ -1543,6 +1803,15 @@ class Client : public clio::run::ContainerClient {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
     const clio::run::u64 front_off = segments.front().blob_off_;
+    // Ordering vs in-flight puts — same rule as every deferred path.
+    {
+      DeferRegistry &oreg = DeferRegistry::Get();
+      clio::run::u64 okey = DeferKeyHash(tag_id, blob_name);
+      while (oreg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+             oreg.KeyOverlapsPending(okey, front_off, front_off + total, 0)) {
+        DeferAwaitKey(okey);
+      }
+    }
     if (total >= DeferRegistry::kBatchChunk) {
       // Multi-extent source: register count-only (no served extent) — a read
       // of a still-pending large record awaits it instead of composing.
@@ -1576,12 +1845,14 @@ class Client : public clio::run::ContainerClient {
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, total});
       reg.batch_used_ += total;
-    }
-    reg.KeyAdd(key, seq, copied, offset, total);
-    {
-      std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_.fetch_add(total, std::memory_order_relaxed);
+      // Same release-before-add hazard as the scalar path above: register
+      // while batch_mtx_ still excludes the flush.
+      reg.KeyAdd(key, seq, copied, offset, total);
+      {
+        std::lock_guard<std::mutex> flk(reg.mtx_);
+        reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+        reg.inflight_bytes_.fetch_add(total, std::memory_order_relaxed);
+      }
     }
     return 0;
   }
@@ -1642,6 +1913,554 @@ class Client : public clio::run::ContainerClient {
       reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
     }
     return 0;
+  }
+
+  // ======================================================================
+  // Client-side data sieving (issue #1007).
+  //
+  // Small sustained writes coalesce into per-blob 64 KiB SHM pages BEFORE
+  // they become tasks. The batch pipeline amortizes task submission, but the
+  // runtime still executes one nested PutBlob per desc (Runtime::
+  // MultiPutBlob) — so 128 sequential 512 B writes cost 128 server-side
+  // puts. Sieved, they cost ONE. A page that fills to its end ships from
+  // the writer's thread as a direct SHM-pointer put (the page IS the
+  // staging; zero further copies). Pages that stall partially full are
+  // swept into the accumulating batch by the background flusher (500 us
+  // cadence) or by whichever drain needs them first.
+  //
+  // Read-your-writes: a page registers ONE per-key extent (KeyAdd) the
+  // moment it opens, grown/overwritten in place under the shard lock
+  // (KeyExtendCopy) — TryServe composes reads from sieve pages exactly like
+  // batch extents, so gets never block on an open page they fully hit.
+  //
+  // Ordering caveat (unchanged from the batch pipeline): two DEFERRED writes
+  // to overlapping bytes that end up in different tasks are applied in
+  // scheduler order, not submission order. Overlaps that land in the SAME
+  // page are applied in submission order by construction (in-place copy).
+  // ======================================================================
+
+  /** Sieving default-on kill switch: CLIO_CTE_PUT_SIEVE=0 disables (also
+   *  the A/B baseline for benchmarks). */
+  static bool SievePutEnabled() {
+    static const bool enabled = [] {
+      const char *e = std::getenv("CLIO_CTE_PUT_SIEVE");
+      return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+  }
+
+  /** Start the flusher thread once, lazily. Atomic fast path so the put
+   *  path never touches the lifecycle mutex after startup. NOT fork-safe by
+   *  design: a child inherits started_==true with no thread, and its pages
+   *  then move only via full-page ships and drains — less timely, still
+   *  correct. */
+  static void SieveEnsureFlusher(DeferRegistry &reg) {
+    if (reg.sieve_thread_started_.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(reg.sieve_lc_mtx_);
+    if (reg.sieve_thread_started_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    reg.sieve_thread_ = std::thread(&Client::SieveFlusherMain);
+    reg.sieve_thread_started_.store(true, std::memory_order_release);
+  }
+
+  /** The 500 us flusher: blocks on the condition variable whenever the
+   *  sieve empties (writers signal only the empty->non-empty transition —
+   *  never per write; #807: a signal per op IS the syscall-per-op
+   *  regression this pipeline exists to avoid) and runs a sweep pass per
+   *  tick otherwise. The CV mutex is lifecycle-only and is dropped for the
+   *  pass itself. */
+  static void SieveFlusherMain() {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "sieve-flush");
+#endif
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::unique_lock<std::mutex> lk(reg.sieve_lc_mtx_);
+    while (!reg.sieve_stop_) {
+      if (reg.sieve_pages_.load(std::memory_order_acquire) == 0) {
+        reg.sieve_cv_.wait(lk, [&reg] {
+          return reg.sieve_stop_ ||
+                 reg.sieve_pages_.load(std::memory_order_acquire) != 0;
+        });
+        continue;
+      }
+      reg.sieve_cv_.wait_for(lk, std::chrono::microseconds(500),
+                             [&reg] { return reg.sieve_stop_; });
+      if (reg.sieve_stop_) {
+        break;
+      }
+      lk.unlock();
+      SieveFlusherPass(reg);
+      lk.lock();
+    }
+  }
+
+  /** One flusher pass. WRITER side of the sieve RwLock: with every put-path
+   *  reader drained, sweep pages untouched for a FULL tick (a hot sequential
+   *  stream's page is always touched, so it is never swept — it ships full
+   *  from the writer's thread), age the rest, enforce the global cap
+   *  (taking even touched pages while over it), and reap empty blob
+   *  entries. The batching itself runs AFTER the lock drops — it can await,
+   *  and an await's backstop re-enters the sieve. */
+  static void SieveFlusherPass(DeferRegistry &reg) {
+    // Probe FIRST, without the sieve write lock: on a hot stream every page
+    // was touched this tick and there is nothing to sweep — taking the
+    // write lock just to discover that would stall every put-path reader
+    // once per tick (writer_priority parks new readers the moment the
+    // writer waits). The probe runs under the map's SHARED scan plus each
+    // blob's mutex (writers mutate the page vector under that mutex), and
+    // does two things: records pages that were ALREADY untouched (sweep
+    // candidates) and ages the rest. Candidates are NOT swept here — the
+    // write pass rechecks them, so a page is never swept in the same tick
+    // it was written.
+    struct Cand {
+      clio::run::u64 key_;
+      clio::run::u64 page_off_;
+    };
+    std::vector<Cand> cands;
+    // READER side of sieve_rw_ for the whole scan: the lifetime rule says a
+    // SieveBlob* is valid only while a sieve_rw_ lock is held (deletes happen
+    // under WRITE mode). The probe originally relied on the map's per-bucket
+    // lock alone, and a concurrent SieveFlushKey (closer-thread drain) could
+    // delete the blob between that bucket lock and this dereference —
+    // heap-use-after-free at clone scale (ASan-confirmed, T41 vs T38).
+    reg.sieve_rw_.ReadLock(0, /*writer_priority=*/true);
+    reg.sieve_.for_each(
+        [&](const clio::run::u64 &k, DeferRegistry::SieveBlob *&blob) {
+          std::lock_guard<std::mutex> blk(blob->mtx_);
+          for (auto &pg : blob->pages_) {
+            if (!pg.touched_.load(std::memory_order_relaxed)) {
+              cands.push_back(Cand{k, pg.page_off_});
+            } else {
+              pg.touched_.store(false, std::memory_order_relaxed);  // age
+            }
+          }
+        },
+        ctp::priv::ForEachLock::kShared);
+    reg.sieve_rw_.ReadUnlock();
+    const bool over_cap =
+        reg.sieve_pages_.load(std::memory_order_relaxed) >
+        DeferRegistry::kSieveMaxPages;
+    if (cands.empty() && !over_cap) {
+      return;  // hot streams keep coalescing; nobody was stalled
+    }
+    std::vector<DeferRegistry::SievePage> out;
+    reg.sieve_rw_.WriteLock(0);  // writers drained; sole entry-delete site
+    for (const Cand &c : cands) {
+      DeferRegistry::SieveBlob **p = reg.sieve_.find(c.key_);
+      if (p == nullptr) continue;  // key drained meanwhile
+      auto &pages = (*p)->pages_;
+      for (auto pit = pages.begin(); pit != pages.end(); ++pit) {
+        if (pit->page_off_ != c.page_off_) continue;
+        // Recheck: written (or re-opened) since the probe -> hot again.
+        if (!pit->touched_.load(std::memory_order_relaxed)) {
+          SieveUnaccount(reg, *pit);
+          out.push_back(std::move(*pit));
+          pages.erase(pit);
+        }
+        break;
+      }
+    }
+    if (reg.sieve_pages_.load(std::memory_order_relaxed) >
+        DeferRegistry::kSieveMaxPages) {
+      // Over the global cap even after the aged sweep: take pages
+      // regardless of touch state until under. Writers only NOTIFY on
+      // overflow (they never do cross-blob work) — this is the sole
+      // enforcement point.
+      reg.sieve_.for_each(
+          [&](const clio::run::u64 &, DeferRegistry::SieveBlob *&blob) {
+            while (!blob->pages_.empty() &&
+                   reg.sieve_pages_.load(std::memory_order_relaxed) >
+                       DeferRegistry::kSieveMaxPages) {
+              SieveUnaccount(reg, blob->pages_.front());
+              out.push_back(std::move(blob->pages_.front()));
+              blob->pages_.erase(blob->pages_.begin());
+            }
+          });
+    }
+    // Reap empty blob entries (collected first: a for_each callback must
+    // not re-enter the map). Deleting is safe exactly here: entry deletion
+    // only ever happens under the write lock, which is why readers may
+    // hold a SieveBlob* for their whole read-locked section.
+    std::vector<clio::run::u64> empty_keys;
+    reg.sieve_.for_each(
+        [&](const clio::run::u64 &k, DeferRegistry::SieveBlob *&blob) {
+          if (blob->pages_.empty()) {
+            empty_keys.push_back(k);
+          }
+        });
+    for (clio::run::u64 k : empty_keys) {
+      DeferRegistry::SieveBlob **p = reg.sieve_.find(k);
+      if (p != nullptr) {
+        DeferRegistry::SieveBlob *doomed = *p;
+        reg.sieve_.erase(k);  // unpublish BEFORE delete
+        delete doomed;
+      }
+    }
+    reg.sieve_rw_.WriteUnlock();
+    if (!out.empty()) {
+      Client *fc = reg.flush_client_.load(std::memory_order_acquire);
+      if (fc != nullptr) {
+        fc->SieveSweepPages(std::move(out));
+      }
+    }
+  }
+
+  /** Release a detached page's share of the sieve counters. Callers hold
+   *  either the blob's mutex (put path) or the sieve write lock (flusher/
+   *  drains) — the extent cannot grow after detach. Born-full pages that
+   *  ship without ever being inserted are never counted, so never pass here. */
+  static void SieveUnaccount(DeferRegistry &reg,
+                             const DeferRegistry::SievePage &pg) {
+    reg.sieve_pages_.fetch_sub(1, std::memory_order_relaxed);
+    reg.sieve_bytes_.fetch_sub(pg.hi_ - pg.lo_, std::memory_order_relaxed);
+  }
+
+  /** Sieve one page-confined sub-write. @return 0 sieved; -3 page slice
+   *  unallocatable RIGHT NOW (caller falls back to the batch path, which
+   *  owns the full await-and-retry machinery). */
+  int SievePutOne(DeferRegistry &reg, clio::run::u64 key, const TagId &tag_id,
+                  const std::string &blob_name, clio::run::u64 page_off,
+                  clio::run::u64 off, const char *src, clio::run::u64 len) {
+    using SievePage = DeferRegistry::SievePage;
+    std::vector<SievePage> sweep;  // holed/evicted pages, batched after unlock
+    SievePage ship;                // filled page, direct-put after unlock
+    bool do_ship = false;
+    bool wake = false;
+    int rc = 0;
+    SieveEnsureFlusher(reg);
+    // READER side of the sieve RwLock: the put path only ever touches ITS
+    // OWN blob, so concurrent writers to different blobs share the lock and
+    // meet only at the self-locking map + their own blob's mutex. The
+    // flusher/drains take WRITE mode — which is also the lifetime rule that
+    // makes `blob` safe to use for this whole section (entries are deleted
+    // only under the write lock). writer_priority so a sustained put stream
+    // cannot starve the 500 us sweep.
+    reg.sieve_rw_.ReadLock(0, /*writer_priority=*/true);
+    DeferRegistry::SieveBlob *blob = nullptr;
+    {
+      DeferRegistry::SieveBlob **found = reg.sieve_.find(key);
+      if (found != nullptr) {
+        blob = *found;
+      } else {
+        auto *fresh = new DeferRegistry::SieveBlob();
+        auto ins = reg.sieve_.insert(key, fresh);
+        blob = *ins.value;
+        if (!ins.inserted) {
+          delete fresh;  // lost the insert race; the winner's blob is ours
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> blk(blob->mtx_);
+      auto &pages = blob->pages_;
+      size_t pi = pages.size();
+      for (size_t i = 0; i < pages.size(); ++i) {
+        if (pages[i].page_off_ == page_off) {
+          pi = i;
+          break;
+        }
+      }
+      // Ordering vs IN-FLIGHT puts (fsx O_DIRECT stale-data races): a write
+      // overlapping a put already shipped/batched for this key must not
+      // become a SECOND in-flight put for the same bytes — the server write
+      // token serializes but does NOT order same-blob tasks, so the older
+      // put can land LAST and resurrect overwritten data. Report -4; the
+      // caller drains the key and retries. The OPEN page's own extent is
+      // exempt: merges into it happen in the buffer, in program order.
+      {
+        clio::run::u64 chk_lo = off;
+        clio::run::u64 chk_hi = off + len;
+        clio::run::u64 own_seq = 0;
+        if (pi < pages.size() &&
+            !(off > pages[pi].hi_ || off + len < pages[pi].lo_)) {
+          own_seq = pages[pi].seq_;
+          chk_lo = std::min(chk_lo, pages[pi].lo_);
+          chk_hi = std::max(chk_hi, pages[pi].hi_);
+        }
+        if (reg.KeyOverlapsPending(key, chk_lo, chk_hi, own_seq)) {
+          rc = -4;
+        }
+      }
+      if (rc == 0 && pi < pages.size() &&
+          (off > pages[pi].hi_ || off + len < pages[pi].lo_)) {
+        // v1 keeps ONE contiguous extent per page: an intra-page hole
+        // sweeps the page out and re-opens it for the new range.
+        sweep.push_back(std::move(pages[pi]));
+        pages.erase(pages.begin() + static_cast<long>(pi));
+        SieveUnaccount(reg, sweep.back());
+        pi = pages.size();
+      }
+      if (rc == 0 && pi == pages.size()) {
+        // Per-blob budget (kSieveMaxBlobPages * 64 KiB = 1 MiB per blob): a
+        // blob needing another page past its budget sweeps its own oldest.
+        // The GLOBAL cap is the flusher's job — a writer never does
+        // cross-blob work; it only signals (see `wake` below).
+        if (pages.size() >= DeferRegistry::kSieveMaxBlobPages) {
+          sweep.push_back(std::move(pages.front()));
+          pages.erase(pages.begin());
+          SieveUnaccount(reg, sweep.back());
+        }
+        ctp::ipc::FullPtr<char> buf =
+            PoolAllocStaging(DeferRegistry::kSievePage);
+        if (buf.IsNull()) {
+          rc = -3;
+        } else {
+          SievePage pg;
+          pg.tag_id_ = tag_id;
+          pg.blob_name_ = blob_name;
+          pg.key_ = key;
+          pg.seq_ = reg.seq_gen_.fetch_add(1) + 1;
+          pg.page_off_ = page_off;
+          pg.lo_ = off;
+          pg.hi_ = off + len;
+          pg.buf_ = buf;
+          pg.touched_ = true;
+          // Copy needs no shard lock: the extent is not registered yet.
+          std::memcpy(buf.ptr_ + (off - page_off), src, len);
+          // Register + account while the blob's mutex is still held, so a
+          // second writer that finds this page always finds its extent too.
+          // Plain atomic bumps, no reg.mtx_: the batch path takes that
+          // mutex because its bumps publish alongside fifo_ mutations;
+          // these publish nothing else.
+          reg.KeyAdd(key, pg.seq_, buf.ptr_ + (off - page_off), off, len);
+          reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+          reg.inflight_bytes_.fetch_add(len, std::memory_order_relaxed);
+          if (pg.hi_ == page_off + DeferRegistry::kSievePage) {
+            ship = std::move(pg);  // born full (write ran to page end);
+            do_ship = true;        //   never inserted, never counted
+          } else {
+            pages.push_back(std::move(pg));
+            reg.sieve_bytes_.fetch_add(len, std::memory_order_relaxed);
+            wake =
+                reg.sieve_pages_.fetch_add(1, std::memory_order_relaxed) == 0;
+          }
+        }
+      } else if (rc == 0) {
+        SievePage &pg = pages[pi];
+        clio::run::u64 new_lo = std::min(pg.lo_, off);
+        clio::run::u64 new_hi = std::max(pg.hi_, off + len);
+        clio::run::u64 added = (new_hi - new_lo) - (pg.hi_ - pg.lo_);
+        // Copy + extent update fused under the shard lock: a concurrent
+        // TryServe of these bytes sees old or new, never a torn mix.
+        reg.KeyExtendCopy(key, pg.seq_, pg.buf_.ptr_ + (off - page_off), src,
+                          len, pg.buf_.ptr_ + (new_lo - page_off), new_lo,
+                          new_hi - new_lo);
+        pg.lo_ = new_lo;
+        pg.hi_ = new_hi;
+        pg.touched_.store(true, std::memory_order_relaxed);
+        if (added != 0) {
+          reg.sieve_bytes_.fetch_add(added, std::memory_order_relaxed);
+          reg.inflight_bytes_.fetch_add(added, std::memory_order_relaxed);
+        }
+        if (pg.hi_ == page_off + DeferRegistry::kSievePage) {
+          // Extent reached the page end: a sequential stream never grows it
+          // further (the next write opens the next page) — ship NOW, from
+          // the writer's thread, as one direct SHM-pointer put.
+          ship = std::move(pg);
+          do_ship = true;
+          pages.erase(pages.begin() + static_cast<long>(pi));
+          SieveUnaccount(reg, ship);
+        }
+      }
+    }
+    reg.sieve_rw_.ReadUnlock();
+    // Signal the flusher on the empty->non-empty transition, and also when
+    // the sieve overflowed its global cap — the flusher is the only actor
+    // that does cross-blob eviction.
+    if (reg.sieve_pages_.load(std::memory_order_relaxed) >
+        DeferRegistry::kSieveMaxPages) {
+      wake = true;
+    }
+    if (!sweep.empty()) {
+      SieveSweepPages(std::move(sweep));
+    }
+    if (do_ship) {
+      SieveShipPage(std::move(ship));
+    }
+    if (wake) {
+      reg.sieve_cv_.notify_one();
+    }
+    return rc;
+  }
+
+  /** Sieve a small write, splitting it across page boundaries. Nonzero only
+   *  when a page slice was unallocatable; earlier sub-writes stay sieved
+   *  and the caller's batch fallback rewrites the SAME bytes (identical
+   *  overlap content, so apply order cannot matter). */
+  int SievePut(const TagId &tag_id, const std::string &blob_name,
+               clio::run::u64 offset, clio::run::u64 size,
+               const char *priv_data, clio::run::u64 key) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    reg.flush_client_.store(this, std::memory_order_release);
+    clio::run::u64 off = offset;
+    clio::run::u64 remaining = size;
+    const char *src = priv_data;
+    while (remaining != 0) {
+      clio::run::u64 page_off =
+          off / DeferRegistry::kSievePage * DeferRegistry::kSievePage;
+      clio::run::u64 in_page =
+          std::min(remaining, page_off + DeferRegistry::kSievePage - off);
+      int rc =
+          SievePutOne(reg, key, tag_id, blob_name, page_off, off, src, in_page);
+      if (rc == -4) {
+        // Overlaps a put still in flight: drain the key so ORDER of the
+        // overlapping bytes is preserved, then retry this same slice.
+        DeferAwaitKey(key);
+        continue;
+      }
+      if (rc != 0) {
+        return rc;
+      }
+      off += in_page;
+      src += in_page;
+      remaining -= in_page;
+    }
+    return 0;
+  }
+
+  /** Ship a filled page as ONE direct SHM-pointer put of its extent. The
+   *  page slice is the put's staging (recycled at reap, AFTER KeyRelease —
+   *  same lifetime rule as every pooled buffer). Bookkeeping was already
+   *  counted at write time, so only the fifo entry is added here. */
+  void SieveShipPage(DeferRegistry::SievePage pg) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    const clio::run::u64 len = pg.hi_ - pg.lo_;
+    ctp::ipc::ShmPtr<> data(
+        pg.buf_.shm_.alloc_id_,
+        pg.buf_.shm_.off_.load() + (pg.lo_ - pg.page_off_));
+    auto fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+    while (fut.IsNull()) {
+      if (!DeferAwaitOldest()) {
+        SieveDropPage(reg, pg, len);  // exhausted, nothing awaitable
+        return;
+      }
+      fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+    }
+    DeferredPut rec;
+    rec.fut_ = fut.template Cast<clio::run::Task>();
+    rec.ents_.push_back(DeferredPut::Ent{pg.key_, pg.seq_, len});
+    rec.staging_ = pg.buf_;
+    rec.staging_size_ = DeferRegistry::kSievePage;
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.fifo_.push_back(std::move(rec));
+    }
+  }
+
+  /** Abandon a detached page when shared memory is exhausted with nothing
+   *  left to await (a state the batch path answers with -2 at submit; a
+   *  sieved write already returned 0, so the loss is reported the way every
+   *  failed write-behind is: the global error count plus the key's sticky
+   *  error, owed to its fsync/close). */
+  static void SieveDropPage(DeferRegistry &reg,
+                            const DeferRegistry::SievePage &pg,
+                            clio::run::u64 len) {
+    reg.errors_.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.pending_count_.fetch_sub(1, std::memory_order_relaxed);
+      reg.inflight_bytes_.fetch_sub(len, std::memory_order_relaxed);
+    }
+    reg.KeyRelease(pg.key_, pg.seq_, ENOMEM);
+    PoolFreeStaging(pg.buf_, DeferRegistry::kSievePage);
+  }
+
+  /** Sweep DETACHED pages into the accumulating batch (one desc per page
+   *  extent) and flush it. Detachment is the caller's job and is what makes
+   *  this re-entrancy safe: ReserveDeferBatchLocked may await, an await may
+   *  trigger SieveSweepAll, and that nested sweep only ever sees pages this
+   *  call does NOT own. Each extent is repointed at its batch-chunk copy
+   *  under the shard lock before its page slice is recycled. */
+  void SieveSweepPages(std::vector<DeferRegistry::SievePage> pages) {
+    if (pages.empty()) {
+      return;
+    }
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::vector<ctp::ipc::FullPtr<char>> recycled;
+    recycled.reserve(pages.size());
+    {
+      std::unique_lock<std::mutex> lk(reg.batch_mtx_);
+      for (auto &pg : pages) {
+        const clio::run::u64 len = pg.hi_ - pg.lo_;
+        char *dst = ReserveDeferBatchLocked(reg, lk, len);
+        if (dst == nullptr) {
+          SieveDropPage(reg, pg, len);
+          continue;
+        }
+        std::memcpy(dst, pg.buf_.ptr_ + (pg.lo_ - pg.page_off_), len);
+        MultiPutDesc d;
+        d.tag_id_ = pg.tag_id_;
+        d.blob_name_ = pg.blob_name_;
+        d.offset_ = pg.lo_;
+        d.size_ = len;
+        d.payload_off_ = reg.batch_used_;
+        reg.batch_descs_.push_back(std::move(d));
+        reg.batch_ents_.push_back(
+            DeferredPut::Ent{pg.key_, pg.seq_, len});
+        reg.batch_used_ += len;
+        // Repoint BEFORE recycling the slice; the chunk outlives the extent
+        // (KeyRelease precedes the task's chunk free, as everywhere).
+        reg.KeyRepoint(pg.key_, pg.seq_, dst);
+        recycled.push_back(pg.buf_);
+      }
+      // Swept pages are aged or forced out — ship rather than parking them
+      // in the batch behind traffic that may never come.
+      FlushDeferBatchLocked(reg);
+    }
+    for (auto &buf : recycled) {
+      PoolFreeStaging(buf, DeferRegistry::kSievePage);
+    }
+  }
+
+  /** Detach and sweep EVERY sieve page (global drains). WRITER side of the
+   *  sieve RwLock, like the flusher pass. */
+  void SieveSweepAll() {
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::vector<DeferRegistry::SievePage> all;
+    std::vector<clio::run::u64> keys;
+    reg.sieve_rw_.WriteLock(0);
+    reg.sieve_.for_each(
+        [&](const clio::run::u64 &k, DeferRegistry::SieveBlob *&blob) {
+          for (auto &pg : blob->pages_) {
+            SieveUnaccount(reg, pg);
+            all.push_back(std::move(pg));
+          }
+          blob->pages_.clear();
+          keys.push_back(k);  // erase after: no map re-entry in a callback
+        });
+    for (clio::run::u64 k : keys) {
+      DeferRegistry::SieveBlob **p = reg.sieve_.find(k);
+      if (p != nullptr) {
+        DeferRegistry::SieveBlob *doomed = *p;
+        reg.sieve_.erase(k);  // unpublish BEFORE delete
+        delete doomed;
+      }
+    }
+    reg.sieve_rw_.WriteUnlock();
+    SieveSweepPages(std::move(all));
+  }
+
+  /** Detach and sweep ONE key's pages (targeted drains: fsync/get of a
+   *  single blob must not break every other stream's open page). */
+  void SieveFlushKey(clio::run::u64 key) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::vector<DeferRegistry::SievePage> mine;
+    reg.sieve_rw_.WriteLock(0);
+    DeferRegistry::SieveBlob **p = reg.sieve_.find(key);
+    if (p != nullptr) {
+      DeferRegistry::SieveBlob *blob = *p;
+      for (auto &pg : blob->pages_) {
+        SieveUnaccount(reg, pg);
+        mine.push_back(std::move(pg));
+      }
+      reg.sieve_.erase(key);  // unpublish BEFORE delete (bucket lock barrier)
+      delete blob;
+    }
+    reg.sieve_rw_.WriteUnlock();
+    SieveSweepPages(std::move(mine));
   }
 
   /** Ensure the accumulating batch chunk has room for `size` more bytes,
@@ -1790,10 +2609,14 @@ class Client : public clio::run::ContainerClient {
           task->SetComplete();
           return fut;
         }
-        if (served == -1) {
-          // Partial coverage only: the bytes outside the pending put are
-          // stale in the store until it lands. -2 (no overlap at all) needs
-          // no wait and falls straight through to the normal read.
+        if (served == -1 || served == -2) {
+          // Partial coverage (-1): bytes outside the pending put are stale
+          // in the store until it lands. NO overlap (-2) must ALSO drain:
+          // a same-blob put in flight for a DIFFERENT range still mutates
+          // the blob's block layout server-side, and GetBlob readers hold
+          // no write token — a read overlapping the extend window returned
+          // recycled-block garbage where hole zeros belong (fsx generic/112
+          // buffered+mmap, generic/091 O_DIRECT: op-N-era stale bytes).
           AwaitPendingPuts(tag_id, blob_name);
         }
       }
@@ -1877,7 +2700,20 @@ class Client : public clio::run::ContainerClient {
       // window pays for synchronization.
       clio::run::u64 cur =
           reg.inflight_bytes_.load(std::memory_order_relaxed);
-      if (cur <= max_inflight_bytes &&
+      // OPEN sieve pages are exempt from a NONZERO wall (issue #1007): the
+      // per-blob buffer budget is its own bound (kSieveMaxBlobPages, plus
+      // the global kSieveMaxPages), and counting open pages here made any
+      // wall smaller than one 64 KiB page a PERMANENT stall — every write
+      // entered the await path and force-flushed every open page (measured:
+      // 512 B x 8 threads collapsed ~3x at a 64 KiB wall). A wall of 0
+      // keeps its full-drain meaning: everything, sieve included, retires.
+      clio::run::u64 paced = cur;
+      if (max_inflight_bytes != 0) {
+        clio::run::u64 sieve_b =
+            reg.sieve_bytes_.load(std::memory_order_relaxed);
+        paced = cur > sieve_b ? cur - sieve_b : 0;
+      }
+      if (paced <= max_inflight_bytes &&
           reg.pending_count_.load(std::memory_order_relaxed) <=
               max_inflight_count) {
         return cur;
@@ -2385,6 +3221,31 @@ class Client : public clio::run::ContainerClient {
    * @param blob_name Name of the blob
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
+  /**
+   * Ask whether a byte range of a blob is physically present in the tier.
+   *
+   * Metadata only — it moves no payload, so it is far cheaper than the read
+   * it lets a caller avoid. The intended shape is: try the shared-memory
+   * path, and on a miss ask this rather than abandoning the whole request,
+   * because a miss in the SHM mirror does not distinguish a hole (zeros are
+   * correct) from bytes that exist but are only reachable by RPC.
+   *
+   * @param tag_id Tag owning the blob
+   * @param blob_name Blob name
+   * @param offset Start of the range of interest
+   * @param size Length of the range; 0 means "to the end of the blob"
+   */
+  clio::run::Future<GetResidencyTask> AsyncGetResidency(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset = 0, clio::run::u64 size = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetResidencyTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size);
+    return ipc_manager->Send(task);
+  }
+
   clio::run::Future<DelBlobTask> AsyncDelBlob(
       const TagId &tag_id,
       const std::string &blob_name,
@@ -2411,11 +3272,13 @@ class Client : public clio::run::ContainerClient {
    */
   clio::run::Future<EvictTask> AsyncEvict(
       float min_tier_score, clio::run::u64 bytes,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast(),
+      clio::run::u32 droppable_only = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<EvictTask>(clio::run::CreateTaskId(),
                                                 pool_id_, pool_query,
-                                                min_tier_score, bytes);
+                                                min_tier_score, bytes,
+                                                droppable_only);
     return ipc_manager->Send(task);
   }
 
@@ -2563,7 +3426,11 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<GetTagSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -2733,7 +3600,11 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<TagQueryTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_regex, max_tags);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**

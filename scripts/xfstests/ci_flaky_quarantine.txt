@@ -1,0 +1,79 @@
+# xfstests FLAKY QUARANTINE — tests that pass MOST of the time against the clio
+# FUSE filesystem but fail non-deterministically in CI.
+#
+# scripts/xfstests/run_ci_xfstests.sh subtracts this list from
+# ci_baseline_pass.txt before gating, then runs these tests in a SECOND,
+# NON-GATING lane and reports the outcome as a ::warning:: + step summary. They
+# still run on every job — they just cannot turn the check red.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-25 EVIDENCE (issue #1022). Mined from the CI Adapters "adapters
+# (linux, all 5)" job logs for all 157 completed runs between 2026-08-05 and
+# 2026-08-25 (144 reached the xfstests phase).
+#
+# Method: a run whose xfstests phase reported MORE THAN 3 failures was treated
+# as a branch-wide regression and excluded from the flake population — that is
+# 10 runs, ALL of them on 1007-client-put-sieving, which genuinely broke the
+# filesystem (7-19 failures per run, incl. MOUNTFAIL) before it was fixed.
+# Mixing those in would have libelled ~20 healthy tests as flaky. The remaining
+# 134 runs are the "clean population" below.
+#
+#   clean runs                                    : 134
+#   clean runs turned RED purely by xfstests flake:   5  (3.7%)
+#   distinct tests responsible                    :   5
+#
+#   test           failures / 134 clean runs   when
+#   ------------   -------------------------   -----------------------------
+#   generic/209        3  (2.2%)               1011-macfuse-build-break x2,
+#                                              1020-viz-teardown-deadlock
+#   generic/729        2  (1.5%)               dev (push), 1018-bdev-prealloc
+#   generic/647        1  (0.7%)               dev (push)
+#   generic/451        1  (0.7%)               1018-bdev-preallocate-budget
+#   generic/070        1  (0.7%)               1020-viz-teardown-deadlock
+#
+# Every one of those five red runs was on a branch that touched NOTHING these
+# tests exercise (a macFUSE-only build fix; a dashboard-teardown fix; a bdev
+# preallocation clamp; two dev merges). generic/209 failing twice on
+# 1011-macfuse-build-break — a branch whose whole diff is Darwin build glue —
+# is the cleanest proof available that this is timing, not code.
+#
+# The other 67 baseline tests: 0 failures in 134 clean runs. The gate is
+# therefore 72 -> 67 enforced, 5 reported.
+#
+# NOT quarantined, for the record (checked in the same sweep):
+#   * cte_hdf5_vol_io_dataset — read-back data mismatch, 5/146 runs, but ALL of
+#     them on or before 2026-08-11 and 0/90 since. Historical; leave gating.
+#   * fuse_ops — failed in 2 runs, BOTH attempts, BOTH on 1007-client-put-
+#     sieving. A real regression that was fixed, not a flake.
+#   * the compat suites, the live mount smoke, apt/pip/docker setup: zero
+#     failures in 157 runs.
+#
+# 2026-08-25 FIRST CAPTURED SIGNATURES. The run that validated this quarantine
+# (32883603078, on the PR that introduced it -- a CI-scripts-only diff) flaked
+# generic/070 AND generic/729, and the new diagnostics printed why:
+#
+#   generic/070  rm: cannot remove '.../fsstress/p0/d4b/.../dd60':
+#                Directory not empty
+#                -> fsstress teardown: rmdir sees a directory as non-empty
+#                   after its children were unlinked. An unlink/readdir
+#                   visibility ordering hole, not test noise.
+#
+#   generic/729  mmap-rw-fault: pread (D_DIRECT) from hole is broken
+#                -> an O_DIRECT read from a hole did not come back zeroed.
+#
+# So these are REAL filesystem-semantics bugs that happen to be rare -- not
+# infrastructure noise. Quarantine is the right call for the gate (a 0.7-2.2%
+# per-test failure rate cannot be allowed to block unrelated merges) but they
+# should be fixed, not tolerated. Note also that this pair failing together on
+# one run is exactly the measured rate, and would have turned the CI-scripts PR
+# red under the old gate.
+#
+# Re-admit a test to ci_baseline_pass.txt once the underlying race is fixed and
+# it has been green across several CI runs. Do not re-admit on a local pass —
+# these flake only under the runner's constrained scheduling.
+# ---------------------------------------------------------------------------
+generic/070
+generic/209
+generic/451
+generic/647
+generic/729

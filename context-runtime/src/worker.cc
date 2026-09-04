@@ -320,6 +320,34 @@ void Worker::Run() {
     // Increment iteration counter
     iteration_count_++;
 
+    // CLIO_WORKER_RATE=1: wall time per worker-loop iteration. Anything driven
+    // by the loop -- every periodic, including the cross-node send drain --
+    // inherits this as its latency quantum, so it is the ceiling on any "poll
+    // faster" fix. NOTE it measures WALL time, so an idle worker's number is
+    // dominated by its epoll park, not by loop cost: read it as "how often this
+    // worker comes around", and compare workers rather than reading it as CPU.
+    // (Measured on the collective benchmark: scheduler worker ~1.3us, but the
+    // net send/recv workers ~82us/~157us -- they are parked most of the time,
+    // which is why their wakeup, not their poll rate, sets send latency.)
+    {
+      static bool rate_on = [] {
+        const char *e = std::getenv("CLIO_WORKER_RATE");
+        return e != nullptr && *e != '\0' && *e != '0';
+      }();
+      if (rate_on && iteration_count_ % 4096 == 0) {
+        static thread_local int64_t prev_ns = 0;
+        int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+        if (prev_ns != 0) {
+          double us_per_iter = (now_ns - prev_ns) / 1000.0 / 4096.0;
+          HLOG(kInfo, "[WORKERRATE] worker={} {}us/iteration", worker_id_,
+               us_per_iter);
+        }
+        prev_ns = now_ns;
+      }
+    }
+
     if (!did_work_) {
       // No work was done - suspend worker with adaptive sleep
       SuspendMe();

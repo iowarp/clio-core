@@ -1,0 +1,69 @@
+# Compose configuration for the transparent-summarization integration test.
+#
+# The CAE core sits at the CTE entrypoint (512.0) and forwards to the
+# summarizer (401.0), which forwards to the real CTE core (513.0). When a
+# PutBlob's tag+blob name matches a label_matches entry the summarizer calls
+# the local Ollama instance and stores the returned summary as
+# `{blob_name}_label` in the same tag.
+
+networking:
+  port: 9413
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  # Default bdev fallback tier.
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  # CTE core at the bottom of the chain. Composed FIRST: an interposer's
+  # next_pool_id must already exist when its container is created.
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "513.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "128MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  # Summarizer interposer: owns the LLM summarization rules.
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "513.0"
+    label_endpoint: "http://127.0.0.1:11434"
+    label_prompts:
+      summarize: "Summarize the following text in one short sentence."
+    label_matches:
+      # Rule 1: small ".txt" blobs — comfortable single-shot context.
+      - tag_re: ".*\\.txt$"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+        context_length: 4096
+      # Rule 2: ".chunked" tag — deliberately tiny context_length so any
+      # non-trivial blob hits the chunk-and-concatenate path in
+      # Summarizer::PutBlob. Exercised by the chunking test.
+      - tag_re: ".*\\.chunked$"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+        context_length: 512
+
+  # CAE at the CTE entrypoint, forwarding through the summarizer.
+  - mod_name: clio_cae_core
+    pool_name: cae_labeler
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "401.0"

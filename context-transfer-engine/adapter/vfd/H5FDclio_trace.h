@@ -74,7 +74,16 @@
 #include <fstream>
 #include <map>
 #include <string>
+
+// getpid() is the only POSIX call in this header. <process.h> is the MSVC CRT
+// spelling; windows.h is deliberately NOT pulled in here -- it defines macros
+// over ordinary identifiers (Yield() and friends) that break the driver body
+// and clio's headers, which is why the Win32 half lives in its own TU.
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "adapter/clio_trace_schema.h"
 
@@ -133,7 +142,15 @@ inline bool Enabled() {
 #endif
 }
 
-inline long TracePid() { return static_cast<long>(::getpid()); }
+// MSVC spells it _getpid(); the value is only used to keep trace filenames and
+// records distinct per process, so either spelling serves equally.
+inline long TracePid() {
+#ifdef _WIN32
+  return static_cast<long>(::_getpid());
+#else
+  return static_cast<long>(::getpid());
+#endif
+}
 
 /** Filenames must not collide across processes (MPI ranks) or contain path
  *  separators from the traced file's own path. */

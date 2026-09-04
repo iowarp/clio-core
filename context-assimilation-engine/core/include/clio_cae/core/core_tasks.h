@@ -42,54 +42,12 @@
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
 namespace clio::cae::core {
 
 using MonitorTask = clio::run::admin::MonitorTask;
-
-/**
- * One labeling rule from compose YAML.
- *
- * When CAE intercepts a PutBlob and the inbound tag name matches `tag_re`
- * AND the blob name matches `blob_re`, CAE sends the blob payload to
- * `model` on the configured `label_endpoint` (see LabelingConfig) using
- * the prompt template registered in label_prompts_[prompt]. The LLM
- * response is stored alongside the original blob as `{blob_name}_label`.
- *
- * `context_length_` is the per-request token budget passed to Ollama as
- * `options.num_ctx`. It also drives chunking: when the blob payload
- * exceeds the effective byte budget for one prompt, CAE splits the blob
- * into chunks each sized to fit, runs the prompt on every chunk, and
- * concatenates the per-chunk responses into the final label.
- *
- * Regexes are matched with std::regex_search (so `.*` matches everything;
- * `.*\\.txt` matches a .txt suffix). Globs are not converted.
- */
-struct LabelMatch {
-  std::string tag_re_;
-  std::string blob_re_;
-  std::string model_;
-  std::string prompt_;  // key into label_prompts_
-  // Per-request Ollama context window in tokens. Also drives chunk
-  // sizing — see core_runtime.cc::PutBlob. 0 means "use Ollama default"
-  // (typically 2048) and disables chunking. A safe production value
-  // matches the model's architectural max (e.g. 32768 for gemma3:1b,
-  // 131072 for gemma3:4b+).
-  int context_length_ = 4096;
-  // Hard cap on the LLM response length (Ollama `num_predict`). 0
-  // means "no cap" — Ollama generates until EOS or context fills.
-  // Setting a value caps each per-chunk summary; with chunking the
-  // final concatenated label is roughly num_predict_ × (#chunks).
-  int num_predict_ = 0;
-
-  template <class Archive>
-  void serialize(Archive &ar) {
-    ar(tag_re_, blob_re_, model_, prompt_, context_length_, num_predict_);
-  }
-};
 
 /**
  * CreateParams for core chimod
@@ -103,51 +61,36 @@ struct CreateParams {
   // 513.0) when CAE is configured as a transparent interceptor in front of
   // CTE. When null, the CAE forwarding handlers fall back to the global CTE
   // pool ID (kCtePoolId). Mirrors compressor's CompressorConfig::next_pool_id_.
+  //
+  // Transparent LLM summarization used to be configured here too
+  // (label_endpoint / label_prompts / label_matches). It now lives in its own
+  // interposer chimod: see context-assimilation-engine/summarizer. Compose it
+  // between this pool and CTE and move those keys onto its entry.
   clio::run::PoolId next_pool_id_;
-
-  // Transparent labeling configuration (all optional).
-  // label_matches_ is empty by default — CAE behaves as a pure passthrough.
-  // When entries are present, PutBlob fires a labeling RPC per matching
-  // rule. See LabelMatch above for matching semantics.
-  std::vector<LabelMatch> label_matches_;
-  // Named prompt templates referenced by LabelMatch::prompt_. The full LLM
-  // input becomes "{prompt}\n\n{blob_text}".
-  std::unordered_map<std::string, std::string> label_prompts_;
-  // HTTP(S) endpoint of the inference server (Ollama-compatible). The
-  // labeling handler POSTs to "{label_endpoint_}/api/generate".
-  std::string label_endpoint_;
 
   // Default constructor
   CreateParams() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
   // Copy constructor (for BaseCreateTask)
   CreateParams(const CreateParams &other)
-      : next_pool_id_(other.next_pool_id_),
-        label_matches_(other.label_matches_),
-        label_prompts_(other.label_prompts_),
-        label_endpoint_(other.label_endpoint_) {}
+      : next_pool_id_(other.next_pool_id_) {}
 
   // Compose pool-id ctor (matches compressor pattern)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
-      : next_pool_id_(other.next_pool_id_),
-        label_matches_(other.label_matches_),
-        label_prompts_(other.label_prompts_),
-        label_endpoint_(other.label_endpoint_) {
+      : next_pool_id_(other.next_pool_id_) {
     (void)pool_id;
   }
 
   // Serialization support
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, label_matches_, label_prompts_, label_endpoint_);
+    ar(next_pool_id_);
   }
 
   /**
    * Load configuration from compose YAML. Parses:
    *   - `next_pool_id`        ("major.minor")
-   *   - `label_matches`       (list of {tag_re, blob_re, model, prompt})
-   *   - `label_prompts`       (map of prompt-name → prompt template)
-   *   - `label_endpoint`      (LLM HTTP endpoint base URL)
+   * @param pool_config The compose entry for this pool.
    */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     if (pool_config.config_.empty()) return;
@@ -160,31 +103,6 @@ struct CreateParams {
           clio::run::u32 major = std::stoul(next_str.substr(0, dot));
           clio::run::u32 minor = std::stoul(next_str.substr(dot + 1));
           next_pool_id_ = clio::run::PoolId(major, minor);
-        }
-      }
-      if (node["label_endpoint"]) {
-        label_endpoint_ = node["label_endpoint"].as<std::string>();
-      }
-      if (node["label_prompts"] && node["label_prompts"].IsMap()) {
-        for (const auto &kv : node["label_prompts"]) {
-          label_prompts_[kv.first.as<std::string>()] =
-              kv.second.as<std::string>();
-        }
-      }
-      if (node["label_matches"] && node["label_matches"].IsSequence()) {
-        for (const auto &entry : node["label_matches"]) {
-          LabelMatch m;
-          if (entry["tag_re"]) m.tag_re_ = entry["tag_re"].as<std::string>();
-          if (entry["blob_re"]) m.blob_re_ = entry["blob_re"].as<std::string>();
-          if (entry["model"]) m.model_ = entry["model"].as<std::string>();
-          if (entry["prompt"]) m.prompt_ = entry["prompt"].as<std::string>();
-          if (entry["context_length"]) {
-            m.context_length_ = entry["context_length"].as<int>();
-          }
-          if (entry["num_predict"]) {
-            m.num_predict_ = entry["num_predict"].as<int>();
-          }
-          label_matches_.push_back(std::move(m));
         }
       }
     } catch (...) {
@@ -284,7 +202,23 @@ struct ParseOmniTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ParseOmniTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ParseOmniTask>();
+    // Each replica schedules its own share of the work, so the count is the
+    // SUM. result_code_ keeps the FIRST failure so a later success cannot mask
+    // it.
+    num_tasks_scheduled_ += replica->num_tasks_scheduled_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -437,7 +371,22 @@ struct ExportDataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ExportDataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ExportDataTask>();
+    // Each replica exports its own share, so the byte count is the SUM;
+    // result_code_ keeps the FIRST failure.
+    bytes_exported_ += replica->bytes_exported_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -509,7 +458,22 @@ struct ImportDataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ImportDataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ImportDataTask>();
+    // Each replica imports its own share, so the byte count is the SUM;
+    // result_code_ keeps the FIRST failure.
+    bytes_imported_ += replica->bytes_imported_;
+    if (result_code_ == 0) {
+      result_code_ = replica->result_code_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 

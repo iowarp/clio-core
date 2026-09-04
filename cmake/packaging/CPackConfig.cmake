@@ -67,13 +67,6 @@ if(CLIO_CORE_ENABLE_DEB_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # actually validated in CI.
     set(CPACK_DEBIAN_PACKAGE_DEPENDS
         "libzmq3-dev, libyaml-cpp-dev, libmsgpack-dev, libsodium-dev")
-    # The pure-Python context visualizer ships in the package (see
-    # CLIO_CORE_ENABLE_VISUALIZER). Declare its Python runtime deps so
-    # `context-visualizer` works out of the box after `apt install`.
-    if(CLIO_CORE_ENABLE_VISUALIZER)
-        set(CPACK_DEBIAN_PACKAGE_DEPENDS
-            "${CPACK_DEBIAN_PACKAGE_DEPENDS}, python3, python3-flask, python3-yaml, python3-msgpack")
-    endif()
     # The FUSE adapter binary (clio_cte_fuse) links libfuse3.so.3 and
     # mounting needs the setuid fusermount3 helper from the fuse3 package.
     # Without these the shipped binary dies at exec with a dynamic-linker
@@ -112,13 +105,6 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # "nothing provides msgpack-c" on Fedora 40.
     set(CPACK_RPM_PACKAGE_REQUIRES
         "zeromq-devel, yaml-cpp-devel, msgpack-devel, libsodium-devel")
-    # Python runtime deps for the bundled context visualizer (AUTOREQ is off,
-    # so these must be declared explicitly). Fedora names: python3-pyyaml
-    # (vs Debian's python3-yaml) and python3-msgpack.
-    if(CLIO_CORE_ENABLE_VISUALIZER)
-        set(CPACK_RPM_PACKAGE_REQUIRES
-            "${CPACK_RPM_PACKAGE_REQUIRES}, python3, python3-flask, python3-pyyaml, python3-msgpack")
-    endif()
     # FUSE runtime deps for clio_cte_fuse — same rationale as the DEB
     # branch above (#899): fuse3-devel pulls libfuse3.so.3, fuse3 provides
     # fusermount3 for actually mounting.

@@ -13,12 +13,14 @@
 #include "basic_test.h"
 
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/memory/backend/posix_shm_mmap.h>
 
 #include <cstdlib>
 #include <string>
 #include <vector>
 
 using ctp::SystemInfo;
+using ctp::ipc::PosixShmMmap;
 
 TEST_CASE("SystemInfoCpu") {
   int cpus = SystemInfo::GetCpuCount();
@@ -154,4 +156,46 @@ TEST_CASE("SystemInfoProcessAndModule") {
 #else
   REQUIRE(mod_dir.front() == '/');
 #endif
+}
+
+TEST_CASE("SystemInfoSharedMemoryError") {
+  // GetLastSharedMemoryError() renders whatever the platform's shared-memory
+  // calls last reported: strerror(errno) on POSIX, FormatMessage over
+  // GetLastError() plus the numeric code on Windows. It must always produce
+  // something a human can read -- the point of it is that the previous
+  // "shm_open failed: {strerror(errno)}" reported a Win32 commit-limit failure
+  // as EAGAIN, because the Win32 calls do not set errno at all.
+  std::string msg = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!msg.empty());
+
+  // After a call that genuinely failed it must still be non-empty, and must
+  // not fall through to the "unknown error" placeholder.
+  ctp::File missing;
+  REQUIRE_FALSE(
+      SystemInfo::OpenSharedMemory(missing, "ctp_no_such_segment_xyz"));
+  std::string after = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!after.empty());
+  REQUIRE(after != "unknown error");
+}
+
+TEST_CASE("SystemInfoSharedMemoryCreateFailure") {
+  // A name far past any platform's limit: memfd_create(2) caps the name at
+  // 249 bytes, and the macOS/Windows branches open a file whose path this
+  // makes far too long. Every platform therefore fails the create, which is
+  // the one path that reports through GetLastSharedMemoryError().
+  const std::string too_long(4096, 'x');
+
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, too_long, 1024 * 1024));
+
+  // The same failure one layer up: shm_init() must report it and return false
+  // rather than going on to map a backend it never created.
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(),
+                                 1024 * 1024, too_long));
+
+  // Destroying a segment that was never created is a no-op everywhere, and
+  // must stay one now that the Windows branch actually deletes a file.
+  SystemInfo::DestroySharedMemory(too_long);
+  SystemInfo::DestroySharedMemory("ctp_no_such_segment_xyz");
 }

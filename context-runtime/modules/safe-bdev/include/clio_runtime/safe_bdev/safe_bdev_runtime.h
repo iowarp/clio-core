@@ -208,6 +208,15 @@ class Runtime : public clio::run::Container {
 
   clio::run::u64 GetWorkRemaining() const override;
 
+  /**
+   * Register the safe-bdev dashboard page's endpoints (issue #990):
+   * the pool index, the add/remove member actions, and the create form. The
+   * page itself ships in this module's viz/ directory. Defined in
+   * safe_bdev_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
                 clio::run::shared_ptr<clio::run::Task> &task_ptr) override;
 
@@ -346,7 +355,7 @@ class Runtime : public clio::run::Container {
   //==========================================================================
   // Recovery observability. RecoverBdev rebuilds a failed member's chunk for
   // EVERY slot it participates in; each such slot is one "recovery operation".
-  // These atomics let Monitor() -- and the context-visualizer safe-bdev
+  // These atomics let Monitor() -- and the dashboard safe-bdev
   // dashboard -- report live rebuild progress. Reset at the start of every
   // RecoverBdev. Atomic because Monitor() may run on a different worker fiber
   // than the in-progress rebuild.

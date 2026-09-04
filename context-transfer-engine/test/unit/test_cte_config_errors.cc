@@ -137,7 +137,7 @@ TEST_CASE("ConfigErrors - storage device parsing", "[cte][config][storage]") {
   }
 }
 
-TEST_CASE("ConfigErrors - dpe and gpu_metadata_cache parsing",
+TEST_CASE("ConfigErrors - dpe parsing",
           "[cte][config][dpe]") {
   SECTION("Invalid dpe_type rejected");
   Config config;
@@ -151,19 +151,6 @@ TEST_CASE("ConfigErrors - dpe and gpu_metadata_cache parsing",
                               "\n"));
     REQUIRE(ok.dpe_.dpe_type_ == type);
   }
-
-  SECTION("gpu_metadata_cache keys parsed");
-  Config gmc;
-  REQUIRE(gmc.LoadFromString(
-      "gpu_metadata_cache:\n"
-      "  enabled: true\n"
-      "  capacity: 4mb\n"
-      "  max_blobs: 128\n"
-      "  max_tags: 32\n"));
-  REQUIRE(gmc.gpu_metadata_cache_.enabled_);
-  REQUIRE(gmc.gpu_metadata_cache_.capacity_bytes_ == 4ULL * 1024 * 1024);
-  REQUIRE(gmc.gpu_metadata_cache_.max_blobs_ == 128);
-  REQUIRE(gmc.gpu_metadata_cache_.max_tags_ == 32);
 }
 
 namespace {

@@ -73,17 +73,17 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config python3 \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
 
     - name: Configure with CMake
       run: |
-        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
-        # pure-Python context visualizer ships as a standard feature via
-        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings). The web
+        # dashboard is served by the runtime itself (issue #990); its assets
+        # install via clio_add_viz_assets, no Python involved.
         # Cache + replication chimods already default ON (#886); pin them
         # explicitly so a future default flip cannot silently drop them
         # from published packages (#899).
@@ -91,7 +91,6 @@ jobs:
           -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
-          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -DCLIO_CTE_ENABLE_CACHE=ON \
           -DCLIO_CTE_ENABLE_REPLICATION=ON \
@@ -151,15 +150,13 @@ jobs:
 
     - name: Configure with CMake
       run: |
-        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
-        # pure-Python context visualizer ships as a standard feature via
-        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings). The web
+        # dashboard is served by the runtime itself (issue #990).
         # Cache + replication pins: same rationale as build-deb (#899).
         cmake -B build-rpm \
           -DCLIO_CORE_ENABLE_RPM_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
-          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -DCLIO_CTE_ENABLE_CACHE=ON \
@@ -214,8 +211,8 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config wget file \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
@@ -284,7 +281,7 @@ jobs:
     - name: Install + smoke test
       run: |
         set -e
-        apt-get update
+        for i in 1 2 3; do apt-get update && break || sleep 5; done
         # dpkg-installs the .deb, then apt-get -f install pulls in any
         # runtime deps the package declared (libzmq, libyaml-cpp, ...).
         apt-get install -y ./pkg/*.deb || (apt-get -f install -y && apt-get install -y ./pkg/*.deb)
@@ -297,16 +294,6 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
-        echo "=== context-visualizer (standard feature) ==="
-        # Launcher must be on PATH and the package importable. --help exits 0
-        # via argparse; only a signal-level death indicates a real problem
-        # (e.g. a missing Python runtime dep the package failed to declare).
-        context-visualizer --help; rc=$?
-        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
-          echo "FAIL: context-visualizer --help died with exit code $rc"
-          exit 1
-        fi
-        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .deb now declares libfuse3-dev + fuse3, so the apt install
         # above must have pulled libfuse3.so.3 — a load failure here means
@@ -361,16 +348,6 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
-        echo "=== context-visualizer (standard feature) ==="
-        # Launcher must be on PATH and the package importable. --help exits 0
-        # via argparse; only a signal-level death indicates a real problem
-        # (e.g. a missing Python runtime dep the package failed to declare).
-        context-visualizer --help; rc=$?
-        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
-          echo "FAIL: context-visualizer --help died with exit code $rc"
-          exit 1
-        fi
-        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .rpm now requires fuse3-devel + fuse3, so dnf must have
         # pulled libfuse3.so.3 — a load failure here means the dependency
@@ -406,6 +383,17 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download AppImage artifact
       uses: actions/download-artifact@v4
       with:
@@ -419,8 +407,8 @@ jobs:
         #   1. Mount via FUSE (requires libfuse2 on the runner)
         #   2. APPIMAGE_EXTRACT_AND_RUN=1 — extract to a tmpdir + exec
         # Use (2) so the test runs even on minimal runners without FUSE.
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends file
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends file
         chmod +x pkg/*.AppImage
         echo "=== AppImage info ==="
         file pkg/*.AppImage
@@ -482,8 +470,14 @@ jobs:
       run: |
         C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
 
+    # Retry + assert, mirroring build-pip (#1004): choco can exit 0 on a
+    # community-feed 503, silently building the package without the adapter.
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE rather than packaging without the FUSE adapter (#1004)"
+        }
 
     # cpack -G NSIS below shells out to makensis. Nothing installed it, so the
     # job failed with "Cannot find NSIS compiler makensis ... Cannot initialize
@@ -491,7 +485,7 @@ jobs:
     # package, so it reads as a packaging-config problem rather than a missing
     # tool. The runner image does not ship NSIS.
     - name: Install NSIS (installer generator for cpack -G NSIS)
-      run: choco install nsis -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install nsis -y --no-progress
 
     - name: Configure with CMake
       run: |
@@ -536,14 +530,30 @@ jobs:
     timeout-minutes: 45
     if: always() && needs.build-windows.result == 'success'
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download Windows package
       uses: actions/download-artifact@v4
       with:
         name: windows-package-x86_64
         path: pkg/
 
+    # Same hardening for the runtime install used by the smoke test (#1004).
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: |
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\bin")) {
+          throw "WinFsp runtime missing after the install succeeded -- failing HERE rather than smoke-testing without it (#1004)"
+        }
 
     - name: Extract ZIP + smoke test
       shell: pwsh

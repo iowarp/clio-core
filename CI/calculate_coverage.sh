@@ -597,6 +597,8 @@ lcov --extract coverage_filtered.info \
 lcov --extract coverage_filtered.info \
      "${REPO_ROOT}/context-assimilation-engine/core/src/*" \
      "${REPO_ROOT}/context-assimilation-engine/core/include/*" \
+     "${REPO_ROOT}/context-assimilation-engine/summarizer/src/*" \
+     "${REPO_ROOT}/context-assimilation-engine/summarizer/include/*" \
      --output-file "${TMP_DIR}/cae.info" \
      >/dev/null 2>&1 || true
 

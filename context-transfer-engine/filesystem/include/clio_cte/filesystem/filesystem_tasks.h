@@ -118,39 +118,163 @@ struct OpenTask : public clio::run::Task {
   OUT clio::run::u64 handle_;
   OUT clio::run::u64 size_;
   OUT clio::run::u32 created_;  // 1 if the file was newly created
+  // Packed TagId (major<<32|minor) of the file's tag, so adapters can drive
+  // page-blob I/O (sieve writes, RYW reads) through the CTE client directly.
+  OUT clio::run::u64 tag_packed_;
 
   OpenTask()
       : clio::run::Task(), path_(CTP_MALLOC), flags_(0), mode_(0644),
-        handle_(0), size_(0), created_(0) {}
+        handle_(0), size_(0), created_(0), tag_packed_(0) {}
   explicit OpenTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                     const clio::run::PoolQuery &pool_query, const std::string &path,
                     clio::run::u32 flags, clio::run::u32 mode)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kOpen),
         path_(CTP_MALLOC, path), flags_(flags), mode_(mode), handle_(0),
-        size_(0), created_(0) {}
+        size_(0), created_(0), tag_packed_(0) {}
   void Copy(const ctp::ipc::FullPtr<OpenTask>& o) {
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
+    tag_packed_ = o->tag_packed_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_, flags_, mode_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(handle_, size_, created_);
+    Task::SerializeOut(ar); ar(handle_, size_, created_, tag_packed_);
   }
 };
 
 /** Close: release a handle (drains pending writes server-side). */
 struct CloseTask : public clio::run::Task {
   IN clio::run::u64 handle_;
-  CloseTask() : clio::run::Task(), handle_(0) {}
+  // Advance the file's logical size to at least this before releasing the
+  // handle (0 = no advance). Carried on CLOSE — not a path-keyed truncate —
+  // because it must survive a rename racing a detached close: the handle's
+  // server-side FileInfo tracks the file identity across renames.
+  IN clio::run::u64 advance_size_;
+  CloseTask() : clio::run::Task(), handle_(0), advance_size_(0) {}
   explicit CloseTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
-                     const clio::run::PoolQuery &pool_query, clio::run::u64 handle)
+                     const clio::run::PoolQuery &pool_query, clio::run::u64 handle,
+                     clio::run::u64 advance_size = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kClose),
-        handle_(handle) {}
-  void Copy(const ctp::ipc::FullPtr<CloseTask>& o) { handle_ = o->handle_; }
+        handle_(handle), advance_size_(advance_size) {}
+  void Copy(const ctp::ipc::FullPtr<CloseTask>& o) {
+    handle_ = o->handle_; advance_size_ = o->advance_size_;
+  }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(handle_);
+    Task::SerializeIn(ar); ar(handle_, advance_size_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * MultiCreate (batched, sieve-flushed file creation): create N files in ONE
+ * task. Each entry carries the path, the client-MINTED packed TagId (top-bit
+ * minor partition; the tag chain adopts it via preferred_id), and the create
+ * mode. create(2) itself returns without any task — the adapter's flusher
+ * ships these every tick, exactly like the write sieve ships pages.
+ */
+struct MultiCreateEnt {
+  std::string path_;
+  clio::run::u64 tag_packed_ = 0;
+  clio::run::u32 mode_ = 0644;
+};
+
+inline std::string EncodeMultiCreate(const std::vector<MultiCreateEnt> &ents) {
+  std::string out;
+  auto put32 = [&](clio::run::u32 v) {
+    out.append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  auto put64 = [&](clio::run::u64 v) {
+    out.append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  put32(static_cast<clio::run::u32>(ents.size()));
+  for (const auto &e : ents) {
+    put32(static_cast<clio::run::u32>(e.path_.size()));
+    out.append(e.path_);
+    put64(e.tag_packed_);
+    put32(e.mode_);
+  }
+  return out;
+}
+
+inline bool DecodeMultiCreate(const char *data, size_t len,
+                              std::vector<MultiCreateEnt> *out) {
+  size_t off = 0;
+  auto get32 = [&](clio::run::u32 *v) {
+    if (off + sizeof(*v) > len) return false;
+    std::memcpy(v, data + off, sizeof(*v));
+    off += sizeof(*v);
+    return true;
+  };
+  auto get64 = [&](clio::run::u64 *v) {
+    if (off + sizeof(*v) > len) return false;
+    std::memcpy(v, data + off, sizeof(*v));
+    off += sizeof(*v);
+    return true;
+  };
+  clio::run::u32 n = 0;
+  if (!get32(&n)) return false;
+  out->clear();
+  out->reserve(n);
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    MultiCreateEnt e;
+    clio::run::u32 plen = 0;
+    if (!get32(&plen) || off + plen > len) return false;
+    e.path_.assign(data + off, plen);
+    off += plen;
+    if (!get64(&e.tag_packed_) || !get32(&e.mode_)) return false;
+    out->push_back(std::move(e));
+  }
+  return true;
+}
+
+struct MultiCreateTask : public clio::run::Task {
+  IN clio::run::priv::string packed_;  // EncodeMultiCreate payload
+  OUT clio::run::u32 num_ok_;
+  OUT clio::run::u32 first_rc_;
+  MultiCreateTask()
+      : clio::run::Task(), packed_(CTP_MALLOC), num_ok_(0), first_rc_(0) {}
+  explicit MultiCreateTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           const std::string &packed)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiCreate),
+        packed_(CTP_MALLOC, packed), num_ok_(0), first_rc_(0) {}
+  void Copy(const ctp::ipc::FullPtr<MultiCreateTask> &o) {
+    packed_ = o->packed_; num_ok_ = o->num_ok_; first_rc_ = o->first_rc_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(packed_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(num_ok_, first_rc_);
+  }
+};
+
+/**
+ * AdvanceSize: raise a file's logical size, keyed by TAG rather than path or
+ * handle. This is the rename-proof size push for sieve-minted files: a
+ * path-keyed truncate delivered after the app renamed the file RESURRECTED
+ * the old name (cfs Truncate materializes missing paths by design), and the
+ * ghost then hijacked later renames. The tag names the file's identity; the
+ * handler publishes under whatever path the file currently has.
+ */
+struct AdvanceSizeTask : public clio::run::Task {
+  IN clio::run::u64 tag_packed_;
+  IN clio::run::u64 size_;
+  AdvanceSizeTask() : clio::run::Task(), tag_packed_(0), size_(0) {}
+  explicit AdvanceSizeTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u64 tag_packed, clio::run::u64 size)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
+        tag_packed_(tag_packed), size_(size) {}
+  void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask> &o) {
+    tag_packed_ = o->tag_packed_; size_ = o->size_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_packed_, size_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
@@ -262,21 +386,25 @@ struct GetattrTask : public clio::run::Task {
   OUT clio::run::u32 uid_;  // chown'd owner uid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 gid_;  // chown'd owner gid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 mode_;  // chmod'd/created mode bits; 0xFFFFFFFF = default
+  // POSIX link count (canonical name + hard-link aliases), computed
+  // server-side so getattr costs ONE round trip — the adapter previously
+  // issued a separate alias query per regular-file stat.
+  OUT clio::run::u32 nlink_;
   GetattrTask()
       : clio::run::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
         ino_(0), ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
   explicit GetattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetattr),
         path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0),
         ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
     size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
     mtime_ = o->mtime_; atime_ = o->atime_; is_symlink_ = o->is_symlink_;
-    uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_;
+    uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_; nlink_ = o->nlink_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
@@ -284,7 +412,7 @@ struct GetattrTask : public clio::run::Task {
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar);
     ar(exists_, is_dir_, size_, ino_, ctime_, mtime_, atime_, is_symlink_,
-       uid_, gid_, mode_);
+       uid_, gid_, mode_, nlink_);
   }
 };
 
@@ -292,17 +420,35 @@ struct GetattrTask : public clio::run::Task {
 struct TruncateTask : public clio::run::Task {
   IN clio::run::priv::string path_;
   IN clio::run::u64 new_size_;
-  TruncateTask() : clio::run::Task(), path_(CTP_MALLOC), new_size_(0) {}
+  /** Nonzero = ftruncate through an OPEN handle: resolve by this TAG and
+   *  never materialize the path. A path-keyed truncate deliberately creates
+   *  missing files (POSIX truncate(2)), but an fd-truncate of a file
+   *  unlinked-while-open RESURRECTED the deleted name through that same
+   *  materialization (generic/070's undeletable ghosts). */
+  IN clio::run::u64 tag_packed_;
+  /** The caller-known FULL extent of prior writes (the FUSE adapter's
+   *  hiwater). The chimod-tracked size lags sieve-direct writes (they bypass
+   *  the Write handler), so trimming by it left REAL page-blobs beyond a
+   *  shrink alive — holes then read the old bytes back (fsx). The trim
+   *  covers up to max(tracked, old_extent_). */
+  IN clio::run::u64 old_extent_;
+  TruncateTask()
+      : clio::run::Task(), path_(CTP_MALLOC), new_size_(0), tag_packed_(0),
+        old_extent_(0) {}
   explicit TruncateTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query,
-                        const std::string &path, clio::run::u64 new_size)
+                        const std::string &path, clio::run::u64 new_size,
+                        clio::run::u64 tag_packed = 0,
+                        clio::run::u64 old_extent = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kTruncate),
-        path_(CTP_MALLOC, path), new_size_(new_size) {}
+        path_(CTP_MALLOC, path), new_size_(new_size),
+        tag_packed_(tag_packed), old_extent_(old_extent) {}
   void Copy(const ctp::ipc::FullPtr<TruncateTask>& o) {
-    path_ = o->path_; new_size_ = o->new_size_;
+    path_ = o->path_; new_size_ = o->new_size_; tag_packed_ = o->tag_packed_;
+    old_extent_ = o->old_extent_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(path_, new_size_);
+    Task::SerializeIn(ar); ar(path_, new_size_, tag_packed_, old_extent_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };

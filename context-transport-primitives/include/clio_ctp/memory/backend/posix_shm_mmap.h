@@ -90,8 +90,12 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     SystemInfo::DestroySharedMemory(url);
     if (!SystemInfo::CreateNewSharedMemory(fd_, url, backend_size)) {
-      char *err_buf = strerror(errno);
-      HLOG(kError, "shm_open failed: {}", err_buf);
+      // NOT strerror(errno): none of the three platform implementations is
+      // shm_open(), and the Win32 one does not set errno at all, so this used
+      // to report a commit-limit failure as "Resource temporarily
+      // unavailable". Ask the platform what actually went wrong.
+      HLOG(kError, "could not create shared memory segment {} of {} bytes: {}",
+           url, backend_size, SystemInfo::GetLastSharedMemoryError());
       return false;
     }
     url_ = url;

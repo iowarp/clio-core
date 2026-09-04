@@ -1,0 +1,123 @@
+# Nightly full sweep on dev.
+#
+# Two jobs the PR/merge gates deliberately do not do:
+#
+#  1. Run the QUARANTINED tests. Blocking jobs exclude the `flaky` ctest label
+#     so one unlucky test cannot hold up a merge, but a quarantined test that
+#     nobody ever runs is a test that has been deleted without saying so. This
+#     runs them every night and reports, so quarantine stays a holding pen
+#     rather than a graveyard.
+#
+#  2. Catch ENVIRONMENT drift on its own schedule instead of inside someone's
+#     pull request. Runner images move underneath us -- a Miniconda base that
+#     jumped to a new Python broke conda-build with nothing on our side having
+#     changed (#874). When that happens at 03:00 against dev, it is obviously
+#     infrastructure. When it happens at 14:00 against a PR, it looks like the
+#     PR did it, and somebody spends an afternoon proving otherwise.
+#
+# Reports, never gates: nothing here is a required check, and a failure means
+# "look at the environment or the quarantine list", not "your branch is bad".
+name: Nightly Full Sweep
+
+on:
+  schedule:
+    # 03:00 UTC daily -- after the day's merges have settled.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-full-sweep
+  cancel-in-progress: false
+
+jobs:
+  quarantined-tests:
+    name: quarantined tests (flaky label)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      # -L (not -LE): run ONLY what the gates skip. No --repeat here -- the
+      # point is to measure how often these actually fail, and until-pass
+      # would erase exactly that signal.
+      # A quarantined test failing is the EXPECTED outcome, so the exit code is
+      # captured and reported rather than thrown. Deliberately not
+      # continue-on-error: that flag hides a step's result from the reader as
+      # well as from the gate, and every masked step in this repo has cost
+      # somebody an afternoon. Here the outcome is recorded explicitly.
+      - name: Run quarantined tests
+        id: quarantined
+        run: |
+          set -o pipefail
+          rc=0
+          ctest --test-dir build -L flaky --output-on-failure --timeout 300 \
+            2>&1 | tee /tmp/quarantined.log || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "quarantined suite exited $rc (reported, not gating)"
+
+      - name: Summarize quarantine
+        if: always()
+        run: |
+          {
+            echo "## Quarantined tests (\`flaky\` label)"
+            echo
+            if [ "${{ steps.quarantined.outputs.rc }}" = "0" ]; then
+              echo "All quarantined tests passed. Candidates for requalification —"
+              echo "check each against a measured baseline before removing the label."
+            else
+              echo "Some quarantined tests still fail. Expected; that is why they are quarantined."
+            fi
+            echo
+            echo '```'
+            grep -E "tests passed|tests failed|Failed|Passed" /tmp/quarantined.log 2>/dev/null | tail -40 || echo "(no ctest summary captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report retried-but-passed tests
+        if: always()
+        run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "nightly quarantined"
+
+  environment-drift:
+    name: environment drift probe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15, windows-2025]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          submodules: recursive
+
+      # Record what the image actually gave us. When a nightly goes red without
+      # a matching commit, this is the diff that explains it.
+      - name: Record toolchain versions
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.os }}"
+            echo '```'
+            echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            cmake --version 2>/dev/null | head -1 || echo "cmake: absent"
+            python3 --version 2>&1 || python --version 2>&1 || echo "python: absent"
+            git --version
+            ( cc --version 2>/dev/null || clang --version 2>/dev/null || cl 2>&1 ) | head -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

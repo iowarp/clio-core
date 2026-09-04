@@ -184,6 +184,45 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip;leak;crash"
   )
 
+  # Issue #970: a task submitted AFTER ClientFinalize must fail rather than park
+  # forever, or the process never leaves exit(). Forks a client that registers an
+  # atexit handler BEFORE clio init -- reproducing HDF5's position in the LIFO
+  # ordering, without needing HDF5 -- and asserts the child exits.
+  add_executable(clio_run_client_exit_wait_test test_client_exit_wait.cc)
+  target_include_directories(clio_run_client_exit_wait_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_client_exit_wait_test
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_client_exit_wait_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(clio_run_client_exit_wait_test
+    clio_run clio_cte_core_runtime clio_bdev_runtime)
+  set_target_properties(clio_run_client_exit_wait_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_client_exit_wait
+    COMMAND clio_run_client_exit_wait_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  # TIMEOUT comfortably exceeds the test's own 30s child budget, so a real hang
+  # is reported by the test's FAIL message rather than as an opaque ctest kill.
+  set_tests_properties(cr_cli_client_exit_wait PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 180
+    LABELS "msan_skip"
+  )
+
   # Filesystem chimod test: compose bdev->cte_core->filesystem, drive the cfs
   # client (open/write/getattr/read/truncate), assert EXACT logical size.
   # Only built when the filesystem chimod is enabled.

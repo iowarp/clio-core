@@ -40,11 +40,6 @@ option(CLIO_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
-# The context visualizer is pure Python (no compilation), so it ships as a
-# standard feature in every package — independent of the heavyweight nanobind
-# bindings gated by CLIO_CORE_ENABLE_PYTHON. Keep it ON so the .deb/.rpm/conda
-# packages (built with CLIO_CORE_ENABLE_PYTHON=OFF) still include it.
-option(CLIO_CORE_ENABLE_VISUALIZER "Install the pure-Python context visualizer dashboard" ON)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
 # Precompiled headers speed up builds but conflict with WINDOWS_EXPORT_ALL_SYMBOLS
 # under the Ninja generator with non-MSVC Windows compilers (icx/clang-cl): the
@@ -199,7 +194,7 @@ option(CAE_ENABLE_GCS "Enable Google Cloud Storage (gs://) import in CAE" OFF)
 # LLM labeling/summary + semantic-search features and their integration tests
 # require a running Ollama service. OFF by default so default builds don't
 # build or run them without Ollama.
-option(CLIO_CAE_ENABLE_SUMMARY "Enable CAE LLM labeling/summary + semantic-search (requires a running Ollama service)" OFF)
+option(CLIO_CAE_ENABLE_SUMMARY "Enable the summarizer chimod's live-Ollama tests + semantic-search (requires a running Ollama service)" OFF)
 
 #------------------------------------------------------------------------------
 # External Examples and Applications
@@ -1526,16 +1521,6 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
-# Context Visualizer (pure Python web dashboard). Gated on its own option so
-# it ships in the .deb/.rpm/conda packages even though those set
-# CLIO_CORE_ENABLE_PYTHON=OFF (it needs no compilation, only a Python runtime).
-if(CLIO_CORE_ENABLE_VISUALIZER)
-    message(STATUS "Building context-visualizer component (Python)")
-    add_subdirectory(context-visualizer)
-else()
-    message(STATUS "Context-visualizer component disabled (CLIO_CORE_ENABLE_VISUALIZER=OFF)")
-endif()
-
 # Gray-Scott Example Application
 if(CLIO_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
@@ -2087,11 +2072,9 @@ if(CLIO_CORE_ENABLE_PYTHON)
       COMPONENT pip_package
       LIBRARY DESTINATION ext)
   endif()
-  # Note: the context_visualizer Python package ships at the wheel root
-  # (top-level "context_visualizer/") via scikit-build-core's wheel.packages
-  # setting in pyproject.toml, not via CMake install.  That keeps the
-  # `python -m context_visualizer` and `context-visualizer` entry-point
-  # paths consistent with the package's own __main__.py.
+  # Note: the web dashboard is served by the runtime itself (issue #990);
+  # its per-ChiMod assets install via clio_add_viz_assets() under both the
+  # default and pip_package components.
 endif()
 
 # Default config -> iowarp_core/data/

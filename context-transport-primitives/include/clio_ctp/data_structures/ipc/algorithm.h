@@ -44,13 +44,25 @@ template <typename IterT>
 using iterator_type_v =
     typename std::remove_reference<decltype(*std::declval<IterT>())>::type;
 
-/** Swap two values */
+namespace detail {
+
+/**
+ * Swap two values.
+ *
+ * Deliberately kept out of namespace ctp. A generic, unconstrained `swap` in
+ * ctp is found by ADL for every ctp type -- and for pointers to one -- where
+ * it ties exactly with `std::swap` and makes the unqualified `swap()` calls
+ * inside libc++ ambiguous. `std::vector<ctp::shared_ptr<T, A>>` reallocating
+ * in `__split_buffer` is one such call.
+ */
 template <typename T>
 CTP_CROSS_FUN void swap(T &a, T &b) {
   T tmp = a;
   a = b;
   b = tmp;
 }
+
+}  // namespace detail
 
 /** Default sorting algorithm */
 #define CTP_DEFAULT_SORT_CMP ctp ::less_than<iterator_type_v<IterT>>
@@ -129,7 +141,7 @@ CTP_CROSS_FUN void insertion_sort(IterT start, const IterT &end, CmpT &&cmp) {
   for (auto i = start; i != end; ++i) {
     auto j = i;
     while (j != start && cmp(*(j), *(j - 1))) {
-      swap(*j, *(j - 1));
+      detail::swap(*j, *(j - 1));
       --j;
     }
   }
@@ -147,7 +159,7 @@ CTP_CROSS_FUN void heapify(IterT start, size_t n, size_t i, CmpT &&cmp) {
   if (right < n && cmp(*(start + largest), *(start + right))) largest = right;
 
   if (largest != i) {
-    swap(*(start + i), *(start + largest));
+    detail::swap(*(start + i), *(start + largest));
     heapify(start, n, largest, cmp);
   }
 }
@@ -162,7 +174,7 @@ CTP_CROSS_FUN void heap_sort(IterT start, const IterT &end, CmpT &&cmp) {
 
   // Extract elements from heap one by one
   for (int i = n - 1; i > 0; i--) {
-    swap(*start, *(start + i));
+    detail::swap(*start, *(start + i));
     heapify(start, i, 0, cmp);
   }
 }
@@ -175,15 +187,15 @@ CTP_CROSS_FUN void quick_sort(IterT start, const IterT &end, CmpT &&cmp) {
   }
   auto pivot = start + (end - start) / 2;
   auto pivot_val = *pivot;
-  swap(*pivot, *(end - 1));
+  detail::swap(*pivot, *(end - 1));
   auto store = start;
   for (auto i = start; i < end - 1; ++i) {
     if (cmp(*(i), *(end - 1))) {
-      swap(*store, *i);
+      detail::swap(*store, *i);
       ++store;
     }
   }
-  swap(*store, *(end - 1));
+  detail::swap(*store, *(end - 1));
   sort(start, store, cmp);
   sort(store + 1, end, cmp);
 }

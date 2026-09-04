@@ -1,0 +1,330 @@
+/*
+ * Clio dashboard -- served by the admin ChiMod out of the running daemon.
+ * Palette inherited from the retired Python context-visualizer for continuity.
+ * No external assets: a daemon on an isolated cluster node must render offline.
+ */
+
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-table: #0f3460;
+  --accent: #e94560;
+  --accent-secondary: #53d8fb;
+  --text: #eee;
+  --text-muted: #9aa;
+  --border: #2a2a4a;
+  --success: #4caf50;
+  --warning: #ff9800;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  font-size: 14px;
+}
+
+a { color: var(--accent-secondary); }
+
+/* ---- Navigation --------------------------------------------------------- */
+
+.navbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0 1.5rem;
+  height: 3.25rem;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-brand {
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.nav-links {
+  list-style: none;
+  display: flex;
+  gap: 0.25rem;
+}
+
+.nav-links a {
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+}
+
+.nav-links a:hover, .nav-links a.active {
+  background: var(--bg-table);
+  color: var(--text);
+}
+
+.nav-status {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.nav-status.ok { color: var(--success); }
+.nav-status.bad { color: var(--accent); }
+
+/* ---- Layout ------------------------------------------------------------- */
+
+.content {
+  max-width: 1200px;
+  margin: 1.5rem auto 3rem;
+  padding: 0 1.5rem;
+}
+
+h1 { font-size: 1.4rem; margin-bottom: 1rem; }
+
+h2 {
+  font-size: 1rem;
+  margin: 1.5rem 0 0.6rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.sub { color: var(--text-muted); font-size: 0.85rem; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+}
+
+.card h3 {
+  font-size: 1rem;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--accent-secondary); }
+.card.dead { opacity: 0.55; }
+
+/* Pool cards: room for the shutdown "x" in the corner, and a FIXED footprint —
+   the grid track decides the width and long content never widens the card.
+   Long values (a file-backed pool's name is a filesystem path) crop at the
+   card edge and scroll horizontally instead. */
+/* Pool sections use wider tracks than the default grid: the cards carry a
+   stats summary and an expandable statistics table, so they get more room. */
+.pool-grid {
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+
+.pool-card {
+  position: relative;
+  padding-right: 2.25rem;
+  min-width: 0;          /* grid items default to min-width:auto, which lets
+                            content stretch the track — pin it */
+  min-height: 8rem;      /* uniform card height across a section */
+  overflow: hidden;
+}
+
+/* The "read more" toggle and its statistics panel. */
+.pool-more { margin-top: 0.4rem; }
+
+.pool-more a {
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: var(--accent-secondary);
+  user-select: none;
+}
+
+.pool-stats {
+  margin-top: 0.4rem;
+  max-height: 14rem;
+  overflow-y: auto;      /* long stat lists scroll inside the card */
+}
+
+.pool-card h3,
+.pool-card .sub {
+  display: block;
+  white-space: nowrap;
+  overflow-x: auto;      /* crop + scroll, never wrap or spill */
+  scrollbar-width: thin;
+  padding-bottom: 2px;   /* keep the scrollbar off the glyphs */
+}
+
+.pool-card h3::-webkit-scrollbar,
+.pool-card .sub::-webkit-scrollbar { height: 4px; }
+.pool-card h3::-webkit-scrollbar-thumb,
+.pool-card .sub::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.card-close {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  line-height: 1;
+  padding: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.card-close:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(233, 69, 96, 0.12);
+}
+
+/* ---- Badges and meters -------------------------------------------------- */
+
+.badge {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  background: var(--bg-table);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.badge.alive { background: rgba(76, 175, 80, 0.2); color: var(--success); }
+.badge.dead { background: rgba(233, 69, 96, 0.2); color: var(--accent); }
+.badge.warn { background: rgba(255, 152, 0, 0.2); color: var(--warning); }
+.badge.leader { background: rgba(83, 216, 251, 0.2); color: var(--accent-secondary); }
+
+.meter {
+  margin: 0.4rem 0;
+}
+
+.meter-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.15rem;
+}
+
+.meter-bar {
+  height: 6px;
+  background: var(--bg-table);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--accent-secondary);
+  transition: width 0.3s;
+}
+
+.meter-fill.hot { background: var(--accent); }
+.meter-fill.warm { background: var(--warning); }
+
+/* ---- Tables ------------------------------------------------------------- */
+
+.table-wrap { overflow-x: auto; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+}
+
+tbody tr:hover { background: var(--bg-card); }
+
+/* Numeric columns right-align — HEADERS INCLUDED. A left-aligned header over a
+   right-aligned column makes the value appear to belong to its neighbour. */
+td.num, th.num { text-align: right; }
+
+/* Task-prediction table: the CPU / Wall groups get a dividing rule, group
+   titles center over their coefficient+error pairs, and rows the model has
+   not trained yet recede. */
+.pred-group { border-left: 1px solid var(--border); }
+.pred-table thead tr:first-child th.pred-group { text-align: center; }
+.pred-table thead th { vertical-align: bottom; }
+.pred-table tr.untrained td { color: var(--text-muted); }
+
+/* ---- Forms and pre ------------------------------------------------------ */
+
+input, select, button {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  background: var(--bg-table);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.35rem 0.5rem;
+}
+
+button { cursor: pointer; }
+button:hover { border-color: var(--accent-secondary); }
+
+.row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+
+pre {
+  background: var(--bg-table);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.error {
+  background: rgba(233, 69, 96, 0.15);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 0.6rem 0.75rem;
+  margin: 0.75rem 0;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 0.75rem 0;
+}
+
+/* Sparkline SVG for the system-stats history. */
+.spark { width: 100%; height: 40px; display: block; }
+.spark path { fill: none; stroke: var(--accent-secondary); stroke-width: 1.5; }
+.spark rect { fill: var(--bg-table); }

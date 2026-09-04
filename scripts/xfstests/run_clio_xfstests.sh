@@ -161,7 +161,34 @@ for t in "${LIST[@]}"; do
     echo "--- end [${t}] runtime diagnosis ---"
   elif echo "${out}" | grep -q "^Not run:"; then echo "${t}: notrun"; notrun=$((notrun+1))
   elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
-  else echo "${t}: FAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; fi
+  else echo "${t}: FAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"
+    # PRINT WHY. ./check's output -- which carries the golden-vs-actual diff --
+    # was captured into ${out} and then thrown away, so a CI failure read
+    # exactly "generic/070 : FAIL" and nothing else. Five red runs in three
+    # weeks were triaged by re-running rather than by reading, because there was
+    # nothing to read. Cost of keeping it: ~40 lines per failing test.
+    # ${t} carries trailing whitespace from ./check -n (which is why every
+    # status line above reads "generic/070 : FAIL", with the space). Path
+    # globs built from it silently match nothing, so trim before using it as
+    # a filename -- the first cut of this block did not, and printed no
+    # artifacts at all while looking like it had run.
+    tt="${t//[[:space:]]/}"
+    echo "--- [${tt}] failure diagnosis ---"
+    echo "  [./check output, last 40 lines]:"
+    echo "${out}" | tail -n 40 | sed "s/^/    /"
+    # RESULT_BASE is results/ by default but becomes results/<section>/ when
+    # local.config declares sections, so find the artifacts instead of assuming
+    # the path -- an assumed path that misses prints nothing and looks the same
+    # as a test that left no artifacts.
+    for ext in out.bad full dmesg; do
+      while IFS= read -r f; do
+        [ -s "${f}" ] || continue
+        echo "  [${f#"${XFSTESTS_DIR}/"}, last 40 lines]:"
+        tail -n 40 "${f}" | sed "s/^/    /"
+      done < <(find "${XFSTESTS_DIR}/results" -type f -path "*/${tt}.${ext}" 2>/dev/null)
+    done
+    echo "--- end [${tt}] failure diagnosis ---"
+  fi
 done
 
 ran=$((pass+fail))

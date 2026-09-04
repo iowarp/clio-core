@@ -79,16 +79,11 @@ requirements:
     # - google-cloud-cpp
     - pyyaml
     - msgpack-python
-    - flask
 
 test:
   commands:
     - test -f $PREFIX/lib/libclio_run_cxx.so    # [linux]
     - test -f $PREFIX/lib/libclio_run_cxx.dylib  # [osx]
-    # The context visualizer ships as a standard feature: its package must be
-    # importable and the `context-visualizer` launcher must be on PATH.
-    - python -c "import context_visualizer"
-    - context-visualizer --help
 
 about:
   home: https://www.iowarp.ai

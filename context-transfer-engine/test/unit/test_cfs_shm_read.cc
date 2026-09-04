@@ -688,4 +688,195 @@ TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
   cfs_io->RemovePath(path);
 }
 
+// The SEQUENTIAL half of the descriptor layer: ReadFd / SeekFd / TellFd.
+//
+// The cases above drive the POSITIONAL calls (PreadFd/PwriteFd) and the
+// whole-file ones (SizeFd/SyncFd/FtruncateFd), but nothing reached these three
+// -- and per-descriptor offset state is the ONLY thing that distinguishes them
+// from their positional counterparts, so it was the one part of the layer with
+// no coverage at all. It is also the part that just stopped being POSIX-only:
+// the descriptor layer used to be `#if !defined(_WIN32)`'d out entirely, and
+// now compiles everywhere, which makes an untested offset contract a portable
+// untested offset contract.
+//
+// Every assertion below is about the offset, not the bytes: reads are checked
+// against a position-dependent pattern so a read from the WRONG offset fails
+// on content rather than merely on length.
+TEST_CASE("clio-fs descriptor layer: sequential read, seek, tell",
+          "[cfs][fd][noleak]") {
+  REQUIRE(InitRuntime());
+  auto *cfs_io = CLIO_CFS_CLIENT;
+  REQUIRE(cfs_io != nullptr);
+
+  const std::string path = "clio::/tmp/clio_cfs_seq_io.dat";
+  cfs_io->RemovePath(path);
+
+  // Byte i is a function of i, so any off-by-offset read is detectable.
+  const size_t kSize = 8192;
+  const size_t kChunk = 1024;
+  std::vector<char> src(kSize);
+  for (size_t i = 0; i < kSize; ++i) {
+    src[i] = static_cast<char>((i * 17 + 3) % 251);
+  }
+
+  int fd = cfs_io->OpenFd(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  REQUIRE(fd >= 0);
+  REQUIRE(cfs_io->PwriteFd(fd, src.data(), kSize, 0) ==
+          static_cast<ssize_t>(kSize));
+  REQUIRE(cfs_io->SyncFd(fd) == 0);
+
+  std::vector<char> got(kChunk);
+
+  SECTION("a fresh descriptor starts at 0");
+  // PwriteFd is positional and must NOT have moved the offset.
+  REQUIRE(cfs_io->TellFd(fd) == 0);
+
+  SECTION("ReadFd advances the offset by exactly what it returned");
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data(), kChunk) == 0);
+  REQUIRE(cfs_io->TellFd(fd) == static_cast<off_t>(kChunk));
+
+  // The second read must continue where the first stopped rather than
+  // re-reading from 0 -- the defining property of a sequential read.
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + kChunk, kChunk) == 0);
+  REQUIRE(cfs_io->TellFd(fd) == static_cast<off_t>(2 * kChunk));
+
+  SECTION("SEEK_SET is absolute");
+  REQUIRE(cfs_io->SeekFd(fd, 4096, SEEK_SET) == 4096);
+  REQUIRE(cfs_io->TellFd(fd) == 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + 4096, kChunk) == 0);
+
+  SECTION("SEEK_CUR is relative to the current offset");
+  // Now at 4096+kChunk. Rewind one chunk and re-read the same bytes.
+  REQUIRE(cfs_io->SeekFd(fd, -static_cast<off_t>(kChunk), SEEK_CUR) == 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + 4096, kChunk) == 0);
+  // A zero-offset SEEK_CUR is the documented way to ask "where am I?", and
+  // must agree with TellFd.
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_CUR) == cfs_io->TellFd(fd));
+
+  SECTION("SEEK_END resolves against the real size, deferred writes included");
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_END) == static_cast<off_t>(kSize));
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_END) == cfs_io->SizeFd(fd));
+  // At EOF a read returns 0, not an error.
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == 0);
+  // A negative SEEK_END lands inside the file.
+  REQUIRE(cfs_io->SeekFd(fd, -static_cast<off_t>(kChunk), SEEK_END) ==
+          static_cast<off_t>(kSize - kChunk));
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + kSize - kChunk, kChunk) == 0);
+
+  SECTION("seeking before byte 0 fails and leaves the offset alone");
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_SET) == 0);
+  errno = 0;
+  REQUIRE(cfs_io->SeekFd(fd, -1, SEEK_SET) == -1);
+  REQUIRE(errno == EINVAL);
+  REQUIRE(cfs_io->TellFd(fd) == 0);
+
+  SECTION("an unknown whence is rejected");
+  errno = 0;
+  REQUIRE(cfs_io->SeekFd(fd, 0, 0x7fff) == -1);
+  REQUIRE(errno == EINVAL);
+
+  SECTION("a seek past EOF is legal; reading there returns 0");
+  REQUIRE(cfs_io->SeekFd(fd, static_cast<off_t>(kSize) + 4096, SEEK_SET) ==
+          static_cast<off_t>(kSize) + 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == 0);
+
+  SECTION("every offset call rejects a descriptor we never issued");
+  REQUIRE(cfs_io->CloseFd(fd) == 0);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == -1);
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_SET) == -1);
+  REQUIRE(cfs_io->TellFd(fd) == -1);
+
+  cfs_io->RemovePath(path);
+}
+
+// A sparse file must be served BY the fast path, not around it.
+//
+// Before GetResidency, one absent page anywhere in a request sent the ENTIRE
+// request to the RPC path: a miss in the SHM mirror could not distinguish "no
+// such bytes" from "bytes exist but are not reachable from here", and only the
+// first can be answered with zeros. So a file with any hole in it lost the fast
+// path for every read touching the hole, however much of the rest was resident.
+//
+// This asserts both halves: that the bytes are right, and that they came from
+// the fast path. Checking only the bytes would pass just as happily against the
+// old fall-back-to-RPC behaviour, which is also correct -- the hole counter is
+// what separates "still correct" from "correct AND not paying a round trip".
+TEST_CASE("clio-fs SHM read serves holes in a sparse file",
+          "[cfs][shm][residency][noleak]") {
+  REQUIRE(InitRuntime());
+  auto *cfs_io = CLIO_CFS_CLIENT;
+  REQUIRE(cfs_io != nullptr);
+
+  if (CLIO_CPU_IPC == nullptr ||
+      CLIO_CPU_IPC->GetMetadataAllocator() == nullptr) {
+    std::printf("[residency] SKIP: no metadata SHM segment on this platform\n");
+    return;
+  }
+
+  const std::string path = "clio::/tmp/clio_cfs_sparse_test.bin";
+  const size_t kPage = static_cast<size_t>(clio::cte::filesystem::kFsPageSize);
+  cfs_io->RemovePath(path);
+
+  // Two FULL pages, three pages apart. Whole pages on purpose: a partially
+  // written page leaves a blob that EXISTS but is short, which is a different
+  // case (present-but-not-covering) and correctly still takes the RPC path.
+  // Pages 1 and 2 have no blob at all, which is the hole this is about.
+  std::vector<char> page(kPage);
+  for (size_t i = 0; i < kPage; ++i) {
+    page[i] = static_cast<char>((i * 17 + 3) % 251);
+  }
+  int fd = cfs_io->OpenFd(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  REQUIRE(fd >= 0);
+  REQUIRE(cfs_io->PwriteFd(fd, page.data(), kPage, 0) ==
+          static_cast<ssize_t>(kPage));
+  REQUIRE(cfs_io->PwriteFd(fd, page.data(), kPage,
+                           static_cast<off_t>(3 * kPage)) ==
+          static_cast<ssize_t>(kPage));
+  cfs_io->CloseFd(fd);
+  cfs_io->Flush(path);
+
+  fd = cfs_io->OpenFd(path, O_RDONLY, 0644);
+  REQUIRE(fd >= 0);
+
+  const clio::run::u64 holes_before =
+      clio::cte::filesystem::Client::ShmReadHoles().load(
+          std::memory_order_relaxed);
+
+  std::vector<char> got(4 * kPage, '\xAA');
+  const ssize_t nr = cfs_io->PreadFd(fd, got.data(), 4 * kPage, 0);
+  REQUIRE(nr == static_cast<ssize_t>(4 * kPage));
+
+  // Written pages come back verbatim; the gap reads as zeros, which is what
+  // POSIX says an unwritten region inside a file contains.
+  REQUIRE(std::memcmp(got.data(), page.data(), kPage) == 0);
+  REQUIRE(std::memcmp(got.data() + 3 * kPage, page.data(), kPage) == 0);
+  for (size_t i = kPage; i < 3 * kPage; ++i) {
+    if (got[i] != 0) {
+      FAIL("hole byte at offset " << i << " is " << static_cast<int>(got[i])
+                                  << ", expected 0");
+      break;
+    }
+  }
+
+  const clio::run::u64 holes_after =
+      clio::cte::filesystem::Client::ShmReadHoles().load(
+          std::memory_order_relaxed);
+  REQUIRE(holes_after > holes_before);
+  std::printf("[residency] holes served from the fast path: %llu\n",
+              static_cast<unsigned long long>(holes_after - holes_before));
+
+  cfs_io->CloseFd(fd);
+  cfs_io->RemovePath(path);
+}
+
 SIMPLE_TEST_MAIN()

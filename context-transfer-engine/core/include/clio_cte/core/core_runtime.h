@@ -48,7 +48,6 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/data_organizer/data_organizer.h>
 #include <clio_cte/core/shm_metadata_cache.h>
-#include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
 #include <clio_ctp/search/regex_search_engine.h>
 
@@ -97,6 +96,15 @@ public:
    * Monitor container state (Method::kMonitor)
    */
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
+
+  /**
+   * Register the CTE dashboard page's endpoints (issue #990): the pool index,
+   * the target roster, register/unregister-target actions, and the create
+   * form. The page ships in this module's viz/ directory. Defined in
+   * core_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
 
   /**
    * Destroy the container (Method::kDestroy)
@@ -429,6 +437,7 @@ private:
   /** Project a BlobInfo into its cacheable form. Returns false when the blob
    *  cannot be represented (too many blocks), in which case it is not
    *  cached and clients keep using the RPC path for it. */
+  void MirrorTagShm(const TagId &tag_id, const TagInfo &info);
   bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
 
   /** Mirror one blob into the SHM cache. No-op when caching is off. */
@@ -480,70 +489,6 @@ private:
 
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;
-
-  // -----------------------------------------------------------------
-  // GPU metadata cache (optional; populated when
-  // config_.gpu_metadata_cache_.enabled_ is true).
-  //
-  // Owned by the CTE Core server. The header pointer addresses
-  // GPU-managed USM (sycl::malloc_shared on SYCL, cudaMallocManaged on
-  // CUDA). All mutations go through GpuCache* helpers below, which are
-  // the ONLY places that touch this state from PutBlob / GetOrCreateTag /
-  // DelBlob / DelTag.
-  // -----------------------------------------------------------------
-  GpuMetadataCacheHeader *gpu_cache_ = nullptr;
-  size_t gpu_cache_bytes_ = 0;
-
-  /**
-   * Allocate and initialize the GPU metadata cache region. No-op if
-   * the feature is disabled or no GPU backend is built in. Sets
-   * gpu_cache_ / gpu_cache_bytes_ on success.
-   *
-   * @return true on success (or feature-disabled), false on allocation
-   *         failure.
-   */
-  bool GpuCacheCreate();
-
-  /** Free the GPU metadata cache region. Safe to call when disabled. */
-  void GpuCacheDestroy();
-
-  /**
-   * Add or update a blob entry in the cache. Called from PutBlob right
-   * after the blob has been placed. Resolves the bdev_type of the
-   * blob's first block via registered_targets_ + storage_devices_,
-   * and either projects the blob into the cache (DRAM-tier targets) or
-   * removes any stale projection (file/noop targets).
-   *
-   * The PutBlob call site stays a single line; all bdev-type lookup
-   * logic lives here.
-   */
-  void GpuCacheOnPutBlob(const TagId &tag_id, const std::string &blob_name,
-                         const BlobInfo &blob_info);
-
-  /**
-   * Resolve the bdev_type string ("ram", "hbm", "pinned", "file", "noop",
-   * "") for a blob given its BlobInfo. Returns an empty string when
-   * registered_targets_ has no entry for the first block's pool id.
-   *
-   * Caller must hold no locks (this acquires target_lock_ for read).
-   */
-  std::string GetBdevTypeForBlob(const BlobInfo &blob_info);
-
-  /** Remove a blob entry. Called from DelBlob. */
-  void GpuCacheOnDelBlob(const TagId &tag_id, const std::string &blob_name);
-
-  /** Add (or refresh) a tag entry. Called from GetOrCreateTag. */
-  void GpuCacheOnGetOrCreateTag(const TagId &tag_id,
-                                const std::string &tag_name);
-
-  /** Remove a tag entry and cascade-remove all blob entries owning it. */
-  void GpuCacheOnDelTag(const TagId &tag_id);
-
-  /**
-   * Read-only accessor (host-side) for tests / diagnostics. Returns
-   * the cache header pointer if enabled, else nullptr.
-   */
-  GpuMetadataCacheHeader *GetGpuCache() const { return gpu_cache_; }
 
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
@@ -694,11 +639,46 @@ private:
    * @param blob_score Score for target selection
    * @param error_code Output: 0 for success, non-zero for failure
    * @param min_persistence_level Minimum persistence level for target filtering
+   * @param shortfall Optional output: on a placement failure (error_code 1-3),
+   *                  the bytes that could not be placed; 0 on success.
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
                              int min_persistence_level = 0,
-                             clio::run::u64 preallocate = 0);
+                             clio::run::u64 preallocate = 0,
+                             clio::run::u64 *shortfall = nullptr);
+
+  /**
+   * One placement attempt for a put: grow-to-cover (ExtendBlob) or
+   * wholesale-replace (ResizeBlob), chosen by kCtePutReplace in put_flags.
+   * Shared by the initial attempt and the retry, which must issue an identical
+   * call.
+   * @param error_code Output: 0 on success, allocator code otherwise
+   * @param shortfall Output: bytes that could not be placed (see ExtendBlob)
+   */
+  clio::run::TaskResume PlaceBlobBytesOnce(BlobInfo &blob_info,
+                                     clio::run::u32 put_flags,
+                                     clio::run::u64 offset, clio::run::u64 size,
+                                     float blob_score,
+                                     int min_persistence_level,
+                                     clio::run::u64 preallocate,
+                                     clio::run::u32 &error_code,
+                                     clio::run::u64 &shortfall);
+
+  /**
+   * Place a put's bytes, making room once if the tier is full.
+   *
+   * On a capacity failure for an expendable put (kCtePutDroppable), reclaims
+   * the shortfall from other expendable blobs and retries once. Any other
+   * failure is returned as-is.
+   * @param error_code Output: 0 on success, allocator code otherwise
+   */
+  clio::run::TaskResume PlaceBlobBytes(BlobInfo &blob_info,
+                                 clio::run::u32 put_flags,
+                                 clio::run::u64 offset, clio::run::u64 size,
+                                 float blob_score, int min_persistence_level,
+                                 clio::run::u64 preallocate,
+                                 clio::run::u32 &error_code);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via
@@ -710,10 +690,12 @@ private:
    * @param blob_score Score for target selection on grow
    * @param error_code Output: 0 for success, non-zero for failure
    * @param min_persistence_level Minimum persistence level for target filtering
+   * @param shortfall Optional output: see ExtendBlob.
    */
   clio::run::TaskResume ResizeBlob(BlobInfo &blob_info, clio::run::u64 new_size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 *shortfall = nullptr);
 
   /**
    * Write data to existing blob blocks
@@ -834,6 +816,11 @@ private:
    * @param rctx Runtime context for task execution
    */
   clio::run::TaskResume GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask> &task);
+
+  /** Residency: is this byte range physically present in the tier?
+   *  See GetResidencyTask for why only the tier can answer this. */
+  clio::run::TaskResume GetResidency(
+      clio::run::shared_ptr<GetResidencyTask> &task);
 
   /**
    * Get contained blobs operation - returns all blob names in a tag

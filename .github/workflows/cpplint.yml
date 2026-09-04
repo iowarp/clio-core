@@ -7,9 +7,20 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
 jobs:
   cpplint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v6
     - run: pipx run cpplint --recursive .
+    # Deliberately here and not in cluster-tests.yml. Cluster Tests is gated on
+    # `event_name != pull_request`, so a PR that introduces a colliding subnet
+    # would not be checked until after it merged -- which is the whole reason
+    # the 172.30.0.0/24 pile-up survived. cpplint runs on every PR, costs
+    # seconds, and needs no docker.
+    - name: Integration compose subnets are unique
+      run: bash CI/check_compose_subnets.sh

@@ -114,6 +114,41 @@ bool MemBdevTransport::Init(const CreateParams& params,
       break;
   }
 
+  // Eager preallocation commits REAL memory: PreallocateRamPages() allocates
+  // and zeroes every kRamPageSize page, so a DRAM-derived capacity asks the
+  // node to commit ~all of its RAM before the first write ever lands.
+  //
+  // The unsized-pool degradation above cannot catch that, because CTE resolves
+  // `capacity_limit: "0g"` to DefaultRamCapacityBytes() (80% of
+  // GetRamCapacity()) BEFORE the bdev sees it (core_config.cc, "0g" handling).
+  // total_size_ is then non-zero, so the pool looks explicitly sized and the
+  // guard passes it straight through.
+  //
+  // Apply the same half-budget clamp ipc_manager uses for the main/metadata
+  // segments (ServerInitShm): past that point the live set can only end in
+  // thrash, SIGBUS or OOM, so degrade to lazy rather than boot a time bomb.
+  // Lazy is safe here because EnsureRamPage() allocates on demand and
+  // AllocRamPage() zeroes what it hands back; capacity_limit stays a cap for
+  // placement either way, only the up-front commit changes.
+  //
+  // Measured on a 15.9 GiB win-10 host: GetRamCapacity() reported 20 GiB, so
+  // "0g" resolved to 16 GiB and this committed 16 x 1 GiB pages on the private
+  // heap (the SHM mapping having already failed with "MapViewOfFile: Access is
+  // denied" at that size). That wedged the worker inside Create and timed out
+  // 8 CAE/CTE tests at 300 s apiece, while Linux CI stayed green because its
+  // memfd mapping is sparse and never falls back to the heap.
+  if (preallocate) {
+    const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+    if (budget > 0 && static_cast<size_t>(ram_capacity_) > budget / 2) {
+      HLOG(kWarning,
+           "bdev: capacity {} bytes exceeds half the memory budget ({} bytes); "
+           "preallocating it would commit more memory than this host can hold, "
+           "so pages will be allocated lazily instead",
+           ram_capacity_, budget);
+      preallocate = false;
+    }
+  }
+
   if (preallocate) {
     PreallocateRamPages();
   }
@@ -208,15 +243,12 @@ void MemBdevTransport::PreallocateRamPages() {
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   ram_pages_.resize(num_pages);
   for (RamPage &page : ram_pages_) {
+    // AllocRamPage() zeroes each page it allocates, which is both the
+    // pre-fault and the read-as-zero guarantee: pageable pages are otherwise
+    // faulted in 4 KiB at a time by the first write inside the I/O path, and a
+    // GPU D2H into never-touched pageable memory is the slowest copy the
+    // driver offers. Zeroing here as well would just write every page twice.
     AllocRamPage(page);
-    if (page.data == nullptr) continue;
-    // Pre-fault (pageable) / zero (both). Pageable pages are otherwise faulted
-    // in 4 KiB at a time by the first write, inside the I/O path; a GPU D2H into
-    // never-touched pageable memory is the slowest copy the driver offers. The
-    // zeroing also preserves the read semantics below: a region that was never
-    // written must read back as zeros, and a preallocated page can no longer be
-    // detected by a null pointer.
-    memset(page.data, 0, kRamPageSize);
   }
 }
 
@@ -321,6 +353,15 @@ char* MemBdevTransport::AllocRamPage(RamPage &page) {
   if (page.data == nullptr) {
     page.data = new char[kRamPageSize];
     page.pinned = false;
+  }
+  // Zero every page we hand back. A region that was never written must read
+  // back as zeros, and neither `new char[]` nor MallocHost guarantees that.
+  // PreallocateRamPages() used to be the only thing zeroing these, so a page
+  // allocated on the I/O path could expose heap garbage for whatever parts of
+  // it nobody had written yet — already reachable for an unsized pool, and now
+  // for any pool whose eager preallocation the half-budget clamp degraded.
+  if (page.data != nullptr) {
+    std::memset(page.data, 0, kRamPageSize);
   }
   return page.data;
 }

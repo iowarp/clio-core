@@ -12,6 +12,13 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -36,6 +43,7 @@ jobs:
   # default arch for contributors, and where cr_cli_cfs_rename surfaced.
   matrix-tier:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       os: ${{ steps.pick.outputs.os }}
     steps:
@@ -128,7 +136,7 @@ jobs:
           # -T Test writes the dashboard XML once for the CDash step. Retry
           # intermittently-flaky in-process-runtime tests up to 3x (#482/#485).
           ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
-            -LE "integration|restart|functional|query|stress|docker" \
+            -LE "integration|restart|functional|query|stress|docker|flaky" \
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
 
       - name: Submit results to CDash
@@ -224,4 +232,10 @@ jobs:
           # #619's fallback-runtime punting has no macOS support yet (#634);
           # those cases are excluded until it lands.
           ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 \
-            -LE "ollama" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
+            -LE "ollama|flaky" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
+      - name: Report retried-but-passed tests
+        if: always()
+        shell: bash
+        # A green check must not mean "some test failed and we retried until it
+        # did not" (#919/#921). Reports only -- never fails the job.
+        run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "macos boost ${{ matrix.os }}"

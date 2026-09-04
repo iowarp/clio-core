@@ -232,6 +232,15 @@ class SystemInfo {
 
   CTP_DLL static void DestroySharedMemory(const std::string &name);
 
+  /** Why the last CreateNewSharedMemory/OpenSharedMemory call failed.
+   *
+   *  Callers used to report this as strerror(errno), which is right on POSIX
+   *  and meaningless on Windows: the Win32 shared-memory calls do not set
+   *  errno, so a commit-limit failure (ERROR_COMMITMENT_LIMIT) was reported as
+   *  whatever errno happened to hold -- in practice "Resource temporarily
+   *  unavailable", which points at the wrong problem entirely. */
+  CTP_DLL static std::string GetLastSharedMemoryError();
+
   CTP_DLL static void *MapPrivateMemory(size_t size);
 
   CTP_DLL static void *MapSharedMemory(const File &fd, size_t size, i64 off);

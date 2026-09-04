@@ -21,6 +21,9 @@ name: Docker Distributed Stop Test
 on:
   push:
     branches: [main, dev]
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
   workflow_dispatch:
 
 concurrency:

@@ -49,6 +49,24 @@ target_link_libraries(clio_cte_vfd_no_runtime_tests
     ${HDF5_LIBRARIES}
 )
 
+if(WIN32)
+    foreach(_vfd_test clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests)
+        # Same reason the driver needs it: HDF5's public globals (H5T_NATIVE_*_g,
+        # H5P_CLS_*_g) are H5_DLLVAR, which only becomes __declspec(dllimport)
+        # once the consumer defines this. Functions link either way, so the
+        # failure shows up as LNK2019 on the type/class ids alone.
+        if(NOT HDF5_USE_STATIC_LIBRARIES)
+            target_compile_definitions(${_vfd_test} PRIVATE H5_BUILT_AS_DYNAMIC_LIB)
+        endif()
+        # The Win32 half of the driver's platform layer. The tests call the same
+        # clio_vfd_* shims the driver does (flock/pread have no MSVC spelling),
+        # and these are internal glue rather than driver API -- so compile the TU
+        # in here rather than widening clio_vfd's exported surface for tests.
+        target_sources(${_vfd_test} PRIVATE
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/vfd/H5FDclio_compat_win.cc)
+    endforeach()
+endif()
+
 install(
     TARGETS clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests
     RUNTIME DESTINATION bin
@@ -65,7 +83,15 @@ if(CLIO_CORE_ENABLE_TESTS)
         # see the VOL I/O suite's note.
         ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
         RESOURCE_LOCK "clio_runtime"
-        TIMEOUT 120
+        # 300 rather than 120, matching the other runtime-based suites here.
+        # Warm, this binary runs in ~15s; the first run after a reboot took over
+        # 120s and was cut off mid-suite while still making steady progress
+        # (cold page-faulting of the runtime's shm segments, plus a virus
+        # scanner meeting freshly linked binaries). A timeout that fires on a
+        # healthy run reports as a failure with no failing assertion, which is
+        # the least actionable signal available -- the ceiling wants to be high
+        # enough that TIMEOUT here means genuinely stuck.
+        TIMEOUT 300
         LABELS "msan_skip")
 
     # No runtime, no fixtures, no resource lock -- the point is that this one

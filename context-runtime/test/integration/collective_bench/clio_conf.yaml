@@ -1,0 +1,34 @@
+---
+# 4-node cluster config for the collective latency benchmark.
+#
+# neighborhood_size 4 puts all four nodes in one neighborhood, so every
+# AllToOne task routes to the SAME leader and the barrier counts all four
+# containers. A smaller neighborhood would split the collective across two
+# leaders, and neither group's count could ever reach the pool's container
+# count -- the barrier would simply never release. Node ids are 0-based, so
+# the window [0,4) covers all four.
+#
+# No `compose:` section: the benchmark's rank 0 creates the MOD_NAME pool
+# itself (pool 9100.0), which gives it one container per node -- exactly the
+# membership the AllToOne barrier waits for.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 1GB
+  runtime_data_segment_size: 1GB
+
+networking:
+  port: 9413
+  neighborhood_size: 4
+  hostfile: /workspace/context-runtime/test/integration/collective_bench/hostfile
+
+logging:
+  level: error
+  file: /tmp/clio.log
+
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50
+  heartbeat_interval: 1000

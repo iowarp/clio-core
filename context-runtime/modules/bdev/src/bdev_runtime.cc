@@ -10,6 +10,8 @@
 #include <clio_runtime/worker.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_runtime/pool_manager.h>
+#include <clio_runtime/viz/viz_json.h>
 
 #include <algorithm>
 #include <cctype>
@@ -146,11 +148,11 @@ void Runtime::LoadPerfStats() {
   }
   perf_metrics_ = m;
   // Seed the learned wall-clock model so InferWallClockTime (which GetStats
-  // derives its bandwidth from) starts warm instead of at the 1.0 seed.
-  // SetMethodWallCoef writes through to the pool's model owner (the static
-  // container) — writing method_model_wall_ directly would land on this
-  // container's own now-unused table and the seed would be invisible to both
-  // inference and the monitor (issue #956).
+  // derives its bandwidth from) starts warm instead of at the 1.0 seed. The
+  // model is per container (issue #994), so this seeds exactly the table this
+  // bdev's own tasks are scheduled and reinforced against — a second bdev
+  // container on the node (recovered from a peer, backing another device)
+  // keeps its own profile.
   if (wall_read > 0.0f) {
     SetMethodWallCoef(Method::kRead, wall_read);
   }
@@ -538,6 +540,213 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 }
 
 void Runtime::PostGpuContainerCreate() {}
+
+namespace {
+
+/** The bdev types the dashboard offers, in form order. S3/GCS are omitted: they
+ *  need credentials and endpoint state a one-line form cannot express. */
+const std::pair<const char *, BdevType> kVizBdevTypes[] = {
+    {"ram", BdevType::kRam},       {"file", BdevType::kFile},
+    {"hbm", BdevType::kHbm},       {"pinned", BdevType::kPinned},
+    {"noop", BdevType::kNoop},
+};
+
+/** @return true and set @p out if @p name is an offered bdev type. */
+bool ParseVizBdevType(const std::string &name, BdevType *out) {
+  for (const auto &kv : kVizBdevTypes) {
+    if (name == kv.first) {
+      *out = kv.second;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Validate the create form's fields, writing per-field messages into @p errors.
+ * Shared by action=validate and the create itself, so the two can never
+ * disagree about what is acceptable.
+ * @return number of errors found (0 = valid; outputs are then set)
+ */
+size_t ValidateBdevCreate(const clio::run::viz::Request &req,
+                          clio::run::viz::JsonWriter &errors,
+                          std::string *pool_name, clio::run::PoolId *pool_id,
+                          BdevType *bdev_type, clio::run::u64 *capacity) {
+  size_t count = 0;
+  auto fail = [&errors, &count](const std::string &field,
+                                const std::string &message) {
+    errors.Field(field, message);
+    ++count;
+  };
+
+  *pool_name = req.Param("pool_name");
+  if (pool_name->empty()) {
+    fail("pool_name", "required (\"ram::name\" or a filesystem path)");
+  }
+
+  const std::string id_str = req.Param("pool_id");
+  if (id_str.empty()) {
+    fail("pool_id", "required");
+  } else {
+    try {
+      *pool_id = clio::run::PoolId::FromString(id_str);
+      if (pool_id->IsNull()) {
+        fail("pool_id", "must not be null");
+      }
+    } catch (const std::exception &e) {
+      fail("pool_id", std::string("unparseable: ") + e.what());
+    }
+  }
+
+  const std::string type_str = req.Param("bdev_type", "ram");
+  if (!ParseVizBdevType(type_str, bdev_type)) {
+    fail("bdev_type", "unknown type '" + type_str + "'");
+  }
+
+  const std::string cap_str = req.Param("capacity", "0");
+  if (!clio::run::viz::ParseSizeField(cap_str, capacity)) {
+    fail("capacity", "unparseable size '" + cap_str + "' (e.g. \"16MB\")");
+  } else if (count == 0 && *capacity == 0 && *bdev_type != BdevType::kNoop) {
+    fail("capacity", "must be > 0");
+  }
+  return count;
+}
+
+}  // namespace
+
+void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
+                          const std::string &mod_name) {
+  // Node-local read only: the pool table is already in this process, so the
+  // page's index costs no task. Runs on an HTTP thread, so it takes the pool
+  // manager's own read lock and touches nothing else.
+  viz.AddRoute(
+      {"GET", "/api/mod/" + mod_name + "/pools", mod_name,
+       "Block-device pools on this node",
+       [mod_name](const clio::run::viz::Request &,
+                  clio::run::viz::Response &resp) {
+         auto *pool_manager = CLIO_POOL_MANAGER;
+         if (!pool_manager) {
+           resp.Error(503, "pool manager unavailable");
+           return;
+         }
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Key("pools").BeginArray();
+         for (const auto &pid : pool_manager->GetAllPoolIds()) {
+           const auto *info = pool_manager->GetPoolInfo(pid);
+           if (!info || info->chimod_name_ != mod_name) {
+             continue;
+           }
+           w.BeginObject();
+           w.Field("pool_id", pid.ToString());
+           w.Field("pool_name", info->pool_name_);
+           w.EndObject();
+         }
+         w.EndArray();
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
+  // ---- Create form (the dashboard's "Add Pool" convention) ----------------
+  // GET answers a form spec the admin's Pools page renders; POST validates the
+  // submitted fields (action=validate) or creates the pool. The module owns
+  // both, so what the form accepts and what Create accepts is one code path.
+  viz.AddRoute(
+      {"GET", "/api/mod/" + mod_name + "/create", mod_name,
+       "Form spec for creating a block-device pool",
+       [mod_name](const clio::run::viz::Request &,
+                  clio::run::viz::Response &resp) {
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Field("mod_name", mod_name);
+         w.Field("title", "Block device");
+         w.Key("fields").BeginArray();
+         w.BeginObject();
+         w.Field("name", "pool_name").Field("label", "Pool name");
+         w.Field("type", "text").Field("required", true);
+         w.Field("placeholder", "ram::my_bdev");
+         w.Field("help",
+                 "\"ram::<name>\" for DRAM, or a filesystem path for a "
+                 "file-backed device");
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "pool_id").Field("label", "Pool ID");
+         w.Field("type", "text").Field("required", true);
+         w.Field("default",
+                 std::to_string(clio::run::viz::SuggestFreePoolMajor(800)) +
+                     ".0");
+         w.Field("help", "major.minor; prefilled with a free id");
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "bdev_type").Field("label", "Type");
+         w.Field("type", "select").Field("default", "ram");
+         w.Key("options").BeginArray();
+         for (const auto &kv : kVizBdevTypes) {
+           w.Value(kv.first);
+         }
+         w.EndArray();
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "capacity").Field("label", "Capacity");
+         w.Field("type", "text").Field("default", "1GB");
+         w.Field("help", "size with units: 64MB, 1GB, ...");
+         w.EndObject();
+         w.EndArray();
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
+  viz.AddRoute(
+      {"POST", "/api/mod/" + mod_name + "/create", mod_name,
+       "Validate (action=validate) or create a block-device pool",
+       [](const clio::run::viz::Request &req, clio::run::viz::Response &resp) {
+         std::string pool_name;
+         clio::run::PoolId pool_id;
+         BdevType bdev_type = BdevType::kRam;
+         clio::run::u64 capacity = 0;
+         clio::run::viz::JsonWriter errors;
+         errors.BeginObject();
+         const size_t error_count = ValidateBdevCreate(
+             req, errors, &pool_name, &pool_id, &bdev_type, &capacity);
+         errors.EndObject();
+         if (error_count > 0) {
+           clio::run::viz::JsonWriter w;
+           w.BeginObject();
+           w.Field("ok", false);
+           w.RawField("errors", errors.Str());
+           w.EndObject();
+           resp.status = 400;
+           resp.Json(w.Str());
+           return;
+         }
+         if (req.Param("action") == "validate") {
+           resp.Json("{\"ok\":true}");
+           return;
+         }
+         // Get-or-create semantics, like every CreateTask: an existing
+         // pool_name returns the existing pool rather than failing.
+         Client client(pool_id);
+         auto future = client.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                          pool_name, pool_id, bdev_type,
+                                          capacity);
+         if (!future.Wait(30.0f)) {
+           resp.Error(503, "bdev create timed out");
+           return;
+         }
+         if (future->return_code_ != 0) {
+           resp.Error(500, "bdev create failed with rc=" +
+                               std::to_string(future->return_code_));
+           return;
+         }
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Field("ok", true);
+         w.Field("pool_name", pool_name);
+         w.Field("pool_id", future->new_pool_id_.ToString());
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+}
 
 void Runtime::StopHealthPolling() {
   health_poll_stop_.store(true, std::memory_order_relaxed);

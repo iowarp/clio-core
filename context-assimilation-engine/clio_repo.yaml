@@ -3,6 +3,12 @@ namespace: clio::cae
 version: 1.0.0
 description: "Content Assimilation Engine (CAE) ChiMod Repository"
 
-# Module discovery - directories to scan for ChiMods
+# Module discovery - directories to scan for ChiMods.
+#
+# `summarizer` is deliberately absent: like the CTE cache / replication /
+# indexer interposers, its autogen (methods header + lib_exec dispatch) is
+# hand-maintained so every unhandled core method falls through to the pool
+# below. `clio_run repo refresh` would regenerate a plain switch with no
+# default-case forwarding and break interposition.
 modules:
   - core

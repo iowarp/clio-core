@@ -77,6 +77,18 @@ class Runtime : public clio::run::Container {
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
   void PostGpuContainerCreate() override;
+
+  /**
+   * Register the block-device dashboard page's endpoint (issue #990).
+   *
+   * The page itself lives in this module's viz/ directory and is mounted at
+   * /viz/clio_bdev automatically; this adds the one thing it cannot get from the
+   * admin's generic endpoints -- which of this node's pools are block devices.
+   * Per-device numbers then come from the generic per-pool Monitor forward,
+   * which lands in this module's own Monitor("stats") handler.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
   clio::run::TaskResume Run(clio::run::u32 method,
                       clio::run::shared_ptr<clio::run::Task> task_ptr) override;
   clio::run::u64 GetWorkRemaining() const override;

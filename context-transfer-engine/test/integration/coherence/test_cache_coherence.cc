@@ -127,6 +127,19 @@ bool Barrier(const clio::cte::core::TagId &tag_id) {
         break;
       }
       if (std::chrono::steady_clock::now() > deadline) {
+        // Name the blob we gave up on, and what the last probe actually saw.
+        // "Condition: Barrier(tag_id)" alone never said WHICH rank's blob
+        // never became visible, so every diagnosis so far has been guesswork.
+        auto last = Chain()->AsyncGetBlobSize(tag_id, name);
+        last.Wait();
+        fprintf(stderr,
+                "[BARRIER-TIMEOUT] rank=%d epoch=%d waiting_on='%s' "
+                "tag=(%u.%u) rc=%u size=%llu%c",
+                Rank(), epoch, name.c_str(),
+                (unsigned)tag_id.major_, (unsigned)tag_id.minor_,
+                (unsigned)last->GetReturnCode(),
+                (unsigned long long)last->size_, 10);
+        fflush(stderr);
         return false;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -233,6 +246,21 @@ static void SegmentedRound(const clio::cte::core::TagId &tag_id,
   std::vector<char> got(kSharedSize);
   REQUIRE(ReadFull(tag_id, blob, got.data(), kSharedSize));
   for (int w = 0; w < kNumNodes; ++w) {
+    if (!MatchesPattern(got.data() + w * kSegSize, kSegSize, w, round)) {
+      // This assertion is the FIRST failure in the suite and the real bug;
+      // every Barrier() failure afterwards is a cascade (a rank that leaves a
+      // test early desynchronises the global epoch counter, after which ranks
+      // barrier under different tag ids and deadlock). DecodePattern already
+      // exists "for failure forensics" but nothing ever printed it, so the
+      // suite only ever reported that some byte was wrong -- never WHICH
+      // writer's segment, nor what it actually held.
+      fprintf(stderr,
+              "[SEG-MISMATCH] reader_rank=%d blob='%s' round=%d bad_seg=%d "
+              "expected='w%dr%d' actual='%s'%c",
+              rank, blob.c_str(), round, w, w, round,
+              DecodePattern(got.data() + w * kSegSize, kSegSize).c_str(), 10);
+      fflush(stderr);
+    }
     REQUIRE(MatchesPattern(got.data() + w * kSegSize, kSegSize, w, round));
   }
   REQUIRE(Barrier(tag_id));

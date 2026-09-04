@@ -41,6 +41,7 @@ using pid_t = int;
 #endif
 
 #include <atomic>
+#include <exception>
 // ============================================================================
 // Coroutine backend selection.
 //   * Default: C++20 stackless coroutines (std::coroutine_handle).
@@ -742,6 +743,36 @@ class Task {
    *
    * IMPORTANT: Derived classes that override AggregateOut MUST call
    * Task::AggregateOut(replica_task) first before aggregating their own fields.
+   *
+   * THE CONTRACT (issue #915) — AggregateOut merges a REPLICA's OUT fields
+   * into THIS (origin) task, an N->1 gather. Two rules follow, and violating
+   * either corrupts a live runtime rather than merely returning bad data:
+   *
+   *   1. NEVER implement it by delegating to Copy(). Copy() is a WHOLE-TASK
+   *      assignment: it runs Task::Copy, overwriting this origin's task_id_,
+   *      pool_query_, method_, task_flags_, completer_ and task_group_ with
+   *      the REPLICA's — and the replica's task_id_ carries net_key/replica_id,
+   *      so the origin adopts a subtask's identity mid-flight while send_map_,
+   *      the replica accounting and the completion path still key off its own.
+   *      That is the `free(): invalid pointer` / SIGSEGV that killed
+   *      leader-election recovery in #856.
+   *   2. Touch OUT (and INOUT) fields ONLY, and never re-assign an shm-backed
+   *      member the CLIENT owns (a priv::string IN field, a ShmPtr payload
+   *      buffer). Doing so frees the origin's buffer through the replica's
+   *      allocator. Bulk-transferred payloads have already landed in the
+   *      origin's own buffer and must be left alone.
+   *
+   * Pick a reduction that suits each OUT field — SUM for partitioned counters,
+   * MAX for an owner-reported value that non-owners answer 0 for,
+   * first-non-empty for a diagnostic string, concatenation for a vector —
+   * and make sure a SINGLE-replica gather lands on the replica's value, since
+   * that is what almost every route actually does.
+   *
+   * Enforcement: `cr_aggregate_out_contract` lints every AggregateOut body in
+   * the tree for a Copy() call, the autogen sweep asserts the origin's identity
+   * survives a real container-dispatched aggregation for every method, and
+   * RecvOut (src/ipc/ipc_run2run.cc) checks and repairs it at run time for
+   * out-of-tree chimods.
    *
    * @param replica_task The replica task to aggregate from
    */

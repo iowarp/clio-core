@@ -49,6 +49,7 @@
 #include "clio_runtime/module_manager.h"
 #include "clio_runtime/work_orchestrator.h"
 #include "clio_runtime/admin.h"
+#include "clio_runtime/viz/viz_server.h"
 
 /**
  * Convenience macros for accessing CLIO Runtime singletons
@@ -65,6 +66,7 @@
 // CLIO_MODULE_MANAGER   - Module manager for dynamic loading
 // CLIO_WORK_ORCHESTRATOR - Work orchestrator for thread management
 // CLIO_ADMIN            - Admin ChiMod client singleton
+// CLIO_VIZ              - Node-local web dashboard server / route registry
 
 // All macros are defined in their respective header files:
 // - CLIO_RUNTIME_MANAGER defined in clio_runtime/manager.h

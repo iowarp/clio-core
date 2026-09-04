@@ -49,22 +49,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 /* HDF5 header for dynamic plugin loading */
 #include "H5FDclio.h" /* Clio file driver     */
+#include "H5FDclio_compat.h" /* POSIX/Win32 platform layer */
 #include "H5PLextern.h"
 #include "adapter/clio_config_str.h"
 #include "adapter/clio_require_runtime.h"
+#include "adapter/clio_coherence_stamp.h"
 #include "H5FDclio_trace.h"
 #include <clio_cte/filesystem/filesystem_client.h>
 #include "clio_cte/core/core_client.h"
 #include <clio_ctp/util/logging.h>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <map>
+#include <string>
+#include <vector>
 
 /* The driver identification number, initialized at runtime */
 static hid_t H5FD_CLIO_g = H5I_INVALID_HID;
@@ -79,11 +84,55 @@ static hid_t H5FDclio_err_minor_g = H5I_INVALID_HID;
 unsigned long H5FDclio_read_vector_calls_g = 0;
 unsigned long H5FDclio_write_vector_calls_g = 0;
 
+/* Observability: the largest span serviced as ONE coalesced I/O, in bytes.
+ * The coalescing window is a promise about memory -- the span sizes a scratch
+ * buffer -- and a promise nothing can see is one that rots. Single-element
+ * groups are not counted: those are serviced directly, allocate nothing, and
+ * are legitimately larger than the window. Exported (not static) so the suite
+ * can assert the window is actually enforced. */
+unsigned long H5FDclio_vec_max_span_g = 0;
+
 /* Observability: CTE cache-tier operations that FAILED. Survivable while the
  * cache is populate-only, but a dropped Pwrite is a range the cache believes
  * it holds and does not -- the stale-data hazard any read tier has to contain.
  * Exported (not static) so tests can assert on them. */
 unsigned long H5FDclio_cache_write_failures_g = 0;
+/* Reads served from the tier, and reads that fell through to the native file.
+ * Both are needed: a cache that is off and one that never hits are otherwise
+ * indistinguishable -- same bytes, same success. */
+unsigned long H5FDclio_cache_read_hits_g = 0;
+unsigned long H5FDclio_cache_read_misses_g = 0;
+/* Cached copies dropped because the file changed underneath them. Distinct
+ * from a read miss: a workload that invalidates on every open is paying to
+ * populate a cache it can never use. */
+unsigned long H5FDclio_cache_stale_invalidations_g = 0;
+
+/* Also governs the coherence stamp: coherence exists only to make the read
+ * tier safe, so with the tier off, validating and stamping is pure cost. Safe
+ * to skip -- a session that never stamps leaves none, and the next open that
+ * cares fails closed. */
+static bool H5FD__clio_read_tier_on() {
+  static const bool on = [] {
+    const char *e = getenv("CLIO_VFD_READ_TIER");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+/* An xattr on the TIER's copy, so it travels with the cached bytes and is
+   dropped with them. Never on the native file: this driver must leave the
+   authoritative image exactly as a native writer would. */
+static constexpr const char *H5FD_CLIO_STAMP_XATTR = "user.clio.coherence";
+
+/* "1:" is this connector's cache-layout version -- bump it when the CFS page
+   layout changes, so old cached bytes are invalidated. Empty when the file
+   cannot be stat'd, which callers treat as "no verdict". */
+static std::string H5FD__clio_stamp_of(const char *native_path) {
+  const std::string id = clio::adapter::stamp::FileIdentity(native_path);
+  if (id.empty()) return std::string();
+  return std::string("1:") + id;
+}
+
 unsigned long H5FDclio_cache_truncate_failures_g = 0;
 
 /* Push a driver error onto HDF5's default error stack. Callbacks still return
@@ -109,7 +158,22 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
 #define H5FD_CLIO_POSIX_CREATE_MODE_RW 0666
 #endif
 
-#define MAXADDR (((haddr_t)1 << (8 * sizeof(off_t) - 1)) - 1)
+/* Whether the CTE cache tier can be compiled at all.
+ *
+ * The tier is driven through clio::cte::filesystem::Client's descriptor API
+ * (OpenFd/PwriteFd/CloseFd/FtruncateFd/RemovePath), and that API is POSIX-only
+ * upstream -- filesystem_client.h puts it inside `#if !defined(_WIN32)`
+ * because it is specified in terms of ssize_t/off_t and POSIX descriptor
+ * semantics. Until it is ported, the Windows build is native-only: the
+ * authoritative on-disk file is written exactly as on every other platform,
+ * and the cache tier is off.
+ *
+ * This is the same degradation the driver already applies at run time when the
+ * CLIO runtime is unreachable (see H5FD__clio_cache_available below); on
+ * Windows the answer is simply known at compile time. */
+#define H5FD_CLIO_HAVE_CACHE_TIER 1
+
+#define MAXADDR (((haddr_t)1 << (8 * sizeof(clio_vfd_off_t) - 1)) - 1)
 #define SUCCEED 0
 #define FAIL (-1)
 
@@ -136,6 +200,69 @@ static size_t H5FD__clio_max_io_bytes(void) {
   return limit;
 }
 
+/*---------------------------------------------------------------------------
+ * Process-exit guard.
+ *
+ * HDF5 installs atexit(H5_term_library) the first time the library is
+ * initialized, and H5_term_library closes every file, datatype and group the
+ * application left open -- which reaches this driver's write, flush, truncate
+ * and close callbacks LONG AFTER main() has returned.
+ *
+ * The CLIO client, by contrast, is a set of process-global objects whose
+ * teardown runs as ordinary static destructors: the shared ZeroMQ context
+ * (whose destructor zmq_ctx_shutdown()s every socket, so RecvZmqClientThread
+ * exits), the deferred-write registry, the IPC manager's receive threads.
+ * Every one of those is registered LATER than HDF5's atexit handler -- the
+ * client is first constructed on the first H5Fopen, long after H5open() -- and
+ * exit handlers run last-registered-first. So by the time H5_term_library asks
+ * this driver to close a file, CLIO is already gone. Calling into it then does
+ * one of two things, both observed in the netCDF-C suite:
+ *
+ *   - SIGSEGV inside Client::DeferRegisterWrite, dereferencing the destroyed
+ *     DeferRegistry hash table (h5_test/tst_h_dimscales, at exit, after the
+ *     test itself printed "Tests successful!");
+ *   - an unkillable hang in Client::CloseFd, waiting on a future that no
+ *     surviving receive thread will ever complete (h5_test/tst_h_compounds2,
+ *     tst_h_strings2, and every ncdump shell test whose child processes never
+ *     exit).
+ *
+ * The fix is to stop calling into CLIO once teardown has begun. The guard is
+ * armed from every entry point HDF5 can reach this driver through --
+ * H5PLget_plugin_info() for the HDF5_DRIVER=clio_vfd path, H5FD_clio_init()
+ * for an application that registers the driver itself, and open() as a
+ * backstop -- all of which run AFTER H5open() has installed H5_term_library,
+ * so LIFO ordering guarantees it runs BEFORE H5_term_library: the flag is
+ * always set by the time the late callbacks arrive. Nothing is lost by
+ * skipping the tier there -- it is populate-only and
+ * best-effort, and every byte has already been written through to the
+ * authoritative native file, so the on-disk image is complete and valid either
+ * way.
+ *
+ * Not atomic on purpose: it is written once by the thread running exit
+ * handlers, at a point where the C runtime has already serialized teardown.
+ *---------------------------------------------------------------------------*/
+static bool H5FDclio_exiting_g = false;
+
+static void H5FD__clio_note_exit(void) { H5FDclio_exiting_g = true; }
+
+/* Register the guard once, from driver init. Separate from the flag so the
+ * registration cannot be duplicated by a re-register of the driver. */
+static void H5FD__clio_install_exit_guard(void) {
+  static bool installed = false;
+  if (!installed) {
+    installed = true;
+    atexit(H5FD__clio_note_exit);
+  }
+}
+
+/* True when it is still safe to call into the CTE cache tier: this file has a
+ * handle AND the process has not begun running exit handlers. Every cache-tier
+ * call site goes through this -- a call site that tests `fd >= 0` alone is the
+ * bug described above. */
+static inline bool H5FD__clio_cache_live(int fd) {
+  return fd >= 0 && !H5FDclio_exiting_g;
+}
+
 /* Attach to the CLIO runtime, at most once per process, and remember the
  * answer. Attaching to an absent runtime retries for CLIO_CLIENT_RETRY_TIMEOUT
  * seconds (60 by default), so asking per H5Fopen would make a down runtime
@@ -145,6 +272,10 @@ static size_t H5FD__clio_max_io_bytes(void) {
  * picked up for the life of the process. Files stay native-only, which is
  * correct, just unaccelerated. */
 static bool H5FD__clio_cache_available(void) {
+  /* Checked before the cached answer: a file opened while exit handlers are
+     running (HDF5 reopens nothing, but H5FD__clio_del does open a FAPL path)
+     must not attach to a client that is being torn down. */
+  if (H5FDclio_exiting_g) return false;
   static const bool available = clio::cte::core::CLIO_CTE_CLIENT_INIT();
   return available;
 }
@@ -167,6 +298,21 @@ static bool H5FD__clio_cache_env_enabled(void) {
            strcmp(v, "false") == 0 || strcmp(v, "no") == 0);
 }
 
+/* Read the CLIO_VFD_FSYNC opt-IN for the flush callback. Default off; any of
+ * "1"/"on"/"true"/"yes" turns it on for every file in the process. The mirror
+ * image of CLIO_VFD_CACHE: that one can only DISABLE what the FAPL asked for,
+ * this one can only ENABLE what the FAPL left off -- in both cases the
+ * environment moves the knob in the safe direction (fail-closed for the cache,
+ * more-durable for fsync), so neither can silently weaken an explicit choice
+ * made in code. */
+static bool H5FD__clio_fsync_env_forced(void) {
+  const char *v = getenv("CLIO_VFD_FSYNC");
+  if (!v || !*v) return false;
+  return strcmp(v, "1") == 0 || strcmp(v, "on") == 0 ||
+         strcmp(v, "true") == 0 || strcmp(v, "yes") == 0;
+}
+
+
 /* True when addr/size cannot be expressed as a POSIX file region: an undefined
  * address, an address past the driver's advertised maxaddr, or a length that
  * wraps when added to the address. sec2 performs the equivalent checks; without
@@ -185,11 +331,35 @@ extern "C" {
  * read tier makes them meaningful. */
 typedef struct H5FD_clio_fapl_t {
   hbool_t cache_enabled; /* populate the CTE cache tier (default on) */
+  hbool_t fsync_on_flush; /* fsync(2) the native file in flush (default off) */
+  size_t sieve_max;      /* vector-I/O coalescing window, bytes (0 = off) */
 } H5FD_clio_fapl_t;
 
+/* Coalescing window for vector I/O. 64 KiB matches HDF5's own default sieve
+ * buffer (H5Pset_sieve_buf_size), which is the mechanism this replaces for
+ * drivers that implement vector I/O -- see H5FD__clio_write_vector. */
+#define H5FD_CLIO_SIEVE_MAX_DEF ((size_t)(64 * 1024))
+
+/* Largest accepted coalescing window. The window bounds a scratch buffer this
+ * driver allocates per vector call, so an absurd value is not a slow
+ * configuration but an out-of-memory one -- and 1 GiB is already four orders of
+ * magnitude past the useful range (HDF5's own sieve default is 64 KiB). Having
+ * a stated maximum is also what lets every entry point reject a nonsense value
+ * with the same message instead of each one inventing its own bound. */
+#define H5FD_CLIO_SIEVE_MAX_LIM ((unsigned long long)1 << 30)
+
+/* 0 (coalescing off) through the limit above. Applied to every source of the
+ * value: the config string, and a driver-info block an application built by
+ * hand and passed to H5Pset_driver. */
+static inline bool H5FD__clio_sieve_valid(size_t v) {
+  return (unsigned long long)v <= H5FD_CLIO_SIEVE_MAX_LIM;
+}
+
 /* Default policy when a file is opened without a driver-specific FAPL
- * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on. */
-static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {/*cache_enabled*/ 1};
+ * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on, coalescing on. */
+static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
+    /*cache_enabled*/ 1, /*fsync_on_flush*/ 0,
+    /*sieve_max*/ H5FD_CLIO_SIEVE_MAX_DEF};
 
 /*
  * Apply the driver config string, if the FAPL carries one.
@@ -201,6 +371,10 @@ static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {/*cache_enabled*/ 1};
  *
  * Recognised keys:
  *   cache=0|1|on|off|true|false|yes|no   the CTE tier
+ *   fsync=0|1|on|off|true|false|yes|no   fsync(2) inside the flush callback
+ *                                        (default off; see H5FD__clio_flush)
+ *   sieve=<bytes>                        vector-I/O coalescing window
+ *                                        (0 disables; default 65536)
  *
  * An unrecognised key is an ERROR, not a shrug. A config string is something a
  * person typed, and a parser that ignores what it does not understand converts
@@ -234,9 +408,51 @@ static bool H5FD__clio_apply_config_str(hid_t fapl_id, H5FD_clio_fapl_t *fa) {
         return false;
       }
       fa->cache_enabled = on ? 1 : 0;
+    } else if (e.first == "fsync") {
+      bool on = false;
+      if (!clio::cte::adapter::ConfigParseBool(e.second, &on)) {
+        H5FD_CLIO_ERROR(("driver config: fsync='" + e.second +
+                         "' is not a boolean (use 0/1/on/off/true/false)")
+                            .c_str());
+        return false;
+      }
+      fa->fsync_on_flush = on ? 1 : 0;
+    } else if (e.first == "sieve") {
+      /* strtoull WRAPS a negative instead of rejecting it -- "-1" parses as
+         ULLONG_MAX with errno untouched, which would install a SIZE_MAX
+         window. Refuse the sign up front; detecting the wrap afterwards is not
+         possible, since ULLONG_MAX is also a legitimate spelling of a value
+         this driver would reject for being too large anyway. */
+      const std::string &sv = e.second;
+      const size_t first = sv.find_first_not_of(" \t");
+      if (first == std::string::npos || sv[first] == '-') {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
+                         "' is not a byte count (must be >= 0)")
+                            .c_str());
+        return false;
+      }
+      errno = 0;
+      char *endp = nullptr;
+      const unsigned long long v = strtoull(sv.c_str(), &endp, 0);
+      if (errno != 0 || endp == sv.c_str() || (endp && *endp != '\0')) {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
+                         "' is not a byte count")
+                            .c_str());
+        return false;
+      }
+      /* Bound before the narrowing cast: on a 32-bit size_t the cast alone
+         would silently truncate, and a window larger than the limit is
+         refused on every platform for the same reason. */
+      if (v > H5FD_CLIO_SIEVE_MAX_LIM) {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
+                         "' exceeds the maximum coalescing window (1 GiB)")
+                            .c_str());
+        return false;
+      }
+      fa->sieve_max = (size_t)v;
     } else {
       H5FD_CLIO_ERROR(("driver config: unknown key '" + e.first +
-                       "' (this driver accepts: cache)")
+                       "' (this driver accepts: cache, fsync, sieve)")
                           .c_str());
       return false;
     }
@@ -261,10 +477,23 @@ typedef struct H5FD_clio_t {
    * one path (relative vs absolute, symlink vs target, with vs without the
    * clio:: marker) must compare equal or the library opens the same file twice
    * with two independent metadata caches, which corrupts it. sec2 parity. */
-  dev_t st_dev;       /* device id of the authoritative native file */
-  ino_t st_ino;       /* inode number of the authoritative native file */
+  /* Opaque per-platform identity: dev/ino on POSIX, volume serial + file
+   * index on Windows, where st_ino is always 0. See H5FDclio_compat.h. */
+  clio_vfd_file_id_t file_id;
   clio::vfdtrace::FileTrace *trace; /* byte-altitude telemetry; null when off */
+  /* May the tier answer for this file? Decided once at open; default-refuse. */
+  bool tier_coherent;
+  /* The tier copy may be incomplete (a populate, truncate, invalidation or
+     cache close failed), so it must not be stamped. */
+  bool cache_degraded;
+  /* Identity at open, NULL if unstattable. Compared at close so a file that
+     changed underneath the session is not stamped over stale cached bytes. */
+  char *open_stamp_;
 } H5FD_clio_t;
+
+/* Was this file opened with write intent? H5F_ACC_RDWR is what open() keyed
+ * its O_RDWR/O_RDONLY choice off, so it is the same question, asked later. */
+#define H5FD_CLIO_WRITABLE(f) (((f)->flags & H5F_ACC_RDWR) != 0)
 
 /* Prototypes */
 static herr_t H5FD__clio_term(void);
@@ -360,6 +589,12 @@ static const H5FD_class_t H5FD_clio_g = {
 hid_t H5FD_clio_init(void) {
   hid_t ret_value = H5I_INVALID_HID; /* Return value */
 
+  /* The ordering argument that makes the guard work is that this atexit()
+     call follows the one H5open() already made for H5_term_library. Every
+     entry point that arms it is reached after H5open(), so arming it at all
+     of them is safe and none of them can be the one that gets missed. */
+  H5FD__clio_install_exit_guard();
+
   /* Register the driver's HDF5 error class + messages once. Without this,
    * term() unregistered a class that init() never registered, so the error
    * path was dead and failures were silent. */
@@ -425,6 +660,11 @@ static herr_t H5FD__clio_term(void) {
  */
 static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
                                  hid_t fapl_id, haddr_t maxaddr) {
+  /* Belt and braces. Whatever route selected this driver, a file open is
+     unconditionally after H5open(), so the guard is armed no later than the
+     first file that could still be open when exit handlers start running. */
+  H5FD__clio_install_exit_guard();
+
   // Argument validation, sec2 parity. Without these a NULL name dereferences in
   // HasClioPrefix below, and an out-of-range maxaddr is accepted despite the
   // class advertising MAXADDR.
@@ -465,12 +705,52 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     return nullptr;
   }
 
+  /* Validate the coalescing window HERE, after both sources have had their say.
+     The config string vets its own input, but a driver-info block does not go
+     through it at all: H5Pset_driver(fapl, id, &fa) takes whatever struct the
+     application filled in, so a value that never passed a parser can still
+     reach this point. sieve_max sizes a scratch allocation, which makes a
+     nonsense one an allocation failure rather than a slow open -- and this is
+     the single place every FAPL path converges on. Fail closed, as the config
+     string does. */
+  if (!H5FD__clio_sieve_valid(fa.sieve_max)) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("driver FAPL: the vector-I/O coalescing window "
+                    "(sieve_max) exceeds the maximum of 1 GiB");
+    return nullptr;
+  }
+
   /* Environment opt-out, applied AFTER the config string and last, so that
      CLIO_VFD_CACHE=0 can always force the tier off no matter what else asked
      for it -- the documented "either is sufficient to DISABLE" rule. Applied
      before the runtime probe below so it also skips the attach attempt (and
      therefore its retry timeout) rather than attaching and then not using it. */
   if (fa.cache_enabled && !H5FD__clio_cache_env_enabled()) {
+    fa.cache_enabled = 0;
+  }
+
+  /* Same shape, opposite direction: the environment can turn the flush-time
+     durability barrier ON for a file whose FAPL did not ask for it. */
+  if (!fa.fsync_on_flush && H5FD__clio_fsync_env_forced()) {
+    fa.fsync_on_flush = 1;
+  }
+
+  /* A read-only open has nothing to gain from the cache tier, so do not attach
+     one. The tier is write-populated and not yet served on reads:
+     H5FD__clio_do_read goes to the authoritative descriptor unconditionally,
+     and H5FD__clio_do_write -- the only writer -- cannot run on a file HDF5
+     opened without H5F_ACC_RDWR. The handle would therefore be opened, never
+     used, and closed.
+     It is not free: the attach waits on a CFS Open task here and close() waits
+     on a Close, so a read-only open/close cycle pays two blocking round trips --
+     and the open one is serviced by Runtime::Open, which for an open without
+     O_CREAT awaits a TagQuery and then a GetTagSize inside the runtime. A
+     workload that opens and closes files in a loop spends its entire time there:
+     netCDF-C's nc_test4/tst_files4 does 32768 read-only open/close cycles, i.e.
+     ~66k client round trips for a tier no byte is ever read from.
+     Decided before the H5FD__clio_cache_available() probe below so a read-only
+     open also skips the runtime attach and its retry timeout. */
+  if (fa.cache_enabled && !(H5F_ACC_RDWR & flags)) {
     fa.cache_enabled = 0;
   }
 
@@ -521,9 +801,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
 
   // The AUTHORITATIVE store is a real on-disk native HDF5 file at this exact
   // path, so standard tools (h5dump/h5ls) read it live.
+  // clio_vfd_open, not open(2): MSVC has no POSIX open, so the Windows port
+  // routes every descriptor call through the compat shims.
   std::string native_path = name;
-  int posix_fd =
-      open(native_path.c_str(), o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
+  int posix_fd = clio_vfd_open(native_path.c_str(), o_flags,
+                               H5FD_CLIO_POSIX_CREATE_MODE_RW);
   if (posix_fd < 0) {
     // Fail-closed: no authoritative file => the open fails. We do not proceed
     // with a cache-only file. Record errno on the driver error stack.
@@ -531,15 +813,88 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     return nullptr;
   }
 
-  // CTE cache handle: populated on write, not yet served on reads. Opening it
-  // is best-effort -- the authoritative native file already succeeded, so a
-  // cache-open failure must not sink the open; fd == -1 just means "no cache
-  // this session".
+  // CTE cache handle. Best-effort: the authoritative file is already open, so
+  // a cache-open failure must not sink this one -- fd == -1 just means no
+  // cache this session.
+  //
+  // O_RDWR|O_CREAT regardless of the application's flags: the tier copy is
+  // ours, and a read-only HDF5 open must still be able to create it, stamp it,
+  // and populate on a miss. O_TRUNC is preserved.
   int fd = -1;
+#if H5FD_CLIO_HAVE_CACHE_TIER
   if (fa.cache_enabled) {
-    fd = CLIO_CFS_CLIENT->OpenFd(name, o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
+    int cache_flags = (o_flags & ~O_ACCMODE) | O_RDWR | O_CREAT;
+    fd = CLIO_CFS_CLIENT->OpenFd(name, cache_flags,
+                                 H5FD_CLIO_POSIX_CREATE_MODE_RW);
     HLOG(kDebug, "");
   }
+#endif
+
+  // Coherence gate. The tier may only answer for this file if the stamp taken
+  // at its last close still describes the file as it is NOW. Anything else --
+  // mismatch, no stamp, unstattable -- means the cached copy cannot be vouched
+  // for, so it is dropped and this session starts with an empty tier.
+  //
+  // Gated on a cache handle actually existing. Every step here is a CFS RPC,
+  // and where no filesystem pool is composed those go to a pool that is not
+  // there: issuing them before knowing a handle could be had is what wedged
+  // the compat suite, whose runtime composes only bdev + cte_core. fd >= 0 is
+  // the proof that the pool answered.
+  //
+  // A truncating open skips the check: O_TRUNC already emptied the tier copy,
+  // so there is nothing left to be stale.
+  bool tier_coherent = false;
+  bool cache_degraded = false;
+#if H5FD_CLIO_HAVE_CACHE_TIER
+  if (fd >= 0 && H5FD__clio_read_tier_on()) {
+    if (o_flags & O_TRUNC) {
+      // OpenFd fires its own truncate for O_TRUNC but discards the result and
+      // still hands back a valid fd, so "the tier copy is empty" was an
+      // assumption. Do it explicitly and check: if the previous file's pages
+      // survive, marking the tier coherent would serve them.
+      if (CLIO_CFS_CLIENT->FtruncateFd(fd, 0) == 0) {
+        tier_coherent = true;
+      } else {
+        cache_degraded = true;
+      }
+    } else {
+      const std::string want = H5FD__clio_stamp_of(native_path.c_str());
+      auto got = CLIO_CFS_CLIENT->AsyncGetxattr(name, H5FD_CLIO_STAMP_XATTR);
+      got.Wait();
+      const bool have = got->GetReturnCode() == 0 && got->found_ == 1;
+      // want.empty() means the file could not be stat'd: no verdict is
+      // possible, so refuse rather than compare against nothing.
+      tier_coherent = have && !want.empty() && got->value_.str() == want;
+      if (!tier_coherent) {
+        // Drop the cached copy and take a fresh handle on the empty one. This
+        // removes only the tier's pages and xattrs -- CFS is a blob-backed
+        // namespace with no native backing, so it cannot touch the user's
+        // file.
+        //
+        // The drop is CHECKED, not assumed. If it fails the stale pages
+        // survive, and while this session is safe (it will not read them), its
+        // close must not stamp -- a stamp would tell the NEXT session that a
+        // tier still holding pre-change pages describes the file.
+        CLIO_CFS_CLIENT->CloseFd(fd);
+        const int rc = CLIO_CFS_CLIENT->RemovePath(name);
+        H5FDclio_cache_stale_invalidations_g++;
+        fd = CLIO_CFS_CLIENT->OpenFd(name,
+                                     (o_flags & ~O_ACCMODE) | O_RDWR | O_CREAT,
+                                     H5FD_CLIO_POSIX_CREATE_MODE_RW);
+        if (rc == 0 && fd >= 0) {
+          // The copy really is gone and the handle really is fresh, so the
+          // tier is empty and consistent with the file: this session may use
+          // it. Without this the session paid read-through on every miss with
+          // no possibility of a hit -- and since a file's first open never
+          // has a stamp, that was the common case.
+          tier_coherent = true;
+        } else {
+          cache_degraded = true;
+        }
+      }
+    }
+  }
+#endif
 
   /* Create the new file struct */
   H5FD_clio_t *file = (H5FD_clio_t *)calloc(1, sizeof(H5FD_clio_t));
@@ -549,10 +904,12 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     // so set it explicitly for an accurate error message.
     errno = ENOMEM;
     H5FD_CLIO_ERROR("calloc() of VFD file struct failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     return nullptr;
   }
 
@@ -563,26 +920,37 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // Identity + size from ONE fstat of the authoritative file. cmp() depends on
   // dev/ino, so a failed fstat is fail-closed: without identity the library
   // could not tell this file apart from another and might open it twice.
-  struct stat st;
-  if (fstat(posix_fd, &st) < 0) {
+  clio_vfd_file_id_t file_id;
+  clio_vfd_off_t file_size = 0;
+  if (clio_vfd_fstat(posix_fd, &file_id, &file_size) < 0) {
     H5FD_CLIO_ERROR("fstat() of authoritative native file failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     free(file);
     return nullptr;
   }
 
   /* Pack file */
   file->filename_ = strdup(name);
+  file->tier_coherent = tier_coherent;
+  file->cache_degraded = cache_degraded;
+  {
+    const std::string ident = H5FD__clio_stamp_of(native_path.c_str());
+    file->open_stamp_ = ident.empty() ? nullptr : strdup(ident.c_str());
+  }
   if (!file->filename_) {
     errno = ENOMEM;
     H5FD_CLIO_ERROR("strdup() of file name failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     free(file);
     return nullptr;
   }
@@ -590,12 +958,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   file->posix_fd = posix_fd;
   file->flags = flags;
   file->fa = fa;
-  file->st_dev = st.st_dev;
-  file->st_ino = st.st_ino;
+  file->file_id = file_id;
 
   // EOF is the authoritative on-disk size (durable across reopen/append), not a
   // session-local counter or the cache's logical size.
-  file->eof = (haddr_t)st.st_size;
+  file->eof = (haddr_t)file_size;
 
   return (H5FD_t *)file;
 } /* end H5FD__clio_open() */
@@ -622,22 +989,82 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
   // a durability barrier (no pending dirty state), and the on-disk file is a
   // complete valid native HDF5 image afterward.
   if (file->posix_fd >= 0) {
-    if (fsync(file->posix_fd) < 0) {
+    /* Only a file we could have WRITTEN has anything to persist, and asking to
+     * persist a read-only one is not portable: fsync(2) tolerates a read-only
+     * descriptor, but the Windows equivalent (_commit -> FlushFileBuffers)
+     * requires write access. The debug CRT asserts outright there ("Invalid
+     * file descriptor", ucrt commit.cpp), and the release CRT quietly returns
+     * EBADF -- which this fail-closed branch would then turn into a failed
+     * H5Fclose on a file that was never dirty. Reproduced by the no-runtime
+     * test's read-only reopen, which is the second open of the same path. */
+    if (H5FD_CLIO_WRITABLE(file) && clio_vfd_fsync(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("fsync() on close failed");
       ret_value = FAIL; /* fail-closed: a close that did not persist fails */
     }
     // close() itself can fail (EIO, and notably deferred write errors on NFS).
     // A close that reports an error has not necessarily persisted, so it is
     // fail-closed too -- the whole point of the barrier.
-    if (close(file->posix_fd) < 0) {
+    if (clio_vfd_close(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("close() of authoritative native file failed");
       ret_value = FAIL;
     }
   }
-  // Release the CTE cache handle, if this session had one.
-  if (file->fd >= 0) {
-    CLIO_CFS_CLIENT->CloseFd(file->fd);
+  // Release the CTE cache handle, if this session had one -- unless the
+  // process is already running its exit handlers, in which case the client
+  // that would service the close no longer has a receive thread and the wait
+  // never returns. The handle goes down with the process.
+  //
+  // Closed before the stamp is decided: CloseFd is the only place a deferred
+  // CFS write failure surfaces, since deferred writes report success at submit.
+#if H5FD_CLIO_HAVE_CACHE_TIER
+  const bool cache_live = H5FD__clio_cache_live(file->fd);
+  if (cache_live) {
+    if (CLIO_CFS_CLIENT->CloseFd(file->fd) != 0) {
+      file->cache_degraded = true;
+    }
     HLOG(kDebug, "");
+  }
+  file->fd = -1;
+
+  // Stamp only what this session can vouch for. Withheld when the cached copy
+  // may be incomplete (degraded), when the file moved underneath the session --
+  // stamping the new identity over a tier holding the old bytes is the exact
+  // staleness this prevents -- or when mtime is too young to discriminate a
+  // later write. Taken after the native fsync/close above, so the mtime it
+  // embeds is the one the file will keep.
+  //
+  // Skipped entirely once exit handlers are running: these are blocking CFS
+  // calls, and a client being torn down can no longer answer them.
+  if (cache_live && file->filename_ != nullptr && H5FD__clio_read_tier_on()) {
+    const std::string now = H5FD__clio_stamp_of(file->filename_);
+    const bool changed = file->open_stamp_ == nullptr || now.empty() ||
+                         now != std::string(file->open_stamp_);
+    const std::string stamp =
+        (file->cache_degraded || changed ||
+         clio::adapter::stamp::Ambiguous(file->filename_))
+            ? std::string()
+            : now;
+    if (stamp.empty()) {
+      auto rm = CLIO_CFS_CLIENT->AsyncRemovexattr(
+          std::string(file->filename_), H5FD_CLIO_STAMP_XATTR);
+      rm.Wait();
+    } else {
+      // flags 0 = create-or-replace: a file opened, closed and reopened must
+      // overwrite its own previous stamp rather than fail with EEXIST.
+      auto set = CLIO_CFS_CLIENT->AsyncSetxattr(
+          std::string(file->filename_), H5FD_CLIO_STAMP_XATTR, stamp, 0);
+      set.Wait();
+      if (set->GetReturnCode() != 0) {
+        HLOG(kWarning,
+             "clio-vfd: coherence stamp for {} failed to store (rc={}); the "
+             "cached copy will be dropped on the next open",
+             file->filename_, set->GetReturnCode());
+      }
+    }
+  }
+#endif
+  if (file->open_stamp_) {
+    free(file->open_stamp_);
   }
   if (file->filename_) {
     free(file->filename_);
@@ -667,11 +1094,7 @@ static int H5FD__clio_cmp(const H5FD_t *_f1, const H5FD_t *_f2) {
   // to any of them look like four different files, so the library could open
   // one file several times with independent metadata caches and corrupt it.
   // sec2 compares dev/ino for exactly this reason.
-  if (f1->st_dev < f2->st_dev) return -1;
-  if (f1->st_dev > f2->st_dev) return 1;
-  if (f1->st_ino < f2->st_ino) return -1;
-  if (f1->st_ino > f2->st_ino) return 1;
-  return 0;
+  return clio_vfd_cmp_file_id(&f1->file_id, &f2->file_id);
 } /* end H5FD__clio_cmp() */
 
 /*-------------------------------------------------------------------------
@@ -795,9 +1218,37 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
     H5FD_CLIO_ERROR("read region is undefined or out of range");
     return FAIL;
   }
+  // Serve from the tier only when it holds the WHOLE range and this session's
+  // coherence check passed.
+  //
+  // TryReadShmResident rather than a plain CFS read: CFS zero-fills holes and
+  // reports a full read. Right for a filesystem; wrong here, where a range the
+  // tier does not hold is not zeros but bytes living in the native file.
+  //
+  // All-or-nothing per request: splitting a read between tier and file would
+  // mean tracking which half came from where on every failure path.
+#if H5FD_CLIO_HAVE_CACHE_TIER
+  if (H5FD__clio_read_tier_on() && file->tier_coherent && file->fd >= 0 &&
+      file->filename_ != nullptr) {
+    const ssize_t served = CLIO_CFS_CLIENT->TryReadShmResident(
+        file->filename_, static_cast<clio::run::u64>(addr), buf, size);
+    if (served == static_cast<ssize_t>(size)) {
+      H5FDclio_cache_read_hits_g++;
+      if (getenv("CLIO_VFD_DEBUG"))
+        fprintf(stderr, "[vfd] READ(tier) addr=%llu size=%llu\n",
+                (unsigned long long)addr, (unsigned long long)size);
+      return SUCCEED;
+    }
+    // A SHORT read is refused too, not stitched: the tier held only part of
+    // the range, and the rest is the file's. Fall through and take it all from
+    // the file rather than track a split.
+    H5FDclio_cache_read_misses_g++;
+  }
+#endif
+
   char *dst = static_cast<char *>(buf);
   size_t remaining = size;
-  off_t off = static_cast<off_t>(addr);
+  clio_vfd_off_t off = static_cast<clio_vfd_off_t>(addr);
 
   // Loop rather than issue one pread. A short return is NOT proof of EOF: the
   // kernel caps a single transfer (0x7ffff000 on Linux) and a signal can cut
@@ -808,7 +1259,7 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
   while (remaining > 0) {
     const size_t cap = H5FD__clio_max_io_bytes();
     size_t want = (remaining > cap) ? cap : remaining;
-    ssize_t got = pread(file->posix_fd, dst, want, off);
+    clio_vfd_ssize_t got = clio_vfd_pread(file->posix_fd, dst, want, off);
     if (got < 0) {
       if (errno == EINTR) {
         continue; /* interrupted before transferring anything: retry */
@@ -824,6 +1275,24 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
     off += got;
     remaining -= static_cast<size_t>(got);
   }
+  // Populate on a miss. Not an optimisation: a writing session's own close
+  // flushes the file, so its mtime is always fresh and its stamp always
+  // withheld -- a tier filled only by writes is never stamped, and so never
+  // readable. The open either matched the stamp or dropped the copy, so what
+  // is written here came from the file as it now stands.
+#if H5FD_CLIO_HAVE_CACHE_TIER
+  if (H5FD__clio_read_tier_on() && file->fd >= 0) {
+    if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size,
+                                  static_cast<off_t>(addr)) < 0) {
+      H5FDclio_cache_write_failures_g++;
+      // A populate that failed leaves a hole the tier does not know about, so
+      // this copy can no longer be vouched for as a whole. Counting it is not
+      // enough: without latching, close would still stamp it.
+      file->cache_degraded = true;
+    }
+  }
+#endif
+
   if (getenv("CLIO_VFD_DEBUG"))
     fprintf(stderr, "[vfd] READ  addr=%llu size=%llu\n",
             (unsigned long long)addr, (unsigned long long)size);
@@ -839,7 +1308,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   }
   const char *src = static_cast<const char *>(buf);
   size_t remaining = size;
-  off_t off = static_cast<off_t>(addr);
+  clio_vfd_off_t off = static_cast<clio_vfd_off_t>(addr);
 
   // Same loop as the read path: chunk to stay under the kernel's per-call cap
   // and retry on EINTR. A short pwrite is a partial transfer to be continued,
@@ -847,7 +1316,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   while (remaining > 0) {
     const size_t cap = H5FD__clio_max_io_bytes();
     size_t want = (remaining > cap) ? cap : remaining;
-    ssize_t put = pwrite(file->posix_fd, src, want, off);
+    clio_vfd_ssize_t put = clio_vfd_pwrite(file->posix_fd, src, want, off);
     if (put < 0) {
       if (errno == EINTR) {
         continue;
@@ -873,7 +1342,8 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   // already succeeded), but NOT silent: a dropped populate is a range the tier
   // does not hold, which the future read tier must not mistake for resident
   // data. Count it and log once per failure so residency work has a signal.
-  if (file->fd >= 0) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
+  if (H5FD__clio_cache_live(file->fd)) {
     if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
       H5FDclio_cache_write_failures_g++;
       HLOG(kWarning,
@@ -882,6 +1352,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
            (unsigned long long)addr, (unsigned long long)size);
     }
   }
+#endif
   if ((haddr_t)(addr + size) > file->eof) {
     file->eof = (haddr_t)(addr + size);
   }
@@ -977,6 +1448,145 @@ static herr_t H5FD__clio_write(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
  *
  *-------------------------------------------------------------------------
  */
+/* Shorthand state for a vector's sizes[]/types[] arrays.
+ *
+ * Both arrays may be "shortened": a 0 size (H5FD_MEM_NOLIST type) at i > 0
+ * means this and every later element reuse the last explicit value. The rule is
+ * monotone -- once shortened, always shortened -- so the state can be
+ * snapshotted at the first element of a group and replayed over that group,
+ * which is what the coalescing loops below need in order to walk a group twice
+ * (once to size it, once to copy it). */
+typedef struct H5FD_clio_vecst_t {
+  size_t size;
+  bool size_fixed;
+  H5FD_mem_t type;
+  bool type_fixed;
+} H5FD_clio_vecst_t;
+
+static inline void H5FD__clio_vecst_init(H5FD_clio_vecst_t *st,
+                                         const size_t sizes[],
+                                         const H5FD_mem_t types[]) {
+  st->size = sizes[0];
+  st->size_fixed = false;
+  st->type = types ? types[0] : H5FD_MEM_DEFAULT;
+  st->type_fixed = false;
+}
+
+/* Advance the state to element k; afterwards st->size/st->type are k's. */
+static inline void H5FD__clio_vecst_step(H5FD_clio_vecst_t *st, uint32_t k,
+                                         const size_t sizes[],
+                                         const H5FD_mem_t types[]) {
+  if (!st->size_fixed) {
+    if (k > 0 && sizes[k] == 0)
+      st->size_fixed = true;
+    else
+      st->size = sizes[k];
+  }
+  if (types && !st->type_fixed) {
+    if (k > 0 && types[k] == H5FD_MEM_NOLIST)
+      st->type_fixed = true;
+    else
+      st->type = types[k];
+  }
+}
+
+/* Find the longest run of elements starting at `i` whose spanning region stays
+ * within `cap` bytes. Returns the element index one past the run, and stores
+ * the span end and the sum of the elements' sizes.
+ *
+ * Elements must be ascending for a run to form; HDF5's vectors are, but a
+ * non-monotone entry simply closes the group rather than being mishandled. */
+static uint32_t H5FD__clio_vec_group(uint32_t i, uint32_t count,
+                                     const haddr_t addrs[],
+                                     const size_t sizes[],
+                                     const H5FD_mem_t types[],
+                                     H5FD_clio_vecst_t st, size_t cap,
+                                     haddr_t *end_out, size_t *payload_out) {
+  haddr_t end = addrs[i] + st.size;
+  size_t payload = st.size;
+  uint32_t j = i + 1;
+  /* An element that is already larger than the window stays a group of one.
+     Coalescing around it cannot honour the window -- the scratch buffer would
+     be sized by that element, not by `cap` -- and there is nothing to gain:
+     the element is serviced as a single I/O either way. */
+  if (cap > 0 && (uint64_t)(end - addrs[i]) <= (uint64_t)cap) {
+    while (j < count) {
+      H5FD_clio_vecst_t nxt = st;
+      H5FD__clio_vecst_step(&nxt, j, sizes, types);
+      if (addrs[j] < addrs[i]) break;                 /* not ascending */
+      const haddr_t e = addrs[j] + nxt.size;
+      if (e <= addrs[i]) break;                       /* degenerate */
+      /* Test the span the group WOULD have, not this element's own end. They
+         differ whenever an element falls inside the span already accumulated
+         (a shorter element after a longer one), and testing the element's end
+         there would admit it while the span -- and with it the scratch
+         allocation -- stayed above the window. */
+      const haddr_t nend = (e > end) ? e : end;
+      if ((uint64_t)(nend - addrs[i]) > (uint64_t)cap) break;
+      st = nxt;
+      end = nend;
+      payload += nxt.size;
+      j++;
+    }
+  }
+  *end_out = end;
+  *payload_out = payload;
+  return j;
+}
+
+/* Scratch for one coalesced group. Bounded by the sieve window, so this is a
+ * 64 KiB allocation by default and it is reused for the whole vector call.
+ *
+ * The allocation is the one step here that can fail, and it must fail as this
+ * driver's failure rather than as an exception: these callbacks are reached
+ * from HDF5's C frames, and unwinding a C++ exception through them is
+ * undefined. Convert it to FAIL, with the reason on HDF5's error stack, and
+ * let the caller return FAIL to the library. */
+static herr_t H5FD__clio_vec_scratch(std::vector<char> *buf, size_t need) {
+  if (buf->size() >= need) {
+    return SUCCEED;
+  }
+  try {
+    buf->resize(need);
+  } catch (const std::exception &ex) {
+    errno = ENOMEM;
+    H5FD_CLIO_ERROR(
+        ("could not allocate the " + std::to_string(need) +
+         "-byte vector-I/O scratch buffer: " + ex.what()).c_str());
+    return FAIL;
+  } catch (...) {
+    errno = ENOMEM;
+    H5FD_CLIO_ERROR("could not allocate the vector-I/O scratch buffer");
+    return FAIL;
+  }
+  return SUCCEED;
+}
+
+/*-------------------------------------------------------------------------
+ * Coalescing vector I/O.
+ *
+ * HDF5 hands a driver that implements these callbacks the WHOLE selection in
+ * one call -- for a strided slab of a contiguous dataset that is tens of
+ * thousands of 4-byte elements (measured: count=65536, size=4, stride 1024).
+ * Servicing them one at a time costs one pread/pwrite AND one CTE populate
+ * round-trip per element, which made such writes ~200x slower than sec2
+ * (iowarp/clio-core#980).
+ *
+ * The library's own answer to this pattern is the data sieve buffer, but
+ * implementing vector I/O is exactly what turns selection I/O on and takes the
+ * sieve path away (H5Dio.c, H5D__ioinfo_adjust) -- so the driver has to do it
+ * itself. Consecutive elements are grouped while their spanning region stays
+ * within the sieve window and serviced as one I/O:
+ *
+ *   - a group whose elements exactly tile the span needs no read: gather and
+ *     write once;
+ *   - otherwise read the span, patch the elements in, write the span back.
+ *     The span ends at the last element's end, so nothing outside the range the
+ *     unmerged path would have written is touched.
+ *
+ * `sieve=0` in the driver config restores the element-at-a-time behaviour.
+ *-------------------------------------------------------------------------
+ */
 static herr_t H5FD__clio_read_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
                                      H5FD_mem_t types[], haddr_t addrs[],
                                      size_t sizes[], void *bufs[]) {
@@ -986,34 +1596,47 @@ static herr_t H5FD__clio_read_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
   if (count == 0) {
     return SUCCEED;
   }
-  size_t size = sizes[0];
-  bool size_fixed = false; /* once a 0 size is seen, reuse the last explicit */
-  /* types[] uses the same shorthand with H5FD_MEM_NOLIST as the terminator,
-     and the array may genuinely be that short -- reading past the terminator
-     is out of bounds, not just wrong. */
-  H5FD_mem_t type = types ? types[0] : H5FD_MEM_DEFAULT;
-  bool type_fixed = false;
-  for (uint32_t i = 0; i < count; i++) {
-    if (!size_fixed) {
-      if (i > 0 && sizes[i] == 0) {
-        size_fixed = true; /* size stays = the last explicit size */
-      } else {
-        size = sizes[i];
+  const size_t cap = file->fa.sieve_max;
+  H5FD_clio_vecst_t st;
+  H5FD__clio_vecst_init(&st, sizes, types);
+  std::vector<char> scratch;
+
+  uint32_t i = 0;
+  while (i < count) {
+    H5FD_clio_vecst_t gst = st;
+    H5FD__clio_vecst_step(&gst, i, sizes, types);
+    haddr_t end;
+    size_t payload;
+    const uint32_t j = H5FD__clio_vec_group(i, count, addrs, sizes, types, gst,
+                                            cap, &end, &payload);
+    if (j == i + 1) {
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                            addrs[i], gst.size, [&] {
+                              return H5FD__clio_do_read(file, addrs[i],
+                                                        gst.size, bufs[i]);
+                            }) < 0) {
+        return FAIL;
+      }
+    } else {
+      const size_t span = (size_t)(end - addrs[i]);
+      if ((unsigned long)span > H5FDclio_vec_max_span_g)
+        H5FDclio_vec_max_span_g = (unsigned long)span;
+      if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                            addrs[i], span, [&] {
+                              return H5FD__clio_do_read(file, addrs[i], span,
+                                                        scratch.data());
+                            }) < 0) {
+        return FAIL;
+      }
+      H5FD_clio_vecst_t cp = gst;
+      for (uint32_t k = i; k < j; k++) {
+        if (k > i) H5FD__clio_vecst_step(&cp, k, sizes, types);
+        memcpy(bufs[k], scratch.data() + (size_t)(addrs[k] - addrs[i]), cp.size);
       }
     }
-    if (types && !type_fixed) {
-      if (i > 0 && types[i] == H5FD_MEM_NOLIST) {
-        type_fixed = true;
-      } else {
-        type = types[i];
-      }
-    }
-    if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead,
-                          (int)type, addrs[i], size,
-                          [&] { return H5FD__clio_do_read(file, addrs[i], size,
-                                                          bufs[i]); }) < 0) {
-      return FAIL;
-    }
+    for (uint32_t k = i; k < j; k++) H5FD__clio_vecst_step(&st, k, sizes, types);
+    i = j;
   }
   return SUCCEED;
 } /* end H5FD__clio_read_vector() */
@@ -1027,31 +1650,58 @@ static herr_t H5FD__clio_write_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
   if (count == 0) {
     return SUCCEED;
   }
-  size_t size = sizes[0];
-  bool size_fixed = false;
-  H5FD_mem_t type = types ? types[0] : H5FD_MEM_DEFAULT; /* see read_vector */
-  bool type_fixed = false;
-  for (uint32_t i = 0; i < count; i++) {
-    if (!size_fixed) {
-      if (i > 0 && sizes[i] == 0) {
-        size_fixed = true;
-      } else {
-        size = sizes[i];
+  const size_t cap = file->fa.sieve_max;
+  H5FD_clio_vecst_t st;
+  H5FD__clio_vecst_init(&st, sizes, types);
+  std::vector<char> scratch;
+
+  uint32_t i = 0;
+  while (i < count) {
+    H5FD_clio_vecst_t gst = st;
+    H5FD__clio_vecst_step(&gst, i, sizes, types);
+    haddr_t end;
+    size_t payload;
+    const uint32_t j = H5FD__clio_vec_group(i, count, addrs, sizes, types, gst,
+                                            cap, &end, &payload);
+    if (j == i + 1) {
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite, (int)gst.type,
+                            addrs[i], gst.size, [&] {
+                              return H5FD__clio_do_write(file, addrs[i],
+                                                         gst.size, bufs[i]);
+                            }) < 0) {
+        return FAIL;
+      }
+    } else {
+      const size_t span = (size_t)(end - addrs[i]);
+      if ((unsigned long)span > H5FDclio_vec_max_span_g)
+        H5FDclio_vec_max_span_g = (unsigned long)span;
+      if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
+      /* Elements that exactly tile the span leave no bytes to preserve, so the
+         read-modify part is skipped and this is a pure gather. */
+      if (payload < span) {
+        if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                              addrs[i], span, [&] {
+                                return H5FD__clio_do_read(file, addrs[i], span,
+                                                          scratch.data());
+                              }) < 0) {
+          return FAIL;
+        }
+      }
+      H5FD_clio_vecst_t cp = gst;
+      for (uint32_t k = i; k < j; k++) {
+        if (k > i) H5FD__clio_vecst_step(&cp, k, sizes, types);
+        memcpy(scratch.data() + (size_t)(addrs[k] - addrs[i]), bufs[k], cp.size);
+      }
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite, (int)gst.type,
+                            addrs[i], span, [&] {
+                              return H5FD__clio_do_write(file, addrs[i], span,
+                                                         scratch.data());
+                            }) < 0) {
+        return FAIL;
       }
     }
-    if (types && !type_fixed) {
-      if (i > 0 && types[i] == H5FD_MEM_NOLIST) {
-        type_fixed = true;
-      } else {
-        type = types[i];
-      }
-    }
-    if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite,
-                          (int)type, addrs[i], size,
-                          [&] { return H5FD__clio_do_write(file, addrs[i], size,
-                                                           bufs[i]); }) < 0) {
-      return FAIL;
-    }
+    for (uint32_t k = i; k < j; k++) H5FD__clio_vecst_step(&st, k, sizes, types);
+    i = j;
   }
   return SUCCEED;
 } /* end H5FD__clio_write_vector() */
@@ -1081,9 +1731,33 @@ static herr_t H5FD__clio_get_handle(H5FD_t *_file, hid_t fapl,
 /*-------------------------------------------------------------------------
  * Function:    H5FD__clio_flush
  *
- * Purpose:     Durability barrier: fsync the authoritative native file so a
- *              successful H5Fflush/H5Dflush leaves no pending dirty state on
- *              disk. Fail-closed if the fsync fails.
+ * Purpose:     Push this driver's buffers out to the file. There are none:
+ *              every write is written through to the authoritative native file
+ *              by pwrite(2) before the write callback returns, so by the time
+ *              flush is called the data is already in the page cache and
+ *              visible to every other process on the machine. That is what
+ *              HDF5 asks a flush callback for, and it is what sec2 -- the
+ *              reference driver this one is byte-for-byte compatible with --
+ *              provides by having no flush callback at all.
+ *
+ *              This used to fsync(2) unconditionally, which is a DURABILITY
+ *              barrier (survive a power cut), not a visibility one, and is
+ *              strictly stronger than the callback's contract. It is also
+ *              ruinously expensive at netCDF-4's call rate: netCDF calls
+ *              H5Fflush from nc_enddef, so nc_test4/tst_atts -- which
+ *              re-enters define mode 3 x 2^16 times -- issued ~200k fsyncs and
+ *              went from 0.9s on sec2 to over 300s here (ctest timeout).
+ *              tst_h_strings2, tst_h_compounds2 and the ncdump shell tests
+ *              were the same shape.
+ *
+ *              The barrier is still available, because "my writes are on
+ *              stable storage when H5Fflush returns" is a real requirement for
+ *              some callers -- it is just opt-in now: fsync=1 in the driver
+ *              config string (HDF5_DRIVER_CONFIG="fsync=1"), or
+ *              CLIO_VFD_FSYNC=1 in the environment for a process that cannot
+ *              reach the FAPL. close() fsyncs unconditionally either way, so
+ *              a file that is closed normally is always durable; only the
+ *              per-flush barrier is a choice.
  *
  * Return:      SUCCEED/FAIL
  *
@@ -1093,10 +1767,21 @@ static herr_t H5FD__clio_flush(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   (void)dxpl_id;
   (void)closing;
   H5FD_clio_t *file = (H5FD_clio_t *)_file;
-  // Persist the authoritative native file; fail-closed so a flush that did not
-  // reach disk never reports success. Writes are write-through, so the native
-  // file is the only store holding data to flush.
-  if (file->posix_fd >= 0 && fsync(file->posix_fd) < 0) {
+  if (!file->fa.fsync_on_flush) {
+    return SUCCEED;
+  }
+  // Opt-in durability barrier; fail-closed so a flush that did not reach disk
+  // never reports success. Writes are write-through, so the native file is the
+  // only store holding data to flush.
+  //
+  // H5FD_CLIO_WRITABLE is a separate condition from the opt-in above, and both
+  // are needed: fsync(2) tolerates a read-only descriptor, but the Windows
+  // equivalent does not -- _commit() is FlushFileBuffers(), which requires
+  // write access. The debug CRT asserts and the release CRT returns EBADF,
+  // which the fail-closed branch below would turn into a failed flush on a
+  // file that was never dirty.
+  if (file->posix_fd >= 0 && H5FD_CLIO_WRITABLE(file) &&
+      clio_vfd_fsync(file->posix_fd) < 0) {
     H5FD_CLIO_ERROR("fsync() in flush failed");
     return FAIL;
   }
@@ -1120,14 +1805,15 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   H5FD_clio_t *file = (H5FD_clio_t *)_file;
   if (file->eof != file->eoa) {
     if (file->posix_fd >= 0 &&
-        ftruncate(file->posix_fd, (off_t)file->eoa) < 0) {
+        clio_vfd_ftruncate(file->posix_fd, (clio_vfd_off_t)file->eoa) < 0) {
       H5FD_CLIO_ERROR("ftruncate() of authoritative native file failed");
       return FAIL;
     }
     // Keep the CTE cache's logical size in step (best-effort; populate-only
     // tier, see the write callback). Counted on failure for the same reason:
     // a tier that did not shrink still holds bytes past the new EOF.
-    if (file->fd >= 0) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
+    if (H5FD__clio_cache_live(file->fd)) {
       if (CLIO_CFS_CLIENT->FtruncateFd(file->fd, (off_t)file->eoa) < 0) {
         H5FDclio_cache_truncate_failures_g++;
         HLOG(kWarning,
@@ -1136,6 +1822,7 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
              (unsigned long long)file->eoa);
       }
     }
+#endif
     file->eof = file->eoa;
   }
   return SUCCEED;
@@ -1158,8 +1845,7 @@ static herr_t H5FD__clio_lock(H5FD_t *_file, bool rw) {
   if (file->posix_fd < 0) {
     return SUCCEED;
   }
-  int lock_flags = (rw ? LOCK_EX : LOCK_SH) | LOCK_NB;
-  if (flock(file->posix_fd, lock_flags) < 0) {
+  if (clio_vfd_lock(file->posix_fd, rw ? 1 : 0) < 0) {
     if (errno == ENOSYS) {
       return SUCCEED; /* locking unsupported here: not an error (sec2 parity) */
     }
@@ -1177,7 +1863,7 @@ static herr_t H5FD__clio_unlock(H5FD_t *_file) {
   if (file->posix_fd < 0) {
     return SUCCEED;
   }
-  if (flock(file->posix_fd, LOCK_UN) < 0) {
+  if (clio_vfd_unlock(file->posix_fd) < 0) {
     if (errno == ENOSYS) {
       return SUCCEED;
     }
@@ -1238,7 +1924,13 @@ herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled) {
   if (driver < 0) {
     return FAIL;
   }
-  H5FD_clio_fapl_t fa;
+  /* Start from the defaults so EVERY field is initialized, including the ones
+     this entry point does not expose. H5Pset_driver copies the struct verbatim
+     onto the FAPL, so a field left unset here would reach H5FD__clio_open as
+     stack garbage -- for sieve_max, as the coalescing window and therefore as
+     the size of a scratch allocation. Assigning the default struct rather than
+     naming fields keeps that true for whatever is added next. */
+  H5FD_clio_fapl_t fa = H5FD_clio_fapl_default_g;
   fa.cache_enabled = cache_enabled;
   return H5Pset_driver(fapl_id, driver, &fa);
 }
@@ -1309,13 +2001,16 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
   // file alone is still correct -- the delete must not fail just because CLIO
   // is down (same reasoning as open()).
   if (H5FD__clio_cache_available()) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
     CLIO_CFS_CLIENT->RemovePath(name);
+#endif
   }
 
   // Remove the authoritative native file. The name is a plain path -- the
   // marked form is refused at open() -- so no stripping is needed. Fail-closed
   // on error (sec2 parity) so a failed delete is reported, not masked.
-  if (unlink(name) < 0) {
+  // clio_vfd_unlink, not unlink(2): MSVC has no POSIX unlink.
+  if (clio_vfd_unlink(name) < 0) {
     H5FD_CLIO_ERROR("unlink() of authoritative native file failed");
     return FAIL;
   }
@@ -1325,8 +2020,21 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
 /*
  * Entry points for dynamic plugin loading.
  */
-H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VFD; }
+/* H5PLUGIN_DLL, not a bare definition: H5PLextern.h declares both entry points
+ * with it, which is __declspec(dllexport) on Windows, so defining them without
+ * it is a linkage mismatch (MSVC C2375) -- and an unexported entry point is one
+ * HDF5's plugin loader cannot find. Elsewhere it expands to default visibility,
+ * which is what a plugin entry point wants in any case. */
+H5PLUGIN_DLL H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VFD; }
 
-const void *H5PLget_plugin_info(void) { return &H5FD_clio_g; }
+H5PLUGIN_DLL const void *H5PLget_plugin_info(void) {
+  /* The plugin path does NOT go through H5FD_clio_init(): HDF5 asks for the
+     class struct here and registers the driver itself. So this is the entry
+     point that must arm the process-exit guard -- arming it only in
+     H5FD_clio_init() left the guard disarmed for every HDF5_DRIVER=clio_vfd
+     application, which is all of them. */
+  H5FD__clio_install_exit_guard();
+  return &H5FD_clio_g;
+}
 
 } // extern C

@@ -45,6 +45,12 @@
 # or resolve the self-send/lost-wakeup) — tracked in REMAINING_WORK.md; needs
 # CI-iteration validation. Gate: 84 -> 72. Re-add each test once the runtime fix
 # lands and it passes several clean CI runs.
+# 2026-08-25 FLAKY QUARANTINE (issue #1022). Five of the tests below flake in
+# CI -- generic/070 209 451 647 729. They stay listed here (they are still run
+# on every job) but are subtracted from the ENFORCED set by
+# run_ci_xfstests.sh and reported non-gating instead. Per-test failure rates
+# and the 157-run evidence they came from are in ci_flaky_quarantine.txt.
+# Enforced gate: 72 -> 67.
 generic/001
 generic/002
 generic/005

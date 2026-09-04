@@ -70,30 +70,10 @@ add_clio_module_client(
 )
 
 #------------------------------------------------------------------------------
-# Optional labeling support (libcurl + nlohmann/json → OllamaGenerate).
-# nlohmann_json is always available (found or FetchContent'd by root).
-# CURL is a system package; if missing the label_client compiles as a stub
-# that returns false — assimilation still works, just without auto-labeling.
-#------------------------------------------------------------------------------
-find_package(CURL QUIET)
-if(CURL_FOUND AND nlohmann_json_FOUND)
-  message(STATUS "CAE labeling support: ENABLED (libcurl + nlohmann_json found)")
-  set(CAE_LABELING_ENABLED TRUE)
-else()
-  if(NOT CURL_FOUND)
-    message(STATUS "CAE labeling support: DISABLED (libcurl not found)")
-  else()
-    message(STATUS "CAE labeling support: DISABLED (nlohmann_json not found)")
-  endif()
-  set(CAE_LABELING_ENABLED FALSE)
-endif()
-
-#------------------------------------------------------------------------------
 # Runtime Library
 #------------------------------------------------------------------------------
 set(RUNTIME_SOURCES
   src/core_runtime.cc
-  src/label_client.cc
   src/factory/assimilator_factory.cc
   src/factory/binary_file_assimilator.cc
   src/factory/string_data_assimilator.cc
@@ -103,11 +83,6 @@ set(RUNTIME_SOURCES
 set(RUNTIME_LINK_LIBRARIES
   clio_cte_core_client
 )
-
-if(CAE_LABELING_ENABLED)
-  add_compile_definitions(CLIO_CAE_ENABLE_LABELING)
-  list(APPEND RUNTIME_LINK_LIBRARIES CURL::libcurl)
-endif()
 
 # Conditionally add HDF5 assimilator if enabled
 if(HDF5_ENABLED)
@@ -151,12 +126,6 @@ add_clio_module_runtime(
   LINK_LIBRARIES
     ${RUNTIME_LINK_LIBRARIES}
 )
-
-# nlohmann_json is PRIVATE: it may be a FetchContent target (non-imported),
-# and PUBLIC linking would require it to be in the install export set.
-if(CAE_LABELING_ENABLED)
-  target_link_libraries(clio_cae_core_runtime PRIVATE nlohmann_json::nlohmann_json)
-endif()
 
 # Add HDF5 include directories to runtime if enabled
 if(HDF5_ENABLED)
