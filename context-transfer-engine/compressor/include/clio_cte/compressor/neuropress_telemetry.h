@@ -29,6 +29,26 @@ bool SelectionLogEnabled();
 /** Gates recording sweep candidates, never the sweep itself. */
 bool ExploreLogEnabled();
 
+/**
+ * @brief Park how long this chunk's SELECTION took, and whether it ran the model.
+ *
+ * Parked rather than passed because the measurement is taken inside
+ * NeuroPressRankChunk while the row is written two frames up in
+ * DynamicSchedule -- the same split, and the same fix, as the primary's
+ * measured quality below.
+ *
+ * `micros` covers the whole selection: the statistics kernel, the reuse
+ * decision, and either a forward pass plus ranking plus the prediction D2H, or
+ * the cached ranking. Both paths wait on the same statistics kernel, so the
+ * DIFFERENCE between the reused and computed populations is what reuse is
+ * worth -- which is the only end this can be measured from, the saving being
+ * far below what a wall-clock run resolves.
+ *
+ * Thread-local: worker threads select concurrently, and a shared slot would
+ * hand one chunk's timing to another's row.
+ */
+void RecordSelectionTiming(double micros, bool reused);
+
 /** packed_preset carries shuffle+quantize as stored in the blob header.
  *  checksum is FNV-1a of the chunk, to prove another impl saw the same bytes. */
 void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,

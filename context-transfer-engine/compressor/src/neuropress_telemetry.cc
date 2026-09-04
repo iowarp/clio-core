@@ -206,7 +206,8 @@ SelectionLog *SelectionLogInstance() {
                      "seq,blob,chunk_bytes,entropy,mad,second_deriv,wire_lib,"
                      "lib_name,algo_idx,quantize,shuffle,preset,pred_ratio,"
                      "pred_ct_ms,pred_dt_ms,pred_psnr,actual_ratio,"
-                     "actual_ct_ms,actual_psnr,checksum,role\n");
+                     "actual_ct_ms,actual_psnr,checksum,role,"
+                     "select_us,reused\n");
       }
     }
     return l;
@@ -214,6 +215,19 @@ SelectionLog *SelectionLogInstance() {
   return log;
 }
 }  // namespace
+
+namespace {
+/* Parked by NeuroPressRankChunk, taken by the row writer. -1 means the chunk
+   never reached the model (a static-codec run, or a decline), which is a
+   different thing from a selection that took no time. */
+thread_local double g_select_us = -1.0;
+thread_local int g_select_reused = -1;
+}  // namespace
+
+void RecordSelectionTiming(double micros, bool reused) {
+  g_select_us = micros;
+  g_select_reused = reused ? 1 : 0;
+}
 
 bool SelectionLogEnabled() {
   static const bool on = [] {
@@ -514,7 +528,8 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
 
   std::fprintf(fp,
                "%ld,%s,%zu,%.10g,%.10g,%.10g,%d,%s,%d,%d,%d,%d,"
-               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu,%s\n",
+               "%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%llu,%s,"
+               "%.3f,%d\n",
                log->seq++, blob_name.c_str(), chunk_size, entropy, mad,
                second_deriv, wire_lib, lib_name.c_str(), algo_idx, quantize,
                shuffle, preset,
@@ -523,7 +538,12 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
                predicted ? predicted->decompress_time_ms_ : 0.0,
                predicted ? predicted->psnr_db_ : 0.0,
                actual_ratio, actual_ct_ms, actual_psnr, checksum,
-               role ? role : "primary");
+               role ? role : "primary", g_select_us, g_select_reused);
+  /* Reset after use: an explore row written for the same chunk must not
+     inherit the primary's timing, and a later chunk that never reached the
+     model must report -1 rather than the last one that did. */
+  g_select_us = -1.0;
+  g_select_reused = -1;
   std::fflush(fp);
 }
 
